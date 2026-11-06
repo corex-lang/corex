@@ -62,3 +62,19 @@ Never accept a subagent's output blindly: verify its claims, run the full valida
 3.  Execute the 5-stage subagent quality pipeline (`Specify` → `Critique` → `Implement` → `Red-Team Verify` → `Test/Fuzz/Audit`).
 4.  Run all formatters, linters, type checkers, tests, and benchmarks; fix every error, warning, or coverage gap until the workspace is 100% clean.
 5.  Update `CHANGELOG.md` per `.agents/AGENTS.md` Section 7 and report your verification summary.
+
+---
+
+## Current Active Assignment: Execute Phase 0 Only
+
+All 15 Research Decision Gates (`RDG-01`–`RDG-15`) are now resolved and committed in `docs/research/DR-01.md` through `docs/research/DR-15.md`.
+
+Your mission in this session is to execute **Phase 0: Bootstrap Foundation, Terminal Renderer & Verification Harness** from `PLAN.md` in `stage0/` (using **Zig** as specified in `docs/research/DR-01.md` and `docs/research/DR-11.md`–`DR-12.md`):
+
+1.  Read `.agents/AGENTS.md`, `PLAN.md`, `docs/research/DR-01.md`, `docs/research/DR-11.md` (Section 2.4 `VfsSourceMap`), `docs/research/DR-12.md` (Section 1.4 `TokenBuffer` / `Span` / `LineIndex`), and `docs/research/DR-15.md` (Section 2.1 Monochrome Unicode Glyph Vocabulary), along with all five `.agents/skills/*/SKILL.md` files.
+2.  Initialize the Stage 0 Zig workspace (`build.zig`, `stage0/src/main.zig`, `stage0/src/root.zig`) targeting our local Zig toolchain with strict compiler checks.
+3.  Implement and verify all Phase 0 deliverables using the 5-stage subagent quality pipeline (`Specify` -> `Critique` -> `Implement` -> `Red-Team Verify` -> `Test/Fuzz/Audit`):
+    -   Foundational arenas and handles (`BumpArena`, `StringInterner` with `Wyhash(0)`, `VfsSourceMap` / `SourceMap`, `FileId(u32)`, `Span`, and `LineIndex` UTF-8/UTF-16 lookup).
+    -   Centralized CLI & Diagnostic Rendering Engine (`cli::style`, `cli::box_draw`, `diag::renderer`) using strictly monochrome Unicode box-drawing and geometric glyphs (`╭`, `│`, `╰`, `├`, `─`, `▸`, `•`, `✓`, `✗`, `⚠\u{FE0E}`) + ANSI styling (`NO_COLOR` & `--color=always|auto|never` aware) and the `corex` CLI command router (`build`, `run`, `check`, `test`, `fmt`, `upgrade`, `lsp`, `bench`).
+    -   Multi-tier automated test harness (`unit`, `snapshots`, `compile_fail`, `run_pass`, `differential`, `fuzz`), benchmark harness (`bench/`), and the repository-wide drift-guard test asserting zero colored emojis exist anywhere in the repository.
+4.  Achieve 100% test coverage across all Phase 0 modules, verify `zig build test` and `markdownlint-cli2` pass with zero warnings or errors, update `CHANGELOG.md`, and stop at the completion of Phase 0 for review.
