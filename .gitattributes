@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.cx text eol=lf linguist-language=CoreX linguist-detectable=true
+*.png binary
+*.ico binary
+*.wasm binary

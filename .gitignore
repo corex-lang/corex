@@ -1,0 +1,39 @@
+# Build & compiler artifacts:
+/build/
+/dist/
+/out/
+/target/
+/zig-cache/
+/zig-out/
+/.corex/
+/.cache/
+
+# Compiled binaries & object files:
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.dSYM/
+*.wasm
+
+# Test, fuzzing & benchmark output:
+/coverage/
+/fuzz/corpus/
+/fuzz/artifacts/
+/bench/results/
+.pytest_cache/
+.pytest_tmp/
+.coverage
+
+# Tooling & editor directories:
+.mypy_cache/
+.ruff_cache/
+/.venv/
+/node_modules/
+.DS_Store
+Thumbs.db
