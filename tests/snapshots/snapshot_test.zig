@@ -1,7 +1,8 @@
 //! Golden Snapshot Verification Suite (`tests/snapshots/snapshot_test.zig`)
 //!
 //! Compares rendered CLI help menus, single-line diagnostics, multi-line region diagnostics,
-//! cross-file stitched diagnostics, and CLI typo diagnostics against golden `.snap` files.
+//! cross-file stitched diagnostics, CLI typo diagnostics, lexer token/trivia streams, and parser
+//! CST/AST trees and diagnostics against golden `.snap` files.
 //!
 //! Normalizes `CRLF` (`\r\n`) to `LF` (`\n`) when loading `.snap` files so snapshots match across OSes.
 
@@ -11,12 +12,16 @@ const corex = @import("corex");
 const router = corex.router;
 const FileId = corex.FileId;
 const TokenIndex = corex.TokenIndex;
+const CstNodeIndex = corex.CstNodeIndex;
+const NodeIndex = corex.NodeIndex;
 const Span = corex.Span;
 const StringInterner = corex.StringInterner;
 const VfsSourceMap = corex.VfsSourceMap;
 const TokenBuffer = corex.TokenBuffer;
 const LosslessCstArena = corex.LosslessCstArena;
+const AstArena = corex.AstArena;
 const Lexer = corex.Lexer;
+const Parser = corex.Parser;
 const StyleConfig = corex.StyleConfig;
 const DiagnosticSink = corex.DiagnosticSink;
 const LabeledSpan = corex.LabeledSpan;
@@ -351,6 +356,135 @@ test "test_snapshot_diag_lexer_warnings_w0101_w0201" {
         std.testing.allocator,
         std.testing.io,
         "tests/snapshots/diag_lexer_warnings.snap",
+        out_writer.buffered(),
+    );
+}
+
+test "test_snapshot_parser_cst_and_ast_tree" {
+    const sample_source =
+        "pub struct Metric[T] {\n" ++
+        "    pub val: T,\n" ++
+        "}\n" ++
+        "pub fn render[T](opt: Option[T]) -> View {\n" ++
+        "    let .Some(item) = opt else {\n" ++
+        "        return Empty;\n" ++
+        "    };\n" ++
+        "    let score = item |> compute() catch 0;\n" ++
+        "    let label = match score {\n" ++
+        "        0 => \"idle\",\n" ++
+        "        _ => \"active\",\n" ++
+        "    };\n" ++
+        "    Card(padding: 8) {\n" ++
+        "        Text(value: label);\n" ++
+        "    }\n" ++
+        "}\n";
+
+    var token_buf = TokenBuffer.init(std.testing.allocator);
+    defer token_buf.deinit();
+    var cst_arena = LosslessCstArena.init(std.testing.allocator);
+    defer cst_arena.deinit();
+    var ast_arena = AstArena.init(std.testing.allocator);
+    defer ast_arena.deinit();
+    var sink = DiagnosticSink.init(std.testing.allocator);
+    defer sink.deinit();
+
+    _ = try corex.parseSource(
+        sample_source,
+        FileId.fromInt(0),
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+        &sink,
+        null,
+    );
+    try std.testing.expectEqual(@as(u32, 0), sink.error_count);
+    try std.testing.expectEqual(@as(u32, 0), sink.warning_count);
+
+    var out_buf: [16384]u8 = undefined;
+    var out_writer = std.Io.Writer.fixed(&out_buf);
+
+    try out_writer.print("=== CST ({d} nodes) ===\n", .{cst_arena.countNodes()});
+    var i: usize = 0;
+    while (i < cst_arena.countNodes()) : (i += 1) {
+        const rec = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(i)));
+        var first_tok = rec.token.asInt();
+        var last_tok = first_tok;
+        var j: usize = i;
+        while (j < i + @as(usize, rec.subtree_size)) : (j += 1) {
+            const child_tok = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(j))).token.asInt();
+            if (child_tok < first_tok) first_tok = child_tok;
+            if (child_tok > last_tok) last_tok = child_tok;
+        }
+        try out_writer.print(
+            "cst[{d:0>3}] {s} size={d} tok={d}..{d}\n",
+            .{ i, @tagName(rec.kind), rec.subtree_size, first_tok, last_tok },
+        );
+    }
+
+    try out_writer.print("=== AST ({d} nodes) ===\n", .{ast_arena.countNodes()});
+    i = 0;
+    while (i < ast_arena.countNodes()) : (i += 1) {
+        const ast_id = NodeIndex.fromInt(@intCast(i));
+        const ast_rec = ast_arena.getNode(ast_id);
+        try out_writer.print(
+            "ast[{d:0>2}] {s} cst={d} main_tok={d}\n",
+            .{ i, @tagName(ast_rec.tag), ast_arena.getCstOrigin(ast_id).asInt(), ast_rec.main_token.asInt() },
+        );
+    }
+
+    try expectMatchesSnapshotFile(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/snapshots/parser_cst_ast.snap",
+        out_writer.buffered(),
+    );
+}
+
+test "test_snapshot_diag_parser_errors_e0201_to_e0203" {
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var source_map = VfsSourceMap.init(std.testing.allocator, &interner);
+    defer source_map.deinit(std.testing.io);
+
+    const err_source =
+        "fn check_cmp(a: i32, b: i32) -> bool {\n" ++
+        "    return a < b < 10;\n" ++
+        "}\n" ++
+        "fn unclosed_delim(x: i32 {\n" ++
+        "    return ((x + 1));\n" ++
+        "}\n";
+    const file_id = try source_map.setOverlay("src\\parser\\errors.cx", err_source, .root);
+
+    var token_buf = TokenBuffer.init(std.testing.allocator);
+    defer token_buf.deinit();
+    var cst_arena = LosslessCstArena.init(std.testing.allocator);
+    defer cst_arena.deinit();
+    var ast_arena = AstArena.init(std.testing.allocator);
+    defer ast_arena.deinit();
+    var sink = DiagnosticSink.init(std.testing.allocator);
+    defer sink.deinit();
+
+    try corex.tokenize(err_source, file_id, &token_buf, &sink, &interner);
+    var parser_instance = Parser.initWithOptions(
+        err_source,
+        file_id,
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+        &sink,
+        &interner,
+        .{ .max_depth = 6 },
+    );
+    _ = try parser_instance.parse();
+
+    var out_buf: [4096]u8 = undefined;
+    var out_writer = std.Io.Writer.fixed(&out_buf);
+    try DiagnosticRenderer.init(&source_map, &interner, StyleConfig.MONOCHROME).renderAll(&out_writer, &sink);
+
+    try expectMatchesSnapshotFile(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/snapshots/diag_parser_errors.snap",
         out_writer.buffered(),
     );
 }

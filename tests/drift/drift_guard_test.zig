@@ -13,14 +13,21 @@ const style = corex.style;
 const router = corex.router;
 const diagnostic = corex.diagnostic;
 const lexer = corex.lexer;
+const syntax = corex.syntax_arenas;
 const TokenKind = corex.TokenKind;
+const CstNodeKind = syntax.CstNodeKind;
+const AstTag = syntax.AstTag;
+const TokenSet128 = corex.TokenSet128;
+const DiagnosticCode = corex.DiagnosticCode;
 const StyleConfig = corex.StyleConfig;
 
 // --------------------------------------- CONSTS ----------------------------------------
 
 /// Canonical 90-character top-level section dividers required by `.agents/skills/docs/SKILL.md` Section 3.
 const CANONICAL_TOP_DIVIDERS = [_]struct {
+    /// Center-padded section label (`" TYPES "`, `" CONSTS "`, etc.).
     label: []const u8,
+    /// Exact 90-character canonical divider line.
     expected: []const u8,
 }{
     .{
@@ -237,4 +244,54 @@ test "test_drift_guard_phase1_token_kind_contiguity_and_keyword_table" {
         try std.testing.expect(was_seen);
     }
     try std.testing.expectEqual(@as(usize, 19), prim_count);
+}
+
+test "test_drift_guard_phase2_cst_node_kind_ast_tag_and_parser_diagnostics" {
+    // [1] Verify `CstNodeKind` enum contiguity (`0..N-1`):
+    const cst_enum_info = @typeInfo(CstNodeKind).@"enum";
+    const cst_values = std.enums.values(CstNodeKind);
+    try std.testing.expectEqual(cst_enum_info.field_names.len, cst_values.len);
+    inline for (cst_values, 0..) |cst_val, i| {
+        try std.testing.expectEqual(@as(u8, @intCast(i)), @backingInt(cst_val));
+        try std.testing.expectEqual(cst_val, @as(CstNodeKind, @enumFromInt(@as(u8, @intCast(i)))));
+        try std.testing.expectEqualStrings(cst_enum_info.field_names[i], @tagName(cst_val));
+    }
+
+    // [2] Verify `AstTag` enum contiguity (`0..M-1`):
+    const ast_enum_info = @typeInfo(AstTag).@"enum";
+    const ast_values = std.enums.values(AstTag);
+    try std.testing.expectEqual(ast_enum_info.field_names.len, ast_values.len);
+    inline for (ast_values, 0..) |ast_val, i| {
+        try std.testing.expectEqual(@as(u8, @intCast(i)), @backingInt(ast_val));
+        try std.testing.expectEqual(ast_val, @as(AstTag, @enumFromInt(@as(u8, @intCast(i)))));
+        try std.testing.expectEqualStrings(ast_enum_info.field_names[i], @tagName(ast_val));
+    }
+
+    // [3] Verify `TokenSet128` covers all 112 `TokenKind`s (`@backingInt(tok) < 128`):
+    const token_values = std.enums.values(TokenKind);
+    try std.testing.expectEqual(@as(usize, 112), token_values.len);
+    var full_set = TokenSet128.EMPTY;
+    for (token_values) |tok_val| {
+        try std.testing.expect(@backingInt(tok_val) < 128);
+        full_set = full_set.unionWith(TokenSet128.initOne(tok_val));
+        try std.testing.expect(full_set.contains(tok_val));
+    }
+
+    // [4] Verify parser diagnostic codes (`E0201`, `E0202`, `E0203`, `W0201`) in `DIAGNOSTIC_CATALOG`:
+    try std.testing.expectEqualStrings(
+        "E0201",
+        DiagnosticCode.e0201_unexpected_token.asCodeStr(),
+    );
+    try std.testing.expectEqualStrings(
+        "E0202",
+        DiagnosticCode.e0202_unclosed_delimiter.asCodeStr(),
+    );
+    try std.testing.expectEqualStrings(
+        "E0203",
+        DiagnosticCode.e0203_parse_depth_exceeded.asCodeStr(),
+    );
+    try std.testing.expectEqualStrings(
+        "W0201",
+        DiagnosticCode.w0201_non_canonical_identifier_case.asCodeStr(),
+    );
 }

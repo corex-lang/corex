@@ -19,6 +19,8 @@ pub const vfs_sourcemap = @import("vfs_sourcemap.zig");
 pub const syntax_arenas = @import("syntax_arenas.zig");
 /// Deterministic maximal-munch UTF-8 lexer, `TriviaAccumulator`, and identifier casing helpers.
 pub const lexer = @import("lexer.zig");
+/// Fault-tolerant recursive-descent + Pratt parser, lossless CST/AST builder, and incremental re-parser.
+pub const parser = @import("parser.zig");
 /// Monochrome Unicode glyph registry, `ColorMode`, and ANSI SGR styling helpers.
 pub const style = @import("cli/style.zig");
 /// Rounded Unicode card, aligned table, and 1/8th-block progress bar renderers.
@@ -123,6 +125,24 @@ pub const toSnakeCase = lexer.toSnakeCase;
 pub const toPascalCase = lexer.toPascalCase;
 /// Converts an identifier to canonical `SCREAMING_SNAKE_CASE`.
 pub const toScreamingSnakeCase = lexer.toScreamingSnakeCase;
+/// 128-bit token kind bitset for $O(1)$ synchronization and lookahead checks.
+pub const TokenSet128 = parser.TokenSet128;
+/// Source byte edit descriptor for incremental re-lexing and re-parsing.
+pub const EditRange = parser.EditRange;
+/// Telemetry returned by `reparseIncremental`.
+pub const IncrementalReparseStats = parser.IncrementalReparseStats;
+/// Configurable resource caps and warning toggles for `Parser`.
+pub const ParserOptions = parser.ParserOptions;
+/// Fault-tolerant recursive-descent and Pratt parser.
+pub const Parser = parser.Parser;
+/// Parses a pre-tokenized `TokenBuffer` into `cst_arena` and `ast_arena`.
+pub const parseTokens = parser.parseTokens;
+/// Tokenizes `source` and parses it into `cst_arena` and `ast_arena`.
+pub const parseSource = parser.parseSource;
+/// Canonical alias for `parseSource`.
+pub const parseFile = parser.parseFile;
+/// Incrementally re-lexes and re-parses `new_source` after `edit`.
+pub const reparseIncremental = parser.reparseIncremental;
 
 // ---------------- Diagnostics & CLI Re-Exports ----------------
 /// Monochrome Unicode glyph registry.
@@ -156,6 +176,7 @@ test "test_root_module_references_all_phase0_submodules" {
     _ = vfs_sourcemap;
     _ = syntax_arenas;
     _ = lexer;
+    _ = parser;
     _ = style;
     _ = box_draw;
     _ = router;

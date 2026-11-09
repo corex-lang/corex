@@ -1,0 +1,24 @@
+✗ error[E0201]: chained relational or range operators are non-associative in CoreX
+  ╭─▸ src/parser/errors.cx:2:18
+  │
+2 │     return a < b < 10;
+  │                  ^ chain comparisons with `and` or add explicit parentheses
+  │
+  ╰───────
+
+✗ error[E0202]: unclosed block, group, or generic delimiter
+  ╭─▸ src/parser/errors.cx:4:26
+  │
+4 │ fn unclosed_delim(x: i32 {
+  │                  ─ unclosed delimiter opened here
+  │                          ^ expected `)` to close parameter list
+  │
+  ╰───────
+
+✗ error[E0203]: parser recursion depth limit exceeded
+  ╭─▸ src/parser/errors.cx:5:14
+  │
+5 │     return ((x + 1));
+  │              ^ maximum parser recursion depth exceeded here
+  │
+  ╰───────
