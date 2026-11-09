@@ -1,8 +1,8 @@
 //! CoreX Stage 0 Master Verification Suite Runner (`tests/test_runner.zig`)
 //!
-//! Aggregates and executes all Phase 0, Phase 1, and Phase 2 isolated unit tests (`tests/unit/`),
-//! golden snapshot tests (`tests/snapshots/`), deterministic PRNG fuzzers (`tests/fuzz/`), and
-//! repository drift guards (`tests/drift/`).
+//! Aggregates and executes all Phase 0, Phase 1, Phase 2, and Phase 3 isolated unit tests
+//! (`tests/unit/`), golden snapshot tests (`tests/snapshots/`), deterministic PRNG fuzzers
+//! (`tests/fuzz/`), and repository drift guards (`tests/drift/`).
 //!
 //! Invoked automatically by `zig build test` alongside internal `stage0/src/` module tests.
 
@@ -20,13 +20,17 @@ pub const syntax_arenas_test = @import("unit/syntax_arenas_test.zig");
 pub const lexer_test = @import("unit/lexer_test.zig");
 /// Unit tests for `parser.zig` (lossless CST/AST, 15 Pratt tiers, showcases, recovery, incremental).
 pub const parser_test = @import("unit/parser_test.zig");
+/// Unit tests for `query_db.zig` (`CompilerDb`, 10-stage pipeline, Early Cutoff, Durability, `ItemTree`).
+pub const query_db_test = @import("unit/query_db_test.zig");
+/// Unit tests for `fmt_engine.zig` (`DocInst`, `DocArena`, `DocRenderer`, `corex fmt`, `--fix`).
+pub const fmt_engine_test = @import("unit/fmt_engine_test.zig");
 /// Unit tests for `diag/diagnostic.zig` and `diag/renderer.zig` (`DiagnosticSink`, `TransactionalPatcher`).
 pub const diagnostic_test = @import("unit/diagnostic_test.zig");
 /// Unit tests for `cli/style.zig`, `cli/box_draw.zig`, and `cli/router.zig`.
 pub const cli_router_test = @import("unit/cli_router_test.zig");
 /// Unit tests for `bench/harness.zig` (`computeStats`, `runCase`, `renderResultsTable`).
 pub const bench_harness_test = @import("unit/bench_harness_test.zig");
-/// Golden `.snap` snapshot tests for CLI help, token streams, and diagnostic rendering.
+/// Golden `.snap` snapshot tests for CLI help, token streams, diagnostics, `fmt`, and `query_db`.
 pub const snapshot_test = @import("snapshots/snapshot_test.zig");
 /// Phase 0 deterministic PRNG fuzzing suite (`LineIndex`, `TransactionalPatcher`, `BumpArena`).
 pub const phase0_fuzz = @import("fuzz/phase0_fuzz.zig");
@@ -34,16 +38,20 @@ pub const phase0_fuzz = @import("fuzz/phase0_fuzz.zig");
 pub const phase1_lexer_fuzz = @import("fuzz/phase1_lexer_fuzz.zig");
 /// Phase 2 deterministic PRNG fuzzing suite (2,500+ mutated `.cx` ASTs + 1,000+ incremental edits).
 pub const phase2_parser_fuzz = @import("fuzz/phase2_parser_fuzz.zig");
+/// Phase 3 deterministic PRNG fuzzing suite (`corex fmt` idempotency/comments + `CompilerDb` Early Cutoff).
+pub const phase3_fmt_fuzz = @import("fuzz/phase3_fmt_fuzz.zig");
 /// Repository-wide drift guards (zero colored emojis, CLI parity, diagnostic catalog, `< 150` col format).
 pub const drift_guard_test = @import("drift/drift_guard_test.zig");
 
-test "test_runner_references_all_phase0_phase1_and_phase2_verification_suites" {
+test "test_runner_references_all_phase0_phase1_phase2_and_phase3_verification_suites" {
     std.testing.refAllDecls(@This());
     _ = mem_foundation_test;
     _ = vfs_sourcemap_test;
     _ = syntax_arenas_test;
     _ = lexer_test;
     _ = parser_test;
+    _ = query_db_test;
+    _ = fmt_engine_test;
     _ = diagnostic_test;
     _ = cli_router_test;
     _ = bench_harness_test;
@@ -51,5 +59,6 @@ test "test_runner_references_all_phase0_phase1_and_phase2_verification_suites" {
     _ = phase0_fuzz;
     _ = phase1_lexer_fuzz;
     _ = phase2_parser_fuzz;
+    _ = phase3_fmt_fuzz;
     _ = drift_guard_test;
 }

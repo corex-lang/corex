@@ -14,6 +14,7 @@ const box_draw = @import("box_draw.zig");
 const diag = @import("../diag/diagnostic.zig");
 const renderer = @import("../diag/renderer.zig");
 const bench_harness = @import("../bench/harness.zig");
+const fmt_engine = @import("../fmt_engine.zig");
 
 const ColorMode = style.ColorMode;
 const Glyphs = style.Glyphs;
@@ -103,6 +104,24 @@ pub const GlobalFlagDescriptor = struct {
     summary: []const u8,
 };
 
+/// Subcommand-specific CLI option identifiers for `corex fmt` (`FMT_FLAGS`).
+pub const FmtFlagId = enum(u8) {
+    /// `--check` – verify formatting without writing files (`0`).
+    check = 0,
+    /// `--fix` – apply canonical identifier casing and missing `;` autofixes (`1`).
+    fix = 1,
+};
+
+/// Static metadata entry in `FMT_FLAGS` describing `corex fmt` flags.
+pub const FmtFlagDescriptor = struct {
+    /// Strongly typed `corex fmt` flag enum tag.
+    id: FmtFlagId,
+    /// Canonical long flag token (e.g., `"--check"`).
+    long_flag: []const u8,
+    /// Concise one-line summary.
+    summary: []const u8,
+};
+
 /// Resolved CLI action produced by `parseArgs`.
 pub const CommandAction = union(enum) {
     /// Render the global or subcommand-specific `--help` menu and exit `0`.
@@ -115,6 +134,10 @@ pub const CommandAction = union(enum) {
         subcommand: SubcommandId,
         /// Slice of positional arguments allocated in `DiagnosticSink.arena`.
         positional_args: []const []const u8,
+        /// Whether `--check` was passed (e.g., `corex fmt --check`).
+        is_check_only: bool = false,
+        /// Whether `--fix` was passed (e.g., `corex fmt --fix`).
+        is_fix_mode: bool = false,
     },
     /// Invalid CLI invocation; errors have been emitted into `DiagnosticSink`.
     invalid: void,
@@ -126,6 +149,10 @@ pub const ParsedCommand = struct {
     color_mode: ColorMode = .auto,
     /// Resolved command action to execute.
     action: CommandAction = .{ .show_help = null },
+    /// Whether `--check` was passed on `corex fmt`.
+    is_check_only: bool = false,
+    /// Whether `--fix` was passed on `corex fmt`.
+    is_fix_mode: bool = false,
 };
 
 // --------------------------------------- CONSTS ----------------------------------------
@@ -212,12 +239,30 @@ pub const GLOBAL_FLAGS = [_]GlobalFlagDescriptor{
     },
 };
 
+/// Canonical `corex fmt` option table (`DR-14` Section 1.5).
+pub const FMT_FLAGS = [_]FmtFlagDescriptor{
+    .{
+        .id = .check,
+        .long_flag = "--check",
+        .summary = "Verify that source files are formatted without writing changes to disk",
+    },
+    .{
+        .id = .fix,
+        .long_flag = "--fix",
+        .summary = "Apply canonical identifier casing and missing semicolon autofixes",
+    },
+};
+
 // -------------------------------------- INTERNALS --------------------------------------
 
 /// Emits an `E0001` diagnostic for an unrecognized CLI flag, attaching a typo hint if within distance 2.
-fn emitUnknownFlagDiagnostic(sink: *DiagnosticSink, unknown_flag: []const u8) !void {
+fn emitUnknownFlagDiagnostic(
+    sink: *DiagnosticSink,
+    unknown_flag: []const u8,
+    subcommand: ?SubcommandId,
+) !void {
     const msg = try std.fmt.allocPrint(sink.arena.asAllocator(), "unknown CLI option `{s}`", .{unknown_flag});
-    if (suggestGlobalFlag(unknown_flag)) |suggested_flag| {
+    if (suggestFlagForSubcommand(unknown_flag, subcommand)) |suggested_flag| {
         try sink.emit(.{
             .code = .e0001_unknown_cli_flag,
             .severity = .err,
@@ -316,6 +361,11 @@ pub fn suggestSubcommand(unknown_subcommand: []const u8) ?[]const u8 {
 
 /// Returns the closest global flag in `GLOBAL_FLAGS` within edit distance `<= 2`, or `null`.
 pub fn suggestGlobalFlag(unknown_flag: []const u8) ?[]const u8 {
+    return suggestFlagForSubcommand(unknown_flag, null);
+}
+
+/// Returns the closest global or subcommand-specific flag within edit distance `<= 2`, or `null`.
+pub fn suggestFlagForSubcommand(unknown_flag: []const u8, subcommand: ?SubcommandId) ?[]const u8 {
     const flag_name = if (std.mem.indexOfScalar(u8, unknown_flag, '=')) |eq_idx|
         unknown_flag[0..eq_idx]
     else
@@ -337,6 +387,15 @@ pub fn suggestGlobalFlag(unknown_flag: []const u8) ?[]const u8 {
             }
         }
     }
+    if (subcommand == .fmt) {
+        for (FMT_FLAGS) |fmt_desc| {
+            const fmt_dist = computeLevenshteinDistance(flag_name, fmt_desc.long_flag);
+            if (fmt_dist < best_distance) {
+                best_distance = fmt_dist;
+                best_match = fmt_desc.long_flag;
+            }
+        }
+    }
     return best_match;
 }
 
@@ -345,6 +404,8 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
     var color_mode: ColorMode = .auto;
     var has_help_flag = false;
     var has_version_flag = false;
+    var is_check_only = false;
+    var is_fix_mode = false;
     var selected_subcommand: ?SubcommandId = null;
     var positional_list: std.ArrayList([]const u8) = .empty;
     var is_after_double_dash = false;
@@ -362,6 +423,10 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                 has_help_flag = true;
             } else if (std.mem.eql(u8, arg_text, "-V") or std.mem.eql(u8, arg_text, "--version")) {
                 has_version_flag = true;
+            } else if (selected_subcommand == .fmt and std.mem.eql(u8, arg_text, "--check")) {
+                is_check_only = true;
+            } else if (selected_subcommand == .fmt and std.mem.eql(u8, arg_text, "--fix")) {
+                is_fix_mode = true;
             } else if (std.mem.startsWith(u8, arg_text, "--color=")) {
                 const raw_val = arg_text["--color=".len..];
                 if (ColorMode.parse(raw_val)) |parsed_mode| {
@@ -387,7 +452,7 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                     }
                 }
             } else {
-                try emitUnknownFlagDiagnostic(sink, arg_text);
+                try emitUnknownFlagDiagnostic(sink, arg_text, selected_subcommand);
             }
             continue;
         }
@@ -415,10 +480,14 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
     if (selected_subcommand) |sub_id| {
         return .{
             .color_mode = color_mode,
+            .is_check_only = is_check_only,
+            .is_fix_mode = is_fix_mode,
             .action = .{
                 .execute_subcommand = .{
                     .subcommand = sub_id,
                     .positional_args = positional_list.items,
+                    .is_check_only = is_check_only,
+                    .is_fix_mode = is_fix_mode,
                 },
             },
         };
@@ -534,6 +603,108 @@ pub fn runCli(
                 try bench_harness.runDefaultPhase0Suite(allocator, io, stdout_writer, stdout_style);
                 return 0;
             }
+            if (exec_info.subcommand == .fmt) {
+                var has_unformatted_or_error = false;
+                for (exec_info.positional_args) |file_arg| {
+                    const raw_source = std.Io.Dir.cwd().readFileAlloc(
+                        io,
+                        file_arg,
+                        allocator,
+                        .limited(vfs.MAX_SOURCE_FILE_BYTES),
+                    ) catch {
+                        try sink.emit(.{
+                            .code = .e0004_source_file_io_error,
+                            .severity = .err,
+                            .message = try std.fmt.allocPrint(
+                                sink.arena.asAllocator(),
+                                "failed to open or read source file `{s}`",
+                                .{file_arg},
+                            ),
+                        });
+                        continue;
+                    };
+                    defer allocator.free(raw_source);
+
+                    const file_id = try source_map.setOverlay(file_arg, raw_source, .root);
+                    _ = try source_map.getLineIndex(file_id);
+
+                    var fmt_res = try fmt_engine.formatSourceWithOptions(
+                        allocator,
+                        raw_source,
+                        file_id,
+                        .{ .is_fix_mode = exec_info.is_fix_mode },
+                    );
+                    defer fmt_res.deinit(allocator);
+
+                    if (fmt_res.has_syntax_errors) {
+                        has_unformatted_or_error = true;
+                        var err_msg_buf: [512]u8 = undefined;
+                        const err_msg = std.fmt.bufPrint(
+                            &err_msg_buf,
+                            "syntax errors in {s}",
+                            .{file_arg},
+                        ) catch file_arg;
+                        try stderr_style.writeStatusHeader(
+                            stderr_writer,
+                            .err,
+                            Glyphs.FAILURE,
+                            "fmt",
+                            err_msg,
+                        );
+                        try stderr_writer.writeByte('\n');
+                        continue;
+                    }
+
+                    if (fmt_res.is_changed) {
+                        if (exec_info.is_check_only) {
+                            has_unformatted_or_error = true;
+                            try stderr_style.writeStatusHeader(
+                                stderr_writer,
+                                .err,
+                                Glyphs.FAILURE,
+                                "fmt --check",
+                                file_arg,
+                            );
+                            try stderr_writer.writeByte('\n');
+                        } else {
+                            std.Io.Dir.cwd().writeFile(io, .{
+                                .sub_path = file_arg,
+                                .data = fmt_res.formatted_text,
+                            }) catch {
+                                try sink.emit(.{
+                                    .code = .e0004_source_file_io_error,
+                                    .severity = .err,
+                                    .message = try std.fmt.allocPrint(
+                                        sink.arena.asAllocator(),
+                                        "failed to write formatted source file `{s}`",
+                                        .{file_arg},
+                                    ),
+                                });
+                                continue;
+                            };
+                        }
+                    }
+                }
+                if (sink.hasErrors()) {
+                    try DiagnosticRenderer.init(&source_map, &interner, stderr_style).renderAll(
+                        stderr_writer,
+                        &sink,
+                    );
+                    return 1;
+                }
+                if (has_unformatted_or_error) {
+                    return 1;
+                }
+                try stdout_style.writeStatusHeader(
+                    stdout_writer,
+                    .success,
+                    Glyphs.SUCCESS,
+                    exec_info.subcommand.asName(),
+                    "CoreX source files formatted canonically",
+                );
+                try stdout_writer.writeByte('\n');
+                return 0;
+            }
             for (exec_info.positional_args) |file_arg| {
                 const file_id = source_map.resolveOrCreatePath(io, file_arg, .root) catch {
                     try sink.emit(.{
@@ -588,4 +759,20 @@ test "test_cli_router_subcommands_flags_and_typo_suggestions" {
     try std.testing.expectEqual(ColorMode.never, parsed.color_mode);
     try std.testing.expectEqual(SubcommandId.check, parsed.action.execute_subcommand.subcommand);
     try std.testing.expectEqual(@as(usize, 1), parsed.action.execute_subcommand.positional_args.len);
+
+    // `--check` and `--fix` are valid on `fmt`, and typo suggestions include `FMT_FLAGS`:
+    try std.testing.expectEqualStrings("--check", suggestFlagForSubcommand("--chck", .fmt).?);
+    try std.testing.expectEqualStrings("--fix", suggestFlagForSubcommand("--fx", .fmt).?);
+
+    const parsed_fmt = try parseArgs(&.{ "fmt", "--check", "--fix" }, &sink);
+    try std.testing.expect(!sink.hasErrors());
+    try std.testing.expect(parsed_fmt.is_check_only);
+    try std.testing.expect(parsed_fmt.is_fix_mode);
+
+    // Passing `--check` to a non-`fmt` subcommand emits `E0001`:
+    var err_sink = DiagnosticSink.init(std.testing.allocator);
+    defer err_sink.deinit();
+    const invalid_cmd = try parseArgs(&.{ "build", "--check" }, &err_sink);
+    try std.testing.expect(err_sink.hasErrors());
+    try std.testing.expectEqual(CommandAction.invalid, invalid_cmd.action);
 }

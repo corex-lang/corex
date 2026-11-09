@@ -1,0 +1,13 @@
+const MAX_RETRY_LIMIT: u32 = 10;
+
+pub struct FrameHeader {
+    pub payload_bytes: u32,
+}
+
+pub fn compute_frame_total(frame_header: FrameHeader) -> u32 {
+    let local_sum = frame_header.payload_bytes + MAX_RETRY_LIMIT;
+    if local_sum > 0 {
+        return local_sum;
+    }
+    return 0;
+}

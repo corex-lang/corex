@@ -295,3 +295,40 @@ test "test_drift_guard_phase2_cst_node_kind_ast_tag_and_parser_diagnostics" {
         DiagnosticCode.w0201_non_canonical_identifier_case.asCodeStr(),
     );
 }
+
+test "test_drift_guard_phase3_query_db_fmt_engine_and_cli_flags" {
+    // [1] Verify `QueryStage` 10-stage enum contiguity (`0..9`) and `query_db` layout parity:
+    const stage_values = std.enums.values(corex.QueryStage);
+    try std.testing.expectEqual(@as(usize, 10), stage_values.len);
+    inline for (stage_values, 0..) |stage_val, i| {
+        try std.testing.expectEqual(@as(u8, @intCast(i)), @backingInt(stage_val));
+    }
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(corex.Revision));
+    try std.testing.expectEqual(@as(usize, 1), @sizeOf(corex.Durability));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(corex.Fingerprint128));
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(corex.DefId));
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(corex.QueryKey));
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(corex.MemoHeader));
+
+    // [2] Verify `DocOp`, `GroupMode`, and 8-byte `DocInst` layout parity (`DR-14` Section 1.2):
+    const doc_op_values = std.enums.values(corex.DocOp);
+    try std.testing.expectEqual(@as(usize, 13), doc_op_values.len);
+    inline for (doc_op_values, 0..) |op_val, i| {
+        try std.testing.expectEqual(@as(u8, @intCast(i)), @backingInt(op_val));
+    }
+    const group_mode_values = std.enums.values(corex.GroupMode);
+    try std.testing.expectEqual(@as(usize, 3), group_mode_values.len);
+    inline for (group_mode_values, 0..) |mode_val, i| {
+        try std.testing.expectEqual(@as(u8, @intCast(i)), @backingInt(mode_val));
+    }
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(corex.DocInst));
+
+    // [3] Verify `FMT_FLAGS` (`--check`, `--fix`) parity in `stage0/src/cli/router.zig`:
+    try std.testing.expectEqual(@as(usize, 2), router.FMT_FLAGS.len);
+    try std.testing.expectEqualStrings("--check", router.FMT_FLAGS[0].long_flag);
+    try std.testing.expectEqualStrings("--fix", router.FMT_FLAGS[1].long_flag);
+    for (router.FMT_FLAGS, 0..) |fmt_flag, i| {
+        try std.testing.expectEqual(i, @as(usize, @backingInt(fmt_flag.id)));
+        try std.testing.expect(fmt_flag.summary.len > 0);
+    }
+}

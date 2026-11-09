@@ -1,0 +1,17 @@
+=== Revision 2 (Initial Build: stdlib=high, app=low) ===
+exec[parse_cst]=2 exec[lower_ast]=2 exec[item_tree]=2 exec[typecheck_body]=3 exec[verify_sast_mir]=3
+early_cutoffs=0 durability_fast_paths=0 green_hits=0
+foo: sig_changed=R2 body_changed=R2 sast_verified=R2
+bar: sig_changed=R2 body_changed=R2 sast_verified=R2
+
+=== Revision 3 (Comment & Whitespace Edit in app) ===
+exec[parse_cst]=3 exec[lower_ast]=3 exec[item_tree]=2 exec[typecheck_body]=3 exec[verify_sast_mir]=3
+early_cutoffs=1 durability_fast_paths=1 green_hits=13
+app.lower_ast: verified=R3 changed=R2 (backdated!)
+stdlib.sast: verified=R3 changed=R2 min_durability=high
+
+=== Revision 4 (Body Edit in foo + 50-Line Shift Before bar) ===
+exec[parse_cst]=4 exec[lower_ast]=4 exec[item_tree]=3 exec[typecheck_body]=4 exec[verify_sast_mir]=4
+early_cutoffs=5 durability_fast_paths=1 green_hits=17
+foo: sig_changed=R2 body_changed=R4 typed_changed=R4 sast_verified=R4
+bar: sig_changed=R2 body_changed=R2 typed_changed=R2 sast_verified=R4

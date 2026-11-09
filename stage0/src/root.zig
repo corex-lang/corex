@@ -21,6 +21,10 @@ pub const syntax_arenas = @import("syntax_arenas.zig");
 pub const lexer = @import("lexer.zig");
 /// Fault-tolerant recursive-descent + Pratt parser, lossless CST/AST builder, and incremental re-parser.
 pub const parser = @import("parser.zig");
+/// Demand-driven incremental query database (`CompilerDb`) with Early Cutoff and Durability.
+pub const query_db = @import("query_db.zig");
+/// Hybrid steerable Wadler-Lindig formatter (`corex fmt`), 8-byte `DocArena`, and `--fix` engine.
+pub const fmt_engine = @import("fmt_engine.zig");
 /// Monochrome Unicode glyph registry, `ColorMode`, and ANSI SGR styling helpers.
 pub const style = @import("cli/style.zig");
 /// Rounded Unicode card, aligned table, and 1/8th-block progress bar renderers.
@@ -144,6 +148,60 @@ pub const parseFile = parser.parseFile;
 /// Incrementally re-lexes and re-parses `new_source` after `edit`.
 pub const reparseIncremental = parser.reparseIncremental;
 
+// ------------------ Query Engine Re-Exports -------------------
+/// Monotonically increasing logical database revision clock.
+pub const Revision = query_db.Revision;
+/// Input stability classification (`low`, `medium`, `high`).
+pub const Durability = query_db.Durability;
+/// 128-bit structural or cryptographic content fingerprint.
+pub const Fingerprint128 = query_db.Fingerprint128;
+/// Streaming 128-bit dual-seed `Wyhash` structural hasher.
+pub const StructuralHasher = query_db.StructuralHasher;
+/// Packed 32-bit definition handle (`file_index` + `local_item_index`).
+pub const DefId = query_db.DefId;
+/// Canonical 10-stage demand-driven query pipeline stage enum.
+pub const QueryStage = query_db.QueryStage;
+/// Universal 8-byte key identifying a node in the `CompilerDb` dependency DAG.
+pub const QueryKey = query_db.QueryKey;
+/// 40-byte memoized query header.
+pub const MemoHeader = query_db.MemoHeader;
+/// Error set returned by demand-driven queries in `CompilerDb`.
+pub const QueryError = query_db.QueryError;
+/// Top-level declaration category tag in `ItemTree`.
+pub const ItemKind = query_db.ItemKind;
+/// Single top-level declaration entry in a file's `ItemTree`.
+pub const ItemTreeEntry = query_db.ItemTreeEntry;
+/// Position-independent top-level `ItemTree` firewall for a source file.
+pub const ItemTree = query_db.ItemTree;
+/// Position-independent relative body AST projection window for a `DefId`.
+pub const BodyAstWindow = query_db.BodyAstWindow;
+/// Demand-driven incremental query database (`DR-12` Section 3).
+pub const CompilerDb = query_db.CompilerDb;
+
+// ---------------- Formatter Engine Re-Exports -----------------
+/// Document algebra opcode discriminant (`1` byte inside `DocInst`).
+pub const DocOp = fmt_engine.DocOp;
+/// Group breaking policy (`auto_fit`, `force_break`, `columnar_grid`).
+pub const GroupMode = fmt_engine.GroupMode;
+/// Exact 8-byte Wadler-Lindig document algebra instruction.
+pub const DocInst = fmt_engine.DocInst;
+/// Open group stack frame for $O(1)$ `flat_width` backpatching.
+pub const OpenGroupFrame = fmt_engine.OpenGroupFrame;
+/// Contiguous arena of 8-byte `DocInst` instructions.
+pub const DocArena = fmt_engine.DocArena;
+/// Single-pass $O(N)$ linear document renderer.
+pub const DocRenderer = fmt_engine.DocRenderer;
+/// Configuration options controlling `corex fmt` and `corex fmt --fix`.
+pub const FormatOptions = fmt_engine.FormatOptions;
+/// Result returned by `formatSource`, `formatSourceWithOptions`, and `formatTokensAndCst`.
+pub const FormatResult = fmt_engine.FormatResult;
+/// Formats a pre-tokenized `TokenBuffer` and `LosslessCstArena` using `FormatOptions`.
+pub const formatTokensAndCst = fmt_engine.formatTokensAndCst;
+/// Tokenizes, parses, and formats `source` using `FormatOptions`.
+pub const formatSourceWithOptions = fmt_engine.formatSourceWithOptions;
+/// Tokenizes, parses, and formats `source` using default `FormatOptions`.
+pub const formatSource = fmt_engine.formatSource;
+
 // ---------------- Diagnostics & CLI Re-Exports ----------------
 /// Monochrome Unicode glyph registry.
 pub const Glyphs = style.Glyphs;
@@ -177,6 +235,8 @@ test "test_root_module_references_all_phase0_submodules" {
     _ = syntax_arenas;
     _ = lexer;
     _ = parser;
+    _ = query_db;
+    _ = fmt_engine;
     _ = style;
     _ = box_draw;
     _ = router;

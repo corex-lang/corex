@@ -1,0 +1,36 @@
+use std::io::{self, BufReader as Br, Read, Write};
+use core::mem;
+
+const MIN_PORT: u16 = 80;
+const MAX_PORT: u16 = 65535;
+
+pub struct Metric[T] {
+    pub val: T,
+}
+
+pub fn render_dashboard[T](opt_val: Option[T], raw_score: i32) -> View {
+    let .Some(item) = opt_val else {
+        return Empty;
+    };
+    let table = [
+          1,  20, 300,   4,  50, 600,   7,  80,
+        900,  10,
+    ];
+    let score = raw_score
+        |> compute_step()
+        |> clamp_score(0, 100);
+    let total = table
+        .iter()
+        .sum_all();
+    let broken_pt = Point {
+        x: score,
+        y: total,
+    };
+    let label = match score {
+        0 => "idle",
+        _ => "active",
+    };
+    Card(padding: 8) {
+        Text(value: label);
+    }
+}

@@ -1411,6 +1411,9 @@ pub const Parser = struct {
             .kw_trait => return self.parseTraitItem(item_cst, &has_error),
             .kw_impl => return self.parseImplItem(item_cst, &has_error),
             .kw_comptime => {
+                if (self.peekKindNth(1) != .lbrace) {
+                    return self.parseFunctionOrSubscriptItem(item_cst, &has_error);
+                }
                 self.cst.nodes.items(.kind)[item_cst.asInt()] = .block;
                 _ = try self.consumeLeaf(.token_leaf, .{});
                 const block_node = try self.parseBlock();
@@ -1418,6 +1421,14 @@ pub const Parser = struct {
                 return block_node;
             },
             .kw_async, .kw_unsafe, .kw_extern, .kw_fn => {
+                if (self.peekKind() == .kw_unsafe and self.peekKindNth(1) == .kw_impl) {
+                    _ = try self.consumeLeaf(.token_leaf, .{});
+                    return self.parseImplItem(item_cst, &has_error);
+                }
+                if (self.peekKind() == .kw_unsafe and self.peekKindNth(1) == .kw_trait) {
+                    _ = try self.consumeLeaf(.token_leaf, .{});
+                    return self.parseTraitItem(item_cst, &has_error);
+                }
                 return self.parseFunctionOrSubscriptItem(item_cst, &has_error);
             },
             .ident => {
@@ -2119,7 +2130,7 @@ pub const Parser = struct {
                 const member_node = switch (self.peekKind()) {
                     .kw_type => try self.parseTypeAliasItem(mem_cst, &has_mem_err),
                     .kw_const => try self.parseConstItem(mem_cst, &has_mem_err),
-                    .kw_async, .kw_unsafe, .kw_extern, .kw_fn => blk: {
+                    .kw_async, .kw_unsafe, .kw_extern, .kw_comptime, .kw_fn => blk: {
                         const fn_node = try self.parseFunctionOrSubscriptItem(mem_cst, &has_mem_err);
                         self.cst.nodes.items(.kind)[mem_cst.asInt()] = .trait_member;
                         break :blk fn_node;
@@ -2235,7 +2246,7 @@ pub const Parser = struct {
                 const member_node = switch (self.peekKind()) {
                     .kw_type => try self.parseTypeAliasItem(mem_cst, &has_mem_err),
                     .kw_const => try self.parseConstItem(mem_cst, &has_mem_err),
-                    .kw_async, .kw_unsafe, .kw_extern, .kw_fn => blk: {
+                    .kw_async, .kw_unsafe, .kw_extern, .kw_comptime, .kw_fn => blk: {
                         const fn_node = try self.parseFunctionOrSubscriptItem(mem_cst, &has_mem_err);
                         self.cst.nodes.items(.kind)[mem_cst.asInt()] = .impl_member;
                         break :blk fn_node;
@@ -2319,7 +2330,8 @@ pub const Parser = struct {
         self.cst.nodes.items(.kind)[item_cst.asInt()] = .fn_item;
         while (self.peekKind() == .kw_async or
             self.peekKind() == .kw_unsafe or
-            self.peekKind() == .kw_extern)
+            self.peekKind() == .kw_extern or
+            self.peekKind() == .kw_comptime)
         {
             const qual_kind = self.peekKind();
             _ = try self.consumeLeaf(.token_leaf, .{});

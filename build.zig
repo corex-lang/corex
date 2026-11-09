@@ -4,7 +4,7 @@
 //! `build/stage0/` and the standard `zig-out/bin/` prefix per `.agents/skills/build/SKILL.md`.
 //!
 //! Provides `zig build`, `zig build run`, `zig build test` (executing both internal module tests and
-//! `tests/test_runner.zig`), and `zig build bench` (executing `phase0_bench`, `phase1_bench`, and `phase2_bench`).
+//! `tests/test_runner.zig`), and `zig build bench` (executing `phase0_bench` through `phase3_bench`).
 
 const std = @import("std");
 
@@ -70,7 +70,7 @@ pub fn build(builder: *std.Build) void {
     });
     test_step.dependOn(&builder.addRunArtifact(external_tests).step);
 
-    // [5] Configure `zig build bench` (executing `phase0_bench`, `phase1_bench`, and `phase2_bench` in `.fast`):
+    // [5] Configure `zig build bench` (executing `phase0_bench`..`phase3_bench` in `.fast`):
     const bench_optimize: std.builtin.Optimize = if (optimize == .debug) .fast else optimize;
     const bench_corex_mod = builder.createModule(.{
         .root_source_file = builder.path("stage0/src/root.zig"),
@@ -121,15 +121,37 @@ pub fn build(builder: *std.Build) void {
     const run_bench2 = builder.addRunArtifact(bench2_exe);
     run_bench2.step.dependOn(&run_bench1.step);
 
-    const bench_step = builder.step("bench", "Run Phase 0, Phase 1, and Phase 2 statistical performance benchmarks");
+    const bench3_exe_mod = builder.createModule(.{
+        .root_source_file = builder.path("bench/suites/phase3_bench.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .imports = &.{
+            .{ .name = "corex", .module = bench_corex_mod },
+        },
+    });
+    const bench3_exe = builder.addExecutable(.{
+        .name = "phase3_bench",
+        .root_module = bench3_exe_mod,
+    });
+    const run_bench3 = builder.addRunArtifact(bench3_exe);
+    run_bench3.step.dependOn(&run_bench2.step);
+
+    const bench_step = builder.step(
+        "bench",
+        "Run Phase 0, Phase 1, Phase 2, and Phase 3 statistical performance benchmarks",
+    );
     bench_step.dependOn(&run_bench0.step);
     bench_step.dependOn(&run_bench1.step);
     bench_step.dependOn(&run_bench2.step);
+    bench_step.dependOn(&run_bench3.step);
 
     builder.step("bench-phase1", "Run Phase 1 lexer performance benchmarks").dependOn(
         &builder.addRunArtifact(bench1_exe).step,
     );
     builder.step("bench-phase2", "Run Phase 2 parser performance benchmarks").dependOn(
         &builder.addRunArtifact(bench2_exe).step,
+    );
+    builder.step("bench-phase3", "Run Phase 3 query engine & formatter performance benchmarks").dependOn(
+        &builder.addRunArtifact(bench3_exe).step,
     );
 }

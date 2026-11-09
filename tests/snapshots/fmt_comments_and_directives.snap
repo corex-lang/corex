@@ -1,0 +1,27 @@
+//! Module header doc comment
+// Leading comment on Point
+pub struct Point {
+    pub x: i32, // trailing comment on x
+    // leading comment on y
+    pub y: i32,
+}
+
+pub fn empty_containers(
+    // dangling comment in empty params
+) {
+    // dangling comment in empty block
+}
+
+pub fn empty_list_and_call() {
+    let arr = [
+        // dangling comment in empty array
+    ];
+    let res = call_fn(
+        // dangling comment in empty args
+    );
+}
+
+// corex fmt: off
+const   RAW_TABLE:   [i32; 4] = [ 1,   2,  3,    4 ];
+// corex fmt: on
+// Trailing EOF comment

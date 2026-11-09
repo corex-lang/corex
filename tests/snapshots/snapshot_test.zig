@@ -1,8 +1,9 @@
 //! Golden Snapshot Verification Suite (`tests/snapshots/snapshot_test.zig`)
 //!
 //! Compares rendered CLI help menus, single-line diagnostics, multi-line region diagnostics,
-//! cross-file stitched diagnostics, CLI typo diagnostics, lexer token/trivia streams, and parser
-//! CST/AST trees and diagnostics against golden `.snap` files.
+//! cross-file stitched diagnostics, CLI typo diagnostics, lexer token/trivia streams, parser
+//! CST/AST trees and diagnostics, `corex fmt` / `corex fmt --fix` formatting outputs, and
+//! `CompilerDb` Early Cutoff / `ItemTree` firewall reports against golden `.snap` files.
 //!
 //! Normalizes `CRLF` (`\r\n`) to `LF` (`\n`) when loading `.snap` files so snapshots match across OSes.
 
@@ -10,6 +11,7 @@ const std = @import("std");
 const corex = @import("corex");
 
 const router = corex.router;
+const fmt_engine = corex.fmt_engine;
 const FileId = corex.FileId;
 const TokenIndex = corex.TokenIndex;
 const CstNodeIndex = corex.CstNodeIndex;
@@ -22,6 +24,8 @@ const LosslessCstArena = corex.LosslessCstArena;
 const AstArena = corex.AstArena;
 const Lexer = corex.Lexer;
 const Parser = corex.Parser;
+const QueryKey = corex.QueryKey;
+const CompilerDb = corex.CompilerDb;
 const StyleConfig = corex.StyleConfig;
 const DiagnosticSink = corex.DiagnosticSink;
 const LabeledSpan = corex.LabeledSpan;
@@ -485,6 +489,279 @@ test "test_snapshot_diag_parser_errors_e0201_to_e0203" {
         std.testing.allocator,
         std.testing.io,
         "tests/snapshots/diag_parser_errors.snap",
+        out_writer.buffered(),
+    );
+}
+
+test "test_snapshot_fmt_showcases" {
+    const sample_source =
+        "use std::io::{Write, self, Read, BufReader as Br};\n" ++
+        "use core::mem;\n" ++
+        "const MIN_PORT: u16 = 80;\n" ++
+        "const MAX_PORT: u16 = 65535;\n" ++
+        "pub struct Metric[T] {\n" ++
+        "    pub val: T,\n" ++
+        "}\n" ++
+        "pub fn render_dashboard[T](opt_val: Option[T], raw_score: i32) -> View {\n" ++
+        "    let .Some(item) = opt_val else {\n" ++
+        "        return Empty;\n" ++
+        "    };\n" ++
+        "    let table = [\n" ++
+        "        1, 20, 300, 4, 50, 600, 7, 80, 900, 10,\n" ++
+        "    ];\n" ++
+        "    let score = raw_score\n" ++
+        "        |> compute_step()\n" ++
+        "        |> clamp_score(0, 100);\n" ++
+        "    let total = table\n" ++
+        "        .iter()\n" ++
+        "        .sum_all();\n" ++
+        "    let broken_pt = Point {\n" ++
+        "        x: score,\n" ++
+        "        y: total,\n" ++
+        "    };\n" ++
+        "    let label = match (score) {\n" ++
+        "        0 => \"idle\",\n" ++
+        "        _ => \"active\",\n" ++
+        "    };\n" ++
+        "    Card(padding: 8) {\n" ++
+        "        Text(value: label);\n" ++
+        "    }\n" ++
+        "}\n";
+
+    var fmt_res = try fmt_engine.formatSource(std.testing.allocator, sample_source, FileId.fromInt(0));
+    defer fmt_res.deinit(std.testing.allocator);
+
+    try expectMatchesSnapshotFile(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/snapshots/fmt_showcases.snap",
+        fmt_res.formatted_text,
+    );
+}
+
+test "test_snapshot_fmt_comments_and_directives" {
+    const sample_source =
+        "//! Module header doc comment\n" ++
+        "// Leading comment on Point\n" ++
+        "pub struct Point {\n" ++
+        "    pub x: i32; // trailing comment on x\n" ++
+        "    // leading comment on y\n" ++
+        "    pub y: i32\n" ++
+        "}\n" ++
+        "pub fn empty_containers(\n" ++
+        "    // dangling comment in empty params\n" ++
+        ") {\n" ++
+        "    // dangling comment in empty block\n" ++
+        "}\n" ++
+        "pub fn empty_list_and_call() {\n" ++
+        "    let arr = [\n" ++
+        "        // dangling comment in empty array\n" ++
+        "    ];\n" ++
+        "    let res = call_fn(\n" ++
+        "        // dangling comment in empty args\n" ++
+        "    );\n" ++
+        "}\n" ++
+        "// corex fmt: off\n" ++
+        "const   RAW_TABLE:   [i32; 4] = [ 1,   2,  3,    4 ];\n" ++
+        "// corex fmt: on\n" ++
+        "// Trailing EOF comment\n";
+
+    var fmt_res = try fmt_engine.formatSource(std.testing.allocator, sample_source, FileId.fromInt(0));
+    defer fmt_res.deinit(std.testing.allocator);
+
+    try expectMatchesSnapshotFile(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/snapshots/fmt_comments_and_directives.snap",
+        fmt_res.formatted_text,
+    );
+}
+
+test "test_snapshot_fmt_fix_normalization" {
+    const unfixed_source =
+        "const max_retry_limit: u32 = 10\n" ++
+        "pub struct frame_header {\n" ++
+        "    pub PayloadBytes: u32,\n" ++
+        "}\n" ++
+        "pub fn ComputeFrameTotal(frame_header: frame_header) -> u32 {\n" ++
+        "    ;\n" ++
+        "    let LocalSum = frame_header.PayloadBytes + max_retry_limit\n" ++
+        "    if (LocalSum > 0) {\n" ++
+        "        return LocalSum\n" ++
+        "    };\n" ++
+        "    return 0\n" ++
+        "}\n";
+
+    var fmt_res = try fmt_engine.formatSourceWithOptions(
+        std.testing.allocator,
+        unfixed_source,
+        FileId.fromInt(0),
+        .{ .is_fix_mode = true },
+    );
+    defer fmt_res.deinit(std.testing.allocator);
+
+    try expectMatchesSnapshotFile(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/snapshots/fmt_fix_normalization.snap",
+        fmt_res.formatted_text,
+    );
+}
+
+test "test_snapshot_query_db_early_cutoff" {
+    var db = try CompilerDb.init(std.testing.allocator);
+    defer db.deinit();
+
+    const stdlib_file = FileId.fromInt(1);
+    const app_file = FileId.fromInt(2);
+
+    _ = try db.setInput(
+        stdlib_file,
+        "pub fn clamp_val(val: i32) -> i32 { return val; }\n",
+        .high,
+    );
+    const app_v1 =
+        "pub fn foo(val: i32) -> i32 {\n    return val + 1;\n}\n" ++
+        "pub fn bar(val: i32) -> i32 {\n    return val * 2;\n}\n";
+    const rev_init = try db.setInput(app_file, app_v1, .low);
+
+    const stdlib_def = (try db.extractItemTree(stdlib_file)).entries[0].def_id;
+    const app_tree_v1 = try db.extractItemTree(app_file);
+    const def_foo = app_tree_v1.entries[0].def_id;
+    const def_bar = app_tree_v1.entries[1].def_id;
+
+    _ = try db.verifySastMir(stdlib_def);
+    _ = try db.verifySastMir(def_foo);
+    _ = try db.verifySastMir(def_bar);
+
+    var out_buf: [4096]u8 = undefined;
+    var out_writer = std.Io.Writer.fixed(&out_buf);
+
+    try out_writer.print(
+        "=== Revision {d} (Initial Build: stdlib=high, app=low) ===\n",
+        .{rev_init.asInt()},
+    );
+    try out_writer.print(
+        "exec[parse_cst]={d} exec[lower_ast]={d} exec[item_tree]={d} exec[typecheck_body]={d} exec[verify_sast_mir]={d}\n",
+        .{
+            db.telemetry.countExecutions(.parse_cst),
+            db.telemetry.countExecutions(.lower_ast),
+            db.telemetry.countExecutions(.item_tree),
+            db.telemetry.countExecutions(.typecheck_body),
+            db.telemetry.countExecutions(.verify_sast_mir),
+        },
+    );
+    try out_writer.print(
+        "early_cutoffs={d} durability_fast_paths={d} green_hits={d}\n",
+        .{ db.telemetry.early_cutoff_hits, db.telemetry.durability_fast_path_hits, db.telemetry.green_hits },
+    );
+    try out_writer.print(
+        "foo: sig_changed=R{d} body_changed=R{d} sast_verified=R{d}\n",
+        .{
+            db.getMemoHeader(QueryKey.forDef(.def_signature, def_foo)).?.changed_at.asInt(),
+            db.getMemoHeader(QueryKey.forDef(.body_ast_proj, def_foo)).?.changed_at.asInt(),
+            db.getMemoHeader(QueryKey.forDef(.verify_sast_mir, def_foo)).?.verified_at.asInt(),
+        },
+    );
+    try out_writer.print(
+        "bar: sig_changed=R{d} body_changed=R{d} sast_verified=R{d}\n\n",
+        .{
+            db.getMemoHeader(QueryKey.forDef(.def_signature, def_bar)).?.changed_at.asInt(),
+            db.getMemoHeader(QueryKey.forDef(.body_ast_proj, def_bar)).?.changed_at.asInt(),
+            db.getMemoHeader(QueryKey.forDef(.verify_sast_mir, def_bar)).?.verified_at.asInt(),
+        },
+    );
+
+    // Revision 3: Comment & whitespace edit in `app_file`:
+    const app_v2 =
+        "// Header comment\npub fn foo(   val: i32 ) -> i32 {\n    // inner\n    return val + 1;\n}\n" ++
+        "pub fn bar(val: i32) -> i32 {\n    return val * 2;\n}\n";
+    const rev_comment = try db.setInput(app_file, app_v2, .low);
+    _ = try db.verifySastMir(stdlib_def);
+    _ = try db.verifySastMir(def_foo);
+    _ = try db.verifySastMir(def_bar);
+
+    const lower_memo = db.getMemoHeader(QueryKey.forFile(.lower_ast, app_file)).?;
+    const stdlib_memo = db.getMemoHeader(QueryKey.forDef(.verify_sast_mir, stdlib_def)).?;
+    try out_writer.print(
+        "=== Revision {d} (Comment & Whitespace Edit in app) ===\n",
+        .{rev_comment.asInt()},
+    );
+    try out_writer.print(
+        "exec[parse_cst]={d} exec[lower_ast]={d} exec[item_tree]={d} exec[typecheck_body]={d} exec[verify_sast_mir]={d}\n",
+        .{
+            db.telemetry.countExecutions(.parse_cst),
+            db.telemetry.countExecutions(.lower_ast),
+            db.telemetry.countExecutions(.item_tree),
+            db.telemetry.countExecutions(.typecheck_body),
+            db.telemetry.countExecutions(.verify_sast_mir),
+        },
+    );
+    try out_writer.print(
+        "early_cutoffs={d} durability_fast_paths={d} green_hits={d}\n",
+        .{ db.telemetry.early_cutoff_hits, db.telemetry.durability_fast_path_hits, db.telemetry.green_hits },
+    );
+    try out_writer.print(
+        "app.lower_ast: verified=R{d} changed=R{d} (backdated!)\n",
+        .{ lower_memo.verified_at.asInt(), lower_memo.changed_at.asInt() },
+    );
+    try out_writer.print(
+        "stdlib.sast: verified=R{d} changed=R{d} min_durability={s}\n\n",
+        .{ stdlib_memo.verified_at.asInt(), stdlib_memo.changed_at.asInt(), @tagName(stdlib_memo.min_durability) },
+    );
+
+    // Revision 4: Body edit in `foo` + 50-line shift before `bar`:
+    const fifty_lines: *const [50]u8 = &@splat('\n');
+    const app_v3 =
+        "pub fn foo(val: i32) -> i32 {\n    let shifted = val + 99;\n" ++
+        fifty_lines ++
+        "    return shifted;\n}\n" ++
+        "pub fn bar(val: i32) -> i32 {\n    return val * 2;\n}\n";
+    const rev_body = try db.setInput(app_file, app_v3, .low);
+    _ = try db.verifySastMir(def_bar);
+    _ = try db.verifySastMir(def_foo);
+
+    try out_writer.print(
+        "=== Revision {d} (Body Edit in foo + 50-Line Shift Before bar) ===\n",
+        .{rev_body.asInt()},
+    );
+    try out_writer.print(
+        "exec[parse_cst]={d} exec[lower_ast]={d} exec[item_tree]={d} exec[typecheck_body]={d} exec[verify_sast_mir]={d}\n",
+        .{
+            db.telemetry.countExecutions(.parse_cst),
+            db.telemetry.countExecutions(.lower_ast),
+            db.telemetry.countExecutions(.item_tree),
+            db.telemetry.countExecutions(.typecheck_body),
+            db.telemetry.countExecutions(.verify_sast_mir),
+        },
+    );
+    try out_writer.print(
+        "early_cutoffs={d} durability_fast_paths={d} green_hits={d}\n",
+        .{ db.telemetry.early_cutoff_hits, db.telemetry.durability_fast_path_hits, db.telemetry.green_hits },
+    );
+    try out_writer.print(
+        "foo: sig_changed=R{d} body_changed=R{d} typed_changed=R{d} sast_verified=R{d}\n",
+        .{
+            db.getMemoHeader(QueryKey.forDef(.def_signature, def_foo)).?.changed_at.asInt(),
+            db.getMemoHeader(QueryKey.forDef(.body_ast_proj, def_foo)).?.changed_at.asInt(),
+            db.getMemoHeader(QueryKey.forDef(.typecheck_body, def_foo)).?.changed_at.asInt(),
+            db.getMemoHeader(QueryKey.forDef(.verify_sast_mir, def_foo)).?.verified_at.asInt(),
+        },
+    );
+    try out_writer.print(
+        "bar: sig_changed=R{d} body_changed=R{d} typed_changed=R{d} sast_verified=R{d}\n",
+        .{
+            db.getMemoHeader(QueryKey.forDef(.def_signature, def_bar)).?.changed_at.asInt(),
+            db.getMemoHeader(QueryKey.forDef(.body_ast_proj, def_bar)).?.changed_at.asInt(),
+            db.getMemoHeader(QueryKey.forDef(.typecheck_body, def_bar)).?.changed_at.asInt(),
+            db.getMemoHeader(QueryKey.forDef(.verify_sast_mir, def_bar)).?.verified_at.asInt(),
+        },
+    );
+
+    try expectMatchesSnapshotFile(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/snapshots/query_db_early_cutoff.snap",
         out_writer.buffered(),
     );
 }
