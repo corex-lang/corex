@@ -1,0 +1,12 @@
+✗ error[E0401]: mismatched types in call to `connect`
+  ╭─▸ src/app/main.cx:3:13
+  │
+3 │     connect("8080");
+  │             ^^^^^^ expected `u16`, found `str`
+  │
+  ├─▸ src/net/http.cx:1:16
+  │
+1 │ pub fn connect(port: u16) {
+  │                ───────── parameter `port` declared here
+  │
+  ╰─▸ help: pass an integer literal such as `8080`

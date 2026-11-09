@@ -1,0 +1,2 @@
+✗ error[E0001]: unknown CLI option `--hlp`
+  ╰─▸ help: did you mean `--help`?

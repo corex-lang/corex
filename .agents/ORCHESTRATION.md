@@ -65,7 +65,7 @@ Never accept a subagent's output blindly: verify its claims, run the full valida
 
 ---
 
-## Current Active Assignment: Execute Phase 0 Only
+## Current Active Assignment: Execute Phase 1 Only
 
 All 15 Research Decision Gates (`RDG-01`–`RDG-15`) are now resolved and committed in `docs/research/DR-01.md` through `docs/research/DR-15.md`.
 

@@ -83,13 +83,13 @@ In accordance with `AGENTS.md` Section 5, all terminal rendering and compiler di
 
 ```text
 ✗ error[E0302]: use of moved value `buffer` after scope transfer
-  ╭─▸ src/net/socket.cx:42:18
-  │
+   ╭─▸ src/net/socket.cx:42:18
+   │
 40 │     let packet = consume_payload(buffer)
    │                                  ────── value moved here
 41 │     log_status("dispatched")
 42 │     return read_header(buffer)
    │                        ^^^^^^ value used here after transfer
-  │
-  ╰─▸ help: pass a borrowed view via `buffer.as_slice()` if `consume_payload` does not retain ownership
+   │
+   ╰─▸ help: pass a borrowed view via `buffer.as_slice()` if `consume_payload` does not retain ownership
 ```

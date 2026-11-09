@@ -1,0 +1,10 @@
+✗ error[E0306]: value escapes lexical arena or stack region
+  ╭─▸ src/mem/region.cx:2:5
+  │
+2 │ ╭─▸     region scratch {
+3 │ │           let buf = scratch.alloc(64);
+4 │ │           return buf.as_slice();
+5 │ │       }
+  │ ╰───────^ region `scratch` ends here before returned slice is consumed
+  │
+  ╰─▸ help: allocate in caller-provided arena or return an owned container

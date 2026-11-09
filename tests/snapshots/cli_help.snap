@@ -1,0 +1,19 @@
+╭─ corex 0.1.0-dev ─────────────────────────────────────────╮
+│ A streamlined, zero-GC, statically typed systems language │
+│ Usage: corex [OPTIONS] <COMMAND> [ARGS]…                  │
+╰───────────────────────────────────────────────────────────╯
+
+Commands:
+  ▸ build     Compile a CoreX package or source file into a native or WebAssembly artifact
+  ▸ run       Compile and immediately execute a CoreX binary
+  ▸ check     Run fast syntax, type, region, and SAST verification without codegen
+  ▸ test      Compile and execute unit, snapshot, and safety verification suites
+  ▸ fmt       Format CoreX source files canonically using the lossless CST
+  ▸ upgrade   Apply automated AST/CST migrations and machine-applicable fixes
+  ▸ lsp       Start the CoreX Language Server Protocol (LSP) daemon over stdio
+  ▸ bench     Run statistical performance benchmarks and emit monochrome report tables
+
+Global Options:
+  -h, --help          Display this help menu or subcommand documentation
+  -V, --version       Display the CoreX toolchain version
+      --color=<when>  Configure terminal ANSI color output (default: auto)
