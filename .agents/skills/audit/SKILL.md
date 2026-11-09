@@ -41,7 +41,7 @@ Use this skill to execute a systematic quality, soundness, performance, and stan
 -   Verify all rules in **`AGENTS.md` Section 6**:
     -   Canonical section order (`TYPES`, `CONSTS`, `INTERNALS`, `PUBLIC API`, `MAIN`) with exact 90-char / 65-char separators.
     -   Zero single-letter variable names (except `i`, `j`, `n`, `x`, `y`, `z`).
-    -   Strict `is_`/`has_`, `as_…`, `to_…`, `extract_…`, and `resolve_path` naming.
+    -   Strict `is_…`/`has_…`, `as_…`, `to_…`, `extract_…`, and `resolve_path` naming in `.cx` (and corresponding `camelCase` `is…`/`has…`, `as…`, `to…`, `extract…`, and `resolvePath` in Stage 0 Zig).
     -   Zero single-use temporary variables; condition-scoped bindings inlined.
 
 ### D. CLI Aesthetics, Documentation & Comments

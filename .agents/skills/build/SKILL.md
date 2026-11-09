@@ -19,7 +19,7 @@ Before packaging or running release builds, always run the full validation suite
 
 The CoreX build system supports both the initial bootstrap compiler (Stage 0) and the self-hosted `.cx` compiler (Stages 1–2):
 
-1.  **Stage 0 (Bootstrap Compiler):** Built from the host systems language source tree into `build/stage0/corex` (or `corex.exe` on Windows) with maximum compiler warnings treated as errors (`-Wall -Wextra -Werror` / strict lint profiles).
+1.  **Stage 0 (Bootstrap Compiler):** Built from the Stage 0 Zig source tree (`stage0/`, configured via `build.zig` with unified binary name `corex`) into `build/stage0/corex` (or `build/stage0/corex.exe` on Windows) with strict Zig compiler checks and zero warnings; `zig build test` executes all Stage 0 unit, snapshot, and drift-guard suites.
 2.  **Stage 1 (First Self-Hosted Build):** Built by invoking `build/stage0/corex build` on the self-hosted compiler source tree (`compiler/*.cx`), producing `build/stage1/corex`.
 3.  **Stage 2 (Reproducibility Verification Build):** Built by invoking `build/stage1/corex build` on the identical `compiler/*.cx` source tree, producing `build/stage2/corex`.
 

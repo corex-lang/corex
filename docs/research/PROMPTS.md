@@ -6,23 +6,23 @@ This catalog contains the 15 self-contained, copy-pasteable `Deep research` prom
 
 ## Research Report Index & Execution Waves
 
-| Report ID   | Gate ID      | Target Report Path       | Wave   | Files to Attach in Chat                  | Blocking Phase   | Subsystem / Architectural Scope                                                        |
-| ----------- | ------------ | ------------------------ | ------ | ---------------------------------------- | ---------------- | -------------------------------------------------------------------------------------- |
-| **`DR-01`** | **`RDG-01`** | `docs/research/DR-01.md` | Wave 1 | *None (Completed)*                       | Phase 0          | Bootstrap Implementation Language & Self-Hosting Strategy                              |
-| **`DR-02`** | **`RDG-02`** | `docs/research/DR-02.md` | Wave 1 | *None (Completed)*                       | Phase 2          | Programming Paradigm & Execution Semantics                                             |
-| **`DR-03`** | **`RDG-03`** | `docs/research/DR-03.md` | Wave 1 | *None (Completed)*                       | Phase 1 / 2      | Ergonomic Syntax, Delimiter Design & Naming Conventions                                |
-| **`DR-04`** | **`RDG-04`** | `docs/research/DR-04.md` | Wave 2 | `DR-01`, `DR-02`, `DR-03`                | Phase 4          | Static Type System, Constrained Type Groups & Zero-Overhead Inference                  |
-| **`DR-05`** | **`RDG-05`** | `docs/research/DR-05.md` | Wave 2 | `DR-01`, `DR-02`, `DR-03`                | Phase 5          | Compile-Time Execution (`comptime`) & Metaprogramming Architecture                     |
-| **`DR-06`** | **`RDG-06`** | `docs/research/DR-06.md` | Wave 2 | `DR-01`, `DR-02`, `DR-03`                | Phase 6          | Zero-GC Automatic Memory Management, Manual Control & SAST Verifier                    |
-| **`DR-07`** | **`RDG-07`** | `docs/research/DR-07.md` | Wave 2 | `DR-01`, `DR-02`, `DR-03`                | Phase 4 / 6      | Error Handling Model & Zero-Cost Propagation Semantics                                 |
-| **`DR-12`** | **`RDG-12`** | `docs/research/DR-12.md` | Wave 2 | `DR-01`, `DR-02`, `DR-03`                | Phase 2 / 3 / 10 | Incremental Query Engine, Fault-Tolerant Lossless CST & Built-in LSP                   |
-| **`DR-13`** | **`RDG-13`** | `docs/research/DR-13.md` | Wave 2 | `DR-01`, `DR-02`, `DR-03`                | Phase 5          | Intermediate Representations (`HIR` & SSA `MIR`) & Optimization Pipeline               |
-| **`DR-08`** | **`RDG-08`** | `docs/research/DR-08.md` | Wave 3 | `DR-01`–`DR-03`, `DR-06`, `DR-07`        | Phase 8 / 11     | Concurrency, Async/Structured Execution & High-Throughput I/O Model                    |
-| **`DR-09`** | **`RDG-09`** | `docs/research/DR-09.md` | Wave 3 | `DR-01`–`DR-03`, `DR-06`, `DR-13`        | Phase 7          | Dual-Mode Compiler Backend Architecture (Instant Dev vs. Production AOT)               |
-| **`DR-10`** | **`RDG-10`** | `docs/research/DR-10.md` | Wave 3 | `DR-01`–`DR-03`, `DR-06`, `DR-07`, `DR-13` | Phase 8        | Cross-Compilation, Zero-Dependency Linking, C FFI & WebAssembly (`wasm32`)             |
-| **`DR-11`** | **`RDG-11`** | `docs/research/DR-11.md` | Wave 3 | `DR-01`, `DR-02`, `DR-03`                | Phase 9          | Package Manager, URL/Registry Resolution, Global Cache & Lockfiles                     |
-| **`DR-14`** | **`RDG-14`** | `docs/research/DR-14.md` | Wave 3 | `DR-01`–`DR-03`, `DR-12`                 | Phase 3 / 10     | Zero-Legacy AST Migration Engine (`corex upgrade`) & Canonical Formatter (`corex fmt`) |
-| **`DR-15`** | **`RDG-15`** | `docs/research/DR-15.md` | Wave 3 | `DR-02`–`DR-08`                          | Phase 11         | Stage-2 `.cx` Standard Library, TUI/CLI & Unified WebAssembly/Native UI Architecture   |
+| Report ID   | Gate ID      | Target Report Path       | Wave   | Files to Attach in Chat                    | Blocking Phase   | Subsystem / Architectural Scope                                                        |
+| ----------- | ------------ | ------------------------ | ------ | ------------------------------------------ | ---------------- | -------------------------------------------------------------------------------------- |
+| **`DR-01`** | **`RDG-01`** | `docs/research/DR-01.md` | Wave 1 | *None (Completed)*                         | Phase 0          | Bootstrap Implementation Language & Self-Hosting Strategy                              |
+| **`DR-02`** | **`RDG-02`** | `docs/research/DR-02.md` | Wave 1 | *None (Completed)*                         | Phase 2          | Programming Paradigm & Execution Semantics                                             |
+| **`DR-03`** | **`RDG-03`** | `docs/research/DR-03.md` | Wave 1 | *None (Completed)*                         | Phase 1 / 2      | Ergonomic Syntax, Delimiter Design & Naming Conventions                                |
+| **`DR-04`** | **`RDG-04`** | `docs/research/DR-04.md` | Wave 2 | `DR-01`, `DR-02`, `DR-03`                  | Phase 4          | Static Type System, Constrained Type Groups & Zero-Overhead Inference                  |
+| **`DR-05`** | **`RDG-05`** | `docs/research/DR-05.md` | Wave 2 | `DR-01`, `DR-02`, `DR-03`                  | Phase 5          | Compile-Time Execution (`comptime`) & Metaprogramming Architecture                     |
+| **`DR-06`** | **`RDG-06`** | `docs/research/DR-06.md` | Wave 2 | `DR-01`, `DR-02`, `DR-03`                  | Phase 6          | Zero-GC Automatic Memory Management, Manual Control & SAST Verifier                    |
+| **`DR-07`** | **`RDG-07`** | `docs/research/DR-07.md` | Wave 2 | `DR-01`, `DR-02`, `DR-03`                  | Phase 4 / 6      | Error Handling Model & Zero-Cost Propagation Semantics                                 |
+| **`DR-12`** | **`RDG-12`** | `docs/research/DR-12.md` | Wave 2 | `DR-01`, `DR-02`, `DR-03`                  | Phase 2 / 3 / 10 | Incremental Query Engine, Fault-Tolerant Lossless CST & Built-in LSP                   |
+| **`DR-13`** | **`RDG-13`** | `docs/research/DR-13.md` | Wave 2 | `DR-01`, `DR-02`, `DR-03`                  | Phase 5          | Intermediate Representations (`HIR` & SSA `MIR`) & Optimization Pipeline               |
+| **`DR-08`** | **`RDG-08`** | `docs/research/DR-08.md` | Wave 3 | `DR-01`–`DR-03`, `DR-06`, `DR-07`          | Phase 8 / 11     | Concurrency, Async/Structured Execution & High-Throughput I/O Model                    |
+| **`DR-09`** | **`RDG-09`** | `docs/research/DR-09.md` | Wave 3 | `DR-01`–`DR-03`, `DR-06`, `DR-13`          | Phase 7          | Dual-Mode Compiler Backend Architecture (Instant Dev vs. Production AOT)               |
+| **`DR-10`** | **`RDG-10`** | `docs/research/DR-10.md` | Wave 3 | `DR-01`–`DR-03`, `DR-06`, `DR-07`, `DR-13` | Phase 8          | Cross-Compilation, Zero-Dependency Linking, C FFI & WebAssembly (`wasm32`)             |
+| **`DR-11`** | **`RDG-11`** | `docs/research/DR-11.md` | Wave 3 | `DR-01`, `DR-02`, `DR-03`                  | Phase 9          | Package Manager, URL/Registry Resolution, Global Cache & Lockfiles                     |
+| **`DR-14`** | **`RDG-14`** | `docs/research/DR-14.md` | Wave 3 | `DR-01`–`DR-03`, `DR-12`                   | Phase 3 / 10     | Zero-Legacy AST Migration Engine (`corex upgrade`) & Canonical Formatter (`corex fmt`) |
+| **`DR-15`** | **`RDG-15`** | `docs/research/DR-15.md` | Wave 3 | `DR-02`–`DR-08`                            | Phase 11         | Stage-2 `.cx` Standard Library, TUI/CLI & Unified WebAssembly/Native UI Architecture   |
 
 ---
 
@@ -70,7 +70,7 @@ Primary target workloads include:
 - High-throughput, low-latency web backends and APIs.
 - Snappy, lightweight web applications (`wasm32`) and native GUI apps without needing a separate frontend language.
 
-I am open to any programming paradigm—imperative, functional, expression-oriented, data-oriented (DOD), value-oriented (mutable value semantics like Hylo/Swift), or a novel hybrid—provided it maximizes **developer ergonomics, flat learning curve, compile-time safety, and C-level execution speed**.
+I am open to any programming paradigm – imperative, functional, expression-oriented, data-oriented (DOD), value-oriented (mutable value semantics like Hylo/Swift), or a novel hybrid – provided it maximizes **developer ergonomics, flat learning curve, compile-time safety, and C-level execution speed**.
 
 ## Research Objectives
 1. **Paradigm Comparative Analysis:** Evaluate pure imperative/procedural (C, Odin, Go), expression-oriented algebraic/imperative hybrids (Rust, Zig, Kotlin), functional-first systems models (OCaml/Flambda, Roc, Koka), Data-Oriented Design (DOD / SoA-first), and Mutable Value Semantics (Hylo) against CoreX's goals.
@@ -205,7 +205,7 @@ CoreX (`.cx`) aims to shift as much computation, configuration validation, seria
 ## Context & Vision
 CoreX's memory management has three strict requirements:
 1. **No Runtime Tracing Garbage Collector:** Deterministic C-level speed and minimal memory footprint.
-2. **Automatic Default with Compile-Time Safety:** Everyday coding must feel effortless—memory allocation and deallocation are handled automatically by the compiler by default **without forcing Rust-style lifetime annotation gymnastics (`<'a, 'b>`) on the developer**.
+2. **Automatic Default with Compile-Time Safety:** Everyday coding must feel effortless – memory allocation and deallocation are handled automatically by the compiler by default **without forcing Rust-style lifetime annotation gymnastics (`<'a, 'b>`) on the developer**.
 3. **Optional Manual Control + Built-In Static Vulnerability Analysis (SAST):** Power users can take explicit manual control over memory allocation, arenas, and raw layout when needed. To prevent manual or hybrid memory management from introducing C-style bugs, the compiler includes a built-in static analysis engine (SAST) and lifetime/ownership verifier on `MIR` that checks memory operations at compile time and emits crystal-clear errors/warnings for potential vulnerabilities (**use-after-free, double-free, memory leaks, dangling stack/arena escapes, uninitialized reads, and buffer overflows**).
 
 ## Research Objectives
@@ -240,7 +240,7 @@ CoreX's memory management has three strict requirements:
 > - **`DR-03.md` (Authoritative for Surface Syntax):** Square-bracket generics (`Result[T, E]`), postfix `?` propagation (`File::open(path)?`), postfix `T?` option sugar (`Option[T]`), `let .Some(x) = expr else { return ... };` guards, and contextual `.Ok(v)` / `.Err(e)` / `.Some(v)` / `.None` variant shorthand.
 
 ## Context & Vision
-CoreX (`.cx`) needs the cleanest, highest-performance error handling mechanism possible—one that makes error handling effortless and readable, guarantees compile-time exhaustiveness, and introduces **zero hidden control flow and zero runtime overhead** (no C++ DWARF stack-unwinding exceptions or heap-allocated stack traces on normal error paths).
+CoreX (`.cx`) needs the cleanest, highest-performance error handling mechanism possible – one that makes error handling effortless and readable, guarantees compile-time exhaustiveness, and introduces **zero hidden control flow and zero runtime overhead** (no C++ DWARF stack-unwinding exceptions or heap-allocated stack traces on normal error paths).
 
 ## Research Objectives
 1. **Reconciling `DR-02` and `DR-03` into a Unified Error Syntax & Type Representation:**
@@ -340,7 +340,7 @@ CoreX requires a **Dual-Mode Compilation Pipeline**:
 > - **`DR-06.md`, `DR-07.md`, & `DR-13.md`:** Zero-GC memory/SAST boundary checks, register-level error ABI, and `MIR` representation.
 
 ## Context & Vision
-CoreX must effortlessly cross-compile from any host machine (Windows, Linux, macOS) to all major targets (`x86_64` and `aarch64` Linux, macOS, Windows, and `wasm32`) out of the box—without forcing the user to install gigabytes of platform SDKs, Xcode, or Visual Studio build tools. Users must be able to choose between compiling a **single standalone static executable** or **dynamically linked binaries/libraries**, and call **C libraries (FFI)** with zero overhead.
+CoreX must effortlessly cross-compile from any host machine (Windows, Linux, macOS) to all major targets (`x86_64` and `aarch64` Linux, macOS, Windows, and `wasm32`) out of the box – without forcing the user to install gigabytes of platform SDKs, Xcode, or Visual Studio build tools. Users must be able to choose between compiling a **single standalone static executable** or **dynamically linked binaries/libraries**, and call **C libraries (FFI)** with zero overhead.
 
 ## Research Objectives
 1. **Out-of-the-Box Cross-Compilation & Embedded `lld` Linker Architecture:**
@@ -415,7 +415,7 @@ CoreX packages a built-in Language Server (`corex lsp`), linter (`corex check`),
 ## Research Objectives
 1. **Lossless Contiguous CST (`LosslessCstArena`) & Typed AST (`AstArena`) Architecture:**
    - Build upon `DR-01` Section 2.2 (Carbon-style flat postorder/bracketed SoA parse tree with explicit parser state stack, `MAX_PARSE_DEPTH = 512`) and `DR-03`'s 92-token grammar.
-   - Specify how 100% of source bytes—including comments, blank lines, whitespace trivia, and malformed tokens—are represented losslessly alongside the SoA `TokenBuffer` so `corex fmt`, `corex upgrade`, and `corex lsp` round-trip any `.cx` file bit-for-bit without heap-pointer tree overhead.
+   - Specify how 100% of source bytes – including comments, blank lines, whitespace trivia, and malformed tokens – are represented losslessly alongside the SoA `TokenBuffer` so `corex fmt`, `corex upgrade`, and `corex lsp` round-trip any `.cx` file bit-for-bit without heap-pointer tree overhead.
 2. **Fault-Tolerant Parsing & Bidirectional Type Recovery for Incomplete Code:**
    - Specify exact synchronization anchor sets for `DR-03`'s grammar (recovering cleanly at `;`, `{`, `}`, and top-level item starters `pub`, `fn`, `struct`, `enum`, `trait`, `impl`, `let`, `var`).
    - Specify how placeholder `Error` nodes propagate through `DR-02`'s bidirectional type checker (`Type::Error` unifying silently without cascading secondary errors) so autocomplete (`user.`) and signature help (`repo.find(`) work accurately while code is broken mid-keystroke.
