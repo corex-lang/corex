@@ -26,23 +26,23 @@ flowchart TD
     CST --> TOOLING["Unified Tooling Engine: corex fmt, corex upgrade (RDG-14), corex lsp (RDG-12)"]
 ```
 
-| Gate ID      | Research Specification Report                                   | Blocking Phase   | Modular Boundary / Interface Governed                                                                         |
-| ------------ | --------------------------------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------- |
-| **`RDG-01`** | [`docs/research/DR-01.md`](docs/research/DR-01.md)              | Phase 0          | Bootstrap implementation language, build scripts, arena allocator primitives, self-hosting seed strategy      |
-| **`RDG-02`** | [`docs/research/DR-02.md`](docs/research/DR-02.md)              | Phase 2          | Programming paradigm, expression vs. statement semantics, mutability defaults, data composition model         |
-| **`RDG-03`** | [`docs/research/DR-03.md`](docs/research/DR-03.md)              | Phase 1 / 2      | Ergonomic syntax, `TokenKind` table, block/generic delimiters, grammar production rules, casing rules         |
-| **`RDG-04`** | [`docs/research/DR-04.md`](docs/research/DR-04.md)              | Phase 4          | `TypeArena`, bidirectional constraint solver, constrained type groups (`Number`), variance rules              |
-| **`RDG-05`** | [`docs/research/DR-05.md`](docs/research/DR-05.md)              | Phase 5          | `MirInterpreter` / `comptime` evaluator, type-level evaluation, compile-time reflection hooks                 |
-| **`RDG-06`** | [`docs/research/DR-06.md`](docs/research/DR-06.md)              | Phase 6          | Zero-GC automatic scope cleanup, interprocedural escape/alias inference, manual allocators, `MIR` SAST engine |
-| **`RDG-07`** | [`docs/research/DR-07.md`](docs/research/DR-07.md)              | Phase 4 / 6      | Zero-overhead error union representation, register/flag ABI lowering, exhaustiveness diagnostics              |
-| **`RDG-08`** | [`docs/research/DR-08.md`](docs/research/DR-08.md)              | Phase 8 / 11     | Structured concurrency, coroutine/task lowering, data-race verification, OS I/O completion reactor            |
-| **`RDG-09`** | [`docs/research/DR-09.md`](docs/research/DR-09.md)              | Phase 7          | `CodegenBackend` trait, instant `--dev` machine-code emitter/JIT, optimizing `--release` AOT pass pipeline    |
+| Gate ID      | Research Specification Report                                   | Blocking Phase   | Modular Boundary / Interface Governed                                                                          |
+| ------------ | --------------------------------------------------------------- | ---------------- | -------------------------------------------------------------------------------------------------------------- |
+| **`RDG-01`** | [`docs/research/DR-01.md`](docs/research/DR-01.md)              | Phase 0          | Bootstrap implementation language, build scripts, arena allocator primitives, self-hosting seed strategy       |
+| **`RDG-02`** | [`docs/research/DR-02.md`](docs/research/DR-02.md)              | Phase 2          | Programming paradigm, expression vs. statement semantics, mutability defaults, data composition model          |
+| **`RDG-03`** | [`docs/research/DR-03.md`](docs/research/DR-03.md)              | Phase 1 / 2      | Ergonomic syntax, `TokenKind` table, block/generic delimiters, grammar production rules, casing rules          |
+| **`RDG-04`** | [`docs/research/DR-04.md`](docs/research/DR-04.md)              | Phase 4          | `TypeArena`, bidirectional constraint solver, constrained type groups (`Number`), variance rules               |
+| **`RDG-05`** | [`docs/research/DR-05.md`](docs/research/DR-05.md)              | Phase 5          | `MirInterpreter` / `comptime` evaluator, type-level evaluation, compile-time reflection hooks                  |
+| **`RDG-06`** | [`docs/research/DR-06.md`](docs/research/DR-06.md)              | Phase 6          | Zero-GC automatic scope cleanup, interprocedural escape/alias inference, manual allocators, `MIR` SAST engine  |
+| **`RDG-07`** | [`docs/research/DR-07.md`](docs/research/DR-07.md)              | Phase 4 / 6      | Zero-overhead error union representation, register/flag ABI lowering, exhaustiveness diagnostics               |
+| **`RDG-08`** | [`docs/research/DR-08.md`](docs/research/DR-08.md)              | Phase 8 / 11     | Structured concurrency, coroutine/task lowering, data-race verification, OS I/O completion reactor             |
+| **`RDG-09`** | [`docs/research/DR-09.md`](docs/research/DR-09.md)              | Phase 7          | `CodegenBackend` trait, instant `--dev` machine-code emitter/JIT, optimizing `--release` AOT pass pipeline     |
 | **`RDG-10`** | [`docs/research/DR-10.md`](docs/research/DR-10.md)              | Phase 8          | Cross-compilation target descriptors, standalone static/dynamic linking, C FFI ABI marshaler, `wasm32` emitter |
-| **`RDG-11`** | [`docs/research/DR-11.md`](docs/research/DR-11.md)              | Phase 9          | Zero-friction URL/registry imports, content-addressable store (`~/.corex/cache`), `corex.lock` schema         |
+| **`RDG-11`** | [`docs/research/DR-11.md`](docs/research/DR-11.md)              | Phase 9          | Zero-friction URL/registry imports, content-addressable store (`~/.corex/cache`), `corex.lock` schema          |
 | **`RDG-12`** | [`docs/research/DR-12.md`](docs/research/DR-12.md)              | Phase 2 / 3 / 10 | Fault-tolerant lossless CST, incremental query database (`CompilerDb`), early-cutoff invalidation, `corex lsp` |
-| **`RDG-13`** | [`docs/research/DR-13.md`](docs/research/DR-13.md)              | Phase 5          | Desugared `HIR` nodes, basic-block SSA `MIR` with place projections, SROA/inlining/DCE/monomorphization       |
-| **`RDG-14`** | [`docs/research/DR-14.md`](docs/research/DR-14.md)              | Phase 3 / 10     | Canonical CST pretty-printer (`corex fmt`), zero-legacy automated spec migration engine (`corex upgrade`)     |
-| **`RDG-15`** | [`docs/research/DR-15.md`](docs/research/DR-15.md)              | Phase 11         | Stage-2 `.cx` standard library (`std::cli`, `std::tui`, `std::fs`, `std::net`, `std::http`, `std::ui`)        |
+| **`RDG-13`** | [`docs/research/DR-13.md`](docs/research/DR-13.md)              | Phase 5          | Desugared `HIR` nodes, basic-block SSA `MIR` with place projections, SROA/inlining/DCE/monomorphization        |
+| **`RDG-14`** | [`docs/research/DR-14.md`](docs/research/DR-14.md)              | Phase 3 / 10     | Canonical CST pretty-printer (`corex fmt`), zero-legacy automated spec migration engine (`corex upgrade`)      |
+| **`RDG-15`** | [`docs/research/DR-15.md`](docs/research/DR-15.md)              | Phase 11         | Stage-2 `.cx` standard library (`std::cli`, `std::tui`, `std::fs`, `std::net`, `std::http`, `std::ui`)         |
 
 ---
 

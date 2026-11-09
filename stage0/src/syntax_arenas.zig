@@ -967,6 +967,51 @@ pub const MAX_AST_NODES: usize = 8 * 1024 * 1024;
 
 // -------------------------------------- INTERNALS --------------------------------------
 
+/// Appends up to 15 `TriviaPiece` items from `pieces` into `dest`, coalescing overflow across all 15 slots.
+fn appendTriviaSliceCoalesced(
+    allocator: std.mem.Allocator,
+    dest: *std.ArrayList(TriviaPiece),
+    pieces: []const TriviaPiece,
+) !u4 {
+    if (pieces.len == 0) return 0;
+    const max_slots: usize = std.math.maxInt(u4);
+    const max_piece_bytes: usize = std.math.maxInt(u16);
+    if (pieces.len <= max_slots) {
+        try dest.appendSlice(allocator, pieces);
+        return @intCast(pieces.len);
+    }
+
+    var slots: [max_slots]TriviaPiece = pieces[0..max_slots].*;
+    for (pieces[max_slots..]) |extra_piece| {
+        var remaining: usize = extra_piece.byte_len;
+        while (remaining > 0) {
+            const slot14_room: usize = max_piece_bytes - slots[max_slots - 1].byte_len;
+            if (slot14_room > 0) {
+                const added: u16 = @intCast(@min(remaining, slot14_room));
+                slots[max_slots - 1].byte_len += added;
+                remaining -= added;
+                continue;
+            }
+            // Ripple capacity from earlier under-full slots `0..14` toward slot 14:
+            var has_transferred = false;
+            var i: usize = 0;
+            while (i + 1 < max_slots) : (i += 1) {
+                const room_in_curr: usize = max_piece_bytes - slots[i].byte_len;
+                if (room_in_curr == 0 or slots[i + 1].byte_len == 0) continue;
+                const shift_bytes: u16 = @intCast(@min(room_in_curr, @as(usize, slots[i + 1].byte_len)));
+                slots[i].byte_len += shift_bytes;
+                slots[i + 1].byte_offset += shift_bytes;
+                slots[i + 1].byte_len -= shift_bytes;
+                has_transferred = true;
+            }
+            if (!has_transferred) break;
+        }
+    }
+
+    try dest.appendSlice(allocator, &slots);
+    return std.math.maxInt(u4);
+}
+
 comptime {
     std.debug.assert(@typeInfo(TokenKind).@"enum".field_names.len == 112);
     std.debug.assert(@sizeOf(TokenKind) == 1);
@@ -1033,16 +1078,12 @@ pub const TokenBuffer = struct {
         const trivia_start: u24 = @intCast(self.trivia.items.len);
         errdefer self.trivia.shrinkRetainingCapacity(trivia_start);
 
-        if (clamped_leading > 0) {
-            try self.trivia.appendSlice(self.allocator, leading_trivia[0..clamped_leading]);
-        }
-        if (clamped_trailing > 0) {
-            try self.trivia.appendSlice(self.allocator, trailing_trivia[0..clamped_trailing]);
-        }
+        const leading_count = try appendTriviaSliceCoalesced(self.allocator, &self.trivia, leading_trivia);
+        const trailing_count = try appendTriviaSliceCoalesced(self.allocator, &self.trivia, trailing_trivia);
 
         var merged_flags = flags;
-        if (clamped_leading > 0) merged_flags.has_leading_trivia_pieces = true;
-        if (clamped_trailing > 0) merged_flags.has_trailing_trivia = true;
+        if (leading_count > 0) merged_flags.has_leading_trivia_pieces = true;
+        if (trailing_count > 0) merged_flags.has_trailing_trivia = true;
 
         const token_index = TokenIndex.fromInt(@intCast(self.tokens.len));
         try self.tokens.append(self.allocator, .{
@@ -1052,8 +1093,8 @@ pub const TokenBuffer = struct {
             .byte_offset = byte_offset,
             .trivia_span = .{
                 .start_index = trivia_start,
-                .leading_count = @intCast(clamped_leading),
-                .trailing_count = @intCast(clamped_trailing),
+                .leading_count = leading_count,
+                .trailing_count = trailing_count,
             },
         });
         return token_index;
@@ -1451,4 +1492,63 @@ test "test_cst_parse_depth_cap_and_ast_arena_extra_data" {
     try std.testing.expectEqual(AstTag.expr_hole, ast_arena.getNode(hole_node).tag);
     try std.testing.expectEqual(CstNodeIndex.fromInt(2), ast_arena.getCstOrigin(hole_node));
     try std.testing.expectEqualSlices(u32, &child_indices, ast_arena.getExtraSlice(extra_start, 3));
+}
+
+test "test_append_token_coalesces_overflow_trivia_into_slot_14" {
+    const source_code = " \t \t \t \t \t \t \t \t \t \treturn";
+    var token_buf = TokenBuffer.init(std.testing.allocator);
+    defer token_buf.deinit();
+
+    var leading_pieces: [20]TriviaPiece = undefined;
+    for (&leading_pieces, 0..) |*piece, i| {
+        piece.* = .{
+            .kind = if (i % 2 == 0) .spaces else .tabs,
+            .byte_offset = @intCast(i),
+            .byte_len = 1,
+        };
+    }
+
+    const tok_ret = try token_buf.appendToken(.kw_return, .{}, 20, 6, &leading_pieces, &.{});
+    const stored_leading = token_buf.getLeadingTrivia(tok_ret);
+    try std.testing.expectEqual(@as(usize, 15), stored_leading.len);
+    try std.testing.expectEqual(@as(u32, 14), stored_leading[14].byte_offset);
+    try std.testing.expectEqual(@as(u16, 6), stored_leading[14].byte_len);
+
+    var cst_arena = LosslessCstArena.init(std.testing.allocator);
+    defer cst_arena.deinit();
+    const reconstructed = try cst_arena.reconstructSource(std.testing.allocator, source_code, &token_buf);
+    defer std.testing.allocator.free(reconstructed);
+    try std.testing.expectEqualStrings(source_code, reconstructed);
+
+    // Also verify > 15 pieces where pieces[14..] exceed 65,535 bytes ripple into earlier slots:
+    const large_len: usize = 14 + 40_000 + 40_000;
+    const large_buf = try std.testing.allocator.alloc(u8, large_len);
+    defer std.testing.allocator.free(large_buf);
+    @memset(large_buf, ' ');
+
+    var large_token_buf = TokenBuffer.init(std.testing.allocator);
+    defer large_token_buf.deinit();
+
+    var large_pieces: [16]TriviaPiece = undefined;
+    var cur_offset: u32 = 0;
+    for (0..14) |slot_idx| {
+        large_pieces[slot_idx] = .{
+            .kind = .spaces,
+            .byte_offset = cur_offset,
+            .byte_len = 1,
+        };
+        cur_offset += 1;
+    }
+    large_pieces[14] = .{ .kind = .spaces, .byte_offset = cur_offset, .byte_len = 40_000 };
+    cur_offset += 40_000;
+    large_pieces[15] = .{ .kind = .spaces, .byte_offset = cur_offset, .byte_len = 40_000 };
+
+    _ = try large_token_buf.appendToken(.eof, .{}, @intCast(large_len), 0, &large_pieces, &.{});
+    const reconstructed_large = try cst_arena.reconstructSource(
+        std.testing.allocator,
+        large_buf,
+        &large_token_buf,
+    );
+    defer std.testing.allocator.free(reconstructed_large);
+    try std.testing.expectEqualSlices(u8, large_buf, reconstructed_large);
 }

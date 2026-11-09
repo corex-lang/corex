@@ -17,6 +17,8 @@ pub const mem_foundation = @import("mem_foundation.zig");
 pub const vfs_sourcemap = @import("vfs_sourcemap.zig");
 /// Lossless CST, `TokenBuffer`, `TriviaPiece`, and `AstArena` (`AstStore`) syntax tables.
 pub const syntax_arenas = @import("syntax_arenas.zig");
+/// Deterministic maximal-munch UTF-8 lexer, `TriviaAccumulator`, and identifier casing helpers.
+pub const lexer = @import("lexer.zig");
 /// Monochrome Unicode glyph registry, `ColorMode`, and ANSI SGR styling helpers.
 pub const style = @import("cli/style.zig");
 /// Rounded Unicode card, aligned table, and 1/8th-block progress bar renderers.
@@ -99,6 +101,28 @@ pub const LosslessCstArena = syntax_arenas.LosslessCstArena;
 pub const AstArena = syntax_arenas.AstArena;
 /// Alias for `AstArena`.
 pub const AstStore = syntax_arenas.AstStore;
+/// Canonical CoreX orthographic identifier casing category.
+pub const IdentifierCase = lexer.IdentifierCase;
+/// Disjoint identifier or keyword classification result.
+pub const IdentifierClassification = lexer.IdentifierClassification;
+/// Configurable resource caps and warning toggles for `Lexer`.
+pub const LexerOptions = lexer.LexerOptions;
+/// Deterministic maximal-munch UTF-8 lexer.
+pub const Lexer = lexer.Lexer;
+/// Single-pass UTF-8 tokenizer entry point.
+pub const tokenize = lexer.tokenize;
+/// Canonical alias for `tokenize`.
+pub const lexFile = lexer.lexFile;
+/// Looks up a lexeme in the 45-keyword + 19-primitive-type table.
+pub const lookupKeywordOrPrim = lexer.lookupKeywordOrPrim;
+/// Classifies an identifier or keyword under the `DR-03` disjoint casing invariant.
+pub const classifyIdentifierOrKeyword = lexer.classifyIdentifierOrKeyword;
+/// Converts an identifier to canonical `snake_case`.
+pub const toSnakeCase = lexer.toSnakeCase;
+/// Converts an identifier to canonical `PascalCase`.
+pub const toPascalCase = lexer.toPascalCase;
+/// Converts an identifier to canonical `SCREAMING_SNAKE_CASE`.
+pub const toScreamingSnakeCase = lexer.toScreamingSnakeCase;
 
 // ---------------- Diagnostics & CLI Re-Exports ----------------
 /// Monochrome Unicode glyph registry.
@@ -131,6 +155,7 @@ test "test_root_module_references_all_phase0_submodules" {
     _ = mem_foundation;
     _ = vfs_sourcemap;
     _ = syntax_arenas;
+    _ = lexer;
     _ = style;
     _ = box_draw;
     _ = router;

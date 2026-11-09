@@ -1,0 +1,43 @@
+⚠︎ warning[W0201]: identifier does not follow canonical CoreX casing
+  ╭─▸ src/lexer/warnings.cx:1:5
+  │
+1 │ let badCamel = "hello \'world";
+  │     ^^^^^^^^ value/function identifiers must use `snake_case`
+  │
+  ├╴ help: convert identifier to canonical CoreX casing
+1 - let badCamel = "hello \'world";
+1 + let bad_camel = "hello \'world";
+  ╰───────
+
+⚠︎ warning[W0101]: redundant character escape sequence in literal
+  ╭─▸ src/lexer/warnings.cx:1:23
+  │
+1 │ let badCamel = "hello \'world";
+  │                       ^^ unnecessary backslash escape; character stands for itself
+  │
+  ├╴ help: remove redundant backslash escape
+1 - let badCamel = "hello \'world";
+1 + let badCamel = "hello 'world";
+  ╰───────
+
+⚠︎ warning[W0201]: identifier does not follow canonical CoreX casing
+  ╭─▸ src/lexer/warnings.cx:2:8
+  │
+2 │ struct Bad_Type {}
+  │        ^^^^^^^^ type/variant identifiers must use `PascalCase` without underscores
+  │
+  ├╴ help: convert identifier to canonical CoreX casing
+2 - struct Bad_Type {}
+2 + struct BadType {}
+  ╰───────
+
+⚠︎ warning[W0201]: identifier does not follow canonical CoreX casing
+  ╭─▸ src/lexer/warnings.cx:3:7
+  │
+3 │ const MAX__LIMIT: u32 = 10;
+  │       ^^^^^^^^^^ constant identifiers must use `SCREAMING_SNAKE_CASE`
+  │
+  ├╴ help: convert identifier to canonical CoreX casing
+3 - const MAX__LIMIT: u32 = 10;
+3 + const MAX_LIMIT: u32 = 10;
+  ╰───────

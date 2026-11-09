@@ -4,7 +4,7 @@
 //! `build/stage0/` and the standard `zig-out/bin/` prefix per `.agents/skills/build/SKILL.md`.
 //!
 //! Provides `zig build`, `zig build run`, `zig build test` (executing both internal module tests and
-//! `tests/test_runner.zig`), and `zig build bench` (executing `bench/suites/phase0_bench.zig`).
+//! `tests/test_runner.zig`), and `zig build bench` (executing `phase0_bench` and `phase1_bench`).
 
 const std = @import("std");
 
@@ -70,14 +70,14 @@ pub fn build(builder: *std.Build) void {
     });
     test_step.dependOn(&builder.addRunArtifact(external_tests).step);
 
-    // [5] Configure `zig build bench` (executing `bench/suites/phase0_bench.zig` in `.fast`):
+    // [5] Configure `zig build bench` (executing `phase0_bench` and `phase1_bench` in `.fast`):
     const bench_optimize: std.builtin.Optimize = if (optimize == .debug) .fast else optimize;
     const bench_corex_mod = builder.createModule(.{
         .root_source_file = builder.path("stage0/src/root.zig"),
         .target = target,
         .optimize = bench_optimize,
     });
-    const bench_exe_mod = builder.createModule(.{
+    const bench0_exe_mod = builder.createModule(.{
         .root_source_file = builder.path("bench/suites/phase0_bench.zig"),
         .target = target,
         .optimize = bench_optimize,
@@ -85,11 +85,31 @@ pub fn build(builder: *std.Build) void {
             .{ .name = "corex", .module = bench_corex_mod },
         },
     });
-    const bench_exe = builder.addExecutable(.{
+    const bench0_exe = builder.addExecutable(.{
         .name = "phase0_bench",
-        .root_module = bench_exe_mod,
+        .root_module = bench0_exe_mod,
     });
-    builder.step("bench", "Run Phase 0 statistical performance benchmarks").dependOn(
-        &builder.addRunArtifact(bench_exe).step,
-    );
+    const run_bench0 = builder.addRunArtifact(bench0_exe);
+
+    const bench1_exe_mod = builder.createModule(.{
+        .root_source_file = builder.path("bench/suites/phase1_bench.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .imports = &.{
+            .{ .name = "corex", .module = bench_corex_mod },
+        },
+    });
+    const bench1_exe = builder.addExecutable(.{
+        .name = "phase1_bench",
+        .root_module = bench1_exe_mod,
+    });
+    const run_bench1 = builder.addRunArtifact(bench1_exe);
+    run_bench1.step.dependOn(&run_bench0.step);
+
+    const bench_step = builder.step("bench", "Run Phase 0 and Phase 1 statistical performance benchmarks");
+    bench_step.dependOn(&run_bench0.step);
+    bench_step.dependOn(&run_bench1.step);
+
+    const bench_phase1_step = builder.step("bench-phase1", "Run Phase 1 lexer performance benchmarks");
+    bench_phase1_step.dependOn(&builder.addRunArtifact(bench1_exe).step);
 }

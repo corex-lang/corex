@@ -12,6 +12,8 @@ const corex = @import("corex");
 const style = corex.style;
 const router = corex.router;
 const diagnostic = corex.diagnostic;
+const lexer = corex.lexer;
+const TokenKind = corex.TokenKind;
 const StyleConfig = corex.StyleConfig;
 
 // --------------------------------------- CONSTS ----------------------------------------
@@ -201,4 +203,38 @@ test "test_drift_guard_zig_files_column_150_and_section_dividers" {
         try walkZigDirectoryFormatting(std.testing.allocator, std.testing.io, dir_name);
     }
     try checkZigFileFormattingAndDividers(std.testing.allocator, std.testing.io, "build.zig");
+}
+
+test "test_drift_guard_phase1_token_kind_contiguity_and_keyword_table" {
+    const token_enum_info = @typeInfo(TokenKind).@"enum";
+    const token_values = std.enums.values(TokenKind);
+    try std.testing.expectEqual(@as(usize, 112), token_enum_info.field_names.len);
+    try std.testing.expectEqual(@as(usize, 112), token_values.len);
+
+    inline for (token_values, 0..) |tok_val, i| {
+        try std.testing.expectEqual(@as(u8, @intCast(i)), @backingInt(tok_val));
+        try std.testing.expectEqual(tok_val, @as(TokenKind, @enumFromInt(@as(u8, @intCast(i)))));
+        try std.testing.expectEqualStrings(token_enum_info.field_names[i], @tagName(tok_val));
+    }
+
+    const keys = lexer.KEYWORD_OR_PRIM_MAP.keys();
+    const values = lexer.KEYWORD_OR_PRIM_MAP.values();
+    try std.testing.expectEqual(@as(usize, 64), keys.len);
+
+    var keyword_seen: [45]bool = @splat(false);
+    var prim_count: usize = 0;
+    for (values) |kind_val| {
+        const backing = @backingInt(kind_val);
+        if (backing < 45) {
+            try std.testing.expect(!keyword_seen[backing]);
+            keyword_seen[backing] = true;
+        } else {
+            try std.testing.expectEqual(TokenKind.prim_type, kind_val);
+            prim_count += 1;
+        }
+    }
+    for (keyword_seen) |was_seen| {
+        try std.testing.expect(was_seen);
+    }
+    try std.testing.expectEqual(@as(usize, 19), prim_count);
 }

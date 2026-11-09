@@ -1,0 +1,32 @@
+✗ error[E0101]: malformed hexadecimal escape sequence `\xHH`
+  ╭─▸ src/lexer/errors.cx:1:16
+  │
+1 │ let bad_esc = "\xGG";
+  │                ^^^^ expected exactly two hexadecimal digits `[0-9a-fA-F]` after `\x`
+  │
+  ╰───────
+
+✗ error[E0102]: character literal may only contain a single Unicode scalar value
+  ╭─▸ src/lexer/errors.cx:2:15
+  │
+2 │ let bad_chr = 'ab';
+  │               ^^^^ expected a single character or escape sequence enclosed in `'…'`
+  │
+  ╰───────
+
+✗ error[E0103]: malformed numeric literal
+  ╭─▸ src/lexer/errors.cx:3:15
+  │
+3 │ let bad_num = 0x_1F;
+  │               ^^^^^ invalid digits, radix prefix, `_` separator placement, or trailing suffix
+  │
+  ╰───────
+
+✗ error[E0104]: source file token count exceeds maximum token limit
+  ╭─▸ src/lexer/errors.cx:4:1
+  │
+4 │ ╭─▸ let overflow = 99;
+5 │ │   
+  │ ╰───^ remaining source bytes preserved as unparsed tail trivia
+  │
+  ╰───────
