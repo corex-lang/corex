@@ -765,3 +765,55 @@ test "test_snapshot_query_db_early_cutoff" {
         out_writer.buffered(),
     );
 }
+
+test "test_snapshot_diag_phase4_type_errors" {
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var source_map = VfsSourceMap.init(std.testing.allocator, &interner);
+    defer source_map.deinit(std.testing.io);
+
+    const phase4_err_src =
+        "pub type UserId = distinct u64;\n" ++
+        "pub type SystemPort = u16 is 1..=1024;\n" ++
+        "pub fn add_same(lhs: Number, rhs: Number) -> Number {\n" ++
+        "    return lhs + rhs;\n" ++
+        "}\n" ++
+        "pub fn check_errors(\n" ++
+        "    packet_length: i32,\n" ++
+        "    other_val: i64,\n" ++
+        "    user_id: UserId,\n" ++
+        "    raw_id: u64,\n" ++
+        "    opt_byte: u8?,\n" ++
+        ") -> SystemPort {\n" ++
+        "    let _typo = packet_lenght + 1;\n" ++
+        "    let _conflict = add_same(packet_length, other_val);\n" ++
+        "    let _mixed = user_id + raw_id;\n" ++
+        "    let _missing = match opt_byte {\n" ++
+        "        .Some(val) => val,\n" ++
+        "    };\n" ++
+        "    return 8080;\n" ++
+        "}\n";
+
+    const file_id = try source_map.setOverlay(
+        "src\\typecheck\\phase4_errors.cx",
+        phase4_err_src,
+        .root,
+    );
+    var tc_res = try corex.typecheckSource(std.testing.allocator, file_id, phase4_err_src);
+    defer tc_res.deinit();
+
+    var out_buf: [16384]u8 = undefined;
+    var out_writer = std.Io.Writer.fixed(&out_buf);
+    try DiagnosticRenderer.init(
+        &source_map,
+        &interner,
+        StyleConfig.MONOCHROME,
+    ).renderAll(&out_writer, &tc_res.diagnostics);
+
+    try expectMatchesSnapshotFile(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/snapshots/diag_phase4_type_errors.snap",
+        out_writer.buffered(),
+    );
+}

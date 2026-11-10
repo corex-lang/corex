@@ -1,0 +1,40 @@
+✗ error[E0403]: unresolved symbol `packet_lenght` in this scope
+   ╭─▸ src/typecheck/phase4_errors.cx:13:17
+   │
+13 │     let _typo = packet_lenght + 1;
+   │                 ^^^^^^^^^^^^^ not found in this scope; did you mean `packet_length`?
+   │
+   ├╴ help: replace with `packet_length`
+   ╰───────
+
+✗ error[E0404]: Bind-Once Type Group `Number` bound to conflicting types `i32` and `i64` (use `any Number` for independent parameters)
+   ╭─▸ src/typecheck/phase4_errors.cx:14:45
+   │
+14 │     let _conflict = add_same(packet_length, other_val);
+   │                                             ^^^^^^^^^ expected same concrete type as previous Bind-Once parameter
+   │
+   ╰───────
+
+✗ error[E0405]: cannot mix `distinct` type `UserId` with `u64` without an explicit `as` cast
+   ╭─▸ src/typecheck/phase4_errors.cx:15:26
+   │
+15 │     let _mixed = user_id + raw_id;
+   │                          ^ `distinct` newtypes do not implicitly convert to or from their underlying type
+   │
+   ╰───────
+
+✗ error[E0415]: non-exhaustive `match`; variant `.None` is not covered
+   ╭─▸ src/typecheck/phase4_errors.cx:16:20
+   │
+16 │     let _missing = match opt_byte {
+   │                    ^^^^^ handle all enum/Result/Option variants or add a `_` wildcard arm
+   │
+   ╰───────
+
+✗ error[E0406]: value `8080` violates refinement type `SystemPort (1..=1024)` (expected `1..=1024`)
+   ╭─▸ src/typecheck/phase4_errors.cx:19:12
+   │
+19 │     return 8080;
+   │            ^^^^ value outside refined range `low..=high`
+   │
+   ╰───────

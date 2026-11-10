@@ -25,6 +25,10 @@ pub const parser = @import("parser.zig");
 pub const query_db = @import("query_db.zig");
 /// Hybrid steerable Wadler-Lindig formatter (`corex fmt`), 8-byte `DocArena`, and `--fix` engine.
 pub const fmt_engine = @import("fmt_engine.zig");
+/// Module & lexical scope name resolution, `SymbolTable`, `ScopeArena`, and Levenshtein typo engine.
+pub const symbol_resolver = @import("symbol_resolver.zig");
+/// Canonical 14-byte SoA `TypeNode` `InternPool` (`TypeArena`), Constrained Type Groups, and bidirectional type checker.
+pub const type_system = @import("type_system.zig");
 /// Monochrome Unicode glyph registry, `ColorMode`, and ANSI SGR styling helpers.
 pub const style = @import("cli/style.zig");
 /// Rounded Unicode card, aligned table, and 1/8th-block progress bar renderers.
@@ -202,6 +206,58 @@ pub const formatSourceWithOptions = fmt_engine.formatSourceWithOptions;
 /// Tokenizes, parses, and formats `source` using default `FormatOptions`.
 pub const formatSource = fmt_engine.formatSource;
 
+// --------- Symbol Resolution & Type System Re-Exports ---------
+/// Disjoint symbol namespace (`type_ns`, `value_ns`, `const_ns`).
+pub const Namespace = symbol_resolver.Namespace;
+/// 3-bit namespace lookup filter mask.
+pub const NamespaceMask = symbol_resolver.NamespaceMask;
+/// Lexical or module scope kind tag.
+pub const ScopeKind = symbol_resolver.ScopeKind;
+/// Contiguous Structure-of-Arrays lexical and module scope arena.
+pub const ScopeArena = symbol_resolver.ScopeArena;
+/// Strongly typed 32-bit index into `SymbolTable.symbols`.
+pub const SymbolIndex = symbol_resolver.SymbolIndex;
+/// Item visibility tier across module boundaries.
+pub const Visibility = symbol_resolver.Visibility;
+/// Resolved symbol classification tag.
+pub const SymbolKind = symbol_resolver.SymbolKind;
+/// Resolved symbol record in `SymbolTable`.
+pub const SymbolRecord = symbol_resolver.SymbolRecord;
+/// Explicit `@overload` function group.
+pub const OverloadSet = symbol_resolver.OverloadSet;
+/// Unified lexical and module symbol table.
+pub const SymbolTable = symbol_resolver.SymbolTable;
+/// Collects module-level declarations for a parsed source file.
+pub const collectFileModuleItems = symbol_resolver.collectFileModuleItems;
+/// Resolves `use` import statements for a parsed source file.
+pub const resolveFileUseImports = symbol_resolver.resolveFileUseImports;
+/// Computes bounded Damerau-Levenshtein edit distance for `E0403` suggestions.
+pub const computeEditDistance = symbol_resolver.computeEditDistance;
+/// 32-bit primitive membership bitmask for Constrained Type Groups (`DR-04` Section 1.2).
+pub const TypeGroupMask = type_system.TypeGroupMask;
+/// Canonical `TypeNode` discriminant tag (`DR-04` Section 2.1).
+pub const TypeTag = type_system.TypeTag;
+/// 1-byte packed type capability and property bitflags.
+pub const TypeFlags = type_system.TypeFlags;
+/// Parameter passing convention mode (`DR-02`).
+pub const ParamMode = type_system.ParamMode;
+/// Maximum recursion depth for type and expression checking (`256`).
+pub const MAX_TYPE_DEPTH = type_system.MAX_TYPE_DEPTH;
+/// Exact 14-byte zero-padding Structure-of-Arrays `TypeNode` (`DR-04` Section 2.1).
+pub const TypeNode = type_system.TypeNode;
+/// Inline 16-slot stack `SubstitutionMap` with overflow spill (`DR-04` Section 2.2).
+pub const SubstitutionMap = type_system.SubstitutionMap;
+/// Canonical deduplicated `InternPool` (`TypeArena`) pre-populated with static `TypeId` slots `0..63`.
+pub const InternPool = type_system.InternPool;
+/// Alias for `InternPool`.
+pub const TypeArena = type_system.TypeArena;
+/// Spine-local bidirectional type checker and Maranget pattern exhaustiveness verifier.
+pub const TypeChecker = type_system.TypeChecker;
+/// Result bundle returned by `typecheckSource`.
+pub const TypecheckResult = type_system.TypecheckResult;
+/// Standalone single-file lex + parse + resolve + bidirectional type-check entry point.
+pub const typecheckSource = type_system.typecheckSource;
+
 // ---------------- Diagnostics & CLI Re-Exports ----------------
 /// Monochrome Unicode glyph registry.
 pub const Glyphs = style.Glyphs;
@@ -237,6 +293,8 @@ test "test_root_module_references_all_phase0_submodules" {
     _ = parser;
     _ = query_db;
     _ = fmt_engine;
+    _ = symbol_resolver;
+    _ = type_system;
     _ = style;
     _ = box_draw;
     _ = router;

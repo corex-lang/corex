@@ -197,7 +197,7 @@ pub const STMT_STARTER_SET: TokenSet128 = TokenSet128.initMany(&.{
     .kw_if,
     .kw_match,
 });
-/// Tokens that can legally begin a `PrimaryType` expression (`DR-03` Section 5.4 Part 5).
+/// Tokens that can legally begin a `PrimaryType` expression (`DR-03` Section 5.4 Part 5 & `DR-04`).
 pub const TYPE_STARTER_SET: TokenSet128 = TokenSet128.initMany(&.{
     .prim_type,
     .kw_self_type,
@@ -206,6 +206,7 @@ pub const TYPE_STARTER_SET: TokenSet128 = TokenSet128.initMany(&.{
     .kw_own,
     .kw_ref,
     .hash_soa,
+    .tilde,
     .lbracket,
     .lparen,
     .kw_fn,
@@ -1693,7 +1694,18 @@ pub const Parser = struct {
             _ = try self.consumeLeaf(.token_leaf, .{});
             if (self.peekKind() == .kw_bit_field) {
                 _ = try self.consumeLeaf(.token_leaf, .{});
-                target_type_op = PackedOperand.initNode(try self.parseType());
+                if (self.peekKind() == .lparen) {
+                    const open_paren = try self.consumeLeaf(.token_leaf, .{});
+                    target_type_op = PackedOperand.initNode(try self.parseType());
+                    try self.expectClosingDelimiter(
+                        .rparen,
+                        open_paren,
+                        has_error,
+                        "expected `)` after `bit_field` backing integer type",
+                    );
+                } else {
+                    target_type_op = PackedOperand.initNode(try self.parseType());
+                }
                 if (self.peekKind() == .lbrace) {
                     try self.parseBitFieldBody(has_error);
                 }
@@ -1709,10 +1721,23 @@ pub const Parser = struct {
                 }, item_cst);
             }
 
-            target_type_op = PackedOperand.initNode(try self.parseType());
-            if (self.peekKind() == .kw_is) {
-                _ = try self.consumeLeaf(.token_leaf, .{});
-                refine_pat_op = PackedOperand.initNode(try self.parsePattern(false));
+            const first_target = try self.parseType();
+            if (self.peekKind() == .pipe) {
+                var union_members: std.ArrayList(u32) = .empty;
+                defer union_members.deinit(self.ast.allocator);
+                try union_members.append(self.ast.allocator, first_target.asInt());
+                while (self.peekKind() == .pipe) {
+                    _ = try self.consumeLeaf(.token_leaf, .{});
+                    try union_members.append(self.ast.allocator, (try self.parseType()).asInt());
+                }
+                target_type_op = PackedOperand.initExtra(try self.ast.appendExtraSlice(union_members.items));
+                refine_pat_op = .{ .tag = .extra, .payload = @intCast(union_members.items.len) };
+            } else {
+                target_type_op = PackedOperand.initNode(first_target);
+                if (self.peekKind() == .kw_is) {
+                    _ = try self.consumeLeaf(.token_leaf, .{});
+                    refine_pat_op = PackedOperand.initNode(try self.parsePattern(false));
+                }
             }
         }
 
@@ -1877,13 +1902,25 @@ pub const Parser = struct {
             has_error,
             "expected `PascalCase` identifier after `bit_field`",
         );
-        _ = try self.expectToken(
-            .colon,
-            has_error,
-            "expected `:` and backing integer type after `bit_field` name",
-            "expected `:` here",
-        );
-        const backing_ty = try self.parseType();
+        const backing_ty = if (self.peekKind() == .lparen) blk: {
+            const open_paren = try self.consumeLeaf(.token_leaf, .{});
+            const inner_ty = try self.parseType();
+            try self.expectClosingDelimiter(
+                .rparen,
+                open_paren,
+                has_error,
+                "expected `)` after `bit_field` backing integer type",
+            );
+            break :blk inner_ty;
+        } else blk: {
+            _ = try self.expectToken(
+                .colon,
+                has_error,
+                "expected `:` and backing integer type after `bit_field` name",
+                "expected `:` here",
+            );
+            break :blk try self.parseType();
+        };
 
         if (self.peekKind() == .lbrace) {
             try self.parseBitFieldBody(has_error);
@@ -2755,7 +2792,7 @@ pub const Parser = struct {
                     .lhs = PackedOperand.initNode(inner_ty),
                 }, ptr_cst);
             },
-            .kw_own, .kw_ref, .hash_soa => {
+            .kw_own, .kw_ref, .hash_soa, .tilde => {
                 const mode_cst = try self.startCstNode(.mode_type);
                 const mode_tok = try self.consumeLeaf(.token_leaf, .{});
                 if (self.peekKind() == .kw_mut) {
@@ -2897,18 +2934,20 @@ pub const Parser = struct {
                 }, fn_cst);
             },
             .ident, .type_ident, .const_ident => {
-                // Handle `dyn Trait` existential type if `ident` is `"dyn"`:
+                // Handle `dyn Trait`, `any Group`, or `distinct BaseType` modifier prefixes:
                 if (self.peekKind() == .ident and
-                    std.mem.eql(u8, self.peekLexemeNth(0), "dyn") and
+                    (std.mem.eql(u8, self.peekLexemeNth(0), "dyn") or
+                        std.mem.eql(u8, self.peekLexemeNth(0), "any") or
+                        std.mem.eql(u8, self.peekLexemeNth(0), "distinct")) and
                     TYPE_STARTER_SET.contains(self.peekKindNth(1)))
                 {
                     const mode_cst = try self.startCstNode(.mode_type);
-                    const dyn_tok = try self.consumeLeaf(.token_leaf, .{});
+                    const mode_tok = try self.consumeLeaf(.token_leaf, .{});
                     const inner_ty = try self.parseType();
                     self.cst.finishNode(mode_cst, .{});
                     return self.ast.appendNodeWithCst(.{
                         .tag = .mode_type,
-                        .main_token = dyn_tok,
+                        .main_token = mode_tok,
                         .lhs = PackedOperand.initNode(inner_ty),
                     }, mode_cst);
                 }

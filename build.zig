@@ -4,7 +4,7 @@
 //! `build/stage0/` and the standard `zig-out/bin/` prefix per `.agents/skills/build/SKILL.md`.
 //!
 //! Provides `zig build`, `zig build run`, `zig build test` (executing both internal module tests and
-//! `tests/test_runner.zig`), and `zig build bench` (executing `phase0_bench` through `phase3_bench`).
+//! `tests/test_runner.zig`), and `zig build bench` (executing `phase0_bench` through `phase4_bench`).
 
 const std = @import("std");
 
@@ -136,14 +136,30 @@ pub fn build(builder: *std.Build) void {
     const run_bench3 = builder.addRunArtifact(bench3_exe);
     run_bench3.step.dependOn(&run_bench2.step);
 
+    const bench4_exe_mod = builder.createModule(.{
+        .root_source_file = builder.path("bench/suites/phase4_bench.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .imports = &.{
+            .{ .name = "corex", .module = bench_corex_mod },
+        },
+    });
+    const bench4_exe = builder.addExecutable(.{
+        .name = "phase4_bench",
+        .root_module = bench4_exe_mod,
+    });
+    const run_bench4 = builder.addRunArtifact(bench4_exe);
+    run_bench4.step.dependOn(&run_bench3.step);
+
     const bench_step = builder.step(
         "bench",
-        "Run Phase 0, Phase 1, Phase 2, and Phase 3 statistical performance benchmarks",
+        "Run Phase 0, Phase 1, Phase 2, Phase 3, and Phase 4 statistical performance benchmarks",
     );
     bench_step.dependOn(&run_bench0.step);
     bench_step.dependOn(&run_bench1.step);
     bench_step.dependOn(&run_bench2.step);
     bench_step.dependOn(&run_bench3.step);
+    bench_step.dependOn(&run_bench4.step);
 
     builder.step("bench-phase1", "Run Phase 1 lexer performance benchmarks").dependOn(
         &builder.addRunArtifact(bench1_exe).step,
@@ -153,5 +169,8 @@ pub fn build(builder: *std.Build) void {
     );
     builder.step("bench-phase3", "Run Phase 3 query engine & formatter performance benchmarks").dependOn(
         &builder.addRunArtifact(bench3_exe).step,
+    );
+    builder.step("bench-phase4", "Run Phase 4 name resolution & type checker performance benchmarks").dependOn(
+        &builder.addRunArtifact(bench4_exe).step,
     );
 }

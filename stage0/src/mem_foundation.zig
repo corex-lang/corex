@@ -339,9 +339,70 @@ pub const TypeId = enum(u32) {
         return @backingInt(self);
     }
 
+    /// Alias for `asInt` matching `DR-04` §5.2 `toU32` terminology.
+    pub inline fn toU32(self: TypeId) u32 {
+        return @backingInt(self);
+    }
+
     /// Returns true if `self` is the `.none` sentinel.
     pub inline fn isNone(self: TypeId) bool {
         return self == .none;
+    }
+
+    /// Returns true if `self` is the poison `.err_ty` recovery sentinel.
+    pub inline fn isError(self: TypeId) bool {
+        return self == .err_ty;
+    }
+
+    /// Returns true if `self` is one of the 19 reserved primitive types (`0..18`).
+    pub inline fn isPrimitive(self: TypeId) bool {
+        return @backingInt(self) <= @backingInt(TypeId.f64_ty);
+    }
+
+    /// Returns true if `self` is a primitive type or inference/error sentinel (`0..21`).
+    pub inline fn isPrimitiveOrSentinel(self: TypeId) bool {
+        return @backingInt(self) <= @backingInt(TypeId.err_ty);
+    }
+
+    /// Returns true if `self` is one of the 11 built-in Constrained Type Groups (`32..42`).
+    pub inline fn isBuiltinGroup(self: TypeId) bool {
+        const raw = @backingInt(self);
+        return raw >= @backingInt(TypeId.group_signed) and raw <= @backingInt(TypeId.group_copy);
+    }
+
+    /// Returns true if `self` is a signed integer primitive (`i8`..`isize`).
+    pub inline fn isSignedIntPrimitive(self: TypeId) bool {
+        const raw = @backingInt(self);
+        return raw >= @backingInt(TypeId.i8_ty) and raw <= @backingInt(TypeId.isize_ty);
+    }
+
+    /// Returns true if `self` is an unsigned integer primitive (`u8`..`usize`).
+    pub inline fn isUnsignedIntPrimitive(self: TypeId) bool {
+        const raw = @backingInt(self);
+        return raw >= @backingInt(TypeId.u8_ty) and raw <= @backingInt(TypeId.usize_ty);
+    }
+
+    /// Returns true if `self` is a signed or unsigned integer primitive (`i8`..`usize`).
+    pub inline fn isIntegerPrimitive(self: TypeId) bool {
+        const raw = @backingInt(self);
+        return raw >= @backingInt(TypeId.i8_ty) and raw <= @backingInt(TypeId.usize_ty);
+    }
+
+    /// Returns true if `self` is an IEEE-754 floating-point primitive (`f32` or `f64`).
+    pub inline fn isFloatPrimitive(self: TypeId) bool {
+        return self == .f32_ty or self == .f64_ty;
+    }
+
+    /// Returns true if `self` is an integer or floating-point primitive (`i8`..`f64`).
+    pub inline fn isNumericPrimitive(self: TypeId) bool {
+        const raw = @backingInt(self);
+        return raw >= @backingInt(TypeId.i8_ty) and raw <= @backingInt(TypeId.f64_ty);
+    }
+
+    /// Returns the 32-bit `TypeGroupMask` bit (`1 << self`) for primitive types (`0..18`).
+    pub inline fn primitiveBit(self: TypeId) u32 {
+        std.debug.assert(@backingInt(self) <= @backingInt(TypeId.f64_ty));
+        return @as(u32, 1) << @as(u5, @intCast(@backingInt(self)));
     }
 };
 

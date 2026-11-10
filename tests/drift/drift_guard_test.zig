@@ -228,20 +228,20 @@ test "test_drift_guard_phase1_token_kind_contiguity_and_keyword_table" {
     const values = lexer.KEYWORD_OR_PRIM_MAP.values();
     try std.testing.expectEqual(@as(usize, 64), keys.len);
 
-    var keyword_seen: [45]bool = @splat(false);
+    var has_seen_keyword: [45]bool = @splat(false);
     var prim_count: usize = 0;
     for (values) |kind_val| {
         const backing = @backingInt(kind_val);
         if (backing < 45) {
-            try std.testing.expect(!keyword_seen[backing]);
-            keyword_seen[backing] = true;
+            try std.testing.expect(!has_seen_keyword[backing]);
+            has_seen_keyword[backing] = true;
         } else {
             try std.testing.expectEqual(TokenKind.prim_type, kind_val);
             prim_count += 1;
         }
     }
-    for (keyword_seen) |was_seen| {
-        try std.testing.expect(was_seen);
+    for (has_seen_keyword) |has_seen| {
+        try std.testing.expect(has_seen);
     }
     try std.testing.expectEqual(@as(usize, 19), prim_count);
 }
@@ -331,4 +331,49 @@ test "test_drift_guard_phase3_query_db_fmt_engine_and_cli_flags" {
         try std.testing.expectEqual(i, @as(usize, @backingInt(fmt_flag.id)));
         try std.testing.expect(fmt_flag.summary.len > 0);
     }
+}
+
+test "test_drift_guard_phase4_type_node_layout_type_groups_and_diagnostics" {
+    // [1] Verify 14-byte SoA `TypeNode` column layout and `TypeTag` enum contiguity (`DR-04` Section 2.1):
+    try std.testing.expectEqual(@as(usize, 1), @sizeOf(corex.TypeTag));
+    try std.testing.expectEqual(@as(usize, 1), @sizeOf(corex.TypeFlags));
+    try std.testing.expectEqual(@as(usize, 1), @sizeOf(corex.ParamMode));
+    try std.testing.expectEqual(
+        @as(usize, 14),
+        @sizeOf(corex.TypeTag) + @sizeOf(corex.TypeFlags) + 3 * @sizeOf(u32),
+    );
+
+    const type_tag_values = std.enums.values(corex.TypeTag);
+    inline for (type_tag_values, 0..) |tag_val, i| {
+        try std.testing.expectEqual(@as(u8, @intCast(i)), @backingInt(tag_val));
+    }
+
+    // [2] Verify 11 Constrained Type Groups in `TypeGroupMask` (`32..42`):
+    var grp_slot: u32 = 32;
+    while (grp_slot <= 42) : (grp_slot += 1) {
+        const grp_id = corex.TypeId.fromInt(grp_slot);
+        try std.testing.expect(grp_id.isBuiltinGroup());
+        try std.testing.expect(corex.TypeGroupMask.forBuiltinGroup(grp_id) != 0);
+    }
+
+    // [3] Verify Phase 4 diagnostic codes (`E0400`–`E0415`, `W0401`, `W0402`, `E0502`):
+    try std.testing.expectEqualStrings("E0400", DiagnosticCode.e0400_ambiguous_overload.asCodeStr());
+    try std.testing.expectEqualStrings("E0401", DiagnosticCode.e0401_type_mismatch.asCodeStr());
+    try std.testing.expectEqualStrings("E0402", DiagnosticCode.e0402_unsatisfied_trait_bound.asCodeStr());
+    try std.testing.expectEqualStrings("E0403", DiagnosticCode.e0403_unresolved_symbol.asCodeStr());
+    try std.testing.expectEqualStrings("E0404", DiagnosticCode.e0404_bind_once_group_conflict.asCodeStr());
+    try std.testing.expectEqualStrings("E0405", DiagnosticCode.e0405_distinct_type_mixing.asCodeStr());
+    try std.testing.expectEqualStrings("E0406", DiagnosticCode.e0406_range_refinement_violation.asCodeStr());
+    try std.testing.expectEqualStrings("E0407", DiagnosticCode.e0407_invalid_contextual_variant.asCodeStr());
+    try std.testing.expectEqualStrings("E0408", DiagnosticCode.e0408_duplicate_definition.asCodeStr());
+    try std.testing.expectEqualStrings("E0409", DiagnosticCode.e0409_private_symbol_access.asCodeStr());
+    try std.testing.expectEqualStrings("E0410", DiagnosticCode.e0410_try_outside_fallible_fn.asCodeStr());
+    try std.testing.expectEqualStrings("E0411", DiagnosticCode.e0411_missing_from_error_conversion.asCodeStr());
+    try std.testing.expectEqualStrings("E0412", DiagnosticCode.e0412_let_else_not_diverging.asCodeStr());
+    try std.testing.expectEqualStrings("E0413", DiagnosticCode.e0413_unhandled_must_use_or_result.asCodeStr());
+    try std.testing.expectEqualStrings("E0414", DiagnosticCode.e0414_bare_wildcard_result_discard.asCodeStr());
+    try std.testing.expectEqualStrings("E0415", DiagnosticCode.e0415_non_exhaustive_match.asCodeStr());
+    try std.testing.expectEqualStrings("W0401", DiagnosticCode.w0401_unreachable_pattern_arm.asCodeStr());
+    try std.testing.expectEqualStrings("W0402", DiagnosticCode.w0402_unused_binding.asCodeStr());
+    try std.testing.expectEqualStrings("E0502", DiagnosticCode.e0502_integer_constant_overflow.asCodeStr());
 }

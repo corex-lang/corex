@@ -14,9 +14,12 @@ const syntax_arenas = @import("syntax_arenas.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const diagnostic = @import("diag/diagnostic.zig");
+const symbol_resolver = @import("symbol_resolver.zig");
+const type_system = @import("type_system.zig");
 
 const FileId = mem_foundation.FileId;
 const SymbolId = mem_foundation.SymbolId;
+const TypeId = mem_foundation.TypeId;
 const StringInterner = mem_foundation.StringInterner;
 const TokenIndex = mem_foundation.TokenIndex;
 const CstNodeIndex = mem_foundation.CstNodeIndex;
@@ -29,6 +32,11 @@ const TokenBuffer = syntax_arenas.TokenBuffer;
 const LosslessCstArena = syntax_arenas.LosslessCstArena;
 const AstArena = syntax_arenas.AstArena;
 const DiagnosticSink = diagnostic.DiagnosticSink;
+const ScopeId = symbol_resolver.ScopeId;
+const SymbolIndex = symbol_resolver.SymbolIndex;
+const SymbolTable = symbol_resolver.SymbolTable;
+const InternPool = type_system.InternPool;
+const TypeChecker = type_system.TypeChecker;
 
 // ---------------------------------------- TYPES ----------------------------------------
 
@@ -549,10 +557,14 @@ pub const BodyAstWindow = struct {
 pub const ResolvedSignaturesArtifact = struct {
     /// Target source file handle.
     file_id: FileId,
+    /// Root module lexical `ScopeId` in `CompilerDb.symbol_table`.
+    module_scope: ScopeId = .none,
     /// Total number of top-level items resolved in `file_id`.
     item_count: u32,
     /// Total number of `pub`-exported items in `file_id`.
     public_item_count: u32,
+    /// Total number of name-resolution or signature errors emitted in `file_id`.
+    error_count: u32 = 0,
     /// 128-bit fingerprint of the resolved module signature map.
     signatures_fingerprint: Fingerprint128,
 };
@@ -567,6 +579,10 @@ pub const DefSignatureArtifact = struct {
     is_pub: bool,
     /// Interned symbol identifier.
     name_symbol: SymbolId,
+    /// Resolved symbol handle in `CompilerDb.symbol_table`.
+    symbol_index: SymbolIndex = .none,
+    /// Resolved canonical `TypeId` in `CompilerDb.type_pool`.
+    type_id: TypeId = .err_ty,
     /// 128-bit fingerprint of this definition's signature.
     signature_fingerprint: Fingerprint128,
 };
@@ -579,6 +595,10 @@ pub const TypedBodyArtifact = struct {
     file_id: FileId,
     /// Root AST node of the checked body.
     body_ast_node: NodeIndex,
+    /// Number of type-checking errors emitted inside `def_id`'s body.
+    error_count: u32 = 0,
+    /// Number of warnings (e.g., `W0401`, `W0402`) emitted inside `def_id`'s body.
+    warning_count: u32 = 0,
     /// 128-bit signature fingerprint consumed during body checking.
     signature_fingerprint: Fingerprint128,
     /// 128-bit position-independent body AST fingerprint consumed during body checking.
@@ -1417,6 +1437,14 @@ pub const CompilerDb = struct {
     typed_bodies: std.AutoHashMapUnmanaged(u32, TypedBodyArtifact) = .empty,
     /// Stage 9 per-definition SAST verification artifacts keyed by `DefId.asInt()`.
     sast_results: std.AutoHashMapUnmanaged(u32, SastVerificationArtifact) = .empty,
+    /// Canonical deduplicated `InternPool` (`TypeArena`) shared across queries.
+    type_pool: InternPool,
+    /// Unified lexical and module `SymbolTable` shared across queries.
+    symbol_table: SymbolTable,
+    /// Per-file signature resolution diagnostic sinks keyed by `FileId.asInt()`.
+    sig_diagnostics: std.AutoHashMapUnmanaged(u32, DiagnosticSink) = .empty,
+    /// Per-definition body type-checking diagnostic sinks keyed by `DefId.asInt()`.
+    body_diagnostics: std.AutoHashMapUnmanaged(u32, DiagnosticSink) = .empty,
     /// Optional hook for injecting synthetic dependency cycles in unit tests.
     custom_stage_hook: ?CustomStageHook = null,
     /// Execution, Green Path, Durability fast-path, and Early Cutoff counters.
@@ -1424,9 +1452,19 @@ pub const CompilerDb = struct {
 
     /// Initializes a new `CompilerDb` instance bound to `allocator`.
     pub fn init(allocator: std.mem.Allocator) !CompilerDb {
+        var interner = try StringInterner.init(allocator);
+        errdefer interner.deinit();
+
+        var type_pool = try InternPool.init(allocator);
+        errdefer type_pool.deinit();
+
+        const symbol_table = try SymbolTable.init(allocator, &interner);
+
         return .{
             .allocator = allocator,
-            .interner = try StringInterner.init(allocator),
+            .interner = interner,
+            .type_pool = type_pool,
+            .symbol_table = symbol_table,
         };
     }
 
@@ -1450,6 +1488,20 @@ pub const CompilerDb = struct {
         }
         self.item_trees.deinit(self.allocator);
 
+        var sig_diag_iter = self.sig_diagnostics.valueIterator();
+        while (sig_diag_iter.next()) |sink_ptr| {
+            sink_ptr.deinit();
+        }
+        self.sig_diagnostics.deinit(self.allocator);
+
+        var body_diag_iter = self.body_diagnostics.valueIterator();
+        while (body_diag_iter.next()) |sink_ptr| {
+            sink_ptr.deinit();
+        }
+        self.body_diagnostics.deinit(self.allocator);
+
+        self.symbol_table.deinit();
+        self.type_pool.deinit();
         self.lowered_artifacts.deinit(self.allocator);
         self.body_windows.deinit(self.allocator);
         self.resolved_signatures.deinit(self.allocator);
@@ -2049,6 +2101,16 @@ pub const CompilerDb = struct {
         return window.body_fingerprint;
     }
 
+    /// Returns the signature resolution `DiagnosticSink` for `file_id` if available.
+    pub fn getSignatureDiagnostics(self: *const CompilerDb, file_id: FileId) ?*const DiagnosticSink {
+        return self.sig_diagnostics.getPtr(file_id.asInt());
+    }
+
+    /// Returns the body type-checking `DiagnosticSink` for `def_id` if available.
+    pub fn getBodyDiagnostics(self: *const CompilerDb, def_id: DefId) ?*const DiagnosticSink {
+        return self.body_diagnostics.getPtr(def_id.asInt());
+    }
+
     /// Stage 6 implementation: resolves module signatures for `file_id` (shielded by `tree_fingerprint`).
     fn computeResolveSignatures(self: *CompilerDb, file_id: FileId) QueryError!Fingerprint128 {
         const item_tree = try self.extractItemTree(file_id);
@@ -2065,11 +2127,73 @@ pub const CompilerDb = struct {
             if (entry.is_pub) public_count += 1;
         }
 
+        // Run Phase 4 symbol collection, `use` resolution, and signature type resolution for `file_id`:
+        var mod_scope: ScopeId = .none;
+        var sig_err_count: u32 = 0;
+        if (self.source_inputs.getPtr(file_id.asInt())) |input_ptr| {
+            if (self.parsed_artifacts.getPtr(file_id.asInt())) |parsed_ptr| {
+                const diag_gop = try self.sig_diagnostics.getOrPut(self.allocator, file_id.asInt());
+                if (!diag_gop.found_existing) {
+                    diag_gop.value_ptr.* = DiagnosticSink.init(self.allocator);
+                } else {
+                    diag_gop.value_ptr.diagnostics.clearRetainingCapacity();
+                    diag_gop.value_ptr.arena.resetRetainingCapacity();
+                    diag_gop.value_ptr.error_count = 0;
+                    diag_gop.value_ptr.warning_count = 0;
+                    diag_gop.value_ptr.has_reached_limit = false;
+                }
+                const sig_sink = diag_gop.value_ptr;
+
+                // Detach previous module scope for `file_id` so re-runs allocate a clean scope:
+                _ = self.symbol_table.file_module_scopes.remove(file_id.asInt());
+
+                mod_scope = symbol_resolver.collectFileModuleItems(
+                    &self.symbol_table,
+                    &self.interner,
+                    file_id,
+                    input_ptr.owned_text,
+                    &parsed_ptr.token_buffer,
+                    &parsed_ptr.cst_arena,
+                    &parsed_ptr.ast_arena,
+                    sig_sink,
+                ) catch return error.OutOfMemory;
+
+                symbol_resolver.resolveFileUseImports(
+                    &self.symbol_table,
+                    &self.interner,
+                    file_id,
+                    input_ptr.owned_text,
+                    &parsed_ptr.token_buffer,
+                    &parsed_ptr.cst_arena,
+                    sig_sink,
+                ) catch return error.OutOfMemory;
+
+                var checker = TypeChecker.init(
+                    self.allocator,
+                    &self.interner,
+                    &self.type_pool,
+                    &self.symbol_table,
+                    file_id,
+                    input_ptr.owned_text,
+                    &parsed_ptr.token_buffer,
+                    &parsed_ptr.cst_arena,
+                    &parsed_ptr.ast_arena,
+                    sig_sink,
+                ) catch return error.OutOfMemory;
+                defer checker.deinit();
+
+                checker.resolveModuleSignatures() catch return error.OutOfMemory;
+                sig_err_count = sig_sink.error_count;
+            }
+        }
+
         const resolved_fp = hasher.final();
         try self.resolved_signatures.put(self.allocator, file_id.asInt(), .{
             .file_id = file_id,
+            .module_scope = mod_scope,
             .item_count = @intCast(item_tree.entries.len),
             .public_item_count = public_count,
+            .error_count = sig_err_count,
             .signatures_fingerprint = resolved_fp,
         });
         return resolved_fp;
@@ -2086,6 +2210,12 @@ pub const CompilerDb = struct {
         const item_tree = self.item_trees.getPtr(file_id.asInt()) orelse return error.MissingSourceInput;
         const entry = item_tree.getEntry(def_id) orelse return error.InvalidDefId;
 
+        const sym_idx = self.symbol_table.def_to_symbol.get(def_id.asInt()) orelse .none;
+        const resolved_ty: TypeId = if (!sym_idx.isNone())
+            self.symbol_table.getSymbol(sym_idx).type_id
+        else
+            .err_ty;
+
         var hasher = StructuralHasher.init();
         hasher.updateU32(def_id.asInt());
         hasher.updateU8(@intFromEnum(entry.kind));
@@ -2099,6 +2229,8 @@ pub const CompilerDb = struct {
             .kind = entry.kind,
             .is_pub = entry.is_pub,
             .name_symbol = entry.name_symbol,
+            .symbol_index = sym_idx,
+            .type_id = resolved_ty,
             .signature_fingerprint = def_sig_fp,
         });
         return def_sig_fp;
@@ -2111,6 +2243,44 @@ pub const CompilerDb = struct {
         const body_window = try self.getBodyAstProj(def_id);
         try self.unwindIfCancelled();
 
+        const file_id = def_id.fileId();
+        var body_err_count: u32 = 0;
+        var body_warn_count: u32 = 0;
+
+        if (self.source_inputs.getPtr(file_id.asInt())) |input_ptr| {
+            if (self.parsed_artifacts.getPtr(file_id.asInt())) |parsed_ptr| {
+                const diag_gop = try self.body_diagnostics.getOrPut(self.allocator, def_id.asInt());
+                if (!diag_gop.found_existing) {
+                    diag_gop.value_ptr.* = DiagnosticSink.init(self.allocator);
+                } else {
+                    diag_gop.value_ptr.diagnostics.clearRetainingCapacity();
+                    diag_gop.value_ptr.arena.resetRetainingCapacity();
+                    diag_gop.value_ptr.error_count = 0;
+                    diag_gop.value_ptr.warning_count = 0;
+                    diag_gop.value_ptr.has_reached_limit = false;
+                }
+                const body_sink = diag_gop.value_ptr;
+
+                var checker = TypeChecker.init(
+                    self.allocator,
+                    &self.interner,
+                    &self.type_pool,
+                    &self.symbol_table,
+                    file_id,
+                    input_ptr.owned_text,
+                    &parsed_ptr.token_buffer,
+                    &parsed_ptr.cst_arena,
+                    &parsed_ptr.ast_arena,
+                    body_sink,
+                ) catch return error.OutOfMemory;
+                defer checker.deinit();
+
+                checker.checkDefBody(def_id) catch return error.OutOfMemory;
+                body_err_count = body_sink.error_count;
+                body_warn_count = body_sink.warning_count;
+            }
+        }
+
         var hasher = StructuralHasher.init();
         hasher.updateU32(def_id.asInt());
         hasher.updateFingerprint(def_sig.signature_fingerprint);
@@ -2119,8 +2289,10 @@ pub const CompilerDb = struct {
 
         try self.typed_bodies.put(self.allocator, def_id.asInt(), .{
             .def_id = def_id,
-            .file_id = def_id.fileId(),
+            .file_id = file_id,
             .body_ast_node = body_window.body_ast_node,
+            .error_count = body_err_count,
+            .warning_count = body_warn_count,
             .signature_fingerprint = def_sig.signature_fingerprint,
             .body_fingerprint = body_window.body_fingerprint,
             .typed_fingerprint = typed_fp,
@@ -2136,9 +2308,9 @@ pub const CompilerDb = struct {
 
         const file_id = def_id.fileId();
         const has_errors = if (self.parsed_artifacts.getPtr(file_id.asInt())) |parsed_ptr|
-            parsed_ptr.has_parse_errors
+            parsed_ptr.has_parse_errors or typed_body.error_count > 0
         else
-            false;
+            typed_body.error_count > 0;
 
         var hasher = StructuralHasher.init();
         hasher.updateU32(def_id.asInt());
@@ -2242,7 +2414,7 @@ test "test_set_input_noop_durability_upgrade_and_comment_early_cutoff" {
 
     const tree_r3 = try db.extractItemTree(file_id);
     try std.testing.expectEqual(@as(usize, 1), tree_r3.entries.len);
-    // `parse_cst` and `lower_ast` re-executed, `lower_ast` backdated `changed_at = R1`, so `item_tree` skipped!
+    // `parse_cst` and `lower_ast` re-executed, `lower_ast` backdated `changed_at = R1`, so `item_tree` skipped:
     try std.testing.expectEqual(@as(u64, 2), db.telemetry.countExecutions(.parse_cst));
     try std.testing.expectEqual(@as(u64, 2), db.telemetry.countExecutions(.lower_ast));
     try std.testing.expectEqual(@as(u64, 1), db.telemetry.countExecutions(.item_tree));
@@ -2323,12 +2495,12 @@ test "test_item_tree_signature_firewall_and_position_independent_sibling_bodies"
     const rev2 = try db.setInput(file_id, source_v2, .low);
     try std.testing.expect(rev2.isAfter(rev1));
 
-    // [1] Verify `bar` first: `bar` shifted by 20 lines, yet `typecheckBody(def_bar)` is NOT re-executed!
+    // [1] Verify `bar` first: `bar` shifted by 20 lines, yet `typecheckBody(def_bar)` is NOT re-executed:
     _ = try db.verifySastMir(def_bar);
     try std.testing.expectEqual(@as(u64, 2), db.telemetry.countExecutions(.typecheck_body));
     try std.testing.expectEqual(@as(u64, 2), db.telemetry.countExecutions(.verify_sast_mir));
 
-    // [2] Verify `foo`: `foo`'s signature projections backdate to `rev1`, while `typecheckBody(def_foo)` re-runs!
+    // [2] Verify `foo`: `foo`'s signature projections backdate to `rev1`, while `typecheckBody(def_foo)` re-runs:
     _ = try db.verifySastMir(def_foo);
     try std.testing.expectEqual(@as(u64, 3), db.telemetry.countExecutions(.typecheck_body));
     try std.testing.expectEqual(@as(u64, 3), db.telemetry.countExecutions(.verify_sast_mir));

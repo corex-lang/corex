@@ -1,6 +1,6 @@
 //! CoreX Stage 0 Master Verification Suite Runner (`tests/test_runner.zig`)
 //!
-//! Aggregates and executes all Phase 0, Phase 1, Phase 2, and Phase 3 isolated unit tests
+//! Aggregates and executes all Phase 0, Phase 1, Phase 2, Phase 3, and Phase 4 isolated unit tests
 //! (`tests/unit/`), golden snapshot tests (`tests/snapshots/`), deterministic PRNG fuzzers
 //! (`tests/fuzz/`), and repository drift guards (`tests/drift/`).
 //!
@@ -24,6 +24,10 @@ pub const parser_test = @import("unit/parser_test.zig");
 pub const query_db_test = @import("unit/query_db_test.zig");
 /// Unit tests for `fmt_engine.zig` (`DocInst`, `DocArena`, `DocRenderer`, `corex fmt`, `--fix`).
 pub const fmt_engine_test = @import("unit/fmt_engine_test.zig");
+/// Unit tests for `symbol_resolver.zig` (`ScopeArena`, `SymbolTable`, `mod`, `use`, `E0403`, `E0408`, `E0409`, `W0402`).
+pub const symbol_resolver_test = @import("unit/symbol_resolver_test.zig");
+/// Unit tests for `type_system.zig` (`InternPool`, `TypeGroupMask`, `E0400`–`E0415`, `W0401`, `E0502`).
+pub const type_system_test = @import("unit/type_system_test.zig");
 /// Unit tests for `diag/diagnostic.zig` and `diag/renderer.zig` (`DiagnosticSink`, `TransactionalPatcher`).
 pub const diagnostic_test = @import("unit/diagnostic_test.zig");
 /// Unit tests for `cli/style.zig`, `cli/box_draw.zig`, and `cli/router.zig`.
@@ -40,10 +44,12 @@ pub const phase1_lexer_fuzz = @import("fuzz/phase1_lexer_fuzz.zig");
 pub const phase2_parser_fuzz = @import("fuzz/phase2_parser_fuzz.zig");
 /// Phase 3 deterministic PRNG fuzzing suite (`corex fmt` idempotency/comments + `CompilerDb` Early Cutoff).
 pub const phase3_fmt_fuzz = @import("fuzz/phase3_fmt_fuzz.zig");
+/// Phase 4 deterministic PRNG fuzzing suite (`symbol_resolver` + `type_system` fault tolerance & incremental parity).
+pub const phase4_typecheck_fuzz = @import("fuzz/phase4_typecheck_fuzz.zig");
 /// Repository-wide drift guards (zero colored emojis, CLI parity, diagnostic catalog, `< 150` col format).
 pub const drift_guard_test = @import("drift/drift_guard_test.zig");
 
-test "test_runner_references_all_phase0_phase1_phase2_and_phase3_verification_suites" {
+test "test_runner_references_all_phase0_phase1_phase2_phase3_and_phase4_verification_suites" {
     std.testing.refAllDecls(@This());
     _ = mem_foundation_test;
     _ = vfs_sourcemap_test;
@@ -52,6 +58,8 @@ test "test_runner_references_all_phase0_phase1_phase2_and_phase3_verification_su
     _ = parser_test;
     _ = query_db_test;
     _ = fmt_engine_test;
+    _ = symbol_resolver_test;
+    _ = type_system_test;
     _ = diagnostic_test;
     _ = cli_router_test;
     _ = bench_harness_test;
@@ -60,5 +68,6 @@ test "test_runner_references_all_phase0_phase1_phase2_and_phase3_verification_su
     _ = phase1_lexer_fuzz;
     _ = phase2_parser_fuzz;
     _ = phase3_fmt_fuzz;
+    _ = phase4_typecheck_fuzz;
     _ = drift_guard_test;
 }

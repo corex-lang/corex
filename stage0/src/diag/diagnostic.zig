@@ -181,33 +181,64 @@ pub const DiagnosticCode = enum(u16) {
     /// Value escapes lexical arena or stack region (`E0306`).
     e0306_region_escape_violation = 14,
 
-    // E04xx; Type System, Inference, Traits & Bounds:
+    // E04xx; Type System, Inference, Traits, Bounds & Error Semantics:
+    /// Ambiguous overload call in explicit overload group (`E0400`).
+    e0400_ambiguous_overload = 15,
     /// Mismatched types between expected and found expressions (`E0401`).
-    e0401_type_mismatch = 15,
+    e0401_type_mismatch = 16,
     /// Type does not satisfy constrained trait or type group bound (`E0402`).
-    e0402_unsatisfied_trait_bound = 16,
+    e0402_unsatisfied_trait_bound = 17,
     /// Unresolved identifier or symbol in scope (`E0403`).
-    e0403_unresolved_symbol = 17,
+    e0403_unresolved_symbol = 18,
+    /// Conflicting concrete types for a Bind-Once Constrained Type Group (`E0404`).
+    e0404_bind_once_group_conflict = 19,
+    /// Distinct nominal type mixed with underlying representation without `as` or `~T` (`E0405`).
+    e0405_distinct_type_mixing = 20,
+    /// Compile-time value or width violates range refinement or bit-field bounds (`E0406`).
+    e0406_range_refinement_violation = 21,
+    /// Contextual `.Variant` syntax cannot be resolved against expected type (`E0407`).
+    e0407_invalid_contextual_variant = 22,
+    /// Duplicate symbol definition in the same namespace and lexical scope (`E0408`).
+    e0408_duplicate_definition = 23,
+    /// Access to a private item, field, or method outside its defining module (`E0409`).
+    e0409_private_symbol_access = 24,
+    /// Postfix `?` operator used outside a fallible `Result` or `Option` function (`E0410`).
+    e0410_try_outside_fallible_fn = 25,
+    /// Propagated error type cannot be converted via `FromError` or `@from` (`E0411`).
+    e0411_missing_from_error_conversion = 26,
+    /// `let … else` guard block does not unconditionally diverge (`never`) (`E0412`).
+    e0412_let_else_not_diverging = 27,
+    /// Unhandled `Result[T, E]` or `@must_use` value in expression statement (`E0413`).
+    e0413_unhandled_must_use_or_result = 28,
+    /// Forbidden bare `let _ = fallible()` discard of a `Result[T, E]` without `catch` (`E0414`).
+    e0414_bare_wildcard_result_discard = 29,
+    /// Non-exhaustive pattern arms in `match` expression (`E0415`).
+    e0415_non_exhaustive_match = 30,
 
     // E05xx; Comptime Virtual Machine & MIR Lowering:
     /// Compile-time execution exceeded step fuel budget (`E0501`).
-    e0501_comptime_step_limit_exceeded = 18,
+    e0501_comptime_step_limit_exceeded = 31,
     /// Compile-time integer arithmetic overflow (`E0502`).
-    e0502_integer_constant_overflow = 19,
+    e0502_integer_constant_overflow = 32,
 
     // W00xx to W05xx; Subsystem Compiler Warnings:
     /// Deprecated CLI invocation or option (`W0001`).
-    w0001_deprecated_cli_option = 20,
+    w0001_deprecated_cli_option = 33,
     /// Redundant character escape sequence in literal (`W0101`).
-    w0101_redundant_escape_sequence = 21,
+    w0101_redundant_escape_sequence = 34,
     /// Identifier does not follow canonical CoreX casing (`W0201`).
-    w0201_non_canonical_identifier_case = 22,
+    w0201_non_canonical_identifier_case = 35,
     /// Unused region capability or linear binding (`W0308`).
-    w0308_unused_region_allocation = 23,
+    w0308_unused_region_allocation = 36,
     /// Unreachable pattern arm in `match` expression (`W0401`).
-    w0401_unreachable_pattern_arm = 24,
+    w0401_unreachable_pattern_arm = 37,
+    /// Unused local variable binding or function parameter (`W0402`).
+    w0402_unused_binding = 38,
     /// Function exceeds MIR inlining cost threshold (`W0501`).
-    w0501_inlining_budget_exceeded = 25,
+    w0501_inlining_budget_exceeded = 39,
+
+    /// Ergonomic alias for `.e0502_integer_constant_overflow`.
+    pub const e0502_integer_overflow: DiagnosticCode = .e0502_integer_constant_overflow;
 
     /// Returns the static `DiagnosticDescriptor` metadata for this `DiagnosticCode` in $O(1)$ time.
     pub inline fn asDescriptor(self: DiagnosticCode) DiagnosticDescriptor {
@@ -402,6 +433,13 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .explanation = "A reference or container tied to a local arena or stack frame escaped its lexical scope.",
     },
     .{
+        .code = .e0400_ambiguous_overload,
+        .code_str = "E0400",
+        .default_severity = .err,
+        .title = "ambiguous overload call",
+        .explanation = "Multiple candidate functions in the explicit overload group match the argument types equally.",
+    },
+    .{
         .code = .e0401_type_mismatch,
         .code_str = "E0401",
         .default_severity = .err,
@@ -421,6 +459,90 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .default_severity = .err,
         .title = "unresolved identifier or symbol in scope",
         .explanation = "The referenced variable, function, type, or module name is not bound in scope.",
+    },
+    .{
+        .code = .e0404_bind_once_group_conflict,
+        .code_str = "E0404",
+        .default_severity = .err,
+        .title = "conflicting types for bind-once type group",
+        .explanation = "A bare Constrained Type Group parameter binds once across the signature; use `any Group` for independent types.",
+    },
+    .{
+        .code = .e0405_distinct_type_mixing,
+        .code_str = "E0405",
+        .default_severity = .err,
+        .title = "cannot mix distinct nominal type with underlying type",
+        .explanation = "A `distinct` nominal type does not implicitly coerce to or from its underlying type without `as` or `~T`.",
+    },
+    .{
+        .code = .e0406_range_refinement_violation,
+        .code_str = "E0406",
+        .default_severity = .err,
+        .title = "compile-time value outside range refinement or integer bounds",
+        .explanation = "The evaluated constant, literal, or bit-field width falls outside the target type's valid bounds.",
+    },
+    .{
+        .code = .e0407_invalid_contextual_variant,
+        .code_str = "E0407",
+        .default_severity = .err,
+        .title = "cannot infer contextual variant",
+        .explanation = "Contextual `.Variant` syntax requires a known target `enum`, `Option[T]`, or `Result[T, E]` expected type.",
+    },
+    .{
+        .code = .e0408_duplicate_definition,
+        .code_str = "E0408",
+        .default_severity = .err,
+        .title = "duplicate symbol definition in scope",
+        .explanation = "A symbol with this name is already defined in the same namespace within the current scope.",
+    },
+    .{
+        .code = .e0409_private_symbol_access,
+        .code_str = "E0409",
+        .default_severity = .err,
+        .title = "symbol or member is private",
+        .explanation = "Items, struct fields, and methods without `pub` cannot be accessed outside their defining module.",
+    },
+    .{
+        .code = .e0410_try_outside_fallible_fn,
+        .code_str = "E0410",
+        .default_severity = .err,
+        .title = "cannot use `?` operator outside fallible function",
+        .explanation = "Postfix `?` propagates `.Err` or `.None` and requires an enclosing `Result[T, E]` or `Option[T]` return type.",
+    },
+    .{
+        .code = .e0411_missing_from_error_conversion,
+        .code_str = "E0411",
+        .default_severity = .err,
+        .title = "cannot convert propagated error type via `?`",
+        .explanation = "The enclosing error type does not match the inner error type and lacks `FromError` or `@from` upcasting.",
+    },
+    .{
+        .code = .e0412_let_else_not_diverging,
+        .code_str = "E0412",
+        .default_severity = .err,
+        .title = "let-else guard block must diverge",
+        .explanation = "The `else` block of a `let Pattern = expr else { … }` guard must unconditionally diverge (`never`).",
+    },
+    .{
+        .code = .e0413_unhandled_must_use_or_result,
+        .code_str = "E0413",
+        .default_severity = .err,
+        .title = "unhandled Result or @must_use return value",
+        .explanation = "Fallible `Result[T, E]` and `@must_use` values cannot be silently ignored in an expression statement.",
+    },
+    .{
+        .code = .e0414_bare_wildcard_result_discard,
+        .code_str = "E0414",
+        .default_severity = .err,
+        .title = "cannot discard Result with bare let _ =",
+        .explanation = "Discarding a `Result[T, E]` via bare `let _ = fallible()` is forbidden; use `let _ = fallible() catch {}`.",
+    },
+    .{
+        .code = .e0415_non_exhaustive_match,
+        .code_str = "E0415",
+        .default_severity = .err,
+        .title = "non-exhaustive match patterns",
+        .explanation = "The `match` arms do not cover every possible value of the scrutinee type.",
     },
     .{
         .code = .e0501_comptime_step_limit_exceeded,
@@ -470,6 +592,13 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .default_severity = .warning,
         .title = "unreachable match pattern arm",
         .explanation = "A `match` arm is completely subsumed by preceding patterns and can never execute.",
+    },
+    .{
+        .code = .w0402_unused_binding,
+        .code_str = "W0402",
+        .default_severity = .warning,
+        .title = "unused local binding or parameter",
+        .explanation = "A local variable or function parameter is never read; prefix with `_` if intentionally unused.",
     },
     .{
         .code = .w0501_inlining_budget_exceeded,
