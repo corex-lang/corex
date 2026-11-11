@@ -1,6 +1,6 @@
-# Upfront `Deep Research` Prompts (`DR-01`–`DR-15`)
+# Upfront `Deep Research` Prompts (`DR-01`–`DR-19`)
 
-This catalog contains the 15 self-contained, copy-pasteable `Deep research` prompts that resolve the Research Decision Gates (`RDG-01`–`RDG-15`) in [PLAN.md](../../PLAN.md). When a `Deep research` report is completed, save its output to the corresponding `docs/research/DR-XX.md` path listed below.
+This catalog contains the 19 self-contained, copy-pasteable `Deep research` prompts that resolve the Research Decision Gates (`RDG-01`–`RDG-19`) in [PLAN.md](../../PLAN.md). When a `Deep research` report is completed, save its output to the corresponding `docs/research/DR-XX.md` path listed below.
 
 ---
 
@@ -23,6 +23,10 @@ This catalog contains the 15 self-contained, copy-pasteable `Deep research` prom
 | **`DR-11`** | **`RDG-11`** | `docs/research/DR-11.md` | Wave 3 | `DR-01`, `DR-02`, `DR-03`                  | Phase 9          | Package Manager, URL/Registry Resolution, Global Cache & Lockfiles                     |
 | **`DR-14`** | **`RDG-14`** | `docs/research/DR-14.md` | Wave 3 | `DR-01`–`DR-03`, `DR-12`                   | Phase 3 / 10     | Zero-Legacy AST Migration Engine (`corex upgrade`) & Canonical Formatter (`corex fmt`) |
 | **`DR-15`** | **`RDG-15`** | `docs/research/DR-15.md` | Wave 3 | `DR-02`–`DR-08`                            | Phase 11         | Stage-2 `.cx` Standard Library, TUI/CLI & Unified WebAssembly/Native UI Architecture   |
+| **`DR-16`** | **`RDG-16`** | `docs/research/DR-16.md` | Wave 4 | `DR-01`, `DR-11`, `DR-12`, `DR-14`         | Phase 9 / 10        | Dependency-Conflict Solution Synthesis, Ranking & Lossless `corex.toml` Quick-Apply    |
+| **`DR-17`** | **`RDG-17`** | `docs/research/DR-17.md` | Wave 4 | `DR-01`, `DR-06`, `DR-11`, `DR-12`         | Phase 6 / 9 / 10    | Zero-Annotation Call-Graph Capability Sandboxing & `@no_alloc` / `@no_panic` Contracts |
+| **`DR-18`** | **`RDG-18`** | `docs/research/DR-18.md` | Wave 4 | `DR-01`, `DR-08`, `DR-09`, `DR-15`         | Phase 7 / 8 / 11    | Deterministic `Context` Simulation (`corex test --sim`) & Native Coverage Fuzzing      |
+| **`DR-19`** | **`RDG-19`** | `docs/research/DR-19.md` | Wave 4 | `DR-01`, `DR-06`, `DR-08`, `DR-09`, `DR-15`| Phase 7 (Seam) / 13 | Stateful Live Hot-Reloading (`corex run --watch`), `@must_vectorize` & Cluster Sim     |
 
 ---
 
@@ -536,3 +540,157 @@ CoreX follows a **Two-Stage Standard Library** strategy:
 3. **Technical Blueprint for `std::http` / `std::serde` and the Unified `std::ui` (`wasm32` + Native) Application Engine.**
 
 ```
+
+---
+
+## `DR-16` (Plugs into `RDG-16` → `docs/research/DR-16.md`): Dependency-Conflict Solution Synthesis, Ranking & Lossless `corex.toml` Quick-Apply
+
+`````markdown
+# Deep Research Request (DR-16): Pre-Verified Dependency-Conflict Solution Synthesis, Multi-Criteria Ranking & Lossless Interactive/LSP Manifest Quick-Apply for CoreX (.cx)
+
+> **Live Repository & Attached Baseline Specifications (`DR-01`, `DR-11`, `DR-12`, `DR-14`):**
+> - **Repository:** [corex-lang/corex](https://github.com/corex-lang/corex) (`main` branch – if you have web/GitHub access, inspect `PLAN.md`, `docs/research/DR-01.md`–`DR-15.md`, and `stage0/src/` directly alongside any attached files).
+> - **`DR-01.md`:** Arena-allocated SoA data structures (`BumpArena`, `StringInterner`, `Span`, `FileId(u32)`), deterministic execution invariants, and monochrome Unicode + ANSI CLI diagnostics (`╭`, `│`, `╰`, `├`, `─`, `▸`, `•`, `✓`, `✗`, `⚠`; zero colored emojis).
+> - **`DR-11.md`:** `corex.toml` manifest and single-file `---` script frontmatter schemas, `corex.lock` schema, two-phase **Bounded-MVS + PubGrub CDCL** resolver, `SeriesKey` major-version partitioning, `[resolution].exclude` security/regression bans, `links` native C symbol uniqueness, and `--locked` / `--offline` / `--frozen` hermetic build modes.
+> - **`DR-12.md` & `DR-14.md`:** Incremental `CompilerDb`, `DiagnosticSink`, `SuggestedFix` (`TextEdit` byte spans, `FixApplicability`, `EditPriority`), `TransactionalPatcher`, `corex upgrade` / `corex fix`, and `corex lsp` (`textDocument/codeAction`).
+
+## Context & Vision
+In `DR-11.md`, CoreX resolves 99.9% of dependency graphs automatically via Bounded-MVS, automatic cross-major symbol mangling, and PubGrub routing around excluded versions. However, when a dependency conflict is **genuinely ambiguous or unsatisfiable without altering user intent** (e.g., contradictory root `corex.toml` version bounds and `[resolution].exclude` rules, cross-major public API type mismatches, or conflicting native `links = "..."` C static libraries), `DR-11` currently stops after rendering PubGrub's plain-English root-cause proof tree.
+
+CoreX should go one step further than `cargo`, `uv`, `go`, and `npm`:
+1. Emit a crystal-clear monochrome diagnostic explaining the exact conflict cause (via `DR-11`'s PubGrub proof tree).
+2. Automatically search and **mathematically pre-verify** distinct candidate ways to resolve the conflict (so the user never has to guess by trial-and-error, and choosing a displayed solution is guaranteed to produce a 100% conflict-free `corex.lock` without hitting a second downstream conflict).
+3. Display the ranked, pre-verified solutions directly inside the same diagnostic (with exact `corex.toml` diff previews) and let the developer **apply a chosen solution in one step** – interactively in a TTY terminal (continuing the build immediately in-process), via a deterministic CLI flag in non-interactive shells, or via a one-click Quick Fix Code Action in `corex lsp` – while preserving 100% of comments and formatting in `corex.toml`.
+
+## Research Objectives
+Conduct a rigorous, evidence-based systems and solver-engineering analysis covering:
+1. **Counterfactual Conflict-Solution Enumeration over Bounded-MVS + PubGrub (`< 10 ms` Budget):**
+   - Analyze prior art in SAT/MaxSAT package conflict remediation – including SUSE `libsolv` (`zypper`/`dnf` problem-solution rules), MARCO/CAMUS Minimal Unsatisfiable Subset (MUS) & Minimal Correction Subset (MCS) duality, Partial Weighted MaxSAT, and OCaml `opam` (`MCCS` multi-criteria CUDF optimization).
+   - Design the exact algorithm extending `DR-11`'s PubGrub decision-level-0 conflict DAG to enumerate distinct, minimal, **100% pre-verified** resolution candidates (covering single- and multi-package version bound adjustments, side-by-side major-version aliasing `pkg-v1 = { package = "...", version = "..." }`, `[resolution].exclude` narrowing, feature-flag adjustments, and `links` native library unification) under strict CPU/step caps so pathological graphs never blow up combinatorially.
+2. **Security-Aware Multi-Criteria Ranking & Deduplication:**
+   - Define a deterministic lexicographic objective function ranking candidate solutions by safety and minimal disruption (e.g., penalizing relaxation of CVE security exclusions in `[resolution].exclude`, preferring patch/minor bumps over major downgrades, minimizing total changed manifests/packages, and flagging any security or breaking-API implications explicitly).
+3. **Lossless, Comment-Preserving `corex.toml` CST & `TransactionalPatcher` Lowering:**
+   - Design a compact, arena-allocated, lossless TOML v1.0 Concrete Syntax Tree (supporting both project `corex.toml` files and single-file `.cx` `---` TOML frontmatter) that tracks exact byte `Span`s of keys, inline tables, arrays, and `#` comments.
+   - Specify how each verified conflict solution lowers into conflict-free `SuggestedFix` (`[]TextEdit`) bundles compatible with `DR-14`'s `TransactionalPatcher` so rewriting dependency entries or inserting aliases preserves 100% of user comments, blank lines, and alignment.
+4. **Interactive TTY Prompt, Non-Interactive CLI Flag & `corex lsp` Code Action Protocol:**
+   - Specify the exact monochrome CLI diagnostic layout (`╭`, `│`, `╰`, `├`, `─`, `▸`, `•`, `✓`, `✗`, `⚠`) combining the PubGrub conflict proof tree, numbered verified solution cards with `corex.toml` diffs, and the interactive selection prompt.
+   - Define strict safety and determinism guards: when interactive prompting is allowed (`stdin` & `stderr` TTYs, not `--locked` / `--frozen` / `--no-input` / `CI=true`), how in-process build continuation works immediately after patching `corex.toml` and writing `corex.lock`, how non-interactive CLI invocation (`corex fix` / `corex upgrade`) applies a chosen solution deterministically, and how `corex lsp` (`DR-12`) exposes each verified solution as a ranked `textDocument/codeAction` Quick Fix on `corex.toml`.
+
+## Required Deliverables
+1. **Formal Counterfactual MCS / MaxSAT Solution Enumeration & Security-Aware Ranking Algorithm** integrated with `DR-11`'s Bounded-MVS + PubGrub solver (including exact Zig / `.cx` SoA arena data structures and complexity/step bounds).
+2. **Lossless `corex.toml` & Script-Frontmatter CST + Comment-Preserving `TextEdit` Patching Specification** integrated with `DR-14`'s `TransactionalPatcher`.
+3. **End-to-End Monochrome CLI Diagnostic Layout, Interactive TTY State Machine, CLI Flags & `corex lsp` Code Action Specification** (with concrete conflict scenarios and exact rendered terminal examples).
+
+## Output Formatting Requirement (CRITICAL)
+Output your entire completed specification report wrapped inside **one single outer 4-backtick ````markdown … ```` code block** (using standard 3-backtick ``` fences for any inner code blocks or diagrams, monochrome Unicode glyphs `╭`, `│`, `╰`, `├`, `─`, `▸`, `•`, `✓`, `✗`, `⚠` with zero colored emojis, Unicode ellipsis `…` in prose, and en dashes ` – ` instead of em dashes) so the entire report can be copied and pasted directly into `docs/research/DR-16.md`.
+`````
+
+---
+
+## `DR-17` (Plugs into `RDG-17` → `docs/research/DR-17.md`): Zero-Annotation Call-Graph Capability Sandboxing & `@no_alloc` / `@no_panic` Contracts
+
+`````markdown
+# Deep Research Request (DR-17): Zero-Annotation Interprocedural Call-Graph Effect/Capability Inference, Supply-Chain Lockfile Sandboxing & `@no_alloc` / `@no_panic` Verification for CoreX (.cx)
+
+> **Live Repository & Attached Baseline Specifications (`DR-01`, `DR-06`, `DR-11`, `DR-12`):**
+> - **Repository:** [corex-lang/corex](https://github.com/corex-lang/corex) (`main` branch – inspect `PLAN.md`, `docs/research/DR-01.md`–`DR-15.md`, and `stage0/src/` directly if web/GitHub access is available).
+> - **`DR-01.md` & `DR-12.md`:** Arena-allocated SoA compiler tables (`BumpArena`, `CompilerDb` Early Cutoff, `DiagnosticSink`), monochrome CLI diagnostics (`╭`, `│`, `╰`, `├`, `─`, `▸`, `•`, `✓`, `✗`, `⚠`; zero colored emojis), and `< 10 ms` `corex lsp` protocol.
+> - **`DR-06.md`:** Phase 6 4-pass `MIR` SAST engine – specifically Pass 3 Tarjan Strongly Connected Component (SCC) bottom-up `FnRegionSummary` (24 bytes) inference, Pass 4 Pentagon (`Intv × Sub`) + Sparse ABCD bounds-check elision, and `E03xx`/`W03xx` diagnostics.
+> - **`DR-11.md` & `DR-15.md`:** `corex.toml` / `corex.lock` package schemas, zero hidden pre-`main` `init()` constructors, zero arbitrary `build.rs` scripts, and explicit `Context` (`context.allocator`) propagation.
+
+## Context & Vision
+CoreX forbids pre-`main` global constructors and arbitrary Turing-complete build scripts, and Phase 6 (`DR-06` Pass 3) already traverses the `MIR` call graph bottom-up in Tarjan SCC order. By piggybacking a compact effect/capability bitmask (`fs`, `net`, `env`, `process`, `ffi`, `unsafe`, `alloc`, `may_panic`) onto that pass, CoreX can unlock two major capabilities with **zero permission annotations in ordinary `.cx` code** and **zero runtime overhead**:
+1. **Compile-Time Supply-Chain Capability Sandboxing (Phases 6 & 9):** Automatically infer the exact OS/FFI capabilities transitively reachable from every package, record them in `corex.lock`, and enforce optional `corex.toml` policies so if a compromised patch update to a pure library (e.g., JSON, math, formatting) suddenly touches `std::net`, `std::process`, or `ffi`, compilation halts before a single instruction runs.
+2. **Hard Real-Time & Kernel Safety Contracts (`@no_alloc` & `@no_panic`, Phases 6 & 10):** Statically prove that annotated hot functions (and every callee in their transitive dynamic/static call graph) never allocate heap memory and retain zero un-elided panic edges after Pentagon bounds verification.
+
+## Research Objectives
+1. **Compact `EffectCapabilityMask` Algebra & Indirect-Call Soundness:**
+   - Design the exact bitmask layout (`u16` / `u32`) and packing alongside `DR-06`'s 24-byte `FnRegionSummary` without inflating L1 cache footprints or breaking Early Cutoff in `CompilerDb`.
+   - Solve indirect call soundness cleanly: how function pointers (`fn(...)`), `@local` closures, `own` closures, and `dyn Trait` vtable dispatch propagate or bound capabilities (`alloc`, `may_panic`, OS capabilities) without requiring verbose effect polymorphism on everyday `.cx` code.
+2. **Exact `@no_alloc` & `@no_panic` Semantics on `MIR`:**
+   - Define what constitutes an allocation (`context.allocator`, `System` heap vs. stack/fixed-buffer/pre-allocated lexical scratch checkpoints if permitted or distinguished) and what constitutes a residual `may_panic` edge after `DR-06` Pass 4 Pentagon bounds-check elision, integer division/overflow checks, and `.unwrap()` / `unreachable` terminators.
+   - Specify shortest-witness call-chain trace reconstruction so `@no_alloc`, `@no_panic`, and supply-chain capability diagnostics display the exact multi-hop `fn A -> fn B -> syscall/panic` chain with source spans.
+3. **`corex.lock` / `corex.toml` Supply-Chain Policy & `corex check` / `corex lsp` Integration:**
+   - Specify how per-package capabilities are serialized in `corex.lock`, how default trust-on-first-lock vs. capability-escalation-on-upgrade alerts/blocks work in `corex build` / `corex upgrade`, how `[dependencies]` or `[security.capabilities]` in `corex.toml` can declaratively restrict dependencies, and how `corex lsp` surfaces inferred capabilities/contracts on hover.
+
+## Required Deliverables
+1. **Formal `MIR` Effect/Capability Summary Lattice, Indirect-Call Typing Rules & Tarjan SCC Propagation Specification** (with exact Zig / `.cx` SoA struct layouts).
+2. **`@no_alloc` & `@no_panic` Verification Rules, Shortest-Witness Call-Chain Diagnostic Renderer & `E03xx`/`W03xx` Catalog Entries.**
+3. **`corex.lock` / `corex.toml` Capability Schema, Escalation Policy Rules & `corex check` / `corex lsp` Specification.**
+
+## Output Formatting Requirement (CRITICAL)
+Output your entire completed specification report wrapped inside **one single outer 4-backtick ````markdown … ```` code block** (using standard 3-backtick ``` fences for any inner code blocks or diagrams, monochrome Unicode glyphs `╭`, `│`, `╰`, `├`, `─`, `▸`, `•`, `✓`, `✗`, `⚠` with zero colored emojis, Unicode ellipsis `…` in prose, and en dashes ` – ` instead of em dashes) so the entire report can be copied and pasted directly into `docs/research/DR-17.md`.
+`````
+
+---
+
+## `DR-18` (Plugs into `RDG-18` → `docs/research/DR-18.md`): Deterministic `Context` Simulation (`corex test --sim`) & Native Coverage Fuzzing (`corex test --fuzz`)
+
+`````markdown
+# Deep Research Request (DR-18): Deterministic Concurrency/Fault-Injection Simulation (`corex test --sim`) & Zero-Config Coverage-Guided Native Fuzzing (`corex test --fuzz`) for CoreX (.cx)
+
+> **Live Repository & Attached Baseline Specifications (`DR-01`, `DR-08`, `DR-09`, `DR-15`):**
+> - **Repository:** [corex-lang/corex](https://github.com/corex-lang/corex) (`main` branch – inspect `PLAN.md`, `docs/research/DR-01.md`–`DR-15.md`, and `stage0/src/` directly if web/GitHub access is available).
+> - **`DR-08.md`:** Caller-inlined stackless coroutines, lexical `TaskGroup` nurseries, thread-per-core `io_uring` / `IOCP` / `kqueue` / WASI completion reactors, and `@linear` two-phase DMA-safe cancellation.
+> - **`DR-09.md`:** Dual-mode codegen (`--dev` TPDE-style single-pass native emitter + `--release` LLVM 20–23 AOT via `corex_llvm.cpp`).
+> - **`DR-15.md`:** Explicit `Context` register/slot (`allocator`, `temp_allocator`, clocks, entropy, reactor) and `std::test` architecture.
+
+## Context & Vision
+CoreX routes all memory allocation, monotonic/wall clocks, entropy, and async `TaskGroup` / completion I/O through its explicit `Context` rather than hidden OS globals. This architecture enables two built-in `corex test` verification engines with **zero production runtime overhead**:
+1. **Deterministic Simulation & Fault-Injection Testing (`corex test --sim --seed <u64>`, Phases 8 & 11):** Inspired by FoundationDB, TigerBeetle VOPR, and Rust `turmoil`/`loom`, swap in a deterministic single-threaded simulation `Context` that virtualizes time (running hours of timeouts in microseconds), deterministically permutes `TaskGroup` task wakeups and I/O completions, and systematically injects `Allocator` `OOM` and I/O errors with 100% bit-exact replay from a 64-bit seed.
+2. **Zero-Config Coverage-Guided Native Fuzzing & Counterexample Shrinking (`corex test --fuzz`, Phases 7 & 11):** Upgrade `DR-15`'s basic PRNG property fuzzer into compiler-instrumented coverage-guided fuzzing (using lightweight 8-bit edge counters in `--fuzz` builds) with structure-aware input mutation, automatic counterexample minimization, and zero-friction deterministic regression corpus snapshots.
+
+## Research Objectives
+1. **Zero-Overhead `Context` Seam & Deterministic Simulation Reactor (`corex test --sim`):**
+   - Specify the exact `Context` interface in Phase 8 / Phase 11 so production `--release` builds inline direct OS clock/reactor calls with zero vtable indirection penalty, while `--sim` builds bind a seeded deterministic `SimReactor` + virtual clock + PRNG + iterative/random `OOM` fault-injecting `Allocator`.
+   - Guarantee strict determinism (banning or trapping unseeded host syscalls, hash-seed randomization, and pointer-address ordering leaks during `--sim` execution).
+2. **Minimal-Bloat Coverage Instrumentation & Structure-Aware Shrinking (`corex test --fuzz`):**
+   - Compare LLVM `SanitizerCoverage` (`inline-8bit-counters` + `pc-table` + CMP tracing in `corex_llvm.cpp`) vs. `MIR` / Tier-C `--dev` edge counters so Stage-0 and Stage-1 compiler complexity stays minimal while fuzzing throughput remains high.
+   - Design an in-process zero-libFuzzer `.cx` fuzzing loop + byte-stream-backed structure-aware generator/shrinker (`Arbitrary` trait / internal-choice-sequence shrinking like Hypothesis/`proptest`) that turns any discovered panic, SAST assertion, or invariant failure into a committed, deterministic `@test` corpus entry.
+
+## Required Deliverables
+1. **`Context` Simulation Seam & Deterministic `SimReactor` / Virtual-Time / `OOM` Fault-Injection Specification.**
+2. **Compiler `--fuzz` Instrumentation Contract (`corex_llvm.cpp` / `--dev`), In-Process Coverage-Guided Mutation Engine & Counterexample Shrinker Blueprint.**
+3. **CLI Workflow, Corpus Layout & Monochrome Terminal Output Specification for `corex test --sim` and `corex test --fuzz`.**
+
+## Output Formatting Requirement (CRITICAL)
+Output your entire completed specification report wrapped inside **one single outer 4-backtick ````markdown … ```` code block** (using standard 3-backtick ``` fences for any inner code blocks or diagrams, monochrome Unicode glyphs `╭`, `│`, `╰`, `├`, `─`, `▸`, `•`, `✓`, `✗`, `⚠` with zero colored emojis, Unicode ellipsis `…` in prose, and en dashes ` – ` instead of em dashes) so the entire report can be copied and pasted directly into `docs/research/DR-18.md`.
+`````
+
+---
+
+## `DR-19` (Plugs into `RDG-19` → `docs/research/DR-19.md`): Stateful Live Hot-Reloading (`corex run --watch`), `@must_vectorize` SIMD Contracts & Cluster Simulation
+
+`````markdown
+# Deep Research Request (DR-19): Forward-Compatible Phase-7 Hot-Reload Seam & Post-v0.0.1 (`0.x`) Stateful Live Hot-Code Patching (`corex run --watch`), `@must_vectorize` SIMD Contracts & Multi-Node Simulation for CoreX (.cx)
+
+> **Live Repository & Attached Baseline Specifications (`DR-01`, `DR-06`, `DR-08`, `DR-09`, `DR-15`):**
+> - **Repository:** [corex-lang/corex](https://github.com/corex-lang/corex) (`main` branch – inspect `PLAN.md`, `docs/research/DR-01.md`–`DR-15.md`, and `stage0/src/` directly if web/GitHub access is available).
+> - **`DR-09.md`:** Tier C `--dev` single-pass native emitter with padded `Atom` function slots and `GOT` indirection for `< 50 ms` incremental binary patching on disk, plus Tier B LLVM 20–23 `--release` AOT backend.
+> - **`DR-06.md` & `DR-08.md`:** Strict MVS ownership (`Copy`, `AutoDrop`, `@linear`), `SlotMap` UI state arenas, and structured `TaskGroup` event loops.
+> - **`DR-15.md`:** `std::tui`, `std::http`, and GPUI/Masonry-style `std::ui` architecture.
+
+## Context & Vision
+To keep CoreX's `v0.0.1` initial self-hosting critical path (`Phases 6–12`) lean so Stage-0 Zig is retired as quickly as possible while unlocking major `Phase 13` (`Post-v0.0.1` / `0.x`) capabilities without rewriting the backend, `DR-19` specifies two tiers:
+1. **Pre-v0.0.1 Forward-Compatible Seam (Phase 7 – Tiny Footprint):** Define the minimal `Atom` / `GOT` symbol-indirection and `TypeLayoutHash` metadata table to emit in Phase 7 `--dev` builds so Phase 13 requires zero backend rewrite.
+2. **Post-v0.0.1 (`0.x`) Phase 13 Capabilities (implemented directly in the self-hosted `.cx` compiler once Stage 0 is retired):**
+   - **Sub-50ms Stateful Live In-Process Hot-Code Reloading (`corex run --watch`):** Patch updated machine code directly into a running `--dev` process across Linux, macOS (`MAP_JIT` / `pthread_jit_write_protect_np`), and Windows (`VirtualProtect` / IPC shim), preserving live `AppState` and `Arena` memory at quiescent frame/request boundaries whenever `TypeLayoutHash` is unchanged and cleanly restarting when `struct`/`enum` layouts change.
+   - **Target-Verified Hardware SIMD Contracts (`@must_vectorize`):** Per-target static verification of loop vectorization and lane widths across `x86_64` (`AVX2`/`AVX-512`), `aarch64` (`NEON`/`SVE`), and `wasm32` (`SIMD128`), plus `corex lsp` SIMD remarks.
+   - **Multi-Node Deterministic Cluster & Crash-Consistency Simulation:** Extend `DR-18`'s `corex test --sim` to multi-node virtual networks (partitions, packet reordering) and virtualized power-loss/fsync crash-consistency testing.
+
+## Research Objectives
+1. **Minimal Phase-7 `Atom` / `GOT` & `TypeLayoutHash` Seam (`< 200 LOC`):**
+   - Specify the exact metadata records and epoch-quiescent safepoint protocol needed in Phase 7 `--dev` builds so `--release` pays zero cost and Phase 13 plugs in cleanly.
+2. **Cross-OS Live Process Patching & Memory-Safety Soundness (Phase 13):**
+   - Solve active stack-frame hazards, stale function pointers / vtables, TLS/static state, `@linear` OS handles, and OS `W^X` code-signing constraints across Linux, macOS Apple Silicon, and Windows without permitting Use-After-Free or type confusion under MVS.
+3. **Deterministic `@must_vectorize` Verification & Multi-Node Virtual Network/FS Architecture (Phase 13):**
+   - Design target-parameterized `@must_vectorize` verification over LLVM optimization remarks / `#soa` loop IR without false-positive brittleness in `--dev` mode, and specify multi-node virtualized TCP/UDP + page-cache/fsync simulation over `DR-18`'s `SimReactor`.
+
+## Required Deliverables
+1. **Exact Phase-7 Forward-Compatible `Atom` / `GOT` & `TypeLayoutHash` Binary Seam Specification.**
+2. **Phase-13 Cross-Platform Stateful Live Hot-Reloading Architecture & MVS Soundness Proof.**
+3. **Phase-13 `@must_vectorize` Target Contract Specification & Multi-Node Network/Storage Simulation Blueprint.**
+
+## Output Formatting Requirement (CRITICAL)
+Output your entire completed specification report wrapped inside **one single outer 4-backtick ````markdown … ```` code block** (using standard 3-backtick ``` fences for any inner code blocks or diagrams, monochrome Unicode glyphs `╭`, `│`, `╰`, `├`, `─`, `▸`, `•`, `✓`, `✗`, `⚠` with zero colored emojis, Unicode ellipsis `…` in prose, and en dashes ` – ` instead of em dashes) so the entire report can be copied and pasted directly into `docs/research/DR-19.md`.
+`````
