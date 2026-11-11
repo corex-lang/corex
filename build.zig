@@ -4,7 +4,7 @@
 //! `build/stage0/` and the standard `zig-out/bin/` prefix per `.agents/skills/build/SKILL.md`.
 //!
 //! Provides `zig build`, `zig build run`, `zig build test` (executing both internal module tests and
-//! `tests/test_runner.zig`), and `zig build bench` (executing `phase0_bench` through `phase4_bench`).
+//! `tests/test_runner.zig`), and `zig build bench` (executing `phase0_bench` through `phase5_bench`).
 
 const std = @import("std");
 
@@ -70,7 +70,7 @@ pub fn build(builder: *std.Build) void {
     });
     test_step.dependOn(&builder.addRunArtifact(external_tests).step);
 
-    // [5] Configure `zig build bench` (executing `phase0_bench`..`phase3_bench` in `.fast`):
+    // [5] Configure `zig build bench` (executing all phase benchmark suites in `.fast`):
     const bench_optimize: std.builtin.Optimize = if (optimize == .debug) .fast else optimize;
     const bench_corex_mod = builder.createModule(.{
         .root_source_file = builder.path("stage0/src/root.zig"),
@@ -151,15 +151,31 @@ pub fn build(builder: *std.Build) void {
     const run_bench4 = builder.addRunArtifact(bench4_exe);
     run_bench4.step.dependOn(&run_bench3.step);
 
+    const bench5_exe_mod = builder.createModule(.{
+        .root_source_file = builder.path("bench/suites/phase5_bench.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .imports = &.{
+            .{ .name = "corex", .module = bench_corex_mod },
+        },
+    });
+    const bench5_exe = builder.addExecutable(.{
+        .name = "phase5_bench",
+        .root_module = bench5_exe_mod,
+    });
+    const run_bench5 = builder.addRunArtifact(bench5_exe);
+    run_bench5.step.dependOn(&run_bench4.step);
+
     const bench_step = builder.step(
         "bench",
-        "Run Phase 0, Phase 1, Phase 2, Phase 3, and Phase 4 statistical performance benchmarks",
+        "Run Phase 0, Phase 1, Phase 2, Phase 3, Phase 4, and Phase 5 statistical performance benchmarks",
     );
     bench_step.dependOn(&run_bench0.step);
     bench_step.dependOn(&run_bench1.step);
     bench_step.dependOn(&run_bench2.step);
     bench_step.dependOn(&run_bench3.step);
     bench_step.dependOn(&run_bench4.step);
+    bench_step.dependOn(&run_bench5.step);
 
     builder.step("bench-phase1", "Run Phase 1 lexer performance benchmarks").dependOn(
         &builder.addRunArtifact(bench1_exe).step,
@@ -172,5 +188,8 @@ pub fn build(builder: *std.Build) void {
     );
     builder.step("bench-phase4", "Run Phase 4 name resolution & type checker performance benchmarks").dependOn(
         &builder.addRunArtifact(bench4_exe).step,
+    );
+    builder.step("bench-phase5", "Run Phase 5 HIR, MIR, optimizer & MirVm performance benchmarks").dependOn(
+        &builder.addRunArtifact(bench5_exe).step,
     );
 }

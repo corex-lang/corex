@@ -550,4 +550,38 @@ test "test_type_system_maranget_exhaustiveness_e0415_w0401_and_incremental_query
         try std.testing.expectEqual(@as(u32, 0), body1_r2.error_count);
         try std.testing.expectEqual(@as(u32, 0), body2_r2.error_count);
     }
+
+    // [4] Nominal `enum` exhaustiveness ignores implicit `Self` and `impl` methods in `target_scope`:
+    {
+        const exhaustive_enum_src =
+            "pub enum Mode { Alpha, Beta(i32) }\n" ++
+            "impl Mode {\n" ++
+            "    pub fn weight(&self) -> i32 { return 1; }\n" ++
+            "}\n" ++
+            "pub fn eval_mode(mode: Mode) -> i32 {\n" ++
+            "    return match mode {\n" ++
+            "        .Alpha => 0,\n" ++
+            "        .Beta(val) => val,\n" ++
+            "    };\n" ++
+            "}\n";
+
+        var ok_res = try runFullTypecheck(std.testing.allocator, exhaustive_enum_src);
+        defer ok_res.deinit();
+        try std.testing.expect(!ok_res.diagnostics.hasErrors());
+        try std.testing.expectEqual(@as(u32, 0), ok_res.diagnostics.warning_count);
+
+        const missing_alpha_src =
+            "pub enum Mode { Alpha, Beta(i32) }\n" ++
+            "pub fn eval_missing(mode: Mode) -> i32 {\n" ++
+            "    return match mode {\n" ++
+            "        .Beta(val) => val,\n" ++
+            "    };\n" ++
+            "}\n";
+
+        var err_res = try runFullTypecheck(std.testing.allocator, missing_alpha_src);
+        defer err_res.deinit();
+        try std.testing.expect(hasDiag(&err_res.diagnostics, .e0415_non_exhaustive_match));
+        try std.testing.expect(std.mem.indexOf(u8, err_res.diagnostics.diagnostics.items[0].message, ".Alpha") != null);
+        try std.testing.expect(std.mem.indexOf(u8, err_res.diagnostics.diagnostics.items[0].message, ".Self") == null);
+    }
 }

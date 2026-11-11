@@ -1,8 +1,9 @@
 //! Repository-Wide Drift Guards (`tests/drift/drift_guard_test.zig`)
 //!
 //! Enforces zero colored emojis across the entire repository, 100% parity between `router.zig`
-//! tables and `corex --help`, `DIAGNOSTIC_CATALOG` subsystem prefix integrity, and `< 150` column
-//! line length plus 90-character top-level section dividers across all `.zig` source files.
+//! tables and `corex --help`, `DIAGNOSTIC_CATALOG` subsystem prefix integrity, Phase 1–5 IR/VM/opt
+//! struct layouts, enum contiguity, and diagnostic test coverage, plus `< 150` column line length
+//! and 90-character top-level section dividers across all `.zig` source files.
 //!
 //! Prevents code/documentation drift and stylistic regressions automatically during `zig build test`.
 
@@ -146,6 +147,54 @@ fn walkZigDirectoryFormatting(allocator: std.mem.Allocator, io: std.Io, dir_path
         const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.path });
         defer allocator.free(full_path);
         try checkZigFileFormattingAndDividers(allocator, io, full_path);
+    }
+}
+
+/// Asserts that `EnumType` has strictly contiguous integer backing tags `0 .. N - 1`.
+fn expectContiguousEnum(comptime EnumType: type) !void {
+    const enum_info = @typeInfo(EnumType).@"enum";
+    const TagInt = enum_info.tag_type;
+    const enum_values = std.enums.values(EnumType);
+    try std.testing.expectEqual(enum_info.field_names.len, enum_values.len);
+    inline for (enum_values, 0..) |enum_val, i| {
+        const expected_tag: TagInt = @intCast(i);
+        try std.testing.expectEqual(expected_tag, @backingInt(enum_val));
+        try std.testing.expectEqual(enum_val, @as(EnumType, @enumFromInt(expected_tag)));
+        try std.testing.expectEqualStrings(enum_info.field_names[i], @tagName(enum_val));
+    }
+}
+
+/// Scans all `.zig` files under `dir_path` and marks `has_found[i] = true` whenever `identifiers[i]` appears.
+fn markReferencedIdentifiersInDir(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir_path: []const u8,
+    identifiers: []const []const u8,
+    has_found: []bool,
+) !void {
+    var opened_dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer opened_dir.close(io);
+
+    var walker = try opened_dir.walk(allocator);
+    defer walker.deinit();
+
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig")) continue;
+        const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.path });
+        defer allocator.free(full_path);
+        const content = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            full_path,
+            allocator,
+            .limited(16 * 1024 * 1024),
+        );
+        defer allocator.free(content);
+
+        for (identifiers, 0..) |ident_name, i| {
+            if (!has_found[i] and std.mem.indexOf(u8, content, ident_name) != null) {
+                has_found[i] = true;
+            }
+        }
     }
 }
 
@@ -297,9 +346,9 @@ test "test_drift_guard_phase2_cst_node_kind_ast_tag_and_parser_diagnostics" {
 }
 
 test "test_drift_guard_phase3_query_db_fmt_engine_and_cli_flags" {
-    // [1] Verify `QueryStage` 10-stage enum contiguity (`0..9`) and `query_db` layout parity:
+    // [1] Verify `QueryStage` 14-stage enum contiguity (`0..13`) and `query_db` layout parity:
     const stage_values = std.enums.values(corex.QueryStage);
-    try std.testing.expectEqual(@as(usize, 10), stage_values.len);
+    try std.testing.expectEqual(@as(usize, 14), stage_values.len);
     inline for (stage_values, 0..) |stage_val, i| {
         try std.testing.expectEqual(@as(u8, @intCast(i)), @backingInt(stage_val));
     }
@@ -376,4 +425,151 @@ test "test_drift_guard_phase4_type_node_layout_type_groups_and_diagnostics" {
     try std.testing.expectEqualStrings("W0401", DiagnosticCode.w0401_unreachable_pattern_arm.asCodeStr());
     try std.testing.expectEqualStrings("W0402", DiagnosticCode.w0402_unused_binding.asCodeStr());
     try std.testing.expectEqualStrings("E0502", DiagnosticCode.e0502_integer_constant_overflow.asCodeStr());
+}
+
+test "test_drift_guard_phase5_hir_mir_vm_opt_layouts_cli_flags_and_diagnostics" {
+    // [1] Verify exact byte sizes of all canonical Phase 5 structs and handles:
+    try std.testing.expectEqual(@as(usize, 1), @sizeOf(corex.HirTag));
+    try std.testing.expectEqual(@as(usize, 1), @sizeOf(corex.HirFlags));
+    try std.testing.expectEqual(
+        @as(usize, 18),
+        @sizeOf(corex.HirTag) +
+            @sizeOf(corex.HirFlags) +
+            @sizeOf(corex.TypeId) +
+            @sizeOf(corex.TokenIndex) +
+            @sizeOf(corex.HirNode.Data),
+    );
+    try std.testing.expectEqual(@as(usize, 20), @sizeOf(corex.HirNode));
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(corex.BitSpec));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(corex.LocalDecl));
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(corex.MirPlace));
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(corex.MirProjection));
+    try std.testing.expectEqual(
+        @as(usize, 16),
+        @sizeOf(corex.MirOp) +
+            @sizeOf(corex.InstFlags) +
+            @sizeOf(u16) +
+            @sizeOf(corex.TypeId) +
+            @sizeOf(corex.MirInst.Operands),
+    );
+    try std.testing.expectEqual(@as(usize, 12), @sizeOf(corex.MirTerminator));
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(corex.MirBasicBlock));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(corex.MirOutgoingEdge));
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(corex.ComptimeAllocId));
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(corex.SymbolicPtr));
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(corex.RegSlot));
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(corex.ProvenanceEntry));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(corex.LayoutShapeKey));
+
+    // [2] Verify contiguity (`0..N-1`) of all Phase 5 IR and intrinsic enums:
+    try expectContiguousEnum(corex.HirTag);
+    try expectContiguousEnum(corex.MirOp);
+    try expectContiguousEnum(corex.BinOpKind);
+    try expectContiguousEnum(corex.UnaryOpKind);
+    try expectContiguousEnum(corex.TerminatorKind);
+    try expectContiguousEnum(corex.IntrinsicKind);
+
+    // [3] Verify `router.COMPILE_FLAGS` alphabetical sorting, summaries, subcommand help, and `parseArgs`:
+    try std.testing.expectEqual(@as(usize, 3), router.COMPILE_FLAGS.len);
+    try std.testing.expectEqualStrings("--comptime-limit", router.COMPILE_FLAGS[0].long_flag);
+    try std.testing.expectEqualStrings("--dev", router.COMPILE_FLAGS[1].long_flag);
+    try std.testing.expectEqualStrings("--release", router.COMPILE_FLAGS[2].long_flag);
+    for (router.COMPILE_FLAGS, 0..) |comp_flag, i| {
+        try std.testing.expectEqual(i, @as(usize, @backingInt(comp_flag.id)));
+        try std.testing.expect(comp_flag.summary.len > 0);
+        if (i > 0) {
+            try std.testing.expectEqual(
+                std.math.Order.lt,
+                std.mem.order(u8, router.COMPILE_FLAGS[i - 1].long_flag, comp_flag.long_flag),
+            );
+        }
+    }
+
+    const compile_subcommands = [_]router.SubcommandId{ .build, .run, .check, .test_cmd };
+    for (compile_subcommands) |sub_id| {
+        var sub_help_buf: [8192]u8 = undefined;
+        var sub_help_writer = std.Io.Writer.fixed(&sub_help_buf);
+        try router.renderSubcommandHelp(&sub_help_writer, StyleConfig.MONOCHROME, sub_id);
+        const sub_help_out = sub_help_writer.buffered();
+        for (router.COMPILE_FLAGS) |comp_flag| {
+            try std.testing.expect(std.mem.indexOf(u8, sub_help_out, comp_flag.long_flag) != null);
+            try std.testing.expect(std.mem.indexOf(u8, sub_help_out, comp_flag.summary) != null);
+        }
+
+        const sub_name = sub_id.asDescriptor().name;
+        var dev_sink = corex.DiagnosticSink.init(std.testing.allocator);
+        defer dev_sink.deinit();
+        const parsed_dev = try router.parseArgs(
+            &.{ sub_name, "--dev", "--comptime-limit=250000" },
+            &dev_sink,
+        );
+        try std.testing.expect(!dev_sink.hasErrors());
+        try std.testing.expect(!parsed_dev.is_release_mode);
+        try std.testing.expectEqual(@as(u64, 250_000), parsed_dev.comptime_step_limit);
+
+        var rel_sink = corex.DiagnosticSink.init(std.testing.allocator);
+        defer rel_sink.deinit();
+        const parsed_rel = try router.parseArgs(
+            &.{ sub_name, "--release", "--comptime-limit=500000" },
+            &rel_sink,
+        );
+        try std.testing.expect(!rel_sink.hasErrors());
+        try std.testing.expect(parsed_rel.is_release_mode);
+        try std.testing.expectEqual(@as(u64, 500_000), parsed_rel.comptime_step_limit);
+    }
+
+    // [4] Verify all 11 Phase 5 diagnostic codes (`E0501`–`E0510`, `W0501`) and test suite coverage:
+    const phase5_specs = [_]struct {
+        /// Canonical Phase 5 `DiagnosticCode` tag.
+        code: DiagnosticCode,
+        /// Expected 5-character CLI code string.
+        expected_str: []const u8,
+    }{
+        .{ .code = .e0501_comptime_step_limit_exceeded, .expected_str = "E0501" },
+        .{ .code = .e0502_integer_constant_overflow, .expected_str = "E0502" },
+        .{ .code = .e0503_forbidden_comptime_operation, .expected_str = "E0503" },
+        .{ .code = .e0504_comptime_out_of_bounds, .expected_str = "E0504" },
+        .{ .code = .e0505_comptime_uninitialized_read, .expected_str = "E0505" },
+        .{ .code = .e0506_comptime_invalid_pointer, .expected_str = "E0506" },
+        .{ .code = .e0507_comptime_arithmetic_trap, .expected_str = "E0507" },
+        .{ .code = .e0508_comptime_resource_limit_exceeded, .expected_str = "E0508" },
+        .{ .code = .e0509_comptime_evaluation_cycle, .expected_str = "E0509" },
+        .{ .code = .e0510_compile_assertion_failed, .expected_str = "E0510" },
+        .{ .code = .w0501_inlining_budget_exceeded, .expected_str = "W0501" },
+    };
+
+    var tag_identifiers: [phase5_specs.len][]const u8 = undefined;
+    var has_test_reference: [phase5_specs.len]bool = @splat(false);
+    for (phase5_specs, 0..) |spec, i| {
+        const entry = diagnostic.DIAGNOSTIC_CATALOG[@backingInt(spec.code)];
+        try std.testing.expectEqualStrings(spec.expected_str, spec.code.asCodeStr());
+        try std.testing.expectEqualStrings(spec.expected_str, entry.code_str);
+        try std.testing.expect(entry.title.len > 0);
+        try std.testing.expect(entry.explanation.len > 0);
+        tag_identifiers[i] = @tagName(spec.code);
+    }
+
+    try markReferencedIdentifiersInDir(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/unit",
+        &tag_identifiers,
+        &has_test_reference,
+    );
+    try markReferencedIdentifiersInDir(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/snapshots",
+        &tag_identifiers,
+        &has_test_reference,
+    );
+    for (has_test_reference, 0..) |has_ref, i| {
+        if (!has_ref) {
+            std.debug.print(
+                "Phase 5 diagnostic `{s}` is not referenced in `tests/unit/` or `tests/snapshots/`\n",
+                .{tag_identifiers[i]},
+            );
+        }
+        try std.testing.expect(has_ref);
+    }
 }

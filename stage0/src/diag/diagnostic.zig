@@ -220,22 +220,38 @@ pub const DiagnosticCode = enum(u16) {
     e0501_comptime_step_limit_exceeded = 31,
     /// Compile-time integer arithmetic overflow (`E0502`).
     e0502_integer_constant_overflow = 32,
+    /// Forbidden non-deterministic, FFI, I/O, or raw pointer-to-integer operation in `comptime` (`E0503`).
+    e0503_forbidden_comptime_operation = 33,
+    /// Out-of-bounds array, slice, or virtual allocation access in `comptime` (`E0504`).
+    e0504_comptime_out_of_bounds = 34,
+    /// Read from uninitialized virtual memory bytes in `comptime` (`E0505`).
+    e0505_comptime_uninitialized_read = 35,
+    /// Null, misaligned, or dangling virtual pointer dereference in `comptime` (`E0506`).
+    e0506_comptime_invalid_pointer = 36,
+    /// Division by zero, remainder by zero, or invalid shift count in `comptime` (`E0507`).
+    e0507_comptime_arithmetic_trap = 37,
+    /// Virtual heap, call depth, loop unroll, or `@embed_bytes` cap exceeded in `comptime` (`E0508`).
+    e0508_comptime_resource_limit_exceeded = 38,
+    /// Cyclic dependency across `const` or `comptime` evaluations (`E0509`).
+    e0509_comptime_evaluation_cycle = 39,
+    /// Failed `@compile_assert` or reached `@compile_error` intrinsic (`E0510`).
+    e0510_compile_assertion_failed = 40,
 
     // W00xx to W05xx; Subsystem Compiler Warnings:
     /// Deprecated CLI invocation or option (`W0001`).
-    w0001_deprecated_cli_option = 33,
+    w0001_deprecated_cli_option = 41,
     /// Redundant character escape sequence in literal (`W0101`).
-    w0101_redundant_escape_sequence = 34,
+    w0101_redundant_escape_sequence = 42,
     /// Identifier does not follow canonical CoreX casing (`W0201`).
-    w0201_non_canonical_identifier_case = 35,
+    w0201_non_canonical_identifier_case = 43,
     /// Unused region capability or linear binding (`W0308`).
-    w0308_unused_region_allocation = 36,
+    w0308_unused_region_allocation = 44,
     /// Unreachable pattern arm in `match` expression (`W0401`).
-    w0401_unreachable_pattern_arm = 37,
+    w0401_unreachable_pattern_arm = 45,
     /// Unused local variable binding or function parameter (`W0402`).
-    w0402_unused_binding = 38,
+    w0402_unused_binding = 46,
     /// Function exceeds MIR inlining cost threshold (`W0501`).
-    w0501_inlining_budget_exceeded = 39,
+    w0501_inlining_budget_exceeded = 47,
 
     /// Ergonomic alias for `.e0502_integer_constant_overflow`.
     pub const e0502_integer_overflow: DiagnosticCode = .e0502_integer_constant_overflow;
@@ -557,6 +573,62 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .default_severity = .err,
         .title = "compile-time integer arithmetic overflow",
         .explanation = "A constant folding or `comptime` integer operation overflowed its target bit width.",
+    },
+    .{
+        .code = .e0503_forbidden_comptime_operation,
+        .code_str = "E0503",
+        .default_severity = .err,
+        .title = "forbidden operation in comptime context",
+        .explanation = "Compile-time evaluation forbids I/O, FFI calls, non-determinism, and raw pointer-to-integer casts.",
+    },
+    .{
+        .code = .e0504_comptime_out_of_bounds,
+        .code_str = "E0504",
+        .default_severity = .err,
+        .title = "compile-time memory access out of bounds",
+        .explanation = "A `comptime` array, slice, or virtual allocation access fell outside its allocated bounds.",
+    },
+    .{
+        .code = .e0505_comptime_uninitialized_read,
+        .code_str = "E0505",
+        .default_severity = .err,
+        .title = "compile-time read of uninitialized memory",
+        .explanation = "A `comptime` load read from bytes whose shadow initialization bitmap was unset.",
+    },
+    .{
+        .code = .e0506_comptime_invalid_pointer,
+        .code_str = "E0506",
+        .default_severity = .err,
+        .title = "compile-time invalid or dangling pointer",
+        .explanation = "A `comptime` dereference used a null, misaligned, or deallocated virtual allocation pointer.",
+    },
+    .{
+        .code = .e0507_comptime_arithmetic_trap,
+        .code_str = "E0507",
+        .default_severity = .err,
+        .title = "compile-time arithmetic trap",
+        .explanation = "A `comptime` division by zero, remainder by zero, or invalid shift count occurred.",
+    },
+    .{
+        .code = .e0508_comptime_resource_limit_exceeded,
+        .code_str = "E0508",
+        .default_severity = .err,
+        .title = "compile-time resource limit exceeded",
+        .explanation = "A `comptime` evaluation exceeded the virtual heap, call depth, unroll, or `@embed_bytes` cap.",
+    },
+    .{
+        .code = .e0509_comptime_evaluation_cycle,
+        .code_str = "E0509",
+        .default_severity = .err,
+        .title = "compile-time evaluation cycle detected",
+        .explanation = "A `const` item or `comptime` query recursively depended on its own value before completion.",
+    },
+    .{
+        .code = .e0510_compile_assertion_failed,
+        .code_str = "E0510",
+        .default_severity = .err,
+        .title = "compile-time assertion or error triggered",
+        .explanation = "An explicit `@compile_assert` condition evaluated to `false` or `@compile_error` was reached.",
     },
     .{
         .code = .w0001_deprecated_cli_option,

@@ -1,8 +1,8 @@
 //! CoreX Stage 0 Master Verification Suite Runner (`tests/test_runner.zig`)
 //!
-//! Aggregates and executes all Phase 0, Phase 1, Phase 2, Phase 3, and Phase 4 isolated unit tests
-//! (`tests/unit/`), golden snapshot tests (`tests/snapshots/`), deterministic PRNG fuzzers
-//! (`tests/fuzz/`), and repository drift guards (`tests/drift/`).
+//! Aggregates and executes all Phase 0, Phase 1, Phase 2, Phase 3, Phase 4, and Phase 5 isolated
+//! unit tests (`tests/unit/`), golden snapshot tests (`tests/snapshots/`), deterministic PRNG
+//! fuzzers (`tests/fuzz/`), and repository drift guards (`tests/drift/`).
 //!
 //! Invoked automatically by `zig build test` alongside internal `stage0/src/` module tests.
 
@@ -20,7 +20,7 @@ pub const syntax_arenas_test = @import("unit/syntax_arenas_test.zig");
 pub const lexer_test = @import("unit/lexer_test.zig");
 /// Unit tests for `parser.zig` (lossless CST/AST, 15 Pratt tiers, showcases, recovery, incremental).
 pub const parser_test = @import("unit/parser_test.zig");
-/// Unit tests for `query_db.zig` (`CompilerDb`, 10-stage pipeline, Early Cutoff, Durability, `ItemTree`).
+/// Unit tests for `query_db.zig` (`CompilerDb`, 14-stage pipeline, Early Cutoff, Durability, `ItemTree`).
 pub const query_db_test = @import("unit/query_db_test.zig");
 /// Unit tests for `fmt_engine.zig` (`DocInst`, `DocArena`, `DocRenderer`, `corex fmt`, `--fix`).
 pub const fmt_engine_test = @import("unit/fmt_engine_test.zig");
@@ -28,6 +28,14 @@ pub const fmt_engine_test = @import("unit/fmt_engine_test.zig");
 pub const symbol_resolver_test = @import("unit/symbol_resolver_test.zig");
 /// Unit tests for `type_system.zig` (`InternPool`, `TypeGroupMask`, `E0400`–`E0415`, `W0401`, `E0502`).
 pub const type_system_test = @import("unit/type_system_test.zig");
+/// Unit tests for `hir.zig` (18B SoA `HirNode`, `BitSpec`, all 12 `AST -> HIR` desugarings, `renderHir`).
+pub const hir_test = @import("unit/hir_test.zig");
+/// Unit tests for `mir.zig` (Block-Arg SSA `MirSsaBuilder`, `switch_int`, `defer`, `subscript`, `V1`–`V6`).
+pub const mir_test = @import("unit/mir_test.zig");
+/// Unit tests for `mir_vm.zig` (`SymbolicPtr`, `VmValueRepr`, `E0501`–`E0510`, 9 reflection intrinsics, `.rodata`).
+pub const mir_vm_test = @import("unit/mir_vm_test.zig");
+/// Unit tests for `mir_opt.zig` (`LayoutShapeKey`, `--dev` `D1`–`D5`, `--release` `R1`–`R6`, `W0501`, `ICF`).
+pub const mir_opt_test = @import("unit/mir_opt_test.zig");
 /// Unit tests for `diag/diagnostic.zig` and `diag/renderer.zig` (`DiagnosticSink`, `TransactionalPatcher`).
 pub const diagnostic_test = @import("unit/diagnostic_test.zig");
 /// Unit tests for `cli/style.zig`, `cli/box_draw.zig`, and `cli/router.zig`.
@@ -46,10 +54,12 @@ pub const phase2_parser_fuzz = @import("fuzz/phase2_parser_fuzz.zig");
 pub const phase3_fmt_fuzz = @import("fuzz/phase3_fmt_fuzz.zig");
 /// Phase 4 deterministic PRNG fuzzing suite (`symbol_resolver` + `type_system` fault tolerance & incremental parity).
 pub const phase4_typecheck_fuzz = @import("fuzz/phase4_typecheck_fuzz.zig");
+/// Phase 5 deterministic PRNG fuzzing suite (`HIR`/`MIR` fault tolerance, `--dev` vs `--release` parity, and `CompilerDb` Stages 10–13).
+pub const phase5_mir_comptime_fuzz = @import("fuzz/phase5_mir_comptime_fuzz.zig");
 /// Repository-wide drift guards (zero colored emojis, CLI parity, diagnostic catalog, `< 150` col format).
 pub const drift_guard_test = @import("drift/drift_guard_test.zig");
 
-test "test_runner_references_all_phase0_phase1_phase2_phase3_and_phase4_verification_suites" {
+test "test_runner_references_all_phase0_to_phase5_verification_suites" {
     std.testing.refAllDecls(@This());
     _ = mem_foundation_test;
     _ = vfs_sourcemap_test;
@@ -60,6 +70,10 @@ test "test_runner_references_all_phase0_phase1_phase2_phase3_and_phase4_verifica
     _ = fmt_engine_test;
     _ = symbol_resolver_test;
     _ = type_system_test;
+    _ = hir_test;
+    _ = mir_test;
+    _ = mir_vm_test;
+    _ = mir_opt_test;
     _ = diagnostic_test;
     _ = cli_router_test;
     _ = bench_harness_test;
@@ -69,5 +83,6 @@ test "test_runner_references_all_phase0_phase1_phase2_phase3_and_phase4_verifica
     _ = phase2_parser_fuzz;
     _ = phase3_fmt_fuzz;
     _ = phase4_typecheck_fuzz;
+    _ = phase5_mir_comptime_fuzz;
     _ = drift_guard_test;
 }

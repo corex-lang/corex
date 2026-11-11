@@ -230,6 +230,62 @@ pub const SymbolKind = enum(u8) {
     field_sym = 20,
 };
 
+/// 1-byte bit-packed mask of compiler-synthesized `@derive(...)` traits (`DR-05` Section 2.3).
+pub const DeriveMask = packed struct(u8) {
+    /// `@derive(Eq)` (`fn eq(&self, other: &Self) -> bool`).
+    has_eq: bool = false,
+    /// `@derive(Hash)` (`fn hash(&self) -> u64`).
+    has_hash: bool = false,
+    /// `@derive(Debug)` (`fn debug(&self) -> str`).
+    has_debug: bool = false,
+    /// `@derive(Clone)` (`fn clone(&self) -> Self`).
+    has_clone: bool = false,
+    /// Reserved padding bits (`0`).
+    reserved: u4 = 0,
+
+    /// Returns `true` if at least one built-in `@derive` trait is requested.
+    pub inline fn hasAny(self: DeriveMask) bool {
+        return self.has_eq or self.has_hash or self.has_debug or self.has_clone;
+    }
+};
+
+/// 1-byte bit-packed mask of valid declaration targets for an `@attribute_schema` struct (`DR-05` Section 2.2).
+pub const AttrTargetMask = packed struct(u8) {
+    /// Allowed on `struct` declarations (`.Struct`).
+    has_struct_target: bool = false,
+    /// Allowed on `enum` declarations (`.Enum`).
+    has_enum_target: bool = false,
+    /// Allowed on `struct`/`union`/`bit_field` fields (`.StructField` / `.Field`).
+    has_field_target: bool = false,
+    /// Allowed on `fn` declarations and methods (`.Fn` / `.Function`).
+    has_fn_target: bool = false,
+    /// Allowed on `enum` variants (`.EnumVariant` / `.Variant`).
+    has_variant_target: bool = false,
+    /// Allowed on function parameters (`.Param`).
+    has_param_target: bool = false,
+    /// Allowed on local `let` / `var` bindings (`.Local`).
+    has_local_target: bool = false,
+    /// Allowed on `union` declarations (`.Union`).
+    has_union_target: bool = false,
+
+    /// Unrestricted target mask used when `@attribute_schema` omits an explicit `targets` filter.
+    pub const ALL: AttrTargetMask = .{
+        .has_struct_target = true,
+        .has_enum_target = true,
+        .has_field_target = true,
+        .has_fn_target = true,
+        .has_variant_target = true,
+        .has_param_target = true,
+        .has_local_target = true,
+        .has_union_target = true,
+    };
+
+    /// Returns `true` if no target bit is enabled.
+    pub inline fn isEmpty(self: AttrTargetMask) bool {
+        return @as(u8, @bitCast(self)) == 0;
+    }
+};
+
 /// 2-byte bit-packed semantic and attribute flags attached to each `SymbolRecord`.
 pub const SymbolFlags = packed struct(u16) {
     /// `true` if declared with `pub`.
@@ -258,8 +314,12 @@ pub const SymbolFlags = packed struct(u16) {
     is_type_group: bool = false,
     /// `true` if this function is an `extern` or trait prototype without a body block.
     is_prototype_only: bool = false,
-    /// Reserved padding bits (`0`).
-    reserved: u3 = 0,
+    /// `true` if declared with `comptime` (`comptime fn` or `comptime` parameter, `DR-05` Section 3.1).
+    is_comptime: bool = false,
+    /// `true` if annotated with `@attribute_schema` (`DR-05` Section 2.2).
+    is_attribute_schema: bool = false,
+    /// `true` if declared with `extern` or `@extern` (`DR-05` Section 3.1).
+    is_extern: bool = false,
 };
 
 /// Complete metadata record for a symbol registered in `SymbolTable`.
@@ -278,8 +338,10 @@ pub const SymbolRecord = struct {
     flags: SymbolFlags = .{},
     /// Enclosing `ScopeId` where this symbol is registered.
     scope_id: ScopeId,
-    /// Associated top-level `DefId` (`.NONE` for locals and built-ins).
+    /// Associated top-level `DefId` (`.NONE` for locals, nested methods, and built-ins).
     def_id: DefId = .NONE,
+    /// Enclosing top-level `DefId` owning a `@derive` or `impl` member symbol (`.NONE` otherwise).
+    owner_def_id: DefId = .NONE,
     /// AST node index of the declaration (`.none` for built-ins).
     ast_node: NodeIndex = .none,
     /// CST node index of the declaration (`.none` for built-ins).
@@ -296,6 +358,12 @@ pub const SymbolRecord = struct {
     member_ordinal: u16 = 0,
     /// Bit width for `bit_field` members (`0` for standard fields).
     bit_width: u16 = 0,
+    /// Bitmask of `comptime`-qualified value parameters (`bit i == 1` when parameter `i` is `comptime`).
+    is_comptime_param_mask: u64 = 0,
+    /// Parsed `@derive(Eq, Hash, Debug, Clone)` bitmask on nominal `struct` / `enum` / `union` items.
+    derive_mask: DeriveMask = .{},
+    /// Allowed declaration target bitmask when `flags.is_attribute_schema` is `true`.
+    attr_target_mask: AttrTargetMask = .{},
 };
 
 /// Explicit `@overload` function group tracking all member `fn_sym` symbols in a scope (`DR-02`).
@@ -409,6 +477,37 @@ pub const BUILTIN_TYPES_AND_GROUPS = [_]BuiltinTypeEntry{
     .{ .name = "Copy", .type_id = .group_copy, .is_group = true },
 };
 
+/// Canonical `AttributeTarget` variant names for `@attribute_schema(targets = […])` typo suggestions.
+const ATTRIBUTE_TARGET_NAMES = [_][]const u8{
+    "Enum",
+    "EnumVariant",
+    "Field",
+    "Fn",
+    "Function",
+    "Local",
+    "Param",
+    "Struct",
+    "StructField",
+    "Union",
+    "Variant",
+};
+
+/// $O(1)$ static lookup map from `AttributeTarget` variant names to `AttrTargetMask` bits.
+const ATTRIBUTE_TARGET_MAP = std.StaticStringMap(AttrTargetMask).initComptime(.{
+    .{ "Enum", AttrTargetMask{ .has_enum_target = true } },
+    .{ "EnumVariant", AttrTargetMask{ .has_variant_target = true } },
+    .{ "Field", AttrTargetMask{ .has_field_target = true } },
+    .{ "Fn", AttrTargetMask{ .has_fn_target = true } },
+    .{ "Function", AttrTargetMask{ .has_fn_target = true } },
+    .{ "Local", AttrTargetMask{ .has_local_target = true } },
+    .{ "LocalVar", AttrTargetMask{ .has_local_target = true } },
+    .{ "Param", AttrTargetMask{ .has_param_target = true } },
+    .{ "Struct", AttrTargetMask{ .has_struct_target = true } },
+    .{ "StructField", AttrTargetMask{ .has_field_target = true } },
+    .{ "Union", AttrTargetMask{ .has_union_target = true } },
+    .{ "Variant", AttrTargetMask{ .has_variant_target = true } },
+});
+
 // -------------------------------------- INTERNALS --------------------------------------
 
 // -------------- Scoped Hash Key & Lexeme Helpers --------------
@@ -419,6 +518,11 @@ inline fn packScopedSymbolKey(scope_id: ScopeId, name: SymbolId, namespace: Name
     const ns_part: u64 = @as(u64, @intFromEnum(namespace)) << 30;
     const sym_part: u64 = @as(u64, name.asInt()) << 32;
     return sym_part | ns_part | scope_part;
+}
+
+/// Packs `(target_ty, trait_sym_idx)` into a collision-free 64-bit key for `SymbolTable.trait_impl_pairs`.
+pub inline fn packTraitImplKey(target_ty: TypeId, trait_sym_idx: SymbolIndex) u64 {
+    return (@as(u64, target_ty.toU32()) << 32) | @as(u64, trait_sym_idx.asInt());
 }
 
 /// Returns the UTF-8 source slice of `token_id`, or `""` for synthesized/out-of-bounds tokens.
@@ -629,10 +733,16 @@ pub const SymbolTable = struct {
     type_to_symbol: std.AutoHashMapUnmanaged(u32, SymbolIndex) = .empty,
     /// Registered `@from` (`FromError`) `(source_err_ty, target_err_ty)` pairs for `?` upcasting (`DR-07`).
     from_error_pairs: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// Maps `(source_err_ty, target_err_ty)` to the conversion `fn` `DefId` when backed by an `@from fn`.
+    from_error_fn_defs: std.AutoHashMapUnmanaged(u64, DefId) = .empty,
+    /// Registered `(target_ty, trait_sym_idx)` pairs from `impl Trait for Type` and `@derive(Trait)`.
+    trait_impl_pairs: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// Deferred `use` imports queued during Pass 1 for Pass 2 cross-module resolution.
     pending_imports: std.ArrayListUnmanaged(PendingUseImport) = .empty,
     /// Global prelude `ScopeId` (`ScopeId.fromInt(0)`).
     prelude_scope: ScopeId = .none,
+    /// Lazily populated `std::meta` module `ScopeId` (`DR-05` §3.3).
+    std_meta_scope: ScopeId = .none,
 
     /// Initializes a new `SymbolTable` and pre-populates the global prelude scope (`ScopeId` `0`).
     pub fn init(allocator: std.mem.Allocator, interner: *StringInterner) !SymbolTable {
@@ -665,6 +775,8 @@ pub const SymbolTable = struct {
         self.def_to_symbol.deinit(self.allocator);
         self.type_to_symbol.deinit(self.allocator);
         self.from_error_pairs.deinit(self.allocator);
+        self.from_error_fn_defs.deinit(self.allocator);
+        self.trait_impl_pairs.deinit(self.allocator);
         self.pending_imports.deinit(self.allocator);
         self.scope_arena.deinit();
         self.* = undefined;
@@ -689,9 +801,102 @@ pub const SymbolTable = struct {
         self.def_to_symbol.clearRetainingCapacity();
         self.type_to_symbol.clearRetainingCapacity();
         self.from_error_pairs.clearRetainingCapacity();
+        self.from_error_fn_defs.clearRetainingCapacity();
+        self.trait_impl_pairs.clearRetainingCapacity();
         self.pending_imports.clearRetainingCapacity();
         self.scope_arena.resetRetainingCapacity();
+        self.std_meta_scope = .none;
         try self.populateGlobalPrelude(interner);
+    }
+
+    /// Lazily populates `std::meta` and its 8 value-based reflection mirror stubs (`DR-05` §3.3).
+    pub fn ensureStdMetaScope(self: *SymbolTable, interner: *StringInterner) !ScopeId {
+        if (!self.std_meta_scope.isNone()) return self.std_meta_scope;
+
+        const std_sym_id = try interner.intern("std");
+        const existing_std = self.lookupInScopeDirect(
+            self.prelude_scope,
+            std_sym_id,
+            NamespaceMask.VALUE_ONLY,
+        );
+        const std_scope = if (!existing_std.isNone() and
+            !self.getSymbol(existing_std).target_scope.isNone())
+            self.getSymbol(existing_std).target_scope
+        else blk: {
+            const new_std_scope = try self.scope_arena.allocScope(
+                .module_scope,
+                self.prelude_scope,
+                .NONE,
+                .none,
+                .{},
+            );
+            _ = try self.defineSymbol(.{
+                .name = std_sym_id,
+                .name_text = interner.get(std_sym_id),
+                .kind = .module_sym,
+                .namespace = .value_ns,
+                .visibility = .public,
+                .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+                .scope_id = self.prelude_scope,
+                .target_scope = new_std_scope,
+            }, null);
+            break :blk new_std_scope;
+        };
+
+        const meta_sym_id = try interner.intern("meta");
+        const meta_scope = try self.scope_arena.allocScope(
+            .module_scope,
+            std_scope,
+            .NONE,
+            .none,
+            .{},
+        );
+        _ = try self.defineSymbol(.{
+            .name = meta_sym_id,
+            .name_text = interner.get(meta_sym_id),
+            .kind = .module_sym,
+            .namespace = .value_ns,
+            .visibility = .public,
+            .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+            .scope_id = std_scope,
+            .target_scope = meta_scope,
+        }, null);
+
+        const MirrorStub = struct { name: []const u8, kind: SymbolKind };
+        const stubs = [8]MirrorStub{
+            .{ .name = "EnumInfo", .kind = .struct_sym },
+            .{ .name = "FieldInfo", .kind = .struct_sym },
+            .{ .name = "MetaId", .kind = .struct_sym },
+            .{ .name = "PrimKind", .kind = .enum_sym },
+            .{ .name = "StructInfo", .kind = .struct_sym },
+            .{ .name = "TypeInfo", .kind = .struct_sym },
+            .{ .name = "TypeKind", .kind = .enum_sym },
+            .{ .name = "VariantInfo", .kind = .struct_sym },
+        };
+        for (stubs) |stub| {
+            const stub_sym_id = try interner.intern(stub.name);
+            const member_scope = try self.scope_arena.allocScope(
+                .nominal_type_scope,
+                meta_scope,
+                .NONE,
+                .none,
+                .{},
+            );
+            _ = try self.defineSymbol(.{
+                .name = stub_sym_id,
+                .name_text = interner.get(stub_sym_id),
+                .kind = stub.kind,
+                .namespace = .type_ns,
+                .visibility = .public,
+                .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+                .scope_id = meta_scope,
+                .target_scope = member_scope,
+                .type_id = .err_ty,
+            }, null);
+        }
+
+        self.std_meta_scope = meta_scope;
+        return meta_scope;
     }
 
     /// Populates `ScopeId` `0` (`.global_prelude`) with the 19 primitives, 11 Type Groups, and built-in traits.
@@ -1358,16 +1563,228 @@ pub fn emitPrivateAccessDiagnostic(
 
 // --------- Module Item Collection & `use` Resolution ----------
 
-/// Extracts `@overload`, `@must_use`, `@from`, and `#soa` flags from CST `.attribute` nodes inside `item_cst`.
-pub fn extractItemAttributesAndVisibility(
+/// Combined item modifier, `@derive`, and `@attribute_schema` metadata extracted from CST headers.
+pub const ItemHeaderMetadata = struct {
+    /// Extracted item visibility, modifier, and attribute flags.
+    flags: SymbolFlags = .{},
+    /// Parsed `@derive(Eq, Hash, Debug, Clone)` bitmask.
+    derive_mask: DeriveMask = .{},
+    /// Parsed `@attribute_schema(targets = …)` target bitmask.
+    attr_target_mask: AttrTargetMask = .{},
+};
+
+/// Returns the next leaf `TokenIndex` inside `[start_cursor .. attr_end)`, or `.none` if exhausted.
+fn peekNextAttrLeafToken(
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    start_cursor: usize,
+    attr_end: usize,
+) TokenIndex {
+    var scan_idx = start_cursor;
+    while (scan_idx < attr_end) : (scan_idx += 1) {
+        const cand = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(scan_idx)));
+        if (cand.subtree_size <= 1 and !cand.token.isNone() and
+            cand.token.asInt() < token_buffer.countTokens())
+        {
+            return cand.token;
+        }
+    }
+    return .none;
+}
+
+/// Emits `E0403` for an unknown `@attribute_schema` parameter or misspelled `AttributeTarget` variant.
+fn emitInvalidAttributeSchemaToken(
+    sink: *DiagnosticSink,
+    file_id: FileId,
+    token_buffer: *const TokenBuffer,
+    bad_tok: TokenIndex,
+    bad_lexeme: []const u8,
+    is_named_param: bool,
+) !void {
+    const span = token_buffer.getTokenSpan(file_id, bad_tok);
+    const arena_alloc = sink.arena.asAllocator();
+    const message = if (is_named_param)
+        try std.fmt.allocPrint(
+            arena_alloc,
+            "unknown `@attribute_schema` parameter `{s}`; expected `targets`",
+            .{bad_lexeme},
+        )
+    else
+        try std.fmt.allocPrint(
+            arena_alloc,
+            "unknown `AttributeTarget` variant `{s}` in `@attribute_schema`",
+            .{bad_lexeme},
+        );
+    const label_text = if (is_named_param)
+        "unknown `@attribute_schema` parameter"
+    else
+        "invalid `AttributeTarget` variant here";
+
+    var best_suggestion: ?[]const u8 = if (is_named_param) "targets" else null;
+    if (!is_named_param and bad_lexeme.len > 0) {
+        var best_dist: u16 = 3;
+        for (ATTRIBUTE_TARGET_NAMES) |cand_name| {
+            const dist = computeEditDistance(bad_lexeme, cand_name);
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_suggestion = cand_name;
+            }
+        }
+    }
+
+    const labels = [1]LabeledSpan{
+        .{ .span = span, .label = label_text, .style = .primary },
+    };
+    if (best_suggestion) |suggested| {
+        const help_note = try std.fmt.allocPrint(
+            arena_alloc,
+            "help: did you mean `{s}`?",
+            .{suggested},
+        );
+        const notes = [1][]const u8{help_note};
+        _ = try sink.emit(.{
+            .code = .e0403_unresolved_symbol,
+            .severity = .err,
+            .primary_span = span,
+            .message = message,
+            .labels = &labels,
+            .notes = &notes,
+        });
+    } else {
+        _ = try sink.emit(.{
+            .code = .e0403_unresolved_symbol,
+            .severity = .err,
+            .primary_span = span,
+            .message = message,
+            .labels = &labels,
+        });
+    }
+}
+
+/// Extracts and validates `@attribute_schema(...)` target arguments inside `[arg_start .. attr_end)`.
+fn extractAttributeSchemaTargets(
+    source: []const u8,
+    file_id: FileId,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    arg_start: usize,
+    attr_end: usize,
+    diagnostic_sink: ?*DiagnosticSink,
+) !AttrTargetMask {
+    const first_tok = peekNextAttrLeafToken(token_buffer, cst_arena, arg_start, attr_end);
+    if (first_tok.isNone() or token_buffer.getToken(first_tok).kind != .lparen) {
+        return AttrTargetMask.ALL;
+    }
+
+    var parsed_mask = AttrTargetMask{};
+    var arg_cur = arg_start;
+    while (arg_cur < attr_end) : (arg_cur += 1) {
+        const arg_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cur)));
+        if (arg_leaf.subtree_size > 1 or arg_leaf.token.isNone() or
+            arg_leaf.token.asInt() >= token_buffer.countTokens())
+        {
+            continue;
+        }
+        const arg_kind = token_buffer.getToken(arg_leaf.token).kind;
+        switch (arg_kind) {
+            .lparen,
+            .rparen,
+            .lbracket,
+            .rbracket,
+            .comma,
+            .dot,
+            .coloncolon,
+            .pipe,
+            .eq,
+            .colon,
+            => continue,
+            else => {},
+        }
+
+        const token_lex = extractTokenSlice(source, token_buffer, arg_leaf.token);
+        if (isIdentifierToken(arg_kind)) {
+            const next_tok = peekNextAttrLeafToken(token_buffer, cst_arena, arg_cur + 1, attr_end);
+            const next_kind: TokenKind = if (!next_tok.isNone())
+                token_buffer.getToken(next_tok).kind
+            else
+                .eof;
+            if (next_kind == .eq or next_kind == .colon) {
+                if (!std.mem.eql(u8, token_lex, "targets")) {
+                    if (diagnostic_sink) |sink| {
+                        try emitInvalidAttributeSchemaToken(
+                            sink,
+                            file_id,
+                            token_buffer,
+                            arg_leaf.token,
+                            token_lex,
+                            true,
+                        );
+                    }
+                }
+                continue;
+            }
+            if ((next_kind == .coloncolon or next_kind == .dot) and
+                std.mem.eql(u8, token_lex, "AttributeTarget"))
+            {
+                continue;
+            }
+            if (ATTRIBUTE_TARGET_MAP.get(token_lex)) |bit_val| {
+                parsed_mask = @bitCast(@as(u8, @bitCast(parsed_mask)) | @as(u8, @bitCast(bit_val)));
+            } else if (diagnostic_sink) |sink| {
+                try emitInvalidAttributeSchemaToken(
+                    sink,
+                    file_id,
+                    token_buffer,
+                    arg_leaf.token,
+                    token_lex,
+                    false,
+                );
+            }
+        } else if (diagnostic_sink) |sink| {
+            try emitInvalidAttributeSchemaToken(
+                sink,
+                file_id,
+                token_buffer,
+                arg_leaf.token,
+                token_lex,
+                false,
+            );
+        }
+    }
+    return parsed_mask;
+}
+
+/// Extracts item flags, `comptime` modifier, `@derive(...)`, and `@attribute_schema(...)` metadata from `item_cst`.
+pub fn extractItemHeaderMetadata(
     source: []const u8,
     token_buffer: *const TokenBuffer,
     cst_arena: *const LosslessCstArena,
     item_cst: CstNodeIndex,
     main_token: TokenIndex,
-) SymbolFlags {
-    var flags = SymbolFlags{};
-    if (item_cst.isNone() or item_cst.asInt() >= cst_arena.countNodes()) return flags;
+) ItemHeaderMetadata {
+    return extractItemHeaderMetadataValidated(
+        source,
+        .none,
+        token_buffer,
+        cst_arena,
+        item_cst,
+        main_token,
+        null,
+    ) catch ItemHeaderMetadata{};
+}
+
+/// Extracts item header metadata while validating `@attribute_schema(...)` targets into `diagnostic_sink`.
+pub fn extractItemHeaderMetadataValidated(
+    source: []const u8,
+    file_id: FileId,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    item_cst: CstNodeIndex,
+    main_token: TokenIndex,
+    diagnostic_sink: ?*DiagnosticSink,
+) !ItemHeaderMetadata {
+    var meta = ItemHeaderMetadata{};
+    if (item_cst.isNone() or item_cst.asInt() >= cst_arena.countNodes()) return meta;
 
     const start_idx: usize = item_cst.asInt();
     const root_rec = cst_arena.getNode(item_cst);
@@ -1383,8 +1800,21 @@ pub fn extractItemAttributesAndVisibility(
             break;
         }
         if (node.kind == .visibility_modifier) {
-            flags.is_pub = true;
+            meta.flags.is_pub = true;
             continue;
+        }
+        if (node.subtree_size <= 1 and !node.flags.is_bracketed and !node.token.isNone() and
+            node.token.asInt() < token_buffer.countTokens())
+        {
+            const tok_kind_pre = token_buffer.getToken(node.token).kind;
+            if (tok_kind_pre == .kw_comptime) {
+                meta.flags.is_comptime = true;
+                continue;
+            }
+            if (tok_kind_pre == .kw_extern) {
+                meta.flags.is_extern = true;
+                continue;
+            }
         }
         if (node.kind == .attribute) {
             const attr_end = @min(cursor + @max(@as(usize, node.subtree_size), 1), end_idx);
@@ -1398,13 +1828,48 @@ pub fn extractItemAttributesAndVisibility(
                     if (isIdentifierToken(tok_kind) or tok_kind == .kw_pub) {
                         const attr_name = extractTokenSlice(source, token_buffer, leaf.token);
                         if (std.mem.eql(u8, attr_name, "overload")) {
-                            flags.is_overload = true;
+                            meta.flags.is_overload = true;
                         } else if (std.mem.eql(u8, attr_name, "must_use")) {
-                            flags.is_must_use = true;
+                            meta.flags.is_must_use = true;
                         } else if (std.mem.eql(u8, attr_name, "from")) {
-                            flags.is_from_error = true;
+                            meta.flags.is_from_error = true;
                         } else if (std.mem.eql(u8, attr_name, "soa")) {
-                            flags.is_soa_annotated = true;
+                            meta.flags.is_soa_annotated = true;
+                        } else if (std.mem.eql(u8, attr_name, "extern")) {
+                            meta.flags.is_extern = true;
+                        } else if (std.mem.eql(u8, attr_name, "derive")) {
+                            var arg_cur = attr_cur + 1;
+                            while (arg_cur < attr_end) : (arg_cur += 1) {
+                                const arg_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cur)));
+                                if (arg_leaf.subtree_size <= 1 and !arg_leaf.token.isNone() and
+                                    arg_leaf.token.asInt() < token_buffer.countTokens())
+                                {
+                                    const arg_kind = token_buffer.getToken(arg_leaf.token).kind;
+                                    if (isIdentifierToken(arg_kind)) {
+                                        const trait_lex = extractTokenSlice(source, token_buffer, arg_leaf.token);
+                                        if (std.mem.eql(u8, trait_lex, "Eq")) {
+                                            meta.derive_mask.has_eq = true;
+                                        } else if (std.mem.eql(u8, trait_lex, "Hash")) {
+                                            meta.derive_mask.has_hash = true;
+                                        } else if (std.mem.eql(u8, trait_lex, "Debug")) {
+                                            meta.derive_mask.has_debug = true;
+                                        } else if (std.mem.eql(u8, trait_lex, "Clone")) {
+                                            meta.derive_mask.has_clone = true;
+                                        }
+                                    }
+                                }
+                            }
+                        } else if (std.mem.eql(u8, attr_name, "attribute_schema")) {
+                            meta.flags.is_attribute_schema = true;
+                            meta.attr_target_mask = try extractAttributeSchemaTargets(
+                                source,
+                                file_id,
+                                token_buffer,
+                                cst_arena,
+                                attr_cur + 1,
+                                attr_end,
+                                diagnostic_sink,
+                            );
                         }
                         break;
                     }
@@ -1415,7 +1880,18 @@ pub fn extractItemAttributesAndVisibility(
             }
         }
     }
-    return flags;
+    return meta;
+}
+
+/// Extracts `@overload`, `@must_use`, `@from`, and `#soa` flags from CST `.attribute` nodes inside `item_cst`.
+pub fn extractItemAttributesAndVisibility(
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    item_cst: CstNodeIndex,
+    main_token: TokenIndex,
+) SymbolFlags {
+    return extractItemHeaderMetadata(source, token_buffer, cst_arena, item_cst, main_token).flags;
 }
 
 /// Returns `true` if `item_cst` contains a direct leaf token of `target_kind`.
@@ -1510,6 +1986,7 @@ pub fn collectFileModuleItems(
             file_id,
             file_scope,
             true,
+            .NONE,
             item_slice,
             source,
             token_buffer,
@@ -1528,6 +2005,7 @@ fn collectItemSliceInScope(
     file_id: FileId,
     enclosing_scope: ScopeId,
     is_file_top_level: bool,
+    enclosing_owner_def: DefId,
     item_slice: []const u32,
     source: []const u8,
     token_buffer: *const TokenBuffer,
@@ -1549,13 +2027,16 @@ fn collectItemSliceInScope(
         } else .NONE;
 
         const item_cst = ast_arena.getCstOrigin(item_node_idx);
-        var flags = extractItemAttributesAndVisibility(
+        const header_meta = try extractItemHeaderMetadataValidated(
             source,
+            file_id,
             token_buffer,
             cst_arena,
             item_cst,
             ast_node.main_token,
+            diagnostic_sink,
         );
+        var flags = header_meta.flags;
         const visibility: Visibility = if (flags.is_pub) .public else .private;
 
         switch (ast_node.tag) {
@@ -1602,6 +2083,7 @@ fn collectItemSliceInScope(
                         file_id,
                         mod_scope,
                         false,
+                        .NONE,
                         inner_items,
                         source,
                         token_buffer,
@@ -1658,6 +2140,8 @@ fn collectItemSliceInScope(
                     .cst_node = item_cst,
                     .decl_span = name_span,
                     .target_scope = member_scope,
+                    .derive_mask = header_meta.derive_mask,
+                    .attr_target_mask = header_meta.attr_target_mask,
                 }, diagnostic_sink);
 
                 try collectStructOrBitFieldMembers(
@@ -1699,6 +2183,8 @@ fn collectItemSliceInScope(
                     .cst_node = item_cst,
                     .decl_span = name_span,
                     .target_scope = variant_scope,
+                    .derive_mask = header_meta.derive_mask,
+                    .attr_target_mask = header_meta.attr_target_mask,
                 }, diagnostic_sink);
 
                 try collectEnumVariants(
@@ -1754,6 +2240,7 @@ fn collectItemSliceInScope(
                         file_id,
                         trait_scope,
                         false,
+                        .NONE,
                         member_slice,
                         source,
                         token_buffer,
@@ -1844,6 +2331,7 @@ fn collectItemSliceInScope(
                     .flags = flags,
                     .scope_id = enclosing_scope,
                     .def_id = def_id,
+                    .owner_def_id = enclosing_owner_def,
                     .ast_node = item_node_idx,
                     .cst_node = item_cst,
                     .decl_span = name_span,
@@ -1866,6 +2354,7 @@ fn collectItemSliceInScope(
                     .flags = flags,
                     .scope_id = enclosing_scope,
                     .def_id = def_id,
+                    .owner_def_id = enclosing_owner_def,
                     .ast_node = item_node_idx,
                     .cst_node = item_cst,
                     .decl_span = name_span,
@@ -1893,6 +2382,7 @@ fn collectItemSliceInScope(
                     file_id,
                     target_scope,
                     false,
+                    def_id,
                     member_items,
                     source,
                     token_buffer,
@@ -2532,6 +3022,9 @@ pub fn resolveModulePathSegments(
 
         const seg_sym_id = try interner.intern(seg_lexeme);
         const seg_span = token_buffer.getTokenSpan(file_id, seg_tok);
+        if (i == 0 and std.mem.eql(u8, seg_lexeme, "std")) {
+            _ = try sym_table.ensureStdMetaScope(interner);
+        }
         const lookup_res = if (i == 0 and cur_scope == caller_scope)
             sym_table.lookupLexical(cur_scope, seg_sym_id, NamespaceMask.TYPE_OR_VALUE)
         else

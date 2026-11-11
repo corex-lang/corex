@@ -1,0 +1,166 @@
+hir_module : unit
+  hir_const_decl : bool
+  hir_struct_decl : IoError
+  hir_enum_decl : AppError
+  hir_struct_decl : SampleRow
+  hir_struct_decl : PacketFlags
+  hir_fn_decl : <type> @scale_step
+    hir_block : never
+      hir_return : never
+        hir_binary_op : i32 [mul]
+          hir_var_ref : i32 _l1 (num)
+          hir_var_ref : i32 _l2 (factor)
+  hir_fn_decl : <type> @read_raw
+    hir_block : never
+      hir_if : unit
+        hir_var_ref : bool _l4 (is_ok)
+        hir_block : never
+          hir_return : never
+            hir_construct : Result[i32, IoError]
+      hir_return : never
+        hir_construct : Result[i32, IoError]
+  hir_fn_decl : <type> @lift_value
+    hir_block : never
+      hir_local_decl : unit _l11
+        hir_match : i32
+          hir_call : Result[i32, IoError]
+            hir_global_ref : <type>
+            hir_project_arg : bool
+              hir_var_ref : bool _l7 (is_ok)
+          hir_var_ref : i32 _l9
+          hir_return : never
+            hir_construct : Result[i32, AppError]
+      hir_local_decl : unit _l12
+        hir_call : i32
+          hir_global_ref : <type>
+          hir_project_arg : i32
+            hir_var_ref : i32 _l8 (seed_val)
+          hir_project_arg : i32
+            hir_const_val : i32 = 2
+      hir_return : never
+        hir_construct : Result[i32, AppError]
+  hir_fn_decl : <type> @showcase_hir
+    hir_block : never
+      hir_match : unit
+        hir_var_ref : i32? _l14 (opt_in)
+        hir_const_val : unit = ()
+        hir_block : never
+          hir_return : never
+            hir_const_val : i32 = 0
+      hir_local_decl : unit _l20
+        hir_match : i32
+          hir_call : Result[i32, AppError]
+            hir_global_ref : <type>
+            hir_project_arg : bool
+              hir_var_ref : bool _l15 (is_ok)
+            hir_project_arg : i32
+              hir_var_ref : i32 _l16 (unwrapped)
+          hir_var_ref : i32 _l17
+          hir_match : i32
+            hir_var_ref : AppError _l18 (err)
+            hir_field_proj : i32
+              hir_var_ref : IoError _l19 (io_err)
+            hir_const_val : i32 = -1
+      hir_local_decl : unit _l21
+        hir_construct : #soa [SampleRow; 2]
+      hir_assign : unit
+        hir_block : i32
+          hir_local_decl : unit _l22
+            hir_const_val : i32 = 0
+          hir_soa_field_ptr : i32 [meta=0]
+            hir_var_ref : #soa [SampleRow; 2] _l21 (rows)
+            hir_var_ref : i32 _l22
+        hir_var_ref : i32 _l20 (recovered)
+      hir_block : unit
+        hir_local_decl : unit _l23
+          hir_const_val : i32 = 3
+        hir_local_decl : unit _l25
+          hir_unary_op : &mut i32
+            hir_block : i32
+              hir_local_decl : unit _l24
+                hir_const_val : i32 = 1
+              hir_soa_field_ptr : i32 [meta=0]
+                hir_var_ref : #soa [SampleRow; 2] _l21 (rows)
+                hir_var_ref : i32 _l24
+        hir_assign : unit
+          hir_unary_op : i32
+            hir_var_ref : &mut i32 _l25
+          hir_binary_op : i32 [add]
+            hir_unary_op : i32
+              hir_var_ref : &mut i32 _l25
+            hir_var_ref : i32 _l23
+      hir_local_decl : unit _l29
+        hir_block : PacketFlags
+          hir_local_decl : unit _l26
+            hir_const_val : bool = false
+          hir_local_decl : unit _l27
+            hir_const_val : u16 = 2
+          hir_local_decl : unit _l28
+            hir_construct : PacketFlags
+          hir_bitfield_rmw : unit [meta=1048832]
+            hir_var_ref : PacketFlags _l28
+            hir_var_ref : bool _l26
+          hir_bitfield_rmw : unit [meta=1052417]
+            hir_var_ref : PacketFlags _l28
+            hir_var_ref : u16 _l27
+          hir_var_ref : PacketFlags _l28
+      hir_bitfield_rmw : unit [meta=1048832]
+        hir_var_ref : PacketFlags _l29 (flags)
+        hir_const_val : bool = true
+      hir_bitfield_rmw : unit [meta=1052417]
+        hir_var_ref : PacketFlags _l29 (flags)
+        hir_const_val : u16 = 5
+      hir_local_decl : unit _l30
+        hir_block : i32
+          hir_const_val : i32 = 10
+      hir_local_decl : unit _l31
+        hir_const_val : i32 = 0
+      hir_block : unit
+        hir_block : unit
+          hir_local_decl : unit _l32
+            hir_const_val : i32 = 0
+          hir_assign : unit
+            hir_var_ref : i32 _l31 (unrolled_sum)
+            hir_binary_op : i32 [add]
+              hir_var_ref : i32 _l31 (unrolled_sum)
+              hir_var_ref : i32 _l32
+      hir_block : unit
+        hir_block : unit
+          hir_local_decl : unit _l33
+            hir_const_val : i32 = 1
+          hir_assign : unit
+            hir_var_ref : i32 _l31 (unrolled_sum)
+            hir_binary_op : i32 [add]
+              hir_var_ref : i32 _l31 (unrolled_sum)
+              hir_var_ref : i32 _l33
+      hir_block : unit
+        hir_block : unit
+          hir_local_decl : unit _l34
+            hir_const_val : i32 = 2
+          hir_assign : unit
+            hir_var_ref : i32 _l31 (unrolled_sum)
+            hir_binary_op : i32 [add]
+              hir_var_ref : i32 _l31 (unrolled_sum)
+              hir_var_ref : i32 _l34
+      hir_return : never
+        hir_binary_op : i32 [add]
+          hir_binary_op : i32 [add]
+            hir_binary_op : i32 [add]
+              hir_binary_op : i32 [add]
+                hir_block : i32
+                  hir_local_decl : unit _l35
+                    hir_const_val : i32 = 0
+                  hir_soa_field_ptr : i32 [meta=0]
+                    hir_var_ref : #soa [SampleRow; 2] _l21 (rows)
+                    hir_var_ref : i32 _l35
+                hir_block : i32
+                  hir_local_decl : unit _l36
+                    hir_const_val : i32 = 1
+                  hir_soa_field_ptr : i32 [meta=0]
+                    hir_var_ref : #soa [SampleRow; 2] _l21 (rows)
+                    hir_var_ref : i32 _l36
+              hir_cast : i32
+                hir_bitfield_read : u16
+                  hir_var_ref : PacketFlags _l29 (flags)
+            hir_var_ref : i32 _l30 (bonus)
+          hir_var_ref : i32 _l31 (unrolled_sum)

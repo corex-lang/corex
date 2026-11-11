@@ -3024,7 +3024,7 @@ const CstFormatter = struct {
                     try self.emitTokenWithTrivia(child.token, "=", false);
                     try self.doc_arena.emitText(" ");
                 } else if (tok_kind == .kw_mut or tok_kind == .kw_own or tok_kind == .kw_ref or
-                    tok_kind == .kw_let)
+                    tok_kind == .kw_let or tok_kind == .kw_comptime)
                 {
                     try self.emitTokenWithTrivia(child.token, null, false);
                     try self.doc_arena.emitText(" ");
@@ -3626,6 +3626,42 @@ const CstFormatter = struct {
         }
     }
 
+    /// Returns whether `cst_id` is a block-bodied control-flow or `comptime` statement CST node.
+    fn isBlockBodiedStmtCst(self: *const CstFormatter, cst_id: CstNodeIndex) bool {
+        const node = self.cst_arena.getNode(cst_id);
+        return switch (node.kind) {
+            .if_expr,
+            .match_expr,
+            .for_stmt,
+            .while_stmt,
+            .loop_expr,
+            .block,
+            => true,
+            .prefix_expr => blk: {
+                if (node.subtree_size <= 1) break :blk false;
+                const end_idx: usize = cst_id.asInt() + node.subtree_size;
+                var first_child_id: CstNodeIndex = .none;
+                var last_child_id: CstNodeIndex = .none;
+                var child_cursor: usize = cst_id.asInt() + 1;
+                while (child_cursor < end_idx) {
+                    const child_id = CstNodeIndex.fromInt(@intCast(child_cursor));
+                    const child = self.cst_arena.getNode(child_id);
+                    if (!self.shouldSkipLeaf(child)) {
+                        if (first_child_id.isNone()) first_child_id = child_id;
+                        last_child_id = child_id;
+                    }
+                    child_cursor += @max(@as(usize, 1), child.subtree_size);
+                }
+                if (first_child_id.isNone() or last_child_id.isNone()) break :blk false;
+                const first_child = self.cst_arena.getNode(first_child_id);
+                if (first_child.subtree_size != 1 or first_child.token.isNone()) break :blk false;
+                if (self.token_buffer.getToken(first_child.token).kind != .kw_comptime) break :blk false;
+                break :blk self.isBlockBodiedStmtCst(last_child_id);
+            },
+            else => false,
+        };
+    }
+
     /// Formats an `.expr_stmt`, stripping redundant `;` on block-bodied control-flow statements.
     fn formatExprStmt(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
@@ -3648,18 +3684,7 @@ const CstFormatter = struct {
 
         if (expr_child) |inner_id| {
             try self.formatNode(inner_id);
-            const inner_kind = self.cst_arena.getNode(inner_id).kind;
-            const is_block_bodied = switch (inner_kind) {
-                .if_expr,
-                .match_expr,
-                .for_stmt,
-                .while_stmt,
-                .loop_expr,
-                .block,
-                => true,
-                else => false,
-            };
-            if (is_block_bodied) {
+            if (self.isBlockBodiedStmtCst(inner_id)) {
                 if (!semi_tok.isNone()) {
                     if (self.hasUnconsumedLeadingComments(semi_tok)) {
                         if (!self.hasTrailingNewlineInstruction()) {
@@ -3842,7 +3867,7 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats a `.for_stmt` (`for pat in iter { … }`), stripping outer parens on `iter`.
+    /// Formats a `.for_stmt` (`[comptime] for pat in iter { … }`), stripping outer parens on `iter`.
     fn formatForStmt(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
@@ -3852,7 +3877,10 @@ const CstFormatter = struct {
             const child = self.cst_arena.getNode(child_id);
             if (child.subtree_size == 1 and !child.token.isNone()) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
-                if (child.kind == .for_introducer or tok_kind == .kw_for) {
+                if (tok_kind == .kw_comptime) {
+                    try self.emitTokenWithTrivia(child.token, "comptime", false);
+                    try self.doc_arena.emitText(" ");
+                } else if (child.kind == .for_introducer or tok_kind == .kw_for) {
                     try self.emitTokenWithTrivia(child.token, "for", false);
                     try self.doc_arena.emitText(" ");
                 } else {
@@ -4575,7 +4603,7 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats a `.prefix_expr` (`-x`, `!x`, `~x`, `&x`, `&mut x`, `*x`).
+    /// Formats a `.prefix_expr` (`-x`, `!x`, `~x`, `&x`, `&mut x`, `*x`, `comptime expr`).
     fn formatPrefixExpr(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
@@ -4586,7 +4614,8 @@ const CstFormatter = struct {
             if (child.subtree_size == 1 and !child.token.isNone()) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
                 if ((tok_kind == .kw_mut or tok_kind == .kw_own or tok_kind == .kw_ref or
-                    tok_kind == .kw_let or tok_kind == .ident) and idx + 1 < children.items.len)
+                    tok_kind == .kw_let or tok_kind == .kw_comptime or tok_kind == .ident) and
+                    idx + 1 < children.items.len)
                 {
                     try self.emitTokenWithTrivia(child.token, null, false);
                     try self.doc_arena.emitText(" ");
@@ -5571,4 +5600,40 @@ test "test_format_red_team_role_aware_fix_renaming" {
         "    return foo.inner_val;\n" ++
         "}\n";
     try std.testing.expectEqualStrings(expected, res.formatted_text);
+}
+
+test "test_format_phase5_comptime_intrinsics_and_is_pattern_idempotence" {
+    const src =
+        "fn inspect[T](comptime label: str, status: Status) -> usize {\n" ++
+        "    @compile_assert(@size_of[T]() > 0, label);\n" ++
+        "    comptime {\n" ++
+        "        @compile_assert(true, \"ok\");\n" ++
+        "    };\n" ++
+        "    comptime if @size_of[T]() == 8 {\n" ++
+        "        let sz = @align_of[T]();\n" ++
+        "    };\n" ++
+        "    comptime for idx in 0..4 {\n" ++
+        "        let step = idx;\n" ++
+        "    }\n" ++
+        "    if status is Ready {\n" ++
+        "        return comptime @size_of[T]();\n" ++
+        "    }\n" ++
+        "    return 0;\n" ++
+        "}\n";
+
+    var pass1 = try formatSource(std.testing.allocator, src, FileId.fromInt(0));
+    defer pass1.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "fn inspect[T](comptime label: str, status: Status) -> usize") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "@compile_assert(@size_of[T]() > 0, label);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "comptime for idx in 0..4 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "if status is Ready {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "return comptime @size_of[T]();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "    };\n") == null);
+
+    var pass2 = try formatSource(std.testing.allocator, pass1.formatted_text, FileId.fromInt(0));
+    defer pass2.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(pass1.formatted_text, pass2.formatted_text);
+    try std.testing.expect(!pass2.is_changed);
 }

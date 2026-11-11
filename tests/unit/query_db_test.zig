@@ -1,7 +1,7 @@
 //! Unit Tests for Demand-Driven Incremental Query Engine (`tests/unit/query_db_test.zig`)
 //!
 //! Exercises `Revision`, `Durability`, `Fingerprint128`, `StructuralHasher`, `DefId`, `QueryStage`,
-//! `QueryKey`, `MemoHeader`, and the 10-stage `CompilerDb` pipeline (`DR-12` Section 3).
+//! `QueryKey`, `MemoHeader`, and the 14-stage `CompilerDb` pipeline (`DR-12` Section 3 & `DR-13`):
 //!
 //! - Verifies `setInput` same-value no-ops, durability promotion/demotion, and multi-file revisions.
 //! - Verifies `lower_ast` Early Cutoff on comment/whitespace edits and `ItemTree` signature firewalls
@@ -9,6 +9,9 @@
 //! - Verifies 3-tier `Durability` fast-paths, green-path `min_durability` recomputation, cycle
 //!   detection (`error.DependencyCycle`), cooperative cancellation (`error.Cancelled`), and all 11
 //!   `ItemKind` variants in `extractItemTree`.
+//! - Verifies Phase 5 Stages `10..13` (`lowerDefHir`, `buildDefMir`, `evalComptimeDef`, and
+//!   `optimizeMirModule`), per-`DefId` HIR/MIR firewall preservation on sibling body edits, and
+//!   `setTargetLayout` / `setComptimeStepLimit` / `setEmbedSandbox` incremental invalidation.
 
 const std = @import("std");
 const corex = @import("corex");
@@ -515,4 +518,332 @@ test "test_query_db_extract_item_tree_all_item_kinds_and_lookup_helpers" {
     try std.testing.expectEqual(tree.entries[10].def_id, found_fn.def_id);
     try std.testing.expect(tree.findByName("non_existent_symbol") == null);
     try std.testing.expect(tree.getEntry(DefId.init(FileId.fromInt(99), 0)) == null);
+}
+
+// -------- Phase 5 Stages 10..13 & Config Invalidation ---------
+
+test "test_query_db_phase5_stages_10_to_13_and_sibling_body_hir_mir_firewall" {
+    var db = try CompilerDb.init(std.testing.allocator);
+    defer db.deinit();
+
+    const file_id = FileId.fromInt(50);
+    const source_v1 =
+        \\pub const BASE_OFFSET: i64 = 12 * 3;
+        \\
+        \\pub fn upstream_helper(val: i64) -> i64 {
+        \\    return val + 1;
+        \\}
+        \\
+        \\pub fn stable_worker(seed: i64) -> i64 {
+        \\    return (seed * 2) + BASE_OFFSET;
+        \\}
+    ;
+
+    _ = try db.setInput(file_id, source_v1, .low);
+    const tree_v1 = try db.extractItemTree(file_id);
+    const const_def = tree_v1.findByName("BASE_OFFSET").?.def_id;
+    const helper_def = tree_v1.findByName("upstream_helper").?.def_id;
+    const worker_def = tree_v1.findByName("stable_worker").?.def_id;
+
+    // [1] Stage 10 (`lowerDefHir`), Stage 11 (`buildDefMir`), Stage 12 (`evalComptimeDef`),
+    // and Stage 13 (`optimizeMirModule` in both `--dev` and `--release`):
+    const worker_hir_v1 = try db.lowerDefHir(worker_def);
+    try std.testing.expect(worker_hir_v1.nodes.len > 0);
+    try std.testing.expect(!db.getHirDiagnostics(worker_def).?.hasErrors());
+
+    const worker_mir_v1 = (try db.buildDefMir(worker_def)).?;
+    try std.testing.expect(worker_mir_v1.blocks.items.len >= 1);
+    try std.testing.expect(!db.getMirDiagnostics(worker_def).?.hasErrors());
+
+    const const_eval = try db.evalComptimeDef(const_def);
+    try std.testing.expect(!const_eval.has_errors);
+    try std.testing.expectEqual(@as(i128, 36), const_eval.value.int_val);
+
+    const dev_mod = try db.optimizeMirModule(file_id, false);
+    const rel_mod = try db.optimizeMirModule(file_id, true);
+    try std.testing.expect(dev_mod.findBodyByName(&db.interner, "stable_worker") != null);
+    try std.testing.expect(rel_mod.findBodyByName(&db.interner, "stable_worker") != null);
+    try std.testing.expect(!db.getOptimizedMirDiagnostics(file_id, false).?.hasErrors());
+    try std.testing.expect(!db.getOptimizedMirDiagnostics(file_id, true).?.hasErrors());
+
+    const hir_execs_before = db.telemetry.countExecutions(.lower_def_hir);
+    const mir_execs_before = db.telemetry.countExecutions(.build_def_mir);
+
+    // [2] Edit ONLY `upstream_helper`'s body (adding extra statements shifting file-level AST/token IDs)
+    // while keeping all item signatures and `stable_worker`'s body unchanged:
+    const source_v2 =
+        \\pub const BASE_OFFSET: i64 = 12 * 3;
+        \\
+        \\pub fn upstream_helper(val: i64) -> i64 {
+        \\    let step_one = val + 10;
+        \\    let step_two = step_one * 2;
+        \\    let step_three = step_two - 9;
+        \\    return step_three;
+        \\}
+        \\
+        \\pub fn stable_worker(seed: i64) -> i64 {
+        \\    return (seed * 2) + BASE_OFFSET;
+        \\}
+    ;
+
+    _ = try db.setInput(file_id, source_v2, .low);
+
+    // Querying `stable_worker` at Stage 11 MUST hit the Green Path without re-running `lowerDefHir` or `buildDefMir`:
+    const worker_mir_v2 = (try db.buildDefMir(worker_def)).?;
+    try std.testing.expect(worker_mir_v2.blocks.items.len >= 1);
+    try std.testing.expectEqual(hir_execs_before, db.telemetry.countExecutions(.lower_def_hir));
+    try std.testing.expectEqual(mir_execs_before, db.telemetry.countExecutions(.build_def_mir));
+
+    // Meanwhile, querying `upstream_helper` DOES lower its newly modified body cleanly:
+    const helper_mir_v2 = (try db.buildDefMir(helper_def)).?;
+    try std.testing.expect(helper_mir_v2.blocks.items.len >= 1);
+    try std.testing.expectEqual(hir_execs_before + 1, db.telemetry.countExecutions(.lower_def_hir));
+    try std.testing.expectEqual(mir_execs_before + 1, db.telemetry.countExecutions(.build_def_mir));
+}
+
+test "test_query_db_phase5_target_layout_step_limit_and_embed_sandbox_invalidation" {
+    const allocator = std.testing.allocator;
+    var db = try CompilerDb.init(allocator);
+    defer db.deinit();
+
+    const file_id = FileId.fromInt(51);
+    const source =
+        \\pub const PTR_BYTES: usize = @size_of[&u8]();
+        \\
+        \\pub comptime fn spin_steps(limit: i64) -> i64 {
+        \\    var idx: i64 = 0;
+        \\    var acc: i64 = 0;
+        \\    while idx < limit {
+        \\        acc += 1;
+        \\        idx += 1;
+        \\    }
+        \\    return acc;
+        \\}
+        \\
+        \\pub const LOOP_WORK: i64 = spin_steps(40);
+        \\pub const ASSET_LEN: usize = @embed_bytes("assets/version.bin").len();
+    ;
+
+    var vfs_v1: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer vfs_v1.deinit(allocator);
+    try vfs_v1.put(allocator, "assets/version.bin", "v10");
+
+    db.setTargetLayout(corex.TargetLayout.NATIVE_64);
+    db.setEmbedSandbox(null, &vfs_v1);
+    _ = try db.setInput(file_id, source, .low);
+
+    const tree = try db.extractItemTree(file_id);
+    const ptr_def = tree.findByName("PTR_BYTES").?.def_id;
+    const loop_def = tree.findByName("LOOP_WORK").?.def_id;
+    const asset_def = tree.findByName("ASSET_LEN").?.def_id;
+
+    // [1] Initial evaluation under `NATIVE_64`, generous step limit, and 3-byte VFS payload:
+    const ptr_nat = try db.evalComptimeDef(ptr_def);
+    try std.testing.expect(!ptr_nat.has_errors);
+    try std.testing.expectEqual(@as(i128, 8), ptr_nat.value.int_val);
+
+    const loop_ok = try db.evalComptimeDef(loop_def);
+    try std.testing.expect(!loop_ok.has_errors);
+    try std.testing.expectEqual(@as(i128, 40), loop_ok.value.int_val);
+
+    const asset_v1 = try db.evalComptimeDef(asset_def);
+    try std.testing.expect(!asset_v1.has_errors);
+    try std.testing.expectEqual(@as(i128, 3), asset_v1.value.int_val);
+
+    // [2] Switching `setTargetLayout(.WASM32)` invalidates `PTR_BYTES` (`8 -> 4`):
+    db.setTargetLayout(corex.TargetLayout.WASM32);
+    const ptr_wasm = try db.evalComptimeDef(ptr_def);
+    try std.testing.expect(!ptr_wasm.has_errors);
+    try std.testing.expectEqual(@as(i128, 4), ptr_wasm.value.int_val);
+
+    // [3] Tightening `setComptimeStepLimit(12)` invalidates `LOOP_WORK` and triggers `E0501`:
+    db.setComptimeStepLimit(12);
+    const loop_trapped = try db.evalComptimeDef(loop_def);
+    try std.testing.expect(loop_trapped.has_errors);
+    const ct_sink = db.getComptimeDiagnostics(loop_def).?;
+    try std.testing.expect(ct_sink.hasErrors());
+    try std.testing.expectEqual(
+        corex.DiagnosticCode.e0501_comptime_step_limit_exceeded,
+        ct_sink.diagnostics.items[0].code,
+    );
+
+    // [4] Updating `setEmbedSandbox` with a 7-byte payload invalidates `ASSET_LEN` (`3 -> 7`):
+    db.setComptimeStepLimit(100_000);
+    var vfs_v2: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer vfs_v2.deinit(allocator);
+    try vfs_v2.put(allocator, "assets/version.bin", "v20-rc1");
+    db.setEmbedSandbox(null, &vfs_v2);
+
+    const asset_v2 = try db.evalComptimeDef(asset_def);
+    try std.testing.expect(!asset_v2.has_errors);
+    try std.testing.expectEqual(@as(i128, 7), asset_v2.value.int_val);
+}
+
+test "test_query_db_stages_10_to_13_pool_order_independent_fingerprints" {
+    const allocator = std.testing.allocator;
+    const file_id = FileId.fromInt(1);
+
+    const rev1_src =
+        "pub fn preamble(seed: i64) -> i64 { return seed; }\n" ++
+        "pub const FACTOR: i64 = 12;\n" ++
+        "pub fn helper(val: i64) -> i64 { return val + FACTOR; }\n" ++
+        "pub fn entry_calc(seed: i64) -> i64 {\n" ++
+        "    let transient_a: f64? = .Some(1.5);\n" ++
+        "    let _unused = transient_a;\n" ++
+        "    return helper(seed);\n" ++
+        "}\n";
+    const rev2_src =
+        "pub fn preamble(seed: i64) -> i64 {\n" ++
+        "    let bumped = (seed + 1) * 2;\n" ++
+        "    return bumped - 1;\n" ++
+        "}\n" ++
+        "pub const FACTOR: i64 = 25;\n" ++
+        "pub fn helper(val: i64) -> i64 { return val + FACTOR; }\n" ++
+        "pub fn entry_calc(seed: i64) -> i64 {\n" ++
+        "    let opt_seed: i64? = .Some(seed);\n" ++
+        "    let .Some(unwrapped) = opt_seed else { return 0; };\n" ++
+        "    return helper(unwrapped);\n" ++
+        "}\n";
+
+    var inc_db = try CompilerDb.init(allocator);
+    defer inc_db.deinit();
+    _ = try inc_db.setInput(file_id, rev1_src, .low);
+    _ = try inc_db.evalComptimeDef(DefId.init(file_id, 1));
+    _ = try inc_db.optimizeMirModule(file_id, false);
+
+    // Mutate `inc_db` to `rev2_src` after preceding `preamble` shifted AST node indices and pools interned `rev1_src`:
+    _ = try inc_db.setInput(file_id, rev2_src, .low);
+
+    var scratch_db = try CompilerDb.init(allocator);
+    defer scratch_db.deinit();
+    _ = try scratch_db.setInput(file_id, rev2_src, .low);
+
+    const inc_eval = try inc_db.evalComptimeDef(DefId.init(file_id, 1));
+    const scr_eval = try scratch_db.evalComptimeDef(DefId.init(file_id, 1));
+    try std.testing.expect(
+        Fingerprint128.eql(inc_eval.value_fingerprint, scr_eval.value_fingerprint),
+    );
+    try std.testing.expectEqual(@as(i128, 25), inc_eval.value.int_val);
+    try std.testing.expectEqual(inc_eval.value.int_val, scr_eval.value.int_val);
+
+    var item_ord: u12 = 0;
+    while (item_ord < 4) : (item_ord += 1) {
+        const def_id = DefId.init(file_id, item_ord);
+        const inc_hir_hdr = try inc_db.fetchQuery(QueryKey.forDef(.lower_def_hir, def_id));
+        const scr_hir_hdr = try scratch_db.fetchQuery(QueryKey.forDef(.lower_def_hir, def_id));
+        try std.testing.expect(
+            Fingerprint128.eql(inc_hir_hdr.output_fingerprint, scr_hir_hdr.output_fingerprint),
+        );
+
+        const inc_mir_art = try inc_db.buildDefMirArtifact(def_id);
+        const scr_mir_art = try scratch_db.buildDefMirArtifact(def_id);
+        try std.testing.expect(
+            Fingerprint128.eql(inc_mir_art.mir_fingerprint, scr_mir_art.mir_fingerprint),
+        );
+    }
+
+    for ([2]bool{ false, true }) |is_release| {
+        const inc_opt = try inc_db.optimizeMirModule(file_id, is_release);
+        const scr_opt = try scratch_db.optimizeMirModule(file_id, is_release);
+        try std.testing.expectEqual(inc_opt.fingerprint, scr_opt.fingerprint);
+        try std.testing.expectEqual(inc_opt.bodies.items.len, scr_opt.bodies.items.len);
+    }
+}
+
+test "test_query_db_comptime_derive_impl_methods_memo_isolation_and_invalidation" {
+    const allocator = std.testing.allocator;
+    const file_id = FileId.fromInt(1);
+
+    const rev1_src =
+        "@derive(Eq, Hash, Clone)\n" ++
+        "pub struct Pt {\n" ++
+        "    pub px: i64,\n" ++
+        "    pub py: i64,\n" ++
+        "}\n" ++
+        "pub struct Counter {\n" ++
+        "    pub count: i64,\n" ++
+        "}\n" ++
+        "impl Counter {\n" ++
+        "    pub fn plus_one(&self) -> i64 {\n" ++
+        "        return self.count + 1;\n" ++
+        "    }\n" ++
+        "    @inline(always)\n" ++
+        "    pub fn plus_ten(&self) -> i64 {\n" ++
+        "        return self.count + 10;\n" ++
+        "    }\n" ++
+        "    pub fn id_val[T](&self, item: T) -> T {\n" ++
+        "        let _ = self;\n" ++
+        "        return item;\n" ++
+        "    }\n" ++
+        "}\n" ++
+        "pub fn eval_impl_and_derive() -> i64 {\n" ++
+        "    let pa = Pt { px: 4, py: 8 };\n" ++
+        "    let pb = pa.clone();\n" ++
+        "    let eq_score: i64 = if pa == pb and pa.hash() == pb.hash() { 100 } else { 0 };\n" ++
+        "    let ctr = Counter { count: 5 };\n" ++
+        "    return eq_score + ctr.plus_one() + ctr.plus_one() + ctr.plus_ten();\n" ++
+        "}\n" ++
+        "pub const TOTAL: i64 = eval_impl_and_derive();\n" ++
+        "pub fn runtime_entry(seed: i64) -> i64 {\n" ++
+        "    let ctr = Counter { count: seed };\n" ++
+        "    return ctr.plus_ten() + ctr.id_val(7);\n" ++
+        "}\n";
+
+    const rev2_src =
+        "@derive(Eq, Hash, Clone)\n" ++
+        "pub struct Pt {\n" ++
+        "    pub px: i64,\n" ++
+        "    pub py: i64,\n" ++
+        "}\n" ++
+        "pub struct Counter {\n" ++
+        "    pub count: i64,\n" ++
+        "}\n" ++
+        "impl Counter {\n" ++
+        "    pub fn plus_one(&self) -> i64 {\n" ++
+        "        return self.count + 2;\n" ++
+        "    }\n" ++
+        "    @inline(always)\n" ++
+        "    pub fn plus_ten(&self) -> i64 {\n" ++
+        "        return self.count + 10;\n" ++
+        "    }\n" ++
+        "    pub fn id_val[T](&self, item: T) -> T {\n" ++
+        "        let _ = self;\n" ++
+        "        return item;\n" ++
+        "    }\n" ++
+        "}\n" ++
+        "pub fn eval_impl_and_derive() -> i64 {\n" ++
+        "    let pa = Pt { px: 4, py: 8 };\n" ++
+        "    let pb = pa.clone();\n" ++
+        "    let eq_score: i64 = if pa == pb and pa.hash() == pb.hash() { 100 } else { 0 };\n" ++
+        "    let ctr = Counter { count: 5 };\n" ++
+        "    return eq_score + ctr.plus_one() + ctr.plus_one() + ctr.plus_ten();\n" ++
+        "}\n" ++
+        "pub const TOTAL: i64 = eval_impl_and_derive();\n" ++
+        "pub fn runtime_entry(seed: i64) -> i64 {\n" ++
+        "    let ctr = Counter { count: seed };\n" ++
+        "    return ctr.plus_ten() + ctr.id_val(7);\n" ++
+        "}\n";
+
+    var db = try CompilerDb.init(allocator);
+    defer db.deinit();
+    _ = try db.setInput(file_id, rev1_src, .low);
+
+    // [1] Evaluate `TOTAL` (`DefId` ordinal 4): `100 + 6 + 6 + 15 = 127` with zero errors:
+    const total_rev1 = try db.evalComptimeDef(DefId.init(file_id, 4));
+    try std.testing.expect(!total_rev1.has_errors);
+    try std.testing.expectEqual(@as(i128, 127), total_rev1.value.int_val);
+
+    // [2] Optimize module in `--dev` and `--release` (`D1` `@inline(always)` + `D5` generic `impl` method):
+    const dev_opt = try db.optimizeMirModule(file_id, false);
+    const rel_opt = try db.optimizeMirModule(file_id, true);
+    try std.testing.expect(dev_opt.bodies.items.len > 0);
+    try std.testing.expect(rel_opt.bodies.items.len > 0);
+    try std.testing.expectEqual(@as(u32, 0), db.getOptimizedMirDiagnostics(file_id, false).?.error_count);
+    try std.testing.expectEqual(@as(u32, 0), db.getOptimizedMirDiagnostics(file_id, true).?.error_count);
+
+    // [3] Editing `Counter.plus_one` (`+ 1` -> `+ 2`) invalidates `PureCallMemoCache` (`127 -> 129`):
+    _ = try db.setInput(file_id, rev2_src, .low);
+    const total_rev2 = try db.evalComptimeDef(DefId.init(file_id, 4));
+    try std.testing.expect(!total_rev2.has_errors);
+    try std.testing.expectEqual(@as(i128, 129), total_rev2.value.int_val);
 }

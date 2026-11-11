@@ -1,0 +1,41 @@
+✗ error[E0501]: `comptime` evaluation exceeded step budget
+  ╭─▸ src/comptime/phase5_errors.cx:3:22
+  │
+3 │     while cursor > 0 {
+  │                      ^ step limit exceeded here
+  ┆
+9 │     return spin_inner(1);
+  │                      ─ called at `comptime` from `spin_outer`
+  │
+  ╰─▸ help: increase the step budget via `--comptime-limit=<steps>`
+
+✗ error[E0504]: array index out of bounds during `comptime` evaluation
+   ╭─▸ src/comptime/phase5_errors.cx:13:17
+   │
+13 │     return items[index_val];
+   │                 ^ index exceeds fixed array length
+14 │ }
+15 │ pub fn oob_outer() -> i32 {
+16 │     return oob_inner(3);
+   │                     ─ called at `comptime` from `oob_outer`
+   │
+   ╰───────
+
+✗ error[E0510]: limit must be positive
+   ╭─▸ src/comptime/phase5_errors.cx:19:6
+   │
+19 │     @compile_assert(limit_val > 0, "limit must be positive");
+   │      ^^^^^^^^^^^^^^ `@compile_assert` failed here
+   ┆
+23 │     return assert_inner(0);
+   │                        ─ called at `comptime` from `assert_outer`
+   │
+   ╰───────
+
+⚠︎ warning[W0501]: explicit `@inline` function exceeded inlining cost budget or recursion check
+   ╭─▸ src/comptime/phase5_errors.cx:30:31
+   │
+30 │     return 1 + rec_inline_step(depth - 1);
+   │                               ^ `@inline` budget exceeded here
+   │
+   ╰───────

@@ -119,6 +119,60 @@ test "test_levenshtein_distance_and_cli_arg_parsing_matrix" {
         try std.testing.expect(sink.hasErrors());
         try std.testing.expectEqual(corex.DiagnosticCode.e0001_unknown_cli_flag, sink.asSlice()[0].code);
     }
+
+    // [5] Compilation flags (`--comptime-limit`, `--dev`, `--release`) on `build`/`run`/`check`/`test`:
+    {
+        var sink = DiagnosticSink.init(std.testing.allocator);
+        defer sink.deinit();
+        const parsed_rel = try router.parseArgs(
+            &.{ "build", "--release", "--comptime-limit=50000", "main.cx" },
+            &sink,
+        );
+        try std.testing.expect(!sink.hasErrors());
+        try std.testing.expect(parsed_rel.is_release_mode);
+        try std.testing.expectEqual(@as(u64, 50_000), parsed_rel.comptime_step_limit);
+        try std.testing.expect(parsed_rel.action.execute_subcommand.is_release_mode);
+        try std.testing.expectEqual(@as(u64, 50_000), parsed_rel.action.execute_subcommand.comptime_step_limit);
+
+        const parsed_dev = try router.parseArgs(&.{ "check", "--dev", "--comptime-limit", "1234" }, &sink);
+        try std.testing.expect(!sink.hasErrors());
+        try std.testing.expect(!parsed_dev.is_release_mode);
+        try std.testing.expectEqual(@as(u64, 1_234), parsed_dev.comptime_step_limit);
+
+        try std.testing.expectEqualStrings("--release", router.suggestFlagForSubcommand("--relase", .build).?);
+        try std.testing.expectEqualStrings(
+            "--comptime-limit",
+            router.suggestFlagForSubcommand("--comptime-limt", .check).?,
+        );
+    }
+
+    // [6] Conflicting `--dev` + `--release`, missing `--comptime-limit` value, and zero/non-numeric rejection:
+    {
+        var conflict_sink = DiagnosticSink.init(std.testing.allocator);
+        defer conflict_sink.deinit();
+        _ = try router.parseArgs(&.{ "build", "--dev", "--release" }, &conflict_sink);
+        try std.testing.expect(conflict_sink.hasErrors());
+        try std.testing.expectEqual(corex.DiagnosticCode.e0001_unknown_cli_flag, conflict_sink.asSlice()[0].code);
+
+        var missing_sink = DiagnosticSink.init(std.testing.allocator);
+        defer missing_sink.deinit();
+        _ = try router.parseArgs(&.{ "test", "--comptime-limit" }, &missing_sink);
+        try std.testing.expect(missing_sink.hasErrors());
+        try std.testing.expectEqual(corex.DiagnosticCode.e0003_missing_cli_argument, missing_sink.asSlice()[0].code);
+
+        var zero_sink = DiagnosticSink.init(std.testing.allocator);
+        defer zero_sink.deinit();
+        _ = try router.parseArgs(&.{ "run", "--comptime-limit=0" }, &zero_sink);
+        try std.testing.expect(zero_sink.hasErrors());
+        try std.testing.expectEqual(corex.DiagnosticCode.e0001_unknown_cli_flag, zero_sink.asSlice()[0].code);
+
+        var help_buf: [2048]u8 = undefined;
+        var help_writer = std.Io.Writer.fixed(&help_buf);
+        try router.renderSubcommandHelp(&help_writer, StyleConfig.MONOCHROME, .build);
+        try std.testing.expect(std.mem.indexOf(u8, help_writer.buffered(), "--comptime-limit=<steps>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, help_writer.buffered(), "--dev") != null);
+        try std.testing.expect(std.mem.indexOf(u8, help_writer.buffered(), "--release") != null);
+    }
 }
 
 test "test_run_cli_lifecycle_version_check_and_missing_file_error" {

@@ -34,6 +34,14 @@ test "test_diagnostic_severity_and_catalog_code_resolution" {
     try std.testing.expectEqualStrings("help", Severity.help.asLabel());
 
     try std.testing.expectEqual(DiagnosticCode.e0302_use_after_move, DiagnosticCode.fromCodeStr("E0302").?);
+    try std.testing.expectEqual(DiagnosticCode.e0503_forbidden_comptime_operation, DiagnosticCode.fromCodeStr("E0503").?);
+    try std.testing.expectEqual(DiagnosticCode.e0504_comptime_out_of_bounds, DiagnosticCode.fromCodeStr("E0504").?);
+    try std.testing.expectEqual(DiagnosticCode.e0505_comptime_uninitialized_read, DiagnosticCode.fromCodeStr("E0505").?);
+    try std.testing.expectEqual(DiagnosticCode.e0506_comptime_invalid_pointer, DiagnosticCode.fromCodeStr("E0506").?);
+    try std.testing.expectEqual(DiagnosticCode.e0507_comptime_arithmetic_trap, DiagnosticCode.fromCodeStr("E0507").?);
+    try std.testing.expectEqual(DiagnosticCode.e0508_comptime_resource_limit_exceeded, DiagnosticCode.fromCodeStr("E0508").?);
+    try std.testing.expectEqual(DiagnosticCode.e0509_comptime_evaluation_cycle, DiagnosticCode.fromCodeStr("E0509").?);
+    try std.testing.expectEqual(DiagnosticCode.e0510_compile_assertion_failed, DiagnosticCode.fromCodeStr("E0510").?);
     try std.testing.expectEqual(DiagnosticCode.w0308_unused_region_allocation, DiagnosticCode.fromCodeStr("W0308").?);
     try std.testing.expect(DiagnosticCode.fromCodeStr("E9999") == null);
 

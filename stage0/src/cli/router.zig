@@ -122,6 +122,28 @@ pub const FmtFlagDescriptor = struct {
     summary: []const u8,
 };
 
+/// Subcommand-specific CLI option identifiers for compilation/verification subcommands (`COMPILE_FLAGS`).
+pub const CompileFlagId = enum(u8) {
+    /// `--comptime-limit=<steps>` – configure `MirVm` compile-time execution step budget (`0`).
+    comptime_limit = 0,
+    /// `--dev` – compile in fast development mode (`1`).
+    dev = 1,
+    /// `--release` – compile in production release mode (`2`).
+    release = 2,
+};
+
+/// Static metadata entry in `COMPILE_FLAGS` describing `build`/`run`/`check`/`test` flags.
+pub const CompileFlagDescriptor = struct {
+    /// Strongly typed compilation flag enum tag.
+    id: CompileFlagId,
+    /// Canonical long flag token (e.g., `"--comptime-limit"`).
+    long_flag: []const u8,
+    /// Optional value placeholder suffix (e.g., `"=<steps>"`).
+    value_suffix: ?[]const u8 = null,
+    /// Concise one-line summary displayed in subcommand `--help`.
+    summary: []const u8,
+};
+
 /// Resolved CLI action produced by `parseArgs`.
 pub const CommandAction = union(enum) {
     /// Render the global or subcommand-specific `--help` menu and exit `0`.
@@ -138,6 +160,10 @@ pub const CommandAction = union(enum) {
         is_check_only: bool = false,
         /// Whether `--fix` was passed (e.g., `corex fmt --fix`).
         is_fix_mode: bool = false,
+        /// Maximum `MirVm` compile-time execution step budget (`--comptime-limit`).
+        comptime_step_limit: u64 = DEFAULT_COMPTIME_STEP_LIMIT,
+        /// Whether `--release` optimization mode was selected (`false` for `--dev` default).
+        is_release_mode: bool = false,
     },
     /// Invalid CLI invocation; errors have been emitted into `DiagnosticSink`.
     invalid: void,
@@ -153,12 +179,18 @@ pub const ParsedCommand = struct {
     is_check_only: bool = false,
     /// Whether `--fix` was passed on `corex fmt`.
     is_fix_mode: bool = false,
+    /// Maximum `MirVm` compile-time execution step budget (`--comptime-limit`).
+    comptime_step_limit: u64 = DEFAULT_COMPTIME_STEP_LIMIT,
+    /// Whether `--release` optimization mode was selected (`false` for `--dev` default).
+    is_release_mode: bool = false,
 };
 
 // --------------------------------------- CONSTS ----------------------------------------
 
 /// Canonical Stage 0 toolchain version string.
 pub const COREX_VERSION: []const u8 = "0.1.0-dev";
+/// Default compile-time virtual machine instruction step fuel budget (`DR-05` Section 3.3).
+pub const DEFAULT_COMPTIME_STEP_LIMIT: u64 = 10_000_000;
 /// Maximum Levenshtein edit distance eligible for typo suggestions.
 pub const MAX_EDIT_DISTANCE: usize = 2;
 
@@ -253,7 +285,66 @@ pub const FMT_FLAGS = [_]FmtFlagDescriptor{
     },
 };
 
+/// Canonical compilation and verification option table (`build`, `run`, `check`, `test`).
+pub const COMPILE_FLAGS = [_]CompileFlagDescriptor{
+    .{
+        .id = .comptime_limit,
+        .long_flag = "--comptime-limit",
+        .value_suffix = "=<steps>",
+        .summary = std.fmt.comptimePrint(
+            "Set maximum compile-time VM execution step budget (default: {d})",
+            .{DEFAULT_COMPTIME_STEP_LIMIT},
+        ),
+    },
+    .{
+        .id = .dev,
+        .long_flag = "--dev",
+        .value_suffix = null,
+        .summary = "Compile in fast development mode with local constant folding",
+    },
+    .{
+        .id = .release,
+        .long_flag = "--release",
+        .value_suffix = null,
+        .summary = "Compile in production release mode with full SSA optimization",
+    },
+};
+
 // -------------------------------------- INTERNALS --------------------------------------
+
+/// Extracts a strictly positive ASCII decimal step count (`> 0`), rejecting empty, signed, or zero values.
+fn extractPositiveStepLimit(raw_val: []const u8) ?u64 {
+    if (raw_val.len == 0) return null;
+    for (raw_val) |byte_val| {
+        if (!std.ascii.isDigit(byte_val)) return null;
+    }
+    const parsed_val = std.fmt.parseUnsigned(u64, raw_val, 10) catch return null;
+    return if (parsed_val > 0) parsed_val else null;
+}
+
+/// Emits an `E0001` diagnostic when `--comptime-limit` receives a non-numeric, negative, or zero value.
+fn emitInvalidComptimeLimitDiagnostic(sink: *DiagnosticSink, raw_step_val: []const u8) !void {
+    try sink.emit(.{
+        .code = .e0001_unknown_cli_flag,
+        .severity = .err,
+        .message = try std.fmt.allocPrint(
+            sink.arena.asAllocator(),
+            "invalid step count `{s}` for `--comptime-limit`; expected positive integer > 0",
+            .{raw_step_val},
+        ),
+        .notes = &.{"help: pass a positive integer such as `--comptime-limit=10000000`"},
+    });
+}
+
+/// Emits an `E0001` diagnostic when both `--dev` and `--release` are passed together.
+fn emitConflictingOptFlagsDiagnostic(sink: *DiagnosticSink) !void {
+    try sink.emit(.{
+        .code = .e0001_unknown_cli_flag,
+        .severity = .err,
+        .message = "conflicting CLI optimization flags `--dev` and `--release`",
+        .notes = &.{"help: pass either `--dev` or `--release`, not both"},
+    });
+}
 
 /// Emits an `E0001` diagnostic for an unrecognized CLI flag, attaching a typo hint if within distance 2.
 fn emitUnknownFlagDiagnostic(
@@ -364,6 +455,14 @@ pub fn suggestGlobalFlag(unknown_flag: []const u8) ?[]const u8 {
     return suggestFlagForSubcommand(unknown_flag, null);
 }
 
+/// Returns `true` if `subcommand` accepts `COMPILE_FLAGS` (`build`, `run`, `check`, `test`).
+pub inline fn isCompileSubcommand(subcommand: SubcommandId) bool {
+    return switch (subcommand) {
+        .build, .run, .check, .@"test" => true,
+        else => false,
+    };
+}
+
 /// Returns the closest global or subcommand-specific flag within edit distance `<= 2`, or `null`.
 pub fn suggestFlagForSubcommand(unknown_flag: []const u8, subcommand: ?SubcommandId) ?[]const u8 {
     const flag_name = if (std.mem.indexOfScalar(u8, unknown_flag, '=')) |eq_idx|
@@ -395,6 +494,16 @@ pub fn suggestFlagForSubcommand(unknown_flag: []const u8, subcommand: ?Subcomman
                 best_match = fmt_desc.long_flag;
             }
         }
+    } else if (subcommand) |sub_id| {
+        if (isCompileSubcommand(sub_id)) {
+            for (COMPILE_FLAGS) |comp_desc| {
+                const comp_dist = computeLevenshteinDistance(flag_name, comp_desc.long_flag);
+                if (comp_dist < best_distance) {
+                    best_distance = comp_dist;
+                    best_match = comp_desc.long_flag;
+                }
+            }
+        }
     }
     return best_match;
 }
@@ -406,6 +515,9 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
     var has_version_flag = false;
     var is_check_only = false;
     var is_fix_mode = false;
+    var comptime_step_limit: u64 = DEFAULT_COMPTIME_STEP_LIMIT;
+    var has_seen_dev = false;
+    var has_seen_release = false;
     var selected_subcommand: ?SubcommandId = null;
     var positional_list: std.ArrayList([]const u8) = .empty;
     var is_after_double_dash = false;
@@ -419,6 +531,7 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
         }
 
         if (!is_after_double_dash and std.mem.startsWith(u8, arg_text, "-")) {
+            const is_compile_sub = selected_subcommand != null and isCompileSubcommand(selected_subcommand.?);
             if (std.mem.eql(u8, arg_text, "-h") or std.mem.eql(u8, arg_text, "--help")) {
                 has_help_flag = true;
             } else if (std.mem.eql(u8, arg_text, "-V") or std.mem.eql(u8, arg_text, "--version")) {
@@ -427,6 +540,40 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                 is_check_only = true;
             } else if (selected_subcommand == .fmt and std.mem.eql(u8, arg_text, "--fix")) {
                 is_fix_mode = true;
+            } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--dev")) {
+                if (has_seen_release) {
+                    try emitConflictingOptFlagsDiagnostic(sink);
+                }
+                has_seen_dev = true;
+            } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--release")) {
+                if (has_seen_dev) {
+                    try emitConflictingOptFlagsDiagnostic(sink);
+                }
+                has_seen_release = true;
+            } else if (is_compile_sub and std.mem.startsWith(u8, arg_text, "--comptime-limit=")) {
+                const raw_val = arg_text["--comptime-limit=".len..];
+                if (extractPositiveStepLimit(raw_val)) |parsed_steps| {
+                    comptime_step_limit = parsed_steps;
+                } else {
+                    try emitInvalidComptimeLimitDiagnostic(sink, raw_val);
+                }
+            } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--comptime-limit")) {
+                if (arg_idx + 1 >= raw_args.len) {
+                    try sink.emit(.{
+                        .code = .e0003_missing_cli_argument,
+                        .severity = .err,
+                        .message = "missing step count for `--comptime-limit`; expected positive integer",
+                        .notes = &.{"help: pass `--comptime-limit=<steps>` (e.g., `--comptime-limit=10000000`)"},
+                    });
+                } else {
+                    arg_idx += 1;
+                    const next_val = raw_args[arg_idx];
+                    if (extractPositiveStepLimit(next_val)) |parsed_steps| {
+                        comptime_step_limit = parsed_steps;
+                    } else {
+                        try emitInvalidComptimeLimitDiagnostic(sink, next_val);
+                    }
+                }
             } else if (std.mem.startsWith(u8, arg_text, "--color=")) {
                 const raw_val = arg_text["--color=".len..];
                 if (ColorMode.parse(raw_val)) |parsed_mode| {
@@ -482,12 +629,16 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
             .color_mode = color_mode,
             .is_check_only = is_check_only,
             .is_fix_mode = is_fix_mode,
+            .comptime_step_limit = comptime_step_limit,
+            .is_release_mode = has_seen_release,
             .action = .{
                 .execute_subcommand = .{
                     .subcommand = sub_id,
                     .positional_args = positional_list.items,
                     .is_check_only = is_check_only,
                     .is_fix_mode = is_fix_mode,
+                    .comptime_step_limit = comptime_step_limit,
+                    .is_release_mode = has_seen_release,
                 },
             },
         };
@@ -554,6 +705,102 @@ pub fn renderHelp(writer: *std.Io.Writer, style_config: StyleConfig) std.Io.Writ
     }
 }
 
+/// Renders subcommand-specific `--help` (`corex <subcommand> --help`) including scoped options.
+pub fn renderSubcommandHelp(
+    writer: *std.Io.Writer,
+    style_config: StyleConfig,
+    subcommand: SubcommandId,
+) std.Io.Writer.Error!void {
+    const sub_desc = subcommand.asDescriptor();
+    var title_buf: [64]u8 = undefined;
+    var title_writer = std.Io.Writer.fixed(&title_buf);
+    title_writer.print("corex {s}", .{sub_desc.name}) catch unreachable;
+
+    var usage_buf: [128]u8 = undefined;
+    var usage_writer = std.Io.Writer.fixed(&usage_buf);
+    if (sub_desc.usage.len > 0) {
+        usage_writer.print("Usage: corex {s} [OPTIONS] {s}", .{ sub_desc.name, sub_desc.usage }) catch unreachable;
+    } else {
+        usage_writer.print("Usage: corex {s} [OPTIONS]", .{sub_desc.name}) catch unreachable;
+    }
+
+    try CardRenderer.init(style_config).renderCard(
+        writer,
+        title_writer.buffered(),
+        &.{ sub_desc.summary, usage_writer.buffered() },
+    );
+    try writer.writeByte('\n');
+
+    if (isCompileSubcommand(subcommand)) {
+        try style_config.writeStyled(writer, .bold, "Compile Options:");
+        try writer.writeByte('\n');
+        for (COMPILE_FLAGS) |comp_desc| {
+            var flag_buf: [64]u8 = undefined;
+            var flag_writer = std.Io.Writer.fixed(&flag_buf);
+            flag_writer.print("    {s}", .{comp_desc.long_flag}) catch unreachable;
+            if (comp_desc.value_suffix) |suffix_str| {
+                flag_writer.writeAll(suffix_str) catch unreachable;
+            }
+            const formatted_flag = flag_writer.buffered();
+            try writer.writeAll("  ");
+            try style_config.writeStyled(writer, .bold, formatted_flag);
+            if (formatted_flag.len < 28) {
+                try writer.splatByteAll(' ', 28 - formatted_flag.len);
+            } else {
+                try writer.writeByte(' ');
+            }
+            try writer.writeAll(comp_desc.summary);
+            try writer.writeByte('\n');
+        }
+        try writer.writeByte('\n');
+    } else if (subcommand == .fmt) {
+        try style_config.writeStyled(writer, .bold, "Format Options:");
+        try writer.writeByte('\n');
+        for (FMT_FLAGS) |fmt_desc| {
+            var flag_buf: [64]u8 = undefined;
+            var flag_writer = std.Io.Writer.fixed(&flag_buf);
+            flag_writer.print("    {s}", .{fmt_desc.long_flag}) catch unreachable;
+            const formatted_flag = flag_writer.buffered();
+            try writer.writeAll("  ");
+            try style_config.writeStyled(writer, .bold, formatted_flag);
+            if (formatted_flag.len < 20) {
+                try writer.splatByteAll(' ', 20 - formatted_flag.len);
+            } else {
+                try writer.writeByte(' ');
+            }
+            try writer.writeAll(fmt_desc.summary);
+            try writer.writeByte('\n');
+        }
+        try writer.writeByte('\n');
+    }
+
+    try style_config.writeStyled(writer, .bold, "Global Options:");
+    try writer.writeByte('\n');
+    for (GLOBAL_FLAGS) |flag_desc| {
+        var flag_label_buf: [64]u8 = undefined;
+        var label_writer = std.Io.Writer.fixed(&flag_label_buf);
+        if (flag_desc.short_flag) |short_str| {
+            label_writer.print("{s}, {s}", .{ short_str, flag_desc.long_flag }) catch unreachable;
+        } else {
+            label_writer.print("    {s}", .{flag_desc.long_flag}) catch unreachable;
+        }
+        if (flag_desc.value_suffix) |suffix_str| {
+            label_writer.writeAll(suffix_str) catch unreachable;
+        }
+        const formatted_flag = label_writer.buffered();
+
+        try writer.writeAll("  ");
+        try style_config.writeStyled(writer, .bold, formatted_flag);
+        if (formatted_flag.len < 20) {
+            try writer.splatByteAll(' ', 20 - formatted_flag.len);
+        } else {
+            try writer.writeByte(' ');
+        }
+        try writer.writeAll(flag_desc.summary);
+        try writer.writeByte('\n');
+    }
+}
+
 /// Renders the canonical `corex --version` line into `writer`.
 pub fn renderVersion(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writer.writeAll("corex " ++ COREX_VERSION ++ " (stage0 zig 0.17.0)\n");
@@ -590,8 +837,12 @@ pub fn runCli(
             try DiagnosticRenderer.init(&source_map, &interner, stderr_style).renderAll(stderr_writer, &sink);
             return 1;
         },
-        .show_help => {
-            try renderHelp(stdout_writer, stdout_style);
+        .show_help => |sub_opt| {
+            if (sub_opt) |sub_id| {
+                try renderSubcommandHelp(stdout_writer, stdout_style, sub_id);
+            } else {
+                try renderHelp(stdout_writer, stdout_style);
+            }
             return 0;
         },
         .show_version => {
@@ -743,6 +994,12 @@ comptime {
     }
     for (GLOBAL_FLAGS, 0..) |flag_desc, i| {
         std.debug.assert(@backingInt(flag_desc.id) == i);
+    }
+    for (FMT_FLAGS, 0..) |fmt_desc, i| {
+        std.debug.assert(@backingInt(fmt_desc.id) == i);
+    }
+    for (COMPILE_FLAGS, 0..) |comp_desc, i| {
+        std.debug.assert(@backingInt(comp_desc.id) == i);
     }
 }
 

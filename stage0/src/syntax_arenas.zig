@@ -1385,6 +1385,90 @@ pub const AstArena = struct {
 /// Canonical alias for `AstArena` (`DR-01` Section 4.1).
 pub const AstStore = AstArena;
 
+/// Computes the $O(N)$ exclusive `extra_data` end index for every AST node in `ast`, handling out-of-order
+/// slice allocations such as `NodeIndex.root` (`0`) whose top-level item list is appended at parse end.
+pub fn computeAstNodeExtraEnds(allocator: std.mem.Allocator, ast: *const AstArena) ![]u32 {
+    const ast_len = ast.countNodes();
+    const extra_end_table = try allocator.alloc(u32, ast_len);
+    errdefer allocator.free(extra_end_table);
+    if (ast_len == 0) return extra_end_table;
+
+    const extra_len = ast.extra_data.items.len;
+    if (extra_len == 0) {
+        @memset(extra_end_table, 0);
+        return extra_end_table;
+    }
+
+    const has_slice_start = try allocator.alloc(bool, extra_len);
+    defer allocator.free(has_slice_start);
+    @memset(has_slice_start, false);
+
+    const end_for_start = try allocator.alloc(u32, extra_len);
+    defer allocator.free(end_for_start);
+
+    for (0..ast_len) |node_idx| {
+        const node = ast.getNode(NodeIndex.fromInt(@intCast(node_idx)));
+        if (node.lhs.tag == .extra and node.rhs.tag == .extra) {
+            const start_pos: usize = node.lhs.payload;
+            const end_pos: usize = start_pos +| @as(usize, node.rhs.payload);
+            if (start_pos < extra_len and node.rhs.payload > 0) has_slice_start[start_pos] = true;
+            if (end_pos < extra_len) has_slice_start[end_pos] = true;
+        } else if (node.lhs.tag == .extra) {
+            if (node.lhs.payload < extra_len) has_slice_start[node.lhs.payload] = true;
+        } else if (node.rhs.tag == .extra) {
+            if (node.rhs.payload < extra_len) has_slice_start[node.rhs.payload] = true;
+        }
+    }
+
+    var next_boundary: u32 = @intCast(extra_len);
+    var pos: usize = extra_len;
+    while (pos > 0) {
+        pos -= 1;
+        if (has_slice_start[pos]) {
+            end_for_start[pos] = next_boundary;
+            next_boundary = @intCast(pos);
+        }
+    }
+
+    for (0..ast_len) |node_idx| {
+        const node = ast.getNode(NodeIndex.fromInt(@intCast(node_idx)));
+        if (node.lhs.tag == .extra and node.rhs.tag == .extra) {
+            extra_end_table[node_idx] = node.lhs.payload +| node.rhs.payload;
+        } else if (node.lhs.tag == .extra) {
+            extra_end_table[node_idx] = if (node.lhs.payload < extra_len)
+                end_for_start[node.lhs.payload]
+            else
+                @intCast(extra_len);
+        } else if (node.rhs.tag == .extra) {
+            extra_end_table[node_idx] = if (node.rhs.payload < extra_len)
+                end_for_start[node.rhs.payload]
+            else
+                @intCast(extra_len);
+        } else {
+            extra_end_table[node_idx] = 0;
+        }
+    }
+    return extra_end_table;
+}
+
+/// Computes the $O(N)$ inverse `CstNodeIndex -> NodeIndex` lookup table for `ast`.
+pub fn computeCstToAstMap(
+    allocator: std.mem.Allocator,
+    cst_node_count: usize,
+    ast: *const AstArena,
+) ![]NodeIndex {
+    const cst_map = try allocator.alloc(NodeIndex, cst_node_count);
+    errdefer allocator.free(cst_map);
+    @memset(cst_map, .none);
+
+    for (ast.ast_to_cst.items, 0..) |cst_origin, ast_idx| {
+        if (!cst_origin.isNone() and cst_origin.asInt() < cst_node_count) {
+            cst_map[cst_origin.asInt()] = NodeIndex.fromInt(@intCast(ast_idx));
+        }
+    }
+    return cst_map;
+}
+
 // ------------------------- Unit Tests -------------------------
 
 test "test_token_buffer_trivia_and_lossless_cst_reconstruction" {
@@ -1479,6 +1563,13 @@ test "test_cst_parse_depth_cap_and_ast_arena_extra_data" {
     var ast_arena = AstArena.init(std.testing.allocator);
     defer ast_arena.deinit();
 
+    const root_ast = try ast_arena.appendNodeWithCst(.{
+        .tag = .root,
+        .main_token = TokenIndex.fromInt(0),
+        .lhs = .NONE,
+        .rhs = .NONE,
+    }, CstNodeIndex.fromInt(0));
+
     const child_indices = [_]u32{ 1, 2, 3 };
     const extra_start = try ast_arena.appendExtraSlice(&child_indices);
     const hole_node = try ast_arena.appendNodeWithCst(.{
@@ -1488,10 +1579,27 @@ test "test_cst_parse_depth_cap_and_ast_arena_extra_data" {
         .rhs = PackedOperand.initToken(TokenIndex.fromInt(4)),
     }, CstNodeIndex.fromInt(2));
 
-    try std.testing.expectEqual(@as(usize, 1), ast_arena.countNodes());
+    const root_items = [_]u32{hole_node.asInt()};
+    ast_arena.nodes.items(.lhs)[root_ast.asInt()] = PackedOperand.initExtra(
+        try ast_arena.appendExtraSlice(&root_items),
+    );
+    ast_arena.nodes.items(.rhs)[root_ast.asInt()] = .{ .tag = .extra, .payload = 1 };
+
+    try std.testing.expectEqual(@as(usize, 2), ast_arena.countNodes());
     try std.testing.expectEqual(AstTag.expr_hole, ast_arena.getNode(hole_node).tag);
     try std.testing.expectEqual(CstNodeIndex.fromInt(2), ast_arena.getCstOrigin(hole_node));
     try std.testing.expectEqualSlices(u32, &child_indices, ast_arena.getExtraSlice(extra_start, 3));
+
+    const extra_ends = try computeAstNodeExtraEnds(std.testing.allocator, &ast_arena);
+    defer std.testing.allocator.free(extra_ends);
+    try std.testing.expectEqual(@as(u32, 3), extra_ends[hole_node.asInt()]);
+    try std.testing.expectEqual(@as(u32, 4), extra_ends[root_ast.asInt()]);
+
+    const cst_map = try computeCstToAstMap(std.testing.allocator, 5, &ast_arena);
+    defer std.testing.allocator.free(cst_map);
+    try std.testing.expectEqual(root_ast, cst_map[0]);
+    try std.testing.expectEqual(NodeIndex.none, cst_map[1]);
+    try std.testing.expectEqual(hole_node, cst_map[2]);
 }
 
 test "test_append_token_coalesces_overflow_trivia_into_slot_14" {

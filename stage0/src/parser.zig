@@ -196,6 +196,7 @@ pub const STMT_STARTER_SET: TokenSet128 = TokenSet128.initMany(&.{
     .kw_loop,
     .kw_if,
     .kw_match,
+    .kw_comptime,
 });
 /// Tokens that can legally begin a `PrimaryType` expression (`DR-03` Section 5.4 Part 5 & `DR-04`).
 pub const TYPE_STARTER_SET: TokenSet128 = TokenSet128.initMany(&.{
@@ -251,6 +252,7 @@ pub const MEMBER_STOP_SET: TokenSet128 = TokenSet128.initMany(&.{
     .kw_pub,
     .kw_type,
     .kw_const,
+    .kw_comptime,
     .kw_async,
     .kw_unsafe,
     .kw_extern,
@@ -266,6 +268,7 @@ pub const PARAM_STOP_SET: TokenSet128 = TokenSet128.initMany(&.{
     .kw_where,
     .lbrace,
     .semi,
+    .kw_comptime,
     .kw_mut,
     .kw_own,
     .kw_ref,
@@ -460,6 +463,8 @@ fn getInfixBindingPower(kind: TokenKind) ?InfixBindingPower {
         .pipe => .{ .left_bp = 12, .right_bp = 13 },
         // Tier 5 – Range Constructors (`..`, `..=`), Non-Associative:
         .dotdot, .dotdoteq => .{ .left_bp = 10, .right_bp = 11, .is_non_associative = true },
+        // Tier 4.5 – Inline Pattern Test (`is Pattern`), Non-Associative:
+        .kw_is => .{ .left_bp = 9, .right_bp = 10, .is_non_associative = true },
         // Tier 4 – Relational & Equality (`==`, `!=`, `<`, `<=`, `>`, `>=`), Non-Associative:
         .eqeq, .bang_eq, .lt, .le, .gt, .ge => .{
             .left_bp = 8,
@@ -707,6 +712,8 @@ pub const Parser = struct {
     is_recovering_depth_overflow: bool = false,
     /// `true` if the most recently completed expression in the current statement ended with a `{ … }` block.
     has_last_expr_block_body: bool = false,
+    /// `true` while parsing the candidate LHS lvalue of a block expression/assignment statement.
+    is_in_stmt_lhs: bool = false,
 
     /// Initializes a `Parser` with default `ParserOptions`.
     pub fn init(
@@ -2476,6 +2483,10 @@ pub const Parser = struct {
 
             try self.parseAttributes(&has_param_err);
 
+            if (self.peekKind() == .kw_comptime) {
+                _ = try self.consumeLeaf(.token_leaf, .{});
+            }
+
             // Check for `SelfParam` (`[ "&" ["mut"] | "mut" | "own" | "ref" ["mut"] ] "self"`):
             if (self.peekKind() == .amp) {
                 _ = try self.consumeLeaf(.token_leaf, .{});
@@ -3154,12 +3165,94 @@ pub const Parser = struct {
         }, block_cst);
     }
 
+    /// Returns `true` if `@` at `peek(0)` starts an `@attribute` prefix on a local declaration/statement.
+    fn isLeadingStmtAttribute(self: *const Parser) bool {
+        var lookahead: usize = 0;
+        var steps: usize = 0;
+        while (steps < 256 and self.peekKindNth(lookahead) == .at) : (steps += 1) {
+            lookahead += 1;
+            const name_kind = self.peekKindNth(lookahead);
+            if (!isIdentifierKind(name_kind) and !isKeywordKind(name_kind)) return false;
+            lookahead += 1;
+            if (self.peekKindNth(lookahead) == .lbracket) return false;
+            if (self.peekKindNth(lookahead) == .lparen) {
+                var paren_depth: u32 = 1;
+                lookahead += 1;
+                while (steps < 256 and paren_depth > 0) : (steps += 1) {
+                    const inner_kind = self.peekKindNth(lookahead);
+                    if (inner_kind == .eof) return false;
+                    if (inner_kind == .lparen) {
+                        paren_depth += 1;
+                    } else if (inner_kind == .rparen) {
+                        paren_depth -= 1;
+                    }
+                    lookahead += 1;
+                }
+                if (paren_depth != 0) return false;
+            }
+        }
+        return switch (self.peekKindNth(lookahead)) {
+            .kw_let,
+            .kw_var,
+            .kw_const,
+            .kw_type,
+            .kw_struct,
+            .kw_enum,
+            .kw_union,
+            .kw_bit_field,
+            .kw_fn,
+            .kw_defer,
+            .kw_errdefer,
+            .kw_for,
+            .kw_while,
+            .kw_comptime,
+            => true,
+            else => false,
+        };
+    }
+
+    /// Returns `true` if `@` at `peek(0)` precedes a block-local `Item` declaration rather than a `Stmt`.
+    fn isLeadingItemAttributeInBlock(self: *const Parser) bool {
+        var lookahead: usize = 0;
+        var steps: usize = 0;
+        while (steps < 256 and self.peekKindNth(lookahead) == .at) : (steps += 1) {
+            lookahead += 1;
+            const name_kind = self.peekKindNth(lookahead);
+            if (!isIdentifierKind(name_kind) and !isKeywordKind(name_kind)) return false;
+            lookahead += 1;
+            if (self.peekKindNth(lookahead) == .lbracket) return false;
+            if (self.peekKindNth(lookahead) == .lparen) {
+                var paren_depth: u32 = 1;
+                lookahead += 1;
+                while (steps < 256 and paren_depth > 0) : (steps += 1) {
+                    const inner_kind = self.peekKindNth(lookahead);
+                    if (inner_kind == .eof) return false;
+                    if (inner_kind == .lparen) {
+                        paren_depth += 1;
+                    } else if (inner_kind == .rparen) {
+                        paren_depth -= 1;
+                    }
+                    lookahead += 1;
+                }
+                if (paren_depth != 0) return false;
+            }
+        }
+        return switch (self.peekKindNth(lookahead)) {
+            .kw_const, .kw_type, .kw_struct, .kw_enum, .kw_union, .kw_bit_field, .kw_fn => true,
+            .kw_comptime => self.peekKindNth(lookahead + 1) == .kw_fn,
+            else => false,
+        };
+    }
+
     /// Parses a single `Stmt` or `TailExpr` inside a `Block`.
     fn parseStmt(self: *Parser, is_tail_out: *bool) anyerror!NodeIndex {
         is_tail_out.* = false;
 
-        // Check for `@attr` annotations on a local `let`/`var` declaration:
-        if (self.peekKind() == .at) {
+        // Check for `@attr` annotations on a local declaration/statement (excluding `@intrinsic` calls):
+        if (self.peekKind() == .at and self.isLeadingStmtAttribute()) {
+            if (self.isLeadingItemAttributeInBlock()) {
+                return self.parseItem();
+            }
             const decl_cst = try self.startCstNode(.local_decl_stmt);
             var has_attr_err = false;
             try self.parseAttributes(&has_attr_err);
@@ -3181,8 +3274,16 @@ pub const Parser = struct {
             .kw_break => return self.parseBreakStmt(),
             .kw_continue => return self.parseContinueStmt(),
             .kw_for => return self.parseForStmt(),
+            .kw_comptime => {
+                if (self.peekKindNth(1) == .kw_for) {
+                    return self.parseForStmt();
+                }
+                if (self.peekKindNth(1) == .kw_fn) {
+                    return self.parseItem();
+                }
+            },
             .kw_while => return self.parseWhileStmt(),
-            .kw_const, .kw_type, .kw_struct, .kw_enum, .kw_union, .kw_fn => {
+            .kw_const, .kw_type, .kw_struct, .kw_enum, .kw_union, .kw_bit_field, .kw_fn => {
                 return self.parseItem();
             },
             else => {},
@@ -3194,7 +3295,12 @@ pub const Parser = struct {
         const stmt_ast_start = self.ast.countNodes();
 
         self.has_last_expr_block_body = false;
-        const expr_node = try self.parseExpr(true);
+        const saved_stmt_lhs = self.is_in_stmt_lhs;
+        self.is_in_stmt_lhs = true;
+        const expr_node = blk_stmt_expr: {
+            defer self.is_in_stmt_lhs = saved_stmt_lhs;
+            break :blk_stmt_expr try self.parseExpr(true);
+        };
         const expr_tag = self.ast.getNode(expr_node).tag;
         const is_block_bodied = self.has_last_expr_block_body or isBlockBodiedAstTag(expr_tag);
 
@@ -3434,10 +3540,14 @@ pub const Parser = struct {
         }, cont_cst);
     }
 
-    /// Parses `ForStmt = "for" Pattern "in" ExprNoStruct Block ;`.
+    /// Parses `ForStmt = ["comptime"] "for" Pattern "in" ExprNoStruct Block ;`.
     fn parseForStmt(self: *Parser) anyerror!NodeIndex {
         const for_cst = try self.startCstNode(.for_stmt);
         var has_error = false;
+        var comptime_tok: TokenIndex = .none;
+        if (self.peekKind() == .kw_comptime) {
+            comptime_tok = try self.consumeLeaf(.token_leaf, .{});
+        }
         const for_tok = try self.consumeLeaf(.for_introducer, .{});
 
         const header_cst = try self.startCstNode(.for_header);
@@ -3458,7 +3568,7 @@ pub const Parser = struct {
         const extra_idx = try self.ast.appendExtraSlice(&extra_pair);
         return self.ast.appendNodeWithCst(.{
             .tag = .for_stmt,
-            .main_token = for_tok,
+            .main_token = if (!comptime_tok.isNone()) comptime_tok else for_tok,
             .lhs = PackedOperand.initExtra(extra_idx),
             .rhs = PackedOperand.initNode(body_block),
         }, for_cst);
@@ -3526,24 +3636,36 @@ pub const Parser = struct {
 
     /// Parses `Pattern = SinglePattern { "|" SinglePattern } ;` (`DR-03` Section 5.4 Part 7).
     pub fn parsePattern(self: *Parser, is_binding_slot: bool) anyerror!NodeIndex {
+        return self.parsePatternWithOptions(is_binding_slot, true);
+    }
+
+    /// Parses `Pattern` while optionally forbidding outer `{ … }` struct destructuring in `ExprNoStruct` headers.
+    pub fn parsePatternWithOptions(
+        self: *Parser,
+        is_binding_slot: bool,
+        is_struct_pat_allowed: bool,
+    ) anyerror!NodeIndex {
         try self.flushCarrierTokens();
         const pat_cst_start = CstNodeIndex.fromInt(@intCast(self.cst.countNodes()));
         const pat_ast_start = self.ast.countNodes();
 
-        self.pushState(.pattern_parse, pat_cst_start) catch |err| switch (err) {
+        self.pushState(.pattern_parse, pat_cst_start) catch |parse_err| switch (parse_err) {
             error.ParseDepthExceeded => {
                 const hole_cst = try self.startCstNode(.invalid_parse_subtree);
                 return self.recoverDepthOverflow(hole_cst, MATCH_ARM_STOP_SET, .pattern_hole);
             },
-            else => return err,
+            else => return parse_err,
         };
         var chain_pushes: usize = 0;
         defer self.popStates(1 + chain_pushes);
 
-        var lhs_pat = try self.parseSinglePattern(is_binding_slot);
+        var lhs_pat = try self.parseSinglePattern(is_binding_slot, is_struct_pat_allowed);
 
-        while (!self.is_recovering_depth_overflow and self.peekKind() == .pipe) {
-            self.pushState(.pattern_parse, pat_cst_start) catch |err| switch (err) {
+        while (!self.is_recovering_depth_overflow and
+            self.peekKind() == .pipe and
+            !(!is_struct_pat_allowed and self.isPayloadCaptureBar()))
+        {
+            self.pushState(.pattern_parse, pat_cst_start) catch |parse_err| switch (parse_err) {
                 error.ParseDepthExceeded => {
                     _ = try self.precedeNode(
                         pat_cst_start,
@@ -3553,14 +3675,14 @@ pub const Parser = struct {
                     );
                     return self.recoverDepthOverflow(pat_cst_start, MATCH_ARM_STOP_SET, .pattern_hole);
                 },
-                else => return err,
+                else => return parse_err,
             };
             chain_pushes += 1;
 
             const pipe_tok = self.peekTokenIndexNth(0);
             _ = try self.precedeNode(pat_cst_start, pat_ast_start, .or_pat, pipe_tok);
             _ = try self.consumeLeaf(.token_leaf, .{});
-            const rhs_pat = try self.parseSinglePattern(is_binding_slot);
+            const rhs_pat = try self.parseSinglePattern(is_binding_slot, is_struct_pat_allowed);
             self.cst.finishNode(pat_cst_start, .{});
             lhs_pat = try self.ast.appendNodeWithCst(.{
                 .tag = .or_pat,
@@ -3573,7 +3695,11 @@ pub const Parser = struct {
     }
 
     /// Parses a single pattern (`_`, literal/range, tuple, binding, `.Variant`, or `PathPattern`).
-    fn parseSinglePattern(self: *Parser, is_binding_slot: bool) anyerror!NodeIndex {
+    fn parseSinglePattern(
+        self: *Parser,
+        is_binding_slot: bool,
+        is_struct_pat_allowed: bool,
+    ) anyerror!NodeIndex {
         try self.flushCarrierTokens();
         const pat_cst_start = CstNodeIndex.fromInt(@intCast(self.cst.countNodes()));
         const pat_ast_start = self.ast.countNodes();
@@ -3699,9 +3825,9 @@ pub const Parser = struct {
                 defer payload_pats.deinit(self.ast.allocator);
 
                 if (self.peekKind() == .lparen) {
-                    try self.parseTuplePatPayload(&payload_pats, &has_err);
-                } else if (self.peekKind() == .lbrace) {
-                    try self.parseStructPatPayload(&payload_pats, &has_err);
+                    try self.parseTuplePatPayload(&payload_pats, is_binding_slot, &has_err);
+                } else if (is_struct_pat_allowed and self.peekKind() == .lbrace) {
+                    try self.parseStructPatPayload(&payload_pats, is_binding_slot, &has_err);
                 }
                 self.cst.finishNode(var_cst, .{ .has_error = has_err });
 
@@ -3738,10 +3864,11 @@ pub const Parser = struct {
                 }, bind_cst);
             },
             .ident, .type_ident, .const_ident, .kw_self_type => {
-                // Path, variant, or struct destructuring pattern (`Option::Some(x)` or `Point { x, y }`):
+                // Path, variant, or struct destructuring pattern (`Option::Some(x)`, `Ready`, or `Point { x, y }`):
                 if (self.peekKindNth(1) == .coloncolon or
                     self.peekKindNth(1) == .lparen or
-                    self.peekKindNth(1) == .lbrace)
+                    (is_struct_pat_allowed and self.peekKindNth(1) == .lbrace) or
+                    (!is_binding_slot and self.peekKind() == .type_ident))
                 {
                     const path_cst = try self.startCstNode(.path_pat);
                     var has_err = false;
@@ -3767,11 +3894,11 @@ pub const Parser = struct {
 
                     if (self.peekKind() == .lparen) {
                         self.cst.nodes.items(.kind)[path_cst.asInt()] = .variant_pat;
-                        try self.parseTuplePatPayload(&payload_pats, &has_err);
-                    } else if (self.peekKind() == .lbrace) {
+                        try self.parseTuplePatPayload(&payload_pats, is_binding_slot, &has_err);
+                    } else if (is_struct_pat_allowed and self.peekKind() == .lbrace) {
                         self.cst.nodes.items(.kind)[path_cst.asInt()] = .struct_pat;
                         res_tag = .struct_pat;
-                        try self.parseStructPatPayload(&payload_pats, &has_err);
+                        try self.parseStructPatPayload(&payload_pats, is_binding_slot, &has_err);
                     }
                     self.cst.finishNode(path_cst, .{ .has_error = has_err });
 
@@ -3837,6 +3964,7 @@ pub const Parser = struct {
     fn parseTuplePatPayload(
         self: *Parser,
         payload_pats: *std.ArrayList(u32),
+        is_binding_slot: bool,
         has_error: *bool,
     ) anyerror!void {
         const open_paren = try self.consumeLeaf(.token_leaf, .{});
@@ -3846,7 +3974,7 @@ pub const Parser = struct {
             self.peekKind() != .eof)
         {
             const loop_start = self.cursor;
-            try payload_pats.append(self.ast.allocator, (try self.parsePattern(true)).asInt());
+            try payload_pats.append(self.ast.allocator, (try self.parsePattern(is_binding_slot)).asInt());
             if (self.peekKind() == .comma) {
                 _ = try self.consumeLeaf(.token_leaf, .{});
             } else {
@@ -3866,6 +3994,7 @@ pub const Parser = struct {
     fn parseStructPatPayload(
         self: *Parser,
         payload_pats: *std.ArrayList(u32),
+        is_binding_slot: bool,
         has_error: *bool,
     ) anyerror!void {
         const open_brace = try self.consumeLeaf(.token_leaf, .{});
@@ -3896,7 +4025,7 @@ pub const Parser = struct {
                     _ = try self.consumeLeaf(.token_leaf, .{});
                     try payload_pats.append(
                         self.ast.allocator,
-                        (try self.parsePattern(true)).asInt(),
+                        (try self.parsePattern(is_binding_slot)).asInt(),
                     );
                 } else {
                     const bind_node = try self.ast.appendNodeWithCst(.{
@@ -4174,8 +4303,9 @@ pub const Parser = struct {
                 break;
             }
 
-            // [3] Reject nested assignment operators inside expressions (`if (x = 0)`):
-            if (min_bp > 0 and isAssignOp(cur_kind)) {
+            // [3] Break on outer statement-level assignment, or reject nested assignment inside expressions:
+            if (isAssignOp(cur_kind)) {
+                if (self.is_in_stmt_lhs) break;
                 const assign_tok = self.peekTokenIndexNth(0);
                 try self.emitUnexpectedToken(
                     assign_tok,
@@ -4198,6 +4328,7 @@ pub const Parser = struct {
             // [4] Infix Operators (Tiers 12 down to 1):
             if (getInfixBindingPower(cur_kind)) |bp_info| {
                 if (bp_info.left_bp < min_bp) break;
+                self.is_in_stmt_lhs = false;
 
                 self.pushState(.expr_pratt_loop, lhs_cst_start) catch |err| switch (err) {
                     error.ParseDepthExceeded => {
@@ -4266,6 +4397,36 @@ pub const Parser = struct {
                         .main_token = catch_tok,
                         .lhs = PackedOperand.initNode(lhs_node),
                         .rhs = PackedOperand.initNode(fallback_node),
+                    }, lhs_cst_start);
+                    continue;
+                }
+
+                if (cur_kind == .kw_is) {
+                    const is_tok = self.peekTokenIndexNth(0);
+                    _ = try self.precedeNode(lhs_cst_start, lhs_ast_start, .infix_expr, is_tok);
+                    _ = try self.consumeLeaf(.token_leaf, .{});
+                    const rhs_pat = try self.parsePatternWithOptions(false, is_struct_lit_allowed);
+
+                    var has_is_chain_err = false;
+                    if (self.peekKind() == .kw_is) {
+                        has_is_chain_err = true;
+                        const chain_tok = self.peekTokenIndexNth(0);
+                        try self.emitUnexpectedToken(
+                            chain_tok,
+                            "chained `is` pattern test operators are non-associative in CoreX",
+                            "combine pattern tests with `and` or add explicit parentheses",
+                        );
+                        _ = try self.consumeLeaf(.invalid_parse_leaf, .{ .has_error = true });
+                        _ = try self.parsePatternWithOptions(false, is_struct_lit_allowed);
+                    }
+
+                    self.cst.finishNode(lhs_cst_start, .{ .has_error = has_is_chain_err });
+                    self.has_last_expr_block_body = false;
+                    lhs_node = try self.ast.appendNodeWithCst(.{
+                        .tag = .binary_expr,
+                        .main_token = is_tok,
+                        .lhs = PackedOperand.initNode(lhs_node),
+                        .rhs = PackedOperand.initNode(rhs_pat),
                     }, lhs_cst_start);
                     continue;
                 }
@@ -4420,8 +4581,15 @@ pub const Parser = struct {
         lhs_ast_start: usize,
         is_struct_lit_allowed: bool,
     ) anyerror!NodeIndex {
+        const saved_stmt_lhs = self.is_in_stmt_lhs;
+        self.is_in_stmt_lhs = false;
+        defer self.is_in_stmt_lhs = saved_stmt_lhs;
         const bracket_tok = self.peekTokenIndexNth(0);
-        if (self.isTypeArgsAfterLBracket()) {
+        const lhs_ast = self.ast.getNode(lhs_node);
+        const is_intrinsic_callee = lhs_ast.tag == .ident_expr and
+            !lhs_ast.main_token.isNone() and
+            self.token_buffer.getToken(lhs_ast.main_token).kind == .at;
+        if (is_intrinsic_callee or self.isTypeArgsAfterLBracket()) {
             _ = try self.precedeNode(lhs_cst_start, lhs_ast_start, .call_expr, bracket_tok);
             var has_err = false;
             var call_items: std.ArrayList(u32) = .empty;
@@ -4531,6 +4699,9 @@ pub const Parser = struct {
         has_error: *bool,
         is_incomplete_out: *bool,
     ) anyerror!void {
+        const saved_stmt_lhs = self.is_in_stmt_lhs;
+        self.is_in_stmt_lhs = false;
+        defer self.is_in_stmt_lhs = saved_stmt_lhs;
         const open_paren = try self.consumeLeaf(.token_leaf, .{});
         self.pushState(.call_args_loop, CstNodeIndex.fromInt(@intCast(self.cst.countNodes() - 1))) catch |err| switch (err) {
             error.ParseDepthExceeded => {
@@ -4666,7 +4837,12 @@ pub const Parser = struct {
                 }
             }
 
-            const operand = try self.parseExprBp(right_bp, is_struct_lit_allowed);
+            const saved_stmt_lhs = self.is_in_stmt_lhs;
+            self.is_in_stmt_lhs = saved_stmt_lhs and (op_kind == .star);
+            const operand = blk_pref: {
+                defer self.is_in_stmt_lhs = saved_stmt_lhs;
+                break :blk_pref try self.parseExprBp(right_bp, is_struct_lit_allowed);
+            };
             self.cst.finishNode(pref_cst, .{});
             self.has_last_expr_block_body = false;
             return self.ast.appendNodeWithCst(.{
@@ -4680,6 +4856,9 @@ pub const Parser = struct {
 
     /// Parses a `PrimaryExpr` (`DR-03` Section 5.4 Part 8).
     fn parsePrimaryExpr(self: *Parser, is_struct_lit_allowed: bool) anyerror!NodeIndex {
+        const saved_stmt_lhs = self.is_in_stmt_lhs;
+        self.is_in_stmt_lhs = false;
+        defer self.is_in_stmt_lhs = saved_stmt_lhs;
         self.has_last_expr_block_body = false;
         switch (self.peekKind()) {
             .int_lit => {
@@ -4881,7 +5060,73 @@ pub const Parser = struct {
                     .lhs = PackedOperand.initNode(body_node),
                 }, loop_cst);
             },
-            .kw_comptime, .kw_unsafe, .kw_async => {
+            .at => {
+                if ((isIdentifierKind(self.peekKindNth(1)) or isKeywordKind(self.peekKindNth(1))) and
+                    (self.peekKindNth(2) == .pipe or self.peekKindNth(2) == .pipepipe))
+                {
+                    return self.parseClosureExpr(is_struct_lit_allowed);
+                }
+                const intr_cst = try self.startCstNode(.path_pat);
+                var has_intr_err = false;
+                const at_tok = try self.consumeLeaf(.token_leaf, .{});
+                const ident_tok = try self.expectIdentifierWithCasing(
+                    .ident,
+                    .snake_case,
+                    &has_intr_err,
+                    "expected `snake_case` intrinsic identifier after `@`",
+                );
+                self.cst.finishNode(intr_cst, .{ .has_error = has_intr_err });
+                self.has_last_expr_block_body = false;
+                return self.ast.appendNodeWithCst(.{
+                    .tag = .ident_expr,
+                    .main_token = at_tok,
+                    .lhs = PackedOperand.initToken(ident_tok),
+                }, intr_cst);
+            },
+            .kw_comptime => {
+                const comp_cst = try self.startCstNode(.prefix_expr);
+                self.pushState(.expr_prefix_finish, comp_cst) catch |parse_err| switch (parse_err) {
+                    error.ParseDepthExceeded => {
+                        return self.recoverDepthOverflow(comp_cst, EXPR_SYNC_STOP_SET, .expr_hole);
+                    },
+                    else => return parse_err,
+                };
+                defer self.popStates(1);
+
+                const comp_tok = try self.consumeLeaf(.token_leaf, .{});
+                var has_inner_block = false;
+                const inner_node = switch (self.peekKind()) {
+                    .lbrace => blk: {
+                        const parsed_blk = try self.parseBlock();
+                        has_inner_block = true;
+                        break :blk parsed_blk;
+                    },
+                    .kw_if => blk: {
+                        const parsed_if = try self.parseIfExpr();
+                        has_inner_block = true;
+                        break :blk parsed_if;
+                    },
+                    .kw_match => blk: {
+                        const parsed_match = try self.parseMatchExpr();
+                        has_inner_block = true;
+                        break :blk parsed_match;
+                    },
+                    else => blk: {
+                        const parsed_expr = try self.parseExprBp(26, is_struct_lit_allowed);
+                        has_inner_block = self.has_last_expr_block_body or
+                            isBlockBodiedAstTag(self.ast.getNode(parsed_expr).tag);
+                        break :blk parsed_expr;
+                    },
+                };
+                self.cst.finishNode(comp_cst, .{});
+                self.has_last_expr_block_body = has_inner_block;
+                return self.ast.appendNodeWithCst(.{
+                    .tag = .unary_expr,
+                    .main_token = comp_tok,
+                    .lhs = PackedOperand.initNode(inner_node),
+                }, comp_cst);
+            },
+            .kw_unsafe, .kw_async => {
                 const blk_cst = try self.startCstNode(.block);
                 _ = try self.consumeLeaf(.token_leaf, .{});
                 const inner_blk = try self.parseBlock();
@@ -5124,10 +5369,13 @@ pub const Parser = struct {
         );
     }
 
-    /// Parses `ClosureExpr = ("||" | "|" [ClosureParam {"," ClosureParam} [","]] "|") ["->" Type] (Block | Expr)`.
+    /// Parses `ClosureExpr = { Attribute } ("||" | "|" [ClosureParam {"," ClosureParam} [","]] "|") ["->" Type] (Block | Expr)`.
     fn parseClosureExpr(self: *Parser, is_struct_lit_allowed: bool) anyerror!NodeIndex {
         const clos_cst = try self.startCstNode(.closure_expr);
         var has_error = false;
+        if (self.peekKind() == .at) {
+            try self.parseAttributes(&has_error);
+        }
         const open_tok = try self.consumeLeaf(.closure_start, .{});
 
         var param_tokens: std.ArrayList(u32) = .empty;
@@ -6445,4 +6693,94 @@ test "test_parser_red_team_adversarial_regressions_rt01_to_rt07" {
         if (cst_kind == .view_block_expr) view_block_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), view_block_count);
+}
+
+test "test_parse_phase5_intrinsics_comptime_and_is_pattern" {
+    var token_buf = TokenBuffer.init(std.testing.allocator);
+    defer token_buf.deinit();
+    var cst_arena = LosslessCstArena.init(std.testing.allocator);
+    defer cst_arena.deinit();
+    var ast_arena = AstArena.init(std.testing.allocator);
+    defer ast_arena.deinit();
+    var sink = diagnostic.DiagnosticSink.init(std.testing.allocator);
+    defer sink.deinit();
+
+    const valid_src =
+        "fn check_phase5[T](comptime msg: str, status: Status) -> usize {\n" ++
+        "    @allow_unused let local_val = @size_of[T]();\n" ++
+        "    @compile_assert(local_val > 0, msg);\n" ++
+        "    comptime {\n" ++
+        "        @compile_assert(@implements[T, Eq](), msg);\n" ++
+        "    }\n" ++
+        "    comptime for idx in 0..2 {\n" ++
+        "        let step = idx;\n" ++
+        "    }\n" ++
+        "    if status is Ready {\n" ++
+        "        return comptime @align_of[T]();\n" ++
+        "    }\n" ++
+        "    if status is .Pending(code) {\n" ++
+        "        return code;\n" ++
+        "    }\n" ++
+        "    return local_val;\n" ++
+        "}\n";
+
+    _ = try parseSource(valid_src, FileId.fromInt(0), &token_buf, &cst_arena, &ast_arena, &sink, null);
+    try std.testing.expectEqual(@as(u32, 0), sink.error_count);
+    try verifyCstAndAstInvariants(
+        std.testing.allocator,
+        valid_src,
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+    );
+
+    // Chained `a is B is C` is non-associative and must emit `E0201`:
+    const non_assoc_src = "fn chained_is(val: Status) -> bool { return val is Ready is Ready; }\n";
+    sink.diagnostics.clearRetainingCapacity();
+    sink.error_count = 0;
+    sink.warning_count = 0;
+    _ = try parseSource(non_assoc_src, FileId.fromInt(1), &token_buf, &cst_arena, &ast_arena, &sink, null);
+    try std.testing.expect(sink.error_count >= 1);
+    try verifyCstAndAstInvariants(
+        std.testing.allocator,
+        non_assoc_src,
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+    );
+}
+
+test "test_parse_leading_stmt_attribute_before_comptime_constructs" {
+    var token_buf = TokenBuffer.init(std.testing.allocator);
+    defer token_buf.deinit();
+    var cst_arena = LosslessCstArena.init(std.testing.allocator);
+    defer cst_arena.deinit();
+    var ast_arena = AstArena.init(std.testing.allocator);
+    defer ast_arena.deinit();
+    var sink = diagnostic.DiagnosticSink.init(std.testing.allocator);
+    defer sink.deinit();
+
+    const source =
+        "fn annotated_comptime_stmts(slot: &mut i32) -> i32 {\n" ++
+        "    @must_use comptime fn helper() -> i32 { return 7; }\n" ++
+        "    @unroll comptime for idx in 0..2 {\n" ++
+        "        let step = idx;\n" ++
+        "    }\n" ++
+        "    @check_block comptime {\n" ++
+        "        @compile_assert(helper() == 7, \"ok\");\n" ++
+        "    };\n" ++
+        "    *slot = 20;\n" ++
+        "    let local_cb = @local |delta: i32| delta + *slot;\n" ++
+        "    return local_cb(helper());\n" ++
+        "}\n";
+
+    _ = try parseSource(source, FileId.fromInt(2), &token_buf, &cst_arena, &ast_arena, &sink, null);
+    try std.testing.expectEqual(@as(u32, 0), sink.error_count);
+    try verifyCstAndAstInvariants(
+        std.testing.allocator,
+        source,
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+    );
 }

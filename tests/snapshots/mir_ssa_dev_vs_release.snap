@@ -1,0 +1,409 @@
+=== [1] Lowered Pre-Strip MIR (Ghost Ops Intact) ===
+mir fn @showcase_ssa_cfg(params: 2) {
+  local _0 [set_mode] [addr]
+  local _1 [let_mode] (limit)
+  local _2 [let_mode] (mode_tag)
+  local _3 [let_mode] (audit_log)
+  local _4 [let_mode]
+  local _5 [let_mode]
+  local _6 [let_mode]
+  local _7 [let_mode]
+  local _8 [let_mode] (pair) [addr]
+  local _9 [let_mode] (idx)
+  local _10 [let_mode] (delta)
+  local _11 [let_mode] (bonus)
+  local _12 [let_mode]
+  local _13 [let_mode] [addr]
+  local _14 [let_mode]
+  ^bb0() [preds: 0]:
+    %126 = const_scalar (53, 0)
+    %125 = const_scalar (52, 0)
+    %89 = const_scalar (40, 0)
+    %88 = const_scalar (39, 0)
+    %58 = const_scalar (23, 0)
+    %57 = const_scalar (22, 0)
+    %0 = ghost_storage_init _1
+    %1 = ghost_access_let _1
+    %2 = place_load _1
+    %3 = ghost_access_end %1
+    %4 = ghost_storage_init _2
+    %5 = ghost_access_let _2
+    %6 = place_load _2
+    %7 = ghost_access_end %5
+    %8 = const_scalar (0, 0)
+    %9 = const_scalar (1, 0)
+    %10 = const_scalar (2, 0)
+    %11 = const_scalar (3, 0)
+    %12 = const_scalar (4, 0)
+    %13 = const_scalar (5, 0)
+    %14 = const_scalar (6, 0)
+    %15 = const_scalar (7, 0)
+    %16 = aggregate_make (0, 2)
+    %17 = ghost_storage_init _8
+    %18 = place_store _8 <- %16
+    %19 = const_scalar (8, 0)
+    %20 = const_scalar (9, 0)
+    %21 = const_scalar (10, 0)
+    term br -> ^bb1(%20)
+  ^bb1(%22) [preds: 2]:
+    %24 = bin_op.slt %22, %2
+    term cond_br [val=%24] -> ^bb3() -> ^bb4()
+  ^bb2() [preds: 1]:
+    %62 = const_scalar (26, 0)
+    %65 = const_scalar (27, 0)
+    %66 = bin_op.eq %6, %65
+    term cond_br [val=%66] -> ^bb9() -> ^bb10()
+  ^bb3() [preds: 1]:
+    %25 = const_scalar (11, 0)
+    %26 = bin_op.srem_checked %22, %25
+    %27 = const_scalar (12, 0)
+    %28 = bin_op.eq %26, %27
+    term cond_br [val=%28] -> ^bb6() -> ^bb7()
+  ^bb4() [preds: 1]:
+    term br -> ^bb2()
+  ^bb5() [preds: 1]:
+    %59 = const_scalar (24, 0)
+    %60 = const_scalar (25, 0)
+    term br -> ^bb1(%54)
+  ^bb6() [preds: 1]:
+    %29 = const_scalar (13, 0)
+    %30 = bin_op.sadd_checked %22, %29
+    term br -> ^bb8(%30)
+  ^bb7() [preds: 1]:
+    %31 = const_scalar (14, 0)
+    %32 = bin_op.sadd_checked %22, %31
+    term br -> ^bb8(%32)
+  ^bb8(%33) [preds: 2]:
+    %34 = const_scalar (15, 0)
+    %35 = ghost_access_let _8.f0
+    %36 = place_load _8.f0
+    %37 = ghost_access_end %35
+    %38 = bin_op.sadd_checked %36, %33
+    %39 = ghost_access_set _8.f0
+    %40 = place_store _8.f0 <- %38
+    %41 = ghost_access_end %39
+    %42 = const_scalar (16, 0)
+    %43 = ghost_access_let _8.f1
+    %44 = place_load _8.f1
+    %45 = ghost_access_end %43
+    %46 = const_scalar (17, 0)
+    %47 = bin_op.sadd_checked %44, %46
+    %48 = ghost_access_set _8.f1
+    %49 = place_store _8.f1 <- %47
+    %50 = ghost_access_end %48
+    %51 = const_scalar (18, 0)
+    %53 = const_scalar (19, 0)
+    %54 = bin_op.sadd_checked %22, %53
+    %55 = const_scalar (20, 0)
+    %56 = const_scalar (21, 0)
+    term br -> ^bb5()
+  ^bb9() [preds: 1]:
+    %67 = const_scalar (28, 0)
+    %68 = aggregate_make (2, 65537)
+    %69 = ghost_storage_deinit _8
+    term br -> ^bb12(%68)
+  ^bb10() [preds: 1]:
+    %90 = const_scalar (41, 0)
+    term br -> ^bb11()
+  ^bb11() [preds: 1]:
+    %91 = const_scalar (42, 0)
+    %92 = ghost_storage_init _13
+    %93 = place_store _13 <- %6
+    %94 = ghost_access_let _13
+    %95 = place_load _13
+    %96 = ghost_access_end %94
+    term switch_int [val=%95] -> ^bb17() -> ^bb18() -> ^bb19()
+  ^bb12(%70) [preds: 1] [cleanup_pad]:
+    %71 = const_scalar (29, 0)
+    %72 = const_scalar (30, 0)
+    %74 = const_scalar (55, 0)
+    %75 = const_scalar (31, 0)
+    %76 = const_scalar (32, 0)
+    %77 = const_scalar (33, 0)
+    term br -> ^bb13(%70)
+  ^bb13(%78) [preds: 1] [cleanup_pad]:
+    %79 = const_scalar (34, 0)
+    %80 = const_scalar (35, 0)
+    %82 = const_scalar (56, 0)
+    %83 = const_scalar (36, 0)
+    %84 = const_scalar (37, 0)
+    %85 = const_scalar (38, 0)
+    %86 = ghost_storage_init _0
+    %87 = place_store _0 <- %78
+    term ret [val=%78]
+  ^bb14() [preds: 1]:
+    %97 = const_scalar (43, 0)
+    term br -> ^bb20(%97)
+  ^bb15() [preds: 1]:
+    %98 = const_scalar (44, 0)
+    term br -> ^bb20(%98)
+  ^bb16() [preds: 1]:
+    %99 = const_scalar (45, 0)
+    term br -> ^bb20(%99)
+  ^bb17() [preds: 1]:
+    term br -> ^bb14()
+  ^bb18() [preds: 1]:
+    term br -> ^bb15()
+  ^bb19() [preds: 1]:
+    term br -> ^bb16()
+  ^bb20(%100) [preds: 3]:
+    %101 = const_scalar (46, 0)
+    %102 = ghost_access_let _8.f0
+    %103 = place_load _8.f0
+    %104 = ghost_access_end %102
+    %105 = ghost_access_let _8.f1
+    %106 = place_load _8.f1
+    %107 = ghost_access_end %105
+    %108 = bin_op.sadd_checked %103, %106
+    %109 = bin_op.sadd_checked %108, %100
+    %113 = bin_op.sadd_checked %109, %8
+    %114 = aggregate_make (3, 1)
+    %115 = const_scalar (47, 0)
+    %116 = const_scalar (48, 0)
+    %117 = const_scalar (54, 0)
+    %118 = const_scalar (49, 0)
+    %119 = const_scalar (50, 0)
+    %120 = const_scalar (51, 0)
+    %121 = ghost_storage_deinit _13
+    %122 = ghost_storage_deinit _8
+    %123 = ghost_storage_init _0
+    %124 = place_store _0 <- %114
+    term ret [val=%114]
+}
+
+=== [2] --dev Optimized MIR (D1..D5) ===
+mir fn @showcase_ssa_cfg(params: 2) [contextless] [ghost_stripped] {
+  local _0 [set_mode] [addr]
+  local _1 [let_mode] (limit)
+  local _2 [let_mode] (mode_tag)
+  local _3 [let_mode] (audit_log)
+  local _4 [let_mode]
+  local _5 [let_mode]
+  local _6 [let_mode]
+  local _7 [let_mode]
+  local _8 [let_mode] (pair) [addr]
+  local _9 [let_mode] (idx)
+  local _10 [let_mode] (delta)
+  local _11 [let_mode] (bonus)
+  local _12 [let_mode]
+  local _13 [let_mode] [addr]
+  local _14 [let_mode]
+  ^bb0() [preds: 0]:
+    %126 = const_scalar (53, 0)
+    %125 = const_scalar (52, 0)
+    %89 = const_scalar (40, 0)
+    %88 = const_scalar (39, 0)
+    %58 = const_scalar (23, 0)
+    %57 = const_scalar (22, 0)
+    %2 = place_load _1
+    %6 = place_load _2
+    %8 = const_scalar (0, 0)
+    %9 = const_scalar (1, 0)
+    %10 = const_scalar (2, 0)
+    %11 = const_scalar (3, 0)
+    %12 = const_scalar (4, 0)
+    %13 = const_scalar (5, 0)
+    %14 = const_scalar (6, 0)
+    %15 = const_scalar (7, 0)
+    %16 = aggregate_make (0, 2)
+    %18 = place_store _8 <- %16
+    %19 = const_scalar (8, 0)
+    %20 = const_scalar (9, 0)
+    %21 = const_scalar (10, 0)
+    term br -> ^bb1(%20)
+  ^bb1(%22) [preds: 2]:
+    %24 = bin_op.slt %22, %2
+    term cond_br [val=%24] -> ^bb3() -> ^bb4()
+  ^bb2() [preds: 1]:
+    %62 = const_scalar (26, 0)
+    %65 = const_scalar (27, 0)
+    %66 = bin_op.eq %6, %65
+    term cond_br [val=%66] -> ^bb9() -> ^bb10()
+  ^bb3() [preds: 1]:
+    %25 = const_scalar (11, 0)
+    %26 = bin_op.srem_checked %22, %25
+    %27 = const_scalar (12, 0)
+    %28 = bin_op.eq %26, %27
+    term cond_br [val=%28] -> ^bb6() -> ^bb7()
+  ^bb4() [preds: 1]:
+    term br -> ^bb2()
+  ^bb5() [preds: 1]:
+    %59 = const_scalar (24, 0)
+    %60 = const_scalar (25, 0)
+    term br -> ^bb1(%54)
+  ^bb6() [preds: 1]:
+    %29 = const_scalar (13, 0)
+    %30 = bin_op.sadd_checked %22, %29
+    term br -> ^bb8(%30)
+  ^bb7() [preds: 1]:
+    %31 = const_scalar (14, 0)
+    %32 = bin_op.sadd_checked %22, %31
+    term br -> ^bb8(%32)
+  ^bb8(%33) [preds: 2]:
+    %34 = const_scalar (15, 0)
+    %36 = place_load _8.f0
+    %38 = bin_op.sadd_checked %36, %33
+    %40 = place_store _8.f0 <- %38
+    %42 = const_scalar (16, 0)
+    %44 = place_load _8.f1
+    %46 = const_scalar (17, 0)
+    %47 = bin_op.sadd_checked %44, %46
+    %49 = place_store _8.f1 <- %47
+    %51 = const_scalar (18, 0)
+    %53 = const_scalar (19, 0)
+    %54 = bin_op.sadd_checked %22, %53
+    %55 = const_scalar (20, 0)
+    %56 = const_scalar (21, 0)
+    term br -> ^bb5()
+  ^bb9() [preds: 1]:
+    %67 = const_scalar (28, 0)
+    %68 = aggregate_make (2, 65537)
+    term br -> ^bb12(%68)
+  ^bb10() [preds: 1]:
+    %90 = const_scalar (41, 0)
+    term br -> ^bb11()
+  ^bb11() [preds: 1]:
+    %91 = const_scalar (42, 0)
+    %93 = place_store _13 <- %6
+    %95 = place_load _13
+    term switch_int [val=%95] -> ^bb17() -> ^bb18() -> ^bb19()
+  ^bb12(%70) [preds: 1] [cleanup_pad]:
+    %71 = const_scalar (29, 0)
+    %72 = const_scalar (30, 0)
+    %74 = const_scalar (55, 0)
+    %75 = const_scalar (31, 0)
+    %76 = const_scalar (32, 0)
+    %77 = const_scalar (33, 0)
+    term br -> ^bb13(%70)
+  ^bb13(%78) [preds: 1] [cleanup_pad]:
+    %79 = const_scalar (34, 0)
+    %80 = const_scalar (35, 0)
+    %82 = const_scalar (56, 0)
+    %83 = const_scalar (36, 0)
+    %84 = const_scalar (37, 0)
+    %85 = const_scalar (38, 0)
+    %87 = place_store _0 <- %78
+    term ret [val=%78]
+  ^bb14() [preds: 1]:
+    %97 = const_scalar (43, 0)
+    term br -> ^bb20(%97)
+  ^bb15() [preds: 1]:
+    %98 = const_scalar (44, 0)
+    term br -> ^bb20(%98)
+  ^bb16() [preds: 1]:
+    %99 = const_scalar (45, 0)
+    term br -> ^bb20(%99)
+  ^bb17() [preds: 1]:
+    term br -> ^bb14()
+  ^bb18() [preds: 1]:
+    term br -> ^bb15()
+  ^bb19() [preds: 1]:
+    term br -> ^bb16()
+  ^bb20(%100) [preds: 3]:
+    %101 = const_scalar (46, 0)
+    %103 = place_load _8.f0
+    %106 = place_load _8.f1
+    %108 = bin_op.sadd_checked %103, %106
+    %109 = bin_op.sadd_checked %108, %100
+    %113 = bin_op.sadd_checked %109, %8
+    %114 = aggregate_make (3, 1)
+    %115 = const_scalar (47, 0)
+    %116 = const_scalar (48, 0)
+    %117 = const_scalar (54, 0)
+    %118 = const_scalar (49, 0)
+    %119 = const_scalar (50, 0)
+    %120 = const_scalar (51, 0)
+    %124 = place_store _0 <- %114
+    term ret [val=%114]
+}
+
+=== [3] --release Optimized MIR (D1..D5 + R1..R6) ===
+mir fn @showcase_ssa_cfg(params: 2) [contextless] [ghost_stripped] {
+  local _0 [set_mode] [addr]
+  local _1 [let_mode] (limit)
+  local _2 [let_mode] (mode_tag)
+  local _3 [let_mode] (audit_log)
+  local _4 [let_mode]
+  local _5 [let_mode]
+  local _6 [let_mode]
+  local _7 [let_mode]
+  local _8 [let_mode] (pair)
+  local _9 [let_mode] (idx)
+  local _10 [let_mode] (delta)
+  local _11 [let_mode] (bonus)
+  local _12 [let_mode]
+  local _13 [let_mode]
+  local _14 [let_mode]
+  ^bb0() [preds: 0]:
+    %2 = place_load _1
+    %6 = place_load _2
+    %8 = const_scalar (0, 0)
+    %16 = aggregate_make (0, 2)
+    %127 = aggregate_extract (16, 0)
+    %128 = aggregate_extract (16, 1)
+    term br -> ^bb1(%8, %127, %128)
+  ^bb1(%22, %130, %132) [preds: 2]:
+    %24 = bin_op.slt %22, %2
+    term cond_br [val=%24] -> ^bb3() -> ^bb2()
+  ^bb2() [preds: 1]:
+    %65 = const_scalar (27, 0)
+    %66 = bin_op.eq %6, %65
+    term cond_br [val=%66] -> ^bb9() -> ^bb10()
+  ^bb3() [preds: 1]:
+    %25 = const_scalar (11, 0)
+    %26 = bin_op.srem_checked %22, %25
+    %28 = bin_op.eq %26, %8
+    term cond_br [val=%28] -> ^bb6() -> ^bb7()
+  ^bb4() [preds: 0]:
+    term unreachable_term
+  ^bb5() [preds: 0]:
+    term unreachable_term
+  ^bb6() [preds: 1]:
+    %30 = bin_op.sadd_checked %22, %25
+    term br -> ^bb8(%30)
+  ^bb7() [preds: 1]:
+    %31 = const_scalar (14, 0)
+    %32 = bin_op.sadd_checked %22, %31
+    term br -> ^bb8(%32)
+  ^bb8(%33) [preds: 2]:
+    %38 = bin_op.sadd_checked %130, %33
+    %46 = const_scalar (17, 0)
+    %47 = bin_op.sadd_checked %132, %46
+    %54 = bin_op.sadd_checked %22, %46
+    term br -> ^bb1(%54, %38, %47)
+  ^bb9() [preds: 1]:
+    %67 = const_scalar (28, 0)
+    %68 = aggregate_make (2, 65537)
+    %87 = place_store _0 <- %68
+    term ret [val=%68]
+  ^bb10() [preds: 1]:
+    term switch_int [val=%6] -> ^bb14() -> ^bb15() -> ^bb16()
+  ^bb11() [preds: 0]:
+    term unreachable_term
+  ^bb12() [preds: 0] [cleanup_pad]:
+    term unreachable_term
+  ^bb13() [preds: 0] [cleanup_pad]:
+    term unreachable_term
+  ^bb14() [preds: 1]:
+    %97 = const_scalar (43, 0)
+    term br -> ^bb20(%97)
+  ^bb15() [preds: 1]:
+    %98 = const_scalar (44, 0)
+    term br -> ^bb20(%98)
+  ^bb16() [preds: 1]:
+    %99 = const_scalar (45, 0)
+    term br -> ^bb20(%99)
+  ^bb17() [preds: 0]:
+    term unreachable_term
+  ^bb18() [preds: 0]:
+    term unreachable_term
+  ^bb19() [preds: 0]:
+    term unreachable_term
+  ^bb20(%100) [preds: 3]:
+    %108 = bin_op.sadd_checked %130, %132
+    %109 = bin_op.sadd_checked %108, %100
+    %113 = bin_op.add_wrap %109, %8
+    %114 = aggregate_make (3, 1)
+    %124 = place_store _0 <- %114
+    term ret [val=%114]
+}

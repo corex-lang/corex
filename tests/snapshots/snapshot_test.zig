@@ -2,8 +2,10 @@
 //!
 //! Compares rendered CLI help menus, single-line diagnostics, multi-line region diagnostics,
 //! cross-file stitched diagnostics, CLI typo diagnostics, lexer token/trivia streams, parser
-//! CST/AST trees and diagnostics, `corex fmt` / `corex fmt --fix` formatting outputs, and
-//! `CompilerDb` Early Cutoff / `ItemTree` firewall reports against golden `.snap` files.
+//! CST/AST trees and diagnostics, `corex fmt` / `corex fmt --fix` formatting outputs,
+//! `CompilerDb` Early Cutoff / `ItemTree` firewall reports, and Phase 5 `HIR` desugaring,
+//! Block-Argument SSA `MIR` (`--dev` vs `--release`, monomorphization, `LayoutShapeKey` dedup,
+//! and `R6` `ICF`), and multi-frame `comptime` / `W0501` diagnostics against golden `.snap` files.
 //!
 //! Normalizes `CRLF` (`\r\n`) to `LF` (`\n`) when loading `.snap` files so snapshots match across OSes.
 
@@ -53,6 +55,51 @@ fn expectMatchesSnapshotFile(
         }
     }
     try std.testing.expectEqualStrings(normalized_snap.items, actual_output);
+}
+
+/// Asserts that `sink` recorded zero errors, printing any unexpected diagnostics on failure.
+fn expectZeroDiagErrors(sink: *const DiagnosticSink) !void {
+    if (sink.hasErrors()) {
+        for (sink.diagnostics.items) |diag_item| {
+            std.debug.print(
+                "Unexpected diagnostic [{s}]: {s}\n",
+                .{ diag_item.code.asCodeStr(), diag_item.message },
+            );
+        }
+    }
+    try std.testing.expect(!sink.hasErrors());
+}
+
+/// Returns `true` if `sink` contains at least one diagnostic with `expected_code`.
+fn hasDiagnosticCodeInSink(
+    sink: *const DiagnosticSink,
+    expected_code: corex.DiagnosticCode,
+) bool {
+    for (sink.diagnostics.items) |diag_item| {
+        if (diag_item.code == expected_code) return true;
+    }
+    return false;
+}
+
+/// Registers every lowered `MirBody` inside `bundle` on `vm_engine` with its resolved `SymbolIndex`.
+fn registerAllMirBodiesInVm(
+    vm_engine: *corex.MirVm,
+    bundle: *corex.mir.MirSourceBundle,
+) !void {
+    for (bundle.mir_bundle.bodies.items) |*body_ptr| {
+        var sym_idx = bundle.hir_bundle.sym_table.def_to_symbol.get(
+            body_ptr.def_id.asInt(),
+        ) orelse corex.SymbolIndex.none;
+        if (sym_idx.isNone()) {
+            for (bundle.hir_bundle.hir_store.functions.items) |fn_meta| {
+                if (fn_meta.name == body_ptr.name and !fn_meta.symbol_index.isNone()) {
+                    sym_idx = fn_meta.symbol_index;
+                    break;
+                }
+            }
+        }
+        _ = try vm_engine.registerBody(body_ptr, sym_idx);
+    }
 }
 
 // ------------------------------------- PUBLIC API --------------------------------------
@@ -815,5 +862,491 @@ test "test_snapshot_diag_phase4_type_errors" {
         std.testing.io,
         "tests/snapshots/diag_phase4_type_errors.snap",
         out_writer.buffered(),
+    );
+}
+
+test "test_snapshot_phase5_hir_desugaring" {
+    const hir_showcase_src =
+        "pub const ENABLE_BONUS: bool = true;\n" ++
+        "pub struct IoError {\n" ++
+        "    pub code: i32,\n" ++
+        "}\n" ++
+        "pub enum AppError {\n" ++
+        "    @from Io(IoError),\n" ++
+        "    Invalid,\n" ++
+        "}\n" ++
+        "pub struct SampleRow {\n" ++
+        "    pub weight: i32,\n" ++
+        "    pub tag: u32,\n" ++
+        "}\n" ++
+        "pub bit_field PacketFlags : u16 {\n" ++
+        "    pub is_live: bool | 1,\n" ++
+        "    pub tag: u16 | 15,\n" ++
+        "}\n" ++
+        "pub fn scale_step(num: i32, factor: i32) -> i32 {\n" ++
+        "    return num * factor;\n" ++
+        "}\n" ++
+        "pub fn read_raw(is_ok: bool) -> Result[i32, IoError] {\n" ++
+        "    if is_ok {\n" ++
+        "        return .Ok(20);\n" ++
+        "    }\n" ++
+        "    return .Err(IoError { code: 404 });\n" ++
+        "}\n" ++
+        "pub fn lift_value(is_ok: bool, seed_val: i32) -> Result[i32, AppError] {\n" ++
+        "    let raw_val = read_raw(is_ok)?;\n" ++
+        "    let piped = seed_val |> scale_step(2);\n" ++
+        "    return .Ok(piped + raw_val);\n" ++
+        "}\n" ++
+        "pub fn showcase_hir(opt_in: i32?, is_ok: bool) -> i32 {\n" ++
+        "    let .Some(unwrapped) = opt_in else {\n" ++
+        "        return 0;\n" ++
+        "    };\n" ++
+        "    let recovered = lift_value(is_ok, unwrapped) catch |err| match err {\n" ++
+        "        .Io(io_err) => io_err.code,\n" ++
+        "        .Invalid => -1,\n" ++
+        "    };\n" ++
+        "    var rows: #soa [SampleRow; 2] = @default_init[#soa [SampleRow; 2]]();\n" ++
+        "    rows[0].weight = recovered;\n" ++
+        "    rows.weight[1] += 3;\n" ++
+        "    var flags = PacketFlags { is_live: false, tag: 2 };\n" ++
+        "    flags.is_live = true;\n" ++
+        "    flags.tag = 5;\n" ++
+        "    let bonus: i32 = comptime if ENABLE_BONUS { 10 } else { 0 };\n" ++
+        "    var unrolled_sum: i32 = 0;\n" ++
+        "    comptime for step in 0..3 {\n" ++
+        "        unrolled_sum += step;\n" ++
+        "    }\n" ++
+        "    return rows[0].weight + rows[1].weight + (flags.tag as i32) + bonus + unrolled_sum;\n" ++
+        "}\n";
+
+    var bundle = try corex.lowerSourceToHir(
+        std.testing.allocator,
+        hir_showcase_src,
+        corex.TargetLayout.NATIVE_64,
+    );
+    defer bundle.deinit();
+    try expectZeroDiagErrors(&bundle.diagnostics);
+
+    const rendered_hir = try corex.renderHir(
+        std.testing.allocator,
+        &bundle.hir_store,
+        &bundle.pool,
+        &bundle.sym_table,
+        &bundle.interner,
+    );
+    defer std.testing.allocator.free(rendered_hir);
+
+    try expectMatchesSnapshotFile(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/snapshots/hir_desugaring.snap",
+        rendered_hir,
+    );
+}
+
+test "test_snapshot_phase5_mir_ssa_dev_vs_release" {
+    const mir_showcase_src =
+        "pub struct AccumPair {\n" ++
+        "    pub total: i64,\n" ++
+        "    pub steps: i64,\n" ++
+        "}\n" ++
+        "pub fn showcase_ssa_cfg(limit: i64, mode_tag: i64) -> Result[i64, i64] {\n" ++
+        "    var audit_log: i64 = 0;\n" ++
+        "    defer {\n" ++
+        "        audit_log += 1;\n" ++
+        "    }\n" ++
+        "    errdefer {\n" ++
+        "        audit_log += 10;\n" ++
+        "    }\n" ++
+        "    var pair = AccumPair { total: 0, steps: 0 };\n" ++
+        "    var idx: i64 = 0;\n" ++
+        "    while idx < limit {\n" ++
+        "        let delta: i64 = if idx % 2 == 0 { idx + 2 } else { idx + 1 };\n" ++
+        "        pair.total = pair.total + delta;\n" ++
+        "        pair.steps = pair.steps + 1;\n" ++
+        "        idx = idx + 1;\n" ++
+        "    }\n" ++
+        "    if mode_tag == 2 {\n" ++
+        "        return .Err(-1);\n" ++
+        "    }\n" ++
+        "    let bonus: i64 = match mode_tag {\n" ++
+        "        0 => 10,\n" ++
+        "        1 => 20,\n" ++
+        "        _ => 30,\n" ++
+        "    };\n" ++
+        "    return .Ok(pair.total + pair.steps + bonus + audit_log);\n" ++
+        "}\n";
+
+    var bundle = try corex.lowerSourceToMir(
+        std.testing.allocator,
+        FileId.fromInt(0),
+        mir_showcase_src,
+        corex.TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer bundle.deinit();
+    try expectZeroDiagErrors(&bundle.hir_bundle.diagnostics);
+
+    var dev_sink = DiagnosticSink.init(std.testing.allocator);
+    defer dev_sink.deinit();
+    var dev_res = try corex.optimizeMirModule(
+        std.testing.allocator,
+        bundle.mir_bundle.bodies.items,
+        &bundle.hir_bundle.pool,
+        &bundle.hir_bundle.sym_table,
+        &bundle.hir_bundle.interner,
+        .{
+            .is_release_mode = false,
+            .is_preserving_pre_strip_mir = true,
+            .target_layout = corex.TargetLayout.NATIVE_64,
+            .syntax_view = .{
+                .source = mir_showcase_src,
+                .tokens = &bundle.hir_bundle.tokens,
+                .cst_arena = &bundle.hir_bundle.cst_arena,
+            },
+        },
+        &dev_sink,
+    );
+    defer dev_res.deinit();
+    try std.testing.expect(!dev_sink.hasErrors());
+
+    var rel_sink = DiagnosticSink.init(std.testing.allocator);
+    defer rel_sink.deinit();
+    var rel_res = try corex.optimizeMirModule(
+        std.testing.allocator,
+        bundle.mir_bundle.bodies.items,
+        &bundle.hir_bundle.pool,
+        &bundle.hir_bundle.sym_table,
+        &bundle.hir_bundle.interner,
+        .{
+            .is_release_mode = true,
+            .is_preserving_pre_strip_mir = false,
+            .target_layout = corex.TargetLayout.NATIVE_64,
+            .syntax_view = .{
+                .source = mir_showcase_src,
+                .tokens = &bundle.hir_bundle.tokens,
+                .cst_arena = &bundle.hir_bundle.cst_arena,
+            },
+        },
+        &rel_sink,
+    );
+    defer rel_res.deinit();
+    try std.testing.expect(!rel_sink.hasErrors());
+
+    const pre_strip_body = &dev_res.pre_strip_bodies.items[0];
+    const dev_body = dev_res.findBodyByName(&bundle.hir_bundle.interner, "showcase_ssa_cfg").?;
+    const rel_body = rel_res.findBodyByName(&bundle.hir_bundle.interner, "showcase_ssa_cfg").?;
+
+    const pre_strip_dump = try corex.renderMir(
+        std.testing.allocator,
+        pre_strip_body,
+        &bundle.hir_bundle.interner,
+    );
+    defer std.testing.allocator.free(pre_strip_dump);
+
+    const dev_dump = try corex.renderMir(
+        std.testing.allocator,
+        dev_body,
+        &bundle.hir_bundle.interner,
+    );
+    defer std.testing.allocator.free(dev_dump);
+
+    const rel_dump = try corex.renderMir(
+        std.testing.allocator,
+        rel_body,
+        &bundle.hir_bundle.interner,
+    );
+    defer std.testing.allocator.free(rel_dump);
+
+    var combined_out: std.ArrayList(u8) = .empty;
+    defer combined_out.deinit(std.testing.allocator);
+    try combined_out.appendSlice(
+        std.testing.allocator,
+        "=== [1] Lowered Pre-Strip MIR (Ghost Ops Intact) ===\n",
+    );
+    try combined_out.appendSlice(std.testing.allocator, pre_strip_dump);
+    try combined_out.appendSlice(
+        std.testing.allocator,
+        "\n=== [2] --dev Optimized MIR (D1..D5) ===\n",
+    );
+    try combined_out.appendSlice(std.testing.allocator, dev_dump);
+    try combined_out.appendSlice(
+        std.testing.allocator,
+        "\n=== [3] --release Optimized MIR (D1..D5 + R1..R6) ===\n",
+    );
+    try combined_out.appendSlice(std.testing.allocator, rel_dump);
+
+    try expectMatchesSnapshotFile(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/snapshots/mir_ssa_dev_vs_release.snap",
+        combined_out.items,
+    );
+}
+
+test "test_snapshot_phase5_mir_monomorph_and_icf" {
+    const mono_icf_src =
+        "pub fn scale_add(val: Number, factor: Number) -> Number {\n" ++
+        "    return val * factor + val;\n" ++
+        "}\n" ++
+        "pub fn select_ptr[T](take_left: bool, left_ref: T, right_ref: T) -> T {\n" ++
+        "    if take_left {\n" ++
+        "        return left_ref;\n" ++
+        "    }\n" ++
+        "    return right_ref;\n" ++
+        "}\n" ++
+        "@inline(never)\n" ++
+        "pub fn hash_lane_a(lhs: i64, rhs: i64) -> i64 {\n" ++
+        "    let sum_val = lhs + rhs;\n" ++
+        "    return sum_val * 3 - lhs;\n" ++
+        "}\n" ++
+        "@inline(never)\n" ++
+        "pub fn hash_lane_b(first: i64, second: i64) -> i64 {\n" ++
+        "    let combined = first + second;\n" ++
+        "    return combined * 3 - first;\n" ++
+        "}\n" ++
+        "pub fn run_mono_icf_entry(seed_val: i64) -> i64 {\n" ++
+        "    let u_left: u32 = 11;\n" ++
+        "    let u_right: u32 = 22;\n" ++
+        "    let i_left: i32 = 33;\n" ++
+        "    let i_right: i32 = 44;\n" ++
+        "    let two_i64: i64 = 2;\n" ++
+        "    let four_u32: u32 = 4;\n" ++
+        "    let three_u32: u32 = 3;\n" ++
+        "    let chosen_u = select_ptr(true, &u_left, &u_right);\n" ++
+        "    let chosen_i = select_ptr(false, &i_left, &i_right);\n" ++
+        "    let scaled_i64 = scale_add(seed_val, two_i64);\n" ++
+        "    let scaled_u32 = scale_add(four_u32, three_u32) as i64;\n" ++
+        "    return (*chosen_u as i64) + (*chosen_i as i64) + scaled_i64 + scaled_u32 +\n" ++
+        "        hash_lane_a(seed_val, 5) + hash_lane_b(seed_val, 5);\n" ++
+        "}\n";
+
+    var bundle = try corex.lowerSourceToMir(
+        std.testing.allocator,
+        FileId.fromInt(0),
+        mono_icf_src,
+        corex.TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer bundle.deinit();
+    try expectZeroDiagErrors(&bundle.hir_bundle.diagnostics);
+
+    var rel_sink = DiagnosticSink.init(std.testing.allocator);
+    defer rel_sink.deinit();
+    var rel_res = try corex.optimizeMirModule(
+        std.testing.allocator,
+        bundle.mir_bundle.bodies.items,
+        &bundle.hir_bundle.pool,
+        &bundle.hir_bundle.sym_table,
+        &bundle.hir_bundle.interner,
+        .{
+            .is_release_mode = true,
+            .is_preserving_pre_strip_mir = false,
+            .target_layout = corex.TargetLayout.NATIVE_64,
+            .syntax_view = .{
+                .source = mono_icf_src,
+                .tokens = &bundle.hir_bundle.tokens,
+                .cst_arena = &bundle.hir_bundle.cst_arena,
+            },
+        },
+        &rel_sink,
+    );
+    defer rel_res.deinit();
+    try std.testing.expect(!rel_sink.hasErrors());
+    try std.testing.expect(rel_res.dedup_merged_count >= 1);
+    try std.testing.expect(rel_res.icf_folded_count >= 1);
+
+    var combined_out: std.ArrayList(u8) = .empty;
+    defer combined_out.deinit(std.testing.allocator);
+
+    var hdr_buf: [256]u8 = undefined;
+    var hdr_writer = std.Io.Writer.fixed(&hdr_buf);
+    try hdr_writer.print(
+        "=== Phase 5 Monomorphization, LayoutShapeKey Dedup & R6 ICF Summary ===\n" ++
+            "bodies={d} dedup_merged_count={d} icf_merged_count={d}\n\n",
+        .{ rel_res.bodies.items.len, rel_res.dedup_merged_count, rel_res.icf_folded_count },
+    );
+    try combined_out.appendSlice(std.testing.allocator, hdr_writer.buffered());
+
+    for (rel_res.bodies.items, 0..) |*body_item, i| {
+        if (i > 0) try combined_out.append(std.testing.allocator, '\n');
+        const body_dump = try corex.renderMir(
+            std.testing.allocator,
+            body_item,
+            &bundle.hir_bundle.interner,
+        );
+        defer std.testing.allocator.free(body_dump);
+        try combined_out.appendSlice(std.testing.allocator, body_dump);
+    }
+
+    try expectMatchesSnapshotFile(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/snapshots/mir_monomorph_icf.snap",
+        combined_out.items,
+    );
+}
+
+test "test_snapshot_diag_phase5_comptime_stack_trace_and_w0501" {
+    const phase5_err_src =
+        "pub fn spin_inner(seed_val: i64) -> i64 {\n" ++
+        "    var cursor: i64 = seed_val;\n" ++
+        "    while cursor > 0 {\n" ++
+        "        cursor += 1;\n" ++
+        "    }\n" ++
+        "    return cursor;\n" ++
+        "}\n" ++
+        "pub fn spin_outer() -> i64 {\n" ++
+        "    return spin_inner(1);\n" ++
+        "}\n" ++
+        "pub fn oob_inner(index_val: usize) -> i32 {\n" ++
+        "    let items: [i32; 3] = [10, 20, 30];\n" ++
+        "    return items[index_val];\n" ++
+        "}\n" ++
+        "pub fn oob_outer() -> i32 {\n" ++
+        "    return oob_inner(3);\n" ++
+        "}\n" ++
+        "pub fn assert_inner(limit_val: i64) -> i64 {\n" ++
+        "    @compile_assert(limit_val > 0, \"limit must be positive\");\n" ++
+        "    return limit_val;\n" ++
+        "}\n" ++
+        "pub fn assert_outer() -> i64 {\n" ++
+        "    return assert_inner(0);\n" ++
+        "}\n" ++
+        "@inline\n" ++
+        "pub fn rec_inline_step(depth: i64) -> i64 {\n" ++
+        "    if depth <= 0 {\n" ++
+        "        return 0;\n" ++
+        "    }\n" ++
+        "    return 1 + rec_inline_step(depth - 1);\n" ++
+        "}\n" ++
+        "pub fn call_rec_inline(seed_val: i64) -> i64 {\n" ++
+        "    return rec_inline_step(seed_val);\n" ++
+        "}\n";
+
+    var bundle = try corex.lowerSourceToMir(
+        std.testing.allocator,
+        FileId.fromInt(0),
+        phase5_err_src,
+        corex.TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer bundle.deinit();
+
+    var source_map = VfsSourceMap.init(std.testing.allocator, &bundle.hir_bundle.interner);
+    defer source_map.deinit(std.testing.io);
+    const vfs_file_id = try source_map.setOverlay(
+        "src\\comptime\\phase5_errors.cx",
+        phase5_err_src,
+        .root,
+    );
+    try std.testing.expectEqual(FileId.fromInt(0), vfs_file_id);
+
+    var file_tokens: std.AutoHashMapUnmanaged(u32, *const TokenBuffer) = .empty;
+    defer file_tokens.deinit(std.testing.allocator);
+    try file_tokens.put(std.testing.allocator, vfs_file_id.asInt(), &bundle.hir_bundle.tokens);
+
+    var rodata_pool = corex.RodataPool.init(std.testing.allocator);
+    defer rodata_pool.deinit();
+    var diag_sink = DiagnosticSink.init(std.testing.allocator);
+    defer diag_sink.deinit();
+
+    // [1] `E0501` step budget exceeded with `--comptime-limit` help note + call-stack trace:
+    {
+        var vm_step = try corex.MirVm.init(
+            std.testing.allocator,
+            &bundle.hir_bundle.interner,
+            &bundle.hir_bundle.pool,
+            &bundle.hir_bundle.sym_table,
+            &rodata_pool,
+            null,
+            &diag_sink,
+            .{ .step_budget = 64, .file_tokens = &file_tokens },
+        );
+        defer vm_step.deinit();
+        try registerAllMirBodiesInVm(&vm_step, &bundle);
+        const spin_outer = bundle.mir_bundle.findBodyByName(
+            &bundle.hir_bundle.interner,
+            "spin_outer",
+        ).?;
+        try std.testing.expectError(error.StepLimitExceeded, vm_step.evalBody(spin_outer, &.{}));
+    }
+
+    // [2] `E0504` spatial out-of-bounds read + `E0510` `@compile_assert` failure with call-stack traces:
+    {
+        var vm_trap = try corex.MirVm.init(
+            std.testing.allocator,
+            &bundle.hir_bundle.interner,
+            &bundle.hir_bundle.pool,
+            &bundle.hir_bundle.sym_table,
+            &rodata_pool,
+            null,
+            &diag_sink,
+            .{ .file_tokens = &file_tokens },
+        );
+        defer vm_trap.deinit();
+        try registerAllMirBodiesInVm(&vm_trap, &bundle);
+
+        const oob_outer = bundle.mir_bundle.findBodyByName(
+            &bundle.hir_bundle.interner,
+            "oob_outer",
+        ).?;
+        try std.testing.expectError(error.OutOfBounds, vm_trap.evalBody(oob_outer, &.{}));
+
+        const assert_outer = bundle.mir_bundle.findBodyByName(
+            &bundle.hir_bundle.interner,
+            "assert_outer",
+        ).?;
+        try std.testing.expectError(
+            error.CompileAssertionFailed,
+            vm_trap.evalBody(assert_outer, &.{}),
+        );
+    }
+
+    // [3] `W0501` `@inline` inlining budget / recursion warning in `--release` `optimizeMirModule`:
+    {
+        var rel_res = try corex.optimizeMirModule(
+            std.testing.allocator,
+            bundle.mir_bundle.bodies.items,
+            &bundle.hir_bundle.pool,
+            &bundle.hir_bundle.sym_table,
+            &bundle.hir_bundle.interner,
+            .{
+                .is_release_mode = true,
+                .is_preserving_pre_strip_mir = false,
+                .target_layout = corex.TargetLayout.NATIVE_64,
+                .syntax_view = .{
+                    .source = phase5_err_src,
+                    .tokens = &bundle.hir_bundle.tokens,
+                    .cst_arena = &bundle.hir_bundle.cst_arena,
+                },
+            },
+            &diag_sink,
+        );
+        defer rel_res.deinit();
+    }
+
+    try std.testing.expect(hasDiagnosticCodeInSink(&diag_sink, .e0501_comptime_step_limit_exceeded));
+    try std.testing.expect(hasDiagnosticCodeInSink(&diag_sink, .e0504_comptime_out_of_bounds));
+    try std.testing.expect(hasDiagnosticCodeInSink(&diag_sink, .e0510_compile_assertion_failed));
+    try std.testing.expect(hasDiagnosticCodeInSink(&diag_sink, .w0501_inlining_budget_exceeded));
+
+    var out_buf: [32768]u8 = undefined;
+    var out_writer = std.Io.Writer.fixed(&out_buf);
+    try DiagnosticRenderer.init(
+        &source_map,
+        &bundle.hir_bundle.interner,
+        StyleConfig.MONOCHROME,
+    ).renderAll(&out_writer, &diag_sink);
+
+    const rendered_text = out_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, rendered_text, "src/comptime/phase5_errors.cx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered_text, "src\\comptime\\phase5_errors.cx") == null);
+
+    try expectMatchesSnapshotFile(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/snapshots/diag_phase5_comptime_errors.snap",
+        rendered_text,
     );
 }
