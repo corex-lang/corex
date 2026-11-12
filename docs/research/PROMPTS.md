@@ -1,32 +1,33 @@
-# Upfront `Deep Research` Prompts (`DR-01`–`DR-19`)
+# Upfront `Deep Research` Prompts (`DR-01`–`DR-20`)
 
-This catalog contains the 19 self-contained, copy-pasteable `Deep research` prompts that resolve the Research Decision Gates (`RDG-01`–`RDG-19`) in [PLAN.md](../../PLAN.md). When a `Deep research` report is completed, save its output to the corresponding `docs/research/DR-XX.md` path listed below.
+This catalog contains the 20 self-contained, copy-pasteable `Deep research` prompts that resolve the Research Decision Gates (`RDG-01`–`RDG-20`) in [PLAN.md](../../PLAN.md). When a `Deep research` report is completed, save its output to the corresponding `docs/research/DR-XX.md` path listed below.
 
 ---
 
 ## Research Report Index & Execution Waves
 
-| Report ID   | Gate ID      | Target Report Path       | Wave   | Files to Attach in Chat                    | Blocking Phase   | Subsystem / Architectural Scope                                                        |
-| ----------- | ------------ | ------------------------ | ------ | ------------------------------------------ | ---------------- | -------------------------------------------------------------------------------------- |
-| **`DR-01`** | **`RDG-01`** | `docs/research/DR-01.md` | Wave 1 | *None (Completed)*                         | Phase 0          | Bootstrap Implementation Language & Self-Hosting Strategy                              |
-| **`DR-02`** | **`RDG-02`** | `docs/research/DR-02.md` | Wave 1 | *None (Completed)*                         | Phase 2          | Programming Paradigm & Execution Semantics                                             |
-| **`DR-03`** | **`RDG-03`** | `docs/research/DR-03.md` | Wave 1 | *None (Completed)*                         | Phase 1 / 2      | Ergonomic Syntax, Delimiter Design & Naming Conventions                                |
-| **`DR-04`** | **`RDG-04`** | `docs/research/DR-04.md` | Wave 2 | `DR-01`, `DR-02`, `DR-03`                  | Phase 4          | Static Type System, Constrained Type Groups & Zero-Overhead Inference                  |
-| **`DR-05`** | **`RDG-05`** | `docs/research/DR-05.md` | Wave 2 | `DR-01`, `DR-02`, `DR-03`                  | Phase 5          | Compile-Time Execution (`comptime`) & Metaprogramming Architecture                     |
-| **`DR-06`** | **`RDG-06`** | `docs/research/DR-06.md` | Wave 2 | `DR-01`, `DR-02`, `DR-03`                  | Phase 6          | Zero-GC Automatic Memory Management, Manual Control & SAST Verifier                    |
-| **`DR-07`** | **`RDG-07`** | `docs/research/DR-07.md` | Wave 2 | `DR-01`, `DR-02`, `DR-03`                  | Phase 4 / 6      | Error Handling Model & Zero-Cost Propagation Semantics                                 |
-| **`DR-12`** | **`RDG-12`** | `docs/research/DR-12.md` | Wave 2 | `DR-01`, `DR-02`, `DR-03`                  | Phase 2 / 3 / 10 | Incremental Query Engine, Fault-Tolerant Lossless CST & Built-in LSP                   |
-| **`DR-13`** | **`RDG-13`** | `docs/research/DR-13.md` | Wave 2 | `DR-01`, `DR-02`, `DR-03`                  | Phase 5          | Intermediate Representations (`HIR` & SSA `MIR`) & Optimization Pipeline               |
-| **`DR-08`** | **`RDG-08`** | `docs/research/DR-08.md` | Wave 3 | `DR-01`–`DR-03`, `DR-06`, `DR-07`          | Phase 8 / 11     | Concurrency, Async/Structured Execution & High-Throughput I/O Model                    |
-| **`DR-09`** | **`RDG-09`** | `docs/research/DR-09.md` | Wave 3 | `DR-01`–`DR-03`, `DR-06`, `DR-13`          | Phase 7          | Dual-Mode Compiler Backend Architecture (Instant Dev vs. Production AOT)               |
-| **`DR-10`** | **`RDG-10`** | `docs/research/DR-10.md` | Wave 3 | `DR-01`–`DR-03`, `DR-06`, `DR-07`, `DR-13` | Phase 8          | Cross-Compilation, Zero-Dependency Linking, C FFI & WebAssembly (`wasm32`)             |
-| **`DR-11`** | **`RDG-11`** | `docs/research/DR-11.md` | Wave 3 | `DR-01`, `DR-02`, `DR-03`                  | Phase 9          | Package Manager, URL/Registry Resolution, Global Cache & Lockfiles                     |
-| **`DR-14`** | **`RDG-14`** | `docs/research/DR-14.md` | Wave 3 | `DR-01`–`DR-03`, `DR-12`                   | Phase 3 / 10     | Zero-Legacy AST Migration Engine (`corex upgrade`) & Canonical Formatter (`corex fmt`) |
-| **`DR-15`** | **`RDG-15`** | `docs/research/DR-15.md` | Wave 3 | `DR-02`–`DR-08`                            | Phase 11         | Stage-2 `.cx` Standard Library, TUI/CLI & Unified WebAssembly/Native UI Architecture   |
-| **`DR-16`** | **`RDG-16`** | `docs/research/DR-16.md` | Wave 4 | `DR-01`, `DR-11`, `DR-12`, `DR-14`         | Phase 9 / 10        | Dependency-Conflict Solution Synthesis, Ranking & Lossless `corex.toml` Quick-Apply    |
-| **`DR-17`** | **`RDG-17`** | `docs/research/DR-17.md` | Wave 4 | `DR-01`, `DR-06`, `DR-11`, `DR-12`         | Phase 6 / 9 / 10    | Zero-Annotation Call-Graph Capability Sandboxing & `@no_alloc` / `@no_panic` Contracts |
-| **`DR-18`** | **`RDG-18`** | `docs/research/DR-18.md` | Wave 4 | `DR-01`, `DR-08`, `DR-09`, `DR-15`         | Phase 7 / 8 / 11    | Deterministic `Context` Simulation (`corex test --sim`) & Native Coverage Fuzzing      |
-| **`DR-19`** | **`RDG-19`** | `docs/research/DR-19.md` | Wave 4 | `DR-01`, `DR-06`, `DR-08`, `DR-09`, `DR-15`| Phase 7 (Seam) / 13 | Stateful Live Hot-Reloading (`corex run --watch`), `@must_vectorize` & Cluster Sim     |
+| Report ID   | Gate ID      | Target Report Path       | Wave   | MD Files to Attach in Chat                          | Blocking Phase        | Subsystem / Architectural Scope                                                        |
+| ----------- | ------------ | ------------------------ | ------ | --------------------------------------------------- | --------------------- | -------------------------------------------------------------------------------------- |
+| **`DR-01`** | **`RDG-01`** | `docs/research/DR-01.md` | Wave 1 | *None*                                              | Phase 0               | Bootstrap Implementation Language & Self-Hosting Strategy                              |
+| **`DR-02`** | **`RDG-02`** | `docs/research/DR-02.md` | Wave 1 | *None*                                              | Phase 2               | Programming Paradigm & Execution Semantics                                             |
+| **`DR-03`** | **`RDG-03`** | `docs/research/DR-03.md` | Wave 1 | *None*                                              | Phase 1 / 2           | Ergonomic Syntax, Delimiter Design & Naming Conventions                                |
+| **`DR-04`** | **`RDG-04`** | `docs/research/DR-04.md` | Wave 2 | `DR-01`–`DR-03`                                     | Phase 4               | Static Type System, Constrained Type Groups & Zero-Overhead Inference                  |
+| **`DR-05`** | **`RDG-05`** | `docs/research/DR-05.md` | Wave 2 | `DR-01`–`DR-03`                                     | Phase 5               | Compile-Time Execution (`comptime`) & Metaprogramming Architecture                     |
+| **`DR-06`** | **`RDG-06`** | `docs/research/DR-06.md` | Wave 2 | `DR-01`–`DR-03`                                     | Phase 6               | Zero-GC Automatic Memory Management, Manual Control & SAST Verifier                    |
+| **`DR-07`** | **`RDG-07`** | `docs/research/DR-07.md` | Wave 2 | `DR-01`–`DR-03`                                     | Phase 4 / 6           | Error Handling Model & Zero-Cost Propagation Semantics                                 |
+| **`DR-12`** | **`RDG-12`** | `docs/research/DR-12.md` | Wave 2 | `DR-01`–`DR-03`                                     | Phase 2 / 3 / 10      | Incremental Query Engine, Fault-Tolerant Lossless CST & Built-in LSP                   |
+| **`DR-13`** | **`RDG-13`** | `docs/research/DR-13.md` | Wave 2 | `DR-01`–`DR-03`                                     | Phase 5               | Intermediate Representations (`HIR` & SSA `MIR`) & Optimization Pipeline               |
+| **`DR-08`** | **`RDG-08`** | `docs/research/DR-08.md` | Wave 3 | `DR-01`–`DR-03`, `DR-06`, `DR-07`                   | Phase 8 / 11          | Concurrency, Async/Structured Execution & High-Throughput I/O Model                    |
+| **`DR-09`** | **`RDG-09`** | `docs/research/DR-09.md` | Wave 3 | `DR-01`–`DR-03`, `DR-06`, `DR-13`                   | Phase 7               | Dual-Mode Compiler Backend Architecture (Instant Dev vs. Production AOT)               |
+| **`DR-10`** | **`RDG-10`** | `docs/research/DR-10.md` | Wave 3 | `DR-01`–`DR-03`, `DR-06`, `DR-07`, `DR-13`          | Phase 8               | Cross-Compilation, Zero-Dependency Linking, C FFI & WebAssembly (`wasm32`)             |
+| **`DR-11`** | **`RDG-11`** | `docs/research/DR-11.md` | Wave 3 | `DR-01`–`DR-03`                                     | Phase 9               | Package Manager, URL/Registry Resolution, Global Cache & Lockfiles                     |
+| **`DR-14`** | **`RDG-14`** | `docs/research/DR-14.md` | Wave 3 | `DR-01`–`DR-03`, `DR-12`                            | Phase 3 / 10          | Zero-Legacy AST Migration Engine (`corex upgrade`) & Canonical Formatter (`corex fmt`) |
+| **`DR-15`** | **`RDG-15`** | `docs/research/DR-15.md` | Wave 3 | `DR-02`–`DR-08`                                     | Phase 11              | Stage-2 `.cx` Standard Library, TUI/CLI & Unified WebAssembly/Native UI Architecture   |
+| **`DR-16`** | **`RDG-16`** | `docs/research/DR-16.md` | Wave 4 | `PLAN`, `DR-01`, `DR-11`, `DR-12`, `DR-14`, `DR-20` | Phase 9 (Seam) / 13.2 | Dependency-Conflict Solution Synthesis, Ranking & Lossless `corex.toml` Quick-Apply    |
+| **`DR-17`** | **`RDG-17`** | `docs/research/DR-17.md` | Wave 4 | `PLAN`, `DR-01`, `DR-06`, `DR-11`, `DR-12`, `DR-20` | Phase 6 / 9 / 10      | Zero-Annotation Call-Graph Capability Sandboxing & `@no_alloc` / `@no_panic` Contracts |
+| **`DR-18`** | **`RDG-18`** | `docs/research/DR-18.md` | Wave 4 | `PLAN`, `DR-01`, `DR-08`, `DR-09`, `DR-15`, `DR-20` | Phase 7 / 8 / 11      | Deterministic `Context` Simulation (`corex test --sim`) & Native Coverage Fuzzing      |
+| **`DR-19`** | **`RDG-19`** | `docs/research/DR-19.md` | Wave 4 | `PLAN`, `DR-01`, `DR-06`, `DR-08`, `DR-09`, `DR-20` | Phase 7 (Seam) / 13   | Self-Hosted Tier C, Live Hot-Reloading (`run --watch`), `@must_vectorize` & VOPR Sim   |
+| **`DR-20`** | **`RDG-20`** | `docs/research/DR-20.md` | Wave 4 | *None*                                              | Phases 6–13           | Holistic Superpower Catalog (`D-01`–`D-11`), Soundness Fixes & `195-LOC` Seam Audit    |
 
 ---
 
@@ -548,10 +549,10 @@ CoreX follows a **Two-Stage Standard Library** strategy:
 `````markdown
 # Deep Research Request (DR-16): Pre-Verified Dependency-Conflict Solution Synthesis, Multi-Criteria Ranking & Lossless Interactive/LSP Manifest Quick-Apply for CoreX (.cx)
 
-> **Live Repository & Attached Baseline Specifications (`DR-01`, `DR-11`, `DR-12`, `DR-14`):**
-> - **Repository:** [corex-lang/corex](https://github.com/corex-lang/corex) (`main` branch – if you have web/GitHub access, inspect `PLAN.md`, `docs/research/DR-01.md`–`DR-15.md`, and `stage0/src/` directly alongside any attached files).
+> **Live Repository & Attached Baseline Specifications (`DR-01`, `DR-11`, `DR-12`, `DR-14`, `DR-20`):**
+> - **Repository:** [corex-lang/corex](https://github.com/corex-lang/corex) (`main` branch – inspect `PLAN.md`, `docs/research/DR-01.md`–`DR-20.md`, and `stage0/src/` directly if web/GitHub access is available).
 > - **`DR-01.md`:** Arena-allocated SoA data structures (`BumpArena`, `StringInterner`, `Span`, `FileId(u32)`), deterministic execution invariants, and monochrome Unicode + ANSI CLI diagnostics (`╭`, `│`, `╰`, `├`, `─`, `▸`, `•`, `✓`, `✗`, `⚠`; zero colored emojis).
-> - **`DR-11.md`:** `corex.toml` manifest and single-file `---` script frontmatter schemas, `corex.lock` schema, two-phase **Bounded-MVS + PubGrub CDCL** resolver, `SeriesKey` major-version partitioning, `[resolution].exclude` security/regression bans, `links` native C symbol uniqueness, and `--locked` / `--offline` / `--frozen` hermetic build modes.
+> - **`DR-11.md` & `DR-20.md`:** `corex.toml` manifest and single-file `---` script frontmatter schemas, `corex.lock` schema, two-phase **Bounded-MVS + PubGrub CDCL** resolver, `SeriesKey` major-version partitioning, `[resolution].exclude` security/regression bans, `links` native C symbol uniqueness, `--locked` / `--offline` / `--frozen` hermetic build modes, and `DR-20` Audit 3.5's split (`35-LOC` Phase 9 PubGrub DAG + lossless `corex.toml` CST seam, with full counterfactual MCS/MaxSAT synthesis implemented `1x` in `.cx` in `Phase 13.2`).
 > - **`DR-12.md` & `DR-14.md`:** Incremental `CompilerDb`, `DiagnosticSink`, `SuggestedFix` (`TextEdit` byte spans, `FixApplicability`, `EditPriority`), `TransactionalPatcher`, `corex upgrade` / `corex fix`, and `corex lsp` (`textDocument/codeAction`).
 
 ## Context & Vision
@@ -592,31 +593,31 @@ Output your entire completed specification report wrapped inside **one single ou
 `````markdown
 # Deep Research Request (DR-17): Zero-Annotation Interprocedural Call-Graph Effect/Capability Inference, Supply-Chain Lockfile Sandboxing & `@no_alloc` / `@no_panic` Verification for CoreX (.cx)
 
-> **Live Repository & Attached Baseline Specifications (`DR-01`, `DR-06`, `DR-11`, `DR-12`):**
-> - **Repository:** [corex-lang/corex](https://github.com/corex-lang/corex) (`main` branch – inspect `PLAN.md`, `docs/research/DR-01.md`–`DR-15.md`, and `stage0/src/` directly if web/GitHub access is available).
+> **Live Repository & Attached Baseline Specifications (`DR-01`, `DR-06`, `DR-11`, `DR-12`, `DR-20`):**
+> - **Repository:** [corex-lang/corex](https://github.com/corex-lang/corex) (`main` branch – inspect `PLAN.md`, `docs/research/DR-01.md`–`DR-20.md`, and `stage0/src/` directly if web/GitHub access is available).
 > - **`DR-01.md` & `DR-12.md`:** Arena-allocated SoA compiler tables (`BumpArena`, `CompilerDb` Early Cutoff, `DiagnosticSink`), monochrome CLI diagnostics (`╭`, `│`, `╰`, `├`, `─`, `▸`, `•`, `✓`, `✗`, `⚠`; zero colored emojis), and `< 10 ms` `corex lsp` protocol.
-> - **`DR-06.md`:** Phase 6 4-pass `MIR` SAST engine – specifically Pass 3 Tarjan Strongly Connected Component (SCC) bottom-up `FnRegionSummary` (24 bytes) inference, Pass 4 Pentagon (`Intv × Sub`) + Sparse ABCD bounds-check elision, and `E03xx`/`W03xx` diagnostics.
-> - **`DR-11.md` & `DR-15.md`:** `corex.toml` / `corex.lock` package schemas, zero hidden pre-`main` `init()` constructors, zero arbitrary `build.rs` scripts, and explicit `Context` (`context.allocator`) propagation.
+> - **`DR-06.md` & `DR-20.md`:** Phase 6 4-pass `MIR` SAST engine – specifically Pass 3 Tarjan Strongly Connected Component (SCC) bottom-up `FnRegionSummary` inference (extended by `DR-20` `D-02` with `own_frame_bytes` + `max_subtree_bytes` for `@max_stack(N)` and `D-04` 2-bit `ScratchEffect`), Pass 4 demand-sliced Pentagon (`MAX_SUB_VARS = 256` per `DR-20` `Fix-06A`), MVS `yield`-projection panic guards (`DR-20` `Fix-06B`), `DR-20` `Fix-17` sandbox hardening, and `DR-20` `D-08` `.cxi` public-interface digest export.
+> - **`DR-11.md` & `DR-15.md`:** `corex.toml` / `corex.lock` package schemas, zero hidden pre-`main` `init()` constructors, zero arbitrary `build.rs` scripts, and explicit `Context` (`context.allocator`, `Context.scratch[0..2]`) propagation.
 
 ## Context & Vision
-CoreX forbids pre-`main` global constructors and arbitrary Turing-complete build scripts, and Phase 6 (`DR-06` Pass 3) already traverses the `MIR` call graph bottom-up in Tarjan SCC order. By piggybacking a compact effect/capability bitmask (`fs`, `net`, `env`, `process`, `ffi`, `unsafe`, `alloc`, `may_panic`) onto that pass, CoreX can unlock two major capabilities with **zero permission annotations in ordinary `.cx` code** and **zero runtime overhead**:
-1. **Compile-Time Supply-Chain Capability Sandboxing (Phases 6 & 9):** Automatically infer the exact OS/FFI capabilities transitively reachable from every package, record them in `corex.lock`, and enforce optional `corex.toml` policies so if a compromised patch update to a pure library (e.g., JSON, math, formatting) suddenly touches `std::net`, `std::process`, or `ffi`, compilation halts before a single instruction runs.
-2. **Hard Real-Time & Kernel Safety Contracts (`@no_alloc` & `@no_panic`, Phases 6 & 10):** Statically prove that annotated hot functions (and every callee in their transitive dynamic/static call graph) never allocate heap memory and retain zero un-elided panic edges after Pentagon bounds verification.
+CoreX forbids pre-`main` global constructors and arbitrary Turing-complete build scripts, and Phase 6 (`DR-06` Pass 3) already traverses the `MIR` call graph bottom-up in Tarjan SCC order. By piggybacking a compact `EffectCapabilityMask` (`fs`, `net`, `env`, `process`, `ffi`, `unsafe`, `alloc`, `may_panic`) onto `FnRegionSummary`, CoreX unlocks two major capabilities with **zero permission annotations in ordinary `.cx` code** and **zero runtime overhead**:
+1. **Compile-Time Supply-Chain Capability Sandboxing (Phases 6 & 9):** Automatically infer the exact OS/FFI capabilities transitively reachable from every package, record them in `corex.lock` and the `.cxi` public summary (`DR-20` `D-08`), and enforce `corex.toml` policies so if a compromised patch update to a pure library (e.g., JSON, math, formatting) suddenly touches `std::net`, `std::process`, or `ffi`, compilation halts before a single instruction runs.
+2. **Hard Real-Time, Projection & Kernel Safety Contracts (`@no_alloc` & `@no_panic`, Phases 6 & 10):** Statically prove that annotated hot functions (and un-refilled non-`Copy` `subscript`/`yield` projection scopes per `DR-20` `Fix-06B`) never allocate heap memory and retain zero un-elided panic edges after demand-sliced Pentagon bounds verification.
 
 ## Research Objectives
-1. **Compact `EffectCapabilityMask` Algebra & Indirect-Call Soundness:**
-   - Design the exact bitmask layout (`u16` / `u32`) and packing alongside `DR-06`'s 24-byte `FnRegionSummary` without inflating L1 cache footprints or breaking Early Cutoff in `CompilerDb`.
-   - Solve indirect call soundness cleanly: how function pointers (`fn(...)`), `@local` closures, `own` closures, and `dyn Trait` vtable dispatch propagate or bound capabilities (`alloc`, `may_panic`, OS capabilities) without requiring verbose effect polymorphism on everyday `.cx` code.
+1. **Compact `EffectCapabilityMask` Algebra, Indirect-Call Soundness & `DR-20` `Fix-17` Hardening:**
+   - Design the exact bitmask layout (`u16` / `u32`) packed cleanly alongside `DR-06`/`DR-20`'s extended `FnRegionSummary` (`ret_provenance_mask`, `global_escape_mask`, `consumed_param_mask`, `param_flow_matrix`, `own_frame_bytes`, `max_subtree_bytes`, `ScratchEffect`) without breaking `CompilerDb` Early Cutoff.
+   - Close all `DR-20` `Fix-17` sandbox bypasses: (a) enforce hermetic `MirVm` `comptime` (zero host syscalls) and package-root path-jailing on `@embed_bytes`; (b) taint any `extern` declaration, `@export`, `@link_name`, `@link_section` (e.g., `.init_array` / `.CRT$XCU`), or inline `asm` with `ffi | unsafe`; and (c) propagate `EffectCapabilityMask` soundly across function pointers (`fn(…)`), `@local` / `own` closures, and `dyn Trait` vtable dispatch without requiring verbose effect polymorphism on everyday `.cx` code.
 2. **Exact `@no_alloc` & `@no_panic` Semantics on `MIR`:**
-   - Define what constitutes an allocation (`context.allocator`, `System` heap vs. stack/fixed-buffer/pre-allocated lexical scratch checkpoints if permitted or distinguished) and what constitutes a residual `may_panic` edge after `DR-06` Pass 4 Pentagon bounds-check elision, integer division/overflow checks, and `.unwrap()` / `unreachable` terminators.
+   - Define what constitutes an allocation (`context.allocator` / `System` heap vs. stack, `FixedBuffer`, or pre-allocated `Context.scratch[0..2]` checkpoints) and what constitutes a residual `may_panic` edge after `DR-06`/`DR-20` demand-sliced Pentagon bounds-check elision, division/overflow checks, `.unwrap()` / `unreachable` terminators, and MVS `yield` projection guards (`Fix-06B`).
    - Specify shortest-witness call-chain trace reconstruction so `@no_alloc`, `@no_panic`, and supply-chain capability diagnostics display the exact multi-hop `fn A -> fn B -> syscall/panic` chain with source spans.
-3. **`corex.lock` / `corex.toml` Supply-Chain Policy & `corex check` / `corex lsp` Integration:**
-   - Specify how per-package capabilities are serialized in `corex.lock`, how default trust-on-first-lock vs. capability-escalation-on-upgrade alerts/blocks work in `corex build` / `corex upgrade`, how `[dependencies]` or `[security.capabilities]` in `corex.toml` can declaratively restrict dependencies, and how `corex lsp` surfaces inferred capabilities/contracts on hover.
+3. **`corex.lock` / `corex.toml` Supply-Chain Policy, `.cxi` Digest Seam (`D-08`) & `corex check` / `corex lsp` Integration:**
+   - Specify how per-package capabilities are serialized in `corex.lock` and hashed into the Phase 9 `.cxi` public-interface digest (`DR-20` Seam #7), how trust-on-first-lock vs. capability-escalation-on-upgrade blocking works in `corex build` / `corex upgrade`, how `corex.toml` can declaratively restrict dependency capabilities, and how `corex lsp` surfaces inferred capabilities/contracts on hover.
 
 ## Required Deliverables
-1. **Formal `MIR` Effect/Capability Summary Lattice, Indirect-Call Typing Rules & Tarjan SCC Propagation Specification** (with exact Zig / `.cx` SoA struct layouts).
-2. **`@no_alloc` & `@no_panic` Verification Rules, Shortest-Witness Call-Chain Diagnostic Renderer & `E03xx`/`W03xx` Catalog Entries.**
-3. **`corex.lock` / `corex.toml` Capability Schema, Escalation Policy Rules & `corex check` / `corex lsp` Specification.**
+1. **Formal `MIR` `EffectCapabilityMask` + Extended `FnRegionSummary` Layout, Indirect-Call Rules & `Fix-17` Sandbox Hardening Specification** (exact Zig / `.cx` SoA structs).
+2. **`@no_alloc` & `@no_panic` Verification Rules, Shortest-Witness Call-Chain Diagnostic Renderer & `E03xx`/`W03xx` Catalog Entries** (preserving existing `E0301`–`E0307` / `W0308` codes).
+3. **`corex.lock` / `corex.toml` Capability Schema, `.cxi` Digest Seam & `corex check` / `corex lsp` Specification.**
 
 ## Output Formatting Requirement (CRITICAL)
 Output your entire completed specification report wrapped inside **one single outer 4-backtick ````markdown … ```` code block** (using standard 3-backtick ``` fences for any inner code blocks or diagrams, monochrome Unicode glyphs `╭`, `│`, `╰`, `├`, `─`, `▸`, `•`, `✓`, `✗`, `⚠` with zero colored emojis, Unicode ellipsis `…` in prose, and en dashes ` – ` instead of em dashes) so the entire report can be copied and pasted directly into `docs/research/DR-17.md`.
@@ -629,11 +630,11 @@ Output your entire completed specification report wrapped inside **one single ou
 `````markdown
 # Deep Research Request (DR-18): Deterministic Concurrency/Fault-Injection Simulation (`corex test --sim`) & Zero-Config Coverage-Guided Native Fuzzing (`corex test --fuzz`) for CoreX (.cx)
 
-> **Live Repository & Attached Baseline Specifications (`DR-01`, `DR-08`, `DR-09`, `DR-15`):**
-> - **Repository:** [corex-lang/corex](https://github.com/corex-lang/corex) (`main` branch – inspect `PLAN.md`, `docs/research/DR-01.md`–`DR-15.md`, and `stage0/src/` directly if web/GitHub access is available).
-> - **`DR-08.md`:** Caller-inlined stackless coroutines, lexical `TaskGroup` nurseries, thread-per-core `io_uring` / `IOCP` / `kqueue` / WASI completion reactors, and `@linear` two-phase DMA-safe cancellation.
-> - **`DR-09.md`:** Dual-mode codegen (`--dev` TPDE-style single-pass native emitter + `--release` LLVM 20–23 AOT via `corex_llvm.cpp`).
-> - **`DR-15.md`:** Explicit `Context` register/slot (`allocator`, `temp_allocator`, clocks, entropy, reactor) and `std::test` architecture.
+> **Live Repository & Attached Baseline Specifications (`DR-01`, `DR-08`, `DR-09`, `DR-15`, `DR-20`):**
+> - **Repository:** [corex-lang/corex](https://github.com/corex-lang/corex) (`main` branch – inspect `PLAN.md`, `docs/research/DR-01.md`–`DR-20.md`, and `stage0/src/` directly if web/GitHub access is available).
+> - **`DR-08.md` & `DR-20.md`:** Caller-inlined stackless coroutines (`<= 16 KiB` static frame cap), lexical `TaskGroup` nurseries, `@linear` `CompletionReaper` DMA-safe cancellation (`Fix-08B`), `Context.reactor: *const ReactorVTable` (`25-LOC` Phase 8 seam), and `Fix-18A` (`Context.rng`-seeded `Map`/`Set` + `--sim` warning on pointer-to-integer `&x as usize` casts).
+> - **`DR-09.md`:** Dual-mode codegen (`-ofmt=c` + LLVM 20–23 AOT via `corex_llvm.cpp` in `Pre-v0.0.1`, plus self-hosted Tier C `--dev` in `Phase 13.0`).
+> - **`DR-15.md`:** Explicit `Context` register/slot (`allocator`, `scratch[0..2]`, clocks, entropy, reactor) and `std::test` architecture.
 
 ## Context & Vision
 CoreX routes all memory allocation, monotonic/wall clocks, entropy, and async `TaskGroup` / completion I/O through its explicit `Context` rather than hidden OS globals. This architecture enables two built-in `corex test` verification engines with **zero production runtime overhead**:
@@ -664,11 +665,11 @@ Output your entire completed specification report wrapped inside **one single ou
 `````markdown
 # Deep Research Request (DR-19): Forward-Compatible Phase-7 Hot-Reload Seam & Post-v0.0.1 (`0.x`) Stateful Live Hot-Code Patching (`corex run --watch`), `@must_vectorize` SIMD Contracts & Multi-Node Simulation for CoreX (.cx)
 
-> **Live Repository & Attached Baseline Specifications (`DR-01`, `DR-06`, `DR-08`, `DR-09`, `DR-15`):**
-> - **Repository:** [corex-lang/corex](https://github.com/corex-lang/corex) (`main` branch – inspect `PLAN.md`, `docs/research/DR-01.md`–`DR-15.md`, and `stage0/src/` directly if web/GitHub access is available).
-> - **`DR-09.md`:** Tier C `--dev` single-pass native emitter with padded `Atom` function slots and `GOT` indirection for `< 50 ms` incremental binary patching on disk, plus Tier B LLVM 20–23 `--release` AOT backend.
+> **Live Repository & Attached Baseline Specifications (`DR-01`, `DR-06`, `DR-08`, `DR-09`, `DR-15`, `DR-20`):**
+> - **Repository:** [corex-lang/corex](https://github.com/corex-lang/corex) (`main` branch – inspect `PLAN.md`, `docs/research/DR-01.md`–`DR-20.md`, and `stage0/src/` directly if web/GitHub access is available).
+> - **`DR-09.md` & `DR-20.md`:** `50-LOC` Phase 7 `--dev` `GOT` indirection + `{TypeId, LayoutShapeKey, FieldHash64}` + `poll_reload()` + `LoopContractMask` seams (`DR-20` Seam Checklist #3–#4), `SIGKILL`-safe macOS `UnlinkAndReplace` (`Prune-02`), self-hosted `Phase 13.0` Tier C `--dev` native emitter (`Prune-01`), delayed-unroll `@must_vectorize` (`Audit 3.7`), and TigerBeetle VOPR-style two-phase (*Safety* → *Frozen-Liveness*) multi-node simulation (`Audit 3.7`).
 > - **`DR-06.md` & `DR-08.md`:** Strict MVS ownership (`Copy`, `AutoDrop`, `@linear`), `SlotMap` UI state arenas, and structured `TaskGroup` event loops.
-> - **`DR-15.md`:** `std::tui`, `std::http`, and GPUI/Masonry-style `std::ui` architecture.
+> - **`DR-15.md`:** `std::tui`, `std::http`, and GPUI/Masonry-style `std::ui` architecture (`Phase 13.1`–`13.4`).
 
 ## Context & Vision
 To keep CoreX's `v0.0.1` initial self-hosting critical path (`Phases 6–12`) lean so Stage-0 Zig is retired as quickly as possible while unlocking major `Phase 13` (`Post-v0.0.1` / `0.x`) capabilities without rewriting the backend, `DR-19` specifies two tiers:
@@ -694,3 +695,9 @@ To keep CoreX's `v0.0.1` initial self-hosting critical path (`Phases 6–12`) le
 ## Output Formatting Requirement (CRITICAL)
 Output your entire completed specification report wrapped inside **one single outer 4-backtick ````markdown … ```` code block** (using standard 3-backtick ``` fences for any inner code blocks or diagrams, monochrome Unicode glyphs `╭`, `│`, `╰`, `├`, `─`, `▸`, `•`, `✓`, `✗`, `⚠` with zero colored emojis, Unicode ellipsis `…` in prose, and en dashes ` – ` instead of em dashes) so the entire report can be copied and pasted directly into `docs/research/DR-19.md`.
 `````
+
+---
+
+## `DR-20` (Plugs into `RDG-20` → `docs/research/DR-20.md`): Holistic Superpower Catalog, Soundness Fixes & Pre-`v0.0.1` Scope Audit
+
+> Resolved and committed in [DR-20.md](DR-20.md) (`Bucket A` `Phases 6–11` integrations, `Bucket B` `Phase 13.0`–`13.4` post-`v0.0.1` capabilities, `Bucket C` `Prune-01`–`07` / `Reject-01` scope and soundness amendments, and the `195-LOC` Pre-`v0.0.1` Seam Reservation Checklist).
