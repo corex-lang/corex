@@ -534,6 +534,84 @@ pub const MirIntrinsicKind = enum(u16) {
     align_of = 5,
     /// Polymorphic `@type_name[T]()` (`operands.lhs = TypeId.asInt()`, `operands.rhs = 0`).
     type_name = 6,
+    /// `@as_bytes(&val)` / `val.as_bytes()` wire slice view (`extra_args = [ref_val]`).
+    as_bytes = 7,
+    /// `@bit_cast[Dst](src)` layout-checked bitwise reinterpretation (`extra_args = [src_val]`).
+    bit_cast = 8,
+    /// `@from_bytes[T](bytes)` fallible wire deserialization (`extra_args = [bytes_val]`).
+    from_bytes = 9,
+    /// `@view_bytes[T](bytes)` aligned zero-copy wire view (`extra_args = [bytes_val]`).
+    view_bytes = 10,
+    /// `@drop_trace(id)` deterministic destructor execution breadcrumb (`extra_args = [id_val]`).
+    drop_trace = 11,
+    /// Dynamic index bounds check (`extra_args = [idx_val, len_val, container_kind_val]`).
+    bounds_check = 12,
+    /// Dynamic slice sub-range check (`extra_args = [lo_val, hi_val, len_val]`).
+    slice_range_check = 13,
+    /// Checked `.narrow[Dst]()` integer narrowing (`extra_args = [src_val, min_val, max_val]`).
+    narrow_check = 14,
+    /// Fallible `.try_narrow[Dst]()` integer narrowing (`extra_args = [src_val, min_val, max_val]`).
+    try_narrow = 15,
+    /// Zero-fills full `sizeof(T)` bytes of a `@zero_pad` destination (`lhs = PlaceId, rhs = NONE_U32`).
+    zero_pad = 16,
+    /// Unconditional in-place destructor execution (`lhs = PlaceId, rhs = NONE_U32`).
+    drop_in_place = 17,
+    /// Flag-guarded conditional destructor execution (`lhs = PlaceId, rhs = flag_val`).
+    drop_if_live = 18,
+    /// Immediate non-unwinding abort guard inside a vacated `inout` `subscript` (`lhs = NONE_U32, rhs = NONE_U32`).
+    abort_vacated_panic = 19,
+    /// Ghost manual deallocation marker stripped in Pass `D3` (`lhs = PlaceId, rhs = region_or_none`).
+    ghost_storage_free = 20,
+
+    /// Returns `true` when `operands.lhs` encodes a `PlaceId` rather than `extra_args` or `TypeId`.
+    pub inline fn hasPlaceInLhs(self: MirIntrinsicKind) bool {
+        return switch (self) {
+            .zero_pad, .drop_in_place, .drop_if_live, .ghost_storage_free => true,
+            else => false,
+        };
+    }
+
+    /// Returns `true` when `operands.rhs` encodes an SSA `MirValueId` liveness flag (`drop_if_live`).
+    pub inline fn hasSsaFlagInRhs(self: MirIntrinsicKind) bool {
+        return self == .drop_if_live;
+    }
+
+    /// Returns `true` when `operands.lhs` encodes a reflected `TypeId` (`size_of`, `align_of`, `type_name`).
+    pub inline fn hasTypeIdInLhs(self: MirIntrinsicKind) bool {
+        return switch (self) {
+            .size_of, .align_of, .type_name => true,
+            else => false,
+        };
+    }
+
+    /// Returns `true` when `operands` slices `MirBody.extra_args[lhs .. lhs + rhs]`.
+    pub inline fn hasExtraArgs(self: MirIntrinsicKind) bool {
+        return !self.hasPlaceInLhs() and !self.hasTypeIdInLhs() and self != .abort_vacated_panic;
+    }
+
+    /// Returns `true` when `R5` DCE must treat this intrinsic as a live side-effecting root.
+    pub inline fn isSideEffectingRoot(self: MirIntrinsicKind) bool {
+        return switch (self) {
+            .compile_assert,
+            .compile_error,
+            .drop_trace,
+            .bounds_check,
+            .slice_range_check,
+            .narrow_check,
+            .zero_pad,
+            .drop_in_place,
+            .drop_if_live,
+            .abort_vacated_panic,
+            .ghost_storage_free,
+            => true,
+            else => false,
+        };
+    }
+
+    /// Returns `true` when Pass `D3` Ghost stripping erases this intrinsic (`ghost_storage_free`).
+    pub inline fn isGhostIntrinsic(self: MirIntrinsicKind) bool {
+        return self == .ghost_storage_free;
+    }
 };
 
 /// Packed 1-byte instruction property flags in `MirInst` (`DR-13` §3.3).
@@ -548,8 +626,10 @@ pub const InstFlags = packed struct(u8) {
     has_trap_risk: bool = false,
     /// `true` if this instruction constructs a stack-pinned `@local` / regional closure (`V6`).
     is_local_closure: bool = false,
+    /// `true` if any trap raised by this instruction inside a `Fix-06B` vacated window must abort immediately.
+    is_abort_on_panic: bool = false,
     /// Reserved zero padding bits.
-    _pad: u3 = 0,
+    _pad: u2 = 0,
 };
 
 /// 16-byte SoA instruction record in `MirBody.insts` (`1 + 1 + 2 + 4 + 8 = 16B`, `DR-13` §3.3).
@@ -717,6 +797,8 @@ pub const MirCallSite = struct {
     ret_ty: TypeId,
     /// `true` if callee is marked `@noalloc` / `contextless` or built-in pure (`V6`).
     is_callee_contextless: bool = false,
+    /// `true` if any panic raised during this call inside a `Fix-06B` vacated window must abort immediately.
+    is_abort_on_panic: bool = false,
     /// Source token of the call expression.
     origin_token: TokenIndex = .none,
 };
@@ -740,6 +822,22 @@ pub const MirConst = union(enum) {
 };
 
 // -------------------- Canonical `MirBody` ---------------------
+
+/// CFG window `[start_block .. end_block]` where an `inout` `subscript` vacates `self` (`DR-20` `Fix-06B`).
+pub const VacatedProjectionWindow = struct {
+    /// Basic block where the `inout` `subscript` projection opened.
+    start_block: MirBlockId,
+    /// Basic block where the `subscript` writeback epilogue closed.
+    end_block: MirBlockId,
+    /// Ghost access token bounding the projection scope (`.none` if closed inline without Ghost token).
+    access_token: MirValueId,
+    /// Yielded caller-side `PlaceId`.
+    yielded_place: PlaceId,
+    /// Concrete `TypeId` of the yielded projection.
+    yielded_ty: TypeId,
+    /// Originating `subscript` call-site `TokenIndex` for diagnostics.
+    site_token: TokenIndex,
+};
 
 /// Self-contained Block-Argument SSA representation of a single lowered function or constant body.
 pub const MirBody = struct {
@@ -769,9 +867,13 @@ pub const MirBody = struct {
     is_contextless: bool = false,
     /// `true` if `MAX_MIR_INSTRUCTIONS`, `MAX_MIR_BLOCKS`, or projection caps overflowed (`E0508`).
     has_overflowed_limits: bool = false,
+    /// `true` once Phase 6 `ElaborateDrops` has materialized destructors on this body.
+    is_sast_elaborated: bool = false,
 
     /// Local slot declarations (`_0` is always the return slot).
     locals: std.ArrayListUnmanaged(LocalDecl) = .empty,
+    /// Parallel lexical block nesting depths per local (`0` for `_0`/params, `>= 1` for body scopes).
+    local_scope_depths: std.ArrayListUnmanaged(u16) = .empty,
     /// Interned/appended `MirPlace` table (`PlaceId(0)` is unprojected `_0`).
     places: std.ArrayListUnmanaged(MirPlace) = .empty,
     /// Flat projection element pool sliced by `MirPlace.[proj_start .. proj_start + proj_len]`.
@@ -803,6 +905,8 @@ pub const MirBody = struct {
     call_arg_modes: std.ArrayListUnmanaged(ParamMode) = .empty,
     /// Constant pool referenced by `MirOp.const_scalar`.
     consts: std.ArrayListUnmanaged(MirConst) = .empty,
+    /// Recorded `inout` `subscript` vacated-`self` windows inspected by `mir_sast` (`DR-20` `Fix-06B`).
+    vacated_windows: std.ArrayListUnmanaged(VacatedProjectionWindow) = .empty,
 
     /// Initializes an empty `MirBody` with pre-strip ghost tracking active.
     pub fn init(allocator: std.mem.Allocator, file_id: FileId, def_id: DefId) MirBody {
@@ -818,6 +922,7 @@ pub const MirBody = struct {
     /// Releases all memory owned by `self`.
     pub fn deinit(self: *MirBody) void {
         self.locals.deinit(self.allocator);
+        self.local_scope_depths.deinit(self.allocator);
         self.places.deinit(self.allocator);
         self.projections.deinit(self.allocator);
         self.insts.deinit(self.allocator);
@@ -832,6 +937,7 @@ pub const MirBody = struct {
         self.calls.deinit(self.allocator);
         self.call_arg_modes.deinit(self.allocator);
         self.consts.deinit(self.allocator);
+        self.vacated_windows.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -850,10 +956,12 @@ pub const MirBody = struct {
             .is_ghost_stripped = self.is_ghost_stripped,
             .is_contextless = self.is_contextless,
             .has_overflowed_limits = self.has_overflowed_limits,
+            .is_sast_elaborated = self.is_sast_elaborated,
         };
         errdefer copy.deinit();
 
         try copy.locals.appendSlice(allocator, self.locals.items);
+        try copy.local_scope_depths.appendSlice(allocator, self.local_scope_depths.items);
         try copy.places.appendSlice(allocator, self.places.items);
         try copy.projections.appendSlice(allocator, self.projections.items);
         try copy.insts.ensureTotalCapacity(allocator, self.insts.len);
@@ -871,6 +979,7 @@ pub const MirBody = struct {
         try copy.calls.appendSlice(allocator, self.calls.items);
         try copy.call_arg_modes.appendSlice(allocator, self.call_arg_modes.items);
         try copy.consts.appendSlice(allocator, self.consts.items);
+        try copy.vacated_windows.appendSlice(allocator, self.vacated_windows.items);
         return copy;
     }
 
@@ -1013,7 +1122,12 @@ pub const MirBody = struct {
                     }
                 },
                 .intrinsic_op => {
-                    if (opnd.rhs > 0) {
+                    const ikind: MirIntrinsicKind = @fromBackingInt(aux);
+                    if (ikind.hasPlaceInLhs()) {
+                        if (ikind.hasSsaFlagInRhs() and opnd.rhs != NONE_U32) {
+                            rewriteFn(ctx, &opnd.rhs);
+                        }
+                    } else if (ikind.hasExtraArgs() and opnd.rhs > 0) {
                         for (self.extra_args.items[opnd.lhs .. opnd.lhs + opnd.rhs]) |*slot| {
                             if (slot.* != NONE_U32) rewriteFn(ctx, slot);
                         }
@@ -1065,6 +1179,13 @@ pub const MirBody = struct {
                 if (tok_slot.* != NONE_U32) rewriteFn(ctx, tok_slot);
             }
         }
+        for (self.vacated_windows.items) |*win| {
+            if (!win.access_token.isNone()) {
+                var raw_tok = win.access_token.asInt();
+                rewriteFn(ctx, &raw_tok);
+                win.access_token = MirValueId.fromInt(raw_tok);
+            }
+        }
     }
 };
 
@@ -1086,6 +1207,8 @@ pub const MAX_BLOCK_PREDS: u32 = 65_534;
 pub const MAX_BLOCK_PARAMS: u32 = 16_383;
 /// Hard resource cap on Maranget decision-tree specialization nodes per `match` (`16,384`, `E0508`).
 pub const MAX_DECISION_NODES: u32 = 16_384;
+/// Bitflag in `MirTerminator.aux_u8` (`kind == .trap`) forcing immediate `abort` inside a vacated projection window.
+pub const TRAP_ABORT_ON_PANIC_FLAG: u8 = 0x80;
 
 /// Bitmask extracting `param_len: u14` from `MirBasicBlock.meta_bits`.
 const BLOCK_PARAM_LEN_MASK: u16 = 0x3FFF;
@@ -1898,11 +2021,13 @@ const SubscriptPlaceBinding = struct {
     place_id: PlaceId,
 };
 
-/// Deferred post-`yield` `subscript` cleanup triggered when `trigger_tok` closes (`MAJ-01`).
+/// Deferred post-`yield` `subscript` cleanup triggered when `trigger_tok` closes (`MAJ-01`, `Fix-06B`).
 const DeferredSubscriptCleanup = struct {
     /// Ghost access token (`yield_ghost_tok`) whose close executes `post_yield_stmts`.
     trigger_tok: MirValueId,
-    /// Post-`yield` trailing `HirIndex` statements from the `subscript` body.
+    /// Optional index in `MirBody.vacated_windows` updated with `end_block` on close.
+    vacated_window_idx: ?usize = null,
+    /// Post-`yield` trailing `HirIndex` statements and subscript `defer`s from the `subscript` body.
     post_yield_stmts: std.ArrayListUnmanaged(HirIndex) = .empty,
     /// Captured `hir_local_remap` pairs for `post_yield_stmts`.
     local_bindings: std.ArrayListUnmanaged(SubscriptLocalBinding) = .empty,
@@ -1953,6 +2078,8 @@ const SplicedSubscriptAccess = struct {
     place_id: PlaceId,
     /// Ghost access token opened on the yielded place (`.none` if pure rvalue temp).
     yield_ghost_tok: MirValueId = .none,
+    /// Optional index in `MirBody.vacated_windows` tracking this `inout` vacated projection (`Fix-06B`).
+    vacated_window_idx: ?usize = null,
     /// Post-`yield` trailing `HirIndex` statements inside the `subscript` body to run on close.
     post_yield_stmts: std.ArrayListUnmanaged(HirIndex) = .empty,
     /// Ghost tokens opened for the `subscript` call arguments themselves.
@@ -2028,6 +2155,8 @@ const MirLowerer = struct {
     subscript_splice_depth: usize = 0,
     /// Counter of Maranget decision-tree nodes synthesized in the current `match` (`MAX_DECISION_NODES`).
     decision_node_count: u32 = 0,
+    /// `true` when lowering for Phase 6 `mir_sast` so mutable `&T`, `*T`, and `str` bindings keep place stores.
+    is_for_sast: bool = false,
 
     /// Releases all temporary lowering buffers owned by `self`.
     fn deinit(self: *MirLowerer) void {
@@ -2061,6 +2190,14 @@ const MirLowerer = struct {
                 fl.is_address_taken = true;
             } else if (!self.isSsaScalarEligibleType(loc.type_id)) {
                 fl.is_address_taken = true;
+            } else if (self.is_for_sast and fl.is_mut and !fl.is_arg) {
+                const unwrapped = self.pool.unwrapUnderlyingType(loc.type_id);
+                if (!unwrapped.isError()) {
+                    const tag = self.pool.getNode(unwrapped).tag;
+                    if (unwrapped == .str_ty or tag == .ref_ty or tag == .raw_ptr_ty) {
+                        fl.is_address_taken = true;
+                    }
+                }
             }
             loc.setFlags(fl);
         }
@@ -2167,10 +2304,11 @@ const MirLowerer = struct {
             .struct_ty, .union_ty => blk: {
                 const sym = self.sym_table.getSymbol(SymbolIndex.fromInt(node.rhs)).*;
                 if (sym.target_scope.isNone()) break :blk false;
+                const nom_subst = type_system.NominalTypeSubst.init(self.pool, self.sym_table, unwrapped);
                 for (self.sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
                     const mem_sym = self.sym_table.getSymbol(mem_idx).*;
                     if (mem_sym.kind == .field_sym and
-                        self.hasTypeRegionsDepth(mem_sym.type_id, depth + 1))
+                        self.hasTypeRegionsDepth(nom_subst.resolve(mem_sym.type_id), depth + 1))
                     {
                         break :blk true;
                     }
@@ -2180,10 +2318,11 @@ const MirLowerer = struct {
             .enum_ty => blk: {
                 const sym = self.sym_table.getSymbol(SymbolIndex.fromInt(node.rhs)).*;
                 if (sym.target_scope.isNone()) break :blk false;
+                const nom_subst = type_system.NominalTypeSubst.init(self.pool, self.sym_table, unwrapped);
                 for (self.sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
                     const mem_sym = self.sym_table.getSymbol(mem_idx).*;
                     if (mem_sym.kind == .enum_variant_sym and mem_sym.type_id != .unit_ty and
-                        self.hasTypeRegionsDepth(mem_sym.type_id, depth + 1))
+                        self.hasTypeRegionsDepth(nom_subst.resolve(mem_sym.type_id), depth + 1))
                     {
                         break :blk true;
                     }
@@ -2443,6 +2582,10 @@ const MirLowerer = struct {
                 },
             ),
         );
+        try self.body.local_scope_depths.append(
+            self.body.allocator,
+            @intCast(@min(@max(self.scope_depth, 1), std.math.maxInt(u16))),
+        );
         try self.local_var_types.append(self.allocator, val_ty);
         self.ssa.var_types = self.local_var_types.items;
         return LocalId.fromInt(raw_id);
@@ -2558,7 +2701,7 @@ const MirLowerer = struct {
         }
     }
 
-    /// Executes any deferred `subscript` `post_yield_stmts` bound to `closed_tok` (`MAJ-01`).
+    /// Executes any deferred `subscript` `post_yield_stmts` bound to `closed_tok` (`MAJ-01`, `Fix-06B`).
     fn runDeferredSubscriptCleanupForToken(
         self: *MirLowerer,
         closed_tok: MirValueId,
@@ -2573,6 +2716,11 @@ const MirLowerer = struct {
                 var entry = self.deferred_subscript_cleanups.orderedRemove(idx);
                 defer entry.deinit(self.allocator);
                 try self.executeSubscriptPostYield(&entry);
+                if (entry.vacated_window_idx) |win_idx| {
+                    if (win_idx < self.body.vacated_windows.items.len and !self.cur_bb.isNone()) {
+                        self.body.vacated_windows.items[win_idx].end_block = self.cur_bb;
+                    }
+                }
             } else {
                 const snapshot = self.deferred_subscript_cleanups.items[idx];
                 try self.executeSubscriptPostYield(&snapshot);
@@ -2873,6 +3021,76 @@ const MirLowerer = struct {
         return pad_bb;
     }
 
+    /// Emits `MirIntrinsicKind.zero_pad` on `dest_place` when `val_ty` carries `@zero_pad` (`DR-20` `D-01`).
+    fn emitZeroPadIfRequired(
+        self: *MirLowerer,
+        dest_place: PlaceId,
+        val_ty: TypeId,
+        tok: TokenIndex,
+    ) !void {
+        if (!isZeroPadNominalType(self.pool, self.sym_table, val_ty)) return;
+        _ = try self.ssa.emitInst(self.cur_bb, .{
+            .op = .intrinsic_op,
+            .flags = .{ .has_side_effects = true, .is_synthetic = true },
+            .aux_u16 = @backingInt(MirIntrinsicKind.zero_pad),
+            .type_id = .unit_ty,
+            .operands = .{ .lhs = dest_place.asInt(), .rhs = NONE_U32 },
+        }, tok);
+    }
+
+    /// Emits `MirIntrinsicKind.bounds_check` immediately prior to dynamic `.index` projection (`[MAJOR-02]`).
+    fn emitIndexBoundsCheck(
+        self: *MirLowerer,
+        peeled_place: PlaceId,
+        unwrapped_base: TypeId,
+        idx_val: MirValueId,
+        is_soa: bool,
+        tok: TokenIndex,
+    ) !void {
+        if (unwrapped_base.isError()) return;
+        const base_node = self.pool.getNode(unwrapped_base);
+        const is_fixed_array = base_node.tag == .array_ty or base_node.tag == .soa_array_ty;
+        const is_concrete_len = is_fixed_array and
+            (base_node.rhs & type_system.SYMBOLIC_ARRAY_LEN_FLAG) == 0;
+
+        const len_val: MirValueId = if (is_concrete_len) blk: {
+            const len_const_idx = try self.body.appendConst(.{ .int_val = @as(i128, base_node.rhs) });
+            break :blk try self.ssa.emitInst(self.cur_bb, .{
+                .op = .const_scalar,
+                .flags = .{ .is_synthetic = true },
+                .type_id = .usize_ty,
+                .operands = .{ .lhs = len_const_idx, .rhs = 0 },
+            }, tok);
+        } else blk: {
+            const len_proj = [1]MirProjection{.{ .kind = .slice_len, .payload = 0 }};
+            if (!self.isValidPlaceExtension(peeled_place, &len_proj)) return;
+            const len_place = try self.extendPlace(peeled_place, &len_proj);
+            break :blk try self.loadPlaceValue(len_place, .usize_ty, tok, false);
+        };
+
+        const container_kind: i128 = if (is_soa) 2 else if (is_fixed_array) 1 else 0;
+        const kind_const_idx = try self.body.appendConst(.{ .int_val = container_kind });
+        const kind_val = try self.ssa.emitInst(self.cur_bb, .{
+            .op = .const_scalar,
+            .flags = .{ .is_synthetic = true },
+            .type_id = .u8_ty,
+            .operands = .{ .lhs = kind_const_idx, .rhs = 0 },
+        }, tok);
+
+        const args_start: u32 = @intCast(self.body.extra_args.items.len);
+        try self.body.extra_args.appendSlice(
+            self.body.allocator,
+            &[3]u32{ idx_val.asInt(), len_val.asInt(), kind_val.asInt() },
+        );
+        _ = try self.ssa.emitInst(self.cur_bb, .{
+            .op = .intrinsic_op,
+            .flags = .{ .has_side_effects = true, .has_trap_risk = true, .is_synthetic = true },
+            .aux_u16 = @backingInt(MirIntrinsicKind.bounds_check),
+            .type_id = .unit_ty,
+            .operands = .{ .lhs = args_start, .rhs = 3 },
+        }, tok);
+    }
+
     /// Stores `ret_val` into `_0` (marking `_0` initialized for `V5`) and sets `.ret` terminator.
     fn emitFinalReturnTerminator(
         self: *MirLowerer,
@@ -2886,6 +3104,7 @@ const MirLowerer = struct {
             .type_id = .unit_ty,
             .operands = .{ .lhs = LocalId.return_slot.asInt(), .rhs = 0 },
         }, tok);
+        try self.emitZeroPadIfRequired(.return_place, self.body.ret_ty, tok);
         _ = try self.ssa.emitInst(self.cur_bb, .{
             .op = .place_store,
             .flags = .{ .has_side_effects = true, .is_synthetic = true },
@@ -3218,6 +3437,8 @@ const MirLowerer = struct {
                 {
                     return self.allocErrorFallbackPlace(node.type_id, tok);
                 }
+                const is_soa_base = base_tag == .soa_array_ty or base_tag == .soa_slice_ty;
+                try self.emitIndexBoundsCheck(peeled.place_id, unwrapped_base, idx_val, is_soa_base, tok);
                 return self.extendPlace(peeled.place_id, &idx_proj);
             },
             .hir_soa_field_ptr => {
@@ -3251,6 +3472,7 @@ const MirLowerer = struct {
                 if (!self.isValidPlaceExtension(peeled.place_id, &soa_projs)) {
                     return self.allocErrorFallbackPlace(node.type_id, tok);
                 }
+                try self.emitIndexBoundsCheck(peeled.place_id, unwrapped_base, idx_val, true, tok);
                 return self.extendPlace(peeled.place_id, &soa_projs);
             },
             .hir_unary_op => {
@@ -3310,7 +3532,7 @@ const MirLowerer = struct {
                 if (!spliced.yield_ghost_tok.isNone()) {
                     try self.active_expr_borrows.append(self.allocator, spliced.yield_ghost_tok);
                     spliced.yield_ghost_tok = .none;
-                } else if (spliced.post_yield_stmts.items.len > 0) {
+                } else if (spliced.post_yield_stmts.items.len > 0 or spliced.vacated_window_idx != null) {
                     const anchor_lid = try self.allocTempLocal(.unit_ty, tok, true, false);
                     try self.markStorageInit(anchor_lid, tok);
                     const anchor_place = try self.makePlace(anchor_lid, &.{});
@@ -3323,12 +3545,21 @@ const MirLowerer = struct {
                     try self.active_expr_borrows.append(self.allocator, cleanup_trigger);
                 }
 
-                if (spliced.post_yield_stmts.items.len > 0 and !cleanup_trigger.isNone()) {
+                if (spliced.vacated_window_idx) |win_idx| {
+                    if (win_idx < self.body.vacated_windows.items.len and !cleanup_trigger.isNone()) {
+                        self.body.vacated_windows.items[win_idx].access_token = cleanup_trigger;
+                    }
+                }
+
+                if ((spliced.post_yield_stmts.items.len > 0 or spliced.vacated_window_idx != null) and
+                    !cleanup_trigger.isNone())
+                {
                     try self.deferred_subscript_cleanups.append(self.allocator, .{
                         .trigger_tok = cleanup_trigger,
                         .post_yield_stmts = spliced.post_yield_stmts,
                         .local_bindings = spliced.local_bindings,
                         .place_bindings = spliced.place_bindings,
+                        .vacated_window_idx = spliced.vacated_window_idx,
                     });
                 } else {
                     spliced.post_yield_stmts.deinit(self.allocator);
@@ -3348,6 +3579,7 @@ const MirLowerer = struct {
         const temp_lid = try self.allocTempLocal(node.type_id, tok, true, false);
         const temp_place = try self.makePlace(temp_lid, &.{});
         try self.markStorageInit(temp_lid, tok);
+        try self.emitZeroPadIfRequired(temp_place, node.type_id, tok);
         _ = try self.ssa.emitInst(self.cur_bb, .{
             .op = .place_store,
             .flags = .{ .has_side_effects = true, .is_synthetic = true },
@@ -3461,6 +3693,7 @@ const MirLowerer = struct {
                 if (is_place_needed) {
                     const param_place = try self.makePlace(param_lid, &.{});
                     try self.markStorageInit(param_lid, tok);
+                    try self.emitZeroPadIfRequired(param_place, param_decl.type_id, tok);
                     _ = try self.ssa.emitInst(self.cur_bb, .{
                         .op = .place_store,
                         .flags = .{ .has_side_effects = true, .is_synthetic = true },
@@ -3496,8 +3729,11 @@ const MirLowerer = struct {
             try self.hir_local_remap.put(self.allocator, slot, fresh_lid);
         }
 
-        // [3] Walk `fn_meta.body_hir` up to `hir_yield`, lower yielded place, and capture trailing stmts:
+        // [3] Walk `fn_meta.body_hir` up to `hir_yield`, lower yielded place, and capture trailing + `defer` stmts (`Fix-06B`):
         var yielded_place: ?PlaceId = null;
+        var open_block = self.cur_bb;
+        var subscript_defers: std.ArrayListUnmanaged(HirIndex) = .empty;
+        defer subscript_defers.deinit(self.allocator);
         const body_node = self.hir_store.getNode(fn_meta.body_hir);
         if (body_node.tag == .hir_block) {
             const stmts = self.hir_store.getLenPrefixedExtra(body_node.data.lhs);
@@ -3510,10 +3746,21 @@ const MirLowerer = struct {
                         try self.lowerMutPlace(yield_target)
                     else
                         try self.lowerPlace(yield_target);
+                    open_block = self.cur_bb;
                     for (stmts[stmt_i + 1 ..]) |trailing_raw| {
-                        try result.post_yield_stmts.append(self.allocator, HirIndex.fromInt(trailing_raw));
+                        const trailing_hir = HirIndex.fromInt(trailing_raw);
+                        const trailing_node = self.hir_store.getNode(trailing_hir);
+                        if (trailing_node.tag == .hir_defer and (trailing_node.data.lhs & 1) == 0) {
+                            try subscript_defers.append(self.allocator, HirIndex.fromInt(trailing_node.data.rhs));
+                        } else {
+                            try result.post_yield_stmts.append(self.allocator, trailing_hir);
+                        }
                     }
                     break;
+                }
+                if (stmt_node.tag == .hir_defer and (stmt_node.data.lhs & 1) == 0) {
+                    try subscript_defers.append(self.allocator, HirIndex.fromInt(stmt_node.data.rhs));
+                    continue;
                 }
                 _ = try self.lowerRValue(stmt_hir);
             }
@@ -3528,7 +3775,13 @@ const MirLowerer = struct {
                     try self.lowerMutPlace(yield_target)
                 else
                     try self.lowerPlace(yield_target);
+                open_block = self.cur_bb;
             }
+        }
+        var def_idx = subscript_defers.items.len;
+        while (def_idx > 0) {
+            def_idx -= 1;
+            try result.post_yield_stmts.append(self.allocator, subscript_defers.items[def_idx]);
         }
 
         result.place_id = yielded_place orelse blk: {
@@ -3582,10 +3835,37 @@ const MirLowerer = struct {
                 tok,
             );
         }
+
+        // [4] Record `VacatedProjectionWindow` when an `inout` `subscript` yields non-`Copy` or vacates `self` (`Fix-06B`):
+        const is_self_inout = fn_meta.param_len > 0 and
+            self.hir_store.locals.items[fn_meta.param_local_start].mode == .inout_mode;
+        if ((access_mode == .inout_mode or is_self_inout) and !open_block.isNone()) {
+            const is_non_copy = !call_node.type_id.isError() and
+                type_system.classifyOwnershipTier(self.pool, self.sym_table, call_node.type_id) != .copy_tier;
+            const is_self_vacated = if (fn_meta.param_len > 0) blk: {
+                const self_hir_slot = fn_meta.param_local_start;
+                if (self.hir_place_remap.get(self_hir_slot)) |self_place| {
+                    break :blk self.body.places.items[self_place.asInt()].base != yielded_base;
+                }
+                break :blk false;
+            } else false;
+            if (is_non_copy or is_self_vacated) {
+                const win_idx = self.body.vacated_windows.items.len;
+                try self.body.vacated_windows.append(self.body.allocator, .{
+                    .start_block = open_block,
+                    .end_block = self.cur_bb,
+                    .access_token = result.yield_ghost_tok,
+                    .yielded_place = result.place_id,
+                    .yielded_ty = call_node.type_id,
+                    .site_token = tok,
+                });
+                result.vacated_window_idx = win_idx;
+            }
+        }
         return result;
     }
 
-    /// Closes a `SplicedSubscriptAccess` after caller read/write completes (`[CRITICAL-07]`, `MAJ-01`).
+    /// Closes a `SplicedSubscriptAccess` after caller read/write completes (`[CRITICAL-07]`, `MAJ-01`, `Fix-06B`).
     fn closeSplicedSubscriptAccess(
         self: *MirLowerer,
         spliced: *SplicedSubscriptAccess,
@@ -3601,8 +3881,14 @@ const MirLowerer = struct {
                 .post_yield_stmts = spliced.post_yield_stmts,
                 .local_bindings = spliced.local_bindings,
                 .place_bindings = spliced.place_bindings,
+                .vacated_window_idx = spliced.vacated_window_idx,
             };
             try self.executeSubscriptPostYield(&cleanup_view);
+        }
+        if (spliced.vacated_window_idx) |win_idx| {
+            if (win_idx < self.body.vacated_windows.items.len and !self.cur_bb.isNone()) {
+                self.body.vacated_windows.items[win_idx].end_block = self.cur_bb;
+            }
         }
         var arg_idx = spliced.arg_ghost_tokens.items.len;
         while (arg_idx > 0) {
@@ -3758,11 +4044,12 @@ const MirLowerer = struct {
             .struct_ty, .union_ty => {
                 const sym = self.sym_table.getSymbol(SymbolIndex.fromInt(node.rhs)).*;
                 if (!sym.target_scope.isNone()) {
+                    const nom_subst = type_system.NominalTypeSubst.init(self.pool, self.sym_table, unwrapped);
                     var cur_ord: u32 = 0;
                     for (self.sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
                         const mem_sym = self.sym_table.getSymbol(mem_idx).*;
                         if (mem_sym.kind != .field_sym) continue;
-                        if (cur_ord == ordinal) return mem_sym.type_id;
+                        if (cur_ord == ordinal) return nom_subst.resolve(mem_sym.type_id);
                         cur_ord += 1;
                     }
                 }
@@ -3783,11 +4070,12 @@ const MirLowerer = struct {
             .enum_ty => {
                 const sym = self.sym_table.getSymbol(SymbolIndex.fromInt(node.rhs)).*;
                 if (!sym.target_scope.isNone()) {
+                    const nom_subst = type_system.NominalTypeSubst.init(self.pool, self.sym_table, unwrapped);
                     var cur_ord: u32 = 0;
                     for (self.sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
                         const mem_sym = self.sym_table.getSymbol(mem_idx).*;
                         if (mem_sym.kind != .enum_variant_sym) continue;
-                        if (cur_ord == tag_ordinal) return mem_sym.type_id;
+                        if (cur_ord == tag_ordinal) return nom_subst.resolve(mem_sym.type_id);
                         cur_ord += 1;
                     }
                 }
@@ -4067,6 +4355,10 @@ const MirLowerer = struct {
             },
             .hir_local_decl => {
                 const lid = self.mapHirLocal(node.data.lhs);
+                if (!lid.isNone() and lid.asInt() < self.body.local_scope_depths.items.len) {
+                    self.body.local_scope_depths.items[lid.asInt()] =
+                        @intCast(@min(@max(self.scope_depth, 1), std.math.maxInt(u16)));
+                }
                 const init_hir = HirIndex.fromInt(node.data.rhs);
                 if (!init_hir.isNone()) {
                     if (!lid.isNone() and self.hir_store.getNode(init_hir).tag == .hir_closure) {
@@ -4082,6 +4374,7 @@ const MirLowerer = struct {
                         if (self.body.locals.items[lid.asInt()].flags().is_address_taken) {
                             const place = try self.makePlace(lid, &.{});
                             try self.markStorageInit(lid, tok);
+                            try self.emitZeroPadIfRequired(place, self.body.locals.items[lid.asInt()].type_id, tok);
                             _ = try self.ssa.emitInst(self.cur_bb, .{
                                 .op = .place_store,
                                 .flags = .{ .has_side_effects = true },
@@ -4114,15 +4407,18 @@ const MirLowerer = struct {
                 }
 
                 if (self.findTailSubscriptCall(lhs_hir)) |sub_call_hir| {
-                    const rhs_val = try self.lowerRValue(rhs_hir);
-                    if (self.cur_bb.isNone() or self.ssa.isBlockTerminated(self.cur_bb)) {
-                        return self.emitUnitVal(tok);
-                    }
                     try self.lowerSubscriptAssignPrefixBlocks(lhs_hir);
                     if (self.cur_bb.isNone() or self.ssa.isBlockTerminated(self.cur_bb)) {
                         return self.emitUnitVal(tok);
                     }
                     var spliced = try self.spliceSubscriptCall(sub_call_hir, .inout_mode, true);
+                    errdefer spliced.deinit(self.allocator);
+                    const rhs_val = try self.lowerRValue(rhs_hir);
+                    if (self.cur_bb.isNone() or self.ssa.isBlockTerminated(self.cur_bb)) {
+                        spliced.deinit(self.allocator);
+                        return self.emitUnitVal(tok);
+                    }
+                    try self.emitZeroPadIfRequired(spliced.place_id, lhs_node.type_id, tok);
                     _ = try self.ssa.emitInst(self.cur_bb, .{
                         .op = .place_store,
                         .flags = .{ .has_side_effects = true },
@@ -4146,6 +4442,7 @@ const MirLowerer = struct {
                     try self.markStorageInit(LocalId.fromInt(place_rec.base), tok);
                 }
                 const write_tok = try self.emitGhostOpen(.ghost_access_set, dest_place, .scoped_projection, tok);
+                try self.emitZeroPadIfRequired(dest_place, lhs_node.type_id, tok);
                 _ = try self.ssa.emitInst(self.cur_bb, .{
                     .op = .place_store,
                     .flags = .{ .has_side_effects = true },
@@ -4658,11 +4955,10 @@ const MirLowerer = struct {
         return false;
     }
 
-    /// Lowers `hir_intrinsic_call` (`@compile_assert`, `@compile_error`, `@embed_bytes`, etc.).
+    /// Lowers `hir_intrinsic_call` (`@compile_assert`, `@compile_error`, `@embed_bytes`, wire/narrow intrinsics, etc.).
     fn lowerIntrinsicNode(self: *MirLowerer, intr_hir: HirIndex) anyerror!MirValueId {
         const node = self.hir_store.getNode(intr_hir);
         const tok = node.origin_token;
-        const intr_kind: type_system.IntrinsicKind = @fromBackingInt(@intCast(@as(u8, @truncate(node.data.lhs))));
 
         const extra_base = node.data.rhs;
         const type_len = if (extra_base < self.hir_store.extra_data.items.len)
@@ -4684,6 +4980,31 @@ const MirLowerer = struct {
             }
         }
 
+        if ((node.data.lhs & hir.HIR_INTERNAL_INTRINSIC_FLAG) != 0) {
+            const internal_kind: hir.HirInternalIntrinsic = @fromBackingInt(
+                @intCast(@as(u8, @truncate(node.data.lhs))),
+            );
+            const args_start: u32 = @intCast(self.body.extra_args.items.len);
+            try self.body.extra_args.appendSlice(self.body.allocator, lowered_vals.items);
+            return switch (internal_kind) {
+                .narrow_check => self.ssa.emitInst(self.cur_bb, .{
+                    .op = .intrinsic_op,
+                    .flags = .{ .has_side_effects = true, .has_trap_risk = true, .is_synthetic = true },
+                    .aux_u16 = @backingInt(MirIntrinsicKind.narrow_check),
+                    .type_id = node.type_id,
+                    .operands = .{ .lhs = args_start, .rhs = @intCast(lowered_vals.items.len) },
+                }, tok),
+                .try_narrow => self.ssa.emitInst(self.cur_bb, .{
+                    .op = .intrinsic_op,
+                    .flags = .{ .is_synthetic = true },
+                    .aux_u16 = @backingInt(MirIntrinsicKind.try_narrow),
+                    .type_id = node.type_id,
+                    .operands = .{ .lhs = args_start, .rhs = @intCast(lowered_vals.items.len) },
+                }, tok),
+            };
+        }
+
+        const intr_kind: type_system.IntrinsicKind = @fromBackingInt(@intCast(@as(u8, @truncate(node.data.lhs))));
         switch (intr_kind) {
             .compile_error => {
                 const args_start: u32 = @intCast(self.body.extra_args.items.len);
@@ -4756,6 +5077,35 @@ const MirLowerer = struct {
                     .aux_u16 = @backingInt(mir_kind),
                     .type_id = node.type_id,
                     .operands = .{ .lhs = type_arg_raw, .rhs = 0 },
+                }, tok);
+            },
+            .as_bytes, .bit_cast, .from_bytes, .view_bytes => {
+                const mir_kind: MirIntrinsicKind = switch (intr_kind) {
+                    .as_bytes => .as_bytes,
+                    .bit_cast => .bit_cast,
+                    .from_bytes => .from_bytes,
+                    .view_bytes => .view_bytes,
+                    else => unreachable,
+                };
+                const args_start: u32 = @intCast(self.body.extra_args.items.len);
+                try self.body.extra_args.appendSlice(self.body.allocator, lowered_vals.items);
+                return self.ssa.emitInst(self.cur_bb, .{
+                    .op = .intrinsic_op,
+                    .flags = .{ .has_trap_risk = true, .is_unsafe = node.flags.is_unsafe },
+                    .aux_u16 = @backingInt(mir_kind),
+                    .type_id = node.type_id,
+                    .operands = .{ .lhs = args_start, .rhs = @intCast(lowered_vals.items.len) },
+                }, tok);
+            },
+            .drop_trace => {
+                const args_start: u32 = @intCast(self.body.extra_args.items.len);
+                try self.body.extra_args.appendSlice(self.body.allocator, lowered_vals.items);
+                return self.ssa.emitInst(self.cur_bb, .{
+                    .op = .intrinsic_op,
+                    .flags = .{ .has_side_effects = true, .is_unsafe = node.flags.is_unsafe },
+                    .aux_u16 = @backingInt(MirIntrinsicKind.drop_trace),
+                    .type_id = .unit_ty,
+                    .operands = .{ .lhs = args_start, .rhs = @intCast(lowered_vals.items.len) },
                 }, tok);
             },
             else => {
@@ -5314,6 +5664,8 @@ const MirLowerer = struct {
         arm_ref_specs: []std.ArrayListUnmanaged(ArmRefSpec),
         /// Root scrutinee `PlaceId` used when an `or_pat` binds the same `ref` local to distinct sub-places.
         scrut_place: PlaceId,
+        /// Static `TypeId` of `scrut_place`.
+        scrut_ty: TypeId,
     };
 
     /// Disjoint elementary integer/char interval `[low ..= high]` (`DR-13` §4.1.5).
@@ -5455,6 +5807,7 @@ const MirLowerer = struct {
             .arm_reached = arm_reached,
             .arm_ref_specs = arm_ref_specs,
             .scrut_place = scrut_place,
+            .scrut_ty = scrut_node.type_id,
         };
 
         self.decision_node_count = 0;
@@ -5579,6 +5932,107 @@ const MirLowerer = struct {
         });
     }
 
+    /// Returns `true` if sub-pattern `sub_idx` safely binds or unpacks any `@linear` value without `_` drops.
+    fn isNonWildcardLinearSubPat(self: *const MirLowerer, sub_idx: u32, depth: u8) bool {
+        if (depth >= 32 or sub_idx == NONE_U32 or sub_idx >= self.hir_store.patterns.items.len) return false;
+        const sub_pat = self.hir_store.patterns.items[sub_idx];
+        if (sub_pat.type_id.isError() or
+            type_system.classifyOwnershipTier(self.pool, self.sym_table, sub_pat.type_id) != .linear_tier)
+        {
+            return true;
+        }
+        return switch (sub_pat.kind) {
+            .bind => |bind_pat| !bind_pat.is_ref,
+            .struct_pat, .tuple, .variant, .or_pat => self.isCompleteLinearUnpackPat(sub_idx, depth + 1),
+            else => false,
+        };
+    }
+
+    /// Returns `true` if `pat_idx` structurally unpacks a `@linear` aggregate/sum by value without dropping `@linear` fields.
+    fn isCompleteLinearUnpackPat(self: *const MirLowerer, pat_idx: u32, depth: u8) bool {
+        if (depth >= 32 or pat_idx == NONE_U32 or pat_idx >= self.hir_store.patterns.items.len) return false;
+        const pat = self.hir_store.patterns.items[pat_idx];
+        switch (pat.kind) {
+            .struct_pat => |sp| {
+                const unwrapped = self.pool.unwrapUnderlyingType(pat.type_id);
+                if (unwrapped.isError()) return false;
+                const ty_node = self.pool.getNode(unwrapped);
+                if (ty_node.tag != .struct_ty and ty_node.tag != .union_ty) return false;
+                const sym = self.sym_table.getSymbol(SymbolIndex.fromInt(ty_node.rhs)).*;
+                if (sym.target_scope.isNone()) return true;
+
+                var field_ord: u32 = 0;
+                for (self.sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
+                    const mem_sym = self.sym_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind != .field_sym) continue;
+                    defer field_ord += 1;
+                    if (!mem_sym.type_id.isError() and
+                        type_system.classifyOwnershipTier(self.pool, self.sym_table, mem_sym.type_id) == .linear_tier)
+                    {
+                        var matched_sub: ?u32 = null;
+                        for (0..sp.field_len) |field_i| {
+                            const pair_base = sp.field_start + @as(u32, @intCast(field_i * 2));
+                            if (self.hir_store.extra_data.items[pair_base] == field_ord) {
+                                matched_sub = self.hir_store.extra_data.items[pair_base + 1];
+                                break;
+                            }
+                        }
+                        const sub_pat_idx = matched_sub orelse return false;
+                        if (!self.isNonWildcardLinearSubPat(sub_pat_idx, depth + 1)) return false;
+                    }
+                }
+                return true;
+            },
+            .tuple => |tup| {
+                if (tup.sub_len != self.countProductFields(pat.type_id)) return false;
+                for (self.hir_store.extra_data.items[tup.sub_start .. tup.sub_start + tup.sub_len]) |sub_raw| {
+                    if (!self.isNonWildcardLinearSubPat(sub_raw, depth + 1)) return false;
+                }
+                return true;
+            },
+            .variant => |vp| {
+                for (self.hir_store.extra_data.items[vp.sub_start .. vp.sub_start + vp.sub_len]) |sub_raw| {
+                    if (!self.isNonWildcardLinearSubPat(sub_raw, depth + 1)) return false;
+                }
+                return true;
+            },
+            .or_pat => |op| {
+                return self.isCompleteLinearUnpackPat(op.lhs_pat, depth + 1) and
+                    self.isCompleteLinearUnpackPat(op.rhs_pat, depth + 1);
+            },
+            else => return false,
+        }
+    }
+
+    /// Emits `ghost_storage_move(scrut_place)` when `pat_idx` unpacks a `@linear` scrutinee completely by value.
+    fn emitLinearUnpackMoveIfApplicable(
+        self: *MirLowerer,
+        scrut_place: PlaceId,
+        scrut_ty: TypeId,
+        pat_idx: u32,
+        bindings: []const PatBinding,
+        tok: TokenIndex,
+    ) !void {
+        if (scrut_place.asInt() >= self.body.places.items.len) return;
+        if (self.isPlaceBehindSharedRef(scrut_place)) return;
+        for (bindings) |binding| {
+            if (binding.is_ref) return;
+        }
+        if (scrut_ty.isError() or
+            type_system.classifyOwnershipTier(self.pool, self.sym_table, scrut_ty) != .linear_tier)
+        {
+            return;
+        }
+        if (!self.isCompleteLinearUnpackPat(pat_idx, 0)) return;
+
+        _ = try self.ssa.emitInst(self.cur_bb, .{
+            .op = .ghost_storage_move,
+            .flags = .{ .has_side_effects = true, .is_synthetic = true },
+            .type_id = .unit_ty,
+            .operands = .{ .lhs = scrut_place.asInt(), .rhs = 0 },
+        }, tok);
+    }
+
     /// Recursively compiles `(col_places, col_types, raw_rows)` into a CFG decision tree (`DR-13` §4.1).
     fn compileDecisionMatrix(
         self: *MirLowerer,
@@ -5634,6 +6088,13 @@ const MirLowerer = struct {
             const arm = ctx.arms[matched_row.arm_idx];
             if (arm.guard_hir.isNone()) {
                 try self.emitPatternBindings(matched_row.bindings, true, false, arm.origin_token);
+                try self.emitLinearUnpackMoveIfApplicable(
+                    ctx.scrut_place,
+                    ctx.scrut_ty,
+                    arm.pat_idx,
+                    matched_row.bindings,
+                    arm.origin_token,
+                );
                 try self.recordArmRefBindings(ctx, matched_row.arm_idx, matched_row.bindings);
                 ctx.arm_reached[matched_row.arm_idx] = true;
                 try self.emitBr(ctx.arm_blocks[matched_row.arm_idx], &.{});
@@ -5669,6 +6130,13 @@ const MirLowerer = struct {
 
             self.cur_bb = hit_bb;
             try self.emitPatternBindings(matched_row.bindings, true, false, arm.origin_token);
+            try self.emitLinearUnpackMoveIfApplicable(
+                ctx.scrut_place,
+                ctx.scrut_ty,
+                arm.pat_idx,
+                matched_row.bindings,
+                arm.origin_token,
+            );
             try self.recordArmRefBindings(ctx, matched_row.arm_idx, matched_row.bindings);
             ctx.arm_reached[matched_row.arm_idx] = true;
             try self.emitBr(ctx.arm_blocks[matched_row.arm_idx], &.{});
@@ -5986,6 +6454,10 @@ const MirLowerer = struct {
         for (bindings) |binding| {
             const lid = self.mapHirLocal(binding.hir_local_id);
             if (lid.isNone()) continue;
+            if (lid.asInt() < self.body.local_scope_depths.items.len) {
+                self.body.local_scope_depths.items[lid.asInt()] =
+                    @intCast(@min(@max(self.scope_depth, 1), std.math.maxInt(u16)));
+            }
             const local_decl = self.body.locals.items[lid.asInt()];
 
             const bound_val = if (binding.is_ref)
@@ -6003,6 +6475,7 @@ const MirLowerer = struct {
             if (local_decl.flags().is_address_taken) {
                 const dst_place = try self.makePlace(lid, &.{});
                 try self.markStorageInit(lid, tok);
+                try self.emitZeroPadIfRequired(dst_place, local_decl.type_id, tok);
                 _ = try self.ssa.emitInst(self.cur_bb, .{
                     .op = .place_store,
                     .flags = .{ .has_side_effects = true, .is_synthetic = true },
@@ -6682,6 +7155,7 @@ const MirLowerer = struct {
 
         // [1] Populate `locals` (`_0` return slot + formal parameters + body locals) & `PlaceId(0)`:
         try self.body.locals.ensureTotalCapacity(self.body.allocator, self.root_local_len);
+        try self.body.local_scope_depths.ensureTotalCapacity(self.body.allocator, self.root_local_len);
         try self.local_var_types.ensureTotalCapacity(self.allocator, self.root_local_len);
 
         for (0..self.root_local_len) |offset| {
@@ -6707,6 +7181,10 @@ const MirLowerer = struct {
                         },
                     ),
                 );
+                try self.body.local_scope_depths.append(
+                    self.body.allocator,
+                    if (is_ret or is_arg) 0 else 1,
+                );
                 try self.local_var_types.append(self.allocator, h_loc.type_id);
             } else {
                 const slot_ty = if (offset == 0) fn_meta.ret_ty else TypeId.unit_ty;
@@ -6718,6 +7196,10 @@ const MirLowerer = struct {
                         .is_address_taken = offset == 0,
                         .is_return_slot = offset == 0,
                     }),
+                );
+                try self.body.local_scope_depths.append(
+                    self.body.allocator,
+                    if (offset == 0) 0 else 1,
                 );
                 try self.local_var_types.append(self.allocator, slot_ty);
             }
@@ -7268,7 +7750,16 @@ pub fn verifyMirBody(
                     }
                 },
                 .intrinsic_op => {
-                    if (inst.operands.rhs > 0) {
+                    const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+                    if (ikind.hasPlaceInLhs()) {
+                        try v1_ctx.checkPlaceIndices(body, inst.operands.lhs, bb_id, rank);
+                        if (ikind.hasSsaFlagInRhs() and inst.operands.rhs != NONE_U32) {
+                            try v1_ctx.checkVal(inst.operands.rhs, bb_id, rank);
+                        }
+                    } else if (ikind.hasExtraArgs() and inst.operands.rhs > 0) {
+                        if (inst.operands.lhs + inst.operands.rhs > body.extra_args.items.len) {
+                            return error.V1DominanceViolation;
+                        }
                         for (body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs]) |v_id| {
                             try v1_ctx.checkVal(v_id, bb_id, rank);
                         }
@@ -7319,7 +7810,11 @@ pub fn verifyMirBody(
     if (body.is_ghost_stripped) {
         for (dom.rpo_blocks) |bb_idx| {
             for (body.getBlockInsts(MirBlockId.fromInt(bb_idx))) |inst_val| {
-                if (body.getInst(inst_val).op.isGhost()) {
+                const inst = body.getInst(inst_val);
+                if (inst.op.isGhost() or
+                    (inst.op == .intrinsic_op and
+                        @as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)).isGhostIntrinsic()))
+                {
                     return error.V4PostStripGhostPresent;
                 }
             }
@@ -7474,11 +7969,14 @@ fn resolveVerifierFieldType(
         .struct_ty, .union_ty => {
             const sym = sym_table.getSymbol(SymbolIndex.fromInt(node.rhs)).*;
             if (sym.target_scope.isNone()) return null;
+            const subst = type_system.NominalTypeSubst.init(pool, sym_table, unwrapped);
             var cur_ord: u32 = 0;
             for (sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
                 const mem_sym = sym_table.getSymbol(mem_idx).*;
                 if (mem_sym.kind != .field_sym) continue;
-                if (cur_ord == ordinal) return pool.unwrapUnderlyingType(mem_sym.type_id);
+                if (cur_ord == ordinal) {
+                    return pool.unwrapUnderlyingType(subst.resolve(mem_sym.type_id));
+                }
                 cur_ord += 1;
             }
             return null;
@@ -7512,11 +8010,14 @@ fn resolveVerifierVariantPayload(
         .enum_ty => blk: {
             const sym = sym_table.getSymbol(SymbolIndex.fromInt(node.rhs)).*;
             if (sym.target_scope.isNone()) break :blk null;
+            const subst = type_system.NominalTypeSubst.init(pool, sym_table, unwrapped);
             var cur_ord: u32 = 0;
             for (sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
                 const mem_sym = sym_table.getSymbol(mem_idx).*;
                 if (mem_sym.kind != .enum_variant_sym) continue;
-                if (cur_ord == tag_ord) break :blk pool.unwrapUnderlyingType(mem_sym.type_id);
+                if (cur_ord == tag_ord) {
+                    break :blk pool.unwrapUnderlyingType(subst.resolve(mem_sym.type_id));
+                }
                 cur_ord += 1;
             }
             break :blk null;
@@ -8357,6 +8858,65 @@ pub fn lowerHirToMir(
     return bundle;
 }
 
+/// Lowers a single `HirFnMeta` into `MirBody` without pre-SAST `V4`/`V5`/`V6` gating so `mir_sast` can analyze it.
+pub fn lowerHirFnToMirForSast(
+    allocator: std.mem.Allocator,
+    hir_store: *const HirStore,
+    fn_meta: HirFnMeta,
+    pool: *InternPool,
+    sym_table: *const SymbolTable,
+    interner: *const StringInterner,
+    diagnostic_sink: ?*DiagnosticSink,
+) !MirBody {
+    var body = MirBody.init(allocator, hir_store.file_id, fn_meta.def_id);
+    errdefer body.deinit();
+
+    var lowerer = MirLowerer{
+        .allocator = allocator,
+        .hir_store = hir_store,
+        .pool = pool,
+        .sym_table = sym_table,
+        .interner = interner,
+        .body = &body,
+        .ssa = MirSsaBuilder.init(allocator, &body, &.{}, diagnostic_sink),
+        .diagnostic_sink = diagnostic_sink,
+        .is_for_sast = true,
+    };
+    defer lowerer.deinit();
+
+    try lowerer.lowerFunction(fn_meta);
+    return body;
+}
+
+/// Lowers all non-`subscript` bodies in `hir_store` into `MirModuleBundle` for Phase 6 `mir_sast` analysis.
+pub fn lowerHirToMirForSast(
+    allocator: std.mem.Allocator,
+    hir_store: *const HirStore,
+    pool: *InternPool,
+    sym_table: *const SymbolTable,
+    interner: *const StringInterner,
+    diagnostic_sink: ?*DiagnosticSink,
+) !MirModuleBundle {
+    var bundle = MirModuleBundle{ .allocator = allocator };
+    errdefer bundle.deinit();
+
+    for (hir_store.functions.items) |fn_meta| {
+        if (fn_meta.body_hir.isNone() or fn_meta.is_subscript) continue;
+        var lowered_body = try lowerHirFnToMirForSast(
+            allocator,
+            hir_store,
+            fn_meta,
+            pool,
+            sym_table,
+            interner,
+            diagnostic_sink,
+        );
+        errdefer lowered_body.deinit();
+        try bundle.bodies.append(allocator, lowered_body);
+    }
+    return bundle;
+}
+
 /// Parses, resolves, type-checks, lowers to `HIR`, lowers to `MIR`, and verifies `V1`–`V6` in one call.
 pub fn lowerSourceToMir(
     allocator: std.mem.Allocator,
@@ -8476,6 +9036,24 @@ pub fn lowerSourceToMir(
         .hir_bundle = hir_bundle,
         .mir_bundle = mir_bundle,
     };
+}
+
+/// Returns `true` when `raw_ty` unwraps to a nominal `@zero_pad` `struct`, `union`, or `enum` (`DR-20` `D-01`).
+pub fn isZeroPadNominalType(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    raw_ty: TypeId,
+) bool {
+    if (raw_ty.isError()) return false;
+    const unwrapped = pool.unwrapUnderlyingType(raw_ty);
+    if (unwrapped.isError()) return false;
+    const ty_node = pool.getNode(unwrapped);
+    if (ty_node.tag != .struct_ty and ty_node.tag != .union_ty and ty_node.tag != .enum_ty) {
+        return false;
+    }
+    const sym_idx = SymbolIndex.fromInt(ty_node.rhs);
+    if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return false;
+    return sym_table.getSymbol(sym_idx).contract_flags.is_zero_pad;
 }
 
 /// Renders a `MirBody` into a deterministic monochrome human-readable dump for golden snapshots.
@@ -8599,6 +9177,42 @@ pub fn renderMir(
                         std.fmt.bufPrint(&num_buf, " _{d}", .{inst.operands.lhs}) catch "",
                     );
                 },
+                .intrinsic_op => {
+                    const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+                    try out.append(allocator, '.');
+                    try out.appendSlice(allocator, @tagName(ikind));
+                    if (ikind.hasPlaceInLhs()) {
+                        try appendRenderedPlace(allocator, body, PlaceId.fromInt(inst.operands.lhs), &out);
+                        if (ikind.hasSsaFlagInRhs() and inst.operands.rhs != NONE_U32) {
+                            try out.appendSlice(
+                                allocator,
+                                std.fmt.bufPrint(&num_buf, ", %{d}", .{inst.operands.rhs}) catch "",
+                            );
+                        } else if (ikind == .ghost_storage_free and inst.operands.rhs != NONE_U32) {
+                            try out.appendSlice(
+                                allocator,
+                                std.fmt.bufPrint(&num_buf, ", reg={d}", .{inst.operands.rhs}) catch "",
+                            );
+                        }
+                    } else if (ikind.hasTypeIdInLhs()) {
+                        try out.appendSlice(
+                            allocator,
+                            std.fmt.bufPrint(&num_buf, " [ty={d}]", .{inst.operands.lhs}) catch "",
+                        );
+                    } else if (ikind.hasExtraArgs() and inst.operands.rhs > 0 and
+                        inst.operands.lhs + inst.operands.rhs <= body.extra_args.items.len)
+                    {
+                        try out.appendSlice(allocator, " (");
+                        for (body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs], 0..) |arg_v, arg_i| {
+                            if (arg_i > 0) try out.appendSlice(allocator, ", ");
+                            try out.appendSlice(
+                                allocator,
+                                std.fmt.bufPrint(&num_buf, "%{d}", .{arg_v}) catch "",
+                            );
+                        }
+                        try out.append(allocator, ')');
+                    }
+                },
                 else => {
                     try out.appendSlice(
                         allocator,
@@ -8609,6 +9223,9 @@ pub fn renderMir(
                         ) catch "",
                     );
                 },
+            }
+            if (inst.flags.is_abort_on_panic) {
+                try out.appendSlice(allocator, " [abort_on_panic]");
             }
             try out.append(allocator, '\n');
         }
@@ -8622,6 +9239,12 @@ pub fn renderMir(
                 allocator,
                 std.fmt.bufPrint(&num_buf, " [val=%{d}]", .{term.cond_or_val}) catch "",
             );
+        }
+        const is_abort_term = (term.kind == .call and term.cond_or_val < body.calls.items.len and
+            body.calls.items[term.cond_or_val].is_abort_on_panic) or
+            (term.kind == .trap and (term.aux_u8 & TRAP_ABORT_ON_PANIC_FLAG) != 0);
+        if (is_abort_term) {
+            try out.appendSlice(allocator, " [abort_on_panic]");
         }
         for (body.getOutgoingEdges(bb_id)) |edge| {
             try out.appendSlice(
@@ -9629,4 +10252,76 @@ test "test_redteam_3a_mir_definite_init_partial_moves_local_closure_escape_and_c
             }
         }
     }
+}
+
+test "test_phase6_mir_intrinsics_vacated_windows_and_subscript_defer" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(MirInst));
+    try std.testing.expect(MirIntrinsicKind.zero_pad.hasPlaceInLhs());
+    try std.testing.expect(MirIntrinsicKind.drop_in_place.hasPlaceInLhs());
+    try std.testing.expect(MirIntrinsicKind.drop_if_live.hasPlaceInLhs());
+    try std.testing.expect(MirIntrinsicKind.ghost_storage_free.hasPlaceInLhs());
+    try std.testing.expect(!MirIntrinsicKind.bounds_check.hasPlaceInLhs());
+    try std.testing.expect(MirIntrinsicKind.drop_if_live.hasSsaFlagInRhs());
+    try std.testing.expect(!MirIntrinsicKind.drop_in_place.hasSsaFlagInRhs());
+    try std.testing.expect(MirIntrinsicKind.ghost_storage_free.isGhostIntrinsic());
+    try std.testing.expect(!MirIntrinsicKind.drop_in_place.isGhostIntrinsic());
+
+    // [1] Lower `.narrow`, `.try_narrow`, `@zero_pad`, wire intrinsics, `@drop_trace`, `bounds_check`, and `Fix-06B` `subscript`:
+    const phase6_src =
+        \\@zero_pad
+        \\@repr(C)
+        \\pub struct WireHdr {
+        \\    pub tag: u8,
+        \\    pub code: u32,
+        \\}
+        \\pub struct Vec[T] {
+        \\    pub len: usize,
+        \\}
+        \\pub struct NonCopyBox {
+        \\    pub data: Vec[u32],
+        \\}
+        \\pub subscript mut_box_slot(mut items: inout [NonCopyBox; 2], mut log_slot: inout i32, idx: usize) -> NonCopyBox {
+        \\    defer { log_slot = log_slot + 100; }
+        \\    yield items[idx];
+        \\    log_slot = log_slot + 1;
+        \\}
+        \\pub fn inspect_phase6_lowering(raw_num: i32, mut boxes: inout [NonCopyBox; 2]) -> u32 {
+        \\    let narrowed_u8: u8 = raw_num.narrow[u8]();
+        \\    let maybe_u8: u8? = raw_num.try_narrow[u8]();
+        \\    let hdr = WireHdr { tag: narrowed_u8, code: 7 };
+        \\    let hdr_bytes: &[u8] = hdr.as_bytes();
+        \\    let casted_u64: u64 = @bit_cast[u64](hdr);
+        \\    let decoded_hdr: WireHdr? = @from_bytes[WireHdr](hdr_bytes);
+        \\    let viewed_hdr: (&WireHdr)? = @view_bytes[WireHdr](hdr_bytes);
+        \\    @drop_trace(42);
+        \\    var trace_log: i32 = 0;
+        \\    {
+        \\        let _ = &mut_box_slot(boxes, trace_log, 0);
+        \\    }
+        \\    mut_box_slot(boxes, trace_log, 1) = NonCopyBox { data: Vec { len: 2 } };
+        \\    let _ = maybe_u8;
+        \\    let _ = casted_u64;
+        \\    let _ = decoded_hdr;
+        \\    let _ = viewed_hdr;
+        \\    return hdr_bytes[0] as u32;
+        \\}
+    ;
+    var bundle = try lowerSourceToMir(alloc, FileId.fromInt(90), phase6_src, TargetLayout.NATIVE_64, .{});
+    defer bundle.deinit();
+    try std.testing.expect(!bundle.hir_bundle.diagnostics.hasErrors());
+
+    const fn_body = bundle.mir_bundle.findBodyByName(&bundle.hir_bundle.interner, "inspect_phase6_lowering").?;
+    try std.testing.expect(fn_body.vacated_windows.items.len >= 1);
+
+    var cloned_body = try fn_body.clone(alloc);
+    defer cloned_body.deinit();
+    try std.testing.expectEqual(fn_body.vacated_windows.items.len, cloned_body.vacated_windows.items.len);
+
+    const rendered = try renderMir(alloc, fn_body, &bundle.hir_bundle.interner);
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "narrow_check") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "try_narrow") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "zero_pad") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "bounds_check") != null);
 }

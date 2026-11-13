@@ -150,9 +150,9 @@ const EXHAUSTIVE_TOKEN_CASES = [_]struct {
 
 /// Authoritative list of all 19 primitive type keywords that map to `TokenKind.prim_type` (`45`).
 const ALL_19_PRIMITIVE_TYPES = [_][]const u8{
-    "i8",    "i16", "i32", "i64",  "i128", "isize",
-    "u8",    "u16", "u32", "u64",  "u128", "usize",
-    "f32",   "f64", "bool", "char", "str",  "never",
+    "i8",   "i16", "i32",  "i64",  "i128", "isize",
+    "u8",   "u16", "u32",  "u64",  "u128", "usize",
+    "f32",  "f64", "bool", "char", "str",  "never",
     "unit",
 };
 
@@ -374,10 +374,10 @@ test "test_lexer_numeric_literals_ranges_method_calls_and_e0103_errors" {
 
     // [2] Exhaustive malformed numeric literals emitting `E0103`:
     const malformed_numbers = [_][]const u8{
-        "0x",      "0X",       "0b",      "0B",       "0o",       "0O",
-        "0x_1",    "0x1_",     "0x1__2",  "0x1g",     "0b102",    "0o78",
-        "1__2",    "123_",     "1.2__3",  "1.2_",     "1.0e",     "1.0e+",
-        "1.0e-",   "1.0e_2",   "1.0e2_",  "1.0e2__3", "123abc",   "42u64",
+        "0x",      "0X",     "0b",     "0B",       "0o",     "0O",
+        "0x_1",    "0x1_",   "0x1__2", "0x1g",     "0b102",  "0o78",
+        "1__2",    "123_",   "1.2__3", "1.2_",     "1.0e",   "1.0e+",
+        "1.0e-",   "1.0e_2", "1.0e2_", "1.0e2__3", "123abc", "42u64",
         "3.14f64",
     };
     for (malformed_numbers) |bad_num| {

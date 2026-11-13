@@ -38,7 +38,7 @@ This catalog contains the 20 self-contained, copy-pasteable `Deep research` prom
 
 ## Context & Vision
 I am building a new general-purpose systems and application programming language called **CoreX** (repository `corex-lang/corex`, file extension `.cx`, CLI binary `corex`):
-> *"A streamlined, zero-GC, statically typed programming language built for instant compilation, compile-time safety, and C-level runtime speed."*
+> *"Build reliable software effortlessly at systems-level speed."*
 
 CoreX has an explicit milestone of **100% self-hosting** (rewriting the compiler, memory/SAST verifier, package manager, formatter, migration tool, and LSP in CoreX itself) prior to Version 1.0, after which it must no longer depend on any external host language.
 

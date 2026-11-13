@@ -75,14 +75,14 @@ const LITERAL_WORKLOAD_BUFFER: [LITERAL_WORKLOAD_CHUNK.len * 64]u8 = blk: {
 
 /// Representative mix of 32 keywords, primitive types, `snake_case`, `PascalCase`, and `SCREAMING_SNAKE_CASE` lexemes.
 const IDENTIFIER_CLASSIFICATION_CORPUS = [_][]const u8{
-    "pub",                  "fn",                   "struct",               "enum",
-    "trait",                "impl",                 "comptime",             "bit_field",
-    "errdefer",             "catch",                "return",               "while",
-    "i32",                  "u64",                  "usize",                "f64",
-    "bool",                 "str",                  "never",                "unit",
-    "_",                    "resolve_path",         "parse_expression",     "emit_diagnostic",
-    "count_instructions",   "has_side_effects",     "TokenBuffer",          "LosslessCstArena",
-    "DiagnosticRenderer",   "TransactionalPatcher", "MAX_TOKENS_PER_FILE",  "DEFAULT_SLAB_SIZE",
+    "pub",                "fn",                   "struct",              "enum",
+    "trait",              "impl",                 "comptime",            "bit_field",
+    "errdefer",           "catch",                "return",              "while",
+    "i32",                "u64",                  "usize",               "f64",
+    "bool",               "str",                  "never",               "unit",
+    "_",                  "resolve_path",         "parse_expression",    "emit_diagnostic",
+    "count_instructions", "has_side_effects",     "TokenBuffer",         "LosslessCstArena",
+    "DiagnosticRenderer", "TransactionalPatcher", "MAX_TOKENS_PER_FILE", "DEFAULT_SLAB_SIZE",
 };
 
 // -------------------------------------- INTERNALS --------------------------------------

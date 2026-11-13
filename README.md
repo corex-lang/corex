@@ -1,6 +1,6 @@
 # CoreX
 
-> *A streamlined, zero-GC, statically typed programming language built for instant compilation, compile-time safety, and C-level runtime speed.*
+> *Build reliable software effortlessly at systems-level speed.*
 
 **CoreX** (`corex-lang/corex`) is a systems and application programming language designed for maximum developer ergonomics, deterministic compile-time memory safety without a tracing garbage collector, and zero-cold-start native and WebAssembly execution.
 

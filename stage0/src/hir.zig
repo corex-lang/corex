@@ -236,6 +236,14 @@ pub const HirUnaryOp = enum(u8) {
     deref = 5,
 };
 
+/// Compiler-internal `HIR` intrinsic sub-kinds encoded via `HIR_INTERNAL_INTRINSIC_FLAG` (`D-11`).
+pub const HirInternalIntrinsic = enum(u8) {
+    /// Checked `.narrow[Dst]()` conversion (`extra = [1, 3, dst_ty, src_hir, min_hir, max_hir]`).
+    narrow_check = 0,
+    /// Fallible `.try_narrow[Dst]()` conversion (`extra = [1, 3, dst_ty, src_hir, min_hir, max_hir]`).
+    try_narrow = 1,
+};
+
 /// Canonical binary operators in `HIR` (short-circuiting `and`/`or` remain explicit until `MIR` CFG lowering).
 pub const HirBinaryOp = enum(u8) {
     /// Checked addition (`+`).
@@ -775,6 +783,9 @@ pub const MAX_UNROLL: u32 = 4096;
 
 /// Distinguished field ordinal representing `.len` on slices, `#soa` slices, and `str`.
 pub const FIELD_ORDINAL_LEN: u32 = 0xFFFF_FFFE;
+
+/// High-bit tag in `hir_intrinsic_call.data.lhs` selecting `HirInternalIntrinsic` over `IntrinsicKind`.
+pub const HIR_INTERNAL_INTRINSIC_FLAG: u32 = 1 << 16;
 
 /// Sentinel value indicating no `HirIndex` or optional child (`0xFFFF_FFFF`).
 const NONE_U32: u32 = std.math.maxInt(u32);
@@ -4396,10 +4407,19 @@ const HirLowerer = struct {
         tok: TokenIndex,
     ) !HirIndex {
         const extra_idx = try self.store.appendLenPrefixedExtra(stmt_ids);
+        const tail_cat: ValueCategory = if (block_ty == .never_ty)
+            .diverging
+        else if (!tail_hir.isNone() and tail_hir.asInt() < self.store.nodes.len) blk: {
+            const tail_node = self.store.getNode(tail_hir);
+            break :blk switch (tail_node.tag) {
+                .hir_index_proj, .hir_soa_field_ptr, .hir_subscript_call, .hir_field_proj => tail_node.flags.category,
+                else => .rvalue,
+            };
+        } else .rvalue;
         return self.emitNode(.{
             .tag = .hir_block,
             .flags = .{
-                .category = if (block_ty == .never_ty) .diverging else .rvalue,
+                .category = tail_cat,
                 .is_synthetic = true,
             },
             .type_id = self.concreteType(block_ty),
@@ -5072,6 +5092,8 @@ const HirLowerer = struct {
                         }
                     }
                 }
+                const enum_subst = type_system.NominalTypeSubst.init(self.pool, self.sym_table, target_ty);
+                var_payload_ty = try enum_subst.applyMut(self.allocator, self.pool, var_payload_ty);
                 var lowered_args: std.ArrayListUnmanaged(u32) = .empty;
                 defer lowered_args.deinit(self.allocator);
                 if (arg_nodes.len == 1) {
@@ -5206,10 +5228,14 @@ const HirLowerer = struct {
         defer canonical_names.deinit(self.allocator);
         var canonical_texts: std.ArrayListUnmanaged([]const u8) = .empty;
         defer canonical_texts.deinit(self.allocator);
+        const struct_subst = type_system.NominalTypeSubst.init(self.pool, self.sym_table, target_ty);
         for (self.sym_table.getScopeMembers(struct_sym.target_scope)) |mem_idx| {
             const mem_sym = self.sym_table.getSymbol(mem_idx).*;
             if (mem_sym.kind != .field_sym) continue;
-            try canonical_tys.append(self.allocator, mem_sym.type_id);
+            try canonical_tys.append(
+                self.allocator,
+                try struct_subst.applyMut(self.allocator, self.pool, mem_sym.type_id),
+            );
             try canonical_names.append(self.allocator, mem_sym.name);
             try canonical_texts.append(self.allocator, mem_sym.name_text);
         }
@@ -6500,7 +6526,9 @@ const HirLowerer = struct {
         if (recv_node.tag == .soa_slice_ty or recv_node.tag == .soa_array_ty) {
             const elem_ty = TypeId.fromInt(recv_node.lhs);
             if (self.findStructFieldInfo(elem_ty, member_name)) |f_info| {
-                const col_slice_ty = try self.pool.internSlice(f_info.field_ty, base_cat == .place_mut);
+                const elem_subst = type_system.NominalTypeSubst.init(self.pool, self.sym_table, elem_ty);
+                const subst_f_ty = try elem_subst.applyMut(self.allocator, self.pool, f_info.field_ty);
+                const col_slice_ty = try self.pool.internSlice(subst_f_ty, base_cat == .place_mut);
                 return self.emitNode(.{
                     .tag = .hir_field_proj,
                     .flags = .{ .category = .rvalue },
@@ -6526,6 +6554,8 @@ const HirLowerer = struct {
 
         // Nominal `struct` or `union` field projection:
         if (self.findStructFieldInfo(recv_ty, member_name)) |f_info| {
+            const recv_subst = type_system.NominalTypeSubst.init(self.pool, self.sym_table, recv_ty);
+            const subst_f_ty = try recv_subst.applyMut(self.allocator, self.pool, f_info.field_ty);
             const proj_cat: ValueCategory = switch (base_cat) {
                 .place_mut => .place_mut,
                 .place_imm => .place_imm,
@@ -6534,7 +6564,7 @@ const HirLowerer = struct {
             return self.emitNode(.{
                 .tag = .hir_field_proj,
                 .flags = .{ .category = proj_cat, .is_unsafe = self.is_in_unsafe or recv_node.tag == .union_ty },
-                .type_id = self.concreteType(f_info.field_ty),
+                .type_id = self.concreteType(subst_f_ty),
                 .origin_token = tok,
                 .data = .{ .lhs = deref_base.asInt(), .rhs = f_info.ordinal },
             }, ast_origin);
@@ -6746,12 +6776,14 @@ const HirLowerer = struct {
         if (!resolved_sym_idx.isNone()) {
             const sym = self.sym_table.getSymbol(resolved_sym_idx).*;
             if (sym.kind == .enum_variant_sym) {
+                const enum_subst = type_system.NominalTypeSubst.init(self.pool, self.sym_table, target_ty);
+                const subst_var_ty = try enum_subst.applyMut(self.allocator, self.pool, sym.type_id);
                 var arg_hirs: std.ArrayListUnmanaged(u32) = .empty;
                 defer arg_hirs.deinit(self.allocator);
                 if (val_args.len == 1) {
-                    try arg_hirs.append(self.allocator, (try self.lowerExpr(val_args[0], sym.type_id)).asInt());
+                    try arg_hirs.append(self.allocator, (try self.lowerExpr(val_args[0], subst_var_ty)).asInt());
                 } else {
-                    const tup_elems = self.pool.getTupleElements(sym.type_id);
+                    const tup_elems = self.pool.getTupleElements(subst_var_ty);
                     for (val_args, 0..) |arg_id, i| {
                         const sub_ty = if (i < tup_elems.len) TypeId.fromInt(tup_elems[i]) else .err_ty;
                         try arg_hirs.append(self.allocator, (try self.lowerExpr(arg_id, sub_ty)).asInt());
@@ -6872,7 +6904,12 @@ const HirLowerer = struct {
         for (type_arg_nodes, 0..) |t_node_id, i| {
             if (type_args[i] == .unit_ty) {
                 const n_ty = self.nodeType(t_node_id);
-                if (!n_ty.isError()) type_args[i] = n_ty;
+                if (!n_ty.isError()) {
+                    type_args[i] = n_ty;
+                } else {
+                    const fb_ty = self.resolveSimpleTypeAstFallback(t_node_id);
+                    if (!fb_ty.isError()) type_args[i] = fb_ty;
+                }
             }
         }
 
@@ -6944,7 +6981,15 @@ const HirLowerer = struct {
             try payload_words.append(self.allocator, (try self.lowerExpr(v_arg_id, .err_ty)).asInt());
         }
         const extra_idx = try self.store.appendExtraSlice(payload_words.items);
-        const res_ty = if (!target_ty.isError()) target_ty else .unit_ty;
+        const res_ty = if (!target_ty.isError())
+            target_ty
+        else switch (intr_kind) {
+            .bit_cast => type_args[0],
+            .from_bytes => try self.pool.internOptional(type_args[0]),
+            .view_bytes => try self.pool.internOptional(try self.pool.internRef(type_args[0], false)),
+            .as_bytes => try self.pool.internRef(try self.pool.internSlice(.u8_ty, false), false),
+            else => .unit_ty,
+        };
         return self.emitNode(.{
             .tag = .hir_intrinsic_call,
             .flags = .{ .category = if (res_ty == .never_ty) .diverging else .rvalue },
@@ -6989,6 +7034,56 @@ const HirLowerer = struct {
             }
         }
 
+        // Built-in `.narrow[Dst]()` / `.try_narrow[Dst]()` checked integer conversions (`DR-20` `D-11`):
+        if (self.side_tables) |tables| {
+            if (tables.getNarrowCall(expr_id)) |narrow_info| {
+                const raw_recv_hir = try self.lowerExpr(recv_id, .err_ty);
+                const deref_recv_hir = try self.autoDerefPlace(raw_recv_hir, tok);
+                const min_hir = try self.emitConstVal(
+                    .{ .int_val = narrow_info.min_val },
+                    .i128_ty,
+                    tok,
+                    .none,
+                    true,
+                );
+                const max_hir = try self.emitConstVal(
+                    .{ .int_val = narrow_info.max_val },
+                    .i128_ty,
+                    tok,
+                    .none,
+                    true,
+                );
+                const narrow_payload = [6]u32{
+                    1,
+                    3,
+                    narrow_info.dst_ty.toU32(),
+                    deref_recv_hir.asInt(),
+                    min_hir.asInt(),
+                    max_hir.asInt(),
+                };
+                const extra_idx = try self.store.appendExtraSlice(&narrow_payload);
+                const internal_kind: HirInternalIntrinsic = if (narrow_info.kind == .try_narrow)
+                    .try_narrow
+                else
+                    .narrow_check;
+                const resolved_ty = if (!target_ty.isError()) target_ty else self.nodeType(expr_id);
+                const fallback_ty = if (narrow_info.kind == .try_narrow)
+                    try self.pool.internOptional(narrow_info.dst_ty)
+                else
+                    narrow_info.dst_ty;
+                return self.emitNode(.{
+                    .tag = .hir_intrinsic_call,
+                    .flags = .{ .category = .rvalue, .is_synthetic = true },
+                    .type_id = self.concreteType(if (!resolved_ty.isError()) resolved_ty else fallback_ty),
+                    .origin_token = tok,
+                    .data = .{
+                        .lhs = HIR_INTERNAL_INTRINSIC_FLAG | @backingInt(internal_kind),
+                        .rhs = extra_idx,
+                    },
+                }, expr_id);
+            }
+        }
+
         var method_sym_idx = self.nodeSymbol(expr_id);
         if (method_sym_idx.isNone()) {
             const recv_ty = self.unwrapRefType(self.nodeType(recv_id));
@@ -6996,7 +7091,33 @@ const HirLowerer = struct {
                 method_sym_idx = found_m;
             }
         }
-        if (method_sym_idx.isNone()) return self.emitErrorHole(tok, expr_id, target_ty);
+        if (method_sym_idx.isNone()) {
+            // Built-in `.as_bytes()` wire view on `IntoBytes` values / `&T` when unshadowed (`DR-20` `D-01`):
+            if (val_args.len == 0 and std.mem.eql(u8, member_name, "as_bytes")) {
+                const raw_recv_hir = try self.lowerExpr(recv_id, .err_ty);
+                const deref_recv_hir = try self.autoDerefPlace(raw_recv_hir, tok);
+                const inner_ty = self.store.getNode(deref_recv_hir).type_id;
+                const ref_ty = try self.pool.internRef(inner_ty, false);
+                const ref_hir = try self.emitSyntheticAddrOf(deref_recv_hir, ref_ty, false, tok);
+                const as_bytes_payload = [3]u32{ 0, 1, ref_hir.asInt() };
+                const extra_idx = try self.store.appendExtraSlice(&as_bytes_payload);
+                const resolved_ty = if (!target_ty.isError()) target_ty else self.nodeType(expr_id);
+                const fallback_slice_ty = try self.pool.internRef(
+                    try self.pool.internSlice(.u8_ty, false),
+                    false,
+                );
+                return self.emitNode(.{
+                    .tag = .hir_intrinsic_call,
+                    .flags = .{ .category = .rvalue, .is_synthetic = true },
+                    .type_id = self.concreteType(
+                        if (!resolved_ty.isError()) resolved_ty else fallback_slice_ty,
+                    ),
+                    .origin_token = tok,
+                    .data = .{ .lhs = @backingInt(IntrinsicKind.as_bytes), .rhs = extra_idx },
+                }, expr_id);
+            }
+            return self.emitErrorHole(tok, expr_id, target_ty);
+        }
 
         const method_sym = self.sym_table.getSymbol(method_sym_idx).*;
         const sig_view = self.pool.getFnSignatureView(method_sym.type_id);
@@ -8222,12 +8343,13 @@ const HirLowerer = struct {
         const nom_sym = self.sym_table.getSymbol(sym_idx).*;
         if (nom_sym.target_scope.isNone()) return null;
 
+        const nom_subst = type_system.NominalTypeSubst.init(self.pool, self.sym_table, unwrapped);
         var ord: u32 = 0;
         for (self.sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
             const mem_sym = self.sym_table.getSymbol(mem_idx).*;
             if (mem_sym.kind != .field_sym) continue;
             if (std.mem.eql(u8, mem_sym.name_text, field_name)) {
-                return .{ .ordinal = ord, .field_ty = mem_sym.type_id };
+                return .{ .ordinal = ord, .field_ty = nom_subst.resolve(mem_sym.type_id) };
             }
             ord += 1;
         }
@@ -8372,12 +8494,14 @@ const HirLowerer = struct {
                 var f_hirs: std.ArrayListUnmanaged(u32) = .empty;
                 defer f_hirs.deinit(self.allocator);
                 if (!struct_sym.target_scope.isNone()) {
+                    const st_subst = type_system.NominalTypeSubst.init(self.pool, self.sym_table, ty);
                     for (self.sym_table.getScopeMembers(struct_sym.target_scope)) |mem_idx| {
                         const mem_sym = self.sym_table.getSymbol(mem_idx).*;
                         if (mem_sym.kind != .field_sym) continue;
+                        const subst_f_ty = try st_subst.applyMut(self.allocator, self.pool, mem_sym.type_id);
                         try f_hirs.append(
                             self.allocator,
-                            (try self.emitDefaultInitValue(mem_sym.type_id, tok)).asInt(),
+                            (try self.emitDefaultInitValue(subst_f_ty, tok)).asInt(),
                         );
                     }
                 }
@@ -8664,13 +8788,14 @@ const HirLowerer = struct {
                     .enum_ty => {
                         const enum_sym = self.sym_table.getSymbol(SymbolIndex.fromInt(scr_ty_node.rhs)).*;
                         if (!enum_sym.target_scope.isNone()) {
+                            const enum_subst = type_system.NominalTypeSubst.init(self.pool, self.sym_table, unwrapped);
                             var ord: u32 = 0;
                             for (self.sym_table.getScopeMembers(enum_sym.target_scope)) |m_idx| {
                                 const m_sym = self.sym_table.getSymbol(m_idx).*;
                                 if (m_sym.kind != .enum_variant_sym) continue;
                                 if (std.mem.eql(u8, m_sym.name_text, var_name)) {
                                     tag_ordinal = ord;
-                                    payload_ty = m_sym.type_id;
+                                    payload_ty = try enum_subst.applyMut(self.allocator, self.pool, m_sym.type_id);
                                     break;
                                 }
                                 ord += 1;
@@ -9521,11 +9646,44 @@ const HirLowerer = struct {
                         }
                         const bound_ty = self.pool.unwrapUnderlyingType(t_arg_1);
                         if (bound_ty.isBuiltinGroup() or self.pool.getTag(bound_ty) == .user_group) {
-                            const sat = type_system.checkGroupSatisfaction(self.pool, t_arg_0, bound_ty);
+                            const sat = type_system.checkGroupSatisfaction(
+                                self.pool,
+                                self.sym_table,
+                                self.store.target_layout,
+                                t_arg_0,
+                                bound_ty,
+                            );
                             return .{ .bool_val = sat != .rejected and sat != .rejected_distinct_without_tilde };
                         }
                         const trait_node = self.pool.getNode(bound_ty);
                         if (trait_node.tag == .trait_ty) {
+                            const trait_sym = self.sym_table.getSymbol(SymbolIndex.fromInt(trait_node.rhs));
+                            if (self.pool.getFlags(t_arg_0).is_secret and
+                                (std.mem.eql(u8, trait_sym.name_text, "Debug") or
+                                    std.mem.eql(u8, trait_sym.name_text, "Display")))
+                            {
+                                return .{ .bool_val = false };
+                            }
+                            if (trait_sym.flags.is_builtin) {
+                                if (std.mem.eql(u8, trait_sym.name_text, "Copy")) {
+                                    return .{
+                                        .bool_val = type_system.classifyOwnershipTier(
+                                            self.pool,
+                                            self.sym_table,
+                                            t_arg_0,
+                                        ) == .copy_tier,
+                                    };
+                                }
+                                if (std.mem.eql(u8, trait_sym.name_text, "AutoDrop")) {
+                                    return .{
+                                        .bool_val = type_system.classifyOwnershipTier(
+                                            self.pool,
+                                            self.sym_table,
+                                            t_arg_0,
+                                        ) == .auto_drop_tier,
+                                    };
+                                }
+                            }
                             const unwrapped_impl = self.pool.unwrapUnderlyingType(t_arg_0);
                             const unwrapped_key = (@as(u64, unwrapped_impl.toU32()) << 32) |
                                 @as(u64, trait_node.rhs);

@@ -162,12 +162,12 @@ pub const SymbolIndex = enum(u32) {
 
     /// Wraps a raw 32-bit unsigned integer into a `SymbolIndex`.
     pub inline fn fromInt(raw_value: u32) SymbolIndex {
-        return @enumFromInt(raw_value);
+        return @fromBackingInt(@intCast(raw_value));
     }
 
     /// Extracts the underlying 32-bit unsigned integer of `self`.
     pub inline fn asInt(self: SymbolIndex) u32 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     /// Returns `true` if `self` is `.none`.
@@ -230,7 +230,7 @@ pub const SymbolKind = enum(u8) {
     field_sym = 20,
 };
 
-/// 1-byte bit-packed mask of compiler-synthesized `@derive(...)` traits (`DR-05` Section 2.3).
+/// 1-byte bit-packed mask of compiler-synthesized `@derive(…)` traits (`DR-05` Section 2.3).
 pub const DeriveMask = packed struct(u8) {
     /// `@derive(Eq)` (`fn eq(&self, other: &Self) -> bool`).
     has_eq: bool = false,
@@ -322,6 +322,62 @@ pub const SymbolFlags = packed struct(u16) {
     is_extern: bool = false,
 };
 
+/// 2-byte bit-packed Phase 6 contract, safety, and FFI attributes attached to `SymbolRecord` (`DR-17`, `DR-20`).
+pub const DeclContractFlags = packed struct(u16) {
+    /// `true` if annotated with `@no_alloc` (`DR-17` §2.2).
+    is_no_alloc: bool = false,
+    /// `true` if annotated with `@no_panic` (`DR-17` §2.2).
+    is_no_panic: bool = false,
+    /// `true` if annotated with `@no_block` (`DR-17` §2.2).
+    is_no_block: bool = false,
+    /// `true` if annotated with `@linear` (`DR-06` §1.2 Tier 3).
+    is_linear: bool = false,
+    /// `true` if annotated with `@zero_pad` (`DR-20` `D-01`).
+    is_zero_pad: bool = false,
+    /// `true` if annotated with `@secret` (`DR-20` `D-02`, Seam #1).
+    is_secret: bool = false,
+    /// `true` if annotated with `@std_cap_boundary` (`DR-17` §2.3).
+    is_std_cap_boundary: bool = false,
+    /// `true` if annotated with `@export`.
+    is_export: bool = false,
+    /// `true` if annotated with `@link_name(…)`.
+    has_link_name: bool = false,
+    /// `true` if annotated with `@link_section(…)`.
+    has_link_section: bool = false,
+    /// `true` if annotated with `@max_stack(…)` (`DR-17` §3.2).
+    has_max_stack: bool = false,
+    /// `true` if annotated with `@local` (`DR-06` §1.2 non-escaping borrow).
+    is_local_only: bool = false,
+    /// `true` if annotated with `@ifunc` (`DR-17` §4.2 Gate C indirect resolver).
+    is_ifunc: bool = false,
+    /// Reserved zero bits keeping `DeclContractFlags` at `2` bytes.
+    _reserved: u3 = 0,
+
+    comptime {
+        std.debug.assert(@sizeOf(DeclContractFlags) == 2);
+    }
+};
+
+/// Canonical 16-bit inferred capability/effect bits (`DR-17` §2.1) for `@std_cap_boundary` masks.
+pub const CapabilityBits = struct {
+    /// Dynamic heap allocation capability (`@no_alloc` forbids this bit).
+    pub const HEAP_ALLOC: u16 = 1 << 0;
+    /// Unrecoverable trap / panic capability (`@no_panic` forbids this bit).
+    pub const MAY_PANIC: u16 = 1 << 1;
+    /// Blocking or async I/O suspension capability (`@no_block` forbids `IO_ASYNC | IO_FS | IO_NET | THREAD_SPAWN`).
+    pub const IO_ASYNC: u16 = 1 << 2;
+    /// Filesystem I/O capability.
+    pub const IO_FS: u16 = 1 << 3;
+    /// Network socket I/O capability.
+    pub const IO_NET: u16 = 1 << 4;
+    /// OS thread or fiber spawn capability.
+    pub const THREAD_SPAWN: u16 = 1 << 5;
+    /// Foreign function interface or `unsafe` block capability.
+    pub const FFI_UNSAFE: u16 = 1 << 6;
+    /// Non-deterministic clock or OS entropy capability.
+    pub const CLOCK_ENTROPY: u16 = 1 << 7;
+};
+
 /// Complete metadata record for a symbol registered in `SymbolTable`.
 pub const SymbolRecord = struct {
     /// Interned identifier handle (`SymbolId`).
@@ -364,6 +420,18 @@ pub const SymbolRecord = struct {
     derive_mask: DeriveMask = .{},
     /// Allowed declaration target bitmask when `flags.is_attribute_schema` is `true`.
     attr_target_mask: AttrTargetMask = .{},
+    /// Phase 6 contract, ownership, secret, zero-pad, and FFI flags (`DR-17`, `DR-20`).
+    contract_flags: DeclContractFlags = .{},
+    /// Explicit stack frame budget in bytes when `contract_flags.has_max_stack` is `true` (`@max_stack(N)`).
+    max_stack_bytes: u32 = 0,
+    /// Capability bits explicitly emitted at an `@std_cap_boundary` (`DR-17` §2.3).
+    cap_emits_mask: u16 = 0,
+    /// Capability bits explicitly cleared/trusted at an `@std_cap_boundary` (`DR-17` §2.3).
+    cap_clears_mask: u16 = 0,
+    /// Interned section name when `contract_flags.has_link_section` is `true` (`@link_section("…")`).
+    link_section_name: []const u8 = "",
+    /// Explicit discriminant width in bits on `@repr(u8/u16/u32/u64)` `enum` declarations (`0` = default).
+    repr_tag_bits: u8 = 0,
 };
 
 /// Explicit `@overload` function group tracking all member `fn_sym` symbols in a scope (`DR-02`).
@@ -408,6 +476,52 @@ pub const LookupResult = union(enum) {
     not_found,
 };
 
+/// Recognized built-in declaration header attribute selector for `extractItemHeaderMetadataValidated`.
+const HeaderAttrKind = enum(u8) {
+    /// `@attribute_schema` target-constrained schema struct attribute.
+    attribute_schema,
+    /// `@derive(Eq, Hash, Debug, Clone)` trait synthesis attribute.
+    derive,
+    /// `@export` symbol export attribute.
+    export_attr,
+    /// `@extern` foreign symbol linkage attribute.
+    extern_attr,
+    /// `@from` `FromError` upcasting constructor attribute.
+    from,
+    /// `@ifunc` forbidden indirect function resolver attribute (`E0327`).
+    ifunc,
+    /// `@linear` Tier 3 must-consume ownership attribute (`DR-06`).
+    linear,
+    /// `@link_name(…)` custom linker symbol name attribute.
+    link_name,
+    /// `@link_section(…)` custom object section attribute (`E0327` checked).
+    link_section,
+    /// `@local` non-escaping borrow attribute (`DR-06`).
+    local,
+    /// `@max_stack(N)` static stack frame byte budget attribute (`DR-17`).
+    max_stack,
+    /// `@must_use` unused-result warning attribute (`DR-07`).
+    must_use,
+    /// `@no_alloc` heap-allocation-free effect contract (`DR-17`).
+    no_alloc,
+    /// `@no_block` non-blocking effect contract (`DR-17`).
+    no_block,
+    /// `@no_panic` panic-free effect contract (`DR-17`).
+    no_panic,
+    /// `@overload` explicit function overload group attribute (`DR-02`).
+    overload,
+    /// `@repr(…)` explicit layout and discriminant width attribute.
+    repr,
+    /// `@secret` constant-time / wire-redacted taint attribute (`DR-20`).
+    secret,
+    /// `@soa` Structure-of-Arrays layout attribute.
+    soa,
+    /// `@std_cap_boundary(…)` stdlib capability boundary attribute (`DR-17`).
+    std_cap_boundary,
+    /// `@zero_pad` deterministic padding zeroing attribute (`DR-20`).
+    zero_pad,
+};
+
 // --------------------------------------- CONSTS ----------------------------------------
 
 /// Maximum lexical scope nesting depth (`512`, matching `syntax_arenas.MAX_PARSE_DEPTH`).
@@ -416,8 +530,9 @@ pub const MAX_SCOPE_DEPTH: usize = 512;
 /// Maximum identifier byte length evaluated by the stack-allocated Levenshtein matrix (`64`).
 pub const MAX_EDIT_DISTANCE_LEN: usize = 64;
 
-/// Built-in trait names pre-populated in `.global_prelude` (`DR-02` & `DR-04`).
+/// Built-in trait names pre-populated in `.global_prelude` (`DR-02`, `DR-04` & `DR-06`).
 pub const BUILTIN_TRAIT_NAMES = [_][]const u8{
+    "AutoDrop",
     "Clone",
     "Copy",
     "Debug",
@@ -437,13 +552,13 @@ pub const BUILTIN_TRAIT_NAMES = [_][]const u8{
 pub const BuiltinTypeEntry = struct {
     /// Surface identifier in `.cx` source code.
     name: []const u8,
-    /// Pre-assigned static `TypeId` (`0..42`).
+    /// Pre-assigned static `TypeId` (`0..44`).
     type_id: TypeId,
-    /// `true` if this entry is one of the 11 Constrained Type Groups (`32..42`).
+    /// `true` if this entry is one of the 13 Constrained Type Groups (`32..44`).
     is_group: bool,
 };
 
-/// Canonical table of 19 primitive types and 11 Constrained Type Groups (`DR-04` Section 1.1).
+/// Canonical table of 19 primitive types and 13 Constrained Type Groups (`DR-04` Section 1.1 & `DR-20` `D-01`).
 pub const BUILTIN_TYPES_AND_GROUPS = [_]BuiltinTypeEntry{
     .{ .name = "i8", .type_id = .i8_ty, .is_group = false },
     .{ .name = "i16", .type_id = .i16_ty, .is_group = false },
@@ -475,7 +590,36 @@ pub const BUILTIN_TYPES_AND_GROUPS = [_]BuiltinTypeEntry{
     .{ .name = "Bytes", .type_id = .group_bytes, .is_group = true },
     .{ .name = "Scalar", .type_id = .group_scalar, .is_group = true },
     .{ .name = "Copy", .type_id = .group_copy, .is_group = true },
+    .{ .name = "FromBytes", .type_id = .group_from_bytes, .is_group = true },
+    .{ .name = "IntoBytes", .type_id = .group_into_bytes, .is_group = true },
 };
+
+/// $O(1)$ static lookup map from `@std_cap_boundary` capability names to `CapabilityBits` (`DR-17` §2.3).
+pub const CAPABILITY_NAME_MAP = std.StaticStringMap(u16).initComptime(.{
+    .{ "ClockEntropy", CapabilityBits.CLOCK_ENTROPY },
+    .{ "FfiUnsafe", CapabilityBits.FFI_UNSAFE },
+    .{ "HeapAlloc", CapabilityBits.HEAP_ALLOC },
+    .{ "IoAsync", CapabilityBits.IO_ASYNC },
+    .{ "IoFs", CapabilityBits.IO_FS },
+    .{ "IoNet", CapabilityBits.IO_NET },
+    .{ "MayPanic", CapabilityBits.MAY_PANIC },
+    .{ "ThreadSpawn", CapabilityBits.THREAD_SPAWN },
+    .{ "alloc", CapabilityBits.HEAP_ALLOC },
+    .{ "block", CapabilityBits.IO_ASYNC },
+    .{ "clock_entropy", CapabilityBits.CLOCK_ENTROPY },
+    .{ "ffi", CapabilityBits.FFI_UNSAFE },
+    .{ "ffi_unsafe", CapabilityBits.FFI_UNSAFE },
+    .{ "fs", CapabilityBits.IO_FS },
+    .{ "heap_alloc", CapabilityBits.HEAP_ALLOC },
+    .{ "io_async", CapabilityBits.IO_ASYNC },
+    .{ "io_fs", CapabilityBits.IO_FS },
+    .{ "io_net", CapabilityBits.IO_NET },
+    .{ "may_panic", CapabilityBits.MAY_PANIC },
+    .{ "net", CapabilityBits.IO_NET },
+    .{ "panic", CapabilityBits.MAY_PANIC },
+    .{ "thread_spawn", CapabilityBits.THREAD_SPAWN },
+    .{ "unsafe_op", CapabilityBits.FFI_UNSAFE },
+});
 
 /// Canonical `AttributeTarget` variant names for `@attribute_schema(targets = […])` typo suggestions.
 const ATTRIBUTE_TARGET_NAMES = [_][]const u8{
@@ -508,6 +652,52 @@ const ATTRIBUTE_TARGET_MAP = std.StaticStringMap(AttrTargetMask).initComptime(.{
     .{ "Variant", AttrTargetMask{ .has_variant_target = true } },
 });
 
+/// $O(1)$ static lookup map from `@repr(…)` integer/ABI argument names to discriminant bit widths.
+const REPR_TAG_BITS_MAP = std.StaticStringMap(u8).initComptime(.{
+    .{ "C", 32 },
+    .{ "i16", 16 },
+    .{ "i32", 32 },
+    .{ "i64", 64 },
+    .{ "i8", 8 },
+    .{ "u16", 16 },
+    .{ "u32", 32 },
+    .{ "u64", 64 },
+    .{ "u8", 8 },
+});
+
+/// $O(1)$ static lookup map from declaration `@attr` identifiers to `HeaderAttrKind`.
+const HEADER_ATTR_MAP = std.StaticStringMap(HeaderAttrKind).initComptime(.{
+    .{ "attribute_schema", .attribute_schema },
+    .{ "derive", .derive },
+    .{ "export", .export_attr },
+    .{ "extern", .extern_attr },
+    .{ "from", .from },
+    .{ "ifunc", .ifunc },
+    .{ "linear", .linear },
+    .{ "link_name", .link_name },
+    .{ "link_section", .link_section },
+    .{ "local", .local },
+    .{ "max_stack", .max_stack },
+    .{ "must_use", .must_use },
+    .{ "no_alloc", .no_alloc },
+    .{ "no_block", .no_block },
+    .{ "no_panic", .no_panic },
+    .{ "overload", .overload },
+    .{ "repr", .repr },
+    .{ "secret", .secret },
+    .{ "soa", .soa },
+    .{ "std_cap_boundary", .std_cap_boundary },
+    .{ "zero_pad", .zero_pad },
+});
+
+/// $O(1)$ static lookup map from built-in `@derive` trait identifiers to `DeriveMask` bits.
+const DERIVE_TRAIT_MAP = std.StaticStringMap(DeriveMask).initComptime(.{
+    .{ "Clone", DeriveMask{ .has_clone = true } },
+    .{ "Debug", DeriveMask{ .has_debug = true } },
+    .{ "Eq", DeriveMask{ .has_eq = true } },
+    .{ "Hash", DeriveMask{ .has_hash = true } },
+});
+
 // -------------------------------------- INTERNALS --------------------------------------
 
 // -------------- Scoped Hash Key & Lexeme Helpers --------------
@@ -515,7 +705,7 @@ const ATTRIBUTE_TARGET_MAP = std.StaticStringMap(AttrTargetMask).initComptime(.{
 /// Packs `(scope_id, symbol_id, namespace)` into a collision-free 64-bit lookup key.
 inline fn packScopedSymbolKey(scope_id: ScopeId, name: SymbolId, namespace: Namespace) u64 {
     const scope_part: u64 = @as(u64, scope_id.asInt() & 0x3FFF_FFFF);
-    const ns_part: u64 = @as(u64, @intFromEnum(namespace)) << 30;
+    const ns_part: u64 = @as(u64, @backingInt(namespace)) << 30;
     const sym_part: u64 = @as(u64, name.asInt()) << 32;
     return sym_part | ns_part | scope_part;
 }
@@ -737,6 +927,8 @@ pub const SymbolTable = struct {
     from_error_fn_defs: std.AutoHashMapUnmanaged(u64, DefId) = .empty,
     /// Registered `(target_ty, trait_sym_idx)` pairs from `impl Trait for Type` and `@derive(Trait)`.
     trait_impl_pairs: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// Maps an `impl Trait for Type` method `SymbolIndex.asInt()` to its implemented `trait_sym` `SymbolIndex`.
+    impl_method_trait: std.AutoHashMapUnmanaged(u32, SymbolIndex) = .empty,
     /// Deferred `use` imports queued during Pass 1 for Pass 2 cross-module resolution.
     pending_imports: std.ArrayListUnmanaged(PendingUseImport) = .empty,
     /// Global prelude `ScopeId` (`ScopeId.fromInt(0)`).
@@ -777,6 +969,7 @@ pub const SymbolTable = struct {
         self.from_error_pairs.deinit(self.allocator);
         self.from_error_fn_defs.deinit(self.allocator);
         self.trait_impl_pairs.deinit(self.allocator);
+        self.impl_method_trait.deinit(self.allocator);
         self.pending_imports.deinit(self.allocator);
         self.scope_arena.deinit();
         self.* = undefined;
@@ -803,6 +996,7 @@ pub const SymbolTable = struct {
         self.from_error_pairs.clearRetainingCapacity();
         self.from_error_fn_defs.clearRetainingCapacity();
         self.trait_impl_pairs.clearRetainingCapacity();
+        self.impl_method_trait.clearRetainingCapacity();
         self.pending_imports.clearRetainingCapacity();
         self.scope_arena.resetRetainingCapacity();
         self.std_meta_scope = .none;
@@ -1563,7 +1757,7 @@ pub fn emitPrivateAccessDiagnostic(
 
 // --------- Module Item Collection & `use` Resolution ----------
 
-/// Combined item modifier, `@derive`, and `@attribute_schema` metadata extracted from CST headers.
+/// Combined item modifier, `@derive`, `@attribute_schema`, and Phase 6 contract metadata extracted from CST headers.
 pub const ItemHeaderMetadata = struct {
     /// Extracted item visibility, modifier, and attribute flags.
     flags: SymbolFlags = .{},
@@ -1571,7 +1765,253 @@ pub const ItemHeaderMetadata = struct {
     derive_mask: DeriveMask = .{},
     /// Parsed `@attribute_schema(targets = …)` target bitmask.
     attr_target_mask: AttrTargetMask = .{},
+    /// Phase 6 contract, ownership, secret, zero-pad, and FFI attribute flags (`DR-17`, `DR-20`).
+    contract_flags: DeclContractFlags = .{},
+    /// Explicit stack frame budget in bytes when `contract_flags.has_max_stack` is `true` (`@max_stack(N)`).
+    max_stack_bytes: u32 = 0,
+    /// Capability bits explicitly emitted at an `@std_cap_boundary` (`DR-17` §2.3).
+    cap_emits_mask: u16 = 0,
+    /// Capability bits explicitly cleared/trusted at an `@std_cap_boundary` (`DR-17` §2.3).
+    cap_clears_mask: u16 = 0,
+    /// Inline decoded section name buffer when `contract_flags.has_link_section` is `true`.
+    link_section_buf: [256]u8 = undefined,
+    /// Valid byte length inside `link_section_buf`.
+    link_section_len: u16 = 0,
+    /// Explicit discriminant width in bits on `@repr(…)` items (`0` = default).
+    repr_tag_bits: u8 = 0,
+
+    /// Returns the decoded `@link_section` byte slice.
+    pub inline fn asLinkSectionSlice(self: *const ItemHeaderMetadata) []const u8 {
+        return self.link_section_buf[0..self.link_section_len];
+    }
 };
+
+/// Returns `true` if `section_name` targets a forbidden constructor/destructor/TLS/interpose section (`E0327`).
+pub fn isForbiddenExecutableSection(section_name: []const u8) bool {
+    const trimmed_full = std.mem.trim(u8, section_name, " \t\r\n");
+    if (trimmed_full.len == 0) return false;
+
+    var seg_iter = std.mem.splitScalar(u8, trimmed_full, ',');
+    while (seg_iter.next()) |raw_seg| {
+        const seg_trimmed = std.mem.trim(u8, raw_seg, " \t\r\n");
+        if (seg_trimmed.len == 0) continue;
+
+        var lower_buf: [128]u8 = undefined;
+        const copy_len = @min(seg_trimmed.len, lower_buf.len);
+        for (seg_trimmed[0..copy_len], 0..) |byte_val, i| {
+            lower_buf[i] = std.ascii.toLower(byte_val);
+        }
+        const seg = lower_buf[0..copy_len];
+
+        if (std.mem.eql(u8, seg, ".init") or
+            std.mem.startsWith(u8, seg, ".init.") or
+            std.mem.startsWith(u8, seg, ".init_array") or
+            std.mem.eql(u8, seg, ".fini") or
+            std.mem.startsWith(u8, seg, ".fini.") or
+            std.mem.startsWith(u8, seg, ".fini_array") or
+            std.mem.startsWith(u8, seg, ".preinit_array") or
+            std.mem.startsWith(u8, seg, ".ctors") or
+            std.mem.startsWith(u8, seg, ".dtors") or
+            std.mem.startsWith(u8, seg, ".crt$xc") or
+            std.mem.startsWith(u8, seg, ".crt$xi") or
+            std.mem.startsWith(u8, seg, ".crt$xl") or
+            std.mem.startsWith(u8, seg, ".crt$xp") or
+            std.mem.startsWith(u8, seg, ".crt$xt") or
+            std.mem.eql(u8, seg, ".tls") or
+            std.mem.startsWith(u8, seg, ".tls.") or
+            std.mem.startsWith(u8, seg, ".tls$") or
+            std.mem.startsWith(u8, seg, "__mod_init_func") or
+            std.mem.startsWith(u8, seg, "__mod_term_func") or
+            std.mem.startsWith(u8, seg, "__interpose") or
+            std.mem.startsWith(u8, seg, "__kmod_init") or
+            std.mem.startsWith(u8, seg, "__kmod_term") or
+            std.mem.startsWith(u8, seg, "__wasm_call_ctors"))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Strips outer quotes (`"…"` or `r#"…"#`) and decodes standard `\xNN` / `\u{…}` escapes into `out_buf`.
+fn unquoteAttrStringLexeme(lexeme: []const u8, out_buf: *[256]u8) []const u8 {
+    if (std.mem.startsWith(u8, lexeme, "r")) {
+        var hash_count: usize = 0;
+        var idx: usize = 1;
+        while (idx < lexeme.len and lexeme[idx] == '#') : (idx += 1) {
+            hash_count += 1;
+        }
+        if (idx < lexeme.len and lexeme[idx] == '"' and lexeme.len >= idx + 2 + hash_count) {
+            return lexeme[idx + 1 .. lexeme.len - 1 - hash_count];
+        }
+    }
+    const inner = if (lexeme.len >= 2 and lexeme[0] == '"' and lexeme[lexeme.len - 1] == '"')
+        lexeme[1 .. lexeme.len - 1]
+    else
+        lexeme;
+    if (std.mem.indexOfScalar(u8, inner, '\\') == null) return inner;
+
+    var out_len: usize = 0;
+    var i: usize = 0;
+    while (i < inner.len and out_len < out_buf.len) {
+        if (inner[i] != '\\' or i + 1 >= inner.len) {
+            out_buf[out_len] = inner[i];
+            out_len += 1;
+            i += 1;
+            continue;
+        }
+        const esc_ch = inner[i + 1];
+        i += 2;
+        switch (esc_ch) {
+            'n' => {
+                out_buf[out_len] = '\n';
+                out_len += 1;
+            },
+            'r' => {
+                out_buf[out_len] = '\r';
+                out_len += 1;
+            },
+            't' => {
+                out_buf[out_len] = '\t';
+                out_len += 1;
+            },
+            '0' => {
+                out_buf[out_len] = 0;
+                out_len += 1;
+            },
+            '\\', '"', '\'' => {
+                out_buf[out_len] = esc_ch;
+                out_len += 1;
+            },
+            'x' => {
+                if (i + 2 <= inner.len) {
+                    const hi_nibble = std.fmt.charToDigit(inner[i], 16) catch null;
+                    const lo_nibble = std.fmt.charToDigit(inner[i + 1], 16) catch null;
+                    if (hi_nibble != null and lo_nibble != null) {
+                        out_buf[out_len] = (@as(u8, hi_nibble.?) << 4) | @as(u8, lo_nibble.?);
+                        out_len += 1;
+                        i += 2;
+                        continue;
+                    }
+                }
+                out_buf[out_len] = 'x';
+                out_len += 1;
+            },
+            'u' => {
+                if (i < inner.len and inner[i] == '{') {
+                    if (std.mem.indexOfScalarPos(u8, inner, i + 1, '}')) |close_brace| {
+                        const hex_digits = inner[i + 1 .. close_brace];
+                        if (std.fmt.parseInt(u21, hex_digits, 16)) |codepoint| {
+                            if (std.unicode.utf8ValidCodepoint(codepoint) and out_len + 4 <= out_buf.len) {
+                                const encoded_len = std.unicode.utf8Encode(
+                                    codepoint,
+                                    out_buf[out_len .. out_len + 4],
+                                ) catch 0;
+                                out_len += encoded_len;
+                                i = close_brace + 1;
+                                continue;
+                            }
+                        } else |_| {}
+                    }
+                }
+                out_buf[out_len] = 'u';
+                out_len += 1;
+            },
+            else => {
+                out_buf[out_len] = esc_ch;
+                out_len += 1;
+            },
+        }
+    }
+    return out_buf[0..out_len];
+}
+
+/// Extracts an unsigned 32-bit integer value from a literal lexeme (allowing `_` separators and `0x`/`0b`/`0o` prefixes).
+fn extractAttrUint32Lexeme(lexeme: []const u8) ?u32 {
+    var clean_buf: [64]u8 = undefined;
+    var clean_len: usize = 0;
+    for (lexeme) |byte_val| {
+        if (byte_val == '_') continue;
+        if (clean_len >= clean_buf.len) return null;
+        clean_buf[clean_len] = byte_val;
+        clean_len += 1;
+    }
+    return std.fmt.parseInt(u32, clean_buf[0..clean_len], 0) catch null;
+}
+
+/// Extracts `emits` and `clears` capability bitmasks from `@std_cap_boundary(…)` inside `[arg_start .. attr_end)`.
+fn extractStdCapBoundaryMasks(
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    arg_start: usize,
+    attr_end: usize,
+    emits_out: *u16,
+    clears_out: *u16,
+) void {
+    var active_mode: enum { emits_mode, clears_mode } = .clears_mode;
+    var arg_cur = arg_start;
+    while (arg_cur < attr_end) : (arg_cur += 1) {
+        const arg_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cur)));
+        if (arg_leaf.subtree_size > 1 or arg_leaf.token.isNone() or
+            arg_leaf.token.asInt() >= token_buffer.countTokens())
+        {
+            continue;
+        }
+        const arg_kind = token_buffer.getToken(arg_leaf.token).kind;
+        if (!isIdentifierToken(arg_kind) and arg_kind != .string_lit) continue;
+        const raw_lex = extractTokenSlice(source, token_buffer, arg_leaf.token);
+        var unquote_buf: [256]u8 = undefined;
+        const ident_lex = if (arg_kind == .string_lit)
+            unquoteAttrStringLexeme(raw_lex, &unquote_buf)
+        else
+            raw_lex;
+
+        const next_tok = peekNextAttrLeafToken(token_buffer, cst_arena, arg_cur + 1, attr_end);
+        const next_kind: TokenKind = if (!next_tok.isNone())
+            token_buffer.getToken(next_tok).kind
+        else
+            .eof;
+        if (next_kind == .eq or next_kind == .colon) {
+            if (std.mem.eql(u8, ident_lex, "emits")) {
+                active_mode = .emits_mode;
+            } else if (std.mem.eql(u8, ident_lex, "clears")) {
+                active_mode = .clears_mode;
+            }
+            continue;
+        }
+        if (CAPABILITY_NAME_MAP.get(ident_lex)) |cap_bit| {
+            switch (active_mode) {
+                .emits_mode => emits_out.* |= cap_bit,
+                .clears_mode => clears_out.* |= cap_bit,
+            }
+        }
+    }
+}
+
+/// Extracts explicit discriminant bit width from `@repr(u8 | u16 | u32 | u64 | C)` inside `[arg_start .. attr_end)`.
+fn extractReprTagBits(
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    arg_start: usize,
+    attr_end: usize,
+) u8 {
+    var arg_cur = arg_start;
+    while (arg_cur < attr_end) : (arg_cur += 1) {
+        const arg_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cur)));
+        if (arg_leaf.subtree_size > 1 or arg_leaf.token.isNone() or
+            arg_leaf.token.asInt() >= token_buffer.countTokens())
+        {
+            continue;
+        }
+        const arg_kind = token_buffer.getToken(arg_leaf.token).kind;
+        if (arg_kind != .prim_type and !isIdentifierToken(arg_kind)) continue;
+        const repr_lex = extractTokenSlice(source, token_buffer, arg_leaf.token);
+        if (REPR_TAG_BITS_MAP.get(repr_lex)) |tag_bits| return tag_bits;
+    }
+    return 0;
+}
 
 /// Returns the next leaf `TokenIndex` inside `[start_cursor .. attr_end)`, or `.none` if exhausted.
 fn peekNextAttrLeafToken(
@@ -1661,7 +2101,7 @@ fn emitInvalidAttributeSchemaToken(
     }
 }
 
-/// Extracts and validates `@attribute_schema(...)` target arguments inside `[arg_start .. attr_end)`.
+/// Extracts and validates `@attribute_schema(…)` target arguments inside `[arg_start .. attr_end)`.
 fn extractAttributeSchemaTargets(
     source: []const u8,
     file_id: FileId,
@@ -1754,7 +2194,136 @@ fn extractAttributeSchemaTargets(
     return parsed_mask;
 }
 
-/// Extracts item flags, `comptime` modifier, `@derive(...)`, and `@attribute_schema(...)` metadata from `item_cst`.
+/// Extracts `@link_section(…)` section bytes inside `[arg_start .. attr_end)` and enforces `E0327`.
+fn extractLinkSectionAttr(
+    source: []const u8,
+    file_id: FileId,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    arg_start: usize,
+    attr_end: usize,
+    meta: *ItemHeaderMetadata,
+    diagnostic_sink: ?*DiagnosticSink,
+) !void {
+    meta.contract_flags.has_link_section = true;
+    var sec_cur = arg_start;
+    while (sec_cur < attr_end) : (sec_cur += 1) {
+        const sec_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(sec_cur)));
+        if (sec_leaf.subtree_size <= 1 and !sec_leaf.token.isNone() and
+            sec_leaf.token.asInt() < token_buffer.countTokens())
+        {
+            if (token_buffer.getToken(sec_leaf.token).kind == .string_lit) {
+                const sec_raw = extractTokenSlice(source, token_buffer, sec_leaf.token);
+                var unesc_buf: [256]u8 = undefined;
+                const sec_name = unquoteAttrStringLexeme(sec_raw, &unesc_buf);
+                const copy_len = @min(sec_name.len, meta.link_section_buf.len);
+                @memcpy(meta.link_section_buf[0..copy_len], sec_name[0..copy_len]);
+                meta.link_section_len = @intCast(copy_len);
+                if (isForbiddenExecutableSection(sec_name)) {
+                    if (diagnostic_sink) |sink| {
+                        const sec_span = token_buffer.getTokenSpan(file_id, sec_leaf.token);
+                        const msg = try std.fmt.allocPrint(
+                            sink.arena.asAllocator(),
+                            "forbidden executable/constructor section `{s}` in `@link_section`",
+                            .{sec_name},
+                        );
+                        const labels = [1]LabeledSpan{
+                            .{
+                                .span = sec_span,
+                                .label = "constructor/destructor/TLS section bypasses `main(ctx)` capability root",
+                                .style = .primary,
+                            },
+                        };
+                        _ = try sink.emit(.{
+                            .code = .e0327_forbidden_sandbox_bypass_attribute,
+                            .severity = .err,
+                            .primary_span = sec_span,
+                            .message = msg,
+                            .labels = &labels,
+                        });
+                    }
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// Extracts `@max_stack(…)` byte budget inside `[arg_start .. attr_end)` and validates 32-bit bounds.
+fn extractMaxStackAttr(
+    source: []const u8,
+    file_id: FileId,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    attr_token: TokenIndex,
+    arg_start: usize,
+    attr_end: usize,
+    meta: *ItemHeaderMetadata,
+    diagnostic_sink: ?*DiagnosticSink,
+) !void {
+    meta.contract_flags.has_max_stack = true;
+    var has_minus = false;
+    var has_parsed_limit = false;
+    var has_overflow = false;
+    var diag_tok: TokenIndex = attr_token;
+    var stk_cur = arg_start;
+    while (stk_cur < attr_end) : (stk_cur += 1) {
+        const stk_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(stk_cur)));
+        if (stk_leaf.subtree_size <= 1 and !stk_leaf.token.isNone() and
+            stk_leaf.token.asInt() < token_buffer.countTokens())
+        {
+            const stk_kind = token_buffer.getToken(stk_leaf.token).kind;
+            if (stk_kind == .lparen or stk_kind == .rparen) continue;
+            if (stk_kind == .minus) {
+                has_minus = true;
+                diag_tok = stk_leaf.token;
+                continue;
+            }
+            diag_tok = stk_leaf.token;
+            if (stk_kind == .int_lit and !has_minus) {
+                const stk_lex = extractTokenSlice(source, token_buffer, stk_leaf.token);
+                if (extractAttrUint32Lexeme(stk_lex)) |parsed_bytes| {
+                    meta.max_stack_bytes = parsed_bytes;
+                    has_parsed_limit = true;
+                } else {
+                    has_overflow = true;
+                }
+            }
+            break;
+        }
+    }
+    if (!has_parsed_limit) {
+        if (diagnostic_sink) |sink| {
+            const bad_span = token_buffer.getTokenSpan(file_id, diag_tok);
+            const err_code: diagnostic.DiagnosticCode = if (has_overflow)
+                .e0103_invalid_numeric_literal
+            else
+                .e0406_range_refinement_violation;
+            const err_msg: []const u8 = if (has_minus)
+                "`@max_stack` byte budget cannot be negative"
+            else if (has_overflow)
+                "`@max_stack` byte budget overflows maximum 32-bit frame limit"
+            else
+                "`@max_stack` requires a non-negative 32-bit integer byte limit";
+            const labels = [1]LabeledSpan{
+                .{
+                    .span = bad_span,
+                    .label = "invalid `@max_stack` byte budget here",
+                    .style = .primary,
+                },
+            };
+            _ = try sink.emit(.{
+                .code = err_code,
+                .severity = .err,
+                .primary_span = bad_span,
+                .message = err_msg,
+                .labels = &labels,
+            });
+        }
+    }
+}
+
+/// Extracts item flags, `comptime` modifier, `@derive(…)`, and `@attribute_schema(…)` metadata from `item_cst`.
 pub fn extractItemHeaderMetadata(
     source: []const u8,
     token_buffer: *const TokenBuffer,
@@ -1773,7 +2342,7 @@ pub fn extractItemHeaderMetadata(
     ) catch ItemHeaderMetadata{};
 }
 
-/// Extracts item header metadata while validating `@attribute_schema(...)` targets into `diagnostic_sink`.
+/// Extracts item header metadata while validating `@attribute_schema(…)` targets into `diagnostic_sink`.
 pub fn extractItemHeaderMetadataValidated(
     source: []const u8,
     file_id: FileId,
@@ -1827,49 +2396,117 @@ pub fn extractItemHeaderMetadataValidated(
                     const tok_kind = token_buffer.getToken(leaf.token).kind;
                     if (isIdentifierToken(tok_kind) or tok_kind == .kw_pub) {
                         const attr_name = extractTokenSlice(source, token_buffer, leaf.token);
-                        if (std.mem.eql(u8, attr_name, "overload")) {
-                            meta.flags.is_overload = true;
-                        } else if (std.mem.eql(u8, attr_name, "must_use")) {
-                            meta.flags.is_must_use = true;
-                        } else if (std.mem.eql(u8, attr_name, "from")) {
-                            meta.flags.is_from_error = true;
-                        } else if (std.mem.eql(u8, attr_name, "soa")) {
-                            meta.flags.is_soa_annotated = true;
-                        } else if (std.mem.eql(u8, attr_name, "extern")) {
-                            meta.flags.is_extern = true;
-                        } else if (std.mem.eql(u8, attr_name, "derive")) {
-                            var arg_cur = attr_cur + 1;
-                            while (arg_cur < attr_end) : (arg_cur += 1) {
-                                const arg_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cur)));
-                                if (arg_leaf.subtree_size <= 1 and !arg_leaf.token.isNone() and
-                                    arg_leaf.token.asInt() < token_buffer.countTokens())
-                                {
-                                    const arg_kind = token_buffer.getToken(arg_leaf.token).kind;
-                                    if (isIdentifierToken(arg_kind)) {
-                                        const trait_lex = extractTokenSlice(source, token_buffer, arg_leaf.token);
-                                        if (std.mem.eql(u8, trait_lex, "Eq")) {
-                                            meta.derive_mask.has_eq = true;
-                                        } else if (std.mem.eql(u8, trait_lex, "Hash")) {
-                                            meta.derive_mask.has_hash = true;
-                                        } else if (std.mem.eql(u8, trait_lex, "Debug")) {
-                                            meta.derive_mask.has_debug = true;
-                                        } else if (std.mem.eql(u8, trait_lex, "Clone")) {
-                                            meta.derive_mask.has_clone = true;
+                        if (HEADER_ATTR_MAP.get(attr_name)) |attr_kind| {
+                            switch (attr_kind) {
+                                .overload => meta.flags.is_overload = true,
+                                .must_use => meta.flags.is_must_use = true,
+                                .from => meta.flags.is_from_error = true,
+                                .soa => meta.flags.is_soa_annotated = true,
+                                .extern_attr => meta.flags.is_extern = true,
+                                .no_alloc => meta.contract_flags.is_no_alloc = true,
+                                .no_panic => meta.contract_flags.is_no_panic = true,
+                                .no_block => meta.contract_flags.is_no_block = true,
+                                .linear => meta.contract_flags.is_linear = true,
+                                .zero_pad => meta.contract_flags.is_zero_pad = true,
+                                .secret => meta.contract_flags.is_secret = true,
+                                .export_attr => meta.contract_flags.is_export = true,
+                                .local => meta.contract_flags.is_local_only = true,
+                                .link_name => meta.contract_flags.has_link_name = true,
+                                .ifunc => {
+                                    meta.contract_flags.is_ifunc = true;
+                                    if (diagnostic_sink) |sink| {
+                                        const ifunc_span = token_buffer.getTokenSpan(file_id, leaf.token);
+                                        const labels = [1]LabeledSpan{
+                                            .{
+                                                .span = ifunc_span,
+                                                .label = "dynamic loader resolver bypasses `main(ctx)` capability root",
+                                                .style = .primary,
+                                            },
+                                        };
+                                        _ = try sink.emit(.{
+                                            .code = .e0327_forbidden_sandbox_bypass_attribute,
+                                            .severity = .err,
+                                            .primary_span = ifunc_span,
+                                            .message = "forbidden `@ifunc` indirect function resolver attribute",
+                                            .labels = &labels,
+                                        });
+                                    }
+                                },
+                                .link_section => try extractLinkSectionAttr(
+                                    source,
+                                    file_id,
+                                    token_buffer,
+                                    cst_arena,
+                                    attr_cur + 1,
+                                    attr_end,
+                                    &meta,
+                                    diagnostic_sink,
+                                ),
+                                .max_stack => try extractMaxStackAttr(
+                                    source,
+                                    file_id,
+                                    token_buffer,
+                                    cst_arena,
+                                    leaf.token,
+                                    attr_cur + 1,
+                                    attr_end,
+                                    &meta,
+                                    diagnostic_sink,
+                                ),
+                                .std_cap_boundary => {
+                                    meta.contract_flags.is_std_cap_boundary = true;
+                                    extractStdCapBoundaryMasks(
+                                        source,
+                                        token_buffer,
+                                        cst_arena,
+                                        attr_cur + 1,
+                                        attr_end,
+                                        &meta.cap_emits_mask,
+                                        &meta.cap_clears_mask,
+                                    );
+                                },
+                                .repr => {
+                                    meta.repr_tag_bits = extractReprTagBits(
+                                        source,
+                                        token_buffer,
+                                        cst_arena,
+                                        attr_cur + 1,
+                                        attr_end,
+                                    );
+                                },
+                                .derive => {
+                                    var arg_cur = attr_cur + 1;
+                                    while (arg_cur < attr_end) : (arg_cur += 1) {
+                                        const arg_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cur)));
+                                        if (arg_leaf.subtree_size <= 1 and !arg_leaf.token.isNone() and
+                                            arg_leaf.token.asInt() < token_buffer.countTokens())
+                                        {
+                                            const arg_kind = token_buffer.getToken(arg_leaf.token).kind;
+                                            if (isIdentifierToken(arg_kind)) {
+                                                const trait_lex = extractTokenSlice(source, token_buffer, arg_leaf.token);
+                                                if (DERIVE_TRAIT_MAP.get(trait_lex)) |trait_bit| {
+                                                    meta.derive_mask = @bitCast(
+                                                        @as(u8, @bitCast(meta.derive_mask)) |
+                                                            @as(u8, @bitCast(trait_bit)),
+                                                    );
+                                                }
+                                            }
                                         }
                                     }
-                                }
+                                },
+                                .attribute_schema => {
+                                    meta.flags.is_attribute_schema = true;
+                                    meta.attr_target_mask = try extractAttributeSchemaTargets(
+                                        source,
+                                        file_id,
+                                        token_buffer,
+                                        cst_arena,
+                                        attr_cur + 1,
+                                        attr_end,
+                                        diagnostic_sink,
+                                    );
+                                },
                             }
-                        } else if (std.mem.eql(u8, attr_name, "attribute_schema")) {
-                            meta.flags.is_attribute_schema = true;
-                            meta.attr_target_mask = try extractAttributeSchemaTargets(
-                                source,
-                                file_id,
-                                token_buffer,
-                                cst_arena,
-                                attr_cur + 1,
-                                attr_end,
-                                diagnostic_sink,
-                            );
                         }
                         break;
                     }
@@ -2038,6 +2675,11 @@ fn collectItemSliceInScope(
         );
         var flags = header_meta.flags;
         const visibility: Visibility = if (flags.is_pub) .public else .private;
+        const link_sec_slice = header_meta.asLinkSectionSlice();
+        const interned_link_sec: []const u8 = if (link_sec_slice.len > 0)
+            interner.get(try interner.intern(link_sec_slice))
+        else
+            "";
 
         switch (ast_node.tag) {
             .mod_decl => {
@@ -2142,6 +2784,12 @@ fn collectItemSliceInScope(
                     .target_scope = member_scope,
                     .derive_mask = header_meta.derive_mask,
                     .attr_target_mask = header_meta.attr_target_mask,
+                    .contract_flags = header_meta.contract_flags,
+                    .max_stack_bytes = header_meta.max_stack_bytes,
+                    .cap_emits_mask = header_meta.cap_emits_mask,
+                    .cap_clears_mask = header_meta.cap_clears_mask,
+                    .link_section_name = interned_link_sec,
+                    .repr_tag_bits = header_meta.repr_tag_bits,
                 }, diagnostic_sink);
 
                 try collectStructOrBitFieldMembers(
@@ -2185,6 +2833,12 @@ fn collectItemSliceInScope(
                     .target_scope = variant_scope,
                     .derive_mask = header_meta.derive_mask,
                     .attr_target_mask = header_meta.attr_target_mask,
+                    .contract_flags = header_meta.contract_flags,
+                    .max_stack_bytes = header_meta.max_stack_bytes,
+                    .cap_emits_mask = header_meta.cap_emits_mask,
+                    .cap_clears_mask = header_meta.cap_clears_mask,
+                    .link_section_name = interned_link_sec,
+                    .repr_tag_bits = header_meta.repr_tag_bits,
                 }, diagnostic_sink);
 
                 try collectEnumVariants(
@@ -2227,6 +2881,7 @@ fn collectItemSliceInScope(
                     .cst_node = item_cst,
                     .decl_span = name_span,
                     .target_scope = trait_scope,
+                    .contract_flags = header_meta.contract_flags,
                 }, diagnostic_sink);
 
                 if (ast_node.lhs.tag == .extra and ast_node.rhs.tag == .extra and ast_node.rhs.payload > 0) {
@@ -2299,6 +2954,9 @@ fn collectItemSliceInScope(
                     .cst_node = item_cst,
                     .decl_span = name_span,
                     .target_scope = bf_member_scope,
+                    .contract_flags = header_meta.contract_flags,
+                    .link_section_name = interned_link_sec,
+                    .repr_tag_bits = header_meta.repr_tag_bits,
                 }, diagnostic_sink);
 
                 if (alias_kind == .bit_field_sym and !bf_member_scope.isNone()) {
@@ -2335,6 +2993,8 @@ fn collectItemSliceInScope(
                     .ast_node = item_node_idx,
                     .cst_node = item_cst,
                     .decl_span = name_span,
+                    .contract_flags = header_meta.contract_flags,
+                    .link_section_name = interned_link_sec,
                 }, diagnostic_sink);
             },
             .fn_decl => {
@@ -2358,11 +3018,16 @@ fn collectItemSliceInScope(
                     .ast_node = item_node_idx,
                     .cst_node = item_cst,
                     .decl_span = name_span,
+                    .contract_flags = header_meta.contract_flags,
+                    .max_stack_bytes = header_meta.max_stack_bytes,
+                    .cap_emits_mask = header_meta.cap_emits_mask,
+                    .cap_clears_mask = header_meta.cap_clears_mask,
+                    .link_section_name = interned_link_sec,
                 }, diagnostic_sink);
             },
             .impl_decl => {
                 // Collect methods inside `impl [Trait for] TargetType { … }` into `TargetType`'s member scope:
-                const target_scope = try resolveImplTargetScope(
+                const impl_target = try resolveImplTargetScope(
                     sym_table,
                     interner,
                     file_id,
@@ -2376,11 +3041,12 @@ fn collectItemSliceInScope(
                     ast_arena,
                 );
                 const member_items = extractImplMemberItems(ast_arena, item_node_idx);
+                const pre_sym_len = sym_table.symbols.items.len;
                 try collectItemSliceInScope(
                     sym_table,
                     interner,
                     file_id,
-                    target_scope,
+                    impl_target.target_scope,
                     false,
                     def_id,
                     member_items,
@@ -2390,6 +3056,19 @@ fn collectItemSliceInScope(
                     ast_arena,
                     diagnostic_sink,
                 );
+                if (!impl_target.trait_sym_idx.isNone()) {
+                    var sym_i = pre_sym_len;
+                    while (sym_i < sym_table.symbols.items.len) : (sym_i += 1) {
+                        const added_sym = sym_table.symbols.items[sym_i];
+                        if (added_sym.kind == .fn_sym and added_sym.scope_id == impl_target.target_scope) {
+                            try sym_table.impl_method_trait.put(
+                                sym_table.allocator,
+                                @intCast(sym_i),
+                                impl_target.trait_sym_idx,
+                            );
+                        }
+                    }
+                }
             },
             else => {},
         }
@@ -2426,7 +3105,15 @@ pub fn extractImplMemberItems(ast_arena: *const AstArena, impl_node_idx: NodeInd
     return ast_arena.extra_data.items[start_extra..end_extra];
 }
 
-/// Finds or creates the member `ScopeId` for the target type of an `impl` block.
+/// Target member scope and optional implemented `trait_sym` resolved for an `impl` header.
+const ImplTargetResolution = struct {
+    /// Member scope receiving `impl` methods.
+    target_scope: ScopeId,
+    /// Implemented `.trait_sym` when `impl Trait for Type` is resolved (`SymbolIndex.none` for inherent `impl Type`).
+    trait_sym_idx: SymbolIndex,
+};
+
+/// Finds or creates the member `ScopeId` and implemented `trait_sym` for an `impl` block.
 fn resolveImplTargetScope(
     sym_table: *SymbolTable,
     interner: *StringInterner,
@@ -2439,8 +3126,9 @@ fn resolveImplTargetScope(
     token_buffer: *const TokenBuffer,
     cst_arena: *const LosslessCstArena,
     ast_arena: *const AstArena,
-) !ScopeId {
+) !ImplTargetResolution {
     _ = ast_arena;
+    var trait_sym_idx: SymbolIndex = .none;
     if (!item_cst.isNone() and item_cst.asInt() < cst_arena.countNodes()) {
         const start_idx: usize = item_cst.asInt();
         const root_rec = cst_arena.getNode(item_cst);
@@ -2483,6 +3171,18 @@ fn resolveImplTargetScope(
             }
         }
 
+        if (has_seen_for and first_type_name.len > 0) {
+            const trait_id = try interner.intern(first_type_name);
+            switch (sym_table.lookupLexical(enclosing_scope, trait_id, NamespaceMask.TYPE_ONLY)) {
+                .found => |found_trait| {
+                    if (sym_table.getSymbol(found_trait).kind == .trait_sym) {
+                        trait_sym_idx = found_trait;
+                    }
+                },
+                else => {},
+            }
+        }
+
         const target_type_name = if (has_seen_for and after_for_type_name.len > 0)
             after_for_type_name
         else
@@ -2494,7 +3194,12 @@ fn resolveImplTargetScope(
             switch (lookup) {
                 .found => |sym_idx| {
                     const sym = sym_table.getSymbol(sym_idx);
-                    if (!sym.target_scope.isNone()) return sym.target_scope;
+                    if (!sym.target_scope.isNone()) {
+                        return .{
+                            .target_scope = sym.target_scope,
+                            .trait_sym_idx = trait_sym_idx,
+                        };
+                    }
                     const created_scope = try sym_table.scope_arena.allocScope(
                         .nominal_type_scope,
                         enclosing_scope,
@@ -2503,20 +3208,26 @@ fn resolveImplTargetScope(
                         .{},
                     );
                     sym_table.getSymbolMut(sym_idx).target_scope = created_scope;
-                    return created_scope;
+                    return .{
+                        .target_scope = created_scope,
+                        .trait_sym_idx = trait_sym_idx,
+                    };
                 },
                 else => {},
             }
         }
     }
 
-    return sym_table.scope_arena.allocScope(
-        .impl_scope,
-        enclosing_scope,
-        def_id,
-        file_id,
-        .{},
-    );
+    return .{
+        .target_scope = try sym_table.scope_arena.allocScope(
+            .impl_scope,
+            enclosing_scope,
+            def_id,
+            file_id,
+            .{},
+        ),
+        .trait_sym_idx = trait_sym_idx,
+    };
 }
 
 /// Collects `.struct_field` CST nodes inside a `struct`, `union`, or `bit_field` declaration into `member_scope`.

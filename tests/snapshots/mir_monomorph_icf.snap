@@ -87,7 +87,7 @@ mir fn @run_mono_icf_entry(params: 1) [contextless] [ghost_stripped] {
     %62 = bin_op.sadd_checked %61, %148
     %63 = bin_op.sadd_checked %62, %51
     %64 = const_scalar (20, 0)
-    %65 = fn_addr (2, 46)
+    %65 = fn_addr (2, 49)
     term call [val=%4] -> ^bb5()
   ^bb1() [preds: 0]:
     term unreachable_term

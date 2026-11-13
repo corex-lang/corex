@@ -92,6 +92,10 @@ pub const TypeGroupMask = struct {
     pub const SCALAR: u32 = NUMBER | TypeId.bool_ty.primitiveBit() | TypeId.char_ty.primitiveBit();
     /// `Copy = Scalar | str | never | unit` (all 19 primitives, slots `0..18`).
     pub const COPY: u32 = (1 << 19) - 1;
+    /// `FromBytes = Integer | Float | unit` (excludes `bool`, `char`, `str`, `never`, `DR-20` `D-01`).
+    pub const FROM_BYTES: u32 = INTEGER | FLOAT | TypeId.unit_ty.primitiveBit();
+    /// `IntoBytes = FromBytes | bool | char` (excludes `str` and `never`, `DR-20` `D-01`).
+    pub const INTO_BYTES: u32 = FROM_BYTES | TypeId.bool_ty.primitiveBit() | TypeId.char_ty.primitiveBit();
 
     /// Returns `true` if `prim_ty` (`0..18`) is a member of `group_mask` in $O(1)$ bit-test time.
     pub inline fn containsPrimitive(group_mask: u32, prim_ty: TypeId) bool {
@@ -103,7 +107,7 @@ pub const TypeGroupMask = struct {
         return (sub_mask & ~super_mask) == 0;
     }
 
-    /// Returns the canonical 32-bit `TypeGroupMask` for a built-in group `TypeId` (`32..42`).
+    /// Returns the canonical 32-bit `TypeGroupMask` for a built-in group `TypeId` (`32..44`).
     pub inline fn forBuiltinGroup(group_id: TypeId) u32 {
         return switch (group_id) {
             .group_signed => SIGNED,
@@ -117,6 +121,8 @@ pub const TypeGroupMask = struct {
             .group_bytes => BYTES,
             .group_scalar => SCALAR,
             .group_copy => COPY,
+            .group_from_bytes => FROM_BYTES,
+            .group_into_bytes => INTO_BYTES,
             else => 0,
         };
     }
@@ -198,10 +204,57 @@ pub const TypeFlags = packed struct(u8) {
     is_must_use: bool = false,
     /// `true` if this type has a statically known compile-time size.
     is_sized: bool = true,
-    /// `true` if this type carries `#soa` layout.
-    is_soa: bool = false,
-    /// `true` if this type has a custom destructor (`Drop`).
+    /// `true` if this type is or transitively contains a `@secret` value (`DR-20` `D-02`, Seam #1).
+    is_secret: bool = false,
+    /// `true` if this type has an automatic or custom destructor (`AutoDrop` / `Drop`).
     has_drop: bool = false,
+
+    comptime {
+        std.debug.assert(@sizeOf(TypeFlags) == 1);
+    }
+};
+
+/// Three-tier value ownership classification (`DR-06` §1.2).
+pub const OwnershipTier = enum(u8) {
+    /// Tier 1: Bitwise copyable value (`Copy` primitives, slices, `&T`, `*T`, `fn`, `@local` closures).
+    copy_tier = 0,
+    /// Tier 2: Owned value with deterministic scope-exit `Drop`/`AutoDrop` (`Vec[T]`, `String`, `Map[K, V]`).
+    auto_drop_tier = 1,
+    /// Tier 3: Must-consume `@linear` resource (`Arena`, `File`, `Socket`, `PgTx`, `&mut T` linear loan).
+    linear_tier = 2,
+
+    /// Returns the stricter (higher-ranked) of two `OwnershipTier` values.
+    pub inline fn maxTier(lhs_tier: OwnershipTier, rhs_tier: OwnershipTier) OwnershipTier {
+        return if (@backingInt(lhs_tier) >= @backingInt(rhs_tier)) lhs_tier else rhs_tier;
+    }
+};
+
+/// 1-byte bit-packed contract guarantees carried on `.fn_ty` and `.closure_ty` signatures (`DR-17`, `[CRITICAL-07]`).
+pub const FnPtrContractMask = packed struct(u8) {
+    /// `true` if the function type guarantees `@no_alloc` (`E0320` on violation).
+    has_no_alloc: bool = false,
+    /// `true` if the function type guarantees `@no_panic` (`E0321` on violation).
+    has_no_panic: bool = false,
+    /// `true` if the function type guarantees `@no_block` (`E0322` on violation).
+    has_no_block: bool = false,
+    /// Reserved zero bits keeping `FnPtrContractMask` at `1` byte.
+    _reserved: u5 = 0,
+
+    comptime {
+        std.debug.assert(@sizeOf(FnPtrContractMask) == 1);
+    }
+
+    /// Returns `true` if any contract bit is set on `self`.
+    pub inline fn hasAny(self: FnPtrContractMask) bool {
+        return @as(u8, @bitCast(self)) != 0;
+    }
+
+    /// Returns `true` if `self` guarantees every contract bit required by `required`.
+    pub inline fn isSatisfying(self: FnPtrContractMask, required: FnPtrContractMask) bool {
+        const self_bits: u8 = @bitCast(self);
+        const req_bits: u8 = @bitCast(required);
+        return (self_bits & req_bits) == req_bits;
+    }
 };
 
 /// Parameter passing convention mode (`DR-02` Section 1.1 & `DR-04` Section 2.2).
@@ -264,6 +317,10 @@ pub const FnSignatureView = struct {
     param_types: []const u32,
     /// Slice of packed `ParamMode` values (`arity` elements).
     param_modes: []const u32,
+    /// Contract guarantees packed in bits `16..23` of `extra[node.lhs]` (`[CRITICAL-07]`).
+    contracts: FnPtrContractMask = .{},
+    /// Closure environment ownership tier packed in bits `24..25` of `extra[node.lhs]`.
+    capture_tier: OwnershipTier = .copy_tier,
 
     /// Returns the number of parameters in the signature.
     pub inline fn paramCount(self: FnSignatureView) usize {
@@ -279,7 +336,7 @@ pub const FnSignatureView = struct {
     /// Returns the `ParamMode` of parameter `idx`.
     pub inline fn getParamMode(self: FnSignatureView, idx: usize) ParamMode {
         if (idx >= self.param_modes.len) return .let_mode;
-        return @enumFromInt(@as(u2, @truncate(self.param_modes[idx])));
+        return @fromBackingInt(@intCast(@as(u2, @truncate(self.param_modes[idx]))));
     }
 };
 
@@ -459,6 +516,47 @@ pub const SubstitutionMap = struct {
                 }
                 break :blk try pool.internTuple(subst_elems);
             },
+            .struct_ty, .enum_ty, .union_ty => blk: {
+                const raw_args = pool.getGenericTypeArgs(ty);
+                if (raw_args.len == 0) break :blk ty;
+                const subst_args = try pool.allocator.alloc(TypeId, raw_args.len);
+                defer pool.allocator.free(subst_args);
+                for (raw_args, 0..) |raw_arg, i| {
+                    subst_args[i] = try self.applyBounded(
+                        pool,
+                        TypeId.fromInt(raw_arg),
+                        depth + 1,
+                    );
+                }
+                break :blk try pool.internNominalInstantiation(
+                    ty,
+                    subst_args,
+                    node.flags.is_copy,
+                    node.flags.has_drop,
+                );
+            },
+            .fn_ty, .closure_ty => blk: {
+                const sig_view = pool.getFnSignatureView(ty) orelse break :blk ty;
+                const arity = sig_view.paramCount();
+                const subst_params = try pool.allocator.alloc(TypeId, arity);
+                defer if (arity > 0) pool.allocator.free(subst_params);
+                const subst_modes = try pool.allocator.alloc(ParamMode, arity);
+                defer if (arity > 0) pool.allocator.free(subst_modes);
+                for (0..arity) |i| {
+                    subst_params[i] = try self.applyBounded(pool, sig_view.getParamType(i), depth + 1);
+                    subst_modes[i] = sig_view.getParamMode(i);
+                }
+                const subst_ret = try self.applyBounded(pool, sig_view.ret_ty, depth + 1);
+                break :blk try pool.internFnWithContractsAndCapture(
+                    node.tag,
+                    subst_params,
+                    subst_modes,
+                    subst_ret,
+                    node.flags.is_must_use,
+                    sig_view.contracts,
+                    sig_view.capture_tier,
+                );
+            },
             else => ty,
         };
     }
@@ -532,14 +630,103 @@ pub const AttrInstance = struct {
     target_symbol: SymbolIndex,
     /// Enclosing top-level item `DefId` (`DefId.NONE` when module-scoped without a `DefId`).
     owner_def_id: DefId,
-    /// Source span of the `@Schema(...)` attribute application.
+    /// Source span of the `@Schema(…)` attribute application.
     attr_span: Span,
     /// Owned slice of validated constant field initializers.
     fields: []AttrFieldInit,
 };
 
-/// Per-body AST-window-scoped semantic side tables extracted from `TypeChecker` (`[CRITICAL-11]`).
-///
+/// Canonical field slots exposed on `Context` (`DR-20` `D-04`, `D-06B`, Seam #2).
+pub const ContextFieldKind = enum(u8) {
+    /// Dynamic allocator capability handle (`allocator`).
+    allocator = 0,
+    /// Dual-ping-pong scratch arena array (`scratch: [BumpArena; 2]`, `D-04`).
+    scratch = 1,
+    /// Per-context deterministic PRNG seed (`rng_seed: u64`).
+    rng_seed = 2,
+    /// Nullable lock-free crash-flight-recorder ring pointer (`trace_sink: (*mut u8)?`, `D-06B`, Seam #2).
+    trace_sink = 3,
+};
+
+/// Canonical `Context` seam layout metadata (`DR-20` `D-04`, `D-06B`, Seam #2).
+pub const ContextFieldLayout = struct {
+    /// Canonical field name on `Context`.
+    name: []const u8,
+    /// Logical `ContextFieldKind` slot.
+    kind: ContextFieldKind,
+    /// Zero-based canonical slot ordinal.
+    slot_ordinal: u8,
+
+    /// Canonical 4-slot `Context` seam layout table.
+    pub const CANONICAL_FIELDS = [4]ContextFieldLayout{
+        .{ .name = "allocator", .kind = .allocator, .slot_ordinal = 0 },
+        .{ .name = "scratch", .kind = .scratch, .slot_ordinal = 1 },
+        .{ .name = "rng_seed", .kind = .rng_seed, .slot_ordinal = 2 },
+        .{ .name = "trace_sink", .kind = .trace_sink, .slot_ordinal = 3 },
+    };
+
+    /// Resolves `field_name` against `CANONICAL_FIELDS`, returning `null` if unknown.
+    pub fn fromFieldName(field_name: []const u8) ?ContextFieldLayout {
+        return CONTEXT_FIELD_LAYOUT_MAP.get(field_name);
+    }
+};
+
+/// Exact wire-layout safety failure reason reported by `E0315` (`DR-20` `D-01`, `[CRITICAL-08]`).
+pub const WireLayoutViolationReason = enum(u8) {
+    /// Type carries `@secret` (`is_secret == true`) and cannot cross raw byte boundaries.
+    secret_type = 0,
+    /// Type belongs to `AutoDrop` or `@linear` ownership tier (`has_drop` or linear resource).
+    non_copy_ownership = 1,
+    /// Type contains pointers, references, slices, `str`, function pointers, closures, or `dyn Trait`.
+    indirection_or_handle = 2,
+    /// Type has invalid bit patterns (`bool`, `char`, `never`, `T?`, `Result`, or non-exhaustive `enum`).
+    invalid_bit_patterns = 3,
+    /// Refinement `T is low..=high` narrows the domain of its base integer type.
+    refinement_narrows_domain = 4,
+    /// Struct or tuple contains unzeroed inter-field padding without `@zero_pad`.
+    unzeroed_inter_field_padding = 5,
+    /// Struct or tuple contains unzeroed tail padding without `@zero_pad`.
+    unzeroed_tail_padding = 6,
+    /// `union` lacks `@zero_pad` required to zero inactive variant tail bytes before `IntoBytes`.
+    union_requires_zero_pad = 7,
+    /// `@bit_cast[Dst](src)` source and destination byte sizes differ.
+    size_mismatch = 8,
+};
+
+/// Structured layout diagnostic explanation for `E0315` wire-contract violations.
+pub const WireLayoutViolation = struct {
+    /// Primary violation classification.
+    reason: WireLayoutViolationReason,
+    /// Exact byte offset where padding or invalid bit-pattern member begins.
+    byte_offset: u64 = 0,
+    /// Number of uninitialized padding bytes (or expected size on `.size_mismatch`).
+    padding_bytes: u64 = 0,
+    /// Offending field/type identifier when applicable (`""` for anonymous primitives/tuples).
+    field_name: []const u8 = "",
+};
+
+/// Selector distinguishing `.narrow` (trapping/checked) vs. `.try_narrow` (`Option`-returning) (`DR-20` `D-11`).
+pub const NarrowCallKind = enum(u8) {
+    /// Checked `.narrow[Dst]()` / `.narrow() -> Dst` (traps on out-of-range runtime value unless statically proven).
+    narrow = 0,
+    /// Fallible `.try_narrow[Dst]()` / `.try_narrow() -> Dst?` (returns `.None` on out-of-range value).
+    try_narrow = 1,
+};
+
+/// Side-table record recorded by `TypeChecker` for `.narrow` / `.try_narrow` method calls (`DR-20` `D-11`).
+pub const NarrowCallInfo = struct {
+    /// `.narrow` vs. `.try_narrow`.
+    kind: NarrowCallKind,
+    /// Receiver integer (or `RangeRefined` integer) `TypeId`.
+    src_ty: TypeId,
+    /// Target narrowed integer (or `RangeRefined` integer) `TypeId` (`Dst`, unwrapped from `Dst?` for `try_narrow`).
+    dst_ty: TypeId,
+    /// Inclusive lower bound of `dst_ty` (`128`-bit signed domain).
+    min_val: i128 = 0,
+    /// Inclusive upper bound of `dst_ty` (`128`-bit signed domain).
+    max_val: i128 = 0,
+};
+
 /// Stores resolved types, symbols, generic instantiations, `?` conversions, and `@attribute_schema`
 /// instances strictly within `[ast_start .. ast_end)` using window-relative keys (`node_id - ast_start`)
 /// so sibling-body edits that shift `ast_start` preserve Early Cutoff via $O(1)$ `rebaseWindow`.
@@ -560,6 +747,8 @@ pub const BodySemanticSideTables = struct {
     call_instantiations: std.AutoHashMapUnmanaged(u32, []TypeId) = .empty,
     /// `@from` `FromError` conversion function `DefId`s keyed by relative `.try_expr` AST offset.
     try_conversions: std.AutoHashMapUnmanaged(u32, DefId) = .empty,
+    /// Resolved `.narrow` / `.try_narrow` descriptors keyed by relative `.method_call` AST offset (`DR-20` `D-11`).
+    narrow_calls: std.AutoHashMapUnmanaged(u32, NarrowCallInfo) = .empty,
     /// Validated `@attribute_schema` instances scoped to `def_id` (or file when `def_id.isNone()`).
     attr_instances: []AttrInstance = &.{},
 
@@ -573,6 +762,7 @@ pub const BodySemanticSideTables = struct {
         }
         self.call_instantiations.deinit(self.allocator);
         self.try_conversions.deinit(self.allocator);
+        self.narrow_calls.deinit(self.allocator);
         for (self.attr_instances) |attr_inst| {
             if (attr_inst.fields.len > 0) self.allocator.free(attr_inst.fields);
         }
@@ -621,9 +811,17 @@ pub const BodySemanticSideTables = struct {
         if (raw_idx < self.ast_start or raw_idx >= self.ast_end) return null;
         return self.try_conversions.get(raw_idx - self.ast_start);
     }
+
+    /// Looks up the `.narrow` / `.try_narrow` descriptor recorded for `.method_call` AST node `call_id`.
+    pub inline fn getNarrowCall(self: *const BodySemanticSideTables, call_id: NodeIndex) ?NarrowCallInfo {
+        if (call_id.isNone()) return null;
+        const raw_idx = call_id.asInt();
+        if (raw_idx < self.ast_start or raw_idx >= self.ast_end) return null;
+        return self.narrow_calls.get(raw_idx - self.ast_start);
+    }
 };
 
-/// Canonical compiler-intrinsic selector for `@snake_case` expressions (`DR-05` Section 3.3).
+/// Canonical compiler-intrinsic selector for `@snake_case` expressions (`DR-05` Section 3.3 & `DR-20` `D-01`).
 pub const IntrinsicKind = enum(u8) {
     /// `@align_of[T]() -> usize` (`0`).
     align_of = 0,
@@ -649,6 +847,16 @@ pub const IntrinsicKind = enum(u8) {
     type_info = 10,
     /// `@type_name[T]() -> str` (`11`).
     type_name = 11,
+    /// `@as_bytes(&val) -> &[u8]` (`12`, requires `T: IntoBytes`, `E0315`).
+    as_bytes = 12,
+    /// `@bit_cast[Dst](src) -> Dst` (`13`, requires `Src: IntoBytes`, `Dst: FromBytes`, equal byte size, `E0315`).
+    bit_cast = 13,
+    /// `@drop_trace(id: i64) -> unit` (`14`, deterministic destructor order verification hook).
+    drop_trace = 14,
+    /// `@from_bytes[T](bytes: &[u8]) -> T?` (`15`, requires `T: FromBytes`, `E0315`).
+    from_bytes = 15,
+    /// `@view_bytes[T](bytes: &[u8]) -> (&T)?` (`16`, requires `T: FromBytes`, `E0315`).
+    view_bytes = 16,
 };
 
 // --------------------------------------- CONSTS ----------------------------------------
@@ -661,6 +869,12 @@ pub const MAX_TYPE_DEPTH: u32 = 256;
 
 /// High-bit tag in `TypeNode.rhs` marking a symbolic `[const N: usize]` array length (`[T; N]`).
 pub const SYMBOLIC_ARRAY_LEN_FLAG: u32 = 0x8000_0000;
+
+/// Magic top-byte tag in `TypeNode.lhs` marking an instantiated generic nominal container (`Vec[T]`, `Map[K, V]`).
+pub const GENERIC_NOMINAL_INST_TAG: u32 = 0xA500_0000;
+
+/// Bitmask isolating the top-byte tag for `GENERIC_NOMINAL_INST_TAG` in `TypeNode.lhs`.
+pub const GENERIC_NOMINAL_INST_MASK: u32 = 0xFF00_0000;
 
 /// Canonical 32-bit `Wyhash` seed for `InternPool` structural hashing.
 const TYPE_HASH_SEED: u64 = 0x517C_C1B7_2722_0A95;
@@ -677,32 +891,87 @@ const BUILTIN_ATTRIBUTE_MAP = std.StaticStringMap(void).initComptime(.{
     .{ "export", {} },
     .{ "extern", {} },
     .{ "from", {} },
+    .{ "ifunc", {} },
     .{ "inline", {} },
+    .{ "linear", {} },
     .{ "link_name", {} },
+    .{ "link_section", {} },
     .{ "local", {} },
+    .{ "max_stack", {} },
     .{ "must_use", {} },
+    .{ "no_alloc", {} },
+    .{ "no_block", {} },
+    .{ "no_panic", {} },
     .{ "noinline", {} },
     .{ "overload", {} },
     .{ "packed", {} },
     .{ "repr", {} },
+    .{ "secret", {} },
     .{ "soa", {} },
+    .{ "std_cap_boundary", {} },
     .{ "test", {} },
+    .{ "zero_pad", {} },
 });
 
 /// $O(1)$ static lookup map from `@snake_case` intrinsic identifier to `IntrinsicKind`.
 pub const INTRINSIC_NAME_MAP = std.StaticStringMap(IntrinsicKind).initComptime(.{
     .{ "align_of", .align_of },
+    .{ "as_bytes", .as_bytes },
+    .{ "bit_cast", .bit_cast },
     .{ "compile_assert", .compile_assert },
     .{ "compile_error", .compile_error },
     .{ "default_init", .default_init },
+    .{ "drop_trace", .drop_trace },
     .{ "embed_bytes", .embed_bytes },
     .{ "field", .field },
     .{ "field_attr_lookup", .field_attr_lookup },
+    .{ "from_bytes", .from_bytes },
     .{ "has_field", .has_field },
     .{ "implements", .implements },
     .{ "size_of", .size_of },
     .{ "type_info", .type_info },
     .{ "type_name", .type_name },
+    .{ "view_bytes", .view_bytes },
+});
+
+/// $O(1)$ static lookup map of built-in/std Tier 3 `@linear` resource type names (`DR-06` §1.2).
+pub const LINEAR_BUILTIN_TYPE_MAP = std.StaticStringMap(void).initComptime(.{
+    .{ "Arena", {} },
+    .{ "BumpArena", {} },
+    .{ "File", {} },
+    .{ "IoSubmission", {} },
+    .{ "MutexGuard", {} },
+    .{ "OwnPtr", {} },
+    .{ "PgTx", {} },
+    .{ "PoolAllocator", {} },
+    .{ "Socket", {} },
+});
+
+/// $O(1)$ static lookup map of built-in/std Tier 2 `AutoDrop` container type names (`DR-06` §1.2).
+pub const AUTO_DROP_CONTAINER_MAP = std.StaticStringMap(void).initComptime(.{
+    .{ "BTreeMap", {} },
+    .{ "HashMap", {} },
+    .{ "HashSet", {} },
+    .{ "Map", {} },
+    .{ "Set", {} },
+    .{ "SlotMap", {} },
+    .{ "SoaVec", {} },
+    .{ "String", {} },
+    .{ "Vec", {} },
+});
+
+/// $O(1)$ static lookup map from canonical `Context` field names to `ContextFieldLayout` (`DR-20` Seam #2).
+const CONTEXT_FIELD_LAYOUT_MAP = std.StaticStringMap(ContextFieldLayout).initComptime(.{
+    .{ "allocator", ContextFieldLayout.CANONICAL_FIELDS[0] },
+    .{ "rng_seed", ContextFieldLayout.CANONICAL_FIELDS[2] },
+    .{ "scratch", ContextFieldLayout.CANONICAL_FIELDS[1] },
+    .{ "trace_sink", ContextFieldLayout.CANONICAL_FIELDS[3] },
+});
+
+/// $O(1)$ static lookup map of built-in/std Tier 1 `Copy` handle nominal type names (`DR-06` §1.2).
+pub const COPY_BUILTIN_NOMINAL_MAP = std.StaticStringMap(void).initComptime(.{
+    .{ "SlotKey", {} },
+    .{ "Span16", {} },
 });
 
 /// $O(1)$ static lookup map of the 8 `std::meta` value-based reflection mirror type names (`DR-05` §3.3).
@@ -755,7 +1024,7 @@ fn computeStructuralTypeHash(
     extra_slice: []const u32,
 ) u32 {
     var hasher = std.hash.Wyhash.init(TYPE_HASH_SEED);
-    const header_bytes = [2]u8{ @intFromEnum(tag), @bitCast(flags) };
+    const header_bytes = [2]u8{ @backingInt(tag), @bitCast(flags) };
     hasher.update(&header_bytes);
     var pair_bytes: [8]u8 = undefined;
     std.mem.writeInt(u32, pair_bytes[0..4], lhs, .little);
@@ -787,8 +1056,18 @@ fn defaultConcreteForGroup(group_ty: TypeId, is_int: bool) TypeId {
     return if (is_int) .i32_ty else .f64_ty;
 }
 
+/// Inclusive `[min_val, max_val]` 128-bit bounds and bit width of a primitive integer `TypeId`.
+pub const PrimitiveIntBounds = struct {
+    /// Minimum representable signed/unsigned value (`i128` domain).
+    min_val: i128,
+    /// Maximum representable signed/unsigned value (`i128` domain; capped at `i128` max for `u128`).
+    max_val: i128,
+    /// Bit width of the primitive integer (`8`, `16`, `32`, `64`, or `128`).
+    bits: u16,
+};
+
 /// Returns the inclusive `[min_val, max_val]` 128-bit integer bounds of a primitive integer `TypeId`.
-pub fn getPrimitiveIntBounds(prim_ty: TypeId) ?struct { min_val: i128, max_val: i128, bits: u16 } {
+pub fn getPrimitiveIntBounds(prim_ty: TypeId) ?PrimitiveIntBounds {
     return switch (prim_ty) {
         .i8_ty => .{ .min_val = std.math.minInt(i8), .max_val = std.math.maxInt(i8), .bits = 8 },
         .i16_ty => .{ .min_val = std.math.minInt(i16), .max_val = std.math.maxInt(i16), .bits = 16 },
@@ -813,6 +1092,38 @@ pub fn getTargetPrimitiveIntBits(prim_ty: TypeId, target_layout: TargetLayout) ?
         return bounds.bits;
     }
     return null;
+}
+
+/// Returns the target-aware inclusive `[min_val, max_val]` 128-bit bounds of a primitive integer `TypeId`.
+fn getTargetPrimitiveIntBounds(
+    prim_ty: TypeId,
+    target_layout: TargetLayout,
+) ?PrimitiveIntBounds {
+    if (target_layout.ptr_byte_size == 4) {
+        if (prim_ty == .isize_ty) {
+            return .{ .min_val = std.math.minInt(i32), .max_val = std.math.maxInt(i32), .bits = 32 };
+        } else if (prim_ty == .usize_ty) {
+            return .{ .min_val = 0, .max_val = std.math.maxInt(u32), .bits = 32 };
+        }
+    }
+    return getPrimitiveIntBounds(prim_ty);
+}
+
+/// Returns `true` if `enum_sym` is a fieldless `enum` whose variant count equals `2^bit_width` with zero tag holes.
+fn isExhaustiveFieldlessEnumForBits(
+    sym_table: *const SymbolTable,
+    enum_sym: SymbolRecord,
+    bit_width: u16,
+) bool {
+    if (bit_width == 0 or bit_width >= 64 or enum_sym.target_scope.isNone()) return false;
+    var variant_count: u64 = 0;
+    for (sym_table.getScopeMembers(enum_sym.target_scope)) |mem_idx| {
+        const mem_sym = sym_table.getSymbol(mem_idx).*;
+        if (mem_sym.kind != .enum_variant_sym) continue;
+        if (mem_sym.type_id != .unit_ty) return false;
+        variant_count += 1;
+    }
+    return variant_count == (@as(u64, 1) << @intCast(bit_width));
 }
 
 /// Returns `true` if `arr_cst` is a repeat `[val; count]` array literal with a direct-child `;` separator.
@@ -1420,7 +1731,7 @@ pub const InternPool = struct {
                     .lhs = slot_idx,
                     .rhs = 0,
                 });
-            } else if (slot_idx >= 32 and slot_idx <= 42) {
+            } else if (slot_idx >= 32 and slot_idx <= 44) {
                 const mask = TypeGroupMask.forBuiltinGroup(tid);
                 const flags: TypeFlags = .{ .is_copy = true, .is_sized = true };
                 self.nodes.appendAssumeCapacity(.{
@@ -1566,6 +1877,8 @@ pub const InternPool = struct {
             .has_type_vars = inner_flags.has_type_vars,
             .has_regions = inner_flags.has_regions,
             .is_sized = true,
+            .is_secret = inner_flags.is_secret,
+            .has_drop = inner_flags.has_drop,
         }, payload_ty.toU32(), 0);
     }
 
@@ -1580,6 +1893,8 @@ pub const InternPool = struct {
             .has_regions = ok_flags.has_regions or err_flags.has_regions,
             .is_must_use = true,
             .is_sized = true,
+            .is_secret = ok_flags.is_secret or err_flags.is_secret,
+            .has_drop = ok_flags.has_drop or err_flags.has_drop,
         }, ok_ty.toU32(), err_ty_arg.toU32());
     }
 
@@ -1592,7 +1907,7 @@ pub const InternPool = struct {
             .has_type_vars = elem_flags.has_type_vars,
             .has_regions = true,
             .is_sized = true,
-            .is_soa = is_soa,
+            .is_secret = elem_flags.is_secret,
         }, elem_ty.toU32(), 0);
     }
 
@@ -1605,7 +1920,8 @@ pub const InternPool = struct {
             .has_type_vars = elem_flags.has_type_vars,
             .has_regions = elem_flags.has_regions,
             .is_sized = true,
-            .is_soa = is_soa,
+            .is_secret = elem_flags.is_secret,
+            .has_drop = elem_flags.has_drop,
         }, elem_ty.toU32(), array_len);
     }
 
@@ -1623,7 +1939,8 @@ pub const InternPool = struct {
             .has_type_vars = true,
             .has_regions = elem_flags.has_regions,
             .is_sized = false,
-            .is_soa = is_soa,
+            .is_secret = elem_flags.is_secret,
+            .has_drop = elem_flags.has_drop,
         }, elem_ty.toU32(), SYMBOLIC_ARRAY_LEN_FLAG | (const_param_sym_id.asInt() & ~SYMBOLIC_ARRAY_LEN_FLAG));
     }
 
@@ -1636,6 +1953,7 @@ pub const InternPool = struct {
             .has_type_vars = inner_flags.has_type_vars,
             .has_regions = true,
             .is_sized = true,
+            .is_secret = inner_flags.is_secret,
         }, inner_ty.toU32(), if (is_mut) 1 else 0);
     }
 
@@ -1647,6 +1965,7 @@ pub const InternPool = struct {
             .is_copy = true,
             .has_type_vars = inner_flags.has_type_vars,
             .is_sized = true,
+            .is_secret = inner_flags.is_secret,
         }, inner_ty.toU32(), if (is_mut) 1 else 0);
     }
 
@@ -1658,6 +1977,7 @@ pub const InternPool = struct {
             .is_copy = inner_flags.is_copy,
             .has_type_vars = true,
             .is_sized = true,
+            .is_secret = inner_flags.is_secret,
         }, target_ty.toU32(), 0);
     }
 
@@ -1667,6 +1987,8 @@ pub const InternPool = struct {
         var is_copy = true;
         var has_vars = false;
         var has_regs = false;
+        var has_secret = false;
+        var has_drop = false;
         const raw_words = try self.allocator.alloc(u32, elem_types.len);
         defer self.allocator.free(raw_words);
 
@@ -1676,6 +1998,8 @@ pub const InternPool = struct {
             if (!fl.is_copy) is_copy = false;
             if (fl.has_type_vars) has_vars = true;
             if (fl.has_regions) has_regs = true;
+            if (fl.is_secret) has_secret = true;
+            if (fl.has_drop) has_drop = true;
             raw_words[i] = elem_ty.toU32();
         }
         return self.internExtra(.tuple_ty, .{
@@ -1683,6 +2007,8 @@ pub const InternPool = struct {
             .has_type_vars = has_vars,
             .has_regions = has_regs,
             .is_sized = true,
+            .is_secret = has_secret,
+            .has_drop = has_drop,
         }, @intCast(elem_types.len), raw_words);
     }
 
@@ -1694,14 +2020,103 @@ pub const InternPool = struct {
         sym_idx: SymbolIndex,
         is_copy: bool,
         is_must_use: bool,
-        is_soa: bool,
+        is_secret: bool,
     ) !TypeId {
         return self.internSimple(tag, .{
             .is_copy = is_copy,
             .is_must_use = is_must_use,
             .is_sized = (tag != .trait_ty),
-            .is_soa = is_soa,
+            .is_secret = is_secret,
         }, lhs_id, sym_idx.asInt());
+    }
+
+    /// Interns a generic nominal instantiation (`Vec[T]`, `Map[K, V]`) carrying concrete `type_args`.
+    pub fn internNominalInstantiation(
+        self: *InternPool,
+        base_ty: TypeId,
+        type_args: []const TypeId,
+        is_copy: bool,
+        has_drop: bool,
+    ) !TypeId {
+        if (base_ty.isError() or type_args.len == 0) return base_ty;
+        const base_node = self.getNode(base_ty);
+        const is_reinst = (base_node.lhs & GENERIC_NOMINAL_INST_MASK) == GENERIC_NOMINAL_INST_TAG;
+        var has_vars = if (is_reinst) false else base_node.flags.has_type_vars;
+        var has_regs = if (is_reinst) false else base_node.flags.has_regions;
+        var has_secret = if (is_reinst) false else base_node.flags.is_secret;
+
+        var extra_words: std.ArrayListUnmanaged(u32) = .empty;
+        defer extra_words.deinit(self.allocator);
+        try extra_words.append(self.allocator, @intCast(type_args.len));
+        for (type_args) |arg_ty| {
+            if (arg_ty.isError()) return .err_ty;
+            const arg_fl = self.getFlags(arg_ty);
+            if (arg_fl.has_type_vars) has_vars = true;
+            if (arg_fl.has_regions) has_regs = true;
+            if (arg_fl.is_secret) has_secret = true;
+            try extra_words.append(self.allocator, arg_ty.toU32());
+        }
+
+        const flags: TypeFlags = .{
+            .is_copy = is_copy,
+            .has_type_vars = has_vars,
+            .has_regions = has_regs,
+            .is_must_use = base_node.flags.is_must_use,
+            .is_sized = base_node.flags.is_sized,
+            .is_secret = has_secret,
+            .has_drop = has_drop,
+        };
+        const struct_hash = computeStructuralTypeHash(
+            base_node.tag,
+            .{},
+            GENERIC_NOMINAL_INST_TAG | @as(u32, @intCast(extra_words.items.len)),
+            base_node.rhs,
+            extra_words.items,
+        );
+        const gop = try self.dedup_buckets.getOrPut(self.allocator, struct_hash);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .empty;
+        } else {
+            for (gop.value_ptr.items) |cand_id| {
+                const cand = self.getNode(cand_id);
+                if (cand.tag == base_node.tag and
+                    cand.rhs == base_node.rhs and
+                    (cand.lhs & GENERIC_NOMINAL_INST_MASK) == GENERIC_NOMINAL_INST_TAG)
+                {
+                    const start_idx: usize = cand.lhs & ~GENERIC_NOMINAL_INST_MASK;
+                    if (start_idx + extra_words.items.len <= self.extra.items.len and
+                        std.mem.eql(u32, self.extra.items[start_idx .. start_idx + extra_words.items.len], extra_words.items))
+                    {
+                        return cand_id;
+                    }
+                }
+            }
+        }
+
+        const extra_start: u32 = @intCast(self.extra.items.len);
+        try self.extra.appendSlice(self.allocator, extra_words.items);
+        const new_id = TypeId.fromInt(@intCast(self.nodes.len));
+        try self.nodes.append(self.allocator, .{
+            .tag = base_node.tag,
+            .flags = flags,
+            .hash = struct_hash,
+            .lhs = GENERIC_NOMINAL_INST_TAG | (extra_start & ~GENERIC_NOMINAL_INST_MASK),
+            .rhs = base_node.rhs,
+        });
+        try gop.value_ptr.append(self.allocator, new_id);
+        return new_id;
+    }
+
+    /// Returns the interned `TypeId.toU32()` argument slice on an instantiated generic nominal container.
+    pub fn getGenericTypeArgs(self: *const InternPool, nominal_ty: TypeId) []const u32 {
+        const node = self.getNode(nominal_ty);
+        if (node.tag != .struct_ty and node.tag != .enum_ty and node.tag != .union_ty) return &.{};
+        if ((node.lhs & GENERIC_NOMINAL_INST_MASK) != GENERIC_NOMINAL_INST_TAG) return &.{};
+        const start_idx: usize = node.lhs & ~GENERIC_NOMINAL_INST_MASK;
+        if (start_idx >= self.extra.items.len) return &.{};
+        const count: usize = self.extra.items[start_idx];
+        if (start_idx + 1 + count > self.extra.items.len) return &.{};
+        return self.extra.items[start_idx + 1 .. start_idx + 1 + count];
     }
 
     /// Interns a `type New = distinct Base;` type (`distinct_ty`).
@@ -1717,6 +2132,8 @@ pub const InternPool = struct {
             .has_regions = base_flags.has_regions,
             .is_must_use = base_flags.is_must_use,
             .is_sized = true,
+            .is_secret = base_flags.is_secret,
+            .has_drop = base_flags.has_drop,
         }, base_ty.toU32(), sym_idx.asInt());
     }
 
@@ -1756,6 +2173,8 @@ pub const InternPool = struct {
         return self.internExtra(.refined_ty, .{
             .is_copy = base_flags.is_copy,
             .is_sized = true,
+            .is_secret = base_flags.is_secret,
+            .has_drop = base_flags.has_drop,
         }, base_ty.toU32(), &full_payload);
     }
 
@@ -1851,7 +2270,7 @@ pub const InternPool = struct {
         }, bound_ty.toU32(), name_sym.asInt());
     }
 
-    /// Interns a function or closure signature (`fn(P…) -> R`).
+    /// Interns a function or closure signature (`fn(P…) -> R`) with default empty `FnPtrContractMask`.
     pub fn internFn(
         self: *InternPool,
         tag: TypeTag,
@@ -1860,26 +2279,74 @@ pub const InternPool = struct {
         ret_ty: TypeId,
         is_must_use: bool,
     ) !TypeId {
+        return self.internFnWithContractsAndCapture(
+            tag,
+            param_types,
+            param_modes,
+            ret_ty,
+            is_must_use,
+            .{},
+            .copy_tier,
+        );
+    }
+
+    /// Interns a function or closure signature carrying `FnPtrContractMask` in bits `16..23` of `extra[0]`.
+    pub fn internFnWithContracts(
+        self: *InternPool,
+        tag: TypeTag,
+        param_types: []const TypeId,
+        param_modes: []const ParamMode,
+        ret_ty: TypeId,
+        is_must_use: bool,
+        contracts: FnPtrContractMask,
+    ) !TypeId {
+        return self.internFnWithContractsAndCapture(
+            tag,
+            param_types,
+            param_modes,
+            ret_ty,
+            is_must_use,
+            contracts,
+            .copy_tier,
+        );
+    }
+
+    /// Interns a function or closure signature carrying both `contracts` (`16..23`) and `capture_tier` (`24..25`).
+    pub fn internFnWithContractsAndCapture(
+        self: *InternPool,
+        tag: TypeTag,
+        param_types: []const TypeId,
+        param_modes: []const ParamMode,
+        ret_ty: TypeId,
+        is_must_use: bool,
+        contracts: FnPtrContractMask,
+        capture_tier: OwnershipTier,
+    ) !TypeId {
         var has_vars = self.getFlags(ret_ty).has_type_vars;
         var extra_words: std.ArrayListUnmanaged(u32) = .empty;
         defer extra_words.deinit(self.allocator);
 
         const arity: u32 = @intCast(param_types.len);
-        try extra_words.append(self.allocator, arity);
+        const packed_hdr: u32 = (arity & 0xFFFF) |
+            (@as(u32, @as(u8, @bitCast(contracts))) << 16) |
+            (@as(u32, @backingInt(capture_tier)) << 24);
+        try extra_words.append(self.allocator, packed_hdr);
         for (param_types) |pty| {
             if (self.getFlags(pty).has_type_vars) has_vars = true;
             try extra_words.append(self.allocator, pty.toU32());
         }
         for (0..param_types.len) |i| {
             const mode: ParamMode = if (i < param_modes.len) param_modes[i] else .let_mode;
-            try extra_words.append(self.allocator, @intFromEnum(mode));
+            try extra_words.append(self.allocator, @backingInt(mode));
         }
 
+        const is_copy_fn = if (tag == .fn_ty) true else (capture_tier == .copy_tier);
         return self.internExtra(tag, .{
-            .is_copy = (tag == .fn_ty),
+            .is_copy = is_copy_fn,
             .has_type_vars = has_vars,
             .is_must_use = is_must_use,
             .is_sized = true,
+            .has_drop = (tag == .closure_ty and capture_tier == .auto_drop_tier),
         }, ret_ty.toU32(), extra_words.items);
     }
 
@@ -1888,7 +2355,11 @@ pub const InternPool = struct {
         const node = self.getNode(fn_ty);
         if (node.tag != .fn_ty and node.tag != .closure_ty) return null;
         if (node.lhs >= self.extra.items.len) return null;
-        const arity: usize = self.extra.items[node.lhs];
+        const raw_hdr = self.extra.items[node.lhs];
+        const arity: usize = raw_hdr & 0xFFFF;
+        const contracts: FnPtrContractMask = @bitCast(@as(u8, @truncate(raw_hdr >> 16)));
+        const raw_tier: u8 = @truncate((raw_hdr >> 24) & 0x03);
+        const capture_tier: OwnershipTier = if (raw_tier <= 2) @fromBackingInt(@intCast(raw_tier)) else .copy_tier;
         const params_start: usize = node.lhs + 1;
         const modes_start: usize = params_start + arity;
         if (modes_start + arity > self.extra.items.len) return null;
@@ -1896,6 +2367,8 @@ pub const InternPool = struct {
             .ret_ty = TypeId.fromInt(node.rhs),
             .param_types = self.extra.items[params_start .. params_start + arity],
             .param_modes = self.extra.items[modes_start .. modes_start + arity],
+            .contracts = contracts,
+            .capture_tier = capture_tier,
         };
     }
 
@@ -1974,7 +2447,17 @@ pub const InternPool = struct {
             .struct_ty, .enum_ty, .union_ty, .bit_field_ty, .trait_ty, .distinct_ty, .user_group => {
                 const sym_idx = SymbolIndex.fromInt(node.rhs);
                 if (!sym_idx.isNone() and sym_idx.asInt() < sym_table.symbols.items.len) {
-                    return writer.writeAll(sym_table.getSymbol(sym_idx).name_text);
+                    writer.writeAll(sym_table.getSymbol(sym_idx).name_text);
+                    const gen_args = self.getGenericTypeArgs(ty);
+                    if (gen_args.len > 0) {
+                        writer.writeAll("[");
+                        for (gen_args, 0..) |raw_arg, i| {
+                            if (i > 0) writer.writeAll(", ");
+                            self.writeTypeToWriter(TypeId.fromInt(raw_arg), sym_table, writer, depth + 1);
+                        }
+                        writer.writeAll("]");
+                    }
+                    return;
                 }
                 return writer.writeAll("<nominal>");
             },
@@ -2051,8 +2534,772 @@ pub const InternPool = struct {
                 writer.writeAll("any ");
                 return self.writeTypeToWriter(TypeId.fromInt(node.lhs), sym_table, writer, depth + 1);
             },
+            .fn_ty, .closure_ty => {
+                const sig_view = self.getFnSignatureView(ty) orelse return writer.writeAll("<fn>");
+                if (sig_view.contracts.has_no_alloc) writer.writeAll("@no_alloc ");
+                if (sig_view.contracts.has_no_panic) writer.writeAll("@no_panic ");
+                if (sig_view.contracts.has_no_block) writer.writeAll("@no_block ");
+                if (node.tag == .closure_ty and sig_view.capture_tier != .copy_tier) {
+                    writer.writeAll("own ");
+                }
+                writer.writeAll(if (node.tag == .closure_ty) "|" else "fn(");
+                for (0..sig_view.paramCount()) |i| {
+                    if (i > 0) writer.writeAll(", ");
+                    switch (sig_view.getParamMode(i)) {
+                        .let_mode => {},
+                        .inout_mode => writer.writeAll("inout "),
+                        .sink_mode => writer.writeAll("sink "),
+                        .set_mode => writer.writeAll("set "),
+                    }
+                    self.writeTypeToWriter(sig_view.getParamType(i), sym_table, writer, depth + 1);
+                }
+                writer.writeAll(if (node.tag == .closure_ty) "| -> " else ") -> ");
+                return self.writeTypeToWriter(sig_view.ret_ty, sym_table, writer, depth + 1);
+            },
             else => return writer.writeAll("<type>"),
         }
+    }
+
+    /// Returns `null` if `ty` satisfies `FromBytes` (`DR-20` `D-01`), or a `WireLayoutViolation` explaining why not.
+    pub fn explainFromBytesViolation(
+        self: *const InternPool,
+        ty: TypeId,
+        sym_table: *const SymbolTable,
+        target_layout: TargetLayout,
+    ) ?WireLayoutViolation {
+        return self.explainFromBytesViolationBounded(ty, sym_table, target_layout, &NominalTypeSubst.EMPTY, 0);
+    }
+
+    /// Returns `true` if every possible bit pattern of `ty` is a valid, non-secret, `Copy` value (`DR-20` `D-01`).
+    pub fn isFromBytesValid(
+        self: *const InternPool,
+        ty: TypeId,
+        sym_table: *const SymbolTable,
+        target_layout: TargetLayout,
+    ) bool {
+        return self.explainFromBytesViolation(ty, sym_table, target_layout) == null;
+    }
+
+    /// Depth-bounded helper for `explainFromBytesViolation` with generic nominal substitution `subst`.
+    fn explainFromBytesViolationBounded(
+        self: *const InternPool,
+        raw_ty: TypeId,
+        sym_table: *const SymbolTable,
+        target_layout: TargetLayout,
+        subst: *const NominalTypeSubst,
+        depth: u32,
+    ) ?WireLayoutViolation {
+        const ty = subst.resolve(raw_ty);
+        if (ty.isError() or depth >= MAX_TYPE_DEPTH) return null;
+        if (self.getFlags(ty).is_secret) {
+            return .{ .reason = .secret_type };
+        }
+        var visited_tier: [32]u64 = undefined;
+        if (classifyOwnershipTierBounded(self, sym_table, ty, subst, &visited_tier, 0) != .copy_tier) {
+            return .{ .reason = .non_copy_ownership };
+        }
+        if (ty == .untyped_int_ty or ty == .untyped_float_ty) return null;
+        if (ty.isPrimitive()) {
+            if (ty == .str_ty) return .{ .reason = .indirection_or_handle };
+            if (TypeGroupMask.containsPrimitive(TypeGroupMask.FROM_BYTES, ty)) return null;
+            return .{ .reason = .invalid_bit_patterns };
+        }
+
+        const node = self.getNode(ty);
+        switch (node.tag) {
+            .raw_ptr_ty,
+            .ref_ty,
+            .mut_ref_ty,
+            .slice_ty,
+            .soa_slice_ty,
+            .fn_ty,
+            .closure_ty,
+            .dyn_trait_ty,
+            .trait_ty,
+            => return .{ .reason = .indirection_or_handle },
+            .optional_ty, .result_ty => return .{ .reason = .invalid_bit_patterns },
+            .refined_ty => {
+                const bounds = self.getRefinementBounds(ty) orelse
+                    return .{ .reason = .refinement_narrows_domain };
+                if (self.explainFromBytesViolationBounded(
+                    bounds.base_ty,
+                    sym_table,
+                    target_layout,
+                    subst,
+                    depth + 1,
+                )) |violation| {
+                    return violation;
+                }
+                const underlying_prim = self.unwrapUnderlyingType(subst.resolve(bounds.base_ty));
+                if (underlying_prim == .u128_ty) {
+                    return .{ .reason = .refinement_narrows_domain };
+                }
+                const full_bounds = getTargetPrimitiveIntBounds(underlying_prim, target_layout) orelse
+                    return .{ .reason = .refinement_narrows_domain };
+                if (bounds.min_val <= full_bounds.min_val and bounds.max_val >= full_bounds.max_val) {
+                    return null;
+                }
+                return .{ .reason = .refinement_narrows_domain };
+            },
+            .distinct_ty => {
+                const sym_idx = SymbolIndex.fromInt(node.rhs);
+                if (!sym_idx.isNone() and sym_idx.asInt() < sym_table.symbols.items.len) {
+                    if (sym_table.getSymbol(sym_idx).contract_flags.is_secret) {
+                        return .{ .reason = .secret_type, .field_name = sym_table.getSymbol(sym_idx).name_text };
+                    }
+                }
+                return self.explainFromBytesViolationBounded(
+                    TypeId.fromInt(node.lhs),
+                    sym_table,
+                    target_layout,
+                    subst,
+                    depth + 1,
+                );
+            },
+            .array_ty, .soa_array_ty => {
+                if ((node.rhs & SYMBOLIC_ARRAY_LEN_FLAG) != 0) {
+                    return .{ .reason = .invalid_bit_patterns };
+                }
+                return self.explainFromBytesViolationBounded(
+                    TypeId.fromInt(node.lhs),
+                    sym_table,
+                    target_layout,
+                    subst,
+                    depth + 1,
+                );
+            },
+            .tuple_ty => {
+                var cur_offset: u64 = 0;
+                for (self.getTupleElements(ty)) |raw_elem| {
+                    const elem_ty = subst.resolve(TypeId.fromInt(raw_elem));
+                    const elem_layout = computeTypeLayoutBounded(
+                        self,
+                        sym_table,
+                        elem_ty,
+                        target_layout,
+                        subst,
+                        depth + 1,
+                    );
+                    const aligned_off = alignUpU64(cur_offset, elem_layout.align_bytes);
+                    if (self.explainFromBytesViolationBounded(
+                        elem_ty,
+                        sym_table,
+                        target_layout,
+                        subst,
+                        depth + 1,
+                    )) |sub_v| {
+                        return .{
+                            .reason = sub_v.reason,
+                            .byte_offset = aligned_off +| sub_v.byte_offset,
+                            .padding_bytes = sub_v.padding_bytes,
+                            .field_name = sub_v.field_name,
+                        };
+                    }
+                    cur_offset = aligned_off +| elem_layout.byte_size;
+                }
+                return null;
+            },
+            .bit_field_ty => {
+                const backing_ty = self.unwrapUnderlyingType(subst.resolve(TypeId.fromInt(node.lhs)));
+                const backing_bits = getTargetPrimitiveIntBits(backing_ty, target_layout) orelse
+                    return .{ .reason = .invalid_bit_patterns };
+                const sym_idx = SymbolIndex.fromInt(node.rhs);
+                if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) {
+                    return .{ .reason = .invalid_bit_patterns };
+                }
+                const bf_sym = sym_table.getSymbol(sym_idx).*;
+                if (bf_sym.contract_flags.is_secret) {
+                    return .{ .reason = .secret_type, .field_name = bf_sym.name_text };
+                }
+                if (bf_sym.target_scope.isNone()) return null;
+                var total_bits: u32 = 0;
+                for (sym_table.getScopeMembers(bf_sym.target_scope)) |mem_idx| {
+                    const mem_sym = sym_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind != .field_sym) continue;
+                    total_bits += mem_sym.bit_width;
+                    const mem_ty = subst.resolve(mem_sym.type_id);
+                    if (self.getFlags(mem_ty).is_secret) {
+                        return .{ .reason = .secret_type, .field_name = mem_sym.name_text };
+                    }
+                    // Peel only `.distinct_ty` wrappers first so any `.refined_ty` or `@secret` layer is caught:
+                    var peeled_mem = mem_ty;
+                    var has_refinement_layer = false;
+                    var peel_steps: u32 = 0;
+                    while (!peeled_mem.isPrimitiveOrSentinel() and peel_steps < MAX_TYPE_DEPTH) : (peel_steps += 1) {
+                        const peeled_node = self.getNode(peeled_mem);
+                        if (peeled_node.tag == .distinct_ty) {
+                            const dist_sym = SymbolIndex.fromInt(peeled_node.rhs);
+                            if (!dist_sym.isNone() and dist_sym.asInt() < sym_table.symbols.items.len and
+                                sym_table.getSymbol(dist_sym).contract_flags.is_secret)
+                            {
+                                return .{ .reason = .secret_type, .field_name = mem_sym.name_text };
+                            }
+                            peeled_mem = subst.resolve(TypeId.fromInt(peeled_node.lhs));
+                            continue;
+                        }
+                        if (peeled_node.tag == .refined_ty) {
+                            has_refinement_layer = true;
+                        }
+                        break;
+                    }
+                    if (!has_refinement_layer and peeled_mem == .bool_ty) {
+                        if (mem_sym.bit_width != 1) {
+                            return .{ .reason = .invalid_bit_patterns, .field_name = mem_sym.name_text };
+                        }
+                    } else if (!has_refinement_layer and !peeled_mem.isPrimitiveOrSentinel() and
+                        self.getTag(peeled_mem) == .enum_ty)
+                    {
+                        const enum_sym_idx = SymbolIndex.fromInt(self.getNode(peeled_mem).rhs);
+                        if (enum_sym_idx.isNone() or enum_sym_idx.asInt() >= sym_table.symbols.items.len) {
+                            return .{ .reason = .invalid_bit_patterns, .field_name = mem_sym.name_text };
+                        }
+                        const enum_sym = sym_table.getSymbol(enum_sym_idx).*;
+                        if (enum_sym.contract_flags.is_secret) {
+                            return .{ .reason = .secret_type, .field_name = mem_sym.name_text };
+                        }
+                        if (!isExhaustiveFieldlessEnumForBits(sym_table, enum_sym, mem_sym.bit_width)) {
+                            return .{ .reason = .invalid_bit_patterns, .field_name = mem_sym.name_text };
+                        }
+                    } else if (self.explainFromBytesViolationBounded(
+                        mem_ty,
+                        sym_table,
+                        target_layout,
+                        subst,
+                        depth + 1,
+                    )) |violation| {
+                        return .{
+                            .reason = violation.reason,
+                            .field_name = if (violation.field_name.len > 0) violation.field_name else mem_sym.name_text,
+                        };
+                    }
+                }
+                if (total_bits != backing_bits) {
+                    return .{ .reason = .invalid_bit_patterns, .field_name = bf_sym.name_text };
+                }
+                return null;
+            },
+            .struct_ty => {
+                const sym_idx = SymbolIndex.fromInt(node.rhs);
+                if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) {
+                    return .{ .reason = .invalid_bit_patterns };
+                }
+                const st_sym = sym_table.getSymbol(sym_idx).*;
+                if (st_sym.contract_flags.is_secret) {
+                    return .{ .reason = .secret_type, .field_name = st_sym.name_text };
+                }
+                if (st_sym.target_scope.isNone()) return null;
+                const child_subst = NominalTypeSubst.fromNominal(self, sym_table, ty, st_sym, subst);
+                const active_subst = if (child_subst.len > 0) &child_subst else subst;
+                var cur_offset: u64 = 0;
+                for (sym_table.getScopeMembers(st_sym.target_scope)) |mem_idx| {
+                    const mem_sym = sym_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind != .field_sym) continue;
+                    const f_layout = computeTypeLayoutBounded(
+                        self,
+                        sym_table,
+                        mem_sym.type_id,
+                        target_layout,
+                        active_subst,
+                        depth + 1,
+                    );
+                    const aligned_off = alignUpU64(cur_offset, f_layout.align_bytes);
+                    if (self.explainFromBytesViolationBounded(
+                        mem_sym.type_id,
+                        sym_table,
+                        target_layout,
+                        active_subst,
+                        depth + 1,
+                    )) |sub_v| {
+                        return .{
+                            .reason = sub_v.reason,
+                            .byte_offset = aligned_off +| sub_v.byte_offset,
+                            .padding_bytes = sub_v.padding_bytes,
+                            .field_name = if (sub_v.field_name.len > 0) sub_v.field_name else mem_sym.name_text,
+                        };
+                    }
+                    cur_offset = aligned_off +| f_layout.byte_size;
+                }
+                return null;
+            },
+            .union_ty => {
+                const sym_idx = SymbolIndex.fromInt(node.rhs);
+                if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) {
+                    return .{ .reason = .invalid_bit_patterns };
+                }
+                const un_sym = sym_table.getSymbol(sym_idx).*;
+                if (un_sym.contract_flags.is_secret) {
+                    return .{ .reason = .secret_type, .field_name = un_sym.name_text };
+                }
+                if (un_sym.target_scope.isNone()) return null;
+                const child_subst = NominalTypeSubst.fromNominal(self, sym_table, ty, un_sym, subst);
+                const active_subst = if (child_subst.len > 0) &child_subst else subst;
+                for (sym_table.getScopeMembers(un_sym.target_scope)) |mem_idx| {
+                    const mem_sym = sym_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind != .field_sym) continue;
+                    if (self.explainFromBytesViolationBounded(
+                        mem_sym.type_id,
+                        sym_table,
+                        target_layout,
+                        active_subst,
+                        depth + 1,
+                    )) |sub_v| {
+                        return .{
+                            .reason = sub_v.reason,
+                            .byte_offset = sub_v.byte_offset,
+                            .padding_bytes = sub_v.padding_bytes,
+                            .field_name = if (sub_v.field_name.len > 0) sub_v.field_name else mem_sym.name_text,
+                        };
+                    }
+                }
+                return null;
+            },
+            .enum_ty => {
+                const sym_idx = SymbolIndex.fromInt(node.rhs);
+                if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) {
+                    return .{ .reason = .invalid_bit_patterns };
+                }
+                const enum_sym = sym_table.getSymbol(sym_idx).*;
+                if (enum_sym.contract_flags.is_secret) {
+                    return .{ .reason = .secret_type, .field_name = enum_sym.name_text };
+                }
+                if (enum_sym.repr_tag_bits == 0 or
+                    !isExhaustiveFieldlessEnumForBits(sym_table, enum_sym, enum_sym.repr_tag_bits))
+                {
+                    return .{ .reason = .invalid_bit_patterns, .field_name = enum_sym.name_text };
+                }
+                return null;
+            },
+            else => return .{ .reason = .invalid_bit_patterns },
+        }
+    }
+
+    /// Returns `null` if `ty` satisfies `IntoBytes` (`DR-20` `D-01`), or a `WireLayoutViolation` with padding offset.
+    pub fn explainIntoBytesViolation(
+        self: *const InternPool,
+        ty: TypeId,
+        sym_table: *const SymbolTable,
+        target_layout: TargetLayout,
+    ) ?WireLayoutViolation {
+        return self.explainIntoBytesViolationBounded(ty, sym_table, target_layout, &NominalTypeSubst.EMPTY, 0);
+    }
+
+    /// Returns `true` if `ty` has initialized, non-secret, pointer-free bytes (`DR-20` `D-01`, `[CRITICAL-08]`).
+    pub fn isIntoBytesValid(
+        self: *const InternPool,
+        ty: TypeId,
+        sym_table: *const SymbolTable,
+        target_layout: TargetLayout,
+    ) bool {
+        return self.explainIntoBytesViolation(ty, sym_table, target_layout) == null;
+    }
+
+    /// Depth-bounded helper for `explainIntoBytesViolation` with generic nominal substitution `subst`.
+    fn explainIntoBytesViolationBounded(
+        self: *const InternPool,
+        raw_ty: TypeId,
+        sym_table: *const SymbolTable,
+        target_layout: TargetLayout,
+        subst: *const NominalTypeSubst,
+        depth: u32,
+    ) ?WireLayoutViolation {
+        const ty = subst.resolve(raw_ty);
+        if (ty.isError() or depth >= MAX_TYPE_DEPTH) return null;
+        if (self.getFlags(ty).is_secret) {
+            return .{ .reason = .secret_type };
+        }
+        var visited_tier: [32]u64 = undefined;
+        if (classifyOwnershipTierBounded(self, sym_table, ty, subst, &visited_tier, 0) != .copy_tier) {
+            return .{ .reason = .non_copy_ownership };
+        }
+        if (ty == .untyped_int_ty or ty == .untyped_float_ty) return null;
+        if (ty.isPrimitive()) {
+            if (ty == .str_ty) return .{ .reason = .indirection_or_handle };
+            if (TypeGroupMask.containsPrimitive(TypeGroupMask.INTO_BYTES, ty)) return null;
+            return .{ .reason = .invalid_bit_patterns };
+        }
+
+        const node = self.getNode(ty);
+        switch (node.tag) {
+            .raw_ptr_ty,
+            .ref_ty,
+            .mut_ref_ty,
+            .slice_ty,
+            .soa_slice_ty,
+            .fn_ty,
+            .closure_ty,
+            .dyn_trait_ty,
+            .trait_ty,
+            => return .{ .reason = .indirection_or_handle },
+            .refined_ty => {
+                if (self.getRefinementBounds(ty)) |bounds| {
+                    return self.explainIntoBytesViolationBounded(
+                        bounds.base_ty,
+                        sym_table,
+                        target_layout,
+                        subst,
+                        depth + 1,
+                    );
+                }
+                return self.explainIntoBytesViolationBounded(
+                    TypeId.fromInt(node.rhs),
+                    sym_table,
+                    target_layout,
+                    subst,
+                    depth + 1,
+                );
+            },
+            .distinct_ty => {
+                const sym_idx = SymbolIndex.fromInt(node.rhs);
+                if (!sym_idx.isNone() and sym_idx.asInt() < sym_table.symbols.items.len) {
+                    if (sym_table.getSymbol(sym_idx).contract_flags.is_secret) {
+                        return .{ .reason = .secret_type, .field_name = sym_table.getSymbol(sym_idx).name_text };
+                    }
+                }
+                return self.explainIntoBytesViolationBounded(
+                    TypeId.fromInt(node.lhs),
+                    sym_table,
+                    target_layout,
+                    subst,
+                    depth + 1,
+                );
+            },
+            .bit_field_ty => {
+                const sym_idx = SymbolIndex.fromInt(node.rhs);
+                if (!sym_idx.isNone() and sym_idx.asInt() < sym_table.symbols.items.len) {
+                    const bf_sym = sym_table.getSymbol(sym_idx).*;
+                    if (bf_sym.contract_flags.is_secret) {
+                        return .{ .reason = .secret_type, .field_name = bf_sym.name_text };
+                    }
+                    if (!bf_sym.target_scope.isNone()) {
+                        for (sym_table.getScopeMembers(bf_sym.target_scope)) |mem_idx| {
+                            const mem_sym = sym_table.getSymbol(mem_idx).*;
+                            const mem_ty = subst.resolve(mem_sym.type_id);
+                            if (mem_sym.kind == .field_sym and self.getFlags(mem_ty).is_secret) {
+                                return .{ .reason = .secret_type, .field_name = mem_sym.name_text };
+                            }
+                        }
+                    }
+                }
+                return self.explainIntoBytesViolationBounded(
+                    TypeId.fromInt(node.lhs),
+                    sym_table,
+                    target_layout,
+                    subst,
+                    depth + 1,
+                );
+            },
+            .array_ty, .soa_array_ty => {
+                if ((node.rhs & SYMBOLIC_ARRAY_LEN_FLAG) != 0) {
+                    return .{ .reason = .invalid_bit_patterns };
+                }
+                return self.explainIntoBytesViolationBounded(
+                    TypeId.fromInt(node.lhs),
+                    sym_table,
+                    target_layout,
+                    subst,
+                    depth + 1,
+                );
+            },
+            .tuple_ty => {
+                var cur_offset: u64 = 0;
+                var max_align_log2: u8 = 0;
+                for (self.getTupleElements(ty)) |raw_elem| {
+                    const elem_ty = subst.resolve(TypeId.fromInt(raw_elem));
+                    const elem_layout = computeTypeLayoutBounded(
+                        self,
+                        sym_table,
+                        elem_ty,
+                        target_layout,
+                        subst,
+                        depth + 1,
+                    );
+                    if (elem_layout.align_log2 > max_align_log2) max_align_log2 = elem_layout.align_log2;
+                    const aligned_off = alignUpU64(cur_offset, elem_layout.align_bytes);
+                    if (self.explainIntoBytesViolationBounded(
+                        elem_ty,
+                        sym_table,
+                        target_layout,
+                        subst,
+                        depth + 1,
+                    )) |sub_v| {
+                        return .{
+                            .reason = sub_v.reason,
+                            .byte_offset = aligned_off +| sub_v.byte_offset,
+                            .padding_bytes = sub_v.padding_bytes,
+                            .field_name = sub_v.field_name,
+                        };
+                    }
+                    if (aligned_off > cur_offset) {
+                        return .{
+                            .reason = .unzeroed_inter_field_padding,
+                            .byte_offset = cur_offset,
+                            .padding_bytes = aligned_off - cur_offset,
+                        };
+                    }
+                    cur_offset = aligned_off +| elem_layout.byte_size;
+                }
+                const max_align_bytes: u32 = @as(u32, 1) << @intCast(max_align_log2);
+                const total_size = alignUpU64(cur_offset, max_align_bytes);
+                if (total_size > cur_offset) {
+                    return .{
+                        .reason = .unzeroed_tail_padding,
+                        .byte_offset = cur_offset,
+                        .padding_bytes = total_size - cur_offset,
+                    };
+                }
+                return null;
+            },
+            .struct_ty => {
+                const sym_idx = SymbolIndex.fromInt(node.rhs);
+                if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) {
+                    return .{ .reason = .invalid_bit_patterns };
+                }
+                const st_sym = sym_table.getSymbol(sym_idx).*;
+                if (st_sym.contract_flags.is_secret) {
+                    return .{ .reason = .secret_type, .field_name = st_sym.name_text };
+                }
+                if (st_sym.target_scope.isNone()) return null;
+                const child_subst = NominalTypeSubst.fromNominal(self, sym_table, ty, st_sym, subst);
+                const active_subst = if (child_subst.len > 0) &child_subst else subst;
+                const is_zero_padded = st_sym.contract_flags.is_zero_pad;
+                var cur_offset: u64 = 0;
+                var max_align_log2: u8 = 0;
+                for (sym_table.getScopeMembers(st_sym.target_scope)) |mem_idx| {
+                    const mem_sym = sym_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind != .field_sym) continue;
+                    const f_layout = computeTypeLayoutBounded(
+                        self,
+                        sym_table,
+                        mem_sym.type_id,
+                        target_layout,
+                        active_subst,
+                        depth + 1,
+                    );
+                    if (f_layout.align_log2 > max_align_log2) max_align_log2 = f_layout.align_log2;
+                    const aligned_off = alignUpU64(cur_offset, f_layout.align_bytes);
+                    if (self.explainIntoBytesViolationBounded(
+                        mem_sym.type_id,
+                        sym_table,
+                        target_layout,
+                        active_subst,
+                        depth + 1,
+                    )) |sub_v| {
+                        return .{
+                            .reason = sub_v.reason,
+                            .byte_offset = aligned_off +| sub_v.byte_offset,
+                            .padding_bytes = sub_v.padding_bytes,
+                            .field_name = if (sub_v.field_name.len > 0) sub_v.field_name else mem_sym.name_text,
+                        };
+                    }
+                    if (!is_zero_padded and aligned_off > cur_offset) {
+                        return .{
+                            .reason = .unzeroed_inter_field_padding,
+                            .byte_offset = cur_offset,
+                            .padding_bytes = aligned_off - cur_offset,
+                            .field_name = mem_sym.name_text,
+                        };
+                    }
+                    cur_offset = aligned_off +| f_layout.byte_size;
+                }
+                const max_align_bytes: u32 = @as(u32, 1) << @intCast(max_align_log2);
+                const total_size = alignUpU64(cur_offset, max_align_bytes);
+                if (!is_zero_padded and total_size > cur_offset) {
+                    return .{
+                        .reason = .unzeroed_tail_padding,
+                        .byte_offset = cur_offset,
+                        .padding_bytes = total_size - cur_offset,
+                        .field_name = st_sym.name_text,
+                    };
+                }
+                return null;
+            },
+            .union_ty => {
+                const sym_idx = SymbolIndex.fromInt(node.rhs);
+                if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) {
+                    return .{ .reason = .invalid_bit_patterns };
+                }
+                const un_sym = sym_table.getSymbol(sym_idx).*;
+                if (un_sym.contract_flags.is_secret) {
+                    return .{ .reason = .secret_type, .field_name = un_sym.name_text };
+                }
+                if (un_sym.target_scope.isNone()) return null;
+                const child_subst = NominalTypeSubst.fromNominal(self, sym_table, ty, un_sym, subst);
+                const active_subst = if (child_subst.len > 0) &child_subst else subst;
+                for (sym_table.getScopeMembers(un_sym.target_scope)) |mem_idx| {
+                    const mem_sym = sym_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind != .field_sym) continue;
+                    if (self.explainIntoBytesViolationBounded(
+                        mem_sym.type_id,
+                        sym_table,
+                        target_layout,
+                        active_subst,
+                        depth + 1,
+                    )) |sub_v| {
+                        return .{
+                            .reason = sub_v.reason,
+                            .byte_offset = sub_v.byte_offset,
+                            .padding_bytes = sub_v.padding_bytes,
+                            .field_name = if (sub_v.field_name.len > 0) sub_v.field_name else mem_sym.name_text,
+                        };
+                    }
+                }
+                if (!un_sym.contract_flags.is_zero_pad) {
+                    const un_layout = computeTypeLayoutBounded(self, sym_table, ty, target_layout, subst, depth + 1);
+                    return .{
+                        .reason = .union_requires_zero_pad,
+                        .byte_offset = 0,
+                        .padding_bytes = un_layout.byte_size,
+                        .field_name = un_sym.name_text,
+                    };
+                }
+                return null;
+            },
+            .enum_ty => {
+                const sym_idx = SymbolIndex.fromInt(node.rhs);
+                if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) {
+                    return .{ .reason = .invalid_bit_patterns };
+                }
+                const enum_sym = sym_table.getSymbol(sym_idx).*;
+                if (enum_sym.contract_flags.is_secret) {
+                    return .{ .reason = .secret_type, .field_name = enum_sym.name_text };
+                }
+                if (enum_sym.target_scope.isNone()) return null;
+                const child_subst = NominalTypeSubst.fromNominal(self, sym_table, ty, enum_sym, subst);
+                const active_subst = if (child_subst.len > 0) &child_subst else subst;
+                var has_payload = false;
+                for (sym_table.getScopeMembers(enum_sym.target_scope)) |mem_idx| {
+                    const mem_sym = sym_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind != .enum_variant_sym) continue;
+                    if (mem_sym.type_id != .unit_ty) {
+                        has_payload = true;
+                        if (self.explainIntoBytesViolationBounded(
+                            mem_sym.type_id,
+                            sym_table,
+                            target_layout,
+                            active_subst,
+                            depth + 1,
+                        )) |sub_v| {
+                            return sub_v;
+                        }
+                    }
+                }
+                if (has_payload and !enum_sym.contract_flags.is_zero_pad) {
+                    const enum_layout = computeTypeLayoutBounded(self, sym_table, ty, target_layout, subst, depth + 1);
+                    return .{
+                        .reason = .unzeroed_inter_field_padding,
+                        .byte_offset = 1,
+                        .padding_bytes = enum_layout.byte_size -| 1,
+                        .field_name = enum_sym.name_text,
+                    };
+                }
+                return null;
+            },
+            else => return .{ .reason = .invalid_bit_patterns },
+        }
+    }
+};
+
+/// Stack-allocated generic type-parameter substitution table for instantiated nominals (`DR-04` §1.4).
+pub const NominalTypeSubst = struct {
+    /// Maximum inline generic type parameters tracked per nominal declaration.
+    pub const MAX_PARAMS: usize = 16;
+
+    /// Declared `.type_param` `TypeId` keys from `sym.target_scope`.
+    keys: [MAX_PARAMS]TypeId = @splat(.err_ty),
+    /// Bound concrete `TypeId` arguments from `pool.getGenericTypeArgs(nominal_ty)`.
+    vals: [MAX_PARAMS]TypeId = @splat(.err_ty),
+    /// Active key-value pair count (`0` when non-generic).
+    len: u8 = 0,
+
+    /// Empty substitution identity.
+    pub const EMPTY: NominalTypeSubst = .{};
+
+    /// Builds a root substitution table directly from `nominal_ty` (unwrapping `distinct` / refinement layers).
+    pub fn init(
+        pool: *const InternPool,
+        sym_table: *const SymbolTable,
+        nominal_ty: TypeId,
+    ) NominalTypeSubst {
+        const unwrapped = pool.unwrapUnderlyingType(nominal_ty);
+        if (unwrapped.isError()) return EMPTY;
+        const node = pool.getNode(unwrapped);
+        if (node.tag != .struct_ty and node.tag != .enum_ty and
+            node.tag != .union_ty and node.tag != .bit_field_ty)
+        {
+            return EMPTY;
+        }
+        const sym_idx = SymbolIndex.fromInt(node.rhs);
+        if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return EMPTY;
+        return fromNominal(pool, sym_table, unwrapped, sym_table.getSymbol(sym_idx).*, &EMPTY);
+    }
+
+    /// Builds a stack substitution mapping `nom_sym`'s `.type_param_sym` members to `nominal_ty`'s generic args,
+    /// composing each argument through `parent_subst` for nested generic instantiations (`Outer[Inner[T]]`).
+    pub fn fromNominal(
+        pool: *const InternPool,
+        sym_table: *const SymbolTable,
+        nominal_ty: TypeId,
+        nom_sym: SymbolRecord,
+        parent_subst: *const NominalTypeSubst,
+    ) NominalTypeSubst {
+        var out: NominalTypeSubst = .{};
+        if (nom_sym.target_scope.isNone()) return out;
+        const raw_args = pool.getGenericTypeArgs(pool.unwrapUnderlyingType(nominal_ty));
+        if (raw_args.len == 0) return out;
+        var arg_idx: usize = 0;
+        for (sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
+            if (arg_idx >= raw_args.len or out.len >= MAX_PARAMS) break;
+            const mem_sym = sym_table.getSymbol(mem_idx).*;
+            if (mem_sym.kind != .type_param_sym or mem_sym.type_id.isError()) continue;
+            out.keys[out.len] = mem_sym.type_id;
+            out.vals[out.len] = parent_subst.resolve(TypeId.fromInt(raw_args[arg_idx]));
+            out.len += 1;
+            arg_idx += 1;
+        }
+        return out;
+    }
+
+    /// Resolves `ty` through up to `MAX_PARAMS` transitive steps if it matches `keys`, or returns `ty`.
+    pub inline fn resolve(self: *const NominalTypeSubst, ty: TypeId) TypeId {
+        var cur = ty;
+        var step: usize = 0;
+        while (step < self.len) : (step += 1) {
+            var has_matched = false;
+            for (0..self.len) |i| {
+                if (self.keys[i] == cur and self.vals[i] != cur) {
+                    cur = self.vals[i];
+                    has_matched = true;
+                    break;
+                }
+            }
+            if (!has_matched) break;
+        }
+        return cur;
+    }
+
+    /// Deeply substitutes `.type_param` occurrences in `member_ty` (including compound `[T; N]`, `(T, U)`, etc.).
+    pub fn applyMut(
+        self: *const NominalTypeSubst,
+        allocator: std.mem.Allocator,
+        pool: *InternPool,
+        member_ty: TypeId,
+    ) !TypeId {
+        if (self.len == 0 or member_ty.isPrimitiveOrSentinel() or !pool.getFlags(member_ty).has_type_vars) {
+            return member_ty;
+        }
+        const direct_ty = self.resolve(member_ty);
+        if (direct_ty != member_ty and !pool.getFlags(direct_ty).has_type_vars) return direct_ty;
+        var subst_map: SubstitutionMap = .{};
+        defer subst_map.deinit(allocator);
+        for (0..self.len) |i| {
+            try subst_map.put(
+                allocator,
+                self.keys[i],
+                self.vals[i],
+                .{ .file_id = .none, .start_byte = 0, .end_byte = 0 },
+            );
+        }
+        return subst_map.apply(pool, member_ty);
     }
 };
 
@@ -2075,17 +3322,19 @@ pub fn computeTypeLayoutWithPool(
     type_id: TypeId,
     target_layout: TargetLayout,
 ) TypeLayout {
-    return computeTypeLayoutBounded(pool, sym_table, type_id, target_layout, 0);
+    return computeTypeLayoutBounded(pool, sym_table, type_id, target_layout, &NominalTypeSubst.EMPTY, 0);
 }
 
-/// Depth-bounded helper (`MAX_TYPE_DEPTH`) for `computeTypeLayoutWithPool`.
+/// Depth-bounded helper (`MAX_TYPE_DEPTH`) for `computeTypeLayoutWithPool` with generic nominal substitution `subst`.
 fn computeTypeLayoutBounded(
     pool: *const InternPool,
     sym_table: *const SymbolTable,
-    type_id: TypeId,
+    raw_type_id: TypeId,
     target_layout: TargetLayout,
+    subst: *const NominalTypeSubst,
     depth: u32,
 ) TypeLayout {
+    const type_id = subst.resolve(raw_type_id);
     if (depth >= MAX_TYPE_DEPTH) {
         return .{ .byte_size = 0, .align_bytes = 1, .align_log2 = 0, .is_sized = false };
     }
@@ -2143,10 +3392,24 @@ fn computeTypeLayoutBounded(
             };
         },
         .distinct_ty, .bit_field_ty => {
-            return computeTypeLayoutBounded(pool, sym_table, TypeId.fromInt(node.lhs), target_layout, depth + 1);
+            return computeTypeLayoutBounded(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.lhs),
+                target_layout,
+                subst,
+                depth + 1,
+            );
         },
         .refined_ty => {
-            return computeTypeLayoutBounded(pool, sym_table, TypeId.fromInt(node.rhs), target_layout, depth + 1);
+            return computeTypeLayoutBounded(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.rhs),
+                target_layout,
+                subst,
+                depth + 1,
+            );
         },
         .array_ty, .soa_array_ty => {
             const elem_layout = computeTypeLayoutBounded(
@@ -2154,6 +3417,7 @@ fn computeTypeLayoutBounded(
                 sym_table,
                 TypeId.fromInt(node.lhs),
                 target_layout,
+                subst,
                 depth + 1,
             );
             if ((node.rhs & SYMBOLIC_ARRAY_LEN_FLAG) != 0 or !elem_layout.is_sized) {
@@ -2180,6 +3444,7 @@ fn computeTypeLayoutBounded(
                     sym_table,
                     TypeId.fromInt(raw_elem),
                     target_layout,
+                    subst,
                     depth + 1,
                 );
                 if (!elem_layout.is_sized) is_all_sized = false;
@@ -2203,6 +3468,8 @@ fn computeTypeLayoutBounded(
             if (struct_sym.target_scope.isNone()) {
                 return .{ .byte_size = 0, .align_bytes = 1, .align_log2 = 0 };
             }
+            const child_subst = NominalTypeSubst.fromNominal(pool, sym_table, type_id, struct_sym, subst);
+            const active_subst = if (child_subst.len > 0) &child_subst else subst;
             var cur_offset: u64 = 0;
             var max_align_log2: u8 = 0;
             var is_all_sized = true;
@@ -2214,6 +3481,7 @@ fn computeTypeLayoutBounded(
                     sym_table,
                     mem_sym.type_id,
                     target_layout,
+                    active_subst,
                     depth + 1,
                 );
                 if (!field_layout.is_sized) is_all_sized = false;
@@ -2237,6 +3505,8 @@ fn computeTypeLayoutBounded(
             if (union_sym.target_scope.isNone()) {
                 return .{ .byte_size = 0, .align_bytes = 1, .align_log2 = 0 };
             }
+            const child_subst = NominalTypeSubst.fromNominal(pool, sym_table, type_id, union_sym, subst);
+            const active_subst = if (child_subst.len > 0) &child_subst else subst;
             var max_field_size: u64 = 0;
             var max_align_log2: u8 = 0;
             var is_all_sized = true;
@@ -2248,6 +3518,7 @@ fn computeTypeLayoutBounded(
                     sym_table,
                     mem_sym.type_id,
                     target_layout,
+                    active_subst,
                     depth + 1,
                 );
                 if (!field_layout.is_sized) is_all_sized = false;
@@ -2268,6 +3539,7 @@ fn computeTypeLayoutBounded(
                 sym_table,
                 TypeId.fromInt(node.lhs),
                 target_layout,
+                subst,
                 depth + 1,
             );
             const max_align_log2: u8 = payload_layout.align_log2;
@@ -2286,6 +3558,7 @@ fn computeTypeLayoutBounded(
                 sym_table,
                 TypeId.fromInt(node.lhs),
                 target_layout,
+                subst,
                 depth + 1,
             );
             const err_layout = computeTypeLayoutBounded(
@@ -2293,6 +3566,7 @@ fn computeTypeLayoutBounded(
                 sym_table,
                 TypeId.fromInt(node.rhs),
                 target_layout,
+                subst,
                 depth + 1,
             );
             const max_payload_log2: u8 = @max(ok_layout.align_log2, err_layout.align_log2);
@@ -2315,6 +3589,8 @@ fn computeTypeLayoutBounded(
             if (enum_sym.target_scope.isNone()) {
                 return .{ .byte_size = 1, .align_bytes = 1, .align_log2 = 0 };
             }
+            const child_subst = NominalTypeSubst.fromNominal(pool, sym_table, type_id, enum_sym, subst);
+            const active_subst = if (child_subst.len > 0) &child_subst else subst;
             var variant_count: usize = 0;
             var max_payload_size: u64 = 0;
             var max_payload_log2: u8 = 0;
@@ -2329,6 +3605,7 @@ fn computeTypeLayoutBounded(
                         sym_table,
                         mem_sym.type_id,
                         target_layout,
+                        active_subst,
                         depth + 1,
                     );
                     if (!var_layout.is_sized) is_all_sized = false;
@@ -2339,7 +3616,15 @@ fn computeTypeLayoutBounded(
             if (variant_count == 0) {
                 return .{ .byte_size = 0, .align_bytes = 1, .align_log2 = 0 };
             }
-            const tag_log2: u8 = if (variant_count <= 256) 0 else if (variant_count <= 65_536) 1 else 2;
+            const auto_tag_log2: u8 = if (variant_count <= 256) 0 else if (variant_count <= 65_536) 1 else 2;
+            const repr_tag_log2: u8 = switch (enum_sym.repr_tag_bits) {
+                8 => 0,
+                16 => 1,
+                32 => 2,
+                64 => 3,
+                else => 0,
+            };
+            const tag_log2: u8 = @max(auto_tag_log2, repr_tag_log2);
             const tag_bytes: u64 = @as(u64, 1) << @intCast(tag_log2);
             const max_align_log2: u8 = @max(tag_log2, max_payload_log2);
             const max_align_bytes: u32 = @as(u32, 1) << @intCast(max_align_log2);
@@ -2382,12 +3667,13 @@ pub fn computeStructFieldOffset(
     const struct_sym = sym_table.getSymbol(sym_idx).*;
     if (struct_sym.target_scope.isNone()) return null;
 
+    const subst = NominalTypeSubst.fromNominal(pool, sym_table, unwrapped, struct_sym, &NominalTypeSubst.EMPTY);
     var cur_offset: u64 = 0;
     var cur_ordinal: u32 = 0;
     for (sym_table.getScopeMembers(struct_sym.target_scope)) |mem_idx| {
         const mem_sym = sym_table.getSymbol(mem_idx).*;
         if (mem_sym.kind != .field_sym) continue;
-        const field_layout = computeTypeLayoutWithPool(pool, sym_table, mem_sym.type_id, target_layout);
+        const field_layout = computeTypeLayoutBounded(pool, sym_table, mem_sym.type_id, target_layout, &subst, 1);
         const aligned_offset = alignUpU64(cur_offset, field_layout.align_bytes);
         if (cur_ordinal == field_ordinal) return aligned_offset;
         cur_offset = aligned_offset +| field_layout.byte_size;
@@ -2396,7 +3682,280 @@ pub fn computeStructFieldOffset(
     return null;
 }
 
-// ---------- Group Membership & `FromError` Registry -----------
+// ---------- Ownership Tiers, Context & Group Bounds -----------
+
+/// Returns `true` if `ty` (or its borrowed `&Context` / `&mut Context` target) is the `Context` capability struct.
+pub fn isContextType(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    ty: TypeId,
+) bool {
+    if (ty.isError()) return false;
+    var cur_ty = pool.unwrapRefinementBase(ty);
+    const cur_tag = pool.getTag(cur_ty);
+    if (cur_tag == .ref_ty or cur_tag == .mut_ref_ty) {
+        cur_ty = pool.unwrapRefinementBase(TypeId.fromInt(pool.getNode(cur_ty).lhs));
+    }
+    const node = pool.getNode(cur_ty);
+    if (node.tag != .struct_ty) return false;
+    const sym_idx = SymbolIndex.fromInt(node.rhs);
+    if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return false;
+    return std.mem.eql(u8, sym_table.getSymbol(sym_idx).name_text, "Context");
+}
+
+/// Returns `true` if `sym_table` records an explicit `Drop`/`AutoDrop` trait `impl` or inherent `fn drop` for `ty`.
+fn hasNominalDropTraitImpl(
+    sym_table: *const SymbolTable,
+    ty: TypeId,
+    base_nom_ty: TypeId,
+    target_scope: ScopeId,
+) bool {
+    if (!target_scope.isNone()) {
+        for (sym_table.getScopeMembers(target_scope)) |mem_idx| {
+            const mem_sym = sym_table.getSymbol(mem_idx).*;
+            if (mem_sym.kind == .fn_sym and std.mem.eql(u8, mem_sym.name_text, "drop")) {
+                return true;
+            }
+        }
+    }
+    var key_it = sym_table.trait_impl_pairs.keyIterator();
+    while (key_it.next()) |pair_key_ptr| {
+        const target_raw: u32 = @truncate(pair_key_ptr.* >> 32);
+        const trait_raw: u32 = @truncate(pair_key_ptr.*);
+        if (target_raw != ty.toU32() and target_raw != base_nom_ty.toU32()) continue;
+        const trait_idx = SymbolIndex.fromInt(trait_raw);
+        if (trait_idx.isNone() or trait_idx.asInt() >= sym_table.symbols.items.len) continue;
+        const trait_name = sym_table.getSymbol(trait_idx).name_text;
+        if (std.mem.eql(u8, trait_name, "Drop") or std.mem.eql(u8, trait_name, "AutoDrop")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Returns the maximum of two `OwnershipTier` values (`copy_tier < auto_drop_tier < linear_tier`).
+inline fn maxOwnershipTier(lhs_tier: OwnershipTier, rhs_tier: OwnershipTier) OwnershipTier {
+    return if (@backingInt(rhs_tier) > @backingInt(lhs_tier)) rhs_tier else lhs_tier;
+}
+
+/// Classifies `ty` into its canonical compile-time `OwnershipTier` (`Copy`, `AutoDrop`, or `@linear`, `DR-06` Section 1.2).
+pub fn classifyOwnershipTier(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    ty: TypeId,
+) OwnershipTier {
+    var visited_buf: [32]u64 = undefined;
+    return classifyOwnershipTierBounded(pool, sym_table, ty, &NominalTypeSubst.EMPTY, &visited_buf, 0);
+}
+
+/// Classifies `ty` under an active generic nominal substitution `subst` (`Copy`, `AutoDrop`, or `@linear`).
+pub fn classifyOwnershipTierWithSubst(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    ty: TypeId,
+    subst: *const NominalTypeSubst,
+) OwnershipTier {
+    var visited_buf: [32]u64 = undefined;
+    return classifyOwnershipTierBounded(pool, sym_table, ty, subst, &visited_buf, 0);
+}
+
+/// Cycle-safe, depth-bounded helper for `classifyOwnershipTier` with generic nominal substitution `subst`.
+fn classifyOwnershipTierBounded(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    raw_ty: TypeId,
+    subst: *const NominalTypeSubst,
+    visited_stack: *[32]u64,
+    depth: usize,
+) OwnershipTier {
+    const ty = subst.resolve(raw_ty);
+    if (ty.isError() or ty == .untyped_int_ty or ty == .untyped_float_ty or ty.isPrimitive()) {
+        return .copy_tier;
+    }
+    if (depth >= visited_stack.len) return .copy_tier;
+    const subst_tag: u64 = if (subst.len > 0) @as(u64, subst.vals[0].toU32()) << 32 else 0;
+    const visit_key: u64 = subst_tag | @as(u64, ty.toU32());
+    for (visited_stack[0..depth]) |seen_raw| {
+        if (seen_raw == visit_key) return .copy_tier;
+    }
+    visited_stack[depth] = visit_key;
+    const next_depth = depth + 1;
+
+    const node = pool.getNode(ty);
+    switch (node.tag) {
+        .mut_ref_ty => return .linear_tier,
+        .slice_ty,
+        .soa_slice_ty,
+        .ref_ty,
+        .raw_ptr_ty,
+        .fn_ty,
+        .bit_field_ty,
+        .trait_ty,
+        .builtin_group,
+        .user_group,
+        .tilde_approx,
+        .bind_once_group_var,
+        .bind_many_any_var,
+        .type_param,
+        => return .copy_tier,
+        .dyn_trait_ty => return .auto_drop_tier,
+        .closure_ty => {
+            if (pool.getFnSignatureView(ty)) |sig_view| {
+                return sig_view.capture_tier;
+            }
+            return .copy_tier;
+        },
+        .refined_ty => {
+            if (pool.getRefinementBounds(ty)) |bounds| {
+                return classifyOwnershipTierBounded(pool, sym_table, bounds.base_ty, subst, visited_stack, next_depth);
+            }
+            return classifyOwnershipTierBounded(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.rhs),
+                subst,
+                visited_stack,
+                next_depth,
+            );
+        },
+        .array_ty, .soa_array_ty, .optional_ty => {
+            return classifyOwnershipTierBounded(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.lhs),
+                subst,
+                visited_stack,
+                next_depth,
+            );
+        },
+        .result_ty => {
+            const ok_tier = classifyOwnershipTierBounded(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.lhs),
+                subst,
+                visited_stack,
+                next_depth,
+            );
+            if (ok_tier == .linear_tier) return .linear_tier;
+            const err_tier = classifyOwnershipTierBounded(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.rhs),
+                subst,
+                visited_stack,
+                next_depth,
+            );
+            return maxOwnershipTier(ok_tier, err_tier);
+        },
+        .tuple_ty => {
+            var max_tier: OwnershipTier = .copy_tier;
+            for (pool.getTupleElements(ty)) |raw_elem| {
+                const elem_tier = classifyOwnershipTierBounded(
+                    pool,
+                    sym_table,
+                    TypeId.fromInt(raw_elem),
+                    subst,
+                    visited_stack,
+                    next_depth,
+                );
+                max_tier = maxOwnershipTier(max_tier, elem_tier);
+                if (max_tier == .linear_tier) return .linear_tier;
+            }
+            return max_tier;
+        },
+        .distinct_ty => {
+            const sym_idx = SymbolIndex.fromInt(node.rhs);
+            if (!sym_idx.isNone() and sym_idx.asInt() < sym_table.symbols.items.len) {
+                const dist_sym = sym_table.getSymbol(sym_idx).*;
+                if (dist_sym.contract_flags.is_linear) return .linear_tier;
+                if (hasNominalDropTraitImpl(sym_table, ty, dist_sym.type_id, dist_sym.target_scope)) {
+                    const inner_tier = classifyOwnershipTierBounded(
+                        pool,
+                        sym_table,
+                        TypeId.fromInt(node.lhs),
+                        subst,
+                        visited_stack,
+                        next_depth,
+                    );
+                    return maxOwnershipTier(.auto_drop_tier, inner_tier);
+                }
+            }
+            if (pool.getFlags(ty).has_drop) {
+                const inner_tier = classifyOwnershipTierBounded(
+                    pool,
+                    sym_table,
+                    TypeId.fromInt(node.lhs),
+                    subst,
+                    visited_stack,
+                    next_depth,
+                );
+                return maxOwnershipTier(.auto_drop_tier, inner_tier);
+            }
+            return classifyOwnershipTierBounded(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.lhs),
+                subst,
+                visited_stack,
+                next_depth,
+            );
+        },
+        .struct_ty, .enum_ty, .union_ty => {
+            const sym_idx = SymbolIndex.fromInt(node.rhs);
+            if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) {
+                return if (pool.getFlags(ty).has_drop) .auto_drop_tier else .copy_tier;
+            }
+            const nom_sym = sym_table.getSymbol(sym_idx).*;
+            if (nom_sym.contract_flags.is_linear or LINEAR_BUILTIN_TYPE_MAP.has(nom_sym.name_text)) {
+                return .linear_tier;
+            }
+            if (COPY_BUILTIN_NOMINAL_MAP.has(nom_sym.name_text)) {
+                return .copy_tier;
+            }
+            var max_tier: OwnershipTier = .copy_tier;
+            if (AUTO_DROP_CONTAINER_MAP.has(nom_sym.name_text) or
+                pool.getFlags(ty).has_drop or
+                hasNominalDropTraitImpl(sym_table, ty, nom_sym.type_id, nom_sym.target_scope))
+            {
+                max_tier = .auto_drop_tier;
+            }
+            const child_subst = NominalTypeSubst.fromNominal(pool, sym_table, ty, nom_sym, subst);
+            const active_subst = if (child_subst.len > 0) &child_subst else subst;
+            for (pool.getGenericTypeArgs(ty)) |raw_arg| {
+                const arg_tier = classifyOwnershipTierBounded(
+                    pool,
+                    sym_table,
+                    TypeId.fromInt(raw_arg),
+                    subst,
+                    visited_stack,
+                    next_depth,
+                );
+                max_tier = maxOwnershipTier(max_tier, arg_tier);
+                if (max_tier == .linear_tier) return .linear_tier;
+            }
+            if (!nom_sym.target_scope.isNone()) {
+                for (sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
+                    const mem_sym = sym_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind != .field_sym and mem_sym.kind != .enum_variant_sym) continue;
+                    if (mem_sym.type_id == .unit_ty or mem_sym.type_id.isError()) continue;
+                    const child_tier = classifyOwnershipTierBounded(
+                        pool,
+                        sym_table,
+                        mem_sym.type_id,
+                        active_subst,
+                        visited_stack,
+                        next_depth,
+                    );
+                    max_tier = maxOwnershipTier(max_tier, child_tier);
+                    if (max_tier == .linear_tier) return .linear_tier;
+                }
+            }
+            return max_tier;
+        },
+        else => return .copy_tier,
+    }
+}
 
 /// Classification of whether a candidate type satisfies a Constrained Type Group or `~T` bound.
 pub const GroupMatchResult = enum(u8) {
@@ -2410,39 +3969,91 @@ pub const GroupMatchResult = enum(u8) {
     matched_exact = 3,
 };
 
-/// Evaluates whether `candidate_ty` satisfies `group_ty` (built-in group, user group, or `~T`).
+/// Evaluates whether `candidate_ty` satisfies `group_ty` (built-in group, `Copy`/`FromBytes`/`IntoBytes`, user group, or `~T`).
 pub fn checkGroupSatisfaction(
     pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    target_layout: TargetLayout,
     candidate_ty: TypeId,
     group_ty: TypeId,
 ) GroupMatchResult {
-    return checkGroupSatisfactionBounded(pool, candidate_ty, group_ty, 0);
+    return checkGroupSatisfactionBounded(pool, sym_table, target_layout, candidate_ty, group_ty, 0);
 }
 
 /// Depth-bounded helper (`MAX_TYPE_DEPTH`) for `checkGroupSatisfaction`.
 fn checkGroupSatisfactionBounded(
     pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    target_layout: TargetLayout,
     candidate_ty: TypeId,
     group_ty: TypeId,
     depth: u32,
 ) GroupMatchResult {
     if (depth >= MAX_TYPE_DEPTH) return .rejected;
-    if (candidate_ty.isError() or group_ty.isError() or group_ty == .group_copy) {
-        return .matched_exact;
+    if (candidate_ty.isError() or group_ty.isError()) return .matched_exact;
+
+    // [1] Ownership & wire-transmute structural groups (checked BEFORE `unwrapRefinementBase`):
+    if (group_ty == .group_copy) {
+        return if (classifyOwnershipTier(pool, sym_table, candidate_ty) == .copy_tier)
+            .matched_exact
+        else
+            .rejected;
     }
+    if (group_ty == .group_from_bytes) {
+        return if (pool.isFromBytesValid(candidate_ty, sym_table, target_layout))
+            .matched_exact
+        else
+            .rejected;
+    }
+    if (group_ty == .group_into_bytes) {
+        return if (pool.isIntoBytesValid(candidate_ty, sym_table, target_layout))
+            .matched_exact
+        else
+            .rejected;
+    }
+
     const unwrapped_refinement = pool.unwrapRefinementBase(candidate_ty);
     const underlying_ty = pool.unwrapUnderlyingType(candidate_ty);
     const is_distinct_candidate = (pool.getTag(unwrapped_refinement) == .distinct_ty);
 
-    // [1] `~Target` underlying-type approximation:
+    // [2] `~Target` underlying-type approximation:
     const group_node = pool.getNode(group_ty);
     if (group_node.tag == .tilde_approx) {
         const inner_target = TypeId.fromInt(group_node.lhs);
+        if (inner_target == .group_copy or
+            inner_target == .group_from_bytes or
+            inner_target == .group_into_bytes)
+        {
+            if (pool.getFlags(candidate_ty).is_secret and
+                (inner_target == .group_from_bytes or inner_target == .group_into_bytes))
+            {
+                return .rejected;
+            }
+            const direct_match = checkGroupSatisfactionBounded(
+                pool,
+                sym_table,
+                target_layout,
+                candidate_ty,
+                inner_target,
+                depth + 1,
+            );
+            if (direct_match == .matched_exact or direct_match == .matched_via_tilde) {
+                return if (is_distinct_candidate) .matched_via_tilde else direct_match;
+            }
+            return .rejected;
+        }
         if (inner_target.isBuiltinGroup() or
             pool.getTag(inner_target) == .user_group or
             pool.getTag(inner_target) == .tilde_approx)
         {
-            const base_match = checkGroupSatisfactionBounded(pool, underlying_ty, inner_target, depth + 1);
+            const base_match = checkGroupSatisfactionBounded(
+                pool,
+                sym_table,
+                target_layout,
+                underlying_ty,
+                inner_target,
+                depth + 1,
+            );
             if (base_match == .matched_exact or base_match == .matched_via_tilde) {
                 return if (is_distinct_candidate) .matched_via_tilde else base_match;
             }
@@ -2456,7 +4067,7 @@ fn checkGroupSatisfactionBounded(
         return .rejected;
     }
 
-    // [2] Built-in Constrained Type Group (`32..42`):
+    // [3] Built-in Constrained Type Group (`32..41`):
     if (group_ty.isBuiltinGroup() or group_node.tag == .builtin_group) {
         const mask = if (group_ty.isBuiltinGroup())
             TypeGroupMask.forBuiltinGroup(group_ty)
@@ -2483,7 +4094,7 @@ fn checkGroupSatisfactionBounded(
         return .rejected;
     }
 
-    // [3] User-defined Constrained Type Group (`type G = A | ~B`):
+    // [4] User-defined Constrained Type Group (`type G = A | ~B`):
     if (pool.getUserGroupView(group_ty)) |view| {
         if (candidate_ty == .untyped_int_ty) {
             if (((view.prim_mask | view.tilde_prim_mask) & TypeGroupMask.INTEGER) != 0) {
@@ -2528,7 +4139,7 @@ fn checkGroupSatisfactionBounded(
         return .rejected;
     }
 
-    // [4] Nominal trait bound (`[T: MyTrait]`):
+    // [5] Nominal trait bound (`[T: MyTrait]`):
     if (unwrapped_refinement == group_ty) return .matched_exact;
     return .rejected;
 }
@@ -2541,13 +4152,20 @@ pub fn isTypeGroupSubset(
 ) bool {
     if (sub_group == super_group) return true;
     if (sub_group.isBuiltinGroup() and super_group.isBuiltinGroup()) {
+        if (sub_group == .group_copy or
+            sub_group == .group_from_bytes or
+            sub_group == .group_into_bytes)
+        {
+            return super_group == .group_copy;
+        }
+        if (super_group == .group_copy) return true;
         return TypeGroupMask.isSubsetOf(
             TypeGroupMask.forBuiltinGroup(sub_group),
             TypeGroupMask.forBuiltinGroup(super_group),
         );
     }
     if (pool.getUserGroupView(sub_group)) |sub_view| {
-        if (super_group.isBuiltinGroup()) {
+        if (super_group.isBuiltinGroup() and super_group != .group_copy) {
             const super_mask = TypeGroupMask.forBuiltinGroup(super_group);
             return sub_view.exact_members.len == 0 and
                 sub_view.tilde_members.len == 0 and
@@ -2692,8 +4310,14 @@ pub const TypeChecker = struct {
     call_instantiations: std.AutoHashMapUnmanaged(u32, []TypeId) = .empty,
     /// `@from` `FromError` conversion `DefId`s keyed by `.try_expr` `NodeIndex.asInt()`.
     try_conversions: std.AutoHashMapUnmanaged(u32, DefId) = .empty,
+    /// Resolved `.narrow` / `.try_narrow` call metadata keyed by `.method_call` `NodeIndex.asInt()` (`D-11`).
+    narrow_calls: std.AutoHashMapUnmanaged(u32, NarrowCallInfo) = .empty,
     /// Validated `@attribute_schema` instances collected across declarations, fields, and variants.
     attr_instances: std.ArrayListUnmanaged(AttrInstance) = .empty,
+    /// `true` when checking a privileged `std` library file permitted to declare `@std_cap_boundary`.
+    is_stdlib_file: bool = false,
+    /// Lazily synthesized `std::mem::BumpArena` `TypeId` for `Context.scratch` (`D-04`).
+    builtin_bump_arena_ty: TypeId = .err_ty,
     /// Active lexical `ScopeId` during body checking.
     current_scope: ScopeId = .none,
     /// Declared return `TypeId` of the enclosing function (`.unit_ty` at module level).
@@ -2809,6 +4433,7 @@ pub const TypeChecker = struct {
         }
         self.call_instantiations.deinit(self.allocator);
         self.try_conversions.deinit(self.allocator);
+        self.narrow_calls.deinit(self.allocator);
         for (self.attr_instances.items) |attr_inst| {
             if (attr_inst.fields.len > 0) self.allocator.free(attr_inst.fields);
         }
@@ -2978,6 +4603,14 @@ pub const TypeChecker = struct {
             }
         }
 
+        var narrow_iter = self.narrow_calls.iterator();
+        while (narrow_iter.next()) |entry| {
+            const raw_node = entry.key_ptr.*;
+            if (raw_node >= result.ast_start and raw_node < result.ast_end) {
+                try result.narrow_calls.put(allocator, raw_node - result.ast_start, entry.value_ptr.*);
+            }
+        }
+
         var matching_attrs: std.ArrayListUnmanaged(AttrInstance) = .empty;
         errdefer {
             for (matching_attrs.items) |attr_item| {
@@ -3046,6 +4679,7 @@ pub const TypeChecker = struct {
     pub fn resolveModuleSignatures(self: *TypeChecker) !void {
         const mod_scope = self.sym_table.file_module_scopes.get(self.file_id.asInt()) orelse return;
         try self.resolveScopeSignaturesRecursive(mod_scope);
+        try self.propagateNominalFlagsFixpoint();
         if (self.ast_arena.countNodes() > 0) {
             const root_node = self.ast_arena.getNode(.root);
             if (root_node.lhs.tag == .extra and root_node.rhs.tag == .extra and root_node.rhs.payload > 0) {
@@ -3056,7 +4690,118 @@ pub const TypeChecker = struct {
                 try self.registerImplTraitPairsInItemSlice(mod_scope, root_items);
             }
         }
+        try self.propagateNominalFlagsFixpoint();
         try self.verifyScopeDerivesAndAttributesRecursive(mod_scope);
+    }
+
+    /// Runs a bounded fixpoint propagating `is_secret` (`[MAJOR-01]`) and ownership flags (`is_copy`, `has_drop`).
+    fn propagateNominalFlagsFixpoint(self: *TypeChecker) !void {
+        // [1] Bounded transitive fixpoint propagating `TypeFlags.is_secret` upward across composites:
+        var pass_idx: u32 = 0;
+        while (pass_idx < MAX_TYPE_DEPTH) : (pass_idx += 1) {
+            var has_changed = false;
+            var raw_ty: u32 = TypeId.first_dynamic.toU32();
+            while (raw_ty < self.pool.nodes.len) : (raw_ty += 1) {
+                const cur_ty = TypeId.fromInt(raw_ty);
+                if (self.pool.getFlags(cur_ty).is_secret) continue;
+                const node = self.pool.getNode(cur_ty);
+                const is_marked_secret: bool = switch (node.tag) {
+                    .ref_ty,
+                    .mut_ref_ty,
+                    .raw_ptr_ty,
+                    .slice_ty,
+                    .soa_slice_ty,
+                    .array_ty,
+                    .soa_array_ty,
+                    .optional_ty,
+                    .tilde_approx,
+                    => self.pool.getFlags(TypeId.fromInt(node.lhs)).is_secret,
+                    .result_ty => self.pool.getFlags(TypeId.fromInt(node.lhs)).is_secret or
+                        self.pool.getFlags(TypeId.fromInt(node.rhs)).is_secret,
+                    .tuple_ty => blk: {
+                        for (self.pool.getTupleElements(cur_ty)) |raw_elem| {
+                            if (self.pool.getFlags(TypeId.fromInt(raw_elem)).is_secret) break :blk true;
+                        }
+                        break :blk false;
+                    },
+                    .distinct_ty => self.pool.getFlags(TypeId.fromInt(node.lhs)).is_secret or
+                        (!SymbolIndex.fromInt(node.rhs).isNone() and
+                            self.sym_table.getSymbol(SymbolIndex.fromInt(node.rhs)).contract_flags.is_secret),
+                    .refined_ty => self.pool.getFlags(TypeId.fromInt(node.rhs)).is_secret,
+                    .struct_ty, .union_ty, .bit_field_ty, .enum_ty => blk: {
+                        const sym_idx = SymbolIndex.fromInt(node.rhs);
+                        if (sym_idx.isNone()) break :blk false;
+                        const nom_sym = self.sym_table.getSymbol(sym_idx).*;
+                        if (nom_sym.contract_flags.is_secret) break :blk true;
+                        for (self.pool.getGenericTypeArgs(cur_ty)) |raw_arg| {
+                            if (self.pool.getFlags(TypeId.fromInt(raw_arg)).is_secret) break :blk true;
+                        }
+                        if (nom_sym.target_scope.isNone()) break :blk false;
+                        for (self.sym_table.getScopeMembers(nom_sym.target_scope)) |member_idx| {
+                            const member_sym = self.sym_table.getSymbol(member_idx).*;
+                            if ((member_sym.kind == .field_sym or member_sym.kind == .enum_variant_sym) and
+                                !member_sym.type_id.isError() and
+                                self.pool.getFlags(member_sym.type_id).is_secret)
+                            {
+                                break :blk true;
+                            }
+                        }
+                        break :blk false;
+                    },
+                    else => false,
+                };
+                if (is_marked_secret) {
+                    self.pool.nodes.items(.flags)[raw_ty].is_secret = true;
+                    has_changed = true;
+                }
+            }
+            if (!has_changed) break;
+        }
+
+        // [2] Evict premature `@derive(Debug)` registrations on transitively `@secret` nominals and sync `is_copy` / `has_drop`:
+        const debug_trait_idx = try self.lookupAndEnsureTraitByName("Debug");
+        const display_trait_idx = try self.lookupAndEnsureTraitByName("Display");
+        var raw_ty: u32 = TypeId.first_dynamic.toU32();
+        while (raw_ty < self.pool.nodes.len) : (raw_ty += 1) {
+            const cur_ty = TypeId.fromInt(raw_ty);
+            const node = self.pool.getNode(cur_ty);
+            if (node.flags.is_secret) {
+                if (!debug_trait_idx.isNone()) {
+                    _ = self.sym_table.trait_impl_pairs.remove(packTraitImplPair(cur_ty, debug_trait_idx));
+                }
+                if (!display_trait_idx.isNone()) {
+                    _ = self.sym_table.trait_impl_pairs.remove(packTraitImplPair(cur_ty, display_trait_idx));
+                }
+            }
+            switch (node.tag) {
+                .struct_ty,
+                .enum_ty,
+                .union_ty,
+                .bit_field_ty,
+                .distinct_ty,
+                .refined_ty,
+                .tuple_ty,
+                .array_ty,
+                .soa_array_ty,
+                .optional_ty,
+                .result_ty,
+                .closure_ty,
+                .mut_ref_ty,
+                .ref_ty,
+                .raw_ptr_ty,
+                .slice_ty,
+                .soa_slice_ty,
+                .fn_ty,
+                => {
+                    const tier = classifyOwnershipTier(self.pool, self.sym_table, cur_ty);
+                    self.pool.nodes.items(.flags)[raw_ty].is_copy = (tier == .copy_tier);
+                    if (tier == .auto_drop_tier) {
+                        self.pool.nodes.items(.flags)[raw_ty].has_drop = true;
+                    }
+                },
+                else => {},
+            }
+        }
     }
 
     /// Recursively resolves declarations in `scope_id` and its child module/type scopes.
@@ -3082,23 +4827,23 @@ pub const TypeChecker = struct {
                     sym_idx,
                     false,
                     sym.flags.is_must_use,
-                    sym.flags.is_soa_annotated,
+                    sym.contract_flags.is_secret,
                 ),
                 .enum_sym => try self.pool.internNominal(
                     .enum_ty,
                     sym.def_id.asInt(),
                     sym_idx,
-                    true,
+                    !sym.contract_flags.is_linear,
                     sym.flags.is_must_use,
-                    false,
+                    sym.contract_flags.is_secret,
                 ),
                 .union_sym => try self.pool.internNominal(
                     .union_ty,
                     sym.def_id.asInt(),
                     sym_idx,
-                    true,
+                    !sym.contract_flags.is_linear,
                     sym.flags.is_must_use,
-                    false,
+                    sym.contract_flags.is_secret,
                 ),
                 .bit_field_sym => blk: {
                     var backing_ty: TypeId = .u32_ty;
@@ -3120,7 +4865,7 @@ pub const TypeChecker = struct {
                         sym_idx,
                         true,
                         sym.flags.is_must_use,
-                        false,
+                        sym.contract_flags.is_secret,
                     );
                 },
                 .trait_sym => try self.pool.internNominal(
@@ -3360,17 +5105,203 @@ pub const TypeChecker = struct {
                         const target_ty = try self.resolveTypeAst(target_ast);
                         if (!target_ty.isError()) {
                             if (self.sym_table.type_to_symbol.get(trait_ty.toU32())) |trait_sym_idx| {
-                                try self.sym_table.trait_impl_pairs.put(
-                                    self.sym_table.allocator,
-                                    packTraitImplPair(target_ty, trait_sym_idx),
-                                    {},
+                                const trait_sym = self.sym_table.getSymbol(trait_sym_idx).*;
+                                const is_fmt_trait = std.mem.eql(u8, trait_sym.name_text, "Debug") or
+                                    std.mem.eql(u8, trait_sym.name_text, "Display");
+                                if (is_fmt_trait and self.pool.getFlags(target_ty).is_secret) {
+                                    var ty_buf: [96]u8 = undefined;
+                                    const target_str = self.pool.formatType(target_ty, self.sym_table, &ty_buf);
+                                    var msg_buf: [200]u8 = undefined;
+                                    const msg = std.fmt.bufPrint(
+                                        &msg_buf,
+                                        "cannot implement `{s}` for `@secret` type `{s}`",
+                                        .{ trait_sym.name_text, target_str },
+                                    ) catch "cannot implement formatting trait for `@secret` type";
+                                    try self.emitDiagnosticSimple(
+                                        .e0402_unsatisfied_trait_bound,
+                                        self.getAstNodeSpan(item_node_id),
+                                        msg,
+                                        "`@secret` types forbid `Debug` and `Display` formatting",
+                                    );
+                                } else {
+                                    try self.sym_table.trait_impl_pairs.put(
+                                        self.sym_table.allocator,
+                                        packTraitImplPair(target_ty, trait_sym_idx),
+                                        {},
+                                    );
+                                    if ((std.mem.eql(u8, trait_sym.name_text, "Drop") or
+                                        std.mem.eql(u8, trait_sym.name_text, "AutoDrop")) and
+                                        !target_ty.isPrimitive() and target_ty.toU32() < self.pool.nodes.len)
+                                    {
+                                        self.pool.nodes.items(.flags)[target_ty.toU32()].has_drop = true;
+                                        self.pool.nodes.items(.flags)[target_ty.toU32()].is_copy = false;
+                                    }
+                                }
+                                try self.verifyImplMethodContractNonEscalation(
+                                    item_node_id,
+                                    target_ty,
+                                    trait_sym_idx,
+                                    self.sym_table.type_to_symbol.get(target_ty.toU32()) == null,
                                 );
                             }
                         }
                     }
                 }
+            } else {
+                const target_ast = self.findFirstAstInCstRange(start_idx + 1, header_end_pos);
+                var resolved_target_ty: TypeId = .err_ty;
+                const is_non_nominal = if (!target_ast.isNone()) blk_non_nom: {
+                    resolved_target_ty = try self.resolveTypeAst(target_ast);
+                    break :blk_non_nom self.sym_table.type_to_symbol.get(resolved_target_ty.toU32()) == null;
+                } else true;
+                try self.verifyImplMethodContractNonEscalation(
+                    item_node_id,
+                    resolved_target_ty,
+                    .none,
+                    is_non_nominal,
+                );
             }
         }
+    }
+
+    /// Verifies that `impl` methods preserve all trait contracts (`E0323`, `Fix-17`) and checks `@std_cap_boundary` (`E0327`).
+    fn verifyImplMethodContractNonEscalation(
+        self: *TypeChecker,
+        impl_node_id: NodeIndex,
+        target_ty: TypeId,
+        trait_sym_idx: SymbolIndex,
+        is_checking_cap_boundary: bool,
+    ) !void {
+        const impl_node = self.ast_arena.getNode(impl_node_id);
+        if (impl_node.rhs.tag != .extra) return;
+        const start_extra: usize = impl_node.rhs.payload;
+        if (start_extra >= self.ast_arena.extra_data.items.len) return;
+        var end_extra: usize = start_extra;
+        while (end_extra < self.ast_arena.extra_data.items.len) : (end_extra += 1) {
+            if (self.ast_arena.extra_data.items[end_extra] >= impl_node_id.asInt()) break;
+        }
+        const member_items = self.ast_arena.extra_data.items[start_extra..end_extra];
+        const trait_sym_opt = if (!trait_sym_idx.isNone()) self.sym_table.getSymbol(trait_sym_idx).* else null;
+        const target_scope: ScopeId = if (!target_ty.isError()) blk_scope: {
+            if (self.sym_table.type_to_symbol.get(target_ty.toU32())) |target_sym_idx| {
+                break :blk_scope self.sym_table.getSymbol(target_sym_idx).target_scope;
+            }
+            break :blk_scope .none;
+        } else .none;
+
+        for (member_items) |raw_member_id| {
+            const member_ast_id = NodeIndex.fromInt(raw_member_id);
+            if (member_ast_id.isNone() or member_ast_id.asInt() >= self.ast_arena.countNodes()) continue;
+            const member_ast = self.ast_arena.getNode(member_ast_id);
+            if (member_ast.tag != .fn_decl) continue;
+            const member_cst = self.ast_arena.getCstOrigin(member_ast_id);
+            const mem_meta = try symbol_resolver.extractItemHeaderMetadataValidated(
+                self.source,
+                self.file_id,
+                self.token_buffer,
+                self.cst_arena,
+                member_cst,
+                member_ast.main_token,
+                null,
+            );
+            const method_span = self.getAstNodeSpan(member_ast_id);
+            if (is_checking_cap_boundary and mem_meta.contract_flags.is_std_cap_boundary and !self.is_stdlib_file) {
+                try self.emitDiagnosticSimple(
+                    .e0327_forbidden_sandbox_bypass_attribute,
+                    method_span,
+                    "`@std_cap_boundary` is restricted to privileged `std` library modules",
+                    "forbidden capability-boundary attribute in user code",
+                );
+            }
+
+            const trait_sym = trait_sym_opt orelse continue;
+            if (!target_scope.isNone()) {
+                for (self.sym_table.getScopeMembers(target_scope)) |cand_sym_idx| {
+                    const cand_sym = self.sym_table.getSymbol(cand_sym_idx);
+                    if (cand_sym.kind == .fn_sym and cand_sym.ast_node == member_ast_id) {
+                        try self.sym_table.impl_method_trait.put(
+                            self.sym_table.allocator,
+                            cand_sym_idx.asInt(),
+                            trait_sym_idx,
+                        );
+                        break;
+                    }
+                }
+            }
+            if (trait_sym.target_scope.isNone()) continue;
+            const method_name = self.extractFnDeclNameFromCst(member_cst, member_ast.main_token);
+            if (method_name.len == 0) continue;
+            const method_sym_id = try self.interner.intern(method_name);
+            const trait_method_idx = self.sym_table.lookupInScopeDirect(
+                trait_sym.target_scope,
+                method_sym_id,
+                NamespaceMask.VALUE_ONLY,
+            );
+            if (trait_method_idx.isNone()) continue;
+            const trait_method = self.sym_table.getSymbol(trait_method_idx).*;
+            if (trait_method.kind != .fn_sym) continue;
+
+            const missing_contract: ?[]const u8 = if (trait_method.contract_flags.is_no_alloc and
+                !mem_meta.contract_flags.is_no_alloc)
+                "@no_alloc"
+            else if (trait_method.contract_flags.is_no_panic and !mem_meta.contract_flags.is_no_panic)
+                "@no_panic"
+            else if (trait_method.contract_flags.is_no_block and !mem_meta.contract_flags.is_no_block)
+                "@no_block"
+            else
+                null;
+
+            if (missing_contract) |contract_attr| {
+                var msg_buf: [220]u8 = undefined;
+                const msg = std.fmt.bufPrint(
+                    &msg_buf,
+                    "`impl` method `{s}` omits required `{s}` contract declared by trait `{s}`",
+                    .{ method_name, contract_attr, trait_sym.name_text },
+                ) catch "`impl` method omits required effect contract declared by trait";
+                try self.emitDiagnosticSimple(
+                    .e0323_trait_impl_effect_escalation,
+                    method_span,
+                    msg,
+                    "trait implementation cannot escalate effect or allocation contracts",
+                );
+            }
+        }
+    }
+
+    /// Extracts the declared function identifier lexeme from a `.fn_decl` CST subtree.
+    fn extractFnDeclNameFromCst(
+        self: *const TypeChecker,
+        fn_cst: CstNodeIndex,
+        fallback_tok: TokenIndex,
+    ) []const u8 {
+        if (!fn_cst.isNone() and fn_cst.asInt() < self.cst_arena.countNodes()) {
+            const start_idx: usize = fn_cst.asInt();
+            const root_rec = self.cst_arena.getNode(fn_cst);
+            const end_idx: usize = @min(
+                start_idx + @max(@as(usize, root_rec.subtree_size), 1),
+                self.cst_arena.countNodes(),
+            );
+            var has_seen_kw_fn = false;
+            var cur: usize = start_idx + 1;
+            while (cur < end_idx) : (cur += 1) {
+                const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+                if (sub.kind == .attribute) {
+                    if (sub.subtree_size > 1) cur += @as(usize, sub.subtree_size) - 1;
+                    continue;
+                }
+                if (sub.kind == .block or sub.kind == .param_list or sub.kind == .type_params) break;
+                const is_leaf = sub.subtree_size <= 1 and !sub.flags.is_bracketed;
+                if (!is_leaf or sub.flags.is_missing_or_injected or sub.token.isNone()) continue;
+                if (sub.token.asInt() >= self.token_buffer.countTokens()) continue;
+                const tok_kind = self.token_buffer.getToken(sub.token).kind;
+                if (tok_kind == .kw_fn) {
+                    has_seen_kw_fn = true;
+                } else if (has_seen_kw_fn and symbol_resolver.isIdentifierToken(tok_kind)) {
+                    return symbol_resolver.extractTokenSlice(self.source, self.token_buffer, sub.token);
+                }
+            }
+        }
+        return symbol_resolver.extractTokenSlice(self.source, self.token_buffer, fallback_tok);
     }
 
     /// Registers Two-Phase `@derive(Eq, Hash, Debug, Clone)` trait headers and method signatures (`DR-05` §2.2).
@@ -3419,6 +5350,11 @@ pub const TypeChecker = struct {
 
         for (specs) |spec| {
             if (!spec.is_enabled) continue;
+            if (std.mem.eql(u8, spec.trait_name, "Debug") and
+                (nom_sym.contract_flags.is_secret or self.pool.getFlags(nom_sym.type_id).is_secret))
+            {
+                continue;
+            }
             const trait_sym_idx = try self.lookupAndEnsureTraitByName(spec.trait_name);
             if (!trait_sym_idx.isNone()) {
                 try self.sym_table.trait_impl_pairs.put(
@@ -3465,7 +5401,7 @@ pub const TypeChecker = struct {
         }
     }
 
-    /// Recursively verifies `@attribute_schema` rules, `@derive` member bounds, and user `@Schema(...)` attributes.
+    /// Recursively verifies `@attribute_schema` rules, `@derive` member bounds, and user `@Schema(…)` attributes.
     fn verifyScopeDerivesAndAttributesRecursive(self: *TypeChecker, scope_id: ScopeId) anyerror!void {
         const saved_scope = self.current_scope;
         self.current_scope = scope_id;
@@ -3481,6 +5417,28 @@ pub const TypeChecker = struct {
             const sym = self.sym_table.getSymbol(sym_idx).*;
             if (sym.flags.is_builtin or sym.flags.is_imported) continue;
 
+            if (sym.contract_flags.is_std_cap_boundary and !self.is_stdlib_file) {
+                try self.emitDiagnosticSimple(
+                    .e0327_forbidden_sandbox_bypass_attribute,
+                    sym.decl_span,
+                    "`@std_cap_boundary` is restricted to privileged `std` library modules",
+                    "forbidden capability-boundary attribute in user code",
+                );
+            }
+            if (sym.contract_flags.is_secret and
+                sym.kind != .struct_sym and
+                sym.kind != .distinct_type_sym and
+                sym.kind != .type_alias_sym and
+                sym.kind != .refined_type_sym and
+                sym.kind != .type_group_sym)
+            {
+                try self.emitDiagnosticSimple(
+                    .e0405_distinct_type_mixing,
+                    sym.decl_span,
+                    "`@secret` is only permitted on `struct` declarations and `distinct` type aliases",
+                    "use `struct` or `type Name = distinct Base;` for `@secret` values",
+                );
+            }
             if (sym.flags.is_attribute_schema) {
                 try self.validateAttributeSchemaDecl(sym_idx);
             }
@@ -3505,6 +5463,14 @@ pub const TypeChecker = struct {
                         for (child_members) |child_idx| {
                             const child_sym = self.sym_table.getSymbol(child_idx).*;
                             if (child_sym.flags.is_builtin or child_sym.flags.is_imported) continue;
+                            if (child_sym.contract_flags.is_std_cap_boundary and !self.is_stdlib_file) {
+                                try self.emitDiagnosticSimple(
+                                    .e0327_forbidden_sandbox_bypass_attribute,
+                                    child_sym.decl_span,
+                                    "`@std_cap_boundary` is restricted to privileged `std` library modules",
+                                    "forbidden capability-boundary attribute in user code",
+                                );
+                            }
                             if (child_sym.kind == .field_sym or child_sym.kind == .enum_variant_sym) {
                                 try self.validateSymbolAttributes(child_idx, sym.def_id);
                             } else if (child_sym.kind == .fn_sym) {
@@ -3601,7 +5567,7 @@ pub const TypeChecker = struct {
         const nom_sym = self.sym_table.getSymbol(nominal_sym_idx).*;
         if (nom_sym.target_scope.isNone()) return;
 
-        // Validate unknown trait identifiers inside `@derive(...)`:
+        // Validate unknown trait identifiers inside `@derive(…)`:
         if (!nom_sym.cst_node.isNone() and nom_sym.cst_node.asInt() < self.cst_arena.countNodes()) {
             const start_idx: usize = nom_sym.cst_node.asInt();
             const root_rec = self.cst_arena.getNode(nom_sym.cst_node);
@@ -3635,6 +5601,23 @@ pub const TypeChecker = struct {
 
         for (checks) |chk| {
             if (!chk.is_enabled) continue;
+            if (std.mem.eql(u8, chk.name, "Debug") and
+                (nom_sym.contract_flags.is_secret or self.pool.getFlags(nom_sym.type_id).is_secret))
+            {
+                var msg_buf: [200]u8 = undefined;
+                const msg = std.fmt.bufPrint(
+                    &msg_buf,
+                    "cannot `@derive(Debug)` on `@secret` type `{s}`",
+                    .{nom_sym.name_text},
+                ) catch "cannot `@derive(Debug)` on `@secret` type";
+                try self.emitDiagnosticSimple(
+                    .e0402_unsatisfied_trait_bound,
+                    nom_sym.decl_span,
+                    msg,
+                    "`@secret` types forbid `Debug` formatting to prevent credential leakage",
+                );
+                continue;
+            }
             const trait_sym_idx = try self.lookupAndEnsureTraitByName(chk.name);
             if (trait_sym_idx.isNone()) continue;
             const trait_ty = self.sym_table.getSymbol(trait_sym_idx).type_id;
@@ -3663,7 +5646,7 @@ pub const TypeChecker = struct {
         }
     }
 
-    /// Checks that every identifier passed to `@derive(...)` resolves to a known trait (`E0403` / `E0402`).
+    /// Checks that every identifier passed to `@derive(…)` resolves to a known trait (`E0403` / `E0402`).
     fn checkDeriveTraitNamesInAttrCst(self: *TypeChecker, attr_start: usize, attr_end: usize) !void {
         var has_seen_derive = false;
         var cur = attr_start + 1;
@@ -3687,7 +5670,7 @@ pub const TypeChecker = struct {
                         try self.emitDiagnosticSimple(
                             .e0402_unsatisfied_trait_bound,
                             span,
-                            "`@derive(...)` argument must be a trait",
+                            "`@derive(…)` argument must be a trait",
                             "expected trait identifier here",
                         );
                     }
@@ -3722,23 +5705,34 @@ pub const TypeChecker = struct {
         if (target_ty == .never_ty) return true;
         const bound_ty = self.pool.unwrapUnderlyingType(trait_ty);
         if (bound_ty.isBuiltinGroup() or self.pool.getTag(bound_ty) == .user_group) {
-            const sat = checkGroupSatisfaction(self.pool, target_ty, bound_ty);
+            const sat = checkGroupSatisfaction(self.pool, self.sym_table, self.target_layout, target_ty, bound_ty);
             return sat != .rejected and sat != .rejected_distinct_without_tilde;
         }
 
         const trait_sym_idx = self.sym_table.type_to_symbol.get(bound_ty.toU32()) orelse return false;
+        const trait_sym = self.sym_table.getSymbol(trait_sym_idx).*;
+        const t_name = trait_sym.name_text;
+        if (self.pool.getFlags(target_ty).is_secret and
+            (std.mem.eql(u8, t_name, "Debug") or std.mem.eql(u8, t_name, "Display")))
+        {
+            return false;
+        }
         if (self.sym_table.trait_impl_pairs.contains(packTraitImplPair(target_ty, trait_sym_idx))) {
             return true;
         }
 
-        const trait_sym = self.sym_table.getSymbol(trait_sym_idx).*;
         const target_node = self.pool.getNode(target_ty);
         if (target_node.tag == .refined_ty) {
             return self.hasTraitImplementation(TypeId.fromInt(target_node.rhs), trait_ty, depth + 1);
         }
 
         if (!trait_sym.flags.is_builtin) return false;
-        const t_name = trait_sym.name_text;
+        if (std.mem.eql(u8, t_name, "Copy")) {
+            return classifyOwnershipTier(self.pool, self.sym_table, target_ty) == .copy_tier;
+        }
+        if (std.mem.eql(u8, t_name, "AutoDrop")) {
+            return classifyOwnershipTier(self.pool, self.sym_table, target_ty) == .auto_drop_tier;
+        }
 
         if (std.mem.eql(u8, t_name, "Send") or std.mem.eql(u8, t_name, "Sync")) {
             return target_node.tag != .raw_ptr_ty;
@@ -3810,7 +5804,7 @@ pub const TypeChecker = struct {
         };
     }
 
-    /// Validates user `@Schema(...)` attributes attached to `target_sym_idx`, populating `self.attr_instances`.
+    /// Validates user `@Schema(…)` attributes attached to `target_sym_idx`, populating `self.attr_instances`.
     fn validateSymbolAttributes(
         self: *TypeChecker,
         target_sym_idx: SymbolIndex,
@@ -4077,7 +6071,7 @@ pub const TypeChecker = struct {
         return .none;
     }
 
-    /// Validates one `name = expr` or positional `expr` segment inside an `@Schema(...)` call.
+    /// Validates one `name = expr` or positional `expr` segment inside an `@Schema(…)` call.
     fn checkAttributeArgumentSegment(
         self: *TypeChecker,
         schema_scope: ScopeId,
@@ -4278,6 +6272,14 @@ pub const TypeChecker = struct {
 
         // [1] User-defined Constrained Type Group (`type G = A | ~B;`):
         if (ast_node.lhs.tag == .extra and ast_node.rhs.tag == .extra) {
+            if (sym.contract_flags.is_secret) {
+                try self.emitDiagnosticSimple(
+                    .e0405_distinct_type_mixing,
+                    sym.decl_span,
+                    "`@secret` cannot be applied to a Constrained Type Group; use `type Name = distinct Base;`",
+                    "help: declare a nominal `@secret` newtype with `distinct`",
+                );
+            }
             const member_slice = self.ast_arena.getExtraSlice(
                 ExtraIndex.fromInt(ast_node.lhs.payload),
                 ast_node.rhs.payload,
@@ -4339,12 +6341,31 @@ pub const TypeChecker = struct {
             );
             if (std.mem.eql(u8, mode_lexeme, "distinct") and target_ast.lhs.tag == .node) {
                 const base_ty = try self.resolveTypeAst(NodeIndex.fromInt(target_ast.lhs.payload));
-                return self.pool.internDistinct(base_ty, sym_idx);
+                const dist_ty = try self.pool.internDistinct(base_ty, sym_idx);
+                if (sym.contract_flags.is_secret and !dist_ty.isError() and dist_ty.toU32() < self.pool.nodes.len) {
+                    self.pool.nodes.items(.flags)[dist_ty.toU32()].is_secret = true;
+                }
+                return dist_ty;
             }
         }
 
         const base_ty = try self.resolveTypeAst(target_ast_id);
         if (base_ty.isError()) return .err_ty;
+
+        if (sym.contract_flags.is_secret) {
+            var msg_buf: [220]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &msg_buf,
+                "`@secret` cannot be applied to transparent type alias `{s}`; use `type {s} = distinct …;`",
+                .{ sym.name_text, sym.name_text },
+            ) catch "`@secret` requires a `distinct` newtype rather than a transparent alias";
+            try self.emitDiagnosticSimple(
+                .e0405_distinct_type_mixing,
+                sym.decl_span,
+                msg,
+                "help: add `distinct` after `=` to isolate the `@secret` type",
+            );
+        }
 
         // [3] Range or pattern refinement (`type Port = u16 is 1024..=65535;`):
         if (ast_node.rhs.tag == .node) {
@@ -4373,10 +6394,47 @@ pub const TypeChecker = struct {
         return base_ty;
     }
 
+    /// Registers header `.type_param` declarations on a nominal `struct`, `union`, `bit_field`, or `enum`.
+    fn registerNominalHeaderTypeParams(
+        self: *TypeChecker,
+        target_scope: ScopeId,
+        cst_node: CstNodeIndex,
+    ) !void {
+        if (target_scope.isNone() or cst_node.isNone() or cst_node.asInt() >= self.cst_arena.countNodes()) return;
+        for (self.sym_table.getScopeMembers(target_scope)) |existing_idx| {
+            const existing_kind = self.sym_table.getSymbol(existing_idx).kind;
+            if (existing_kind == .type_param_sym or existing_kind == .const_param_sym) return;
+        }
+        const start_idx: usize = cst_node.asInt();
+        const root_rec = self.cst_arena.getNode(cst_node);
+        const end_idx: usize = @min(
+            start_idx + @max(@as(usize, root_rec.subtree_size), 1),
+            self.cst_arena.countNodes(),
+        );
+        var cursor: usize = start_idx + 1;
+        while (cursor < end_idx) {
+            const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cursor)));
+            if (sub.kind == .struct_field or sub.kind == .enum_variant or sub.kind == .block) break;
+            if (sub.kind == .type_param) {
+                const param_end = @min(cursor + @max(@as(usize, sub.subtree_size), 1), end_idx);
+                try self.registerGenericTypeParamFromCst(target_scope, cursor, param_end);
+                cursor = param_end;
+                continue;
+            }
+            cursor += 1;
+        }
+    }
+
     /// Resolves field types of a `struct`, `union`, or `bit_field` declaration and checks `bit_field` widths.
     fn resolveStructOrBitFieldFields(self: *TypeChecker, struct_sym_idx: SymbolIndex) !void {
         const struct_sym = self.sym_table.getSymbol(struct_sym_idx).*;
         if (struct_sym.target_scope.isNone() or struct_sym.ast_node.isNone()) return;
+
+        const saved_scope = self.current_scope;
+        self.current_scope = struct_sym.target_scope;
+        defer self.current_scope = saved_scope;
+
+        try self.registerNominalHeaderTypeParams(struct_sym.target_scope, struct_sym.cst_node);
 
         const ast_node = self.ast_arena.getNode(struct_sym.ast_node);
         const field_members = try self.allocator.dupe(
@@ -4453,7 +6511,11 @@ pub const TypeChecker = struct {
             if (!self.pool.getFlags(field_ty).is_copy) has_all_copy_fields = false;
             field_i += 1;
         }
-        if (has_all_copy_fields and struct_sym.type_id.toU32() < self.pool.nodes.len) {
+        if (has_all_copy_fields and
+            !struct_sym.contract_flags.is_linear and
+            struct_sym.type_id.toU32() < self.pool.nodes.len and
+            !self.pool.getFlags(struct_sym.type_id).has_drop)
+        {
             self.pool.nodes.items(.flags)[struct_sym.type_id.toU32()].is_copy = true;
         }
     }
@@ -4473,6 +6535,12 @@ pub const TypeChecker = struct {
     fn resolveEnumVariantPayloads(self: *TypeChecker, enum_sym_idx: SymbolIndex) !void {
         const enum_sym = self.sym_table.getSymbol(enum_sym_idx).*;
         if (enum_sym.target_scope.isNone()) return;
+
+        const saved_scope = self.current_scope;
+        self.current_scope = enum_sym.target_scope;
+        defer self.current_scope = saved_scope;
+
+        try self.registerNominalHeaderTypeParams(enum_sym.target_scope, enum_sym.cst_node);
 
         const variant_members = try self.allocator.dupe(
             SymbolIndex,
@@ -4599,12 +6667,18 @@ pub const TypeChecker = struct {
         if (is_must_use) {
             self.sym_table.getSymbolMut(fn_sym_idx).flags.is_must_use = true;
         }
-        const fn_ty = try self.pool.internFn(
+        const fn_contracts: FnPtrContractMask = .{
+            .has_no_alloc = fn_sym.contract_flags.is_no_alloc,
+            .has_no_panic = fn_sym.contract_flags.is_no_panic,
+            .has_no_block = fn_sym.contract_flags.is_no_block,
+        };
+        const fn_ty = try self.pool.internFnWithContracts(
             .fn_ty,
             param_types.items,
             param_modes.items,
             ret_ty,
             is_must_use,
+            fn_contracts,
         );
         self.sym_table.getSymbolMut(fn_sym_idx).type_id = fn_ty;
 
@@ -4700,6 +6774,7 @@ pub const TypeChecker = struct {
         var name_tok: TokenIndex = .none;
         var is_mut = false;
         var is_comptime_param = false;
+        var is_local_param = false;
         var has_amp = false;
         var is_self_param = false;
         var mode: ParamMode = .let_mode;
@@ -4709,6 +6784,19 @@ pub const TypeChecker = struct {
         while (cur < cst_end) : (cur += 1) {
             const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
             if (sub.kind == .attribute) {
+                const attr_end = @min(cur + @max(@as(usize, sub.subtree_size), 1), cst_end);
+                var attr_cur = cur + 1;
+                while (attr_cur < attr_end) : (attr_cur += 1) {
+                    const attr_leaf = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(attr_cur)));
+                    if (attr_leaf.subtree_size > 1 or attr_leaf.token.isNone() or
+                        attr_leaf.token.asInt() >= self.token_buffer.countTokens()) continue;
+                    const attr_kind = self.token_buffer.getToken(attr_leaf.token).kind;
+                    if (symbol_resolver.isIdentifierToken(attr_kind)) {
+                        const attr_lex = symbol_resolver.extractTokenSlice(self.source, self.token_buffer, attr_leaf.token);
+                        if (std.mem.eql(u8, attr_lex, "local")) is_local_param = true;
+                        break;
+                    }
+                }
                 if (sub.subtree_size > 1) cur += @as(usize, sub.subtree_size) - 1;
                 continue;
             }
@@ -4823,6 +6911,7 @@ pub const TypeChecker = struct {
                     .decl_span = self.token_buffer.getTokenSpan(self.file_id, name_tok),
                     .type_id = param_ty,
                     .member_ordinal = ordinal,
+                    .contract_flags = .{ .is_local_only = is_local_param },
                 }, self.diagnostic_sink);
                 const owner_def: DefId = if (!fn_sym_idx.isNone())
                     self.sym_table.getSymbol(fn_sym_idx).def_id
@@ -4950,6 +7039,54 @@ pub const TypeChecker = struct {
                 break :blk try self.pool.internTuple(elem_types);
             },
             .fn_type => blk: {
+                var fn_contracts: FnPtrContractMask = .{};
+                const fn_cst = self.ast_arena.getCstOrigin(type_node_id);
+                if (!fn_cst.isNone() and fn_cst.asInt() < self.cst_arena.countNodes()) {
+                    const cst_start: usize = fn_cst.asInt();
+                    const cst_rec = self.cst_arena.getNode(fn_cst);
+                    const cst_end: usize = @min(
+                        cst_start + @max(@as(usize, cst_rec.subtree_size), 1),
+                        self.cst_arena.countNodes(),
+                    );
+                    var cur: usize = cst_start + 1;
+                    while (cur < cst_end) : (cur += 1) {
+                        const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+                        if (sub.kind == .attribute) {
+                            const attr_end = @min(cur + @max(@as(usize, sub.subtree_size), 1), cst_end);
+                            var attr_cur = cur + 1;
+                            while (attr_cur < attr_end) : (attr_cur += 1) {
+                                const leaf = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(attr_cur)));
+                                if (leaf.subtree_size > 1 or leaf.token.isNone() or
+                                    leaf.token.asInt() >= self.token_buffer.countTokens()) continue;
+                                const leaf_kind = self.token_buffer.getToken(leaf.token).kind;
+                                if (symbol_resolver.isIdentifierToken(leaf_kind)) {
+                                    const attr_lex = symbol_resolver.extractTokenSlice(
+                                        self.source,
+                                        self.token_buffer,
+                                        leaf.token,
+                                    );
+                                    if (std.mem.eql(u8, attr_lex, "no_alloc")) {
+                                        fn_contracts.has_no_alloc = true;
+                                    } else if (std.mem.eql(u8, attr_lex, "no_panic")) {
+                                        fn_contracts.has_no_panic = true;
+                                    } else if (std.mem.eql(u8, attr_lex, "no_block")) {
+                                        fn_contracts.has_no_block = true;
+                                    }
+                                    break;
+                                }
+                            }
+                            if (sub.subtree_size > 1) cur += @as(usize, sub.subtree_size) - 1;
+                            continue;
+                        }
+                        if (sub.subtree_size <= 1 and !sub.token.isNone() and
+                            sub.token.asInt() < self.token_buffer.countTokens() and
+                            self.token_buffer.getToken(sub.token).kind == .kw_fn)
+                        {
+                            break;
+                        }
+                    }
+                }
+
                 var ret_ty: TypeId = .unit_ty;
                 if (ast_node.rhs.tag == .node) {
                     ret_ty = try self.resolveTypeAst(NodeIndex.fromInt(ast_node.rhs.payload));
@@ -4960,11 +7097,36 @@ pub const TypeChecker = struct {
                 defer param_modes.deinit(self.allocator);
                 if (ast_node.lhs.tag == .extra) {
                     const start_extra: usize = ast_node.lhs.payload;
+                    const param_upper_bound: u32 = if (ast_node.rhs.tag == .node)
+                        @min(ast_node.rhs.payload, type_node_id.asInt())
+                    else
+                        type_node_id.asInt();
+                    const fn_cst_start: usize = if (!fn_cst.isNone()) fn_cst.asInt() else 0;
+                    const fn_cst_end: usize = if (!fn_cst.isNone() and fn_cst.asInt() < self.cst_arena.countNodes())
+                        @min(
+                            fn_cst_start + @max(@as(usize, self.cst_arena.getNode(fn_cst).subtree_size), 1),
+                            self.cst_arena.countNodes(),
+                        )
+                    else
+                        0;
+                    var prev_param_raw: ?u32 = null;
                     var cur_extra = start_extra;
                     while (cur_extra < self.ast_arena.extra_data.items.len) : (cur_extra += 1) {
                         const cand_node = self.ast_arena.extra_data.items[cur_extra];
-                        if (cand_node >= type_node_id.asInt()) break;
+                        if (cand_node >= param_upper_bound) break;
+                        if (prev_param_raw) |prev_raw| {
+                            if (cand_node <= prev_raw) break;
+                        }
                         const cand_id = NodeIndex.fromInt(cand_node);
+                        if (fn_cst_end > fn_cst_start) {
+                            const cand_cst = self.ast_arena.getCstOrigin(cand_id);
+                            if (cand_cst.isNone() or cand_cst.asInt() < fn_cst_start or
+                                cand_cst.asInt() >= fn_cst_end)
+                            {
+                                break;
+                            }
+                        }
+                        prev_param_raw = cand_node;
                         var fn_param_mode: ParamMode = .let_mode;
                         if (self.ast_arena.getNode(cand_id).tag == .mode_type) {
                             const m_tok = self.ast_arena.getNode(cand_id).main_token;
@@ -4984,12 +7146,13 @@ pub const TypeChecker = struct {
                         try param_modes.append(self.allocator, fn_param_mode);
                     }
                 }
-                break :blk try self.pool.internFn(
+                break :blk try self.pool.internFnWithContracts(
                     .fn_ty,
                     param_types.items,
                     param_modes.items,
                     ret_ty,
                     false,
+                    fn_contracts,
                 );
             },
             .mode_type => blk: {
@@ -5132,11 +7295,112 @@ pub const TypeChecker = struct {
                         .unit_ty;
                     break :blk try self.pool.internOptional(payload_ty);
                 }
-                break :blk try self.resolveNamedOrGroupTypeRaw(type_node_id);
+                const base_ty = try self.resolveNamedOrGroupTypeRaw(type_node_id);
+                if (arg_slice.len == 0) break :blk base_ty;
+
+                const resolved_args = try self.allocator.alloc(TypeId, arg_slice.len);
+                defer self.allocator.free(resolved_args);
+                for (arg_slice, 0..) |raw_arg_ast, i| {
+                    resolved_args[i] = try self.resolveTypeAst(NodeIndex.fromInt(raw_arg_ast));
+                }
+                if (base_ty.isError()) break :blk .err_ty;
+
+                const base_node = self.pool.getNode(base_ty);
+                if (base_node.tag == .struct_ty or base_node.tag == .enum_ty or base_node.tag == .union_ty) {
+                    break :blk try self.internNominalWithResolvedArgs(base_ty, resolved_args);
+                }
+                break :blk base_ty;
             },
             else => .err_ty,
         };
         return self.recordNodeType(type_node_id, resolved);
+    }
+
+    /// Interns an instantiated nominal container (`base_ty[resolved_args]`) and updates its ownership flags.
+    fn internNominalWithResolvedArgs(
+        self: *TypeChecker,
+        base_ty: TypeId,
+        resolved_args: []const TypeId,
+    ) !TypeId {
+        if (base_ty.isError() or resolved_args.len == 0) return base_ty;
+        const base_node = self.pool.getNode(base_ty);
+        if (base_node.tag != .struct_ty and base_node.tag != .enum_ty and base_node.tag != .union_ty) {
+            return base_ty;
+        }
+        const base_sym_idx = SymbolIndex.fromInt(base_node.rhs);
+        const base_name = if (!base_sym_idx.isNone())
+            self.sym_table.getSymbol(base_sym_idx).name_text
+        else
+            "";
+        var has_non_copy_arg = false;
+        for (resolved_args) |arg_ty| {
+            if (arg_ty.isError()) return .err_ty;
+            if (classifyOwnershipTier(self.pool, self.sym_table, arg_ty) != .copy_tier) {
+                has_non_copy_arg = true;
+            }
+        }
+        var provisional_is_copy = base_node.flags.is_copy and !has_non_copy_arg;
+        var provisional_has_drop = base_node.flags.has_drop;
+        if (COPY_BUILTIN_NOMINAL_MAP.has(base_name)) {
+            provisional_is_copy = true;
+            provisional_has_drop = false;
+        } else if (LINEAR_BUILTIN_TYPE_MAP.has(base_name)) {
+            provisional_is_copy = false;
+            provisional_has_drop = false;
+        } else if (AUTO_DROP_CONTAINER_MAP.has(base_name)) {
+            provisional_is_copy = false;
+            provisional_has_drop = true;
+        }
+        const inst_ty = try self.pool.internNominalInstantiation(
+            base_ty,
+            resolved_args,
+            provisional_is_copy,
+            provisional_has_drop,
+        );
+        if (!inst_ty.isError() and !base_sym_idx.isNone()) {
+            try self.sym_table.type_to_symbol.put(self.allocator, inst_ty.toU32(), base_sym_idx);
+            if (!self.pool.getFlags(inst_ty).has_type_vars and inst_ty.toU32() < self.pool.nodes.len) {
+                const final_tier = classifyOwnershipTier(self.pool, self.sym_table, inst_ty);
+                self.pool.nodes.items(.flags)[inst_ty.toU32()].is_copy = (final_tier == .copy_tier);
+                self.pool.nodes.items(.flags)[inst_ty.toU32()].has_drop = (final_tier == .auto_drop_tier);
+            }
+        }
+        return inst_ty;
+    }
+
+    /// Substitutes generic `.type_param` occurrences in `member_ty` using `nominal_ty`'s concrete type arguments.
+    fn substituteNominalMemberType(
+        self: *TypeChecker,
+        nominal_ty: TypeId,
+        member_ty: TypeId,
+    ) !TypeId {
+        if (member_ty.isPrimitiveOrSentinel() or !self.pool.getFlags(member_ty).has_type_vars) {
+            return member_ty;
+        }
+        const nom_subst = NominalTypeSubst.init(
+            self.pool,
+            self.sym_table,
+            self.pool.unwrapUnderlyingType(nominal_ty),
+        );
+        if (nom_subst.len == 0) return member_ty;
+        const subst_ty = try nom_subst.applyMut(self.allocator, self.pool, member_ty);
+        if (!subst_ty.isError() and !self.pool.getFlags(subst_ty).has_type_vars) {
+            const subst_node = self.pool.getNode(subst_ty);
+            if ((subst_node.tag == .struct_ty or subst_node.tag == .enum_ty or subst_node.tag == .union_ty) and
+                self.pool.getGenericTypeArgs(subst_ty).len > 0)
+            {
+                const sym_idx = SymbolIndex.fromInt(subst_node.rhs);
+                if (!sym_idx.isNone()) {
+                    try self.sym_table.type_to_symbol.put(self.allocator, subst_ty.toU32(), sym_idx);
+                    if (subst_ty.toU32() < self.pool.nodes.len) {
+                        const tier = classifyOwnershipTier(self.pool, self.sym_table, subst_ty);
+                        self.pool.nodes.items(.flags)[subst_ty.toU32()].is_copy = (tier == .copy_tier);
+                        self.pool.nodes.items(.flags)[subst_ty.toU32()].has_drop = (tier == .auto_drop_tier);
+                    }
+                }
+            }
+        }
+        return subst_ty;
     }
 
     /// Searches `expr_id` for a reference to a generic `.const_param_sym` or `comptime` `.param_sym`.
@@ -5760,9 +8024,9 @@ pub const TypeChecker = struct {
 
         // `PrimKind` 19 variants (`DR-05` §3.3):
         const prim_variants = [_][]const u8{
-            "Bool", "I8", "I16", "I32", "I64", "I128", "Isize",
-            "U8", "U16", "U32", "U64", "U128", "Usize",
-            "F32", "F64", "Char", "Str", "Unit", "Never",
+            "Bool", "I8",   "I16", "I32",  "I64",   "I128",  "Isize",
+            "U8",   "U16",  "U32", "U64",  "U128",  "Usize", "F32",
+            "F64",  "Char", "Str", "Unit", "Never",
         };
         const prim_scope = self.sym_table.getSymbol(prim_kind_sym).target_scope;
         for (prim_variants, 0..) |variant_name, i| {
@@ -6050,6 +8314,12 @@ pub const TypeChecker = struct {
                         return self.sym_table.getSymbol(meta_sym_idx).type_id;
                     }
                 }
+                // Lazily synthesize built-in `Context`, `@linear` resources, `AutoDrop` containers, and `Copy` handles:
+                if (seg_count <= 1) {
+                    if (try self.ensureBuiltinStdNominalType(target_lexeme)) |builtin_nom_ty| {
+                        return builtin_nom_ty;
+                    }
+                }
                 if (self.diagnostic_sink) |sink| {
                     const suggestion = if (seg_count <= 1)
                         self.sym_table.suggestClosestSymbol(
@@ -6074,6 +8344,136 @@ pub const TypeChecker = struct {
                 return .err_ty;
             },
         }
+    }
+
+    /// Lazily synthesizes built-in `Context`, `@linear` resource, `AutoDrop` container, and `Copy` handle nominals.
+    fn ensureBuiltinStdNominalType(self: *TypeChecker, type_name: []const u8) anyerror!?TypeId {
+        const is_context = std.mem.eql(u8, type_name, "Context");
+        const is_allocator = std.mem.eql(u8, type_name, "Allocator");
+        const is_linear = LINEAR_BUILTIN_TYPE_MAP.has(type_name);
+        const is_auto_drop = AUTO_DROP_CONTAINER_MAP.has(type_name);
+        const is_copy_handle = COPY_BUILTIN_NOMINAL_MAP.has(type_name);
+        if (!is_context and !is_allocator and !is_linear and !is_auto_drop and !is_copy_handle) {
+            return null;
+        }
+
+        const target_scope = self.sym_table.prelude_scope;
+        if (target_scope.isNone()) return null;
+        const sym_id = try self.interner.intern(type_name);
+        const existing_idx = self.sym_table.lookupInScopeDirect(target_scope, sym_id, NamespaceMask.TYPE_ONLY);
+        if (!existing_idx.isNone()) {
+            const existing_ty = self.sym_table.getSymbol(existing_idx).type_id;
+            if (!existing_ty.isError()) return existing_ty;
+        }
+
+        const member_scope = try self.sym_table.scope_arena.allocScope(
+            .nominal_type_scope,
+            target_scope,
+            .NONE,
+            .none,
+            .{},
+        );
+        const is_copy_nom = is_allocator or is_copy_handle;
+        const sym_idx = if (!existing_idx.isNone()) blk_existing: {
+            self.sym_table.getSymbolMut(existing_idx).target_scope = member_scope;
+            if (is_linear) self.sym_table.getSymbolMut(existing_idx).contract_flags.is_linear = true;
+            break :blk_existing existing_idx;
+        } else try self.sym_table.defineSymbol(.{
+            .name = sym_id,
+            .name_text = self.interner.get(sym_id),
+            .kind = .struct_sym,
+            .namespace = .type_ns,
+            .visibility = .public,
+            .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+            .scope_id = target_scope,
+            .target_scope = member_scope,
+            .contract_flags = .{ .is_linear = is_linear },
+        }, null);
+
+        const nom_ty = try self.pool.internNominal(
+            .struct_ty,
+            0xFE00_0000 | (sym_idx.asInt() & 0x00FF_FFFF),
+            sym_idx,
+            is_copy_nom,
+            false,
+            false,
+        );
+        if (is_auto_drop and nom_ty.toU32() < self.pool.nodes.len) {
+            self.pool.nodes.items(.flags)[nom_ty.toU32()].has_drop = true;
+            self.pool.nodes.items(.flags)[nom_ty.toU32()].is_copy = false;
+        }
+        self.sym_table.getSymbolMut(sym_idx).type_id = nom_ty;
+        try self.sym_table.type_to_symbol.put(self.allocator, nom_ty.toU32(), sym_idx);
+        if (std.mem.eql(u8, type_name, "BumpArena")) {
+            self.builtin_bump_arena_ty = nom_ty;
+        }
+
+        // Define local helper to register synthetic built-in struct fields on `owner_scope`:
+        const addSyntheticField = struct {
+            //! Local helper namespace for synthetic built-in `.field_sym` registration.
+
+            /// Interns `field_name` and registers a public built-in `.field_sym` in `owner_scope`.
+            fn run(
+                checker: *TypeChecker,
+                owner_scope: ScopeId,
+                field_name: []const u8,
+                field_ty: TypeId,
+                ordinal: u16,
+            ) !void {
+                const field_id = try checker.interner.intern(field_name);
+                _ = try checker.sym_table.defineSymbol(.{
+                    .name = field_id,
+                    .name_text = checker.interner.get(field_id),
+                    .kind = .field_sym,
+                    .namespace = .value_ns,
+                    .visibility = .public,
+                    .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+                    .scope_id = owner_scope,
+                    .type_id = field_ty,
+                    .member_ordinal = ordinal,
+                }, null);
+            }
+        }.run;
+
+        if (is_context) {
+            for (ContextFieldLayout.CANONICAL_FIELDS) |slot| {
+                const slot_ty = (try self.resolveContextSeamFieldType(slot.name)) orelse .err_ty;
+                try addSyntheticField(self, member_scope, slot.name, slot_ty, slot.slot_ordinal);
+            }
+            if (nom_ty.toU32() < self.pool.nodes.len) {
+                self.pool.nodes.items(.flags)[nom_ty.toU32()].is_copy = false;
+            }
+        } else if (std.mem.eql(u8, type_name, "Span16")) {
+            try addSyntheticField(self, member_scope, "off", .u16_ty, 0);
+            try addSyntheticField(self, member_scope, "len", .u16_ty, 1);
+        } else if (std.mem.eql(u8, type_name, "SlotKey")) {
+            try addSyntheticField(self, member_scope, "index", .u32_ty, 0);
+            try addSyntheticField(self, member_scope, "generation", .u32_ty, 1);
+        } else if (is_allocator or is_linear) {
+            try addSyntheticField(self, member_scope, "_handle", .usize_ty, 0);
+        } else if (is_auto_drop) {
+            try addSyntheticField(self, member_scope, "_ptr", .usize_ty, 0);
+            try addSyntheticField(self, member_scope, "_len", .usize_ty, 1);
+            try addSyntheticField(self, member_scope, "_cap", .usize_ty, 2);
+        }
+        return nom_ty;
+    }
+
+    /// Resolves the canonical `TypeId` for a `Context` Seam #2 field (`allocator`, `scratch`, `rng_seed`, `trace_sink`).
+    pub fn resolveContextSeamFieldType(self: *TypeChecker, field_name: []const u8) anyerror!?TypeId {
+        const layout = ContextFieldLayout.fromFieldName(field_name) orelse return null;
+        return switch (layout.kind) {
+            .allocator => (try self.ensureBuiltinStdNominalType("Allocator")) orelse .usize_ty,
+            .scratch => blk: {
+                const bump_ty = if (!self.builtin_bump_arena_ty.isError())
+                    self.builtin_bump_arena_ty
+                else
+                    (try self.ensureBuiltinStdNominalType("BumpArena")) orelse .usize_ty;
+                break :blk try self.pool.internArray(bump_ty, 2, false);
+            },
+            .rng_seed => .u64_ty,
+            .trace_sink => try self.pool.internOptional(try self.pool.internRawPtr(.u8_ty, true)),
+        };
     }
 
     /// Returns `true` if `cst_id` contains a direct `.kw_mut` token leaf.
@@ -7569,7 +9969,10 @@ pub const TypeChecker = struct {
                                 NamespaceMask.VALUE_ONLY,
                             );
                             if (!f_sym_idx.isNone()) {
-                                field_ty = self.sym_table.getSymbol(f_sym_idx).type_id;
+                                field_ty = try self.substituteNominalMemberType(
+                                    unwrapped,
+                                    self.sym_table.getSymbol(f_sym_idx).type_id,
+                                );
                             }
                         }
                     }
@@ -7612,7 +10015,10 @@ pub const TypeChecker = struct {
                         if (!v_idx.isNone()) {
                             self.sym_table.markSymbolUsed(v_idx);
                             self.recordNodeSymbol(pat_id, v_idx);
-                            return self.sym_table.getSymbol(v_idx).type_id;
+                            return self.substituteNominalMemberType(
+                                unwrapped,
+                                self.sym_table.getSymbol(v_idx).type_id,
+                            );
                         }
                     }
                 }
@@ -7766,12 +10172,30 @@ pub const TypeChecker = struct {
                     return self.recordNodeType(expr_id, .err_ty);
                 }
             },
+            .struct_lit => {
+                const actual_struct_ty = try self.synthOrCheckStructLit(expr_id, expected_ty);
+                if (actual_struct_ty.isError()) return self.recordNodeType(expr_id, .err_ty);
+                if (try self.checkTypeCompatibility(expr_id, actual_struct_ty, expected_ty)) {
+                    return self.recordNodeType(expr_id, expected_ty);
+                }
+                return self.recordNodeType(expr_id, .err_ty);
+            },
             .binary_expr => {
                 if (!expr_node.main_token.isNone() and
                     self.token_buffer.getToken(expr_node.main_token).kind == .kw_catch)
                 {
                     return self.synthCatchExpr(expr_id, expected_ty);
                 }
+            },
+            .method_call => {
+                const method_ty = try self.synthOrCheckMethodCallExpr(expr_id, expected_ty);
+                if (method_ty.isError() or method_ty == .never_ty) {
+                    return self.recordNodeType(expr_id, if (method_ty == .never_ty) expected_ty else .err_ty);
+                }
+                if (try self.checkTypeCompatibility(expr_id, method_ty, expected_ty)) {
+                    return self.recordNodeType(expr_id, expected_ty);
+                }
+                return self.recordNodeType(expr_id, .err_ty);
             },
             else => {},
         }
@@ -8169,8 +10593,68 @@ pub const TypeChecker = struct {
         else
             .unit_ty;
 
+        var max_capture_tier: OwnershipTier = .copy_tier;
+        const expr_cst = self.ast_arena.getCstOrigin(expr_id);
+        if (self.hasOwnKeywordBeforePipeInCst(expr_cst) and
+            !expr_cst.isNone() and expr_cst.asInt() < self.cst_arena.countNodes())
+        {
+            const closure_depth = self.sym_table.scope_arena.getScope(closure_scope).depth;
+            const cst_start: usize = expr_cst.asInt();
+            const cst_rec = self.cst_arena.getNode(expr_cst);
+            const cst_end: usize = @min(
+                cst_start + @max(@as(usize, cst_rec.subtree_size), 1),
+                self.cst_to_ast.len,
+            );
+            for (self.cst_to_ast[cst_start..cst_end]) |mapped_ast| {
+                if (mapped_ast.isNone() or mapped_ast.asInt() >= self.node_symbols.len) continue;
+                const cap_sym_idx = self.node_symbols[mapped_ast.asInt()];
+                if (cap_sym_idx.isNone()) continue;
+                const cap_sym = self.sym_table.getSymbol(cap_sym_idx).*;
+                if ((cap_sym.kind == .local_let_sym or cap_sym.kind == .local_var_sym or
+                    cap_sym.kind == .param_sym) and !cap_sym.scope_id.isNone())
+                {
+                    const sym_depth = self.sym_table.scope_arena.getScope(cap_sym.scope_id).depth;
+                    if (sym_depth < closure_depth) {
+                        const cap_tier = classifyOwnershipTier(self.pool, self.sym_table, cap_sym.type_id);
+                        if (@backingInt(cap_tier) > @backingInt(max_capture_tier)) {
+                            max_capture_tier = cap_tier;
+                        }
+                    }
+                }
+            }
+        }
+
         try symbol_resolver.checkUnusedBindingsInScope(self.sym_table, closure_scope, self.interner, self.diagnostic_sink);
-        return self.pool.internFn(.closure_ty, param_types, param_modes, body_ty, false);
+        return self.pool.internFnWithContractsAndCapture(
+            .closure_ty,
+            param_types,
+            param_modes,
+            body_ty,
+            false,
+            .{},
+            max_capture_tier,
+        );
+    }
+
+    /// Returns `true` if closure CST `cst_id` carries a leading `own` capture modifier before `|`.
+    fn hasOwnKeywordBeforePipeInCst(self: *const TypeChecker, cst_id: CstNodeIndex) bool {
+        if (cst_id.isNone() or cst_id.asInt() >= self.cst_arena.countNodes()) return false;
+        const start_idx: usize = cst_id.asInt();
+        const root_rec = self.cst_arena.getNode(cst_id);
+        const end_idx: usize = @min(
+            start_idx + @max(@as(usize, root_rec.subtree_size), 1),
+            self.cst_arena.countNodes(),
+        );
+        var cur: usize = start_idx + 1;
+        while (cur < end_idx) : (cur += 1) {
+            const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+            if (sub.subtree_size > 1 or sub.token.isNone() or
+                sub.token.asInt() >= self.token_buffer.countTokens()) continue;
+            const kind = self.token_buffer.getToken(sub.token).kind;
+            if (kind == .kw_own) return true;
+            if (kind == .pipe or kind == .pipepipe or kind == .lbrace) break;
+        }
+        return false;
     }
 
     /// Type-checks `[e_0, …, e_k]` or `[val; count]` array literals with optional expected element type and length.
@@ -8554,7 +11038,13 @@ pub const TypeChecker = struct {
         {
             const group_ty = TypeId.fromInt(exp_node.lhs);
             const check_cand = parsed.suffix_ty orelse .untyped_int_ty;
-            if (checkGroupSatisfaction(self.pool, check_cand, group_ty) != .rejected) {
+            if (checkGroupSatisfaction(
+                self.pool,
+                self.sym_table,
+                self.target_layout,
+                check_cand,
+                group_ty,
+            ) != .rejected) {
                 return self.recordNodeType(lit_id, expected_ty);
             }
         }
@@ -8833,17 +11323,21 @@ pub const TypeChecker = struct {
                             self.sym_table.markSymbolUsed(v_idx);
                             self.recordNodeSymbol(expr_id, v_idx);
                             const v_sym = self.sym_table.getSymbol(v_idx).*;
-                            if (v_sym.type_id == .unit_ty) {
+                            const var_payload_ty = try self.substituteNominalMemberType(
+                                expected_ty,
+                                v_sym.type_id,
+                            );
+                            if (var_payload_ty == .unit_ty) {
                                 if (arg_nodes.len > 0) {
                                     for (arg_nodes) |raw_arg| {
                                         _ = try self.synthExpr(NodeIndex.fromInt(raw_arg));
                                     }
                                     try self.emitTypeMismatch(self.getAstNodeSpan(expr_id), .unit_ty, expected_ty);
                                 }
-                            } else if (self.pool.getTag(v_sym.type_id) == .tuple_ty) {
-                                const tup_elems = self.pool.getTupleElements(v_sym.type_id);
+                            } else if (self.pool.getTag(var_payload_ty) == .tuple_ty) {
+                                const tup_elems = self.pool.getTupleElements(var_payload_ty);
                                 if (arg_nodes.len != tup_elems.len) {
-                                    try self.emitTypeMismatch(self.getAstNodeSpan(expr_id), v_sym.type_id, .unit_ty);
+                                    try self.emitTypeMismatch(self.getAstNodeSpan(expr_id), var_payload_ty, .unit_ty);
                                 }
                                 for (arg_nodes, 0..) |raw_arg, i| {
                                     const exp_elem = if (i < tup_elems.len)
@@ -8853,13 +11347,13 @@ pub const TypeChecker = struct {
                                     _ = try self.checkExpr(NodeIndex.fromInt(raw_arg), exp_elem);
                                 }
                             } else if (arg_nodes.len == 1) {
-                                _ = try self.checkExpr(NodeIndex.fromInt(arg_nodes[0]), v_sym.type_id);
+                                _ = try self.checkExpr(NodeIndex.fromInt(arg_nodes[0]), var_payload_ty);
                             } else {
                                 for (arg_nodes) |raw_arg| {
                                     _ = try self.synthExpr(NodeIndex.fromInt(raw_arg));
                                 }
-                                if (!v_sym.type_id.isError()) {
-                                    try self.emitTypeMismatch(self.getAstNodeSpan(expr_id), v_sym.type_id, .unit_ty);
+                                if (!var_payload_ty.isError()) {
+                                    try self.emitTypeMismatch(self.getAstNodeSpan(expr_id), var_payload_ty, .unit_ty);
                                 }
                             }
                             return self.recordNodeType(expr_id, expected_ty);
@@ -8890,18 +11384,62 @@ pub const TypeChecker = struct {
 
     /// Synthesizes a `StructLiteral` expression (`Point { x: 1, y: 2 }`).
     fn synthStructLit(self: *TypeChecker, expr_id: NodeIndex) !TypeId {
+        return self.synthOrCheckStructLit(expr_id, .err_ty);
+    }
+
+    /// Synthesizes or checks a `StructLiteral` expression, inferring or substituting generic nominal arguments.
+    fn synthOrCheckStructLit(
+        self: *TypeChecker,
+        expr_id: NodeIndex,
+        expected_ty: TypeId,
+    ) !TypeId {
         const ast_node = self.ast_arena.getNode(expr_id);
         if (ast_node.lhs.tag != .node) return .err_ty;
         const path_node_id = NodeIndex.fromInt(ast_node.lhs.payload);
-        const struct_ty = try self.resolveNamedOrGroupTypeRaw(path_node_id);
+        var struct_ty = if (self.ast_arena.getNode(path_node_id).tag == .generic_type)
+            try self.resolveTypeAst(path_node_id)
+        else
+            try self.resolveNamedOrGroupTypeRaw(path_node_id);
         if (struct_ty.isError()) return .err_ty;
 
-        const struct_node = self.pool.getNode(self.pool.unwrapUnderlyingType(struct_ty));
+        if (!expected_ty.isError()) {
+            const exp_unwrapped = self.pool.unwrapUnderlyingType(expected_ty);
+            const act_unwrapped = self.pool.unwrapUnderlyingType(struct_ty);
+            const exp_node = self.pool.getNode(exp_unwrapped);
+            const act_node = self.pool.getNode(act_unwrapped);
+            if ((act_node.tag == .struct_ty or act_node.tag == .union_ty) and
+                act_node.tag == exp_node.tag and
+                act_node.rhs == exp_node.rhs and
+                self.pool.getGenericTypeArgs(act_unwrapped).len == 0 and
+                self.pool.getGenericTypeArgs(exp_unwrapped).len > 0)
+            {
+                struct_ty = exp_unwrapped;
+            }
+        }
+
+        const unwrapped_struct_ty = self.pool.unwrapUnderlyingType(struct_ty);
+        const struct_node = self.pool.getNode(unwrapped_struct_ty);
         const target_scope: ScopeId = if (struct_node.tag == .struct_ty or
             struct_node.tag == .union_ty or struct_node.tag == .bit_field_ty)
             self.sym_table.getSymbol(SymbolIndex.fromInt(struct_node.rhs)).target_scope
         else
             .none;
+
+        var header_type_params: [16]TypeId = undefined;
+        var header_param_count: usize = 0;
+        const is_uninstantiated_generic = !target_scope.isNone() and
+            self.pool.getGenericTypeArgs(unwrapped_struct_ty).len == 0;
+        if (is_uninstantiated_generic) {
+            for (self.sym_table.getScopeMembers(target_scope)) |mem_idx| {
+                const mem_sym = self.sym_table.getSymbol(mem_idx);
+                if (mem_sym.kind == .type_param_sym and header_param_count < header_type_params.len) {
+                    header_type_params[header_param_count] = mem_sym.type_id;
+                    header_param_count += 1;
+                }
+            }
+        }
+        var inferred_subst: SubstitutionMap = .{};
+        defer inferred_subst.deinit(self.allocator);
 
         const field_exprs = self.getNodeExtraSlice(expr_id, true);
         const lit_cst = self.ast_arena.getCstOrigin(expr_id);
@@ -8955,7 +11493,10 @@ pub const TypeChecker = struct {
                 );
                 if (!f_sym_idx.isNone()) {
                     self.sym_table.markSymbolUsed(f_sym_idx);
-                    expected_field_ty = self.sym_table.getSymbol(f_sym_idx).type_id;
+                    expected_field_ty = try self.substituteNominalMemberType(
+                        unwrapped_struct_ty,
+                        self.sym_table.getSymbol(f_sym_idx).type_id,
+                    );
                 } else if (self.diagnostic_sink) |sink| {
                     const suggestion = self.sym_table.suggestClosestInScope(
                         target_scope,
@@ -8972,9 +11513,47 @@ pub const TypeChecker = struct {
                 }
             }
             if (!expected_field_ty.isError()) {
-                _ = try self.checkExpr(val_expr_id, expected_field_ty);
+                if (header_param_count > 0 and self.pool.getFlags(expected_field_ty).has_type_vars) {
+                    const current_expected = try inferred_subst.apply(self.pool, expected_field_ty);
+                    if (!self.pool.getFlags(current_expected).has_type_vars) {
+                        _ = try self.checkExpr(val_expr_id, current_expected);
+                    } else {
+                        const val_ty = self.materializeUntypedType(try self.synthExpr(val_expr_id));
+                        if (!val_ty.isError()) {
+                            _ = try self.unifyParamTypeWithArg(
+                                expected_field_ty,
+                                val_ty,
+                                self.getAstNodeSpan(val_expr_id),
+                                &inferred_subst,
+                                true,
+                            );
+                        }
+                    }
+                } else {
+                    _ = try self.checkExpr(val_expr_id, expected_field_ty);
+                }
             } else {
                 _ = try self.synthExpr(val_expr_id);
+            }
+        }
+
+        if (header_param_count > 0 and struct_ty == unwrapped_struct_ty) {
+            var inferred_args: [16]TypeId = undefined;
+            var has_all_inferred = true;
+            var p_idx: usize = 0;
+            while (p_idx < header_param_count) : (p_idx += 1) {
+                if (inferred_subst.lookup(header_type_params[p_idx])) |bound_arg| {
+                    inferred_args[p_idx] = self.materializeUntypedType(bound_arg);
+                } else {
+                    has_all_inferred = false;
+                    break;
+                }
+            }
+            if (has_all_inferred) {
+                struct_ty = try self.internNominalWithResolvedArgs(
+                    unwrapped_struct_ty,
+                    inferred_args[0..header_param_count],
+                );
             }
         }
         return struct_ty;
@@ -9439,7 +12018,10 @@ pub const TypeChecker = struct {
                     if (!f_idx.isNone()) {
                         self.sym_table.markSymbolUsed(f_idx);
                         self.recordNodeSymbol(expr_id, f_idx);
-                        const col_ty = self.sym_table.getSymbol(f_idx).type_id;
+                        const col_ty = try self.substituteNominalMemberType(
+                            elem_ty,
+                            self.sym_table.getSymbol(f_idx).type_id,
+                        );
                         return self.pool.internSlice(col_ty, false);
                     }
                 }
@@ -9467,7 +12049,10 @@ pub const TypeChecker = struct {
                     .found => |f_idx| {
                         self.sym_table.markSymbolUsed(f_idx);
                         self.recordNodeSymbol(expr_id, f_idx);
-                        return self.sym_table.getSymbol(f_idx).type_id;
+                        return self.substituteNominalMemberType(
+                            recv_ty,
+                            self.sym_table.getSymbol(f_idx).type_id,
+                        );
                     },
                     .private_error => |priv_idx| {
                         if (self.diagnostic_sink) |sink| {
@@ -9480,6 +12065,11 @@ pub const TypeChecker = struct {
                         return .err_ty;
                     },
                     .not_found => {
+                        if (isContextType(self.pool, self.sym_table, recv_ty)) {
+                            if (try self.resolveContextSeamFieldType(member_lexeme)) |ctx_field_ty| {
+                                return ctx_field_ty;
+                            }
+                        }
                         if (self.diagnostic_sink) |sink| {
                             const suggestion = self.sym_table.suggestClosestInScope(
                                 type_sym.target_scope,
@@ -10052,7 +12642,13 @@ pub const TypeChecker = struct {
                                     }
                                     return .err_ty;
                                 },
-                                .not_found => {},
+                                .not_found => {
+                                    if (isContextType(self.pool, self.sym_table, target_ty)) {
+                                        if (try self.resolveContextSeamFieldType(field_name)) |ctx_field_ty| {
+                                            return self.recordNodeType(callee_id, ctx_field_ty);
+                                        }
+                                    }
+                                },
                             }
                         }
                     }
@@ -10253,11 +12849,259 @@ pub const TypeChecker = struct {
                 }
                 return self.recordNodeType(callee_id, .never_ty);
             },
+            .drop_trace => {
+                if (type_arg_nodes.len != 0 or val_args.len != 1) {
+                    try self.emitDiagnosticSimple(
+                        .e0401_type_mismatch,
+                        self.getAstNodeSpan(call_id),
+                        "`@drop_trace` expects 0 type arguments and 1 integer `(id)` argument",
+                        "expected `@drop_trace(id)`",
+                    );
+                    for (val_args) |arg_id| _ = try self.synthExpr(arg_id);
+                    return .unit_ty;
+                }
+                const id_ty = try self.synthExpr(val_args[0]);
+                const id_base = self.pool.unwrapRefinementBase(id_ty);
+                if (id_base == .untyped_int_ty) {
+                    _ = try self.checkExpr(val_args[0], .i64_ty);
+                } else if (!id_base.isError() and !id_base.isIntegerPrimitive()) {
+                    try self.emitTypeMismatch(self.getAstNodeSpan(val_args[0]), .i64_ty, id_ty);
+                }
+                return self.recordNodeType(callee_id, .unit_ty);
+            },
+            .as_bytes => {
+                const byte_slice_ty = try self.pool.internSlice(.u8_ty, false);
+                const ref_bytes_ty = try self.pool.internRef(byte_slice_ty, false);
+                if (type_arg_nodes.len > 1 or val_args.len != 1) {
+                    try self.emitDiagnosticSimple(
+                        .e0401_type_mismatch,
+                        self.getAstNodeSpan(call_id),
+                        "`@as_bytes` expects `(&val)` (with optional `[T]`) returning `&[u8]`",
+                        "expected `@as_bytes(&val)`",
+                    );
+                    for (val_args) |arg_id| _ = try self.synthExpr(arg_id);
+                    return ref_bytes_ty;
+                }
+                const raw_val_ty = if (type_arg_nodes.len == 1 and !type_args[0].isError()) blk_exp: {
+                    const expected_ref = try self.pool.internRef(type_args[0], false);
+                    const syn_arg = try self.synthExpr(val_args[0]);
+                    if (!syn_arg.isError()) {
+                        const unwrapped_arg = self.unwrapRefType(syn_arg);
+                        if (unwrapped_arg != type_args[0]) {
+                            _ = try self.checkTypeCompatibility(val_args[0], syn_arg, expected_ref);
+                        }
+                    }
+                    break :blk_exp type_args[0];
+                } else self.materializeUntypedType(self.unwrapRefType(try self.synthExpr(val_args[0])));
+
+                if (!raw_val_ty.isError() and !self.pool.getFlags(raw_val_ty).has_type_vars) {
+                    if (self.pool.explainIntoBytesViolation(raw_val_ty, self.sym_table, self.target_layout)) |viol| {
+                        try self.emitWireLayoutViolation(self.getAstNodeSpan(call_id), raw_val_ty, "IntoBytes", viol);
+                    }
+                }
+                return self.recordNodeType(callee_id, ref_bytes_ty);
+            },
+            .bit_cast => {
+                if (type_arg_nodes.len != 1 or val_args.len != 1) {
+                    try self.emitDiagnosticSimple(
+                        .e0401_type_mismatch,
+                        self.getAstNodeSpan(call_id),
+                        "`@bit_cast` expects 1 type argument `[Dst]` and 1 value argument `(src)`",
+                        "expected `@bit_cast[Dst](src)`",
+                    );
+                    for (val_args) |arg_id| _ = try self.synthExpr(arg_id);
+                    return if (type_arg_nodes.len >= 1) type_args[0] else .err_ty;
+                }
+                const dst_ty = type_args[0];
+                const src_ty = self.materializeUntypedType(try self.synthExpr(val_args[0]));
+                if (!src_ty.isError() and !dst_ty.isError() and
+                    !self.pool.getFlags(src_ty).has_type_vars and
+                    !self.pool.getFlags(dst_ty).has_type_vars)
+                {
+                    if (self.pool.explainIntoBytesViolation(src_ty, self.sym_table, self.target_layout)) |src_viol| {
+                        try self.emitWireLayoutViolation(self.getAstNodeSpan(val_args[0]), src_ty, "IntoBytes", src_viol);
+                    } else if (self.pool.explainFromBytesViolation(dst_ty, self.sym_table, self.target_layout)) |dst_viol| {
+                        try self.emitWireLayoutViolation(
+                            self.getAstNodeSpan(type_arg_nodes[0]),
+                            dst_ty,
+                            "FromBytes",
+                            dst_viol,
+                        );
+                    } else {
+                        const src_layout = self.computeTypeLayout(src_ty, self.target_layout);
+                        const dst_layout = self.computeTypeLayout(dst_ty, self.target_layout);
+                        if (src_layout.byte_size != dst_layout.byte_size) {
+                            var src_buf: [64]u8 = undefined;
+                            var dst_buf: [64]u8 = undefined;
+                            const src_str = self.pool.formatType(src_ty, self.sym_table, &src_buf);
+                            const dst_str = self.pool.formatType(dst_ty, self.sym_table, &dst_buf);
+                            var msg_buf: [240]u8 = undefined;
+                            const msg = std.fmt.bufPrint(
+                                &msg_buf,
+                                "`@bit_cast` size mismatch: source `{s}` is {d} byte(s) whereas destination `{s}` is {d} byte(s)",
+                                .{ src_str, src_layout.byte_size, dst_str, dst_layout.byte_size },
+                            ) catch "`@bit_cast` source and destination types have different byte sizes";
+                            try self.emitDiagnosticSimple(
+                                .e0315_wire_layout_contract_violation,
+                                self.getAstNodeSpan(call_id),
+                                msg,
+                                "source and destination byte sizes must match exactly",
+                            );
+                        }
+                    }
+                }
+                return self.recordNodeType(callee_id, dst_ty);
+            },
+            .from_bytes, .view_bytes => {
+                const is_view = (intr_kind == .view_bytes);
+                if (type_arg_nodes.len != 1 or val_args.len != 1) {
+                    try self.emitDiagnosticSimple(
+                        .e0401_type_mismatch,
+                        self.getAstNodeSpan(call_id),
+                        "wire byte intrinsic expects 1 type argument `[T]` and 1 byte slice/array argument `(bytes)`",
+                        "expected `@from_bytes[T](bytes)` or `@view_bytes[T](bytes)`",
+                    );
+                    for (val_args) |arg_id| _ = try self.synthExpr(arg_id);
+                    return .err_ty;
+                }
+                const target_ty = type_args[0];
+                const raw_bytes_ty = try self.synthExpr(val_args[0]);
+                const unwrapped_bytes = self.unwrapRefType(raw_bytes_ty);
+                const bytes_node = self.pool.getNode(unwrapped_bytes);
+
+                if (!raw_bytes_ty.isError()) {
+                    const is_u8_slice = bytes_node.tag == .slice_ty and TypeId.fromInt(bytes_node.lhs) == .u8_ty;
+                    const is_u8_array = bytes_node.tag == .array_ty and TypeId.fromInt(bytes_node.lhs) == .u8_ty;
+                    if (!is_u8_slice and !is_u8_array) {
+                        const expected_slice = try self.pool.internRef(
+                            try self.pool.internSlice(.u8_ty, false),
+                            false,
+                        );
+                        try self.emitTypeMismatch(self.getAstNodeSpan(val_args[0]), expected_slice, raw_bytes_ty);
+                    } else if (is_u8_array and (bytes_node.rhs & SYMBOLIC_ARRAY_LEN_FLAG) == 0 and
+                        !target_ty.isError() and !self.pool.getFlags(target_ty).has_type_vars)
+                    {
+                        const target_size = self.computeTypeLayout(target_ty, self.target_layout).byte_size;
+                        if (@as(u64, bytes_node.rhs) != target_size) {
+                            var ty_buf: [64]u8 = undefined;
+                            const ty_str = self.pool.formatType(target_ty, self.sym_table, &ty_buf);
+                            var msg_buf: [240]u8 = undefined;
+                            const msg = std.fmt.bufPrint(
+                                &msg_buf,
+                                "byte array length ({d} byte(s)) does not match `sizeof({s})` ({d} byte(s))",
+                                .{ bytes_node.rhs, ty_str, target_size },
+                            ) catch "fixed byte array length does not match target `FromBytes` byte size";
+                            try self.emitDiagnosticSimple(
+                                .e0315_wire_layout_contract_violation,
+                                self.getAstNodeSpan(val_args[0]),
+                                msg,
+                                "wire transmutation requires exact byte size match",
+                            );
+                        }
+                    }
+                }
+
+                if (!target_ty.isError() and !self.pool.getFlags(target_ty).has_type_vars) {
+                    if (self.pool.explainFromBytesViolation(target_ty, self.sym_table, self.target_layout)) |viol| {
+                        try self.emitWireLayoutViolation(
+                            self.getAstNodeSpan(type_arg_nodes[0]),
+                            target_ty,
+                            "FromBytes",
+                            viol,
+                        );
+                    }
+                }
+                const payload_ty = if (is_view) try self.pool.internRef(target_ty, false) else target_ty;
+                const opt_res_ty = try self.pool.internOptional(payload_ty);
+                return self.recordNodeType(callee_id, opt_res_ty);
+            },
         }
+    }
+
+    /// Emits `E0315` (`e0315_wire_layout_contract_violation`) with exact field/padding byte-offset details.
+    fn emitWireLayoutViolation(
+        self: *TypeChecker,
+        span: Span,
+        root_ty: TypeId,
+        contract_name: []const u8,
+        violation: WireLayoutViolation,
+    ) !void {
+        if (self.diagnostic_sink == null) return;
+        var root_buf: [80]u8 = undefined;
+        const root_str = self.pool.formatType(root_ty, self.sym_table, &root_buf);
+        const member_label: []const u8 = if (violation.field_name.len > 0) violation.field_name else root_str;
+
+        var msg_buf: [280]u8 = undefined;
+        const msg: []const u8 = switch (violation.reason) {
+            .secret_type => std.fmt.bufPrint(
+                &msg_buf,
+                "type `{s}` contains `@secret` data (`{s}`) and cannot satisfy `{s}`",
+                .{ root_str, member_label, contract_name },
+            ) catch "type contains `@secret` data and cannot cross raw byte boundaries",
+            .non_copy_ownership => std.fmt.bufPrint(
+                &msg_buf,
+                "type `{s}` owns `AutoDrop` or `@linear` resource (`{s}`) and cannot satisfy `{s}`",
+                .{ root_str, member_label, contract_name },
+            ) catch "non-`Copy` resource type cannot satisfy wire layout contract",
+            .indirection_or_handle => std.fmt.bufPrint(
+                &msg_buf,
+                "type `{s}` contains pointer, reference, or slice indirection at byte offset {d} and cannot satisfy `{s}`",
+                .{ root_str, violation.byte_offset, contract_name },
+            ) catch "indirection type cannot satisfy wire layout contract",
+            .invalid_bit_patterns => if (violation.field_name.len > 0)
+                std.fmt.bufPrint(
+                    &msg_buf,
+                    "type `{s}` cannot satisfy `{s}`: member `{s}` at byte offset {d} has invalid bit patterns",
+                    .{ root_str, contract_name, violation.field_name, violation.byte_offset },
+                ) catch "field has invalid bit patterns for `FromBytes`"
+            else
+                std.fmt.bufPrint(
+                    &msg_buf,
+                    "type `{s}` (at byte offset {d}) has invalid bit patterns and cannot satisfy `{s}`",
+                    .{ root_str, violation.byte_offset, contract_name },
+                ) catch "type has invalid bit patterns for `FromBytes`",
+            .refinement_narrows_domain => std.fmt.bufPrint(
+                &msg_buf,
+                "range-refined type `{s}` (`{s}` at byte offset {d}) restricts valid bit patterns and cannot satisfy `{s}`",
+                .{ root_str, member_label, violation.byte_offset, contract_name },
+            ) catch "range-refined type cannot satisfy `FromBytes`",
+            .unzeroed_inter_field_padding => std.fmt.bufPrint(
+                &msg_buf,
+                "type `{s}` has {d} uninitialized padding byte(s) before field `{s}` at byte offset {d}; add `@zero_pad` for `{s}`",
+                .{ root_str, violation.padding_bytes, violation.field_name, violation.byte_offset, contract_name },
+            ) catch "type has uninitialized inter-field padding bytes; add `@zero_pad` for `IntoBytes`",
+            .unzeroed_tail_padding => std.fmt.bufPrint(
+                &msg_buf,
+                "type `{s}` has {d} uninitialized trailing padding byte(s) at byte offset {d}; add `@zero_pad` for `{s}`",
+                .{ root_str, violation.padding_bytes, violation.byte_offset, contract_name },
+            ) catch "type has uninitialized trailing padding bytes; add `@zero_pad` for `IntoBytes`",
+            .union_requires_zero_pad => std.fmt.bufPrint(
+                &msg_buf,
+                "union `{s}` (at byte offset {d}) may contain uninitialized variant tail bytes; add `@zero_pad` for `{s}`",
+                .{ member_label, violation.byte_offset, contract_name },
+            ) catch "union requires `@zero_pad` to satisfy `IntoBytes`",
+            .size_mismatch => std.fmt.bufPrint(
+                &msg_buf,
+                "type `{s}` byte size ({d}) does not match expected wire layout size ({d})",
+                .{ root_str, violation.byte_offset, violation.padding_bytes },
+            ) catch "wire layout byte size mismatch",
+        };
+
+        try self.emitDiagnosticSimple(
+            .e0315_wire_layout_contract_violation,
+            span,
+            msg,
+            "violates `FromBytes` / `IntoBytes` wire layout contract",
+        );
     }
 
     /// Synthesizes `receiver.method(args)` (`method_call`).
     fn synthMethodCallExpr(self: *TypeChecker, expr_id: NodeIndex) !TypeId {
+        return self.synthOrCheckMethodCallExpr(expr_id, .err_ty);
+    }
+
+    /// Synthesizes or checks `receiver.method(args)` with optional bidirectional `expected_ty` (`D-11`).
+    fn synthOrCheckMethodCallExpr(self: *TypeChecker, expr_id: NodeIndex, expected_ty: TypeId) !TypeId {
         const ast_node = self.ast_arena.getNode(expr_id);
         if (ast_node.lhs.tag != .node) return .err_ty;
         const recv_id = NodeIndex.fromInt(ast_node.lhs.payload);
@@ -10296,7 +13140,7 @@ pub const TypeChecker = struct {
         const unwrapped_recv = self.unwrapRefType(recv_ty);
         const recv_node = self.pool.getNode(unwrapped_recv);
 
-        // Built-in `.len()` method on slices, arrays, `#soa` containers, and `str`:
+        // [1] Built-in `.len()` method on slices, arrays, `#soa` containers, and `str`:
         if ((recv_node.tag == .slice_ty or recv_node.tag == .array_ty or
             recv_node.tag == .soa_slice_ty or recv_node.tag == .soa_array_ty or
             unwrapped_recv == .str_ty) and
@@ -10306,6 +13150,79 @@ pub const TypeChecker = struct {
             return .usize_ty;
         }
 
+        // [2] Built-in `.narrow[Dst]()` / `.narrow()` and `.try_narrow[Dst]()` / `.try_narrow()` (`D-11`):
+        const recv_int_base = self.pool.unwrapRefinementBase(unwrapped_recv);
+        const is_narrow = std.mem.eql(u8, member_name, "narrow");
+        const is_try_narrow = std.mem.eql(u8, member_name, "try_narrow");
+        if ((is_narrow or is_try_narrow) and
+            (recv_int_base.isIntegerPrimitive() or recv_int_base == .untyped_int_ty))
+        {
+            if (explicit_type_args.len > 1 or args.len != 0) {
+                try self.emitDiagnosticSimple(
+                    .e0401_type_mismatch,
+                    self.getAstNodeSpan(expr_id),
+                    "`.narrow` / `.try_narrow` expects at most 1 type argument `[Dst]` and 0 value arguments `()`",
+                    "expected `val.narrow[Dst]()` or `val.narrow()`",
+                );
+                for (explicit_type_args) |type_node_id| _ = try self.resolveTypeAst(type_node_id);
+                for (args) |arg_id| _ = try self.synthExpr(arg_id);
+                return .err_ty;
+            }
+            if (recv_int_base == .untyped_int_ty) {
+                _ = try self.checkExpr(recv_id, .i32_ty);
+            }
+
+            var dst_ty: TypeId = .err_ty;
+            if (explicit_type_args.len == 1) {
+                dst_ty = try self.resolveTypeAst(explicit_type_args[0]);
+            } else if (!expected_ty.isError()) {
+                if (is_narrow) {
+                    dst_ty = expected_ty;
+                } else if (self.pool.getTag(expected_ty) == .optional_ty) {
+                    dst_ty = TypeId.fromInt(self.pool.getNode(expected_ty).lhs);
+                }
+            }
+            if (dst_ty.isError()) {
+                if (explicit_type_args.len == 0) {
+                    try self.emitDiagnosticSimple(
+                        .e0401_type_mismatch,
+                        member_span,
+                        "cannot infer target integer type for narrowing call; specify `[Dst]` or add a type annotation",
+                        "specify `.narrow[Dst]()` / `.try_narrow[Dst]()` here",
+                    );
+                }
+                return .err_ty;
+            }
+
+            const dst_base = self.pool.unwrapRefinementBase(dst_ty);
+            if (!dst_base.isIntegerPrimitive()) {
+                try self.emitDiagnosticSimple(
+                    .e0401_type_mismatch,
+                    if (explicit_type_args.len == 1) self.getAstNodeSpan(explicit_type_args[0]) else member_span,
+                    "narrowing target type must be a primitive or range-refined integer type",
+                    "expected integer target type here",
+                );
+                return .err_ty;
+            }
+
+            const prim_bounds = getTargetPrimitiveIntBounds(dst_base, self.target_layout);
+            const base_min: i128 = if (prim_bounds) |bounds| bounds.min_val else 0;
+            const base_max: i128 = if (prim_bounds) |bounds| bounds.max_val else 0;
+            const ref_bounds = self.pool.getRefinementBounds(dst_ty);
+
+            const one_arg = [1]TypeId{dst_ty};
+            try self.recordCallInstantiation(expr_id, &one_arg);
+            try self.narrow_calls.put(self.allocator, expr_id.asInt(), .{
+                .kind = if (is_try_narrow) .try_narrow else .narrow,
+                .src_ty = self.materializeUntypedType(unwrapped_recv),
+                .dst_ty = dst_ty,
+                .min_val = if (ref_bounds) |bounds| @max(base_min, bounds.min_val) else base_min,
+                .max_val = if (ref_bounds) |bounds| @min(base_max, bounds.max_val) else base_max,
+            });
+            return if (is_try_narrow) try self.pool.internOptional(dst_ty) else dst_ty;
+        }
+
+        // [3] User or `impl` method lookup on nominal / trait-bounded receivers:
         var lookup_owner_scope: ScopeId = .none;
         if (recv_node.tag == .struct_ty or recv_node.tag == .enum_ty or
             recv_node.tag == .union_ty or recv_node.tag == .trait_ty)
@@ -10354,6 +13271,18 @@ pub const TypeChecker = struct {
                 },
                 .not_found => {},
             }
+        }
+
+        // [4] Built-in `.as_bytes()` wire projection on `IntoBytes` values / `&T` (`D-01`, `E0315`):
+        if (std.mem.eql(u8, member_name, "as_bytes") and explicit_type_args.len == 0 and args.len == 0) {
+            const mat_recv = self.materializeUntypedType(unwrapped_recv);
+            if (!mat_recv.isError() and !self.pool.getFlags(mat_recv).has_type_vars) {
+                if (self.pool.explainIntoBytesViolation(mat_recv, self.sym_table, self.target_layout)) |viol| {
+                    try self.emitWireLayoutViolation(self.getAstNodeSpan(expr_id), mat_recv, "IntoBytes", viol);
+                }
+            }
+            const byte_slice_ty = try self.pool.internSlice(.u8_ty, false);
+            return self.pool.internRef(byte_slice_ty, false);
         }
 
         for (explicit_type_args) |type_node_id| _ = try self.resolveTypeAst(type_node_id);
@@ -10410,9 +13339,14 @@ pub const TypeChecker = struct {
                     p_node.tag == .type_param)
                 {
                     const grp_ty = TypeId.fromInt(p_node.lhs);
-                    if (checkGroupSatisfaction(self.pool, arg_ty, grp_ty) == .rejected or
-                        checkGroupSatisfaction(self.pool, arg_ty, grp_ty) == .rejected_distinct_without_tilde)
-                    {
+                    const sat = checkGroupSatisfaction(
+                        self.pool,
+                        self.sym_table,
+                        self.target_layout,
+                        arg_ty,
+                        grp_ty,
+                    );
+                    if (sat == .rejected or sat == .rejected_distinct_without_tilde) {
                         has_all_matched = false;
                         break;
                     }
@@ -10446,7 +13380,7 @@ pub const TypeChecker = struct {
             }
 
             if (!has_all_matched) continue;
-            if (@intFromEnum(cand_score) > @intFromEnum(best_score)) {
+            if (@backingInt(cand_score) > @backingInt(best_score)) {
                 best_score = cand_score;
                 best_candidate = cand_idx;
                 is_ambiguous = false;
@@ -10555,7 +13489,13 @@ pub const TypeChecker = struct {
                 const tp_id = declared_type_params.items[i];
                 const tp_node = self.pool.getNode(tp_id);
                 const grp_ty = TypeId.fromInt(tp_node.lhs);
-                var sat = checkGroupSatisfaction(self.pool, resolved_ty, grp_ty);
+                var sat = checkGroupSatisfaction(
+                    self.pool,
+                    self.sym_table,
+                    self.target_layout,
+                    resolved_ty,
+                    grp_ty,
+                );
                 if (sat == .rejected and self.pool.getTag(grp_ty) == .trait_ty) {
                     if (try self.hasTraitImplementation(resolved_ty, grp_ty, 0)) {
                         sat = .matched_exact;
@@ -10720,7 +13660,13 @@ pub const TypeChecker = struct {
         {
             const concrete_arg = self.materializeUntypedType(arg_ty);
             const group_ty = TypeId.fromInt(p_node.lhs);
-            var sat = checkGroupSatisfaction(self.pool, concrete_arg, group_ty);
+            var sat = checkGroupSatisfaction(
+                self.pool,
+                self.sym_table,
+                self.target_layout,
+                concrete_arg,
+                group_ty,
+            );
             if (sat == .rejected and self.pool.getTag(group_ty) == .trait_ty) {
                 if (try self.hasTraitImplementation(concrete_arg, group_ty, 0)) {
                     sat = .matched_exact;
@@ -10921,6 +13867,73 @@ pub const TypeChecker = struct {
                         }
                     }
                     return has_all_elems_matched;
+                }
+            },
+            .struct_ty, .enum_ty, .union_ty => {
+                if (a_node.tag == p_node.tag and p_node.rhs == a_node.rhs) {
+                    const p_args = self.pool.getGenericTypeArgs(param_ty);
+                    const a_args = self.pool.getGenericTypeArgs(arg_ty);
+                    if (p_args.len == a_args.len) {
+                        var has_all_args_matched = true;
+                        for (p_args, 0..) |raw_p_arg, i| {
+                            if (!(try self.unifyParamTypeWithArg(
+                                TypeId.fromInt(raw_p_arg),
+                                TypeId.fromInt(a_args[i]),
+                                arg_span,
+                                subst,
+                                is_emitting_diags,
+                            ))) {
+                                has_all_args_matched = false;
+                            }
+                        }
+                        return has_all_args_matched;
+                    }
+                }
+            },
+            .fn_ty, .closure_ty => {
+                if (a_node.tag == p_node.tag) {
+                    const p_sig = self.pool.getFnSignatureView(param_ty) orelse return false;
+                    const a_sig = self.pool.getFnSignatureView(arg_ty) orelse return false;
+                    if (p_sig.paramCount() == a_sig.paramCount() and
+                        std.mem.eql(u32, p_sig.param_modes, a_sig.param_modes))
+                    {
+                        var has_sig_matched = true;
+                        var param_i: usize = 0;
+                        while (param_i < p_sig.paramCount()) : (param_i += 1) {
+                            if (!(try self.unifyParamTypeWithArg(
+                                p_sig.getParamType(param_i),
+                                a_sig.getParamType(param_i),
+                                arg_span,
+                                subst,
+                                is_emitting_diags,
+                            ))) {
+                                has_sig_matched = false;
+                            }
+                        }
+                        if (!(try self.unifyParamTypeWithArg(
+                            p_sig.ret_ty,
+                            a_sig.ret_ty,
+                            arg_span,
+                            subst,
+                            is_emitting_diags,
+                        ))) {
+                            has_sig_matched = false;
+                        }
+                        if (!has_sig_matched) return false;
+                        if (a_sig.contracts.isSatisfying(p_sig.contracts)) {
+                            return true;
+                        }
+                        if (is_emitting_diags) {
+                            try self.emitFnContractCoercionError(
+                                arg_span,
+                                arg_ty,
+                                try subst.apply(self.pool, param_ty),
+                                a_sig.contracts,
+                                p_sig.contracts,
+                            );
+                        }
+                        return false;
+                    }
                 }
             },
             else => {},
@@ -11521,7 +14534,13 @@ pub const TypeChecker = struct {
                 TypeId.fromInt(exp_node.lhs)
             else
                 expected_ty;
-            var sat = checkGroupSatisfaction(self.pool, actual_ty, grp_ty);
+            var sat = checkGroupSatisfaction(
+                self.pool,
+                self.sym_table,
+                self.target_layout,
+                actual_ty,
+                grp_ty,
+            );
             if (sat == .rejected and self.pool.getTag(grp_ty) == .trait_ty) {
                 if (try self.hasTraitImplementation(self.materializeUntypedType(actual_ty), grp_ty, 0)) {
                     sat = .matched_exact;
@@ -11635,6 +14654,42 @@ pub const TypeChecker = struct {
             }
         }
 
+        // [6] Function pointer & closure contract subtyping (`@no_alloc fn` -> `fn`, `[CRITICAL-07]`, `E0320`–`E0322`):
+        if ((act_node.tag == .fn_ty or act_node.tag == .closure_ty) and act_node.tag == exp_node.tag) {
+            if (self.pool.getFnSignatureView(actual_ty)) |act_sig| {
+                if (self.pool.getFnSignatureView(expected_ty)) |exp_sig| {
+                    if (act_sig.paramCount() == exp_sig.paramCount() and
+                        std.mem.eql(u32, act_sig.param_types, exp_sig.param_types) and
+                        std.mem.eql(u32, act_sig.param_modes, exp_sig.param_modes) and
+                        act_sig.ret_ty == exp_sig.ret_ty)
+                    {
+                        if (act_sig.contracts.isSatisfying(exp_sig.contracts)) {
+                            return true;
+                        }
+                        try self.emitFnContractCoercionError(
+                            self.getAstNodeSpan(expr_id),
+                            actual_ty,
+                            expected_ty,
+                            act_sig.contracts,
+                            exp_sig.contracts,
+                        );
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // [7] Uninstantiated generic nominal struct/enum literal compatibility (`Box { val: x }` -> `Box[T]`):
+        if ((act_node.tag == .struct_ty or act_node.tag == .enum_ty or act_node.tag == .union_ty) and
+            act_node.tag == exp_node.tag and act_node.rhs == exp_node.rhs)
+        {
+            const act_args = self.pool.getGenericTypeArgs(actual_ty);
+            const exp_args = self.pool.getGenericTypeArgs(expected_ty);
+            if (act_args.len == 0 or exp_args.len == 0) {
+                return true;
+            }
+        }
+
         try self.emitTypeMismatch(
             self.getAstNodeSpan(expr_id),
             expected_ty,
@@ -11666,6 +14721,49 @@ pub const TypeChecker = struct {
         return cur;
     }
 
+    /// Emits `E0320`, `E0321`, or `E0322` when coercing a function lacking `@no_alloc`, `@no_panic`, or `@no_block`.
+    fn emitFnContractCoercionError(
+        self: *TypeChecker,
+        span: Span,
+        actual_ty: TypeId,
+        expected_ty: TypeId,
+        actual_contracts: FnPtrContractMask,
+        expected_contracts: FnPtrContractMask,
+    ) !void {
+        if (self.diagnostic_sink == null) return;
+        var act_buf: [96]u8 = undefined;
+        var exp_buf: [96]u8 = undefined;
+        const act_str = self.pool.formatType(actual_ty, self.sym_table, &act_buf);
+        const exp_str = self.pool.formatType(expected_ty, self.sym_table, &exp_buf);
+
+        const code: DiagnosticCode = if (expected_contracts.has_no_alloc and !actual_contracts.has_no_alloc)
+            .e0320_no_alloc_contract_violation
+        else if (expected_contracts.has_no_panic and !actual_contracts.has_no_panic)
+            .e0321_no_panic_contract_violation
+        else
+            .e0322_no_block_contract_violation;
+
+        const attr_name: []const u8 = switch (code) {
+            .e0320_no_alloc_contract_violation => "@no_alloc",
+            .e0321_no_panic_contract_violation => "@no_panic",
+            else => "@no_block",
+        };
+
+        var msg_buf: [240]u8 = undefined;
+        const msg = std.fmt.bufPrint(
+            &msg_buf,
+            "cannot coerce `{s}` to `{s}`: target function type requires `{s}` contract",
+            .{ act_str, exp_str, attr_name },
+        ) catch "cannot coerce function value to stricter `@no_alloc` / `@no_panic` / `@no_block` function type";
+
+        try self.emitDiagnosticSimple(
+            code,
+            span,
+            msg,
+            "function value lacks required effect contract",
+        );
+    }
+
     /// Returns `true` if `ty` is a type variable whose constraining Type Group admits integer literals.
     fn isIntegerBoundedVar(self: *const TypeChecker, ty: TypeId) bool {
         const node = self.pool.getNode(ty);
@@ -11674,7 +14772,13 @@ pub const TypeChecker = struct {
             node.tag == .type_param)
         {
             const grp_ty = TypeId.fromInt(node.lhs);
-            return checkGroupSatisfaction(self.pool, .untyped_int_ty, grp_ty) != .rejected;
+            return checkGroupSatisfaction(
+                self.pool,
+                self.sym_table,
+                self.target_layout,
+                .untyped_int_ty,
+                grp_ty,
+            ) != .rejected;
         }
         return false;
     }
@@ -12697,4 +15801,460 @@ test "test_redteam_3a_attr_escapes_enum_ordinals_string_interp_and_large_arity" 
     var large_res = try typecheckSource(std.testing.allocator, FileId.fromInt(27), dyn_buf.items);
     defer large_res.deinit();
     try std.testing.expectEqual(@as(usize, 0), large_res.diagnostics.countDiagnostics());
+}
+
+test "test_phase6_three_tier_ownership_and_generic_containers" {
+    const src =
+        \\pub struct Span16 {
+        \\    pub start: u32,
+        \\    pub len: u32,
+        \\}
+        \\pub struct SlotKey[T] {
+        \\    pub raw: u64,
+        \\}
+        \\pub struct Vec[T] {
+        \\    pub len: usize,
+        \\}
+        \\pub struct String {
+        \\    pub len: usize,
+        \\}
+        \\pub struct File {
+        \\    pub fd: i32,
+        \\}
+        \\pub struct Socket {
+        \\    pub fd: i32,
+        \\}
+        \\@linear
+        \\pub struct TxHandle {
+        \\    pub tx_id: u64,
+        \\}
+        \\pub struct AutoHolder {
+        \\    pub items: Vec[u32],
+        \\}
+        \\pub struct LinearHolder {
+        \\    pub list: Vec[File],
+        \\}
+        \\pub fn check_tiers(
+        \\    sp: Span16,
+        \\    key: SlotKey[File],
+        \\    nums: Vec[u32],
+        \\    text: String,
+        \\    file_val: File,
+        \\    sock_opt: Socket?,
+        \\    tx: TxHandle,
+        \\    holder: AutoHolder,
+        \\    lin_holder: LinearHolder,
+        \\) -> bool {
+        \\    let copy_ok = @implements[Span16, Copy]() and @implements[SlotKey[File], Copy]();
+        \\    let vec_auto = !@implements[Vec[u32], Copy]() and @implements[Vec[u32], AutoDrop]();
+        \\    let file_lin = !@implements[File, Copy]() and !@implements[File, AutoDrop]();
+        \\    let _ = sp;
+        \\    let _ = key;
+        \\    let _ = nums;
+        \\    let _ = text;
+        \\    let _ = file_val;
+        \\    let _ = sock_opt;
+        \\    let _ = tx;
+        \\    let _ = holder;
+        \\    let _ = lin_holder;
+        \\    return copy_ok and vec_auto and file_lin;
+        \\}
+    ;
+    var res = try typecheckSource(std.testing.allocator, FileId.fromInt(28), src);
+    defer res.deinit();
+    try std.testing.expectEqual(@as(usize, 0), res.diagnostics.countDiagnostics());
+
+    // [1] Verify primitive and handle `Copy` tiers vs. `AutoDrop` vs. `@linear`:
+    try std.testing.expectEqual(
+        OwnershipTier.copy_tier,
+        classifyOwnershipTier(&res.type_pool, &res.symbol_table, .u32_ty),
+    );
+    try std.testing.expectEqual(
+        OwnershipTier.copy_tier,
+        classifyOwnershipTier(&res.type_pool, &res.symbol_table, .str_ty),
+    );
+
+    var has_checked_vec_u32 = false;
+    var has_checked_vec_file = false;
+    var has_checked_slot_key = false;
+    var has_checked_tx_handle = false;
+    var has_checked_auto_holder = false;
+    var has_checked_lin_holder = false;
+    var sym_i: u32 = 0;
+    while (sym_i < res.symbol_table.symbols.items.len) : (sym_i += 1) {
+        const sym = res.symbol_table.getSymbol(SymbolIndex.fromInt(sym_i)).*;
+        if (sym.kind == .param_sym) {
+            if (std.mem.eql(u8, sym.name_text, "key")) {
+                try std.testing.expectEqual(
+                    OwnershipTier.copy_tier,
+                    classifyOwnershipTier(&res.type_pool, &res.symbol_table, sym.type_id),
+                );
+                try std.testing.expect(res.type_pool.getFlags(sym.type_id).is_copy);
+                has_checked_slot_key = true;
+            } else if (std.mem.eql(u8, sym.name_text, "nums")) {
+                try std.testing.expectEqual(
+                    OwnershipTier.auto_drop_tier,
+                    classifyOwnershipTier(&res.type_pool, &res.symbol_table, sym.type_id),
+                );
+                try std.testing.expect(!res.type_pool.getFlags(sym.type_id).is_copy);
+                try std.testing.expect(res.type_pool.getFlags(sym.type_id).has_drop);
+                has_checked_vec_u32 = true;
+            } else if (std.mem.eql(u8, sym.name_text, "tx")) {
+                try std.testing.expectEqual(
+                    OwnershipTier.linear_tier,
+                    classifyOwnershipTier(&res.type_pool, &res.symbol_table, sym.type_id),
+                );
+                try std.testing.expect(!res.type_pool.getFlags(sym.type_id).is_copy);
+                has_checked_tx_handle = true;
+            } else if (std.mem.eql(u8, sym.name_text, "holder")) {
+                try std.testing.expectEqual(
+                    OwnershipTier.auto_drop_tier,
+                    classifyOwnershipTier(&res.type_pool, &res.symbol_table, sym.type_id),
+                );
+                has_checked_auto_holder = true;
+            } else if (std.mem.eql(u8, sym.name_text, "lin_holder")) {
+                try std.testing.expectEqual(
+                    OwnershipTier.linear_tier,
+                    classifyOwnershipTier(&res.type_pool, &res.symbol_table, sym.type_id),
+                );
+                has_checked_lin_holder = true;
+            } else if (std.mem.eql(u8, sym.name_text, "sock_opt")) {
+                try std.testing.expectEqual(
+                    OwnershipTier.linear_tier,
+                    classifyOwnershipTier(&res.type_pool, &res.symbol_table, sym.type_id),
+                );
+                has_checked_vec_file = true;
+            }
+        }
+    }
+    try std.testing.expect(has_checked_slot_key and has_checked_vec_u32 and has_checked_vec_file);
+    try std.testing.expect(has_checked_tx_handle and has_checked_auto_holder and has_checked_lin_holder);
+}
+
+test "test_phase6_wire_contracts_from_bytes_into_bytes_and_zero_pad" {
+    const valid_src =
+        \\pub type Port = u16 is 1024..=65535;
+        \\pub type FullByte = u8 is 0..=255;
+        \\pub bit_field WireFlags(u8) {
+        \\    is_fin: bool | 1,
+        \\    opcode: u8 | 7,
+        \\}
+        \\@zero_pad
+        \\pub struct ZeroPaddedHdr {
+        \\    pub tag: u8,
+        \\    pub len: u32,
+        \\}
+        \\pub struct PackedHdr {
+        \\    pub magic: u16,
+        \\    pub version: u16,
+        \\}
+        \\pub fn wire_ok(hdr: &ZeroPaddedHdr, packed_hdr: PackedHdr, raw_slice: &[u8]) -> u32 {
+        \\    @drop_trace(1);
+        \\    let bytes_a: &[u8] = hdr.as_bytes();
+        \\    let bytes_b: &[u8] = @as_bytes(&packed_hdr);
+        \\    let parsed_opt: PackedHdr? = @from_bytes[PackedHdr](raw_slice);
+        \\    let view_opt: (&PackedHdr)? = @view_bytes[PackedHdr](bytes_a);
+        \\    let flt_val: f32 = 1.0;
+        \\    let bits: u32 = @bit_cast[u32](flt_val);
+        \\    let _ = bytes_b;
+        \\    let _ = parsed_opt;
+        \\    let _ = view_opt;
+        \\    return bits;
+        \\}
+    ;
+    var ok_res = try typecheckSource(std.testing.allocator, FileId.fromInt(29), valid_src);
+    defer ok_res.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ok_res.diagnostics.countDiagnostics());
+
+    // [1] Primitive & refinement `FromBytes` / `IntoBytes` checks:
+    try std.testing.expect(
+        !ok_res.type_pool.isFromBytesValid(.bool_ty, &ok_res.symbol_table, TargetLayout.NATIVE_64),
+    );
+    try std.testing.expect(
+        !ok_res.type_pool.isFromBytesValid(.char_ty, &ok_res.symbol_table, TargetLayout.NATIVE_64),
+    );
+    try std.testing.expect(
+        ok_res.type_pool.isIntoBytesValid(.bool_ty, &ok_res.symbol_table, TargetLayout.NATIVE_64),
+    );
+    try std.testing.expect(
+        ok_res.type_pool.isIntoBytesValid(.char_ty, &ok_res.symbol_table, TargetLayout.NATIVE_64),
+    );
+    try std.testing.expect(
+        !ok_res.type_pool.isIntoBytesValid(.str_ty, &ok_res.symbol_table, TargetLayout.NATIVE_64),
+    );
+
+    var has_found_port = false;
+    var has_found_full_byte = false;
+    var has_found_flags = false;
+    var sym_i: u32 = 0;
+    while (sym_i < ok_res.symbol_table.symbols.items.len) : (sym_i += 1) {
+        const sym = ok_res.symbol_table.getSymbol(SymbolIndex.fromInt(sym_i)).*;
+        if (std.mem.eql(u8, sym.name_text, "Port")) {
+            has_found_port = true;
+            try std.testing.expect(
+                !ok_res.type_pool.isFromBytesValid(sym.type_id, &ok_res.symbol_table, TargetLayout.NATIVE_64),
+            );
+            try std.testing.expect(
+                ok_res.type_pool.isIntoBytesValid(sym.type_id, &ok_res.symbol_table, TargetLayout.NATIVE_64),
+            );
+            try std.testing.expectEqual(
+                GroupMatchResult.rejected,
+                checkGroupSatisfaction(
+                    &ok_res.type_pool,
+                    &ok_res.symbol_table,
+                    TargetLayout.NATIVE_64,
+                    sym.type_id,
+                    .group_from_bytes,
+                ),
+            );
+        } else if (std.mem.eql(u8, sym.name_text, "FullByte")) {
+            has_found_full_byte = true;
+            try std.testing.expect(
+                ok_res.type_pool.isFromBytesValid(sym.type_id, &ok_res.symbol_table, TargetLayout.NATIVE_64),
+            );
+        } else if (std.mem.eql(u8, sym.name_text, "WireFlags")) {
+            has_found_flags = true;
+            try std.testing.expect(
+                ok_res.type_pool.isFromBytesValid(sym.type_id, &ok_res.symbol_table, TargetLayout.NATIVE_64),
+            );
+        }
+    }
+    try std.testing.expect(has_found_port and has_found_full_byte and has_found_flags);
+
+    // [2] Unpadded struct padding offset (`byte_offset = 1`, `padding_bytes = 3`) & `E0315`:
+    const bad_wire_src =
+        \\pub struct UnpaddedHdr {
+        \\    pub tag: u8,
+        \\    pub payload: u32,
+        \\}
+        \\pub fn leak_padding(hdr: &UnpaddedHdr) -> &[u8] {
+        \\    return hdr.as_bytes();
+        \\}
+    ;
+    var bad_res = try typecheckSource(std.testing.allocator, FileId.fromInt(30), bad_wire_src);
+    defer bad_res.deinit();
+    try std.testing.expect(hasDiagnosticCode(&bad_res.diagnostics, .e0315_wire_layout_contract_violation));
+
+    var has_verified_padding_offset = false;
+    sym_i = 0;
+    while (sym_i < bad_res.symbol_table.symbols.items.len) : (sym_i += 1) {
+        const sym = bad_res.symbol_table.getSymbol(SymbolIndex.fromInt(sym_i)).*;
+        if (std.mem.eql(u8, sym.name_text, "UnpaddedHdr")) {
+            const viol = bad_res.type_pool.explainIntoBytesViolation(
+                sym.type_id,
+                &bad_res.symbol_table,
+                TargetLayout.NATIVE_64,
+            ) orelse unreachable;
+            try std.testing.expectEqual(WireLayoutViolationReason.unzeroed_inter_field_padding, viol.reason);
+            try std.testing.expectEqual(@as(u64, 1), viol.byte_offset);
+            try std.testing.expectEqual(@as(u64, 3), viol.padding_bytes);
+            try std.testing.expectEqualStrings("payload", viol.field_name);
+            has_verified_padding_offset = true;
+        }
+    }
+    try std.testing.expect(has_verified_padding_offset);
+}
+
+test "test_phase6_seam1_secret_taint_propagation_and_e0402_e0405" {
+    try std.testing.expectEqual(@as(usize, 1), @sizeOf(TypeFlags));
+    try std.testing.expectEqual(
+        @as(usize, 14),
+        @sizeOf(TypeTag) + @sizeOf(TypeFlags) + @sizeOf(u32) + @sizeOf(u32) + @sizeOf(u32),
+    );
+
+    // [1] `@secret` nominal fixpoint propagation & `IntoBytes` rejection (`E0315`):
+    const secret_wire_src =
+        \\@secret
+        \\pub type ApiKey = distinct [u8; 32];
+        \\pub struct Envelope {
+        \\    pub key: ApiKey,
+        \\}
+        \\pub fn try_dump_secret(env: &Envelope) -> &[u8] {
+        \\    return env.as_bytes();
+        \\}
+    ;
+    var sw_res = try typecheckSource(std.testing.allocator, FileId.fromInt(31), secret_wire_src);
+    defer sw_res.deinit();
+    try std.testing.expect(hasDiagnosticCode(&sw_res.diagnostics, .e0315_wire_layout_contract_violation));
+
+    var is_env_secret = false;
+    var sym_i: u32 = 0;
+    while (sym_i < sw_res.symbol_table.symbols.items.len) : (sym_i += 1) {
+        const sym = sw_res.symbol_table.getSymbol(SymbolIndex.fromInt(sym_i)).*;
+        if (std.mem.eql(u8, sym.name_text, "Envelope")) {
+            is_env_secret = sw_res.type_pool.getFlags(sym.type_id).is_secret;
+        }
+    }
+    try std.testing.expect(is_env_secret);
+
+    // [2] `@secret` on transparent `type` alias emits `E0405`:
+    const bad_alias_src =
+        \\@secret
+        \\pub type TransparentSecret = u64;
+    ;
+    var alias_res = try typecheckSource(std.testing.allocator, FileId.fromInt(32), bad_alias_src);
+    defer alias_res.deinit();
+    try std.testing.expect(hasDiagnosticCode(&alias_res.diagnostics, .e0405_distinct_type_mixing));
+
+    // [3] `@derive(Debug)` on `@secret` struct emits `E0402`:
+    const bad_debug_src =
+        \\@derive(Debug)
+        \\@secret
+        \\pub struct SecretVault {
+        \\    pub pin: u64,
+        \\}
+    ;
+    var dbg_res = try typecheckSource(std.testing.allocator, FileId.fromInt(33), bad_debug_src);
+    defer dbg_res.deinit();
+    try std.testing.expect(hasDiagnosticCode(&dbg_res.diagnostics, .e0402_unsatisfied_trait_bound));
+}
+
+test "test_phase6_seam2_context_fields_and_safe_narrowing_d11" {
+    const src =
+        \\pub struct Context {}
+        \\pub fn exercise_ctx_and_narrow(ctx: &Context, wide_val: i64) -> u8 {
+        \\    let seed: u64 = ctx.rng_seed;
+        \\    let sink_ptr: (*mut u8)? = ctx.trace_sink;
+        \\    let explicit_b: u8 = wide_val.narrow[u8]();
+        \\    let inferred_b: u8 = wide_val.narrow();
+        \\    let try_explicit: u8? = wide_val.try_narrow[u8]();
+        \\    let try_inferred: u8? = wide_val.try_narrow();
+        \\    let _ = seed;
+        \\    let _ = sink_ptr;
+        \\    let _ = inferred_b;
+        \\    let _ = try_explicit;
+        \\    let _ = try_inferred;
+        \\    return explicit_b;
+        \\}
+    ;
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var token_buffer = TokenBuffer.init(std.testing.allocator);
+    defer token_buffer.deinit();
+    var cst_arena = LosslessCstArena.init(std.testing.allocator);
+    defer cst_arena.deinit();
+    var ast_arena = AstArena.init(std.testing.allocator);
+    defer ast_arena.deinit();
+    var diagnostics = DiagnosticSink.init(std.testing.allocator);
+    defer diagnostics.deinit();
+    const file_id = FileId.fromInt(34);
+    _ = try parser.parseSource(
+        src,
+        file_id,
+        &token_buffer,
+        &cst_arena,
+        &ast_arena,
+        &diagnostics,
+        &interner,
+    );
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+    var sym_table = try SymbolTable.init(std.testing.allocator, &interner);
+    defer sym_table.deinit();
+    _ = try symbol_resolver.collectFileModuleItems(
+        &sym_table,
+        &interner,
+        file_id,
+        src,
+        &token_buffer,
+        &cst_arena,
+        &ast_arena,
+        &diagnostics,
+    );
+
+    var checker = try TypeChecker.init(
+        std.testing.allocator,
+        &interner,
+        &pool,
+        &sym_table,
+        file_id,
+        src,
+        &token_buffer,
+        &cst_arena,
+        &ast_arena,
+        &diagnostics,
+    );
+    defer checker.deinit();
+    try checker.resolveModuleSignatures();
+    try checker.checkFileBodies();
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.countDiagnostics());
+    try std.testing.expectEqual(@as(u32, 4), checker.narrow_calls.count());
+}
+
+test "test_phase6_fn_ptr_contracts_trait_nonescalation_and_sandbox_e0320_e0327" {
+    // [1] Valid `@no_alloc @no_panic fn` -> `fn` and `@no_alloc fn` coercion:
+    const valid_fn_src =
+        \\@no_alloc
+        \\@no_panic
+        \\pub fn fast_add(lhs: i32, rhs: i32) -> i32 {
+        \\    return lhs +% rhs;
+        \\}
+        \\pub fn accept_plain(cb: fn(i32, i32) -> i32) -> i32 {
+        \\    return cb(1, 2);
+        \\}
+        \\pub fn accept_no_alloc(cb: @no_alloc fn(i32, i32) -> i32) -> i32 {
+        \\    return cb(3, 4);
+        \\}
+        \\pub fn run_valid() -> i32 {
+        \\    return accept_plain(fast_add) +% accept_no_alloc(fast_add);
+        \\}
+    ;
+    var ok_fn_res = try typecheckSource(std.testing.allocator, FileId.fromInt(35), valid_fn_src);
+    defer ok_fn_res.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ok_fn_res.diagnostics.countDiagnostics());
+
+    // [2] Missing `@no_alloc` / `@no_panic` / `@no_block` on `fn` coercion (`E0320`, `E0321`, `E0322`):
+    const bad_fn_src =
+        \\pub fn plain_cb(val: i32) -> i32 {
+        \\    return val;
+        \\}
+        \\pub fn bad_coercions() -> unit {
+        \\    let f_alloc: @no_alloc fn(i32) -> i32 = plain_cb;
+        \\    let f_panic: @no_panic fn(i32) -> i32 = plain_cb;
+        \\    let f_block: @no_block fn(i32) -> i32 = plain_cb;
+        \\    let _ = f_alloc;
+        \\    let _ = f_panic;
+        \\    let _ = f_block;
+        \\}
+    ;
+    var bad_fn_res = try typecheckSource(std.testing.allocator, FileId.fromInt(36), bad_fn_src);
+    defer bad_fn_res.deinit();
+    try std.testing.expect(hasDiagnosticCode(&bad_fn_res.diagnostics, .e0320_no_alloc_contract_violation));
+    try std.testing.expect(hasDiagnosticCode(&bad_fn_res.diagnostics, .e0321_no_panic_contract_violation));
+    try std.testing.expect(hasDiagnosticCode(&bad_fn_res.diagnostics, .e0322_no_block_contract_violation));
+
+    // [3] Trait `impl` contract escalation (`E0323`):
+    const bad_impl_src =
+        \\pub trait PacketCodec {
+        \\    @no_alloc
+        \\    fn step(val: i32) -> i32;
+        \\}
+        \\pub struct BadCodec {}
+        \\impl PacketCodec for BadCodec {
+        \\    pub fn step(val: i32) -> i32 {
+        \\        return val;
+        \\    }
+        \\}
+    ;
+    var bad_impl_res = try typecheckSource(std.testing.allocator, FileId.fromInt(37), bad_impl_src);
+    defer bad_impl_res.deinit();
+    try std.testing.expect(hasDiagnosticCode(&bad_impl_res.diagnostics, .e0323_trait_impl_effect_escalation));
+
+    // [4] Forbidden `@link_section` & user `@std_cap_boundary` (`E0327`):
+    try std.testing.expect(symbol_resolver.isForbiddenExecutableSection("__DATA,__mod_init_func"));
+    try std.testing.expect(symbol_resolver.isForbiddenExecutableSection(".init_array"));
+    try std.testing.expect(symbol_resolver.isForbiddenExecutableSection(".CRT$XCU"));
+    try std.testing.expect(symbol_resolver.isForbiddenExecutableSection(".tls$ZZZ"));
+    try std.testing.expect(!symbol_resolver.isForbiddenExecutableSection(".rodata.lookup"));
+
+    const sandbox_src =
+        \\@link_section(".init_array")
+        \\pub fn evil_ctor() -> unit {}
+        \\@std_cap_boundary(emits = [FS])
+        \\pub fn user_spoof() -> unit {}
+    ;
+    var sb_res = try typecheckSource(std.testing.allocator, FileId.fromInt(38), sandbox_src);
+    defer sb_res.deinit();
+    try std.testing.expect(hasDiagnosticCode(&sb_res.diagnostics, .e0327_forbidden_sandbox_bypass_attribute));
+    try std.testing.expect(sb_res.diagnostics.countDiagnostics() >= 2);
 }

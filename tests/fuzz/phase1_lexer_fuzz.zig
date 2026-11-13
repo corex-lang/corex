@@ -204,7 +204,7 @@ test "test_fuzz_lexer_10_million_random_and_mutated_inputs_lossless" {
     };
 
     var threads: [FAST_FUZZ_WORKER_COUNT - 1]?std.Thread = @splat(null);
-    for (0 .. FAST_FUZZ_WORKER_COUNT - 1) |worker_idx| {
+    for (0..FAST_FUZZ_WORKER_COUNT - 1) |worker_idx| {
         const worker_seed: u64 = 0xC0DEC0DE_20261109 ^
             (@as(u64, @intCast(worker_idx + 1)) *% 0x9E37_79B9_7F4A_7C15);
         threads[worker_idx] = std.Thread.spawn(

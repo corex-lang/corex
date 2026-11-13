@@ -3,9 +3,11 @@
 //! Compares rendered CLI help menus, single-line diagnostics, multi-line region diagnostics,
 //! cross-file stitched diagnostics, CLI typo diagnostics, lexer token/trivia streams, parser
 //! CST/AST trees and diagnostics, `corex fmt` / `corex fmt --fix` formatting outputs,
-//! `CompilerDb` Early Cutoff / `ItemTree` firewall reports, and Phase 5 `HIR` desugaring,
+//! `CompilerDb` Early Cutoff / `ItemTree` firewall reports, Phase 5 `HIR` desugaring,
 //! Block-Argument SSA `MIR` (`--dev` vs `--release`, monomorphization, `LayoutShapeKey` dedup,
-//! and `R6` `ICF`), and multi-frame `comptime` / `W0501` diagnostics against golden `.snap` files.
+//! and `R6` `ICF`), multi-frame `comptime` / `W0501` diagnostics, and Phase 6 `SAST` ownership/
+//! borrow/escape/bounds diagnostics, capability witness chains, and `MIR` drop elaboration
+//! against golden `.snap` files.
 //!
 //! Normalizes `CRLF` (`\r\n`) to `LF` (`\n`) when loading `.snap` files so snapshots match across OSes.
 
@@ -32,6 +34,35 @@ const StyleConfig = corex.StyleConfig;
 const DiagnosticSink = corex.DiagnosticSink;
 const LabeledSpan = corex.LabeledSpan;
 const DiagnosticRenderer = corex.DiagnosticRenderer;
+
+// --------------------------------------- CONSTS ----------------------------------------
+
+/// Canonical Phase 6 diagnostic codes verified across SAST unit and golden snapshot suites (`DR-06`, `DR-17`, `DR-20`).
+const PHASE6_DIAGNOSTIC_CODES = [_]corex.DiagnosticCode{
+    .e0301_use_after_free,
+    .e0302_use_after_move,
+    .e0303_uninitialized_memory_read,
+    .e0304_resource_or_memory_leak,
+    .e0305_exclusivity_violation,
+    .e0306_region_escape_violation,
+    .e0307_static_buffer_overflow,
+    .w0308_unused_region_allocation,
+    .e0313_double_free_or_close,
+    .w0314_unproven_bounds_access,
+    .e0315_wire_layout_contract_violation,
+    .e0316_max_stack_budget_exceeded,
+    .e0320_no_alloc_contract_violation,
+    .e0321_no_panic_contract_violation,
+    .e0322_no_block_contract_violation,
+    .e0323_trait_impl_effect_escalation,
+    .e0324_package_capability_violation,
+    .e0325_comptime_sandbox_violation,
+    .e0326_embed_path_escape,
+    .e0327_forbidden_sandbox_bypass_attribute,
+    .e0328_scratch_arena_ping_pong_conflict,
+    .w0329_vacated_projection_panic_abort,
+    .w0330_ambient_dead_capability_in_dep,
+};
 
 // -------------------------------------- INTERNALS --------------------------------------
 
@@ -97,6 +128,21 @@ fn registerAllMirBodiesInVm(
                     break;
                 }
             }
+        }
+        _ = try vm_engine.registerBody(body_ptr, sym_idx);
+    }
+}
+
+/// Registers every optimized `MirBody` inside `bodies` on `vm_engine` using `sym_table` metadata.
+fn registerOptimizedBodiesInVm(
+    vm_engine: *corex.MirVm,
+    bodies: []const corex.MirBody,
+    sym_table: *const corex.SymbolTable,
+) !void {
+    for (bodies) |*body_ptr| {
+        var sym_idx = body_ptr.symbol_index;
+        if (sym_idx.isNone() and !body_ptr.def_id.isNone()) {
+            sym_idx = sym_table.def_to_symbol.get(body_ptr.def_id.asInt()) orelse .none;
         }
         _ = try vm_engine.registerBody(body_ptr, sym_idx);
     }
@@ -1348,5 +1394,539 @@ test "test_snapshot_diag_phase5_comptime_stack_trace_and_w0501" {
         std.testing.io,
         "tests/snapshots/diag_phase5_comptime_errors.snap",
         rendered_text,
+    );
+}
+
+test "test_snapshot_phase6_sast_ownership_region_and_bounds_diagnostics" {
+    for (PHASE6_DIAGNOSTIC_CODES) |phase6_code| {
+        try std.testing.expectEqual(@as(usize, 5), phase6_code.asCodeStr().len);
+    }
+
+    const phase6_ownership_src =
+        "pub struct Vec[T] {\n" ++
+        "    pub len: usize,\n" ++
+        "}\n" ++
+        "pub struct BumpArena {\n" ++
+        "    pub used: usize,\n" ++
+        "}\n" ++
+        "pub struct Context {\n" ++
+        "    pub allocator: usize,\n" ++
+        "    pub scratch: [BumpArena; 2],\n" ++
+        "}\n" ++
+        "pub fn consume_vec(own _items: sink Vec[i64]) {}\n" ++
+        "pub fn head_slice(items: &[i64]) -> &[i64] {\n" ++
+        "    return items;\n" ++
+        "}\n" ++
+        "pub fn mutate_arr(mut arr: inout [i64; 4]) {\n" ++
+        "    arr[0] = 99;\n" ++
+        "}\n" ++
+        "pub fn reset(_arena: &BumpArena) {}\n" ++
+        "pub fn wire_size_mismatch(word: u32) -> u64 {\n" ++
+        "    return @bit_cast[u64](word);\n" ++
+        "}\n" ++
+        "pub fn use_after_move() -> usize {\n" ++
+        "    let items = Vec { len: 4 };\n" ++
+        "    consume_vec(items);\n" ++
+        "    return items.len;\n" ++
+        "}\n" ++
+        "pub fn borrow_conflict() -> usize {\n" ++
+        "    var arr: [i64; 4] = [1, 2, 3, 4];\n" ++
+        "    let view = head_slice(&arr);\n" ++
+        "    mutate_arr(arr);\n" ++
+        "    return view.len;\n" ++
+        "}\n" ++
+        "pub fn stack_escape() -> &i64 {\n" ++
+        "    let local_val: i64 = 77;\n" ++
+        "    return &local_val;\n" ++
+        "}\n" ++
+        "pub fn scratch_conflict(ctx: &Context) -> usize {\n" ++
+        "    let live_ref = &ctx.scratch[0];\n" ++
+        "    reset(&ctx.scratch[0]);\n" ++
+        "    return live_ref.used;\n" ++
+        "}\n" ++
+        "pub fn static_oob() -> i64 {\n" ++
+        "    let fixed: [i64; 3] = [1, 2, 3];\n" ++
+        "    return fixed[3];\n" ++
+        "}\n" ++
+        "pub fn unproven_strict_bounds(slice_in: &[i64], raw_idx: usize) -> i64 {\n" ++
+        "    return slice_in[raw_idx];\n" ++
+        "}\n";
+
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var source_map = VfsSourceMap.init(std.testing.allocator, &interner);
+    defer source_map.deinit(std.testing.io);
+
+    const vfs_file_id = try source_map.setOverlay(
+        "src\\sast\\phase6_ownership_errors.cx",
+        phase6_ownership_src,
+        .root,
+    );
+    try std.testing.expectEqual(FileId.fromInt(0), vfs_file_id);
+
+    var token_buffer = TokenBuffer.init(std.testing.allocator);
+    defer token_buffer.deinit();
+    var cst_arena = LosslessCstArena.init(std.testing.allocator);
+    defer cst_arena.deinit();
+    var ast_arena = AstArena.init(std.testing.allocator);
+    defer ast_arena.deinit();
+    var diag_sink = DiagnosticSink.init(std.testing.allocator);
+    defer diag_sink.deinit();
+    var lowering_sink = DiagnosticSink.init(std.testing.allocator);
+    defer lowering_sink.deinit();
+
+    _ = try corex.parseSource(
+        phase6_ownership_src,
+        vfs_file_id,
+        &token_buffer,
+        &cst_arena,
+        &ast_arena,
+        &lowering_sink,
+        &interner,
+    );
+    try expectZeroDiagErrors(&lowering_sink);
+
+    var sym_table = try corex.SymbolTable.init(std.testing.allocator, &interner);
+    defer sym_table.deinit();
+    _ = try corex.collectFileModuleItems(
+        &sym_table,
+        &interner,
+        vfs_file_id,
+        phase6_ownership_src,
+        &token_buffer,
+        &cst_arena,
+        &ast_arena,
+        &diag_sink,
+    );
+    try corex.resolveFileUseImports(
+        &sym_table,
+        &interner,
+        vfs_file_id,
+        phase6_ownership_src,
+        &token_buffer,
+        &cst_arena,
+        &diag_sink,
+    );
+
+    var pool = try corex.InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+    var checker = try corex.TypeChecker.init(
+        std.testing.allocator,
+        &interner,
+        &pool,
+        &sym_table,
+        vfs_file_id,
+        phase6_ownership_src,
+        &token_buffer,
+        &cst_arena,
+        &ast_arena,
+        &diag_sink,
+    );
+    defer checker.deinit();
+    checker.target_layout = corex.TargetLayout.NATIVE_64;
+    try checker.resolveModuleSignatures();
+    try checker.checkFileBodies();
+
+    var side_tables = try checker.extractFileSemanticSideTables(std.testing.allocator);
+    defer side_tables.deinit();
+    var hir_store = try corex.hir.lowerFileToHir(
+        std.testing.allocator,
+        vfs_file_id,
+        phase6_ownership_src,
+        &token_buffer,
+        &cst_arena,
+        &ast_arena,
+        &interner,
+        &pool,
+        &sym_table,
+        &side_tables,
+        &lowering_sink,
+        corex.TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer hir_store.deinit();
+    try expectZeroDiagErrors(&lowering_sink);
+
+    var mir_module = try corex.mir.lowerHirToMirForSast(
+        std.testing.allocator,
+        &hir_store,
+        &pool,
+        &sym_table,
+        &interner,
+        &lowering_sink,
+    );
+    defer mir_module.deinit();
+    try expectZeroDiagErrors(&lowering_sink);
+
+    var sast_res = try corex.analyzeAndElaborateMirModule(
+        std.testing.allocator,
+        mir_module.bodies.items,
+        &pool,
+        &sym_table,
+        &interner,
+        .{
+            .is_sast_strict = true,
+            .diagnostic_sink = &diag_sink,
+            .source_text = phase6_ownership_src,
+            .token_buffer = &token_buffer,
+            .cst_arena = &cst_arena,
+        },
+    );
+    defer sast_res.deinit();
+
+    try std.testing.expect(hasDiagnosticCodeInSink(&diag_sink, .e0302_use_after_move));
+    try std.testing.expect(hasDiagnosticCodeInSink(&diag_sink, .e0305_exclusivity_violation));
+    try std.testing.expect(hasDiagnosticCodeInSink(&diag_sink, .e0306_region_escape_violation));
+    try std.testing.expect(hasDiagnosticCodeInSink(&diag_sink, .e0307_static_buffer_overflow));
+    try std.testing.expect(hasDiagnosticCodeInSink(&diag_sink, .e0315_wire_layout_contract_violation));
+    try std.testing.expect(hasDiagnosticCodeInSink(&diag_sink, .e0328_scratch_arena_ping_pong_conflict));
+    try std.testing.expect(hasDiagnosticCodeInSink(&diag_sink, .w0314_unproven_bounds_access));
+
+    var out_buf: [65536]u8 = undefined;
+    var out_writer = std.Io.Writer.fixed(&out_buf);
+    try DiagnosticRenderer.init(
+        &source_map,
+        &interner,
+        StyleConfig.MONOCHROME,
+    ).renderAll(&out_writer, &diag_sink);
+
+    const rendered_text = out_writer.buffered();
+    try std.testing.expect(
+        std.mem.indexOf(u8, rendered_text, "src/sast/phase6_ownership_errors.cx") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, rendered_text, "src\\sast\\phase6_ownership_errors.cx") == null,
+    );
+
+    try expectMatchesSnapshotFile(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/snapshots/diag_phase6_sast_errors.snap",
+        rendered_text,
+    );
+}
+
+test "test_snapshot_phase6_capability_contracts_and_witness_chains" {
+    const phase6_cap_src =
+        "extern \"C\" fn raw_c_hook() -> i32;\n" ++
+        "fn open_file() -> i32;\n" ++
+        "pub struct Context {\n" ++
+        "    pub allocator: usize,\n" ++
+        "}\n" ++
+        "fn fs_sync_leaf() -> i32 {\n" ++
+        "    return open_file();\n" ++
+        "}\n" ++
+        "fn fs_sync_mid() -> i32 {\n" ++
+        "    return fs_sync_leaf();\n" ++
+        "}\n" ++
+        "@max_stack(32)\n" ++
+        "pub fn rec_climb(depth: i32) -> i32 {\n" ++
+        "    if depth <= 0 {\n" ++
+        "        return 0;\n" ++
+        "    }\n" ++
+        "    return rec_climb(depth - 1) + 1;\n" ++
+        "}\n" ++
+        "fn alloc_leaf(ctx: &Context) -> usize {\n" ++
+        "    return ctx.allocator;\n" ++
+        "}\n" ++
+        "fn alloc_mid(ctx: &Context) -> usize {\n" ++
+        "    return alloc_leaf(ctx);\n" ++
+        "}\n" ++
+        "@no_alloc\n" ++
+        "pub fn no_alloc_entry(ctx: &Context) -> usize {\n" ++
+        "    return alloc_mid(ctx);\n" ++
+        "}\n" ++
+        "fn panic_leaf(items: &[i32], idx: usize) -> i32 {\n" ++
+        "    return items[idx];\n" ++
+        "}\n" ++
+        "fn panic_mid(items: &[i32], idx: usize) -> i32 {\n" ++
+        "    return panic_leaf(items, idx);\n" ++
+        "}\n" ++
+        "@no_panic\n" ++
+        "pub fn no_panic_entry(items: &[i32], idx: usize) -> i32 {\n" ++
+        "    return panic_mid(items, idx);\n" ++
+        "}\n" ++
+        "@no_block\n" ++
+        "pub fn no_block_entry() -> i32 {\n" ++
+        "    return fs_sync_mid();\n" ++
+        "}\n" ++
+        "comptime fn bad_comptime_probe() -> i32 {\n" ++
+        "    return fs_sync_mid();\n" ++
+        "}\n" ++
+        "fn dead_private_ffi() -> i32 {\n" ++
+        "    return unsafe { raw_c_hook() };\n" ++
+        "}\n";
+
+    var sast_bundle = try corex.lowerAndVerifySourceMirSast(
+        std.testing.allocator,
+        FileId.fromInt(0),
+        phase6_cap_src,
+        corex.TargetLayout.NATIVE_64,
+        .{
+            .package_policy = .{
+                .package_name = "untrusted_codec",
+                .policy_span = Span.init(FileId.fromInt(0), 0, 34),
+                .allowed_caps = corex.EffectCapabilityMask.EMPTY,
+                .is_third_party_dependency = true,
+                .enforcement_scope = .surface,
+            },
+        },
+    );
+    defer sast_bundle.deinit();
+
+    var source_map = VfsSourceMap.init(std.testing.allocator, &sast_bundle.interner);
+    defer source_map.deinit(std.testing.io);
+    const vfs_file_id = try source_map.setOverlay(
+        "src\\sast\\phase6_capability_errors.cx",
+        phase6_cap_src,
+        .root,
+    );
+    try std.testing.expectEqual(FileId.fromInt(0), vfs_file_id);
+
+    try std.testing.expect(hasDiagnosticCodeInSink(&sast_bundle.diagnostics, .e0316_max_stack_budget_exceeded));
+    try std.testing.expect(hasDiagnosticCodeInSink(&sast_bundle.diagnostics, .e0320_no_alloc_contract_violation));
+    try std.testing.expect(hasDiagnosticCodeInSink(&sast_bundle.diagnostics, .e0321_no_panic_contract_violation));
+    try std.testing.expect(hasDiagnosticCodeInSink(&sast_bundle.diagnostics, .e0322_no_block_contract_violation));
+    try std.testing.expect(hasDiagnosticCodeInSink(&sast_bundle.diagnostics, .e0324_package_capability_violation));
+    try std.testing.expect(hasDiagnosticCodeInSink(&sast_bundle.diagnostics, .e0325_comptime_sandbox_violation));
+    try std.testing.expect(hasDiagnosticCodeInSink(&sast_bundle.diagnostics, .w0330_ambient_dead_capability_in_dep));
+
+    var out_buf: [65536]u8 = undefined;
+    var out_writer = std.Io.Writer.fixed(&out_buf);
+    try DiagnosticRenderer.init(
+        &source_map,
+        &sast_bundle.interner,
+        StyleConfig.MONOCHROME,
+    ).renderAll(&out_writer, &sast_bundle.diagnostics);
+
+    const rendered_text = out_writer.buffered();
+    try std.testing.expect(
+        std.mem.indexOf(u8, rendered_text, "src/sast/phase6_capability_errors.cx") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, rendered_text, "src\\sast\\phase6_capability_errors.cx") == null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, rendered_text, corex.Glyphs.POINTER_SOLID) != null);
+
+    try expectMatchesSnapshotFile(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/snapshots/diag_phase6_capabilities.snap",
+        rendered_text,
+    );
+}
+
+test "test_snapshot_phase6_mir_drop_elaboration_and_dev_release_parity" {
+    const drop_showcase_src =
+        "pub trait Drop {\n" ++
+        "    fn drop(&mut self);\n" ++
+        "}\n" ++
+        "pub struct TrackedGuard {\n" ++
+        "    pub id: i64,\n" ++
+        "}\n" ++
+        "impl Drop for TrackedGuard {\n" ++
+        "    pub fn drop(&mut self) {\n" ++
+        "        @drop_trace(self.id);\n" ++
+        "    }\n" ++
+        "}\n" ++
+        "pub fn consume_guard(own item: sink TrackedGuard) -> i64 {\n" ++
+        "    return item.id;\n" ++
+        "}\n" ++
+        "@no_panic\n" ++
+        "pub fn run_drop_and_bce_showcase(take_branch: bool, probe_idx: usize) -> i64 {\n" ++
+        "    let outer_guard = TrackedGuard { id: 100 };\n" ++
+        "    let cond_guard = TrackedGuard { id: 200 };\n" ++
+        "    let weights: [i64; 4] = [3, 5, 7, 11];\n" ++
+        "    let slice_view: &[i64] = &weights;\n" ++
+        "    var total: i64 = 0;\n" ++
+        "    if take_branch {\n" ++
+        "        total = consume_guard(cond_guard);\n" ++
+        "    }\n" ++
+        "    if probe_idx < slice_view.len {\n" ++
+        "        total = total +% slice_view[probe_idx];\n" ++
+        "    }\n" ++
+        "    return total +% outer_guard.id;\n" ++
+        "}\n" ++
+        "pub fn entry_moved() -> i64 {\n" ++
+        "    return run_drop_and_bce_showcase(true, 2);\n" ++
+        "}\n" ++
+        "pub fn entry_kept() -> i64 {\n" ++
+        "    return run_drop_and_bce_showcase(false, 1);\n" ++
+        "}\n";
+
+    var sast_bundle = try corex.lowerAndVerifySourceMirSast(
+        std.testing.allocator,
+        FileId.fromInt(0),
+        drop_showcase_src,
+        corex.TargetLayout.NATIVE_64,
+        .{ .is_sast_strict = true },
+    );
+    defer sast_bundle.deinit();
+    try expectZeroDiagErrors(&sast_bundle.diagnostics);
+    try std.testing.expectEqual(@as(usize, 0), sast_bundle.diagnostics.diagnostics.items.len);
+    try std.testing.expect(sast_bundle.sast_result.eliminated_bounds_checks > 0);
+    try std.testing.expect(sast_bundle.sast_result.emitted_drops >= 2);
+
+    var dev_sink = DiagnosticSink.init(std.testing.allocator);
+    defer dev_sink.deinit();
+    var dev_res = try corex.optimizeMirModule(
+        std.testing.allocator,
+        sast_bundle.mir_module.bodies.items,
+        &sast_bundle.pool,
+        &sast_bundle.sym_table,
+        &sast_bundle.interner,
+        .{
+            .is_release_mode = false,
+            .is_preserving_pre_strip_mir = false,
+            .target_layout = corex.TargetLayout.NATIVE_64,
+            .syntax_view = .{
+                .source = drop_showcase_src,
+                .tokens = &sast_bundle.token_buffer,
+                .cst_arena = &sast_bundle.cst_arena,
+            },
+        },
+        &dev_sink,
+    );
+    defer dev_res.deinit();
+    try expectZeroDiagErrors(&dev_sink);
+
+    var rel_sink = DiagnosticSink.init(std.testing.allocator);
+    defer rel_sink.deinit();
+    var rel_res = try corex.optimizeMirModule(
+        std.testing.allocator,
+        sast_bundle.mir_module.bodies.items,
+        &sast_bundle.pool,
+        &sast_bundle.sym_table,
+        &sast_bundle.interner,
+        .{
+            .is_release_mode = true,
+            .is_preserving_pre_strip_mir = false,
+            .target_layout = corex.TargetLayout.NATIVE_64,
+            .syntax_view = .{
+                .source = drop_showcase_src,
+                .tokens = &sast_bundle.token_buffer,
+                .cst_arena = &sast_bundle.cst_arena,
+            },
+        },
+        &rel_sink,
+    );
+    defer rel_res.deinit();
+    try expectZeroDiagErrors(&rel_sink);
+
+    // Execute both `entry_moved` and `entry_kept` in `MirVm` under `--dev` and `--release`:
+    var rodata_dev = corex.RodataPool.init(std.testing.allocator);
+    defer rodata_dev.deinit();
+    var rodata_rel = corex.RodataPool.init(std.testing.allocator);
+    defer rodata_rel.deinit();
+
+    const entry_names = [_]struct {
+        /// Entrypoint function name registered in `MirVm`.
+        name: []const u8,
+        /// Expected deterministic signed integer return value.
+        expected_scalar: i64,
+    }{
+        .{ .name = "entry_moved", .expected_scalar = 307 },
+        .{ .name = "entry_kept", .expected_scalar = 105 },
+    };
+
+    for (entry_names) |entry_case| {
+        var vm_dev = try corex.MirVm.init(
+            std.testing.allocator,
+            &sast_bundle.interner,
+            &sast_bundle.pool,
+            &sast_bundle.sym_table,
+            &rodata_dev,
+            null,
+            &dev_sink,
+            .{ .target_layout = corex.TargetLayout.NATIVE_64 },
+        );
+        defer vm_dev.deinit();
+        try registerOptimizedBodiesInVm(&vm_dev, dev_res.bodies.items, &sast_bundle.sym_table);
+
+        var vm_rel = try corex.MirVm.init(
+            std.testing.allocator,
+            &sast_bundle.interner,
+            &sast_bundle.pool,
+            &sast_bundle.sym_table,
+            &rodata_rel,
+            null,
+            &rel_sink,
+            .{ .target_layout = corex.TargetLayout.NATIVE_64 },
+        );
+        defer vm_rel.deinit();
+        try registerOptimizedBodiesInVm(&vm_rel, rel_res.bodies.items, &sast_bundle.sym_table);
+
+        const dev_entry = dev_res.findBodyByName(&sast_bundle.interner, entry_case.name).?;
+        const rel_entry = rel_res.findBodyByName(&sast_bundle.interner, entry_case.name).?;
+
+        const dev_val = try vm_dev.evalBody(dev_entry, &.{});
+        const rel_val = try vm_rel.evalBody(rel_entry, &.{});
+        try std.testing.expectEqual(entry_case.expected_scalar, dev_val.slot.scalar_i64);
+        try std.testing.expectEqual(dev_val.slot.scalar_i64, rel_val.slot.scalar_i64);
+        try std.testing.expectEqualSlices(i64, &[_]i64{ 200, 100 }, vm_dev.asDropTraceSlice());
+        try std.testing.expectEqualSlices(i64, vm_dev.asDropTraceSlice(), vm_rel.asDropTraceSlice());
+        try std.testing.expectEqual(@as(u32, 0), vm_dev.countUnfreedHeapAllocations());
+        try std.testing.expectEqual(@as(u32, 0), vm_rel.countUnfreedHeapAllocations());
+    }
+
+    const elaborated_body = sast_bundle.mir_module.findBodyByName(
+        &sast_bundle.interner,
+        "run_drop_and_bce_showcase",
+    ).?;
+    const dev_showcase = dev_res.findBodyByName(
+        &sast_bundle.interner,
+        "run_drop_and_bce_showcase",
+    ).?;
+    const rel_showcase = rel_res.findBodyByName(
+        &sast_bundle.interner,
+        "run_drop_and_bce_showcase",
+    ).?;
+
+    const elaborated_dump = try corex.renderMir(
+        std.testing.allocator,
+        elaborated_body,
+        &sast_bundle.interner,
+    );
+    defer std.testing.allocator.free(elaborated_dump);
+    try std.testing.expect(std.mem.indexOf(u8, elaborated_dump, "intrinsic_op.drop_in_place") != null);
+    try std.testing.expect(std.mem.indexOf(u8, elaborated_dump, "intrinsic_op.drop_if_live") != null);
+
+    const dev_dump = try corex.renderMir(
+        std.testing.allocator,
+        dev_showcase,
+        &sast_bundle.interner,
+    );
+    defer std.testing.allocator.free(dev_dump);
+
+    const rel_dump = try corex.renderMir(
+        std.testing.allocator,
+        rel_showcase,
+        &sast_bundle.interner,
+    );
+    defer std.testing.allocator.free(rel_dump);
+
+    var combined_out: std.ArrayList(u8) = .empty;
+    defer combined_out.deinit(std.testing.allocator);
+    try combined_out.appendSlice(
+        std.testing.allocator,
+        "=== [1] SAST-Elaborated Pre-Strip MIR (Drop Glue & Pentagon BCE) ===\n",
+    );
+    try combined_out.appendSlice(std.testing.allocator, elaborated_dump);
+    try combined_out.appendSlice(
+        std.testing.allocator,
+        "\n=== [2] --dev Optimized MIR (D1..D5) ===\n",
+    );
+    try combined_out.appendSlice(std.testing.allocator, dev_dump);
+    try combined_out.appendSlice(
+        std.testing.allocator,
+        "\n=== [3] --release Optimized MIR (D1..D5 + R1..R6) ===\n",
+    );
+    try combined_out.appendSlice(std.testing.allocator, rel_dump);
+
+    try expectMatchesSnapshotFile(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/snapshots/mir_phase6_drop_elaboration.snap",
+        combined_out.items,
     );
 }

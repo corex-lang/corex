@@ -60,21 +60,21 @@ pub const TokenSet128 = struct {
 
     /// Constructs a `TokenSet128` containing a single `TokenKind`.
     pub inline fn initOne(kind: TokenKind) TokenSet128 {
-        return .{ .mask = @as(u128, 1) << @intCast(@intFromEnum(kind)) };
+        return .{ .mask = @as(u128, 1) << @intCast(@backingInt(kind)) };
     }
 
     /// Constructs a `TokenSet128` containing all token kinds in `kinds`.
     pub fn initMany(kinds: []const TokenKind) TokenSet128 {
         var combined_mask: u128 = 0;
         for (kinds) |kind_item| {
-            combined_mask |= @as(u128, 1) << @intCast(@intFromEnum(kind_item));
+            combined_mask |= @as(u128, 1) << @intCast(@backingInt(kind_item));
         }
         return .{ .mask = combined_mask };
     }
 
     /// Returns `true` if `kind` is a member of `self` in $O(1)$ time.
     pub inline fn contains(self: TokenSet128, kind: TokenKind) bool {
-        return ((self.mask >> @as(u7, @intCast(@intFromEnum(kind)))) & 1) != 0;
+        return ((self.mask >> @as(u7, @intCast(@backingInt(kind)))) & 1) != 0;
     }
 
     /// Returns the bitwise union (`self | other`) of two token sets.
@@ -210,13 +210,14 @@ pub const TYPE_STARTER_SET: TokenSet128 = TokenSet128.initMany(&.{
     .tilde,
     .lbracket,
     .lparen,
+    .at,
     .kw_fn,
     .ident,
     .type_ident,
     .const_ident,
 });
 /// Consume-anchor set for top-level `Item` recovery (`DR-12` Section 2.2 Deliverable 2A).
-pub const ITEM_CONSUME_SET: TokenSet128 = TokenSet128.initMany(&.{ .semi });
+pub const ITEM_CONSUME_SET: TokenSet128 = TokenSet128.initMany(&.{.semi});
 /// Stop-before anchor set for top-level `Item` recovery (`DR-12` Section 2.2 Deliverable 2A).
 pub const ITEM_STOP_SET: TokenSet128 = ITEM_STARTER_SET.unionWith(TokenSet128.initMany(&.{
     .rbrace,
@@ -260,7 +261,7 @@ pub const MEMBER_STOP_SET: TokenSet128 = TokenSet128.initMany(&.{
     .eof,
 });
 /// Consume-anchor set for function parameter lists.
-pub const PARAM_CONSUME_SET: TokenSet128 = TokenSet128.initMany(&.{ .comma });
+pub const PARAM_CONSUME_SET: TokenSet128 = TokenSet128.initMany(&.{.comma});
 /// Stop-before anchor set for function parameter lists.
 pub const PARAM_STOP_SET: TokenSet128 = TokenSet128.initMany(&.{
     .rparen,
@@ -293,7 +294,7 @@ pub const TYPE_ARG_STOP_SET: TokenSet128 = TokenSet128.initMany(&.{
     .eof,
 });
 /// Consume-anchor set for `Block` statement loops.
-pub const BLOCK_STMT_CONSUME_SET: TokenSet128 = TokenSet128.initMany(&.{ .semi });
+pub const BLOCK_STMT_CONSUME_SET: TokenSet128 = TokenSet128.initMany(&.{.semi});
 /// Stop-before anchor set for `Block` statement loops.
 pub const BLOCK_STMT_STOP_SET: TokenSet128 = STMT_STARTER_SET.unionWith(TokenSet128.initMany(&.{
     .rbrace,
@@ -306,7 +307,7 @@ pub const LOCAL_INIT_STOP_SET: TokenSet128 = STMT_STARTER_SET.unionWith(TokenSet
     .eof,
 }));
 /// Consume-anchor set for `match` arm loops.
-pub const MATCH_ARM_CONSUME_SET: TokenSet128 = TokenSet128.initMany(&.{ .comma });
+pub const MATCH_ARM_CONSUME_SET: TokenSet128 = TokenSet128.initMany(&.{.comma});
 /// Stop-before anchor set for `match` arm loops.
 pub const MATCH_ARM_STOP_SET: TokenSet128 = TokenSet128.initMany(&.{
     .rbrace,
@@ -382,7 +383,7 @@ inline fn isIdentifierKind(kind: TokenKind) bool {
 
 /// Returns `true` if `kind` is one of the 45 language keywords (`0..44`).
 inline fn isKeywordKind(kind: TokenKind) bool {
-    return @intFromEnum(kind) <= @intFromEnum(TokenKind.kw_self_type);
+    return @backingInt(kind) <= @backingInt(TokenKind.kw_self_type);
 }
 
 /// Returns `true` if `kind` is one of the 11 assignment operators (`DR-03` Section 5.3 Tier 0).
@@ -2507,6 +2508,17 @@ pub const Parser = struct {
                 _ = try self.consumeLeaf(.token_leaf, .{});
                 if (self.peekKind() == .colon) {
                     _ = try self.consumeLeaf(.token_leaf, .{});
+                    if (self.peekKind() == .kw_let or
+                        (self.peekKind() == .ident and
+                            (std.mem.eql(u8, self.peekLexemeNth(0), "inout") or
+                                std.mem.eql(u8, self.peekLexemeNth(0), "sink") or
+                                std.mem.eql(u8, self.peekLexemeNth(0), "set") or
+                                std.mem.eql(u8, self.peekLexemeNth(0), "yielded"))))
+                    {
+                        if (self.peekKindNth(1) != .comma and self.peekKindNth(1) != .rparen) {
+                            _ = try self.consumeLeaf(.token_leaf, .{});
+                        }
+                    }
                     _ = try self.parseType();
                 }
             } else if (isIdentifierKind(self.peekKind()) or self.peekKind() == .underscore) {
@@ -2528,11 +2540,11 @@ pub const Parser = struct {
                 );
                 // Support optional Hylo/DR-02 parameter convention keywords (`inout`, `sink`, `set`, `let`, `yielded`):
                 if (self.peekKind() == .kw_let or
-                    ( self.peekKind() == .ident and
+                    (self.peekKind() == .ident and
                         (std.mem.eql(u8, self.peekLexemeNth(0), "inout") or
-                        std.mem.eql(u8, self.peekLexemeNth(0), "sink") or
-                        std.mem.eql(u8, self.peekLexemeNth(0), "set") or
-                        std.mem.eql(u8, self.peekLexemeNth(0), "yielded"))))
+                            std.mem.eql(u8, self.peekLexemeNth(0), "sink") or
+                            std.mem.eql(u8, self.peekLexemeNth(0), "set") or
+                            std.mem.eql(u8, self.peekLexemeNth(0), "yielded"))))
                 {
                     if (self.peekKindNth(1) != .comma and self.peekKindNth(1) != .rparen) {
                         _ = try self.consumeLeaf(.token_leaf, .{});
@@ -2849,6 +2861,7 @@ pub const Parser = struct {
                 const open_paren = try self.consumeLeaf(.token_leaf, .{});
                 var elem_types: std.ArrayList(u32) = .empty;
                 defer elem_types.deinit(self.ast.allocator);
+                var has_comma = false;
 
                 while (self.peekKind() != .rparen and
                     self.peekKind() != .rbrace and
@@ -2858,6 +2871,7 @@ pub const Parser = struct {
                     const loop_start = self.cursor;
                     try elem_types.append(self.ast.allocator, (try self.parseType()).asInt());
                     if (self.peekKind() == .comma) {
+                        has_comma = true;
                         _ = try self.consumeLeaf(.token_leaf, .{});
                     } else {
                         break;
@@ -2871,6 +2885,9 @@ pub const Parser = struct {
                     "expected `)` to close tuple type",
                 );
                 self.cst.finishNode(tup_cst, .{ .has_error = has_err });
+                if (elem_types.items.len == 1 and !has_comma) {
+                    return NodeIndex.fromInt(elem_types.items[0]);
+                }
 
                 var lhs_op: PackedOperand = .NONE;
                 var rhs_op: PackedOperand = .NONE;
@@ -2885,9 +2902,12 @@ pub const Parser = struct {
                     .rhs = rhs_op,
                 }, tup_cst);
             },
-            .kw_async, .kw_unsafe, .kw_fn => {
+            .at, .kw_async, .kw_unsafe, .kw_fn => {
                 const fn_cst = try self.startCstNode(.fn_type);
                 var has_err = false;
+                if (self.peekKind() == .at) {
+                    try self.parseAttributes(&has_err);
+                }
                 while (self.peekKind() == .kw_async or self.peekKind() == .kw_unsafe) {
                     _ = try self.consumeLeaf(.token_leaf, .{});
                 }
@@ -4827,8 +4847,8 @@ pub const Parser = struct {
                 (self.peekKind() == .kw_mut or self.peekKind() == .kw_let or
                     (self.peekKind() == .ident and
                         (std.mem.eql(u8, self.peekLexemeNth(0), "inout") or
-                        std.mem.eql(u8, self.peekLexemeNth(0), "sink") or
-                        std.mem.eql(u8, self.peekLexemeNth(0), "set")))))
+                            std.mem.eql(u8, self.peekLexemeNth(0), "sink") or
+                            std.mem.eql(u8, self.peekLexemeNth(0), "set")))))
             {
                 if (self.peekKind() == .kw_mut or self.peekKind() == .kw_let or
                     !EXPR_SYNC_STOP_SET.contains(self.peekKindNth(1)))

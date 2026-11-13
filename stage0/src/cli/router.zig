@@ -15,6 +15,7 @@ const diag = @import("../diag/diagnostic.zig");
 const renderer = @import("../diag/renderer.zig");
 const bench_harness = @import("../bench/harness.zig");
 const fmt_engine = @import("../fmt_engine.zig");
+const query_db = @import("../query_db.zig");
 
 const ColorMode = style.ColorMode;
 const Glyphs = style.Glyphs;
@@ -130,6 +131,8 @@ pub const CompileFlagId = enum(u8) {
     dev = 1,
     /// `--release` – compile in production release mode (`2`).
     release = 2,
+    /// `--sast-strict` – emit `W0314` warnings on unproven bounds checks (`3`).
+    sast_strict = 3,
 };
 
 /// Static metadata entry in `COMPILE_FLAGS` describing `build`/`run`/`check`/`test` flags.
@@ -164,6 +167,8 @@ pub const CommandAction = union(enum) {
         comptime_step_limit: u64 = DEFAULT_COMPTIME_STEP_LIMIT,
         /// Whether `--release` optimization mode was selected (`false` for `--dev` default).
         is_release_mode: bool = false,
+        /// Whether `--sast-strict` was passed to warn (`W0314`) on unproven bounds checks.
+        is_sast_strict: bool = false,
     },
     /// Invalid CLI invocation; errors have been emitted into `DiagnosticSink`.
     invalid: void,
@@ -183,6 +188,8 @@ pub const ParsedCommand = struct {
     comptime_step_limit: u64 = DEFAULT_COMPTIME_STEP_LIMIT,
     /// Whether `--release` optimization mode was selected (`false` for `--dev` default).
     is_release_mode: bool = false,
+    /// Whether `--sast-strict` was passed on a compile/check subcommand.
+    is_sast_strict: bool = false,
 };
 
 // --------------------------------------- CONSTS ----------------------------------------
@@ -307,6 +314,12 @@ pub const COMPILE_FLAGS = [_]CompileFlagDescriptor{
         .long_flag = "--release",
         .value_suffix = null,
         .summary = "Compile in production release mode with full SSA optimization",
+    },
+    .{
+        .id = .sast_strict,
+        .long_flag = "--sast-strict",
+        .value_suffix = null,
+        .summary = "Emit W0314 warnings when array or slice bounds checks cannot be statically elided",
     },
 };
 
@@ -518,6 +531,7 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
     var comptime_step_limit: u64 = DEFAULT_COMPTIME_STEP_LIMIT;
     var has_seen_dev = false;
     var has_seen_release = false;
+    var is_sast_strict = false;
     var selected_subcommand: ?SubcommandId = null;
     var positional_list: std.ArrayList([]const u8) = .empty;
     var is_after_double_dash = false;
@@ -550,6 +564,8 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                     try emitConflictingOptFlagsDiagnostic(sink);
                 }
                 has_seen_release = true;
+            } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--sast-strict")) {
+                is_sast_strict = true;
             } else if (is_compile_sub and std.mem.startsWith(u8, arg_text, "--comptime-limit=")) {
                 const raw_val = arg_text["--comptime-limit=".len..];
                 if (extractPositiveStepLimit(raw_val)) |parsed_steps| {
@@ -631,6 +647,7 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
             .is_fix_mode = is_fix_mode,
             .comptime_step_limit = comptime_step_limit,
             .is_release_mode = has_seen_release,
+            .is_sast_strict = is_sast_strict,
             .action = .{
                 .execute_subcommand = .{
                     .subcommand = sub_id,
@@ -639,6 +656,7 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                     .is_fix_mode = is_fix_mode,
                     .comptime_step_limit = comptime_step_limit,
                     .is_release_mode = has_seen_release,
+                    .is_sast_strict = is_sast_strict,
                 },
             },
         };
@@ -653,7 +671,7 @@ pub fn renderHelp(writer: *std.Io.Writer, style_config: StyleConfig) std.Io.Writ
         writer,
         "corex " ++ COREX_VERSION,
         &.{
-            "A streamlined, zero-GC, statically typed systems language",
+            "Build reliable software effortlessly at systems-level speed",
             "Usage: corex [OPTIONS] <COMMAND> [ARGS]…",
         },
     );
@@ -956,6 +974,9 @@ pub fn runCli(
                 try stdout_writer.writeByte('\n');
                 return 0;
             }
+            var cx_file_ids: std.ArrayListUnmanaged(mem.FileId) = .empty;
+            defer cx_file_ids.deinit(allocator);
+
             for (exec_info.positional_args) |file_arg| {
                 const file_id = source_map.resolveOrCreatePath(io, file_arg, .root) catch {
                     try sink.emit(.{
@@ -970,10 +991,92 @@ pub fn runCli(
                     continue;
                 };
                 _ = try source_map.getLineIndex(file_id);
+                if (std.mem.endsWith(u8, file_arg, ".cx")) {
+                    try cx_file_ids.append(allocator, file_id);
+                }
             }
             if (sink.hasErrors()) {
                 try DiagnosticRenderer.init(&source_map, &interner, stderr_style).renderAll(stderr_writer, &sink);
                 return 1;
+            }
+            if (exec_info.subcommand == .check and cx_file_ids.items.len > 0) {
+                var db = try query_db.CompilerDb.init(allocator);
+                defer db.deinit();
+                db.setSastStrict(exec_info.is_sast_strict);
+                db.setComptimeStepLimit(exec_info.comptime_step_limit);
+                db.setEmbedIo(io);
+
+                for (cx_file_ids.items) |cx_fid| {
+                    const file_bytes = source_map.getFileSource(cx_fid) orelse "";
+                    _ = try db.setInput(cx_fid, file_bytes, .low);
+                }
+
+                const diag_renderer = DiagnosticRenderer.init(&source_map, &interner, stderr_style);
+                var has_check_errors = false;
+
+                for (cx_file_ids.items) |cx_fid| {
+                    const parsed_art = try db.parseCst(cx_fid);
+                    if (parsed_art.diagnostics.diagnostics.items.len > 0) {
+                        try diag_renderer.renderAll(stderr_writer, &parsed_art.diagnostics);
+                        if (parsed_art.diagnostics.hasErrors()) has_check_errors = true;
+                    }
+
+                    const sig_art = try db.resolveSignatures(cx_fid);
+                    if (db.getSignatureDiagnostics(cx_fid)) |sig_sink| {
+                        if (sig_sink.diagnostics.items.len > 0) {
+                            try diag_renderer.renderAll(stderr_writer, sig_sink);
+                        }
+                        if (sig_sink.hasErrors()) has_check_errors = true;
+                    }
+                    if (sig_art.error_count > 0) has_check_errors = true;
+
+                    const item_tree = try db.extractItemTree(cx_fid);
+                    for (item_tree.entries) |entry| {
+                        const typed_art = try db.typecheckBody(entry.def_id);
+                        if (db.getBodyDiagnostics(entry.def_id)) |body_sink| {
+                            if (body_sink.diagnostics.items.len > 0) {
+                                try diag_renderer.renderAll(stderr_writer, body_sink);
+                            }
+                            if (body_sink.hasErrors()) has_check_errors = true;
+                        }
+                        if (typed_art.error_count > 0) has_check_errors = true;
+
+                        const sast_art = try db.verifySastMir(entry.def_id);
+                        if (db.getSastDiagnostics(entry.def_id)) |sast_sink| {
+                            if (sast_sink.diagnostics.items.len > 0) {
+                                try diag_renderer.renderAll(stderr_writer, sast_sink);
+                            }
+                            if (sast_sink.hasErrors()) has_check_errors = true;
+                        }
+                        if (!sast_art.is_verified_sound) has_check_errors = true;
+
+                        if (!has_check_errors and
+                            (entry.kind == .const_decl or entry.kind == .extern_block))
+                        {
+                            const ct_art_opt: ?query_db.ComptimeEvalArtifact =
+                                db.evalComptimeDef(entry.def_id) catch |ct_err| switch (ct_err) {
+                                    error.OutOfMemory => return error.OutOfMemory,
+                                    else => blk: {
+                                        has_check_errors = true;
+                                        break :blk null;
+                                    },
+                                };
+                            if (db.getComptimeDiagnostics(entry.def_id)) |ct_sink| {
+                                if (ct_sink.diagnostics.items.len > 0) {
+                                    try diag_renderer.renderAll(stderr_writer, ct_sink);
+                                }
+                                if (ct_sink.hasErrors()) has_check_errors = true;
+                            }
+                            if (ct_art_opt) |ct_art| {
+                                if (ct_art.has_errors) has_check_errors = true;
+                            }
+                        }
+                    }
+                }
+
+                if (has_check_errors) {
+                    return 1;
+                }
             }
             try stdout_style.writeStatusHeader(
                 stdout_writer,

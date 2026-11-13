@@ -31,6 +31,7 @@ const type_system = @import("type_system.zig");
 const query_db = @import("query_db.zig");
 const hir = @import("hir.zig");
 const mir = @import("mir.zig");
+const mir_sast = @import("mir_sast.zig");
 
 const FileId = mem_foundation.FileId;
 const Span = mem_foundation.Span;
@@ -172,7 +173,7 @@ pub const InlineDirective = enum(u8) {
     inline_never = 3,
 };
 
-/// Optional per-file CST context allowing `mir_opt` to extract `@inline(...)` / `@cold` directives.
+/// Optional per-file CST context allowing `mir_opt` to extract `@inline(…)` / `@cold` directives.
 pub const FileSyntaxView = struct {
     /// Raw UTF-8 source buffer of the file.
     source: []const u8,
@@ -197,6 +198,14 @@ pub const MirOptConfig = struct {
     inline_overrides: ?*const std.AutoHashMapUnmanaged(u32, InlineDirective) = null,
     /// Optional set of `comptime fn` `DefId.asInt()`s skipped by runtime monomorphization (`D5`).
     comptime_fn_defs: ?*const std.AutoHashMapUnmanaged(u32, void) = null,
+    /// Enables Phase 6 Pass `D0` (`mir_sast` typestate, `ElaborateDrops`, Pentagon BCE, & sandbox).
+    is_sast_enabled: bool = false,
+    /// Enables `--sast-strict` (`W0314` on unproven bounds checks) during Pass `D0`.
+    is_sast_strict: bool = false,
+    /// Optional dedicated diagnostic sink for Pass `D0` (`falls back to optimizeMirModule's sink`).
+    sast_sink: ?*DiagnosticSink = null,
+    /// Optional full `mir_sast.SastConfig` override for Pass `D0`.
+    sast_config: ?mir_sast.SastConfig = null,
 };
 
 /// Output artifact produced by `optimizeMirModule` (`CompilerDb` stage `optimize_mir_module`).
@@ -207,6 +216,8 @@ pub const MirOptModuleResult = struct {
     bodies: std.ArrayListUnmanaged(MirBody) = .empty,
     /// Optional pre-`D3` Ghost-bearing `MirBody` clones preserved for Phase 6 SAST when requested.
     pre_strip_bodies: std.ArrayListUnmanaged(MirBody) = .empty,
+    /// Optional Phase 6 `MirSastResult` populated when Pass `D0` (`is_sast_enabled`) executes.
+    sast_result: ?mir_sast.MirSastResult = null,
     /// Count of generic monomorphizations merged by sound `LayoutShapeKey` deduplication (`D5`).
     dedup_merged_count: u32 = 0,
     /// Count of identical bodies folded by `Wyhash(0)` structural `ICF` (`R6`).
@@ -214,8 +225,11 @@ pub const MirOptModuleResult = struct {
     /// Deterministic 64-bit `Wyhash(0)` structural fingerprint of `bodies` for `CompilerDb` Early Cutoff.
     fingerprint: u64 = 0,
 
-    /// Releases all `MirBody`s owned by `self`.
+    /// Releases all `MirBody`s and SAST summaries owned by `self`.
     pub fn deinit(self: *MirOptModuleResult) void {
+        if (self.sast_result) |*sast_res| {
+            sast_res.deinit();
+        }
         for (self.bodies.items) |*body_item| {
             body_item.deinit();
         }
@@ -732,6 +746,13 @@ fn spliceDirectCallSite(
                 cloned_flags,
             ),
         );
+        if (caller.local_scope_depths.items.len > 0) {
+            const base_depth: u16 = if (loc_i < callee.local_scope_depths.items.len)
+                callee.local_scope_depths.items[loc_i]
+            else
+                1;
+            try caller.local_scope_depths.append(caller.allocator, base_depth);
+        }
         local_remap[loc_i] = new_lid;
     }
 
@@ -881,7 +902,13 @@ fn spliceDirectCallSite(
                 }
             },
             .intrinsic_op => {
-                if (inst.operands.rhs > 0) {
+                const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+                if (ikind.hasPlaceInLhs()) {
+                    inst.operands.lhs = place_remap[inst.operands.lhs].asInt();
+                    if (ikind.hasSsaFlagInRhs() and inst.operands.rhs != mir.NONE_U32) {
+                        inst.operands.rhs += inst_offset;
+                    }
+                } else if (ikind.hasExtraArgs() and inst.operands.rhs > 0) {
                     const new_ex: u32 = @intCast(caller.extra_args.items.len);
                     for (callee.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs]) |v_raw| {
                         try caller.extra_args.append(caller.allocator, v_raw + inst_offset);
@@ -995,7 +1022,12 @@ fn spliceDirectCallSite(
                     }
                 }
             }
-            if (!is_pre_strip and old_inst.op.isGhost()) continue;
+            if (!is_pre_strip and (old_inst.op.isGhost() or
+                (old_inst.op == .intrinsic_op and
+                    @as(MirIntrinsicKind, @fromBackingInt(old_inst.aux_u16)).isGhostIntrinsic())))
+            {
+                continue;
+            }
             try mapped_insts.append(allocator, MirValueId.fromInt(inst_offset + old_inst_val.asInt()));
         }
 
@@ -1141,6 +1173,28 @@ fn spliceDirectCallSite(
         .edge_len = 1,
         .edge_start = entry_edge_idx,
     };
+
+    if (is_pre_strip and callee.vacated_windows.items.len > 0) {
+        for (callee.vacated_windows.items) |cal_win| {
+            try caller.vacated_windows.append(caller.allocator, .{
+                .start_block = if (cal_win.start_block.isNone())
+                    .none
+                else
+                    MirBlockId.fromInt(bb_offset + cal_win.start_block.asInt()),
+                .end_block = if (cal_win.end_block.isNone())
+                    .none
+                else
+                    MirBlockId.fromInt(bb_offset + cal_win.end_block.asInt()),
+                .access_token = if (cal_win.access_token.isNone())
+                    .none
+                else
+                    MirValueId.fromInt(inst_offset + cal_win.access_token.asInt()),
+                .yielded_place = place_remap[cal_win.yielded_place.asInt()],
+                .yielded_ty = cal_win.yielded_ty,
+                .site_token = cal_win.site_token,
+            });
+        }
+    }
 
     try rebuildPredsAndSweepUnreachable(allocator, caller);
 }
@@ -1786,6 +1840,13 @@ fn foldConstUnaryOp(
             };
             return .{ .folded = .{ .float_val = canonOptF32AsF64(@floatCast(fv)) } };
         },
+        .bitcast_op => {
+            const src_info = resolveOptIntInfo(pool, src_ty, target_layout) orelse return .not_foldable;
+            const dst_info = resolveOptIntInfo(pool, dst_ty, target_layout) orelse return .not_foldable;
+            if (src_info.bits != dst_info.bits) return .not_foldable;
+            const low_bits = zextConstInt(constToI128(src_mc) orelse return .not_foldable, src_info.bits);
+            return .{ .folded = makeTypedIntMirConst(pool, dst_ty, low_bits, target_layout) };
+        },
         else => return .not_foldable,
     }
 }
@@ -2042,7 +2103,13 @@ fn runPassD3StripGhostInstructions(allocator: std.mem.Allocator, body: *MirBody)
         const start: u32 = @intCast(new_block_insts.items.len);
         var kept: u32 = 0;
         for (old_slice) |inst_val| {
-            if (body.getInst(inst_val).op.isGhost()) continue;
+            const inst = body.getInst(inst_val);
+            if (inst.op.isGhost() or
+                (inst.op == .intrinsic_op and
+                    @as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)).isGhostIntrinsic()))
+            {
+                continue;
+            }
             new_block_insts.appendAssumeCapacity(inst_val);
             kept += 1;
         }
@@ -2120,7 +2187,6 @@ fn runPassD4BranchFoldAndPrune(allocator: std.mem.Allocator, body: *MirBody) !vo
 
     try rebuildPredsAndSweepUnreachable(allocator, body);
 }
-
 
 // -------- Pass `D5`: Monomorphization & `contextless` ---------
 
@@ -2461,6 +2527,38 @@ fn substituteMirType(
             }
             return pool.internTuple(new_elems);
         },
+        .struct_ty, .enum_ty, .union_ty => {
+            const raw_args = pool.getGenericTypeArgs(ty);
+            if (raw_args.len == 0) return ty;
+            const new_args = try allocator.alloc(TypeId, raw_args.len);
+            defer allocator.free(new_args);
+            for (raw_args, 0..) |raw_arg, i| {
+                new_args[i] = try substituteMirType(allocator, pool, TypeId.fromInt(raw_arg), subst, depth + 1);
+            }
+            return pool.internNominalInstantiation(ty, new_args, node.flags.is_copy, node.flags.has_drop);
+        },
+        .fn_ty, .closure_ty => {
+            const sig_view = pool.getFnSignatureView(ty) orelse return ty;
+            const arity = sig_view.paramCount();
+            const new_params = try allocator.alloc(TypeId, arity);
+            defer if (arity > 0) allocator.free(new_params);
+            const new_modes = try allocator.alloc(ParamMode, arity);
+            defer if (arity > 0) allocator.free(new_modes);
+            for (0..arity) |i| {
+                new_params[i] = try substituteMirType(allocator, pool, sig_view.getParamType(i), subst, depth + 1);
+                new_modes[i] = sig_view.getParamMode(i);
+            }
+            const new_ret = try substituteMirType(allocator, pool, sig_view.ret_ty, subst, depth + 1);
+            return pool.internFnWithContractsAndCapture(
+                node.tag,
+                new_params,
+                new_modes,
+                new_ret,
+                node.flags.is_must_use,
+                sig_view.contracts,
+                sig_view.capture_tier,
+            );
+        },
         else => return ty,
     }
 }
@@ -2561,11 +2659,14 @@ fn resolveOptCompositeFieldStep(
             if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return null;
             const st_sym = sym_table.getSymbol(sym_idx).*;
             if (st_sym.target_scope.isNone()) return null;
+            const subst = type_system.NominalTypeSubst.init(pool, sym_table, comp_ty);
             var ord: u32 = 0;
             for (sym_table.getScopeMembers(st_sym.target_scope)) |mem_idx| {
                 const mem_sym = sym_table.getSymbol(mem_idx).*;
                 if (mem_sym.kind != .field_sym) continue;
                 if (ord == field_ordinal) {
+                    const resolved_ty = subst.resolve(mem_sym.type_id);
+                    if (subst.len > 0 and pool.getFlags(resolved_ty).has_type_vars) return null;
                     const byte_off: u64 = type_system.computeStructFieldOffset(
                         pool,
                         sym_table,
@@ -2573,7 +2674,7 @@ fn resolveOptCompositeFieldStep(
                         field_ordinal,
                         target_layout,
                     ) orelse 0;
-                    return .{ .byte_offset = byte_off, .field_ty = mem_sym.type_id };
+                    return .{ .byte_offset = byte_off, .field_ty = resolved_ty };
                 }
                 ord += 1;
             }
@@ -2584,12 +2685,15 @@ fn resolveOptCompositeFieldStep(
             if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return null;
             const un_sym = sym_table.getSymbol(sym_idx).*;
             if (un_sym.target_scope.isNone()) return null;
+            const subst = type_system.NominalTypeSubst.init(pool, sym_table, comp_ty);
             var ord: u32 = 0;
             for (sym_table.getScopeMembers(un_sym.target_scope)) |mem_idx| {
                 const mem_sym = sym_table.getSymbol(mem_idx).*;
                 if (mem_sym.kind != .field_sym) continue;
                 if (ord == field_ordinal) {
-                    return .{ .byte_offset = 0, .field_ty = mem_sym.type_id };
+                    const resolved_ty = subst.resolve(mem_sym.type_id);
+                    if (subst.len > 0 and pool.getFlags(resolved_ty).has_type_vars) return null;
+                    return .{ .byte_offset = 0, .field_ty = resolved_ty };
                 }
                 ord += 1;
             }
@@ -2641,15 +2745,17 @@ fn computeOptSumPayloadOffset(
             if (!sym_idx.isNone() and sym_idx.asInt() < sym_table.symbols.items.len) {
                 const enum_sym = sym_table.getSymbol(sym_idx).*;
                 if (!enum_sym.target_scope.isNone()) {
+                    const subst = type_system.NominalTypeSubst.init(pool, sym_table, sum_ty);
                     for (sym_table.getScopeMembers(enum_sym.target_scope)) |mem_idx| {
                         const mem_sym = sym_table.getSymbol(mem_idx).*;
                         if (mem_sym.kind != .enum_variant_sym) continue;
                         variant_count += 1;
-                        if (mem_sym.type_id != .unit_ty and !mem_sym.type_id.isError()) {
+                        const var_ty = subst.resolve(mem_sym.type_id);
+                        if (var_ty != .unit_ty and !var_ty.isError()) {
                             const var_lay = type_system.computeTypeLayoutWithPool(
                                 pool,
                                 sym_table,
-                                mem_sym.type_id,
+                                var_ty,
                                 target_layout,
                             );
                             if (var_lay.align_bytes > max_pay_align) max_pay_align = var_lay.align_bytes;
@@ -2682,11 +2788,12 @@ fn resolveOptVariantPayloadType(
             if (!sym_idx.isNone() and sym_idx.asInt() < sym_table.symbols.items.len) {
                 const enum_sym = sym_table.getSymbol(sym_idx).*;
                 if (!enum_sym.target_scope.isNone()) {
+                    const subst = type_system.NominalTypeSubst.init(pool, sym_table, sum_ty);
                     var ord: u32 = 0;
                     for (sym_table.getScopeMembers(enum_sym.target_scope)) |mem_idx| {
                         const mem_sym = sym_table.getSymbol(mem_idx).*;
                         if (mem_sym.kind != .enum_variant_sym) continue;
-                        if (ord == tag_ordinal) break :blk mem_sym.type_id;
+                        if (ord == tag_ordinal) break :blk subst.resolve(mem_sym.type_id);
                         ord += 1;
                     }
                 }
@@ -2729,7 +2836,7 @@ fn hashCalleeTargetCanonical(
         } else {
             const zero_def: u32 = DefId.NONE.asInt();
             hasher.update(std.mem.asBytes(&zero_def));
-            hasher.update(&[_]u8{@intFromEnum(sym.kind)});
+            hasher.update(&[_]u8{@backingInt(sym.kind)});
             const file_raw = sym.decl_span.file_id.asInt();
             hasher.update(std.mem.asBytes(&file_raw));
             hasher.update(std.mem.asBytes(&sym.member_ordinal));
@@ -2879,7 +2986,7 @@ fn computeFieldOffsetsAndCalleesDigest(
         }
     }
     for (body.consts.items) |mc| {
-        hasher.update(&[_]u8{@intFromEnum(mc)});
+        hasher.update(&[_]u8{@backingInt(mc)});
         switch (mc) {
             .unit_val => {},
             .bool_val => |bv| hasher.update(&[_]u8{@intFromBool(bv)}),
@@ -3246,6 +3353,9 @@ fn runPassD5MonomorphizeAndPromote(
             for (spec.locals.items) |*loc| {
                 loc.type_id = try substituteMirType(allocator, pool, loc.type_id, &subst, 0);
             }
+            for (spec.vacated_windows.items) |*win| {
+                win.yielded_ty = try substituteMirType(allocator, pool, win.yielded_ty, &subst, 0);
+            }
             for (0..spec.insts.len) |inst_i| {
                 var inst = spec.insts.get(inst_i);
                 inst.type_id = try substituteMirType(allocator, pool, inst.type_id, &subst, 0);
@@ -3268,9 +3378,9 @@ fn runPassD5MonomorphizeAndPromote(
                             }
                         }
                     }
-                } else if (inst.op == .intrinsic_op and inst.operands.rhs == 0) {
+                } else if (inst.op == .intrinsic_op) {
                     const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
-                    if (ikind == .size_of or ikind == .align_of or ikind == .type_name) {
+                    if (ikind.hasTypeIdInLhs()) {
                         const subst_ty = try substituteMirType(
                             allocator,
                             pool,
@@ -3805,13 +3915,14 @@ fn decomposeSmallCompositeFields(
         if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return null;
         const sym = sym_table.getSymbol(sym_idx).*;
         if (sym.target_scope.isNone()) return null;
+        const subst = type_system.NominalTypeSubst.init(pool, sym_table, ty);
         var count: usize = 0;
         for (sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
             const mem = sym_table.getSymbol(mem_idx).*;
             if (mem.kind != .field_sym) continue;
             if (count >= MAX_SROA_COMPOSITE_FIELDS) return null;
-            const f_ty = pool.unwrapUnderlyingType(mem.type_id);
-            if (!isSroaRegisterType(pool, f_ty)) return null;
+            const f_ty = pool.unwrapUnderlyingType(subst.resolve(mem.type_id));
+            if (pool.getFlags(f_ty).has_type_vars or !isSroaRegisterType(pool, f_ty)) return null;
             out_fields[count] = f_ty;
             count += 1;
         }
@@ -3860,6 +3971,13 @@ fn runPassR2SroaPromotion(
                     } else if (pl.proj_len == 1) {
                         const proj = body.projections.items[pl.proj_start];
                         if (proj.kind != .field) is_disqualified[pl.base] = true;
+                    }
+                },
+                .intrinsic_op => {
+                    const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+                    if (ikind.hasPlaceInLhs() and inst.operands.lhs < body.places.items.len) {
+                        const base = body.places.items[inst.operands.lhs].base;
+                        if (base < local_count) is_disqualified[base] = true;
                     }
                 },
                 else => {},
@@ -4391,6 +4509,85 @@ fn runPassR3ValueRangeProp(
                                     }
                                 }
                             }
+                        } else if (ikind == .bounds_check and inst.operands.rhs >= 2 and
+                            inst.operands.lhs + 2 <= ctx.m_body.extra_args.items.len)
+                        {
+                            const idx_raw = ctx.m_body.extra_args.items[inst.operands.lhs];
+                            const len_raw = ctx.m_body.extra_args.items[inst.operands.lhs + 1];
+                            if (idx_raw < ctx.cur_ranges.len and len_raw < ctx.cur_ranges.len) {
+                                if (ctx.cur_ranges[idx_raw]) |idx_r| {
+                                    if (ctx.cur_ranges[len_raw]) |len_r| {
+                                        if (idx_r.min_val >= 0 and idx_r.max_val < len_r.min_val) {
+                                            const c_idx = try ctx.m_body.appendConst(.unit_val);
+                                            ctx.m_body.insts.set(raw, .{
+                                                .op = .const_scalar,
+                                                .flags = .{ .is_synthetic = true },
+                                                .type_id = .unit_ty,
+                                                .operands = .{ .lhs = c_idx, .rhs = 0 },
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        } else if (ikind == .narrow_check and inst.operands.rhs >= 3 and
+                            inst.operands.lhs + 3 <= ctx.m_body.extra_args.items.len)
+                        {
+                            const src_raw = ctx.m_body.extra_args.items[inst.operands.lhs];
+                            const min_raw = ctx.m_body.extra_args.items[inst.operands.lhs + 1];
+                            const max_raw = ctx.m_body.extra_args.items[inst.operands.lhs + 2];
+                            if (src_raw < ctx.cur_ranges.len and min_raw < ctx.cur_ranges.len and
+                                max_raw < ctx.cur_ranges.len)
+                            {
+                                if (ctx.cur_ranges[src_raw]) |src_r| {
+                                    if (ctx.cur_ranges[min_raw]) |min_r| {
+                                        if (ctx.cur_ranges[max_raw]) |max_r| {
+                                            if (min_r.min_val == min_r.max_val and max_r.min_val == max_r.max_val and
+                                                src_r.min_val >= min_r.min_val and src_r.max_val <= max_r.max_val)
+                                            {
+                                                const src_ty = ctx.m_body.getInst(MirValueId.fromInt(src_raw)).type_id;
+                                                if (resolveOptIntInfo(ctx.intern_pool, src_ty, ctx.layout)) |src_info| {
+                                                    if (resolveOptIntInfo(ctx.intern_pool, inst.type_id, ctx.layout)) |dst_info| {
+                                                        if (dst_info.bits < src_info.bits) {
+                                                            ctx.m_body.insts.set(raw, .{
+                                                                .op = .unary_op,
+                                                                .flags = .{ .is_synthetic = true },
+                                                                .aux_u16 = @backingInt(UnaryOpKind.int_trunc),
+                                                                .type_id = inst.type_id,
+                                                                .operands = .{ .lhs = src_raw, .rhs = 0 },
+                                                            });
+                                                        } else if (dst_info.bits > src_info.bits) {
+                                                            const ext_op: UnaryOpKind = if (src_info.is_signed) .int_sext else .int_zext;
+                                                            ctx.m_body.insts.set(raw, .{
+                                                                .op = .unary_op,
+                                                                .flags = .{ .is_synthetic = true },
+                                                                .aux_u16 = @backingInt(ext_op),
+                                                                .type_id = inst.type_id,
+                                                                .operands = .{ .lhs = src_raw, .rhs = 0 },
+                                                            });
+                                                        } else if (src_ty == inst.type_id) {
+                                                            ctx.m_body.insts.set(raw, .{
+                                                                .op = .copy_val,
+                                                                .flags = .{ .is_synthetic = true },
+                                                                .type_id = inst.type_id,
+                                                                .operands = .{ .lhs = src_raw, .rhs = 0 },
+                                                            });
+                                                        } else {
+                                                            ctx.m_body.insts.set(raw, .{
+                                                                .op = .unary_op,
+                                                                .flags = .{ .is_synthetic = true },
+                                                                .aux_u16 = @backingInt(UnaryOpKind.bitcast_op),
+                                                                .type_id = inst.type_id,
+                                                                .operands = .{ .lhs = src_raw, .rhs = 0 },
+                                                            });
+                                                        }
+                                                        try ctx.setScopedRange(raw, src_r);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     },
                     else => {},
@@ -4414,7 +4611,6 @@ fn runPassR3ValueRangeProp(
     };
     try ctx.visitDomBlock(0);
 }
-
 
 // ------------ Pass `R4`: SCCP, Switch Fusion & GVN ------------
 
@@ -4582,7 +4778,7 @@ fn makeGvnKey(
         .const_scalar => {
             if (inst.operands.lhs >= body.consts.items.len) return null;
             const mc = body.consts.items[inst.operands.lhs];
-            var tag_word: u64 = @intFromEnum(mc);
+            var tag_word: u64 = @backingInt(mc);
             var pay_word: u64 = 0;
             switch (mc) {
                 .unit_val => {},
@@ -5099,8 +5295,10 @@ fn eliminateDeadSsaInstructions(allocator: std.mem.Allocator, body: *MirBody) !v
         }
         for (body.getBlockInsts(bb_id)) |iv| {
             const inst = body.getInst(iv);
+            const is_intrinsic_root = inst.op == .intrinsic_op and
+                @as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)).isSideEffectingRoot();
             if (inst.flags.has_side_effects or inst.flags.has_trap_risk or inst.op == .place_store or
-                inst.op == .place_set_discrim or inst.op.isGhost())
+                inst.op == .place_set_discrim or inst.op.isGhost() or is_intrinsic_root)
             {
                 try markSsaValLive(allocator, iv.asInt(), is_live, &worklist);
             }
@@ -5209,7 +5407,15 @@ fn eliminateDeadSsaInstructions(allocator: std.mem.Allocator, body: *MirBody) !v
                 }
             },
             .intrinsic_op => {
-                if (inst.operands.rhs > 0) {
+                const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+                if (ikind.hasPlaceInLhs()) {
+                    try markPlaceIndicesLive(allocator, body, inst.operands.lhs, is_live, &worklist);
+                    if (ikind.hasSsaFlagInRhs() and inst.operands.rhs != mir.NONE_U32) {
+                        try markSsaValLive(allocator, inst.operands.rhs, is_live, &worklist);
+                    }
+                } else if (ikind.hasExtraArgs() and inst.operands.rhs > 0 and
+                    inst.operands.lhs + inst.operands.rhs <= body.extra_args.items.len)
+                {
                     for (body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs]) |v_id| {
                         try markSsaValLive(allocator, v_id, is_live, &worklist);
                     }
@@ -5768,7 +5974,7 @@ fn computeMirBodyStructuralHashWithInterner(
                 .const_scalar => {
                     if (inst.operands.lhs < body.consts.items.len) {
                         const mc = body.consts.items[inst.operands.lhs];
-                        hasher.update(&[_]u8{@intFromEnum(mc)});
+                        hasher.update(&[_]u8{@backingInt(mc)});
                         switch (mc) {
                             .unit_val => {},
                             .bool_val => |bv| hasher.update(&[_]u8{@intFromBool(bv)}),
@@ -5923,8 +6129,24 @@ fn computeMirBodyStructuralHashWithInterner(
                 },
                 .intrinsic_op => {
                     const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
-                    hasher.update(std.mem.asBytes(&inst.operands.rhs));
-                    if (inst.operands.rhs == 0) {
+                    if (ikind.hasPlaceInLhs()) {
+                        const pdig = computeSinglePlaceByteDigest(
+                            body,
+                            PlaceId.fromInt(inst.operands.lhs),
+                            val_norm,
+                            pool,
+                            sym_table,
+                            target_layout,
+                        );
+                        hasher.update(std.mem.asBytes(&pdig));
+                        if (ikind.hasSsaFlagInRhs()) {
+                            const nr = if (inst.operands.rhs < val_norm.len) val_norm[inst.operands.rhs] else mir.NONE_U32;
+                            hasher.update(std.mem.asBytes(&nr));
+                        } else {
+                            hasher.update(std.mem.asBytes(&inst.operands.rhs));
+                        }
+                    } else if (ikind.hasTypeIdInLhs()) {
+                        hasher.update(std.mem.asBytes(&inst.operands.rhs));
                         const ty_arg = TypeId.fromInt(inst.operands.lhs);
                         switch (ikind) {
                             .size_of, .align_of => {
@@ -5938,17 +6160,23 @@ fn computeMirBodyStructuralHashWithInterner(
                             },
                             else => hasher.update(std.mem.asBytes(&inst.operands.lhs)),
                         }
-                    } else if (inst.operands.lhs + inst.operands.rhs <= body.extra_args.items.len) {
-                        for (body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs]) |v_raw| {
-                            const nv = if (v_raw < val_norm.len) val_norm[v_raw] else mir.NONE_U32;
-                            hasher.update(std.mem.asBytes(&nv));
-                        }
-                        if (ikind == .derive_debug_fmt) {
-                            const first_raw = body.extra_args.items[inst.operands.lhs];
-                            if (first_raw < body.insts.len) {
-                                const arg_ty = body.getInst(MirValueId.fromInt(first_raw)).type_id;
-                                var tbuf: [512]u8 = undefined;
-                                hasher.update(pool.formatType(arg_ty, sym_table, &tbuf));
+                    } else if (!ikind.hasExtraArgs()) {
+                        hasher.update(std.mem.asBytes(&inst.operands.lhs));
+                        hasher.update(std.mem.asBytes(&inst.operands.rhs));
+                    } else {
+                        hasher.update(std.mem.asBytes(&inst.operands.rhs));
+                        if (inst.operands.rhs > 0 and inst.operands.lhs + inst.operands.rhs <= body.extra_args.items.len) {
+                            for (body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs]) |v_raw| {
+                                const nv = if (v_raw < val_norm.len) val_norm[v_raw] else mir.NONE_U32;
+                                hasher.update(std.mem.asBytes(&nv));
+                            }
+                            if (ikind == .derive_debug_fmt) {
+                                const first_raw = body.extra_args.items[inst.operands.lhs];
+                                if (first_raw < body.insts.len) {
+                                    const arg_ty = body.getInst(MirValueId.fromInt(first_raw)).type_id;
+                                    var tbuf: [512]u8 = undefined;
+                                    hasher.update(pool.formatType(arg_ty, sym_table, &tbuf));
+                                }
                             }
                         }
                     }
@@ -6341,9 +6569,33 @@ pub fn isMirBodyStructurallyEqual(
                     }
                 },
                 .intrinsic_op => {
-                    if (inst_a.operands.rhs != inst_b.operands.rhs) return false;
                     const ikind: MirIntrinsicKind = @fromBackingInt(inst_a.aux_u16);
-                    if (inst_a.operands.rhs == 0) {
+                    if (ikind.hasPlaceInLhs()) {
+                        if (!isPlaceStructurallyEqual(
+                            body_a,
+                            PlaceId.fromInt(inst_a.operands.lhs),
+                            val_a,
+                            body_b,
+                            PlaceId.fromInt(inst_b.operands.lhs),
+                            val_b,
+                            pool,
+                            sym_table,
+                            target_layout,
+                        )) return false;
+                        if (ikind.hasSsaFlagInRhs()) {
+                            if ((inst_a.operands.rhs == mir.NONE_U32) != (inst_b.operands.rhs == mir.NONE_U32)) {
+                                return false;
+                            }
+                            if (inst_a.operands.rhs != mir.NONE_U32 and
+                                val_a[inst_a.operands.rhs] != val_b[inst_b.operands.rhs])
+                            {
+                                return false;
+                            }
+                        } else if (inst_a.operands.rhs != inst_b.operands.rhs) {
+                            return false;
+                        }
+                    } else if (ikind.hasTypeIdInLhs()) {
+                        if (inst_a.operands.rhs != inst_b.operands.rhs) return false;
                         const ty_a = TypeId.fromInt(inst_a.operands.lhs);
                         const ty_b = TypeId.fromInt(inst_b.operands.lhs);
                         switch (ikind) {
@@ -6368,25 +6620,31 @@ pub fn isMirBodyStructurallyEqual(
                             },
                             else => if (inst_a.operands.lhs != inst_b.operands.lhs) return false,
                         }
+                    } else if (!ikind.hasExtraArgs()) {
+                        if (inst_a.operands.lhs != inst_b.operands.lhs or
+                            inst_a.operands.rhs != inst_b.operands.rhs) return false;
                     } else {
+                        if (inst_a.operands.rhs != inst_b.operands.rhs) return false;
                         const arg_len = inst_a.operands.rhs;
-                        if (inst_a.operands.lhs + arg_len > body_a.extra_args.items.len or
-                            inst_b.operands.lhs + arg_len > body_b.extra_args.items.len) return false;
-                        for (0..arg_len) |arg_i| {
-                            const aa = body_a.extra_args.items[inst_a.operands.lhs + arg_i];
-                            const ab = body_b.extra_args.items[inst_b.operands.lhs + arg_i];
-                            if (val_a[aa] != val_b[ab]) return false;
-                        }
-                        if (ikind == .derive_debug_fmt) {
-                            const raw_a = body_a.extra_args.items[inst_a.operands.lhs];
-                            const raw_b = body_b.extra_args.items[inst_b.operands.lhs];
-                            var buf_a: [512]u8 = undefined;
-                            var buf_b: [512]u8 = undefined;
-                            if (!std.mem.eql(
-                                u8,
-                                pool.formatType(body_a.getInst(MirValueId.fromInt(raw_a)).type_id, sym_table, &buf_a),
-                                pool.formatType(body_b.getInst(MirValueId.fromInt(raw_b)).type_id, sym_table, &buf_b),
-                            )) return false;
+                        if (arg_len > 0) {
+                            if (inst_a.operands.lhs + arg_len > body_a.extra_args.items.len or
+                                inst_b.operands.lhs + arg_len > body_b.extra_args.items.len) return false;
+                            for (0..arg_len) |arg_i| {
+                                const aa = body_a.extra_args.items[inst_a.operands.lhs + arg_i];
+                                const ab = body_b.extra_args.items[inst_b.operands.lhs + arg_i];
+                                if (val_a[aa] != val_b[ab]) return false;
+                            }
+                            if (ikind == .derive_debug_fmt) {
+                                const raw_a = body_a.extra_args.items[inst_a.operands.lhs];
+                                const raw_b = body_b.extra_args.items[inst_b.operands.lhs];
+                                var buf_a: [512]u8 = undefined;
+                                var buf_b: [512]u8 = undefined;
+                                if (!std.mem.eql(
+                                    u8,
+                                    pool.formatType(body_a.getInst(MirValueId.fromInt(raw_a)).type_id, sym_table, &buf_a),
+                                    pool.formatType(body_b.getInst(MirValueId.fromInt(raw_b)).type_id, sym_table, &buf_b),
+                                )) return false;
+                            }
                         }
                     }
                 },
@@ -6648,10 +6906,32 @@ fn verifyAllConcreteBodies(
     sym_table: *const SymbolTable,
     sink: ?*DiagnosticSink,
 ) !void {
+    return verifyAllConcreteBodiesMode(allocator, bodies, pool, sym_table, sink, false);
+}
+
+/// Verifies `V1`–`V6` across `bodies`, relaxing lexical `V4`/`V5` when `is_allowing_nll_or_sast_errors` is set.
+fn verifyAllConcreteBodiesMode(
+    allocator: std.mem.Allocator,
+    bodies: []const MirBody,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    sink: ?*DiagnosticSink,
+    is_allowing_nll_or_sast_errors: bool,
+) !void {
     for (bodies) |*body_item| {
         if (body_item.has_overflowed_limits) continue;
         if (isGenericTemplateBody(body_item, pool, sym_table)) continue;
-        try mir.verifyMirBody(allocator, body_item, pool, sym_table, sink);
+        if (!is_allowing_nll_or_sast_errors) {
+            try mir.verifyMirBody(allocator, body_item, pool, sym_table, sink);
+            continue;
+        }
+        mir.verifyMirBody(allocator, body_item, pool, sym_table, null) catch |ver_err| switch (ver_err) {
+            error.V4GhostExclusivityConflict,
+            error.V5ReadUninitializedOrMoved,
+            error.V5IncompleteExitInitialization,
+            => {},
+            else => return ver_err,
+        };
     }
 }
 
@@ -6732,17 +7012,53 @@ pub fn optimizeMirModule(
         try result.bodies.append(allocator, cloned);
     }
 
-    // Execute `--dev` 5-pass pipeline (`D1`–`D5`):
+    var has_unelaborated_body = false;
+    for (result.bodies.items) |*body_item| {
+        if (!body_item.is_sast_elaborated) {
+            has_unelaborated_body = true;
+            break;
+        }
+    }
+    const is_running_sast = (config.is_sast_enabled and has_unelaborated_body) or
+        config.sast_sink != null or config.sast_config != null;
+    var has_sast_errors = false;
+
+    // Execute `--dev` pipeline (`D1` -> `D2` -> `D0` SAST -> `D3` -> `D4` -> `D5`):
 
     // [D1] Mandatory `@inline(always)` call splicing:
     try runPassD1InlineAlways(allocator, result.bodies.items, sym_table, config, diagnostic_sink);
-    try verifyAllConcreteBodies(allocator, result.bodies.items, pool, sym_table, diagnostic_sink);
+    try verifyAllConcreteBodiesMode(allocator, result.bodies.items, pool, sym_table, diagnostic_sink, true);
 
     // [D2] Reachable-only local constant folding & `E0502`/`E0507` compile-time traps:
     for (result.bodies.items) |*body_item| {
         try runPassD2ReachableConstFold(allocator, body_item, pool, sym_table, config, diagnostic_sink);
     }
-    try verifyAllConcreteBodies(allocator, result.bodies.items, pool, sym_table, diagnostic_sink);
+    try verifyAllConcreteBodiesMode(allocator, result.bodies.items, pool, sym_table, diagnostic_sink, true);
+
+    // [D0] Phase 6 SAST verification, `ElaborateDrops`, Pentagon BCE, & `.narrow()` cast rewriting:
+    if (is_running_sast) {
+        var effective_sast = config.sast_config orelse mir_sast.SastConfig{};
+        if (effective_sast.diagnostic_sink == null) {
+            effective_sast.diagnostic_sink = config.sast_sink orelse diagnostic_sink;
+        }
+        if (config.is_sast_strict) effective_sast.is_sast_strict = true;
+        if (config.syntax_view) |syn_view| {
+            if (effective_sast.source_text == null) effective_sast.source_text = syn_view.source;
+            if (effective_sast.token_buffer == null) effective_sast.token_buffer = syn_view.tokens;
+            if (effective_sast.cst_arena == null) effective_sast.cst_arena = syn_view.cst_arena;
+        }
+        result.sast_result = try mir_sast.analyzeAndElaborateMirModule(
+            allocator,
+            result.bodies.items,
+            pool,
+            sym_table,
+            interner,
+            effective_sast,
+        );
+        if (effective_sast.diagnostic_sink) |active_sink| {
+            has_sast_errors = active_sink.hasErrors();
+        }
+    }
 
     // [D3] Ghost instruction strip gate (preserving pre-strip clones when requested for Phase 6 SAST):
     if (config.is_preserving_pre_strip_mir) {
@@ -6756,13 +7072,13 @@ pub fn optimizeMirModule(
     for (result.bodies.items) |*body_item| {
         try runPassD3StripGhostInstructions(allocator, body_item);
     }
-    try verifyAllConcreteBodies(allocator, result.bodies.items, pool, sym_table, diagnostic_sink);
+    try verifyAllConcreteBodiesMode(allocator, result.bodies.items, pool, sym_table, diagnostic_sink, has_sast_errors);
 
     // [D4] Constant branch/switch folding + single-pass unreachable block pruning:
     for (result.bodies.items) |*body_item| {
         try runPassD4BranchFoldAndPrune(allocator, body_item);
     }
-    try verifyAllConcreteBodies(allocator, result.bodies.items, pool, sym_table, diagnostic_sink);
+    try verifyAllConcreteBodiesMode(allocator, result.bodies.items, pool, sym_table, diagnostic_sink, has_sast_errors);
 
     // [D5] Monomorphization + Tarjan SCC `contextless` promotion + `LayoutShapeKey` deduplication:
     try runPassD5MonomorphizeAndPromote(
@@ -6775,7 +7091,7 @@ pub fn optimizeMirModule(
         diagnostic_sink,
         &result.dedup_merged_count,
     );
-    try verifyAllConcreteBodies(allocator, result.bodies.items, pool, sym_table, diagnostic_sink);
+    try verifyAllConcreteBodiesMode(allocator, result.bodies.items, pool, sym_table, diagnostic_sink, has_sast_errors);
 
     // Execute `--release` 6-pass pipeline (`R1`–`R6`):
     if (config.is_release_mode) {
@@ -7508,7 +7824,7 @@ test "test_mir_opt_d1_inliner_guards_max_place_proj_depth_with_e0508" {
         bodies.deinit(allocator);
     }
 
-    // Build `deep_callee(mut slot: inout ...)` with a 150-step `.field` projection on param local `1`:
+    // Build `deep_callee(mut slot: inout …)` with a 150-step `.field` projection on param local `1`:
     var callee_body = MirBody.init(allocator, file_id, callee_def);
     callee_body.name = callee_name;
     callee_body.ret_ty = .unit_ty;
@@ -7623,4 +7939,278 @@ test "test_mir_opt_d1_inliner_guards_max_place_proj_depth_with_e0508" {
         DiagCode.e0508_comptime_resource_limit_exceeded,
         d1_sink.diagnostics.items[0].code,
     );
+}
+
+test "test_phase6_mir_opt_place_intrinsics_d3_strip_sroa_dce_icf_and_vrp" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\@zero_pad
+        \\@repr(C)
+        \\pub struct PadItem {
+        \\    pub flag: u8,
+        \\    pub word: u32,
+        \\}
+        \\pub fn vrp_elide_checks(in_val: i32) -> u8 {
+        \\    let fixed: [i32; 4] = [11, 22, 33, 44];
+        \\    let dyn_idx: usize = 2;
+        \\    let picked: i32 = fixed[dyn_idx];
+        \\    if in_val >= 0 {
+        \\        if in_val <= 200 {
+        \\            return in_val.narrow[u8]() +% (picked as u8);
+        \\        }
+        \\    }
+        \\    return 0;
+        \\}
+        \\pub fn pad_helper_a(flag_v: u8) -> u64 {
+        \\    let item = PadItem { flag: flag_v, word: 9 };
+        \\    return @bit_cast[u64](item);
+        \\}
+        \\pub fn pad_helper_b(flag_v: u8) -> u64 {
+        \\    let item = PadItem { flag: flag_v, word: 9 };
+        \\    return @bit_cast[u64](item);
+        \\}
+    ;
+    var bundle = try mir.lowerSourceToMir(allocator, FileId.fromInt(91), src, TargetLayout.NATIVE_64, .{});
+    defer bundle.deinit();
+    try std.testing.expect(!bundle.hir_bundle.diagnostics.hasErrors());
+
+    // Inject `drop_in_place`, `drop_if_live`, and `ghost_storage_free` into `pad_helper_a` & `pad_helper_b` before `MirOpt`:
+    const helper_names = [2][]const u8{ "pad_helper_a", "pad_helper_b" };
+    for (helper_names) |helper_name| {
+        const body_mut = blk_find: {
+            for (bundle.mir_bundle.bodies.items) |*cand| {
+                if (std.mem.eql(u8, bundle.hir_bundle.interner.get(cand.name), helper_name)) {
+                    break :blk_find cand;
+                }
+            }
+            unreachable;
+        };
+        const slot_lid = mir.LocalId.fromInt(@intCast(body_mut.locals.items.len));
+        try body_mut.locals.append(
+            allocator,
+            mir.LocalDecl.init(.empty, .i32_ty, .none, 0, .let_mode, .{ .is_mut = true, .is_address_taken = true }),
+        );
+        const slot_place = PlaceId.fromInt(@intCast(body_mut.places.items.len));
+        try body_mut.places.append(allocator, .{ .base = slot_lid.asInt(), .proj_start = 0, .proj_len = 0 });
+
+        const true_const = try body_mut.appendConst(.{ .bool_val = true });
+        const flag_val = try body_mut.appendInst(.{
+            .op = .const_scalar,
+            .flags = .{ .is_synthetic = true },
+            .type_id = .bool_ty,
+            .operands = .{ .lhs = true_const, .rhs = 0 },
+        }, .none);
+        const init_val = try body_mut.appendInst(.{
+            .op = .ghost_storage_init,
+            .flags = .{ .has_side_effects = true, .is_synthetic = true },
+            .type_id = .unit_ty,
+            .operands = .{ .lhs = slot_lid.asInt(), .rhs = 0 },
+        }, .none);
+        const store_val = try body_mut.appendInst(.{
+            .op = .place_store,
+            .flags = .{ .has_side_effects = true, .is_synthetic = true },
+            .type_id = .unit_ty,
+            .operands = .{ .lhs = slot_place.asInt(), .rhs = flag_val.asInt() },
+        }, .none);
+        const drop_cond_val = try body_mut.appendInst(.{
+            .op = .intrinsic_op,
+            .flags = .{ .has_side_effects = true, .is_synthetic = true },
+            .aux_u16 = @backingInt(mir.MirIntrinsicKind.drop_if_live),
+            .type_id = .i32_ty,
+            .operands = .{ .lhs = slot_place.asInt(), .rhs = flag_val.asInt() },
+        }, .none);
+        const drop_val = try body_mut.appendInst(.{
+            .op = .intrinsic_op,
+            .flags = .{ .has_side_effects = true, .is_synthetic = true },
+            .aux_u16 = @backingInt(mir.MirIntrinsicKind.drop_in_place),
+            .type_id = .i32_ty,
+            .operands = .{ .lhs = slot_place.asInt(), .rhs = mir.NONE_U32 },
+        }, .none);
+        const free_ghost_val = try body_mut.appendInst(.{
+            .op = .intrinsic_op,
+            .flags = .{ .has_side_effects = true, .is_synthetic = true },
+            .aux_u16 = @backingInt(mir.MirIntrinsicKind.ghost_storage_free),
+            .type_id = .unit_ty,
+            .operands = .{ .lhs = slot_place.asInt(), .rhs = mir.NONE_U32 },
+        }, .none);
+        const deinit_val = try body_mut.appendInst(.{
+            .op = .ghost_storage_deinit,
+            .flags = .{ .has_side_effects = true, .is_synthetic = true },
+            .type_id = .unit_ty,
+            .operands = .{ .lhs = slot_lid.asInt(), .rhs = 0 },
+        }, .none);
+
+        // Rebuild `block_insts` appending our injected sequence at the end of `^bb0`:
+        var rebuilt_insts: std.ArrayListUnmanaged(MirValueId) = .empty;
+        defer rebuilt_insts.deinit(allocator);
+        for (body_mut.blocks.items, 0..) |*bb_item, bb_idx| {
+            const new_start: u32 = @intCast(rebuilt_insts.items.len);
+            try rebuilt_insts.appendSlice(
+                allocator,
+                body_mut.block_insts.items[bb_item.inst_start .. bb_item.inst_start + bb_item.inst_len],
+            );
+            if (bb_idx == 0) {
+                try rebuilt_insts.appendSlice(allocator, &.{
+                    flag_val,
+                    init_val,
+                    store_val,
+                    drop_cond_val,
+                    drop_val,
+                    free_ghost_val,
+                    deinit_val,
+                });
+            }
+            bb_item.inst_start = new_start;
+            bb_item.inst_len = @intCast(rebuilt_insts.items.len - new_start);
+        }
+        body_mut.block_insts.clearRetainingCapacity();
+        try body_mut.block_insts.appendSlice(allocator, rebuilt_insts.items);
+    }
+
+    var sink = DiagnosticSink.init(allocator);
+    defer sink.deinit();
+    var opt_res = try optimizeMirModule(
+        allocator,
+        bundle.mir_bundle.bodies.items,
+        &bundle.hir_bundle.pool,
+        &bundle.hir_bundle.sym_table,
+        &bundle.hir_bundle.interner,
+        .{ .is_release_mode = true, .target_layout = TargetLayout.NATIVE_64 },
+        &sink,
+    );
+    defer opt_res.deinit();
+    try std.testing.expect(!sink.hasErrors());
+    try std.testing.expect(opt_res.icf_folded_count >= 1);
+
+    // Verify `D3` stripped `ghost_storage_free` while preserving `drop_in_place` and `drop_if_live`:
+    const opt_helper = blk_opt_helper: {
+        for (opt_res.bodies.items) |*cand| {
+            if (std.mem.eql(u8, bundle.hir_bundle.interner.get(cand.name), "pad_helper_a")) {
+                break :blk_opt_helper cand;
+            }
+        }
+        unreachable;
+    };
+    var has_drop_in_place = false;
+    var has_drop_if_live = false;
+    for (opt_helper.block_insts.items) |iv| {
+        const inst = opt_helper.getInst(iv);
+        if (inst.op == .intrinsic_op) {
+            const ikind: mir.MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+            try std.testing.expect(ikind != .ghost_storage_free);
+            if (ikind == .drop_in_place) has_drop_in_place = true;
+            if (ikind == .drop_if_live) has_drop_if_live = true;
+        }
+    }
+    try std.testing.expect(has_drop_in_place);
+    try std.testing.expect(has_drop_if_live);
+
+    // Verify `R3` VRP folded provably safe `bounds_check` and `narrow_check` inside `vrp_elide_checks`:
+    const vrp_body = blk_vrp: {
+        for (opt_res.bodies.items) |*cand| {
+            if (std.mem.eql(u8, bundle.hir_bundle.interner.get(cand.name), "vrp_elide_checks")) {
+                break :blk_vrp cand;
+            }
+        }
+        unreachable;
+    };
+    for (vrp_body.block_insts.items) |iv| {
+        const inst = vrp_body.getInst(iv);
+        if (inst.op == .intrinsic_op) {
+            const ikind: mir.MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+            try std.testing.expect(ikind != .bounds_check);
+            try std.testing.expect(ikind != .narrow_check);
+        }
+    }
+}
+
+test "test_phase6_pass_d0_sast_elaborate_drops_bce_and_d3_ghost_strip_e2e" {
+    const allocator = std.testing.allocator;
+    const mir_vm = @import("mir_vm.zig");
+
+    const source =
+        \\pub struct Vec[T] {
+        \\    pub len: usize,
+        \\}
+        \\pub fn take_vec(own buf: sink Vec[i64]) {}
+        \\@no_panic
+        \\pub fn d0_pipeline_entry(cond: bool, val: i32) -> i64 {
+        \\    let buf = Vec { len: 3 };
+        \\    if cond {
+        \\        take_vec(buf);
+        \\    }
+        \\    let table: [i64; 4] = [10, 20, 30, 40];
+        \\    if val >= 0 and val < 4 {
+        \\        let idx: usize = val.narrow[usize]();
+        \\        return table[idx];
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+
+    var hir_bundle = try hir.lowerSourceToHir(allocator, source, TargetLayout.NATIVE_64);
+    defer hir_bundle.deinit();
+    try std.testing.expect(!hir_bundle.diagnostics.hasErrors());
+
+    var mir_sink = DiagnosticSink.init(allocator);
+    defer mir_sink.deinit();
+    var mir_mod = try mir.lowerHirToMirForSast(
+        allocator,
+        &hir_bundle.hir_store,
+        &hir_bundle.pool,
+        &hir_bundle.sym_table,
+        &hir_bundle.interner,
+        &mir_sink,
+    );
+    defer mir_mod.deinit();
+    try std.testing.expect(!mir_sink.hasErrors());
+
+    var opt_sink = DiagnosticSink.init(allocator);
+    defer opt_sink.deinit();
+    var opt_res = try optimizeMirModule(
+        allocator,
+        mir_mod.bodies.items,
+        &hir_bundle.pool,
+        &hir_bundle.sym_table,
+        &hir_bundle.interner,
+        .{
+            .is_sast_enabled = true,
+            .is_sast_strict = true,
+            .is_preserving_pre_strip_mir = true,
+            .is_release_mode = true,
+            .syntax_view = .{
+                .source = source,
+                .tokens = &hir_bundle.tokens,
+                .cst_arena = &hir_bundle.cst_arena,
+            },
+        },
+        &opt_sink,
+    );
+    defer opt_res.deinit();
+    try std.testing.expect(!opt_sink.hasErrors());
+    try std.testing.expect(opt_res.sast_result != null);
+    try std.testing.expect(opt_res.sast_result.?.emitted_drops >= 1);
+    try std.testing.expectEqual(@as(u32, 1), opt_res.sast_result.?.eliminated_bounds_checks);
+    try std.testing.expectEqual(@as(u32, 1), opt_res.sast_result.?.eliminated_narrow_checks);
+    try std.testing.expectEqual(opt_res.bodies.items.len, opt_res.pre_strip_bodies.items.len);
+
+    var rodata_pool = mir_vm.RodataPool.init(allocator);
+    defer rodata_pool.deinit();
+    var vm = try mir_vm.MirVm.init(
+        allocator,
+        &hir_bundle.interner,
+        &hir_bundle.pool,
+        &hir_bundle.sym_table,
+        &rodata_pool,
+        null,
+        null,
+        .{},
+    );
+    defer vm.deinit();
+    for (opt_res.bodies.items) |*b_ptr| {
+        _ = try vm.registerBody(b_ptr, .none);
+    }
+    const entry_body = opt_res.findBodyByName(&hir_bundle.interner, "d0_pipeline_entry").?;
+    const eval_out = try vm.evalBody(entry_body, &.{ .{ .scalar_u64 = 0 }, .{ .scalar_i64 = 2 } });
+    try std.testing.expectEqual(@as(i64, 30), eval_out.slot.scalar_i64);
 }

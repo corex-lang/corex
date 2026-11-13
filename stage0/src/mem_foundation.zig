@@ -323,6 +323,10 @@ pub const TypeId = enum(u32) {
     group_scalar = 41,
     /// Constrained type group `Copy` (`42`).
     group_copy = 42,
+    /// Constrained type group `FromBytes` (`43`).
+    group_from_bytes = 43,
+    /// Constrained type group `IntoBytes` (`44`).
+    group_into_bytes = 44,
     /// First dynamically interned user/composite type index (`64`).
     first_dynamic = 64,
     /// Sentinel value representing no type.
@@ -364,10 +368,10 @@ pub const TypeId = enum(u32) {
         return @backingInt(self) <= @backingInt(TypeId.err_ty);
     }
 
-    /// Returns true if `self` is one of the 11 built-in Constrained Type Groups (`32..42`).
+    /// Returns true if `self` is one of the 13 built-in Constrained Type Groups (`32..44`).
     pub inline fn isBuiltinGroup(self: TypeId) bool {
         const raw = @backingInt(self);
-        return raw >= @backingInt(TypeId.group_signed) and raw <= @backingInt(TypeId.group_copy);
+        return raw >= @backingInt(TypeId.group_signed) and raw <= @backingInt(TypeId.group_into_bytes);
     }
 
     /// Returns true if `self` is a signed integer primitive (`i8`..`isize`).

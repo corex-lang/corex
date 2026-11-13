@@ -63,12 +63,12 @@ fn expectCanonicalFormat(
 
 test "test_fmt_doc_inst_layout_arena_backpatching_and_large_text_chunking" {
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(DocInst));
-    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(DocOp.nop));
-    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(DocOp.text));
-    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(DocOp.line));
-    try std.testing.expectEqual(@as(u8, 8), @intFromEnum(DocOp.group_begin));
-    try std.testing.expectEqual(@as(u8, 6), @intFromEnum(DocOp.indent));
-    try std.testing.expectEqual(@as(u8, 7), @intFromEnum(DocOp.dedent));
+    try std.testing.expectEqual(@as(u8, 0), @backingInt(DocOp.nop));
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(DocOp.text));
+    try std.testing.expectEqual(@as(u8, 2), @backingInt(DocOp.line));
+    try std.testing.expectEqual(@as(u8, 8), @backingInt(DocOp.group_begin));
+    try std.testing.expectEqual(@as(u8, 6), @backingInt(DocOp.indent));
+    try std.testing.expectEqual(@as(u8, 7), @backingInt(DocOp.dedent));
 
     var arena = DocArena.init(std.testing.allocator);
     defer arena.deinit();

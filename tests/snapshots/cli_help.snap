@@ -1,7 +1,7 @@
-╭─ corex 0.1.0-dev ─────────────────────────────────────────╮
-│ A streamlined, zero-GC, statically typed systems language │
-│ Usage: corex [OPTIONS] <COMMAND> [ARGS]…                  │
-╰───────────────────────────────────────────────────────────╯
+╭─ corex 0.1.0-dev ───────────────────────────────────────────╮
+│ Build reliable software effortlessly at systems-level speed │
+│ Usage: corex [OPTIONS] <COMMAND> [ARGS]…                    │
+╰─────────────────────────────────────────────────────────────╯
 
 Commands:
   ▸ build     Compile a CoreX package or source file into a native or WebAssembly artifact

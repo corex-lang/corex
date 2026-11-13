@@ -1,0 +1,61 @@
+✗ error[E0316]: function has unbounded stack usage (recursion or indirect call), exceeding `@max_stack(32)`
+   ╭─▸ src/sast/phase6_capability_errors.cx:13:8
+   │
+13 │ pub fn rec_climb(depth: i32) -> i32 {
+   │        ^^^^^^^^^ `@max_stack` budget exceeded here
+   │
+   ╰─▸ help: eliminate recursion/indirect dispatch or reduce large stack locals
+
+✗ error[E0320]: `@no_alloc` function performs or transitively reaches dynamic heap allocation
+   ╭─▸ src/sast/phase6_capability_errors.cx:27:21
+   │
+26 │ pub fn no_alloc_entry(ctx: &Context) -> usize {
+   │        ────────────── `@no_alloc` contract declared here
+27 │     return alloc_mid(ctx);
+   │                     ^ heap allocation reachable from `@no_alloc` body
+   │
+   ╰─▸ help: call witness: `no_alloc_entry` ▸ `alloc_mid` ▸ `alloc_leaf`
+
+✗ error[E0321]: `@no_panic` function contains an uneliminated trap, bounds check, or panicking call
+   ╭─▸ src/sast/phase6_capability_errors.cx:37:21
+   │
+36 │ pub fn no_panic_entry(items: &[i32], idx: usize) -> i32 {
+   │        ────────────── `@no_panic` contract declared here
+37 │     return panic_mid(items, idx);
+   │                     ^ potential panic path in `@no_panic` function
+   │
+   ╰─▸ help: call witness: `no_panic_entry` ▸ `panic_mid` ▸ `panic_leaf`
+
+✗ error[E0322]: `@no_block` function performs or reaches blocking I/O, process, or synchronization operations
+   ╭─▸ src/sast/phase6_capability_errors.cx:41:23
+   │
+40 │ pub fn no_block_entry() -> i32 {
+   │        ────────────── `@no_block` contract declared here
+41 │     return fs_sync_mid();
+   │                       ^ blocking operation reachable from `@no_block` body
+   │
+   ╰─▸ help: call witness: `no_block_entry` ▸ `fs_sync_mid` ▸ `fs_sync_leaf`
+
+✗ error[E0325]: hermetic `comptime` item reaches forbidden host capability `fs`
+   ╭─▸ src/sast/phase6_capability_errors.cx:44:23
+   │
+44 │     return fs_sync_mid();
+   │                       ^ non-hermetic capability reachable during compile-time evaluation
+   │
+   ╰─▸ help: call witness: `bad_comptime_probe` ▸ `fs_sync_mid` ▸ `fs_sync_leaf`
+
+✗ error[E0324]: package `untrusted_codec` reaches unauthorized capability `fs` not granted in `corex.toml` / `corex.lock`
+  ╭─▸ src/sast/phase6_capability_errors.cx:1:1
+  │
+1 │ extern "C" fn raw_c_hook() -> i32;
+  │ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unauthorized capability reachable from package export/entry root
+  │
+  ╰─▸ help: grant the capability in `[dependencies]` policy or remove the offending call chain
+
+⚠︎ warning[W0330]: dependency `untrusted_codec` contains unreachable ambient `ffi, unsafe_op` code outside exported call graph
+  ╭─▸ src/sast/phase6_capability_errors.cx:1:1
+  │
+1 │ extern "C" fn raw_c_hook() -> i32;
+  │ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ dead `ffi` / `unsafe` capability present in dependency source
+  │
+  ╰─▸ help: audit unreachable `extern`/`unsafe` items in this third-party dependency

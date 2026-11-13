@@ -273,7 +273,7 @@ pub const DocArena = struct {
         const inst_index: u32 = @intCast(self.instructions.items.len);
         try self.instructions.append(self.allocator, .{
             .op = .group_begin,
-            .mode_or_delta = @intFromEnum(mode),
+            .mode_or_delta = @backingInt(mode),
             .flat_width = 0,
             .payload = 0,
         });
@@ -540,7 +540,7 @@ pub const DocRenderer = struct {
                     }
                 },
                 .group_begin => {
-                    const mode: GroupMode = @enumFromInt(inst.mode_or_delta);
+                    const mode: GroupMode = @fromBackingInt(@intCast(inst.mode_or_delta));
                     const effective_col = if (self.is_at_line_start)
                         self.pending_indent_spaces
                     else

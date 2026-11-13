@@ -1,0 +1,62 @@
+✗ error[E0315]: `@bit_cast` size mismatch: source `u32` is 4 byte(s) whereas destination `u64` is 8 byte(s)
+   ╭─▸ src/sast/phase6_ownership_errors.cx:20:21
+   │
+20 │     return @bit_cast[u64](word);
+   │                     ^ source and destination byte sizes must match exactly
+   │
+   ╰───────
+
+✗ error[E0302]: cannot borrow value after it was moved
+   ╭─▸ src/sast/phase6_ownership_errors.cx:25:17
+   │
+25 │     return items.len;
+   │                 ^ borrow of moved value occurs here
+   │
+   ╰─▸ help: re-initialize the binding before borrowing it again
+
+✗ error[E0305]: conflicting simultaneous borrows violate the Law of Exclusivity
+   ╭─▸ src/sast/phase6_ownership_errors.cx:30:15
+   │
+29 │     let view = head_slice(&arr);
+   │                           ─ active shared borrow opened here
+30 │     mutate_arr(arr);
+   │               ^ exclusive access requested here
+31 │     return view.len;
+   │                ─ active borrow later used here
+   │
+   ╰─▸ help: split the accesses into sequential statements so the earlier borrow ends before mutation
+
+✗ error[E0306]: cannot return reference, slice, view, or `@local` closure tied to stack or local `Arena`
+   ╭─▸ src/sast/phase6_ownership_errors.cx:35:12
+   │
+35 │     return &local_val;
+   │            ^ local-region value escapes function frame on `return` here
+   │            ─ local stack or lexical `Arena` storage originates here
+   │
+   ╰─▸ help: return an owned value (`Vec`, `String`) or accept a caller `inout Arena` parameter
+
+✗ error[E0328]: callee rewinds a `Context.scratch` arena slot while a slice from that slot is still live
+   ╭─▸ src/sast/phase6_ownership_errors.cx:39:10
+   │
+38 │     let live_ref = &ctx.scratch[0];
+   │                    ─ live `Context.scratch` allocation borrowed here
+39 │     reset(&ctx.scratch[0]);
+   │          ^ call rewinds active scratch arena slot here
+   │
+   ╰─▸ help: pass the active scratch arena to `ctx.scratch_scope(…)` so the callee uses complement slot `1 - i`
+
+✗ error[E0307]: index access is statically proven out of bounds
+   ╭─▸ src/sast/phase6_ownership_errors.cx:44:17
+   │
+44 │     return fixed[3];
+   │                 ^ index exceeds proven container length here
+   │
+   ╰─▸ help: ensure `0 <= index < container.len` before indexing
+
+⚠︎ warning[W0314]: slice or array bounds check could not be statically discharged under `--sast-strict`
+   ╭─▸ src/sast/phase6_ownership_errors.cx:47:20
+   │
+47 │     return slice_in[raw_idx];
+   │                    ^ runtime bounds check retained here
+   │
+   ╰─▸ help: guard the index with `if idx < slice.len` or use fallible `.get(idx)`

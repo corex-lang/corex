@@ -33,6 +33,8 @@ pub const type_system = @import("type_system.zig");
 pub const hir = @import("hir.zig");
 /// Block-Argument SSA `MirBody`, Braun `MirSsaBuilder`, Maranget + Jacobs decision trees, and `MirVerifier` `V1`–`V6`.
 pub const mir = @import("mir.zig");
+/// Phase 6 `MIR` SAST engine, `ElaborateDrops`, Demand-Sliced Pentagon BCE, and capability sandbox (`DR-06`, `DR-17`, `DR-20`).
+pub const mir_sast = @import("mir_sast.zig");
 /// Sandboxed 64-bit register `MirVm`, reflection intrinsics, `Wyhash(0)` memoization, and `.rodata` promotion (`DR-05` §3).
 pub const mir_vm = @import("mir_vm.zig");
 /// Dual-mode `MIR` optimizer (`--dev` `D1`–`D5` & `--release` `R1`–`R6`), monomorphizer, and `LayoutShapeKey` deduplicator.
@@ -191,6 +193,8 @@ pub const ItemTreeEntry = query_db.ItemTreeEntry;
 pub const ItemTree = query_db.ItemTree;
 /// Position-independent relative body AST projection window for a `DefId`.
 pub const BodyAstWindow = query_db.BodyAstWindow;
+/// Per-definition `MIR` SAST ownership, contract, and capability verification artifact (`Stage 9`).
+pub const SastVerificationArtifact = query_db.SastVerificationArtifact;
 /// Per-definition lowered and `V1`–`V6` verified `MIR` bundle artifact (`Stage 11`).
 pub const DefMirArtifact = query_db.DefMirArtifact;
 /// Evaluated `const` / `comptime` definition artifact with `.rodata` promotion (`Stage 12`).
@@ -237,12 +241,18 @@ pub const SymbolIndex = symbol_resolver.SymbolIndex;
 pub const Visibility = symbol_resolver.Visibility;
 /// Resolved symbol classification tag.
 pub const SymbolKind = symbol_resolver.SymbolKind;
-/// 1-byte bit-packed mask of compiler-synthesized `@derive(...)` traits (`DR-05` Section 2.3).
+/// 1-byte bit-packed mask of compiler-synthesized `@derive(…)` traits (`DR-05` Section 2.3).
 pub const DeriveMask = symbol_resolver.DeriveMask;
 /// 1-byte bit-packed mask of valid declaration targets for an `@attribute_schema` struct (`DR-05` Section 2.2).
 pub const AttrTargetMask = symbol_resolver.AttrTargetMask;
 /// Resolved symbol record in `SymbolTable`.
 pub const SymbolRecord = symbol_resolver.SymbolRecord;
+/// 2-byte bit-packed declaration-level contract, ownership, and FFI flags (`DR-17`, `DR-20`).
+pub const DeclContractFlags = symbol_resolver.DeclContractFlags;
+/// Canonical ambient capability bit positions for `@std_cap_boundary` (`DR-17` §3.1).
+pub const CapabilityBits = symbol_resolver.CapabilityBits;
+/// Returns `true` when a `@link_section` name targets a forbidden executable/CTOR/TLS section (`E0327`).
+pub const isForbiddenExecutableSection = symbol_resolver.isForbiddenExecutableSection;
 /// Explicit `@overload` function group.
 pub const OverloadSet = symbol_resolver.OverloadSet;
 /// Unified lexical and module symbol table.
@@ -259,6 +269,28 @@ pub const TypeGroupMask = type_system.TypeGroupMask;
 pub const TypeTag = type_system.TypeTag;
 /// 1-byte packed type capability and property bitflags.
 pub const TypeFlags = type_system.TypeFlags;
+/// Three-tier CoreX value ownership classification (`DR-06` §1.2, `DR-20` §2.3).
+pub const OwnershipTier = type_system.OwnershipTier;
+/// Classifies any `TypeId` into `.copy_tier`, `.auto_drop_tier`, or `.linear_tier`.
+pub const classifyOwnershipTier = type_system.classifyOwnershipTier;
+/// 1-byte bit-packed effect contract mask carried on `fn(…)` and closure types (`[CRITICAL-07]`).
+pub const FnPtrContractMask = type_system.FnPtrContractMask;
+/// Canonical field ordinals on CoreX's implicit/explicit `Context` value (`Seam #2`, `D-04`, `D-06B`).
+pub const ContextFieldKind = type_system.ContextFieldKind;
+/// Seam #2 `Context` field layout descriptor shared with `HIR`, `MIR`, and `mir_sast`.
+pub const ContextFieldLayout = type_system.ContextFieldLayout;
+/// Returns `true` when `ty` refers to the built-in or user-declared `Context` struct (`Seam #2`).
+pub const isContextType = type_system.isContextType;
+/// Reason code reported when `FromBytes` or `IntoBytes` rejects a type (`D-01`, `E0315`).
+pub const WireLayoutViolationReason = type_system.WireLayoutViolationReason;
+/// Detailed `FromBytes` / `IntoBytes` violation payload carrying exact byte offset for `E0315`.
+pub const WireLayoutViolation = type_system.WireLayoutViolation;
+/// Selector distinguishing `.narrow[Dst]()` vs. `.try_narrow[Dst]()` in `BodySemanticSideTables` (`D-11`).
+pub const NarrowCallKind = type_system.NarrowCallKind;
+/// Side-table record emitted by `TypeChecker` for `.narrow` / `.try_narrow` calls (`D-11`).
+pub const NarrowCallInfo = type_system.NarrowCallInfo;
+/// Evaluates Constrained Type Group satisfaction (`FromBytes`, `IntoBytes`, `Copy`, `Numeric`, …).
+pub const checkGroupSatisfaction = type_system.checkGroupSatisfaction;
 /// Parameter passing convention mode (`DR-02`).
 pub const ParamMode = type_system.ParamMode;
 /// Maximum recursion depth for type and expression checking (`256`).
@@ -363,6 +395,8 @@ pub const BinOpKind = mir.BinOpKind;
 pub const UnaryOpKind = mir.UnaryOpKind;
 /// Sub-kind encoded in `MirInst.aux_u16` on `MirOp.aggregate_make`.
 pub const AggregateKind = mir.AggregateKind;
+/// Sub-kind encoded in `MirInst.aux_u16` on `MirOp.intrinsic_op` (`DR-06`, `DR-20`).
+pub const MirIntrinsicKind = mir.MirIntrinsicKind;
 /// 1-byte instruction property flags in `MirInst`.
 pub const InstFlags = mir.InstFlags;
 /// 16-byte SoA instruction record in `MirBody.insts`.
@@ -379,8 +413,12 @@ pub const MirOutgoingEdge = mir.MirOutgoingEdge;
 pub const MirCallSite = mir.MirCallSite;
 /// Constant scalar or literal record in `MirBody.consts`.
 pub const MirConst = mir.MirConst;
+/// Vacated non-`Copy` `inout` `subscript` projection window recorded on `MirBody` (`Fix-06B`).
+pub const VacatedProjectionWindow = mir.VacatedProjectionWindow;
 /// Block-Argument SSA representation of a lowered function or constant body.
 pub const MirBody = mir.MirBody;
+/// Returns `true` when `raw_ty` unwraps to a nominal `@zero_pad` `struct`, `union`, or `enum`.
+pub const isZeroPadNominalType = mir.isZeroPadNominalType;
 /// Braun et al. single-pass forward Block-Argument SSA builder (`DR-13` §3.5, `[MAJOR-01]`).
 pub const MirSsaBuilder = mir.MirSsaBuilder;
 /// Cooper-Harvey-Kennedy dominator tree rooted at `^bb0`.
@@ -397,10 +435,72 @@ pub const MirModuleBundle = mir.MirModuleBundle;
 pub const lowerHirFnToMir = mir.lowerHirFnToMir;
 /// Lowers all non-`subscript` bodies in `HirStore` into verified `MirBody`s.
 pub const lowerHirToMir = mir.lowerHirToMir;
+/// Lowers a single `HirFnMeta` into a verified `MirBody` with `bounds_check`/`narrow_check` SAST intrinsics.
+pub const lowerHirFnToMirForSast = mir.lowerHirFnToMirForSast;
+/// Lowers all non-`subscript` bodies in `HirStore` into verified `MirBody`s with SAST intrinsics.
+pub const lowerHirToMirForSast = mir.lowerHirToMirForSast;
 /// Standalone end-to-end `Source -> HIR -> MIR` helper.
 pub const lowerSourceToMir = mir.lowerSourceToMir;
 /// Deterministic monochrome `MIR` formatter for golden snapshot tests.
 pub const renderMir = mir.renderMir;
+
+// ----------------- MIR SAST Engine Re-Exports -----------------
+/// Canonical 16-bit (`2B`) inferred effect and OS capability bitset (`DR-17` §2.5).
+pub const EffectCapabilityMask = mir_sast.EffectCapabilityMask;
+/// Canonical 16-bit (`2B`) contract and `Context.scratch[0..2]` ping-pong mask (`DR-17` §2.5).
+pub const FnContractScratchMask = mir_sast.FnContractScratchMask;
+/// Canonical 40-byte (`34` caller-observable bytes) per-function region, effect, and stack summary (`DR-17` §2.5).
+pub const FnRegionSummary = mir_sast.FnRegionSummary;
+/// Interprocedural call, destructor, or capability-reification edge classification (`DR-17` §2.4).
+pub const WitnessEdgeKind = mir_sast.WitnessEdgeKind;
+/// 4-byte packed metadata carried on each `WitnessCallEdge`.
+pub const WitnessEdgeMeta = mir_sast.WitnessEdgeMeta;
+/// 12-byte Compressed Sparse Row (`CSR`) call-graph edge (`DR-17` §2.4).
+pub const WitnessCallEdge = mir_sast.WitnessCallEdge;
+/// Single hop in a shortest capability/effect violation witness chain.
+pub const WitnessStep = mir_sast.WitnessStep;
+/// Contiguous CSR store of `FnRegionSummary` records and `WitnessCallEdge`s.
+pub const FnSummaryStore = mir_sast.FnSummaryStore;
+/// Strongly typed 32-bit handle into a per-function `MovePath` trie.
+pub const MovePathId = mir_sast.MovePathId;
+/// 1-byte bit-packed ownership and projection flags on a `MovePathNode`.
+pub const MovePathFlags = mir_sast.MovePathFlags;
+/// Canonical 20-byte `MovePath` trie node (`DR-06` §2.1).
+pub const MovePathNode = mir_sast.MovePathNode;
+/// Result of resolving a `MirPlace` against a `MovePath` trie (`is_partial` weak-update guard).
+pub const PlacePathLookup = mir_sast.PlacePathLookup;
+/// Hybrid bitset (`u64` inline register words for `<= 64` paths, `BumpArena` slice for `> 64`).
+pub const DenseBitSet = mir_sast.DenseBitSet;
+/// 16-byte sign-biased order-preserving scalar interval (`DR-06` §2.3).
+pub const Intv = mir_sast.Intv;
+/// 32-byte (`256`-bit) strict upper-bound row in the Demand-Sliced Pentagon solver (`DR-06` §2.3).
+pub const PentagonSubRow = mir_sast.PentagonSubRow;
+/// Three-tier package capability roll-up (`ambient_caps`, `reachable_caps`, `surface_caps`, `DR-17` §3.1).
+pub const PackageCapSummary = mir_sast.PackageCapSummary;
+/// Package capability sandbox policy declared in `corex.toml` / `corex.lock` (`DR-17` §3.1).
+pub const PackageCapPolicy = mir_sast.PackageCapPolicy;
+/// Strongly typed cross-`DefId` `FnRegionSummary` resolver hook for `CompilerDb` Stage 9.
+pub const ExternalSummaryResolver = mir_sast.ExternalSummaryResolver;
+/// Configuration parameters governing `mir_sast` analysis and elaboration.
+pub const SastConfig = mir_sast.SastConfig;
+/// Complete result returned by `analyzeAndElaborateMirModule` and `analyzeSingleMirBody`.
+pub const MirSastResult = mir_sast.MirSastResult;
+/// Self-contained pipeline bundle returned by `lowerAndVerifySourceMirSast`.
+pub const MirSastPipelineBundle = mir_sast.MirSastPipelineBundle;
+/// Hard per-function `MovePath` trie node cap (`4,096`).
+pub const MAX_MOVE_PATHS = mir_sast.MAX_MOVE_PATHS;
+/// Hard Demand-Sliced Pentagon upper-bound variable cap (`256`, `Fix-06A` / `Prune-05`).
+pub const MAX_SUB_VARS = mir_sast.MAX_SUB_VARS;
+/// Hard Demand-Sliced Pentagon reachable block cap (`128`, `Fix-06A` / `Prune-05`).
+pub const MAX_PENTAGON_BLOCKS = mir_sast.MAX_PENTAGON_BLOCKS;
+/// Verifies `PackageCapSummary` against `PackageCapPolicy` (`E0324` & `W0330`).
+pub const verifyPackageCapPolicy = mir_sast.verifyPackageCapPolicy;
+/// Runs the complete 4-pass Phase 6 SAST & Elaboration pipeline in-place on `MirBody` slices.
+pub const analyzeAndElaborateMirModule = mir_sast.analyzeAndElaborateMirModule;
+/// Runs the Phase 6 SAST & Elaboration pipeline in-place on a single `MirBody`.
+pub const analyzeSingleMirBody = mir_sast.analyzeSingleMirBody;
+/// Standalone end-to-end `Source -> HIR -> MIR -> SAST` pipeline helper.
+pub const lowerAndVerifySourceMirSast = mir_sast.lowerAndVerifySourceMirSast;
 
 // ------------ `MirVm` & `MIR` Optimizer Re-Exports ------------
 /// Disjoint 2-bit allocation domain tag inside `ComptimeAllocId` (`[CRITICAL-02]`).
@@ -489,6 +589,7 @@ test "test_root_module_references_all_phase0_submodules" {
     _ = type_system;
     _ = hir;
     _ = mir;
+    _ = mir_sast;
     _ = mir_vm;
     _ = mir_opt;
     _ = style;

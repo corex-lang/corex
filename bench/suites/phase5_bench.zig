@@ -162,10 +162,8 @@ const SYNTHETIC_PHASE5_MODULE_64K: [SYNTHETIC_MODULE_LEN]u8 = blk: {
     var buf: [SYNTHETIC_MODULE_LEN]u8 = undefined;
     @memcpy(buf[0..SYNTHETIC_PREAMBLE_32_LOC.len], SYNTHETIC_PREAMBLE_32_LOC);
 
-    const worker_prefix_len = (
-        "/// Evaluates pipelines, `?`/`catch`, `match`, `for` loops, structs, and `defer`.\n" ++
-            "pub fn eval_phase5_work"
-    ).len;
+    const worker_prefix_len = ("/// Evaluates pipelines, `?`/`catch`, `match`, `for` loops, structs, and `defer`.\n" ++
+        "pub fn eval_phase5_work").len;
 
     var i: usize = 0;
     while (i < 126) : (i += 1) {

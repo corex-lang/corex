@@ -20,6 +20,7 @@ const symbol_resolver = @import("symbol_resolver.zig");
 const type_system = @import("type_system.zig");
 const hir = @import("hir.zig");
 const mir = @import("mir.zig");
+const mir_sast = @import("mir_sast.zig");
 const mir_vm = @import("mir_vm.zig");
 const mir_opt = @import("mir_opt.zig");
 
@@ -61,17 +62,17 @@ pub const Revision = enum(u32) {
 
     /// Converts a raw 32-bit unsigned integer into a `Revision`.
     pub inline fn fromInt(raw_val: u32) Revision {
-        return @enumFromInt(raw_val);
+        return @fromBackingInt(@intCast(raw_val));
     }
 
     /// Returns the underlying 32-bit integer representation of `self`.
     pub inline fn asInt(self: Revision) u32 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     /// Returns the next sequential `Revision` (`self + 1`).
     pub inline fn next(self: Revision) Revision {
-        return @enumFromInt(self.asInt() + 1);
+        return @fromBackingInt(@intCast(self.asInt() + 1));
     }
 
     /// Returns `true` if `self` occurred strictly after `other` (`self > other`).
@@ -91,7 +92,7 @@ pub const Durability = enum(u2) {
 
     /// Returns the less durable (minimum) tier of `first` and `second`.
     pub inline fn minTier(first: Durability, second: Durability) Durability {
-        return if (@intFromEnum(first) < @intFromEnum(second)) first else second;
+        return if (@backingInt(first) < @backingInt(second)) first else second;
     }
 };
 
@@ -330,6 +331,16 @@ pub const QueryKey = extern struct {
         };
     }
 
+    /// Constructs a Stage 9 `QueryKey` projecting only the 34 caller-observable `FnRegionSummary` bytes (`DR-17` §2.5).
+    pub inline fn forSastSummaryProj(def_id: DefId) QueryKey {
+        return .{
+            .stage = .verify_sast_mir,
+            .flags = SAST_SUMMARY_PROJ_FLAG,
+            .reserved = 0,
+            .entity_index = def_id.asInt(),
+        };
+    }
+
     /// Constructs a synthetic `.source_text` `QueryKey` for a Stage-0 compiler config slot (`[CRITICAL-17]`).
     pub inline fn forConfig(config_entity: u32) QueryKey {
         return .{
@@ -355,7 +366,7 @@ pub const QueryKey = extern struct {
         return (@as(u64, self.entity_index) << 32) |
             (@as(u64, self.reserved) << 16) |
             (@as(u64, self.flags) << 8) |
-            @as(u64, @intFromEnum(self.stage));
+            @as(u64, @backingInt(self.stage));
     }
 };
 
@@ -660,14 +671,26 @@ pub const TypedBodyArtifact = struct {
     typed_fingerprint: Fingerprint128,
 };
 
-/// Stage 9 per-definition MIR SAST ownership and memory safety verification artifact.
+/// Stage 9 per-definition MIR SAST ownership, contract, and capability verification artifact.
 pub const SastVerificationArtifact = struct {
     /// Target definition handle.
     def_id: DefId,
     /// Owning source file handle.
     file_id: FileId,
-    /// `true` if the body passed SAST verification without fatal memory safety errors.
+    /// `true` if the body passed SAST verification without fatal memory, contract, or sandbox errors.
     is_verified_sound: bool,
+    /// Number of SAST errors emitted inside `def_id`.
+    error_count: u32 = 0,
+    /// Number of SAST warnings (`W0308`, `W0314`, `W0329`, `W0330`) emitted inside `def_id`.
+    warning_count: u32 = 0,
+    /// Count of `bounds_check` / `slice_range_check` intrinsics statically proven & eliminated.
+    eliminated_bounds_checks: u32 = 0,
+    /// Count of `.narrow()` (`narrow_check`) intrinsics statically proven & eliminated.
+    eliminated_narrow_checks: u32 = 0,
+    /// Count of `drop_in_place` / `drop_if_live` instructions synthesized by `ElaborateDrops`.
+    emitted_drops: u32 = 0,
+    /// Finalized 40-byte `FnRegionSummary` (`34` caller-observable bytes for Early Cutoff).
+    summary: mir_sast.FnRegionSummary = .{},
     /// 128-bit fingerprint of the SAST verification summary.
     sast_fingerprint: Fingerprint128,
 };
@@ -701,6 +724,20 @@ pub const DefMirArtifact = struct {
     }
 };
 
+/// Cached drop-elaborated `MirModuleBundle` for `MirVm` `comptime` execution, keyed to `DefMirArtifact.mir_fingerprint`.
+pub const ComptimeElabMirEntry = struct {
+    /// Fingerprint of the unelaborated `DefMirArtifact` from which `bundle` was elaborated.
+    source_mir_fp: Fingerprint128,
+    /// Drop-elaborated `MirModuleBundle` with `drop_in_place` / `drop_if_live` instructions materialized.
+    bundle: mir.MirModuleBundle,
+
+    /// Releases all `MirBody` allocations owned by `self.bundle`.
+    pub fn deinit(self: *ComptimeElabMirEntry) void {
+        self.bundle.deinit();
+        self.* = undefined;
+    }
+};
+
 /// Stage 12 evaluated `const` / `comptime` definition artifact with `.rodata` promotion & Early Cutoff fingerprint.
 pub const ComptimeEvalArtifact = struct {
     /// Target definition handle.
@@ -730,7 +767,7 @@ pub const QueryTelemetry = struct {
 
     /// Returns the total execution count recorded for `stage`.
     pub inline fn countExecutions(self: *const QueryTelemetry, stage: QueryStage) u64 {
-        return self.stage_executions[@intFromEnum(stage)];
+        return self.stage_executions[@backingInt(stage)];
     }
 
     /// Resets all telemetry counters to zero.
@@ -758,8 +795,12 @@ pub const CONFIG_KEY_TARGET_LAYOUT: u32 = 0xFFFF_FFF0;
 pub const CONFIG_KEY_COMPTIME_LIMIT: u32 = 0xFFFF_FFF1;
 /// Reserved synthetic `.source_text` entity index tracking `CompilerDb` `@embed_bytes` sandbox (`[CRITICAL-17]`).
 pub const CONFIG_KEY_EMBED_SANDBOX: u32 = 0xFFFF_FFF2;
+/// Reserved synthetic `.source_text` entity index tracking `--sast-strict` (`CompilerDb.is_sast_strict`).
+pub const CONFIG_KEY_SAST_STRICT: u32 = 0xFFFF_FFF3;
 /// Flag bit on `.source_text` `QueryKey.flags` identifying a tracked `@embed_bytes` file dependency (`[CRITICAL-02]`).
 pub const EMBED_FILE_KEY_FLAG: u8 = 0x01;
+/// Flag bit on `.verify_sast_mir` `QueryKey.flags` projecting only the 34 caller-observable `FnRegionSummary` bytes.
+pub const SAST_SUMMARY_PROJ_FLAG: u8 = 1 << 1;
 /// Sentinel byte hashed into `signature_fingerprint` in place of a skipped `.block` body.
 const BODY_BLOCK_OMITTED_MARKER: u8 = 0xB0;
 /// Sentinel byte hashed for parser-injected error recovery leaves (`is_missing_or_injected and has_error`).
@@ -808,7 +849,7 @@ pub fn computeCstFingerprint(
     while (i < token_count) : (i += 1) {
         const tok_id = TokenIndex.fromInt(@intCast(i));
         const tok_rec = token_buffer.getToken(tok_id);
-        hasher.updateU8(@intFromEnum(tok_rec.kind));
+        hasher.updateU8(@backingInt(tok_rec.kind));
         hasher.updateU8(@bitCast(tok_rec.flags));
         hasher.updateU16(tok_rec.byte_len);
         hasher.updateU32(tok_rec.byte_offset);
@@ -819,7 +860,7 @@ pub fn computeCstFingerprint(
     i = 0;
     while (i < cst_count) : (i += 1) {
         const cst_rec = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(i)));
-        hasher.updateU8(@intFromEnum(cst_rec.kind));
+        hasher.updateU8(@backingInt(cst_rec.kind));
         hasher.updateU8(@bitCast(cst_rec.flags));
         hasher.updateU32(cst_rec.token.asInt());
         hasher.updateU32(cst_rec.subtree_size);
@@ -843,31 +884,31 @@ pub fn computeAstFingerprint(
     var i: usize = 0;
     while (i < ast_count) : (i += 1) {
         const node = ast_arena.getNode(NodeIndex.fromInt(@intCast(i)));
-        hasher.updateU8(@intFromEnum(node.tag));
+        hasher.updateU8(@backingInt(node.tag));
         if (!node.main_token.isNone() and node.main_token.asInt() < token_buffer.countTokens()) {
             const main_rec = token_buffer.getToken(node.main_token);
-            hasher.updateU8(@intFromEnum(main_rec.kind));
+            hasher.updateU8(@backingInt(main_rec.kind));
             hasher.updateBytes(getTokenLexeme(source, token_buffer, node.main_token));
         } else {
             hasher.updateU8(0xFF);
         }
 
-        hasher.updateU8(@intFromEnum(node.lhs.tag));
+        hasher.updateU8(@backingInt(node.lhs.tag));
         if (node.lhs.tag == .token) {
             const lhs_tok = TokenIndex.fromInt(node.lhs.payload);
             if (lhs_tok.asInt() < token_buffer.countTokens()) {
-                hasher.updateU8(@intFromEnum(token_buffer.getToken(lhs_tok).kind));
+                hasher.updateU8(@backingInt(token_buffer.getToken(lhs_tok).kind));
                 hasher.updateBytes(getTokenLexeme(source, token_buffer, lhs_tok));
             }
         } else {
             hasher.updateU32(node.lhs.payload);
         }
 
-        hasher.updateU8(@intFromEnum(node.rhs.tag));
+        hasher.updateU8(@backingInt(node.rhs.tag));
         if (node.rhs.tag == .token) {
             const rhs_tok = TokenIndex.fromInt(node.rhs.payload);
             if (rhs_tok.asInt() < token_buffer.countTokens()) {
-                hasher.updateU8(@intFromEnum(token_buffer.getToken(rhs_tok).kind));
+                hasher.updateU8(@backingInt(token_buffer.getToken(rhs_tok).kind));
                 hasher.updateBytes(getTokenLexeme(source, token_buffer, rhs_tok));
             }
         } else {
@@ -889,14 +930,14 @@ pub fn computeAstFingerprint(
         if (is_leaf and cst_rec.flags.is_missing_or_injected and !cst_rec.flags.has_error) {
             continue;
         }
-        hasher.updateU8(@intFromEnum(cst_rec.kind));
+        hasher.updateU8(@backingInt(cst_rec.kind));
         hasher.updateU8(if (cst_rec.flags.has_error) 1 else 0);
         if (is_leaf) {
             if (cst_rec.flags.is_missing_or_injected and cst_rec.flags.has_error) {
                 hasher.updateU8(INJECTED_ERROR_LEAF_MARKER);
             } else if (!cst_rec.token.isNone() and cst_rec.token.asInt() < token_buffer.countTokens()) {
                 const tok_rec = token_buffer.getToken(cst_rec.token);
-                hasher.updateU8(@intFromEnum(tok_rec.kind));
+                hasher.updateU8(@backingInt(tok_rec.kind));
                 hasher.updateBytes(getTokenLexeme(source, token_buffer, cst_rec.token));
             }
         } else {
@@ -971,21 +1012,21 @@ pub fn computeItemSignatureFingerprint(
         if (is_leaf) {
             if (node.flags.is_missing_or_injected) {
                 if (node.flags.has_error) {
-                    hasher.updateU8(@intFromEnum(node.kind));
+                    hasher.updateU8(@backingInt(node.kind));
                     hasher.updateU8(INJECTED_ERROR_LEAF_MARKER);
                 }
                 cursor += 1;
                 continue;
             }
-            hasher.updateU8(@intFromEnum(node.kind));
+            hasher.updateU8(@backingInt(node.kind));
             hasher.updateU8(if (node.flags.has_error) 1 else 0);
             if (!node.token.isNone() and node.token.asInt() < token_buffer.countTokens()) {
                 const tok_rec = token_buffer.getToken(node.token);
-                hasher.updateU8(@intFromEnum(tok_rec.kind));
+                hasher.updateU8(@backingInt(tok_rec.kind));
                 hasher.updateBytes(getTokenLexeme(source, token_buffer, node.token));
             }
         } else {
-            hasher.updateU8(@intFromEnum(node.kind));
+            hasher.updateU8(@backingInt(node.kind));
             hasher.updateU8(if (node.flags.has_error) 1 else 0);
             if (cursor > root_idx and node.kind != .trait_member and node.kind != .impl_member) {
                 hasher.updateU32(node.subtree_size);
@@ -1019,20 +1060,20 @@ fn hashPositionIndependentCstSubtree(
         if (is_leaf) {
             if (node.flags.is_missing_or_injected) {
                 if (node.flags.has_error) {
-                    hasher.updateU8(@intFromEnum(node.kind));
+                    hasher.updateU8(@backingInt(node.kind));
                     hasher.updateU8(INJECTED_ERROR_LEAF_MARKER);
                 }
                 continue;
             }
-            hasher.updateU8(@intFromEnum(node.kind));
+            hasher.updateU8(@backingInt(node.kind));
             hasher.updateU8(if (node.flags.has_error) 1 else 0);
             if (!node.token.isNone() and node.token.asInt() < token_buffer.countTokens()) {
                 const tok_rec = token_buffer.getToken(node.token);
-                hasher.updateU8(@intFromEnum(tok_rec.kind));
+                hasher.updateU8(@backingInt(tok_rec.kind));
                 hasher.updateBytes(getTokenLexeme(source, token_buffer, node.token));
             }
         } else {
-            hasher.updateU8(@intFromEnum(node.kind));
+            hasher.updateU8(@backingInt(node.kind));
             hasher.updateU8(if (node.flags.has_error) 1 else 0);
             hasher.updateU32(node.subtree_size);
         }
@@ -1107,7 +1148,7 @@ pub fn computeItemBodyFingerprint(
             {
                 const tok_rec = token_buffer.getToken(node.token);
                 if (tok_rec.kind == .semi) break;
-                hasher.updateU8(@intFromEnum(tok_rec.kind));
+                hasher.updateU8(@backingInt(tok_rec.kind));
                 hasher.updateBytes(getTokenLexeme(source, token_buffer, node.token));
             }
         }
@@ -1464,7 +1505,7 @@ fn extractItemTreeFromAst(
     sig_tree_hasher.updateU32(@intCast(entries_list.items.len));
     for (entries_list.items) |entry| {
         sig_tree_hasher.updateU32(entry.def_id.asInt());
-        sig_tree_hasher.updateU8(@intFromEnum(entry.kind));
+        sig_tree_hasher.updateU8(@backingInt(entry.kind));
         sig_tree_hasher.updateU8(if (entry.is_pub) 1 else 0);
         sig_tree_hasher.updateBytes(entry.name_text);
         sig_tree_hasher.updateFingerprint(entry.signature_fingerprint);
@@ -1549,7 +1590,7 @@ fn computeHirStoreFingerprint(
     var has_intrinsic_type_args = false;
     for (0..store.nodes.len) |node_idx| {
         const node = store.nodes.get(node_idx);
-        hasher.updateU8(@intFromEnum(node.tag));
+        hasher.updateU8(@backingInt(node.tag));
         hasher.updateU8(@bitCast(node.flags));
         hashTypeCanonical(&hasher, pool, sym_table, node.type_id);
         hasher.updateU32(node.data.lhs);
@@ -1586,7 +1627,7 @@ fn computeHirStoreFingerprint(
     for (store.locals.items) |loc_decl| {
         hashSymbolTextCanonical(&hasher, interner, loc_decl.name);
         hashTypeCanonical(&hasher, pool, sym_table, loc_decl.type_id);
-        hasher.updateU8(@intFromEnum(loc_decl.mode));
+        hasher.updateU8(@backingInt(loc_decl.mode));
         hasher.updateU8(@intFromBool(loc_decl.is_mut));
         hasher.updateU8(@intFromBool(loc_decl.is_comptime));
     }
@@ -1715,25 +1756,37 @@ fn computeMirBundleFingerprint(
             for (body_item.getBlockInsts(bb_id)) |inst_val| {
                 const inst = body_item.getInst(inst_val);
                 hasher.updateU32(inst_val.asInt());
-                hasher.updateU8(@intFromEnum(inst.op));
+                hasher.updateU8(@backingInt(inst.op));
                 hasher.updateU16(inst.aux_u16);
                 hashTypeCanonical(&hasher, pool, sym_table, inst.type_id);
                 if (inst.op == .fn_addr) {
                     hasher.updateU32(inst.operands.lhs);
                     hasher.updateU32(0);
-                } else if (inst.op == .intrinsic_op and
-                    (inst.aux_u16 == @intFromEnum(mir.MirIntrinsicKind.size_of) or
-                    inst.aux_u16 == @intFromEnum(mir.MirIntrinsicKind.align_of) or
-                    inst.aux_u16 == @intFromEnum(mir.MirIntrinsicKind.type_name)))
-                {
-                    hashTypeCanonical(&hasher, pool, sym_table, TypeId.fromInt(inst.operands.lhs));
-                    hasher.updateU32(inst.operands.rhs);
+                } else if (inst.op == .intrinsic_op) {
+                    const ikind: mir.MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+                    if (ikind.hasPlaceInLhs()) {
+                        hasher.updateU32(inst.operands.lhs);
+                        hasher.updateU32(inst.operands.rhs);
+                    } else if (ikind.hasTypeIdInLhs()) {
+                        hashTypeCanonical(&hasher, pool, sym_table, TypeId.fromInt(inst.operands.lhs));
+                        hasher.updateU32(inst.operands.rhs);
+                    } else if (ikind.hasExtraArgs() and inst.operands.rhs > 0 and
+                        inst.operands.lhs + inst.operands.rhs <= body_item.extra_args.items.len)
+                    {
+                        hasher.updateU32(inst.operands.rhs);
+                        for (body_item.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs]) |arg_val| {
+                            hasher.updateU32(arg_val);
+                        }
+                    } else {
+                        hasher.updateU32(inst.operands.lhs);
+                        hasher.updateU32(inst.operands.rhs);
+                    }
                 } else {
                     hasher.updateU32(inst.operands.lhs);
                     hasher.updateU32(inst.operands.rhs);
                 }
             }
-            hasher.updateU8(@intFromEnum(bb.terminator.kind));
+            hasher.updateU8(@backingInt(bb.terminator.kind));
             hasher.updateU32(bb.terminator.cond_or_val);
             for (body_item.getOutgoingEdges(bb_id)) |edge| {
                 hasher.updateU32(edge.target_bb.asInt());
@@ -1936,6 +1989,10 @@ pub const CompilerDb = struct {
     typed_bodies: std.AutoHashMapUnmanaged(u32, TypedBodyArtifact) = .empty,
     /// Stage 9 per-definition SAST verification artifacts keyed by `DefId.asInt()`.
     sast_results: std.AutoHashMapUnmanaged(u32, SastVerificationArtifact) = .empty,
+    /// Stage 9 finalized 40-byte `FnRegionSummary` records keyed by `DefId.asInt()`.
+    sast_summaries: std.AutoHashMapUnmanaged(u32, mir_sast.FnRegionSummary) = .empty,
+    /// Stage 9 per-symbol `FnRegionSummary` records (including `impl` methods) keyed by `SymbolIndex.asInt()`.
+    sast_sym_summaries: std.AutoHashMapUnmanaged(u32, mir_sast.FnRegionSummary) = .empty,
     /// Canonical deduplicated `InternPool` (`TypeArena`) shared across queries.
     type_pool: InternPool,
     /// Unified lexical and module `SymbolTable` shared across queries.
@@ -1944,6 +2001,8 @@ pub const CompilerDb = struct {
     comptime_step_limit: u64 = router.DEFAULT_COMPTIME_STEP_LIMIT,
     /// Active target pointer size and alignment (`NATIVE_64` vs `WASM32`).
     target_layout: TargetLayout = TargetLayout.NATIVE_64,
+    /// Active `--sast-strict` policy flag (`W0314` on unproven bounds checks outside `@no_panic`).
+    is_sast_strict: bool = false,
     /// Optional workspace root directory path for VFS-sandboxed `@embed_bytes` (`DR-05` §3.3).
     workspace_root: ?[]const u8 = null,
     /// Optional Zig `Io` handle for disk-backed `@embed_bytes` inside `workspace_root`.
@@ -1952,8 +2011,8 @@ pub const CompilerDb = struct {
     virtual_files: ?*const std.StringHashMapUnmanaged([]const u8) = null,
     /// Monotonic counter bumped on every `setEmbedSandbox` / `setEmbedIo` mutation (`[CRITICAL-17]`).
     embed_sandbox_epoch: u64 = 0,
-    /// Last-changed revisions for synthetic config keys `0xFFFF_FFF0..0xFFFF_FFF2` (`[CRITICAL-17]`).
-    config_changed_at: [3]Revision = .{ .initial, .initial, .initial },
+    /// Last-changed revisions for synthetic config keys `0xFFFF_FFF0..0xFFFF_FFF3` (`[CRITICAL-17]`).
+    config_changed_at: [4]Revision = .{ .initial, .initial, .initial, .initial },
     /// Deduplicated `.rodata` constant pool shared across `MirVm` evaluations.
     rodata_pool: mir_vm.RodataPool,
     /// Bounded `Wyhash(0)` pure-call memoization cache shared across `MirVm` runs.
@@ -1966,14 +2025,20 @@ pub const CompilerDb = struct {
     lowered_def_hirs: std.AutoHashMapUnmanaged(u32, hir.HirStore) = .empty,
     /// Stage 11 per-definition verified `MIR` bundles keyed by `DefId.asInt()`.
     built_def_mirs: std.AutoHashMapUnmanaged(u32, DefMirArtifact) = .empty,
+    /// Cached drop-elaborated `MIR` bundles for `MirVm` `comptime` execution keyed by `DefId.asInt()`.
+    comptime_elab_mirs: std.AutoHashMapUnmanaged(u32, ComptimeElabMirEntry) = .empty,
+    /// Cross-`DefId` mutual-recursion peer sets discovered during Stage 9 `verify_sast_mir`.
+    sast_cycle_peers: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(DefId)) = .empty,
     /// Stage 12 evaluated `const` / `comptime` artifacts keyed by `DefId.asInt()`.
     evaluated_comptime_defs: std.AutoHashMapUnmanaged(u32, ComptimeEvalArtifact) = .empty,
-    /// Stage 13 optimized `MIR` module results keyed by `QueryKey.forFileMode(...).asU64()`.
+    /// Stage 13 optimized `MIR` module results keyed by `QueryKey.forFileMode(…).asU64()`.
     optimized_mir_modules: std.AutoHashMapUnmanaged(u64, mir_opt.MirOptModuleResult) = .empty,
     /// Per-file signature resolution diagnostic sinks keyed by `FileId.asInt()`.
     sig_diagnostics: std.AutoHashMapUnmanaged(u32, DiagnosticSink) = .empty,
     /// Per-definition body type-checking diagnostic sinks keyed by `DefId.asInt()`.
     body_diagnostics: std.AutoHashMapUnmanaged(u32, DiagnosticSink) = .empty,
+    /// Per-definition Stage 9 `MIR` SAST diagnostic sinks keyed by `DefId.asInt()`.
+    sast_diagnostics: std.AutoHashMapUnmanaged(u32, DiagnosticSink) = .empty,
     /// Per-definition `HIR` lowering diagnostic sinks keyed by `DefId.asInt()`.
     hir_diagnostics: std.AutoHashMapUnmanaged(u32, DiagnosticSink) = .empty,
     /// Per-definition `MIR` construction & verification diagnostic sinks keyed by `DefId.asInt()`.
@@ -2051,6 +2116,18 @@ pub const CompilerDb = struct {
         }
         self.built_def_mirs.deinit(self.allocator);
 
+        var elab_mir_iter = self.comptime_elab_mirs.valueIterator();
+        while (elab_mir_iter.next()) |elab_ptr| {
+            elab_ptr.deinit();
+        }
+        self.comptime_elab_mirs.deinit(self.allocator);
+
+        var cycle_peer_iter = self.sast_cycle_peers.valueIterator();
+        while (cycle_peer_iter.next()) |peer_list_ptr| {
+            peer_list_ptr.deinit(self.allocator);
+        }
+        self.sast_cycle_peers.deinit(self.allocator);
+
         self.evaluated_comptime_defs.deinit(self.allocator);
 
         var opt_iter = self.optimized_mir_modules.valueIterator();
@@ -2070,6 +2147,12 @@ pub const CompilerDb = struct {
             sink_ptr.deinit();
         }
         self.body_diagnostics.deinit(self.allocator);
+
+        var sast_diag_iter = self.sast_diagnostics.valueIterator();
+        while (sast_diag_iter.next()) |sink_ptr| {
+            sink_ptr.deinit();
+        }
+        self.sast_diagnostics.deinit(self.allocator);
 
         var hir_diag_iter = self.hir_diagnostics.valueIterator();
         while (hir_diag_iter.next()) |sink_ptr| {
@@ -2105,6 +2188,8 @@ pub const CompilerDb = struct {
         self.def_signatures.deinit(self.allocator);
         self.typed_bodies.deinit(self.allocator);
         self.sast_results.deinit(self.allocator);
+        self.sast_summaries.deinit(self.allocator);
+        self.sast_sym_summaries.deinit(self.allocator);
         self.memos.deinit(self.allocator);
         self.dep_edges.deinit(self.allocator);
         self.scratch_dep_edges.deinit(self.allocator);
@@ -2170,6 +2255,9 @@ pub const CompilerDb = struct {
                     hasher.updateU8(0);
                 }
             },
+            CONFIG_KEY_SAST_STRICT => {
+                hasher.updateU8(@intFromBool(self.is_sast_strict));
+            },
             else => {},
         }
         return hasher.final();
@@ -2202,6 +2290,12 @@ pub const CompilerDb = struct {
     pub fn readComptimeStepLimit(self: *CompilerDb) QueryError!u64 {
         _ = try self.fetchQuery(QueryKey.forConfig(CONFIG_KEY_COMPTIME_LIMIT));
         return self.comptime_step_limit;
+    }
+
+    /// Reads `is_sast_strict` while recording a tracked dependency on `CONFIG_KEY_SAST_STRICT`.
+    pub fn readSastStrict(self: *CompilerDb) QueryError!bool {
+        _ = try self.fetchQuery(QueryKey.forConfig(CONFIG_KEY_SAST_STRICT));
+        return self.is_sast_strict;
     }
 
     /// Records a tracked dependency on `CONFIG_KEY_EMBED_SANDBOX` whenever `@embed_bytes` queries sandbox state.
@@ -2306,6 +2400,13 @@ pub const CompilerDb = struct {
         self.bumpConfigInput(CONFIG_KEY_TARGET_LAYOUT);
     }
 
+    /// Updates `--sast-strict` (`is_sast_strict`) and bumps `current_revision` when changed.
+    pub fn setSastStrict(self: *CompilerDb, is_strict: bool) void {
+        if (self.is_sast_strict == is_strict) return;
+        self.is_sast_strict = is_strict;
+        self.bumpConfigInput(CONFIG_KEY_SAST_STRICT);
+    }
+
     /// Configures the workspace root directory and optional in-memory VFS overlay for `@embed_bytes`.
     pub fn setEmbedSandbox(
         self: *CompilerDb,
@@ -2354,7 +2455,7 @@ pub const CompilerDb = struct {
             }
 
             self.current_revision = self.current_revision.next();
-            const max_affected_tier: usize = @max(@intFromEnum(old_durability), @intFromEnum(durability));
+            const max_affected_tier: usize = @max(@backingInt(old_durability), @backingInt(durability));
             var tier_idx: usize = 0;
             while (tier_idx <= max_affected_tier) : (tier_idx += 1) {
                 self.last_changed_by_durability[tier_idx] = self.current_revision;
@@ -2386,7 +2487,7 @@ pub const CompilerDb = struct {
             self.current_revision = self.current_revision.next();
         }
         var tier_idx: usize = 0;
-        while (tier_idx <= @intFromEnum(durability)) : (tier_idx += 1) {
+        while (tier_idx <= @backingInt(durability)) : (tier_idx += 1) {
             self.last_changed_by_durability[tier_idx] = self.current_revision;
         }
 
@@ -2472,6 +2573,17 @@ pub const CompilerDb = struct {
         return self.sast_results.get(def_id.asInt()) orelse error.InvalidDefId;
     }
 
+    /// Stage 9 summary firewall: fetches `def_id`'s 40-byte `FnRegionSummary` gated by its 34 caller-observable bytes.
+    pub fn getSastSummaryProj(self: *CompilerDb, def_id: DefId) QueryError!mir_sast.FnRegionSummary {
+        _ = try self.fetchQuery(QueryKey.forSastSummaryProj(def_id));
+        return self.sast_summaries.get(def_id.asInt()) orelse .{};
+    }
+
+    /// Inspects the cached Stage 9 `FnRegionSummary` for `def_id` without triggering execution.
+    pub inline fn getSastSummary(self: *const CompilerDb, def_id: DefId) ?mir_sast.FnRegionSummary {
+        return self.sast_summaries.get(def_id.asInt());
+    }
+
     /// Stage 10: Lowers a single `def_id` into an owned `HirStore` (`[CRITICAL-11]` per-`DefId` firewall).
     pub fn lowerDefHir(self: *CompilerDb, def_id: DefId) QueryError!*const hir.HirStore {
         _ = try self.fetchQuery(QueryKey.forDef(.lower_def_hir, def_id));
@@ -2487,6 +2599,77 @@ pub const CompilerDb = struct {
     /// Stage 11 convenience wrapper returning the primary `MirBody` for `def_id` (`null` for type-only defs).
     pub fn buildDefMir(self: *CompilerDb, def_id: DefId) QueryError!?*const mir.MirBody {
         return (try self.buildDefMirArtifact(def_id)).primaryBody();
+    }
+
+    /// Returns drop-elaborated `MirBody` records for `def_id` for `MirVm` `comptime` execution (`[CRITICAL-04]`).
+    pub fn getComptimeElaboratedMirBodies(
+        self: *CompilerDb,
+        def_id: DefId,
+    ) QueryError![]const mir.MirBody {
+        const mir_art = try self.buildDefMirArtifact(def_id);
+        if (mir_art.bundle.bodies.items.len == 0) return &.{};
+
+        if (self.comptime_elab_mirs.getPtr(def_id.asInt())) |cached_ptr| {
+            if (Fingerprint128.eql(cached_ptr.source_mir_fp, mir_art.mir_fingerprint)) {
+                return cached_ptr.bundle.bodies.items;
+            }
+        }
+
+        var elab_bundle = mir.MirModuleBundle{ .allocator = self.allocator };
+        errdefer elab_bundle.deinit();
+        for (mir_art.bundle.bodies.items) |*src_body| {
+            var dup_body = src_body.clone(self.allocator) catch return error.OutOfMemory;
+            errdefer dup_body.deinit();
+            try elab_bundle.bodies.append(self.allocator, dup_body);
+        }
+
+        const file_id = def_id.fileId();
+        const src_opt = if (self.source_inputs.getPtr(file_id.asInt())) |in_ptr| in_ptr.owned_text else null;
+        const parsed_opt = self.parsed_artifacts.getPtr(file_id.asInt());
+        var scratch_sink = DiagnosticSink.init(self.allocator);
+        defer scratch_sink.deinit();
+
+        const elab_ok = if (mir_sast.analyzeAndElaborateMirModule(
+            self.allocator,
+            elab_bundle.bodies.items,
+            &self.type_pool,
+            &self.symbol_table,
+            &self.interner,
+            .{
+                .diagnostic_sink = &scratch_sink,
+                .is_comptime_context = false,
+                .source_text = src_opt,
+                .token_buffer = if (parsed_opt) |pp| &pp.token_buffer else null,
+                .cst_arena = if (parsed_opt) |pp| &pp.cst_arena else null,
+                .external_resolver = .{
+                    .compiler_db = self,
+                    .resolve_fn = resolveDbCalleeSummary,
+                },
+            },
+        )) |elab_res_val| blk: {
+            var elab_res = elab_res_val;
+            elab_res.deinit();
+            break :blk scratch_sink.error_count == 0;
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Cancelled => return error.Cancelled,
+            else => false,
+        };
+
+        if (!elab_ok) {
+            elab_bundle.deinit();
+            return mir_art.bundle.bodies.items;
+        }
+
+        const entry = ComptimeElabMirEntry{
+            .source_mir_fp = mir_art.mir_fingerprint,
+            .bundle = elab_bundle,
+        };
+        if (try self.comptime_elab_mirs.fetchPut(self.allocator, def_id.asInt(), entry)) |prev_kv| {
+            var old_entry = prev_kv.value;
+            old_entry.deinit();
+        }
+        return self.comptime_elab_mirs.getPtr(def_id.asInt()).?.bundle.bodies.items;
     }
 
     /// Stage 12: Evaluates `def_id` in `MirVm`, promotes to `.rodata`, and emits `E0509` on evaluation cycles.
@@ -2686,7 +2869,7 @@ pub const CompilerDb = struct {
 
         // [3] Durability Fast-Path: if no input at `>= memo_snapshot.min_durability` changed since `last_verified`:
         var has_durability_change = false;
-        var tier_idx: usize = @intFromEnum(memo_snapshot.min_durability);
+        var tier_idx: usize = @backingInt(memo_snapshot.min_durability);
         while (tier_idx < DURABILITY_COUNT) : (tier_idx += 1) {
             if (self.last_changed_by_durability[tier_idx].isAfter(last_verified)) {
                 has_durability_change = true;
@@ -2761,7 +2944,7 @@ pub const CompilerDb = struct {
                 return embed_memo;
             }
             if (key.entity_index >= CONFIG_KEY_TARGET_LAYOUT and
-                key.entity_index <= CONFIG_KEY_EMBED_SANDBOX)
+                key.entity_index <= CONFIG_KEY_SAST_STRICT)
             {
                 const cfg_slot = key.entity_index - CONFIG_KEY_TARGET_LAYOUT;
                 const cfg_memo = MemoHeader{
@@ -2813,7 +2996,7 @@ pub const CompilerDb = struct {
         }
 
         const old_memo_opt = self.memos.get(key.asU64());
-        self.telemetry.stage_executions[@intFromEnum(key.stage)] += 1;
+        self.telemetry.stage_executions[@backingInt(key.stage)] += 1;
 
         if (self.custom_stage_hook) |hook_fn| {
             try hook_fn(self, key);
@@ -2918,7 +3101,7 @@ pub const CompilerDb = struct {
                     break :blk self.probeEmbeddedFileFingerprint(SymbolId.fromInt(key.entity_index));
                 }
                 if (key.entity_index >= CONFIG_KEY_TARGET_LAYOUT and
-                    key.entity_index <= CONFIG_KEY_EMBED_SANDBOX)
+                    key.entity_index <= CONFIG_KEY_SAST_STRICT)
                 {
                     break :blk self.computeConfigFingerprint(key.entity_index);
                 }
@@ -2933,7 +3116,7 @@ pub const CompilerDb = struct {
             .resolve_signatures => self.computeResolveSignatures(FileId.fromInt(key.entity_index)),
             .def_signature => self.computeDefSignature(DefId.fromInt(key.entity_index)),
             .typecheck_body => self.computeTypecheckBody(DefId.fromInt(key.entity_index)),
-            .verify_sast_mir => self.computeVerifySastMir(DefId.fromInt(key.entity_index)),
+            .verify_sast_mir => self.computeVerifySastMirKey(key),
             .lower_def_hir => self.computeLowerDefHir(DefId.fromInt(key.entity_index)),
             .build_def_mir => self.computeBuildDefMir(DefId.fromInt(key.entity_index)),
             .eval_comptime_def => self.computeEvalComptimeDef(DefId.fromInt(key.entity_index)),
@@ -3088,6 +3271,11 @@ pub const CompilerDb = struct {
     /// Returns the body type-checking `DiagnosticSink` for `def_id` if available.
     pub fn getBodyDiagnostics(self: *const CompilerDb, def_id: DefId) ?*const DiagnosticSink {
         return self.body_diagnostics.getPtr(def_id.asInt());
+    }
+
+    /// Returns the Stage 9 `MIR` SAST `DiagnosticSink` for `def_id` if available.
+    pub fn getSastDiagnostics(self: *const CompilerDb, def_id: DefId) ?*const DiagnosticSink {
+        return self.sast_diagnostics.getPtr(def_id.asInt());
     }
 
     /// Returns the `HIR` lowering `DiagnosticSink` for `def_id` if available.
@@ -3286,6 +3474,7 @@ pub const CompilerDb = struct {
                 defer checker.deinit();
                 checker.db = self;
                 checker.target_layout = active_layout;
+                checker.is_stdlib_file = (input_ptr.durability == .high);
 
                 checker.resolveModuleSignatures() catch return error.OutOfMemory;
                 sig_err_count = sig_sink.error_count;
@@ -3331,7 +3520,7 @@ pub const CompilerDb = struct {
 
         var hasher = StructuralHasher.init();
         hasher.updateU32(def_id.asInt());
-        hasher.updateU8(@intFromEnum(entry.kind));
+        hasher.updateU8(@backingInt(entry.kind));
         hasher.updateU8(if (entry.is_pub) 1 else 0);
         hasher.updateU32(entry.name_symbol.asInt());
         hasher.updateU32(resolved_ty.toU32());
@@ -3385,6 +3574,7 @@ pub const CompilerDb = struct {
                 defer checker.deinit();
                 checker.db = self;
                 checker.target_layout = active_layout;
+                checker.is_stdlib_file = (input_ptr.durability == .high);
 
                 checker.checkDefBody(def_id) catch return error.OutOfMemory;
                 body_err_count = body_sink.error_count;
@@ -3465,28 +3655,549 @@ pub const CompilerDb = struct {
         return typed_fp;
     }
 
-    /// Stage 9 implementation: runs SAST MIR verification on `def_id`'s typed body.
+    /// Constructs a fail-closed conservative `FnRegionSummary` for an in-flight mutual-recursion cycle (`[CRITICAL-03]`).
+    fn makeConservativeCycleSummary(
+        db: *const CompilerDb,
+        target_def: DefId,
+        callee_sym: SymbolIndex,
+    ) mir_sast.FnRegionSummary {
+        var summary = mir_sast.FnRegionSummary{
+            .ret_provenance_mask = std.math.maxInt(u64),
+            .param_flow_matrix = std.math.maxInt(u64),
+            .global_escape_mask = std.math.maxInt(u32),
+            .max_subtree_bytes = mir_sast.FnRegionSummary.STACK_UNBOUNDED,
+            .direct_effects_bits = 0x0FFF,
+            .inferred_effects_bits = 0x0FFF,
+        };
+        var cs_mask = mir_sast.FnContractScratchMask{
+            .is_scc_recursive = true,
+            .scratch_touch_mask = 0b11,
+            .scratch_rewind_mask = 0b11,
+        };
+        var resolved_sym = callee_sym;
+        if (resolved_sym.isNone() and !target_def.isNone()) {
+            resolved_sym = db.symbol_table.def_to_symbol.get(target_def.asInt()) orelse .none;
+        }
+        if (!resolved_sym.isNone() and resolved_sym.asInt() < db.symbol_table.symbols.items.len) {
+            const srec = db.symbol_table.getSymbol(resolved_sym).*;
+            cs_mask.has_no_alloc = srec.contract_flags.is_no_alloc;
+            cs_mask.has_no_panic = srec.contract_flags.is_no_panic;
+            cs_mask.has_no_block = srec.contract_flags.is_no_block;
+            cs_mask.has_max_stack_attr = srec.contract_flags.has_max_stack;
+        }
+        summary.setContractsScratch(cs_mask);
+        return summary;
+    }
+
+    /// Records all `.verify_sast_mir` participants on `active_stack` from `target_def` upward as mutual-recursion peers.
+    fn recordSastCycleOnActiveStack(db: *CompilerDb, target_def: DefId) !void {
+        var cycle_start: ?usize = null;
+        for (db.active_stack.items, 0..) |frame, idx| {
+            if (frame.key.stage == .verify_sast_mir and frame.key.entity_index == target_def.asInt()) {
+                cycle_start = idx;
+                break;
+            }
+        }
+        const start_idx = cycle_start orelse return;
+
+        var participants: std.ArrayListUnmanaged(DefId) = .empty;
+        defer participants.deinit(db.allocator);
+        for (db.active_stack.items[start_idx..]) |frame| {
+            if (frame.key.stage != .verify_sast_mir) continue;
+            const p_def = DefId.fromInt(frame.key.entity_index);
+            if (p_def.isNone()) continue;
+            var is_existing = false;
+            for (participants.items) |existing| {
+                if (existing == p_def) {
+                    is_existing = true;
+                    break;
+                }
+            }
+            if (!is_existing) try participants.append(db.allocator, p_def);
+        }
+
+        for (participants.items) |owner_def| {
+            const gop = try db.sast_cycle_peers.getOrPut(db.allocator, owner_def.asInt());
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .empty;
+            }
+            for (participants.items) |peer_def| {
+                if (peer_def == owner_def) continue;
+                var is_already_recorded = false;
+                for (gop.value_ptr.items) |existing_peer| {
+                    if (existing_peer == peer_def) {
+                        is_already_recorded = true;
+                        break;
+                    }
+                }
+                if (!is_already_recorded) {
+                    try gop.value_ptr.append(db.allocator, peer_def);
+                }
+            }
+        }
+    }
+
+    /// Resolves cross-`DefId` `FnRegionSummary` dependencies via `getSastSummaryProj` (34-byte Early Cutoff).
+    fn resolveDbCalleeSummary(
+        compiler_db_opt: ?*CompilerDb,
+        summary_map_opt: ?*const std.AutoHashMapUnmanaged(u32, mir_sast.FnRegionSummary),
+        callee_def: DefId,
+        callee_sym: SymbolIndex,
+    ) QueryError!?mir_sast.FnRegionSummary {
+        if (summary_map_opt) |smap| {
+            if (!callee_def.isNone()) {
+                if (smap.get(callee_def.asInt())) |found_sum| return found_sum;
+            }
+        }
+        const db = compiler_db_opt orelse return null;
+        var target_def = callee_def;
+        if (!callee_sym.isNone() and callee_sym.asInt() < db.symbol_table.symbols.items.len) {
+            const sym_rec = db.symbol_table.getSymbol(callee_sym).*;
+            if (sym_rec.flags.is_extern or sym_rec.flags.is_prototype_only) return null;
+            if (target_def.isNone()) {
+                target_def = if (!sym_rec.def_id.isNone()) sym_rec.def_id else sym_rec.owner_def_id;
+            }
+        }
+        if (target_def.isNone()) return null;
+
+        if (db.def_signatures.get(target_def.asInt())) |dsig| {
+            if (dsig.kind == .extern_block) return null;
+        }
+
+        // Detect cross-`DefId` mutual recursion before recording a cyclic edge in `dep_edges`:
+        if (db.in_flight_keys.contains(QueryKey.forDef(.verify_sast_mir, target_def).asU64()) or
+            db.in_flight_keys.contains(QueryKey.forSastSummaryProj(target_def).asU64()))
+        {
+            recordSastCycleOnActiveStack(db, target_def) catch return error.OutOfMemory;
+            return makeConservativeCycleSummary(db, target_def, callee_sym);
+        }
+
+        const def_summary = db.getSastSummaryProj(target_def) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Cancelled => return error.Cancelled,
+            error.DependencyCycle => {
+                recordSastCycleOnActiveStack(db, target_def) catch return error.OutOfMemory;
+                return makeConservativeCycleSummary(db, target_def, callee_sym);
+            },
+            error.MissingSourceInput, error.InvalidDefId => return null,
+        };
+        if (!callee_sym.isNone()) {
+            if (db.sast_sym_summaries.get(callee_sym.asInt())) |method_sum| {
+                return method_sum;
+            }
+        }
+        return def_summary;
+    }
+
+    /// Lowers clean pre-SAST `MirBody` records for `target_def` into `out_bodies` for Stage 9 SAST analysis.
+    fn appendCleanSastBodiesForDef(
+        self: *CompilerDb,
+        target_def: DefId,
+        active_layout: TargetLayout,
+        out_bodies: *std.ArrayListUnmanaged(mir.MirBody),
+        out_is_comptime: *bool,
+    ) QueryError!void {
+        const target_file = target_def.fileId();
+        const parsed_ptr = self.parsed_artifacts.getPtr(target_file.asInt()) orelse return;
+        const input_ptr = self.source_inputs.getPtr(target_file.asInt()) orelse return;
+
+        if (self.body_windows.get(target_def.asInt())) |body_window| {
+            try self.syncDefWindowAndSideTables(target_def, parsed_ptr, body_window.item_ast_node);
+        } else if (self.item_trees.getPtr(target_file.asInt())) |tree_ptr| {
+            if (tree_ptr.getEntry(target_def)) |entry| {
+                try self.syncDefWindowAndSideTables(target_def, parsed_ptr, entry.ast_node);
+            }
+        }
+
+        var hir_scratch_sink = DiagnosticSink.init(self.allocator);
+        defer hir_scratch_sink.deinit();
+        const eval_hook = mir_vm.makeComptimeEvalHook(self, target_def.asInt());
+
+        var store = hir.lowerDefToHir(
+            self.allocator,
+            target_def,
+            input_ptr.owned_text,
+            &parsed_ptr.token_buffer,
+            &parsed_ptr.cst_arena,
+            &parsed_ptr.ast_arena,
+            &self.interner,
+            &self.type_pool,
+            &self.symbol_table,
+            self.def_side_tables.getPtr(target_def.asInt()),
+            &hir_scratch_sink,
+            active_layout,
+            eval_hook,
+        ) catch |err| switch (err) {
+            error.Cancelled => return error.Cancelled,
+            error.DependencyCycle => return error.DependencyCycle,
+            error.MissingSourceInput => return error.MissingSourceInput,
+            error.InvalidDefId => return error.InvalidDefId,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.OutOfMemory,
+        };
+        defer store.deinit();
+        if (hir_scratch_sink.error_count != 0) return;
+
+        var mir_scratch_sink = DiagnosticSink.init(self.allocator);
+        defer mir_scratch_sink.deinit();
+
+        var bundle = mir.lowerHirToMirForSast(
+            self.allocator,
+            &store,
+            &self.type_pool,
+            &self.symbol_table,
+            &self.interner,
+            &mir_scratch_sink,
+        ) catch return error.OutOfMemory;
+        defer bundle.deinit();
+
+        const def_sig_opt = self.def_signatures.get(target_def.asInt());
+        if (!store.root_hir.isNone() and store.root_hir.asInt() < store.nodes.len) {
+            const root_node = store.getNode(store.root_hir);
+            if (root_node.tag == .hir_const_decl) {
+                const init_hir = HirIndex.fromInt(root_node.data.rhs);
+                if (!init_hir.isNone()) {
+                    var init_body = lowerInitializerHirToMirBody(
+                        self.allocator,
+                        target_def,
+                        &store,
+                        init_hir,
+                        root_node.type_id,
+                        &self.type_pool,
+                        &self.symbol_table,
+                        &self.interner,
+                        &mir_scratch_sink,
+                    ) catch return error.OutOfMemory;
+                    errdefer init_body.deinit();
+                    try bundle.bodies.append(self.allocator, init_body);
+                    out_is_comptime.* = true;
+                }
+            } else if (def_sig_opt != null and
+                def_sig_opt.?.kind == .extern_block and
+                root_node.tag == .hir_block)
+            {
+                var blk_body = lowerInitializerHirToMirBody(
+                    self.allocator,
+                    target_def,
+                    &store,
+                    store.root_hir,
+                    .unit_ty,
+                    &self.type_pool,
+                    &self.symbol_table,
+                    &self.interner,
+                    &mir_scratch_sink,
+                ) catch return error.OutOfMemory;
+                errdefer blk_body.deinit();
+                try bundle.bodies.append(self.allocator, blk_body);
+                out_is_comptime.* = true;
+            }
+        }
+
+        if (mir_scratch_sink.error_count != 0) return;
+        try out_bodies.ensureUnusedCapacity(self.allocator, bundle.bodies.items.len);
+        for (bundle.bodies.items) |moved_body| {
+            out_bodies.appendAssumeCapacity(moved_body);
+        }
+        bundle.bodies.shrinkRetainingCapacity(0);
+    }
+
+    /// Synchronizes `symbol_table` AST/CST handles and rebases `def_side_tables` after sibling line shifts.
+    fn syncDefWindowAndSideTables(
+        self: *CompilerDb,
+        def_id: DefId,
+        parsed_ptr: *const ParsedCstArtifact,
+        item_ast_node: NodeIndex,
+    ) QueryError!void {
+        if (item_ast_node.isNone() or item_ast_node.asInt() >= parsed_ptr.ast_arena.countNodes()) return;
+        const item_cst = parsed_ptr.ast_arena.getCstOrigin(item_ast_node);
+        if (self.symbol_table.def_to_symbol.get(def_id.asInt())) |sym_idx| {
+            if (!sym_idx.isNone()) {
+                const sym_mut = self.symbol_table.getSymbolMut(sym_idx);
+                sym_mut.ast_node = item_ast_node;
+                sym_mut.cst_node = item_cst;
+            }
+        }
+        if (self.def_side_tables.getPtr(def_id.asInt())) |st_ptr| {
+            if (!item_cst.isNone() and item_cst.asInt() < parsed_ptr.cst_arena.countNodes()) {
+                const cst_map = syntax_arenas.computeCstToAstMap(
+                    self.allocator,
+                    parsed_ptr.cst_arena.countNodes(),
+                    &parsed_ptr.ast_arena,
+                ) catch return error.OutOfMemory;
+                defer if (cst_map.len > 0) self.allocator.free(cst_map);
+
+                const cst_start: usize = item_cst.asInt();
+                const cst_rec = parsed_ptr.cst_arena.getNode(item_cst);
+                const cst_end: usize = @min(
+                    cst_start + @max(@as(usize, cst_rec.subtree_size), 1),
+                    cst_map.len,
+                );
+                var min_ast: u32 = std.math.maxInt(u32);
+                for (cst_map[cst_start..cst_end]) |mapped_ast| {
+                    if (!mapped_ast.isNone() and mapped_ast.asInt() < min_ast) {
+                        min_ast = mapped_ast.asInt();
+                    }
+                }
+                if (min_ast != std.math.maxInt(u32) and min_ast != st_ptr.ast_start) {
+                    st_ptr.rebaseWindow(min_ast);
+                }
+            }
+        }
+    }
+
+    /// Stage 9 implementation: dispatches either full SAST verification (`flags == 0`) or 34-byte summary projection.
+    fn computeVerifySastMirKey(self: *CompilerDb, key: QueryKey) QueryError!Fingerprint128 {
+        const def_id = DefId.fromInt(key.entity_index);
+        if (def_id.isNone()) return error.InvalidDefId;
+
+        if ((key.flags & SAST_SUMMARY_PROJ_FLAG) != 0) {
+            _ = try self.verifySastMir(def_id);
+            try self.unwindIfCancelled();
+            const summary = self.sast_summaries.get(def_id.asInt()) orelse mir_sast.FnRegionSummary{};
+            var obs_bytes: [34]u8 = undefined;
+            summary.writeObservableBytes(&obs_bytes);
+
+            var proj_hasher = StructuralHasher.init();
+            proj_hasher.updateU32(def_id.asInt());
+            proj_hasher.updateBytes(&obs_bytes);
+            return proj_hasher.final();
+        }
+
+        return self.computeVerifySastMir(def_id);
+    }
+
+    /// Stage 9 implementation: runs Phase 6 MIR SAST & elaboration on `def_id`'s typed body.
     fn computeVerifySastMir(self: *CompilerDb, def_id: DefId) QueryError!Fingerprint128 {
         if (def_id.isNone()) return error.InvalidDefId;
         const typed_body = try self.typecheckBody(def_id);
+        const active_layout = try self.readTargetLayout();
+        const is_strict = try self.readSastStrict();
         try self.unwindIfCancelled();
 
+        if (self.sast_cycle_peers.getPtr(def_id.asInt())) |peer_list| {
+            peer_list.clearRetainingCapacity();
+        }
+
         const file_id = def_id.fileId();
-        const has_errors = if (self.parsed_artifacts.getPtr(file_id.asInt())) |parsed_ptr|
+        const parsed_init_opt = self.parsed_artifacts.getPtr(file_id.asInt());
+        const has_front_errors = if (parsed_init_opt) |parsed_ptr|
             parsed_ptr.has_parse_errors or typed_body.error_count > 0
         else
             typed_body.error_count > 0;
 
+        var local_sast_sink = DiagnosticSink.init(self.allocator);
+        var is_sink_installed = false;
+        errdefer if (!is_sink_installed) local_sast_sink.deinit();
+
+        var final_summary = mir_sast.FnRegionSummary{};
+        var elim_bounds: u32 = 0;
+        var elim_narrow: u32 = 0;
+        var emitted_drops: u32 = 0;
+
+        if (!has_front_errors and
+            self.parsed_artifacts.contains(file_id.asInt()) and
+            self.source_inputs.contains(file_id.asInt()))
+        {
+            var local_tok_buf = self.parsed_artifacts.getPtr(file_id.asInt()).?.token_buffer;
+            var local_cst_arena = self.parsed_artifacts.getPtr(file_id.asInt()).?.cst_arena;
+            const src_text = self.source_inputs.getPtr(file_id.asInt()).?.owned_text;
+
+            var active_bodies: std.ArrayListUnmanaged(mir.MirBody) = .empty;
+            defer {
+                for (active_bodies.items) |*body_item| body_item.deinit();
+                active_bodies.deinit(self.allocator);
+            }
+            var is_comptime_item = false;
+            try self.appendCleanSastBodiesForDef(
+                def_id,
+                active_layout,
+                &active_bodies,
+                &is_comptime_item,
+            );
+
+            const primary_len = active_bodies.items.len;
+            if (primary_len > 0) {
+                var sast_res = mir_sast.analyzeAndElaborateMirModule(
+                    self.allocator,
+                    active_bodies.items,
+                    &self.type_pool,
+                    &self.symbol_table,
+                    &self.interner,
+                    .{
+                        .diagnostic_sink = &local_sast_sink,
+                        .is_sast_strict = is_strict,
+                        .is_comptime_context = is_comptime_item,
+                        .primary_body_count = primary_len,
+                        .source_text = src_text,
+                        .token_buffer = &local_tok_buf,
+                        .cst_arena = &local_cst_arena,
+                        .external_resolver = .{
+                            .compiler_db = self,
+                            .resolve_fn = resolveDbCalleeSummary,
+                        },
+                    },
+                ) catch |err| switch (err) {
+                    error.Cancelled => return error.Cancelled,
+                    error.DependencyCycle => return error.DependencyCycle,
+                    error.MissingSourceInput => return error.MissingSourceInput,
+                    error.InvalidDefId => return error.InvalidDefId,
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.OutOfMemory,
+                };
+                var has_live_sast_res = true;
+                defer if (has_live_sast_res) sast_res.deinit();
+
+                // If `resolveDbCalleeSummary` discovered a cross-`DefId` mutual-recursion cycle (`[CRITICAL-03]`),
+                // expand `active_bodies` with all peer `DefId`s and converge the full Tarjan SCC precisely:
+                var cycle_round: usize = 0;
+                var prev_peer_count: usize = 0;
+                while (cycle_round < 4) : (cycle_round += 1) {
+                    const cur_peer_count = if (self.sast_cycle_peers.getPtr(def_id.asInt())) |peer_list|
+                        peer_list.items.len
+                    else
+                        0;
+                    if (cur_peer_count == 0 or cur_peer_count == prev_peer_count) break;
+                    prev_peer_count = cur_peer_count;
+
+                    const peers_snapshot = try self.allocator.dupe(
+                        DefId,
+                        self.sast_cycle_peers.getPtr(def_id.asInt()).?.items,
+                    );
+                    defer self.allocator.free(peers_snapshot);
+
+                    sast_res.deinit();
+                    has_live_sast_res = false;
+                    local_sast_sink.deinit();
+                    local_sast_sink = DiagnosticSink.init(self.allocator);
+                    for (active_bodies.items) |*body_item| body_item.deinit();
+                    active_bodies.clearRetainingCapacity();
+
+                    var is_dummy_ct = false;
+                    try self.appendCleanSastBodiesForDef(
+                        def_id,
+                        active_layout,
+                        &active_bodies,
+                        &is_dummy_ct,
+                    );
+                    const rerun_primary_len = active_bodies.items.len;
+                    for (peers_snapshot) |peer_def| {
+                        const peer_tb = self.typecheckBody(peer_def) catch |err| switch (err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            error.Cancelled => return error.Cancelled,
+                            else => continue,
+                        };
+                        if (peer_tb.error_count == 0) {
+                            var is_peer_ct = false;
+                            try self.appendCleanSastBodiesForDef(
+                                peer_def,
+                                active_layout,
+                                &active_bodies,
+                                &is_peer_ct,
+                            );
+                        }
+                    }
+
+                    local_tok_buf = self.parsed_artifacts.getPtr(file_id.asInt()).?.token_buffer;
+                    local_cst_arena = self.parsed_artifacts.getPtr(file_id.asInt()).?.cst_arena;
+                    const refreshed_src = self.source_inputs.getPtr(file_id.asInt()).?.owned_text;
+                    sast_res = mir_sast.analyzeAndElaborateMirModule(
+                        self.allocator,
+                        active_bodies.items,
+                        &self.type_pool,
+                        &self.symbol_table,
+                        &self.interner,
+                        .{
+                            .diagnostic_sink = &local_sast_sink,
+                            .is_sast_strict = is_strict,
+                            .is_comptime_context = is_comptime_item,
+                            .primary_body_count = rerun_primary_len,
+                            .source_text = refreshed_src,
+                            .token_buffer = &local_tok_buf,
+                            .cst_arena = &local_cst_arena,
+                            .external_resolver = .{
+                                .compiler_db = self,
+                                .resolve_fn = resolveDbCalleeSummary,
+                            },
+                        },
+                    ) catch |err| switch (err) {
+                        error.Cancelled => return error.Cancelled,
+                        error.DependencyCycle => return error.DependencyCycle,
+                        error.MissingSourceInput => return error.MissingSourceInput,
+                        error.InvalidDefId => return error.InvalidDefId,
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.OutOfMemory,
+                    };
+                    has_live_sast_res = true;
+                }
+
+                elim_bounds = sast_res.eliminated_bounds_checks;
+                elim_narrow = sast_res.eliminated_narrow_checks;
+                emitted_drops = sast_res.emitted_drops;
+
+                var has_matched_primary = false;
+                const summary_limit = @min(primary_len, sast_res.summary_store.summaries.len);
+                for (sast_res.summary_store.summaries[0..summary_limit], 0..) |slot_sum, slot_i| {
+                    const slot_def = sast_res.summary_store.def_ids[slot_i];
+                    const slot_sym = sast_res.summary_store.symbol_indices[slot_i];
+                    if (!slot_sym.isNone()) {
+                        try self.sast_sym_summaries.put(
+                            self.allocator,
+                            slot_sym.asInt(),
+                            slot_sum,
+                        );
+                    }
+                    if (!slot_def.isNone()) {
+                        try self.sast_summaries.put(
+                            self.allocator,
+                            slot_def.asInt(),
+                            slot_sum,
+                        );
+                        if (slot_def == def_id) {
+                            final_summary = slot_sum;
+                            has_matched_primary = true;
+                        }
+                    }
+                }
+                if (!has_matched_primary and summary_limit > 0) {
+                    final_summary = sast_res.summary_store.summaries[0];
+                }
+            }
+        }
+
+        const sink_gop = try self.sast_diagnostics.getOrPut(self.allocator, def_id.asInt());
+        if (sink_gop.found_existing) {
+            sink_gop.value_ptr.deinit();
+        }
+        sink_gop.value_ptr.* = local_sast_sink;
+        is_sink_installed = true;
+
+        try self.sast_summaries.put(self.allocator, def_id.asInt(), final_summary);
+        var obs_bytes: [34]u8 = undefined;
+        final_summary.writeObservableBytes(&obs_bytes);
+
+        const total_sast_errors = sink_gop.value_ptr.error_count;
+        const total_sast_warnings = sink_gop.value_ptr.warning_count;
+        const is_sound = !has_front_errors and total_sast_errors == 0;
+
         var hasher = StructuralHasher.init();
         hasher.updateU32(def_id.asInt());
-        hasher.updateU8(if (has_errors) 0 else 1);
+        hasher.updateU8(if (is_sound) 1 else 0);
+        hasher.updateU32(total_sast_errors);
+        hasher.updateU32(total_sast_warnings);
+        hasher.updateBytes(&obs_bytes);
         hasher.updateFingerprint(typed_body.typed_fingerprint);
         const sast_fp = hasher.final();
 
         try self.sast_results.put(self.allocator, def_id.asInt(), .{
             .def_id = def_id,
             .file_id = file_id,
-            .is_verified_sound = !has_errors,
+            .is_verified_sound = is_sound,
+            .error_count = total_sast_errors,
+            .warning_count = total_sast_warnings,
+            .eliminated_bounds_checks = elim_bounds,
+            .eliminated_narrow_checks = elim_narrow,
+            .emitted_drops = emitted_drops,
+            .summary = final_summary,
             .sast_fingerprint = sast_fp,
         });
         return sast_fp;
@@ -3505,45 +4216,7 @@ pub const CompilerDb = struct {
         const parsed_ptr = self.parsed_artifacts.getPtr(file_id.asInt()) orelse return error.MissingSourceInput;
         const hir_sink = try resetOrCreateDefDiagSink(&self.hir_diagnostics, self.allocator, def_id.asInt());
 
-        // Refresh `ast_node` / `cst_node` and rebase `def_side_tables` if preceding sibling bodies shifted AST IDs:
-        if (!body_window.item_ast_node.isNone() and
-            body_window.item_ast_node.asInt() < parsed_ptr.ast_arena.countNodes())
-        {
-            const item_cst = parsed_ptr.ast_arena.getCstOrigin(body_window.item_ast_node);
-            if (self.symbol_table.def_to_symbol.get(def_id.asInt())) |sym_idx| {
-                if (!sym_idx.isNone()) {
-                    const sym_mut = self.symbol_table.getSymbolMut(sym_idx);
-                    sym_mut.ast_node = body_window.item_ast_node;
-                    sym_mut.cst_node = item_cst;
-                }
-            }
-            if (self.def_side_tables.getPtr(def_id.asInt())) |st_ptr| {
-                if (!item_cst.isNone() and item_cst.asInt() < parsed_ptr.cst_arena.countNodes()) {
-                    const cst_map = syntax_arenas.computeCstToAstMap(
-                        self.allocator,
-                        parsed_ptr.cst_arena.countNodes(),
-                        &parsed_ptr.ast_arena,
-                    ) catch return error.OutOfMemory;
-                    defer if (cst_map.len > 0) self.allocator.free(cst_map);
-
-                    const cst_start: usize = item_cst.asInt();
-                    const cst_rec = parsed_ptr.cst_arena.getNode(item_cst);
-                    const cst_end: usize = @min(
-                        cst_start + @max(@as(usize, cst_rec.subtree_size), 1),
-                        cst_map.len,
-                    );
-                    var min_ast: u32 = std.math.maxInt(u32);
-                    for (cst_map[cst_start..cst_end]) |mapped_ast| {
-                        if (!mapped_ast.isNone() and mapped_ast.asInt() < min_ast) {
-                            min_ast = mapped_ast.asInt();
-                        }
-                    }
-                    if (min_ast != std.math.maxInt(u32) and min_ast != st_ptr.ast_start) {
-                        st_ptr.rebaseWindow(min_ast);
-                    }
-                }
-            }
-        }
+        try self.syncDefWindowAndSideTables(def_id, parsed_ptr, body_window.item_ast_node);
 
         const eval_hook = mir_vm.makeComptimeEvalHook(self, def_id.asInt());
         var store = hir.lowerDefToHir(
@@ -3689,6 +4362,111 @@ pub const CompilerDb = struct {
             return empty_fp;
         };
 
+        var primary_idx: usize = 0;
+        for (mir_art.bundle.bodies.items, 0..) |*body_item, b_idx| {
+            if (body_item.def_id == def_id) {
+                primary_idx = b_idx;
+                break;
+            }
+        }
+
+        // `Fix-17` Gate D/F + `[CRITICAL-04]`: Elaborate `drop_in_place` / `drop_if_live` & reject `E0325` before `MirVm`!
+        var cloned_bodies: std.ArrayListUnmanaged(mir.MirBody) = .empty;
+        defer {
+            for (cloned_bodies.items) |*cloned_item| cloned_item.deinit();
+            cloned_bodies.deinit(self.allocator);
+        }
+        var is_using_elaborated_clones = false;
+        {
+            const file_id = def_id.fileId();
+            const src_opt = if (self.source_inputs.getPtr(file_id.asInt())) |in_ptr| in_ptr.owned_text else null;
+            const parsed_opt = self.parsed_artifacts.getPtr(file_id.asInt());
+
+            for (mir_art.bundle.bodies.items) |*src_body| {
+                var dup_body = src_body.clone(self.allocator) catch return error.OutOfMemory;
+                errdefer dup_body.deinit();
+                try cloned_bodies.append(self.allocator, dup_body);
+            }
+
+            var gate_sink = DiagnosticSink.init(self.allocator);
+            defer gate_sink.deinit();
+
+            if (mir_sast.analyzeAndElaborateMirModule(
+                self.allocator,
+                cloned_bodies.items,
+                &self.type_pool,
+                &self.symbol_table,
+                &self.interner,
+                .{
+                    .diagnostic_sink = &gate_sink,
+                    .is_comptime_context = true,
+                    .source_text = src_opt,
+                    .token_buffer = if (parsed_opt) |pp| &pp.token_buffer else null,
+                    .cst_arena = if (parsed_opt) |pp| &pp.cst_arena else null,
+                    .external_resolver = .{
+                        .compiler_db = self,
+                        .resolve_fn = resolveDbCalleeSummary,
+                    },
+                },
+            )) |gate_res_val| {
+                var gate_res = gate_res_val;
+                defer gate_res.deinit();
+                var has_e0325 = false;
+                for (gate_sink.diagnostics.items) |diag_item| {
+                    if (diag_item.code == .e0325_comptime_sandbox_violation) {
+                        has_e0325 = true;
+                        const sink_alloc = ct_sink.arena.asAllocator();
+                        const dup_msg = sink_alloc.dupe(u8, diag_item.message) catch return error.OutOfMemory;
+                        const dup_labels = sink_alloc.alloc(LabeledSpan, diag_item.labels.len) catch
+                            return error.OutOfMemory;
+                        for (diag_item.labels, 0..) |src_lbl, lbl_i| {
+                            dup_labels[lbl_i] = .{
+                                .span = src_lbl.span,
+                                .label = sink_alloc.dupe(u8, src_lbl.label) catch return error.OutOfMemory,
+                                .style = src_lbl.style,
+                            };
+                        }
+                        const dup_notes = sink_alloc.alloc([]const u8, diag_item.notes.len) catch
+                            return error.OutOfMemory;
+                        for (diag_item.notes, 0..) |src_note, note_i| {
+                            dup_notes[note_i] = sink_alloc.dupe(u8, src_note) catch return error.OutOfMemory;
+                        }
+                        try ct_sink.emit(.{
+                            .code = diag_item.code,
+                            .severity = .err,
+                            .primary_span = diag_item.primary_span,
+                            .message = dup_msg,
+                            .labels = dup_labels,
+                            .notes = dup_notes,
+                        });
+                    }
+                }
+                if (has_e0325) {
+                    var sandbox_hasher = StructuralHasher.init();
+                    sandbox_hasher.updateU32(def_id.asInt());
+                    sandbox_hasher.updateU8(0xFD);
+                    sandbox_hasher.updateU32(ct_sink.error_count);
+                    const sandbox_fp = sandbox_hasher.final();
+                    try self.evaluated_comptime_defs.put(self.allocator, def_id.asInt(), .{
+                        .def_id = def_id,
+                        .type_id = target_body.ret_ty,
+                        .value = .unit_val,
+                        .rodata_id = .none,
+                        .has_errors = true,
+                        .value_fingerprint = sandbox_fp,
+                    });
+                    return sandbox_fp;
+                }
+                if (gate_sink.error_count == 0 and cloned_bodies.items.len > primary_idx) {
+                    is_using_elaborated_clones = true;
+                }
+            } else |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Cancelled => return error.Cancelled,
+                else => {},
+            }
+        }
+
         var file_tokens: std.AutoHashMapUnmanaged(u32, *const TokenBuffer) = .empty;
         defer file_tokens.deinit(self.allocator);
         try self.populateFileTokensMap(&file_tokens);
@@ -3707,7 +4485,9 @@ pub const CompilerDb = struct {
         defer vm.deinit();
 
         vm.markDbBackedDef(def_id) catch return error.OutOfMemory;
-        for (mir_art.bundle.bodies.items) |*body_item| {
+        const exec_bodies = if (is_using_elaborated_clones) cloned_bodies.items else mir_art.bundle.bodies.items;
+        const exec_target = if (is_using_elaborated_clones) &cloned_bodies.items[primary_idx] else target_body;
+        for (exec_bodies) |*body_item| {
             const sym_idx = if (!body_item.symbol_index.isNone())
                 body_item.symbol_index
             else
@@ -3715,7 +4495,7 @@ pub const CompilerDb = struct {
             _ = vm.registerBody(body_item, sym_idx) catch return error.OutOfMemory;
         }
 
-        const eval_res = vm.evalBody(target_body, &.{}) catch |err| switch (err) {
+        const eval_res = vm.evalBody(exec_target, &.{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Cancelled => return error.Cancelled,
             error.EvaluationCycle => return error.DependencyCycle,
@@ -3769,7 +4549,7 @@ pub const CompilerDb = struct {
         var val_hasher = StructuralHasher.init();
         val_hasher.updateU32(def_id.asInt());
         hashTypeCanonical(&val_hasher, &self.type_pool, &self.symbol_table, eval_res.type_id);
-        val_hasher.updateU8(@intFromEnum(rodata_id.domain()));
+        val_hasher.updateU8(@backingInt(rodata_id.domain()));
         if (rodata_id.domain() == .rodata_blob) {
             if (self.rodata_pool.getBlob(rodata_id.payloadIndex())) |blob| {
                 val_hasher.updateU64(blob.content_hash);
@@ -3858,6 +4638,7 @@ pub const CompilerDb = struct {
             break :blk null;
         } else null;
 
+        const is_strict = try self.readSastStrict();
         var opt_res = mir_opt.optimizeMirModule(
             self.allocator,
             collected_bodies.items,
@@ -3869,6 +4650,8 @@ pub const CompilerDb = struct {
                 .target_layout = active_layout,
                 .syntax_view = maybe_syntax_view,
                 .comptime_fn_defs = &comptime_fn_defs,
+                .is_sast_enabled = true,
+                .is_sast_strict = is_strict,
             },
             opt_sink,
         ) catch return error.OutOfMemory;
@@ -4603,5 +5386,89 @@ test "test_phase5_pure_call_memo_replays_deps_overflow_deps_red_path_cancel_and_
     try std.testing.expectEqual(
         diagnostic.DiagnosticCode.e0506_comptime_invalid_pointer,
         uaf_diags.diagnostics.items[0].code,
+    );
+}
+
+// -------- Phase 6: 34B Summary Firewall & Strict Gate ---------
+
+test "test_phase6_sast_summary_early_cutoff_sast_strict_and_comptime_e0325" {
+    var db = try CompilerDb.init(std.testing.allocator);
+    defer db.deinit();
+
+    // [1] 34-byte `SAST_SUMMARY_PROJ_FLAG` Early Cutoff shields caller when callee body changes internally:
+    const file_id = FileId.fromInt(60);
+    const src_v1 =
+        \\pub fn leaf_calc(val: i32) -> i32 {
+        \\    let step = val + 1;
+        \\    return step;
+        \\}
+        \\
+        \\pub fn caller_fn(arr: [i32; 4], idx: usize) -> i32 {
+        \\    return leaf_calc(arr[idx]);
+        \\}
+    ;
+    const rev1 = try db.setInput(file_id, src_v1, .low);
+    const tree_v1 = try db.extractItemTree(file_id);
+    const def_leaf = tree_v1.entries[0].def_id;
+    const def_caller = tree_v1.entries[1].def_id;
+
+    const caller_r1 = try db.verifySastMir(def_caller);
+    try std.testing.expect(caller_r1.is_verified_sound);
+    try std.testing.expectEqual(@as(u32, 0), caller_r1.warning_count);
+
+    // Edit `leaf_calc`'s internal arithmetic without changing its 34-byte `FnRegionSummary`:
+    const src_v2 =
+        \\pub fn leaf_calc(val: i32) -> i32 {
+        \\    let step_a = val * 3;
+        \\    let step_b = step_a - 7;
+        \\    return step_b;
+        \\}
+        \\
+        \\pub fn caller_fn(arr: [i32; 4], idx: usize) -> i32 {
+        \\    return leaf_calc(arr[idx]);
+        \\}
+    ;
+    const rev2 = try db.setInput(file_id, src_v2, .low);
+    try std.testing.expect(rev2.isAfter(rev1));
+
+    const caller_r2 = try db.verifySastMir(def_caller);
+    try std.testing.expect(caller_r2.is_verified_sound);
+    const proj_memo = db.getMemoHeader(QueryKey.forSastSummaryProj(def_leaf)).?;
+    const caller_memo = db.getMemoHeader(QueryKey.forDef(.verify_sast_mir, def_caller)).?;
+    try std.testing.expectEqual(rev1, proj_memo.changed_at);
+    try std.testing.expectEqual(rev1, caller_memo.changed_at);
+    try std.testing.expectEqual(rev2, caller_memo.verified_at);
+
+    // [2] Toggling `setSastStrict(true)` invalidates `CONFIG_KEY_SAST_STRICT` and emits `W0314` on `arr[idx]`:
+    db.setSastStrict(true);
+    const caller_strict = try db.verifySastMir(def_caller);
+    try std.testing.expect(caller_strict.is_verified_sound);
+    try std.testing.expect(caller_strict.warning_count >= 1);
+    const strict_diags = db.getSastDiagnostics(def_caller).?;
+    try std.testing.expectEqual(
+        diagnostic.DiagnosticCode.w0314_unproven_bounds_access,
+        strict_diags.diagnostics.items[0].code,
+    );
+    db.setSastStrict(false);
+
+    // [3] `evalComptimeDef` rejects transitive FFI/host capability (`E0325`) before `MirVm` executes:
+    const ct_file = FileId.fromInt(61);
+    const ct_src =
+        \\extern "C" fn host_clock() -> i32;
+        \\pub fn sneaky_bridge() -> i32 {
+        \\    return unsafe { host_clock() };
+        \\}
+        \\pub const BAD_CT: i32 = sneaky_bridge();
+    ;
+    _ = try db.setInput(ct_file, ct_src, .low);
+    const ct_tree = try db.extractItemTree(ct_file);
+    const def_bad_ct = ct_tree.entries[2].def_id;
+
+    const ct_art = try db.evalComptimeDef(def_bad_ct);
+    try std.testing.expect(ct_art.has_errors);
+    const ct_diags = db.getComptimeDiagnostics(def_bad_ct).?;
+    try std.testing.expectEqual(
+        diagnostic.DiagnosticCode.e0325_comptime_sandbox_violation,
+        ct_diags.diagnostics.items[0].code,
     );
 }

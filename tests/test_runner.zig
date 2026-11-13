@@ -1,8 +1,8 @@
 //! CoreX Stage 0 Master Verification Suite Runner (`tests/test_runner.zig`)
 //!
-//! Aggregates and executes all Phase 0, Phase 1, Phase 2, Phase 3, Phase 4, and Phase 5 isolated
-//! unit tests (`tests/unit/`), golden snapshot tests (`tests/snapshots/`), deterministic PRNG
-//! fuzzers (`tests/fuzz/`), and repository drift guards (`tests/drift/`).
+//! Aggregates and executes all Phase 0, Phase 1, Phase 2, Phase 3, Phase 4, Phase 5, and Phase 6
+//! isolated unit tests (`tests/unit/`), golden snapshot tests (`tests/snapshots/`), deterministic
+//! PRNG fuzzers (`tests/fuzz/`), and repository drift guards (`tests/drift/`).
 //!
 //! Invoked automatically by `zig build test` alongside internal `stage0/src/` module tests.
 
@@ -32,6 +32,8 @@ pub const type_system_test = @import("unit/type_system_test.zig");
 pub const hir_test = @import("unit/hir_test.zig");
 /// Unit tests for `mir.zig` (Block-Arg SSA `MirSsaBuilder`, `switch_int`, `defer`, `subscript`, `V1`–`V6`).
 pub const mir_test = @import("unit/mir_test.zig");
+/// Unit tests for `mir_sast.zig` (3-tier ownership, NLL, `ElaborateDrops`, `FnRegionSummary`, Pentagon BCE, `E03xx`/`W03xx`).
+pub const mir_sast_test = @import("unit/mir_sast_test.zig");
 /// Unit tests for `mir_vm.zig` (`SymbolicPtr`, `VmValueRepr`, `E0501`–`E0510`, 9 reflection intrinsics, `.rodata`).
 pub const mir_vm_test = @import("unit/mir_vm_test.zig");
 /// Unit tests for `mir_opt.zig` (`LayoutShapeKey`, `--dev` `D1`–`D5`, `--release` `R1`–`R6`, `W0501`, `ICF`).
@@ -42,7 +44,7 @@ pub const diagnostic_test = @import("unit/diagnostic_test.zig");
 pub const cli_router_test = @import("unit/cli_router_test.zig");
 /// Unit tests for `bench/harness.zig` (`computeStats`, `runCase`, `renderResultsTable`).
 pub const bench_harness_test = @import("unit/bench_harness_test.zig");
-/// Golden `.snap` snapshot tests for CLI help, token streams, diagnostics, `fmt`, and `query_db`.
+/// Golden `.snap` snapshot tests for CLI help, token streams, diagnostics, `fmt`, `query_db`, and `MIR`/`SAST`.
 pub const snapshot_test = @import("snapshots/snapshot_test.zig");
 /// Phase 0 deterministic PRNG fuzzing suite (`LineIndex`, `TransactionalPatcher`, `BumpArena`).
 pub const phase0_fuzz = @import("fuzz/phase0_fuzz.zig");
@@ -56,10 +58,12 @@ pub const phase3_fmt_fuzz = @import("fuzz/phase3_fmt_fuzz.zig");
 pub const phase4_typecheck_fuzz = @import("fuzz/phase4_typecheck_fuzz.zig");
 /// Phase 5 deterministic PRNG fuzzing suite (`HIR`/`MIR` fault tolerance, `--dev` vs `--release` parity, and `CompilerDb` Stages 10–13).
 pub const phase5_mir_comptime_fuzz = @import("fuzz/phase5_mir_comptime_fuzz.zig");
+/// Phase 6 deterministic PRNG fuzzing suite (`mir_sast` fault tolerance, `--dev` vs `--release` drop/BCE parity, and `CompilerDb` Stage 9).
+pub const phase6_sast_fuzz = @import("fuzz/phase6_sast_fuzz.zig");
 /// Repository-wide drift guards (zero colored emojis, CLI parity, diagnostic catalog, `< 150` col format).
 pub const drift_guard_test = @import("drift/drift_guard_test.zig");
 
-test "test_runner_references_all_phase0_to_phase5_verification_suites" {
+test "test_runner_references_all_phase0_to_phase6_verification_suites" {
     std.testing.refAllDecls(@This());
     _ = mem_foundation_test;
     _ = vfs_sourcemap_test;
@@ -72,6 +76,7 @@ test "test_runner_references_all_phase0_to_phase5_verification_suites" {
     _ = type_system_test;
     _ = hir_test;
     _ = mir_test;
+    _ = mir_sast_test;
     _ = mir_vm_test;
     _ = mir_opt_test;
     _ = diagnostic_test;
@@ -84,5 +89,6 @@ test "test_runner_references_all_phase0_to_phase5_verification_suites" {
     _ = phase3_fmt_fuzz;
     _ = phase4_typecheck_fuzz;
     _ = phase5_mir_comptime_fuzz;
+    _ = phase6_sast_fuzz;
     _ = drift_guard_test;
 }
