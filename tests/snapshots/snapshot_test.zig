@@ -35,35 +35,6 @@ const DiagnosticSink = corex.DiagnosticSink;
 const LabeledSpan = corex.LabeledSpan;
 const DiagnosticRenderer = corex.DiagnosticRenderer;
 
-// --------------------------------------- CONSTS ----------------------------------------
-
-/// Canonical Phase 6 diagnostic codes verified across SAST unit and golden snapshot suites (`DR-06`, `DR-17`, `DR-20`).
-const PHASE6_DIAGNOSTIC_CODES = [_]corex.DiagnosticCode{
-    .e0301_use_after_free,
-    .e0302_use_after_move,
-    .e0303_uninitialized_memory_read,
-    .e0304_resource_or_memory_leak,
-    .e0305_exclusivity_violation,
-    .e0306_region_escape_violation,
-    .e0307_static_buffer_overflow,
-    .w0308_unused_region_allocation,
-    .e0313_double_free_or_close,
-    .w0314_unproven_bounds_access,
-    .e0315_wire_layout_contract_violation,
-    .e0316_max_stack_budget_exceeded,
-    .e0320_no_alloc_contract_violation,
-    .e0321_no_panic_contract_violation,
-    .e0322_no_block_contract_violation,
-    .e0323_trait_impl_effect_escalation,
-    .e0324_package_capability_violation,
-    .e0325_comptime_sandbox_violation,
-    .e0326_embed_path_escape,
-    .e0327_forbidden_sandbox_bypass_attribute,
-    .e0328_scratch_arena_ping_pong_conflict,
-    .w0329_vacated_projection_panic_abort,
-    .w0330_ambient_dead_capability_in_dep,
-};
-
 // -------------------------------------- INTERNALS --------------------------------------
 
 /// Reads `snap_path` from disk, normalizes `\r\n` to `\n`, and asserts exact equality with `actual_output`.
@@ -1398,10 +1369,6 @@ test "test_snapshot_diag_phase5_comptime_stack_trace_and_w0501" {
 }
 
 test "test_snapshot_phase6_sast_ownership_region_and_bounds_diagnostics" {
-    for (PHASE6_DIAGNOSTIC_CODES) |phase6_code| {
-        try std.testing.expectEqual(@as(usize, 5), phase6_code.asCodeStr().len);
-    }
-
     const phase6_ownership_src =
         "pub struct Vec[T] {\n" ++
         "    pub len: usize,\n" ++

@@ -976,6 +976,7 @@ pub fn runCli(
             }
             var cx_file_ids: std.ArrayListUnmanaged(mem.FileId) = .empty;
             defer cx_file_ids.deinit(allocator);
+            var embed_sandbox_root: []const u8 = ".";
 
             for (exec_info.positional_args) |file_arg| {
                 const file_id = source_map.resolveOrCreatePath(io, file_arg, .root) catch {
@@ -992,6 +993,9 @@ pub fn runCli(
                 };
                 _ = try source_map.getLineIndex(file_id);
                 if (std.mem.endsWith(u8, file_arg, ".cx")) {
+                    if (cx_file_ids.items.len == 0) {
+                        embed_sandbox_root = std.fs.path.dirname(file_arg) orelse ".";
+                    }
                     try cx_file_ids.append(allocator, file_id);
                 }
             }
@@ -1004,6 +1008,7 @@ pub fn runCli(
                 defer db.deinit();
                 db.setSastStrict(exec_info.is_sast_strict);
                 db.setComptimeStepLimit(exec_info.comptime_step_limit);
+                db.setEmbedSandbox(embed_sandbox_root, null);
                 db.setEmbedIo(io);
 
                 for (cx_file_ids.items) |cx_fid| {

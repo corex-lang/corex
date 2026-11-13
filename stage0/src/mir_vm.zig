@@ -1141,7 +1141,7 @@ pub fn isCanonicalPathWithinRoot(canon_root: []const u8, canon_target: []const u
 
 /// Returns `true` if the suffix of `canon_target` beneath `canon_root` matches `rel_path` segment-for-segment
 /// without traversing any intermediate symlink or NTFS junction/reparse point (`DR-20` `Fix-17` Gate D).
-fn isDirectCanonicalSubpath(canon_root: []const u8, canon_target: []const u8, rel_path: []const u8) bool {
+pub fn isDirectCanonicalSubpath(canon_root: []const u8, canon_target: []const u8, rel_path: []const u8) bool {
     if (!isCanonicalPathWithinRoot(canon_root, canon_target)) return false;
     const root_trimmed = std.mem.trimEnd(u8, canon_root, "/\\");
     const target_rel = canon_target[root_trimmed.len + 1 ..];
@@ -6543,21 +6543,38 @@ pub const MirVm = struct {
                         );
                     }
 
-                    const max_read_bytes: usize = @intCast(@min(self.options.mem_limit, std.math.maxInt(u32)));
-                    const file_bytes = std.Io.Dir.cwd().readFileAlloc(
-                        io_handle,
-                        canon_target,
-                        self.allocator,
-                        .limited(max_read_bytes),
-                    ) catch {
+                    const max_read_bytes: u64 = @min(self.options.mem_limit, std.math.maxInt(u32));
+                    if (file_stat.size > max_read_bytes) {
+                        return self.failWithTrap(
+                            error.ResourceLimitExceeded,
+                            .e0508_comptime_resource_limit_exceeded,
+                            "`@embed_bytes` target file exceeds compile-time memory budget",
+                            "oversized `@embed_bytes` file",
+                            null,
+                        );
+                    }
+                    const expected_size: usize = @intCast(file_stat.size);
+                    const file_bytes = self.allocator.alloc(u8, expected_size) catch
+                        return error.OutOfMemory;
+                    errdefer self.allocator.free(file_bytes);
+                    const actual_read = opened_file.readPositionalAll(io_handle, file_bytes, 0) catch {
                         return self.failWithTrap(
                             error.ForbiddenOperation,
                             .e0503_forbidden_comptime_operation,
-                            "`@embed_bytes` target file could not be opened inside workspace sandbox",
+                            "`@embed_bytes` target file could not be read from verified descriptor",
                             "unreadable `@embed_bytes` file",
                             null,
                         );
                     };
+                    if (actual_read != expected_size) {
+                        return self.failWithTrap(
+                            error.ForbiddenOperation,
+                            .e0503_forbidden_comptime_operation,
+                            "`@embed_bytes` target file changed size concurrently during read",
+                            "truncated `@embed_bytes` file",
+                            null,
+                        );
+                    }
                     owned_disk_buf = file_bytes;
                     loaded_bytes = file_bytes;
                 }

@@ -852,6 +852,13 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
     },
 };
 
+comptime {
+    std.debug.assert(@typeInfo(DiagnosticCode).@"enum".field_names.len == DIAGNOSTIC_CATALOG.len);
+    for (DIAGNOSTIC_CATALOG, 0..) |entry, i| {
+        std.debug.assert(@backingInt(entry.code) == i);
+    }
+}
+
 // -------------------------------------- INTERNALS --------------------------------------
 
 /// Returns `true` if at least one edit in `edits` targets `file_id`.
@@ -1178,13 +1185,6 @@ pub const TransactionalPatcher = struct {
         };
     }
 };
-
-comptime {
-    std.debug.assert(@typeInfo(DiagnosticCode).@"enum".field_names.len == DIAGNOSTIC_CATALOG.len);
-    for (DIAGNOSTIC_CATALOG, 0..) |entry, i| {
-        std.debug.assert(@backingInt(entry.code) == i);
-    }
-}
 
 test "test_diagnostic_sink_error_cap_and_patcher" {
     var sink = DiagnosticSink.initWithLimit(std.testing.allocator, 2);

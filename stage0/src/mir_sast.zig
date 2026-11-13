@@ -461,12 +461,22 @@ pub const FnSummaryStore = struct {
 
         bfs_loop: while (q_head < q_tail) : (q_head += 1) {
             const cur_slot = queue[q_head];
+            const is_root_self_culprit = (cur_slot == root_slot) and
+                (self.summaries[root_slot].direct_effects_bits & forbidden_mask) != 0;
+
             for (self.getEdges(cur_slot)) |edge| {
                 const edge_meta = edge.meta();
-                if ((edge_meta.edge_effects_bits & forbidden_mask) != 0) {
+                const eff_forbidden: u16 = if (edge_meta.edge_kind == .reify_fn_addr or
+                    edge_meta.edge_kind == .reify_vtable)
+                    (forbidden_mask & EffectCapabilityMask.LOCKFILE_CAP_BITS)
+                else
+                    forbidden_mask;
+                if (eff_forbidden == 0) continue;
+
+                if ((edge_meta.edge_effects_bits & eff_forbidden) != 0) {
                     const maybe_callee = self.node_key_to_slot.get(edge.callee_def) orelse mir.NONE_U32;
                     if (maybe_callee == mir.NONE_U32 or
-                        (self.summaries[maybe_callee].direct_effects_bits & forbidden_mask) != 0 or
+                        (self.summaries[maybe_callee].direct_effects_bits & eff_forbidden) != 0 or
                         self.summaries[maybe_callee].contractsScratch().is_std_cap_boundary)
                     {
                         leaf_caller = cur_slot;
@@ -478,8 +488,10 @@ pub const FnSummaryStore = struct {
 
                 const next_slot = self.node_key_to_slot.get(edge.callee_def) orelse continue;
                 const next_sum = self.summaries[next_slot];
-                if ((next_sum.inferred_effects_bits & forbidden_mask) == 0) continue;
-                if ((next_sum.direct_effects_bits & forbidden_mask) != 0 or
+                if ((next_sum.inferred_effects_bits & eff_forbidden) == 0) continue;
+                if (is_root_self_culprit) continue;
+
+                if ((next_sum.direct_effects_bits & eff_forbidden) != 0 or
                     next_sum.contractsScratch().is_std_cap_boundary)
                 {
                     leaf_caller = cur_slot;
@@ -1258,6 +1270,12 @@ const SCRATCH_RESET_METHOD_MAP = std.StaticStringMap(void).initComptime(.{
     .{ "scratch_rewind", {} },
 });
 
+/// $O(1)$ static map of `Context.scratch` complement-slot selector helper names (`D-04`).
+const SCRATCH_SELECT_METHOD_MAP = std.StaticStringMap(void).initComptime(.{
+    .{ "scratch_scope", {} },
+    .{ "select_scratch", {} },
+});
+
 /// $O(1)$ static map of dynamic heap-growing container methods (`alloc = true` when receiver is not `Arena`).
 const HEAP_GROWTH_METHOD_MAP = std.StaticStringMap(void).initComptime(.{
     .{ "alloc", {} },
@@ -1303,22 +1321,7 @@ const EXTERN_PROTO_EFFECT_MAP = std.StaticStringMap(EffectCapabilityMask).initCo
 
 /// Translates `symbol_resolver.CapabilityBits` into canonical 12-bit `EffectCapabilityMask`.
 fn capabilityBitsToEffectMask(cap_bits: u16) EffectCapabilityMask {
-    var out = EffectCapabilityMask.EMPTY;
-    if ((cap_bits & CapabilityBits.HEAP_ALLOC) != 0) out.alloc = true;
-    if ((cap_bits & CapabilityBits.MAY_PANIC) != 0) out.may_panic = true;
-    if ((cap_bits & CapabilityBits.IO_ASYNC) != 0) out.blocking_sync = true;
-    if ((cap_bits & CapabilityBits.IO_FS) != 0) out.fs = true;
-    if ((cap_bits & CapabilityBits.IO_NET) != 0) out.net = true;
-    if ((cap_bits & CapabilityBits.THREAD_SPAWN) != 0) out.process = true;
-    if ((cap_bits & CapabilityBits.FFI_UNSAFE) != 0) {
-        out.ffi = true;
-        out.unsafe_op = true;
-    }
-    if ((cap_bits & CapabilityBits.CLOCK_ENTROPY) != 0) {
-        out.clock = true;
-        out.entropy = true;
-    }
-    return out;
+    return EffectCapabilityMask.fromBits(cap_bits & 0x0FFF);
 }
 
 /// Strips outer string literal quotes (`"…"` or `r#"…"#`) without allocating.
@@ -1332,85 +1335,92 @@ fn stripAttrQuotes(lexeme: []const u8) []const u8 {
 /// Extracts exact 12-bit `(emits, clears)` masks for an `@std_cap_boundary` symbol (`DR-17` §2.3).
 fn extractBoundaryMasksForSymbol(
     sym: SymbolRecord,
+    active_file_id: FileId,
     config: SastConfig,
 ) struct { emits: u16, clears: u16 } {
-    if (config.source_text) |src_bytes| {
-        if (config.token_buffer) |tok_buf| {
-            if (config.cst_arena) |cst_ar| {
-                if (!sym.cst_node.isNone() and sym.cst_node.asInt() < cst_ar.countNodes()) {
-                    const start_idx: usize = sym.cst_node.asInt();
-                    const root_rec = cst_ar.getNode(sym.cst_node);
-                    const end_idx: usize = @min(
-                        start_idx + @max(@as(usize, root_rec.subtree_size), 1),
-                        cst_ar.countNodes(),
-                    );
-                    var has_fine_attr = false;
-                    var fine_emits: u16 = 0;
-                    var fine_clears: u16 = 0;
+    if (sym.cap_emits_mask != 0 or sym.cap_clears_mask != 0) {
+        return .{
+            .emits = capabilityBitsToEffectMask(sym.cap_emits_mask).asBits(),
+            .clears = capabilityBitsToEffectMask(sym.cap_clears_mask).asBits(),
+        };
+    }
 
-                    var cur_idx: usize = start_idx + 1;
-                    while (cur_idx < end_idx) : (cur_idx += 1) {
-                        const node = cst_ar.getNode(CstNodeIndex.fromInt(@intCast(cur_idx)));
-                        if (node.kind != .attribute) continue;
-                        const attr_end = @min(
-                            cur_idx + @max(@as(usize, node.subtree_size), 1),
-                            end_idx,
+    if (!sym.decl_span.file_id.isNone() and sym.decl_span.file_id == active_file_id) {
+        if (config.source_text) |src_bytes| {
+            if (config.token_buffer) |tok_buf| {
+                if (config.cst_arena) |cst_ar| {
+                    if (!sym.cst_node.isNone() and sym.cst_node.asInt() < cst_ar.countNodes()) {
+                        const start_idx: usize = sym.cst_node.asInt();
+                        const root_rec = cst_ar.getNode(sym.cst_node);
+                        const end_idx: usize = @min(
+                            start_idx + @max(@as(usize, root_rec.subtree_size), 1),
+                            cst_ar.countNodes(),
                         );
-                        var is_boundary_attr = false;
-                        var is_emits_mode = false;
-                        var leaf_cur = cur_idx + 1;
-                        while (leaf_cur < attr_end) : (leaf_cur += 1) {
-                            const leaf = cst_ar.getNode(CstNodeIndex.fromInt(@intCast(leaf_cur)));
-                            if (leaf.subtree_size > 1 or leaf.token.isNone() or
-                                leaf.token.asInt() >= tok_buf.countTokens())
-                            {
-                                continue;
-                            }
-                            const tok = tok_buf.getToken(leaf.token);
-                            if (tok.byte_offset >= src_bytes.len) continue;
-                            const end_off = @min(@as(usize, tok.byte_offset) + tok.byte_len, src_bytes.len);
-                            const raw_lex = src_bytes[tok.byte_offset..end_off];
-                            const ident_lex = if (tok.kind == .string_lit)
-                                stripAttrQuotes(raw_lex)
-                            else
-                                raw_lex;
+                        var has_fine_attr = false;
+                        var fine_emits: u16 = 0;
+                        var fine_clears: u16 = 0;
 
-                            if (!is_boundary_attr) {
-                                if (std.mem.eql(u8, ident_lex, "std_cap_boundary")) {
-                                    is_boundary_attr = true;
-                                    has_fine_attr = true;
+                        var cur_idx: usize = start_idx + 1;
+                        while (cur_idx < end_idx) : (cur_idx += 1) {
+                            const node = cst_ar.getNode(CstNodeIndex.fromInt(@intCast(cur_idx)));
+                            if (node.kind != .attribute) continue;
+                            const attr_end = @min(
+                                cur_idx + @max(@as(usize, node.subtree_size), 1),
+                                end_idx,
+                            );
+                            var is_boundary_attr = false;
+                            var is_emits_mode = false;
+                            var leaf_cur = cur_idx + 1;
+                            while (leaf_cur < attr_end) : (leaf_cur += 1) {
+                                const leaf = cst_ar.getNode(CstNodeIndex.fromInt(@intCast(leaf_cur)));
+                                if (leaf.subtree_size > 1 or leaf.token.isNone() or
+                                    leaf.token.asInt() >= tok_buf.countTokens())
+                                {
+                                    continue;
                                 }
-                                continue;
-                            }
-                            if (std.mem.eql(u8, ident_lex, "emits")) {
-                                is_emits_mode = true;
-                                continue;
-                            }
-                            if (std.mem.eql(u8, ident_lex, "clears")) {
-                                is_emits_mode = false;
-                                continue;
-                            }
-                            if (FINE_CAPABILITY_NAME_MAP.get(ident_lex)) |cap_bits| {
-                                if (is_emits_mode) {
-                                    fine_emits |= cap_bits;
-                                } else {
-                                    fine_clears |= cap_bits;
+                                const tok = tok_buf.getToken(leaf.token);
+                                if (tok.byte_offset >= src_bytes.len) continue;
+                                const end_off = @min(@as(usize, tok.byte_offset) + tok.byte_len, src_bytes.len);
+                                const raw_lex = src_bytes[tok.byte_offset..end_off];
+                                const ident_lex = if (tok.kind == .string_lit)
+                                    stripAttrQuotes(raw_lex)
+                                else
+                                    raw_lex;
+
+                                if (!is_boundary_attr) {
+                                    if (std.mem.eql(u8, ident_lex, "std_cap_boundary")) {
+                                        is_boundary_attr = true;
+                                        has_fine_attr = true;
+                                    }
+                                    continue;
+                                }
+                                if (std.mem.eql(u8, ident_lex, "emits")) {
+                                    is_emits_mode = true;
+                                    continue;
+                                }
+                                if (std.mem.eql(u8, ident_lex, "clears")) {
+                                    is_emits_mode = false;
+                                    continue;
+                                }
+                                if (FINE_CAPABILITY_NAME_MAP.get(ident_lex)) |cap_bits| {
+                                    if (is_emits_mode) {
+                                        fine_emits |= cap_bits;
+                                    } else {
+                                        fine_clears |= cap_bits;
+                                    }
                                 }
                             }
                         }
-                    }
-                    if (has_fine_attr) {
-                        return .{ .emits = fine_emits, .clears = fine_clears };
+                        if (has_fine_attr) {
+                            return .{ .emits = fine_emits, .clears = fine_clears };
+                        }
                     }
                 }
             }
         }
     }
 
-    return .{
-        .emits = capabilityBitsToEffectMask(sym.cap_emits_mask).asBits(),
-        .clears = capabilityBitsToEffectMask(sym.cap_clears_mask).asBits(),
-    };
+    return .{ .emits = 0, .clears = 0 };
 }
 
 /// Resolves a `TokenIndex` into an exact byte `Span` when `config.token_buffer` matches `file_id`.
@@ -1799,34 +1809,73 @@ const SccSchedule = struct {
     }
 };
 
-/// Builds the module call graph (including `fn_addr`, closures, and `Drop` glue) and computes Tarjan SCCs.
+/// Extracts the `trait_sym` `SymbolIndex` when `raw_ty` is `dyn Trait`, `&dyn Trait`, `&mut dyn Trait`, or `*dyn Trait`.
+fn extractDynTraitSymbol(pool: *const InternPool, raw_ty: TypeId) ?SymbolIndex {
+    if (raw_ty.isError()) return null;
+    var cur_ty = pool.unwrapUnderlyingType(raw_ty);
+    if (cur_ty.isError()) return null;
+    var cur_node = pool.getNode(cur_ty);
+    if (cur_node.tag == .ref_ty or cur_node.tag == .mut_ref_ty or cur_node.tag == .raw_ptr_ty) {
+        cur_ty = pool.unwrapUnderlyingType(TypeId.fromInt(cur_node.lhs));
+        if (cur_ty.isError()) return null;
+        cur_node = pool.getNode(cur_ty);
+    }
+    if (cur_node.tag != .dyn_trait_ty) return null;
+    const trait_ty = pool.unwrapUnderlyingType(TypeId.fromInt(cur_node.lhs));
+    if (trait_ty.isError()) return null;
+    const trait_node = pool.getNode(trait_ty);
+    if (trait_node.tag != .trait_ty) return null;
+    const trait_sym = SymbolIndex.fromInt(trait_node.rhs);
+    return if (trait_sym.isNone()) null else trait_sym;
+}
+
+/// Extracts the concrete nominal `SymbolIndex` (`struct`, `enum`, `union`) behind `raw_ty` or a reference/pointer to it.
+fn extractConcreteNominalSymbol(pool: *const InternPool, raw_ty: TypeId) ?SymbolIndex {
+    if (raw_ty.isError()) return null;
+    var cur_ty = pool.unwrapUnderlyingType(raw_ty);
+    if (cur_ty.isError()) return null;
+    var cur_node = pool.getNode(cur_ty);
+    if (cur_node.tag == .ref_ty or cur_node.tag == .mut_ref_ty or cur_node.tag == .raw_ptr_ty) {
+        cur_ty = pool.unwrapUnderlyingType(TypeId.fromInt(cur_node.lhs));
+        if (cur_ty.isError()) return null;
+        cur_node = pool.getNode(cur_ty);
+    }
+    if (cur_node.tag != .struct_ty and cur_node.tag != .enum_ty and cur_node.tag != .union_ty) return null;
+    const nom_sym = SymbolIndex.fromInt(cur_node.rhs);
+    return if (nom_sym.isNone()) null else nom_sym;
+}
+
+/// Builds the module call graph (including `fn_addr`, closures, vtables, and `Drop` glue) and computes Tarjan SCCs.
 fn computeBottomUpTarjanSccs(
     allocator: std.mem.Allocator,
+    scratch_arena: *BumpArena,
     bodies: []const MirBody,
     pool: *const InternPool,
     sym_table: *const SymbolTable,
     key_to_slot: *const std.AutoHashMapUnmanaged(u32, u32),
     sym_to_slot: *const std.AutoHashMapUnmanaged(u32, u32),
 ) !SccSchedule {
-    const fn_count = bodies.len;
-    const adj_lists = try allocator.alloc(std.ArrayListUnmanaged(u32), fn_count);
-    for (adj_lists) |*list| list.* = .empty;
-    defer {
-        for (adj_lists) |*list| list.deinit(allocator);
-        allocator.free(adj_lists);
-    }
+    const cp = scratch_arena.checkpoint();
+    defer scratch_arena.restore(cp);
+    const arena_alloc = scratch_arena.asAllocator();
 
-    const has_self_edge = try allocator.alloc(bool, fn_count);
-    defer allocator.free(has_self_edge);
+    const fn_count = bodies.len;
+    const adj_lists = try arena_alloc.alloc(std.ArrayListUnmanaged(u32), fn_count);
+    for (adj_lists) |*list| list.* = .empty;
+    const adj_seen = try arena_alloc.alloc(DenseBitSet, fn_count);
+    for (adj_seen) |*seen_set| seen_set.* = try DenseBitSet.initEmpty(arena_alloc, fn_count);
+
+    const has_self_edge = try arena_alloc.alloc(bool, fn_count);
     @memset(has_self_edge, false);
 
     const addUniqueEdge = struct {
         //! Deduplicated call-graph edge helper recording self-loops in `has_self_flags`.
 
-        /// Appends `dst_slot` to `lists[src_slot]` if absent, or sets `has_self_flags[src_slot]` on self-edge.
+        /// Appends `dst_slot` to `lists[src_slot]` in $O(1)$ if absent, or sets `has_self_flags[src_slot]` on self-edge.
         fn run(
             alloc: std.mem.Allocator,
             lists: []std.ArrayListUnmanaged(u32),
+            seen_sets: []DenseBitSet,
             has_self_flags: []bool,
             src_slot: u32,
             dst_slot: u32,
@@ -1835,9 +1884,8 @@ fn computeBottomUpTarjanSccs(
                 has_self_flags[src_slot] = true;
                 return;
             }
-            for (lists[src_slot].items) |existing| {
-                if (existing == dst_slot) return;
-            }
+            if (seen_sets[src_slot].isSet(dst_slot)) return;
+            seen_sets[src_slot].set(dst_slot);
             try lists[src_slot].append(alloc, dst_slot);
         }
     }.run;
@@ -1855,15 +1903,16 @@ fn computeBottomUpTarjanSccs(
                 target_opt = sym_to_slot.get(call_site.direct_symbol.asInt());
             }
             if (target_opt) |callee_slot| {
-                try addUniqueEdge(allocator, adj_lists, has_self_edge, caller_slot, callee_slot);
+                try addUniqueEdge(arena_alloc, adj_lists, adj_seen, has_self_edge, caller_slot, callee_slot);
             }
         }
 
-        // [2] Reified `fn_addr` and `closure_make` bodies:
+        // [2] Reified `fn_addr`, `closure_make`, and `dyn Trait` vtable coercion bodies:
         const ops = body.insts.items(.op);
         const aux_slice = body.insts.items(.aux_u16);
         const opnds = body.insts.items(.operands);
-        for (ops, aux_slice, opnds) |op, aux, opnd| {
+        const inst_tys = body.insts.items(.type_id);
+        for (ops, aux_slice, opnds, inst_tys) |op, aux, opnd, inst_ty| {
             if (op == .fn_addr) {
                 var target_opt: ?u32 = null;
                 if (opnd.lhs != mir.NONE_U32) target_opt = key_to_slot.get(opnd.lhs);
@@ -1871,13 +1920,45 @@ fn computeBottomUpTarjanSccs(
                     target_opt = sym_to_slot.get(opnd.rhs);
                 }
                 if (target_opt) |callee_slot| {
-                    try addUniqueEdge(allocator, adj_lists, has_self_edge, caller_slot, callee_slot);
+                    try addUniqueEdge(arena_alloc, adj_lists, adj_seen, has_self_edge, caller_slot, callee_slot);
                 }
             } else if (op == .aggregate_make) {
                 const agg_kind: AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(aux))));
                 if (agg_kind == .closure_make) {
                     if (key_to_slot.get(opnd.lhs)) |clos_slot| {
-                        try addUniqueEdge(allocator, adj_lists, has_self_edge, caller_slot, clos_slot);
+                        try addUniqueEdge(arena_alloc, adj_lists, adj_seen, has_self_edge, caller_slot, clos_slot);
+                    }
+                }
+            } else if ((op == .unary_op or op == .copy_val) and opnd.lhs < inst_tys.len) {
+                if (extractDynTraitSymbol(pool, inst_ty)) |trait_sym_idx| {
+                    const src_ty = inst_tys[opnd.lhs];
+                    if (extractDynTraitSymbol(pool, src_ty) == null) {
+                        if (extractConcreteNominalSymbol(pool, src_ty)) |nom_sym_idx| {
+                            if (nom_sym_idx.asInt() < sym_table.symbols.items.len) {
+                                const nom_sym = sym_table.getSymbol(nom_sym_idx).*;
+                                if (!nom_sym.target_scope.isNone()) {
+                                    for (sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
+                                        const mem_sym = sym_table.getSymbol(mem_idx).*;
+                                        if (mem_sym.kind != .fn_sym) continue;
+                                        if (sym_table.impl_method_trait.get(mem_idx.asInt()) != trait_sym_idx) continue;
+                                        const impl_slot = (if (!mem_sym.def_id.isNone())
+                                            key_to_slot.get(mem_sym.def_id.asInt())
+                                        else
+                                            null) orelse sym_to_slot.get(mem_idx.asInt());
+                                        if (impl_slot) |callee_slot| {
+                                            try addUniqueEdge(
+                                                arena_alloc,
+                                                adj_lists,
+                                                adj_seen,
+                                                has_self_edge,
+                                                caller_slot,
+                                                callee_slot,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1885,7 +1966,6 @@ fn computeBottomUpTarjanSccs(
 
         // [3] Potential `AutoDrop` destructor `Drop::drop` callees on body locals & `&mut T` pointees:
         var drop_syms: std.ArrayListUnmanaged(SymbolIndex) = .empty;
-        defer drop_syms.deinit(allocator);
         for (body.locals.items, 0..) |loc, loc_i| {
             if (loc_i == 0) continue;
             var candidate_types: [2]TypeId = .{ .err_ty, .err_ty };
@@ -1903,7 +1983,7 @@ fn computeBottomUpTarjanSccs(
                 var has_heap = false;
                 drop_syms.clearRetainingCapacity();
                 try collectDropGlueTargets(
-                    allocator,
+                    arena_alloc,
                     pool,
                     sym_table,
                     cand_ty,
@@ -1913,12 +1993,12 @@ fn computeBottomUpTarjanSccs(
                 );
                 for (drop_syms.items) |drop_sym_idx| {
                     if (sym_to_slot.get(drop_sym_idx.asInt())) |drop_slot| {
-                        try addUniqueEdge(allocator, adj_lists, has_self_edge, caller_slot, drop_slot);
+                        try addUniqueEdge(arena_alloc, adj_lists, adj_seen, has_self_edge, caller_slot, drop_slot);
                     } else {
                         const drop_def = sym_table.getSymbol(drop_sym_idx).def_id;
                         if (!drop_def.isNone()) {
                             if (key_to_slot.get(drop_def.asInt())) |drop_slot| {
-                                try addUniqueEdge(allocator, adj_lists, has_self_edge, caller_slot, drop_slot);
+                                try addUniqueEdge(arena_alloc, adj_lists, adj_seen, has_self_edge, caller_slot, drop_slot);
                             }
                         }
                     }
@@ -1928,20 +2008,16 @@ fn computeBottomUpTarjanSccs(
     }
 
     // Iterative Tarjan $O(V + E)$ DFS:
-    const indices = try allocator.alloc(u32, fn_count);
-    defer allocator.free(indices);
+    const indices = try arena_alloc.alloc(u32, fn_count);
     @memset(indices, mir.NONE_U32);
 
-    const lowlinks = try allocator.alloc(u32, fn_count);
-    defer allocator.free(lowlinks);
+    const lowlinks = try arena_alloc.alloc(u32, fn_count);
     @memset(lowlinks, mir.NONE_U32);
 
-    const is_on_stack = try allocator.alloc(bool, fn_count);
-    defer allocator.free(is_on_stack);
+    const is_on_stack = try arena_alloc.alloc(bool, fn_count);
     @memset(is_on_stack, false);
 
-    const scc_stack = try allocator.alloc(u32, fn_count);
-    defer allocator.free(scc_stack);
+    const scc_stack = try arena_alloc.alloc(u32, fn_count);
     var scc_sp: usize = 0;
 
     const TarjanFrame = struct {
@@ -1952,8 +2028,7 @@ fn computeBottomUpTarjanSccs(
         /// Next outgoing neighbor index in `adj_lists[node]`.
         edge_cursor: usize,
     };
-    const dfs_stack = try allocator.alloc(TarjanFrame, fn_count + 1);
-    defer allocator.free(dfs_stack);
+    const dfs_stack = try arena_alloc.alloc(TarjanFrame, fn_count + 1);
 
     var scc_members: std.ArrayListUnmanaged(u32) = .empty;
     errdefer scc_members.deinit(allocator);
@@ -2654,6 +2729,10 @@ const BodyProvenanceHorizon = struct {
     live_scratch_in: []u2,
     /// Active `Context.scratch[0..2]` mask (`u2`) on exit from each basic block (`len == block_count`).
     live_scratch_out: []u2,
+    /// Exact `LoanId` index minted per SSA instruction (`mir.NONE_U32` if none; `len == inst_count`).
+    inst_minted_loan: []const u32,
+    /// Exact `DenseBitSet` of `LoanId`s minted per `.call` site (`len == body.calls.items.len`).
+    call_minted_mask: []const DenseBitSet,
 };
 
 /// Inspects `place_id` to detect `ctx.scratch[idx]` (`Context` field ordinal `1`), returning `0b01`, `0b10`, or `0b11`.
@@ -3740,7 +3819,7 @@ fn computeBodyProvenanceAndNllHorizon(
                 }
 
                 // Pure propagation instructions (`copy_val`, `place_store` into non-deref local, `aggregate_make`)
-                // only make a loan live if the destination itself is later read!
+                // only make a loan live if the destination itself is later read:
                 const is_pure_carrier = switch (inst.op) {
                     .copy_val, .aggregate_make, .aggregate_insert => !cur_loans.intersects(val_prov[val_idx].loan_mask) and
                         (cur_scratch & val_prov[val_idx].scratch_mask) == 0,
@@ -3749,7 +3828,7 @@ fn computeBodyProvenanceAndNllHorizon(
                             const pl_id = PlaceId.fromInt(inst.operands.lhs);
                             const projs = body.getPlaceProjections(pl_id);
                             const base_loc = body.places.items[inst.operands.lhs].base;
-                            // Storing into `_0` (`return_slot`) IS a real escaping use!
+                            // Storing into `_0` (`return_slot`) is an escaping use:
                             if (base_loc != 0 and (projs.len == 0 or projs[0].kind != .deref)) {
                                 break :blk !cur_loans.intersects(local_prov[base_loc].loan_mask) and
                                     (cur_scratch & local_prov[base_loc].scratch_mask) == 0;
@@ -3800,6 +3879,8 @@ fn computeBodyProvenanceAndNllHorizon(
         .live_loans_out = live_loans_out,
         .live_scratch_in = live_scratch_in,
         .live_scratch_out = live_scratch_out,
+        .inst_minted_loan = inst_minted_loan,
+        .call_minted_mask = call_minted_mask,
     };
 }
 
@@ -3925,7 +4006,7 @@ fn isScratchScopeHelperCall(sym_table: *const SymbolTable, call_site: mir.MirCal
         return false;
     }
     const name = sym_table.getSymbol(call_site.direct_symbol).name_text;
-    return std.mem.eql(u8, name, "scratch_scope") or std.mem.eql(u8, name, "select_scratch");
+    return SCRATCH_SELECT_METHOD_MAP.has(name);
 }
 
 /// Returns `true` if call argument `(mode, word)` has `Arena` or `BumpArena` type.
@@ -4456,6 +4537,31 @@ fn applyPathMoveOrFreeToState(
     }
 }
 
+/// Returns `true` if `m_idx` still holds at least one unconsumed `@linear` obligation in `state`.
+fn hasLiveLinearObligation(
+    trie: *const MovePathTrie,
+    state: *const TypestateState,
+    m_idx: usize,
+) bool {
+    if (m_idx >= trie.nodes.len) return false;
+    const node = trie.nodes[m_idx];
+    if (!node.flags().is_linear or !state.maybe_init.isSet(m_idx)) return false;
+
+    var has_linear_field_child = false;
+    var walk_ch = node.first_child;
+    while (!walk_ch.isNone()) {
+        const ch_idx = walk_ch.asInt();
+        const ch_node = trie.nodes[ch_idx];
+        if (ch_node.proj_kind_raw == @backingInt(mir.ProjKind.field) and ch_node.flags().is_linear) {
+            has_linear_field_child = true;
+            if (hasLiveLinearObligation(trie, state, ch_idx)) return true;
+        }
+        walk_ch = ch_node.next_sibling;
+    }
+    if (has_linear_field_child) return false;
+    return true;
+}
+
 /// Returns `true` if `m_idx` or any descendant in `trie.subtree[m_idx]` was moved out and not yet re-initialized.
 fn hasMovedUninitDescendant(
     trie: *const MovePathTrie,
@@ -4487,7 +4593,7 @@ fn detectRawPtrNullGuard(
         //! Local helper checking whether `val_raw` peels to a zero/null pointer constant.
 
         /// Returns `true` if `val_raw` in `body_ref` represents a null raw-pointer constant.
-        fn check(body_ref: *const MirBody, val_raw: u32) bool {
+        fn isZeroVal(body_ref: *const MirBody, val_raw: u32) bool {
             if (val_raw >= body_ref.insts.len) return false;
             var cur = body_ref.getInst(MirValueId.fromInt(val_raw));
             if (cur.op == .unary_op or cur.op == .copy_val) {
@@ -4499,7 +4605,7 @@ fn detectRawPtrNullGuard(
             const mc = body_ref.consts.items[cur.operands.lhs];
             return (mc == .int_val and mc.int_val == 0) or mc == .unit_val;
         }
-    }.check;
+    }.isZeroVal;
 
     const extractLoadedPtrLocal = struct {
         //! Local helper extracting the unprojected raw-pointer `LocalId` index loaded by `val_raw`.
@@ -4675,7 +4781,7 @@ fn applyCallStateTransitionSilent(
     const arg0_mode = body.call_arg_modes.items[call_site.modes_start];
     const arg0_word = body.extra_args.items[call_site.args_start];
 
-    // `PoolAllocator::free(&mut pool, ptr)`: marks `ptr` (arg 1) freed!
+    // `PoolAllocator::free(&mut pool, ptr)` marks `ptr` (`arg 1`) freed:
     if (call_site.args_len >= 2 and isPoolArgPlaceOrVal(body, pool, sym_table, arg0_mode, arg0_word)) {
         const ptr_mode = body.call_arg_modes.items[call_site.modes_start + 1];
         const ptr_word = body.extra_args.items[call_site.args_start + 1];
@@ -4831,14 +4937,14 @@ fn computeBlockStepHorizons(
             }
         },
         .call => {
-            if (term.cond_or_val < body.calls.items.len) {
-                const call_site = body.calls.items[term.cond_or_val];
-                // Exclude loans minted by this exact call's return view (`open_token == call_site.origin_token`):
-                for (horizon.loans, 0..) |loan, l_idx| {
-                    if (!loan.is_overflow_wildcard and loan.open_token == call_site.origin_token) {
-                        cur_loans.unset(l_idx);
-                    }
-                }
+            const call_idx = term.cond_or_val;
+            if (call_idx < body.calls.items.len) {
+                const call_site = body.calls.items[call_idx];
+                // Exclude non-wildcard loans minted by this exact call's return view:
+                const has_wild_set = loan_count == MAX_TRACKED_LOANS and
+                    cur_loans.isSet(MAX_TRACKED_LOANS - 1);
+                cur_loans.differenceInPlace(horizon.call_minted_mask[call_idx]);
+                if (has_wild_set) cur_loans.set(MAX_TRACKED_LOANS - 1);
                 term_loans_out.* = try cur_loans.clone(arena_alloc);
                 term_scratch_out.* = cur_scratch;
 
@@ -4885,13 +4991,9 @@ fn computeBlockStepHorizons(
         if ((inst.op == .place_addr or inst.op == .soa_column_slice) and
             inst.operands.lhs < trie.place_map.len)
         {
-            const lookup = trie.place_map[inst.operands.lhs];
-            for (horizon.loans, 0..) |loan, l_idx| {
-                if (!loan.is_overflow_wildcard and loan.path_id == lookup.id and
-                    loan.open_token == body.origin_tokens.items[val_idx])
-                {
-                    cur_loans.unset(l_idx);
-                }
+            const minted_loan = horizon.inst_minted_loan[val_idx];
+            if (minted_loan < loan_count and !horizon.loans[minted_loan].is_overflow_wildcard) {
+                cur_loans.unset(minted_loan);
             }
             const scratch_m = detectContextScratchAccess(
                 body,
@@ -5026,19 +5128,25 @@ fn planDropsForMovePath(
     if (m_idx >= trie.nodes.len) return;
     const node = trie.nodes[m_idx];
     const fl = node.flags();
-    if (!fl.is_auto_drop) return;
+    const is_decomposed_linear_struct = !fl.is_auto_drop and fl.is_linear and
+        !fl.is_custom_drop_struct and !node.first_child.isNone() and
+        trie.nodes[node.first_child.asInt()].proj_kind_raw == @backingInt(mir.ProjKind.field) and
+        !hasLiveLinearObligation(trie, state, m_idx);
+    if (!fl.is_auto_drop and !is_decomposed_linear_struct) return;
 
     const base_loc = body.locals.items[node.base_local];
     const leaf_ty = trie.node_types[m_idx];
     if (leaf_ty.isError() or leaf_ty == .unit_ty) return;
 
-    if (try isTrivialArenaDrop(perm_alloc, pool, sym_table, leaf_ty, base_loc.region_raw)) {
+    if (!is_decomposed_linear_struct and
+        try isTrivialArenaDrop(perm_alloc, pool, sym_table, leaf_ty, base_loc.region_raw))
+    {
         return;
     }
 
     // Decompose non-custom-`Drop` structs/tuples into per-field drops whenever fields have partial move or partial init:
-    var has_decomposable_fields = false;
-    if (!fl.is_custom_drop_struct and !node.first_child.isNone()) {
+    var has_decomposable_fields = is_decomposed_linear_struct;
+    if (!has_decomposable_fields and !fl.is_custom_drop_struct and !node.first_child.isNone()) {
         const first_kind = trie.nodes[node.first_child.asInt()].proj_kind_raw;
         if (first_kind == @backingInt(mir.ProjKind.field)) {
             if (state.maybe_uninit.isSet(m_idx)) {
@@ -5058,7 +5166,7 @@ fn planDropsForMovePath(
     }
 
     if (has_decomposable_fields) {
-        // Collect direct `.field` children and sort by `field_or_variant_ord DESC` (reverse declaration order!):
+        // Collect direct `.field` children and sort by `field_or_variant_ord DESC` (reverse declaration order):
         var children: std.ArrayListUnmanaged(usize) = .empty;
         var ch_id = node.first_child;
         while (!ch_id.isNone()) {
@@ -5070,10 +5178,10 @@ fn planDropsForMovePath(
         }
         std.mem.sortUnstable(usize, children.items, trie.nodes, struct {
             /// Orders child field indices in reverse field declaration order (`DESC`).
-            fn desc(nodes_slice: []const MovePathNode, lhs_i: usize, rhs_i: usize) bool {
+            fn isAfterFieldOrd(nodes_slice: []const MovePathNode, lhs_i: usize, rhs_i: usize) bool {
                 return nodes_slice[lhs_i].field_or_variant_ord > nodes_slice[rhs_i].field_or_variant_ord;
             }
-        }.desc);
+        }.isAfterFieldOrd);
 
         for (children.items) |ch_idx| {
             try planDropsForMovePath(
@@ -5458,8 +5566,9 @@ fn runPass2TypestateNllAndDrops(
                         }
 
                         // [b] `@linear` Completeness Law (`E0304`):
-                        if (lid < trie.direct_local_limit and trie.nodes[lid].flags().is_linear and
-                            work_state.maybe_init.isSet(lid) and !has_reported_path_diag[lid])
+                        if (lid < trie.direct_local_limit and
+                            hasLiveLinearObligation(trie, &work_state, lid) and
+                            !has_reported_path_diag[lid])
                         {
                             has_reported_path_diag[lid] = true;
                             outcome.emitted_error_count += 1;
@@ -6054,7 +6163,7 @@ fn runPass2TypestateNllAndDrops(
                         // [c] Live `@linear` overwrite (`E0304`) & live `AutoDrop` reassignment (`ElaborateDrops`):
                         if (!lookup.is_partial and (!has_leading_deref or is_safe_mut_deref) and pl_rec.base != 0) {
                             const m_flags = trie.nodes[m_idx].flags();
-                            if (m_flags.is_linear and work_state.maybe_init.isSet(m_idx) and !has_reported_path_diag[m_idx]) {
+                            if (hasLiveLinearObligation(trie, &work_state, m_idx) and !has_reported_path_diag[m_idx]) {
                                 has_reported_path_diag[m_idx] = true;
                                 outcome.emitted_error_count += 1;
                                 try emitSastDiag(
@@ -6068,7 +6177,7 @@ fn runPass2TypestateNllAndDrops(
                                     null,
                                     "consume or close the existing `@linear` value before reassigning this variable",
                                 );
-                            } else if (m_flags.is_auto_drop and work_state.maybe_init.isSet(m_idx)) {
+                            } else if ((m_flags.is_auto_drop or m_flags.is_linear) and work_state.maybe_init.isSet(m_idx)) {
                                 try planDropsForMovePath(
                                     arena_alloc,
                                     perm_alloc,
@@ -6247,7 +6356,7 @@ fn runPass2TypestateNllAndDrops(
                     }
                 } else if (param_mode == .sink_mode) {
                     const p_flags = trie.nodes[slot_i].flags();
-                    if (p_flags.is_linear and work_state.maybe_init.isSet(slot_i) and !has_reported_path_diag[slot_i]) {
+                    if (hasLiveLinearObligation(trie, &work_state, slot_i) and !has_reported_path_diag[slot_i]) {
                         has_reported_path_diag[slot_i] = true;
                         outcome.emitted_error_count += 1;
                         try emitSastDiag(
@@ -6261,7 +6370,7 @@ fn runPass2TypestateNllAndDrops(
                             null,
                             "consume or close the `sink` parameter on all normal and `?` return paths",
                         );
-                    } else if (p_flags.is_auto_drop and work_state.maybe_init.isSet(slot_i)) {
+                    } else if ((p_flags.is_auto_drop or p_flags.is_linear) and work_state.maybe_init.isSet(slot_i)) {
                         try planDropsForMovePath(
                             arena_alloc,
                             perm_alloc,
@@ -6310,23 +6419,34 @@ fn runPass2TypestateNllAndDrops(
 
             // [b] `D-04` `Context.scratch[0..2]` ping-pong aliasing conflict (`E0328`):
             var call_rewind_mask: u2 = 0;
+            var arg_live_scratch: u2 = 0;
             var is_forwarding_ctx = false;
+            const is_reset_call = isScratchResetCall(sym_table, call_site);
             for (0..call_site.args_len) |arg_i| {
                 const mode = body.call_arg_modes.items[call_site.modes_start + arg_i];
                 const word = body.extra_args.items[call_site.args_start + arg_i];
+                const is_ctx_arg = isContextArgPlaceOrVal(body, pool, sym_table, mode, word);
+                if (is_ctx_arg) is_forwarding_ctx = true;
                 if (mode != .let_mode and mode != .sink_mode and word < body.places.items.len) {
                     const sm = detectContextScratchAccess(body, pool, sym_table, PlaceId.fromInt(word));
                     scratch_touch |= sm;
-                    if (arg_i == 0 and sm != 0 and isScratchResetCall(sym_table, call_site)) {
+                    if (arg_i == 0 and sm != 0 and is_reset_call) {
                         call_rewind_mask |= sm;
+                    } else if (!is_ctx_arg) {
+                        const projs = body.getPlaceProjections(PlaceId.fromInt(word));
+                        const base_loc = body.places.items[word].base;
+                        if (projs.len > 0 and projs[0].kind == .deref and base_loc < local_count) {
+                            arg_live_scratch |= horizon.local_prov[base_loc].scratch_mask;
+                        }
                     }
                 } else if ((mode == .let_mode or mode == .sink_mode) and word < horizon.val_prov.len) {
                     const sm = horizon.val_prov[word].scratch_mask;
-                    if (arg_i == 0 and sm != 0 and isScratchResetCall(sym_table, call_site)) {
+                    if (arg_i == 0 and sm != 0 and is_reset_call) {
                         call_rewind_mask |= sm;
+                    } else if (!is_ctx_arg) {
+                        arg_live_scratch |= sm;
                     }
                 }
-                if (isContextArgPlaceOrVal(body, pool, sym_table, mode, word)) is_forwarding_ctx = true;
             }
             if (is_forwarding_ctx) {
                 if (callee_opt) |csum| {
@@ -6336,7 +6456,7 @@ fn runPass2TypestateNllAndDrops(
             }
             scratch_rewind |= call_rewind_mask;
 
-            if ((call_rewind_mask & term_scratch) != 0) {
+            if ((call_rewind_mask & (term_scratch | arg_live_scratch)) != 0) {
                 outcome.emitted_error_count += 1;
                 var open_tok: TokenIndex = .none;
                 for (horizon.val_prov) |vp| {
@@ -6671,7 +6791,7 @@ fn checkAndApplyCallFreeDiagnostics(
     if (extractExplicitFreeCallTarget(body, trie, pool, sym_table, call_site)) |lookup| {
         const m_idx = lookup.id.asInt();
         // Note: if `recv` was passed by consuming `sink self`, `ghost_storage_move` ran right before `.call`,
-        // so only `ever_freed` (from an EARLIER free/close!) indicates a duplicate close!
+        // so only `ever_freed` (from an earlier free/close) indicates a duplicate close:
         if (work_state.ever_freed.isSet(m_idx)) {
             outcome.emitted_error_count += 1;
             has_reported_path_diag[m_idx] = true;
@@ -6875,14 +6995,16 @@ fn materializePlannedDrops(
     }.run;
 
     const CallSetFlagEntry = struct {
-        //! Deferred `_drop_flag = true` update injected on a normal-return block after a `set`-mode call argument.
+        //! Deferred `_drop_flag` update injected on a normal-return block after a `set` or explicit-free call.
 
-        /// Normal-return successor block index where `flag_path` becomes initialized.
+        /// Normal-return successor block index where `flag_path` changes state.
         target_bb: u32,
-        /// `MovePathId` index of the `_drop_flag`-tracked path initialized by the `set` argument.
+        /// `MovePathId` index of the `_drop_flag`-tracked path updated by the call.
         flag_path: usize,
         /// Call-site origin token attached to the synthesized flag store.
         token: TokenIndex,
+        /// `true` for `set`-mode initialization; `false` for explicit `.free()` / `.close()` / `.deinit()`.
+        is_value_true: bool,
     };
     var call_set_entries: std.ArrayListUnmanaged(CallSetFlagEntry) = .empty;
     if (flagged_paths.items.len > 0) {
@@ -6904,8 +7026,21 @@ fn materializePlannedDrops(
                                 .target_bb = normal_target_bb,
                                 .flag_path = fm,
                                 .token = call_site.origin_token,
+                                .is_value_true = true,
                             });
                         }
+                    }
+                }
+            }
+            if (extractExplicitFreeCallTarget(body, trie, pool, sym_table, call_site)) |free_lk| {
+                for (flagged_paths.items) |fm| {
+                    if (trie.conflict[free_lk.id.asInt()].isSet(fm)) {
+                        try call_set_entries.append(arena_alloc, .{
+                            .target_bb = normal_target_bb,
+                            .flag_path = fm,
+                            .token = call_site.origin_token,
+                            .is_value_true = false,
+                        });
                     }
                 }
             }
@@ -6945,7 +7080,7 @@ fn materializePlannedDrops(
             try rebuilt_insts.append(arena_alloc, old_slice[param_prefix_len]);
         }
 
-        // Prepend `_drop_flag` initializers at top of `^bb0` and `set`-mode call-return flag writes:
+        // Prepend `_drop_flag` initializers at top of `^bb0` and call-return flag writes:
         if (flagged_paths.items.len > 0) {
             if (bb_idx == 0) {
                 for (flagged_paths.items) |m_idx| {
@@ -6958,20 +7093,23 @@ fn materializePlannedDrops(
                         .operands = .{ .lhs = f_lid.asInt(), .rhs = 0 },
                     }, .none);
                     try rebuilt_insts.append(arena_alloc, init_inst);
-                    const is_init_param = m_idx >= 1 and m_idx <= body.param_count and
-                        body.locals.items[m_idx].mode() == .sink_mode;
+                    const base_loc = trie.nodes[m_idx].base_local;
+                    const is_init_param = base_loc >= 1 and base_loc <= body.param_count and
+                        (body.locals.items[base_loc].mode() == .sink_mode or
+                            body.locals.items[base_loc].mode() == .inout_mode);
                     const init_c = if (is_init_param) true_const_opt.? else false_const_opt.?;
                     try emitFlagStore(body, &rebuilt_insts, arena_alloc, f_pl, init_c, .none);
                 }
             }
             for (call_set_entries.items) |set_entry| {
                 if (set_entry.target_bb == bb_idx) {
+                    const flag_c = if (set_entry.is_value_true) true_const_opt.? else false_const_opt.?;
                     try emitFlagStore(
                         body,
                         &rebuilt_insts,
                         arena_alloc,
                         flag_places[set_entry.flag_path],
-                        true_const_opt.?,
+                        flag_c,
                         set_entry.token,
                     );
                 }
@@ -7419,18 +7557,34 @@ fn evalBinOpIntv(
             return dst_dom.top_intv;
         },
         .umul_checked, .umul_sat => {
-            const prod_lo = lb.lo * rb.lo;
-            const prod_hi = lb.hi * rb.hi;
-            return encodeClippedI128ToIntv(@max(prod_lo, db.lo), @min(prod_hi, db.hi), dst_dom);
+            const lo_mul = @mulWithOverflow(lb.lo, rb.lo);
+            const hi_mul = @mulWithOverflow(lb.hi, rb.hi);
+            const prod_lo: i128 = if (lo_mul[1] != 0) db.hi + 1 else lo_mul[0];
+            const prod_hi: i128 = if (hi_mul[1] != 0) db.hi else hi_mul[0];
+            if (kind == .umul_checked and prod_lo > db.hi) return Intv.BOTTOM;
+            return encodeClippedI128ToIntv(@max(@min(prod_lo, db.hi), db.lo), @min(prod_hi, db.hi), dst_dom);
         },
         .smul_checked, .smul_sat, .mul_wrap => {
-            const p1 = lb.lo * rb.lo;
-            const p2 = lb.lo * rb.hi;
-            const p3 = lb.hi * rb.lo;
-            const p4 = lb.hi * rb.hi;
+            const clampedMul = struct {
+                //! Overflow-safe `i128` multiplication clamping extreme `u64`/`i64` products just outside `[lo_lim, hi_lim]`.
+
+                /// Multiplies `lhs_v * rhs_v`, mapping `i128` overflow to `lo_lim - 1` (negative) or `hi_lim + 1` (positive).
+                fn eval(lhs_v: i128, rhs_v: i128, lo_lim: i128, hi_lim: i128) i128 {
+                    const mul_res = @mulWithOverflow(lhs_v, rhs_v);
+                    if (mul_res[1] != 0) {
+                        return if ((lhs_v < 0) != (rhs_v < 0)) lo_lim - 1 else hi_lim + 1;
+                    }
+                    return mul_res[0];
+                }
+            }.eval;
+            const p1 = clampedMul(lb.lo, rb.lo, db.lo, db.hi);
+            const p2 = clampedMul(lb.lo, rb.hi, db.lo, db.hi);
+            const p3 = clampedMul(lb.hi, rb.lo, db.lo, db.hi);
+            const p4 = clampedMul(lb.hi, rb.hi, db.lo, db.hi);
             const min_p = @min(@min(p1, p2), @min(p3, p4));
             const max_p = @max(@max(p1, p2), @max(p3, p4));
             if (kind == .mul_wrap and (min_p < db.lo or max_p > db.hi)) return dst_dom.top_intv;
+            if (kind == .smul_checked and (min_p > db.hi or max_p < db.lo)) return Intv.BOTTOM;
             return encodeClippedI128ToIntv(@max(min_p, db.lo), @min(max_p, db.hi), dst_dom);
         },
         .udiv_checked => {
@@ -7623,13 +7777,35 @@ fn refineIntvPairFromCmp(
     return .{ .lhs_out = lhs_out, .rhs_out = rhs_out };
 }
 
+/// Discriminates direct root-local loads from direct vs. dereferenced `.slice_len` loads.
+const LoadedPlaceKind = enum(u8) {
+    /// Unprojected `place_load` of `base_local`.
+    root_local,
+    /// `base_local.len` (`proj_len == 1 and kind == .slice_len`).
+    direct_slice_len,
+    /// `(*base_local).len` (`proj_len == 2 and projs[0] == .deref and projs[1] == .slice_len`).
+    deref_slice_len,
+};
+
 /// Identifies an unprojected local or `.slice_len` projection loaded by `val_raw` (`null` otherwise).
 const LoadedPlaceKey = struct {
     /// Root `LocalId.asInt()`.
     base_local: u32,
-    /// `true` when `PlaceId` is `base_local.len` (`proj_len == 1 and kind == .slice_len`).
-    is_slice_len: bool,
+    /// Classification of the loaded place projection.
+    kind: LoadedPlaceKind,
+
+    /// Returns `true` if `self` represents either a direct or dereferenced `.slice_len` load.
+    inline fn isSliceLen(self: LoadedPlaceKey) bool {
+        return self.kind != .root_local;
+    }
 };
+
+/// Returns `true` if `base_local` in `body` is a shared immutable reference (`&T` / `.ref_ty`).
+inline fn isSharedRefLocal(body: *const MirBody, pool: *const InternPool, base_local: u32) bool {
+    if (base_local >= body.locals.items.len) return false;
+    const unwrapped = pool.unwrapUnderlyingType(body.locals.items[base_local].type_id);
+    return !unwrapped.isError() and pool.getNode(unwrapped).tag == .ref_ty;
+}
 
 /// Extracts a `LoadedPlaceKey` when `val_raw` is a `place_load` of a root local or `.slice_len`.
 fn extractLoadedPlaceKey(body: *const MirBody, val_raw: u32) ?LoadedPlaceKey {
@@ -7639,14 +7815,14 @@ fn extractLoadedPlaceKey(body: *const MirBody, val_raw: u32) ?LoadedPlaceKey {
     if (inst.op != .place_load or inst.operands.lhs >= body.places.items.len) return null;
     const pl_rec = body.places.items[inst.operands.lhs];
     if (pl_rec.proj_len == 0) {
-        return .{ .base_local = pl_rec.base, .is_slice_len = false };
+        return .{ .base_local = pl_rec.base, .kind = .root_local };
     }
     const projs = body.getPlaceProjections(PlaceId.fromInt(inst.operands.lhs));
     if (projs.len == 1 and projs[0].kind == .slice_len) {
-        return .{ .base_local = pl_rec.base, .is_slice_len = true };
+        return .{ .base_local = pl_rec.base, .kind = .direct_slice_len };
     }
     if (projs.len == 2 and projs[0].kind == .deref and projs[1].kind == .slice_len) {
-        return .{ .base_local = pl_rec.base, .is_slice_len = true };
+        return .{ .base_local = pl_rec.base, .kind = .deref_slice_len };
     }
     return null;
 }
@@ -7855,13 +8031,13 @@ fn readDomRefinedIntv(
         }
     }
     if (extractLoadedPlaceKey(body, peeled)) |pkey| {
-        if (pkey.is_slice_len and pkey.base_local < slice_len_overrides.len and
+        if (pkey.isSliceLen() and pkey.base_local < slice_len_overrides.len and
             local_store_counts[pkey.base_local] <= 1)
         {
             if (slice_len_overrides[pkey.base_local]) |sl_ov| {
                 cur_iv = cur_iv.meet(sl_ov);
             }
-        } else if (!pkey.is_slice_len and pkey.base_local < local_overrides.len and
+        } else if (!pkey.isSliceLen() and pkey.base_local < local_overrides.len and
             local_store_counts[pkey.base_local] <= 1)
         {
             if (local_overrides[pkey.base_local]) |loc_ov| {
@@ -7875,6 +8051,7 @@ fn readDomRefinedIntv(
 /// Populates dominating `cond_br` refinements for `bb_idx` into `val_overrides`, `local_overrides`, and `slice_len_overrides`.
 fn populateBlockDomOverrides(
     body: *const MirBody,
+    pool: *const InternPool,
     dom: *const DominatorTree,
     bb_idx: u32,
     val_domains: []const ?ScalarIntDomain,
@@ -7945,14 +8122,16 @@ fn populateBlockDomOverrides(
                         refined.rhs_out;
 
                     if (extractLoadedPlaceKey(body, cmp.lhs_val)) |lkey| {
-                        if (lkey.is_slice_len and lkey.base_local < local_count and
+                        const is_immut_len = (lkey.kind == .direct_slice_len) or
+                            (lkey.kind == .deref_slice_len and isSharedRefLocal(body, pool, lkey.base_local));
+                        if (is_immut_len and lkey.base_local < local_count and
                             local_store_counts[lkey.base_local] <= 1)
                         {
                             slice_len_overrides[lkey.base_local] = if (slice_len_overrides[lkey.base_local]) |prev|
                                 prev.meet(refined.lhs_out)
                             else
                                 refined.lhs_out;
-                        } else if (!lkey.is_slice_len and lkey.base_local < local_count and
+                        } else if (!lkey.isSliceLen() and lkey.base_local < local_count and
                             local_store_counts[lkey.base_local] <= 1)
                         {
                             local_overrides[lkey.base_local] = if (local_overrides[lkey.base_local]) |prev|
@@ -7962,14 +8141,16 @@ fn populateBlockDomOverrides(
                         }
                     }
                     if (extractLoadedPlaceKey(body, cmp.rhs_val)) |rkey| {
-                        if (rkey.is_slice_len and rkey.base_local < local_count and
+                        const is_immut_len = (rkey.kind == .direct_slice_len) or
+                            (rkey.kind == .deref_slice_len and isSharedRefLocal(body, pool, rkey.base_local));
+                        if (is_immut_len and rkey.base_local < local_count and
                             local_store_counts[rkey.base_local] <= 1)
                         {
                             slice_len_overrides[rkey.base_local] = if (slice_len_overrides[rkey.base_local]) |prev|
                                 prev.meet(refined.rhs_out)
                             else
                                 refined.rhs_out;
-                        } else if (!rkey.is_slice_len and rkey.base_local < local_count and
+                        } else if (!rkey.isSliceLen() and rkey.base_local < local_count and
                             local_store_counts[rkey.base_local] <= 1)
                         {
                             local_overrides[rkey.base_local] = if (local_overrides[rkey.base_local]) |prev|
@@ -8015,14 +8196,18 @@ fn isCheckedInstProvenSafeByIntv(
             return switch (bk) {
                 .sadd_checked, .uadd_checked => (lb.lo + rb.lo >= db.lo) and (lb.hi + rb.hi <= db.hi),
                 .ssub_checked, .usub_checked => (lb.lo - rb.hi >= db.lo) and (lb.hi - rb.lo <= db.hi),
-                .umul_checked => (lb.hi * rb.hi <= db.hi),
+                .umul_checked => blk: {
+                    const hi_mul = @mulWithOverflow(lb.hi, rb.hi);
+                    break :blk hi_mul[1] == 0 and hi_mul[0] <= db.hi;
+                },
                 .smul_checked => blk: {
-                    const p1 = lb.lo * rb.lo;
-                    const p2 = lb.lo * rb.hi;
-                    const p3 = lb.hi * rb.lo;
-                    const p4 = lb.hi * rb.hi;
-                    const min_p = @min(@min(p1, p2), @min(p3, p4));
-                    const max_p = @max(@max(p1, p2), @max(p3, p4));
+                    const m1 = @mulWithOverflow(lb.lo, rb.lo);
+                    const m2 = @mulWithOverflow(lb.lo, rb.hi);
+                    const m3 = @mulWithOverflow(lb.hi, rb.lo);
+                    const m4 = @mulWithOverflow(lb.hi, rb.hi);
+                    if ((m1[1] | m2[1] | m3[1] | m4[1]) != 0) break :blk false;
+                    const min_p = @min(@min(m1[0], m2[0]), @min(m3[0], m4[0]));
+                    const max_p = @max(@max(m1[0], m2[0]), @max(m3[0], m4[0]));
                     break :blk min_p >= db.lo and max_p <= db.hi;
                 },
                 .udiv_checked, .urem_checked => rb.lo >= 1,
@@ -8170,26 +8355,42 @@ fn runPass4IntervalsAndPentagonBce(
     @memset(local_store_counts, 0);
     const local_unique_val = try arena_alloc.alloc(u32, local_count);
     @memset(local_unique_val, mir.NONE_U32);
+    const local_unique_bb = try arena_alloc.alloc(u32, local_count);
+    @memset(local_unique_bb, mir.NONE_U32);
 
-    for (0..inst_count) |v_idx| {
-        const inst = body.getInst(MirValueId.fromInt(@intCast(v_idx)));
-        if (inst.op == .place_store and inst.operands.lhs < body.places.items.len) {
-            const pl_rec = body.places.items[inst.operands.lhs];
-            if (pl_rec.base < local_count) {
-                local_store_counts[pl_rec.base] +|= 1;
-                if (pl_rec.proj_len == 0 and local_store_counts[pl_rec.base] == 1) {
-                    local_unique_val[pl_rec.base] = inst.operands.rhs;
-                } else {
-                    local_unique_val[pl_rec.base] = mir.NONE_U32;
+    // Count caller-initialized formal parameters (`mode != .set_mode`) as 1 entry store:
+    for (1..local_count) |loc_i| {
+        const loc = body.locals.items[loc_i];
+        if (loc.flags().is_arg and loc.mode() != .set_mode) {
+            local_store_counts[loc_i] = 1;
+        }
+    }
+
+    for (0..block_count) |b_usize| {
+        const b_u32: u32 = @intCast(b_usize);
+        for (body.getBlockInsts(MirBlockId.fromInt(b_u32))) |inst_vid| {
+            const inst = body.getInst(inst_vid);
+            if (inst.op == .place_store and inst.operands.lhs < body.places.items.len) {
+                const pl_rec = body.places.items[inst.operands.lhs];
+                if (pl_rec.base < local_count) {
+                    local_store_counts[pl_rec.base] +|= 1;
+                    if (pl_rec.proj_len == 0 and local_store_counts[pl_rec.base] == 1) {
+                        local_unique_val[pl_rec.base] = inst.operands.rhs;
+                        local_unique_bb[pl_rec.base] = b_u32;
+                    } else {
+                        local_unique_val[pl_rec.base] = mir.NONE_U32;
+                        local_unique_bb[pl_rec.base] = mir.NONE_U32;
+                    }
                 }
-            }
-        } else if (inst.op == .place_addr and inst.operands.lhs < body.places.items.len) {
-            const unwrapped = pool.unwrapUnderlyingType(inst.type_id);
-            if (!unwrapped.isError() and pool.getNode(unwrapped).tag != .ref_ty) {
-                const base = body.places.items[inst.operands.lhs].base;
-                if (base < local_count) {
-                    local_store_counts[base] = 2;
-                    local_unique_val[base] = mir.NONE_U32;
+            } else if (inst.op == .place_addr and inst.operands.lhs < body.places.items.len) {
+                const unwrapped = pool.unwrapUnderlyingType(inst.type_id);
+                if (!unwrapped.isError() and pool.getNode(unwrapped).tag != .ref_ty) {
+                    const base = body.places.items[inst.operands.lhs].base;
+                    if (base < local_count) {
+                        local_store_counts[base] = 2;
+                        local_unique_val[base] = mir.NONE_U32;
+                        local_unique_bb[base] = mir.NONE_U32;
+                    }
                 }
             }
         }
@@ -8203,6 +8404,7 @@ fn runPass4IntervalsAndPentagonBce(
                 if (base < local_count) {
                     local_store_counts[base] = 2;
                     local_unique_val[base] = mir.NONE_U32;
+                    local_unique_bb[base] = mir.NONE_U32;
                 }
             }
         }
@@ -8331,6 +8533,7 @@ fn runPass4IntervalsAndPentagonBce(
             // Collect dominating `cond_br` interval refinements active on entry to `bb_idx`:
             populateBlockDomOverrides(
                 body,
+                pool,
                 dom,
                 bb_idx,
                 val_domains,
@@ -8369,15 +8572,19 @@ fn runPass4IntervalsAndPentagonBce(
                         if (extractStaticArrayLenPlace(body, pool, sym_table, pl_id)) |arr_len| {
                             new_iv = Intv.initUnsigned(arr_len, arr_len);
                         } else if (extractLoadedPlaceKey(body, v_idx)) |pkey| {
-                            if (pkey.is_slice_len and pkey.base_local < local_count and
+                            if (pkey.isSliceLen() and pkey.base_local < local_count and
                                 local_store_counts[pkey.base_local] <= 1)
                             {
                                 if (slice_len_overrides[pkey.base_local]) |sl_ov| {
                                     new_iv = new_iv.meet(sl_ov);
                                 }
-                            } else if (!pkey.is_slice_len and pkey.base_local < local_count) {
+                            } else if (!pkey.isSliceLen() and pkey.base_local < local_count) {
                                 const uniq_v = local_unique_val[pkey.base_local];
-                                if (uniq_v < inst_count and !val_intv[uniq_v].isBottom()) {
+                                const uniq_bb = local_unique_bb[pkey.base_local];
+                                if (uniq_v < inst_count and uniq_bb < block_count and
+                                    dom.isDominatorOf(MirBlockId.fromInt(uniq_bb), bb_id) and
+                                    !val_intv[uniq_v].isBottom())
+                                {
                                     new_iv = readDomRefinedIntv(
                                         body,
                                         uniq_v,
@@ -8550,6 +8757,16 @@ fn runPass4IntervalsAndPentagonBce(
         }
     }
 
+    // Fail-closed soundness guard if the 24-iteration `Intv` RPO loop did not converge:
+    if (has_intv_changed) {
+        for (0..block_count) |b_i| {
+            is_intv_reachable[b_i] = dom.isReachable(MirBlockId.fromInt(@intCast(b_i)));
+        }
+        for (0..inst_count) |v_i| {
+            val_intv[v_i] = if (val_domains[v_i]) |vd| vd.top_intv else Intv.TOP_ORD;
+        }
+    }
+
     // [3] Step 1 Discharge: rewrite proven `.narrow_check`, `.bounds_check`, `.slice_range_check` & emit `E0406`/`E0307`:
     var unit_const_opt: ?u32 = null;
     var unproven_checks: std.ArrayListUnmanaged(PendingBceCheck) = .empty;
@@ -8558,6 +8775,7 @@ fn runPass4IntervalsAndPentagonBce(
         if (!is_intv_reachable[bb_idx]) continue;
         populateBlockDomOverrides(
             body,
+            pool,
             dom,
             bb_idx,
             val_domains,
@@ -8764,33 +8982,44 @@ fn runPass4IntervalsAndPentagonBce(
     if (unproven_checks.items.len > 0 and outcome.emitted_error_count == 0) {
         // Canonicalize `copy_val`, single-store local `place_load`, and `.slice_len` `place_load` roots:
         const canon_val = try arena_alloc.alloc(u32, inst_count);
+        for (0..inst_count) |v_idx| {
+            canon_val[v_idx] = peelCopyValId(body, @intCast(v_idx));
+        }
         const first_slice_len_val = try arena_alloc.alloc(u32, local_count);
         @memset(first_slice_len_val, mir.NONE_U32);
         const first_unmut_load_val = try arena_alloc.alloc(u32, local_count);
         @memset(first_unmut_load_val, mir.NONE_U32);
 
-        for (0..inst_count) |v_idx| {
-            const peeled = peelCopyValId(body, @intCast(v_idx));
-            canon_val[v_idx] = peeled;
-            if (extractLoadedPlaceKey(body, peeled)) |pkey| {
-                if (pkey.is_slice_len and pkey.base_local < local_count and
-                    local_store_counts[pkey.base_local] <= 1)
-                {
-                    if (first_slice_len_val[pkey.base_local] == mir.NONE_U32) {
-                        first_slice_len_val[pkey.base_local] = peeled;
-                    }
-                    canon_val[v_idx] = first_slice_len_val[pkey.base_local];
-                } else if (!pkey.is_slice_len and pkey.base_local < local_count and
-                    local_store_counts[pkey.base_local] <= 1)
-                {
-                    const uniq_v = local_unique_val[pkey.base_local];
-                    if (uniq_v < inst_count) {
-                        canon_val[v_idx] = peelCopyValId(body, uniq_v);
-                    } else {
-                        if (first_unmut_load_val[pkey.base_local] == mir.NONE_U32) {
-                            first_unmut_load_val[pkey.base_local] = peeled;
+        for (0..block_count) |b_usize| {
+            const load_bb = MirBlockId.fromInt(@intCast(b_usize));
+            for (body.getBlockInsts(load_bb)) |inst_vid| {
+                const v_idx = inst_vid.asInt();
+                const peeled = canon_val[v_idx];
+                if (extractLoadedPlaceKey(body, peeled)) |pkey| {
+                    const is_immut_len = (pkey.kind == .direct_slice_len) or
+                        (pkey.kind == .deref_slice_len and isSharedRefLocal(body, pool, pkey.base_local));
+                    if (is_immut_len and pkey.base_local < local_count and
+                        local_store_counts[pkey.base_local] <= 1)
+                    {
+                        if (first_slice_len_val[pkey.base_local] == mir.NONE_U32) {
+                            first_slice_len_val[pkey.base_local] = peeled;
                         }
-                        canon_val[v_idx] = first_unmut_load_val[pkey.base_local];
+                        canon_val[v_idx] = first_slice_len_val[pkey.base_local];
+                    } else if (!pkey.isSliceLen() and pkey.base_local < local_count and
+                        local_store_counts[pkey.base_local] <= 1)
+                    {
+                        const uniq_v = local_unique_val[pkey.base_local];
+                        const uniq_bb = local_unique_bb[pkey.base_local];
+                        if (uniq_v < inst_count and uniq_bb < block_count and
+                            dom.isDominatorOf(MirBlockId.fromInt(uniq_bb), load_bb))
+                        {
+                            canon_val[v_idx] = peelCopyValId(body, uniq_v);
+                        } else if (uniq_v == mir.NONE_U32) {
+                            if (first_unmut_load_val[pkey.base_local] == mir.NONE_U32) {
+                                first_unmut_load_val[pkey.base_local] = peeled;
+                            }
+                            canon_val[v_idx] = first_unmut_load_val[pkey.base_local];
+                        }
                     }
                 }
             }
@@ -8920,6 +9149,7 @@ fn runPass4IntervalsAndPentagonBce(
 
                 populateBlockDomOverrides(
                     body,
+                    pool,
                     dom,
                     bb_idx,
                     val_domains,
@@ -9328,6 +9558,7 @@ fn runPass4IntervalsAndPentagonBce(
         if (!is_intv_reachable[bb_idx]) continue;
         populateBlockDomOverrides(
             body,
+            pool,
             dom,
             bb_idx,
             val_domains,
@@ -9557,7 +9788,9 @@ fn isUnmutatedCallableLocal(
     max_stores: u32,
 ) bool {
     if (base_local >= body.locals.items.len) return false;
-    var store_count: u32 = 0;
+    const base_decl = body.locals.items[base_local];
+    var store_count: u32 = if (base_decl.flags().is_arg and base_decl.mode() != .set_mode) 1 else 0;
+    if (store_count > max_stores) return false;
     for (0..body.insts.len) |scan_i| {
         const inst = body.getInst(MirValueId.fromInt(@intCast(scan_i)));
         if (inst.op == .place_store and inst.operands.lhs < body.places.items.len) {
@@ -9584,10 +9817,11 @@ fn isUnmutatedCallableLocal(
     return true;
 }
 
-/// Infers conservative indirect call effects from a callable SSA value's `FnSignatureView`.
+/// Infers conservative indirect call effects from a callable SSA value's `FnSignatureView` or `dyn Trait` ceiling.
 fn inferCallableTypeIndirectEffects(
     body: *const MirBody,
     pool: *const InternPool,
+    sym_table: *const SymbolTable,
     val_raw: u32,
 ) EffectCapabilityMask {
     var ind_eff = EffectCapabilityMask{
@@ -9597,13 +9831,49 @@ fn inferCallableTypeIndirectEffects(
         .indirect_opaque = true,
     };
     if (val_raw < body.insts.len) {
-        const c_ty = pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(val_raw)).type_id);
-        if (!c_ty.isError() and pool.getNode(c_ty).tag != .dyn_trait_ty) {
-            if (pool.getFnSignatureView(c_ty)) |sig_v| {
-                ind_eff.alloc = !sig_v.contracts.has_no_alloc;
-                ind_eff.may_panic = !sig_v.contracts.has_no_panic;
-                ind_eff.blocking_sync = !sig_v.contracts.has_no_block;
-                ind_eff.indirect_opaque = !sig_v.contracts.hasAny();
+        const raw_ty = body.getInst(MirValueId.fromInt(val_raw)).type_id;
+        if (extractDynTraitSymbol(pool, raw_ty)) |trait_sym_idx| {
+            if (trait_sym_idx.asInt() < sym_table.symbols.items.len) {
+                const trait_sym = sym_table.getSymbol(trait_sym_idx).*;
+                var has_no_alloc = trait_sym.contract_flags.is_no_alloc;
+                var has_no_panic = trait_sym.contract_flags.is_no_panic;
+                var has_no_block = trait_sym.contract_flags.is_no_block;
+                if (!trait_sym.target_scope.isNone()) {
+                    var has_any_fn = false;
+                    var is_all_no_alloc = true;
+                    var is_all_no_panic = true;
+                    var is_all_no_block = true;
+                    for (sym_table.getScopeMembers(trait_sym.target_scope)) |t_mem_idx| {
+                        const t_mem = sym_table.getSymbol(t_mem_idx).*;
+                        if (t_mem.kind != .fn_sym) continue;
+                        has_any_fn = true;
+                        if (!t_mem.contract_flags.is_no_alloc) is_all_no_alloc = false;
+                        if (!t_mem.contract_flags.is_no_panic) is_all_no_panic = false;
+                        if (!t_mem.contract_flags.is_no_block) is_all_no_block = false;
+                    }
+                    if (has_any_fn) {
+                        has_no_alloc = has_no_alloc or is_all_no_alloc;
+                        has_no_panic = has_no_panic or is_all_no_panic;
+                        has_no_block = has_no_block or is_all_no_block;
+                    }
+                }
+                ind_eff.alloc = !has_no_alloc;
+                ind_eff.may_panic = !has_no_panic;
+                ind_eff.blocking_sync = !has_no_block;
+                ind_eff.indirect_opaque = !(has_no_alloc or has_no_panic or has_no_block);
+            }
+        } else {
+            var c_ty = pool.unwrapUnderlyingType(raw_ty);
+            if (!c_ty.isError() and (pool.getNode(c_ty).tag == .ref_ty or pool.getNode(c_ty).tag == .mut_ref_ty)) {
+                c_ty = pool.unwrapUnderlyingType(TypeId.fromInt(pool.getNode(c_ty).lhs));
+            }
+            if (!c_ty.isError()) {
+                if (pool.getFnSignatureView(c_ty)) |sig_v| {
+                    ind_eff.alloc = !sig_v.contracts.has_no_alloc;
+                    ind_eff.may_panic = !sig_v.contracts.has_no_panic;
+                    ind_eff.blocking_sync = !sig_v.contracts.has_no_block;
+                    ind_eff.indirect_opaque = !sig_v.contracts.hasAny();
+                }
             }
         }
     }
@@ -9624,7 +9894,7 @@ fn extractFormalCallbackParamOrd(
     if (pl_rec.proj_len != 0) return null;
     if (pl_rec.base >= 1 and pl_rec.base <= body.param_count) {
         const param_ord = pl_rec.base - 1;
-        if (param_ord < 16 and isUnmutatedCallableLocal(body, pool, pl_rec.base, 0)) {
+        if (param_ord < 16 and isUnmutatedCallableLocal(body, pool, pl_rec.base, 1)) {
             return @intCast(param_ord);
         }
     }
@@ -9836,12 +10106,23 @@ fn collectVacatedWindowSlices(
         const cur_bb = queue.items[q_head];
         const cur_insts = body.getBlockInsts(MirBlockId.fromInt(cur_bb));
         const slice_lo: usize = if (cur_bb == start_bb) @min(start_pos, cur_insts.len) else 0;
-        const is_stopping_in_cur = (cur_bb == end_bb) and (end_close_pos != null or end_bb != start_bb or cur_insts.len > slice_lo);
-        const slice_hi: usize = if (cur_bb == end_bb and end_close_pos != null)
-            @min(end_close_pos.?, cur_insts.len)
+        var local_close_pos: ?usize = if (cur_bb == end_bb) end_close_pos else null;
+        if (local_close_pos == null and !win.access_token.isNone() and slice_lo < cur_insts.len) {
+            for (cur_insts[slice_lo..], slice_lo..) |vid, pos| {
+                const inst = body.getInst(vid);
+                if (inst.op == .ghost_access_end and inst.operands.lhs == win.access_token.asInt()) {
+                    local_close_pos = pos;
+                    break;
+                }
+            }
+        }
+        const is_stopping_in_cur = (local_close_pos != null) or
+            (cur_bb == end_bb and (end_bb != start_bb or cur_insts.len > slice_lo));
+        const slice_hi: usize = if (local_close_pos) |close_pos|
+            @min(close_pos, cur_insts.len)
         else
             cur_insts.len;
-        const has_terminator = !(cur_bb == end_bb and end_close_pos != null);
+        const has_terminator = (local_close_pos == null) and !(cur_bb == end_bb and end_close_pos != null);
 
         try out_slices.append(allocator, .{
             .bb_idx = cur_bb,
@@ -9850,7 +10131,7 @@ fn collectVacatedWindowSlices(
             .has_terminator = has_terminator,
         });
 
-        if (is_stopping_in_cur and end_close_pos != null) continue;
+        if (is_stopping_in_cur and local_close_pos != null) continue;
         if (cur_bb == end_bb and cur_bb != start_bb) continue;
 
         for (body.getOutgoingEdges(MirBlockId.fromInt(cur_bb))) |edge| {
@@ -10005,6 +10286,7 @@ fn verifyElaboratedMirBody(
 /// Runs Pass 3 across all `bodies` in bottom-up Tarjan SCC order, populating `FnSummaryStore` & `PackageCapSummary`.
 fn runPass3SummaryContractsAndSandbox(
     allocator: std.mem.Allocator,
+    scratch_arena: *BumpArena,
     bodies: []MirBody,
     scc_sched: *const SccSchedule,
     pass2_outcomes: []const Pass2BodyOutcome,
@@ -10023,6 +10305,8 @@ fn runPass3SummaryContractsAndSandbox(
 
     // [1] Compute body-local direct effects, `own_frame_bytes`, `forwarded_cb_mask`, and outgoing edges:
     for (bodies, 0..) |*body, slot_usize| {
+        const cp = scratch_arena.checkpoint();
+        defer scratch_arena.restore(cp);
         const slot_idx: u32 = @intCast(slot_usize);
         var direct_eff = EffectCapabilityMask.EMPTY;
         var contracts = summaries[slot_idx].contractsScratch();
@@ -10048,7 +10332,11 @@ fn runPass3SummaryContractsAndSandbox(
                 sym.contract_flags.is_export or
                 sym.contract_flags.has_link_name or
                 sym.contract_flags.has_link_section;
-            if (sym.flags.is_extern) {
+            if (sym.flags.is_extern or
+                sym.contract_flags.is_export or
+                sym.contract_flags.has_link_name or
+                sym.contract_flags.has_link_section)
+            {
                 direct_eff.ffi = true;
                 direct_eff.unsafe_op = true;
             }
@@ -10064,12 +10352,13 @@ fn runPass3SummaryContractsAndSandbox(
             direct_eff.may_panic = true;
         }
 
-        // Track direct `fn_addr` instructions used purely as `.call` callees so we only mark reified ones:
-        var direct_call_callee_vals = std.AutoHashMapUnmanaged(u32, void){};
-        defer direct_call_callee_vals.deinit(allocator);
+        // Track direct `fn_addr` instructions used purely as `.call` callees in $O(1)$ via `DenseBitSet`:
+        var direct_call_callee_vals = try DenseBitSet.initEmpty(scratch_arena.asAllocator(), body.insts.len);
         for (body.calls.items) |cs| {
-            if (!cs.direct_def_id.isNone() or !cs.direct_symbol.isNone()) {
-                try direct_call_callee_vals.put(allocator, cs.callee_val.asInt(), {});
+            if ((!cs.direct_def_id.isNone() or !cs.direct_symbol.isNone()) and
+                cs.callee_val.asInt() < body.insts.len)
+            {
+                direct_call_callee_vals.set(cs.callee_val.asInt());
             }
         }
 
@@ -10099,7 +10388,7 @@ fn runPass3SummaryContractsAndSandbox(
                     }
                 },
                 .fn_addr => {
-                    if (!direct_call_callee_vals.contains(@intCast(v_idx))) {
+                    if (!direct_call_callee_vals.isSet(v_idx)) {
                         var target_key: u32 = inst.operands.lhs;
                         var reify_eff: u16 = 0;
                         const fn_def = if (inst.operands.lhs != mir.NONE_U32)
@@ -10129,7 +10418,7 @@ fn runPass3SummaryContractsAndSandbox(
                             } else if (!fn_sym.isNone() and fn_sym.asInt() < sym_table.symbols.items.len) {
                                 const t_sym = sym_table.getSymbol(fn_sym).*;
                                 if (t_sym.contract_flags.is_std_cap_boundary) {
-                                    reify_eff = extractBoundaryMasksForSymbol(t_sym, config).emits &
+                                    reify_eff = extractBoundaryMasksForSymbol(t_sym, body.file_id, config).emits &
                                         EffectCapabilityMask.LOCKFILE_CAP_BITS;
                                 } else {
                                     reify_eff = inferExternalPrototypeEffects(t_sym).asBits() &
@@ -10148,6 +10437,62 @@ fn runPass3SummaryContractsAndSandbox(
                                 .edge_effects_bits = reify_eff,
                             },
                         ));
+                    }
+                },
+                .copy_val, .unary_op => {
+                    if (inst.operands.lhs < body.insts.len) {
+                        if (extractDynTraitSymbol(pool, inst.type_id)) |trait_sym_idx| {
+                            const src_ty = body.getInst(MirValueId.fromInt(inst.operands.lhs)).type_id;
+                            if (extractDynTraitSymbol(pool, src_ty) == null) {
+                                if (extractConcreteNominalSymbol(pool, src_ty)) |nom_sym_idx| {
+                                    if (nom_sym_idx.asInt() < sym_table.symbols.items.len) {
+                                        const nom_sym = sym_table.getSymbol(nom_sym_idx).*;
+                                        if (!nom_sym.target_scope.isNone()) {
+                                            for (sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
+                                                const mem_sym = sym_table.getSymbol(mem_idx).*;
+                                                if (mem_sym.kind != .fn_sym) continue;
+                                                if (sym_table.impl_method_trait.get(mem_idx.asInt()) != trait_sym_idx) continue;
+                                                var vtbl_key: u32 = mem_sym.def_id.asInt();
+                                                var vtbl_eff: u16 = 0;
+                                                if (sym_to_slot.get(mem_idx.asInt())) |m_slot| {
+                                                    vtbl_key = nodeKeyForBody(&bodies[m_slot], m_slot);
+                                                }
+                                                if (key_to_slot.get(vtbl_key) == null) {
+                                                    if (try lookupCalleeSummary(
+                                                        mem_sym.def_id,
+                                                        mem_idx,
+                                                        summaries,
+                                                        key_to_slot,
+                                                        sym_to_slot,
+                                                        config,
+                                                    )) |ext_vt_sum| {
+                                                        vtbl_eff = ext_vt_sum.inferred_effects_bits &
+                                                            EffectCapabilityMask.LOCKFILE_CAP_BITS;
+                                                    } else if (mem_sym.contract_flags.is_std_cap_boundary) {
+                                                        vtbl_eff = extractBoundaryMasksForSymbol(
+                                                            mem_sym,
+                                                            body.file_id,
+                                                            config,
+                                                        ).emits & EffectCapabilityMask.LOCKFILE_CAP_BITS;
+                                                    } else {
+                                                        vtbl_eff = inferExternalPrototypeEffects(mem_sym).asBits() &
+                                                            EffectCapabilityMask.LOCKFILE_CAP_BITS;
+                                                    }
+                                                }
+                                                try per_body_edges[slot_usize].append(allocator, WitnessCallEdge.init(
+                                                    vtbl_key,
+                                                    tok,
+                                                    .{
+                                                        .edge_kind = .reify_vtable,
+                                                        .edge_effects_bits = vtbl_eff,
+                                                    },
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 },
                 else => {},
@@ -10204,7 +10549,9 @@ fn runPass3SummaryContractsAndSandbox(
                                 } else if (extractFormalCallbackParamOrd(body, pool, MirValueId.fromInt(word))) |caller_cb_ord| {
                                     cb_mask |= (@as(u16, 1) << caller_cb_ord);
                                 } else {
-                                    ext_eff = ext_eff.unionWith(inferCallableTypeIndirectEffects(body, pool, word));
+                                    ext_eff = ext_eff.unionWith(
+                                        inferCallableTypeIndirectEffects(body, pool, sym_table, word),
+                                    );
                                 }
                             }
                         }
@@ -10212,7 +10559,9 @@ fn runPass3SummaryContractsAndSandbox(
                 } else if (!cs.direct_symbol.isNone() and cs.direct_symbol.asInt() < sym_table.symbols.items.len) {
                     const c_sym = sym_table.getSymbol(cs.direct_symbol).*;
                     if (c_sym.contract_flags.is_std_cap_boundary) {
-                        ext_eff = EffectCapabilityMask.fromBits(extractBoundaryMasksForSymbol(c_sym, config).emits);
+                        ext_eff = EffectCapabilityMask.fromBits(
+                            extractBoundaryMasksForSymbol(c_sym, body.file_id, config).emits,
+                        );
                     } else {
                         const is_recv_arena = cs.args_len > 0 and isArenaArgPlaceOrVal(
                             body,
@@ -10258,13 +10607,12 @@ fn runPass3SummaryContractsAndSandbox(
                         .{ .edge_kind = .direct_call },
                     ));
                 } else {
-                    const ind_eff = inferCallableTypeIndirectEffects(body, pool, cs.callee_val.asInt());
+                    const ind_eff = inferCallableTypeIndirectEffects(body, pool, sym_table, cs.callee_val.asInt());
                     var e_kind: WitnessEdgeKind = .indirect_fn_ptr;
-                    if (cs.callee_val.asInt() < body.insts.len) {
-                        const c_ty = pool.unwrapUnderlyingType(body.getInst(cs.callee_val).type_id);
-                        if (!c_ty.isError() and pool.getNode(c_ty).tag == .dyn_trait_ty) {
-                            e_kind = .indirect_vtable;
-                        }
+                    if (cs.callee_val.asInt() < body.insts.len and
+                        extractDynTraitSymbol(pool, body.getInst(cs.callee_val).type_id) != null)
+                    {
+                        e_kind = .indirect_vtable;
                     }
 
                     if (cb_ord_opt != null) {
@@ -10376,7 +10724,7 @@ fn runPass3SummaryContractsAndSandbox(
                         {
                             const cb_sym = sym_table.getSymbol(cb_target.sym_idx).*;
                             const cb_eff = if (cb_sym.contract_flags.is_std_cap_boundary)
-                                extractBoundaryMasksForSymbol(cb_sym, config).emits
+                                extractBoundaryMasksForSymbol(cb_sym, body.file_id, config).emits
                             else
                                 inferExternalPrototypeEffects(cb_sym).asBits();
                             try per_body_edges[slot_u32].append(allocator, WitnessCallEdge.init(
@@ -10392,7 +10740,7 @@ fn runPass3SummaryContractsAndSandbox(
                     } else if (extractFormalCallbackParamOrd(body, pool, MirValueId.fromInt(word))) |caller_cb_ord| {
                         summaries[slot_u32].forwarded_cb_mask |= (@as(u16, 1) << caller_cb_ord);
                     } else {
-                        const opaque_eff = inferCallableTypeIndirectEffects(body, pool, word);
+                        const opaque_eff = inferCallableTypeIndirectEffects(body, pool, sym_table, word);
                         summaries[slot_u32].direct_effects_bits |= opaque_eff.asBits();
                         try per_body_edges[slot_u32].append(allocator, WitnessCallEdge.init(
                             mir.NONE_U32,
@@ -10472,7 +10820,7 @@ fn runPass3SummaryContractsAndSandbox(
                         }
                     }
                     if (sym_rec_opt) |srec| {
-                        const b_masks = extractBoundaryMasksForSymbol(srec, config);
+                        const b_masks = extractBoundaryMasksForSymbol(srec, body.file_id, config);
                         final_bits = (raw_bits & ~b_masks.clears) | b_masks.emits;
                     }
                 }
@@ -10853,14 +11201,21 @@ fn runPass3SummaryContractsAndSandbox(
                         {
                             const c_sym = sym_table.getSymbol(cs.direct_symbol).*;
                             const c_eff = if (c_sym.contract_flags.is_std_cap_boundary)
-                                EffectCapabilityMask.fromBits(extractBoundaryMasksForSymbol(c_sym, config).emits)
+                                EffectCapabilityMask.fromBits(
+                                    extractBoundaryMasksForSymbol(c_sym, body.file_id, config).emits,
+                                )
                             else
                                 inferExternalPrototypeEffects(c_sym);
                             if (c_eff.may_panic) {
                                 has_window_panic = true;
                                 break;
                             }
-                        } else if (inferCallableTypeIndirectEffects(body, pool, cs.callee_val.asInt()).may_panic) {
+                        } else if (inferCallableTypeIndirectEffects(
+                            body,
+                            pool,
+                            sym_table,
+                            cs.callee_val.asInt(),
+                        ).may_panic) {
                             has_window_panic = true;
                             break;
                         }
@@ -10949,6 +11304,14 @@ fn runPass3SummaryContractsAndSandbox(
         {
             try verifyElaboratedMirBody(allocator, body, pool, sym_table);
         }
+    }
+
+    // Clamp caller-observable contract bits on exported summaries for `CompilerDb` Early Cutoff (`DR-17` §2.2):
+    for (store.summaries) |*sum_entry| {
+        const cs_mask = sum_entry.contractsScratch();
+        if (cs_mask.has_no_alloc) sum_entry.inferred_effects_bits &= ~EffectCapabilityMask.ALLOC_BIT;
+        if (cs_mask.has_no_panic) sum_entry.inferred_effects_bits &= ~EffectCapabilityMask.MAY_PANIC_BIT;
+        if (cs_mask.has_no_block) sum_entry.inferred_effects_bits &= ~EffectCapabilityMask.BLOCKING_BITS;
     }
 
     out_package_caps.* = pkg_caps;
@@ -11277,8 +11640,13 @@ pub fn analyzeAndElaborateMirModule(
         dom_init_count += 1;
     }
 
+    // Reusable per-function `BumpArena` reclaimed in $O(1)$ after each stage (`AGENTS.md` §2):
+    var scratch_arena = BumpArena.init(allocator);
+    defer scratch_arena.deinit();
+
     var scc_sched = try computeBottomUpTarjanSccs(
         allocator,
+        &scratch_arena,
         bodies,
         pool,
         sym_table,
@@ -11310,10 +11678,6 @@ pub fn analyzeAndElaborateMirModule(
         for (per_body_edges) |*el| el.deinit(allocator);
         allocator.free(per_body_edges);
     }
-
-    // Reusable per-function `BumpArena` reclaimed in $O(1)$ after each function (`AGENTS.md` §2):
-    var scratch_arena = BumpArena.init(allocator);
-    defer scratch_arena.deinit();
 
     var total_elim_bce: u32 = 0;
     var total_elim_narrow: u32 = 0;
@@ -11418,6 +11782,7 @@ pub fn analyzeAndElaborateMirModule(
     var pkg_caps = PackageCapSummary{};
     const store = try runPass3SummaryContractsAndSandbox(
         allocator,
+        &scratch_arena,
         bodies,
         &scc_sched,
         pass2_outcomes,

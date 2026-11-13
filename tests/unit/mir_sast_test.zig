@@ -2223,3 +2223,271 @@ test "test_phase6_critical01_mutable_slice_reassignment_zero_mod_and_d11_narrow_
         countDiagnosticCode(&narrow_bad_bundle.diagnostics, .e0406_range_refinement_violation),
     );
 }
+
+test "test_phase6_audit_regressions_overflow_params_drops_and_cross_file_caps" {
+    const allocator = std.testing.allocator;
+
+    // [1] Pass 4 `u64 * u64` overflow safety; checked `*` emits `E0321` without `i128` panic, `*%` passes:
+    const checked_u64_mul_src =
+        \\@no_panic
+        \\pub fn checked_u64_mul(lhs: u64, rhs: u64) -> u64 {
+        \\    return lhs * rhs;
+        \\}
+    ;
+    try expectSastDiagnostic(
+        allocator,
+        430,
+        checked_u64_mul_src,
+        .{},
+        .e0321_no_panic_contract_violation,
+    );
+
+    const wrapping_u64_mul_src =
+        \\@no_panic
+        \\pub fn wrapping_u64_mul(lhs: u64, rhs: u64) -> u64 {
+        \\    return lhs *% rhs;
+        \\}
+    ;
+    var wrap_mul_bundle = try verifyCleanSast(allocator, 431, wrapping_u64_mul_src, .{});
+    defer wrap_mul_bundle.deinit();
+
+    // [2] Pass 4 conditional formal-parameter overwrite & `&mut [T]` deref slice length soundness:
+    const mut_param_overwrite_src =
+        \\@no_panic
+        \\pub fn bad_mut_param(mut idx: usize, should_clobber: bool, arr: &[i64; 4]) -> i64 {
+        \\    if idx < 2 {
+        \\        if should_clobber {
+        \\            idx = 9;
+        \\        }
+        \\        return arr[idx];
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var mut_param_bundle = try corex.lowerAndVerifySourceMirSast(
+        allocator,
+        FileId.fromInt(432),
+        mut_param_overwrite_src,
+        TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer mut_param_bundle.deinit();
+    try std.testing.expectEqual(@as(u32, 0), mut_param_bundle.sast_result.eliminated_bounds_checks);
+    try std.testing.expect(
+        hasDiagnosticCode(&mut_param_bundle.diagnostics, .e0321_no_panic_contract_violation),
+    );
+
+    const mut_slice_deref_src =
+        \\pub fn shrink_slice(mut slot: inout &[i64], empty: &[i64]) {
+        \\    slot = empty;
+        \\}
+        \\@no_panic
+        \\pub fn bad_deref_slice_len(mut slot: inout &[i64], empty: &[i64], idx: usize) -> i64 {
+        \\    if idx < slot.len {
+        \\        shrink_slice(slot, empty);
+        \\        return slot[idx];
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var mut_deref_bundle = try corex.lowerAndVerifySourceMirSast(
+        allocator,
+        FileId.fromInt(433),
+        mut_slice_deref_src,
+        TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer mut_deref_bundle.deinit();
+    try std.testing.expectEqual(@as(u32, 0), mut_deref_bundle.sast_result.eliminated_bounds_checks);
+    try std.testing.expect(
+        hasDiagnosticCode(&mut_deref_bundle.diagnostics, .e0321_no_panic_contract_violation),
+    );
+
+    // [3] Pass 2 projected `sink` partial move, conditional `.deinit()` `_drop_flag` clear, & composite `@linear`:
+    const sink_partial_and_deinit_src =
+        \\pub struct TrackedBuf {
+        \\    pub id: i64,
+        \\}
+        \\impl TrackedBuf {
+        \\    pub fn drop(&mut self) {
+        \\        @drop_trace(self.id);
+        \\    }
+        \\    pub fn deinit(own self: sink TrackedBuf) {
+        \\        @drop_trace(100 + self.id);
+        \\        let TrackedBuf { id: _ } = self;
+        \\    }
+        \\}
+        \\pub struct BufPair {
+        \\    pub first: TrackedBuf,
+        \\    pub second: TrackedBuf,
+        \\}
+        \\pub fn take_first_or_explicit_deinit(own pair: sink BufPair, is_explicit: bool) -> i64 {
+        \\    var local_buf = TrackedBuf { id: 7 };
+        \\    if is_explicit {
+        \\        local_buf.deinit();
+        \\    }
+        \\    let moved_first = pair.first;
+        \\    return moved_first.id;
+        \\}
+        \\pub fn entry_sink_partial(is_explicit: bool) -> i64 {
+        \\    let pair = BufPair {
+        \\        first: TrackedBuf { id: 1 },
+        \\        second: TrackedBuf { id: 2 },
+        \\    };
+        \\    return take_first_or_explicit_deinit(pair, is_explicit);
+        \\}
+    ;
+    var sink_drop_bundle = try verifyCleanSast(allocator, 434, sink_partial_and_deinit_src, .{});
+    defer sink_drop_bundle.deinit();
+
+    const entry_body = sink_drop_bundle.mir_module.findBodyByName(
+        &sink_drop_bundle.interner,
+        "entry_sink_partial",
+    ).?;
+    var rodata = RodataPool.init(allocator);
+    defer rodata.deinit();
+    var vm = try MirVm.init(
+        allocator,
+        &sink_drop_bundle.interner,
+        &sink_drop_bundle.pool,
+        &sink_drop_bundle.sym_table,
+        &rodata,
+        null,
+        null,
+        .{},
+    );
+    defer vm.deinit();
+    for (sink_drop_bundle.mir_module.bodies.items) |*body_ptr| {
+        _ = try vm.registerBody(body_ptr, body_ptr.symbol_index);
+    }
+
+    // `is_explicit == false`; `moved_first` (`1`), `local_buf` (`7`), and unmoved `pair.second` (`2`) each drop once:
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        (try vm.evalBody(entry_body, &[_]RegSlot{.{ .scalar_u64 = 0 }})).slot.scalar_i64,
+    );
+    try std.testing.expectEqual(@as(usize, 3), vm.asDropTraceSlice().len);
+
+    // `is_explicit == true`; `local_buf.deinit()` clears `_drop_flag` so `local_buf` never double-drops:
+    vm.drop_trace.clearRetainingCapacity();
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        (try vm.evalBody(entry_body, &[_]RegSlot{.{ .scalar_u64 = 1 }})).slot.scalar_i64,
+    );
+    var count_id_seven: usize = 0;
+    var count_deinit_marker: usize = 0;
+    for (vm.asDropTraceSlice()) |trace_id| {
+        if (trace_id == 7) count_id_seven += 1;
+        if (trace_id == 107) count_deinit_marker += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count_deinit_marker);
+    try std.testing.expect(count_id_seven <= 1);
+
+    const composite_linear_src =
+        \\@linear
+        \\pub struct LinearLease {
+        \\    pub handle: i32,
+        \\}
+        \\pub struct LeasePair {
+        \\    pub left: LinearLease,
+        \\    pub right: LinearLease,
+        \\}
+        \\pub fn release_lease(own lease: sink LinearLease) {
+        \\    let LinearLease { handle: _ } = lease;
+        \\}
+        \\pub fn split_and_release_both(own pair: sink LeasePair) {
+        \\    release_lease(pair.left);
+        \\    release_lease(pair.right);
+        \\}
+    ;
+    var comp_linear_bundle = try verifyCleanSast(allocator, 435, composite_linear_src, .{});
+    defer comp_linear_bundle.deinit();
+
+    // [4] `D-04` `Context.scratch[0]` slice passed directly into a callee that rewinds `scratch[0]` emits `E0328`:
+    const scratch_arg_conflict_src =
+        \\pub struct ScratchArena {
+        \\    pub backing: [u8; 8],
+        \\}
+        \\impl ScratchArena {
+        \\    pub fn alloc_slice(&mut self) -> &[u8] {
+        \\        return &self.backing;
+        \\    }
+        \\    pub fn reset(&mut self) {
+        \\        self.backing[0] = 0;
+        \\    }
+        \\}
+        \\pub struct Context {
+        \\    pub allocator: usize,
+        \\    pub scratch: [ScratchArena; 2],
+        \\}
+        \\pub fn rewind_and_read(mut ctx: inout Context, borrowed: &[u8]) -> usize {
+        \\    ctx.scratch[0].reset();
+        \\    return borrowed.len;
+        \\}
+        \\pub fn pass_scratch_into_rewinder(mut ctx: inout Context) -> usize {
+        \\    let scratch_view = ctx.scratch[0].alloc_slice();
+        \\    return rewind_and_read(ctx, scratch_view);
+        \\}
+    ;
+    try expectSastDiagnostic(
+        allocator,
+        436,
+        scratch_arg_conflict_src,
+        .{},
+        .e0328_scratch_arena_ping_pong_conflict,
+    );
+
+    // [5] Cross-file `CompilerDb` `@std_cap_boundary` (`env` bit) & `--release` `optimizeMirModule` on SAST error:
+    var db = try CompilerDb.init(allocator);
+    defer db.deinit();
+
+    const std_env_file = FileId.fromInt(437);
+    const std_env_src =
+        \\extern "C" fn host_getenv_raw() -> i32;
+        \\@std_cap_boundary(clears = [ffi, unsafe_op], emits = [env])
+        \\pub fn read_env_flag() -> i32 {
+        \\    return unsafe { host_getenv_raw() };
+        \\}
+    ;
+    _ = try db.setInput(std_env_file, std_env_src, .high);
+    try db.symbol_table.named_module_scopes.put(
+        allocator,
+        (try db.interner.intern("std_env")).asInt(),
+        (try db.resolveSignatures(std_env_file)).module_scope,
+    );
+
+    const app_file = FileId.fromInt(438);
+    const app_src =
+        \\use std_env::read_env_flag;
+        \\pub fn app_probe_env() -> i32 {
+        \\    return read_env_flag();
+        \\}
+    ;
+    _ = try db.setInput(app_file, app_src, .low);
+    const app_def = findDefIdByName((try db.extractItemTree(app_file)).entries, "app_probe_env").?;
+    try std.testing.expect((try db.verifySastMir(app_def)).is_verified_sound);
+    const app_effects = (try db.getSastSummaryProj(app_def)).inferredEffects();
+    try std.testing.expect(app_effects.env);
+    try std.testing.expect(!app_effects.ffi);
+    try std.testing.expect(!app_effects.unsafe_op);
+    _ = try db.optimizeMirModule(app_file, true);
+
+    const invalid_sast_file = FileId.fromInt(439);
+    const invalid_sast_src =
+        \\pub fn uninit_in_release(cond: bool) -> i64 {
+        \\    var slot: i64;
+        \\    if cond {
+        \\        slot = 10;
+        \\    }
+        \\    return slot;
+        \\}
+    ;
+    _ = try db.setInput(invalid_sast_file, invalid_sast_src, .low);
+    _ = try db.optimizeMirModule(invalid_sast_file, true);
+    try std.testing.expect(
+        hasDiagnosticCode(
+            db.getOptimizedMirDiagnostics(invalid_sast_file, true).?,
+            .e0303_uninitialized_memory_read,
+        ),
+    );
+}

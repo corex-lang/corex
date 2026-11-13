@@ -358,24 +358,46 @@ pub const DeclContractFlags = packed struct(u16) {
     }
 };
 
-/// Canonical 16-bit inferred capability/effect bits (`DR-17` §2.1) for `@std_cap_boundary` masks.
+/// Canonical 12-bit inferred capability/effect bits (`DR-17` §2.1) for `@std_cap_boundary` masks.
 pub const CapabilityBits = struct {
-    /// Dynamic heap allocation capability (`@no_alloc` forbids this bit).
-    pub const HEAP_ALLOC: u16 = 1 << 0;
-    /// Unrecoverable trap / panic capability (`@no_panic` forbids this bit).
-    pub const MAY_PANIC: u16 = 1 << 1;
-    /// Blocking or async I/O suspension capability (`@no_block` forbids `IO_ASYNC | IO_FS | IO_NET | THREAD_SPAWN`).
-    pub const IO_ASYNC: u16 = 1 << 2;
-    /// Filesystem I/O capability.
-    pub const IO_FS: u16 = 1 << 3;
-    /// Network socket I/O capability.
-    pub const IO_NET: u16 = 1 << 4;
-    /// OS thread or fiber spawn capability.
-    pub const THREAD_SPAWN: u16 = 1 << 5;
-    /// Foreign function interface or `unsafe` block capability.
-    pub const FFI_UNSAFE: u16 = 1 << 6;
-    /// Non-deterministic clock or OS entropy capability.
-    pub const CLOCK_ENTROPY: u16 = 1 << 7;
+    /// Filesystem I/O capability (`bit 0`).
+    pub const FS: u16 = 1 << 0;
+    /// Network socket I/O capability (`bit 1`).
+    pub const NET: u16 = 1 << 1;
+    /// Environment variable, `argv`, or host metadata capability (`bit 2`).
+    pub const ENV: u16 = 1 << 2;
+    /// Child process, signal, or OS thread spawn capability (`bit 3`).
+    pub const PROCESS: u16 = 1 << 3;
+    /// Foreign function interface or linker symbol capability (`bit 4`).
+    pub const FFI: u16 = 1 << 4;
+    /// Raw pointer dereference, pointer offset, `union`, or `asm` capability (`bit 5`).
+    pub const UNSAFE_OP: u16 = 1 << 5;
+    /// Dynamic heap allocation capability (`bit 6`; `@no_alloc` forbids this bit).
+    pub const ALLOC: u16 = 1 << 6;
+    /// Unrecoverable trap / panic capability (`bit 7`; `@no_panic` forbids this bit).
+    pub const MAY_PANIC: u16 = 1 << 7;
+    /// Direct host clock capability (`bit 8`).
+    pub const CLOCK: u16 = 1 << 8;
+    /// Direct host OS entropy / CSPRNG capability (`bit 9`).
+    pub const ENTROPY: u16 = 1 << 9;
+    /// Blocking synchronization or sleep capability (`bit 10`; `@no_block` forbids blocking bits).
+    pub const BLOCKING_SYNC: u16 = 1 << 10;
+    /// Unconstrained dynamic `fn(…)` or `dyn Trait` dispatch capability (`bit 11`).
+    pub const INDIRECT_OPAQUE: u16 = 1 << 11;
+    /// Alias for `ALLOC` (`1 << 6`).
+    pub const HEAP_ALLOC: u16 = ALLOC;
+    /// Alias for `BLOCKING_SYNC` (`1 << 10`).
+    pub const IO_ASYNC: u16 = BLOCKING_SYNC;
+    /// Alias for `FS` (`1 << 0`).
+    pub const IO_FS: u16 = FS;
+    /// Alias for `NET` (`1 << 1`).
+    pub const IO_NET: u16 = NET;
+    /// Alias for `PROCESS` (`1 << 3`).
+    pub const THREAD_SPAWN: u16 = PROCESS;
+    /// Composite mask for `FFI | UNSAFE_OP` (`0x0030`).
+    pub const FFI_UNSAFE: u16 = FFI | UNSAFE_OP;
+    /// Composite mask for `CLOCK | ENTROPY` (`0x0300`).
+    pub const CLOCK_ENTROPY: u16 = CLOCK | ENTROPY;
 };
 
 /// Complete metadata record for a symbol registered in `SymbolTable`.
@@ -594,31 +616,48 @@ pub const BUILTIN_TYPES_AND_GROUPS = [_]BuiltinTypeEntry{
     .{ .name = "IntoBytes", .type_id = .group_into_bytes, .is_group = true },
 };
 
-/// $O(1)$ static lookup map from `@std_cap_boundary` capability names to `CapabilityBits` (`DR-17` §2.3).
+/// $O(1)$ static lookup map from `@std_cap_boundary` capability names to `CapabilityBits` (`DR-17` §2.1–2.3).
 pub const CAPABILITY_NAME_MAP = std.StaticStringMap(u16).initComptime(.{
+    .{ "Alloc", CapabilityBits.ALLOC },
+    .{ "BlockingSync", CapabilityBits.BLOCKING_SYNC },
+    .{ "Clock", CapabilityBits.CLOCK },
     .{ "ClockEntropy", CapabilityBits.CLOCK_ENTROPY },
+    .{ "Entropy", CapabilityBits.ENTROPY },
+    .{ "Env", CapabilityBits.ENV },
+    .{ "Ffi", CapabilityBits.FFI },
     .{ "FfiUnsafe", CapabilityBits.FFI_UNSAFE },
+    .{ "Fs", CapabilityBits.FS },
     .{ "HeapAlloc", CapabilityBits.HEAP_ALLOC },
+    .{ "IndirectOpaque", CapabilityBits.INDIRECT_OPAQUE },
     .{ "IoAsync", CapabilityBits.IO_ASYNC },
     .{ "IoFs", CapabilityBits.IO_FS },
     .{ "IoNet", CapabilityBits.IO_NET },
     .{ "MayPanic", CapabilityBits.MAY_PANIC },
+    .{ "Net", CapabilityBits.NET },
+    .{ "Process", CapabilityBits.PROCESS },
     .{ "ThreadSpawn", CapabilityBits.THREAD_SPAWN },
-    .{ "alloc", CapabilityBits.HEAP_ALLOC },
-    .{ "block", CapabilityBits.IO_ASYNC },
+    .{ "UnsafeOp", CapabilityBits.UNSAFE_OP },
+    .{ "alloc", CapabilityBits.ALLOC },
+    .{ "block", CapabilityBits.BLOCKING_SYNC },
+    .{ "blocking_sync", CapabilityBits.BLOCKING_SYNC },
+    .{ "clock", CapabilityBits.CLOCK },
     .{ "clock_entropy", CapabilityBits.CLOCK_ENTROPY },
-    .{ "ffi", CapabilityBits.FFI_UNSAFE },
+    .{ "entropy", CapabilityBits.ENTROPY },
+    .{ "env", CapabilityBits.ENV },
+    .{ "ffi", CapabilityBits.FFI },
     .{ "ffi_unsafe", CapabilityBits.FFI_UNSAFE },
-    .{ "fs", CapabilityBits.IO_FS },
+    .{ "fs", CapabilityBits.FS },
     .{ "heap_alloc", CapabilityBits.HEAP_ALLOC },
+    .{ "indirect_opaque", CapabilityBits.INDIRECT_OPAQUE },
     .{ "io_async", CapabilityBits.IO_ASYNC },
     .{ "io_fs", CapabilityBits.IO_FS },
     .{ "io_net", CapabilityBits.IO_NET },
     .{ "may_panic", CapabilityBits.MAY_PANIC },
-    .{ "net", CapabilityBits.IO_NET },
+    .{ "net", CapabilityBits.NET },
     .{ "panic", CapabilityBits.MAY_PANIC },
+    .{ "process", CapabilityBits.PROCESS },
     .{ "thread_spawn", CapabilityBits.THREAD_SPAWN },
-    .{ "unsafe_op", CapabilityBits.FFI_UNSAFE },
+    .{ "unsafe_op", CapabilityBits.UNSAFE_OP },
 });
 
 /// Canonical `AttributeTarget` variant names for `@attribute_schema(targets = […])` typo suggestions.

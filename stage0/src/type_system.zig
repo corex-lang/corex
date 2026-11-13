@@ -880,7 +880,7 @@ pub const GENERIC_NOMINAL_INST_MASK: u32 = 0xFF00_0000;
 const TYPE_HASH_SEED: u64 = 0x517C_C1B7_2722_0A95;
 
 /// $O(1)$ static lookup map of built-in compiler attributes skipped during user `@attribute_schema` checks.
-const BUILTIN_ATTRIBUTE_MAP = std.StaticStringMap(void).initComptime(.{
+pub const BUILTIN_ATTRIBUTE_MAP = std.StaticStringMap(void).initComptime(.{
     .{ "align", {} },
     .{ "allow", {} },
     .{ "attribute_schema", {} },

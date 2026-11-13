@@ -678,4 +678,68 @@ test "test_drift_guard_phase6_sast_layouts_seams_cli_and_diagnostics" {
         }
         try std.testing.expect(has_ref);
     }
+
+    // [5] Verify canonical intrinsic, built-in attribute, and 12-bit `DR-17` capability lookup tables:
+    try expectContiguousEnum(corex.type_system.IntrinsicKind);
+    try std.testing.expectEqual(
+        @typeInfo(corex.type_system.IntrinsicKind).@"enum".field_names.len,
+        corex.type_system.INTRINSIC_NAME_MAP.keys().len,
+    );
+    inline for (std.enums.values(corex.type_system.IntrinsicKind)) |intrinsic_val| {
+        try std.testing.expectEqual(
+            intrinsic_val,
+            corex.type_system.INTRINSIC_NAME_MAP.get(@tagName(intrinsic_val)).?,
+        );
+    }
+
+    const required_phase6_attrs = [_][]const u8{
+        "ifunc",
+        "linear",
+        "local",
+        "max_stack",
+        "no_alloc",
+        "no_block",
+        "no_panic",
+        "secret",
+        "std_cap_boundary",
+        "zero_pad",
+    };
+    for (required_phase6_attrs) |attr_name| {
+        try std.testing.expect(corex.type_system.BUILTIN_ATTRIBUTE_MAP.has(attr_name));
+    }
+
+    const canonical_caps = [_]struct {
+        /// Canonical lowercase `DR-17` §2.1 capability name.
+        snake_name: []const u8,
+        /// Canonical `PascalCase` `DR-17` §2.1 capability name.
+        pascal_name: []const u8,
+        /// Expected distinct single-bit position (`0..11`).
+        expected_bit: u16,
+    }{
+        .{ .snake_name = "fs", .pascal_name = "Fs", .expected_bit = 1 << 0 },
+        .{ .snake_name = "net", .pascal_name = "Net", .expected_bit = 1 << 1 },
+        .{ .snake_name = "env", .pascal_name = "Env", .expected_bit = 1 << 2 },
+        .{ .snake_name = "process", .pascal_name = "Process", .expected_bit = 1 << 3 },
+        .{ .snake_name = "ffi", .pascal_name = "Ffi", .expected_bit = 1 << 4 },
+        .{ .snake_name = "unsafe_op", .pascal_name = "UnsafeOp", .expected_bit = 1 << 5 },
+        .{ .snake_name = "alloc", .pascal_name = "Alloc", .expected_bit = 1 << 6 },
+        .{ .snake_name = "may_panic", .pascal_name = "MayPanic", .expected_bit = 1 << 7 },
+        .{ .snake_name = "clock", .pascal_name = "Clock", .expected_bit = 1 << 8 },
+        .{ .snake_name = "entropy", .pascal_name = "Entropy", .expected_bit = 1 << 9 },
+        .{ .snake_name = "blocking_sync", .pascal_name = "BlockingSync", .expected_bit = 1 << 10 },
+        .{ .snake_name = "indirect_opaque", .pascal_name = "IndirectOpaque", .expected_bit = 1 << 11 },
+    };
+    var combined_cap_bits: u16 = 0;
+    for (canonical_caps) |cap_spec| {
+        try std.testing.expectEqual(
+            cap_spec.expected_bit,
+            corex.symbol_resolver.CAPABILITY_NAME_MAP.get(cap_spec.snake_name).?,
+        );
+        try std.testing.expectEqual(
+            cap_spec.expected_bit,
+            corex.symbol_resolver.CAPABILITY_NAME_MAP.get(cap_spec.pascal_name).?,
+        );
+        combined_cap_bits |= cap_spec.expected_bit;
+    }
+    try std.testing.expectEqual(@as(u16, 0x0FFF), combined_cap_bits);
 }

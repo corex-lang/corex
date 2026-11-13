@@ -7093,8 +7093,8 @@ pub fn optimizeMirModule(
     );
     try verifyAllConcreteBodiesMode(allocator, result.bodies.items, pool, sym_table, diagnostic_sink, has_sast_errors);
 
-    // Execute `--release` 6-pass pipeline (`R1`–`R6`):
-    if (config.is_release_mode) {
+    // Execute `--release` 6-pass pipeline (`R1`–`R6`) only when SAST verification succeeded cleanly:
+    if (config.is_release_mode and !has_sast_errors) {
         // [R1] Bounded cost-model inliner (`W0501` on explicit `@inline` overflow/recursion):
         try runPassR1CostModelInliner(allocator, result.bodies.items, sym_table, config, diagnostic_sink);
         try verifyAllConcreteBodies(allocator, result.bodies.items, pool, sym_table, diagnostic_sink);

@@ -2349,27 +2349,46 @@ pub const CompilerDb = struct {
             }
             if (self.workspace_root) |ws_root| {
                 if (self.embed_io) |io_handle| {
-                    if (std.fs.path.join(self.allocator, &.{ ws_root, rel_path })) |full_path| {
-                        defer self.allocator.free(full_path);
-                        if (std.Io.Dir.cwd().realPathFileAlloc(io_handle, ws_root, self.allocator)) |canon_ws| {
-                            defer self.allocator.free(canon_ws);
-                            if (std.Io.Dir.cwd().realPathFileAlloc(
-                                io_handle,
-                                full_path,
-                                self.allocator,
-                            )) |canon_target| {
-                                defer self.allocator.free(canon_target);
-                                if (mir_vm.isCanonicalPathWithinRoot(canon_ws, canon_target)) {
-                                    if (std.Io.Dir.cwd().readFileAlloc(
-                                        io_handle,
-                                        canon_target,
-                                        self.allocator,
-                                        .limited(mir_vm.DEFAULT_MEM_LIMIT),
-                                    )) |disk_bytes| {
-                                        defer self.allocator.free(disk_bytes);
-                                        return Fingerprint128.hashBytes(disk_bytes);
-                                    } else |_| {}
-                                }
+                    if (std.Io.Dir.cwd().realPathFileAlloc(io_handle, ws_root, self.allocator)) |canon_ws| {
+                        defer self.allocator.free(canon_ws);
+                        if (std.fs.path.join(self.allocator, &.{ canon_ws, rel_path })) |full_path| {
+                            defer self.allocator.free(full_path);
+                            if (std.Io.Dir.cwd().openFile(io_handle, full_path, .{
+                                .mode = .read_only,
+                                .allow_directory = false,
+                                .follow_symlinks = false,
+                            })) |opened_file| {
+                                defer opened_file.close(io_handle);
+                                if (opened_file.stat(io_handle)) |file_stat| {
+                                    const max_read_bytes: u64 = @min(
+                                        mir_vm.DEFAULT_MEM_LIMIT,
+                                        std.math.maxInt(u32),
+                                    );
+                                    if (file_stat.kind == .file and file_stat.size <= max_read_bytes) {
+                                        if (std.Io.Dir.cwd().realPathFileAlloc(
+                                            io_handle,
+                                            full_path,
+                                            self.allocator,
+                                        )) |canon_target| {
+                                            defer self.allocator.free(canon_target);
+                                            if (mir_vm.isDirectCanonicalSubpath(canon_ws, canon_target, rel_path)) {
+                                                const expected_size: usize = @intCast(file_stat.size);
+                                                if (self.allocator.alloc(u8, expected_size)) |disk_bytes| {
+                                                    defer self.allocator.free(disk_bytes);
+                                                    if (opened_file.readPositionalAll(
+                                                        io_handle,
+                                                        disk_bytes,
+                                                        0,
+                                                    )) |actual_read| {
+                                                        if (actual_read == expected_size) {
+                                                            return Fingerprint128.hashBytes(disk_bytes);
+                                                        }
+                                                    } else |_| {}
+                                                } else |_| {}
+                                            }
+                                        } else |_| {}
+                                    }
+                                } else |_| {}
                             } else |_| {}
                         } else |_| {}
                     } else |_| {}
@@ -4271,7 +4290,20 @@ pub const CompilerDb = struct {
             &self.symbol_table,
             &self.interner,
             mir_sink,
-        ) catch return error.OutOfMemory;
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => blk: {
+                _ = try resetOrCreateDefDiagSink(&self.mir_diagnostics, self.allocator, def_id.asInt());
+                break :blk mir.lowerHirToMirForSast(
+                    self.allocator,
+                    hir_store,
+                    &self.type_pool,
+                    &self.symbol_table,
+                    &self.interner,
+                    mir_sink,
+                ) catch return error.OutOfMemory;
+            },
+        };
         errdefer bundle.deinit();
 
         var is_init_only = false;
@@ -4652,9 +4684,19 @@ pub const CompilerDb = struct {
                 .comptime_fn_defs = &comptime_fn_defs,
                 .is_sast_enabled = true,
                 .is_sast_strict = is_strict,
+                .sast_config = .{
+                    .is_sast_strict = is_strict,
+                    .external_resolver = .{
+                        .compiler_db = self,
+                        .resolve_fn = resolveDbCalleeSummary,
+                    },
+                },
             },
             opt_sink,
-        ) catch return error.OutOfMemory;
+        ) catch |err| switch (err) {
+            error.Cancelled => return error.Cancelled,
+            else => return error.OutOfMemory,
+        };
         errdefer opt_res.deinit();
 
         var hasher = StructuralHasher.init();
