@@ -1,6 +1,6 @@
-# Upfront `Deep Research` Prompts (`DR-01`–`DR-20`)
+# Upfront `Deep Research` Prompts (`DR-01`–`DR-21`)
 
-This catalog contains the 20 self-contained, copy-pasteable `Deep research` prompts that resolve the Research Decision Gates (`RDG-01`–`RDG-20`) in [PLAN.md](../../PLAN.md). When a `Deep research` report is completed, save its output to the corresponding `docs/research/DR-XX.md` path listed below.
+This catalog contains the 21 self-contained, copy-pasteable `Deep research` prompts and specifications that resolve the Research Decision Gates (`RDG-01`–`RDG-21`) in [PLAN.md](../../PLAN.md). When a `Deep research` report is completed, save its output to the corresponding `docs/research/DR-XX.md` path listed below.
 
 ---
 
@@ -28,6 +28,7 @@ This catalog contains the 20 self-contained, copy-pasteable `Deep research` prom
 | **`DR-18`** | **`RDG-18`** | `docs/research/DR-18.md` | Wave 4 | `PLAN`, `DR-01`, `DR-08`, `DR-09`, `DR-15`, `DR-20` | Phase 7 / 8 / 11      | Deterministic `Context` Simulation (`corex test --sim`) & Native Coverage Fuzzing      |
 | **`DR-19`** | **`RDG-19`** | `docs/research/DR-19.md` | Wave 4 | `PLAN`, `DR-01`, `DR-06`, `DR-08`, `DR-09`, `DR-20` | Phase 7 (Seam) / 13   | Self-Hosted Tier C, Live Hot-Reloading (`run --watch`), `@must_vectorize` & VOPR Sim   |
 | **`DR-20`** | **`RDG-20`** | `docs/research/DR-20.md` | Wave 4 | *None*                                              | Phases 6–13           | Holistic Superpower Catalog (`D-01`–`D-11`), Soundness Fixes & `195-LOC` Seam Audit    |
+| **`DR-21`** | **`RDG-21`** | `docs/research/DR-21.md` | Wave 5 | `PLAN`, `DR-02`–`DR-08`, `DR-12`–`DR-15`, `DR-20`   | Phase 7.5 (Pre-Ph. 8) | Surface Syntax, `cx.*` Namespace, Unified `.` Paths & `SE-01`–`SE-08` Ergonomics       |
 
 ---
 
@@ -701,3 +702,9 @@ Output your entire completed specification report wrapped inside **one single ou
 ## `DR-20` (Plugs into `RDG-20` → `docs/research/DR-20.md`): Holistic Superpower Catalog, Soundness Fixes & Pre-`v0.0.1` Scope Audit
 
 > Resolved and committed in [DR-20.md](DR-20.md) (`Bucket A` `Phases 6–11` integrations, `Bucket B` `Phase 13.0`–`13.4` post-`v0.0.1` capabilities, `Bucket C` `Prune-01`–`07` / `Reject-01` scope and soundness amendments, and the `195-LOC` Pre-`v0.0.1` Seam Reservation Checklist).
+
+---
+
+## `DR-21` (Plugs into `RDG-21` → `docs/research/DR-21.md`): Surface Syntax, Standard Namespace (`cx.*`) & Zero-Cost Ergonomic Elevation
+
+> Resolved in [DR-21.md](DR-21.md) (`ADR-21A`/`21B` `cx.*` public standard namespace + `--internal-core` Stage-1 kernel boundary, `ADR-21C` unified `.` path/member separator retiring `::`, `SE-01`–`SE-08` zero-cost surface elevations – flow-sensitive `is` chains retiring `if let`/`while let`, `(x := expr)` condition bindings, `orelse` `T?` coalescing, `$` slice length indexing, `for item, i`, `T?` labeled value-break loops, `= expr;` functions + named/default call arguments, and `with context.<slot> = expr` blocks – plus `UR-21-00`–`UR-21-07` `corex upgrade` rules).
