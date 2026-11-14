@@ -3225,6 +3225,7 @@ pub const Parser = struct {
             .kw_errdefer,
             .kw_for,
             .kw_while,
+            .kw_loop,
             .kw_comptime,
             => true,
             else => false,
@@ -3281,6 +3282,9 @@ pub const Parser = struct {
             }
             const inner_stmt = try self.parseStmt(is_tail_out);
             self.cst.finishNode(decl_cst, .{ .has_error = has_attr_err });
+            if (!inner_stmt.isNone() and inner_stmt.asInt() < self.ast.ast_to_cst.items.len) {
+                self.ast.ast_to_cst.items[inner_stmt.asInt()] = decl_cst;
+            }
             return inner_stmt;
         }
 

@@ -4,9 +4,38 @@
 //! `build/stage0/` and the standard `zig-out/bin/` prefix per `.agents/skills/build/SKILL.md`.
 //!
 //! Provides `zig build`, `zig build run`, `zig build test` (executing both internal module tests and
-//! `tests/test_runner.zig`), and `zig build bench` (executing `phase0_bench` through `phase6_bench`).
+//! `tests/test_runner.zig`), and `zig build bench` (executing `phase0_bench` through `phase7_bench`).
 
 const std = @import("std");
+
+// -------------------------------------- INTERNALS --------------------------------------
+
+/// Wires the optional `-Dllvm-prefix=<path>` C++20 `corex_llvm` static bridge into `mod`.
+fn configureLlvmBridgeForModule(
+    builder: *std.Build,
+    mod: *std.Build.Module,
+    llvm_prefix_opt: ?[]const u8,
+) void {
+    mod.addIncludePath(builder.path("stage0/src"));
+    if (llvm_prefix_opt) |llvm_prefix| {
+        const inc_dir = std.fmt.allocPrint(builder.allocator, "{s}/include", .{llvm_prefix}) catch @panic("OOM");
+        const lib_dir = std.fmt.allocPrint(builder.allocator, "{s}/lib", .{llvm_prefix}) catch @panic("OOM");
+        mod.addSystemIncludePath(.{ .cwd_relative = inc_dir });
+        mod.addLibraryPath(.{ .cwd_relative = lib_dir });
+        mod.link_libcpp = true;
+        mod.addCSourceFile(.{
+            .file = builder.path("stage0/src/corex_llvm.cpp"),
+            .flags = &.{
+                "-std=c++20",
+                "-fno-exceptions",
+                "-fno-rtti",
+                "-D__STDC_CONSTANT_MACROS",
+                "-D__STDC_FORMAT_MACROS",
+                "-D__STDC_LIMIT_MACROS",
+            },
+        });
+    }
+}
 
 // ------------------------------------- PUBLIC API --------------------------------------
 
@@ -14,6 +43,14 @@ const std = @import("std");
 pub fn build(builder: *std.Build) void {
     const target = builder.standardTargetOptions(.{});
     const optimize = builder.standardOptimizeOption(.{});
+    const llvm_prefix_opt = builder.option(
+        []const u8,
+        "llvm-prefix",
+        "Optional LLVM 20–23 installation prefix enabling the static C++20 corex_llvm bridge",
+    );
+
+    const build_options = builder.addOptions();
+    build_options.addOption(bool, "has_llvm_cpp_bridge", llvm_prefix_opt != null);
 
     // [1] Define the canonical `corex` Stage 0 library module rooted at `stage0/src/root.zig`:
     const corex_mod = builder.addModule("corex", .{
@@ -21,6 +58,8 @@ pub fn build(builder: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    corex_mod.addOptions("build_options", build_options);
+    configureLlvmBridgeForModule(builder, corex_mod, llvm_prefix_opt);
 
     // [2] Build the `corex` CLI executable and install into `build/stage0/` and `zig-out/bin/`:
     const exe_mod = builder.createModule(.{
@@ -77,6 +116,8 @@ pub fn build(builder: *std.Build) void {
         .target = target,
         .optimize = bench_optimize,
     });
+    bench_corex_mod.addOptions("build_options", build_options);
+    configureLlvmBridgeForModule(builder, bench_corex_mod, llvm_prefix_opt);
     const bench0_exe_mod = builder.createModule(.{
         .root_source_file = builder.path("bench/suites/phase0_bench.zig"),
         .target = target,
@@ -181,9 +222,24 @@ pub fn build(builder: *std.Build) void {
     const run_bench6 = builder.addRunArtifact(bench6_exe);
     run_bench6.step.dependOn(&run_bench5.step);
 
+    const bench7_exe_mod = builder.createModule(.{
+        .root_source_file = builder.path("bench/suites/phase7_bench.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .imports = &.{
+            .{ .name = "corex", .module = bench_corex_mod },
+        },
+    });
+    const bench7_exe = builder.addExecutable(.{
+        .name = "phase7_bench",
+        .root_module = bench7_exe_mod,
+    });
+    const run_bench7 = builder.addRunArtifact(bench7_exe);
+    run_bench7.step.dependOn(&run_bench6.step);
+
     const bench_step = builder.step(
         "bench",
-        "Run Phase 0, Phase 1, Phase 2, Phase 3, Phase 4, Phase 5, and Phase 6 statistical performance benchmarks",
+        "Run Phase 0 through Phase 7 statistical performance benchmarks",
     );
     bench_step.dependOn(&run_bench0.step);
     bench_step.dependOn(&run_bench1.step);
@@ -192,6 +248,7 @@ pub fn build(builder: *std.Build) void {
     bench_step.dependOn(&run_bench4.step);
     bench_step.dependOn(&run_bench5.step);
     bench_step.dependOn(&run_bench6.step);
+    bench_step.dependOn(&run_bench7.step);
 
     builder.step("bench-phase1", "Run Phase 1 lexer performance benchmarks").dependOn(
         &builder.addRunArtifact(bench1_exe).step,
@@ -210,5 +267,8 @@ pub fn build(builder: *std.Build) void {
     );
     builder.step("bench-phase6", "Run Phase 6 MIR SAST, drop elaboration & Pentagon BCE benchmarks").dependOn(
         &builder.addRunArtifact(bench6_exe).step,
+    );
+    builder.step("bench-phase7", "Run Phase 7 ABI, Tier A C99, Tier B LLVM & C-baseline benchmarks").dependOn(
+        &builder.addRunArtifact(bench7_exe).step,
     );
 }

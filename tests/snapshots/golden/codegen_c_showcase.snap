@@ -1,0 +1,978 @@
+/* Generated deterministically by CoreX Stage-0 Tier A (-ofmt=c) */
+/* module: codegen_showcase | target: x86_64-linux */
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <math.h>
+#if defined(_WIN32)
+#include <io.h>
+#include <fcntl.h>
+#else
+#include <unistd.h>
+#endif
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__wasm__)
+#define CX_THREAD_LOCAL _Thread_local
+#elif defined(_MSC_VER)
+#define CX_THREAD_LOCAL __declspec(thread)
+#elif (defined(__GNUC__) || defined(__clang__)) && !defined(__wasm__)
+#define CX_THREAD_LOCAL __thread
+#else
+#define CX_THREAD_LOCAL
+#endif
+
+typedef void (*_cx_fn_slot_t)(void);
+
+static void _cx_rt_init(void) {
+#if defined(_WIN32)
+    (void)_setmode(1, _O_BINARY);
+    (void)_setmode(2, _O_BINARY);
+#endif
+}
+
+static void _cx_rt_trace_append(const char *line_text) {
+    const char *trace_path = getenv("COREX_ORACLE_TRACE_FILE");
+    if (trace_path != NULL && trace_path[0] != '\0') {
+        FILE *trace_fp = fopen(trace_path, "ab");
+        if (trace_fp != NULL) {
+            size_t line_len = strlen(line_text);
+            if (line_len > 0) {
+                (void)fwrite(line_text, 1, line_len, trace_fp);
+            }
+            (void)fflush(trace_fp);
+            (void)fclose(trace_fp);
+        }
+    }
+}
+
+static void _cx_rt_drop_trace(int64_t drop_id) {
+    char msg_buf[64];
+    (void)snprintf(msg_buf, sizeof(msg_buf), "DROP:%lld\n", (long long)drop_id);
+    _cx_rt_trace_append(msg_buf);
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noreturn))
+#endif
+static void _cx_rt_trap(uint32_t trap_reason) {
+    (void)trap_reason;
+    const char *trace_path = getenv("COREX_ORACLE_TRACE_FILE");
+    if (trace_path != NULL && trace_path[0] != '\0') {
+        _cx_rt_trace_append("TRAP:1\n");
+        (void)fflush(stdout);
+        (void)fflush(stderr);
+        _exit(101);
+    }
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_trap();
+#else
+    abort();
+#endif
+}
+
+static intptr_t _cx_rt_sys_write(int32_t fd_num, const uint8_t *buf_ptr, size_t buf_len) {
+    if (fd_num != 1 && fd_num != 2) {
+        return (intptr_t)(-1);
+    }
+    if (buf_len == 0) {
+        return 0;
+    }
+    size_t total_written = 0;
+    while (total_written < buf_len) {
+#if defined(_WIN32)
+        size_t rem_len = buf_len - total_written;
+        unsigned int chunk_len = rem_len > 0x7FFFFFFFu ? 0x7FFFFFFFu : (unsigned int)rem_len;
+        int wrote_now = _write((int)fd_num, buf_ptr + total_written, chunk_len);
+#else
+        ssize_t wrote_now = write((int)fd_num, buf_ptr + total_written, buf_len - total_written);
+#endif
+        if (wrote_now <= 0) {
+            return total_written > 0 ? (intptr_t)total_written : (intptr_t)(-1);
+        }
+        total_written += (size_t)wrote_now;
+    }
+    return (intptr_t)total_written;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noreturn))
+#endif
+static void _cx_rt_sys_exit(int32_t status_code) {
+    char exit_buf[64];
+    (void)snprintf(exit_buf, sizeof(exit_buf), "EXIT:%d\n", (int)status_code);
+    _cx_rt_trace_append(exit_buf);
+    (void)fflush(stdout);
+    (void)fflush(stderr);
+    _exit((int)status_code);
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noreturn))
+#endif
+static void _cx_rt_panic(const uint8_t *msg_ptr, size_t msg_len) {
+    static const uint8_t prefix_bytes[7] = { 'p', 'a', 'n', 'i', 'c', ':', ' ' };
+    static const uint8_t nl_byte[1] = { '\n' };
+    (void)_cx_rt_sys_write(2, prefix_bytes, 7);
+    if (msg_ptr != NULL && msg_len > 0) {
+        (void)_cx_rt_sys_write(2, msg_ptr, msg_len);
+    }
+    (void)_cx_rt_sys_write(2, nl_byte, 1);
+    _cx_rt_trap(0);
+}
+
+static inline uint8_t _cx_str_eq(
+    const uint8_t *lhs_ptr,
+    size_t lhs_len,
+    const uint8_t *rhs_ptr,
+    size_t rhs_len
+) {
+    if (lhs_len != rhs_len) return 0u;
+    if (lhs_len == 0) return 1u;
+    return memcmp(lhs_ptr, rhs_ptr, lhs_len) == 0 ? 1u : 0u;
+}
+
+static const uint8_t __attribute__((aligned(16))) _cx_empty_rodata[1u] = { 0x00u };
+
+static inline uint8_t _cx_read_u8(const uint8_t *base_p, size_t off_b) {
+    return base_p[off_b];
+}
+static inline uint16_t _cx_read_u16(const uint8_t *base_p, size_t off_b) {
+    uint16_t out_v = 0u;
+    memcpy(&out_v, base_p + off_b, sizeof(out_v));
+    return out_v;
+}
+static inline uint32_t _cx_read_u32(const uint8_t *base_p, size_t off_b) {
+    uint32_t out_v = 0u;
+    memcpy(&out_v, base_p + off_b, sizeof(out_v));
+    return out_v;
+}
+static inline uint64_t _cx_read_u64(const uint8_t *base_p, size_t off_b) {
+    uint64_t out_v = 0u;
+    memcpy(&out_v, base_p + off_b, sizeof(out_v));
+    return out_v;
+}
+static inline void _cx_write_u8(uint8_t *base_p, size_t off_b, uint8_t val) {
+    base_p[off_b] = val;
+}
+static inline void _cx_write_u16(uint8_t *base_p, size_t off_b, uint16_t val) {
+    memcpy(base_p + off_b, &val, sizeof(val));
+}
+static inline void _cx_write_u32(uint8_t *base_p, size_t off_b, uint32_t val) {
+    memcpy(base_p + off_b, &val, sizeof(val));
+}
+static inline void _cx_write_u64(uint8_t *base_p, size_t off_b, uint64_t val) {
+    memcpy(base_p + off_b, &val, sizeof(val));
+}
+#if defined(__SIZEOF_INT128__)
+typedef __int128 cx_i128;
+typedef unsigned __int128 cx_u128;
+static inline cx_u128 _cx_u128_make(uint64_t lo_w, uint64_t hi_w) {
+    return ((cx_u128)hi_w << 64) | (cx_u128)lo_w;
+}
+static inline cx_i128 _cx_i128_make(uint64_t lo_w, uint64_t hi_w) {
+    return (cx_i128)_cx_u128_make(lo_w, hi_w);
+}
+static inline uint64_t _cx_u128_lo(cx_u128 val) { return (uint64_t)val; }
+static inline uint64_t _cx_u128_hi(cx_u128 val) { return (uint64_t)(val >> 64); }
+static inline cx_u128 _cx_as_u128(cx_i128 val) { return (cx_u128)val; }
+static inline cx_i128 _cx_as_i128(cx_u128 val) { return (cx_i128)val; }
+static inline cx_u128 _cx_u128_add_wrap(cx_u128 lhs_v, cx_u128 rhs_v) { return lhs_v + rhs_v; }
+static inline cx_u128 _cx_u128_sub_wrap(cx_u128 lhs_v, cx_u128 rhs_v) { return lhs_v - rhs_v; }
+static inline cx_u128 _cx_u128_mul_wrap(cx_u128 lhs_v, cx_u128 rhs_v) { return lhs_v * rhs_v; }
+static inline cx_u128 _cx_u128_and(cx_u128 lhs_v, cx_u128 rhs_v) { return lhs_v & rhs_v; }
+static inline cx_u128 _cx_u128_or(cx_u128 lhs_v, cx_u128 rhs_v) { return lhs_v | rhs_v; }
+static inline cx_u128 _cx_u128_xor(cx_u128 lhs_v, cx_u128 rhs_v) { return lhs_v ^ rhs_v; }
+static inline cx_u128 _cx_u128_not(cx_u128 val) { return ~val; }
+static inline cx_u128 _cx_u128_shl(cx_u128 val, uint32_t amt) { return val << (amt & 127u); }
+static inline cx_u128 _cx_u128_lshr(cx_u128 val, uint32_t amt) { return val >> (amt & 127u); }
+static inline cx_i128 _cx_i128_ashr(cx_i128 val, uint32_t amt) { return val >> (amt & 127u); }
+static inline uint8_t _cx_u128_eq(cx_u128 lhs_v, cx_u128 rhs_v) { return lhs_v == rhs_v ? 1u : 0u; }
+static inline uint8_t _cx_u128_ult(cx_u128 lhs_v, cx_u128 rhs_v) { return lhs_v < rhs_v ? 1u : 0u; }
+static inline uint8_t _cx_i128_slt(cx_i128 lhs_v, cx_i128 rhs_v) { return lhs_v < rhs_v ? 1u : 0u; }
+static inline cx_u128 _cx_u128_add_chk(cx_u128 lhs_v, cx_u128 rhs_v) {
+    cx_u128 res_v = lhs_v + rhs_v;
+    if (res_v < lhs_v) _cx_rt_trap(2);
+    return res_v;
+}
+static inline cx_u128 _cx_u128_sub_chk(cx_u128 lhs_v, cx_u128 rhs_v) {
+    if (lhs_v < rhs_v) _cx_rt_trap(2);
+    return lhs_v - rhs_v;
+}
+static inline cx_u128 _cx_u128_mul_chk(cx_u128 lhs_v, cx_u128 rhs_v) {
+    cx_u128 res_v = 0;
+    if (__builtin_mul_overflow(lhs_v, rhs_v, &res_v)) _cx_rt_trap(2);
+    return res_v;
+}
+static inline cx_i128 _cx_i128_add_chk(cx_i128 lhs_v, cx_i128 rhs_v) {
+    cx_i128 res_v = 0;
+    if (__builtin_add_overflow(lhs_v, rhs_v, &res_v)) _cx_rt_trap(2);
+    return res_v;
+}
+static inline cx_i128 _cx_i128_sub_chk(cx_i128 lhs_v, cx_i128 rhs_v) {
+    cx_i128 res_v = 0;
+    if (__builtin_sub_overflow(lhs_v, rhs_v, &res_v)) _cx_rt_trap(2);
+    return res_v;
+}
+static inline cx_i128 _cx_i128_mul_chk(cx_i128 lhs_v, cx_i128 rhs_v) {
+    cx_i128 res_v = 0;
+    if (__builtin_mul_overflow(lhs_v, rhs_v, &res_v)) _cx_rt_trap(2);
+    return res_v;
+}
+static inline cx_u128 _cx_u128_div_chk(cx_u128 lhs_v, cx_u128 rhs_v) {
+    if (rhs_v == 0) _cx_rt_trap(2);
+    return lhs_v / rhs_v;
+}
+static inline cx_u128 _cx_u128_rem_chk(cx_u128 lhs_v, cx_u128 rhs_v) {
+    if (rhs_v == 0) _cx_rt_trap(2);
+    return lhs_v % rhs_v;
+}
+static inline cx_i128 _cx_i128_div_chk(cx_i128 lhs_v, cx_i128 rhs_v) {
+    cx_i128 min_v = (cx_i128)((cx_u128)1 << 127);
+    if (rhs_v == 0 || (lhs_v == min_v && rhs_v == (cx_i128)(-1))) _cx_rt_trap(2);
+    return lhs_v / rhs_v;
+}
+static inline cx_i128 _cx_i128_rem_chk(cx_i128 lhs_v, cx_i128 rhs_v) {
+    cx_i128 min_v = (cx_i128)((cx_u128)1 << 127);
+    if (rhs_v == 0 || (lhs_v == min_v && rhs_v == (cx_i128)(-1))) _cx_rt_trap(2);
+    return lhs_v % rhs_v;
+}
+#else
+typedef struct __attribute__((aligned(8))) cx_u128 { uint64_t lo; uint64_t hi; } cx_u128;
+typedef cx_u128 cx_i128;
+static inline cx_u128 _cx_u128_make(uint64_t lo_w, uint64_t hi_w) {
+    cx_u128 out_v; out_v.lo = lo_w; out_v.hi = hi_w; return out_v;
+}
+static inline cx_i128 _cx_i128_make(uint64_t lo_w, uint64_t hi_w) {
+    return _cx_u128_make(lo_w, hi_w);
+}
+static inline uint64_t _cx_u128_lo(cx_u128 val) { return val.lo; }
+static inline uint64_t _cx_u128_hi(cx_u128 val) { return val.hi; }
+static inline cx_u128 _cx_as_u128(cx_i128 val) { return val; }
+static inline cx_i128 _cx_as_i128(cx_u128 val) { return val; }
+static inline cx_u128 _cx_u128_add_wrap(cx_u128 lhs_v, cx_u128 rhs_v) {
+    uint64_t lo_s = lhs_v.lo + rhs_v.lo;
+    uint64_t carry_b = lo_s < lhs_v.lo ? 1ull : 0ull;
+    return _cx_u128_make(lo_s, lhs_v.hi + rhs_v.hi + carry_b);
+}
+static inline cx_u128 _cx_u128_sub_wrap(cx_u128 lhs_v, cx_u128 rhs_v) {
+    uint64_t borrow_b = lhs_v.lo < rhs_v.lo ? 1ull : 0ull;
+    return _cx_u128_make(lhs_v.lo - rhs_v.lo, lhs_v.hi - rhs_v.hi - borrow_b);
+}
+static inline cx_u128 _cx_u128_mul_wrap(cx_u128 lhs_v, cx_u128 rhs_v) {
+    uint64_t a_lo = lhs_v.lo & 0xFFFFFFFFull, a_hi = lhs_v.lo >> 32;
+    uint64_t b_lo = rhs_v.lo & 0xFFFFFFFFull, b_hi = rhs_v.lo >> 32;
+    uint64_t p0 = a_lo * b_lo;
+    uint64_t p1 = a_lo * b_hi;
+    uint64_t p2 = a_hi * b_lo;
+    uint64_t p3 = a_hi * b_hi;
+    uint64_t mid_c = ((p0 >> 32) + (p1 & 0xFFFFFFFFull) + (p2 & 0xFFFFFFFFull)) >> 32;
+    uint64_t hi_w = p3 + (p1 >> 32) + (p2 >> 32) + mid_c + lhs_v.lo * rhs_v.hi + lhs_v.hi * rhs_v.lo;
+    return _cx_u128_make(lhs_v.lo * rhs_v.lo, hi_w);
+}
+static inline cx_u128 _cx_u128_and(cx_u128 lhs_v, cx_u128 rhs_v) {
+    return _cx_u128_make(lhs_v.lo & rhs_v.lo, lhs_v.hi & rhs_v.hi);
+}
+static inline cx_u128 _cx_u128_or(cx_u128 lhs_v, cx_u128 rhs_v) {
+    return _cx_u128_make(lhs_v.lo | rhs_v.lo, lhs_v.hi | rhs_v.hi);
+}
+static inline cx_u128 _cx_u128_xor(cx_u128 lhs_v, cx_u128 rhs_v) {
+    return _cx_u128_make(lhs_v.lo ^ rhs_v.lo, lhs_v.hi ^ rhs_v.hi);
+}
+static inline cx_u128 _cx_u128_not(cx_u128 val) { return _cx_u128_make(~val.lo, ~val.hi); }
+static inline cx_u128 _cx_u128_shl(cx_u128 val, uint32_t amt) {
+    uint32_t sh = amt & 127u;
+    if (sh == 0) return val;
+    if (sh >= 64) return _cx_u128_make(0, val.lo << (sh - 64));
+    return _cx_u128_make(val.lo << sh, (val.hi << sh) | (val.lo >> (64 - sh)));
+}
+static inline cx_u128 _cx_u128_lshr(cx_u128 val, uint32_t amt) {
+    uint32_t sh = amt & 127u;
+    if (sh == 0) return val;
+    if (sh >= 64) return _cx_u128_make(val.hi >> (sh - 64), 0);
+    return _cx_u128_make((val.lo >> sh) | (val.hi << (64 - sh)), val.hi >> sh);
+}
+static inline cx_i128 _cx_i128_ashr(cx_i128 val, uint32_t amt) {
+    uint32_t sh = amt & 127u;
+    if (sh == 0) return val;
+    int64_t s_hi = (int64_t)val.hi;
+    if (sh >= 64) {
+        uint64_t new_lo = (uint64_t)(s_hi >> (sh - 64));
+        uint64_t sign_fill = s_hi < 0 ? 0xFFFFFFFFFFFFFFFFull : 0ull;
+        return _cx_u128_make(new_lo, sign_fill);
+    }
+    return _cx_u128_make((val.lo >> sh) | (val.hi << (64 - sh)), (uint64_t)(s_hi >> sh));
+}
+static inline uint8_t _cx_u128_eq(cx_u128 lhs_v, cx_u128 rhs_v) {
+    return (lhs_v.lo == rhs_v.lo && lhs_v.hi == rhs_v.hi) ? 1u : 0u;
+}
+static inline uint8_t _cx_u128_ult(cx_u128 lhs_v, cx_u128 rhs_v) {
+    return (lhs_v.hi < rhs_v.hi || (lhs_v.hi == rhs_v.hi && lhs_v.lo < rhs_v.lo)) ? 1u : 0u;
+}
+static inline uint8_t _cx_i128_slt(cx_i128 lhs_v, cx_i128 rhs_v) {
+    int64_t l_hi = (int64_t)lhs_v.hi, r_hi = (int64_t)rhs_v.hi;
+    return (l_hi < r_hi || (l_hi == r_hi && lhs_v.lo < rhs_v.lo)) ? 1u : 0u;
+}
+static inline cx_u128 _cx_u128_add_chk(cx_u128 lhs_v, cx_u128 rhs_v) {
+    cx_u128 res_v = _cx_u128_add_wrap(lhs_v, rhs_v);
+    if (_cx_u128_ult(res_v, lhs_v)) _cx_rt_trap(2);
+    return res_v;
+}
+static inline cx_u128 _cx_u128_sub_chk(cx_u128 lhs_v, cx_u128 rhs_v) {
+    if (_cx_u128_ult(lhs_v, rhs_v)) _cx_rt_trap(2);
+    return _cx_u128_sub_wrap(lhs_v, rhs_v);
+}
+static inline cx_u128 _cx_u128_divrem(cx_u128 num_v, cx_u128 den_v, cx_u128 *rem_out) {
+    if (den_v.lo == 0 && den_v.hi == 0) _cx_rt_trap(2);
+    cx_u128 quot_v = _cx_u128_make(0, 0);
+    cx_u128 rem_v = _cx_u128_make(0, 0);
+    int bit_i = 127;
+    while (bit_i >= 0) {
+        rem_v = _cx_u128_shl(rem_v, 1);
+        uint64_t bit_b = (bit_i >= 64) ? ((num_v.hi >> (bit_i - 64)) & 1ull) : ((num_v.lo >> bit_i) & 1ull);
+        rem_v.lo |= bit_b;
+        if (!_cx_u128_ult(rem_v, den_v)) {
+            rem_v = _cx_u128_sub_wrap(rem_v, den_v);
+            if (bit_i >= 64) quot_v.hi |= (1ull << (bit_i - 64));
+            else quot_v.lo |= (1ull << bit_i);
+        }
+        bit_i -= 1;
+    }
+    if (rem_out != NULL) *rem_out = rem_v;
+    return quot_v;
+}
+static inline cx_u128 _cx_u128_mul_chk(cx_u128 lhs_v, cx_u128 rhs_v) {
+    cx_u128 prod_v = _cx_u128_mul_wrap(lhs_v, rhs_v);
+    if ((lhs_v.lo != 0 || lhs_v.hi != 0) && !_cx_u128_eq(_cx_u128_divrem(prod_v, lhs_v, NULL), rhs_v)) {
+        _cx_rt_trap(2);
+    }
+    return prod_v;
+}
+static inline cx_i128 _cx_i128_add_chk(cx_i128 lhs_v, cx_i128 rhs_v) {
+    cx_i128 res_v = _cx_u128_add_wrap(lhs_v, rhs_v);
+    uint64_t l_s = lhs_v.hi >> 63, r_s = rhs_v.hi >> 63, o_s = res_v.hi >> 63;
+    if (l_s == r_s && o_s != l_s) _cx_rt_trap(2);
+    return res_v;
+}
+static inline cx_i128 _cx_i128_sub_chk(cx_i128 lhs_v, cx_i128 rhs_v) {
+    cx_i128 res_v = _cx_u128_sub_wrap(lhs_v, rhs_v);
+    uint64_t l_s = lhs_v.hi >> 63, r_s = rhs_v.hi >> 63, o_s = res_v.hi >> 63;
+    if (l_s != r_s && o_s != l_s) _cx_rt_trap(2);
+    return res_v;
+}
+static inline cx_u128 _cx_i128_abs(cx_i128 val) {
+    return ((int64_t)val.hi < 0) ? _cx_u128_sub_wrap(_cx_u128_make(0, 0), val) : val;
+}
+static inline cx_i128 _cx_i128_mul_chk(cx_i128 lhs_v, cx_i128 rhs_v) {
+    int is_neg = (((int64_t)lhs_v.hi < 0) != ((int64_t)rhs_v.hi < 0));
+    cx_u128 mag_l = _cx_i128_abs(lhs_v), mag_r = _cx_i128_abs(rhs_v);
+    cx_u128 prod_u = _cx_u128_mul_chk(mag_l, mag_r);
+    cx_u128 lim_u = _cx_u128_make(is_neg ? 0ull : 0xFFFFFFFFFFFFFFFFull, is_neg ? 0x8000000000000000ull : 0x7FFFFFFFFFFFFFFFull);
+    if (_cx_u128_ult(lim_u, prod_u)) _cx_rt_trap(2);
+    return is_neg ? _cx_u128_sub_wrap(_cx_u128_make(0, 0), prod_u) : prod_u;
+}
+static inline cx_u128 _cx_u128_div_chk(cx_u128 lhs_v, cx_u128 rhs_v) {
+    return _cx_u128_divrem(lhs_v, rhs_v, NULL);
+}
+static inline cx_u128 _cx_u128_rem_chk(cx_u128 lhs_v, cx_u128 rhs_v) {
+    cx_u128 rem_v; (void)_cx_u128_divrem(lhs_v, rhs_v, &rem_v); return rem_v;
+}
+static inline cx_i128 _cx_i128_div_chk(cx_i128 lhs_v, cx_i128 rhs_v) {
+    if (rhs_v.lo == 0 && rhs_v.hi == 0) _cx_rt_trap(2);
+    if (lhs_v.lo == 0 && lhs_v.hi == 0x8000000000000000ull &&
+        rhs_v.lo == 0xFFFFFFFFFFFFFFFFull && rhs_v.hi == 0xFFFFFFFFFFFFFFFFull) _cx_rt_trap(2);
+    int is_neg = (((int64_t)lhs_v.hi < 0) != ((int64_t)rhs_v.hi < 0));
+    cx_u128 quot_u = _cx_u128_divrem(_cx_i128_abs(lhs_v), _cx_i128_abs(rhs_v), NULL);
+    return is_neg ? _cx_u128_sub_wrap(_cx_u128_make(0, 0), quot_u) : quot_u;
+}
+static inline cx_i128 _cx_i128_rem_chk(cx_i128 lhs_v, cx_i128 rhs_v) {
+    if (rhs_v.lo == 0 && rhs_v.hi == 0) _cx_rt_trap(2);
+    if (lhs_v.lo == 0 && lhs_v.hi == 0x8000000000000000ull &&
+        rhs_v.lo == 0xFFFFFFFFFFFFFFFFull && rhs_v.hi == 0xFFFFFFFFFFFFFFFFull) _cx_rt_trap(2);
+    cx_u128 rem_u; (void)_cx_u128_divrem(_cx_i128_abs(lhs_v), _cx_i128_abs(rhs_v), &rem_u);
+    return ((int64_t)lhs_v.hi < 0) ? _cx_u128_sub_wrap(_cx_u128_make(0, 0), rem_u) : rem_u;
+}
+#endif
+
+static inline uint32_t _cx_clz64(uint64_t val) {
+    uint32_t cnt = 0u;
+    while ((val & 0x8000000000000000ull) == 0ull) { cnt += 1u; val <<= 1u; }
+    return cnt;
+}
+static inline cx_u128 _cx_u128_add_sat(cx_u128 lhs_v, cx_u128 rhs_v) {
+    cx_u128 res_v = _cx_u128_add_wrap(lhs_v, rhs_v);
+    return _cx_u128_ult(res_v, lhs_v) ? _cx_u128_make(0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFFull) : res_v;
+}
+static inline cx_u128 _cx_u128_sub_sat(cx_u128 lhs_v, cx_u128 rhs_v) {
+    return _cx_u128_ult(lhs_v, rhs_v) ? _cx_u128_make(0ull, 0ull) : _cx_u128_sub_wrap(lhs_v, rhs_v);
+}
+static inline cx_u128 _cx_u128_mul_sat(cx_u128 lhs_v, cx_u128 rhs_v) {
+    cx_u128 prod_v = _cx_u128_mul_wrap(lhs_v, rhs_v);
+    if ((_cx_u128_lo(lhs_v) != 0ull || _cx_u128_hi(lhs_v) != 0ull) &&
+        !_cx_u128_eq(_cx_u128_div_chk(prod_v, lhs_v), rhs_v)) {
+        return _cx_u128_make(0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFFull);
+    }
+    return prod_v;
+}
+static inline cx_i128 _cx_i128_add_sat(cx_i128 lhs_v, cx_i128 rhs_v) {
+    cx_u128 lu_v = _cx_as_u128(lhs_v), ru_v = _cx_as_u128(rhs_v);
+    cx_u128 res_v = _cx_u128_add_wrap(lu_v, ru_v);
+    uint64_t l_s = _cx_u128_hi(lu_v) >> 63, r_s = _cx_u128_hi(ru_v) >> 63, o_s = _cx_u128_hi(res_v) >> 63;
+    if (l_s == r_s && o_s != l_s) {
+        return _cx_as_i128(l_s ? _cx_u128_make(0ull, 0x8000000000000000ull) : _cx_u128_make(0xFFFFFFFFFFFFFFFFull, 0x7FFFFFFFFFFFFFFFull));
+    }
+    return _cx_as_i128(res_v);
+}
+static inline cx_i128 _cx_i128_sub_sat(cx_i128 lhs_v, cx_i128 rhs_v) {
+    cx_u128 lu_v = _cx_as_u128(lhs_v), ru_v = _cx_as_u128(rhs_v);
+    cx_u128 res_v = _cx_u128_sub_wrap(lu_v, ru_v);
+    uint64_t l_s = _cx_u128_hi(lu_v) >> 63, r_s = _cx_u128_hi(ru_v) >> 63, o_s = _cx_u128_hi(res_v) >> 63;
+    if (l_s != r_s && o_s != l_s) {
+        return _cx_as_i128(l_s ? _cx_u128_make(0ull, 0x8000000000000000ull) : _cx_u128_make(0xFFFFFFFFFFFFFFFFull, 0x7FFFFFFFFFFFFFFFull));
+    }
+    return _cx_as_i128(res_v);
+}
+static inline cx_i128 _cx_i128_mul_sat(cx_i128 lhs_v, cx_i128 rhs_v) {
+    cx_u128 lu_v = _cx_as_u128(lhs_v), ru_v = _cx_as_u128(rhs_v);
+    int is_neg = (((int64_t)_cx_u128_hi(lu_v) < 0) != ((int64_t)_cx_u128_hi(ru_v) < 0));
+    cx_u128 mag_l = ((int64_t)_cx_u128_hi(lu_v) < 0) ? _cx_u128_sub_wrap(_cx_u128_make(0ull, 0ull), lu_v) : lu_v;
+    cx_u128 mag_r = ((int64_t)_cx_u128_hi(ru_v) < 0) ? _cx_u128_sub_wrap(_cx_u128_make(0ull, 0ull), ru_v) : ru_v;
+    cx_u128 prod_u = _cx_u128_mul_sat(mag_l, mag_r);
+    cx_u128 lim_u = _cx_u128_make(is_neg ? 0ull : 0xFFFFFFFFFFFFFFFFull, is_neg ? 0x8000000000000000ull : 0x7FFFFFFFFFFFFFFFull);
+    if (_cx_u128_ult(lim_u, prod_u)) return _cx_as_i128(lim_u);
+    return _cx_as_i128(is_neg ? _cx_u128_sub_wrap(_cx_u128_make(0ull, 0ull), prod_u) : prod_u);
+}
+static inline double _cx_u128_to_f64(cx_u128 val) {
+    uint64_t hi_w = _cx_u128_hi(val), lo_w = _cx_u128_lo(val);
+    if (hi_w == 0ull) return (double)lo_w;
+    uint32_t bit_len = 128u - _cx_clz64(hi_w);
+    uint32_t sh_amt = bit_len - 55u;
+    cx_u128 top_u = _cx_u128_lshr(val, sh_amt);
+    cx_u128 rem_u = _cx_u128_sub_wrap(val, _cx_u128_shl(top_u, sh_amt));
+    uint64_t sticky_b = (_cx_u128_lo(rem_u) != 0ull || _cx_u128_hi(rem_u) != 0ull) ? 1ull : 0ull;
+    uint64_t sig55 = _cx_u128_lo(top_u) | sticky_b;
+    uint32_t s1 = sh_amt > 52u ? 52u : sh_amt;
+    uint32_t s2 = sh_amt - s1;
+    return ((double)sig55 * (double)(1ull << s1)) * (double)(1ull << s2);
+}
+static inline float _cx_u128_to_f32(cx_u128 val) {
+    uint64_t hi_w = _cx_u128_hi(val), lo_w = _cx_u128_lo(val);
+    if (hi_w == 0ull) return (float)lo_w;
+    uint32_t bit_len = 128u - _cx_clz64(hi_w);
+    uint32_t sh_amt = bit_len - 26u;
+    cx_u128 top_u = _cx_u128_lshr(val, sh_amt);
+    cx_u128 rem_u = _cx_u128_sub_wrap(val, _cx_u128_shl(top_u, sh_amt));
+    uint64_t sticky_b = (_cx_u128_lo(rem_u) != 0ull || _cx_u128_hi(rem_u) != 0ull) ? 1ull : 0ull;
+    uint64_t sig26 = _cx_u128_lo(top_u) | sticky_b;
+    uint32_t s1 = sh_amt > 62u ? 62u : sh_amt;
+    uint32_t s2 = sh_amt - s1;
+    return ((float)sig26 * (float)(1ull << s1)) * (float)(1ull << s2);
+}
+static inline double _cx_i128_to_f64(cx_i128 val) {
+    cx_u128 u_val = _cx_as_u128(val);
+    if (((int64_t)_cx_u128_hi(u_val)) < 0) {
+        return -_cx_u128_to_f64(_cx_u128_sub_wrap(_cx_u128_make(0ull, 0ull), u_val));
+    }
+    return _cx_u128_to_f64(u_val);
+}
+static inline float _cx_i128_to_f32(cx_i128 val) {
+    cx_u128 u_val = _cx_as_u128(val);
+    if (((int64_t)_cx_u128_hi(u_val)) < 0) {
+        return -_cx_u128_to_f32(_cx_u128_sub_wrap(_cx_u128_make(0ull, 0ull), u_val));
+    }
+    return _cx_u128_to_f32(u_val);
+}
+static inline int64_t _cx_f64_to_i64(double val, double min_incl, double max_excl) {
+    if (isnan(val) || isinf(val)) _cx_rt_trap(2);
+    double tr_v = trunc(val);
+    if (tr_v < min_incl || tr_v >= max_excl) _cx_rt_trap(2);
+    return (int64_t)tr_v;
+}
+static inline uint64_t _cx_f64_to_u64(double val, double max_excl) {
+    if (isnan(val) || isinf(val)) _cx_rt_trap(2);
+    double tr_v = trunc(val);
+    if (tr_v < 0.0 || tr_v >= max_excl) _cx_rt_trap(2);
+    return (uint64_t)tr_v;
+}
+static inline cx_u128 _cx_f64_to_u128(double val) {
+    if (isnan(val) || isinf(val)) _cx_rt_trap(2);
+    double tr_v = trunc(val);
+    if (tr_v < 0.0 || tr_v >= 340282366920938463463374607431768211456.0) _cx_rt_trap(2);
+    double two64 = 18446744073709551616.0;
+    uint64_t hi_w = (uint64_t)(tr_v / two64);
+    uint64_t lo_w = (uint64_t)(tr_v - (double)hi_w * two64);
+    return _cx_u128_make(lo_w, hi_w);
+}
+static inline cx_i128 _cx_f64_to_i128(double val) {
+    if (isnan(val) || isinf(val)) _cx_rt_trap(2);
+    double tr_v = trunc(val);
+    if (tr_v < -170141183460469231731687303715884105728.0 ||
+        tr_v >= 170141183460469231731687303715884105728.0) _cx_rt_trap(2);
+    if (tr_v < 0.0) {
+        cx_u128 mag_u = _cx_f64_to_u128(-tr_v);
+        return _cx_as_i128(_cx_u128_sub_wrap(_cx_u128_make(0ull, 0ull), mag_u));
+    }
+    return _cx_as_i128(_cx_f64_to_u128(tr_v));
+}
+static size_t _cx_fmt_u128(char *out_buf, cx_u128 val) {
+    if (_cx_u128_hi(val) == 0ull) {
+        int len_n = snprintf(out_buf, 64u, "%llu", (unsigned long long)_cx_u128_lo(val));
+        return len_n > 0 ? (size_t)len_n : 0u;
+    }
+    char rev_buf[48];
+    size_t rev_n = 0u;
+    cx_u128 cur_v = val;
+    cx_u128 ten_v = _cx_u128_make(10ull, 0ull);
+    while (_cx_u128_lo(cur_v) != 0ull || _cx_u128_hi(cur_v) != 0ull) {
+        cx_u128 rem_v = _cx_u128_rem_chk(cur_v, ten_v);
+        rev_buf[rev_n] = (char)('0' + (int)_cx_u128_lo(rem_v));
+        rev_n += 1u;
+        cur_v = _cx_u128_div_chk(cur_v, ten_v);
+    }
+    size_t idx_i = 0u;
+    while (idx_i < rev_n) {
+        out_buf[idx_i] = rev_buf[rev_n - 1u - idx_i];
+        idx_i += 1u;
+    }
+    out_buf[rev_n] = '\0';
+    return rev_n;
+}
+static size_t _cx_fmt_i128(char *out_buf, cx_i128 val) {
+    cx_u128 u_val = _cx_as_u128(val);
+    if (((int64_t)_cx_u128_hi(u_val)) < 0) {
+        out_buf[0] = '-';
+        return 1u + _cx_fmt_u128(out_buf + 1, _cx_u128_sub_wrap(_cx_u128_make(0ull, 0ull), u_val));
+    }
+    return _cx_fmt_u128(out_buf, u_val);
+}
+
+typedef struct _cx_ty_4 _cx_ty_4;
+typedef struct _cx_ty_64 _cx_ty_64;
+typedef struct _cx_ty_65 _cx_ty_65;
+typedef struct _cx_ty_66 _cx_ty_66;
+typedef struct _cx_ty_68 _cx_ty_68;
+typedef struct _cx_ty_73 _cx_ty_73;
+typedef struct _cx_ty_74 _cx_ty_74;
+
+struct _cx_ty_4 { uint8_t *ptr; uint64_t len; };
+typedef char _cx_sz_assert_4[(sizeof(_cx_ty_4) == 16u) ? 1 : -1];
+struct __attribute__((aligned(4))) _cx_ty_64 {
+    uint8_t _f0;
+    uint8_t _pad_0[3u];
+    uint32_t _f1;
+};
+typedef char _cx_sz_assert_64[(sizeof(_cx_ty_64) == 8u) ? 1 : -1];
+struct __attribute__((aligned(4))) _cx_ty_65 {
+    int32_t _f0;
+    int32_t _f1;
+};
+typedef char _cx_sz_assert_65[(sizeof(_cx_ty_65) == 8u) ? 1 : -1];
+struct __attribute__((aligned(4))) _cx_ty_66 {
+    uint8_t _tag;
+    uint8_t _pad_tag[3u];
+    union {
+        int32_t _v0;
+        int32_t _v1;
+        uint8_t _raw[4u];
+    } _u;
+};
+typedef char _cx_sz_assert_66[(sizeof(_cx_ty_66) == 8u) ? 1 : -1];
+typedef _cx_ty_66 (*_cx_ty_67)(_cx_ty_64);
+struct __attribute__((aligned(4))) _cx_ty_68 {
+    uint8_t _tag;
+    uint8_t _pad_tag[3u];
+    union {
+        int32_t _v1;
+        uint8_t _raw[4u];
+    } _u;
+};
+typedef char _cx_sz_assert_68[(sizeof(_cx_ty_68) == 8u) ? 1 : -1];
+struct __attribute__((aligned(16))) _cx_ty_73 { uint8_t _bytes[32u]; };
+typedef char _cx_sz_assert_73[(sizeof(_cx_ty_73) == 32u) ? 1 : -1];
+struct __attribute__((aligned(4))) _cx_ty_74 { int32_t _elems[4u]; };
+typedef char _cx_sz_assert_74[(sizeof(_cx_ty_74) == 16u) ? 1 : -1];
+
+
+static _cx_ty_66 _cx_fn_0_decode_header(_cx_ty_64 _arg_1);
+static _cx_ty_66 _cx_fn_1_compute_showcase(_cx_ty_64 _arg_1, _cx_ty_68 _arg_2);
+
+static _cx_ty_66 _cx_fn_0_decode_header(_cx_ty_64 _arg_1) {
+    _cx_ty_66 _loc_0; memset(&_loc_0, 0, sizeof(_loc_0)); (void)_loc_0;
+    _cx_ty_64 _loc_1 = _arg_1; (void)_loc_1;
+    uint8_t _v_2; memset(&_v_2, 0, sizeof(_v_2)); (void)_v_2;
+    uint8_t _v_4; memset(&_v_4, 0, sizeof(_v_4)); (void)_v_4;
+    uint8_t _v_5; memset(&_v_5, 0, sizeof(_v_5)); (void)_v_5;
+    int32_t _v_6; memset(&_v_6, 0, sizeof(_v_6)); (void)_v_6;
+    _cx_ty_66 _v_7; memset(&_v_7, 0, sizeof(_v_7)); (void)_v_7;
+    uint8_t _v_9 = 0u; (void)_v_9;
+    uint8_t _v_10 = 0u; (void)_v_10;
+    uint8_t _v_11 = 0u; (void)_v_11;
+    uint8_t _v_12 = 0u; (void)_v_12;
+    uint8_t _v_13 = 0u; (void)_v_13;
+    uint8_t _v_15; memset(&_v_15, 0, sizeof(_v_15)); (void)_v_15;
+    int32_t _v_17; memset(&_v_17, 0, sizeof(_v_17)); (void)_v_17;
+    uint32_t _v_19; memset(&_v_19, 0, sizeof(_v_19)); (void)_v_19;
+    int32_t _v_21; memset(&_v_21, 0, sizeof(_v_21)); (void)_v_21;
+    int32_t _v_22; memset(&_v_22, 0, sizeof(_v_22)); (void)_v_22;
+    _cx_ty_66 _v_23; memset(&_v_23, 0, sizeof(_v_23)); (void)_v_23;
+    uint8_t _v_25 = 0u; (void)_v_25;
+    uint8_t _v_26 = 0u; (void)_v_26;
+    uint8_t _v_27 = 0u; (void)_v_27;
+    goto _bb_0;
+_bb_0: ;
+    _v_2 = ((_loc_1)._f0);
+    _v_4 = (uint8_t)(0ull);
+    _v_5 = (((uint8_t)_v_2) == ((uint8_t)_v_4)) ? 1u : 0u;
+    if ((_v_5 & 1u) != 0u) {
+    goto _bb_1;
+    } else {
+    goto _bb_2;
+    }
+_bb_1: ;
+    _v_6 = (int32_t)(0ull);
+    memset(&_v_7, 0, sizeof(_v_7));
+    _v_7._u._v1 = _v_6;
+    _cx_write_u8((uint8_t *)&(_v_7), 0u, (uint8_t)1u);
+    _loc_0 = _v_7;
+    return _v_7;
+_bb_2: ;
+    _v_15 = ((_loc_1)._f0);
+    _v_17 = (int32_t)((uint8_t)_v_15);
+    _v_19 = ((_loc_1)._f1);
+    memcpy(&_v_21, &_v_19, sizeof(_v_21));
+    { int32_t _ov = 0; if (__builtin_add_overflow((int32_t)_v_17, (int32_t)_v_21, &_ov)) _cx_rt_trap(2); _v_22 = (int32_t)_ov; }
+    memset(&_v_23, 0, sizeof(_v_23));
+    _v_23._u._v0 = _v_22;
+    _cx_write_u8((uint8_t *)&(_v_23), 0u, (uint8_t)0u);
+    _loc_0 = _v_23;
+    return _v_23;
+_bb_3: ;
+    _cx_rt_trap(0u);
+}
+
+static _cx_ty_66 _cx_fn_1_compute_showcase(_cx_ty_64 _arg_1, _cx_ty_68 _arg_2) {
+    _cx_ty_66 _loc_0; memset(&_loc_0, 0, sizeof(_loc_0)); (void)_loc_0;
+    _cx_ty_64 _loc_1 = _arg_1; (void)_loc_1;
+    _cx_ty_68 _loc_2 = _arg_2; (void)_loc_2;
+    int32_t _loc_3; memset(&_loc_3, 0, sizeof(_loc_3)); (void)_loc_3;
+    int32_t _loc_4; memset(&_loc_4, 0, sizeof(_loc_4)); (void)_loc_4;
+    int32_t _loc_5; memset(&_loc_5, 0, sizeof(_loc_5)); (void)_loc_5;
+    _cx_ty_73 _loc_6; memset(&_loc_6, 0, sizeof(_loc_6)); (void)_loc_6;
+    int32_t _loc_7; memset(&_loc_7, 0, sizeof(_loc_7)); (void)_loc_7;
+    int32_t _loc_8; memset(&_loc_8, 0, sizeof(_loc_8)); (void)_loc_8;
+    _cx_ty_74 _loc_9; memset(&_loc_9, 0, sizeof(_loc_9)); (void)_loc_9;
+    uint64_t _loc_10; memset(&_loc_10, 0, sizeof(_loc_10)); (void)_loc_10;
+    uint64_t _loc_11; memset(&_loc_11, 0, sizeof(_loc_11)); (void)_loc_11;
+    uint64_t _loc_12; memset(&_loc_12, 0, sizeof(_loc_12)); (void)_loc_12;
+    uint64_t _loc_13; memset(&_loc_13, 0, sizeof(_loc_13)); (void)_loc_13;
+    int32_t _loc_14; memset(&_loc_14, 0, sizeof(_loc_14)); (void)_loc_14;
+    int32_t _loc_15; memset(&_loc_15, 0, sizeof(_loc_15)); (void)_loc_15;
+    int32_t _loc_16; memset(&_loc_16, 0, sizeof(_loc_16)); (void)_loc_16;
+    int32_t _loc_17; memset(&_loc_17, 0, sizeof(_loc_17)); (void)_loc_17;
+    int32_t _loc_18; memset(&_loc_18, 0, sizeof(_loc_18)); (void)_loc_18;
+    _cx_ty_66 _loc_19; memset(&_loc_19, 0, sizeof(_loc_19)); (void)_loc_19;
+    int32_t _loc_20; memset(&_loc_20, 0, sizeof(_loc_20)); (void)_loc_20;
+    int32_t _loc_21; memset(&_loc_21, 0, sizeof(_loc_21)); (void)_loc_21;
+    _cx_ty_66 _loc_22; memset(&_loc_22, 0, sizeof(_loc_22)); (void)_loc_22;
+    _cx_ty_64 _loc_23; memset(&_loc_23, 0, sizeof(_loc_23)); (void)_loc_23;
+    _cx_ty_64 _v_3; memset(&_v_3, 0, sizeof(_v_3)); (void)_v_3;
+    _cx_ty_67 _v_5; memset(&_v_5, 0, sizeof(_v_5)); (void)_v_5;
+    _cx_ty_66 _v_7; memset(&_v_7, 0, sizeof(_v_7)); (void)_v_7;
+    uint8_t _v_10 = 0u; (void)_v_10;
+    uint32_t _v_12; memset(&_v_12, 0, sizeof(_v_12)); (void)_v_12;
+    int32_t _v_15; memset(&_v_15, 0, sizeof(_v_15)); (void)_v_15;
+    int32_t _v_18; memset(&_v_18, 0, sizeof(_v_18)); (void)_v_18;
+    _cx_ty_66 _v_20; memset(&_v_20, 0, sizeof(_v_20)); (void)_v_20;
+    uint8_t _v_23 = 0u; (void)_v_23;
+    uint8_t _v_24 = 0u; (void)_v_24;
+    uint8_t _v_25 = 0u; (void)_v_25;
+    int32_t _v_26; memset(&_v_26, 0, sizeof(_v_26)); (void)_v_26;
+    int32_t _v_27; memset(&_v_27, 0, sizeof(_v_27)); (void)_v_27;
+    _cx_ty_65 _v_28; memset(&_v_28, 0, sizeof(_v_28)); (void)_v_28;
+    _cx_ty_73 _v_29; memset(&_v_29, 0, sizeof(_v_29)); (void)_v_29;
+    uint8_t _v_31 = 0u; (void)_v_31;
+    uint8_t _v_32 = 0u; (void)_v_32;
+    int32_t _v_33; memset(&_v_33, 0, sizeof(_v_33)); (void)_v_33;
+    int32_t _v_34; memset(&_v_34, 0, sizeof(_v_34)); (void)_v_34;
+    uint8_t _v_35 = 0u; (void)_v_35;
+    uint64_t _v_36; memset(&_v_36, 0, sizeof(_v_36)); (void)_v_36;
+    uint8_t _v_37; memset(&_v_37, 0, sizeof(_v_37)); (void)_v_37;
+    uint8_t _v_38 = 0u; (void)_v_38;
+    uint8_t _v_40 = 0u; (void)_v_40;
+    uint8_t _v_42 = 0u; (void)_v_42;
+    int32_t _v_43; memset(&_v_43, 0, sizeof(_v_43)); (void)_v_43;
+    int32_t _v_44; memset(&_v_44, 0, sizeof(_v_44)); (void)_v_44;
+    uint8_t _v_45 = 0u; (void)_v_45;
+    uint64_t _v_46; memset(&_v_46, 0, sizeof(_v_46)); (void)_v_46;
+    uint8_t _v_47; memset(&_v_47, 0, sizeof(_v_47)); (void)_v_47;
+    uint8_t _v_48 = 0u; (void)_v_48;
+    uint8_t _v_50 = 0u; (void)_v_50;
+    uint8_t _v_52 = 0u; (void)_v_52;
+    int32_t _v_53; memset(&_v_53, 0, sizeof(_v_53)); (void)_v_53;
+    int32_t _v_54; memset(&_v_54, 0, sizeof(_v_54)); (void)_v_54;
+    int32_t _v_55; memset(&_v_55, 0, sizeof(_v_55)); (void)_v_55;
+    int32_t _v_56; memset(&_v_56, 0, sizeof(_v_56)); (void)_v_56;
+    _cx_ty_74 _v_57; memset(&_v_57, 0, sizeof(_v_57)); (void)_v_57;
+    uint8_t _v_59 = 0u; (void)_v_59;
+    uint8_t _v_60 = 0u; (void)_v_60;
+    uint64_t _v_61; memset(&_v_61, 0, sizeof(_v_61)); (void)_v_61;
+    uint8_t _v_62 = 0u; (void)_v_62;
+    uint64_t _v_63; memset(&_v_63, 0, sizeof(_v_63)); (void)_v_63;
+    uint64_t _v_64; memset(&_v_64, 0, sizeof(_v_64)); (void)_v_64;
+    uint8_t _v_65; memset(&_v_65, 0, sizeof(_v_65)); (void)_v_65;
+    uint8_t _v_66 = 0u; (void)_v_66;
+    uint64_t _v_67; memset(&_v_67, 0, sizeof(_v_67)); (void)_v_67;
+    uint8_t _v_68; memset(&_v_68, 0, sizeof(_v_68)); (void)_v_68;
+    uint8_t _v_69 = 0u; (void)_v_69;
+    int32_t _v_71; memset(&_v_71, 0, sizeof(_v_71)); (void)_v_71;
+    int32_t _v_73; memset(&_v_73, 0, sizeof(_v_73)); (void)_v_73;
+    int32_t _v_74; memset(&_v_74, 0, sizeof(_v_74)); (void)_v_74;
+    uint8_t _v_75 = 0u; (void)_v_75;
+    uint64_t _v_76; memset(&_v_76, 0, sizeof(_v_76)); (void)_v_76;
+    uint8_t _v_77; memset(&_v_77, 0, sizeof(_v_77)); (void)_v_77;
+    uint8_t _v_78 = 0u; (void)_v_78;
+    uint8_t _v_80 = 0u; (void)_v_80;
+    uint8_t _v_82 = 0u; (void)_v_82;
+    uint64_t _v_83; memset(&_v_83, 0, sizeof(_v_83)); (void)_v_83;
+    uint8_t _v_84 = 0u; (void)_v_84;
+    uint64_t _v_85; memset(&_v_85, 0, sizeof(_v_85)); (void)_v_85;
+    uint8_t _v_86 = 0u; (void)_v_86;
+    uint8_t _v_87 = 0u; (void)_v_87;
+    uint8_t _v_88 = 0u; (void)_v_88;
+    uint8_t _v_89 = 0u; (void)_v_89;
+    uint8_t _v_90 = 0u; (void)_v_90;
+    uint8_t _v_91 = 0u; (void)_v_91;
+    uint8_t _v_92 = 0u; (void)_v_92;
+    uint8_t _v_93 = 0u; (void)_v_93;
+    _cx_ty_74 _v_95; memset(&_v_95, 0, sizeof(_v_95)); (void)_v_95;
+    int32_t _v_97; memset(&_v_97, 0, sizeof(_v_97)); (void)_v_97;
+    _cx_ty_74 _v_98; memset(&_v_98, 0, sizeof(_v_98)); (void)_v_98;
+    _cx_ty_74 _v_99; memset(&_v_99, 0, sizeof(_v_99)); (void)_v_99;
+    int32_t _v_100; memset(&_v_100, 0, sizeof(_v_100)); (void)_v_100;
+    uint8_t _v_101 = 0u; (void)_v_101;
+    uint32_t _v_103; memset(&_v_103, 0, sizeof(_v_103)); (void)_v_103;
+    int32_t _v_106; memset(&_v_106, 0, sizeof(_v_106)); (void)_v_106;
+    int32_t _v_108; memset(&_v_108, 0, sizeof(_v_108)); (void)_v_108;
+    int32_t _v_109; memset(&_v_109, 0, sizeof(_v_109)); (void)_v_109;
+    uint8_t _v_110 = 0u; (void)_v_110;
+    int32_t _v_111; memset(&_v_111, 0, sizeof(_v_111)); (void)_v_111;
+    int32_t _v_112; memset(&_v_112, 0, sizeof(_v_112)); (void)_v_112;
+    uint8_t _v_113 = 0u; (void)_v_113;
+    uint64_t _v_114; memset(&_v_114, 0, sizeof(_v_114)); (void)_v_114;
+    uint8_t _v_115; memset(&_v_115, 0, sizeof(_v_115)); (void)_v_115;
+    uint8_t _v_116 = 0u; (void)_v_116;
+    int32_t _v_118; memset(&_v_118, 0, sizeof(_v_118)); (void)_v_118;
+    int32_t _v_120; memset(&_v_120, 0, sizeof(_v_120)); (void)_v_120;
+    int32_t _v_121; memset(&_v_121, 0, sizeof(_v_121)); (void)_v_121;
+    uint8_t _v_122 = 0u; (void)_v_122;
+    uint64_t _v_123; memset(&_v_123, 0, sizeof(_v_123)); (void)_v_123;
+    uint8_t _v_124; memset(&_v_124, 0, sizeof(_v_124)); (void)_v_124;
+    uint8_t _v_125 = 0u; (void)_v_125;
+    int32_t _v_127; memset(&_v_127, 0, sizeof(_v_127)); (void)_v_127;
+    int32_t _v_129; memset(&_v_129, 0, sizeof(_v_129)); (void)_v_129;
+    int32_t _v_130; memset(&_v_130, 0, sizeof(_v_130)); (void)_v_130;
+    _cx_ty_66 _v_131; memset(&_v_131, 0, sizeof(_v_131)); (void)_v_131;
+    uint8_t _v_136 = 0u; (void)_v_136;
+    uint8_t _v_137 = 0u; (void)_v_137;
+    uint8_t _v_138 = 0u; (void)_v_138;
+    uint8_t _v_141; memset(&_v_141, 0, sizeof(_v_141)); (void)_v_141;
+    uint8_t _v_143; memset(&_v_143, 0, sizeof(_v_143)); (void)_v_143;
+    uint8_t _v_144; memset(&_v_144, 0, sizeof(_v_144)); (void)_v_144;
+    int32_t _v_145; memset(&_v_145, 0, sizeof(_v_145)); (void)_v_145;
+    _cx_ty_66 _v_146; memset(&_v_146, 0, sizeof(_v_146)); (void)_v_146;
+    uint8_t _v_148 = 0u; (void)_v_148;
+    uint8_t _v_149 = 0u; (void)_v_149;
+    uint8_t _v_150 = 0u; (void)_v_150;
+    uint8_t _v_151 = 0u; (void)_v_151;
+    uint8_t _v_152 = 0u; (void)_v_152;
+    uint8_t _v_154; memset(&_v_154, 0, sizeof(_v_154)); (void)_v_154;
+    int32_t _v_156; memset(&_v_156, 0, sizeof(_v_156)); (void)_v_156;
+    uint32_t _v_158; memset(&_v_158, 0, sizeof(_v_158)); (void)_v_158;
+    int32_t _v_160; memset(&_v_160, 0, sizeof(_v_160)); (void)_v_160;
+    int32_t _v_161; memset(&_v_161, 0, sizeof(_v_161)); (void)_v_161;
+    _cx_ty_66 _v_162; memset(&_v_162, 0, sizeof(_v_162)); (void)_v_162;
+    uint8_t _v_164 = 0u; (void)_v_164;
+    uint8_t _v_165 = 0u; (void)_v_165;
+    uint8_t _v_166 = 0u; (void)_v_166;
+    uint8_t _v_167 = 0u; (void)_v_167;
+    uint8_t _v_168; memset(&_v_168, 0, sizeof(_v_168)); (void)_v_168;
+    uint32_t _v_169; memset(&_v_169, 0, sizeof(_v_169)); (void)_v_169;
+    goto _bb_0;
+_bb_0: ;
+    _v_3 = _loc_1;
+    _v_168 = _v_3._f0;
+    _v_169 = _v_3._f1;
+    _v_143 = (uint8_t)(0ull);
+    _v_144 = (((uint8_t)_v_168) == ((uint8_t)_v_143)) ? 1u : 0u;
+    if ((_v_144 & 1u) != 0u) {
+    goto _bb_20;
+    } else {
+    goto _bb_21;
+    }
+_bb_1: ;
+    _loc_19 = _v_7;
+    _v_12 = (uint32_t)(((uint64_t)_cx_read_u8((const uint8_t *)&(_loc_19), 0u)));
+    switch (((uint64_t)_v_12) & 4294967295ull) {
+    case 0ull:
+    goto _bb_4;
+    case 1ull:
+    goto _bb_5;
+    default:
+    goto _bb_6;
+    }
+_bb_2: ;
+    _cx_rt_trap(0u);
+_bb_3: ;
+    _cx_rt_trap(0u);
+_bb_4: ;
+    _v_15 = ((_loc_19)._u._v0);
+    _v_26 = (int32_t)(0ull);
+    memset(&_v_28, 0, sizeof(_v_28));
+    _v_28._f0 = _v_26;
+    _v_28._f1 = _v_26;
+    memset(&_v_29, 0, sizeof(_v_29));
+    { size_t _ri = 0u; while (_ri < 4u) { ((int32_t *)(&_v_29._bytes[0u]))[_ri] = _v_28._f0; _ri += 1u; } }
+    { size_t _ri = 0u; while (_ri < 4u) { ((int32_t *)(&_v_29._bytes[16u]))[_ri] = _v_28._f1; _ri += 1u; } }
+    _loc_6 = _v_29;
+    _v_33 = (int32_t)(1ull);
+    _v_36 = (uint64_t)(4ull);
+    (((int32_t *)(&((_loc_6)._bytes[0u])))[((size_t)_v_26)]) = _v_33;
+    _v_43 = (int32_t)(8ull);
+    _v_44 = (int32_t)(3ull);
+    (((int32_t *)(&((_loc_6)._bytes[16u])))[((size_t)_v_44)]) = _v_43;
+    _v_53 = (int32_t)(2ull);
+    _v_54 = (int32_t)(4ull);
+    _v_55 = (int32_t)(6ull);
+    memset(&_v_57, 0, sizeof(_v_57));
+    _v_57._elems[0u] = _v_53;
+    _v_57._elems[1u] = _v_54;
+    _v_57._elems[2u] = _v_55;
+    _v_57._elems[3u] = _v_43;
+    _loc_9 = _v_57;
+    _v_61 = (uint64_t)(0ull);
+    {
+        uint64_t _phi_0 = _v_61;
+        _v_63 = _phi_0;
+        goto _bb_8;
+    }
+_bb_5: ;
+    _v_18 = ((_loc_19)._u._v1);
+    memset(&_v_20, 0, sizeof(_v_20));
+    _v_20._u._v1 = _v_18;
+    _cx_write_u8((uint8_t *)&(_v_20), 0u, (uint8_t)1u);
+    _loc_0 = _v_20;
+    return _v_20;
+_bb_6: ;
+    _cx_rt_trap(0u);
+_bb_7: ;
+    _cx_rt_trap(0u);
+_bb_8: ;
+    _v_65 = (((uint64_t)_v_63) < ((uint64_t)_v_36)) ? 1u : 0u;
+    if ((_v_65 & 1u) != 0u) {
+    goto _bb_10;
+    } else {
+    goto _bb_9;
+    }
+_bb_9: ;
+    _v_95 = _loc_9;
+    _v_98._elems[0u] = _v_15;
+    _v_98._elems[1u] = _v_15;
+    _v_98._elems[2u] = _v_15;
+    _v_98._elems[3u] = _v_15;
+    _v_99._elems[0u] = (int32_t)(((uint32_t)_v_95._elems[0u]) + ((uint32_t)_v_98._elems[0u]));
+    _v_99._elems[1u] = (int32_t)(((uint32_t)_v_95._elems[1u]) + ((uint32_t)_v_98._elems[1u]));
+    _v_99._elems[2u] = (int32_t)(((uint32_t)_v_95._elems[2u]) + ((uint32_t)_v_98._elems[2u]));
+    _v_99._elems[3u] = (int32_t)(((uint32_t)_v_95._elems[3u]) + ((uint32_t)_v_98._elems[3u]));
+    { uint32_t _racc_0 = 0u;
+      _racc_0 = (uint32_t)(_racc_0 + (uint32_t)_v_99._elems[0u]);
+      _racc_0 = (uint32_t)(_racc_0 + (uint32_t)_v_99._elems[1u]);
+      _racc_0 = (uint32_t)(_racc_0 + (uint32_t)_v_99._elems[2u]);
+      _racc_0 = (uint32_t)(_racc_0 + (uint32_t)_v_99._elems[3u]);
+      _v_100 = (int32_t)_racc_0; }
+    _v_103 = (uint32_t)(((uint64_t)_cx_read_u8((const uint8_t *)&(_loc_2), 0u)));
+    switch (((uint64_t)_v_103) & 4294967295ull) {
+    case 1ull:
+    goto _bb_15;
+    case 0ull:
+    goto _bb_14;
+    default:
+    goto _bb_17;
+    }
+_bb_10: ;
+    _v_71 = ((_loc_9)._elems[((size_t)_v_63)]);
+    { int32_t _ov = 0; if (__builtin_add_overflow((int32_t)_v_71, (int32_t)_v_33, &_ov)) _cx_rt_trap(2); _v_74 = (int32_t)_ov; }
+    ((_loc_9)._elems[((size_t)_v_63)]) = _v_74;
+    _v_83 = (uint64_t)(1ull);
+    _v_85 = (uint64_t)(((uint64_t)_v_63) + ((uint64_t)_v_83));
+    {
+        uint64_t _phi_0 = _v_85;
+        _v_63 = _phi_0;
+        goto _bb_8;
+    }
+_bb_11: ;
+    _cx_rt_trap(0u);
+_bb_12: ;
+    _cx_rt_trap(0u);
+_bb_13: ;
+    _cx_rt_trap(0u);
+_bb_14: ;
+    {
+        int32_t _phi_0 = _v_26;
+        _v_109 = _phi_0;
+        goto _bb_18;
+    }
+_bb_15: ;
+    _v_106 = ((_loc_2)._u._v1);
+    {
+        int32_t _phi_0 = _v_106;
+        _v_109 = _phi_0;
+        goto _bb_18;
+    }
+_bb_16: ;
+    _cx_rt_trap(0u);
+_bb_17: ;
+    _cx_rt_trap(0u);
+_bb_18: ;
+    _v_118 = (((int32_t *)(&((_loc_6)._bytes[0u])))[((size_t)_v_26)]);
+    { int32_t _ov = 0; if (__builtin_add_overflow((int32_t)_v_100, (int32_t)_v_118, &_ov)) _cx_rt_trap(2); _v_120 = (int32_t)_ov; }
+    _v_127 = (((int32_t *)(&((_loc_6)._bytes[16u])))[((size_t)_v_44)]);
+    { int32_t _ov = 0; if (__builtin_add_overflow((int32_t)_v_120, (int32_t)_v_127, &_ov)) _cx_rt_trap(2); _v_129 = (int32_t)_ov; }
+    { int32_t _ov = 0; if (__builtin_add_overflow((int32_t)_v_129, (int32_t)_v_109, &_ov)) _cx_rt_trap(2); _v_130 = (int32_t)_ov; }
+    memset(&_v_131, 0, sizeof(_v_131));
+    _v_131._u._v0 = _v_130;
+    _cx_write_u8((uint8_t *)&(_v_131), 0u, (uint8_t)0u);
+    _loc_0 = _v_131;
+    return _v_131;
+_bb_19: ;
+    _cx_rt_trap(0u);
+_bb_20: ;
+    _v_145 = (int32_t)(0ull);
+    memset(&_v_146, 0, sizeof(_v_146));
+    _v_146._u._v1 = _v_145;
+    _cx_write_u8((uint8_t *)&(_v_146), 0u, (uint8_t)1u);
+    _loc_22 = _v_146;
+    {
+        _cx_ty_66 _phi_0 = _v_146;
+        _v_7 = _phi_0;
+        goto _bb_1;
+    }
+_bb_21: ;
+    _v_156 = (int32_t)((uint8_t)_v_168);
+    memcpy(&_v_160, &_v_169, sizeof(_v_160));
+    { int32_t _ov = 0; if (__builtin_add_overflow((int32_t)_v_156, (int32_t)_v_160, &_ov)) _cx_rt_trap(2); _v_161 = (int32_t)_ov; }
+    memset(&_v_162, 0, sizeof(_v_162));
+    _v_162._u._v0 = _v_161;
+    _cx_write_u8((uint8_t *)&(_v_162), 0u, (uint8_t)0u);
+    _loc_22 = _v_162;
+    {
+        _cx_ty_66 _phi_0 = _v_162;
+        _v_7 = _phi_0;
+        goto _bb_1;
+    }
+_bb_22: ;
+    _cx_rt_trap(0u);
+}
+

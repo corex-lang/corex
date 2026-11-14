@@ -39,6 +39,16 @@ pub const mir_sast = @import("mir_sast.zig");
 pub const mir_vm = @import("mir_vm.zig");
 /// Dual-mode `MIR` optimizer (`--dev` `D1`–`D5` & `--release` `R1`–`R6`), monomorphizer, and `LayoutShapeKey` deduplicator.
 pub const mir_opt = @import("mir_opt.zig");
+/// Target specs, unified `TypeLayoutResolver`, `AbiClassifier`, `CodegenBackend`, and `Prune-02` atomic file writer.
+pub const codegen_abi = @import("codegen_abi.zig");
+/// Phase-7 `< 200` LOC forward-compatible `--dev` GOT, `CxTypeLayoutRecord`, and `.cx_dev_meta` binary seam (`DR-19`).
+pub const codegen_dev_seam = @import("codegen_dev_seam.zig");
+/// Tier A (`-ofmt=c`) deterministic ISO C99 backend emitter and `zig cc` compilation driver (`DR-01`, `DR-20`).
+pub const codegen_c = @import("codegen_c.zig");
+/// Tier B (`LLVM 20–23`) opaque-pointer `.ll` backend, optional static C++20 bridge, and `--fuzz` SanCov driver (`DR-09`, `DR-18`).
+pub const codegen_llvm = @import("codegen_llvm.zig");
+/// Four-tier differential backend execution oracle (`MirVm` `--dev`/`--release` vs Tier A C99 vs Tier B LLVM, `DR-20` `D-07A`).
+pub const diff_oracle = @import("diff_oracle.zig");
 /// Monochrome Unicode glyph registry, `ColorMode`, and ANSI SGR styling helpers.
 pub const style = @import("cli/style.zig");
 /// Rounded Unicode card, aligned table, and 1/8th-block progress bar renderers.
@@ -199,6 +209,14 @@ pub const SastVerificationArtifact = query_db.SastVerificationArtifact;
 pub const DefMirArtifact = query_db.DefMirArtifact;
 /// Evaluated `const` / `comptime` definition artifact with `.rodata` promotion (`Stage 12`).
 pub const ComptimeEvalArtifact = query_db.ComptimeEvalArtifact;
+/// 64-bit semantic `Wyhash(0)` nominal field/variant layout digest (`DR-19` §1.2).
+pub const FieldHash64 = query_db.FieldHash64;
+/// Strongly typed 32-bit `.cx_got[got_idx]` callable slot handle (`DR-19` §1.1).
+pub const GotSlotId = query_db.GotSlotId;
+/// Computes the deterministic `DR-19` §1.2 `FieldHash64` (`TypeLayoutHash`) for `raw_ty`.
+pub const computeNominalFieldHash64 = query_db.computeNominalFieldHash64;
+/// Builds a 32-byte `CxTypeLayoutRecord` pairing `LayoutShapeKey` with semantic `FieldHash64`.
+pub const buildCxTypeLayoutRecord = query_db.buildCxTypeLayoutRecord;
 /// Demand-driven incremental query database (`DR-12` Section 3).
 pub const CompilerDb = query_db.CompilerDb;
 
@@ -413,6 +431,18 @@ pub const MirOutgoingEdge = mir.MirOutgoingEdge;
 pub const MirCallSite = mir.MirCallSite;
 /// Constant scalar or literal record in `MirBody.consts`.
 pub const MirConst = mir.MirConst;
+/// 1-byte `@must_vectorize` / `@vectorize_width` contract flags (`DR-20` Seam `#4`).
+pub const LoopContractMask = mir.LoopContractMask;
+/// 8-byte SIMD loop contract descriptor (`DR-19` §1, `DR-20` Seam `#4`).
+pub const LoopContractMeta = mir.LoopContractMeta;
+/// 16-byte sparse loop-vectorization contract stored in `MirBody.loop_contracts`.
+pub const MirLoopContractEntry = mir.MirLoopContractEntry;
+/// 16-byte `$O(1)$` embedded binary blob descriptor stored in `MirConst.raw_blob` (`DR-20` `D-03`).
+pub const RawBlobConst = mir.RawBlobConst;
+/// Deduplicated binary blob store populated by `materializeModuleEmbedBytes` (`[CRITICAL-07]`).
+pub const MirBlobStore = mir.MirBlobStore;
+/// Pre-codegen `@embed_bytes` materializer converting constant paths into `MirConst.raw_blob`.
+pub const materializeModuleEmbedBytes = mir.materializeModuleEmbedBytes;
 /// Vacated non-`Copy` `inout` `subscript` projection window recorded on `MirBody` (`Fix-06B`).
 pub const VacatedProjectionWindow = mir.VacatedProjectionWindow;
 /// Block-Argument SSA representation of a lowered function or constant body.
@@ -501,6 +531,10 @@ pub const analyzeAndElaborateMirModule = mir_sast.analyzeAndElaborateMirModule;
 pub const analyzeSingleMirBody = mir_sast.analyzeSingleMirBody;
 /// Standalone end-to-end `Source -> HIR -> MIR -> SAST` pipeline helper.
 pub const lowerAndVerifySourceMirSast = mir_sast.lowerAndVerifySourceMirSast;
+/// 24-byte Pentagon-proven SSA scalar range & alignment fact (`[MAJOR-08]`).
+pub const ProvenValueRange = mir_sast.ProvenValueRange;
+/// Extracts sign-bias-decoded `ProvenValueRange` facts for LLVM `!range` / `@llvm.assume` (`[MAJOR-08]`).
+pub const computeBodyProvenRanges = mir_sast.computeBodyProvenRanges;
 
 // ------------ `MirVm` & `MIR` Optimizer Re-Exports ------------
 /// Disjoint 2-bit allocation domain tag inside `ComptimeAllocId` (`[CRITICAL-02]`).
@@ -550,6 +584,68 @@ pub const computeLayoutShapeKey = mir_opt.computeLayoutShapeKey;
 /// Executes the `--dev` (`D1`–`D5`) or `--release` (`D1`–`D5` + `R1`–`R6`) `MIR` pipeline.
 pub const optimizeMirModule = mir_opt.optimizeMirModule;
 
+// ---------- Phase 7 Codegen, ABI & Dev Seam Exports -----------
+/// Supported Phase-7 hardware instruction-set architectures.
+pub const TargetArch = codegen_abi.TargetArch;
+/// Supported Phase-7 operating systems and ABI environments.
+pub const TargetOs = codegen_abi.TargetOs;
+/// Target SIMD alignment tier (`none`, `sse2_neon_simd128`, `avx2`, `avx512`).
+pub const SimdLevel = codegen_abi.SimdLevel;
+/// 4-byte binary-exact target specification covering all 7 canonical targets.
+pub const TargetSpec = codegen_abi.TargetSpec;
+/// 24-byte binary-exact niche descriptor.
+pub const NicheSpec = codegen_abi.NicheSpec;
+/// 32-byte binary-exact resolved type layout record.
+pub const ResolvedTypeLayout = codegen_abi.ResolvedTypeLayout;
+/// Unified frontend type layout, field-order, `#soa` column, and niche resolver.
+pub const TypeLayoutResolver = codegen_abi.TypeLayoutResolver;
+/// Lowered machine calling convention (`cx_native`, `cx_result_cc`, `c_system`, `wasm_mvp`).
+pub const CallingConvKind = codegen_abi.CallingConvKind;
+/// Per-parameter or return value passing mode in `AbiParamRecipe`.
+pub const AbiPassMode = codegen_abi.AbiPassMode;
+/// 16-byte binary-exact parameter or return ABI lowering recipe.
+pub const AbiParamRecipe = codegen_abi.AbiParamRecipe;
+/// Complete lowered machine calling-convention recipe for a function or indirect call site.
+pub const AbiFnRecipe = codegen_abi.AbiFnRecipe;
+/// Canonical machine calling-convention classifier (`DR-09` §1.1, `Fix-07`).
+pub const AbiClassifier = codegen_abi.AbiClassifier;
+/// Exhaustive tagged-union codegen backend (`tier_a_c99` / `tier_b_llvm`).
+pub const CodegenBackend = codegen_abi.CodegenBackend;
+/// Optimization pipeline level for Tier B LLVM emission (`-O0`..`-Oz`).
+pub const OptLevel = codegen_abi.OptLevel;
+/// Tier A (`-ofmt=c`) backend configuration.
+pub const CBackendConfig = codegen_abi.CBackendConfig;
+/// Tier B (`LLVM 20–23`) backend configuration.
+pub const LlvmBackendConfig = codegen_abi.LlvmBackendConfig;
+/// Output artifact form (`.source_text`, `.object_file`, `.executable`).
+pub const OutputArtifactKind = codegen_abi.OutputArtifactKind;
+/// Owned artifact bundle produced by `CodegenBackend.emitModule`.
+pub const CodegenArtifact = codegen_abi.CodegenArtifact;
+/// Strongly typed module input consumed by `CodegenBackend.emitModule`.
+pub const CodegenModuleInput = codegen_abi.CodegenModuleInput;
+/// `Prune-02` `SIGKILL`-safe `UnlinkAndReplace` atomic file writer.
+pub const atomicWriteOutputFile = codegen_abi.atomicWriteOutputFile;
+/// 64-byte `.cx_dev_meta` binary section header (`DR-19` §1.2).
+pub const CxDevSeamHeader = codegen_dev_seam.CxDevSeamHeader;
+/// 24-byte `.cx_got` callable slot metadata record (`DR-19` §1.2).
+pub const CxGotSlotMeta = codegen_dev_seam.CxGotSlotMeta;
+/// 32-byte layout equivalence record pairing `LayoutShapeKey` with `FieldHash64` (`DR-19` §1.2).
+pub const CxTypeLayoutRecord = codegen_dev_seam.CxTypeLayoutRecord;
+/// 64-byte runtime safepoint control block (`DR-19` §1.2).
+pub const CxReloadControlBlock = codegen_dev_seam.CxReloadControlBlock;
+/// Canonical 4-tier differential oracle stage identifier (`DR-20` `D-07A`).
+pub const OracleTierId = diff_oracle.OracleTierId;
+/// Observable runtime outcome of a single backend tier in `diff_oracle`.
+pub const OracleTierOutcome = diff_oracle.OracleTierOutcome;
+/// Configuration options for `runFourTierDiffOracle` and `runFourTierDiffOracleOnDb`.
+pub const DiffOracleOptions = diff_oracle.DiffOracleOptions;
+/// Complete 4-tier differential verification report (`DR-20` `D-07A`).
+pub const DiffOracleReport = diff_oracle.DiffOracleReport;
+/// Runs the 4-tier differential backend oracle against a `CompilerDb` module graph.
+pub const runFourTierDiffOracleOnDb = diff_oracle.runFourTierDiffOracleOnDb;
+/// Runs the 4-tier differential backend oracle on a single `.cx` source buffer.
+pub const runFourTierDiffOracle = diff_oracle.runFourTierDiffOracle;
+
 // ---------------- Diagnostics & CLI Re-Exports ----------------
 /// Monochrome Unicode glyph registry.
 pub const Glyphs = style.Glyphs;
@@ -592,6 +688,11 @@ test "test_root_module_references_all_phase0_submodules" {
     _ = mir_sast;
     _ = mir_vm;
     _ = mir_opt;
+    _ = codegen_abi;
+    _ = codegen_dev_seam;
+    _ = codegen_c;
+    _ = codegen_llvm;
+    _ = diff_oracle;
     _ = style;
     _ = box_draw;
     _ = router;

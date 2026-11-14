@@ -1,0 +1,66 @@
+//! Windows Win32 `kernel32` Handle Constants and C-ABI Prototypes (`core::sys::windows`)
+//!
+//! Declares Win32 standard-handle identifiers (`STD_INPUT_HANDLE`, `STD_OUTPUT_HANDLE`,
+//! `STD_ERROR_HANDLE`), `kernel32.dll` `GetStdHandle` / `WriteFile` / `ExitProcess` `extern "C"`
+//! prototypes, and safe `@sys_write` / `@sys_exit` helpers.
+//!
+//! Safe stream helpers operate in binary mode (`_O_BINARY` without `LF` -> `CRLF` translation) to
+//! guarantee byte-exact output parity across Windows and POSIX hosts.
+
+// --------------------------------------- CONSTS ----------------------------------------
+
+/// Win32 `STD_INPUT_HANDLE` (`(DWORD)-10`).
+pub const STD_INPUT_HANDLE: i32 = -10;
+
+/// Win32 `STD_OUTPUT_HANDLE` (`(DWORD)-11`).
+pub const STD_OUTPUT_HANDLE: i32 = -11;
+
+/// Win32 `STD_ERROR_HANDLE` (`(DWORD)-12`).
+pub const STD_ERROR_HANDLE: i32 = -12;
+
+/// Canonical CoreX standard output stream descriptor (`1`).
+pub const STDOUT_FD: i32 = 1;
+
+/// Canonical CoreX standard error stream descriptor (`2`).
+pub const STDERR_FD: i32 = 2;
+
+// ------------------------------------- PUBLIC API --------------------------------------
+/// Win32 `GetStdHandle(std_handle_id)` `kernel32` prototype.
+@link_name("GetStdHandle")
+pub extern "C" fn win32_get_std_handle(std_handle_id: u32) -> *u8;
+
+/// Win32 `WriteFile(handle_ptr, buf_ptr, byte_len, written_out, overlapped_ptr)` prototype.
+@link_name("WriteFile")
+pub extern "C" fn win32_write_file(
+    handle_ptr: *u8,
+    buf_ptr: *u8,
+    byte_len: u32,
+    written_out: *mut u32,
+    overlapped_ptr: *mut u8,
+) -> i32;
+
+/// Win32 `ExitProcess(exit_code)` `kernel32` prototype.
+@link_name("ExitProcess")
+pub extern "C" fn win32_exit_process(exit_code: u32) -> never;
+
+/// Safe wrapper writing `text` to standard output in binary mode (`fd = 1`).
+@inline
+@no_alloc
+pub fn write_stdout(text: str) -> isize {
+    return @sys_write(STDOUT_FD, text);
+}
+
+/// Safe wrapper writing `text` to standard error in binary mode (`fd = 2`).
+@inline
+@no_alloc
+pub fn write_stderr(text: str) -> isize {
+    return @sys_write(STDERR_FD, text);
+}
+
+/// Safe wrapper terminating the process with `status_code`.
+@cold
+@noinline
+@no_alloc
+pub fn exit_process(status_code: i32) -> never {
+    @sys_exit(status_code);
+}

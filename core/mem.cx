@@ -1,0 +1,73 @@
+//! Memory Layout Queries, Alignment Arithmetic, and Cache-Line Padding (`core::mem`)
+//!
+//! Wraps CoreX's compile-time type layout intrinsics (`@size_of`, `@align_of`, `@default_init`)
+//! and provides `@cache_aligned` `CachePadded[T]` containers to eliminate false sharing across
+//! hardware cache lines (`64B` on `x86_64` / `aarch64-linux`, `128B` on `aarch64-macos`).
+//!
+//! Alignment arithmetic helpers use wrapping bitmask operations so power-of-two rounding is
+//! branch-minimal and `@no_panic`-clean.
+
+// ---------------------------------------- TYPES ----------------------------------------
+
+/// Cache-line padded wrapper isolating concurrent state from destructive false sharing (`DR-08`).
+@cache_aligned
+pub struct CachePadded[T] {
+    /// Inner payload aligned to the target architectural cache-line size.
+    pub value: T,
+}
+
+// ------------------------------------- PUBLIC API --------------------------------------
+/// Returns the byte stride (`sizeof(T)`) of `T` on the active compilation target.
+@inline
+@no_alloc
+@no_panic
+pub fn size_of_type[T]() -> usize {
+    return @size_of[T]();
+}
+
+/// Returns the byte alignment (`alignof(T)`) of `T` on the active compilation target.
+@inline
+@no_alloc
+@no_panic
+pub fn align_of_type[T]() -> usize {
+    return @align_of[T]();
+}
+
+/// Constructs the canonical zero/default-initialized value of `T` (`@default_init[T]()`).
+@inline
+@no_alloc
+pub fn zeroed_value[T]() -> T {
+    return @default_init[T]();
+}
+
+/// Wraps `initial_value` in a `@cache_aligned` `CachePadded[T]` slot.
+@inline
+@no_alloc
+@no_panic
+pub fn cache_padded_new[T](initial_value: T) -> CachePadded[T] {
+    return CachePadded[T] { value: initial_value };
+}
+
+/// Returns `true` if `candidate` is a non-zero power of two (`1`, `2`, `4`, `8`, …).
+@inline
+@no_alloc
+@no_panic
+pub fn is_power_of_two_usize(candidate: usize) -> bool {
+    if candidate == 0 {
+        return false;
+    }
+    return (candidate & (candidate -% 1)) == 0;
+}
+
+/// Rounds `byte_offset` upward to the next multiple of power-of-two `alignment` (wrapping on max).
+@inline
+@no_alloc
+@no_panic
+pub fn align_up_usize(byte_offset: usize, alignment: usize) -> usize {
+    if alignment <= 1 {
+        return byte_offset;
+    }
+    let mask: usize = alignment -% 1;
+    let bumped: usize = byte_offset +% mask;
+    return bumped -% (bumped & mask);
+}

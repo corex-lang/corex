@@ -1897,3 +1897,103 @@ test "test_snapshot_phase6_mir_drop_elaboration_and_dev_release_parity" {
         combined_out.items,
     );
 }
+
+test "test_snapshot_phase7_codegen_c_and_llvm_showcase" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const showcase_src =
+        "//! Phase 7 Tier A (`-ofmt=c`) & Tier B (`LLVM`) Golden Codegen Showcase\n" ++
+        "@repr(C)\n" ++
+        "@zero_pad\n" ++
+        "pub struct PacketHeader {\n" ++
+        "    pub kind_tag: u8,\n" ++
+        "    pub payload_len: u32,\n" ++
+        "}\n\n" ++
+        "pub struct SamplePair {\n" ++
+        "    pub left_lane: i32,\n" ++
+        "    pub right_lane: i32,\n" ++
+        "}\n\n" ++
+        "pub fn decode_header(hdr: PacketHeader) -> Result[i32, i32] {\n" ++
+        "    if hdr.kind_tag == 0 {\n" ++
+        "        return .Err(0);\n" ++
+        "    }\n" ++
+        "    return .Ok((hdr.kind_tag as i32) + (hdr.payload_len as i32));\n" ++
+        "}\n\n" ++
+        "pub fn compute_showcase(hdr: PacketHeader, bonus_opt: i32?) -> Result[i32, i32] {\n" ++
+        "    let base_val: i32 = decode_header(hdr)?;\n" ++
+        "    var pairs: #soa [SamplePair; 4] = @default_init[#soa [SamplePair; 4]]();\n" ++
+        "    pairs[0].left_lane = 1;\n" ++
+        "    pairs[3].right_lane = 8;\n" ++
+        "    var work_lanes: [i32; 4] = [2, 4, 6, 8];\n" ++
+        "    var idx: usize = 0;\n" ++
+        "    @must_vectorize\n" ++
+        "    while idx < 4 {\n" ++
+        "        work_lanes[idx] = work_lanes[idx] + 1;\n" ++
+        "        idx += 1;\n" ++
+        "    }\n" ++
+        "    let simd_sum: i32 = @simd_reduce_add(@simd_add(work_lanes, @simd_splat[[i32; 4]](base_val)));\n" ++
+        "    let opt_delta: i32 = match bonus_opt {\n" ++
+        "        .Some(extra_v) => extra_v,\n" ++
+        "        .None => 0,\n" ++
+        "    };\n" ++
+        "    return .Ok(simd_sum + pairs[0].left_lane + pairs[3].right_lane + opt_delta);\n" ++
+        "}\n";
+
+    var db = try CompilerDb.init(allocator);
+    defer db.deinit();
+    db.setTargetSpec(corex.TargetSpec.X86_64_LINUX);
+    const fid = FileId.fromInt(0);
+    _ = try db.setInput(fid, showcase_src, .low);
+
+    var sink = DiagnosticSink.init(allocator);
+    defer sink.deinit();
+
+    var c_art = try db.compileModuleArtifact(
+        fid,
+        .{
+            .tier_a_c99 = .{
+                .target = corex.TargetSpec.X86_64_LINUX,
+                .is_release_mode = true,
+                .has_line_directives = false,
+            },
+        },
+        .{
+            .module_name = "codegen_showcase",
+            .artifact_kind = .source_text,
+            .diagnostic_sink = &sink,
+        },
+    );
+    defer c_art.deinit(allocator);
+    try expectZeroDiagErrors(&sink);
+
+    var ll_art = try db.compileModuleArtifact(
+        fid,
+        .{
+            .tier_b_llvm = .{
+                .target = corex.TargetSpec.X86_64_LINUX,
+                .is_release_mode = true,
+            },
+        },
+        .{
+            .module_name = "codegen_showcase",
+            .artifact_kind = .source_text,
+            .diagnostic_sink = &sink,
+        },
+    );
+    defer ll_art.deinit(allocator);
+    try expectZeroDiagErrors(&sink);
+
+    try expectMatchesSnapshotFile(
+        allocator,
+        io,
+        "tests/snapshots/golden/codegen_c_showcase.snap",
+        c_art.emitted_text,
+    );
+    try expectMatchesSnapshotFile(
+        allocator,
+        io,
+        "tests/snapshots/golden/codegen_llvm_showcase.snap",
+        ll_art.emitted_text,
+    );
+}

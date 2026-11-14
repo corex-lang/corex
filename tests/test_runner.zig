@@ -1,8 +1,8 @@
 //! CoreX Stage 0 Master Verification Suite Runner (`tests/test_runner.zig`)
 //!
-//! Aggregates and executes all Phase 0, Phase 1, Phase 2, Phase 3, Phase 4, Phase 5, and Phase 6
-//! isolated unit tests (`tests/unit/`), golden snapshot tests (`tests/snapshots/`), deterministic
-//! PRNG fuzzers (`tests/fuzz/`), and repository drift guards (`tests/drift/`).
+//! Aggregates and executes all Phase 0, Phase 1, Phase 2, Phase 3, Phase 4, Phase 5, Phase 6, and
+//! Phase 7 isolated unit tests (`tests/unit/`), golden snapshot tests (`tests/snapshots/`),
+//! deterministic PRNG fuzzers (`tests/fuzz/`), and repository drift guards (`tests/drift/`).
 //!
 //! Invoked automatically by `zig build test` alongside internal `stage0/src/` module tests.
 
@@ -38,6 +38,18 @@ pub const mir_sast_test = @import("unit/mir_sast_test.zig");
 pub const mir_vm_test = @import("unit/mir_vm_test.zig");
 /// Unit tests for `mir_opt.zig` (`LayoutShapeKey`, `--dev` `D1`–`D5`, `--release` `R1`–`R6`, `W0501`, `ICF`).
 pub const mir_opt_test = @import("unit/mir_opt_test.zig");
+/// Unit tests for `codegen_abi.zig` (`TargetSpec`, `TypeLayoutResolver`, `AbiClassifier`, Phase 7 intrinsics, `E0006`–`E0008`).
+pub const codegen_abi_test = @import("unit/codegen_abi_test.zig");
+/// Unit tests for `codegen_dev_seam.zig` (`< 200` LOC seam, `.cx_dev_meta`, `FieldHash64`, `D-10A` cache invalidation).
+pub const codegen_dev_seam_test = @import("unit/codegen_dev_seam_test.zig");
+/// Unit tests for `codegen_c.zig` (Tier A ISO C99 emitter, `@zero_pad`, `#soa`, `--dev` GOT, native execution).
+pub const codegen_c_test = @import("unit/codegen_c_test.zig");
+/// Unit tests for `codegen_llvm.zig` (Tier B LLVM 20–23 IR emitter, `swifterror`, MVS, Pentagon, `--fuzz`).
+pub const codegen_llvm_test = @import("unit/codegen_llvm_test.zig");
+/// Unit & 4-tier differential tests for Stage-1 minimal `core` (`core/**/*.cx`).
+pub const core_stdlib_test = @import("unit/core_stdlib_test.zig");
+/// Unit & CLI end-to-end tests for `diff_oracle.zig` and Phase 7 subcommands (`build`, `run`, `test --diff-backends`).
+pub const diff_oracle_test = @import("unit/diff_oracle_test.zig");
 /// Unit tests for `diag/diagnostic.zig` and `diag/renderer.zig` (`DiagnosticSink`, `TransactionalPatcher`).
 pub const diagnostic_test = @import("unit/diagnostic_test.zig");
 /// Unit tests for `cli/style.zig`, `cli/box_draw.zig`, and `cli/router.zig`.
@@ -60,10 +72,12 @@ pub const phase4_typecheck_fuzz = @import("fuzz/phase4_typecheck_fuzz.zig");
 pub const phase5_mir_comptime_fuzz = @import("fuzz/phase5_mir_comptime_fuzz.zig");
 /// Phase 6 deterministic PRNG fuzzing suite (`mir_sast` fault tolerance, `--dev` vs `--release` drop/BCE parity, and `CompilerDb` Stage 9).
 pub const phase6_sast_fuzz = @import("fuzz/phase6_sast_fuzz.zig");
+/// Phase 7 deterministic PRNG fuzzing suite (4-tier differential backend oracle & cross-target IR determinism).
+pub const phase7_diff_backends_fuzz = @import("fuzz/phase7_diff_backends_fuzz.zig");
 /// Repository-wide drift guards (zero colored emojis, CLI parity, diagnostic catalog, `< 150` col format).
 pub const drift_guard_test = @import("drift/drift_guard_test.zig");
 
-test "test_runner_references_all_phase0_to_phase6_verification_suites" {
+test "test_runner_references_all_phase0_to_phase7_verification_suites" {
     std.testing.refAllDecls(@This());
     _ = mem_foundation_test;
     _ = vfs_sourcemap_test;
@@ -79,6 +93,12 @@ test "test_runner_references_all_phase0_to_phase6_verification_suites" {
     _ = mir_sast_test;
     _ = mir_vm_test;
     _ = mir_opt_test;
+    _ = codegen_abi_test;
+    _ = codegen_dev_seam_test;
+    _ = codegen_c_test;
+    _ = codegen_llvm_test;
+    _ = core_stdlib_test;
+    _ = diff_oracle_test;
     _ = diagnostic_test;
     _ = cli_router_test;
     _ = bench_harness_test;
@@ -90,5 +110,6 @@ test "test_runner_references_all_phase0_to_phase6_verification_suites" {
     _ = phase4_typecheck_fuzz;
     _ = phase5_mir_comptime_fuzz;
     _ = phase6_sast_fuzz;
+    _ = phase7_diff_backends_fuzz;
     _ = drift_guard_test;
 }

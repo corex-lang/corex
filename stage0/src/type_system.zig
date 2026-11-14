@@ -564,21 +564,42 @@ pub const SubstitutionMap = struct {
 
 // --------- Target Layout & Body Side Tables (`DR-05`) ---------
 
-/// Target pointer size and alignment parameters shared across `TypeChecker`, `HIR`, `MirVm`, and `MIR`.
+/// Target pointer, cache-line, and SIMD alignment parameters shared across `TypeChecker`, `HIR`, `MirVm`, and `MIR`.
 pub const TargetLayout = struct {
     /// Target pointer width in bytes (`8` on 64-bit hosts, `4` on `wasm32`).
     ptr_byte_size: u8 = 8,
     /// Base-2 logarithm of target pointer alignment (`3` -> 8-byte align, `2` -> 4-byte align).
     ptr_align_log2: u8 = 3,
+    /// Base-2 logarithm of target cache-line size (`6` -> 64B, `7` -> 128B on `aarch64-macos`).
+    cache_line_align_log2: u8 = 6,
+    /// Base-2 logarithm of target baseline SIMD column alignment (`4` -> 16B, `5` -> 32B, `6` -> 64B).
+    simd_align_log2: u8 = 4,
 
     /// Canonical 64-bit native target layout (`x86_64` / `aarch64`).
     pub const NATIVE_64: TargetLayout = .{ .ptr_byte_size = 8, .ptr_align_log2 = 3 };
+    /// Canonical 64-bit Apple Silicon target layout (`aarch64-macos`, `128B` L2 cache line).
+    pub const AARCH64_MACOS: TargetLayout = .{
+        .ptr_byte_size = 8,
+        .ptr_align_log2 = 3,
+        .cache_line_align_log2 = 7,
+        .simd_align_log2 = 4,
+    };
     /// Canonical 32-bit WebAssembly target layout (`wasm32`).
     pub const WASM32: TargetLayout = .{ .ptr_byte_size = 4, .ptr_align_log2 = 2 };
 
     /// Returns the pointer alignment in bytes (`1 << ptr_align_log2`).
     pub inline fn ptrAlignBytes(self: TargetLayout) u32 {
         return @as(u32, 1) << @intCast(self.ptr_align_log2);
+    }
+
+    /// Returns the target cache-line alignment in bytes (`1 << cache_line_align_log2`).
+    pub inline fn cacheLineAlignBytes(self: TargetLayout) u32 {
+        return @as(u32, 1) << @intCast(self.cache_line_align_log2);
+    }
+
+    /// Returns the target SIMD column alignment in bytes (`1 << simd_align_log2`).
+    pub inline fn simdAlignBytes(self: TargetLayout) u32 {
+        return @as(u32, 1) << @intCast(self.simd_align_log2);
     }
 };
 
@@ -592,6 +613,78 @@ pub const TypeLayout = struct {
     align_log2: u8,
     /// `true` when the type has a statically known concrete size.
     is_sized: bool = true,
+};
+
+/// Leaf scalar or non-null pointer niche classification (`DR-07`, `DR-09`, `[CRITICAL-04]`).
+pub const NicheKind = enum(u8) {
+    /// No unused bit pattern exists inside this type.
+    none = 0,
+    /// Non-null pointer slot (`&T`, `&mut T`, `fn`, `[T]`, `#soa [T]`, `str`, `closure`) where `0` is invalid.
+    zero_ptr = 1,
+    /// Scalar integer slot (`bool`, `char`, `enum` tag, or positive `is` refinement) with unused value(s).
+    high_scalar_range = 2,
+};
+
+/// Borrow-safe leaf niche location inside a concrete type (`[CRITICAL-04]`).
+pub const LeafNicheInfo = struct {
+    /// Encoding kind of the niche slot.
+    kind: NicheKind = .none,
+    /// Byte offset of the niche scalar/pointer from the start of the enclosing type.
+    byte_offset: u32 = 0,
+    /// Byte width of the niche scalar/pointer (`1`, `2`, `4`, or `8`).
+    scalar_bytes: u8 = 0,
+    /// First invalid bit pattern (`0` for `.zero_ptr`, `2` for `bool`, `0x110000` for `char`, `V` for `enum`).
+    invalid_first: u64 = 0,
+    /// Number of contiguous invalid bit patterns starting at `invalid_first`.
+    invalid_count: u64 = 0,
+};
+
+/// Canonical in-memory representation of `Option[T]`, `Result[T, E]`, and `enum` sums (`[CRITICAL-04]`).
+pub const SumMemoryReprKind = enum(u8) {
+    /// Explicit integer tag at byte `0` followed by aligned payload union.
+    explicit_tag = 0,
+    /// Single ZST variant folded into payload's leaf scalar/pointer niche (`sizeof == sizeof(payload)`).
+    niche_single = 1,
+    /// `Result[T, never]` transparent single-variant representation (`sizeof == sizeof(T)`, `tag == 0`).
+    transparent_ok = 2,
+};
+
+/// Complete resolved in-memory sum layout shared across `TypeChecker`, `MIR`, `MirOpt`, `MirVm`, and codegen.
+pub const SumMemoryLayout = struct {
+    /// Representation kind in memory.
+    repr: SumMemoryReprKind = .explicit_tag,
+    /// Total padded size of the sum in bytes.
+    byte_size: u64 = 0,
+    /// Required alignment in bytes (`1 << align_log2`).
+    align_bytes: u32 = 1,
+    /// Base-2 logarithm of `align_bytes`.
+    align_log2: u8 = 0,
+    /// `true` when all constituent variants have statically known sizes.
+    is_sized: bool = true,
+    /// Explicit tag byte width (`1`, `2`, `4`, or `8` when `repr == .explicit_tag`; `0` otherwise).
+    tag_bytes: u8 = 1,
+    /// Byte offset where non-ZST variant payloads start (`0` for `.niche_single` and `.transparent_ok`).
+    payload_offset: u64 = 0,
+    /// Discriminant ordinal represented by `niche.invalid_first` when `repr == .niche_single`.
+    zst_discriminant: u32 = 0,
+    /// Discriminant ordinal represented by non-niche payload bytes when `repr == .niche_single`.
+    payload_discriminant: u32 = 1,
+    /// Concrete `TypeId` of the non-ZST payload when `repr == .niche_single` or `.transparent_ok`.
+    payload_ty: TypeId = .unit_ty,
+    /// Leaf scalar/pointer niche descriptor when `repr == .niche_single`.
+    niche: LeafNicheInfo = .{},
+};
+
+/// Computed `#soa [S; C]` column offset and alignment metadata (`[CRITICAL-03]`).
+pub const SoaColumnInfo = struct {
+    /// Byte offset of column `field_ordinal` inside `#soa [S; C]`.
+    byte_offset: u64,
+    /// Column alignment `log2` (`@max(field_align_log2, target_layout.simd_align_log2)`).
+    col_align_log2: u8,
+    /// Resolved concrete `TypeId` of the struct field.
+    field_ty: TypeId,
+    /// Computed `TypeLayout` of `field_ty`.
+    field_layout: TypeLayout,
 };
 
 /// Validated compile-time constant argument value inside an `@attribute_schema` instance.
@@ -821,42 +914,76 @@ pub const BodySemanticSideTables = struct {
     }
 };
 
-/// Canonical compiler-intrinsic selector for `@snake_case` expressions (`DR-05` Section 3.3 & `DR-20` `D-01`).
+/// Canonical compiler-intrinsic selector for `@snake_case` expressions (`DR-05` §3.3, `DR-20` `D-01`, Phase 7).
 pub const IntrinsicKind = enum(u8) {
     /// `@align_of[T]() -> usize` (`0`).
     align_of = 0,
-    /// `@compile_assert(cond: bool, msg: str) -> unit` (`1`).
-    compile_assert = 1,
-    /// `@compile_error(msg: str) -> never` (`2`).
-    compile_error = 2,
-    /// `@default_init[T]() -> T` (`3`).
-    default_init = 3,
-    /// `@embed_bytes(comptime path: str) -> &[u8]` (`4`).
-    embed_bytes = 4,
-    /// `@field(target, comptime field_ref) -> FieldTy` (`5`).
-    field = 5,
-    /// `@field_attr_lookup[A](id: MetaId, idx: u32) -> A?` (`6`).
-    field_attr_lookup = 6,
-    /// `@has_field[T](comptime name: str) -> bool` (`7`).
-    has_field = 7,
-    /// `@implements[T, Trait]() -> bool` (`8`).
-    implements = 8,
-    /// `@size_of[T]() -> usize` (`9`).
-    size_of = 9,
-    /// `@type_info[T]() -> std::meta::TypeInfo` (`10`).
-    type_info = 10,
-    /// `@type_name[T]() -> str` (`11`).
-    type_name = 11,
-    /// `@as_bytes(&val) -> &[u8]` (`12`, requires `T: IntoBytes`, `E0315`).
-    as_bytes = 12,
-    /// `@bit_cast[Dst](src) -> Dst` (`13`, requires `Src: IntoBytes`, `Dst: FromBytes`, equal byte size, `E0315`).
-    bit_cast = 13,
-    /// `@drop_trace(id: i64) -> unit` (`14`, deterministic destructor order verification hook).
-    drop_trace = 14,
-    /// `@from_bytes[T](bytes: &[u8]) -> T?` (`15`, requires `T: FromBytes`, `E0315`).
-    from_bytes = 15,
-    /// `@view_bytes[T](bytes: &[u8]) -> (&T)?` (`16`, requires `T: FromBytes`, `E0315`).
-    view_bytes = 16,
+    /// `@as_bytes(&val) -> &[u8]` (`1`, requires `T: IntoBytes`, `E0315`).
+    as_bytes = 1,
+    /// `@atomic_cmpxchg(ptr, expected, desired) -> (T, bool)` (`2`).
+    atomic_cmpxchg = 2,
+    /// `@atomic_fence(order?) -> unit` (`3`).
+    atomic_fence = 3,
+    /// `@atomic_load(ptr, order?) -> T` (`4`).
+    atomic_load = 4,
+    /// `@atomic_rmw_add(ptr, delta, order?) -> T` (`5`).
+    atomic_rmw_add = 5,
+    /// `@atomic_rmw_sub(ptr, delta, order?) -> T` (`6`).
+    atomic_rmw_sub = 6,
+    /// `@atomic_rmw_xchg(ptr, val, order?) -> T` (`7`).
+    atomic_rmw_xchg = 7,
+    /// `@atomic_store(ptr, val, order?) -> unit` (`8`).
+    atomic_store = 8,
+    /// `@bit_cast[Dst](src) -> Dst` (`9`, requires `Src: IntoBytes`, `Dst: FromBytes`, equal size, `E0315`).
+    bit_cast = 9,
+    /// `@compile_assert(cond: bool, msg: str) -> unit` (`10`).
+    compile_assert = 10,
+    /// `@compile_error(msg: str) -> never` (`11`).
+    compile_error = 11,
+    /// `@default_init[T]() -> T` (`12`).
+    default_init = 12,
+    /// `@drop_trace(id: i64) -> unit` (`13`).
+    drop_trace = 13,
+    /// `@embed_bytes(comptime path: str) -> &[u8]` (`14`).
+    embed_bytes = 14,
+    /// `@field(target, comptime field_ref) -> FieldTy` (`15`).
+    field = 15,
+    /// `@field_attr_lookup[A](id: MetaId, idx: u32) -> A?` (`16`).
+    field_attr_lookup = 16,
+    /// `@from_bytes[T](bytes: &[u8]) -> T?` (`17`, requires `T: FromBytes`, `E0315`).
+    from_bytes = 17,
+    /// `@has_field[T](comptime name: str) -> bool` (`18`).
+    has_field = 18,
+    /// `@implements[T, Trait]() -> bool` (`19`).
+    implements = 19,
+    /// `@panic(msg: str) -> never` (`20`).
+    panic = 20,
+    /// `@poll_reload(state?) -> bool` (`21`, `DR-19` quiescent epoch safepoint hook).
+    poll_reload = 21,
+    /// `@simd_add(lhs, rhs) -> Vec` (`22`).
+    simd_add = 22,
+    /// `@simd_mul(lhs, rhs) -> Vec` (`23`).
+    simd_mul = 23,
+    /// `@simd_reduce_add(vec) -> Lane` (`24`).
+    simd_reduce_add = 24,
+    /// `@simd_splat[Vec](lane) -> Vec` (`25`).
+    simd_splat = 25,
+    /// `@simd_sub(lhs, rhs) -> Vec` (`26`).
+    simd_sub = 26,
+    /// `@size_of[T]() -> usize` (`27`).
+    size_of = 27,
+    /// `@sys_exit(code: i32) -> never` (`28`).
+    sys_exit = 28,
+    /// `@sys_write(fd: i32, buf) -> isize` (`29`).
+    sys_write = 29,
+    /// `@trap() -> never` (`30`).
+    trap = 30,
+    /// `@type_info[T]() -> std::meta::TypeInfo` (`31`).
+    type_info = 31,
+    /// `@type_name[T]() -> str` (`32`).
+    type_name = 32,
+    /// `@view_bytes[T](bytes: &[u8]) -> (&T)?` (`33`, requires `T: FromBytes`, `E0315`).
+    view_bytes = 33,
 };
 
 // --------------------------------------- CONSTS ----------------------------------------
@@ -885,6 +1012,7 @@ pub const BUILTIN_ATTRIBUTE_MAP = std.StaticStringMap(void).initComptime(.{
     .{ "allow", {} },
     .{ "attribute_schema", {} },
     .{ "bench", {} },
+    .{ "cache_aligned", {} },
     .{ "cold", {} },
     .{ "deprecated", {} },
     .{ "derive", {} },
@@ -899,6 +1027,7 @@ pub const BUILTIN_ATTRIBUTE_MAP = std.StaticStringMap(void).initComptime(.{
     .{ "local", {} },
     .{ "max_stack", {} },
     .{ "must_use", {} },
+    .{ "must_vectorize", {} },
     .{ "no_alloc", {} },
     .{ "no_block", {} },
     .{ "no_panic", {} },
@@ -910,6 +1039,7 @@ pub const BUILTIN_ATTRIBUTE_MAP = std.StaticStringMap(void).initComptime(.{
     .{ "soa", {} },
     .{ "std_cap_boundary", {} },
     .{ "test", {} },
+    .{ "vectorize_width", {} },
     .{ "zero_pad", {} },
 });
 
@@ -917,6 +1047,13 @@ pub const BUILTIN_ATTRIBUTE_MAP = std.StaticStringMap(void).initComptime(.{
 pub const INTRINSIC_NAME_MAP = std.StaticStringMap(IntrinsicKind).initComptime(.{
     .{ "align_of", .align_of },
     .{ "as_bytes", .as_bytes },
+    .{ "atomic_cmpxchg", .atomic_cmpxchg },
+    .{ "atomic_fence", .atomic_fence },
+    .{ "atomic_load", .atomic_load },
+    .{ "atomic_rmw_add", .atomic_rmw_add },
+    .{ "atomic_rmw_sub", .atomic_rmw_sub },
+    .{ "atomic_rmw_xchg", .atomic_rmw_xchg },
+    .{ "atomic_store", .atomic_store },
     .{ "bit_cast", .bit_cast },
     .{ "compile_assert", .compile_assert },
     .{ "compile_error", .compile_error },
@@ -928,7 +1065,17 @@ pub const INTRINSIC_NAME_MAP = std.StaticStringMap(IntrinsicKind).initComptime(.
     .{ "from_bytes", .from_bytes },
     .{ "has_field", .has_field },
     .{ "implements", .implements },
+    .{ "panic", .panic },
+    .{ "poll_reload", .poll_reload },
+    .{ "simd_add", .simd_add },
+    .{ "simd_mul", .simd_mul },
+    .{ "simd_reduce_add", .simd_reduce_add },
+    .{ "simd_splat", .simd_splat },
+    .{ "simd_sub", .simd_sub },
     .{ "size_of", .size_of },
+    .{ "sys_exit", .sys_exit },
+    .{ "sys_write", .sys_write },
+    .{ "trap", .trap },
     .{ "type_info", .type_info },
     .{ "type_name", .type_name },
     .{ "view_bytes", .view_bytes },
@@ -2617,7 +2764,19 @@ pub const InternPool = struct {
             .dyn_trait_ty,
             .trait_ty,
             => return .{ .reason = .indirection_or_handle },
-            .optional_ty, .result_ty => return .{ .reason = .invalid_bit_patterns },
+            .optional_ty => return .{ .reason = .invalid_bit_patterns },
+            .result_ty => {
+                if (subst.resolve(TypeId.fromInt(node.rhs)) == .never_ty) {
+                    return self.explainFromBytesViolationBounded(
+                        TypeId.fromInt(node.lhs),
+                        sym_table,
+                        target_layout,
+                        subst,
+                        depth + 1,
+                    );
+                }
+                return .{ .reason = .invalid_bit_patterns };
+            },
             .refined_ty => {
                 const bounds = self.getRefinementBounds(ty) orelse
                     return .{ .reason = .refinement_narrows_domain };
@@ -2669,8 +2828,9 @@ pub const InternPool = struct {
                 );
             },
             .tuple_ty => {
-                var cur_offset: u64 = 0;
-                for (self.getTupleElements(ty)) |raw_elem| {
+                const elems = self.getTupleElements(ty);
+                var rank_mask: u64 = 0;
+                for (elems) |raw_elem| {
                     const elem_ty = subst.resolve(TypeId.fromInt(raw_elem));
                     const elem_layout = computeTypeLayoutBounded(
                         self,
@@ -2680,22 +2840,59 @@ pub const InternPool = struct {
                         subst,
                         depth + 1,
                     );
-                    const aligned_off = alignUpU64(cur_offset, elem_layout.align_bytes);
-                    if (self.explainFromBytesViolationBounded(
-                        elem_ty,
+                    const has_niche = computeLeafNicheBounded(
+                        self,
                         sym_table,
+                        elem_ty,
                         target_layout,
                         subst,
                         depth + 1,
-                    )) |sub_v| {
-                        return .{
-                            .reason = sub_v.reason,
-                            .byte_offset = aligned_off +| sub_v.byte_offset,
-                            .padding_bytes = sub_v.padding_bytes,
-                            .field_name = sub_v.field_name,
-                        };
+                    ).kind != .none;
+                    const rank: u6 = (@as(u6, @intCast(@min(elem_layout.align_log2, 30))) << 1) | @intFromBool(has_niche);
+                    rank_mask |= (@as(u64, 1) << rank);
+                }
+                var cur_offset: u64 = 0;
+                while (rank_mask != 0) {
+                    const top_rank: u6 = @intCast(63 - @clz(rank_mask));
+                    rank_mask &= ~(@as(u64, 1) << top_rank);
+                    for (elems) |raw_elem| {
+                        const elem_ty = subst.resolve(TypeId.fromInt(raw_elem));
+                        const elem_layout = computeTypeLayoutBounded(
+                            self,
+                            sym_table,
+                            elem_ty,
+                            target_layout,
+                            subst,
+                            depth + 1,
+                        );
+                        const has_niche = computeLeafNicheBounded(
+                            self,
+                            sym_table,
+                            elem_ty,
+                            target_layout,
+                            subst,
+                            depth + 1,
+                        ).kind != .none;
+                        const rank: u6 = (@as(u6, @intCast(@min(elem_layout.align_log2, 30))) << 1) |
+                            @intFromBool(has_niche);
+                        if (rank != top_rank) continue;
+                        const aligned_off = alignUpU64(cur_offset, elem_layout.align_bytes);
+                        if (self.explainFromBytesViolationBounded(
+                            elem_ty,
+                            sym_table,
+                            target_layout,
+                            subst,
+                            depth + 1,
+                        )) |sub_v| {
+                            return .{
+                                .reason = sub_v.reason,
+                                .byte_offset = aligned_off +| sub_v.byte_offset,
+                                .padding_bytes = sub_v.padding_bytes,
+                                .field_name = sub_v.field_name,
+                            };
+                        }
+                        cur_offset = aligned_off +| elem_layout.byte_size;
                     }
-                    cur_offset = aligned_off +| elem_layout.byte_size;
                 }
                 return null;
             },
@@ -2790,8 +2987,43 @@ pub const InternPool = struct {
                 if (st_sym.target_scope.isNone()) return null;
                 const child_subst = NominalTypeSubst.fromNominal(self, sym_table, ty, st_sym, subst);
                 const active_subst = if (child_subst.len > 0) &child_subst else subst;
+                const is_packed = st_sym.contract_flags.is_packed;
+                const is_decl_order = is_packed or st_sym.contract_flags.is_repr_c;
+                const members = sym_table.getScopeMembers(st_sym.target_scope);
                 var cur_offset: u64 = 0;
-                for (sym_table.getScopeMembers(st_sym.target_scope)) |mem_idx| {
+                if (is_decl_order) {
+                    for (members) |mem_idx| {
+                        const mem_sym = sym_table.getSymbol(mem_idx).*;
+                        if (mem_sym.kind != .field_sym) continue;
+                        const f_layout = computeTypeLayoutBounded(
+                            self,
+                            sym_table,
+                            mem_sym.type_id,
+                            target_layout,
+                            active_subst,
+                            depth + 1,
+                        );
+                        const aligned_off = if (is_packed) cur_offset else alignUpU64(cur_offset, f_layout.align_bytes);
+                        if (self.explainFromBytesViolationBounded(
+                            mem_sym.type_id,
+                            sym_table,
+                            target_layout,
+                            active_subst,
+                            depth + 1,
+                        )) |sub_v| {
+                            return .{
+                                .reason = sub_v.reason,
+                                .byte_offset = aligned_off +| sub_v.byte_offset,
+                                .padding_bytes = sub_v.padding_bytes,
+                                .field_name = if (sub_v.field_name.len > 0) sub_v.field_name else mem_sym.name_text,
+                            };
+                        }
+                        cur_offset = aligned_off +| f_layout.byte_size;
+                    }
+                    return null;
+                }
+                var rank_mask: u64 = 0;
+                for (members) |mem_idx| {
                     const mem_sym = sym_table.getSymbol(mem_idx).*;
                     if (mem_sym.kind != .field_sym) continue;
                     const f_layout = computeTypeLayoutBounded(
@@ -2802,22 +3034,59 @@ pub const InternPool = struct {
                         active_subst,
                         depth + 1,
                     );
-                    const aligned_off = alignUpU64(cur_offset, f_layout.align_bytes);
-                    if (self.explainFromBytesViolationBounded(
-                        mem_sym.type_id,
+                    const has_niche = computeLeafNicheBounded(
+                        self,
                         sym_table,
+                        mem_sym.type_id,
                         target_layout,
                         active_subst,
                         depth + 1,
-                    )) |sub_v| {
-                        return .{
-                            .reason = sub_v.reason,
-                            .byte_offset = aligned_off +| sub_v.byte_offset,
-                            .padding_bytes = sub_v.padding_bytes,
-                            .field_name = if (sub_v.field_name.len > 0) sub_v.field_name else mem_sym.name_text,
-                        };
+                    ).kind != .none;
+                    const rank: u6 = (@as(u6, @intCast(@min(f_layout.align_log2, 30))) << 1) | @intFromBool(has_niche);
+                    rank_mask |= (@as(u64, 1) << rank);
+                }
+                while (rank_mask != 0) {
+                    const top_rank: u6 = @intCast(63 - @clz(rank_mask));
+                    rank_mask &= ~(@as(u64, 1) << top_rank);
+                    for (members) |mem_idx| {
+                        const mem_sym = sym_table.getSymbol(mem_idx).*;
+                        if (mem_sym.kind != .field_sym) continue;
+                        const f_layout = computeTypeLayoutBounded(
+                            self,
+                            sym_table,
+                            mem_sym.type_id,
+                            target_layout,
+                            active_subst,
+                            depth + 1,
+                        );
+                        const has_niche = computeLeafNicheBounded(
+                            self,
+                            sym_table,
+                            mem_sym.type_id,
+                            target_layout,
+                            active_subst,
+                            depth + 1,
+                        ).kind != .none;
+                        const rank: u6 = (@as(u6, @intCast(@min(f_layout.align_log2, 30))) << 1) |
+                            @intFromBool(has_niche);
+                        if (rank != top_rank) continue;
+                        const aligned_off = alignUpU64(cur_offset, f_layout.align_bytes);
+                        if (self.explainFromBytesViolationBounded(
+                            mem_sym.type_id,
+                            sym_table,
+                            target_layout,
+                            active_subst,
+                            depth + 1,
+                        )) |sub_v| {
+                            return .{
+                                .reason = sub_v.reason,
+                                .byte_offset = aligned_off +| sub_v.byte_offset,
+                                .padding_bytes = sub_v.padding_bytes,
+                                .field_name = if (sub_v.field_name.len > 0) sub_v.field_name else mem_sym.name_text,
+                            };
+                        }
+                        cur_offset = aligned_off +| f_layout.byte_size;
                     }
-                    cur_offset = aligned_off +| f_layout.byte_size;
                 }
                 return null;
             },
@@ -2988,7 +3257,7 @@ pub const InternPool = struct {
                     depth + 1,
                 );
             },
-            .array_ty, .soa_array_ty => {
+            .array_ty => {
                 if ((node.rhs & SYMBOLIC_ARRAY_LEN_FLAG) != 0) {
                     return .{ .reason = .invalid_bit_patterns };
                 }
@@ -3000,10 +3269,75 @@ pub const InternPool = struct {
                     depth + 1,
                 );
             },
+            .soa_array_ty => {
+                if ((node.rhs & SYMBOLIC_ARRAY_LEN_FLAG) != 0) {
+                    return .{ .reason = .invalid_bit_patterns };
+                }
+                if (self.explainIntoBytesViolationBounded(
+                    TypeId.fromInt(node.lhs),
+                    sym_table,
+                    target_layout,
+                    subst,
+                    depth + 1,
+                )) |elem_v| {
+                    return elem_v;
+                }
+                const elem_ty = self.unwrapUnderlyingType(subst.resolve(TypeId.fromInt(node.lhs)));
+                const elem_node = self.getNode(elem_ty);
+                if (elem_node.tag == .struct_ty) {
+                    const sym_idx = SymbolIndex.fromInt(elem_node.rhs);
+                    if (!sym_idx.isNone() and sym_idx.asInt() < sym_table.symbols.items.len) {
+                        const st_sym = sym_table.getSymbol(sym_idx).*;
+                        if (!st_sym.contract_flags.is_zero_pad and !st_sym.target_scope.isNone() and node.rhs > 0) {
+                            const child_subst = NominalTypeSubst.fromNominal(self, sym_table, elem_ty, st_sym, subst);
+                            const active_subst = if (child_subst.len > 0) &child_subst else subst;
+                            var cur_offset: u64 = 0;
+                            var max_align_log2: u8 = 0;
+                            for (sym_table.getScopeMembers(st_sym.target_scope)) |mem_idx| {
+                                const mem_sym = sym_table.getSymbol(mem_idx).*;
+                                if (mem_sym.kind != .field_sym) continue;
+                                const f_layout = computeTypeLayoutBounded(
+                                    self,
+                                    sym_table,
+                                    mem_sym.type_id,
+                                    target_layout,
+                                    active_subst,
+                                    depth + 1,
+                                );
+                                const col_log2 = @max(f_layout.align_log2, target_layout.simd_align_log2);
+                                const col_align = @as(u32, 1) << @intCast(col_log2);
+                                max_align_log2 = @max(max_align_log2, col_log2);
+                                const col_off = alignUpU64(cur_offset, col_align);
+                                if (col_off > cur_offset) {
+                                    return .{
+                                        .reason = .unzeroed_inter_field_padding,
+                                        .byte_offset = cur_offset,
+                                        .padding_bytes = col_off - cur_offset,
+                                        .field_name = mem_sym.name_text,
+                                    };
+                                }
+                                cur_offset = col_off +| (f_layout.byte_size *| @as(u64, node.rhs));
+                            }
+                            const max_align = @as(u32, 1) << @intCast(max_align_log2);
+                            const total_sz = alignUpU64(cur_offset, max_align);
+                            if (total_sz > cur_offset) {
+                                return .{
+                                    .reason = .unzeroed_tail_padding,
+                                    .byte_offset = cur_offset,
+                                    .padding_bytes = total_sz - cur_offset,
+                                    .field_name = st_sym.name_text,
+                                };
+                            }
+                        }
+                    }
+                }
+                return null;
+            },
             .tuple_ty => {
-                var cur_offset: u64 = 0;
+                const elems = self.getTupleElements(ty);
+                var rank_mask: u64 = 0;
                 var max_align_log2: u8 = 0;
-                for (self.getTupleElements(ty)) |raw_elem| {
+                for (elems) |raw_elem| {
                     const elem_ty = subst.resolve(TypeId.fromInt(raw_elem));
                     const elem_layout = computeTypeLayoutBounded(
                         self,
@@ -3014,29 +3348,66 @@ pub const InternPool = struct {
                         depth + 1,
                     );
                     if (elem_layout.align_log2 > max_align_log2) max_align_log2 = elem_layout.align_log2;
-                    const aligned_off = alignUpU64(cur_offset, elem_layout.align_bytes);
-                    if (self.explainIntoBytesViolationBounded(
-                        elem_ty,
+                    const has_niche = computeLeafNicheBounded(
+                        self,
                         sym_table,
+                        elem_ty,
                         target_layout,
                         subst,
                         depth + 1,
-                    )) |sub_v| {
-                        return .{
-                            .reason = sub_v.reason,
-                            .byte_offset = aligned_off +| sub_v.byte_offset,
-                            .padding_bytes = sub_v.padding_bytes,
-                            .field_name = sub_v.field_name,
-                        };
+                    ).kind != .none;
+                    const rank: u6 = (@as(u6, @intCast(@min(elem_layout.align_log2, 30))) << 1) | @intFromBool(has_niche);
+                    rank_mask |= (@as(u64, 1) << rank);
+                }
+                var cur_offset: u64 = 0;
+                while (rank_mask != 0) {
+                    const top_rank: u6 = @intCast(63 - @clz(rank_mask));
+                    rank_mask &= ~(@as(u64, 1) << top_rank);
+                    for (elems) |raw_elem| {
+                        const elem_ty = subst.resolve(TypeId.fromInt(raw_elem));
+                        const elem_layout = computeTypeLayoutBounded(
+                            self,
+                            sym_table,
+                            elem_ty,
+                            target_layout,
+                            subst,
+                            depth + 1,
+                        );
+                        const has_niche = computeLeafNicheBounded(
+                            self,
+                            sym_table,
+                            elem_ty,
+                            target_layout,
+                            subst,
+                            depth + 1,
+                        ).kind != .none;
+                        const rank: u6 = (@as(u6, @intCast(@min(elem_layout.align_log2, 30))) << 1) |
+                            @intFromBool(has_niche);
+                        if (rank != top_rank) continue;
+                        const aligned_off = alignUpU64(cur_offset, elem_layout.align_bytes);
+                        if (self.explainIntoBytesViolationBounded(
+                            elem_ty,
+                            sym_table,
+                            target_layout,
+                            subst,
+                            depth + 1,
+                        )) |sub_v| {
+                            return .{
+                                .reason = sub_v.reason,
+                                .byte_offset = aligned_off +| sub_v.byte_offset,
+                                .padding_bytes = sub_v.padding_bytes,
+                                .field_name = sub_v.field_name,
+                            };
+                        }
+                        if (aligned_off > cur_offset) {
+                            return .{
+                                .reason = .unzeroed_inter_field_padding,
+                                .byte_offset = cur_offset,
+                                .padding_bytes = aligned_off - cur_offset,
+                            };
+                        }
+                        cur_offset = aligned_off +| elem_layout.byte_size;
                     }
-                    if (aligned_off > cur_offset) {
-                        return .{
-                            .reason = .unzeroed_inter_field_padding,
-                            .byte_offset = cur_offset,
-                            .padding_bytes = aligned_off - cur_offset,
-                        };
-                    }
-                    cur_offset = aligned_off +| elem_layout.byte_size;
                 }
                 const max_align_bytes: u32 = @as(u32, 1) << @intCast(max_align_log2);
                 const total_size = alignUpU64(cur_offset, max_align_bytes);
@@ -3062,44 +3433,132 @@ pub const InternPool = struct {
                 const child_subst = NominalTypeSubst.fromNominal(self, sym_table, ty, st_sym, subst);
                 const active_subst = if (child_subst.len > 0) &child_subst else subst;
                 const is_zero_padded = st_sym.contract_flags.is_zero_pad;
+                const is_packed = st_sym.contract_flags.is_packed;
+                const is_decl_order = is_packed or st_sym.contract_flags.is_repr_c;
+                const members = sym_table.getScopeMembers(st_sym.target_scope);
                 var cur_offset: u64 = 0;
                 var max_align_log2: u8 = 0;
-                for (sym_table.getScopeMembers(st_sym.target_scope)) |mem_idx| {
-                    const mem_sym = sym_table.getSymbol(mem_idx).*;
-                    if (mem_sym.kind != .field_sym) continue;
-                    const f_layout = computeTypeLayoutBounded(
-                        self,
-                        sym_table,
-                        mem_sym.type_id,
-                        target_layout,
-                        active_subst,
-                        depth + 1,
-                    );
-                    if (f_layout.align_log2 > max_align_log2) max_align_log2 = f_layout.align_log2;
-                    const aligned_off = alignUpU64(cur_offset, f_layout.align_bytes);
-                    if (self.explainIntoBytesViolationBounded(
-                        mem_sym.type_id,
-                        sym_table,
-                        target_layout,
-                        active_subst,
-                        depth + 1,
-                    )) |sub_v| {
-                        return .{
-                            .reason = sub_v.reason,
-                            .byte_offset = aligned_off +| sub_v.byte_offset,
-                            .padding_bytes = sub_v.padding_bytes,
-                            .field_name = if (sub_v.field_name.len > 0) sub_v.field_name else mem_sym.name_text,
-                        };
+                if (is_decl_order) {
+                    for (members) |mem_idx| {
+                        const mem_sym = sym_table.getSymbol(mem_idx).*;
+                        if (mem_sym.kind != .field_sym) continue;
+                        const f_layout = computeTypeLayoutBounded(
+                            self,
+                            sym_table,
+                            mem_sym.type_id,
+                            target_layout,
+                            active_subst,
+                            depth + 1,
+                        );
+                        if (!is_packed and f_layout.align_log2 > max_align_log2) max_align_log2 = f_layout.align_log2;
+                        const aligned_off = if (is_packed) cur_offset else alignUpU64(cur_offset, f_layout.align_bytes);
+                        if (self.explainIntoBytesViolationBounded(
+                            mem_sym.type_id,
+                            sym_table,
+                            target_layout,
+                            active_subst,
+                            depth + 1,
+                        )) |sub_v| {
+                            return .{
+                                .reason = sub_v.reason,
+                                .byte_offset = aligned_off +| sub_v.byte_offset,
+                                .padding_bytes = sub_v.padding_bytes,
+                                .field_name = if (sub_v.field_name.len > 0) sub_v.field_name else mem_sym.name_text,
+                            };
+                        }
+                        if (!is_zero_padded and aligned_off > cur_offset) {
+                            return .{
+                                .reason = .unzeroed_inter_field_padding,
+                                .byte_offset = cur_offset,
+                                .padding_bytes = aligned_off - cur_offset,
+                                .field_name = mem_sym.name_text,
+                            };
+                        }
+                        cur_offset = aligned_off +| f_layout.byte_size;
                     }
-                    if (!is_zero_padded and aligned_off > cur_offset) {
-                        return .{
-                            .reason = .unzeroed_inter_field_padding,
-                            .byte_offset = cur_offset,
-                            .padding_bytes = aligned_off - cur_offset,
-                            .field_name = mem_sym.name_text,
-                        };
+                } else {
+                    var rank_mask: u64 = 0;
+                    for (members) |mem_idx| {
+                        const mem_sym = sym_table.getSymbol(mem_idx).*;
+                        if (mem_sym.kind != .field_sym) continue;
+                        const f_layout = computeTypeLayoutBounded(
+                            self,
+                            sym_table,
+                            mem_sym.type_id,
+                            target_layout,
+                            active_subst,
+                            depth + 1,
+                        );
+                        if (f_layout.align_log2 > max_align_log2) max_align_log2 = f_layout.align_log2;
+                        const has_niche = computeLeafNicheBounded(
+                            self,
+                            sym_table,
+                            mem_sym.type_id,
+                            target_layout,
+                            active_subst,
+                            depth + 1,
+                        ).kind != .none;
+                        const rank: u6 = (@as(u6, @intCast(@min(f_layout.align_log2, 30))) << 1) |
+                            @intFromBool(has_niche);
+                        rank_mask |= (@as(u64, 1) << rank);
                     }
-                    cur_offset = aligned_off +| f_layout.byte_size;
+                    while (rank_mask != 0) {
+                        const top_rank: u6 = @intCast(63 - @clz(rank_mask));
+                        rank_mask &= ~(@as(u64, 1) << top_rank);
+                        for (members) |mem_idx| {
+                            const mem_sym = sym_table.getSymbol(mem_idx).*;
+                            if (mem_sym.kind != .field_sym) continue;
+                            const f_layout = computeTypeLayoutBounded(
+                                self,
+                                sym_table,
+                                mem_sym.type_id,
+                                target_layout,
+                                active_subst,
+                                depth + 1,
+                            );
+                            const has_niche = computeLeafNicheBounded(
+                                self,
+                                sym_table,
+                                mem_sym.type_id,
+                                target_layout,
+                                active_subst,
+                                depth + 1,
+                            ).kind != .none;
+                            const rank: u6 = (@as(u6, @intCast(@min(f_layout.align_log2, 30))) << 1) |
+                                @intFromBool(has_niche);
+                            if (rank != top_rank) continue;
+                            const aligned_off = alignUpU64(cur_offset, f_layout.align_bytes);
+                            if (self.explainIntoBytesViolationBounded(
+                                mem_sym.type_id,
+                                sym_table,
+                                target_layout,
+                                active_subst,
+                                depth + 1,
+                            )) |sub_v| {
+                                return .{
+                                    .reason = sub_v.reason,
+                                    .byte_offset = aligned_off +| sub_v.byte_offset,
+                                    .padding_bytes = sub_v.padding_bytes,
+                                    .field_name = if (sub_v.field_name.len > 0) sub_v.field_name else mem_sym.name_text,
+                                };
+                            }
+                            if (!is_zero_padded and aligned_off > cur_offset) {
+                                return .{
+                                    .reason = .unzeroed_inter_field_padding,
+                                    .byte_offset = cur_offset,
+                                    .padding_bytes = aligned_off - cur_offset,
+                                    .field_name = mem_sym.name_text,
+                                };
+                            }
+                            cur_offset = aligned_off +| f_layout.byte_size;
+                        }
+                    }
+                }
+                if (st_sym.contract_flags.is_cache_aligned) {
+                    max_align_log2 = @max(max_align_log2, target_layout.cache_line_align_log2);
+                }
+                if (st_sym.explicit_align_log2_plus1 > 0) {
+                    max_align_log2 = @max(max_align_log2, st_sym.explicit_align_log2_plus1 - 1);
                 }
                 const max_align_bytes: u32 = @as(u32, 1) << @intCast(max_align_log2);
                 const total_size = alignUpU64(cur_offset, max_align_bytes);
@@ -3112,6 +3571,19 @@ pub const InternPool = struct {
                     };
                 }
                 return null;
+            },
+            .result_ty => {
+                const err_unwrapped = self.unwrapUnderlyingType(subst.resolve(TypeId.fromInt(node.rhs)));
+                if (err_unwrapped == .never_ty) {
+                    return self.explainIntoBytesViolationBounded(
+                        TypeId.fromInt(node.lhs),
+                        sym_table,
+                        target_layout,
+                        subst,
+                        depth + 1,
+                    );
+                }
+                return .{ .reason = .invalid_bit_patterns };
             },
             .union_ty => {
                 const sym_idx = SymbolIndex.fromInt(node.rhs);
@@ -3411,7 +3883,7 @@ fn computeTypeLayoutBounded(
                 depth + 1,
             );
         },
-        .array_ty, .soa_array_ty => {
+        .array_ty => {
             const elem_layout = computeTypeLayoutBounded(
                 pool,
                 sym_table,
@@ -3434,11 +3906,78 @@ fn computeTypeLayoutBounded(
                 .align_log2 = elem_layout.align_log2,
             };
         },
-        .tuple_ty => {
+        .soa_array_ty => {
+            const elem_raw = subst.resolve(TypeId.fromInt(node.lhs));
+            const elem_layout = computeTypeLayoutBounded(pool, sym_table, elem_raw, target_layout, subst, depth + 1);
+            if ((node.rhs & SYMBOLIC_ARRAY_LEN_FLAG) != 0 or !elem_layout.is_sized) {
+                const unsized_log2 = @max(elem_layout.align_log2, target_layout.simd_align_log2);
+                return .{
+                    .byte_size = 0,
+                    .align_bytes = @as(u32, 1) << @intCast(unsized_log2),
+                    .align_log2 = unsized_log2,
+                    .is_sized = false,
+                };
+            }
+            const elem_unwrapped = pool.unwrapUnderlyingType(elem_raw);
+            const elem_node = pool.getNode(elem_unwrapped);
+            if (elem_node.tag != .struct_ty) {
+                const arr_log2 = @max(elem_layout.align_log2, target_layout.simd_align_log2);
+                const arr_align = @as(u32, 1) << @intCast(arr_log2);
+                return .{
+                    .byte_size = alignUpU64(elem_layout.byte_size *| @as(u64, node.rhs), arr_align),
+                    .align_bytes = arr_align,
+                    .align_log2 = arr_log2,
+                };
+            }
+            const sym_idx = SymbolIndex.fromInt(elem_node.rhs);
+            if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) {
+                return .{ .byte_size = 0, .align_bytes = 1, .align_log2 = 0 };
+            }
+            const st_sym = sym_table.getSymbol(sym_idx).*;
+            if (st_sym.target_scope.isNone()) {
+                return .{ .byte_size = 0, .align_bytes = 1, .align_log2 = 0 };
+            }
+            const child_subst = NominalTypeSubst.fromNominal(pool, sym_table, elem_unwrapped, st_sym, subst);
+            const active_subst = if (child_subst.len > 0) &child_subst else subst;
             var cur_offset: u64 = 0;
             var max_align_log2: u8 = 0;
+            var has_any_field = false;
             var is_all_sized = true;
-            for (pool.getTupleElements(type_id)) |raw_elem| {
+            for (sym_table.getScopeMembers(st_sym.target_scope)) |mem_idx| {
+                const mem_sym = sym_table.getSymbol(mem_idx).*;
+                if (mem_sym.kind != .field_sym) continue;
+                has_any_field = true;
+                const f_layout = computeTypeLayoutBounded(
+                    pool,
+                    sym_table,
+                    mem_sym.type_id,
+                    target_layout,
+                    active_subst,
+                    depth + 1,
+                );
+                if (!f_layout.is_sized) is_all_sized = false;
+                const col_log2 = @max(f_layout.align_log2, target_layout.simd_align_log2);
+                const col_align = @as(u32, 1) << @intCast(col_log2);
+                max_align_log2 = @max(max_align_log2, col_log2);
+                cur_offset = alignUpU64(cur_offset, col_align) +| (f_layout.byte_size *| @as(u64, node.rhs));
+            }
+            if (!has_any_field) {
+                return .{ .byte_size = 0, .align_bytes = 1, .align_log2 = 0 };
+            }
+            const max_align_bytes = @as(u32, 1) << @intCast(max_align_log2);
+            return .{
+                .byte_size = if (node.rhs == 0) 0 else alignUpU64(cur_offset, max_align_bytes),
+                .align_bytes = max_align_bytes,
+                .align_log2 = max_align_log2,
+                .is_sized = is_all_sized,
+            };
+        },
+        .tuple_ty => {
+            const elems = pool.getTupleElements(type_id);
+            var rank_mask: u64 = 0;
+            var max_align_log2: u8 = 0;
+            var is_all_sized = true;
+            for (elems) |raw_elem| {
                 const elem_layout = computeTypeLayoutBounded(
                     pool,
                     sym_table,
@@ -3449,7 +3988,43 @@ fn computeTypeLayoutBounded(
                 );
                 if (!elem_layout.is_sized) is_all_sized = false;
                 if (elem_layout.align_log2 > max_align_log2) max_align_log2 = elem_layout.align_log2;
-                cur_offset = alignUpU64(cur_offset, elem_layout.align_bytes) +| elem_layout.byte_size;
+                const has_niche = computeLeafNicheBounded(
+                    pool,
+                    sym_table,
+                    TypeId.fromInt(raw_elem),
+                    target_layout,
+                    subst,
+                    depth + 1,
+                ).kind != .none;
+                const rank: u6 = (@as(u6, @intCast(@min(elem_layout.align_log2, 30))) << 1) | @intFromBool(has_niche);
+                rank_mask |= (@as(u64, 1) << rank);
+            }
+            var cur_offset: u64 = 0;
+            while (rank_mask != 0) {
+                const top_rank: u6 = @intCast(63 - @clz(rank_mask));
+                rank_mask &= ~(@as(u64, 1) << top_rank);
+                for (elems) |raw_elem| {
+                    const elem_layout = computeTypeLayoutBounded(
+                        pool,
+                        sym_table,
+                        TypeId.fromInt(raw_elem),
+                        target_layout,
+                        subst,
+                        depth + 1,
+                    );
+                    const has_niche = computeLeafNicheBounded(
+                        pool,
+                        sym_table,
+                        TypeId.fromInt(raw_elem),
+                        target_layout,
+                        subst,
+                        depth + 1,
+                    ).kind != .none;
+                    const rank: u6 = (@as(u6, @intCast(@min(elem_layout.align_log2, 30))) << 1) |
+                        @intFromBool(has_niche);
+                    if (rank != top_rank) continue;
+                    cur_offset = alignUpU64(cur_offset, elem_layout.align_bytes) +| elem_layout.byte_size;
+                }
             }
             const max_align_bytes: u32 = @as(u32, 1) << @intCast(max_align_log2);
             return .{
@@ -3466,27 +4041,107 @@ fn computeTypeLayoutBounded(
             }
             const struct_sym = sym_table.getSymbol(sym_idx).*;
             if (struct_sym.target_scope.isNone()) {
-                return .{ .byte_size = 0, .align_bytes = 1, .align_log2 = 0 };
+                var empty_log2: u8 = 0;
+                if (struct_sym.contract_flags.is_cache_aligned) {
+                    empty_log2 = @max(empty_log2, target_layout.cache_line_align_log2);
+                }
+                if (struct_sym.explicit_align_log2_plus1 > 0) {
+                    empty_log2 = @max(empty_log2, struct_sym.explicit_align_log2_plus1 - 1);
+                }
+                return .{
+                    .byte_size = 0,
+                    .align_bytes = @as(u32, 1) << @intCast(empty_log2),
+                    .align_log2 = empty_log2,
+                };
             }
             const child_subst = NominalTypeSubst.fromNominal(pool, sym_table, type_id, struct_sym, subst);
             const active_subst = if (child_subst.len > 0) &child_subst else subst;
+            const is_packed = struct_sym.contract_flags.is_packed;
+            const is_decl_order = is_packed or struct_sym.contract_flags.is_repr_c;
+            const members = sym_table.getScopeMembers(struct_sym.target_scope);
             var cur_offset: u64 = 0;
             var max_align_log2: u8 = 0;
             var is_all_sized = true;
-            for (sym_table.getScopeMembers(struct_sym.target_scope)) |mem_idx| {
-                const mem_sym = sym_table.getSymbol(mem_idx).*;
-                if (mem_sym.kind != .field_sym) continue;
-                const field_layout = computeTypeLayoutBounded(
-                    pool,
-                    sym_table,
-                    mem_sym.type_id,
-                    target_layout,
-                    active_subst,
-                    depth + 1,
-                );
-                if (!field_layout.is_sized) is_all_sized = false;
-                if (field_layout.align_log2 > max_align_log2) max_align_log2 = field_layout.align_log2;
-                cur_offset = alignUpU64(cur_offset, field_layout.align_bytes) +| field_layout.byte_size;
+            if (is_decl_order) {
+                for (members) |mem_idx| {
+                    const mem_sym = sym_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind != .field_sym) continue;
+                    const field_layout = computeTypeLayoutBounded(
+                        pool,
+                        sym_table,
+                        mem_sym.type_id,
+                        target_layout,
+                        active_subst,
+                        depth + 1,
+                    );
+                    if (!field_layout.is_sized) is_all_sized = false;
+                    if (!is_packed and field_layout.align_log2 > max_align_log2) {
+                        max_align_log2 = field_layout.align_log2;
+                    }
+                    const eff_align: u32 = if (is_packed) 1 else field_layout.align_bytes;
+                    cur_offset = alignUpU64(cur_offset, eff_align) +| field_layout.byte_size;
+                }
+            } else {
+                var rank_mask: u64 = 0;
+                for (members) |mem_idx| {
+                    const mem_sym = sym_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind != .field_sym) continue;
+                    const field_layout = computeTypeLayoutBounded(
+                        pool,
+                        sym_table,
+                        mem_sym.type_id,
+                        target_layout,
+                        active_subst,
+                        depth + 1,
+                    );
+                    if (!field_layout.is_sized) is_all_sized = false;
+                    if (field_layout.align_log2 > max_align_log2) max_align_log2 = field_layout.align_log2;
+                    const has_niche = computeLeafNicheBounded(
+                        pool,
+                        sym_table,
+                        mem_sym.type_id,
+                        target_layout,
+                        active_subst,
+                        depth + 1,
+                    ).kind != .none;
+                    const rank: u6 = (@as(u6, @intCast(@min(field_layout.align_log2, 30))) << 1) |
+                        @intFromBool(has_niche);
+                    rank_mask |= (@as(u64, 1) << rank);
+                }
+                while (rank_mask != 0) {
+                    const top_rank: u6 = @intCast(63 - @clz(rank_mask));
+                    rank_mask &= ~(@as(u64, 1) << top_rank);
+                    for (members) |mem_idx| {
+                        const mem_sym = sym_table.getSymbol(mem_idx).*;
+                        if (mem_sym.kind != .field_sym) continue;
+                        const field_layout = computeTypeLayoutBounded(
+                            pool,
+                            sym_table,
+                            mem_sym.type_id,
+                            target_layout,
+                            active_subst,
+                            depth + 1,
+                        );
+                        const has_niche = computeLeafNicheBounded(
+                            pool,
+                            sym_table,
+                            mem_sym.type_id,
+                            target_layout,
+                            active_subst,
+                            depth + 1,
+                        ).kind != .none;
+                        const rank: u6 = (@as(u6, @intCast(@min(field_layout.align_log2, 30))) << 1) |
+                            @intFromBool(has_niche);
+                        if (rank != top_rank) continue;
+                        cur_offset = alignUpU64(cur_offset, field_layout.align_bytes) +| field_layout.byte_size;
+                    }
+                }
+            }
+            if (struct_sym.contract_flags.is_cache_aligned) {
+                max_align_log2 = @max(max_align_log2, target_layout.cache_line_align_log2);
+            }
+            if (struct_sym.explicit_align_log2_plus1 > 0) {
+                max_align_log2 = @max(max_align_log2, struct_sym.explicit_align_log2_plus1 - 1);
             }
             const max_align_bytes: u32 = @as(u32, 1) << @intCast(max_align_log2);
             return .{
@@ -3523,7 +4178,15 @@ fn computeTypeLayoutBounded(
                 );
                 if (!field_layout.is_sized) is_all_sized = false;
                 if (field_layout.byte_size > max_field_size) max_field_size = field_layout.byte_size;
-                if (field_layout.align_log2 > max_align_log2) max_align_log2 = field_layout.align_log2;
+                if (!union_sym.contract_flags.is_packed and field_layout.align_log2 > max_align_log2) {
+                    max_align_log2 = field_layout.align_log2;
+                }
+            }
+            if (union_sym.contract_flags.is_cache_aligned) {
+                max_align_log2 = @max(max_align_log2, target_layout.cache_line_align_log2);
+            }
+            if (union_sym.explicit_align_log2_plus1 > 0) {
+                max_align_log2 = @max(max_align_log2, union_sym.explicit_align_log2_plus1 - 1);
             }
             const max_align_bytes: u32 = @as(u32, 1) << @intCast(max_align_log2);
             return .{
@@ -3533,63 +4196,495 @@ fn computeTypeLayoutBounded(
                 .is_sized = is_all_sized,
             };
         },
+        .optional_ty, .result_ty, .enum_ty => {
+            const sum_layout = computeSumMemoryLayoutBounded(pool, sym_table, type_id, target_layout, subst, depth);
+            return .{
+                .byte_size = sum_layout.byte_size,
+                .align_bytes = sum_layout.align_bytes,
+                .align_log2 = sum_layout.align_log2,
+                .is_sized = sum_layout.is_sized,
+            };
+        },
+        else => {
+            return .{ .byte_size = 0, .align_bytes = 1, .align_log2 = 0, .is_sized = false };
+        },
+    }
+}
+
+/// Resolves the leaf scalar or pointer niche (`LeafNicheInfo`) inside `type_id` under `target_layout`.
+pub fn computeLeafNiche(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    type_id: TypeId,
+    target_layout: TargetLayout,
+) LeafNicheInfo {
+    return computeLeafNicheBounded(pool, sym_table, type_id, target_layout, &NominalTypeSubst.EMPTY, 0);
+}
+
+/// Depth-bounded leaf niche resolver (`[CRITICAL-04]`).
+pub fn computeLeafNicheBounded(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    raw_ty: TypeId,
+    target_layout: TargetLayout,
+    subst: *const NominalTypeSubst,
+    depth: u32,
+) LeafNicheInfo {
+    const ty = subst.resolve(raw_ty);
+    if (ty.isError() or depth >= MAX_TYPE_DEPTH) return .{};
+
+    switch (ty) {
+        .bool_ty => return .{
+            .kind = .high_scalar_range,
+            .byte_offset = 0,
+            .scalar_bytes = 1,
+            .invalid_first = 2,
+            .invalid_count = 254,
+        },
+        .char_ty => return .{
+            .kind = .high_scalar_range,
+            .byte_offset = 0,
+            .scalar_bytes = 4,
+            .invalid_first = 0x110000,
+            .invalid_count = 0x1_0000_0000 - 0x110000,
+        },
+        .str_ty => return .{
+            .kind = .zero_ptr,
+            .byte_offset = 0,
+            .scalar_bytes = target_layout.ptr_byte_size,
+            .invalid_first = 0,
+            .invalid_count = 1,
+        },
+        else => {
+            if (ty.isPrimitive()) return .{};
+        },
+    }
+
+    const node = pool.getNode(ty);
+    switch (node.tag) {
+        .ref_ty, .mut_ref_ty, .fn_ty, .slice_ty, .soa_slice_ty, .closure_ty => {
+            return .{
+                .kind = .zero_ptr,
+                .byte_offset = 0,
+                .scalar_bytes = target_layout.ptr_byte_size,
+                .invalid_first = 0,
+                .invalid_count = 1,
+            };
+        },
+        .distinct_ty => {
+            return computeLeafNicheBounded(pool, sym_table, TypeId.fromInt(node.lhs), target_layout, subst, depth + 1);
+        },
+        .refined_ty => {
+            if (pool.getRefinementBounds(ty)) |bounds| {
+                const base_prim = pool.unwrapUnderlyingType(subst.resolve(bounds.base_ty));
+                if (bounds.min_val > 0 and base_prim != .i128_ty and base_prim != .u128_ty) {
+                    if (getTargetPrimitiveIntBits(base_prim, target_layout)) |bit_width| {
+                        const byte_width: u8 = @intCast(bit_width / 8);
+                        if (byte_width == 1 or byte_width == 2 or byte_width == 4 or byte_width == 8) {
+                            const max_unsigned: u64 = if (bit_width == 64)
+                                std.math.maxInt(u64)
+                            else
+                                (@as(u64, 1) << @intCast(bit_width)) - 1;
+                            const raw_count: u64 = @intCast(@min(bounds.min_val, @as(i128, std.math.maxInt(u64))));
+                            const count_u64: u64 = @min(raw_count, max_unsigned);
+                            if (count_u64 > 0) {
+                                return .{
+                                    .kind = .high_scalar_range,
+                                    .byte_offset = 0,
+                                    .scalar_bytes = byte_width,
+                                    .invalid_first = 0,
+                                    .invalid_count = count_u64,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+            return .{};
+        },
+        .array_ty => {
+            if ((node.rhs & SYMBOLIC_ARRAY_LEN_FLAG) != 0 or node.rhs == 0) return .{};
+            return computeLeafNicheBounded(pool, sym_table, TypeId.fromInt(node.lhs), target_layout, subst, depth + 1);
+        },
+        .tuple_ty => {
+            const elems = pool.getTupleElements(ty);
+            var rank_mask: u64 = 0;
+            for (elems) |raw_elem| {
+                const elem_layout = computeTypeLayoutBounded(
+                    pool,
+                    sym_table,
+                    TypeId.fromInt(raw_elem),
+                    target_layout,
+                    subst,
+                    depth + 1,
+                );
+                const sub_niche = computeLeafNicheBounded(
+                    pool,
+                    sym_table,
+                    TypeId.fromInt(raw_elem),
+                    target_layout,
+                    subst,
+                    depth + 1,
+                );
+                const rank: u6 = (@as(u6, @intCast(@min(elem_layout.align_log2, 30))) << 1) |
+                    @intFromBool(sub_niche.kind != .none);
+                rank_mask |= (@as(u64, 1) << rank);
+            }
+            var cur_offset: u64 = 0;
+            while (rank_mask != 0) {
+                const top_rank: u6 = @intCast(63 - @clz(rank_mask));
+                rank_mask &= ~(@as(u64, 1) << top_rank);
+                for (elems) |raw_elem| {
+                    const elem_layout = computeTypeLayoutBounded(
+                        pool,
+                        sym_table,
+                        TypeId.fromInt(raw_elem),
+                        target_layout,
+                        subst,
+                        depth + 1,
+                    );
+                    const sub_niche = computeLeafNicheBounded(
+                        pool,
+                        sym_table,
+                        TypeId.fromInt(raw_elem),
+                        target_layout,
+                        subst,
+                        depth + 1,
+                    );
+                    const rank: u6 = (@as(u6, @intCast(@min(elem_layout.align_log2, 30))) << 1) |
+                        @intFromBool(sub_niche.kind != .none);
+                    if (rank != top_rank) continue;
+                    const aligned_off = alignUpU64(cur_offset, elem_layout.align_bytes);
+                    if (sub_niche.kind != .none and aligned_off +| sub_niche.byte_offset <= std.math.maxInt(u32)) {
+                        var shifted = sub_niche;
+                        shifted.byte_offset = @intCast(aligned_off + sub_niche.byte_offset);
+                        return shifted;
+                    }
+                    cur_offset = aligned_off +| elem_layout.byte_size;
+                }
+            }
+            return .{};
+        },
+        .struct_ty => {
+            const sym_idx = SymbolIndex.fromInt(node.rhs);
+            if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return .{};
+            const st_sym = sym_table.getSymbol(sym_idx).*;
+            if (st_sym.target_scope.isNone() or st_sym.contract_flags.is_packed) return .{};
+            const child_subst = NominalTypeSubst.fromNominal(pool, sym_table, ty, st_sym, subst);
+            const active_subst = if (child_subst.len > 0) &child_subst else subst;
+            const members = sym_table.getScopeMembers(st_sym.target_scope);
+            var cur_offset: u64 = 0;
+            if (st_sym.contract_flags.is_repr_c) {
+                for (members) |mem_idx| {
+                    const mem_sym = sym_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind != .field_sym) continue;
+                    const f_layout = computeTypeLayoutBounded(
+                        pool,
+                        sym_table,
+                        mem_sym.type_id,
+                        target_layout,
+                        active_subst,
+                        depth + 1,
+                    );
+                    const aligned_off = alignUpU64(cur_offset, f_layout.align_bytes);
+                    const sub_niche = computeLeafNicheBounded(
+                        pool,
+                        sym_table,
+                        mem_sym.type_id,
+                        target_layout,
+                        active_subst,
+                        depth + 1,
+                    );
+                    if (sub_niche.kind != .none and aligned_off +| sub_niche.byte_offset <= std.math.maxInt(u32)) {
+                        var shifted = sub_niche;
+                        shifted.byte_offset = @intCast(aligned_off + sub_niche.byte_offset);
+                        return shifted;
+                    }
+                    cur_offset = aligned_off +| f_layout.byte_size;
+                }
+                return .{};
+            }
+            var rank_mask: u64 = 0;
+            for (members) |mem_idx| {
+                const mem_sym = sym_table.getSymbol(mem_idx).*;
+                if (mem_sym.kind != .field_sym) continue;
+                const f_layout = computeTypeLayoutBounded(
+                    pool,
+                    sym_table,
+                    mem_sym.type_id,
+                    target_layout,
+                    active_subst,
+                    depth + 1,
+                );
+                const sub_niche = computeLeafNicheBounded(
+                    pool,
+                    sym_table,
+                    mem_sym.type_id,
+                    target_layout,
+                    active_subst,
+                    depth + 1,
+                );
+                const rank: u6 = (@as(u6, @intCast(@min(f_layout.align_log2, 30))) << 1) |
+                    @intFromBool(sub_niche.kind != .none);
+                rank_mask |= (@as(u64, 1) << rank);
+            }
+            while (rank_mask != 0) {
+                const top_rank: u6 = @intCast(63 - @clz(rank_mask));
+                rank_mask &= ~(@as(u64, 1) << top_rank);
+                for (members) |mem_idx| {
+                    const mem_sym = sym_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind != .field_sym) continue;
+                    const f_layout = computeTypeLayoutBounded(
+                        pool,
+                        sym_table,
+                        mem_sym.type_id,
+                        target_layout,
+                        active_subst,
+                        depth + 1,
+                    );
+                    const sub_niche = computeLeafNicheBounded(
+                        pool,
+                        sym_table,
+                        mem_sym.type_id,
+                        target_layout,
+                        active_subst,
+                        depth + 1,
+                    );
+                    const rank: u6 = (@as(u6, @intCast(@min(f_layout.align_log2, 30))) << 1) |
+                        @intFromBool(sub_niche.kind != .none);
+                    if (rank != top_rank) continue;
+                    const aligned_off = alignUpU64(cur_offset, f_layout.align_bytes);
+                    if (sub_niche.kind != .none and aligned_off +| sub_niche.byte_offset <= std.math.maxInt(u32)) {
+                        var shifted = sub_niche;
+                        shifted.byte_offset = @intCast(aligned_off + sub_niche.byte_offset);
+                        return shifted;
+                    }
+                    cur_offset = aligned_off +| f_layout.byte_size;
+                }
+            }
+            return .{};
+        },
+        .enum_ty => {
+            const sym_idx = SymbolIndex.fromInt(node.rhs);
+            if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return .{};
+            const enum_sym = sym_table.getSymbol(sym_idx).*;
+            if (enum_sym.target_scope.isNone()) return .{};
+            var variant_count: u64 = 0;
+            for (sym_table.getScopeMembers(enum_sym.target_scope)) |mem_idx| {
+                if (sym_table.getSymbol(mem_idx).kind == .enum_variant_sym) variant_count += 1;
+            }
+            if (variant_count == 0) return .{};
+            const auto_tag_log2: u8 = if (variant_count <= 256) 0 else if (variant_count <= 65_536) 1 else 2;
+            const repr_tag_log2: u8 = switch (enum_sym.repr_tag_bits) {
+                8 => 0,
+                16 => 1,
+                32 => 2,
+                64 => 3,
+                else => 0,
+            };
+            const tag_log2: u8 = @max(auto_tag_log2, repr_tag_log2);
+            const tag_bytes: u8 = @as(u8, 1) << @intCast(tag_log2);
+            const tag_bits: u8 = tag_bytes * 8;
+            const max_tag_val: u64 = if (tag_bits == 64)
+                std.math.maxInt(u64)
+            else
+                (@as(u64, 1) << @intCast(tag_bits)) - 1;
+            if (variant_count <= max_tag_val) {
+                return .{
+                    .kind = .high_scalar_range,
+                    .byte_offset = 0,
+                    .scalar_bytes = tag_bytes,
+                    .invalid_first = variant_count,
+                    .invalid_count = (max_tag_val - variant_count) + 1,
+                };
+            }
+            return .{};
+        },
+        .optional_ty, .result_ty => {
+            const sum_layout = computeSumMemoryLayoutBounded(pool, sym_table, ty, target_layout, subst, depth + 1);
+            switch (sum_layout.repr) {
+                .transparent_ok => return computeLeafNicheBounded(
+                    pool,
+                    sym_table,
+                    sum_layout.payload_ty,
+                    target_layout,
+                    subst,
+                    depth + 1,
+                ),
+                .niche_single => {
+                    if (sum_layout.niche.kind == .high_scalar_range and sum_layout.niche.invalid_count > 1) {
+                        return .{
+                            .kind = .high_scalar_range,
+                            .byte_offset = sum_layout.niche.byte_offset,
+                            .scalar_bytes = sum_layout.niche.scalar_bytes,
+                            .invalid_first = sum_layout.niche.invalid_first + 1,
+                            .invalid_count = sum_layout.niche.invalid_count - 1,
+                        };
+                    }
+                    return .{};
+                },
+                .explicit_tag => return .{
+                    .kind = .high_scalar_range,
+                    .byte_offset = 0,
+                    .scalar_bytes = sum_layout.tag_bytes,
+                    .invalid_first = 2,
+                    .invalid_count = 254,
+                },
+            }
+        },
+        else => return .{},
+    }
+}
+
+/// Resolves the canonical in-memory `SumMemoryLayout` for `Option[T]`, `Result[T, E]`, or `enum` (`[CRITICAL-04]`).
+pub fn computeSumMemoryLayout(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    sum_ty: TypeId,
+    target_layout: TargetLayout,
+) SumMemoryLayout {
+    return computeSumMemoryLayoutBounded(
+        pool,
+        sym_table,
+        pool.unwrapUnderlyingType(sum_ty),
+        target_layout,
+        &NominalTypeSubst.EMPTY,
+        0,
+    );
+}
+
+/// Depth-bounded helper computing canonical sum memory layout (`[CRITICAL-04]`).
+pub fn computeSumMemoryLayoutBounded(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    raw_sum_ty: TypeId,
+    target_layout: TargetLayout,
+    subst: *const NominalTypeSubst,
+    depth: u32,
+) SumMemoryLayout {
+    const sum_ty = subst.resolve(raw_sum_ty);
+    if (sum_ty.isError() or depth >= MAX_TYPE_DEPTH) {
+        return .{ .is_sized = false };
+    }
+    const node = pool.getNode(sum_ty);
+    switch (node.tag) {
         .optional_ty => {
+            const payload_ty = subst.resolve(TypeId.fromInt(node.lhs));
             const payload_layout = computeTypeLayoutBounded(
                 pool,
                 sym_table,
-                TypeId.fromInt(node.lhs),
+                payload_ty,
                 target_layout,
                 subst,
                 depth + 1,
             );
-            const max_align_log2: u8 = payload_layout.align_log2;
-            const max_align_bytes: u32 = @as(u32, 1) << @intCast(max_align_log2);
+            const niche = computeLeafNicheBounded(pool, sym_table, payload_ty, target_layout, subst, depth + 1);
+            if (niche.kind != .none) {
+                return .{
+                    .repr = .niche_single,
+                    .byte_size = payload_layout.byte_size,
+                    .align_bytes = payload_layout.align_bytes,
+                    .align_log2 = payload_layout.align_log2,
+                    .is_sized = payload_layout.is_sized,
+                    .tag_bytes = 0,
+                    .payload_offset = 0,
+                    .zst_discriminant = 0,
+                    .payload_discriminant = 1,
+                    .payload_ty = payload_ty,
+                    .niche = niche,
+                };
+            }
             const payload_offset = alignUpU64(1, payload_layout.align_bytes);
             return .{
-                .byte_size = alignUpU64(payload_offset +| payload_layout.byte_size, max_align_bytes),
-                .align_bytes = max_align_bytes,
-                .align_log2 = max_align_log2,
+                .repr = .explicit_tag,
+                .byte_size = alignUpU64(payload_offset +| payload_layout.byte_size, payload_layout.align_bytes),
+                .align_bytes = payload_layout.align_bytes,
+                .align_log2 = payload_layout.align_log2,
                 .is_sized = payload_layout.is_sized,
+                .tag_bytes = 1,
+                .payload_offset = payload_offset,
+                .payload_ty = payload_ty,
             };
         },
         .result_ty => {
-            const ok_layout = computeTypeLayoutBounded(
-                pool,
-                sym_table,
-                TypeId.fromInt(node.lhs),
-                target_layout,
-                subst,
-                depth + 1,
-            );
-            const err_layout = computeTypeLayoutBounded(
-                pool,
-                sym_table,
-                TypeId.fromInt(node.rhs),
-                target_layout,
-                subst,
-                depth + 1,
-            );
+            const ok_ty = subst.resolve(TypeId.fromInt(node.lhs));
+            const err_ty = subst.resolve(TypeId.fromInt(node.rhs));
+            const ok_unwrapped = pool.unwrapUnderlyingType(ok_ty);
+            const err_unwrapped = pool.unwrapUnderlyingType(err_ty);
+            const ok_layout = computeTypeLayoutBounded(pool, sym_table, ok_ty, target_layout, subst, depth + 1);
+            if (err_unwrapped == .never_ty) {
+                return .{
+                    .repr = .transparent_ok,
+                    .byte_size = ok_layout.byte_size,
+                    .align_bytes = ok_layout.align_bytes,
+                    .align_log2 = ok_layout.align_log2,
+                    .is_sized = ok_layout.is_sized,
+                    .tag_bytes = 0,
+                    .payload_offset = 0,
+                    .payload_discriminant = 0,
+                    .payload_ty = ok_ty,
+                };
+            }
+            const err_layout = computeTypeLayoutBounded(pool, sym_table, err_ty, target_layout, subst, depth + 1);
+            if (err_unwrapped == .unit_ty and ok_unwrapped != .unit_ty) {
+                const ok_niche = computeLeafNicheBounded(pool, sym_table, ok_ty, target_layout, subst, depth + 1);
+                if (ok_niche.kind != .none) {
+                    return .{
+                        .repr = .niche_single,
+                        .byte_size = ok_layout.byte_size,
+                        .align_bytes = ok_layout.align_bytes,
+                        .align_log2 = ok_layout.align_log2,
+                        .is_sized = ok_layout.is_sized,
+                        .tag_bytes = 0,
+                        .payload_offset = 0,
+                        .zst_discriminant = 1,
+                        .payload_discriminant = 0,
+                        .payload_ty = ok_ty,
+                        .niche = ok_niche,
+                    };
+                }
+            } else if (ok_unwrapped == .unit_ty and err_unwrapped != .unit_ty) {
+                const err_niche = computeLeafNicheBounded(pool, sym_table, err_ty, target_layout, subst, depth + 1);
+                if (err_niche.kind != .none) {
+                    return .{
+                        .repr = .niche_single,
+                        .byte_size = err_layout.byte_size,
+                        .align_bytes = err_layout.align_bytes,
+                        .align_log2 = err_layout.align_log2,
+                        .is_sized = err_layout.is_sized,
+                        .tag_bytes = 0,
+                        .payload_offset = 0,
+                        .zst_discriminant = 0,
+                        .payload_discriminant = 1,
+                        .payload_ty = err_ty,
+                        .niche = err_niche,
+                    };
+                }
+            }
             const max_payload_log2: u8 = @max(ok_layout.align_log2, err_layout.align_log2);
             const max_align_bytes: u32 = @as(u32, 1) << @intCast(max_payload_log2);
             const max_payload_size: u64 = @max(ok_layout.byte_size, err_layout.byte_size);
             const payload_offset = alignUpU64(1, max_align_bytes);
             return .{
+                .repr = .explicit_tag,
                 .byte_size = alignUpU64(payload_offset +| max_payload_size, max_align_bytes),
                 .align_bytes = max_align_bytes,
                 .align_log2 = max_payload_log2,
                 .is_sized = ok_layout.is_sized and err_layout.is_sized,
+                .tag_bytes = 1,
+                .payload_offset = payload_offset,
             };
         },
         .enum_ty => {
             const sym_idx = SymbolIndex.fromInt(node.rhs);
             if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) {
-                return .{ .byte_size = 1, .align_bytes = 1, .align_log2 = 0 };
+                return .{ .byte_size = 1, .align_bytes = 1, .align_log2 = 0, .tag_bytes = 1 };
             }
             const enum_sym = sym_table.getSymbol(sym_idx).*;
             if (enum_sym.target_scope.isNone()) {
-                return .{ .byte_size = 1, .align_bytes = 1, .align_log2 = 0 };
+                return .{ .byte_size = 1, .align_bytes = 1, .align_log2 = 0, .tag_bytes = 1 };
             }
-            const child_subst = NominalTypeSubst.fromNominal(pool, sym_table, type_id, enum_sym, subst);
+            const child_subst = NominalTypeSubst.fromNominal(pool, sym_table, sum_ty, enum_sym, subst);
             const active_subst = if (child_subst.len > 0) &child_subst else subst;
             var variant_count: usize = 0;
             var max_payload_size: u64 = 0;
@@ -3614,7 +4709,7 @@ fn computeTypeLayoutBounded(
                 }
             }
             if (variant_count == 0) {
-                return .{ .byte_size = 0, .align_bytes = 1, .align_log2 = 0 };
+                return .{ .byte_size = 0, .align_bytes = 1, .align_log2 = 0, .tag_bytes = 0 };
             }
             const auto_tag_log2: u8 = if (variant_count <= 256) 0 else if (variant_count <= 65_536) 1 else 2;
             const repr_tag_log2: u8 = switch (enum_sym.repr_tag_bits) {
@@ -3625,29 +4720,39 @@ fn computeTypeLayoutBounded(
                 else => 0,
             };
             const tag_log2: u8 = @max(auto_tag_log2, repr_tag_log2);
-            const tag_bytes: u64 = @as(u64, 1) << @intCast(tag_log2);
-            const max_align_log2: u8 = @max(tag_log2, max_payload_log2);
+            const tag_bytes: u8 = @as(u8, 1) << @intCast(tag_log2);
+            var max_align_log2: u8 = @max(tag_log2, max_payload_log2);
+            if (enum_sym.contract_flags.is_cache_aligned) {
+                max_align_log2 = @max(max_align_log2, target_layout.cache_line_align_log2);
+            }
+            if (enum_sym.explicit_align_log2_plus1 > 0) {
+                max_align_log2 = @max(max_align_log2, enum_sym.explicit_align_log2_plus1 - 1);
+            }
             const max_align_bytes: u32 = @as(u32, 1) << @intCast(max_align_log2);
             if (max_payload_size == 0) {
                 return .{
-                    .byte_size = tag_bytes,
+                    .repr = .explicit_tag,
+                    .byte_size = alignUpU64(tag_bytes, max_align_bytes),
                     .align_bytes = max_align_bytes,
                     .align_log2 = max_align_log2,
                     .is_sized = is_all_sized,
+                    .tag_bytes = tag_bytes,
+                    .payload_offset = tag_bytes,
                 };
             }
             const payload_align_bytes: u32 = @as(u32, 1) << @intCast(max_payload_log2);
             const payload_offset = alignUpU64(tag_bytes, payload_align_bytes);
             return .{
+                .repr = .explicit_tag,
                 .byte_size = alignUpU64(payload_offset +| max_payload_size, max_align_bytes),
                 .align_bytes = max_align_bytes,
                 .align_log2 = max_align_log2,
                 .is_sized = is_all_sized,
+                .tag_bytes = tag_bytes,
+                .payload_offset = payload_offset,
             };
         },
-        else => {
-            return .{ .byte_size = 0, .align_bytes = 1, .align_log2 = 0, .is_sized = false };
-        },
+        else => return .{ .is_sized = false },
     }
 }
 
@@ -3668,15 +4773,176 @@ pub fn computeStructFieldOffset(
     if (struct_sym.target_scope.isNone()) return null;
 
     const subst = NominalTypeSubst.fromNominal(pool, sym_table, unwrapped, struct_sym, &NominalTypeSubst.EMPTY);
+    const is_packed = struct_sym.contract_flags.is_packed;
+    const is_decl_order = is_packed or struct_sym.contract_flags.is_repr_c;
+    const members = sym_table.getScopeMembers(struct_sym.target_scope);
+    var cur_offset: u64 = 0;
+    if (is_decl_order) {
+        var cur_ordinal: u32 = 0;
+        for (members) |mem_idx| {
+            const mem_sym = sym_table.getSymbol(mem_idx).*;
+            if (mem_sym.kind != .field_sym) continue;
+            const field_layout = computeTypeLayoutBounded(pool, sym_table, mem_sym.type_id, target_layout, &subst, 1);
+            const eff_align: u32 = if (is_packed) 1 else field_layout.align_bytes;
+            const aligned_offset = alignUpU64(cur_offset, eff_align);
+            if (cur_ordinal == field_ordinal) return aligned_offset;
+            cur_offset = aligned_offset +| field_layout.byte_size;
+            cur_ordinal += 1;
+        }
+        return null;
+    }
+
+    var rank_mask: u64 = 0;
+    for (members) |mem_idx| {
+        const mem_sym = sym_table.getSymbol(mem_idx).*;
+        if (mem_sym.kind != .field_sym) continue;
+        const field_layout = computeTypeLayoutBounded(pool, sym_table, mem_sym.type_id, target_layout, &subst, 1);
+        const has_niche = computeLeafNicheBounded(pool, sym_table, mem_sym.type_id, target_layout, &subst, 1).kind != .none;
+        const rank: u6 = (@as(u6, @intCast(@min(field_layout.align_log2, 30))) << 1) | @intFromBool(has_niche);
+        rank_mask |= (@as(u64, 1) << rank);
+    }
+    while (rank_mask != 0) {
+        const top_rank: u6 = @intCast(63 - @clz(rank_mask));
+        rank_mask &= ~(@as(u64, 1) << top_rank);
+        var cur_ordinal: u32 = 0;
+        for (members) |mem_idx| {
+            const mem_sym = sym_table.getSymbol(mem_idx).*;
+            if (mem_sym.kind != .field_sym) continue;
+            defer cur_ordinal += 1;
+            const field_layout = computeTypeLayoutBounded(pool, sym_table, mem_sym.type_id, target_layout, &subst, 1);
+            const has_niche = computeLeafNicheBounded(pool, sym_table, mem_sym.type_id, target_layout, &subst, 1).kind != .none;
+            const rank: u6 = (@as(u6, @intCast(@min(field_layout.align_log2, 30))) << 1) | @intFromBool(has_niche);
+            if (rank != top_rank) continue;
+            const aligned_offset = alignUpU64(cur_offset, field_layout.align_bytes);
+            if (cur_ordinal == field_ordinal) return aligned_offset;
+            cur_offset = aligned_offset +| field_layout.byte_size;
+        }
+    }
+    return null;
+}
+
+/// Computes the exact byte offset of `elem_ordinal` inside `tuple_ty` (`null` if `tuple_ty` is not a `tuple`).
+pub fn computeTupleElemOffset(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    tuple_ty: TypeId,
+    elem_ordinal: u32,
+    target_layout: TargetLayout,
+) ?u64 {
+    const unwrapped = pool.unwrapUnderlyingType(tuple_ty);
+    const node = pool.getNode(unwrapped);
+    if (node.tag != .tuple_ty) return null;
+    const elems = pool.getTupleElements(unwrapped);
+    if (elem_ordinal >= elems.len) return null;
+
+    var rank_mask: u64 = 0;
+    for (elems) |raw_elem| {
+        const elem_ty = TypeId.fromInt(raw_elem);
+        const elem_layout = computeTypeLayoutBounded(pool, sym_table, elem_ty, target_layout, &NominalTypeSubst.EMPTY, 1);
+        const has_niche = computeLeafNicheBounded(pool, sym_table, elem_ty, target_layout, &NominalTypeSubst.EMPTY, 1).kind != .none;
+        const rank: u6 = (@as(u6, @intCast(@min(elem_layout.align_log2, 30))) << 1) | @intFromBool(has_niche);
+        rank_mask |= (@as(u64, 1) << rank);
+    }
+    var cur_offset: u64 = 0;
+    while (rank_mask != 0) {
+        const top_rank: u6 = @intCast(63 - @clz(rank_mask));
+        rank_mask &= ~(@as(u64, 1) << top_rank);
+        for (elems, 0..) |raw_elem, idx| {
+            const elem_ty = TypeId.fromInt(raw_elem);
+            const elem_layout = computeTypeLayoutBounded(pool, sym_table, elem_ty, target_layout, &NominalTypeSubst.EMPTY, 1);
+            const has_niche = computeLeafNicheBounded(pool, sym_table, elem_ty, target_layout, &NominalTypeSubst.EMPTY, 1).kind != .none;
+            const rank: u6 = (@as(u6, @intCast(@min(elem_layout.align_log2, 30))) << 1) | @intFromBool(has_niche);
+            if (rank != top_rank) continue;
+            const aligned_offset = alignUpU64(cur_offset, elem_layout.align_bytes);
+            if (idx == elem_ordinal) return aligned_offset;
+            cur_offset = aligned_offset +| elem_layout.byte_size;
+        }
+    }
+    return null;
+}
+
+/// Computes the SIMD-aligned byte offset and type of column `field_ordinal` inside `#soa [S; elem_count]` (`[CRITICAL-03]`).
+pub fn computeSoaColumnInfo(
+    allocator: ?std.mem.Allocator,
+    pool: *InternPool,
+    sym_table: *const SymbolTable,
+    elem_struct_ty: TypeId,
+    elem_count: u64,
+    field_ordinal: u32,
+    target_layout: TargetLayout,
+) ?SoaColumnInfo {
+    const unwrapped = pool.unwrapUnderlyingType(elem_struct_ty);
+    const node = pool.getNode(unwrapped);
+    if (node.tag != .struct_ty) return null;
+    const sym_idx = SymbolIndex.fromInt(node.rhs);
+    if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return null;
+    const struct_sym = sym_table.getSymbol(sym_idx).*;
+    if (struct_sym.target_scope.isNone()) return null;
+
+    const subst = NominalTypeSubst.fromNominal(pool, sym_table, unwrapped, struct_sym, &NominalTypeSubst.EMPTY);
     var cur_offset: u64 = 0;
     var cur_ordinal: u32 = 0;
     for (sym_table.getScopeMembers(struct_sym.target_scope)) |mem_idx| {
         const mem_sym = sym_table.getSymbol(mem_idx).*;
         if (mem_sym.kind != .field_sym) continue;
         const field_layout = computeTypeLayoutBounded(pool, sym_table, mem_sym.type_id, target_layout, &subst, 1);
-        const aligned_offset = alignUpU64(cur_offset, field_layout.align_bytes);
-        if (cur_ordinal == field_ordinal) return aligned_offset;
-        cur_offset = aligned_offset +| field_layout.byte_size;
+        const col_log2 = @max(field_layout.align_log2, target_layout.simd_align_log2);
+        const col_align = @as(u32, 1) << @intCast(col_log2);
+        const col_offset = alignUpU64(cur_offset, col_align);
+        if (cur_ordinal == field_ordinal) {
+            const concrete_ty = if (subst.len > 0 and allocator != null)
+                subst.applyMut(allocator.?, pool, mem_sym.type_id) catch subst.resolve(mem_sym.type_id)
+            else
+                subst.resolve(mem_sym.type_id);
+            return .{
+                .byte_offset = col_offset,
+                .col_align_log2 = col_log2,
+                .field_ty = concrete_ty,
+                .field_layout = field_layout,
+            };
+        }
+        cur_offset = col_offset +| (field_layout.byte_size *| elem_count);
+        cur_ordinal += 1;
+    }
+    return null;
+}
+
+/// Read-only `const InternPool` variant of `computeSoaColumnInfo` for `TypeLayoutResolver` and `MirOpt`.
+pub fn computeSoaColumnInfoReadOnly(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    elem_struct_ty: TypeId,
+    elem_count: u64,
+    field_ordinal: u32,
+    target_layout: TargetLayout,
+) ?SoaColumnInfo {
+    const unwrapped = pool.unwrapUnderlyingType(elem_struct_ty);
+    const node = pool.getNode(unwrapped);
+    if (node.tag != .struct_ty) return null;
+    const sym_idx = SymbolIndex.fromInt(node.rhs);
+    if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return null;
+    const struct_sym = sym_table.getSymbol(sym_idx).*;
+    if (struct_sym.target_scope.isNone()) return null;
+
+    const subst = NominalTypeSubst.fromNominal(pool, sym_table, unwrapped, struct_sym, &NominalTypeSubst.EMPTY);
+    var cur_offset: u64 = 0;
+    var cur_ordinal: u32 = 0;
+    for (sym_table.getScopeMembers(struct_sym.target_scope)) |mem_idx| {
+        const mem_sym = sym_table.getSymbol(mem_idx).*;
+        if (mem_sym.kind != .field_sym) continue;
+        const field_layout = computeTypeLayoutBounded(pool, sym_table, mem_sym.type_id, target_layout, &subst, 1);
+        const col_log2 = @max(field_layout.align_log2, target_layout.simd_align_log2);
+        const col_align = @as(u32, 1) << @intCast(col_log2);
+        const col_offset = alignUpU64(cur_offset, col_align);
+        if (cur_ordinal == field_ordinal) {
+            return .{
+                .byte_offset = col_offset,
+                .col_align_log2 = col_log2,
+                .field_ty = subst.resolve(mem_sym.type_id),
+                .field_layout = field_layout,
+            };
+        }
+        cur_offset = col_offset +| (field_layout.byte_size *| elem_count);
         cur_ordinal += 1;
     }
     return null;
@@ -4909,7 +6175,9 @@ pub const TypeChecker = struct {
             if (sym.flags.is_builtin or sym.flags.is_imported) continue;
             switch (sym.kind) {
                 .module_sym => {
-                    if (!sym.target_scope.isNone()) {
+                    if (!sym.target_scope.isNone() and
+                        self.sym_table.scope_arena.getScope(sym.target_scope).file_id == self.file_id)
+                    {
                         try self.resolveScopeSignaturesRecursive(sym.target_scope);
                         if (!sym.ast_node.isNone()) {
                             const mod_items = self.extractModInnerItemsSlice(sym.ast_node);
@@ -5449,7 +6717,9 @@ pub const TypeChecker = struct {
 
             switch (sym.kind) {
                 .module_sym => {
-                    if (!sym.target_scope.isNone()) {
+                    if (!sym.target_scope.isNone() and
+                        self.sym_table.scope_arena.getScope(sym.target_scope).file_id == self.file_id)
+                    {
                         try self.verifyScopeDerivesAndAttributesRecursive(sym.target_scope);
                     }
                 },
@@ -10197,6 +11467,14 @@ pub const TypeChecker = struct {
                 }
                 return self.recordNodeType(expr_id, .err_ty);
             },
+            .closure_expr => {
+                const clos_ty = try self.synthOrCheckClosureExpr(expr_id, expected_ty);
+                if (clos_ty.isError()) return self.recordNodeType(expr_id, .err_ty);
+                if (try self.checkTypeCompatibility(expr_id, clos_ty, expected_ty)) {
+                    return self.recordNodeType(expr_id, expected_ty);
+                }
+                return self.recordNodeType(expr_id, .err_ty);
+            },
             else => {},
         }
 
@@ -10535,6 +11813,11 @@ pub const TypeChecker = struct {
 
     /// Synthesizes a closure expression (`|p1, p2| body`), binding parameters inside a dedicated `.fn_scope`.
     fn synthClosureExpr(self: *TypeChecker, expr_id: NodeIndex) !TypeId {
+        return self.synthOrCheckClosureExpr(expr_id, .err_ty);
+    }
+
+    /// Synthesizes or contextually checks a closure expression (`|p1: T1, …| -> R body`) inside `.fn_scope`.
+    fn synthOrCheckClosureExpr(self: *TypeChecker, expr_id: NodeIndex, expected_ty: TypeId) !TypeId {
         const ast_node = self.ast_arena.getNode(expr_id);
         const saved_scope = self.current_scope;
         const saved_ret_ty = self.current_fn_ret_ty;
@@ -10564,10 +11847,132 @@ pub const TypeChecker = struct {
         defer if (param_types.len > 0) self.allocator.free(param_types);
         const param_modes = try self.allocator.alloc(ParamMode, param_count);
         defer if (param_modes.len > 0) self.allocator.free(param_modes);
+        const param_is_mut = try self.allocator.alloc(bool, param_count);
+        defer if (param_is_mut.len > 0) self.allocator.free(param_is_mut);
+        const has_explicit_mode = try self.allocator.alloc(bool, param_count);
+        defer if (has_explicit_mode.len > 0) self.allocator.free(has_explicit_mode);
+        @memset(param_types, .err_ty);
         @memset(param_modes, .let_mode);
+        @memset(param_is_mut, false);
+        @memset(has_explicit_mode, false);
+
+        var explicit_ret_ty: ?TypeId = null;
+        const expr_cst = self.ast_arena.getCstOrigin(expr_id);
+        const body_cst = if (ast_node.rhs.tag == .node)
+            self.ast_arena.getCstOrigin(NodeIndex.fromInt(ast_node.rhs.payload))
+        else
+            CstNodeIndex.none;
+        if (!expr_cst.isNone() and expr_cst.asInt() < self.cst_arena.countNodes()) {
+            const cst_start: usize = expr_cst.asInt();
+            const cst_rec = self.cst_arena.getNode(expr_cst);
+            const full_end: usize = @min(
+                cst_start + @max(@as(usize, cst_rec.subtree_size), 1),
+                self.cst_arena.countNodes(),
+            );
+            const header_end: usize = if (!body_cst.isNone() and body_cst.asInt() > cst_start)
+                @min(@as(usize, body_cst.asInt()), full_end)
+            else
+                full_end;
+            var cursor: usize = cst_start + 1;
+            var param_ord: usize = 0;
+            while (cursor < header_end) {
+                const sub_rec = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cursor)));
+                const sub_end = @min(cursor + @max(@as(usize, sub_rec.subtree_size), 1), header_end);
+                if (sub_rec.kind == .closure_param and param_ord < param_count) {
+                    var colon_pos: ?usize = null;
+                    var has_amp = false;
+                    var is_mut = false;
+                    var mode: ParamMode = .let_mode;
+                    var is_mode_explicit = false;
+                    var p_cur: usize = cursor + 1;
+                    while (p_cur < sub_end) : (p_cur += 1) {
+                        const leaf = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(p_cur)));
+                        const is_leaf = leaf.subtree_size <= 1 and !leaf.flags.is_bracketed;
+                        if (!is_leaf or leaf.flags.is_missing_or_injected or leaf.token.isNone() or
+                            leaf.token.asInt() >= self.token_buffer.countTokens()) continue;
+                        const t_kind = self.token_buffer.getToken(leaf.token).kind;
+                        if (t_kind == .colon) {
+                            colon_pos = p_cur;
+                            break;
+                        }
+                        if (t_kind == .amp or t_kind == .kw_ref) {
+                            has_amp = true;
+                        } else if (t_kind == .kw_mut) {
+                            is_mut = true;
+                            if (!has_amp) {
+                                mode = .inout_mode;
+                                is_mode_explicit = true;
+                            }
+                        } else if (t_kind == .kw_own) {
+                            mode = .sink_mode;
+                            is_mode_explicit = true;
+                        }
+                    }
+                    if (colon_pos) |c_pos| {
+                        const ty_ast = self.findFirstAstInCstRange(c_pos + 1, sub_end);
+                        if (!ty_ast.isNone() and self.ast_arena.getNode(ty_ast).tag == .mode_type) {
+                            const m_tok = self.ast_arena.getNode(ty_ast).main_token;
+                            if (!m_tok.isNone() and m_tok.asInt() < self.token_buffer.countTokens()) {
+                                const m_kind = self.token_buffer.getToken(m_tok).kind;
+                                const m_lex = symbol_resolver.extractTokenSlice(self.source, self.token_buffer, m_tok);
+                                if (m_kind == .kw_own or std.mem.eql(u8, m_lex, "sink")) {
+                                    mode = .sink_mode;
+                                    is_mode_explicit = true;
+                                } else if (std.mem.eql(u8, m_lex, "inout")) {
+                                    mode = .inout_mode;
+                                    is_mut = true;
+                                    is_mode_explicit = true;
+                                } else if (std.mem.eql(u8, m_lex, "set")) {
+                                    mode = .set_mode;
+                                    is_mut = true;
+                                    is_mode_explicit = true;
+                                }
+                            }
+                        }
+                        if (!ty_ast.isNone() and isTypeAstTag(self.ast_arena.getNode(ty_ast).tag)) {
+                            param_types[param_ord] = try self.resolveTypeAst(ty_ast);
+                        }
+                    }
+                    param_modes[param_ord] = mode;
+                    param_is_mut[param_ord] = is_mut and !has_amp;
+                    has_explicit_mode[param_ord] = is_mode_explicit;
+                    param_ord += 1;
+                    cursor = sub_end;
+                    continue;
+                }
+                if (sub_rec.kind == .return_type) {
+                    const ret_ast = self.findFirstAstInCstRange(cursor + 1, sub_end);
+                    if (!ret_ast.isNone() and isTypeAstTag(self.ast_arena.getNode(ret_ast).tag)) {
+                        self.is_in_return_type_pos = true;
+                        defer self.is_in_return_type_pos = false;
+                        explicit_ret_ty = try self.resolveTypeAst(ret_ast);
+                    }
+                    cursor = sub_end;
+                    continue;
+                }
+                cursor += 1;
+            }
+        }
+
+        const exp_sig = if (!expected_ty.isError())
+            self.pool.getFnSignatureView(self.pool.unwrapUnderlyingType(expected_ty))
+        else
+            null;
         for (param_tokens, 0..) |raw_tok, i| {
+            if (param_types[i].isError()) {
+                if (exp_sig) |es| {
+                    if (i < es.paramCount() and !self.pool.getFlags(es.getParamType(i)).has_type_vars) {
+                        param_types[i] = es.getParamType(i);
+                        if (!has_explicit_mode[i]) {
+                            param_modes[i] = es.getParamMode(i);
+                            if (param_modes[i] == .inout_mode or param_modes[i] == .set_mode) {
+                                param_is_mut[i] = true;
+                            }
+                        }
+                    }
+                }
+            }
             const param_tok = TokenIndex.fromInt(raw_tok);
-            param_types[i] = .err_ty;
             if (!param_tok.isNone() and param_tok.asInt() < self.token_buffer.countTokens()) {
                 const param_name = symbol_resolver.extractTokenSlice(self.source, self.token_buffer, param_tok);
                 if (param_name.len > 0 and !std.mem.eql(u8, param_name, "_")) {
@@ -10578,23 +11983,34 @@ pub const TypeChecker = struct {
                         .kind = .param_sym,
                         .namespace = .value_ns,
                         .visibility = .private,
-                        .flags = .{ .is_used = true },
+                        .flags = .{ .is_used = true, .is_mut = param_is_mut[i] },
                         .scope_id = closure_scope,
                         .decl_span = self.token_buffer.getTokenSpan(self.file_id, param_tok),
-                        .type_id = .err_ty,
+                        .type_id = param_types[i],
                         .member_ordinal = @intCast(i),
                     }, self.diagnostic_sink);
                 }
             }
         }
 
-        const body_ty: TypeId = if (ast_node.rhs.tag == .node)
-            self.materializeUntypedType(try self.synthExpr(NodeIndex.fromInt(ast_node.rhs.payload)))
+        const target_ret_ty: TypeId = if (explicit_ret_ty) |er|
+            er
+        else if (exp_sig) |es|
+            (if (!es.ret_ty.isError() and !self.pool.getFlags(es.ret_ty).has_type_vars) es.ret_ty else .err_ty)
         else
-            .unit_ty;
+            .err_ty;
+        self.current_fn_ret_ty = target_ret_ty;
+
+        const body_ty: TypeId = if (ast_node.rhs.tag == .node) blk: {
+            const body_node = NodeIndex.fromInt(ast_node.rhs.payload);
+            if (!target_ret_ty.isError()) {
+                const checked_ty = try self.checkExpr(body_node, target_ret_ty);
+                break :blk if (checked_ty.isError() and explicit_ret_ty == null) .err_ty else target_ret_ty;
+            }
+            break :blk self.materializeUntypedType(try self.synthExpr(body_node));
+        } else .unit_ty;
 
         var max_capture_tier: OwnershipTier = .copy_tier;
-        const expr_cst = self.ast_arena.getCstOrigin(expr_id);
         if (self.hasOwnKeywordBeforePipeInCst(expr_cst) and
             !expr_cst.isNone() and expr_cst.asInt() < self.cst_arena.countNodes())
         {
@@ -13015,7 +14431,404 @@ pub const TypeChecker = struct {
                 const opt_res_ty = try self.pool.internOptional(payload_ty);
                 return self.recordNodeType(callee_id, opt_res_ty);
             },
+            .atomic_fence => {
+                if (type_arg_nodes.len != 0 or val_args.len > 1) {
+                    try self.emitDiagnosticSimple(
+                        .e0401_type_mismatch,
+                        self.getAstNodeSpan(call_id),
+                        "`@atomic_fence` expects 0 type arguments and 0 or 1 ordering argument",
+                        "expected `@atomic_fence()` or `@atomic_fence(order)`",
+                    );
+                    for (val_args) |arg_id| _ = try self.synthExpr(arg_id);
+                    return .unit_ty;
+                }
+                if (val_args.len == 1) {
+                    try self.checkAtomicOrderingArg(val_args[0]);
+                }
+                return self.recordNodeType(callee_id, .unit_ty);
+            },
+            .atomic_load => {
+                if (type_arg_nodes.len > 1 or val_args.len == 0 or val_args.len > 2) {
+                    try self.emitDiagnosticSimple(
+                        .e0401_type_mismatch,
+                        self.getAstNodeSpan(call_id),
+                        "`@atomic_load` expects `(ptr)` or `(ptr, order)`",
+                        "expected `@atomic_load(&slot)`",
+                    );
+                    for (val_args) |arg_id| _ = try self.synthExpr(arg_id);
+                    return if (type_arg_nodes.len == 1) type_args[0] else .err_ty;
+                }
+                const pointee_ty = try self.checkAtomicPtrArg(
+                    val_args[0],
+                    if (type_arg_nodes.len == 1) type_args[0] else null,
+                    false,
+                    false,
+                );
+                if (val_args.len == 2) {
+                    try self.checkAtomicOrderingArg(val_args[1]);
+                }
+                return self.recordNodeType(callee_id, pointee_ty);
+            },
+            .atomic_store => {
+                if (type_arg_nodes.len > 1 or val_args.len < 2 or val_args.len > 3) {
+                    try self.emitDiagnosticSimple(
+                        .e0401_type_mismatch,
+                        self.getAstNodeSpan(call_id),
+                        "`@atomic_store` expects `(ptr, val)` or `(ptr, val, order)`",
+                        "expected `@atomic_store(&mut slot, val)`",
+                    );
+                    for (val_args) |arg_id| _ = try self.synthExpr(arg_id);
+                    return .unit_ty;
+                }
+                const pointee_ty = try self.checkAtomicPtrArg(
+                    val_args[0],
+                    if (type_arg_nodes.len == 1) type_args[0] else null,
+                    true,
+                    false,
+                );
+                if (!pointee_ty.isError()) {
+                    _ = try self.checkExpr(val_args[1], pointee_ty);
+                } else {
+                    _ = try self.synthExpr(val_args[1]);
+                }
+                if (val_args.len == 3) {
+                    try self.checkAtomicOrderingArg(val_args[2]);
+                }
+                return self.recordNodeType(callee_id, .unit_ty);
+            },
+            .atomic_rmw_add, .atomic_rmw_sub, .atomic_rmw_xchg => {
+                const requires_int = (intr_kind != .atomic_rmw_xchg);
+                if (type_arg_nodes.len > 1 or val_args.len < 2 or val_args.len > 3) {
+                    try self.emitDiagnosticSimple(
+                        .e0401_type_mismatch,
+                        self.getAstNodeSpan(call_id),
+                        "atomic RMW intrinsic expects `(ptr, operand)` or `(ptr, operand, order)`",
+                        "expected `@atomic_rmw_*(ptr, val)`",
+                    );
+                    for (val_args) |arg_id| _ = try self.synthExpr(arg_id);
+                    return if (type_arg_nodes.len == 1) type_args[0] else .err_ty;
+                }
+                const pointee_ty = try self.checkAtomicPtrArg(
+                    val_args[0],
+                    if (type_arg_nodes.len == 1) type_args[0] else null,
+                    true,
+                    requires_int,
+                );
+                if (!pointee_ty.isError()) {
+                    _ = try self.checkExpr(val_args[1], pointee_ty);
+                } else {
+                    _ = try self.synthExpr(val_args[1]);
+                }
+                if (val_args.len == 3) {
+                    try self.checkAtomicOrderingArg(val_args[2]);
+                }
+                return self.recordNodeType(callee_id, pointee_ty);
+            },
+            .atomic_cmpxchg => {
+                if (type_arg_nodes.len > 1 or val_args.len < 3 or val_args.len > 5) {
+                    try self.emitDiagnosticSimple(
+                        .e0401_type_mismatch,
+                        self.getAstNodeSpan(call_id),
+                        "`@atomic_cmpxchg` expects `(ptr, expected, desired)` with up to 2 ordering arguments",
+                        "expected `@atomic_cmpxchg(&mut slot, expected, desired)`",
+                    );
+                    for (val_args) |arg_id| _ = try self.synthExpr(arg_id);
+                    return .err_ty;
+                }
+                const pointee_ty = try self.checkAtomicPtrArg(
+                    val_args[0],
+                    if (type_arg_nodes.len == 1) type_args[0] else null,
+                    true,
+                    false,
+                );
+                if (!pointee_ty.isError()) {
+                    _ = try self.checkExpr(val_args[1], pointee_ty);
+                    _ = try self.checkExpr(val_args[2], pointee_ty);
+                } else {
+                    _ = try self.synthExpr(val_args[1]);
+                    _ = try self.synthExpr(val_args[2]);
+                }
+                if (val_args.len >= 4) try self.checkAtomicOrderingArg(val_args[3]);
+                if (val_args.len == 5) try self.checkAtomicOrderingArg(val_args[4]);
+                if (pointee_ty.isError()) return .err_ty;
+                const pair_ty = try self.pool.internTuple(&.{ pointee_ty, .bool_ty });
+                return self.recordNodeType(callee_id, pair_ty);
+            },
+            .simd_splat => {
+                if (type_arg_nodes.len != 1 or val_args.len != 1) {
+                    try self.emitDiagnosticSimple(
+                        .e0401_type_mismatch,
+                        self.getAstNodeSpan(call_id),
+                        "`@simd_splat` expects 1 vector type argument `[Vec]` and 1 lane value `(val)`",
+                        "expected `@simd_splat[[T; N]](val)`",
+                    );
+                    for (val_args) |arg_id| _ = try self.synthExpr(arg_id);
+                    return if (type_arg_nodes.len >= 1) type_args[0] else .err_ty;
+                }
+                const vec_ty = type_args[0];
+                const lane_ty = self.extractSimdVectorLaneType(vec_ty, self.getAstNodeSpan(type_arg_nodes[0])) catch .err_ty;
+                if (!lane_ty.isError()) {
+                    _ = try self.checkExpr(val_args[0], lane_ty);
+                } else {
+                    _ = try self.synthExpr(val_args[0]);
+                }
+                return self.recordNodeType(callee_id, vec_ty);
+            },
+            .simd_add, .simd_sub, .simd_mul => {
+                if (type_arg_nodes.len > 1 or val_args.len != 2) {
+                    try self.emitDiagnosticSimple(
+                        .e0401_type_mismatch,
+                        self.getAstNodeSpan(call_id),
+                        "SIMD arithmetic intrinsic expects 2 vector arguments `(lhs, rhs)`",
+                        "expected `@simd_*(lhs, rhs)`",
+                    );
+                    for (val_args) |arg_id| _ = try self.synthExpr(arg_id);
+                    return if (type_arg_nodes.len == 1) type_args[0] else .err_ty;
+                }
+                const lhs_ty = if (type_arg_nodes.len == 1 and !type_args[0].isError()) blk_vec: {
+                    _ = try self.checkExpr(val_args[0], type_args[0]);
+                    break :blk_vec type_args[0];
+                } else self.materializeUntypedType(try self.synthExpr(val_args[0]));
+                _ = try self.extractSimdVectorLaneType(lhs_ty, self.getAstNodeSpan(val_args[0]));
+                if (!lhs_ty.isError()) {
+                    _ = try self.checkExpr(val_args[1], lhs_ty);
+                } else {
+                    _ = try self.synthExpr(val_args[1]);
+                }
+                return self.recordNodeType(callee_id, lhs_ty);
+            },
+            .simd_reduce_add => {
+                if (type_arg_nodes.len > 1 or val_args.len != 1) {
+                    try self.emitDiagnosticSimple(
+                        .e0401_type_mismatch,
+                        self.getAstNodeSpan(call_id),
+                        "`@simd_reduce_add` expects 1 vector argument `(vec)`",
+                        "expected `@simd_reduce_add(vec)`",
+                    );
+                    for (val_args) |arg_id| _ = try self.synthExpr(arg_id);
+                    return .err_ty;
+                }
+                const vec_ty = if (type_arg_nodes.len == 1 and !type_args[0].isError()) blk_rvec: {
+                    _ = try self.checkExpr(val_args[0], type_args[0]);
+                    break :blk_rvec type_args[0];
+                } else self.materializeUntypedType(try self.synthExpr(val_args[0]));
+                const lane_ty = try self.extractSimdVectorLaneType(vec_ty, self.getAstNodeSpan(val_args[0]));
+                return self.recordNodeType(callee_id, lane_ty);
+            },
+            .panic => {
+                if (type_arg_nodes.len != 0 or val_args.len != 1) {
+                    try self.emitDiagnosticSimple(
+                        .e0401_type_mismatch,
+                        self.getAstNodeSpan(call_id),
+                        "`@panic` expects 0 type arguments and 1 `str` message `(msg)`",
+                        "expected `@panic(\"message\")`",
+                    );
+                    for (val_args) |arg_id| _ = try self.synthExpr(arg_id);
+                    return .never_ty;
+                }
+                _ = try self.checkExpr(val_args[0], .str_ty);
+                return self.recordNodeType(callee_id, .never_ty);
+            },
+            .trap => {
+                if (type_arg_nodes.len != 0 or val_args.len != 0) {
+                    try self.emitDiagnosticSimple(
+                        .e0401_type_mismatch,
+                        self.getAstNodeSpan(call_id),
+                        "`@trap` expects 0 type arguments and 0 value arguments `()`",
+                        "expected `@trap()`",
+                    );
+                    for (val_args) |arg_id| _ = try self.synthExpr(arg_id);
+                }
+                return self.recordNodeType(callee_id, .never_ty);
+            },
+            .poll_reload => {
+                if (type_arg_nodes.len > 1 or val_args.len > 1) {
+                    try self.emitDiagnosticSimple(
+                        .e0401_type_mismatch,
+                        self.getAstNodeSpan(call_id),
+                        "`@poll_reload` expects `()` or `(&mut app_state)`",
+                        "expected `@poll_reload()` or `@poll_reload(&mut state)`",
+                    );
+                    for (val_args) |arg_id| _ = try self.synthExpr(arg_id);
+                    return .bool_ty;
+                }
+                if (val_args.len == 1) {
+                    const state_arg_ty = if (type_arg_nodes.len == 1 and !type_args[0].isError()) blk_st: {
+                        const exp_mut_ref = try self.pool.internRef(type_args[0], true);
+                        _ = try self.checkExpr(val_args[0], exp_mut_ref);
+                        break :blk_st exp_mut_ref;
+                    } else try self.synthExpr(val_args[0]);
+                    if (!state_arg_ty.isError() and !self.pool.getFlags(state_arg_ty).has_type_vars) {
+                        const st_node = self.pool.getNode(self.pool.unwrapUnderlyingType(state_arg_ty));
+                        if (st_node.tag != .mut_ref_ty) {
+                            try self.emitDiagnosticSimple(
+                                .e0401_type_mismatch,
+                                self.getAstNodeSpan(val_args[0]),
+                                "`@poll_reload` state argument must be an exclusive mutable reference `&mut S`",
+                                "expected `&mut S` here",
+                            );
+                        }
+                    }
+                }
+                return self.recordNodeType(callee_id, .bool_ty);
+            },
+            .sys_exit => {
+                if (type_arg_nodes.len != 0 or val_args.len != 1) {
+                    try self.emitDiagnosticSimple(
+                        .e0401_type_mismatch,
+                        self.getAstNodeSpan(call_id),
+                        "`@sys_exit` expects 0 type arguments and 1 `(code: i32)` argument",
+                        "expected `@sys_exit(code)`",
+                    );
+                    for (val_args) |arg_id| _ = try self.synthExpr(arg_id);
+                    return .never_ty;
+                }
+                _ = try self.checkExpr(val_args[0], .i32_ty);
+                return self.recordNodeType(callee_id, .never_ty);
+            },
+            .sys_write => {
+                if (type_arg_nodes.len != 0 or val_args.len != 2) {
+                    try self.emitDiagnosticSimple(
+                        .e0401_type_mismatch,
+                        self.getAstNodeSpan(call_id),
+                        "`@sys_write` expects `(fd: i32, buf: [u8] | &[u8] | str)` returning `isize`",
+                        "expected `@sys_write(fd, buf)`",
+                    );
+                    for (val_args) |arg_id| _ = try self.synthExpr(arg_id);
+                    return .isize_ty;
+                }
+                _ = try self.checkExpr(val_args[0], .i32_ty);
+                const buf_ty = try self.synthExpr(val_args[1]);
+                if (!buf_ty.isError() and !self.pool.getFlags(buf_ty).has_type_vars) {
+                    const unwrapped_buf = self.unwrapRefType(buf_ty);
+                    const buf_node = self.pool.getNode(unwrapped_buf);
+                    const is_valid_buf = unwrapped_buf == .str_ty or
+                        (buf_node.tag == .slice_ty and TypeId.fromInt(buf_node.lhs) == .u8_ty) or
+                        (buf_node.tag == .array_ty and TypeId.fromInt(buf_node.lhs) == .u8_ty and
+                            (self.pool.getTag(buf_ty) == .ref_ty or self.pool.getTag(buf_ty) == .mut_ref_ty));
+                    if (!is_valid_buf) {
+                        const expected_slice = try self.pool.internSlice(.u8_ty, false);
+                        try self.emitTypeMismatch(self.getAstNodeSpan(val_args[1]), expected_slice, buf_ty);
+                    }
+                }
+                return self.recordNodeType(callee_id, .isize_ty);
+            },
         }
+    }
+
+    /// Type-checks an optional memory ordering argument (`u8` / integer or fieldless `Ordering` enum).
+    fn checkAtomicOrderingArg(self: *TypeChecker, arg_id: NodeIndex) !void {
+        const ord_ty = try self.synthExpr(arg_id);
+        if (ord_ty.isError() or self.pool.getFlags(ord_ty).has_type_vars) return;
+        const unwrapped = self.pool.unwrapUnderlyingType(ord_ty);
+        if (unwrapped == .untyped_int_ty) {
+            _ = try self.checkExpr(arg_id, .u8_ty);
+            return;
+        }
+        if (unwrapped.isIntegerPrimitive()) return;
+        if (self.pool.getTag(unwrapped) == .enum_ty) return;
+        try self.emitTypeMismatch(self.getAstNodeSpan(arg_id), .u8_ty, ord_ty);
+    }
+
+    /// Validates a pointer/reference target for `@atomic_*` intrinsics and returns the pointee `TypeId`.
+    fn checkAtomicPtrArg(
+        self: *TypeChecker,
+        ptr_arg_id: NodeIndex,
+        explicit_pointee: ?TypeId,
+        is_mut_required: bool,
+        is_integer_required: bool,
+    ) !TypeId {
+        const ptr_ty = try self.synthExpr(ptr_arg_id);
+        if (ptr_ty.isError()) return explicit_pointee orelse .err_ty;
+        const unwrapped_ptr = self.pool.unwrapUnderlyingType(ptr_ty);
+        if (self.pool.getFlags(unwrapped_ptr).has_type_vars) {
+            return explicit_pointee orelse blk_inner: {
+                const p_node = self.pool.getNode(unwrapped_ptr);
+                if (p_node.tag == .ref_ty or p_node.tag == .mut_ref_ty or p_node.tag == .raw_ptr_ty) {
+                    break :blk_inner TypeId.fromInt(p_node.lhs);
+                }
+                break :blk_inner .err_ty;
+            };
+        }
+        const ptr_node = self.pool.getNode(unwrapped_ptr);
+        const is_valid_ptr = ptr_node.tag == .ref_ty or ptr_node.tag == .mut_ref_ty or ptr_node.tag == .raw_ptr_ty;
+        if (!is_valid_ptr) {
+            try self.emitDiagnosticSimple(
+                .e0401_type_mismatch,
+                self.getAstNodeSpan(ptr_arg_id),
+                "atomic intrinsic first argument must be a reference (`&T` / `&mut T`) or raw pointer (`*T` / `*mut T`)",
+                "expected pointer or reference to atomic slot",
+            );
+            return explicit_pointee orelse .err_ty;
+        }
+        const is_mut_ptr = ptr_node.tag == .mut_ref_ty or (ptr_node.tag == .raw_ptr_ty and ptr_node.rhs != 0);
+        if (is_mut_required and !is_mut_ptr) {
+            try self.emitDiagnosticSimple(
+                .e0401_type_mismatch,
+                self.getAstNodeSpan(ptr_arg_id),
+                "mutating atomic intrinsic requires `&mut T` or `*mut T` target",
+                "immutable pointer passed to atomic store/RMW",
+            );
+        }
+        const pointee_ty = TypeId.fromInt(ptr_node.lhs);
+        if (explicit_pointee) |exp_ty| {
+            if (!exp_ty.isError() and pointee_ty != exp_ty) {
+                try self.emitTypeMismatch(self.getAstNodeSpan(ptr_arg_id), exp_ty, pointee_ty);
+            }
+        }
+        const base_pointee = self.pool.unwrapUnderlyingType(pointee_ty);
+        if (!base_pointee.isError() and !self.pool.getFlags(base_pointee).has_type_vars) {
+            const p_tag = self.pool.getTag(base_pointee);
+            const is_int = base_pointee.isIntegerPrimitive() and base_pointee != .i128_ty and base_pointee != .u128_ty;
+            const is_scalar = is_int or base_pointee == .bool_ty or p_tag == .raw_ptr_ty or
+                p_tag == .ref_ty or p_tag == .fn_ty or p_tag == .enum_ty;
+            if ((is_integer_required and !is_int) or (!is_integer_required and !is_scalar)) {
+                try self.emitDiagnosticSimple(
+                    .e0401_type_mismatch,
+                    self.getAstNodeSpan(ptr_arg_id),
+                    "atomic target type must be an atomic-width integer, `bool`, fieldless `enum`, or thin pointer",
+                    "unsupported atomic value type",
+                );
+            }
+        }
+        return pointee_ty;
+    }
+
+    /// Validates that `vec_ty` unwraps to `[Lane; N]` with power-of-two `N` (`2..64`) and numeric `Lane`.
+    fn extractSimdVectorLaneType(self: *TypeChecker, vec_ty: TypeId, err_span: Span) !TypeId {
+        if (vec_ty.isError()) return .err_ty;
+        const unwrapped = self.pool.unwrapUnderlyingType(vec_ty);
+        if (self.pool.getFlags(unwrapped).has_type_vars) {
+            const v_node = self.pool.getNode(unwrapped);
+            if (v_node.tag == .array_ty) return TypeId.fromInt(v_node.lhs);
+            return .err_ty;
+        }
+        const vec_node = self.pool.getNode(unwrapped);
+        if (vec_node.tag != .array_ty or (vec_node.rhs & SYMBOLIC_ARRAY_LEN_FLAG) != 0) {
+            try self.emitDiagnosticSimple(
+                .e0401_type_mismatch,
+                err_span,
+                "SIMD intrinsic requires a fixed-width vector `[Lane; N]` where `N` is a power of two (`2..64`)",
+                "expected SIMD vector type `[Lane; N]`",
+            );
+            return .err_ty;
+        }
+        const lane_count = vec_node.rhs;
+        const lane_ty = TypeId.fromInt(vec_node.lhs);
+        const lane_base = self.pool.unwrapUnderlyingType(lane_ty);
+        const is_valid_lane = (lane_base.isIntegerPrimitive() and lane_base != .i128_ty and lane_base != .u128_ty) or
+            lane_base == .f32_ty or lane_base == .f64_ty;
+        const is_valid_width = lane_count >= 2 and lane_count <= 64 and std.math.isPowerOfTwo(lane_count);
+        if (!is_valid_lane or !is_valid_width) {
+            try self.emitDiagnosticSimple(
+                .e0401_type_mismatch,
+                err_span,
+                "SIMD vector `[Lane; N]` requires numeric lane (`i8..i64`, `u8..u64`, `f32`, `f64`) and power-of-two `N` (`2..64`)",
+                "invalid SIMD lane type or lane count",
+            );
+            return .err_ty;
+        }
+        return lane_ty;
     }
 
     /// Emits `E0315` (`e0315_wire_layout_contract_violation`) with exact field/padding byte-offset details.
@@ -15486,7 +17299,13 @@ test "test_phase5_target_layout_and_body_semantic_side_tables" {
         \\}
         \\
         \\@TagAttr(code = 42)
+        \\@repr(C)
         \\pub struct Padded {
+        \\    pub flag: u8,
+        \\    pub word: u64,
+        \\}
+        \\
+        \\pub struct NativeReordered {
         \\    pub flag: u8,
         \\    pub word: u64,
         \\}
@@ -15579,6 +17398,19 @@ test "test_phase5_target_layout_and_body_semantic_side_tables" {
     try std.testing.expectEqual(
         @as(?u64, 8),
         computeStructFieldOffset(&pool, &sym_table, padded_ty, 1, TargetLayout.NATIVE_64),
+    );
+
+    const reord_sym_id = try interner.intern("NativeReordered");
+    const reord_sym_idx = sym_table.lookupInScopeDirect(mod_scope, reord_sym_id, NamespaceMask.TYPE_ONLY);
+    const reord_ty = sym_table.getSymbol(reord_sym_idx).type_id;
+    try std.testing.expectEqual(@as(u64, 16), checker.computeTypeLayout(reord_ty, TargetLayout.NATIVE_64).byte_size);
+    try std.testing.expectEqual(
+        @as(?u64, 0),
+        computeStructFieldOffset(&pool, &sym_table, reord_ty, 1, TargetLayout.NATIVE_64),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 8),
+        computeStructFieldOffset(&pool, &sym_table, reord_ty, 0, TargetLayout.NATIVE_64),
     );
 
     // [2] Verify window-scoped `BodySemanticSideTables` extraction & `rebaseWindow`:
@@ -16021,9 +17853,14 @@ test "test_phase6_wire_contracts_from_bytes_into_bytes_and_zero_pad" {
     }
     try std.testing.expect(has_found_port and has_found_full_byte and has_found_flags);
 
-    // [2] Unpadded struct padding offset (`byte_offset = 1`, `padding_bytes = 3`) & `E0315`:
+    // [2] Unpadded struct padding offset (`@repr(C)` inter-field at `1`, native tail at `5`) & `E0315`:
     const bad_wire_src =
+        \\@repr(C)
         \\pub struct UnpaddedHdr {
+        \\    pub tag: u8,
+        \\    pub payload: u32,
+        \\}
+        \\pub struct NativeUnpaddedHdr {
         \\    pub tag: u8,
         \\    pub payload: u32,
         \\}
@@ -16036,6 +17873,7 @@ test "test_phase6_wire_contracts_from_bytes_into_bytes_and_zero_pad" {
     try std.testing.expect(hasDiagnosticCode(&bad_res.diagnostics, .e0315_wire_layout_contract_violation));
 
     var has_verified_padding_offset = false;
+    var has_verified_native_tail_offset = false;
     sym_i = 0;
     while (sym_i < bad_res.symbol_table.symbols.items.len) : (sym_i += 1) {
         const sym = bad_res.symbol_table.getSymbol(SymbolIndex.fromInt(sym_i)).*;
@@ -16050,9 +17888,19 @@ test "test_phase6_wire_contracts_from_bytes_into_bytes_and_zero_pad" {
             try std.testing.expectEqual(@as(u64, 3), viol.padding_bytes);
             try std.testing.expectEqualStrings("payload", viol.field_name);
             has_verified_padding_offset = true;
+        } else if (std.mem.eql(u8, sym.name_text, "NativeUnpaddedHdr")) {
+            const native_viol = bad_res.type_pool.explainIntoBytesViolation(
+                sym.type_id,
+                &bad_res.symbol_table,
+                TargetLayout.NATIVE_64,
+            ) orelse unreachable;
+            try std.testing.expectEqual(WireLayoutViolationReason.unzeroed_tail_padding, native_viol.reason);
+            try std.testing.expectEqual(@as(u64, 5), native_viol.byte_offset);
+            try std.testing.expectEqual(@as(u64, 3), native_viol.padding_bytes);
+            has_verified_native_tail_offset = true;
         }
     }
-    try std.testing.expect(has_verified_padding_offset);
+    try std.testing.expect(has_verified_padding_offset and has_verified_native_tail_offset);
 }
 
 test "test_phase6_seam1_secret_taint_propagation_and_e0402_e0405" {

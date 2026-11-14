@@ -7,6 +7,7 @@
 //! Levenshtein typo suggestions (`help: did you mean \`…\`?`), and renders the monochrome help menu.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = @import("../mem_foundation.zig");
 const vfs = @import("../vfs_sourcemap.zig");
 const style = @import("style.zig");
@@ -16,6 +17,8 @@ const renderer = @import("../diag/renderer.zig");
 const bench_harness = @import("../bench/harness.zig");
 const fmt_engine = @import("../fmt_engine.zig");
 const query_db = @import("../query_db.zig");
+const codegen_abi = @import("../codegen_abi.zig");
+const diff_oracle = @import("../diff_oracle.zig");
 
 const ColorMode = style.ColorMode;
 const Glyphs = style.Glyphs;
@@ -123,16 +126,45 @@ pub const FmtFlagDescriptor = struct {
     summary: []const u8,
 };
 
+/// Codegen backend family selectable via `--ofmt=<c|llvm>` / `-ofmt=<c|llvm>`.
+pub const OutputFormat = enum(u8) {
+    /// Tier A deterministic ISO C99 backend (`-ofmt=c`).
+    c = 0,
+    /// Tier B LLVM 20–23 backend (`-ofmt=llvm`, default).
+    llvm = 1,
+
+    /// Parses `"c"` or `"llvm"` into an `OutputFormat`.
+    pub fn parse(raw_format: []const u8) ?OutputFormat {
+        if (std.mem.eql(u8, raw_format, "c")) return .c;
+        if (std.mem.eql(u8, raw_format, "llvm")) return .llvm;
+        return null;
+    }
+};
+
 /// Subcommand-specific CLI option identifiers for compilation/verification subcommands (`COMPILE_FLAGS`).
 pub const CompileFlagId = enum(u8) {
     /// `--comptime-limit=<steps>` – configure `MirVm` compile-time execution step budget (`0`).
     comptime_limit = 0,
     /// `--dev` – compile in fast development mode (`1`).
     dev = 1,
-    /// `--release` – compile in production release mode (`2`).
-    release = 2,
-    /// `--sast-strict` – emit `W0314` warnings on unproven bounds checks (`3`).
-    sast_strict = 3,
+    /// `--diff-backends` – run 4-tier `MirVm` / C99 / LLVM differential oracle (`2`).
+    diff_backends = 2,
+    /// `--emit-c` – emit deterministic ISO C99 source text (`3`).
+    emit_c = 3,
+    /// `--emit-llvm` – emit deterministic LLVM 20–23 `.ll` IR text (`4`).
+    emit_llvm = 4,
+    /// `--fuzz` – instrument output with `SanitizerCoverage` edge counters (`5`).
+    fuzz = 5,
+    /// `--ofmt=<c|llvm>` – select Tier A (`c`) or Tier B (`llvm`) codegen backend (`6`).
+    ofmt = 6,
+    /// `--output=<path>` – write compiled artifact to `<path>` (`7`).
+    output = 7,
+    /// `--release` – compile in production release mode (`8`).
+    release = 8,
+    /// `--sast-strict` – emit `W0314` warnings on unproven bounds checks (`9`).
+    sast_strict = 9,
+    /// `--target=<triple>` – select cross-compilation target triple (`10`).
+    target = 10,
 };
 
 /// Static metadata entry in `COMPILE_FLAGS` describing `build`/`run`/`check`/`test` flags.
@@ -159,6 +191,10 @@ pub const CommandAction = union(enum) {
         subcommand: SubcommandId,
         /// Slice of positional arguments allocated in `DiagnosticSink.arena`.
         positional_args: []const []const u8,
+        /// Number of `positional_args` preceding `--` (remaining entries are `run_args`).
+        pre_dash_arg_count: usize = 0,
+        /// Arguments forwarded after `--` to child binary during `corex run`.
+        run_args: []const []const u8 = &.{},
         /// Whether `--check` was passed (e.g., `corex fmt --check`).
         is_check_only: bool = false,
         /// Whether `--fix` was passed (e.g., `corex fmt --fix`).
@@ -169,6 +205,20 @@ pub const CommandAction = union(enum) {
         is_release_mode: bool = false,
         /// Whether `--sast-strict` was passed to warn (`W0314`) on unproven bounds checks.
         is_sast_strict: bool = false,
+        /// Whether `--diff-backends` 4-tier differential verification was enabled.
+        is_diff_backends: bool = false,
+        /// Whether `--emit-c` textual C99 emission was requested.
+        is_emit_c: bool = false,
+        /// Whether `--emit-llvm` textual LLVM `.ll` IR emission was requested.
+        is_emit_llvm: bool = false,
+        /// Whether `--fuzz` `SanitizerCoverage` instrumentation was requested.
+        is_fuzz_enabled: bool = false,
+        /// Selected codegen backend family (`llvm` by default, or `c` with `-ofmt=c`).
+        output_format: OutputFormat = .llvm,
+        /// Optional explicit output artifact path (`-o <path>` / `--output=<path>`).
+        output_path: ?[]const u8 = null,
+        /// Optional explicit target specification (`--target=<triple>`).
+        target_spec: ?codegen_abi.TargetSpec = null,
     },
     /// Invalid CLI invocation; errors have been emitted into `DiagnosticSink`.
     invalid: void,
@@ -190,6 +240,22 @@ pub const ParsedCommand = struct {
     is_release_mode: bool = false,
     /// Whether `--sast-strict` was passed on a compile/check subcommand.
     is_sast_strict: bool = false,
+    /// Whether `--diff-backends` was passed on `corex test`.
+    is_diff_backends: bool = false,
+    /// Whether `--emit-c` was passed on a compile subcommand.
+    is_emit_c: bool = false,
+    /// Whether `--emit-llvm` was passed on a compile subcommand.
+    is_emit_llvm: bool = false,
+    /// Whether `--fuzz` was passed on a compile subcommand.
+    is_fuzz_enabled: bool = false,
+    /// Selected codegen backend family (`llvm` by default).
+    output_format: OutputFormat = .llvm,
+    /// Optional explicit output path (`-o` / `--output`).
+    output_path: ?[]const u8 = null,
+    /// Optional explicit target specification (`--target`).
+    target_spec: ?codegen_abi.TargetSpec = null,
+    /// Arguments passed after `--` (forwarded to the child executable on `corex run`).
+    run_args: []const []const u8 = &.{},
 };
 
 // --------------------------------------- CONSTS ----------------------------------------
@@ -299,7 +365,7 @@ pub const COMPILE_FLAGS = [_]CompileFlagDescriptor{
         .long_flag = "--comptime-limit",
         .value_suffix = "=<steps>",
         .summary = std.fmt.comptimePrint(
-            "Set maximum compile-time VM execution step budget (default: {d})",
+            "Set maximum compile-time VM step budget (default: {d})",
             .{DEFAULT_COMPTIME_STEP_LIMIT},
         ),
     },
@@ -308,6 +374,42 @@ pub const COMPILE_FLAGS = [_]CompileFlagDescriptor{
         .long_flag = "--dev",
         .value_suffix = null,
         .summary = "Compile in fast development mode with local constant folding",
+    },
+    .{
+        .id = .diff_backends,
+        .long_flag = "--diff-backends",
+        .value_suffix = null,
+        .summary = "Verify 4-tier parity across MirVm, C99, and LLVM backends",
+    },
+    .{
+        .id = .emit_c,
+        .long_flag = "--emit-c",
+        .value_suffix = null,
+        .summary = "Emit deterministic ISO C99 source text without linking",
+    },
+    .{
+        .id = .emit_llvm,
+        .long_flag = "--emit-llvm",
+        .value_suffix = null,
+        .summary = "Emit deterministic LLVM 20–23 IR text without linking",
+    },
+    .{
+        .id = .fuzz,
+        .long_flag = "--fuzz",
+        .value_suffix = null,
+        .summary = "Instrument compiled output with SanitizerCoverage counters",
+    },
+    .{
+        .id = .ofmt,
+        .long_flag = "--ofmt",
+        .value_suffix = "=<c|llvm>",
+        .summary = "Select Tier A C99 (`c`) or Tier B LLVM (`llvm`) backend",
+    },
+    .{
+        .id = .output,
+        .long_flag = "--output",
+        .value_suffix = "=<path>",
+        .summary = "Write compiled binary, object, or IR artifact to `<path>`",
     },
     .{
         .id = .release,
@@ -319,9 +421,27 @@ pub const COMPILE_FLAGS = [_]CompileFlagDescriptor{
         .id = .sast_strict,
         .long_flag = "--sast-strict",
         .value_suffix = null,
-        .summary = "Emit W0314 warnings when array or slice bounds checks cannot be statically elided",
+        .summary = "Emit W0314 warnings when bounds checks cannot be elided",
+    },
+    .{
+        .id = .target,
+        .long_flag = "--target",
+        .value_suffix = "=<triple>",
+        .summary = "Cross-compile for target triple (e.g., `wasm32-wasi`)",
     },
 };
+
+/// Maximum recursive `mod <name>;` discovery depth across workspace module trees.
+const MAX_MODULE_DISCOVERY_DEPTH: u32 = 64;
+/// $O(1)$ lookup table of package/directory hub basenames whose child modules live directly in `parent_dir`.
+const HUB_MODULE_BASENAME_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "lib.cx", {} },
+    .{ "main.cx", {} },
+    .{ "mod.cx", {} },
+    .{ "root.cx", {} },
+});
+/// Monotonic atomic counter preventing scratch-path collisions across concurrent `corex run` calls.
+var next_run_scratch_seq = std.atomic.Value(u32).init(1);
 
 // -------------------------------------- INTERNALS --------------------------------------
 
@@ -356,6 +476,30 @@ fn emitConflictingOptFlagsDiagnostic(sink: *DiagnosticSink) !void {
         .severity = .err,
         .message = "conflicting CLI optimization flags `--dev` and `--release`",
         .notes = &.{"help: pass either `--dev` or `--release`, not both"},
+    });
+}
+
+/// Emits an `E0001` diagnostic when both `--emit-c` and `--emit-llvm` are passed together.
+fn emitConflictingEmitFlagsDiagnostic(sink: *DiagnosticSink) !void {
+    try sink.emit(.{
+        .code = .e0001_unknown_cli_flag,
+        .severity = .err,
+        .message = "conflicting CLI emission flags `--emit-c` and `--emit-llvm`",
+        .notes = &.{"help: pass either `--emit-c` or `--emit-llvm`, not both"},
+    });
+}
+
+/// Emits an `E0001` diagnostic when `--ofmt` / `-ofmt` receives an unsupported backend name.
+fn emitInvalidOutputFormatDiagnostic(sink: *DiagnosticSink, raw_fmt_val: []const u8) !void {
+    try sink.emit(.{
+        .code = .e0001_unknown_cli_flag,
+        .severity = .err,
+        .message = try std.fmt.allocPrint(
+            sink.arena.asAllocator(),
+            "invalid backend format `{s}` for `--ofmt`",
+            .{raw_fmt_val},
+        ),
+        .notes = &.{"help: valid backend formats for `--ofmt` / `-ofmt` are `c` or `llvm`"},
     });
 }
 
@@ -415,6 +559,285 @@ fn emitInvalidColorValueDiagnostic(sink: *DiagnosticSink, raw_color_val: []const
         ),
         .notes = &.{"help: valid values for `--color` are `auto`, `always`, or `never`"},
     });
+}
+
+/// Orders UTF-8 relative paths ascending for deterministic directory traversal.
+fn isLessThanUtf8Path(_: void, lhs_path: []u8, rhs_path: []u8) bool {
+    return std.mem.order(u8, lhs_path, rhs_path) == .lt;
+}
+
+/// Appends `.cx` file paths inside `dir_path` (sorted lexicographically) into `out_paths`, or returns `false` if not a dir.
+fn collectDirectoryCxPaths(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir_path: []const u8,
+    out_paths: *std.ArrayListUnmanaged([]u8),
+) !bool {
+    var opened_dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return false;
+    defer opened_dir.close(io);
+
+    const start_idx = out_paths.items.len;
+    var walker = try opened_dir.walk(allocator);
+    defer walker.deinit();
+
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".cx")) continue;
+        const joined_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.path });
+        errdefer allocator.free(joined_path);
+        for (joined_path) |*ch_ptr| {
+            if (ch_ptr.* == '\\') ch_ptr.* = '/';
+        }
+        try out_paths.append(allocator, joined_path);
+    }
+
+    std.mem.sort([]u8, out_paths.items[start_idx..], {}, isLessThanUtf8Path);
+    return true;
+}
+
+/// Recursively discovers and binds external `mod <name>;` `.cx` files reachable from `parent_fid`.
+fn discoverExternalSubmodulesRecursive(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_map: *vfs.VfsSourceMap,
+    db: *query_db.CompilerDb,
+    parent_fid: mem.FileId,
+    parent_path: []const u8,
+    durability: query_db.Durability,
+    pkg_id: vfs.PackageId,
+    visited_fids: *std.AutoHashMapUnmanaged(u32, void),
+    has_core_mention_out: *bool,
+    depth: u32,
+) !void {
+    if (depth >= MAX_MODULE_DISCOVERY_DEPTH or visited_fids.contains(parent_fid.asInt())) return;
+    try visited_fids.put(allocator, parent_fid.asInt(), {});
+
+    _ = source_map.getLineIndex(parent_fid) catch {};
+    const parent_src = source_map.getFileSource(parent_fid) orelse "";
+    if (!has_core_mention_out.* and std.mem.indexOf(u8, parent_src, "core") != null) {
+        has_core_mention_out.* = true;
+    }
+    _ = try db.setInput(parent_fid, parent_src, durability);
+
+    var ext_mod_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer ext_mod_names.deinit(allocator);
+    {
+        const parsed_art = try db.parseCst(parent_fid);
+        const item_entries = (try db.extractItemTree(parent_fid)).entries;
+        for (item_entries) |entry| {
+            if (entry.kind != .mod_decl or entry.name_text.len == 0) continue;
+            if (!entry.ast_node.isNone() and
+                parsed_art.ast_arena.getNode(entry.ast_node).rhs.tag == .extra)
+            {
+                continue;
+            }
+            try ext_mod_names.append(allocator, entry.name_text);
+        }
+    }
+
+    const parent_dir = std.fs.path.dirname(parent_path) orelse ".";
+    const parent_base = std.fs.path.basename(parent_path);
+    const parent_stem = std.fs.path.stem(parent_path);
+    const is_hub_file = HUB_MODULE_BASENAME_SET.has(parent_base);
+
+    for (ext_mod_names.items) |mod_name| {
+        var cand_paths: [4]?[]u8 = @splat(null);
+        defer {
+            for (cand_paths) |maybe_p| {
+                if (maybe_p) |owned_p| allocator.free(owned_p);
+            }
+        }
+        var cand_len: usize = 0;
+        if (!is_hub_file) {
+            cand_paths[cand_len] = try std.fmt.allocPrint(
+                allocator,
+                "{s}/{s}/{s}.cx",
+                .{ parent_dir, parent_stem, mod_name },
+            );
+            cand_len += 1;
+            cand_paths[cand_len] = try std.fmt.allocPrint(
+                allocator,
+                "{s}/{s}/{s}/mod.cx",
+                .{ parent_dir, parent_stem, mod_name },
+            );
+            cand_len += 1;
+        }
+        cand_paths[cand_len] = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}.cx",
+            .{ parent_dir, mod_name },
+        );
+        cand_len += 1;
+        cand_paths[cand_len] = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}/mod.cx",
+            .{ parent_dir, mod_name },
+        );
+        cand_len += 1;
+
+        var idx: usize = 0;
+        while (idx < cand_len) : (idx += 1) {
+            const cand_str = cand_paths[idx].?;
+            if (source_map.resolveOrCreatePath(io, cand_str, pkg_id)) |child_fid| {
+                _ = try source_map.getLineIndex(child_fid);
+                try db.bindExternalModule(parent_fid, mod_name, child_fid);
+                try discoverExternalSubmodulesRecursive(
+                    allocator,
+                    io,
+                    source_map,
+                    db,
+                    child_fid,
+                    cand_str,
+                    durability,
+                    pkg_id,
+                    visited_fids,
+                    has_core_mention_out,
+                    depth + 1,
+                );
+                break;
+            } else |_| {}
+        }
+    }
+}
+
+/// Registers `core/root.cx` (and its `core/` submodule tree) on `db` when available on disk.
+fn registerWorkspaceCoreModuleIfNeeded(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_map: *vfs.VfsSourceMap,
+    db: *query_db.CompilerDb,
+    visited_fids: *std.AutoHashMapUnmanaged(u32, void),
+) !void {
+    const core_root_path = "core/root.cx";
+    const core_fid = source_map.resolveOrCreatePath(io, core_root_path, .std_core) catch return;
+    _ = try source_map.getLineIndex(core_fid);
+    var has_dummy_core_mention = true;
+    try discoverExternalSubmodulesRecursive(
+        allocator,
+        io,
+        source_map,
+        db,
+        core_fid,
+        core_root_path,
+        .high,
+        .std_core,
+        visited_fids,
+        &has_dummy_core_mention,
+        0,
+    );
+    try db.registerRootModule("core", core_fid);
+}
+
+/// Returns `true` if `file_id` declares a top-level `fn main` entrypoint.
+fn fileDeclaresMainEntrypoint(db: *query_db.CompilerDb, file_id: mem.FileId) !bool {
+    const item_tree = try db.extractItemTree(file_id);
+    for (item_tree.entries) |entry| {
+        if (entry.kind == .fn_decl and std.mem.eql(u8, entry.name_text, "main")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Verifies all reachable module files from `root_files` and renders any front-end/SAST/comptime diagnostics.
+fn verifyAndRenderModuleDiagnostics(
+    allocator: std.mem.Allocator,
+    db: *query_db.CompilerDb,
+    root_files: []const mem.FileId,
+    diag_renderer: DiagnosticRenderer,
+    stderr_writer: *std.Io.Writer,
+) !bool {
+    var reachable_files: std.ArrayListUnmanaged(mem.FileId) = .empty;
+    defer reachable_files.deinit(allocator);
+    if (root_files.len > 0) {
+        try db.collectReachableModuleFiles(root_files[0], root_files[1..], &reachable_files);
+    }
+
+    var has_errors = false;
+    for (reachable_files.items) |mod_fid| {
+        const parsed_art = try db.parseCst(mod_fid);
+        if (parsed_art.diagnostics.diagnostics.items.len > 0) {
+            try diag_renderer.renderAll(stderr_writer, &parsed_art.diagnostics);
+            if (parsed_art.diagnostics.hasErrors()) has_errors = true;
+        }
+
+        const sig_err_count = (try db.resolveSignatures(mod_fid)).error_count;
+        if (db.getSignatureDiagnostics(mod_fid)) |sig_sink| {
+            if (sig_sink.diagnostics.items.len > 0) {
+                try diag_renderer.renderAll(stderr_writer, sig_sink);
+            }
+            if (sig_sink.hasErrors()) has_errors = true;
+        }
+        if (sig_err_count > 0) has_errors = true;
+
+        const item_entries = (try db.extractItemTree(mod_fid)).entries;
+        for (item_entries) |entry| {
+            const body_err_count = (try db.typecheckBody(entry.def_id)).error_count;
+            if (db.getBodyDiagnostics(entry.def_id)) |body_sink| {
+                if (body_sink.diagnostics.items.len > 0) {
+                    try diag_renderer.renderAll(stderr_writer, body_sink);
+                }
+                if (body_sink.hasErrors()) has_errors = true;
+            }
+            if (body_err_count > 0) has_errors = true;
+
+            const is_verified_sound = (try db.verifySastMir(entry.def_id)).is_verified_sound;
+            if (db.getSastDiagnostics(entry.def_id)) |sast_sink| {
+                if (sast_sink.diagnostics.items.len > 0) {
+                    try diag_renderer.renderAll(stderr_writer, sast_sink);
+                }
+                if (sast_sink.hasErrors()) has_errors = true;
+            }
+            if (!is_verified_sound) has_errors = true;
+
+            if (!has_errors and (entry.kind == .const_decl or entry.kind == .extern_block)) {
+                const ct_art_opt: ?query_db.ComptimeEvalArtifact =
+                    db.evalComptimeDef(entry.def_id) catch |ct_err| switch (ct_err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => blk: {
+                            has_errors = true;
+                            break :blk null;
+                        },
+                    };
+                if (db.getComptimeDiagnostics(entry.def_id)) |ct_sink| {
+                    if (ct_sink.diagnostics.items.len > 0) {
+                        try diag_renderer.renderAll(stderr_writer, ct_sink);
+                    }
+                    if (ct_sink.hasErrors()) has_errors = true;
+                }
+                if (ct_art_opt) |ct_art| {
+                    if (ct_art.has_errors) has_errors = true;
+                }
+            }
+        }
+    }
+    return has_errors;
+}
+
+/// Builds a `CodegenBackend` matching `(output_format, target_spec, is_release_mode, is_fuzz_enabled)`.
+fn buildConfiguredBackend(
+    output_format: OutputFormat,
+    target_spec: codegen_abi.TargetSpec,
+    is_release_mode: bool,
+    is_fuzz_enabled: bool,
+) codegen_abi.CodegenBackend {
+    return switch (output_format) {
+        .c => .{
+            .tier_a_c99 = .{
+                .target = target_spec,
+                .is_release_mode = is_release_mode,
+                .is_fuzz_instrumented = is_fuzz_enabled,
+                .has_line_directives = true,
+            },
+        },
+        .llvm => .{
+            .tier_b_llvm = .{
+                .target = target_spec,
+                .opt_level = if (is_release_mode) .release_fast_o2 else .debug_o0,
+                .is_release_mode = is_release_mode,
+                .is_fuzz_instrumented = is_fuzz_enabled,
+            },
+        },
+    };
 }
 
 // ------------------------------------- PUBLIC API --------------------------------------
@@ -521,7 +944,7 @@ pub fn suggestFlagForSubcommand(unknown_flag: []const u8, subcommand: ?Subcomman
     return best_match;
 }
 
-/// Parses CLI arguments (excluding `argv[0]`), emitting `E0001`/`E0002`/`E0003` into `sink` on error.
+/// Parses CLI arguments (excluding `argv[0]`), emitting `E0001`/`E0002`/`E0003`/`E0006` into `sink` on error.
 pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCommand {
     var color_mode: ColorMode = .auto;
     var has_help_flag = false;
@@ -532,15 +955,24 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
     var has_seen_dev = false;
     var has_seen_release = false;
     var is_sast_strict = false;
+    var is_diff_backends = false;
+    var is_emit_c = false;
+    var is_emit_llvm = false;
+    var is_fuzz_enabled = false;
+    var output_format: OutputFormat = .llvm;
+    var output_path: ?[]const u8 = null;
+    var target_spec: ?codegen_abi.TargetSpec = null;
     var selected_subcommand: ?SubcommandId = null;
     var positional_list: std.ArrayList([]const u8) = .empty;
     var is_after_double_dash = false;
+    var pre_dash_count: ?usize = null;
 
     var arg_idx: usize = 0;
     while (arg_idx < raw_args.len) : (arg_idx += 1) {
         const arg_text = raw_args[arg_idx];
         if (!is_after_double_dash and std.mem.eql(u8, arg_text, "--")) {
             is_after_double_dash = true;
+            pre_dash_count = positional_list.items.len;
             continue;
         }
 
@@ -566,6 +998,103 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                 has_seen_release = true;
             } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--sast-strict")) {
                 is_sast_strict = true;
+            } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--diff-backends")) {
+                is_diff_backends = true;
+            } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--emit-c")) {
+                if (is_emit_llvm) {
+                    try emitConflictingEmitFlagsDiagnostic(sink);
+                }
+                is_emit_c = true;
+                output_format = .c;
+            } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--emit-llvm")) {
+                if (is_emit_c) {
+                    try emitConflictingEmitFlagsDiagnostic(sink);
+                }
+                is_emit_llvm = true;
+                output_format = .llvm;
+            } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--fuzz")) {
+                is_fuzz_enabled = true;
+            } else if (is_compile_sub and (std.mem.startsWith(u8, arg_text, "--ofmt=") or
+                std.mem.startsWith(u8, arg_text, "-ofmt=")))
+            {
+                const eq_pos = std.mem.indexOfScalar(u8, arg_text, '=').?;
+                const raw_fmt = arg_text[eq_pos + 1 ..];
+                if (OutputFormat.parse(raw_fmt)) |parsed_fmt| {
+                    output_format = parsed_fmt;
+                } else {
+                    try emitInvalidOutputFormatDiagnostic(sink, raw_fmt);
+                }
+            } else if (is_compile_sub and (std.mem.eql(u8, arg_text, "--ofmt") or
+                std.mem.eql(u8, arg_text, "-ofmt")))
+            {
+                if (arg_idx + 1 >= raw_args.len) {
+                    try sink.emit(.{
+                        .code = .e0003_missing_cli_argument,
+                        .severity = .err,
+                        .message = "missing backend format for `--ofmt`; expected `c` or `llvm`",
+                        .notes = &.{"help: pass `--ofmt=c` (`-ofmt=c`) or `--ofmt=llvm` (`-ofmt=llvm`)"},
+                    });
+                } else {
+                    arg_idx += 1;
+                    const next_fmt = raw_args[arg_idx];
+                    if (OutputFormat.parse(next_fmt)) |parsed_fmt| {
+                        output_format = parsed_fmt;
+                    } else {
+                        try emitInvalidOutputFormatDiagnostic(sink, next_fmt);
+                    }
+                }
+            } else if (is_compile_sub and (std.mem.startsWith(u8, arg_text, "--output=") or
+                std.mem.startsWith(u8, arg_text, "-o=")))
+            {
+                const eq_pos = std.mem.indexOfScalar(u8, arg_text, '=').?;
+                const raw_out = arg_text[eq_pos + 1 ..];
+                if (raw_out.len == 0) {
+                    try sink.emit(.{
+                        .code = .e0003_missing_cli_argument,
+                        .severity = .err,
+                        .message = "missing file path for `--output` / `-o`",
+                        .notes = &.{"help: pass `--output=<path>` or `-o <path>`"},
+                    });
+                } else {
+                    output_path = try sink.arena.asAllocator().dupe(u8, raw_out);
+                }
+            } else if (is_compile_sub and (std.mem.eql(u8, arg_text, "--output") or
+                std.mem.eql(u8, arg_text, "-o")))
+            {
+                if (arg_idx + 1 >= raw_args.len or raw_args[arg_idx + 1].len == 0) {
+                    try sink.emit(.{
+                        .code = .e0003_missing_cli_argument,
+                        .severity = .err,
+                        .message = "missing file path for `--output` / `-o`",
+                        .notes = &.{"help: pass `--output=<path>` or `-o <path>`"},
+                    });
+                } else {
+                    arg_idx += 1;
+                    output_path = try sink.arena.asAllocator().dupe(u8, raw_args[arg_idx]);
+                }
+            } else if (is_compile_sub and std.mem.startsWith(u8, arg_text, "--target=")) {
+                const raw_triple = arg_text["--target=".len..];
+                target_spec = try codegen_abi.TargetSpec.parseOrEmitInvalidTarget(
+                    raw_triple,
+                    mem.Span.ZERO,
+                    sink,
+                );
+            } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--target")) {
+                if (arg_idx + 1 >= raw_args.len) {
+                    try sink.emit(.{
+                        .code = .e0003_missing_cli_argument,
+                        .severity = .err,
+                        .message = "missing target triple for `--target`",
+                        .notes = &.{"help: pass `--target=<triple>` (e.g., `--target=wasm32-wasi`)"},
+                    });
+                } else {
+                    arg_idx += 1;
+                    target_spec = try codegen_abi.TargetSpec.parseOrEmitInvalidTarget(
+                        raw_args[arg_idx],
+                        mem.Span.ZERO,
+                        sink,
+                    );
+                }
             } else if (is_compile_sub and std.mem.startsWith(u8, arg_text, "--comptime-limit=")) {
                 const raw_val = arg_text["--comptime-limit=".len..];
                 if (extractPositiveStepLimit(raw_val)) |parsed_steps| {
@@ -641,6 +1170,8 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
         return .{ .color_mode = color_mode, .action = .show_version };
     }
     if (selected_subcommand) |sub_id| {
+        const split_pos = pre_dash_count orelse positional_list.items.len;
+        const forwarded_run_args = positional_list.items[split_pos..];
         return .{
             .color_mode = color_mode,
             .is_check_only = is_check_only,
@@ -648,15 +1179,32 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
             .comptime_step_limit = comptime_step_limit,
             .is_release_mode = has_seen_release,
             .is_sast_strict = is_sast_strict,
+            .is_diff_backends = is_diff_backends,
+            .is_emit_c = is_emit_c,
+            .is_emit_llvm = is_emit_llvm,
+            .is_fuzz_enabled = is_fuzz_enabled,
+            .output_format = output_format,
+            .output_path = output_path,
+            .target_spec = target_spec,
+            .run_args = forwarded_run_args,
             .action = .{
                 .execute_subcommand = .{
                     .subcommand = sub_id,
                     .positional_args = positional_list.items,
+                    .pre_dash_arg_count = split_pos,
+                    .run_args = forwarded_run_args,
                     .is_check_only = is_check_only,
                     .is_fix_mode = is_fix_mode,
                     .comptime_step_limit = comptime_step_limit,
                     .is_release_mode = has_seen_release,
                     .is_sast_strict = is_sast_strict,
+                    .is_diff_backends = is_diff_backends,
+                    .is_emit_c = is_emit_c,
+                    .is_emit_llvm = is_emit_llvm,
+                    .is_fuzz_enabled = is_fuzz_enabled,
+                    .output_format = output_format,
+                    .output_path = output_path,
+                    .target_spec = target_spec,
                 },
             },
         };
@@ -873,8 +1421,21 @@ pub fn runCli(
                 return 0;
             }
             if (exec_info.subcommand == .fmt) {
+                var expanded_fmt_paths: std.ArrayListUnmanaged([]u8) = .empty;
+                defer {
+                    for (expanded_fmt_paths.items) |owned_p| allocator.free(owned_p);
+                    expanded_fmt_paths.deinit(allocator);
+                }
+                for (exec_info.positional_args) |raw_arg| {
+                    if (!(try collectDirectoryCxPaths(allocator, io, raw_arg, &expanded_fmt_paths))) {
+                        const duped_arg = try allocator.dupe(u8, raw_arg);
+                        errdefer allocator.free(duped_arg);
+                        try expanded_fmt_paths.append(allocator, duped_arg);
+                    }
+                }
+
                 var has_unformatted_or_error = false;
-                for (exec_info.positional_args) |file_arg| {
+                for (expanded_fmt_paths.items) |file_arg| {
                     const raw_source = std.Io.Dir.cwd().readFileAlloc(
                         io,
                         file_arg,
@@ -974,11 +1535,33 @@ pub fn runCli(
                 try stdout_writer.writeByte('\n');
                 return 0;
             }
+
+            const input_positional = if (exec_info.subcommand == .run)
+                exec_info.positional_args[0..exec_info.pre_dash_arg_count]
+            else
+                exec_info.positional_args;
+
+            var expanded_paths: std.ArrayListUnmanaged([]u8) = .empty;
+            defer {
+                for (expanded_paths.items) |owned_p| allocator.free(owned_p);
+                expanded_paths.deinit(allocator);
+            }
+            for (input_positional) |raw_arg| {
+                const allow_dir = exec_info.subcommand == .check or exec_info.subcommand == .@"test";
+                if (!allow_dir or !(try collectDirectoryCxPaths(allocator, io, raw_arg, &expanded_paths))) {
+                    const duped_arg = try allocator.dupe(u8, raw_arg);
+                    errdefer allocator.free(duped_arg);
+                    try expanded_paths.append(allocator, duped_arg);
+                }
+            }
+
             var cx_file_ids: std.ArrayListUnmanaged(mem.FileId) = .empty;
             defer cx_file_ids.deinit(allocator);
+            var cx_file_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer cx_file_paths.deinit(allocator);
             var embed_sandbox_root: []const u8 = ".";
 
-            for (exec_info.positional_args) |file_arg| {
+            for (expanded_paths.items) |file_arg| {
                 const file_id = source_map.resolveOrCreatePath(io, file_arg, .root) catch {
                     try sink.emit(.{
                         .code = .e0004_source_file_io_error,
@@ -997,90 +1580,267 @@ pub fn runCli(
                         embed_sandbox_root = std.fs.path.dirname(file_arg) orelse ".";
                     }
                     try cx_file_ids.append(allocator, file_id);
+                    try cx_file_paths.append(allocator, file_arg);
                 }
             }
             if (sink.hasErrors()) {
                 try DiagnosticRenderer.init(&source_map, &interner, stderr_style).renderAll(stderr_writer, &sink);
                 return 1;
             }
-            if (exec_info.subcommand == .check and cx_file_ids.items.len > 0) {
+
+            if (isCompileSubcommand(exec_info.subcommand) and cx_file_ids.items.len > 0) {
                 var db = try query_db.CompilerDb.init(allocator);
                 defer db.deinit();
                 db.setSastStrict(exec_info.is_sast_strict);
                 db.setComptimeStepLimit(exec_info.comptime_step_limit);
                 db.setEmbedSandbox(embed_sandbox_root, null);
                 db.setEmbedIo(io);
+                if (exec_info.target_spec) |explicit_target| {
+                    db.setTargetSpec(explicit_target);
+                }
 
-                for (cx_file_ids.items) |cx_fid| {
-                    const file_bytes = source_map.getFileSource(cx_fid) orelse "";
-                    _ = try db.setInput(cx_fid, file_bytes, .low);
+                var visited_fids: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                defer visited_fids.deinit(allocator);
+                var has_core_mention = false;
+
+                for (cx_file_ids.items, cx_file_paths.items) |cx_fid, cx_path| {
+                    try discoverExternalSubmodulesRecursive(
+                        allocator,
+                        io,
+                        &source_map,
+                        &db,
+                        cx_fid,
+                        cx_path,
+                        .low,
+                        .root,
+                        &visited_fids,
+                        &has_core_mention,
+                        0,
+                    );
+                }
+                if (has_core_mention) {
+                    try registerWorkspaceCoreModuleIfNeeded(
+                        allocator,
+                        io,
+                        &source_map,
+                        &db,
+                        &visited_fids,
+                    );
                 }
 
                 const diag_renderer = DiagnosticRenderer.init(&source_map, &interner, stderr_style);
-                var has_check_errors = false;
-
-                for (cx_file_ids.items) |cx_fid| {
-                    const parsed_art = try db.parseCst(cx_fid);
-                    if (parsed_art.diagnostics.diagnostics.items.len > 0) {
-                        try diag_renderer.renderAll(stderr_writer, &parsed_art.diagnostics);
-                        if (parsed_art.diagnostics.hasErrors()) has_check_errors = true;
-                    }
-
-                    const sig_art = try db.resolveSignatures(cx_fid);
-                    if (db.getSignatureDiagnostics(cx_fid)) |sig_sink| {
-                        if (sig_sink.diagnostics.items.len > 0) {
-                            try diag_renderer.renderAll(stderr_writer, sig_sink);
-                        }
-                        if (sig_sink.hasErrors()) has_check_errors = true;
-                    }
-                    if (sig_art.error_count > 0) has_check_errors = true;
-
-                    const item_tree = try db.extractItemTree(cx_fid);
-                    for (item_tree.entries) |entry| {
-                        const typed_art = try db.typecheckBody(entry.def_id);
-                        if (db.getBodyDiagnostics(entry.def_id)) |body_sink| {
-                            if (body_sink.diagnostics.items.len > 0) {
-                                try diag_renderer.renderAll(stderr_writer, body_sink);
-                            }
-                            if (body_sink.hasErrors()) has_check_errors = true;
-                        }
-                        if (typed_art.error_count > 0) has_check_errors = true;
-
-                        const sast_art = try db.verifySastMir(entry.def_id);
-                        if (db.getSastDiagnostics(entry.def_id)) |sast_sink| {
-                            if (sast_sink.diagnostics.items.len > 0) {
-                                try diag_renderer.renderAll(stderr_writer, sast_sink);
-                            }
-                            if (sast_sink.hasErrors()) has_check_errors = true;
-                        }
-                        if (!sast_art.is_verified_sound) has_check_errors = true;
-
-                        if (!has_check_errors and
-                            (entry.kind == .const_decl or entry.kind == .extern_block))
-                        {
-                            const ct_art_opt: ?query_db.ComptimeEvalArtifact =
-                                db.evalComptimeDef(entry.def_id) catch |ct_err| switch (ct_err) {
-                                    error.OutOfMemory => return error.OutOfMemory,
-                                    else => blk: {
-                                        has_check_errors = true;
-                                        break :blk null;
-                                    },
-                                };
-                            if (db.getComptimeDiagnostics(entry.def_id)) |ct_sink| {
-                                if (ct_sink.diagnostics.items.len > 0) {
-                                    try diag_renderer.renderAll(stderr_writer, ct_sink);
-                                }
-                                if (ct_sink.hasErrors()) has_check_errors = true;
-                            }
-                            if (ct_art_opt) |ct_art| {
-                                if (ct_art.has_errors) has_check_errors = true;
-                            }
-                        }
-                    }
+                if (try verifyAndRenderModuleDiagnostics(
+                    allocator,
+                    &db,
+                    cx_file_ids.items,
+                    diag_renderer,
+                    stderr_writer,
+                )) {
+                    return 1;
                 }
 
-                if (has_check_errors) {
-                    return 1;
+                switch (exec_info.subcommand) {
+                    .check => {},
+                    .build => {
+                        const active_target = exec_info.target_spec orelse codegen_abi.TargetSpec.host();
+                        const has_main = try fileDeclaresMainEntrypoint(&db, cx_file_ids.items[0]);
+                        const artifact_kind: codegen_abi.OutputArtifactKind =
+                            if (exec_info.is_emit_c or exec_info.is_emit_llvm)
+                                .source_text
+                            else if (has_main)
+                                .executable
+                            else
+                                .object_file;
+
+                        const stem = std.fs.path.stem(cx_file_paths.items[0]);
+                        const default_ext: []const u8 = switch (artifact_kind) {
+                            .source_text => if (exec_info.output_format == .c) ".c" else ".ll",
+                            .executable => active_target.executableExtension(),
+                            .object_file => active_target.objectExtension(),
+                        };
+                        const default_out = try std.fmt.allocPrint(
+                            allocator,
+                            "build/{s}{s}",
+                            .{ stem, default_ext },
+                        );
+                        defer allocator.free(default_out);
+                        const final_out_path = exec_info.output_path orelse default_out;
+
+                        const backend = buildConfiguredBackend(
+                            exec_info.output_format,
+                            active_target,
+                            exec_info.is_release_mode,
+                            exec_info.is_fuzz_enabled,
+                        );
+                        var build_art = db.compileModuleArtifact(cx_file_ids.items[0], backend, .{
+                            .module_name = stem,
+                            .extra_file_ids = cx_file_ids.items[1..],
+                            .vfs_source_map = &source_map,
+                            .is_dev_got_enabled = false,
+                            .artifact_kind = artifact_kind,
+                            .output_path = final_out_path,
+                            .io = io,
+                            .environ_map = environ_map,
+                            .diagnostic_sink = &sink,
+                        }) catch |comp_err| switch (comp_err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            else => {
+                                if (sink.hasErrors()) {
+                                    try diag_renderer.renderAll(stderr_writer, &sink);
+                                }
+                                return 1;
+                            },
+                        };
+                        defer build_art.deinit(allocator);
+
+                        try stdout_style.writeStatusHeader(
+                            stdout_writer,
+                            .success,
+                            Glyphs.SUCCESS,
+                            "build",
+                            final_out_path,
+                        );
+                        try stdout_writer.writeByte('\n');
+                        return 0;
+                    },
+                    .run => {
+                        const host_target = exec_info.target_spec orelse codegen_abi.TargetSpec.host();
+                        if (!std.meta.eql(host_target.arch, codegen_abi.TargetSpec.host().arch) or
+                            !std.meta.eql(host_target.os, codegen_abi.TargetSpec.host().os))
+                        {
+                            try sink.emit(.{
+                                .code = .e0006_invalid_target_triple,
+                                .severity = .err,
+                                .message = "cannot execute cross-compiled target directly via `corex run`",
+                                .notes = &.{"help: use `corex build --target=<triple>` to emit a cross-target binary"},
+                            });
+                            try diag_renderer.renderAll(stderr_writer, &sink);
+                            return 1;
+                        }
+
+                        const run_seq = next_run_scratch_seq.fetchAdd(1, .monotonic);
+                        const scratch_dir = try std.fmt.allocPrint(
+                            allocator,
+                            ".zig-cache/cx_run_{d}",
+                            .{run_seq},
+                        );
+                        defer allocator.free(scratch_dir);
+                        defer std.Io.Dir.cwd().deleteTree(io, scratch_dir) catch {};
+
+                        const stem = std.fs.path.stem(cx_file_paths.items[0]);
+                        const temp_exe_path = try std.fmt.allocPrint(
+                            allocator,
+                            "{s}/{s}{s}",
+                            .{ scratch_dir, stem, host_target.executableExtension() },
+                        );
+                        defer allocator.free(temp_exe_path);
+                        const final_exe_path = exec_info.output_path orelse temp_exe_path;
+
+                        const backend = buildConfiguredBackend(
+                            exec_info.output_format,
+                            host_target,
+                            exec_info.is_release_mode,
+                            exec_info.is_fuzz_enabled,
+                        );
+                        var run_art = db.compileModuleArtifact(cx_file_ids.items[0], backend, .{
+                            .module_name = stem,
+                            .extra_file_ids = cx_file_ids.items[1..],
+                            .vfs_source_map = &source_map,
+                            .is_dev_got_enabled = false,
+                            .artifact_kind = .executable,
+                            .output_path = final_exe_path,
+                            .io = io,
+                            .environ_map = environ_map,
+                            .diagnostic_sink = &sink,
+                        }) catch |comp_err| switch (comp_err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            else => {
+                                if (sink.hasErrors()) {
+                                    try diag_renderer.renderAll(stderr_writer, &sink);
+                                }
+                                return 1;
+                            },
+                        };
+                        defer run_art.deinit(allocator);
+
+                        var child_argv: std.ArrayListUnmanaged([]const u8) = .empty;
+                        defer child_argv.deinit(allocator);
+                        try child_argv.append(allocator, final_exe_path);
+                        try child_argv.appendSlice(allocator, exec_info.run_args);
+
+                        const child_res = std.process.run(allocator, io, .{
+                            .argv = child_argv.items,
+                            .environ_map = environ_map,
+                        }) catch {
+                            try sink.emit(.{
+                                .code = .e0007_codegen_backend_failure,
+                                .severity = .err,
+                                .message = "failed to spawn compiled CoreX executable",
+                            });
+                            try diag_renderer.renderAll(stderr_writer, &sink);
+                            return 1;
+                        };
+                        defer allocator.free(child_res.stdout);
+                        defer allocator.free(child_res.stderr);
+
+                        if (child_res.stdout.len > 0) try stdout_writer.writeAll(child_res.stdout);
+                        if (child_res.stderr.len > 0) try stderr_writer.writeAll(child_res.stderr);
+                        return switch (child_res.term) {
+                            .exited => |status_code| status_code,
+                            else => if (builtin.os.tag == .windows) 101 else 134,
+                        };
+                    },
+                    .@"test" => {
+                        if (exec_info.is_diff_backends) {
+                            var tested_main_count: usize = 0;
+                            for (cx_file_ids.items) |test_fid| {
+                                if (!(try fileDeclaresMainEntrypoint(&db, test_fid))) continue;
+                                tested_main_count += 1;
+                                var oracle_report = diff_oracle.runFourTierDiffOracleOnDb(
+                                    allocator,
+                                    &db,
+                                    test_fid,
+                                    .{
+                                        .io = io,
+                                        .environ_map = environ_map,
+                                        .vfs_source_map = &source_map,
+                                        .workspace_root = embed_sandbox_root,
+                                        .comptime_step_limit = exec_info.comptime_step_limit,
+                                        .diagnostic_sink = &sink,
+                                    },
+                                ) catch |oracle_err| switch (oracle_err) {
+                                    error.OutOfMemory => return error.OutOfMemory,
+                                    else => {
+                                        if (sink.hasErrors()) {
+                                            try diag_renderer.renderAll(stderr_writer, &sink);
+                                        }
+                                        return 1;
+                                    },
+                                };
+                                defer oracle_report.deinit(allocator);
+                                if (!oracle_report.is_all_matching) {
+                                    try stderr_writer.writeAll(oracle_report.rendered_diff_table);
+                                    return 1;
+                                }
+                            }
+                            var msg_buf: [128]u8 = undefined;
+                            const status_msg = std.fmt.bufPrint(
+                                &msg_buf,
+                                "4-tier differential oracle verified ({d} module(s))",
+                                .{tested_main_count},
+                            ) catch "4-tier differential oracle verified";
+                            try stdout_style.writeStatusHeader(
+                                stdout_writer,
+                                .success,
+                                Glyphs.SUCCESS,
+                                "test",
+                                status_msg,
+                            );
+                            try stdout_writer.writeByte('\n');
+                            return 0;
+                        }
+                    },
+                    else => {},
                 }
             }
             try stdout_style.writeStatusHeader(
@@ -1095,6 +1855,8 @@ pub fn runCli(
         },
     }
 }
+
+// ---------------------------------------- MAIN -----------------------------------------
 
 comptime {
     for (SUBCOMMANDS, 0..) |descriptor, i| {

@@ -350,6 +350,114 @@ fn classifyOpSemantics(
     };
 }
 
+/// Computes a recursive 64-bit `Wyhash` digest of `raw_ty`'s layout shape and interior lane/pointee/field
+/// `OpSemanticsTag`s so `.intrinsic_op` (`@simd_*`, `@atomic_*`, wire casts) never conflates `[f32; 4]` with `[i32; 4]`.
+fn computeDeepTypeSemanticsDigest(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    raw_ty: TypeId,
+    subst: *const type_system.NominalTypeSubst,
+    target_layout: TargetLayout,
+    depth: u32,
+) u64 {
+    var hasher = std.hash.Wyhash.init(0x514D_445F_5345_4D31);
+    const resolved_ty = subst.resolve(raw_ty);
+    if (depth > 12 or resolved_ty.isError()) return hasher.final();
+
+    const shape = computeLayoutShapeKey(pool, sym_table, resolved_ty, target_layout);
+    const sem = classifyOpSemantics(pool, resolved_ty, target_layout);
+    hasher.update(std.mem.asBytes(&shape));
+    hasher.update(&[_]u8{@backingInt(sem)});
+
+    const ty = pool.unwrapUnderlyingType(resolved_ty);
+    const node = pool.getNode(ty);
+    hasher.update(&[_]u8{@backingInt(node.tag)});
+    switch (node.tag) {
+        .ref_ty, .mut_ref_ty, .raw_ptr_ty, .slice_ty, .soa_slice_ty, .optional_ty => {
+            const sub_dig = computeDeepTypeSemanticsDigest(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.lhs),
+                subst,
+                target_layout,
+                depth + 1,
+            );
+            hasher.update(std.mem.asBytes(&sub_dig));
+            hasher.update(std.mem.asBytes(&node.rhs));
+        },
+        .array_ty, .soa_array_ty => {
+            const sub_dig = computeDeepTypeSemanticsDigest(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.lhs),
+                subst,
+                target_layout,
+                depth + 1,
+            );
+            hasher.update(std.mem.asBytes(&sub_dig));
+            hasher.update(std.mem.asBytes(&node.rhs));
+        },
+        .result_ty => {
+            const ok_dig = computeDeepTypeSemanticsDigest(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.lhs),
+                subst,
+                target_layout,
+                depth + 1,
+            );
+            const err_dig = computeDeepTypeSemanticsDigest(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.rhs),
+                subst,
+                target_layout,
+                depth + 1,
+            );
+            hasher.update(std.mem.asBytes(&ok_dig));
+            hasher.update(std.mem.asBytes(&err_dig));
+        },
+        .tuple_ty => {
+            for (pool.getTupleElements(ty)) |elem_raw| {
+                const elem_dig = computeDeepTypeSemanticsDigest(
+                    pool,
+                    sym_table,
+                    TypeId.fromInt(elem_raw),
+                    subst,
+                    target_layout,
+                    depth + 1,
+                );
+                hasher.update(std.mem.asBytes(&elem_dig));
+            }
+        },
+        .struct_ty, .union_ty => {
+            const sym_idx = SymbolIndex.fromInt(node.rhs);
+            if (!sym_idx.isNone() and sym_idx.asInt() < sym_table.symbols.items.len) {
+                const sym = sym_table.getSymbol(sym_idx).*;
+                if (!sym.target_scope.isNone()) {
+                    const child_subst = type_system.NominalTypeSubst.fromNominal(pool, sym_table, ty, sym, subst);
+                    const active_subst = if (child_subst.len > 0) &child_subst else subst;
+                    for (sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
+                        const mem_sym = sym_table.getSymbol(mem_idx).*;
+                        if (mem_sym.kind != .field_sym) continue;
+                        const field_dig = computeDeepTypeSemanticsDigest(
+                            pool,
+                            sym_table,
+                            mem_sym.type_id,
+                            active_subst,
+                            target_layout,
+                            depth + 1,
+                        );
+                        hasher.update(std.mem.asBytes(&field_dig));
+                    }
+                }
+            }
+        },
+        else => {},
+    }
+    return hasher.final();
+}
+
 /// Populates pointer-word bits inside `mask` for words `[0..31]` carrying pointer provenance.
 fn populatePtrWordMask(
     pool: *const InternPool,
@@ -371,19 +479,30 @@ fn populatePtrWordMask(
     }
     const node = pool.getNode(ty);
     switch (node.tag) {
-        .ref_ty, .mut_ref_ty, .raw_ptr_ty, .fn_ty, .slice_ty => {
+        .ref_ty, .mut_ref_ty, .raw_ptr_ty, .fn_ty, .slice_ty, .soa_slice_ty => {
             if (byte_base % ptr_size == 0 and (byte_base / ptr_size) < 32) {
                 mask.* |= (@as(u32, 1) << @intCast(byte_base / ptr_size));
             }
         },
+        .closure_ty => {
+            if (byte_base % ptr_size == 0) {
+                const fn_word = byte_base / ptr_size;
+                if (fn_word < 32) mask.* |= (@as(u32, 1) << @intCast(fn_word));
+                if (fn_word + 1 < 32) mask.* |= (@as(u32, 1) << @intCast(fn_word + 1));
+            }
+        },
         .tuple_ty => {
-            var running: u64 = 0;
-            for (pool.getTupleElements(ty)) |elem_raw| {
+            for (pool.getTupleElements(ty), 0..) |elem_raw, elem_idx| {
                 const elem_ty = TypeId.fromInt(elem_raw);
-                const elem_lay = type_system.computeTypeLayoutWithPool(pool, sym_table, elem_ty, target_layout);
-                running = std.mem.alignForward(u64, running, @max(@as(u64, elem_lay.align_bytes), 1));
-                populatePtrWordMask(pool, sym_table, elem_ty, byte_base + running, target_layout, depth + 1, mask);
-                running += elem_lay.byte_size;
+                if (type_system.computeTupleElemOffset(
+                    pool,
+                    sym_table,
+                    ty,
+                    @intCast(elem_idx),
+                    target_layout,
+                )) |off| {
+                    populatePtrWordMask(pool, sym_table, elem_ty, byte_base + off, target_layout, depth + 1, mask);
+                }
             }
         },
         .struct_ty => {
@@ -426,6 +545,77 @@ fn populatePtrWordMask(
                     mask,
                 );
             }
+        },
+        .soa_array_ty => {
+            const elem_ty = TypeId.fromInt(node.lhs);
+            const arr_len: u64 = node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+            const elem_node = pool.getNode(pool.unwrapUnderlyingType(elem_ty));
+            if (elem_node.tag != .struct_ty) return;
+            const sym_idx = SymbolIndex.fromInt(elem_node.rhs);
+            if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return;
+            const st_sym = sym_table.getSymbol(sym_idx).*;
+            if (st_sym.target_scope.isNone()) return;
+            var ord: u32 = 0;
+            for (sym_table.getScopeMembers(st_sym.target_scope)) |mem_idx| {
+                if (sym_table.getSymbol(mem_idx).kind != .field_sym) continue;
+                if (type_system.computeSoaColumnInfoReadOnly(
+                    pool,
+                    sym_table,
+                    elem_ty,
+                    arr_len,
+                    ord,
+                    target_layout,
+                )) |col_info| {
+                    if (col_info.field_layout.byte_size > 0) {
+                        const max_elems = @min(arr_len, 32);
+                        for (0..@intCast(max_elems)) |elem_i| {
+                            populatePtrWordMask(
+                                pool,
+                                sym_table,
+                                col_info.field_ty,
+                                byte_base + col_info.byte_offset + @as(u64, elem_i) * col_info.field_layout.byte_size,
+                                target_layout,
+                                depth + 1,
+                                mask,
+                            );
+                        }
+                    }
+                }
+                ord += 1;
+            }
+        },
+        .optional_ty => {
+            const sum_lay = type_system.computeSumMemoryLayout(pool, sym_table, ty, target_layout);
+            populatePtrWordMask(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.lhs),
+                byte_base + sum_lay.payload_offset,
+                target_layout,
+                depth + 1,
+                mask,
+            );
+        },
+        .result_ty => {
+            const sum_lay = type_system.computeSumMemoryLayout(pool, sym_table, ty, target_layout);
+            populatePtrWordMask(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.lhs),
+                byte_base + sum_lay.payload_offset,
+                target_layout,
+                depth + 1,
+                mask,
+            );
+            populatePtrWordMask(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.rhs),
+                byte_base + sum_lay.payload_offset,
+                target_layout,
+                depth + 1,
+                mask,
+            );
         },
         else => {},
     }
@@ -612,6 +802,22 @@ fn rebuildPredsAndSweepUnreachable(allocator: std.mem.Allocator, body: *MirBody)
         body.blocks.items[bb_i].pred_start = start;
         body.blocks.items[bb_i].pred_len = @intCast(pred_lists[bb_i].items.len);
     }
+
+    var lc_write: usize = 0;
+    for (body.loop_contracts.items) |lc_entry| {
+        const hdr_idx = lc_entry.header_bb.asInt();
+        if (hdr_idx >= block_count or !is_reachable[hdr_idx]) continue;
+        var updated = lc_entry;
+        if (!updated.latch_bb.isNone()) {
+            const latch_idx = updated.latch_bb.asInt();
+            if (latch_idx >= block_count or !is_reachable[latch_idx]) {
+                updated.latch_bb = .none;
+            }
+        }
+        body.loop_contracts.items[lc_write] = updated;
+        lc_write += 1;
+    }
+    body.loop_contracts.items.len = lc_write;
 }
 
 ///Applies a map `old_val_raw -> new_val_raw` transitively across every SSA value use in `body`
@@ -1113,6 +1319,18 @@ fn spliceDirectCallSite(
                         );
                     }
                 }
+                var new_ta_start: u32 = 0;
+                var new_ta_len: u16 = 0;
+                if (old_cs.type_args_len > 0 and
+                    old_cs.type_args_start + old_cs.type_args_len <= callee.extra_args.items.len)
+                {
+                    new_ta_start = @intCast(caller.extra_args.items.len);
+                    new_ta_len = old_cs.type_args_len;
+                    try caller.extra_args.appendSlice(
+                        caller.allocator,
+                        callee.extra_args.items[old_cs.type_args_start .. old_cs.type_args_start + old_cs.type_args_len],
+                    );
+                }
                 const new_cs_idx: u32 = @intCast(caller.calls.items.len);
                 try caller.calls.append(caller.allocator, .{
                     .callee_val = MirValueId.fromInt(inst_offset + old_cs.callee_val.asInt()),
@@ -1123,6 +1341,8 @@ fn spliceDirectCallSite(
                     .modes_start = new_cs_modes,
                     .call_borrows_start = new_bor_start,
                     .call_borrows_len = new_bor_len,
+                    .type_args_start = new_ta_start,
+                    .type_args_len = new_ta_len,
                     .ret_ty = old_cs.ret_ty,
                     .is_callee_contextless = old_cs.is_callee_contextless,
                     .origin_token = old_cs.origin_token,
@@ -1194,6 +1414,20 @@ fn spliceDirectCallSite(
                 .site_token = cal_win.site_token,
             });
         }
+    }
+
+    for (callee.loop_contracts.items) |cal_lc| {
+        try caller.loop_contracts.append(caller.allocator, .{
+            .header_bb = if (cal_lc.header_bb.isNone())
+                .none
+            else
+                MirBlockId.fromInt(bb_offset + cal_lc.header_bb.asInt()),
+            .latch_bb = if (cal_lc.latch_bb.isNone())
+                .none
+            else
+                MirBlockId.fromInt(bb_offset + cal_lc.latch_bb.asInt()),
+            .meta = cal_lc.meta,
+        });
     }
 
     try rebuildPredsAndSweepUnreachable(allocator, caller);
@@ -2642,17 +2876,14 @@ fn resolveOptCompositeFieldStep(
         .tuple_ty => {
             const elems = pool.getTupleElements(comp_ty);
             if (field_ordinal >= elems.len) return null;
-            var cur_offset: u64 = 0;
-            for (elems, 0..) |raw_elem, idx| {
-                const elem_ty = TypeId.fromInt(raw_elem);
-                const elem_lay = type_system.computeTypeLayoutWithPool(pool, sym_table, elem_ty, target_layout);
-                cur_offset = std.mem.alignForward(u64, cur_offset, @max(@as(u64, elem_lay.align_bytes), 1));
-                if (idx == field_ordinal) {
-                    return .{ .byte_offset = cur_offset, .field_ty = elem_ty };
-                }
-                cur_offset += elem_lay.byte_size;
-            }
-            return null;
+            const byte_off = type_system.computeTupleElemOffset(
+                pool,
+                sym_table,
+                comp_ty,
+                field_ordinal,
+                target_layout,
+            ) orelse return null;
+            return .{ .byte_offset = byte_off, .field_ty = TypeId.fromInt(elems[field_ordinal]) };
         },
         .struct_ty => {
             const sym_idx = SymbolIndex.fromInt(node.rhs);
@@ -2713,61 +2944,15 @@ fn computeOptSumPayloadOffset(
     const sum_ty = pool.unwrapUnderlyingType(raw_sum_ty);
     if (sum_ty.isError()) return 0;
     const node = pool.getNode(sum_ty);
-    switch (node.tag) {
-        .optional_ty => {
-            const inner_lay = type_system.computeTypeLayoutWithPool(
-                pool,
-                sym_table,
-                TypeId.fromInt(node.lhs),
-                target_layout,
-            );
-            return std.mem.alignForward(u64, 1, @max(@as(u64, inner_lay.align_bytes), 1));
-        },
-        .result_ty => {
-            const ok_lay = type_system.computeTypeLayoutWithPool(
-                pool,
-                sym_table,
-                TypeId.fromInt(node.lhs),
-                target_layout,
-            );
-            const err_lay = type_system.computeTypeLayoutWithPool(
-                pool,
-                sym_table,
-                TypeId.fromInt(node.rhs),
-                target_layout,
-            );
-            return std.mem.alignForward(u64, 1, @max(@max(ok_lay.align_bytes, err_lay.align_bytes), 1));
-        },
-        .enum_ty => {
-            const sym_idx = SymbolIndex.fromInt(node.rhs);
-            var variant_count: u32 = 0;
-            var max_pay_align: u32 = 1;
-            if (!sym_idx.isNone() and sym_idx.asInt() < sym_table.symbols.items.len) {
-                const enum_sym = sym_table.getSymbol(sym_idx).*;
-                if (!enum_sym.target_scope.isNone()) {
-                    const subst = type_system.NominalTypeSubst.init(pool, sym_table, sum_ty);
-                    for (sym_table.getScopeMembers(enum_sym.target_scope)) |mem_idx| {
-                        const mem_sym = sym_table.getSymbol(mem_idx).*;
-                        if (mem_sym.kind != .enum_variant_sym) continue;
-                        variant_count += 1;
-                        const var_ty = subst.resolve(mem_sym.type_id);
-                        if (var_ty != .unit_ty and !var_ty.isError()) {
-                            const var_lay = type_system.computeTypeLayoutWithPool(
-                                pool,
-                                sym_table,
-                                var_ty,
-                                target_layout,
-                            );
-                            if (var_lay.align_bytes > max_pay_align) max_pay_align = var_lay.align_bytes;
-                        }
-                    }
-                }
-            }
-            const tag_bytes: u64 = if (variant_count <= 256) 1 else if (variant_count <= 65_536) 2 else 4;
-            return std.mem.alignForward(u64, tag_bytes, max_pay_align);
-        },
-        else => return 0,
-    }
+    return switch (node.tag) {
+        .optional_ty, .result_ty, .enum_ty => type_system.computeSumMemoryLayout(
+            pool,
+            sym_table,
+            sum_ty,
+            target_layout,
+        ).payload_offset,
+        else => 0,
+    };
 }
 
 /// Resolves the payload `TypeId` of variant `tag_ordinal` inside `.optional_ty`, `.result_ty`, or `.enum_ty`.
@@ -3016,6 +3201,43 @@ fn computeFieldOffsetsAndCalleesDigest(
                     hasher.update(std.mem.asBytes(&bv));
                 }
             },
+            .raw_blob => |rb| {
+                hasher.update(std.mem.asBytes(&rb.blob_id));
+                hasher.update(&[_]u8{rb.align_log2});
+                hasher.update(std.mem.asBytes(&rb.byte_len));
+            },
+        }
+    }
+    for (0..body.insts.len) |inst_idx| {
+        const inst = body.insts.get(inst_idx);
+        if (inst.op != .intrinsic_op) continue;
+        hasher.update(std.mem.asBytes(&inst.aux_u16));
+        const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+        if (ikind.hasExtraArgs()) {
+            const out_dig = computeDeepTypeSemanticsDigest(
+                pool,
+                sym_table,
+                inst.type_id,
+                &type_system.NominalTypeSubst.EMPTY,
+                target_layout,
+                0,
+            );
+            hasher.update(std.mem.asBytes(&out_dig));
+            if (inst.operands.rhs > 0 and inst.operands.lhs + inst.operands.rhs <= body.extra_args.items.len) {
+                for (body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs]) |v_raw| {
+                    if (v_raw < body.insts.len) {
+                        const arg_dig = computeDeepTypeSemanticsDigest(
+                            pool,
+                            sym_table,
+                            body.getInst(MirValueId.fromInt(v_raw)).type_id,
+                            &type_system.NominalTypeSubst.EMPTY,
+                            target_layout,
+                            0,
+                        );
+                        hasher.update(std.mem.asBytes(&arg_dig));
+                    }
+                }
+            }
         }
     }
     for (body.calls.items) |cs| {
@@ -3316,6 +3538,38 @@ fn runPassD5MonomorphizeAndPromote(
             defer ordered_vars.deinit(allocator);
 
             const caller_ref = &concrete_bodies.items[item.caller_idx];
+            if (cs_snapshot.type_args_len > 0 and
+                cs_snapshot.type_args_start + cs_snapshot.type_args_len <= caller_ref.extra_args.items.len)
+            {
+                var tmpl_sym_idx = tmpl.symbol_index;
+                if (tmpl_sym_idx.isNone() and !tmpl.def_id.isNone()) {
+                    tmpl_sym_idx = sym_table.def_to_symbol.get(tmpl.def_id.asInt()) orelse .none;
+                }
+                if (!tmpl_sym_idx.isNone() and tmpl_sym_idx.asInt() < sym_table.symbols.items.len) {
+                    const tmpl_sym = sym_table.getSymbol(tmpl_sym_idx).*;
+                    if (!tmpl_sym.target_scope.isNone()) {
+                        var tp_ord: usize = 0;
+                        for (sym_table.getScopeMembers(tmpl_sym.target_scope)) |mem_idx| {
+                            const mem_sym = sym_table.getSymbol(mem_idx).*;
+                            if (mem_sym.kind != .type_param_sym or mem_sym.type_id.isError()) continue;
+                            if (tp_ord >= cs_snapshot.type_args_len) break;
+                            const call_ta = TypeId.fromInt(
+                                caller_ref.extra_args.items[cs_snapshot.type_args_start + tp_ord],
+                            );
+                            tp_ord += 1;
+                            try unifyTemplateTypeBinding(
+                                allocator,
+                                pool,
+                                mem_sym.type_id,
+                                call_ta,
+                                &subst,
+                                &ordered_vars,
+                                0,
+                            );
+                        }
+                    }
+                }
+            }
             const arg_n = @min(@as(usize, cs_snapshot.args_len), tmpl.param_count);
             for (0..arg_n) |ai| {
                 const tmpl_p_ty = tmpl.locals.items[1 + ai].type_id;
@@ -3462,6 +3716,21 @@ fn runPassD5MonomorphizeAndPromote(
             var has_nested_generic_call = false;
             for (spec.calls.items) |*sub_cs| {
                 sub_cs.ret_ty = try substituteMirType(allocator, pool, sub_cs.ret_ty, &subst, 0);
+                if (sub_cs.type_args_len > 0 and
+                    sub_cs.type_args_start + sub_cs.type_args_len <= spec.extra_args.items.len)
+                {
+                    for (0..sub_cs.type_args_len) |ta_i| {
+                        const slot_ptr = &spec.extra_args.items[sub_cs.type_args_start + ta_i];
+                        const subst_ta = try substituteMirType(
+                            allocator,
+                            pool,
+                            TypeId.fromInt(slot_ptr.*),
+                            &subst,
+                            0,
+                        );
+                        slot_ptr.* = subst_ta.toU32();
+                    }
+                }
                 if (tmpl_map.lookup(sub_cs.direct_def_id, sub_cs.direct_symbol, sym_table) != null) {
                     has_nested_generic_call = true;
                 }
@@ -4635,6 +4904,10 @@ fn isMirConstExactEqual(mc_a: MirConst, mc_b: MirConst) bool {
             @as(u64, @bitCast(fa)) == @as(u64, @bitCast(mc_b.float_val)),
         .str_val => |sa| mc_b == .str_val and sa == mc_b.str_val,
         .bytes_val => |bya| mc_b == .bytes_val and bya == mc_b.bytes_val,
+        .raw_blob => |rba| mc_b == .raw_blob and
+            rba.blob_id == mc_b.raw_blob.blob_id and
+            rba.align_log2 == mc_b.raw_blob.align_log2 and
+            rba.byte_len == mc_b.raw_blob.byte_len,
     };
 }
 
@@ -4793,6 +5066,10 @@ fn makeGvnKey(
                 .float_val => |fv| pay_word = @bitCast(fv),
                 .str_val => |sv| pay_word = sv.asInt(),
                 .bytes_val => |bv| pay_word = bv.asInt(),
+                .raw_blob => |rb| {
+                    tag_word |= (@as(u64, rb.blob_id) << 8) | (@as(u64, rb.align_log2) << 40);
+                    pay_word = rb.byte_len;
+                },
             }
             return .{
                 .op = .const_scalar,
@@ -5549,6 +5826,16 @@ fn runPassR5DceJumpThreadAndMerge(allocator: std.mem.Allocator, body: *MirBody) 
             }
             body.blocks.items[pred_i].terminator = succ_term;
 
+            // Remap any loop-contract header/latch pointing at absorbed `succ_i` to `pred_i`:
+            for (body.loop_contracts.items) |*lc_entry| {
+                if (lc_entry.header_bb.asInt() == succ_i) {
+                    lc_entry.header_bb = MirBlockId.fromInt(@intCast(pred_i));
+                }
+                if (lc_entry.latch_bb.asInt() == succ_i) {
+                    lc_entry.latch_bb = MirBlockId.fromInt(@intCast(pred_i));
+                }
+            }
+
             // Clear absorbed `succ_i`:
             body.blocks.items[succ_i].inst_len = 0;
             body.blocks.items[succ_i].setParamLen(0);
@@ -5900,7 +6187,11 @@ fn computeMirBodyStructuralHashWithInterner(
         @intFromBool(body.is_contextless),
         @intFromBool(body.is_ghost_stripped),
         target_layout.ptr_byte_size,
+        target_layout.cache_line_align_log2,
+        target_layout.simd_align_log2,
     });
+    const lc_count: u32 = @intCast(body.loop_contracts.items.len);
+    hasher.update(std.mem.asBytes(&lc_count));
     const ret_shape = computeLayoutShapeKey(pool, sym_table, body.ret_ty, target_layout);
     hasher.update(std.mem.asBytes(&ret_shape));
     hasher.update(&[_]u8{@backingInt(classifyOpSemantics(pool, body.ret_ty, target_layout))});
@@ -6004,6 +6295,11 @@ fn computeMirBodyStructuralHashWithInterner(
                                     hasher.update(std.mem.asBytes(&bv));
                                 }
                             },
+                            .raw_blob => |rb| {
+                                hasher.update(std.mem.asBytes(&rb.blob_id));
+                                hasher.update(&[_]u8{rb.align_log2});
+                                hasher.update(std.mem.asBytes(&rb.byte_len));
+                            },
                         }
                     }
                 },
@@ -6067,9 +6363,18 @@ fn computeMirBodyStructuralHashWithInterner(
                         .tagged_variant => {
                             const tag_ord: u32 = inst.operands.rhs >> 16;
                             const elem_len: u32 = inst.operands.rhs & 0xFFFF;
-                            const pay_off = computeOptSumPayloadOffset(pool, sym_table, inst.type_id, target_layout);
+                            const sum_lay = type_system.computeSumMemoryLayout(pool, sym_table, inst.type_id, target_layout);
+                            const pay_off = sum_lay.payload_offset;
                             const pay_ty = resolveOptVariantPayloadType(pool, sym_table, inst.type_id, tag_ord);
                             const pay_shape = computeLayoutShapeKey(pool, sym_table, pay_ty, target_layout);
+                            hasher.update(&[_]u8{
+                                @backingInt(sum_lay.repr),
+                                @backingInt(sum_lay.niche.kind),
+                                sum_lay.niche.scalar_bytes,
+                                @truncate(sum_lay.zst_discriminant),
+                            });
+                            hasher.update(std.mem.asBytes(&sum_lay.niche.byte_offset));
+                            hasher.update(std.mem.asBytes(&sum_lay.niche.invalid_first));
                             hasher.update(std.mem.asBytes(&tag_ord));
                             hasher.update(std.mem.asBytes(&elem_len));
                             hasher.update(std.mem.asBytes(&pay_off));
@@ -6101,7 +6406,12 @@ fn computeMirBodyStructuralHashWithInterner(
                                 for (body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs], 0..) |v_raw, f_idx| {
                                     const nv = if (v_raw < val_norm.len) val_norm[v_raw] else mir.NONE_U32;
                                     hasher.update(std.mem.asBytes(&nv));
-                                    if (resolveOptCompositeFieldStep(
+                                    if (pool.getNode(pool.unwrapUnderlyingType(inst.type_id)).tag == .union_ty) {
+                                        const ut = body.getInst(MirValueId.fromInt(v_raw)).type_id;
+                                        const u_shape = computeLayoutShapeKey(pool, sym_table, ut, target_layout);
+                                        hasher.update(std.mem.asBytes(&u_shape));
+                                        hasher.update(&[_]u8{@backingInt(classifyOpSemantics(pool, ut, target_layout))});
+                                    } else if (resolveOptCompositeFieldStep(
                                         pool,
                                         sym_table,
                                         inst.type_id,
@@ -6164,11 +6474,31 @@ fn computeMirBodyStructuralHashWithInterner(
                         hasher.update(std.mem.asBytes(&inst.operands.lhs));
                         hasher.update(std.mem.asBytes(&inst.operands.rhs));
                     } else {
+                        const out_dig = computeDeepTypeSemanticsDigest(
+                            pool,
+                            sym_table,
+                            inst.type_id,
+                            &type_system.NominalTypeSubst.EMPTY,
+                            target_layout,
+                            0,
+                        );
+                        hasher.update(std.mem.asBytes(&out_dig));
                         hasher.update(std.mem.asBytes(&inst.operands.rhs));
                         if (inst.operands.rhs > 0 and inst.operands.lhs + inst.operands.rhs <= body.extra_args.items.len) {
                             for (body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs]) |v_raw| {
                                 const nv = if (v_raw < val_norm.len) val_norm[v_raw] else mir.NONE_U32;
                                 hasher.update(std.mem.asBytes(&nv));
+                                if (v_raw < body.insts.len) {
+                                    const arg_dig = computeDeepTypeSemanticsDigest(
+                                        pool,
+                                        sym_table,
+                                        body.getInst(MirValueId.fromInt(v_raw)).type_id,
+                                        &type_system.NominalTypeSubst.EMPTY,
+                                        target_layout,
+                                        0,
+                                    );
+                                    hasher.update(std.mem.asBytes(&arg_dig));
+                                }
                             }
                             if (ikind == .derive_debug_fmt) {
                                 const first_raw = body.extra_args.items[inst.operands.lhs];
@@ -6294,6 +6624,21 @@ fn computeMirBodyStructuralHashWithInterner(
         }
     }
 
+    for (body.loop_contracts.items) |lc_entry| {
+        const nhdr = if (lc_entry.header_bb.asInt() < bb_norm.len) bb_norm[lc_entry.header_bb.asInt()] else mir.NONE_U32;
+        const nlat = if (!lc_entry.latch_bb.isNone() and lc_entry.latch_bb.asInt() < bb_norm.len)
+            bb_norm[lc_entry.latch_bb.asInt()]
+        else
+            mir.NONE_U32;
+        hasher.update(std.mem.asBytes(&nhdr));
+        hasher.update(std.mem.asBytes(&nlat));
+        hasher.update(&[_]u8{
+            @bitCast(lc_entry.meta.contract_flags),
+            lc_entry.meta.target_override_mask,
+        });
+        hasher.update(std.mem.asBytes(&lc_entry.meta.min_lanes));
+    }
+
     return hasher.final();
 }
 
@@ -6309,7 +6654,8 @@ pub fn isMirBodyStructurallyEqual(
     if (body_a.param_count != body_b.param_count or
         body_a.is_contextless != body_b.is_contextless or
         body_a.is_ghost_stripped != body_b.is_ghost_stripped or
-        body_a.locals.items.len != body_b.locals.items.len)
+        body_a.locals.items.len != body_b.locals.items.len or
+        body_a.loop_contracts.items.len != body_b.loop_contracts.items.len)
     {
         return false;
     }
@@ -6480,9 +6826,18 @@ pub fn isMirBodyStructurallyEqual(
                             if (inst_a.operands.rhs != inst_b.operands.rhs) return false;
                             const tag_ord: u32 = inst_a.operands.rhs >> 16;
                             const elem_len: u32 = inst_a.operands.rhs & 0xFFFF;
-                            const off_a = computeOptSumPayloadOffset(pool, sym_table, inst_a.type_id, target_layout);
-                            const off_b = computeOptSumPayloadOffset(pool, sym_table, inst_b.type_id, target_layout);
-                            if (off_a != off_b) return false;
+                            const sum_a = type_system.computeSumMemoryLayout(pool, sym_table, inst_a.type_id, target_layout);
+                            const sum_b = type_system.computeSumMemoryLayout(pool, sym_table, inst_b.type_id, target_layout);
+                            if (sum_a.repr != sum_b.repr or
+                                sum_a.payload_offset != sum_b.payload_offset or
+                                sum_a.zst_discriminant != sum_b.zst_discriminant or
+                                sum_a.niche.kind != sum_b.niche.kind or
+                                sum_a.niche.byte_offset != sum_b.niche.byte_offset or
+                                sum_a.niche.scalar_bytes != sum_b.niche.scalar_bytes or
+                                sum_a.niche.invalid_first != sum_b.niche.invalid_first)
+                            {
+                                return false;
+                            }
                             const pay_a = resolveOptVariantPayloadType(pool, sym_table, inst_a.type_id, tag_ord);
                             const pay_b = resolveOptVariantPayloadType(pool, sym_table, inst_b.type_id, tag_ord);
                             if (!computeLayoutShapeKey(pool, sym_table, pay_a, target_layout).isEqual(
@@ -6526,6 +6881,20 @@ pub fn isMirBodyStructurallyEqual(
                                 const ea = body_a.extra_args.items[inst_a.operands.lhs + f_idx];
                                 const eb = body_b.extra_args.items[inst_b.operands.lhs + f_idx];
                                 if (val_a[ea] != val_b[eb]) return false;
+                                if (pool.getNode(pool.unwrapUnderlyingType(inst_a.type_id)).tag == .union_ty or
+                                    pool.getNode(pool.unwrapUnderlyingType(inst_b.type_id)).tag == .union_ty)
+                                {
+                                    const ta = body_a.getInst(MirValueId.fromInt(ea)).type_id;
+                                    const tb = body_b.getInst(MirValueId.fromInt(eb)).type_id;
+                                    if (!computeLayoutShapeKey(pool, sym_table, ta, target_layout).isEqual(
+                                        computeLayoutShapeKey(pool, sym_table, tb, target_layout),
+                                    ) or classifyOpSemantics(pool, ta, target_layout) !=
+                                        classifyOpSemantics(pool, tb, target_layout))
+                                    {
+                                        return false;
+                                    }
+                                    continue;
+                                }
                                 const step_a = resolveOptCompositeFieldStep(
                                     pool,
                                     sym_table,
@@ -6625,6 +6994,21 @@ pub fn isMirBodyStructurallyEqual(
                             inst_a.operands.rhs != inst_b.operands.rhs) return false;
                     } else {
                         if (inst_a.operands.rhs != inst_b.operands.rhs) return false;
+                        if (computeDeepTypeSemanticsDigest(
+                            pool,
+                            sym_table,
+                            inst_a.type_id,
+                            &type_system.NominalTypeSubst.EMPTY,
+                            target_layout,
+                            0,
+                        ) != computeDeepTypeSemanticsDigest(
+                            pool,
+                            sym_table,
+                            inst_b.type_id,
+                            &type_system.NominalTypeSubst.EMPTY,
+                            target_layout,
+                            0,
+                        )) return false;
                         const arg_len = inst_a.operands.rhs;
                         if (arg_len > 0) {
                             if (inst_a.operands.lhs + arg_len > body_a.extra_args.items.len or
@@ -6633,6 +7017,23 @@ pub fn isMirBodyStructurallyEqual(
                                 const aa = body_a.extra_args.items[inst_a.operands.lhs + arg_i];
                                 const ab = body_b.extra_args.items[inst_b.operands.lhs + arg_i];
                                 if (val_a[aa] != val_b[ab]) return false;
+                                if (aa < body_a.insts.len and ab < body_b.insts.len) {
+                                    if (computeDeepTypeSemanticsDigest(
+                                        pool,
+                                        sym_table,
+                                        body_a.getInst(MirValueId.fromInt(aa)).type_id,
+                                        &type_system.NominalTypeSubst.EMPTY,
+                                        target_layout,
+                                        0,
+                                    ) != computeDeepTypeSemanticsDigest(
+                                        pool,
+                                        sym_table,
+                                        body_b.getInst(MirValueId.fromInt(ab)).type_id,
+                                        &type_system.NominalTypeSubst.EMPTY,
+                                        target_layout,
+                                        0,
+                                    )) return false;
+                                }
                             }
                             if (ikind == .derive_debug_fmt) {
                                 const raw_a = body_a.extra_args.items[inst_a.operands.lhs];
@@ -6669,6 +7070,21 @@ pub fn isMirBodyStructurallyEqual(
                         sym_table,
                         target_layout,
                     ) or inst_a.operands.rhs != inst_b.operands.rhs) return false;
+                    if (inst_a.op == .place_discriminant or inst_a.op == .place_set_discrim) {
+                        const pl_ty_a = inferPlaceTypeInBody(body_a, PlaceId.fromInt(inst_a.operands.lhs), pool, sym_table);
+                        const pl_ty_b = inferPlaceTypeInBody(body_b, PlaceId.fromInt(inst_b.operands.lhs), pool, sym_table);
+                        const sum_a = type_system.computeSumMemoryLayout(pool, sym_table, pl_ty_a, target_layout);
+                        const sum_b = type_system.computeSumMemoryLayout(pool, sym_table, pl_ty_b, target_layout);
+                        if (sum_a.repr != sum_b.repr or
+                            sum_a.zst_discriminant != sum_b.zst_discriminant or
+                            sum_a.niche.kind != sum_b.niche.kind or
+                            sum_a.niche.byte_offset != sum_b.niche.byte_offset or
+                            sum_a.niche.scalar_bytes != sum_b.niche.scalar_bytes or
+                            sum_a.niche.invalid_first != sum_b.niche.invalid_first)
+                        {
+                            return false;
+                        }
+                    }
                 },
                 .place_store => {
                     if (!isPlaceStructurallyEqual(
@@ -6787,6 +7203,20 @@ pub fn isMirBodyStructurallyEqual(
         }
     }
 
+    for (body_a.loop_contracts.items, body_b.loop_contracts.items) |lca, lcb| {
+        const hdr_a = if (lca.header_bb.asInt() < bb_a.len) bb_a[lca.header_bb.asInt()] else mir.NONE_U32;
+        const hdr_b = if (lcb.header_bb.asInt() < bb_b.len) bb_b[lcb.header_bb.asInt()] else mir.NONE_U32;
+        const lat_a = if (!lca.latch_bb.isNone() and lca.latch_bb.asInt() < bb_a.len) bb_a[lca.latch_bb.asInt()] else mir.NONE_U32;
+        const lat_b = if (!lcb.latch_bb.isNone() and lcb.latch_bb.asInt() < bb_b.len) bb_b[lcb.latch_bb.asInt()] else mir.NONE_U32;
+        if (hdr_a != hdr_b or lat_a != lat_b or
+            @as(u8, @bitCast(lca.meta.contract_flags)) != @as(u8, @bitCast(lcb.meta.contract_flags)) or
+            lca.meta.target_override_mask != lcb.meta.target_override_mask or
+            lca.meta.min_lanes != lcb.meta.min_lanes)
+        {
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -6834,6 +7264,11 @@ fn runPassR6StructuralIcf(
                 const inst = b_item.getInst(iv);
                 if (inst.op == .fn_addr and !call_callee_vals.contains(iv.asInt())) {
                     try addr_taken_defs.put(allocator, inst.operands.lhs, {});
+                } else if (inst.op == .aggregate_make) {
+                    const agg_kind: AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+                    if (agg_kind == .closure_make) {
+                        try addr_taken_defs.put(allocator, inst.operands.lhs, {});
+                    }
                 }
             }
         }
@@ -6970,7 +7405,8 @@ pub fn computeLayoutShapeKey(
         .bool_01
     else if (ty == .char_ty)
         .char_unicode
-    else if (node.tag == .ref_ty or node.tag == .mut_ref_ty or node.tag == .fn_ty)
+    else if (ty == .str_ty or node.tag == .ref_ty or node.tag == .mut_ref_ty or node.tag == .fn_ty or
+        node.tag == .slice_ty or node.tag == .soa_slice_ty or node.tag == .closure_ty)
         .non_null_ptr
     else if (node.tag == .enum_ty)
         .enum_tag_ceil

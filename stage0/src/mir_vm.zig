@@ -602,6 +602,14 @@ pub const VmExecOptions = struct {
     file_tokens: ?*const std.AutoHashMapUnmanaged(u32, *const TokenBuffer) = null,
     /// Optional `CompilerDb` for on-demand cross-definition `buildDefMir` / `evalComptimeDef` resolution.
     compiler_db: ?*query_db.CompilerDb = null,
+    /// Optional pre-materialized `MirBlobStore` for `MirConst.raw_blob` (`@embed_bytes`, `[CRITICAL-07]`).
+    blob_store: ?*const mir.MirBlobStore = null,
+    /// Optional `stdout` capture buffer when `is_oracle_runtime_mode` is `true` (`D-07A`).
+    stdout_capture: ?*std.ArrayListUnmanaged(u8) = null,
+    /// Optional `stderr` capture buffer when `is_oracle_runtime_mode` is `true` (`D-07A`).
+    stderr_capture: ?*std.ArrayListUnmanaged(u8) = null,
+    /// Enables differential-oracle runtime execution of `@sys_write` and `@sys_exit` (`D-07A`).
+    is_oracle_runtime_mode: bool = false,
 };
 
 /// Error set returned by `MirVm` when compile-time evaluation traps or runs out of host memory.
@@ -628,6 +636,8 @@ pub const VmEvalError = error{
     CompileAssertionFailed,
     /// Trap inside a vacated non-`Copy` `inout` `subscript` projection window triggered immediate abort.
     AbortedVacatedPanic,
+    /// Explicit `@sys_exit(code)` terminated oracle execution cleanly (`MirVm.exited_with_code`).
+    ProcessExited,
     /// Target callee `MirBody` could not be resolved.
     UnresolvedCallee,
     /// Cooperative query cancellation (`DR-12` §3.3).
@@ -850,70 +860,17 @@ pub fn computeSumTypeTagAndPayloadLayout(
     const sum_ty = pool.unwrapUnderlyingType(raw_sum_ty);
     const total_layout = type_system.computeTypeLayoutWithPool(pool, sym_table, sum_ty, target_layout);
     const node = pool.getNode(sum_ty);
-    switch (node.tag) {
-        .optional_ty => {
-            const inner_lay = type_system.computeTypeLayoutWithPool(
-                pool,
-                sym_table,
-                TypeId.fromInt(node.lhs),
-                target_layout,
-            );
-            const pay_off: u32 = @intCast(std.mem.alignForward(u64, 1, @max(@as(u64, inner_lay.align_bytes), 1)));
-            return .{ .tag_bytes = 1, .payload_offset = pay_off, .total_layout = total_layout };
+    return switch (node.tag) {
+        .optional_ty, .result_ty, .enum_ty => blk: {
+            const sum_lay = type_system.computeSumMemoryLayout(pool, sym_table, sum_ty, target_layout);
+            break :blk .{
+                .tag_bytes = sum_lay.tag_bytes,
+                .payload_offset = @intCast(sum_lay.payload_offset),
+                .total_layout = total_layout,
+            };
         },
-        .result_ty => {
-            const ok_lay = type_system.computeTypeLayoutWithPool(
-                pool,
-                sym_table,
-                TypeId.fromInt(node.lhs),
-                target_layout,
-            );
-            const err_lay = type_system.computeTypeLayoutWithPool(
-                pool,
-                sym_table,
-                TypeId.fromInt(node.rhs),
-                target_layout,
-            );
-            const max_align = @max(@max(ok_lay.align_bytes, err_lay.align_bytes), 1);
-            const pay_off: u32 = @intCast(std.mem.alignForward(u64, 1, max_align));
-            return .{ .tag_bytes = 1, .payload_offset = pay_off, .total_layout = total_layout };
-        },
-        .enum_ty => {
-            const sym_idx = SymbolIndex.fromInt(node.rhs);
-            var variant_count: u32 = 0;
-            var max_pay_align: u32 = 1;
-            if (!sym_idx.isNone() and sym_idx.asInt() < sym_table.symbols.items.len) {
-                const enum_sym = sym_table.getSymbol(sym_idx).*;
-                if (!enum_sym.target_scope.isNone()) {
-                    const subst = type_system.NominalTypeSubst.init(pool, sym_table, sum_ty);
-                    for (sym_table.getScopeMembers(enum_sym.target_scope)) |mem_idx| {
-                        const mem_sym = sym_table.getSymbol(mem_idx).*;
-                        if (mem_sym.kind != .enum_variant_sym) continue;
-                        variant_count += 1;
-                        const var_ty = subst.resolve(mem_sym.type_id);
-                        if (var_ty != .unit_ty and !var_ty.isError()) {
-                            const v_lay = type_system.computeTypeLayoutWithPool(
-                                pool,
-                                sym_table,
-                                var_ty,
-                                target_layout,
-                            );
-                            if (v_lay.align_bytes > max_pay_align) max_pay_align = v_lay.align_bytes;
-                        }
-                    }
-                }
-            }
-            const tag_bytes: u32 = if (variant_count <= 256)
-                1
-            else if (variant_count <= 65_536)
-                2
-            else
-                4;
-            const pay_off: u32 = @intCast(std.mem.alignForward(u64, tag_bytes, max_pay_align));
-            return .{ .tag_bytes = tag_bytes, .payload_offset = pay_off, .total_layout = total_layout };
-        },
-        else => return .{ .tag_bytes = 0, .payload_offset = 0, .total_layout = total_layout },
-    }
+        else => .{ .tag_bytes = 0, .payload_offset = 0, .total_layout = total_layout },
+    };
 }
 
 /// Resolves the payload `TypeId` of variant `tag_ordinal` inside `raw_sum_ty`.
@@ -949,6 +906,16 @@ fn resolveVariantPayloadType(
     };
 }
 
+/// Returns `true` when `raw_ty` unwraps to a `@packed` `.struct_ty` with 1-byte field alignment.
+fn isPackedStructType(pool: *const InternPool, sym_table: *const SymbolTable, raw_ty: TypeId) bool {
+    const ty = pool.unwrapUnderlyingType(raw_ty);
+    const node = pool.getNode(ty);
+    if (node.tag != .struct_ty) return false;
+    const sym_idx = SymbolIndex.fromInt(node.rhs);
+    if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return false;
+    return sym_table.getSymbol(sym_idx).contract_flags.is_packed;
+}
+
 /// Computes the byte offset and field `TypeId` of `field_ordinal` inside a `.struct_ty`, `.tuple_ty`, or `.union_ty`.
 pub fn computeCompositeFieldOffsetAndType(
     pool: *const InternPool,
@@ -963,17 +930,14 @@ pub fn computeCompositeFieldOffsetAndType(
         .tuple_ty => {
             const elems = pool.getTupleElements(comp_ty);
             if (field_ordinal >= elems.len) return null;
-            var cur_offset: u64 = 0;
-            for (elems, 0..) |raw_elem, idx| {
-                const elem_ty = TypeId.fromInt(raw_elem);
-                const elem_lay = type_system.computeTypeLayoutWithPool(pool, sym_table, elem_ty, target_layout);
-                cur_offset = std.mem.alignForward(u64, cur_offset, @max(@as(u64, elem_lay.align_bytes), 1));
-                if (idx == field_ordinal) {
-                    return .{ .byte_offset = @intCast(cur_offset), .field_ty = elem_ty };
-                }
-                cur_offset += elem_lay.byte_size;
-            }
-            return null;
+            const byte_off = type_system.computeTupleElemOffset(
+                pool,
+                sym_table,
+                comp_ty,
+                field_ordinal,
+                target_layout,
+            ) orelse return null;
+            return .{ .byte_offset = @intCast(byte_off), .field_ty = TypeId.fromInt(elems[field_ordinal]) };
         },
         .struct_ty => {
             const byte_off = type_system.computeStructFieldOffset(
@@ -1036,35 +1000,18 @@ fn computeSoaColumnOffsetAndType(
     elem_capacity: u32,
     target_layout: TargetLayout,
 ) ?struct { column_byte_offset: u32, field_ty: TypeId } {
-    const struct_ty = pool.unwrapUnderlyingType(elem_struct_ty);
-    const node = pool.getNode(struct_ty);
-    if (node.tag != .struct_ty) return null;
-    const sym_idx = SymbolIndex.fromInt(node.rhs);
-    if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return null;
-    const st_sym = sym_table.getSymbol(sym_idx).*;
-    if (st_sym.target_scope.isNone()) return null;
-    const subst = type_system.NominalTypeSubst.init(pool, sym_table, struct_ty);
-
-    var cur_offset: u64 = 0;
-    var ord: u32 = 0;
-    for (sym_table.getScopeMembers(st_sym.target_scope)) |mem_idx| {
-        const mem_sym = sym_table.getSymbol(mem_idx).*;
-        if (mem_sym.kind != .field_sym) continue;
-        const resolved_field_ty = subst.resolve(mem_sym.type_id);
-        const field_lay = type_system.computeTypeLayoutWithPool(
-            pool,
-            sym_table,
-            resolved_field_ty,
-            target_layout,
-        );
-        cur_offset = std.mem.alignForward(u64, cur_offset, @max(@as(u64, field_lay.align_bytes), 1));
-        if (ord == field_ordinal) {
-            return .{ .column_byte_offset = @intCast(cur_offset), .field_ty = resolved_field_ty };
-        }
-        cur_offset += field_lay.byte_size * @as(u64, elem_capacity);
-        ord += 1;
-    }
-    return null;
+    const col_info = type_system.computeSoaColumnInfoReadOnly(
+        pool,
+        sym_table,
+        elem_struct_ty,
+        elem_capacity,
+        field_ordinal,
+        target_layout,
+    ) orelse return null;
+    return .{
+        .column_byte_offset = @intCast(col_info.byte_offset),
+        .field_ty = col_info.field_ty,
+    };
 }
 
 // -------------- Reflection & VFS Sandbox Helpers --------------
@@ -1226,6 +1173,10 @@ pub const MirVm = struct {
     abort_on_panic_depth: u32 = 0,
     /// Set to `true` when a trap inside an `[abort_on_panic]` window triggered immediate abort (`[MAJOR-10]`).
     has_aborted_vacated_panic: bool = false,
+    /// Non-null dangling `0`-byte sentinel allocation for empty slices (`[CRITICAL-04]`).
+    dangling_empty_alloc: ComptimeAllocId = .null_ptr,
+    /// Process exit code recorded when `@sys_exit(code)` runs under `is_oracle_runtime_mode`.
+    exited_with_code: ?i32 = null,
 
     /// Initializes a `MirVm` instance with reserved slot `0` (`.null_ptr`) in `allocations`.
     pub fn init(
@@ -1260,6 +1211,16 @@ pub const MirVm = struct {
             .is_live = false,
             .is_stack_frame = false,
         });
+        // Reserve index `1` as the live, aligned, `0`-byte dangling slice sentinel (`[CRITICAL-04]`):
+        try vm.allocations.append(allocator, .{
+            .bytes = &.{},
+            .init_mask = &.{},
+            .align_log2 = 16,
+            .is_mutable = false,
+            .is_live = true,
+            .is_stack_frame = false,
+        });
+        vm.dangling_empty_alloc = ComptimeAllocId.fromVmIndex(1);
         return vm;
     }
 
@@ -2366,6 +2327,7 @@ pub const MirVm = struct {
         elem_index: usize,
         elem_slot: RegSlot,
     ) VmEvalError!void {
+        const src_align_override = isPackedStructType(self.pool, self.sym_table, elem_struct_ty);
         var field_ord: u32 = 0;
         while (computeCompositeFieldOffsetAndType(
             self.pool,
@@ -2396,7 +2358,7 @@ pub const MirVm = struct {
                 dst_field_ptr,
                 src_field_ptr,
                 field_lay.byte_size,
-                field_lay.align_log2,
+                if (src_align_override) 0 else field_lay.align_log2,
             );
         }
     }
@@ -2438,6 +2400,16 @@ pub const MirVm = struct {
         place_ptr: SymbolicPtr,
         raw_ty: TypeId,
     ) VmEvalError!RegSlot {
+        return self.loadTypedSlotFromMemoryAligned(place_ptr, raw_ty, false);
+    }
+
+    /// Loads a typed `RegSlot` from `place_ptr`, allowing 1-byte alignment when `is_unaligned` (`@packed`).
+    pub fn loadTypedSlotFromMemoryAligned(
+        self: *MirVm,
+        place_ptr: SymbolicPtr,
+        raw_ty: TypeId,
+        is_unaligned: bool,
+    ) VmEvalError!RegSlot {
         const ty = self.pool.unwrapUnderlyingType(raw_ty);
         const lay = type_system.computeTypeLayoutWithPool(
             self.pool,
@@ -2445,6 +2417,7 @@ pub const MirVm = struct {
             ty,
             self.options.target_layout,
         );
+        const eff_align_log2: u8 = if (is_unaligned) 0 else lay.align_log2;
         const repr = classifyValueRepr(self.pool, self.sym_table, ty, self.options.target_layout);
 
         switch (repr) {
@@ -2452,7 +2425,7 @@ pub const MirVm = struct {
                 if (lay.byte_size == 0) return .{ .scalar_u64 = 0 };
                 var buf: [8]u8 = @splat(0);
                 const byte_len: usize = @intCast(lay.byte_size);
-                try self.readScalarBytes(place_ptr, lay.align_log2, buf[0..byte_len]);
+                try self.readScalarBytes(place_ptr, eff_align_log2, buf[0..byte_len]);
                 if (ty == .f64_ty or ty == .untyped_float_ty) {
                     const bits = std.mem.readInt(u64, &buf, .little);
                     return .{ .scalar_f64 = canonicalizeF64(@bitCast(bits)) };
@@ -2475,20 +2448,20 @@ pub const MirVm = struct {
                 return .{ .scalar_u64 = raw_u64 };
             },
             .inline_ptr => {
-                return .{ .sym_ptr = try self.readPointerAt(place_ptr, lay.align_log2) };
+                return .{ .sym_ptr = try self.readPointerAt(place_ptr, eff_align_log2) };
             },
             .by_value_snapshot => {
                 // For `i128` / `u128`, validate all 16 bytes are initialized scalar bytes (`E0505`/`E0503`):
                 if (ty == .i128_ty or ty == .u128_ty) {
                     var i128_buf: [16]u8 = undefined;
-                    try self.readScalarBytes(place_ptr, lay.align_log2, &i128_buf);
+                    try self.readScalarBytes(place_ptr, eff_align_log2, &i128_buf);
                     const snap = try self.allocSnapshotForType(ty, false);
                     try self.writeScalarBytes(snap, 0, &i128_buf);
                     self.sealSnapshot(snap);
                     return .{ .sym_ptr = snap };
                 }
                 const snap = try self.allocSnapshotForType(ty, false);
-                try self.copyMemoryRange(snap, place_ptr, lay.byte_size, lay.align_log2);
+                try self.copyMemoryRange(snap, place_ptr, lay.byte_size, eff_align_log2);
                 self.sealSnapshot(snap);
                 return .{ .sym_ptr = snap };
             },
@@ -2502,6 +2475,17 @@ pub const MirVm = struct {
         raw_ty: TypeId,
         slot: RegSlot,
     ) VmEvalError!void {
+        return self.storeTypedSlotToMemoryAligned(place_ptr, raw_ty, slot, false);
+    }
+
+    /// Stores a typed `RegSlot` into `place_ptr`, allowing 1-byte alignment when `is_unaligned` (`@packed`).
+    pub fn storeTypedSlotToMemoryAligned(
+        self: *MirVm,
+        place_ptr: SymbolicPtr,
+        raw_ty: TypeId,
+        slot: RegSlot,
+        is_unaligned: bool,
+    ) VmEvalError!void {
         const ty = self.pool.unwrapUnderlyingType(raw_ty);
         const lay = type_system.computeTypeLayoutWithPool(
             self.pool,
@@ -2509,6 +2493,7 @@ pub const MirVm = struct {
             ty,
             self.options.target_layout,
         );
+        const eff_align_log2: u8 = if (is_unaligned) 0 else lay.align_log2;
         const repr = classifyValueRepr(self.pool, self.sym_table, ty, self.options.target_layout);
 
         switch (repr) {
@@ -2525,13 +2510,13 @@ pub const MirVm = struct {
                     std.mem.writeInt(u64, &buf, slot.scalar_u64, .little);
                 }
                 const byte_len: usize = @intCast(lay.byte_size);
-                try self.writeScalarBytes(place_ptr, lay.align_log2, buf[0..byte_len]);
+                try self.writeScalarBytes(place_ptr, eff_align_log2, buf[0..byte_len]);
             },
             .inline_ptr => {
-                try self.writePointerAt(place_ptr, lay.align_log2, slot.sym_ptr);
+                try self.writePointerAt(place_ptr, eff_align_log2, slot.sym_ptr);
             },
             .by_value_snapshot => {
-                try self.copyMemoryRange(place_ptr, slot.sym_ptr, lay.byte_size, lay.align_log2);
+                try self.copyMemoryRange(place_ptr, slot.sym_ptr, lay.byte_size, eff_align_log2);
             },
         }
     }
@@ -2545,7 +2530,11 @@ pub const MirVm = struct {
     ) VmEvalError!RegSlot {
         const snap = try self.allocSnapshotForType(slice_ty, false);
         const ptr_width: u32 = self.options.target_layout.ptr_byte_size;
-        try self.writePointerAt(snap, self.options.target_layout.ptr_align_log2, data_ptr);
+        const effective_ptr = if (elem_len == 0 and data_ptr.alloc_id.isNullOrNone())
+            SymbolicPtr{ .alloc_id = self.dangling_empty_alloc, .byte_offset = 0 }
+        else
+            data_ptr;
+        try self.writePointerAt(snap, self.options.target_layout.ptr_align_log2, effective_ptr);
         const len_ptr = SymbolicPtr{ .alloc_id = snap.alloc_id, .byte_offset = ptr_width };
         if (ptr_width == 8) {
             var buf: [8]u8 = undefined;
@@ -2558,6 +2547,88 @@ pub const MirVm = struct {
         }
         self.sealSnapshot(snap);
         return .{ .sym_ptr = snap };
+    }
+
+    /// Reads the active variant ordinal (`0 .. V - 1`) of `raw_sum_ty` at `base_ptr` (`[CRITICAL-04]`).
+    pub fn readSumDiscriminantAt(
+        self: *MirVm,
+        base_ptr: SymbolicPtr,
+        raw_sum_ty: TypeId,
+    ) VmEvalError!u32 {
+        const sum_ty = self.pool.unwrapUnderlyingType(raw_sum_ty);
+        const sum_lay = type_system.computeSumMemoryLayout(
+            self.pool,
+            self.sym_table,
+            sum_ty,
+            self.options.target_layout,
+        );
+        switch (sum_lay.repr) {
+            .transparent_ok => return 0,
+            .niche_single => {
+                const zst_ord: u32 = sum_lay.zst_discriminant;
+                const pay_ord: u32 = sum_lay.payload_discriminant;
+                const niche_ptr = try self.advanceSymbolicPtr(base_ptr, sum_lay.niche.byte_offset);
+                if (sum_lay.niche.kind == .zero_ptr) {
+                    const loaded_ptr = try self.readPointerAt(
+                        niche_ptr,
+                        self.options.target_layout.ptr_align_log2,
+                    );
+                    return if (loaded_ptr.alloc_id == .null_ptr) zst_ord else pay_ord;
+                }
+                var scalar_buf: [8]u8 = @splat(0);
+                const s_len: usize = sum_lay.niche.scalar_bytes;
+                try self.readScalarBytes(niche_ptr, 0, scalar_buf[0..s_len]);
+                const raw_val = std.mem.readInt(u64, &scalar_buf, .little);
+                return if (raw_val == sum_lay.niche.invalid_first) zst_ord else pay_ord;
+            },
+            .explicit_tag => {
+                if (sum_lay.tag_bytes == 0) return 0;
+                var tag_buf: [4]u8 = @splat(0);
+                try self.readScalarBytes(base_ptr, 0, tag_buf[0..sum_lay.tag_bytes]);
+                return std.mem.readInt(u32, &tag_buf, .little);
+            },
+        }
+    }
+
+    /// Writes the active variant ordinal (`tag_ord`) of `raw_sum_ty` into `base_ptr` (`[CRITICAL-04]`).
+    pub fn writeSumDiscriminantAt(
+        self: *MirVm,
+        base_ptr: SymbolicPtr,
+        raw_sum_ty: TypeId,
+        tag_ord: u32,
+    ) VmEvalError!void {
+        const sum_ty = self.pool.unwrapUnderlyingType(raw_sum_ty);
+        const sum_lay = type_system.computeSumMemoryLayout(
+            self.pool,
+            self.sym_table,
+            sum_ty,
+            self.options.target_layout,
+        );
+        switch (sum_lay.repr) {
+            .transparent_ok => {},
+            .niche_single => {
+                if (tag_ord != sum_lay.zst_discriminant) return;
+                const niche_ptr = try self.advanceSymbolicPtr(base_ptr, sum_lay.niche.byte_offset);
+                if (sum_lay.niche.kind == .zero_ptr) {
+                    try self.writePointerAt(
+                        niche_ptr,
+                        self.options.target_layout.ptr_align_log2,
+                        SymbolicPtr.NULL,
+                    );
+                } else {
+                    var niche_buf: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &niche_buf, sum_lay.niche.invalid_first, .little);
+                    try self.writeScalarBytes(niche_ptr, 0, niche_buf[0..sum_lay.niche.scalar_bytes]);
+                }
+            },
+            .explicit_tag => {
+                if (sum_lay.tag_bytes > 0) {
+                    var tag_buf: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &tag_buf, tag_ord, .little);
+                    try self.writeScalarBytes(base_ptr, 0, tag_buf[0..sum_lay.tag_bytes]);
+                }
+            },
+        }
     }
 
     /// Reads `(data_ptr, elem_len)` out of a `str`, `[T]`, or `#soa [T]` snapshot or memory location.
@@ -2813,6 +2884,12 @@ pub const MirVm = struct {
                     std.mem.writeInt(u32, buf16[0..4], sym_id.asInt(), .little);
                     hasher.update(buf16[0..4]);
                 },
+                .raw_blob => |rb| {
+                    hasher.update(&[2]u8{ 7, rb.align_log2 });
+                    std.mem.writeInt(u32, buf16[0..4], rb.blob_id, .little);
+                    std.mem.writeInt(u64, buf16[4..12], rb.byte_len, .little);
+                    hasher.update(buf16[0..12]);
+                },
             }
         }
     }
@@ -2903,9 +2980,11 @@ pub const MirVm = struct {
         var buf8: [8]u8 = undefined;
         std.mem.writeInt(u64, &buf8, callee_key, .little);
         hasher.update(&buf8);
-        hasher.update(&[3]u8{
+        hasher.update(&[5]u8{
             self.options.target_layout.ptr_byte_size,
             self.options.target_layout.ptr_align_log2,
+            self.options.target_layout.cache_line_align_log2,
+            self.options.target_layout.simd_align_log2,
             @intFromBool(self.options.compiler_db != null),
         });
         if (self.options.compiler_db == null) {
@@ -3164,9 +3243,21 @@ pub const MirVm = struct {
             ptr: SymbolicPtr,
             /// Pointee `TypeId` stored at `ptr`.
             pointee_ty: TypeId,
+            /// Whether `ptr` projects through a `@packed` struct and allows 1-byte alignment.
+            is_unaligned: bool = false,
         },
         /// Compile-time constant `usize` length from `.slice_len` on fixed `[T; N]` / `#soa [T; N]`.
         constant_usize: u64,
+    };
+
+    /// Temporary aligned bounce buffer record for an `inout`/`set` `@packed` field argument.
+    const UnalignedBounceWriteback = struct {
+        /// Unaligned caller place address inside the `@packed` aggregate.
+        orig_ptr: SymbolicPtr,
+        /// Aligned temporary bounce allocation passed to the callee.
+        bounce_ptr: SymbolicPtr,
+        /// Byte width copied back after a non-trapping call completes.
+        byte_size: u64,
     };
 
     /// Allocates a fresh uninitialized stack `ComptimeAllocId` for `local_idx` inside `call_stack[frame_idx]`
@@ -3222,6 +3313,7 @@ pub const MirVm = struct {
         const frame = &self.call_stack.items[frame_idx];
         var cur_ptr = frame.local_ptrs[place.base];
         var cur_ty = self.pool.unwrapUnderlyingType(body.locals.items[place.base].type_id);
+        var is_unaligned = false;
         var active_downcast: ?u32 = null;
         var soa_col_view: ?struct {
             data_ptr: SymbolicPtr,
@@ -3274,8 +3366,12 @@ pub const MirVm = struct {
             switch (proj.kind) {
                 .deref => {
                     active_downcast = null;
-                    cur_ptr = try self.readPointerAt(cur_ptr, self.options.target_layout.ptr_align_log2);
+                    cur_ptr = try self.readPointerAt(
+                        cur_ptr,
+                        if (is_unaligned) 0 else self.options.target_layout.ptr_align_log2,
+                    );
                     cur_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(ty_node.lhs));
+                    is_unaligned = false;
                 },
                 .downcast => {
                     active_downcast = proj.payload;
@@ -3307,12 +3403,18 @@ pub const MirVm = struct {
                                 "invalid variant field projection",
                                 null,
                             );
+                            if (isPackedStructType(self.pool, self.sym_table, var_pay_ty)) {
+                                is_unaligned = true;
+                            }
                             cur_ptr = try self.advanceSymbolicPtr(cur_ptr, sub_field.byte_offset);
                             cur_ty = self.pool.unwrapUnderlyingType(sub_field.field_ty);
                         } else {
                             cur_ty = var_pay_ty;
                         }
                     } else {
+                        if (isPackedStructType(self.pool, self.sym_table, cur_ty)) {
+                            is_unaligned = true;
+                        }
                         const field_info = computeCompositeFieldOffsetAndType(
                             self.pool,
                             self.sym_table,
@@ -3380,6 +3482,7 @@ pub const MirVm = struct {
                         const delta = try self.mulOffsetChecked(idx_u128, elem_lay.byte_size);
                         cur_ptr = try self.advanceSymbolicPtr(fat.data_ptr, delta);
                         cur_ty = elem_ty;
+                        is_unaligned = false;
                     } else {
                         return self.failWithTrap(
                             error.OutOfBounds,
@@ -3454,7 +3557,7 @@ pub const MirVm = struct {
                 },
             }
         }
-        return .{ .memory_ptr = .{ .ptr = cur_ptr, .pointee_ty = cur_ty } };
+        return .{ .memory_ptr = .{ .ptr = cur_ptr, .pointee_ty = cur_ty, .is_unaligned = is_unaligned } };
     }
 
     // -------- Instruction, Operator & Terminator Dispatch ---------
@@ -4088,20 +4191,30 @@ pub const MirVm = struct {
                 const target_entry = self.callables.items[callable_idx.?];
                 if (target_entry.body) |closure_body| {
                     const capture_count = closure_body.param_count -| call_site.args_len;
-                    var cur_off: u64 = self.options.target_layout.ptr_byte_size;
-                    for (0..capture_count) |cap_i| {
-                        const cap_ty = closure_body.locals.items[1 + cap_i].type_id;
-                        const cap_lay = type_system.computeTypeLayoutWithPool(
-                            self.pool,
-                            self.sym_table,
-                            cap_ty,
-                            self.options.target_layout,
+                    if (capture_count > 0) {
+                        const cap_env_ptr = try self.readPointerAt(
+                            try self.advanceSymbolicPtr(env_ptr, self.options.target_layout.ptr_byte_size),
+                            self.options.target_layout.ptr_align_log2,
                         );
-                        cur_off = std.mem.alignForward(u64, cur_off, @max(@as(u64, cap_lay.align_bytes), 1));
-                        const cap_ptr = try self.advanceSymbolicPtr(env_ptr, cur_off);
-                        const cap_slot = try self.loadTypedSlotFromMemory(cap_ptr, cap_ty);
-                        val_args.append(self.allocator, cap_slot) catch return error.OutOfMemory;
-                        cur_off += cap_lay.byte_size;
+                        var cur_off: u64 = 0;
+                        for (0..capture_count) |cap_i| {
+                            const cap_ty = closure_body.locals.items[1 + cap_i].type_id;
+                            const cap_lay = type_system.computeTypeLayoutWithPool(
+                                self.pool,
+                                self.sym_table,
+                                cap_ty,
+                                self.options.target_layout,
+                            );
+                            if (cap_lay.byte_size == 0) {
+                                val_args.append(self.allocator, .{ .scalar_u64 = 0 }) catch return error.OutOfMemory;
+                                continue;
+                            }
+                            cur_off = std.mem.alignForward(u64, cur_off, @max(@as(u64, cap_lay.align_bytes), 1));
+                            const cap_ptr = try self.advanceSymbolicPtr(cap_env_ptr, cur_off);
+                            const cap_slot = try self.loadTypedSlotFromMemory(cap_ptr, cap_ty);
+                            val_args.append(self.allocator, cap_slot) catch return error.OutOfMemory;
+                            cur_off += cap_lay.byte_size;
+                        }
                     }
                 }
             } else {
@@ -4154,6 +4267,17 @@ pub const MirVm = struct {
             );
         };
 
+        var unaligned_bounces: std.ArrayListUnmanaged(UnalignedBounceWriteback) = .empty;
+        defer {
+            for (unaligned_bounces.items) |wb| {
+                const slot_idx = wb.bounce_ptr.alloc_id.payloadIndex();
+                if (slot_idx > 0 and slot_idx < self.allocations.items.len) {
+                    self.allocations.items[slot_idx].is_live = false;
+                }
+            }
+            unaligned_bounces.deinit(self.allocator);
+        }
+
         // Evaluate arguments (preserving caller frame lookup across `evalPlace`):
         for (0..call_site.args_len) |arg_i| {
             const mode = caller_body.call_arg_modes.items[call_site.modes_start + arg_i];
@@ -4171,7 +4295,35 @@ pub const MirVm = struct {
                 switch (outcome) {
                     .memory_ptr => |mp| {
                         _ = try self.validateAccess(mp.ptr, 0, 0, true);
-                        alias_args.append(self.allocator, mp.ptr) catch return error.OutOfMemory;
+                        if (mp.is_unaligned) {
+                            const bounce_lay = type_system.computeTypeLayoutWithPool(
+                                self.pool,
+                                self.sym_table,
+                                mp.pointee_ty,
+                                self.options.target_layout,
+                            );
+                            const bounce_id = try self.allocMemory(
+                                bounce_lay.byte_size,
+                                bounce_lay.align_log2,
+                                true,
+                                true,
+                                false,
+                                0,
+                                call_span,
+                            );
+                            const bounce_ptr = SymbolicPtr{ .alloc_id = bounce_id, .byte_offset = 0 };
+                            if (mode == .inout_mode and bounce_lay.byte_size > 0) {
+                                try self.copyMemoryRange(bounce_ptr, mp.ptr, bounce_lay.byte_size, 0);
+                            }
+                            unaligned_bounces.append(self.allocator, .{
+                                .orig_ptr = mp.ptr,
+                                .bounce_ptr = bounce_ptr,
+                                .byte_size = bounce_lay.byte_size,
+                            }) catch return error.OutOfMemory;
+                            alias_args.append(self.allocator, bounce_ptr) catch return error.OutOfMemory;
+                        } else {
+                            alias_args.append(self.allocator, mp.ptr) catch return error.OutOfMemory;
+                        }
                     },
                     .constant_usize => {
                         return self.failWithTrap(
@@ -4186,7 +4338,13 @@ pub const MirVm = struct {
             }
         }
 
-        return self.invokeBodyInternal(target_body, val_args.items, alias_args.items, call_span);
+        const call_res = try self.invokeBodyInternal(target_body, val_args.items, alias_args.items, call_span);
+        for (unaligned_bounces.items) |wb| {
+            if (wb.byte_size > 0) {
+                try self.copyMemoryRange(wb.orig_ptr, wb.bounce_ptr, wb.byte_size, 0);
+            }
+        }
+        return call_res;
     }
 
     /// Evaluates a single `MirInst` inside `call_stack[frame_idx]`.
@@ -4342,7 +4500,7 @@ pub const MirVm = struct {
                 );
                 return switch (outcome) {
                     .constant_usize => |len_val| self.makeIntSlot(inst.type_id, len_val),
-                    .memory_ptr => |mp| self.loadTypedSlotFromMemory(mp.ptr, inst.type_id),
+                    .memory_ptr => |mp| self.loadTypedSlotFromMemoryAligned(mp.ptr, inst.type_id, mp.is_unaligned),
                 };
             },
             .place_store => {
@@ -4353,7 +4511,7 @@ pub const MirVm = struct {
                 );
                 switch (outcome) {
                     .memory_ptr => |mp| {
-                        try self.storeTypedSlotToMemory(mp.ptr, mp.pointee_ty, rhs_slot);
+                        try self.storeTypedSlotToMemoryAligned(mp.ptr, mp.pointee_ty, rhs_slot, mp.is_unaligned);
                     },
                     .constant_usize => {
                         return self.failWithTrap(
@@ -4373,16 +4531,8 @@ pub const MirVm = struct {
                     PlaceId.fromInt(inst.operands.lhs),
                 );
                 const mp = outcome.memory_ptr;
-                const sum_info = computeSumTypeTagAndPayloadLayout(
-                    self.pool,
-                    self.sym_table,
-                    mp.pointee_ty,
-                    self.options.target_layout,
-                );
-                if (sum_info.tag_bytes == 0) return self.makeIntSlot(inst.type_id, 0);
-                var tag_buf: [4]u8 = @splat(0);
-                try self.readScalarBytes(mp.ptr, 0, tag_buf[0..sum_info.tag_bytes]);
-                return self.makeIntSlot(inst.type_id, std.mem.readInt(u32, &tag_buf, .little));
+                const tag_ord = try self.readSumDiscriminantAt(mp.ptr, mp.pointee_ty);
+                return self.makeIntSlot(inst.type_id, tag_ord);
             },
             .place_set_discrim => {
                 const outcome = try self.evalPlace(
@@ -4390,17 +4540,7 @@ pub const MirVm = struct {
                     PlaceId.fromInt(inst.operands.lhs),
                 );
                 const mp = outcome.memory_ptr;
-                const sum_info = computeSumTypeTagAndPayloadLayout(
-                    self.pool,
-                    self.sym_table,
-                    mp.pointee_ty,
-                    self.options.target_layout,
-                );
-                if (sum_info.tag_bytes > 0) {
-                    var tag_buf: [4]u8 = undefined;
-                    std.mem.writeInt(u32, &tag_buf, inst.operands.rhs, .little);
-                    try self.writeScalarBytes(mp.ptr, 0, tag_buf[0..sum_info.tag_bytes]);
-                }
+                try self.writeSumDiscriminantAt(mp.ptr, mp.pointee_ty, inst.operands.rhs);
                 return .{ .scalar_u64 = 0 };
             },
             .place_addr => {
@@ -4533,6 +4673,40 @@ pub const MirVm = struct {
                 }
                 return self.makeFatSliceSlot(ty, data_ptr, bytes.len);
             },
+            .raw_blob => |rb| {
+                const store = self.options.blob_store orelse {
+                    return self.failWithTrap(
+                        error.ForbiddenOperation,
+                        .e0503_forbidden_comptime_operation,
+                        "`MirConst.raw_blob` executed without an attached `MirBlobStore`",
+                        "missing `MirBlobStore` for `@embed_bytes` blob",
+                        null,
+                    );
+                };
+                const raw_bytes = store.getBytes(rb.blob_id) orelse {
+                    return self.failWithTrap(
+                        error.OutOfBounds,
+                        .e0504_comptime_out_of_bounds,
+                        "`MirConst.raw_blob` references out-of-range blob index",
+                        "invalid `blob_id` here",
+                        null,
+                    );
+                };
+                const blob_aid = self.rodata_pool.internBlob(raw_bytes, &.{}, rb.align_log2) catch
+                    return error.OutOfMemory;
+                const data_ptr = SymbolicPtr{ .alloc_id = blob_aid, .byte_offset = 0 };
+                const ty_node = self.pool.getNode(ty);
+                if (ty_node.tag == .ref_ty or ty_node.tag == .raw_ptr_ty) {
+                    const pointee_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(ty_node.lhs));
+                    if (self.pool.getNode(pointee_ty).tag == .slice_ty) {
+                        const slice_slot = try self.makeFatSliceSlot(pointee_ty, data_ptr, raw_bytes.len);
+                        const rodata_id = try self.promoteSnapshotToRodata(slice_slot.sym_ptr, pointee_ty);
+                        return .{ .sym_ptr = .{ .alloc_id = rodata_id, .byte_offset = 0 } };
+                    }
+                    return .{ .sym_ptr = data_ptr };
+                }
+                return self.makeFatSliceSlot(ty, data_ptr, raw_bytes.len);
+            },
         }
     }
 
@@ -4554,6 +4728,276 @@ pub const MirVm = struct {
         errdefer self.allocator.free(out_buf);
         try self.readScalarBytes(fat.data_ptr, 0, out_buf);
         return out_buf;
+    }
+
+    /// Recursively evaluates structural equality between two typed `RegSlot` values (capped at depth 64).
+    fn areTypedSlotsEqual(
+        self: *MirVm,
+        raw_ty: TypeId,
+        lhs_slot: RegSlot,
+        rhs_slot: RegSlot,
+        depth: u32,
+    ) VmEvalError!bool {
+        if (depth > 64) return false;
+        const ty = self.pool.unwrapUnderlyingType(raw_ty);
+        const lay = type_system.computeTypeLayoutWithPool(
+            self.pool,
+            self.sym_table,
+            ty,
+            self.options.target_layout,
+        );
+        if (lay.byte_size == 0) return true;
+
+        if (ty == .str_ty) {
+            const lhs_bytes = try self.readStrSlotBytes(lhs_slot);
+            defer self.allocator.free(lhs_bytes);
+            const rhs_bytes = try self.readStrSlotBytes(rhs_slot);
+            defer self.allocator.free(rhs_bytes);
+            return std.mem.eql(u8, lhs_bytes, rhs_bytes);
+        }
+        if (ty == .f32_ty) {
+            return unpackF32Slot(lhs_slot) == unpackF32Slot(rhs_slot);
+        }
+        if (ty == .f64_ty or ty == .untyped_float_ty) {
+            return canonicalizeF64(lhs_slot.scalar_f64) == canonicalizeF64(rhs_slot.scalar_f64);
+        }
+        if (resolveIntInfo(self.pool, ty, self.options.target_layout) != null) {
+            return (try self.readIntBitsFromSlot(lhs_slot, ty)) ==
+                (try self.readIntBitsFromSlot(rhs_slot, ty));
+        }
+        const repr = classifyValueRepr(self.pool, self.sym_table, ty, self.options.target_layout);
+        if (repr == .inline_ptr) {
+            return lhs_slot.sym_ptr.alloc_id == rhs_slot.sym_ptr.alloc_id and
+                lhs_slot.sym_ptr.byte_offset == rhs_slot.sym_ptr.byte_offset;
+        }
+
+        const node = self.pool.getNode(ty);
+        switch (node.tag) {
+            .enum_ty, .optional_ty, .result_ty => {
+                const lhs_tag = try self.readSumDiscriminantAt(lhs_slot.sym_ptr, ty);
+                const rhs_tag = try self.readSumDiscriminantAt(rhs_slot.sym_ptr, ty);
+                if (lhs_tag != rhs_tag) return false;
+                const var_pay_ty = self.pool.unwrapUnderlyingType(
+                    resolveVariantPayloadType(self.pool, self.sym_table, ty, lhs_tag),
+                );
+                const pay_lay = type_system.computeTypeLayoutWithPool(
+                    self.pool,
+                    self.sym_table,
+                    var_pay_ty,
+                    self.options.target_layout,
+                );
+                if (pay_lay.byte_size == 0) return true;
+                const sum_info = computeSumTypeTagAndPayloadLayout(
+                    self.pool,
+                    self.sym_table,
+                    ty,
+                    self.options.target_layout,
+                );
+                const lhs_pay = try self.loadTypedSlotFromMemoryAligned(
+                    try self.advanceSymbolicPtr(lhs_slot.sym_ptr, sum_info.payload_offset),
+                    var_pay_ty,
+                    true,
+                );
+                const rhs_pay = try self.loadTypedSlotFromMemoryAligned(
+                    try self.advanceSymbolicPtr(rhs_slot.sym_ptr, sum_info.payload_offset),
+                    var_pay_ty,
+                    true,
+                );
+                return self.areTypedSlotsEqual(var_pay_ty, lhs_pay, rhs_pay, depth + 1);
+            },
+            .struct_ty, .tuple_ty => {
+                const is_packed_st = isPackedStructType(self.pool, self.sym_table, ty);
+                var ord: u32 = 0;
+                while (computeCompositeFieldOffsetAndType(
+                    self.pool,
+                    self.sym_table,
+                    ty,
+                    ord,
+                    self.options.target_layout,
+                )) |f_info| : (ord += 1) {
+                    const lhs_f = try self.loadTypedSlotFromMemoryAligned(
+                        try self.advanceSymbolicPtr(lhs_slot.sym_ptr, f_info.byte_offset),
+                        f_info.field_ty,
+                        is_packed_st,
+                    );
+                    const rhs_f = try self.loadTypedSlotFromMemoryAligned(
+                        try self.advanceSymbolicPtr(rhs_slot.sym_ptr, f_info.byte_offset),
+                        f_info.field_ty,
+                        is_packed_st,
+                    );
+                    if (!(try self.areTypedSlotsEqual(f_info.field_ty, lhs_f, rhs_f, depth + 1))) {
+                        return false;
+                    }
+                }
+                return true;
+            },
+            .array_ty => {
+                const elem_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+                const arr_len: u32 = node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+                const elem_lay = type_system.computeTypeLayoutWithPool(
+                    self.pool,
+                    self.sym_table,
+                    elem_ty,
+                    self.options.target_layout,
+                );
+                var elem_i: u32 = 0;
+                while (elem_i < arr_len) : (elem_i += 1) {
+                    const off = try self.mulOffsetChecked(elem_i, elem_lay.byte_size);
+                    const lhs_e = try self.loadTypedSlotFromMemoryAligned(
+                        try self.advanceSymbolicPtr(lhs_slot.sym_ptr, off),
+                        elem_ty,
+                        true,
+                    );
+                    const rhs_e = try self.loadTypedSlotFromMemoryAligned(
+                        try self.advanceSymbolicPtr(rhs_slot.sym_ptr, off),
+                        elem_ty,
+                        true,
+                    );
+                    if (!(try self.areTypedSlotsEqual(elem_ty, lhs_e, rhs_e, depth + 1))) {
+                        return false;
+                    }
+                }
+                return true;
+            },
+            .soa_array_ty => {
+                const elem_struct_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+                const cap: u32 = node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+                var col_ord: u32 = 0;
+                while (computeSoaColumnOffsetAndType(
+                    self.pool,
+                    self.sym_table,
+                    elem_struct_ty,
+                    col_ord,
+                    cap,
+                    self.options.target_layout,
+                )) |col| : (col_ord += 1) {
+                    const f_lay = type_system.computeTypeLayoutWithPool(
+                        self.pool,
+                        self.sym_table,
+                        col.field_ty,
+                        self.options.target_layout,
+                    );
+                    var elem_i: u32 = 0;
+                    while (elem_i < cap) : (elem_i += 1) {
+                        const off = col.column_byte_offset + (try self.mulOffsetChecked(elem_i, f_lay.byte_size));
+                        const lhs_e = try self.loadTypedSlotFromMemoryAligned(
+                            try self.advanceSymbolicPtr(lhs_slot.sym_ptr, off),
+                            col.field_ty,
+                            true,
+                        );
+                        const rhs_e = try self.loadTypedSlotFromMemoryAligned(
+                            try self.advanceSymbolicPtr(rhs_slot.sym_ptr, off),
+                            col.field_ty,
+                            true,
+                        );
+                        if (!(try self.areTypedSlotsEqual(col.field_ty, lhs_e, rhs_e, depth + 1))) {
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            },
+            .slice_ty => {
+                const lhs_fat = try self.readFatSliceParts(lhs_slot.sym_ptr);
+                const rhs_fat = try self.readFatSliceParts(rhs_slot.sym_ptr);
+                if (lhs_fat.elem_len != rhs_fat.elem_len) return false;
+                const elem_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+                const elem_lay = type_system.computeTypeLayoutWithPool(
+                    self.pool,
+                    self.sym_table,
+                    elem_ty,
+                    self.options.target_layout,
+                );
+                var elem_i: u64 = 0;
+                while (elem_i < lhs_fat.elem_len) : (elem_i += 1) {
+                    const off = try self.mulOffsetChecked(elem_i, elem_lay.byte_size);
+                    const lhs_e = try self.loadTypedSlotFromMemoryAligned(
+                        try self.advanceSymbolicPtr(lhs_fat.data_ptr, off),
+                        elem_ty,
+                        true,
+                    );
+                    const rhs_e = try self.loadTypedSlotFromMemoryAligned(
+                        try self.advanceSymbolicPtr(rhs_fat.data_ptr, off),
+                        elem_ty,
+                        true,
+                    );
+                    if (!(try self.areTypedSlotsEqual(elem_ty, lhs_e, rhs_e, depth + 1))) {
+                        return false;
+                    }
+                }
+                return true;
+            },
+            .soa_slice_ty => {
+                const lhs_fat = try self.readFatSliceParts(lhs_slot.sym_ptr);
+                const rhs_fat = try self.readFatSliceParts(rhs_slot.sym_ptr);
+                if (lhs_fat.elem_len != rhs_fat.elem_len) return false;
+                const elem_struct_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+                var lhs_cap: u32 = @truncate(lhs_fat.elem_len);
+                if (lhs_fat.data_ptr.alloc_id.domain() == .vm_alloc) {
+                    const rec = &self.allocations.items[lhs_fat.data_ptr.alloc_id.payloadIndex()];
+                    if (rec.soa_elem_capacity > 0) lhs_cap = rec.soa_elem_capacity;
+                }
+                var rhs_cap: u32 = @truncate(rhs_fat.elem_len);
+                if (rhs_fat.data_ptr.alloc_id.domain() == .vm_alloc) {
+                    const rec = &self.allocations.items[rhs_fat.data_ptr.alloc_id.payloadIndex()];
+                    if (rec.soa_elem_capacity > 0) rhs_cap = rec.soa_elem_capacity;
+                }
+                var col_ord: u32 = 0;
+                while (true) : (col_ord += 1) {
+                    const lhs_col = computeSoaColumnOffsetAndType(
+                        self.pool,
+                        self.sym_table,
+                        elem_struct_ty,
+                        col_ord,
+                        lhs_cap,
+                        self.options.target_layout,
+                    ) orelse break;
+                    const rhs_col = computeSoaColumnOffsetAndType(
+                        self.pool,
+                        self.sym_table,
+                        elem_struct_ty,
+                        col_ord,
+                        rhs_cap,
+                        self.options.target_layout,
+                    ) orelse break;
+                    const f_lay = type_system.computeTypeLayoutWithPool(
+                        self.pool,
+                        self.sym_table,
+                        lhs_col.field_ty,
+                        self.options.target_layout,
+                    );
+                    var elem_i: u64 = 0;
+                    while (elem_i < lhs_fat.elem_len) : (elem_i += 1) {
+                        const elem_off = try self.mulOffsetChecked(elem_i, f_lay.byte_size);
+                        const lhs_e = try self.loadTypedSlotFromMemoryAligned(
+                            try self.advanceSymbolicPtr(lhs_fat.data_ptr, lhs_col.column_byte_offset + elem_off),
+                            lhs_col.field_ty,
+                            true,
+                        );
+                        const rhs_e = try self.loadTypedSlotFromMemoryAligned(
+                            try self.advanceSymbolicPtr(rhs_fat.data_ptr, rhs_col.column_byte_offset + elem_off),
+                            rhs_col.field_ty,
+                            true,
+                        );
+                        if (!(try self.areTypedSlotsEqual(lhs_col.field_ty, lhs_e, rhs_e, depth + 1))) {
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            },
+            .closure_ty => {
+                const ptr_align = self.options.target_layout.ptr_align_log2;
+                const ptr_width = self.options.target_layout.ptr_byte_size;
+                const lhs_fn = try self.readPointerAt(lhs_slot.sym_ptr, ptr_align);
+                const rhs_fn = try self.readPointerAt(rhs_slot.sym_ptr, ptr_align);
+                const lhs_env = try self.readPointerAt(try self.advanceSymbolicPtr(lhs_slot.sym_ptr, ptr_width), ptr_align);
+                const rhs_env = try self.readPointerAt(try self.advanceSymbolicPtr(rhs_slot.sym_ptr, ptr_width), ptr_align);
+                return lhs_fn.alloc_id == rhs_fn.alloc_id and lhs_fn.byte_offset == rhs_fn.byte_offset and
+                    lhs_env.alloc_id == rhs_env.alloc_id and lhs_env.byte_offset == rhs_env.byte_offset;
+            },
+            else => return false,
+        }
     }
 
     /// Evaluates a typed binary `BinOpKind` instruction (`E0502` on overflow, `E0507` on div-by-zero).
@@ -4647,8 +5091,13 @@ pub const MirVm = struct {
         }
 
         // [4] Integer & boolean arithmetic, shifts, bitwise ops, and comparisons (`1..128` bits):
-        const info = resolveIntInfo(self.pool, op_ty, self.options.target_layout) orelse
+        const info = resolveIntInfo(self.pool, op_ty, self.options.target_layout) orelse {
+            if (kind == .eq or kind == .ne) {
+                const is_eq = try self.areTypedSlotsEqual(op_ty, lhs_slot, rhs_slot, 0);
+                return .{ .scalar_u64 = @intFromBool(if (kind == .eq) is_eq else !is_eq) };
+            }
             return .{ .scalar_u64 = 0 };
+        };
         const rhs_ty = body.getInst(rhs_val).type_id;
         const rhs_info = resolveIntInfo(self.pool, rhs_ty, self.options.target_layout) orelse info;
 
@@ -5112,16 +5561,8 @@ pub const MirVm = struct {
                 return self.loadTypedSlotFromMemory(tmp_place, dst_ty);
             },
             .ssa_discriminant => {
-                const sum_info = computeSumTypeTagAndPayloadLayout(
-                    self.pool,
-                    self.sym_table,
-                    src_ty,
-                    self.options.target_layout,
-                );
-                if (sum_info.tag_bytes == 0) return self.makeIntSlot(dst_ty, 0);
-                var tag_buf: [4]u8 = @splat(0);
-                try self.readScalarBytes(src_slot.sym_ptr, 0, tag_buf[0..sum_info.tag_bytes]);
-                return self.makeIntSlot(dst_ty, std.mem.readInt(u32, &tag_buf, .little));
+                const tag_ord = try self.readSumDiscriminantAt(src_slot.sym_ptr, src_ty);
+                return self.makeIntSlot(dst_ty, tag_ord);
             },
             .ssa_variant_payload => {
                 const sum_info = computeSumTypeTagAndPayloadLayout(
@@ -5153,20 +5594,30 @@ pub const MirVm = struct {
                     mir.isZeroPadNominalType(self.pool, self.sym_table, agg_ty);
                 const snap = try self.allocSnapshotForType(agg_ty, is_zero_pad);
                 const elem_ids = body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs];
-                for (elem_ids, 0..) |raw_val, ord_i| {
-                    const f_info = computeCompositeFieldOffsetAndType(
-                        self.pool,
-                        self.sym_table,
-                        agg_ty,
-                        @intCast(ord_i),
-                        self.options.target_layout,
-                    ) orelse continue;
-                    const elem_slot = self.call_stack.items[frame_idx].regs[raw_val];
-                    try self.storeTypedSlotToMemory(
-                        try self.advanceSymbolicPtr(snap, f_info.byte_offset),
-                        f_info.field_ty,
-                        elem_slot,
-                    );
+                if (self.pool.getNode(agg_ty).tag == .union_ty) {
+                    for (elem_ids) |raw_val| {
+                        const elem_ty = body.getInst(MirValueId.fromInt(raw_val)).type_id;
+                        const elem_slot = self.call_stack.items[frame_idx].regs[raw_val];
+                        try self.storeTypedSlotToMemory(snap, elem_ty, elem_slot);
+                    }
+                } else {
+                    const is_packed_agg = isPackedStructType(self.pool, self.sym_table, agg_ty);
+                    for (elem_ids, 0..) |raw_val, ord_i| {
+                        const f_info = computeCompositeFieldOffsetAndType(
+                            self.pool,
+                            self.sym_table,
+                            agg_ty,
+                            @intCast(ord_i),
+                            self.options.target_layout,
+                        ) orelse continue;
+                        const elem_slot = self.call_stack.items[frame_idx].regs[raw_val];
+                        try self.storeTypedSlotToMemoryAligned(
+                            try self.advanceSymbolicPtr(snap, f_info.byte_offset),
+                            f_info.field_ty,
+                            elem_slot,
+                            is_packed_agg,
+                        );
+                    }
                 }
                 self.sealSnapshot(snap);
                 return .{ .sym_ptr = snap };
@@ -5250,11 +5701,6 @@ pub const MirVm = struct {
                     agg_ty,
                     self.options.target_layout,
                 );
-                if (sum_info.tag_bytes > 0) {
-                    var tag_buf: [4]u8 = undefined;
-                    std.mem.writeInt(u32, &tag_buf, tag_ord, .little);
-                    try self.writeScalarBytes(snap, 0, tag_buf[0..sum_info.tag_bytes]);
-                }
                 if (elem_len == 1) {
                     const raw_val = body.extra_args.items[inst.operands.lhs];
                     const pay_ty = body.getInst(MirValueId.fromInt(raw_val)).type_id;
@@ -5283,6 +5729,7 @@ pub const MirVm = struct {
                         );
                     }
                 }
+                try self.writeSumDiscriminantAt(snap, agg_ty, tag_ord);
                 self.sealSnapshot(snap);
                 return .{ .sym_ptr = snap };
             },
@@ -5305,7 +5752,7 @@ pub const MirVm = struct {
                 );
             },
             .closure_make => {
-                const snap = try self.allocSnapshotForType(agg_ty, false);
+                const snap = try self.allocSnapshotForType(agg_ty, true);
                 const fn_idx = try self.resolveOrLoadCallable(DefId.fromInt(inst.operands.lhs), .none);
                 try self.writePointerAt(
                     snap,
@@ -5314,23 +5761,58 @@ pub const MirVm = struct {
                 );
                 const cap_len = body.extra_args.items[inst.operands.rhs];
                 const cap_start = inst.operands.rhs + 1;
-                var cur_off: u64 = self.options.target_layout.ptr_byte_size;
-                for (0..cap_len) |cap_i| {
-                    const cap_val = MirValueId.fromInt(body.extra_args.items[cap_start + cap_i]);
-                    const cap_ty = body.getInst(cap_val).type_id;
-                    const cap_lay = type_system.computeTypeLayoutWithPool(
-                        self.pool,
-                        self.sym_table,
-                        cap_ty,
-                        self.options.target_layout,
+                if (cap_len > 0) {
+                    var env_size: u64 = 0;
+                    var env_align_log2: u8 = self.options.target_layout.ptr_align_log2;
+                    for (0..cap_len) |cap_i| {
+                        const cap_val = MirValueId.fromInt(body.extra_args.items[cap_start + cap_i]);
+                        const cap_ty = body.getInst(cap_val).type_id;
+                        const cap_lay = type_system.computeTypeLayoutWithPool(
+                            self.pool,
+                            self.sym_table,
+                            cap_ty,
+                            self.options.target_layout,
+                        );
+                        if (cap_lay.byte_size == 0) continue;
+                        env_align_log2 = @max(env_align_log2, cap_lay.align_log2);
+                        env_size = std.mem.alignForward(u64, env_size, @max(@as(u64, cap_lay.align_bytes), 1));
+                        env_size += cap_lay.byte_size;
+                    }
+                    const env_alloc_id = try self.allocMemory(
+                        @max(env_size, 1),
+                        env_align_log2,
+                        true,
+                        false,
+                        true,
+                        0,
+                        self.active_inst_span,
                     );
-                    cur_off = std.mem.alignForward(u64, cur_off, @max(@as(u64, cap_lay.align_bytes), 1));
-                    try self.storeTypedSlotToMemory(
-                        try self.advanceSymbolicPtr(snap, cur_off),
-                        cap_ty,
-                        self.call_stack.items[frame_idx].regs[cap_val.asInt()],
+                    const cap_env_ptr = SymbolicPtr{ .alloc_id = env_alloc_id, .byte_offset = 0 };
+                    var cur_off: u64 = 0;
+                    for (0..cap_len) |cap_i| {
+                        const cap_val = MirValueId.fromInt(body.extra_args.items[cap_start + cap_i]);
+                        const cap_ty = body.getInst(cap_val).type_id;
+                        const cap_lay = type_system.computeTypeLayoutWithPool(
+                            self.pool,
+                            self.sym_table,
+                            cap_ty,
+                            self.options.target_layout,
+                        );
+                        if (cap_lay.byte_size == 0) continue;
+                        cur_off = std.mem.alignForward(u64, cur_off, @max(@as(u64, cap_lay.align_bytes), 1));
+                        try self.storeTypedSlotToMemory(
+                            try self.advanceSymbolicPtr(cap_env_ptr, cur_off),
+                            cap_ty,
+                            self.call_stack.items[frame_idx].regs[cap_val.asInt()],
+                        );
+                        cur_off += cap_lay.byte_size;
+                    }
+                    self.sealSnapshot(cap_env_ptr);
+                    try self.writePointerAt(
+                        try self.advanceSymbolicPtr(snap, self.options.target_layout.ptr_byte_size),
+                        self.options.target_layout.ptr_align_log2,
+                        cap_env_ptr,
                     );
-                    cur_off += cap_lay.byte_size;
                 }
                 self.sealSnapshot(snap);
                 return .{ .sym_ptr = snap };
@@ -5367,9 +5849,10 @@ pub const MirVm = struct {
         )) |f_info| {
             byte_off = f_info.byte_offset;
         }
-        return self.loadTypedSlotFromMemory(
+        return self.loadTypedSlotFromMemoryAligned(
             try self.advanceSymbolicPtr(agg_slot.sym_ptr, byte_off),
             res_ty,
+            isPackedStructType(self.pool, self.sym_table, agg_ty),
         );
     }
 
@@ -5414,10 +5897,11 @@ pub const MirVm = struct {
             ordinal,
             self.options.target_layout,
         )) |f_info| {
-            try self.storeTypedSlotToMemory(
+            try self.storeTypedSlotToMemoryAligned(
                 try self.advanceSymbolicPtr(snap, f_info.byte_offset),
                 f_info.field_ty,
                 new_elem_slot,
+                isPackedStructType(self.pool, self.sym_table, agg_ty),
             );
         }
         self.sealSnapshot(snap);
@@ -5659,12 +6143,7 @@ pub const MirVm = struct {
                     ty,
                     self.options.target_layout,
                 );
-                var tag_ord: u32 = 0;
-                if (sum_info.tag_bytes > 0) {
-                    var tag_buf: [4]u8 = @splat(0);
-                    try self.readScalarBytes(place_ptr, 0, tag_buf[0..sum_info.tag_bytes]);
-                    tag_ord = std.mem.readInt(u32, &tag_buf, .little);
-                }
+                const tag_ord = try self.readSumDiscriminantAt(place_ptr, ty);
                 const var_pay_ty = resolveVariantPayloadType(self.pool, self.sym_table, ty, tag_ord);
                 if (var_pay_ty != .unit_ty and !var_pay_ty.isError()) {
                     try self.dropPlaceInVm(
@@ -5730,6 +6209,10 @@ pub const MirVm = struct {
         arg_slot: RegSlot,
     ) VmEvalError!struct { data_ptr: SymbolicPtr, byte_len: u64 } {
         const arg_ty = self.pool.unwrapUnderlyingType(raw_arg_ty);
+        if (arg_ty == .str_ty) {
+            const fat = try self.readFatSliceParts(arg_slot.sym_ptr);
+            return .{ .data_ptr = fat.data_ptr, .byte_len = fat.elem_len };
+        }
         const arg_node = self.pool.getNode(arg_ty);
         if (arg_node.tag == .slice_ty) {
             const fat = try self.readFatSliceParts(arg_slot.sym_ptr);
@@ -5743,6 +6226,10 @@ pub const MirVm = struct {
         }
         if (arg_node.tag == .ref_ty or arg_node.tag == .mut_ref_ty or arg_node.tag == .raw_ptr_ty) {
             const pointee_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(arg_node.lhs));
+            if (pointee_ty == .str_ty) {
+                const fat = try self.readFatSliceParts(arg_slot.sym_ptr);
+                return .{ .data_ptr = fat.data_ptr, .byte_len = fat.elem_len };
+            }
             const pointee_node = self.pool.getNode(pointee_ty);
             if (pointee_node.tag == .slice_ty) {
                 const fat = try self.readFatSliceParts(arg_slot.sym_ptr);
@@ -6054,10 +6541,7 @@ pub const MirVm = struct {
                 const is_align_ok = !is_view or
                     self.isSymbolicPtrAlignedForView(span_info.data_ptr, target_lay.align_log2);
                 if (!is_size_ok or !is_align_ok) {
-                    if (sum_info.tag_bytes > 0) {
-                        var none_tag: [4]u8 = @splat(0);
-                        try self.writeScalarBytes(opt_snap, 0, none_tag[0..sum_info.tag_bytes]);
-                    }
+                    try self.writeSumDiscriminantAt(opt_snap, opt_ty, 0);
                     self.sealSnapshot(opt_snap);
                     return .{ .sym_ptr = opt_snap };
                 }
@@ -6075,11 +6559,6 @@ pub const MirVm = struct {
                 };
                 try self.readScalarBytes(span_info.data_ptr, 0, raw_buf);
 
-                if (sum_info.tag_bytes > 0) {
-                    var some_tag: [4]u8 = undefined;
-                    std.mem.writeInt(u32, &some_tag, 1, .little);
-                    try self.writeScalarBytes(opt_snap, 0, some_tag[0..sum_info.tag_bytes]);
-                }
                 const pay_ptr = try self.advanceSymbolicPtr(opt_snap, sum_info.payload_offset);
                 if (is_view) {
                     try self.writePointerAt(
@@ -6094,6 +6573,7 @@ pub const MirVm = struct {
                     const val_slot = try self.loadTypedSlotFromMemory(val_tmp, target_ty);
                     try self.storeTypedSlotToMemory(pay_ptr, some_pay_ty, val_slot);
                 }
+                try self.writeSumDiscriminantAt(opt_snap, opt_ty, 1);
                 self.sealSnapshot(opt_snap);
                 return .{ .sym_ptr = opt_snap };
             },
@@ -6239,20 +6719,15 @@ pub const MirVm = struct {
                     self.options.target_layout,
                 );
                 if (narrow_res.is_in_range) {
-                    if (sum_info.tag_bytes > 0) {
-                        var some_tag: [4]u8 = undefined;
-                        std.mem.writeInt(u32, &some_tag, 1, .little);
-                        try self.writeScalarBytes(opt_snap, 0, some_tag[0..sum_info.tag_bytes]);
-                    }
                     const pay_slot = try self.makeIntSlot(dst_ty, narrow_res.converted_bits);
                     try self.storeTypedSlotToMemory(
                         try self.advanceSymbolicPtr(opt_snap, sum_info.payload_offset),
                         dst_ty,
                         pay_slot,
                     );
-                } else if (sum_info.tag_bytes > 0) {
-                    var none_tag: [4]u8 = @splat(0);
-                    try self.writeScalarBytes(opt_snap, 0, none_tag[0..sum_info.tag_bytes]);
+                    try self.writeSumDiscriminantAt(opt_snap, opt_ty, 1);
+                } else {
+                    try self.writeSumDiscriminantAt(opt_snap, opt_ty, 0);
                 }
                 self.sealSnapshot(opt_snap);
                 return .{ .sym_ptr = opt_snap };
@@ -6325,6 +6800,346 @@ pub const MirVm = struct {
                     try self.freeHeapMemory(mp.ptr);
                 }
                 return .{ .scalar_u64 = 0 };
+            },
+            .atomic_fence => return .{ .scalar_u64 = 0 },
+            .atomic_load => {
+                if (args.len < 1) return .{ .scalar_u64 = 0 };
+                const ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                return self.loadTypedSlotFromMemory(ptr, inst.type_id);
+            },
+            .atomic_store => {
+                if (args.len < 2) return .{ .scalar_u64 = 0 };
+                const ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const val_ty = body.getInst(MirValueId.fromInt(args[1])).type_id;
+                try self.storeTypedSlotToMemory(ptr, val_ty, self.call_stack.items[frame_idx].regs[args[1]]);
+                return .{ .scalar_u64 = 0 };
+            },
+            .atomic_rmw_xchg => {
+                if (args.len < 2) return .{ .scalar_u64 = 0 };
+                const ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const old_slot = try self.loadTypedSlotFromMemory(ptr, inst.type_id);
+                try self.storeTypedSlotToMemory(
+                    ptr,
+                    inst.type_id,
+                    self.call_stack.items[frame_idx].regs[args[1]],
+                );
+                return old_slot;
+            },
+            .atomic_rmw_add, .atomic_rmw_sub => {
+                if (args.len < 2) return .{ .scalar_u64 = 0 };
+                const ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const old_slot = try self.loadTypedSlotFromMemory(ptr, inst.type_id);
+                const old_bits = try self.readIntBitsFromSlot(old_slot, inst.type_id);
+                const rhs_bits = try self.readIntBitsFromSlot(
+                    self.call_stack.items[frame_idx].regs[args[1]],
+                    inst.type_id,
+                );
+                const next_bits = if (kind == .atomic_rmw_add) old_bits +% rhs_bits else old_bits -% rhs_bits;
+                const next_slot = try self.makeIntSlot(inst.type_id, next_bits);
+                try self.storeTypedSlotToMemory(ptr, inst.type_id, next_slot);
+                return old_slot;
+            },
+            .atomic_cmpxchg => {
+                if (args.len < 3) return .{ .scalar_u64 = 0 };
+                const ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const val_ty = self.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[1])).type_id);
+                const cur_slot = try self.loadTypedSlotFromMemory(ptr, val_ty);
+                const exp_slot = self.call_stack.items[frame_idx].regs[args[1]];
+                const des_slot = self.call_stack.items[frame_idx].regs[args[2]];
+                const val_repr = classifyValueRepr(
+                    self.pool,
+                    self.sym_table,
+                    val_ty,
+                    self.options.target_layout,
+                );
+                const is_matched = if (val_repr == .inline_ptr)
+                    (cur_slot.sym_ptr.alloc_id == exp_slot.sym_ptr.alloc_id and
+                        cur_slot.sym_ptr.byte_offset == exp_slot.sym_ptr.byte_offset)
+                else if (val_ty == .bool_ty)
+                    ((cur_slot.scalar_u64 & 1) == (exp_slot.scalar_u64 & 1))
+                else blk: {
+                    const cur_bits = try self.readIntBitsFromSlot(cur_slot, val_ty);
+                    const exp_bits = try self.readIntBitsFromSlot(exp_slot, val_ty);
+                    break :blk cur_bits == exp_bits;
+                };
+                if (is_matched) {
+                    try self.storeTypedSlotToMemory(ptr, val_ty, des_slot);
+                }
+                const pair_snap = try self.allocSnapshotForType(inst.type_id, false);
+                if (computeCompositeFieldOffsetAndType(
+                    self.pool,
+                    self.sym_table,
+                    inst.type_id,
+                    0,
+                    self.options.target_layout,
+                )) |f0| {
+                    try self.storeTypedSlotToMemory(
+                        try self.advanceSymbolicPtr(pair_snap, f0.byte_offset),
+                        f0.field_ty,
+                        cur_slot,
+                    );
+                }
+                if (computeCompositeFieldOffsetAndType(
+                    self.pool,
+                    self.sym_table,
+                    inst.type_id,
+                    1,
+                    self.options.target_layout,
+                )) |f1| {
+                    try self.storeTypedSlotToMemory(
+                        try self.advanceSymbolicPtr(pair_snap, f1.byte_offset),
+                        f1.field_ty,
+                        .{ .scalar_u64 = @intFromBool(is_matched) },
+                    );
+                }
+                self.sealSnapshot(pair_snap);
+                return .{ .sym_ptr = pair_snap };
+            },
+            .simd_splat => {
+                if (args.len < 1) return .{ .scalar_u64 = 0 };
+                const vec_ty = self.pool.unwrapUnderlyingType(inst.type_id);
+                const vec_node = self.pool.getNode(vec_ty);
+                const lane_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(vec_node.lhs));
+                const lane_count: u64 = vec_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+                const lane_lay = type_system.computeTypeLayoutWithPool(
+                    self.pool,
+                    self.sym_table,
+                    lane_ty,
+                    self.options.target_layout,
+                );
+                const snap = try self.allocSnapshotForType(vec_ty, false);
+                const lane_slot = self.call_stack.items[frame_idx].regs[args[0]];
+                for (0..@intCast(lane_count)) |lane_i| {
+                    const off = try self.mulOffsetChecked(lane_i, lane_lay.byte_size);
+                    try self.storeTypedSlotToMemory(
+                        try self.advanceSymbolicPtr(snap, off),
+                        lane_ty,
+                        lane_slot,
+                    );
+                }
+                self.sealSnapshot(snap);
+                return .{ .sym_ptr = snap };
+            },
+            .simd_add, .simd_sub, .simd_mul => {
+                if (args.len < 2) return .{ .scalar_u64 = 0 };
+                const vec_ty = self.pool.unwrapUnderlyingType(inst.type_id);
+                const vec_node = self.pool.getNode(vec_ty);
+                const lane_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(vec_node.lhs));
+                const lane_count: u64 = vec_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+                const lane_lay = type_system.computeTypeLayoutWithPool(
+                    self.pool,
+                    self.sym_table,
+                    lane_ty,
+                    self.options.target_layout,
+                );
+                const lhs_base = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const rhs_base = self.call_stack.items[frame_idx].regs[args[1]].sym_ptr;
+                const snap = try self.allocSnapshotForType(vec_ty, false);
+                for (0..@intCast(lane_count)) |lane_i| {
+                    const off = try self.mulOffsetChecked(lane_i, lane_lay.byte_size);
+                    const lhs_lane = try self.loadTypedSlotFromMemory(
+                        try self.advanceSymbolicPtr(lhs_base, off),
+                        lane_ty,
+                    );
+                    const rhs_lane = try self.loadTypedSlotFromMemory(
+                        try self.advanceSymbolicPtr(rhs_base, off),
+                        lane_ty,
+                    );
+                    const out_lane: RegSlot = if (lane_ty == .f32_ty) blk_f32: {
+                        const lv = unpackF32Slot(lhs_lane);
+                        const rv = unpackF32Slot(rhs_lane);
+                        const res = switch (kind) {
+                            .simd_add => lv + rv,
+                            .simd_sub => lv - rv,
+                            else => lv * rv,
+                        };
+                        break :blk_f32 packF32Slot(res);
+                    } else if (lane_ty == .f64_ty) blk_f64: {
+                        const lv = lhs_lane.scalar_f64;
+                        const rv = rhs_lane.scalar_f64;
+                        const res = switch (kind) {
+                            .simd_add => lv + rv,
+                            .simd_sub => lv - rv,
+                            else => lv * rv,
+                        };
+                        break :blk_f64 .{ .scalar_f64 = canonicalizeF64(res) };
+                    } else blk_int: {
+                        const lb = try self.readIntBitsFromSlot(lhs_lane, lane_ty);
+                        const rb = try self.readIntBitsFromSlot(rhs_lane, lane_ty);
+                        const res = switch (kind) {
+                            .simd_add => lb +% rb,
+                            .simd_sub => lb -% rb,
+                            else => lb *% rb,
+                        };
+                        break :blk_int try self.makeIntSlot(lane_ty, res);
+                    };
+                    try self.storeTypedSlotToMemory(
+                        try self.advanceSymbolicPtr(snap, off),
+                        lane_ty,
+                        out_lane,
+                    );
+                }
+                self.sealSnapshot(snap);
+                return .{ .sym_ptr = snap };
+            },
+            .simd_reduce_add => {
+                if (args.len < 1) return .{ .scalar_u64 = 0 };
+                const vec_ty = self.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[0])).type_id);
+                const vec_node = self.pool.getNode(vec_ty);
+                const lane_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(vec_node.lhs));
+                const lane_count: u64 = vec_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+                const lane_lay = type_system.computeTypeLayoutWithPool(
+                    self.pool,
+                    self.sym_table,
+                    lane_ty,
+                    self.options.target_layout,
+                );
+                const vec_base = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                if (lane_ty == .f32_ty) {
+                    var acc_f32: f32 = 0.0;
+                    for (0..@intCast(lane_count)) |lane_i| {
+                        const off = try self.mulOffsetChecked(lane_i, lane_lay.byte_size);
+                        const lane_slot = try self.loadTypedSlotFromMemory(
+                            try self.advanceSymbolicPtr(vec_base, off),
+                            lane_ty,
+                        );
+                        acc_f32 += unpackF32Slot(lane_slot);
+                    }
+                    return packF32Slot(acc_f32);
+                }
+                if (lane_ty == .f64_ty) {
+                    var acc_f64: f64 = 0.0;
+                    for (0..@intCast(lane_count)) |lane_i| {
+                        const off = try self.mulOffsetChecked(lane_i, lane_lay.byte_size);
+                        const lane_slot = try self.loadTypedSlotFromMemory(
+                            try self.advanceSymbolicPtr(vec_base, off),
+                            lane_ty,
+                        );
+                        acc_f64 += lane_slot.scalar_f64;
+                    }
+                    return .{ .scalar_f64 = canonicalizeF64(acc_f64) };
+                }
+                var acc_int: u128 = 0;
+                for (0..@intCast(lane_count)) |lane_i| {
+                    const off = try self.mulOffsetChecked(lane_i, lane_lay.byte_size);
+                    const lane_slot = try self.loadTypedSlotFromMemory(
+                        try self.advanceSymbolicPtr(vec_base, off),
+                        lane_ty,
+                    );
+                    acc_int +%= try self.readIntBitsFromSlot(lane_slot, lane_ty);
+                }
+                return self.makeIntSlot(inst.type_id, acc_int);
+            },
+            .poll_reload => return .{ .scalar_u64 = 0 },
+            .panic => {
+                if (args.len >= 1) {
+                    const msg_bytes = try self.readStrSlotBytes(self.call_stack.items[frame_idx].regs[args[0]]);
+                    defer self.allocator.free(msg_bytes);
+                    if (self.options.is_oracle_runtime_mode) {
+                        if (self.options.stderr_capture) |err_buf| {
+                            err_buf.appendSlice(self.allocator, "panic: ") catch return error.OutOfMemory;
+                            err_buf.appendSlice(self.allocator, msg_bytes) catch return error.OutOfMemory;
+                            err_buf.append(self.allocator, '\n') catch return error.OutOfMemory;
+                        }
+                    }
+                    const owned_msg = if (self.diagnostic_sink) |sink|
+                        (sink.arena.dupe(u8, msg_bytes) catch "@panic triggered")
+                    else
+                        "@panic triggered";
+                    return self.failWithTrap(
+                        error.ArithmeticTrap,
+                        .e0507_comptime_arithmetic_trap,
+                        owned_msg,
+                        "`@panic` triggered here",
+                        null,
+                    );
+                }
+                return self.failWithTrap(
+                    error.ArithmeticTrap,
+                    .e0507_comptime_arithmetic_trap,
+                    "`@panic` triggered during `comptime` evaluation",
+                    "`@panic` triggered here",
+                    null,
+                );
+            },
+            .trap => {
+                return self.failWithTrap(
+                    error.ArithmeticTrap,
+                    .e0507_comptime_arithmetic_trap,
+                    "explicit `@trap()` triggered",
+                    "`@trap` triggered here",
+                    null,
+                );
+            },
+            .sys_write => {
+                if (!self.options.is_oracle_runtime_mode) {
+                    return self.failWithTrap(
+                        error.ForbiddenOperation,
+                        .e0503_forbidden_comptime_operation,
+                        "`@sys_write` host I/O syscall is forbidden during `comptime` evaluation",
+                        "`@sys_write` is forbidden at `comptime`",
+                        null,
+                    );
+                }
+                if (args.len < 2) return self.makeIntSlot(inst.type_id, @bitCast(@as(i128, -1)));
+                const fd_ty = body.getInst(MirValueId.fromInt(args[0])).type_id;
+                const fd_bits = try self.readIntBitsFromSlot(
+                    self.call_stack.items[frame_idx].regs[args[0]],
+                    fd_ty,
+                );
+                const fd_i32: i32 = @truncate(signExtendToI128(fd_bits, 32));
+                const span_info = try self.extractWireBytesSpan(
+                    body.getInst(MirValueId.fromInt(args[1])).type_id,
+                    self.call_stack.items[frame_idx].regs[args[1]],
+                );
+                if (span_info.byte_len > self.options.mem_limit) {
+                    return self.failWithTrap(
+                        error.ResourceLimitExceeded,
+                        .e0508_comptime_resource_limit_exceeded,
+                        "`@sys_write` buffer length exceeds memory limit",
+                        "oversized `@sys_write` buffer",
+                        null,
+                    );
+                }
+                const target_capture = if (fd_i32 == 1)
+                    self.options.stdout_capture
+                else if (fd_i32 == 2)
+                    self.options.stderr_capture
+                else
+                    return self.makeIntSlot(inst.type_id, @bitCast(@as(i128, -1)));
+
+                const byte_len: usize = @intCast(span_info.byte_len);
+                if (byte_len > 0) {
+                    const tmp = self.allocator.alloc(u8, byte_len) catch return error.OutOfMemory;
+                    defer self.allocator.free(tmp);
+                    try self.readScalarBytes(span_info.data_ptr, 0, tmp);
+                    if (target_capture) |cap_buf| {
+                        cap_buf.appendSlice(self.allocator, tmp) catch return error.OutOfMemory;
+                    }
+                }
+                return self.makeIntSlot(inst.type_id, @bitCast(@as(i128, @intCast(byte_len))));
+            },
+            .sys_exit => {
+                if (!self.options.is_oracle_runtime_mode) {
+                    return self.failWithTrap(
+                        error.ForbiddenOperation,
+                        .e0503_forbidden_comptime_operation,
+                        "`@sys_exit` host process termination is forbidden during `comptime` evaluation",
+                        "`@sys_exit` is forbidden at `comptime`",
+                        null,
+                    );
+                }
+                var exit_i32: i32 = 0;
+                if (args.len >= 1) {
+                    const code_ty = body.getInst(MirValueId.fromInt(args[0])).type_id;
+                    const code_bits = try self.readIntBitsFromSlot(
+                        self.call_stack.items[frame_idx].regs[args[0]],
+                        code_ty,
+                    );
+                    exit_i32 = @truncate(signExtendToI128(code_bits, 32));
+                }
+                self.exited_with_code = exit_i32;
+                return error.ProcessExited;
             },
         }
     }
@@ -6402,9 +7217,10 @@ pub const MirVm = struct {
                             ord,
                             self.options.target_layout,
                         )) |f_info| {
-                            const f_slot = try self.loadTypedSlotFromMemory(
+                            const f_slot = try self.loadTypedSlotFromMemoryAligned(
                                 try self.advanceSymbolicPtr(val_slot.sym_ptr, f_info.byte_offset),
                                 f_info.field_ty,
+                                st_sym.contract_flags.is_packed,
                             );
                             try self.appendFormattedValue(out, f_info.field_ty, f_slot);
                         }
@@ -7231,33 +8047,84 @@ pub const MirVm = struct {
                 return true;
             },
             .optional_ty, .result_ty, .enum_ty => {
-                const sum_info = computeSumTypeTagAndPayloadLayout(
+                const sum_lay = type_system.computeSumMemoryLayout(
                     self.pool,
                     self.sym_table,
                     ty,
                     self.options.target_layout,
                 );
-                if (!try self.isContiguousByteRangeInitialized(
-                    alloc_rec,
-                    base_off,
-                    sum_info.tag_bytes,
-                    is_emitting_diag,
-                )) {
-                    return false;
-                }
                 var tag_ord: u32 = 0;
-                if (sum_info.tag_bytes > 0) {
-                    var tag_buf: [4]u8 = @splat(0);
-                    const start_idx: usize = base_off;
-                    const tag_len: usize = sum_info.tag_bytes;
-                    @memcpy(tag_buf[0..tag_len], alloc_rec.bytes[start_idx .. start_idx + tag_len]);
-                    tag_ord = std.mem.readInt(u32, &tag_buf, .little);
+                switch (sum_lay.repr) {
+                    .transparent_ok => tag_ord = 0,
+                    .niche_single => {
+                        const zst_ord: u32 = sum_lay.zst_discriminant;
+                        const pay_ord: u32 = sum_lay.payload_discriminant;
+                        const niche_off = std.math.add(u32, base_off, sum_lay.niche.byte_offset) catch {
+                            if (!is_emitting_diag) return false;
+                            return self.failWithTrap(
+                                error.OutOfBounds,
+                                .e0504_comptime_out_of_bounds,
+                                "sum niche offset overflowed `u32` during `.rodata` promotion",
+                                "out-of-bounds niche offset here",
+                                null,
+                            );
+                        };
+                        const niche_bytes: u64 = if (sum_lay.niche.kind == .zero_ptr)
+                            self.options.target_layout.ptr_byte_size
+                        else
+                            sum_lay.niche.scalar_bytes;
+                        if (!try self.isContiguousByteRangeInitialized(
+                            alloc_rec,
+                            niche_off,
+                            niche_bytes,
+                            is_emitting_diag,
+                        )) {
+                            return false;
+                        }
+                        if (sum_lay.niche.kind == .zero_ptr) {
+                            const prov_aid = findExactProvenance(alloc_rec, niche_off) orelse {
+                                if (!is_emitting_diag) return false;
+                                return self.failWithTrap(
+                                    error.ForbiddenOperation,
+                                    .e0503_forbidden_comptime_operation,
+                                    "pointer-niched sum lacks valid pointer provenance during `.rodata` promotion",
+                                    "missing pointer provenance here",
+                                    null,
+                                );
+                            };
+                            tag_ord = if (prov_aid == .null_ptr) zst_ord else pay_ord;
+                        } else {
+                            var sbuf: [8]u8 = @splat(0);
+                            const n_idx: usize = niche_off;
+                            const s_len: usize = sum_lay.niche.scalar_bytes;
+                            @memcpy(sbuf[0..s_len], alloc_rec.bytes[n_idx .. n_idx + s_len]);
+                            const raw_val = std.mem.readInt(u64, &sbuf, .little);
+                            tag_ord = if (raw_val == sum_lay.niche.invalid_first) zst_ord else pay_ord;
+                        }
+                    },
+                    .explicit_tag => {
+                        if (!try self.isContiguousByteRangeInitialized(
+                            alloc_rec,
+                            base_off,
+                            sum_lay.tag_bytes,
+                            is_emitting_diag,
+                        )) {
+                            return false;
+                        }
+                        if (sum_lay.tag_bytes > 0) {
+                            var tag_buf: [4]u8 = @splat(0);
+                            const start_idx: usize = base_off;
+                            const tag_len: usize = sum_lay.tag_bytes;
+                            @memcpy(tag_buf[0..tag_len], alloc_rec.bytes[start_idx .. start_idx + tag_len]);
+                            tag_ord = std.mem.readInt(u32, &tag_buf, .little);
+                        }
+                    },
                 }
                 const pay_ty = self.pool.unwrapUnderlyingType(
                     resolveVariantPayloadType(self.pool, self.sym_table, ty, tag_ord),
                 );
                 if (pay_ty != .unit_ty and !pay_ty.isError()) {
-                    const pay_off = std.math.add(u32, base_off, sum_info.payload_offset) catch {
+                    const pay_off = std.math.add(u32, base_off, @intCast(sum_lay.payload_offset)) catch {
                         if (!is_emitting_diag) return false;
                         return self.failWithTrap(
                             error.OutOfBounds,
@@ -7498,12 +8365,7 @@ pub const MirVm = struct {
                         ty,
                         self.options.target_layout,
                     );
-                    var tag_ord: u32 = 0;
-                    if (sum_info.tag_bytes > 0) {
-                        var tag_buf: [4]u8 = @splat(0);
-                        try self.readScalarBytes(slot.sym_ptr, 0, tag_buf[0..sum_info.tag_bytes]);
-                        tag_ord = std.mem.readInt(u32, &tag_buf, .little);
-                    }
+                    const tag_ord = try self.readSumDiscriminantAt(slot.sym_ptr, ty);
                     const pay_ty = self.pool.unwrapUnderlyingType(
                         resolveVariantPayloadType(self.pool, self.sym_table, ty, tag_ord),
                     );
@@ -7559,6 +8421,7 @@ pub const MirVm = struct {
                             elem_indices.append(self.allocator, c_idx) catch return error.OutOfMemory;
                         }
                     } else {
+                        const is_packed_agg = isPackedStructType(self.pool, self.sym_table, ty);
                         var ord: u32 = 0;
                         while (computeCompositeFieldOffsetAndType(
                             self.pool,
@@ -7568,7 +8431,7 @@ pub const MirVm = struct {
                             self.options.target_layout,
                         )) |f_info| : (ord += 1) {
                             const f_ptr = try self.advanceSymbolicPtr(slot.sym_ptr, f_info.byte_offset);
-                            const f_slot = try self.loadTypedSlotFromMemory(f_ptr, f_info.field_ty);
+                            const f_slot = try self.loadTypedSlotFromMemoryAligned(f_ptr, f_info.field_ty, is_packed_agg);
                             const f_repr = classifyValueRepr(
                                 self.pool,
                                 self.sym_table,
@@ -8098,19 +8961,19 @@ test "MirVm executes loops, inout/set mutation, >8B aggregates, memoization, and
     const res_two = try vm.evalBody(target_body, &limit_arg);
     try std.testing.expectEqual(@as(u64, 1), memo_cache.hit_count);
 
-    // Promote both results to `.rodata`: padding bytes after `tag: u8` must be deterministically zeroed
-    // and deduplicated to the exact same `ComptimeAllocId`:
+    // Promote both results to `.rodata`; native-reordered `Pair` places `total: i64` (`55`) at `0..8`,
+    // `tag: u8` (`7`) at `8`, and deterministically zeroes trailing padding bytes `9..16`:
     const blob_one = try vm.promoteResultToRodata(res_one);
     const blob_two = try vm.promoteResultToRodata(res_two);
     try std.testing.expectEqual(blob_one.asInt(), blob_two.asInt());
 
     const blob = rodata_pool.getBlob(blob_one.payloadIndex()).?;
     try std.testing.expectEqual(@as(usize, 16), blob.bytes.len);
-    try std.testing.expectEqual(@as(u8, 7), blob.bytes[0]);
-    for (blob.bytes[1..8]) |pad_byte| {
+    try std.testing.expectEqual(@as(i64, 55), std.mem.readInt(i64, blob.bytes[0..8], .little));
+    try std.testing.expectEqual(@as(u8, 7), blob.bytes[8]);
+    for (blob.bytes[9..16]) |pad_byte| {
         try std.testing.expectEqual(@as(u8, 0), pad_byte);
     }
-    try std.testing.expectEqual(@as(i64, 55), std.mem.readInt(i64, blob.bytes[8..16], .little));
 }
 
 test "MirVm TargetLayout NATIVE_64 vs WASM32 usize width and provenance traps" {
@@ -8670,7 +9533,13 @@ test "test_mir_vm_advance_symbolic_ptr_u32_overflow_loop_uaf_e0506_and_alias_imp
 test "test_mir_vm_rodata_promotion_uninit_leaf_e0505_padding_subslice_and_cycle_e0503" {
     const allocator = std.testing.allocator;
     const source =
+        \\@repr(C)
         \\pub struct PaddedPair {
+        \\    pub flag: u8,
+        \\    pub count: u64,
+        \\}
+        \\
+        \\pub struct NativePaddedPair {
         \\    pub flag: u8,
         \\    pub count: u64,
         \\}
@@ -8687,13 +9556,16 @@ test "test_mir_vm_rodata_promotion_uninit_leaf_e0505_padding_subslice_and_cycle_
     try std.testing.expect(!bundle.hir_bundle.diagnostics.hasErrors());
 
     var padded_ty: TypeId = .err_ty;
+    var native_padded_ty: TypeId = .err_ty;
     for (bundle.hir_bundle.sym_table.symbols.items) |sym_item| {
         if (sym_item.kind == .struct_sym and std.mem.eql(u8, sym_item.name_text, "PaddedPair")) {
             padded_ty = sym_item.type_id;
-            break;
+        } else if (sym_item.kind == .struct_sym and std.mem.eql(u8, sym_item.name_text, "NativePaddedPair")) {
+            native_padded_ty = sym_item.type_id;
         }
     }
     try std.testing.expect(!padded_ty.isError());
+    try std.testing.expect(!native_padded_ty.isError());
 
     var rodata_pool = RodataPool.init(allocator);
     defer rodata_pool.deinit();
@@ -8736,6 +9608,19 @@ test "test_mir_vm_rodata_promotion_uninit_leaf_e0505_padding_subslice_and_cycle_
         try std.testing.expectEqual(@as(u8, 0), pad_byte);
     }
     try std.testing.expectEqual(@as(u64, 99), std.mem.readInt(u64, pair_blob.bytes[8..16], .little));
+
+    // Companion native-reordered struct (`count: u64` at `0..8`, `flag: u8` at `8`, tail pad `9..16`):
+    const nat_alloc = try vm.allocMemory(16, 3, true, false, false, 0, Span.init(FileId.fromInt(23), 0, 0));
+    @memset(vm.allocations.items[nat_alloc.payloadIndex()].bytes[9..16], 0xCC);
+    try vm.writeScalarBytes(.{ .alloc_id = nat_alloc, .byte_offset = 0 }, 3, &count_bytes);
+    try vm.writeScalarBytes(.{ .alloc_id = nat_alloc, .byte_offset = 8 }, 0, &.{7});
+    const promoted_nat = try vm.promoteSnapshotToRodata(.{ .alloc_id = nat_alloc, .byte_offset = 0 }, native_padded_ty);
+    const nat_blob = rodata_pool.getBlob(promoted_nat.payloadIndex()).?;
+    try std.testing.expectEqual(@as(u64, 99), std.mem.readInt(u64, nat_blob.bytes[0..8], .little));
+    try std.testing.expectEqual(@as(u8, 7), nat_blob.bytes[8]);
+    for (nat_blob.bytes[9..16]) |pad_byte| {
+        try std.testing.expectEqual(@as(u8, 0), pad_byte);
+    }
 
     // [MAJOR-07] (c): `.string_lit` sub-slice promotion (`byte_offset = 2`, `[u8; 3]`) copies exact sub-slice bytes:
     const lit_sym = try bundle.hir_bundle.interner.intern("xxABCzz");

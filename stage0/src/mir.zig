@@ -28,6 +28,7 @@
 //!   (`maxInt(u32)`) is the sole sentinel for absent SSA values (`[MINOR-01]`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mem_foundation = @import("mem_foundation.zig");
 const syntax_arenas = @import("syntax_arenas.zig");
 const diagnostic = @import("diag/diagnostic.zig");
@@ -562,6 +563,40 @@ pub const MirIntrinsicKind = enum(u16) {
     abort_vacated_panic = 19,
     /// Ghost manual deallocation marker stripped in Pass `D3` (`lhs = PlaceId, rhs = region_or_none`).
     ghost_storage_free = 20,
+    /// `@atomic_load[T](ptr, ordering) -> T` (`extra_args = [ptr_val, ordering_val]`).
+    atomic_load = 21,
+    /// `@atomic_store[T](ptr, val, ordering) -> unit` (`extra_args = [ptr_val, val, ordering_val]`).
+    atomic_store = 22,
+    /// `@atomic_rmw_add[T](ptr, val, ordering) -> T` (`extra_args = [ptr_val, val, ordering_val]`).
+    atomic_rmw_add = 23,
+    /// `@atomic_rmw_sub[T](ptr, val, ordering) -> T` (`extra_args = [ptr_val, val, ordering_val]`).
+    atomic_rmw_sub = 24,
+    /// `@atomic_rmw_xchg[T](ptr, val, ordering) -> T` (`extra_args = [ptr_val, val, ordering_val]`).
+    atomic_rmw_xchg = 25,
+    /// `@atomic_cmpxchg[T](ptr, exp, des, succ, fail) -> (T, bool)` (`extra_args = [ptr, exp, des, succ, fail]`).
+    atomic_cmpxchg = 26,
+    /// `@atomic_fence(ordering) -> unit` (`extra_args = [ordering_val]`).
+    atomic_fence = 27,
+    /// `@simd_splat[V](scalar) -> V` (`extra_args = [scalar_val]`).
+    simd_splat = 28,
+    /// `@simd_add[V](lhs, rhs) -> V` (`extra_args = [lhs_val, rhs_val]`).
+    simd_add = 29,
+    /// `@simd_sub[V](lhs, rhs) -> V` (`extra_args = [lhs_val, rhs_val]`).
+    simd_sub = 30,
+    /// `@simd_mul[V](lhs, rhs) -> V` (`extra_args = [lhs_val, rhs_val]`).
+    simd_mul = 31,
+    /// `@simd_reduce_add[V](vec) -> Lane` (`extra_args = [vec_val]`).
+    simd_reduce_add = 32,
+    /// `@panic(msg) -> never` (`extra_args = [msg_val]`).
+    panic = 33,
+    /// `@trap() -> never` (`extra_args = []`).
+    trap = 34,
+    /// `@poll_reload(&mut state) -> bool` (`extra_args = [state_ref_val]`).
+    poll_reload = 35,
+    /// `@sys_write(fd, buf) -> isize` (`extra_args = [fd_val, buf_val]`).
+    sys_write = 36,
+    /// `@sys_exit(code) -> never` (`extra_args = [code_val]`).
+    sys_exit = 37,
 
     /// Returns `true` when `operands.lhs` encodes a `PlaceId` rather than `extra_args` or `TypeId`.
     pub inline fn hasPlaceInLhs(self: MirIntrinsicKind) bool {
@@ -603,6 +638,18 @@ pub const MirIntrinsicKind = enum(u16) {
             .drop_if_live,
             .abort_vacated_panic,
             .ghost_storage_free,
+            .atomic_load,
+            .atomic_store,
+            .atomic_rmw_add,
+            .atomic_rmw_sub,
+            .atomic_rmw_xchg,
+            .atomic_cmpxchg,
+            .atomic_fence,
+            .panic,
+            .trap,
+            .poll_reload,
+            .sys_write,
+            .sys_exit,
             => true,
             else => false,
         };
@@ -793,6 +840,10 @@ pub const MirCallSite = struct {
     call_borrows_start: u32 = 0,
     /// Count of call-scoped Ghost tokens to close immediately after the call returns.
     call_borrows_len: u16 = 0,
+    /// Start index in `MirBody.extra_args` of instantiated generic `TypeId` words for this call.
+    type_args_start: u32 = 0,
+    /// Count of instantiated generic `TypeId` words recorded for this call (`0` for non-generic calls).
+    type_args_len: u16 = 0,
     /// Concrete return `TypeId` received by `normal_bb`'s single formal `%ret_val` parameter.
     ret_ty: TypeId,
     /// `true` if callee is marked `@noalloc` / `contextless` or built-in pure (`V6`).
@@ -801,6 +852,34 @@ pub const MirCallSite = struct {
     is_abort_on_panic: bool = false,
     /// Source token of the call expression.
     origin_token: TokenIndex = .none,
+};
+
+/// Re-exported 1-byte `@must_vectorize` / `@vectorize_width` contract flags (`DR-20` Seam #4).
+pub const LoopContractMask = hir.LoopContractMask;
+
+/// Re-exported 8-byte SIMD loop contract descriptor (`DR-19` §1, `DR-20` Seam #4).
+pub const LoopContractMeta = hir.LoopContractMeta;
+
+/// 16-byte sparse loop-vectorization contract stored in `MirBody.loop_contracts` (`@sizeOf(MirBasicBlock) == 32`).
+pub const MirLoopContractEntry = extern struct {
+    /// Canonical loop header block ID (`4B`).
+    header_bb: MirBlockId,
+    /// Canonical loop back-edge latch block ID (`4B`).
+    latch_bb: MirBlockId,
+    /// Lowered `@must_vectorize` / `@vectorize_width(N)` contract metadata (`8B`).
+    meta: LoopContractMeta = .{},
+};
+
+/// 16-byte `$O(1)$` embedded binary blob descriptor stored in `MirConst.raw_blob` (`DR-20` `D-03`, `[CRITICAL-07]`).
+pub const RawBlobConst = extern struct {
+    /// Zero-based index into `MirBlobStore.blobs`.
+    blob_id: u32,
+    /// Log2 byte alignment of the embedded payload (`0` = 1-byte aligned).
+    align_log2: u8 = 0,
+    /// Explicit zero padding (`3B`).
+    _pad: [3]u8 = .{ 0, 0, 0 },
+    /// Exact byte length of the embedded payload.
+    byte_len: u64,
 };
 
 /// Constant scalar or aggregate literal stored in `MirBody.consts`.
@@ -819,6 +898,79 @@ pub const MirConst = union(enum) {
     str_val: SymbolId,
     /// Byte slice literal (`SymbolId` into `StringInterner`).
     bytes_val: SymbolId,
+    /// Pre-materialized `$O(1)$` `@embed_bytes` blob bypassing `StringInterner` (`DR-20` `D-03`).
+    raw_blob: RawBlobConst,
+};
+
+/// Deduplicated binary blob store populated by `materializeModuleEmbedBytes` prior to codegen (`[CRITICAL-07]`).
+pub const MirBlobStore = struct {
+    /// Backing allocator owning all allocated byte slices and hash tables.
+    allocator: std.mem.Allocator,
+    /// Contiguous owned byte slices indexed by `RawBlobConst.blob_id`.
+    blobs: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Relative path to `blob_id` deduplication map so identical `@embed_bytes` paths share one `.rodata` array.
+    path_to_blob_id: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Owned relative path keys stored in `path_to_blob_id`.
+    owned_paths: std.ArrayListUnmanaged([]u8) = .empty,
+
+    /// Initializes an empty `MirBlobStore`.
+    pub fn init(allocator: std.mem.Allocator) MirBlobStore {
+        return .{ .allocator = allocator };
+    }
+
+    /// Releases all owned blob buffers and path keys.
+    pub fn deinit(self: *MirBlobStore) void {
+        for (self.blobs.items) |buf| {
+            self.allocator.free(buf);
+        }
+        self.blobs.deinit(self.allocator);
+        for (self.owned_paths.items) |path_key| {
+            self.allocator.free(path_key);
+        }
+        self.owned_paths.deinit(self.allocator);
+        self.path_to_blob_id.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    /// Interns `bytes` under `rel_path` (or appends an anonymous blob when `rel_path.len == 0`) and returns `blob_id`.
+    pub fn internBlob(self: *MirBlobStore, rel_path: []const u8, bytes: []const u8) !u32 {
+        if (rel_path.len > 0) {
+            if (self.path_to_blob_id.get(rel_path)) |existing_id| {
+                return existing_id;
+            }
+        }
+        const blob_id: u32 = @intCast(self.blobs.items.len);
+        const duped_bytes = try self.allocator.dupe(u8, bytes);
+        errdefer self.allocator.free(duped_bytes);
+        try self.blobs.append(self.allocator, duped_bytes);
+        if (rel_path.len > 0) {
+            const duped_path = try self.allocator.dupe(u8, rel_path);
+            errdefer self.allocator.free(duped_path);
+            try self.owned_paths.append(self.allocator, duped_path);
+            try self.path_to_blob_id.put(self.allocator, duped_path, blob_id);
+        }
+        return blob_id;
+    }
+
+    /// Fetches the byte slice of `blob_id` in $O(1)$ time, or `null` if out of range.
+    pub inline fn getBytes(self: *const MirBlobStore, blob_id: u32) ?[]const u8 {
+        if (blob_id >= self.blobs.items.len) return null;
+        return self.blobs.items[blob_id];
+    }
+};
+
+/// Sandbox configuration passed to `materializeBodyEmbedBytes` and `materializeModuleEmbedBytes` (`[CRITICAL-07]`).
+pub const EmbedMaterializeOptions = struct {
+    /// Optional workspace root directory path for disk-backed `@embed_bytes`.
+    workspace_root: ?[]const u8 = null,
+    /// Optional Zig `Io` handle for disk-backed `@embed_bytes` inside `workspace_root`.
+    io: ?std.Io = null,
+    /// Optional in-memory VFS file map (`relative_path -> bytes`) checked before `workspace_root`.
+    virtual_files: ?*const std.StringHashMapUnmanaged([]const u8) = null,
+    /// Optional `CompilerDb` to record incremental file-read dependencies.
+    compiler_db: ?*query_db.CompilerDb = null,
+    /// Maximum single `@embed_bytes` file size (`64 MiB` default per `DR-20` `D-03`).
+    max_blob_bytes: u64 = MAX_EMBED_BLOB_BYTES,
 };
 
 // -------------------- Canonical `MirBody` ---------------------
@@ -907,6 +1059,8 @@ pub const MirBody = struct {
     consts: std.ArrayListUnmanaged(MirConst) = .empty,
     /// Recorded `inout` `subscript` vacated-`self` windows inspected by `mir_sast` (`DR-20` `Fix-06B`).
     vacated_windows: std.ArrayListUnmanaged(VacatedProjectionWindow) = .empty,
+    /// Sparse `@must_vectorize` / `@vectorize_width(N)` loop contracts (`@sizeOf(MirBasicBlock) == 32`).
+    loop_contracts: std.ArrayListUnmanaged(MirLoopContractEntry) = .empty,
 
     /// Initializes an empty `MirBody` with pre-strip ghost tracking active.
     pub fn init(allocator: std.mem.Allocator, file_id: FileId, def_id: DefId) MirBody {
@@ -938,6 +1092,7 @@ pub const MirBody = struct {
         self.call_arg_modes.deinit(self.allocator);
         self.consts.deinit(self.allocator);
         self.vacated_windows.deinit(self.allocator);
+        self.loop_contracts.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -980,6 +1135,7 @@ pub const MirBody = struct {
         try copy.call_arg_modes.appendSlice(allocator, self.call_arg_modes.items);
         try copy.consts.appendSlice(allocator, self.consts.items);
         try copy.vacated_windows.appendSlice(allocator, self.vacated_windows.items);
+        try copy.loop_contracts.appendSlice(allocator, self.loop_contracts.items);
         return copy;
     }
 
@@ -1217,8 +1373,11 @@ const BLOCK_SEALED_BIT: u16 = 1 << 14;
 /// Bitflag marking `is_cleanup_pad` (`bit 15`) in `MirBasicBlock.meta_bits`.
 const BLOCK_CLEANUP_PAD_BIT: u16 = 1 << 15;
 
+/// Default maximum `@embed_bytes` file size (`64 MiB`, `DR-20` `D-03`).
+pub const MAX_EMBED_BLOB_BYTES: u64 = 64 * 1024 * 1024;
+
 comptime {
-    // Enforce exact Phase 5 MIR cache-density byte-size invariants (`[CRITICAL-01]`, `[MINOR-02]`):
+    // Enforce exact Phase 5 & Phase 7 MIR cache-density byte-size invariants (`[CRITICAL-01]`, `[MINOR-02]`):
     std.debug.assert(@sizeOf(LocalFlags) == 1);
     std.debug.assert(@sizeOf(LocalDecl) == 16);
     std.debug.assert(@sizeOf(MirPlace) == 8);
@@ -1231,6 +1390,10 @@ comptime {
     std.debug.assert(@sizeOf(MirTerminator) == 12);
     std.debug.assert(@sizeOf(MirBasicBlock) == 32);
     std.debug.assert(@sizeOf(MirOutgoingEdge) == 16);
+    std.debug.assert(@sizeOf(LoopContractMask) == 1);
+    std.debug.assert(@sizeOf(LoopContractMeta) == 8);
+    std.debug.assert(@sizeOf(MirLoopContractEntry) == 16);
+    std.debug.assert(@sizeOf(RawBlobConst) == 16);
 }
 
 // -------------------------------------- INTERNALS --------------------------------------
@@ -4866,6 +5029,18 @@ const MirLowerer = struct {
         try self.body.extra_args.appendSlice(self.body.allocator, arg_words.items);
         const call_borrows_start: u32 = @intCast(self.body.extra_args.items.len);
         try self.body.extra_args.appendSlice(self.body.allocator, call_borrows.items);
+        var type_args_start: u32 = 0;
+        var type_args_len: u16 = 0;
+        if (self.hir_store.call_type_args.get(call_hir.asInt())) |ta_span| {
+            if (ta_span.len > 0 and ta_span.start + ta_span.len <= self.hir_store.extra_data.items.len) {
+                type_args_start = @intCast(self.body.extra_args.items.len);
+                type_args_len = ta_span.len;
+                try self.body.extra_args.appendSlice(
+                    self.body.allocator,
+                    self.hir_store.extra_data.items[ta_span.start .. ta_span.start + ta_span.len],
+                );
+            }
+        }
         const modes_start: u32 = @intCast(self.body.call_arg_modes.items.len);
         try self.body.call_arg_modes.appendSlice(self.body.allocator, arg_modes.items);
 
@@ -4888,6 +5063,8 @@ const MirLowerer = struct {
             .modes_start = modes_start,
             .call_borrows_start = call_borrows_start,
             .call_borrows_len = @intCast(call_borrows.items.len),
+            .type_args_start = type_args_start,
+            .type_args_len = type_args_len,
             .ret_ty = call_node.type_id,
             .is_callee_contextless = is_callee_contextless,
             .origin_token = tok,
@@ -5105,6 +5282,93 @@ const MirLowerer = struct {
                     .flags = .{ .has_side_effects = true, .is_unsafe = node.flags.is_unsafe },
                     .aux_u16 = @backingInt(MirIntrinsicKind.drop_trace),
                     .type_id = .unit_ty,
+                    .operands = .{ .lhs = args_start, .rhs = @intCast(lowered_vals.items.len) },
+                }, tok);
+            },
+            .panic, .trap, .sys_exit => {
+                const mir_kind: MirIntrinsicKind = switch (intr_kind) {
+                    .panic => .panic,
+                    .trap => .trap,
+                    .sys_exit => .sys_exit,
+                    else => unreachable,
+                };
+                const args_start: u32 = @intCast(self.body.extra_args.items.len);
+                try self.body.extra_args.appendSlice(self.body.allocator, lowered_vals.items);
+                _ = try self.ssa.emitInst(self.cur_bb, .{
+                    .op = .intrinsic_op,
+                    .flags = .{
+                        .has_side_effects = true,
+                        .has_trap_risk = intr_kind != .sys_exit,
+                        .is_unsafe = node.flags.is_unsafe,
+                    },
+                    .aux_u16 = @backingInt(mir_kind),
+                    .type_id = .never_ty,
+                    .operands = .{ .lhs = args_start, .rhs = @intCast(lowered_vals.items.len) },
+                }, tok);
+                try self.emitBorrowEndsAboveDepth(0, tok);
+                if (intr_kind == .sys_exit) {
+                    self.ssa.setTerminator(self.cur_bb, .{ .kind = .unreachable_term });
+                } else {
+                    self.ssa.setTerminator(self.cur_bb, .{
+                        .kind = .trap,
+                        .aux_u8 = @backingInt(MirTrapReason.assertion_failed),
+                    });
+                }
+                return self.ssa.emitDefaultScalarInBlock(.fromInt(0), node.type_id);
+            },
+            .atomic_load,
+            .atomic_store,
+            .atomic_rmw_add,
+            .atomic_rmw_sub,
+            .atomic_rmw_xchg,
+            .atomic_cmpxchg,
+            .atomic_fence,
+            .poll_reload,
+            .sys_write,
+            => {
+                const mir_kind: MirIntrinsicKind = switch (intr_kind) {
+                    .atomic_load => .atomic_load,
+                    .atomic_store => .atomic_store,
+                    .atomic_rmw_add => .atomic_rmw_add,
+                    .atomic_rmw_sub => .atomic_rmw_sub,
+                    .atomic_rmw_xchg => .atomic_rmw_xchg,
+                    .atomic_cmpxchg => .atomic_cmpxchg,
+                    .atomic_fence => .atomic_fence,
+                    .poll_reload => .poll_reload,
+                    .sys_write => .sys_write,
+                    else => unreachable,
+                };
+                const args_start: u32 = @intCast(self.body.extra_args.items.len);
+                try self.body.extra_args.appendSlice(self.body.allocator, lowered_vals.items);
+                return self.ssa.emitInst(self.cur_bb, .{
+                    .op = .intrinsic_op,
+                    .flags = .{ .has_side_effects = true, .is_unsafe = node.flags.is_unsafe },
+                    .aux_u16 = @backingInt(mir_kind),
+                    .type_id = node.type_id,
+                    .operands = .{ .lhs = args_start, .rhs = @intCast(lowered_vals.items.len) },
+                }, tok);
+            },
+            .simd_splat,
+            .simd_add,
+            .simd_sub,
+            .simd_mul,
+            .simd_reduce_add,
+            => {
+                const mir_kind: MirIntrinsicKind = switch (intr_kind) {
+                    .simd_splat => .simd_splat,
+                    .simd_add => .simd_add,
+                    .simd_sub => .simd_sub,
+                    .simd_mul => .simd_mul,
+                    .simd_reduce_add => .simd_reduce_add,
+                    else => unreachable,
+                };
+                const args_start: u32 = @intCast(self.body.extra_args.items.len);
+                try self.body.extra_args.appendSlice(self.body.allocator, lowered_vals.items);
+                return self.ssa.emitInst(self.cur_bb, .{
+                    .op = .intrinsic_op,
+                    .flags = .{ .is_unsafe = node.flags.is_unsafe },
+                    .aux_u16 = @backingInt(mir_kind),
+                    .type_id = node.type_id,
                     .operands = .{ .lhs = args_start, .rhs = @intCast(lowered_vals.items.len) },
                 }, tok);
             },
@@ -5421,11 +5685,26 @@ const MirLowerer = struct {
         self.cur_bb = header_bb;
         const iter_borrow_base = self.active_expr_borrows.items.len;
         _ = try self.lowerRValue(body_hir);
+        var latch_bb = header_bb;
         if (!self.cur_bb.isNone() and !self.ssa.isBlockTerminated(self.cur_bb)) {
+            latch_bb = self.cur_bb;
             try self.popAndCloseBorrowsTo(iter_borrow_base, tok);
             try self.emitBr(header_bb, &.{});
         } else {
             self.active_expr_borrows.items.len = iter_borrow_base;
+            const preds = self.ssa.blocks_scratch.items[header_bb.asInt()].preds.items;
+            if (preds.len > 1) {
+                const last_edge_id = preds[preds.len - 1];
+                latch_bb = self.body.extra_edges.items[last_edge_id.asInt()].src_bb;
+            }
+        }
+
+        if (self.hir_store.loop_contracts.get(loop_id)) |contract_meta| {
+            try self.body.loop_contracts.append(self.body.allocator, .{
+                .header_bb = header_bb,
+                .latch_bb = latch_bb,
+                .meta = contract_meta,
+            });
         }
 
         _ = self.loop_stack.pop();
@@ -7137,13 +7416,69 @@ const MirLowerer = struct {
 
     // ------------- Top-Level Function Lowering Driver -------------
 
+    /// Appends `hir_slot` (or a fallback placeholder) to `self.body.locals`, optionally recording `hir_local_remap`.
+    fn appendHirSlotAsMirLocal(
+        self: *MirLowerer,
+        hir_slot: u32,
+        is_ret: bool,
+        is_arg: bool,
+        fallback_ty: TypeId,
+        is_recording_remap: bool,
+    ) !void {
+        const mir_slot: u32 = @intCast(self.body.locals.items.len);
+        if (hir_slot < self.hir_store.locals.items.len) {
+            const h_loc = self.hir_store.locals.items[hir_slot];
+            try self.body.locals.append(
+                self.body.allocator,
+                LocalDecl.init(
+                    h_loc.name,
+                    h_loc.type_id,
+                    .none,
+                    0,
+                    if (is_ret) .set_mode else h_loc.mode,
+                    .{
+                        .is_mut = is_ret or h_loc.is_mut or h_loc.mode == .inout_mode or h_loc.mode == .set_mode,
+                        .is_arg = is_arg,
+                        .is_synthetic_temp = h_loc.is_temp,
+                        .is_address_taken = is_ret,
+                        .is_return_slot = is_ret,
+                    },
+                ),
+            );
+            try self.body.local_scope_depths.append(
+                self.body.allocator,
+                if (is_ret or is_arg) 0 else 1,
+            );
+            try self.local_var_types.append(self.allocator, h_loc.type_id);
+        } else {
+            try self.body.locals.append(
+                self.body.allocator,
+                LocalDecl.init(.empty, fallback_ty, .none, 0, if (is_ret) .set_mode else .let_mode, .{
+                    .is_mut = is_ret,
+                    .is_arg = is_arg,
+                    .is_synthetic_temp = true,
+                    .is_address_taken = is_ret,
+                    .is_return_slot = is_ret,
+                }),
+            );
+            try self.body.local_scope_depths.append(
+                self.body.allocator,
+                if (is_ret or is_arg) 0 else 1,
+            );
+            try self.local_var_types.append(self.allocator, fallback_ty);
+        }
+        if (is_recording_remap) {
+            try self.hir_local_remap.put(self.allocator, hir_slot, LocalId.fromInt(mir_slot));
+        }
+    }
+
     /// Lowers a single `HirFnMeta` into `self.body` and finalizes SSA via `self.ssa.finish()`.
     fn lowerFunction(self: *MirLowerer, fn_meta: HirFnMeta) !void {
         self.body.def_id = fn_meta.def_id;
         self.body.symbol_index = fn_meta.symbol_index;
         self.body.name = fn_meta.name;
         self.body.ret_ty = fn_meta.ret_ty;
-        self.body.param_count = fn_meta.param_len;
+        self.body.param_count = fn_meta.capture_len + fn_meta.param_len;
         self.body.target_layout = self.hir_store.target_layout;
         self.body.is_contextless = fn_meta.is_contextless;
 
@@ -7151,57 +7486,35 @@ const MirLowerer = struct {
         self.root_local_len = if (fn_meta.total_local_len > 0)
             fn_meta.total_local_len
         else
-            1 + fn_meta.param_len;
+            1 + fn_meta.capture_len + fn_meta.param_len;
 
-        // [1] Populate `locals` (`_0` return slot + formal parameters + body locals) & `PlaceId(0)`:
+        // [1] Populate `locals` (`_0` return slot + formal captures + formal parameters + body locals) & `PlaceId(0)`:
         try self.body.locals.ensureTotalCapacity(self.body.allocator, self.root_local_len);
         try self.body.local_scope_depths.ensureTotalCapacity(self.body.allocator, self.root_local_len);
         try self.local_var_types.ensureTotalCapacity(self.allocator, self.root_local_len);
 
-        for (0..self.root_local_len) |offset| {
-            const hir_slot = self.base_hir_local + @as(u32, @intCast(offset));
-            if (hir_slot < self.hir_store.locals.items.len) {
-                const h_loc = self.hir_store.locals.items[hir_slot];
+        if (fn_meta.capture_len > 0) {
+            try self.appendHirSlotAsMirLocal(self.base_hir_local, true, false, fn_meta.ret_ty, true);
+            for (0..fn_meta.capture_len) |cap_i| {
+                const inner_hir_slot = self.hir_store.extra_data.items[fn_meta.capture_extra_start + cap_i * 2 + 1];
+                try self.appendHirSlotAsMirLocal(inner_hir_slot, false, true, .unit_ty, true);
+            }
+            for (0..fn_meta.param_len) |param_i| {
+                const param_hir_slot = fn_meta.param_local_start + @as(u32, @intCast(param_i));
+                try self.appendHirSlotAsMirLocal(param_hir_slot, false, true, .unit_ty, true);
+            }
+            for (1..self.root_local_len) |offset| {
+                const hir_slot = self.base_hir_local + @as(u32, @intCast(offset));
+                if (self.hir_local_remap.contains(hir_slot)) continue;
+                try self.appendHirSlotAsMirLocal(hir_slot, false, false, .unit_ty, true);
+            }
+        } else {
+            for (0..self.root_local_len) |offset| {
+                const hir_slot = self.base_hir_local + @as(u32, @intCast(offset));
                 const is_ret = offset == 0;
-                const is_arg = offset >= 1 and (offset <= fn_meta.param_len or h_loc.is_param);
-                try self.body.locals.append(
-                    self.body.allocator,
-                    LocalDecl.init(
-                        h_loc.name,
-                        h_loc.type_id,
-                        .none,
-                        0,
-                        if (is_ret) .set_mode else h_loc.mode,
-                        .{
-                            .is_mut = is_ret or h_loc.is_mut or h_loc.mode == .inout_mode or h_loc.mode == .set_mode,
-                            .is_arg = is_arg,
-                            .is_synthetic_temp = h_loc.is_temp,
-                            .is_address_taken = is_ret,
-                            .is_return_slot = is_ret,
-                        },
-                    ),
-                );
-                try self.body.local_scope_depths.append(
-                    self.body.allocator,
-                    if (is_ret or is_arg) 0 else 1,
-                );
-                try self.local_var_types.append(self.allocator, h_loc.type_id);
-            } else {
-                const slot_ty = if (offset == 0) fn_meta.ret_ty else TypeId.unit_ty;
-                try self.body.locals.append(
-                    self.body.allocator,
-                    LocalDecl.init(.empty, slot_ty, .none, 0, .let_mode, .{
-                        .is_mut = offset == 0,
-                        .is_synthetic_temp = true,
-                        .is_address_taken = offset == 0,
-                        .is_return_slot = offset == 0,
-                    }),
-                );
-                try self.body.local_scope_depths.append(
-                    self.body.allocator,
-                    if (offset == 0) 0 else 1,
-                );
-                try self.local_var_types.append(self.allocator, slot_ty);
+                const is_arg = offset >= 1 and offset <= fn_meta.param_len;
+                const fb_ty = if (is_ret) fn_meta.ret_ty else TypeId.unit_ty;
+                try self.appendHirSlotAsMirLocal(hir_slot, is_ret, is_arg, fb_ty, false);
             }
         }
         self.ssa.var_types = self.local_var_types.items;
@@ -9303,6 +9616,455 @@ fn appendRenderedPlace(
             .slice_len => try out.appendSlice(allocator, ".len"),
         }
     }
+}
+
+/// Returns `true` if `stem` matches a reserved Windows DOS device name (`CON`, `PRN`, `AUX`, `NUL`,
+/// `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive, `DR-20` `Fix-17` Gate D).
+fn isReservedWindowsEmbedStem(stem: []const u8) bool {
+    if (stem.len == 3) {
+        return std.ascii.eqlIgnoreCase(stem, "CON") or
+            std.ascii.eqlIgnoreCase(stem, "PRN") or
+            std.ascii.eqlIgnoreCase(stem, "AUX") or
+            std.ascii.eqlIgnoreCase(stem, "NUL");
+    }
+    if (stem.len == 4 and stem[3] >= '1' and stem[3] <= '9') {
+        return std.ascii.eqlIgnoreCase(stem[0..3], "COM") or
+            std.ascii.eqlIgnoreCase(stem[0..3], "LPT");
+    }
+    return false;
+}
+
+/// Validates a relative `@embed_bytes(path)` string, rejecting empty paths, absolute paths, Windows
+/// drive prefixes, NUL bytes, `.` or `..` segments, empty segments, and reserved Windows device stems (`E0326`).
+pub fn isValidSandboxedEmbedPath(rel_path: []const u8) bool {
+    if (rel_path.len == 0) return false;
+    if (rel_path[0] == '/' or rel_path[0] == '\\') return false;
+    if (std.fs.path.isAbsolute(rel_path)) return false;
+    for (rel_path) |byte_val| {
+        if (byte_val == 0 or byte_val == ':') return false;
+    }
+
+    var start_pos: usize = 0;
+    var idx: usize = 0;
+    while (idx <= rel_path.len) : (idx += 1) {
+        const is_sep = idx == rel_path.len or rel_path[idx] == '/' or rel_path[idx] == '\\';
+        if (is_sep) {
+            const segment = rel_path[start_pos..idx];
+            if (segment.len == 0) return false;
+            if (std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return false;
+            const trimmed_seg = std.mem.trimEnd(u8, segment, " .");
+            if (trimmed_seg.len == 0) return false;
+            const dot_pos = std.mem.indexOfScalar(u8, trimmed_seg, '.') orelse trimmed_seg.len;
+            const stem = std.mem.trimEnd(u8, trimmed_seg[0..dot_pos], " ");
+            if (isReservedWindowsEmbedStem(stem)) return false;
+            start_pos = idx + 1;
+        }
+    }
+    return true;
+}
+
+/// Returns `true` if canonical file path `canon_target` is strictly nested inside canonical directory
+/// `canon_root` on a path-component boundary.
+pub fn isCanonicalPathWithinRoot(canon_root: []const u8, canon_target: []const u8) bool {
+    if (canon_root.len == 0 or canon_target.len == 0) return false;
+    const root_trimmed = std.mem.trimEnd(u8, canon_root, "/\\");
+    if (canon_target.len <= root_trimmed.len) return false;
+
+    for (0..root_trimmed.len) |idx| {
+        const root_byte = root_trimmed[idx];
+        const target_byte = canon_target[idx];
+        const is_root_sep = root_byte == '/' or root_byte == '\\';
+        const is_target_sep = target_byte == '/' or target_byte == '\\';
+        if (is_root_sep and is_target_sep) continue;
+        if (builtin.os.tag == .windows) {
+            if (std.ascii.toLower(root_byte) != std.ascii.toLower(target_byte)) return false;
+        } else {
+            if (root_byte != target_byte) return false;
+        }
+    }
+
+    const boundary_byte = canon_target[root_trimmed.len];
+    return boundary_byte == '/' or boundary_byte == '\\';
+}
+
+/// Returns `true` if the suffix of `canon_target` beneath `canon_root` matches `rel_path` segment-for-segment
+/// without traversing any intermediate symlink or NTFS junction/reparse point (`DR-20` `Fix-17` Gate D).
+pub fn isDirectCanonicalSubpath(canon_root: []const u8, canon_target: []const u8, rel_path: []const u8) bool {
+    if (!isCanonicalPathWithinRoot(canon_root, canon_target)) return false;
+    const root_trimmed = std.mem.trimEnd(u8, canon_root, "/\\");
+    const target_rel = canon_target[root_trimmed.len + 1 ..];
+    if (target_rel.len != rel_path.len) return false;
+    for (0..rel_path.len) |i| {
+        const lhs_byte = target_rel[i];
+        const rhs_byte = rel_path[i];
+        const is_lhs_sep = lhs_byte == '/' or lhs_byte == '\\';
+        const is_rhs_sep = rhs_byte == '/' or rhs_byte == '\\';
+        if (is_lhs_sep and is_rhs_sep) continue;
+        if (builtin.os.tag == .windows) {
+            if (std.ascii.toLower(lhs_byte) != std.ascii.toLower(rhs_byte)) return false;
+        } else {
+            if (lhs_byte != rhs_byte) return false;
+        }
+    }
+    return true;
+}
+
+/// Emits a diagnostic at `tok` in `body.file_id` when `diagnostic_sink` is present.
+fn emitEmbedDiagnostic(
+    diagnostic_sink: ?*DiagnosticSink,
+    file_id: FileId,
+    tokens: ?*const TokenBuffer,
+    tok: TokenIndex,
+    code: DiagnosticCode,
+    message: []const u8,
+    label_msg: []const u8,
+) !void {
+    const sink = diagnostic_sink orelse return;
+    const span = if (tokens) |tbuf|
+        (if (!tok.isNone() and tok.asInt() < tbuf.countTokens())
+            tbuf.getTokenSpan(file_id, tok)
+        else
+            Span.init(file_id, 0, 0))
+    else
+        Span.init(file_id, 0, 0);
+    try sink.emit(.{
+        .code = code,
+        .severity = .err,
+        .primary_span = span,
+        .message = message,
+        .labels = &[_]LabeledSpan{.{
+            .span = span,
+            .label = label_msg,
+            .style = .primary,
+        }},
+    });
+}
+
+/// Resolves reachable constant-path `@embed_bytes` calls in `body` into `blob_store` and rewrites them in-place
+/// to `MirOp.const_scalar` (`MirConst.raw_blob`), keeping `MirLowerer` pure/I/O-free (`[CRITICAL-07]`).
+pub fn materializeBodyEmbedBytes(
+    body: *MirBody,
+    interner: *const StringInterner,
+    tokens: ?*const TokenBuffer,
+    blob_store: *MirBlobStore,
+    options: EmbedMaterializeOptions,
+    diagnostic_sink: ?*DiagnosticSink,
+) !bool {
+    if (body.blocks.items.len == 0) return true;
+    const allocator = blob_store.allocator;
+
+    // [1] Compute block reachability from `^bb0` so unreachable dead branches are skipped:
+    var is_reachable = try allocator.alloc(bool, body.blocks.items.len);
+    defer allocator.free(is_reachable);
+    @memset(is_reachable, false);
+    var worklist: std.ArrayListUnmanaged(u32) = .empty;
+    defer worklist.deinit(allocator);
+    is_reachable[0] = true;
+    try worklist.append(allocator, 0);
+    while (worklist.items.len > 0) {
+        const cur_idx = worklist.pop().?;
+        for (body.getOutgoingEdges(MirBlockId.fromInt(cur_idx))) |edge| {
+            const tgt = edge.target_bb.asInt();
+            if (tgt < is_reachable.len and !is_reachable[tgt]) {
+                is_reachable[tgt] = true;
+                try worklist.append(allocator, tgt);
+            }
+        }
+    }
+
+    // [2] Materialize constant-path `.embed_bytes` in reachable blocks:
+    var is_all_ok = true;
+    for (0..body.blocks.items.len) |bb_idx| {
+        if (!is_reachable[bb_idx]) continue;
+        for (body.getBlockInsts(MirBlockId.fromInt(@intCast(bb_idx)))) |inst_val| {
+            const inst = body.getInst(inst_val);
+            if (inst.op != .intrinsic_op) continue;
+            if (@as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)) != .embed_bytes) continue;
+            if (inst.operands.rhs == 0 or inst.operands.lhs + inst.operands.rhs > body.extra_args.items.len) {
+                continue;
+            }
+            var cur_val = body.extra_args.items[inst.operands.lhs];
+            var hop_budget: u32 = 32;
+            while (hop_budget > 0 and cur_val < body.insts.len) : (hop_budget -= 1) {
+                const def_inst = body.insts.get(cur_val);
+                if (def_inst.op == .copy_val) {
+                    cur_val = def_inst.operands.lhs;
+                } else {
+                    break;
+                }
+            }
+            if (cur_val >= body.insts.len) continue;
+            const path_inst = body.insts.get(cur_val);
+            if (path_inst.op != .const_scalar or path_inst.operands.lhs >= body.consts.items.len) continue;
+            const path_const = body.consts.items[path_inst.operands.lhs];
+            if (path_const != .str_val) continue;
+
+            const rel_path = interner.get(path_const.str_val);
+            const tok = if (inst_val.asInt() < body.origin_tokens.items.len)
+                body.origin_tokens.items[inst_val.asInt()]
+            else
+                TokenIndex.none;
+
+            if (!isValidSandboxedEmbedPath(rel_path)) {
+                try emitEmbedDiagnostic(
+                    diagnostic_sink,
+                    body.file_id,
+                    tokens,
+                    tok,
+                    .e0326_embed_path_escape,
+                    "`@embed_bytes` path must be a relative package path without `.`, `..`, drive prefixes, or device names",
+                    "`@embed_bytes` path escapes package sandbox here",
+                );
+                is_all_ok = false;
+                continue;
+            }
+
+            var loaded_bytes: ?[]const u8 = null;
+            var owned_disk_buf: ?[]u8 = null;
+            defer if (owned_disk_buf) |buf| allocator.free(buf);
+
+            if (options.virtual_files) |vfs_map| {
+                if (vfs_map.get(rel_path)) |vfs_bytes| {
+                    if (vfs_bytes.len > options.max_blob_bytes) {
+                        try emitEmbedDiagnostic(
+                            diagnostic_sink,
+                            body.file_id,
+                            tokens,
+                            tok,
+                            .e0508_comptime_resource_limit_exceeded,
+                            "`@embed_bytes` target file exceeds compile-time memory budget",
+                            "oversized `@embed_bytes` file",
+                        );
+                        is_all_ok = false;
+                        continue;
+                    }
+                    loaded_bytes = vfs_bytes;
+                }
+            }
+
+            if (loaded_bytes == null) {
+                if (options.workspace_root) |ws_root| {
+                    if (options.io) |io_handle| {
+                        const canon_ws = std.Io.Dir.cwd().realPathFileAlloc(
+                            io_handle,
+                            ws_root,
+                            allocator,
+                        ) catch {
+                            try emitEmbedDiagnostic(
+                                diagnostic_sink,
+                                body.file_id,
+                                tokens,
+                                tok,
+                                .e0503_forbidden_comptime_operation,
+                                "`@embed_bytes` workspace root could not be canonicalized",
+                                "invalid workspace sandbox root",
+                            );
+                            is_all_ok = false;
+                            continue;
+                        };
+                        defer allocator.free(canon_ws);
+
+                        const full_path = try std.fs.path.join(allocator, &.{ canon_ws, rel_path });
+                        defer allocator.free(full_path);
+
+                        const opened_file = std.Io.Dir.cwd().openFile(io_handle, full_path, .{
+                            .mode = .read_only,
+                            .allow_directory = false,
+                            .follow_symlinks = false,
+                        }) catch |open_err| {
+                            switch (open_err) {
+                                error.SymLinkLoop, error.IsDir, error.NotDir => {
+                                    try emitEmbedDiagnostic(
+                                        diagnostic_sink,
+                                        body.file_id,
+                                        tokens,
+                                        tok,
+                                        .e0326_embed_path_escape,
+                                        "`@embed_bytes` target cannot be a symlink, reparse point, or directory",
+                                        "`@embed_bytes` symlink or non-regular target blocked here",
+                                    );
+                                },
+                                else => {
+                                    try emitEmbedDiagnostic(
+                                        diagnostic_sink,
+                                        body.file_id,
+                                        tokens,
+                                        tok,
+                                        .e0503_forbidden_comptime_operation,
+                                        "`@embed_bytes` target file could not be opened inside workspace sandbox",
+                                        "unreadable `@embed_bytes` file",
+                                    );
+                                },
+                            }
+                            is_all_ok = false;
+                            continue;
+                        };
+                        defer opened_file.close(io_handle);
+
+                        const file_stat = opened_file.stat(io_handle) catch {
+                            try emitEmbedDiagnostic(
+                                diagnostic_sink,
+                                body.file_id,
+                                tokens,
+                                tok,
+                                .e0503_forbidden_comptime_operation,
+                                "`@embed_bytes` target file metadata could not be queried",
+                                "unreadable `@embed_bytes` file",
+                            );
+                            is_all_ok = false;
+                            continue;
+                        };
+                        if (file_stat.kind != .file) {
+                            try emitEmbedDiagnostic(
+                                diagnostic_sink,
+                                body.file_id,
+                                tokens,
+                                tok,
+                                .e0326_embed_path_escape,
+                                "`@embed_bytes` target must be a regular file inside the package sandbox",
+                                "non-regular `@embed_bytes` target blocked here",
+                            );
+                            is_all_ok = false;
+                            continue;
+                        }
+                        const canon_target = std.Io.Dir.cwd().realPathFileAlloc(
+                            io_handle,
+                            full_path,
+                            allocator,
+                        ) catch {
+                            try emitEmbedDiagnostic(
+                                diagnostic_sink,
+                                body.file_id,
+                                tokens,
+                                tok,
+                                .e0326_embed_path_escape,
+                                "`@embed_bytes` target path could not be canonicalized inside package sandbox",
+                                "`@embed_bytes` sandbox violation here",
+                            );
+                            is_all_ok = false;
+                            continue;
+                        };
+                        defer allocator.free(canon_target);
+
+                        if (!isDirectCanonicalSubpath(canon_ws, canon_target, rel_path)) {
+                            try emitEmbedDiagnostic(
+                                diagnostic_sink,
+                                body.file_id,
+                                tokens,
+                                tok,
+                                .e0326_embed_path_escape,
+                                "`@embed_bytes` target resolved outside package sandbox or traversed a symlink/junction",
+                                "sandbox escape blocked here",
+                            );
+                            is_all_ok = false;
+                            continue;
+                        }
+                        if (file_stat.size > options.max_blob_bytes) {
+                            try emitEmbedDiagnostic(
+                                diagnostic_sink,
+                                body.file_id,
+                                tokens,
+                                tok,
+                                .e0508_comptime_resource_limit_exceeded,
+                                "`@embed_bytes` target file exceeds compile-time memory budget",
+                                "oversized `@embed_bytes` file",
+                            );
+                            is_all_ok = false;
+                            continue;
+                        }
+
+                        const expected_size: usize = @intCast(file_stat.size);
+                        const file_bytes = try allocator.alloc(u8, expected_size);
+                        errdefer allocator.free(file_bytes);
+                        const actual_read = opened_file.readPositionalAll(io_handle, file_bytes, 0) catch {
+                            allocator.free(file_bytes);
+                            try emitEmbedDiagnostic(
+                                diagnostic_sink,
+                                body.file_id,
+                                tokens,
+                                tok,
+                                .e0503_forbidden_comptime_operation,
+                                "`@embed_bytes` target file could not be read from verified descriptor",
+                                "unreadable `@embed_bytes` file",
+                            );
+                            is_all_ok = false;
+                            continue;
+                        };
+                        if (actual_read != expected_size) {
+                            allocator.free(file_bytes);
+                            try emitEmbedDiagnostic(
+                                diagnostic_sink,
+                                body.file_id,
+                                tokens,
+                                tok,
+                                .e0503_forbidden_comptime_operation,
+                                "`@embed_bytes` target file changed size concurrently during read",
+                                "truncated `@embed_bytes` file",
+                            );
+                            is_all_ok = false;
+                            continue;
+                        }
+                        owned_disk_buf = file_bytes;
+                        loaded_bytes = file_bytes;
+                    }
+                }
+            }
+
+            const raw_bytes = loaded_bytes orelse {
+                try emitEmbedDiagnostic(
+                    diagnostic_sink,
+                    body.file_id,
+                    tokens,
+                    tok,
+                    .e0503_forbidden_comptime_operation,
+                    "`@embed_bytes` requires an active workspace root or virtual file mapping",
+                    "unavailable `@embed_bytes` file",
+                );
+                is_all_ok = false;
+                continue;
+            };
+
+            if (options.compiler_db) |db| {
+                _ = try db.recordEmbedSandboxDependency();
+                _ = try db.recordEmbeddedFileRead(rel_path, raw_bytes);
+            }
+
+            const blob_id = try blob_store.internBlob(rel_path, raw_bytes);
+            const const_idx = try body.appendConst(.{
+                .raw_blob = .{
+                    .blob_id = blob_id,
+                    .align_log2 = 0,
+                    .byte_len = raw_bytes.len,
+                },
+            });
+            body.insts.set(inst_val.asInt(), .{
+                .op = .const_scalar,
+                .flags = .{},
+                .aux_u16 = 0,
+                .type_id = inst.type_id,
+                .operands = .{ .lhs = const_idx, .rhs = 0 },
+            });
+        }
+    }
+    return is_all_ok;
+}
+
+/// Materializes reachable `@embed_bytes` constants across all `bodies` in a module prior to codegen (`[CRITICAL-07]`).
+pub fn materializeModuleEmbedBytes(
+    bodies: []MirBody,
+    interner: *const StringInterner,
+    tokens: ?*const TokenBuffer,
+    blob_store: *MirBlobStore,
+    options: EmbedMaterializeOptions,
+    diagnostic_sink: ?*DiagnosticSink,
+) !bool {
+    var is_all_ok = true;
+    for (bodies) |*body| {
+        if (!(try materializeBodyEmbedBytes(body, interner, tokens, blob_store, options, diagnostic_sink))) {
+            is_all_ok = false;
+        }
+    }
+    return is_all_ok;
 }
 
 // ---------------------------------------- MAIN -----------------------------------------

@@ -154,142 +154,148 @@ pub const DiagnosticCode = enum(u16) {
     e0004_source_file_io_error = 3,
     /// Source file exceeds the 64 MiB maximum size cap (`E0005`).
     e0005_source_file_size_exceeded = 4,
+    /// Invalid or unsupported compilation `--target` triple (`E0006`).
+    e0006_invalid_target_triple = 5,
+    /// Backend code generation or IR lowering failure (`E0007`).
+    e0007_codegen_backend_failure = 6,
+    /// External compiler driver or linker invocation failure (`E0008`).
+    e0008_linker_invocation_failed = 7,
 
     // E01xx; Lexical Scanning, UTF-8 & Literal Rules:
     /// Invalid UTF-8 byte sequence in source file (`E0101`).
-    e0101_invalid_utf8_sequence = 5,
+    e0101_invalid_utf8_sequence = 8,
     /// Unterminated string or character literal (`E0102`).
-    e0102_unterminated_string_literal = 6,
+    e0102_unterminated_string_literal = 9,
     /// Malformed numeric literal or invalid digit separator (`E0103`).
-    e0103_invalid_numeric_literal = 7,
+    e0103_invalid_numeric_literal = 10,
     /// File token count exceeds `MAX_TOKENS_PER_FILE` (`E0104`).
-    e0104_token_limit_exceeded = 8,
+    e0104_token_limit_exceeded = 11,
 
     // E02xx; Syntax Parsing, Recovery & Casing:
     /// Unexpected token in grammar production (`E0201`).
-    e0201_unexpected_token = 9,
+    e0201_unexpected_token = 12,
     /// Unclosed block, group, or generic delimiter (`E0202`).
-    e0202_unclosed_delimiter = 10,
+    e0202_unclosed_delimiter = 13,
     /// Parser recursion depth exceeded `MAX_PARSE_DEPTH` (`E0203`).
-    e0203_parse_depth_exceeded = 11,
+    e0203_parse_depth_exceeded = 14,
 
     // E03xx; MIR SAST Memory, Ownership, Capabilities & Exclusivity:
     /// Use of deallocated or freed value (`E0301`).
-    e0301_use_after_free = 12,
+    e0301_use_after_free = 15,
     /// Use of moved value after ownership transfer (`E0302`).
-    e0302_use_after_move = 13,
+    e0302_use_after_move = 16,
     /// Read of possibly uninitialized memory or binding (`E0303`).
-    e0303_uninitialized_memory_read = 14,
+    e0303_uninitialized_memory_read = 17,
     /// Unconsumed `@linear` resource or memory leak (`E0304`).
-    e0304_resource_or_memory_leak = 15,
+    e0304_resource_or_memory_leak = 18,
     /// Mutable aliasing or MVS loan exclusivity violation (`E0305`).
-    e0305_exclusivity_violation = 16,
+    e0305_exclusivity_violation = 19,
     /// Value escapes lexical arena or stack region (`E0306`).
-    e0306_region_escape_violation = 17,
+    e0306_region_escape_violation = 20,
     /// Compile-time proven out-of-bounds buffer access (`E0307`).
-    e0307_static_buffer_overflow = 18,
+    e0307_static_buffer_overflow = 21,
     /// Double free or duplicate `@linear` resource consumption (`E0313`).
-    e0313_double_free_or_close = 19,
+    e0313_double_free_or_close = 22,
     /// `FromBytes` / `IntoBytes` wire layout contract violation (`E0315`).
-    e0315_wire_layout_contract_violation = 20,
+    e0315_wire_layout_contract_violation = 23,
     /// Worst-case call stack exceeds `@max_stack` budget (`E0316`).
-    e0316_max_stack_budget_exceeded = 21,
+    e0316_max_stack_budget_exceeded = 24,
     /// `@no_alloc` contract violated by heap allocation (`E0320`).
-    e0320_no_alloc_contract_violation = 22,
+    e0320_no_alloc_contract_violation = 25,
     /// `@no_panic` contract violated by residual trap path (`E0321`).
-    e0321_no_panic_contract_violation = 23,
+    e0321_no_panic_contract_violation = 26,
     /// `@no_block` contract violated by blocking operation (`E0322`).
-    e0322_no_block_contract_violation = 24,
+    e0322_no_block_contract_violation = 27,
     /// Trait `impl` method escalates signature contract (`E0323`).
-    e0323_trait_impl_effect_escalation = 25,
+    e0323_trait_impl_effect_escalation = 28,
     /// Package exceeds authorized capability policy (`E0324`).
-    e0324_package_capability_violation = 26,
+    e0324_package_capability_violation = 29,
     /// Forbidden capability in hermetic `comptime` context (`E0325`).
-    e0325_comptime_sandbox_violation = 27,
+    e0325_comptime_sandbox_violation = 30,
     /// `@embed_bytes` path escapes package sandbox root (`E0326`).
-    e0326_embed_path_escape = 28,
+    e0326_embed_path_escape = 31,
     /// Forbidden linker section or sandbox bypass attribute (`E0327`).
-    e0327_forbidden_sandbox_bypass_attribute = 29,
+    e0327_forbidden_sandbox_bypass_attribute = 32,
     /// Scratch arena rewind aliases caller output arena (`E0328`).
-    e0328_scratch_arena_ping_pong_conflict = 30,
+    e0328_scratch_arena_ping_pong_conflict = 33,
 
     // E04xx; Type System, Inference, Traits, Bounds & Error Semantics:
     /// Ambiguous overload call in explicit overload group (`E0400`).
-    e0400_ambiguous_overload = 31,
+    e0400_ambiguous_overload = 34,
     /// Mismatched types between expected and found expressions (`E0401`).
-    e0401_type_mismatch = 32,
+    e0401_type_mismatch = 35,
     /// Type does not satisfy constrained trait or type group bound (`E0402`).
-    e0402_unsatisfied_trait_bound = 33,
+    e0402_unsatisfied_trait_bound = 36,
     /// Unresolved identifier or symbol in scope (`E0403`).
-    e0403_unresolved_symbol = 34,
+    e0403_unresolved_symbol = 37,
     /// Conflicting concrete types for a Bind-Once Constrained Type Group (`E0404`).
-    e0404_bind_once_group_conflict = 35,
+    e0404_bind_once_group_conflict = 38,
     /// Distinct nominal type mixed with underlying representation without `as` or `~T` (`E0405`).
-    e0405_distinct_type_mixing = 36,
+    e0405_distinct_type_mixing = 39,
     /// Compile-time value or width violates range refinement or bit-field bounds (`E0406`).
-    e0406_range_refinement_violation = 37,
+    e0406_range_refinement_violation = 40,
     /// Contextual `.Variant` syntax cannot be resolved against expected type (`E0407`).
-    e0407_invalid_contextual_variant = 38,
+    e0407_invalid_contextual_variant = 41,
     /// Duplicate symbol definition in the same namespace and lexical scope (`E0408`).
-    e0408_duplicate_definition = 39,
+    e0408_duplicate_definition = 42,
     /// Access to a private item, field, or method outside its defining module (`E0409`).
-    e0409_private_symbol_access = 40,
+    e0409_private_symbol_access = 43,
     /// Postfix `?` operator used outside a fallible `Result` or `Option` function (`E0410`).
-    e0410_try_outside_fallible_fn = 41,
+    e0410_try_outside_fallible_fn = 44,
     /// Propagated error type cannot be converted via `FromError` or `@from` (`E0411`).
-    e0411_missing_from_error_conversion = 42,
+    e0411_missing_from_error_conversion = 45,
     /// `let … else` guard block does not unconditionally diverge (`never`) (`E0412`).
-    e0412_let_else_not_diverging = 43,
+    e0412_let_else_not_diverging = 46,
     /// Unhandled `Result[T, E]` or `@must_use` value in expression statement (`E0413`).
-    e0413_unhandled_must_use_or_result = 44,
+    e0413_unhandled_must_use_or_result = 47,
     /// Forbidden bare `let _ = fallible()` discard of a `Result[T, E]` without `catch` (`E0414`).
-    e0414_bare_wildcard_result_discard = 45,
+    e0414_bare_wildcard_result_discard = 48,
     /// Non-exhaustive pattern arms in `match` expression (`E0415`).
-    e0415_non_exhaustive_match = 46,
+    e0415_non_exhaustive_match = 49,
 
     // E05xx; Comptime Virtual Machine & MIR Lowering:
     /// Compile-time execution exceeded step fuel budget (`E0501`).
-    e0501_comptime_step_limit_exceeded = 47,
+    e0501_comptime_step_limit_exceeded = 50,
     /// Compile-time integer arithmetic overflow (`E0502`).
-    e0502_integer_constant_overflow = 48,
+    e0502_integer_constant_overflow = 51,
     /// Forbidden non-deterministic, FFI, I/O, or raw pointer-to-integer operation in `comptime` (`E0503`).
-    e0503_forbidden_comptime_operation = 49,
+    e0503_forbidden_comptime_operation = 52,
     /// Out-of-bounds array, slice, or virtual allocation access in `comptime` (`E0504`).
-    e0504_comptime_out_of_bounds = 50,
+    e0504_comptime_out_of_bounds = 53,
     /// Read from uninitialized virtual memory bytes in `comptime` (`E0505`).
-    e0505_comptime_uninitialized_read = 51,
+    e0505_comptime_uninitialized_read = 54,
     /// Null, misaligned, or dangling virtual pointer dereference in `comptime` (`E0506`).
-    e0506_comptime_invalid_pointer = 52,
+    e0506_comptime_invalid_pointer = 55,
     /// Division by zero, remainder by zero, or invalid shift count in `comptime` (`E0507`).
-    e0507_comptime_arithmetic_trap = 53,
+    e0507_comptime_arithmetic_trap = 56,
     /// Virtual heap, call depth, loop unroll, or `@embed_bytes` cap exceeded in `comptime` (`E0508`).
-    e0508_comptime_resource_limit_exceeded = 54,
+    e0508_comptime_resource_limit_exceeded = 57,
     /// Cyclic dependency across `const` or `comptime` evaluations (`E0509`).
-    e0509_comptime_evaluation_cycle = 55,
+    e0509_comptime_evaluation_cycle = 58,
     /// Failed `@compile_assert` or reached `@compile_error` intrinsic (`E0510`).
-    e0510_compile_assertion_failed = 56,
+    e0510_compile_assertion_failed = 59,
 
     // W00xx to W05xx; Subsystem Compiler Warnings:
     /// Deprecated CLI invocation or option (`W0001`).
-    w0001_deprecated_cli_option = 57,
+    w0001_deprecated_cli_option = 60,
     /// Redundant character escape sequence in literal (`W0101`).
-    w0101_redundant_escape_sequence = 58,
+    w0101_redundant_escape_sequence = 61,
     /// Identifier does not follow canonical CoreX casing (`W0201`).
-    w0201_non_canonical_identifier_case = 59,
+    w0201_non_canonical_identifier_case = 62,
     /// Unused region capability or linear binding (`W0308`).
-    w0308_unused_region_allocation = 60,
+    w0308_unused_region_allocation = 63,
     /// Slice or array bounds not statically proven under `--sast-strict` (`W0314`).
-    w0314_unproven_bounds_access = 61,
+    w0314_unproven_bounds_access = 64,
     /// Panic inside vacated non-`Copy` projection inserts abort guard (`W0329`).
-    w0329_vacated_projection_panic_abort = 62,
+    w0329_vacated_projection_panic_abort = 65,
     /// Unreachable high-risk capability exported by dependency (`W0330`).
-    w0330_ambient_dead_capability_in_dep = 63,
+    w0330_ambient_dead_capability_in_dep = 66,
     /// Unreachable pattern arm in `match` expression (`W0401`).
-    w0401_unreachable_pattern_arm = 64,
+    w0401_unreachable_pattern_arm = 67,
     /// Unused local variable binding or function parameter (`W0402`).
-    w0402_unused_binding = 65,
+    w0402_unused_binding = 68,
     /// Function exceeds MIR inlining cost threshold (`W0501`).
-    w0501_inlining_budget_exceeded = 66,
+    w0501_inlining_budget_exceeded = 69,
 
     /// Ergonomic alias for `.e0502_integer_constant_overflow`.
     pub const e0502_integer_overflow: DiagnosticCode = .e0502_integer_constant_overflow;
@@ -415,6 +421,27 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .default_severity = .err,
         .title = "source file exceeds maximum size cap",
         .explanation = "A source file exceeded the 64 MiB bounded input limit.",
+    },
+    .{
+        .code = .e0006_invalid_target_triple,
+        .code_str = "E0006",
+        .default_severity = .err,
+        .title = "invalid or unsupported target triple",
+        .explanation = "The `--target` triple is malformed or not supported by this CoreX compiler.",
+    },
+    .{
+        .code = .e0007_codegen_backend_failure,
+        .code_str = "E0007",
+        .default_severity = .err,
+        .title = "backend code generation failure",
+        .explanation = "The Tier A C99 or Tier B LLVM code generator failed to emit an artifact.",
+    },
+    .{
+        .code = .e0008_linker_invocation_failed,
+        .code_str = "E0008",
+        .default_severity = .err,
+        .title = "compiler driver or linker invocation failed",
+        .explanation = "Invoking `zig cc` or the target system linker failed or exited non-zero.",
     },
     .{
         .code = .e0101_invalid_utf8_sequence,

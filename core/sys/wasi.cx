@@ -1,0 +1,63 @@
+//! WebAssembly System Interface (`wasm32-wasi` Preview 1) Descriptors (`core::sys::wasi`)
+//!
+//! Defines `WasiCiovec` scatter/gather I/O descriptors (`@repr(C)`), WASI Preview 1 error and
+//! stream constants, and `wasi_snapshot_preview1` `fd_write` / `proc_exit` `extern "C"` prototypes.
+//!
+//! Safe `write_stdout`, `write_stderr`, and `exit_process` wrappers lower through `@sys_write` and
+//! `@sys_exit`, which emit `fd_write` / `proc_exit` directly on `wasm32-wasi` targets.
+@repr(C)
+pub struct WasiCiovec {
+    /// Linear-memory pointer to the start of the byte buffer.
+    pub buf_ptr: *u8,
+    /// Number of contiguous bytes in `buf_ptr`.
+    pub buf_len: usize,
+}
+
+// --------------------------------------- CONSTS ----------------------------------------
+/// WASI standard input descriptor (`0`).
+pub const WASI_STDIN_FD: i32 = 0;
+
+/// WASI standard output descriptor (`1`).
+pub const WASI_STDOUT_FD: i32 = 1;
+
+/// WASI standard error descriptor (`2`).
+pub const WASI_STDERR_FD: i32 = 2;
+
+/// WASI `ERRNO_SUCCESS` status code (`0`).
+pub const WASI_ERRNO_SUCCESS: u16 = 0;
+
+// ------------------------------------- PUBLIC API --------------------------------------
+/// WASI Preview 1 `fd_write(fd, iovs_ptr, iovs_len, nwritten_out)` import prototype.
+@link_name("fd_write")
+pub extern "C" fn wasi_fd_write(
+    file_desc: i32,
+    iovs_ptr: *WasiCiovec,
+    iovs_len: usize,
+    nwritten_out: *mut usize,
+) -> u16;
+
+/// WASI Preview 1 `proc_exit(exit_code)` import prototype.
+@link_name("proc_exit")
+pub extern "C" fn wasi_proc_exit(exit_code: i32) -> never;
+
+/// Safe wrapper writing `text` to WASI standard output (`fd = 1`).
+@inline
+@no_alloc
+pub fn write_stdout(text: str) -> isize {
+    return @sys_write(WASI_STDOUT_FD, text);
+}
+
+/// Safe wrapper writing `text` to WASI standard error (`fd = 2`).
+@inline
+@no_alloc
+pub fn write_stderr(text: str) -> isize {
+    return @sys_write(WASI_STDERR_FD, text);
+}
+
+/// Safe wrapper terminating the WASI instance with `status_code`.
+@cold
+@noinline
+@no_alloc
+pub fn exit_process(status_code: i32) -> never {
+    @sys_exit(status_code);
+}

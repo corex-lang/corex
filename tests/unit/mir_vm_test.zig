@@ -753,8 +753,8 @@ test "test_mir_vm_comptime_diagnostics_e0505_init_mask_and_rodata_padding" {
         try std.testing.expect(hasDiag(&sink, .e0505_comptime_uninitialized_read));
     }
 
-    // [2] `(u8, i64)` (`16B`, bytes `1..8` alignment padding):
-    // Promoting with `i64` leaf uninitialized traps `E0505`; initializing `i64` succeeds and zeros `1..8`:
+    // [2] `(u8, i64)` (`16B`, native-reordered: `.1: i64` at `0..8`, `.0: u8` at `8`, trailing padding `9..16`):
+    // Promoting with `i64` leaf uninitialized traps `E0505`; initializing `i64` succeeds and zeros `9..16`:
     const padded_tup_ty = try pool.internTuple(&[_]TypeId{ .u8_ty, .i64_ty });
     const alloc_id = try vm_engine.allocMemory(
         16,
@@ -767,21 +767,21 @@ test "test_mir_vm_comptime_diagnostics_e0505_init_mask_and_rodata_padding" {
     );
     const base_ptr = SymbolicPtr{ .alloc_id = alloc_id, .byte_offset = 0 };
 
-    // Dirty raw bytes `1..8` without setting `init_mask` so padding canonicalization is proven:
-    @memset(vm_engine.allocations.items[alloc_id.payloadIndex()].bytes[1..8], 0xCC);
-    try vm_engine.writeScalarBytes(base_ptr, 0, &[_]u8{0x2A});
+    // Dirty raw trailing padding bytes `9..16` without setting `init_mask` so padding canonicalization is proven:
+    @memset(vm_engine.allocations.items[alloc_id.payloadIndex()].bytes[9..16], 0xCC);
+    try vm_engine.writeScalarBytes(.{ .alloc_id = alloc_id, .byte_offset = 8 }, 0, &[_]u8{0x2A});
 
-    // Leaf `.1` (`i64` at `8..16`) is still uninitialized -> `promoteSnapshotToRodata` traps `E0505`:
+    // Leaf `.1` (`i64` at `0..8`) is still uninitialized -> `promoteSnapshotToRodata` traps `E0505`:
     try std.testing.expectError(
         error.UninitializedRead,
         vm_engine.promoteSnapshotToRodata(base_ptr, padded_tup_ty),
     );
 
-    // Initialize `.1` (`8..16`), leaving padding `1..8` uninitialized -> `.rodata` promotion zeros `1..8`:
+    // Initialize `.1` (`0..8`), leaving padding `9..16` uninitialized -> `.rodata` promotion zeros `9..16`:
     var i64_bytes: [8]u8 = undefined;
     std.mem.writeInt(i64, &i64_bytes, 9001, .little);
     try vm_engine.writeScalarBytes(
-        .{ .alloc_id = alloc_id, .byte_offset = 8 },
+        base_ptr,
         3,
         &i64_bytes,
     );
@@ -789,11 +789,11 @@ test "test_mir_vm_comptime_diagnostics_e0505_init_mask_and_rodata_padding" {
     const promoted_id = try vm_engine.promoteSnapshotToRodata(base_ptr, padded_tup_ty);
     try std.testing.expectEqual(AllocDomain.rodata_blob, promoted_id.domain());
     const blob = rodata_pool.getBlob(promoted_id.payloadIndex()).?;
-    try std.testing.expectEqual(@as(u8, 0x2A), blob.bytes[0]);
-    for (blob.bytes[1..8]) |pad_byte| {
+    try std.testing.expectEqual(@as(i64, 9001), std.mem.readInt(i64, blob.bytes[0..8], .little));
+    try std.testing.expectEqual(@as(u8, 0x2A), blob.bytes[8]);
+    for (blob.bytes[9..16]) |pad_byte| {
         try std.testing.expectEqual(@as(u8, 0), pad_byte);
     }
-    try std.testing.expectEqual(@as(i64, 9001), std.mem.readInt(i64, blob.bytes[8..16], .little));
 }
 
 // `E0506` temporal UAF (dangling return + loop-local `ghost_storage_deinit`), null deref, `.rodata` write:

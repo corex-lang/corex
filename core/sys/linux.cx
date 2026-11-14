@@ -1,0 +1,62 @@
+//! Linux POSIX Syscall Constants and C-ABI Prototypes (`core::sys::linux`)
+//!
+//! Declares canonical Linux file-descriptor numbers, `x86_64` / `aarch64` syscall numbers, and
+//! `libc` `write` / `_exit` `extern "C"` prototypes alongside safe `@sys_write` / `@sys_exit`
+//! wrappers.
+//!
+//! Direct calls to `extern "C"` prototypes require an explicit `unsafe` block, whereas safe stream
+//! helpers delegate through compiler-verified `@sys_*` intrinsics.
+
+// --------------------------------------- CONSTS ----------------------------------------
+
+/// Standard input file descriptor (`0`).
+pub const STDIN_FILENO: i32 = 0;
+
+/// Standard output file descriptor (`1`).
+pub const STDOUT_FILENO: i32 = 1;
+
+/// Standard error file descriptor (`2`).
+pub const STDERR_FILENO: i32 = 2;
+
+/// Linux `x86_64` `SYS_write` syscall number (`1`).
+pub const SYS_WRITE_X86_64: i64 = 1;
+
+/// Linux `x86_64` `SYS_exit_group` syscall number (`231`).
+pub const SYS_EXIT_GROUP_X86_64: i64 = 231;
+
+/// Linux `aarch64` `SYS_write` syscall number (`64`).
+pub const SYS_WRITE_AARCH64: i64 = 64;
+
+/// Linux `aarch64` `SYS_exit_group` syscall number (`94`).
+pub const SYS_EXIT_GROUP_AARCH64: i64 = 94;
+
+// ------------------------------------- PUBLIC API --------------------------------------
+/// POSIX `write(fd, buf_ptr, byte_len)` C-ABI prototype (`unistd.h`).
+@link_name("write")
+pub extern "C" fn linux_posix_write(file_desc: i32, buf_ptr: *u8, byte_len: usize) -> isize;
+
+/// POSIX `_exit(status_code)` C-ABI prototype (`unistd.h`).
+@link_name("_exit")
+pub extern "C" fn linux_posix_exit(status_code: i32) -> never;
+
+/// Safe wrapper writing `text` to Linux `STDOUT_FILENO` (`1`).
+@inline
+@no_alloc
+pub fn write_stdout(text: str) -> isize {
+    return @sys_write(STDOUT_FILENO, text);
+}
+
+/// Safe wrapper writing `text` to Linux `STDERR_FILENO` (`2`).
+@inline
+@no_alloc
+pub fn write_stderr(text: str) -> isize {
+    return @sys_write(STDERR_FILENO, text);
+}
+
+/// Safe wrapper terminating the process with `status_code`.
+@cold
+@noinline
+@no_alloc
+pub fn exit_process(status_code: i32) -> never {
+    @sys_exit(status_code);
+}

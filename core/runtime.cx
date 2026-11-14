@@ -1,0 +1,28 @@
+//! Hot-Reload Safe-Point Seam and Drop-Trace Runtime Hooks (`core::runtime`)
+//!
+//! Exposes the zero-cost `DR-19` `poll_reload` safe-point intrinsic (`false` no-op in `--release`
+//! and Stage-0 builds; single relaxed `u64` generation load in `--dev` GOT builds) alongside
+//! deterministic `record_drop_trace` hooks used by the 4-tier differential oracle (`D-07A`).
+//!
+//! Event loops and frame schedulers call `poll_reload()` at quiescent safe points without incurring
+//! any heap allocations or indirect branch overhead in production binaries.
+
+// ------------------------------------- PUBLIC API --------------------------------------
+
+/// Polls the `DR-19` hot-reload generation counter at a quiescent safe point (zero-cost in `--release`).
+@inline
+pub fn poll_reload() -> unit {
+    @poll_reload();
+}
+
+/// Polls the `DR-19` hot-reload generation counter and returns `true` when a reload patch applied.
+@inline
+pub fn has_pending_reload() -> bool {
+    return @poll_reload();
+}
+
+/// Appends `trace_id` to the deterministic `@drop_trace` sequence for lifecycle verification.
+@inline
+pub fn record_drop_trace(trace_id: i64) -> unit {
+    @drop_trace(trace_id);
+}

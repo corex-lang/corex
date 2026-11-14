@@ -23,6 +23,8 @@ const mir = @import("mir.zig");
 const mir_sast = @import("mir_sast.zig");
 const mir_vm = @import("mir_vm.zig");
 const mir_opt = @import("mir_opt.zig");
+const codegen_abi = @import("codegen_abi.zig");
+const codegen_dev_seam = @import("codegen_dev_seam.zig");
 
 const FileId = mem_foundation.FileId;
 const Span = mem_foundation.Span;
@@ -255,6 +257,50 @@ pub const DefId = packed struct(u32) {
     /// Returns `true` if `self` is the `DefId.NONE` sentinel.
     pub inline fn isNone(self: DefId) bool {
         return self.asInt() == std.math.maxInt(u32);
+    }
+};
+
+/// 64-bit semantic `Wyhash(0)` nominal field/variant layout digest (`DR-19` §1.2, `DR-20` Seam `#3`).
+pub const FieldHash64 = enum(u64) {
+    /// Sentinel zero digest (`0`).
+    zero = 0,
+    _,
+
+    /// Wraps a raw 64-bit `Wyhash(0)` digest into `FieldHash64`.
+    pub inline fn fromInt(raw_val: u64) FieldHash64 {
+        return @fromBackingInt(raw_val);
+    }
+
+    /// Returns the underlying 64-bit unsigned integer digest.
+    pub inline fn asInt(self: FieldHash64) u64 {
+        return @backingInt(self);
+    }
+
+    /// Returns `true` when `self` equals `FieldHash64.zero`.
+    pub inline fn isZero(self: FieldHash64) bool {
+        return self == .zero;
+    }
+};
+
+/// Strongly typed 32-bit `.cx_got[got_idx]` slot handle (`DR-19` §1.1, `DR-20` Seam `#3`).
+pub const GotSlotId = enum(u32) {
+    /// Sentinel indicating direct emission with no `.cx_got` slot (`0xFFFF_FFFF`).
+    none = std.math.maxInt(u32),
+    _,
+
+    /// Wraps a zero-based `.cx_got` slot ordinal into `GotSlotId`.
+    pub inline fn fromInt(raw_val: u32) GotSlotId {
+        return @fromBackingInt(raw_val);
+    }
+
+    /// Returns the raw 32-bit slot ordinal.
+    pub inline fn asInt(self: GotSlotId) u32 {
+        return @backingInt(self);
+    }
+
+    /// Returns `true` if `self` equals `GotSlotId.none`.
+    pub inline fn isNone(self: GotSlotId) bool {
+        return self == .none;
     }
 };
 
@@ -752,6 +798,44 @@ pub const ComptimeEvalArtifact = struct {
     has_errors: bool = false,
     /// 128-bit fingerprint computed strictly from `(type_id, canonical_value)` for Early Cutoff backdating.
     value_fingerprint: Fingerprint128,
+};
+
+/// Errors returned by `CompilerDb.compileModuleArtifact`.
+pub const ModuleCompileError = QueryError || error{
+    /// Front-end, SAST, comptime, or `@embed_bytes` diagnostics prevented artifact emission.
+    FrontendErrors,
+    /// Tier A or Tier B IR emission / atomic output write failed (`E0007`).
+    BackendFailure,
+    /// External `zig cc` / `LLD` driver invocation failed (`E0008`).
+    CompilerDriverFailed,
+    /// `.object_file` or `.executable` requested without `output_path` or `io`.
+    MissingOutputConfig,
+    /// `-Dllvm-prefix` static C++20 `corex_llvm` bridge was requested when not linked in.
+    StaticBridgeUnavailable,
+};
+
+/// Configuration options for `CompilerDb.compileModuleArtifact`.
+pub const ModuleCompileOptions = struct {
+    /// Logical module name emitted in `.ll` / debug headers.
+    module_name: []const u8 = "corex_mod",
+    /// Optional additional `.cx` `FileId`s compiled into the same artifact alongside `root_file_id`.
+    extra_file_ids: []const FileId = &.{},
+    /// Optional `VfsSourceMap` for `#line` directives and DWARF source spans.
+    vfs_source_map: ?*const vfs_sourcemap.VfsSourceMap = null,
+    /// Emit `--dev` GOT function-pointer table indirection + `.cx_dev_meta` seam (`DR-19`).
+    is_dev_got_enabled: bool = false,
+    /// Enable `COREX_ORACLE_TRACE_FILE` trap/drop/return instrumentation (`D-07A`).
+    is_oracle_trace_enabled: bool = false,
+    /// Requested output form (`.source_text`, `.object_file`, or `.executable`).
+    artifact_kind: codegen_abi.OutputArtifactKind = .source_text,
+    /// Output file path on disk (required for `.object_file` and `.executable`).
+    output_path: ?[]const u8 = null,
+    /// Zig `Io` handle for `zig cc` subprocesses and `atomicWriteOutputFile`.
+    io: ?std.Io = null,
+    /// Optional host environment map forwarded to `zig cc`.
+    environ_map: ?*const std.process.Environ.Map = null,
+    /// Optional diagnostic sink receiving backend/linker errors (`E0007` / `E0008`).
+    diagnostic_sink: ?*DiagnosticSink = null,
 };
 
 /// Telemetry counters tracking per-stage query executions, Early Cutoffs, and fast-path hits.
@@ -1827,6 +1911,12 @@ fn computeMirBundleFingerprint(
                     hasher.updateU8(6);
                     hashSymbolTextCanonical(&hasher, interner, bid);
                 },
+                .raw_blob => |rb| {
+                    hasher.updateU8(7);
+                    hasher.updateU32(rb.blob_id);
+                    hasher.updateU8(rb.align_log2);
+                    hasher.updateU64(rb.byte_len);
+                },
             }
         }
     }
@@ -1932,17 +2022,381 @@ fn lowerInitializerHirToMirBody(
     );
 }
 
+/// Computes a cycle-safe recursive `Wyhash(0)` semantic `FieldHash64` (`DR-19` §1.2).
+fn computeNominalFieldHash64Bounded(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    raw_ty: TypeId,
+    target_layout: TargetLayout,
+    subst: *const type_system.NominalTypeSubst,
+    visited_syms: []const u32,
+    depth: u32,
+) u64 {
+    const ty = subst.resolve(raw_ty);
+    var hasher = std.hash.Wyhash.init(0);
+    if (ty.isError() or depth >= 32) {
+        const raw_id = ty.toU32();
+        hasher.update(std.mem.asBytes(&raw_id));
+        return hasher.final();
+    }
+    const shape_key = mir_opt.computeLayoutShapeKey(pool, sym_table, ty, target_layout);
+    const shape_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&shape_key));
+    const tier_byte: u8 = @backingInt(type_system.classifyOwnershipTier(pool, sym_table, ty));
+    if (ty.isPrimitive()) {
+        const prim_raw = ty.toU32();
+        hasher.update(&[_]u8{ 0x01, tier_byte });
+        hasher.update(std.mem.asBytes(&prim_raw));
+        hasher.update(std.mem.asBytes(&shape_hash));
+        return hasher.final();
+    }
+    const node = pool.getNode(ty);
+    hasher.update(&[_]u8{ @backingInt(node.tag), tier_byte });
+    hasher.update(std.mem.asBytes(&shape_hash));
+    switch (node.tag) {
+        .ref_ty, .mut_ref_ty, .raw_ptr_ty, .slice_ty, .soa_slice_ty => {
+            const pointee_ty = subst.resolve(TypeId.fromInt(node.lhs));
+            if (!pointee_ty.isPrimitiveOrSentinel()) {
+                const pointee_node = pool.getNode(pointee_ty);
+                if (pointee_node.tag == .struct_ty or pointee_node.tag == .enum_ty or pointee_node.tag == .union_ty) {
+                    for (visited_syms) |seen_sym| {
+                        if (seen_sym == pointee_node.rhs) {
+                            hasher.update("cycle:");
+                            if (pointee_node.rhs < sym_table.symbols.items.len) {
+                                hasher.update(sym_table.getSymbol(SymbolIndex.fromInt(pointee_node.rhs)).name_text);
+                            }
+                            return hasher.final();
+                        }
+                    }
+                }
+            }
+            const sub_h = computeNominalFieldHash64Bounded(
+                pool,
+                sym_table,
+                pointee_ty,
+                target_layout,
+                subst,
+                visited_syms,
+                depth + 1,
+            );
+            hasher.update(std.mem.asBytes(&sub_h));
+            hasher.update(std.mem.asBytes(&node.rhs));
+        },
+        .array_ty, .soa_array_ty, .optional_ty => {
+            const elem_h = computeNominalFieldHash64Bounded(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.lhs),
+                target_layout,
+                subst,
+                visited_syms,
+                depth + 1,
+            );
+            hasher.update(std.mem.asBytes(&elem_h));
+            hasher.update(std.mem.asBytes(&node.rhs));
+        },
+        .result_ty => {
+            const ok_h = computeNominalFieldHash64Bounded(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.lhs),
+                target_layout,
+                subst,
+                visited_syms,
+                depth + 1,
+            );
+            const err_h = computeNominalFieldHash64Bounded(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.rhs),
+                target_layout,
+                subst,
+                visited_syms,
+                depth + 1,
+            );
+            hasher.update(std.mem.asBytes(&ok_h));
+            hasher.update(std.mem.asBytes(&err_h));
+        },
+        .tuple_ty => {
+            for (pool.getTupleElements(ty), 0..) |raw_elem, elem_i| {
+                const elem_ord: u32 = @intCast(elem_i);
+                const elem_off = type_system.computeTupleElemOffset(pool, sym_table, ty, elem_ord, target_layout) orelse 0;
+                const elem_h = computeNominalFieldHash64Bounded(
+                    pool,
+                    sym_table,
+                    TypeId.fromInt(raw_elem),
+                    target_layout,
+                    subst,
+                    visited_syms,
+                    depth + 1,
+                );
+                hasher.update(std.mem.asBytes(&elem_ord));
+                hasher.update(std.mem.asBytes(&elem_off));
+                hasher.update(std.mem.asBytes(&elem_h));
+            }
+        },
+        .distinct_ty, .bit_field_ty => {
+            if (node.rhs < sym_table.symbols.items.len) {
+                const nom_sym = sym_table.getSymbol(SymbolIndex.fromInt(node.rhs)).*;
+                hasher.update(nom_sym.name_text);
+            }
+            const base_h = computeNominalFieldHash64Bounded(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.lhs),
+                target_layout,
+                subst,
+                visited_syms,
+                depth + 1,
+            );
+            hasher.update(std.mem.asBytes(&base_h));
+        },
+        .refined_ty => {
+            if (pool.getRefinementBounds(ty)) |bounds| {
+                hasher.update(std.mem.asBytes(&bounds.min_val));
+                hasher.update(std.mem.asBytes(&bounds.max_val));
+            }
+            const base_h = computeNominalFieldHash64Bounded(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.rhs),
+                target_layout,
+                subst,
+                visited_syms,
+                depth + 1,
+            );
+            hasher.update(std.mem.asBytes(&base_h));
+        },
+        .struct_ty, .union_ty, .enum_ty => {
+            const sym_idx = SymbolIndex.fromInt(node.rhs);
+            if (!sym_idx.isNone() and sym_idx.asInt() < sym_table.symbols.items.len) {
+                const nom_sym = sym_table.getSymbol(sym_idx).*;
+                const flags_bits: u16 = @bitCast(nom_sym.contract_flags);
+                hasher.update(nom_sym.name_text);
+                hasher.update(std.mem.asBytes(&flags_bits));
+                hasher.update(&[_]u8{ nom_sym.explicit_align_log2_plus1, nom_sym.repr_tag_bits });
+                var next_visited_buf: [32]u32 = undefined;
+                const prev_len = @min(visited_syms.len, 31);
+                @memcpy(next_visited_buf[0..prev_len], visited_syms[0..prev_len]);
+                next_visited_buf[prev_len] = sym_idx.asInt();
+                const next_visited = next_visited_buf[0 .. prev_len + 1];
+                const child_subst = type_system.NominalTypeSubst.fromNominal(pool, sym_table, ty, nom_sym, subst);
+                const active_subst = if (child_subst.len > 0) &child_subst else subst;
+                if (!nom_sym.target_scope.isNone()) {
+                    var member_ord: u32 = 0;
+                    for (sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
+                        const mem_sym = sym_table.getSymbol(mem_idx).*;
+                        if (node.tag == .enum_ty) {
+                            if (mem_sym.kind != .enum_variant_sym) continue;
+                            hasher.update(mem_sym.name_text);
+                            hasher.update(std.mem.asBytes(&member_ord));
+                            const var_h = computeNominalFieldHash64Bounded(
+                                pool,
+                                sym_table,
+                                mem_sym.type_id,
+                                target_layout,
+                                active_subst,
+                                next_visited,
+                                depth + 1,
+                            );
+                            hasher.update(std.mem.asBytes(&var_h));
+                            member_ord += 1;
+                        } else {
+                            if (mem_sym.kind != .field_sym) continue;
+                            const phys_off: u64 = if (node.tag == .struct_ty)
+                                (type_system.computeStructFieldOffset(
+                                    pool,
+                                    sym_table,
+                                    ty,
+                                    member_ord,
+                                    target_layout,
+                                ) orelse 0)
+                            else
+                                0;
+                            hasher.update(mem_sym.name_text);
+                            hasher.update(std.mem.asBytes(&member_ord));
+                            hasher.update(std.mem.asBytes(&phys_off));
+                            const field_h = computeNominalFieldHash64Bounded(
+                                pool,
+                                sym_table,
+                                mem_sym.type_id,
+                                target_layout,
+                                active_subst,
+                                next_visited,
+                                depth + 1,
+                            );
+                            hasher.update(std.mem.asBytes(&field_h));
+                            member_ord += 1;
+                        }
+                    }
+                }
+            }
+        },
+        else => {
+            hasher.update(std.mem.asBytes(&node.lhs));
+            hasher.update(std.mem.asBytes(&node.rhs));
+        },
+    }
+    return hasher.final();
+}
+
 comptime {
     std.debug.assert(@sizeOf(Revision) == 4);
     std.debug.assert(@sizeOf(Durability) == 1);
     std.debug.assert(@sizeOf(Fingerprint128) == 16);
     std.debug.assert(@alignOf(Fingerprint128) == 8);
     std.debug.assert(@sizeOf(DefId) == 4);
+    std.debug.assert(@sizeOf(FieldHash64) == 8);
+    std.debug.assert(@sizeOf(GotSlotId) == 4);
     std.debug.assert(@sizeOf(QueryStage) == 1);
     std.debug.assert(@sizeOf(QueryKey) == 8);
     std.debug.assert(@alignOf(QueryKey) == 4);
     std.debug.assert(@sizeOf(MemoHeader) == 40);
     std.debug.assert(@alignOf(MemoHeader) == 8);
+}
+
+/// Recursively collects composite `TypeId`s reachable across a MIR module for `.cx_dev_meta` records.
+fn discoverDevRecordTypeBounded(
+    allocator: std.mem.Allocator,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    raw_ty: TypeId,
+    seen_set: *std.AutoHashMapUnmanaged(u32, void),
+    out_ids: *std.ArrayListUnmanaged(u32),
+    depth: u32,
+) !void {
+    if (depth >= 64) return;
+    const unwrapped = pool.unwrapUnderlyingType(raw_ty);
+    if (unwrapped.isError() or unwrapped == .unit_ty or unwrapped == .never_ty) return;
+    if (unwrapped == .str_ty) {
+        if (!(try seen_set.getOrPut(allocator, TypeId.str_ty.toU32())).found_existing) {
+            try out_ids.append(allocator, TypeId.str_ty.toU32());
+        }
+        return;
+    }
+    if (unwrapped.isPrimitiveOrSentinel() or unwrapped.isBuiltinGroup()) return;
+    if ((try seen_set.getOrPut(allocator, unwrapped.toU32())).found_existing) return;
+
+    const node = pool.getNode(unwrapped);
+    switch (node.tag) {
+        .struct_ty,
+        .tuple_ty,
+        .union_ty,
+        .array_ty,
+        .soa_array_ty,
+        .slice_ty,
+        .soa_slice_ty,
+        .optional_ty,
+        .result_ty,
+        .closure_ty,
+        .enum_ty,
+        => try out_ids.append(allocator, unwrapped.toU32()),
+        else => {},
+    }
+
+    switch (node.tag) {
+        .ref_ty,
+        .mut_ref_ty,
+        .raw_ptr_ty,
+        .slice_ty,
+        .soa_slice_ty,
+        .array_ty,
+        .soa_array_ty,
+        .optional_ty,
+        .bit_field_ty,
+        => {
+            try discoverDevRecordTypeBounded(
+                allocator,
+                pool,
+                sym_table,
+                TypeId.fromInt(node.lhs),
+                seen_set,
+                out_ids,
+                depth + 1,
+            );
+        },
+        .result_ty => {
+            try discoverDevRecordTypeBounded(
+                allocator,
+                pool,
+                sym_table,
+                TypeId.fromInt(node.lhs),
+                seen_set,
+                out_ids,
+                depth + 1,
+            );
+            try discoverDevRecordTypeBounded(
+                allocator,
+                pool,
+                sym_table,
+                TypeId.fromInt(node.rhs),
+                seen_set,
+                out_ids,
+                depth + 1,
+            );
+        },
+        .tuple_ty => {
+            for (pool.getTupleElements(unwrapped)) |elem_raw| {
+                try discoverDevRecordTypeBounded(
+                    allocator,
+                    pool,
+                    sym_table,
+                    TypeId.fromInt(elem_raw),
+                    seen_set,
+                    out_ids,
+                    depth + 1,
+                );
+            }
+        },
+        .struct_ty, .union_ty, .enum_ty => {
+            const sym_idx = SymbolIndex.fromInt(node.rhs);
+            if (!sym_idx.isNone() and sym_idx.asInt() < sym_table.symbols.items.len) {
+                const nom_sym = sym_table.getSymbol(sym_idx).*;
+                if (!nom_sym.target_scope.isNone()) {
+                    const subst = type_system.NominalTypeSubst.init(pool, sym_table, unwrapped);
+                    for (sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
+                        const mem_sym = sym_table.getSymbol(mem_idx).*;
+                        if (mem_sym.kind != .field_sym and mem_sym.kind != .enum_variant_sym) continue;
+                        if (mem_sym.type_id.isError() or mem_sym.type_id == unwrapped) continue;
+                        try discoverDevRecordTypeBounded(
+                            allocator,
+                            pool,
+                            sym_table,
+                            subst.resolve(mem_sym.type_id),
+                            seen_set,
+                            out_ids,
+                            depth + 1,
+                        );
+                    }
+                }
+            }
+        },
+        .fn_ty, .closure_ty => {
+            if (pool.getFnSignatureView(unwrapped)) |sig| {
+                try discoverDevRecordTypeBounded(
+                    allocator,
+                    pool,
+                    sym_table,
+                    sig.ret_ty,
+                    seen_set,
+                    out_ids,
+                    depth + 1,
+                );
+                var param_i: usize = 0;
+                while (param_i < sig.paramCount()) : (param_i += 1) {
+                    try discoverDevRecordTypeBounded(
+                        allocator,
+                        pool,
+                        sym_table,
+                        sig.getParamType(param_i),
+                        seen_set,
+                        out_ids,
+                        depth + 1,
+                    );
+                }
+            }
+        },
+        else => {},
+    }
 }
 
 // ------------------------------------- PUBLIC API --------------------------------------
@@ -2001,6 +2455,12 @@ pub const CompilerDb = struct {
     comptime_step_limit: u64 = router.DEFAULT_COMPTIME_STEP_LIMIT,
     /// Active target pointer size and alignment (`NATIVE_64` vs `WASM32`).
     target_layout: TargetLayout = TargetLayout.NATIVE_64,
+    /// Active Phase 7 `TargetSpec` synchronized with `target_layout`.
+    target_spec: codegen_abi.TargetSpec = codegen_abi.TargetSpec.host(),
+    /// External `mod <name>;` file bindings keyed by `(parent_file_id << 32) | mod_name_sym`.
+    external_mod_files: std.AutoHashMapUnmanaged(u64, FileId) = .empty,
+    /// Root package/stdlib module bindings (`"core" -> core/root.cx`) keyed by `SymbolId.asInt()`.
+    root_module_files: std.AutoHashMapUnmanaged(u32, FileId) = .empty,
     /// Active `--sast-strict` policy flag (`W0314` on unproven bounds checks outside `@no_panic`).
     is_sast_strict: bool = false,
     /// Optional workspace root directory path for VFS-sandboxed `@embed_bytes` (`DR-05` §3.3).
@@ -2190,6 +2650,8 @@ pub const CompilerDb = struct {
         self.sast_results.deinit(self.allocator);
         self.sast_summaries.deinit(self.allocator);
         self.sast_sym_summaries.deinit(self.allocator);
+        self.external_mod_files.deinit(self.allocator);
+        self.root_module_files.deinit(self.allocator);
         self.memos.deinit(self.allocator);
         self.dep_edges.deinit(self.allocator);
         self.scratch_dep_edges.deinit(self.allocator);
@@ -2242,6 +2704,8 @@ pub const CompilerDb = struct {
             CONFIG_KEY_TARGET_LAYOUT => {
                 hasher.updateU8(self.target_layout.ptr_byte_size);
                 hasher.updateU8(self.target_layout.ptr_align_log2);
+                hasher.updateU8(self.target_layout.cache_line_align_log2);
+                hasher.updateU8(self.target_layout.simd_align_log2);
             },
             CONFIG_KEY_COMPTIME_LIMIT => {
                 hasher.updateU64(self.comptime_step_limit);
@@ -2408,14 +2872,57 @@ pub const CompilerDb = struct {
         self.bumpConfigInput(CONFIG_KEY_COMPTIME_LIMIT);
     }
 
-    /// Updates `target_layout` (`NATIVE_64` vs `WASM32`) and bumps `current_revision` when changed.
+    /// Updates `target_layout` (`NATIVE_64`, `AARCH64_MACOS`, `WASM32`, …) and bumps `current_revision` when changed.
     pub fn setTargetLayout(self: *CompilerDb, new_layout: TargetLayout) void {
         if (self.target_layout.ptr_byte_size == new_layout.ptr_byte_size and
-            self.target_layout.ptr_align_log2 == new_layout.ptr_align_log2)
+            self.target_layout.ptr_align_log2 == new_layout.ptr_align_log2 and
+            self.target_layout.cache_line_align_log2 == new_layout.cache_line_align_log2 and
+            self.target_layout.simd_align_log2 == new_layout.simd_align_log2)
         {
             return;
         }
         self.target_layout = new_layout;
+        self.bumpConfigInput(CONFIG_KEY_TARGET_LAYOUT);
+    }
+
+    /// Updates `target_spec` and synchronizes `target_layout` (`aarch64-macos` `128B` cache line, `wasm32` `4B` ptrs).
+    pub fn setTargetSpec(self: *CompilerDb, new_spec: codegen_abi.TargetSpec) void {
+        self.target_spec = new_spec;
+        self.setTargetLayout(new_spec.asTargetLayout());
+    }
+
+    /// Returns the active Phase 7 `TargetSpec` configured on `self`.
+    pub inline fn getTargetSpec(self: *const CompilerDb) codegen_abi.TargetSpec {
+        return self.target_spec;
+    }
+
+    /// Binds an external `mod <mod_name>;` declaration in `parent_file_id` to `child_file_id`.
+    pub fn bindExternalModule(
+        self: *CompilerDb,
+        parent_file_id: FileId,
+        mod_name: []const u8,
+        child_file_id: FileId,
+    ) !void {
+        const mod_sym = try self.interner.intern(mod_name);
+        const key: u64 = (@as(u64, parent_file_id.asInt()) << 32) | @as(u64, mod_sym.asInt());
+        if (self.external_mod_files.get(key)) |existing_fid| {
+            if (existing_fid == child_file_id) return;
+        }
+        try self.external_mod_files.put(self.allocator, key, child_file_id);
+        self.bumpConfigInput(CONFIG_KEY_TARGET_LAYOUT);
+    }
+
+    /// Registers a root module prefix (such as `"core" -> core/root.cx`) visible across workspace files.
+    pub fn registerRootModule(
+        self: *CompilerDb,
+        mod_name: []const u8,
+        root_file_id: FileId,
+    ) !void {
+        const mod_sym = try self.interner.intern(mod_name);
+        if (self.root_module_files.get(mod_sym.asInt())) |existing_fid| {
+            if (existing_fid == root_file_id) return;
+        }
+        try self.root_module_files.put(self.allocator, mod_sym.asInt(), root_file_id);
         self.bumpConfigInput(CONFIG_KEY_TARGET_LAYOUT);
     }
 
@@ -2711,6 +3218,299 @@ pub const CompilerDb = struct {
         const key = QueryKey.forFileMode(.optimize_mir_module, file_id, is_release_mode);
         _ = try self.fetchQuery(key);
         return self.optimized_mir_modules.getPtr(key.asU64()) orelse error.MissingSourceInput;
+    }
+
+    /// Appends `file_id` and its transitive `external_mod_files` children into `out_files` in dependency-first order.
+    fn appendModuleSubtreePostOrder(
+        self: *CompilerDb,
+        file_id: FileId,
+        seen_files: *std.AutoHashMapUnmanaged(u32, void),
+        out_files: *std.ArrayListUnmanaged(FileId),
+        depth: u32,
+    ) QueryError!void {
+        if (file_id.isNone() or depth >= 64) return;
+        const seen_gop = try seen_files.getOrPut(self.allocator, file_id.asInt());
+        if (seen_gop.found_existing) return;
+
+        const item_entries = (try self.extractItemTree(file_id)).entries;
+        for (item_entries) |entry| {
+            if (entry.kind == .mod_decl) {
+                const ext_key: u64 = (@as(u64, file_id.asInt()) << 32) | @as(u64, entry.name_symbol.asInt());
+                if (self.external_mod_files.get(ext_key)) |child_fid| {
+                    try self.appendModuleSubtreePostOrder(child_fid, seen_files, out_files, depth + 1);
+                }
+            }
+        }
+        try out_files.append(self.allocator, file_id);
+    }
+
+    /// Collects all reachable `FileId`s for `root_file_id` (including `root_module_files` and `extra_file_ids`).
+    pub fn collectReachableModuleFiles(
+        self: *CompilerDb,
+        root_file_id: FileId,
+        extra_file_ids: []const FileId,
+        out_files: *std.ArrayListUnmanaged(FileId),
+    ) QueryError!void {
+        var seen_files: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer seen_files.deinit(self.allocator);
+
+        var root_syms: std.ArrayListUnmanaged(u32) = .empty;
+        defer root_syms.deinit(self.allocator);
+        var root_iter = self.root_module_files.keyIterator();
+        while (root_iter.next()) |sym_key| {
+            try root_syms.append(self.allocator, sym_key.*);
+        }
+        std.mem.sort(u32, root_syms.items, {}, std.sort.asc(u32));
+        for (root_syms.items) |sym_raw| {
+            if (self.root_module_files.get(sym_raw)) |pkg_root_fid| {
+                if (pkg_root_fid != root_file_id) {
+                    try self.appendModuleSubtreePostOrder(pkg_root_fid, &seen_files, out_files, 0);
+                }
+            }
+        }
+
+        for (extra_file_ids) |extra_fid| {
+            if (extra_fid != root_file_id) {
+                try self.appendModuleSubtreePostOrder(extra_fid, &seen_files, out_files, 0);
+            }
+        }
+        try self.appendModuleSubtreePostOrder(root_file_id, &seen_files, out_files, 0);
+    }
+
+    /// Clones and optimizes (`--dev` or `--release`) all `MirBody` items across `reachable_files` into `out_bodies`.
+    pub fn collectOptimizedModuleBodies(
+        self: *CompilerDb,
+        out_allocator: std.mem.Allocator,
+        root_file_id: FileId,
+        reachable_files: []const FileId,
+        is_release_mode: bool,
+        diagnostic_sink: ?*DiagnosticSink,
+        out_bodies: *std.ArrayListUnmanaged(mir.MirBody),
+    ) ModuleCompileError!void {
+        const active_layout = try self.readTargetLayout();
+        const is_strict = try self.readSastStrict();
+
+        if (reachable_files.len == 1 and reachable_files[0] == root_file_id) {
+            const opt_res = try self.optimizeMirModule(root_file_id, is_release_mode);
+            if (self.getOptimizedMirDiagnostics(root_file_id, is_release_mode)) |opt_sink| {
+                if (opt_sink.hasErrors()) return error.FrontendErrors;
+            }
+            try out_bodies.ensureTotalCapacity(out_allocator, opt_res.bodies.items.len);
+            for (opt_res.bodies.items) |*src_body| {
+                var cloned_body = src_body.clone(out_allocator) catch return error.OutOfMemory;
+                errdefer cloned_body.deinit();
+                out_bodies.appendAssumeCapacity(cloned_body);
+            }
+            return;
+        }
+
+        var raw_bodies: std.ArrayListUnmanaged(mir.MirBody) = .empty;
+        defer {
+            for (raw_bodies.items) |*raw_item| raw_item.deinit();
+            raw_bodies.deinit(out_allocator);
+        }
+        var comptime_fn_defs: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer comptime_fn_defs.deinit(out_allocator);
+
+        for (reachable_files) |mod_fid| {
+            for ((try self.extractItemTree(mod_fid)).entries) |entry| {
+                const def_mir = try self.buildDefMirArtifact(entry.def_id);
+                if (self.lowered_def_hirs.getPtr(entry.def_id.asInt())) |hir_ptr| {
+                    for (hir_ptr.functions.items) |fn_meta| {
+                        if (fn_meta.is_comptime and !fn_meta.def_id.isNone()) {
+                            try comptime_fn_defs.put(out_allocator, fn_meta.def_id.asInt(), {});
+                        }
+                    }
+                }
+                if (def_mir.is_comptime_initializer_only) continue;
+                for (def_mir.bundle.bodies.items) |*src_body| {
+                    var cloned_body = src_body.clone(out_allocator) catch return error.OutOfMemory;
+                    errdefer cloned_body.deinit();
+                    try raw_bodies.append(out_allocator, cloned_body);
+                }
+            }
+        }
+
+        var local_opt_sink = DiagnosticSink.init(out_allocator);
+        defer local_opt_sink.deinit();
+        const active_opt_sink = if (diagnostic_sink) |ext_sink| ext_sink else &local_opt_sink;
+
+        const root_syntax_view: ?mir_opt.FileSyntaxView = if (self.source_inputs.getPtr(root_file_id.asInt())) |in_ptr| blk: {
+            if (self.parsed_artifacts.getPtr(root_file_id.asInt())) |p_ptr| {
+                break :blk .{
+                    .source = in_ptr.owned_text,
+                    .tokens = &p_ptr.token_buffer,
+                    .cst_arena = &p_ptr.cst_arena,
+                };
+            }
+            break :blk null;
+        } else null;
+
+        var multi_opt = mir_opt.optimizeMirModule(
+            out_allocator,
+            raw_bodies.items,
+            &self.type_pool,
+            &self.symbol_table,
+            &self.interner,
+            .{
+                .is_release_mode = is_release_mode,
+                .target_layout = active_layout,
+                .syntax_view = root_syntax_view,
+                .comptime_fn_defs = &comptime_fn_defs,
+                .is_sast_enabled = true,
+                .is_sast_strict = is_strict,
+                .sast_config = .{
+                    .is_sast_strict = is_strict,
+                    .external_resolver = .{
+                        .compiler_db = self,
+                        .resolve_fn = resolveDbCalleeSummary,
+                    },
+                },
+            },
+            active_opt_sink,
+        ) catch |opt_err| switch (opt_err) {
+            error.Cancelled => return error.Cancelled,
+            else => return error.OutOfMemory,
+        };
+        defer multi_opt.deinit();
+        if (active_opt_sink.hasErrors()) return error.FrontendErrors;
+
+        try out_bodies.ensureTotalCapacity(out_allocator, multi_opt.bodies.items.len);
+        for (multi_opt.bodies.items) |*opt_body| {
+            var cloned_body = opt_body.clone(out_allocator) catch return error.OutOfMemory;
+            errdefer cloned_body.deinit();
+            out_bodies.appendAssumeCapacity(cloned_body);
+        }
+    }
+
+    /// Stage 14 orchestrator: verifies all reachable module files, runs `MIR` opt + `@embed_bytes`, and emits codegen.
+    pub fn compileModuleArtifact(
+        self: *CompilerDb,
+        root_file_id: FileId,
+        backend: codegen_abi.CodegenBackend,
+        options: ModuleCompileOptions,
+    ) ModuleCompileError!codegen_abi.CodegenArtifact {
+        self.setTargetSpec(backend.targetSpec());
+
+        var reachable_files: std.ArrayListUnmanaged(FileId) = .empty;
+        defer reachable_files.deinit(self.allocator);
+        try self.collectReachableModuleFiles(root_file_id, options.extra_file_ids, &reachable_files);
+
+        var has_front_errors = false;
+        for (reachable_files.items) |mod_fid| {
+            if ((try self.parseCst(mod_fid)).diagnostics.hasErrors()) has_front_errors = true;
+            if ((try self.resolveSignatures(mod_fid)).error_count > 0) has_front_errors = true;
+
+            for ((try self.extractItemTree(mod_fid)).entries) |entry| {
+                if ((try self.typecheckBody(entry.def_id)).error_count > 0) has_front_errors = true;
+                if (!(try self.verifySastMir(entry.def_id)).is_verified_sound) has_front_errors = true;
+
+                if (!has_front_errors and (entry.kind == .const_decl or entry.kind == .extern_block)) {
+                    const ct_art = self.evalComptimeDef(entry.def_id) catch |ct_err| switch (ct_err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.Cancelled => return error.Cancelled,
+                        else => {
+                            has_front_errors = true;
+                            continue;
+                        },
+                    };
+                    if (ct_art.has_errors) has_front_errors = true;
+                }
+            }
+        }
+        if (has_front_errors) return error.FrontendErrors;
+
+        var working_bodies: std.ArrayListUnmanaged(mir.MirBody) = .empty;
+        defer {
+            for (working_bodies.items) |*body_item| body_item.deinit();
+            working_bodies.deinit(self.allocator);
+        }
+        try self.collectOptimizedModuleBodies(
+            self.allocator,
+            root_file_id,
+            reachable_files.items,
+            backend.isReleaseMode(),
+            options.diagnostic_sink,
+            &working_bodies,
+        );
+
+        // Materialize reachable `@embed_bytes` constants per body (`[CRITICAL-07]`):
+        var blob_store = mir.MirBlobStore.init(self.allocator);
+        defer blob_store.deinit();
+        var local_embed_sink = DiagnosticSink.init(self.allocator);
+        defer local_embed_sink.deinit();
+        const active_embed_sink = if (options.diagnostic_sink) |ext_sink| ext_sink else &local_embed_sink;
+        const active_io = if (options.io) |io_handle| io_handle else self.embed_io;
+
+        var is_embed_ok = true;
+        for (working_bodies.items) |*body_ptr| {
+            const body_fid = body_ptr.def_id.fileId();
+            const body_tokens = if (self.parsed_artifacts.getPtr(body_fid.asInt())) |p_ptr|
+                &p_ptr.token_buffer
+            else
+                null;
+            const ok = mir.materializeBodyEmbedBytes(
+                body_ptr,
+                &self.interner,
+                body_tokens,
+                &blob_store,
+                .{
+                    .workspace_root = self.workspace_root,
+                    .io = active_io,
+                    .virtual_files = self.virtual_files,
+                },
+                active_embed_sink,
+            ) catch return error.OutOfMemory;
+            if (!ok) is_embed_ok = false;
+        }
+        if (!is_embed_ok or active_embed_sink.hasErrors()) return error.FrontendErrors;
+
+        // Compute Pentagon `ProvenValueRange` slices (`[MAJOR-08]`):
+        const body_count = working_bodies.items.len;
+        const proven_views = try self.allocator.alloc([]const codegen_abi.ProvenValueRange, body_count);
+        defer self.allocator.free(proven_views);
+        const owned_proven = try self.allocator.alloc([]codegen_abi.ProvenValueRange, body_count);
+        @memset(owned_proven, &.{});
+        defer {
+            for (owned_proven) |slice_item| {
+                if (slice_item.len > 0) self.allocator.free(slice_item);
+            }
+            self.allocator.free(owned_proven);
+        }
+        for (working_bodies.items, 0..) |*body_ptr, b_idx| {
+            const computed_ranges = mir_sast.computeBodyProvenRanges(
+                self.allocator,
+                body_ptr,
+                &self.type_pool,
+                &self.symbol_table,
+            ) catch return error.OutOfMemory;
+            owned_proven[b_idx] = computed_ranges;
+            proven_views[b_idx] = computed_ranges;
+        }
+
+        var file_tokens: std.AutoHashMapUnmanaged(u32, *const TokenBuffer) = .empty;
+        defer file_tokens.deinit(self.allocator);
+        try self.populateFileTokensMap(&file_tokens);
+
+        return backend.emitModule(self.allocator, .{
+            .bodies = working_bodies.items,
+            .pool = &self.type_pool,
+            .sym_table = &self.symbol_table,
+            .interner = &self.interner,
+            .module_name = options.module_name,
+            .vfs_source_map = options.vfs_source_map,
+            .file_tokens = &file_tokens,
+            .rodata_pool = &self.rodata_pool,
+            .blob_store = &blob_store,
+            .proven_ranges = proven_views,
+            .is_dev_got_enabled = options.is_dev_got_enabled,
+            .is_oracle_trace_enabled = options.is_oracle_trace_enabled,
+            .artifact_kind = options.artifact_kind,
+            .output_path = options.output_path,
+            .io = active_io,
+            .environ_map = options.environ_map,
+            .diagnostic_sink = options.diagnostic_sink,
+        });
     }
 
     /// Bridge invoked by `mir_vm.makeComptimeEvalHook` to resolve cross-definition `const` `DefId`s.
@@ -3425,22 +4225,108 @@ pub const CompilerDb = struct {
         try self.emitComptimeCycleIntoSink(sink, def_id);
     }
 
+    /// Returns `true` if `candidate_fid` equals `subtree_root_fid` or is a transitive `external_mod_files` child.
+    fn isModuleSubtreeMember(
+        self: *const CompilerDb,
+        subtree_root_fid: FileId,
+        candidate_fid: FileId,
+    ) !bool {
+        if (subtree_root_fid == candidate_fid) return true;
+        if (self.external_mod_files.count() == 0) return false;
+
+        var visited_fids: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer visited_fids.deinit(self.allocator);
+        var work_stack: std.ArrayListUnmanaged(u32) = .empty;
+        defer work_stack.deinit(self.allocator);
+
+        try visited_fids.put(self.allocator, subtree_root_fid.asInt(), {});
+        try work_stack.append(self.allocator, subtree_root_fid.asInt());
+
+        while (work_stack.pop()) |parent_raw| {
+            var ext_iter = self.external_mod_files.iterator();
+            while (ext_iter.next()) |kv| {
+                const key_parent: u32 = @truncate(kv.key_ptr.* >> 32);
+                if (key_parent != parent_raw) continue;
+                const child_raw = kv.value_ptr.asInt();
+                if (child_raw == candidate_fid.asInt()) return true;
+                const gop = try visited_fids.getOrPut(self.allocator, child_raw);
+                if (!gop.found_existing) {
+                    try work_stack.append(self.allocator, child_raw);
+                }
+            }
+        }
+        return false;
+    }
+
     /// Stage 6 implementation: resolves module signatures for `file_id` (shielded by `tree_fingerprint`).
     fn computeResolveSignatures(self: *CompilerDb, file_id: FileId) QueryError!Fingerprint128 {
-        const item_tree = try self.extractItemTree(file_id);
+        const item_tree_init = try self.extractItemTree(file_id);
+        const item_entries = item_tree_init.entries;
+        const item_tree_fp = item_tree_init.tree_fingerprint;
         const active_layout = try self.readTargetLayout();
         try self.unwindIfCancelled();
 
         var hasher = StructuralHasher.init();
         hasher.updateU32(file_id.asInt());
         hasher.updateU8(active_layout.ptr_byte_size);
-        hasher.updateFingerprint(item_tree.tree_fingerprint);
+        hasher.updateFingerprint(item_tree_fp);
 
         var public_count: u32 = 0;
-        for (item_tree.entries) |entry| {
+        for (item_entries) |entry| {
             const sig_fp = try self.getItemTreeSigProj(entry.def_id);
             hasher.updateFingerprint(sig_fp);
             if (entry.is_pub) public_count += 1;
+        }
+
+        // Resolve registered root packages (`core/root.cx`) and child external `mod` files first:
+        var root_mod_syms: std.ArrayListUnmanaged(u32) = .empty;
+        defer root_mod_syms.deinit(self.allocator);
+        var root_key_iter = self.root_module_files.keyIterator();
+        while (root_key_iter.next()) |sym_key| {
+            try root_mod_syms.append(self.allocator, sym_key.*);
+        }
+        std.mem.sort(u32, root_mod_syms.items, {}, std.sort.asc(u32));
+        for (root_mod_syms.items) |root_sym_raw| {
+            const root_fid = self.root_module_files.get(root_sym_raw) orelse continue;
+            if (root_fid != file_id and
+                !(try self.isModuleSubtreeMember(root_fid, file_id)) and
+                !self.in_flight_keys.contains(QueryKey.forFile(.resolve_signatures, root_fid).asU64()))
+            {
+                const root_sigs = try self.resolveSignatures(root_fid);
+                hasher.updateFingerprint(root_sigs.signatures_fingerprint);
+                if (!root_sigs.module_scope.isNone()) {
+                    try self.symbol_table.named_module_scopes.put(
+                        self.allocator,
+                        root_sym_raw,
+                        root_sigs.module_scope,
+                    );
+                }
+            }
+        }
+        for (item_entries) |entry| {
+            if (entry.kind == .mod_decl) {
+                const ext_key: u64 = (@as(u64, file_id.asInt()) << 32) | @as(u64, entry.name_symbol.asInt());
+                if (self.external_mod_files.get(ext_key)) |child_fid| {
+                    if (child_fid != file_id and
+                        !self.in_flight_keys.contains(QueryKey.forFile(.resolve_signatures, child_fid).asU64()))
+                    {
+                        const child_sigs = try self.resolveSignatures(child_fid);
+                        hasher.updateFingerprint(child_sigs.signatures_fingerprint);
+                        if (!child_sigs.module_scope.isNone()) {
+                            try self.symbol_table.bindExternalModuleScope(
+                                file_id,
+                                entry.name_symbol,
+                                child_sigs.module_scope,
+                            );
+                            try self.symbol_table.named_module_scopes.put(
+                                self.allocator,
+                                entry.name_symbol.asInt(),
+                                child_sigs.module_scope,
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         // Run Phase 4 symbol collection, `use` resolution, and signature type resolution for `file_id`:
@@ -3467,6 +4353,12 @@ pub const CompilerDb = struct {
                     &parsed_ptr.ast_arena,
                     sig_sink,
                 ) catch return error.OutOfMemory;
+
+                for (root_mod_syms.items) |root_sym_raw| {
+                    if (self.root_module_files.get(root_sym_raw) == file_id and !mod_scope.isNone()) {
+                        try self.symbol_table.named_module_scopes.put(self.allocator, root_sym_raw, mod_scope);
+                    }
+                }
 
                 symbol_resolver.resolveFileUseImports(
                     &self.symbol_table,
@@ -3512,7 +4404,7 @@ pub const CompilerDb = struct {
         try self.resolved_signatures.put(self.allocator, file_id.asInt(), .{
             .file_id = file_id,
             .module_scope = mod_scope,
-            .item_count = @intCast(item_tree.entries.len),
+            .item_count = @intCast(item_entries.len),
             .public_item_count = public_count,
             .error_count = sig_err_count,
             .signatures_fingerprint = resolved_fp,
@@ -4703,6 +5595,8 @@ pub const CompilerDb = struct {
         hasher.updateU32(file_id.asInt());
         hasher.updateU8(@intFromBool(is_release_mode));
         hasher.updateU8(active_layout.ptr_byte_size);
+        hasher.updateU8(active_layout.cache_line_align_log2);
+        hasher.updateU8(active_layout.simd_align_log2);
         hasher.updateU64(opt_res.fingerprint);
         hasher.updateU32(opt_res.dedup_merged_count);
         hasher.updateU32(opt_res.icf_folded_count);
@@ -4720,6 +5614,139 @@ pub const CompilerDb = struct {
         return opt_fp;
     }
 };
+
+/// Computes the deterministic `DR-19` §1.2 `FieldHash64` (`TypeLayoutHash`) for `raw_ty` under `target_layout`.
+pub fn computeNominalFieldHash64(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    raw_ty: TypeId,
+    target_layout: TargetLayout,
+) FieldHash64 {
+    return FieldHash64.fromInt(computeNominalFieldHash64Bounded(
+        pool,
+        sym_table,
+        raw_ty,
+        target_layout,
+        &type_system.NominalTypeSubst.EMPTY,
+        &.{},
+        0,
+    ));
+}
+
+/// Builds a 32-byte `CxTypeLayoutRecord` pairing `LayoutShapeKey` with semantic `FieldHash64` (`DR-19` §1.2).
+pub fn buildCxTypeLayoutRecord(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    raw_ty: TypeId,
+    target_layout: TargetLayout,
+) codegen_dev_seam.CxTypeLayoutRecord {
+    const layout = type_system.computeTypeLayoutWithPool(pool, sym_table, raw_ty, target_layout);
+    const shape_key = mir_opt.computeLayoutShapeKey(pool, sym_table, raw_ty, target_layout);
+    const tier_bits: u8 = @backingInt(type_system.classifyOwnershipTier(pool, sym_table, raw_ty));
+    var kind_flags: u8 = tier_bits;
+    var fields_len: u16 = 0;
+    var fqn_hash32: u32 = 0;
+    if (!raw_ty.isPrimitiveOrSentinel()) {
+        const node = pool.getNode(raw_ty);
+        if (node.tag == .struct_ty or node.tag == .union_ty or node.tag == .enum_ty) {
+            const sym_idx = SymbolIndex.fromInt(node.rhs);
+            if (!sym_idx.isNone() and sym_idx.asInt() < sym_table.symbols.items.len) {
+                const nom_sym = sym_table.getSymbol(sym_idx).*;
+                fqn_hash32 = @truncate(std.hash.Wyhash.hash(0, nom_sym.name_text));
+                if (nom_sym.contract_flags.is_repr_c) kind_flags |= 0x04;
+                if (nom_sym.contract_flags.is_packed) kind_flags |= 0x08;
+                if (nom_sym.contract_flags.is_cache_aligned) kind_flags |= 0x10;
+                if (!nom_sym.target_scope.isNone()) {
+                    for (sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
+                        const mk = sym_table.getSymbol(mem_idx).kind;
+                        if (mk == .field_sym or mk == .enum_variant_sym) fields_len +|= 1;
+                    }
+                }
+            }
+        }
+    }
+    return .{
+        .type_id = raw_ty,
+        .byte_size = @intCast(@min(layout.byte_size, std.math.maxInt(u32))),
+        .align_log2 = layout.align_log2,
+        .kind_flags = kind_flags,
+        .fields_len = fields_len,
+        .fqn_hash32 = fqn_hash32,
+        .layout_shape_hash64 = std.hash.Wyhash.hash(0, std.mem.asBytes(&shape_key)),
+        .field_hash64 = computeNominalFieldHash64(pool, sym_table, raw_ty, target_layout).asInt(),
+    };
+}
+
+/// Collects deterministic `CxTypeLayoutRecord` entries for all composite types across `bodies`.
+pub fn collectModuleDevTypeRecords(
+    allocator: std.mem.Allocator,
+    bodies: []const mir.MirBody,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    target_layout: TargetLayout,
+) ![]codegen_dev_seam.CxTypeLayoutRecord {
+    var seen_set: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer seen_set.deinit(allocator);
+    var discovered_ids: std.ArrayListUnmanaged(u32) = .empty;
+    defer discovered_ids.deinit(allocator);
+
+    for (bodies) |*body_ptr| {
+        try discoverDevRecordTypeBounded(
+            allocator,
+            pool,
+            sym_table,
+            body_ptr.ret_ty,
+            &seen_set,
+            &discovered_ids,
+            0,
+        );
+        for (body_ptr.locals.items) |loc_decl| {
+            try discoverDevRecordTypeBounded(
+                allocator,
+                pool,
+                sym_table,
+                loc_decl.type_id,
+                &seen_set,
+                &discovered_ids,
+                0,
+            );
+        }
+        for (0..body_ptr.insts.len) |inst_raw| {
+            try discoverDevRecordTypeBounded(
+                allocator,
+                pool,
+                sym_table,
+                body_ptr.insts.get(inst_raw).type_id,
+                &seen_set,
+                &discovered_ids,
+                0,
+            );
+        }
+        for (body_ptr.calls.items) |call_site| {
+            try discoverDevRecordTypeBounded(
+                allocator,
+                pool,
+                sym_table,
+                call_site.ret_ty,
+                &seen_set,
+                &discovered_ids,
+                0,
+            );
+        }
+    }
+
+    std.mem.sort(u32, discovered_ids.items, {}, std.sort.asc(u32));
+    const records = try allocator.alloc(codegen_dev_seam.CxTypeLayoutRecord, discovered_ids.items.len);
+    for (discovered_ids.items, 0..) |raw_id, idx| {
+        records[idx] = buildCxTypeLayoutRecord(
+            pool,
+            sym_table,
+            TypeId.fromInt(raw_id),
+            target_layout,
+        );
+    }
+    return records;
+}
 
 // ---------------------------------------- MAIN -----------------------------------------
 

@@ -1,0 +1,257 @@
+//! Lock-Free Atomic Primitives and Memory Ordering Fences (`core::atomic`)
+//!
+//! Provides `@repr(C)` atomic wrappers (`AtomicBool`, `AtomicU32`, `AtomicU64`, `AtomicUsize`)
+//! and explicit hardware/compiler memory-ordering constants (`ORDER_RELAXED`..`ORDER_SEQ_CST`)
+//! lowered directly to C11 / LLVM atomic instructions via `@atomic_*` compiler intrinsics.
+//!
+//! Mutating operations accept `inout` atomic slots (`DR-02` Mutable Value Semantics) so callers
+//! retain ergonomic value-oriented syntax while hardware RMW atomicity is preserved in place.
+
+// ---------------------------------------- TYPES ----------------------------------------
+
+/// Memory ordering lattice matching LLVM / C11 atomic ordering codes (`DR-08`).
+pub enum MemoryOrder {
+    /// Monotonic atomicity with no cross-thread synchronization (`ORDER_RELAXED = 0`).
+    Relaxed,
+    /// Acquire load/fence synchronization (`ORDER_ACQUIRE = 2`).
+    Acquire,
+    /// Release store/fence synchronization (`ORDER_RELEASE = 3`).
+    Release,
+    /// Acquire-release read-modify-write synchronization (`ORDER_ACQ_REL = 4`).
+    AcqRel,
+    /// Sequentially consistent total-order synchronization (`ORDER_SEQ_CST = 5`).
+    SeqCst,
+}
+
+/// Lock-free atomic boolean backed by an aligned `u8` (`0` = `false`, `1` = `true`).
+@repr(C)
+pub struct AtomicBool {
+    /// Backing atomic byte (`0` or `1`).
+    pub inner: u8,
+}
+
+/// Lock-free 32-bit unsigned atomic integer.
+@repr(C)
+@align(4)
+pub struct AtomicU32 {
+    /// Backing 32-bit unsigned cell.
+    pub inner: u32,
+}
+
+/// Lock-free 64-bit unsigned atomic integer.
+@repr(C)
+@align(8)
+pub struct AtomicU64 {
+    /// Backing 64-bit unsigned cell.
+    pub inner: u64,
+}
+
+/// Lock-free pointer-width unsigned atomic integer.
+@repr(C)
+pub struct AtomicUsize {
+    /// Backing pointer-width unsigned cell.
+    pub inner: usize,
+}
+
+// --------------------------------------- CONSTS ----------------------------------------
+/// Monotonic (`relaxed`) memory ordering code (`0`).
+pub const ORDER_RELAXED: u8 = 0;
+
+/// Acquire (`acquire`) memory ordering code (`2`).
+pub const ORDER_ACQUIRE: u8 = 2;
+
+/// Release (`release`) memory ordering code (`3`).
+pub const ORDER_RELEASE: u8 = 3;
+
+/// Acquire-release (`acq_rel`) memory ordering code (`4`).
+pub const ORDER_ACQ_REL: u8 = 4;
+
+/// Sequentially consistent (`seq_cst`) memory ordering code (`5`).
+pub const ORDER_SEQ_CST: u8 = 5;
+
+// ------------------------------------- PUBLIC API --------------------------------------
+/// Maps a `MemoryOrder` enum tag to its canonical `@atomic_*` ordering byte (`0..5`).
+@inline
+@no_alloc
+@no_panic
+pub fn order_to_code(order_tag: MemoryOrder) -> u8 {
+    return match order_tag {
+        .Relaxed => ORDER_RELAXED,
+        .Acquire => ORDER_ACQUIRE,
+        .Release => ORDER_RELEASE,
+        .AcqRel => ORDER_ACQ_REL,
+        .SeqCst => ORDER_SEQ_CST,
+    };
+}
+
+/// Emits a hardware and compiler atomic memory fence with ordering `order_code`.
+@inline
+@no_alloc
+pub fn fence(order_code: u8) -> unit {
+    @atomic_fence(order_code);
+}
+
+/// Constructs an `AtomicBool` initialized to `is_initial_set`.
+@inline
+@no_alloc
+@no_panic
+pub fn atomic_bool_new(is_initial_set: bool) -> AtomicBool {
+    let encoded_byte: u8 = if is_initial_set {
+        1
+    } else {
+        0
+    };
+    return AtomicBool { inner: encoded_byte };
+}
+
+/// Atomically loads the boolean flag stored in `slot` with ordering `order_code`.
+@inline
+@no_alloc
+pub fn atomic_bool_load(slot: &AtomicBool, order_code: u8) -> bool {
+    return @atomic_load(&slot.inner, order_code) != 0;
+}
+
+/// Atomically stores `is_set` into `slot` with ordering `order_code`.
+@inline
+@no_alloc
+pub fn atomic_bool_store(mut slot: inout AtomicBool, is_set: bool, order_code: u8) -> unit {
+    let encoded_byte: u8 = if is_set {
+        1
+    } else {
+        0
+    };
+    @atomic_store(&mut slot.inner, encoded_byte, order_code);
+}
+
+/// Atomically swaps `is_set` into `slot` and returns the previous boolean value.
+@inline
+@no_alloc
+pub fn atomic_bool_swap(mut slot: inout AtomicBool, is_set: bool, order_code: u8) -> bool {
+    let encoded_byte: u8 = if is_set {
+        1
+    } else {
+        0
+    };
+    return @atomic_rmw_xchg(&mut slot.inner, encoded_byte, order_code) != 0;
+}
+
+/// Constructs an `AtomicU32` initialized to `initial_val`.
+@inline
+@no_alloc
+@no_panic
+pub fn atomic_u32_new(initial_val: u32) -> AtomicU32 {
+    return AtomicU32 { inner: initial_val };
+}
+
+/// Atomically loads the `u32` value from `slot` with ordering `order_code`.
+@inline
+@no_alloc
+pub fn atomic_u32_load(slot: &AtomicU32, order_code: u8) -> u32 {
+    return @atomic_load(&slot.inner, order_code);
+}
+
+/// Atomically stores `next_val` into `slot` with ordering `order_code`.
+@inline
+@no_alloc
+pub fn atomic_u32_store(mut slot: inout AtomicU32, next_val: u32, order_code: u8) -> unit {
+    @atomic_store(&mut slot.inner, next_val, order_code);
+}
+
+/// Atomically adds `delta` to `slot` and returns the previous `u32` value.
+@inline
+@no_alloc
+pub fn atomic_u32_fetch_add(mut slot: inout AtomicU32, delta: u32, order_code: u8) -> u32 {
+    return @atomic_rmw_add(&mut slot.inner, delta, order_code);
+}
+
+/// Atomically subtracts `delta` from `slot` and returns the previous `u32` value.
+@inline
+@no_alloc
+pub fn atomic_u32_fetch_sub(mut slot: inout AtomicU32, delta: u32, order_code: u8) -> u32 {
+    return @atomic_rmw_sub(&mut slot.inner, delta, order_code);
+}
+
+/// Atomically exchanges `slot` with `next_val` and returns the previous `u32` value.
+@inline
+@no_alloc
+pub fn atomic_u32_swap(mut slot: inout AtomicU32, next_val: u32, order_code: u8) -> u32 {
+    return @atomic_rmw_xchg(&mut slot.inner, next_val, order_code);
+}
+
+/// Atomically compares `slot` against `expected_val`, storing `desired_val` when equal.
+@inline
+@no_alloc
+pub fn atomic_u32_compare_exchange(
+    mut slot: inout AtomicU32,
+    expected_val: u32,
+    desired_val: u32,
+    succ_order: u8,
+    fail_order: u8,
+) -> (u32, bool) {
+    return @atomic_cmpxchg(&mut slot.inner, expected_val, desired_val, succ_order, fail_order);
+}
+
+/// Constructs an `AtomicU64` initialized to `initial_val`.
+@inline
+@no_alloc
+@no_panic
+pub fn atomic_u64_new(initial_val: u64) -> AtomicU64 {
+    return AtomicU64 { inner: initial_val };
+}
+
+/// Atomically loads the `u64` value from `slot` with ordering `order_code`.
+@inline
+@no_alloc
+pub fn atomic_u64_load(slot: &AtomicU64, order_code: u8) -> u64 {
+    return @atomic_load(&slot.inner, order_code);
+}
+
+/// Atomically stores `next_val` into `slot` with ordering `order_code`.
+@inline
+@no_alloc
+pub fn atomic_u64_store(mut slot: inout AtomicU64, next_val: u64, order_code: u8) -> unit {
+    @atomic_store(&mut slot.inner, next_val, order_code);
+}
+
+/// Atomically adds `delta` to `slot` and returns the previous `u64` value.
+@inline
+@no_alloc
+pub fn atomic_u64_fetch_add(mut slot: inout AtomicU64, delta: u64, order_code: u8) -> u64 {
+    return @atomic_rmw_add(&mut slot.inner, delta, order_code);
+}
+
+/// Atomically subtracts `delta` from `slot` and returns the previous `u64` value.
+@inline
+@no_alloc
+pub fn atomic_u64_fetch_sub(mut slot: inout AtomicU64, delta: u64, order_code: u8) -> u64 {
+    return @atomic_rmw_sub(&mut slot.inner, delta, order_code);
+}
+
+/// Constructs an `AtomicUsize` initialized to `initial_val`.
+@inline
+@no_alloc
+@no_panic
+pub fn atomic_usize_new(initial_val: usize) -> AtomicUsize {
+    return AtomicUsize { inner: initial_val };
+}
+
+/// Atomically loads the `usize` value from `slot` with ordering `order_code`.
+@inline
+@no_alloc
+pub fn atomic_usize_load(slot: &AtomicUsize, order_code: u8) -> usize {
+    return @atomic_load(&slot.inner, order_code);
+}
+
+/// Atomically stores `next_val` into `slot` with ordering `order_code`.
+@inline
+@no_alloc
+pub fn atomic_usize_store(mut slot: inout AtomicUsize, next_val: usize, order_code: u8) -> unit {
+    @atomic_store(&mut slot.inner, next_val, order_code);
+}
+
+/// Atomically adds `delta` to `slot` and returns the previous `usize` value.
+@inline
+@no_alloc
+pub fn atomic_usize_fetch_add(mut slot: inout AtomicUsize, delta: usize, order_code: u8) -> usize {
+    return @atomic_rmw_add(&mut slot.inner, delta, order_code);
+}

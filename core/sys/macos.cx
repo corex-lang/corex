@@ -1,0 +1,48 @@
+//! Apple macOS Darwin `libSystem` Constants and C-ABI Prototypes (`core::sys::macos`)
+//!
+//! Declares canonical Darwin file-descriptor constants, Apple Silicon (`aarch64-macos`) `128B`
+//! cache-line constant, and `libSystem.B.dylib` `write` / `_exit` `extern "C"` prototypes.
+//!
+//! On macOS, userland binaries link against `libSystem` rather than invoking unstable raw traps;
+//! safe stream helpers route through `@sys_write` and `@sys_exit`.
+pub const STDIN_FILENO: i32 = 0;
+
+/// Darwin standard output file descriptor (`1`).
+pub const STDOUT_FILENO: i32 = 1;
+
+/// Darwin standard error file descriptor (`2`).
+pub const STDERR_FILENO: i32 = 2;
+
+/// Apple Silicon M-series architectural coherency granule (`128` bytes, `DR-08`).
+pub const APPLE_SILICON_CACHE_LINE_BYTES: usize = 128;
+
+// ------------------------------------- PUBLIC API --------------------------------------
+/// Darwin `libSystem` `write(file_desc, buf_ptr, byte_len)` C-ABI prototype.
+@link_name("write")
+pub extern "C" fn darwin_write(file_desc: i32, buf_ptr: *u8, byte_len: usize) -> isize;
+
+/// Darwin `libSystem` `_exit(status_code)` C-ABI prototype.
+@link_name("_exit")
+pub extern "C" fn darwin_exit(status_code: i32) -> never;
+
+/// Safe wrapper writing `text` to Darwin `STDOUT_FILENO` (`1`).
+@inline
+@no_alloc
+pub fn write_stdout(text: str) -> isize {
+    return @sys_write(STDOUT_FILENO, text);
+}
+
+/// Safe wrapper writing `text` to Darwin `STDERR_FILENO` (`2`).
+@inline
+@no_alloc
+pub fn write_stderr(text: str) -> isize {
+    return @sys_write(STDERR_FILENO, text);
+}
+
+/// Safe wrapper terminating the process with `status_code`.
+@cold
+@noinline
+@no_alloc
+pub fn exit_process(status_code: i32) -> never {
+    @sys_exit(status_code);
+}

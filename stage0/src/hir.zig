@@ -567,6 +567,42 @@ pub const HirMatchArm = struct {
     origin_token: TokenIndex,
 };
 
+/// Packed 1-byte boolean flags governing `@must_vectorize` and `@vectorize_width` checks (`DR-19` §1, `DR-20` Seam #4).
+pub const LoopContractMask = packed struct(u8) {
+    /// `true` when `@must_vectorize` requires backend loop vectorization.
+    is_must_vectorize: bool = false,
+    /// `true` when predicated early exits are permitted inside the vectorized loop.
+    has_predicated_early_exit: bool = false,
+    /// `true` when scalable vectorization (`vscale`) is allowed on SVE/RVV targets.
+    is_scalable_allowed: bool = true,
+    /// `true` when SLP / unroll-and-jam satisfaction is permitted.
+    is_slp_unroll_allowed: bool = true,
+    /// `true` when floating-point reduction reassociation is permitted.
+    has_reassoc_fp_reduce: bool = false,
+    /// Reserved bits (`0`).
+    _reserved: u3 = 0,
+};
+
+/// 8-byte SIMD loop contract payload recorded per `loop_id` (`DR-19` §1, `DR-20` Seam #4).
+pub const LoopContractMeta = extern struct {
+    /// Packed loop contract flags (`1B`).
+    contract_flags: LoopContractMask = .{},
+    /// Target override mask (`0` when target-default).
+    target_override_mask: u8 = 0,
+    /// Explicit `@vectorize_width(N)` lane count (`0` = canonical target vector width / `sizeof(elem)`).
+    min_lanes: u16 = 0,
+    /// Pre-allocated diagnostic handle (`DiagId.none` when unused).
+    diag_id: mem_foundation.DiagId = .none,
+
+    /// Alias matching `DR-19` `LoopContractMeta.Flags`.
+    pub const Flags = LoopContractMask;
+};
+
+comptime {
+    std.debug.assert(@sizeOf(LoopContractMask) == 1 and @bitSizeOf(LoopContractMask) == 8);
+    std.debug.assert(@sizeOf(LoopContractMeta) == 8);
+}
+
 // ------------------ Comptime Evaluation Hook ------------------
 
 /// Pluggable callback interface allowing Wave 2C's `MirVm` and `CompilerDb` to evaluate Tier-2 `comptime`
@@ -597,6 +633,14 @@ pub const ComptimeEvalHook = struct {
 
 // -------------------- SoA HIR Arena Store ---------------------
 
+/// Slice descriptor in `HirStore.extra_data` storing concrete `TypeId` words for a generic `hir_call`.
+pub const CallTypeArgsSpan = struct {
+    /// Start index in `HirStore.extra_data`.
+    start: u32,
+    /// Number of `TypeId` words recorded for the call instantiation.
+    len: u16,
+};
+
 /// Per-module or per-`DefId` Structure-of-Arrays `HIR` arena (`DR-13` §2.1).
 pub const HirStore = struct {
     /// Backing allocator for growable SoA columns and side tables.
@@ -623,6 +667,10 @@ pub const HirStore = struct {
     const_pool: std.ArrayListUnmanaged(ComptimeValue) = .empty,
     /// Flat constant-pool child indices for aggregate `ComptimeValue`s.
     const_elements: std.ArrayListUnmanaged(u32) = .empty,
+    /// Sparse `@must_vectorize` / `@vectorize_width(N)` contracts keyed by `hir_loop` `loop_id`.
+    loop_contracts: std.AutoHashMapUnmanaged(u32, LoopContractMeta) = .empty,
+    /// Sparse explicit/inferred generic type-argument spans keyed by `hir_call` `HirIndex`.
+    call_type_args: std.AutoHashMapUnmanaged(u32, CallTypeArgsSpan) = .empty,
     /// Root `hir_module` or single-item `HirIndex` (`.none` when empty).
     root_hir: HirIndex = .none,
     /// `true` if `MAX_HIR_NODES` or `MAX_HIR_LOWER_DEPTH` was exceeded (`E0508`).
@@ -647,6 +695,8 @@ pub const HirStore = struct {
         self.functions.deinit(self.allocator);
         self.const_pool.deinit(self.allocator);
         self.const_elements.deinit(self.allocator);
+        self.loop_contracts.deinit(self.allocator);
+        self.call_type_args.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -902,6 +952,10 @@ const HirLowerer = struct {
     has_emitted_limit_diag: bool = false,
     /// Active function boundary local floor for closure capture detection (`0` at module level).
     closure_outer_local_ceil: u32 = 0,
+    /// Enclosing top-level item `DefId` used to mint collision-free synthetic closure `DefId`s.
+    active_owner_def_id: DefId = .NONE,
+    /// Monotonic closure ordinal within `active_owner_def_id` (deterministic across module vs per-`DefId` lowering).
+    closure_ordinal_in_owner: u32 = 0,
     /// Collected `(outer_local_id, inner_local_id)` pairs for the currently lowering closure.
     active_closure_captures: std.ArrayListUnmanaged(u32) = .empty,
 
@@ -1388,6 +1442,8 @@ const HirLowerer = struct {
     /// Lowers a single `DefId` item (and any `@derive` methods if `DefId` is a nominal type) in isolation.
     fn lowerSingleDef(self: *HirLowerer, def_id: DefId) !HirIndex {
         if (def_id.isNone()) return .none;
+        self.active_owner_def_id = def_id;
+        self.closure_ordinal_in_owner = 0;
         const mod_scope = self.sym_table.file_module_scopes.get(self.store.file_id.asInt()) orelse
             self.sym_table.prelude_scope;
         self.current_scope = mod_scope;
@@ -1528,7 +1584,9 @@ const HirLowerer = struct {
                     }
                 },
                 .module_sym => {
-                    if (!sym.target_scope.isNone() and !sym.ast_node.isNone()) {
+                    if (!sym.target_scope.isNone() and !sym.ast_node.isNone() and
+                        self.sym_table.scope_arena.getScope(sym.target_scope).file_id == self.store.file_id)
+                    {
                         const sub_slice = self.getAstExtraSlice(sym.ast_node, true);
                         try self.lowerItemSlice(sym.target_scope, sub_slice, out_items);
                     }
@@ -1650,6 +1708,8 @@ const HirLowerer = struct {
         const saved_ret_ty = self.current_fn_ret_ty;
         const saved_loop_id = self.current_loop_id;
         const saved_closure_ceil = self.closure_outer_local_ceil;
+        const saved_owner_def = self.active_owner_def_id;
+        const saved_closure_ord = self.closure_ordinal_in_owner;
         const local_checkpoint = self.local_shadow_log.items.len;
         const ct_checkpoint = self.comptime_shadow_log.items.len;
         defer {
@@ -1659,12 +1719,18 @@ const HirLowerer = struct {
             self.current_fn_ret_ty = saved_ret_ty;
             self.current_loop_id = saved_loop_id;
             self.closure_outer_local_ceil = saved_closure_ceil;
+            self.active_owner_def_id = saved_owner_def;
+            self.closure_ordinal_in_owner = saved_closure_ord;
         }
 
         self.current_scope = if (!fn_sym.target_scope.isNone()) fn_sym.target_scope else fn_sym.scope_id;
         self.current_fn_ret_ty = sig_view.ret_ty;
         self.current_loop_id = null;
         self.closure_outer_local_ceil = 0;
+        if (!fn_sym.def_id.isNone()) {
+            self.active_owner_def_id = fn_sym.def_id;
+            self.closure_ordinal_in_owner = 0;
+        }
 
         // [1] Reserve local slot `0` (relative to function start) for `_return_slot`:
         const return_local_id = try self.store.appendLocal(.{
@@ -1815,6 +1881,68 @@ const HirLowerer = struct {
         const sym = self.sym_table.getSymbol(fn_sym_idx).*;
         return self.hasAttrNamedInCst(sym.cst_node, "noalloc") or
             self.hasAttrNamedInCst(sym.cst_node, "contextless");
+    }
+
+    /// Extracts leading `@must_vectorize` and `@vectorize_width(N)` CST attributes on `ast_id` into `store.loop_contracts`.
+    fn recordLoopContractFromAst(self: *HirLowerer, ast_id: NodeIndex, loop_id: u32) !void {
+        if (ast_id.isNone() or ast_id.asInt() >= self.ast_arena.countNodes()) return;
+        const cst_id = self.ast_arena.getCstOrigin(ast_id);
+        if (cst_id.isNone() or cst_id.asInt() >= self.cst_arena.countNodes()) return;
+        const start_idx: usize = cst_id.asInt();
+        const rec = self.cst_arena.getNode(cst_id);
+        const end_idx: usize = @min(
+            start_idx + @max(@as(usize, rec.subtree_size), 1),
+            self.cst_arena.countNodes(),
+        );
+        var meta: LoopContractMeta = .{};
+        var has_contract = false;
+        var cur = start_idx + 1;
+        while (cur < end_idx) {
+            const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+            if (sub.kind == .block or sub.kind == .for_stmt or sub.kind == .while_stmt) break;
+            if (sub.kind == .attribute) {
+                const attr_end = @min(cur + @max(@as(usize, sub.subtree_size), 1), end_idx);
+                var attr_name: []const u8 = "";
+                var width_val: ?u16 = null;
+                var leaf_cur = cur + 1;
+                while (leaf_cur < attr_end) : (leaf_cur += 1) {
+                    const leaf = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(leaf_cur)));
+                    if (leaf.subtree_size <= 1 and !leaf.token.isNone() and
+                        leaf.token.asInt() < self.tokens.countTokens())
+                    {
+                        const tk = self.tokens.getToken(leaf.token).kind;
+                        if (attr_name.len == 0 and symbol_resolver.isIdentifierToken(tk)) {
+                            attr_name = symbol_resolver.extractTokenSlice(self.source, self.tokens, leaf.token);
+                        } else if (tk == .int_lit and width_val == null) {
+                            const num_text = symbol_resolver.extractTokenSlice(self.source, self.tokens, leaf.token);
+                            if (std.fmt.parseInt(u32, num_text, 0) catch null) |parsed_width| {
+                                if (parsed_width >= 1 and parsed_width <= std.math.maxInt(u16)) {
+                                    width_val = @intCast(parsed_width);
+                                }
+                            }
+                        }
+                    }
+                }
+                if (std.mem.eql(u8, attr_name, "must_vectorize")) {
+                    meta.contract_flags.is_must_vectorize = true;
+                    if (width_val) |lanes| meta.min_lanes = lanes;
+                    has_contract = true;
+                } else if (std.mem.eql(u8, attr_name, "vectorize_width")) {
+                    if (width_val) |lanes| meta.min_lanes = lanes;
+                    has_contract = true;
+                }
+                cur = attr_end;
+                continue;
+            }
+            if (sub.subtree_size > 1) {
+                cur += sub.subtree_size;
+                continue;
+            }
+            cur += 1;
+        }
+        if (has_contract) {
+            try self.store.loop_contracts.put(self.allocator, loop_id, meta);
+        }
     }
 
     // --------- Phase 3 Two-Phase `@derive` Body Synthesis ---------
@@ -3722,6 +3850,7 @@ const HirLowerer = struct {
 
         const loop_id = self.next_loop_id;
         self.next_loop_id += 1;
+        try self.recordLoopContractFromAst(stmt_id, loop_id);
         const saved_loop_id = self.current_loop_id;
         const saved_in_ct_for = self.is_in_comptime_for;
         self.current_loop_id = loop_id;
@@ -4163,6 +4292,7 @@ const HirLowerer = struct {
 
         const loop_id = self.next_loop_id;
         self.next_loop_id += 1;
+        try self.recordLoopContractFromAst(stmt_id, loop_id);
         const saved_loop_id = self.current_loop_id;
         const saved_in_ct_for = self.is_in_comptime_for;
         self.current_loop_id = loop_id;
@@ -5377,16 +5507,25 @@ const HirLowerer = struct {
             }
         }
 
-        var final_fields = try self.allocator.alloc(u32, total_fields);
-        defer self.allocator.free(final_fields);
-        for (0..total_fields) |ord_idx| {
-            const f_hir = if (!field_slots[ord_idx].isNone())
-                field_slots[ord_idx]
-            else
-                try self.emitDefaultInitValue(canonical_tys.items[ord_idx], tok);
-            final_fields[ord_idx] = f_hir.asInt();
+        var final_fields: std.ArrayListUnmanaged(u32) = .empty;
+        defer final_fields.deinit(self.allocator);
+        if (struct_node.tag == .union_ty) {
+            for (0..total_fields) |ord_idx| {
+                if (!field_slots[ord_idx].isNone()) {
+                    try final_fields.append(self.allocator, field_slots[ord_idx].asInt());
+                }
+            }
+        } else {
+            try final_fields.ensureTotalCapacity(self.allocator, total_fields);
+            for (0..total_fields) |ord_idx| {
+                const f_hir = if (!field_slots[ord_idx].isNone())
+                    field_slots[ord_idx]
+                else
+                    try self.emitDefaultInitValue(canonical_tys.items[ord_idx], tok);
+                final_fields.appendAssumeCapacity(f_hir.asInt());
+            }
         }
-        const extra_idx = try self.store.appendLenPrefixedExtra(final_fields);
+        const extra_idx = try self.store.appendLenPrefixedExtra(final_fields.items);
         const construct_hir = try self.emitNode(.{
             .tag = .hir_construct,
             .flags = .{ .category = .rvalue },
@@ -6865,11 +7004,55 @@ const HirLowerer = struct {
             .origin_token = tok,
             .data = .{ .lhs = callee_hir.asInt(), .rhs = extra_idx },
         }, expr_id);
+        if (!is_sub) {
+            try self.recordCallTypeArgs(expr_id, call_hir, type_arg_nodes.items);
+        }
 
         if (seq_stmts.items.len > 0) {
             return self.emitSyntheticBlock(seq_stmts.items, call_hir, ret_ty, tok);
         }
         return call_hir;
+    }
+
+    /// Persists explicit or `TypeChecker`-instantiated generic type arguments for `call_hir` in `store.call_type_args`.
+    fn recordCallTypeArgs(
+        self: *HirLowerer,
+        call_ast_id: NodeIndex,
+        call_hir: HirIndex,
+        type_arg_nodes: []const NodeIndex,
+    ) !void {
+        if (call_hir.isNone()) return;
+        if (self.side_tables) |tables| {
+            if (tables.getCallInstantiation(call_ast_id)) |inst_slice| {
+                if (inst_slice.len > 0) {
+                    const start_idx: u32 = @intCast(self.store.extra_data.items.len);
+                    for (inst_slice) |inst_ty| {
+                        try self.store.extra_data.append(self.allocator, self.concreteType(inst_ty).toU32());
+                    }
+                    try self.store.call_type_args.put(self.allocator, call_hir.asInt(), .{
+                        .start = start_idx,
+                        .len = @intCast(inst_slice.len),
+                    });
+                    return;
+                }
+            }
+        }
+        if (type_arg_nodes.len == 0) return;
+        const start_idx: u32 = @intCast(self.store.extra_data.items.len);
+        for (type_arg_nodes) |t_node_id| {
+            const node_ty = self.nodeType(t_node_id);
+            const resolved_ty = if (!node_ty.isError())
+                node_ty
+            else blk: {
+                const fallback_ty = self.resolveSimpleTypeAstFallback(t_node_id);
+                break :blk if (!fallback_ty.isError()) fallback_ty else TypeId.unit_ty;
+            };
+            try self.store.extra_data.append(self.allocator, self.concreteType(resolved_ty).toU32());
+        }
+        try self.store.call_type_args.put(self.allocator, call_hir.asInt(), .{
+            .start = start_idx,
+            .len = @intCast(type_arg_nodes.len),
+        });
     }
 
     /// Lowers all 12 Phase 5 `@intrinsic` calls (`DR-05` Deliverable 2), folding reflection queries eagerly when concrete.
@@ -6981,13 +7164,41 @@ const HirLowerer = struct {
             try payload_words.append(self.allocator, (try self.lowerExpr(v_arg_id, .err_ty)).asInt());
         }
         const extra_idx = try self.store.appendExtraSlice(payload_words.items);
-        const res_ty = if (!target_ty.isError())
-            target_ty
+        const checked_call_ty = if (!target_ty.isError()) target_ty else self.nodeType(call_id);
+        const res_ty = if (!checked_call_ty.isError())
+            checked_call_ty
         else switch (intr_kind) {
             .bit_cast => type_args[0],
             .from_bytes => try self.pool.internOptional(type_args[0]),
             .view_bytes => try self.pool.internOptional(try self.pool.internRef(type_args[0], false)),
-            .as_bytes => try self.pool.internRef(try self.pool.internSlice(.u8_ty, false), false),
+            .as_bytes, .embed_bytes => try self.pool.internRef(try self.pool.internSlice(.u8_ty, false), false),
+            .type_name => .str_ty,
+            .size_of, .align_of => .usize_ty,
+            .has_field, .implements, .poll_reload => .bool_ty,
+            .compile_error, .panic, .trap, .sys_exit => .never_ty,
+            .sys_write => .isize_ty,
+            .atomic_load, .atomic_rmw_add, .atomic_rmw_sub, .atomic_rmw_xchg => if (type_arg_nodes.len >= 1)
+                type_args[0]
+            else
+                .usize_ty,
+            .atomic_cmpxchg => blk_cmpxchg_ty: {
+                const elem_ty = if (type_arg_nodes.len >= 1) type_args[0] else .usize_ty;
+                const pair_elems = [2]TypeId{ elem_ty, .bool_ty };
+                break :blk_cmpxchg_ty try self.pool.internTuple(&pair_elems);
+            },
+            .simd_splat, .simd_add, .simd_sub, .simd_mul => if (type_arg_nodes.len >= 1)
+                type_args[0]
+            else
+                .f32_ty,
+            .simd_reduce_add => blk_reduce_ty: {
+                if (type_arg_nodes.len >= 1) {
+                    const vec_ty = self.pool.unwrapUnderlyingType(type_args[0]);
+                    if (!vec_ty.isPrimitive() and self.pool.getTag(vec_ty) == .array_ty) {
+                        break :blk_reduce_ty TypeId.fromInt(self.pool.getNode(vec_ty).lhs);
+                    }
+                }
+                break :blk_reduce_ty .f32_ty;
+            },
             else => .unit_ty,
         };
         return self.emitNode(.{
@@ -7011,12 +7222,17 @@ const HirLowerer = struct {
         const member_tok = TokenIndex.fromInt(raw_items[0]);
         const member_name = symbol_resolver.extractTokenSlice(self.source, self.tokens, member_tok);
 
+        var type_arg_nodes: std.ArrayListUnmanaged(NodeIndex) = .empty;
+        defer type_arg_nodes.deinit(self.allocator);
         var val_arg_nodes: std.ArrayListUnmanaged(NodeIndex) = .empty;
         defer val_arg_nodes.deinit(self.allocator);
         for (raw_items[1..]) |raw_item| {
             const item_id = NodeIndex.fromInt(raw_item);
             if (item_id.asInt() >= self.ast_arena.countNodes()) continue;
-            if (isTypeAstTag(self.ast_arena.getNode(item_id).tag)) continue;
+            if (isTypeAstTag(self.ast_arena.getNode(item_id).tag)) {
+                try type_arg_nodes.append(self.allocator, item_id);
+                continue;
+            }
             try val_arg_nodes.append(self.allocator, item_id);
         }
         const val_args = val_arg_nodes.items;
@@ -7179,13 +7395,17 @@ const HirLowerer = struct {
             self.concreteType(sv.ret_ty)
         else
             .unit_ty;
+        const is_sub_method = self.isCalleeSubscript(callee_hir);
         const call_hir = try self.emitNode(.{
-            .tag = if (self.isCalleeSubscript(callee_hir)) .hir_subscript_call else .hir_call,
+            .tag = if (is_sub_method) .hir_subscript_call else .hir_call,
             .flags = .{ .category = .rvalue, .is_unsafe = self.is_in_unsafe },
             .type_id = ret_ty,
             .origin_token = tok,
             .data = .{ .lhs = callee_hir.asInt(), .rhs = extra_idx },
         }, expr_id);
+        if (!is_sub_method) {
+            try self.recordCallTypeArgs(expr_id, call_hir, type_arg_nodes.items);
+        }
 
         if (seq_stmts.items.len > 0) {
             return self.emitSyntheticBlock(seq_stmts.items, call_hir, ret_ty, tok);
@@ -7890,6 +8110,7 @@ const HirLowerer = struct {
         const body_id = if (ast_node.lhs.tag == .node) NodeIndex.fromInt(ast_node.lhs.payload) else .none;
         const loop_id = self.next_loop_id;
         self.next_loop_id += 1;
+        try self.recordLoopContractFromAst(expr_id, loop_id);
         const saved_loop_id = self.current_loop_id;
         const saved_in_ct_for = self.is_in_comptime_for;
         self.current_loop_id = loop_id;
@@ -7962,12 +8183,16 @@ const HirLowerer = struct {
                 (if (i < sv.paramCount()) self.concreteType(sv.getParamType(i)) else .i32_ty)
             else
                 .i32_ty;
+            const p_mode = if (sig_view) |sv|
+                (if (i < sv.paramCount()) sv.getParamMode(i) else .let_mode)
+            else
+                .let_mode;
             const slot_id = try self.store.appendLocal(.{
                 .name = p_name,
                 .type_id = p_ty,
                 .decl_span = self.tokens.getTokenSpan(self.store.file_id, p_tok),
-                .mode = .let_mode,
-                .is_mut = false,
+                .mode = p_mode,
+                .is_mut = (p_mode == .inout_mode or p_mode == .set_mode),
                 .is_param = true,
                 .is_temp = false,
             });
@@ -7976,7 +8201,18 @@ const HirLowerer = struct {
 
         const is_local_clos = self.hasAttrNamedInCst(self.ast_arena.getCstOrigin(expr_id), "local");
         const fn_meta_idx: u32 = @intCast(self.store.functions.items.len);
+        const clos_ord = self.closure_ordinal_in_owner;
+        self.closure_ordinal_in_owner += 1;
+        const file_bits: u32 = if (!self.store.file_id.isNone()) self.store.file_id.asInt() & 0x01FF else 0;
+        const owner_bits: u32 = if (!self.active_owner_def_id.isNone())
+            @as(u32, self.active_owner_def_id.itemIndex()) & 0x0FFF
+        else
+            0x0FFF;
+        const synth_closure_def = DefId.fromInt(
+            0x5000_0000 + (file_bits << 20) + (owner_bits << 8) + (clos_ord & 0x00FF),
+        );
         try self.store.functions.append(self.allocator, .{
+            .def_id = synth_closure_def,
             .fn_ty = self.concreteType(target_ty),
             .ret_ty = ret_ty,
             .return_local_id = return_local_id,

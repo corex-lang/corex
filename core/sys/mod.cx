@@ -1,0 +1,64 @@
+//! Cross-Platform Syscall Descriptors and Safe Stream I/O (`core::sys`)
+//!
+//! Re-exports platform-specific syscall descriptor submodules (`linux`, `macos`, `windows`, `wasi`)
+//! and provides safe, allocation-free standard-stream write and process-termination helpers backed
+//! by `@sys_write` and `@sys_exit`.
+//!
+//! All `write_*` and `exit_process` helpers preserve byte-exact parity across `MirVm`, Tier A
+//! (`-ofmt=c`), and Tier B (`LLVM`) on Windows, Linux, macOS, and `wasm32-wasi`.
+
+/// Linux (`x86_64` / `aarch64`) POSIX syscall prototypes and standard file descriptors.
+pub mod linux;
+
+/// Apple macOS (`aarch64` / `x86_64`) BSD `libSystem` prototypes and standard file descriptors.
+pub mod macos;
+
+/// Windows (`x86_64` / `aarch64`) Win32 `kernel32` console/process prototypes and handle constants.
+pub mod windows;
+
+/// WebAssembly System Interface (`wasm32-wasi` Preview 1) `wasi_snapshot_preview1` prototypes.
+pub mod wasi;
+
+// --------------------------------------- CONSTS ----------------------------------------
+/// Canonical standard output stream descriptor (`1`).
+pub const STDOUT_FD: i32 = 1;
+
+/// Canonical standard error stream descriptor (`2`).
+pub const STDERR_FD: i32 = 2;
+
+// ------------------------------------- PUBLIC API --------------------------------------
+/// Writes raw UTF-8 `text` to standard output (`fd = 1`) and returns the byte count written.
+@inline
+@no_alloc
+pub fn write_stdout(text: str) -> isize {
+    return @sys_write(STDOUT_FD, text);
+}
+
+/// Writes raw `bytes` slice to standard output (`fd = 1`) and returns the byte count written.
+@inline
+@no_alloc
+pub fn write_stdout_bytes(bytes: &[u8]) -> isize {
+    return @sys_write(STDOUT_FD, bytes);
+}
+
+/// Writes raw UTF-8 `text` to standard error (`fd = 2`) and returns the byte count written.
+@inline
+@no_alloc
+pub fn write_stderr(text: str) -> isize {
+    return @sys_write(STDERR_FD, text);
+}
+
+/// Writes raw `bytes` slice to standard error (`fd = 2`) and returns the byte count written.
+@inline
+@no_alloc
+pub fn write_stderr_bytes(bytes: &[u8]) -> isize {
+    return @sys_write(STDERR_FD, bytes);
+}
+
+/// Immediately terminates the current process with `status_code` (`@sys_exit`).
+@cold
+@noinline
+@no_alloc
+pub fn exit_process(status_code: i32) -> never {
+    @sys_exit(status_code);
+}

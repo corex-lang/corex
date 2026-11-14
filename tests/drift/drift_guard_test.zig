@@ -198,10 +198,69 @@ fn markReferencedIdentifiersInDir(
     }
 }
 
+/// Verifies `< 150` col lines, 90/65-char dividers, and `corex fmt` idempotency (`!is_changed`) on `cx_path`.
+fn checkCxFileFormattingAndDividers(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cx_path: []const u8,
+) !void {
+    const raw_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        cx_path,
+        allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer allocator.free(raw_bytes);
+
+    var norm_buf = try std.ArrayList(u8).initCapacity(allocator, raw_bytes.len);
+    defer norm_buf.deinit(allocator);
+    for (raw_bytes) |byte_val| {
+        if (byte_val != '\r') norm_buf.appendAssumeCapacity(byte_val);
+    }
+
+    try checkZigFileFormattingAndDividers(allocator, io, cx_path);
+
+    var fmt_res = try corex.formatSourceWithOptions(
+        allocator,
+        norm_buf.items,
+        corex.FileId.fromInt(0),
+        .{},
+    );
+    defer fmt_res.deinit(allocator);
+    try std.testing.expect(!fmt_res.has_syntax_errors);
+    if (fmt_res.is_changed) {
+        std.debug.print("Drift Guard Phase 7: `{s}` is not formatted canonically\n", .{cx_path});
+    }
+    try std.testing.expect(!fmt_res.is_changed);
+}
+
+/// Recursively walks `dir_path` and checks all `.cx` files for `< 150` cols, dividers, and `corex fmt` parity.
+fn walkCxDirectoryFormatting(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir_path: []const u8,
+) !void {
+    var opened_dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer opened_dir.close(io);
+
+    var walker = try opened_dir.walk(allocator);
+    defer walker.deinit();
+
+    var found_cx_count: usize = 0;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".cx")) continue;
+        const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.path });
+        defer allocator.free(full_path);
+        try checkCxFileFormattingAndDividers(allocator, io, full_path);
+        found_cx_count += 1;
+    }
+    try std.testing.expect(found_cx_count >= 12);
+}
+
 // ------------------------------------- PUBLIC API --------------------------------------
 
 test "test_drift_guard_zero_colored_emojis_across_repository" {
-    for ([_][]const u8{ "stage0", "tests", "bench", "docs", ".agents" }) |dir_name| {
+    for ([_][]const u8{ "stage0", "core", "tests", "bench", "docs", ".agents" }) |dir_name| {
         try walkDirectoryZeroBannedEmojis(std.testing.allocator, std.testing.io, dir_name);
     }
     for ([_][]const u8{ "PLAN.md", "CHANGELOG.md", "README.md", "build.zig" }) |file_name| {
@@ -470,11 +529,18 @@ test "test_drift_guard_phase5_hir_mir_vm_opt_layouts_cli_flags_and_diagnostics" 
     try expectContiguousEnum(corex.IntrinsicKind);
 
     // [3] Verify `router.COMPILE_FLAGS` alphabetical sorting, summaries, subcommand help, and `parseArgs`:
-    try std.testing.expectEqual(@as(usize, 4), router.COMPILE_FLAGS.len);
+    try std.testing.expectEqual(@as(usize, 11), router.COMPILE_FLAGS.len);
     try std.testing.expectEqualStrings("--comptime-limit", router.COMPILE_FLAGS[0].long_flag);
     try std.testing.expectEqualStrings("--dev", router.COMPILE_FLAGS[1].long_flag);
-    try std.testing.expectEqualStrings("--release", router.COMPILE_FLAGS[2].long_flag);
-    try std.testing.expectEqualStrings("--sast-strict", router.COMPILE_FLAGS[3].long_flag);
+    try std.testing.expectEqualStrings("--diff-backends", router.COMPILE_FLAGS[2].long_flag);
+    try std.testing.expectEqualStrings("--emit-c", router.COMPILE_FLAGS[3].long_flag);
+    try std.testing.expectEqualStrings("--emit-llvm", router.COMPILE_FLAGS[4].long_flag);
+    try std.testing.expectEqualStrings("--fuzz", router.COMPILE_FLAGS[5].long_flag);
+    try std.testing.expectEqualStrings("--ofmt", router.COMPILE_FLAGS[6].long_flag);
+    try std.testing.expectEqualStrings("--output", router.COMPILE_FLAGS[7].long_flag);
+    try std.testing.expectEqualStrings("--release", router.COMPILE_FLAGS[8].long_flag);
+    try std.testing.expectEqualStrings("--sast-strict", router.COMPILE_FLAGS[9].long_flag);
+    try std.testing.expectEqualStrings("--target", router.COMPILE_FLAGS[10].long_flag);
     for (router.COMPILE_FLAGS, 0..) |comp_flag, i| {
         try std.testing.expectEqual(i, @as(usize, @backingInt(comp_flag.id)));
         try std.testing.expect(comp_flag.summary.len > 0);
@@ -742,4 +808,89 @@ test "test_drift_guard_phase6_sast_layouts_seams_cli_and_diagnostics" {
         combined_cap_bits |= cap_spec.expected_bit;
     }
     try std.testing.expectEqual(@as(u16, 0x0FFF), combined_cap_bits);
+}
+
+test "test_drift_guard_phase7_abi_codegen_seam_layouts_and_core" {
+    // [1] Verify exact Phase 7 ABI, layout, Pentagon range, loop-contract, and dev-seam byte sizes:
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(corex.TargetSpec));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(corex.NicheSpec));
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(corex.ResolvedTypeLayout));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(corex.AbiParamRecipe));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(corex.ProvenValueRange));
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(corex.mir.LoopContractMeta));
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(corex.MirBasicBlock));
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(corex.CxDevSeamHeader));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(corex.CxGotSlotMeta));
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(corex.CxTypeLayoutRecord));
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(corex.CxReloadControlBlock));
+
+    // [2] Verify Apple Silicon (`aarch64-macos`) `128B` (`2^7`) `@cache_aligned` layout invariant (`D-10A`).
+    try std.testing.expectEqual(
+        @as(u8, 7),
+        corex.TargetSpec.AARCH64_MACOS.asTargetLayout().cache_line_align_log2,
+    );
+    try std.testing.expectEqual(
+        @as(u8, 6),
+        corex.TargetSpec.X86_64_LINUX.asTargetLayout().cache_line_align_log2,
+    );
+
+    // [3] Verify `stage0/src/codegen_dev_seam.zig` stays strictly `< 200` lines (`Prune-04`).
+    const seam_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "stage0/src/codegen_dev_seam.zig",
+        std.testing.allocator,
+        .limited(1024 * 1024),
+    );
+    defer std.testing.allocator.free(seam_bytes);
+    var seam_line_count: usize = 1;
+    for (seam_bytes) |byte_val| {
+        if (byte_val == '\n') seam_line_count += 1;
+    }
+    if (seam_bytes.len > 0 and seam_bytes[seam_bytes.len - 1] == '\n') {
+        seam_line_count -= 1;
+    }
+    try std.testing.expect(seam_line_count < 200);
+
+    // [4] Verify all `core/**/*.cx` files obey `< 150` cols, 90/65-char dividers, and `corex fmt --check`:
+    try walkCxDirectoryFormatting(std.testing.allocator, std.testing.io, "core");
+
+    // [5] Verify Phase 7 diagnostics (`E0006`, `E0007`, `E0008`) and test-suite references:
+    const phase7_specs = [_]struct {
+        /// Canonical Phase 7 `DiagnosticCode` tag.
+        code: DiagnosticCode,
+        /// Expected 5-character CLI code string.
+        expected_str: []const u8,
+    }{
+        .{ .code = .e0006_invalid_target_triple, .expected_str = "E0006" },
+        .{ .code = .e0007_codegen_backend_failure, .expected_str = "E0007" },
+        .{ .code = .e0008_linker_invocation_failed, .expected_str = "E0008" },
+    };
+
+    var tag_identifiers: [phase7_specs.len][]const u8 = undefined;
+    var has_test_reference: [phase7_specs.len]bool = @splat(false);
+    for (phase7_specs, 0..) |spec, i| {
+        const entry = diagnostic.DIAGNOSTIC_CATALOG[@backingInt(spec.code)];
+        try std.testing.expectEqualStrings(spec.expected_str, spec.code.asCodeStr());
+        try std.testing.expectEqualStrings(spec.expected_str, entry.code_str);
+        try std.testing.expect(entry.title.len > 0);
+        try std.testing.expect(entry.explanation.len > 0);
+        tag_identifiers[i] = @tagName(spec.code);
+    }
+
+    try markReferencedIdentifiersInDir(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/unit",
+        &tag_identifiers,
+        &has_test_reference,
+    );
+    for (has_test_reference, 0..) |has_ref, i| {
+        if (!has_ref) {
+            std.debug.print(
+                "Phase 7 diagnostic `{s}` is not referenced in `tests/unit/`\n",
+                .{tag_identifiers[i]},
+            );
+        }
+        try std.testing.expect(has_ref);
+    }
 }

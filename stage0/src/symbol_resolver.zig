@@ -350,8 +350,12 @@ pub const DeclContractFlags = packed struct(u16) {
     is_local_only: bool = false,
     /// `true` if annotated with `@ifunc` (`DR-17` §4.2 Gate C indirect resolver).
     is_ifunc: bool = false,
-    /// Reserved zero bits keeping `DeclContractFlags` at `2` bytes.
-    _reserved: u3 = 0,
+    /// `true` if annotated with `@repr(C)` or `@repr(c)`.
+    is_repr_c: bool = false,
+    /// `true` if annotated with `@packed` or `@repr(packed)`.
+    is_packed: bool = false,
+    /// `true` if annotated with `@cache_aligned` (`DR-20` `D-10A`).
+    is_cache_aligned: bool = false,
 
     comptime {
         std.debug.assert(@sizeOf(DeclContractFlags) == 2);
@@ -452,8 +456,12 @@ pub const SymbolRecord = struct {
     cap_clears_mask: u16 = 0,
     /// Interned section name when `contract_flags.has_link_section` is `true` (`@link_section("…")`).
     link_section_name: []const u8 = "",
+    /// Interned external symbol name when `contract_flags.has_link_name` is `true` (`@link_name("…")`).
+    link_name_text: []const u8 = "",
     /// Explicit discriminant width in bits on `@repr(u8/u16/u32/u64)` `enum` declarations (`0` = default).
     repr_tag_bits: u8 = 0,
+    /// Explicit power-of-two alignment encoded as `log2(align) + 1` (`0` = default).
+    explicit_align_log2_plus1: u8 = 0,
 };
 
 /// Explicit `@overload` function group tracking all member `fn_sym` symbols in a scope (`DR-02`).
@@ -500,8 +508,12 @@ pub const LookupResult = union(enum) {
 
 /// Recognized built-in declaration header attribute selector for `extractItemHeaderMetadataValidated`.
 const HeaderAttrKind = enum(u8) {
+    /// `@align(N)` explicit power-of-two byte alignment attribute.
+    align_attr,
     /// `@attribute_schema` target-constrained schema struct attribute.
     attribute_schema,
+    /// `@cache_aligned` target L1/L2 cache-line alignment attribute (`DR-20` `D-10A`).
+    cache_aligned,
     /// `@derive(Eq, Hash, Debug, Clone)` trait synthesis attribute.
     derive,
     /// `@export` symbol export attribute.
@@ -532,6 +544,8 @@ const HeaderAttrKind = enum(u8) {
     no_panic,
     /// `@overload` explicit function overload group attribute (`DR-02`).
     overload,
+    /// `@packed` 1-byte field alignment attribute.
+    packed_attr,
     /// `@repr(…)` explicit layout and discriminant width attribute.
     repr,
     /// `@secret` constant-time / wire-redacted taint attribute (`DR-20`).
@@ -706,7 +720,9 @@ const REPR_TAG_BITS_MAP = std.StaticStringMap(u8).initComptime(.{
 
 /// $O(1)$ static lookup map from declaration `@attr` identifiers to `HeaderAttrKind`.
 const HEADER_ATTR_MAP = std.StaticStringMap(HeaderAttrKind).initComptime(.{
+    .{ "align", .align_attr },
     .{ "attribute_schema", .attribute_schema },
+    .{ "cache_aligned", .cache_aligned },
     .{ "derive", .derive },
     .{ "export", .export_attr },
     .{ "extern", .extern_attr },
@@ -722,6 +738,7 @@ const HEADER_ATTR_MAP = std.StaticStringMap(HeaderAttrKind).initComptime(.{
     .{ "no_block", .no_block },
     .{ "no_panic", .no_panic },
     .{ "overload", .overload },
+    .{ "packed", .packed_attr },
     .{ "repr", .repr },
     .{ "secret", .secret },
     .{ "soa", .soa },
@@ -956,6 +973,8 @@ pub const SymbolTable = struct {
     file_module_scopes: std.AutoHashMapUnmanaged(u32, ScopeId) = .empty,
     /// Maps module `SymbolId.asInt()` to its root `.module_scope` `ScopeId` for cross-file `mod` / `use`.
     named_module_scopes: std.AutoHashMapUnmanaged(u32, ScopeId) = .empty,
+    /// Maps `(file_id << 32) | mod_name_sym` to the bound external file's root `.module_scope` `ScopeId`.
+    external_module_scopes: std.AutoHashMapUnmanaged(u64, ScopeId) = .empty,
     /// Maps `DefId.asInt()` to its primary `SymbolIndex`.
     def_to_symbol: std.AutoHashMapUnmanaged(u32, SymbolIndex) = .empty,
     /// Maps nominal `TypeId.toU32()` to its defining `SymbolIndex` for field/variant/method lookup.
@@ -1003,6 +1022,7 @@ pub const SymbolTable = struct {
         self.scoped_map.deinit(self.allocator);
         self.file_module_scopes.deinit(self.allocator);
         self.named_module_scopes.deinit(self.allocator);
+        self.external_module_scopes.deinit(self.allocator);
         self.def_to_symbol.deinit(self.allocator);
         self.type_to_symbol.deinit(self.allocator);
         self.from_error_pairs.deinit(self.allocator);
@@ -1030,6 +1050,7 @@ pub const SymbolTable = struct {
         self.scoped_map.clearRetainingCapacity();
         self.file_module_scopes.clearRetainingCapacity();
         self.named_module_scopes.clearRetainingCapacity();
+        self.external_module_scopes.clearRetainingCapacity();
         self.def_to_symbol.clearRetainingCapacity();
         self.type_to_symbol.clearRetainingCapacity();
         self.from_error_pairs.clearRetainingCapacity();
@@ -1040,6 +1061,30 @@ pub const SymbolTable = struct {
         self.scope_arena.resetRetainingCapacity();
         self.std_meta_scope = .none;
         try self.populateGlobalPrelude(interner);
+    }
+
+    /// Binds an external `mod <name>;` declaration in `parent_file_id` to `target_scope`.
+    pub fn bindExternalModuleScope(
+        self: *SymbolTable,
+        parent_file_id: FileId,
+        mod_name: SymbolId,
+        target_scope: ScopeId,
+    ) !void {
+        const key: u64 = (@as(u64, parent_file_id.asInt()) << 32) | @as(u64, mod_name.asInt());
+        try self.external_module_scopes.put(self.allocator, key, target_scope);
+    }
+
+    /// Looks up a bound external `.module_scope` `ScopeId` for `mod <name>;` in `parent_file_id`.
+    pub fn getExternalModuleScope(
+        self: *const SymbolTable,
+        parent_file_id: FileId,
+        mod_name: SymbolId,
+    ) ScopeId {
+        const key: u64 = (@as(u64, parent_file_id.asInt()) << 32) | @as(u64, mod_name.asInt());
+        if (self.external_module_scopes.get(key)) |bound_scope| {
+            if (!bound_scope.isNone()) return bound_scope;
+        }
+        return .none;
     }
 
     /// Lazily populates `std::meta` and its 8 value-based reflection mirror stubs (`DR-05` §3.3).
@@ -1816,12 +1861,23 @@ pub const ItemHeaderMetadata = struct {
     link_section_buf: [256]u8 = undefined,
     /// Valid byte length inside `link_section_buf`.
     link_section_len: u16 = 0,
+    /// Inline decoded external symbol name buffer when `contract_flags.has_link_name` is `true`.
+    link_name_buf: [256]u8 = undefined,
+    /// Valid byte length inside `link_name_buf`.
+    link_name_len: u16 = 0,
     /// Explicit discriminant width in bits on `@repr(…)` items (`0` = default).
     repr_tag_bits: u8 = 0,
+    /// Explicit power-of-two alignment encoded as `log2(align) + 1` (`0` = default).
+    explicit_align_log2_plus1: u8 = 0,
 
     /// Returns the decoded `@link_section` byte slice.
     pub inline fn asLinkSectionSlice(self: *const ItemHeaderMetadata) []const u8 {
         return self.link_section_buf[0..self.link_section_len];
+    }
+
+    /// Returns the decoded `@link_name` byte slice.
+    pub inline fn asLinkNameSlice(self: *const ItemHeaderMetadata) []const u8 {
+        return self.link_name_buf[0..self.link_name_len];
     }
 };
 
@@ -2028,14 +2084,16 @@ fn extractStdCapBoundaryMasks(
     }
 }
 
-/// Extracts explicit discriminant bit width from `@repr(u8 | u16 | u32 | u64 | C)` inside `[arg_start .. attr_end)`.
-fn extractReprTagBits(
+/// Extracts `@repr(C | c | packed | align = N | u8..u64 | i8..i64)` metadata inside `[arg_start .. attr_end)`.
+fn extractReprAttr(
     source: []const u8,
     token_buffer: *const TokenBuffer,
     cst_arena: *const LosslessCstArena,
     arg_start: usize,
     attr_end: usize,
-) u8 {
+    meta: *ItemHeaderMetadata,
+) void {
+    var is_expecting_align = false;
     var arg_cur = arg_start;
     while (arg_cur < attr_end) : (arg_cur += 1) {
         const arg_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cur)));
@@ -2045,11 +2103,103 @@ fn extractReprTagBits(
             continue;
         }
         const arg_kind = token_buffer.getToken(arg_leaf.token).kind;
+        if (arg_kind == .int_lit and is_expecting_align) {
+            const align_lex = extractTokenSlice(source, token_buffer, arg_leaf.token);
+            if (extractAttrUint32Lexeme(align_lex)) |align_bytes| {
+                if (align_bytes > 0 and std.math.isPowerOfTwo(align_bytes) and align_bytes <= (@as(u32, 1) << 29)) {
+                    const log2_plus1: u8 = @as(u8, @intCast(std.math.log2_int(u32, align_bytes))) + 1;
+                    meta.explicit_align_log2_plus1 = @max(meta.explicit_align_log2_plus1, log2_plus1);
+                }
+            }
+            is_expecting_align = false;
+            continue;
+        }
+        if (arg_kind == .eq or arg_kind == .lparen or arg_kind == .rparen) continue;
+        if (arg_kind == .comma) {
+            is_expecting_align = false;
+            continue;
+        }
         if (arg_kind != .prim_type and !isIdentifierToken(arg_kind)) continue;
         const repr_lex = extractTokenSlice(source, token_buffer, arg_leaf.token);
-        if (REPR_TAG_BITS_MAP.get(repr_lex)) |tag_bits| return tag_bits;
+        if (std.mem.eql(u8, repr_lex, "C") or std.mem.eql(u8, repr_lex, "c")) {
+            meta.contract_flags.is_repr_c = true;
+            if (meta.repr_tag_bits == 0) meta.repr_tag_bits = 32;
+        } else if (std.mem.eql(u8, repr_lex, "packed")) {
+            meta.contract_flags.is_packed = true;
+        } else if (std.mem.eql(u8, repr_lex, "align")) {
+            is_expecting_align = true;
+        } else if (REPR_TAG_BITS_MAP.get(repr_lex)) |tag_bits| {
+            meta.repr_tag_bits = tag_bits;
+        }
     }
-    return 0;
+}
+
+/// Extracts `@align(N)` power-of-two alignment inside `[arg_start .. attr_end)`.
+fn extractAlignAttr(
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    arg_start: usize,
+    attr_end: usize,
+    meta: *ItemHeaderMetadata,
+) void {
+    var arg_cur = arg_start;
+    while (arg_cur < attr_end) : (arg_cur += 1) {
+        const arg_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cur)));
+        if (arg_leaf.subtree_size > 1 or arg_leaf.token.isNone() or
+            arg_leaf.token.asInt() >= token_buffer.countTokens())
+        {
+            continue;
+        }
+        if (token_buffer.getToken(arg_leaf.token).kind == .int_lit) {
+            const align_lex = extractTokenSlice(source, token_buffer, arg_leaf.token);
+            if (extractAttrUint32Lexeme(align_lex)) |align_bytes| {
+                if (align_bytes > 0 and std.math.isPowerOfTwo(align_bytes) and align_bytes <= (@as(u32, 1) << 29)) {
+                    const log2_plus1: u8 = @as(u8, @intCast(std.math.log2_int(u32, align_bytes))) + 1;
+                    meta.explicit_align_log2_plus1 = @max(meta.explicit_align_log2_plus1, log2_plus1);
+                }
+            }
+            break;
+        }
+    }
+}
+
+/// Extracts `@link_name("…")` external symbol name inside `[arg_start .. attr_end)`.
+fn extractLinkNameAttr(
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    arg_start: usize,
+    attr_end: usize,
+    meta: *ItemHeaderMetadata,
+) void {
+    var name_cur = arg_start;
+    while (name_cur < attr_end) : (name_cur += 1) {
+        const name_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(name_cur)));
+        if (name_leaf.subtree_size <= 1 and !name_leaf.token.isNone() and
+            name_leaf.token.asInt() < token_buffer.countTokens())
+        {
+            if (token_buffer.getToken(name_leaf.token).kind == .string_lit) {
+                const name_raw = extractTokenSlice(source, token_buffer, name_leaf.token);
+                var unesc_buf: [256]u8 = undefined;
+                const sym_name = unquoteAttrStringLexeme(name_raw, &unesc_buf);
+                var has_ctrl_byte = false;
+                for (sym_name) |byte_val| {
+                    if (byte_val == 0 or byte_val == '\n' or byte_val == '\r' or (byte_val < 0x20 and byte_val != 0x01)) {
+                        has_ctrl_byte = true;
+                        break;
+                    }
+                }
+                if (!has_ctrl_byte and sym_name.len > 0) {
+                    const copy_len = @min(sym_name.len, meta.link_name_buf.len);
+                    @memcpy(meta.link_name_buf[0..copy_len], sym_name[0..copy_len]);
+                    meta.link_name_len = @intCast(copy_len);
+                    meta.contract_flags.has_link_name = true;
+                }
+                break;
+            }
+        }
+    }
 }
 
 /// Returns the next leaf `TokenIndex` inside `[start_cursor .. attr_end)`, or `.none` if exhausted.
@@ -2450,7 +2600,24 @@ pub fn extractItemHeaderMetadataValidated(
                                 .secret => meta.contract_flags.is_secret = true,
                                 .export_attr => meta.contract_flags.is_export = true,
                                 .local => meta.contract_flags.is_local_only = true,
-                                .link_name => meta.contract_flags.has_link_name = true,
+                                .cache_aligned => meta.contract_flags.is_cache_aligned = true,
+                                .packed_attr => meta.contract_flags.is_packed = true,
+                                .align_attr => extractAlignAttr(
+                                    source,
+                                    token_buffer,
+                                    cst_arena,
+                                    attr_cur + 1,
+                                    attr_end,
+                                    &meta,
+                                ),
+                                .link_name => extractLinkNameAttr(
+                                    source,
+                                    token_buffer,
+                                    cst_arena,
+                                    attr_cur + 1,
+                                    attr_end,
+                                    &meta,
+                                ),
                                 .ifunc => {
                                     meta.contract_flags.is_ifunc = true;
                                     if (diagnostic_sink) |sink| {
@@ -2504,15 +2671,14 @@ pub fn extractItemHeaderMetadataValidated(
                                         &meta.cap_clears_mask,
                                     );
                                 },
-                                .repr => {
-                                    meta.repr_tag_bits = extractReprTagBits(
-                                        source,
-                                        token_buffer,
-                                        cst_arena,
-                                        attr_cur + 1,
-                                        attr_end,
-                                    );
-                                },
+                                .repr => extractReprAttr(
+                                    source,
+                                    token_buffer,
+                                    cst_arena,
+                                    attr_cur + 1,
+                                    attr_end,
+                                    &meta,
+                                ),
                                 .derive => {
                                     var arg_cur = attr_cur + 1;
                                     while (arg_cur < attr_end) : (arg_cur += 1) {
@@ -2719,6 +2885,11 @@ fn collectItemSliceInScope(
             interner.get(try interner.intern(link_sec_slice))
         else
             "";
+        const link_name_slice = header_meta.asLinkNameSlice();
+        const interned_link_name: []const u8 = if (link_name_slice.len > 0)
+            interner.get(try interner.intern(link_name_slice))
+        else
+            "";
 
         switch (ast_node.tag) {
             .mod_decl => {
@@ -2731,14 +2902,24 @@ fn collectItemSliceInScope(
                 const name_sym = try interner.intern(name_str);
                 const name_span = token_buffer.getTokenSpan(file_id, name_tok);
 
-                const mod_scope = try sym_table.scope_arena.allocScope(
-                    .module_scope,
-                    enclosing_scope,
-                    def_id,
-                    file_id,
-                    .{},
-                );
-                try sym_table.named_module_scopes.put(sym_table.allocator, name_sym.asInt(), mod_scope);
+                const bound_ext_scope: ScopeId = if (ast_node.rhs.tag != .extra) blk: {
+                    const direct_ext = sym_table.getExternalModuleScope(file_id, name_sym);
+                    if (!direct_ext.isNone()) break :blk direct_ext;
+                    break :blk sym_table.named_module_scopes.get(name_sym.asInt()) orelse .none;
+                } else .none;
+                const mod_scope = if (!bound_ext_scope.isNone())
+                    bound_ext_scope
+                else blk: {
+                    const fresh_scope = try sym_table.scope_arena.allocScope(
+                        .module_scope,
+                        enclosing_scope,
+                        def_id,
+                        file_id,
+                        .{},
+                    );
+                    try sym_table.named_module_scopes.put(sym_table.allocator, name_sym.asInt(), fresh_scope);
+                    break :blk fresh_scope;
+                };
 
                 _ = try sym_table.defineSymbol(.{
                     .name = name_sym,
@@ -2828,7 +3009,9 @@ fn collectItemSliceInScope(
                     .cap_emits_mask = header_meta.cap_emits_mask,
                     .cap_clears_mask = header_meta.cap_clears_mask,
                     .link_section_name = interned_link_sec,
+                    .link_name_text = interned_link_name,
                     .repr_tag_bits = header_meta.repr_tag_bits,
+                    .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
                 }, diagnostic_sink);
 
                 try collectStructOrBitFieldMembers(
@@ -2877,7 +3060,9 @@ fn collectItemSliceInScope(
                     .cap_emits_mask = header_meta.cap_emits_mask,
                     .cap_clears_mask = header_meta.cap_clears_mask,
                     .link_section_name = interned_link_sec,
+                    .link_name_text = interned_link_name,
                     .repr_tag_bits = header_meta.repr_tag_bits,
+                    .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
                 }, diagnostic_sink);
 
                 try collectEnumVariants(
@@ -2995,7 +3180,9 @@ fn collectItemSliceInScope(
                     .target_scope = bf_member_scope,
                     .contract_flags = header_meta.contract_flags,
                     .link_section_name = interned_link_sec,
+                    .link_name_text = interned_link_name,
                     .repr_tag_bits = header_meta.repr_tag_bits,
+                    .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
                 }, diagnostic_sink);
 
                 if (alias_kind == .bit_field_sym and !bf_member_scope.isNone()) {
@@ -3034,6 +3221,8 @@ fn collectItemSliceInScope(
                     .decl_span = name_span,
                     .contract_flags = header_meta.contract_flags,
                     .link_section_name = interned_link_sec,
+                    .link_name_text = interned_link_name,
+                    .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
                 }, diagnostic_sink);
             },
             .fn_decl => {
@@ -3062,6 +3251,8 @@ fn collectItemSliceInScope(
                     .cap_emits_mask = header_meta.cap_emits_mask,
                     .cap_clears_mask = header_meta.cap_clears_mask,
                     .link_section_name = interned_link_sec,
+                    .link_name_text = interned_link_name,
+                    .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
                 }, diagnostic_sink);
             },
             .impl_decl => {

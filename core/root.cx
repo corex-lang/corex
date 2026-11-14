@@ -1,0 +1,29 @@
+//! CoreX Stage-1 Minimal Core Library Root (`core`)
+//!
+//! Exposes foundational freestanding primitives, alignment and layout queries, lock-free atomics,
+//! portable explicit SIMD vectors, deterministic trap/panic handlers, hot-reload runtime seams,
+//! and platform syscall descriptors for Stage-1 CoreX programs.
+//!
+//! All modules inside `core` are strictly typed, heap-allocation-free (`@no_alloc` compatible),
+//! and verified across `MirVm`, Tier A (`-ofmt=c`), and Tier B (`LLVM`).
+
+/// Scalar integer bounds and branch-clean min/max/clamp helpers.
+pub mod primitives;
+
+/// Memory layout queries (`@size_of`, `@align_of`, `@default_init`) and `@cache_aligned` wrappers.
+pub mod mem;
+
+/// Lock-free atomic types and memory-ordering fences backed by `@atomic_*` intrinsics.
+pub mod atomic;
+
+/// Portable `@repr(C)` fixed-width SIMD vector wrappers backed by `@simd_*` intrinsics.
+pub mod simd;
+
+/// Unconditional hardware traps, formatted panic aborts, and invariant assertions.
+pub mod panic;
+
+/// Zero-cost `DR-19` hot-reload safe-point polling and deterministic drop-trace hooks.
+pub mod runtime;
+
+/// Platform syscall descriptors and safe standard-stream / process-exit wrappers.
+pub mod sys;

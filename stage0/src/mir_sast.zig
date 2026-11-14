@@ -1012,6 +1012,56 @@ pub const PentagonSubRow = extern struct {
     }
 };
 
+/// 24-byte proven SSA scalar value range & alignment fact exported for LLVM `!range` / `@llvm.assume` (`[MAJOR-08]`).
+pub const ProvenValueRange = extern struct {
+    /// Two's-complement bit-cast inclusive lower bound (`Intv.decodeSigned` for signed, raw `u64` for unsigned).
+    min_bits: u64,
+    /// Two's-complement bit-cast inclusive upper bound (`Intv.decodeSigned` for signed, raw `u64` for unsigned).
+    max_bits: u64,
+    /// Raw `MirValueId` (`0 .. body.insts.len - 1`) in the analyzed `MirBody`.
+    mir_value_raw: u32,
+    /// Scalar integer/boolean/char bit width (`1 .. 64`).
+    bit_width: u16,
+    /// Packed `Flags` byte (`1B`).
+    flags_bits: u8 = 0,
+    /// Proven non-zero pointer alignment `log2` (`0` when unproven or scalar).
+    proven_align_log2: u8 = 0,
+
+    /// Packed boolean flags stored in `flags_bits`.
+    pub const Flags = packed struct(u8) {
+        /// `true` if the integer domain is two's-complement signed (`i8..i64`, `isize`).
+        is_signed: bool = false,
+        /// `true` if proven strictly non-negative (`min >= 0`), enabling `nuw` / `zext` / `inbounds`.
+        is_non_negative: bool = false,
+        /// `true` if proven strictly non-zero (`0 ∉ [min, max]`), enabling division-by-zero / `!nonnull` elision.
+        is_non_zero: bool = false,
+        /// `true` if this SSA value is a non-null CoreX reference (`&T`, `&mut T`, or `fn`).
+        is_nonnull_ptr: bool = false,
+        /// Reserved zero bits (`0`).
+        _reserved: u4 = 0,
+    };
+
+    comptime {
+        std.debug.assert(@sizeOf(Flags) == 1 and @bitSizeOf(Flags) == 8);
+        std.debug.assert(@sizeOf(ProvenValueRange) == 24 and @alignOf(ProvenValueRange) == 8);
+    }
+
+    /// Decodes `flags_bits` into `Flags`.
+    pub inline fn flags(self: ProvenValueRange) Flags {
+        return @bitCast(self.flags_bits);
+    }
+
+    /// Returns the decoded signed inclusive lower bound when `self.flags().is_signed` holds.
+    pub inline fn signedMin(self: ProvenValueRange) i64 {
+        return @bitCast(self.min_bits);
+    }
+
+    /// Returns the decoded signed inclusive upper bound when `self.flags().is_signed` holds.
+    pub inline fn signedMax(self: ProvenValueRange) i64 {
+        return @bitCast(self.max_bits);
+    }
+};
+
 // ----------------- Package Capability Sandbox -----------------
 
 /// Three-tier package capability roll-up (`DR-17` §3.1 & `Fix-17` Gate E).
@@ -6232,6 +6282,39 @@ fn runPass2TypestateNllAndDrops(
                         if (base < work_state.local_raw_ptr.len) {
                             work_state.local_raw_ptr[base] = .freed_or_dangling;
                         }
+                    } else if (ikind == .atomic_store or
+                        ikind == .atomic_rmw_add or
+                        ikind == .atomic_rmw_sub or
+                        ikind == .atomic_rmw_xchg or
+                        ikind == .atomic_cmpxchg)
+                    {
+                        if (inst.operands.rhs > 0 and inst.operands.lhs < body.extra_args.items.len) {
+                            const ptr_val_raw = body.extra_args.items[inst.operands.lhs];
+                            if (ptr_val_raw < body.insts.len) {
+                                const ptr_ty = pool.unwrapUnderlyingType(
+                                    body.getInst(MirValueId.fromInt(ptr_val_raw)).type_id,
+                                );
+                                if (!ptr_ty.isError() and !ptr_ty.isPrimitive()) {
+                                    const ptr_node = pool.getNode(ptr_ty);
+                                    const is_mut_ptr = ptr_node.tag == .mut_ref_ty or
+                                        (ptr_node.tag == .raw_ptr_ty and ptr_node.rhs != 0);
+                                    if (!is_mut_ptr) {
+                                        outcome.emitted_error_count += 1;
+                                        try emitSastDiag(
+                                            eff_config.diagnostic_sink,
+                                            .e0305_exclusivity_violation,
+                                            .err,
+                                            inst_span,
+                                            "atomic mutation requires a mutable reference (`&mut T`) or mutable raw pointer (`*mut T`)",
+                                            "immutable pointer or reference passed to atomic mutator here",
+                                            null,
+                                            null,
+                                            "pass `&mut place` or `*mut T` to atomic store/RMW/cmpxchg intrinsics",
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 },
                 else => {},
@@ -8048,6 +8131,29 @@ fn readDomRefinedIntv(
     return cur_iv;
 }
 
+/// Returns `true` when `place_id` contains at least one `.deref` projection (`*ptr`).
+fn hasPlaceDerefProjection(body: *const MirBody, place_id: PlaceId) bool {
+    if (place_id.isNone() or place_id.asInt() >= body.places.items.len) return false;
+    for (body.getPlaceProjections(place_id)) |proj| {
+        if (proj.kind == .deref) return true;
+    }
+    return false;
+}
+
+/// Invalidates intra-block `local_overrides` / `slice_len_overrides` for every mutably address-taken local.
+fn clearMutAddrTakenLocalOverrides(
+    has_mut_addr_taken: []const bool,
+    local_overrides: []?Intv,
+    slice_len_overrides: []?Intv,
+) void {
+    for (has_mut_addr_taken, 0..) |is_taken, loc_idx| {
+        if (is_taken) {
+            local_overrides[loc_idx] = null;
+            slice_len_overrides[loc_idx] = null;
+        }
+    }
+}
+
 /// Populates dominating `cond_br` refinements for `bb_idx` into `val_overrides`, `local_overrides`, and `slice_len_overrides`.
 fn populateBlockDomOverrides(
     body: *const MirBody,
@@ -8357,6 +8463,8 @@ fn runPass4IntervalsAndPentagonBce(
     @memset(local_unique_val, mir.NONE_U32);
     const local_unique_bb = try arena_alloc.alloc(u32, local_count);
     @memset(local_unique_bb, mir.NONE_U32);
+    const has_mut_addr_taken = try arena_alloc.alloc(bool, local_count);
+    @memset(has_mut_addr_taken, false);
 
     // Count caller-initialized formal parameters (`mode != .set_mode`) as 1 entry store:
     for (1..local_count) |loc_i| {
@@ -8382,12 +8490,32 @@ fn runPass4IntervalsAndPentagonBce(
                         local_unique_bb[pl_rec.base] = mir.NONE_U32;
                     }
                 }
+            } else if (inst.op == .place_set_discrim and inst.operands.lhs < body.places.items.len) {
+                const base = body.places.items[inst.operands.lhs].base;
+                if (base < local_count) {
+                    local_store_counts[base] +|= 1;
+                    local_unique_val[base] = mir.NONE_U32;
+                    local_unique_bb[base] = mir.NONE_U32;
+                }
             } else if (inst.op == .place_addr and inst.operands.lhs < body.places.items.len) {
                 const unwrapped = pool.unwrapUnderlyingType(inst.type_id);
                 if (!unwrapped.isError() and pool.getNode(unwrapped).tag != .ref_ty) {
                     const base = body.places.items[inst.operands.lhs].base;
                     if (base < local_count) {
+                        has_mut_addr_taken[base] = true;
                         local_store_counts[base] = 2;
+                        local_unique_val[base] = mir.NONE_U32;
+                        local_unique_bb[base] = mir.NONE_U32;
+                    }
+                }
+            } else if (inst.op == .intrinsic_op) {
+                const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+                if ((ikind == .zero_pad or ikind == .drop_in_place or ikind == .drop_if_live) and
+                    inst.operands.lhs < body.places.items.len)
+                {
+                    const base = body.places.items[inst.operands.lhs].base;
+                    if (base < local_count) {
+                        local_store_counts[base] +|= 1;
                         local_unique_val[base] = mir.NONE_U32;
                         local_unique_bb[base] = mir.NONE_U32;
                     }
@@ -8603,6 +8731,14 @@ fn runPass4IntervalsAndPentagonBce(
                     },
                     .place_store => {
                         if (inst.operands.lhs < body.places.items.len) {
+                            const pl_id = PlaceId.fromInt(inst.operands.lhs);
+                            if (hasPlaceDerefProjection(body, pl_id)) {
+                                clearMutAddrTakenLocalOverrides(
+                                    has_mut_addr_taken,
+                                    local_overrides,
+                                    slice_len_overrides,
+                                );
+                            }
                             const pl_rec = body.places.items[inst.operands.lhs];
                             if (pl_rec.base < local_count) {
                                 local_overrides[pl_rec.base] = null;
@@ -8617,6 +8753,35 @@ fn runPass4IntervalsAndPentagonBce(
                                         slice_len_overrides,
                                         local_store_counts,
                                     );
+                                }
+                            }
+                        }
+                    },
+                    .place_set_discrim => {
+                        if (inst.operands.lhs < body.places.items.len) {
+                            const pl_id = PlaceId.fromInt(inst.operands.lhs);
+                            if (hasPlaceDerefProjection(body, pl_id)) {
+                                clearMutAddrTakenLocalOverrides(
+                                    has_mut_addr_taken,
+                                    local_overrides,
+                                    slice_len_overrides,
+                                );
+                            }
+                            const base = body.places.items[inst.operands.lhs].base;
+                            if (base < local_count) {
+                                local_overrides[base] = null;
+                                slice_len_overrides[base] = null;
+                            }
+                        }
+                    },
+                    .place_addr => {
+                        if (inst.operands.lhs < body.places.items.len) {
+                            const unwrapped = pool.unwrapUnderlyingType(inst.type_id);
+                            if (!unwrapped.isError() and pool.getNode(unwrapped).tag != .ref_ty) {
+                                const base = body.places.items[inst.operands.lhs].base;
+                                if (base < local_count) {
+                                    local_overrides[base] = null;
+                                    slice_len_overrides[base] = null;
                                 }
                             }
                         }
@@ -8661,7 +8826,31 @@ fn runPass4IntervalsAndPentagonBce(
                     },
                     .intrinsic_op => {
                         const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
-                        if (ikind == .narrow_check and inst.operands.rhs >= 3 and
+                        if (ikind == .atomic_store or
+                            ikind == .atomic_rmw_add or
+                            ikind == .atomic_rmw_sub or
+                            ikind == .atomic_rmw_xchg or
+                            ikind == .atomic_cmpxchg)
+                        {
+                            clearMutAddrTakenLocalOverrides(
+                                has_mut_addr_taken,
+                                local_overrides,
+                                slice_len_overrides,
+                            );
+                        } else if (ikind == .zero_pad or ikind == .drop_in_place or ikind == .drop_if_live) {
+                            clearMutAddrTakenLocalOverrides(
+                                has_mut_addr_taken,
+                                local_overrides,
+                                slice_len_overrides,
+                            );
+                            if (inst.operands.lhs < body.places.items.len) {
+                                const base = body.places.items[inst.operands.lhs].base;
+                                if (base < local_count) {
+                                    local_overrides[base] = null;
+                                    slice_len_overrides[base] = null;
+                                }
+                            }
+                        } else if (ikind == .narrow_check and inst.operands.rhs >= 3 and
                             inst.operands.lhs + 3 <= body.extra_args.items.len)
                         {
                             const src_v = body.extra_args.items[inst.operands.lhs];
@@ -9584,6 +9773,8 @@ fn runPass4IntervalsAndPentagonBce(
                     .compile_assert,
                     .compile_error,
                     .abort_vacated_panic,
+                    .panic,
+                    .trap,
                     => has_block_panic = true,
                     else => {},
                 }
@@ -10495,6 +10686,16 @@ fn runPass3SummaryContractsAndSandbox(
                         }
                     }
                 },
+                .intrinsic_op => {
+                    const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+                    switch (ikind) {
+                        .sys_write => direct_eff.fs = true,
+                        .sys_exit => direct_eff.process = true,
+                        .panic, .trap => direct_eff.may_panic = true,
+                        .poll_reload => {},
+                        else => {},
+                    }
+                },
                 else => {},
             }
         }
@@ -11165,6 +11366,8 @@ fn runPass3SummaryContractsAndSandbox(
                                     .compile_assert,
                                     .compile_error,
                                     .abort_vacated_panic,
+                                    .panic,
+                                    .trap,
                                     => {
                                         has_window_panic = true;
                                         break;
@@ -11987,6 +12190,756 @@ pub fn lowerAndVerifySourceMirSast(
         .sast_result = sast_result,
         .diagnostics = diagnostics,
     };
+}
+
+/// Read-only sign-biased `Intv` fixpoint result over a single `MirBody`.
+const SolvedBodyIntervals = struct {
+    val_domains: []?ScalarIntDomain,
+    val_intv: []Intv,
+    is_intv_reachable: []bool,
+    local_store_counts: []u32,
+    val_overrides: []?Intv,
+    local_overrides: []?Intv,
+    slice_len_overrides: []?Intv,
+};
+
+/// Solves Steps 1 & 2 of the $O(V)$ 16-byte Sign-Biased `Intv` RPO fixpoint without mutating `body`.
+fn solveBodySignBiasedIntervals(
+    arena_alloc: std.mem.Allocator,
+    body: *const MirBody,
+    dom: *const DominatorTree,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+) !SolvedBodyIntervals {
+    const block_count = body.blocks.items.len;
+    const inst_count = body.insts.len;
+    const local_count = body.locals.items.len;
+
+    const val_domains = try arena_alloc.alloc(?ScalarIntDomain, inst_count);
+    for (0..inst_count) |v_idx| {
+        val_domains[v_idx] = classifyScalarIntDomain(
+            pool,
+            body.insts.items(.type_id)[v_idx],
+            body.target_layout,
+        );
+    }
+
+    const local_store_counts = try arena_alloc.alloc(u32, local_count);
+    @memset(local_store_counts, 0);
+    const local_unique_val = try arena_alloc.alloc(u32, local_count);
+    @memset(local_unique_val, mir.NONE_U32);
+    const local_unique_bb = try arena_alloc.alloc(u32, local_count);
+    @memset(local_unique_bb, mir.NONE_U32);
+    const has_mut_addr_taken = try arena_alloc.alloc(bool, local_count);
+    @memset(has_mut_addr_taken, false);
+
+    for (1..local_count) |loc_i| {
+        const loc = body.locals.items[loc_i];
+        if (loc.flags().is_arg and loc.mode() != .set_mode) {
+            local_store_counts[loc_i] = 1;
+        }
+    }
+
+    for (0..block_count) |b_usize| {
+        const b_u32: u32 = @intCast(b_usize);
+        for (body.getBlockInsts(MirBlockId.fromInt(b_u32))) |inst_vid| {
+            const inst = body.getInst(inst_vid);
+            if (inst.op == .place_store and inst.operands.lhs < body.places.items.len) {
+                const pl_rec = body.places.items[inst.operands.lhs];
+                if (pl_rec.base < local_count) {
+                    local_store_counts[pl_rec.base] +|= 1;
+                    if (pl_rec.proj_len == 0 and local_store_counts[pl_rec.base] == 1) {
+                        local_unique_val[pl_rec.base] = inst.operands.rhs;
+                        local_unique_bb[pl_rec.base] = b_u32;
+                    } else {
+                        local_unique_val[pl_rec.base] = mir.NONE_U32;
+                        local_unique_bb[pl_rec.base] = mir.NONE_U32;
+                    }
+                }
+            } else if (inst.op == .place_set_discrim and inst.operands.lhs < body.places.items.len) {
+                const base = body.places.items[inst.operands.lhs].base;
+                if (base < local_count) {
+                    local_store_counts[base] +|= 1;
+                    local_unique_val[base] = mir.NONE_U32;
+                    local_unique_bb[base] = mir.NONE_U32;
+                }
+            } else if (inst.op == .place_addr and inst.operands.lhs < body.places.items.len) {
+                const unwrapped = pool.unwrapUnderlyingType(inst.type_id);
+                if (!unwrapped.isError() and pool.getNode(unwrapped).tag != .ref_ty) {
+                    const base = body.places.items[inst.operands.lhs].base;
+                    if (base < local_count) {
+                        has_mut_addr_taken[base] = true;
+                        local_store_counts[base] = 2;
+                        local_unique_val[base] = mir.NONE_U32;
+                        local_unique_bb[base] = mir.NONE_U32;
+                    }
+                }
+            } else if (inst.op == .intrinsic_op) {
+                const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+                if ((ikind == .zero_pad or ikind == .drop_in_place or ikind == .drop_if_live) and
+                    inst.operands.lhs < body.places.items.len)
+                {
+                    const base = body.places.items[inst.operands.lhs].base;
+                    if (base < local_count) {
+                        local_store_counts[base] +|= 1;
+                        local_unique_val[base] = mir.NONE_U32;
+                        local_unique_bb[base] = mir.NONE_U32;
+                    }
+                }
+            }
+        }
+    }
+    for (body.calls.items) |call_site| {
+        for (0..call_site.args_len) |arg_i| {
+            const mode = body.call_arg_modes.items[call_site.modes_start + arg_i];
+            const word = body.extra_args.items[call_site.args_start + arg_i];
+            if ((mode == .inout_mode or mode == .set_mode) and word < body.places.items.len) {
+                const base = body.places.items[word].base;
+                if (base < local_count) {
+                    local_store_counts[base] = 2;
+                    local_unique_val[base] = mir.NONE_U32;
+                    local_unique_bb[base] = mir.NONE_U32;
+                }
+            }
+        }
+    }
+
+    const val_intv = try arena_alloc.alloc(Intv, inst_count);
+    @memset(val_intv, Intv.BOTTOM);
+    const is_intv_reachable = try arena_alloc.alloc(bool, block_count);
+    @memset(is_intv_reachable, false);
+    if (block_count > 0) is_intv_reachable[0] = true;
+
+    const is_loop_header = try arena_alloc.alloc(bool, block_count);
+    @memset(is_loop_header, false);
+    for (dom.rpo_blocks) |bb_idx| {
+        const cur_rpo = dom.rpo_index[bb_idx];
+        for (body.getPredEdges(MirBlockId.fromInt(bb_idx))) |pred_eid| {
+            if (pred_eid.asInt() >= body.extra_edges.items.len) continue;
+            const src_bb = body.extra_edges.items[pred_eid.asInt()].src_bb.asInt();
+            if (src_bb < block_count and dom.rpo_index[src_bb] != mir.NONE_U32 and
+                dom.rpo_index[src_bb] >= cur_rpo)
+            {
+                is_loop_header[bb_idx] = true;
+            }
+        }
+    }
+
+    const val_overrides = try arena_alloc.alloc(?Intv, inst_count);
+    const local_overrides = try arena_alloc.alloc(?Intv, local_count);
+    const slice_len_overrides = try arena_alloc.alloc(?Intv, local_count);
+
+    var has_intv_changed = block_count > 0;
+    var intv_iters: usize = 0;
+    while (has_intv_changed and intv_iters < 24) : (intv_iters += 1) {
+        has_intv_changed = false;
+        for (dom.rpo_blocks) |bb_idx| {
+            if (!is_intv_reachable[bb_idx]) continue;
+            const bb_id = MirBlockId.fromInt(bb_idx);
+
+            const params = body.getBlockParams(bb_id);
+            if (params.len > 0) {
+                const preds = body.getPredEdges(bb_id);
+                for (params, 0..) |param_vid, p_ord| {
+                    const p_idx = param_vid.asInt();
+                    const p_dom_opt = val_domains[p_idx];
+                    var joined = Intv.BOTTOM;
+                    for (preds) |pred_eid| {
+                        if (pred_eid.asInt() >= body.extra_edges.items.len) continue;
+                        const edge = body.extra_edges.items[pred_eid.asInt()];
+                        const src_bb = edge.src_bb.asInt();
+                        if (src_bb >= block_count or !is_intv_reachable[src_bb]) continue;
+
+                        const src_term = body.blocks.items[src_bb].terminator;
+                        if (src_term.kind == .cond_br and src_term.cond_or_val < inst_count) {
+                            const c_iv = val_intv[src_term.cond_or_val];
+                            const is_then_edge = (pred_eid.asInt() == src_term.edge_start);
+                            if (!c_iv.isBottom()) {
+                                if (is_then_edge and c_iv.lo_ord == 0 and c_iv.hi_ord == 0) continue;
+                                if (!is_then_edge and c_iv.lo_ord == 1 and c_iv.hi_ord == 1) continue;
+                            }
+                        }
+
+                        if (p_ord < edge.args_len and edge.args_start + p_ord < body.extra_args.items.len) {
+                            const arg_v = body.extra_args.items[edge.args_start + p_ord];
+                            if (arg_v < inst_count) {
+                                var edge_iv = val_intv[arg_v];
+                                if (src_term.kind == .cond_br and src_term.cond_or_val < inst_count) {
+                                    const is_then = (pred_eid.asInt() == src_term.edge_start);
+                                    var edge_cmps: [32]DecodedBranchCmp = undefined;
+                                    var edge_cmp_len: usize = 0;
+                                    collectDerivedCmpGuards(
+                                        body,
+                                        dom,
+                                        src_term.cond_or_val,
+                                        is_then,
+                                        0,
+                                        &edge_cmps,
+                                        &edge_cmp_len,
+                                    );
+                                    const peeled_arg = peelCopyValId(body, arg_v);
+                                    for (edge_cmps[0..edge_cmp_len]) |cmp| {
+                                        if (cmp.lhs_val == peeled_arg and cmp.rhs_val < inst_count) {
+                                            if (val_domains[cmp.lhs_val]) |cdom| {
+                                                edge_iv = refineIntvPairFromCmp(
+                                                    cmp,
+                                                    edge_iv,
+                                                    val_intv[cmp.rhs_val],
+                                                    cdom,
+                                                ).lhs_out;
+                                            }
+                                        } else if (cmp.rhs_val == peeled_arg and cmp.lhs_val < inst_count) {
+                                            if (val_domains[cmp.rhs_val]) |cdom| {
+                                                edge_iv = refineIntvPairFromCmp(
+                                                    cmp,
+                                                    val_intv[cmp.lhs_val],
+                                                    edge_iv,
+                                                    cdom,
+                                                ).rhs_out;
+                                            }
+                                        }
+                                    }
+                                }
+                                joined = joined.join(edge_iv);
+                            }
+                        } else if (src_term.kind == .call and p_ord == 0) {
+                            joined = if (p_dom_opt) |pd| pd.top_intv else Intv.TOP_ORD;
+                        }
+                    }
+
+                    const old_iv = val_intv[p_idx];
+                    if (is_loop_header[bb_idx] and intv_iters >= 3 and !old_iv.isBottom() and !joined.isBottom()) {
+                        const top_iv = if (p_dom_opt) |pd| pd.top_intv else Intv.TOP_ORD;
+                        if (joined.lo_ord < old_iv.lo_ord) joined.lo_ord = top_iv.lo_ord;
+                        if (joined.hi_ord > old_iv.hi_ord) joined.hi_ord = top_iv.hi_ord;
+                    }
+                    if (!joined.eql(old_iv)) {
+                        val_intv[p_idx] = joined;
+                        has_intv_changed = true;
+                    }
+                }
+            }
+
+            populateBlockDomOverrides(
+                body,
+                pool,
+                dom,
+                bb_idx,
+                val_domains,
+                val_intv,
+                local_store_counts,
+                val_overrides,
+                local_overrides,
+                slice_len_overrides,
+            );
+
+            for (body.getBlockInsts(bb_id)) |inst_vid| {
+                const v_idx = inst_vid.asInt();
+                const inst = body.getInst(inst_vid);
+                const dst_dom_opt = val_domains[v_idx];
+
+                var new_iv: Intv = if (dst_dom_opt) |dd| dd.top_intv else Intv.TOP_ORD;
+                switch (inst.op) {
+                    .block_param => continue,
+                    .const_scalar => {
+                        new_iv = evalConstScalarIntv(body, inst, dst_dom_opt);
+                    },
+                    .copy_val => {
+                        new_iv = readDomRefinedIntv(
+                            body,
+                            inst.operands.lhs,
+                            val_intv,
+                            val_overrides,
+                            local_overrides,
+                            slice_len_overrides,
+                            local_store_counts,
+                        );
+                    },
+                    .place_load => {
+                        const pl_id = PlaceId.fromInt(inst.operands.lhs);
+                        if (extractStaticArrayLenPlace(body, pool, sym_table, pl_id)) |arr_len| {
+                            new_iv = Intv.initUnsigned(arr_len, arr_len);
+                        } else if (extractLoadedPlaceKey(body, v_idx)) |pkey| {
+                            if (pkey.isSliceLen() and pkey.base_local < local_count and
+                                local_store_counts[pkey.base_local] <= 1)
+                            {
+                                if (slice_len_overrides[pkey.base_local]) |sl_ov| {
+                                    new_iv = new_iv.meet(sl_ov);
+                                }
+                            } else if (!pkey.isSliceLen() and pkey.base_local < local_count) {
+                                const uniq_v = local_unique_val[pkey.base_local];
+                                const uniq_bb = local_unique_bb[pkey.base_local];
+                                if (uniq_v < inst_count and uniq_bb < block_count and
+                                    dom.isDominatorOf(MirBlockId.fromInt(uniq_bb), bb_id) and
+                                    !val_intv[uniq_v].isBottom())
+                                {
+                                    new_iv = readDomRefinedIntv(
+                                        body,
+                                        uniq_v,
+                                        val_intv,
+                                        val_overrides,
+                                        local_overrides,
+                                        slice_len_overrides,
+                                        local_store_counts,
+                                    );
+                                }
+                                if (local_overrides[pkey.base_local]) |loc_ov| {
+                                    new_iv = new_iv.meet(loc_ov);
+                                }
+                            }
+                        }
+                    },
+                    .place_store => {
+                        if (inst.operands.lhs < body.places.items.len) {
+                            const pl_id = PlaceId.fromInt(inst.operands.lhs);
+                            if (hasPlaceDerefProjection(body, pl_id)) {
+                                clearMutAddrTakenLocalOverrides(
+                                    has_mut_addr_taken,
+                                    local_overrides,
+                                    slice_len_overrides,
+                                );
+                            }
+                            const pl_rec = body.places.items[inst.operands.lhs];
+                            if (pl_rec.base < local_count) {
+                                local_overrides[pl_rec.base] = null;
+                                slice_len_overrides[pl_rec.base] = null;
+                                if (pl_rec.proj_len == 0 and inst.operands.rhs < inst_count) {
+                                    local_overrides[pl_rec.base] = readDomRefinedIntv(
+                                        body,
+                                        inst.operands.rhs,
+                                        val_intv,
+                                        val_overrides,
+                                        local_overrides,
+                                        slice_len_overrides,
+                                        local_store_counts,
+                                    );
+                                }
+                            }
+                        }
+                    },
+                    .place_set_discrim => {
+                        if (inst.operands.lhs < body.places.items.len) {
+                            const pl_id = PlaceId.fromInt(inst.operands.lhs);
+                            if (hasPlaceDerefProjection(body, pl_id)) {
+                                clearMutAddrTakenLocalOverrides(
+                                    has_mut_addr_taken,
+                                    local_overrides,
+                                    slice_len_overrides,
+                                );
+                            }
+                            const base = body.places.items[inst.operands.lhs].base;
+                            if (base < local_count) {
+                                local_overrides[base] = null;
+                                slice_len_overrides[base] = null;
+                            }
+                        }
+                    },
+                    .place_addr => {
+                        if (inst.operands.lhs < body.places.items.len) {
+                            const unwrapped = pool.unwrapUnderlyingType(inst.type_id);
+                            if (!unwrapped.isError() and pool.getNode(unwrapped).tag != .ref_ty) {
+                                const base = body.places.items[inst.operands.lhs].base;
+                                if (base < local_count) {
+                                    local_overrides[base] = null;
+                                    slice_len_overrides[base] = null;
+                                }
+                            }
+                        }
+                    },
+                    .unary_op => {
+                        const uk: UnaryOpKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+                        const src_iv = readDomRefinedIntv(
+                            body,
+                            inst.operands.lhs,
+                            val_intv,
+                            val_overrides,
+                            local_overrides,
+                            slice_len_overrides,
+                            local_store_counts,
+                        );
+                        const src_dom = if (inst.operands.lhs < inst_count) val_domains[inst.operands.lhs] else null;
+                        new_iv = evalUnaryOpIntv(uk, src_iv, src_dom, dst_dom_opt);
+                    },
+                    .bin_op => {
+                        const bk: BinOpKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+                        const lhs_iv = readDomRefinedIntv(
+                            body,
+                            inst.operands.lhs,
+                            val_intv,
+                            val_overrides,
+                            local_overrides,
+                            slice_len_overrides,
+                            local_store_counts,
+                        );
+                        const rhs_iv = readDomRefinedIntv(
+                            body,
+                            inst.operands.rhs,
+                            val_intv,
+                            val_overrides,
+                            local_overrides,
+                            slice_len_overrides,
+                            local_store_counts,
+                        );
+                        const l_dom = if (inst.operands.lhs < inst_count) val_domains[inst.operands.lhs] else null;
+                        const r_dom = if (inst.operands.rhs < inst_count) val_domains[inst.operands.rhs] else null;
+                        new_iv = evalBinOpIntv(bk, lhs_iv, rhs_iv, l_dom, r_dom, dst_dom_opt);
+                    },
+                    .intrinsic_op => {
+                        const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+                        if (ikind == .atomic_store or
+                            ikind == .atomic_rmw_add or
+                            ikind == .atomic_rmw_sub or
+                            ikind == .atomic_rmw_xchg or
+                            ikind == .atomic_cmpxchg)
+                        {
+                            clearMutAddrTakenLocalOverrides(
+                                has_mut_addr_taken,
+                                local_overrides,
+                                slice_len_overrides,
+                            );
+                        } else if (ikind == .zero_pad or ikind == .drop_in_place or ikind == .drop_if_live) {
+                            clearMutAddrTakenLocalOverrides(
+                                has_mut_addr_taken,
+                                local_overrides,
+                                slice_len_overrides,
+                            );
+                            if (inst.operands.lhs < body.places.items.len) {
+                                const base = body.places.items[inst.operands.lhs].base;
+                                if (base < local_count) {
+                                    local_overrides[base] = null;
+                                    slice_len_overrides[base] = null;
+                                }
+                            }
+                        } else if (ikind == .narrow_check and inst.operands.rhs >= 3 and
+                            inst.operands.lhs + 3 <= body.extra_args.items.len)
+                        {
+                            const src_v = body.extra_args.items[inst.operands.lhs];
+                            const min_v = body.extra_args.items[inst.operands.lhs + 1];
+                            const max_v = body.extra_args.items[inst.operands.lhs + 2];
+                            if (dst_dom_opt) |dd| {
+                                var narrowed = dd.top_intv;
+                                if (min_v < inst_count and max_v < inst_count) {
+                                    const min_inst = body.getInst(MirValueId.fromInt(min_v));
+                                    const max_inst = body.getInst(MirValueId.fromInt(max_v));
+                                    if (min_inst.op == .const_scalar and max_inst.op == .const_scalar and
+                                        min_inst.operands.lhs < body.consts.items.len and
+                                        max_inst.operands.lhs < body.consts.items.len)
+                                    {
+                                        const min_mc = body.consts.items[min_inst.operands.lhs];
+                                        const max_mc = body.consts.items[max_inst.operands.lhs];
+                                        if (min_mc == .int_val and max_mc == .int_val) {
+                                            narrowed = narrowed.meet(
+                                                encodeClippedI128ToIntv(min_mc.int_val, max_mc.int_val, dd),
+                                            );
+                                        }
+                                    }
+                                }
+                                if (src_v < inst_count) {
+                                    if (val_domains[src_v]) |sd| {
+                                        const src_iv = readDomRefinedIntv(
+                                            body,
+                                            src_v,
+                                            val_intv,
+                                            val_overrides,
+                                            local_overrides,
+                                            slice_len_overrides,
+                                            local_store_counts,
+                                        );
+                                        if (!src_iv.isBottom()) {
+                                            const sb = decodeIntvToI128(src_iv, sd);
+                                            narrowed = narrowed.meet(encodeClippedI128ToIntv(sb.lo, sb.hi, dd));
+                                        }
+                                    }
+                                }
+                                new_iv = narrowed;
+                            }
+                        }
+                    },
+                    else => {},
+                }
+
+                if (val_overrides[v_idx]) |ov| {
+                    new_iv = new_iv.meet(ov);
+                }
+                if (!new_iv.eql(val_intv[v_idx])) {
+                    val_intv[v_idx] = new_iv;
+                    has_intv_changed = true;
+                }
+            }
+
+            const term = body.blocks.items[bb_idx].terminator;
+            if (term.kind == .cond_br and term.edge_len >= 2 and
+                term.cond_or_val < inst_count and
+                term.edge_start + 1 < body.extra_edges.items.len)
+            {
+                const cond_iv = readDomRefinedIntv(
+                    body,
+                    term.cond_or_val,
+                    val_intv,
+                    val_overrides,
+                    local_overrides,
+                    slice_len_overrides,
+                    local_store_counts,
+                );
+                const then_dst = body.extra_edges.items[term.edge_start].target_bb.asInt();
+                const else_dst = body.extra_edges.items[term.edge_start + 1].target_bb.asInt();
+                if (!cond_iv.isBottom()) {
+                    if (!(cond_iv.lo_ord == 0 and cond_iv.hi_ord == 0) and
+                        then_dst < block_count and !is_intv_reachable[then_dst])
+                    {
+                        is_intv_reachable[then_dst] = true;
+                        has_intv_changed = true;
+                    }
+                    if (!(cond_iv.lo_ord == 1 and cond_iv.hi_ord == 1) and
+                        else_dst < block_count and !is_intv_reachable[else_dst])
+                    {
+                        is_intv_reachable[else_dst] = true;
+                        has_intv_changed = true;
+                    }
+                }
+            } else {
+                for (body.getOutgoingEdges(bb_id)) |edge| {
+                    const dst = edge.target_bb.asInt();
+                    if (dst < block_count and !is_intv_reachable[dst]) {
+                        is_intv_reachable[dst] = true;
+                        has_intv_changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if (has_intv_changed) {
+        for (0..block_count) |b_i| {
+            is_intv_reachable[b_i] = dom.isReachable(MirBlockId.fromInt(@intCast(b_i)));
+        }
+        for (0..inst_count) |v_i| {
+            val_intv[v_i] = if (val_domains[v_i]) |vd| vd.top_intv else Intv.TOP_ORD;
+        }
+    }
+
+    return .{
+        .val_domains = val_domains,
+        .val_intv = val_intv,
+        .is_intv_reachable = is_intv_reachable,
+        .local_store_counts = local_store_counts,
+        .val_overrides = val_overrides,
+        .local_overrides = local_overrides,
+        .slice_len_overrides = slice_len_overrides,
+    };
+}
+
+/// Returns `true` when `&place` / `&mut place` ends inside a `@packed` aggregate or raw-pointer dereference.
+fn hasUnalignedPlaceProjection(
+    body: *const MirBody,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    place_id: PlaceId,
+) bool {
+    if (place_id.isNone() or place_id.asInt() >= body.places.items.len) return true;
+    const pl_rec = body.places.items[place_id.asInt()];
+    if (pl_rec.base >= body.locals.items.len) return true;
+
+    var cur_ty = pool.unwrapUnderlyingType(body.locals.items[pl_rec.base].type_id);
+    var active_subst: type_system.NominalTypeSubst = .{};
+    var active_dc: ?u32 = null;
+    var active_soa: ?TypeId = null;
+    var is_unaligned = false;
+
+    for (body.getPlaceProjections(place_id)) |proj| {
+        const resolved_cur = pool.unwrapUnderlyingType(active_subst.resolve(cur_ty));
+        if (!resolved_cur.isError() and !resolved_cur.isPrimitive()) {
+            const c_node = pool.getNode(resolved_cur);
+            switch (proj.kind) {
+                .deref => {
+                    is_unaligned = (c_node.tag == .raw_ptr_ty);
+                },
+                .field => {
+                    if (c_node.tag == .struct_ty or c_node.tag == .union_ty) {
+                        const sym_idx = symbol_resolver.SymbolIndex.fromInt(c_node.rhs);
+                        if (!sym_idx.isNone() and sym_idx.asInt() < sym_table.symbols.items.len) {
+                            if (sym_table.getSymbol(sym_idx).contract_flags.is_packed) {
+                                is_unaligned = true;
+                            }
+                        }
+                    }
+                },
+                .soa_elem => is_unaligned = false,
+                .index, .downcast, .slice_len => {},
+            }
+        }
+        cur_ty = stepProjectedType(pool, sym_table, cur_ty, proj, &active_subst, &active_dc, &active_soa);
+    }
+    return is_unaligned;
+}
+
+/// Records any proven scalar interval or non-null/aligned reference fact for `v_raw` into `out_table`.
+fn recordOneProvenRange(
+    body_ref: *const MirBody,
+    pool_ref: *const InternPool,
+    sym_ref: *const SymbolTable,
+    solved_ref: SolvedBodyIntervals,
+    out_table: []?ProvenValueRange,
+    v_raw: u32,
+) void {
+    if (v_raw >= body_ref.insts.len) return;
+    const inst_ty = pool_ref.unwrapUnderlyingType(body_ref.insts.items(.type_id)[v_raw]);
+    if (solved_ref.val_domains[v_raw]) |dom_info| {
+        if (dom_info.bits == 0 or dom_info.bits > 64) return;
+        const iv = readDomRefinedIntv(
+            body_ref,
+            v_raw,
+            solved_ref.val_intv,
+            solved_ref.val_overrides,
+            solved_ref.local_overrides,
+            solved_ref.slice_len_overrides,
+            solved_ref.local_store_counts,
+        );
+        if (iv.isBottom()) return;
+        const min_bits: u64 = if (dom_info.is_signed)
+            @bitCast(Intv.decodeSigned(iv.lo_ord))
+        else
+            iv.lo_ord;
+        const max_bits: u64 = if (dom_info.is_signed)
+            @bitCast(Intv.decodeSigned(iv.hi_ord))
+        else
+            iv.hi_ord;
+        const width_mask: u64 = if (dom_info.bits == 64)
+            std.math.maxInt(u64)
+        else
+            (@as(u64, 1) << @intCast(dom_info.bits)) - 1;
+        if (((max_bits +% 1) & width_mask) == (min_bits & width_mask)) {
+            return;
+        }
+        const is_non_neg = !dom_info.is_signed or Intv.decodeSigned(iv.lo_ord) >= 0;
+        const is_non_zero = if (dom_info.is_signed)
+            (Intv.decodeSigned(iv.lo_ord) > 0 or Intv.decodeSigned(iv.hi_ord) < 0)
+        else
+            (iv.lo_ord > 0);
+        const flags = ProvenValueRange.Flags{
+            .is_signed = dom_info.is_signed,
+            .is_non_negative = is_non_neg,
+            .is_non_zero = is_non_zero,
+        };
+        out_table[v_raw] = .{
+            .min_bits = min_bits,
+            .max_bits = max_bits,
+            .mir_value_raw = v_raw,
+            .bit_width = dom_info.bits,
+            .flags_bits = @bitCast(flags),
+            .proven_align_log2 = 0,
+        };
+        return;
+    }
+    if (!inst_ty.isError() and !inst_ty.isPrimitive()) {
+        const node = pool_ref.getNode(inst_ty);
+        if (node.tag == .ref_ty or node.tag == .mut_ref_ty or node.tag == .fn_ty) {
+            var align_log2: u8 = 0;
+            if (node.tag == .ref_ty or node.tag == .mut_ref_ty) {
+                const pointee_layout = type_system.computeTypeLayoutWithPool(
+                    pool_ref,
+                    sym_ref,
+                    TypeId.fromInt(node.lhs),
+                    body_ref.target_layout,
+                );
+                if (pointee_layout.align_bytes > 1) {
+                    align_log2 = std.math.log2_int(u32, pointee_layout.align_bytes);
+                }
+                const inst_op = body_ref.insts.items(.op)[v_raw];
+                const inst_ops = body_ref.insts.items(.operands)[v_raw];
+                if (inst_op == .place_addr) {
+                    if (hasUnalignedPlaceProjection(body_ref, pool_ref, sym_ref, PlaceId.fromInt(inst_ops.lhs))) {
+                        align_log2 = 0;
+                    }
+                } else if (inst_op == .copy_val or inst_op == .unary_op) {
+                    if (inst_ops.lhs < v_raw) {
+                        if (out_table[inst_ops.lhs]) |src_r| {
+                            align_log2 = @min(align_log2, src_r.proven_align_log2);
+                        } else {
+                            align_log2 = 0;
+                        }
+                    } else {
+                        align_log2 = 0;
+                    }
+                }
+            }
+            const flags = ProvenValueRange.Flags{
+                .is_non_zero = true,
+                .is_nonnull_ptr = true,
+            };
+            out_table[v_raw] = .{
+                .min_bits = 1,
+                .max_bits = std.math.maxInt(u64),
+                .mir_value_raw = v_raw,
+                .bit_width = @as(u16, body_ref.target_layout.ptr_byte_size) * 8,
+                .flags_bits = @bitCast(flags),
+                .proven_align_log2 = align_log2,
+            };
+        }
+    }
+}
+
+/// Computes non-trivial `ProvenValueRange` facts (`24B` each) for `body`, decoding `SIGN_BIAS_U64` on signed
+/// integers (`i8..i64`, `isize`) and omitting full-domain `(max +% 1) == min` mod $2^W$ intervals (`[MAJOR-08]`).
+pub fn computeBodyProvenRanges(
+    allocator: std.mem.Allocator,
+    body: *const MirBody,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+) ![]ProvenValueRange {
+    if (body.blocks.items.len == 0 or body.insts.len == 0) {
+        return allocator.alloc(ProvenValueRange, 0);
+    }
+
+    var dom = try mir.computeDominators(allocator, body);
+    defer dom.deinit();
+
+    var scratch_arena = BumpArena.init(allocator);
+    defer scratch_arena.deinit();
+    const arena_alloc = scratch_arena.asAllocator();
+
+    const solved = try solveBodySignBiasedIntervals(arena_alloc, body, &dom, pool, sym_table);
+
+    const per_val_opt = try arena_alloc.alloc(?ProvenValueRange, body.insts.len);
+    @memset(per_val_opt, null);
+
+    for (dom.rpo_blocks) |bb_idx| {
+        if (!solved.is_intv_reachable[bb_idx]) continue;
+        const bb_id = MirBlockId.fromInt(bb_idx);
+        populateBlockDomOverrides(
+            body,
+            pool,
+            &dom,
+            bb_idx,
+            solved.val_domains,
+            solved.val_intv,
+            solved.local_store_counts,
+            solved.val_overrides,
+            solved.local_overrides,
+            solved.slice_len_overrides,
+        );
+
+        for (body.getBlockParams(bb_id)) |param_vid| {
+            recordOneProvenRange(body, pool, sym_table, solved, per_val_opt, param_vid.asInt());
+        }
+        for (body.getBlockInsts(bb_id)) |inst_vid| {
+            recordOneProvenRange(body, pool, sym_table, solved, per_val_opt, inst_vid.asInt());
+        }
+    }
+
+    var count: usize = 0;
+    for (per_val_opt) |opt_item| {
+        if (opt_item != null) count += 1;
+    }
+    const result = try allocator.alloc(ProvenValueRange, count);
+    var write_idx: usize = 0;
+    for (per_val_opt) |opt_item| {
+        if (opt_item) |item| {
+            result[write_idx] = item;
+            write_idx += 1;
+        }
+    }
+    return result;
 }
 
 // ---------------------------------------- MAIN -----------------------------------------
