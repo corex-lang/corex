@@ -1,12 +1,12 @@
-# Upfront `Deep Research` Prompts (`DR-01`–`DR-21`)
+# Upfront `Deep Research` Prompts (`DR-01`–`DR-22`)
 
-This catalog contains the 21 self-contained, copy-pasteable `Deep research` prompts and specifications that resolve the Research Decision Gates (`RDG-01`–`RDG-21`) in [PLAN.md](../../PLAN.md). When a `Deep research` report is completed, save its output to the corresponding `docs/research/DR-XX.md` path listed below.
+This catalog contains the 22 self-contained, copy-pasteable `Deep research` prompts and specifications that resolve the Research Decision Gates (`RDG-01`–`RDG-22`) in [PLAN.md](../../PLAN.md). When a `Deep research` report is completed, save its output to the corresponding `docs/research/DR-XX.md` path listed below.
 
 ---
 
 ## Research Report Index & Execution Waves
 
-| Report ID   | Gate ID      | Target Report Path       | Wave   | MD Files to Attach in Chat                          | Blocking Phase        | Subsystem / Architectural Scope                                                        |
+| Report ID   | Gate ID      | Target Report Path       | Wave   | MD Files to Attach in Chat (max 10)                 | Blocking Phase        | Subsystem / Architectural Scope                                                        |
 | ----------- | ------------ | ------------------------ | ------ | --------------------------------------------------- | --------------------- | -------------------------------------------------------------------------------------- |
 | **`DR-01`** | **`RDG-01`** | `docs/research/DR-01.md` | Wave 1 | *None*                                              | Phase 0               | Bootstrap Implementation Language & Self-Hosting Strategy                              |
 | **`DR-02`** | **`RDG-02`** | `docs/research/DR-02.md` | Wave 1 | *None*                                              | Phase 2               | Programming Paradigm & Execution Semantics                                             |
@@ -29,6 +29,7 @@ This catalog contains the 21 self-contained, copy-pasteable `Deep research` prom
 | **`DR-19`** | **`RDG-19`** | `docs/research/DR-19.md` | Wave 4 | `PLAN`, `DR-01`, `DR-06`, `DR-08`, `DR-09`, `DR-20` | Phase 7 (Seam) / 13   | Self-Hosted Tier C, Live Hot-Reloading (`run --watch`), `@must_vectorize` & VOPR Sim   |
 | **`DR-20`** | **`RDG-20`** | `docs/research/DR-20.md` | Wave 4 | *None*                                              | Phases 6–13           | Holistic Superpower Catalog (`D-01`–`D-11`), Soundness Fixes & `195-LOC` Seam Audit    |
 | **`DR-21`** | **`RDG-21`** | `docs/research/DR-21.md` | Wave 5 | `PLAN`, `DR-02`–`DR-08`, `DR-12`–`DR-15`, `DR-20`   | Phase 7.5 (Pre-Ph. 8) | Surface Syntax, `cx.*` Namespace, Unified `.` Paths & `SE-01`–`SE-08` Ergonomics       |
+| **`DR-22`** | **`RDG-22`** | `docs/research/DR-22.md` | Wave 6 | `PLAN`, `DR-21`, `DR-02`–`04`, `DR-06`–`08`, `10`, `15` | Phase 7.6 (Pre-Ph. 8) | Canonical CoreX v1.0 Surface Lock (`ADR-22A`–`22F`) & `SE-09`–`SE-23` Advantages       |
 
 ---
 
@@ -708,3 +709,9 @@ Output your entire completed specification report wrapped inside **one single ou
 ## `DR-21` (Plugs into `RDG-21` → `docs/research/DR-21.md`): Surface Syntax, Standard Namespace (`cx.*`) & Zero-Cost Ergonomic Elevation
 
 > Resolved in [DR-21.md](DR-21.md) (`ADR-21A`/`21B` `cx.*` public standard namespace + `--internal-core` Stage-1 kernel boundary, `ADR-21C` unified `.` path/member separator retiring `::`, `SE-01`–`SE-08` zero-cost surface elevations – flow-sensitive `is` chains retiring `if let`/`while let`, `(x := expr)` condition bindings, `orelse` `T?` coalescing, `$` slice length indexing, `for item, i`, `T?` labeled value-break loops, `= expr;` functions + named/default call arguments, and `with context.<slot> = expr` blocks – plus `UR-21-00`–`UR-21-07` `corex upgrade` rules).
+
+---
+
+## `DR-22` (Plugs into `RDG-22` → `docs/research/DR-22.md`): Definitive Surface Syntax Canonicalization, Micro-Ergonomic Polish & Zero-Cost Language Advantages
+
+> Resolved in [DR-22.md](DR-22.md) (`ADR-22A`–`22F` One Canonical Way surface lock – word-based `and`/`or`/`not` + `~x`, `let`/`var` + `&T`/`&mut T`/`own T`/`&out T` MVS parameter modes with callee-local `var x: T`, payload-first `T!E` + 4-tier `Type` precedence, `@attr(k: v)` + `bit_field Name: uN` + `enum Name: Int` + `.len()` + `Number` + `@no_alloc`, 4-tier `pub(super)`/`pub(pkg)`/`pub` visibility, and `*T`/`*mut T`/`*opaque` + `&raw [mut]` + postfix `ptr.*` – alongside `120` `TokenKind`s, `SE-09`–`SE-23` zero-cost language advantages, and `UR-22-00`–`UR-22-06` `corex upgrade` rules).

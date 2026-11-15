@@ -6927,21 +6927,49 @@ const HirLowerer = struct {
         return null;
     }
 
-    /// Resolves `recv_id` when it is an unshadowed primitive type identifier (`u32`, `f64`, etc.).
+    /// Resolves `recv_id` when it denotes a primitive type or alias/distinct/refined wrapper (`u32`, `f64`, etc.).
     fn resolveBuiltinPrimitiveAst(self: *const HirLowerer, recv_id: NodeIndex) ?TypeId {
         if (recv_id.isNone() or recv_id.asInt() >= self.ast_arena.countNodes()) return null;
         const recv_node = self.ast_arena.getNode(recv_id);
-        if (recv_node.tag != .ident_expr or recv_node.main_token.isNone()) return null;
-        const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, recv_node.main_token);
-        return self.resolveBuiltinPrimitiveLexeme(lexeme);
+        if (recv_node.tag == .ident_expr and !recv_node.main_token.isNone()) {
+            const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, recv_node.main_token);
+            if (self.resolveBuiltinPrimitiveLexeme(lexeme)) |prim_ty| return prim_ty;
+        }
+        var sym_idx = self.nodeSymbol(recv_id);
+        if (sym_idx.isNone() and recv_node.tag == .ident_expr and !recv_node.main_token.isNone()) {
+            const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, recv_node.main_token);
+            if (self.interner.lookup(lexeme)) |name_id| {
+                if (!self.active_name_to_local.contains(name_id.asInt()) and
+                    !self.active_comptime_vals.contains(name_id.asInt()))
+                {
+                    switch (self.sym_table.lookupLexical(self.current_scope, name_id, NamespaceMask.ALL)) {
+                        .found => |found_idx| sym_idx = found_idx,
+                        else => {},
+                    }
+                }
+            }
+        }
+        if (!sym_idx.isNone() and !self.symbol_to_local.contains(sym_idx.asInt())) {
+            const sym = self.sym_table.getSymbol(sym_idx);
+            switch (sym.kind) {
+                .type_alias_sym, .distinct_type_sym, .refined_type_sym, .type_param_sym => {
+                    const concrete_ty = self.concreteType(sym.type_id);
+                    const base_prim = self.pool.unwrapRefinementBase(self.pool.unwrapUnderlyingType(concrete_ty));
+                    if (base_prim.isIntegerPrimitive() or base_prim.isFloatPrimitive()) return concrete_ty;
+                },
+                else => {},
+            }
+        }
+        return null;
     }
 
     /// Evaluates built-in associated constants on integer and floating-point primitives (`u32.MAX`, `f64.PI`, etc.).
     fn evalPrimitiveAssocConst(
         self: *const HirLowerer,
-        prim_ty: TypeId,
+        raw_prim_ty: TypeId,
         member_name: []const u8,
     ) ?struct { val: ComptimeValue, ty: TypeId } {
+        const prim_ty = self.pool.unwrapRefinementBase(self.pool.unwrapUnderlyingType(raw_prim_ty));
         if (prim_ty.isIntegerPrimitive()) {
             const int_assoc = type_system.INT_ASSOC_CONST_MAP.get(member_name) orelse return null;
             const ptr_bits: u32 = @as(u32, self.store.target_layout.ptr_byte_size) * 8;
@@ -9184,23 +9212,29 @@ const HirLowerer = struct {
         }, .none);
     }
 
-    /// Lowers built-in integer endian helpers (`from_le_bytes`, `to_le_bytes`, `from_be_bytes`, `to_be_bytes`).
+    /// Lowers built-in integer and float endian helpers (`from_{le,be,ne}_bytes`, `to_{le,be,ne}_bytes`).
     fn tryLowerPrimitiveEndianHelper(
         self: *HirLowerer,
         expr_id: NodeIndex,
-        prim_ty: TypeId,
+        static_or_recv_ty: TypeId,
         is_static_call: bool,
         recv_id: NodeIndex,
         member_name: []const u8,
         val_args: []const NodeIndex,
         tok: TokenIndex,
     ) !?HirIndex {
-        if (!prim_ty.isIntegerPrimitive()) return null;
+        const raw_base = self.pool.unwrapRefinementBase(self.pool.unwrapUnderlyingType(static_or_recv_ty));
+        const prim_ty: TypeId = switch (raw_base) {
+            .untyped_int_ty => .i32_ty,
+            .untyped_float_ty => .f64_ty,
+            else => raw_base,
+        };
+        if (!prim_ty.isIntegerPrimitive() and !prim_ty.isFloatPrimitive()) return null;
         const byte_count: usize = switch (prim_ty) {
             .i8_ty, .u8_ty => 1,
             .i16_ty, .u16_ty => 2,
-            .i32_ty, .u32_ty => 4,
-            .i64_ty, .u64_ty => 8,
+            .i32_ty, .u32_ty, .f32_ty => 4,
+            .i64_ty, .u64_ty, .f64_ty => 8,
             .i128_ty, .u128_ty => 16,
             .isize_ty, .usize_ty => self.store.target_layout.ptr_byte_size,
             else => return null,
@@ -9208,9 +9242,17 @@ const HirLowerer = struct {
         const byte_arr_ty = try self.pool.internArray(.u8_ty, @intCast(byte_count), false);
 
         if (is_static_call and val_args.len == 1 and
-            (std.mem.eql(u8, member_name, "from_le_bytes") or std.mem.eql(u8, member_name, "from_be_bytes")))
+            (std.mem.eql(u8, member_name, "from_le_bytes") or
+                std.mem.eql(u8, member_name, "from_be_bytes") or
+                std.mem.eql(u8, member_name, "from_ne_bytes")))
         {
             const is_be = std.mem.eql(u8, member_name, "from_be_bytes");
+            const out_ty = if (!static_or_recv_ty.isError() and
+                raw_base != .untyped_int_ty and
+                raw_base != .untyped_float_ty)
+                static_or_recv_ty
+            else
+                prim_ty;
             var stmts: std.ArrayListUnmanaged(u32) = .empty;
             defer stmts.deinit(self.allocator);
             var bytes_hir = try self.lowerExpr(self.unwrapCallArgAst(val_args[0]), byte_arr_ty);
@@ -9218,25 +9260,31 @@ const HirLowerer = struct {
             if (is_be) {
                 bytes_hir = try self.reverseByteArrayHir(bytes_hir, byte_arr_ty, byte_count, tok, &stmts);
             }
-            const extra_idx = try self.store.appendExtraSlice(&[4]u32{ 1, 1, prim_ty.toU32(), bytes_hir.asInt() });
+            const extra_idx = try self.store.appendExtraSlice(&[4]u32{ 1, 1, out_ty.toU32(), bytes_hir.asInt() });
             const cast_hir = try self.emitNode(.{
                 .tag = .hir_intrinsic_call,
                 .flags = .{ .category = .rvalue, .is_synthetic = true },
-                .type_id = prim_ty,
+                .type_id = out_ty,
                 .origin_token = tok,
                 .data = .{ .lhs = @backingInt(IntrinsicKind.bit_cast), .rhs = extra_idx },
             }, expr_id);
-            if (stmts.items.len > 0) return try self.emitSyntheticBlock(stmts.items, cast_hir, prim_ty, tok);
+            if (stmts.items.len > 0) return try self.emitSyntheticBlock(stmts.items, cast_hir, out_ty, tok);
             return cast_hir;
         }
 
         if (!is_static_call and val_args.len == 0 and
-            (std.mem.eql(u8, member_name, "to_le_bytes") or std.mem.eql(u8, member_name, "to_be_bytes")))
+            (std.mem.eql(u8, member_name, "to_le_bytes") or
+                std.mem.eql(u8, member_name, "to_be_bytes") or
+                std.mem.eql(u8, member_name, "to_ne_bytes")))
         {
             const is_be = std.mem.eql(u8, member_name, "to_be_bytes");
             var stmts: std.ArrayListUnmanaged(u32) = .empty;
             defer stmts.deinit(self.allocator);
-            const raw_recv = try self.lowerExpr(recv_id, prim_ty);
+            const recv_expect: TypeId = if (raw_base == .untyped_int_ty or raw_base == .untyped_float_ty)
+                prim_ty
+            else
+                .err_ty;
+            const raw_recv = try self.lowerExpr(recv_id, recv_expect);
             const deref_recv = try self.autoDerefPlace(raw_recv, tok);
             const extra_idx = try self.store.appendExtraSlice(
                 &[4]u32{ 1, 1, byte_arr_ty.toU32(), deref_recv.asInt() },

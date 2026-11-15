@@ -13158,11 +13158,10 @@ fn appendConstInitializerMirBodiesForSast(
                             const kind_raw = temp_store.extra_data.items[cursor];
                             cursor += 1;
                             if (kind_raw == @backingInt(hir.HirCondClauseKind.is_match)) {
-                                if (cursor + 3 <= temp_store.extra_data.items.len) {
+                                if (cursor + 2 <= temp_store.extra_data.items.len) {
                                     const scrut_raw = temp_store.extra_data.items[cursor];
                                     const pat_idx = temp_store.extra_data.items[cursor + 1];
-                                    const guard_raw = temp_store.extra_data.items[cursor + 2];
-                                    cursor += 3;
+                                    cursor += 2;
                                     if (scrut_raw != mir.NONE_U32) try visit_stack.append(allocator, scrut_raw);
                                     try remapConstPatLocals(
                                         allocator,
@@ -13172,7 +13171,6 @@ fn appendConstInitializerMirBodiesForSast(
                                         &local_remap,
                                         0,
                                     );
-                                    if (guard_raw != mir.NONE_U32) try visit_stack.append(allocator, guard_raw);
                                 }
                             } else if (cursor < temp_store.extra_data.items.len) {
                                 const pred_raw = temp_store.extra_data.items[cursor];

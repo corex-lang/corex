@@ -1090,4 +1090,51 @@ test "test_regression_four_tier_context_arena_closure_drop_and_dependent_default
     try std.testing.expectEqual(@as(i64, 85), report.outcomes[0].return_scalar_i64);
 }
 
+test "test_regression_four_tier_primitive_float_ne_and_alias_endian_helpers" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const endian_src =
+        \\pub type Word = u32;
+        \\pub type NetPort = distinct u16;
+        \\
+        \\pub fn main() -> i32 {
+        \\    let ne_word: u32 = 0x1234_5678;
+        \\    let ne_round: u32 = u32.from_ne_bytes(ne_word.to_ne_bytes());
+        \\    let ne_ok: i32 = if ne_round == ne_word { 11 } else { 0 };
+        \\
+        \\    let f32_five: f32 = f32.from_le_bytes([0x00, 0x00, 0xA0, 0x40]);
+        \\    let f32_three: f32 = f32.from_be_bytes([0x40, 0x40, 0x00, 0x00]);
+        \\    let f32_ne: f32 = f32.from_ne_bytes(f32_five.to_ne_bytes());
+        \\    let f32_be_hi: u8 = f32_three.to_be_bytes()[0];
+        \\    let f32_le_hi: u8 = f32_five.to_le_bytes()[3];
+        \\    let f32_score: i32 = (f32_ne as i32) + (f32_three as i32) +
+        \\        (if f32_be_hi == 0x40 and f32_le_hi == 0x40 { 7 } else { 0 });
+        \\
+        \\    let f64_nine: f64 = f64.from_le_bytes([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x40]);
+        \\    let f64_seven: f64 = f64.from_be_bytes([0x40, 0x1C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        \\    let f64_ne: f64 = f64.from_ne_bytes(f64_nine.to_ne_bytes());
+        \\    let f64_be_sec: u8 = f64_seven.to_be_bytes()[1];
+        \\    let f64_score: i32 = (f64_ne as i32) + (f64_seven as i32) +
+        \\        (if f64_be_sec == 0x1C { 13 } else { 0 });
+        \\
+        \\    let alias_max_ok: i32 = if Word.MAX == 0xFFFF_FFFF { 5 } else { 0 };
+        \\    let alias_word: Word = Word.from_le_bytes([19, 0, 0, 0]);
+        \\    let http_port: NetPort = NetPort.from_be_bytes([0x00, 0x50]);
+        \\    let port_lo: i32 = http_port.to_be_bytes()[1] as i32;
+        \\    let lit_bytes_ok: i32 = if (258).to_le_bytes()[1] == 1 and (2.0).to_be_bytes()[0] == 0x40 { 3 } else { 0 };
+        \\
+        \\    return ne_ok + f32_score + f64_score + alias_max_ok + (alias_word as i32) + port_lo + lit_bytes_ok;
+        \\}
+    ;
+
+    var report = try expectFourTierParity(allocator, io, endian_src);
+    defer report.deinit(allocator);
+    try std.testing.expect(!report.outcomes[0].has_trapped);
+    // `ne_ok = 11`; `f32_score = 5 + 3 + 7 = 15`; `f64_score = 9 + 7 + 13 = 29`;
+    // `alias_max_ok = 5`; `alias_word = 19`; `port_lo = 80`; `lit_bytes_ok = 3` -> `162`:
+    try std.testing.expectEqual(@as(i64, 162), report.outcomes[0].return_scalar_i64);
+}
+
+
 

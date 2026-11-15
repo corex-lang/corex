@@ -1432,3 +1432,72 @@ test "test_parser_deep_postfix_dot_and_bracket_chains_are_bounded_without_recurs
     try std.testing.expectEqual(DiagnosticCode.e0203_parse_depth_exceeded, sink.asSlice()[0].code);
     try expectValidCstAndAstInvariants(src_buf.items, &token_buf, &cst_arena, &ast_arena);
 }
+
+test "test_regression_is_type_start_contextual_any_dyn_distinct_index_and_linear_module_scan" {
+    var token_buf = TokenBuffer.init(std.testing.allocator);
+    defer token_buf.deinit();
+    var cst_arena = LosslessCstArena.init(std.testing.allocator);
+    defer cst_arena.deinit();
+    var ast_arena = AstArena.init(std.testing.allocator);
+    defer ast_arena.deinit();
+    var sink = DiagnosticSink.init(std.testing.allocator);
+    defer sink.deinit();
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    // [1] Contextual `any`, `dyn`, and `distinct` identifiers in index expressions vs `TypeArgs` / `type`:
+    const contextual_disambig_src =
+        \\pub type UserId = distinct u32;
+        \\
+        \\fn check_contextual_brackets(arr: &[i32]) -> i32 {
+        \\    let idx_a = arr[any()];
+        \\    let idx_b = arr[any[u32]()];
+        \\    let idx_c = arr[dyn()];
+        \\    let idx_d = arr[distinct()];
+        \\    let idx_e = arr[any * 2];
+        \\    let idx_f = arr[any.offset];
+        \\    let gen_a = wrap[dyn Reader](idx_a);
+        \\    let gen_b = wrap[&dyn cx.io.Reader[u8]](idx_b);
+        \\    let gen_c = wrap[any Numeric](idx_c);
+        \\    return idx_d + idx_e + idx_f + gen_a + gen_b + gen_c;
+        \\}
+    ;
+    _ = try corex.parseSource(
+        contextual_disambig_src,
+        FileId.fromInt(0),
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+        &sink,
+        &interner,
+    );
+    try std.testing.expectEqual(@as(u32, 0), sink.error_count);
+    try std.testing.expect(hasCstKind(&cst_arena, .index_expr));
+    try std.testing.expect(hasCstKind(&cst_arena, .type_args));
+    try expectValidCstAndAstInvariants(contextual_disambig_src, &token_buf, &cst_arena, &ast_arena);
+
+    // [2] Deep lowercase `.ident` path inside `arr[mod0.mod1. … .mod255]` scans linearly with `0` errors:
+    var deep_index_buf: std.ArrayList(u8) = .empty;
+    defer deep_index_buf.deinit(std.testing.allocator);
+    try deep_index_buf.appendSlice(std.testing.allocator, "fn deep_index_path(arr: &[i32]) -> i32 {\n    return arr[root_pkg");
+    var i: usize = 0;
+    while (i < 256) : (i += 1) {
+        try deep_index_buf.appendSlice(std.testing.allocator, ".seg");
+    }
+    try deep_index_buf.appendSlice(std.testing.allocator, "] + wrap[pkg_a.pkg_b.pkg_c.LeafType](1);\n}\n");
+
+    sink.diagnostics.clearRetainingCapacity();
+    sink.error_count = 0;
+    sink.warning_count = 0;
+    _ = try corex.parseSource(
+        deep_index_buf.items,
+        FileId.fromInt(1),
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+        &sink,
+        &interner,
+    );
+    try std.testing.expectEqual(@as(u32, 0), sink.error_count);
+    try expectValidCstAndAstInvariants(deep_index_buf.items, &token_buf, &cst_arena, &ast_arena);
+}

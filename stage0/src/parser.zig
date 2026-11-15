@@ -964,6 +964,36 @@ pub const Parser = struct {
         return self.peekNth(lookahead).kind;
     }
 
+    /// Advances `start_raw` past any carrier tokens, returning the index of the next non-carrier token.
+    inline fn skipCarrierRawIndex(self: *const Parser, start_raw: usize) usize {
+        const total_tokens = self.token_buffer.countTokens();
+        var scan_idx = start_raw;
+        while (scan_idx < total_tokens) : (scan_idx += 1) {
+            if (!isCarrierToken(self.token_buffer.getToken(TokenIndex.fromInt(@intCast(scan_idx))))) {
+                return scan_idx;
+            }
+        }
+        return total_tokens;
+    }
+
+    /// Advances `start_raw` by `count` non-carrier tokens in $O(\text{count})$ raw steps.
+    inline fn advanceNonCarrierRawIndex(self: *const Parser, start_raw: usize, count: usize) usize {
+        const total_tokens = self.token_buffer.countTokens();
+        var cur_raw = self.skipCarrierRawIndex(start_raw);
+        var rem = count;
+        while (rem > 0 and cur_raw < total_tokens) : (rem -= 1) {
+            cur_raw = self.skipCarrierRawIndex(cur_raw + 1);
+        }
+        return cur_raw;
+    }
+
+    /// Returns the non-carrier `TokenKind` at `raw_idx` (`.eof` when out of bounds).
+    inline fn rawTokenKindAt(self: *const Parser, raw_idx: usize) TokenKind {
+        const cur_raw = self.skipCarrierRawIndex(raw_idx);
+        if (cur_raw >= self.token_buffer.countTokens()) return .eof;
+        return self.token_buffer.getToken(TokenIndex.fromInt(@intCast(cur_raw))).kind;
+    }
+
     /// Returns the source `Span` for `token_id`, clamping out-of-bounds synthetic EOF indices.
     fn getTokenSpan(self: *const Parser, token_id: TokenIndex) Span {
         if (token_id.asInt() >= self.token_buffer.countTokens()) {
@@ -4882,16 +4912,17 @@ pub const Parser = struct {
 
     /// Returns `true` if the token at `start_lookahead` begins a `Type` (`DR-21` Section 1.3).
     fn isTypeStart(self: *const Parser, start_lookahead: usize) bool {
-        var lookahead: usize = start_lookahead;
+        var raw_idx: usize = self.peekTokenIndexNth(start_lookahead).asInt();
         var steps: usize = 0;
         while (steps < MAX_TYPE_LOOKAHEAD) : (steps += 1) {
-            switch (self.peekKindNth(lookahead)) {
+            switch (self.rawTokenKindAt(raw_idx)) {
                 .prim_type => {
-                    return self.peekKindNth(lookahead + 1) != .dot;
+                    return self.rawTokenKindAt(self.advanceNonCarrierRawIndex(raw_idx, 1)) != .dot;
                 },
                 .kw_self_type => {
-                    if (self.peekKindNth(lookahead + 1) == .dot) {
-                        return self.peekKindNth(lookahead + 2) == .type_ident;
+                    const next_raw = self.advanceNonCarrierRawIndex(raw_idx, 1);
+                    if (self.rawTokenKindAt(next_raw) == .dot) {
+                        return self.rawTokenKindAt(self.advanceNonCarrierRawIndex(next_raw, 1)) == .type_ident;
                     }
                     return true;
                 },
@@ -4906,21 +4937,22 @@ pub const Parser = struct {
                 .pipepipe,
                 => return true,
                 .star => {
-                    lookahead = if (self.peekKindNth(lookahead + 1) == .kw_mut or
-                        self.peekKindNth(lookahead + 1) == .kw_const)
-                        lookahead + 2
+                    const next_raw = self.advanceNonCarrierRawIndex(raw_idx, 1);
+                    const next_kind = self.rawTokenKindAt(next_raw);
+                    raw_idx = if (next_kind == .kw_mut or next_kind == .kw_const)
+                        self.advanceNonCarrierRawIndex(next_raw, 1)
                     else
-                        lookahead + 1;
+                        next_raw;
                 },
                 .pipe => {
-                    var scan_off: usize = lookahead + 1;
+                    var scan_raw: usize = self.advanceNonCarrierRawIndex(raw_idx, 1);
                     var pipe_steps: usize = 0;
                     var nested_depth: u32 = 0;
                     while (pipe_steps < MAX_TYPE_LOOKAHEAD) : (pipe_steps += 1) {
-                        const tok_kind = self.peekKindNth(scan_off);
+                        const tok_kind = self.rawTokenKindAt(scan_raw);
                         if (tok_kind == .eof or tok_kind == .semi or tok_kind == .rbrace) return false;
                         if (nested_depth == 0 and tok_kind == .pipe) {
-                            const after_pipe = self.peekKindNth(scan_off + 1);
+                            const after_pipe = self.rawTokenKindAt(self.advanceNonCarrierRawIndex(scan_raw, 1));
                             return after_pipe == .arrow or
                                 after_pipe == .rbracket or
                                 after_pipe == .comma or
@@ -4932,28 +4964,31 @@ pub const Parser = struct {
                             if (nested_depth == 0) return false;
                             nested_depth -= 1;
                         }
-                        scan_off += 1;
+                        scan_raw = self.advanceNonCarrierRawIndex(scan_raw, 1);
                     }
                     return false;
                 },
                 .type_ident => {
-                    const next_kind = self.peekKindNth(lookahead + 1);
+                    const next_raw = self.advanceNonCarrierRawIndex(raw_idx, 1);
+                    const next_kind = self.rawTokenKindAt(next_raw);
                     if (next_kind == .dot or next_kind == .lparen or next_kind == .lbrace) {
                         return false;
                     }
                     if (next_kind == .lbracket) {
-                        var scan_off: usize = lookahead + 2;
+                        var scan_raw: usize = self.advanceNonCarrierRawIndex(next_raw, 1);
                         var scan_steps: usize = 0;
                         var bracket_depth: u32 = 1;
                         while (scan_steps < MAX_TYPE_LOOKAHEAD) : (scan_steps += 1) {
-                            const tok_kind = self.peekKindNth(scan_off);
+                            const tok_kind = self.rawTokenKindAt(scan_raw);
                             if (tok_kind == .eof or tok_kind == .semi or tok_kind == .rbrace) break;
                             if (tok_kind == .lbracket) {
                                 bracket_depth += 1;
                             } else if (tok_kind == .rbracket) {
                                 bracket_depth -= 1;
                                 if (bracket_depth == 0) {
-                                    const after_close = self.peekKindNth(scan_off + 1);
+                                    const after_close = self.rawTokenKindAt(
+                                        self.advanceNonCarrierRawIndex(scan_raw, 1),
+                                    );
                                     if (after_close == .dot or
                                         after_close == .lparen or
                                         after_close == .lbrace)
@@ -4963,45 +4998,49 @@ pub const Parser = struct {
                                     break;
                                 }
                             }
-                            scan_off += 1;
+                            scan_raw = self.advanceNonCarrierRawIndex(scan_raw, 1);
                         }
                     }
                     return true;
                 },
                 .amp => {
-                    lookahead = if (self.peekKindNth(lookahead + 1) == .kw_mut)
-                        lookahead + 2
+                    const next_raw = self.advanceNonCarrierRawIndex(raw_idx, 1);
+                    raw_idx = if (self.rawTokenKindAt(next_raw) == .kw_mut)
+                        self.advanceNonCarrierRawIndex(next_raw, 1)
                     else
-                        lookahead + 1;
+                        next_raw;
                 },
                 .lparen => {
-                    if (self.peekKindNth(lookahead + 1) == .rparen) return true;
-                    lookahead += 1;
+                    const next_raw = self.advanceNonCarrierRawIndex(raw_idx, 1);
+                    if (self.rawTokenKindAt(next_raw) == .rparen) return true;
+                    raw_idx = next_raw;
                 },
                 .lbracket => {
-                    lookahead += 1;
+                    raw_idx = self.advanceNonCarrierRawIndex(raw_idx, 1);
                 },
                 .ident => {
-                    const lexeme = self.peekLexemeNth(lookahead);
-                    if ((std.mem.eql(u8, lexeme, "dyn") or
-                        std.mem.eql(u8, lexeme, "any") or
-                        std.mem.eql(u8, lexeme, "distinct")) and
-                        TYPE_STARTER_SET.contains(self.peekKindNth(lookahead + 1)))
+                    const cur_tok_id = TokenIndex.fromInt(@intCast(self.skipCarrierRawIndex(raw_idx)));
+                    const lexeme = self.getTokenLexeme(cur_tok_id);
+                    const next_raw = self.advanceNonCarrierRawIndex(raw_idx, 1);
+                    const next_kind = self.rawTokenKindAt(next_raw);
+                    if ((std.mem.eql(u8, lexeme, "dyn") or std.mem.eql(u8, lexeme, "any")) and
+                        (next_kind == .type_ident or next_kind == .kw_self_type or
+                            (next_kind == .ident and
+                                self.rawTokenKindAt(self.advanceNonCarrierRawIndex(next_raw, 1)) == .dot)))
                     {
-                        lookahead += 1;
+                        raw_idx = next_raw;
                         continue;
                     }
-                    var scan_off: usize = lookahead;
+                    var scan_raw: usize = raw_idx;
                     var seg_steps: usize = 0;
-                    const max_toks: usize = self.token_buffer.countTokens();
-                    while (seg_steps <= max_toks and
-                        self.peekKindNth(scan_off) == .ident and
-                        self.peekKindNth(scan_off + 1) == .dot) : (seg_steps += 1)
+                    while (seg_steps < MAX_TYPE_LOOKAHEAD and
+                        self.rawTokenKindAt(scan_raw) == .ident and
+                        self.rawTokenKindAt(self.advanceNonCarrierRawIndex(scan_raw, 1)) == .dot) : (seg_steps += 1)
                     {
-                        scan_off += 2;
+                        scan_raw = self.advanceNonCarrierRawIndex(scan_raw, 2);
                     }
-                    if (scan_off > lookahead and self.peekKindNth(scan_off) == .type_ident) {
-                        lookahead = scan_off;
+                    if (scan_raw > raw_idx and self.rawTokenKindAt(scan_raw) == .type_ident) {
+                        raw_idx = scan_raw;
                         continue;
                     }
                     return false;
@@ -5017,7 +5056,7 @@ pub const Parser = struct {
         if (lhs_node.isNone() or self.has_last_expr_block_body) return false;
         var cur_node_id = lhs_node;
         var is_type_tail_required = false;
-        const max_steps: usize = self.ast.countNodes();
+        const max_steps: usize = @min(self.ast.countNodes(), self.options.max_depth);
         var step_count: usize = 0;
         while (step_count <= max_steps) : (step_count += 1) {
             if (cur_node_id.isNone()) return false;
@@ -5059,7 +5098,7 @@ pub const Parser = struct {
     fn hasTrailingTypeLhs(self: *const Parser, lhs_node: NodeIndex) bool {
         if (lhs_node.isNone() or self.has_last_expr_block_body) return false;
         var cur_node_id = lhs_node;
-        const max_steps: usize = self.ast.countNodes();
+        const max_steps: usize = @min(self.ast.countNodes(), self.options.max_depth);
         var step_count: usize = 0;
         while (step_count <= max_steps) : (step_count += 1) {
             if (cur_node_id.isNone()) return false;

@@ -3377,4 +3377,72 @@ test "test_regression_hir_if_condition_autodrop_scope_and_inclusive_slice_e0307"
     );
 }
 
+test "test_regression_const_initializer_cond_if_is_match_sast_gate_f" {
+    const allocator = std.testing.allocator;
+
+    // [1] Top-level `const` initializers with `HirCondClauseKind.is_match` (`if … is …` & `while … is …`)
+    // synchronize `extra_data` (`2` payload words) cleanly in Gate F SAST (`0` diagnostics):
+    const clean_const_cond_src =
+        \\pub const COND_IF_CONST: i64 = {
+        \\    let maybe_seed: i64? = .Some(6);
+        \\    let bonus_table: [i64; 3] = [10, 20, 30];
+        \\    if maybe_seed is .Some(seed_val) and (doubled_val := seed_val * 2) > 8 {
+        \\        doubled_val + bonus_table[1]
+        \\    } else {
+        \\        bonus_table[0]
+        \\    }
+        \\};
+        \\
+        \\pub const COND_WHILE_CONST: i64 = {
+        \\    var step_opt: i64? = .Some(3);
+        \\    var total_acc: i64 = 0;
+        \\    while step_opt is .Some(cur_step) and cur_step > 0 {
+        \\        total_acc = total_acc + cur_step;
+        \\        step_opt = if cur_step > 1 { .Some(cur_step - 1) } else { .None };
+        \\    }
+        \\    total_acc
+        \\};
+        \\
+        \\pub fn read_const_pair() -> i64 {
+        \\    return COND_IF_CONST + COND_WHILE_CONST;
+        \\}
+    ;
+    var clean_bundle = try verifyCleanSast(allocator, 544, clean_const_cond_src, .{});
+    defer clean_bundle.deinit();
+
+    // [2] Static OOB inside trailing clause or `else_tail` after `is_match` in a `const` initializer emits `E0307`:
+    const bad_const_else_oob_src =
+        \\pub const BAD_ELSE_CONST: i64 = {
+        \\    let maybe_val: i64? = .None;
+        \\    let fixed_arr: [i64; 3] = [10, 20, 30];
+        \\    if maybe_val is .Some(hit_val) {
+        \\        hit_val
+        \\    } else {
+        \\        fixed_arr[7]
+        \\    }
+        \\};
+        \\pub fn use_bad_else() -> i64 {
+        \\    return BAD_ELSE_CONST;
+        \\}
+    ;
+    try expectSastDiagnostic(allocator, 545, bad_const_else_oob_src, .{}, .e0307_static_buffer_overflow);
+
+    const bad_const_guard_oob_src =
+        \\pub const BAD_GUARD_CONST: i64 = {
+        \\    let maybe_val: i64? = .Some(4);
+        \\    let fixed_arr: [i64; 2] = [10, 20];
+        \\    if maybe_val is .Some(hit_val) and fixed_arr[5] > 0 {
+        \\        hit_val
+        \\    } else {
+        \\        0
+        \\    }
+        \\};
+        \\pub fn use_bad_guard() -> i64 {
+        \\    return BAD_GUARD_CONST;
+        \\}
+    ;
+    try expectSastDiagnostic(allocator, 546, bad_const_guard_oob_src, .{}, .e0307_static_buffer_overflow);
+}
+
+
 
