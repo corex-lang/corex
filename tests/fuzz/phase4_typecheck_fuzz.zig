@@ -1,10 +1,12 @@
-//! Phase 4 Deterministic Name Resolution, Type System & Error Semantics Fuzzing Suite (`tests/fuzz/phase4_typecheck_fuzz.zig`)
+//! Phase 4 & Phase 7.5 Deterministic Name Resolution, Type System & `DR-21` Fuzzing Suite (`tests/fuzz/phase4_typecheck_fuzz.zig`)
 //!
-//! Exercises structure-aware and mutated `.cx` programs with Constrained Type Groups (`Number`,
-//! `any Signed`, `~Unsigned`), `distinct` newtypes, `is` range refinements, `bit_field` declarations,
-//! `#soa` slices, `Result[T, E]` / `T?` `?` propagation, `catch |err|`, `let … else`, `match`
-//! exhaustiveness, and syntax recovery holes (`expr_hole`, `type_hole`, `pattern_hole`) through
-//! `symbol_resolver` and `type_system`.
+//! Exercises structure-aware and mutated `.cx` programs combining Phase 4 (`Number`, `any Signed`,
+//! `~Unsigned`, `distinct`, `is` range refinements, `bit_field`, `#soa`, `Result[T, E]` / `T?` `?`,
+//! `catch |err|`, `let … else`, `match` exhaustiveness, and recovery holes) with Phase 7.5 (`DR-21`
+//! Unified `.` static/associated calls, `is` / `is not` flow narrowing, `(val := expr)` walrus
+//! conditions, `orelse` / `unreachable`, `$` slice length, `= expr;` functions, named/default call
+//! arguments, indexed `for item, idx in`, labeled `T?` value-`break` loops, `with context`, and
+//! `use cx.*` vs `use core.*`) through `symbol_resolver` and `type_system`.
 //!
 //! - Asserts zero crashes, zero leaks, and poison-type (`TypeId.err_ty`) soundness across mutated ASTs.
 //! - Asserts 100% fingerprint parity between an incrementally mutated `CompilerDb` and a fresh
@@ -15,7 +17,6 @@ const corex = @import("corex");
 
 const type_system = corex.type_system;
 const FileId = corex.FileId;
-const DefId = corex.DefId;
 const Durability = corex.Durability;
 const Fingerprint128 = corex.Fingerprint128;
 const CompilerDb = corex.CompilerDb;
@@ -27,7 +28,21 @@ const TYPECHECK_FUZZ_ITERATIONS: usize = 600;
 /// Number of incremental `CompilerDb` revision steps verified in `test_fuzz_phase4_incremental_typecheck_parity`.
 const INCREMENTAL_TYPECHECK_ITERATIONS: usize = 250;
 
-/// Type-level and declaration seed items for Phase 4 structure-aware fuzzing.
+/// Stub `core` / `cx` root module registered for `use cx.*` vs `use core.*` (`E0218`) incremental parity.
+const CORE_STUB_SOURCE =
+    "pub mod mem {\n" ++
+    "    pub fn word_bytes() -> i32 = 8;\n" ++
+    "}\n";
+
+/// Module-header import variants exercising `use cx.*` (`ADR-21B`) vs forbidden direct `use core.*` (`E0218`).
+const PHASE4_IMPORT_VARIANTS = [_][]const u8{
+    "use cx.mem;\n\n",
+    "use cx.{mem};\n\n",
+    "use core.mem;\n\n",
+    "",
+};
+
+/// Type-level and declaration seed items for Phase 4 & Phase 7.5 (`DR-21`) structure-aware fuzzing.
 const PHASE4_SEED_ITEMS = [_][]const u8{
     "pub type UserId = distinct u64;\n",
     "pub type PortNum = u16 is 1..=1024;\n",
@@ -36,9 +51,19 @@ const PHASE4_SEED_ITEMS = [_][]const u8{
     "pub enum AppError { @from Io(IoError), InvalidPort, }\n",
     "pub struct Vec2 { pub x: f32, pub y: f32 }\n",
     "pub bit_field HeaderBits(u8) { pub ver: u8 | 3, pub flags: u8 | 5 }\n",
-    "pub fn add_numbers(lhs: Number, rhs: Number) -> Number { return lhs + rhs; }\n",
-    "pub fn compare_any(lhs: any Signed, rhs: any Signed) -> bool { let _a = lhs; let _b = rhs; return true; }\n",
-    "pub fn unwrap_id(uid: ~u64) -> ~u64 { return uid; }\n",
+    "pub struct PairCounter { pub count: i32 }\n" ++
+        "impl PairCounter {\n" ++
+        "    pub const DEFAULT_SEED: i32 = 4;\n" ++
+        "    pub fn with_seed(seed_val: i32) -> PairCounter = PairCounter { count: seed_val };\n" ++
+        "}\n",
+    "pub fn add_numbers(lhs: Number, rhs: Number) -> Number = lhs + rhs;\n",
+    "pub fn compare_any(lhs: any Signed, rhs: any Signed) -> bool { let _lhs = lhs; let _rhs = rhs; return true; }\n",
+    "pub fn unwrap_id(uid: ~u64) -> ~u64 = uid;\n",
+    "pub fn affine_calc(base: i32, scale: i32 = 2, bias: i32 = base + 1) -> i32 = base * scale + bias;\n",
+    "pub fn read_assoc_and_tuple(nested: ((i32, i32), i32)) -> i32 =\n" ++
+        "    PairCounter.with_seed(PairCounter.DEFAULT_SEED).count + nested.0.1 + nested.1;\n",
+    "pub fn call_named_and_defaults(val_in: i32) -> i32 =\n" ++
+        "    affine_calc(val_in) + affine_calc(bias: 5, base: val_in) + affine_calc(val_in, scale: 3);\n",
     "pub fn read_port(raw: u16) -> Result[PortNum, IoError] {\n" ++
         "    if raw == 80 { return .Ok(80); }\n" ++
         "    return .Err(IoError { code: 404 });\n" ++
@@ -54,33 +79,109 @@ const PHASE4_SEED_ITEMS = [_][]const u8{
         "        128..=255 => 2,\n" ++
         "    };\n" ++
         "}\n",
-    "pub fn guard_optional(opt: i32?) -> i32 {\n" ++
-        "    let .Some(inner) = opt else { return 0; };\n" ++
-        "    return inner + 1;\n" ++
+    "pub fn guard_optional(opt_val: i32?) -> i32 {\n" ++
+        "    let .Some(inner_val) = opt_val else { return 0; };\n" ++
+        "    return inner_val + 1;\n" ++
+        "}\n",
+    "pub fn narrow_is_walrus_and_orelse(opt_in: i32?, backup_opt: i32?) -> i32 {\n" ++
+        "    if (cand_opt := opt_in) is .Some(inner_val) and (shifted := inner_val + 2) > 4 {\n" ++
+        "        let _keep = cand_opt;\n" ++
+        "        return shifted;\n" ++
+        "    } else if backup_opt is not .None {\n" ++
+        "        return backup_opt orelse unreachable;\n" ++
+        "    }\n" ++
+        "    return opt_in orelse 9;\n" ++
+        "}\n",
+    "pub fn scan_dollar_indexed_and_labeled_break(items: &[i32]) -> i32 {\n" ++
+        "    var acc_sum: i32 = 0;\n" ++
+        "    for item_val, item_idx in items {\n" ++
+        "        acc_sum += item_val + (item_idx as i32);\n" ++
+        "    }\n" ++
+        "    let tail_bonus: i32 = if (total_len := items.len) >= 2 {\n" ++
+        "        let trimmed: &[i32] = items[..$ - 1];\n" ++
+        "        items[$ - 1] + trimmed[$ - 1] + (total_len as i32)\n" ++
+        "    } else {\n" ++
+        "        0\n" ++
+        "    };\n" ++
+        "    let found_idx: usize = search_slot: for item_val, item_idx in items {\n" ++
+        "        if item_val > 10 {\n" ++
+        "            break :search_slot item_idx;\n" ++
+        "        }\n" ++
+        "    } orelse 0;\n" ++
+        "    return acc_sum + tail_bonus + (found_idx as i32);\n" ++
+        "}\n",
+    "pub fn check_with_cancel_token() -> usize {\n" ++
+        "    let local_tok = CancelToken { _handle: 7 };\n" ++
+        "    return with context.cancel_token = local_tok {\n" ++
+        "        context.cancel_token._handle\n" ++
+        "    };\n" ++
         "}\n",
     "pub fn project_soa(items: #soa [Vec2]) -> f32 {\n" ++
-        "    let xs: [f32] = items.x;\n" ++
-        "    return xs[0];\n" ++
+        "    let xs_col: [f32] = items.x;\n" ++
+        "    return xs_col[0];\n" ++
         "}\n",
 };
 
-/// Deliberately malformed or type-error seed items stressing poison-type propagation (`TypeId.err_ty`).
+/// Deliberately malformed or error-triggering snippets stressing `DR-21` diagnostics & poison soundness (`TypeId.err_ty`).
 const PHASE4_MUTATION_SNIPPETS = [_][]const u8{
-    "pub fn broken_hole(a: i32) -> i32 { let x: = ; return x + a; }\n",
-    "pub fn conflict_call(a: i32, b: i64) -> i32 { return add_numbers(a, b); }\n",
-    "pub fn bad_distinct(u: UserId, raw: u64) -> u64 { return u + raw; }\n",
+    "pub fn broken_hole(arg_val: i32) -> i32 { let x: = ; return x + arg_val; }\n",
+    "pub fn conflict_call(lhs: i32, rhs: i64) -> i32 { return add_numbers(lhs, rhs); }\n",
+    "pub fn bad_distinct(user_id: UserId, raw_val: u64) -> u64 { return user_id + raw_val; }\n",
     "pub fn bad_refine() -> PortNum { return 9999; }\n",
     "pub fn bad_try() -> i32 { return read_port(80)?; }\n",
-    "pub fn bad_match(b: bool) -> i32 { return match b { true => 1 }; }\n",
+    "pub fn bad_match(flag: bool) -> i32 { return match flag { true => 1 }; }\n",
     "pub fn bad_discard() { read_port(80); let _ = read_port(80); }\n",
+    "pub fn bad_or_is_bind(opt_val: i32?) -> i32 {\n" ++
+        "    if opt_val is .Some(inner_val) or true { return inner_val; }\n" ++
+        "    return 0;\n" ++
+        "}\n",
+    "pub fn bad_standalone_walrus() -> i32 { leaked_val := 42; return leaked_val; }\n",
+    "pub fn bad_or_walrus(flag: bool) -> i32 {\n" ++
+        "    if flag or (leaked_val := 7) > 0 { return leaked_val; }\n" ++
+        "    return 0;\n" ++
+        "}\n",
+    "pub fn bad_legacy_colons() -> i32 { return PairCounter::with_seed(1).count; }\n",
+    "pub fn bad_retired_if_let(opt_val: i32?) -> i32 {\n" ++
+        "    if let .Some(inner_val) = opt_val { return inner_val; }\n" ++
+        "    return 0;\n" ++
+        "}\n",
+    "pub fn bad_outer_dollar() -> usize = $;\n",
+    "pub fn bad_irrefutable_is(raw_val: i32) -> i32 {\n" ++
+        "    if raw_val is bound_val { return bound_val; }\n" ++
+        "    return 0;\n" ++
+        "}\n",
+    "pub fn bad_named_arg_order() -> i32 = affine_calc(scale: 2, 10);\n",
+    "use core.mem;\npub fn bad_core_import() -> i32 = 0;\n",
+    "use cx.mem;\npub fn unresolved_cx_standalone() -> i32 = 0;\n",
 };
 
-/// Function body variants for incremental `CompilerDb` Phase 4 parity fuzzing.
+/// Function body variants for incremental `CompilerDb` Phase 4 & Phase 7.5 (`DR-21`) parity fuzzing.
 const PHASE4_BODY_VARIANTS = [_][]const u8{
     "    let step = add_generic(input_val, 10);\n    return .Ok(step);\n",
-    "    // Comment edit only\n    let step = add_generic(input_val, 10);\n\n    return .Ok(step);\n",
-    "    let step = match input_val { 0 => 1, _ => input_val + 2 };\n    return .Ok(step);\n",
-    "    let opt_v: i32? = .Some(input_val);\n    let .Some(v) = opt_v else { return .Err(1); };\n    return .Ok(v);\n",
+    "    // Comment edit only:\n    let step = add_generic(input_val, 10);\n\n    return .Ok(step);\n",
+    "    let opt_in: i32? = if input_val > 0 { .Some(input_val) } else { .None };\n" ++
+        "    if (cand_opt := opt_in) is .Some(inner_val) and (shifted := inner_val + 3) > 5 {\n" ++
+        "        let _keep = cand_opt;\n" ++
+        "        return .Ok(scale_step(bonus: shifted, base: inner_val));\n" ++
+        "    }\n" ++
+        "    return .Ok(opt_in orelse 7);\n",
+    "    let fixed_nums: [i32; 4] = [input_val, 4, 8, 12];\n" ++
+        "    let view_nums: &[i32] = &fixed_nums;\n" ++
+        "    var loop_acc: i32 = view_nums[$ - 1];\n" ++
+        "    for item_val, item_idx in view_nums[..$ - 1] {\n" ++
+        "        loop_acc += item_val + (item_idx as i32);\n" ++
+        "    }\n" ++
+        "    let hit_val: i32 = find_gt: for item_val, item_idx in view_nums {\n" ++
+        "        if item_val > 6 { break :find_gt item_val + (item_idx as i32); }\n" ++
+        "    } orelse 1;\n" ++
+        "    return .Ok(loop_acc + hit_val);\n",
+    "    let active_tok = CancelToken { _handle: 11 };\n" ++
+        "    let tok_bonus: i32 = with context.cancel_token = active_tok {\n" ++
+        "        context.cancel_token._handle as i32\n" ++
+        "    };\n" ++
+        "    return .Ok(scale_step(input_val) + tok_bonus);\n",
+    "    let cx_word_sz: i32 = cx.mem.word_bytes();\n    return .Ok(input_val + cx_word_sz);\n",
+    "    let direct_core_err: i32 = core.mem.word_bytes();\n    return .Ok(direct_core_err);\n",
     "    let bad_mismatch: bool = input_val;\n    let _keep = bad_mismatch;\n    return .Ok(0);\n",
 };
 
@@ -90,28 +191,33 @@ const PHASE4_BODY_VARIANTS = [_][]const u8{
 fn buildIncrementalTypecheckModule(
     allocator: std.mem.Allocator,
     has_banner_comment: bool,
+    import_choice: usize,
     body_choices: [3]usize,
 ) ![]u8 {
     var builder: std.ArrayList(u8) = .empty;
     errdefer builder.deinit(allocator);
 
     if (has_banner_comment) {
-        try builder.appendSlice(allocator, "//! Incremental Phase 4 fuzz banner\n\n");
+        try builder.appendSlice(allocator, "//! Incremental Phase 4 + DR-21 fuzz banner\n\n");
     }
+    try builder.appendSlice(allocator, PHASE4_IMPORT_VARIANTS[import_choice]);
     try builder.appendSlice(
         allocator,
-        "pub fn add_generic(lhs: Number, rhs: Number) -> Number {\n    return lhs + rhs;\n}\n\n",
+        "pub fn add_generic(lhs: Number, rhs: Number) -> Number = lhs + rhs;\n\n" ++
+            "pub fn scale_step(base: i32, factor: i32 = 2, bonus: i32 = base + 1) -> i32 = base * factor + bonus;\n\n",
     );
 
     var fn_i: usize = 0;
     while (fn_i < 3) : (fn_i += 1) {
         var hdr_buf: [128]u8 = undefined;
-        const hdr = try std.fmt.bufPrint(
-            &hdr_buf,
-            "pub fn worker_{d}(input_val: i32) -> Result[i32, i32] {{\n",
-            .{fn_i},
+        try builder.appendSlice(
+            allocator,
+            try std.fmt.bufPrint(
+                &hdr_buf,
+                "pub fn worker_{d}(input_val: i32) -> Result[i32, i32] {{\n",
+                .{fn_i},
+            ),
         );
-        try builder.appendSlice(allocator, hdr);
         try builder.appendSlice(allocator, PHASE4_BODY_VARIANTS[body_choices[fn_i]]);
         try builder.appendSlice(allocator, "}\n\n");
     }
@@ -124,7 +230,7 @@ test "test_fuzz_phase4_typechecker_fault_tolerance_and_poison_soundness" {
     var prng = std.Random.DefaultPrng.init(0xF004_C0DE_2026_0004);
     const random = prng.random();
 
-    var source_buf: [4096]u8 = undefined;
+    var source_buf: [8192]u8 = undefined;
     var iter_idx: usize = 0;
     while (iter_idx < TYPECHECK_FUZZ_ITERATIONS) : (iter_idx += 1) {
         var byte_len: usize = 0;
@@ -145,20 +251,23 @@ test "test_fuzz_phase4_typechecker_fault_tolerance_and_poison_soundness" {
         // Apply random single-byte perturbation on 25% of iterations:
         if (iter_idx % 4 == 0 and byte_len > 0) {
             const mut_pos = random.uintLessThan(usize, byte_len);
-            source_buf[mut_pos] = switch (random.uintLessThan(u8, 6)) {
+            source_buf[mut_pos] = switch (random.uintLessThan(u8, 8)) {
                 0 => ';',
                 1 => ' ',
                 2 => '?',
                 3 => '~',
                 4 => '_',
+                5 => '$',
+                6 => ':',
                 else => source_buf[mut_pos],
             };
         }
 
-        const source_slice = source_buf[0..byte_len];
-        const file_id = FileId.fromInt(@intCast((iter_idx & 0xFF) + 1));
-
-        var res = try type_system.typecheckSource(std.testing.allocator, file_id, source_slice);
+        var res = try type_system.typecheckSource(
+            std.testing.allocator,
+            FileId.fromInt(@intCast((iter_idx & 0xFF) + 1)),
+            source_buf[0..byte_len],
+        );
         defer res.deinit();
 
         try std.testing.expect(res.type_pool.countTypes() >= 64);
@@ -172,20 +281,25 @@ test "test_fuzz_phase4_incremental_typecheck_parity" {
     var inc_db = try CompilerDb.init(std.testing.allocator);
     defer inc_db.deinit();
 
+    const core_fid = FileId.fromInt(2);
+    _ = try inc_db.setInput(core_fid, CORE_STUB_SOURCE, .high);
+    try inc_db.registerRootModule("core", core_fid);
+    try inc_db.registerRootModule("cx", core_fid);
+
     const file_id = FileId.fromInt(1);
-    var body_choices = [3]usize{ 0, 1, 2 };
-    var has_banner = false;
-    var dur: Durability = .low;
+    var import_choice: usize = 0;
+    var body_choices = [3]usize{ 0, 2, 3 };
+    var has_banner_comment = false;
+    var durability: Durability = .low;
 
     var step_idx: usize = 0;
     while (step_idx < INCREMENTAL_TYPECHECK_ITERATIONS) : (step_idx += 1) {
-        switch (random.uintLessThan(u8, 4)) {
-            0 => has_banner = !has_banner,
-            1 => {
-                const slot = random.uintLessThan(usize, 3);
-                body_choices[slot] = random.uintLessThan(usize, PHASE4_BODY_VARIANTS.len);
-            },
-            2 => dur = switch (random.uintLessThan(u8, 3)) {
+        switch (random.uintLessThan(u8, 5)) {
+            0 => has_banner_comment = !has_banner_comment,
+            1 => body_choices[random.uintLessThan(usize, 3)] =
+                random.uintLessThan(usize, PHASE4_BODY_VARIANTS.len),
+            2 => import_choice = random.uintLessThan(usize, PHASE4_IMPORT_VARIANTS.len),
+            3 => durability = switch (random.uintLessThan(u8, 3)) {
                 0 => .low,
                 1 => .medium,
                 else => .high,
@@ -195,32 +309,45 @@ test "test_fuzz_phase4_incremental_typecheck_parity" {
 
         const src = try buildIncrementalTypecheckModule(
             std.testing.allocator,
-            has_banner,
+            has_banner_comment,
+            import_choice,
             body_choices,
         );
         defer std.testing.allocator.free(src);
 
-        _ = try inc_db.setInput(file_id, src, dur);
+        _ = try inc_db.setInput(file_id, src, durability);
 
         var scratch_db = try CompilerDb.init(std.testing.allocator);
         defer scratch_db.deinit();
-        _ = try scratch_db.setInput(file_id, src, dur);
+        _ = try scratch_db.setInput(core_fid, CORE_STUB_SOURCE, .high);
+        try scratch_db.registerRootModule("core", core_fid);
+        try scratch_db.registerRootModule("cx", core_fid);
+        _ = try scratch_db.setInput(file_id, src, durability);
 
+        // [1] Module-level signature & import (`use cx.*` vs `use core.*`) parity:
         const inc_mod_scope = try inc_db.resolveSignatures(file_id);
         const scr_mod_scope = try scratch_db.resolveSignatures(file_id);
+        try std.testing.expectEqual(inc_mod_scope.error_count, scr_mod_scope.error_count);
         try std.testing.expect(
             Fingerprint128.eql(inc_mod_scope.signatures_fingerprint, scr_mod_scope.signatures_fingerprint),
         );
 
-        var item_ord: u12 = 0;
-        while (item_ord < 4) : (item_ord += 1) {
-            const def_id = DefId.init(file_id, item_ord);
-            const inc_sig = try inc_db.getDefSignature(def_id);
-            const scr_sig = try scratch_db.getDefSignature(def_id);
-            try std.testing.expect(Fingerprint128.eql(inc_sig.signature_fingerprint, scr_sig.signature_fingerprint));
+        // [2] Per-definition `getDefSignature` and `typecheckBody` parity across all `ItemTree` entries:
+        const inc_tree = try inc_db.extractItemTree(file_id);
+        try std.testing.expectEqual(
+            inc_tree.entries.len,
+            (try scratch_db.extractItemTree(file_id)).entries.len,
+        );
+        for (inc_tree.entries) |entry| {
+            try std.testing.expect(
+                Fingerprint128.eql(
+                    (try inc_db.getDefSignature(entry.def_id)).signature_fingerprint,
+                    (try scratch_db.getDefSignature(entry.def_id)).signature_fingerprint,
+                ),
+            );
 
-            const inc_body = try inc_db.typecheckBody(def_id);
-            const scr_body = try scratch_db.typecheckBody(def_id);
+            const inc_body = try inc_db.typecheckBody(entry.def_id);
+            const scr_body = try scratch_db.typecheckBody(entry.def_id);
             try std.testing.expectEqual(inc_body.error_count, scr_body.error_count);
             try std.testing.expect(Fingerprint128.eql(inc_body.typed_fingerprint, scr_body.typed_fingerprint));
         }

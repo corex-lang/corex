@@ -3,7 +3,7 @@
 //! Implements Phase 5 (`PLAN.md` §2.1, `DR-02`, `DR-05`, and `DR-13` Deliverable 2) Structure-of-Arrays
 //! `HirNode` / `HirStore` lowering from typed `AST` + `BodySemanticSideTables`:
 //! - Zero-padding 18-byte SoA `HirNode` layout (`20` bytes AoS) with bounded `MAX_HIR_NODES` and depth caps,
-//! - Canonical desugaring of `|>`, postfix `?`, `catch`, `let … else`, `if let`, `while let`, and `is` patterns,
+//! - Canonical desugaring of `|>`, postfix `?`, `catch`, `let … else`, and `is` patterns,
 //! - Continue-safe and `u8`-overflow-safe `for` / `while` loop canonicalization, `#soa` projections, and `bit_field` RMW,
 //! - Two-phase `@derive(Eq, Hash, Debug, Clone)` body synthesis, `comptime if`/`match`/`for` unrolling, and `renderHir`.
 
@@ -111,7 +111,7 @@ pub const HirTag = enum(u8) {
     /// Closure expression (`lhs = fn_meta_index, rhs = body_hir`).
     hir_closure = 24,
 
-    // Control Flow, Scopes & Recovery (`25..33`):
+    // Control Flow, Scopes & Recovery (`25..43`):
     /// Lexical statement block with optional tail expression (`lhs = extra{stmt_len, stmts…}, rhs = tail_hir_or_none`).
     hir_block = 25,
     /// Conditional branch (`lhs = cond_hir, rhs = extra{then_hir, else_hir_or_none}`).
@@ -130,8 +130,34 @@ pub const HirTag = enum(u8) {
     hir_defer = 32,
     /// `subscript` projection `yield` (`lhs = yielded_place_hir, rhs = 0`).
     hir_yield = 33,
+    /// Conjunctive `is` / `:=` conditional branch (`lhs = extra{clause_count, clauses…, then_hir, else_hir_or_none}, rhs = 0`).
+    hir_cond_if = 34,
+    /// Conjunctive `is` / `:=` conditional loop (`lhs = extra{clause_count, clauses…, body_hir, result_opt_local_or_none}, rhs = loop_id`).
+    hir_cond_while = 35,
+    /// Short-circuiting `Option[T]` fallback (`lhs = opt_hir, rhs = fallback_hir`).
+    hir_orelse = 36,
+    /// Diverging `unreachable` assertion (`lhs = 0, rhs = 0`).
+    hir_unreachable = 37,
+    /// Implicit `Context` slot read (`lhs = slot_ordinal, rhs = 0`).
+    hir_ctx_get = 38,
+    /// Implicit `Context` slot write (`lhs = slot_ordinal, rhs = val_hir`).
+    hir_ctx_set = 39,
+    /// Implicit `Context` allocator/temp region push (`lhs = slot_ordinal, rhs = val_hir`).
+    hir_ctx_region_push = 40,
+    /// Implicit `Context` allocator/temp region pop (`lhs = slot_ordinal, rhs = 0`).
+    hir_ctx_region_pop = 41,
+    /// Subslice range projection (`lhs = base_hir, rhs = extra{start_hir_or_none, end_hir_or_none, is_inclusive}`).
+    hir_slice_range = 42,
     /// Error-recovery poison node preserving downstream IR invariants (`lhs = 0, rhs = 0`).
-    hir_error_hole = 34,
+    hir_error_hole = 43,
+};
+
+/// Clause discriminant encoded inside `hir_cond_if` and `hir_cond_while` `extra_data` streams (`DR-21` `SE-01`/`SE-02`).
+pub const HirCondClauseKind = enum(u32) {
+    /// Boolean predicate clause (`extra_data`: `[0, bool_expr_hir]`).
+    bool_pred = 0,
+    /// Pattern `is` match clause (`extra_data`: `[1, scrutinee_hir, pat_idx]`).
+    is_match = 1,
 };
 
 /// Value category attached to every `HirNode` (`DR-13` §2.1).
@@ -158,8 +184,10 @@ pub const HirFlags = packed struct(u8) {
     is_unsafe: bool = false,
     /// `true` if tainted by an upstream syntax or type error.
     has_error: bool = false,
-    /// Reserved zero padding bits.
-    _reserved: u2 = 0,
+    /// `true` on `hir_binary_op(.sub)` when the left operand is `$` (`$ - k` traps on underflow even in release, `SE-04`).
+    is_dollar_sub: bool = false,
+    /// Reserved zero padding bit.
+    _reserved: u1 = 0,
 };
 
 /// Zero-padding 18-byte Structure-of-Arrays `HIR` node (`20` bytes AoS, `[MAJOR-05]`).
@@ -332,13 +360,13 @@ pub const HirConstructKind = enum(u8) {
     array_repeat = 3,
     /// Nominal `enum` variant (`lhs >> 8 = tag_ordinal`, `extra = {payload_len, payload_hirs…}`).
     enum_variant = 4,
-    /// `Option[T]::None` (`tag = 0`, no payload).
+    /// `Option[T].None` (`tag = 0`, no payload).
     optional_none = 5,
-    /// `Option[T]::Some(val)` (`tag = 1`, `extra = {1, val_hir}`).
+    /// `Option[T].Some(val)` (`tag = 1`, `extra = {1, val_hir}`).
     optional_some = 6,
-    /// `Result[T, E]::Ok(val)` (`tag = 0`, `extra = {1, val_hir}`).
+    /// `Result[T, E].Ok(val)` (`tag = 0`, `extra = {1, val_hir}`).
     result_ok = 7,
-    /// `Result[T, E]::Err(err)` (`tag = 1`, `extra = {1, err_hir}`).
+    /// `Result[T, E].Err(err)` (`tag = 1`, `extra = {1, err_hir}`).
     result_err = 8,
     /// Zero-initialized backing integer for `bit_field` default construction.
     bitfield_zero = 9,
@@ -366,6 +394,8 @@ pub const HirLocalDecl = struct {
     is_temp: bool = false,
     /// `true` if bound inside a `comptime` context.
     is_comptime: bool = false,
+    /// `true` if bound by `:=` inside a `ConditionScope` (`hir_cond_if` / `hir_cond_while`) for pre-`else` drop (`SE-01`).
+    is_cond_binding: bool = false,
     /// Originating `SymbolIndex` in `SymbolTable` (`.none` for synthetic temporaries).
     symbol_index: SymbolIndex = .none,
 };
@@ -551,6 +581,34 @@ pub const HirPat = struct {
             lhs_pat: u32,
             /// Right alternative `HirPat` index.
             rhs_pat: u32,
+        },
+        /// Whole-value binding with nested sub-pattern (`x @ sub_pat`, `mut x @ sub_pat`, `ref x @ sub_pat`).
+        at_pat: struct {
+            /// Target `LocalId` in `HirStore.locals`.
+            local_id: u32,
+            /// `true` if mutable binding.
+            is_mut: bool,
+            /// `true` if borrowed by reference (`ref` / `&`).
+            is_ref: bool,
+            /// Nested `HirPat` index matched against the same scrutinee.
+            sub_pat: u32,
+        },
+        /// Fixed-array or slice destructuring (`[p0, ..rest, s0]`; `extra_data[prefix_start..]` stores prefix then suffix `HirPat` indices).
+        slice_pat: struct {
+            /// Start offset in `HirStore.extra_data` of `prefix_len + suffix_len` child `HirPat` indices.
+            prefix_start: u32,
+            /// Number of leading element patterns before `..`.
+            prefix_len: u16,
+            /// Number of trailing element patterns after `..`.
+            suffix_len: u16,
+            /// `true` if a `..` rest wildcard or capture is present.
+            has_rest: bool,
+            /// Captured subslice `LocalId` in `HirStore.locals`, or `NONE_U32` when unnamed (`..`).
+            rest_local_id: u32,
+            /// `true` if the captured rest binding is mutable (`mut rest`).
+            is_rest_mut: bool,
+            /// `true` if the captured rest binding is a reference (`ref rest`).
+            is_rest_ref: bool,
         },
     };
 };
@@ -838,7 +896,7 @@ pub const FIELD_ORDINAL_LEN: u32 = 0xFFFF_FFFE;
 pub const HIR_INTERNAL_INTRINSIC_FLAG: u32 = 1 << 16;
 
 /// Sentinel value indicating no `HirIndex` or optional child (`0xFFFF_FFFF`).
-const NONE_U32: u32 = std.math.maxInt(u32);
+pub const NONE_U32: u32 = std.math.maxInt(u32);
 
 /// FNV-1a 64-bit offset basis used by synthesized `@derive(Hash)` implementations.
 const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -903,6 +961,22 @@ const ShadowZipRestore = struct {
     name_id: u32,
     /// Previous `VirtualZipBinding` (`null` if none).
     prev_zip: ?VirtualZipBinding,
+};
+
+/// Active loop frame on `HirLowerer.loop_stack` for `:label` jumps and `Option[T]` value-breaking `for`/`while` (`SE-05`/`SE-06`).
+const ActiveLoopEntry = struct {
+    /// Canonical `hir_loop` / `hir_cond_while` identifier.
+    loop_id: u32,
+    /// Optional `:label` symbol (`SymbolId.empty` when unlabeled).
+    label_id: SymbolId = .empty,
+    /// `true` when this frame corresponds to an unrolled `comptime for` loop (`CRIT-10`).
+    is_comptime_for: bool = false,
+    /// Synthetic `Option[T]` local (`__loop_res`) for value-breaking `for`/`while`, or `NONE_U32` otherwise.
+    result_opt_local: u32 = NONE_U32,
+    /// Expected `break val` payload `TypeId` (`.unit_ty` when unit-breaking).
+    payload_ty: TypeId = .unit_ty,
+    /// Concrete `Option[T]` `TypeId` when `result_opt_local != NONE_U32` (`.unit_ty` otherwise).
+    opt_ty: TypeId = .unit_ty,
 };
 
 /// Stateful `AST -> HIR` desugaring, `@derive` synthesis, and `comptime` unrolling engine.
@@ -991,6 +1065,16 @@ const HirLowerer = struct {
     interp_override_token: TokenIndex = .none,
     /// Override outer span used while lowering sub-parsed `{expr}` string interpolation HIR nodes (`MAJ-08`).
     interp_override_span: ?Span = null,
+    /// Stack of active loops in the current function for `:label` and `Option[T]` `break` resolution (`SE-05`/`SE-06`).
+    loop_stack: std.ArrayListUnmanaged(ActiveLoopEntry) = .empty,
+    /// Floor index in `loop_stack` isolating inner closures from outer function loops.
+    closure_loop_stack_floor: usize = 0,
+    /// Stack of active indexing receiver length locals (`usize`) bound to `$` (`SE-04`).
+    dollar_len_stack: std.ArrayListUnmanaged(u32) = .empty,
+    /// `true` while lowering a `ConditionScope` (`hir_cond_if` / `hir_cond_while`) outside nested `{ … }` blocks (`SE-01`).
+    is_in_cond_scope: bool = false,
+    /// `true` while lowering the direct target place of an assignment, `&mut`, or `inout` / `set` receiver (`SE-04`).
+    is_mut_lvalue_ctx: bool = false,
 
     /// Initializes a `HirLowerer` with precomputed $O(1)$ AST/CST auxiliary index maps.
     fn init(
@@ -1042,6 +1126,8 @@ const HirLowerer = struct {
         self.comptime_shadow_log.deinit(self.allocator);
         self.active_zip_bindings.deinit(self.allocator);
         self.zip_shadow_log.deinit(self.allocator);
+        self.loop_stack.deinit(self.allocator);
+        self.dollar_len_stack.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -1726,6 +1812,10 @@ const HirLowerer = struct {
         self.current_scope = if (!fn_sym.target_scope.isNone()) fn_sym.target_scope else fn_sym.scope_id;
         self.current_fn_ret_ty = sig_view.ret_ty;
         self.current_loop_id = null;
+        self.loop_stack.clearRetainingCapacity();
+        self.closure_loop_stack_floor = 0;
+        self.dollar_len_stack.clearRetainingCapacity();
+        self.is_in_cond_scope = false;
         self.closure_outer_local_ceil = 0;
         if (!fn_sym.def_id.isNone()) {
             self.active_owner_def_id = fn_sym.def_id;
@@ -1810,11 +1900,43 @@ const HirLowerer = struct {
             .is_derived = false,
         });
 
-        // [3] Lower function body block if present:
+        // [3] Lower function body block or single-expression `= Expr;` body if present:
         var body_hir: HirIndex = .none;
         if (fn_ast.rhs.tag == .node) {
             const body_ast_id = NodeIndex.fromInt(fn_ast.rhs.payload);
-            body_hir = try self.lowerBlockExpr(body_ast_id, sig_view.ret_ty, !is_subscript);
+            if (!body_ast_id.isNone() and body_ast_id.asInt() < self.ast_arena.countNodes() and
+                self.ast_arena.getNode(body_ast_id).tag == .block)
+            {
+                body_hir = try self.lowerBlockExpr(body_ast_id, sig_view.ret_ty, !is_subscript);
+            } else {
+                const expr_hir = try self.lowerExpr(body_ast_id, sig_view.ret_ty);
+                var body_stmts: [1]u32 = undefined;
+                if (is_subscript) {
+                    const yield_node = try self.emitNode(.{
+                        .tag = .hir_yield,
+                        .flags = .{ .category = .rvalue, .is_synthetic = true },
+                        .type_id = self.store.getNode(expr_hir).type_id,
+                        .origin_token = fn_ast.main_token,
+                        .data = .{ .lhs = expr_hir.asInt(), .rhs = 0 },
+                    }, body_ast_id);
+                    body_stmts[0] = yield_node.asInt();
+                    body_hir = try self.emitSyntheticBlock(&body_stmts, .none, .unit_ty, fn_ast.main_token);
+                } else if (!expr_hir.isNone() and self.store.getNode(expr_hir).type_id == .never_ty) {
+                    body_stmts[0] = expr_hir.asInt();
+                    body_hir = try self.emitSyntheticBlock(&body_stmts, .none, .never_ty, fn_ast.main_token);
+                } else {
+                    const err_kind = self.classifyReturnExpr(expr_hir, sig_view.ret_ty);
+                    const ret_node = try self.emitNode(.{
+                        .tag = .hir_return,
+                        .flags = .{ .category = .diverging, .is_synthetic = true },
+                        .type_id = .never_ty,
+                        .origin_token = fn_ast.main_token,
+                        .data = .{ .lhs = expr_hir.asInt(), .rhs = @backingInt(err_kind) },
+                    }, body_ast_id);
+                    body_stmts[0] = ret_node.asInt();
+                    body_hir = try self.emitSyntheticBlock(&body_stmts, .none, .never_ty, fn_ast.main_token);
+                }
+            }
         }
 
         const total_locals: u32 = @intCast(self.store.locals.items.len - return_local_id);
@@ -1842,7 +1964,7 @@ const HirLowerer = struct {
         var cur = start_idx + 1;
         while (cur < end_idx) {
             const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
-            if (sub.kind == .fn_introducer or sub.kind == .block) break;
+            if (sub.kind == .fn_introducer or sub.kind == .block or sub.kind == .fn_expr_body) break;
             if (sub.kind == .attribute) {
                 const attr_end = @min(cur + @max(@as(usize, sub.subtree_size), 1), end_idx);
                 var leaf_cur = cur + 1;
@@ -3013,6 +3135,8 @@ const HirLowerer = struct {
         defer self.leaveDepth();
 
         const saved_unsafe = self.is_in_unsafe;
+        const was_in_cond_scope = self.is_in_cond_scope;
+        self.is_in_cond_scope = false;
         if (self.hasKeywordInCst(self.ast_arena.getCstOrigin(block_id), .kw_unsafe)) {
             self.is_in_unsafe = true;
         }
@@ -3023,6 +3147,7 @@ const HirLowerer = struct {
             self.popZipBindingsTo(zip_checkpoint);
             self.popComptimeBindingsTo(ct_checkpoint);
             self.popLexicalLocalsTo(local_checkpoint);
+            self.is_in_cond_scope = was_in_cond_scope;
             self.is_in_unsafe = saved_unsafe;
         }
 
@@ -3157,80 +3282,23 @@ const HirLowerer = struct {
                 if (!def_hir.isNone()) try out_stmts.append(self.allocator, def_hir.asInt());
             },
             .return_stmt => {
-                const val_hir = if (stmt_node.lhs.tag == .node)
-                    try self.lowerExpr(NodeIndex.fromInt(stmt_node.lhs.payload), self.current_fn_ret_ty)
-                else
-                    try self.emitUnitConst(stmt_node.main_token, .none);
-                const err_kind = self.classifyReturnExpr(val_hir, self.current_fn_ret_ty);
-                const ret_hir = try self.emitNode(.{
-                    .tag = .hir_return,
-                    .flags = .{ .category = .diverging, .is_unsafe = self.is_in_unsafe },
-                    .type_id = .never_ty,
-                    .origin_token = stmt_node.main_token,
-                    .data = .{ .lhs = val_hir.asInt(), .rhs = @backingInt(err_kind) },
-                }, stmt_id);
-                try out_stmts.append(self.allocator, ret_hir.asInt());
+                const ret_hir = try self.lowerReturnNode(stmt_id);
+                if (!ret_hir.isNone()) try out_stmts.append(self.allocator, ret_hir.asInt());
                 has_diverged.* = true;
             },
             .break_stmt => {
-                if (self.is_in_comptime_for) {
-                    if (self.comptime_runtime_cond_depth > 0) {
-                        try self.emitDiagnostic(
-                            .e0503_forbidden_comptime_operation,
-                            self.astSpan(stmt_id),
-                            "`break` targeting a `comptime for` loop cannot depend on a runtime condition",
-                            "use `comptime if` or a runtime `for` loop instead",
-                        );
-                    } else {
-                        self.comptime_loop_state = .broken;
-                    }
-                    has_diverged.* = true;
-                    return;
-                }
-                const val_hir = if (stmt_node.lhs.tag == .node)
-                    try self.lowerExpr(NodeIndex.fromInt(stmt_node.lhs.payload), .err_ty)
-                else
-                    HirIndex.none;
-                const loop_id = self.current_loop_id orelse 0;
-                const brk_hir = try self.emitNode(.{
-                    .tag = .hir_break,
-                    .flags = .{ .category = .diverging, .is_unsafe = self.is_in_unsafe },
-                    .type_id = .never_ty,
-                    .origin_token = stmt_node.main_token,
-                    .data = .{ .lhs = loop_id, .rhs = val_hir.asInt() },
-                }, stmt_id);
-                try out_stmts.append(self.allocator, brk_hir.asInt());
+                const brk_hir = try self.lowerBreakNode(stmt_id, true);
+                if (!brk_hir.isNone()) try out_stmts.append(self.allocator, brk_hir.asInt());
                 has_diverged.* = true;
             },
             .continue_stmt => {
-                if (self.is_in_comptime_for) {
-                    if (self.comptime_runtime_cond_depth > 0) {
-                        try self.emitDiagnostic(
-                            .e0503_forbidden_comptime_operation,
-                            self.astSpan(stmt_id),
-                            "`continue` targeting a `comptime for` loop cannot depend on a runtime condition",
-                            "use `comptime if` or a runtime `for` loop instead",
-                        );
-                    } else {
-                        self.comptime_loop_state = .continued;
-                    }
-                    has_diverged.* = true;
-                    return;
-                }
-                const loop_id = self.current_loop_id orelse 0;
-                const cont_hir = try self.emitNode(.{
-                    .tag = .hir_continue,
-                    .flags = .{ .category = .diverging, .is_unsafe = self.is_in_unsafe },
-                    .type_id = .never_ty,
-                    .origin_token = stmt_node.main_token,
-                    .data = .{ .lhs = loop_id, .rhs = 0 },
-                }, stmt_id);
-                try out_stmts.append(self.allocator, cont_hir.asInt());
+                const cont_hir = try self.lowerContinueNode(stmt_id, true);
+                if (!cont_hir.isNone()) try out_stmts.append(self.allocator, cont_hir.asInt());
                 has_diverged.* = true;
             },
-            .for_stmt => try self.lowerForStmt(stmt_id, out_stmts),
+            .for_stmt => try self.lowerForStmt(stmt_id, out_stmts, .unit_ty),
             .while_stmt => {
-                const while_hir = try self.lowerWhileStmt(stmt_id);
+                const while_hir = try self.lowerWhileStmt(stmt_id, .unit_ty);
                 if (!while_hir.isNone()) try out_stmts.append(self.allocator, while_hir.asInt());
             },
             .assign_stmt => {
@@ -3585,34 +3653,304 @@ const HirLowerer = struct {
         }, stmt_id);
     }
 
-    /// Dispatches `comptime for` unrolling (`MAX_UNROLL = 4096`) vs. runtime `for` canonicalization.
+    /// Interns an optional loop label token (`label:` or `:label`), stripping any leading/trailing `:`.
+    fn internLabelToken(self: *HirLowerer, label_tok: TokenIndex) !SymbolId {
+        if (label_tok.isNone() or label_tok.asInt() >= self.tokens.countTokens()) return .empty;
+        var lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, label_tok);
+        if (lexeme.len > 0 and lexeme[0] == ':') lexeme = lexeme[1..];
+        if (lexeme.len > 0 and lexeme[lexeme.len - 1] == ':') lexeme = lexeme[0 .. lexeme.len - 1];
+        if (lexeme.len == 0) return .empty;
+        return self.interner.intern(lexeme);
+    }
+
+    /// Resolves the innermost matching `ActiveLoopEntry` in the current function/closure for `label_tok`.
+    fn findTargetLoop(self: *const HirLowerer, label_tok: TokenIndex) ?ActiveLoopEntry {
+        const floor = @min(self.closure_loop_stack_floor, self.loop_stack.items.len);
+        const visible = self.loop_stack.items[floor..];
+        if (visible.len == 0) return null;
+        if (label_tok.isNone() or label_tok.asInt() >= self.tokens.countTokens()) {
+            return visible[visible.len - 1];
+        }
+        var lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, label_tok);
+        if (lexeme.len > 0 and lexeme[0] == ':') lexeme = lexeme[1..];
+        if (lexeme.len > 0 and lexeme[lexeme.len - 1] == ':') lexeme = lexeme[0 .. lexeme.len - 1];
+        const target_id = self.interner.lookup(lexeme) orelse return null;
+        var rev_idx = visible.len;
+        while (rev_idx > 0) {
+            rev_idx -= 1;
+            if (visible[rev_idx].label_id == target_id) return visible[rev_idx];
+        }
+        return null;
+    }
+
+    /// Constructs a synthetic `.None` value for `opt_ty` (`Option[T]` or distinct wrapper around `Option[T]`).
+    fn emitOptionalNoneConstruct(self: *HirLowerer, opt_ty: TypeId, tok: TokenIndex) !HirIndex {
+        const concrete_opt = self.concreteType(opt_ty);
+        const unwrapped_opt = self.pool.unwrapUnderlyingType(concrete_opt);
+        const extra_idx = try self.store.appendLenPrefixedExtra(&.{});
+        var none_hir = try self.emitNode(.{
+            .tag = .hir_construct,
+            .flags = .{ .category = .rvalue, .is_synthetic = true },
+            .type_id = unwrapped_opt,
+            .origin_token = tok,
+            .data = .{ .lhs = @backingInt(HirConstructKind.optional_none), .rhs = extra_idx },
+        }, .none);
+        if (unwrapped_opt != concrete_opt) {
+            none_hir = try self.emitNode(.{
+                .tag = .hir_cast,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = concrete_opt,
+                .origin_token = tok,
+                .data = .{ .lhs = none_hir.asInt(), .rhs = @backingInt(HirCastKind.distinct_wrap) },
+            }, .none);
+        }
+        return none_hir;
+    }
+
+    /// Lowers `return [expr]` (in statement or expression position) into `hir_return` (`never`).
+    fn lowerReturnNode(self: *HirLowerer, node_id: NodeIndex) anyerror!HirIndex {
+        const stmt_node = self.ast_arena.getNode(node_id);
+        const val_hir = if (stmt_node.lhs.tag == .node)
+            try self.lowerExpr(NodeIndex.fromInt(stmt_node.lhs.payload), self.current_fn_ret_ty)
+        else
+            try self.emitUnitConst(stmt_node.main_token, .none);
+        const err_kind = self.classifyReturnExpr(val_hir, self.current_fn_ret_ty);
+        return self.emitNode(.{
+            .tag = .hir_return,
+            .flags = .{ .category = .diverging, .is_unsafe = self.is_in_unsafe },
+            .type_id = .never_ty,
+            .origin_token = stmt_node.main_token,
+            .data = .{ .lhs = val_hir.asInt(), .rhs = @backingInt(err_kind) },
+        }, node_id);
+    }
+
+    /// Lowers `break [:label] [val]` (in statement or expression position) into `hir_break` (wrapping `Some(val)` on `for`/`while`).
+    fn lowerBreakNode(self: *HirLowerer, node_id: NodeIndex, is_stmt_pos: bool) anyerror!HirIndex {
+        const stmt_node = self.ast_arena.getNode(node_id);
+        const tok = stmt_node.main_token;
+        const label_tok = if (stmt_node.rhs.tag == .token) TokenIndex.fromInt(stmt_node.rhs.payload) else .none;
+        const target_entry = self.findTargetLoop(label_tok);
+
+        const is_ct_target = if (target_entry) |entry| entry.is_comptime_for else self.is_in_comptime_for;
+        if (is_ct_target) {
+            if (self.comptime_runtime_cond_depth > 0) {
+                try self.emitDiagnostic(
+                    .e0503_forbidden_comptime_operation,
+                    self.astSpan(node_id),
+                    "`break` targeting a `comptime for` loop cannot depend on a runtime condition",
+                    "use `comptime if` or a runtime `for` loop instead",
+                );
+            } else {
+                self.comptime_loop_state = .broken;
+            }
+            return if (is_stmt_pos) .none else self.emitErrorHole(tok, node_id, .never_ty);
+        }
+
+        const target_loop_id = if (target_entry) |entry| entry.loop_id else (self.current_loop_id orelse 0);
+        if (stmt_node.lhs.tag == .node) {
+            const val_ast_id = NodeIndex.fromInt(stmt_node.lhs.payload);
+            const expected_val_ty = if (target_entry) |entry| entry.payload_ty else .err_ty;
+            const val_hir = try self.lowerExpr(val_ast_id, expected_val_ty);
+            if (target_entry != null and target_entry.?.result_opt_local != NONE_U32) {
+                const opt_ty = self.concreteType(target_entry.?.opt_ty);
+                const unwrapped_opt = self.pool.unwrapUnderlyingType(opt_ty);
+                const payload_ty = TypeId.fromInt(self.pool.getNode(unwrapped_opt).lhs);
+                const coerced_val = try self.applyImplicitCoercionIfNeeded(val_hir, payload_ty, tok);
+                const some_extra = try self.store.appendLenPrefixedExtra(&[1]u32{coerced_val.asInt()});
+                var some_hir = try self.emitNode(.{
+                    .tag = .hir_construct,
+                    .flags = .{ .category = .rvalue, .is_synthetic = true },
+                    .type_id = unwrapped_opt,
+                    .origin_token = tok,
+                    .data = .{
+                        .lhs = @as(u32, @backingInt(HirConstructKind.optional_some)) | (1 << 8),
+                        .rhs = some_extra,
+                    },
+                }, .none);
+                if (unwrapped_opt != opt_ty) {
+                    some_hir = try self.emitNode(.{
+                        .tag = .hir_cast,
+                        .flags = .{ .category = .rvalue, .is_synthetic = true },
+                        .type_id = opt_ty,
+                        .origin_token = tok,
+                        .data = .{ .lhs = some_hir.asInt(), .rhs = @backingInt(HirCastKind.distinct_wrap) },
+                    }, .none);
+                }
+                const assign_res = try self.emitSyntheticAssign(
+                    try self.emitVarRef(target_entry.?.result_opt_local, tok, .none),
+                    some_hir,
+                    tok,
+                );
+                const brk_hir = try self.emitNode(.{
+                    .tag = .hir_break,
+                    .flags = .{ .category = .diverging, .is_unsafe = self.is_in_unsafe },
+                    .type_id = .never_ty,
+                    .origin_token = tok,
+                    .data = .{ .lhs = target_loop_id, .rhs = NONE_U32 },
+                }, node_id);
+                return self.emitSyntheticBlock(
+                    &[2]u32{ assign_res.asInt(), brk_hir.asInt() },
+                    .none,
+                    .never_ty,
+                    tok,
+                );
+            }
+            return self.emitNode(.{
+                .tag = .hir_break,
+                .flags = .{ .category = .diverging, .is_unsafe = self.is_in_unsafe },
+                .type_id = .never_ty,
+                .origin_token = tok,
+                .data = .{ .lhs = target_loop_id, .rhs = val_hir.asInt() },
+            }, node_id);
+        }
+
+        return self.emitNode(.{
+            .tag = .hir_break,
+            .flags = .{ .category = .diverging, .is_unsafe = self.is_in_unsafe },
+            .type_id = .never_ty,
+            .origin_token = tok,
+            .data = .{ .lhs = target_loop_id, .rhs = NONE_U32 },
+        }, node_id);
+    }
+
+    /// Lowers `continue [:label]` (in statement or expression position) into `hir_continue` (`never`).
+    fn lowerContinueNode(self: *HirLowerer, node_id: NodeIndex, is_stmt_pos: bool) anyerror!HirIndex {
+        const stmt_node = self.ast_arena.getNode(node_id);
+        const tok = stmt_node.main_token;
+        const label_tok = if (stmt_node.lhs.tag == .token) TokenIndex.fromInt(stmt_node.lhs.payload) else .none;
+        const target_entry = self.findTargetLoop(label_tok);
+
+        const is_ct_target = if (target_entry) |entry| entry.is_comptime_for else self.is_in_comptime_for;
+        if (is_ct_target) {
+            if (self.comptime_runtime_cond_depth > 0) {
+                try self.emitDiagnostic(
+                    .e0503_forbidden_comptime_operation,
+                    self.astSpan(node_id),
+                    "`continue` targeting a `comptime for` loop cannot depend on a runtime condition",
+                    "use `comptime if` or a runtime `for` loop instead",
+                );
+            } else {
+                self.comptime_loop_state = .continued;
+            }
+            return if (is_stmt_pos) .none else self.emitErrorHole(tok, node_id, .never_ty);
+        }
+
+        const target_loop_id = if (target_entry) |entry| entry.loop_id else (self.current_loop_id orelse 0);
+        return self.emitNode(.{
+            .tag = .hir_continue,
+            .flags = .{ .category = .diverging, .is_unsafe = self.is_in_unsafe },
+            .type_id = .never_ty,
+            .origin_token = tok,
+            .data = .{ .lhs = target_loop_id, .rhs = 0 },
+        }, node_id);
+    }
+
+    /// Extracts `(start_id, end_id, is_inclusive)` when `iter_id` is a `.range_expr` or `..`/`..=` `.binary_expr`.
+    const RangeAstInfo = struct {
+        /// Optional range start expression (`NodeIndex.none` for `..end` / `..=end` / `..`).
+        start_id: NodeIndex,
+        /// Optional range end expression (`NodeIndex.none` for `start..` / `..`).
+        end_id: NodeIndex,
+        /// `true` when operator token is `..=`.
+        is_inclusive: bool,
+    };
+
+    /// Inspects `node_id` and returns `RangeAstInfo` if it represents a range expression.
+    fn extractRangeAstInfo(self: *const HirLowerer, node_id: NodeIndex) ?RangeAstInfo {
+        if (node_id.isNone() or node_id.asInt() >= self.ast_arena.countNodes()) return null;
+        const node = self.ast_arena.getNode(node_id);
+        if (node.tag == .range_expr) {
+            const is_incl = !node.main_token.isNone() and
+                node.main_token.asInt() < self.tokens.countTokens() and
+                self.tokens.getToken(node.main_token).kind == .dotdoteq;
+            return .{
+                .start_id = if (node.lhs.tag == .node) NodeIndex.fromInt(node.lhs.payload) else .none,
+                .end_id = if (node.rhs.tag == .node) NodeIndex.fromInt(node.rhs.payload) else .none,
+                .is_inclusive = is_incl,
+            };
+        }
+        if (node.tag == .binary_expr and !node.main_token.isNone() and
+            node.main_token.asInt() < self.tokens.countTokens())
+        {
+            const op_kind = self.tokens.getToken(node.main_token).kind;
+            if (op_kind == .dotdot or op_kind == .dotdoteq) {
+                return .{
+                    .start_id = if (node.lhs.tag == .node) NodeIndex.fromInt(node.lhs.payload) else .none,
+                    .end_id = if (node.rhs.tag == .node) NodeIndex.fromInt(node.rhs.payload) else .none,
+                    .is_inclusive = op_kind == .dotdoteq,
+                };
+            }
+        }
+        return null;
+    }
+
+    /// Binds the optional `, i` (`usize`) counter token of a `for` loop in the current iteration scope (`SE-05`).
+    fn bindForIndexLocal(
+        self: *HirLowerer,
+        index_tok: TokenIndex,
+        idx_val_hir: HirIndex,
+        out_stmts: *std.ArrayListUnmanaged(u32),
+    ) !void {
+        if (index_tok.isNone() or index_tok.asInt() >= self.tokens.countTokens()) return;
+        const idx_lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, index_tok);
+        if (idx_lex.len == 0 or std.mem.eql(u8, idx_lex, "_")) return;
+        const idx_name_id = try self.interner.intern(idx_lex);
+        const idx_slot = try self.store.appendLocal(.{
+            .name = idx_name_id,
+            .type_id = .usize_ty,
+            .decl_span = self.tokens.getTokenSpan(self.store.file_id, index_tok),
+            .mode = .let_mode,
+            .is_mut = false,
+            .is_param = false,
+            .is_temp = false,
+        });
+        try self.pushLexicalLocal(idx_name_id, idx_slot);
+        try out_stmts.append(self.allocator, (try self.emitLocalDeclNode(idx_slot, idx_val_hir, index_tok)).asInt());
+    }
+
+    /// Dispatches `comptime for` unrolling (`MAX_UNROLL = 4096`) vs. runtime `for` canonicalization (`SE-05`/`SE-06`).
     fn lowerForStmt(
         self: *HirLowerer,
         stmt_id: NodeIndex,
         out_stmts: *std.ArrayListUnmanaged(u32),
+        expected_ty: TypeId,
     ) anyerror!void {
         const stmt_node = self.ast_arena.getNode(stmt_id);
-        const pair = self.getAstExtraSlice(stmt_id, false);
-        const pat_id = if (pair.len >= 1) NodeIndex.fromInt(pair[0]) else .none;
-        const iter_id = if (pair.len >= 2) NodeIndex.fromInt(pair[1]) else .none;
+        const extra = self.getAstExtraSlice(stmt_id, false);
+        const pat_id = if (extra.len >= 1) NodeIndex.fromInt(extra[0]) else .none;
+        const iter_id = if (extra.len >= 2) NodeIndex.fromInt(extra[1]) else .none;
+        const index_tok = if (extra.len >= 3) TokenIndex.fromInt(extra[2]) else .none;
+        const label_tok = if (extra.len >= 4) TokenIndex.fromInt(extra[3]) else .none;
+        const ref_mode: u32 = if (extra.len >= 5) extra[4] else 0;
         const body_id = if (stmt_node.rhs.tag == .node) NodeIndex.fromInt(stmt_node.rhs.payload) else .none;
 
         const is_comptime_for = !stmt_node.main_token.isNone() and
             self.tokens.getToken(stmt_node.main_token).kind == .kw_comptime;
         if (is_comptime_for) {
-            try self.lowerComptimeForStmt(stmt_id, pat_id, iter_id, body_id, out_stmts);
+            try self.lowerComptimeForStmt(stmt_id, pat_id, iter_id, index_tok, label_tok, body_id, out_stmts);
             return;
         }
-        const loop_hir = try self.lowerRuntimeForStmt(stmt_id, pat_id, iter_id, body_id);
+        const loop_hir = try self.lowerRuntimeForStmt(
+            stmt_id,
+            pat_id,
+            iter_id,
+            index_tok,
+            label_tok,
+            ref_mode,
+            body_id,
+            expected_ty,
+        );
         if (!loop_hir.isNone()) try out_stmts.append(self.allocator, loop_hir.asInt());
     }
 
-    /// Statically unrolls `comptime for pat in iter_expr { body }` up to `MAX_UNROLL = 4096` (`E0501`).
+    /// Statically unrolls `comptime for pat[, idx] in iter_expr { body }` up to `MAX_UNROLL = 4096` (`E0501`).
     fn lowerComptimeForStmt(
         self: *HirLowerer,
         stmt_id: NodeIndex,
         pat_id: NodeIndex,
         iter_id: NodeIndex,
+        index_tok: TokenIndex,
+        label_tok: TokenIndex,
         body_id: NodeIndex,
         out_stmts: *std.ArrayListUnmanaged(u32),
     ) anyerror!void {
@@ -3630,6 +3968,14 @@ const HirLowerer = struct {
             return;
         }
 
+        const label_id = try self.internLabelToken(label_tok);
+        try self.loop_stack.append(self.allocator, .{
+            .loop_id = 0,
+            .label_id = label_id,
+            .is_comptime_for = true,
+        });
+        defer _ = self.loop_stack.pop();
+
         const saved_in_ct_for = self.is_in_comptime_for;
         const saved_rt_cond_depth = self.comptime_runtime_cond_depth;
         const saved_ct_state = self.comptime_loop_state;
@@ -3643,10 +3989,21 @@ const HirLowerer = struct {
         }
 
         const pat_name_id = self.extractBindPatNameId(pat_id);
-        for (elements.items) |elem_val| {
+        const idx_name_id: SymbolId = if (!index_tok.isNone() and index_tok.asInt() < self.tokens.countTokens()) blk: {
+            const idx_lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, index_tok);
+            if (idx_lex.len > 0 and !std.mem.eql(u8, idx_lex, "_")) {
+                break :blk try self.interner.intern(idx_lex);
+            }
+            break :blk .empty;
+        } else .empty;
+
+        for (elements.items, 0..) |elem_val, iter_i| {
             const ct_checkpoint = self.comptime_shadow_log.items.len;
             defer self.popComptimeBindingsTo(ct_checkpoint);
             try self.pushComptimeBinding(pat_name_id, elem_val);
+            if (idx_name_id != .empty) {
+                try self.pushComptimeBinding(idx_name_id, .{ .int_val = @intCast(iter_i) });
+            }
 
             const unrolled_blk = try self.lowerBlockExpr(body_id, .unit_ty, false);
             if (!unrolled_blk.isNone()) {
@@ -3663,7 +4020,7 @@ const HirLowerer = struct {
         }
     }
 
-    /// Collects compile-time elements for `comptime for` (`a..b`, `a..=b`, array/tuple literals, `.fields`, `.variants`).
+    /// Collects compile-time elements for `comptime for` (`a..b`, `a..=b`, `..b`, `..=b`, array/tuple literals, `.fields`, `.variants`).
     /// Returns `true` if the sequence exceeds `MAX_UNROLL` (`4,096`).
     fn collectComptimeForSequence(
         self: *HirLowerer,
@@ -3673,49 +4030,49 @@ const HirLowerer = struct {
         if (iter_id.isNone() or iter_id.asInt() >= self.ast_arena.countNodes()) return false;
         const iter_node = self.ast_arena.getNode(iter_id);
 
-        // [1] Compile-time integer range `start..end` or `start..=end`:
-        if (iter_node.tag == .binary_expr and !iter_node.main_token.isNone()) {
-            const op_kind = self.tokens.getToken(iter_node.main_token).kind;
-            if ((op_kind == .dotdot or op_kind == .dotdoteq) and
-                iter_node.lhs.tag == .node and iter_node.rhs.tag == .node)
-            {
-                const lhs_ast_id = NodeIndex.fromInt(iter_node.lhs.payload);
-                const rhs_ast_id = NodeIndex.fromInt(iter_node.rhs.payload);
-                const start_val = (try self.tryEvalAstComptime(lhs_ast_id, .i64_ty)) orelse return false;
-                const end_val = (try self.tryEvalAstComptime(rhs_ast_id, .i64_ty)) orelse return false;
-                if (start_val != .int_val or end_val != .int_val) return false;
-                const is_inclusive = op_kind == .dotdoteq;
-                const lhs_ty = self.pool.unwrapUnderlyingType(self.nodeType(lhs_ast_id));
-                const rhs_ty = self.pool.unwrapUnderlyingType(self.nodeType(rhs_ast_id));
-                const is_u128 = lhs_ty == .u128_ty or rhs_ty == .u128_ty;
+        // [1] Compile-time integer range `start..end`, `start..=end`, `..end`, or `..=end`:
+        if (self.extractRangeAstInfo(iter_id)) |range_info| {
+            if (range_info.end_id.isNone()) return true;
+            const start_val: ComptimeValue = if (!range_info.start_id.isNone())
+                (try self.tryEvalAstComptime(range_info.start_id, .i64_ty)) orelse return false
+            else
+                .{ .int_val = 0 };
+            const end_val = (try self.tryEvalAstComptime(range_info.end_id, .i64_ty)) orelse return false;
+            if (start_val != .int_val or end_val != .int_val) return false;
+            const is_inclusive = range_info.is_inclusive;
+            const lhs_ty = if (!range_info.start_id.isNone())
+                self.pool.unwrapUnderlyingType(self.nodeType(range_info.start_id))
+            else
+                .usize_ty;
+            const rhs_ty = self.pool.unwrapUnderlyingType(self.nodeType(range_info.end_id));
+            const is_u128 = lhs_ty == .u128_ty or rhs_ty == .u128_ty;
 
-                var diff: u128 = 0;
-                if (is_u128) {
-                    const start_u: u128 = @bitCast(start_val.int_val);
-                    const end_u: u128 = @bitCast(end_val.int_val);
-                    if ((!is_inclusive and start_u >= end_u) or (is_inclusive and start_u > end_u)) {
-                        return false;
-                    }
-                    diff = end_u - start_u;
-                } else {
-                    if ((!is_inclusive and start_val.int_val >= end_val.int_val) or
-                        (is_inclusive and start_val.int_val > end_val.int_val))
-                    {
-                        return false;
-                    }
-                    diff = @bitCast(end_val.int_val -% start_val.int_val);
+            var diff: u128 = 0;
+            if (is_u128) {
+                const start_u: u128 = @bitCast(start_val.int_val);
+                const end_u: u128 = @bitCast(end_val.int_val);
+                if ((!is_inclusive and start_u >= end_u) or (is_inclusive and start_u > end_u)) {
+                    return false;
                 }
-                if (diff > MAX_UNROLL or (is_inclusive and diff >= MAX_UNROLL)) return true;
-                const total_iters: usize = @intCast(if (is_inclusive) diff + 1 else diff);
-
-                var cur = start_val.int_val;
-                var count: usize = 0;
-                while (count < total_iters) : (count += 1) {
-                    try out_elems.append(self.allocator, .{ .int_val = cur });
-                    if (count + 1 < total_iters) cur = cur +% 1;
+                diff = end_u - start_u;
+            } else {
+                if ((!is_inclusive and start_val.int_val >= end_val.int_val) or
+                    (is_inclusive and start_val.int_val > end_val.int_val))
+                {
+                    return false;
                 }
-                return false;
+                diff = @bitCast(end_val.int_val -% start_val.int_val);
             }
+            if (diff > MAX_UNROLL or (is_inclusive and diff >= MAX_UNROLL)) return true;
+            const total_iters: usize = @intCast(if (is_inclusive) diff + 1 else diff);
+
+            var cur = start_val.int_val;
+            var count: usize = 0;
+            while (count < total_iters) : (count += 1) {
+                try out_elems.append(self.allocator, .{ .int_val = cur });
+                if (count + 1 < total_iters) cur = cur +% 1;
+            }
+            return false;
         }
 
         // [2] Reflection `@type_info[T]().fields` or `@type_info[T]().variants`:
@@ -3833,13 +4190,42 @@ const HirLowerer = struct {
         return false;
     }
 
-    /// Lowers runtime `for pat in iter_expr { body }` into canonical `continue`-safe & `u8`-overflow-safe `hir_loop`.
+    /// Wraps `elem_hir` (`elem_ty`) in `&` / `&mut` when `for ref` / `for ref mut` (`ref_mode != 0`) is active.
+    fn wrapForRefModeIfNeeded(
+        self: *HirLowerer,
+        pat_id: NodeIndex,
+        elem_hir: HirIndex,
+        elem_ty: TypeId,
+        ref_mode: u32,
+        tok: TokenIndex,
+    ) !struct { val_hir: HirIndex, val_ty: TypeId } {
+        const concrete_elem = self.concreteType(elem_ty);
+        if (ref_mode == 0) return .{ .val_hir = elem_hir, .val_ty = concrete_elem };
+        if (!pat_id.isNone() and pat_id.asInt() < self.ast_arena.countNodes() and
+            self.ast_arena.getNode(pat_id).tag == .bind_pat)
+        {
+            const pat_cst = self.ast_arena.getCstOrigin(pat_id);
+            if (self.hasKeywordInCst(pat_cst, .kw_ref) or self.hasKeywordInCst(pat_cst, .amp)) {
+                return .{ .val_hir = elem_hir, .val_ty = concrete_elem };
+            }
+        }
+        const is_mut_ref = ref_mode == 2;
+        const ref_ty = try self.pool.internRef(concrete_elem, is_mut_ref);
+        const addr_hir = try self.emitSyntheticAddrOf(elem_hir, ref_ty, is_mut_ref, tok);
+        return .{ .val_hir = addr_hir, .val_ty = ref_ty };
+    }
+
+    /// Lowers runtime `for [ref [mut]] pat[, idx] in iter_expr { body }` into canonical `hir_loop` (`SE-05`/`SE-06`).
     fn lowerRuntimeForStmt(
         self: *HirLowerer,
         stmt_id: NodeIndex,
         pat_id: NodeIndex,
         iter_id: NodeIndex,
+        index_tok: TokenIndex,
+        label_tok: TokenIndex,
+        ref_mode: u32,
         body_id: NodeIndex,
+        expected_ty: TypeId,
     ) anyerror!HirIndex {
         const stmt_node = self.ast_arena.getNode(stmt_id);
         const tok = stmt_node.main_token;
@@ -3848,9 +4234,42 @@ const HirLowerer = struct {
         }
         const iter_node = self.ast_arena.getNode(iter_id);
 
+        const recorded_loop_ty = self.nodeType(stmt_id);
+        const loop_ty = self.concreteType(if (!recorded_loop_ty.isError()) recorded_loop_ty else expected_ty);
+        const unwrapped_loop_ty = self.pool.unwrapUnderlyingType(loop_ty);
+        const is_opt_result = loop_ty != .unit_ty and self.pool.getTag(unwrapped_loop_ty) == .optional_ty;
+        const opt_payload_ty: TypeId = if (is_opt_result)
+            self.concreteType(TypeId.fromInt(self.pool.getNode(unwrapped_loop_ty).lhs))
+        else
+            .unit_ty;
+
+        var outer_stmts: std.ArrayListUnmanaged(u32) = .empty;
+        defer outer_stmts.deinit(self.allocator);
+
+        var res_opt_local: u32 = NONE_U32;
+        if (is_opt_result) {
+            res_opt_local = try self.allocTempLocal(loop_ty, tok, true);
+            const init_none = try self.emitOptionalNoneConstruct(loop_ty, tok);
+            try outer_stmts.append(
+                self.allocator,
+                (try self.emitLocalDeclNode(res_opt_local, init_none, tok)).asInt(),
+            );
+        }
+
         const loop_id = self.next_loop_id;
         self.next_loop_id += 1;
         try self.recordLoopContractFromAst(stmt_id, loop_id);
+        const label_id = try self.internLabelToken(label_tok);
+        try self.loop_stack.append(self.allocator, .{
+            .loop_id = loop_id,
+            .label_id = label_id,
+            .is_comptime_for = false,
+            .result_opt_local = res_opt_local,
+            .payload_ty = opt_payload_ty,
+            .opt_ty = if (is_opt_result) loop_ty else .unit_ty,
+        });
+        defer _ = self.loop_stack.pop();
+
         const saved_loop_id = self.current_loop_id;
         const saved_in_ct_for = self.is_in_comptime_for;
         self.current_loop_id = loop_id;
@@ -3864,163 +4283,225 @@ const HirLowerer = struct {
             self.current_loop_id = saved_loop_id;
         }
 
-        var outer_stmts: std.ArrayListUnmanaged(u32) = .empty;
-        defer outer_stmts.deinit(self.allocator);
+        // [1] Integer ranges `start..end`, `start..=end`, `..end`, `..=end`, and unbounded `start..`:
+        if (self.extractRangeAstInfo(iter_id)) |range_info| {
+            const elem_ty = self.concreteType(blk: {
+                const p_ty = self.unwrapRefType(self.nodeType(pat_id));
+                if (!p_ty.isError() and p_ty != .unit_ty) break :blk p_ty;
+                if (!range_info.start_id.isNone()) {
+                    const s_ty = self.nodeType(range_info.start_id);
+                    if (!s_ty.isError()) break :blk s_ty;
+                }
+                if (!range_info.end_id.isNone()) {
+                    const e_ty = self.nodeType(range_info.end_id);
+                    if (!e_ty.isError()) break :blk e_ty;
+                }
+                break :blk .usize_ty;
+            });
+            const start_hir = if (!range_info.start_id.isNone())
+                try self.lowerExpr(range_info.start_id, elem_ty)
+            else
+                try self.emitConstVal(.{ .int_val = 0 }, elem_ty, tok, .none, true);
 
-        // [1] Exclusive `start..end` and inclusive `start..=end` (`0u8..=255u8` overflow-safe, `DR-13` §2.2 Rule 5):
-        if (iter_node.tag == .binary_expr and !iter_node.main_token.isNone()) {
-            const op_kind = self.tokens.getToken(iter_node.main_token).kind;
-            if ((op_kind == .dotdot or op_kind == .dotdoteq) and
-                iter_node.lhs.tag == .node and iter_node.rhs.tag == .node)
-            {
-                const is_inclusive = op_kind == .dotdoteq;
-                const elem_ty = self.concreteType(blk: {
-                    const p_ty = self.unwrapRefType(self.nodeType(pat_id));
-                    if (!p_ty.isError()) break :blk p_ty;
-                    const i_ty = self.nodeType(iter_id);
-                    if (!i_ty.isError()) break :blk i_ty;
-                    break :blk .i32_ty;
-                });
-                const start_hir = try self.lowerExpr(NodeIndex.fromInt(iter_node.lhs.payload), elem_ty);
-                const end_hir = try self.lowerExpr(NodeIndex.fromInt(iter_node.rhs.payload), elem_ty);
+            const cur_local = try self.allocTempLocal(elem_ty, tok, true);
+            try outer_stmts.append(self.allocator, (try self.emitLocalDeclNode(cur_local, start_hir, tok)).asInt());
 
-                const cur_local = try self.allocTempLocal(elem_ty, tok, true);
+            var range_ord_local: u32 = NONE_U32;
+            if (!index_tok.isNone()) {
+                range_ord_local = try self.allocTempLocal(.usize_ty, tok, true);
+                const zero_ord = try self.emitConstVal(.{ .int_val = 0 }, .usize_ty, tok, .none, true);
+                try outer_stmts.append(
+                    self.allocator,
+                    (try self.emitLocalDeclNode(range_ord_local, zero_ord, tok)).asInt(),
+                );
+            }
+
+            var loop_stmts: std.ArrayListUnmanaged(u32) = .empty;
+            defer loop_stmts.deinit(self.allocator);
+
+            if (range_info.end_id.isNone()) {
+                // Unbounded range `start..` or `..`:
+                const iter_elem_local = try self.allocTempLocal(elem_ty, tok, ref_mode == 2);
+                try loop_stmts.append(
+                    self.allocator,
+                    (try self.emitLocalDeclNode(iter_elem_local, try self.emitVarRef(cur_local, tok, .none), tok)).asInt(),
+                );
+                const elem_val = try self.emitVarRef(iter_elem_local, tok, .none);
+                const wrapped_elem = try self.wrapForRefModeIfNeeded(pat_id, elem_val, elem_ty, ref_mode, tok);
+                try self.emitPatternBindStmts(pat_id, wrapped_elem.val_hir, wrapped_elem.val_ty, tok, &loop_stmts);
+
+                const one_const = try self.emitConstVal(.{ .int_val = 1 }, elem_ty, tok, .none, true);
+                const next_val = try self.emitSyntheticBinOp(
+                    .add,
+                    try self.emitVarRef(cur_local, tok, .none),
+                    one_const,
+                    elem_ty,
+                    tok,
+                );
+                try loop_stmts.append(
+                    self.allocator,
+                    (try self.emitSyntheticAssign(try self.emitVarRef(cur_local, tok, .none), next_val, tok)).asInt(),
+                );
+            } else if (!range_info.is_inclusive) {
+                const end_hir = try self.lowerExpr(range_info.end_id, elem_ty);
                 const end_local = try self.allocTempLocal(elem_ty, tok, false);
-                try outer_stmts.append(self.allocator, (try self.emitLocalDeclNode(cur_local, start_hir, tok)).asInt());
                 try outer_stmts.append(self.allocator, (try self.emitLocalDeclNode(end_local, end_hir, tok)).asInt());
 
-                var loop_stmts: std.ArrayListUnmanaged(u32) = .empty;
-                defer loop_stmts.deinit(self.allocator);
+                const lt_cond = try self.emitSyntheticBinOp(
+                    .lt,
+                    try self.emitVarRef(cur_local, tok, .none),
+                    try self.emitVarRef(end_local, tok, .none),
+                    .bool_ty,
+                    tok,
+                );
+                try loop_stmts.append(self.allocator, (try self.emitLoopBreakIfFalse(lt_cond, loop_id, tok)).asInt());
 
-                if (!is_inclusive) {
-                    // `if !(_cur < _end) { break; }`:
-                    const lt_cond = try self.emitSyntheticBinOp(
-                        .lt,
-                        try self.emitVarRef(cur_local, tok, .none),
-                        try self.emitVarRef(end_local, tok, .none),
-                        .bool_ty,
-                        tok,
-                    );
-                    const exit_guard = try self.emitLoopBreakIfFalse(lt_cond, loop_id, tok);
-                    try loop_stmts.append(self.allocator, exit_guard.asInt());
+                const iter_elem_local = try self.allocTempLocal(elem_ty, tok, ref_mode == 2);
+                try loop_stmts.append(
+                    self.allocator,
+                    (try self.emitLocalDeclNode(iter_elem_local, try self.emitVarRef(cur_local, tok, .none), tok)).asInt(),
+                );
+                const elem_val = try self.emitVarRef(iter_elem_local, tok, .none);
+                const wrapped_elem = try self.wrapForRefModeIfNeeded(pat_id, elem_val, elem_ty, ref_mode, tok);
+                try self.emitPatternBindStmts(pat_id, wrapped_elem.val_hir, wrapped_elem.val_ty, tok, &loop_stmts);
 
-                    // Capture immutable per-iteration `elem = _cur` BEFORE advancing `_cur = _cur +% 1` (`MAJ-04`):
-                    const iter_elem_local = try self.allocTempLocal(elem_ty, tok, false);
-                    const iter_elem_decl = try self.emitLocalDeclNode(
-                        iter_elem_local,
-                        try self.emitVarRef(cur_local, tok, .none),
-                        tok,
-                    );
-                    try loop_stmts.append(self.allocator, iter_elem_decl.asInt());
-                    const elem_val = try self.emitVarRef(iter_elem_local, tok, .none);
-                    try self.emitPatternBindStmts(pat_id, elem_val, elem_ty, tok, &loop_stmts);
+                const one_const = try self.emitConstVal(.{ .int_val = 1 }, elem_ty, tok, .none, true);
+                const next_val = try self.emitSyntheticBinOp(
+                    .wrap_add,
+                    try self.emitVarRef(cur_local, tok, .none),
+                    one_const,
+                    elem_ty,
+                    tok,
+                );
+                try loop_stmts.append(
+                    self.allocator,
+                    (try self.emitSyntheticAssign(try self.emitVarRef(cur_local, tok, .none), next_val, tok)).asInt(),
+                );
+            } else {
+                const end_hir = try self.lowerExpr(range_info.end_id, elem_ty);
+                const end_local = try self.allocTempLocal(elem_ty, tok, false);
+                try outer_stmts.append(self.allocator, (try self.emitLocalDeclNode(end_local, end_hir, tok)).asInt());
 
-                    const one_const = try self.emitConstVal(.{ .int_val = 1 }, elem_ty, tok, .none, true);
-                    const next_val = try self.emitSyntheticBinOp(
-                        .wrap_add,
-                        try self.emitVarRef(cur_local, tok, .none),
-                        one_const,
-                        elem_ty,
-                        tok,
-                    );
-                    const adv_assign = try self.emitSyntheticAssign(
-                        try self.emitVarRef(cur_local, tok, .none),
-                        next_val,
-                        tok,
-                    );
-                    try loop_stmts.append(self.allocator, adv_assign.asInt());
-                } else {
-                    // `var _is_done: bool = _cur > _end;` prevents `255u8 + 1` wraparound:
-                    const init_done = try self.emitSyntheticBinOp(
-                        .gt,
-                        try self.emitVarRef(cur_local, tok, .none),
-                        try self.emitVarRef(end_local, tok, .none),
-                        .bool_ty,
-                        tok,
-                    );
-                    const done_local = try self.allocTempLocal(.bool_ty, tok, true);
-                    try outer_stmts.append(
-                        self.allocator,
-                        (try self.emitLocalDeclNode(done_local, init_done, tok)).asInt(),
-                    );
+                const init_done = try self.emitSyntheticBinOp(
+                    .gt,
+                    try self.emitVarRef(cur_local, tok, .none),
+                    try self.emitVarRef(end_local, tok, .none),
+                    .bool_ty,
+                    tok,
+                );
+                const done_local = try self.allocTempLocal(.bool_ty, tok, true);
+                try outer_stmts.append(
+                    self.allocator,
+                    (try self.emitLocalDeclNode(done_local, init_done, tok)).asInt(),
+                );
 
-                    // `if _is_done { break; }`:
-                    const done_break = try self.emitLoopBreakIfTrue(
-                        try self.emitVarRef(done_local, tok, .none),
-                        loop_id,
-                        tok,
-                    );
-                    try loop_stmts.append(self.allocator, done_break.asInt());
+                const done_break = try self.emitLoopBreakIfTrue(
+                    try self.emitVarRef(done_local, tok, .none),
+                    loop_id,
+                    tok,
+                );
+                try loop_stmts.append(self.allocator, done_break.asInt());
 
-                    // Capture immutable per-iteration `elem = _cur` BEFORE `_is_done / _cur +% 1` step (`MAJ-04`):
-                    const iter_elem_local = try self.allocTempLocal(elem_ty, tok, false);
-                    const iter_elem_decl = try self.emitLocalDeclNode(
-                        iter_elem_local,
-                        try self.emitVarRef(cur_local, tok, .none),
-                        tok,
-                    );
-                    try loop_stmts.append(self.allocator, iter_elem_decl.asInt());
-                    const elem_val = try self.emitVarRef(iter_elem_local, tok, .none);
-                    try self.emitPatternBindStmts(pat_id, elem_val, elem_ty, tok, &loop_stmts);
+                const iter_elem_local = try self.allocTempLocal(elem_ty, tok, ref_mode == 2);
+                try loop_stmts.append(
+                    self.allocator,
+                    (try self.emitLocalDeclNode(iter_elem_local, try self.emitVarRef(cur_local, tok, .none), tok)).asInt(),
+                );
+                const elem_val = try self.emitVarRef(iter_elem_local, tok, .none);
+                const wrapped_elem = try self.wrapForRefModeIfNeeded(pat_id, elem_val, elem_ty, ref_mode, tok);
+                try self.emitPatternBindStmts(pat_id, wrapped_elem.val_hir, wrapped_elem.val_ty, tok, &loop_stmts);
 
-                    // `if _cur == _end { _is_done = true; } else { _cur = _cur +% 1; }`:
-                    const at_end_cond = try self.emitSyntheticBinOp(
-                        .eq,
-                        try self.emitVarRef(cur_local, tok, .none),
-                        try self.emitVarRef(end_local, tok, .none),
-                        .bool_ty,
-                        tok,
-                    );
-                    const set_done = try self.emitSyntheticAssign(
-                        try self.emitVarRef(done_local, tok, .none),
-                        try self.emitConstVal(.{ .bool_val = true }, .bool_ty, tok, .none, true),
-                        tok,
-                    );
-                    const then_blk = try self.wrapSingleStmtBlock(set_done, tok);
+                const at_end_cond = try self.emitSyntheticBinOp(
+                    .eq,
+                    try self.emitVarRef(cur_local, tok, .none),
+                    try self.emitVarRef(end_local, tok, .none),
+                    .bool_ty,
+                    tok,
+                );
+                const set_done = try self.emitSyntheticAssign(
+                    try self.emitVarRef(done_local, tok, .none),
+                    try self.emitConstVal(.{ .bool_val = true }, .bool_ty, tok, .none, true),
+                    tok,
+                );
+                const then_blk = try self.wrapSingleStmtBlock(set_done, tok);
 
-                    const one_const = try self.emitConstVal(.{ .int_val = 1 }, elem_ty, tok, .none, true);
-                    const next_val = try self.emitSyntheticBinOp(
-                        .wrap_add,
-                        try self.emitVarRef(cur_local, tok, .none),
-                        one_const,
-                        elem_ty,
-                        tok,
-                    );
-                    const inc_cur = try self.emitSyntheticAssign(
-                        try self.emitVarRef(cur_local, tok, .none),
-                        next_val,
-                        tok,
-                    );
-                    const else_blk = try self.wrapSingleStmtBlock(inc_cur, tok);
+                const one_const = try self.emitConstVal(.{ .int_val = 1 }, elem_ty, tok, .none, true);
+                const next_val = try self.emitSyntheticBinOp(
+                    .wrap_add,
+                    try self.emitVarRef(cur_local, tok, .none),
+                    one_const,
+                    elem_ty,
+                    tok,
+                );
+                const inc_cur = try self.emitSyntheticAssign(
+                    try self.emitVarRef(cur_local, tok, .none),
+                    next_val,
+                    tok,
+                );
+                const else_blk = try self.wrapSingleStmtBlock(inc_cur, tok);
 
-                    const step_if_extra = try self.store.appendExtraSlice(&[2]u32{
-                        then_blk.asInt(),
-                        else_blk.asInt(),
-                    });
-                    const step_if = try self.emitNode(.{
-                        .tag = .hir_if,
-                        .flags = .{ .category = .rvalue, .is_synthetic = true },
-                        .type_id = .unit_ty,
-                        .origin_token = tok,
-                        .data = .{ .lhs = at_end_cond.asInt(), .rhs = step_if_extra },
-                    }, .none);
-                    try loop_stmts.append(self.allocator, step_if.asInt());
-                }
-
-                const user_body = try self.lowerBlockExpr(body_id, .unit_ty, false);
-                try loop_stmts.append(self.allocator, user_body.asInt());
-
-                const loop_blk = try self.emitSyntheticBlock(loop_stmts.items, .none, .unit_ty, tok);
-                const loop_node = try self.emitNode(.{
-                    .tag = .hir_loop,
+                const step_if_extra = try self.store.appendExtraSlice(&[2]u32{
+                    then_blk.asInt(),
+                    else_blk.asInt(),
+                });
+                const step_if = try self.emitNode(.{
+                    .tag = .hir_if,
                     .flags = .{ .category = .rvalue, .is_synthetic = true },
                     .type_id = .unit_ty,
                     .origin_token = tok,
-                    .data = .{ .lhs = loop_blk.asInt(), .rhs = loop_id },
-                }, stmt_id);
-                try outer_stmts.append(self.allocator, loop_node.asInt());
-                return self.emitSyntheticBlock(outer_stmts.items, .none, .unit_ty, tok);
+                    .data = .{ .lhs = at_end_cond.asInt(), .rhs = step_if_extra },
+                }, .none);
+                try loop_stmts.append(self.allocator, step_if.asInt());
             }
+
+            if (range_ord_local != NONE_U32) {
+                const cur_ord_local = try self.allocTempLocal(.usize_ty, tok, false);
+                try loop_stmts.append(
+                    self.allocator,
+                    (try self.emitLocalDeclNode(
+                        cur_ord_local,
+                        try self.emitVarRef(range_ord_local, tok, .none),
+                        tok,
+                    )).asInt(),
+                );
+                const one_ord = try self.emitConstVal(.{ .int_val = 1 }, .usize_ty, tok, .none, true);
+                const next_ord = try self.emitSyntheticBinOp(
+                    .add,
+                    try self.emitVarRef(range_ord_local, tok, .none),
+                    one_ord,
+                    .usize_ty,
+                    tok,
+                );
+                try loop_stmts.append(
+                    self.allocator,
+                    (try self.emitSyntheticAssign(
+                        try self.emitVarRef(range_ord_local, tok, .none),
+                        next_ord,
+                        tok,
+                    )).asInt(),
+                );
+                try self.bindForIndexLocal(index_tok, try self.emitVarRef(cur_ord_local, tok, .none), &loop_stmts);
+            }
+
+            const user_body = try self.lowerBlockExpr(body_id, .unit_ty, false);
+            try loop_stmts.append(self.allocator, user_body.asInt());
+
+            const loop_blk = try self.emitSyntheticBlock(loop_stmts.items, .none, .unit_ty, tok);
+            const loop_node = try self.emitNode(.{
+                .tag = .hir_loop,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = .unit_ty,
+                .origin_token = tok,
+                .data = .{ .lhs = loop_blk.asInt(), .rhs = loop_id },
+            }, stmt_id);
+            try outer_stmts.append(self.allocator, loop_node.asInt());
+            const tail_res = if (is_opt_result) try self.emitVarRef(res_opt_local, tok, .none) else .none;
+            return self.emitSyntheticBlock(
+                outer_stmts.items,
+                tail_res,
+                if (is_opt_result) loop_ty else .unit_ty,
+                tok,
+            );
         }
 
         // [2] Zero-temporary `soa_zip(s0, s1, …)` (`DR-13` §2.2 Rule 5):
@@ -4034,7 +4515,18 @@ const HirLowerer = struct {
                     callee_node.main_token,
                 );
                 if (std.mem.eql(u8, callee_name, "soa_zip")) {
-                    return self.lowerSoaZipLoop(stmt_id, pat_id, iter_id, body_id, loop_id, &outer_stmts);
+                    return self.lowerSoaZipLoop(
+                        stmt_id,
+                        pat_id,
+                        iter_id,
+                        index_tok,
+                        ref_mode,
+                        body_id,
+                        loop_id,
+                        res_opt_local,
+                        if (is_opt_result) loop_ty else .unit_ty,
+                        &outer_stmts,
+                    );
                 }
             }
         }
@@ -4049,7 +4541,7 @@ const HirLowerer = struct {
             else => .unit_ty,
         };
 
-        const seq_local = try self.allocTempLocal(seq_ty, tok, false);
+        const seq_local = try self.allocTempLocal(seq_ty, tok, ref_mode == 2);
         try outer_stmts.append(self.allocator, (try self.emitLocalDeclNode(seq_local, seq_hir, tok)).asInt());
 
         const len_hir = try self.emitSequenceLen(try self.emitVarRef(seq_local, tok, .none), seq_ty, tok);
@@ -4108,7 +4600,9 @@ const HirLowerer = struct {
                 .rhs = (try self.emitVarRef(cur_idx_local, tok, .none)).asInt(),
             },
         }, .none);
-        try self.emitPatternBindStmts(pat_id, elem_proj, elem_ty, tok, &loop_stmts);
+        const wrapped_elem = try self.wrapForRefModeIfNeeded(pat_id, elem_proj, elem_ty, ref_mode, tok);
+        try self.emitPatternBindStmts(pat_id, wrapped_elem.val_hir, wrapped_elem.val_ty, tok, &loop_stmts);
+        try self.bindForIndexLocal(index_tok, try self.emitVarRef(cur_idx_local, tok, .none), &loop_stmts);
 
         const user_body = try self.lowerBlockExpr(body_id, .unit_ty, false);
         try loop_stmts.append(self.allocator, user_body.asInt());
@@ -4122,17 +4616,27 @@ const HirLowerer = struct {
             .data = .{ .lhs = loop_blk.asInt(), .rhs = loop_id },
         }, stmt_id);
         try outer_stmts.append(self.allocator, loop_node.asInt());
-        return self.emitSyntheticBlock(outer_stmts.items, .none, .unit_ty, tok);
+        const tail_res = if (is_opt_result) try self.emitVarRef(res_opt_local, tok, .none) else .none;
+        return self.emitSyntheticBlock(
+            outer_stmts.items,
+            tail_res,
+            if (is_opt_result) loop_ty else .unit_ty,
+            tok,
+        );
     }
 
-    /// Lowers `for pat in soa_zip(s0, s1, …) { body }` without allocating an intermediate AoS tuple on stack.
+    /// Lowers `for pat[, idx] in soa_zip(s0, s1, …) { body }` without allocating an intermediate AoS tuple on stack.
     fn lowerSoaZipLoop(
         self: *HirLowerer,
         stmt_id: NodeIndex,
         pat_id: NodeIndex,
         iter_id: NodeIndex,
+        index_tok: TokenIndex,
+        ref_mode: u32,
         body_id: NodeIndex,
         loop_id: u32,
+        res_opt_local: u32,
+        res_ty: TypeId,
         outer_stmts: *std.ArrayListUnmanaged(u32),
     ) !HirIndex {
         const tok = self.ast_arena.getNode(stmt_id).main_token;
@@ -4156,21 +4660,17 @@ const HirLowerer = struct {
             if (isTypeAstTag(arg_ast.tag)) continue;
 
             var item_label: SymbolId = if (raw_i < arg_labels.len) arg_labels[raw_i] else .empty;
-            if (arg_ast.tag == .binary_expr and !arg_ast.main_token.isNone() and
-                self.tokens.getToken(arg_ast.main_token).kind == .eq and
-                arg_ast.lhs.tag == .node and arg_ast.rhs.tag == .node)
-            {
-                const lhs_ast = self.ast_arena.getNode(NodeIndex.fromInt(arg_ast.lhs.payload));
-                if (lhs_ast.tag == .ident_expr and !lhs_ast.main_token.isNone()) {
-                    const lbl_text = symbol_resolver.extractTokenSlice(self.source, self.tokens, lhs_ast.main_token);
-                    item_label = try self.interner.intern(lbl_text);
-                    arg_id = NodeIndex.fromInt(arg_ast.rhs.payload);
+            if (arg_ast.tag == .named_arg) {
+                if (!arg_ast.main_token.isNone() and arg_ast.main_token.asInt() < self.tokens.countTokens()) {
+                    const lbl_text = symbol_resolver.extractTokenSlice(self.source, self.tokens, arg_ast.main_token);
+                    if (lbl_text.len > 0) item_label = try self.interner.intern(lbl_text);
                 }
+                if (arg_ast.lhs.tag == .node) arg_id = NodeIndex.fromInt(arg_ast.lhs.payload);
             }
 
             const seq_hir = try self.lowerExpr(arg_id, .err_ty);
             const seq_ty = self.store.getNode(seq_hir).type_id;
-            const is_seq_mut = self.store.getNode(seq_hir).flags.category == .place_mut;
+            const is_seq_mut = self.store.getNode(seq_hir).flags.category == .place_mut or ref_mode == 2;
             const seq_slot = try self.allocTempLocal(seq_ty, tok, is_seq_mut);
             try outer_stmts.append(self.allocator, (try self.emitLocalDeclNode(seq_slot, seq_hir, tok)).asInt());
             try seq_locals_list.append(self.allocator, seq_slot);
@@ -4239,6 +4739,7 @@ const HirLowerer = struct {
                 const sub_pats = self.getAstExtraSlice(pat_id, false);
                 const count = @min(sub_pats.len, zip_info.seq_locals.len);
                 for (sub_pats[0..count], 0..) |raw_sub, i| {
+                    const sub_pat_id = NodeIndex.fromInt(raw_sub);
                     const seq_ty = zip_info.seq_types[i];
                     const unwrapped = self.unwrapRefType(seq_ty);
                     const seq_ty_node = self.pool.getNode(unwrapped);
@@ -4264,10 +4765,24 @@ const HirLowerer = struct {
                             .rhs = (try self.emitVarRef(cur_idx_local, tok, .none)).asInt(),
                         },
                     }, .none);
-                    try self.emitPatternBindStmts(NodeIndex.fromInt(raw_sub), elem_proj, elem_ty, tok, &loop_stmts);
+                    const wrapped_sub = try self.wrapForRefModeIfNeeded(
+                        sub_pat_id,
+                        elem_proj,
+                        elem_ty,
+                        ref_mode,
+                        tok,
+                    );
+                    try self.emitPatternBindStmts(
+                        sub_pat_id,
+                        wrapped_sub.val_hir,
+                        wrapped_sub.val_ty,
+                        tok,
+                        &loop_stmts,
+                    );
                 }
             }
         }
+        try self.bindForIndexLocal(index_tok, try self.emitVarRef(cur_idx_local, tok, .none), &loop_stmts);
 
         const user_body = try self.lowerBlockExpr(body_id, .unit_ty, false);
         try loop_stmts.append(self.allocator, user_body.asInt());
@@ -4280,19 +4795,61 @@ const HirLowerer = struct {
             .data = .{ .lhs = loop_blk.asInt(), .rhs = loop_id },
         }, stmt_id);
         try outer_stmts.append(self.allocator, loop_node.asInt());
-        return self.emitSyntheticBlock(outer_stmts.items, .none, .unit_ty, tok);
+        const tail_res = if (res_opt_local != NONE_U32) try self.emitVarRef(res_opt_local, tok, .none) else .none;
+        return self.emitSyntheticBlock(outer_stmts.items, tail_res, res_ty, tok);
     }
 
-    /// Lowers `while cond { body }` and `while let pat = expr { body }` into canonical `hir_loop`.
-    fn lowerWhileStmt(self: *HirLowerer, stmt_id: NodeIndex) anyerror!HirIndex {
+    /// Lowers `while cond { body }` into `hir_cond_while` (when `is` / `:=` is present) or canonical `hir_loop` (`SE-01`/`SE-02`/`SE-06`).
+    fn lowerWhileStmt(self: *HirLowerer, stmt_id: NodeIndex, expected_ty: TypeId) anyerror!HirIndex {
         const stmt_node = self.ast_arena.getNode(stmt_id);
         const tok = stmt_node.main_token;
-        const cond_id = if (stmt_node.lhs.tag == .node) NodeIndex.fromInt(stmt_node.lhs.payload) else .none;
+        var cond_id: NodeIndex = .none;
+        var label_tok: TokenIndex = .none;
+        if (stmt_node.lhs.tag == .extra) {
+            const pair = self.getAstExtraSlice(stmt_id, false);
+            if (pair.len >= 1) cond_id = NodeIndex.fromInt(pair[0]);
+            if (pair.len >= 2) label_tok = TokenIndex.fromInt(pair[1]);
+        } else if (stmt_node.lhs.tag == .node) {
+            cond_id = NodeIndex.fromInt(stmt_node.lhs.payload);
+        }
         const body_id = if (stmt_node.rhs.tag == .node) NodeIndex.fromInt(stmt_node.rhs.payload) else .none;
+
+        const recorded_loop_ty = self.nodeType(stmt_id);
+        const loop_ty = self.concreteType(if (!recorded_loop_ty.isError()) recorded_loop_ty else expected_ty);
+        const unwrapped_loop_ty = self.pool.unwrapUnderlyingType(loop_ty);
+        const is_opt_result = loop_ty != .unit_ty and self.pool.getTag(unwrapped_loop_ty) == .optional_ty;
+        const opt_payload_ty: TypeId = if (is_opt_result)
+            self.concreteType(TypeId.fromInt(self.pool.getNode(unwrapped_loop_ty).lhs))
+        else
+            .unit_ty;
+
+        var outer_stmts: std.ArrayListUnmanaged(u32) = .empty;
+        defer outer_stmts.deinit(self.allocator);
+
+        var res_opt_local: u32 = NONE_U32;
+        if (is_opt_result) {
+            res_opt_local = try self.allocTempLocal(loop_ty, tok, true);
+            const init_none = try self.emitOptionalNoneConstruct(loop_ty, tok);
+            try outer_stmts.append(
+                self.allocator,
+                (try self.emitLocalDeclNode(res_opt_local, init_none, tok)).asInt(),
+            );
+        }
 
         const loop_id = self.next_loop_id;
         self.next_loop_id += 1;
         try self.recordLoopContractFromAst(stmt_id, loop_id);
+        const label_id = try self.internLabelToken(label_tok);
+        try self.loop_stack.append(self.allocator, .{
+            .loop_id = loop_id,
+            .label_id = label_id,
+            .is_comptime_for = false,
+            .result_opt_local = res_opt_local,
+            .payload_ty = opt_payload_ty,
+            .opt_ty = if (is_opt_result) loop_ty else .unit_ty,
+        });
+        defer _ = self.loop_stack.pop();
+
         const saved_loop_id = self.current_loop_id;
         const saved_in_ct_for = self.is_in_comptime_for;
         self.current_loop_id = loop_id;
@@ -4302,6 +4859,43 @@ const HirLowerer = struct {
             self.popLexicalLocalsTo(local_checkpoint);
             self.is_in_comptime_for = saved_in_ct_for;
             self.current_loop_id = saved_loop_id;
+        }
+
+        if (self.hasConditionScope(cond_id)) {
+            var clauses: std.ArrayListUnmanaged(NodeIndex) = .empty;
+            defer clauses.deinit(self.allocator);
+            var has_unused_is = false;
+            try self.collectConjunctiveClauses(cond_id, &clauses, &has_unused_is);
+
+            var extra_words: std.ArrayListUnmanaged(u32) = .empty;
+            defer extra_words.deinit(self.allocator);
+            try extra_words.append(self.allocator, @intCast(clauses.items.len));
+
+            const was_in_cond = self.is_in_cond_scope;
+            self.is_in_cond_scope = true;
+            {
+                errdefer self.is_in_cond_scope = was_in_cond;
+                try self.lowerCondClauseList(clauses.items, &extra_words);
+            }
+            self.is_in_cond_scope = was_in_cond;
+
+            const body_hir = try self.lowerBlockExpr(body_id, .unit_ty, false);
+            try extra_words.append(self.allocator, body_hir.asInt());
+            try extra_words.append(self.allocator, res_opt_local);
+
+            const extra_idx = try self.store.appendExtraSlice(extra_words.items);
+            const cond_while_ty = if (is_opt_result) loop_ty else .unit_ty;
+            const cond_while_hir = try self.emitNode(.{
+                .tag = .hir_cond_while,
+                .flags = .{ .category = .rvalue, .is_unsafe = self.is_in_unsafe },
+                .type_id = cond_while_ty,
+                .origin_token = tok,
+                .data = .{ .lhs = extra_idx, .rhs = loop_id },
+            }, stmt_id);
+            if (is_opt_result) {
+                return self.emitSyntheticBlock(outer_stmts.items, cond_while_hir, loop_ty, tok);
+            }
+            return cond_while_hir;
         }
 
         const brk_node = try self.emitNode(.{
@@ -4315,7 +4909,6 @@ const HirLowerer = struct {
 
         const step_hir = try self.lowerConditionBranch(
             cond_id,
-            self.ast_arena.getCstOrigin(stmt_id),
             body_id,
             .none,
             brk_blk,
@@ -4324,13 +4917,36 @@ const HirLowerer = struct {
             stmt_id,
         );
         const loop_blk = try self.wrapSingleStmtBlock(step_hir, tok);
-        return self.emitNode(.{
+        const loop_node = try self.emitNode(.{
             .tag = .hir_loop,
             .flags = .{ .category = .rvalue, .is_synthetic = true },
             .type_id = .unit_ty,
             .origin_token = tok,
             .data = .{ .lhs = loop_blk.asInt(), .rhs = loop_id },
         }, stmt_id);
+        if (is_opt_result) {
+            try outer_stmts.append(self.allocator, loop_node.asInt());
+            return self.emitSyntheticBlock(
+                outer_stmts.items,
+                try self.emitVarRef(res_opt_local, tok, .none),
+                loop_ty,
+                tok,
+            );
+        }
+        return loop_node;
+    }
+
+    /// Lowers `place_ast_id` with `is_mut_lvalue_ctx = is_mut_needed` so `$` receivers acquire `&mut` only when mutated.
+    fn lowerPlaceWithMutCtx(
+        self: *HirLowerer,
+        place_ast_id: NodeIndex,
+        target_ty: TypeId,
+        is_mut_needed: bool,
+    ) anyerror!HirIndex {
+        const saved_mut_ctx = self.is_mut_lvalue_ctx;
+        self.is_mut_lvalue_ctx = is_mut_needed;
+        defer self.is_mut_lvalue_ctx = saved_mut_ctx;
+        return self.lowerExpr(place_ast_id, target_ty);
     }
 
     /// Lowers `lhs = rhs;` and compound assignments (`+=`, `-=`, etc.), synthesizing `hir_bitfield_rmw` on `bit_field`s.
@@ -4347,9 +4963,9 @@ const HirLowerer = struct {
 
         // [1] Direct `=` assignment:
         if (op_kind == .eq) {
-            const lhs_hir = try self.lowerExpr(lhs_id, .err_ty);
+            const lhs_hir = try self.lowerPlaceWithMutCtx(lhs_id, .err_ty, true);
             const lhs_node = self.store.getNode(lhs_hir);
-            const rhs_hir = try self.lowerExpr(rhs_id, lhs_node.type_id);
+            const rhs_hir = try self.lowerPlaceWithMutCtx(rhs_id, lhs_node.type_id, false);
             if (lhs_node.tag == .hir_bitfield_read) {
                 const rmw_extra = try self.store.appendExtraSlice(&[2]u32{ lhs_node.data.rhs, rhs_hir.asInt() });
                 self.store.nodes.set(lhs_hir.asInt(), .{
@@ -4387,11 +5003,11 @@ const HirLowerer = struct {
         };
 
         const expected_rhs_ty = self.nodeType(lhs_id);
-        const raw_rhs_hir = try self.lowerExpr(rhs_id, expected_rhs_ty);
+        const raw_rhs_hir = try self.lowerPlaceWithMutCtx(rhs_id, expected_rhs_ty, false);
         const rhs_local = try self.allocTempLocal(self.store.getNode(raw_rhs_hir).type_id, tok, false);
         const decl_rhs = try self.emitLocalDeclNode(rhs_local, raw_rhs_hir, tok);
 
-        const lhs_hir = try self.lowerExpr(lhs_id, .err_ty);
+        const lhs_hir = try self.lowerPlaceWithMutCtx(lhs_id, .err_ty, true);
         const lhs_node = self.store.getNode(lhs_hir);
         const rhs_ref = try self.applyImplicitCoercionIfNeeded(
             try self.emitVarRef(rhs_local, tok, .none),
@@ -4791,6 +5407,27 @@ const HirLowerer = struct {
             .if_expr => try self.lowerIfExpr(expr_id, target_ty, false),
             .match_expr => try self.lowerMatchExpr(expr_id, target_ty, false),
             .loop_expr => try self.lowerLoopExpr(expr_id, target_ty),
+            .for_stmt => try self.lowerForExpr(expr_id, target_ty),
+            .while_stmt => try self.lowerWhileStmt(expr_id, target_ty),
+            .return_stmt => try self.lowerReturnNode(expr_id),
+            .break_stmt => try self.lowerBreakNode(expr_id, false),
+            .continue_stmt => try self.lowerContinueNode(expr_id, false),
+            .walrus_expr => try self.lowerWalrusExpr(expr_id, target_ty),
+            .is_expr => try self.lowerStandaloneIsExpr(expr_id),
+            .range_expr => try self.lowerRangeValueExpr(expr_id, target_ty),
+            .dollar_expr => try self.lowerDollarExpr(expr_id),
+            .context_expr => try self.lowerContextExpr(expr_id, target_ty),
+            .unreachable_expr => try self.emitNode(.{
+                .tag = .hir_unreachable,
+                .flags = .{ .category = .diverging, .is_unsafe = self.is_in_unsafe },
+                .type_id = .never_ty,
+                .origin_token = ast_node.main_token,
+            }, expr_id),
+            .with_expr => try self.lowerWithExpr(expr_id, target_ty),
+            .named_arg => if (ast_node.lhs.tag == .node)
+                try self.lowerExpr(NodeIndex.fromInt(ast_node.lhs.payload), target_ty)
+            else
+                try self.emitErrorHole(ast_node.main_token, expr_id, target_ty),
             .closure_expr => try self.lowerClosureExpr(expr_id, target_ty),
             .await_expr => if (ast_node.lhs.tag == .node)
                 try self.lowerExpr(NodeIndex.fromInt(ast_node.lhs.payload), target_ty)
@@ -4800,6 +5437,495 @@ const HirLowerer = struct {
         };
 
         return self.applyImplicitCoercionIfNeeded(raw_hir, expected_ty, ast_node.main_token);
+    }
+
+    /// Unwraps `.named_arg` (`label = expr`) to its inner value `NodeIndex`, leaving positional args unchanged.
+    fn unwrapCallArgAst(self: *const HirLowerer, arg_id: NodeIndex) NodeIndex {
+        if (!arg_id.isNone() and arg_id.asInt() < self.ast_arena.countNodes()) {
+            const arg_node = self.ast_arena.getNode(arg_id);
+            if (arg_node.tag == .named_arg and arg_node.lhs.tag == .node) {
+                return NodeIndex.fromInt(arg_node.lhs.payload);
+            }
+        }
+        return arg_id;
+    }
+
+    /// Lowers a `.for_stmt` appearing in expression position (`for x in xs { break x; } orelse fallback`).
+    fn lowerForExpr(self: *HirLowerer, expr_id: NodeIndex, expected_ty: TypeId) anyerror!HirIndex {
+        const ast_node = self.ast_arena.getNode(expr_id);
+        var stmts: std.ArrayListUnmanaged(u32) = .empty;
+        defer stmts.deinit(self.allocator);
+        try self.lowerForStmt(expr_id, &stmts, expected_ty);
+        if (stmts.items.len == 0) return self.emitUnitConst(ast_node.main_token, expr_id);
+        if (stmts.items.len == 1) return HirIndex.fromInt(stmts.items[0]);
+        return self.emitSyntheticBlock(stmts.items, .none, .unit_ty, ast_node.main_token);
+    }
+
+    /// Shared local allocation and initializer lowering for `x := expr` (`var x := expr`, `x: T := expr`, `SE-01`).
+    fn lowerWalrusCore(
+        self: *HirLowerer,
+        expr_id: NodeIndex,
+        expected_ty: TypeId,
+    ) anyerror!struct { slot_id: u32, decl_hir: HirIndex, ident_tok: TokenIndex, slot_ty: TypeId } {
+        const ast_node = self.ast_arena.getNode(expr_id);
+        const tok = ast_node.main_token;
+        const ident_tok = if (ast_node.lhs.tag == .token)
+            TokenIndex.fromInt(ast_node.lhs.payload)
+        else
+            tok;
+        const extra = self.getAstExtraSlice(expr_id, true);
+        const is_var = extra.len >= 1 and extra[0] != 0;
+        const type_node = if (extra.len >= 2) NodeIndex.fromInt(extra[1]) else .none;
+        const init_id = if (extra.len >= 3) NodeIndex.fromInt(extra[2]) else .none;
+
+        const sym_idx = self.nodeSymbol(expr_id);
+        const expected_init_ty = if (!sym_idx.isNone())
+            self.concreteType(self.sym_table.getSymbol(sym_idx).type_id)
+        else if (!type_node.isNone())
+            self.concreteType(self.nodeType(type_node))
+        else if (!expected_ty.isError() and expected_ty != .unit_ty)
+            self.concreteType(expected_ty)
+        else
+            self.nodeType(expr_id);
+
+        const raw_init_hir = try self.lowerExpr(init_id, expected_init_ty);
+        if (!raw_init_hir.isNone() and self.store.getNode(raw_init_hir).tag == .hir_closure and
+            self.hasAttrNamedInCst(self.ast_arena.getCstOrigin(expr_id), "local"))
+        {
+            const fn_meta_idx = self.store.getNode(raw_init_hir).data.lhs;
+            if (fn_meta_idx < self.store.functions.items.len) {
+                self.store.functions.items[fn_meta_idx].is_local_closure = true;
+            }
+        }
+
+        const slot_ty = self.concreteType(if (!expected_init_ty.isError())
+            expected_init_ty
+        else
+            self.store.getNode(raw_init_hir).type_id);
+        const init_hir = try self.applyImplicitCoercionIfNeeded(raw_init_hir, slot_ty, tok);
+
+        const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, ident_tok);
+        const is_wildcard = lexeme.len == 0 or std.mem.eql(u8, lexeme, "_");
+        const name_id = if (is_wildcard) SymbolId.empty else try self.interner.intern(lexeme);
+        const decl_span = if (!ident_tok.isNone() and ident_tok.asInt() < self.tokens.countTokens())
+            self.tokens.getTokenSpan(self.store.file_id, ident_tok)
+        else
+            self.astSpan(expr_id);
+
+        const slot_id = try self.store.appendLocal(.{
+            .name = name_id,
+            .type_id = slot_ty,
+            .decl_span = decl_span,
+            .mode = .let_mode,
+            .is_mut = is_var,
+            .is_param = false,
+            .is_temp = is_wildcard,
+            .is_cond_binding = self.is_in_cond_scope,
+            .symbol_index = sym_idx,
+        });
+        if (!sym_idx.isNone()) {
+            try self.symbol_to_local.put(self.allocator, sym_idx.asInt(), slot_id);
+        }
+        try self.pushLexicalLocal(name_id, slot_id);
+
+        const decl_hir = try self.emitNode(.{
+            .tag = .hir_local_decl,
+            .flags = .{ .category = .rvalue, .is_synthetic = is_wildcard, .is_unsafe = self.is_in_unsafe },
+            .type_id = .unit_ty,
+            .origin_token = tok,
+            .data = .{ .lhs = slot_id, .rhs = init_hir.asInt() },
+        }, expr_id);
+        return .{ .slot_id = slot_id, .decl_hir = decl_hir, .ident_tok = ident_tok, .slot_ty = slot_ty };
+    }
+
+    /// Lowers `x := expr` in expression or `ConditionScope` position, yielding the bound local reference (`SE-01`).
+    fn lowerWalrusExpr(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) anyerror!HirIndex {
+        const walrus = try self.lowerWalrusCore(expr_id, target_ty);
+        const ref_hir = try self.emitVarRef(walrus.slot_id, walrus.ident_tok, .none);
+        const blk_hir = try self.emitSyntheticBlock(
+            &[1]u32{walrus.decl_hir.asInt()},
+            ref_hir,
+            walrus.slot_ty,
+            self.ast_arena.getNode(expr_id).main_token,
+        );
+        self.store.nodes.items(.flags)[blk_hir.asInt()].category = self.store.getNode(ref_hir).flags.category;
+        return blk_hir;
+    }
+
+    /// Lowers standalone `expr is Pattern` and `expr is not Pattern` into a two-arm boolean `hir_match` (`SE-02`).
+    fn lowerStandaloneIsExpr(self: *HirLowerer, expr_id: NodeIndex) anyerror!HirIndex {
+        const ast_node = self.ast_arena.getNode(expr_id);
+        const tok = ast_node.main_token;
+        const is_negated = !tok.isNone() and tok.asInt() < self.tokens.countTokens() and
+            self.tokens.getToken(tok).kind == .kw_not;
+        const scrut_id = if (ast_node.lhs.tag == .node) NodeIndex.fromInt(ast_node.lhs.payload) else .none;
+        const pat_id = if (ast_node.rhs.tag == .node) NodeIndex.fromInt(ast_node.rhs.payload) else .none;
+
+        const scrutinee_hir = try self.lowerExpr(scrut_id, .err_ty);
+        const scrut_ty = self.store.getNode(scrutinee_hir).type_id;
+        const local_checkpoint = self.local_shadow_log.items.len;
+        defer self.popLexicalLocalsTo(local_checkpoint);
+
+        const pat_idx = try self.lowerTopPattern(pat_id, scrut_ty, false);
+        const wild_pat = try self.store.appendPat(.{
+            .type_id = scrut_ty,
+            .origin_token = tok,
+            .kind = .wildcard,
+        });
+        const arm_start: u32 = @intCast(self.store.match_arms.items.len);
+        try self.store.match_arms.append(self.allocator, .{
+            .pat_idx = pat_idx,
+            .guard_hir = .none,
+            .body_hir = try self.emitConstVal(.{ .bool_val = !is_negated }, .bool_ty, tok, .none, true),
+            .origin_token = tok,
+        });
+        try self.store.match_arms.append(self.allocator, .{
+            .pat_idx = wild_pat,
+            .guard_hir = .none,
+            .body_hir = try self.emitConstVal(.{ .bool_val = is_negated }, .bool_ty, tok, .none, true),
+            .origin_token = tok,
+        });
+        const match_extra = try self.store.appendExtraSlice(&[2]u32{ arm_start, 2 });
+        return self.emitNode(.{
+            .tag = .hir_match,
+            .flags = .{ .category = .rvalue, .is_synthetic = true },
+            .type_id = .bool_ty,
+            .origin_token = tok,
+            .data = .{ .lhs = scrutinee_hir.asInt(), .rhs = match_extra },
+        }, expr_id);
+    }
+
+    /// Lowers a standalone `.range_expr` value (`a..b`, `a..=b`, `..b`, `a..`, `..`) into `hir_construct`.
+    fn lowerRangeValueExpr(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) anyerror!HirIndex {
+        const ast_node = self.ast_arena.getNode(expr_id);
+        const tok = ast_node.main_token;
+        const range_info = self.extractRangeAstInfo(expr_id) orelse
+            return self.emitErrorHole(tok, expr_id, target_ty);
+
+        var bound_ty: TypeId = .usize_ty;
+        const res_ty = if (!target_ty.isError())
+            self.concreteType(target_ty)
+        else
+            self.concreteType(self.nodeType(expr_id));
+        if (!res_ty.isError() and self.pool.getTag(res_ty) == .tuple_ty) {
+            const elems = self.pool.getTupleElements(res_ty);
+            if (elems.len >= 1) bound_ty = self.concreteType(TypeId.fromInt(elems[0]));
+        } else if (!range_info.start_id.isNone()) {
+            const start_ty = self.nodeType(range_info.start_id);
+            if (!start_ty.isError()) bound_ty = self.concreteType(start_ty);
+        } else if (!range_info.end_id.isNone()) {
+            const end_ty = self.nodeType(range_info.end_id);
+            if (!end_ty.isError()) bound_ty = self.concreteType(end_ty);
+        }
+
+        const start_hir = if (!range_info.start_id.isNone())
+            try self.lowerExpr(range_info.start_id, bound_ty)
+        else
+            try self.emitConstVal(.{ .int_val = 0 }, bound_ty, tok, .none, true);
+        const end_hir = if (!range_info.end_id.isNone())
+            try self.lowerExpr(range_info.end_id, bound_ty)
+        else
+            try self.emitConstVal(.{ .int_val = std.math.maxInt(i64) }, bound_ty, tok, .none, true);
+
+        const final_ty = if (!res_ty.isError()) res_ty else try self.pool.internTuple(&[2]TypeId{ bound_ty, bound_ty });
+        if (self.pool.getTag(final_ty) == .tuple_ty) {
+            const tup_elems = self.pool.getTupleElements(final_ty);
+            if (tup_elems.len >= 3) {
+                const incl_hir = try self.emitConstVal(
+                    .{ .bool_val = range_info.is_inclusive },
+                    .bool_ty,
+                    tok,
+                    .none,
+                    true,
+                );
+                const extra_idx = try self.store.appendLenPrefixedExtra(
+                    &[3]u32{ start_hir.asInt(), end_hir.asInt(), incl_hir.asInt() },
+                );
+                return self.emitNode(.{
+                    .tag = .hir_construct,
+                    .flags = .{ .category = .rvalue, .is_synthetic = true },
+                    .type_id = final_ty,
+                    .origin_token = tok,
+                    .data = .{ .lhs = @backingInt(HirConstructKind.tuple_init), .rhs = extra_idx },
+                }, expr_id);
+            }
+        }
+        const extra_idx = try self.store.appendLenPrefixedExtra(&[2]u32{ start_hir.asInt(), end_hir.asInt() });
+        const construct_kind: HirConstructKind = if (self.pool.getTag(final_ty) == .struct_ty)
+            .struct_init
+        else
+            .tuple_init;
+        return self.emitNode(.{
+            .tag = .hir_construct,
+            .flags = .{ .category = .rvalue, .is_synthetic = true },
+            .type_id = final_ty,
+            .origin_token = tok,
+            .data = .{ .lhs = @backingInt(construct_kind), .rhs = extra_idx },
+        }, expr_id);
+    }
+
+    /// Lowers `$` (`AstTag.dollar_expr`) inside `base[…]` to the innermost active receiver length local (`SE-04`).
+    fn lowerDollarExpr(self: *HirLowerer, expr_id: NodeIndex) !HirIndex {
+        const ast_node = self.ast_arena.getNode(expr_id);
+        if (self.dollar_len_stack.items.len > 0) {
+            const len_local = self.dollar_len_stack.items[self.dollar_len_stack.items.len - 1];
+            return self.emitVarRef(len_local, ast_node.main_token, expr_id);
+        }
+        return self.emitErrorHole(ast_node.main_token, expr_id, .usize_ty);
+    }
+
+    /// Resolves the canonical `TypeId` of an implicit `Context` slot (`SE-08`), synchronized with `type_system.zig`.
+    fn resolveContextSlotType(self: *HirLowerer, layout: type_system.ContextFieldLayout) !TypeId {
+        switch (layout.kind) {
+            .rng_seed => return .u64_ty,
+            .allocator, .temp_allocator => {
+                if (self.lookupNominalTypeByName("Allocator")) |found_ty| return found_ty;
+                return self.pool.internRawPtr(.u8_ty, true);
+            },
+            .scratch => {
+                if (self.lookupNominalTypeByName("BumpArena")) |arena_ty| {
+                    return self.pool.internArray(arena_ty, 2, false);
+                }
+                if (self.lookupNominalTypeByName("Arena")) |found_ty| return found_ty;
+                return self.pool.internRawPtr(.u8_ty, true);
+            },
+            .trace_sink => {
+                if (self.lookupNominalTypeByName("TraceSink")) |found_ty| return found_ty;
+                return self.pool.internRawPtr(.u8_ty, true);
+            },
+            .logger => {
+                if (self.lookupNominalTypeByName("Logger")) |found_ty| return found_ty;
+                return self.pool.internRawPtr(.u8_ty, true);
+            },
+            .diagnostics => {
+                if (self.lookupNominalTypeByName("DiagSink")) |found_ty| return found_ty;
+                if (self.lookupNominalTypeByName("Diagnostics")) |found_ty| return found_ty;
+                if (self.lookupNominalTypeByName("DiagnosticSink")) |sink_ty| {
+                    return self.pool.internRawPtr(sink_ty, true);
+                }
+                return self.pool.internRawPtr(.u8_ty, true);
+            },
+            .cancel_token => {
+                if (self.lookupNominalTypeByName("CancelToken")) |found_ty| return found_ty;
+                return self.pool.internOptional(try self.pool.internRawPtr(.u8_ty, true));
+            },
+        }
+    }
+
+    /// Looks up a nominal `TypeId` by `type_name` in `current_scope` or `prelude_scope`.
+    fn lookupNominalTypeByName(self: *const HirLowerer, type_name: []const u8) ?TypeId {
+        const name_id = self.interner.lookup(type_name) orelse return null;
+        switch (self.sym_table.lookupLexical(self.current_scope, name_id, NamespaceMask.TYPE_ONLY)) {
+            .found => |sym_idx| {
+                const sym_ty = self.sym_table.getSymbol(sym_idx).type_id;
+                if (!sym_ty.isError()) return self.concreteType(sym_ty);
+            },
+            else => {},
+        }
+        return null;
+    }
+
+    /// Lowers a standalone `context` expression (`AstTag.context_expr`) by materializing its canonical slots (`SE-08`).
+    fn lowerContextExpr(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) !HirIndex {
+        const ast_node = self.ast_arena.getNode(expr_id);
+        const tok = ast_node.main_token;
+        const res_ty = if (!target_ty.isError())
+            self.concreteType(target_ty)
+        else
+            self.concreteType(self.nodeType(expr_id));
+        if (!res_ty.isError() and self.pool.getTag(res_ty) == .struct_ty) {
+            const struct_sym = self.sym_table.getSymbol(SymbolIndex.fromInt(self.pool.getNode(res_ty).rhs)).*;
+            if (!struct_sym.target_scope.isNone()) {
+                var field_hirs: std.ArrayListUnmanaged(u32) = .empty;
+                defer field_hirs.deinit(self.allocator);
+                for (self.sym_table.getScopeMembers(struct_sym.target_scope)) |mem_idx| {
+                    const mem_sym = self.sym_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind != .field_sym) continue;
+                    const slot_ord: u32 = if (type_system.ContextFieldLayout.fromFieldName(mem_sym.name_text)) |info|
+                        info.slot_ordinal
+                    else
+                        0;
+                    const get_hir = try self.emitNode(.{
+                        .tag = .hir_ctx_get,
+                        .flags = .{ .category = .rvalue, .is_synthetic = true },
+                        .type_id = self.concreteType(mem_sym.type_id),
+                        .origin_token = tok,
+                        .data = .{ .lhs = slot_ord, .rhs = 0 },
+                    }, .none);
+                    try field_hirs.append(self.allocator, get_hir.asInt());
+                }
+                const extra_idx = try self.store.appendLenPrefixedExtra(field_hirs.items);
+                return self.emitNode(.{
+                    .tag = .hir_construct,
+                    .flags = .{ .category = .rvalue, .is_synthetic = true },
+                    .type_id = res_ty,
+                    .origin_token = tok,
+                    .data = .{ .lhs = @backingInt(HirConstructKind.struct_init), .rhs = extra_idx },
+                }, expr_id);
+            }
+        }
+        const fallback_ty = if (!res_ty.isError()) res_ty else try self.pool.internRawPtr(.u8_ty, true);
+        return self.emitNode(.{
+            .tag = .hir_ctx_get,
+            .flags = .{ .category = .rvalue },
+            .type_id = fallback_ty,
+            .origin_token = tok,
+            .data = .{ .lhs = 0, .rhs = 0 },
+        }, expr_id);
+    }
+
+    /// Lowers `with context.slot = val { body }` with `hir_defer` LIFO restoration and region push/pop (`SE-08`).
+    fn lowerWithExpr(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) anyerror!HirIndex {
+        const ast_node = self.ast_arena.getNode(expr_id);
+        const tok = ast_node.main_token;
+        const extra = self.getAstExtraSlice(expr_id, false);
+        const override_count: usize = if (extra.len >= 1) extra[0] else 0;
+        const body_id = if (ast_node.rhs.tag == .node) NodeIndex.fromInt(ast_node.rhs.payload) else .none;
+        if (override_count == 0) {
+            return self.lowerBlockExpr(body_id, target_ty, false);
+        }
+
+        var with_stmts: std.ArrayListUnmanaged(u32) = .empty;
+        defer with_stmts.deinit(self.allocator);
+
+        var ov_i: usize = 0;
+        while (ov_i < override_count and 1 + 2 * ov_i + 1 < extra.len) : (ov_i += 1) {
+            const slot_tok = TokenIndex.fromInt(extra[1 + 2 * ov_i]);
+            const val_ast_id = NodeIndex.fromInt(extra[1 + 2 * ov_i + 1]);
+            const slot_name = symbol_resolver.extractTokenSlice(self.source, self.tokens, slot_tok);
+            const maybe_layout = type_system.ContextFieldLayout.fromFieldName(slot_name);
+            if (maybe_layout == null or !maybe_layout.?.kind.isWithOverridable()) {
+                const discarded = try self.lowerExpr(val_ast_id, .err_ty);
+                const tmp_slot = try self.allocTempLocal(self.store.getNode(discarded).type_id, slot_tok, false);
+                try with_stmts.append(self.allocator, (try self.emitLocalDeclNode(tmp_slot, discarded, slot_tok)).asInt());
+                continue;
+            }
+            const layout = maybe_layout.?;
+            const slot_ord: u32 = layout.slot_ordinal;
+            const is_region_slot = layout.kind.isWithOverridable();
+
+            const canonical_slot_ty = try self.resolveContextSlotType(layout);
+            const raw_val_hir = try self.lowerPlaceWithMutCtx(val_ast_id, .err_ty, false);
+            const raw_val_ty = self.store.getNode(raw_val_hir).type_id;
+            const has_nominal_slot_ty = !canonical_slot_ty.isError() and
+                self.pool.getTag(canonical_slot_ty) == .struct_ty;
+            const is_raw_ptr_or_ref = switch (self.pool.getTag(self.pool.unwrapUnderlyingType(raw_val_ty))) {
+                .ref_ty, .mut_ref_ty, .raw_ptr_ty => true,
+                else => false,
+            };
+            const effective_slot_ty = if ((has_nominal_slot_ty and
+                (raw_val_ty == canonical_slot_ty or is_raw_ptr_or_ref)) or
+                layout.kind == .rng_seed or raw_val_ty.isError())
+                canonical_slot_ty
+            else
+                raw_val_ty;
+
+            // Keep coerced borrows (e.g., `&mut arena`) anchored in a live local across `body` for `mir_sast` borrow safety:
+            const hold_local = try self.allocTempLocal(raw_val_ty, slot_tok, false);
+            try with_stmts.append(self.allocator, (try self.emitLocalDeclNode(hold_local, raw_val_hir, slot_tok)).asInt());
+            var new_slot_hir = try self.emitVarRef(hold_local, slot_tok, .none);
+            if (raw_val_ty != effective_slot_ty) {
+                new_slot_hir = try self.emitNode(.{
+                    .tag = .hir_cast,
+                    .flags = .{ .category = .rvalue, .is_synthetic = true },
+                    .type_id = effective_slot_ty,
+                    .origin_token = slot_tok,
+                    .data = .{ .lhs = new_slot_hir.asInt(), .rhs = @backingInt(HirCastKind.ptr_cast) },
+                }, .none);
+            }
+
+            const prev_ctx_hir = try self.emitNode(.{
+                .tag = .hir_ctx_get,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = effective_slot_ty,
+                .origin_token = slot_tok,
+                .data = .{ .lhs = slot_ord, .rhs = 0 },
+            }, .none);
+            const saved_local = try self.allocTempLocal(effective_slot_ty, slot_tok, false);
+            try with_stmts.append(
+                self.allocator,
+                (try self.emitLocalDeclNode(saved_local, prev_ctx_hir, slot_tok)).asInt(),
+            );
+
+            const set_new_hir = try self.emitNode(.{
+                .tag = .hir_ctx_set,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = .unit_ty,
+                .origin_token = slot_tok,
+                .data = .{ .lhs = slot_ord, .rhs = new_slot_hir.asInt() },
+            }, .none);
+            try with_stmts.append(self.allocator, set_new_hir.asInt());
+
+            if (is_region_slot) {
+                const region_val = if (raw_val_ty != effective_slot_ty)
+                    try self.emitNode(.{
+                        .tag = .hir_cast,
+                        .flags = .{ .category = .rvalue, .is_synthetic = true },
+                        .type_id = effective_slot_ty,
+                        .origin_token = slot_tok,
+                        .data = .{
+                            .lhs = (try self.emitVarRef(hold_local, slot_tok, .none)).asInt(),
+                            .rhs = @backingInt(HirCastKind.ptr_cast),
+                        },
+                    }, .none)
+                else
+                    try self.emitVarRef(hold_local, slot_tok, .none);
+                const push_hir = try self.emitNode(.{
+                    .tag = .hir_ctx_region_push,
+                    .flags = .{ .category = .rvalue, .is_synthetic = true },
+                    .type_id = .unit_ty,
+                    .origin_token = slot_tok,
+                    .data = .{ .lhs = slot_ord, .rhs = region_val.asInt() },
+                }, .none);
+                try with_stmts.append(self.allocator, push_hir.asInt());
+            }
+
+            var cleanup_stmts: [2]u32 = undefined;
+            var cleanup_len: usize = 0;
+            if (is_region_slot) {
+                const pop_hir = try self.emitNode(.{
+                    .tag = .hir_ctx_region_pop,
+                    .flags = .{ .category = .rvalue, .is_synthetic = true },
+                    .type_id = .unit_ty,
+                    .origin_token = slot_tok,
+                    .data = .{ .lhs = slot_ord, .rhs = 0 },
+                }, .none);
+                cleanup_stmts[cleanup_len] = pop_hir.asInt();
+                cleanup_len += 1;
+            }
+            const restore_set_hir = try self.emitNode(.{
+                .tag = .hir_ctx_set,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = .unit_ty,
+                .origin_token = slot_tok,
+                .data = .{
+                    .lhs = slot_ord,
+                    .rhs = (try self.emitVarRef(saved_local, slot_tok, .none)).asInt(),
+                },
+            }, .none);
+            cleanup_stmts[cleanup_len] = restore_set_hir.asInt();
+            cleanup_len += 1;
+
+            const cleanup_blk = try self.emitSyntheticBlock(
+                cleanup_stmts[0..cleanup_len],
+                .none,
+                .unit_ty,
+                slot_tok,
+            );
+            const defer_hir = try self.emitNode(.{
+                .tag = .hir_defer,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = .unit_ty,
+                .origin_token = slot_tok,
+                .data = .{ .lhs = 0, .rhs = cleanup_blk.asInt() },
+            }, .none);
+            try with_stmts.append(self.allocator, defer_hir.asInt());
+        }
+
+        const body_hir = try self.lowerBlockExpr(body_id, target_ty, false);
+        const body_ty = self.store.getNode(body_hir).type_id;
+        const final_ty = if (!target_ty.isError()) self.concreteType(target_ty) else body_ty;
+        return self.emitSyntheticBlock(with_stmts.items, body_hir, final_ty, tok);
     }
 
     /// Inserts an explicit `hir_cast` node when `expected_ty` requires mutability relaxation or borrowed slice coercion.
@@ -5164,7 +6290,7 @@ const HirLowerer = struct {
                 }
                 const payload_ty = TypeId.fromInt(ty_node.lhs);
                 const payload_hir = if (arg_nodes.len >= 1)
-                    try self.lowerExpr(NodeIndex.fromInt(arg_nodes[0]), payload_ty)
+                    try self.lowerExpr(self.unwrapCallArgAst(NodeIndex.fromInt(arg_nodes[0])), payload_ty)
                 else
                     try self.emitUnitConst(expr_node.main_token, .none);
                 const extra_idx = try self.store.appendLenPrefixedExtra(&[1]u32{payload_hir.asInt()});
@@ -5183,7 +6309,7 @@ const HirLowerer = struct {
                 const is_ok = std.mem.eql(u8, var_name, "Ok");
                 const payload_ty = TypeId.fromInt(if (is_ok) ty_node.lhs else ty_node.rhs);
                 const payload_hir = if (arg_nodes.len >= 1)
-                    try self.lowerExpr(NodeIndex.fromInt(arg_nodes[0]), payload_ty)
+                    try self.lowerExpr(self.unwrapCallArgAst(NodeIndex.fromInt(arg_nodes[0])), payload_ty)
                 else
                     try self.emitUnitConst(expr_node.main_token, .none);
                 const extra_idx = try self.store.appendLenPrefixedExtra(&[1]u32{payload_hir.asInt()});
@@ -5227,17 +6353,19 @@ const HirLowerer = struct {
                 var lowered_args: std.ArrayListUnmanaged(u32) = .empty;
                 defer lowered_args.deinit(self.allocator);
                 if (arg_nodes.len == 1) {
+                    const first_arg = self.unwrapCallArgAst(NodeIndex.fromInt(arg_nodes[0]));
                     try lowered_args.append(
                         self.allocator,
-                        (try self.lowerExpr(NodeIndex.fromInt(arg_nodes[0]), var_payload_ty)).asInt(),
+                        (try self.lowerExpr(first_arg, var_payload_ty)).asInt(),
                     );
                 } else if (arg_nodes.len > 1) {
                     const tup_elems = self.pool.getTupleElements(var_payload_ty);
                     for (arg_nodes, 0..) |raw_arg, i| {
                         const sub_ty = if (i < tup_elems.len) TypeId.fromInt(tup_elems[i]) else .err_ty;
+                        const unwrapped_arg = self.unwrapCallArgAst(NodeIndex.fromInt(raw_arg));
                         try lowered_args.append(
                             self.allocator,
-                            (try self.lowerExpr(NodeIndex.fromInt(raw_arg), sub_ty)).asInt(),
+                            (try self.lowerExpr(unwrapped_arg, sub_ty)).asInt(),
                         );
                     }
                 }
@@ -5597,7 +6725,10 @@ const HirLowerer = struct {
             return self.emitConstVal(.{ .int_val = neg_val }, int_ty, tok, expr_id, false);
         }
 
-        const inner_hir = try self.lowerExpr(inner_id, .err_ty);
+        const is_mut_borrow_op = (op_kind == .amp or op_kind == .kw_ref) and
+            (self.hasKeywordInCst(self.ast_arena.getCstOrigin(expr_id), .kw_mut) or
+                self.pool.getTag(target_ty) == .mut_ref_ty);
+        const inner_hir = try self.lowerPlaceWithMutCtx(inner_id, .err_ty, is_mut_borrow_op);
         const inner_node = self.store.getNode(inner_hir);
 
         switch (op_kind) {
@@ -5626,19 +6757,17 @@ const HirLowerer = struct {
                 }, expr_id);
             },
             .amp, .kw_ref => {
-                const is_mut = self.hasKeywordInCst(self.ast_arena.getCstOrigin(expr_id), .kw_mut) or
-                    (self.pool.getTag(target_ty) == .mut_ref_ty);
                 const ref_ty = if (!target_ty.isError())
                     target_ty
                 else
-                    try self.pool.internRef(inner_node.type_id, is_mut);
+                    try self.pool.internRef(inner_node.type_id, is_mut_borrow_op);
                 return self.emitNode(.{
                     .tag = .hir_unary_op,
                     .flags = .{ .category = .rvalue },
                     .type_id = ref_ty,
                     .origin_token = tok,
                     .data = .{
-                        .lhs = @backingInt(if (is_mut) HirUnaryOp.addr_of_mut else HirUnaryOp.addr_of),
+                        .lhs = @backingInt(if (is_mut_borrow_op) HirUnaryOp.addr_of_mut else HirUnaryOp.addr_of),
                         .rhs = inner_hir.asInt(),
                     },
                 }, expr_id);
@@ -5715,7 +6844,241 @@ const HirLowerer = struct {
         }, expr_id);
     }
 
-    /// Desugars `lhs |> f(a_1, …, a_k)` and `lhs |> recv.m(a_1, …, a_k)` (`DR-13` §2.2 Rule 1 & `MAJ-06`).
+    /// Classification of a `.` receiver expression under `DR-21` Unified `.` resolution.
+    const StaticDotKind = enum(u8) {
+        /// Runtime value expression (`instance.field` / `instance.method()`).
+        none = 0,
+        /// Module namespace (`cx.mem`, `pkg.sub`).
+        module_ns = 1,
+        /// Nominal, primitive, or built-in sum type namespace (`Point`, `Option`, `u32`).
+        type_ns = 2,
+    };
+
+    /// Classifies whether `recv_id` denotes a static module or type namespace rather than a runtime value.
+    fn resolveStaticDotTargetAst(self: *const HirLowerer, recv_id: NodeIndex) StaticDotKind {
+        if (recv_id.isNone() or recv_id.asInt() >= self.ast_arena.countNodes()) return .none;
+        const recv_node = self.ast_arena.getNode(recv_id);
+        if (recv_node.tag == .index_expr and recv_node.lhs.tag == .node) {
+            return self.resolveStaticDotTargetAst(NodeIndex.fromInt(recv_node.lhs.payload));
+        }
+        if (recv_node.tag == .ident_expr and !recv_node.main_token.isNone()) {
+            const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, recv_node.main_token);
+            if (self.interner.lookup(lexeme)) |name_id| {
+                if (self.active_name_to_local.contains(name_id.asInt()) or
+                    self.active_comptime_vals.contains(name_id.asInt()) or
+                    self.active_zip_bindings.contains(name_id.asInt()))
+                {
+                    return .none;
+                }
+            }
+        }
+        var sym_idx = self.nodeSymbol(recv_id);
+        if (sym_idx.isNone() and recv_node.tag == .ident_expr and !recv_node.main_token.isNone()) {
+            const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, recv_node.main_token);
+            if (self.interner.lookup(lexeme)) |name_id| {
+                switch (self.sym_table.lookupLexical(self.current_scope, name_id, NamespaceMask.ALL)) {
+                    .found => |found_idx| sym_idx = found_idx,
+                    else => {},
+                }
+            }
+        }
+        if (!sym_idx.isNone()) {
+            if (self.symbol_to_local.contains(sym_idx.asInt())) return .none;
+            return switch (self.sym_table.getSymbol(sym_idx).kind) {
+                .module_sym => .module_ns,
+                .struct_sym,
+                .enum_sym,
+                .union_sym,
+                .bit_field_sym,
+                .trait_sym,
+                .type_alias_sym,
+                .distinct_type_sym,
+                .refined_type_sym,
+                .type_param_sym,
+                => .type_ns,
+                else => .none,
+            };
+        }
+        if (recv_node.tag == .ident_expr and !recv_node.main_token.isNone()) {
+            const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, recv_node.main_token);
+            if (std.mem.eql(u8, lexeme, "Option") or std.mem.eql(u8, lexeme, "Result") or
+                self.resolveBuiltinPrimitiveLexeme(lexeme) != null)
+            {
+                return .type_ns;
+            }
+        }
+        return .none;
+    }
+
+    /// Maps an unshadowed primitive type identifier lexeme (`u32`, `f64`, etc.) to its canonical `TypeId`.
+    fn resolveBuiltinPrimitiveLexeme(self: *const HirLowerer, lexeme: []const u8) ?TypeId {
+        if (self.interner.lookup(lexeme)) |name_id| {
+            if (self.active_name_to_local.contains(name_id.asInt()) or
+                self.active_comptime_vals.contains(name_id.asInt()))
+            {
+                return null;
+            }
+        }
+        if (symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.get(lexeme)) |builtin_ty| {
+            if (!builtin_ty.isBuiltinGroup() and builtin_ty != .never_ty and builtin_ty != .unit_ty) {
+                return builtin_ty;
+            }
+        }
+        return null;
+    }
+
+    /// Resolves `recv_id` when it is an unshadowed primitive type identifier (`u32`, `f64`, etc.).
+    fn resolveBuiltinPrimitiveAst(self: *const HirLowerer, recv_id: NodeIndex) ?TypeId {
+        if (recv_id.isNone() or recv_id.asInt() >= self.ast_arena.countNodes()) return null;
+        const recv_node = self.ast_arena.getNode(recv_id);
+        if (recv_node.tag != .ident_expr or recv_node.main_token.isNone()) return null;
+        const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, recv_node.main_token);
+        return self.resolveBuiltinPrimitiveLexeme(lexeme);
+    }
+
+    /// Evaluates built-in associated constants on integer and floating-point primitives (`u32.MAX`, `f64.PI`, etc.).
+    fn evalPrimitiveAssocConst(
+        self: *const HirLowerer,
+        prim_ty: TypeId,
+        member_name: []const u8,
+    ) ?struct { val: ComptimeValue, ty: TypeId } {
+        if (prim_ty.isIntegerPrimitive()) {
+            const int_assoc = type_system.INT_ASSOC_CONST_MAP.get(member_name) orelse return null;
+            const ptr_bits: u32 = @as(u32, self.store.target_layout.ptr_byte_size) * 8;
+            const bits: u32 = switch (prim_ty) {
+                .i8_ty, .u8_ty => 8,
+                .i16_ty, .u16_ty => 16,
+                .i32_ty, .u32_ty => 32,
+                .i64_ty, .u64_ty => 64,
+                .i128_ty, .u128_ty => 128,
+                .isize_ty, .usize_ty => ptr_bits,
+                else => return null,
+            };
+            const is_signed = prim_ty.isSignedIntPrimitive();
+            return switch (int_assoc) {
+                .bits => .{ .val = .{ .int_val = @as(i128, bits) }, .ty = .u32_ty },
+                .min => blk_min: {
+                    if (!is_signed) break :blk_min .{ .val = .{ .int_val = 0 }, .ty = prim_ty };
+                    const min_val: i128 = if (bits >= 128)
+                        std.math.minInt(i128)
+                    else
+                        -(@as(i128, 1) << @intCast(bits - 1));
+                    break :blk_min .{ .val = .{ .int_val = min_val }, .ty = prim_ty };
+                },
+                .max => blk_max: {
+                    if (is_signed) {
+                        const max_signed: i128 = if (bits >= 128)
+                            std.math.maxInt(i128)
+                        else
+                            (@as(i128, 1) << @intCast(bits - 1)) - 1;
+                        break :blk_max .{ .val = .{ .int_val = max_signed }, .ty = prim_ty };
+                    }
+                    const max_unsigned: i128 = if (bits >= 128)
+                        @bitCast(@as(u128, std.math.maxInt(u128)))
+                    else
+                        (@as(i128, 1) << @intCast(bits)) - 1;
+                    break :blk_max .{ .val = .{ .int_val = max_unsigned }, .ty = prim_ty };
+                },
+            };
+        } else if (prim_ty.isFloatPrimitive()) {
+            const float_assoc = type_system.FLOAT_ASSOC_CONST_MAP.get(member_name) orelse return null;
+            return switch (float_assoc) {
+                .bits => .{
+                    .val = .{
+                        .int_val = switch (prim_ty) {
+                            .f32_ty => 32,
+                            .f64_ty => 64,
+                            else => 64,
+                        },
+                    },
+                    .ty = .u32_ty,
+                },
+                .infinity => .{ .val = .{ .float_val = std.math.inf(f64) }, .ty = prim_ty },
+                .neg_infinity => .{ .val = .{ .float_val = -std.math.inf(f64) }, .ty = prim_ty },
+                .nan => .{ .val = .{ .float_val = std.math.nan(f64) }, .ty = prim_ty },
+                .pi => .{
+                    .val = .{
+                        .float_val = switch (prim_ty) {
+                            .f32_ty => @floatCast(@as(f32, std.math.pi)),
+                            else => std.math.pi,
+                        },
+                    },
+                    .ty = prim_ty,
+                },
+                .tau => .{
+                    .val = .{
+                        .float_val = switch (prim_ty) {
+                            .f32_ty => @floatCast(@as(f32, std.math.tau)),
+                            else => std.math.tau,
+                        },
+                    },
+                    .ty = prim_ty,
+                },
+                .epsilon => .{
+                    .val = .{
+                        .float_val = switch (prim_ty) {
+                            .f32_ty => @floatCast(std.math.floatEps(f32)),
+                            else => std.math.floatEps(f64),
+                        },
+                    },
+                    .ty = prim_ty,
+                },
+                .min => .{
+                    .val = .{
+                        .float_val = switch (prim_ty) {
+                            .f32_ty => -@as(f64, @floatCast(std.math.floatMax(f32))),
+                            else => -std.math.floatMax(f64),
+                        },
+                    },
+                    .ty = prim_ty,
+                },
+                .max => .{
+                    .val = .{
+                        .float_val = switch (prim_ty) {
+                            .f32_ty => @floatCast(std.math.floatMax(f32)),
+                            else => std.math.floatMax(f64),
+                        },
+                    },
+                    .ty = prim_ty,
+                },
+            };
+        }
+        return null;
+    }
+
+    /// Resolves a member symbol inside a static module/type AST receiver when `side_tables` are absent.
+    fn lookupStaticMemberSymbolFallback(
+        self: *const HirLowerer,
+        recv_id: NodeIndex,
+        member_name: []const u8,
+    ) SymbolIndex {
+        const member_id = self.interner.lookup(member_name) orelse return .none;
+        const target_base_id = if (!recv_id.isNone() and recv_id.asInt() < self.ast_arena.countNodes() and
+            self.ast_arena.getNode(recv_id).tag == .index_expr and
+            self.ast_arena.getNode(recv_id).lhs.tag == .node)
+            NodeIndex.fromInt(self.ast_arena.getNode(recv_id).lhs.payload)
+        else
+            recv_id;
+        var recv_sym = self.nodeSymbol(target_base_id);
+        if (recv_sym.isNone() and !target_base_id.isNone() and target_base_id.asInt() < self.ast_arena.countNodes()) {
+            const base_node = self.ast_arena.getNode(target_base_id);
+            if (base_node.tag == .ident_expr and !base_node.main_token.isNone()) {
+                const lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, base_node.main_token);
+                if (self.interner.lookup(lex)) |base_name_id| {
+                    switch (self.sym_table.lookupLexical(self.current_scope, base_name_id, NamespaceMask.ALL)) {
+                        .found => |found_idx| recv_sym = found_idx,
+                        else => {},
+                    }
+                }
+            }
+        }
+        if (recv_sym.isNone()) return .none;
+        const owner_scope = self.sym_table.getSymbol(recv_sym).target_scope;
+        if (owner_scope.isNone()) return .none;
+        return self.sym_table.lookupInScopeDirect(owner_scope, member_id, NamespaceMask.ALL);
+    }
+
+    /// Desugars `lhs |> f(a_1, …, a_k)`, `lhs |> mod.f(a_1, …, a_k)`, and `lhs |> recv.m(a_1, …, a_k)` (`DR-13` §2.2 Rule 1 & `MAJ-06`).
     fn lowerPipeExpr(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) !HirIndex {
         const ast_node = self.ast_arena.getNode(expr_id);
         const tok = ast_node.main_token;
@@ -5726,106 +7089,98 @@ const HirLowerer = struct {
         const rhs_id = NodeIndex.fromInt(ast_node.rhs.payload);
         const rhs_node = self.ast_arena.getNode(rhs_id);
 
-        // [1] Method pipeline `lhs |> recv.method(a_1, …, a_k)` -> `method(recv, lhs, a_1, …, a_k)` (`MAJ-06`):
+        // [1] `.method_call` pipeline (`lhs |> recv.method(…)` OR static `lhs |> mod.func(…)` under Unified `.`):
         if (rhs_node.tag == .method_call and rhs_node.lhs.tag == .node) {
             const recv_id = NodeIndex.fromInt(rhs_node.lhs.payload);
             const raw_items = self.getAstExtraSlice(rhs_id, true);
             if (raw_items.len == 0) return self.emitErrorHole(tok, expr_id, target_ty);
             const member_tok = TokenIndex.fromInt(raw_items[0]);
             const member_name = symbol_resolver.extractTokenSlice(self.source, self.tokens, member_tok);
+            const is_static_recv = self.resolveStaticDotTargetAst(recv_id) != .none;
 
-            var method_sym_idx = self.nodeSymbol(rhs_id);
+            var type_arg_nodes: std.ArrayListUnmanaged(NodeIndex) = .empty;
+            defer type_arg_nodes.deinit(self.allocator);
+            var pipe_val_args: std.ArrayListUnmanaged(NodeIndex) = .empty;
+            defer pipe_val_args.deinit(self.allocator);
+            try pipe_val_args.append(self.allocator, lhs_id);
+            for (raw_items[1..]) |raw_item| {
+                const item_id = NodeIndex.fromInt(raw_item);
+                if (item_id.asInt() >= self.ast_arena.countNodes()) continue;
+                if (isTypeAstTag(self.ast_arena.getNode(item_id).tag)) {
+                    try type_arg_nodes.append(self.allocator, item_id);
+                } else {
+                    try pipe_val_args.append(self.allocator, item_id);
+                }
+            }
+
+            const expr_method_sym = self.nodeSymbol(expr_id);
+            var method_sym_idx = if (!expr_method_sym.isNone()) expr_method_sym else self.nodeSymbol(rhs_id);
             if (method_sym_idx.isNone()) {
-                const recv_ty = self.unwrapRefType(self.nodeType(recv_id));
-                if (try self.lookupMethodOnType(recv_ty, member_name)) |found_m| {
-                    method_sym_idx = found_m;
+                if (is_static_recv) {
+                    method_sym_idx = self.lookupStaticMemberSymbolFallback(recv_id, member_name);
+                } else {
+                    const recv_ty = self.unwrapRefType(self.nodeType(recv_id));
+                    if (try self.lookupMethodOnType(recv_ty, member_name)) |found_m| {
+                        method_sym_idx = found_m;
+                    }
                 }
             }
             if (method_sym_idx.isNone()) return self.emitErrorHole(tok, expr_id, target_ty);
 
             const method_sym = self.sym_table.getSymbol(method_sym_idx).*;
             const sig_view = self.pool.getFnSignatureView(method_sym.type_id);
+            const has_self_receiver = !is_static_recv;
 
             var seq_stmts: std.ArrayListUnmanaged(u32) = .empty;
             defer seq_stmts.deinit(self.allocator);
+            var ordered_args: std.ArrayListUnmanaged(HirIndex) = .empty;
+            defer ordered_args.deinit(self.allocator);
 
-            const lhs_param_ty = if (sig_view) |sv|
-                (if (sv.paramCount() > 1) sv.getParamType(1) else .err_ty)
-            else
-                .err_ty;
-            const lhs_mode: ParamMode = if (sig_view) |sv|
-                (if (sv.paramCount() > 1) sv.getParamMode(1) else .let_mode)
-            else
-                .let_mode;
-
-            var piped_hir = try self.lowerExpr(lhs_id, lhs_param_ty);
-            if (!lhs_param_ty.isError()) {
-                piped_hir = try self.adjustReceiverForParam(piped_hir, lhs_param_ty, tok);
-            }
-            if (lhs_mode != .inout_mode and lhs_mode != .set_mode) {
-                const lhs_tmp = try self.allocTempLocal(self.store.getNode(piped_hir).type_id, tok, false);
-                try seq_stmts.append(self.allocator, (try self.emitLocalDeclNode(lhs_tmp, piped_hir, tok)).asInt());
-                piped_hir = try self.emitVarRef(lhs_tmp, tok, .none);
-            }
-
-            var extra_arg_hirs: std.ArrayListUnmanaged(HirIndex) = .empty;
-            defer extra_arg_hirs.deinit(self.allocator);
-            var extra_arg_modes: std.ArrayListUnmanaged(ParamMode) = .empty;
-            defer extra_arg_modes.deinit(self.allocator);
-
-            var param_ord: usize = 2;
-            for (raw_items[1..]) |raw_item| {
-                const item_id = NodeIndex.fromInt(raw_item);
-                if (item_id.asInt() >= self.ast_arena.countNodes()) continue;
-                if (isTypeAstTag(self.ast_arena.getNode(item_id).tag)) continue;
-
-                const p_ty = if (sig_view) |sv|
-                    (if (param_ord < sv.paramCount()) sv.getParamType(param_ord) else .err_ty)
-                else
-                    .err_ty;
-                const p_mode: ParamMode = if (sig_view) |sv|
-                    (if (param_ord < sv.paramCount()) sv.getParamMode(param_ord) else .let_mode)
-                else
-                    .let_mode;
-                var arg_hir = try self.lowerExpr(item_id, p_ty);
-                if (!p_ty.isError()) {
-                    arg_hir = try self.adjustReceiverForParam(arg_hir, p_ty, tok);
-                }
-                if (p_mode != .inout_mode and p_mode != .set_mode) {
-                    const tmp_slot = try self.allocTempLocal(self.store.getNode(arg_hir).type_id, tok, false);
-                    try seq_stmts.append(self.allocator, (try self.emitLocalDeclNode(tmp_slot, arg_hir, tok)).asInt());
-                    arg_hir = try self.emitVarRef(tmp_slot, tok, .none);
-                }
-                try extra_arg_hirs.append(self.allocator, arg_hir);
-                try extra_arg_modes.append(self.allocator, p_mode);
-                param_ord += 1;
-            }
-
-            const raw_recv_hir = try self.lowerExpr(recv_id, .err_ty);
-            const self_param_ty = if (sig_view) |sv|
-                (if (sv.paramCount() > 0) sv.getParamType(0) else self.store.getNode(raw_recv_hir).type_id)
-            else
-                self.store.getNode(raw_recv_hir).type_id;
-            const self_mode: ParamMode = if (sig_view) |sv|
-                (if (sv.paramCount() > 0) sv.getParamMode(0) else .let_mode)
-            else
-                .let_mode;
-            const adjusted_recv = try self.adjustReceiverForParam(raw_recv_hir, self_param_ty, tok);
+            try self.lowerMappedDirectArgs(
+                expr_id,
+                method_sym_idx,
+                method_sym.type_id,
+                has_self_receiver,
+                pipe_val_args.items,
+                tok,
+                &seq_stmts,
+                &ordered_args,
+            );
 
             var wrapped_args: std.ArrayListUnmanaged(u32) = .empty;
             defer wrapped_args.deinit(self.allocator);
-            try wrapped_args.append(
-                self.allocator,
-                (try self.wrapArgProjection(adjusted_recv, self_mode, tok)).asInt(),
-            );
-            try wrapped_args.append(
-                self.allocator,
-                (try self.wrapArgProjection(piped_hir, lhs_mode, tok)).asInt(),
-            );
-            for (extra_arg_hirs.items, 0..) |arg_hir, i| {
+            if (has_self_receiver) {
+                const raw_recv_hir = try self.lowerExpr(recv_id, .err_ty);
+                const self_param_ty = if (sig_view) |sv|
+                    (if (sv.paramCount() > 0) sv.getParamType(0) else self.store.getNode(raw_recv_hir).type_id)
+                else
+                    self.store.getNode(raw_recv_hir).type_id;
+                const self_mode: ParamMode = if (sig_view) |sv|
+                    (if (sv.paramCount() > 0) sv.getParamMode(0) else .let_mode)
+                else
+                    .let_mode;
+                const adjusted_recv = try self.adjustReceiverForParam(raw_recv_hir, self_param_ty, tok);
                 try wrapped_args.append(
                     self.allocator,
-                    (try self.wrapArgProjection(arg_hir, extra_arg_modes.items[i], tok)).asInt(),
+                    (try self.wrapArgProjection(adjusted_recv, self_mode, tok)).asInt(),
+                );
+            }
+            const param_offset: usize = if (has_self_receiver) 1 else 0;
+            for (ordered_args.items, 0..) |arg_hir, i| {
+                const param_idx = param_offset + i;
+                var adj_arg = arg_hir;
+                const param_mode: ParamMode = if (sig_view) |sv|
+                    (if (param_idx < sv.paramCount()) sv.getParamMode(param_idx) else .let_mode)
+                else
+                    .let_mode;
+                if (sig_view) |sv| {
+                    if (param_idx < sv.paramCount()) {
+                        adj_arg = try self.adjustReceiverForParam(adj_arg, sv.getParamType(param_idx), tok);
+                    }
+                }
+                try wrapped_args.append(
+                    self.allocator,
+                    (try self.wrapArgProjection(adj_arg, param_mode, tok)).asInt(),
                 );
             }
 
@@ -5843,13 +7198,19 @@ const HirLowerer = struct {
             else
                 .unit_ty;
             const extra_idx = try self.store.appendLenPrefixedExtra(wrapped_args.items);
+            const is_sub_pipe = self.isCalleeSubscript(callee_hir);
             const call_hir = try self.emitNode(.{
-                .tag = if (self.isCalleeSubscript(callee_hir)) .hir_subscript_call else .hir_call,
+                .tag = if (is_sub_pipe) .hir_subscript_call else .hir_call,
                 .flags = .{ .category = .rvalue, .is_synthetic = true, .is_unsafe = self.is_in_unsafe },
                 .type_id = ret_ty,
                 .origin_token = tok,
                 .data = .{ .lhs = callee_hir.asInt(), .rhs = extra_idx },
             }, expr_id);
+            if (!is_sub_pipe) {
+                const inst_ast = if (self.side_tables != null and
+                    self.side_tables.?.getCallInstantiation(expr_id) != null) expr_id else rhs_id;
+                try self.recordCallTypeArgs(inst_ast, call_hir, type_arg_nodes.items);
+            }
             if (seq_stmts.items.len > 0) {
                 return self.emitSyntheticBlock(seq_stmts.items, call_hir, ret_ty, tok);
             }
@@ -5864,7 +7225,35 @@ const HirLowerer = struct {
             raw_call_items = self.getAstExtraSlice(rhs_id, true);
         }
 
-        const rhs_sym_idx = self.nodeSymbol(rhs_id);
+        var pipe_type_args: std.ArrayListUnmanaged(NodeIndex) = .empty;
+        defer pipe_type_args.deinit(self.allocator);
+        var pipe_val_args: std.ArrayListUnmanaged(NodeIndex) = .empty;
+        defer pipe_val_args.deinit(self.allocator);
+        try pipe_val_args.append(self.allocator, lhs_id);
+        for (raw_call_items) |raw_item| {
+            const item_id = NodeIndex.fromInt(raw_item);
+            if (item_id.asInt() >= self.ast_arena.countNodes()) continue;
+            if (isTypeAstTag(self.ast_arena.getNode(item_id).tag)) {
+                try pipe_type_args.append(self.allocator, item_id);
+            } else {
+                try pipe_val_args.append(self.allocator, item_id);
+            }
+        }
+        if (self.ast_arena.getNode(callee_ast_id).tag == .generic_call and
+            self.ast_arena.getNode(callee_ast_id).lhs.tag == .node)
+        {
+            const inner_gen_id = callee_ast_id;
+            callee_ast_id = NodeIndex.fromInt(self.ast_arena.getNode(inner_gen_id).lhs.payload);
+            for (self.getAstExtraSlice(inner_gen_id, true)) |raw_item| {
+                const item_id = NodeIndex.fromInt(raw_item);
+                if (item_id.asInt() < self.ast_arena.countNodes()) {
+                    try pipe_type_args.append(self.allocator, item_id);
+                }
+            }
+        }
+
+        const expr_sym_idx = self.nodeSymbol(expr_id);
+        const rhs_sym_idx = if (!expr_sym_idx.isNone()) expr_sym_idx else self.nodeSymbol(rhs_id);
         const resolved_sym_idx = if (!rhs_sym_idx.isNone()) rhs_sym_idx else self.nodeSymbol(callee_ast_id);
         const is_direct_sym = !resolved_sym_idx.isNone() and
             self.sym_table.getSymbol(resolved_sym_idx).kind == .fn_sym;
@@ -5876,47 +7265,38 @@ const HirLowerer = struct {
 
         var seq_stmts: std.ArrayListUnmanaged(u32) = .empty;
         defer seq_stmts.deinit(self.allocator);
-
-        const first_ty: TypeId = if (sig_view) |sv|
-            (if (sv.paramCount() > 0) sv.getParamType(0) else .err_ty)
-        else
-            .err_ty;
-        const first_mode_pre: ParamMode = if (sig_view) |sv|
-            (if (sv.paramCount() > 0) sv.getParamMode(0) else .let_mode)
-        else
-            .let_mode;
-
-        var lhs_hir = try self.lowerExpr(lhs_id, first_ty);
-        if (!is_direct_sym and first_mode_pre != .inout_mode and first_mode_pre != .set_mode) {
-            const lhs_tmp = try self.allocTempLocal(self.store.getNode(lhs_hir).type_id, tok, false);
-            try seq_stmts.append(self.allocator, (try self.emitLocalDeclNode(lhs_tmp, lhs_hir, tok)).asInt());
-            lhs_hir = try self.emitVarRef(lhs_tmp, tok, .none);
-        }
-
         var lowered_call_args: std.ArrayListUnmanaged(HirIndex) = .empty;
         defer lowered_call_args.deinit(self.allocator);
-        var arg_ordinal: usize = 1;
-        for (raw_call_items) |raw_item| {
-            const item_id = NodeIndex.fromInt(raw_item);
-            if (item_id.asInt() >= self.ast_arena.countNodes()) continue;
-            if (isTypeAstTag(self.ast_arena.getNode(item_id).tag)) continue;
 
-            const param_ty: TypeId = if (sig_view) |sv|
-                (if (arg_ordinal < sv.paramCount()) sv.getParamType(arg_ordinal) else .err_ty)
-            else
-                .err_ty;
-            const param_mode_pre: ParamMode = if (sig_view) |sv|
-                (if (arg_ordinal < sv.paramCount()) sv.getParamMode(arg_ordinal) else .let_mode)
-            else
-                .let_mode;
-            var arg_hir = try self.lowerExpr(item_id, param_ty);
-            if (!is_direct_sym and param_mode_pre != .inout_mode and param_mode_pre != .set_mode) {
-                const tmp_slot = try self.allocTempLocal(self.store.getNode(arg_hir).type_id, tok, false);
-                try seq_stmts.append(self.allocator, (try self.emitLocalDeclNode(tmp_slot, arg_hir, tok)).asInt());
-                arg_hir = try self.emitVarRef(tmp_slot, tok, .none);
+        if (is_direct_sym) {
+            try self.lowerMappedDirectArgs(
+                expr_id,
+                resolved_sym_idx,
+                pre_callee_ty,
+                false,
+                pipe_val_args.items,
+                tok,
+                &seq_stmts,
+                &lowered_call_args,
+            );
+        } else {
+            for (pipe_val_args.items, 0..) |val_item_id, i| {
+                const param_ty: TypeId = if (sig_view) |sv|
+                    (if (i < sv.paramCount()) sv.getParamType(i) else .err_ty)
+                else
+                    .err_ty;
+                const param_mode_pre: ParamMode = if (sig_view) |sv|
+                    (if (i < sv.paramCount()) sv.getParamMode(i) else .let_mode)
+                else
+                    .let_mode;
+                var arg_hir = try self.lowerExpr(self.unwrapCallArgAst(val_item_id), param_ty);
+                if (param_mode_pre != .inout_mode and param_mode_pre != .set_mode) {
+                    const tmp_slot = try self.allocTempLocal(self.store.getNode(arg_hir).type_id, tok, false);
+                    try seq_stmts.append(self.allocator, (try self.emitLocalDeclNode(tmp_slot, arg_hir, tok)).asInt());
+                    arg_hir = try self.emitVarRef(tmp_slot, tok, .none);
+                }
+                try lowered_call_args.append(self.allocator, arg_hir);
             }
-            try lowered_call_args.append(self.allocator, arg_hir);
-            arg_ordinal += 1;
         }
 
         const callee_hir = if (is_direct_sym) blk: {
@@ -5937,30 +7317,18 @@ const HirLowerer = struct {
         var wrapped_args: std.ArrayListUnmanaged(u32) = .empty;
         defer wrapped_args.deinit(self.allocator);
 
-        const first_mode: ParamMode = if (sig_view) |sv|
-            (if (sv.paramCount() > 0) sv.getParamMode(0) else .let_mode)
-        else
-            .let_mode;
-        if (sig_view) |sv| {
-            if (sv.paramCount() > 0) {
-                lhs_hir = try self.adjustReceiverForParam(lhs_hir, sv.getParamType(0), tok);
-            }
-        }
-        try wrapped_args.append(self.allocator, (try self.wrapArgProjection(lhs_hir, first_mode, tok)).asInt());
-
         for (lowered_call_args.items, 0..) |raw_arg_hir, i| {
-            const p_idx = i + 1;
             var adj_arg = raw_arg_hir;
-            const p_mode: ParamMode = if (sig_view) |sv|
-                (if (p_idx < sv.paramCount()) sv.getParamMode(p_idx) else .let_mode)
+            const param_mode: ParamMode = if (sig_view) |sv|
+                (if (i < sv.paramCount()) sv.getParamMode(i) else .let_mode)
             else
                 .let_mode;
             if (sig_view) |sv| {
-                if (p_idx < sv.paramCount()) {
-                    adj_arg = try self.adjustReceiverForParam(adj_arg, sv.getParamType(p_idx), tok);
+                if (i < sv.paramCount()) {
+                    adj_arg = try self.adjustReceiverForParam(adj_arg, sv.getParamType(i), tok);
                 }
             }
-            try wrapped_args.append(self.allocator, (try self.wrapArgProjection(adj_arg, p_mode, tok)).asInt());
+            try wrapped_args.append(self.allocator, (try self.wrapArgProjection(adj_arg, param_mode, tok)).asInt());
         }
 
         const ret_ty = if (!target_ty.isError())
@@ -5971,13 +7339,19 @@ const HirLowerer = struct {
             .unit_ty;
 
         const extra_idx = try self.store.appendLenPrefixedExtra(wrapped_args.items);
+        const is_sub_call = self.isCalleeSubscript(callee_hir);
         const call_hir = try self.emitNode(.{
-            .tag = if (self.isCalleeSubscript(callee_hir)) .hir_subscript_call else .hir_call,
+            .tag = if (is_sub_call) .hir_subscript_call else .hir_call,
             .flags = .{ .category = .rvalue, .is_synthetic = true, .is_unsafe = self.is_in_unsafe },
             .type_id = ret_ty,
             .origin_token = tok,
             .data = .{ .lhs = callee_hir.asInt(), .rhs = extra_idx },
         }, expr_id);
+        if (!is_sub_call) {
+            const inst_ast = if (self.side_tables != null and
+                self.side_tables.?.getCallInstantiation(expr_id) != null) expr_id else rhs_id;
+            try self.recordCallTypeArgs(inst_ast, call_hir, pipe_type_args.items);
+        }
         if (seq_stmts.items.len > 0) {
             return self.emitSyntheticBlock(seq_stmts.items, call_hir, ret_ty, tok);
         }
@@ -6248,7 +7622,7 @@ const HirLowerer = struct {
         return self.emitErrorHole(tok, expr_id, target_ty);
     }
 
-    /// Lowers infix binary operators, `expr catch |err| fallback`, and `expr is Pattern`.
+    /// Lowers infix binary operators, `expr orelse fallback`, `expr catch |err| fallback`, and `expr is Pattern`.
     fn lowerBinaryOrCatchExpr(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) !HirIndex {
         const ast_node = self.ast_arena.getNode(expr_id);
         const tok = ast_node.main_token;
@@ -6256,6 +7630,9 @@ const HirLowerer = struct {
 
         if (op_kind == .kw_catch) {
             return self.lowerCatchExpr(expr_id, target_ty);
+        }
+        if (op_kind == .kw_orelse) {
+            return self.lowerOrelseExpr(expr_id, target_ty);
         }
         if (ast_node.lhs.tag != .node or ast_node.rhs.tag != .node) {
             return self.emitErrorHole(tok, expr_id, target_ty);
@@ -6299,7 +7676,7 @@ const HirLowerer = struct {
             }, expr_id);
         }
 
-        // [2] Resolved operator trait call (`side_tables` or nominal `Eq::eq` for `==` / `!=`, `CRIT-13`):
+        // [2] Resolved operator trait call (`side_tables` or nominal `Eq.eq` for `==` / `!=`, `CRIT-13`):
         const op_sym_idx = self.nodeSymbol(expr_id);
         if (!op_sym_idx.isNone() and self.sym_table.getSymbol(op_sym_idx).kind == .fn_sym) {
             const lhs_hir = try self.lowerExpr(lhs_id, .err_ty);
@@ -6390,14 +7767,63 @@ const HirLowerer = struct {
             .eq, .ne, .lt, .le, .gt, .ge, .logical_and, .logical_or => .bool_ty,
             else => if (!target_ty.isError()) target_ty else lhs_ty,
         };
+        const is_dollar_sub = bin_op == .sub and self.ast_arena.getNode(lhs_id).tag == .dollar_expr;
         const pair = [2]u32{ lhs_hir.asInt(), rhs_hir.asInt() };
         const extra_idx = try self.store.appendExtraSlice(&pair);
         return self.emitNode(.{
             .tag = .hir_binary_op,
-            .flags = .{ .category = .rvalue },
+            .flags = .{
+                .category = .rvalue,
+                .is_unsafe = self.is_in_unsafe,
+                .is_dollar_sub = is_dollar_sub,
+            },
             .type_id = self.concreteType(res_ty),
             .origin_token = tok,
             .data = .{ .lhs = extra_idx, .rhs = @backingInt(bin_op) },
+        }, expr_id);
+    }
+
+    /// Lowers short-circuiting `opt_expr orelse fallback_expr` into `hir_orelse` (`SE-03`).
+    fn lowerOrelseExpr(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) !HirIndex {
+        const ast_node = self.ast_arena.getNode(expr_id);
+        const tok = ast_node.main_token;
+        const lhs_id = if (ast_node.lhs.tag == .node) NodeIndex.fromInt(ast_node.lhs.payload) else .none;
+        const rhs_id = if (ast_node.rhs.tag == .node) NodeIndex.fromInt(ast_node.rhs.payload) else .none;
+
+        var opt_hir = try self.lowerExpr(lhs_id, .err_ty);
+        const raw_opt_ty = self.store.getNode(opt_hir).type_id;
+        const opt_ty = self.pool.unwrapUnderlyingType(raw_opt_ty);
+        if (opt_ty != raw_opt_ty) {
+            opt_hir = try self.emitNode(.{
+                .tag = .hir_cast,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = opt_ty,
+                .origin_token = tok,
+                .data = .{ .lhs = opt_hir.asInt(), .rhs = @backingInt(HirCastKind.distinct_unwrap) },
+            }, .none);
+        }
+        const opt_ty_node = self.pool.getNode(opt_ty);
+        const payload_ty = if (opt_ty_node.tag == .optional_ty)
+            self.concreteType(TypeId.fromInt(opt_ty_node.lhs))
+        else
+            .unit_ty;
+        const res_ty = self.concreteType(if (!target_ty.isError()) target_ty else payload_ty);
+
+        if (self.is_in_comptime_for) self.comptime_runtime_cond_depth += 1;
+        defer if (self.is_in_comptime_for) {
+            self.comptime_runtime_cond_depth -= 1;
+        };
+        const fallback_hir = try self.lowerExpr(rhs_id, res_ty);
+
+        return self.emitNode(.{
+            .tag = .hir_orelse,
+            .flags = .{
+                .category = if (res_ty == .never_ty) .diverging else .rvalue,
+                .is_unsafe = self.is_in_unsafe,
+            },
+            .type_id = res_ty,
+            .origin_token = tok,
+            .data = .{ .lhs = opt_hir.asInt(), .rhs = fallback_hir.asInt() },
         }, expr_id);
     }
 
@@ -6527,7 +7953,7 @@ const HirLowerer = struct {
         }, expr_id);
     }
 
-    /// Lowers `.field_access` (`s.field`, `tup.0`, `.len`, `#soa` `items[i].x`, and `bit_field` `bf.member`).
+    /// Lowers `.field_access` (`s.field`, `tup.0`, `.len`, `#soa` `items[i].x`, `bit_field`, `context.slot`, and Unified `.`).
     fn lowerFieldAccess(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) !HirIndex {
         const ast_node = self.ast_arena.getNode(expr_id);
         const tok = ast_node.main_token;
@@ -6537,14 +7963,90 @@ const HirLowerer = struct {
         const recv_id = NodeIndex.fromInt(ast_node.lhs.payload);
         const member_tok = TokenIndex.fromInt(ast_node.rhs.payload);
         const member_lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, member_tok);
+        const recv_ast = self.ast_arena.getNode(recv_id);
 
-        // [1] Fold compile-time `TypeInfo` / `FieldInfo` / `VariantInfo` member access directly:
+        // [0] Implicit `context.<slot>` read (`SE-08`):
+        if (recv_ast.tag == .context_expr) {
+            if (type_system.ContextFieldLayout.fromFieldName(member_lexeme)) |slot_layout| {
+                const recorded_ty = self.concreteType(self.nodeType(expr_id));
+                const slot_ty = if (!recorded_ty.isError())
+                    recorded_ty
+                else if (!target_ty.isError())
+                    self.concreteType(target_ty)
+                else
+                    try self.resolveContextSlotType(slot_layout);
+                return self.emitNode(.{
+                    .tag = .hir_ctx_get,
+                    .flags = .{ .category = .rvalue, .is_unsafe = self.is_in_unsafe },
+                    .type_id = slot_ty,
+                    .origin_token = tok,
+                    .data = .{ .lhs = slot_layout.slot_ordinal, .rhs = 0 },
+                }, expr_id);
+            }
+            return self.emitErrorHole(tok, expr_id, target_ty);
+        }
+
+        // [1] Fold compile-time `TypeInfo` / `FieldInfo` / `VariantInfo` / associated constants directly:
         if (try self.tryEvalAstComptime(expr_id, target_ty)) |folded_meta| {
             const res_ty = if (!target_ty.isError()) target_ty else self.inferComptimeValType(folded_meta);
             return self.emitConstVal(folded_meta, res_ty, tok, expr_id, true);
         }
 
-        const recv_ast = self.ast_arena.getNode(recv_id);
+        // [1b] Static Unified `.` (`u32.MAX`, `Option.None`, `Enum.UnitVariant`, `mod.CONST`, `mod.fn`):
+        if (self.resolveBuiltinPrimitiveAst(recv_id)) |prim_ty| {
+            if (self.evalPrimitiveAssocConst(prim_ty, member_lexeme)) |assoc| {
+                const out_ty = if (!target_ty.isError()) target_ty else assoc.ty;
+                return self.emitConstVal(assoc.val, out_ty, tok, expr_id, true);
+            }
+        }
+        const static_kind = self.resolveStaticDotTargetAst(recv_id);
+        var static_sym_idx = self.nodeSymbol(expr_id);
+        if (static_sym_idx.isNone() and static_kind != .none) {
+            static_sym_idx = self.lookupStaticMemberSymbolFallback(recv_id, member_lexeme);
+        }
+        if (!static_sym_idx.isNone()) {
+            const sym = self.sym_table.getSymbol(static_sym_idx).*;
+            if (sym.kind == .const_sym) {
+                if (try self.evalConstSymbol(static_sym_idx)) |folded_const| {
+                    const const_ty = if (!target_ty.isError()) target_ty else sym.type_id;
+                    return self.emitConstVal(folded_const, const_ty, tok, expr_id, true);
+                }
+                return self.emitNode(.{
+                    .tag = .hir_global_ref,
+                    .flags = .{ .category = .rvalue },
+                    .type_id = if (!target_ty.isError()) target_ty else self.concreteType(sym.type_id),
+                    .origin_token = tok,
+                    .data = .{ .lhs = sym.def_id.asInt(), .rhs = static_sym_idx.asInt() },
+                }, expr_id);
+            }
+            if (sym.kind == .enum_variant_sym and sym.type_id == .unit_ty) {
+                const extra_idx = try self.store.appendLenPrefixedExtra(&.{});
+                const encoded_lhs: u32 = @as(u32, @backingInt(HirConstructKind.enum_variant)) |
+                    (@as(u32, sym.member_ordinal) << 8);
+                return self.emitNode(.{
+                    .tag = .hir_construct,
+                    .flags = .{ .category = .rvalue },
+                    .type_id = if (!target_ty.isError()) target_ty else sym.type_id,
+                    .origin_token = tok,
+                    .data = .{ .lhs = encoded_lhs, .rhs = extra_idx },
+                }, expr_id);
+            }
+            if (sym.kind == .fn_sym) {
+                return self.emitNode(.{
+                    .tag = .hir_global_ref,
+                    .flags = .{ .category = .rvalue },
+                    .type_id = if (!target_ty.isError()) target_ty else self.concreteType(sym.type_id),
+                    .origin_token = tok,
+                    .data = .{ .lhs = sym.def_id.asInt(), .rhs = static_sym_idx.asInt() },
+                }, expr_id);
+            }
+        }
+        if (static_kind == .type_ns and std.mem.eql(u8, member_lexeme, "None")) {
+            const unwrapped_target = self.pool.unwrapUnderlyingType(target_ty);
+            if (!unwrapped_target.isError() and self.pool.getTag(unwrapped_target) == .optional_ty) {
+                return self.emitOptionalNoneConstruct(target_ty, tok);
+            }
+        }
 
         // [2] Virtual zero-temporary `soa_zip` projection (`v.0` or `v.pos`, `DR-13` §2.2 Rule 5):
         if (recv_ast.tag == .ident_expr) {
@@ -6661,13 +8163,13 @@ const HirLowerer = struct {
         const deref_base = try self.autoDerefPlace(raw_recv_hir, tok);
         const base_cat = self.store.getNode(deref_base).flags.category;
 
-        // `#soa [S]` column slice projection `items.field -> [FieldTy]`:
+        // `#soa [S]` column slice projection `items.field -> [FieldTy]` (`is_soa = false`):
         if (recv_node.tag == .soa_slice_ty or recv_node.tag == .soa_array_ty) {
             const elem_ty = TypeId.fromInt(recv_node.lhs);
             if (self.findStructFieldInfo(elem_ty, member_name)) |f_info| {
                 const elem_subst = type_system.NominalTypeSubst.init(self.pool, self.sym_table, elem_ty);
                 const subst_f_ty = try elem_subst.applyMut(self.allocator, self.pool, f_info.field_ty);
-                const col_slice_ty = try self.pool.internSlice(subst_f_ty, base_cat == .place_mut);
+                const col_slice_ty = try self.pool.internSlice(subst_f_ty, false);
                 return self.emitNode(.{
                     .tag = .hir_field_proj,
                     .flags = .{ .category = .rvalue },
@@ -6713,6 +8215,148 @@ const HirLowerer = struct {
         return self.emitErrorHole(tok, ast_origin, fallback_ty);
     }
 
+    /// Returns `true` if `root_id` references `$` (`AstTag.dollar_expr`) bound to the enclosing index receiver (`SE-04`).
+    fn hasDollarAst(self: *const HirLowerer, root_id: NodeIndex) bool {
+        return self.hasDollarAstDepth(root_id, 0);
+    }
+
+    /// Bounded recursive helper for `hasDollarAst` stopping at nested `.index_expr` RHS and closures.
+    fn hasDollarAstDepth(self: *const HirLowerer, node_id: NodeIndex, depth: u32) bool {
+        if (depth > 128 or node_id.isNone() or node_id.asInt() >= self.ast_arena.countNodes()) return false;
+        const node = self.ast_arena.getNode(node_id);
+        switch (node.tag) {
+            .dollar_expr => return true,
+            .closure_expr, .fn_decl => return false,
+            .index_expr => {
+                // Only `lhs` (inner base) sees the outer `$`; `rhs` rebinds `$` to the inner receiver:
+                if (node.lhs.tag == .node) {
+                    return self.hasDollarAstDepth(NodeIndex.fromInt(node.lhs.payload), depth + 1);
+                }
+                return false;
+            },
+            else => {},
+        }
+        if (node.lhs.tag == .node) {
+            if (self.hasDollarAstDepth(NodeIndex.fromInt(node.lhs.payload), depth + 1)) return true;
+        } else if (node.lhs.tag == .extra) {
+            for (self.getAstExtraSlice(node_id, false)) |raw_child| {
+                if (self.hasDollarAstDepth(NodeIndex.fromInt(raw_child), depth + 1)) return true;
+            }
+        }
+        if (node.rhs.tag == .node) {
+            if (self.hasDollarAstDepth(NodeIndex.fromInt(node.rhs.payload), depth + 1)) return true;
+        } else if (node.rhs.tag == .extra) {
+            for (self.getAstExtraSlice(node_id, true)) |raw_child| {
+                if (self.hasDollarAstDepth(NodeIndex.fromInt(raw_child), depth + 1)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Evaluates an indexing receiver once and binds its length (`usize`) into a temp local for `$` (`SE-04`).
+    fn bindIndexReceiverForDollar(
+        self: *HirLowerer,
+        base_ast_id: NodeIndex,
+        is_mut_access_needed: bool,
+        tok: TokenIndex,
+        out_stmts: *std.ArrayListUnmanaged(u32),
+    ) !struct { base_hir: HirIndex, len_slot: u32 } {
+        const raw_base_hir = try self.lowerPlaceWithMutCtx(base_ast_id, .err_ty, is_mut_access_needed);
+        const raw_node = self.store.getNode(raw_base_hir);
+        const raw_ty = raw_node.type_id;
+
+        var reusable_base: HirIndex = raw_base_hir;
+        var seq_len_ty: TypeId = raw_ty;
+        if (raw_node.tag == .hir_var_ref) {
+            reusable_base = raw_base_hir;
+        } else {
+            const deref_base = try self.autoDerefPlace(raw_base_hir, tok);
+            const deref_node = self.store.getNode(deref_base);
+            if (deref_node.flags.category == .place_mut or deref_node.flags.category == .place_imm) {
+                const is_mut = is_mut_access_needed and deref_node.flags.category == .place_mut;
+                const deref_ty = deref_node.type_id;
+                const ptr_ty = try self.pool.internRef(deref_ty, is_mut);
+                const addr_hir = try self.emitSyntheticAddrOf(deref_base, ptr_ty, is_mut, tok);
+                const ptr_slot = try self.allocTempLocal(ptr_ty, tok, false);
+                try out_stmts.append(self.allocator, (try self.emitLocalDeclNode(ptr_slot, addr_hir, tok)).asInt());
+                reusable_base = try self.emitNode(.{
+                    .tag = .hir_unary_op,
+                    .flags = .{ .category = if (is_mut) .place_mut else .place_imm, .is_synthetic = true },
+                    .type_id = deref_ty,
+                    .origin_token = tok,
+                    .data = .{
+                        .lhs = @backingInt(HirUnaryOp.deref),
+                        .rhs = (try self.emitVarRef(ptr_slot, tok, .none)).asInt(),
+                    },
+                }, .none);
+                seq_len_ty = deref_ty;
+            } else {
+                const val_slot = try self.allocTempLocal(raw_ty, tok, false);
+                try out_stmts.append(
+                    self.allocator,
+                    (try self.emitLocalDeclNode(val_slot, raw_base_hir, tok)).asInt(),
+                );
+                reusable_base = try self.emitVarRef(val_slot, tok, .none);
+            }
+        }
+
+        // Re-emit a fresh handle for `.len` computation so `reusable_base` is not aliased in the HIR tree:
+        const len_base_copy = blk_copy: {
+            const reusable_node = self.store.getNode(reusable_base);
+            if (reusable_node.tag == .hir_var_ref) {
+                break :blk_copy try self.emitVarRef(reusable_node.data.lhs, tok, .none);
+            }
+            const ptr_var = self.store.getNode(HirIndex.fromInt(reusable_node.data.rhs));
+            const ptr_ref = try self.emitVarRef(ptr_var.data.lhs, tok, .none);
+            break :blk_copy try self.emitNode(.{
+                .tag = .hir_unary_op,
+                .flags = reusable_node.flags,
+                .type_id = reusable_node.type_id,
+                .origin_token = tok,
+                .data = .{ .lhs = @backingInt(HirUnaryOp.deref), .rhs = ptr_ref.asInt() },
+            }, .none);
+        };
+
+        const unwrapped_ty = self.unwrapRefType(seq_len_ty);
+        const unwrapped_tag = self.pool.getTag(unwrapped_ty);
+        const len_hir: HirIndex = if (unwrapped_tag == .slice_ty or unwrapped_tag == .array_ty or
+            unwrapped_tag == .soa_slice_ty or unwrapped_tag == .soa_array_ty or unwrapped_ty == .str_ty)
+            try self.emitSequenceLen(len_base_copy, seq_len_ty, tok)
+        else if (try self.lookupMethodOnType(unwrapped_ty, "len")) |len_sym_idx| blk_m: {
+            const len_sym = self.sym_table.getSymbol(len_sym_idx).*;
+            const len_sig = self.pool.getFnSignatureView(len_sym.type_id);
+            const self_ty = if (len_sig) |sv|
+                (if (sv.paramCount() > 0) sv.getParamType(0) else seq_len_ty)
+            else
+                seq_len_ty;
+            const self_mode = if (len_sig) |sv|
+                (if (sv.paramCount() > 0) sv.getParamMode(0) else .let_mode)
+            else
+                .let_mode;
+            const adj_recv = try self.adjustReceiverForParam(len_base_copy, self_ty, tok);
+            const proj_recv = try self.wrapArgProjection(adj_recv, self_mode, tok);
+            const callee_hir = try self.emitNode(.{
+                .tag = .hir_global_ref,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = len_sym.type_id,
+                .origin_token = tok,
+                .data = .{ .lhs = len_sym.def_id.asInt(), .rhs = len_sym_idx.asInt() },
+            }, .none);
+            const extra_idx = try self.store.appendLenPrefixedExtra(&[1]u32{proj_recv.asInt()});
+            break :blk_m try self.emitNode(.{
+                .tag = .hir_call,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = .usize_ty,
+                .origin_token = tok,
+                .data = .{ .lhs = callee_hir.asInt(), .rhs = extra_idx },
+            }, .none);
+        } else try self.emitConstVal(.{ .int_val = 0 }, .usize_ty, tok, .none, true);
+
+        const len_slot = try self.allocTempLocal(.usize_ty, tok, false);
+        try out_stmts.append(self.allocator, (try self.emitLocalDeclNode(len_slot, len_hir, tok)).asInt());
+        return .{ .base_hir = reusable_base, .len_slot = len_slot };
+    }
+
     /// Emits `hir_soa_field_ptr` shared by both `items[i].field` and `items.field[i]` (`DR-13` §2.2 Rule 6 & `MAJ-03`).
     fn emitSoaElementFieldPtr(
         self: *HirLowerer,
@@ -6724,12 +8368,31 @@ const HirLowerer = struct {
         tok: TokenIndex,
         ast_origin: NodeIndex,
     ) !HirIndex {
-        const idx_hir = try self.lowerExpr(idx_ast, .usize_ty);
-        const idx_slot = try self.allocTempLocal(self.store.getNode(idx_hir).type_id, tok, false);
-        const idx_decl = try self.emitLocalDeclNode(idx_slot, idx_hir, tok);
+        const is_mut_access_needed = self.is_mut_lvalue_ctx;
+        const has_dollar = self.hasDollarAst(idx_ast);
+        var seq_stmts: std.ArrayListUnmanaged(u32) = .empty;
+        defer seq_stmts.deinit(self.allocator);
 
-        const raw_base_hir = try self.lowerExpr(soa_base_ast, .err_ty);
-        const deref_base = try self.autoDerefPlace(raw_base_hir, tok);
+        var deref_base: HirIndex = .none;
+        var idx_slot: u32 = 0;
+        if (has_dollar) {
+            const bound = try self.bindIndexReceiverForDollar(soa_base_ast, is_mut_access_needed, tok, &seq_stmts);
+            deref_base = try self.autoDerefPlace(bound.base_hir, tok);
+            try self.dollar_len_stack.append(self.allocator, bound.len_slot);
+            const idx_hir = blk_idx: {
+                defer _ = self.dollar_len_stack.pop();
+                break :blk_idx try self.lowerPlaceWithMutCtx(idx_ast, .usize_ty, false);
+            };
+            idx_slot = try self.allocTempLocal(self.store.getNode(idx_hir).type_id, tok, false);
+            try seq_stmts.append(self.allocator, (try self.emitLocalDeclNode(idx_slot, idx_hir, tok)).asInt());
+        } else {
+            const idx_hir = try self.lowerPlaceWithMutCtx(idx_ast, .usize_ty, false);
+            idx_slot = try self.allocTempLocal(self.store.getNode(idx_hir).type_id, tok, false);
+            try seq_stmts.append(self.allocator, (try self.emitLocalDeclNode(idx_slot, idx_hir, tok)).asInt());
+            const raw_base_hir = try self.lowerPlaceWithMutCtx(soa_base_ast, .err_ty, is_mut_access_needed);
+            deref_base = try self.autoDerefPlace(raw_base_hir, tok);
+        }
+
         const elem_struct_ty = TypeId.fromInt(self.pool.getNode(unwrapped_soa_ty).lhs);
         const f_info = self.findStructFieldInfo(elem_struct_ty, field_name) orelse
             return self.emitErrorHole(tok, ast_origin, target_ty);
@@ -6750,11 +8413,15 @@ const HirLowerer = struct {
             .origin_token = tok,
             .data = .{ .lhs = deref_base.asInt(), .rhs = extra_idx },
         }, ast_origin);
-        return self.emitSyntheticBlock(&[1]u32{idx_decl.asInt()}, soa_ptr, field_ty, tok);
+        return self.emitSyntheticBlock(seq_stmts.items, soa_ptr, field_ty, tok);
     }
 
-    /// Lowers `base[index]`, rewriting `#soa` `items.field[i]` to `hir_soa_field_ptr` and `subscript`s to `hir_subscript_call`.
+    /// Lowers `base[index]` and `base[start..end]`, supporting `$` length sugar, `#soa`, and `subscript`s (`SE-04`).
     fn lowerIndexExpr(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) !HirIndex {
+        const outer_mut_ctx = self.is_mut_lvalue_ctx;
+        self.is_mut_lvalue_ctx = false;
+        defer self.is_mut_lvalue_ctx = outer_mut_ctx;
+
         const ast_node = self.ast_arena.getNode(expr_id);
         const tok = ast_node.main_token;
         if (ast_node.lhs.tag != .node or ast_node.rhs.tag != .node) {
@@ -6764,6 +8431,119 @@ const HirLowerer = struct {
         const idx_ast_id = NodeIndex.fromInt(ast_node.rhs.payload);
         const base_ast = self.ast_arena.getNode(base_ast_id);
 
+        // [0] Subslice range indexing `base[start..end]`, `base[..end]`, `base[start..]`, `base[..]` (`SE-04`):
+        if (self.extractRangeAstInfo(idx_ast_id)) |range_info| {
+            var seq_stmts: std.ArrayListUnmanaged(u32) = .empty;
+            defer seq_stmts.deinit(self.allocator);
+
+            const is_mut_slice_needed = outer_mut_ctx or
+                (!target_ty.isError() and self.pool.getTag(self.concreteType(target_ty)) == .mut_ref_ty);
+            const has_dollar = self.hasDollarAst(range_info.start_id) or
+                self.hasDollarAst(range_info.end_id);
+            var deref_base: HirIndex = .none;
+            var start_hir: HirIndex = .none;
+            var end_hir: HirIndex = .none;
+            if (has_dollar) {
+                const bound = try self.bindIndexReceiverForDollar(base_ast_id, is_mut_slice_needed, tok, &seq_stmts);
+                deref_base = try self.autoDerefPlace(bound.base_hir, tok);
+                try self.dollar_len_stack.append(self.allocator, bound.len_slot);
+                defer _ = self.dollar_len_stack.pop();
+                if (!range_info.start_id.isNone()) {
+                    start_hir = try self.lowerExpr(range_info.start_id, .usize_ty);
+                }
+                if (!range_info.end_id.isNone()) {
+                    end_hir = try self.lowerExpr(range_info.end_id, .usize_ty);
+                }
+            } else {
+                const raw_base_hir = try self.lowerPlaceWithMutCtx(base_ast_id, .err_ty, is_mut_slice_needed);
+                deref_base = try self.autoDerefPlace(raw_base_hir, tok);
+                if (!range_info.start_id.isNone()) {
+                    start_hir = try self.lowerExpr(range_info.start_id, .usize_ty);
+                }
+                if (!range_info.end_id.isNone()) {
+                    end_hir = try self.lowerExpr(range_info.end_id, .usize_ty);
+                }
+            }
+
+            var seq_base = deref_base;
+            var base_node = self.store.getNode(seq_base);
+            var base_ty_node = self.pool.getNode(base_node.type_id);
+            const is_mut_seq = base_node.flags.category == .place_mut;
+            if (base_ty_node.tag == .struct_ty) {
+                const method_name = if (try self.lookupMethodOnType(base_node.type_id, "as_str") != null)
+                    "as_str"
+                else if (is_mut_seq and try self.lookupMethodOnType(base_node.type_id, "as_mut_slice") != null)
+                    "as_mut_slice"
+                else
+                    "as_slice";
+                if (try self.lookupMethodOnType(base_node.type_id, method_name)) |view_sym_idx| {
+                    const view_sym = self.sym_table.getSymbol(view_sym_idx).*;
+                    const view_sig = self.pool.getFnSignatureView(view_sym.type_id);
+                    const self_ty = if (view_sig) |sv|
+                        (if (sv.paramCount() > 0) sv.getParamType(0) else base_node.type_id)
+                    else
+                        base_node.type_id;
+                    const self_mode = if (view_sig) |sv|
+                        (if (sv.paramCount() > 0) sv.getParamMode(0) else .let_mode)
+                    else
+                        .let_mode;
+                    const adj_recv = try self.adjustReceiverForParam(seq_base, self_ty, tok);
+                    const proj_recv = try self.wrapArgProjection(adj_recv, self_mode, tok);
+                    const callee_hir = try self.emitNode(.{
+                        .tag = .hir_global_ref,
+                        .flags = .{ .category = .rvalue, .is_synthetic = true },
+                        .type_id = view_sym.type_id,
+                        .origin_token = tok,
+                        .data = .{ .lhs = view_sym.def_id.asInt(), .rhs = view_sym_idx.asInt() },
+                    }, .none);
+                    const extra_idx = try self.store.appendLenPrefixedExtra(&[1]u32{proj_recv.asInt()});
+                    const ret_ty = if (view_sig) |sv| self.concreteType(sv.ret_ty) else .str_ty;
+                    const call_hir = try self.emitNode(.{
+                        .tag = .hir_call,
+                        .flags = .{ .category = .rvalue, .is_synthetic = true },
+                        .type_id = ret_ty,
+                        .origin_token = tok,
+                        .data = .{ .lhs = callee_hir.asInt(), .rhs = extra_idx },
+                    }, .none);
+                    seq_base = try self.autoDerefPlace(call_hir, tok);
+                    base_node = self.store.getNode(seq_base);
+                    base_ty_node = self.pool.getNode(base_node.type_id);
+                }
+            }
+            const slice_res_ty = if (!target_ty.isError())
+                self.concreteType(target_ty)
+            else if (base_node.type_id == .str_ty)
+                .str_ty
+            else switch (base_ty_node.tag) {
+                .slice_ty, .array_ty => try self.pool.internRef(
+                    try self.pool.internSlice(TypeId.fromInt(base_ty_node.lhs), false),
+                    base_node.flags.category == .place_mut,
+                ),
+                .soa_slice_ty, .soa_array_ty => try self.pool.internRef(
+                    try self.pool.internSlice(TypeId.fromInt(base_ty_node.lhs), true),
+                    base_node.flags.category == .place_mut,
+                ),
+                else => .str_ty,
+            };
+
+            const range_extra = try self.store.appendExtraSlice(&[3]u32{
+                start_hir.asInt(),
+                end_hir.asInt(),
+                @intFromBool(range_info.is_inclusive),
+            });
+            const slice_hir = try self.emitNode(.{
+                .tag = .hir_slice_range,
+                .flags = .{ .category = .rvalue, .is_unsafe = self.is_in_unsafe },
+                .type_id = slice_res_ty,
+                .origin_token = tok,
+                .data = .{ .lhs = seq_base.asInt(), .rhs = range_extra },
+            }, expr_id);
+            if (seq_stmts.items.len > 0) {
+                return self.emitSyntheticBlock(seq_stmts.items, slice_hir, slice_res_ty, tok);
+            }
+            return slice_hir;
+        }
+
         // [1] Intercept `#soa` columnar syntax `items.field[i] -> hir_soa_field_ptr` (`DR-13` §2.2 Rule 6):
         if (base_ast.tag == .field_access and base_ast.lhs.tag == .node and base_ast.rhs.tag == .token) {
             const soa_cand_ast = NodeIndex.fromInt(base_ast.lhs.payload);
@@ -6772,6 +8552,7 @@ const HirLowerer = struct {
             if (soa_tag == .soa_slice_ty or soa_tag == .soa_array_ty) {
                 const field_tok = TokenIndex.fromInt(base_ast.rhs.payload);
                 const field_name = symbol_resolver.extractTokenSlice(self.source, self.tokens, field_tok);
+                self.is_mut_lvalue_ctx = outer_mut_ctx;
                 return self.emitSoaElementFieldPtr(
                     soa_cand_ast,
                     idx_ast_id,
@@ -6784,15 +8565,12 @@ const HirLowerer = struct {
             }
         }
 
+        const has_dollar = self.hasDollarAst(idx_ast_id);
+
         // [2] Check if `base` is a nominal type defining `subscript(&self, idx)`:
         const raw_base_ty = self.nodeType(base_ast_id);
         const unwrapped_base = self.unwrapRefType(raw_base_ty);
         if (try self.lookupMethodOnType(unwrapped_base, "subscript")) |sub_sym_idx| {
-            const idx_hir = try self.lowerExpr(idx_ast_id, .usize_ty);
-            const idx_slot = try self.allocTempLocal(self.store.getNode(idx_hir).type_id, tok, false);
-            const idx_decl = try self.emitLocalDeclNode(idx_slot, idx_hir, tok);
-
-            const base_hir = try self.lowerExpr(base_ast_id, .err_ty);
             const sub_sym = self.sym_table.getSymbol(sub_sym_idx).*;
             const sig_view = self.pool.getFnSignatureView(sub_sym.type_id);
             const recv_param_ty = if (sig_view) |sv| sv.getParamType(0) else raw_base_ty;
@@ -6801,6 +8579,30 @@ const HirLowerer = struct {
                 (if (sv.paramCount() > 1) sv.getParamMode(1) else .let_mode)
             else
                 .let_mode;
+            const is_mut_sub_needed = outer_mut_ctx or recv_mode == .inout_mode or recv_mode == .set_mode or
+                self.pool.getTag(recv_param_ty) == .mut_ref_ty;
+
+            var seq_stmts: std.ArrayListUnmanaged(u32) = .empty;
+            defer seq_stmts.deinit(self.allocator);
+
+            var base_hir: HirIndex = .none;
+            var idx_slot: u32 = 0;
+            if (has_dollar) {
+                const bound = try self.bindIndexReceiverForDollar(base_ast_id, is_mut_sub_needed, tok, &seq_stmts);
+                base_hir = bound.base_hir;
+                try self.dollar_len_stack.append(self.allocator, bound.len_slot);
+                const idx_hir = blk_sub_idx: {
+                    defer _ = self.dollar_len_stack.pop();
+                    break :blk_sub_idx try self.lowerExpr(idx_ast_id, .usize_ty);
+                };
+                idx_slot = try self.allocTempLocal(self.store.getNode(idx_hir).type_id, tok, false);
+                try seq_stmts.append(self.allocator, (try self.emitLocalDeclNode(idx_slot, idx_hir, tok)).asInt());
+            } else {
+                const idx_hir = try self.lowerExpr(idx_ast_id, .usize_ty);
+                idx_slot = try self.allocTempLocal(self.store.getNode(idx_hir).type_id, tok, false);
+                try seq_stmts.append(self.allocator, (try self.emitLocalDeclNode(idx_slot, idx_hir, tok)).asInt());
+                base_hir = try self.lowerPlaceWithMutCtx(base_ast_id, .err_ty, is_mut_sub_needed);
+            }
 
             const adjusted_recv = try self.adjustReceiverForParam(base_hir, recv_param_ty, tok);
             const proj_recv = try self.wrapArgProjection(adjusted_recv, recv_mode, tok);
@@ -6826,20 +8628,39 @@ const HirLowerer = struct {
                 .origin_token = tok,
                 .data = .{ .lhs = callee_hir.asInt(), .rhs = extra_idx },
             }, expr_id);
-            return self.emitSyntheticBlock(&[1]u32{idx_decl.asInt()}, sub_call, ret_ty, tok);
+            return self.emitSyntheticBlock(seq_stmts.items, sub_call, ret_ty, tok);
         }
 
-        // [3] Built-in array / slice / `#soa` element index projection (`DR-02` §2.2 post-arg sequencing: index then base):
-        const idx_hir = try self.lowerExpr(idx_ast_id, .usize_ty);
-        const idx_slot = try self.allocTempLocal(self.store.getNode(idx_hir).type_id, tok, false);
-        const idx_decl = try self.emitLocalDeclNode(idx_slot, idx_hir, tok);
+        // [3] Built-in array / slice / `#soa` element index projection (`SE-04` `$` or `DR-02` §2.2 index-then-base):
+        var seq_stmts: std.ArrayListUnmanaged(u32) = .empty;
+        defer seq_stmts.deinit(self.allocator);
 
-        const raw_base_hir = try self.lowerExpr(base_ast_id, .err_ty);
-        const deref_base = try self.autoDerefPlace(raw_base_hir, tok);
+        var deref_base: HirIndex = .none;
+        var idx_slot: u32 = 0;
+        if (has_dollar) {
+            const bound = try self.bindIndexReceiverForDollar(base_ast_id, outer_mut_ctx, tok, &seq_stmts);
+            deref_base = try self.autoDerefPlace(bound.base_hir, tok);
+            try self.dollar_len_stack.append(self.allocator, bound.len_slot);
+            const idx_hir = blk_arr_idx: {
+                defer _ = self.dollar_len_stack.pop();
+                break :blk_arr_idx try self.lowerExpr(idx_ast_id, .usize_ty);
+            };
+            idx_slot = try self.allocTempLocal(self.store.getNode(idx_hir).type_id, tok, false);
+            try seq_stmts.append(self.allocator, (try self.emitLocalDeclNode(idx_slot, idx_hir, tok)).asInt());
+        } else {
+            const idx_hir = try self.lowerExpr(idx_ast_id, .usize_ty);
+            idx_slot = try self.allocTempLocal(self.store.getNode(idx_hir).type_id, tok, false);
+            try seq_stmts.append(self.allocator, (try self.emitLocalDeclNode(idx_slot, idx_hir, tok)).asInt());
+            const raw_base_hir = try self.lowerPlaceWithMutCtx(base_ast_id, .err_ty, outer_mut_ctx);
+            deref_base = try self.autoDerefPlace(raw_base_hir, tok);
+        }
+
         const base_node = self.store.getNode(deref_base);
         const base_ty_node = self.pool.getNode(base_node.type_id);
         const elem_ty = self.concreteType(if (!target_ty.isError())
             target_ty
+        else if (base_node.type_id == .str_ty)
+            .u8_ty
         else switch (base_ty_node.tag) {
             .slice_ty, .soa_slice_ty, .array_ty, .soa_array_ty => TypeId.fromInt(base_ty_node.lhs),
             else => .unit_ty,
@@ -6854,10 +8675,589 @@ const HirLowerer = struct {
             .origin_token = tok,
             .data = .{ .lhs = deref_base.asInt(), .rhs = idx_ref.asInt() },
         }, expr_id);
-        return self.emitSyntheticBlock(&[1]u32{idx_decl.asInt()}, proj_hir, elem_ty, tok);
+        return self.emitSyntheticBlock(seq_stmts.items, proj_hir, elem_ty, tok);
     }
 
-    /// Lowers direct, generic, `@overload`, `subscript`, and `@intrinsic` calls (`DR-02` §2.2 & `DR-05` §3.3).
+    /// Lowers an omitted default argument expression (`param: T = DefaultExpr`) in the callee's lexical scope (`SE-07`).
+    fn lowerCalleeDefaultExpr(
+        self: *HirLowerer,
+        callee_sym: SymbolIndex,
+        full_param_idx: usize,
+        param_offset: usize,
+        slot_locals: []const u32,
+        param_ty: TypeId,
+        call_tok: TokenIndex,
+    ) anyerror!HirIndex {
+        const concrete_param_ty = self.concreteType(if (!param_ty.isError()) param_ty else .unit_ty);
+        var active_callee_sym = callee_sym;
+        if (!callee_sym.isNone() and callee_sym.asInt() < self.sym_table.symbols.items.len) {
+            const raw_callee = self.sym_table.getSymbol(callee_sym).*;
+            if (!raw_callee.def_id.isNone()) {
+                if (self.sym_table.def_to_symbol.get(raw_callee.def_id.asInt())) |latest_callee| {
+                    if (!latest_callee.isNone()) active_callee_sym = latest_callee;
+                }
+            }
+        }
+        const specs = self.sym_table.fn_param_specs.get(active_callee_sym.asInt()) orelse
+            return self.emitDefaultInitValue(concrete_param_ty, call_tok);
+        if (full_param_idx >= specs.len or !specs[full_param_idx].has_default or
+            specs[full_param_idx].default_ast_node.isNone())
+        {
+            return self.emitDefaultInitValue(concrete_param_ty, call_tok);
+        }
+        const spec = specs[full_param_idx];
+        const callee_rec = self.sym_table.getSymbol(active_callee_sym).*;
+        const callee_scope = if (!callee_rec.target_scope.isNone())
+            callee_rec.target_scope
+        else
+            callee_rec.scope_id;
+
+        const saved_locals = self.active_name_to_local;
+        const saved_ct = self.active_comptime_vals;
+        const saved_zips = self.active_zip_bindings;
+        const saved_scope = self.current_scope;
+        const saved_mut_ctx = self.is_mut_lvalue_ctx;
+        self.active_name_to_local = .empty;
+        self.active_comptime_vals = .empty;
+        self.active_zip_bindings = .empty;
+        self.current_scope = callee_scope;
+        self.is_mut_lvalue_ctx = false;
+        defer {
+            self.active_name_to_local.deinit(self.allocator);
+            self.active_comptime_vals.deinit(self.allocator);
+            self.active_zip_bindings.deinit(self.allocator);
+            self.active_name_to_local = saved_locals;
+            self.active_comptime_vals = saved_ct;
+            self.active_zip_bindings = saved_zips;
+            self.current_scope = saved_scope;
+            self.is_mut_lvalue_ctx = saved_mut_ctx;
+        }
+
+        // Bind earlier evaluated parameter slots (`0 .. full_param_idx`) so `hi: i32 = lo + 10` resolves `lo`:
+        for (0..@min(full_param_idx, specs.len)) |prior_full_idx| {
+            if (prior_full_idx < param_offset) continue;
+            const rel_prior = prior_full_idx - param_offset;
+            if (rel_prior >= slot_locals.len or slot_locals[rel_prior] == NONE_U32) continue;
+            const prior_spec = specs[prior_full_idx];
+            const param_name_id = if (prior_spec.name != .empty)
+                prior_spec.name
+            else if (prior_spec.name_text.len > 0)
+                try self.interner.intern(prior_spec.name_text)
+            else
+                SymbolId.empty;
+            if (param_name_id != .empty) {
+                try self.active_name_to_local.put(self.allocator, param_name_id.asInt(), slot_locals[rel_prior]);
+            }
+        }
+
+        if (spec.decl_file_id.isNone() or spec.decl_file_id == self.store.file_id) {
+            const saved_tables = self.side_tables;
+            defer self.side_tables = saved_tables;
+            if (self.eval_hook.compiler_db) |db| {
+                if (try db.getExternalFileSyntaxView(self.store.file_id)) |same_view| {
+                    if (same_view.file_side_tables) |file_st| {
+                        self.side_tables = file_st;
+                    }
+                }
+            }
+            return self.lowerExpr(spec.default_ast_node, concrete_param_ty);
+        }
+
+        const db = self.eval_hook.compiler_db orelse
+            return self.emitDefaultInitValue(concrete_param_ty, call_tok);
+        const ext_view = (try db.getExternalFileSyntaxView(spec.decl_file_id)) orelse
+            return self.emitDefaultInitValue(concrete_param_ty, call_tok);
+
+        const ext_extra_ends = try syntax_arenas.computeAstNodeExtraEnds(self.allocator, ext_view.ast_arena);
+        defer if (ext_extra_ends.len > 0) self.allocator.free(ext_extra_ends);
+        const ext_cst_map = try syntax_arenas.computeCstToAstMap(
+            self.allocator,
+            ext_view.cst_arena.countNodes(),
+            ext_view.ast_arena,
+        );
+        defer if (ext_cst_map.len > 0) self.allocator.free(ext_cst_map);
+
+        const outer_span = if (!call_tok.isNone() and call_tok.asInt() < self.tokens.countTokens())
+            self.tokens.getTokenSpan(self.store.file_id, call_tok)
+        else
+            Span.init(self.store.file_id, 0, 0);
+
+        const saved_source = self.source;
+        const saved_tokens = self.tokens;
+        const saved_cst = self.cst_arena;
+        const saved_ast = self.ast_arena;
+        const saved_tables = self.side_tables;
+        const saved_extra_ends = self.node_extra_end;
+        const saved_cst_map = self.cst_to_ast;
+        const saved_ov_tok = self.interp_override_token;
+        const saved_ov_span = self.interp_override_span;
+
+        self.source = ext_view.source;
+        self.tokens = ext_view.tokens;
+        self.cst_arena = ext_view.cst_arena;
+        self.ast_arena = ext_view.ast_arena;
+        self.side_tables = ext_view.file_side_tables;
+        self.node_extra_end = ext_extra_ends;
+        self.cst_to_ast = ext_cst_map;
+        self.interp_override_token = call_tok;
+        self.interp_override_span = outer_span;
+        defer {
+            self.source = saved_source;
+            self.tokens = saved_tokens;
+            self.cst_arena = saved_cst;
+            self.ast_arena = saved_ast;
+            self.side_tables = saved_tables;
+            self.node_extra_end = saved_extra_ends;
+            self.cst_to_ast = saved_cst_map;
+            self.interp_override_token = saved_ov_tok;
+            self.interp_override_span = saved_ov_span;
+        }
+
+        return self.lowerExpr(spec.default_ast_node, concrete_param_ty);
+    }
+
+    /// Evaluates positional, named, and omitted default arguments for a direct `fn_sym` call (`SE-07`).
+    /// Preserves call-site evaluation order for supplied arguments followed by formal order for omitted defaults.
+    fn lowerMappedDirectArgs(
+        self: *HirLowerer,
+        call_ast_id: NodeIndex,
+        callee_sym: SymbolIndex,
+        callee_sig_ty: TypeId,
+        has_self_receiver: bool,
+        raw_val_args: []const NodeIndex,
+        tok: TokenIndex,
+        out_seq_stmts: *std.ArrayListUnmanaged(u32),
+        out_arg_hirs: *std.ArrayListUnmanaged(HirIndex),
+    ) !void {
+        const sig_view = self.pool.getFnSignatureView(callee_sig_ty);
+        const param_offset: usize = if (has_self_receiver) 1 else 0;
+
+        if (self.side_tables) |tables| {
+            if (tables.getCallArgMapping(call_ast_id)) |mapping| {
+                const total_non_self: usize = mapping.total_params;
+                const slot_hirs = try self.allocator.alloc(HirIndex, total_non_self);
+                defer self.allocator.free(slot_hirs);
+                @memset(slot_hirs, .none);
+                const slot_locals = try self.allocator.alloc(u32, total_non_self);
+                defer self.allocator.free(slot_locals);
+                @memset(slot_locals, NONE_U32);
+
+                const has_omitted_default = mapping.provided_slots.len < total_non_self;
+                const must_sequence = has_self_receiver or mapping.has_reordered_or_default or has_omitted_default;
+                for (mapping.provided_slots) |slot| {
+                    if (slot.param_index >= total_non_self) continue;
+                    const full_idx = param_offset + @as(usize, slot.param_index);
+                    const p_ty = if (sig_view) |sv|
+                        (if (full_idx < sv.paramCount()) sv.getParamType(full_idx) else .err_ty)
+                    else
+                        .err_ty;
+                    const p_mode = if (sig_view) |sv|
+                        (if (full_idx < sv.paramCount()) sv.getParamMode(full_idx) else .let_mode)
+                    else
+                        .let_mode;
+
+                    const is_mut_arg = p_mode == .inout_mode or p_mode == .set_mode;
+                    const arg_hir = try self.lowerPlaceWithMutCtx(
+                        self.unwrapCallArgAst(slot.arg_ast_node),
+                        p_ty,
+                        is_mut_arg,
+                    );
+                    if (!must_sequence) {
+                        slot_hirs[slot.param_index] = arg_hir;
+                    } else if (is_mut_arg) {
+                        if (self.store.getNode(arg_hir).tag == .hir_var_ref) {
+                            slot_hirs[slot.param_index] = arg_hir;
+                            slot_locals[slot.param_index] = self.store.getNode(arg_hir).data.lhs;
+                        } else {
+                            const place_ty = self.store.getNode(arg_hir).type_id;
+                            const ptr_ty = try self.pool.internRef(place_ty, true);
+                            const addr_hir = try self.emitSyntheticAddrOf(arg_hir, ptr_ty, true, tok);
+                            const ptr_tmp = try self.allocTempLocal(ptr_ty, tok, false);
+                            try out_seq_stmts.append(
+                                self.allocator,
+                                (try self.emitLocalDeclNode(ptr_tmp, addr_hir, tok)).asInt(),
+                            );
+                            slot_hirs[slot.param_index] = try self.emitNode(.{
+                                .tag = .hir_unary_op,
+                                .flags = .{ .category = .place_mut, .is_synthetic = true },
+                                .type_id = place_ty,
+                                .origin_token = tok,
+                                .data = .{
+                                    .lhs = @backingInt(HirUnaryOp.deref),
+                                    .rhs = (try self.emitVarRef(ptr_tmp, tok, .none)).asInt(),
+                                },
+                            }, .none);
+                        }
+                    } else {
+                        const tmp_slot = try self.allocTempLocal(self.store.getNode(arg_hir).type_id, tok, false);
+                        try out_seq_stmts.append(
+                            self.allocator,
+                            (try self.emitLocalDeclNode(tmp_slot, arg_hir, tok)).asInt(),
+                        );
+                        slot_locals[slot.param_index] = tmp_slot;
+                        slot_hirs[slot.param_index] = try self.emitVarRef(tmp_slot, tok, .none);
+                    }
+                }
+
+                for (0..total_non_self) |rel_idx| {
+                    if (!slot_hirs[rel_idx].isNone()) continue;
+                    const full_idx = param_offset + rel_idx;
+                    const p_ty = if (sig_view) |sv|
+                        (if (full_idx < sv.paramCount()) sv.getParamType(full_idx) else .err_ty)
+                    else
+                        .err_ty;
+                    const def_hir = try self.lowerCalleeDefaultExpr(
+                        callee_sym,
+                        full_idx,
+                        param_offset,
+                        slot_locals,
+                        p_ty,
+                        tok,
+                    );
+                    const tmp_slot = try self.allocTempLocal(self.store.getNode(def_hir).type_id, tok, false);
+                    try out_seq_stmts.append(
+                        self.allocator,
+                        (try self.emitLocalDeclNode(tmp_slot, def_hir, tok)).asInt(),
+                    );
+                    slot_locals[rel_idx] = tmp_slot;
+                    slot_hirs[rel_idx] = try self.emitVarRef(tmp_slot, tok, .none);
+                }
+
+                try out_arg_hirs.appendSlice(self.allocator, slot_hirs);
+                return;
+            }
+        }
+
+        // Fallback when `side_tables` are absent (`lowerResolvedSourceOnly` tests):
+        const specs_opt = self.sym_table.fn_param_specs.get(callee_sym.asInt());
+        const formal_total: usize = if (sig_view) |sv|
+            sv.paramCount()
+        else if (specs_opt) |specs|
+            specs.len
+        else
+            param_offset + raw_val_args.len;
+        const total_non_self: usize = @max(formal_total -| param_offset, raw_val_args.len);
+        const slot_hirs = try self.allocator.alloc(HirIndex, total_non_self);
+        defer self.allocator.free(slot_hirs);
+        @memset(slot_hirs, .none);
+        const slot_locals = try self.allocator.alloc(u32, total_non_self);
+        defer self.allocator.free(slot_locals);
+        @memset(slot_locals, NONE_U32);
+
+        var has_any_named = false;
+        for (raw_val_args) |raw_arg| {
+            if (!raw_arg.isNone() and raw_arg.asInt() < self.ast_arena.countNodes() and
+                self.ast_arena.getNode(raw_arg).tag == .named_arg)
+            {
+                has_any_named = true;
+                break;
+            }
+        }
+        const has_omitted_fallback = raw_val_args.len < total_non_self;
+        const is_seq_fallback_required = has_self_receiver or has_any_named or has_omitted_fallback;
+
+        for (raw_val_args, 0..) |raw_arg, call_i| {
+            var target_rel: usize = call_i;
+            if (!raw_arg.isNone() and raw_arg.asInt() < self.ast_arena.countNodes()) {
+                const raw_node = self.ast_arena.getNode(raw_arg);
+                if (raw_node.tag == .named_arg and !raw_node.main_token.isNone()) {
+                    const lbl = symbol_resolver.extractTokenSlice(self.source, self.tokens, raw_node.main_token);
+                    if (specs_opt) |specs| {
+                        for (param_offset..specs.len) |full_k| {
+                            if (std.mem.eql(u8, specs[full_k].name_text, lbl)) {
+                                target_rel = full_k - param_offset;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if (target_rel >= total_non_self) continue;
+            const full_idx = param_offset + target_rel;
+            const p_ty = if (sig_view) |sv|
+                (if (full_idx < sv.paramCount()) sv.getParamType(full_idx) else .err_ty)
+            else
+                .err_ty;
+            const p_mode = if (sig_view) |sv|
+                (if (full_idx < sv.paramCount()) sv.getParamMode(full_idx) else .let_mode)
+            else
+                .let_mode;
+            const is_mut_arg = p_mode == .inout_mode or p_mode == .set_mode;
+            const arg_hir = try self.lowerPlaceWithMutCtx(self.unwrapCallArgAst(raw_arg), p_ty, is_mut_arg);
+            if (is_seq_fallback_required and !is_mut_arg) {
+                const tmp_slot = try self.allocTempLocal(self.store.getNode(arg_hir).type_id, tok, false);
+                try out_seq_stmts.append(
+                    self.allocator,
+                    (try self.emitLocalDeclNode(tmp_slot, arg_hir, tok)).asInt(),
+                );
+                slot_locals[target_rel] = tmp_slot;
+                slot_hirs[target_rel] = try self.emitVarRef(tmp_slot, tok, .none);
+            } else {
+                if (self.store.getNode(arg_hir).tag == .hir_var_ref) {
+                    slot_locals[target_rel] = self.store.getNode(arg_hir).data.lhs;
+                }
+                slot_hirs[target_rel] = arg_hir;
+            }
+        }
+
+        for (0..total_non_self) |rel_idx| {
+            if (!slot_hirs[rel_idx].isNone()) continue;
+            const full_idx = param_offset + rel_idx;
+            const p_ty = if (sig_view) |sv|
+                (if (full_idx < sv.paramCount()) sv.getParamType(full_idx) else .err_ty)
+            else
+                .err_ty;
+            const def_hir = try self.lowerCalleeDefaultExpr(
+                callee_sym,
+                full_idx,
+                param_offset,
+                slot_locals,
+                p_ty,
+                tok,
+            );
+            const tmp_slot = try self.allocTempLocal(self.store.getNode(def_hir).type_id, tok, false);
+            try out_seq_stmts.append(
+                self.allocator,
+                (try self.emitLocalDeclNode(tmp_slot, def_hir, tok)).asInt(),
+            );
+            slot_locals[rel_idx] = tmp_slot;
+            slot_hirs[rel_idx] = try self.emitVarRef(tmp_slot, tok, .none);
+        }
+        try out_arg_hirs.appendSlice(self.allocator, slot_hirs);
+    }
+
+    /// Lowers built-in `Option.Some(x)`, `Result.Ok(x)`, `Result.Err(e)`, and `Enum.Variant(args)` under Unified `.`.
+    fn tryLowerStaticSumConstructor(
+        self: *HirLowerer,
+        expr_id: NodeIndex,
+        member_name: []const u8,
+        val_args: []const NodeIndex,
+        target_ty: TypeId,
+        tok: TokenIndex,
+    ) !?HirIndex {
+        const concrete_target = self.concreteType(if (!target_ty.isError()) target_ty else self.nodeType(expr_id));
+        if (concrete_target.isError()) return null;
+        const unwrapped_ty = self.pool.unwrapUnderlyingType(concrete_target);
+        const ty_node = self.pool.getNode(unwrapped_ty);
+
+        switch (ty_node.tag) {
+            .optional_ty => {
+                if (!std.mem.eql(u8, member_name, "Some")) return null;
+                const payload_ty = TypeId.fromInt(ty_node.lhs);
+                const payload_hir = if (val_args.len >= 1)
+                    try self.lowerExpr(self.unwrapCallArgAst(val_args[0]), payload_ty)
+                else
+                    try self.emitUnitConst(tok, .none);
+                const extra_idx = try self.store.appendLenPrefixedExtra(&[1]u32{payload_hir.asInt()});
+                var out_hir = try self.emitNode(.{
+                    .tag = .hir_construct,
+                    .flags = .{ .category = .rvalue },
+                    .type_id = unwrapped_ty,
+                    .origin_token = tok,
+                    .data = .{
+                        .lhs = @as(u32, @backingInt(HirConstructKind.optional_some)) | (1 << 8),
+                        .rhs = extra_idx,
+                    },
+                }, expr_id);
+                if (unwrapped_ty != concrete_target) {
+                    out_hir = try self.emitNode(.{
+                        .tag = .hir_cast,
+                        .flags = .{ .category = .rvalue, .is_synthetic = true },
+                        .type_id = concrete_target,
+                        .origin_token = tok,
+                        .data = .{ .lhs = out_hir.asInt(), .rhs = @backingInt(HirCastKind.distinct_wrap) },
+                    }, .none);
+                }
+                return out_hir;
+            },
+            .result_ty => {
+                const is_ok = std.mem.eql(u8, member_name, "Ok");
+                const is_err = std.mem.eql(u8, member_name, "Err");
+                if (!is_ok and !is_err) return null;
+                const payload_ty = TypeId.fromInt(if (is_ok) ty_node.lhs else ty_node.rhs);
+                const payload_hir = if (val_args.len >= 1)
+                    try self.lowerExpr(self.unwrapCallArgAst(val_args[0]), payload_ty)
+                else
+                    try self.emitUnitConst(tok, .none);
+                const extra_idx = try self.store.appendLenPrefixedExtra(&[1]u32{payload_hir.asInt()});
+                const kind: HirConstructKind = if (is_ok) .result_ok else .result_err;
+                const tag_shift: u32 = if (is_ok) 0 else (1 << 8);
+                var out_hir = try self.emitNode(.{
+                    .tag = .hir_construct,
+                    .flags = .{ .category = .rvalue },
+                    .type_id = unwrapped_ty,
+                    .origin_token = tok,
+                    .data = .{ .lhs = @as(u32, @backingInt(kind)) | tag_shift, .rhs = extra_idx },
+                }, expr_id);
+                if (unwrapped_ty != concrete_target) {
+                    out_hir = try self.emitNode(.{
+                        .tag = .hir_cast,
+                        .flags = .{ .category = .rvalue, .is_synthetic = true },
+                        .type_id = concrete_target,
+                        .origin_token = tok,
+                        .data = .{ .lhs = out_hir.asInt(), .rhs = @backingInt(HirCastKind.distinct_wrap) },
+                    }, .none);
+                }
+                return out_hir;
+            },
+            .enum_ty => {
+                const enum_sym = self.sym_table.getSymbol(SymbolIndex.fromInt(ty_node.rhs)).*;
+                if (enum_sym.target_scope.isNone()) return null;
+                const var_name_id = self.interner.lookup(member_name) orelse return null;
+                const found_idx = self.sym_table.lookupInScopeDirect(
+                    enum_sym.target_scope,
+                    var_name_id,
+                    NamespaceMask.VALUE_ONLY,
+                );
+                if (found_idx.isNone()) return null;
+                const v_sym = self.sym_table.getSymbol(found_idx).*;
+                if (v_sym.kind != .enum_variant_sym) return null;
+                const enum_subst = type_system.NominalTypeSubst.init(self.pool, self.sym_table, unwrapped_ty);
+                const subst_var_ty = try enum_subst.applyMut(self.allocator, self.pool, v_sym.type_id);
+                var arg_hirs: std.ArrayListUnmanaged(u32) = .empty;
+                defer arg_hirs.deinit(self.allocator);
+                if (val_args.len == 1) {
+                    const a0 = self.unwrapCallArgAst(val_args[0]);
+                    try arg_hirs.append(self.allocator, (try self.lowerExpr(a0, subst_var_ty)).asInt());
+                } else {
+                    const tup_elems = self.pool.getTupleElements(subst_var_ty);
+                    for (val_args, 0..) |arg_id, i| {
+                        const sub_ty = if (i < tup_elems.len) TypeId.fromInt(tup_elems[i]) else .err_ty;
+                        const unwrapped_arg = self.unwrapCallArgAst(arg_id);
+                        try arg_hirs.append(self.allocator, (try self.lowerExpr(unwrapped_arg, sub_ty)).asInt());
+                    }
+                }
+                const extra_idx = try self.store.appendLenPrefixedExtra(arg_hirs.items);
+                return try self.emitNode(.{
+                    .tag = .hir_construct,
+                    .flags = .{ .category = .rvalue },
+                    .type_id = concrete_target,
+                    .origin_token = tok,
+                    .data = .{
+                        .lhs = @as(u32, @backingInt(HirConstructKind.enum_variant)) |
+                            (@as(u32, v_sym.member_ordinal) << 8),
+                        .rhs = extra_idx,
+                    },
+                }, expr_id);
+            },
+            else => return null,
+        }
+    }
+
+    /// Reverses a fixed `[u8; byte_count]` array expression in `HIR` for big-endian byte conversions.
+    fn reverseByteArrayHir(
+        self: *HirLowerer,
+        arr_hir: HirIndex,
+        arr_ty: TypeId,
+        byte_count: usize,
+        tok: TokenIndex,
+        out_stmts: *std.ArrayListUnmanaged(u32),
+    ) !HirIndex {
+        if (byte_count <= 1) return arr_hir;
+        const arr_slot = try self.allocTempLocal(arr_ty, tok, false);
+        try out_stmts.append(self.allocator, (try self.emitLocalDeclNode(arr_slot, arr_hir, tok)).asInt());
+        var elems: std.ArrayListUnmanaged(u32) = .empty;
+        defer elems.deinit(self.allocator);
+        var rev_i: usize = byte_count;
+        while (rev_i > 0) {
+            rev_i -= 1;
+            const idx_const = try self.emitConstVal(.{ .int_val = @intCast(rev_i) }, .usize_ty, tok, .none, true);
+            const proj = try self.emitNode(.{
+                .tag = .hir_index_proj,
+                .flags = .{ .category = .place_imm, .is_synthetic = true },
+                .type_id = .u8_ty,
+                .origin_token = tok,
+                .data = .{
+                    .lhs = (try self.emitVarRef(arr_slot, tok, .none)).asInt(),
+                    .rhs = idx_const.asInt(),
+                },
+            }, .none);
+            try elems.append(self.allocator, proj.asInt());
+        }
+        const extra_idx = try self.store.appendLenPrefixedExtra(elems.items);
+        return self.emitNode(.{
+            .tag = .hir_construct,
+            .flags = .{ .category = .rvalue, .is_synthetic = true },
+            .type_id = arr_ty,
+            .origin_token = tok,
+            .data = .{ .lhs = @backingInt(HirConstructKind.array_elements), .rhs = extra_idx },
+        }, .none);
+    }
+
+    /// Lowers built-in integer endian helpers (`from_le_bytes`, `to_le_bytes`, `from_be_bytes`, `to_be_bytes`).
+    fn tryLowerPrimitiveEndianHelper(
+        self: *HirLowerer,
+        expr_id: NodeIndex,
+        prim_ty: TypeId,
+        is_static_call: bool,
+        recv_id: NodeIndex,
+        member_name: []const u8,
+        val_args: []const NodeIndex,
+        tok: TokenIndex,
+    ) !?HirIndex {
+        if (!prim_ty.isIntegerPrimitive()) return null;
+        const byte_count: usize = switch (prim_ty) {
+            .i8_ty, .u8_ty => 1,
+            .i16_ty, .u16_ty => 2,
+            .i32_ty, .u32_ty => 4,
+            .i64_ty, .u64_ty => 8,
+            .i128_ty, .u128_ty => 16,
+            .isize_ty, .usize_ty => self.store.target_layout.ptr_byte_size,
+            else => return null,
+        };
+        const byte_arr_ty = try self.pool.internArray(.u8_ty, @intCast(byte_count), false);
+
+        if (is_static_call and val_args.len == 1 and
+            (std.mem.eql(u8, member_name, "from_le_bytes") or std.mem.eql(u8, member_name, "from_be_bytes")))
+        {
+            const is_be = std.mem.eql(u8, member_name, "from_be_bytes");
+            var stmts: std.ArrayListUnmanaged(u32) = .empty;
+            defer stmts.deinit(self.allocator);
+            var bytes_hir = try self.lowerExpr(self.unwrapCallArgAst(val_args[0]), byte_arr_ty);
+            bytes_hir = try self.autoDerefPlace(bytes_hir, tok);
+            if (is_be) {
+                bytes_hir = try self.reverseByteArrayHir(bytes_hir, byte_arr_ty, byte_count, tok, &stmts);
+            }
+            const extra_idx = try self.store.appendExtraSlice(&[4]u32{ 1, 1, prim_ty.toU32(), bytes_hir.asInt() });
+            const cast_hir = try self.emitNode(.{
+                .tag = .hir_intrinsic_call,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = prim_ty,
+                .origin_token = tok,
+                .data = .{ .lhs = @backingInt(IntrinsicKind.bit_cast), .rhs = extra_idx },
+            }, expr_id);
+            if (stmts.items.len > 0) return try self.emitSyntheticBlock(stmts.items, cast_hir, prim_ty, tok);
+            return cast_hir;
+        }
+
+        if (!is_static_call and val_args.len == 0 and
+            (std.mem.eql(u8, member_name, "to_le_bytes") or std.mem.eql(u8, member_name, "to_be_bytes")))
+        {
+            const is_be = std.mem.eql(u8, member_name, "to_be_bytes");
+            var stmts: std.ArrayListUnmanaged(u32) = .empty;
+            defer stmts.deinit(self.allocator);
+            const raw_recv = try self.lowerExpr(recv_id, prim_ty);
+            const deref_recv = try self.autoDerefPlace(raw_recv, tok);
+            const extra_idx = try self.store.appendExtraSlice(
+                &[4]u32{ 1, 1, byte_arr_ty.toU32(), deref_recv.asInt() },
+            );
+            var out_hir = try self.emitNode(.{
+                .tag = .hir_intrinsic_call,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = byte_arr_ty,
+                .origin_token = tok,
+                .data = .{ .lhs = @backingInt(IntrinsicKind.bit_cast), .rhs = extra_idx },
+            }, expr_id);
+            if (is_be) {
+                out_hir = try self.reverseByteArrayHir(out_hir, byte_arr_ty, byte_count, tok, &stmts);
+            }
+            if (stmts.items.len > 0) return try self.emitSyntheticBlock(stmts.items, out_hir, byte_arr_ty, tok);
+            return out_hir;
+        }
+        return null;
+    }
+
+    /// Lowers direct, generic, `@overload`, `subscript`, and `@intrinsic` calls (`DR-02` §2.2, `DR-05` §3.3 & `SE-07`).
     fn lowerCallExpr(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) !HirIndex {
         const ast_node = self.ast_arena.getNode(expr_id);
         const tok = ast_node.main_token;
@@ -6898,7 +9298,7 @@ const HirLowerer = struct {
             );
         }
 
-        // [2] Enum tuple-variant constructor `Enum::Variant(a, b)` resolved via `nodeSymbol` or lexical fallback:
+        // [2] Enum tuple-variant or static `Option.Some` / `Result.Ok` / endian helper constructor:
         const call_sym_idx = self.nodeSymbol(expr_id);
         var resolved_sym_idx = if (!call_sym_idx.isNone()) call_sym_idx else self.nodeSymbol(callee_ast_id);
         if (resolved_sym_idx.isNone() and callee_ast.tag == .ident_expr and !callee_ast.main_token.isNone()) {
@@ -6912,6 +9312,40 @@ const HirLowerer = struct {
                 }
             }
         }
+        if (resolved_sym_idx.isNone() and callee_ast.tag == .field_access and
+            callee_ast.lhs.tag == .node and callee_ast.rhs.tag == .token)
+        {
+            const recv_id = NodeIndex.fromInt(callee_ast.lhs.payload);
+            const member_name = symbol_resolver.extractTokenSlice(
+                self.source,
+                self.tokens,
+                TokenIndex.fromInt(callee_ast.rhs.payload),
+            );
+            const static_kind = self.resolveStaticDotTargetAst(recv_id);
+            if (static_kind != .none) {
+                resolved_sym_idx = self.lookupStaticMemberSymbolFallback(recv_id, member_name);
+                if (resolved_sym_idx.isNone() and static_kind == .type_ns) {
+                    if (self.resolveBuiltinPrimitiveAst(recv_id)) |prim_ty| {
+                        if (try self.tryLowerPrimitiveEndianHelper(
+                            expr_id,
+                            prim_ty,
+                            true,
+                            recv_id,
+                            member_name,
+                            val_args,
+                            tok,
+                        )) |endian_hir| return endian_hir;
+                    }
+                    if (try self.tryLowerStaticSumConstructor(
+                        expr_id,
+                        member_name,
+                        val_args,
+                        target_ty,
+                        tok,
+                    )) |ctor_hir| return ctor_hir;
+                }
+            }
+        }
         if (!resolved_sym_idx.isNone()) {
             const sym = self.sym_table.getSymbol(resolved_sym_idx).*;
             if (sym.kind == .enum_variant_sym) {
@@ -6920,16 +9354,18 @@ const HirLowerer = struct {
                 var arg_hirs: std.ArrayListUnmanaged(u32) = .empty;
                 defer arg_hirs.deinit(self.allocator);
                 if (val_args.len == 1) {
-                    try arg_hirs.append(self.allocator, (try self.lowerExpr(val_args[0], subst_var_ty)).asInt());
+                    const a0 = self.unwrapCallArgAst(val_args[0]);
+                    try arg_hirs.append(self.allocator, (try self.lowerExpr(a0, subst_var_ty)).asInt());
                 } else {
                     const tup_elems = self.pool.getTupleElements(subst_var_ty);
                     for (val_args, 0..) |arg_id, i| {
                         const sub_ty = if (i < tup_elems.len) TypeId.fromInt(tup_elems[i]) else .err_ty;
-                        try arg_hirs.append(self.allocator, (try self.lowerExpr(arg_id, sub_ty)).asInt());
+                        const unwrapped_arg = self.unwrapCallArgAst(arg_id);
+                        try arg_hirs.append(self.allocator, (try self.lowerExpr(unwrapped_arg, sub_ty)).asInt());
                     }
                 }
                 const extra_idx = try self.store.appendLenPrefixedExtra(arg_hirs.items);
-                return self.emitNode(.{
+                return try self.emitNode(.{
                     .tag = .hir_construct,
                     .flags = .{ .category = .rvalue },
                     .type_id = self.concreteType(target_ty),
@@ -6943,7 +9379,7 @@ const HirLowerer = struct {
             }
         }
 
-        // [3] Resolve concrete `@overload` or direct function symbol if available:
+        // [3] Resolve concrete `@overload`, named/default `fn_sym` call (`SE-07`), or indirect closure/fn-ptr call:
         const is_direct_sym = !resolved_sym_idx.isNone() and
             self.sym_table.getSymbol(resolved_sym_idx).kind == .fn_sym;
         const callee_sig_ty = if (is_direct_sym)
@@ -6957,22 +9393,45 @@ const HirLowerer = struct {
         var wrapped_args: std.ArrayListUnmanaged(u32) = .empty;
         defer wrapped_args.deinit(self.allocator);
 
-        for (val_args, 0..) |arg_id, i| {
-            const p_ty = if (sig_view) |sv|
-                (if (i < sv.paramCount()) sv.getParamType(i) else .err_ty)
-            else
-                .err_ty;
-            const p_mode = if (sig_view) |sv|
-                (if (i < sv.paramCount()) sv.getParamMode(i) else .let_mode)
-            else
-                .let_mode;
-            var arg_hir = try self.lowerExpr(arg_id, p_ty);
-            if (!is_direct_sym and p_mode == .let_mode) {
-                const tmp_slot = try self.allocTempLocal(self.store.getNode(arg_hir).type_id, tok, false);
-                try seq_stmts.append(self.allocator, (try self.emitLocalDeclNode(tmp_slot, arg_hir, tok)).asInt());
-                arg_hir = try self.emitVarRef(tmp_slot, tok, .none);
+        if (is_direct_sym) {
+            var ordered_args: std.ArrayListUnmanaged(HirIndex) = .empty;
+            defer ordered_args.deinit(self.allocator);
+            try self.lowerMappedDirectArgs(
+                expr_id,
+                resolved_sym_idx,
+                callee_sig_ty,
+                false,
+                val_args,
+                tok,
+                &seq_stmts,
+                &ordered_args,
+            );
+            for (ordered_args.items, 0..) |arg_hir, i| {
+                const p_mode = if (sig_view) |sv|
+                    (if (i < sv.paramCount()) sv.getParamMode(i) else .let_mode)
+                else
+                    .let_mode;
+                try wrapped_args.append(self.allocator, (try self.wrapArgProjection(arg_hir, p_mode, tok)).asInt());
             }
-            try wrapped_args.append(self.allocator, (try self.wrapArgProjection(arg_hir, p_mode, tok)).asInt());
+        } else {
+            for (val_args, 0..) |arg_id, i| {
+                const p_ty = if (sig_view) |sv|
+                    (if (i < sv.paramCount()) sv.getParamType(i) else .err_ty)
+                else
+                    .err_ty;
+                const p_mode = if (sig_view) |sv|
+                    (if (i < sv.paramCount()) sv.getParamMode(i) else .let_mode)
+                else
+                    .let_mode;
+                const is_mut_arg = p_mode == .inout_mode or p_mode == .set_mode;
+                var arg_hir = try self.lowerPlaceWithMutCtx(self.unwrapCallArgAst(arg_id), p_ty, is_mut_arg);
+                if (p_mode == .let_mode) {
+                    const tmp_slot = try self.allocTempLocal(self.store.getNode(arg_hir).type_id, tok, false);
+                    try seq_stmts.append(self.allocator, (try self.emitLocalDeclNode(tmp_slot, arg_hir, tok)).asInt());
+                    arg_hir = try self.emitVarRef(tmp_slot, tok, .none);
+                }
+                try wrapped_args.append(self.allocator, (try self.wrapArgProjection(arg_hir, p_mode, tok)).asInt());
+            }
         }
 
         const callee_hir = if (is_direct_sym) blk: {
@@ -7098,8 +9557,8 @@ const HirLowerer = struct {
 
         // [1] `@field(target, comptime field_spec)` -> direct `hir_field_proj` / `hir_bitfield_read` (`DR-05` Tier-1):
         if (intr_kind == .field and val_args.len >= 2) {
-            const base_hir = try self.lowerExpr(val_args[0], .err_ty);
-            if (try self.tryEvalAstComptime(val_args[1], .err_ty)) |spec_val| {
+            const base_hir = try self.lowerExpr(self.unwrapCallArgAst(val_args[0]), .err_ty);
+            if (try self.tryEvalAstComptime(self.unwrapCallArgAst(val_args[1]), .err_ty)) |spec_val| {
                 if (spec_val == .str_val) {
                     return self.projectNamedMember(base_hir, self.interner.get(spec_val.str_val), intr_tok, call_id);
                 }
@@ -7122,11 +9581,11 @@ const HirLowerer = struct {
 
         // [3] `@compile_assert(cond, [msg])` inside unrolled `comptime for` / `comptime if`:
         if (intr_kind == .compile_assert and val_args.len >= 1) {
-            if (try self.tryEvalAstComptime(val_args[0], .bool_ty)) |cond_val| {
+            if (try self.tryEvalAstComptime(self.unwrapCallArgAst(val_args[0]), .bool_ty)) |cond_val| {
                 if (cond_val == .bool_val and !cond_val.bool_val) {
                     var msg_text: []const u8 = "compile-time assertion failed";
                     if (val_args.len >= 2) {
-                        if (try self.tryEvalAstComptime(val_args[1], .str_ty)) |m_val| {
+                        if (try self.tryEvalAstComptime(self.unwrapCallArgAst(val_args[1]), .str_ty)) |m_val| {
                             if (m_val == .str_val) msg_text = self.interner.get(m_val.str_val);
                         }
                     }
@@ -7139,7 +9598,7 @@ const HirLowerer = struct {
         // [4] `@compile_error(msg)` inside unrolled `comptime` branch:
         if (intr_kind == .compile_error and val_args.len >= 1) {
             var err_text: []const u8 = "explicit `@compile_error` triggered";
-            if (try self.tryEvalAstComptime(val_args[0], .str_ty)) |m_val| {
+            if (try self.tryEvalAstComptime(self.unwrapCallArgAst(val_args[0]), .str_ty)) |m_val| {
                 if (m_val == .str_val) err_text = self.interner.get(m_val.str_val);
             }
             try self.emitDiagnostic(.e0510_compile_assertion_failed, self.astSpan(call_id), err_text, "triggered here");
@@ -7161,7 +9620,8 @@ const HirLowerer = struct {
             try payload_words.append(self.allocator, type_args[i].toU32());
         }
         for (val_args) |v_arg_id| {
-            try payload_words.append(self.allocator, (try self.lowerExpr(v_arg_id, .err_ty)).asInt());
+            const unwrapped_v = self.unwrapCallArgAst(v_arg_id);
+            try payload_words.append(self.allocator, (try self.lowerExpr(unwrapped_v, .err_ty)).asInt());
         }
         const extra_idx = try self.store.appendExtraSlice(payload_words.items);
         const checked_call_ty = if (!target_ty.isError()) target_ty else self.nodeType(call_id);
@@ -7210,7 +9670,7 @@ const HirLowerer = struct {
         }, call_id);
     }
 
-    /// Lowers `receiver.method(a_1, …, a_k)` enforcing Hylo Post-Argument Receiver Sequencing (`DR-02` §2.2).
+    /// Lowers `receiver.method(…)` and Unified `.` static calls `mod.fn(…)` / `Type.assoc_fn(…)` (`DR-02` §2.2 & `SE-07`).
     fn lowerMethodCallExpr(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) !HirIndex {
         const ast_node = self.ast_arena.getNode(expr_id);
         const tok = ast_node.main_token;
@@ -7221,6 +9681,8 @@ const HirLowerer = struct {
 
         const member_tok = TokenIndex.fromInt(raw_items[0]);
         const member_name = symbol_resolver.extractTokenSlice(self.source, self.tokens, member_tok);
+        const static_kind = self.resolveStaticDotTargetAst(recv_id);
+        const is_static_dot_call = static_kind != .none;
 
         var type_arg_nodes: std.ArrayListUnmanaged(NodeIndex) = .empty;
         defer type_arg_nodes.deinit(self.allocator);
@@ -7238,7 +9700,7 @@ const HirLowerer = struct {
         const val_args = val_arg_nodes.items;
 
         // Built-in `.len()` method on slices, arrays, `#soa`, and `str`:
-        if (val_args.len == 0 and std.mem.eql(u8, member_name, "len")) {
+        if (!is_static_dot_call and val_args.len == 0 and std.mem.eql(u8, member_name, "len")) {
             const raw_recv_ty = self.nodeType(recv_id);
             const unwrapped_recv = self.unwrapRefType(raw_recv_ty);
             const recv_tag = self.pool.getTag(unwrapped_recv);
@@ -7302,83 +9764,166 @@ const HirLowerer = struct {
 
         var method_sym_idx = self.nodeSymbol(expr_id);
         if (method_sym_idx.isNone()) {
-            const recv_ty = self.unwrapRefType(self.nodeType(recv_id));
-            if (try self.lookupMethodOnType(recv_ty, member_name)) |found_m| {
-                method_sym_idx = found_m;
+            if (is_static_dot_call) {
+                method_sym_idx = self.lookupStaticMemberSymbolFallback(recv_id, member_name);
+            } else {
+                const recv_ty = self.unwrapRefType(self.nodeType(recv_id));
+                if (try self.lookupMethodOnType(recv_ty, member_name)) |found_m| {
+                    method_sym_idx = found_m;
+                }
             }
         }
+
+        // Static `Enum.Variant(args)` constructor resolved via `nodeSymbol` or `target_scope`:
+        if (!method_sym_idx.isNone() and self.sym_table.getSymbol(method_sym_idx).kind == .enum_variant_sym) {
+            const v_sym = self.sym_table.getSymbol(method_sym_idx).*;
+            const out_enum_ty = self.concreteType(if (!target_ty.isError()) target_ty else self.nodeType(expr_id));
+            const enum_subst = type_system.NominalTypeSubst.init(self.pool, self.sym_table, out_enum_ty);
+            const subst_var_ty = try enum_subst.applyMut(self.allocator, self.pool, v_sym.type_id);
+            var arg_hirs: std.ArrayListUnmanaged(u32) = .empty;
+            defer arg_hirs.deinit(self.allocator);
+            if (val_args.len == 1) {
+                const a0 = self.unwrapCallArgAst(val_args[0]);
+                try arg_hirs.append(self.allocator, (try self.lowerExpr(a0, subst_var_ty)).asInt());
+            } else {
+                const tup_elems = self.pool.getTupleElements(subst_var_ty);
+                for (val_args, 0..) |arg_id, i| {
+                    const sub_ty = if (i < tup_elems.len) TypeId.fromInt(tup_elems[i]) else .err_ty;
+                    const unwrapped_arg = self.unwrapCallArgAst(arg_id);
+                    try arg_hirs.append(self.allocator, (try self.lowerExpr(unwrapped_arg, sub_ty)).asInt());
+                }
+            }
+            const extra_idx = try self.store.appendLenPrefixedExtra(arg_hirs.items);
+            return self.emitNode(.{
+                .tag = .hir_construct,
+                .flags = .{ .category = .rvalue },
+                .type_id = out_enum_ty,
+                .origin_token = tok,
+                .data = .{
+                    .lhs = @as(u32, @backingInt(HirConstructKind.enum_variant)) |
+                        (@as(u32, v_sym.member_ordinal) << 8),
+                    .rhs = extra_idx,
+                },
+            }, expr_id);
+        }
+
         if (method_sym_idx.isNone()) {
-            // Built-in `.as_bytes()` wire view on `IntoBytes` values / `&T` when unshadowed (`DR-20` `D-01`):
-            if (val_args.len == 0 and std.mem.eql(u8, member_name, "as_bytes")) {
-                const raw_recv_hir = try self.lowerExpr(recv_id, .err_ty);
-                const deref_recv_hir = try self.autoDerefPlace(raw_recv_hir, tok);
-                const inner_ty = self.store.getNode(deref_recv_hir).type_id;
-                const ref_ty = try self.pool.internRef(inner_ty, false);
-                const ref_hir = try self.emitSyntheticAddrOf(deref_recv_hir, ref_ty, false, tok);
-                const as_bytes_payload = [3]u32{ 0, 1, ref_hir.asInt() };
-                const extra_idx = try self.store.appendExtraSlice(&as_bytes_payload);
-                const resolved_ty = if (!target_ty.isError()) target_ty else self.nodeType(expr_id);
-                const fallback_slice_ty = try self.pool.internRef(
-                    try self.pool.internSlice(.u8_ty, false),
+            if (is_static_dot_call and static_kind == .type_ns) {
+                if (self.resolveBuiltinPrimitiveAst(recv_id)) |prim_ty| {
+                    if (try self.tryLowerPrimitiveEndianHelper(
+                        expr_id,
+                        prim_ty,
+                        true,
+                        recv_id,
+                        member_name,
+                        val_args,
+                        tok,
+                    )) |endian_hir| return endian_hir;
+                }
+                if (try self.tryLowerStaticSumConstructor(
+                    expr_id,
+                    member_name,
+                    val_args,
+                    target_ty,
+                    tok,
+                )) |ctor_hir| return ctor_hir;
+            }
+            if (!is_static_dot_call) {
+                const recv_prim_ty = self.pool.unwrapUnderlyingType(self.unwrapRefType(self.nodeType(recv_id)));
+                if (try self.tryLowerPrimitiveEndianHelper(
+                    expr_id,
+                    recv_prim_ty,
                     false,
-                );
-                return self.emitNode(.{
-                    .tag = .hir_intrinsic_call,
-                    .flags = .{ .category = .rvalue, .is_synthetic = true },
-                    .type_id = self.concreteType(
-                        if (!resolved_ty.isError()) resolved_ty else fallback_slice_ty,
-                    ),
-                    .origin_token = tok,
-                    .data = .{ .lhs = @backingInt(IntrinsicKind.as_bytes), .rhs = extra_idx },
-                }, expr_id);
+                    recv_id,
+                    member_name,
+                    val_args,
+                    tok,
+                )) |endian_hir| return endian_hir;
+
+                // Built-in `.as_bytes()` wire view on `IntoBytes` values / `&T` when unshadowed (`DR-20` `D-01`):
+                if (val_args.len == 0 and std.mem.eql(u8, member_name, "as_bytes")) {
+                    const raw_recv_hir = try self.lowerExpr(recv_id, .err_ty);
+                    const deref_recv_hir = try self.autoDerefPlace(raw_recv_hir, tok);
+                    const inner_ty = self.store.getNode(deref_recv_hir).type_id;
+                    const ref_ty = try self.pool.internRef(inner_ty, false);
+                    const ref_hir = try self.emitSyntheticAddrOf(deref_recv_hir, ref_ty, false, tok);
+                    const as_bytes_payload = [3]u32{ 0, 1, ref_hir.asInt() };
+                    const extra_idx = try self.store.appendExtraSlice(&as_bytes_payload);
+                    const resolved_ty = if (!target_ty.isError()) target_ty else self.nodeType(expr_id);
+                    const fallback_slice_ty = try self.pool.internRef(
+                        try self.pool.internSlice(.u8_ty, false),
+                        false,
+                    );
+                    return self.emitNode(.{
+                        .tag = .hir_intrinsic_call,
+                        .flags = .{ .category = .rvalue, .is_synthetic = true },
+                        .type_id = self.concreteType(
+                            if (!resolved_ty.isError()) resolved_ty else fallback_slice_ty,
+                        ),
+                        .origin_token = tok,
+                        .data = .{ .lhs = @backingInt(IntrinsicKind.as_bytes), .rhs = extra_idx },
+                    }, expr_id);
+                }
             }
             return self.emitErrorHole(tok, expr_id, target_ty);
         }
 
         const method_sym = self.sym_table.getSymbol(method_sym_idx).*;
         const sig_view = self.pool.getFnSignatureView(method_sym.type_id);
+        const has_self_receiver = !is_static_dot_call;
 
-        // [1] Evaluate explicit arguments `a_1 .. a_k` strictly left-to-right BEFORE projecting `receiver` (`DR-02` §2.2):
         var seq_stmts: std.ArrayListUnmanaged(u32) = .empty;
         defer seq_stmts.deinit(self.allocator);
-        var arg_temps = try self.allocator.alloc(u32, val_args.len);
-        defer self.allocator.free(arg_temps);
+        var ordered_args: std.ArrayListUnmanaged(HirIndex) = .empty;
+        defer ordered_args.deinit(self.allocator);
 
-        for (val_args, 0..) |arg_id, i| {
-            const param_idx = i + 1;
-            const p_ty = if (sig_view) |sv|
-                (if (param_idx < sv.paramCount()) sv.getParamType(param_idx) else .err_ty)
+        // [1] Evaluate explicit and default arguments (`SE-07`) BEFORE projecting instance `receiver` (`DR-02` §2.2):
+        try self.lowerMappedDirectArgs(
+            expr_id,
+            method_sym_idx,
+            method_sym.type_id,
+            has_self_receiver,
+            val_args,
+            tok,
+            &seq_stmts,
+            &ordered_args,
+        );
+
+        var wrapped_args: std.ArrayListUnmanaged(u32) = .empty;
+        defer wrapped_args.deinit(self.allocator);
+
+        // [2] Evaluate and project `receiver` ONLY for instance method calls (never for Unified `.` static calls):
+        if (has_self_receiver) {
+            const self_mode = if (sig_view) |sv|
+                (if (sv.paramCount() > 0) sv.getParamMode(0) else .let_mode)
+            else
+                .let_mode;
+            const sig_self_ty = if (sig_view) |sv|
+                (if (sv.paramCount() > 0) sv.getParamType(0) else .err_ty)
             else
                 .err_ty;
-            const arg_hir = try self.lowerExpr(arg_id, p_ty);
-            const tmp_slot = try self.allocTempLocal(self.store.getNode(arg_hir).type_id, tok, false);
-            try seq_stmts.append(self.allocator, (try self.emitLocalDeclNode(tmp_slot, arg_hir, tok)).asInt());
-            arg_temps[i] = tmp_slot;
+            const is_mut_self_needed = self_mode == .inout_mode or self_mode == .set_mode or
+                (!sig_self_ty.isError() and self.pool.getTag(sig_self_ty) == .mut_ref_ty);
+            const raw_recv_hir = try self.lowerPlaceWithMutCtx(recv_id, .err_ty, is_mut_self_needed);
+            const self_param_ty = if (!sig_self_ty.isError())
+                sig_self_ty
+            else
+                self.store.getNode(raw_recv_hir).type_id;
+            const adjusted_recv = try self.adjustReceiverForParam(raw_recv_hir, self_param_ty, tok);
+            try wrapped_args.append(
+                self.allocator,
+                (try self.wrapArgProjection(adjusted_recv, self_mode, tok)).asInt(),
+            );
         }
 
-        // [2] Now evaluate and project `receiver` (auto-referencing `&recv` / `&mut recv` when required by `self` param):
-        const raw_recv_hir = try self.lowerExpr(recv_id, .err_ty);
-        const self_param_ty = if (sig_view) |sv|
-            (if (sv.paramCount() > 0) sv.getParamType(0) else self.store.getNode(raw_recv_hir).type_id)
-        else
-            self.store.getNode(raw_recv_hir).type_id;
-        const self_mode = if (sig_view) |sv|
-            (if (sv.paramCount() > 0) sv.getParamMode(0) else .let_mode)
-        else
-            .let_mode;
-        const adjusted_recv = try self.adjustReceiverForParam(raw_recv_hir, self_param_ty, tok);
-
-        var wrapped_args = try self.allocator.alloc(u32, val_args.len + 1);
-        defer self.allocator.free(wrapped_args);
-        wrapped_args[0] = (try self.wrapArgProjection(adjusted_recv, self_mode, tok)).asInt();
-        for (0..val_args.len) |i| {
-            const param_idx = i + 1;
+        const param_offset: usize = if (has_self_receiver) 1 else 0;
+        for (ordered_args.items, 0..) |arg_hir, i| {
+            const param_idx = param_offset + i;
             const p_mode = if (sig_view) |sv|
                 (if (param_idx < sv.paramCount()) sv.getParamMode(param_idx) else .let_mode)
             else
                 .let_mode;
-            const arg_ref = try self.emitVarRef(arg_temps[i], tok, .none);
-            wrapped_args[i + 1] = (try self.wrapArgProjection(arg_ref, p_mode, tok)).asInt();
+            try wrapped_args.append(self.allocator, (try self.wrapArgProjection(arg_hir, p_mode, tok)).asInt());
         }
 
         const callee_hir = try self.emitNode(.{
@@ -7388,7 +9933,7 @@ const HirLowerer = struct {
             .origin_token = tok,
             .data = .{ .lhs = method_sym.def_id.asInt(), .rhs = method_sym_idx.asInt() },
         }, .none);
-        const extra_idx = try self.store.appendLenPrefixedExtra(wrapped_args);
+        const extra_idx = try self.store.appendLenPrefixedExtra(wrapped_args.items);
         const ret_ty = if (!target_ty.isError())
             target_ty
         else if (sig_view) |sv|
@@ -7435,6 +9980,8 @@ const HirLowerer = struct {
         }
 
         if (is_comptime_if and !cond_id.isNone()) {
+            const ct_checkpoint = self.comptime_shadow_log.items.len;
+            defer self.popComptimeBindingsTo(ct_checkpoint);
             if (try self.tryEvalAstComptime(cond_id, .bool_ty)) |cond_val| {
                 const is_taken = switch (cond_val) {
                     .bool_val => |flag| flag,
@@ -7444,6 +9991,7 @@ const HirLowerer = struct {
                 if (is_taken) {
                     return self.lowerBlockExpr(then_id, target_ty, false);
                 }
+                self.popComptimeBindingsTo(ct_checkpoint);
                 if (else_id.isNone()) {
                     return self.emitUnitConst(tok, expr_id);
                 }
@@ -7456,7 +10004,6 @@ const HirLowerer = struct {
 
         return self.lowerConditionBranch(
             cond_id,
-            self.ast_arena.getCstOrigin(expr_id),
             then_id,
             else_id,
             .none,
@@ -7466,7 +10013,140 @@ const HirLowerer = struct {
         );
     }
 
-    /// Flattens top-level `.kw_and` / `.ampamp` conjunctions left-to-right for `if a is Pat and guard` (`CRIT-08`).
+    /// Returns `true` when `clause_id` is a positive `expr is Pattern` AST clause (`SE-01`).
+    fn isPositiveIsClauseAst(self: *const HirLowerer, clause_id: NodeIndex) bool {
+        if (clause_id.isNone() or clause_id.asInt() >= self.ast_arena.countNodes()) return false;
+        const clause_node = self.ast_arena.getNode(clause_id);
+        if (clause_node.lhs.tag != .node or clause_node.rhs.tag != .node) return false;
+        if (clause_node.main_token.isNone() or clause_node.main_token.asInt() >= self.tokens.countTokens()) {
+            return false;
+        }
+        const main_kind = self.tokens.getToken(clause_node.main_token).kind;
+        if (clause_node.tag == .is_expr) {
+            return main_kind != .kw_not;
+        }
+        return clause_node.tag == .binary_expr and main_kind == .kw_is;
+    }
+
+    /// Returns `true` if `expr_id` contains a dominating `.walrus_expr` (`:=`) outside nested blocks/closures (`SE-02`).
+    fn hasDominatingWalrusAst(self: *const HirLowerer, expr_id: NodeIndex, depth: u32) bool {
+        if (depth >= MAX_HIR_LOWER_DEPTH) return false;
+        if (expr_id.isNone() or expr_id.asInt() >= self.ast_arena.countNodes()) return false;
+        const node = self.ast_arena.getNode(expr_id);
+        switch (node.tag) {
+            .walrus_expr => return true,
+            .block,
+            .if_expr,
+            .match_expr,
+            .for_stmt,
+            .while_stmt,
+            .loop_expr,
+            .with_expr,
+            .closure_expr,
+            => return false,
+            .unary_expr => {
+                if (!node.main_token.isNone() and node.main_token.asInt() < self.tokens.countTokens()) {
+                    const op_kind = self.tokens.getToken(node.main_token).kind;
+                    if (op_kind == .kw_not or op_kind == .bang) return false;
+                }
+                if (node.lhs.tag == .node) {
+                    return self.hasDominatingWalrusAst(NodeIndex.fromInt(node.lhs.payload), depth + 1);
+                }
+                return false;
+            },
+            .binary_expr => {
+                if (!node.main_token.isNone() and node.main_token.asInt() < self.tokens.countTokens()) {
+                    const op_kind = self.tokens.getToken(node.main_token).kind;
+                    if (op_kind == .kw_or or op_kind == .pipepipe) return false;
+                    if (op_kind == .kw_orelse or op_kind == .kw_catch) {
+                        return node.lhs.tag == .node and
+                            self.hasDominatingWalrusAst(NodeIndex.fromInt(node.lhs.payload), depth + 1);
+                    }
+                }
+                if (node.lhs.tag == .node and
+                    self.hasDominatingWalrusAst(NodeIndex.fromInt(node.lhs.payload), depth + 1))
+                {
+                    return true;
+                }
+                if (node.rhs.tag == .node and
+                    self.hasDominatingWalrusAst(NodeIndex.fromInt(node.rhs.payload), depth + 1))
+                {
+                    return true;
+                }
+                return false;
+            },
+            .call_expr, .generic_call, .method_call => {
+                if (node.lhs.tag == .node and
+                    self.hasDominatingWalrusAst(NodeIndex.fromInt(node.lhs.payload), depth + 1))
+                {
+                    return true;
+                }
+                const start_idx: usize = if (node.tag == .method_call) 1 else 0;
+                const items = self.getAstExtraSlice(expr_id, true);
+                if (items.len > start_idx) {
+                    for (items[start_idx..]) |raw_arg| {
+                        const arg_id = self.unwrapCallArgAst(NodeIndex.fromInt(raw_arg));
+                        if (!isTypeAstTag(self.ast_arena.getNode(arg_id).tag) and
+                            self.hasDominatingWalrusAst(arg_id, depth + 1))
+                        {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            },
+            .tuple_lit, .array_lit => {
+                for (self.getAstExtraSlice(expr_id, false)) |raw_elem| {
+                    if (self.hasDominatingWalrusAst(NodeIndex.fromInt(raw_elem), depth + 1)) return true;
+                }
+                return false;
+            },
+            .contextual_variant, .struct_lit => {
+                for (self.getAstExtraSlice(expr_id, true)) |raw_elem| {
+                    const elem_id = self.unwrapCallArgAst(NodeIndex.fromInt(raw_elem));
+                    if (self.hasDominatingWalrusAst(elem_id, depth + 1)) return true;
+                }
+                return false;
+            },
+            else => {
+                if (node.lhs.tag == .node and
+                    self.hasDominatingWalrusAst(NodeIndex.fromInt(node.lhs.payload), depth + 1))
+                {
+                    return true;
+                }
+                if (node.rhs.tag == .node and
+                    self.hasDominatingWalrusAst(NodeIndex.fromInt(node.rhs.payload), depth + 1))
+                {
+                    return true;
+                }
+                return false;
+            },
+        }
+    }
+
+    /// Returns `true` if `cond_id` uses `ConditionScope` (`SE-01` positive `is` or `SE-02` dominating `:=` binding).
+    fn hasConditionScope(self: *const HirLowerer, cond_id: NodeIndex) bool {
+        return self.hasConditionScopeDepth(cond_id, 0);
+    }
+
+    /// Bounded recursive helper for `hasConditionScope` along the top-level `and` / `&&` spine.
+    fn hasConditionScopeDepth(self: *const HirLowerer, cond_id: NodeIndex, depth: u32) bool {
+        if (depth >= MAX_HIR_LOWER_DEPTH) return false;
+        if (cond_id.isNone() or cond_id.asInt() >= self.ast_arena.countNodes()) return false;
+        const node = self.ast_arena.getNode(cond_id);
+        if (node.tag == .binary_expr and node.lhs.tag == .node and node.rhs.tag == .node and
+            !node.main_token.isNone() and node.main_token.asInt() < self.tokens.countTokens())
+        {
+            const op_kind = self.tokens.getToken(node.main_token).kind;
+            if (op_kind == .kw_and or op_kind == .ampamp) {
+                return self.hasConditionScopeDepth(NodeIndex.fromInt(node.lhs.payload), depth + 1) or
+                    self.hasConditionScopeDepth(NodeIndex.fromInt(node.rhs.payload), depth + 1);
+            }
+        }
+        return self.isPositiveIsClauseAst(cond_id) or self.hasDominatingWalrusAst(cond_id, depth);
+    }
+
+    /// Flattens top-level `.kw_and` / `.ampamp` conjunctions left-to-right for `hir_cond_if` and `hir_cond_while`.
     fn collectConjunctiveClauses(
         self: *const HirLowerer,
         cond_id: NodeIndex,
@@ -7492,16 +10172,50 @@ const HirLowerer = struct {
                 );
                 return;
             }
-            if (op_kind == .kw_is) has_is_out.* = true;
         }
+        if (self.isPositiveIsClauseAst(cond_id)) has_is_out.* = true;
         try out_clauses.append(self.allocator, cond_id);
     }
 
-    /// Shared condition lowering for `if` and `while` (`if let`, `if opt |cap|`, `if x is Pat`, and boolean `hir_if`).
+    /// Lowers conjunctive `clauses` into `HirCondClauseKind` words (`[0, bool_hir]` or `[1, scrut_hir, pat_idx]`).
+    fn lowerCondClauseList(
+        self: *HirLowerer,
+        clauses: []const NodeIndex,
+        out_words: *std.ArrayListUnmanaged(u32),
+    ) anyerror!void {
+        for (clauses) |clause_id| {
+            if (self.isPositiveIsClauseAst(clause_id)) {
+                const clause_node = self.ast_arena.getNode(clause_id);
+                const scrutinee_hir = try self.lowerExpr(NodeIndex.fromInt(clause_node.lhs.payload), .err_ty);
+                const scrut_ty = self.store.getNode(scrutinee_hir).type_id;
+                const locals_before = self.store.locals.items.len;
+                const pat_idx = try self.lowerTopPattern(
+                    NodeIndex.fromInt(clause_node.rhs.payload),
+                    scrut_ty,
+                    false,
+                );
+                for (self.store.locals.items[locals_before..]) |*bound_local| {
+                    bound_local.is_cond_binding = true;
+                }
+                try out_words.appendSlice(self.allocator, &[3]u32{
+                    @backingInt(HirCondClauseKind.is_match),
+                    scrutinee_hir.asInt(),
+                    pat_idx,
+                });
+            } else {
+                const bool_hir = try self.lowerExpr(clause_id, .bool_ty);
+                try out_words.appendSlice(self.allocator, &[2]u32{
+                    @backingInt(HirCondClauseKind.bool_pred),
+                    bool_hir.asInt(),
+                });
+            }
+        }
+    }
+
+    /// Shared condition lowering for `if` and `while` (`hir_cond_if` and boolean `hir_if`).
     fn lowerConditionBranch(
         self: *HirLowerer,
         cond_id: NodeIndex,
-        enclosing_cst: CstNodeIndex,
         then_id: NodeIndex,
         else_ast_id: NodeIndex,
         synthetic_else_hir: HirIndex,
@@ -7517,475 +10231,51 @@ const HirLowerer = struct {
             self.comptime_runtime_cond_depth -= 1;
         };
 
-        const cond_node = self.ast_arena.getNode(cond_id);
+        // [1] `ConditionScope` `if` (`SE-01` positive `is` and/or `SE-02` dominating `:=` bindings):
+        if (synthetic_else_hir.isNone() and self.hasConditionScope(cond_id)) {
+            var clauses: std.ArrayListUnmanaged(NodeIndex) = .empty;
+            defer clauses.deinit(self.allocator);
+            var has_unused_is = false;
+            try self.collectConjunctiveClauses(cond_id, &clauses, &has_unused_is);
 
-        // [1] `if let pat = scrutinee` / `while let pat = scrutinee`:
-        if (cond_node.tag == .binary_expr and cond_node.lhs.tag == .extra) {
-            const pair = self.getAstExtraSlice(cond_id, false);
-            const pat_id = if (pair.len >= 1) NodeIndex.fromInt(pair[0]) else .none;
-            const scrut_id = if (pair.len >= 2) NodeIndex.fromInt(pair[1]) else .none;
-            const scrut_hir = try self.lowerExpr(scrut_id, .err_ty);
-            const scrut_ty = self.store.getNode(scrut_hir).type_id;
+            var extra_words: std.ArrayListUnmanaged(u32) = .empty;
+            defer extra_words.deinit(self.allocator);
+            try extra_words.append(self.allocator, @intCast(clauses.items.len));
 
-            const then_hir = blk: {
-                const local_checkpoint = self.local_shadow_log.items.len;
-                defer self.popLexicalLocalsTo(local_checkpoint);
-                const pat_idx = try self.lowerTopPattern(pat_id, scrut_ty, false);
-                const body_hir = try self.lowerBlockExpr(then_id, res_ty, false);
-                const arm_start: u32 = @intCast(self.store.match_arms.items.len);
-                try self.store.match_arms.append(self.allocator, .{
-                    .pat_idx = pat_idx,
-                    .guard_hir = .none,
-                    .body_hir = body_hir,
-                    .origin_token = tok,
-                });
-                break :blk arm_start;
-            };
-
-            const else_hir = if (!synthetic_else_hir.isNone())
-                synthetic_else_hir
-            else if (!else_ast_id.isNone())
-                (if (self.ast_arena.getNode(else_ast_id).tag == .if_expr)
-                    try self.lowerIfExpr(else_ast_id, res_ty, false)
-                else
-                    try self.lowerBlockExpr(else_ast_id, res_ty, false))
-            else
-                try self.emitUnitConst(tok, .none);
-
-            const wild_pat = try self.store.appendPat(.{
-                .type_id = scrut_ty,
-                .origin_token = tok,
-                .kind = .wildcard,
-            });
-            try self.store.match_arms.append(self.allocator, .{
-                .pat_idx = wild_pat,
-                .guard_hir = .none,
-                .body_hir = else_hir,
-                .origin_token = tok,
-            });
-            const match_extra = try self.store.appendExtraSlice(&[2]u32{ then_hir, 2 });
-            return self.emitNode(.{
-                .tag = .hir_match,
-                .flags = .{ .category = .rvalue, .is_synthetic = true },
-                .type_id = self.concreteType(res_ty),
-                .origin_token = tok,
-                .data = .{ .lhs = scrut_hir.asInt(), .rhs = match_extra },
-            }, ast_origin);
-        }
-
-        // [2] Optional/Result payload bar `if opt_val |cap| { … }`:
-        const cap_info = self.extractConditionCaptureBar(enclosing_cst);
-        if (!cap_info.token.isNone()) {
-            const scrut_hir = try self.lowerExpr(cond_id, .err_ty);
-            const scrut_ty = self.store.getNode(scrut_hir).type_id;
-            const scr_node = self.pool.getNode(scrut_ty);
-            const is_opt = scr_node.tag == .optional_ty;
-            var payload_ty = self.concreteType(TypeId.fromInt(scr_node.lhs));
-            if (cap_info.is_ref) payload_ty = try self.pool.internRef(payload_ty, false);
-
-            const arm_start: u32 = @intCast(self.store.match_arms.items.len);
+            var then_hir: HirIndex = .none;
             {
                 const local_checkpoint = self.local_shadow_log.items.len;
                 defer self.popLexicalLocalsTo(local_checkpoint);
-                const cap_lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, cap_info.token);
-                const cap_sym_id = if (cap_lex.len > 0 and !std.mem.eql(u8, cap_lex, "_"))
-                    try self.interner.intern(cap_lex)
-                else
-                    SymbolId.empty;
-                const cap_slot = try self.store.appendLocal(.{
-                    .name = cap_sym_id,
-                    .type_id = payload_ty,
-                    .decl_span = self.tokens.getTokenSpan(self.store.file_id, cap_info.token),
-                    .mode = .let_mode,
-                    .is_mut = false,
-                    .is_param = false,
-                    .is_temp = cap_sym_id == .empty,
-                });
-                try self.pushLexicalLocal(cap_sym_id, cap_slot);
-                const bind_pat = try self.store.appendPat(.{
-                    .type_id = payload_ty,
-                    .origin_token = cap_info.token,
-                    .kind = .{ .bind = .{ .local_id = cap_slot, .is_mut = false, .is_ref = cap_info.is_ref } },
-                });
-                const sub_start = try self.store.appendExtraSlice(&[1]u32{bind_pat});
-                const some_pat = try self.store.appendPat(.{
-                    .type_id = scrut_ty,
-                    .origin_token = tok,
-                    .kind = .{
-                        .variant = .{
-                            .tag_ordinal = if (is_opt) 1 else 0,
-                            .payload_ty = TypeId.fromInt(scr_node.lhs),
-                            .sub_start = sub_start,
-                            .sub_len = 1,
-                        },
-                    },
-                });
-                const then_hir = try self.lowerBlockExpr(then_id, res_ty, false);
-                try self.store.match_arms.append(self.allocator, .{
-                    .pat_idx = some_pat,
-                    .guard_hir = .none,
-                    .body_hir = then_hir,
-                    .origin_token = tok,
-                });
+
+                const was_in_cond = self.is_in_cond_scope;
+                self.is_in_cond_scope = true;
+                {
+                    errdefer self.is_in_cond_scope = was_in_cond;
+                    try self.lowerCondClauseList(clauses.items, &extra_words);
+                }
+                self.is_in_cond_scope = was_in_cond;
+
+                then_hir = try self.lowerBlockExpr(then_id, res_ty, false);
             }
 
-            const else_hir = if (!synthetic_else_hir.isNone())
-                synthetic_else_hir
-            else if (!else_ast_id.isNone())
+            const else_hir = if (!else_ast_id.isNone())
                 (if (self.ast_arena.getNode(else_ast_id).tag == .if_expr)
                     try self.lowerIfExpr(else_ast_id, res_ty, false)
                 else
                     try self.lowerBlockExpr(else_ast_id, res_ty, false))
             else
-                try self.emitUnitConst(tok, .none);
+                HirIndex.none;
 
-            const wild_pat = try self.store.appendPat(.{
-                .type_id = scrut_ty,
-                .origin_token = tok,
-                .kind = .wildcard,
-            });
-            try self.store.match_arms.append(self.allocator, .{
-                .pat_idx = wild_pat,
-                .guard_hir = .none,
-                .body_hir = else_hir,
-                .origin_token = tok,
-            });
-            const match_extra = try self.store.appendExtraSlice(&[2]u32{ arm_start, 2 });
+            try extra_words.append(self.allocator, then_hir.asInt());
+            try extra_words.append(self.allocator, else_hir.asInt());
+            const extra_idx = try self.store.appendExtraSlice(extra_words.items);
             return self.emitNode(.{
-                .tag = .hir_match,
-                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .tag = .hir_cond_if,
+                .flags = .{ .category = .rvalue, .is_unsafe = self.is_in_unsafe },
                 .type_id = self.concreteType(res_ty),
                 .origin_token = tok,
-                .data = .{ .lhs = scrut_hir.asInt(), .rhs = match_extra },
+                .data = .{ .lhs = extra_idx, .rhs = 0 },
             }, ast_origin);
-        }
-
-        // [3] Positive `if x is Pattern { … }` and conjunctive `if x is Pattern and guard { … }` (`CRIT-08`):
-        if (cond_node.tag == .binary_expr and !cond_node.main_token.isNone()) {
-            const top_op = self.tokens.getToken(cond_node.main_token).kind;
-            if (top_op == .kw_is and cond_node.lhs.tag == .node and cond_node.rhs.tag == .node) {
-                const scrut_hir = try self.lowerExpr(NodeIndex.fromInt(cond_node.lhs.payload), .err_ty);
-                const scrut_ty = self.store.getNode(scrut_hir).type_id;
-                const arm_start: u32 = @intCast(self.store.match_arms.items.len);
-                {
-                    const local_checkpoint = self.local_shadow_log.items.len;
-                    defer self.popLexicalLocalsTo(local_checkpoint);
-                    const pat_idx = try self.lowerTopPattern(NodeIndex.fromInt(cond_node.rhs.payload), scrut_ty, false);
-                    const then_hir = try self.lowerBlockExpr(then_id, res_ty, false);
-                    try self.store.match_arms.append(self.allocator, .{
-                        .pat_idx = pat_idx,
-                        .guard_hir = .none,
-                        .body_hir = then_hir,
-                        .origin_token = tok,
-                    });
-                }
-                const else_hir = if (!synthetic_else_hir.isNone())
-                    synthetic_else_hir
-                else if (!else_ast_id.isNone())
-                    (if (self.ast_arena.getNode(else_ast_id).tag == .if_expr)
-                        try self.lowerIfExpr(else_ast_id, res_ty, false)
-                    else
-                        try self.lowerBlockExpr(else_ast_id, res_ty, false))
-                else
-                    try self.emitUnitConst(tok, .none);
-
-                const wild_pat = try self.store.appendPat(.{
-                    .type_id = scrut_ty,
-                    .origin_token = tok,
-                    .kind = .wildcard,
-                });
-                try self.store.match_arms.append(self.allocator, .{
-                    .pat_idx = wild_pat,
-                    .guard_hir = .none,
-                    .body_hir = else_hir,
-                    .origin_token = tok,
-                });
-                const match_extra = try self.store.appendExtraSlice(&[2]u32{ arm_start, 2 });
-                return self.emitNode(.{
-                    .tag = .hir_match,
-                    .flags = .{ .category = .rvalue, .is_synthetic = true },
-                    .type_id = self.concreteType(res_ty),
-                    .origin_token = tok,
-                    .data = .{ .lhs = scrut_hir.asInt(), .rhs = match_extra },
-                }, ast_origin);
-            }
-
-            if (top_op == .kw_and or top_op == .ampamp) {
-                var clauses: std.ArrayListUnmanaged(NodeIndex) = .empty;
-                defer clauses.deinit(self.allocator);
-                var has_is_clause = false;
-                try self.collectConjunctiveClauses(cond_id, &clauses, &has_is_clause);
-                if (has_is_clause and clauses.items.len >= 2) {
-                    const ConjStep = union(enum) {
-                        is_pat: struct {
-                            scrut_hir: HirIndex,
-                            scrut_ty: TypeId,
-                            pat_idx: u32,
-                            clause_tok: TokenIndex,
-                        },
-                        bool_cond: struct {
-                            cond_hir: HirIndex,
-                            clause_tok: TokenIndex,
-                        },
-                    };
-                    var steps: std.ArrayListUnmanaged(ConjStep) = .empty;
-                    defer steps.deinit(self.allocator);
-
-                    const has_else = !synthetic_else_hir.isNone() or !else_ast_id.isNone();
-                    const concrete_res_ty = self.concreteType(res_ty);
-
-                    if (!has_else) {
-                        const local_checkpoint = self.local_shadow_log.items.len;
-                        defer self.popLexicalLocalsTo(local_checkpoint);
-
-                        for (clauses.items) |clause_id| {
-                            const c_node = self.ast_arena.getNode(clause_id);
-                            if (c_node.tag == .binary_expr and c_node.lhs.tag == .node and c_node.rhs.tag == .node and
-                                !c_node.main_token.isNone() and
-                                self.tokens.getToken(c_node.main_token).kind == .kw_is)
-                            {
-                                const scr_hir = try self.lowerExpr(NodeIndex.fromInt(c_node.lhs.payload), .err_ty);
-                                const scr_ty = self.store.getNode(scr_hir).type_id;
-                                const pat_idx = try self.lowerTopPattern(
-                                    NodeIndex.fromInt(c_node.rhs.payload),
-                                    scr_ty,
-                                    false,
-                                );
-                                try steps.append(self.allocator, .{
-                                    .is_pat = .{
-                                        .scrut_hir = scr_hir,
-                                        .scrut_ty = scr_ty,
-                                        .pat_idx = pat_idx,
-                                        .clause_tok = c_node.main_token,
-                                    },
-                                });
-                            } else {
-                                try steps.append(self.allocator, .{
-                                    .bool_cond = .{
-                                        .cond_hir = try self.lowerExpr(clause_id, .bool_ty),
-                                        .clause_tok = c_node.main_token,
-                                    },
-                                });
-                            }
-                        }
-
-                        var cur_hir = try self.lowerBlockExpr(then_id, .unit_ty, false);
-                        var rev_i = steps.items.len;
-                        while (rev_i > 0) {
-                            rev_i -= 1;
-                            switch (steps.items[rev_i]) {
-                                .bool_cond => |bc| {
-                                    const if_extra = try self.store.appendExtraSlice(&[2]u32{
-                                        cur_hir.asInt(),
-                                        HirIndex.none.asInt(),
-                                    });
-                                    cur_hir = try self.emitNode(.{
-                                        .tag = .hir_if,
-                                        .flags = .{ .category = .rvalue, .is_synthetic = true },
-                                        .type_id = .unit_ty,
-                                        .origin_token = bc.clause_tok,
-                                        .data = .{ .lhs = bc.cond_hir.asInt(), .rhs = if_extra },
-                                    }, .none);
-                                },
-                                .is_pat => |ip| {
-                                    const wild_pat = try self.store.appendPat(.{
-                                        .type_id = ip.scrut_ty,
-                                        .origin_token = ip.clause_tok,
-                                        .kind = .wildcard,
-                                    });
-                                    const arm_start: u32 = @intCast(self.store.match_arms.items.len);
-                                    try self.store.match_arms.append(self.allocator, .{
-                                        .pat_idx = ip.pat_idx,
-                                        .guard_hir = .none,
-                                        .body_hir = cur_hir,
-                                        .origin_token = ip.clause_tok,
-                                    });
-                                    try self.store.match_arms.append(self.allocator, .{
-                                        .pat_idx = wild_pat,
-                                        .guard_hir = .none,
-                                        .body_hir = try self.emitUnitConst(ip.clause_tok, .none),
-                                        .origin_token = ip.clause_tok,
-                                    });
-                                    const match_extra = try self.store.appendExtraSlice(&[2]u32{ arm_start, 2 });
-                                    cur_hir = try self.emitNode(.{
-                                        .tag = .hir_match,
-                                        .flags = .{ .category = .rvalue, .is_synthetic = true },
-                                        .type_id = .unit_ty,
-                                        .origin_token = ip.clause_tok,
-                                        .data = .{ .lhs = ip.scrut_hir.asInt(), .rhs = match_extra },
-                                    }, .none);
-                                },
-                            }
-                        }
-                        return cur_hir;
-                    }
-
-                    const done_loop_id = self.next_loop_id;
-                    self.next_loop_id += 1;
-                    const mismatch_loop_id = self.next_loop_id;
-                    self.next_loop_id += 1;
-
-                    const guarded_chain = blk: {
-                        const local_checkpoint = self.local_shadow_log.items.len;
-                        defer self.popLexicalLocalsTo(local_checkpoint);
-
-                        for (clauses.items) |clause_id| {
-                            const c_node = self.ast_arena.getNode(clause_id);
-                            if (c_node.tag == .binary_expr and c_node.lhs.tag == .node and c_node.rhs.tag == .node and
-                                !c_node.main_token.isNone() and
-                                self.tokens.getToken(c_node.main_token).kind == .kw_is)
-                            {
-                                const scr_hir = try self.lowerExpr(NodeIndex.fromInt(c_node.lhs.payload), .err_ty);
-                                const scr_ty = self.store.getNode(scr_hir).type_id;
-                                const pat_idx = try self.lowerTopPattern(
-                                    NodeIndex.fromInt(c_node.rhs.payload),
-                                    scr_ty,
-                                    false,
-                                );
-                                try steps.append(self.allocator, .{
-                                    .is_pat = .{
-                                        .scrut_hir = scr_hir,
-                                        .scrut_ty = scr_ty,
-                                        .pat_idx = pat_idx,
-                                        .clause_tok = c_node.main_token,
-                                    },
-                                });
-                            } else {
-                                try steps.append(self.allocator, .{
-                                    .bool_cond = .{
-                                        .cond_hir = try self.lowerExpr(clause_id, .bool_ty),
-                                        .clause_tok = c_node.main_token,
-                                    },
-                                });
-                            }
-                        }
-
-                        const then_val = try self.lowerBlockExpr(then_id, concrete_res_ty, false);
-                        var cur_hir = if (self.store.getNode(then_val).type_id == .never_ty)
-                            then_val
-                        else
-                            try self.emitNode(.{
-                                .tag = .hir_break,
-                                .flags = .{ .category = .diverging, .is_synthetic = true },
-                                .type_id = .never_ty,
-                                .origin_token = tok,
-                                .data = .{ .lhs = done_loop_id, .rhs = then_val.asInt() },
-                            }, .none);
-
-                        var rev_i = steps.items.len;
-                        while (rev_i > 0) {
-                            rev_i -= 1;
-                            switch (steps.items[rev_i]) {
-                                .bool_cond => |bc| {
-                                    const break_miss = try self.emitNode(.{
-                                        .tag = .hir_break,
-                                        .flags = .{ .category = .diverging, .is_synthetic = true },
-                                        .type_id = .never_ty,
-                                        .origin_token = bc.clause_tok,
-                                        .data = .{
-                                            .lhs = mismatch_loop_id,
-                                            .rhs = (try self.emitUnitConst(bc.clause_tok, .none)).asInt(),
-                                        },
-                                    }, .none);
-                                    const if_extra = try self.store.appendExtraSlice(&[2]u32{
-                                        cur_hir.asInt(),
-                                        break_miss.asInt(),
-                                    });
-                                    cur_hir = try self.emitNode(.{
-                                        .tag = .hir_if,
-                                        .flags = .{ .category = .rvalue, .is_synthetic = true },
-                                        .type_id = .unit_ty,
-                                        .origin_token = bc.clause_tok,
-                                        .data = .{ .lhs = bc.cond_hir.asInt(), .rhs = if_extra },
-                                    }, .none);
-                                },
-                                .is_pat => |ip| {
-                                    const break_miss = try self.emitNode(.{
-                                        .tag = .hir_break,
-                                        .flags = .{ .category = .diverging, .is_synthetic = true },
-                                        .type_id = .never_ty,
-                                        .origin_token = ip.clause_tok,
-                                        .data = .{
-                                            .lhs = mismatch_loop_id,
-                                            .rhs = (try self.emitUnitConst(ip.clause_tok, .none)).asInt(),
-                                        },
-                                    }, .none);
-                                    const wild_pat = try self.store.appendPat(.{
-                                        .type_id = ip.scrut_ty,
-                                        .origin_token = ip.clause_tok,
-                                        .kind = .wildcard,
-                                    });
-                                    const arm_start: u32 = @intCast(self.store.match_arms.items.len);
-                                    try self.store.match_arms.append(self.allocator, .{
-                                        .pat_idx = ip.pat_idx,
-                                        .guard_hir = .none,
-                                        .body_hir = cur_hir,
-                                        .origin_token = ip.clause_tok,
-                                    });
-                                    try self.store.match_arms.append(self.allocator, .{
-                                        .pat_idx = wild_pat,
-                                        .guard_hir = .none,
-                                        .body_hir = break_miss,
-                                        .origin_token = ip.clause_tok,
-                                    });
-                                    const match_extra = try self.store.appendExtraSlice(&[2]u32{ arm_start, 2 });
-                                    cur_hir = try self.emitNode(.{
-                                        .tag = .hir_match,
-                                        .flags = .{ .category = .rvalue, .is_synthetic = true },
-                                        .type_id = .unit_ty,
-                                        .origin_token = ip.clause_tok,
-                                        .data = .{ .lhs = ip.scrut_hir.asInt(), .rhs = match_extra },
-                                    }, .none);
-                                },
-                            }
-                        }
-                        break :blk cur_hir;
-                    };
-
-                    const mismatch_loop = try self.emitNode(.{
-                        .tag = .hir_loop,
-                        .flags = .{ .category = .rvalue, .is_synthetic = true },
-                        .type_id = .unit_ty,
-                        .origin_token = tok,
-                        .data = .{ .lhs = guarded_chain.asInt(), .rhs = mismatch_loop_id },
-                    }, .none);
-
-                    const else_val = if (!synthetic_else_hir.isNone())
-                        synthetic_else_hir
-                    else if (self.ast_arena.getNode(else_ast_id).tag == .if_expr)
-                        try self.lowerIfExpr(else_ast_id, concrete_res_ty, false)
-                    else
-                        try self.lowerBlockExpr(else_ast_id, concrete_res_ty, false);
-
-                    const else_exit = if (self.store.getNode(else_val).type_id == .never_ty)
-                        else_val
-                    else
-                        try self.emitNode(.{
-                            .tag = .hir_break,
-                            .flags = .{ .category = .diverging, .is_synthetic = true },
-                            .type_id = .never_ty,
-                            .origin_token = tok,
-                            .data = .{ .lhs = done_loop_id, .rhs = else_val.asInt() },
-                        }, .none);
-
-                    const done_body = try self.emitSyntheticBlock(
-                        &[1]u32{mismatch_loop.asInt()},
-                        else_exit,
-                        .never_ty,
-                        tok,
-                    );
-                    return self.emitNode(.{
-                        .tag = .hir_loop,
-                        .flags = .{
-                            .category = if (concrete_res_ty == .never_ty) .diverging else .rvalue,
-                            .is_synthetic = true,
-                        },
-                        .type_id = concrete_res_ty,
-                        .origin_token = tok,
-                        .data = .{ .lhs = done_body.asInt(), .rhs = done_loop_id },
-                    }, ast_origin);
-                }
-            }
         }
 
         // [4] Standard boolean `hir_if`:
@@ -8104,13 +10394,27 @@ const HirLowerer = struct {
         }, expr_id);
     }
 
-    /// Lowers `loop { … }` (`loop_expr`) into `hir_loop` with its `break` value type.
+    /// Lowers `loop { … }` (`loop_expr`) into `hir_loop` with its `break` value type and optional `:label` (`SE-06`).
     fn lowerLoopExpr(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) !HirIndex {
         const ast_node = self.ast_arena.getNode(expr_id);
         const body_id = if (ast_node.lhs.tag == .node) NodeIndex.fromInt(ast_node.lhs.payload) else .none;
+        const label_tok = if (ast_node.rhs.tag == .token) TokenIndex.fromInt(ast_node.rhs.payload) else .none;
+        const res_ty = if (!target_ty.isError()) target_ty else .unit_ty;
+
         const loop_id = self.next_loop_id;
         self.next_loop_id += 1;
         try self.recordLoopContractFromAst(expr_id, loop_id);
+        const label_id = try self.internLabelToken(label_tok);
+        try self.loop_stack.append(self.allocator, .{
+            .loop_id = loop_id,
+            .label_id = label_id,
+            .is_comptime_for = false,
+            .result_opt_local = NONE_U32,
+            .payload_ty = self.concreteType(res_ty),
+            .opt_ty = .unit_ty,
+        });
+        defer _ = self.loop_stack.pop();
+
         const saved_loop_id = self.current_loop_id;
         const saved_in_ct_for = self.is_in_comptime_for;
         self.current_loop_id = loop_id;
@@ -8121,7 +10425,6 @@ const HirLowerer = struct {
         }
 
         const body_hir = try self.lowerBlockExpr(body_id, .unit_ty, false);
-        const res_ty = if (!target_ty.isError()) target_ty else .unit_ty;
         return self.emitNode(.{
             .tag = .hir_loop,
             .flags = .{
@@ -8144,7 +10447,9 @@ const HirLowerer = struct {
 
         const saved_ret_ty = self.current_fn_ret_ty;
         const saved_loop_id = self.current_loop_id;
+        const saved_loop_floor = self.closure_loop_stack_floor;
         const saved_in_ct_for = self.is_in_comptime_for;
+        const was_in_cond_scope = self.is_in_cond_scope;
         const saved_ceil = self.closure_outer_local_ceil;
         const saved_captures_len = self.active_closure_captures.items.len;
         const local_checkpoint = self.local_shadow_log.items.len;
@@ -8152,7 +10457,9 @@ const HirLowerer = struct {
             self.popLexicalLocalsTo(local_checkpoint);
             self.active_closure_captures.shrinkRetainingCapacity(saved_captures_len);
             self.closure_outer_local_ceil = saved_ceil;
+            self.is_in_cond_scope = was_in_cond_scope;
             self.is_in_comptime_for = saved_in_ct_for;
+            self.closure_loop_stack_floor = saved_loop_floor;
             self.current_loop_id = saved_loop_id;
             self.current_fn_ret_ty = saved_ret_ty;
         }
@@ -8170,7 +10477,9 @@ const HirLowerer = struct {
         self.closure_outer_local_ceil = return_local_id;
         self.current_fn_ret_ty = ret_ty;
         self.current_loop_id = null;
+        self.closure_loop_stack_floor = self.loop_stack.items.len;
         self.is_in_comptime_for = false;
+        self.is_in_cond_scope = false;
 
         for (param_tokens, 0..) |raw_tok, i| {
             const p_tok = TokenIndex.fromInt(raw_tok);
@@ -8377,52 +10686,6 @@ const HirLowerer = struct {
             }
         }
         return .none;
-    }
-
-    /// Extracts an optional `|cap|` or `|&cap|` payload capture bar from an `if` or `while` CST header.
-    fn extractConditionCaptureBar(
-        self: *const HirLowerer,
-        enclosing_cst: CstNodeIndex,
-    ) struct { token: TokenIndex, is_ref: bool } {
-        if (enclosing_cst.isNone() or enclosing_cst.asInt() >= self.cst_arena.countNodes()) {
-            return .{ .token = .none, .is_ref = false };
-        }
-        const start_idx: usize = enclosing_cst.asInt();
-        const rec = self.cst_arena.getNode(enclosing_cst);
-        const end_idx: usize = @min(
-            start_idx + @max(@as(usize, rec.subtree_size), 1),
-            self.cst_arena.countNodes(),
-        );
-        var cur = start_idx + 1;
-        while (cur < end_idx) {
-            const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
-            if (sub.kind == .block) break;
-            if (sub.subtree_size <= 1 and !sub.token.isNone() and
-                sub.token.asInt() < self.tokens.countTokens() and
-                self.tokens.getToken(sub.token).kind == .pipe)
-            {
-                var is_ref = false;
-                var scan = cur + 1;
-                while (scan < end_idx) : (scan += 1) {
-                    const next_leaf = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(scan)));
-                    if (next_leaf.subtree_size <= 1 and !next_leaf.token.isNone() and
-                        next_leaf.token.asInt() < self.tokens.countTokens())
-                    {
-                        const nk = self.tokens.getToken(next_leaf.token).kind;
-                        if (nk == .amp) {
-                            is_ref = true;
-                            continue;
-                        }
-                        if (symbol_resolver.isIdentifierToken(nk)) {
-                            return .{ .token = next_leaf.token, .is_ref = is_ref };
-                        }
-                        break;
-                    }
-                }
-            }
-            cur += 1;
-        }
-        return .{ .token = .none, .is_ref = false };
     }
 
     /// Scans `.match_arm` CST subtrees of `match_expr_id` to recover optional `if guard_expr` AST nodes (`CRIT-11`).
@@ -8814,6 +11077,11 @@ const HirLowerer = struct {
                 const pat_cst = self.ast_arena.getCstOrigin(pat_id);
                 const is_ref = self.hasKeywordInCst(pat_cst, .kw_ref) or self.hasKeywordInCst(pat_cst, .amp);
                 const has_pat_mut = self.hasKeywordInCst(pat_cst, .kw_mut);
+                if (!is_ref and !has_pat_mut and !is_decl_mut) {
+                    if (try self.tryEvalConstPatternValue(pat_id, concrete_scrut)) |const_val| {
+                        return self.emitConstPatternVal(const_val, concrete_scrut, tok);
+                    }
+                }
                 const is_ref_mut = is_ref and has_pat_mut;
                 const is_local_mut = is_decl_mut or (!is_ref and has_pat_mut);
                 const bind_ty = if (is_ref) try self.pool.internRef(concrete_scrut, is_ref_mut) else concrete_scrut;
@@ -8997,6 +11265,11 @@ const HirLowerer = struct {
             },
             .variant_pat => {
                 const sub_nodes = self.getAstExtraSlice(pat_id, false);
+                if (sub_nodes.len == 0) {
+                    if (try self.tryEvalConstPatternValue(pat_id, concrete_scrut)) |const_val| {
+                        return self.emitConstPatternVal(const_val, concrete_scrut, tok);
+                    }
+                }
                 const unwrapped = self.unwrapRefType(concrete_scrut);
                 const scr_ty_node = self.pool.getNode(unwrapped);
                 const var_name = self.extractVariantPatName(pat_id);
@@ -9085,10 +11358,367 @@ const HirLowerer = struct {
                     .kind = .{ .or_pat = .{ .lhs_pat = lhs_idx, .rhs_pat = rhs_idx } },
                 });
             },
+            .at_pat => {
+                const pat_cst = self.ast_arena.getCstOrigin(pat_id);
+                var is_ref = self.hasKeywordInCst(pat_cst, .kw_ref) or self.hasKeywordInCst(pat_cst, .amp);
+                var has_pat_mut = self.hasKeywordInCst(pat_cst, .kw_mut);
+                if (pat_node.lhs.tag == .token) {
+                    const mod_tok = TokenIndex.fromInt(pat_node.lhs.payload);
+                    if (!mod_tok.isNone() and mod_tok.asInt() < self.tokens.countTokens()) {
+                        const mod_kind = self.tokens.getToken(mod_tok).kind;
+                        if (mod_kind == .kw_ref or mod_kind == .amp) is_ref = true;
+                        if (mod_kind == .kw_mut) has_pat_mut = true;
+                    }
+                }
+                const is_ref_mut = is_ref and has_pat_mut;
+                const is_local_mut = is_decl_mut or (!is_ref and has_pat_mut);
+                const bind_ty = if (is_ref) try self.pool.internRef(concrete_scrut, is_ref_mut) else concrete_scrut;
+                const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, tok);
+
+                const sub_pat_idx = if (pat_node.rhs.tag == .node)
+                    try self.lowerPattern(NodeIndex.fromInt(pat_node.rhs.payload), concrete_scrut, is_decl_mut)
+                else
+                    try self.store.appendPat(.{ .type_id = concrete_scrut, .origin_token = tok, .kind = .wildcard });
+
+                if (lexeme.len == 0 or std.mem.eql(u8, lexeme, "_")) {
+                    return sub_pat_idx;
+                }
+                const existing_local = blk: {
+                    if (self.interner.lookup(lexeme)) |existing_id| {
+                        const floor = @min(self.current_pat_shadow_floor, self.local_shadow_log.items.len);
+                        for (self.local_shadow_log.items[floor..]) |shadow_item| {
+                            if (shadow_item.name_id == existing_id.asInt()) {
+                                if (self.active_name_to_local.get(existing_id.asInt())) |cur_slot| {
+                                    if (self.store.locals.items[cur_slot].type_id == bind_ty) {
+                                        break :blk @as(?u32, cur_slot);
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    break :blk null;
+                };
+                const slot_id = existing_local orelse try self.bindSimplePatternLocal(pat_id, bind_ty, is_local_mut);
+                return self.store.appendPat(.{
+                    .type_id = concrete_scrut,
+                    .origin_token = tok,
+                    .kind = .{
+                        .at_pat = .{
+                            .local_id = slot_id,
+                            .is_mut = is_ref_mut or is_local_mut,
+                            .is_ref = is_ref,
+                            .sub_pat = sub_pat_idx,
+                        },
+                    },
+                });
+            },
+            .slice_pat => {
+                const sub_nodes = self.getAstExtraSlice(pat_id, false);
+                const unwrapped = self.unwrapRefType(concrete_scrut);
+                const scr_node = self.pool.getNode(unwrapped);
+                const elem_ty: TypeId = if (scr_node.tag == .slice_ty or scr_node.tag == .array_ty or
+                    scr_node.tag == .soa_slice_ty or scr_node.tag == .soa_array_ty)
+                    self.concreteType(TypeId.fromInt(scr_node.lhs))
+                else
+                    .unit_ty;
+                const is_scr_mut = self.pool.getTag(concrete_scrut) == .mut_ref_ty or is_decl_mut;
+
+                var prefix_pats: std.ArrayListUnmanaged(u32) = .empty;
+                defer prefix_pats.deinit(self.allocator);
+                var suffix_pats: std.ArrayListUnmanaged(u32) = .empty;
+                defer suffix_pats.deinit(self.allocator);
+
+                var has_rest = false;
+                var rest_local_id: u32 = NONE_U32;
+                var is_rest_mut = false;
+                var is_rest_ref = false;
+
+                for (sub_nodes) |raw_sub| {
+                    const sub_id = NodeIndex.fromInt(raw_sub);
+                    if (self.isSliceRestPatternAst(sub_id)) {
+                        if (!has_rest) {
+                            has_rest = true;
+                            const sub_node = self.ast_arena.getNode(sub_id);
+                            if (sub_node.tag == .bind_pat) {
+                                const rest_lex = symbol_resolver.extractTokenSlice(
+                                    self.source,
+                                    self.tokens,
+                                    sub_node.main_token,
+                                );
+                                if (rest_lex.len > 0 and !std.mem.eql(u8, rest_lex, "_")) {
+                                    const rest_cst = self.ast_arena.getCstOrigin(sub_id);
+                                    is_rest_ref = self.hasKeywordInCst(rest_cst, .kw_ref) or
+                                        self.hasKeywordInCst(rest_cst, .amp);
+                                    const has_rest_mut = self.hasKeywordInCst(rest_cst, .kw_mut);
+                                    is_rest_mut = is_decl_mut or has_rest_mut;
+                                    const subslice_ty = try self.pool.internRef(
+                                        try self.pool.internSlice(elem_ty, false),
+                                        is_scr_mut and has_rest_mut,
+                                    );
+                                    const existing_rest = blk_rest: {
+                                        if (self.interner.lookup(rest_lex)) |existing_id| {
+                                            const floor = @min(
+                                                self.current_pat_shadow_floor,
+                                                self.local_shadow_log.items.len,
+                                            );
+                                            for (self.local_shadow_log.items[floor..]) |shadow_item| {
+                                                if (shadow_item.name_id == existing_id.asInt()) {
+                                                    if (self.active_name_to_local.get(existing_id.asInt())) |cur_slot| {
+                                                        if (self.store.locals.items[cur_slot].type_id == subslice_ty) {
+                                                            break :blk_rest @as(?u32, cur_slot);
+                                                        }
+                                                    }
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        break :blk_rest null;
+                                    };
+                                    rest_local_id = existing_rest orelse
+                                        try self.bindSimplePatternLocal(
+                                            sub_id,
+                                            subslice_ty,
+                                            !is_rest_ref and is_rest_mut,
+                                        );
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    const elem_pat_idx = try self.lowerPattern(sub_id, elem_ty, is_decl_mut);
+                    if (!has_rest) {
+                        try prefix_pats.append(self.allocator, elem_pat_idx);
+                    } else {
+                        try suffix_pats.append(self.allocator, elem_pat_idx);
+                    }
+                }
+
+                var combined_subs: std.ArrayListUnmanaged(u32) = .empty;
+                defer combined_subs.deinit(self.allocator);
+                try combined_subs.appendSlice(self.allocator, prefix_pats.items);
+                try combined_subs.appendSlice(self.allocator, suffix_pats.items);
+                const prefix_start = if (combined_subs.items.len > 0)
+                    try self.store.appendExtraSlice(combined_subs.items)
+                else
+                    0;
+
+                return self.store.appendPat(.{
+                    .type_id = concrete_scrut,
+                    .origin_token = tok,
+                    .kind = .{
+                        .slice_pat = .{
+                            .prefix_start = prefix_start,
+                            .prefix_len = @intCast(prefix_pats.items.len),
+                            .suffix_len = @intCast(suffix_pats.items.len),
+                            .has_rest = has_rest,
+                            .rest_local_id = rest_local_id,
+                            .is_rest_mut = is_rest_mut,
+                            .is_rest_ref = is_rest_ref,
+                        },
+                    },
+                });
+            },
             else => {
+                if (try self.tryEvalConstPatternValue(pat_id, concrete_scrut)) |const_val| {
+                    return self.emitConstPatternVal(const_val, concrete_scrut, tok);
+                }
                 return self.store.appendPat(.{ .type_id = concrete_scrut, .origin_token = tok, .kind = .wildcard });
             },
         }
+    }
+
+    /// Evaluates a constant pattern (`if n is MAX_RETRIES` or `if n is u8.MAX`) when `pat_id` denotes a `const`.
+    fn tryEvalConstPatternValue(
+        self: *HirLowerer,
+        pat_id: NodeIndex,
+        concrete_scrut: TypeId,
+    ) anyerror!?ComptimeValue {
+        const pat_sym = self.nodeSymbol(pat_id);
+        if (!pat_sym.isNone()) {
+            const sym = self.sym_table.getSymbol(pat_sym).*;
+            if (sym.kind == .const_sym) {
+                if (sym.name != .empty) {
+                    if (self.active_comptime_vals.get(sym.name.asInt())) |ct_val| return ct_val;
+                }
+                return self.evalConstSymbol(pat_sym);
+            }
+            return null;
+        }
+
+        const pat_node = self.ast_arena.getNode(pat_id);
+        switch (pat_node.tag) {
+            .variant_pat => {
+                if (self.getAstExtraSlice(pat_id, false).len > 0) return null;
+                const unwrapped = self.pool.unwrapUnderlyingType(self.unwrapRefType(concrete_scrut));
+                const scr_tag = self.pool.getTag(unwrapped);
+                if (scr_tag == .optional_ty or scr_tag == .result_ty or scr_tag == .enum_ty) return null;
+                return self.tryEvalVariantPatPathConst(pat_id);
+            },
+            .bind_pat => {
+                if (self.side_tables != null or pat_node.main_token.isNone()) return null;
+                const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, pat_node.main_token);
+                const name_id = self.interner.lookup(lexeme) orelse return null;
+                switch (self.sym_table.lookupLexical(self.current_scope, name_id, NamespaceMask.VALUE_ONLY)) {
+                    .found => |sym_idx| {
+                        if (self.sym_table.getSymbol(sym_idx).kind == .const_sym) {
+                            if (self.active_comptime_vals.get(name_id.asInt())) |ct_val| return ct_val;
+                            return self.evalConstSymbol(sym_idx);
+                        }
+                    },
+                    else => {},
+                }
+                return null;
+            },
+            .ident_expr, .path_expr, .field_access => return self.tryEvalAstComptime(pat_id, concrete_scrut),
+            else => return null,
+        }
+    }
+
+    /// Resolves a zero-argument `.variant_pat` CST path (`MAX_RETRIES`, `Mod.MAX`, or `u8.MAX`) to a `ComptimeValue`.
+    fn tryEvalVariantPatPathConst(self: *HirLowerer, pat_id: NodeIndex) anyerror!?ComptimeValue {
+        const pat_cst = self.ast_arena.getCstOrigin(pat_id);
+        var ident_toks: [8]TokenIndex = undefined;
+        var ident_len: usize = 0;
+        if (!pat_cst.isNone() and pat_cst.asInt() < self.cst_arena.countNodes()) {
+            const start_idx: usize = pat_cst.asInt();
+            const rec = self.cst_arena.getNode(pat_cst);
+            const end_idx: usize = @min(
+                start_idx + @max(@as(usize, rec.subtree_size), 1),
+                self.cst_arena.countNodes(),
+            );
+            var cur = start_idx + 1;
+            while (cur < end_idx) : (cur += 1) {
+                const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+                if (sub.subtree_size <= 1 and !sub.token.isNone() and sub.token.asInt() < self.tokens.countTokens()) {
+                    const tk = self.tokens.getToken(sub.token).kind;
+                    if (tk == .lparen or tk == .lbrace) break;
+                    if (symbol_resolver.isIdentifierToken(tk) and ident_len < ident_toks.len) {
+                        ident_toks[ident_len] = sub.token;
+                        ident_len += 1;
+                    }
+                }
+            }
+        }
+        if (ident_len == 0 and !self.ast_arena.getNode(pat_id).main_token.isNone()) {
+            ident_toks[0] = self.ast_arena.getNode(pat_id).main_token;
+            ident_len = 1;
+        }
+        if (ident_len == 1) {
+            const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, ident_toks[0]);
+            if (self.interner.lookup(lexeme)) |name_id| {
+                if (self.active_comptime_vals.get(name_id.asInt())) |ct_val| return ct_val;
+                switch (self.sym_table.lookupLexical(self.current_scope, name_id, NamespaceMask.VALUE_ONLY)) {
+                    .found => |sym_idx| {
+                        if (self.sym_table.getSymbol(sym_idx).kind == .const_sym) {
+                            return self.evalConstSymbol(sym_idx);
+                        }
+                    },
+                    else => {},
+                }
+            }
+            return null;
+        }
+        if (ident_len == 2) {
+            const base_lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, ident_toks[0]);
+            const mem_lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, ident_toks[1]);
+            if (self.resolveBuiltinPrimitiveLexeme(base_lex)) |prim_ty| {
+                if (self.evalPrimitiveAssocConst(prim_ty, mem_lex)) |assoc| return assoc.val;
+            }
+            const base_id = self.interner.lookup(base_lex) orelse return null;
+            const mem_id = self.interner.lookup(mem_lex) orelse return null;
+            switch (self.sym_table.lookupLexical(self.current_scope, base_id, NamespaceMask.ALL)) {
+                .found => |base_sym_idx| {
+                    const target_scope = self.sym_table.getSymbol(base_sym_idx).target_scope;
+                    if (!target_scope.isNone()) {
+                        const found_mem = self.sym_table.lookupInScopeDirect(
+                            target_scope,
+                            mem_id,
+                            NamespaceMask.VALUE_ONLY,
+                        );
+                        if (!found_mem.isNone() and self.sym_table.getSymbol(found_mem).kind == .const_sym) {
+                            return self.evalConstSymbol(found_mem);
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    /// Emits a literal `HirPattern` matching `const_val` against `concrete_scrut`.
+    fn emitConstPatternVal(
+        self: *HirLowerer,
+        const_val: ComptimeValue,
+        concrete_scrut: TypeId,
+        tok: TokenIndex,
+    ) !u32 {
+        return switch (const_val) {
+            .int_val => |iv| self.store.appendPat(.{
+                .type_id = concrete_scrut,
+                .origin_token = tok,
+                .kind = .{ .lit_int_range = .{ .min_val = iv, .max_val = iv } },
+            }),
+            .char_val => |cv| self.store.appendPat(.{
+                .type_id = concrete_scrut,
+                .origin_token = tok,
+                .kind = .{ .lit_int_range = .{ .min_val = @as(i128, cv), .max_val = @as(i128, cv) } },
+            }),
+            .bool_val => |bv| self.store.appendPat(.{
+                .type_id = .bool_ty,
+                .origin_token = tok,
+                .kind = .{ .lit_bool = bv },
+            }),
+            .str_val => |sv| self.store.appendPat(.{
+                .type_id = .str_ty,
+                .origin_token = tok,
+                .kind = .{ .lit_str = sv },
+            }),
+            .float_val => |fv| self.store.appendPat(.{
+                .type_id = concrete_scrut,
+                .origin_token = tok,
+                .kind = .{ .lit_float = fv },
+            }),
+            else => self.store.appendPat(.{ .type_id = concrete_scrut, .origin_token = tok, .kind = .wildcard }),
+        };
+    }
+
+    /// Compares `scrut_val` against an evaluated constant pattern `const_val` during `comptime` pattern matching.
+    fn isMatchingConstPatternVal(
+        self: *const HirLowerer,
+        scrut_val: ComptimeValue,
+        const_val: ComptimeValue,
+    ) bool {
+        return switch (const_val) {
+            .int_val => |iv| (scrut_val == .int_val and scrut_val.int_val == iv) or
+                (scrut_val == .char_val and @as(i128, scrut_val.char_val) == iv),
+            .char_val => |cv| (scrut_val == .char_val and scrut_val.char_val == cv) or
+                (scrut_val == .int_val and scrut_val.int_val == @as(i128, cv)),
+            .bool_val => |bv| scrut_val == .bool_val and scrut_val.bool_val == bv,
+            .str_val => |sv| scrut_val == .str_val and
+                std.mem.eql(u8, self.interner.get(scrut_val.str_val), self.interner.get(sv)),
+            .float_val => |fv| scrut_val == .float_val and scrut_val.float_val == fv,
+            else => false,
+        };
+    }
+
+    /// Returns `true` if `sub_pat_id` inside a `.slice_pat` is a `..` or `..rest` spread element.
+    fn isSliceRestPatternAst(self: *const HirLowerer, sub_pat_id: NodeIndex) bool {
+        if (sub_pat_id.isNone() or sub_pat_id.asInt() >= self.ast_arena.countNodes()) return false;
+        const sub_pat = self.ast_arena.getNode(sub_pat_id);
+        if (sub_pat.tag == .wildcard_pat and !sub_pat.main_token.isNone() and
+            sub_pat.main_token.asInt() < self.tokens.countTokens())
+        {
+            return self.tokens.getToken(sub_pat.main_token).kind == .dotdot;
+        }
+        if ((sub_pat.tag == .bind_pat or sub_pat.tag == .wildcard_pat) and sub_pat.lhs.tag == .token) {
+            const dotdot_tok = TokenIndex.fromInt(sub_pat.lhs.payload);
+            if (!dotdot_tok.isNone() and dotdot_tok.asInt() < self.tokens.countTokens()) {
+                return self.tokens.getToken(dotdot_tok).kind == .dotdot;
+            }
+        }
+        return false;
     }
 
     /// Evaluates a singleton `.lit_pat` AST node (`int_lit`, `-int_lit`, `char_lit`, or `CONST_IDENT`) into `i128`.
@@ -9232,6 +11862,14 @@ const HirLowerer = struct {
         switch (pat_node.tag) {
             .wildcard_pat => return true,
             .bind_pat => {
+                const pat_cst = self.ast_arena.getCstOrigin(pat_id);
+                const is_ref = self.hasKeywordInCst(pat_cst, .kw_ref) or self.hasKeywordInCst(pat_cst, .amp);
+                const has_pat_mut = self.hasKeywordInCst(pat_cst, .kw_mut);
+                if (!is_ref and !has_pat_mut) {
+                    if (try self.tryEvalConstPatternValue(pat_id, scrut_ty)) |const_val| {
+                        return self.isMatchingConstPatternVal(scrut_val, const_val);
+                    }
+                }
                 const name_id = self.extractBindPatNameId(pat_id);
                 try self.pushComptimeBinding(name_id, scrut_val);
                 return true;
@@ -9308,6 +11946,11 @@ const HirLowerer = struct {
                 };
             },
             .variant_pat => {
+                if (self.getAstExtraSlice(pat_id, false).len == 0) {
+                    if (try self.tryEvalConstPatternValue(pat_id, scrut_ty)) |const_val| {
+                        return self.isMatchingConstPatternVal(scrut_val, const_val);
+                    }
+                }
                 if (scrut_val != .variant) return false;
                 const var_name = self.extractVariantPatName(pat_id);
                 const scr_ty_node = self.pool.getNode(scrut_val.variant.type_id);
@@ -9356,18 +11999,132 @@ const HirLowerer = struct {
                 const payload_val = self.store.const_pool.items[scrut_val.variant.payload_const_idx];
                 return self.matchComptimePattern(NodeIndex.fromInt(sub_nodes[0]), payload_val, payload_ty);
             },
-            else => return false,
+            .at_pat => {
+                const checkpoint = self.comptime_shadow_log.items.len;
+                if (pat_node.rhs.tag == .node) {
+                    if (!try self.matchComptimePattern(
+                        NodeIndex.fromInt(pat_node.rhs.payload),
+                        scrut_val,
+                        scrut_ty,
+                    )) {
+                        self.popComptimeBindingsTo(checkpoint);
+                        return false;
+                    }
+                }
+                const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, pat_node.main_token);
+                if (lexeme.len > 0 and !std.mem.eql(u8, lexeme, "_")) {
+                    try self.pushComptimeBinding(try self.interner.intern(lexeme), scrut_val);
+                }
+                return true;
+            },
+            .slice_pat => {
+                if (scrut_val != .aggregate) return false;
+                const sub_nodes = self.getAstExtraSlice(pat_id, false);
+                var prefix_nodes: std.ArrayListUnmanaged(NodeIndex) = .empty;
+                defer prefix_nodes.deinit(self.allocator);
+                var suffix_nodes: std.ArrayListUnmanaged(NodeIndex) = .empty;
+                defer suffix_nodes.deinit(self.allocator);
+                var has_rest = false;
+                var rest_sub_id: NodeIndex = .none;
+
+                for (sub_nodes) |raw_sub| {
+                    const sub_id = NodeIndex.fromInt(raw_sub);
+                    if (self.isSliceRestPatternAst(sub_id)) {
+                        if (!has_rest) {
+                            has_rest = true;
+                            rest_sub_id = sub_id;
+                        }
+                        continue;
+                    }
+                    if (!has_rest) {
+                        try prefix_nodes.append(self.allocator, sub_id);
+                    } else {
+                        try suffix_nodes.append(self.allocator, sub_id);
+                    }
+                }
+
+                const agg_len: usize = scrut_val.aggregate.elem_len;
+                const fixed_len = prefix_nodes.items.len + suffix_nodes.items.len;
+                if ((!has_rest and agg_len != fixed_len) or (has_rest and agg_len < fixed_len)) return false;
+
+                const unwrapped = self.unwrapRefType(scrut_ty);
+                const scr_node = self.pool.getNode(unwrapped);
+                const elem_ty: TypeId = if (scr_node.tag == .slice_ty or scr_node.tag == .array_ty or
+                    scr_node.tag == .soa_slice_ty or scr_node.tag == .soa_array_ty)
+                    TypeId.fromInt(scr_node.lhs)
+                else
+                    .err_ty;
+
+                const checkpoint = self.comptime_shadow_log.items.len;
+                for (prefix_nodes.items, 0..) |sub_id, i| {
+                    const elem_const_idx = self.store.const_elements.items[scrut_val.aggregate.elem_start + i];
+                    const elem_val = self.store.const_pool.items[elem_const_idx];
+                    if (!try self.matchComptimePattern(sub_id, elem_val, elem_ty)) {
+                        self.popComptimeBindingsTo(checkpoint);
+                        return false;
+                    }
+                }
+                if (has_rest and !rest_sub_id.isNone()) {
+                    const rest_node = self.ast_arena.getNode(rest_sub_id);
+                    if (rest_node.tag == .bind_pat) {
+                        const rest_lex = symbol_resolver.extractTokenSlice(
+                            self.source,
+                            self.tokens,
+                            rest_node.main_token,
+                        );
+                        if (rest_lex.len > 0 and !std.mem.eql(u8, rest_lex, "_")) {
+                            const subslice_ty = if (elem_ty.isError())
+                                scrut_val.aggregate.type_id
+                            else
+                                try self.pool.internRef(try self.pool.internSlice(elem_ty, false), false);
+                            try self.pushComptimeBinding(try self.interner.intern(rest_lex), .{
+                                .aggregate = .{
+                                    .type_id = subslice_ty,
+                                    .elem_start = scrut_val.aggregate.elem_start +
+                                        @as(u32, @intCast(prefix_nodes.items.len)),
+                                    .elem_len = @intCast(agg_len - fixed_len),
+                                },
+                            });
+                        }
+                    }
+                }
+                const suffix_base = agg_len - suffix_nodes.items.len;
+                for (suffix_nodes.items, 0..) |sub_id, i| {
+                    const elem_const_idx = self.store.const_elements.items[
+                        scrut_val.aggregate.elem_start + @as(u32, @intCast(suffix_base + i))
+                    ];
+                    const elem_val = self.store.const_pool.items[elem_const_idx];
+                    if (!try self.matchComptimePattern(sub_id, elem_val, elem_ty)) {
+                        self.popComptimeBindingsTo(checkpoint);
+                        return false;
+                    }
+                }
+                return true;
+            },
+            else => {
+                if (try self.tryEvalConstPatternValue(pat_id, scrut_ty)) |const_val| {
+                    return self.isMatchingConstPatternVal(scrut_val, const_val);
+                }
+                return false;
+            },
         }
     }
 
     /// Evaluates a `const_sym` declaration at compile time with `const_eval_stack` cycle detection (`E0509`).
     fn evalConstSymbol(self: *HirLowerer, sym_idx: SymbolIndex) anyerror!?ComptimeValue {
         if (sym_idx.isNone() or sym_idx.asInt() >= self.sym_table.symbols.items.len) return null;
-        const sym = self.sym_table.getSymbol(sym_idx).*;
+        var active_sym_idx = sym_idx;
+        const raw_sym = self.sym_table.getSymbol(sym_idx).*;
+        if (!raw_sym.def_id.isNone()) {
+            if (self.sym_table.def_to_symbol.get(raw_sym.def_id.asInt())) |latest_idx| {
+                if (!latest_idx.isNone()) active_sym_idx = latest_idx;
+            }
+        }
+        const sym = self.sym_table.getSymbol(active_sym_idx).*;
         if (sym.kind != .const_sym) return null;
 
         for (self.const_eval_stack[0..self.const_eval_depth]) |active_sym| {
-            if (active_sym == sym_idx) {
+            if (active_sym == active_sym_idx) {
                 try self.emitDiagnostic(
                     .e0509_comptime_evaluation_cycle,
                     sym.decl_span,
@@ -9409,7 +12166,7 @@ const HirLowerer = struct {
         const const_ast = self.ast_arena.getNode(const_ast_node);
         if (const_ast.rhs.tag != .node) return null;
 
-        self.const_eval_stack[self.const_eval_depth] = sym_idx;
+        self.const_eval_stack[self.const_eval_depth] = active_sym_idx;
         self.const_eval_depth += 1;
         defer self.const_eval_depth -= 1;
 
@@ -9514,6 +12271,30 @@ const HirLowerer = struct {
                 }
                 return null;
             },
+            .named_arg => {
+                if (ast_node.lhs.tag == .node) {
+                    return self.tryEvalAstComptime(NodeIndex.fromInt(ast_node.lhs.payload), expected_ty);
+                }
+                return null;
+            },
+            .is_expr => {
+                if (ast_node.lhs.tag != .node or ast_node.rhs.tag != .node) return null;
+                const scrut_id = NodeIndex.fromInt(ast_node.lhs.payload);
+                const scrut_val = (try self.tryEvalAstComptime(scrut_id, .err_ty)) orelse return null;
+                const scrut_ty = self.nodeType(scrut_id);
+                const is_negated = !tok.isNone() and tok.asInt() < self.tokens.countTokens() and
+                    self.tokens.getToken(tok).kind == .kw_not;
+                const checkpoint = self.comptime_shadow_log.items.len;
+                const is_matched = try self.matchComptimePattern(
+                    NodeIndex.fromInt(ast_node.rhs.payload),
+                    scrut_val,
+                    scrut_ty,
+                );
+                if (is_negated or !is_matched) {
+                    self.popComptimeBindingsTo(checkpoint);
+                }
+                return .{ .bool_val = if (is_negated) !is_matched else is_matched };
+            },
             .contextual_variant => {
                 const var_tok = if (ast_node.lhs.tag == .token)
                     TokenIndex.fromInt(ast_node.lhs.payload)
@@ -9533,7 +12314,7 @@ const HirLowerer = struct {
                         }
                         if (args.len >= 1) {
                             const inner = (try self.tryEvalAstComptime(
-                                NodeIndex.fromInt(args[0]),
+                                self.unwrapCallArgAst(NodeIndex.fromInt(args[0])),
                                 TypeId.fromInt(ty_node.lhs),
                             )) orelse return null;
                             return .{
@@ -9550,7 +12331,7 @@ const HirLowerer = struct {
                         const payload_ty = TypeId.fromInt(if (is_ok) ty_node.lhs else ty_node.rhs);
                         const payload_idx = if (args.len >= 1) blk: {
                             const inner = (try self.tryEvalAstComptime(
-                                NodeIndex.fromInt(args[0]),
+                                self.unwrapCallArgAst(NodeIndex.fromInt(args[0])),
                                 payload_ty,
                             )) orelse return null;
                             break :blk try self.store.appendConst(inner);
@@ -9570,11 +12351,12 @@ const HirLowerer = struct {
                                 const mem_sym = self.sym_table.getSymbol(mem_idx).*;
                                 if (mem_sym.kind != .enum_variant_sym) continue;
                                 if (std.mem.eql(u8, mem_sym.name_text, var_name)) {
+                                    if (args.len > 1) return null;
                                     const payload_idx = if (args.len == 0 or mem_sym.type_id == .unit_ty)
                                         NONE_U32
                                     else blk: {
                                         const inner = (try self.tryEvalAstComptime(
-                                            NodeIndex.fromInt(args[0]),
+                                            self.unwrapCallArgAst(NodeIndex.fromInt(args[0])),
                                             mem_sym.type_id,
                                         )) orelse return null;
                                         break :blk try self.store.appendConst(inner);
@@ -9623,8 +12405,8 @@ const HirLowerer = struct {
             .binary_expr => {
                 if (ast_node.lhs.tag != .node or ast_node.rhs.tag != .node) return null;
                 const op_kind = self.tokens.getToken(tok).kind;
-                const lhs_val = (try self.tryEvalAstComptime(NodeIndex.fromInt(ast_node.lhs.payload), .err_ty)) orelse
-                    return null;
+                const lhs_id = NodeIndex.fromInt(ast_node.lhs.payload);
+                const lhs_val = (try self.tryEvalAstComptime(lhs_id, .err_ty)) orelse return null;
                 if ((op_kind == .ampamp or op_kind == .kw_and) and lhs_val == .bool_val) {
                     if (!lhs_val.bool_val) return .{ .bool_val = false };
                     return self.tryEvalAstComptime(NodeIndex.fromInt(ast_node.rhs.payload), .bool_ty);
@@ -9632,6 +12414,24 @@ const HirLowerer = struct {
                 if ((op_kind == .pipepipe or op_kind == .kw_or) and lhs_val == .bool_val) {
                     if (lhs_val.bool_val) return .{ .bool_val = true };
                     return self.tryEvalAstComptime(NodeIndex.fromInt(ast_node.rhs.payload), .bool_ty);
+                }
+                if (op_kind == .kw_orelse and lhs_val == .variant) {
+                    if (lhs_val.variant.tag_ordinal == 1 and
+                        lhs_val.variant.payload_const_idx < self.store.const_pool.items.len)
+                    {
+                        return self.store.const_pool.items[lhs_val.variant.payload_const_idx];
+                    }
+                    return self.tryEvalAstComptime(NodeIndex.fromInt(ast_node.rhs.payload), expected_ty);
+                }
+                if (op_kind == .kw_is) {
+                    const checkpoint = self.comptime_shadow_log.items.len;
+                    const is_matched = try self.matchComptimePattern(
+                        NodeIndex.fromInt(ast_node.rhs.payload),
+                        lhs_val,
+                        self.nodeType(lhs_id),
+                    );
+                    if (!is_matched) self.popComptimeBindingsTo(checkpoint);
+                    return .{ .bool_val = is_matched };
                 }
                 const rhs_val = (try self.tryEvalAstComptime(NodeIndex.fromInt(ast_node.rhs.payload), .err_ty)) orelse
                     return null;
@@ -9682,13 +12482,51 @@ const HirLowerer = struct {
             },
             .field_access => {
                 if (ast_node.lhs.tag != .node or ast_node.rhs.tag != .token) return null;
-                const base_val = (try self.tryEvalAstComptime(NodeIndex.fromInt(ast_node.lhs.payload), .err_ty)) orelse
-                    return null;
+                const lhs_id = NodeIndex.fromInt(ast_node.lhs.payload);
                 const member_name = symbol_resolver.extractTokenSlice(
                     self.source,
                     self.tokens,
                     TokenIndex.fromInt(ast_node.rhs.payload),
                 );
+                // [1] Primitive associated constants (`u32.MAX`, `f64.INFINITY`, etc.):
+                if (self.resolveBuiltinPrimitiveAst(lhs_id)) |recv_prim| {
+                    if (self.evalPrimitiveAssocConst(recv_prim, member_name)) |prim_const| {
+                        return prim_const.val;
+                    }
+                }
+                // [2] Unified `.` static constants, unit enum variants, and `Option.None`:
+                var static_sym_idx = self.nodeSymbol(expr_id);
+                if (static_sym_idx.isNone()) {
+                    static_sym_idx = self.lookupStaticMemberSymbolFallback(lhs_id, member_name);
+                }
+                if (!static_sym_idx.isNone()) {
+                    const static_sym = self.sym_table.getSymbol(static_sym_idx).*;
+                    if (static_sym.kind == .const_sym) return self.evalConstSymbol(static_sym_idx);
+                    if (static_sym.kind == .enum_variant_sym and static_sym.type_id == .unit_ty) {
+                        const enum_ty = if (!expected_ty.isError()) expected_ty else self.nodeType(expr_id);
+                        return .{
+                            .variant = .{
+                                .type_id = self.concreteType(enum_ty),
+                                .tag_ordinal = static_sym.member_ordinal,
+                                .payload_const_idx = NONE_U32,
+                            },
+                        };
+                    }
+                }
+                if (std.mem.eql(u8, member_name, "None") and self.resolveStaticDotTargetAst(lhs_id) == .type_ns) {
+                    const opt_ty = self.concreteType(if (!expected_ty.isError())
+                        expected_ty
+                    else
+                        self.nodeType(expr_id));
+                    const unwrapped_opt = self.pool.unwrapUnderlyingType(opt_ty);
+                    if (!unwrapped_opt.isError() and self.pool.getTag(unwrapped_opt) == .optional_ty) {
+                        return .{
+                            .variant = .{ .type_id = opt_ty, .tag_ordinal = 0, .payload_const_idx = NONE_U32 },
+                        };
+                    }
+                }
+
+                const base_val = (try self.tryEvalAstComptime(lhs_id, .err_ty)) orelse return null;
                 switch (base_val) {
                     .type_info_mirror => |ti| {
                         if (std.mem.eql(u8, member_name, "name") or std.mem.eql(u8, member_name, "qualified_name")) {
@@ -9743,8 +12581,7 @@ const HirLowerer = struct {
             },
             .method_call => {
                 if (ast_node.lhs.tag != .node) return null;
-                const recv_val = (try self.tryEvalAstComptime(NodeIndex.fromInt(ast_node.lhs.payload), .err_ty)) orelse
-                    return null;
+                const recv_id = NodeIndex.fromInt(ast_node.lhs.payload);
                 const raw_items = self.getAstExtraSlice(expr_id, true);
                 if (raw_items.len == 0) return null;
                 const method_name = symbol_resolver.extractTokenSlice(
@@ -9752,6 +12589,87 @@ const HirLowerer = struct {
                     self.tokens,
                     TokenIndex.fromInt(raw_items[0]),
                 );
+                // Unified `.` static `Option.Some` / `Result.Ok` / `Result.Err` / `Enum.Variant(payload)` comptime fold:
+                const static_kind = self.resolveStaticDotTargetAst(recv_id);
+                if (static_kind != .none) {
+                    var first_val_arg: NodeIndex = .none;
+                    var val_arg_count: usize = 0;
+                    for (raw_items[1..]) |raw_item| {
+                        const cand_id = self.unwrapCallArgAst(NodeIndex.fromInt(raw_item));
+                        if (cand_id.asInt() < self.ast_arena.countNodes() and
+                            !isTypeAstTag(self.ast_arena.getNode(cand_id).tag))
+                        {
+                            if (first_val_arg.isNone()) first_val_arg = cand_id;
+                            val_arg_count += 1;
+                        }
+                    }
+                    const res_ty = self.concreteType(if (!expected_ty.isError())
+                        expected_ty
+                    else
+                        self.nodeType(expr_id));
+                    const ty_node = self.pool.getNode(self.pool.unwrapUnderlyingType(res_ty));
+                    if (static_kind == .type_ns and ty_node.tag == .optional_ty) {
+                        if (std.mem.eql(u8, method_name, "None")) {
+                            return .{
+                                .variant = .{ .type_id = res_ty, .tag_ordinal = 0, .payload_const_idx = NONE_U32 },
+                            };
+                        }
+                        if (std.mem.eql(u8, method_name, "Some") and !first_val_arg.isNone()) {
+                            const inner = (try self.tryEvalAstComptime(
+                                first_val_arg,
+                                TypeId.fromInt(ty_node.lhs),
+                            )) orelse return null;
+                            return .{
+                                .variant = .{
+                                    .type_id = res_ty,
+                                    .tag_ordinal = 1,
+                                    .payload_const_idx = try self.store.appendConst(inner),
+                                },
+                            };
+                        }
+                    } else if (static_kind == .type_ns and ty_node.tag == .result_ty and
+                        (std.mem.eql(u8, method_name, "Ok") or std.mem.eql(u8, method_name, "Err")))
+                    {
+                        const is_ok = std.mem.eql(u8, method_name, "Ok");
+                        const payload_ty = TypeId.fromInt(if (is_ok) ty_node.lhs else ty_node.rhs);
+                        const payload_idx = if (!first_val_arg.isNone()) blk_res: {
+                            const inner = (try self.tryEvalAstComptime(first_val_arg, payload_ty)) orelse return null;
+                            break :blk_res try self.store.appendConst(inner);
+                        } else NONE_U32;
+                        return .{
+                            .variant = .{
+                                .type_id = res_ty,
+                                .tag_ordinal = if (is_ok) 0 else 1,
+                                .payload_const_idx = payload_idx,
+                            },
+                        };
+                    }
+                    var call_sym = self.nodeSymbol(expr_id);
+                    if (call_sym.isNone()) call_sym = self.lookupStaticMemberSymbolFallback(recv_id, method_name);
+                    if (!call_sym.isNone()) {
+                        const var_sym = self.sym_table.getSymbol(call_sym).*;
+                        if (var_sym.kind == .enum_variant_sym) {
+                            if (val_arg_count > 1) return null;
+                            const payload_idx = if (first_val_arg.isNone() or var_sym.type_id == .unit_ty)
+                                NONE_U32
+                            else blk_ev: {
+                                const inner = (try self.tryEvalAstComptime(
+                                    first_val_arg,
+                                    var_sym.type_id,
+                                )) orelse return null;
+                                break :blk_ev try self.store.appendConst(inner);
+                            };
+                            return .{
+                                .variant = .{
+                                    .type_id = res_ty,
+                                    .tag_ordinal = var_sym.member_ordinal,
+                                    .payload_const_idx = payload_idx,
+                                },
+                            };
+                        }
+                    }
+                }
+                const recv_val = (try self.tryEvalAstComptime(recv_id, .err_ty)) orelse return null;
                 if (recv_val == .type_info_mirror and
                     (std.mem.eql(u8, method_name, "as_struct") or std.mem.eql(u8, method_name, "as_enum")))
                 {
@@ -9826,7 +12744,7 @@ const HirLowerer = struct {
                         }
                         t_count += 1;
                     } else {
-                        try val_arg_nodes.append(self.allocator, item_id);
+                        try val_arg_nodes.append(self.allocator, self.unwrapCallArgAst(item_id));
                     }
                 }
                 const t_arg_0 = if (type_args.items.len >= 1) type_args.items[0] else .err_ty;
@@ -10503,7 +13421,11 @@ fn renderHirNodeRecursive(
             const bin_op: HirBinaryOp = @fromBackingInt(@intCast(@as(u8, @truncate(node.data.rhs))));
             try out_buf.appendSlice(allocator, " [");
             try out_buf.appendSlice(allocator, @tagName(bin_op));
-            try out_buf.appendSlice(allocator, "]\n");
+            try out_buf.append(allocator, ']');
+            if (node.flags.is_dollar_sub) {
+                try out_buf.appendSlice(allocator, " [dollar_sub]");
+            }
+            try out_buf.append(allocator, '\n');
             if (node.data.lhs + 2 <= store.extra_data.items.len) {
                 try renderHirNodeRecursive(
                     allocator,
@@ -10553,7 +13475,7 @@ fn renderHirNodeRecursive(
                 out_buf,
             );
         },
-        .hir_index_proj, .hir_assign => {
+        .hir_index_proj, .hir_assign, .hir_orelse => {
             try out_buf.append(allocator, '\n');
             try renderHirNodeRecursive(
                 allocator,
@@ -10663,6 +13585,140 @@ fn renderHirNodeRecursive(
                 );
             }
         },
+        .hir_cond_if, .hir_cond_while => {
+            if (node.tag == .hir_cond_while) {
+                var loop_scratch: [24]u8 = undefined;
+                try out_buf.appendSlice(
+                    allocator,
+                    std.fmt.bufPrint(&loop_scratch, " ^loop{d}\n", .{node.data.rhs}) catch "\n",
+                );
+            } else {
+                try out_buf.append(allocator, '\n');
+            }
+            if (node.data.lhs < store.extra_data.items.len) {
+                const clause_count = store.extra_data.items[node.data.lhs];
+                var cursor: usize = node.data.lhs + 1;
+                var clause_i: u32 = 0;
+                while (clause_i < clause_count and cursor < store.extra_data.items.len) : (clause_i += 1) {
+                    const clause_kind = store.extra_data.items[cursor];
+                    if (clause_kind == @intFromEnum(HirCondClauseKind.bool_pred) and
+                        cursor + 1 < store.extra_data.items.len)
+                    {
+                        try renderHirNodeRecursive(
+                            allocator,
+                            store,
+                            pool,
+                            sym_table,
+                            interner,
+                            HirIndex.fromInt(store.extra_data.items[cursor + 1]),
+                            indent + 1,
+                            out_buf,
+                        );
+                        cursor += 2;
+                    } else if (clause_kind == @intFromEnum(HirCondClauseKind.is_match) and
+                        cursor + 2 < store.extra_data.items.len)
+                    {
+                        try renderHirNodeRecursive(
+                            allocator,
+                            store,
+                            pool,
+                            sym_table,
+                            interner,
+                            HirIndex.fromInt(store.extra_data.items[cursor + 1]),
+                            indent + 1,
+                            out_buf,
+                        );
+                        cursor += 3;
+                    } else {
+                        break;
+                    }
+                }
+                if (cursor < store.extra_data.items.len) {
+                    try renderHirNodeRecursive(
+                        allocator,
+                        store,
+                        pool,
+                        sym_table,
+                        interner,
+                        HirIndex.fromInt(store.extra_data.items[cursor]),
+                        indent + 1,
+                        out_buf,
+                    );
+                }
+                if (node.tag == .hir_cond_if and cursor + 1 < store.extra_data.items.len) {
+                    try renderHirNodeRecursive(
+                        allocator,
+                        store,
+                        pool,
+                        sym_table,
+                        interner,
+                        HirIndex.fromInt(store.extra_data.items[cursor + 1]),
+                        indent + 1,
+                        out_buf,
+                    );
+                }
+            }
+        },
+        .hir_ctx_get, .hir_ctx_region_pop => {
+            var slot_scratch: [32]u8 = undefined;
+            try out_buf.appendSlice(
+                allocator,
+                std.fmt.bufPrint(&slot_scratch, " [slot={d}]\n", .{node.data.lhs}) catch "\n",
+            );
+        },
+        .hir_ctx_set, .hir_ctx_region_push => {
+            var slot_scratch: [32]u8 = undefined;
+            try out_buf.appendSlice(
+                allocator,
+                std.fmt.bufPrint(&slot_scratch, " [slot={d}]\n", .{node.data.lhs}) catch "\n",
+            );
+            try renderHirNodeRecursive(
+                allocator,
+                store,
+                pool,
+                sym_table,
+                interner,
+                HirIndex.fromInt(node.data.rhs),
+                indent + 1,
+                out_buf,
+            );
+        },
+        .hir_slice_range => {
+            const is_incl = node.data.rhs + 3 <= store.extra_data.items.len and
+                store.extra_data.items[node.data.rhs + 2] != 0;
+            try out_buf.appendSlice(
+                allocator,
+                if (is_incl) " [inclusive=true]\n" else " [inclusive=false]\n",
+            );
+            try renderHirNodeRecursive(
+                allocator,
+                store,
+                pool,
+                sym_table,
+                interner,
+                HirIndex.fromInt(node.data.lhs),
+                indent + 1,
+                out_buf,
+            );
+            if (node.data.rhs + 3 <= store.extra_data.items.len) {
+                var part_i: usize = 0;
+                while (part_i < 2) : (part_i += 1) {
+                    const bound_hir = HirIndex.fromInt(store.extra_data.items[node.data.rhs + part_i]);
+                    if (!bound_hir.isNone()) {
+                        try renderHirNodeRecursive(
+                            allocator,
+                            store,
+                            pool,
+                            sym_table,
+                            interner,
+                            bound_hir,
+                            indent + 1,
+                            out_buf,
+                        );
+                    }
+                }
+            }
+        },
         .hir_match => {
             try out_buf.append(allocator, '\n');
             try renderHirNodeRecursive(
@@ -10707,6 +13763,7 @@ fn renderHirNodeRecursive(
                 out_buf,
             );
         },
+        .hir_unreachable => try out_buf.append(allocator, '\n'),
         else => try out_buf.append(allocator, '\n'),
     }
 }
@@ -11133,14 +14190,14 @@ test "test_hir_pipeline_try_catch_let_else_if_let_and_pattern_is_desugarings" {
     try std.testing.expect(countHirNodesByTag(&pipe_bundle.hir_store, .hir_project_arg) >= 1);
 
     const err_src =
-        \\pub fn helper_opt(maybe_num: i32?) -> i32? {
+        \\pub fn helper_opt(maybe_num: i32?, fallible_res: Result[i32, i32]) -> i32? {
         \\    let unwrapped = maybe_num?;
-        \\    let safe_val = maybe_num catch 0;
+        \\    let fallback_opt = maybe_num orelse 0;
+        \\    let safe_val = fallible_res catch 0;
         \\    let .Some(bound) = maybe_num else { return .None; };
-        \\    if let .Some(inner) = maybe_num {
-        \\        if maybe_num is .Some(_) {
-        \\            return .Some(unwrapped + safe_val + bound + inner);
-        \\        }
+        \\    let is_present: bool = maybe_num is .Some(_);
+        \\    if maybe_num is .Some(inner) and is_present {
+        \\        return .Some(unwrapped + fallback_opt + safe_val + bound + inner);
         \\    }
         \\    return .None;
         \\}
@@ -11149,6 +14206,8 @@ test "test_hir_pipeline_try_catch_let_else_if_let_and_pattern_is_desugarings" {
     defer err_bundle.deinit();
     try std.testing.expect(!err_bundle.diagnostics.hasErrors());
     try std.testing.expect(countHirNodesByTag(&err_bundle.hir_store, .hir_match) >= 4);
+    try std.testing.expect(countHirNodesByTag(&err_bundle.hir_store, .hir_orelse) >= 1);
+    try std.testing.expect(countHirNodesByTag(&err_bundle.hir_store, .hir_cond_if) >= 1);
 
     var has_explicit_err_return = false;
     for (0..err_bundle.hir_store.nodes.len) |i| {
@@ -11165,7 +14224,7 @@ test "test_hir_for_loop_continue_safety_u8_inclusive_range_and_soa_zip" {
     const allocator = std.testing.allocator;
     const range_src =
         \\pub fn sum_bytes() -> u32 {
-        \\    let mut total: u32 = 0;
+        \\    var total: u32 = 0;
         \\    let start_byte: u8 = 0;
         \\    let end_byte: u8 = 255;
         \\    for idx in start_byte..=end_byte {
@@ -11193,7 +14252,7 @@ test "test_hir_for_loop_continue_safety_u8_inclusive_range_and_soa_zip" {
 
     const zip_src =
         \\pub fn integrate(xs: &[i32], ys: &[i32]) -> i32 {
-        \\    let mut acc: i32 = 0;
+        \\    var acc: i32 = 0;
         \\    for pair in soa_zip(pos: xs, vel: ys) {
         \\        acc = acc + pair.pos + pair.1;
         \\    }
@@ -11303,7 +14362,7 @@ test "test_hir_comptime_unrolling_hylo_eval_order_and_resource_caps" {
     const ct_src =
         \\pub struct Pair { pub first: i32, pub second: i64 }
         \\pub fn reflected_sum() -> usize {
-        \\    let mut total: usize = 0;
+        \\    var total: usize = 0;
         \\    comptime if @has_field[Pair]("first") {
         \\        comptime for fld in @type_info[Pair]().as_struct().fields {
         \\            let _ = fld;
@@ -11324,7 +14383,7 @@ test "test_hir_comptime_unrolling_hylo_eval_order_and_resource_caps" {
     // Exceeding `MAX_UNROLL = 4096` in `comptime for` emits `E0501`:
     const overflow_src =
         \\pub fn too_many_iters() -> i32 {
-        \\    let mut count: i32 = 0;
+        \\    var count: i32 = 0;
         \\    comptime for step in 0..5000 {
         \\        let _ = step;
         \\        count = count + 1;
@@ -11377,7 +14436,7 @@ test "test_redteam_3a_hir_conjunctive_is_shadow_isolation_comptime_for_and_opera
         \\}
         \\pub fn exercise_all(outer_shadow: i32, maybe_val: i32?, lhs_key: Key, rhs_key: Key, pkt: Packet) -> i32 {
         \\    let saved_outer: i32 = outer_shadow;
-        \\    let mut else_hits: i32 = 0;
+        \\    var else_hits: i32 = 0;
         \\    if maybe_val is .Some(bound_num) and bound_num > 0 {
         \\        if lhs_key == rhs_key {
         \\            return bound_num;
@@ -11389,7 +14448,7 @@ test "test_redteam_3a_hir_conjunctive_is_shadow_isolation_comptime_for_and_opera
         \\        (.Some(outer_shadow), 1) | (.None, outer_shadow) => outer_shadow,
         \\        _ => 0,
         \\    };
-        \\    let mut unrolled_sum: i32 = 0;
+        \\    var unrolled_sum: i32 = 0;
         \\    comptime for step in 0..6 {
         \\        comptime if step == 1 { continue; }
         \\        comptime if step == 4 { break; }
@@ -11429,7 +14488,7 @@ test "test_redteam_3a_hir_conjunctive_is_shadow_isolation_comptime_for_and_opera
     // [2] `CRIT-10`: runtime-guarded `break` targeting an outer `comptime for` emits `E0503`:
     const bad_ct_break_src =
         \\pub fn bad_runtime_break(runtime_cond: bool) -> i32 {
-        \\    let mut acc: i32 = 0;
+        \\    var acc: i32 = 0;
         \\    comptime for idx in 0..3 {
         \\        let _ = idx;
         \\        if runtime_cond {

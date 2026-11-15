@@ -159,8 +159,8 @@ test "test_fmt_doc_renderer_line_suffix_flushing_and_zero_blank_line_whitespace"
 test "test_fmt_top_level_item_spacing_use_sorting_and_comment_preserving_use_trees" {
     // [1] Consecutive `use` items and single-line `const` items group tightly; functions/types have 1 blank line:
     const spacing_src =
-        "use std::io::{Write, self, Read, BufReader as Br};\n" ++
-        "use core::mem;\n" ++
+        "use cx.io.{Write, self, Read, BufReader as Br};\n" ++
+        "use cx.mem;\n" ++
         "const MIN_PORT: u16 = 80;\n" ++
         "const MAX_PORT: u16 = 8080;\n" ++
         "pub struct Endpoint {\n" ++
@@ -171,8 +171,8 @@ test "test_fmt_top_level_item_spacing_use_sorting_and_comment_preserving_use_tre
         "}\n";
 
     const spacing_expected =
-        "use std::io::{self, BufReader as Br, Read, Write};\n" ++
-        "use core::mem;\n\n" ++
+        "use cx.io.{self, BufReader as Br, Read, Write};\n" ++
+        "use cx.mem;\n\n" ++
         "const MIN_PORT: u16 = 80;\n" ++
         "const MAX_PORT: u16 = 8080;\n\n" ++
         "pub struct Endpoint {\n" ++
@@ -184,9 +184,9 @@ test "test_fmt_top_level_item_spacing_use_sorting_and_comment_preserving_use_tre
     try expectCanonicalFormat(spacing_src, spacing_expected, .{});
 
     // [2] Braced `use` tree with trailing comma forces vertical break and sorts `self` first:
-    const broken_use_src = "use std::collections::{HashSet, BTreeMap, self, Vec,};\n";
+    const broken_use_src = "use cx.col.{HashSet, BTreeMap, self, Vec,};\n";
     const broken_use_expected =
-        "use std::collections::{\n" ++
+        "use cx.col.{\n" ++
         "    self,\n" ++
         "    BTreeMap,\n" ++
         "    HashSet,\n" ++
@@ -196,7 +196,7 @@ test "test_fmt_top_level_item_spacing_use_sorting_and_comment_preserving_use_tre
 
     // [3] Braced `use` tree with attached comments preserves comments without losing trivia:
     const commented_use_src =
-        "use std::io::{\n" ++
+        "use cx.io.{\n" ++
         "    Write, // keep write comment\n" ++
         "    Read,\n" ++
         "};\n";
@@ -332,6 +332,25 @@ test "test_fmt_advanced_declarations_function_types_unary_ops_and_patterns" {
         "}\n";
 
     try expectCanonicalFormat(src, src, .{});
+
+    const dr21_fmt_src =
+        "pub fn is_empty_slice(buf: &[u8]) -> bool = buf.len() == 0;\n\n" ++
+        "pub fn scan_tail(frame: &[u8], hdr_len: usize, scratch: &mut Arena) -> u8 {\n" ++
+        "    if (rem := frame.len()) >= 4 {\n" ++
+        "        let head = frame[..$-4];\n" ++
+        "        let dyn_tail = frame[..$ - hdr_len];\n" ++
+        "        let found: u8 = search: for byte_val, idx in head {\n" ++
+        "            if idx > 0 and byte_val != dyn_tail[0] {\n" ++
+        "                break :search byte_val;\n" ++
+        "            }\n" ++
+        "        } orelse return 0;\n" ++
+        "        with context.allocator = &mut scratch {\n" ++
+        "            return found + (rem as u8);\n" ++
+        "        }\n" ++
+        "    }\n" ++
+        "    return 0;\n" ++
+        "}\n";
+    try expectCanonicalFormat(dr21_fmt_src, dr21_fmt_src, .{});
 }
 
 // ---------- Comments, Directives & Fix Normalization ----------
@@ -538,4 +557,115 @@ test "test_fmt_cli_router_check_fix_and_error_handling" {
     const bad_check = try router.parseArgs(&.{ "check", "--check" }, &sink);
     try std.testing.expectEqual(router.CommandAction.invalid, bad_check.action);
     try std.testing.expect(sink.hasErrors());
+}
+
+test "test_fmt_struct_payload_variant_cond_parens_and_columnar_grid_idempotency" {
+    // [1] Preserve mandatory parens around brace-carrying `.variant_pat` and `.contextual_variant_expr`:
+    const variant_brace_cond_src =
+        "fn handle_event(ev: Event) -> i32 {\n" ++
+        "    if ev is (.Click { x }) {\n" ++
+        "        return x;\n" ++
+        "    }\n" ++
+        "    if ev is (Event.Click { x }) {\n" ++
+        "        return x;\n" ++
+        "    }\n" ++
+        "    if (ev == .Click { x: 10 }) {\n" ++
+        "        return 1;\n" ++
+        "    }\n" ++
+        "    return 0;\n" ++
+        "}\n";
+    try expectCanonicalFormat(variant_brace_cond_src, variant_brace_cond_src, .{});
+
+    // Verify the formatted output re-parses with zero syntax errors:
+    var token_buf = TokenBuffer.init(std.testing.allocator);
+    defer token_buf.deinit();
+    var cst_arena = LosslessCstArena.init(std.testing.allocator);
+    defer cst_arena.deinit();
+    var ast_arena = AstArena.init(std.testing.allocator);
+    defer ast_arena.deinit();
+    var parse_sink = DiagnosticSink.init(std.testing.allocator);
+    defer parse_sink.deinit();
+    _ = try corex.parseSource(
+        variant_brace_cond_src,
+        FileId.fromInt(0),
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+        &parse_sink,
+        null,
+    );
+    try std.testing.expectEqual(@as(u32, 0), parse_sink.error_count);
+
+    // [2] 9-element >100-col scalar array literal without trailing comma is idempotent on Pass 1 & Pass 2:
+    const long_nine_elem_src =
+        "fn thresholds() {\n" ++
+        "    let limits = [1000000001, 1000000002, 1000000003, 1000000004, " ++
+        "1000000005, 1000000006, 1000000007, 1000000008, 1000000009];\n" ++
+        "}\n";
+    var grid_pass1 = try fmt_engine.formatSourceWithOptions(
+        std.testing.allocator,
+        long_nine_elem_src,
+        FileId.fromInt(0),
+        .{},
+    );
+    defer grid_pass1.deinit(std.testing.allocator);
+    try std.testing.expect(!grid_pass1.has_syntax_errors);
+
+    var grid_pass2 = try fmt_engine.formatSourceWithOptions(
+        std.testing.allocator,
+        grid_pass1.formatted_text,
+        FileId.fromInt(0),
+        .{},
+    );
+    defer grid_pass2.deinit(std.testing.allocator);
+    try std.testing.expect(!grid_pass2.has_syntax_errors);
+    try std.testing.expect(!grid_pass2.is_changed);
+    try std.testing.expectEqualStrings(grid_pass1.formatted_text, grid_pass2.formatted_text);
+
+    // [3] Expression-bodied functions with trailing comments and `.invalid_token` handling:
+    const expr_body_comment_src = "fn answer() -> i32 = 42; // trailing answer comment\n";
+    try expectCanonicalFormat(expr_body_comment_src, expr_body_comment_src, .{});
+
+    var invalid_tok_res = try fmt_engine.formatSourceWithOptions(
+        std.testing.allocator,
+        "fn broken() -> i32 = @;\n",
+        FileId.fromInt(0),
+        .{},
+    );
+    defer invalid_tok_res.deinit(std.testing.allocator);
+    try std.testing.expect(invalid_tok_res.has_syntax_errors);
+}
+
+test "test_fmt_preserves_comments_across_slot14_coalesced_trivia" {
+    const coalesced_header_src =
+        "//! Line 1 of module header\n" ++
+        "//! Line 2 of module header\n" ++
+        "//! Line 3 of module header\n" ++
+        "//! Line 4 of module header\n" ++
+        "//! Line 5 of module header\n" ++
+        "//! Line 6 of module header\n" ++
+        "//! Line 7 of module header\n" ++
+        "\n" ++
+        "// ------------------------------------- PUBLIC API --------------------------------------\n" ++
+        "\n" ++
+        "/// Triggers an immediate hardware trap without losing slot-14 coalesced comments.\n" ++
+        "@cold\n" ++
+        "pub fn trap() -> never {\n" ++
+        "    @trap();\n" ++
+        "}\n";
+    const expected_canonical_src =
+        "//! Line 1 of module header\n" ++
+        "//! Line 2 of module header\n" ++
+        "//! Line 3 of module header\n" ++
+        "//! Line 4 of module header\n" ++
+        "//! Line 5 of module header\n" ++
+        "//! Line 6 of module header\n" ++
+        "//! Line 7 of module header\n" ++
+        "// ------------------------------------- PUBLIC API --------------------------------------\n" ++
+        "/// Triggers an immediate hardware trap without losing slot-14 coalesced comments.\n" ++
+        "@cold\n" ++
+        "pub fn trap() -> never {\n" ++
+        "    @trap();\n" ++
+        "}\n";
+    try expectCanonicalFormat(coalesced_header_src, expected_canonical_src, .{});
 }

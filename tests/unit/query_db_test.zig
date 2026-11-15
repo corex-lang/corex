@@ -457,7 +457,7 @@ test "test_query_db_extract_item_tree_all_item_kinds_and_lookup_helpers" {
     const file_id = FileId.fromInt(30);
     const all_items_src =
         "pub mod network;\n" ++
-        "use std::io::{Read, Write};\n" ++
+        "use cx.io.{Read, Write};\n" ++
         "pub const MAX_RETRY: usize = (16 + 4);\n" ++
         "pub type PortNum = u16;\n" ++
         "pub struct PacketHeader {\n    pub length: u32,\n}\n" ++
@@ -846,4 +846,319 @@ test "test_query_db_comptime_derive_impl_methods_memo_isolation_and_invalidation
     const total_rev2 = try db.evalComptimeDef(DefId.init(file_id, 4));
     try std.testing.expect(!total_rev2.has_errors);
     try std.testing.expectEqual(@as(i128, 129), total_rev2.value.int_val);
+}
+
+test "test_query_db_incremental_default_and_named_arg_callee_signature_invalidation" {
+    const allocator = std.testing.allocator;
+    const file_id = FileId.fromInt(1);
+
+    const rev1_src =
+        "pub fn compute(first_arg: i32, second_arg: i32 = 5) -> i32 = first_arg * 10 + second_arg;\n" ++
+        "pub fn caller_pos() -> i32 = compute(2);\n" ++
+        "pub fn caller_named() -> i32 = compute(first_arg: 2, second_arg: 3);\n" ++
+        "pub const POS_VAL: i32 = caller_pos();\n" ++
+        "pub const NAMED_VAL: i32 = caller_named();\n";
+
+    // Revision 2: only `second_arg`'s default expression changes (`5` -> `6`):
+    const rev2_src =
+        "pub fn compute(first_arg: i32, second_arg: i32 = 6) -> i32 = first_arg * 10 + second_arg;\n" ++
+        "pub fn caller_pos() -> i32 = compute(2);\n" ++
+        "pub fn caller_named() -> i32 = compute(first_arg: 2, second_arg: 3);\n" ++
+        "pub const POS_VAL: i32 = caller_pos();\n" ++
+        "pub const NAMED_VAL: i32 = caller_named();\n";
+
+    // Revision 3: parameter order swaps `(first_arg, second_arg)` -> `(second_arg, first_arg = 6)`:
+    const rev3_src =
+        "pub fn compute(second_arg: i32, first_arg: i32 = 6) -> i32 = first_arg * 10 + second_arg;\n" ++
+        "pub fn caller_pos() -> i32 = compute(2);\n" ++
+        "pub fn caller_named() -> i32 = compute(first_arg: 2, second_arg: 3);\n" ++
+        "pub const POS_VAL: i32 = caller_pos();\n" ++
+        "pub const NAMED_VAL: i32 = caller_named();\n";
+
+    var db = try CompilerDb.init(allocator);
+    defer db.deinit();
+
+    // [1] Revision 1 baseline (`compute(2) == 25`, `compute(first_arg: 2, second_arg: 3) == 23`):
+    _ = try db.setInput(file_id, rev1_src, .low);
+    const pos_r1 = try db.evalComptimeDef(DefId.init(file_id, 3));
+    const named_r1 = try db.evalComptimeDef(DefId.init(file_id, 4));
+    try std.testing.expect(!pos_r1.has_errors);
+    try std.testing.expect(!named_r1.has_errors);
+    try std.testing.expectEqual(@as(i128, 25), pos_r1.value.int_val);
+    try std.testing.expectEqual(@as(i128, 23), named_r1.value.int_val);
+
+    const mir_pos_fp_r1 = (try db.buildDefMirArtifact(DefId.init(file_id, 1))).mir_fingerprint;
+    const mir_named_fp_r1 = (try db.buildDefMirArtifact(DefId.init(file_id, 2))).mir_fingerprint;
+
+    // [2] Revision 2 (`second_arg: i32 = 5` -> `6`) invalidates `caller_pos` MIR & `POS_VAL` (`25` -> `26`):
+    _ = try db.setInput(file_id, rev2_src, .low);
+    const pos_r2 = try db.evalComptimeDef(DefId.init(file_id, 3));
+    const named_r2 = try db.evalComptimeDef(DefId.init(file_id, 4));
+    try std.testing.expect(!pos_r2.has_errors);
+    try std.testing.expect(!named_r2.has_errors);
+    try std.testing.expectEqual(@as(i128, 26), pos_r2.value.int_val);
+    try std.testing.expectEqual(@as(i128, 23), named_r2.value.int_val);
+
+    const mir_pos_fp_r2 = (try db.buildDefMirArtifact(DefId.init(file_id, 1))).mir_fingerprint;
+    const mir_named_fp_r2 = (try db.buildDefMirArtifact(DefId.init(file_id, 2))).mir_fingerprint;
+    try std.testing.expect(!Fingerprint128.eql(mir_pos_fp_r1, mir_pos_fp_r2));
+    try std.testing.expect(Fingerprint128.eql(mir_named_fp_r1, mir_named_fp_r2));
+
+    // [3] Revision 3 (`(first_arg, second_arg)` -> `(second_arg, first_arg = 6)`) reorders `caller_named` MIR & updates `POS_VAL` (`62`),
+    // while `caller_pos` (`compute(2)` -> `compute(2, 6)`) hits early-cutoff (`mir_pos_fp_r2 == mir_pos_fp_r3`):
+    _ = try db.setInput(file_id, rev3_src, .low);
+    const pos_r3 = try db.evalComptimeDef(DefId.init(file_id, 3));
+    const named_r3 = try db.evalComptimeDef(DefId.init(file_id, 4));
+    try std.testing.expect(!pos_r3.has_errors);
+    try std.testing.expect(!named_r3.has_errors);
+    try std.testing.expectEqual(@as(i128, 62), pos_r3.value.int_val);
+    try std.testing.expectEqual(@as(i128, 23), named_r3.value.int_val);
+
+    const mir_pos_fp_r3 = (try db.buildDefMirArtifact(DefId.init(file_id, 1))).mir_fingerprint;
+    const mir_named_fp_r3 = (try db.buildDefMirArtifact(DefId.init(file_id, 2))).mir_fingerprint;
+    try std.testing.expect(Fingerprint128.eql(mir_pos_fp_r2, mir_pos_fp_r3));
+    try std.testing.expect(!Fingerprint128.eql(mir_named_fp_r2, mir_named_fp_r3));
+
+    const rev4_src =
+        \\pub fn compute(second_arg: i32, first_arg: i32 = second_arg + 5) -> i32 = first_arg * 10 + second_arg;
+        \\pub fn caller_pos() -> i32 = compute(2);
+        \\pub fn caller_named() -> i32 = compute(second_arg: 3, first_arg: 2);
+        \\pub const POS_VAL: i32 = caller_pos();
+        \\pub const NAMED_VAL: i32 = caller_named();
+    ;
+    _ = try db.setInput(file_id, rev4_src, .low);
+    const pos_r4 = try db.evalComptimeDef(DefId.init(file_id, 3));
+    try std.testing.expect(!pos_r4.has_errors);
+    try std.testing.expectEqual(@as(i128, 72), pos_r4.value.int_val);
+    const mir_pos_fp_r4 = (try db.buildDefMirArtifact(DefId.init(file_id, 1))).mir_fingerprint;
+    try std.testing.expect(!Fingerprint128.eql(mir_pos_fp_r3, mir_pos_fp_r4));
+
+    // [4] Cross-file `getExternalFileSyntaxView` records `parseCst(target_file)` and invalidates callers on default edit:
+    const lib_fid = FileId.fromInt(10);
+    const app_fid = FileId.fromInt(11);
+    _ = try db.setInput(lib_fid, "pub fn remote_add(base: i32, delta: i32 = 5) -> i32 = base + delta;\n", .low);
+    try db.registerRootModule("remote_lib", lib_fid);
+    _ = try db.setInput(
+        app_fid,
+        "use remote_lib.remote_add;\npub const REMOTE_SUM: i32 = remote_add(10);\n",
+        .low,
+    );
+    const remote_r1 = try db.evalComptimeDef(DefId.init(app_fid, 1));
+    try std.testing.expect(!remote_r1.has_errors);
+    try std.testing.expectEqual(@as(i128, 15), remote_r1.value.int_val);
+
+    _ = try db.setInput(lib_fid, "pub fn remote_add(base: i32, delta: i32 = 9) -> i32 = base + delta;\n", .low);
+    const remote_r2 = try db.evalComptimeDef(DefId.init(app_fid, 1));
+    try std.testing.expect(!remote_r2.has_errors);
+    try std.testing.expectEqual(@as(i128, 19), remote_r2.value.int_val);
+}
+
+test "test_query_db_incremental_body_edit_ast_rebase_on_named_and_default_calls" {
+    const allocator = std.testing.allocator;
+    const file_id = FileId.fromInt(21);
+
+    const rev1_src =
+        "pub const SCALE_FACTOR: i64 = 6 * 7;\n" ++
+        "pub fn add_offset(val: i64, offset: i64 = val + 2) -> i64 = val + offset;\n" ++
+        "pub fn self_step(flag: bool, bonus: i64 = 3 + 4) -> i64 {\n" ++
+        "    if flag { return self_step(false); }\n" ++
+        "    return bonus;\n" ++
+        "}\n" ++
+        "pub fn worker(input_val: i64) -> i64 {\n" ++
+        "    return add_offset(offset: SCALE_FACTOR, val: input_val) + add_offset(input_val) + self_step(true);\n" ++
+        "}\n" ++
+        "pub const RESULT_VAL: i64 = worker(10);\n";
+
+    // Body-only edit on `SCALE_FACTOR` shifts all downstream AST indices by `-2` while `resolveSignatures` hits Early Cutoff:
+    const rev2_src =
+        "pub const SCALE_FACTOR: i64 = 19;\n" ++
+        "pub fn add_offset(val: i64, offset: i64 = val + 2) -> i64 = val + offset;\n" ++
+        "pub fn self_step(flag: bool, bonus: i64 = 3 + 4) -> i64 {\n" ++
+        "    if flag { return self_step(false); }\n" ++
+        "    return bonus;\n" ++
+        "}\n" ++
+        "pub fn worker(input_val: i64) -> i64 {\n" ++
+        "    return add_offset(offset: SCALE_FACTOR, val: input_val) + add_offset(input_val) + self_step(true);\n" ++
+        "}\n" ++
+        "pub const RESULT_VAL: i64 = worker(10);\n";
+
+    var inc_db = try CompilerDb.init(allocator);
+    defer inc_db.deinit();
+
+    _ = try inc_db.setInput(file_id, rev1_src, .low);
+    const r1_eval = try inc_db.evalComptimeDef(DefId.init(file_id, 4));
+    try std.testing.expect(!r1_eval.has_errors);
+    try std.testing.expectEqual(@as(i128, (10 + 42) + (10 + 12) + 7), r1_eval.value.int_val);
+
+    _ = try inc_db.setInput(file_id, rev2_src, .low);
+    const inc_hir = try inc_db.lowerDefHir(DefId.init(file_id, 3));
+    const inc_eval = try inc_db.evalComptimeDef(DefId.init(file_id, 4));
+    try std.testing.expect(!inc_eval.has_errors);
+    try std.testing.expectEqual(@as(i128, (10 + 19) + (10 + 12) + 7), inc_eval.value.int_val);
+
+    var fresh_db = try CompilerDb.init(allocator);
+    defer fresh_db.deinit();
+    _ = try fresh_db.setInput(file_id, rev2_src, .low);
+    const fresh_hir = try fresh_db.lowerDefHir(DefId.init(file_id, 3));
+    const fresh_eval = try fresh_db.evalComptimeDef(DefId.init(file_id, 4));
+    try std.testing.expectEqual(fresh_hir.nodes.len, inc_hir.nodes.len);
+    try std.testing.expectEqual(fresh_eval.value.int_val, inc_eval.value.int_val);
+}
+
+test "test_query_db_incremental_builtin_nominal_struct_lit_typed_fingerprint_parity" {
+    const allocator = std.testing.allocator;
+    const file_id = FileId.fromInt(22);
+
+    const rev1_src =
+        "pub fn with_cancel(val: i64) -> i64 {\n" ++
+        "    let active_tok = CancelToken { _handle: 11 };\n" ++
+        "    return with context.cancel_token = active_tok {\n" ++
+        "        val + (context.cancel_token._handle as i64)\n" ++
+        "    };\n" ++
+        "}\n";
+
+    // Prepending an item shifts `with_cancel` from `DefId(22, 0)` to `DefId(22, 1)` after `CancelToken` is already cached in prelude:
+    const rev2_src =
+        "pub const EXTRA_CONST: i64 = 5;\n" ++
+        "pub fn with_cancel(val: i64) -> i64 {\n" ++
+        "    let active_tok = CancelToken { _handle: 11 };\n" ++
+        "    return with context.cancel_token = active_tok {\n" ++
+        "        val + (context.cancel_token._handle as i64)\n" ++
+        "    };\n" ++
+        "}\n";
+
+    var inc_db = try CompilerDb.init(allocator);
+    defer inc_db.deinit();
+    _ = try inc_db.setInput(file_id, rev1_src, .low);
+    _ = try inc_db.typecheckBody(DefId.init(file_id, 0));
+
+    _ = try inc_db.setInput(file_id, rev2_src, .low);
+    const inc_typed = try inc_db.typecheckBody(DefId.init(file_id, 1));
+
+    var fresh_db = try CompilerDb.init(allocator);
+    defer fresh_db.deinit();
+    _ = try fresh_db.setInput(file_id, rev2_src, .low);
+    const fresh_typed = try fresh_db.typecheckBody(DefId.init(file_id, 1));
+
+    try std.testing.expect(Fingerprint128.eql(fresh_typed.typed_fingerprint, inc_typed.typed_fingerprint));
+}
+
+test "test_query_db_durability_transition_and_repeated_resolve_e0218_parity" {
+    const allocator = std.testing.allocator;
+    const core_fid = FileId.fromInt(23);
+    const app_fid = FileId.fromInt(24);
+    const core_stub = "pub mod mem {\n    pub fn word_bytes() -> i32 = 8;\n}\n";
+    const src_v1 = "use core.mem;\npub fn probe_a() -> i32 = 1;\n";
+    const src_v2 = "use core.mem;\npub fn probe_b() -> i32 = 2;\n";
+
+    var inc_db = try CompilerDb.init(allocator);
+    defer inc_db.deinit();
+    _ = try inc_db.setInput(core_fid, core_stub, .high);
+    try inc_db.registerRootModule("core", core_fid);
+    try inc_db.registerRootModule("cx", core_fid);
+
+    _ = try inc_db.setInput(app_fid, src_v1, .low);
+    try std.testing.expectEqual(@as(u32, 1), (try inc_db.resolveSignatures(app_fid)).error_count);
+
+    // Privilege upgrade to `.high` suppresses `E0218` on identical source text:
+    _ = try inc_db.setInput(app_fid, src_v1, .high);
+    try std.testing.expectEqual(@as(u32, 0), (try inc_db.resolveSignatures(app_fid)).error_count);
+
+    // Downgrade back to `.low` and signature edit must emit exactly `1` `E0218` without accumulating stale imports:
+    _ = try inc_db.setInput(app_fid, src_v1, .low);
+    try std.testing.expectEqual(@as(u32, 1), (try inc_db.resolveSignatures(app_fid)).error_count);
+    _ = try inc_db.setInput(app_fid, src_v2, .low);
+    const inc_sigs = try inc_db.resolveSignatures(app_fid);
+    try std.testing.expectEqual(@as(u32, 1), inc_sigs.error_count);
+
+    var fresh_db = try CompilerDb.init(allocator);
+    defer fresh_db.deinit();
+    _ = try fresh_db.setInput(core_fid, core_stub, .high);
+    try fresh_db.registerRootModule("core", core_fid);
+    try fresh_db.registerRootModule("cx", core_fid);
+    _ = try fresh_db.setInput(app_fid, src_v2, .low);
+    const fresh_sigs = try fresh_db.resolveSignatures(app_fid);
+
+    try std.testing.expectEqual(fresh_sigs.error_count, inc_sigs.error_count);
+    try std.testing.expect(Fingerprint128.eql(fresh_sigs.signatures_fingerprint, inc_sigs.signatures_fingerprint));
+}
+
+test "test_query_db_root_cx_qualified_path_and_signature_rerun_default_sast_parity" {
+    const allocator = std.testing.allocator;
+    const core_fid = FileId.fromInt(25);
+    const app_fid = FileId.fromInt(26);
+    const core_stub = "pub mod mem {\n    pub fn word_bytes() -> i64 = 8;\n}\n";
+
+    const rev1_src =
+        "use cx.mem;\n" ++
+        "pub const SCALE_FACTOR: i64 = 6 * 7;\n" ++
+        "pub fn leaf_helper(val: i64) -> i64 = val * 3 + 1;\n" ++
+        "pub fn add_offset(val: i64, offset: i64 = val + 2) -> i64 = val + offset;\n" ++
+        "pub fn worker(input_val: i64) -> i64 {\n" ++
+        "    return cx.mem.word_bytes() + leaf_helper(SCALE_FACTOR) + add_offset(input_val);\n" ++
+        "}\n";
+
+    const rev2_src =
+        "pub const SCALE_FACTOR: i64 = 19;\n" ++
+        "pub fn leaf_helper(val: i64) -> i64 = (val & 63) + 1;\n" ++
+        "pub fn add_offset(val: i64, offset: i64 = val + 2) -> i64 = val + offset;\n" ++
+        "pub fn worker(input_val: i64) -> i64 {\n" ++
+        "    return cx.mem.word_bytes() + leaf_helper(SCALE_FACTOR) + add_offset(input_val);\n" ++
+        "}\n";
+
+    var inc_db = try CompilerDb.init(allocator);
+    defer inc_db.deinit();
+    _ = try inc_db.setInput(core_fid, core_stub, .high);
+    try inc_db.registerRootModule("core", core_fid);
+    try inc_db.registerRootModule("cx", core_fid);
+
+    _ = try inc_db.setInput(app_fid, rev1_src, .low);
+    _ = try inc_db.lowerDefHir(DefId.init(app_fid, 3));
+    _ = try inc_db.verifySastMir(DefId.init(app_fid, 3));
+
+    // Toggle durability `.low` -> `.high` -> `.low` and switch to `rev2_src` (no `use cx.mem;`, shrunk `const`, updated callee):
+    _ = try inc_db.setInput(app_fid, rev1_src, .high);
+    _ = try inc_db.resolveSignatures(app_fid);
+    _ = try inc_db.setInput(app_fid, rev2_src, .low);
+
+    const inc_typed = try inc_db.typecheckBody(DefId.init(app_fid, 3));
+    const inc_hir = try inc_db.lowerDefHir(DefId.init(app_fid, 3));
+    const inc_sast = try inc_db.verifySastMir(DefId.init(app_fid, 3));
+
+    var fresh_db = try CompilerDb.init(allocator);
+    defer fresh_db.deinit();
+    _ = try fresh_db.setInput(core_fid, core_stub, .high);
+    try fresh_db.registerRootModule("core", core_fid);
+    try fresh_db.registerRootModule("cx", core_fid);
+    _ = try fresh_db.setInput(app_fid, rev2_src, .low);
+
+    const fresh_typed = try fresh_db.typecheckBody(DefId.init(app_fid, 3));
+    const fresh_hir = try fresh_db.lowerDefHir(DefId.init(app_fid, 3));
+    const fresh_sast = try fresh_db.verifySastMir(DefId.init(app_fid, 3));
+
+    try std.testing.expect(Fingerprint128.eql(fresh_typed.typed_fingerprint, inc_typed.typed_fingerprint));
+    try std.testing.expectEqual(fresh_hir.countNodes(), inc_hir.countNodes());
+    try std.testing.expect(Fingerprint128.eql(fresh_sast.sast_fingerprint, inc_sast.sast_fingerprint));
+
+    // Re-inserting `use cx.mem;` shifts `DefId(app_fid, 0)` from `.const_decl` back to `.use_decl`;
+    // verify stale `def_to_symbol` keys are pruned so all `DefSignatureArtifact` fingerprints match a fresh DB:
+    _ = try inc_db.setInput(app_fid, rev1_src, .low);
+    var fresh_rev1_db = try CompilerDb.init(allocator);
+    defer fresh_rev1_db.deinit();
+    _ = try fresh_rev1_db.setInput(core_fid, core_stub, .high);
+    try fresh_rev1_db.registerRootModule("core", core_fid);
+    try fresh_rev1_db.registerRootModule("cx", core_fid);
+    _ = try fresh_rev1_db.setInput(app_fid, rev1_src, .low);
+
+    const inc_items = try inc_db.extractItemTree(app_fid);
+    const fresh_items = try fresh_rev1_db.extractItemTree(app_fid);
+    try std.testing.expectEqual(fresh_items.entries.len, inc_items.entries.len);
+    for (fresh_items.entries, 0..) |fresh_entry, i| {
+        const inc_def_sig = try inc_db.getDefSignature(inc_items.entries[i].def_id);
+        const fresh_def_sig = try fresh_rev1_db.getDefSignature(fresh_entry.def_id);
+        try std.testing.expect(Fingerprint128.eql(
+            fresh_def_sig.signature_fingerprint,
+            inc_def_sig.signature_fingerprint,
+        ));
+    }
 }

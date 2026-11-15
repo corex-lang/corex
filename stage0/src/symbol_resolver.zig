@@ -118,6 +118,8 @@ pub const ScopeKind = enum(u8) {
     match_arm_scope = 8,
     /// `catch |err|` or `errdefer |err|` error payload capture scope.
     catch_or_errdefer_scope = 9,
+    /// Positive `if`/`while` `is` and `:=` condition-binding scope (`DR-21` `SE-01`/`SE-02`).
+    condition_scope = 10,
 };
 
 /// 1-byte bit-packed semantic context flags inherited down lexical scope chains.
@@ -464,6 +466,26 @@ pub const SymbolRecord = struct {
     explicit_align_log2_plus1: u8 = 0,
 };
 
+/// Per-parameter metadata stored on `SymbolTable` for named arguments and cross-file default arguments (`SE-07`).
+pub const FnParamSpec = struct {
+    /// Interned parameter identifier (`SymbolId.empty` for unnamed parameters).
+    name: SymbolId = .empty,
+    /// Borrowed UTF-8 slice for `name` from `StringInterner`.
+    name_text: []const u8 = "",
+    /// `true` when this parameter declares `= DefaultExpr`.
+    has_default: bool = false,
+    /// AST node index of `DefaultExpr` inside `decl_file_id`'s `AstArena` (`.none` when `!has_default`).
+    default_ast_node: NodeIndex = .none,
+    /// Owning source file `FileId` containing `default_ast_node`.
+    decl_file_id: FileId = .none,
+    /// Enclosing top-level `DefId` owning this function or method declaration.
+    owner_def_id: DefId = .NONE,
+    /// Principal `TypeId` synthesized for `default_ast_node` (`TypeId.err_ty` until checked).
+    default_type_id: TypeId = .err_ty,
+    /// `true` when referenced by a subsequent parameter's `default_ast_node` (`SE-07`, suppresses `W0402`).
+    is_used_by_default: bool = false,
+};
+
 /// Explicit `@overload` function group tracking all member `fn_sym` symbols in a scope (`DR-02`).
 pub const OverloadSet = struct {
     /// Shared function identifier (`SymbolId`).
@@ -558,6 +580,22 @@ const HeaderAttrKind = enum(u8) {
     zero_pad,
 };
 
+/// Descriptor for a built-in `cx.meta` reflection mirror type stub (`DR-05` §3.3 & `DR-21`).
+const CxMetaMirrorStub = struct {
+    /// Canonical `PascalCase` reflection mirror type name.
+    name: []const u8,
+    /// Nominal symbol kind (`.struct_sym` or `.enum_sym`).
+    kind: SymbolKind,
+};
+
+/// Paired AST/CST node handles for a `.fn_decl` item in DFS module collection order.
+pub const FnDeclSyntaxHandle = struct {
+    /// Lowered `.fn_decl` AST node index.
+    ast_node: NodeIndex,
+    /// Lossless `.fn_item` CST node index.
+    cst_node: CstNodeIndex,
+};
+
 // --------------------------------------- CONSTS ----------------------------------------
 
 /// Maximum lexical scope nesting depth (`512`, matching `syntax_arenas.MAX_PARSE_DEPTH`).
@@ -582,6 +620,18 @@ pub const BUILTIN_TRAIT_NAMES = [_][]const u8{
     "Ord",
     "Send",
     "Sync",
+};
+
+/// Canonical table of 8 value-based reflection mirror stubs in `cx.meta` (`DR-05` §3.3 & `DR-21`).
+const CX_META_MIRROR_STUBS = [8]CxMetaMirrorStub{
+    .{ .name = "EnumInfo", .kind = .struct_sym },
+    .{ .name = "FieldInfo", .kind = .struct_sym },
+    .{ .name = "MetaId", .kind = .struct_sym },
+    .{ .name = "PrimKind", .kind = .enum_sym },
+    .{ .name = "StructInfo", .kind = .struct_sym },
+    .{ .name = "TypeInfo", .kind = .struct_sym },
+    .{ .name = "TypeKind", .kind = .enum_sym },
+    .{ .name = "VariantInfo", .kind = .struct_sym },
 };
 
 /// Built-in primitive and Constrained Type Group mappings pre-populated in `.global_prelude` (`DR-04`).
@@ -629,6 +679,42 @@ pub const BUILTIN_TYPES_AND_GROUPS = [_]BuiltinTypeEntry{
     .{ .name = "FromBytes", .type_id = .group_from_bytes, .is_group = true },
     .{ .name = "IntoBytes", .type_id = .group_into_bytes, .is_group = true },
 };
+
+/// $O(1)$ static lookup map from built-in primitive and Constrained Type Group names to `TypeId`.
+pub const BUILTIN_TYPE_AND_GROUP_MAP = std.StaticStringMap(TypeId).initComptime(.{
+    .{ "Bytes", .group_bytes },
+    .{ "Comparable", .group_comparable },
+    .{ "Copy", .group_copy },
+    .{ "Equatable", .group_equatable },
+    .{ "Float", .group_float },
+    .{ "FromBytes", .group_from_bytes },
+    .{ "Integer", .group_integer },
+    .{ "IntoBytes", .group_into_bytes },
+    .{ "Number", .group_number },
+    .{ "Numeric", .group_numeric },
+    .{ "Scalar", .group_scalar },
+    .{ "Signed", .group_signed },
+    .{ "Unsigned", .group_unsigned },
+    .{ "bool", .bool_ty },
+    .{ "char", .char_ty },
+    .{ "f32", .f32_ty },
+    .{ "f64", .f64_ty },
+    .{ "i128", .i128_ty },
+    .{ "i16", .i16_ty },
+    .{ "i32", .i32_ty },
+    .{ "i64", .i64_ty },
+    .{ "i8", .i8_ty },
+    .{ "isize", .isize_ty },
+    .{ "never", .never_ty },
+    .{ "str", .str_ty },
+    .{ "u128", .u128_ty },
+    .{ "u16", .u16_ty },
+    .{ "u32", .u32_ty },
+    .{ "u64", .u64_ty },
+    .{ "u8", .u8_ty },
+    .{ "unit", .unit_ty },
+    .{ "usize", .usize_ty },
+});
 
 /// $O(1)$ static lookup map from `@std_cap_boundary` capability names to `CapabilityBits` (`DR-17` §2.1–2.3).
 pub const CAPABILITY_NAME_MAP = std.StaticStringMap(u16).initComptime(.{
@@ -850,6 +936,82 @@ pub fn computeEditDistance(query: []const u8, candidate: []const u8) u16 {
     return prev_row[cand_len];
 }
 
+/// Appends `.fn_decl` AST/CST handles from `item_slice` in exact `collectItemSliceInScope` DFS order.
+fn collectFnDeclHandlesInSlice(
+    allocator: std.mem.Allocator,
+    item_slice: []const u32,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    ast_arena: *const AstArena,
+    out_handles: *std.ArrayListUnmanaged(FnDeclSyntaxHandle),
+    depth: u32,
+) std.mem.Allocator.Error!void {
+    if (depth >= MAX_SCOPE_DEPTH) return;
+    for (item_slice) |raw_node_idx| {
+        const item_node_idx = NodeIndex.fromInt(raw_node_idx);
+        if (item_node_idx.asInt() >= ast_arena.countNodes()) continue;
+        const ast_node = ast_arena.getNode(item_node_idx);
+        if (ast_node.tag == .item_hole) continue;
+        const item_cst = ast_arena.getCstOrigin(item_node_idx);
+        switch (ast_node.tag) {
+            .fn_decl => {
+                const name_tok = findItemNameToken(token_buffer, cst_arena, item_cst, ast_node.main_token);
+                if (extractTokenSlice(source, token_buffer, name_tok).len == 0) continue;
+                try out_handles.append(allocator, .{ .ast_node = item_node_idx, .cst_node = item_cst });
+            },
+            .mod_decl => {
+                const name_tok = if (ast_node.lhs.tag == .token)
+                    TokenIndex.fromInt(ast_node.lhs.payload)
+                else
+                    findItemNameToken(token_buffer, cst_arena, item_cst, ast_node.main_token);
+                if (extractTokenSlice(source, token_buffer, name_tok).len == 0) continue;
+                if (ast_node.rhs.tag == .extra) {
+                    try collectFnDeclHandlesInSlice(
+                        allocator,
+                        extractModInnerItems(ast_arena, item_node_idx),
+                        source,
+                        token_buffer,
+                        cst_arena,
+                        ast_arena,
+                        out_handles,
+                        depth + 1,
+                    );
+                }
+            },
+            .trait_decl => {
+                const name_tok = findItemNameToken(token_buffer, cst_arena, item_cst, ast_node.main_token);
+                if (extractTokenSlice(source, token_buffer, name_tok).len == 0) continue;
+                if (ast_node.lhs.tag == .extra and ast_node.rhs.tag == .extra and ast_node.rhs.payload > 0) {
+                    try collectFnDeclHandlesInSlice(
+                        allocator,
+                        ast_arena.getExtraSlice(ExtraIndex.fromInt(ast_node.lhs.payload), ast_node.rhs.payload),
+                        source,
+                        token_buffer,
+                        cst_arena,
+                        ast_arena,
+                        out_handles,
+                        depth + 1,
+                    );
+                }
+            },
+            .impl_decl => {
+                try collectFnDeclHandlesInSlice(
+                    allocator,
+                    extractImplMemberItems(ast_arena, item_node_idx),
+                    source,
+                    token_buffer,
+                    cst_arena,
+                    ast_arena,
+                    out_handles,
+                    depth + 1,
+                );
+            },
+            else => {},
+        }
+    }
+}
+
 // ------------------------------------- PUBLIC API --------------------------------------
 
 // ------------------------ Scope Arena -------------------------
@@ -987,12 +1149,20 @@ pub const SymbolTable = struct {
     trait_impl_pairs: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// Maps an `impl Trait for Type` method `SymbolIndex.asInt()` to its implemented `trait_sym` `SymbolIndex`.
     impl_method_trait: std.AutoHashMapUnmanaged(u32, SymbolIndex) = .empty,
+    /// Maps a function `SymbolIndex.asInt()` to its owned slice of `FnParamSpec` metadata (`SE-07`).
+    fn_param_specs: std.AutoHashMapUnmanaged(u32, []FnParamSpec) = .empty,
     /// Deferred `use` imports queued during Pass 1 for Pass 2 cross-module resolution.
     pending_imports: std.ArrayListUnmanaged(PendingUseImport) = .empty,
     /// Global prelude `ScopeId` (`ScopeId.fromInt(0)`).
     prelude_scope: ScopeId = .none,
-    /// Lazily populated `std::meta` module `ScopeId` (`DR-05` §3.3).
-    std_meta_scope: ScopeId = .none,
+    /// Lazily populated `cx.meta` reflection module `ScopeId` (`DR-05` §3.3 & `DR-21` `ADR-21B`).
+    cx_meta_scope: ScopeId = .none,
+    /// Lazily resolved or synthesized `cx` unified standard library root `ScopeId` (`DR-21` `ADR-21B`).
+    cx_root_scope: ScopeId = .none,
+    /// Lazily resolved or synthesized `cx.sync.atomic` / `cx.atomic` module `ScopeId`.
+    cx_atomic_scope: ScopeId = .none,
+    /// `true` when compiling internal `core/` sources (`--internal-core` or `Durability.high`), suppressing `E0218`.
+    is_internal_core: bool = false,
 
     /// Initializes a new `SymbolTable` and pre-populates the global prelude scope (`ScopeId` `0`).
     pub fn init(allocator: std.mem.Allocator, interner: *StringInterner) !SymbolTable {
@@ -1017,6 +1187,12 @@ pub const SymbolTable = struct {
             list_ptr.deinit(self.allocator);
         }
         self.scope_members.deinit(self.allocator);
+
+        var param_spec_iter = self.fn_param_specs.valueIterator();
+        while (param_spec_iter.next()) |spec_slice_ptr| {
+            self.allocator.free(spec_slice_ptr.*);
+        }
+        self.fn_param_specs.deinit(self.allocator);
 
         self.symbols.deinit(self.allocator);
         self.scoped_map.deinit(self.allocator);
@@ -1046,6 +1222,12 @@ pub const SymbolTable = struct {
             list_ptr.clearRetainingCapacity();
         }
 
+        var param_spec_iter = self.fn_param_specs.valueIterator();
+        while (param_spec_iter.next()) |spec_slice_ptr| {
+            self.allocator.free(spec_slice_ptr.*);
+        }
+        self.fn_param_specs.clearRetainingCapacity();
+
         self.symbols.clearRetainingCapacity();
         self.scoped_map.clearRetainingCapacity();
         self.file_module_scopes.clearRetainingCapacity();
@@ -1059,8 +1241,37 @@ pub const SymbolTable = struct {
         self.impl_method_trait.clearRetainingCapacity();
         self.pending_imports.clearRetainingCapacity();
         self.scope_arena.resetRetainingCapacity();
-        self.std_meta_scope = .none;
+        self.cx_meta_scope = .none;
+        self.cx_root_scope = .none;
+        self.cx_atomic_scope = .none;
+        self.is_internal_core = false;
         try self.populateGlobalPrelude(interner);
+    }
+
+    /// Stores a duplicated `FnParamSpec` slice for `fn_sym_idx` (`SE-07` named/default call metadata).
+    pub fn setFnParamSpecs(
+        self: *SymbolTable,
+        fn_sym_idx: SymbolIndex,
+        specs: []const FnParamSpec,
+    ) !void {
+        if (fn_sym_idx.isNone()) return;
+        const owned = try self.allocator.dupe(FnParamSpec, specs);
+        errdefer self.allocator.free(owned);
+        if (try self.fn_param_specs.fetchPut(self.allocator, fn_sym_idx.asInt(), owned)) |prev_kv| {
+            self.allocator.free(prev_kv.value);
+        }
+    }
+
+    /// Retrieves the `FnParamSpec` slice recorded for `fn_sym_idx`, or `&.{}` if none is registered.
+    pub fn getFnParamSpecs(self: *const SymbolTable, fn_sym_idx: SymbolIndex) []const FnParamSpec {
+        if (fn_sym_idx.isNone()) return &.{};
+        return self.fn_param_specs.get(fn_sym_idx.asInt()) orelse &.{};
+    }
+
+    /// Retrieves the mutable `FnParamSpec` slice recorded for `fn_sym_idx`, or `&.{}` if none is registered.
+    pub fn getFnParamSpecsMut(self: *SymbolTable, fn_sym_idx: SymbolIndex) []FnParamSpec {
+        if (fn_sym_idx.isNone()) return &.{};
+        return self.fn_param_specs.get(fn_sym_idx.asInt()) orelse &.{};
     }
 
     /// Binds an external `mod <name>;` declaration in `parent_file_id` to `target_scope`.
@@ -1087,72 +1298,51 @@ pub const SymbolTable = struct {
         return .none;
     }
 
-    /// Lazily populates `std::meta` and its 8 value-based reflection mirror stubs (`DR-05` §3.3).
-    pub fn ensureStdMetaScope(self: *SymbolTable, interner: *StringInterner) !ScopeId {
-        if (!self.std_meta_scope.isNone()) return self.std_meta_scope;
+    /// Lazily populates `cx.meta` and its 8 value-based reflection mirror stubs (`DR-05` §3.3 & `DR-21`).
+    pub fn ensureCxMetaScope(self: *SymbolTable, interner: *StringInterner) anyerror!ScopeId {
+        if (!self.cx_meta_scope.isNone()) return self.cx_meta_scope;
 
-        const std_sym_id = try interner.intern("std");
-        const existing_std = self.lookupInScopeDirect(
-            self.prelude_scope,
-            std_sym_id,
+        const root_scope = if (!self.cx_root_scope.isNone())
+            self.cx_root_scope
+        else
+            try self.ensureCxRootScope(interner);
+        if (!self.cx_meta_scope.isNone()) return self.cx_meta_scope;
+
+        const meta_sym_id = try interner.intern("meta");
+        const existing_meta = self.lookupInScopeDirect(
+            root_scope,
+            meta_sym_id,
             NamespaceMask.VALUE_ONLY,
         );
-        const std_scope = if (!existing_std.isNone() and
-            !self.getSymbol(existing_std).target_scope.isNone())
-            self.getSymbol(existing_std).target_scope
+        const meta_scope = if (!existing_meta.isNone() and
+            !self.getSymbol(existing_meta).target_scope.isNone())
+            self.getSymbol(existing_meta).target_scope
         else blk: {
-            const new_std_scope = try self.scope_arena.allocScope(
+            const fresh_meta_scope = try self.scope_arena.allocScope(
                 .module_scope,
-                self.prelude_scope,
+                root_scope,
                 .NONE,
                 .none,
                 .{},
             );
             _ = try self.defineSymbol(.{
-                .name = std_sym_id,
-                .name_text = interner.get(std_sym_id),
+                .name = meta_sym_id,
+                .name_text = interner.get(meta_sym_id),
                 .kind = .module_sym,
                 .namespace = .value_ns,
                 .visibility = .public,
                 .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
-                .scope_id = self.prelude_scope,
-                .target_scope = new_std_scope,
+                .scope_id = root_scope,
+                .target_scope = fresh_meta_scope,
             }, null);
-            break :blk new_std_scope;
+            break :blk fresh_meta_scope;
         };
 
-        const meta_sym_id = try interner.intern("meta");
-        const meta_scope = try self.scope_arena.allocScope(
-            .module_scope,
-            std_scope,
-            .NONE,
-            .none,
-            .{},
-        );
-        _ = try self.defineSymbol(.{
-            .name = meta_sym_id,
-            .name_text = interner.get(meta_sym_id),
-            .kind = .module_sym,
-            .namespace = .value_ns,
-            .visibility = .public,
-            .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
-            .scope_id = std_scope,
-            .target_scope = meta_scope,
-        }, null);
-
-        const MirrorStub = struct { name: []const u8, kind: SymbolKind };
-        const stubs = [8]MirrorStub{
-            .{ .name = "EnumInfo", .kind = .struct_sym },
-            .{ .name = "FieldInfo", .kind = .struct_sym },
-            .{ .name = "MetaId", .kind = .struct_sym },
-            .{ .name = "PrimKind", .kind = .enum_sym },
-            .{ .name = "StructInfo", .kind = .struct_sym },
-            .{ .name = "TypeInfo", .kind = .struct_sym },
-            .{ .name = "TypeKind", .kind = .enum_sym },
-            .{ .name = "VariantInfo", .kind = .struct_sym },
-        };
-        for (stubs) |stub| {
+        for (CX_META_MIRROR_STUBS) |stub| {
             const stub_sym_id = try interner.intern(stub.name);
+            if (!self.lookupInScopeDirect(meta_scope, stub_sym_id, NamespaceMask.TYPE_ONLY).isNone()) {
+                continue;
+            }
             const member_scope = try self.scope_arena.allocScope(
                 .nominal_type_scope,
                 meta_scope,
@@ -1173,11 +1363,292 @@ pub const SymbolTable = struct {
             }, null);
         }
 
-        self.std_meta_scope = meta_scope;
+        self.cx_meta_scope = meta_scope;
         return meta_scope;
     }
 
-    /// Populates `ScopeId` `0` (`.global_prelude`) with the 19 primitives, 11 Type Groups, and built-in traits.
+    /// Lazily resolves or synthesizes the unified `cx` standard library root scope and built-in submodule bridges (`DR-21`).
+    pub fn ensureCxRootScope(self: *SymbolTable, interner: *StringInterner) anyerror!ScopeId {
+        const core_sym_id = try interner.intern("core");
+        const cx_sym_id = try interner.intern("cx");
+
+        const registered_root = self.named_module_scopes.get(core_sym_id.asInt()) orelse
+            self.named_module_scopes.get(cx_sym_id.asInt()) orelse
+            ScopeId.none;
+        const root_scope = if (!registered_root.isNone())
+            registered_root
+        else if (!self.cx_root_scope.isNone())
+            self.cx_root_scope
+        else
+            try self.scope_arena.allocScope(.module_scope, self.prelude_scope, .NONE, .none, .{});
+
+        self.cx_root_scope = root_scope;
+        try self.named_module_scopes.put(self.allocator, cx_sym_id.asInt(), root_scope);
+        const existing_cx = self.lookupInScopeDirect(self.prelude_scope, cx_sym_id, NamespaceMask.VALUE_ONLY);
+        if (existing_cx.isNone()) {
+            _ = try self.defineSymbol(.{
+                .name = cx_sym_id,
+                .name_text = interner.get(cx_sym_id),
+                .kind = .module_sym,
+                .namespace = .value_ns,
+                .visibility = .public,
+                .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+                .scope_id = self.prelude_scope,
+                .target_scope = root_scope,
+            }, null);
+        } else {
+            self.getSymbolMut(existing_cx).target_scope = root_scope;
+        }
+
+        // [1] Ensure `cx.meta` and its reflection mirror types (`TypeInfo`, `FieldInfo`, etc.) exist under `cx`:
+        _ = try self.ensureCxMetaScope(interner);
+
+        // [2] Bridge `cx.sync.atomic` -> `core/atomic.cx` when loaded, or synthesize standalone `atomic` stubs:
+        const atomic_sym_id = try interner.intern("atomic");
+        const existing_atomic = self.lookupInScopeDirect(root_scope, atomic_sym_id, NamespaceMask.VALUE_ONLY);
+        const atomic_scope = if (!existing_atomic.isNone() and !self.getSymbol(existing_atomic).target_scope.isNone())
+            self.getSymbol(existing_atomic).target_scope
+        else blk: {
+            const fresh_atomic_scope = try self.scope_arena.allocScope(.module_scope, root_scope, .NONE, .none, .{});
+            _ = try self.defineSymbol(.{
+                .name = atomic_sym_id,
+                .name_text = interner.get(atomic_sym_id),
+                .kind = .module_sym,
+                .namespace = .value_ns,
+                .visibility = .public,
+                .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+                .scope_id = root_scope,
+                .target_scope = fresh_atomic_scope,
+            }, null);
+            try self.populateStandaloneEnumStub(
+                interner,
+                fresh_atomic_scope,
+                "Ordering",
+                &.{ "Relaxed", "Release", "Acquire", "AcqRel", "SeqCst" },
+            );
+            break :blk fresh_atomic_scope;
+        };
+        self.cx_atomic_scope = atomic_scope;
+
+        const sync_sym_id = try interner.intern("sync");
+        const existing_sync = self.lookupInScopeDirect(root_scope, sync_sym_id, NamespaceMask.VALUE_ONLY);
+        const sync_scope = if (!existing_sync.isNone() and !self.getSymbol(existing_sync).target_scope.isNone())
+            self.getSymbol(existing_sync).target_scope
+        else blk: {
+            const fresh_sync_scope = try self.scope_arena.allocScope(.module_scope, root_scope, .NONE, .none, .{});
+            _ = try self.defineSymbol(.{
+                .name = sync_sym_id,
+                .name_text = interner.get(sync_sym_id),
+                .kind = .module_sym,
+                .namespace = .value_ns,
+                .visibility = .public,
+                .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+                .scope_id = root_scope,
+                .target_scope = fresh_sync_scope,
+            }, null);
+            break :blk fresh_sync_scope;
+        };
+        if (self.lookupInScopeDirect(sync_scope, atomic_sym_id, NamespaceMask.VALUE_ONLY).isNone()) {
+            _ = try self.defineSymbol(.{
+                .name = atomic_sym_id,
+                .name_text = interner.get(atomic_sym_id),
+                .kind = .module_sym,
+                .namespace = .value_ns,
+                .visibility = .public,
+                .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+                .scope_id = sync_scope,
+                .target_scope = atomic_scope,
+            }, null);
+        }
+
+        // [3] Synthesize standalone `cx.cmp`, `cx.io`, `cx.fs`, and `cx.mem` stubs when `core/` was not loaded:
+        const cmp_sym_id = try interner.intern("cmp");
+        if (self.lookupInScopeDirect(root_scope, cmp_sym_id, NamespaceMask.VALUE_ONLY).isNone()) {
+            const cmp_scope = try self.scope_arena.allocScope(.module_scope, root_scope, .NONE, .none, .{});
+            _ = try self.defineSymbol(.{
+                .name = cmp_sym_id,
+                .name_text = interner.get(cmp_sym_id),
+                .kind = .module_sym,
+                .namespace = .value_ns,
+                .visibility = .public,
+                .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+                .scope_id = root_scope,
+                .target_scope = cmp_scope,
+            }, null);
+            try self.populateStandaloneEnumStub(interner, cmp_scope, "Ordering", &.{ "Less", "Equal", "Greater" });
+        }
+
+        const io_sym_id = try interner.intern("io");
+        if (self.lookupInScopeDirect(root_scope, io_sym_id, NamespaceMask.VALUE_ONLY).isNone()) {
+            const io_scope = try self.scope_arena.allocScope(.module_scope, root_scope, .NONE, .none, .{});
+            _ = try self.defineSymbol(.{
+                .name = io_sym_id,
+                .name_text = interner.get(io_sym_id),
+                .kind = .module_sym,
+                .namespace = .value_ns,
+                .visibility = .public,
+                .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+                .scope_id = root_scope,
+                .target_scope = io_scope,
+            }, null);
+            for ([_][]const u8{ "Read", "Write" }) |trait_stub| {
+                const trait_id = try interner.intern(trait_stub);
+                const trait_scope = try self.scope_arena.allocScope(.trait_scope, io_scope, .NONE, .none, .{});
+                _ = try self.defineSymbol(.{
+                    .name = trait_id,
+                    .name_text = interner.get(trait_id),
+                    .kind = .trait_sym,
+                    .namespace = .type_ns,
+                    .visibility = .public,
+                    .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+                    .scope_id = io_scope,
+                    .target_scope = trait_scope,
+                }, null);
+            }
+        }
+
+        const fs_sym_id = try interner.intern("fs");
+        if (self.lookupInScopeDirect(root_scope, fs_sym_id, NamespaceMask.VALUE_ONLY).isNone()) {
+            const fs_scope = try self.scope_arena.allocScope(.module_scope, root_scope, .NONE, .none, .{});
+            _ = try self.defineSymbol(.{
+                .name = fs_sym_id,
+                .name_text = interner.get(fs_sym_id),
+                .kind = .module_sym,
+                .namespace = .value_ns,
+                .visibility = .public,
+                .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+                .scope_id = root_scope,
+                .target_scope = fs_scope,
+            }, null);
+            const file_ty_id = try interner.intern("File");
+            const file_member_scope = try self.scope_arena.allocScope(.nominal_type_scope, fs_scope, .NONE, .none, .{});
+            _ = try self.defineSymbol(.{
+                .name = file_ty_id,
+                .name_text = interner.get(file_ty_id),
+                .kind = .struct_sym,
+                .namespace = .type_ns,
+                .visibility = .public,
+                .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+                .scope_id = fs_scope,
+                .target_scope = file_member_scope,
+            }, null);
+        }
+
+        const mem_sym_id = try interner.intern("mem");
+        if (self.lookupInScopeDirect(root_scope, mem_sym_id, NamespaceMask.VALUE_ONLY).isNone()) {
+            const mem_scope = try self.scope_arena.allocScope(.module_scope, root_scope, .NONE, .none, .{});
+            _ = try self.defineSymbol(.{
+                .name = mem_sym_id,
+                .name_text = interner.get(mem_sym_id),
+                .kind = .module_sym,
+                .namespace = .value_ns,
+                .visibility = .public,
+                .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+                .scope_id = root_scope,
+                .target_scope = mem_scope,
+            }, null);
+            const alloc_trait_id = try interner.intern("Allocator");
+            const alloc_trait_scope = try self.scope_arena.allocScope(.trait_scope, mem_scope, .NONE, .none, .{});
+            _ = try self.defineSymbol(.{
+                .name = alloc_trait_id,
+                .name_text = interner.get(alloc_trait_id),
+                .kind = .trait_sym,
+                .namespace = .type_ns,
+                .visibility = .public,
+                .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+                .scope_id = mem_scope,
+                .target_scope = alloc_trait_scope,
+            }, null);
+        }
+
+        return root_scope;
+    }
+
+    /// Populates a built-in unit-variant `enum` stub inside `parent_scope` when `core/` sources are absent.
+    fn populateStandaloneEnumStub(
+        self: *SymbolTable,
+        interner: *StringInterner,
+        parent_scope: ScopeId,
+        enum_name: []const u8,
+        variant_names: []const []const u8,
+    ) !void {
+        const enum_sym_id = try interner.intern(enum_name);
+        if (!self.lookupInScopeDirect(parent_scope, enum_sym_id, NamespaceMask.TYPE_ONLY).isNone()) return;
+        const var_scope = try self.scope_arena.allocScope(.nominal_type_scope, parent_scope, .NONE, .none, .{});
+        _ = try self.defineSymbol(.{
+            .name = enum_sym_id,
+            .name_text = interner.get(enum_sym_id),
+            .kind = .enum_sym,
+            .namespace = .type_ns,
+            .visibility = .public,
+            .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+            .scope_id = parent_scope,
+            .target_scope = var_scope,
+            .derive_mask = .{ .has_eq = true, .has_hash = true, .has_debug = true, .has_clone = true },
+        }, null);
+        for (variant_names, 0..) |var_name, ord| {
+            const var_id = try interner.intern(var_name);
+            _ = try self.defineSymbol(.{
+                .name = var_id,
+                .name_text = interner.get(var_id),
+                .kind = .enum_variant_sym,
+                .namespace = .value_ns,
+                .visibility = .public,
+                .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+                .scope_id = var_scope,
+                .type_id = .unit_ty,
+                .member_ordinal = @intCast(ord),
+            }, null);
+        }
+    }
+
+    /// Resolves root namespace prefixes (`cx`, `core`), enforcing `E0218` on `core` when `!is_internal_core`.
+    pub fn resolveRootNamespaceScope(
+        self: *SymbolTable,
+        interner: *StringInterner,
+        caller_scope: ScopeId,
+        root_lexeme: []const u8,
+        root_span: Span,
+        diagnostic_sink: ?*DiagnosticSink,
+    ) !ScopeId {
+        if (std.mem.eql(u8, root_lexeme, "cx")) {
+            const cx_id = try interner.intern("cx");
+            switch (self.lookupLexical(caller_scope, cx_id, NamespaceMask.VALUE_ONLY)) {
+                .found => |sym_idx| {
+                    const sym = self.getSymbol(sym_idx);
+                    if (sym.scope_id != self.prelude_scope and !sym.flags.is_builtin and !sym.target_scope.isNone()) {
+                        self.markSymbolUsed(sym_idx);
+                        return sym.target_scope;
+                    }
+                },
+                else => {},
+            }
+            return self.ensureCxRootScope(interner);
+        } else if (std.mem.eql(u8, root_lexeme, "core")) {
+            const core_id = try interner.intern("core");
+            switch (self.lookupLexical(caller_scope, core_id, NamespaceMask.VALUE_ONLY)) {
+                .found => |sym_idx| {
+                    const sym = self.getSymbol(sym_idx);
+                    if (sym.scope_id != self.prelude_scope and !sym.flags.is_builtin and !sym.target_scope.isNone()) {
+                        self.markSymbolUsed(sym_idx);
+                        return sym.target_scope;
+                    }
+                },
+                else => {},
+            }
+            const cx_scope = try self.ensureCxRootScope(interner);
+            if (!self.is_internal_core) {
+                if (diagnostic_sink) |sink| {
+                    try emitDirectCoreImportDiagnostic(sink, interner, root_span);
+                }
+                return .none;
+            }
+            return self.named_module_scopes.get(core_id.asInt()) orelse cx_scope;
+        }
+        return .none;
+    }
+
+    /// Populates `ScopeId` `0` (`.global_prelude`) with the 19 primitives, 13 Type Groups, and built-in traits.
     fn populateGlobalPrelude(self: *SymbolTable, interner: *StringInterner) !void {
         self.prelude_scope = try self.scope_arena.allocScope(
             .global_prelude,
@@ -1187,7 +1658,7 @@ pub const SymbolTable = struct {
             .{},
         );
 
-        // [1] Register the 19 primitive types and 11 Constrained Type Groups (`DR-04` Section 1.1):
+        // [1] Register the 19 primitive types and 13 Constrained Type Groups (`DR-04` Section 1.1):
         for (BUILTIN_TYPES_AND_GROUPS) |entry| {
             const sym_name = try interner.intern(entry.name);
             const sym_idx = try self.appendSymbol(.{
@@ -1839,6 +2310,44 @@ pub fn emitPrivateAccessDiagnostic(
     }
 }
 
+/// Emits `E0218` (`e0218_direct_core_import_forbidden`) with a machine-applicable `"cx"` replacement fix.
+pub fn emitDirectCoreImportDiagnostic(
+    sink: *DiagnosticSink,
+    interner: *StringInterner,
+    core_span: Span,
+) !void {
+    const cx_id = try interner.intern("cx");
+    const edit = [1]TextEdit{.{
+        .file_id = core_span.file_id,
+        .start_byte = core_span.start_byte,
+        .end_byte = core_span.end_byte,
+        .replacement_id = cx_id,
+    }};
+    const fix = [1]SuggestedFix{.{
+        .message = "replace `core` with the unified `cx` standard library root",
+        .applicability = .machine_applicable,
+        .priority = .syntax_canonicalization,
+        .edits = &edit,
+    }};
+    const labels = [1]LabeledSpan{.{
+        .span = core_span,
+        .label = "direct `core` root access is reserved for `--internal-core`",
+        .style = .primary,
+    }};
+    const notes = [1][]const u8{
+        "help: import standard library and kernel facilities through `cx.*` instead of `core.*`",
+    };
+    _ = try sink.emit(.{
+        .code = .e0218_direct_core_import_forbidden,
+        .severity = .err,
+        .primary_span = core_span,
+        .message = "direct access to internal `core` root is forbidden outside `--internal-core`",
+        .labels = &labels,
+        .notes = &notes,
+        .suggestions = &fix,
+    });
+}
+
 // --------- Module Item Collection & `use` Resolution ----------
 
 /// Combined item modifier, `@derive`, `@attribute_schema`, and Phase 6 contract metadata extracted from CST headers.
@@ -2322,7 +2831,6 @@ fn extractAttributeSchemaTargets(
             .rbracket,
             .comma,
             .dot,
-            .coloncolon,
             .pipe,
             .eq,
             .colon,
@@ -2352,7 +2860,7 @@ fn extractAttributeSchemaTargets(
                 }
                 continue;
             }
-            if ((next_kind == .coloncolon or next_kind == .dot) and
+            if (next_kind == .dot and
                 std.mem.eql(u8, token_lex, "AttributeTarget"))
             {
                 continue;
@@ -2806,6 +3314,40 @@ pub fn collectFileModuleItems(
     ast_arena: *const AstArena,
     diagnostic_sink: ?*DiagnosticSink,
 ) !ScopeId {
+    var write_idx: usize = 0;
+    for (sym_table.pending_imports.items) |pending_imp| {
+        if (pending_imp.file_id != file_id) {
+            sym_table.pending_imports.items[write_idx] = pending_imp;
+            write_idx += 1;
+        }
+    }
+    sym_table.pending_imports.items.len = write_idx;
+
+    var stale_def_keys: std.ArrayListUnmanaged(u32) = .empty;
+    defer stale_def_keys.deinit(sym_table.allocator);
+    var def_key_iter = sym_table.def_to_symbol.keyIterator();
+    while (def_key_iter.next()) |raw_def_ptr| {
+        if (DefId.fromInt(raw_def_ptr.*).fileId() == file_id) {
+            try stale_def_keys.append(sym_table.allocator, raw_def_ptr.*);
+        }
+    }
+    for (stale_def_keys.items) |stale_def_raw| {
+        _ = sym_table.def_to_symbol.remove(stale_def_raw);
+    }
+
+    var stale_from_keys: std.ArrayListUnmanaged(u64) = .empty;
+    defer stale_from_keys.deinit(sym_table.allocator);
+    var from_iter = sym_table.from_error_fn_defs.iterator();
+    while (from_iter.next()) |from_entry| {
+        if (from_entry.value_ptr.fileId() == file_id) {
+            try stale_from_keys.append(sym_table.allocator, from_entry.key_ptr.*);
+        }
+    }
+    for (stale_from_keys.items) |stale_pair_key| {
+        _ = sym_table.from_error_fn_defs.remove(stale_pair_key);
+        _ = sym_table.from_error_pairs.remove(stale_pair_key);
+    }
+
     const file_scope = try sym_table.scope_arena.allocScope(
         .module_scope,
         sym_table.prelude_scope,
@@ -2838,6 +3380,34 @@ pub fn collectFileModuleItems(
         );
     }
     return file_scope;
+}
+
+/// Extracts all `.fn_decl` AST/CST handles in `ast_arena` in exact `collectFileModuleItems` DFS order.
+pub fn collectFileFnDeclHandles(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    ast_arena: *const AstArena,
+) std.mem.Allocator.Error![]FnDeclSyntaxHandle {
+    var handles: std.ArrayListUnmanaged(FnDeclSyntaxHandle) = .empty;
+    errdefer handles.deinit(allocator);
+    if (ast_arena.countNodes() > 0) {
+        const root_node = ast_arena.getNode(.root);
+        if (root_node.lhs.tag == .extra and root_node.rhs.tag == .extra and root_node.rhs.payload > 0) {
+            try collectFnDeclHandlesInSlice(
+                allocator,
+                ast_arena.getExtraSlice(ExtraIndex.fromInt(root_node.lhs.payload), root_node.rhs.payload),
+                source,
+                token_buffer,
+                cst_arena,
+                ast_arena,
+                &handles,
+                0,
+            );
+        }
+    }
+    return handles.toOwnedSlice(allocator);
 }
 
 /// Collects a slice of AST item indices into `enclosing_scope`.
@@ -3367,8 +3937,10 @@ fn resolveImplTargetScope(
             cst_arena.countNodes(),
         );
 
-        var first_type_name: []const u8 = "";
-        var after_for_type_name: []const u8 = "";
+        var before_for_toks: [16]TokenIndex = undefined;
+        var before_for_len: usize = 0;
+        var after_for_toks: [16]TokenIndex = undefined;
+        var after_for_len: usize = 0;
         var has_seen_for = false;
 
         var cursor: usize = start_idx + 1;
@@ -3392,58 +3964,110 @@ fn resolveImplTargetScope(
                 continue;
             }
             if (isIdentifierToken(tok_kind) or tok_kind == .prim_type) {
-                const lex = extractTokenSlice(source, token_buffer, node.token);
                 if (!has_seen_for) {
-                    if (first_type_name.len == 0) first_type_name = lex;
+                    if (before_for_len < before_for_toks.len) {
+                        before_for_toks[before_for_len] = node.token;
+                        before_for_len += 1;
+                    }
                 } else {
-                    if (after_for_type_name.len == 0) after_for_type_name = lex;
+                    if (after_for_len < after_for_toks.len) {
+                        after_for_toks[after_for_len] = node.token;
+                        after_for_len += 1;
+                    }
                 }
             }
         }
 
-        if (has_seen_for and first_type_name.len > 0) {
-            const trait_id = try interner.intern(first_type_name);
-            switch (sym_table.lookupLexical(enclosing_scope, trait_id, NamespaceMask.TYPE_ONLY)) {
-                .found => |found_trait| {
-                    if (sym_table.getSymbol(found_trait).kind == .trait_sym) {
-                        trait_sym_idx = found_trait;
-                    }
-                },
-                else => {},
+        if (has_seen_for and before_for_len > 0) {
+            const trait_tok = before_for_toks[before_for_len - 1];
+            const trait_lex = extractTokenSlice(source, token_buffer, trait_tok);
+            if (trait_lex.len > 0) {
+                const trait_id = try interner.intern(trait_lex);
+                const trait_lookup: LookupResult = if (before_for_len > 1) blk: {
+                    const mod_scope = try resolveModulePathSegments(
+                        sym_table,
+                        interner,
+                        file_id,
+                        enclosing_scope,
+                        enclosing_scope,
+                        before_for_toks[0 .. before_for_len - 1],
+                        source,
+                        token_buffer,
+                        null,
+                    );
+                    if (mod_scope.isNone()) break :blk .not_found;
+                    break :blk sym_table.lookupInTargetScope(
+                        mod_scope,
+                        enclosing_scope,
+                        trait_id,
+                        NamespaceMask.TYPE_ONLY,
+                    );
+                } else sym_table.lookupLexical(enclosing_scope, trait_id, NamespaceMask.TYPE_ONLY);
+                switch (trait_lookup) {
+                    .found => |found_trait| {
+                        if (sym_table.getSymbol(found_trait).kind == .trait_sym) {
+                            trait_sym_idx = found_trait;
+                        }
+                    },
+                    else => {},
+                }
             }
         }
 
-        const target_type_name = if (has_seen_for and after_for_type_name.len > 0)
-            after_for_type_name
+        const target_toks = if (has_seen_for and after_for_len > 0)
+            after_for_toks[0..after_for_len]
         else
-            first_type_name;
+            before_for_toks[0..before_for_len];
 
-        if (target_type_name.len > 0) {
-            const target_sym_id = try interner.intern(target_type_name);
-            const lookup = sym_table.lookupLexical(enclosing_scope, target_sym_id, NamespaceMask.TYPE_ONLY);
-            switch (lookup) {
-                .found => |sym_idx| {
-                    const sym = sym_table.getSymbol(sym_idx);
-                    if (!sym.target_scope.isNone()) {
+        if (target_toks.len > 0) {
+            const target_tok = target_toks[target_toks.len - 1];
+            const target_type_name = extractTokenSlice(source, token_buffer, target_tok);
+            if (target_type_name.len > 0) {
+                const target_sym_id = try interner.intern(target_type_name);
+                const lookup: LookupResult = if (target_toks.len > 1) blk: {
+                    const mod_scope = try resolveModulePathSegments(
+                        sym_table,
+                        interner,
+                        file_id,
+                        enclosing_scope,
+                        enclosing_scope,
+                        target_toks[0 .. target_toks.len - 1],
+                        source,
+                        token_buffer,
+                        null,
+                    );
+                    if (mod_scope.isNone()) break :blk .not_found;
+                    break :blk sym_table.lookupInTargetScope(
+                        mod_scope,
+                        enclosing_scope,
+                        target_sym_id,
+                        NamespaceMask.TYPE_ONLY,
+                    );
+                } else sym_table.lookupLexical(enclosing_scope, target_sym_id, NamespaceMask.TYPE_ONLY);
+                switch (lookup) {
+                    .found => |sym_idx| {
+                        const sym = sym_table.getSymbol(sym_idx);
+                        if (!sym.target_scope.isNone()) {
+                            return .{
+                                .target_scope = sym.target_scope,
+                                .trait_sym_idx = trait_sym_idx,
+                            };
+                        }
+                        const created_scope = try sym_table.scope_arena.allocScope(
+                            .nominal_type_scope,
+                            enclosing_scope,
+                            def_id,
+                            file_id,
+                            .{},
+                        );
+                        sym_table.getSymbolMut(sym_idx).target_scope = created_scope;
                         return .{
-                            .target_scope = sym.target_scope,
+                            .target_scope = created_scope,
                             .trait_sym_idx = trait_sym_idx,
                         };
-                    }
-                    const created_scope = try sym_table.scope_arena.allocScope(
-                        .nominal_type_scope,
-                        enclosing_scope,
-                        def_id,
-                        file_id,
-                        .{},
-                    );
-                    sym_table.getSymbolMut(sym_idx).target_scope = created_scope;
-                    return .{
-                        .target_scope = created_scope,
-                        .trait_sym_idx = trait_sym_idx,
-                    };
-                },
-                else => {},
+                    },
+                    else => {},
+                }
             }
         }
     }
@@ -3687,6 +4311,7 @@ pub fn resolveFileUseImports(
                     pending.file_id,
                     pending.module_scope,
                     pending.module_scope,
+                    .none,
                     pending.def_id,
                     pending.is_pub,
                     node_id,
@@ -3701,13 +4326,14 @@ pub fn resolveFileUseImports(
     }
 }
 
-/// Recursively resolves a `.use_tree` CST subtree (`path::to::{a, b as c}` or `path::*`).
+/// Recursively resolves a `.use_tree` CST subtree (`path.to.{self, a, b as c}` or `path.*`).
 fn resolveUseTreeCst(
     sym_table: *SymbolTable,
     interner: *StringInterner,
     file_id: FileId,
     dest_module_scope: ScopeId,
     current_lookup_scope: ScopeId,
+    parent_mod_tok: TokenIndex,
     def_id: DefId,
     is_pub: bool,
     tree_cst: CstNodeIndex,
@@ -3729,6 +4355,7 @@ fn resolveUseTreeCst(
     var has_seen_as = false;
     var alias_tok: TokenIndex = .none;
     var has_nested_trees = false;
+    var cached_prefix_scope: ?ScopeId = null;
 
     var cursor: usize = start_idx + 1;
     while (cursor < end_idx) {
@@ -3737,18 +4364,25 @@ fn resolveUseTreeCst(
 
         if (sub.kind == .use_tree) {
             has_nested_trees = true;
-            // First resolve prefix `segments[0..seg_count]` to a target module/type scope:
-            const prefix_scope = try resolveModulePathSegments(
-                sym_table,
-                interner,
-                file_id,
-                dest_module_scope,
-                current_lookup_scope,
-                segments[0..seg_count],
-                source,
-                token_buffer,
-                diagnostic_sink,
-            );
+            // Resolve prefix `segments[0..seg_count]` once across all braced group children:
+            const prefix_scope = if (cached_prefix_scope) |cached_scope|
+                cached_scope
+            else blk: {
+                const resolved_scope = try resolveModulePathSegments(
+                    sym_table,
+                    interner,
+                    file_id,
+                    dest_module_scope,
+                    current_lookup_scope,
+                    segments[0..seg_count],
+                    source,
+                    token_buffer,
+                    diagnostic_sink,
+                );
+                cached_prefix_scope = resolved_scope;
+                break :blk resolved_scope;
+            };
+            const next_parent_tok = if (seg_count > 0) segments[seg_count - 1] else parent_mod_tok;
             if (!prefix_scope.isNone()) {
                 try resolveUseTreeCst(
                     sym_table,
@@ -3756,6 +4390,7 @@ fn resolveUseTreeCst(
                     file_id,
                     dest_module_scope,
                     prefix_scope,
+                    next_parent_tok,
                     def_id,
                     is_pub,
                     sub_id,
@@ -3794,7 +4429,7 @@ fn resolveUseTreeCst(
 
     if (has_nested_trees or seg_count == 0) return;
 
-    // [1] Glob import (`use prefix::*;`):
+    // [1] Glob import (`use prefix.*;`):
     if (is_glob) {
         const target_scope = try resolveModulePathSegments(
             sym_table,
@@ -3842,7 +4477,71 @@ fn resolveUseTreeCst(
         return;
     }
 
-    // [2] Single path import (`use prefix::Item [as Alias];`):
+    // [2] Group `self` import (`use cx.fs.{self, File};` or `use cx.fs.{self as fs_alias};`):
+    const final_tok = segments[seg_count - 1];
+    const final_lexeme = extractTokenSlice(source, token_buffer, final_tok);
+    if (final_lexeme.len == 0) return;
+
+    if (seg_count == 1 and std.mem.eql(u8, final_lexeme, "self") and current_lookup_scope != dest_module_scope) {
+        const bind_name_tok = if (!alias_tok.isNone()) alias_tok else parent_mod_tok;
+        if (bind_name_tok.isNone()) return;
+        const bind_lexeme = extractTokenSlice(source, token_buffer, bind_name_tok);
+        if (bind_lexeme.len == 0 or std.mem.eql(u8, bind_lexeme, "_")) return;
+        const bind_sym_id = try interner.intern(bind_lexeme);
+        const decl_tok = if (!alias_tok.isNone()) alias_tok else final_tok;
+        _ = try sym_table.defineSymbol(.{
+            .name = bind_sym_id,
+            .name_text = interner.get(bind_sym_id),
+            .kind = .module_sym,
+            .namespace = .value_ns,
+            .visibility = if (is_pub) .public else .private,
+            .flags = .{ .is_pub = is_pub, .is_used = true, .is_imported = true },
+            .scope_id = dest_module_scope,
+            .def_id = def_id,
+            .decl_span = token_buffer.getTokenSpan(file_id, decl_tok),
+            .target_scope = current_lookup_scope,
+        }, diagnostic_sink);
+        return;
+    }
+
+    // [3] Single-segment root namespace import (`use cx;`, `use core;` -> `E0218`):
+    const final_span = token_buffer.getTokenSpan(file_id, final_tok);
+    if (seg_count == 1 and current_lookup_scope == dest_module_scope and
+        (std.mem.eql(u8, final_lexeme, "cx") or
+            std.mem.eql(u8, final_lexeme, "core")))
+    {
+        const root_mod_scope = try sym_table.resolveRootNamespaceScope(
+            interner,
+            dest_module_scope,
+            final_lexeme,
+            final_span,
+            diagnostic_sink,
+        );
+        if (!root_mod_scope.isNone()) {
+            const bind_tok = if (!alias_tok.isNone()) alias_tok else final_tok;
+            const bind_lexeme = extractTokenSlice(source, token_buffer, bind_tok);
+            if (bind_lexeme.len == 0 or std.mem.eql(u8, bind_lexeme, "_")) return;
+            const bind_sym_id = try interner.intern(bind_lexeme);
+            _ = try sym_table.defineSymbol(.{
+                .name = bind_sym_id,
+                .name_text = interner.get(bind_sym_id),
+                .kind = .module_sym,
+                .namespace = .value_ns,
+                .visibility = if (is_pub) .public else .private,
+                .flags = .{ .is_pub = is_pub, .is_used = true, .is_imported = true },
+                .scope_id = dest_module_scope,
+                .def_id = def_id,
+                .decl_span = token_buffer.getTokenSpan(file_id, bind_tok),
+                .target_scope = root_mod_scope,
+            }, diagnostic_sink);
+            return;
+        }
+        if (std.mem.eql(u8, final_lexeme, "core") and !sym_table.is_internal_core) {
+            return;
+        }
+    }
+
+    // [4] Single path import (`use prefix.Item [as Alias];`):
     const prefix_scope = if (seg_count > 1)
         try resolveModulePathSegments(
             sym_table,
@@ -3860,11 +4559,7 @@ fn resolveUseTreeCst(
 
     if (prefix_scope.isNone()) return;
 
-    const final_tok = segments[seg_count - 1];
-    const final_lexeme = extractTokenSlice(source, token_buffer, final_tok);
-    if (final_lexeme.len == 0) return;
     const final_sym_id = try interner.intern(final_lexeme);
-    const final_span = token_buffer.getTokenSpan(file_id, final_tok);
 
     const lookup_res = if (seg_count == 1 and prefix_scope == dest_module_scope)
         sym_table.lookupLexical(prefix_scope, final_sym_id, NamespaceMask.ALL)
@@ -3906,25 +4601,38 @@ fn resolveUseTreeCst(
             }
         },
         .not_found => {
-            // Check if `final_sym_id` is a registered cross-file module:
-            if (sym_table.named_module_scopes.get(final_sym_id.asInt())) |ext_mod_scope| {
-                const bind_tok = if (!alias_tok.isNone()) alias_tok else final_tok;
-                const bind_lexeme = extractTokenSlice(source, token_buffer, bind_tok);
-                if (bind_lexeme.len == 0 or std.mem.eql(u8, bind_lexeme, "_")) return;
-                const bind_sym_id = try interner.intern(bind_lexeme);
-                _ = try sym_table.defineSymbol(.{
-                    .name = bind_sym_id,
-                    .name_text = interner.get(bind_sym_id),
-                    .kind = .module_sym,
-                    .namespace = .value_ns,
-                    .visibility = if (is_pub) .public else .private,
-                    .flags = .{ .is_pub = is_pub, .is_used = true, .is_imported = true },
-                    .scope_id = dest_module_scope,
-                    .def_id = def_id,
-                    .decl_span = token_buffer.getTokenSpan(file_id, bind_tok),
-                    .target_scope = ext_mod_scope,
-                }, diagnostic_sink);
+            if (prefix_scope == dest_module_scope and
+                std.mem.eql(u8, final_lexeme, "core") and
+                !sym_table.is_internal_core)
+            {
+                if (diagnostic_sink) |sink| {
+                    try emitDirectCoreImportDiagnostic(sink, interner, final_span);
+                }
                 return;
+            }
+            // Check if `final_sym_id` is a registered root cross-file module strictly at segment 0:
+            if (seg_count == 1 and prefix_scope == dest_module_scope and
+                (!std.mem.eql(u8, final_lexeme, "core") or sym_table.is_internal_core))
+            {
+                if (sym_table.named_module_scopes.get(final_sym_id.asInt())) |ext_mod_scope| {
+                    const bind_tok = if (!alias_tok.isNone()) alias_tok else final_tok;
+                    const bind_lexeme = extractTokenSlice(source, token_buffer, bind_tok);
+                    if (bind_lexeme.len == 0 or std.mem.eql(u8, bind_lexeme, "_")) return;
+                    const bind_sym_id = try interner.intern(bind_lexeme);
+                    _ = try sym_table.defineSymbol(.{
+                        .name = bind_sym_id,
+                        .name_text = interner.get(bind_sym_id),
+                        .kind = .module_sym,
+                        .namespace = .value_ns,
+                        .visibility = if (is_pub) .public else .private,
+                        .flags = .{ .is_pub = is_pub, .is_used = true, .is_imported = true },
+                        .scope_id = dest_module_scope,
+                        .def_id = def_id,
+                        .decl_span = token_buffer.getTokenSpan(file_id, bind_tok),
+                        .target_scope = ext_mod_scope,
+                    }, diagnostic_sink);
+                    return;
+                }
             }
             if (diagnostic_sink) |sink| {
                 const suggestion = if (seg_count == 1 and prefix_scope == dest_module_scope)
@@ -3943,7 +4651,7 @@ fn resolveUseTreeCst(
     }
 }
 
-/// Resolves a sequence of `module::submodule` path tokens to their target `ScopeId`.
+/// Resolves a sequence of `module.submodule` path tokens to their target `ScopeId`.
 pub fn resolveModulePathSegments(
     sym_table: *SymbolTable,
     interner: *StringInterner,
@@ -3963,8 +4671,24 @@ pub fn resolveModulePathSegments(
 
         const seg_sym_id = try interner.intern(seg_lexeme);
         const seg_span = token_buffer.getTokenSpan(file_id, seg_tok);
-        if (i == 0 and std.mem.eql(u8, seg_lexeme, "std")) {
-            _ = try sym_table.ensureStdMetaScope(interner);
+        if (i == 0 and cur_scope == caller_scope and
+            (std.mem.eql(u8, seg_lexeme, "cx") or
+                std.mem.eql(u8, seg_lexeme, "core")))
+        {
+            const root_ns_scope = try sym_table.resolveRootNamespaceScope(
+                interner,
+                caller_scope,
+                seg_lexeme,
+                seg_span,
+                diagnostic_sink,
+            );
+            if (!root_ns_scope.isNone()) {
+                cur_scope = root_ns_scope;
+                continue;
+            }
+            if (std.mem.eql(u8, seg_lexeme, "core") and !sym_table.is_internal_core) {
+                return .none;
+            }
         }
         const lookup_res = if (i == 0 and cur_scope == caller_scope)
             sym_table.lookupLexical(cur_scope, seg_sym_id, NamespaceMask.TYPE_OR_VALUE)
@@ -3979,9 +4703,11 @@ pub fn resolveModulePathSegments(
                     cur_scope = sym.target_scope;
                     continue;
                 }
-                if (sym_table.named_module_scopes.get(seg_sym_id.asInt())) |ext_scope| {
-                    cur_scope = ext_scope;
-                    continue;
+                if (i == 0 and cur_scope == caller_scope and sym.kind == .module_sym) {
+                    if (sym_table.named_module_scopes.get(seg_sym_id.asInt())) |ext_scope| {
+                        cur_scope = ext_scope;
+                        continue;
+                    }
                 }
                 return .none;
             },
@@ -3992,15 +4718,25 @@ pub fn resolveModulePathSegments(
                 return .none;
             },
             .not_found => {
-                if (sym_table.named_module_scopes.get(seg_sym_id.asInt())) |ext_scope| {
-                    cur_scope = ext_scope;
-                    continue;
-                }
-                // Built-in virtual root prefixes (`std`, `core`, `pkg`) resolve to `caller_scope` when not shadowed:
-                if (i == 0 and (std.mem.eql(u8, seg_lexeme, "std") or
-                    std.mem.eql(u8, seg_lexeme, "core") or
-                    std.mem.eql(u8, seg_lexeme, "pkg")))
+                if (cur_scope == caller_scope and
+                    std.mem.eql(u8, seg_lexeme, "core") and
+                    !sym_table.is_internal_core)
                 {
+                    if (diagnostic_sink) |sink| {
+                        try emitDirectCoreImportDiagnostic(sink, interner, seg_span);
+                    }
+                    return .none;
+                }
+                if (i == 0 and cur_scope == caller_scope and
+                    (!std.mem.eql(u8, seg_lexeme, "core") or sym_table.is_internal_core))
+                {
+                    if (sym_table.named_module_scopes.get(seg_sym_id.asInt())) |ext_scope| {
+                        cur_scope = ext_scope;
+                        continue;
+                    }
+                }
+                // Built-in virtual `pkg` root prefix resolves to `caller_scope` when not shadowed:
+                if (i == 0 and std.mem.eql(u8, seg_lexeme, "pkg")) {
                     continue;
                 }
                 if (diagnostic_sink) |sink| {

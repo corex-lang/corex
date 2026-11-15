@@ -81,10 +81,19 @@ const LEXICAL_SEED_FRAGMENTS = [_][]const u8{
     "'ab'",
     "#soa ",
     "#bad ",
-    "+% -% *% +| -| *| |> -> => :: <<= >>= ",
+    "orelse ",
+    "with ",
+    "context ",
+    "unreachable ",
+    ":= ",
+    "$ ",
+    "[..$-1] ",
+    "tup.0.1.2 ",
+    "0..0.5 ",
+    "+% -% *% +| -| *| |> -> => :: := $ <<= >>= ",
     "\xEF\xBB\xBF",
     "\r\x0B\x0C",
-    "\xFF\xFE\xC3\x28$",
+    "\xFF\xFE\xC3\x28$`",
 };
 
 // -------------------------------------- INTERNALS --------------------------------------
@@ -154,7 +163,7 @@ fn runFastFuzzWorkerShard(
 ) void {
     var ring_buf: [256]u8 = undefined;
     const seed_pattern =
-        "fn calc(x: i32) { let s = \"a{x}\\n\"; /* c */ 0x1F +% 1..10 'é' r#\"q\"# #soa }\r\n\xFF";
+        "fn calc(x: i32) { let s = \"a{x}\\n\"; /* c */ 0x1F +% 1..10 := $ 'é' r#\"q\"# #soa }\r\n\xFF";
     for (&ring_buf, 0..) |*byte_ptr, i| {
         byte_ptr.* = seed_pattern[(i + @as(usize, @intCast(initial_seed & 0x3F))) % seed_pattern.len];
     }

@@ -1,6 +1,6 @@
 //! Lossless Concrete Syntax Tree, Token Buffer & Abstract Syntax Tree Arenas
 //!
-//! Defines the 112-variant CoreX `TokenKind` taxonomy, 12-byte SoA `TokenRecord` and 8-byte `TriviaPiece`
+//! Defines the 117-variant CoreX `TokenKind` taxonomy, 12-byte SoA `TokenRecord` and 8-byte `TriviaPiece`
 //! tables (`TokenBuffer`), 10-byte SoA `CstNodeRecord` arena with bounded non-recursive `ParseState` stack
 //! (`LosslessCstArena`), and 13-byte SoA `AstNode` store with `extra_data` trail (`AstArena` / `AstStore`).
 //!
@@ -25,7 +25,7 @@ const Span = mem.Span;
 
 // -------------------- Token & Trivia Types --------------------
 
-/// Authoritative 112-variant lexical token kind table (`0..111`, `DR-03` Section 5.2 & `DR-12` Section 1.4).
+/// Authoritative 117-variant lexical token kind table (`0..116`, `DR-03` §5.2, `DR-12` §1.4, `DR-21` §3.1).
 pub const TokenKind = enum(u8) {
     /// Keyword `pub` (`0`).
     kw_pub = 0,
@@ -103,154 +103,164 @@ pub const TokenKind = enum(u8) {
     kw_continue = 36,
     /// Keyword `catch` (`37`).
     kw_catch = 37,
-    /// Boolean literal keyword `true` (`38`).
-    kw_true = 38,
-    /// Boolean literal keyword `false` (`39`).
-    kw_false = 39,
-    /// Logical operator keyword `and` (`40`).
-    kw_and = 40,
-    /// Logical operator keyword `or` (`41`).
-    kw_or = 41,
-    /// Logical operator keyword `not` (`42`).
-    kw_not = 42,
-    /// Value receiver keyword `self` (`43`).
-    kw_self_val = 43,
-    /// Type receiver keyword `Self` (`44`).
-    kw_self_type = 44,
-    /// Built-in primitive type keyword (`i8`..`f64`, `bool`, `char`, `str`, `never`, `unit`) (`45`).
-    prim_type = 45,
-    /// Lowercase `snake_case` value/function/module identifier (`46`).
-    ident = 46,
-    /// `PascalCase` type, trait, or enum variant identifier (`47`).
-    type_ident = 47,
-    /// `SCREAMING_SNAKE_CASE` compile-time constant identifier (`48`).
-    const_ident = 48,
-    /// Integer literal token (`49`).
-    int_lit = 49,
-    /// Floating-point literal token (`50`).
-    float_lit = 50,
-    /// UTF-8 string literal token (`51`).
-    string_lit = 51,
-    /// Unicode scalar character literal token (`52`).
-    char_lit = 52,
-    /// Left curly brace `{` (`53`).
-    lbrace = 53,
-    /// Right curly brace `}` (`54`).
-    rbrace = 54,
-    /// Left parenthesis `(` (`55`).
-    lparen = 55,
-    /// Right parenthesis `)` (`56`).
-    rparen = 56,
-    /// Left square bracket `[` (`57`).
-    lbracket = 57,
-    /// Right square bracket `]` (`58`).
-    rbracket = 58,
-    /// Semicolon `;` (`59`).
-    semi = 59,
-    /// Comma `,` (`60`).
-    comma = 60,
-    /// Colon `:` (`61`).
-    colon = 61,
-    /// Path separator `::` (`62`).
-    coloncolon = 62,
-    /// Member access period `.` (`63`).
-    dot = 63,
-    /// Exclusive range operator `..` (`64`).
-    dotdot = 64,
-    /// Inclusive range operator `..=` (`65`).
-    dotdoteq = 65,
-    /// Thin return arrow `->` (`66`).
-    arrow = 66,
-    /// Match arm fat arrow `=>` (`67`).
-    fat_arrow = 67,
-    /// Pipeline operator `|>` (`68`).
-    pipe_gt = 68,
-    /// Attribute introducer `@` (`69`).
-    at = 69,
-    /// Structure-of-Arrays directive `#soa` (`70`).
-    hash_soa = 70,
-    /// Error propagation / optional suffix `?` (`71`).
-    question = 71,
-    /// Wildcard underscore `_` (`72`).
-    underscore = 72,
-    /// Addition operator `+` (`73`).
-    plus = 73,
-    /// Subtraction / negation operator `-` (`74`).
-    minus = 74,
-    /// Multiplication / dereference operator `*` (`75`).
-    star = 75,
-    /// Division operator `/` (`76`).
-    slash = 76,
-    /// Remainder operator `%` (`77`).
-    percent = 77,
-    /// Wrapping addition operator `+%` (`78`).
-    plus_percent = 78,
-    /// Wrapping subtraction operator `-%` (`79`).
-    minus_percent = 79,
-    /// Wrapping multiplication operator `*%` (`80`).
-    star_percent = 80,
-    /// Saturating addition operator `+|` (`81`).
-    plus_pipe = 81,
-    /// Saturating subtraction operator `-|` (`82`).
-    minus_pipe = 82,
-    /// Saturating multiplication operator `*| (`83`).
-    star_pipe = 83,
-    /// Equality comparison operator `==` (`84`).
-    eqeq = 84,
-    /// Inequality comparison operator `!=` (`85`).
-    bang_eq = 85,
-    /// Less-than operator `<` (`86`).
-    lt = 86,
-    /// Less-than-or-equal operator `<=` (`87`).
-    le = 87,
-    /// Greater-than operator `>` (`88`).
-    gt = 88,
-    /// Greater-than-or-equal operator `>=` (`89`).
-    ge = 89,
-    /// Bitwise AND / borrow operator `&` (`90`).
-    amp = 90,
-    /// Logical short-circuit AND operator `&&` (`91`).
-    ampamp = 91,
-    /// Bitwise OR / closure delimiter `|` (`92`).
-    pipe = 92,
-    /// Logical short-circuit OR operator `||` (`93`).
-    pipepipe = 93,
-    /// Bitwise XOR operator `^` (`94`).
-    caret = 94,
-    /// Logical NOT / error union operator `!` (`95`).
-    bang = 95,
-    /// Bitwise NOT operator `~` (`96`).
-    tilde = 96,
-    /// Bitwise shift-left operator `<<` (`97`).
-    shl = 97,
-    /// Bitwise shift-right operator `>>` (`98`).
-    shr = 98,
-    /// Assignment operator `=` (`99`).
-    eq = 99,
-    /// Addition-assignment operator `+=` (`100`).
-    plus_eq = 100,
-    /// Subtraction-assignment operator `-=` (`101`).
-    minus_eq = 101,
-    /// Multiplication-assignment operator `*=` (`102`).
-    star_eq = 102,
-    /// Division-assignment operator `/=` (`103`).
-    slash_eq = 103,
-    /// Remainder-assignment operator `%=` (`104`).
-    percent_eq = 104,
-    /// Bitwise AND-assignment operator `&=` (`105`).
-    amp_eq = 105,
-    /// Bitwise OR-assignment operator `|=` (`106`).
-    pipe_eq = 106,
-    /// Bitwise XOR-assignment operator `^=` (`107`).
-    caret_eq = 107,
-    /// Shift-left-assignment operator `<<=` (`108`).
-    shl_eq = 108,
-    /// Shift-right-assignment operator `>>=` (`109`).
-    shr_eq = 109,
-    /// Lexer error recovery token (`110`).
-    invalid_token = 110,
-    /// End-of-file sentinel token (`111`).
-    eof = 111,
+    /// Keyword `orelse` (`38`).
+    kw_orelse = 38,
+    /// Keyword `with` (`39`).
+    kw_with = 39,
+    /// Keyword `context` (`40`).
+    kw_context = 40,
+    /// Keyword `unreachable` (`41`).
+    kw_unreachable = 41,
+    /// Boolean literal keyword `true` (`42`).
+    kw_true = 42,
+    /// Boolean literal keyword `false` (`43`).
+    kw_false = 43,
+    /// Logical operator keyword `and` (`44`).
+    kw_and = 44,
+    /// Logical operator keyword `or` (`45`).
+    kw_or = 45,
+    /// Logical operator keyword `not` (`46`).
+    kw_not = 46,
+    /// Value receiver keyword `self` (`47`).
+    kw_self_val = 47,
+    /// Type receiver keyword `Self` (`48`).
+    kw_self_type = 48,
+    /// Built-in primitive type keyword (`i8`..`f64`, `bool`, `char`, `str`, `never`, `unit`) (`49`).
+    prim_type = 49,
+    /// Lowercase `snake_case` value/function/module identifier (`50`).
+    ident = 50,
+    /// `PascalCase` type, trait, or enum variant identifier (`51`).
+    type_ident = 51,
+    /// `SCREAMING_SNAKE_CASE` compile-time constant identifier (`52`).
+    const_ident = 52,
+    /// Integer literal token (`53`).
+    int_lit = 53,
+    /// Floating-point literal token (`54`).
+    float_lit = 54,
+    /// UTF-8 string literal token (`55`).
+    string_lit = 55,
+    /// Unicode scalar character literal token (`56`).
+    char_lit = 56,
+    /// Left curly brace `{` (`57`).
+    lbrace = 57,
+    /// Right curly brace `}` (`58`).
+    rbrace = 58,
+    /// Left parenthesis `(` (`59`).
+    lparen = 59,
+    /// Right parenthesis `)` (`60`).
+    rparen = 60,
+    /// Left square bracket `[` (`61`).
+    lbracket = 61,
+    /// Right square bracket `]` (`62`).
+    rbracket = 62,
+    /// Semicolon `;` (`63`).
+    semi = 63,
+    /// Comma `,` (`64`).
+    comma = 64,
+    /// Colon `:` (`65`).
+    colon = 65,
+    /// Condition binding operator `:=` (`66`).
+    colon_eq = 66,
+    /// Unified path, member, and contextual variant period `.` (`67`).
+    dot = 67,
+    /// Exclusive range operator `..` (`68`).
+    dotdot = 68,
+    /// Inclusive range operator `..=` (`69`).
+    dotdoteq = 69,
+    /// Thin return arrow `->` (`70`).
+    arrow = 70,
+    /// Match arm fat arrow `=>` (`71`).
+    fat_arrow = 71,
+    /// Pipeline operator `|>` (`72`).
+    pipe_gt = 72,
+    /// Attribute or pattern-binding introducer `@` (`73`).
+    at = 73,
+    /// Structure-of-Arrays directive `#soa` (`74`).
+    hash_soa = 74,
+    /// Slice/array length sentinel `$` (`75`).
+    dollar = 75,
+    /// Error propagation / optional suffix `?` (`76`).
+    question = 76,
+    /// Wildcard underscore `_` (`77`).
+    underscore = 77,
+    /// Addition operator `+` (`78`).
+    plus = 78,
+    /// Subtraction / negation operator `-` (`79`).
+    minus = 79,
+    /// Multiplication / dereference operator `*` (`80`).
+    star = 80,
+    /// Division operator `/` (`81`).
+    slash = 81,
+    /// Remainder operator `%` (`82`).
+    percent = 82,
+    /// Wrapping addition operator `+%` (`83`).
+    plus_percent = 83,
+    /// Wrapping subtraction operator `-%` (`84`).
+    minus_percent = 84,
+    /// Wrapping multiplication operator `*%` (`85`).
+    star_percent = 85,
+    /// Saturating addition operator `+|` (`86`).
+    plus_pipe = 86,
+    /// Saturating subtraction operator `-|` (`87`).
+    minus_pipe = 87,
+    /// Saturating multiplication operator `*|` (`88`).
+    star_pipe = 88,
+    /// Equality comparison operator `==` (`89`).
+    eqeq = 89,
+    /// Inequality comparison operator `!=` (`90`).
+    bang_eq = 90,
+    /// Less-than operator `<` (`91`).
+    lt = 91,
+    /// Less-than-or-equal operator `<=` (`92`).
+    le = 92,
+    /// Greater-than operator `>` (`93`).
+    gt = 93,
+    /// Greater-than-or-equal operator `>=` (`94`).
+    ge = 94,
+    /// Bitwise AND / borrow operator `&` (`95`).
+    amp = 95,
+    /// Logical short-circuit AND operator `&&` (`96`).
+    ampamp = 96,
+    /// Bitwise OR / closure delimiter `|` (`97`).
+    pipe = 97,
+    /// Logical short-circuit OR operator `||` (`98`).
+    pipepipe = 98,
+    /// Bitwise XOR operator `^` (`99`).
+    caret = 99,
+    /// Logical NOT / error union operator `!` (`100`).
+    bang = 100,
+    /// Bitwise NOT operator `~` (`101`).
+    tilde = 101,
+    /// Bitwise shift-left operator `<<` (`102`).
+    shl = 102,
+    /// Bitwise shift-right operator `>>` (`103`).
+    shr = 103,
+    /// Assignment operator `=` (`104`).
+    eq = 104,
+    /// Addition-assignment operator `+=` (`105`).
+    plus_eq = 105,
+    /// Subtraction-assignment operator `-=` (`106`).
+    minus_eq = 106,
+    /// Multiplication-assignment operator `*=` (`107`).
+    star_eq = 107,
+    /// Division-assignment operator `/=` (`108`).
+    slash_eq = 108,
+    /// Remainder-assignment operator `%=` (`109`).
+    percent_eq = 109,
+    /// Bitwise AND-assignment operator `&=` (`110`).
+    amp_eq = 110,
+    /// Bitwise OR-assignment operator `|=` (`111`).
+    pipe_eq = 111,
+    /// Bitwise XOR-assignment operator `^=` (`112`).
+    caret_eq = 112,
+    /// Shift-left-assignment operator `<<=` (`113`).
+    shl_eq = 113,
+    /// Shift-right-assignment operator `>>=` (`114`).
+    shr_eq = 114,
+    /// Lexer error recovery token (`115`).
+    invalid_token = 115,
+    /// End-of-file sentinel token (`116`).
+    eof = 116,
 
     /// Alias for `.lbrace`.
     pub const l_brace: TokenKind = .lbrace;
@@ -264,8 +274,6 @@ pub const TokenKind = enum(u8) {
     pub const l_bracket: TokenKind = .lbracket;
     /// Alias for `.rbracket`.
     pub const r_bracket: TokenKind = .rbracket;
-    /// Alias for `.coloncolon`.
-    pub const colon_colon: TokenKind = .coloncolon;
     /// Alias for `.dotdot`.
     pub const dot_dot: TokenKind = .dotdot;
     /// Alias for `.dotdoteq`.
@@ -282,6 +290,140 @@ pub const TokenKind = enum(u8) {
     pub const pipe_pipe: TokenKind = .pipepipe;
     /// Alias for `.invalid_token`.
     pub const invalid: TokenKind = .invalid_token;
+
+    /// Returns `true` if `self` is one of the 49 reserved CoreX language keywords (`0..48`).
+    pub inline fn isKeyword(self: TokenKind) bool {
+        return @backingInt(self) <= 48;
+    }
+
+    /// Returns `true` if `self` is a lexical identifier token (`.ident`, `.type_ident`, or `.const_ident`).
+    pub inline fn isIdentifier(self: TokenKind) bool {
+        return self == .ident or self == .type_ident or self == .const_ident;
+    }
+
+    /// Returns the fixed canonical spelling for keywords and punctuation/operator tokens, or `null` for dynamic tokens.
+    pub inline fn asSymbolText(self: TokenKind) ?[]const u8 {
+        return switch (self) {
+            .kw_pub => "pub",
+            .kw_mod => "mod",
+            .kw_use => "use",
+            .kw_as => "as",
+            .kw_fn => "fn",
+            .kw_struct => "struct",
+            .kw_enum => "enum",
+            .kw_union => "union",
+            .kw_trait => "trait",
+            .kw_impl => "impl",
+            .kw_type => "type",
+            .kw_const => "const",
+            .kw_let => "let",
+            .kw_var => "var",
+            .kw_bit_field => "bit_field",
+            .kw_comptime => "comptime",
+            .kw_mut => "mut",
+            .kw_own => "own",
+            .kw_ref => "ref",
+            .kw_where => "where",
+            .kw_extern => "extern",
+            .kw_async => "async",
+            .kw_await => "await",
+            .kw_unsafe => "unsafe",
+            .kw_defer => "defer",
+            .kw_errdefer => "errdefer",
+            .kw_is => "is",
+            .kw_if => "if",
+            .kw_else => "else",
+            .kw_match => "match",
+            .kw_for => "for",
+            .kw_in => "in",
+            .kw_while => "while",
+            .kw_loop => "loop",
+            .kw_return => "return",
+            .kw_break => "break",
+            .kw_continue => "continue",
+            .kw_catch => "catch",
+            .kw_orelse => "orelse",
+            .kw_with => "with",
+            .kw_context => "context",
+            .kw_unreachable => "unreachable",
+            .kw_true => "true",
+            .kw_false => "false",
+            .kw_and => "and",
+            .kw_or => "or",
+            .kw_not => "not",
+            .kw_self_val => "self",
+            .kw_self_type => "Self",
+            .lbrace => "{",
+            .rbrace => "}",
+            .lparen => "(",
+            .rparen => ")",
+            .lbracket => "[",
+            .rbracket => "]",
+            .semi => ";",
+            .comma => ",",
+            .colon => ":",
+            .colon_eq => ":=",
+            .dot => ".",
+            .dotdot => "..",
+            .dotdoteq => "..=",
+            .arrow => "->",
+            .fat_arrow => "=>",
+            .pipe_gt => "|>",
+            .at => "@",
+            .hash_soa => "#soa",
+            .dollar => "$",
+            .question => "?",
+            .underscore => "_",
+            .plus => "+",
+            .minus => "-",
+            .star => "*",
+            .slash => "/",
+            .percent => "%",
+            .plus_percent => "+%",
+            .minus_percent => "-%",
+            .star_percent => "*%",
+            .plus_pipe => "+|",
+            .minus_pipe => "-|",
+            .star_pipe => "*|",
+            .eqeq => "==",
+            .bang_eq => "!=",
+            .lt => "<",
+            .le => "<=",
+            .gt => ">",
+            .ge => ">=",
+            .amp => "&",
+            .ampamp => "&&",
+            .pipe => "|",
+            .pipepipe => "||",
+            .caret => "^",
+            .bang => "!",
+            .tilde => "~",
+            .shl => "<<",
+            .shr => ">>",
+            .eq => "=",
+            .plus_eq => "+=",
+            .minus_eq => "-=",
+            .star_eq => "*=",
+            .slash_eq => "/=",
+            .percent_eq => "%=",
+            .amp_eq => "&=",
+            .pipe_eq => "|=",
+            .caret_eq => "^=",
+            .shl_eq => "<<=",
+            .shr_eq => ">>=",
+            .prim_type,
+            .ident,
+            .type_ident,
+            .const_ident,
+            .int_lit,
+            .float_lit,
+            .string_lit,
+            .char_lit,
+            .invalid_token,
+            .eof,
+            => null,
+        };
+    }
 };
 
 /// 1-byte bit-packed flags attached to each `TokenRecord` for $O(1)$ trivia and recovery checks.
@@ -441,6 +583,8 @@ pub const CstNodeKind = enum(u8) {
     return_type,
     /// Complete function signature header.
     fn_sig,
+    /// Single-expression function body (`= expr;`).
+    fn_expr_body,
     /// Complete `fn` declaration item.
     fn_item,
     /// Opening bracket of generic type parameters.
@@ -477,6 +621,10 @@ pub const CstNodeKind = enum(u8) {
     fn_type,
     /// Optional type `?T`.
     optional_type,
+    /// Refined type (`Type where Pred` / `Type is Range`).
+    refined_type,
+    /// Closure type (`|T| -> U`).
+    closure_type,
     /// Opening brace `{` of a statement block.
     block_start,
     /// Complete `{ … }` block expression or body.
@@ -501,6 +649,8 @@ pub const CstNodeKind = enum(u8) {
     break_stmt,
     /// Complete `continue` statement.
     continue_stmt,
+    /// Loop label definition (`label:`) or jump target (`:label`).
+    loop_label,
     /// Introducer of a `for` loop.
     for_introducer,
     /// Header range/iterator clause of a `for` loop.
@@ -547,6 +697,10 @@ pub const CstNodeKind = enum(u8) {
     struct_pat,
     /// Disjunctive `|` pattern.
     or_pat,
+    /// Subpattern binding (`ident @ subpat`).
+    at_pat,
+    /// Array or slice destructuring pattern (`[a, ..rest, b]`).
+    slice_pat,
     /// Scalar literal expression (`int`, `float`, `string`, `char`, `bool`).
     literal_expr,
     /// Receiver `self` value expression.
@@ -571,6 +725,8 @@ pub const CstNodeKind = enum(u8) {
     if_introducer,
     /// Condition expression of an `if` branch.
     if_cond,
+    /// Parenthesized condition binding (`(x := expr)` / `(var x: T := expr)`).
+    walrus_cond_expr,
     /// Complete `if` expression.
     if_expr,
     /// `else` or `else if` branch of an `if` expression.
@@ -609,8 +765,14 @@ pub const CstNodeKind = enum(u8) {
     struct_lit_expr,
     /// View block expression.
     view_block_expr,
+    /// Lexical context override expression (`with context.<slot> = expr { … }`).
+    with_expr,
+    /// Single `context.<slot> = expr` binding clause inside `with`.
+    context_binding,
     /// Explicit type cast expression (`expr as Type`).
     cast_expr,
+    /// Expression-position diverging construct (`return`, `break`, `continue`, `for`, `while`).
+    diverging_expr,
     /// Generic leaf token node in the lossless CST.
     token_leaf,
     /// Temporary pre-order placeholder node reserved while parsing a bracketed construct.
@@ -849,7 +1011,7 @@ pub const AstTag = enum(u8) {
     self_val,
     /// Unqualified identifier expression.
     ident_expr,
-    /// Multi-segment path expression (`a::b::c`).
+    /// Multi-segment path expression (`a.b.c`).
     path_expr,
     /// Contextual enum variant literal (`.Variant`).
     contextual_variant,
@@ -887,6 +1049,22 @@ pub const AstTag = enum(u8) {
     if_expr,
     /// Pattern-matching `match` expression.
     match_expr,
+    /// Parenthesized condition binding (`main_token = colon_eq`, `lhs = ident_tok`, `rhs = extra[is_var, ty, init]`).
+    walrus_expr,
+    /// Pattern test `is` / `is not` (`main_token = kw_is` or `kw_not`, `lhs = scrutinee`, `rhs = pat_node`).
+    is_expr,
+    /// Range expression `..` / `..=` (`main_token = dotdot` or `dotdoteq`, `lhs = start_or_none`, `rhs = end_or_none`).
+    range_expr,
+    /// Bracket length sentinel `$` (`main_token = dollar`, `lhs = .NONE`, `rhs = .NONE`).
+    dollar_expr,
+    /// Implicit lexical `context` value expression (`main_token = kw_context`, `lhs = .NONE`, `rhs = .NONE`).
+    context_expr,
+    /// Diverging `unreachable` expression (`main_token = kw_unreachable`, `lhs = .NONE`, `rhs = .NONE`).
+    unreachable_expr,
+    /// Lexical `with` block (`main_token = kw_with`, `lhs = extra[count, slot_tok, val, …]`, `rhs = body_block`).
+    with_expr,
+    /// Named call argument `label: expr` (`main_token = label_ident_tok`, `lhs = val_expr`, `rhs = .NONE`).
+    named_arg,
     /// Wildcard `_` pattern.
     wildcard_pat,
     /// Variable binding pattern.
@@ -901,6 +1079,10 @@ pub const AstTag = enum(u8) {
     tuple_pat,
     /// Disjunctive `|` pattern.
     or_pat,
+    /// Subpattern binding `ident @ subpat` (`main_token = ident_tok`, `lhs = flags_or_none`, `rhs = subpat_node`).
+    at_pat,
+    /// Slice or array pattern `[…]` (`main_token = lbracket_tok`, `lhs = extra_start`, `rhs = extra_count`).
+    slice_pat,
     /// Fault-tolerant top-level item hole membrane (`PLAN.md` Section 2.4 & `DR-12` Section 2.3).
     item_hole,
     /// Fault-tolerant statement hole membrane.
@@ -964,6 +1146,8 @@ pub const MAX_PARSE_DEPTH: usize = 512;
 pub const MAX_CST_NODES: usize = 8 * 1024 * 1024;
 /// Maximum number of AST nodes allowed in a single `AstArena` (`8,388,608`).
 pub const MAX_AST_NODES: usize = 8 * 1024 * 1024;
+/// `TriviaPiece.flags` bit marking a slot that coalesced multiple adjacent trivia pieces (`> 15` slots).
+pub const TRIVIA_FLAG_COALESCED: u8 = 0x01;
 
 // -------------------------------------- INTERNALS --------------------------------------
 
@@ -989,6 +1173,7 @@ fn appendTriviaSliceCoalesced(
             if (slot14_room > 0) {
                 const added: u16 = @intCast(@min(remaining, slot14_room));
                 slots[max_slots - 1].byte_len += added;
+                slots[max_slots - 1].flags |= TRIVIA_FLAG_COALESCED;
                 remaining -= added;
                 continue;
             }
@@ -1000,8 +1185,10 @@ fn appendTriviaSliceCoalesced(
                 if (room_in_curr == 0 or slots[i + 1].byte_len == 0) continue;
                 const shift_bytes: u16 = @intCast(@min(room_in_curr, @as(usize, slots[i + 1].byte_len)));
                 slots[i].byte_len += shift_bytes;
+                slots[i].flags |= TRIVIA_FLAG_COALESCED;
                 slots[i + 1].byte_offset += shift_bytes;
                 slots[i + 1].byte_len -= shift_bytes;
+                slots[i + 1].flags |= TRIVIA_FLAG_COALESCED;
                 has_transferred = true;
             }
             if (!has_transferred) break;
@@ -1013,7 +1200,14 @@ fn appendTriviaSliceCoalesced(
 }
 
 comptime {
-    std.debug.assert(@typeInfo(TokenKind).@"enum".field_names.len == 112);
+    std.debug.assert(@typeInfo(TokenKind).@"enum".field_names.len == 117);
+    std.debug.assert(@backingInt(TokenKind.kw_self_type) == 48);
+    std.debug.assert(@backingInt(TokenKind.prim_type) == 49);
+    std.debug.assert(@backingInt(TokenKind.colon_eq) == 66);
+    std.debug.assert(@backingInt(TokenKind.dollar) == 75);
+    std.debug.assert(@backingInt(TokenKind.eof) == 116);
+    std.debug.assert(@typeInfo(CstNodeKind).@"enum".field_names.len == 134);
+    std.debug.assert(@typeInfo(AstTag).@"enum".field_names.len == 82);
     std.debug.assert(@sizeOf(TokenKind) == 1);
     std.debug.assert(@sizeOf(TokenFlags) == 1);
     std.debug.assert(@sizeOf(PackedTriviaSpan) == 4);
@@ -1659,4 +1853,27 @@ test "test_append_token_coalesces_overflow_trivia_into_slot_14" {
     );
     defer std.testing.allocator.free(reconstructed_large);
     try std.testing.expectEqualSlices(u8, large_buf, reconstructed_large);
+}
+
+test "test_dr21_token_kind_helpers_and_symbol_text_exhaustiveness" {
+    try std.testing.expect(TokenKind.kw_pub.isKeyword());
+    try std.testing.expect(TokenKind.kw_self_type.isKeyword());
+    try std.testing.expect(!TokenKind.prim_type.isKeyword());
+    try std.testing.expect(TokenKind.ident.isIdentifier());
+    try std.testing.expect(TokenKind.type_ident.isIdentifier());
+    try std.testing.expect(TokenKind.const_ident.isIdentifier());
+    try std.testing.expect(!TokenKind.kw_orelse.isIdentifier());
+    try std.testing.expectEqualStrings(":=", TokenKind.colon_eq.asSymbolText().?);
+    try std.testing.expectEqualStrings("$", TokenKind.dollar.asSymbolText().?);
+
+    var raw_idx: u8 = 0;
+    while (raw_idx < 117) : (raw_idx += 1) {
+        const tok_kind: TokenKind = @enumFromInt(raw_idx);
+        const maybe_text = tok_kind.asSymbolText();
+        if (raw_idx <= 48 or (raw_idx >= 57 and raw_idx <= 114)) {
+            try std.testing.expect(maybe_text != null and maybe_text.?.len >= 1);
+        } else {
+            try std.testing.expect(maybe_text == null);
+        }
+    }
 }

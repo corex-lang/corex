@@ -120,9 +120,8 @@ fn expectSastDiagnostic(
 fn hasBodyIntrinsic(body: *const MirBody, target_kind: MirIntrinsicKind) bool {
     for (body.block_insts.items) |inst_val| {
         const inst = body.getInst(inst_val);
-        if (inst.op == .intrinsic_op) {
-            const cur_kind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
-            if (cur_kind == target_kind) return true;
+        if (inst.op == .intrinsic_op and @as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)) == target_kind) {
+            return true;
         }
     }
     return false;
@@ -2458,7 +2457,7 @@ test "test_phase6_audit_regressions_overflow_params_drops_and_cross_file_caps" {
 
     const app_file = FileId.fromInt(438);
     const app_src =
-        \\use std_env::read_env_flag;
+        \\use std_env.read_env_flag;
         \\pub fn app_probe_env() -> i32 {
         \\    return read_env_flag();
         \\}
@@ -2491,3 +2490,891 @@ test "test_phase6_audit_regressions_overflow_params_drops_and_cross_file_caps" {
         ),
     );
 }
+
+test "test_phase75_cond_scope_pre_else_drop_elaboration_and_linear_e0304_se01_se02" {
+    const allocator = std.testing.allocator;
+
+    // [1] `SE-01` & `SE-02` Two-checkpoint pre-`else` drop ordering (`B1` & `B2` drop BEFORE `else` runs!):
+    const pre_else_drop_src =
+        \\pub struct TraceGuard {
+        \\    pub tag_id: i64,
+        \\}
+        \\impl TraceGuard {
+        \\    pub fn drop(&mut self) {
+        \\        @drop_trace(self.tag_id);
+        \\    }
+        \\}
+        \\pub fn make_guard(tag_id: i64) -> TraceGuard {
+        \\    return TraceGuard { tag_id: tag_id };
+        \\}
+        \\pub fn maybe_guard(is_present: bool, tag_id: i64) -> TraceGuard? {
+        \\    if is_present {
+        \\        return .Some(TraceGuard { tag_id: tag_id });
+        \\    }
+        \\    return .None;
+        \\}
+        \\pub fn run_cond_drops(is_present: bool, is_passing_guard: bool) -> i64 {
+        \\    if maybe_guard(is_present, 10) is .Some(bound_g) and
+        \\        (extra_g := make_guard(20)).tag_id > (if is_passing_guard { 0 as i64 } else { 99 as i64 })
+        \\    {
+        \\        @drop_trace(100);
+        \\        return bound_g.tag_id + extra_g.tag_id;
+        \\    } else {
+        \\        @drop_trace(900);
+        \\        return -1;
+        \\    }
+        \\}
+    ;
+    var drop_bundle = try verifyCleanSast(allocator, 501, pre_else_drop_src, .{});
+    defer drop_bundle.deinit();
+
+    var rodata = RodataPool.init(allocator);
+    defer rodata.deinit();
+    var vm = try MirVm.init(
+        allocator,
+        &drop_bundle.interner,
+        &drop_bundle.pool,
+        &drop_bundle.sym_table,
+        &rodata,
+        null,
+        null,
+        .{},
+    );
+    defer vm.deinit();
+    for (drop_bundle.mir_module.bodies.items) |*body_ptr| {
+        _ = try vm.registerBody(body_ptr, body_ptr.symbol_index);
+    }
+    const run_body = drop_bundle.mir_module.findBodyByName(&drop_bundle.interner, "run_cond_drops").?;
+
+    // Checkpoint B2 false (`is_present = true`, `is_passing_guard = false`);
+    // `extra_g` (`20`) and `bound_g` (`10`) drop in reverse-LIFO order before `else` emits `900`:
+    const res_b2_miss = try vm.evalBody(
+        run_body,
+        &[_]RegSlot{ .{ .scalar_u64 = 1 }, .{ .scalar_u64 = 0 } },
+    );
+    try std.testing.expectEqual(@as(i64, -1), res_b2_miss.slot.scalar_i64);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 20, 10, 900 }, vm.asDropTraceSlice());
+
+    // Checkpoint B1 false (`is_present = false`); `.None` drops no payload before `900`:
+    vm.drop_trace.clearRetainingCapacity();
+    const res_b1_miss = try vm.evalBody(
+        run_body,
+        &[_]RegSlot{ .{ .scalar_u64 = 0 }, .{ .scalar_u64 = 1 } },
+    );
+    try std.testing.expectEqual(@as(i64, -1), res_b1_miss.slot.scalar_i64);
+    try std.testing.expectEqualSlices(i64, &[_]i64{900}, vm.asDropTraceSlice());
+
+    // True branch (`is_present = true`, `is_passing_guard = true`); `then` emits `100`, then `20, 10`:
+    vm.drop_trace.clearRetainingCapacity();
+    const res_hit = try vm.evalBody(
+        run_body,
+        &[_]RegSlot{ .{ .scalar_u64 = 1 }, .{ .scalar_u64 = 1 } },
+    );
+    try std.testing.expectEqual(@as(i64, 30), res_hit.slot.scalar_i64);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 100, 20, 10 }, vm.asDropTraceSlice());
+
+    // [2] `SE-01` `@linear` binding inside `ConditionScope` consumed on `then` (B1 miss safe) passes `0` errors:
+    const linear_ok_src =
+        \\@linear
+        \\pub struct LinearToken {
+        \\    pub id_num: i64,
+        \\}
+        \\pub fn release_token(own tok_in: sink LinearToken) -> i64 {
+        \\    let LinearToken { id_num } = tok_in;
+        \\    return id_num;
+        \\}
+        \\pub fn maybe_token(is_ready: bool) -> LinearToken? {
+        \\    if is_ready {
+        \\        return .Some(LinearToken { id_num: 7 });
+        \\    }
+        \\    return .None;
+        \\}
+        \\pub fn consume_if_some(is_ready: bool) -> i64 {
+        \\    if maybe_token(is_ready) is .Some(live_tok) {
+        \\        return release_token(live_tok);
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var linear_ok_bundle = try verifyCleanSast(allocator, 502, linear_ok_src, .{});
+    defer linear_ok_bundle.deinit();
+
+    // Unconsumed `@linear` binding when trailing guard fails at Checkpoint B2 emits `E0304`:
+    const linear_leak_b2_src =
+        \\@linear
+        \\pub struct LinearToken {
+        \\    pub id_num: i64,
+        \\}
+        \\pub fn release_token(own tok_in: sink LinearToken) -> i64 {
+        \\    let LinearToken { id_num } = tok_in;
+        \\    return id_num;
+        \\}
+        \\pub fn maybe_token(is_ready: bool) -> LinearToken? {
+        \\    if is_ready {
+        \\        return .Some(LinearToken { id_num: 7 });
+        \\    }
+        \\    return .None;
+        \\}
+        \\pub fn leak_on_guard_false(is_ready: bool, is_allowed: bool) -> i64 {
+        \\    if maybe_token(is_ready) is .Some(live_tok) and is_allowed {
+        \\        return release_token(live_tok);
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    try expectSastDiagnostic(allocator, 503, linear_leak_b2_src, .{}, .e0304_resource_or_memory_leak);
+}
+
+test "test_phase75_pentagon_dollar_bce_static_e0307_and_unreachable_e0321_se04_se05" {
+    const allocator = std.testing.allocator;
+
+    // [1] `SE-04` & `SE-05` Pentagon `$` backward-offset transfer rule proves `@no_panic` with zero `W0314`:
+    const pentagon_dollar_ok_src =
+        \\@no_panic
+        \\pub fn sum_tail_and_trim(items: &[i64]) -> i64 {
+        \\    if items.len >= 3 {
+        \\        let sub_mid: &[i64] = items[1..$ - 1];
+        \\        let sub_incl: &[i64] = items[0..=1];
+        \\        return items[$ - 1] +% items[$ - 2] +% (sub_mid.len as i64) +% (sub_incl.len as i64);
+        \\    }
+        \\    if 2 + 2 == 5 {
+        \\        unreachable;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var ok_bundle = try verifyCleanSast(allocator, 510, pentagon_dollar_ok_src, .{ .is_sast_strict = true });
+    defer ok_bundle.deinit();
+    try std.testing.expectEqual(@as(usize, 0), countDiagnosticCode(&ok_bundle.diagnostics, .w0314_unproven_bounds_access));
+
+    // [2] Static `$` underflow (`arr[$ - 4]` on `[i64; 3]`) emits `E0307`:
+    const dollar_underflow_src =
+        \\pub fn static_dollar_underflow() -> i64 {
+        \\    let fixed_arr: [i64; 3] = [10, 20, 30];
+        \\    return fixed_arr[$ - 4];
+        \\}
+    ;
+    try expectSastDiagnostic(allocator, 511, dollar_underflow_src, .{}, .e0307_static_buffer_overflow);
+
+    // [3] Static `$` OOB (`arr[$ - 0]` == `arr[len]` on `[i64; 3]`) emits `E0307`:
+    const dollar_oob_zero_src =
+        \\pub fn static_dollar_zero_oob() -> i64 {
+        \\    let fixed_arr: [i64; 3] = [10, 20, 30];
+        \\    return fixed_arr[$ - 0];
+        \\}
+    ;
+    try expectSastDiagnostic(allocator, 512, dollar_oob_zero_src, .{}, .e0307_static_buffer_overflow);
+
+    // [4] `comptime` `MirVm` `$` underflow emits `E0307` (`e0307_static_buffer_overflow`):
+    var db = try CompilerDb.init(allocator);
+    defer db.deinit();
+    const ct_dollar_file = FileId.fromInt(513);
+    const ct_dollar_src =
+        \\pub fn read_from_end(back_off: usize) -> i64 {
+        \\    let fixed_arr: [i64; 3] = [10, 20, 30];
+        \\    return fixed_arr[$ - back_off];
+        \\}
+        \\pub const BAD_CT_DOLLAR: i64 = read_from_end(5);
+    ;
+    _ = try db.setInput(ct_dollar_file, ct_dollar_src, .low);
+    const ct_tree = try db.extractItemTree(ct_dollar_file);
+    const bad_dollar_def = findDefIdByName(ct_tree.entries, "BAD_CT_DOLLAR").?;
+    const ct_art = try db.evalComptimeDef(bad_dollar_def);
+    try std.testing.expect(ct_art.has_errors);
+    try std.testing.expect(
+        hasDiagnosticCode(
+            db.getComptimeDiagnostics(bad_dollar_def).?,
+            .e0307_static_buffer_overflow,
+        ),
+    );
+
+    // [5] Reachable `unreachable` inside `@no_panic` emits `E0321`:
+    const reachable_unreach_src =
+        \\@no_panic
+        \\pub fn bad_no_panic_unreach(is_flagged: bool) -> i32 {
+        \\    if is_flagged {
+        \\        return 1;
+        \\    }
+        \\    unreachable;
+        \\}
+    ;
+    try expectSastDiagnostic(allocator, 514, reachable_unreach_src, .{}, .e0321_no_panic_contract_violation);
+}
+
+test "test_phase75_context_layout_64b_32b_and_with_allocator_escape_e0306_se08" {
+    const allocator = std.testing.allocator;
+
+    // [1] `SE-08` Canonical 8-slot `Context` layout (`64B` single cache line, `0..7` slot ordinals):
+    try std.testing.expectEqual(@as(u32, 64), ContextFieldLayout.BYTE_SIZE_64);
+    try std.testing.expectEqual(@as(usize, 8), ContextFieldLayout.CANONICAL_FIELDS.len);
+    try std.testing.expectEqual(@as(u8, 0), ContextFieldLayout.fromFieldName("allocator").?.slot_ordinal);
+    try std.testing.expectEqual(@as(u8, 2), ContextFieldLayout.fromFieldName("rng_seed").?.slot_ordinal);
+    try std.testing.expectEqual(@as(u8, 4), ContextFieldLayout.fromFieldName("temp_allocator").?.slot_ordinal);
+    try std.testing.expectEqual(@as(u8, 7), ContextFieldLayout.fromFieldName("cancel_token").?.slot_ordinal);
+
+    // [2] Normal `context.allocator` allocation returned to caller passes (`0` errors),
+    // and returning a `Copy` scalar computed inside `with context.allocator = …` passes (`0` errors):
+    const ctx_alloc_ok_src =
+        \\pub struct OwnedBuffer {
+        \\    pub raw_handle: usize,
+        \\    pub len: usize,
+        \\}
+        \\impl OwnedBuffer {
+        \\    pub fn drop(&mut self) {}
+        \\}
+        \\pub fn alloc_buffer(size_n: usize) -> OwnedBuffer {
+        \\    let active_alloc: Allocator = context.allocator;
+        \\    return OwnedBuffer { raw_handle: active_alloc._handle, len: size_n };
+        \\}
+        \\pub fn caller_owned_ok() -> OwnedBuffer {
+        \\    return alloc_buffer(16);
+        \\}
+        \\pub fn scoped_scalar_ok() -> usize {
+        \\    let scratch_alloc = Allocator { _handle: 4096 };
+        \\    return with context.allocator = scratch_alloc {
+        \\        let temp_buf = alloc_buffer(32);
+        \\        temp_buf.len
+        \\    };
+        \\}
+    ;
+    var ok_bundle = try verifyCleanSast(allocator, 520, ctx_alloc_ok_src, .{});
+    defer ok_bundle.deinit();
+
+    // [3] Escaping a heap carrier from `with context.allocator = …` via `return` emits `E0306`:
+    const escape_return_src =
+        \\pub struct OwnedBuffer {
+        \\    pub raw_handle: usize,
+        \\    pub len: usize,
+        \\}
+        \\impl OwnedBuffer {
+        \\    pub fn drop(&mut self) {}
+        \\}
+        \\pub fn alloc_buffer(size_n: usize) -> OwnedBuffer {
+        \\    let active_alloc: Allocator = context.allocator;
+        \\    return OwnedBuffer { raw_handle: active_alloc._handle, len: size_n };
+        \\}
+        \\pub fn escape_via_return() -> OwnedBuffer {
+        \\    let scratch_alloc = Allocator { _handle: 4096 };
+        \\    with context.allocator = scratch_alloc {
+        \\        return alloc_buffer(64);
+        \\    }
+        \\}
+    ;
+    try expectSastDiagnostic(allocator, 521, escape_return_src, .{}, .e0306_region_escape_violation);
+
+    // [4] Escaping from `with context.temp_allocator = …` into an outer `var` local emits `E0306`:
+    const escape_outer_var_src =
+        \\pub struct OwnedBuffer {
+        \\    pub raw_handle: usize,
+        \\    pub len: usize,
+        \\}
+        \\impl OwnedBuffer {
+        \\    pub fn drop(&mut self) {}
+        \\}
+        \\pub fn alloc_temp_buffer(size_n: usize) -> OwnedBuffer {
+        \\    let active_temp: Allocator = context.temp_allocator;
+        \\    return OwnedBuffer { raw_handle: active_temp._handle, len: size_n };
+        \\}
+        \\pub fn escape_via_outer_var() -> usize {
+        \\    var outer_buf = alloc_temp_buffer(8);
+        \\    let local_temp = Allocator { _handle: 8192 };
+        \\    with context.temp_allocator = local_temp {
+        \\        outer_buf = alloc_temp_buffer(16);
+        \\    }
+        \\    return outer_buf.len;
+        \\}
+    ;
+    try expectSastDiagnostic(allocator, 522, escape_outer_var_src, .{}, .e0306_region_escape_violation);
+
+    // [5] Growing/mutating an outer heap container via `inout` inside `with context.allocator = …` emits `E0306`:
+    const escape_inout_grow_src =
+        \\pub struct OwnedBuffer {
+        \\    pub raw_handle: usize,
+        \\    pub len: usize,
+        \\}
+        \\impl OwnedBuffer {
+        \\    pub fn drop(&mut self) {}
+        \\}
+        \\pub fn alloc_buffer(size_n: usize) -> OwnedBuffer {
+        \\    let active_alloc: Allocator = context.allocator;
+        \\    return OwnedBuffer { raw_handle: active_alloc._handle, len: size_n };
+        \\}
+        \\pub fn grow_buffer(mut buf_ref: inout OwnedBuffer, extra_n: usize) {
+        \\    let active_alloc: Allocator = context.allocator;
+        \\    buf_ref.raw_handle = active_alloc._handle;
+        \\    buf_ref.len = buf_ref.len + extra_n;
+        \\}
+        \\pub fn escape_via_inout_mutation() -> usize {
+        \\    var outer_buf = alloc_buffer(4);
+        \\    let local_alloc = Allocator { _handle: 16384 };
+        \\    with context.allocator = local_alloc {
+        \\        grow_buffer(outer_buf, 12);
+        \\    }
+        \\    return outer_buf.len;
+        \\}
+    ;
+    try expectSastDiagnostic(allocator, 523, escape_inout_grow_src, .{}, .e0306_region_escape_violation);
+}
+
+test "test_regression_linear_complement_scalar_and_multi_autodrop_discharge" {
+    const allocator = std.testing.allocator;
+
+    // [1] `Outcome` with 1 uncovered `AutoDrop` variant (`Msg`) + 1 `Copy` scalar (`Code(usize)`);
+    // taking `.Code(0xDEADBEEF)` must not downcast/drop `Msg`:
+    const outcome_src =
+        \\@linear
+        \\pub struct LinearToken {
+        \\    pub id_num: i64,
+        \\}
+        \\pub struct DropGuard {
+        \\    pub tag: i64,
+        \\}
+        \\impl DropGuard {
+        \\    pub fn drop(&mut self) {
+        \\        @drop_trace(self.tag);
+        \\    }
+        \\}
+        \\pub enum Outcome {
+        \\    Ok(LinearToken),
+        \\    Msg(DropGuard),
+        \\    Code(usize),
+        \\}
+        \\pub fn consume_token(tok_in: sink LinearToken) -> i64 {
+        \\    let LinearToken { id_num } = tok_in;
+        \\    return id_num;
+        \\}
+        \\pub fn handle_outcome(mode: i64) -> i64 {
+        \\    let out_val: Outcome = if mode == 0 {
+        \\        .Ok(LinearToken { id_num: 10 })
+        \\    } else if mode == 1 {
+        \\        .Msg(DropGuard { tag: 77 })
+        \\    } else {
+        \\        .Code(0xDEADBEEF)
+        \\    };
+        \\    if out_val is .Ok(live_tok) {
+        \\        return consume_token(live_tok);
+        \\    }
+        \\    return 99;
+        \\}
+    ;
+
+    var out_bundle = try verifyCleanSast(allocator, 530, outcome_src, .{});
+    defer out_bundle.deinit();
+    const out_body = out_bundle.mir_module.findBodyByName(&out_bundle.interner, "handle_outcome").?;
+
+    var out_rodata = RodataPool.init(allocator);
+    defer out_rodata.deinit();
+    var out_vm = try MirVm.init(
+        allocator,
+        &out_bundle.interner,
+        &out_bundle.pool,
+        &out_bundle.sym_table,
+        &out_rodata,
+        null,
+        null,
+        .{},
+    );
+    defer out_vm.deinit();
+    for (out_bundle.mir_module.bodies.items) |*body_ptr| {
+        _ = try out_vm.registerBody(body_ptr, body_ptr.symbol_index);
+    }
+
+    // `.Code(0xDEADBEEF)` (`mode == 2`); zero bogus `DropGuard.drop` invocations:
+    const code_res = try out_vm.evalBody(out_body, &[_]RegSlot{.{ .scalar_i64 = 2 }});
+    try std.testing.expectEqual(@as(i64, 99), code_res.slot.scalar_i64);
+    try std.testing.expectEqual(@as(usize, 0), out_vm.asDropTraceSlice().len);
+
+    // `.Msg(DropGuard { tag: 77 })` (`mode == 1`); drops `77` cleanly:
+    out_vm.drop_trace.clearRetainingCapacity();
+    const msg_res = try out_vm.evalBody(out_body, &[_]RegSlot{.{ .scalar_i64 = 1 }});
+    try std.testing.expectEqual(@as(i64, 99), msg_res.slot.scalar_i64);
+    try std.testing.expectEqualSlices(i64, &[_]i64{77}, out_vm.asDropTraceSlice());
+
+    // [2] `OpenRes` with multiple uncovered `AutoDrop` variants (`IoErr`, `PathErr`, `PairErr`):
+    const open_res_src =
+        \\@linear
+        \\pub struct LinearToken {
+        \\    pub id_num: i64,
+        \\}
+        \\pub struct DropGuard {
+        \\    pub tag: i64,
+        \\}
+        \\impl DropGuard {
+        \\    pub fn drop(&mut self) {
+        \\        @drop_trace(self.tag);
+        \\    }
+        \\}
+        \\pub enum OpenRes {
+        \\    Ok(LinearToken),
+        \\    IoErr(DropGuard),
+        \\    PathErr(DropGuard),
+        \\    PairErr(DropGuard, DropGuard),
+        \\}
+        \\pub fn consume_token(tok_in: sink LinearToken) -> i64 {
+        \\    let LinearToken { id_num } = tok_in;
+        \\    return id_num;
+        \\}
+        \\pub fn handle_open(mode: i64) -> i64 {
+        \\    let res_val: OpenRes = if mode == 0 {
+        \\        .Ok(LinearToken { id_num: 5 })
+        \\    } else if mode == 1 {
+        \\        .IoErr(DropGuard { tag: 11 })
+        \\    } else if mode == 2 {
+        \\        .PathErr(DropGuard { tag: 22 })
+        \\    } else {
+        \\        .PairErr(DropGuard { tag: 31 }, DropGuard { tag: 32 })
+        \\    };
+        \\    if res_val is .Ok(live_tok) {
+        \\        return consume_token(live_tok);
+        \\    }
+        \\    return -1;
+        \\}
+    ;
+
+    var open_bundle = try verifyCleanSast(allocator, 531, open_res_src, .{});
+    defer open_bundle.deinit();
+    const open_body = open_bundle.mir_module.findBodyByName(&open_bundle.interner, "handle_open").?;
+
+    var open_rodata = RodataPool.init(allocator);
+    defer open_rodata.deinit();
+    var open_vm = try MirVm.init(
+        allocator,
+        &open_bundle.interner,
+        &open_bundle.pool,
+        &open_bundle.sym_table,
+        &open_rodata,
+        null,
+        null,
+        .{},
+    );
+    defer open_vm.deinit();
+    for (open_bundle.mir_module.bodies.items) |*body_ptr| {
+        _ = try open_vm.registerBody(body_ptr, body_ptr.symbol_index);
+    }
+
+    _ = try open_vm.evalBody(open_body, &[_]RegSlot{.{ .scalar_i64 = 1 }});
+    try std.testing.expectEqualSlices(i64, &[_]i64{11}, open_vm.asDropTraceSlice());
+
+    open_vm.drop_trace.clearRetainingCapacity();
+    _ = try open_vm.evalBody(open_body, &[_]RegSlot{.{ .scalar_i64 = 2 }});
+    try std.testing.expectEqualSlices(i64, &[_]i64{22}, open_vm.asDropTraceSlice());
+
+    open_vm.drop_trace.clearRetainingCapacity();
+    _ = try open_vm.evalBody(open_body, &[_]RegSlot{.{ .scalar_i64 = 3 }});
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 32, 31 }, open_vm.asDropTraceSlice());
+    try std.testing.expectEqual(@as(u32, 0), open_vm.countUnfreedHeapAllocations());
+}
+
+test "test_regression_partial_enum_variant_move_wildcard_autodrop" {
+    const allocator = std.testing.allocator;
+
+    const partial_variant_src =
+        \\pub struct DropGuard {
+        \\    pub tag: i64,
+        \\}
+        \\impl DropGuard {
+        \\    pub fn drop(&mut self) {
+        \\        @drop_trace(self.tag);
+        \\    }
+        \\}
+        \\pub enum GuardPair {
+        \\    Both(DropGuard, DropGuard),
+        \\    Empty,
+        \\}
+        \\pub fn run_partial_move_wildcard() -> i64 {
+        \\    let pair_val: GuardPair = .Both(DropGuard { tag: 10 }, DropGuard { tag: 20 });
+        \\    if pair_val is .Both(first_guard, _) {
+        \\        @drop_trace(100);
+        \\        return first_guard.tag;
+        \\    }
+        \\    return 0;
+        \\}
+        \\pub fn run_pure_ref_wildcard() -> i64 {
+        \\    let pair_val: GuardPair = .Both(DropGuard { tag: 40 }, DropGuard { tag: 50 });
+        \\    if pair_val is .Both(ref first_ref, _) {
+        \\        @drop_trace(200);
+        \\        return first_ref.tag;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+
+    var bundle = try verifyCleanSast(allocator, 532, partial_variant_src, .{});
+    defer bundle.deinit();
+    const move_body = bundle.mir_module.findBodyByName(&bundle.interner, "run_partial_move_wildcard").?;
+    const ref_body = bundle.mir_module.findBodyByName(&bundle.interner, "run_pure_ref_wildcard").?;
+
+    var rodata = RodataPool.init(allocator);
+    defer rodata.deinit();
+    var vm = try MirVm.init(
+        allocator,
+        &bundle.interner,
+        &bundle.pool,
+        &bundle.sym_table,
+        &rodata,
+        null,
+        null,
+        .{},
+    );
+    defer vm.deinit();
+    for (bundle.mir_module.bodies.items) |*body_ptr| {
+        _ = try vm.registerBody(body_ptr, body_ptr.symbol_index);
+    }
+
+    // By-value `first_guard` + `_`; both `20` (`_`) and `10` (`first_guard`) drop in LIFO order with zero leaks:
+    const move_res = try vm.evalBody(move_body, &.{});
+    try std.testing.expectEqual(@as(i64, 10), move_res.slot.scalar_i64);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 100, 20, 10 }, vm.asDropTraceSlice());
+    try std.testing.expectEqual(@as(u32, 0), vm.countUnfreedHeapAllocations());
+
+    // Pure `ref` borrow `ref first_ref` + `_`; parent `pair_val` remains whole and drops `[50, 40]` once:
+    vm.drop_trace.clearRetainingCapacity();
+    const ref_res = try vm.evalBody(ref_body, &.{});
+    try std.testing.expectEqual(@as(i64, 40), ref_res.slot.scalar_i64);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 200, 50, 40 }, vm.asDropTraceSlice());
+    try std.testing.expectEqual(@as(u32, 0), vm.countUnfreedHeapAllocations());
+}
+
+test "test_regression_context_handle_escape_e0306_and_allocator_slot_isolation" {
+    const allocator = std.testing.allocator;
+
+    // [1] Escaping `context.logger` from `with context.logger = &local_log` emits `E0306`:
+    const logger_escape_src =
+        \\pub struct LocalLog {
+        \\    pub level: u32,
+        \\}
+        \\impl LocalLog {
+        \\    pub fn as_handle(&self) -> usize = 0;
+        \\}
+        \\pub fn escape_logger() -> Logger {
+        \\    let local_log = LocalLog { level: 1 };
+        \\    with context.logger = &local_log {
+        \\        return context.logger;
+        \\    }
+        \\}
+    ;
+    try expectSastDiagnostic(allocator, 533, logger_escape_src, .{}, .e0306_region_escape_violation);
+
+    // [2] Escaping `context.diagnostics` from `with context.diagnostics = &mut local_diag` emits `E0306`:
+    const diag_escape_src =
+        \\pub struct LocalDiag {
+        \\    pub count: u32,
+        \\}
+        \\impl LocalDiag {
+        \\    pub fn as_handle(&self) -> usize = 0;
+        \\}
+        \\pub fn escape_diagnostics() -> DiagSink {
+        \\    var local_diag = LocalDiag { count: 0 };
+        \\    with context.diagnostics = &mut local_diag {
+        \\        return context.diagnostics;
+        \\    }
+        \\}
+    ;
+    try expectSastDiagnostic(allocator, 534, diag_escape_src, .{}, .e0306_region_escape_violation);
+
+    // [3] Escaping `context.cancel_token` from `with context.cancel_token = &local_tok` emits `E0306`:
+    const cancel_escape_src =
+        \\pub struct LocalCancel {
+        \\    pub is_cancelled: bool,
+        \\}
+        \\impl LocalCancel {
+        \\    pub fn as_handle(&self) -> usize = 0;
+        \\}
+        \\pub fn escape_cancel_token() -> CancelToken {
+        \\    let local_tok = LocalCancel { is_cancelled: false };
+        \\    with context.cancel_token = &local_tok {
+        \\        return context.cancel_token;
+        \\    }
+        \\}
+    ;
+    try expectSastDiagnostic(allocator, 535, cancel_escape_src, .{}, .e0306_region_escape_violation);
+
+    // [4] Escaping a `.raw_ptr_ty` (`*mut u8`) carrier allocated inside `with context.allocator = …` emits `E0306`:
+    const raw_ptr_escape_src =
+        \\pub struct Arena {
+        \\    pub cap: usize,
+        \\}
+        \\pub fn alloc_raw_bytes() -> *mut u8 {
+        \\    let active_alloc = context.allocator;
+        \\    return unsafe { active_alloc._handle as *mut u8 };
+        \\}
+        \\pub fn escape_raw_ptr() -> *mut u8 {
+        \\    var local_arena = Arena { cap: 64 };
+        \\    with context.allocator = &mut local_arena {
+        \\        return alloc_raw_bytes();
+        \\    }
+        \\}
+    ;
+    try expectSastDiagnostic(allocator, 540, raw_ptr_escape_src, .{}, .e0306_region_escape_violation);
+
+    // [5] Allocating from `context.allocator` (`slot 0`) inside `with context.temp_allocator = …` (`slot 4`)
+    // does not conflate slot depths (`0` SAST errors):
+    const non_conflated_src =
+        \\pub struct OwnedBuffer {
+        \\    pub raw_handle: usize,
+        \\    pub len: usize,
+        \\}
+        \\impl OwnedBuffer {
+        \\    pub fn drop(&mut self) {}
+        \\}
+        \\pub fn alloc_primary(size_n: usize) -> OwnedBuffer {
+        \\    let primary_alloc: Allocator = context.allocator;
+        \\    return OwnedBuffer { raw_handle: primary_alloc._handle, len: size_n };
+        \\}
+        \\pub fn alloc_temp(size_n: usize) -> OwnedBuffer {
+        \\    let temp_alloc: Allocator = context.temp_allocator;
+        \\    return OwnedBuffer { raw_handle: temp_alloc._handle, len: size_n };
+        \\}
+        \\pub fn outer_primary_inside_inner_temp_ok() -> OwnedBuffer {
+        \\    let inner_temp = Allocator { _handle: 8192 };
+        \\    with context.temp_allocator = inner_temp {
+        \\        let scratch_only = alloc_temp(16);
+        \\        let _ = scratch_only.len;
+        \\        return alloc_primary(64);
+        \\    }
+        \\}
+    ;
+    var isolated_ok_bundle = try verifyCleanSast(allocator, 536, non_conflated_src, .{});
+    defer isolated_ok_bundle.deinit();
+
+    // [6] Escaping a generic `Holder[Logger]` carrier from `with context.logger = &local_log` emits `E0306`:
+    const generic_holder_escape_src =
+        \\pub struct Holder[T] {
+        \\    pub inner: T,
+        \\}
+        \\pub struct LocalLog {
+        \\    pub level: u32,
+        \\}
+        \\impl LocalLog {
+        \\    pub fn as_handle(&self) -> usize = 0;
+        \\}
+        \\pub fn capture_logger_holder() -> Holder[Logger] {
+        \\    return Holder { inner: context.logger };
+        \\}
+        \\pub fn escape_generic_logger_holder() -> Holder[Logger] {
+        \\    let local_log = LocalLog { level: 1 };
+        \\    with context.logger = &local_log {
+        \\        return capture_logger_holder();
+        \\    }
+        \\}
+    ;
+    var gen_bundle = try corex.lowerAndVerifySourceMirSast(
+        allocator,
+        FileId.fromInt(541),
+        generic_holder_escape_src,
+        TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer gen_bundle.deinit();
+    try std.testing.expectEqual(@as(usize, 1), gen_bundle.diagnostics.diagnostics.items.len);
+    try std.testing.expect(hasDiagnosticCode(&gen_bundle.diagnostics, .e0306_region_escape_violation));
+
+    // [7] Escaping an `enum` variant carrying `Logger` from `with context.logger = &local_log` emits `E0306`:
+    const enum_carrier_escape_src =
+        \\pub enum MaybeLogger {
+        \\    Active(Logger),
+        \\    Inactive,
+        \\}
+        \\pub struct LocalLog {
+        \\    pub level: u32,
+        \\}
+        \\impl LocalLog {
+        \\    pub fn as_handle(&self) -> usize = 0;
+        \\}
+        \\pub fn capture_enum_logger() -> MaybeLogger {
+        \\    return .Active(context.logger);
+        \\}
+        \\pub fn escape_enum_logger() -> MaybeLogger {
+        \\    let local_log = LocalLog { level: 2 };
+        \\    with context.logger = &local_log {
+        \\        return capture_enum_logger();
+        \\    }
+        \\}
+    ;
+    var enum_bundle = try corex.lowerAndVerifySourceMirSast(
+        allocator,
+        FileId.fromInt(542),
+        enum_carrier_escape_src,
+        TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer enum_bundle.deinit();
+    try std.testing.expectEqual(@as(usize, 1), enum_bundle.diagnostics.diagnostics.items.len);
+    try std.testing.expect(hasDiagnosticCode(&enum_bundle.diagnostics, .e0306_region_escape_violation));
+
+    // [8] Escaping a pointer to `Logger` (`*Logger`) from `with context.logger = &local_log` emits `E0306`:
+    const ptr_logger_escape_src =
+        \\pub struct LocalLog {
+        \\    pub level: u32,
+        \\}
+        \\impl LocalLog {
+        \\    pub fn as_handle(&self) -> usize = 0;
+        \\}
+        \\pub fn capture_logger_ptr() -> *Logger {
+        \\    let active_log = context.logger;
+        \\    return unsafe { active_log._handle as *Logger };
+        \\}
+        \\pub fn escape_logger_ptr() -> *Logger {
+        \\    let local_log = LocalLog { level: 3 };
+        \\    with context.logger = &local_log {
+        \\        return capture_logger_ptr();
+        \\    }
+        \\}
+    ;
+    var ptr_bundle = try corex.lowerAndVerifySourceMirSast(
+        allocator,
+        FileId.fromInt(543),
+        ptr_logger_escape_src,
+        TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer ptr_bundle.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ptr_bundle.diagnostics.diagnostics.items.len);
+    try std.testing.expect(hasDiagnosticCode(&ptr_bundle.diagnostics, .e0306_region_escape_violation));
+}
+
+test "test_regression_dollar_shared_read_and_autoderef_mut_slice" {
+    const allocator = std.testing.allocator;
+
+    const dollar_borrow_src =
+        \\pub struct ArrHolder {
+        \\    pub arr: [i64; 4],
+        \\}
+        \\pub struct ViewMut {
+        \\    pub buf: &mut [i32],
+        \\}
+        \\pub fn read_dollar_while_shared_borrowed() -> i64 {
+        \\    var holder = ArrHolder { arr: [10, 20, 30, 40] };
+        \\    let shared_ref = &holder;
+        \\    let last_elem = holder.arr[$ - 1];
+        \\    return shared_ref.arr[0] + last_elem;
+        \\}
+        \\pub fn write_dollar_through_view_mut() -> i64 {
+        \\    var backing: [i32; 3] = [1, 2, 3];
+        \\    let view = ViewMut { buf: &mut backing };
+        \\    view.buf[$ - 1] = 9;
+        \\    return backing[2] as i64;
+        \\}
+    ;
+
+    var bundle = try verifyCleanSast(allocator, 537, dollar_borrow_src, .{});
+    defer bundle.deinit();
+    const read_body = bundle.mir_module.findBodyByName(&bundle.interner, "read_dollar_while_shared_borrowed").?;
+    const write_body = bundle.mir_module.findBodyByName(&bundle.interner, "write_dollar_through_view_mut").?;
+
+    var rodata = RodataPool.init(allocator);
+    defer rodata.deinit();
+    var vm = try MirVm.init(
+        allocator,
+        &bundle.interner,
+        &bundle.pool,
+        &bundle.sym_table,
+        &rodata,
+        null,
+        null,
+        .{},
+    );
+    defer vm.deinit();
+    for (bundle.mir_module.bodies.items) |*body_ptr| {
+        _ = try vm.registerBody(body_ptr, body_ptr.symbol_index);
+    }
+
+    const read_res = try vm.evalBody(read_body, &.{});
+    try std.testing.expectEqual(@as(i64, 50), read_res.slot.scalar_i64);
+    const write_res = try vm.evalBody(write_body, &.{});
+    try std.testing.expectEqual(@as(i64, 9), write_res.slot.scalar_i64);
+}
+
+test "test_regression_hir_if_condition_autodrop_scope_and_inclusive_slice_e0307" {
+    const allocator = std.testing.allocator;
+
+    // [1] `hir_if` (`is not` / boolean call) drops condition `AutoDrop` temporaries before `else`:
+    const cond_temp_src =
+        \\pub struct DropGuard {
+        \\    pub tag: i64,
+        \\}
+        \\impl DropGuard {
+        \\    pub fn drop(&mut self) {
+        \\        @drop_trace(self.tag);
+        \\    }
+        \\}
+        \\pub fn make_opt_guard(is_some: bool, tag: i64) -> DropGuard? {
+        \\    if is_some {
+        \\        return .Some(DropGuard { tag: tag });
+        \\    }
+        \\    return .None;
+        \\}
+        \\pub fn run_if_cond_scope(is_inverted: bool) -> i64 {
+        \\    if is_inverted {
+        \\        if !(make_opt_guard(true, 5) is not .None) {
+        \\            @drop_trace(10);
+        \\            return 1;
+        \\        } else {
+        \\            @drop_trace(20);
+        \\            return 2;
+        \\        }
+        \\    }
+        \\    if make_opt_guard(true, 5) is not .None {
+        \\        @drop_trace(10);
+        \\        return 1;
+        \\    } else {
+        \\        @drop_trace(20);
+        \\        return 2;
+        \\    }
+        \\}
+    ;
+
+    var cond_bundle = try verifyCleanSast(allocator, 538, cond_temp_src, .{});
+    defer cond_bundle.deinit();
+    const cond_body = cond_bundle.mir_module.findBodyByName(&cond_bundle.interner, "run_if_cond_scope").?;
+
+    var rodata = RodataPool.init(allocator);
+    defer rodata.deinit();
+    var vm = try MirVm.init(
+        allocator,
+        &cond_bundle.interner,
+        &cond_bundle.pool,
+        &cond_bundle.sym_table,
+        &rodata,
+        null,
+        null,
+        .{},
+    );
+    defer vm.deinit();
+    for (cond_bundle.mir_module.bodies.items) |*body_ptr| {
+        _ = try vm.registerBody(body_ptr, body_ptr.symbol_index);
+    }
+
+    // `else` branch (`is_inverted = true`); live `.Some(DropGuard(5))` drops before `else` body emits `20`:
+    const else_res = try vm.evalBody(cond_body, &[_]RegSlot{.{ .scalar_u64 = 1 }});
+    try std.testing.expectEqual(@as(i64, 2), else_res.slot.scalar_i64);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 5, 20 }, vm.asDropTraceSlice());
+
+    // `then` branch (`is_inverted = false`); `then` body emits `10`, then condition guard `5` drops at scope exit:
+    vm.drop_trace.clearRetainingCapacity();
+    const then_res = try vm.evalBody(cond_body, &[_]RegSlot{.{ .scalar_u64 = 0 }});
+    try std.testing.expectEqual(@as(i64, 1), then_res.slot.scalar_i64);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 5 }, vm.asDropTraceSlice());
+
+    // [2] `items[0..=usize.MAX]` (`18446744073709551615`) emits `E0307` directly (not `E0502`):
+    const incl_max_src =
+        \\pub fn bad_inclusive_usize_max(items: &[i32]) -> &[i32] {
+        \\    return items[0..=18446744073709551615];
+        \\}
+    ;
+    var incl_bundle = try corex.lowerAndVerifySourceMirSast(
+        allocator,
+        FileId.fromInt(539),
+        incl_max_src,
+        TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer incl_bundle.deinit();
+    try std.testing.expect(hasDiagnosticCode(&incl_bundle.diagnostics, .e0307_static_buffer_overflow));
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countDiagnosticCode(&incl_bundle.diagnostics, .e0502_integer_constant_overflow),
+    );
+}
+
+

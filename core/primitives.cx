@@ -1,10 +1,12 @@
-//! Foundational Scalar Limits and Numeric Helpers (`core::primitives`)
+//! Foundational Scalar Limits and Numeric Helpers (`core.primitives`)
 //!
 //! Defines canonical minimum and maximum constants for fixed-width signed and unsigned integers
 //! alongside branch-clean comparison, clamping, and absolute-difference helpers.
 //!
 //! Every helper in this module is pure, heap-free (`@no_alloc`), and safe for both runtime and
 //! `comptime` evaluation across 32-bit (`wasm32`) and 64-bit native targets.
+// --------------------------------------- CONSTS ----------------------------------------
+/// Minimum representable signed 8-bit integer (`-128`).
 pub const I8_MIN: i8 = -128;
 
 /// Maximum representable signed 8-bit integer (`127`).

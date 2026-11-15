@@ -1,4 +1,4 @@
-//! Portable Explicit SIMD Vector Types and Lane Operations (`core::simd`)
+//! Portable Explicit SIMD Vector Types and Lane Operations (`core.simd`)
 //!
 //! Defines hardware-aligned fixed-width vector wrappers (`Vec4f32`, `Vec2f64`, `Vec4i32`,
 //! `Vec8i32`, `Vec16u8`) lowered to native SSE4.2 / AVX2 / NEON / Wasm `simd128` vector registers
@@ -7,9 +7,7 @@
 //! All arithmetic operations (`splat`, `add`, `sub`, `mul`, `reduce_add`) delegate directly to
 //! `@simd_*` intrinsics with guaranteed bit-exact cross-tier parity (in-order horizontal reductions
 //! for floating-point vectors per `Fix-16`).
-
 // ---------------------------------------- TYPES ----------------------------------------
-
 /// 128-bit 4-lane single-precision floating-point SIMD vector (`4 x f32`).
 @repr(C)
 @align(16)

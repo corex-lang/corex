@@ -134,9 +134,14 @@ test "test_levenshtein_distance_and_cli_arg_parsing_matrix" {
         try std.testing.expect(parsed_rel.action.execute_subcommand.is_release_mode);
         try std.testing.expectEqual(@as(u64, 50_000), parsed_rel.action.execute_subcommand.comptime_step_limit);
 
-        const parsed_dev = try router.parseArgs(&.{ "check", "--dev", "--comptime-limit", "1234" }, &sink);
+        const parsed_dev = try router.parseArgs(
+            &.{ "check", "--dev", "--internal-core", "--comptime-limit", "1234" },
+            &sink,
+        );
         try std.testing.expect(!sink.hasErrors());
         try std.testing.expect(!parsed_dev.is_release_mode);
+        try std.testing.expect(parsed_dev.is_internal_core);
+        try std.testing.expect(parsed_dev.action.execute_subcommand.is_internal_core);
         try std.testing.expectEqual(@as(u64, 1_234), parsed_dev.comptime_step_limit);
 
         try std.testing.expectEqualStrings("--release", router.suggestFlagForSubcommand("--relase", .build).?);
@@ -220,4 +225,61 @@ test "test_run_cli_lifecycle_version_check_and_missing_file_error" {
     );
     try std.testing.expectEqual(@as(u8, 1), missing_exit);
     try std.testing.expect(std.mem.indexOf(u8, err_writer.buffered(), "error[E0004]") != null);
+}
+
+test "test_cli_router_internal_core_flag_on_fmt_and_upgrade" {
+    var sink = DiagnosticSink.init(std.testing.allocator);
+    defer sink.deinit();
+
+    const parsed_fmt = try router.parseArgs(
+        &.{ "fmt", "--internal-core", "core/primitives.cx" },
+        &sink,
+    );
+    try std.testing.expect(!sink.hasErrors());
+    try std.testing.expect(parsed_fmt.is_internal_core);
+    try std.testing.expectEqual(router.SubcommandId.fmt, parsed_fmt.action.execute_subcommand.subcommand);
+    try std.testing.expect(parsed_fmt.action.execute_subcommand.is_internal_core);
+
+    const parsed_upg = try router.parseArgs(
+        &.{ "upgrade", "--internal-core", "core/primitives.cx" },
+        &sink,
+    );
+    try std.testing.expect(!sink.hasErrors());
+    try std.testing.expect(parsed_upg.is_internal_core);
+    try std.testing.expectEqual(router.SubcommandId.upgrade, parsed_upg.action.execute_subcommand.subcommand);
+    try std.testing.expect(parsed_upg.action.execute_subcommand.is_internal_core);
+
+    try std.testing.expectEqualStrings(
+        "--internal-core",
+        router.suggestFlagForSubcommand("--internal-cor", .fmt).?,
+    );
+    try std.testing.expectEqualStrings(
+        "--internal-core",
+        router.suggestFlagForSubcommand("--internal-cor", .upgrade).?,
+    );
+
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var out_writer = std.Io.Writer.fixed(&out_buf);
+    var err_writer = std.Io.Writer.fixed(&err_buf);
+    const upg_exit = try router.runCli(
+        std.testing.allocator,
+        std.testing.io,
+        null,
+        &.{ "--color=never", "upgrade", "--internal-core", "core/primitives.cx" },
+        &out_writer,
+        &err_writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), upg_exit);
+
+    var fmt_help_buf: [4096]u8 = undefined;
+    var fmt_help_writer = std.Io.Writer.fixed(&fmt_help_buf);
+    try router.renderSubcommandHelp(&fmt_help_writer, StyleConfig.MONOCHROME, .fmt);
+    try std.testing.expect(std.mem.indexOf(u8, fmt_help_writer.buffered(), "--internal-core") != null);
+
+    var upg_help_buf: [4096]u8 = undefined;
+    var upg_help_writer = std.Io.Writer.fixed(&upg_help_buf);
+    try router.renderSubcommandHelp(&upg_help_writer, StyleConfig.MONOCHROME, .upgrade);
+    try std.testing.expect(std.mem.indexOf(u8, upg_help_writer.buffered(), "Upgrade Options:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, upg_help_writer.buffered(), "--internal-core") != null);
 }

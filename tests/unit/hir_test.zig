@@ -404,10 +404,10 @@ test "test_hir_desugar_try_operator_from_upcast_and_catch_expressions" {
         "        };\n" ++
         "    } else if mode == 2 {\n" ++
         "        let some_in: i32? = .Some(12);\n" ++
-        "        return propagate_opt(some_in) catch 77;\n" ++
+        "        return propagate_opt(some_in) orelse 77;\n" ++
         "    }\n" ++
         "    let none_in: i32? = .None;\n" ++
-        "    return propagate_opt(none_in) catch 77;\n" ++
+        "    return propagate_opt(none_in) orelse 77;\n" ++
         "}\n";
 
     var bundle = try hir.lowerSourceToHir(
@@ -482,7 +482,7 @@ test "test_hir_desugar_try_operator_from_upcast_and_catch_expressions" {
     );
 }
 
-// Rule 4: `let … else`, `if let`, conjunctive `if expr is Pat and guard`, and `while is`:
+// Rule 4: `let … else`, `if expr is Pat`, conjunctive `if expr is Pat and guard`, and `while is`:
 
 test "test_hir_desugar_let_else_if_let_conjunctive_is_and_while_is" {
     const cond_src =
@@ -492,7 +492,7 @@ test "test_hir_desugar_let_else_if_let_conjunctive_is_and_while_is" {
         "        return -99;\n" ++
         "    };\n" ++
         "    var total: i32 = 0;\n" ++
-        "    if let .Some(bonus) = opt_seed {\n" ++
+        "    if opt_seed is .Some(bonus) {\n" ++
         "        total += bonus;\n" ++
         "    }\n" ++
         "    if opt_seed is .Some(checked) and checked > 10 {\n" ++
@@ -514,10 +514,15 @@ test "test_hir_desugar_let_else_if_let_conjunctive_is_and_while_is" {
     defer bundle.deinit();
     try std.testing.expect(!bundle.diagnostics.hasErrors());
     try std.testing.expect(
-        countTagInRange(&bundle.hir_store, 0, bundle.hir_store.countNodes(), .hir_match) >= 4,
+        countTagInRange(&bundle.hir_store, 0, bundle.hir_store.countNodes(), .hir_match) >= 1,
     );
-    try std.testing.expect(
-        countTagInRange(&bundle.hir_store, 0, bundle.hir_store.countNodes(), .hir_loop) >= 1,
+    try std.testing.expectEqual(
+        @as(u32, 2),
+        countTagInRange(&bundle.hir_store, 0, bundle.hir_store.countNodes(), .hir_cond_if),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        countTagInRange(&bundle.hir_store, 0, bundle.hir_store.countNodes(), .hir_cond_while),
     );
 
     // Negative `seed = -1` diverges via `let … else` (`-99`):
@@ -1125,4 +1130,147 @@ test "test_hir_deterministic_render_and_isolated_lower_def_to_hir" {
     try std.testing.expect(!single_diag.hasErrors());
     try std.testing.expectEqual(@as(usize, 1), single_store.functions.items.len);
     try std.testing.expectEqual(target_def, single_store.functions.items[0].def_id);
+}
+
+// --------- Dependent Defaults, SoA & Float Constants ----------
+
+test "test_regression_hir_dependent_default_params_and_const_patterns" {
+    const dep_default_src =
+        "pub const MAX_RETRIES: i32 = 4;\n" ++
+        "pub fn classify_retry(retries: i32) -> i32 {\n" ++
+        "    return if retries is MAX_RETRIES { 100 } else { retries };\n" ++
+        "}\n" ++
+        "pub fn make_window(lo: i32, mid: i32 = lo + 5, hi: i32 = mid * 2) -> i32 {\n" ++
+        "    return hi - lo;\n" ++
+        "}\n" ++
+        "pub fn run_dependent_defaults() -> i32 {\n" ++
+        "    let pos_all_def = make_window(10);\n" ++
+        "    let named_mid = make_window(4, mid: 7);\n" ++
+        "    let out_of_order = make_window(mid: 9, lo: 3);\n" ++
+        "    let const_pat = classify_retry(4) + classify_retry(2);\n" ++
+        "    return pos_all_def + named_mid + out_of_order + const_pat;\n" ++
+        "}\n";
+
+    var bundle = try hir.lowerSourceToHir(
+        std.testing.allocator,
+        dep_default_src,
+        TargetLayout.NATIVE_64,
+    );
+    defer bundle.deinit();
+    try std.testing.expect(!bundle.diagnostics.hasErrors());
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countTagInRange(&bundle.hir_store, 0, bundle.hir_store.countNodes(), .hir_error_hole),
+    );
+
+    // `make_window(10) = 30 - 10 = 20`; `make_window(4, mid: 7) = 14 - 4 = 10`;
+    // `make_window(mid: 9, lo: 3) = 18 - 3 = 15`; `classify_retry(4) + classify_retry(2) = 102` -> `147`:
+    const actual_sum = try evalSourceFnI64(
+        std.testing.allocator,
+        dep_default_src,
+        TargetLayout.NATIVE_64,
+        "run_dependent_defaults",
+        &.{},
+        15_000,
+    );
+    try std.testing.expectEqual(@as(i64, 147), actual_sum);
+}
+
+test "test_regression_hir_soa_column_projection_interns_plain_slice" {
+    const soa_col_src =
+        "pub struct Vec2 {\n" ++
+        "    pub x: i32,\n" ++
+        "    pub y: i32,\n" ++
+        "}\n" ++
+        "pub fn read_mut_soa_column(pts: &mut #soa [Vec2]) -> i32 {\n" ++
+        "    pts.x[$ - 1] = pts.x[$ - 1] + 5;\n" ++
+        "    let sub_x: &[i32] = pts.x[0..$ - 1];\n" ++
+        "    return (pts.x)[$ - 1] + sub_x[$ - 1];\n" ++
+        "}\n";
+
+    var bundle = try hir.lowerSourceToHir(
+        std.testing.allocator,
+        soa_col_src,
+        TargetLayout.NATIVE_64,
+    );
+    defer bundle.deinit();
+    try std.testing.expect(!bundle.diagnostics.hasErrors());
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countTagInRange(&bundle.hir_store, 0, bundle.hir_store.countNodes(), .hir_error_hole),
+    );
+
+    var has_plain_col_slice = false;
+    const tags = bundle.hir_store.nodes.items(.tag);
+    const type_ids = bundle.hir_store.nodes.items(.type_id);
+    for (tags, type_ids) |node_tag, node_ty| {
+        if (node_tag == .hir_field_proj and !node_ty.isError()) {
+            const unwrapped_ty = bundle.pool.unwrapUnderlyingType(node_ty);
+            try std.testing.expect(bundle.pool.getTag(unwrapped_ty) != .soa_slice_ty);
+            if (bundle.pool.getTag(unwrapped_ty) == .slice_ty) {
+                has_plain_col_slice = true;
+            }
+        }
+    }
+    try std.testing.expect(has_plain_col_slice);
+}
+
+test "test_hir_float_pi_and_tau_associated_constants_lowering_and_vm_parity" {
+    const float_const_src =
+        "pub fn verify_pi_tau() -> i32 {\n" ++
+        "    let pi32: f32 = f32.PI;\n" ++
+        "    let tau32: f32 = f32.TAU;\n" ++
+        "    let pi64: f64 = f64.PI;\n" ++
+        "    let tau64: f64 = f64.TAU;\n" ++
+        "    if pi32 > 3.14 and pi32 < 3.15 and tau32 > 6.28 and tau32 < 6.29 {\n" ++
+        "        if pi64 == 3.141592653589793 and tau64 == 6.283185307179586 {\n" ++
+        "            return 1;\n" ++
+        "        }\n" ++
+        "    }\n" ++
+        "    return 0;\n" ++
+        "}\n";
+
+    var bundle = try hir.lowerSourceToHir(
+        std.testing.allocator,
+        float_const_src,
+        TargetLayout.NATIVE_64,
+    );
+    defer bundle.deinit();
+    try std.testing.expect(!bundle.diagnostics.hasErrors());
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countTagInRange(&bundle.hir_store, 0, bundle.hir_store.countNodes(), .hir_error_hole),
+    );
+
+    const expected_pi32_bits: u64 = @bitCast(@as(f64, @floatCast(@as(f32, std.math.pi))));
+    const expected_tau32_bits: u64 = @bitCast(@as(f64, @floatCast(@as(f32, std.math.tau))));
+    const expected_pi64_bits: u64 = @bitCast(@as(f64, std.math.pi));
+    const expected_tau64_bits: u64 = @bitCast(@as(f64, std.math.tau));
+
+    var has_pi32 = false;
+    var has_tau32 = false;
+    var has_pi64 = false;
+    var has_tau64 = false;
+    for (bundle.hir_store.const_pool.items) |const_item| {
+        if (const_item != .float_val) continue;
+        const val_bits: u64 = @bitCast(const_item.float_val);
+        if (val_bits == expected_pi32_bits) has_pi32 = true;
+        if (val_bits == expected_tau32_bits) has_tau32 = true;
+        if (val_bits == expected_pi64_bits) has_pi64 = true;
+        if (val_bits == expected_tau64_bits) has_tau64 = true;
+    }
+    try std.testing.expect(has_pi32);
+    try std.testing.expect(has_tau32);
+    try std.testing.expect(has_pi64);
+    try std.testing.expect(has_tau64);
+
+    const vm_res = try evalSourceFnI64(
+        std.testing.allocator,
+        float_const_src,
+        TargetLayout.NATIVE_64,
+        "verify_pi_tau",
+        &.{},
+        10_000,
+    );
+    try std.testing.expectEqual(@as(i64, 1), vm_res);
 }

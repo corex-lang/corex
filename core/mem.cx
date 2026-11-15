@@ -1,4 +1,4 @@
-//! Memory Layout Queries, Alignment Arithmetic, and Cache-Line Padding (`core::mem`)
+//! Memory Layout Queries, Alignment Arithmetic, and Cache-Line Padding (`core.mem`)
 //!
 //! Wraps CoreX's compile-time type layout intrinsics (`@size_of`, `@align_of`, `@default_init`)
 //! and provides `@cache_aligned` `CachePadded[T]` containers to eliminate false sharing across
@@ -6,9 +6,7 @@
 //!
 //! Alignment arithmetic helpers use wrapping bitmask operations so power-of-two rounding is
 //! branch-minimal and `@no_panic`-clean.
-
 // ---------------------------------------- TYPES ----------------------------------------
-
 /// Cache-line padded wrapper isolating concurrent state from destructive false sharing (`DR-08`).
 @cache_aligned
 pub struct CachePadded[T] {

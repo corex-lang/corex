@@ -1,10 +1,12 @@
-//! Apple macOS Darwin `libSystem` Constants and C-ABI Prototypes (`core::sys::macos`)
+//! Apple macOS Darwin `libSystem` Constants and C-ABI Prototypes (`core.sys.macos`)
 //!
 //! Declares canonical Darwin file-descriptor constants, Apple Silicon (`aarch64-macos`) `128B`
 //! cache-line constant, and `libSystem.B.dylib` `write` / `_exit` `extern "C"` prototypes.
 //!
 //! On macOS, userland binaries link against `libSystem` rather than invoking unstable raw traps;
 //! safe stream helpers route through `@sys_write` and `@sys_exit`.
+// --------------------------------------- CONSTS ----------------------------------------
+/// Darwin standard input file descriptor (`0`).
 pub const STDIN_FILENO: i32 = 0;
 
 /// Darwin standard output file descriptor (`1`).

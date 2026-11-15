@@ -3,7 +3,7 @@
 //! Exercises `TokenSet128` bitset operations, canonical recovery anchor sets, all top-level `Item`
 //! declarations, generics and `where` clauses, all 11 `PrimaryType` forms and postfix `?`, all
 //! statement and pattern forms, all 15 Pratt expression precedence tiers and `LL(k)` disambiguations,
-//! all 4 `DR-03` Showcase `.cx` programs, fault-tolerant recovery (`E0201`–`E0203`, `W0201`),
+//! all 4 `DR-21` Showcase `.cx` programs, fault-tolerant recovery (`E0201`–`E0203`, `E0215`, `E0216`),
 //! semantic holes, IDE completion nodes (`incomplete_member_access`, `incomplete_call`),
 //! `reparseIncremental`, and Red-Team adversarial regressions (`RT-01`–`RT-07`).
 
@@ -267,11 +267,11 @@ test "test_parser_all_top_level_item_declarations_and_attributes" {
     const items_source =
         \\mod external_mod;
         \\pub mod inline_mod {
-        \\    use self::inner;
-        \\    use Self::Assoc;
-        \\    use std::io::*;
-        \\    use std::fs::{File, BufReader as Br};
-        \\    use net::http as http_alias;
+        \\    use self.inner;
+        \\    use Self.Assoc;
+        \\    use cx.io.*;
+        \\    use cx.fs.{File, BufReader as Br};
+        \\    use net.http as http_alias;
         \\    pub const LIMIT: usize = 256;
         \\    const UNTYPED_CONST = 42;
         \\}
@@ -379,8 +379,8 @@ test "test_parser_all_11_primary_types_and_postfix_optional_chains" {
         \\    pub f_pair_tuple: (i32, str),
         \\    pub f_fn_ptr: async unsafe fn(count: usize, &str) -> bool,
         \\    pub f_dyn_trait: dyn Printable,
-        \\    pub f_qualified: std::collections::Map[str, T, const 8, 16, true, MAX_CAP],
-        \\    pub f_assoc: Container::Item,
+        \\    pub f_qualified: cx.col.Map[str, T, const 8, 16, true, MAX_CAP],
+        \\    pub f_assoc: Container.Item,
         \\    pub f_opt: T?,
         \\    pub f_nested_opt: (&mut [T; N])??,
         \\}
@@ -431,10 +431,10 @@ test "test_parser_all_statement_forms_and_all_11_assignment_operators" {
         \\        }
         \\        counter += idx;
         \\    }
-        \\    while counter < 100 |captured| {
+        \\    while next_opt() is .Some(captured) and counter < 100 {
         \\        counter += captured;
         \\    }
-        \\    while let .Some(next_item) = poll_next() {
+        \\    while poll_next() is .Some(next_item) {
         \\        counter += next_item;
         \\    }
         \\    let loop_out = loop {
@@ -500,7 +500,7 @@ test "test_parser_all_refutable_and_irrefutable_patterns" {
         \\        .Quit => 7,
         \\        .Resize(width, height) if width > 0 => width + height,
         \\        .Click { x_pos, mut y_pos: 0, .. } => x_pos,
-        \\        Event::KeyPress(code) => code,
+        \\        Event.KeyPress(code) => code,
         \\        Point { x_coord, ref y_coord, z_coord: 10, .. } => x_coord + y_coord,
         \\        (first_item, (second_item, _)) => first_item + second_item,
         \\        fallback_bind => 99,
@@ -543,8 +543,8 @@ test "test_parser_all_15_pratt_precedence_tiers_and_llk_disambiguations" {
         \\    let modes = borrow_check(&inout point, &let point, own point, ref point, ref mut point);
         \\    let tuple_and_arr = ((1), (1,), (1, 2), [0; 16], [1, 2, 3,]);
         \\    let generic_calls = alloc[u64](16) + alloc[(u64, i64)](4) + alloc[[u8]](2)
-        \\        + alloc[std::io::File](1) + alloc[dyn Printable](1);
-        \\    let indexing = vec[0] + matrix[1, 2] + table[EnumType::VariantKey] + EnumType::Make[i32](1);
+        \\        + alloc[cx.io.File](1) + alloc[dyn Printable](1);
+        \\    let indexing = vec[0] + matrix[1, 2] + table[EnumType.VariantKey] + EnumType.Make[i32](1);
         \\    let tuple_field = tuple_and_arr.0;
         \\    let closures = (|x: i32, mut y: i32| -> i32 { x + y })(1, 2) + (|_| 0)(1) + (|| 42)();
         \\    let blocks = (async { 1 }) + (unsafe { 2 }) + (comptime { 3 });
@@ -556,9 +556,9 @@ test "test_parser_all_15_pratt_precedence_tiers_and_llk_disambiguations" {
         \\                Badge[u32](count: 1) {}
         \\            }
         \\        }
-        \\    } else if let .Some(v) = opt_val {
+        \\    } else if opt_val is .Some(v) {
         \\        return v;
-        \\    } else if has_item |cap| {
+        \\    } else if has_item is .Some(cap) {
         \\        return cap;
         \\    }
         \\    return casted + piped + caught + tuple_field;
@@ -627,17 +627,48 @@ test "test_parser_catch_right_associativity_vs_pipe_left_associativity" {
         AstTag.binary_expr,
         ast_arena.getNode(NodeIndex.fromInt(ast_arena.getNode(outer_catch_id.?).rhs.payload)).tag,
     );
+
+    // [3] `a orelse b orelse c` is right-associative `a orelse (b orelse c)`, and `|>` binds tighter than `catch`:
+    try expectCleanParse("fn o() -> i32 { return a orelse b orelse c; }\n", &ast_arena, &cst_arena);
+    var outer_orelse_id: ?NodeIndex = null;
+    i = 0;
+    while (i < ast_arena.countNodes()) : (i += 1) {
+        const id = NodeIndex.fromInt(@intCast(i));
+        if (ast_arena.getNode(id).tag == .binary_expr) {
+            outer_orelse_id = id;
+        }
+    }
+    try std.testing.expect(outer_orelse_id != null);
+    try std.testing.expectEqual(
+        AstTag.binary_expr,
+        ast_arena.getNode(NodeIndex.fromInt(ast_arena.getNode(outer_orelse_id.?).rhs.payload)).tag,
+    );
+
+    try expectCleanParse("fn pc() -> i32 { return a |> b() catch c; }\n", &ast_arena, &cst_arena);
+    var pipe_catch_id: ?NodeIndex = null;
+    i = 0;
+    while (i < ast_arena.countNodes()) : (i += 1) {
+        const id = NodeIndex.fromInt(@intCast(i));
+        if (ast_arena.getNode(id).tag == .binary_expr) {
+            pipe_catch_id = id;
+        }
+    }
+    try std.testing.expect(pipe_catch_id != null);
+    try std.testing.expectEqual(
+        AstTag.pipe_expr,
+        ast_arena.getNode(NodeIndex.fromInt(ast_arena.getNode(pipe_catch_id.?).lhs.payload)).tag,
+    );
 }
 
-// ------------------- DR-03 Domain Showcases -------------------
+// ------------------- DR-21 Domain Showcases -------------------
 
 test "test_parser_all_four_dr03_showcase_programs_lossless_and_zero_diagnostics" {
     const showcase_1_cli =
         \\mod cli_scanner;
-        \\use std::env;
-        \\use std::fs::{File, BufReader};
-        \\use std::io::{IoError, Stdout};
-        \\use std::mem::Arena;
+        \\use cx.env;
+        \\use cx.fs.{File, BufReader};
+        \\use cx.io.{IoError, Stdout};
+        \\use cx.mem.Arena;
         \\const DEFAULT_BUF_CAP: usize = 65_536;
         \\@cli_command(name = "cx-scan", version = "1.0.0")
         \\pub struct ScanOptions {
@@ -651,11 +682,11 @@ test "test_parser_all_four_dr03_showcase_programs_lossless_and_zero_diagnostics"
         \\    pub max_matches: usize = 1_000,
         \\}
         \\pub fn scan_file(arena: &mut Arena, opts: &ScanOptions, out: &mut Stdout) -> Result[u64, IoError] {
-        \\    let file = File::open(opts.file_path)?;
+        \\    let file = File.open(opts.file_path)?;
         \\    defer file.close();
-        \\    var reader = BufReader::with_capacity(arena, file, DEFAULT_BUF_CAP);
+        \\    var reader = BufReader.with_capacity(arena, file, DEFAULT_BUF_CAP);
         \\    var matches_found: u64 = 0;
-        \\    while let .Some(line) = reader.next_line()? {
+        \\    while reader.next_line()? is .Some(line) {
         \\        if line.contains(opts.pattern) {
         \\            matches_found += 1;
         \\            out.write_fmt("{opts.file_path}: {line}\n")?;
@@ -667,7 +698,7 @@ test "test_parser_all_four_dr03_showcase_programs_lossless_and_zero_diagnostics"
 
     const showcase_2_http =
         \\mod user_api;
-        \\use net::http::{Request, Response, StatusCode, Json};
+        \\use net.http.{Request, Response, StatusCode, Json};
         \\const MAX_BODY_BYTES: usize = 16_384;
         \\@derive(Deserialize)
         \\pub struct CreateUserReq {
@@ -679,16 +710,16 @@ test "test_parser_all_four_dr03_showcase_programs_lossless_and_zero_diagnostics"
         \\pub async fn create_user(req: &mut Request) -> Result[Json[CreateUserReq], ApiError] {
         \\    let body_bytes = req.read_body_bounded(MAX_BODY_BYTES).await?;
         \\    let payload = body_bytes
-        \\        |> Json::parse[CreateUserReq]()
-        \\        |> Result::map_err(|e| ApiError::InvalidJson(e.message()))?;
-        \\    .Ok(Json::from(payload))
+        \\        |> Json.parse[CreateUserReq]()
+        \\        catch |err| return .Err(ApiError.InvalidJson(err.message()));
+        \\    .Ok(Json.from(payload))
         \\}
     ;
 
     const showcase_3_avl =
         \\mod avl_tree;
-        \\use std::cmp::Ord;
-        \\use std::mem::OwnPtr;
+        \\use cx.cmp.Ord;
+        \\use cx.mem.OwnPtr;
         \\pub struct AvlNode[K: Ord, V] {
         \\    pub key: K,
         \\    pub value: V,
@@ -697,9 +728,7 @@ test "test_parser_all_four_dr03_showcase_programs_lossless_and_zero_diagnostics"
         \\}
         \\impl[K: Ord, V] AvlNode[K, V] {
         \\    fn rotate_right(mut y_node: OwnPtr[AvlNode[K, V]]) -> OwnPtr[AvlNode[K, V]] {
-        \\        let .Some(mut x_node) = y_node.left.take() else {
-        \\            return y_node;
-        \\        };
+        \\        var x_node = y_node.left.take() orelse return y_node;
         \\        y_node.left = x_node.right.take();
         \\        x_node.right = .Some(own y_node);
         \\        x_node
@@ -709,11 +738,11 @@ test "test_parser_all_four_dr03_showcase_programs_lossless_and_zero_diagnostics"
 
     const showcase_4_ui =
         \\mod ui_telemetry;
-        \\use ui::core::{View, Signal, Computed, Theme, Color};
+        \\use cx.ui.{View, Signal, Computed, Theme, Color};
         \\@component
         \\pub fn telemetry_dashboard(node_name: str, cpu_sig: &Signal[f32], theme: &Theme) -> View {
         \\    @state var is_paused: bool = false;
-        \\    let is_critical = Computed::new(|| cpu_sig.get() >= 80.0);
+        \\    let is_critical = Computed.new(|| cpu_sig.get() >= 80.0);
         \\    Card(padding: 16, border_color: theme.border_subtle) {
         \\        Row(justify: .SpaceBetween, align: .Center) {
         \\            Text(value: "Node: {node_name}", weight: .Bold, size: 18);
@@ -848,7 +877,7 @@ test "test_parser_w0201_contextual_casing_recovery_and_transactional_patcher" {
         "}\n" ++
         "const badConstName: i32 = 10;\n" ++
         "fn BadFuncName(BadParam: bad_struct_name) -> i32 {\n" ++
-        "    return bad_param.BadFieldName;\n" ++
+        "    return bad_param.badFieldName;\n" ++
         "}\n";
 
     const expected_patched_source =
@@ -1120,8 +1149,8 @@ test "test_parser_red_team_adversarial_regressions_rt01_through_rt07" {
     var sink = DiagnosticSink.init(std.testing.allocator);
     defer sink.deinit();
 
-    // [1] `RT-01` – Malformed path expressions (`foo::;` and `bar::123`) finish `.path_pat` CST subtree cleanly:
-    const rt01_src = "fn rt01() { let a = foo::; let b = bar::123; }\n";
+    // [1] `RT-01` – Malformed member expressions (`foo.;` and `bar.+;`) terminate CST subtrees cleanly:
+    const rt01_src = "fn rt01() { let a = foo.; let b = bar.+; }\n";
     _ = try corex.parseSource(rt01_src, FileId.fromInt(0), &token_buf, &cst_arena, &ast_arena, &sink, null);
     try std.testing.expect(sink.error_count >= 2);
     try expectValidCstAndAstInvariants(rt01_src, &token_buf, &cst_arena, &ast_arena);
@@ -1189,8 +1218,8 @@ test "test_parser_red_team_adversarial_regressions_rt01_through_rt07" {
     );
     try std.testing.expect(!rt05_stats.is_fast_splice);
 
-    // [5] `RT-06` – Malformed patterns (`-true`, `1..`, `Foo::`) emit `E0201` without hanging:
-    const rt06_src = "fn rt06(val: i32) -> i32 { return match val { -true => 1, 1.. => 2, Foo:: => 3 }; }\n";
+    // [5] `RT-06` – Malformed patterns (`-true`, `1..`, `Foo.`) emit `E0201` without hanging:
+    const rt06_src = "fn rt06(val: i32) -> i32 { return match val { -true => 1, 1.. => 2, Foo. => 3 }; }\n";
     sink.diagnostics.clearRetainingCapacity();
     sink.error_count = 0;
     sink.warning_count = 0;
@@ -1201,4 +1230,205 @@ test "test_parser_red_team_adversarial_regressions_rt01_through_rt07" {
     // [6] `RT-07` – Generic & standard call with empty trailing view block `Card[u32](padding: 16) {}`:
     try expectCleanParse("fn rt07() { Card[u32](padding: 16) {} Row(gap: 8) {} }\n", &ast_arena, &cst_arena);
     try std.testing.expect(hasCstKind(&cst_arena, .view_block_expr));
+
+    // [7] `DR-21` elevated constructs and negative diagnostics (`E0215`, `E0216`):
+    const dr21_src =
+        \\pub fn double_val(val: i32) -> i32 = val * 2;
+        \\pub fn scan_frames(frame: &[u8], scratch: &mut Arena) -> usize {
+        \\    if (hdr_len := frame.len()) >= 4 and frame[..$-2] is [0x43, ..] {
+        \\        let found_idx: usize = search: for byte_val, idx in frame[$-4..] {
+        \\            if byte_val == 0xFF {
+        \\                break :search idx;
+        \\            }
+        \\        } orelse return hdr_len;
+        \\        return with context.allocator = &mut scratch {
+        \\            found_idx
+        \\        };
+        \\    }
+        \\    return unreachable;
+        \\}
+    ;
+    try expectCleanParse(dr21_src, &ast_arena, &cst_arena);
+
+    const bad_walrus_src = "fn bad_walrus() { count := 1; }\n";
+    sink.diagnostics.clearRetainingCapacity();
+    sink.error_count = 0;
+    sink.warning_count = 0;
+    _ = try corex.parseSource(bad_walrus_src, FileId.fromInt(4), &token_buf, &cst_arena, &ast_arena, &sink, null);
+    try std.testing.expect(sink.hasErrors());
+    var has_e0215 = false;
+    for (sink.asSlice()) |diag_item| {
+        if (diag_item.code == .e0215_invalid_walrus_position) has_e0215 = true;
+    }
+    try std.testing.expect(has_e0215);
+    try expectValidCstAndAstInvariants(bad_walrus_src, &token_buf, &cst_arena, &ast_arena);
+
+    const retired_if_let_src = "fn bad_if_let(opt: i32?) -> i32 { if let .Some(val) = opt { return val; } return 0; }\n";
+    sink.diagnostics.clearRetainingCapacity();
+    sink.error_count = 0;
+    sink.warning_count = 0;
+    _ = try corex.parseSource(retired_if_let_src, FileId.fromInt(5), &token_buf, &cst_arena, &ast_arena, &sink, null);
+    try std.testing.expect(sink.hasErrors());
+    var has_e0216 = false;
+    for (sink.asSlice()) |diag_item| {
+        if (diag_item.code == .e0216_retired_if_while_let) has_e0216 = true;
+    }
+    try std.testing.expect(has_e0216);
+    try expectValidCstAndAstInvariants(retired_if_let_src, &token_buf, &cst_arena, &ast_arena);
+}
+
+test "test_parser_dr21_index_vs_type_args_const_patterns_and_if_let_guard_fix" {
+    var token_buf = TokenBuffer.init(std.testing.allocator);
+    defer token_buf.deinit();
+    var cst_arena = LosslessCstArena.init(std.testing.allocator);
+    defer cst_arena.deinit();
+    var ast_arena = AstArena.init(std.testing.allocator);
+    defer ast_arena.deinit();
+    var sink = DiagnosticSink.init(std.testing.allocator);
+    defer sink.deinit();
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    // [1] Disambiguate `IndexExpr` (`arr[*idx_ptr]`, `map[SlotIdx(0)]`, `arr[Vec[u8].LEN]`) vs `TypeArgs`:
+    const disambig_index_src =
+        \\fn test_indexing(arr: &[i32], idx_ptr: *usize, map: &[i32]) -> i32 {
+        \\    let elem_a = arr[*idx_ptr];
+        \\    let elem_b = map[SlotIdx(0)];
+        \\    let elem_c = arr[Vec[u8].LEN];
+        \\    let elem_d = arr[Pair[u8](1)];
+        \\    return elem_a + elem_b + elem_c + elem_d;
+        \\}
+    ;
+    _ = try corex.parseSource(disambig_index_src, FileId.fromInt(0), &token_buf, &cst_arena, &ast_arena, &sink, &interner);
+    try std.testing.expectEqual(@as(u32, 0), sink.error_count);
+    try std.testing.expect(hasCstKind(&cst_arena, .index_expr));
+    try expectValidCstAndAstInvariants(disambig_index_src, &token_buf, &cst_arena, &ast_arena);
+
+    const generic_call_src =
+        \\fn test_generic_calls(ptr: *u8, mut_ptr: *mut u8) -> usize {
+        \\    return foo[Vec[u8]](1) + bar[*u8](ptr) + baz[*mut u8](mut_ptr);
+        \\}
+    ;
+    sink.diagnostics.clearRetainingCapacity();
+    sink.error_count = 0;
+    _ = try corex.parseSource(generic_call_src, FileId.fromInt(1), &token_buf, &cst_arena, &ast_arena, &sink, &interner);
+    try std.testing.expectEqual(@as(u32, 0), sink.error_count);
+    try std.testing.expect(hasCstKind(&cst_arena, .type_args));
+    try std.testing.expect(hasCstKind(&cst_arena, .call_expr));
+    try expectValidCstAndAstInvariants(generic_call_src, &token_buf, &cst_arena, &ast_arena);
+
+    // [2] Bare `SCREAMING_SNAKE_CASE` constants in `is` and `match` lower to `.variant_pat` (not `.bind_pat`):
+    const const_pat_src =
+        \\fn check_retries(count: i32) -> i32 {
+        \\    if count is MAX_RETRIES {
+        \\        return 1;
+        \\    }
+        \\    return match count {
+        \\        MAX_RETRIES => 2,
+        \\        MIN_VAL..=MAX_VAL => 3,
+        \\        _ => 0,
+        \\    };
+        \\}
+    ;
+    sink.diagnostics.clearRetainingCapacity();
+    sink.error_count = 0;
+    _ = try corex.parseSource(const_pat_src, FileId.fromInt(2), &token_buf, &cst_arena, &ast_arena, &sink, &interner);
+    try std.testing.expectEqual(@as(u32, 0), sink.error_count);
+    var variant_pat_count: usize = 0;
+    var bind_pat_count: usize = 0;
+    var i: usize = 0;
+    while (i < ast_arena.countNodes()) : (i += 1) {
+        const tag = ast_arena.getNode(NodeIndex.fromInt(@intCast(i))).tag;
+        if (tag == .variant_pat) variant_pat_count += 1;
+        if (tag == .bind_pat) bind_pat_count += 1;
+    }
+    try std.testing.expect(variant_pat_count >= 2);
+    try std.testing.expectEqual(@as(usize, 0), bind_pat_count);
+    try expectValidCstAndAstInvariants(const_pat_src, &token_buf, &cst_arena, &ast_arena);
+
+    // [3] `if let` with `and` guard produces clean `SuggestedFix` without swallowing `and val > 0`:
+    const guarded_if_let_src = "fn check_guard(opt: i32?) -> i32 { if let .Some(val) = opt and val > 0 { return val; } return 0; }";
+    sink.diagnostics.clearRetainingCapacity();
+    sink.error_count = 0;
+    _ = try corex.parseSource(guarded_if_let_src, FileId.fromInt(3), &token_buf, &cst_arena, &ast_arena, &sink, &interner);
+    try std.testing.expectEqual(@as(u32, 1), sink.error_count);
+    try std.testing.expectEqual(DiagnosticCode.e0216_retired_if_while_let, sink.asSlice()[0].code);
+    try std.testing.expectEqual(@as(usize, 1), sink.asSlice()[0].suggestions.len);
+    var guard_fixes: [1]SuggestedFix = .{sink.asSlice()[0].suggestions[0]};
+    const patched_guard = try TransactionalPatcher.apply(
+        std.testing.allocator,
+        guarded_if_let_src,
+        FileId.fromInt(3),
+        &guard_fixes,
+        &interner,
+    );
+    defer std.testing.allocator.free(patched_guard.patched_source);
+    try std.testing.expectEqualStrings(
+        "fn check_guard(opt: i32?) -> i32 { if opt is .Some(val) and val > 0 { return val; } return 0; }",
+        patched_guard.patched_source,
+    );
+
+    // Struct literals inside call args, index brackets, closures, and walrus RHS inside `if` condition headers parse cleanly:
+    const nested_cond_struct_src =
+        \\fn check_nested_cond(arr: &[i32]) -> i32 {
+        \\    if accept_pt(Point { x: 1, y: 2 }) and (got := (|| Point { x: 3, y: 4 })().x) > arr[idx_of(Point { x: 0, y: 0 })] {
+        \\        return got;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    sink.diagnostics.clearRetainingCapacity();
+    sink.error_count = 0;
+    _ = try corex.parseSource(nested_cond_struct_src, FileId.fromInt(4), &token_buf, &cst_arena, &ast_arena, &sink, &interner);
+    try std.testing.expectEqual(@as(u32, 0), sink.error_count);
+    try expectValidCstAndAstInvariants(nested_cond_struct_src, &token_buf, &cst_arena, &ast_arena);
+}
+
+test "test_parser_deep_postfix_dot_and_bracket_chains_are_bounded_without_recursion" {
+    const dot_chain_len: usize = 300;
+    const bracket_chain_len: usize = 300;
+
+    var src_buf: std.ArrayList(u8) = .empty;
+    defer src_buf.deinit(std.testing.allocator);
+    try src_buf.appendSlice(std.testing.allocator, "fn deep_postfix_chains() -> i32 {\n    let dot_val = pkg");
+    var i: usize = 0;
+    while (i < dot_chain_len) : (i += 1) {
+        try src_buf.appendSlice(std.testing.allocator, ".sub");
+    }
+    try src_buf.appendSlice(std.testing.allocator, ".Leaf[i32](1);\n    return Base");
+    i = 0;
+    while (i < bracket_chain_len) : (i += 1) {
+        try src_buf.appendSlice(std.testing.allocator, "[i32]");
+    }
+    try src_buf.appendSlice(std.testing.allocator, "(dot_val);\n}\n");
+
+    var token_buf = TokenBuffer.init(std.testing.allocator);
+    defer token_buf.deinit();
+    var cst_arena = LosslessCstArena.init(std.testing.allocator);
+    defer cst_arena.deinit();
+    var ast_arena = AstArena.init(std.testing.allocator);
+    defer ast_arena.deinit();
+    var sink = DiagnosticSink.init(std.testing.allocator);
+    defer sink.deinit();
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    _ = try corex.parseSource(src_buf.items, FileId.fromInt(0), &token_buf, &cst_arena, &ast_arena, &sink, &interner);
+    try std.testing.expectEqual(@as(u32, 0), sink.error_count);
+    try expectValidCstAndAstInvariants(src_buf.items, &token_buf, &cst_arena, &ast_arena);
+
+    // Exceeding `MAX_PARSE_DEPTH` (`512`) emits `E0203` once and recovers losslessly without recursion:
+    src_buf.clearRetainingCapacity();
+    try src_buf.appendSlice(std.testing.allocator, "fn overflow_dot_chain() -> i32 {\n    return pkg");
+    i = 0;
+    while (i < 1024) : (i += 1) {
+        try src_buf.appendSlice(std.testing.allocator, ".sub");
+    }
+    try src_buf.appendSlice(std.testing.allocator, ";\n}\n");
+    sink.diagnostics.clearRetainingCapacity();
+    sink.error_count = 0;
+    _ = try corex.parseSource(src_buf.items, FileId.fromInt(1), &token_buf, &cst_arena, &ast_arena, &sink, &interner);
+    try std.testing.expectEqual(@as(u32, 1), sink.error_count);
+    try std.testing.expectEqual(DiagnosticCode.e0203_parse_depth_exceeded, sink.asSlice()[0].code);
+    try expectValidCstAndAstInvariants(src_buf.items, &token_buf, &cst_arena, &ast_arena);
 }

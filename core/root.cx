@@ -2,11 +2,10 @@
 //!
 //! Exposes foundational freestanding primitives, alignment and layout queries, lock-free atomics,
 //! portable explicit SIMD vectors, deterministic trap/panic handlers, hot-reload runtime seams,
-//! and platform syscall descriptors for Stage-1 CoreX programs.
+//! and platform syscall descriptors (re-exported publicly via `cx.*`).
 //!
 //! All modules inside `core` are strictly typed, heap-allocation-free (`@no_alloc` compatible),
 //! and verified across `MirVm`, Tier A (`-ofmt=c`), and Tier B (`LLVM`).
-
 /// Scalar integer bounds and branch-clean min/max/clamp helpers.
 pub mod primitives;
 

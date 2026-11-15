@@ -114,6 +114,8 @@ pub const FmtFlagId = enum(u8) {
     check = 0,
     /// `--fix` – apply canonical identifier casing and missing `;` autofixes (`1`).
     fix = 1,
+    /// `--internal-core` – permit direct `core.*` kernel imports without `E0218` (`2`).
+    internal_core = 2,
 };
 
 /// Static metadata entry in `FMT_FLAGS` describing `corex fmt` flags.
@@ -121,6 +123,22 @@ pub const FmtFlagDescriptor = struct {
     /// Strongly typed `corex fmt` flag enum tag.
     id: FmtFlagId,
     /// Canonical long flag token (e.g., `"--check"`).
+    long_flag: []const u8,
+    /// Concise one-line summary.
+    summary: []const u8,
+};
+
+/// Subcommand-specific CLI option identifiers for `corex upgrade` (`UPGRADE_FLAGS`).
+pub const UpgradeFlagId = enum(u8) {
+    /// `--internal-core` – permit direct `core.*` kernel imports without `E0218` (`0`).
+    internal_core = 0,
+};
+
+/// Static metadata entry in `UPGRADE_FLAGS` describing `corex upgrade` flags.
+pub const UpgradeFlagDescriptor = struct {
+    /// Strongly typed `corex upgrade` flag enum tag.
+    id: UpgradeFlagId,
+    /// Canonical long flag token (e.g., `"--internal-core"`).
     long_flag: []const u8,
     /// Concise one-line summary.
     summary: []const u8,
@@ -155,16 +173,18 @@ pub const CompileFlagId = enum(u8) {
     emit_llvm = 4,
     /// `--fuzz` – instrument output with `SanitizerCoverage` edge counters (`5`).
     fuzz = 5,
-    /// `--ofmt=<c|llvm>` – select Tier A (`c`) or Tier B (`llvm`) codegen backend (`6`).
-    ofmt = 6,
-    /// `--output=<path>` – write compiled artifact to `<path>` (`7`).
-    output = 7,
-    /// `--release` – compile in production release mode (`8`).
-    release = 8,
-    /// `--sast-strict` – emit `W0314` warnings on unproven bounds checks (`9`).
-    sast_strict = 9,
-    /// `--target=<triple>` – select cross-compilation target triple (`10`).
-    target = 10,
+    /// `--internal-core` – permit direct `core.*` kernel imports without `E0218` (`6`).
+    internal_core = 6,
+    /// `--ofmt=<c|llvm>` – select Tier A (`c`) or Tier B (`llvm`) codegen backend (`7`).
+    ofmt = 7,
+    /// `--output=<path>` – write compiled artifact to `<path>` (`8`).
+    output = 8,
+    /// `--release` – compile in production release mode (`9`).
+    release = 9,
+    /// `--sast-strict` – emit `W0314` warnings on unproven bounds checks (`10`).
+    sast_strict = 10,
+    /// `--target=<triple>` – select cross-compilation target triple (`11`).
+    target = 11,
 };
 
 /// Static metadata entry in `COMPILE_FLAGS` describing `build`/`run`/`check`/`test` flags.
@@ -213,6 +233,8 @@ pub const CommandAction = union(enum) {
         is_emit_llvm: bool = false,
         /// Whether `--fuzz` `SanitizerCoverage` instrumentation was requested.
         is_fuzz_enabled: bool = false,
+        /// Whether `--internal-core` was passed to permit direct `core.*` kernel imports.
+        is_internal_core: bool = false,
         /// Selected codegen backend family (`llvm` by default, or `c` with `-ofmt=c`).
         output_format: OutputFormat = .llvm,
         /// Optional explicit output artifact path (`-o <path>` / `--output=<path>`).
@@ -248,6 +270,8 @@ pub const ParsedCommand = struct {
     is_emit_llvm: bool = false,
     /// Whether `--fuzz` was passed on a compile subcommand.
     is_fuzz_enabled: bool = false,
+    /// Whether `--internal-core` was passed on a compile/check subcommand.
+    is_internal_core: bool = false,
     /// Selected codegen backend family (`llvm` by default).
     output_format: OutputFormat = .llvm,
     /// Optional explicit output path (`-o` / `--output`).
@@ -344,7 +368,7 @@ pub const GLOBAL_FLAGS = [_]GlobalFlagDescriptor{
     },
 };
 
-/// Canonical `corex fmt` option table (`DR-14` Section 1.5).
+/// Canonical `corex fmt` option table (`DR-14` Section 1.5 & `DR-21` `ADR-21B`).
 pub const FMT_FLAGS = [_]FmtFlagDescriptor{
     .{
         .id = .check,
@@ -355,6 +379,20 @@ pub const FMT_FLAGS = [_]FmtFlagDescriptor{
         .id = .fix,
         .long_flag = "--fix",
         .summary = "Apply canonical identifier casing and missing semicolon autofixes",
+    },
+    .{
+        .id = .internal_core,
+        .long_flag = "--internal-core",
+        .summary = "Permit direct `core.*` kernel imports without `E0218`",
+    },
+};
+
+/// Canonical `corex upgrade` option table (`DR-21` `ADR-21B`).
+pub const UPGRADE_FLAGS = [_]UpgradeFlagDescriptor{
+    .{
+        .id = .internal_core,
+        .long_flag = "--internal-core",
+        .summary = "Permit direct `core.*` kernel imports without `E0218`",
     },
 };
 
@@ -398,6 +436,12 @@ pub const COMPILE_FLAGS = [_]CompileFlagDescriptor{
         .long_flag = "--fuzz",
         .value_suffix = null,
         .summary = "Instrument compiled output with SanitizerCoverage counters",
+    },
+    .{
+        .id = .internal_core,
+        .long_flag = "--internal-core",
+        .value_suffix = null,
+        .summary = "Permit direct `core.*` kernel imports without `E0218`",
     },
     .{
         .id = .ofmt,
@@ -444,6 +488,22 @@ const HUB_MODULE_BASENAME_SET = std.StaticStringMap(void).initComptime(.{
 var next_run_scratch_seq = std.atomic.Value(u32).init(1);
 
 // -------------------------------------- INTERNALS --------------------------------------
+
+/// Resolves `arg_text` dynamically against `FMT_FLAGS` without hardcoded string drift.
+fn matchFmtFlag(arg_text: []const u8) ?FmtFlagId {
+    inline for (FMT_FLAGS) |fmt_desc| {
+        if (std.mem.eql(u8, arg_text, fmt_desc.long_flag)) return fmt_desc.id;
+    }
+    return null;
+}
+
+/// Resolves `arg_text` dynamically against `UPGRADE_FLAGS` without hardcoded string drift.
+fn matchUpgradeFlag(arg_text: []const u8) ?UpgradeFlagId {
+    inline for (UPGRADE_FLAGS) |upg_desc| {
+        if (std.mem.eql(u8, arg_text, upg_desc.long_flag)) return upg_desc.id;
+    }
+    return null;
+}
 
 /// Extracts a strictly positive ASCII decimal step count (`> 0`), rejecting empty, signed, or zero values.
 fn extractPositiveStepLimit(raw_val: []const u8) ?u64 {
@@ -613,7 +673,9 @@ fn discoverExternalSubmodulesRecursive(
 
     _ = source_map.getLineIndex(parent_fid) catch {};
     const parent_src = source_map.getFileSource(parent_fid) orelse "";
-    if (!has_core_mention_out.* and std.mem.indexOf(u8, parent_src, "core") != null) {
+    if (!has_core_mention_out.* and
+        (std.mem.indexOf(u8, parent_src, "cx") != null or std.mem.indexOf(u8, parent_src, "core") != null))
+    {
         has_core_mention_out.* = true;
     }
     _ = try db.setInput(parent_fid, parent_src, durability);
@@ -725,6 +787,7 @@ fn registerWorkspaceCoreModuleIfNeeded(
         0,
     );
     try db.registerRootModule("core", core_fid);
+    try db.registerRootModule("cx", core_fid);
 }
 
 /// Returns `true` if `file_id` declares a top-level `fn main` entrypoint.
@@ -930,6 +993,14 @@ pub fn suggestFlagForSubcommand(unknown_flag: []const u8, subcommand: ?Subcomman
                 best_match = fmt_desc.long_flag;
             }
         }
+    } else if (subcommand == .upgrade) {
+        for (UPGRADE_FLAGS) |upg_desc| {
+            const upg_dist = computeLevenshteinDistance(flag_name, upg_desc.long_flag);
+            if (upg_dist < best_distance) {
+                best_distance = upg_dist;
+                best_match = upg_desc.long_flag;
+            }
+        }
     } else if (subcommand) |sub_id| {
         if (isCompileSubcommand(sub_id)) {
             for (COMPILE_FLAGS) |comp_desc| {
@@ -959,6 +1030,7 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
     var is_emit_c = false;
     var is_emit_llvm = false;
     var is_fuzz_enabled = false;
+    var is_internal_core = false;
     var output_format: OutputFormat = .llvm;
     var output_path: ?[]const u8 = null;
     var target_spec: ?codegen_abi.TargetSpec = null;
@@ -982,10 +1054,16 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                 has_help_flag = true;
             } else if (std.mem.eql(u8, arg_text, "-V") or std.mem.eql(u8, arg_text, "--version")) {
                 has_version_flag = true;
-            } else if (selected_subcommand == .fmt and std.mem.eql(u8, arg_text, "--check")) {
-                is_check_only = true;
-            } else if (selected_subcommand == .fmt and std.mem.eql(u8, arg_text, "--fix")) {
-                is_fix_mode = true;
+            } else if (selected_subcommand == .fmt and matchFmtFlag(arg_text) != null) {
+                switch (matchFmtFlag(arg_text).?) {
+                    .check => is_check_only = true,
+                    .fix => is_fix_mode = true,
+                    .internal_core => is_internal_core = true,
+                }
+            } else if (selected_subcommand == .upgrade and matchUpgradeFlag(arg_text) != null) {
+                switch (matchUpgradeFlag(arg_text).?) {
+                    .internal_core => is_internal_core = true,
+                }
             } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--dev")) {
                 if (has_seen_release) {
                     try emitConflictingOptFlagsDiagnostic(sink);
@@ -1014,6 +1092,10 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                 output_format = .llvm;
             } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--fuzz")) {
                 is_fuzz_enabled = true;
+            } else if (is_compile_sub and
+                std.mem.eql(u8, arg_text, COMPILE_FLAGS[@backingInt(CompileFlagId.internal_core)].long_flag))
+            {
+                is_internal_core = true;
             } else if (is_compile_sub and (std.mem.startsWith(u8, arg_text, "--ofmt=") or
                 std.mem.startsWith(u8, arg_text, "-ofmt=")))
             {
@@ -1183,6 +1265,7 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
             .is_emit_c = is_emit_c,
             .is_emit_llvm = is_emit_llvm,
             .is_fuzz_enabled = is_fuzz_enabled,
+            .is_internal_core = is_internal_core,
             .output_format = output_format,
             .output_path = output_path,
             .target_spec = target_spec,
@@ -1202,6 +1285,7 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                     .is_emit_c = is_emit_c,
                     .is_emit_llvm = is_emit_llvm,
                     .is_fuzz_enabled = is_fuzz_enabled,
+                    .is_internal_core = is_internal_core,
                     .output_format = output_format,
                     .output_path = output_path,
                     .target_spec = target_spec,
@@ -1329,12 +1413,31 @@ pub fn renderSubcommandHelp(
             const formatted_flag = flag_writer.buffered();
             try writer.writeAll("  ");
             try style_config.writeStyled(writer, .bold, formatted_flag);
-            if (formatted_flag.len < 20) {
-                try writer.splatByteAll(' ', 20 - formatted_flag.len);
+            if (formatted_flag.len < 22) {
+                try writer.splatByteAll(' ', 22 - formatted_flag.len);
             } else {
                 try writer.writeByte(' ');
             }
             try writer.writeAll(fmt_desc.summary);
+            try writer.writeByte('\n');
+        }
+        try writer.writeByte('\n');
+    } else if (subcommand == .upgrade) {
+        try style_config.writeStyled(writer, .bold, "Upgrade Options:");
+        try writer.writeByte('\n');
+        for (UPGRADE_FLAGS) |upg_desc| {
+            var flag_buf: [64]u8 = undefined;
+            var flag_writer = std.Io.Writer.fixed(&flag_buf);
+            flag_writer.print("    {s}", .{upg_desc.long_flag}) catch unreachable;
+            const formatted_flag = flag_writer.buffered();
+            try writer.writeAll("  ");
+            try style_config.writeStyled(writer, .bold, formatted_flag);
+            if (formatted_flag.len < 22) {
+                try writer.splatByteAll(' ', 22 - formatted_flag.len);
+            } else {
+                try writer.writeByte(' ');
+            }
+            try writer.writeAll(upg_desc.summary);
             try writer.writeByte('\n');
         }
         try writer.writeByte('\n');
@@ -1547,7 +1650,9 @@ pub fn runCli(
                 expanded_paths.deinit(allocator);
             }
             for (input_positional) |raw_arg| {
-                const allow_dir = exec_info.subcommand == .check or exec_info.subcommand == .@"test";
+                const allow_dir = exec_info.subcommand == .check or
+                    exec_info.subcommand == .@"test" or
+                    exec_info.subcommand == .upgrade;
                 if (!allow_dir or !(try collectDirectoryCxPaths(allocator, io, raw_arg, &expanded_paths))) {
                     const duped_arg = try allocator.dupe(u8, raw_arg);
                     errdefer allocator.free(duped_arg);
@@ -1588,10 +1693,15 @@ pub fn runCli(
                 return 1;
             }
 
-            if (isCompileSubcommand(exec_info.subcommand) and cx_file_ids.items.len > 0) {
+            if ((isCompileSubcommand(exec_info.subcommand) or exec_info.subcommand == .upgrade) and
+                cx_file_ids.items.len > 0)
+            {
                 var db = try query_db.CompilerDb.init(allocator);
                 defer db.deinit();
                 db.setSastStrict(exec_info.is_sast_strict);
+                if (exec_info.is_internal_core) {
+                    try db.setInternalCore(true);
+                }
                 db.setComptimeStepLimit(exec_info.comptime_step_limit);
                 db.setEmbedSandbox(embed_sandbox_root, null);
                 db.setEmbedIo(io);
@@ -1865,36 +1975,55 @@ comptime {
     for (GLOBAL_FLAGS, 0..) |flag_desc, i| {
         std.debug.assert(@backingInt(flag_desc.id) == i);
     }
+    std.debug.assert(FMT_FLAGS.len == 3);
     for (FMT_FLAGS, 0..) |fmt_desc, i| {
         std.debug.assert(@backingInt(fmt_desc.id) == i);
     }
+    std.debug.assert(UPGRADE_FLAGS.len == 1);
+    for (UPGRADE_FLAGS, 0..) |upg_desc, i| {
+        std.debug.assert(@backingInt(upg_desc.id) == i);
+    }
+    std.debug.assert(COMPILE_FLAGS.len == 12);
     for (COMPILE_FLAGS, 0..) |comp_desc, i| {
         std.debug.assert(@backingInt(comp_desc.id) == i);
     }
 }
 
 test "test_cli_router_subcommands_flags_and_typo_suggestions" {
+    try std.testing.expectEqual(@as(usize, 12), COMPILE_FLAGS.len);
     try std.testing.expectEqualStrings("build", suggestSubcommand("biuld").?);
     try std.testing.expectEqualStrings("check", suggestSubcommand("chck").?);
     try std.testing.expectEqualStrings("--help", suggestGlobalFlag("--hlp").?);
     try std.testing.expectEqualStrings("--version", suggestGlobalFlag("--verison").?);
+    try std.testing.expectEqualStrings("--internal-core", suggestFlagForSubcommand("--internal-cor", .build).?);
 
     var sink = DiagnosticSink.init(std.testing.allocator);
     defer sink.deinit();
     const parsed = try parseArgs(&.{ "--color=never", "check", "main.cx" }, &sink);
     try std.testing.expect(!sink.hasErrors());
     try std.testing.expectEqual(ColorMode.never, parsed.color_mode);
+    try std.testing.expect(!parsed.is_internal_core);
     try std.testing.expectEqual(SubcommandId.check, parsed.action.execute_subcommand.subcommand);
     try std.testing.expectEqual(@as(usize, 1), parsed.action.execute_subcommand.positional_args.len);
 
-    // `--check` and `--fix` are valid on `fmt`, and typo suggestions include `FMT_FLAGS`:
+    const parsed_core = try parseArgs(&.{ "check", "--internal-core", "core/root.cx" }, &sink);
+    try std.testing.expect(!sink.hasErrors());
+    try std.testing.expect(parsed_core.is_internal_core);
+    try std.testing.expect(parsed_core.action.execute_subcommand.is_internal_core);
+
+    // `--check`, `--fix`, and `--internal-core` are valid on `fmt`/`upgrade`, driven by `FMT_FLAGS` & `UPGRADE_FLAGS`:
+    try std.testing.expectEqual(@as(usize, 3), FMT_FLAGS.len);
+    try std.testing.expectEqual(@as(usize, 1), UPGRADE_FLAGS.len);
     try std.testing.expectEqualStrings("--check", suggestFlagForSubcommand("--chck", .fmt).?);
     try std.testing.expectEqualStrings("--fix", suggestFlagForSubcommand("--fx", .fmt).?);
+    try std.testing.expectEqualStrings("--internal-core", suggestFlagForSubcommand("--internal-cor", .fmt).?);
+    try std.testing.expectEqualStrings("--internal-core", suggestFlagForSubcommand("--internal-cor", .upgrade).?);
 
-    const parsed_fmt = try parseArgs(&.{ "fmt", "--check", "--fix" }, &sink);
+    const parsed_fmt = try parseArgs(&.{ "fmt", "--check", "--fix", "--internal-core" }, &sink);
     try std.testing.expect(!sink.hasErrors());
     try std.testing.expect(parsed_fmt.is_check_only);
     try std.testing.expect(parsed_fmt.is_fix_mode);
+    try std.testing.expect(parsed_fmt.is_internal_core);
 
     // Passing `--check` to a non-`fmt` subcommand emits `E0001`:
     var err_sink = DiagnosticSink.init(std.testing.allocator);

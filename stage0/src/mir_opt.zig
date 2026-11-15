@@ -2186,6 +2186,24 @@ fn runPassD2ReachableConstFold(
                                 has_changed = true;
                             },
                             .trap_overflow => |msg| {
+                                if (inst.flags.is_dollar_sub) {
+                                    const will_run_sast = (config.is_sast_enabled and !body.is_sast_elaborated) or
+                                        config.sast_sink != null or config.sast_config != null;
+                                    if (!will_run_sast) {
+                                        const tok = body.origin_tokens.items[raw];
+                                        const span = resolveOptDiagSpan(body.file_id, tok, .none, sym_table, config);
+                                        try emitOptDiagnostic(
+                                            sink,
+                                            .e0307_static_buffer_overflow,
+                                            .err,
+                                            span,
+                                            "compile-time `$` end-offset underflows sequence length",
+                                            "out-of-bounds `$` offset here",
+                                        );
+                                    }
+                                    has_emitted_trap[raw] = true;
+                                    continue;
+                                }
                                 const tok = body.origin_tokens.items[raw];
                                 const span = resolveOptDiagSpan(body.file_id, tok, .none, sym_table, config);
                                 try emitOptDiagnostic(
@@ -2233,6 +2251,24 @@ fn runPassD2ReachableConstFold(
                                 has_changed = true;
                             },
                             .trap_overflow => |msg| {
+                                if (inst.flags.is_dollar_sub) {
+                                    const will_run_sast = (config.is_sast_enabled and !body.is_sast_elaborated) or
+                                        config.sast_sink != null or config.sast_config != null;
+                                    if (!will_run_sast) {
+                                        const tok = body.origin_tokens.items[raw];
+                                        const span = resolveOptDiagSpan(body.file_id, tok, .none, sym_table, config);
+                                        try emitOptDiagnostic(
+                                            sink,
+                                            .e0307_static_buffer_overflow,
+                                            .err,
+                                            span,
+                                            "compile-time `$` end-offset underflows sequence length",
+                                            "out-of-bounds `$` offset here",
+                                        );
+                                    }
+                                    has_emitted_trap[raw] = true;
+                                    continue;
+                                }
                                 const tok = body.origin_tokens.items[raw];
                                 const span = resolveOptDiagSpan(body.file_id, tok, .none, sym_table, config);
                                 try emitOptDiagnostic(
@@ -2528,7 +2564,10 @@ fn inferPlaceTypeInBody(
         const node = pool.getNode(cur_ty);
         switch (proj.kind) {
             .deref => cur_ty = pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs)),
-            .index => cur_ty = pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs)),
+            .index => cur_ty = if (cur_ty == .str_ty)
+                .u8_ty
+            else
+                pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs)),
             .slice_len => cur_ty = .usize_ty,
             .field => {
                 if (node.tag == .tuple_ty) {
@@ -2783,7 +2822,7 @@ fn substituteMirType(
                 new_modes[i] = sig_view.getParamMode(i);
             }
             const new_ret = try substituteMirType(allocator, pool, sig_view.ret_ty, subst, depth + 1);
-            return pool.internFnWithContractsAndCapture(
+            return pool.internFnSignatureFull(
                 node.tag,
                 new_params,
                 new_modes,
@@ -2791,6 +2830,7 @@ fn substituteMirType(
                 node.flags.is_must_use,
                 sig_view.contracts,
                 sig_view.capture_tier,
+                sig_view.has_linear_capture,
             );
         },
         else => return ty,
@@ -3107,7 +3147,10 @@ fn computeFieldOffsetsAndCalleesDigest(
                     const elem_ty = if (active_soa_field_ty) |soa_f| blk: {
                         active_soa_field_ty = null;
                         break :blk soa_f;
-                    } else pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+                    } else if (cur_ty == .str_ty)
+                        .u8_ty
+                    else
+                        pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
                     const elem_shape = computeLayoutShapeKey(pool, sym_table, elem_ty, target_layout);
                     hasher.update(std.mem.asBytes(&elem_shape));
                     hasher.update(&[_]u8{@backingInt(classifyOpSemantics(pool, elem_ty, target_layout))});
@@ -3368,6 +3411,16 @@ fn promoteContextlessTarjanScc(
 
                 var is_promotable = true;
                 for (scc_members.items) |m_idx| {
+                    for (ctx.b_slice[m_idx].block_insts.items) |inst_val| {
+                        const inst = ctx.b_slice[m_idx].getInst(inst_val);
+                        if (inst.op == .intrinsic_op and
+                            @as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)).isContextIntrinsic())
+                        {
+                            is_promotable = false;
+                            break;
+                        }
+                    }
+                    if (!is_promotable) break;
                     for (ctx.b_slice[m_idx].blocks.items) |bb| {
                         if (bb.terminator.kind != .call) continue;
                         const cs = ctx.b_slice[m_idx].calls.items[bb.terminator.cond_or_val];
@@ -5899,7 +5952,10 @@ fn computeSinglePlaceByteDigest(
                 const elem_ty = if (active_soa_field_ty) |soa_f| blk: {
                     active_soa_field_ty = null;
                     break :blk soa_f;
-                } else pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+                } else if (cur_ty == .str_ty)
+                    .u8_ty
+                else
+                    pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
                 const elem_shape = computeLayoutShapeKey(pool, sym_table, elem_ty, target_layout);
                 place_hasher.update(std.mem.asBytes(&elem_shape));
                 place_hasher.update(&[_]u8{@backingInt(classifyOpSemantics(pool, elem_ty, target_layout))});
@@ -6024,11 +6080,17 @@ fn isPlaceStructurallyEqual(
                 cur_ty_a = if (soa_field_a) |sf_a| blk: {
                     soa_field_a = null;
                     break :blk sf_a;
-                } else pool.unwrapUnderlyingType(TypeId.fromInt(node_a.lhs));
+                } else if (cur_ty_a == .str_ty)
+                    .u8_ty
+                else
+                    pool.unwrapUnderlyingType(TypeId.fromInt(node_a.lhs));
                 cur_ty_b = if (soa_field_b) |sf_b| blk: {
                     soa_field_b = null;
                     break :blk sf_b;
-                } else pool.unwrapUnderlyingType(TypeId.fromInt(node_b.lhs));
+                } else if (cur_ty_b == .str_ty)
+                    .u8_ty
+                else
+                    pool.unwrapUnderlyingType(TypeId.fromInt(node_b.lhs));
                 if (!computeLayoutShapeKey(pool, sym_table, cur_ty_a, target_layout).isEqual(
                     computeLayoutShapeKey(pool, sym_table, cur_ty_b, target_layout),
                 ) or classifyOpSemantics(pool, cur_ty_a, target_layout) !=

@@ -74,9 +74,9 @@ cst[071] ident_pat size=2 tok=46..46
 cst[072] token_leaf size=1 tok=46..46
 cst[073] token_leaf size=1 tok=47..47
 cst[074] infix_expr size=10 tok=48..54
-cst[075] ident_pat size=1 tok=48..48
-cst[076] token_leaf size=1 tok=49..49
-cst[077] infix_expr size=7 tok=50..54
+cst[075] infix_expr size=7 tok=48..52
+cst[076] ident_pat size=1 tok=48..48
+cst[077] token_leaf size=1 tok=49..49
 cst[078] call_expr size=4 tok=50..52
 cst[079] ident_pat size=1 tok=50..50
 cst[080] token_leaf size=1 tok=51..51
@@ -129,7 +129,7 @@ cst[126] token_leaf size=1 tok=85..85
 cst[127] token_leaf size=1 tok=86..86
 cst[128] token_leaf size=1 tok=87..87
 cst[129] token_leaf size=1 tok=88..88
-=== AST (38 nodes) ===
+=== AST (40 nodes) ===
 ast[00] root cst=0 main_tok=0
 ast[01] named_type cst=15 main_tok=10
 ast[02] struct_decl cst=1 main_tok=1
@@ -144,12 +144,12 @@ ast[10] return_stmt cst=63 main_tok=40
 ast[11] block cst=61 main_tok=39
 ast[12] local_var_decl cst=48 main_tok=30
 ast[13] bind_pat cst=71 main_tok=46
-ast[14] ident_expr cst=75 main_tok=48
+ast[14] ident_expr cst=76 main_tok=48
 ast[15] ident_expr cst=79 main_tok=50
 ast[16] call_expr cst=78 main_tok=51
-ast[17] int_lit cst=83 main_tok=54
-ast[18] binary_expr cst=77 main_tok=53
-ast[19] pipe_expr cst=74 main_tok=49
+ast[17] pipe_expr cst=75 main_tok=49
+ast[18] int_lit cst=83 main_tok=54
+ast[19] binary_expr cst=74 main_tok=53
 ast[20] local_var_decl cst=69 main_tok=45
 ast[21] bind_pat cst=87 main_tok=57
 ast[22] ident_expr cst=92 main_tok=60
@@ -161,10 +161,12 @@ ast[27] match_expr cst=90 main_tok=59
 ast[28] local_var_decl cst=85 main_tok=56
 ast[29] ident_expr cst=108 main_tok=72
 ast[30] int_lit cst=113 main_tok=76
-ast[31] ident_expr cst=119 main_tok=79
-ast[32] ident_expr cst=124 main_tok=83
-ast[33] call_expr cst=118 main_tok=80
-ast[34] block cst=115 main_tok=78
-ast[35] call_expr cst=106 main_tok=73
-ast[36] block cst=46 main_tok=29
-ast[37] fn_decl cst=19 main_tok=14
+ast[31] named_arg cst=110 main_tok=74
+ast[32] ident_expr cst=119 main_tok=79
+ast[33] ident_expr cst=124 main_tok=83
+ast[34] named_arg cst=121 main_tok=81
+ast[35] call_expr cst=118 main_tok=80
+ast[36] block cst=115 main_tok=78
+ast[37] call_expr cst=106 main_tok=73
+ast[38] block cst=46 main_tok=29
+ast[39] fn_decl cst=19 main_tok=14

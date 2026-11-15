@@ -338,7 +338,7 @@ pub const NicheEncoding = enum(u8) {
 
 /// 24-byte binary-exact niche descriptor (`@sizeOf == 24`, `@alignOf == 8`).
 pub const NicheSpec = extern struct {
-    /// Byte offset of the niche-bearing scalar or pointer within the enclosing type (`0..u32::MAX`).
+    /// Byte offset of the niche-bearing scalar or pointer within the enclosing type (`0..u32.MAX`).
     byte_offset: u32 = 0,
     /// Width of the niche-bearing scalar in bytes (`1`, `2`, `4`, or `8`; `0` when `.none`).
     scalar_bytes: u8 = 0,
@@ -1805,7 +1805,7 @@ pub const AbiClassifier = struct {
                 .is_nocapture = true,
             };
             recipe.context_recipe = .{
-                .lowered_size_bytes = 32,
+                .lowered_size_bytes = type_system.ContextFieldLayout.BYTE_SIZE_64,
                 .pointee_align_bytes = 8,
                 .pass_mode = .indirect_by_ref,
                 .bank_0 = .gpr,
@@ -2269,8 +2269,8 @@ pub const AbiClassifier = struct {
                 .is_nocapture = true,
             };
             recipe.context_recipe = .{
-                .lowered_size_bytes = 16,
-                .pointee_align_bytes = 4,
+                .lowered_size_bytes = type_system.ContextFieldLayout.BYTE_SIZE_64,
+                .pointee_align_bytes = 8,
                 .pass_mode = .indirect_by_ref,
                 .bank_0 = .gpr,
                 .attr_bits = @bitCast(ctx_attrs),

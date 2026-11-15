@@ -33,8 +33,8 @@ const QUERY_DB_FUZZ_ITERATIONS: usize = 300;
 
 /// Syntactic item and statement building blocks for Phase 3 formatter fuzzing.
 const FMT_SEED_ITEMS = [_][]const u8{
-    "use std::io::{Write, self, Read, BufReader as Br};\n",
-    "use core::mem::{size_of, align_of,};\n",
+    "use cx.io.{Write, self, Read, BufReader as Br};\n",
+    "use cx.mem.{size_of, align_of,};\n",
     "const MAX_LIMIT: usize = 0x1000;\n",
     "const MIN_LIMIT: usize = 16;\n",
     "pub type Port = u16;\n",
@@ -43,14 +43,17 @@ const FMT_SEED_ITEMS = [_][]const u8{
     "pub trait Measurable { fn measure(&self) -> i32; }\n",
     "unsafe impl Send for Point[i32] {}\n",
     "impl Point[i32] { pub subscript at_idx(idx: usize) -> i32 { return 0; } }\n",
+    "pub fn scale_val(val: i32) -> i32 = val * 2;\n",
     "pub fn compute_pipeline(val: i32, flag: bool) -> i32 {\n" ++
         "    ;\n" ++
         "    let neg = - -val;\n" ++
         "    let inv = !flag;\n" ++
         "    let grid = [ 1, 20, 300, 4, 50, 600, 7, 80, 900, 10 ];\n" ++
+        "    let tail = grid[..$-2];\n" ++
         "    let piped = val |> step_one() |> step_two();\n" ++
-        "    let chained = grid.iter().count_all();\n" ++
-        "    if (piped > 0) { while (neg < 10) { break; }; };\n" ++
+        "    let chained = tail.iter().count_all();\n" ++
+        "    if (rem := piped) > 0 { while (neg < rem) { break; }; };\n" ++
+        "    with context.allocator = &mut scratch { let _ = opt_v orelse 0; }\n" ++
         "    return match (piped) { 0 => chained, _ => neg, };\n" ++
         "}\n",
     "// corex fmt: off\nconst   RAW_UNTOUCHED:   i32  =   777;\n// corex fmt: on\n",

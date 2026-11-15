@@ -1,5 +1,5 @@
-use std::io::{self, BufReader as Br, Read, Write};
-use core::mem;
+use cx.io.{self, BufReader as Br, Read, Write};
+use cx.mem;
 
 const MIN_PORT: u16 = 80;
 const MAX_PORT: u16 = 65535;

@@ -1,4 +1,4 @@
-//! Cross-Platform Syscall Descriptors and Safe Stream I/O (`core::sys`)
+//! Cross-Platform Syscall Descriptors and Safe Stream I/O (`core.sys`)
 //!
 //! Re-exports platform-specific syscall descriptor submodules (`linux`, `macos`, `windows`, `wasi`)
 //! and provides safe, allocation-free standard-stream write and process-termination helpers backed
@@ -6,7 +6,6 @@
 //!
 //! All `write_*` and `exit_process` helpers preserve byte-exact parity across `MirVm`, Tier A
 //! (`-ofmt=c`), and Tier B (`LLVM`) on Windows, Linux, macOS, and `wasm32-wasi`.
-
 /// Linux (`x86_64` / `aarch64`) POSIX syscall prototypes and standard file descriptors.
 pub mod linux;
 

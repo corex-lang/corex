@@ -756,6 +756,338 @@ test "test_regression_128bit_float_casts_bitfields_c_union_and_closure_pass_mode
     var report = try expectFourTierParity(std.testing.allocator, std.testing.io, src);
     defer report.deinit(std.testing.allocator);
     try std.testing.expect(!report.outcomes[0].has_trapped);
-    // cast_ok = 13; bf_score = 9 + 55 + 3 = 67; union_ok = 19; closure_val = 5 + 6 + 7 + 4 = 22 -> 121.
+    // `cast_ok = 13`; `bf_score = 9 + 55 + 3 = 67`; `union_ok = 19`; `closure_val = 22` -> `121`:
     try std.testing.expectEqual(@as(i64, 121), report.outcomes[0].return_scalar_i64);
 }
+
+test "test_phase75_four_tier_parity_se01_to_se08_and_unreachable_dollar_traps" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // [1] Full 4-tier parity across `SE-01`–`SE-08` (`ConditionScope` pre-`else` `@drop_trace`, `orelse`,
+    // `$` indexing/slicing, nested `$` scopes, `at_pat` + `slice_pat`, named args + `|>`, `with context`):
+    const phase75_showcase_src =
+        \\pub struct DropItem {
+        \\    pub marker: i64,
+        \\}
+        \\impl DropItem {
+        \\    pub fn drop(&mut self) {
+        \\        @drop_trace(self.marker);
+        \\    }
+        \\}
+        \\
+        \\pub fn maybe_drop_item(is_some: bool, marker: i64) -> DropItem? {
+        \\    if is_some {
+        \\        return .Some(DropItem { marker: marker });
+        \\    }
+        \\    return .None;
+        \\}
+        \\
+        \\pub fn scale_and_offset(val_in: i32, factor: i32 = 2, delta: i32 = 3) -> i32 {
+        \\    return val_in * factor + delta;
+        \\}
+        \\
+        \\pub fn read_cancel_bonus() -> i32 {
+        \\    return context.cancel_token._handle as i32;
+        \\}
+        \\
+        \\pub fn match_slice_and_at(items: &[i32], opt_num: i32?) -> i32 {
+        \\    let slice_part: i32 = match items {
+        \\        [] => 0,
+        \\        [single_v] => single_v,
+        \\        [first_v, ..mid_sub, last_v] => first_v + (mid_sub.len as i32) * 10 + last_v,
+        \\    };
+        \\    let at_part: i32 = match opt_num {
+        \\        whole_opt @ .Some(inner_v) => if whole_opt is .Some(dup_v) { inner_v + dup_v } else { 0 },
+        \\        .None => 0,
+        \\    };
+        \\    return slice_part + at_part;
+        \\}
+        \\
+        \\pub fn main() -> i32 {
+        \\    let cond_score: i32 = if maybe_drop_item(true, 11) is .Some(item_a) and
+        \\        (item_b := DropItem { marker: 22 }).marker > 50
+        \\    {
+        \\        (item_a.marker as i32) + (item_b.marker as i32)
+        \\    } else if (fallback_n := 6) > 4 {
+        \\        @drop_trace(99);
+        \\        fallback_n
+        \\    } else {
+        \\        0
+        \\    };
+        \\
+        \\    var loop_sum: i32 = 0;
+        \\    var step_opt: i32? = .Some(3);
+        \\    while step_opt is .Some(cur_step) and (next_step := cur_step - 1) >= 0 {
+        \\        loop_sum = loop_sum + cur_step;
+        \\        step_opt = if next_step > 0 { .Some(next_step) } else { .None };
+        \\    }
+        \\
+        \\    let none_opt: i32? = .None;
+        \\    let some_opt: i32? = .Some(5);
+        \\    let orelse_score: i32 = (none_opt orelse 7) + (some_opt orelse 99);
+        \\
+        \\    let outer_nums: [i32; 6] = [2, 4, 6, 8, 10, 12];
+        \\    let inner_idx: [usize; 3] = [5, 3, 1];
+        \\    let nested_view: &[i32] = outer_nums[inner_idx[$ - 1]..$ - 1];
+        \\    let incl_view: &[i32] = outer_nums[0..=2];
+        \\    let mid_str: str = "corex"[1..$ - 1];
+        \\    let slice_score: i32 = nested_view[$ - 1] + incl_view[$ - 1] + (mid_str.len as i32);
+        \\
+        \\    let pat_score: i32 = match_slice_and_at(nested_view, .Some(4));
+        \\    let pipe_score: i32 = 5 |> scale_and_offset(delta: 4, factor: 3);
+        \\
+        \\    let outer_tok = CancelToken { _handle: 15 };
+        \\    let inner_tok = CancelToken { _handle: 20 };
+        \\    let outer_ctx: i32 = with context.cancel_token = outer_tok {
+        \\        let inner_ctx: i32 = with context.cancel_token = inner_tok {
+        \\            read_cancel_bonus()
+        \\        };
+        \\        inner_ctx + read_cancel_bonus()
+        \\    };
+        \\    let ctx_score: i32 = outer_ctx + read_cancel_bonus();
+        \\
+        \\    return cond_score + loop_sum + orelse_score + slice_score + pat_score + pipe_score + ctx_score;
+        \\}
+    ;
+
+    var ok_report = try expectFourTierParity(allocator, io, phase75_showcase_src);
+    defer ok_report.deinit(allocator);
+    try std.testing.expect(!ok_report.outcomes[0].has_trapped);
+    // Pre-`else` drop trace; `item_b` (`22`), `item_a` (`11`), then `else if` `@drop_trace(99)`:
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 22, 11, 99 }, ok_report.outcomes[0].drop_trace);
+    // `cond_score = 6`, `loop_sum = 6`, `orelse_score = 12`, `slice_score = 19`, `pat_score = 42`,
+    // `pipe_score = 19`, and `ctx_score = 35`, yielding `6 + 6 + 12 + 19 + 42 + 19 + 35 = 139`:
+    try std.testing.expectEqual(@as(i64, 139), ok_report.outcomes[0].return_scalar_i64);
+
+    // [2] Deliberate runtime `unreachable` (`MirTrapReason.unreachable_reached`) traps uniformly (`exit 101`):
+    const unreach_trap_src =
+        \\pub fn pick_branch(code: i32) -> i32 {
+        \\    if code == 0 {
+        \\        return 10;
+        \\    }
+        \\    unreachable;
+        \\}
+        \\pub fn main() -> i32 {
+        \\    return pick_branch(1);
+        \\}
+    ;
+    var unreach_report = try expectFourTierParity(allocator, io, unreach_trap_src);
+    defer unreach_report.deinit(allocator);
+    try std.testing.expect(unreach_report.outcomes[0].has_trapped);
+    try std.testing.expectEqual(@as(i32, 101), unreach_report.outcomes[0].exit_code);
+
+    // [3] Runtime `$ - back_step` underflow traps even in `--release` across all 4 tiers (`SE-04`, `exit 101`):
+    const dollar_trap_src =
+        \\pub fn pick_from_end(items: &[i32], back_step: usize) -> i32 {
+        \\    return items[$ - back_step];
+        \\}
+        \\pub fn main() -> i32 {
+        \\    let nums: [i32; 3] = [10, 20, 30];
+        \\    return pick_from_end(&nums, 5);
+        \\}
+    ;
+    var dollar_report = try expectFourTierParity(allocator, io, dollar_trap_src);
+    defer dollar_report.deinit(allocator);
+    try std.testing.expect(dollar_report.outcomes[0].has_trapped);
+    try std.testing.expectEqual(@as(i32, 101), dollar_report.outcomes[0].exit_code);
+}
+
+test "test_regression_four_tier_linear_complement_partial_variant_and_cond_drops" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const complement_drops_src =
+        \\@linear
+        \\pub struct LinearToken {
+        \\    pub id: i32,
+        \\}
+        \\
+        \\pub fn consume_linear(tok: sink LinearToken) -> i32 {
+        \\    let LinearToken { id } = tok;
+        \\    return id;
+        \\}
+        \\
+        \\pub struct DropGuard {
+        \\    pub tag: i64,
+        \\}
+        \\
+        \\impl DropGuard {
+        \\    pub fn drop(&mut self) {
+        \\        @drop_trace(self.tag);
+        \\    }
+        \\}
+        \\
+        \\pub enum Outcome {
+        \\    Ok(LinearToken),
+        \\    Msg(DropGuard),
+        \\    Code(usize),
+        \\}
+        \\
+        \\pub enum OpenRes {
+        \\    Ok(LinearToken),
+        \\    IoErr(DropGuard),
+        \\    PathErr(DropGuard),
+        \\}
+        \\
+        \\pub enum GuardPair {
+        \\    Both(DropGuard, DropGuard),
+        \\    Empty,
+        \\}
+        \\
+        \\pub fn handle_outcome_code() -> i32 {
+        \\    let out_val: Outcome = .Code(3735928559);
+        \\    if out_val is .Ok(lin_tok) {
+        \\        return consume_linear(lin_tok);
+        \\    }
+        \\    return 10;
+        \\}
+        \\
+        \\pub fn handle_outcome_msg() -> i32 {
+        \\    let out_val: Outcome = .Msg(DropGuard { tag: 77 });
+        \\    if out_val is .Ok(lin_tok) {
+        \\        return consume_linear(lin_tok);
+        \\    }
+        \\    return 20;
+        \\}
+        \\
+        \\pub fn handle_open_path_err() -> i32 {
+        \\    let open_val: OpenRes = .PathErr(DropGuard { tag: 88 });
+        \\    if open_val is .Ok(lin_tok) {
+        \\        return consume_linear(lin_tok);
+        \\    }
+        \\    return 30;
+        \\}
+        \\
+        \\pub fn handle_partial_pair() -> i32 {
+        \\    let pair_val: GuardPair = .Both(DropGuard { tag: 11 }, DropGuard { tag: 22 });
+        \\    if pair_val is .Both(first_guard, _) {
+        \\        @drop_trace(100);
+        \\        return first_guard.tag as i32;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+        \\pub fn make_opt_guard(is_some: bool, tag: i64) -> DropGuard? {
+        \\    if is_some {
+        \\        return .Some(DropGuard { tag: tag });
+        \\    }
+        \\    return .None;
+        \\}
+        \\
+        \\pub fn handle_cond_else_drop() -> i32 {
+        \\    if !(make_opt_guard(true, 5) is not .None) {
+        \\        @drop_trace(300);
+        \\        return 1;
+        \\    } else {
+        \\        @drop_trace(400);
+        \\        return 40;
+        \\    }
+        \\}
+        \\
+        \\pub fn main() -> i32 {
+        \\    let code_part: i32 = handle_outcome_code();
+        \\    let msg_part: i32 = handle_outcome_msg();
+        \\    let open_part: i32 = handle_open_path_err();
+        \\    let pair_part: i32 = handle_partial_pair();
+        \\    let cond_part: i32 = handle_cond_else_drop();
+        \\    return code_part + msg_part + open_part + pair_part + cond_part;
+        \\}
+    ;
+
+    var report = try expectFourTierParity(allocator, io, complement_drops_src);
+    defer report.deinit(allocator);
+    try std.testing.expect(!report.outcomes[0].has_trapped);
+    // `.Code(0xDEADBEEF)` emits zero drop trace; `.Msg(77)` -> `77`; `.PathErr(88)` -> `88`;
+    // `.Both(11, 22)` partial move -> `100, 22, 11`; `hir_if` condition scope -> `5` before `400`:
+    try std.testing.expectEqualSlices(
+        i64,
+        &[_]i64{ 77, 88, 100, 22, 11, 5, 400 },
+        report.outcomes[0].drop_trace,
+    );
+    try std.testing.expectEqual(@as(i64, 111), report.outcomes[0].return_scalar_i64);
+}
+
+test "test_regression_four_tier_context_arena_closure_drop_and_dependent_defaults" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const ctx_defaults_src =
+        \\pub struct Arena {
+        \\    pub bump_tag: usize,
+        \\}
+        \\
+        \\impl Arena {
+        \\    pub fn release(&mut self) {}
+        \\}
+        \\
+        \\pub struct CtxDropProbe {
+        \\    pub marker: i64,
+        \\}
+        \\
+        \\impl CtxDropProbe {
+        \\    pub fn drop(&mut self) {
+        \\        @drop_trace(self.marker + (context.cancel_token._handle as i64));
+        \\    }
+        \\}
+        \\
+        \\pub const MAX_RETRIES: i32 = 4;
+        \\
+        \\pub fn make_window(lo: i32, mid: i32 = lo + 5, hi: i32 = mid * 2) -> i32 {
+        \\    return hi - lo;
+        \\}
+        \\
+        \\pub fn match_const_pat(retries: i32) -> i32 {
+        \\    if retries is MAX_RETRIES {
+        \\        return 7;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+        \\pub fn run_arena_context() -> i32 {
+        \\    let initial_alloc = context.allocator;
+        \\    let _ = initial_alloc._handle;
+        \\    var local_arena = Arena { bump_tag: 99 };
+        \\    defer local_arena.release();
+        \\    with context.allocator = &mut local_arena {
+        \\        let active_alloc = context.allocator;
+        \\        return if active_alloc._handle != 0 { 9 } else { 0 };
+        \\    }
+        \\}
+        \\
+        \\pub fn run_closure_and_drop_in_with() -> i32 {
+        \\    let read_cancel = @local |bonus: i32| -> i32 {
+        \\        return (context.cancel_token._handle as i32) + bonus;
+        \\    };
+        \\    let active_tok = CancelToken { _handle: 33 };
+        \\    let inner_res: i32 = with context.cancel_token = active_tok {
+        \\        let inner_probe = CtxDropProbe { marker: 100 };
+        \\        let _ = inner_probe.marker;
+        \\        read_cancel(7)
+        \\    };
+        \\    let outer_probe = CtxDropProbe { marker: 200 };
+        \\    let _ = outer_probe.marker;
+        \\    let snap_ctx = context;
+        \\    return inner_res + read_cancel(0) + (snap_ctx.rng_seed as i32);
+        \\}
+        \\
+        \\pub fn main() -> i32 {
+        \\    let win_pos: i32 = make_window(3);
+        \\    let win_named: i32 = make_window(mid: 10, lo: 4);
+        \\    let pat_part: i32 = match_const_pat(4);
+        \\    let arena_part: i32 = run_arena_context();
+        \\    let ctx_part: i32 = run_closure_and_drop_in_with();
+        \\    return win_pos + win_named + pat_part + arena_part + ctx_part;
+        \\}
+    ;
+
+    var report = try expectFourTierParity(allocator, io, ctx_defaults_src);
+    defer report.deinit(allocator);
+    try std.testing.expect(!report.outcomes[0].has_trapped);
+    // `inner_probe` drops inside `with context.cancel_token = 33` (`133`); `outer_probe` drops after restore (`200`):
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 133, 200 }, report.outcomes[0].drop_trace);
+    // `win_pos = 13`; `win_named = 16`; `pat_part = 7`; `arena_part = 9`; `ctx_part = 40` -> `85`:
+    try std.testing.expectEqual(@as(i64, 85), report.outcomes[0].return_scalar_i64);
+}
+
+

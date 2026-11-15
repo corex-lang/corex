@@ -389,7 +389,7 @@ test "test_codegen_c_native_executable_execution_and_oracle_trace_parity" {
         \\    if pad_or != 0 {
         \\        @trap();
         \\    }
-        \\    // [2] Empty-slice non-null niche (`Option[str]::Some("") != .None`):
+        \\    // [2] Empty-slice non-null niche (`Option[str].Some("") != .None`):
         \\    let opt_e: str? = .Some("");
         \\    let opt_n: str? = .None;
         \\    if opt_e == opt_n {

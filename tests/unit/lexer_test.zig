@@ -1,6 +1,6 @@
 //! Unit Tests for High-Speed Deterministic Lexer & Trivia Scanner (`tests/unit/lexer_test.zig`)
 //!
-//! Verifies all 112 `TokenKind` variants (`0..111`), all 45 language keywords and 19 primitive types,
+//! Verifies all 117 `TokenKind` variants (`0..116`), all 49 language keywords and 19 primitive types,
 //! all 10 `TriviaKind` classifications across `LF` and `CRLF`, disjoint identifier casing (`W0201`),
 //! numeric literals (`E0103`), interpolated/raw strings and character literals (`W0101`, `E0101`, `E0102`),
 //! resource caps (`E0104`, `> 15` trivia coalescing, `> 65,535`-byte tokens), and lossless reconstruction.
@@ -30,7 +30,7 @@ const TransactionalPatcher = corex.TransactionalPatcher;
 
 // --------------------------------------- CONSTS ----------------------------------------
 
-/// Exhaustive table mapping sample `.cx` lexemes to all 111 non-EOF `TokenKind` variants (`0..110`).
+/// Exhaustive table mapping sample `.cx` lexemes to all 116 non-EOF `TokenKind` variants (`0..115`).
 const EXHAUSTIVE_TOKEN_CASES = [_]struct {
     lexeme: []const u8,
     expected: TokenKind,
@@ -73,6 +73,10 @@ const EXHAUSTIVE_TOKEN_CASES = [_]struct {
     .{ .lexeme = "break", .expected = .kw_break },
     .{ .lexeme = "continue", .expected = .kw_continue },
     .{ .lexeme = "catch", .expected = .kw_catch },
+    .{ .lexeme = "orelse", .expected = .kw_orelse },
+    .{ .lexeme = "with", .expected = .kw_with },
+    .{ .lexeme = "context", .expected = .kw_context },
+    .{ .lexeme = "unreachable", .expected = .kw_unreachable },
     .{ .lexeme = "true", .expected = .kw_true },
     .{ .lexeme = "false", .expected = .kw_false },
     .{ .lexeme = "and", .expected = .kw_and },
@@ -97,7 +101,7 @@ const EXHAUSTIVE_TOKEN_CASES = [_]struct {
     .{ .lexeme = ";", .expected = .semi },
     .{ .lexeme = ",", .expected = .comma },
     .{ .lexeme = ":", .expected = .colon },
-    .{ .lexeme = "::", .expected = .coloncolon },
+    .{ .lexeme = ":=", .expected = .colon_eq },
     .{ .lexeme = ".", .expected = .dot },
     .{ .lexeme = "..", .expected = .dotdot },
     .{ .lexeme = "..=", .expected = .dotdoteq },
@@ -106,6 +110,7 @@ const EXHAUSTIVE_TOKEN_CASES = [_]struct {
     .{ .lexeme = "|>", .expected = .pipe_gt },
     .{ .lexeme = "@", .expected = .at },
     .{ .lexeme = "#soa", .expected = .hash_soa },
+    .{ .lexeme = "$", .expected = .dollar },
     .{ .lexeme = "?", .expected = .question },
     .{ .lexeme = "_", .expected = .underscore },
     .{ .lexeme = "+", .expected = .plus },
@@ -145,10 +150,10 @@ const EXHAUSTIVE_TOKEN_CASES = [_]struct {
     .{ .lexeme = "^=", .expected = .caret_eq },
     .{ .lexeme = "<<=", .expected = .shl_eq },
     .{ .lexeme = ">>=", .expected = .shr_eq },
-    .{ .lexeme = "$", .expected = .invalid_token },
+    .{ .lexeme = "`", .expected = .invalid_token },
 };
 
-/// Authoritative list of all 19 primitive type keywords that map to `TokenKind.prim_type` (`45`).
+/// Authoritative list of all 19 primitive type keywords that map to `TokenKind.prim_type` (`49`).
 const ALL_19_PRIMITIVE_TYPES = [_][]const u8{
     "i8",   "i16", "i32",  "i64",  "i128", "isize",
     "u8",   "u16", "u32",  "u64",  "u128", "usize",
@@ -170,12 +175,12 @@ fn expectLosslessRoundTrip(source: []const u8, token_buffer: *const TokenBuffer)
 
 // ------------------------------------- PUBLIC API --------------------------------------
 
-// ----------------- All 112 TokenKind Variants -----------------
+// ----------------- All 117 TokenKind Variants -----------------
 
-test "test_lexer_all_112_token_kinds_and_19_prim_types_exhaustive" {
-    var seen_variants: [112]bool = @splat(false);
+test "test_lexer_all_117_token_kinds_and_19_prim_types_exhaustive" {
+    var seen_variants: [117]bool = @splat(false);
 
-    // [1] Verify each of the 111 non-EOF token kinds (`0..110`) and final `.eof` (`111`):
+    // [1] Verify each of the 116 non-EOF token kinds (`0..115`) and final `.eof` (`116`):
     for (EXHAUSTIVE_TOKEN_CASES, 0..) |test_case, i| {
         var token_buf = TokenBuffer.init(std.testing.allocator);
         defer token_buf.deinit();
@@ -202,7 +207,7 @@ test "test_lexer_all_112_token_kinds_and_19_prim_types_exhaustive" {
         try std.testing.expect(was_seen);
     }
 
-    // [2] Verify all 19 primitive type keywords map to `TokenKind.prim_type` (`45`) with zero warnings:
+    // [2] Verify all 19 primitive type keywords map to `TokenKind.prim_type` (`49`) with zero warnings:
     try std.testing.expectEqual(@as(usize, 19), ALL_19_PRIMITIVE_TYPES.len);
     for (ALL_19_PRIMITIVE_TYPES) |prim_lexeme| {
         const classification = corex.classifyIdentifierOrKeyword(prim_lexeme);
@@ -371,6 +376,27 @@ test "test_lexer_numeric_literals_ranges_method_calls_and_e0103_errors" {
     const count = valid_buf.countTokens();
     try std.testing.expectEqual(TokenKind.int_lit, valid_buf.getToken(TokenIndex.fromInt(@intCast(count - 3))).kind);
     try std.testing.expectEqual(TokenKind.dot, valid_buf.getToken(TokenIndex.fromInt(@intCast(count - 2))).kind);
+
+    // Verify `DR-21` nested tuple projections (`tup.0.1.2`) vs range float (`0..0.5`):
+    const tuple_proj_src = "tup.0.1.2 0..0.5";
+    var tuple_buf = TokenBuffer.init(std.testing.allocator);
+    defer tuple_buf.deinit();
+    var tuple_sink = DiagnosticSink.init(std.testing.allocator);
+    defer tuple_sink.deinit();
+    try corex.tokenize(tuple_proj_src, FileId.fromInt(0), &tuple_buf, &tuple_sink, null);
+    try std.testing.expectEqual(@as(u32, 0), tuple_sink.error_count);
+    try std.testing.expectEqual(@as(usize, 11), tuple_buf.countTokens());
+    try std.testing.expectEqual(TokenKind.ident, tuple_buf.getToken(TokenIndex.fromInt(0)).kind);
+    try std.testing.expectEqual(TokenKind.dot, tuple_buf.getToken(TokenIndex.fromInt(1)).kind);
+    try std.testing.expectEqual(TokenKind.int_lit, tuple_buf.getToken(TokenIndex.fromInt(2)).kind);
+    try std.testing.expectEqual(TokenKind.dot, tuple_buf.getToken(TokenIndex.fromInt(3)).kind);
+    try std.testing.expectEqual(TokenKind.int_lit, tuple_buf.getToken(TokenIndex.fromInt(4)).kind);
+    try std.testing.expectEqual(TokenKind.dot, tuple_buf.getToken(TokenIndex.fromInt(5)).kind);
+    try std.testing.expectEqual(TokenKind.int_lit, tuple_buf.getToken(TokenIndex.fromInt(6)).kind);
+    try std.testing.expectEqual(TokenKind.int_lit, tuple_buf.getToken(TokenIndex.fromInt(7)).kind);
+    try std.testing.expectEqual(TokenKind.dotdot, tuple_buf.getToken(TokenIndex.fromInt(8)).kind);
+    try std.testing.expectEqual(TokenKind.float_lit, tuple_buf.getToken(TokenIndex.fromInt(9)).kind);
+    try expectLosslessRoundTrip(tuple_proj_src, &tuple_buf);
 
     // [2] Exhaustive malformed numeric literals emitting `E0103`:
     const malformed_numbers = [_][]const u8{
@@ -581,7 +607,7 @@ test "test_lexer_raw_strings_char_literals_and_directives" {
         try expectLosslessRoundTrip(bad_char, &char_buf);
     }
 
-    const unexpected_tokens = "#unknown #soa_extra # $ λ \xFF\xFE";
+    const unexpected_tokens = "#unknown #soa_extra # ` λ \xFF\xFE";
     var unexp_buf = TokenBuffer.init(std.testing.allocator);
     defer unexp_buf.deinit();
     var unexp_sink = DiagnosticSink.init(std.testing.allocator);
@@ -650,4 +676,72 @@ test "test_lexer_trivia_carrier_flush_slot14_coalescing_and_e0104_limit" {
         capped_carrier_sink.asSlice()[0].code,
     );
     try expectLosslessRoundTrip(carrier_source, &capped_carrier_buf);
+}
+
+// ------------- Retired :: Path Separator (E0112) --------------
+
+test "test_lexer_retired_colon_colon_emits_e0112_with_dot_fix" {
+    const retired_src = "use cx::mem::size_of;";
+    var token_buf = TokenBuffer.init(std.testing.allocator);
+    defer token_buf.deinit();
+    var sink = DiagnosticSink.init(std.testing.allocator);
+    defer sink.deinit();
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    try corex.tokenize(retired_src, FileId.fromInt(0), &token_buf, &sink, &interner);
+    try std.testing.expectEqual(@as(u32, 2), sink.error_count);
+    try std.testing.expectEqual(DiagnosticCode.e0112_retired_path_separator, sink.asSlice()[0].code);
+    try std.testing.expectEqual(DiagnosticCode.e0112_retired_path_separator, sink.asSlice()[1].code);
+    try std.testing.expectEqual(TokenKind.dot, token_buf.getToken(TokenIndex.fromInt(2)).kind);
+    try std.testing.expect(token_buf.getToken(TokenIndex.fromInt(2)).flags.has_lexer_error);
+    try expectLosslessRoundTrip(retired_src, &token_buf);
+
+    var fixes: [2]SuggestedFix = .{ sink.asSlice()[0].suggestions[0], sink.asSlice()[1].suggestions[0] };
+    const patched = try TransactionalPatcher.apply(
+        std.testing.allocator,
+        retired_src,
+        FileId.fromInt(0),
+        &fixes,
+        &interner,
+    );
+    defer std.testing.allocator.free(patched.patched_source);
+    try std.testing.expectEqual(@as(u32, 2), patched.applied_count);
+    try std.testing.expectEqualStrings("use cx.mem.size_of;", patched.patched_source);
+}
+
+test "test_lexer_tuple_index_after_dot_rejects_suffixes_hex_and_underscores" {
+    // [1] Valid decimal tuple indices (`tup.0`, `tup.12`) scan cleanly without errors:
+    const valid_src = "let val = tup.0 + tup.12;";
+    var valid_buf = TokenBuffer.init(std.testing.allocator);
+    defer valid_buf.deinit();
+    var valid_sink = DiagnosticSink.init(std.testing.allocator);
+    defer valid_sink.deinit();
+    try corex.tokenize(valid_src, FileId.fromInt(0), &valid_buf, &valid_sink, null);
+    try std.testing.expectEqual(@as(u32, 0), valid_sink.error_count);
+    try expectLosslessRoundTrip(valid_src, &valid_buf);
+
+    // [2] Suffixed, exponent, hex, and underscored tuple indices emit `E0103`:
+    const invalid_cases = [_][]const u8{
+        "tup.0u32",
+        "tup.0e5",
+        "tup.0e+5",
+        "tup.0x0",
+        "tup.0_0",
+    };
+    for (invalid_cases) |bad_src| {
+        var bad_buf = TokenBuffer.init(std.testing.allocator);
+        defer bad_buf.deinit();
+        var bad_sink = DiagnosticSink.init(std.testing.allocator);
+        defer bad_sink.deinit();
+
+        try corex.tokenize(bad_src, FileId.fromInt(0), &bad_buf, &bad_sink, null);
+        try std.testing.expect(bad_sink.error_count >= 1);
+        try std.testing.expectEqual(
+            DiagnosticCode.e0103_invalid_numeric_literal,
+            bad_sink.asSlice()[0].code,
+        );
+        try std.testing.expect(bad_buf.getToken(TokenIndex.fromInt(2)).flags.has_lexer_error);
+        try expectLosslessRoundTrip(bad_src, &bad_buf);
+    }
 }

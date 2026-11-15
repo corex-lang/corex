@@ -661,8 +661,8 @@ static _cx_ty_66 _cx_fn_1_compute_showcase(_cx_ty_64 _arg_1, _cx_ty_68 _arg_2) {
     int32_t _loc_4; memset(&_loc_4, 0, sizeof(_loc_4)); (void)_loc_4;
     int32_t _loc_5; memset(&_loc_5, 0, sizeof(_loc_5)); (void)_loc_5;
     _cx_ty_73 _loc_6; memset(&_loc_6, 0, sizeof(_loc_6)); (void)_loc_6;
-    int32_t _loc_7; memset(&_loc_7, 0, sizeof(_loc_7)); (void)_loc_7;
-    int32_t _loc_8; memset(&_loc_8, 0, sizeof(_loc_8)); (void)_loc_8;
+    uint64_t _loc_7; memset(&_loc_7, 0, sizeof(_loc_7)); (void)_loc_7;
+    uint64_t _loc_8; memset(&_loc_8, 0, sizeof(_loc_8)); (void)_loc_8;
     _cx_ty_74 _loc_9; memset(&_loc_9, 0, sizeof(_loc_9)); (void)_loc_9;
     uint64_t _loc_10; memset(&_loc_10, 0, sizeof(_loc_10)); (void)_loc_10;
     uint64_t _loc_11; memset(&_loc_11, 0, sizeof(_loc_11)); (void)_loc_11;
@@ -671,8 +671,8 @@ static _cx_ty_66 _cx_fn_1_compute_showcase(_cx_ty_64 _arg_1, _cx_ty_68 _arg_2) {
     int32_t _loc_14; memset(&_loc_14, 0, sizeof(_loc_14)); (void)_loc_14;
     int32_t _loc_15; memset(&_loc_15, 0, sizeof(_loc_15)); (void)_loc_15;
     int32_t _loc_16; memset(&_loc_16, 0, sizeof(_loc_16)); (void)_loc_16;
-    int32_t _loc_17; memset(&_loc_17, 0, sizeof(_loc_17)); (void)_loc_17;
-    int32_t _loc_18; memset(&_loc_18, 0, sizeof(_loc_18)); (void)_loc_18;
+    uint64_t _loc_17; memset(&_loc_17, 0, sizeof(_loc_17)); (void)_loc_17;
+    uint64_t _loc_18; memset(&_loc_18, 0, sizeof(_loc_18)); (void)_loc_18;
     _cx_ty_66 _loc_19; memset(&_loc_19, 0, sizeof(_loc_19)); (void)_loc_19;
     int32_t _loc_20; memset(&_loc_20, 0, sizeof(_loc_20)); (void)_loc_20;
     int32_t _loc_21; memset(&_loc_21, 0, sizeof(_loc_21)); (void)_loc_21;
@@ -696,7 +696,7 @@ static _cx_ty_66 _cx_fn_1_compute_showcase(_cx_ty_64 _arg_1, _cx_ty_68 _arg_2) {
     uint8_t _v_31 = 0u; (void)_v_31;
     uint8_t _v_32 = 0u; (void)_v_32;
     int32_t _v_33; memset(&_v_33, 0, sizeof(_v_33)); (void)_v_33;
-    int32_t _v_34; memset(&_v_34, 0, sizeof(_v_34)); (void)_v_34;
+    uint64_t _v_34; memset(&_v_34, 0, sizeof(_v_34)); (void)_v_34;
     uint8_t _v_35 = 0u; (void)_v_35;
     uint64_t _v_36; memset(&_v_36, 0, sizeof(_v_36)); (void)_v_36;
     uint8_t _v_37; memset(&_v_37, 0, sizeof(_v_37)); (void)_v_37;
@@ -704,7 +704,7 @@ static _cx_ty_66 _cx_fn_1_compute_showcase(_cx_ty_64 _arg_1, _cx_ty_68 _arg_2) {
     uint8_t _v_40 = 0u; (void)_v_40;
     uint8_t _v_42 = 0u; (void)_v_42;
     int32_t _v_43; memset(&_v_43, 0, sizeof(_v_43)); (void)_v_43;
-    int32_t _v_44; memset(&_v_44, 0, sizeof(_v_44)); (void)_v_44;
+    uint64_t _v_44; memset(&_v_44, 0, sizeof(_v_44)); (void)_v_44;
     uint8_t _v_45 = 0u; (void)_v_45;
     uint64_t _v_46; memset(&_v_46, 0, sizeof(_v_46)); (void)_v_46;
     uint8_t _v_47; memset(&_v_47, 0, sizeof(_v_47)); (void)_v_47;
@@ -759,14 +759,14 @@ static _cx_ty_66 _cx_fn_1_compute_showcase(_cx_ty_64 _arg_1, _cx_ty_68 _arg_2) {
     int32_t _v_109; memset(&_v_109, 0, sizeof(_v_109)); (void)_v_109;
     uint8_t _v_110 = 0u; (void)_v_110;
     int32_t _v_111; memset(&_v_111, 0, sizeof(_v_111)); (void)_v_111;
-    int32_t _v_112; memset(&_v_112, 0, sizeof(_v_112)); (void)_v_112;
+    uint64_t _v_112; memset(&_v_112, 0, sizeof(_v_112)); (void)_v_112;
     uint8_t _v_113 = 0u; (void)_v_113;
     uint64_t _v_114; memset(&_v_114, 0, sizeof(_v_114)); (void)_v_114;
     uint8_t _v_115; memset(&_v_115, 0, sizeof(_v_115)); (void)_v_115;
     uint8_t _v_116 = 0u; (void)_v_116;
     int32_t _v_118; memset(&_v_118, 0, sizeof(_v_118)); (void)_v_118;
     int32_t _v_120; memset(&_v_120, 0, sizeof(_v_120)); (void)_v_120;
-    int32_t _v_121; memset(&_v_121, 0, sizeof(_v_121)); (void)_v_121;
+    uint64_t _v_121; memset(&_v_121, 0, sizeof(_v_121)); (void)_v_121;
     uint8_t _v_122 = 0u; (void)_v_122;
     uint64_t _v_123; memset(&_v_123, 0, sizeof(_v_123)); (void)_v_123;
     uint8_t _v_124; memset(&_v_124, 0, sizeof(_v_124)); (void)_v_124;
@@ -838,10 +838,11 @@ _bb_4: ;
     { size_t _ri = 0u; while (_ri < 4u) { ((int32_t *)(&_v_29._bytes[16u]))[_ri] = _v_28._f1; _ri += 1u; } }
     _loc_6 = _v_29;
     _v_33 = (int32_t)(1ull);
+    _v_34 = (uint64_t)(0ull);
     _v_36 = (uint64_t)(4ull);
-    (((int32_t *)(&((_loc_6)._bytes[0u])))[((size_t)_v_26)]) = _v_33;
+    (((int32_t *)(&((_loc_6)._bytes[0u])))[((size_t)_v_34)]) = _v_33;
     _v_43 = (int32_t)(8ull);
-    _v_44 = (int32_t)(3ull);
+    _v_44 = (uint64_t)(3ull);
     (((int32_t *)(&((_loc_6)._bytes[16u])))[((size_t)_v_44)]) = _v_43;
     _v_53 = (int32_t)(2ull);
     _v_54 = (int32_t)(4ull);
@@ -852,9 +853,8 @@ _bb_4: ;
     _v_57._elems[2u] = _v_55;
     _v_57._elems[3u] = _v_43;
     _loc_9 = _v_57;
-    _v_61 = (uint64_t)(0ull);
     {
-        uint64_t _phi_0 = _v_61;
+        uint64_t _phi_0 = _v_34;
         _v_63 = _phi_0;
         goto _bb_8;
     }
@@ -936,7 +936,7 @@ _bb_16: ;
 _bb_17: ;
     _cx_rt_trap(0u);
 _bb_18: ;
-    _v_118 = (((int32_t *)(&((_loc_6)._bytes[0u])))[((size_t)_v_26)]);
+    _v_118 = (((int32_t *)(&((_loc_6)._bytes[0u])))[((size_t)_v_34)]);
     { int32_t _ov = 0; if (__builtin_add_overflow((int32_t)_v_100, (int32_t)_v_118, &_ov)) _cx_rt_trap(2); _v_120 = (int32_t)_ov; }
     _v_127 = (((int32_t *)(&((_loc_6)._bytes[16u])))[((size_t)_v_44)]);
     { int32_t _ov = 0; if (__builtin_add_overflow((int32_t)_v_120, (int32_t)_v_127, &_ov)) _cx_rt_trap(2); _v_129 = (int32_t)_ov; }

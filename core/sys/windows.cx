@@ -1,4 +1,4 @@
-//! Windows Win32 `kernel32` Handle Constants and C-ABI Prototypes (`core::sys::windows`)
+//! Windows Win32 `kernel32` Handle Constants and C-ABI Prototypes (`core.sys.windows`)
 //!
 //! Declares Win32 standard-handle identifiers (`STD_INPUT_HANDLE`, `STD_OUTPUT_HANDLE`,
 //! `STD_ERROR_HANDLE`), `kernel32.dll` `GetStdHandle` / `WriteFile` / `ExitProcess` `extern "C"`
@@ -6,9 +6,7 @@
 //!
 //! Safe stream helpers operate in binary mode (`_O_BINARY` without `LF` -> `CRLF` translation) to
 //! guarantee byte-exact output parity across Windows and POSIX hosts.
-
 // --------------------------------------- CONSTS ----------------------------------------
-
 /// Win32 `STD_INPUT_HANDLE` (`(DWORD)-10`).
 pub const STD_INPUT_HANDLE: i32 = -10;
 

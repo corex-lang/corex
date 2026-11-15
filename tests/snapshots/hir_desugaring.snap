@@ -66,10 +66,10 @@ hir_module : unit
       hir_assign : unit
         hir_block : i32
           hir_local_decl : unit _l22
-            hir_const_val : i32 = 0
+            hir_const_val : usize = 0
           hir_soa_field_ptr : i32 [meta=0]
             hir_var_ref : #soa [SampleRow; 2] _l21 (rows)
-            hir_var_ref : i32 _l22
+            hir_var_ref : usize _l22
         hir_var_ref : i32 _l20 (recovered)
       hir_block : unit
         hir_local_decl : unit _l23
@@ -78,10 +78,10 @@ hir_module : unit
           hir_unary_op : &mut i32
             hir_block : i32
               hir_local_decl : unit _l24
-                hir_const_val : i32 = 1
+                hir_const_val : usize = 1
               hir_soa_field_ptr : i32 [meta=0]
                 hir_var_ref : #soa [SampleRow; 2] _l21 (rows)
-                hir_var_ref : i32 _l24
+                hir_var_ref : usize _l24
         hir_assign : unit
           hir_unary_op : i32
             hir_var_ref : &mut i32 _l25
@@ -149,16 +149,16 @@ hir_module : unit
               hir_binary_op : i32 [add]
                 hir_block : i32
                   hir_local_decl : unit _l35
-                    hir_const_val : i32 = 0
+                    hir_const_val : usize = 0
                   hir_soa_field_ptr : i32 [meta=0]
                     hir_var_ref : #soa [SampleRow; 2] _l21 (rows)
-                    hir_var_ref : i32 _l35
+                    hir_var_ref : usize _l35
                 hir_block : i32
                   hir_local_decl : unit _l36
-                    hir_const_val : i32 = 1
+                    hir_const_val : usize = 1
                   hir_soa_field_ptr : i32 [meta=0]
                     hir_var_ref : #soa [SampleRow; 2] _l21 (rows)
-                    hir_var_ref : i32 _l36
+                    hir_var_ref : usize _l36
               hir_cast : i32
                 hir_bitfield_read : u16
                   hir_var_ref : PacketFlags _l29 (flags)

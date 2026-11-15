@@ -1,4 +1,4 @@
-//! Linux POSIX Syscall Constants and C-ABI Prototypes (`core::sys::linux`)
+//! Linux POSIX Syscall Constants and C-ABI Prototypes (`core.sys.linux`)
 //!
 //! Declares canonical Linux file-descriptor numbers, `x86_64` / `aarch64` syscall numbers, and
 //! `libc` `write` / `_exit` `extern "C"` prototypes alongside safe `@sys_write` / `@sys_exit`
@@ -6,9 +6,7 @@
 //!
 //! Direct calls to `extern "C"` prototypes require an explicit `unsafe` block, whereas safe stream
 //! helpers delegate through compiler-verified `@sys_*` intrinsics.
-
 // --------------------------------------- CONSTS ----------------------------------------
-
 /// Standard input file descriptor (`0`).
 pub const STDIN_FILENO: i32 = 0;
 

@@ -811,3 +811,80 @@ test "test_regression_codegen_llvm_wasi_import_module_extern_dedup_and_quoted_id
     );
     defer obj_art.deinit(std.testing.allocator);
 }
+
+test "test_regression_codegen_llvm_tls_64b_context_and_wasm32_rng_seed_rv2_crit05_high04" {
+    const ctx_wasm_src =
+        \\pub fn read_ctx_snapshot_seed() -> u64 {
+        \\    let snap_ctx = context;
+        \\    return snap_ctx.rng_seed + (context.cancel_token._handle as u64);
+        \\}
+        \\pub fn run_scoped_ctx() -> u64 {
+        \\    let scoped_tok = CancelToken { _handle: 42 };
+        \\    return with context.cancel_token = scoped_tok {
+        \\        read_ctx_snapshot_seed()
+        \\    };
+        \\}
+    ;
+
+    var linux_ir = try emitLlvmModuleFromSource(
+        std.testing.allocator,
+        ctx_wasm_src,
+        TargetSpec.X86_64_LINUX,
+        .release_fast_o2,
+        true,
+        false,
+        false,
+        false,
+        .source_text,
+        null,
+        null,
+    );
+    defer linux_ir.deinit(std.testing.allocator);
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            linux_ir.emitted_text,
+            "@_cx_default_ctx = internal thread_local global [64 x i8] zeroinitializer, align 8",
+        ) != null,
+    );
+
+    var wasm_ir = try emitLlvmModuleFromSource(
+        std.testing.allocator,
+        ctx_wasm_src,
+        TargetSpec.WASM32_WASI,
+        .release_fast_o2,
+        true,
+        false,
+        false,
+        false,
+        .source_text,
+        null,
+        null,
+    );
+    defer wasm_ir.deinit(std.testing.allocator);
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            wasm_ir.emitted_text,
+            "@_cx_default_ctx = internal global [64 x i8] zeroinitializer, align 8",
+        ) != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, wasm_ir.emitted_text, "@_cx_ctx_wide_2") == null);
+
+    const wasm_ctx_obj = ".zig-cache/test_tier_b_wasi_ctx64.o";
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, wasm_ctx_obj) catch {};
+    var wasm_obj_art = try emitLlvmModuleFromSource(
+        std.testing.allocator,
+        ctx_wasm_src,
+        TargetSpec.WASM32_WASI,
+        .release_fast_o2,
+        true,
+        false,
+        false,
+        false,
+        .object_file,
+        wasm_ctx_obj,
+        null,
+    );
+    defer wasm_obj_art.deinit(std.testing.allocator);
+}

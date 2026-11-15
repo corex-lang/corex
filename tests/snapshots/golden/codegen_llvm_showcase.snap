@@ -9,7 +9,7 @@ target triple = "x86_64-unknown-linux-gnu"
 %_cx_ty_68 = type <{ [8 x i8] }>
 %_cx_ty_73 = type <{ [32 x i8] }>
 
-@_cx_default_ctx = internal global [32 x i8] zeroinitializer, align 8
+@_cx_default_ctx = internal thread_local global [64 x i8] zeroinitializer, align 8
 @.cx_env_oracle = private unnamed_addr constant [24 x i8] c"COREX_ORACLE_TRACE_FILE\00", align 1
 @.cx_fmode_ab = private unnamed_addr constant [3 x i8] c"ab\00", align 1
 @.cx_msg_trap = private unnamed_addr constant [8 x i8] c"TRAP:1\0A\00", align 1
@@ -224,8 +224,8 @@ _bb_0:
   %_loc_4 = alloca i32, align 8
   %_loc_5 = alloca i32, align 8
   %_loc_6 = alloca %_cx_ty_73, align 16
-  %_loc_7 = alloca i32, align 8
-  %_loc_8 = alloca i32, align 8
+  %_loc_7 = alloca i64, align 8
+  %_loc_8 = alloca i64, align 8
   %_loc_9 = alloca [4 x i32], align 8
   %_loc_10 = alloca i64, align 8
   %_loc_11 = alloca i64, align 8
@@ -234,8 +234,8 @@ _bb_0:
   %_loc_14 = alloca i32, align 8
   %_loc_15 = alloca i32, align 8
   %_loc_16 = alloca i32, align 8
-  %_loc_17 = alloca i32, align 8
-  %_loc_18 = alloca i32, align 8
+  %_loc_17 = alloca i64, align 8
+  %_loc_18 = alloca i64, align 8
   %_loc_19 = alloca %_cx_ty_66, align 8
   %_loc_20 = alloca i32, align 8
   %_loc_21 = alloca i32, align 8
@@ -248,18 +248,18 @@ _bb_0:
   %_scratch_13 = alloca [8 x i8], align 8
   %_scratch_16 = alloca [32 x i8], align 16
   %_scratch_18 = alloca [8 x i8], align 8
-  %_scratch_30 = alloca [16 x i8], align 8
-  %_scratch_37 = alloca [8 x i8], align 8
-  %_scratch_40 = alloca [8 x i8], align 8
+  %_scratch_28 = alloca [16 x i8], align 8
+  %_scratch_35 = alloca [8 x i8], align 8
+  %_scratch_38 = alloca [8 x i8], align 8
+  %_scratch_44 = alloca [16 x i8], align 16
   %_scratch_46 = alloca [16 x i8], align 16
-  %_scratch_48 = alloca [16 x i8], align 16
+  %_scratch_47 = alloca [16 x i8], align 16
   %_scratch_49 = alloca [16 x i8], align 16
-  %_scratch_51 = alloca [16 x i8], align 16
-  %_scratch_75 = alloca [8 x i8], align 8
-  %_scratch_78 = alloca [8 x i8], align 8
-  %_scratch_83 = alloca [8 x i8], align 8
-  %_scratch_86 = alloca [4 x i8], align 8
-  %_scratch_90 = alloca [8 x i8], align 8
+  %_scratch_71 = alloca [8 x i8], align 8
+  %_scratch_74 = alloca [8 x i8], align 8
+  %_scratch_79 = alloca [8 x i8], align 8
+  %_scratch_82 = alloca [4 x i8], align 8
+  %_scratch_86 = alloca [8 x i8], align 8
   call void @llvm.memset.p0.i64(ptr align 8 %_loc_0, i8 0, i64 8, i1 false)
   call void @llvm.memset.p0.i64(ptr align 8 %_loc_1, i8 0, i64 8, i1 false)
   call void @llvm.memset.p0.i64(ptr align 8 %_scratch_0, i8 0, i64 8, i1 false)
@@ -275,8 +275,8 @@ _bb_0:
   call void @llvm.memset.p0.i64(ptr align 8 %_loc_4, i8 0, i64 4, i1 false)
   call void @llvm.memset.p0.i64(ptr align 8 %_loc_5, i8 0, i64 4, i1 false)
   call void @llvm.memset.p0.i64(ptr align 16 %_loc_6, i8 0, i64 32, i1 false)
-  call void @llvm.memset.p0.i64(ptr align 8 %_loc_7, i8 0, i64 4, i1 false)
-  call void @llvm.memset.p0.i64(ptr align 8 %_loc_8, i8 0, i64 4, i1 false)
+  call void @llvm.memset.p0.i64(ptr align 8 %_loc_7, i8 0, i64 8, i1 false)
+  call void @llvm.memset.p0.i64(ptr align 8 %_loc_8, i8 0, i64 8, i1 false)
   call void @llvm.memset.p0.i64(ptr align 8 %_loc_9, i8 0, i64 16, i1 false)
   call void @llvm.memset.p0.i64(ptr align 8 %_loc_10, i8 0, i64 8, i1 false)
   call void @llvm.memset.p0.i64(ptr align 8 %_loc_11, i8 0, i64 8, i1 false)
@@ -285,8 +285,8 @@ _bb_0:
   call void @llvm.memset.p0.i64(ptr align 8 %_loc_14, i8 0, i64 4, i1 false)
   call void @llvm.memset.p0.i64(ptr align 8 %_loc_15, i8 0, i64 4, i1 false)
   call void @llvm.memset.p0.i64(ptr align 8 %_loc_16, i8 0, i64 4, i1 false)
-  call void @llvm.memset.p0.i64(ptr align 8 %_loc_17, i8 0, i64 4, i1 false)
-  call void @llvm.memset.p0.i64(ptr align 8 %_loc_18, i8 0, i64 4, i1 false)
+  call void @llvm.memset.p0.i64(ptr align 8 %_loc_17, i8 0, i64 8, i1 false)
+  call void @llvm.memset.p0.i64(ptr align 8 %_loc_18, i8 0, i64 8, i1 false)
   call void @llvm.memset.p0.i64(ptr align 8 %_loc_19, i8 0, i64 8, i1 false)
   call void @llvm.memset.p0.i64(ptr align 8 %_loc_20, i8 0, i64 4, i1 false)
   call void @llvm.memset.p0.i64(ptr align 8 %_loc_21, i8 0, i64 4, i1 false)
@@ -305,7 +305,7 @@ _bb_0:
   %_v_144 = icmp eq i8 %_v_168, %_v_143
   br i1 %_v_144, label %_bb_20, label %_bb_21
 _bb_1:
-  %_v_7 = phi %_cx_ty_66 [ %_v_146, %_bb_20 ], [ %_v_162, %_ok_89 ]
+  %_v_7 = phi %_cx_ty_66 [ %_v_146, %_bb_20 ], [ %_v_162, %_ok_85 ]
   store %_cx_ty_66 %_v_7, ptr %_loc_19, align 8
   %_v_10 = add i8 0, 0
   %_tag_ld_10 = load i8, ptr %_loc_19, align 1
@@ -358,116 +358,114 @@ _rep_end_17:
   store %_cx_ty_73 %_v_29, ptr %_loc_6, align 16
   %_v_31 = add i8 0, 0
   %_v_33 = add i32 0, 1
+  %_v_34 = add i64 0, 0
   %_v_36 = add i64 0, 4
   %_scol_24 = getelementptr inbounds i8, ptr %_loc_6, i64 0
-  %_idx_c_25 = sext i32 %_v_26 to i64
-  %_sidx_b_26 = mul i64 %_idx_c_25, 4
-  %_sidx_p_26 = getelementptr inbounds i8, ptr %_scol_24, i64 %_sidx_b_26
-  store i32 %_v_33, ptr %_sidx_p_26, align 4
+  %_sidx_b_25 = mul i64 %_v_34, 4
+  %_sidx_p_25 = getelementptr inbounds i8, ptr %_scol_24, i64 %_sidx_b_25
+  store i32 %_v_33, ptr %_sidx_p_25, align 4
   %_v_40 = add i8 0, 0
   %_v_43 = add i32 0, 8
-  %_v_44 = add i32 0, 3
-  %_scol_27 = getelementptr inbounds i8, ptr %_loc_6, i64 16
-  %_idx_c_28 = sext i32 %_v_44 to i64
-  %_sidx_b_29 = mul i64 %_idx_c_28, 4
-  %_sidx_p_29 = getelementptr inbounds i8, ptr %_scol_27, i64 %_sidx_b_29
-  store i32 %_v_43, ptr %_sidx_p_29, align 4
+  %_v_44 = add i64 0, 3
+  %_scol_26 = getelementptr inbounds i8, ptr %_loc_6, i64 16
+  %_sidx_b_27 = mul i64 %_v_44, 4
+  %_sidx_p_27 = getelementptr inbounds i8, ptr %_scol_26, i64 %_sidx_b_27
+  store i32 %_v_43, ptr %_sidx_p_27, align 4
   %_v_50 = add i8 0, 0
   %_v_53 = add i32 0, 2
   %_v_54 = add i32 0, 4
   %_v_55 = add i32 0, 6
-  call void @llvm.memset.p0.i64(ptr align 4 %_scratch_30, i8 0, i64 16, i1 false)
-  store i32 %_v_53, ptr %_scratch_30, align 4
-  %_aep2_31 = getelementptr inbounds i8, ptr %_scratch_30, i64 4
-  store i32 %_v_54, ptr %_aep2_31, align 4
-  %_aep2_32 = getelementptr inbounds i8, ptr %_scratch_30, i64 8
-  store i32 %_v_55, ptr %_aep2_32, align 4
-  %_aep2_33 = getelementptr inbounds i8, ptr %_scratch_30, i64 12
-  store i32 %_v_43, ptr %_aep2_33, align 4
-  %_ld_34 = load [4 x i32], ptr %_scratch_30, align 4
-  %_v_57 = select i1 true, [4 x i32] %_ld_34, [4 x i32] %_ld_34
+  call void @llvm.memset.p0.i64(ptr align 4 %_scratch_28, i8 0, i64 16, i1 false)
+  store i32 %_v_53, ptr %_scratch_28, align 4
+  %_aep2_29 = getelementptr inbounds i8, ptr %_scratch_28, i64 4
+  store i32 %_v_54, ptr %_aep2_29, align 4
+  %_aep2_30 = getelementptr inbounds i8, ptr %_scratch_28, i64 8
+  store i32 %_v_55, ptr %_aep2_30, align 4
+  %_aep2_31 = getelementptr inbounds i8, ptr %_scratch_28, i64 12
+  store i32 %_v_43, ptr %_aep2_31, align 4
+  %_ld_32 = load [4 x i32], ptr %_scratch_28, align 4
+  %_v_57 = select i1 true, [4 x i32] %_ld_32, [4 x i32] %_ld_32
   store [4 x i32] %_v_57, ptr %_loc_9, align 8
   %_v_59 = add i8 0, 0
-  %_v_61 = add i64 0, 0
   br label %_bb_8
 _bb_5:
-  %_vpay_35 = getelementptr inbounds i8, ptr %_loc_19, i64 4
-  %_ld_36 = load i32, ptr %_vpay_35, align 4
-  %_v_18 = select i1 true, i32 %_ld_36, i32 %_ld_36
-  call void @llvm.memset.p0.i64(ptr align 4 %_scratch_37, i8 0, i64 8, i1 false)
-  %_tvp_38 = getelementptr inbounds i8, ptr %_scratch_37, i64 4
-  store i32 %_v_18, ptr %_tvp_38, align 4
-  store i8 1, ptr %_scratch_37, align 1
-  %_ld_39 = load %_cx_ty_66, ptr %_scratch_37, align 4
-  %_v_20 = select i1 true, %_cx_ty_66 %_ld_39, %_cx_ty_66 %_ld_39
+  %_vpay_33 = getelementptr inbounds i8, ptr %_loc_19, i64 4
+  %_ld_34 = load i32, ptr %_vpay_33, align 4
+  %_v_18 = select i1 true, i32 %_ld_34, i32 %_ld_34
+  call void @llvm.memset.p0.i64(ptr align 4 %_scratch_35, i8 0, i64 8, i1 false)
+  %_tvp_36 = getelementptr inbounds i8, ptr %_scratch_35, i64 4
+  store i32 %_v_18, ptr %_tvp_36, align 4
+  store i8 1, ptr %_scratch_35, align 1
+  %_ld_37 = load %_cx_ty_66, ptr %_scratch_35, align 4
+  %_v_20 = select i1 true, %_cx_ty_66 %_ld_37, %_cx_ty_66 %_ld_37
   store %_cx_ty_66 %_v_20, ptr %_loc_0, align 8
   %_v_23 = add i8 0, 0
-  call void @llvm.memset.p0.i64(ptr align 4 %_scratch_40, i8 0, i64 8, i1 false)
-  store %_cx_ty_66 %_v_20, ptr %_scratch_40, align 4
-  %_tag_ld_41 = load i8, ptr %_scratch_40, align 1
-  %_tag_32_41 = zext i8 %_tag_ld_41 to i32
-  %_rc_is_err_42 = icmp ne i32 %_tag_32_41, 0
-  br i1 %_rc_is_err_42, label %_rc_err_42, label %_rc_ok_42
-_rc_err_42:
-  %_rc_ep_42 = getelementptr inbounds i8, ptr %_scratch_40, i64 4
-  %_se_iv_43 = load i32, ptr %_rc_ep_42, align 1
-  %_se_u64_43 = zext i32 %_se_iv_43 to i64
-  %_se_tg_43 = or i64 %_se_u64_43, 72057594037927936
-  %_se_ep_43 = inttoptr i64 %_se_tg_43 to ptr
-  store ptr %_se_ep_43, ptr %_cx_err_slot, align 8
+  call void @llvm.memset.p0.i64(ptr align 4 %_scratch_38, i8 0, i64 8, i1 false)
+  store %_cx_ty_66 %_v_20, ptr %_scratch_38, align 4
+  %_tag_ld_39 = load i8, ptr %_scratch_38, align 1
+  %_tag_32_39 = zext i8 %_tag_ld_39 to i32
+  %_rc_is_err_40 = icmp ne i32 %_tag_32_39, 0
+  br i1 %_rc_is_err_40, label %_rc_err_40, label %_rc_ok_40
+_rc_err_40:
+  %_rc_ep_40 = getelementptr inbounds i8, ptr %_scratch_38, i64 4
+  %_se_iv_41 = load i32, ptr %_rc_ep_40, align 1
+  %_se_u64_41 = zext i32 %_se_iv_41 to i64
+  %_se_tg_41 = or i64 %_se_u64_41, 72057594037927936
+  %_se_ep_41 = inttoptr i64 %_se_tg_41 to ptr
+  store ptr %_se_ep_41, ptr %_cx_err_slot, align 8
   ret i32 0
-_rc_ok_42:
-  %_rc_op_42 = getelementptr inbounds i8, ptr %_scratch_40, i64 4
-  %_ld_44 = load i32, ptr %_rc_op_42, align 4
-  ret i32 %_ld_44
+_rc_ok_40:
+  %_rc_op_40 = getelementptr inbounds i8, ptr %_scratch_38, i64 4
+  %_ld_42 = load i32, ptr %_rc_op_40, align 4
+  ret i32 %_ld_42
 _bb_6:
   unreachable
 _bb_7:
   unreachable
 _bb_8:
-  %_v_63 = phi i64 [ %_v_61, %_rep_end_17 ], [ %_v_85, %_ok_57 ]
+  %_v_63 = phi i64 [ %_v_34, %_rep_end_17 ], [ %_v_85, %_ok_55 ]
   %_v_65 = icmp ult i64 %_v_63, %_v_36
   br i1 %_v_65, label %_bb_10, label %_bb_9
 _bb_9:
-  %_ld_45 = load [4 x i32], ptr %_loc_9, align 8
-  %_v_95 = select i1 true, [4 x i32] %_ld_45, [4 x i32] %_ld_45
-  %_vsp_i_47 = insertelement <4 x i32> poison, i32 %_v_15, i32 0
-  %_vsp_v_47 = shufflevector <4 x i32> %_vsp_i_47, <4 x i32> poison, <4 x i32> zeroinitializer
-  store <4 x i32> %_vsp_v_47, ptr %_scratch_46, align 16
-  %_v_98 = load [4 x i32], ptr %_scratch_46, align 16
-  store [4 x i32] %_v_95, ptr %_scratch_48, align 16
-  store [4 x i32] %_v_98, ptr %_scratch_49, align 16
-  %_vbl_50 = load <4 x i32>, ptr %_scratch_48, align 16
-  %_vbr_50 = load <4 x i32>, ptr %_scratch_49, align 16
-  %_vbo_50 = add <4 x i32> %_vbl_50, %_vbr_50
-  store <4 x i32> %_vbo_50, ptr %_scratch_48, align 16
-  %_v_99 = load [4 x i32], ptr %_scratch_48, align 16
-  store [4 x i32] %_v_99, ptr %_scratch_51, align 16
-  %_vrd_v_52 = load <4 x i32>, ptr %_scratch_51, align 16
-  %_v_100 = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %_vrd_v_52)
-  %_tag_ld_53 = load i8, ptr %_loc_2, align 1
-  %_tag_32_53 = zext i8 %_tag_ld_53 to i32
-  %_v_103 = add i32 %_tag_32_53, 0
+  %_ld_43 = load [4 x i32], ptr %_loc_9, align 8
+  %_v_95 = select i1 true, [4 x i32] %_ld_43, [4 x i32] %_ld_43
+  %_vsp_i_45 = insertelement <4 x i32> poison, i32 %_v_15, i32 0
+  %_vsp_v_45 = shufflevector <4 x i32> %_vsp_i_45, <4 x i32> poison, <4 x i32> zeroinitializer
+  store <4 x i32> %_vsp_v_45, ptr %_scratch_44, align 16
+  %_v_98 = load [4 x i32], ptr %_scratch_44, align 16
+  store [4 x i32] %_v_95, ptr %_scratch_46, align 16
+  store [4 x i32] %_v_98, ptr %_scratch_47, align 16
+  %_vbl_48 = load <4 x i32>, ptr %_scratch_46, align 16
+  %_vbr_48 = load <4 x i32>, ptr %_scratch_47, align 16
+  %_vbo_48 = add <4 x i32> %_vbl_48, %_vbr_48
+  store <4 x i32> %_vbo_48, ptr %_scratch_46, align 16
+  %_v_99 = load [4 x i32], ptr %_scratch_46, align 16
+  store [4 x i32] %_v_99, ptr %_scratch_49, align 16
+  %_vrd_v_50 = load <4 x i32>, ptr %_scratch_49, align 16
+  %_v_100 = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %_vrd_v_50)
+  %_tag_ld_51 = load i8, ptr %_loc_2, align 1
+  %_tag_32_51 = zext i8 %_tag_ld_51 to i32
+  %_v_103 = add i32 %_tag_32_51, 0
   switch i32 %_v_103, label %_bb_17 [
     i32 1, label %_bb_15
     i32 0, label %_bb_14
   ]
 _bb_10:
-  %_ar_bo_54 = mul i64 %_v_63, 4
-  %_ar_ep_54 = getelementptr inbounds i8, ptr %_loc_9, i64 %_ar_bo_54
-  %_ld_55 = load i32, ptr %_ar_ep_54, align 4, !llvm.access.group !2
-  %_v_71 = select i1 true, i32 %_ld_55, i32 %_ld_55
-  %_ovp_56 = call { i32, i1 } @llvm.sadd.with.overflow.i32(i32 %_v_71, i32 %_v_33)
-  %_ovf_56 = extractvalue { i32, i1 } %_ovp_56, 1
-  br i1 %_ovf_56, label %_trap_57, label %_ok_57
-_trap_57:
+  %_ar_bo_52 = mul i64 %_v_63, 4
+  %_ar_ep_52 = getelementptr inbounds i8, ptr %_loc_9, i64 %_ar_bo_52
+  %_ld_53 = load i32, ptr %_ar_ep_52, align 4, !llvm.access.group !2
+  %_v_71 = select i1 true, i32 %_ld_53, i32 %_ld_53
+  %_ovp_54 = call { i32, i1 } @llvm.sadd.with.overflow.i32(i32 %_v_71, i32 %_v_33)
+  %_ovf_54 = extractvalue { i32, i1 } %_ovp_54, 1
+  br i1 %_ovf_54, label %_trap_55, label %_ok_55
+_trap_55:
   call void @_cx_rt_trap(i32 2)
   unreachable
-_ok_57:
-  %_v_74 = extractvalue { i32, i1 } %_ovp_56, 0
-  %_ar_bo_58 = mul i64 %_v_63, 4
-  %_ar_ep_58 = getelementptr inbounds i8, ptr %_loc_9, i64 %_ar_bo_58
-  store i32 %_v_74, ptr %_ar_ep_58, align 4, !llvm.access.group !2
+_ok_55:
+  %_v_74 = extractvalue { i32, i1 } %_ovp_54, 0
+  %_ar_bo_56 = mul i64 %_v_63, 4
+  %_ar_ep_56 = getelementptr inbounds i8, ptr %_loc_9, i64 %_ar_bo_56
+  store i32 %_v_74, ptr %_ar_ep_56, align 4, !llvm.access.group !2
   %_v_80 = add i8 0, 0
   %_v_83 = add i64 0, 1
   %_v_85 = add nuw i64 %_v_63, %_v_83
@@ -481,9 +479,9 @@ _bb_13:
 _bb_14:
   br label %_bb_18
 _bb_15:
-  %_vpay_59 = getelementptr inbounds i8, ptr %_loc_2, i64 4
-  %_ld_60 = load i32, ptr %_vpay_59, align 4
-  %_v_106 = select i1 true, i32 %_ld_60, i32 %_ld_60
+  %_vpay_57 = getelementptr inbounds i8, ptr %_loc_2, i64 4
+  %_ld_58 = load i32, ptr %_vpay_57, align 4
+  %_v_106 = select i1 true, i32 %_ld_58, i32 %_ld_58
   br label %_bb_18
 _bb_16:
   unreachable
@@ -491,101 +489,99 @@ _bb_17:
   unreachable
 _bb_18:
   %_v_109 = phi i32 [ %_v_106, %_bb_15 ], [ %_v_26, %_bb_14 ]
-  %_scol_61 = getelementptr inbounds i8, ptr %_loc_6, i64 0
-  %_idx_c_62 = sext i32 %_v_26 to i64
-  %_sidx_b_63 = mul i64 %_idx_c_62, 4
-  %_sidx_p_63 = getelementptr inbounds i8, ptr %_scol_61, i64 %_sidx_b_63
-  %_ld_64 = load i32, ptr %_sidx_p_63, align 4
-  %_v_118 = select i1 true, i32 %_ld_64, i32 %_ld_64
-  %_ovp_65 = call { i32, i1 } @llvm.sadd.with.overflow.i32(i32 %_v_100, i32 %_v_118)
-  %_ovf_65 = extractvalue { i32, i1 } %_ovp_65, 1
-  br i1 %_ovf_65, label %_trap_66, label %_ok_66
-_trap_66:
+  %_scol_59 = getelementptr inbounds i8, ptr %_loc_6, i64 0
+  %_sidx_b_60 = mul i64 %_v_34, 4
+  %_sidx_p_60 = getelementptr inbounds i8, ptr %_scol_59, i64 %_sidx_b_60
+  %_ld_61 = load i32, ptr %_sidx_p_60, align 4
+  %_v_118 = select i1 true, i32 %_ld_61, i32 %_ld_61
+  %_ovp_62 = call { i32, i1 } @llvm.sadd.with.overflow.i32(i32 %_v_100, i32 %_v_118)
+  %_ovf_62 = extractvalue { i32, i1 } %_ovp_62, 1
+  br i1 %_ovf_62, label %_trap_63, label %_ok_63
+_trap_63:
   call void @_cx_rt_trap(i32 2)
   unreachable
-_ok_66:
-  %_v_120 = extractvalue { i32, i1 } %_ovp_65, 0
-  %_scol_67 = getelementptr inbounds i8, ptr %_loc_6, i64 16
-  %_idx_c_68 = sext i32 %_v_44 to i64
-  %_sidx_b_69 = mul i64 %_idx_c_68, 4
-  %_sidx_p_69 = getelementptr inbounds i8, ptr %_scol_67, i64 %_sidx_b_69
-  %_ld_70 = load i32, ptr %_sidx_p_69, align 4
-  %_v_127 = select i1 true, i32 %_ld_70, i32 %_ld_70
-  %_ovp_71 = call { i32, i1 } @llvm.sadd.with.overflow.i32(i32 %_v_120, i32 %_v_127)
-  %_ovf_71 = extractvalue { i32, i1 } %_ovp_71, 1
-  br i1 %_ovf_71, label %_trap_72, label %_ok_72
-_trap_72:
+_ok_63:
+  %_v_120 = extractvalue { i32, i1 } %_ovp_62, 0
+  %_scol_64 = getelementptr inbounds i8, ptr %_loc_6, i64 16
+  %_sidx_b_65 = mul i64 %_v_44, 4
+  %_sidx_p_65 = getelementptr inbounds i8, ptr %_scol_64, i64 %_sidx_b_65
+  %_ld_66 = load i32, ptr %_sidx_p_65, align 4
+  %_v_127 = select i1 true, i32 %_ld_66, i32 %_ld_66
+  %_ovp_67 = call { i32, i1 } @llvm.sadd.with.overflow.i32(i32 %_v_120, i32 %_v_127)
+  %_ovf_67 = extractvalue { i32, i1 } %_ovp_67, 1
+  br i1 %_ovf_67, label %_trap_68, label %_ok_68
+_trap_68:
   call void @_cx_rt_trap(i32 2)
   unreachable
-_ok_72:
-  %_v_129 = extractvalue { i32, i1 } %_ovp_71, 0
-  %_ovp_73 = call { i32, i1 } @llvm.sadd.with.overflow.i32(i32 %_v_129, i32 %_v_109)
-  %_ovf_73 = extractvalue { i32, i1 } %_ovp_73, 1
-  br i1 %_ovf_73, label %_trap_74, label %_ok_74
-_trap_74:
+_ok_68:
+  %_v_129 = extractvalue { i32, i1 } %_ovp_67, 0
+  %_ovp_69 = call { i32, i1 } @llvm.sadd.with.overflow.i32(i32 %_v_129, i32 %_v_109)
+  %_ovf_69 = extractvalue { i32, i1 } %_ovp_69, 1
+  br i1 %_ovf_69, label %_trap_70, label %_ok_70
+_trap_70:
   call void @_cx_rt_trap(i32 2)
   unreachable
-_ok_74:
-  %_v_130 = extractvalue { i32, i1 } %_ovp_73, 0
-  call void @llvm.memset.p0.i64(ptr align 4 %_scratch_75, i8 0, i64 8, i1 false)
-  %_tvp_76 = getelementptr inbounds i8, ptr %_scratch_75, i64 4
-  store i32 %_v_130, ptr %_tvp_76, align 4
-  store i8 0, ptr %_scratch_75, align 1
-  %_ld_77 = load %_cx_ty_66, ptr %_scratch_75, align 4
-  %_v_131 = select i1 true, %_cx_ty_66 %_ld_77, %_cx_ty_66 %_ld_77
+_ok_70:
+  %_v_130 = extractvalue { i32, i1 } %_ovp_69, 0
+  call void @llvm.memset.p0.i64(ptr align 4 %_scratch_71, i8 0, i64 8, i1 false)
+  %_tvp_72 = getelementptr inbounds i8, ptr %_scratch_71, i64 4
+  store i32 %_v_130, ptr %_tvp_72, align 4
+  store i8 0, ptr %_scratch_71, align 1
+  %_ld_73 = load %_cx_ty_66, ptr %_scratch_71, align 4
+  %_v_131 = select i1 true, %_cx_ty_66 %_ld_73, %_cx_ty_66 %_ld_73
   store %_cx_ty_66 %_v_131, ptr %_loc_0, align 8
   %_v_136 = add i8 0, 0
-  call void @llvm.memset.p0.i64(ptr align 4 %_scratch_78, i8 0, i64 8, i1 false)
-  store %_cx_ty_66 %_v_131, ptr %_scratch_78, align 4
-  %_tag_ld_79 = load i8, ptr %_scratch_78, align 1
-  %_tag_32_79 = zext i8 %_tag_ld_79 to i32
-  %_rc_is_err_80 = icmp ne i32 %_tag_32_79, 0
-  br i1 %_rc_is_err_80, label %_rc_err_80, label %_rc_ok_80
-_rc_err_80:
-  %_rc_ep_80 = getelementptr inbounds i8, ptr %_scratch_78, i64 4
-  %_se_iv_81 = load i32, ptr %_rc_ep_80, align 1
-  %_se_u64_81 = zext i32 %_se_iv_81 to i64
-  %_se_tg_81 = or i64 %_se_u64_81, 72057594037927936
-  %_se_ep_81 = inttoptr i64 %_se_tg_81 to ptr
-  store ptr %_se_ep_81, ptr %_cx_err_slot, align 8
+  call void @llvm.memset.p0.i64(ptr align 4 %_scratch_74, i8 0, i64 8, i1 false)
+  store %_cx_ty_66 %_v_131, ptr %_scratch_74, align 4
+  %_tag_ld_75 = load i8, ptr %_scratch_74, align 1
+  %_tag_32_75 = zext i8 %_tag_ld_75 to i32
+  %_rc_is_err_76 = icmp ne i32 %_tag_32_75, 0
+  br i1 %_rc_is_err_76, label %_rc_err_76, label %_rc_ok_76
+_rc_err_76:
+  %_rc_ep_76 = getelementptr inbounds i8, ptr %_scratch_74, i64 4
+  %_se_iv_77 = load i32, ptr %_rc_ep_76, align 1
+  %_se_u64_77 = zext i32 %_se_iv_77 to i64
+  %_se_tg_77 = or i64 %_se_u64_77, 72057594037927936
+  %_se_ep_77 = inttoptr i64 %_se_tg_77 to ptr
+  store ptr %_se_ep_77, ptr %_cx_err_slot, align 8
   ret i32 0
-_rc_ok_80:
-  %_rc_op_80 = getelementptr inbounds i8, ptr %_scratch_78, i64 4
-  %_ld_82 = load i32, ptr %_rc_op_80, align 4
-  ret i32 %_ld_82
+_rc_ok_76:
+  %_rc_op_76 = getelementptr inbounds i8, ptr %_scratch_74, i64 4
+  %_ld_78 = load i32, ptr %_rc_op_76, align 4
+  ret i32 %_ld_78
 _bb_19:
   unreachable
 _bb_20:
   %_v_145 = add i32 0, 0
-  call void @llvm.memset.p0.i64(ptr align 4 %_scratch_83, i8 0, i64 8, i1 false)
-  %_tvp_84 = getelementptr inbounds i8, ptr %_scratch_83, i64 4
-  store i32 %_v_145, ptr %_tvp_84, align 4
-  store i8 1, ptr %_scratch_83, align 1
-  %_ld_85 = load %_cx_ty_66, ptr %_scratch_83, align 4
-  %_v_146 = select i1 true, %_cx_ty_66 %_ld_85, %_cx_ty_66 %_ld_85
+  call void @llvm.memset.p0.i64(ptr align 4 %_scratch_79, i8 0, i64 8, i1 false)
+  %_tvp_80 = getelementptr inbounds i8, ptr %_scratch_79, i64 4
+  store i32 %_v_145, ptr %_tvp_80, align 4
+  store i8 1, ptr %_scratch_79, align 1
+  %_ld_81 = load %_cx_ty_66, ptr %_scratch_79, align 4
+  %_v_146 = select i1 true, %_cx_ty_66 %_ld_81, %_cx_ty_66 %_ld_81
   store %_cx_ty_66 %_v_146, ptr %_loc_22, align 8
   %_v_148 = add i8 0, 0
   br label %_bb_1
 _bb_21:
   %_v_156 = zext i8 %_v_168 to i32
-  call void @llvm.memset.p0.i64(ptr align 4 %_scratch_86, i8 0, i64 4, i1 false)
-  store i32 %_v_169, ptr %_scratch_86, align 4
-  %_ld_87 = load i32, ptr %_scratch_86, align 4
-  %_v_160 = select i1 true, i32 %_ld_87, i32 %_ld_87
-  %_ovp_88 = call { i32, i1 } @llvm.sadd.with.overflow.i32(i32 %_v_156, i32 %_v_160)
-  %_ovf_88 = extractvalue { i32, i1 } %_ovp_88, 1
-  br i1 %_ovf_88, label %_trap_89, label %_ok_89
-_trap_89:
+  call void @llvm.memset.p0.i64(ptr align 4 %_scratch_82, i8 0, i64 4, i1 false)
+  store i32 %_v_169, ptr %_scratch_82, align 4
+  %_ld_83 = load i32, ptr %_scratch_82, align 4
+  %_v_160 = select i1 true, i32 %_ld_83, i32 %_ld_83
+  %_ovp_84 = call { i32, i1 } @llvm.sadd.with.overflow.i32(i32 %_v_156, i32 %_v_160)
+  %_ovf_84 = extractvalue { i32, i1 } %_ovp_84, 1
+  br i1 %_ovf_84, label %_trap_85, label %_ok_85
+_trap_85:
   call void @_cx_rt_trap(i32 2)
   unreachable
-_ok_89:
-  %_v_161 = extractvalue { i32, i1 } %_ovp_88, 0
-  call void @llvm.memset.p0.i64(ptr align 4 %_scratch_90, i8 0, i64 8, i1 false)
-  %_tvp_91 = getelementptr inbounds i8, ptr %_scratch_90, i64 4
-  store i32 %_v_161, ptr %_tvp_91, align 4
-  store i8 0, ptr %_scratch_90, align 1
-  %_ld_92 = load %_cx_ty_66, ptr %_scratch_90, align 4
-  %_v_162 = select i1 true, %_cx_ty_66 %_ld_92, %_cx_ty_66 %_ld_92
+_ok_85:
+  %_v_161 = extractvalue { i32, i1 } %_ovp_84, 0
+  call void @llvm.memset.p0.i64(ptr align 4 %_scratch_86, i8 0, i64 8, i1 false)
+  %_tvp_87 = getelementptr inbounds i8, ptr %_scratch_86, i64 4
+  store i32 %_v_161, ptr %_tvp_87, align 4
+  store i8 0, ptr %_scratch_86, align 1
+  %_ld_88 = load %_cx_ty_66, ptr %_scratch_86, align 4
+  %_v_162 = select i1 true, %_cx_ty_66 %_ld_88, %_cx_ty_66 %_ld_88
   store %_cx_ty_66 %_v_162, ptr %_loc_22, align 8
   %_v_164 = add i8 0, 0
   br label %_bb_1

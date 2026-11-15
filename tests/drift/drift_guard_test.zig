@@ -1,9 +1,9 @@
 //! Repository-Wide Drift Guards (`tests/drift/drift_guard_test.zig`)
 //!
 //! Enforces zero colored emojis across the entire repository, 100% parity between `router.zig`
-//! tables and `corex --help`, `DIAGNOSTIC_CATALOG` subsystem prefix integrity, Phase 1–6 IR/VM/opt/
-//! SAST struct layouts, `DR-20` seams, enum contiguity, and diagnostic test coverage, plus `< 150`
-//! column line length and 90-character top-level section dividers across all `.zig` source files.
+//! tables and `corex --help`, `DIAGNOSTIC_CATALOG` subsystem prefix integrity, Phase 1–7.5 IR/VM/
+//! SAST/ABI struct layouts, `DR-20`/`DR-21` seams, enum contiguity, and diagnostic test coverage,
+//! plus `< 150` column line length and 90-character top-level dividers across all `.zig`/`.cx` files.
 //!
 //! Prevents code/documentation drift and stylistic regressions automatically during `zig build test`.
 
@@ -152,6 +152,7 @@ fn walkZigDirectoryFormatting(allocator: std.mem.Allocator, io: std.Io, dir_path
 
 /// Asserts that `EnumType` has strictly contiguous integer backing tags `0 .. N - 1`.
 fn expectContiguousEnum(comptime EnumType: type) !void {
+    @setEvalBranchQuota(20_000);
     const enum_info = @typeInfo(EnumType).@"enum";
     const TagInt = enum_info.tag_type;
     const enum_values = std.enums.values(EnumType);
@@ -321,10 +322,11 @@ test "test_drift_guard_zig_files_column_150_and_section_dividers" {
 }
 
 test "test_drift_guard_phase1_token_kind_contiguity_and_keyword_table" {
+    @setEvalBranchQuota(20_000);
     const token_enum_info = @typeInfo(TokenKind).@"enum";
     const token_values = std.enums.values(TokenKind);
-    try std.testing.expectEqual(@as(usize, 112), token_enum_info.field_names.len);
-    try std.testing.expectEqual(@as(usize, 112), token_values.len);
+    try std.testing.expectEqual(@as(usize, 117), token_enum_info.field_names.len);
+    try std.testing.expectEqual(@as(usize, 117), token_values.len);
 
     inline for (token_values, 0..) |tok_val, i| {
         try std.testing.expectEqual(@as(u8, @intCast(i)), @backingInt(tok_val));
@@ -334,13 +336,13 @@ test "test_drift_guard_phase1_token_kind_contiguity_and_keyword_table" {
 
     const keys = lexer.KEYWORD_OR_PRIM_MAP.keys();
     const values = lexer.KEYWORD_OR_PRIM_MAP.values();
-    try std.testing.expectEqual(@as(usize, 64), keys.len);
+    try std.testing.expectEqual(@as(usize, 68), keys.len);
 
-    var has_seen_keyword: [45]bool = @splat(false);
+    var has_seen_keyword: [49]bool = @splat(false);
     var prim_count: usize = 0;
     for (values) |kind_val| {
         const backing = @backingInt(kind_val);
-        if (backing < 45) {
+        if (backing < 49) {
             try std.testing.expect(!has_seen_keyword[backing]);
             has_seen_keyword[backing] = true;
         } else {
@@ -355,6 +357,7 @@ test "test_drift_guard_phase1_token_kind_contiguity_and_keyword_table" {
 }
 
 test "test_drift_guard_phase2_cst_node_kind_ast_tag_and_parser_diagnostics" {
+    @setEvalBranchQuota(20_000);
     // [1] Verify `CstNodeKind` enum contiguity (`0..N-1`):
     const cst_enum_info = @typeInfo(CstNodeKind).@"enum";
     const cst_values = std.enums.values(CstNodeKind);
@@ -375,9 +378,9 @@ test "test_drift_guard_phase2_cst_node_kind_ast_tag_and_parser_diagnostics" {
         try std.testing.expectEqualStrings(ast_enum_info.field_names[i], @tagName(ast_val));
     }
 
-    // [3] Verify `TokenSet128` covers all 112 `TokenKind`s (`@backingInt(tok) < 128`):
+    // [3] Verify `TokenSet128` covers all 117 `TokenKind`s (`@backingInt(tok) < 128`):
     const token_values = std.enums.values(TokenKind);
-    try std.testing.expectEqual(@as(usize, 112), token_values.len);
+    try std.testing.expectEqual(@as(usize, 117), token_values.len);
     var full_set = TokenSet128.EMPTY;
     for (token_values) |tok_val| {
         try std.testing.expect(@backingInt(tok_val) < 128);
@@ -431,13 +434,21 @@ test "test_drift_guard_phase3_query_db_fmt_engine_and_cli_flags" {
     }
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(corex.DocInst));
 
-    // [3] Verify `FMT_FLAGS` (`--check`, `--fix`) parity in `stage0/src/cli/router.zig`:
-    try std.testing.expectEqual(@as(usize, 2), router.FMT_FLAGS.len);
+    // [3] Verify `FMT_FLAGS` (`--check`, `--fix`, `--internal-core`) and `UPGRADE_FLAGS` parity in `stage0/src/cli/router.zig`:
+    try std.testing.expectEqual(@as(usize, 3), router.FMT_FLAGS.len);
     try std.testing.expectEqualStrings("--check", router.FMT_FLAGS[0].long_flag);
     try std.testing.expectEqualStrings("--fix", router.FMT_FLAGS[1].long_flag);
+    try std.testing.expectEqualStrings("--internal-core", router.FMT_FLAGS[2].long_flag);
     for (router.FMT_FLAGS, 0..) |fmt_flag, i| {
         try std.testing.expectEqual(i, @as(usize, @backingInt(fmt_flag.id)));
         try std.testing.expect(fmt_flag.summary.len > 0);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), router.UPGRADE_FLAGS.len);
+    try std.testing.expectEqualStrings("--internal-core", router.UPGRADE_FLAGS[0].long_flag);
+    for (router.UPGRADE_FLAGS, 0..) |upg_flag, i| {
+        try std.testing.expectEqual(i, @as(usize, @backingInt(upg_flag.id)));
+        try std.testing.expect(upg_flag.summary.len > 0);
     }
 }
 
@@ -529,18 +540,19 @@ test "test_drift_guard_phase5_hir_mir_vm_opt_layouts_cli_flags_and_diagnostics" 
     try expectContiguousEnum(corex.IntrinsicKind);
 
     // [3] Verify `router.COMPILE_FLAGS` alphabetical sorting, summaries, subcommand help, and `parseArgs`:
-    try std.testing.expectEqual(@as(usize, 11), router.COMPILE_FLAGS.len);
+    try std.testing.expectEqual(@as(usize, 12), router.COMPILE_FLAGS.len);
     try std.testing.expectEqualStrings("--comptime-limit", router.COMPILE_FLAGS[0].long_flag);
     try std.testing.expectEqualStrings("--dev", router.COMPILE_FLAGS[1].long_flag);
     try std.testing.expectEqualStrings("--diff-backends", router.COMPILE_FLAGS[2].long_flag);
     try std.testing.expectEqualStrings("--emit-c", router.COMPILE_FLAGS[3].long_flag);
     try std.testing.expectEqualStrings("--emit-llvm", router.COMPILE_FLAGS[4].long_flag);
     try std.testing.expectEqualStrings("--fuzz", router.COMPILE_FLAGS[5].long_flag);
-    try std.testing.expectEqualStrings("--ofmt", router.COMPILE_FLAGS[6].long_flag);
-    try std.testing.expectEqualStrings("--output", router.COMPILE_FLAGS[7].long_flag);
-    try std.testing.expectEqualStrings("--release", router.COMPILE_FLAGS[8].long_flag);
-    try std.testing.expectEqualStrings("--sast-strict", router.COMPILE_FLAGS[9].long_flag);
-    try std.testing.expectEqualStrings("--target", router.COMPILE_FLAGS[10].long_flag);
+    try std.testing.expectEqualStrings("--internal-core", router.COMPILE_FLAGS[6].long_flag);
+    try std.testing.expectEqualStrings("--ofmt", router.COMPILE_FLAGS[7].long_flag);
+    try std.testing.expectEqualStrings("--output", router.COMPILE_FLAGS[8].long_flag);
+    try std.testing.expectEqualStrings("--release", router.COMPILE_FLAGS[9].long_flag);
+    try std.testing.expectEqualStrings("--sast-strict", router.COMPILE_FLAGS[10].long_flag);
+    try std.testing.expectEqualStrings("--target", router.COMPILE_FLAGS[11].long_flag);
     for (router.COMPILE_FLAGS, 0..) |comp_flag, i| {
         try std.testing.expectEqual(i, @as(usize, @backingInt(comp_flag.id)));
         try std.testing.expect(comp_flag.summary.len > 0);
@@ -888,6 +900,127 @@ test "test_drift_guard_phase7_abi_codegen_seam_layouts_and_core" {
         if (!has_ref) {
             std.debug.print(
                 "Phase 7 diagnostic `{s}` is not referenced in `tests/unit/`\n",
+                .{tag_identifiers[i]},
+            );
+        }
+        try std.testing.expect(has_ref);
+    }
+}
+
+test "test_drift_guard_phase7_5_dr21_surface_syntax_and_diagnostics" {
+    // [1] Verify `TokenKind` retired `.coloncolon` / `.colon_colon` and exact `DR-21` token ordinals:
+    try std.testing.expect(!@hasField(TokenKind, "coloncolon"));
+    try std.testing.expect(!@hasDecl(TokenKind, "colon_colon"));
+    try std.testing.expectEqual(@as(u8, 38), @backingInt(TokenKind.kw_orelse));
+    try std.testing.expectEqual(@as(u8, 39), @backingInt(TokenKind.kw_with));
+    try std.testing.expectEqual(@as(u8, 40), @backingInt(TokenKind.kw_context));
+    try std.testing.expectEqual(@as(u8, 41), @backingInt(TokenKind.kw_unreachable));
+    try std.testing.expectEqual(@as(u8, 66), @backingInt(TokenKind.colon_eq));
+    try std.testing.expectEqual(@as(u8, 75), @backingInt(TokenKind.dollar));
+
+    // [2] Verify `--internal-core` CLI flag parsing and subcommand `--help` parity across `check`, `fmt`, and `upgrade`:
+    var internal_sink = corex.DiagnosticSink.init(std.testing.allocator);
+    defer internal_sink.deinit();
+    const parsed_internal = try router.parseArgs(&.{ "check", "--internal-core" }, &internal_sink);
+    try std.testing.expect(!internal_sink.hasErrors());
+    try std.testing.expect(parsed_internal.is_internal_core);
+
+    const parsed_fmt_internal = try router.parseArgs(&.{ "fmt", "--internal-core" }, &internal_sink);
+    try std.testing.expect(!internal_sink.hasErrors());
+    try std.testing.expect(parsed_fmt_internal.is_internal_core);
+
+    const parsed_upg_internal = try router.parseArgs(&.{ "upgrade", "--internal-core" }, &internal_sink);
+    try std.testing.expect(!internal_sink.hasErrors());
+    try std.testing.expect(parsed_upg_internal.is_internal_core);
+
+    var fmt_help_buf: [2048]u8 = undefined;
+    var fmt_help_writer = std.Io.Writer.fixed(&fmt_help_buf);
+    try router.renderSubcommandHelp(&fmt_help_writer, corex.StyleConfig.MONOCHROME, .fmt);
+    try std.testing.expect(std.mem.indexOf(u8, fmt_help_writer.buffered(), "--internal-core") != null);
+
+    var upg_help_buf: [2048]u8 = undefined;
+    var upg_help_writer = std.Io.Writer.fixed(&upg_help_buf);
+    try router.renderSubcommandHelp(&upg_help_writer, corex.StyleConfig.MONOCHROME, .upgrade);
+    try std.testing.expect(std.mem.indexOf(u8, upg_help_writer.buffered(), "--internal-core") != null);
+
+    var default_sink = corex.DiagnosticSink.init(std.testing.allocator);
+    defer default_sink.deinit();
+    const parsed_default = try router.parseArgs(&.{"check"}, &default_sink);
+    try std.testing.expect(!default_sink.hasErrors());
+    try std.testing.expect(!parsed_default.is_internal_core);
+
+    // [3] Verify 8-slot `ContextFieldKind` contiguity (`0..7`) and `ContextFieldLayout` lookup (`SE-08`):
+    try expectContiguousEnum(corex.ContextFieldKind);
+    try std.testing.expectEqual(@as(usize, 8), std.enums.values(corex.ContextFieldKind).len);
+    const expected_ctx_slots = [_]struct {
+        /// Canonical `Context` field identifier.
+        name: []const u8,
+        /// Expected `ContextFieldKind` slot discriminant (`0..7`).
+        kind: corex.ContextFieldKind,
+    }{
+        .{ .name = "allocator", .kind = .allocator },
+        .{ .name = "scratch", .kind = .scratch },
+        .{ .name = "rng_seed", .kind = .rng_seed },
+        .{ .name = "trace_sink", .kind = .trace_sink },
+        .{ .name = "temp_allocator", .kind = .temp_allocator },
+        .{ .name = "logger", .kind = .logger },
+        .{ .name = "diagnostics", .kind = .diagnostics },
+        .{ .name = "cancel_token", .kind = .cancel_token },
+    };
+    for (expected_ctx_slots, 0..) |slot_spec, i| {
+        const resolved = corex.ContextFieldLayout.fromFieldName(slot_spec.name);
+        try std.testing.expect(resolved != null);
+        try std.testing.expectEqual(slot_spec.kind, resolved.?.kind);
+        try std.testing.expectEqual(@as(u8, @intCast(i)), resolved.?.slot_ordinal);
+    }
+
+    // [4] Verify all 8 `DR-21` `DiagnosticCode` tags (`78` total catalog entries) and test coverage:
+    try std.testing.expectEqual(@as(usize, 78), diagnostic.DIAGNOSTIC_CATALOG.len);
+    const dr21_specs = [_]struct {
+        /// Canonical Phase 7.5 `DR-21` `DiagnosticCode` tag.
+        code: DiagnosticCode,
+        /// Expected 5-character CLI code string.
+        expected_str: []const u8,
+    }{
+        .{ .code = .e0112_retired_path_separator, .expected_str = "E0112" },
+        .{ .code = .e0214_invalid_condition_binding, .expected_str = "E0214" },
+        .{ .code = .e0215_invalid_walrus_position, .expected_str = "E0215" },
+        .{ .code = .e0216_retired_if_while_let, .expected_str = "E0216" },
+        .{ .code = .e0218_direct_core_import_forbidden, .expected_str = "E0218" },
+        .{ .code = .e0416_invalid_dollar_length_expr, .expected_str = "E0416" },
+        .{ .code = .e0418_irrefutable_is_binding, .expected_str = "E0418" },
+        .{ .code = .e0419_invalid_call_arguments, .expected_str = "E0419" },
+    };
+
+    var tag_identifiers: [dr21_specs.len][]const u8 = undefined;
+    var has_test_reference: [dr21_specs.len]bool = @splat(false);
+    for (dr21_specs, 0..) |spec, i| {
+        const entry = diagnostic.DIAGNOSTIC_CATALOG[@backingInt(spec.code)];
+        try std.testing.expectEqualStrings(spec.expected_str, spec.code.asCodeStr());
+        try std.testing.expectEqualStrings(spec.expected_str, entry.code_str);
+        try std.testing.expect(entry.title.len > 0);
+        try std.testing.expect(entry.explanation.len > 0);
+        tag_identifiers[i] = @tagName(spec.code);
+    }
+
+    try markReferencedIdentifiersInDir(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/unit",
+        &tag_identifiers,
+        &has_test_reference,
+    );
+    try markReferencedIdentifiersInDir(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/snapshots",
+        &tag_identifiers,
+        &has_test_reference,
+    );
+    for (has_test_reference, 0..) |has_ref, i| {
+        if (!has_ref) {
+            std.debug.print(
+                "Phase 7.5 diagnostic `{s}` is not referenced in `tests/unit/` or `tests/snapshots/`\n",
                 .{tag_identifiers[i]},
             );
         }

@@ -365,6 +365,7 @@ test "test_abi_classifier_cx_native_cx_result_cc_swifterror_and_7_target_c_abis"
     try std.testing.expectEqual(SwifterrorKind.zst_err, fn_zst.swifterror_kind);
     try std.testing.expectEqual(@as(u8, 0), fn_zst.swifterror_recipe.attr_bits);
     try std.testing.expect(fn_zst.has_implicit_context);
+    try std.testing.expectEqual(@as(u32, 64), fn_zst.context_recipe.lowered_size_bytes);
     try std.testing.expectEqual(AbiPassMode.indirect_by_ref, fn_zst.param_recipes[0].pass_mode);
     try std.testing.expect(fn_zst.param_recipes[0].attrs().is_readonly);
 
@@ -578,7 +579,7 @@ test "test_phase7_loop_contracts_raw_blob_proven_ranges_and_17_intrinsics_in_vm"
     try std.testing.expect(!sink.hasErrors());
     try std.testing.expectEqual(@as(usize, 1), blob_store.blobs.items.len);
 
-    // [4] Empty-slice non-null niche (`Option[str]::Some("") != Option[str]::None`) + atomics + SIMD + I/O in `MirVm`:
+    // [4] Empty-slice non-null niche (`Option[str].Some("") != Option[str].None`) + atomics + SIMD + I/O in `MirVm`:
     const vm_showcase_src =
         \\pub fn run_phase7_intrinsics() -> i32 {
         \\    let some_empty: str? = .Some("");
@@ -743,4 +744,32 @@ test "test_regression_sysv_eightbyte_span_c_union_abi_and_refined_niche_layout" 
     try std.testing.expectEqual(RegBank.gpr, fn_arm_union.param_recipes[0].bank_0);
     try std.testing.expectEqual(AbiPassMode.direct_scalar, fn_arm_union.ret_recipe.pass_mode);
     try std.testing.expectEqual(RegBank.gpr, fn_arm_union.ret_recipe.bank_0);
+}
+
+test "test_regression_wasm32_context_recipe_uniform_64b_8b_aligned_rv2_crit05" {
+    const src =
+        \\pub fn read_seed() -> u64 {
+        \\    return context.rng_seed;
+        \\}
+    ;
+    var tc_res = try corex.typecheckSource(std.testing.allocator, FileId.fromInt(10), src);
+    defer tc_res.deinit();
+    try std.testing.expect(!tc_res.diagnostics.hasErrors());
+
+    var res_wasm = TypeLayoutResolver.init(
+        std.testing.allocator,
+        &tc_res.type_pool,
+        &tc_res.symbol_table,
+        TargetSpec.WASM32_WASI,
+    );
+    defer res_wasm.deinit();
+    var fn_wasm = try AbiClassifier.classifyFn(std.testing.allocator, &res_wasm, .{
+        .params = &.{},
+        .ret_ty = .u64_ty,
+        .is_contextless = false,
+    });
+    defer fn_wasm.deinit(std.testing.allocator);
+    try std.testing.expect(fn_wasm.has_implicit_context);
+    try std.testing.expectEqual(@as(u32, 64), fn_wasm.context_recipe.lowered_size_bytes);
+    try std.testing.expectEqual(@as(u16, 8), fn_wasm.context_recipe.pointee_align_bytes);
 }

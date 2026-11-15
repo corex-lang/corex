@@ -121,12 +121,20 @@ pub const LineIndex = vfs_sourcemap.LineIndex;
 pub const VfsSourceMap = vfs_sourcemap.VfsSourceMap;
 /// Ergonomic alias for `VfsSourceMap`.
 pub const SourceMap = vfs_sourcemap.SourceMap;
-/// Lexical token taxonomy.
+/// 117-variant lexical token taxonomy (`DR-03` & `DR-21`).
 pub const TokenKind = syntax_arenas.TokenKind;
+/// 1-byte bit-packed token trivia and lexical recovery flags.
+pub const TokenFlags = syntax_arenas.TokenFlags;
 /// Structure-of-Arrays token and trivia buffer.
 pub const TokenBuffer = syntax_arenas.TokenBuffer;
+/// Lossless Concrete Syntax Tree node kind taxonomy.
+pub const CstNodeKind = syntax_arenas.CstNodeKind;
 /// Pre-order lossless Concrete Syntax Tree arena.
 pub const LosslessCstArena = syntax_arenas.LosslessCstArena;
+/// Abstract Syntax Tree node discriminant tag taxonomy.
+pub const AstTag = syntax_arenas.AstTag;
+/// 13-byte Structure-of-Arrays AST node record.
+pub const AstNode = syntax_arenas.AstNode;
 /// Structure-of-Arrays Abstract Syntax Tree arena.
 pub const AstArena = syntax_arenas.AstArena;
 /// Alias for `AstArena`.
@@ -147,7 +155,7 @@ pub const Lexer = lexer.Lexer;
 pub const tokenize = lexer.tokenize;
 /// Canonical alias for `tokenize`.
 pub const lexFile = lexer.lexFile;
-/// Looks up a lexeme in the 45-keyword + 19-primitive-type table.
+/// Looks up a lexeme in the 49-keyword + 19-primitive-type table.
 pub const lookupKeywordOrPrim = lexer.lookupKeywordOrPrim;
 /// Classifies an identifier or keyword under the `DR-03` disjoint casing invariant.
 pub const classifyIdentifierOrKeyword = lexer.classifyIdentifierOrKeyword;

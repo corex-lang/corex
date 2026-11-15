@@ -19,6 +19,7 @@ const StringInterner = corex.StringInterner;
 const TokenBuffer = corex.TokenBuffer;
 const LosslessCstArena = corex.LosslessCstArena;
 const AstArena = corex.AstArena;
+const CompilerDb = corex.CompilerDb;
 const DiagnosticSink = corex.DiagnosticSink;
 const DiagnosticCode = corex.DiagnosticCode;
 const ScopeKind = symbol_resolver.ScopeKind;
@@ -222,8 +223,8 @@ test "test_symbol_resolver_mod_use_imports_and_private_visibility_e0409" {
             "mod extra {\n" ++
             "    pub const BONUS: i32 = 5;\n" ++
             "}\n" ++
-            "use math::{double_val, triple_val as mul3};\n" ++
-            "use extra::*;\n" ++
+            "use math.{double_val, triple_val as mul3};\n" ++
+            "use extra.*;\n" ++
             "pub fn entry(seed: i32) -> i32 {\n" ++
             "    return double_val(seed) + mul3(seed) + BONUS;\n" ++
             "}\n";
@@ -242,7 +243,7 @@ test "test_symbol_resolver_mod_use_imports_and_private_visibility_e0409" {
             "        return val + 1;\n" ++
             "    }\n" ++
             "}\n" ++
-            "use internal_mod::secret_helper;\n" ++
+            "use internal_mod.secret_helper;\n" ++
             "pub fn caller(val: i32) -> i32 {\n" ++
             "    return secret_helper(val);\n" ++
             "}\n";
@@ -261,7 +262,7 @@ test "test_symbol_resolver_mod_use_imports_and_private_visibility_e0409" {
             "        balance: i64,\n" ++
             "    }\n" ++
             "}\n" ++
-            "pub fn inspect_balance(acc: vault::Account) -> i64 {\n" ++
+            "pub fn inspect_balance(acc: vault.Account) -> i64 {\n" ++
             "    return acc.balance;\n" ++
             "}\n";
 
@@ -322,4 +323,102 @@ test "test_symbol_resolver_unused_binding_w0402_and_typo_suggestion_e0403" {
         try std.testing.expectEqual(@as(u32, 1), res.diagnostics.warning_count);
         try std.testing.expect(hasDiagnosticCode(&res.diagnostics, .w0402_unused_binding));
     }
+}
+
+// -------- Internal Core Gate (E0218) Bypass Hardening ---------
+
+test "test_symbol_resolver_internal_core_gate_blocks_self_group_and_non_root_bypasses" {
+    var db = try CompilerDb.init(std.testing.allocator);
+    defer db.deinit();
+
+    const core_fid = FileId.fromInt(10);
+    const user_fid = FileId.fromInt(11);
+    const core_stub_src =
+        "pub mod mem {\n" ++
+        "    pub fn size_of_type[T]() -> usize = 8;\n" ++
+        "}\n";
+    _ = try db.setInput(core_fid, core_stub_src, .high);
+    try db.registerRootModule("core", core_fid);
+    try db.registerRootModule("cx", core_fid);
+
+    // [1] `use self.core.mem;`, `use {self.core.mem};`, and `use core.{mem};` emit `E0218` with zero cascading `E0403`:
+    const blocked_imports = [_][]const u8{
+        "use self.core.mem;\npub fn entry() -> i32 = 0;\n",
+        "use {self.core.mem};\npub fn entry() -> i32 = 0;\n",
+        "use core.{mem};\npub fn entry() -> i32 = 0;\n",
+    };
+    for (blocked_imports) |user_src| {
+        _ = try db.setInput(user_fid, user_src, .low);
+        _ = try db.resolveSignatures(user_fid);
+        const sig_sink = db.getSignatureDiagnostics(user_fid).?;
+        try std.testing.expect(hasDiagnosticCode(sig_sink, .e0218_direct_core_import_forbidden));
+        try std.testing.expect(!hasDiagnosticCode(sig_sink, .e0403_unresolved_symbol));
+    }
+
+    // [2] Non-root segment (`use dummy.core.mem;`) never falls back to global `named_module_scopes` (`E0403`):
+    const dummy_src =
+        "mod dummy {}\n" ++
+        "use dummy.core.mem;\n" ++
+        "pub fn entry() -> i32 = 0;\n";
+    _ = try db.setInput(user_fid, dummy_src, .low);
+    _ = try db.resolveSignatures(user_fid);
+    const dummy_sink = db.getSignatureDiagnostics(user_fid).?;
+    try std.testing.expect(hasDiagnosticCode(dummy_sink, .e0403_unresolved_symbol));
+
+    // [3] Enabling `--internal-core` allows `use core.mem;` cleanly:
+    try db.setInternalCore(true);
+    _ = try db.setInput(user_fid, "use core.mem;\npub fn entry() -> usize = mem.size_of_type[u64]();\n", .low);
+    _ = try db.resolveSignatures(user_fid);
+    const allowed_sink = db.getSignatureDiagnostics(user_fid).?;
+    try std.testing.expect(!allowed_sink.hasErrors());
+}
+
+// ----------- Retired std Namespace & cx.meta Scopes -----------
+
+test "test_symbol_resolver_retired_std_namespace_and_cx_meta_atomic_scopes" {
+    // [1] `ensureCxMetaScope` parents `meta` and `atomic` under `cx_root_scope` without synthesizing `"std"`:
+    {
+        var interner = try StringInterner.init(std.testing.allocator);
+        defer interner.deinit();
+        var sym_table = try SymbolTable.init(std.testing.allocator, &interner);
+        defer sym_table.deinit();
+
+        const meta_scope = try sym_table.ensureCxMetaScope(&interner);
+        try std.testing.expect(!meta_scope.isNone());
+        try std.testing.expectEqual(meta_scope, sym_table.cx_meta_scope);
+        try std.testing.expect(!sym_table.cx_root_scope.isNone());
+        try std.testing.expect(!sym_table.cx_atomic_scope.isNone());
+        try std.testing.expectEqual(
+            sym_table.cx_root_scope,
+            sym_table.scope_arena.getScope(meta_scope).parent,
+        );
+
+        const std_id = try interner.intern("std");
+        try std.testing.expect(
+            sym_table.lookupInScopeDirect(sym_table.prelude_scope, std_id, NamespaceMask.ALL).isNone(),
+        );
+    }
+
+    // [2] `use std.meta;` emits `E0403`, whereas `use cx.meta;` and `use cx.atomic.Ordering;` resolve cleanly:
+    {
+        var retired_std_res = try runResolveAndTypecheck(
+            std.testing.allocator,
+            "use std.meta;\npub fn entry() -> i32 = 0;\n",
+        );
+        defer retired_std_res.deinit();
+        try std.testing.expect(hasDiagnosticCode(&retired_std_res.diagnostics, .e0403_unresolved_symbol));
+
+        var cx_meta_res = try runResolveAndTypecheck(
+            std.testing.allocator,
+            "use cx.meta.TypeInfo;\nuse cx.atomic.Ordering;\npub fn entry(_ord: Ordering, _ti: TypeInfo) -> i32 = 0;\n",
+        );
+        defer cx_meta_res.deinit();
+        try std.testing.expect(!cx_meta_res.diagnostics.hasErrors());
+    }
+
+    // [3] `BUILTIN_TYPE_AND_GROUP_MAP` provides $O(1)$ lookup across primitive types and groups:
+    try std.testing.expectEqual(TypeId.f32_ty, symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.get("f32").?);
+    try std.testing.expectEqual(TypeId.f64_ty, symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.get("f64").?);
+    try std.testing.expectEqual(TypeId.usize_ty, symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.get("usize").?);
+    try std.testing.expect(symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.get("NotABuiltin") == null);
 }

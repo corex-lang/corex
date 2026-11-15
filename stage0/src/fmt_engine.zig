@@ -614,6 +614,14 @@ pub const FormatResult = struct {
 
 // --------------- Trivia & CST Formatter Context ---------------
 
+/// Paired `.context_binding` CST subtree and its optional trailing `,` token.
+const WithBindingEntry = struct {
+    /// CST node index of the `.context_binding` entry.
+    binding_id: CstNodeIndex,
+    /// Trailing `,` token index following this binding, or `.none` when omitted.
+    comma_tok: TokenIndex = .none,
+};
+
 /// Byte range in `source` suppressed by `// corex fmt: off` … `// corex fmt: on`.
 const SuppressedRange = struct {
     /// Starting byte offset in `source` (including the `// corex fmt: off` comment).
@@ -634,13 +642,17 @@ const FixDeclRole = enum(u2) {
 
 /// Pre-classified leading and same-line trailing trivia metadata for a single token in `TokenBuffer`.
 const TokenTriviaMeta = struct {
-    /// Start index in `token_buffer.trivia.items` for this token's leading trivia.
+    /// Start index in `trivia_slice` for this token's leading trivia.
     leading_start: u32 = 0,
-    /// End index in `token_buffer.trivia.items` for this token's leading trivia.
+    /// End index in `trivia_slice` for this token's leading trivia.
     leading_end: u32 = 0,
-    /// Start index in `token_buffer.trivia.items` of same-line trailing trivia stolen from next token.
+    /// Start index in `trivia_slice` for this token's direct trailing trivia.
+    trailing_start: u32 = 0,
+    /// End index in `trivia_slice` for this token's direct trailing trivia.
+    trailing_end: u32 = 0,
+    /// Start index in `trivia_slice` of same-line trailing trivia stolen from next token.
     stolen_trailing_start: u32 = 0,
-    /// End index in `token_buffer.trivia.items` of same-line trailing trivia stolen from next token.
+    /// End index in `trivia_slice` of same-line trailing trivia stolen from next token.
     stolen_trailing_end: u32 = 0,
     /// Whether at least 1 newline occurred between the previous real token and this token.
     has_leading_newline: bool = false,
@@ -664,7 +676,17 @@ const TokenTriviaMeta = struct {
     decl_role: FixDeclRole = .none,
 };
 
-/// Sortable entry representing a single specifier inside a braced `use a::b::{…};` group.
+/// Prepared formatter trivia table borrowing `TokenBuffer.trivia` or owning an uncoalesced expansion.
+const PreparedTriviaTable = struct {
+    /// Active trivia slice indexed by `TokenTriviaMeta` ranges.
+    trivia_slice: []const TriviaPiece,
+    /// Owned expanded trivia buffer when `TRIVIA_FLAG_COALESCED` was present (`null` in the common case).
+    owned_trivia: ?[]TriviaPiece = null,
+    /// Per-token trivia classification table.
+    token_meta: []TokenTriviaMeta,
+};
+
+/// Sortable entry representing a single specifier inside a braced `use a.b.{…};` group.
 const UseSpecEntry = struct {
     /// CST node index of the child `.use_tree` node.
     node_idx: CstNodeIndex,
@@ -733,17 +755,17 @@ fn classifyFmtDirective(comment_slice: []const u8) enum { none, fmt_off, fmt_on 
     return .none;
 }
 
-/// Extracts all `// corex fmt: off` … `// corex fmt: on` byte ranges from `token_buffer.trivia`.
+/// Extracts all `// corex fmt: off` … `// corex fmt: on` byte ranges from `trivia_slice`.
 fn extractSuppressedRanges(
     allocator: std.mem.Allocator,
     source: []const u8,
-    token_buffer: *const TokenBuffer,
+    trivia_slice: []const TriviaPiece,
 ) !std.ArrayList(SuppressedRange) {
     var ranges: std.ArrayList(SuppressedRange) = .empty;
     errdefer ranges.deinit(allocator);
 
     var active_off_start: ?u32 = null;
-    for (token_buffer.trivia.items) |piece| {
+    for (trivia_slice) |piece| {
         if (piece.kind != .line_comment) continue;
         const start: usize = piece.byte_offset;
         const end: usize = @min(source.len, start + piece.byte_len);
@@ -776,31 +798,172 @@ fn extractSuppressedRanges(
     return ranges;
 }
 
+/// Appends chunked `TriviaPiece` records (`<= 65,535` bytes each) into `dest`.
+fn appendChunkedTriviaPieces(
+    allocator: std.mem.Allocator,
+    dest: *std.ArrayList(TriviaPiece),
+    kind: TriviaKind,
+    start_offset: u32,
+    total_len: usize,
+) !void {
+    var cur_off = start_offset;
+    var rem = total_len;
+    while (rem > 0) {
+        const chunk: u16 = @intCast(@min(rem, @as(usize, std.math.maxInt(u16))));
+        try dest.append(allocator, .{
+            .kind = kind,
+            .flags = 0,
+            .byte_len = chunk,
+            .byte_offset = cur_off,
+        });
+        cur_off += chunk;
+        rem -= chunk;
+    }
+}
+
+/// Expands a `TriviaPiece` (splitting `TRIVIA_FLAG_COALESCED` slots back into atomic pieces) into `dest`.
+fn appendExpandedTriviaPiece(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    piece: TriviaPiece,
+    dest: *std.ArrayList(TriviaPiece),
+) !void {
+    if ((piece.flags & syntax_arenas.TRIVIA_FLAG_COALESCED) == 0) {
+        try dest.append(allocator, piece);
+        return;
+    }
+    const start_pos: usize = piece.byte_offset;
+    const end_pos: usize = @min(source.len, start_pos + piece.byte_len);
+    var cursor = start_pos;
+    while (cursor < end_pos) {
+        const byte_val = source[cursor];
+        if (cursor == 0 and byte_val == '#' and cursor + 1 < end_pos and source[cursor + 1] == '!') {
+            const run_start = cursor;
+            cursor += 2;
+            while (cursor < end_pos and source[cursor] != '\n' and source[cursor] != '\r') : (cursor += 1) {}
+            try appendChunkedTriviaPieces(allocator, dest, .shebang, @intCast(run_start), cursor - run_start);
+        } else if (byte_val == ' ') {
+            const run_start = cursor;
+            cursor += 1;
+            while (cursor < end_pos and source[cursor] == ' ') : (cursor += 1) {}
+            try appendChunkedTriviaPieces(allocator, dest, .spaces, @intCast(run_start), cursor - run_start);
+        } else if (byte_val == '\t') {
+            const run_start = cursor;
+            cursor += 1;
+            while (cursor < end_pos and source[cursor] == '\t') : (cursor += 1) {}
+            try appendChunkedTriviaPieces(allocator, dest, .tabs, @intCast(run_start), cursor - run_start);
+        } else if (byte_val == '\n') {
+            try appendChunkedTriviaPieces(allocator, dest, .newline_lf, @intCast(cursor), 1);
+            cursor += 1;
+        } else if (byte_val == '\r') {
+            if (cursor + 1 < end_pos and source[cursor + 1] == '\n') {
+                try appendChunkedTriviaPieces(allocator, dest, .newline_crlf, @intCast(cursor), 2);
+                cursor += 2;
+            } else {
+                try appendChunkedTriviaPieces(allocator, dest, .skipped_unexpected, @intCast(cursor), 1);
+                cursor += 1;
+            }
+        } else if (byte_val == '/' and cursor + 1 < end_pos and source[cursor + 1] == '/') {
+            const run_start = cursor;
+            var comment_kind: TriviaKind = .line_comment;
+            if (cursor + 2 < end_pos) {
+                if (source[cursor + 2] == '!') {
+                    comment_kind = .module_doc_comment;
+                } else if (source[cursor + 2] == '/' and (cursor + 3 >= end_pos or source[cursor + 3] != '/')) {
+                    comment_kind = .doc_comment;
+                }
+            }
+            cursor += 2;
+            while (cursor < end_pos and source[cursor] != '\n' and source[cursor] != '\r') : (cursor += 1) {}
+            try appendChunkedTriviaPieces(allocator, dest, comment_kind, @intCast(run_start), cursor - run_start);
+        } else if (byte_val == '/' and cursor + 1 < end_pos and source[cursor + 1] == '*') {
+            const run_start = cursor;
+            cursor += 2;
+            var depth: u32 = 1;
+            while (cursor < end_pos and depth > 0) {
+                if (source[cursor] == '/' and cursor + 1 < end_pos and source[cursor + 1] == '*') {
+                    depth += 1;
+                    cursor += 2;
+                } else if (source[cursor] == '*' and cursor + 1 < end_pos and source[cursor + 1] == '/') {
+                    depth -= 1;
+                    cursor += 2;
+                } else {
+                    cursor += 1;
+                }
+            }
+            try appendChunkedTriviaPieces(allocator, dest, .block_comment, @intCast(run_start), cursor - run_start);
+        } else {
+            try appendChunkedTriviaPieces(allocator, dest, .skipped_unexpected, @intCast(cursor), 1);
+            cursor += 1;
+        }
+    }
+}
+
 /// Pre-classifies leading and same-line trailing trivia for every token in `token_buffer`.
 fn buildTokenTriviaMeta(
     allocator: std.mem.Allocator,
+    source: []const u8,
     token_buffer: *const TokenBuffer,
-) ![]TokenTriviaMeta {
+) !PreparedTriviaTable {
     const token_count = token_buffer.countTokens();
     const meta_table = try allocator.alloc(TokenTriviaMeta, token_count);
+    errdefer allocator.free(meta_table);
     @memset(meta_table, .{});
 
-    const all_trivia = token_buffer.trivia.items;
+    var has_coalesced = false;
+    for (token_buffer.trivia.items) |piece| {
+        if ((piece.flags & syntax_arenas.TRIVIA_FLAG_COALESCED) != 0) {
+            has_coalesced = true;
+            break;
+        }
+    }
+
+    var owned_trivia: ?[]TriviaPiece = null;
+    errdefer if (owned_trivia) |owned| allocator.free(owned);
+
+    if (has_coalesced) {
+        var expanded: std.ArrayList(TriviaPiece) = .empty;
+        errdefer expanded.deinit(allocator);
+        var tok_idx: usize = 0;
+        while (tok_idx < token_count) : (tok_idx += 1) {
+            const tok_id = TokenIndex.fromInt(@intCast(tok_idx));
+            meta_table[tok_idx].leading_start = @intCast(expanded.items.len);
+            for (token_buffer.getLeadingTrivia(tok_id)) |piece| {
+                try appendExpandedTriviaPiece(allocator, source, piece, &expanded);
+            }
+            meta_table[tok_idx].leading_end = @intCast(expanded.items.len);
+            meta_table[tok_idx].trailing_start = @intCast(expanded.items.len);
+            for (token_buffer.getTrailingTrivia(tok_id)) |piece| {
+                try appendExpandedTriviaPiece(allocator, source, piece, &expanded);
+            }
+            meta_table[tok_idx].trailing_end = @intCast(expanded.items.len);
+        }
+        owned_trivia = try expanded.toOwnedSlice(allocator);
+    } else {
+        var tok_idx: usize = 0;
+        while (tok_idx < token_count) : (tok_idx += 1) {
+            const rec = token_buffer.getToken(TokenIndex.fromInt(@intCast(tok_idx)));
+            const lead_start: u32 = rec.trivia_span.start_index;
+            const lead_end: u32 = lead_start + rec.trivia_span.leading_count;
+            meta_table[tok_idx].leading_start = lead_start;
+            meta_table[tok_idx].leading_end = lead_end;
+            meta_table[tok_idx].trailing_start = lead_end;
+            meta_table[tok_idx].trailing_end = lead_end + rec.trivia_span.trailing_count;
+        }
+    }
+
+    const all_trivia: []const TriviaPiece = if (owned_trivia) |owned| owned else token_buffer.trivia.items;
     var prev_real_tok: ?u32 = null;
 
     var i: usize = 0;
     while (i < token_count) : (i += 1) {
         const tok_id = TokenIndex.fromInt(@intCast(i));
         const rec = token_buffer.getToken(tok_id);
-        const lead_start: u32 = rec.trivia_span.start_index;
-        const lead_count: u32 = rec.trivia_span.leading_count;
-        const lead_end: u32 = lead_start + lead_count;
-        const trail_start: u32 = lead_end;
-        const trail_end: u32 = trail_start + rec.trivia_span.trailing_count;
-
         var meta = &meta_table[i];
-        meta.leading_start = lead_start;
-        meta.leading_end = lead_end;
+        const lead_start: u32 = meta.leading_start;
+        const lead_end: u32 = meta.leading_end;
+        const trail_start: u32 = meta.trailing_start;
+        const trail_end: u32 = meta.trailing_end;
 
         // Check any explicit trailing trivia attached directly to `tok_id`:
         var tr_idx: u32 = trail_start;
@@ -878,7 +1041,11 @@ fn buildTokenTriviaMeta(
         }
     }
 
-    return meta_table;
+    return .{
+        .trivia_slice = all_trivia,
+        .owned_trivia = owned_trivia,
+        .token_meta = meta_table,
+    };
 }
 
 // ----------------- CST Node & Token Utilities -----------------
@@ -986,7 +1153,7 @@ fn isFixableMissingSemicolonNode(
     }
     const end_idx: usize = node_idx.asInt() + node.subtree_size;
     var child_idx: usize = node_idx.asInt() + 1;
-    while (child_idx < end_idx) {
+    while (child_idx < end_idx) : (child_idx += 1) {
         const child_id = CstNodeIndex.fromInt(@intCast(child_idx));
         const child = cst_arena.getNode(child_id);
         if (child.kind == .invalid_parse_subtree or child.kind == .invalid_parse_leaf) {
@@ -998,7 +1165,6 @@ fn isFixableMissingSemicolonNode(
                 return false;
             }
         }
-        child_idx += child.subtree_size;
     }
     return true;
 }
@@ -1041,6 +1207,10 @@ const CstFormatter = struct {
     cst_arena: *const LosslessCstArena,
     /// Target document algebra arena receiving 8-byte `DocInst` instructions.
     doc_arena: *DocArena,
+    /// Active trivia slice (borrowed from `token_buffer` or expanded in `owned_trivia`).
+    trivia_slice: []const TriviaPiece,
+    /// Owned expanded trivia buffer when `TRIVIA_FLAG_COALESCED` was present (`null` otherwise).
+    owned_trivia: ?[]TriviaPiece = null,
     /// Pre-classified per-token trivia metadata table indexed by `TokenIndex.asInt()`.
     token_meta: []TokenTriviaMeta,
     /// Pre-extracted `// corex fmt: off` … `// corex fmt: on` byte ranges.
@@ -1061,6 +1231,8 @@ const CstFormatter = struct {
     rename_allocations: std.ArrayList([]u8) = .empty,
     /// Nesting depth of syntactic type positions (e.g., `.named_type`, `.type_params`, `.type_args`).
     in_type_context: u32 = 0,
+    /// Nesting depth inside `.index_expr` `[…]` brackets for compact `$-K` formatting (`DR-21` §3.3).
+    index_bracket_depth: u32 = 0,
     /// Whether `--fix` mode (casing normalization and missing `;` synthesis) is enabled.
     is_fix_mode: bool,
 
@@ -1073,9 +1245,12 @@ const CstFormatter = struct {
         doc_arena: *DocArena,
         is_fix_mode: bool,
     ) !CstFormatter {
-        const token_meta = try buildTokenTriviaMeta(allocator, token_buffer);
-        errdefer allocator.free(token_meta);
-        var suppressed_ranges = try extractSuppressedRanges(allocator, source, token_buffer);
+        const prepared = try buildTokenTriviaMeta(allocator, source, token_buffer);
+        errdefer {
+            allocator.free(prepared.token_meta);
+            if (prepared.owned_trivia) |owned| allocator.free(owned);
+        }
+        var suppressed_ranges = try extractSuppressedRanges(allocator, source, prepared.trivia_slice);
         errdefer suppressed_ranges.deinit(allocator);
 
         var self = CstFormatter{
@@ -1084,7 +1259,9 @@ const CstFormatter = struct {
             .token_buffer = token_buffer,
             .cst_arena = cst_arena,
             .doc_arena = doc_arena,
-            .token_meta = token_meta,
+            .trivia_slice = prepared.trivia_slice,
+            .owned_trivia = prepared.owned_trivia,
+            .token_meta = prepared.token_meta,
             .suppressed_ranges = suppressed_ranges,
             .is_fix_mode = is_fix_mode,
         };
@@ -1107,6 +1284,7 @@ const CstFormatter = struct {
         self.declared_const_names.deinit(self.allocator);
         self.declared_value_names.deinit(self.allocator);
         self.suppressed_ranges.deinit(self.allocator);
+        if (self.owned_trivia) |owned| self.allocator.free(owned);
         self.allocator.free(self.token_meta);
         self.* = undefined;
     }
@@ -1122,6 +1300,15 @@ const CstFormatter = struct {
             return true;
         }
         return false;
+    }
+
+    /// Returns whether `leaf_node` is a zero-length comment-carrier leaf (`token == .none` or `.eof`).
+    inline fn isZeroLengthCommentCarrierLeaf(self: *const CstFormatter, leaf_node: CstNodeRecord) bool {
+        if (leaf_node.subtree_size != 1) return false;
+        if (leaf_node.token.isNone()) return true;
+        const tok_rec = self.token_buffer.getToken(leaf_node.token);
+        if (tok_rec.kind == .eof) return true;
+        return tok_rec.kind == .invalid_token and tok_rec.flags.is_synthesized and tok_rec.byte_len == 0;
     }
 
     /// Appends the direct CST children of composite node `parent_idx` into `out_children`.
@@ -1212,7 +1399,7 @@ const CstFormatter = struct {
         const first_tok = self.findFirstTokenInSubtree(node_idx);
         if (first_tok.isNone()) return 0;
         const meta = self.token_meta[first_tok.asInt()];
-        const all_trivia = self.token_buffer.trivia.items;
+        const all_trivia = self.trivia_slice;
         var idx: u32 = meta.leading_start;
         while (idx < meta.leading_end) : (idx += 1) {
             if (isCommentOrShebangTrivia(all_trivia[idx].kind)) {
@@ -1228,13 +1415,13 @@ const CstFormatter = struct {
         if (last_tok.isNone()) return 0;
         const rec = self.token_buffer.getToken(last_tok);
         var max_end: u32 = rec.byte_offset + rec.byte_len;
-        for (self.token_buffer.getTrailingTrivia(last_tok)) |piece| {
+        const meta = self.token_meta[last_tok.asInt()];
+        const all_trivia = self.trivia_slice;
+        for (all_trivia[meta.trailing_start..meta.trailing_end]) |piece| {
             if (isCommentOrShebangTrivia(piece.kind)) {
                 max_end = @max(max_end, piece.byte_offset + piece.byte_len);
             }
         }
-        const meta = self.token_meta[last_tok.asInt()];
-        const all_trivia = self.token_buffer.trivia.items;
         var idx: u32 = meta.stolen_trailing_start;
         while (idx < meta.stolen_trailing_end) : (idx += 1) {
             const piece = all_trivia[idx];
@@ -1333,7 +1520,7 @@ const CstFormatter = struct {
 
         if (!meta.has_leading_comments) return;
 
-        const all_trivia = self.token_buffer.trivia.items;
+        const all_trivia = self.trivia_slice;
         var newline_count: u32 = if (meta.has_split_newline) 1 else 0;
         var has_emitted_any_comment = false;
         var last_was_line_comment = false;
@@ -1400,14 +1587,14 @@ const CstFormatter = struct {
 
         if (!meta.has_trailing_comments) return;
 
-        for (self.token_buffer.getTrailingTrivia(tok_id)) |piece| {
+        const all_trivia = self.trivia_slice;
+        for (all_trivia[meta.trailing_start..meta.trailing_end]) |piece| {
             if (!isCommentOrShebangTrivia(piece.kind)) continue;
             const start: usize = piece.byte_offset;
             const end: usize = @min(self.source.len, start + piece.byte_len);
             try self.doc_arena.emitLineSuffix(self.source[start..end]);
         }
 
-        const all_trivia = self.token_buffer.trivia.items;
         var idx: u32 = meta.stolen_trailing_start;
         while (idx < meta.stolen_trailing_end) : (idx += 1) {
             const piece = all_trivia[idx];
@@ -1587,7 +1774,7 @@ const CstFormatter = struct {
             }
         }
 
-        const all_trivia = self.token_buffer.trivia.items;
+        const all_trivia = self.trivia_slice;
         const token_count = self.token_buffer.countTokens();
         var i: usize = 0;
         while (i < token_count) : (i += 1) {
@@ -1792,10 +1979,18 @@ const CstFormatter = struct {
                         try self.registerFixRename(tok_id, .screaming_snake_case);
                     }
                 },
-                .fn_sig, .struct_field, .fn_param, .closure_param, .mod_item => {
+                .fn_sig, .struct_field, .fn_param, .closure_param, .mod_item, .loop_label, .at_pat => {
                     if (self.findFirstIdentTokenInDirectChildren(node_id)) |tok_id| {
                         try self.registerFixRename(tok_id, .snake_case);
                     }
+                },
+                .walrus_cond_expr => {
+                    if (self.findWalrusIdentToken(node_id)) |tok_id| {
+                        try self.registerFixRename(tok_id, .snake_case);
+                    }
+                },
+                .for_header => {
+                    try self.registerForHeaderFixRenames(node_id);
                 },
                 .local_decl_stmt => {
                     if (self.findLocalDeclIdentToken(node_id)) |tok_id| {
@@ -1818,7 +2013,7 @@ const CstFormatter = struct {
     fn registerFixRename(self: *CstFormatter, tok_id: TokenIndex, target_case: TargetCase) !void {
         if (tok_id.isNone()) return;
         const rec = self.token_buffer.getToken(tok_id);
-        if (rec.flags.is_synthesized or !isRenamableIdentifierKind(rec.kind)) return;
+        if (rec.flags.is_synthesized or rec.flags.has_lexer_error or !isRenamableIdentifierKind(rec.kind)) return;
         const raw_name = self.getTokenLexeme(tok_id);
         if (raw_name.len == 0 or std.mem.eql(u8, raw_name, "_") or std.mem.eql(u8, raw_name, "self") or
             std.mem.eql(u8, raw_name, "Self") or std.mem.eql(u8, raw_name, "subscript"))
@@ -1925,6 +2120,51 @@ const CstFormatter = struct {
             child_cursor += @max(@as(usize, 1), child.subtree_size);
         }
         return null;
+    }
+
+    /// Finds the bound identifier token inside a `.walrus_cond_expr` (`([var] ident [: T] := expr)`).
+    fn findWalrusIdentToken(self: *const CstFormatter, walrus_idx: CstNodeIndex) ?TokenIndex {
+        const walrus = self.cst_arena.getNode(walrus_idx);
+        const end_idx: usize = walrus_idx.asInt() + walrus.subtree_size;
+        var child_cursor: usize = walrus_idx.asInt() + 1;
+        while (child_cursor < end_idx) {
+            const child = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(child_cursor)));
+            if (child.subtree_size == 1 and !self.shouldSkipLeaf(child)) {
+                const tok_kind = self.token_buffer.getToken(child.token).kind;
+                if (isRenamableIdentifierKind(tok_kind)) return child.token;
+                if (tok_kind == .colon or tok_kind == .colon_eq) break;
+            }
+            child_cursor += @max(@as(usize, 1), child.subtree_size);
+        }
+        return null;
+    }
+
+    /// Registers bound element/index identifiers inside a `.for_header` (`pat [, idx] in iter`).
+    fn registerForHeaderFixRenames(self: *CstFormatter, header_idx: CstNodeIndex) !void {
+        const header = self.cst_arena.getNode(header_idx);
+        const end_idx: usize = header_idx.asInt() + header.subtree_size;
+        var has_seen_comma = false;
+        var child_cursor: usize = header_idx.asInt() + 1;
+        while (child_cursor < end_idx) {
+            const child_id = CstNodeIndex.fromInt(@intCast(child_cursor));
+            const child = self.cst_arena.getNode(child_id);
+            if (child.kind == .ident_pat) {
+                const pat_tok = if (child.subtree_size == 1 and !self.shouldSkipLeaf(child))
+                    child.token
+                else
+                    self.findFirstIdentTokenInDirectChildren(child_id) orelse .none;
+                try self.registerFixRename(pat_tok, .snake_case);
+            } else if (child.subtree_size == 1 and !self.shouldSkipLeaf(child)) {
+                const tok_kind = self.token_buffer.getToken(child.token).kind;
+                if (tok_kind == .kw_in) break;
+                if (tok_kind == .comma) {
+                    has_seen_comma = true;
+                } else if (has_seen_comma and isRenamableIdentifierKind(tok_kind)) {
+                    try self.registerFixRename(child.token, .snake_case);
+                }
+            }
+            child_cursor += @max(@as(usize, 1), child.subtree_size);
+        }
     }
 
     /// Returns whether `node_idx` has a direct leaf child whose `TokenKind` equals `target_kind`.
@@ -2061,7 +2301,8 @@ const CstFormatter = struct {
         const node = self.cst_arena.getNode(node_idx);
         return switch (node.kind) {
             .type_alias_item, .const_item => true,
-            .trait_member, .fn_item => !self.hasDirectChildKind(node_idx, .block),
+            .trait_member, .fn_item => !self.hasDirectChildKind(node_idx, .block) and
+                !self.hasDirectChildKind(node_idx, .fn_expr_body),
             else => false,
         };
     }
@@ -2125,7 +2366,7 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats a `.use_item` declaration (`[pub] use a::b::{…};`).
+    /// Formats a `.use_item` declaration (`[pub] use a.b.{…};`).
     fn formatUseItem(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
@@ -2933,6 +3174,9 @@ const CstFormatter = struct {
                 }
             } else if (child.kind == .fn_sig) {
                 try self.formatFnSig(child_id);
+            } else if (child.kind == .fn_expr_body) {
+                has_emitted_semi = true;
+                try self.formatFnExprBody(child_id);
             } else if (child.kind == .block) {
                 has_block_body = true;
                 try self.doc_arena.emitText(" ");
@@ -2942,6 +3186,107 @@ const CstFormatter = struct {
             }
         }
         if (!has_block_body and !has_emitted_semi) {
+            try self.doc_arena.emitText(";");
+        }
+    }
+
+    /// Returns whether `expr_id` is a delimited/block-headed expression that hugs `=` in `= expr;`.
+    fn isHuggedFnBodyExpr(self: *const CstFormatter, expr_id: CstNodeIndex) bool {
+        return switch (self.cst_arena.getNode(expr_id).kind) {
+            .block,
+            .match_expr,
+            .struct_lit_expr,
+            .view_block_expr,
+            .with_expr,
+            .if_expr,
+            .for_stmt,
+            .while_stmt,
+            .loop_expr,
+            .array_expr,
+            .call_expr,
+            .closure_expr,
+            => true,
+            else => false,
+        };
+    }
+
+    /// Formats a `.fn_expr_body` node (` = expr;` inline when `< 100` cols, or indented on break).
+    fn formatFnExprBody(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
+        var children: std.ArrayList(CstNodeIndex) = .empty;
+        defer children.deinit(self.allocator);
+        try self.collectDirectChildren(node_idx, &children);
+
+        var eq_tok: TokenIndex = .none;
+        var semi_tok: TokenIndex = .none;
+        var expr_id: ?CstNodeIndex = null;
+
+        for (children.items) |child_id| {
+            const child = self.cst_arena.getNode(child_id);
+            if (self.isZeroLengthCommentCarrierLeaf(child)) {
+                if (!child.token.isNone()) {
+                    try self.flushUnconsumedCommentsInRange(child.token.asInt(), child.token.asInt() + 1, true);
+                }
+                continue;
+            }
+            if (child.subtree_size == 1 and !child.token.isNone()) {
+                const tok_kind = self.token_buffer.getToken(child.token).kind;
+                if (tok_kind == .eq and eq_tok.isNone()) {
+                    eq_tok = child.token;
+                    continue;
+                } else if (tok_kind == .semi) {
+                    semi_tok = child.token;
+                    continue;
+                }
+            }
+            if (expr_id == null) {
+                expr_id = child_id;
+            }
+        }
+
+        if (!eq_tok.isNone()) {
+            try self.doc_arena.emitText(" ");
+            try self.emitTokenWithTrivia(eq_tok, "=", false);
+        }
+
+        if (expr_id) |body_expr_id| {
+            const first_expr_tok = self.findFirstTokenInSubtree(body_expr_id);
+            const has_user_break = !first_expr_tok.isNone() and
+                self.token_meta[first_expr_tok.asInt()].has_leading_newline;
+
+            if (self.isHuggedFnBodyExpr(body_expr_id) and !has_user_break) {
+                try self.doc_arena.emitText(" ");
+                try self.formatNode(body_expr_id);
+                if (!semi_tok.isNone()) {
+                    try self.emitTokenWithTrivia(semi_tok, ";", false);
+                } else {
+                    try self.doc_arena.emitText(";");
+                }
+                return;
+            }
+
+            const mode: GroupMode = if (has_user_break) .force_break else .auto_fit;
+            _ = try self.doc_arena.beginGroup(mode);
+            try self.doc_arena.beginIndent(INDENT_SPACES);
+            try self.doc_arena.emitLine();
+            try self.formatNode(body_expr_id);
+            if (!semi_tok.isNone()) {
+                if (self.hasUnconsumedLeadingComments(semi_tok)) {
+                    try self.emitLeadingTrivia(semi_tok, false);
+                }
+                self.token_meta[semi_tok.asInt()].is_token_emitted = true;
+            }
+            try self.doc_arena.emitText(";");
+            try self.doc_arena.endIndent(INDENT_SPACES);
+            try self.doc_arena.endGroup();
+            if (!semi_tok.isNone()) {
+                try self.emitTrailingTrivia(semi_tok);
+            }
+            return;
+        }
+
+        if (!semi_tok.isNone()) {
+            try self.emitTokenWithTrivia(semi_tok, ";", false);
+        } else {
             try self.doc_arena.emitText(";");
         }
     }
@@ -3241,6 +3586,15 @@ const CstFormatter = struct {
         }
         try self.doc_arena.beginIndent(INDENT_SPACES);
 
+        const is_index_brackets = node_idx.asInt() < self.cst_arena.countNodes() and
+            self.cst_arena.getNode(node_idx).kind == .index_expr;
+        if (is_index_brackets) {
+            self.index_bracket_depth += 1;
+        }
+        defer if (is_index_brackets) {
+            self.index_bracket_depth -= 1;
+        };
+
         for (elements.items, 0..) |entry, elem_i| {
             try self.formatNode(entry.elem_id);
             if (!entry.comma_tok.isNone()) {
@@ -3499,8 +3853,38 @@ const CstFormatter = struct {
         }
     }
 
+    /// Formats a `.loop_label` CST node (`label:` on loops or `:label` on `break`/`continue`).
+    fn formatLoopLabel(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
+        var children: std.ArrayList(CstNodeIndex) = .empty;
+        defer children.deinit(self.allocator);
+        try self.collectDirectChildren(node_idx, &children);
+
+        for (children.items) |child_id| {
+            const child = self.cst_arena.getNode(child_id);
+            if (child.subtree_size == 1 and !child.token.isNone()) {
+                try self.emitTokenWithTrivia(child.token, null, false);
+            } else {
+                try self.formatNode(child_id);
+            }
+        }
+    }
+
     /// Formats a `.return_stmt`, `.break_stmt`, or `.continue_stmt` with a guaranteed `;`.
     fn formatJumpStmt(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
+        try self.formatJumpCore(node_idx, true);
+    }
+
+    /// Formats an expression-position `.diverging_expr` (`return`, `break`, `continue`) without `;`.
+    fn formatDivergingExpr(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
+        try self.formatJumpCore(node_idx, false);
+    }
+
+    /// Shared jump formatter for statement (`require_semi = true`) and expression (`false`) positions.
+    fn formatJumpCore(
+        self: *CstFormatter,
+        node_idx: CstNodeIndex,
+        has_required_semi: bool,
+    ) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
         try self.collectDirectChildren(node_idx, &children);
@@ -3524,17 +3908,28 @@ const CstFormatter = struct {
                         try self.doc_arena.emitText(" ");
                     }
                 } else if (tok_kind == .semi) {
-                    try self.emitTokenWithTrivia(child.token, ";", false);
-                    has_emitted_semi = true;
+                    if (has_required_semi) {
+                        try self.emitTokenWithTrivia(child.token, ";", false);
+                        has_emitted_semi = true;
+                    }
                 } else {
                     try self.emitTokenWithTrivia(child.token, null, false);
+                }
+            } else if (child.kind == .loop_label) {
+                try self.formatLoopLabel(child_id);
+                const has_following_expr = (idx + 1 < children.items.len and
+                    !(self.cst_arena.getNode(children.items[idx + 1]).subtree_size == 1 and
+                        !self.cst_arena.getNode(children.items[idx + 1]).token.isNone() and
+                        self.token_buffer.getToken(self.cst_arena.getNode(children.items[idx + 1]).token).kind == .semi));
+                if (has_following_expr) {
+                    try self.doc_arena.emitText(" ");
                 }
             } else {
                 try self.formatNode(child_id);
             }
         }
-        // Only emit trailing `;` when `node_idx` is a statement (not an inline `yield expr` expression):
-        if (!has_emitted_semi) {
+        // Only emit trailing `;` when `node_idx` is a statement (not `diverging_expr` or inline `yield`):
+        if (has_required_semi and !has_emitted_semi) {
             const first_tok = self.findFirstTokenInSubtree(node_idx);
             const is_yield_expr = !first_tok.isNone() and
                 std.mem.eql(u8, self.getTokenLexeme(first_tok), "yield");
@@ -3635,6 +4030,7 @@ const CstFormatter = struct {
             .for_stmt,
             .while_stmt,
             .loop_expr,
+            .with_expr,
             .block,
             => true,
             .prefix_expr => blk: {
@@ -3673,6 +4069,12 @@ const CstFormatter = struct {
 
         for (children.items) |child_id| {
             const child = self.cst_arena.getNode(child_id);
+            if (self.isZeroLengthCommentCarrierLeaf(child)) {
+                if (!child.token.isNone()) {
+                    try self.flushUnconsumedCommentsInRange(child.token.asInt(), child.token.asInt() + 1, true);
+                }
+                continue;
+            }
             if (child.subtree_size == 1 and !child.token.isNone() and
                 self.token_buffer.getToken(child.token).kind == .semi)
             {
@@ -3714,15 +4116,41 @@ const CstFormatter = struct {
         }
     }
 
-    /// Returns whether `subtree_idx` contains any `.struct_lit_expr`, `.view_block_expr`, or `.block`.
+    /// Returns whether `subtree_idx` contains a braced expression or pattern requiring outer parens.
     fn hasStructLitOrBlockInSubtree(self: *const CstFormatter, subtree_idx: CstNodeIndex) bool {
         const root = self.cst_arena.getNode(subtree_idx);
         const end_idx: usize = subtree_idx.asInt() + root.subtree_size;
         var idx: usize = subtree_idx.asInt();
         while (idx < end_idx) : (idx += 1) {
-            const kind = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(idx))).kind;
-            if (kind == .struct_lit_expr or kind == .view_block_expr or kind == .block) {
+            const node = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(idx)));
+            if (node.kind == .struct_lit_expr or
+                node.kind == .view_block_expr or
+                node.kind == .with_expr or
+                node.kind == .struct_pat or
+                node.kind == .block)
+            {
                 return true;
+            }
+            if (node.kind == .contextual_variant_expr or
+                node.kind == .variant_pat or
+                node.kind == .path_pat)
+            {
+                const sub_end: usize = @min(end_idx, idx + node.subtree_size);
+                var sub_idx: usize = idx + 1;
+                while (sub_idx < sub_end) : (sub_idx += 1) {
+                    const sub_node = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(sub_idx)));
+                    if (sub_node.kind == .field_init or
+                        sub_node.kind == .field_pat or
+                        sub_node.kind == .struct_pat_start)
+                    {
+                        return true;
+                    }
+                    if (sub_node.subtree_size == 1 and !sub_node.token.isNone() and
+                        self.token_buffer.getToken(sub_node.token).kind == .lbrace)
+                    {
+                        return true;
+                    }
+                }
             }
         }
         return false;
@@ -3801,7 +4229,7 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats an `.if_cond` or `.while_header` (`[let pat =] cond [|cap|]`), stripping outer parens.
+    /// Formats an `.if_cond` or `.while_header` condition, stripping redundant outer parens while preserving `(x := expr)`.
     fn formatConditionHeader(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
@@ -3812,7 +4240,6 @@ const CstFormatter = struct {
             return;
         }
 
-        var pipe_count: usize = 0;
         for (children.items, 0..) |child_id, idx| {
             const child = self.cst_arena.getNode(child_id);
             if (child.subtree_size == 1 and !child.token.isNone()) {
@@ -3824,12 +4251,6 @@ const CstFormatter = struct {
                     try self.doc_arena.emitText(" ");
                     try self.emitTokenWithTrivia(child.token, "=", false);
                     try self.doc_arena.emitText(" ");
-                } else if (tok_kind == .pipe) {
-                    if (pipe_count == 0) {
-                        try self.doc_arena.emitText(" ");
-                    }
-                    pipe_count += 1;
-                    try self.emitTokenWithTrivia(child.token, "|", false);
                 } else {
                     try self.emitTokenWithTrivia(child.token, null, false);
                 }
@@ -3867,7 +4288,7 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats a `.for_stmt` (`[comptime] for pat in iter { … }`), stripping outer parens on `iter`.
+    /// Formats a `.for_stmt` (`[label:] [comptime] for pat [, idx] in iter { … }`), stripping outer parens on `iter`.
     fn formatForStmt(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
@@ -3886,6 +4307,9 @@ const CstFormatter = struct {
                 } else {
                     try self.emitTokenWithTrivia(child.token, null, false);
                 }
+            } else if (child.kind == .loop_label) {
+                try self.formatLoopLabel(child_id);
+                try self.doc_arena.emitText(" ");
             } else if (child.kind == .for_header) {
                 try self.formatForHeader(child_id);
                 try self.doc_arena.emitText(" ");
@@ -3897,13 +4321,13 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats a `.for_header` (`pat in iter`), stripping redundant outer parens on `iter`.
+    /// Formats a `.for_header` (`[&[mut] | ref [mut] | own | mut] pat [, idx] in iter`).
     fn formatForHeader(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
         try self.collectDirectChildren(node_idx, &children);
 
-        var seen_kw_in = false;
+        var has_seen_in = false;
         for (children.items) |child_id| {
             const child = self.cst_arena.getNode(child_id);
             if (child.subtree_size == 1 and !child.token.isNone()) {
@@ -3912,11 +4336,24 @@ const CstFormatter = struct {
                     try self.doc_arena.emitText(" ");
                     try self.emitTokenWithTrivia(child.token, "in", false);
                     try self.doc_arena.emitText(" ");
-                    seen_kw_in = true;
+                    has_seen_in = true;
+                    continue;
+                } else if (!has_seen_in and tok_kind == .comma) {
+                    try self.emitTokenWithTrivia(child.token, ",", false);
+                    try self.doc_arena.emitText(" ");
+                    continue;
+                } else if (!has_seen_in and tok_kind == .amp) {
+                    try self.emitTokenWithTrivia(child.token, "&", false);
+                    continue;
+                } else if (!has_seen_in and
+                    (tok_kind == .kw_mut or tok_kind == .kw_ref or tok_kind == .kw_own))
+                {
+                    try self.emitTokenWithTrivia(child.token, null, false);
+                    try self.doc_arena.emitText(" ");
                     continue;
                 }
             }
-            if (seen_kw_in) {
+            if (has_seen_in) {
                 try self.formatHeaderExprStrippingOuterParens(child_id);
             } else {
                 try self.formatNode(child_id);
@@ -3924,7 +4361,7 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats a `.while_stmt` (`while cond { … }`), stripping outer parens on `cond`.
+    /// Formats a `.while_stmt` (`[label:] while cond { … }`), stripping outer parens on `cond`.
     fn formatWhileStmt(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
@@ -3940,6 +4377,9 @@ const CstFormatter = struct {
                 } else {
                     try self.emitTokenWithTrivia(child.token, null, false);
                 }
+            } else if (child.kind == .loop_label) {
+                try self.formatLoopLabel(child_id);
+                try self.doc_arena.emitText(" ");
             } else if (child.kind == .while_header) {
                 try self.formatConditionHeader(child_id);
                 try self.doc_arena.emitText(" ");
@@ -3951,7 +4391,7 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats a `.loop_expr` (`loop { … }`).
+    /// Formats a `.loop_expr` (`[label:] loop { … }`).
     fn formatLoopExpr(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
@@ -3967,9 +4407,154 @@ const CstFormatter = struct {
                 } else {
                     try self.emitTokenWithTrivia(child.token, null, false);
                 }
+            } else if (child.kind == .loop_label) {
+                try self.formatLoopLabel(child_id);
+                try self.doc_arena.emitText(" ");
             } else {
                 try self.formatNode(child_id);
             }
+        }
+    }
+
+    /// Formats a `.walrus_cond_expr` (`([var] name [: Type] := expr)`), always preserving parens (`DR-21` §3.3).
+    fn formatWalrusCondExpr(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
+        var children: std.ArrayList(CstNodeIndex) = .empty;
+        defer children.deinit(self.allocator);
+        try self.collectDirectChildren(node_idx, &children);
+
+        var is_expecting_type = false;
+        for (children.items) |child_id| {
+            const child = self.cst_arena.getNode(child_id);
+            if (child.subtree_size == 1 and !child.token.isNone()) {
+                const tok_kind = self.token_buffer.getToken(child.token).kind;
+                if (tok_kind == .kw_var) {
+                    try self.emitTokenWithTrivia(child.token, "var", false);
+                    try self.doc_arena.emitText(" ");
+                } else if (tok_kind == .colon) {
+                    try self.emitTokenWithTrivia(child.token, ":", false);
+                    try self.doc_arena.emitText(" ");
+                    is_expecting_type = true;
+                } else if (tok_kind == .colon_eq) {
+                    is_expecting_type = false;
+                    try self.doc_arena.emitText(" ");
+                    try self.emitTokenWithTrivia(child.token, ":=", false);
+                    try self.doc_arena.emitText(" ");
+                } else {
+                    try self.emitTokenWithTrivia(child.token, null, false);
+                }
+            } else if (is_expecting_type) {
+                is_expecting_type = false;
+                self.in_type_context += 1;
+                defer self.in_type_context -= 1;
+                try self.formatNode(child_id);
+            } else {
+                try self.formatNode(child_id);
+            }
+        }
+    }
+
+    /// Formats a `.context_binding` (`context.slot = expr`).
+    fn formatContextBinding(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
+        var children: std.ArrayList(CstNodeIndex) = .empty;
+        defer children.deinit(self.allocator);
+        try self.collectDirectChildren(node_idx, &children);
+
+        for (children.items) |child_id| {
+            const child = self.cst_arena.getNode(child_id);
+            if (child.subtree_size == 1 and !child.token.isNone()) {
+                if (self.token_buffer.getToken(child.token).kind == .eq) {
+                    try self.doc_arena.emitText(" ");
+                    try self.emitTokenWithTrivia(child.token, "=", false);
+                    try self.doc_arena.emitText(" ");
+                } else {
+                    try self.emitTokenWithTrivia(child.token, null, false);
+                }
+            } else {
+                try self.formatNode(child_id);
+            }
+        }
+    }
+
+    /// Formats a `.with_expr` (`with context.slot = expr, … { … }`) with trailing-comma steerability.
+    fn formatWithExpr(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
+        var children: std.ArrayList(CstNodeIndex) = .empty;
+        defer children.deinit(self.allocator);
+        try self.collectDirectChildren(node_idx, &children);
+
+        var with_tok: TokenIndex = .none;
+        var bindings: std.ArrayList(WithBindingEntry) = .empty;
+        defer bindings.deinit(self.allocator);
+        var block_id: CstNodeIndex = .none;
+        var has_trailing_comma = false;
+
+        for (children.items) |child_id| {
+            const child = self.cst_arena.getNode(child_id);
+            if (child.subtree_size == 1 and !child.token.isNone()) {
+                const tok_kind = self.token_buffer.getToken(child.token).kind;
+                if (tok_kind == .kw_with and with_tok.isNone()) {
+                    with_tok = child.token;
+                } else if (tok_kind == .comma) {
+                    has_trailing_comma = true;
+                    if (bindings.items.len > 0) {
+                        bindings.items[bindings.items.len - 1].comma_tok = child.token;
+                    }
+                }
+            } else if (child.kind == .context_binding) {
+                has_trailing_comma = false;
+                try bindings.append(self.allocator, .{ .binding_id = child_id });
+            } else if (child.kind == .block) {
+                block_id = child_id;
+            }
+        }
+
+        if (with_tok.isNone() or bindings.items.len == 0 or block_id.isNone()) {
+            try self.formatGenericChildren(node_idx);
+            return;
+        }
+
+        try self.emitTokenLeadingAndGlyph(with_tok, "with", false);
+        const group_mode: GroupMode = if (has_trailing_comma) .force_break else .auto_fit;
+        _ = try self.doc_arena.beginGroup(group_mode);
+        try self.emitTrailingTrivia(with_tok);
+        try self.doc_arena.beginIndent(INDENT_SPACES);
+        try self.doc_arena.emitLine();
+
+        for (bindings.items, 0..) |entry, bind_i| {
+            try self.formatContextBinding(entry.binding_id);
+            if (!entry.comma_tok.isNone()) {
+                try self.emitLeadingTrivia(entry.comma_tok, false);
+                self.token_meta[entry.comma_tok.asInt()].is_token_emitted = true;
+            }
+            if (bind_i + 1 < bindings.items.len) {
+                try self.doc_arena.emitText(",");
+                if (!entry.comma_tok.isNone()) {
+                    try self.emitTrailingTrivia(entry.comma_tok);
+                }
+                try self.doc_arena.emitLine();
+            } else {
+                try self.doc_arena.emitIfBreak(",", "");
+                if (!entry.comma_tok.isNone()) {
+                    try self.emitTrailingTrivia(entry.comma_tok);
+                }
+            }
+        }
+
+        try self.doc_arena.endIndent(INDENT_SPACES);
+        try self.doc_arena.emitLine();
+        try self.doc_arena.endGroup();
+        try self.formatBlock(block_id);
+    }
+
+    /// Formats a `.contextual_variant_expr` (`.Variant`, `.Variant(args)`, or `.Variant { fields }`).
+    fn formatContextualVariantExpr(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
+        if (self.hasDirectChildKind(node_idx, .struct_lit_start) or
+            self.hasDirectTokenKind(node_idx, .lbrace))
+        {
+            try self.formatStructLitExpr(node_idx);
+        } else if (self.hasDirectTokenKind(node_idx, .lparen)) {
+            try self.formatCallExpr(node_idx);
+        } else {
+            try self.formatGenericChildren(node_idx);
         }
     }
 
@@ -4284,6 +4869,28 @@ const CstFormatter = struct {
         return false;
     }
 
+    /// Measures the exact formatted column width of scalar literal element `elem_id`.
+    fn measureScalarLiteralWidth(self: *const CstFormatter, elem_id: CstNodeIndex) usize {
+        const root = self.cst_arena.getNode(elem_id);
+        if (root.subtree_size == 1) {
+            if (self.shouldSkipLeaf(root)) return 0;
+            return self.token_buffer.getToken(root.token).byte_len;
+        }
+        var total_bytes: usize = 0;
+        const end_idx: usize = elem_id.asInt() + root.subtree_size;
+        var idx: usize = elem_id.asInt() + 1;
+        while (idx < end_idx) : (idx += 1) {
+            const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(idx)));
+            if (sub.subtree_size == 1 and !self.shouldSkipLeaf(sub)) {
+                const tok_rec = self.token_buffer.getToken(sub.token);
+                if (!tok_rec.flags.is_synthesized) {
+                    total_bytes += tok_rec.byte_len;
+                }
+            }
+        }
+        return total_bytes;
+    }
+
     /// Formats an `.array_expr` (`[a, b, c]`, `[val; count]`, or `GroupMode.columnar_grid`).
     fn formatArrayExpr(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
@@ -4350,80 +4957,65 @@ const CstFormatter = struct {
             false;
 
         if (is_all_scalars and elements.items.len >= COLUMNAR_GRID_MIN_ELEMENTS and !has_inner_comments) {
-            // Measure total flat width and max element width:
+            // Measure max element width for deterministic `GroupMode.columnar_grid` packing:
             var max_elem_len: usize = 1;
-            var total_flat_len: usize = 2;
-            for (elements.items, 0..) |elem_id, elem_i| {
-                const first_t = self.findFirstTokenInSubtree(elem_id);
-                const last_t = self.findLastTokenInSubtree(elem_id);
-                const start_b: usize = self.token_buffer.getToken(first_t).byte_offset;
-                const end_rec = self.token_buffer.getToken(last_t);
-                const end_b: usize = @min(self.source.len, @as(usize, end_rec.byte_offset) + end_rec.byte_len);
-                const elem_len = end_b -| start_b;
-                max_elem_len = @max(max_elem_len, elem_len);
-                total_flat_len += elem_len + (if (elem_i + 1 < elements.items.len) @as(usize, 2) else 0);
+            for (elements.items) |elem_id| {
+                max_elem_len = @max(max_elem_len, self.measureScalarLiteralWidth(elem_id));
             }
 
-            const should_break_grid = has_trailing_comma or
-                self.isNodeMultilineInSource(node_idx) or
-                (total_flat_len + 16 > MAX_LINE_WIDTH);
-
-            if (should_break_grid) {
-                for (children.items) |child_id| {
-                    const child = self.cst_arena.getNode(child_id);
-                    if (child.subtree_size == 1 and !child.token.isNone() and
-                        self.token_buffer.getToken(child.token).kind == .comma)
-                    {
-                        self.token_meta[child.token.asInt()].is_token_emitted = true;
-                    }
+            for (children.items) |child_id| {
+                const child = self.cst_arena.getNode(child_id);
+                if (child.subtree_size == 1 and !child.token.isNone() and
+                    self.token_buffer.getToken(child.token).kind == .comma)
+                {
+                    self.token_meta[child.token.asInt()].is_token_emitted = true;
                 }
-                const cell_width = max_elem_len + 2;
-                const cols_per_row: usize = std.math.clamp(
-                    (MAX_LINE_WIDTH - 8) / @max(@as(usize, 1), cell_width),
-                    1,
-                    COLUMNAR_GRID_MAX_COLS,
-                );
+            }
 
-                try self.emitTokenWithTrivia(open_tok, "[", false);
-                _ = try self.doc_arena.beginGroup(.columnar_grid);
-                self.doc_arena.poisonOpenGroups();
-                try self.doc_arena.beginIndent(INDENT_SPACES);
-                try self.doc_arena.emitHardLine();
+            const cell_width = max_elem_len + 2;
+            const cols_per_row: usize = std.math.clamp(
+                (MAX_LINE_WIDTH - 8) / @max(@as(usize, 1), cell_width),
+                1,
+                COLUMNAR_GRID_MAX_COLS,
+            );
+            const grid_padding_spaces: [MAX_LINE_WIDTH]u8 = @splat(' ');
+            const group_mode: GroupMode = if (has_trailing_comma) .force_break else .columnar_grid;
 
-                for (elements.items, 0..) |elem_id, elem_i| {
-                    const first_t = self.findFirstTokenInSubtree(elem_id);
-                    const last_t = self.findLastTokenInSubtree(elem_id);
-                    const start_b: usize = self.token_buffer.getToken(first_t).byte_offset;
-                    const end_rec = self.token_buffer.getToken(last_t);
-                    const end_b: usize = @min(self.source.len, @as(usize, end_rec.byte_offset) + end_rec.byte_len);
-                    const elem_len = end_b -| start_b;
+            try self.emitTokenLeadingAndGlyph(open_tok, "[", false);
+            _ = try self.doc_arena.beginGroup(group_mode);
+            try self.emitTrailingTrivia(open_tok);
+            try self.doc_arena.beginIndent(INDENT_SPACES);
+            try self.doc_arena.emitSoftLine();
 
-                    const is_row_end = ((elem_i + 1) % cols_per_row == 0) or
-                        (elem_i + 1 == elements.items.len);
+            for (elements.items, 0..) |elem_id, elem_i| {
+                const elem_len = self.measureScalarLiteralWidth(elem_id);
+                const is_row_end = ((elem_i + 1) % cols_per_row == 0) or
+                    (elem_i + 1 == elements.items.len);
 
-                    // Left-pad numeric literals within the column cell so digits align cleanly:
-                    if (elem_len < max_elem_len) {
-                        var pad_i: usize = 0;
-                        while (pad_i < max_elem_len - elem_len) : (pad_i += 1) {
-                            try self.doc_arena.emitText(" ");
-                        }
-                    }
-                    try self.formatNode(elem_id);
+                // Left-pad numeric literals within the column cell only when the grid group breaks:
+                if (elem_len < max_elem_len) {
+                    const pad_len = @min(max_elem_len - elem_len, grid_padding_spaces.len);
+                    try self.doc_arena.emitIfBreak(grid_padding_spaces[0..pad_len], "");
+                }
+                try self.formatNode(elem_id);
+
+                if (elem_i + 1 < elements.items.len) {
                     try self.doc_arena.emitText(",");
-
                     if (!is_row_end) {
                         try self.doc_arena.emitText(" ");
-                    } else if (elem_i + 1 < elements.items.len) {
-                        try self.doc_arena.emitHardLine();
+                    } else {
+                        try self.doc_arena.emitLine();
                     }
+                } else {
+                    try self.doc_arena.emitIfBreak(",", "");
                 }
-
-                try self.doc_arena.endIndent(INDENT_SPACES);
-                try self.doc_arena.emitHardLine();
-                try self.doc_arena.endGroup();
-                try self.emitTokenWithTrivia(close_tok, "]", false);
-                return;
             }
+
+            try self.doc_arena.endIndent(INDENT_SPACES);
+            try self.doc_arena.emitSoftLine();
+            try self.emitTokenWithTrivia(close_tok, "]", false);
+            try self.doc_arena.endGroup();
+            return;
         }
 
         try self.formatSteerableDelimitedList(node_idx, null, .lbracket, .rbracket, "[", "]", false);
@@ -4537,7 +5129,87 @@ const CstFormatter = struct {
         return true;
     }
 
-    /// Formats an `.infix_expr`, aligning `|>` pipe chains with leading `|>` on broken lines.
+    /// Step in a flattened right-associative `orelse` / `catch` chain (`lhs orelse rhs`).
+    const FallbackChainStep = struct {
+        /// Operator keyword token (`orelse` or `catch`).
+        op_tok: TokenIndex,
+        /// Opening `|` token for a `catch |err|` payload capture, or `.none`.
+        open_pipe_tok: TokenIndex = .none,
+        /// Captured error identifier token inside `catch |err|`, or `.none`.
+        capture_tok: TokenIndex = .none,
+        /// Closing `|` token for a `catch |err|` payload capture, or `.none`.
+        close_pipe_tok: TokenIndex = .none,
+        /// Right-hand fallback expression or block CST node index.
+        rhs_node: CstNodeIndex,
+    };
+
+    /// Extracts a single `orelse` or `catch [|err|]` `.infix_expr` step when `node_idx` matches.
+    fn extractFallbackStep(
+        self: *const CstFormatter,
+        node_idx: CstNodeIndex,
+        lhs_out: *CstNodeIndex,
+        step_out: *FallbackChainStep,
+    ) !bool {
+        if (self.cst_arena.getNode(node_idx).kind != .infix_expr) return false;
+
+        var children: std.ArrayList(CstNodeIndex) = .empty;
+        defer children.deinit(self.allocator);
+        try self.collectDirectChildren(node_idx, &children);
+        if (children.items.len < 3) return false;
+
+        const op_child = self.cst_arena.getNode(children.items[1]);
+        if (op_child.subtree_size != 1 or op_child.token.isNone()) return false;
+        const op_kind = self.token_buffer.getToken(op_child.token).kind;
+        if (op_kind != .kw_orelse and op_kind != .kw_catch) return false;
+
+        if (children.items.len == 3) {
+            lhs_out.* = children.items[0];
+            step_out.* = .{
+                .op_tok = op_child.token,
+                .rhs_node = children.items[2],
+            };
+            return true;
+        }
+        if (children.items.len == 6 and op_kind == .kw_catch) {
+            const open_pipe = self.cst_arena.getNode(children.items[2]);
+            const cap_ident = self.cst_arena.getNode(children.items[3]);
+            const close_pipe = self.cst_arena.getNode(children.items[4]);
+            if (open_pipe.subtree_size == 1 and !open_pipe.token.isNone() and
+                cap_ident.subtree_size == 1 and !cap_ident.token.isNone() and
+                close_pipe.subtree_size == 1 and !close_pipe.token.isNone() and
+                self.token_buffer.getToken(open_pipe.token).kind == .pipe and
+                self.token_buffer.getToken(close_pipe.token).kind == .pipe)
+            {
+                lhs_out.* = children.items[0];
+                step_out.* = .{
+                    .op_tok = op_child.token,
+                    .open_pipe_tok = open_pipe.token,
+                    .capture_tok = cap_ident.token,
+                    .close_pipe_tok = close_pipe.token,
+                    .rhs_node = children.items[5],
+                };
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Emits `orelse` or `catch [|err|]` operator tokens for `step`.
+    fn emitFallbackStepOp(self: *CstFormatter, step: FallbackChainStep) anyerror!void {
+        const op_glyph: []const u8 = if (self.token_buffer.getToken(step.op_tok).kind == .kw_orelse)
+            "orelse"
+        else
+            "catch";
+        try self.emitTokenWithTrivia(step.op_tok, op_glyph, false);
+        if (!step.open_pipe_tok.isNone()) {
+            try self.doc_arena.emitText(" ");
+            try self.emitTokenWithTrivia(step.open_pipe_tok, "|", false);
+            try self.emitTokenWithTrivia(step.capture_tok, null, false);
+            try self.emitTokenWithTrivia(step.close_pipe_tok, "|", false);
+        }
+    }
+
+    /// Formats an `.infix_expr`, aligning `|>` pipe chains and `orelse` / `catch` fallbacks (`DR-21` §3.3).
     fn formatInfixExpr(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var base_node: CstNodeIndex = .none;
         var pipe_steps: std.ArrayList(PipeChainStep) = .empty;
@@ -4565,9 +5237,86 @@ const CstFormatter = struct {
             return;
         }
 
+        var fallback_lhs: CstNodeIndex = .none;
+        var curr_fallback: FallbackChainStep = undefined;
+        if (try self.extractFallbackStep(node_idx, &fallback_lhs, &curr_fallback)) {
+            var fallback_steps: std.ArrayList(FallbackChainStep) = .empty;
+            defer fallback_steps.deinit(self.allocator);
+
+            var next_lhs: CstNodeIndex = .none;
+            var next_step: FallbackChainStep = undefined;
+            while (try self.extractFallbackStep(curr_fallback.rhs_node, &next_lhs, &next_step)) {
+                curr_fallback.rhs_node = next_lhs;
+                try fallback_steps.append(self.allocator, curr_fallback);
+                curr_fallback = next_step;
+            }
+            try fallback_steps.append(self.allocator, curr_fallback);
+
+            try self.formatNode(fallback_lhs);
+            if (fallback_steps.items.len == 1 and
+                !self.token_meta[fallback_steps.items[0].op_tok.asInt()].has_leading_newline and
+                self.isBlockBodiedStmtCst(fallback_steps.items[0].rhs_node))
+            {
+                try self.doc_arena.emitText(" ");
+                try self.emitFallbackStepOp(fallback_steps.items[0]);
+                try self.doc_arena.emitText(" ");
+                try self.formatNode(fallback_steps.items[0].rhs_node);
+                return;
+            }
+
+            var has_fallback_newline = false;
+            for (fallback_steps.items) |step| {
+                if (self.token_meta[step.op_tok.asInt()].has_leading_newline) {
+                    has_fallback_newline = true;
+                }
+            }
+            const fallback_mode: GroupMode = if (has_fallback_newline) .force_break else .auto_fit;
+            _ = try self.doc_arena.beginGroup(fallback_mode);
+            try self.doc_arena.beginIndent(INDENT_SPACES);
+            for (fallback_steps.items) |step| {
+                try self.doc_arena.emitLine();
+                try self.emitFallbackStepOp(step);
+                try self.doc_arena.emitText(" ");
+                try self.formatNode(step.rhs_node);
+            }
+            try self.doc_arena.endIndent(INDENT_SPACES);
+            try self.doc_arena.endGroup();
+            return;
+        }
+
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
         try self.collectDirectChildren(node_idx, &children);
+
+        // Compact `$-K` and `$+K` integer-literal offsets inside `[…]` (`DR-21` §3.3):
+        if (self.index_bracket_depth > 0 and children.items.len == 3) {
+            const lhs_child = self.cst_arena.getNode(children.items[0]);
+            const op_child = self.cst_arena.getNode(children.items[1]);
+            const rhs_child = self.cst_arena.getNode(children.items[2]);
+            if (lhs_child.subtree_size == 1 and !lhs_child.token.isNone() and
+                op_child.subtree_size == 1 and !op_child.token.isNone() and
+                rhs_child.subtree_size == 1 and !rhs_child.token.isNone())
+            {
+                const lhs_kind = self.token_buffer.getToken(lhs_child.token).kind;
+                const op_kind = self.token_buffer.getToken(op_child.token).kind;
+                const rhs_kind = self.token_buffer.getToken(rhs_child.token).kind;
+                if (lhs_kind == .dollar and
+                    (op_kind == .minus or op_kind == .plus) and
+                    rhs_kind == .int_lit and
+                    !self.hasUnconsumedCommentsInTokenRange(
+                        lhs_child.token.asInt(),
+                        rhs_child.token.asInt(),
+                        true,
+                        true,
+                    ))
+                {
+                    try self.formatNode(children.items[0]);
+                    try self.emitTokenWithTrivia(op_child.token, null, false);
+                    try self.formatNode(children.items[2]);
+                    return;
+                }
+            }
+        }
 
         var pipe_capture_count: usize = 0;
         for (children.items, 0..) |child_id, idx| {
@@ -4579,9 +5328,23 @@ const CstFormatter = struct {
                 if (tok_kind == .dotdot or tok_kind == .dotdoteq) {
                     // Range operators `0..10` and `0..=10` have no spaces around `..` / `..=`:
                     try self.emitTokenWithTrivia(child.token, null, false);
-                } else if (tok_kind == .kw_catch) {
+                } else if (tok_kind == .kw_is) {
                     try self.doc_arena.emitText(" ");
-                    try self.emitTokenWithTrivia(child.token, "catch", false);
+                    try self.emitTokenWithTrivia(child.token, "is", false);
+                    const next_child = self.cst_arena.getNode(children.items[idx + 1]);
+                    const is_followed_by_not = next_child.subtree_size == 1 and
+                        !next_child.token.isNone() and
+                        self.token_buffer.getToken(next_child.token).kind == .kw_not;
+                    if (!is_followed_by_not) {
+                        try self.doc_arena.emitText(" ");
+                    }
+                } else if (tok_kind == .kw_not) {
+                    try self.doc_arena.emitText(" ");
+                    try self.emitTokenWithTrivia(child.token, "not", false);
+                    try self.doc_arena.emitText(" ");
+                } else if (tok_kind == .kw_catch or tok_kind == .kw_orelse) {
+                    try self.doc_arena.emitText(" ");
+                    try self.emitTokenWithTrivia(child.token, null, false);
                     try self.doc_arena.emitText(" ");
                 } else if (tok_kind == .pipe and pipe_capture_count > 0) {
                     pipe_capture_count = 0;
@@ -4603,7 +5366,7 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats a `.prefix_expr` (`-x`, `!x`, `~x`, `&x`, `&mut x`, `*x`, `comptime expr`).
+    /// Formats a `.prefix_expr` (`-x`, `!x`, `not x`, `~x`, `&x`, `&mut x`, `*x`, `..b`, `comptime expr`).
     fn formatPrefixExpr(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
@@ -4614,7 +5377,8 @@ const CstFormatter = struct {
             if (child.subtree_size == 1 and !child.token.isNone()) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
                 if ((tok_kind == .kw_mut or tok_kind == .kw_own or tok_kind == .kw_ref or
-                    tok_kind == .kw_let or tok_kind == .kw_comptime or tok_kind == .ident) and
+                    tok_kind == .kw_let or tok_kind == .kw_not or tok_kind == .kw_comptime or
+                    tok_kind == .ident) and
                     idx + 1 < children.items.len)
                 {
                     try self.emitTokenWithTrivia(child.token, null, false);
@@ -4837,12 +5601,39 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats a type CST node (`.ref_type`, `.ptr_type`, `.mode_type`, `.slice_or_array_type`, `.fn_type`).
+    /// Formats a type CST node (`.ref_type`, `.ptr_type`, `.mode_type`, `.refined_type`, `.closure_type`, etc.).
     fn formatTypeNode(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
+        const node = self.cst_arena.getNode(node_idx);
+        if (node.kind == .refined_type) {
+            var children: std.ArrayList(CstNodeIndex) = .empty;
+            defer children.deinit(self.allocator);
+            try self.collectDirectChildren(node_idx, &children);
+
+            for (children.items, 0..) |child_id, idx| {
+                const child = self.cst_arena.getNode(child_id);
+                if (idx == 0) {
+                    self.in_type_context += 1;
+                    defer self.in_type_context -= 1;
+                    try self.formatNode(child_id);
+                } else if (child.subtree_size == 1 and !child.token.isNone()) {
+                    const tok_kind = self.token_buffer.getToken(child.token).kind;
+                    if (tok_kind == .kw_where or tok_kind == .kw_is) {
+                        try self.doc_arena.emitText(" ");
+                        try self.emitTokenWithTrivia(child.token, null, false);
+                        try self.doc_arena.emitText(" ");
+                    } else {
+                        try self.emitTokenWithTrivia(child.token, null, false);
+                    }
+                } else {
+                    try self.formatNode(child_id);
+                }
+            }
+            return;
+        }
+
         self.in_type_context += 1;
         defer self.in_type_context -= 1;
 
-        const node = self.cst_arena.getNode(node_idx);
         if (node.kind == .tuple_type) {
             try self.formatSteerableDelimitedList(node_idx, null, .lparen, .rparen, "(", ")", false);
             return;
@@ -4876,7 +5667,8 @@ const CstFormatter = struct {
                     if (idx + 1 < children.items.len) {
                         const next_c = self.cst_arena.getNode(children.items[idx + 1]);
                         const is_close = next_c.subtree_size == 1 and !next_c.token.isNone() and
-                            self.token_buffer.getToken(next_c.token).kind == .rparen;
+                            (self.token_buffer.getToken(next_c.token).kind == .rparen or
+                                self.token_buffer.getToken(next_c.token).kind == .pipe);
                         if (!is_close) try self.doc_arena.emitText(" ");
                     }
                 } else if (tok_kind == .arrow) {
@@ -4987,12 +5779,16 @@ const CstFormatter = struct {
         try self.emitTokenWithTrivia(close_tok, "}", false);
     }
 
-    /// Formats a pattern CST node (`.tuple_pat`, `.struct_pat`, `.field_pat`, `.or_pat`, `.ident_pat`).
+    /// Formats a pattern CST node (`.tuple_pat`, `.slice_pat`, `.struct_pat`, `.at_pat`, `.or_pat`, `.ident_pat`).
     fn formatPatternNode(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         const node = self.cst_arena.getNode(node_idx);
         switch (node.kind) {
             .tuple_pat => {
                 try self.formatSteerableDelimitedList(node_idx, null, .lparen, .rparen, "(", ")", false);
+                return;
+            },
+            .slice_pat => {
+                try self.formatSteerableDelimitedList(node_idx, null, .lbracket, .rbracket, "[", "]", false);
                 return;
             },
             .struct_pat, .variant_pat => {
@@ -5045,6 +5841,10 @@ const CstFormatter = struct {
                 } else if (tok_kind == .colon) {
                     try self.emitTokenWithTrivia(child.token, ":", false);
                     try self.doc_arena.emitText(" ");
+                } else if (tok_kind == .at and node.kind == .at_pat) {
+                    try self.doc_arena.emitText(" ");
+                    try self.emitTokenWithTrivia(child.token, "@", false);
+                    try self.doc_arena.emitText(" ");
                 } else if (tok_kind == .pipe) {
                     try self.doc_arena.emitText(" ");
                     try self.emitTokenWithTrivia(child.token, "|", false);
@@ -5078,7 +5878,7 @@ const CstFormatter = struct {
         }
     }
 
-    /// Dispatches CST node `node_idx` to its canonical `DR-03` / `DR-14` formatting routine.
+    /// Dispatches CST node `node_idx` to its canonical `DR-03` / `DR-14` / `DR-21` formatting routine.
     fn formatNode(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         const node = self.cst_arena.getNode(node_idx);
         if (node.subtree_size == 1) {
@@ -5102,6 +5902,7 @@ const CstFormatter = struct {
             .trait_item, .impl_item => try self.formatTraitOrImpl(node_idx),
             .fn_item, .trait_member, .impl_member => try self.formatFnOrMember(node_idx),
             .fn_sig => try self.formatFnSig(node_idx),
+            .fn_expr_body => try self.formatFnExprBody(node_idx),
             .return_type => try self.formatReturnType(node_idx),
             .param_list => try self.formatParamList(node_idx),
             .fn_param => try self.formatFnParam(node_idx),
@@ -5114,6 +5915,8 @@ const CstFormatter = struct {
             .local_decl_stmt => try self.formatLocalDeclStmt(node_idx),
             .let_else_branch => try self.formatLetElseBranch(node_idx),
             .return_stmt, .break_stmt, .continue_stmt => try self.formatJumpStmt(node_idx),
+            .diverging_expr => try self.formatDivergingExpr(node_idx),
+            .loop_label => try self.formatLoopLabel(node_idx),
             .defer_stmt => try self.formatDeferStmt(node_idx),
             .assign_stmt => try self.formatAssignStmt(node_idx),
             .expr_stmt => try self.formatExprStmt(node_idx),
@@ -5125,6 +5928,10 @@ const CstFormatter = struct {
             .for_header => try self.formatForHeader(node_idx),
             .while_stmt => try self.formatWhileStmt(node_idx),
             .loop_expr => try self.formatLoopExpr(node_idx),
+            .walrus_cond_expr => try self.formatWalrusCondExpr(node_idx),
+            .with_expr => try self.formatWithExpr(node_idx),
+            .context_binding => try self.formatContextBinding(node_idx),
+            .contextual_variant_expr => try self.formatContextualVariantExpr(node_idx),
             .match_expr => try self.formatMatchExpr(node_idx),
             .match_arm => try self.formatMatchArm(node_idx),
             .call_expr => try self.formatCallExpr(node_idx),
@@ -5151,13 +5958,17 @@ const CstFormatter = struct {
             .slice_or_array_type,
             .tuple_type,
             .fn_type,
+            .closure_type,
             .optional_type,
+            .refined_type,
             => try self.formatTypeNode(node_idx),
             .wildcard_pat,
             .literal_pat,
             .range_pat,
             .tuple_pat,
+            .slice_pat,
             .ident_pat,
+            .at_pat,
             .variant_pat,
             .path_pat,
             .struct_pat,
@@ -5311,24 +6122,24 @@ test "test_doc_renderer_flushes_line_suffix_comments_and_clamps_blank_lines" {
 
 test "test_format_use_tree_sorting_and_trailing_comma_steerability" {
     const src_flat =
-        "use std::collections::{HashMap, BTreeMap, self, Vec};\n" ++
-        "use core::mem;\n";
+        "use cx.col.{HashMap, BTreeMap, self, Vec};\n" ++
+        "use cx.mem;\n";
     var res_flat = try formatSource(std.testing.allocator, src_flat, FileId.fromInt(0));
     defer res_flat.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings(
-        "use std::collections::{self, BTreeMap, HashMap, Vec};\n" ++
-            "use core::mem;\n",
+        "use cx.col.{self, BTreeMap, HashMap, Vec};\n" ++
+            "use cx.mem;\n",
         res_flat.formatted_text,
     );
 
     // Trailing comma inside `use` braces forces multiline break:
-    const src_broken = "use std::collections::{Vec, BTreeMap,};\n";
+    const src_broken = "use cx.col.{Vec, BTreeMap,};\n";
     var res_broken = try formatSource(std.testing.allocator, src_broken, FileId.fromInt(0));
     defer res_broken.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings(
-        "use std::collections::{\n" ++
+        "use cx.col.{\n" ++
             "    BTreeMap,\n" ++
             "    Vec,\n" ++
             "};\n",
@@ -5520,8 +6331,8 @@ test "test_format_red_team_syntax_constructs_and_patterns" {
         "        Point { x, y, .. } => x + y,\n" ++
         "    }\n" ++
         "    match opt_val {\n" ++
-        "        Option::Some(inner_val) => inner_val,\n" ++
-        "        Option::Pair { first_val, second_val } => first_val + second_val,\n" ++
+        "        Option.Some(inner_val) => inner_val,\n" ++
+        "        Option.Pair { first_val, second_val } => first_val + second_val,\n" ++
         "        _ => double_neg,\n" ++
         "    }\n" ++
         "}\n";
@@ -5535,7 +6346,7 @@ test "test_format_red_team_syntax_constructs_and_patterns" {
 
 test "test_format_red_team_comments_and_idempotency" {
     const src =
-        "use std::io::{\n" ++
+        "use cx.io.{\n" ++
         "    Read, // comment on Read\n" ++
         "    Write,\n" ++
         "    // comment before close brace\n" ++
@@ -5636,4 +6447,47 @@ test "test_format_phase5_comptime_intrinsics_and_is_pattern_idempotence" {
 
     try std.testing.expectEqualStrings(pass1.formatted_text, pass2.formatted_text);
     try std.testing.expect(!pass2.is_changed);
+}
+
+test "test_format_dr21_surface_elevations_and_legacy_coloncolon_bailout" {
+    const src =
+        "fn is_empty(buf: &[u8]) -> bool = buf.len() == 0;\n\n" ++
+        "fn process(items: &[u32], opt_val: Option[u32], raw: str) -> usize {\n" ++
+        "    if (count := items.len()) > 0 and opt_val is not .None {\n" ++
+        "        with context.allocator = arena, context.logger = log {\n" ++
+        "            let parsed = raw |> trim() |> parse_usize() catch |err| 0;\n" ++
+        "            let found = search: for item, idx in items[1..$ - 1] {\n" ++
+        "                if item == parsed {\n" ++
+        "                    break :search idx;\n" ++
+        "                }\n" ++
+        "            } orelse return 0;\n" ++
+        "            match items {\n" ++
+        "                whole @ [first, ..middle, last] => return found + whole.len(),\n" ++
+        "                _ => return count,\n" ++
+        "            }\n" ++
+        "        }\n" ++
+        "    }\n" ++
+        "    return 0;\n" ++
+        "}\n";
+
+    var pass1 = try formatSource(std.testing.allocator, src, FileId.fromInt(0));
+    defer pass1.deinit(std.testing.allocator);
+    try std.testing.expect(!pass1.has_syntax_errors);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "if (count := items.len()) > 0 and opt_val is not .None {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "items[1..$-1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "} orelse return 0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "whole @ [first, ..middle, last]") != null);
+
+    var pass2 = try formatSource(std.testing.allocator, pass1.formatted_text, FileId.fromInt(0));
+    defer pass2.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(pass1.formatted_text, pass2.formatted_text);
+    try std.testing.expect(!pass2.is_changed);
+
+    // Legacy `::` emits `E0112` (`has_lexer_error`), causing safe verbatim formatter bailout:
+    const legacy_src = "use cx::io::Read;\n";
+    var legacy_res = try formatSource(std.testing.allocator, legacy_src, FileId.fromInt(0));
+    defer legacy_res.deinit(std.testing.allocator);
+    try std.testing.expect(legacy_res.has_syntax_errors);
+    try std.testing.expect(!legacy_res.is_changed);
+    try std.testing.expectEqualStrings(legacy_src, legacy_res.formatted_text);
 }

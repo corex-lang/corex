@@ -1175,6 +1175,14 @@ pub const MirVm = struct {
     has_aborted_vacated_panic: bool = false,
     /// Non-null dangling `0`-byte sentinel allocation for empty slices (`[CRITICAL-04]`).
     dangling_empty_alloc: ComptimeAllocId = .null_ptr,
+    /// Dynamic 8-slot `Context` capability register bank (`DR-21` `SE-08`).
+    context_slots: [8]RegSlot = @splat(.{ .scalar_u64 = 0 }),
+    /// Per-slot initialization flags for `context_slots` (`false` returns zero-initialized default).
+    context_slots_init: [8]bool = @splat(false),
+    /// Per-slot stored `TypeId` for `context_slots` (coerces synthetic capability handles across slots).
+    context_slot_types: [8]TypeId = @splat(.unit_ty),
+    /// Monotonic counter incremented on any `Context` read/write/region operation (`SE-08` memo guard).
+    context_op_counter: u64 = 0,
     /// Process exit code recorded when `@sys_exit(code)` runs under `is_oracle_runtime_mode`.
     exited_with_code: ?i32 = null,
 
@@ -3483,6 +3491,20 @@ pub const MirVm = struct {
                         cur_ptr = try self.advanceSymbolicPtr(fat.data_ptr, delta);
                         cur_ty = elem_ty;
                         is_unaligned = false;
+                    } else if (cur_ty == .str_ty) {
+                        const fat = try self.readFatSliceParts(cur_ptr);
+                        if (idx_u128 >= fat.elem_len) {
+                            return self.failWithTrap(
+                                error.OutOfBounds,
+                                .e0504_comptime_out_of_bounds,
+                                "string byte index out of bounds during `comptime` evaluation",
+                                "index exceeds string byte length",
+                                null,
+                            );
+                        }
+                        cur_ptr = try self.advanceSymbolicPtr(fat.data_ptr, @intCast(idx_u128));
+                        cur_ty = .u8_ty;
+                        is_unaligned = false;
                     } else {
                         return self.failWithTrap(
                             error.OutOfBounds,
@@ -3732,6 +3754,7 @@ pub const MirVm = struct {
         const dep_checkpoint = self.observed_query_deps.items.len;
         const drop_trace_cp = self.drop_trace.items.len;
         const heap_cp = self.live_heap_allocs;
+        const ctx_op_cp = self.context_op_counter;
 
         if (is_pure_call and !body_owner_def.isNone() and self.db_backed_defs.contains(body_owner_def.asInt())) {
             try self.recordObservedQueryDep(query_db.QueryKey.forDef(.build_def_mir, body_owner_def));
@@ -3740,7 +3763,8 @@ pub const MirVm = struct {
         const raw_ret_slot = try self.executeStackFrame(body, arg_slots, alias_places, call_site_span);
 
         var has_heap_or_drop_effect = self.drop_trace.items.len != drop_trace_cp or
-            self.live_heap_allocs != heap_cp;
+            self.live_heap_allocs != heap_cp or
+            self.context_op_counter != ctx_op_cp;
         if (!has_heap_or_drop_effect) {
             for (self.allocations.items[alloc_cp..]) |alloc_item| {
                 if (alloc_item.is_heap_alloc) {
@@ -4392,6 +4416,7 @@ pub const MirVm = struct {
                     MirValueId.fromInt(inst.operands.lhs),
                     MirValueId.fromInt(inst.operands.rhs),
                     inst.type_id,
+                    inst.flags.is_dollar_sub,
                 );
             },
             .unary_op => {
@@ -4402,6 +4427,7 @@ pub const MirVm = struct {
                     MirValueId.fromInt(inst.operands.lhs),
                     inst.operands.rhs,
                     inst.type_id,
+                    inst.flags.is_synthetic,
                 );
             },
             .aggregate_make => {
@@ -4548,28 +4574,39 @@ pub const MirVm = struct {
                     frame_idx,
                     PlaceId.fromInt(inst.operands.lhs),
                 );
-                const mp = outcome.memory_ptr;
+                const mem_ptr = outcome.memory_ptr;
                 const is_mut_addr = inst.operands.rhs != 0;
-                _ = try self.validateAccess(mp.ptr, 0, 0, is_mut_addr);
-                const res_unwrapped = self.pool.unwrapUnderlyingType(inst.type_id);
-                const res_node = self.pool.getNode(res_unwrapped);
+                const src_node = self.pool.getNode(self.pool.unwrapUnderlyingType(mem_ptr.pointee_ty));
+                if (src_node.tag == .slice_ty or src_node.tag == .soa_slice_ty) {
+                    _ = try self.validateAccess(mem_ptr.ptr, 0, 0, false);
+                    if (is_mut_addr) {
+                        const fat_slice = try self.readFatSliceParts(mem_ptr.ptr);
+                        if (fat_slice.elem_len > 0) {
+                            _ = try self.validateAccess(fat_slice.data_ptr, 0, 0, true);
+                        }
+                    }
+                } else {
+                    _ = try self.validateAccess(mem_ptr.ptr, 0, 0, is_mut_addr);
+                }
+                const res_node = self.pool.getNode(self.pool.unwrapUnderlyingType(inst.type_id));
                 if (res_node.tag == .slice_ty or res_node.tag == .soa_slice_ty) {
-                    const src_node = self.pool.getNode(mp.pointee_ty);
+                    if (src_node.tag == .slice_ty or src_node.tag == .soa_slice_ty) {
+                        return .{ .sym_ptr = mem_ptr.ptr };
+                    }
                     const arr_len: u64 = src_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
-                    return self.makeFatSliceSlot(inst.type_id, mp.ptr, arr_len);
+                    return self.makeFatSliceSlot(inst.type_id, mem_ptr.ptr, arr_len);
                 }
                 if (res_node.tag == .ref_ty or res_node.tag == .mut_ref_ty or res_node.tag == .raw_ptr_ty) {
                     const dst_pointee = self.pool.unwrapUnderlyingType(TypeId.fromInt(res_node.lhs));
                     const dst_pointee_tag = self.pool.getNode(dst_pointee).tag;
-                    const src_node = self.pool.getNode(mp.pointee_ty);
                     if ((dst_pointee_tag == .slice_ty or dst_pointee_tag == .soa_slice_ty) and
                         (src_node.tag == .array_ty or src_node.tag == .soa_array_ty))
                     {
                         const arr_len: u64 = src_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
-                        return self.makeFatSliceSlot(dst_pointee, mp.ptr, arr_len);
+                        return self.makeFatSliceSlot(dst_pointee, mem_ptr.ptr, arr_len);
                     }
                 }
-                return .{ .sym_ptr = mp.ptr };
+                return .{ .sym_ptr = mem_ptr.ptr };
             },
             .soa_column_slice => {
                 const outcome = try self.evalPlace(
@@ -5008,6 +5045,7 @@ pub const MirVm = struct {
         lhs_val: MirValueId,
         rhs_val: MirValueId,
         res_ty: TypeId,
+        is_dollar_sub: bool,
     ) VmEvalError!RegSlot {
         const body = self.call_stack.items[frame_idx].body;
         const lhs_slot = self.call_stack.items[frame_idx].regs[lhs_val.asInt()];
@@ -5161,6 +5199,15 @@ pub const MirVm = struct {
             },
             .usub_checked => {
                 if (lu < ru) {
+                    if (is_dollar_sub) {
+                        return self.failWithTrap(
+                            error.OutOfBounds,
+                            .e0307_static_buffer_overflow,
+                            "compile-time `$` end-offset underflows sequence length",
+                            "out-of-bounds `$` offset here",
+                            null,
+                        );
+                    }
                     return self.failWithTrap(
                         error.IntegerOverflow,
                         .e0502_integer_constant_overflow,
@@ -5360,6 +5407,7 @@ pub const MirVm = struct {
         src_val: MirValueId,
         rhs_aux: u32,
         res_ty: TypeId,
+        is_synthetic: bool,
     ) VmEvalError!RegSlot {
         const body = self.call_stack.items[frame_idx].body;
         const src_slot = self.call_stack.items[frame_idx].regs[src_val.asInt()];
@@ -5537,6 +5585,13 @@ pub const MirVm = struct {
                     }
                 }
                 if (src_repr == .inline_ptr or dst_repr == .inline_ptr) {
+                    if (is_synthetic and kind == .ptr_cast) {
+                        if ((src_repr == .inline_ptr and dst_repr == .inline_scalar) or
+                            (src_repr == .inline_scalar and dst_repr == .inline_ptr))
+                        {
+                            return src_slot;
+                        }
+                    }
                     return self.failWithTrap(
                         error.ForbiddenOperation,
                         .e0503_forbidden_comptime_operation,
@@ -5908,7 +5963,7 @@ pub const MirVm = struct {
         return .{ .sym_ptr = snap };
     }
 
-    /// Looks up a registered `Drop::drop` / `AutoDrop::drop` callable index for unwrapped nominal `ty`.
+    /// Looks up a registered `Drop.drop` / `AutoDrop.drop` callable index for unwrapped nominal `ty`.
     fn lookupDropCallableForType(self: *MirVm, ty: TypeId) VmEvalError!?u32 {
         const ty_node = self.pool.getNode(ty);
         if (ty_node.tag == .struct_ty or ty_node.tag == .enum_ty or ty_node.tag == .union_ty) {
@@ -5933,7 +5988,6 @@ pub const MirVm = struct {
             if (cand_body.param_count != 1 or cand_body.locals.items.len < 2) continue;
             const fn_name = self.interner.get(cand_body.name);
             if (!std.mem.eql(u8, fn_name, "drop") and
-                !std.mem.endsWith(u8, fn_name, "::drop") and
                 !std.mem.endsWith(u8, fn_name, ".drop")) continue;
             const raw_param_ty = self.pool.unwrapUnderlyingType(cand_body.locals.items[1].type_id);
             const param_node = self.pool.getNode(raw_param_ty);
@@ -5996,13 +6050,13 @@ pub const MirVm = struct {
         }
     }
 
-    /// Recursively executes `Drop::drop` / `AutoDrop::drop`, reverse-order field drops, and container buffer frees.
+    /// Recursively executes `Drop.drop` / `AutoDrop.drop`, reverse-order field drops, and container buffer frees.
     fn dropPlaceInVm(self: *MirVm, place_ptr: SymbolicPtr, raw_ty: TypeId) VmEvalError!void {
         try self.tickStepBudget();
         const ty = self.pool.unwrapUnderlyingType(raw_ty);
         if (ty.isError() or ty == .unit_ty or ty == .never_ty or ty.isPrimitive()) return;
 
-        // [1] Invoke explicit user `Drop::drop` / `AutoDrop::drop` on outer nominal value first:
+        // [1] Invoke explicit user `Drop.drop` / `AutoDrop.drop` on outer nominal value first:
         if (try self.lookupDropCallableForType(ty)) |drop_fn_idx| {
             if (self.callables.items[drop_fn_idx].body) |drop_body| {
                 const param_decl = drop_body.locals.items[1];
@@ -7140,6 +7194,227 @@ pub const MirVm = struct {
                 }
                 self.exited_with_code = exit_i32;
                 return error.ProcessExited;
+            },
+            .subslice_make => {
+                if (args.len < 3) return .{ .scalar_u64 = 0 };
+                const base_val = MirValueId.fromInt(args[0]);
+                const lo_ty = body.getInst(MirValueId.fromInt(args[1])).type_id;
+                const hi_ty = body.getInst(MirValueId.fromInt(args[2])).type_id;
+                const lo_u128 = try self.readIntBitsFromSlot(
+                    self.call_stack.items[frame_idx].regs[args[1]],
+                    lo_ty,
+                );
+                const hi_u128 = try self.readIntBitsFromSlot(
+                    self.call_stack.items[frame_idx].regs[args[2]],
+                    hi_ty,
+                );
+                const sub_len: u64 = @intCast(hi_u128 -| lo_u128);
+
+                const base_ty = self.pool.unwrapUnderlyingType(body.getInst(base_val).type_id);
+                const base_node = self.pool.getNode(base_ty);
+                const base_slot = self.call_stack.items[frame_idx].regs[args[0]];
+                const base_data_ptr: SymbolicPtr = if (base_ty == .str_ty or
+                    base_node.tag == .slice_ty or
+                    base_node.tag == .soa_slice_ty)
+                    (try self.readFatSliceParts(base_slot.sym_ptr)).data_ptr
+                else if (base_node.tag == .ref_ty or
+                    base_node.tag == .mut_ref_ty or
+                    base_node.tag == .raw_ptr_ty)
+                blk_ref: {
+                    const pt_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(base_node.lhs));
+                    const pt_tag = self.pool.getNode(pt_ty).tag;
+                    if (pt_ty == .str_ty or pt_tag == .slice_ty or pt_tag == .soa_slice_ty) {
+                        break :blk_ref (try self.readFatSliceParts(base_slot.sym_ptr)).data_ptr;
+                    }
+                    break :blk_ref base_slot.sym_ptr;
+                } else base_slot.sym_ptr;
+
+                const res_unwrapped = self.pool.unwrapUnderlyingType(inst.type_id);
+                const res_node = self.pool.getNode(res_unwrapped);
+                const slice_ty = if (res_node.tag == .ref_ty or
+                    res_node.tag == .mut_ref_ty or
+                    res_node.tag == .raw_ptr_ty)
+                    self.pool.unwrapUnderlyingType(TypeId.fromInt(res_node.lhs))
+                else
+                    res_unwrapped;
+
+                const elem_stride: u64 = if (slice_ty == .str_ty)
+                    1
+                else blk_stride: {
+                    const elem_ty = self.pool.unwrapUnderlyingType(
+                        TypeId.fromInt(self.pool.getNode(slice_ty).lhs),
+                    );
+                    break :blk_stride type_system.computeTypeLayoutWithPool(
+                        self.pool,
+                        self.sym_table,
+                        elem_ty,
+                        self.options.target_layout,
+                    ).byte_size;
+                };
+                const byte_delta = try self.mulOffsetChecked(lo_u128, elem_stride);
+                const sub_data_ptr = if (byte_delta == 0)
+                    base_data_ptr
+                else
+                    try self.advanceSymbolicPtr(base_data_ptr, byte_delta);
+                return self.makeFatSliceSlot(slice_ty, sub_data_ptr, sub_len);
+            },
+            .ctx_get => {
+                self.context_op_counter += 1;
+                if (args.len < 1) return .{ .scalar_u64 = 0 };
+                const slot_ty = body.getInst(MirValueId.fromInt(args[0])).type_id;
+                const slot_bits = try self.readIntBitsFromSlot(
+                    self.call_stack.items[frame_idx].regs[args[0]],
+                    slot_ty,
+                );
+                const slot_ord: usize = @intCast(slot_bits & 7);
+                const dst_ty = self.pool.unwrapUnderlyingType(inst.type_id);
+                if (type_system.ContextFieldLayout.resolveRefPointee(self.pool, self.sym_table, dst_ty)) |ctx_struct_ty| {
+                    const ctx_snap = try self.allocSnapshotForType(ctx_struct_ty, true);
+                    for (0..type_system.ContextFieldLayout.CANONICAL_FIELDS.len) |slot_idx| {
+                        if (!self.context_slots_init[slot_idx]) continue;
+                        const field_info = computeCompositeFieldOffsetAndType(
+                            self.pool,
+                            self.sym_table,
+                            ctx_struct_ty,
+                            @intCast(slot_idx),
+                            self.options.target_layout,
+                        ) orelse continue;
+                        const field_ptr = try self.advanceSymbolicPtr(ctx_snap, field_info.byte_offset);
+                        const stored_slot = self.context_slots[slot_idx];
+                        const stored_ty = self.context_slot_types[slot_idx];
+                        const stored_repr = classifyValueRepr(
+                            self.pool,
+                            self.sym_table,
+                            stored_ty,
+                            self.options.target_layout,
+                        );
+                        const field_repr = classifyValueRepr(
+                            self.pool,
+                            self.sym_table,
+                            field_info.field_ty,
+                            self.options.target_layout,
+                        );
+                        if (stored_repr == field_repr) {
+                            try self.storeTypedSlotToMemoryAligned(field_ptr, field_info.field_ty, stored_slot, false);
+                        } else if ((stored_repr == .inline_ptr or stored_repr == .inline_scalar) and
+                            field_repr == .by_value_snapshot)
+                        {
+                            const field_lay = type_system.computeTypeLayoutWithPool(
+                                self.pool,
+                                self.sym_table,
+                                field_info.field_ty,
+                                self.options.target_layout,
+                            );
+                            if (field_lay.byte_size > 0) {
+                                var word_buf: [8]u8 = @splat(0);
+                                std.mem.writeInt(u64, &word_buf, stored_slot.scalar_u64, .little);
+                                const copy_len: usize = @intCast(@min(field_lay.byte_size, word_buf.len));
+                                try self.writeScalarBytes(field_ptr, 0, word_buf[0..copy_len]);
+                            }
+                        } else if (stored_repr == .by_value_snapshot and
+                            (field_repr == .inline_scalar or field_repr == .inline_ptr))
+                        {
+                            var word_buf: [8]u8 = @splat(0);
+                            const stored_lay = type_system.computeTypeLayoutWithPool(
+                                self.pool,
+                                self.sym_table,
+                                stored_ty,
+                                self.options.target_layout,
+                            );
+                            const copy_len: usize = @intCast(@min(stored_lay.byte_size, word_buf.len));
+                            if (copy_len > 0) {
+                                try self.readScalarBytes(stored_slot.sym_ptr, 0, word_buf[0..copy_len]);
+                                try self.writeScalarBytes(field_ptr, 0, word_buf[0..copy_len]);
+                            }
+                        }
+                    }
+                    self.sealSnapshot(ctx_snap);
+                    return .{ .sym_ptr = ctx_snap };
+                }
+                const dst_repr = classifyValueRepr(
+                    self.pool,
+                    self.sym_table,
+                    dst_ty,
+                    self.options.target_layout,
+                );
+                if (self.context_slots_init[slot_ord]) {
+                    const stored_slot = self.context_slots[slot_ord];
+                    const stored_ty = self.context_slot_types[slot_ord];
+                    const stored_repr = classifyValueRepr(
+                        self.pool,
+                        self.sym_table,
+                        stored_ty,
+                        self.options.target_layout,
+                    );
+                    if (stored_repr == dst_repr) {
+                        return stored_slot;
+                    }
+                    if ((stored_repr == .inline_ptr or stored_repr == .inline_scalar) and
+                        dst_repr == .by_value_snapshot)
+                    {
+                        const wrapped_snap = try self.allocSnapshotForType(dst_ty, true);
+                        const dst_lay = type_system.computeTypeLayoutWithPool(
+                            self.pool,
+                            self.sym_table,
+                            dst_ty,
+                            self.options.target_layout,
+                        );
+                        if (dst_lay.byte_size > 0) {
+                            var word_buf: [8]u8 = @splat(0);
+                            std.mem.writeInt(u64, &word_buf, stored_slot.scalar_u64, .little);
+                            const copy_len: usize = @intCast(@min(dst_lay.byte_size, word_buf.len));
+                            try self.writeScalarBytes(wrapped_snap, 0, word_buf[0..copy_len]);
+                        }
+                        self.sealSnapshot(wrapped_snap);
+                        return .{ .sym_ptr = wrapped_snap };
+                    }
+                    if (stored_repr == .by_value_snapshot and
+                        (dst_repr == .inline_scalar or dst_repr == .inline_ptr))
+                    {
+                        var word_buf: [8]u8 = @splat(0);
+                        const stored_lay = type_system.computeTypeLayoutWithPool(
+                            self.pool,
+                            self.sym_table,
+                            stored_ty,
+                            self.options.target_layout,
+                        );
+                        const copy_len: usize = @intCast(@min(stored_lay.byte_size, word_buf.len));
+                        if (copy_len > 0) {
+                            try self.readScalarBytes(stored_slot.sym_ptr, 0, word_buf[0..copy_len]);
+                        }
+                        return .{ .scalar_u64 = std.mem.readInt(u64, &word_buf, .little) };
+                    }
+                    return stored_slot;
+                }
+                return switch (dst_repr) {
+                    .inline_scalar => .{ .scalar_u64 = 0 },
+                    .inline_ptr => .{ .sym_ptr = SymbolicPtr.NULL },
+                    .by_value_snapshot => blk_zero_snap: {
+                        const zero_snap = try self.allocSnapshotForType(dst_ty, true);
+                        self.sealSnapshot(zero_snap);
+                        break :blk_zero_snap .{ .sym_ptr = zero_snap };
+                    },
+                };
+            },
+            .ctx_set => {
+                self.context_op_counter += 1;
+                if (args.len >= 2) {
+                    const slot_ty = body.getInst(MirValueId.fromInt(args[0])).type_id;
+                    const slot_bits = try self.readIntBitsFromSlot(
+                        self.call_stack.items[frame_idx].regs[args[0]],
+                        slot_ty,
+                    );
+                    const slot_ord: usize = @intCast(slot_bits & 7);
+                    const val_ty = self.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[1])).type_id);
+                    self.context_slots[slot_ord] = self.call_stack.items[frame_idx].regs[args[1]];
+                    self.context_slot_types[slot_ord] = val_ty;
+                    self.context_slots_init[slot_ord] = true;
+                }
+                return .{ .scalar_u64 = 0 };
+            },
+            .ghost_ctx_region_push, .ghost_ctx_region_pop => {
+                self.context_op_counter += 1;
+                return .{ .scalar_u64 = 0 };
             },
         }
     }

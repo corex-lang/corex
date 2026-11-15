@@ -1,8 +1,9 @@
 //! CoreX Stage 0 Master Verification Suite Runner (`tests/test_runner.zig`)
 //!
-//! Aggregates and executes all Phase 0, Phase 1, Phase 2, Phase 3, Phase 4, Phase 5, Phase 6, and
-//! Phase 7 isolated unit tests (`tests/unit/`), golden snapshot tests (`tests/snapshots/`),
-//! deterministic PRNG fuzzers (`tests/fuzz/`), and repository drift guards (`tests/drift/`).
+//! Aggregates and executes all Phase 0, Phase 1, Phase 2, Phase 3, Phase 4, Phase 5, Phase 6,
+//! Phase 7, and Phase 7.5 (`DR-21` surface syntax, `cx.*`, & ergonomic elevation) isolated unit
+//! tests (`tests/unit/`), golden snapshot tests (`tests/snapshots/`), deterministic PRNG fuzzers
+//! (`tests/fuzz/`), and repository drift guards (`tests/drift/`).
 //!
 //! Invoked automatically by `zig build test` alongside internal `stage0/src/` module tests.
 
@@ -16,7 +17,7 @@ pub const mem_foundation_test = @import("unit/mem_foundation_test.zig");
 pub const vfs_sourcemap_test = @import("unit/vfs_sourcemap_test.zig");
 /// Unit tests for `syntax_arenas.zig` (`TokenBuffer`, `LosslessCstArena`, `AstArena`).
 pub const syntax_arenas_test = @import("unit/syntax_arenas_test.zig");
-/// Unit tests for `lexer.zig` (112 `TokenKind`s, 10 `TriviaKind`s, casing, literals, lossless CST).
+/// Unit tests for `lexer.zig` (117 `TokenKind`s, 10 `TriviaKind`s, casing, literals, lossless CST).
 pub const lexer_test = @import("unit/lexer_test.zig");
 /// Unit tests for `parser.zig` (lossless CST/AST, 15 Pratt tiers, showcases, recovery, incremental).
 pub const parser_test = @import("unit/parser_test.zig");
@@ -66,13 +67,13 @@ pub const phase1_lexer_fuzz = @import("fuzz/phase1_lexer_fuzz.zig");
 pub const phase2_parser_fuzz = @import("fuzz/phase2_parser_fuzz.zig");
 /// Phase 3 deterministic PRNG fuzzing suite (`corex fmt` idempotency/comments + `CompilerDb` Early Cutoff).
 pub const phase3_fmt_fuzz = @import("fuzz/phase3_fmt_fuzz.zig");
-/// Phase 4 deterministic PRNG fuzzing suite (`symbol_resolver` + `type_system` fault tolerance & incremental parity).
+/// Phase 4 deterministic PRNG fuzzing suite (`symbol_resolver` + `type_system` + `DR-21` fault tolerance & incremental parity).
 pub const phase4_typecheck_fuzz = @import("fuzz/phase4_typecheck_fuzz.zig");
-/// Phase 5 deterministic PRNG fuzzing suite (`HIR`/`MIR` fault tolerance, `--dev` vs `--release` parity, and `CompilerDb` Stages 10–13).
+/// Phase 5 deterministic PRNG fuzzing suite (`HIR`/`MIR` + `DR-21` fault tolerance, `--dev` vs `--release`, and `CompilerDb` 10–13).
 pub const phase5_mir_comptime_fuzz = @import("fuzz/phase5_mir_comptime_fuzz.zig");
-/// Phase 6 deterministic PRNG fuzzing suite (`mir_sast` fault tolerance, `--dev` vs `--release` drop/BCE parity, and `CompilerDb` Stage 9).
+/// Phase 6 deterministic PRNG fuzzing suite (`mir_sast` + `DR-21` fault tolerance, `--dev` vs `--release` BCE/drops, and Stage 9).
 pub const phase6_sast_fuzz = @import("fuzz/phase6_sast_fuzz.zig");
-/// Phase 7 deterministic PRNG fuzzing suite (4-tier differential backend oracle & cross-target IR determinism).
+/// Phase 7 deterministic PRNG fuzzing suite (`DR-21` 4-tier differential backend oracle & cross-target IR determinism).
 pub const phase7_diff_backends_fuzz = @import("fuzz/phase7_diff_backends_fuzz.zig");
 /// Repository-wide drift guards (zero colored emojis, CLI parity, diagnostic catalog, `< 150` col format).
 pub const drift_guard_test = @import("drift/drift_guard_test.zig");

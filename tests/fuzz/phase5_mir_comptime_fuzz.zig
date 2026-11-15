@@ -1,15 +1,17 @@
-//! Phase 5 Deterministic HIR, MIR, Comptime VM & Optimizer Fuzzing Suite (`tests/fuzz/phase5_mir_comptime_fuzz.zig`)
+//! Phase 5 & Phase 7.5 Deterministic HIR, MIR, Comptime VM, Optimizer & `DR-21` Fuzzing Suite (`tests/fuzz/phase5_mir_comptime_fuzz.zig`)
 //!
-//! Exercises three complementary verification invariants across the Phase 5 middle-end:
-//! 1. **Fault Tolerance & Verifier Soundness (`>= 400` iterations):** Combines Phase 5 `.cx` constructs
-//!    (`|>` pipelines, `?`/`catch`, `let … else`, `for`/`while`, `#soa`, `bit_field`, `@derive(Eq, Clone)`,
-//!    `comptime if`/`for`, `defer`/`errdefer`, `subscript`/`yield`) with malformed/type-error snippets and
-//!    random byte perturbations, asserting zero panics, zero memory leaks, and `V1`–`V6` `MirVerifier`
-//!    acceptance whenever `!diagnostics.hasErrors()`.
+//! Exercises three complementary verification invariants across the Phase 5 & Phase 7.5 middle-end:
+//! 1. **Fault Tolerance & Verifier Soundness (`>= 400` iterations):** Combines Phase 5 & `DR-21`
+//!    `.cx` constructs (`|>`, `?`/`catch`, `let … else`, `is`, `:=`, `orelse`, `$` indexing/slicing,
+//!    indexed `for item, idx in`, labeled `T?` value-`break` loops, `= expr;`, named/default args,
+//!    `with context`, `#soa`, `bit_field`, `@derive`, `comptime if`/`for`, `defer`/`errdefer`, and
+//!    `subscript`/`yield`) with malformed snippets and byte perturbations, asserting zero leaks and
+//!    `V1`–`V6` `MirVerifier` acceptance whenever `!diagnostics.hasErrors()`.
 //! 2. **Differential `--dev` vs `--release` `MirVm` Parity (`>= 200` programs x 2 target layouts):**
-//!    Generates structure-aware, well-typed multi-function `.cx` programs and evaluates `entry_main(seed)`
-//!    in `MirVm` on both `--dev` (`D1`–`D5`) and `--release` (`D1`–`D5` + `R1`–`R6`) across `NATIVE_64`
-//!    and `WASM32`, asserting `V1`–`V6` validity and 100% identical scalar outcomes or trap codes.
+//!    Generates structure-aware, well-typed multi-function `.cx` programs exercising `DR-21` `is`,
+//!    `:=`, `orelse` & `orelse return`, `$` slice indexing/slicing, indexed `for`, labeled `search:`
+//!    value-`break` + `orelse`, `= expr;`, named/dependent-default call args, and `with context`,
+//!    evaluating `entry_main(seed)` on `--dev` vs `--release` across `NATIVE_64` and `WASM32`.
 //! 3. **Incremental `CompilerDb` Stages 10–13 Parity (`>= 120` revisions):** Mutates a multi-item `.cx`
 //!    module in a persistent `CompilerDb` vs a fresh scratch `CompilerDb`, asserting 100% fingerprint
 //!    and value parity across `lowerDefHir`, `buildDefMir`, `evalComptimeDef`, and `optimizeMirModule`.
@@ -56,19 +58,20 @@ const DIFFERENTIAL_DEV_RELEASE_ITERATIONS: usize = 210;
 /// Number of incremental `CompilerDb` revision steps verified in `test_fuzz_phase5_incremental_compiler_db_stages_10_to_13_parity`.
 const INCREMENTAL_DB_ITERATIONS: usize = 128;
 
-/// Valid Phase 5 seed items covering all `AST -> HIR -> MIR` desugarings and constructs.
+/// Valid Phase 5 & Phase 7.5 (`DR-21`) seed items covering all `AST -> HIR -> MIR` desugarings.
 const PHASE5_SEED_ITEMS = [_][]const u8{
     "pub const ENABLE_FAST_PATH: bool = true;\n",
     "pub struct IoFault { pub code: i32 }\n",
     "pub enum PipelineErr { @from Io(IoFault), BadInput, }\n",
     "@derive(Eq, Clone)\npub struct RowPoint { pub x: i32, pub y: i32 }\n",
     "pub bit_field RegControl : u16 { pub is_active: bool | 1, pub mode_bits: u16 | 15 }\n",
-    "pub fn scale_pipe(val: i32, factor: i32) -> i32 { return val * factor + 1; }\n",
-    "pub fn generic_mix(lhs: Number, rhs: Number) -> Number { return lhs + rhs; }\n",
+    "pub fn scale_pipe(val: i32, factor: i32) -> i32 = val * factor + 1;\n",
+    "pub fn generic_mix(lhs: Number, rhs: Number) -> Number = lhs + rhs;\n",
     "pub fn fetch_checked(is_ok: bool) -> Result[i32, IoFault] {\n" ++
         "    if is_ok { return .Ok(12); }\n" ++
         "    return .Err(IoFault { code: 7 });\n" ++
         "}\n",
+    "pub fn affine_default(lhs: i32, rhs: i32 = lhs + 3, scale: i32 = 2) -> i32 = lhs * scale + rhs;\n",
     "pub fn lift_pipeline(is_ok: bool, seed: i32) -> Result[i32, PipelineErr] {\n" ++
         "    var err_trace: i32 = 0;\n" ++
         "    errdefer { err_trace += 1; }\n" ++
@@ -103,6 +106,33 @@ const PHASE5_SEED_ITEMS = [_][]const u8{
     "pub subscript lane_at(lanes: &mut [i32; 2], idx: usize) -> i32 {\n" ++
         "    yield lanes[idx];\n" ++
         "}\n",
+    "pub fn dr21_flow_and_search(opt_in: i32?, seed_in: i32) -> i32 {\n" ++
+        "    let base_val: i32 = opt_in orelse return 5;\n" ++
+        "    let bonus_val: i32 = if (cand_opt := opt_in) is .Some(inner_val) and (shifted_val := inner_val + 2) > 3 {\n" ++
+        "        let _keep = cand_opt;\n" ++
+        "        affine_default(scale: 3, lhs: shifted_val)\n" ++
+        "    } else {\n" ++
+        "        affine_default(seed_in)\n" ++
+        "    };\n" ++
+        "    let nums: [i32; 4] = [base_val, bonus_val, 7, 11];\n" ++
+        "    let head_sub: &[i32] = nums[..$ - 1];\n" ++
+        "    var idx_acc: i32 = nums[$ - 1] + head_sub[$ - 1];\n" ++
+        "    for item_val, item_idx in nums {\n" ++
+        "        idx_acc = idx_acc + item_val + (item_idx as i32);\n" ++
+        "    }\n" ++
+        "    let found_val: i32 = search: for item_val, item_idx in nums {\n" ++
+        "        if item_val > 8 {\n" ++
+        "            break :search item_val + (item_idx as i32);\n" ++
+        "        }\n" ++
+        "    } orelse 2;\n" ++
+        "    return idx_acc + found_val;\n" ++
+        "}\n",
+    "pub fn dr21_scoped_context() -> i64 {\n" ++
+        "    let local_tok = CancelToken { _handle: 9 };\n" ++
+        "    return with context.cancel_token = local_tok {\n" ++
+        "        (context.cancel_token._handle as i64) + (context.rng_seed as i64)\n" ++
+        "    };\n" ++
+        "}\n",
 };
 
 /// Deliberately malformed, poison-typed, or error-triggering snippets for fault-tolerance fuzzing.
@@ -114,13 +144,17 @@ const PHASE5_MUTATION_SNIPPETS = [_][]const u8{
     "pub bit_field BrokenBits : u16 { pub flag: bool | 1, pub tiny: u8 | 4 }\n",
     "pub fn conflicting_number_args(left: i32, right: i64) -> i32 { return generic_mix(left, right); }\n",
     "pub fn unresolved_ident_use(val: i32) -> i32 { return missing_callee(val) + unknown_var; }\n",
+    "pub fn bad_outer_dollar() -> usize = $;\n",
+    "pub fn bad_or_walrus(flag: bool) -> i32 { if flag or (leaked_v := 4) > 0 { return leaked_v; } return 0; }\n",
+    "pub fn bad_named_order() -> i32 = affine_default(scale: 2, 5);\n",
+    "pub fn bad_rng_override() -> i32 { return with context.rng_seed = 7 { 1 }; }\n",
 };
 
 /// `const` initializer variants for Stage 12 `evalComptimeDef` Early Cutoff & backdating parity.
 const INCREMENTAL_CONST_VARIANTS = [_][]const u8{
     "pub const SCALE_FACTOR: i64 = 6 * 7;\n\n",
     "// Trivia-only edit preserving evaluated value 42:\npub const SCALE_FACTOR: i64 = 40 + 2;\n\n",
-    "pub const SCALE_FACTOR: i64 = (10 << 2) + 5;\n\n",
+    "pub const SCALE_FACTOR: i64 = ct_dr21_probe(10);\n\n",
     "pub const SCALE_FACTOR: i64 = 19;\n\n",
 };
 
@@ -130,20 +164,27 @@ const INCREMENTAL_WORKER_VARIANTS = [_][]const u8{
     "    // Formatting and comment-only edit:\n" ++
         "    let base = mix_generic(input_val, SCALE_FACTOR);\n\n" ++
         "    return base + 1;\n",
-    "    var total: i64 = 0;\n" ++
-        "    for step in 0..4 {\n" ++
-        "        total += (step as i64);\n" ++
+    "    let lanes: [i64; 4] = [input_val, SCALE_FACTOR, 6, 12];\n" ++
+        "    let head_view: &[i64] = lanes[..$ - 1];\n" ++
+        "    var total: i64 = lanes[$ - 1] + head_view[$ - 1];\n" ++
+        "    for item_val, item_idx in lanes {\n" ++
+        "        total += item_val + (item_idx as i64);\n" ++
         "    }\n" ++
-        "    return mix_generic(input_val, total) + SCALE_FACTOR;\n",
-    "    let opt_num: i64? = .Some(input_val);\n" ++
-        "    let .Some(unwrapped) = opt_num else { return 0; };\n" ++
-        "    return unwrapped |> add_offset(SCALE_FACTOR);\n",
-    "    let tag_res: i64 = match input_val {\n" ++
-        "        0..=3 => SCALE_FACTOR,\n" ++
-        "        4 | 5 => input_val * 2,\n" ++
-        "        _ => input_val - 1,\n" ++
+        "    let hit_val: i64 = search: for item_val, item_idx in lanes {\n" ++
+        "        if item_val > 10 { break :search item_val + (item_idx as i64); }\n" ++
+        "    } orelse 3;\n" ++
+        "    return mix_generic(total, hit_val);\n",
+    "    let opt_num: i64? = if input_val > 0 { .Some(input_val) } else { .None };\n" ++
+        "    if (cand_opt := opt_num) is .Some(unwrapped) and (shifted := unwrapped + 2) > 4 {\n" ++
+        "        let _keep = cand_opt;\n" ++
+        "        return add_offset(offset: SCALE_FACTOR, val: shifted);\n" ++
+        "    }\n" ++
+        "    return (opt_num orelse 5) + add_offset(input_val);\n",
+    "    let local_tok = CancelToken { _handle: 14 };\n" ++
+        "    let ctx_bonus: i64 = with context.cancel_token = local_tok {\n" ++
+        "        (context.cancel_token._handle as i64) + (context.rng_seed as i64)\n" ++
         "    };\n" ++
-        "    return tag_res;\n",
+        "    return add_offset(input_val, SCALE_FACTOR) + ctx_bonus;\n",
 };
 
 // -------------------------------------- INTERNALS --------------------------------------
@@ -176,6 +217,11 @@ fn generateWellTypedDifferentialProgram(
     const shift_amt = random.intRangeAtMost(i64, 1, 3);
     const guard_thresh = random.intRangeAtMost(i64, 4, 20);
     const const_bias = random.intRangeAtMost(i64, -9, 15);
+    const default_bias = random.intRangeAtMost(i64, 1, 9);
+    const opt_thresh = random.intRangeAtMost(i64, 3, 18);
+    const orelse_fallback = random.intRangeAtMost(i64, 2, 14);
+    const search_thresh = random.intRangeAtMost(i64, 6, 22);
+    const token_handle = random.intRangeAtMost(usize, 5, 45);
     const is_overflow_probe = (prog_idx % 19 == 18);
 
     try src_buf.appendSlice(
@@ -183,10 +229,18 @@ fn generateWellTypedDifferentialProgram(
         "pub struct AccPair {\n    pub left: i64,\n    pub right: i64,\n}\n" ++
             "pub enum StepMode {\n    Idle,\n    Shift(i64),\n    Scale(i64),\n}\n" ++
             "pub fn bump_defer_log(slot: &mut i64, delta: i64) {\n    *slot = *slot + delta;\n}\n" ++
-            "pub fn generic_combine(lhs: Number, rhs: Number) -> Number {\n    return lhs + rhs;\n}\n",
+            "pub fn generic_combine(lhs: Number, rhs: Number) -> Number = lhs + rhs;\n" ++
+            "pub fn opt_probe(raw_seed: i64, thresh: i64) -> i64? {\n" ++
+            "    if raw_seed > thresh { return .Some((raw_seed & 31) + 4); }\n" ++
+            "    return .None;\n" ++
+            "}\n" ++
+            "pub fn unwrap_or_early(opt_in: i64?, fallback_ret: i64) -> i64 {\n" ++
+            "    let core_val: i64 = opt_in orelse return fallback_ret;\n" ++
+            "    return core_val + 5;\n" ++
+            "}\n",
     );
 
-    // Emit `@inline` small arithmetic/bitwise helper:
+    // [1] Emit `= expr;` single-expression `@inline` helper & dependent-default function:
     const inline_expr = switch (inline_op_choice) {
         0 => "(val + delta) ^ 5",
         1 => "(val - delta) | 3",
@@ -195,73 +249,120 @@ fn generateWellTypedDifferentialProgram(
         4 => "((val & 255) >> 1) - delta",
         else => "(val ^ delta) + 7",
     };
-    var helper_buf: [512]u8 = undefined;
-    const helper_text = try std.fmt.bufPrint(
-        &helper_buf,
-        "@inline\npub fn inline_step(val: i64, delta: i64) -> i64 {{\n    return {s};\n}}\n",
-        .{inline_expr},
+    var helper_buf: [768]u8 = undefined;
+    try src_buf.appendSlice(
+        allocator,
+        try std.fmt.bufPrint(
+            &helper_buf,
+            "@inline\npub fn inline_step(val: i64, delta: i64 = 3) -> i64 = {s};\n" ++
+                "pub fn affine_window(lhs_val: i64, mid_val: i64 = lhs_val + {d}, scale_val: i64 = 2) -> i64 =\n" ++
+                "    (lhs_val & 63) * scale_val + mid_val;\n",
+            .{ inline_expr, default_bias },
+        ),
     );
-    try src_buf.appendSlice(allocator, helper_text);
 
-    // Emit worker exercising LIFO `defer` cleanup + `StepMode` enum `match`:
+    // [2] Emit worker exercising LIFO `defer` cleanup + `StepMode` enum `match`:
     var worker_buf: [768]u8 = undefined;
-    const worker_text = try std.fmt.bufPrint(
-        &worker_buf,
-        "pub fn run_mode_worker(mode: StepMode, audit_log: &mut i64) -> i64 {{\n" ++
-            "    defer bump_defer_log(audit_log, {d});\n" ++
-            "    return match mode {{\n" ++
-            "        .Idle => 1,\n" ++
-            "        .Shift(amount) => (amount & 31) << {d},\n" ++
-            "        .Scale(factor) => inline_step(factor, 2),\n" ++
-            "    }};\n" ++
-            "}}\n",
-        .{ defer_delta, shift_amt },
+    try src_buf.appendSlice(
+        allocator,
+        try std.fmt.bufPrint(
+            &worker_buf,
+            "pub fn run_mode_worker(mode: StepMode, audit_log: &mut i64) -> i64 {{\n" ++
+                "    defer bump_defer_log(audit_log, {d});\n" ++
+                "    return match mode {{\n" ++
+                "        .Idle => 1,\n" ++
+                "        .Shift(amount) => (amount & 31) << {d},\n" ++
+                "        .Scale(factor) => inline_step(factor),\n" ++
+                "    }};\n" ++
+                "}}\n",
+            .{ defer_delta, shift_amt },
+        ),
     );
-    try src_buf.appendSlice(allocator, worker_text);
 
-    // Emit `entry_main(seed: i64) -> i64` combining SROA structs/tuples, diamond joins, loops, and `match`:
+    // [3] Emit `entry_main(seed: i64) -> i64` exercising `DR-21` `is`, `:=`, `orelse`, `$`, `for`, `search:`, & `with`:
     const final_tail = if (is_overflow_probe)
-        "    let max_pos: i64 = 9223372036854775806;\n    return max_pos + (safe_seed & 7);\n}\n"
+        "    let _ = dr21_total;\n    let max_pos: i64 = 9223372036854775806;\n    return max_pos + (safe_seed & 7);\n}\n"
     else
-        "    return pair.left + pair.right + tup.0 - tup.1 + matched + mode_val + audit_acc + (small_sum as i64);\n}\n";
+        "    return pair.left + pair.right + tup.0 - tup.1 + matched + mode_val + audit_acc + (small_sum as i64) + dr21_total;\n}\n";
 
-    var main_buf: [1536]u8 = undefined;
-    const main_text = try std.fmt.bufPrint(
-        &main_buf,
-        "pub fn entry_main(seed: i64) -> i64 {{\n" ++
-            "    let safe_seed: i64 = (seed & 31) + 1;\n" ++
-            "    let two_i64: i64 = 2;\n" ++
-            "    var pair = AccPair {{ left: safe_seed, right: {d} }};\n" ++
-            "    let tup: (i64, i64) = (safe_seed + 2, 4);\n" ++
-            "    if (safe_seed & 1) == 0 {{\n" ++
-            "        pair.left = inline_step(pair.left, tup.0);\n" ++
-            "    }} else {{\n" ++
-            "        pair.right = generic_combine(pair.right, tup.1);\n" ++
-            "    }}\n" ++
-            "    var iter_idx: i64 = 0;\n" ++
-            "    while iter_idx < {d} {{\n" ++
-            "        pair.left = generic_combine(pair.left, iter_idx);\n" ++
-            "        iter_idx += 1;\n" ++
-            "    }}\n" ++
-            "    for step_num in 0..{d} {{\n" ++
-            "        pair.right = pair.right + (step_num as i64);\n" ++
-            "    }}\n" ++
-            "    let matched: i64 = match safe_seed {{\n" ++
-            "        0..=4 => pair.left + 3,\n" ++
-            "        5 | 6 | 7 => pair.right + 5,\n" ++
-            "        other if other > {d} => inline_step(other, 1),\n" ++
-            "        _ => generic_combine(pair.left, two_i64),\n" ++
-            "    }};\n" ++
-            "    var audit_acc: i64 = 0;\n" ++
-            "    let chosen_mode: StepMode = if (safe_seed & 2) == 0 {{ .Shift(safe_seed) }} else {{ .Scale(safe_seed) }};\n" ++
-            "    let mode_val = run_mode_worker(chosen_mode, &mut audit_acc);\n" ++
-            "    let small_lhs: i32 = (safe_seed as i32) & 15;\n" ++
-            "    let small_rhs: i32 = 6;\n" ++
-            "    let small_sum: i32 = generic_combine(small_lhs, small_rhs);\n" ++
-            "{s}",
-        .{ const_bias, loop_bound, range_bound, guard_thresh, final_tail },
+    var main_buf: [3072]u8 = undefined;
+    try src_buf.appendSlice(
+        allocator,
+        try std.fmt.bufPrint(
+            &main_buf,
+            "pub fn entry_main(seed: i64) -> i64 {{\n" ++
+                "    let safe_seed: i64 = (seed & 31) + 1;\n" ++
+                "    let two_i64: i64 = 2;\n" ++
+                "    var pair = AccPair {{ left: safe_seed, right: {d} }};\n" ++
+                "    let tup: (i64, i64) = (safe_seed + 2, 4);\n" ++
+                "    if (safe_seed & 1) == 0 {{\n" ++
+                "        pair.left = inline_step(pair.left, tup.0);\n" ++
+                "    }} else {{\n" ++
+                "        pair.right = generic_combine(pair.right, tup.1);\n" ++
+                "    }}\n" ++
+                "    var iter_idx: i64 = 0;\n" ++
+                "    while iter_idx < {d} {{\n" ++
+                "        pair.left = generic_combine(pair.left, iter_idx);\n" ++
+                "        iter_idx += 1;\n" ++
+                "    }}\n" ++
+                "    for step_num in 0..{d} {{\n" ++
+                "        pair.right = pair.right + (step_num as i64);\n" ++
+                "    }}\n" ++
+                "    let matched: i64 = match safe_seed {{\n" ++
+                "        0..=4 => pair.left + 3,\n" ++
+                "        5 | 6 | 7 => pair.right + 5,\n" ++
+                "        other if other > {d} => inline_step(other, 1),\n" ++
+                "        _ => generic_combine(pair.left, two_i64),\n" ++
+                "    }};\n" ++
+                "    var audit_acc: i64 = 0;\n" ++
+                "    let chosen_mode: StepMode = if (safe_seed & 2) == 0 {{ .Shift(safe_seed) }} else {{ .Scale(safe_seed) }};\n" ++
+                "    let mode_val = run_mode_worker(chosen_mode, &mut audit_acc);\n" ++
+                "    let small_lhs: i32 = (safe_seed as i32) & 15;\n" ++
+                "    let small_rhs: i32 = 6;\n" ++
+                "    let small_sum: i32 = generic_combine(small_lhs, small_rhs);\n" ++
+                "    let first_opt: i64? = opt_probe(safe_seed, {d});\n" ++
+                "    let is_val: i64 = if first_opt is .Some(inner_v) {{ inner_v + 2 }} else {{ 1 }};\n" ++
+                "    let walrus_val: i64 = if (cand_opt := opt_probe(safe_seed + 3, {d})) is .Some(got_v) and\n" ++
+                "        (shifted_v := got_v + 3) > 6\n" ++
+                "    {{\n" ++
+                "        let _keep = cand_opt;\n" ++
+                "        shifted_v\n" ++
+                "    }} else {{\n" ++
+                "        3\n" ++
+                "    }};\n" ++
+                "    let orelse_val: i64 = (first_opt orelse {d}) + unwrap_or_early(opt_probe(safe_seed, 10), 4);\n" ++
+                "    let lane_arr: [i64; 4] = [safe_seed, safe_seed + 2, safe_seed + 5, safe_seed + 9];\n" ++
+                "    let trimmed_lanes: &[i64] = lane_arr[..$ - 1];\n" ++
+                "    var indexed_sum: i64 = lane_arr[$ - 1] + trimmed_lanes[$ - 1];\n" ++
+                "    for lane_item, lane_idx in lane_arr {{\n" ++
+                "        indexed_sum = indexed_sum + lane_item + (lane_idx as i64);\n" ++
+                "    }}\n" ++
+                "    let search_val: i64 = search: for lane_item, lane_idx in lane_arr {{\n" ++
+                "        if lane_item > {d} {{\n" ++
+                "            break :search lane_item + (lane_idx as i64);\n" ++
+                "        }}\n" ++
+                "    }} orelse 7;\n" ++
+                "    let named_val: i64 = affine_window(safe_seed) + affine_window(scale_val: 3, lhs_val: safe_seed, mid_val: 4);\n" ++
+                "    let tok_override = CancelToken {{ _handle: {d} }};\n" ++
+                "    let ctx_val: i64 = with context.cancel_token = tok_override {{\n" ++
+                "        (context.cancel_token._handle as i64) + (context.rng_seed as i64)\n" ++
+                "    }};\n" ++
+                "    let dr21_total: i64 = is_val + walrus_val + orelse_val + indexed_sum + search_val + named_val + ctx_val;\n" ++
+                "{s}",
+            .{
+                const_bias,
+                loop_bound,
+                range_bound,
+                guard_thresh,
+                opt_thresh,
+                opt_thresh,
+                orelse_fallback,
+                search_thresh,
+                token_handle,
+                final_tail,
+            },
+        ),
     );
-    try src_buf.appendSlice(allocator, main_text);
 
     return src_buf.toOwnedSlice(allocator);
 }
@@ -298,8 +399,7 @@ fn evalEntryMainOutcome(
 
     const entry_body = opt_res.findBodyByName(&bundle.hir_bundle.interner, "entry_main") orelse
         return error.MissingEntryMain;
-    const args = [1]RegSlot{.{ .scalar_i64 = seed_arg }};
-    const eval_res = vm_engine.evalBody(entry_body, &args) catch |vm_err| switch (vm_err) {
+    const eval_res = vm_engine.evalBody(entry_body, &[_]RegSlot{.{ .scalar_i64 = seed_arg }}) catch |vm_err| switch (vm_err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .vm_trap = vm_err },
     };
@@ -317,24 +417,30 @@ fn buildIncrementalPhase5Module(
     errdefer builder.deinit(allocator);
 
     if (has_banner_comment) {
-        try builder.appendSlice(allocator, "//! Incremental Phase 5 HIR/MIR/Comptime/Opt parity banner\n\n");
+        try builder.appendSlice(allocator, "//! Incremental Phase 5 + DR-21 HIR/MIR/Comptime/Opt parity banner\n\n");
     }
     try builder.appendSlice(allocator, INCREMENTAL_CONST_VARIANTS[const_choice]);
     try builder.appendSlice(
         allocator,
-        "pub fn mix_generic(lhs: Number, rhs: Number) -> Number {\n    return lhs + rhs;\n}\n\n" ++
-            "pub fn add_offset(val: i64, offset: i64) -> i64 {\n    return val + offset;\n}\n\n",
+        "pub fn mix_generic(lhs: Number, rhs: Number) -> Number = lhs + rhs;\n\n" ++
+            "pub fn add_offset(val: i64, offset: i64 = val + 2) -> i64 = val + offset;\n\n" ++
+            "pub fn ct_dr21_probe(seed_val: i64) -> i64 {\n" ++
+            "    let nums: [i64; 3] = [seed_val, seed_val + 4, (seed_val << 2) + 5];\n" ++
+            "    return nums[$ - 1];\n" ++
+            "}\n\n",
     );
 
     var worker_idx: usize = 0;
     while (worker_idx < 3) : (worker_idx += 1) {
         var hdr_buf: [128]u8 = undefined;
-        const hdr_slice = try std.fmt.bufPrint(
-            &hdr_buf,
-            "pub fn worker_{d}(input_val: i64) -> i64 {{\n",
-            .{worker_idx},
+        try builder.appendSlice(
+            allocator,
+            try std.fmt.bufPrint(
+                &hdr_buf,
+                "pub fn worker_{d}(input_val: i64) -> i64 {{\n",
+                .{worker_idx},
+            ),
         );
-        try builder.appendSlice(allocator, hdr_slice);
         try builder.appendSlice(allocator, INCREMENTAL_WORKER_VARIANTS[worker_choices[worker_idx]]);
         try builder.appendSlice(allocator, "}\n\n");
     }
@@ -348,7 +454,7 @@ test "test_fuzz_phase5_malformed_and_mutated_hir_mir_fault_tolerance" {
     var prng = std.Random.DefaultPrng.init(0xF005_C0DE_2026_0501);
     const random = prng.random();
 
-    var source_buf: [4096]u8 = undefined;
+    var source_buf: [8192]u8 = undefined;
     var verified_clean_modules: usize = 0;
 
     var iter_idx: usize = 0;
@@ -358,30 +464,28 @@ test "test_fuzz_phase5_malformed_and_mutated_hir_mir_fault_tolerance" {
         const is_clean_seed_round = (iter_idx % 5 == 0);
 
         if (is_clean_seed_round) {
-            // Emit foundation items `0..8` without duplicates plus a random dependency-closed subset of `8..12`:
-            for (PHASE5_SEED_ITEMS[0..8]) |base_item| {
+            // Emit foundation items `0..9` without duplicates plus a dependency-closed subset of `9..15`:
+            for (PHASE5_SEED_ITEMS[0..9]) |base_item| {
                 @memcpy(source_buf[byte_len .. byte_len + base_item.len], base_item);
                 byte_len += base_item.len;
             }
             if (random.boolean()) {
-                const pipe_item = PHASE5_SEED_ITEMS[8];
+                const pipe_item = PHASE5_SEED_ITEMS[9];
                 @memcpy(source_buf[byte_len .. byte_len + pipe_item.len], pipe_item);
                 byte_len += pipe_item.len;
                 if (random.boolean()) {
-                    const rec_item = PHASE5_SEED_ITEMS[9];
+                    const rec_item = PHASE5_SEED_ITEMS[10];
                     @memcpy(source_buf[byte_len .. byte_len + rec_item.len], rec_item);
                     byte_len += rec_item.len;
                 }
             }
-            if (random.boolean()) {
-                const soa_item = PHASE5_SEED_ITEMS[10];
-                @memcpy(source_buf[byte_len .. byte_len + soa_item.len], soa_item);
-                byte_len += soa_item.len;
-            }
-            if (random.boolean()) {
-                const sub_item = PHASE5_SEED_ITEMS[11];
-                @memcpy(source_buf[byte_len .. byte_len + sub_item.len], sub_item);
-                byte_len += sub_item.len;
+            var extra_idx: usize = 11;
+            while (extra_idx < PHASE5_SEED_ITEMS.len) : (extra_idx += 1) {
+                if (random.boolean()) {
+                    const extra_item = PHASE5_SEED_ITEMS[extra_idx];
+                    @memcpy(source_buf[byte_len .. byte_len + extra_item.len], extra_item);
+                    byte_len += extra_item.len;
+                }
             }
         } else {
             var item_idx: usize = 0;
@@ -401,26 +505,24 @@ test "test_fuzz_phase5_malformed_and_mutated_hir_mir_fault_tolerance" {
         // Apply single-byte perturbation on 30% of non-clean rounds:
         if (!is_clean_seed_round and iter_idx % 3 == 0 and byte_len > 0) {
             const mut_pos = random.uintLessThan(usize, byte_len);
-            source_buf[mut_pos] = switch (random.uintLessThan(u8, 7)) {
+            source_buf[mut_pos] = switch (random.uintLessThan(u8, 9)) {
                 0 => ';',
                 1 => ' ',
                 2 => '?',
                 3 => '|',
                 4 => '}',
                 5 => '_',
+                6 => '$',
+                7 => ':',
                 else => source_buf[mut_pos],
             };
         }
 
-        const source_slice = source_buf[0..byte_len];
-        const file_id = FileId.fromInt(@intCast((iter_idx & 0xFF) + 1));
-        const layout = if ((iter_idx & 1) == 0) TargetLayout.NATIVE_64 else TargetLayout.WASM32;
-
         var bundle = mir.lowerSourceToMir(
             std.testing.allocator,
-            file_id,
-            source_slice,
-            layout,
+            FileId.fromInt(@intCast((iter_idx & 0xFF) + 1)),
+            source_buf[0..byte_len],
+            if ((iter_idx & 1) == 0) TargetLayout.NATIVE_64 else TargetLayout.WASM32,
             .{},
         ) catch |err| {
             if (isExpectedMutationVerifierError(err)) continue;
@@ -448,7 +550,6 @@ test "test_fuzz_phase5_malformed_and_mutated_hir_mir_fault_tolerance" {
 test "test_fuzz_phase5_differential_dev_vs_release_mir_vm_parity" {
     var prng = std.Random.DefaultPrng.init(0xD1FF_0505_2026_BEEF);
     const random = prng.random();
-    const layouts = [_]TargetLayout{ TargetLayout.NATIVE_64, TargetLayout.WASM32 };
 
     var prog_idx: usize = 0;
     while (prog_idx < DIFFERENTIAL_DEV_RELEASE_ITERATIONS) : (prog_idx += 1) {
@@ -462,7 +563,7 @@ test "test_fuzz_phase5_differential_dev_vs_release_mir_vm_parity" {
         const seed_arg = random.intRangeAtMost(i64, -50, 120);
         const file_id = FileId.fromInt(@intCast((prog_idx & 0xFF) + 1));
 
-        for (layouts) |target_layout| {
+        for ([_]TargetLayout{ TargetLayout.NATIVE_64, TargetLayout.WASM32 }) |target_layout| {
             var bundle = try mir.lowerSourceToMir(
                 std.testing.allocator,
                 file_id,
@@ -574,7 +675,7 @@ test "test_fuzz_phase5_incremental_compiler_db_stages_10_to_13_parity" {
     const file_id = FileId.fromInt(1);
     var has_banner_comment = false;
     var const_choice: usize = 0;
-    var worker_choices = [3]usize{ 0, 1, 2 };
+    var worker_choices = [3]usize{ 0, 2, 3 };
     var durability: Durability = .low;
 
     var step_idx: usize = 0;
@@ -582,10 +683,8 @@ test "test_fuzz_phase5_incremental_compiler_db_stages_10_to_13_parity" {
         switch (random.uintLessThan(u8, 5)) {
             0 => has_banner_comment = !has_banner_comment,
             1 => const_choice = random.uintLessThan(usize, INCREMENTAL_CONST_VARIANTS.len),
-            2 => {
-                const slot = random.uintLessThan(usize, 3);
-                worker_choices[slot] = random.uintLessThan(usize, INCREMENTAL_WORKER_VARIANTS.len);
-            },
+            2 => worker_choices[random.uintLessThan(usize, 3)] =
+                random.uintLessThan(usize, INCREMENTAL_WORKER_VARIANTS.len),
             3 => durability = switch (random.uintLessThan(u8, 3)) {
                 0 => .low,
                 1 => .medium,
@@ -618,28 +717,32 @@ test "test_fuzz_phase5_incremental_compiler_db_stages_10_to_13_parity" {
         );
         try std.testing.expectEqual(inc_eval.value.int_val, scr_eval.value.int_val);
 
-        // [2] Stage 10 `lowerDefHir` & Stage 11 `buildDefMir` parity across all 6 module definitions:
-        var item_ord: u12 = 0;
-        while (item_ord < 6) : (item_ord += 1) {
-            const def_id = DefId.init(file_id, item_ord);
-
-            const inc_hir = try inc_db.lowerDefHir(def_id);
-            const scr_hir = try scratch_db.lowerDefHir(def_id);
-            const inc_hir_hdr = try inc_db.fetchQuery(QueryKey.forDef(.lower_def_hir, def_id));
-            const scr_hir_hdr = try scratch_db.fetchQuery(QueryKey.forDef(.lower_def_hir, def_id));
-            try std.testing.expectEqual(inc_hir.countNodes(), scr_hir.countNodes());
+        // [2] Stage 10 `lowerDefHir` & Stage 11 `buildDefMir` parity across all 7 module definitions:
+        const inc_tree = try inc_db.extractItemTree(file_id);
+        try std.testing.expectEqual(
+            inc_tree.entries.len,
+            (try scratch_db.extractItemTree(file_id)).entries.len,
+        );
+        for (inc_tree.entries) |entry| {
+            try std.testing.expectEqual(
+                (try inc_db.lowerDefHir(entry.def_id)).countNodes(),
+                (try scratch_db.lowerDefHir(entry.def_id)).countNodes(),
+            );
             try std.testing.expect(
-                Fingerprint128.eql(inc_hir_hdr.output_fingerprint, scr_hir_hdr.output_fingerprint),
+                Fingerprint128.eql(
+                    (try inc_db.fetchQuery(QueryKey.forDef(.lower_def_hir, entry.def_id))).output_fingerprint,
+                    (try scratch_db.fetchQuery(QueryKey.forDef(.lower_def_hir, entry.def_id))).output_fingerprint,
+                ),
+            );
+            try std.testing.expect(
+                Fingerprint128.eql(
+                    (try inc_db.buildDefMirArtifact(entry.def_id)).mir_fingerprint,
+                    (try scratch_db.buildDefMirArtifact(entry.def_id)).mir_fingerprint,
+                ),
             );
 
-            const inc_mir_art = try inc_db.buildDefMirArtifact(def_id);
-            const scr_mir_art = try scratch_db.buildDefMirArtifact(def_id);
-            try std.testing.expect(
-                Fingerprint128.eql(inc_mir_art.mir_fingerprint, scr_mir_art.mir_fingerprint),
-            );
-
-            const inc_primary = try inc_db.buildDefMir(def_id);
-            const scr_primary = try scratch_db.buildDefMir(def_id);
+            const inc_primary = try inc_db.buildDefMir(entry.def_id);
+            const scr_primary = try scratch_db.buildDefMir(entry.def_id);
             try std.testing.expectEqual(inc_primary != null, scr_primary != null);
             if (inc_primary) |inc_body| {
                 try std.testing.expectEqual(
@@ -650,10 +753,9 @@ test "test_fuzz_phase5_incremental_compiler_db_stages_10_to_13_parity" {
         }
 
         // [3] Stage 13 `optimizeMirModule` parity across both `--dev` and `--release`:
-        const modes = [_]bool{ false, true };
-        for (modes) |is_release| {
-            const inc_opt = try inc_db.optimizeMirModule(file_id, is_release);
-            const scr_opt = try scratch_db.optimizeMirModule(file_id, is_release);
+        for ([_]bool{ false, true }) |is_release_mode| {
+            const inc_opt = try inc_db.optimizeMirModule(file_id, is_release_mode);
+            const scr_opt = try scratch_db.optimizeMirModule(file_id, is_release_mode);
             try std.testing.expectEqual(inc_opt.fingerprint, scr_opt.fingerprint);
             try std.testing.expectEqual(inc_opt.bodies.items.len, scr_opt.bodies.items.len);
             try std.testing.expectEqual(inc_opt.dedup_merged_count, scr_opt.dedup_merged_count);

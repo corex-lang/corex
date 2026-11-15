@@ -228,14 +228,14 @@ test "test_snapshot_diag_cross_file_type_mismatch" {
     defer source_map.deinit(std.testing.io);
 
     const main_src =
-        "use net::http::connect;\n" ++
+        "use net.http.connect;\n" ++
         "fn start() {\n" ++
         "    connect(\"8080\");\n" ++
         "}\n";
     const call_arg_span = Span.init(
         try source_map.setOverlay("src\\app\\main.cx", main_src, .root),
-        49,
-        55,
+        47,
+        53,
     );
     const param_decl_span = Span.init(
         try source_map.setOverlay("src\\net\\http.cx", "pub fn connect(port: u16) {\n}\n", .root),
@@ -559,8 +559,8 @@ test "test_snapshot_diag_parser_errors_e0201_to_e0203" {
 
 test "test_snapshot_fmt_showcases" {
     const sample_source =
-        "use std::io::{Write, self, Read, BufReader as Br};\n" ++
-        "use core::mem;\n" ++
+        "use cx.io.{Write, self, Read, BufReader as Br};\n" ++
+        "use cx.mem;\n" ++
         "const MIN_PORT: u16 = 80;\n" ++
         "const MAX_PORT: u16 = 65535;\n" ++
         "pub struct Metric[T] {\n" ++

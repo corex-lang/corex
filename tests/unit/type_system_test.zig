@@ -312,7 +312,7 @@ test "test_type_system_range_refinements_e0406_bit_field_soa_and_overflow_e0502"
         try std.testing.expect(!res.diagnostics.hasErrors());
     }
 
-    // [4] Integer literal bounds (`u128::MAX` and `i128::MIN` succeed; `256` into `u8` emits `E0502`):
+    // [4] Integer literal bounds (`u128.MAX` and `i128.MIN` succeed; `256` into `u8` emits `E0502`):
     {
         const bounds_ok_src =
             "pub const MAX_U128: u128 = 340282366920938463463374607431768211455;\n" ++
@@ -584,4 +584,476 @@ test "test_type_system_maranget_exhaustiveness_e0415_w0401_and_incremental_query
         try std.testing.expect(std.mem.indexOf(u8, err_res.diagnostics.diagnostics.items[0].message, ".Alpha") != null);
         try std.testing.expect(std.mem.indexOf(u8, err_res.diagnostics.diagnostics.items[0].message, ".Self") == null);
     }
+
+    // [5] `DR-21` positive typing (`orelse`, `:=`, `$`, `= expr;`, named/default args) & negative `E0214`/`E0416`/`E0418`/`E0419`:
+    {
+        const dr21_ok_src =
+            "pub fn add_scaled(base: i32, scale: i32 = 2, bias: i32 = 1) -> i32 = base * scale + bias;\n" ++
+            "pub fn check_dr21(opt: i32?, slice: &[i32]) -> i32 {\n" ++
+            "    let fallback = opt orelse 10;\n" ++
+            "    if (len_val := slice.len()) >= 2 {\n" ++
+            "        let last_elem = slice[$-1];\n" ++
+            "        return add_scaled(fallback + last_elem, bias: len_val as i32);\n" ++
+            "    }\n" ++
+            "    return fallback;\n" ++
+            "}\n";
+        var ok_res = try runFullTypecheck(std.testing.allocator, dr21_ok_src);
+        defer ok_res.deinit();
+        try std.testing.expect(!ok_res.diagnostics.hasErrors());
+
+        const e0214_src =
+            "pub fn bad_cond_bind(opt: i32?) -> i32 {\n" ++
+            "    if opt is .Some(val) or true { return 1; }\n" ++
+            "    return 0;\n" ++
+            "}\n";
+        var e0214_res = try runFullTypecheck(std.testing.allocator, e0214_src);
+        defer e0214_res.deinit();
+        try std.testing.expect(hasDiag(&e0214_res.diagnostics, .e0214_invalid_condition_binding));
+
+        const e0416_src =
+            "pub fn bad_dollar() -> usize {\n" ++
+            "    return $;\n" ++
+            "}\n";
+        var e0416_res = try runFullTypecheck(std.testing.allocator, e0416_src);
+        defer e0416_res.deinit();
+        try std.testing.expect(hasDiag(&e0416_res.diagnostics, .e0416_invalid_dollar_length_expr));
+
+        const e0418_src =
+            "pub fn bad_irrefutable_is(val: i32) -> i32 {\n" ++
+            "    if val is bound { return bound; }\n" ++
+            "    return 0;\n" ++
+            "}\n";
+        var e0418_res = try runFullTypecheck(std.testing.allocator, e0418_src);
+        defer e0418_res.deinit();
+        try std.testing.expect(hasDiag(&e0418_res.diagnostics, .e0418_irrefutable_is_binding));
+
+        const e0419_src =
+            "pub fn pair_sum(left: i32, right: i32) -> i32 = left + right;\n" ++
+            "pub fn bad_call() -> i32 {\n" ++
+            "    return pair_sum(left: 1, 2);\n" ++
+            "}\n";
+        var e0419_res = try runFullTypecheck(std.testing.allocator, e0419_src);
+        defer e0419_res.deinit();
+        try std.testing.expect(hasDiag(&e0419_res.diagnostics, .e0419_invalid_call_arguments));
+    }
+}
+
+// -------- Phase 7.5 (DR-21) Red-Team Sema Regressions ---------
+
+test "test_type_system_walrus_dominance_rejects_negated_equality_call_args_and_nested_rhs" {
+    const cases = [_][]const u8{
+        "pub fn leak_eq_false(cond: bool) -> i32 {\n" ++
+            "    if (cond and (leaked := 0x7777) > 0) == false { return leaked; }\n" ++
+            "    return 0;\n" ++
+            "}\n",
+        "pub fn ignore_flag(_flag: bool) -> bool = true;\n" ++
+            "pub fn leak_call_arg(cond: bool) -> i32 {\n" ++
+            "    if ignore_flag(cond and (leaked := 42) > 0) { return leaked; }\n" ++
+            "    return 0;\n" ++
+            "}\n",
+        "pub fn leak_walrus_rhs() -> i32 {\n" ++
+            "    if (outer := ((inner := 1) + 2)) > 0 { return outer + inner; }\n" ++
+            "    return 0;\n" ++
+            "}\n",
+        "pub fn leak_orelse(opt_flag: bool?) -> i32 {\n" ++
+            "    if (opt_flag orelse ((leaked := 7) > 0)) { return leaked; }\n" ++
+            "    return 0;\n" ++
+            "}\n",
+    };
+
+    for (cases) |bad_src| {
+        var res = try runFullTypecheck(std.testing.allocator, bad_src);
+        defer res.deinit();
+        try std.testing.expect(hasDiag(&res.diagnostics, .e0215_invalid_walrus_position));
+    }
+}
+
+test "test_type_system_default_param_rejects_non_copy_earlier_param_e0304" {
+    const bad_linear_default_src =
+        "@linear\n" ++
+        "pub struct LinearTok {\n" ++
+        "    pub handle: i32,\n" ++
+        "}\n" ++
+        "pub fn consume_pair(tok: LinearTok, dup_tok: LinearTok = tok) -> i32 {\n" ++
+        "    let LinearTok { handle: h1 } = tok;\n" ++
+        "    let LinearTok { handle: h2 } = dup_tok;\n" ++
+        "    return h1 + h2;\n" ++
+        "}\n";
+    var bad_res = try runFullTypecheck(std.testing.allocator, bad_linear_default_src);
+    defer bad_res.deinit();
+    try std.testing.expect(hasDiag(&bad_res.diagnostics, .e0304_resource_or_memory_leak));
+
+    const ok_copy_default_src =
+        "pub fn add_adjacent(base: i32, next: i32 = base + 1) -> i32 = base + next;\n";
+    var ok_res = try runFullTypecheck(std.testing.allocator, ok_copy_default_src);
+    defer ok_res.deinit();
+    try std.testing.expect(!ok_res.diagnostics.hasErrors());
+}
+
+test "test_type_system_retired_option_unwrap_suggested_fix_span_past_offset_50" {
+    const unwrap_or_src =
+        "// Padding comment so method call starts well past byte offset fifty!\n" ++
+        "pub fn migrate_unwrap_or(opt_val: i32?) -> i32 {\n" ++
+        "    return opt_val.unwrap_or(99);\n" ++
+        "}\n";
+    var res_or = try runFullTypecheck(std.testing.allocator, unwrap_or_src);
+    defer res_or.deinit();
+    try std.testing.expectEqual(@as(u32, 1), res_or.diagnostics.error_count);
+    const diag_or = res_or.diagnostics.diagnostics.items[0];
+    try std.testing.expectEqual(@as(usize, 1), diag_or.suggestions.len);
+    try std.testing.expectEqual(@as(usize, 1), diag_or.suggestions[0].edits.len);
+    const edit_or = diag_or.suggestions[0].edits[0];
+    try std.testing.expect(edit_or.start_byte > 50);
+    try std.testing.expect(edit_or.start_byte < edit_or.end_byte);
+    try std.testing.expectEqualStrings(
+        "opt_val.unwrap_or(99)",
+        unwrap_or_src[edit_or.start_byte..edit_or.end_byte],
+    );
+    try std.testing.expectEqualStrings(
+        "opt_val orelse 99",
+        res_or.interner.get(edit_or.replacement_id),
+    );
+
+    const unwrap_src =
+        "// Padding comment so method call starts well past byte offset fifty!\n" ++
+        "pub fn migrate_unwrap(opt_val: i32?) -> i32 {\n" ++
+        "    return opt_val.unwrap();\n" ++
+        "}\n";
+    var res_unw = try runFullTypecheck(std.testing.allocator, unwrap_src);
+    defer res_unw.deinit();
+    try std.testing.expectEqual(@as(u32, 1), res_unw.diagnostics.error_count);
+    const diag_unw = res_unw.diagnostics.diagnostics.items[0];
+    try std.testing.expectEqual(@as(usize, 1), diag_unw.suggestions.len);
+    const edit_unw = diag_unw.suggestions[0].edits[0];
+    try std.testing.expect(edit_unw.start_byte > 50);
+    try std.testing.expect(edit_unw.start_byte < edit_unw.end_byte);
+    try std.testing.expectEqualStrings(
+        "opt_val.unwrap()",
+        unwrap_src[edit_unw.start_byte..edit_unw.end_byte],
+    );
+    try std.testing.expectEqualStrings(
+        "opt_val orelse unreachable",
+        res_unw.interner.get(edit_unw.replacement_id),
+    );
+}
+
+test "test_type_system_inline_core_dot_access_emits_e0218_without_cascading_e0403" {
+    var db = try CompilerDb.init(std.testing.allocator);
+    defer db.deinit();
+
+    const core_fid = FileId.fromInt(20);
+    const user_fid = FileId.fromInt(21);
+    const core_stub_src =
+        "pub mod mem {\n" ++
+        "    pub fn size_of_type[T]() -> usize = 8;\n" ++
+        "}\n";
+    _ = try db.setInput(core_fid, core_stub_src, .high);
+    try db.registerRootModule("core", core_fid);
+    try db.registerRootModule("cx", core_fid);
+
+    // [1] Inline `core.mem.size_of_type[u64]()` emits `E0218` with zero cascading `E0403`:
+    _ = try db.setInput(user_fid, "pub fn entry() -> usize = core.mem.size_of_type[u64]();\n", .low);
+    const body_art = try db.typecheckBody(DefId.init(user_fid, 0));
+    try std.testing.expect(body_art.error_count >= 1);
+    const body_sink = db.getBodyDiagnostics(DefId.init(user_fid, 0)).?;
+    try std.testing.expect(hasDiag(body_sink, .e0218_direct_core_import_forbidden));
+    try std.testing.expect(!hasDiag(body_sink, .e0403_unresolved_symbol));
+
+    // [2] Non-root `dummy.core.mem.*` does not fall back to `named_module_scopes`:
+    const dummy_inline_src =
+        "mod dummy {}\n" ++
+        "pub fn entry() -> usize = dummy.core.mem.size_of_type[u64]();\n";
+    _ = try db.setInput(user_fid, dummy_inline_src, .low);
+    _ = try db.typecheckBody(DefId.init(user_fid, 1));
+    const dummy_sink = db.getBodyDiagnostics(DefId.init(user_fid, 1)).?;
+    try std.testing.expect(hasDiag(dummy_sink, .e0403_unresolved_symbol));
+}
+
+test "test_type_system_const_patterns_irrefutable_is_e0418_and_linear_tuple_guard" {
+    // [1] Bare `SCREAMING_SNAKE_CASE` constants in `is` and `match` match constant values instead of shadowing:
+    const const_match_ok_src =
+        "pub const MAX_RETRIES: i32 = 3;\n" ++
+        "pub fn classify_attempt(attempt: i32) -> i32 {\n" ++
+        "    if attempt is MAX_RETRIES {\n" ++
+        "        return 100;\n" ++
+        "    }\n" ++
+        "    return match attempt {\n" ++
+        "        MAX_RETRIES => 10,\n" ++
+        "        _ => 0,\n" ++
+        "    };\n" ++
+        "}\n";
+    var const_ok_res = try runFullTypecheck(std.testing.allocator, const_match_ok_src);
+    defer const_ok_res.deinit();
+    try std.testing.expect(!const_ok_res.diagnostics.hasErrors());
+
+    const non_exhaustive_const_src =
+        "pub const ONLY_TRUE: bool = true;\n" ++
+        "pub fn bad_const_match(flag: bool) -> i32 {\n" ++
+        "    return match flag {\n" ++
+        "        ONLY_TRUE => 1,\n" ++
+        "    };\n" ++
+        "}\n";
+    var non_ex_res = try runFullTypecheck(std.testing.allocator, non_exhaustive_const_src);
+    defer non_ex_res.deinit();
+    try std.testing.expect(hasDiag(&non_ex_res.diagnostics, .e0415_non_exhaustive_match));
+
+    // [2] Irrefutable composite patterns in `is` (`(a, b)`, `Point { x, y }`, `.Some(_) | _`) emit `E0418`:
+    const irrefutable_cases = [_][]const u8{
+        "pub fn bad_tuple_is(pair: (i32, i32)) -> i32 {\n" ++
+            "    if pair is (left, right) { return left + right; }\n" ++
+            "    return 0;\n" ++
+            "}\n",
+        "pub struct Point { pub x: i32, pub y: i32 }\n" ++
+            "pub fn bad_struct_is(pt: Point) -> i32 {\n" ++
+            "    if pt is (Point { x, y }) { return x + y; }\n" ++
+            "    return 0;\n" ++
+            "}\n",
+        "pub fn bad_or_wildcard_is(opt: i32?) -> i32 {\n" ++
+            "    if opt is (.Some(_) | _) { return 1; }\n" ++
+            "    return 0;\n" ++
+            "}\n",
+    };
+    for (irrefutable_cases) |irref_src| {
+        var irref_res = try runFullTypecheck(std.testing.allocator, irref_src);
+        defer irref_res.deinit();
+        try std.testing.expect(hasDiag(&irref_res.diagnostics, .e0418_irrefutable_is_binding));
+    }
+
+    // [3] Borrowing linear leaf with `ref` while binding `Copy` leaf by value before `and` succeeds (`0` errors):
+    const linear_ref_guard_ok_src =
+        "@linear\n" ++
+        "pub struct Handle { pub fd: i32 }\n" ++
+        "pub enum Slot { Active(Handle), Empty }\n" ++
+        "pub fn check_slot(pair_lin: (Slot, i32)) -> i32 {\n" ++
+        "    var res: i32 = 0;\n" ++
+        "    if pair_lin is (.Active(ref _h), copy_val) and copy_val > 0 {\n" ++
+        "        res = copy_val;\n" ++
+        "    }\n" ++
+        "    let (slot_val, _) = pair_lin;\n" ++
+        "    match slot_val {\n" ++
+        "        .Active(owned_h) => {\n" ++
+        "            let Handle { fd } = owned_h;\n" ++
+        "            return res + fd;\n" ++
+        "        },\n" ++
+        "        .Empty => return res,\n" ++
+        "    }\n" ++
+        "}\n";
+    var lin_ok_res = try runFullTypecheck(std.testing.allocator, linear_ref_guard_ok_src);
+    defer lin_ok_res.deinit();
+    try std.testing.expect(!lin_ok_res.diagnostics.hasErrors());
+
+    // Moving the linear leaf by value before `and` still emits `E0304`:
+    const linear_move_guard_bad_src =
+        "@linear\n" ++
+        "pub struct Handle { pub fd: i32 }\n" ++
+        "pub enum Slot { Active(Handle), Empty }\n" ++
+        "pub fn bad_slot(pair_lin: (Slot, i32)) -> i32 {\n" ++
+        "    if pair_lin is (.Active(moved_h), copy_val) and copy_val > 0 {\n" ++
+        "        let Handle { fd } = moved_h;\n" ++
+        "        return fd + copy_val;\n" ++
+        "    }\n" ++
+        "    return 0;\n" ++
+        "}\n";
+    var lin_bad_res = try runFullTypecheck(std.testing.allocator, linear_move_guard_bad_src);
+    defer lin_bad_res.deinit();
+    try std.testing.expect(hasDiag(&lin_bad_res.diagnostics, .e0304_resource_or_memory_leak));
+}
+
+test "test_type_system_overload_named_defaults_generic_default_subst_and_tuple_variant_e0419" {
+    // [1] `@overload` disambiguation supports named and omitted default arguments + records `call_arg_mappings`:
+    var db = try CompilerDb.init(std.testing.allocator);
+    defer db.deinit();
+    const file_id = FileId.fromInt(30);
+    const overload_src =
+        "@overload\n" ++
+        "pub fn format_metric(val: i32, scale: i32 = 10) -> i32 = val * scale;\n" ++
+        "@overload\n" ++
+        "pub fn format_metric(tag: str, bonus: i32 = 5) -> i32 {\n" ++
+        "    let _ = tag;\n" ++
+        "    return bonus;\n" ++
+        "}\n" ++
+        "pub fn caller() -> i32 {\n" ++
+        "    return format_metric(scale: 3, val: 4) + format_metric(tag: \"ok\");\n" ++
+        "}\n";
+    _ = try db.setInput(file_id, overload_src, .low);
+    const caller_def = DefId.init(file_id, 2);
+    const caller_art = try db.typecheckBody(caller_def);
+    try std.testing.expectEqual(@as(u32, 0), caller_art.error_count);
+    const caller_st = db.def_side_tables.getPtr(caller_def.asInt()).?;
+    try std.testing.expectEqual(@as(u32, 2), caller_st.call_arg_mappings.count());
+
+    // [2] Generic function with omitted default validates `subst(param_ty)` against default initializer type:
+    const bad_generic_default_src =
+        "pub fn with_zero[T](seed: T = 0) -> T = seed;\n" ++
+        "pub fn bad_bool_caller() -> bool = with_zero[bool]();\n";
+    var bad_gen_res = try runFullTypecheck(std.testing.allocator, bad_generic_default_src);
+    defer bad_gen_res.deinit();
+    try std.testing.expect(hasDiag(&bad_gen_res.diagnostics, .e0401_type_mismatch));
+
+    const ok_generic_default_src =
+        "pub fn with_zero[T](seed: T = 0) -> T = seed;\n" ++
+        "pub fn ok_int_caller() -> i64 = with_zero[i64]();\n";
+    var ok_gen_res = try runFullTypecheck(std.testing.allocator, ok_generic_default_src);
+    defer ok_gen_res.deinit();
+    try std.testing.expect(!ok_gen_res.diagnostics.hasErrors());
+
+    // [3] Tuple-variant constructors reject bogus `.named_arg` labels with `E0419`:
+    const tuple_variant_cases = [_][]const u8{
+        "pub fn bad_ctx_some() -> i32? = .Some(fake: 5);\n",
+        "pub fn bad_qual_some() -> i32? = Option[i32].Some(fake: 5);\n",
+        "pub enum Boxed { Item(i32) }\n" ++
+            "pub fn bad_enum_ctor() -> Boxed = Boxed.Item(fake: 5);\n",
+    };
+    for (tuple_variant_cases) |bad_ctor_src| {
+        var ctor_res = try runFullTypecheck(std.testing.allocator, bad_ctor_src);
+        defer ctor_res.deinit();
+        try std.testing.expect(hasDiag(&ctor_res.diagnostics, .e0419_invalid_call_arguments));
+    }
+}
+
+test "test_type_system_tuple_leading_zero_loop_labels_break_typing_and_context_layout" {
+    // [1] Tuple index with leading zero (`tup.00`) emits `E0403`:
+    var tup_res = try runFullTypecheck(
+        std.testing.allocator,
+        "pub fn bad_tup(tup: (i32, i32)) -> i32 = tup.00;\n",
+    );
+    defer tup_res.deinit();
+    try std.testing.expect(hasDiag(&tup_res.diagnostics, .e0403_unresolved_symbol));
+
+    // [2] Unknown `:label` (`E0403`) and value `break` targeting `comptime for` (`E0412`):
+    var unknown_lbl_res = try runFullTypecheck(
+        std.testing.allocator,
+        "pub fn unknown_lbl() {\n    while true { break :missing; }\n}\n",
+    );
+    defer unknown_lbl_res.deinit();
+    try std.testing.expect(hasDiag(&unknown_lbl_res.diagnostics, .e0403_unresolved_symbol));
+
+    var ct_val_break_res = try runFullTypecheck(
+        std.testing.allocator,
+        "pub fn comptime_val_break() -> i32? {\n" ++
+            "    return ct_loop: comptime for idx in 0..3 {\n" ++
+            "        if idx == 1 { break :ct_loop 42; }\n" ++
+            "    };\n" ++
+            "}\n",
+    );
+    defer ct_val_break_res.deinit();
+    try std.testing.expect(hasDiag(&ct_val_break_res.diagnostics, .e0412_let_else_not_diverging));
+
+    // [3] Diverging `break @panic(…)` keeps `for` type `()` (not `()?`), while mixing `break ();` & `break;` emits `E0401`:
+    const diverging_break_ok_src =
+        "pub fn check_nonneg(items: &[i32]) {\n" ++
+        "    let _unit_res: () = for item in items {\n" ++
+        "        if item < 0 { break @panic(\"negative\"); }\n" ++
+        "    };\n" ++
+        "}\n";
+    var div_ok_res = try runFullTypecheck(std.testing.allocator, diverging_break_ok_src);
+    defer div_ok_res.deinit();
+    try std.testing.expect(!div_ok_res.diagnostics.hasErrors());
+
+    const mixed_break_cases = [_][]const u8{
+        "pub fn mix_val_then_bare(items: &[i32]) {\n" ++
+            "    let _ = for item in items {\n" ++
+            "        if item > 0 { break (); }\n" ++
+            "        break;\n" ++
+            "    };\n" ++
+            "}\n",
+        "pub fn mix_bare_then_val(items: &[i32]) {\n" ++
+            "    let _ = for item in items {\n" ++
+            "        if item > 0 { break; }\n" ++
+            "        break ();\n" ++
+            "    };\n" ++
+            "}\n",
+    };
+    for (mixed_break_cases) |mix_src| {
+        var mix_res = try runFullTypecheck(std.testing.allocator, mix_src);
+        defer mix_res.deinit();
+        try std.testing.expect(hasDiag(&mix_res.diagnostics, .e0401_type_mismatch));
+    }
+
+    // [4] Reject unrelated `&Struct` on `with context.logger` and reject `context` inside `extern "C" fn`:
+    const bad_context_cases = [_][]const u8{
+        "pub struct Unrelated { pub code: i32 }\n" ++
+            "pub fn bad_logger_override(unrel: &Unrelated) -> i32 {\n" ++
+            "    return with context.logger = unrel { 1 };\n" ++
+            "}\n",
+        "extern \"C\" fn bad_extern_ctx() -> u64 {\n" ++
+            "    return context.rng_seed;\n" ++
+            "}\n",
+        "extern \"C\" fn bad_extern_with(raw_ptr: *mut u8) -> i32 {\n" ++
+            "    return with context.logger = raw_ptr { 0 };\n" ++
+            "}\n",
+    };
+    for (bad_context_cases) |ctx_err_src| {
+        var ctx_err_res = try runFullTypecheck(std.testing.allocator, ctx_err_src);
+        defer ctx_err_res.deinit();
+        try std.testing.expect(hasDiag(&ctx_err_res.diagnostics, .e0401_type_mismatch));
+    }
+
+    // [5] Populated `Context` layout matches 8-field struct layout (`80B` on 64-bit, `48B` on `wasm32`, align `8`):
+    var ctx_layout_res = try runFullTypecheck(
+        std.testing.allocator,
+        "pub fn capture_ctx() -> u64 { let snap = context; return snap.rng_seed; }\n",
+    );
+    defer ctx_layout_res.deinit();
+    try std.testing.expect(!ctx_layout_res.diagnostics.hasErrors());
+
+    var ctx_type_id: TypeId = .err_ty;
+    for (ctx_layout_res.symbol_table.symbols.items) |sym| {
+        if (sym.flags.is_builtin and std.mem.eql(u8, sym.name_text, "Context")) {
+            ctx_type_id = sym.type_id;
+            break;
+        }
+    }
+    try std.testing.expect(!ctx_type_id.isError());
+
+    const layout_64 = type_system.computeTypeLayoutWithPool(
+        &ctx_layout_res.type_pool,
+        &ctx_layout_res.symbol_table,
+        ctx_type_id,
+        type_system.TargetLayout.NATIVE_64,
+    );
+    try std.testing.expectEqual(@as(u64, 80), layout_64.byte_size);
+    try std.testing.expectEqual(@as(u32, 8), layout_64.align_bytes);
+
+    const layout_wasm32 = type_system.computeTypeLayoutWithPool(
+        &ctx_layout_res.type_pool,
+        &ctx_layout_res.symbol_table,
+        ctx_type_id,
+        type_system.TargetLayout.WASM32,
+    );
+    try std.testing.expectEqual(@as(u64, 48), layout_wasm32.byte_size);
+    try std.testing.expectEqual(@as(u32, 8), layout_wasm32.align_bytes);
+}
+
+test "test_type_system_float_pi_and_tau_associated_constants_and_retired_std" {
+    // [1] `f32.PI`, `f32.TAU`, `f64.PI`, and `f64.TAU` synthesize exact `f32` and `f64` types (`0` errors):
+    const float_const_src =
+        "pub fn circle_f32(radius: f32) -> f32 = (f32.PI * radius * radius) + (f32.TAU * radius);\n" ++
+        "pub fn circle_f64(radius: f64) -> f64 = (f64.PI * radius * radius) + (f64.TAU * radius);\n";
+    var float_ok_res = try runFullTypecheck(std.testing.allocator, float_const_src);
+    defer float_ok_res.deinit();
+    try std.testing.expect(!float_ok_res.diagnostics.hasErrors());
+
+    // [2] Integer primitives reject float-only `PI` and `TAU` associated constants with `E0403`:
+    var bad_int_pi = try runFullTypecheck(
+        std.testing.allocator,
+        "pub fn bad_pi() -> i32 = i32.PI;\n",
+    );
+    defer bad_int_pi.deinit();
+    try std.testing.expect(hasDiag(&bad_int_pi.diagnostics, .e0403_unresolved_symbol));
+
+    // [3] Inline `std.meta` root access is rejected (`E0403`), whereas `cx.atomic.Ordering` resolves in $O(1)$:
+    var bad_std_inline = try runFullTypecheck(
+        std.testing.allocator,
+        "pub fn bad_std(_info: std.meta.TypeInfo) -> i32 = 0;\n",
+    );
+    defer bad_std_inline.deinit();
+    try std.testing.expect(hasDiag(&bad_std_inline.diagnostics, .e0403_unresolved_symbol));
+
+    var ok_cx_atomic = try runFullTypecheck(
+        std.testing.allocator,
+        "pub fn ok_atomic() -> cx.atomic.Ordering = cx.atomic.Ordering.SeqCst;\n",
+    );
+    defer ok_cx_atomic.deinit();
+    try std.testing.expect(!ok_cx_atomic.diagnostics.hasErrors());
 }

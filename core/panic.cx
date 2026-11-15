@@ -1,10 +1,12 @@
-//! Hardware Traps, Unrecoverable Panics, and Invariant Assertions (`core::panic`)
+//! Hardware Traps, Unrecoverable Panics, and Invariant Assertions (`core.panic`)
 //!
 //! Exposes cold, non-returning (`never`) failure entrypoints (`trap` and `panic`) together with
 //! `assert_true` for runtime and compile-time invariant enforcement (`DR-07`).
 //!
 //! Under `COREX_ORACLE_TRACE_FILE` and `MirVm` oracle execution, both `trap` and `panic` record
 //! deterministic trap markers (`exit_code = 101`) with identical `stderr` output across all tiers.
+// ------------------------------------- PUBLIC API --------------------------------------
+/// Triggers an immediate hardware trap (`@trap()`) without writing diagnostic text.
 @cold
 @noinline
 @no_alloc

@@ -6,7 +6,7 @@
 //!   (`is_changed == false`, zero parse errors).
 //! - Full multi-file `core` hierarchy resolves, typechecks, lowers to `HIR`/`MIR`, and passes
 //!   4-pass `mir_sast` with zero errors and zero warnings.
-//! - `@cache_aligned` `core::mem::CachePadded[u64]` resolves to `64B` alignment on `x86_64` and
+//! - `@cache_aligned` `core.mem.CachePadded[u64]` (`cx.mem.CachePadded[u64]`) resolves to `64B` alignment on `x86_64` and
 //!   `128B` alignment on `aarch64-macos` (`D-10A`), cross-compiles to `.o` across `x86_64-linux`,
 //!   `aarch64-macos`, and `wasm32-wasi` in both Tier A and Tier B, and passes the 4-tier
 //!   `diff_oracle` (`MirVm --dev`, `MirVm --release`, Tier A C99, Tier B LLVM).
@@ -174,6 +174,7 @@ test "test_core_stdlib_all_12_files_canonical_format_headers_and_zero_diagnostic
 
     var db = try CompilerDb.init(allocator);
     defer db.deinit();
+    try db.setInternalCore(true);
     const core_fids = try loadCoreTreeIntoDb(allocator, io, &db, 0);
 
     for (core_fids, 0..) |fid, i| {
@@ -263,6 +264,7 @@ test "test_core_mem_cache_padded_target_dependent_64b_vs_128b_apple_silicon" {
         var db = try CompilerDb.init(allocator);
         defer db.deinit();
         db.setTargetSpec(case_item.spec);
+        try db.setInternalCore(true);
         const fid = FileId.fromInt(0);
         _ = try db.setInput(fid, probe_source, .low);
 
@@ -313,11 +315,11 @@ test "test_core_stdlib_cross_target_tier_a_and_tier_b_compilation" {
 
     const harness_src =
         "//! Cross-Target Stage-1 `core` Smoke Consumer\n" ++
-        "use core::primitives::clamp_i32;\n" ++
-        "use core::mem::{align_up_usize, size_of_type};\n" ++
-        "use core::atomic::{ORDER_SEQ_CST, atomic_u32_fetch_add, atomic_u32_new};\n" ++
-        "use core::simd::{add_v4i32, reduce_add_v4i32, splat_v4i32};\n" ++
-        "use core::runtime::poll_reload;\n" ++
+        "use cx.primitives.clamp_i32;\n" ++
+        "use cx.mem.{align_up_usize, size_of_type};\n" ++
+        "use cx.atomic.{ORDER_SEQ_CST, atomic_u32_fetch_add, atomic_u32_new};\n" ++
+        "use cx.simd.{add_v4i32, reduce_add_v4i32, splat_v4i32};\n" ++
+        "use cx.runtime.poll_reload;\n" ++
         "\n" ++
         "pub fn exercise_core_cross_target(raw_input: i32) -> i32 {\n" ++
         "    poll_reload();\n" ++
@@ -412,23 +414,23 @@ test "test_core_stdlib_four_tier_differential_oracle_end_to_end" {
 
     const app_source =
         "//! End-to-End 4-Tier Differential `core` Verification Program\n" ++
-        "use core::primitives::{abs_diff_u32, clamp_i32, max_i64, min_i32};\n" ++
-        "use core::mem::{\n" ++
+        "use cx.primitives.{abs_diff_u32, clamp_i32, max_i64, min_i32};\n" ++
+        "use cx.mem.{\n" ++
         "    align_of_type, align_up_usize, cache_padded_new,\n" ++
         "    is_power_of_two_usize, size_of_type, zeroed_value,\n" ++
         "};\n" ++
-        "use core::atomic::{\n" ++
+        "use cx.atomic.{\n" ++
         "    MemoryOrder, ORDER_SEQ_CST, atomic_bool_new, atomic_bool_swap,\n" ++
         "    atomic_u32_compare_exchange, atomic_u32_fetch_add,\n" ++
         "    atomic_u32_load, atomic_u32_new, fence, order_to_code,\n" ++
         "};\n" ++
-        "use core::simd::{\n" ++
+        "use cx.simd.{\n" ++
         "    add_v16u8, add_v4i32, mul_v4i32, reduce_add_v16u8,\n" ++
         "    reduce_add_v4i32, splat_v16u8, splat_v4i32,\n" ++
         "};\n" ++
-        "use core::panic::assert_true;\n" ++
-        "use core::runtime::{has_pending_reload, poll_reload, record_drop_trace};\n" ++
-        "use core::sys::{write_stderr, write_stdout};\n" ++
+        "use cx.panic.assert_true;\n" ++
+        "use cx.runtime.{has_pending_reload, poll_reload, record_drop_trace};\n" ++
+        "use cx.sys.{write_stderr, write_stdout};\n" ++
         "\n" ++
         "pub fn main() -> i32 {\n" ++
         "    poll_reload();\n" ++
@@ -506,9 +508,9 @@ test "test_regression_core_sys_externs_dedup_and_compile_to_object" {
     const io = std.testing.io;
 
     const posix_src =
-        "//! Regression probe for `core::sys::{linux,macos}` `@link_name(\"write\"/\"_exit\")` dedup\n" ++
-        "use core::sys::linux::{linux_posix_exit, linux_posix_write};\n" ++
-        "use core::sys::macos::{darwin_exit, darwin_write};\n\n" ++
+        "//! Regression probe for `core.sys.{linux,macos}` `@link_name(\"write\"/\"_exit\")` dedup\n" ++
+        "use core.sys.linux.{linux_posix_exit, linux_posix_write};\n" ++
+        "use core.sys.macos.{darwin_exit, darwin_write};\n\n" ++
         "pub fn exercise_posix_externs(flag: i32) -> isize {\n" ++
         "    if flag == -777 {\n" ++
         "        unsafe { linux_posix_exit(1); }\n" ++
@@ -522,8 +524,8 @@ test "test_regression_core_sys_externs_dedup_and_compile_to_object" {
         "}\n";
 
     const wasi_src =
-        "//! Regression probe for `core::sys::wasi` `wasi_snapshot_preview1` imports\n" ++
-        "use core::sys::wasi::{WasiCiovec, wasi_fd_write, wasi_proc_exit};\n\n" ++
+        "//! Regression probe for `core.sys.wasi` `wasi_snapshot_preview1` imports\n" ++
+        "use core.sys.wasi.{WasiCiovec, wasi_fd_write, wasi_proc_exit};\n\n" ++
         "pub fn exercise_wasi_externs(flag: i32) -> u16 {\n" ++
         "    if flag == -999 {\n" ++
         "        unsafe { wasi_proc_exit(1); }\n" ++
@@ -536,7 +538,7 @@ test "test_regression_core_sys_externs_dedup_and_compile_to_object" {
     const cases = [_]struct {
         /// Target architecture/OS triple under test.
         spec: TargetSpec,
-        /// Source program referencing `core::sys` `extern "C"` declarations.
+        /// Source program referencing `core.sys` `extern "C"` declarations.
         src: []const u8,
         /// Temporary object file stem in `.zig-cache/`.
         stem: []const u8,
@@ -550,6 +552,7 @@ test "test_regression_core_sys_externs_dedup_and_compile_to_object" {
         var db = try CompilerDb.init(allocator);
         defer db.deinit();
         db.setTargetSpec(tc.spec);
+        try db.setInternalCore(true);
         _ = try loadCoreTreeIntoDb(allocator, io, &db, 1);
         const app_fid = FileId.fromInt(0);
         _ = try db.setInput(app_fid, tc.src, .low);
@@ -584,4 +587,48 @@ test "test_regression_core_sys_externs_dedup_and_compile_to_object" {
         if (ll_sink.hasErrors()) dumpSinkOnFailure("core_sys_ll", &ll_sink);
         try std.testing.expect(!ll_sink.hasErrors());
     }
+}
+
+test "test_core_direct_import_without_internal_core_emits_e0218" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const forbidden_src =
+        "use core.mem.size_of_type;\n" ++
+        "pub fn bad_user_import() -> usize {\n" ++
+        "    return size_of_type[u32]();\n" ++
+        "}\n";
+
+    var db = try CompilerDb.init(allocator);
+    defer db.deinit();
+    _ = try loadCoreTreeIntoDb(allocator, io, &db, 1);
+
+    const app_fid = FileId.fromInt(0);
+    _ = try db.setInput(app_fid, forbidden_src, .low);
+
+    const sig_art = try db.resolveSignatures(app_fid);
+    var has_e0218 = false;
+    if (db.getSignatureDiagnostics(app_fid)) |sig_sink| {
+        for (sig_sink.diagnostics.items) |diag_item| {
+            if (diag_item.code == .e0218_direct_core_import_forbidden) has_e0218 = true;
+        }
+    }
+    if (!has_e0218) {
+        const items = (try db.extractItemTree(app_fid)).entries;
+        for (items) |entry| {
+            _ = try db.typecheckBody(entry.def_id);
+            if (db.getBodyDiagnostics(entry.def_id)) |body_sink| {
+                for (body_sink.diagnostics.items) |diag_item| {
+                    if (diag_item.code == .e0218_direct_core_import_forbidden) has_e0218 = true;
+                }
+            }
+        }
+    }
+    try std.testing.expect(sig_art.error_count > 0 or has_e0218);
+    try std.testing.expect(has_e0218);
+
+    // Enabling `--internal-core` (`db.setInternalCore(true)`) lifts `E0218` cleanly:
+    try db.setInternalCore(true);
+    const ok_sig = try db.resolveSignatures(app_fid);
+    try std.testing.expectEqual(@as(u32, 0), ok_sig.error_count);
 }

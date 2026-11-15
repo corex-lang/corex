@@ -203,6 +203,8 @@ const BodyEmitState = struct {
     cur_label: []u8,
     /// `true` once `%_cx_call_err = alloca swifterror ptr, align 8` is added to `entry_allocas`.
     has_swifterror_call_slot: bool = false,
+    /// `true` when the enclosing function signature defines an incoming `%_cx_ctx` parameter.
+    has_ctx_param: bool = false,
     /// Monotonic local temporary counter (`%_t_<k>`, `%_scratch_<k>`, `_ok_<k>`).
     next_tmp_id: u32 = 0,
     /// Per-local LLVM pointer operand string (`%_loc_<i>` or `%_arg_p<i>`, empty when ZST).
@@ -418,6 +420,10 @@ const LlvmModuleEmitter = struct {
     declared_externs: std.StringHashMapUnmanaged(void) = .empty,
     /// Owned symbol name strings backing `declared_externs`.
     owned_declared_externs: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Per-slot overflow byte sizes for `Context` slots exceeding `ptrBytes()` (`0` when inline).
+    ctx_wide_slot_sizes: [8]u64 = @splat(0),
+    /// Per-slot alignments for wide `Context` globals (`@_cx_ctx_wide_<slot>`).
+    ctx_wide_slot_aligns: [8]u32 = @splat(8),
 
     /// Initializes `LlvmModuleEmitter` for `cfg` and `input`.
     fn init(
@@ -1394,6 +1400,45 @@ fn indexModuleEntities(emitter: *LlvmModuleEmitter) !void {
                     if (!has_tn) {
                         try emitter.type_name_ids.append(emitter.allocator, refl_raw);
                     }
+                } else if (ikind == .ctx_get or ikind == .ctx_set) {
+                    const call_args = body_ptr.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs];
+                    const slot_val_ty = if (ikind == .ctx_get)
+                        inst.type_id
+                    else if (call_args.len >= 2)
+                        body_ptr.getInst(MirValueId.fromInt(call_args[1])).type_id
+                    else
+                        .unit_ty;
+                    const slot_lay = try emitter.resolver.resolveType(slot_val_ty);
+                    if (slot_lay.size_bytes > 8 and call_args.len >= 1) {
+                        const ord_inst = body_ptr.getInst(MirValueId.fromInt(call_args[0]));
+                        if (ord_inst.op == .const_scalar and ord_inst.operands.lhs < body_ptr.consts.items.len) {
+                            switch (body_ptr.consts.items[ord_inst.operands.lhs]) {
+                                .int_val => |iv| {
+                                    const ord_u: usize = @intCast(@as(u128, @bitCast(iv)) & 7);
+                                    emitter.ctx_wide_slot_sizes[ord_u] = @max(
+                                        emitter.ctx_wide_slot_sizes[ord_u],
+                                        slot_lay.size_bytes,
+                                    );
+                                    emitter.ctx_wide_slot_aligns[ord_u] = @max(
+                                        emitter.ctx_wide_slot_aligns[ord_u],
+                                        slot_lay.alignBytes(),
+                                    );
+                                },
+                                else => {},
+                            }
+                        } else {
+                            for (0..8) |ord_u| {
+                                emitter.ctx_wide_slot_sizes[ord_u] = @max(
+                                    emitter.ctx_wide_slot_sizes[ord_u],
+                                    slot_lay.size_bytes,
+                                );
+                                emitter.ctx_wide_slot_aligns[ord_u] = @max(
+                                    emitter.ctx_wide_slot_aligns[ord_u],
+                                    slot_lay.alignBytes(),
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1828,8 +1873,20 @@ fn emitRodataAndRuntimeHelpers(
 ) !void {
     const ptr_int = ptrIntType(emitter);
 
-    // [1] Default 32-byte `Context` storage passed to contextful functions from `main` / thunks:
-    try emitter.writeAll("@_cx_default_ctx = internal global [32 x i8] zeroinitializer, align 8\n");
+    // [1] Default 64-byte thread-local `Context` storage (`8 * 8B` slots, `align 8`):
+    const ctx_tls_kw = if (emitter.cfg.target.isWasm()) "internal global" else "internal thread_local global";
+    try emitter.print(
+        "@_cx_default_ctx = {s} [{d} x i8] zeroinitializer, align 8\n",
+        .{ ctx_tls_kw, type_system.ContextFieldLayout.BYTE_SIZE_64 },
+    );
+    for (emitter.ctx_wide_slot_sizes, 0..) |wide_sz, slot_i| {
+        if (wide_sz > 8) {
+            try emitter.print(
+                "@_cx_ctx_wide_{d} = {s} [{d} x i8] zeroinitializer, align {d}\n",
+                .{ slot_i, ctx_tls_kw, wide_sz, emitter.ctx_wide_slot_aligns[slot_i] },
+            );
+        }
+    }
 
     // [2] Interned string and byte literals (`@_cx_str_bytes_<id>`) & `@type_name` tables:
     for (emitter.str_sym_ids.items) |sym_raw| {
@@ -2454,7 +2511,7 @@ fn emitWriteSumDiscriminantToPtr(
     }
 }
 
-/// Finds a lowered `Drop::drop` `MirBody` index for `drop_ty` if one exists in `emitter.input.bodies`.
+/// Finds a lowered `Drop.drop` `MirBody` index for `drop_ty` if one exists in `emitter.input.bodies`.
 fn lookupDropBodyIndexForType(emitter: *const LlvmModuleEmitter, drop_ty: TypeId) ?u32 {
     const ty = emitter.input.pool.unwrapUnderlyingType(drop_ty);
     if (!ty.isPrimitiveOrSentinel()) {
@@ -2480,7 +2537,6 @@ fn lookupDropBodyIndexForType(emitter: *const LlvmModuleEmitter, drop_ty: TypeId
         if (cand_body.param_count != 1 or cand_body.locals.items.len < 2) continue;
         const fn_name = emitter.input.interner.get(cand_body.name);
         if (!std.mem.eql(u8, fn_name, "drop") and
-            !std.mem.endsWith(u8, fn_name, "::drop") and
             !std.mem.endsWith(u8, fn_name, ".drop")) continue;
         const raw_param_ty = emitter.input.pool.unwrapUnderlyingType(cand_body.locals.items[1].type_id);
         const param_node = emitter.input.pool.getNode(raw_param_ty);
@@ -3557,7 +3613,10 @@ fn resolvePlaceResultType(
             },
             .index => {
                 active_downcast = null;
-                cur_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+                cur_ty = if (cur_ty == .str_ty)
+                    .u8_ty
+                else
+                    emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
             },
             .soa_elem => {
                 active_downcast = null;
@@ -3806,12 +3865,15 @@ fn lowerPlaceLlvm(
             },
             .index => {
                 active_downcast = null;
-                const elem_ty = try unwrapTransparentType(emitter, TypeId.fromInt(node.lhs));
+                const elem_ty = if (cur_ty == .str_ty)
+                    TypeId.u8_ty
+                else
+                    try unwrapTransparentType(emitter, TypeId.fromInt(node.lhs));
                 const elem_lay = try emitter.resolver.resolveType(elem_ty);
                 const idx_ssa = try coerceIndexToPtrInt(emitter, state, body, proj.payload);
                 defer emitter.allocator.free(idx_ssa);
                 const t_id = state.nextTmp();
-                if (node.tag == .slice_ty) {
+                if (cur_ty == .str_ty or node.tag == .slice_ty) {
                     const hdr_align = @min(@max(cur_align, 1), emitter.cfg.target.ptrBytes());
                     try state.print(
                         "  %_sl_dp_{d} = load ptr, ptr {s}, align {d}\n" ++
@@ -8565,6 +8627,287 @@ fn emitIntrinsicOpLlvm(
             }
             try emitUnreachableAndDeadBlock(emitter, state, dst_raw);
         },
+
+        .subslice_make => {
+            if (args.len < 3) {
+                try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+                return;
+            }
+            const base_ty = try unwrapTransparentType(emitter, body.getInst(MirValueId.fromInt(args[0])).type_id);
+            const base_node = emitter.input.pool.getNode(base_ty);
+            const base_data_ptr: []u8 = if (base_ty == .str_ty or
+                base_node.tag == .slice_ty or
+                base_node.tag == .soa_slice_ty)
+            blk_fat: {
+                const bp_id = state.nextTmp();
+                try state.print(
+                    "  %_sm_bp_{d} = extractvalue {{ ptr, {s} }} %_v_{d}, 0\n",
+                    .{ bp_id, ptr_int, args[0] },
+                );
+                break :blk_fat try std.fmt.allocPrint(emitter.allocator, "%_sm_bp_{d}", .{bp_id});
+            } else if (base_node.tag == .ref_ty or
+                base_node.tag == .mut_ref_ty or
+                base_node.tag == .raw_ptr_ty)
+            blk_ref: {
+                const pt_ty = try unwrapTransparentType(emitter, TypeId.fromInt(base_node.lhs));
+                const pt_tag = emitter.input.pool.getNode(pt_ty).tag;
+                if (pt_ty == .str_ty or pt_tag == .slice_ty or pt_tag == .soa_slice_ty) {
+                    const bp_id = state.nextTmp();
+                    try state.print(
+                        "  %_sm_bp_{d} = load ptr, ptr %_v_{d}, align {d}\n",
+                        .{ bp_id, args[0], emitter.cfg.target.ptrBytes() },
+                    );
+                    break :blk_ref try std.fmt.allocPrint(emitter.allocator, "%_sm_bp_{d}", .{bp_id});
+                }
+                break :blk_ref try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
+            } else if (try isZeroSizedType(emitter, base_ty))
+                try std.fmt.allocPrint(emitter.allocator, "inttoptr ({s} 1 to ptr)", .{ptr_int})
+            else blk_arr: {
+                const base_lay = try emitter.resolver.resolveType(base_ty);
+                const scratch = try state.allocEntryBytes(base_lay.size_bytes, base_lay.alignBytes());
+                const src_ssa = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
+                defer emitter.allocator.free(src_ssa);
+                try emitStoreValueToPtr(
+                    emitter,
+                    state,
+                    base_ty,
+                    src_ssa,
+                    scratch,
+                    base_lay.alignBytes(),
+                    0,
+                    0,
+                    0,
+                );
+                break :blk_arr scratch;
+            };
+            defer emitter.allocator.free(base_data_ptr);
+
+            const lo_ssa = try coerceIndexToPtrInt(emitter, state, body, args[1]);
+            defer emitter.allocator.free(lo_ssa);
+            const hi_ssa = try coerceIndexToPtrInt(emitter, state, body, args[2]);
+            defer emitter.allocator.free(hi_ssa);
+
+            const dst_unwrapped = try unwrapTransparentType(emitter, inst.type_id);
+            const dst_node = emitter.input.pool.getNode(dst_unwrapped);
+            const is_ref_dst = dst_node.tag == .ref_ty or
+                dst_node.tag == .mut_ref_ty or
+                dst_node.tag == .raw_ptr_ty;
+            const sl_ty = if (is_ref_dst)
+                try unwrapTransparentType(emitter, TypeId.fromInt(dst_node.lhs))
+            else
+                dst_unwrapped;
+            const elem_stride: u64 = if (sl_ty == .str_ty)
+                1
+            else blk_st: {
+                const elem_ty = try unwrapTransparentType(
+                    emitter,
+                    TypeId.fromInt(emitter.input.pool.getNode(sl_ty).lhs),
+                );
+                break :blk_st (try emitter.resolver.resolveType(elem_ty)).stride_bytes;
+            };
+
+            const tmp_id = state.nextTmp();
+            try state.print(
+                "  %_sm_off_{d} = mul {s} {s}, {d}\n" ++
+                    "  %_sm_ptr_{d} = getelementptr i8, ptr {s}, {s} %_sm_off_{d}\n" ++
+                    "  %_sm_len_{d} = sub {s} {s}, {s}\n",
+                .{
+                    tmp_id, ptr_int, lo_ssa,        elem_stride,
+                    tmp_id, base_data_ptr, ptr_int, tmp_id,
+                    tmp_id, ptr_int, hi_ssa,        lo_ssa,
+                },
+            );
+            if (is_ref_dst) {
+                const fat_slot = try state.allocEntryBytes(
+                    2 * emitter.cfg.target.ptrBytes(),
+                    emitter.cfg.target.ptrBytes(),
+                );
+                defer emitter.allocator.free(fat_slot);
+                try state.print(
+                    "  store ptr %_sm_ptr_{d}, ptr {s}, align {d}\n" ++
+                        "  %_sm_lp_{d} = getelementptr inbounds {{ ptr, {s} }}, ptr {s}, i32 0, i32 1\n" ++
+                        "  store {s} %_sm_len_{d}, ptr %_sm_lp_{d}, align {d}\n" ++
+                        "  %_v_{d} = select i1 true, ptr {s}, ptr {s}\n",
+                    .{
+                        tmp_id,                         fat_slot, emitter.cfg.target.ptrBytes(),
+                        tmp_id,                         ptr_int,  fat_slot,
+                        ptr_int,                        tmp_id,   tmp_id,
+                        emitter.cfg.target.ptrBytes(),  dst_raw,  fat_slot,
+                        fat_slot,
+                    },
+                );
+            } else {
+                try state.print(
+                    "  %_sm_agg_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr %_sm_ptr_{d}, 0\n" ++
+                        "  %_v_{d} = insertvalue {{ ptr, {s} }} %_sm_agg_{d}, {s} %_sm_len_{d}, 1\n",
+                    .{ tmp_id, ptr_int, tmp_id, dst_raw, ptr_int, tmp_id, ptr_int, tmp_id },
+                );
+            }
+        },
+
+        .ctx_get => {
+            if (args.len < 1 or (try isZeroSizedType(emitter, inst.type_id))) {
+                try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+                return;
+            }
+            const dst_ty = try unwrapTransparentType(emitter, inst.type_id);
+            if (type_system.ContextFieldLayout.resolveRefPointee(
+                emitter.input.pool,
+                emitter.input.sym_table,
+                dst_ty,
+            )) |ctx_pointee| {
+                const ctx_lay = try emitter.resolver.resolveType(ctx_pointee);
+                const snap_ptr = try state.allocEntryBytes(@max(ctx_lay.size_bytes, 1), ctx_lay.alignBytes());
+                defer emitter.allocator.free(snap_ptr);
+                try emitMemsetZero(emitter, state, snap_ptr, ctx_lay.size_bytes, ctx_lay.alignBytes());
+                var decl_ord: u32 = 0;
+                while (decl_ord < ctx_lay.aux_len and decl_ord < 8) : (decl_ord += 1) {
+                    const fld = emitter.resolver.fields_by_decl.items[ctx_lay.aux_start + decl_ord];
+                    if (fld.size_bytes == 0) continue;
+                    const dst_fld_ptr = if (fld.byte_offset == 0)
+                        try emitter.allocator.dupe(u8, snap_ptr)
+                    else blk_fld_gep: {
+                        const gep_tmp = state.nextTmp();
+                        try state.print(
+                            "  %_cgs_dst_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n",
+                            .{ gep_tmp, snap_ptr, ptr_int, fld.byte_offset },
+                        );
+                        break :blk_fld_gep try std.fmt.allocPrint(emitter.allocator, "%_cgs_dst_{d}", .{gep_tmp});
+                    };
+                    defer emitter.allocator.free(dst_fld_ptr);
+                    const dst_fld_align = effectiveOffsetAlign(fld.byte_offset, ctx_lay.alignBytes());
+                    if (fld.size_bytes <= 8) {
+                        const src_slot_ptr = if (decl_ord == 0)
+                            try emitter.allocator.dupe(u8, "@_cx_default_ctx")
+                        else blk_src_gep: {
+                            const src_tmp = state.nextTmp();
+                            try state.print(
+                                "  %_cgs_src_{d} = getelementptr inbounds i8, ptr @_cx_default_ctx, {s} {d}\n",
+                                .{ src_tmp, ptr_int, @as(u64, decl_ord) * 8 },
+                            );
+                            break :blk_src_gep try std.fmt.allocPrint(emitter.allocator, "%_cgs_src_{d}", .{src_tmp});
+                        };
+                        defer emitter.allocator.free(src_slot_ptr);
+                        try emitMemcpyBytes(emitter, state, dst_fld_ptr, dst_fld_align, src_slot_ptr, 8, fld.size_bytes);
+                    } else if (emitter.ctx_wide_slot_sizes[decl_ord] >= fld.size_bytes) {
+                        const wide_src_ptr = try std.fmt.allocPrint(emitter.allocator, "@_cx_ctx_wide_{d}", .{decl_ord});
+                        defer emitter.allocator.free(wide_src_ptr);
+                        try emitMemcpyBytes(
+                            emitter,
+                            state,
+                            dst_fld_ptr,
+                            dst_fld_align,
+                            wide_src_ptr,
+                            emitter.ctx_wide_slot_aligns[decl_ord],
+                            fld.size_bytes,
+                        );
+                    }
+                }
+                try state.print(
+                    "  %_v_{d} = select i1 true, ptr {s}, ptr {s}\n",
+                    .{ dst_raw, snap_ptr, snap_ptr },
+                );
+                return;
+            }
+            const dst_lay = try emitter.resolver.resolveType(dst_ty);
+            var slot_align: u32 = 8;
+            const slot_ptr_ssa: []u8 = if (dst_lay.size_bytes > 8) blk_wide: {
+                var ord_u: usize = 0;
+                const ord_inst = body.getInst(MirValueId.fromInt(args[0]));
+                if (ord_inst.op == .const_scalar and ord_inst.operands.lhs < body.consts.items.len) {
+                    switch (body.consts.items[ord_inst.operands.lhs]) {
+                        .int_val => |iv| ord_u = @intCast(@as(u128, @bitCast(iv)) & 7),
+                        else => {},
+                    }
+                }
+                slot_align = emitter.ctx_wide_slot_aligns[ord_u];
+                break :blk_wide try std.fmt.allocPrint(emitter.allocator, "@_cx_ctx_wide_{d}", .{ord_u});
+            } else blk_inline: {
+                const ord_ssa = try coerceIndexToPtrInt(emitter, state, body, args[0]);
+                defer emitter.allocator.free(ord_ssa);
+                const tmp_id = state.nextTmp();
+                try state.print(
+                    "  %_cg_msk_{d} = and {s} {s}, 7\n" ++
+                        "  %_cg_off_{d} = mul {s} %_cg_msk_{d}, 8\n" ++
+                        "  %_cg_ptr_{d} = getelementptr inbounds i8, ptr @_cx_default_ctx, {s} %_cg_off_{d}\n",
+                    .{ tmp_id, ptr_int, ord_ssa, tmp_id, ptr_int, tmp_id, tmp_id, ptr_int, tmp_id },
+                );
+                break :blk_inline try std.fmt.allocPrint(emitter.allocator, "%_cg_ptr_{d}", .{tmp_id});
+            };
+            defer emitter.allocator.free(slot_ptr_ssa);
+
+            const loaded = try emitLoadValueFromPtr(
+                emitter,
+                state,
+                dst_ty,
+                slot_ptr_ssa,
+                @min(slot_align, dst_lay.alignBytes()),
+                null,
+                0,
+                0,
+                0,
+            );
+            defer emitter.allocator.free(loaded);
+            const dst_val_ty = try formatLlvmValueType(emitter, dst_ty);
+            defer emitter.allocator.free(dst_val_ty);
+            try state.print(
+                "  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n",
+                .{ dst_raw, dst_val_ty, loaded, dst_val_ty, loaded },
+            );
+        },
+
+        .ctx_set => {
+            if (args.len >= 2) {
+                const val_ty = try unwrapTransparentType(emitter, body.getInst(MirValueId.fromInt(args[1])).type_id);
+                if (!(try isZeroSizedType(emitter, val_ty))) {
+                    const val_lay = try emitter.resolver.resolveType(val_ty);
+                    var slot_align: u32 = 8;
+                    const slot_ptr_ssa: []u8 = if (val_lay.size_bytes > 8) blk_wide: {
+                        var ord_u: usize = 0;
+                        const ord_inst = body.getInst(MirValueId.fromInt(args[0]));
+                        if (ord_inst.op == .const_scalar and ord_inst.operands.lhs < body.consts.items.len) {
+                            switch (body.consts.items[ord_inst.operands.lhs]) {
+                                .int_val => |iv| ord_u = @intCast(@as(u128, @bitCast(iv)) & 7),
+                                else => {},
+                            }
+                        }
+                        slot_align = emitter.ctx_wide_slot_aligns[ord_u];
+                        break :blk_wide try std.fmt.allocPrint(emitter.allocator, "@_cx_ctx_wide_{d}", .{ord_u});
+                    } else blk_inline: {
+                        const ord_ssa = try coerceIndexToPtrInt(emitter, state, body, args[0]);
+                        defer emitter.allocator.free(ord_ssa);
+                        const tmp_id = state.nextTmp();
+                        try state.print(
+                            "  %_cs_msk_{d} = and {s} {s}, 7\n" ++
+                                "  %_cs_off_{d} = mul {s} %_cs_msk_{d}, 8\n" ++
+                                "  %_cs_ptr_{d} = getelementptr inbounds i8, ptr @_cx_default_ctx, {s} %_cs_off_{d}\n",
+                            .{ tmp_id, ptr_int, ord_ssa, tmp_id, ptr_int, tmp_id, tmp_id, ptr_int, tmp_id },
+                        );
+                        break :blk_inline try std.fmt.allocPrint(emitter.allocator, "%_cs_ptr_{d}", .{tmp_id});
+                    };
+                    defer emitter.allocator.free(slot_ptr_ssa);
+
+                    const src_ssa = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[1]});
+                    defer emitter.allocator.free(src_ssa);
+                    try emitStoreValueToPtr(
+                        emitter,
+                        state,
+                        val_ty,
+                        src_ssa,
+                        slot_ptr_ssa,
+                        @min(slot_align, val_lay.alignBytes()),
+                        0,
+                        0,
+                        0,
+                    );
+                }
+            }
+            try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+        },
+
+        .ghost_ctx_region_push, .ghost_ctx_region_pop => {
+            try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+        },
     }
 }
 
@@ -10065,6 +10408,7 @@ fn emitMirBody(emitter: *LlvmModuleEmitter, body_idx: u32, body: *const MirBody)
     var state = BodyEmitState{
         .allocator = emitter.allocator,
         .cur_label = try emitter.allocator.dupe(u8, "_bb_0"),
+        .has_ctx_param = recipe.has_implicit_context,
         .local_ptrs = local_ptrs,
         .local_aligns = local_aligns,
         .edge_pred_labels = edge_pred_labels,

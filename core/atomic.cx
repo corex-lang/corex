@@ -1,4 +1,4 @@
-//! Lock-Free Atomic Primitives and Memory Ordering Fences (`core::atomic`)
+//! Lock-Free Atomic Primitives and Memory Ordering Fences (`core.atomic`)
 //!
 //! Provides `@repr(C)` atomic wrappers (`AtomicBool`, `AtomicU32`, `AtomicU64`, `AtomicUsize`)
 //! and explicit hardware/compiler memory-ordering constants (`ORDER_RELAXED`..`ORDER_SEQ_CST`)
@@ -6,9 +6,7 @@
 //!
 //! Mutating operations accept `inout` atomic slots (`DR-02` Mutable Value Semantics) so callers
 //! retain ergonomic value-oriented syntax while hardware RMW atomicity is preserved in place.
-
 // ---------------------------------------- TYPES ----------------------------------------
-
 /// Memory ordering lattice matching LLVM / C11 atomic ordering codes (`DR-08`).
 pub enum MemoryOrder {
     /// Monotonic atomicity with no cross-thread synchronization (`ORDER_RELAXED = 0`).

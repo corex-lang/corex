@@ -184,8 +184,8 @@ pub const FnContractScratchMask = packed struct(u16) {
     has_yield_vacated_noncopy: bool = false,
     /// `true` if `max_subtree_bytes > ASYNC_INLINE_CAP_BYTES` (`16 KiB`).
     has_async_exceeded_inline_cap: bool = false,
-    /// Reserved zero bits keeping `FnContractScratchMask` at `16` bits.
-    _reserved: u2 = 0,
+    /// Bitmask of allocator `Context` slots (`bit 0` = `slot 0` `allocator`, `bit 1` = `slot 4` `temp_allocator`).
+    ctx_alloc_slot_mask: u2 = 0,
 
     comptime {
         std.debug.assert(@sizeOf(FnContractScratchMask) == 2);
@@ -199,7 +199,7 @@ pub const FnContractScratchMask = packed struct(u16) {
 
     /// Constructs a `FnContractScratchMask` from raw 16-bit integer `raw_bits`.
     pub inline fn fromBits(raw_bits: u16) FnContractScratchMask {
-        return @bitCast(raw_bits & 0x3FFF);
+        return @bitCast(raw_bits);
     }
 };
 
@@ -1343,6 +1343,25 @@ const HEAP_GROWTH_METHOD_MAP = std.StaticStringMap(void).initComptime(.{
     .{ "with_capacity", {} },
 });
 
+/// $O(1)$ static map of nominal carrier type names holding `Context` handles or owned heap pointers (`SE-08`).
+const CONTEXT_ALLOC_CARRIER_NAME_MAP = std.StaticStringMap(void).initComptime(.{
+    .{ "Allocator", {} },
+    .{ "Box", {} },
+    .{ "CancelToken", {} },
+    .{ "DiagSink", {} },
+    .{ "Diagnostics", {} },
+    .{ "Logger", {} },
+    .{ "OwnPtr", {} },
+});
+
+/// $O(1)$ static map from `Context` handle type names to their 3-bit `SE-08` carrier mask (`Logger`/`DiagSink`/`CancelToken`).
+const CONTEXT_HANDLE_CARRIER_MASK_MAP = std.StaticStringMap(u8).initComptime(.{
+    .{ "CancelToken", 1 << 2 },
+    .{ "DiagSink", 1 << 1 },
+    .{ "Diagnostics", 1 << 1 },
+    .{ "Logger", 1 << 0 },
+});
+
 /// $O(1)$ static map from built-in/external prototype names to inferred `EffectCapabilityMask` bits.
 const EXTERN_PROTO_EFFECT_MAP = std.StaticStringMap(EffectCapabilityMask).initComptime(.{
     .{ "abort", EffectCapabilityMask{ .may_panic = true } },
@@ -1361,7 +1380,6 @@ const EXTERN_PROTO_EFFECT_MAP = std.StaticStringMap(EffectCapabilityMask).initCo
     .{ "spawn_thread", EffectCapabilityMask{ .process = true } },
     .{ "tcp_connect", EffectCapabilityMask{ .net = true } },
     .{ "udp_bind", EffectCapabilityMask{ .net = true } },
-    .{ "unwrap", EffectCapabilityMask{ .may_panic = true } },
     .{ "write_file", EffectCapabilityMask{ .fs = true } },
 });
 
@@ -1627,7 +1645,7 @@ fn lookupDirectDropMethodSymbol(
     return .none;
 }
 
-/// Recursively collects custom `Drop::drop` symbols and built-in heap-container free flags for `type_id`.
+/// Recursively collects custom `Drop.drop` symbols and built-in heap-container free flags for `type_id`.
 fn collectDropGlueTargets(
     allocator: std.mem.Allocator,
     pool: *const InternPool,
@@ -2014,7 +2032,7 @@ fn computeBottomUpTarjanSccs(
             }
         }
 
-        // [3] Potential `AutoDrop` destructor `Drop::drop` callees on body locals & `&mut T` pointees:
+        // [3] Potential `AutoDrop` destructor `Drop.drop` callees on body locals & `&mut T` pointees:
         var drop_syms: std.ArrayListUnmanaged(SymbolIndex) = .empty;
         for (body.locals.items, 0..) |loc, loc_i| {
             if (loc_i == 0) continue;
@@ -2288,6 +2306,7 @@ fn stepProjectedType(
         },
         .index => {
             active_downcast.* = null;
+            if (cur_ty == .str_ty) return .u8_ty;
             if (node.tag == .array_ty or node.tag == .slice_ty or
                 node.tag == .soa_array_ty or node.tag == .soa_slice_ty)
             {
@@ -2334,7 +2353,7 @@ fn makeMovePathFlags(
     const tier = type_system.classifyOwnershipTierWithSubst(pool, sym_table, resolved_ty, subst);
     return .{
         .is_copy = tier == .copy_tier,
-        .is_linear = tier == .linear_tier,
+        .is_linear = type_system.hasLinearObligationWithSubst(pool, sym_table, resolved_ty, subst),
         .is_auto_drop = tier == .auto_drop_tier,
         .is_custom_drop_struct = !lookupDirectDropMethodSymbol(pool, sym_table, resolved_ty).isNone(),
         .is_behind_shared_ref = is_behind_shared,
@@ -2453,7 +2472,7 @@ fn buildMovePathTrie(
                 if (proj.kind == .deref) {
                     if (before_tag == .ref_ty) is_behind_shared = true;
                     if (before_tag == .raw_ptr_ty) is_deref_raw = true;
-                } else if (proj.kind == .index and before_tag == .slice_ty) {
+                } else if (proj.kind == .index and (before_tag == .slice_ty or unwrapped_before == .str_ty)) {
                     is_behind_shared = true;
                 } else if (proj.kind == .soa_elem and before_tag == .soa_slice_ty and
                     pool.getNode(unwrapped_before).rhs == 0)
@@ -2708,19 +2727,23 @@ const ValueProvenance = struct {
         rhs: ValueProvenance,
         arena_alloc: std.mem.Allocator,
     ) !ValueProvenance {
-        const is_picking_rhs_depth = rhs.max_depth > lhs.max_depth;
+        const resolved_origin: LocalId = if (rhs.max_depth > lhs.max_depth)
+            rhs.origin_local
+        else if (lhs.max_depth > rhs.max_depth)
+            lhs.origin_local
+        else if (!lhs.origin_local.isNone() and !rhs.origin_local.isNone())
+            LocalId.fromInt(@max(lhs.origin_local.asInt(), rhs.origin_local.asInt()))
+        else if (!lhs.origin_local.isNone())
+            lhs.origin_local
+        else
+            rhs.origin_local;
         return .{
             .param_mask = lhs.param_mask | rhs.param_mask,
             .scratch_mask = lhs.scratch_mask | rhs.scratch_mask,
             .raw_ptr_state = RawPtrState.join(lhs.raw_ptr_state, rhs.raw_ptr_state),
             .max_depth = @max(lhs.max_depth, rhs.max_depth),
             .min_target_depth = @min(lhs.min_target_depth, rhs.min_target_depth),
-            .origin_local = if (is_picking_rhs_depth)
-                rhs.origin_local
-            else if (!lhs.origin_local.isNone())
-                lhs.origin_local
-            else
-                rhs.origin_local,
+            .origin_local = resolved_origin,
             .raw_ptr_local = if (!lhs.raw_ptr_local.isNone()) lhs.raw_ptr_local else rhs.raw_ptr_local,
             .loan_mask = try lhs.loan_mask.unionAlloc(rhs.loan_mask, arena_alloc),
             .scratch_open_token = if (!lhs.scratch_open_token.isNone())
@@ -2761,6 +2784,138 @@ const TrackedLoan = struct {
     last_use_token: TokenIndex = .none,
 };
 
+/// Single pushed `with context.allocator` / `with context.temp_allocator` region frame (`SE-08`).
+const CtxRegionEntry = struct {
+    /// Canonical `Context` slot ordinal (`0` = `allocator`, `4` = `temp_allocator`).
+    slot_ord: u8 = 0,
+    /// SSA `MirValueId.asInt()` of `region_val` passed to `ghost_ctx_region_push`.
+    push_val: u32 = mir.NONE_U32,
+    /// Minimum lexical scope depth of the `with` block (`>= DEPTH_LOCAL_REGION_BASE`).
+    fallback_depth: u16 = DEPTH_LOCAL_REGION_BASE,
+    /// Anchor `LocalId` owning the `with` binding (`hold_local` when materialized).
+    fallback_origin: LocalId = .none,
+
+    /// Returns `true` if `lhs` and `rhs` represent the exact same pushed region frame.
+    fn isEqual(lhs: CtxRegionEntry, rhs: CtxRegionEntry) bool {
+        return lhs.slot_ord == rhs.slot_ord and
+            lhs.push_val == rhs.push_val and
+            lhs.fallback_depth == rhs.fallback_depth and
+            lhs.fallback_origin == rhs.fallback_origin;
+    }
+};
+
+/// Bounded inline stack (`<= 16` nested `with` blocks) of active dynamic `Context` allocator regions.
+const CtxRegionStack = struct {
+    /// Contiguous stack entries from outermost (`0`) to innermost (`len - 1`).
+    entries: [16]CtxRegionEntry = undefined,
+    /// Active stack height (`0..16`).
+    len: u8 = 0,
+
+    /// Pushes `entry` onto `self` (clamping at capacity `16` fail-closed on top slot).
+    fn push(self: *CtxRegionStack, entry: CtxRegionEntry) void {
+        if (self.len < 16) {
+            self.entries[self.len] = entry;
+            self.len += 1;
+        } else {
+            self.entries[15].fallback_depth = @max(self.entries[15].fallback_depth, entry.fallback_depth);
+            if (!entry.fallback_origin.isNone()) {
+                if (self.entries[15].fallback_origin.isNone() or
+                    entry.fallback_origin.asInt() > self.entries[15].fallback_origin.asInt())
+                {
+                    self.entries[15].fallback_origin = entry.fallback_origin;
+                }
+            }
+        }
+    }
+
+    /// Pops the innermost matching `slot_ord` frame (or top frame if unmatched).
+    fn popSlot(self: *CtxRegionStack, slot_ord: u8) void {
+        if (self.len == 0) return;
+        var idx: usize = self.len;
+        while (idx > 0) {
+            idx -= 1;
+            if (self.entries[idx].slot_ord == slot_ord) {
+                var shift_i = idx;
+                while (shift_i + 1 < self.len) : (shift_i += 1) {
+                    self.entries[shift_i] = self.entries[shift_i + 1];
+                }
+                self.len -= 1;
+                return;
+            }
+        }
+        self.len -= 1;
+    }
+
+    /// Returns `true` if `lhs` and `rhs` have identical active entries.
+    fn isEqual(lhs: CtxRegionStack, rhs: CtxRegionStack) bool {
+        if (lhs.len != rhs.len) return false;
+        var i: usize = 0;
+        while (i < lhs.len) : (i += 1) {
+            if (!CtxRegionEntry.isEqual(lhs.entries[i], rhs.entries[i])) return false;
+        }
+        return true;
+    }
+
+    /// Evaluates the effective `ValueProvenance` of `entry` given current `val_prov`.
+    fn resolveEntryProv(entry: CtxRegionEntry, val_prov: []const ValueProvenance) ValueProvenance {
+        var res = ValueProvenance{
+            .max_depth = entry.fallback_depth,
+            .origin_local = entry.fallback_origin,
+        };
+        if (entry.push_val < val_prov.len) {
+            const rv = val_prov[entry.push_val];
+            if (rv.max_depth > res.max_depth) {
+                res.max_depth = rv.max_depth;
+                if (!rv.origin_local.isNone()) res.origin_local = rv.origin_local;
+            } else if (rv.max_depth == res.max_depth and !rv.origin_local.isNone()) {
+                if (res.origin_local.isNone() or rv.origin_local.asInt() > res.origin_local.asInt()) {
+                    res.origin_local = rv.origin_local;
+                }
+            }
+        }
+        return res;
+    }
+
+    /// Returns the innermost active `ValueProvenance` for `slot_ord` (`null` if `slot_ord` is not overridden).
+    fn lookupSlotProv(self: *const CtxRegionStack, slot_ord: u8, val_prov: []const ValueProvenance) ?ValueProvenance {
+        var idx: usize = self.len;
+        while (idx > 0) {
+            idx -= 1;
+            if (self.entries[idx].slot_ord == slot_ord) {
+                return resolveEntryProv(self.entries[idx], val_prov);
+            }
+        }
+        return null;
+    }
+
+    /// Returns the combined `ValueProvenance` across active allocator slots in `slot_mask` (`0b01` = `0`, `0b10` = `4`).
+    fn resolveAllocProvForMask(
+        self: *const CtxRegionStack,
+        slot_mask: u2,
+        val_prov: []const ValueProvenance,
+    ) ValueProvenance {
+        var combined = ValueProvenance{};
+        const target_slots = [2]struct { bit: u2, ord: u8 }{
+            .{ .bit = 0b01, .ord = 0 },
+            .{ .bit = 0b10, .ord = 4 },
+        };
+        for (target_slots) |entry| {
+            if ((slot_mask & entry.bit) == 0) continue;
+            if (self.lookupSlotProv(entry.ord, val_prov)) |ep| {
+                if (ep.max_depth > combined.max_depth) {
+                    combined.max_depth = ep.max_depth;
+                    combined.origin_local = ep.origin_local;
+                } else if (ep.max_depth == combined.max_depth and !ep.origin_local.isNone()) {
+                    if (combined.origin_local.isNone() or ep.origin_local.asInt() > combined.origin_local.asInt()) {
+                        combined.origin_local = ep.origin_local;
+                    }
+                }
+            }
+        }
+        return combined;
+    }
+};
+
 /// Result of intra-body region provenance and backward transitive NLL liveness analysis.
 const BodyProvenanceHorizon = struct {
     /// Forward provenance per SSA `MirValueId` (`len == body.insts.len`).
@@ -2769,6 +2924,10 @@ const BodyProvenanceHorizon = struct {
     local_prov: []ValueProvenance,
     /// Lexical declaration depth (`DEPTH_FN_FRAME + scope_nesting`) per `LocalId`.
     local_decl_depth: []u16,
+    /// Active scoped `with context.allocator` (`slot 0`) provenance at each block terminator (`len == block_count`).
+    block_ctx_alloc0_prov_out: []ValueProvenance,
+    /// Active scoped `with context.temp_allocator` (`slot 4`) provenance at each block terminator (`len == block_count`).
+    block_ctx_alloc4_prov_out: []ValueProvenance,
     /// Tracked NLL loans (`0 .. loan_count - 1`, `loan_count <= MAX_TRACKED_LOANS`).
     loans: []TrackedLoan,
     /// Active NLL `loan_mask` (`DenseBitSet`) on entry to each basic block (`len == block_count`).
@@ -3249,6 +3408,54 @@ fn computeBodyProvenanceAndNllHorizon(
 
     const loan_count = loan_list.items.len;
 
+    // [2.5] Precompute per-block dynamic `with context` region stacks (`SE-08`):
+    const block_ctx_stack_in = try arena_alloc.alloc(CtxRegionStack, block_count);
+    @memset(block_ctx_stack_in, .{});
+    const block_ctx_stack_out = try arena_alloc.alloc(CtxRegionStack, block_count);
+    @memset(block_ctx_stack_out, .{});
+
+    const ctx_iter_cap: usize = @max(@as(usize, 16), block_count * 2);
+    var ctx_iter: usize = 0;
+    var has_ctx_changed = true;
+    while (has_ctx_changed and ctx_iter < ctx_iter_cap) : (ctx_iter += 1) {
+        has_ctx_changed = false;
+        for (dom.rpo_blocks) |bb_idx| {
+            const bb_id = MirBlockId.fromInt(bb_idx);
+            var in_stack = CtxRegionStack{};
+            var has_pred_stack = false;
+            for (body.getPredEdges(bb_id)) |pred_eid| {
+                const edge = body.extra_edges.items[pred_eid.asInt()];
+                if (!dom.isReachable(edge.src_bb)) continue;
+                const pred_out = block_ctx_stack_out[edge.src_bb.asInt()];
+                if (!has_pred_stack) {
+                    in_stack = pred_out;
+                    has_pred_stack = true;
+                } else {
+                    const min_len = @min(in_stack.len, pred_out.len);
+                    var common_len: u8 = 0;
+                    while (common_len < min_len) : (common_len += 1) {
+                        if (!CtxRegionEntry.isEqual(in_stack.entries[common_len], pred_out.entries[common_len])) {
+                            break;
+                        }
+                    }
+                    in_stack.len = common_len;
+                }
+            }
+            if (!CtxRegionStack.isEqual(in_stack, block_ctx_stack_in[bb_idx])) {
+                block_ctx_stack_in[bb_idx] = in_stack;
+                has_ctx_changed = true;
+            }
+            var out_stack = in_stack;
+            for (body.getBlockInsts(bb_id)) |inst_val| {
+                stepCtxRegionInst(body, body.getInst(inst_val), local_decl_depth, &out_stack);
+            }
+            if (!CtxRegionStack.isEqual(out_stack, block_ctx_stack_out[bb_idx])) {
+                block_ctx_stack_out[bb_idx] = out_stack;
+                has_ctx_changed = true;
+            }
+        }
+    }
+
     // [3] Forward fixed-point propagation of `ValueProvenance` across SSA & local slots:
     const prov_iter_cap: usize = @max(@as(usize, 64), block_count * 4);
     var iter: usize = 0;
@@ -3257,6 +3464,7 @@ fn computeBodyProvenanceAndNllHorizon(
         has_prov_changed = false;
         for (dom.rpo_blocks) |bb_idx| {
             const bb_id = MirBlockId.fromInt(bb_idx);
+            var cur_ctx_stack = block_ctx_stack_in[bb_idx];
 
             // Merge incoming edge arguments into `block_param`s:
             const params = body.getBlockParams(bb_id);
@@ -3394,11 +3602,13 @@ fn computeBodyProvenanceAndNllHorizon(
                         }
                     },
                     .place_load => {
-                        if (inst.operands.lhs < body.places.items.len and
-                            hasProvenanceCarrier(pool, sym_table, inst.type_id))
-                        {
+                        if (inst.operands.lhs < body.places.items.len) {
                             const place_rec = body.places.items[inst.operands.lhs];
-                            if (place_rec.base < local_count) {
+                            if (place_rec.base < local_count and
+                                (hasProvenanceCarrier(pool, sym_table, inst.type_id) or
+                                    (local_prov[place_rec.base].max_depth >= DEPTH_FN_FRAME and
+                                        isContextAllocCarrier(pool, sym_table, inst.type_id))))
+                            {
                                 next_p = try ValueProvenance.merge(
                                     next_p,
                                     local_prov[place_rec.base],
@@ -3472,7 +3682,9 @@ fn computeBodyProvenanceAndNllHorizon(
                     },
                     .aggregate_extract => {
                         if (inst.operands.lhs < inst_count and
-                            hasProvenanceCarrier(pool, sym_table, inst.type_id))
+                            (hasProvenanceCarrier(pool, sym_table, inst.type_id) or
+                                (val_prov[inst.operands.lhs].max_depth >= DEPTH_FN_FRAME and
+                                    isContextAllocCarrier(pool, sym_table, inst.type_id))))
                         {
                             next_p = try ValueProvenance.merge(next_p, val_prov[inst.operands.lhs], arena_alloc);
                         }
@@ -3490,13 +3702,23 @@ fn computeBodyProvenanceAndNllHorizon(
                     },
                     .intrinsic_op => {
                         const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
-                        if (ikind == .as_bytes or ikind == .view_bytes or ikind == .from_bytes) {
+                        if (ikind == .as_bytes or ikind == .view_bytes or
+                            ikind == .from_bytes or ikind == .subslice_make)
+                        {
                             if (inst.operands.rhs > 0 and inst.operands.lhs < body.extra_args.items.len) {
                                 const src_v = body.extra_args.items[inst.operands.lhs];
                                 if (src_v < inst_count) {
                                     next_p = try ValueProvenance.merge(next_p, val_prov[src_v], arena_alloc);
                                 }
                             }
+                        } else if (ikind == .ctx_get) {
+                            if (extractConstCtxSlotOrd(body, inst)) |slot_ord| {
+                                if (cur_ctx_stack.lookupSlotProv(slot_ord, val_prov)) |slot_prov| {
+                                    next_p = try ValueProvenance.merge(next_p, slot_prov, arena_alloc);
+                                }
+                            }
+                        } else {
+                            stepCtxRegionInst(body, inst, local_decl_depth, &cur_ctx_stack);
                         }
                     },
                     else => {},
@@ -3583,6 +3805,43 @@ fn computeBodyProvenanceAndNllHorizon(
                             has_ret_prov)
                         {
                             ret_p = try ValueProvenance.merge(ret_p, arg_p, arena_alloc);
+                        } else if (arg_i == 0 and isAllocatorArgPlaceOrVal(body, pool, sym_table, mode, word) and
+                            arg_p.max_depth >= DEPTH_FN_FRAME and
+                            isContextAllocCarrier(pool, sym_table, call_site.ret_ty))
+                        {
+                            ret_p = try ValueProvenance.merge(ret_p, arg_p, arena_alloc);
+                        }
+                    }
+
+                    if (cur_ctx_stack.len > 0 and isContextAllocCarrier(pool, sym_table, call_site.ret_ty)) {
+                        const call_alloc_mask = resolveCallCtxAllocSlotMask(
+                            body,
+                            pool,
+                            sym_table,
+                            call_site,
+                            callee_sum_opt,
+                        );
+                        if (call_alloc_mask != 0) {
+                            ret_p = try ValueProvenance.merge(
+                                ret_p,
+                                cur_ctx_stack.resolveAllocProvForMask(call_alloc_mask, val_prov),
+                                arena_alloc,
+                            );
+                        }
+                        if (!call_site.is_callee_contextless) {
+                            const handle_slot_mask = detectContextHandleCarrierMask(
+                                pool,
+                                sym_table,
+                                call_site.ret_ty,
+                                0,
+                            );
+                            const handle_slot_ords = [3]u8{ 5, 6, 7 };
+                            for (handle_slot_ords, 0..) |slot_ord, bit_idx| {
+                                if ((handle_slot_mask & (@as(u8, 1) << @intCast(bit_idx))) == 0) continue;
+                                if (cur_ctx_stack.lookupSlotProv(slot_ord, val_prov)) |slot_prov| {
+                                    ret_p = try ValueProvenance.merge(ret_p, slot_prov, arena_alloc);
+                                }
+                            }
                         }
                     }
 
@@ -3674,6 +3933,55 @@ fn computeBodyProvenanceAndNllHorizon(
                                     has_prov_changed = true;
                                 }
                             }
+                        }
+                    }
+                }
+
+                // Taint mutable container arguments mutated under an active `with context` override (`SE-08`):
+                const mut_alloc_mask = if (cur_ctx_stack.len > 0)
+                    resolveCallCtxAllocSlotMask(body, pool, sym_table, call_site, flow_callee_opt)
+                else
+                    0;
+                if (cur_ctx_stack.len > 0 and (mut_alloc_mask != 0 or !call_site.is_callee_contextless)) {
+                    var ctx_mut_prov = if (mut_alloc_mask != 0)
+                        cur_ctx_stack.resolveAllocProvForMask(mut_alloc_mask, val_prov)
+                    else
+                        ValueProvenance{};
+                    ctx_mut_prov.min_target_depth = std.math.maxInt(u16);
+                    for (0..call_site.args_len) |dst_i| {
+                        const dst_mode = body.call_arg_modes.items[call_site.modes_start + dst_i];
+                        const dst_word = body.extra_args.items[call_site.args_start + dst_i];
+                        const dst_base = extractDirectMutLocalArg(body, dst_mode, dst_word, inst_count) orelse continue;
+                        if (dst_base >= local_count) continue;
+                        const dst_ty = body.locals.items[dst_base].type_id;
+                        if (isArenaType(pool, sym_table, dst_ty) or
+                            type_system.isContextType(pool, sym_table, dst_ty) or
+                            !isContextAllocCarrier(pool, sym_table, dst_ty))
+                        {
+                            continue;
+                        }
+                        var arg_ctx_prov = ctx_mut_prov;
+                        if (!call_site.is_callee_contextless) {
+                            const handle_slot_mask = detectContextHandleCarrierMask(pool, sym_table, dst_ty, 0);
+                            const handle_slot_ords = [3]u8{ 5, 6, 7 };
+                            for (handle_slot_ords, 0..) |slot_ord, bit_idx| {
+                                if ((handle_slot_mask & (@as(u8, 1) << @intCast(bit_idx))) == 0) continue;
+                                if (cur_ctx_stack.lookupSlotProv(slot_ord, val_prov)) |slot_prov| {
+                                    var clean_slot = slot_prov;
+                                    clean_slot.min_target_depth = std.math.maxInt(u16);
+                                    arg_ctx_prov = try ValueProvenance.merge(arg_ctx_prov, clean_slot, arena_alloc);
+                                }
+                            }
+                        }
+                        if (arg_ctx_prov.max_depth == 0) continue;
+                        const merged_dst = try ValueProvenance.merge(
+                            local_prov[dst_base],
+                            arg_ctx_prov,
+                            arena_alloc,
+                        );
+                        if (!ValueProvenance.eql(merged_dst, local_prov[dst_base])) {
+                            local_prov[dst_base] = merged_dst;
+                            has_prov_changed = true;
                         }
                     }
                 }
@@ -3920,10 +4228,19 @@ fn computeBodyProvenanceAndNllHorizon(
         }
     }
 
+    const block_ctx_alloc0_prov_out = try arena_alloc.alloc(ValueProvenance, block_count);
+    const block_ctx_alloc4_prov_out = try arena_alloc.alloc(ValueProvenance, block_count);
+    for (0..block_count) |b_i| {
+        block_ctx_alloc0_prov_out[b_i] = block_ctx_stack_out[b_i].resolveAllocProvForMask(0b01, val_prov);
+        block_ctx_alloc4_prov_out[b_i] = block_ctx_stack_out[b_i].resolveAllocProvForMask(0b10, val_prov);
+    }
+
     return .{
         .val_prov = val_prov,
         .local_prov = local_prov,
         .local_decl_depth = local_decl_depth,
+        .block_ctx_alloc0_prov_out = block_ctx_alloc0_prov_out,
+        .block_ctx_alloc4_prov_out = block_ctx_alloc4_prov_out,
         .loans = loan_list.items,
         .live_loans_in = live_loans_in,
         .live_loans_out = live_loans_out,
@@ -4041,13 +4358,467 @@ fn hasProvenanceCarrier(pool: *const InternPool, sym_table: *const SymbolTable, 
     return hasProvenanceCarrierBounded(pool, sym_table, val_ty, &type_system.NominalTypeSubst.EMPTY, 0);
 }
 
+/// Extracts the constant `Context` slot ordinal (`0..7`) from `extra_args[inst.operands.lhs]` (`null` otherwise).
+fn extractConstCtxSlotOrd(body: *const MirBody, inst: MirInst) ?u8 {
+    if (inst.operands.rhs == 0 or inst.operands.lhs >= body.extra_args.items.len) return null;
+    const slot_val = body.extra_args.items[inst.operands.lhs];
+    if (slot_val >= body.insts.len) return null;
+    const slot_inst = body.getInst(MirValueId.fromInt(slot_val));
+    if (slot_inst.op != .const_scalar or slot_inst.operands.lhs >= body.consts.items.len) return null;
+    const mc = body.consts.items[slot_inst.operands.lhs];
+    if (mc != .int_val or mc.int_val < 0 or mc.int_val > 7) return null;
+    return @intCast(mc.int_val);
+}
+
+/// Steps `cur_stack` across `ghost_ctx_region_push` / `ghost_ctx_region_pop` instructions (`SE-08`).
+fn stepCtxRegionInst(
+    body: *const MirBody,
+    inst: MirInst,
+    local_decl_depth: []const u16,
+    cur_stack: *CtxRegionStack,
+) void {
+    if (inst.op != .intrinsic_op) return;
+    const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+    if (ikind == .ghost_ctx_region_push) {
+        if (inst.operands.rhs < 2 or inst.operands.lhs + 2 > body.extra_args.items.len) return;
+        const slot_ord = extractConstCtxSlotOrd(body, inst) orelse 0;
+        const push_val = body.extra_args.items[inst.operands.lhs + 1];
+        var fallback_depth: u16 = DEPTH_LOCAL_REGION_BASE +| @as(u16, cur_stack.len);
+        var fallback_origin: LocalId = .none;
+
+        var cur_val = push_val;
+        var peel_steps: u8 = 0;
+        while (cur_val < body.insts.len and peel_steps < 8) : (peel_steps += 1) {
+            const cur_inst = body.getInst(MirValueId.fromInt(cur_val));
+            if (cur_inst.op == .copy_val) {
+                cur_val = cur_inst.operands.lhs;
+                continue;
+            }
+            if (cur_inst.op == .aggregate_make) {
+                const agg_kind: AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(cur_inst.aux_u16))));
+                if (agg_kind == .struct_agg and cur_inst.operands.rhs >= 1 and
+                    cur_inst.operands.lhs < body.extra_args.items.len)
+                {
+                    cur_val = body.extra_args.items[cur_inst.operands.lhs];
+                    continue;
+                }
+            }
+            if (cur_inst.op == .unary_op) {
+                const uop: UnaryOpKind = @fromBackingInt(@intCast(@as(u8, @truncate(cur_inst.aux_u16))));
+                if (uop == .ptr_cast or uop == .bitcast_op) {
+                    cur_val = cur_inst.operands.lhs;
+                    continue;
+                }
+            }
+            if ((cur_inst.op == .place_load or cur_inst.op == .place_addr) and
+                cur_inst.operands.lhs < body.places.items.len)
+            {
+                const base_loc = body.places.items[cur_inst.operands.lhs].base;
+                if (base_loc < local_decl_depth.len) {
+                    fallback_depth = @max(fallback_depth, local_decl_depth[base_loc]);
+                    fallback_origin = LocalId.fromInt(base_loc);
+                }
+            }
+            break;
+        }
+        cur_stack.push(.{
+            .slot_ord = slot_ord,
+            .push_val = push_val,
+            .fallback_depth = fallback_depth,
+            .fallback_origin = fallback_origin,
+        });
+    } else if (ikind == .ghost_ctx_region_pop) {
+        cur_stack.popSlot(extractConstCtxSlotOrd(body, inst) orelse 0);
+    }
+}
+
+/// Extracts a non-deref target `LocalId.asInt()` from a mutable call argument (`inout`, `set`, or `&mut local`).
+fn extractDirectMutLocalArg(
+    body: *const MirBody,
+    mode: ParamMode,
+    word: u32,
+    inst_count: usize,
+) ?u32 {
+    if (mode == .inout_mode or mode == .set_mode) {
+        if (word < body.places.items.len) {
+            const place_rec = body.places.items[word];
+            const projs = body.getPlaceProjections(PlaceId.fromInt(word));
+            if (projs.len == 0 or projs[0].kind != .deref) return place_rec.base;
+        }
+        return null;
+    }
+    if (word < inst_count) {
+        const arg_inst = body.getInst(MirValueId.fromInt(word));
+        if (arg_inst.op == .place_addr and arg_inst.operands.rhs != 0 and
+            arg_inst.operands.lhs < body.places.items.len)
+        {
+            const place_rec = body.places.items[arg_inst.operands.lhs];
+            const projs = body.getPlaceProjections(PlaceId.fromInt(arg_inst.operands.lhs));
+            if (projs.len == 0 or projs[0].kind != .deref) return place_rec.base;
+        }
+    }
+    return null;
+}
+
+/// Returns `true` if `type_id` (peeling `&` / `&mut`) is a `Context` `Allocator` handle.
+fn isAllocatorType(pool: *const InternPool, sym_table: *const SymbolTable, type_id: TypeId) bool {
+    if (type_id.isError()) return false;
+    var cur_ty = pool.unwrapUnderlyingType(type_id);
+    const cur_node = pool.getNode(cur_ty);
+    if (cur_node.tag == .ref_ty or cur_node.tag == .mut_ref_ty) {
+        cur_ty = pool.unwrapUnderlyingType(TypeId.fromInt(cur_node.lhs));
+    }
+    const base_node = pool.getNode(cur_ty);
+    if (base_node.tag != .struct_ty) return false;
+    const sym_idx = SymbolIndex.fromInt(base_node.rhs);
+    if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return false;
+    return std.mem.eql(u8, sym_table.getSymbol(sym_idx).name_text, "Allocator");
+}
+
+/// Returns `true` if call argument `(mode, word)` has `Allocator` type.
+fn isAllocatorArgPlaceOrVal(
+    body: *const MirBody,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    mode: ParamMode,
+    word: u32,
+) bool {
+    if (mode == .let_mode or mode == .sink_mode) {
+        if (word >= body.insts.len) return false;
+        return isAllocatorType(pool, sym_table, body.getInst(MirValueId.fromInt(word)).type_id);
+    }
+    if (word >= body.places.items.len) return false;
+    const base_loc = body.places.items[word].base;
+    if (base_loc >= body.locals.items.len) return false;
+    return isAllocatorType(pool, sym_table, body.locals.items[base_loc].type_id);
+}
+
+/// Bounded recursive check for whether `raw_val_ty` can carry borrowed views or `context.allocator`-backed heap storage.
+fn isContextAllocCarrierBounded(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    raw_val_ty: TypeId,
+    subst: *const type_system.NominalTypeSubst,
+    depth: u32,
+) bool {
+    const val_ty = subst.resolve(raw_val_ty);
+    if (val_ty.isError()) return false;
+    if (depth > 16) return true;
+    if (hasProvenanceCarrier(pool, sym_table, val_ty)) return true;
+    if (type_system.classifyOwnershipTier(pool, sym_table, val_ty) == .auto_drop_tier) return true;
+    const unwrapped = pool.unwrapUnderlyingType(val_ty);
+    const node = pool.getNode(unwrapped);
+    switch (node.tag) {
+        .raw_ptr_ty => return true,
+        .array_ty, .soa_array_ty, .optional_ty, .refined_ty => {
+            return isContextAllocCarrierBounded(pool, sym_table, TypeId.fromInt(node.lhs), subst, depth + 1);
+        },
+        .result_ty => {
+            return isContextAllocCarrierBounded(pool, sym_table, TypeId.fromInt(node.lhs), subst, depth + 1) or
+                isContextAllocCarrierBounded(pool, sym_table, TypeId.fromInt(node.rhs), subst, depth + 1);
+        },
+        .tuple_ty => {
+            for (pool.getTupleElements(unwrapped)) |elem_raw| {
+                if (isContextAllocCarrierBounded(pool, sym_table, TypeId.fromInt(elem_raw), subst, depth + 1)) {
+                    return true;
+                }
+            }
+            return false;
+        },
+        .struct_ty, .union_ty => {
+            const sym_idx = SymbolIndex.fromInt(node.rhs);
+            if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return false;
+            const sym = sym_table.getSymbol(sym_idx).*;
+            if (CONTEXT_ALLOC_CARRIER_NAME_MAP.has(sym.name_text)) return true;
+            if (sym.target_scope.isNone()) return false;
+            const child_subst = type_system.NominalTypeSubst.fromNominal(pool, sym_table, unwrapped, sym, subst);
+            const active_subst = if (child_subst.len > 0) &child_subst else subst;
+            for (sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
+                const mem_sym = sym_table.getSymbol(mem_idx).*;
+                if (mem_sym.kind != .field_sym) continue;
+                if (isContextAllocCarrierBounded(pool, sym_table, mem_sym.type_id, active_subst, depth + 1)) {
+                    return true;
+                }
+            }
+            return false;
+        },
+        .enum_ty => {
+            const sym_idx = SymbolIndex.fromInt(node.rhs);
+            if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return false;
+            const sym = sym_table.getSymbol(sym_idx).*;
+            if (sym.target_scope.isNone()) return false;
+            const child_subst = type_system.NominalTypeSubst.fromNominal(pool, sym_table, unwrapped, sym, subst);
+            const active_subst = if (child_subst.len > 0) &child_subst else subst;
+            for (sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
+                const mem_sym = sym_table.getSymbol(mem_idx).*;
+                if (mem_sym.kind != .enum_variant_sym) continue;
+                if (!mem_sym.type_id.isNone() and mem_sym.type_id != .unit_ty and
+                    isContextAllocCarrierBounded(pool, sym_table, mem_sym.type_id, active_subst, depth + 1))
+                {
+                    return true;
+                }
+                if (!mem_sym.target_scope.isNone()) {
+                    for (sym_table.getScopeMembers(mem_sym.target_scope)) |vf_idx| {
+                        const vf_sym = sym_table.getSymbol(vf_idx).*;
+                        if (vf_sym.kind != .field_sym) continue;
+                        if (isContextAllocCarrierBounded(pool, sym_table, vf_sym.type_id, active_subst, depth + 1)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
+/// Returns `true` if `val_ty` can carry borrowed views or `context.allocator`-backed heap allocations (`SE-08`).
+fn isContextAllocCarrier(pool: *const InternPool, sym_table: *const SymbolTable, val_ty: TypeId) bool {
+    return isContextAllocCarrierBounded(pool, sym_table, val_ty, &type_system.NominalTypeSubst.EMPTY, 0);
+}
+
+/// Bounded recursive check returning the 3-bit handle mask (`Logger`/`DiagSink`/`CancelToken`) carried by `raw_val_ty`.
+fn detectContextHandleCarrierMaskBounded(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    raw_val_ty: TypeId,
+    subst: *const type_system.NominalTypeSubst,
+    depth: u32,
+) u8 {
+    const val_ty = subst.resolve(raw_val_ty);
+    if (val_ty.isError()) return 0;
+    if (depth > 16) return 0b111;
+    const unwrapped = pool.unwrapUnderlyingType(val_ty);
+    const node = pool.getNode(unwrapped);
+    switch (node.tag) {
+        .ref_ty,
+        .mut_ref_ty,
+        .raw_ptr_ty,
+        .slice_ty,
+        .soa_slice_ty,
+        .array_ty,
+        .soa_array_ty,
+        .optional_ty,
+        .refined_ty,
+        => {
+            return detectContextHandleCarrierMaskBounded(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.lhs),
+                subst,
+                depth + 1,
+            );
+        },
+        .result_ty => {
+            return detectContextHandleCarrierMaskBounded(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.lhs),
+                subst,
+                depth + 1,
+            ) | detectContextHandleCarrierMaskBounded(
+                pool,
+                sym_table,
+                TypeId.fromInt(node.rhs),
+                subst,
+                depth + 1,
+            );
+        },
+        .tuple_ty => {
+            var mask: u8 = 0;
+            for (pool.getTupleElements(unwrapped)) |elem_raw| {
+                mask |= detectContextHandleCarrierMaskBounded(
+                    pool,
+                    sym_table,
+                    TypeId.fromInt(elem_raw),
+                    subst,
+                    depth + 1,
+                );
+            }
+            return mask;
+        },
+        .struct_ty, .union_ty => {
+            const sym_idx = SymbolIndex.fromInt(node.rhs);
+            if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return 0;
+            const sym = sym_table.getSymbol(sym_idx).*;
+            if (CONTEXT_HANDLE_CARRIER_MASK_MAP.get(sym.name_text)) |direct_mask| return direct_mask;
+            if (sym.target_scope.isNone()) return 0;
+            const child_subst = type_system.NominalTypeSubst.fromNominal(pool, sym_table, unwrapped, sym, subst);
+            const active_subst = if (child_subst.len > 0) &child_subst else subst;
+            var mask: u8 = 0;
+            for (sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
+                const mem_sym = sym_table.getSymbol(mem_idx).*;
+                if (mem_sym.kind != .field_sym) continue;
+                mask |= detectContextHandleCarrierMaskBounded(
+                    pool,
+                    sym_table,
+                    mem_sym.type_id,
+                    active_subst,
+                    depth + 1,
+                );
+            }
+            return mask;
+        },
+        .enum_ty => {
+            const sym_idx = SymbolIndex.fromInt(node.rhs);
+            if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return 0;
+            const sym = sym_table.getSymbol(sym_idx).*;
+            if (sym.target_scope.isNone()) return 0;
+            const child_subst = type_system.NominalTypeSubst.fromNominal(pool, sym_table, unwrapped, sym, subst);
+            const active_subst = if (child_subst.len > 0) &child_subst else subst;
+            var mask: u8 = 0;
+            for (sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
+                const mem_sym = sym_table.getSymbol(mem_idx).*;
+                if (mem_sym.kind != .enum_variant_sym) continue;
+                if (!mem_sym.type_id.isNone() and mem_sym.type_id != .unit_ty) {
+                    mask |= detectContextHandleCarrierMaskBounded(
+                        pool,
+                        sym_table,
+                        mem_sym.type_id,
+                        active_subst,
+                        depth + 1,
+                    );
+                }
+                if (!mem_sym.target_scope.isNone()) {
+                    for (sym_table.getScopeMembers(mem_sym.target_scope)) |vf_idx| {
+                        const vf_sym = sym_table.getSymbol(vf_idx).*;
+                        if (vf_sym.kind != .field_sym) continue;
+                        mask |= detectContextHandleCarrierMaskBounded(
+                            pool,
+                            sym_table,
+                            vf_sym.type_id,
+                            active_subst,
+                            depth + 1,
+                        );
+                    }
+                }
+            }
+            return mask;
+        },
+        else => return 0,
+    }
+}
+
+/// Returns a 3-bit mask (`bit 0` = `Logger`, `bit 1` = `DiagSink`, `bit 2` = `CancelToken`) carried by `val_ty`.
+fn detectContextHandleCarrierMask(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    val_ty: TypeId,
+    depth: u32,
+) u8 {
+    return detectContextHandleCarrierMaskBounded(pool, sym_table, val_ty, &type_system.NominalTypeSubst.EMPTY, depth);
+}
+
+/// Inspects `place_id` to detect `Context.allocator` (`0b01`) or `Context.temp_allocator` (`0b10`) access.
+fn detectContextAllocSlotPlace(
+    body: *const MirBody,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    place_id: PlaceId,
+) u2 {
+    if (place_id.asInt() >= body.places.items.len) return 0;
+    const pl_rec = body.places.items[place_id.asInt()];
+    if (pl_rec.base >= body.locals.items.len) return 0;
+    if (!type_system.isContextType(pool, sym_table, body.locals.items[pl_rec.base].type_id)) return 0;
+    for (body.getPlaceProjections(place_id)) |proj| {
+        if (proj.kind == .field) {
+            if (proj.payload == 0) return 0b01;
+            if (proj.payload == 4) return 0b10;
+            break;
+        }
+    }
+    return 0;
+}
+
+/// Returns the allocator slot mask (`0b01` = `slot 0`, `0b10` = `slot 4`) directly read by `inst`.
+fn detectInstCtxAllocSlotRead(
+    body: *const MirBody,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    inst: MirInst,
+) u2 {
+    switch (inst.op) {
+        .place_load, .place_addr => {
+            return detectContextAllocSlotPlace(body, pool, sym_table, PlaceId.fromInt(inst.operands.lhs));
+        },
+        .aggregate_make => {
+            const agg_k: AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+            if (agg_k == .str_concat and inst.operands.rhs > 0) return 0b01;
+            return 0;
+        },
+        .intrinsic_op => {
+            if (@as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)) == .ctx_get) {
+                if (extractConstCtxSlotOrd(body, inst)) |slot_ord| {
+                    if (slot_ord == 0) {
+                        return 0b01;
+                    } else if (slot_ord == 4) {
+                        return 0b10;
+                    }
+                }
+            }
+            return 0;
+        },
+        else => return 0,
+    }
+}
+
+/// Resolves which `Context` allocator slots (`0b01` = `allocator`, `0b10` = `temp_allocator`) `call_site` may draw from.
+fn resolveCallCtxAllocSlotMask(
+    body: *const MirBody,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    call_site: mir.MirCallSite,
+    callee_sum_opt: ?FnRegionSummary,
+) u2 {
+    if (!hasCallCtxAllocEffect(call_site, callee_sum_opt, sym_table)) return 0;
+    if (callee_sum_opt) |csum| {
+        return csum.contractsScratch().ctx_alloc_slot_mask;
+    }
+    if (call_site.args_len > 0) {
+        const mode0 = body.call_arg_modes.items[call_site.modes_start];
+        const word0 = body.extra_args.items[call_site.args_start];
+        if (isArenaArgPlaceOrVal(body, pool, sym_table, mode0, word0) or
+            isAllocatorArgPlaceOrVal(body, pool, sym_table, mode0, word0))
+        {
+            return 0;
+        }
+    }
+    if (call_site.direct_def_id.isNone() and call_site.direct_symbol.isNone()) {
+        return 0b11;
+    }
+    return 0b01;
+}
+
+/// Returns `true` if `call_site` may allocate via the implicit `context` allocator (`!is_callee_contextless` & `!@no_alloc`).
+fn hasCallCtxAllocEffect(
+    call_site: mir.MirCallSite,
+    callee_sum_opt: ?FnRegionSummary,
+    sym_table: *const SymbolTable,
+) bool {
+    if (call_site.is_callee_contextless) return false;
+    if (callee_sum_opt) |csum| {
+        if (csum.contractsScratch().has_no_alloc) return false;
+    }
+    if (!call_site.direct_symbol.isNone() and call_site.direct_symbol.asInt() < sym_table.symbols.items.len) {
+        const sym = sym_table.getSymbol(call_site.direct_symbol).*;
+        if (sym.contract_flags.is_no_alloc) return false;
+        if (ARENA_LIFECYCLE_METHOD_MAP.has(sym.name_text) or
+            EXPLICIT_FREE_METHOD_MAP.has(sym.name_text) or
+            SCRATCH_RESET_METHOD_MAP.has(sym.name_text))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// Returns `true` if `call_site` invokes a scratch reset/rewind method.
 fn isScratchResetCall(sym_table: *const SymbolTable, call_site: mir.MirCallSite) bool {
     if (call_site.direct_symbol.isNone() or call_site.direct_symbol.asInt() >= sym_table.symbols.items.len) {
         return false;
     }
-    const name = sym_table.getSymbol(call_site.direct_symbol).name_text;
-    return SCRATCH_RESET_METHOD_MAP.has(name);
+    return SCRATCH_RESET_METHOD_MAP.has(sym_table.getSymbol(call_site.direct_symbol).name_text);
 }
 
 /// Returns `true` if `call_site` is a `scratch_scope` ping-pong selector helper.
@@ -4055,8 +4826,7 @@ fn isScratchScopeHelperCall(sym_table: *const SymbolTable, call_site: mir.MirCal
     if (call_site.direct_symbol.isNone() or call_site.direct_symbol.asInt() >= sym_table.symbols.items.len) {
         return false;
     }
-    const name = sym_table.getSymbol(call_site.direct_symbol).name_text;
-    return SCRATCH_SELECT_METHOD_MAP.has(name);
+    return SCRATCH_SELECT_METHOD_MAP.has(sym_table.getSymbol(call_site.direct_symbol).name_text);
 }
 
 /// Returns `true` if call argument `(mode, word)` has `Arena` or `BumpArena` type.
@@ -4164,11 +4934,13 @@ fn convergeRecursiveSccSummaries(
             var cur_contracts = summaries[slot_idx].contractsScratch();
             var next_touch: u2 = cur_contracts.scratch_touch_mask;
             var next_rewind: u2 = cur_contracts.scratch_rewind_mask;
+            var next_alloc_slots: u2 = cur_contracts.ctx_alloc_slot_mask;
 
             for (dom.rpo_blocks) |bb_idx| {
                 const bb_id = MirBlockId.fromInt(bb_idx);
                 for (body.getBlockInsts(bb_id)) |inst_val| {
                     const inst = body.getInst(inst_val);
+                    next_alloc_slots |= detectInstCtxAllocSlotRead(body, pool, sym_table, inst);
                     if (inst.op == .place_addr or inst.op == .soa_column_slice or
                         inst.op == .place_load or inst.op == .place_store)
                     {
@@ -4239,6 +5011,14 @@ fn convergeRecursiveSccSummaries(
                         sym_to_slot,
                         config,
                     );
+                    if (callee_opt) |csum| {
+                        next_alloc_slots |= csum.contractsScratch().ctx_alloc_slot_mask;
+                    } else if (hasCallCtxAllocEffect(call_site, null, sym_table)) {
+                        next_alloc_slots |= if (call_site.direct_def_id.isNone() and call_site.direct_symbol.isNone())
+                            0b11
+                        else
+                            0b01;
+                    }
                     for (0..call_site.args_len) |arg_i| {
                         const mode = body.call_arg_modes.items[call_site.modes_start + arg_i];
                         const word = body.extra_args.items[call_site.args_start + arg_i];
@@ -4278,13 +5058,15 @@ fn convergeRecursiveSccSummaries(
                 next_flow_mat != summaries[slot_idx].param_flow_matrix or
                 next_glob_esc != summaries[slot_idx].global_escape_mask or
                 next_touch != cur_contracts.scratch_touch_mask or
-                next_rewind != cur_contracts.scratch_rewind_mask)
+                next_rewind != cur_contracts.scratch_rewind_mask or
+                next_alloc_slots != cur_contracts.ctx_alloc_slot_mask)
             {
                 summaries[slot_idx].ret_provenance_mask = next_ret_mask;
                 summaries[slot_idx].param_flow_matrix = next_flow_mat;
                 summaries[slot_idx].global_escape_mask = next_glob_esc;
                 cur_contracts.scratch_touch_mask = next_touch;
                 cur_contracts.scratch_rewind_mask = next_rewind;
+                cur_contracts.ctx_alloc_slot_mask = next_alloc_slots;
                 summaries[slot_idx].setContractsScratch(cur_contracts);
                 has_any_changed = true;
             }
@@ -4831,7 +5613,7 @@ fn applyCallStateTransitionSilent(
     const arg0_mode = body.call_arg_modes.items[call_site.modes_start];
     const arg0_word = body.extra_args.items[call_site.args_start];
 
-    // `PoolAllocator::free(&mut pool, ptr)` marks `ptr` (`arg 1`) freed:
+    // `PoolAllocator.free(&mut pool, ptr)` marks `ptr` (`arg 1`) freed:
     if (call_site.args_len >= 2 and isPoolArgPlaceOrVal(body, pool, sym_table, arg0_mode, arg0_word)) {
         const ptr_mode = body.call_arg_modes.items[call_site.modes_start + 1];
         const ptr_word = body.extra_args.items[call_site.args_start + 1];
@@ -5442,6 +6224,7 @@ fn runPass2TypestateNllAndDrops(
     var cur_contracts = summary.contractsScratch();
     var scratch_touch: u2 = cur_contracts.scratch_touch_mask;
     var scratch_rewind: u2 = cur_contracts.scratch_rewind_mask;
+    var ctx_alloc_slots: u2 = cur_contracts.ctx_alloc_slot_mask;
 
     for (dom.rpo_blocks) |bb_idx| {
         const bb_id = MirBlockId.fromInt(bb_idx);
@@ -5473,6 +6256,7 @@ fn runPass2TypestateNllAndDrops(
             const tok = body.origin_tokens.items[val_idx];
             const inst_span = resolveTokenSpan(body.file_id, tok, eff_config, decl_fallback_span);
             if (inst.flags.is_unsafe) outcome.has_unsafe_op = true;
+            ctx_alloc_slots |= detectInstCtxAllocSlotRead(body, pool, sym_table, inst);
 
             // Check raw-pointer dereference safety (`*raw_ptr`) on place operations:
             if (inst.op == .place_load or inst.op == .place_store or
@@ -6154,7 +6938,9 @@ fn runPass2TypestateNllAndDrops(
                         if (inst.operands.rhs < horizon.val_prov.len and pl_rec.base < local_count) {
                             const rhs_prov = horizon.val_prov[inst.operands.rhs];
                             const rhs_ty = body.getInst(MirValueId.fromInt(inst.operands.rhs)).type_id;
-                            if (hasProvenanceCarrier(pool, sym_table, rhs_ty)) {
+                            const has_prov_or_ctx = hasProvenanceCarrier(pool, sym_table, rhs_ty) or
+                                (rhs_prov.max_depth >= DEPTH_FN_FRAME and isContextAllocCarrier(pool, sym_table, rhs_ty));
+                            if (has_prov_or_ctx) {
                                 const is_outer_ref_write = has_leading_deref or
                                     (pl_rec.base >= 1 and pl_rec.base <= body.param_count and
                                         (body.locals.items[pl_rec.base].mode() == .inout_mode or
@@ -6163,15 +6949,23 @@ fn runPass2TypestateNllAndDrops(
                                 const is_closure_store = !unwrapped_rhs.isError() and
                                     (pool.getNode(unwrapped_rhs).tag == .closure_ty or
                                         pool.getNode(unwrapped_rhs).tag == .fn_ty);
+                                const has_synth_same_depth_escape = body.local_scope_depths.items.len != local_count and
+                                    rhs_prov.max_depth == horizon.local_decl_depth[pl_rec.base] and
+                                    rhs_prov.max_depth >= DEPTH_LOCAL_REGION_BASE and
+                                    !rhs_prov.origin_local.isNone() and
+                                    pl_rec.base < rhs_prov.origin_local.asInt();
                                 const is_unloaned_local_escape = !has_leading_deref and pl_rec.base != 0 and
                                     (rhs_prov.loan_mask.isEmpty() or is_closure_store) and
-                                    rhs_prov.max_depth > horizon.local_decl_depth[pl_rec.base];
+                                    (rhs_prov.max_depth > horizon.local_decl_depth[pl_rec.base] or
+                                        has_synth_same_depth_escape);
                                 if (is_outer_ref_write or is_unloaned_local_escape) {
                                     const dst_depth = if (has_leading_deref)
                                         @min(horizon.local_decl_depth[pl_rec.base], horizon.local_prov[pl_rec.base].min_target_depth)
                                     else
                                         horizon.local_decl_depth[pl_rec.base];
-                                    if (rhs_prov.max_depth > dst_depth and !has_reported_path_diag[pl_rec.base]) {
+                                    if ((rhs_prov.max_depth > dst_depth or has_synth_same_depth_escape) and
+                                        !has_reported_path_diag[pl_rec.base])
+                                    {
                                         has_reported_path_diag[pl_rec.base] = true;
                                         outcome.emitted_error_count += 1;
                                         try emitSastDiag(
@@ -6179,11 +6973,11 @@ fn runPass2TypestateNllAndDrops(
                                             .e0306_region_escape_violation,
                                             .err,
                                             inst_span,
-                                            "inner-region reference or view cannot escape into outer reference/parameter",
+                                            "inner-region reference, view, or scoped `with context` allocation cannot escape",
                                             "value with shorter lifetime stored into longer-lived target here",
                                             null,
                                             null,
-                                            "allocate in the destination's arena or avoid storing local references into outer slots",
+                                            "allocate in the destination's arena or avoid storing scoped values into outer slots",
                                         );
                                     }
                                 }
@@ -6367,6 +7161,37 @@ fn runPass2TypestateNllAndDrops(
                         "return an owned value (`Vec`, `String`) or accept a caller `inout Arena` parameter",
                     );
                 }
+            } else if (ret_prov.max_depth >= DEPTH_FN_FRAME and
+                isContextAllocCarrier(pool, sym_table, body.ret_ty) and
+                !has_reported_path_diag[0])
+            {
+                has_reported_path_diag[0] = true;
+                outcome.emitted_error_count += 1;
+                const sec_origin: ?LabeledSpan = if (!ret_prov.origin_local.isNone() and
+                    ret_prov.origin_local.asInt() < local_count)
+                    .{
+                        .span = resolveTokenSpan(
+                            body.file_id,
+                            body.locals.items[ret_prov.origin_local.asInt()].origin_token,
+                            eff_config,
+                            ret_span,
+                        ),
+                        .label = "scoped `with context` allocator originates here",
+                        .style = .secondary,
+                    }
+                else
+                    null;
+                try emitSastDiag(
+                    eff_config.diagnostic_sink,
+                    .e0306_region_escape_violation,
+                    .err,
+                    ret_span,
+                    "cannot return heap-allocated value tied to a scoped `with context` allocator",
+                    "scoped `with context` allocation escapes function frame on `return` here",
+                    sec_origin,
+                    null,
+                    "allocate in the caller's `context.allocator` outside `with`, or consume the value inside `with`",
+                );
             }
 
             // [b] Check formal parameters (`inout`/`&mut` re-init, `set` normal-return init, `sink` `@linear` & `AutoDrop` drops):
@@ -6587,6 +7412,94 @@ fn runPass2TypestateNllAndDrops(
                 );
             }
 
+            // [c.2] Scoped `with context` allocator mutation escape into outer/deref containers (`SE-08` `E0306`):
+            const call_alloc_mask = resolveCallCtxAllocSlotMask(body, pool, sym_table, call_site, callee_opt);
+            ctx_alloc_slots |= call_alloc_mask;
+            if (call_alloc_mask != 0 and bb_idx < horizon.block_ctx_alloc0_prov_out.len) {
+                var active_max_depth: u16 = 0;
+                if ((call_alloc_mask & 0b01) != 0) {
+                    active_max_depth = @max(active_max_depth, horizon.block_ctx_alloc0_prov_out[bb_idx].max_depth);
+                }
+                if ((call_alloc_mask & 0b10) != 0 and bb_idx < horizon.block_ctx_alloc4_prov_out.len) {
+                    active_max_depth = @max(active_max_depth, horizon.block_ctx_alloc4_prov_out[bb_idx].max_depth);
+                }
+                if (active_max_depth >= DEPTH_FN_FRAME) {
+                    for (0..call_site.args_len) |arg_i| {
+                        const mode = body.call_arg_modes.items[call_site.modes_start + arg_i];
+                        const word = body.extra_args.items[call_site.args_start + arg_i];
+                        var dst_depth_opt: ?u16 = null;
+                        var diag_slot_opt: ?usize = null;
+
+                        if ((mode == .inout_mode or mode == .set_mode) and word < body.places.items.len) {
+                            const pl_rec = body.places.items[word];
+                            if (pl_rec.base < local_count) {
+                                const base_ty = body.locals.items[pl_rec.base].type_id;
+                                if (!isArenaType(pool, sym_table, base_ty) and
+                                    !type_system.isContextType(pool, sym_table, base_ty) and
+                                    isContextAllocCarrier(pool, sym_table, base_ty))
+                                {
+                                    const projs = body.getPlaceProjections(PlaceId.fromInt(word));
+                                    const has_deref = projs.len > 0 and projs[0].kind == .deref;
+                                    dst_depth_opt = if (has_deref)
+                                        @min(
+                                            horizon.local_decl_depth[pl_rec.base],
+                                            horizon.local_prov[pl_rec.base].min_target_depth,
+                                        )
+                                    else
+                                        horizon.local_decl_depth[pl_rec.base];
+                                    diag_slot_opt = pl_rec.base;
+                                }
+                            }
+                        } else if (mode == .let_mode and word < horizon.val_prov.len) {
+                            const arg_ty = pool.unwrapUnderlyingType(
+                                body.getInst(MirValueId.fromInt(word)).type_id,
+                            );
+                            if (!arg_ty.isError() and pool.getNode(arg_ty).tag == .mut_ref_ty and
+                                !isArenaType(pool, sym_table, arg_ty) and
+                                !type_system.isContextType(pool, sym_table, arg_ty))
+                            {
+                                const inner_ty = TypeId.fromInt(pool.getNode(arg_ty).lhs);
+                                if (isContextAllocCarrier(pool, sym_table, inner_ty)) {
+                                    dst_depth_opt = horizon.val_prov[word].min_target_depth;
+                                    diag_slot_opt = if (extractArgBaseLocal(body, mode, word)) |arg_base|
+                                        @as(usize, arg_base)
+                                    else
+                                        null;
+                                }
+                            }
+                        }
+
+                        if (dst_depth_opt) |dst_depth| {
+                            if (active_max_depth > dst_depth) {
+                                const is_already_reported = if (diag_slot_opt) |diag_slot|
+                                    diag_slot < has_reported_path_diag.len and has_reported_path_diag[diag_slot]
+                                else
+                                    false;
+                                if (!is_already_reported) {
+                                    if (diag_slot_opt) |diag_slot| {
+                                        if (diag_slot < has_reported_path_diag.len) {
+                                            has_reported_path_diag[diag_slot] = true;
+                                        }
+                                    }
+                                    outcome.emitted_error_count += 1;
+                                    try emitSastDiag(
+                                        eff_config.diagnostic_sink,
+                                        .e0306_region_escape_violation,
+                                        .err,
+                                        call_span,
+                                        "mutating outer container inside `with context` leaks scoped arena/allocator memory",
+                                        "outer container may reallocate using scoped `with context` allocator here",
+                                        null,
+                                        null,
+                                        "pre-reserve or mutate the outer container outside the `with context` block",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // [d] Explicit free / duplicate `@linear` close check (`E0313`):
             try checkAndApplyCallFreeDiagnostics(
                 body,
@@ -6605,6 +7518,7 @@ fn runPass2TypestateNllAndDrops(
 
     cur_contracts.scratch_touch_mask = scratch_touch;
     cur_contracts.scratch_rewind_mask = scratch_rewind;
+    cur_contracts.ctx_alloc_slot_mask = ctx_alloc_slots;
     summary.setContractsScratch(cur_contracts);
     summaries[slot_idx] = summary;
 
@@ -8098,6 +9012,7 @@ fn readDomRefinedIntv(
     local_overrides: []const ?Intv,
     slice_len_overrides: []const ?Intv,
     local_store_counts: []const u32,
+    slice_len_store_counts: []const u32,
 ) Intv {
     if (val_raw >= val_intv.len) return Intv.TOP_ORD;
     const peeled = peelCopyValId(body, val_raw);
@@ -8115,7 +9030,7 @@ fn readDomRefinedIntv(
     }
     if (extractLoadedPlaceKey(body, peeled)) |pkey| {
         if (pkey.isSliceLen() and pkey.base_local < slice_len_overrides.len and
-            local_store_counts[pkey.base_local] <= 1)
+            slice_len_store_counts[pkey.base_local] <= 1)
         {
             if (slice_len_overrides[pkey.base_local]) |sl_ov| {
                 cur_iv = cur_iv.meet(sl_ov);
@@ -8138,6 +9053,17 @@ fn hasPlaceDerefProjection(body: *const MirBody, place_id: PlaceId) bool {
         if (proj.kind == .deref) return true;
     }
     return false;
+}
+
+/// Returns `true` when `place_id` projects into an array/slice element (`.index` / `.soa_elem`) without mutating `.slice_len`.
+fn hasPlaceElementIndexProjection(body: *const MirBody, place_id: PlaceId) bool {
+    if (place_id.isNone() or place_id.asInt() >= body.places.items.len) return false;
+    var has_elem_idx = false;
+    for (body.getPlaceProjections(place_id)) |proj| {
+        if (proj.kind == .slice_len) return false;
+        if (proj.kind == .index or proj.kind == .soa_elem) has_elem_idx = true;
+    }
+    return has_elem_idx;
 }
 
 /// Invalidates intra-block `local_overrides` / `slice_len_overrides` for every mutably address-taken local.
@@ -8163,6 +9089,7 @@ fn populateBlockDomOverrides(
     val_domains: []const ?ScalarIntDomain,
     val_intv: []const Intv,
     local_store_counts: []const u32,
+    slice_len_store_counts: []const u32,
     val_overrides: []?Intv,
     local_overrides: []?Intv,
     slice_len_overrides: []?Intv,
@@ -8207,6 +9134,7 @@ fn populateBlockDomOverrides(
                         local_overrides,
                         slice_len_overrides,
                         local_store_counts,
+                        slice_len_store_counts,
                     );
                     const base_r = readDomRefinedIntv(
                         body,
@@ -8216,6 +9144,7 @@ fn populateBlockDomOverrides(
                         local_overrides,
                         slice_len_overrides,
                         local_store_counts,
+                        slice_len_store_counts,
                     );
                     const refined = refineIntvPairFromCmp(cmp, base_l, base_r, cdom);
                     val_overrides[cmp.lhs_val] = if (val_overrides[cmp.lhs_val]) |prev|
@@ -8231,7 +9160,7 @@ fn populateBlockDomOverrides(
                         const is_immut_len = (lkey.kind == .direct_slice_len) or
                             (lkey.kind == .deref_slice_len and isSharedRefLocal(body, pool, lkey.base_local));
                         if (is_immut_len and lkey.base_local < local_count and
-                            local_store_counts[lkey.base_local] <= 1)
+                            slice_len_store_counts[lkey.base_local] <= 1)
                         {
                             slice_len_overrides[lkey.base_local] = if (slice_len_overrides[lkey.base_local]) |prev|
                                 prev.meet(refined.lhs_out)
@@ -8250,7 +9179,7 @@ fn populateBlockDomOverrides(
                         const is_immut_len = (rkey.kind == .direct_slice_len) or
                             (rkey.kind == .deref_slice_len and isSharedRefLocal(body, pool, rkey.base_local));
                         if (is_immut_len and rkey.base_local < local_count and
-                            local_store_counts[rkey.base_local] <= 1)
+                            slice_len_store_counts[rkey.base_local] <= 1)
                         {
                             slice_len_overrides[rkey.base_local] = if (slice_len_overrides[rkey.base_local]) |prev|
                                 prev.meet(refined.rhs_out)
@@ -8340,6 +9269,23 @@ const PendingBceCheck = struct {
     /// `.bounds_check` or `.slice_range_check`.
     kind: MirIntrinsicKind,
 };
+
+/// Unproven `$ - expr` (`is_dollar_sub`) checked subtraction queued from Step 1 `Intv` into Step 2 Pentagon (`SE-04`).
+const PendingDollarSub = struct {
+    /// Owning basic block index.
+    bb_idx: u32,
+    /// `MirValueId` of the `.bin_op` `.usub_checked` instruction.
+    inst_val: MirValueId,
+};
+
+/// Rewrites a proven non-underflowing `is_dollar_sub` `.usub_checked` in-place into non-trapping `.sub_wrap`.
+fn rewriteProvenDollarSubInPlace(body: *MirBody, inst_val: MirValueId) void {
+    var inst = body.getInst(inst_val);
+    inst.aux_u16 = @backingInt(BinOpKind.sub_wrap);
+    inst.flags.has_trap_risk = false;
+    inst.flags.is_dollar_sub = true;
+    body.insts.set(inst_val.asInt(), inst);
+}
 
 /// Rewrites a proven `bounds_check` or `slice_range_check` in-place into `const_scalar(.unit_val)`.
 fn rewriteProvenBoundsCheckInPlace(body: *MirBody, inst_val: MirValueId, unit_const_idx: u32) void {
@@ -8459,6 +9405,8 @@ fn runPass4IntervalsAndPentagonBce(
 
     const local_store_counts = try arena_alloc.alloc(u32, local_count);
     @memset(local_store_counts, 0);
+    const slice_len_store_counts = try arena_alloc.alloc(u32, local_count);
+    @memset(slice_len_store_counts, 0);
     const local_unique_val = try arena_alloc.alloc(u32, local_count);
     @memset(local_unique_val, mir.NONE_U32);
     const local_unique_bb = try arena_alloc.alloc(u32, local_count);
@@ -8471,6 +9419,7 @@ fn runPass4IntervalsAndPentagonBce(
         const loc = body.locals.items[loc_i];
         if (loc.flags().is_arg and loc.mode() != .set_mode) {
             local_store_counts[loc_i] = 1;
+            slice_len_store_counts[loc_i] = 1;
         }
     }
 
@@ -8479,9 +9428,13 @@ fn runPass4IntervalsAndPentagonBce(
         for (body.getBlockInsts(MirBlockId.fromInt(b_u32))) |inst_vid| {
             const inst = body.getInst(inst_vid);
             if (inst.op == .place_store and inst.operands.lhs < body.places.items.len) {
+                const pl_id = PlaceId.fromInt(inst.operands.lhs);
                 const pl_rec = body.places.items[inst.operands.lhs];
                 if (pl_rec.base < local_count) {
                     local_store_counts[pl_rec.base] +|= 1;
+                    if (!hasPlaceElementIndexProjection(body, pl_id)) {
+                        slice_len_store_counts[pl_rec.base] +|= 1;
+                    }
                     if (pl_rec.proj_len == 0 and local_store_counts[pl_rec.base] == 1) {
                         local_unique_val[pl_rec.base] = inst.operands.rhs;
                         local_unique_bb[pl_rec.base] = b_u32;
@@ -8491,19 +9444,27 @@ fn runPass4IntervalsAndPentagonBce(
                     }
                 }
             } else if (inst.op == .place_set_discrim and inst.operands.lhs < body.places.items.len) {
+                const pl_id = PlaceId.fromInt(inst.operands.lhs);
                 const base = body.places.items[inst.operands.lhs].base;
                 if (base < local_count) {
                     local_store_counts[base] +|= 1;
+                    if (!hasPlaceElementIndexProjection(body, pl_id)) {
+                        slice_len_store_counts[base] +|= 1;
+                    }
                     local_unique_val[base] = mir.NONE_U32;
                     local_unique_bb[base] = mir.NONE_U32;
                 }
             } else if (inst.op == .place_addr and inst.operands.lhs < body.places.items.len) {
                 const unwrapped = pool.unwrapUnderlyingType(inst.type_id);
                 if (!unwrapped.isError() and pool.getNode(unwrapped).tag != .ref_ty) {
+                    const pl_id = PlaceId.fromInt(inst.operands.lhs);
                     const base = body.places.items[inst.operands.lhs].base;
                     if (base < local_count) {
-                        has_mut_addr_taken[base] = true;
                         local_store_counts[base] = 2;
+                        if (!hasPlaceElementIndexProjection(body, pl_id)) {
+                            has_mut_addr_taken[base] = true;
+                            slice_len_store_counts[base] = 2;
+                        }
                         local_unique_val[base] = mir.NONE_U32;
                         local_unique_bb[base] = mir.NONE_U32;
                     }
@@ -8513,9 +9474,13 @@ fn runPass4IntervalsAndPentagonBce(
                 if ((ikind == .zero_pad or ikind == .drop_in_place or ikind == .drop_if_live) and
                     inst.operands.lhs < body.places.items.len)
                 {
+                    const pl_id = PlaceId.fromInt(inst.operands.lhs);
                     const base = body.places.items[inst.operands.lhs].base;
                     if (base < local_count) {
                         local_store_counts[base] +|= 1;
+                        if (!hasPlaceElementIndexProjection(body, pl_id)) {
+                            slice_len_store_counts[base] +|= 1;
+                        }
                         local_unique_val[base] = mir.NONE_U32;
                         local_unique_bb[base] = mir.NONE_U32;
                     }
@@ -8528,9 +9493,13 @@ fn runPass4IntervalsAndPentagonBce(
             const mode = body.call_arg_modes.items[call_site.modes_start + arg_i];
             const word = body.extra_args.items[call_site.args_start + arg_i];
             if ((mode == .inout_mode or mode == .set_mode) and word < body.places.items.len) {
+                const pl_id = PlaceId.fromInt(word);
                 const base = body.places.items[word].base;
                 if (base < local_count) {
                     local_store_counts[base] = 2;
+                    if (!hasPlaceElementIndexProjection(body, pl_id)) {
+                        slice_len_store_counts[base] = 2;
+                    }
                     local_unique_val[base] = mir.NONE_U32;
                     local_unique_bb[base] = mir.NONE_U32;
                 }
@@ -8667,6 +9636,7 @@ fn runPass4IntervalsAndPentagonBce(
                 val_domains,
                 val_intv,
                 local_store_counts,
+                slice_len_store_counts,
                 val_overrides,
                 local_overrides,
                 slice_len_overrides,
@@ -8693,6 +9663,7 @@ fn runPass4IntervalsAndPentagonBce(
                             local_overrides,
                             slice_len_overrides,
                             local_store_counts,
+                            slice_len_store_counts,
                         );
                     },
                     .place_load => {
@@ -8701,7 +9672,7 @@ fn runPass4IntervalsAndPentagonBce(
                             new_iv = Intv.initUnsigned(arr_len, arr_len);
                         } else if (extractLoadedPlaceKey(body, v_idx)) |pkey| {
                             if (pkey.isSliceLen() and pkey.base_local < local_count and
-                                local_store_counts[pkey.base_local] <= 1)
+                                slice_len_store_counts[pkey.base_local] <= 1)
                             {
                                 if (slice_len_overrides[pkey.base_local]) |sl_ov| {
                                     new_iv = new_iv.meet(sl_ov);
@@ -8721,6 +9692,7 @@ fn runPass4IntervalsAndPentagonBce(
                                         local_overrides,
                                         slice_len_overrides,
                                         local_store_counts,
+                                        slice_len_store_counts,
                                     );
                                 }
                                 if (local_overrides[pkey.base_local]) |loc_ov| {
@@ -8742,7 +9714,9 @@ fn runPass4IntervalsAndPentagonBce(
                             const pl_rec = body.places.items[inst.operands.lhs];
                             if (pl_rec.base < local_count) {
                                 local_overrides[pl_rec.base] = null;
-                                slice_len_overrides[pl_rec.base] = null;
+                                if (!hasPlaceElementIndexProjection(body, pl_id)) {
+                                    slice_len_overrides[pl_rec.base] = null;
+                                }
                                 if (pl_rec.proj_len == 0 and inst.operands.rhs < inst_count) {
                                     local_overrides[pl_rec.base] = readDomRefinedIntv(
                                         body,
@@ -8752,6 +9726,7 @@ fn runPass4IntervalsAndPentagonBce(
                                         local_overrides,
                                         slice_len_overrides,
                                         local_store_counts,
+                                        slice_len_store_counts,
                                     );
                                 }
                             }
@@ -8770,7 +9745,9 @@ fn runPass4IntervalsAndPentagonBce(
                             const base = body.places.items[inst.operands.lhs].base;
                             if (base < local_count) {
                                 local_overrides[base] = null;
-                                slice_len_overrides[base] = null;
+                                if (!hasPlaceElementIndexProjection(body, pl_id)) {
+                                    slice_len_overrides[base] = null;
+                                }
                             }
                         }
                     },
@@ -8778,10 +9755,13 @@ fn runPass4IntervalsAndPentagonBce(
                         if (inst.operands.lhs < body.places.items.len) {
                             const unwrapped = pool.unwrapUnderlyingType(inst.type_id);
                             if (!unwrapped.isError() and pool.getNode(unwrapped).tag != .ref_ty) {
+                                const pl_id = PlaceId.fromInt(inst.operands.lhs);
                                 const base = body.places.items[inst.operands.lhs].base;
                                 if (base < local_count) {
                                     local_overrides[base] = null;
-                                    slice_len_overrides[base] = null;
+                                    if (!hasPlaceElementIndexProjection(body, pl_id)) {
+                                        slice_len_overrides[base] = null;
+                                    }
                                 }
                             }
                         }
@@ -8796,6 +9776,7 @@ fn runPass4IntervalsAndPentagonBce(
                             local_overrides,
                             slice_len_overrides,
                             local_store_counts,
+                            slice_len_store_counts,
                         );
                         const src_dom = if (inst.operands.lhs < inst_count) val_domains[inst.operands.lhs] else null;
                         new_iv = evalUnaryOpIntv(uk, src_iv, src_dom, dst_dom_opt);
@@ -8810,6 +9791,7 @@ fn runPass4IntervalsAndPentagonBce(
                             local_overrides,
                             slice_len_overrides,
                             local_store_counts,
+                            slice_len_store_counts,
                         );
                         const rhs_iv = readDomRefinedIntv(
                             body,
@@ -8819,6 +9801,7 @@ fn runPass4IntervalsAndPentagonBce(
                             local_overrides,
                             slice_len_overrides,
                             local_store_counts,
+                            slice_len_store_counts,
                         );
                         const l_dom = if (inst.operands.lhs < inst_count) val_domains[inst.operands.lhs] else null;
                         const r_dom = if (inst.operands.rhs < inst_count) val_domains[inst.operands.rhs] else null;
@@ -8884,6 +9867,7 @@ fn runPass4IntervalsAndPentagonBce(
                                             local_overrides,
                                             slice_len_overrides,
                                             local_store_counts,
+                                            slice_len_store_counts,
                                         );
                                         if (!src_iv.isBottom()) {
                                             const sb = decodeIntvToI128(src_iv, sd);
@@ -8921,6 +9905,7 @@ fn runPass4IntervalsAndPentagonBce(
                     local_overrides,
                     slice_len_overrides,
                     local_store_counts,
+                    slice_len_store_counts,
                 );
                 const then_dst = body.extra_edges.items[term.edge_start].target_bb.asInt();
                 const else_dst = body.extra_edges.items[term.edge_start + 1].target_bb.asInt();
@@ -8959,6 +9944,9 @@ fn runPass4IntervalsAndPentagonBce(
     // [3] Step 1 Discharge: rewrite proven `.narrow_check`, `.bounds_check`, `.slice_range_check` & emit `E0406`/`E0307`:
     var unit_const_opt: ?u32 = null;
     var unproven_checks: std.ArrayListUnmanaged(PendingBceCheck) = .empty;
+    var unproven_dollar_subs: std.ArrayListUnmanaged(PendingDollarSub) = .empty;
+    const has_reported_dollar_oob = try arena_alloc.alloc(bool, inst_count);
+    @memset(has_reported_dollar_oob, false);
 
     for (dom.rpo_blocks) |bb_idx| {
         if (!is_intv_reachable[bb_idx]) continue;
@@ -8970,6 +9958,7 @@ fn runPass4IntervalsAndPentagonBce(
             val_domains,
             val_intv,
             local_store_counts,
+            slice_len_store_counts,
             val_overrides,
             local_overrides,
             slice_len_overrides,
@@ -8977,9 +9966,67 @@ fn runPass4IntervalsAndPentagonBce(
         for (body.getBlockInsts(MirBlockId.fromInt(bb_idx))) |inst_vid| {
             const v_idx = inst_vid.asInt();
             const inst = body.getInst(inst_vid);
+            const tok = body.origin_tokens.items[v_idx];
+
+            if (inst.op == .bin_op and inst.flags.is_dollar_sub) {
+                const bk: BinOpKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+                if (bk == .usub_checked and inst.operands.lhs < inst_count and inst.operands.rhs < inst_count) {
+                    const lhs_dom = val_domains[inst.operands.lhs];
+                    const rhs_dom = val_domains[inst.operands.rhs];
+                    const lhs_iv = readDomRefinedIntv(
+                        body,
+                        inst.operands.lhs,
+                        val_intv,
+                        val_overrides,
+                        local_overrides,
+                        slice_len_overrides,
+                        local_store_counts,
+                        slice_len_store_counts,
+                    );
+                    const rhs_iv = readDomRefinedIntv(
+                        body,
+                        inst.operands.rhs,
+                        val_intv,
+                        val_overrides,
+                        local_overrides,
+                        slice_len_overrides,
+                        local_store_counts,
+                        slice_len_store_counts,
+                    );
+                    if (lhs_dom != null and rhs_dom != null and !lhs_iv.isBottom() and !rhs_iv.isBottom()) {
+                        const lb = decodeIntvToI128(lhs_iv, lhs_dom.?);
+                        const rb = decodeIntvToI128(rhs_iv, rhs_dom.?);
+                        if (lb.hi < rb.lo) {
+                            try emitSastDiag(
+                                config.diagnostic_sink,
+                                .e0307_static_buffer_overflow,
+                                .err,
+                                resolveTokenSpan(body.file_id, tok, config, decl_fallback_span),
+                                "backward `$` index offset statically underflows container length",
+                                "`$` subtraction underflows proven container length here",
+                                null,
+                                null,
+                                "ensure `offset <= container.len` when indexing with `$ - offset`",
+                            );
+                            outcome.emitted_error_count += 1;
+                            has_reported_dollar_oob[v_idx] = true;
+                            continue;
+                        }
+                        if (lb.lo >= rb.hi) {
+                            rewriteProvenDollarSubInPlace(body, inst_vid);
+                            continue;
+                        }
+                    }
+                    try unproven_dollar_subs.append(arena_alloc, .{
+                        .bb_idx = bb_idx,
+                        .inst_val = inst_vid,
+                    });
+                }
+                continue;
+            }
+
             if (inst.op != .intrinsic_op) continue;
             const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
-            const tok = body.origin_tokens.items[v_idx];
 
             if (ikind == .narrow_check and inst.operands.rhs >= 3 and
                 inst.operands.lhs + 3 <= body.extra_args.items.len)
@@ -9006,6 +10053,7 @@ fn runPass4IntervalsAndPentagonBce(
                                     local_overrides,
                                     slice_len_overrides,
                                     local_store_counts,
+                                    slice_len_store_counts,
                                 );
                                 if (!src_iv.isBottom()) {
                                     const sb = decodeIntvToI128(src_iv, src_dom);
@@ -9036,6 +10084,9 @@ fn runPass4IntervalsAndPentagonBce(
             {
                 const idx_v = body.extra_args.items[inst.operands.lhs];
                 const len_v = body.extra_args.items[inst.operands.lhs + 1];
+                if (idx_v < inst_count and has_reported_dollar_oob[peelCopyValId(body, idx_v)]) {
+                    continue;
+                }
                 if (idx_v < inst_count and len_v < inst_count) {
                     const idx_dom = val_domains[idx_v];
                     const len_dom = val_domains[len_v];
@@ -9047,6 +10098,7 @@ fn runPass4IntervalsAndPentagonBce(
                         local_overrides,
                         slice_len_overrides,
                         local_store_counts,
+                        slice_len_store_counts,
                     );
                     const len_iv = readDomRefinedIntv(
                         body,
@@ -9056,6 +10108,7 @@ fn runPass4IntervalsAndPentagonBce(
                         local_overrides,
                         slice_len_overrides,
                         local_store_counts,
+                        slice_len_store_counts,
                     );
                     if (idx_dom != null and len_dom != null and !idx_iv.isBottom() and !len_iv.isBottom()) {
                         const ib = decodeIntvToI128(idx_iv, idx_dom.?);
@@ -9096,7 +10149,68 @@ fn runPass4IntervalsAndPentagonBce(
                 const lo_v = body.extra_args.items[inst.operands.lhs];
                 const hi_v = body.extra_args.items[inst.operands.lhs + 1];
                 const len_v = body.extra_args.items[inst.operands.lhs + 2];
+                if ((lo_v < inst_count and has_reported_dollar_oob[peelCopyValId(body, lo_v)]) or
+                    (hi_v < inst_count and has_reported_dollar_oob[peelCopyValId(body, hi_v)]))
+                {
+                    continue;
+                }
                 if (lo_v < inst_count and hi_v < inst_count and len_v < inst_count) {
+                    const peeled_hi = peelCopyValId(body, hi_v);
+                    if (peeled_hi < inst_count) {
+                        const hi_inst = body.getInst(MirValueId.fromInt(peeled_hi));
+                        if (hi_inst.op == .bin_op and hi_inst.flags.is_synthetic) {
+                            const hi_bk: BinOpKind = @fromBackingInt(@intCast(@as(u8, @truncate(hi_inst.aux_u16))));
+                            if (hi_bk == .uadd_checked and hi_inst.operands.lhs < inst_count and
+                                hi_inst.operands.rhs < inst_count)
+                            {
+                                const end_dom = val_domains[hi_inst.operands.lhs];
+                                const step_dom = val_domains[hi_inst.operands.rhs];
+                                const end_iv = readDomRefinedIntv(
+                                    body,
+                                    hi_inst.operands.lhs,
+                                    val_intv,
+                                    val_overrides,
+                                    local_overrides,
+                                    slice_len_overrides,
+                                    local_store_counts,
+                                    slice_len_store_counts,
+                                );
+                                const step_iv = readDomRefinedIntv(
+                                    body,
+                                    hi_inst.operands.rhs,
+                                    val_intv,
+                                    val_overrides,
+                                    local_overrides,
+                                    slice_len_overrides,
+                                    local_store_counts,
+                                    slice_len_store_counts,
+                                );
+                                if (end_dom != null and step_dom != null and
+                                    !end_dom.?.is_signed and !end_iv.isBottom() and !step_iv.isBottom())
+                                {
+                                    const end_b = decodeIntvToI128(end_iv, end_dom.?);
+                                    const step_b = decodeIntvToI128(step_iv, step_dom.?);
+                                    const max_u = decodeIntvToI128(end_dom.?.top_intv, end_dom.?).hi;
+                                    if (step_b.lo >= 1 and end_b.lo + step_b.lo > max_u) {
+                                        try emitSastDiag(
+                                            config.diagnostic_sink,
+                                            .e0307_static_buffer_overflow,
+                                            .err,
+                                            resolveTokenSpan(body.file_id, tok, config, decl_fallback_span),
+                                            "slice sub-range is statically proven out of bounds (`lo <= hi <= len` violated)",
+                                            "out-of-bounds slice range here",
+                                            null,
+                                            null,
+                                            "ensure `0 <= start <= end <= slice.len` before slicing",
+                                        );
+                                        outcome.emitted_error_count += 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     const lo_dom = val_domains[lo_v];
                     const hi_dom = val_domains[hi_v];
                     const len_dom = val_domains[len_v];
@@ -9108,6 +10222,7 @@ fn runPass4IntervalsAndPentagonBce(
                         local_overrides,
                         slice_len_overrides,
                         local_store_counts,
+                        slice_len_store_counts,
                     );
                     const hi_iv = readDomRefinedIntv(
                         body,
@@ -9117,6 +10232,7 @@ fn runPass4IntervalsAndPentagonBce(
                         local_overrides,
                         slice_len_overrides,
                         local_store_counts,
+                        slice_len_store_counts,
                     );
                     const len_iv = readDomRefinedIntv(
                         body,
@@ -9126,6 +10242,7 @@ fn runPass4IntervalsAndPentagonBce(
                         local_overrides,
                         slice_len_overrides,
                         local_store_counts,
+                        slice_len_store_counts,
                     );
                     if (lo_dom != null and hi_dom != null and len_dom != null and
                         !lo_iv.isBottom() and !hi_iv.isBottom() and !len_iv.isBottom())
@@ -9168,8 +10285,8 @@ fn runPass4IntervalsAndPentagonBce(
     }
 
     // [4] Step 2 & Step 3: Demand-Sliced Sparse ABCD Pentagon (`< 1.5 MB` peak scratch RAM):
-    if (unproven_checks.items.len > 0 and outcome.emitted_error_count == 0) {
-        // Canonicalize `copy_val`, single-store local `place_load`, and `.slice_len` `place_load` roots:
+    if ((unproven_checks.items.len > 0 or unproven_dollar_subs.items.len > 0) and outcome.emitted_error_count == 0) {
+        // Canonicalize `copy_val`, single-store local `place_load`, `.slice_len`, and `x +- 0` roots:
         const canon_val = try arena_alloc.alloc(u32, inst_count);
         for (0..inst_count) |v_idx| {
             canon_val[v_idx] = peelCopyValId(body, @intCast(v_idx));
@@ -9179,8 +10296,8 @@ fn runPass4IntervalsAndPentagonBce(
         const first_unmut_load_val = try arena_alloc.alloc(u32, local_count);
         @memset(first_unmut_load_val, mir.NONE_U32);
 
-        for (0..block_count) |b_usize| {
-            const load_bb = MirBlockId.fromInt(@intCast(b_usize));
+        for (dom.rpo_blocks) |b_u32| {
+            const load_bb = MirBlockId.fromInt(b_u32);
             for (body.getBlockInsts(load_bb)) |inst_vid| {
                 const v_idx = inst_vid.asInt();
                 const peeled = canon_val[v_idx];
@@ -9188,7 +10305,7 @@ fn runPass4IntervalsAndPentagonBce(
                     const is_immut_len = (pkey.kind == .direct_slice_len) or
                         (pkey.kind == .deref_slice_len and isSharedRefLocal(body, pool, pkey.base_local));
                     if (is_immut_len and pkey.base_local < local_count and
-                        local_store_counts[pkey.base_local] <= 1)
+                        slice_len_store_counts[pkey.base_local] <= 1)
                     {
                         if (first_slice_len_val[pkey.base_local] == mir.NONE_U32) {
                             first_slice_len_val[pkey.base_local] = peeled;
@@ -9202,7 +10319,7 @@ fn runPass4IntervalsAndPentagonBce(
                         if (uniq_v < inst_count and uniq_bb < block_count and
                             dom.isDominatorOf(MirBlockId.fromInt(uniq_bb), load_bb))
                         {
-                            canon_val[v_idx] = peelCopyValId(body, uniq_v);
+                            canon_val[v_idx] = canon_val[peelCopyValId(body, uniq_v)];
                         } else if (uniq_v == mir.NONE_U32) {
                             if (first_unmut_load_val[pkey.base_local] == mir.NONE_U32) {
                                 first_unmut_load_val[pkey.base_local] = peeled;
@@ -9210,11 +10327,31 @@ fn runPass4IntervalsAndPentagonBce(
                             canon_val[v_idx] = first_unmut_load_val[pkey.base_local];
                         }
                     }
+                } else {
+                    const inst = body.getInst(MirValueId.fromInt(peeled));
+                    if (inst.op == .bin_op and inst.operands.lhs < inst_count and inst.operands.rhs < inst_count) {
+                        const bk: BinOpKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+                        const is_zero_identity_op = switch (bk) {
+                            .ssub_checked, .usub_checked, .sub_wrap, .sadd_checked, .uadd_checked, .add_wrap => true,
+                            else => false,
+                        };
+                        if (is_zero_identity_op) {
+                            if (val_domains[inst.operands.rhs]) |r_dom| {
+                                const r_iv = val_intv[inst.operands.rhs];
+                                if (!r_iv.isBottom()) {
+                                    const rb = decodeIntvToI128(r_iv, r_dom);
+                                    if (rb.lo == 0 and rb.hi == 0) {
+                                        canon_val[v_idx] = canon_val[inst.operands.lhs];
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // Backward demand slice from `unproven_checks` + dominating `cond_br` predicates (`MAX_SUB_VARS = 256`):
+        // Backward demand slice from `unproven_checks`, `unproven_dollar_subs`, + `cond_br` (`MAX_SUB_VARS = 256`):
         const val_to_pent = try arena_alloc.alloc(u16, inst_count);
         @memset(val_to_pent, std.math.maxInt(u16));
         var pent_vars: std.ArrayListUnmanaged(u32) = .empty;
@@ -9249,6 +10386,12 @@ fn runPass4IntervalsAndPentagonBce(
                 enqueuePentVar(body.extra_args.items[inst.operands.lhs + 1], canon_val, val_to_pent, &pent_vars);
                 enqueuePentVar(body.extra_args.items[inst.operands.lhs + 2], canon_val, val_to_pent, &pent_vars);
             }
+        }
+        for (unproven_dollar_subs.items) |dsub| {
+            const inst = body.getInst(dsub.inst_val);
+            enqueuePentVar(dsub.inst_val.asInt(), canon_val, val_to_pent, &pent_vars);
+            enqueuePentVar(inst.operands.lhs, canon_val, val_to_pent, &pent_vars);
+            enqueuePentVar(inst.operands.rhs, canon_val, val_to_pent, &pent_vars);
         }
 
         for (dom.rpo_blocks) |bb_idx| {
@@ -9311,7 +10454,8 @@ fn runPass4IntervalsAndPentagonBce(
 
             const closed_scratch_a = try arena_alloc.alloc(PentagonSubRow, sub_var_count);
             const closed_scratch_b = try arena_alloc.alloc(PentagonSubRow, sub_var_count);
-            outcome.peak_pentagon_bytes = (total_sub_rows + 2 * sub_var_count) * @sizeOf(PentagonSubRow);
+            const cur_leq_rows = try arena_alloc.alloc(PentagonSubRow, sub_var_count);
+            outcome.peak_pentagon_bytes = (total_sub_rows + 3 * sub_var_count) * @sizeOf(PentagonSubRow);
             std.debug.assert(outcome.peak_pentagon_bytes < 1_500_000);
 
             const block_slot_map = try arena_alloc.alloc(u16, block_count);
@@ -9344,6 +10488,7 @@ fn runPass4IntervalsAndPentagonBce(
                     val_domains,
                     val_intv,
                     local_store_counts,
+                    slice_len_store_counts,
                     val_overrides,
                     local_overrides,
                     slice_len_overrides,
@@ -9440,7 +10585,13 @@ fn runPass4IntervalsAndPentagonBce(
                     @memset(cur_rows, .{});
                 }
 
-                // Also inject any dominating `cond_br` guards along `idom` chain into `cur_rows`:
+                // Seed `cur_leq_rows` (`x <= y`) from strict `cur_rows` + reflexivity:
+                for (0..sub_var_count) |v_i| {
+                    cur_leq_rows[v_i] = cur_rows[v_i];
+                    cur_leq_rows[v_i].insert(@intCast(v_i));
+                }
+
+                // Also inject any dominating `cond_br` guards along `idom` chain into `cur_rows` & `cur_leq_rows`:
                 var dom_walk = bb_idx;
                 var d_steps: usize = 0;
                 while (dom_walk != 0 and d_steps < block_count) : (d_steps += 1) {
@@ -9468,10 +10619,20 @@ fn runPass4IntervalsAndPentagonBce(
                                 val_domains,
                                 cur_rows,
                             );
+                            applyPentagonLeqGuard(
+                                cmp,
+                                canon_val,
+                                val_to_pent,
+                                val_intv,
+                                val_domains,
+                                cur_leq_rows,
+                            );
                         }
                     }
                     dom_walk = idom_bb;
                 }
+                closePentagonRowsOneHop(cur_leq_rows, closed_scratch_b);
+                @memcpy(cur_leq_rows, closed_scratch_b);
 
                 // Step relational transfer rules across instructions in `bb_idx`:
                 for (body.getBlockInsts(bb_id)) |inst_vid| {
@@ -9495,6 +10656,7 @@ fn runPass4IntervalsAndPentagonBce(
                                         local_overrides,
                                         slice_len_overrides,
                                         local_store_counts,
+                                        slice_len_store_counts,
                                     );
                                     const is_preserving_math_val = if (val_domains[src_raw]) |s_dom| blk: {
                                         if (uk == .int_zext) {
@@ -9507,17 +10669,25 @@ fn runPass4IntervalsAndPentagonBce(
                                     } else false;
                                     if (is_preserving_math_val) {
                                         cur_rows[dst_pid] = cur_rows[dst_pid].unionWith(cur_rows[src_pid]);
+                                        cur_leq_rows[dst_pid] = cur_leq_rows[dst_pid].unionWith(cur_leq_rows[src_pid]);
                                     }
                                 }
                             }
                         },
                         .bin_op => {
-                            const bk: BinOpKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+                            var bk: BinOpKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
                             const lhs_raw = inst.operands.lhs;
                             const rhs_raw = inst.operands.rhs;
                             if (lhs_raw < inst_count and rhs_raw < inst_count) {
                                 const lhs_pid = val_to_pent[canon_val[lhs_raw]];
                                 const rhs_pid = val_to_pent[canon_val[rhs_raw]];
+                                if (bk == .usub_checked and inst.flags.is_dollar_sub and
+                                    lhs_pid < sub_var_count and rhs_pid < sub_var_count and
+                                    cur_leq_rows[rhs_pid].contains(@intCast(lhs_pid)))
+                                {
+                                    rewriteProvenDollarSubInPlace(body, inst_vid);
+                                    bk = .sub_wrap;
+                                }
                                 const l_iv = readDomRefinedIntv(
                                     body,
                                     lhs_raw,
@@ -9526,6 +10696,7 @@ fn runPass4IntervalsAndPentagonBce(
                                     local_overrides,
                                     slice_len_overrides,
                                     local_store_counts,
+                                    slice_len_store_counts,
                                 );
                                 const r_iv = readDomRefinedIntv(
                                     body,
@@ -9535,6 +10706,7 @@ fn runPass4IntervalsAndPentagonBce(
                                     local_overrides,
                                     slice_len_overrides,
                                     local_store_counts,
+                                    slice_len_store_counts,
                                 );
                                 const d_iv = readDomRefinedIntv(
                                     body,
@@ -9544,6 +10716,7 @@ fn runPass4IntervalsAndPentagonBce(
                                     local_overrides,
                                     slice_len_overrides,
                                     local_store_counts,
+                                    slice_len_store_counts,
                                 );
                                 if (bk == .urem_checked and rhs_pid < sub_var_count) {
                                     // Soundness guard (`[CRITICAL-01]`): `a % d < d` ONLY when `0 ∉ Intv(d)`:
@@ -9551,6 +10724,8 @@ fn runPass4IntervalsAndPentagonBce(
                                         if (!r_iv.isBottom() and decodeIntvToI128(r_iv, r_dom).lo >= 1) {
                                             cur_rows[dst_pid].insert(@intCast(rhs_pid));
                                             cur_rows[dst_pid] = cur_rows[dst_pid].unionWith(cur_rows[rhs_pid]);
+                                            cur_leq_rows[dst_pid].insert(@intCast(rhs_pid));
+                                            cur_leq_rows[dst_pid] = cur_leq_rows[dst_pid].unionWith(cur_leq_rows[rhs_pid]);
                                         }
                                     }
                                 } else if ((bk == .ssub_checked or bk == .usub_checked or bk == .sub_wrap) and
@@ -9560,9 +10735,17 @@ fn runPass4IntervalsAndPentagonBce(
                                         if (!r_iv.isBottom() and !d_iv.isBottom() and !l_iv.isBottom()) {
                                             const rb = decodeIntvToI128(r_iv, r_dom);
                                             const lb = decodeIntvToI128(l_iv, val_domains[lhs_raw] orelse r_dom);
-                                            if (rb.lo >= 1 and (bk != .sub_wrap or lb.lo >= rb.hi)) {
-                                                cur_rows[dst_pid].insert(@intCast(lhs_pid));
-                                                cur_rows[dst_pid] = cur_rows[dst_pid].unionWith(cur_rows[lhs_pid]);
+                                            const has_no_sub_wrap = (bk != .sub_wrap) or (lb.lo >= rb.hi) or
+                                                (rhs_pid < sub_var_count and cur_leq_rows[rhs_pid].contains(@intCast(lhs_pid)));
+                                            if (has_no_sub_wrap) {
+                                                if (rb.lo >= 0) {
+                                                    cur_leq_rows[dst_pid].insert(@intCast(lhs_pid));
+                                                    cur_leq_rows[dst_pid] = cur_leq_rows[dst_pid].unionWith(cur_leq_rows[lhs_pid]);
+                                                }
+                                                if (rb.lo >= 1) {
+                                                    cur_rows[dst_pid].insert(@intCast(lhs_pid));
+                                                    cur_rows[dst_pid] = cur_rows[dst_pid].unionWith(cur_rows[lhs_pid]);
+                                                }
                                             }
                                         }
                                     }
@@ -9575,9 +10758,16 @@ fn runPass4IntervalsAndPentagonBce(
                                             const rb = decodeIntvToI128(r_iv, r_dom);
                                             const lb = decodeIntvToI128(l_iv, val_domains[lhs_raw] orelse r_dom);
                                             const db = decodeIntvToI128(d_dom.top_intv, d_dom);
-                                            if (rb.lo >= 1 and lb.hi + rb.hi <= db.hi) {
-                                                cur_rows[lhs_pid].insert(@intCast(dst_pid));
-                                                cur_rows[lhs_pid] = cur_rows[lhs_pid].unionWith(cur_rows[dst_pid]);
+                                            const has_no_add_wrap = (bk != .add_wrap) or (lb.hi + rb.hi <= db.hi);
+                                            if (has_no_add_wrap) {
+                                                if (rb.lo >= 0) {
+                                                    cur_leq_rows[lhs_pid].insert(@intCast(dst_pid));
+                                                    cur_leq_rows[lhs_pid] = cur_leq_rows[lhs_pid].unionWith(cur_leq_rows[dst_pid]);
+                                                }
+                                                if (rb.lo >= 1) {
+                                                    cur_rows[lhs_pid].insert(@intCast(dst_pid));
+                                                    cur_rows[lhs_pid] = cur_rows[lhs_pid].unionWith(cur_rows[dst_pid]);
+                                                }
                                             }
                                         }
                                     }
@@ -9586,6 +10776,7 @@ fn runPass4IntervalsAndPentagonBce(
                                     if (val_domains[v_idx]) |d_dom| {
                                         if (!d_dom.is_signed or (!d_iv.isBottom() and decodeIntvToI128(d_iv, d_dom).lo >= 0)) {
                                             cur_rows[dst_pid] = cur_rows[dst_pid].unionWith(cur_rows[rhs_pid]);
+                                            cur_leq_rows[dst_pid] = cur_leq_rows[dst_pid].unionWith(cur_leq_rows[rhs_pid]);
                                         }
                                     }
                                 }
@@ -9596,7 +10787,12 @@ fn runPass4IntervalsAndPentagonBce(
                 }
 
                 // Close 1-hop and test all pending checks residing in `bb_idx`:
+                closePentagonRowsOneHop(cur_leq_rows, closed_scratch_b);
+                @memcpy(cur_leq_rows, closed_scratch_b);
                 closePentagonRowsOneHop(cur_rows, closed_scratch_b);
+                for (0..sub_var_count) |v_i| {
+                    cur_leq_rows[v_i] = cur_leq_rows[v_i].unionWith(closed_scratch_b[v_i]);
+                }
                 for (unproven_checks.items) |chk| {
                     if (chk.bb_idx != bb_idx) continue;
                     const c_inst = body.getInst(chk.inst_val);
@@ -9609,6 +10805,24 @@ fn runPass4IntervalsAndPentagonBce(
                         if (idx_v < inst_count and len_v < inst_count) {
                             const idx_pid = val_to_pent[canon_val[idx_v]];
                             const len_pid = val_to_pent[canon_val[len_v]];
+                            const is_rel_oob = (canon_val[idx_v] == canon_val[len_v]) or
+                                (idx_pid < sub_var_count and len_pid < sub_var_count and
+                                    closed_scratch_b[len_pid].contains(@intCast(idx_pid)));
+                            if (is_rel_oob) {
+                                try emitSastDiag(
+                                    config.diagnostic_sink,
+                                    .e0307_static_buffer_overflow,
+                                    .err,
+                                    resolveTokenSpan(body.file_id, c_tok, config, decl_fallback_span),
+                                    "index access is statically proven out of bounds (`index >= container.len`)",
+                                    "index is guaranteed `>= container.len` here",
+                                    null,
+                                    null,
+                                    "use `$ - 1` for the last element or ensure `index < container.len`",
+                                );
+                                outcome.emitted_error_count += 1;
+                                continue;
+                            }
                             const idx_iv = readDomRefinedIntv(
                                 body,
                                 idx_v,
@@ -9617,6 +10831,7 @@ fn runPass4IntervalsAndPentagonBce(
                                 local_overrides,
                                 slice_len_overrides,
                                 local_store_counts,
+                                slice_len_store_counts,
                             );
                             const is_non_neg = if (val_domains[idx_v]) |id_dom|
                                 (!id_dom.is_signed or (!idx_iv.isBottom() and decodeIntvToI128(idx_iv, id_dom).lo >= 0))
@@ -9636,6 +10851,25 @@ fn runPass4IntervalsAndPentagonBce(
                             const lo_pid = val_to_pent[canon_val[lo_v]];
                             const hi_pid = val_to_pent[canon_val[hi_v]];
                             const len_pid = val_to_pent[canon_val[len_v]];
+                            const is_rel_range_oob = (lo_pid < sub_var_count and hi_pid < sub_var_count and
+                                closed_scratch_b[hi_pid].contains(@intCast(lo_pid))) or
+                                (hi_pid < sub_var_count and len_pid < sub_var_count and
+                                    closed_scratch_b[len_pid].contains(@intCast(hi_pid)));
+                            if (is_rel_range_oob) {
+                                try emitSastDiag(
+                                    config.diagnostic_sink,
+                                    .e0307_static_buffer_overflow,
+                                    .err,
+                                    resolveTokenSpan(body.file_id, c_tok, config, decl_fallback_span),
+                                    "slice sub-range is statically proven out of bounds (`lo <= hi <= len` violated)",
+                                    "out-of-bounds slice range here",
+                                    null,
+                                    null,
+                                    "ensure `0 <= start <= end <= slice.len` before slicing",
+                                );
+                                outcome.emitted_error_count += 1;
+                                continue;
+                            }
                             const lo_iv = readDomRefinedIntv(
                                 body,
                                 lo_v,
@@ -9644,6 +10878,7 @@ fn runPass4IntervalsAndPentagonBce(
                                 local_overrides,
                                 slice_len_overrides,
                                 local_store_counts,
+                                slice_len_store_counts,
                             );
                             const hi_iv = readDomRefinedIntv(
                                 body,
@@ -9653,6 +10888,7 @@ fn runPass4IntervalsAndPentagonBce(
                                 local_overrides,
                                 slice_len_overrides,
                                 local_store_counts,
+                                slice_len_store_counts,
                             );
                             const len_iv = readDomRefinedIntv(
                                 body,
@@ -9662,13 +10898,16 @@ fn runPass4IntervalsAndPentagonBce(
                                 local_overrides,
                                 slice_len_overrides,
                                 local_store_counts,
+                                slice_len_store_counts,
                             );
                             const is_lo_non_neg = if (val_domains[lo_v]) |ld|
                                 (!ld.is_signed or (!lo_iv.isBottom() and decodeIntvToI128(lo_iv, ld).lo >= 0))
                             else
                                 false;
                             const is_lo_le_hi = (canon_val[lo_v] == canon_val[hi_v]) or
-                                (lo_pid < sub_var_count and hi_pid < sub_var_count and closed_scratch_b[lo_pid].contains(@intCast(hi_pid))) or
+                                (lo_pid < sub_var_count and hi_pid < sub_var_count and
+                                    (closed_scratch_b[lo_pid].contains(@intCast(hi_pid)) or
+                                        cur_leq_rows[lo_pid].contains(@intCast(hi_pid)))) or
                                 blk: {
                                     if (val_domains[lo_v] != null and val_domains[hi_v] != null and
                                         !lo_iv.isBottom() and !hi_iv.isBottom())
@@ -9679,7 +10918,9 @@ fn runPass4IntervalsAndPentagonBce(
                                     break :blk false;
                                 };
                             const is_hi_le_len = (canon_val[hi_v] == canon_val[len_v]) or
-                                (hi_pid < sub_var_count and len_pid < sub_var_count and closed_scratch_b[hi_pid].contains(@intCast(len_pid))) or
+                                (hi_pid < sub_var_count and len_pid < sub_var_count and
+                                    (closed_scratch_b[hi_pid].contains(@intCast(len_pid)) or
+                                        cur_leq_rows[hi_pid].contains(@intCast(len_pid)))) or
                                 blk: {
                                     if (val_domains[hi_v] != null and val_domains[len_v] != null and
                                         !hi_iv.isBottom() and !len_iv.isBottom())
@@ -9753,6 +10994,7 @@ fn runPass4IntervalsAndPentagonBce(
             val_domains,
             val_intv,
             local_store_counts,
+            slice_len_store_counts,
             val_overrides,
             local_overrides,
             slice_len_overrides,
@@ -9787,6 +11029,7 @@ fn runPass4IntervalsAndPentagonBce(
                     local_overrides,
                     slice_len_overrides,
                     local_store_counts,
+                    slice_len_store_counts,
                 );
                 const rhs_iv = readDomRefinedIntv(
                     body,
@@ -9796,6 +11039,7 @@ fn runPass4IntervalsAndPentagonBce(
                     local_overrides,
                     slice_len_overrides,
                     local_store_counts,
+                    slice_len_store_counts,
                 );
                 if (!isCheckedInstProvenSafeByIntv(inst, lhs_iv, rhs_iv, val_domains)) {
                     has_block_panic = true;
@@ -9809,6 +11053,75 @@ fn runPass4IntervalsAndPentagonBce(
     }
 
     return outcome;
+}
+
+/// Applies a decoded `cond_br` non-strict relational guard (`<=`, `>=`, `<`, `>`, `==`) onto `leq_rows`.
+fn applyPentagonLeqGuard(
+    cmp: DecodedBranchCmp,
+    canon_val: []const u32,
+    val_to_pent: []const u16,
+    val_intv: []const Intv,
+    val_domains: []const ?ScalarIntDomain,
+    leq_rows: []PentagonSubRow,
+) void {
+    const var_count = leq_rows.len;
+    if (cmp.lhs_val >= canon_val.len or cmp.rhs_val >= canon_val.len) return;
+    const lhs_pid = val_to_pent[canon_val[cmp.lhs_val]];
+    const rhs_pid = val_to_pent[canon_val[cmp.rhs_val]];
+    if (lhs_pid >= var_count or rhs_pid >= var_count or lhs_pid == rhs_pid) return;
+
+    const eff_op: BinOpKind = if (cmp.is_positive) cmp.op else switch (cmp.op) {
+        .slt => .sge,
+        .ult => .uge,
+        .sle => .sgt,
+        .ule => .ugt,
+        .sgt => .sle,
+        .ugt => .ule,
+        .sge => .slt,
+        .uge => .ult,
+        .eq => .ne,
+        .ne => .eq,
+        else => return,
+    };
+
+    const is_unsigned_cmp = switch (eff_op) {
+        .ult, .ule, .ugt, .uge => true,
+        else => false,
+    };
+    const is_signed_cmp = switch (eff_op) {
+        .slt, .sle, .sgt, .sge => true,
+        else => false,
+    };
+    if (is_unsigned_cmp or is_signed_cmp) {
+        for ([2]u32{ cmp.lhs_val, cmp.rhs_val }) |op_val| {
+            if (op_val >= val_intv.len or op_val >= val_domains.len) return;
+            const dom = val_domains[op_val] orelse return;
+            const iv = val_intv[op_val];
+            if (is_unsigned_cmp and dom.is_signed) {
+                if (iv.isBottom() or decodeIntvToI128(iv, dom).lo < 0) return;
+            } else if (is_signed_cmp and !dom.is_signed) {
+                const sign_lim = @as(i128, 1) << @intCast(dom.bits - 1);
+                if (iv.isBottom() or decodeIntvToI128(iv, dom).hi >= sign_lim) return;
+            }
+        }
+    }
+
+    switch (eff_op) {
+        .slt, .ult, .sle, .ule => {
+            leq_rows[lhs_pid].insert(@intCast(rhs_pid));
+            leq_rows[lhs_pid] = leq_rows[lhs_pid].unionWith(leq_rows[rhs_pid]);
+        },
+        .sgt, .ugt, .sge, .uge => {
+            leq_rows[rhs_pid].insert(@intCast(lhs_pid));
+            leq_rows[rhs_pid] = leq_rows[rhs_pid].unionWith(leq_rows[lhs_pid]);
+        },
+        .eq => {
+            const merged = leq_rows[lhs_pid].unionWith(leq_rows[rhs_pid]);
+            leq_rows[lhs_pid] = merged;
+            leq_rows[rhs_pid] = merged;
+        },
+        else => {},
+    }
 }
 
 /// Applies a decoded `cond_br` relational guard (`<`, `<=`, `>`, `>=`, `==`) onto `rows`.
@@ -10466,6 +11779,10 @@ fn verifyElaboratedMirBody(
                                 return error.V6ContextlessReadsContext;
                             }
                         }
+                    } else if (inst.op == .intrinsic_op) {
+                        if (@as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)).isContextIntrinsic()) {
+                            return error.V6ContextlessReadsContext;
+                        }
                     }
                 }
             }
@@ -10692,6 +12009,13 @@ fn runPass3SummaryContractsAndSandbox(
                         .sys_write => direct_eff.fs = true,
                         .sys_exit => direct_eff.process = true,
                         .panic, .trap => direct_eff.may_panic = true,
+                        .ctx_get => {
+                            if (extractConstCtxSlotOrd(body, inst)) |slot_ord| {
+                                if (slot_ord == ContextFieldLayout.CANONICAL_FIELDS[0].slot_ordinal) {
+                                    direct_eff.alloc = true;
+                                }
+                            }
+                        },
                         .poll_reload => {},
                         else => {},
                     }
@@ -11538,6 +12862,136 @@ fn hasExistingDiagAtSpan(sink_opt: ?*const DiagnosticSink, code: DiagnosticCode,
     return false;
 }
 
+/// Clones `old_slot` from `source_store.locals` into `temp_store.locals` if needed and returns its remapped slot.
+fn remapSingleConstLocal(
+    allocator: std.mem.Allocator,
+    old_slot: u32,
+    source_store: *const hir.HirStore,
+    temp_store: *hir.HirStore,
+    local_remap: *std.AutoHashMapUnmanaged(u32, u32),
+) !u32 {
+    const gop = try local_remap.getOrPut(allocator, old_slot);
+    if (!gop.found_existing) {
+        const new_slot: u32 = @intCast(temp_store.locals.items.len);
+        gop.value_ptr.* = new_slot;
+        if (old_slot < source_store.locals.items.len) {
+            var cloned_loc = source_store.locals.items[old_slot];
+            cloned_loc.is_param = false;
+            try temp_store.locals.append(allocator, cloned_loc);
+        }
+    }
+    return gop.value_ptr.*;
+}
+
+/// Recursively remaps `local_id` bindings inside `pat_idx` for synthetic `const` initializer `MirBody` lowering.
+fn remapConstPatLocals(
+    allocator: std.mem.Allocator,
+    pat_idx: u32,
+    source_store: *const hir.HirStore,
+    temp_store: *hir.HirStore,
+    local_remap: *std.AutoHashMapUnmanaged(u32, u32),
+    depth: u8,
+) !void {
+    if (depth > 32 or pat_idx >= temp_store.patterns.items.len) return;
+    var pat = temp_store.patterns.items[pat_idx];
+    switch (pat.kind) {
+        .bind => |*bind_pat| {
+            bind_pat.local_id = try remapSingleConstLocal(
+                allocator,
+                bind_pat.local_id,
+                source_store,
+                temp_store,
+                local_remap,
+            );
+            temp_store.patterns.items[pat_idx] = pat;
+        },
+        .at_pat => |*at_pat| {
+            at_pat.local_id = try remapSingleConstLocal(
+                allocator,
+                at_pat.local_id,
+                source_store,
+                temp_store,
+                local_remap,
+            );
+            const sub_pat = at_pat.sub_pat;
+            temp_store.patterns.items[pat_idx] = pat;
+            try remapConstPatLocals(allocator, sub_pat, source_store, temp_store, local_remap, depth + 1);
+        },
+        .slice_pat => |*slice_pat| {
+            if (slice_pat.rest_local_id != mir.NONE_U32) {
+                slice_pat.rest_local_id = try remapSingleConstLocal(
+                    allocator,
+                    slice_pat.rest_local_id,
+                    source_store,
+                    temp_store,
+                    local_remap,
+                );
+                temp_store.patterns.items[pat_idx] = pat;
+            }
+            const total_sub: u32 = @as(u32, slice_pat.prefix_len) + @as(u32, slice_pat.suffix_len);
+            const safe_end = @min(slice_pat.prefix_start + total_sub, temp_store.extra_data.items.len);
+            var sub_i = slice_pat.prefix_start;
+            while (sub_i < safe_end) : (sub_i += 1) {
+                try remapConstPatLocals(
+                    allocator,
+                    temp_store.extra_data.items[sub_i],
+                    source_store,
+                    temp_store,
+                    local_remap,
+                    depth + 1,
+                );
+            }
+        },
+        .tuple => |tup| {
+            const safe_end = @min(tup.sub_start + tup.sub_len, temp_store.extra_data.items.len);
+            var sub_i = tup.sub_start;
+            while (sub_i < safe_end) : (sub_i += 1) {
+                try remapConstPatLocals(
+                    allocator,
+                    temp_store.extra_data.items[sub_i],
+                    source_store,
+                    temp_store,
+                    local_remap,
+                    depth + 1,
+                );
+            }
+        },
+        .struct_pat => |sp| {
+            const safe_end = @min(sp.field_start + sp.field_len * 2, temp_store.extra_data.items.len);
+            var pair_i = sp.field_start;
+            while (pair_i + 1 < safe_end) : (pair_i += 2) {
+                try remapConstPatLocals(
+                    allocator,
+                    temp_store.extra_data.items[pair_i + 1],
+                    source_store,
+                    temp_store,
+                    local_remap,
+                    depth + 1,
+                );
+            }
+        },
+        .variant => |vp| {
+            const safe_end = @min(vp.sub_start + vp.sub_len, temp_store.extra_data.items.len);
+            var sub_i = vp.sub_start;
+            while (sub_i < safe_end) : (sub_i += 1) {
+                try remapConstPatLocals(
+                    allocator,
+                    temp_store.extra_data.items[sub_i],
+                    source_store,
+                    temp_store,
+                    local_remap,
+                    depth + 1,
+                );
+            }
+        },
+        .or_pat => |op| {
+            try remapConstPatLocals(allocator, op.lhs_pat, source_store, temp_store, local_remap, depth + 1);
+            try remapConstPatLocals(allocator, op.rhs_pat, source_store, temp_store, local_remap, depth + 1);
+        },
+        else => {},
+    }
+}
+
 /// Lowers top-level `hir_const_decl` initializers in `source_store` into zero-arg `MirBody`s for Gate F (`E0325`).
 fn appendConstInitializerMirBodiesForSast(
     allocator: std.mem.Allocator,
@@ -11672,8 +13126,87 @@ fn appendConstInitializerMirBodiesForSast(
                         try visit_stack.append(allocator, temp_store.extra_data.items[cur_node.data.rhs + 1]);
                     }
                 },
-                .hir_unary_op, .hir_project_arg, .hir_defer => {
-                    try visit_stack.append(allocator, cur_node.data.rhs);
+                .hir_match => {
+                    try visit_stack.append(allocator, cur_node.data.lhs);
+                    if (cur_node.data.rhs + 2 <= temp_store.extra_data.items.len) {
+                        const arm_start = temp_store.extra_data.items[cur_node.data.rhs];
+                        const arm_len = temp_store.extra_data.items[cur_node.data.rhs + 1];
+                        const safe_arm_end = @min(arm_start + arm_len, temp_store.match_arms.items.len);
+                        var arm_i = arm_start;
+                        while (arm_i < safe_arm_end) : (arm_i += 1) {
+                            const arm = temp_store.match_arms.items[arm_i];
+                            try remapConstPatLocals(
+                                allocator,
+                                arm.pat_idx,
+                                source_store,
+                                &temp_store,
+                                &local_remap,
+                                0,
+                            );
+                            if (!arm.guard_hir.isNone()) try visit_stack.append(allocator, arm.guard_hir.asInt());
+                            if (!arm.body_hir.isNone()) try visit_stack.append(allocator, arm.body_hir.asInt());
+                        }
+                    }
+                },
+                .hir_cond_if, .hir_cond_while => {
+                    var cursor = cur_node.data.lhs;
+                    if (cursor < temp_store.extra_data.items.len) {
+                        const clause_count = temp_store.extra_data.items[cursor];
+                        cursor += 1;
+                        var clause_i: u32 = 0;
+                        while (clause_i < clause_count and cursor < temp_store.extra_data.items.len) : (clause_i += 1) {
+                            const kind_raw = temp_store.extra_data.items[cursor];
+                            cursor += 1;
+                            if (kind_raw == @backingInt(hir.HirCondClauseKind.is_match)) {
+                                if (cursor + 3 <= temp_store.extra_data.items.len) {
+                                    const scrut_raw = temp_store.extra_data.items[cursor];
+                                    const pat_idx = temp_store.extra_data.items[cursor + 1];
+                                    const guard_raw = temp_store.extra_data.items[cursor + 2];
+                                    cursor += 3;
+                                    if (scrut_raw != mir.NONE_U32) try visit_stack.append(allocator, scrut_raw);
+                                    try remapConstPatLocals(
+                                        allocator,
+                                        pat_idx,
+                                        source_store,
+                                        &temp_store,
+                                        &local_remap,
+                                        0,
+                                    );
+                                    if (guard_raw != mir.NONE_U32) try visit_stack.append(allocator, guard_raw);
+                                }
+                            } else if (cursor < temp_store.extra_data.items.len) {
+                                const pred_raw = temp_store.extra_data.items[cursor];
+                                cursor += 1;
+                                if (pred_raw != mir.NONE_U32) try visit_stack.append(allocator, pred_raw);
+                            }
+                        }
+                        if (cursor < temp_store.extra_data.items.len) {
+                            const first_tail = temp_store.extra_data.items[cursor];
+                            if (first_tail != mir.NONE_U32) try visit_stack.append(allocator, first_tail);
+                        }
+                        if (cur_node.tag == .hir_cond_if) {
+                            if (cursor + 1 < temp_store.extra_data.items.len) {
+                                const else_tail = temp_store.extra_data.items[cursor + 1];
+                                if (else_tail != mir.NONE_U32) try visit_stack.append(allocator, else_tail);
+                            }
+                        } else if (cursor + 1 < temp_store.extra_data.items.len) {
+                            const opt_loc = temp_store.extra_data.items[cursor + 1];
+                            if (opt_loc != mir.NONE_U32) {
+                                temp_store.extra_data.items[cursor + 1] = try remapSingleConstLocal(
+                                    allocator,
+                                    opt_loc,
+                                    source_store,
+                                    &temp_store,
+                                    &local_remap,
+                                );
+                            }
+                        }
+                    }
+                },
+                .hir_unary_op, .hir_project_arg, .hir_defer, .hir_ctx_set, .hir_ctx_region_push, .hir_break => {
+                    if (cur_node.data.rhs != mir.NONE_U32) {
+                        try visit_stack.append(allocator, cur_node.data.rhs);
+                    }
                 },
                 .hir_cast, .hir_field_proj, .hir_loop, .hir_return, .hir_yield => {
                     if (cur_node.data.lhs != mir.NONE_U32) {
@@ -11686,9 +13219,20 @@ fn appendConstInitializerMirBodiesForSast(
                         try visit_stack.append(allocator, temp_store.extra_data.items[cur_node.data.lhs + 1]);
                     }
                 },
-                .hir_assign, .hir_index_proj => {
+                .hir_assign, .hir_index_proj, .hir_orelse => {
                     try visit_stack.append(allocator, cur_node.data.lhs);
                     try visit_stack.append(allocator, cur_node.data.rhs);
+                },
+                .hir_slice_range => {
+                    if (cur_node.data.lhs != mir.NONE_U32) {
+                        try visit_stack.append(allocator, cur_node.data.lhs);
+                    }
+                    if (cur_node.data.rhs + 2 <= temp_store.extra_data.items.len) {
+                        const lo_raw = temp_store.extra_data.items[cur_node.data.rhs];
+                        const hi_raw = temp_store.extra_data.items[cur_node.data.rhs + 1];
+                        if (lo_raw != mir.NONE_U32) try visit_stack.append(allocator, lo_raw);
+                        if (hi_raw != mir.NONE_U32) try visit_stack.append(allocator, hi_raw);
+                    }
                 },
                 else => {},
             }
@@ -12194,12 +13738,21 @@ pub fn lowerAndVerifySourceMirSast(
 
 /// Read-only sign-biased `Intv` fixpoint result over a single `MirBody`.
 const SolvedBodyIntervals = struct {
+    /// Classified scalar integer bit-width/signedness domain per SSA value (`null` for non-integer values).
     val_domains: []?ScalarIntDomain,
+    /// Converged sign-biased interval bound per SSA value (`len == body.insts.len`).
     val_intv: []Intv,
+    /// Reachability flag per basic block under interval constant-branch pruning (`len == block_count`).
     is_intv_reachable: []bool,
+    /// Saturated count of whole-local stores observed per `LocalId` (`len == local_count`).
     local_store_counts: []u32,
+    /// Saturated count of slice/length-mutating writes observed per `LocalId` (`len == local_count`).
+    slice_len_store_counts: []u32,
+    /// Temporary per-edge SSA value interval refinements scratch buffer (`len == body.insts.len`).
     val_overrides: []?Intv,
+    /// Temporary per-edge local variable interval refinements scratch buffer (`len == local_count`).
     local_overrides: []?Intv,
+    /// Temporary per-edge slice `.len` interval refinements scratch buffer (`len == local_count`).
     slice_len_overrides: []?Intv,
 };
 
@@ -12226,6 +13779,8 @@ fn solveBodySignBiasedIntervals(
 
     const local_store_counts = try arena_alloc.alloc(u32, local_count);
     @memset(local_store_counts, 0);
+    const slice_len_store_counts = try arena_alloc.alloc(u32, local_count);
+    @memset(slice_len_store_counts, 0);
     const local_unique_val = try arena_alloc.alloc(u32, local_count);
     @memset(local_unique_val, mir.NONE_U32);
     const local_unique_bb = try arena_alloc.alloc(u32, local_count);
@@ -12237,6 +13792,7 @@ fn solveBodySignBiasedIntervals(
         const loc = body.locals.items[loc_i];
         if (loc.flags().is_arg and loc.mode() != .set_mode) {
             local_store_counts[loc_i] = 1;
+            slice_len_store_counts[loc_i] = 1;
         }
     }
 
@@ -12245,9 +13801,13 @@ fn solveBodySignBiasedIntervals(
         for (body.getBlockInsts(MirBlockId.fromInt(b_u32))) |inst_vid| {
             const inst = body.getInst(inst_vid);
             if (inst.op == .place_store and inst.operands.lhs < body.places.items.len) {
+                const pl_id = PlaceId.fromInt(inst.operands.lhs);
                 const pl_rec = body.places.items[inst.operands.lhs];
                 if (pl_rec.base < local_count) {
                     local_store_counts[pl_rec.base] +|= 1;
+                    if (!hasPlaceElementIndexProjection(body, pl_id)) {
+                        slice_len_store_counts[pl_rec.base] +|= 1;
+                    }
                     if (pl_rec.proj_len == 0 and local_store_counts[pl_rec.base] == 1) {
                         local_unique_val[pl_rec.base] = inst.operands.rhs;
                         local_unique_bb[pl_rec.base] = b_u32;
@@ -12257,19 +13817,27 @@ fn solveBodySignBiasedIntervals(
                     }
                 }
             } else if (inst.op == .place_set_discrim and inst.operands.lhs < body.places.items.len) {
+                const pl_id = PlaceId.fromInt(inst.operands.lhs);
                 const base = body.places.items[inst.operands.lhs].base;
                 if (base < local_count) {
                     local_store_counts[base] +|= 1;
+                    if (!hasPlaceElementIndexProjection(body, pl_id)) {
+                        slice_len_store_counts[base] +|= 1;
+                    }
                     local_unique_val[base] = mir.NONE_U32;
                     local_unique_bb[base] = mir.NONE_U32;
                 }
             } else if (inst.op == .place_addr and inst.operands.lhs < body.places.items.len) {
                 const unwrapped = pool.unwrapUnderlyingType(inst.type_id);
                 if (!unwrapped.isError() and pool.getNode(unwrapped).tag != .ref_ty) {
+                    const pl_id = PlaceId.fromInt(inst.operands.lhs);
                     const base = body.places.items[inst.operands.lhs].base;
                     if (base < local_count) {
-                        has_mut_addr_taken[base] = true;
                         local_store_counts[base] = 2;
+                        if (!hasPlaceElementIndexProjection(body, pl_id)) {
+                            has_mut_addr_taken[base] = true;
+                            slice_len_store_counts[base] = 2;
+                        }
                         local_unique_val[base] = mir.NONE_U32;
                         local_unique_bb[base] = mir.NONE_U32;
                     }
@@ -12279,9 +13847,13 @@ fn solveBodySignBiasedIntervals(
                 if ((ikind == .zero_pad or ikind == .drop_in_place or ikind == .drop_if_live) and
                     inst.operands.lhs < body.places.items.len)
                 {
+                    const pl_id = PlaceId.fromInt(inst.operands.lhs);
                     const base = body.places.items[inst.operands.lhs].base;
                     if (base < local_count) {
                         local_store_counts[base] +|= 1;
+                        if (!hasPlaceElementIndexProjection(body, pl_id)) {
+                            slice_len_store_counts[base] +|= 1;
+                        }
                         local_unique_val[base] = mir.NONE_U32;
                         local_unique_bb[base] = mir.NONE_U32;
                     }
@@ -12294,9 +13866,13 @@ fn solveBodySignBiasedIntervals(
             const mode = body.call_arg_modes.items[call_site.modes_start + arg_i];
             const word = body.extra_args.items[call_site.args_start + arg_i];
             if ((mode == .inout_mode or mode == .set_mode) and word < body.places.items.len) {
+                const pl_id = PlaceId.fromInt(word);
                 const base = body.places.items[word].base;
                 if (base < local_count) {
                     local_store_counts[base] = 2;
+                    if (!hasPlaceElementIndexProjection(body, pl_id)) {
+                        slice_len_store_counts[base] = 2;
+                    }
                     local_unique_val[base] = mir.NONE_U32;
                     local_unique_bb[base] = mir.NONE_U32;
                 }
@@ -12428,6 +14004,7 @@ fn solveBodySignBiasedIntervals(
                 val_domains,
                 val_intv,
                 local_store_counts,
+                slice_len_store_counts,
                 val_overrides,
                 local_overrides,
                 slice_len_overrides,
@@ -12453,6 +14030,7 @@ fn solveBodySignBiasedIntervals(
                             local_overrides,
                             slice_len_overrides,
                             local_store_counts,
+                            slice_len_store_counts,
                         );
                     },
                     .place_load => {
@@ -12461,7 +14039,7 @@ fn solveBodySignBiasedIntervals(
                             new_iv = Intv.initUnsigned(arr_len, arr_len);
                         } else if (extractLoadedPlaceKey(body, v_idx)) |pkey| {
                             if (pkey.isSliceLen() and pkey.base_local < local_count and
-                                local_store_counts[pkey.base_local] <= 1)
+                                slice_len_store_counts[pkey.base_local] <= 1)
                             {
                                 if (slice_len_overrides[pkey.base_local]) |sl_ov| {
                                     new_iv = new_iv.meet(sl_ov);
@@ -12481,6 +14059,7 @@ fn solveBodySignBiasedIntervals(
                                         local_overrides,
                                         slice_len_overrides,
                                         local_store_counts,
+                                        slice_len_store_counts,
                                     );
                                 }
                                 if (local_overrides[pkey.base_local]) |loc_ov| {
@@ -12502,7 +14081,9 @@ fn solveBodySignBiasedIntervals(
                             const pl_rec = body.places.items[inst.operands.lhs];
                             if (pl_rec.base < local_count) {
                                 local_overrides[pl_rec.base] = null;
-                                slice_len_overrides[pl_rec.base] = null;
+                                if (!hasPlaceElementIndexProjection(body, pl_id)) {
+                                    slice_len_overrides[pl_rec.base] = null;
+                                }
                                 if (pl_rec.proj_len == 0 and inst.operands.rhs < inst_count) {
                                     local_overrides[pl_rec.base] = readDomRefinedIntv(
                                         body,
@@ -12512,6 +14093,7 @@ fn solveBodySignBiasedIntervals(
                                         local_overrides,
                                         slice_len_overrides,
                                         local_store_counts,
+                                        slice_len_store_counts,
                                     );
                                 }
                             }
@@ -12530,7 +14112,9 @@ fn solveBodySignBiasedIntervals(
                             const base = body.places.items[inst.operands.lhs].base;
                             if (base < local_count) {
                                 local_overrides[base] = null;
-                                slice_len_overrides[base] = null;
+                                if (!hasPlaceElementIndexProjection(body, pl_id)) {
+                                    slice_len_overrides[base] = null;
+                                }
                             }
                         }
                     },
@@ -12538,10 +14122,13 @@ fn solveBodySignBiasedIntervals(
                         if (inst.operands.lhs < body.places.items.len) {
                             const unwrapped = pool.unwrapUnderlyingType(inst.type_id);
                             if (!unwrapped.isError() and pool.getNode(unwrapped).tag != .ref_ty) {
+                                const pl_id = PlaceId.fromInt(inst.operands.lhs);
                                 const base = body.places.items[inst.operands.lhs].base;
                                 if (base < local_count) {
                                     local_overrides[base] = null;
-                                    slice_len_overrides[base] = null;
+                                    if (!hasPlaceElementIndexProjection(body, pl_id)) {
+                                        slice_len_overrides[base] = null;
+                                    }
                                 }
                             }
                         }
@@ -12556,6 +14143,7 @@ fn solveBodySignBiasedIntervals(
                             local_overrides,
                             slice_len_overrides,
                             local_store_counts,
+                            slice_len_store_counts,
                         );
                         const src_dom = if (inst.operands.lhs < inst_count) val_domains[inst.operands.lhs] else null;
                         new_iv = evalUnaryOpIntv(uk, src_iv, src_dom, dst_dom_opt);
@@ -12570,6 +14158,7 @@ fn solveBodySignBiasedIntervals(
                             local_overrides,
                             slice_len_overrides,
                             local_store_counts,
+                            slice_len_store_counts,
                         );
                         const rhs_iv = readDomRefinedIntv(
                             body,
@@ -12579,6 +14168,7 @@ fn solveBodySignBiasedIntervals(
                             local_overrides,
                             slice_len_overrides,
                             local_store_counts,
+                            slice_len_store_counts,
                         );
                         const l_dom = if (inst.operands.lhs < inst_count) val_domains[inst.operands.lhs] else null;
                         const r_dom = if (inst.operands.rhs < inst_count) val_domains[inst.operands.rhs] else null;
@@ -12644,6 +14234,7 @@ fn solveBodySignBiasedIntervals(
                                             local_overrides,
                                             slice_len_overrides,
                                             local_store_counts,
+                                            slice_len_store_counts,
                                         );
                                         if (!src_iv.isBottom()) {
                                             const sb = decodeIntvToI128(src_iv, sd);
@@ -12680,6 +14271,7 @@ fn solveBodySignBiasedIntervals(
                     local_overrides,
                     slice_len_overrides,
                     local_store_counts,
+                    slice_len_store_counts,
                 );
                 const then_dst = body.extra_edges.items[term.edge_start].target_bb.asInt();
                 const else_dst = body.extra_edges.items[term.edge_start + 1].target_bb.asInt();
@@ -12723,6 +14315,7 @@ fn solveBodySignBiasedIntervals(
         .val_intv = val_intv,
         .is_intv_reachable = is_intv_reachable,
         .local_store_counts = local_store_counts,
+        .slice_len_store_counts = slice_len_store_counts,
         .val_overrides = val_overrides,
         .local_overrides = local_overrides,
         .slice_len_overrides = slice_len_overrides,
@@ -12794,6 +14387,7 @@ fn recordOneProvenRange(
             solved_ref.local_overrides,
             solved_ref.slice_len_overrides,
             solved_ref.local_store_counts,
+            solved_ref.slice_len_store_counts,
         );
         if (iv.isBottom()) return;
         const min_bits: u64 = if (dom_info.is_signed)
@@ -12914,6 +14508,7 @@ pub fn computeBodyProvenRanges(
             solved.val_domains,
             solved.val_intv,
             solved.local_store_counts,
+            solved.slice_len_store_counts,
             solved.val_overrides,
             solved.local_overrides,
             solved.slice_len_overrides,

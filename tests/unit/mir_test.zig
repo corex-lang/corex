@@ -1188,3 +1188,315 @@ test "test_mir_poison_projection_recovery_preserves_v3_place_soundness" {
         );
     }
 }
+
+// Phase 7.5 (`DR-21` `SE-01`–`SE-08`) MIR Lowering, Verifier & `MirVm` Tests:
+
+test "test_phase75_mir_cond_scope_se01_se02_orelse_se03_dollar_slice_se04_se05_and_pats_se06" {
+    // [1] `SE-01` (`is`) + `SE-02` (`:=` walrus) conjunctive `if` / `else if` / `while` & `SE-03` `orelse`:
+    const cond_and_orelse_src =
+        \\pub fn maybe_double(input_val: i64) -> i64? {
+        \\    if input_val > 0 {
+        \\        return .Some(input_val * 2);
+        \\    }
+        \\    return .None;
+        \\}
+        \\pub fn bump_counter(counter: &mut i64, delta: i64) -> i64 {
+        \\    *counter = *counter + delta;
+        \\    return *counter;
+        \\}
+        \\pub fn check_orelse_skips_errdefer(opt_in: i64?) -> Result[i64, i64] {
+        \\    var trace_log: i64 = 10;
+        \\    errdefer {
+        \\        trace_log = 999;
+        \\    }
+        \\    let resolved_val: i64 = opt_in orelse bump_counter(&mut trace_log, 5);
+        \\    return .Ok(resolved_val * 100 + trace_log);
+        \\}
+        \\pub fn eval_cond_scope(seed_val: i64) -> i64 {
+        \\    var step_acc: i64 = 0;
+        \\    let branch_score: i64 = if maybe_double(seed_val) is .Some(doubled) and (shifted := doubled + 3) > 10 {
+        \\        shifted
+        \\    } else if (fallback_v := seed_val + 7) > 8 {
+        \\        fallback_v * 10
+        \\    } else {
+        \\        1
+        \\    };
+        \\    var cursor_opt: i64? = .Some(3);
+        \\    while cursor_opt is .Some(rem_val) and (next_rem := rem_val - 1) >= 0 {
+        \\        step_acc = step_acc + rem_val;
+        \\        cursor_opt = if next_rem > 0 { .Some(next_rem) } else { .None };
+        \\    }
+        \\    let ok_some: i64 = match check_orelse_skips_errdefer(.Some(4)) {
+        \\        .Ok(score_a) => score_a,
+        \\        .Err(_) => -1,
+        \\    };
+        \\    let ok_none: i64 = match check_orelse_skips_errdefer(.None) {
+        \\        .Ok(score_b) => score_b,
+        \\        .Err(_) => -1,
+        \\    };
+        \\    return branch_score + step_acc + ok_some + ok_none;
+        \\}
+    ;
+
+    // `seed_val = 5` yields `shifted = 13`, `step_acc = 6`, `ok_some = 410`, and `ok_none = 1515`;
+    // expected sum `13 + 6 + 410 + 1515 = 1944`:
+    try std.testing.expectEqual(
+        @as(i64, 1944),
+        try lowerVerifyAndEvalI64(
+            std.testing.allocator,
+            cond_and_orelse_src,
+            TargetLayout.NATIVE_64,
+            "eval_cond_scope",
+            &[_]mir_vm.RegSlot{.{ .scalar_i64 = 5 }},
+        ),
+    );
+
+    // `seed_val = 2` takes `else if` `fallback_v = 9 > 8` (`90`); expected sum `90 + 6 + 410 + 1515 = 2021`:
+    try std.testing.expectEqual(
+        @as(i64, 2021),
+        try lowerVerifyAndEvalI64(
+            std.testing.allocator,
+            cond_and_orelse_src,
+            TargetLayout.NATIVE_64,
+            "eval_cond_scope",
+            &[_]mir_vm.RegSlot{.{ .scalar_i64 = 2 }},
+        ),
+    );
+
+    // [2] `SE-04` (`$` `is_dollar_sub`), `SE-05` (`..` / `..=` subslice), `SE-06` (`at_pat` + `slice_pat`), `SE-07`:
+    const slice_and_pat_src =
+        \\pub fn weighted_add(lhs_num: i64, scale: i64 = 2, bias: i64 = 5) -> i64 {
+        \\    return lhs_num * scale + bias;
+        \\}
+        \\pub fn classify_slice(window: &[i64], tag_opt: i64?) -> i64 {
+        \\    let pat_score: i64 = match window {
+        \\        [] => 0,
+        \\        [only_elem] => only_elem,
+        \\        [head_elem, ..middle_rest, tail_elem] => head_elem * 100 + (middle_rest.len as i64) * 10 + tail_elem,
+        \\    };
+        \\    let at_score: i64 = match tag_opt {
+        \\        whole_opt @ .Some(inner_v) => if whole_opt is .Some(check_v) { inner_v + check_v } else { 0 },
+        \\        .None => 0,
+        \\    };
+        \\    return pat_score + at_score;
+        \\}
+        \\pub fn run_dollar_and_patterns() -> i64 {
+        \\    let outer_arr: [i64; 6] = [10, 20, 30, 40, 50, 60];
+        \\    let inner_arr: [usize; 3] = [4, 2, 1];
+        \\    let nested_sub: &[i64] = outer_arr[inner_arr[$ - 1]..$ - 1];
+        \\    let incl_sub: &[i64] = outer_arr[1..=3];
+        \\    let word_mid: str = "corex"[1..$ - 1];
+        \\    let piped_val: i64 = (nested_sub[$ - 1] + incl_sub[$ - 1] + (word_mid.len as i64))
+        \\        |> weighted_add(bias: 7, scale: 3);
+        \\    return piped_val + classify_slice(nested_sub, .Some(6));
+        \\}
+    ;
+
+    var sp_bundle = try mir.lowerSourceToMir(
+        std.testing.allocator,
+        FileId.fromInt(2),
+        slice_and_pat_src,
+        TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer sp_bundle.deinit();
+    try std.testing.expect(!sp_bundle.hir_bundle.diagnostics.hasErrors());
+    const run_body = sp_bundle.mir_bundle.findBodyByName(
+        &sp_bundle.hir_bundle.interner,
+        "run_dollar_and_patterns",
+    ).?;
+    var has_dollar_sub_inst = false;
+    for (0..run_body.insts.len) |inst_i| {
+        const inst = run_body.insts.get(inst_i);
+        if (inst.op == .bin_op and inst.flags.is_dollar_sub and
+            inst.aux_u16 == @intFromEnum(mir.BinOpKind.usub_checked))
+        {
+            has_dollar_sub_inst = true;
+            break;
+        }
+    }
+    try std.testing.expect(has_dollar_sub_inst);
+
+    // `nested_sub = [20, 30, 40, 50]`, `incl_sub = [20, 30, 40]`, `word_mid = "ore"` (`piped_val = 286`);
+    // `classify_slice(nested_sub, .Some(6)) = 2082`, yielding `286 + 2082 = 2368`:
+    try std.testing.expectEqual(
+        @as(i64, 2368),
+        try lowerVerifyAndEvalI64(
+            std.testing.allocator,
+            slice_and_pat_src,
+            TargetLayout.NATIVE_64,
+            "run_dollar_and_patterns",
+            &.{},
+        ),
+    );
+}
+
+test "test_phase75_mir_v6_contextless_ctx_intrinsic_and_vm_with_context_se08" {
+    // [1] `SE-08` `V6`: `is_contextless` `MirBody` containing `MirIntrinsicKind.ctx_get` fails verification:
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+    var sym_table = try SymbolTable.init(std.testing.allocator, &interner);
+    defer sym_table.deinit();
+
+    var bad_ctx_body = MirBody.init(
+        std.testing.allocator,
+        FileId.fromInt(3),
+        DefId.init(FileId.fromInt(3), 0),
+    );
+    defer bad_ctx_body.deinit();
+    bad_ctx_body.ret_ty = .u64_ty;
+    bad_ctx_body.is_contextless = true;
+    bad_ctx_body.is_ghost_stripped = true;
+    bad_ctx_body.has_ghost_instructions = false;
+    _ = try pushLocal(
+        &bad_ctx_body,
+        LocalDecl.init(
+            .empty,
+            .u64_ty,
+            TokenIndex.fromInt(0),
+            0,
+            .let_mode,
+            .{ .is_return_slot = true },
+        ),
+    );
+    var ssa = MirSsaBuilder.init(std.testing.allocator, &bad_ctx_body, &.{}, null);
+    defer ssa.deinit();
+    const entry_bb = try ssa.createBlock(true, false);
+    const slot_ord_v = try emitIntConst(&bad_ctx_body, &ssa, entry_bb, .u32_ty, 5);
+    const args_start: u32 = @intCast(bad_ctx_body.extra_args.items.len);
+    try bad_ctx_body.extra_args.append(std.testing.allocator, slot_ord_v.asInt());
+    const ctx_val = try ssa.emitInst(entry_bb, .{
+        .op = .intrinsic_op,
+        .flags = .{ .has_side_effects = true },
+        .aux_u16 = @intFromEnum(mir.MirIntrinsicKind.ctx_get),
+        .type_id = .u64_ty,
+        .operands = .{ .lhs = args_start, .rhs = 1 },
+    }, TokenIndex.fromInt(0));
+    ssa.setTerminator(entry_bb, .{ .kind = .ret, .cond_or_val = ctx_val.asInt() });
+    try ssa.finish();
+
+    try std.testing.expectError(
+        error.V6ContextlessCallViolation,
+        mir.verifyMirBody(std.testing.allocator, &bad_ctx_body, &pool, &sym_table, null),
+    );
+
+    // [2] `SE-08` `with context.cancel_token`: `MirVm` `PureCallMemoCache` never caches stale `context` reads:
+    const with_ctx_src =
+        \\pub fn read_token_plus(offset: u64) -> u64 {
+        \\    return (context.cancel_token._handle as u64) + offset;
+        \\}
+        \\pub fn run_scoped_tokens() -> i64 {
+        \\    let outer_tok = CancelToken { _handle: 40 };
+        \\    let inner_tok = CancelToken { _handle: 100 };
+        \\    let first_read: u64 = with context.cancel_token = outer_tok {
+        \\        let inner_read: u64 = with context.cancel_token = inner_tok {
+        \\            read_token_plus(5)
+        \\        };
+        \\        inner_read + read_token_plus(5)
+        \\    };
+        \\    let restored_read: u64 = read_token_plus(5);
+        \\    return (first_read + restored_read) as i64;
+        \\}
+    ;
+    // `inner_read = 105`, outer `read_token_plus(5)` after inner restore = `45`, `restored_read = 5` -> `155`:
+    try std.testing.expectEqual(
+        @as(i64, 155),
+        try lowerVerifyAndEvalI64(
+            std.testing.allocator,
+            with_ctx_src,
+            TargetLayout.NATIVE_64,
+            "run_scoped_tokens",
+            &.{},
+        ),
+    );
+}
+
+test "test_regression_comptime_with_context_allocator_synthetic_ptr_cast" {
+    const comptime_ctx_src =
+        \\pub struct Arena {
+        \\    pub cap: usize,
+        \\}
+        \\impl Arena {
+        \\    pub fn release(&mut self) {}
+        \\}
+        \\pub struct LocalLog {
+        \\    pub level: u32,
+        \\}
+        \\impl LocalLog {
+        \\    pub fn as_handle(&self) -> usize = 0;
+        \\}
+        \\pub fn run_ctx_arena_and_log() -> i64 {
+        \\    let _ = context.allocator;
+        \\    let _ = context.logger;
+        \\    var arena = Arena { cap: 56 };
+        \\    defer arena.release();
+        \\    let local_log = LocalLog { level: 3 };
+        \\    let scoped_val: i64 = with context.allocator = &mut arena, context.logger = &local_log {
+        \\        (if context.allocator._handle != 0 { 200 } else { 0 }) + (local_log.level as i64)
+        \\    };
+        \\    return scoped_val + (arena.cap as i64);
+        \\}
+        \\pub const CT_ARENA_RES: i64 = run_ctx_arena_and_log();
+    ;
+
+    try std.testing.expectEqual(
+        @as(i64, 259),
+        try lowerVerifyAndEvalI64(
+            std.testing.allocator,
+            comptime_ctx_src,
+            TargetLayout.NATIVE_64,
+            "run_ctx_arena_and_log",
+            &.{},
+        ),
+    );
+
+    var db = try corex.CompilerDb.init(std.testing.allocator);
+    defer db.deinit();
+    const ok_file = FileId.fromInt(40);
+    _ = try db.setInput(ok_file, comptime_ctx_src, .low);
+    const ok_tree = try db.extractItemTree(ok_file);
+    var ct_def: ?DefId = null;
+    for (ok_tree.entries) |entry| {
+        if (std.mem.eql(u8, entry.name_text, "CT_ARENA_RES")) {
+            ct_def = entry.def_id;
+            break;
+        }
+    }
+    const ct_art = try db.evalComptimeDef(ct_def.?);
+    try std.testing.expect(!ct_art.has_errors);
+    try std.testing.expectEqual(@as(i128, 259), ct_art.value.int_val);
+
+    // User-written pointer-to-integer cast at `comptime` (`is_synthetic == false`) still emits `E0503`:
+    const bad_ptr_cast_src =
+        \\pub fn cast_user_ptr() -> usize {
+        \\    let local_num: i64 = 7;
+        \\    let raw_ptr: *i64 = &local_num as *i64;
+        \\    return unsafe { raw_ptr as usize };
+        \\}
+        \\pub const BAD_PTR_INT: usize = cast_user_ptr();
+    ;
+    const bad_file = FileId.fromInt(41);
+    _ = try db.setInput(bad_file, bad_ptr_cast_src, .low);
+    const bad_tree = try db.extractItemTree(bad_file);
+    var bad_def: ?DefId = null;
+    for (bad_tree.entries) |entry| {
+        if (std.mem.eql(u8, entry.name_text, "BAD_PTR_INT")) {
+            bad_def = entry.def_id;
+            break;
+        }
+    }
+    const bad_art = try db.evalComptimeDef(bad_def.?);
+    try std.testing.expect(bad_art.has_errors);
+    var has_e0503 = false;
+    for (db.getComptimeDiagnostics(bad_def.?).?.diagnostics.items) |diag_item| {
+        if (diag_item.code == .e0503_forbidden_comptime_operation) {
+            has_e0503 = true;
+            break;
+        }
+    }
+    try std.testing.expect(has_e0503);
+}
+
+

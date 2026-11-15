@@ -171,6 +171,10 @@ const CModuleEmitter = struct {
     closure_thunks: std.ArrayListUnmanaged(ClosureThunkSpec) = .empty,
     /// Index of CoreX `main` in `input.bodies` if present (`null` for libraries).
     entry_main_body_idx: ?u32 = null,
+    /// Whether any `MirBody` executes `ctx_get` or `ctx_set` (`SE-08`).
+    has_context_ops: bool = false,
+    /// Aligned per-slot byte stride for `_cx_tls_ctx` (`>= 8`, expanded for wide nominal slots).
+    ctx_slot_stride_bytes: u64 = 8,
     /// Monotonic per-function temporary counter reset at the start of each `MirBody`.
     temp_counter: u32 = 0,
 
@@ -1529,6 +1533,20 @@ fn indexModuleEntities(emitter: *CModuleEmitter) !void {
                     if (!(try emitter.type_name_set.getOrPut(emitter.allocator, refl_ty.toU32())).found_existing) {
                         try emitter.type_name_ids.append(emitter.allocator, refl_ty.toU32());
                     }
+                } else if (ikind == .ctx_get or ikind == .ctx_set) {
+                    emitter.has_context_ops = true;
+                    const call_args = body_ptr.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs];
+                    const slot_val_ty = if (ikind == .ctx_get)
+                        inst.type_id
+                    else if (call_args.len >= 2)
+                        body_ptr.getInst(MirValueId.fromInt(call_args[1])).type_id
+                    else
+                        .unit_ty;
+                    const slot_lay = try emitter.resolver.resolveType(slot_val_ty);
+                    const aligned_sz = std.mem.alignForward(u64, @max(slot_lay.size_bytes, 8), 8);
+                    if (aligned_sz > emitter.ctx_slot_stride_bytes) {
+                        emitter.ctx_slot_stride_bytes = aligned_sz;
+                    }
                 }
             }
         }
@@ -2020,6 +2038,13 @@ fn emitRodataAndDevSeam(emitter: *CModuleEmitter, dev_seam_out: *?[]u8) !void {
         );
     }
 
+    if (emitter.has_context_ops) {
+        try emitter.print(
+            "static CX_THREAD_LOCAL uint8_t __attribute__((aligned(16))) _cx_tls_ctx[{d}u] = {{0}};\n",
+            .{8 * emitter.ctx_slot_stride_bytes},
+        );
+    }
+
     if (emitter.input.is_dev_got_enabled) {
         try emitter.writeAll(
             \\typedef struct __attribute__((aligned(64))) _cx_reload_ctrl_t {
@@ -2119,7 +2144,7 @@ fn buildDevSeamBytes(emitter: *CModuleEmitter) ![]u8 {
 
 // --------- Prototypes, Drop Helpers & Closure Thunks ----------
 
-/// Finds the 0-based `MirBody` index implementing `Drop::drop` for unwrapped `ty` (`null` if none).
+/// Finds the 0-based `MirBody` index implementing `Drop.drop` for unwrapped `ty` (`null` if none).
 fn lookupDropBodyIndexForType(emitter: *const CModuleEmitter, ty: TypeId) ?u32 {
     const ty_node = emitter.input.pool.getNode(ty);
     if (ty_node.tag == .struct_ty or ty_node.tag == .enum_ty or ty_node.tag == .union_ty) {
@@ -2142,7 +2167,6 @@ fn lookupDropBodyIndexForType(emitter: *const CModuleEmitter, ty: TypeId) ?u32 {
         if (cand_body.param_count != 1 or cand_body.locals.items.len < 2) continue;
         const fn_name = emitter.input.interner.get(cand_body.name);
         if (!std.mem.eql(u8, fn_name, "drop") and
-            !std.mem.endsWith(u8, fn_name, "::drop") and
             !std.mem.endsWith(u8, fn_name, ".drop")) continue;
         const raw_param_ty = emitter.input.pool.unwrapUnderlyingType(cand_body.locals.items[1].type_id);
         const param_node = emitter.input.pool.getNode(raw_param_ty);
@@ -2441,7 +2465,7 @@ fn emitClosureThunkDefinition(emitter: *CModuleEmitter, thunk: ClosureThunkSpec)
     try emitter.writeAll(");\n}\n");
 }
 
-/// Emits `_cx_drop_ty_<id>` executing outer `Drop::drop` followed by reverse-order member destructors.
+/// Emits `_cx_drop_ty_<id>` executing outer `Drop.drop` followed by reverse-order member destructors.
 fn emitDropHelperDefinition(emitter: *CModuleEmitter, drop_ty: TypeId) !void {
     const drop_c = try formatCType(emitter, drop_ty);
     defer emitter.allocator.free(drop_c);
@@ -2759,7 +2783,10 @@ fn resolvePlaceResultType(emitter: *CModuleEmitter, body: *const MirBody, place_
             },
             .index => {
                 active_downcast = null;
-                cur_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+                cur_ty = if (cur_ty == .str_ty)
+                    .u8_ty
+                else
+                    emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
             },
             .soa_elem => {
                 active_downcast = null;
@@ -2967,10 +2994,15 @@ fn lowerPlaceC(emitter: *CModuleEmitter, body: *const MirBody, place_id: PlaceId
             },
             .index => {
                 active_downcast = null;
-                const elem_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+                const elem_ty = if (cur_ty == .str_ty)
+                    TypeId.u8_ty
+                else
+                    emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
                 const idx_expr = try formatSsaIndexUsizeExpr(emitter, body, MirValueId.fromInt(proj.payload));
                 defer emitter.allocator.free(idx_expr);
-                const next_expr = if (node.tag == .array_ty)
+                const next_expr = if (cur_ty == .str_ty)
+                    try std.fmt.allocPrint(emitter.allocator, "(((uint8_t *)(({s}).ptr))[{s}])", .{ cur_expr, idx_expr })
+                else if (node.tag == .array_ty)
                     try std.fmt.allocPrint(emitter.allocator, "(({s})._elems[{s}])", .{ cur_expr, idx_expr })
                 else
                     try std.fmt.allocPrint(emitter.allocator, "(({s}).ptr[{s}])", .{ cur_expr, idx_expr });
@@ -3413,6 +3445,26 @@ fn emitMirBody(emitter: *CModuleEmitter, body_idx: u32, body: *const MirBody) !v
                     "    {s} _stmp_{d}; memset(&_stmp_{d}, 0, sizeof(_stmp_{d}));\n",
                     .{ sl_c, inst_i, inst_i, inst_i },
                 );
+            }
+        }
+        if (inst.op == .intrinsic_op) {
+            if (@as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)) == .ctx_get) {
+                if (type_system.ContextFieldLayout.resolveRefPointee(
+                    emitter.input.pool,
+                    emitter.input.sym_table,
+                    inst.type_id,
+                )) |ctx_pointee| {
+                    if (try isZeroSizedType(emitter, ctx_pointee)) {
+                        try emitter.print("    uint8_t _ctx_snap_{d} = 0u;\n", .{inst_i});
+                    } else {
+                        const ctx_c = try formatCType(emitter, ctx_pointee);
+                        defer emitter.allocator.free(ctx_c);
+                        try emitter.print(
+                            "    {s} _ctx_snap_{d}; memset(&_ctx_snap_{d}, 0, sizeof(_ctx_snap_{d}));\n",
+                            .{ ctx_c, inst_i, inst_i, inst_i },
+                        );
+                    }
+                }
             }
         }
     }
@@ -5490,6 +5542,121 @@ fn emitIntrinsicOpC(
                 try emitter.writeAll("    _cx_rt_sys_exit(0);\n");
             }
         },
+        .subslice_make => {
+            if (args.len < 3) return;
+            const base_val = MirValueId.fromInt(args[0]);
+            const base_ty = emitter.input.pool.unwrapUnderlyingType(body.getInst(base_val).type_id);
+            const base_node = emitter.input.pool.getNode(base_ty);
+            const lo_expr = try formatSsaIndexUsizeExpr(emitter, body, MirValueId.fromInt(args[1]));
+            defer emitter.allocator.free(lo_expr);
+            const hi_expr = try formatSsaIndexUsizeExpr(emitter, body, MirValueId.fromInt(args[2]));
+            defer emitter.allocator.free(hi_expr);
+
+            const base_ptr_expr: []u8 = if (base_ty == .str_ty or
+                base_node.tag == .slice_ty or
+                base_node.tag == .soa_slice_ty)
+                try std.fmt.allocPrint(emitter.allocator, "((uintptr_t)(_v_{d}.ptr))", .{args[0]})
+            else if (base_node.tag == .ref_ty or
+                base_node.tag == .mut_ref_ty or
+                base_node.tag == .raw_ptr_ty)
+            blk_ref: {
+                const pt_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(base_node.lhs));
+                const pt_tag = emitter.input.pool.getNode(pt_ty).tag;
+                if (pt_ty == .str_ty or pt_tag == .slice_ty or pt_tag == .soa_slice_ty) {
+                    break :blk_ref try std.fmt.allocPrint(
+                        emitter.allocator,
+                        "((uintptr_t)(_v_{d}->ptr))",
+                        .{args[0]},
+                    );
+                }
+                break :blk_ref try std.fmt.allocPrint(emitter.allocator, "((uintptr_t)_v_{d})", .{args[0]});
+            } else if (try isZeroSizedType(emitter, base_ty))
+                try emitter.allocator.dupe(u8, "((uintptr_t)1u)")
+            else
+                try std.fmt.allocPrint(emitter.allocator, "((uintptr_t)(&_v_{d}._elems[0]))", .{args[0]});
+            defer emitter.allocator.free(base_ptr_expr);
+
+            const sl_ref_pt = resolveSliceRefPointee(emitter, inst.type_id);
+            const sl_ty = sl_ref_pt orelse emitter.input.pool.unwrapUnderlyingType(inst.type_id);
+            const elem_ty = if (sl_ty == .str_ty)
+                TypeId.u8_ty
+            else
+                emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(sl_ty).lhs));
+            const elem_lay = try emitter.resolver.resolveType(elem_ty);
+            const elem_ptr_c: []u8 = if (sl_ty == .str_ty or (try isZeroSizedType(emitter, elem_ty)))
+                try emitter.allocator.dupe(u8, "uint8_t *")
+            else blk_ep: {
+                const elem_c = try formatCType(emitter, elem_ty);
+                defer emitter.allocator.free(elem_c);
+                break :blk_ep try std.fmt.allocPrint(emitter.allocator, "{s} *", .{elem_c});
+            };
+            defer emitter.allocator.free(elem_ptr_c);
+
+            const usize_c = if (emitter.cfg.target.ptrBytes() == 4) "uint32_t" else "uint64_t";
+            if (sl_ref_pt != null) {
+                try emitter.print(
+                    "    _stmp_{d}.ptr = ({s})({s} + ((uintptr_t)({s}) * (uintptr_t){d}u)); " ++
+                        "_stmp_{d}.len = ({s})(({s}) - ({s})); _v_{d} = &_stmp_{d};\n",
+                    .{
+                        dst_raw,            elem_ptr_c, base_ptr_expr, lo_expr,
+                        elem_lay.stride_bytes, dst_raw,    usize_c,       hi_expr,
+                        lo_expr,            dst_raw,    dst_raw,
+                    },
+                );
+            } else {
+                try emitter.print(
+                    "    _v_{d}.ptr = ({s})({s} + ((uintptr_t)({s}) * (uintptr_t){d}u)); " ++
+                        "_v_{d}.len = ({s})(({s}) - ({s}));\n",
+                    .{
+                        dst_raw,               elem_ptr_c, base_ptr_expr, lo_expr,
+                        elem_lay.stride_bytes, dst_raw,    usize_c,       hi_expr,
+                        lo_expr,
+                    },
+                );
+            }
+        },
+        .ctx_get => {
+            if (args.len < 1 or (try isZeroSizedType(emitter, inst.type_id))) return;
+            if (type_system.ContextFieldLayout.resolveRefPointee(
+                emitter.input.pool,
+                emitter.input.sym_table,
+                inst.type_id,
+            )) |ctx_pointee| {
+                const dst_c = try formatCType(emitter, inst.type_id);
+                defer emitter.allocator.free(dst_c);
+                if (!(try isZeroSizedType(emitter, ctx_pointee))) {
+                    const ctx_lay = try emitter.resolver.resolveType(ctx_pointee);
+                    try emitter.print(
+                        "    memset(&_ctx_snap_{d}, 0, sizeof(_ctx_snap_{d}));\n",
+                        .{ dst_raw, dst_raw },
+                    );
+                    var decl_ord: u32 = 0;
+                    while (decl_ord < ctx_lay.aux_len and decl_ord < 8) : (decl_ord += 1) {
+                        const fld = emitter.resolver.fields_by_decl.items[ctx_lay.aux_start + decl_ord];
+                        if (fld.size_bytes == 0 or fld.size_bytes > emitter.ctx_slot_stride_bytes) continue;
+                        try emitter.print(
+                            "    memcpy(&_ctx_snap_{d}._f{d}, &_cx_tls_ctx[{d}u * {d}u], {d}u);\n",
+                            .{ dst_raw, decl_ord, decl_ord, emitter.ctx_slot_stride_bytes, fld.size_bytes },
+                        );
+                    }
+                }
+                try emitter.print("    _v_{d} = ({s})&_ctx_snap_{d};\n", .{ dst_raw, dst_c, dst_raw });
+                return;
+            }
+            try emitter.print(
+                "    memcpy(&_v_{d}, &_cx_tls_ctx[(((size_t)_v_{d}) & 7u) * {d}u], sizeof(_v_{d}));\n",
+                .{ dst_raw, args[0], emitter.ctx_slot_stride_bytes, dst_raw },
+            );
+        },
+        .ctx_set => {
+            if (args.len < 2) return;
+            if (try isZeroSizedType(emitter, body.getInst(MirValueId.fromInt(args[1])).type_id)) return;
+            try emitter.print(
+                "    memcpy(&_cx_tls_ctx[(((size_t)_v_{d}) & 7u) * {d}u], &_v_{d}, sizeof(_v_{d}));\n",
+                .{ args[0], emitter.ctx_slot_stride_bytes, args[1], args[1] },
+            );
+        },
+        .ghost_ctx_region_push, .ghost_ctx_region_pop => {},
     }
 }
 

@@ -1,7 +1,7 @@
 //! High-Speed Deterministic Lexer & Lossless Trivia Scanner
 //!
 //! Scans UTF-8 source buffers into a contiguous Structure-of-Arrays (SoA) `TokenBuffer` in a single
-//! non-backtracking $O(N)$ linear pass while enforcing the `DR-03` 112-token lexical taxonomy.
+//! non-backtracking $O(N)$ linear pass while enforcing the `DR-03` & `DR-21` 117-token lexical taxonomy.
 //!
 //! Preserves 100% of source bytes across leading/trailing `TriviaPiece` slices (`<= 65,535`-byte chunking,
 //! slot-14 coalescing, carrier token flushing past `983,025` trivia bytes, and `E0104` tail preservation)
@@ -133,6 +133,7 @@ pub const TriviaAccumulator = struct {
             if (second_len <= room_in_first) {
                 // Merge `pieces[i + 1]` completely into `pieces[i]` and shift subsequent slots left:
                 self.pieces[i].byte_len = @intCast(first_len + second_len);
+                self.pieces[i].flags |= syntax_arenas.TRIVIA_FLAG_COALESCED;
                 var j: usize = i + 1;
                 while (j + 1 < MAX_TRIVIA_SLOTS) : (j += 1) {
                     self.pieces[j] = self.pieces[j + 1];
@@ -143,8 +144,10 @@ pub const TriviaAccumulator = struct {
                 // Top up `pieces[i]` to 65,535 bytes by shifting bytes from `pieces[i + 1]`:
                 const transfer_bytes: u16 = @intCast(room_in_first);
                 self.pieces[i].byte_len = MAX_TRIVIA_PIECE_BYTES;
+                self.pieces[i].flags |= syntax_arenas.TRIVIA_FLAG_COALESCED;
                 self.pieces[i + 1].byte_offset += transfer_bytes;
                 self.pieces[i + 1].byte_len -= transfer_bytes;
+                self.pieces[i + 1].flags |= syntax_arenas.TRIVIA_FLAG_COALESCED;
             }
         }
         return self.count < MAX_TRIVIA_SLOTS or
@@ -178,6 +181,7 @@ pub const TriviaAccumulator = struct {
         if (slot14_room > 0) {
             const accepted: u16 = @intCast(@min(@as(usize, chunk_len), slot14_room));
             self.pieces[MAX_TRIVIA_SLOTS - 1].byte_len += accepted;
+            self.pieces[MAX_TRIVIA_SLOTS - 1].flags |= syntax_arenas.TRIVIA_FLAG_COALESCED;
             return accepted;
         }
 
@@ -249,7 +253,7 @@ pub const CHAR_CLASS_TABLE: [256]u8 = blk: {
     break :blk table;
 };
 
-/// Authoritative compile-time lookup map for all 45 language keywords and 19 primitive types (`DR-03` §5.2).
+/// Authoritative compile-time lookup map for all 49 language keywords and 19 primitive types (`DR-03` & `DR-21`).
 pub const KEYWORD_OR_PRIM_MAP = std.StaticStringMap(TokenKind).initComptime(.{
     .{ "Self", .kw_self_type },
     .{ "and", .kw_and },
@@ -263,6 +267,7 @@ pub const KEYWORD_OR_PRIM_MAP = std.StaticStringMap(TokenKind).initComptime(.{
     .{ "char", .prim_type },
     .{ "comptime", .kw_comptime },
     .{ "const", .kw_const },
+    .{ "context", .kw_context },
     .{ "continue", .kw_continue },
     .{ "defer", .kw_defer },
     .{ "else", .kw_else },
@@ -292,6 +297,7 @@ pub const KEYWORD_OR_PRIM_MAP = std.StaticStringMap(TokenKind).initComptime(.{
     .{ "never", .prim_type },
     .{ "not", .kw_not },
     .{ "or", .kw_or },
+    .{ "orelse", .kw_orelse },
     .{ "own", .kw_own },
     .{ "pub", .kw_pub },
     .{ "ref", .kw_ref },
@@ -309,12 +315,14 @@ pub const KEYWORD_OR_PRIM_MAP = std.StaticStringMap(TokenKind).initComptime(.{
     .{ "u8", .prim_type },
     .{ "union", .kw_union },
     .{ "unit", .prim_type },
+    .{ "unreachable", .kw_unreachable },
     .{ "unsafe", .kw_unsafe },
     .{ "use", .kw_use },
     .{ "usize", .prim_type },
     .{ "var", .kw_var },
     .{ "where", .kw_where },
     .{ "while", .kw_while },
+    .{ "with", .kw_with },
 });
 
 // -------------------------------------- INTERNALS --------------------------------------
@@ -400,14 +408,14 @@ fn isIdentifierWordBoundary(trimmed_ident: []const u8, index: usize) bool {
 }
 
 comptime {
-    std.debug.assert(KEYWORD_OR_PRIM_MAP.keys().len == 64);
+    std.debug.assert(KEYWORD_OR_PRIM_MAP.keys().len == 68);
 }
 
 // ------------------------------------- PUBLIC API --------------------------------------
 
 // --------------------- Identifier Casing ----------------------
 
-/// Looks up `lexeme` in the compile-time table of 45 language keywords and 19 primitive types.
+/// Looks up `lexeme` in the compile-time table of 49 language keywords and 19 primitive types.
 pub inline fn lookupKeywordOrPrim(lexeme: []const u8) ?TokenKind {
     return KEYWORD_OR_PRIM_MAP.get(lexeme);
 }
@@ -424,7 +432,7 @@ pub fn classifyIdentifierOrKeyword(lexeme: []const u8) IdentifierClassification 
         };
     }
 
-    // [1] Standalone `_` wildcard token (`72`):
+    // [1] Standalone `_` wildcard token (`77`):
     if (lexeme.len == 1 and lexeme[0] == '_') {
         return .{
             .kind = .underscore,
@@ -435,7 +443,7 @@ pub fn classifyIdentifierOrKeyword(lexeme: []const u8) IdentifierClassification 
         };
     }
 
-    // [2] Reserved language keywords (`0..44`) and primitive types (`45`):
+    // [2] Reserved language keywords (`0..48`) and primitive types (`49`):
     if (lookupKeywordOrPrim(lexeme)) |keyword_or_prim_kind| {
         return .{
             .kind = keyword_or_prim_kind,
@@ -480,7 +488,7 @@ pub fn classifyIdentifierOrKeyword(lexeme: []const u8) IdentifierClassification 
         }
     }
 
-    // [4] Lowercase or leading-underscore identifiers (`len >= 2`) always classify as `.ident` (`46`):
+    // [4] Lowercase or leading-underscore identifiers (`len >= 2`) always classify as `.ident` (`50`):
     if (!isAsciiUpper(lexeme[0])) {
         const is_valid_snake = (upper_count == 0) and !has_consecutive_underscores;
         return .{
@@ -492,7 +500,7 @@ pub fn classifyIdentifierOrKeyword(lexeme: []const u8) IdentifierClassification 
         };
     }
 
-    // [5] Uppercase-initial with lowercase or single capital without `_` (`T`, `V4`) -> `.type_ident` (`47`):
+    // [5] Uppercase-initial with lowercase or single capital without `_` (`T`, `V4`) -> `.type_ident` (`51`):
     if (has_lower or (upper_count == 1 and !has_underscore)) {
         const is_valid_pascal = !has_underscore;
         return .{
@@ -504,7 +512,7 @@ pub fn classifyIdentifierOrKeyword(lexeme: []const u8) IdentifierClassification 
         };
     }
 
-    // [6] All-caps with `upper_count >= 2` or `_` (`MAX_SIZE`, `PI_2`, `IO`) -> `.const_ident` (`48`):
+    // [6] All-caps with `upper_count >= 2` or `_` (`MAX_SIZE`, `PI_2`, `IO`) -> `.const_ident` (`52`):
     const is_valid_const = !has_consecutive_underscores and (lexeme[lexeme.len - 1] != '_');
     return .{
         .kind = .const_ident,
@@ -676,7 +684,7 @@ pub const Lexer = struct {
     file_id: FileId,
     /// Target Structure-of-Arrays token and trivia buffer.
     token_buffer: *TokenBuffer,
-    /// Optional diagnostic sink receiving `E0101`–`E0104`, `W0101`, and `W0201` diagnostics.
+    /// Optional diagnostic sink receiving `E0101`–`E0112`, `W0101`, and `W0201` diagnostics.
     diagnostic_sink: ?*DiagnosticSink,
     /// Optional string interner used to intern `SuggestedFix` replacement text.
     interner: ?*StringInterner,
@@ -686,6 +694,8 @@ pub const Lexer = struct {
     cursor: usize = 0,
     /// Leading trivia accumulator for the upcoming token.
     trivia_acc: TriviaAccumulator = .{},
+    /// Kind of the immediately preceding significant syntactic token (`.eof` at start of file).
+    prev_sig_kind: TokenKind = .eof,
 
     /// Initializes a `Lexer` with default `LexerOptions`.
     pub fn init(
@@ -1154,6 +1164,10 @@ pub const Lexer = struct {
                 self.cursor += 1;
                 break :blk .at;
             },
+            '$' => blk: {
+                self.cursor += 1;
+                break :blk .dollar;
+            },
             '?' => blk: {
                 self.cursor += 1;
                 break :blk .question;
@@ -1163,9 +1177,18 @@ pub const Lexer = struct {
                 break :blk .tilde;
             },
             ':' => blk: {
-                if (self.cursor + 1 < self.source.len and self.source[self.cursor + 1] == ':') {
-                    self.cursor += 2;
-                    break :blk .coloncolon;
+                if (self.cursor + 1 < self.source.len) {
+                    if (self.source[self.cursor + 1] == '=') {
+                        self.cursor += 2;
+                        break :blk .colon_eq;
+                    }
+                    if (self.source[self.cursor + 1] == ':') {
+                        const sep_start: u32 = @intCast(self.cursor);
+                        self.cursor += 2;
+                        has_lexer_error = true;
+                        try self.emitRetiredPathSeparatorError(sep_start, sep_start + 2);
+                        break :blk .dot;
+                    }
                 }
                 self.cursor += 1;
                 break :blk .colon;
@@ -1409,6 +1432,7 @@ pub const Lexer = struct {
                 effective_max_tokens,
             );
         }
+        self.prev_sig_kind = token_kind;
     }
 
     /// Scans an identifier, keyword, primitive type, or `_`, checking the `DR-03` casing invariant.
@@ -1438,6 +1462,30 @@ pub const Lexer = struct {
     fn scanNumericLiteral(self: *Lexer, has_lexer_error: *bool) !TokenKind {
         const start_offset = self.cursor;
         var is_malformed = false;
+
+        // [0] Tuple element projection after `.`: scan `[0-9]+` only and reject `[A-Za-z_]` (`E0103`):
+        if (self.prev_sig_kind == .dot) {
+            while (self.cursor < self.source.len and isDecimalDigit(self.source[self.cursor])) {
+                self.cursor += 1;
+            }
+            if (self.cursor < self.source.len and isIdentContinue(self.source[self.cursor])) {
+                while (self.cursor < self.source.len and isIdentContinue(self.source[self.cursor])) {
+                    self.cursor += 1;
+                }
+                if ((self.source[self.cursor - 1] == 'e' or self.source[self.cursor - 1] == 'E') and
+                    self.cursor < self.source.len and
+                    (self.source[self.cursor] == '+' or self.source[self.cursor] == '-'))
+                {
+                    self.cursor += 1;
+                    while (self.cursor < self.source.len and isIdentContinue(self.source[self.cursor])) {
+                        self.cursor += 1;
+                    }
+                }
+                has_lexer_error.* = true;
+                try self.emitNumericLiteralError(start_offset, self.cursor);
+            }
+            return .int_lit;
+        }
 
         // [1] Non-decimal radix integer literals (`0x`/`0X`, `0b`/`0B`, `0o`/`0O`):
         if (self.source[start_offset] == '0' and self.cursor + 1 < self.source.len) {
@@ -1499,7 +1547,7 @@ pub const Lexer = struct {
             is_malformed = true;
         }
 
-        // [3] Fractional `.` part; only consume `.` when followed immediately by `[0-9]`:
+        // [3] Fractional `.` part (`3.14`):
         var is_float = false;
         if (self.cursor + 1 < self.source.len and
             self.source[self.cursor] == '.' and
@@ -1928,7 +1976,7 @@ pub const Lexer = struct {
         }
     }
 
-    /// Scans `#soa` (`TokenKind.hash_soa` = `70`) or emits `.invalid_token` on unknown `#` directives.
+    /// Scans `#soa` (`TokenKind.hash_soa` = `74`) or emits `.invalid_token` on unknown `#` directives.
     fn scanHashDirectiveOrInvalid(self: *Lexer, has_lexer_error: *bool) !TokenKind {
         const start_offset = self.cursor;
         if (self.cursor + 4 <= self.source.len and
@@ -2013,6 +2061,48 @@ pub const Lexer = struct {
             "malformed numeric literal",
             "invalid digits, radix prefix, `_` separator placement, or trailing suffix",
         );
+    }
+
+    /// Emits `E0112` (`e0112_retired_path_separator`) with a `.machine_applicable` fix replacing `::` with `.`.
+    fn emitRetiredPathSeparatorError(self: *Lexer, sep_start: u32, sep_end: u32) !void {
+        const sink = self.diagnostic_sink orelse return;
+        const sep_span = Span.init(self.file_id, sep_start, sep_end);
+        const primary_labels = [_]LabeledSpan{.{
+            .span = sep_span,
+            .label = "retired `::` separator; use `.` instead",
+            .style = .primary,
+        }};
+
+        if (self.interner) |str_interner| {
+            const fix_edits = [_]TextEdit{.{
+                .file_id = self.file_id,
+                .start_byte = sep_start,
+                .end_byte = sep_end,
+                .replacement_id = try str_interner.intern("."),
+            }};
+            const fixes = [_]SuggestedFix{.{
+                .message = "replace '::' with '.'",
+                .applicability = .machine_applicable,
+                .priority = .syntax_canonicalization,
+                .edits = &fix_edits,
+            }};
+            try sink.emit(.{
+                .code = .e0112_retired_path_separator,
+                .severity = .err,
+                .primary_span = sep_span,
+                .message = "path separator '::' has been retired in favor of unified '.'",
+                .labels = &primary_labels,
+                .suggestions = &fixes,
+            });
+        } else {
+            try sink.emit(.{
+                .code = .e0112_retired_path_separator,
+                .severity = .err,
+                .primary_span = sep_span,
+                .message = "path separator '::' has been retired in favor of unified '.'",
+                .labels = &primary_labels,
+            });
+        }
     }
 
     /// Emits `W0101` (`w0101_redundant_escape_sequence`) with a `.machine_applicable` fix replacing `\c` with `c`.
@@ -2135,11 +2225,15 @@ pub const lexFile = tokenize;
 
 // ------------------------- Unit Tests -------------------------
 
-test "test_all_45_keywords_19_prim_types_and_disjoint_casing" {
+test "test_all_49_keywords_19_prim_types_and_disjoint_casing" {
     try std.testing.expectEqual(@as(?TokenKind, .kw_pub), lookupKeywordOrPrim("pub"));
     try std.testing.expectEqual(@as(?TokenKind, .kw_self_val), lookupKeywordOrPrim("self"));
     try std.testing.expectEqual(@as(?TokenKind, .kw_self_type), lookupKeywordOrPrim("Self"));
     try std.testing.expectEqual(@as(?TokenKind, .kw_bit_field), lookupKeywordOrPrim("bit_field"));
+    try std.testing.expectEqual(@as(?TokenKind, .kw_orelse), lookupKeywordOrPrim("orelse"));
+    try std.testing.expectEqual(@as(?TokenKind, .kw_with), lookupKeywordOrPrim("with"));
+    try std.testing.expectEqual(@as(?TokenKind, .kw_context), lookupKeywordOrPrim("context"));
+    try std.testing.expectEqual(@as(?TokenKind, .kw_unreachable), lookupKeywordOrPrim("unreachable"));
     try std.testing.expectEqual(@as(?TokenKind, .prim_type), lookupKeywordOrPrim("i32"));
     try std.testing.expectEqual(@as(?TokenKind, .prim_type), lookupKeywordOrPrim("usize"));
     try std.testing.expectEqual(@as(?TokenKind, .prim_type), lookupKeywordOrPrim("never"));
@@ -2547,4 +2641,98 @@ test "test_oversized_token_and_multimegabyte_tail_lossless_reconstruction" {
     );
     defer std.testing.allocator.free(reconstructed_tail);
     try std.testing.expectEqualSlices(u8, huge_tail_source, reconstructed_tail);
+}
+
+test "test_dr21_walrus_dollar_retired_coloncolon_and_tuple_projection_lexing" {
+    // [1] `:=`, `$`, new keywords, and tuple projection `tup.0.1.2` vs float literals `0.1` / `1.5e2`:
+    const dr21_source =
+        "if (val := opt orelse unreachable) { with context.alloc = arena { let sum_val = buf[$ - 1] + tup.0.1.2; let flt = 0.1 + 1.5e2; } }";
+    var token_buf = TokenBuffer.init(std.testing.allocator);
+    defer token_buf.deinit();
+    var sink = DiagnosticSink.init(std.testing.allocator);
+    defer sink.deinit();
+
+    try tokenize(dr21_source, FileId.fromInt(0), &token_buf, &sink, null);
+    try std.testing.expectEqual(@as(u32, 0), sink.error_count);
+    try std.testing.expectEqual(@as(u32, 0), sink.warning_count);
+
+    try std.testing.expectEqual(TokenKind.colon_eq, token_buf.getToken(TokenIndex.fromInt(3)).kind);
+    try std.testing.expectEqual(TokenKind.kw_orelse, token_buf.getToken(TokenIndex.fromInt(5)).kind);
+    try std.testing.expectEqual(TokenKind.kw_unreachable, token_buf.getToken(TokenIndex.fromInt(6)).kind);
+    try std.testing.expectEqual(TokenKind.kw_with, token_buf.getToken(TokenIndex.fromInt(9)).kind);
+    try std.testing.expectEqual(TokenKind.kw_context, token_buf.getToken(TokenIndex.fromInt(10)).kind);
+    try std.testing.expectEqual(TokenKind.dollar, token_buf.getToken(TokenIndex.fromInt(21)).kind);
+    try std.testing.expectEqual(TokenKind.ident, token_buf.getToken(TokenIndex.fromInt(26)).kind);
+    try std.testing.expectEqual(TokenKind.dot, token_buf.getToken(TokenIndex.fromInt(27)).kind);
+    try std.testing.expectEqual(TokenKind.int_lit, token_buf.getToken(TokenIndex.fromInt(28)).kind);
+    try std.testing.expectEqual(TokenKind.dot, token_buf.getToken(TokenIndex.fromInt(29)).kind);
+    try std.testing.expectEqual(TokenKind.int_lit, token_buf.getToken(TokenIndex.fromInt(30)).kind);
+    try std.testing.expectEqual(TokenKind.dot, token_buf.getToken(TokenIndex.fromInt(31)).kind);
+    try std.testing.expectEqual(TokenKind.int_lit, token_buf.getToken(TokenIndex.fromInt(32)).kind);
+    try std.testing.expectEqual(TokenKind.float_lit, token_buf.getToken(TokenIndex.fromInt(37)).kind);
+    try std.testing.expectEqual(TokenKind.float_lit, token_buf.getToken(TokenIndex.fromInt(39)).kind);
+    try std.testing.expectEqual(@as(usize, 44), token_buf.countTokens());
+
+    // Scientific exponent `e`/`E` immediately after `.` (`tup.0e2`) is rejected with `E0103`:
+    var exp_buf = TokenBuffer.init(std.testing.allocator);
+    defer exp_buf.deinit();
+    var exp_sink = DiagnosticSink.init(std.testing.allocator);
+    defer exp_sink.deinit();
+    try tokenize("tup.0e2", FileId.fromInt(0), &exp_buf, &exp_sink, null);
+    try std.testing.expectEqual(@as(u32, 1), exp_sink.error_count);
+    try std.testing.expectEqual(DiagnosticCode.e0103_invalid_numeric_literal, exp_sink.asSlice()[0].code);
+    try std.testing.expectEqual(TokenKind.int_lit, exp_buf.getToken(TokenIndex.fromInt(2)).kind);
+
+    // [2] Retired `::` emits `E0112` with machine-applicable `.` autofix and lossless CST round-trip:
+    const retired_source = "use cx::mem::Allocator;";
+    var retired_buf = TokenBuffer.init(std.testing.allocator);
+    defer retired_buf.deinit();
+    var retired_sink = DiagnosticSink.init(std.testing.allocator);
+    defer retired_sink.deinit();
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    try tokenize(retired_source, FileId.fromInt(0), &retired_buf, &retired_sink, &interner);
+    try std.testing.expectEqual(@as(u32, 2), retired_sink.error_count);
+    try std.testing.expectEqual(DiagnosticCode.e0112_retired_path_separator, retired_sink.asSlice()[0].code);
+    try std.testing.expectEqual(DiagnosticCode.e0112_retired_path_separator, retired_sink.asSlice()[1].code);
+
+    const recovered_dot = retired_buf.getToken(TokenIndex.fromInt(2));
+    try std.testing.expectEqual(TokenKind.dot, recovered_dot.kind);
+    try std.testing.expectEqual(@as(u16, 2), recovered_dot.byte_len);
+    try std.testing.expect(recovered_dot.flags.has_lexer_error);
+
+    var cst_arena = syntax_arenas.LosslessCstArena.init(std.testing.allocator);
+    defer cst_arena.deinit();
+    const reconstructed = try cst_arena.reconstructSource(
+        std.testing.allocator,
+        retired_source,
+        &retired_buf,
+    );
+    defer std.testing.allocator.free(reconstructed);
+    try std.testing.expectEqualStrings(retired_source, reconstructed);
+
+    var fixes: [2]SuggestedFix = .{
+        retired_sink.asSlice()[0].suggestions[0],
+        retired_sink.asSlice()[1].suggestions[0],
+    };
+    const patch_res = try diagnostic.TransactionalPatcher.apply(
+        std.testing.allocator,
+        retired_source,
+        FileId.fromInt(0),
+        &fixes,
+        &interner,
+    );
+    defer std.testing.allocator.free(patch_res.patched_source);
+    try std.testing.expectEqual(@as(u32, 2), patch_res.applied_count);
+    try std.testing.expectEqualStrings("use cx.mem.Allocator;", patch_res.patched_source);
+
+    // [3] Backtick `` ` `` remains an unrecognized ASCII character (`.invalid_token`, `E0201`):
+    var inv_buf = TokenBuffer.init(std.testing.allocator);
+    defer inv_buf.deinit();
+    var inv_sink = DiagnosticSink.init(std.testing.allocator);
+    defer inv_sink.deinit();
+    try tokenize("`", FileId.fromInt(0), &inv_buf, &inv_sink, null);
+    try std.testing.expectEqual(@as(u32, 1), inv_sink.error_count);
+    try std.testing.expectEqual(TokenKind.invalid_token, inv_buf.getToken(TokenIndex.fromInt(0)).kind);
 }

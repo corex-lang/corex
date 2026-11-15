@@ -1,15 +1,17 @@
-//! Phase 7 Deterministic 4-Tier Differential Backend & Codegen Fuzzing Suite (`tests/fuzz/phase7_diff_backends_fuzz.zig`)
+//! Phase 7 & Phase 7.5 (`DR-21`) Deterministic 4-Tier Differential Backend Fuzz Suite (`tests/fuzz/phase7_diff_backends_fuzz.zig`)
 //!
-//! Exercises two complementary Phase 7 verification invariants (`DR-01`, `DR-20` `D-07A`):
+//! Exercises two complementary Phase 7 & Phase 7.5 verification invariants (`DR-01`, `DR-20` `D-07A`, `DR-21`):
 //! 1. **Full 4-Tier Native + VM Differential Parity (`10` structure-aware PRNG `.cx` programs):**
 //!    Synthesizes randomized, type-safe `.cx` modules combining structs (`@repr(C)` / `@zero_pad`),
-//!    `inout` MVS parameters, `Result[i32, i32]` `?` propagation (`cx_result_cc`), `Option` `match`
-//!    arms, `AutoDrop` + `defer` `@drop_trace(id)` sequences, bounded `while` loops, `[i32; 4]` SIMD
-//!    arithmetic, and `@sys_write` streams, asserting 100% 4-tier `runFourTierDiffOracle` parity.
+//!    `inout` MVS parameters, `Result[i32, i32]` `?` propagation (`cx_result_cc`), `= expr;` functions,
+//!    named & dependent-default call arguments, `is` / `:=` condition bindings with `AutoDrop` pre-`else`
+//!    `@drop_trace(id)` ordering, `orelse`, `arr[..][$ - 1]` slice end-indexing, indexed `for item, idx in`,
+//!    labeled `T?` value-`break` + `orelse`, `with context.cancel_token` + `let snap = context; snap.rng_seed`,
+//!    `[i32; 4]` SIMD arithmetic, and `@sys_write` streams, asserting 100% 4-tier `runFourTierDiffOracle` parity.
 //! 2. **Cross-Target Deterministic IR Emission & VM Parity (`48` PRNG programs x 7 targets):**
 //!    Verifies byte-for-byte deterministic Tier A (`-ofmt=c`, zero `void*`) and Tier B (`LLVM`)
 //!    source emission (`Run 1 == Run 2`) across all 7 canonical `TargetSpec` triples alongside
-//!    `--dev` vs `--release` `MirVm` execution parity.
+//!    `--dev` vs `--release` compilation parity.
 
 const std = @import("std");
 const corex = @import("corex");
@@ -40,7 +42,7 @@ const ALL_CANONICAL_TARGETS = [_]TargetSpec{
 
 // -------------------------------------- INTERNALS --------------------------------------
 
-/// Synthesizes a deterministic, well-typed `.cx` program from `prng_seed` with bounded arithmetic.
+/// Synthesizes a deterministic, well-typed `.cx` program from `prng_seed` with bounded `DR-21` constructs.
 fn generateRandomValidCxProgram(allocator: std.mem.Allocator, prng_seed: u64) ![]u8 {
     var pcg = std.Random.Pcg.init(prng_seed ^ 0x9E37_79B9_7F4A_7C15);
     const rng = pcg.random();
@@ -52,51 +54,76 @@ fn generateRandomValidCxProgram(allocator: std.mem.Allocator, prng_seed: u64) ![
     const simd_scalar: i32 = rng.intRangeAtMost(i32, -6, 9);
     const trace_first: i64 = rng.intRangeAtMost(i64, 10, 99);
     const trace_defer: i64 = rng.intRangeAtMost(i64, 100, 199);
-    const should_take_branch = rng.boolean();
-    const should_trigger_err = rng.boolean();
-    const use_some_opt = rng.boolean();
+    const cond_guard_code: i64 = rng.intRangeAtMost(i64, 210, 260);
+    const cond_guard_thresh: i64 = rng.intRangeAtMost(i64, 225, 245);
+    const default_bias: i32 = rng.intRangeAtMost(i32, 1, 9);
+    const walrus_thresh: i32 = rng.intRangeAtMost(i32, 5, 16);
+    const orelse_fallback: i32 = rng.intRangeAtMost(i32, -7, 8);
+    const lane_tail_val: i32 = rng.intRangeAtMost(i32, 3, 19);
+    const search_thresh: i32 = rng.intRangeAtMost(i32, 3, 12);
+    const token_handle: usize = rng.intRangeAtMost(usize, 5, 63);
+    const is_taking_branch = rng.boolean();
+    const is_triggering_err = rng.boolean();
+    const has_some_opt = rng.boolean();
+    const has_cond_guard = rng.boolean();
 
     var builder: std.ArrayList(u8) = .empty;
     errdefer builder.deinit(allocator);
-    const writer_alloc = allocator;
 
+    var header_buf: [1536]u8 = undefined;
     try builder.appendSlice(
-        writer_alloc,
-        "//! Generated Structure-Aware Phase 7 Differential Fuzz Program\n" ++
-            "pub trait Drop {\n" ++
-            "    fn drop(&mut self);\n" ++
-            "}\n\n" ++
-            "pub struct GuardBox {\n" ++
-            "    pub code: i64,\n" ++
-            "}\n\n" ++
-            "impl Drop for GuardBox {\n" ++
-            "    pub fn drop(&mut self) {\n" ++
-            "        @drop_trace(self.code);\n" ++
-            "    }\n" ++
-            "}\n\n" ++
-            "@repr(C)\n" ++
-            "@zero_pad\n" ++
-            "pub struct PairPacket {\n" ++
-            "    pub tag_u8: u8,\n" ++
-            "    pub payload_i32: i32,\n" ++
-            "}\n\n" ++
-            "pub fn bump_acc(mut acc_slot: inout i32, step_val: i32) -> unit {\n" ++
-            "    acc_slot = acc_slot +% step_val;\n" ++
-            "}\n\n" ++
-            "pub fn checked_gate(flag_err: bool, val_in: i32) -> Result[i32, i32] {\n" ++
-            "    if flag_err {\n" ++
-            "        return .Err(0);\n" ++
-            "    }\n" ++
-            "    return .Ok(val_in +% 7);\n" ++
-            "}\n\n" ++
-            "pub fn eval_gate_wrapper(flag_err: bool, val_in: i32) -> Result[i32, i32] {\n" ++
-            "    let unwrapped: i32 = checked_gate(flag_err, val_in)?;\n" ++
-            "    return .Ok(unwrapped *% 2);\n" ++
-            "}\n\n",
+        allocator,
+        try std.fmt.bufPrint(
+            &header_buf,
+            "//! Generated Structure-Aware Phase 7 & Phase 7.5 (`DR-21`) Differential Fuzz Program\n" ++
+                "pub trait Drop {{\n" ++
+                "    fn drop(&mut self);\n" ++
+                "}}\n\n" ++
+                "pub struct GuardBox {{\n" ++
+                "    pub code: i64,\n" ++
+                "}}\n\n" ++
+                "impl Drop for GuardBox {{\n" ++
+                "    pub fn drop(&mut self) {{\n" ++
+                "        @drop_trace(self.code);\n" ++
+                "    }}\n" ++
+                "}}\n\n" ++
+                "pub fn maybe_guard_box(is_present: bool, code_val: i64) -> GuardBox? {{\n" ++
+                "    if is_present {{\n" ++
+                "        return .Some(GuardBox {{ code: code_val }});\n" ++
+                "    }}\n" ++
+                "    return .None;\n" ++
+                "}}\n\n" ++
+                "@repr(C)\n" ++
+                "@zero_pad\n" ++
+                "pub struct PairPacket {{\n" ++
+                "    pub tag_u8: u8,\n" ++
+                "    pub payload_i32: i32,\n" ++
+                "}}\n\n" ++
+                "pub fn bump_acc(mut acc_slot: inout i32, step_val: i32) -> unit {{\n" ++
+                "    acc_slot = acc_slot +% step_val;\n" ++
+                "}}\n\n" ++
+                "pub fn affine_calc(lhs_val: i32, mid_val: i32 = lhs_val +% {d}, scale_val: i32 = 2) -> i32 =\n" ++
+                "    lhs_val *% scale_val +% mid_val;\n\n" ++
+                "pub fn unwrap_or_early(opt_val: i32?, fallback_val: i32) -> i32 {{\n" ++
+                "    let extracted: i32 = opt_val orelse return fallback_val;\n" ++
+                "    return extracted +% 5;\n" ++
+                "}}\n\n" ++
+                "pub fn checked_gate(flag_err: bool, val_in: i32) -> Result[i32, i32] {{\n" ++
+                "    if flag_err {{\n" ++
+                "        return .Err(0);\n" ++
+                "    }}\n" ++
+                "    return .Ok(val_in +% 7);\n" ++
+                "}}\n\n" ++
+                "pub fn eval_gate_wrapper(flag_err: bool, val_in: i32) -> Result[i32, i32] {{\n" ++
+                "    let unwrapped: i32 = checked_gate(flag_err, val_in)?;\n" ++
+                "    return .Ok(unwrapped *% 2);\n" ++
+                "}}\n\n",
+            .{default_bias},
+        ),
     );
 
     const main_body_text = try std.fmt.allocPrint(
-        writer_alloc,
+        allocator,
         "pub fn main() -> i32 {{\n" ++
             "    let guard_inst = GuardBox {{ code: {d} }};\n" ++
             "    defer {{ @drop_trace({d}); }}\n" ++
@@ -117,6 +144,35 @@ fn generateRandomValidCxProgram(allocator: std.mem.Allocator, prng_seed: u64) ![
             "        .Some(inner_v) => inner_v,\n" ++
             "        .None => -3,\n" ++
             "    }};\n" ++
+            "    if (cand_opt := maybe_bonus) is .Some(inner_val) and (shifted_val := inner_val +% 3) > {d} {{\n" ++
+            "        let _keep = cand_opt;\n" ++
+            "        bump_acc(running_acc, shifted_val);\n" ++
+            "    }} else {{\n" ++
+            "        bump_acc(running_acc, -2);\n" ++
+            "    }}\n" ++
+            "    if maybe_guard_box({s}, {d}) is .Some(cond_guard) and cond_guard.code > {d} {{\n" ++
+            "        @drop_trace(300);\n" ++
+            "        bump_acc(running_acc, cond_guard.code as i32);\n" ++
+            "    }} else {{\n" ++
+            "        @drop_trace(400);\n" ++
+            "    }}\n" ++
+            "    let orelse_term: i32 = (maybe_bonus orelse {d}) +% unwrap_or_early(maybe_bonus, 6);\n" ++
+            "    let call_term: i32 = affine_calc({d}) +% affine_calc(scale_val: 3, lhs_val: {d}, mid_val: 4);\n" ++
+            "    let lane_arr: [i32; 4] = [2, 4, 6, {d}];\n" ++
+            "    let dollar_tail: i32 = lane_arr[..][$ - 1];\n" ++
+            "    for lane_item, lane_idx in lane_arr {{\n" ++
+            "        bump_acc(running_acc, lane_item +% (lane_idx as i32));\n" ++
+            "    }}\n" ++
+            "    let search_term: i32 = search_lane: for lane_item, lane_idx in lane_arr {{\n" ++
+            "        if lane_item > {d} {{\n" ++
+            "            break :search_lane lane_item +% (lane_idx as i32);\n" ++
+            "        }}\n" ++
+            "    }} orelse -5;\n" ++
+            "    let active_tok = CancelToken {{ _handle: {d} }};\n" ++
+            "    let ctx_term: i32 = with context.cancel_token = active_tok {{\n" ++
+            "        let snap = context;\n" ++
+            "        (context.cancel_token._handle as i32) +% (snap.rng_seed as i32)\n" ++
+            "    }};\n" ++
             "    let res_term: i32 = match eval_gate_wrapper({s}, {d}) {{\n" ++
             "        .Ok(ok_v) => ok_v,\n" ++
             "        .Err(err_v) => err_v -% 5,\n" ++
@@ -124,41 +180,51 @@ fn generateRandomValidCxProgram(allocator: std.mem.Allocator, prng_seed: u64) ![
             "    let vec_lanes: [i32; 4] = @simd_add(@simd_splat[[i32; 4]]({d}), [1, 2, 3, 4]);\n" ++
             "    let simd_term: i32 = @simd_reduce_add(vec_lanes);\n" ++
             "    let _ = @sys_write(1, \"fuzz-ok\\n\");\n" ++
-            "    return running_acc +% opt_term +% res_term +% simd_term;\n" ++
+            "    return running_acc +% opt_term +% orelse_term +% call_term +% dollar_tail +%\n" ++
+            "        search_term +% ctx_term +% res_term +% simd_term;\n" ++
             "}}\n",
         .{
             trace_first,
             trace_defer,
             @as(u32, @intCast(@mod(init_beta, 16))),
             init_alpha,
-            if (should_take_branch) "true" else "false",
+            if (is_taking_branch) "true" else "false",
             init_beta,
             init_gamma,
             loop_limit,
-            if (use_some_opt) ".Some(11)" else ".None",
-            if (should_trigger_err) "true" else "false",
+            if (has_some_opt) ".Some(11)" else ".None",
+            walrus_thresh,
+            if (has_cond_guard) "true" else "false",
+            cond_guard_code,
+            cond_guard_thresh,
+            orelse_fallback,
+            init_alpha,
+            init_beta,
+            lane_tail_val,
+            search_thresh,
+            token_handle,
+            if (is_triggering_err) "true" else "false",
             init_gamma,
             simd_scalar,
         },
     );
-    defer writer_alloc.free(main_body_text);
+    defer allocator.free(main_body_text);
 
-    try builder.appendSlice(writer_alloc, main_body_text);
-    return builder.toOwnedSlice(writer_alloc);
+    try builder.appendSlice(allocator, main_body_text);
+    return builder.toOwnedSlice(allocator);
 }
 
 // ------------------------------------- PUBLIC API --------------------------------------
 
 test "test_fuzz_phase7_four_tier_differential_native_and_vm_parity" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
 
     var seed_idx: usize = 0;
     while (seed_idx < FOUR_TIER_NATIVE_FUZZ_SEEDS) : (seed_idx += 1) {
         const cx_program = try generateRandomValidCxProgram(allocator, @intCast(seed_idx));
         defer allocator.free(cx_program);
 
-        var report = try corex.runFourTierDiffOracle(allocator, cx_program, .{ .io = io });
+        var report = try corex.runFourTierDiffOracle(allocator, cx_program, .{ .io = std.testing.io });
         defer report.deinit(allocator);
 
         if (!report.is_all_matching) {
@@ -170,7 +236,7 @@ test "test_fuzz_phase7_four_tier_differential_native_and_vm_parity" {
         try std.testing.expect(report.is_all_matching);
         try std.testing.expect(!report.outcomes[0].has_trapped);
         try std.testing.expectEqualStrings("fuzz-ok\n", report.outcomes[0].stdout_bytes);
-        try std.testing.expectEqual(@as(usize, 2), report.outcomes[0].drop_trace.len);
+        try std.testing.expect(report.outcomes[0].drop_trace.len >= 3);
     }
 }
 
@@ -179,8 +245,10 @@ test "test_fuzz_phase7_deterministic_ir_emission_and_vm_parity_across_targets" {
 
     var seed_idx: usize = 0;
     while (seed_idx < CROSS_TARGET_DETERMINISM_SEEDS) : (seed_idx += 1) {
-        const prng_seed: u64 = 100 + @as(u64, @intCast(seed_idx));
-        const cx_program = try generateRandomValidCxProgram(allocator, prng_seed);
+        const cx_program = try generateRandomValidCxProgram(
+            allocator,
+            100 + @as(u64, @intCast(seed_idx)),
+        );
         defer allocator.free(cx_program);
 
         const target_spec = ALL_CANONICAL_TARGETS[seed_idx % ALL_CANONICAL_TARGETS.len];
@@ -199,13 +267,13 @@ test "test_fuzz_phase7_deterministic_ir_emission_and_vm_parity_across_targets" {
         var sink = DiagnosticSink.init(allocator);
         defer sink.deinit();
 
-        const is_release = (seed_idx & 1) == 1;
+        const is_release_mode = (seed_idx & 1) == 1;
         var c_run1 = try db_first.compileModuleArtifact(
             fid,
             .{
                 .tier_a_c99 = .{
                     .target = target_spec,
-                    .is_release_mode = is_release,
+                    .is_release_mode = is_release_mode,
                     .has_line_directives = false,
                 },
             },
@@ -218,7 +286,7 @@ test "test_fuzz_phase7_deterministic_ir_emission_and_vm_parity_across_targets" {
             .{
                 .tier_a_c99 = .{
                     .target = target_spec,
-                    .is_release_mode = is_release,
+                    .is_release_mode = is_release_mode,
                     .has_line_directives = false,
                 },
             },
@@ -235,7 +303,7 @@ test "test_fuzz_phase7_deterministic_ir_emission_and_vm_parity_across_targets" {
             .{
                 .tier_b_llvm = .{
                     .target = target_spec,
-                    .is_release_mode = is_release,
+                    .is_release_mode = is_release_mode,
                 },
             },
             .{ .artifact_kind = .source_text, .diagnostic_sink = &sink },
@@ -247,7 +315,7 @@ test "test_fuzz_phase7_deterministic_ir_emission_and_vm_parity_across_targets" {
             .{
                 .tier_b_llvm = .{
                     .target = target_spec,
-                    .is_release_mode = is_release,
+                    .is_release_mode = is_release_mode,
                 },
             },
             .{ .artifact_kind = .source_text, .diagnostic_sink = &sink },

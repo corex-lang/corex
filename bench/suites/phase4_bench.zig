@@ -81,7 +81,7 @@ const SYNTHETIC_TYPED_BLOCK_16_LOC =
     "        128..=255 => 40,\n" ++
     "    };\n" ++
     "    let opt_extra: u64? = .Some(tier_bonus);\n" ++
-    "    let unwrapped = opt_extra catch 0;\n" ++
+    "    let unwrapped = opt_extra orelse 0;\n" ++
     "    let total_val: u64 = combined + unwrapped;\n" ++
     "    if total_val == 0 {\n" ++
     "        return .Err(1);\n" ++
