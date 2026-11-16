@@ -47,12 +47,12 @@ const LAYOUT_NICHE_RESULT_SRC =
     "\n" ++
     "pub fn classify_text_opt(maybe_label: str?) -> i32 {\n" ++
     "    return match maybe_label {\n" ++
-    "        .Some(label_str) => (label_str.len as i32) + 10,\n" ++
+    "        .Some(label_str) => (label_str.len() as i32) + 10,\n" ++
     "        .None => -1,\n" ++
     "    };\n" ++
     "}\n" ++
     "\n" ++
-    "pub fn fallible_step(input_code: i32) -> Result[i32, i32] {\n" ++
+    "pub fn fallible_step(input_code: i32) -> i32!i32 {\n" ++
     "    if input_code == 0 {\n" ++
     "        return .Err(0);\n" ++
     "    }\n" ++
@@ -62,7 +62,7 @@ const LAYOUT_NICHE_RESULT_SRC =
     "    return .Ok(input_code * 3);\n" ++
     "}\n" ++
     "\n" ++
-    "pub fn propagate_chain(seed_code: i32) -> Result[i32, i32] {\n" ++
+    "pub fn propagate_chain(seed_code: i32) -> i32!i32 {\n" ++
     "    let first_ok: i32 = fallible_step(seed_code)?;\n" ++
     "    let second_ok: i32 = fallible_step(first_ok - 3)?;\n" ++
     "    return .Ok(first_ok + second_ok);\n" ++
@@ -111,19 +111,19 @@ const DROP_DEFER_ERRDEFER_SRC =
     "    }\n" ++
     "}\n" ++
     "\n" ++
-    "pub fn consume_token(own token_val: sink ScopeToken) -> i64 {\n" ++
+    "pub fn consume_token(token_val: own ScopeToken) -> i64 {\n" ++
     "    @drop_trace(token_val.id + 1000);\n" ++
     "    return token_val.id;\n" ++
     "}\n" ++
     "\n" ++
-    "pub fn run_transaction(should_fail: bool, should_move: bool) -> Result[i32, i32] {\n" ++
+    "pub fn run_transaction(should_fail: bool, should_move: bool) -> i32!i32 {\n" ++
     "    let first_tok = ScopeToken { id: 10 };\n" ++
     "    defer { @drop_trace(90); }\n" ++
     "    errdefer { @drop_trace(77); }\n" ++
     "    let second_tok = ScopeToken { id: 20 };\n" ++
     "    var acc: i32 = first_tok.id as i32;\n" ++
     "    if should_move {\n" ++
-    "        acc = acc + (consume_token(second_tok) as i32);\n" ++
+    "        acc = acc + (consume_token(own second_tok) as i32);\n" ++
     "    }\n" ++
     "    if should_fail {\n" ++
     "        return .Err(5);\n" ++
@@ -152,8 +152,8 @@ const SOA_VECTORIZE_CLOSURE_SRC =
     "    pub mass: i32,\n" ++
     "}\n" ++
     "\n" ++
-    "pub fn step_value(mut current: inout i32, delta: i32) -> unit {\n" ++
-    "    current = current + delta;\n" ++
+    "pub fn step_value(current: &mut i32, delta: i32) {\n" ++
+    "    current.* = current.* + delta;\n" ++
     "}\n" ++
     "\n" ++
     "pub fn scale_lane(val: i32) -> i32 {\n" ++
@@ -180,11 +180,11 @@ const SOA_VECTORIZE_CLOSURE_SRC =
     "    }\n" ++
     "\n" ++
     "    var total_pos: i32 = swarm[0].pos_x + swarm[1].vel_x + swarm[2].mass + swarm[3].pos_x;\n" ++
-    "    step_value(total_pos, lanes_a[0] + lanes_a[3]);\n" ++
+    "    step_value(&mut total_pos, lanes_a[0] + lanes_a[3]);\n" ++
     "    let bias: i32 = 5;\n" ++
     "    let bias_ref: &i32 = &bias;\n" ++
-    "    @local let read_biased = || -> i32 { *bias_ref + 8 };\n" ++
-    "    let closure_sum: i32 = read_biased() + apply_fn_ptr(6, scale_lane) + *bias_ref;\n" ++
+    "    @local let read_biased = || -> i32 { bias_ref.* + 8 };\n" ++
+    "    let closure_sum: i32 = read_biased() + apply_fn_ptr(6, scale_lane) + bias_ref.*;\n" ++
     "    return total_pos + closure_sum;\n" ++
     "}\n";
 
@@ -598,8 +598,8 @@ test "test_regression_refined_niche_option_packed_align_and_aggregate_insert" {
         \\    return updated;
         \\}
         \\
-        \\pub fn bump_packed_slot(mut slot_val: inout u64, delta: u64) {
-        \\    slot_val = slot_val + delta;
+        \\pub fn bump_packed_slot(frame_ref: &mut UnalignedFrame, delta: u64) {
+        \\    frame_ref.*.payload = frame_ref.*.payload + delta;
         \\}
         \\
         \\pub fn main() -> i32 {
@@ -612,11 +612,11 @@ test "test_regression_refined_niche_option_packed_align_and_aggregate_insert" {
         \\    let opt_snone: SmallPos? = .None;
         \\    let opt_m5: MidPos? = .Some(m_five);
         \\    let opt_mnone: MidPos? = .None;
-        \\    let eq_bonus: i32 = if opt_s1 != opt_snone && opt_m5 != opt_mnone { 4 } else { 0 };
+        \\    let eq_bonus: i32 = if opt_s1 != opt_snone and opt_m5 != opt_mnone { 4 } else { 0 };
         \\
         \\    var frame = UnalignedFrame { prefix: 3, payload: 100, tail: 9 };
         \\    frame = replace_packed_payload(frame, 200);
-        \\    bump_packed_slot(frame.payload, 15);
+        \\    bump_packed_slot(&mut frame, 15);
         \\
         \\    let niche_sum: i32 = classify_small_opt(opt_s1) + classify_small_opt(opt_s10) +
         \\        classify_small_opt(opt_snone) + classify_mid_opt(opt_m5) +
@@ -638,22 +638,22 @@ test "test_regression_must_vectorize_scalar_reduction_and_shared_mvs_aliasing" {
         \\    var acc: i32 = 0;
         \\    var idx: usize = 0;
         \\    @must_vectorize
-        \\    while idx < (*lanes).len {
-        \\        acc = acc + (*lanes)[idx];
+        \\    while idx < lanes.len() {
+        \\        acc = acc + lanes[idx];
         \\        idx += 1;
         \\    }
         \\    return acc;
         \\}
         \\
-        \\pub fn add_aliased_shared_refs(lhs_ref: &i32, rhs_ref: &i32, mut dst_acc: inout i32) {
-        \\    dst_acc = dst_acc + *lhs_ref + *rhs_ref;
+        \\pub fn add_aliased_shared_refs(lhs_ref: &i32, rhs_ref: &i32, dst_acc: &mut i32) {
+        \\    dst_acc.* = dst_acc.* + lhs_ref.* + rhs_ref.*;
         \\}
         \\
         \\pub fn main() -> i32 {
         \\    let data_arr: [i32; 8] = [2, 4, 6, 8, 1, 3, 5, 7];
         \\    var total: i32 = sum_slice_vectorized(&data_arr);
         \\    let shared_cell: i32 = 11;
-        \\    add_aliased_shared_refs(&shared_cell, &shared_cell, total);
+        \\    add_aliased_shared_refs(&shared_cell, &shared_cell, &mut total);
         \\    return total;
         \\}
     ;
@@ -675,17 +675,17 @@ test "test_regression_slice_array_coercion_const_str_ref_derive_debug_and_compos
         \\pub const BANNER_TEXT: str = "corex-rodata";
         \\
         \\pub fn read_borrowed_slice(bytes_ref: &[u8]) -> i32 {
-        \\    return ((*bytes_ref).len as i32) + ((*bytes_ref)[0] as i32) + ((*bytes_ref)[3] as i32);
+        \\    return (bytes_ref.len() as i32) + (bytes_ref[0] as i32) + (bytes_ref[3] as i32);
         \\}
         \\
         \\pub fn read_borrowed_str(text_ref: &str) -> i32 {
-        \\    return (*text_ref).len as i32;
+        \\    return text_ref.*.len() as i32;
         \\}
         \\
         \\pub fn inspect_badge_debug_len(val: i32) -> i32 {
         \\    let badge = StatusBadge { code: val };
         \\    let dbg_str: str = badge.debug();
-        \\    return if dbg_str.len > 0 { 5 } else { 0 };
+        \\    return if dbg_str.len() > 0 { 5 } else { 0 };
         \\}
         \\
         \\pub fn main() -> i32 {
@@ -696,7 +696,7 @@ test "test_regression_slice_array_coercion_const_str_ref_derive_debug_and_compos
         \\    let opt_pair_a: [i32; 2]? = .Some([1, 2]);
         \\    let opt_pair_b: [i32; 2]? = .Some([1, 2]);
         \\    let opt_pair_c: [i32; 2]? = .Some([1, 3]);
-        \\    let eq_score: i32 = if opt_pair_a == opt_pair_b && opt_pair_a != opt_pair_c { 17 } else { 0 };
+        \\    let eq_score: i32 = if opt_pair_a == opt_pair_b and opt_pair_a != opt_pair_c { 17 } else { 0 };
         \\    return coerced_score + banner_len + dbg_ok + eq_score;
         \\}
     ;
@@ -733,7 +733,7 @@ test "test_regression_128bit_float_casts_bitfields_c_union_and_closure_pass_mode
         \\    let as_f64: f64 = wide_neg as f64;
         \\    let back_i128: i128 = as_f64 as i128;
         \\    let interp_s: str = "v={wide_neg}";
-        \\    let cast_ok: i32 = if back_i128 == wide_neg && interp_s == "v=-8000000000" { 13 } else { 0 };
+        \\    let cast_ok: i32 = if back_i128 == wide_neg and interp_s == "v=-8000000000" { 13 } else { 0 };
         \\
         \\    var wbf = WideBits { lo_word: 9, hi_tag: 42, top_rest: 3 };
         \\    wbf.hi_tag = 55;
@@ -746,7 +746,7 @@ test "test_regression_128bit_float_casts_bitfields_c_union_and_closure_pass_mode
         \\    let scale_bias: i64 = 4;
         \\    let bias_ref: &i64 = &scale_bias;
         \\    @local let sum_big = |triple_in: BigTriple| -> i64 {
-        \\        triple_in.first + triple_in.second + triple_in.third + *bias_ref
+        \\        triple_in.first + triple_in.second + triple_in.third + bias_ref.*
         \\    };
         \\    let closure_val: i32 = sum_big(BigTriple { first: 5, second: 6, third: 7 }) as i32;
         \\    return cast_ok + bf_score + union_ok + closure_val;
@@ -795,7 +795,7 @@ test "test_phase75_four_tier_parity_se01_to_se08_and_unreachable_dollar_traps" {
         \\    let slice_part: i32 = match items {
         \\        [] => 0,
         \\        [single_v] => single_v,
-        \\        [first_v, ..mid_sub, last_v] => first_v + (mid_sub.len as i32) * 10 + last_v,
+        \\        [first_v, ..mid_sub, last_v] => first_v + (mid_sub.len() as i32) * 10 + last_v,
         \\    };
         \\    let at_part: i32 = match opt_num {
         \\        whole_opt @ .Some(inner_v) => if whole_opt is .Some(dup_v) { inner_v + dup_v } else { 0 },
@@ -832,7 +832,7 @@ test "test_phase75_four_tier_parity_se01_to_se08_and_unreachable_dollar_traps" {
         \\    let nested_view: &[i32] = outer_nums[inner_idx[$ - 1]..$ - 1];
         \\    let incl_view: &[i32] = outer_nums[0..=2];
         \\    let mid_str: str = "corex"[1..$ - 1];
-        \\    let slice_score: i32 = nested_view[$ - 1] + incl_view[$ - 1] + (mid_str.len as i32);
+        \\    let slice_score: i32 = nested_view[$ - 1] + incl_view[$ - 1] + (mid_str.len() as i32);
         \\
         \\    let pat_score: i32 = match_slice_and_at(nested_view, .Some(4));
         \\    let pipe_score: i32 = 5 |> scale_and_offset(delta: 4, factor: 3);
@@ -903,7 +903,7 @@ test "test_regression_four_tier_linear_complement_partial_variant_and_cond_drops
         \\    pub id: i32,
         \\}
         \\
-        \\pub fn consume_linear(tok: sink LinearToken) -> i32 {
+        \\pub fn consume_linear(tok: own LinearToken) -> i32 {
         \\    let LinearToken { id } = tok;
         \\    return id;
         \\}
@@ -938,7 +938,7 @@ test "test_regression_four_tier_linear_complement_partial_variant_and_cond_drops
         \\pub fn handle_outcome_code() -> i32 {
         \\    let out_val: Outcome = .Code(3735928559);
         \\    if out_val is .Ok(lin_tok) {
-        \\        return consume_linear(lin_tok);
+        \\        return consume_linear(own lin_tok);
         \\    }
         \\    return 10;
         \\}
@@ -946,7 +946,7 @@ test "test_regression_four_tier_linear_complement_partial_variant_and_cond_drops
         \\pub fn handle_outcome_msg() -> i32 {
         \\    let out_val: Outcome = .Msg(DropGuard { tag: 77 });
         \\    if out_val is .Ok(lin_tok) {
-        \\        return consume_linear(lin_tok);
+        \\        return consume_linear(own lin_tok);
         \\    }
         \\    return 20;
         \\}
@@ -954,7 +954,7 @@ test "test_regression_four_tier_linear_complement_partial_variant_and_cond_drops
         \\pub fn handle_open_path_err() -> i32 {
         \\    let open_val: OpenRes = .PathErr(DropGuard { tag: 88 });
         \\    if open_val is .Ok(lin_tok) {
-        \\        return consume_linear(lin_tok);
+        \\        return consume_linear(own lin_tok);
         \\    }
         \\    return 30;
         \\}
@@ -976,7 +976,7 @@ test "test_regression_four_tier_linear_complement_partial_variant_and_cond_drops
         \\}
         \\
         \\pub fn handle_cond_else_drop() -> i32 {
-        \\    if !(make_opt_guard(true, 5) is not .None) {
+        \\    if not (make_opt_guard(true, 5) is not .None) {
         \\        @drop_trace(300);
         \\        return 1;
         \\    } else {
@@ -1136,5 +1136,244 @@ test "test_regression_four_tier_primitive_float_ne_and_alias_endian_helpers" {
     try std.testing.expectEqual(@as(i64, 162), report.outcomes[0].return_scalar_i64);
 }
 
+test "test_phase76_four_tier_parity_dr22_strings_fmt_update_swap_subscript_loc_builder_and_fsm" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
+    const dr22_showcase_src =
+        \\pub struct DropBox {
+        \\    pub id: i64,
+        \\}
+        \\impl DropBox {
+        \\    pub fn drop(&mut self) {
+        \\        @drop_trace(self.id);
+        \\    }
+        \\}
+        \\
+        \\pub struct ConfigCopy {
+        \\    pub width: i32,
+        \\    pub height: i32,
+        \\    pub scale: i32,
+        \\}
+        \\
+        \\pub struct PacketOwned {
+        \\    pub code: i32,
+        \\    pub guard_keep: DropBox,
+        \\    pub guard_replace: DropBox,
+        \\}
+        \\
+        \\pub struct Ring4 {
+        \\    pub slots: [i32; 4],
+        \\}
+        \\impl Ring4 {
+        \\    pub subscript(idx: usize) -> i32 {
+        \\        let {
+        \\            yield self.slots[idx % 4];
+        \\        }
+        \\        inout {
+        \\            yield &mut self.slots[idx % 4];
+        \\        }
+        \\    }
+        \\}
+        \\
+        \\pub struct RowBuilder {
+        \\    pub total: i32,
+        \\    pub count: i32,
+        \\}
+        \\@builder_item
+        \\pub fn item(bld: &mut RowBuilder, weight: i32) {
+        \\    bld.total = bld.total + weight;
+        \\    bld.count = bld.count + 1;
+        \\}
+        \\
+        \\pub fn build_rows(seed: i32, body: @builder |&mut RowBuilder|) -> i32 {
+        \\    var bld = RowBuilder { total: seed, count: 0 };
+        \\    body(&mut bld);
+        \\    return bld.total + bld.count * 10;
+        \\}
+        \\
+        \\pub fn swap_pair(left: &mut i32, right: &mut i32) {
+        \\    (left.*, right.*) = (right.*, left.*);
+        \\}
+        \\
+        \\pub fn caller_probe(loc: SourceLoc = @caller_location()) -> i32 {
+        \\    return (if loc.line > 50 { 9 } else { 0 }) + (loc.fn_name.len() as i32);
+        \\}
+        \\
+        \\pub enum LexState {
+        \\    Start,
+        \\    Scan(i32),
+        \\    Emit(i32),
+        \\}
+        \\
+        \\pub fn run_fsm(steps: i32) -> i32 {
+        \\    var acc: i32 = 0;
+        \\    return fsm: match LexState.Start {
+        \\        .Start => {
+        \\            continue :fsm LexState.Scan(steps);
+        \\        },
+        \\        .Scan(rem) => {
+        \\            if rem > 0 {
+        \\                acc = acc + rem;
+        \\                continue :fsm LexState.Scan(rem - 1);
+        \\            }
+        \\            continue :fsm LexState.Emit(acc);
+        \\        },
+        \\        .Emit(final_sum) => final_sum + 3,
+        \\    };
+        \\}
+        \\
+        \\pub fn main() -> i32 {
+        \\    let tag_num: i32 = 7;
+        \\    let banner: str = """
+        \\        hdr={tag_num}
+        \\        ok
+        \\        """;
+        \\    let _ = @sys_write(1, banner);
+        \\
+        \\    let magic_bytes: &[u8; 4] = b"CX\x2a!";
+        \\    let byte_nl: u8 = b'\n';
+        \\    let bytes_score: i32 = (magic_bytes.*[2] as i32) + (byte_nl as i32);
+        \\
+        \\    let hex_val: u32 = 0x2a_u32;
+        \\    let fmt_line: str = "\n{{{hex_val:08x}|{hex_val=}}}\n";
+        \\    let _ = @sys_write(1, fmt_line);
+        \\    let fmt_score: i32 = fmt_line.len() as i32;
+        \\
+        \\    let base_cfg = ConfigCopy { width: 10, height: 20, scale: 3 };
+        \\    let next_cfg = ConfigCopy { width: 15, ..base_cfg };
+        \\    let cfg_score: i32 = next_cfg.width + next_cfg.height + next_cfg.scale + base_cfg.width;
+        \\
+        \\    var pkt_score: i32 = 0;
+        \\    {
+        \\        let pkt_1 = PacketOwned {
+        \\            code: 1,
+        \\            guard_keep: DropBox { id: 101 },
+        \\            guard_replace: DropBox { id: 202 },
+        \\        };
+        \\        let pkt_2 = PacketOwned {
+        \\            code: 6,
+        \\            guard_replace: DropBox { id: 303 },
+        \\            ..own pkt_1
+        \\        };
+        \\        pkt_score = pkt_2.code + (pkt_2.guard_keep.id as i32) - 100;
+        \\    }
+        \\
+        \\    var first_v: i32 = 12;
+        \\    var second_v: i32 = 35;
+        \\    swap_pair(&mut first_v, &mut second_v);
+        \\    let swap_score: i32 = first_v - second_v;
+        \\
+        \\    var ring = Ring4 { slots: [2, 4, 6, 8] };
+        \\    let prev_ring_slot: i32 = ring[1];
+        \\    ring[5] = prev_ring_slot + 10;
+        \\    let sub_score: i32 = ring[1] + ring[3];
+        \\
+        \\    let loc_score: i32 = caller_probe();
+        \\    let builder_score: i32 = build_rows(5) {
+        \\        item(7);
+        \\        item(8);
+        \\    };
+        \\    let fsm_score: i32 = run_fsm(4);
+        \\
+        \\    return (banner.len() as i32) + bytes_score + fmt_score + cfg_score + pkt_score +
+        \\        swap_score + sub_score + loc_score + builder_score + fsm_score - 200;
+        \\}
+    ;
 
+    var report = try expectFourTierParity(allocator, io, dr22_showcase_src);
+    defer report.deinit(allocator);
+    try std.testing.expect(!report.outcomes[0].has_trapped);
+    try std.testing.expectEqualStrings(
+        "hdr=7\nok\n{0000002a|hex_val=42}\n",
+        report.outcomes[0].stdout_bytes,
+    );
+    try std.testing.expectEqual(@as(usize, 3), report.outcomes[0].drop_trace.len);
+    // `8 + 52 + 23 + 48 + 7 + 23 + 22 + 13 + 40 + 13 - 200 = 49`:
+    try std.testing.expectEqual(@as(i64, 49), report.outcomes[0].return_scalar_i64);
+
+    // Verify 4-tier parity for `[u8; 6]`-backed `bit_field`, `[i32; 3]` `~x`, single-eval rvalue `..make_cfg()`,
+    // partial-move + `..base` spread, generic `type` alias defaults, and `/` vs. `*` `@overload` zones:
+    const byte_bf_and_spread_src =
+        \\pub bit_field MacAddr: [u8; 6] {
+        \\    pub oui: u32 | 24,
+        \\    pub nibble: u8 | 4,
+        \\    pub nic: u32 | 20,
+        \\}
+        \\
+        \\pub struct CopyTriple {
+        \\    pub width: i32,
+        \\    pub height: i32,
+        \\    pub scale: i32,
+        \\}
+        \\
+        \\pub struct GuardId {
+        \\    pub id: i32,
+        \\}
+        \\
+        \\impl GuardId {
+        \\    pub fn drop(&mut self) {
+        \\        @drop_trace(self.id as i64);
+        \\    }
+        \\}
+        \\
+        \\pub struct MixedPkt {
+        \\    pub code: i32,
+        \\    pub guard: GuardId,
+        \\}
+        \\
+        \\pub type Pair[A, B = A] = (A, B);
+        \\
+        \\@overload
+        \\pub fn zone_pick(val: i32, /) -> i32 {
+        \\    return val + 2;
+        \\}
+        \\
+        \\@overload
+        \\pub fn zone_pick(*, val: i32) -> i32 {
+        \\    return val + 10;
+        \\}
+        \\
+        \\pub fn make_triple(calls: &mut i32) -> CopyTriple {
+        \\    calls.* += 1;
+        \\    return CopyTriple { width: 1, height: 7, scale: 3 };
+        \\}
+        \\
+        \\pub fn main() -> i32 {
+        \\    var mac = MacAddr { oui: 0x010203_u32, nibble: 0x0a_u8, nic: 0xbcdef_u32 };
+        \\    mac.nibble = 0x05_u8;
+        \\    let inv_mac = ~mac;
+        \\    let raw_inv: [u8; 6] = inv_mac as [u8; 6];
+        \\    let bf_score: i32 = (mac.oui == 0x010203_u32) as i32 +
+        \\        (mac.nibble as i32) +
+        \\        ((mac.nic & 0x0f_u32) as i32) +
+        \\        ((raw_inv[0] == 0xfc_u8) as i32);
+        \\
+        \\    let arr3: [i32; 3] = [1, -2, 3];
+        \\    let inv_arr3 = ~arr3;
+        \\    let arr_score: i32 = inv_arr3[0] + inv_arr3[1] + inv_arr3[2];
+        \\
+        \\    var eval_calls: i32 = 0;
+        \\    let rval_spread = CopyTriple { width: 9, ..make_triple(&mut eval_calls) };
+        \\    let spread_score: i32 = rval_spread.width + rval_spread.height + rval_spread.scale + (eval_calls * 10);
+        \\
+        \\    var pkt_score: i32 = 0;
+        \\    {
+        \\        let p1 = MixedPkt { code: 11, guard: GuardId { id: 77 } };
+        \\        let p2 = MixedPkt { guard: own p1.guard, ..p1 };
+        \\        pkt_score = p2.code + p2.guard.id - 70;
+        \\    }
+        \\
+        \\    let dup_pair: Pair[i32] = (4, 6);
+        \\    let zone_score: i32 = dup_pair.0 + dup_pair.1 + zone_pick(3) + zone_pick(val: 4);
+        \\    return bf_score + arr_score + spread_score + pkt_score + zone_score;
+        \\}
+    ;
+    var bf_report = try expectFourTierParity(allocator, io, byte_bf_and_spread_src);
+    defer bf_report.deinit(allocator);
+    try std.testing.expect(!bf_report.outcomes[0].has_trapped);
+    try std.testing.expectEqual(@as(usize, 1), bf_report.outcomes[0].drop_trace.len);
+    // `bf_score = 1 + 5 + 15 + 1 = 22`; `arr_score = -2 + 1 + -4 = -5`; `spread_score = 9 + 7 + 3 + 10 = 29`;
+    // `pkt_score = 11 + 77 - 70 = 18`; `zone_score = 4 + 6 + 5 + 14 = 29` -> `22 - 5 + 29 + 18 + 29 = 93`:
+    try std.testing.expectEqual(@as(i64, 93), bf_report.outcomes[0].return_scalar_i64);
+}

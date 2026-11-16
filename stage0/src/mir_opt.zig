@@ -297,7 +297,7 @@ const OptIntInfo = struct {
     is_signed: bool,
 };
 
-/// Returns `OptIntInfo` when `raw_ty` is an integer, `bool`, `char`, or `bit_field`.
+/// Returns `OptIntInfo` when `raw_ty` is an integer, `bool`, `char`, `bit_field`, or backed `enum`.
 fn resolveOptIntInfo(
     pool: *const InternPool,
     raw_ty: TypeId,
@@ -323,6 +323,11 @@ fn resolveOptIntInfo(
             if (node.tag == .bit_field_ty) {
                 break :blk resolveOptIntInfo(pool, TypeId.fromInt(node.lhs), target_layout);
             }
+            if (node.tag == .enum_ty) {
+                if (pool.getEnumBackingIntType(ty)) |backing_ty| {
+                    break :blk resolveOptIntInfo(pool, backing_ty, target_layout);
+                }
+            }
             break :blk null;
         },
     };
@@ -340,6 +345,7 @@ fn classifyOpSemantics(
     if (ty == .bool_ty) return .bool_sem;
     if (ty == .f32_ty) return .ieee_f32;
     if (ty == .f64_ty or ty == .untyped_float_ty) return .ieee_f64;
+    if (ty == .source_loc_ty) return .pointer_or_ref;
     if (resolveOptIntInfo(pool, ty, target_layout)) |info| {
         return if (info.is_signed) .signed_int else .unsigned_int;
     }
@@ -471,9 +477,17 @@ fn populatePtrWordMask(
     if (depth > 16 or raw_ty.isError()) return;
     const ptr_size: u64 = target_layout.ptr_byte_size;
     const ty = pool.unwrapUnderlyingType(raw_ty);
-    if (ty == .str_ty) {
+    if (ty == .str_ty or ty == .source_loc_ty) {
         if (byte_base % ptr_size == 0 and (byte_base / ptr_size) < 32) {
             mask.* |= (@as(u32, 1) << @intCast(byte_base / ptr_size));
+        }
+        return;
+    }
+    if (ty == .fmt_args_ty) {
+        if (byte_base % ptr_size == 0) {
+            const base_word = byte_base / ptr_size;
+            if (base_word < 32) mask.* |= (@as(u32, 1) << @intCast(base_word));
+            if (base_word + 2 < 32) mask.* |= (@as(u32, 1) << @intCast(base_word + 2));
         }
         return;
     }
@@ -489,6 +503,11 @@ fn populatePtrWordMask(
                 const fn_word = byte_base / ptr_size;
                 if (fn_word < 32) mask.* |= (@as(u32, 1) << @intCast(fn_word));
                 if (fn_word + 1 < 32) mask.* |= (@as(u32, 1) << @intCast(fn_word + 1));
+                if (pool.getFnSignatureView(ty)) |sig_view| {
+                    if ((sig_view.capture_tier != .copy_tier or sig_view.has_linear_capture) and fn_word + 2 < 32) {
+                        mask.* |= (@as(u32, 1) << @intCast(fn_word + 2));
+                    }
+                }
             }
         },
         .tuple_ty => {
@@ -1098,7 +1117,7 @@ fn spliceDirectCallSite(
                         }
                         inst.operands.rhs = new_ex;
                     },
-                    .tuple_agg, .struct_agg, .array_elems, .str_concat => {
+                    .tuple_agg, .struct_agg, .array_elems, .str_concat, .fmt_args_make => {
                         const new_ex: u32 = @intCast(caller.extra_args.items.len);
                         for (callee.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs]) |v_raw| {
                             try caller.extra_args.append(caller.allocator, v_raw + inst_offset);
@@ -1412,6 +1431,32 @@ fn spliceDirectCallSite(
                 .yielded_place = place_remap[cal_win.yielded_place.asInt()],
                 .yielded_ty = cal_win.yielded_ty,
                 .site_token = cal_win.site_token,
+            });
+        }
+    }
+
+    if (is_pre_strip and callee.parallel_assign_groups.items.len > 0) {
+        for (callee.parallel_assign_groups.items) |cal_grp| {
+            const new_start: u32 = @intCast(caller.parallel_assign_places.items.len);
+            const end_idx = @min(
+                callee.parallel_assign_places.items.len,
+                @as(usize, cal_grp.places_start) + @as(usize, cal_grp.places_len),
+            );
+            for (callee.parallel_assign_places.items[cal_grp.places_start..end_idx]) |cal_pl_id| {
+                const mapped_pl = if (cal_pl_id.asInt() < place_remap.len)
+                    place_remap[cal_pl_id.asInt()]
+                else
+                    cal_pl_id;
+                try caller.parallel_assign_places.append(caller.allocator, mapped_pl);
+            }
+            try caller.parallel_assign_groups.append(caller.allocator, .{
+                .block_id = if (cal_grp.block_id.isNone())
+                    .none
+                else
+                    MirBlockId.fromInt(bb_offset + cal_grp.block_id.asInt()),
+                .places_start = new_start,
+                .places_len = @intCast(end_idx - @as(usize, cal_grp.places_start)),
+                .origin_token = cal_grp.origin_token,
             });
         }
     }
@@ -2297,6 +2342,31 @@ fn runPassD2ReachableConstFold(
                             .not_foldable => {},
                         }
                     },
+                    .aggregate_extract => {
+                        if (known_consts[raw] != null or inst.operands.lhs >= known_consts.len) continue;
+                        const base_mc = known_consts[inst.operands.lhs] orelse continue;
+                        if (base_mc == .source_loc) {
+                            const sl = base_mc.source_loc;
+                            const folded_mc: ?MirConst = switch (inst.operands.rhs) {
+                                0 => .{ .str_val = sl.file_sym },
+                                1 => .{ .str_val = sl.fn_sym },
+                                2 => .{ .int_val = @as(i128, sl.line) },
+                                3 => .{ .int_val = @as(i128, sl.col) },
+                                else => null,
+                            };
+                            if (folded_mc) |mc| {
+                                const c_idx = try body.appendConst(mc);
+                                body.insts.set(raw, .{
+                                    .op = .const_scalar,
+                                    .flags = .{},
+                                    .type_id = inst.type_id,
+                                    .operands = .{ .lhs = c_idx, .rhs = 0 },
+                                });
+                                known_consts[raw] = mc;
+                                has_changed = true;
+                            }
+                        }
+                    },
                     else => {},
                 }
             }
@@ -2566,11 +2636,19 @@ fn inferPlaceTypeInBody(
             .deref => cur_ty = pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs)),
             .index => cur_ty = if (cur_ty == .str_ty)
                 .u8_ty
+            else if (mir.unionSliceElemType(pool, cur_ty)) |u_elem|
+                u_elem
             else
                 pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs)),
             .slice_len => cur_ty = .usize_ty,
             .field => {
-                if (node.tag == .tuple_ty) {
+                if (cur_ty == .source_loc_ty) {
+                    cur_ty = switch (proj.payload) {
+                        0, 1 => .str_ty,
+                        2, 3 => .u32_ty,
+                        else => .err_ty,
+                    };
+                } else if (node.tag == .tuple_ty) {
                     const elems = pool.getTupleElements(cur_ty);
                     if (proj.payload < elems.len) {
                         cur_ty = pool.unwrapUnderlyingType(TypeId.fromInt(elems[proj.payload]));
@@ -2728,6 +2806,39 @@ fn unifyTemplateTypeBinding(
                 );
             }
         },
+        .struct_ty, .enum_ty, .union_ty => {
+            if (p_node.rhs == c_node.rhs) {
+                const p_args = pool.getGenericTypeArgs(pattern_ty);
+                const c_args = pool.getGenericTypeArgs(c_unwrapped);
+                const n = @min(p_args.len, c_args.len);
+                for (0..n) |i| {
+                    try unifyTemplateTypeBinding(
+                        allocator,
+                        pool,
+                        TypeId.fromInt(p_args[i]),
+                        TypeId.fromInt(c_args[i]),
+                        subst,
+                        ordered_vars,
+                        depth + 1,
+                    );
+                }
+            }
+        },
+        .primitive => {
+            if (p_node.rhs == c_node.rhs and
+                (pool.isTaskGroupType(pattern_ty) or pool.isTaskHandleType(pattern_ty)))
+            {
+                try unifyTemplateTypeBinding(
+                    allocator,
+                    pool,
+                    TypeId.fromInt(p_node.lhs),
+                    TypeId.fromInt(c_node.lhs),
+                    subst,
+                    ordered_vars,
+                    depth + 1,
+                );
+            }
+        },
         else => {},
     }
 }
@@ -2746,12 +2857,24 @@ fn substituteMirType(
 
     const node = pool.getNode(ty);
     switch (node.tag) {
+        .primitive => {
+            if (pool.getTaskGroupErrorType(ty)) |err_ty| {
+                const inner = try substituteMirType(allocator, pool, err_ty, subst, depth + 1);
+                return pool.internTaskGroup(inner);
+            }
+            if (pool.getTaskHandleValueType(ty)) |val_ty| {
+                const inner = try substituteMirType(allocator, pool, val_ty, subst, depth + 1);
+                return pool.internTaskHandle(inner);
+            }
+            return ty;
+        },
         .ref_ty => {
             const inner = try substituteMirType(allocator, pool, TypeId.fromInt(node.lhs), subst, depth + 1);
             return pool.internRef(inner, false);
         },
         .mut_ref_ty => {
             const inner = try substituteMirType(allocator, pool, TypeId.fromInt(node.lhs), subst, depth + 1);
+            if (pool.isOutRef(ty)) return pool.internOutRef(inner);
             return pool.internRef(inner, true);
         },
         .raw_ptr_ty => {
@@ -2822,7 +2945,19 @@ fn substituteMirType(
                 new_modes[i] = sig_view.getParamMode(i);
             }
             const new_ret = try substituteMirType(allocator, pool, sig_view.ret_ty, subst, depth + 1);
-            return pool.internFnSignatureFull(
+            if (node.tag == .closure_ty) {
+                return pool.internClosureSignatureExt(
+                    new_params,
+                    new_modes,
+                    new_ret,
+                    sig_view.contracts,
+                    sig_view.capture_tier,
+                    sig_view.has_linear_capture,
+                    sig_view.is_async,
+                    sig_view.has_env_capture,
+                );
+            }
+            return pool.internFnSignatureExt(
                 node.tag,
                 new_params,
                 new_modes,
@@ -2831,6 +2966,9 @@ fn substituteMirType(
                 sig_view.contracts,
                 sig_view.capture_tier,
                 sig_view.has_linear_capture,
+                sig_view.is_variadic,
+                sig_view.is_c_abi,
+                sig_view.is_async,
             );
         },
         else => return ty,
@@ -2875,6 +3013,11 @@ fn specializeBinOpForSemantics(kind: BinOpKind, sem: OpSemanticsTag) BinOpKind {
             .umul_checked => .smul_checked,
             .udiv_checked => .sdiv_checked,
             .urem_checked => .srem_checked,
+            .lshr_checked => .ashr_checked,
+            .lshr_wrap => .ashr_wrap,
+            .uadd_sat => .sadd_sat,
+            .usub_sat => .ssub_sat,
+            .umul_sat => .smul_sat,
             .ult => .slt,
             .ule => .sle,
             .ugt => .sgt,
@@ -2891,6 +3034,91 @@ fn specializeUnaryOpForSemantics(kind: UnaryOpKind, sem: OpSemanticsTag) UnaryOp
         if (kind == .sneg_checked or kind == .neg_wrap) return .fneg;
     }
     return kind;
+}
+
+/// Recomputes a monomorphized unary cast `MirInst` from its concrete `src_ty` and `inst.type_id` (`SE-09`).
+fn specializeMonomorphizedUnaryInst(
+    pool: *const InternPool,
+    inst: MirInst,
+    src_ty: TypeId,
+    target_layout: TargetLayout,
+) MirInst {
+    const ukind: UnaryOpKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+    const unwrapped_src = pool.unwrapUnderlyingType(src_ty);
+    const unwrapped_dst = pool.unwrapUnderlyingType(inst.type_id);
+
+    switch (ukind) {
+        .int_trunc,
+        .int_sext,
+        .int_zext,
+        .bitcast_op,
+        .int_to_float_signed,
+        .int_to_float_unsigned,
+        .float_to_int_signed,
+        .float_to_int_unsigned,
+        .float_promote,
+        .float_demote,
+        => {
+            if (unwrapped_src == unwrapped_dst) {
+                return .{
+                    .op = .copy_val,
+                    .flags = inst.flags,
+                    .type_id = inst.type_id,
+                    .operands = .{ .lhs = inst.operands.lhs, .rhs = 0 },
+                };
+            }
+            const is_src_float = unwrapped_src == .f32_ty or unwrapped_src == .f64_ty;
+            const is_dst_float = unwrapped_dst == .f32_ty or unwrapped_dst == .f64_ty;
+            var updated = inst;
+            if (is_src_float and is_dst_float) {
+                updated.aux_u16 = @backingInt(
+                    if (unwrapped_src == .f32_ty) UnaryOpKind.float_promote else UnaryOpKind.float_demote,
+                );
+                return updated;
+            }
+            if (is_dst_float) {
+                if (resolveOptIntInfo(pool, unwrapped_src, target_layout)) |src_info| {
+                    updated.aux_u16 = @backingInt(
+                        if (src_info.is_signed) UnaryOpKind.int_to_float_signed else UnaryOpKind.int_to_float_unsigned,
+                    );
+                    return updated;
+                }
+            }
+            if (is_src_float) {
+                if (resolveOptIntInfo(pool, unwrapped_dst, target_layout)) |dst_info| {
+                    updated.aux_u16 = @backingInt(
+                        if (dst_info.is_signed) UnaryOpKind.float_to_int_signed else UnaryOpKind.float_to_int_unsigned,
+                    );
+                    return updated;
+                }
+            }
+            if (unwrapped_src == .bool_ty and resolveOptIntInfo(pool, unwrapped_dst, target_layout) != null) {
+                updated.aux_u16 = @backingInt(UnaryOpKind.int_zext);
+                return updated;
+            }
+            if (resolveOptIntInfo(pool, unwrapped_src, target_layout)) |src_info| {
+                if (resolveOptIntInfo(pool, unwrapped_dst, target_layout)) |dst_info| {
+                    if (dst_info.bits < src_info.bits) {
+                        updated.aux_u16 = @backingInt(UnaryOpKind.int_trunc);
+                    } else if (dst_info.bits > src_info.bits) {
+                        updated.aux_u16 = @backingInt(
+                            if (src_info.is_signed) UnaryOpKind.int_sext else UnaryOpKind.int_zext,
+                        );
+                    } else {
+                        updated.aux_u16 = @backingInt(UnaryOpKind.bitcast_op);
+                    }
+                    return updated;
+                }
+            }
+            return updated;
+        },
+        else => {
+            var updated = inst;
+            const sem = classifyOpSemantics(pool, src_ty, target_layout);
+            updated.aux_u16 = @backingInt(specializeUnaryOpForSemantics(ukind, sem));
+            return updated;
+        },
+    }
 }
 
 /// Resolved byte offset and member `TypeId` of a composite field projection step.
@@ -2911,6 +3139,16 @@ fn resolveOptCompositeFieldStep(
 ) ?OptFieldStep {
     const comp_ty = pool.unwrapUnderlyingType(raw_comp_ty);
     if (comp_ty.isError()) return null;
+    if (comp_ty == .source_loc_ty) {
+        const str_bytes = @as(u64, target_layout.ptr_byte_size) * 2;
+        return switch (field_ordinal) {
+            0 => .{ .byte_offset = 0, .field_ty = .str_ty },
+            1 => .{ .byte_offset = str_bytes, .field_ty = .str_ty },
+            2 => .{ .byte_offset = str_bytes * 2, .field_ty = .u32_ty },
+            3 => .{ .byte_offset = str_bytes * 2 + 4, .field_ty = .u32_ty },
+            else => null,
+        };
+    }
     const node = pool.getNode(comp_ty);
     switch (node.tag) {
         .tuple_ty => {
@@ -3149,6 +3387,8 @@ fn computeFieldOffsetsAndCalleesDigest(
                         break :blk soa_f;
                     } else if (cur_ty == .str_ty)
                         .u8_ty
+                    else if (mir.unionSliceElemType(pool, cur_ty)) |u_elem|
+                        u_elem
                     else
                         pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
                     const elem_shape = computeLayoutShapeKey(pool, sym_table, elem_ty, target_layout);
@@ -3248,6 +3488,23 @@ fn computeFieldOffsetsAndCalleesDigest(
                 hasher.update(std.mem.asBytes(&rb.blob_id));
                 hasher.update(&[_]u8{rb.align_log2});
                 hasher.update(std.mem.asBytes(&rb.byte_len));
+            },
+            .source_loc => |sl| {
+                if (interner) |str_pool| {
+                    const file_bytes = str_pool.get(sl.file_sym);
+                    const file_len: u32 = @intCast(file_bytes.len);
+                    hasher.update(std.mem.asBytes(&file_len));
+                    hasher.update(file_bytes);
+                    const fn_bytes = str_pool.get(sl.fn_sym);
+                    const fn_len: u32 = @intCast(fn_bytes.len);
+                    hasher.update(std.mem.asBytes(&fn_len));
+                    hasher.update(fn_bytes);
+                } else {
+                    hasher.update(std.mem.asBytes(&sl.file_sym));
+                    hasher.update(std.mem.asBytes(&sl.fn_sym));
+                }
+                hasher.update(std.mem.asBytes(&sl.line));
+                hasher.update(std.mem.asBytes(&sl.col));
             },
         }
     }
@@ -3760,10 +4017,10 @@ fn runPassD5MonomorphizeAndPromote(
                     spec.insts.set(inst_i, inst);
                 } else if (inst.op == .unary_op and inst.operands.lhs < spec.insts.len) {
                     const op_ty = spec.getInst(MirValueId.fromInt(inst.operands.lhs)).type_id;
-                    const sem = classifyOpSemantics(pool, op_ty, config.target_layout);
-                    const ukind: UnaryOpKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
-                    inst.aux_u16 = @backingInt(specializeUnaryOpForSemantics(ukind, sem));
-                    spec.insts.set(inst_i, inst);
+                    spec.insts.set(
+                        inst_i,
+                        specializeMonomorphizedUnaryInst(pool, inst, op_ty, config.target_layout),
+                    );
                 }
             }
             var has_nested_generic_call = false;
@@ -4206,10 +4463,12 @@ fn isSroaRegisterType(pool: *const InternPool, raw_ty: TypeId) bool {
         .f64_ty,
         .char_ty,
         .str_ty,
+        .source_loc_ty,
         => return true,
         else => {},
     }
     const tag = pool.getNode(ty).tag;
+    if (tag == .enum_ty and pool.getEnumBackingIntType(ty) != null) return true;
     return tag == .ref_ty or tag == .mut_ref_ty or tag == .raw_ptr_ty or tag == .fn_ty or tag == .bit_field_ty;
 }
 
@@ -4961,6 +5220,11 @@ fn isMirConstExactEqual(mc_a: MirConst, mc_b: MirConst) bool {
             rba.blob_id == mc_b.raw_blob.blob_id and
             rba.align_log2 == mc_b.raw_blob.align_log2 and
             rba.byte_len == mc_b.raw_blob.byte_len,
+        .source_loc => |sla| mc_b == .source_loc and
+            sla.file_sym == mc_b.source_loc.file_sym and
+            sla.fn_sym == mc_b.source_loc.fn_sym and
+            sla.line == mc_b.source_loc.line and
+            sla.col == mc_b.source_loc.col,
     };
 }
 
@@ -5122,6 +5386,11 @@ fn makeGvnKey(
                 .raw_blob => |rb| {
                     tag_word |= (@as(u64, rb.blob_id) << 8) | (@as(u64, rb.align_log2) << 40);
                     pay_word = rb.byte_len;
+                },
+                .source_loc => |sl| {
+                    if ((sl.file_sym.asInt() >> 28) != 0 or (sl.fn_sym.asInt() >> 28) != 0) return null;
+                    tag_word |= (@as(u64, sl.file_sym.asInt()) << 8) | (@as(u64, sl.fn_sym.asInt()) << 36);
+                    pay_word = (@as(u64, sl.line) << 32) | @as(u64, sl.col);
                 },
             }
             return .{
@@ -5352,6 +5621,22 @@ fn runPassR4SccpSwitchFusionAndGvn(
                                     .folded => |mc| .{ .constant = mc },
                                     else => .bottom,
                                 };
+                                if (meetSccpLattice(&val_lat[raw], next_lat)) has_progressed = true;
+                            }
+                        },
+                        .aggregate_extract => {
+                            if (inst.operands.lhs >= val_lat.len) continue;
+                            const bl = val_lat[inst.operands.lhs];
+                            if (bl == .bottom) {
+                                if (meetSccpLattice(&val_lat[raw], .bottom)) has_progressed = true;
+                            } else if (bl == .constant) {
+                                const next_lat: SccpLattice = if (bl.constant == .source_loc) switch (inst.operands.rhs) {
+                                    0 => .{ .constant = .{ .str_val = bl.constant.source_loc.file_sym } },
+                                    1 => .{ .constant = .{ .str_val = bl.constant.source_loc.fn_sym } },
+                                    2 => .{ .constant = .{ .int_val = @as(i128, bl.constant.source_loc.line) } },
+                                    3 => .{ .constant = .{ .int_val = @as(i128, bl.constant.source_loc.col) } },
+                                    else => .bottom,
+                                } else .bottom;
                                 if (meetSccpLattice(&val_lat[raw], next_lat)) has_progressed = true;
                             }
                         },
@@ -5729,7 +6014,7 @@ fn eliminateDeadSsaInstructions(allocator: std.mem.Allocator, body: *MirBody) !v
                             try markSsaValLive(allocator, v_id, is_live, &worklist);
                         }
                     },
-                    .tuple_agg, .struct_agg, .array_elems, .str_concat => {
+                    .tuple_agg, .struct_agg, .array_elems, .str_concat, .fmt_args_make => {
                         for (body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs]) |v_id| {
                             try markSsaValLive(allocator, v_id, is_live, &worklist);
                         }
@@ -5954,6 +6239,8 @@ fn computeSinglePlaceByteDigest(
                     break :blk soa_f;
                 } else if (cur_ty == .str_ty)
                     .u8_ty
+                else if (mir.unionSliceElemType(pool, cur_ty)) |u_elem|
+                    u_elem
                 else
                     pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
                 const elem_shape = computeLayoutShapeKey(pool, sym_table, elem_ty, target_layout);
@@ -6082,6 +6369,8 @@ fn isPlaceStructurallyEqual(
                     break :blk sf_a;
                 } else if (cur_ty_a == .str_ty)
                     .u8_ty
+                else if (mir.unionSliceElemType(pool, cur_ty_a)) |u_elem_a|
+                    u_elem_a
                 else
                     pool.unwrapUnderlyingType(TypeId.fromInt(node_a.lhs));
                 cur_ty_b = if (soa_field_b) |sf_b| blk: {
@@ -6089,6 +6378,8 @@ fn isPlaceStructurallyEqual(
                     break :blk sf_b;
                 } else if (cur_ty_b == .str_ty)
                     .u8_ty
+                else if (mir.unionSliceElemType(pool, cur_ty_b)) |u_elem_b|
+                    u_elem_b
                 else
                     pool.unwrapUnderlyingType(TypeId.fromInt(node_b.lhs));
                 if (!computeLayoutShapeKey(pool, sym_table, cur_ty_a, target_layout).isEqual(
@@ -6362,6 +6653,23 @@ fn computeMirBodyStructuralHashWithInterner(
                                 hasher.update(&[_]u8{rb.align_log2});
                                 hasher.update(std.mem.asBytes(&rb.byte_len));
                             },
+                            .source_loc => |sl| {
+                                if (interner) |str_pool| {
+                                    const file_bytes = str_pool.get(sl.file_sym);
+                                    const file_len: u32 = @intCast(file_bytes.len);
+                                    hasher.update(std.mem.asBytes(&file_len));
+                                    hasher.update(file_bytes);
+                                    const fn_bytes = str_pool.get(sl.fn_sym);
+                                    const fn_len: u32 = @intCast(fn_bytes.len);
+                                    hasher.update(std.mem.asBytes(&fn_len));
+                                    hasher.update(fn_bytes);
+                                } else {
+                                    hasher.update(std.mem.asBytes(&sl.file_sym));
+                                    hasher.update(std.mem.asBytes(&sl.fn_sym));
+                                }
+                                hasher.update(std.mem.asBytes(&sl.line));
+                                hasher.update(std.mem.asBytes(&sl.col));
+                            },
                         }
                     }
                 },
@@ -6488,7 +6796,7 @@ fn computeMirBodyStructuralHashWithInterner(
                                 }
                             }
                         },
-                        .array_elems, .str_concat => {
+                        .array_elems, .str_concat, .fmt_args_make => {
                             hasher.update(std.mem.asBytes(&inst.operands.rhs));
                             if (inst.operands.lhs + inst.operands.rhs <= body.extra_args.items.len) {
                                 for (body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs]) |v_raw| {
@@ -6986,7 +7294,7 @@ pub fn isMirBodyStructurallyEqual(
                                 }
                             }
                         },
-                        .array_elems, .str_concat => {
+                        .array_elems, .str_concat, .fmt_args_make => {
                             if (inst_a.operands.rhs != inst_b.operands.rhs) return false;
                             const elem_len = inst_a.operands.rhs;
                             if (inst_a.operands.lhs + elem_len > body_a.extra_args.items.len or
@@ -7458,8 +7766,9 @@ pub fn computeLayoutShapeKey(
         .indirect_sret;
 
     const node = pool.getNode(ty);
+    const is_non_copy_prim = ty == .bencher_ty or pool.isTaskGroupType(ty) or pool.isTaskHandleType(ty);
     const is_copy: u8 = @intFromBool(
-        node.flags.is_copy or node.tag == .primitive or node.tag == .ref_ty or
+        node.flags.is_copy or (node.tag == .primitive and !is_non_copy_prim) or node.tag == .ref_ty or
             node.tag == .raw_ptr_ty or node.tag == .fn_ty or node.tag == .bit_field_ty,
     );
 
@@ -7467,8 +7776,8 @@ pub fn computeLayoutShapeKey(
         .bool_01
     else if (ty == .char_ty)
         .char_unicode
-    else if (ty == .str_ty or node.tag == .ref_ty or node.tag == .mut_ref_ty or node.tag == .fn_ty or
-        node.tag == .slice_ty or node.tag == .soa_slice_ty or node.tag == .closure_ty)
+    else if (ty == .str_ty or ty == .source_loc_ty or node.tag == .ref_ty or node.tag == .mut_ref_ty or
+        node.tag == .fn_ty or node.tag == .slice_ty or node.tag == .soa_slice_ty or node.tag == .closure_ty)
         .non_null_ptr
     else if (node.tag == .enum_ty)
         .enum_tag_ceil
@@ -8097,7 +8406,7 @@ test "test_mir_opt_d5_monomorphize_preserves_type_name_and_interior_field_signed
         \\    if is_first_less(neg_pair, one_i32) {
         \\        score = score + 10;
         \\    }
-        \\    if !is_first_less(big_pair, one_u32) {
+        \\    if not is_first_less(big_pair, one_u32) {
         \\        score = score + 20;
         \\    }
         \\    return score;
@@ -8170,7 +8479,7 @@ test "test_mir_opt_r3_u128_top_bit_vrp_and_d2_shift_rhs_type_e0502_without_casca
     const u128_src =
         \\pub fn check_high_u128(is_top_bit: bool) -> bool {
         \\    var wide_val: u128 = 170141183460469231731687303715884105728;
-        \\    if !is_top_bit {
+        \\    if not is_top_bit {
         \\        wide_val = 20;
         \\    }
         \\    return wide_val < 10;
@@ -8630,12 +8939,12 @@ test "test_phase6_pass_d0_sast_elaborate_drops_bce_and_d3_ghost_strip_e2e" {
         \\pub struct Vec[T] {
         \\    pub len: usize,
         \\}
-        \\pub fn take_vec(own buf: sink Vec[i64]) {}
+        \\pub fn take_vec(buf: own Vec[i64]) {}
         \\@no_panic
         \\pub fn d0_pipeline_entry(cond: bool, val: i32) -> i64 {
         \\    let buf = Vec { len: 3 };
         \\    if cond {
-        \\        take_vec(buf);
+        \\        take_vec(own buf);
         \\    }
         \\    let table: [i64; 4] = [10, 20, 30, 40];
         \\    if val >= 0 and val < 4 {
@@ -8711,4 +9020,119 @@ test "test_phase6_pass_d0_sast_elaborate_drops_bce_and_d3_ghost_strip_e2e" {
     const entry_body = opt_res.findBodyByName(&hir_bundle.interner, "d0_pipeline_entry").?;
     const eval_out = try vm.evalBody(entry_body, &.{ .{ .scalar_u64 = 0 }, .{ .scalar_i64 = 2 } });
     try std.testing.expectEqual(@as(i64, 30), eval_out.slot.scalar_i64);
+}
+
+test "test_phase76_stage4_mir_opt_layout_ptr_masks_and_union_bound_casts" {
+    const allocator = std.testing.allocator;
+    const mir_vm = @import("mir_vm.zig");
+
+    const source =
+        \\pub fn widen_to_i64[T: i8 | u8](val: T) -> i64 {
+        \\    return (val as i32) as i64;
+        \\}
+        \\pub fn shift_and_sat_i64[T: i8 | u8](val: T, amt: T, delta: T) -> i64 {
+        \\    let shifted: T = val >> amt;
+        \\    let saturated: T = val +| delta;
+        \\    return (shifted as i64) * 1000 + (saturated as i64);
+        \\}
+        \\pub fn cast_num[T: i64 | f64](val: i32) -> T {
+        \\    return val as T;
+        \\}
+        \\pub fn run_union_mono() -> i64 {
+        \\    let neg_wide: i64 = widen_to_i64[i8](-1_i8);
+        \\    let pos_wide: i64 = widen_to_i64[u8](255_u8);
+        \\    let signed_ops: i64 = shift_and_sat_i64[i8](-8_i8, 1_i8, -125_i8);
+        \\    let unsigned_ops: i64 = shift_and_sat_i64[u8](250_u8, 1_u8, 10_u8);
+        \\    let as_int: i64 = cast_num[i64](-7);
+        \\    let as_flt: f64 = cast_num[f64](-7);
+        \\    return neg_wide * 1000000 + pos_wide * 1000 + signed_ops + unsigned_ops + as_int + (as_flt as i64);
+        \\}
+    ;
+
+    var bundle = try mir.lowerSourceToMir(
+        allocator,
+        FileId.fromInt(92),
+        source,
+        TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer bundle.deinit();
+    try std.testing.expect(!bundle.hir_bundle.diagnostics.hasErrors());
+
+    // [1] Verify `SourceLoc`, `FmtArgs`, and 2-word vs 3-word `Closure` layout keys and `ptr_mask`:
+    const pool = &bundle.hir_bundle.pool;
+    const sym_table = &bundle.hir_bundle.sym_table;
+    try std.testing.expectEqual(
+        OpSemanticsTag.pointer_or_ref,
+        classifyOpSemantics(pool, .source_loc_ty, TargetLayout.NATIVE_64),
+    );
+    const src_loc_shape = computeLayoutShapeKey(pool, sym_table, .source_loc_ty, TargetLayout.NATIVE_64);
+    try std.testing.expectEqual(NicheKind.non_null_ptr, src_loc_shape.niche_kind);
+    try std.testing.expectEqual(@as(u32, 0b001), src_loc_shape.ptr_mask_64);
+
+    const fmt_args_shape = computeLayoutShapeKey(pool, sym_table, .fmt_args_ty, TargetLayout.NATIVE_64);
+    try std.testing.expectEqual(@as(u32, 0b0101), fmt_args_shape.ptr_mask_64);
+
+    const copy_closure_ty = try pool.internFnSignatureFull(
+        .closure_ty,
+        &.{},
+        &.{},
+        .i32_ty,
+        false,
+        .{},
+        .copy_tier,
+        false,
+    );
+    const move_closure_ty = try pool.internFnSignatureFull(
+        .closure_ty,
+        &.{},
+        &.{},
+        .i32_ty,
+        false,
+        .{},
+        .auto_drop_tier,
+        false,
+    );
+    const copy_closure_shape = computeLayoutShapeKey(pool, sym_table, copy_closure_ty, TargetLayout.NATIVE_64);
+    const move_closure_shape = computeLayoutShapeKey(pool, sym_table, move_closure_ty, TargetLayout.NATIVE_64);
+    try std.testing.expectEqual(@as(u32, 0b011), copy_closure_shape.ptr_mask_64);
+    try std.testing.expectEqual(@as(u32, 0b111), move_closure_shape.ptr_mask_64);
+
+    // [2] Optimize and execute union-bound casts, arithmetic right shifts, and saturating ops:
+    var opt_sink = DiagnosticSink.init(allocator);
+    defer opt_sink.deinit();
+    var opt_res = try optimizeMirModule(
+        allocator,
+        bundle.mir_bundle.bodies.items,
+        pool,
+        sym_table,
+        &bundle.hir_bundle.interner,
+        .{ .is_release_mode = true, .target_layout = TargetLayout.NATIVE_64 },
+        &opt_sink,
+    );
+    defer opt_res.deinit();
+    try std.testing.expect(!opt_sink.hasErrors());
+
+    var rodata_pool = mir_vm.RodataPool.init(allocator);
+    defer rodata_pool.deinit();
+    var vm = try mir_vm.MirVm.init(
+        allocator,
+        &bundle.hir_bundle.interner,
+        pool,
+        sym_table,
+        &rodata_pool,
+        null,
+        null,
+        .{},
+    );
+    defer vm.deinit();
+    for (opt_res.bodies.items) |*body_ptr| {
+        _ = try vm.registerBody(body_ptr, .none);
+    }
+    const run_body = opt_res.findBodyByName(&bundle.hir_bundle.interner, "run_union_mono").?;
+    const eval_out = try vm.evalBody(run_body, &.{});
+    // `neg_wide = -1` (-1_000_000), `pos_wide = 255` (+255_000),
+    // `signed_ops = (-4 * 1000) + (-128) = -4128`, `unsigned_ops = (125 * 1000) + 255 = 125255`,
+    // `as_int = -7`, `as_flt as i64 = -7` -> `-1_000_000 + 255_000 - 4128 + 125255 - 14 = -623887`:
+    try std.testing.expectEqual(@as(i64, -623887), eval_out.slot.scalar_i64);
 }

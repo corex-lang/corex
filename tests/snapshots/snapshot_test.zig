@@ -292,11 +292,11 @@ test "test_snapshot_lexer_token_stream_and_trivia" {
         "#!/usr/bin/env corex\n" ++
         "//! Lexer snapshot module\n" ++
         "const MAX_STEPS: usize = 0x10_00;\n" ++
-        "pub fn step_count(val: i32) -> Result[i32, IoError] {\n" ++
+        "pub fn step_count(val: i32) -> i32!IoError {\n" ++
         "    for i in 0..10 {\n" ++
         "        let msg = \"step={val.max(1)} {r#\"ok\"#}\\n\";\n" ++
         "    }\n" ++
-        "    return Ok(val +% 1);\n" ++
+        "    return .Ok(val +% 1);\n" ++
         "}\n";
 
     var token_buf = TokenBuffer.init(std.testing.allocator);
@@ -433,7 +433,7 @@ test "test_snapshot_parser_cst_and_ast_tree" {
         "pub struct Metric[T] {\n" ++
         "    pub val: T,\n" ++
         "}\n" ++
-        "pub fn render[T](opt: Option[T]) -> View {\n" ++
+        "pub fn render[T](opt: T?) -> View {\n" ++
         "    let .Some(item) = opt else {\n" ++
         "        return Empty;\n" ++
         "    };\n" ++
@@ -608,7 +608,7 @@ test "test_snapshot_fmt_comments_and_directives" {
         "//! Module header doc comment\n" ++
         "// Leading comment on Point\n" ++
         "pub struct Point {\n" ++
-        "    pub x: i32; // trailing comment on x\n" ++
+        "    pub x: i32, // trailing comment on x\n" ++
         "    // leading comment on y\n" ++
         "    pub y: i32\n" ++
         "}\n" ++
@@ -896,20 +896,20 @@ test "test_snapshot_phase5_hir_desugaring" {
         "    pub weight: i32,\n" ++
         "    pub tag: u32,\n" ++
         "}\n" ++
-        "pub bit_field PacketFlags : u16 {\n" ++
+        "pub bit_field PacketFlags: u16 {\n" ++
         "    pub is_live: bool | 1,\n" ++
         "    pub tag: u16 | 15,\n" ++
         "}\n" ++
         "pub fn scale_step(num: i32, factor: i32) -> i32 {\n" ++
         "    return num * factor;\n" ++
         "}\n" ++
-        "pub fn read_raw(is_ok: bool) -> Result[i32, IoError] {\n" ++
+        "pub fn read_raw(is_ok: bool) -> i32!IoError {\n" ++
         "    if is_ok {\n" ++
         "        return .Ok(20);\n" ++
         "    }\n" ++
         "    return .Err(IoError { code: 404 });\n" ++
         "}\n" ++
-        "pub fn lift_value(is_ok: bool, seed_val: i32) -> Result[i32, AppError] {\n" ++
+        "pub fn lift_value(is_ok: bool, seed_val: i32) -> i32!AppError {\n" ++
         "    let raw_val = read_raw(is_ok)?;\n" ++
         "    let piped = seed_val |> scale_step(2);\n" ++
         "    return .Ok(piped + raw_val);\n" ++
@@ -967,7 +967,7 @@ test "test_snapshot_phase5_mir_ssa_dev_vs_release" {
         "    pub total: i64,\n" ++
         "    pub steps: i64,\n" ++
         "}\n" ++
-        "pub fn showcase_ssa_cfg(limit: i64, mode_tag: i64) -> Result[i64, i64] {\n" ++
+        "pub fn showcase_ssa_cfg(limit: i64, mode_tag: i64) -> i64!i64 {\n" ++
         "    var audit_log: i64 = 0;\n" ++
         "    defer {\n" ++
         "        audit_log += 1;\n" ++
@@ -1134,7 +1134,7 @@ test "test_snapshot_phase5_mir_monomorph_and_icf" {
         "    let chosen_i = select_ptr(false, &i_left, &i_right);\n" ++
         "    let scaled_i64 = scale_add(seed_val, two_i64);\n" ++
         "    let scaled_u32 = scale_add(four_u32, three_u32) as i64;\n" ++
-        "    return (*chosen_u as i64) + (*chosen_i as i64) + scaled_i64 + scaled_u32 +\n" ++
+        "    return (chosen_u.* as i64) + (chosen_i.* as i64) + scaled_i64 + scaled_u32 +\n" ++
         "        hash_lane_a(seed_val, 5) + hash_lane_b(seed_val, 5);\n" ++
         "}\n";
 
@@ -1380,11 +1380,11 @@ test "test_snapshot_phase6_sast_ownership_region_and_bounds_diagnostics" {
         "    pub allocator: usize,\n" ++
         "    pub scratch: [BumpArena; 2],\n" ++
         "}\n" ++
-        "pub fn consume_vec(own _items: sink Vec[i64]) {}\n" ++
+        "pub fn consume_vec(_items: own Vec[i64]) {}\n" ++
         "pub fn head_slice(items: &[i64]) -> &[i64] {\n" ++
         "    return items;\n" ++
         "}\n" ++
-        "pub fn mutate_arr(mut arr: inout [i64; 4]) {\n" ++
+        "pub fn mutate_arr(arr: &mut [i64; 4]) {\n" ++
         "    arr[0] = 99;\n" ++
         "}\n" ++
         "pub fn reset(_arena: &BumpArena) {}\n" ++
@@ -1393,14 +1393,14 @@ test "test_snapshot_phase6_sast_ownership_region_and_bounds_diagnostics" {
         "}\n" ++
         "pub fn use_after_move() -> usize {\n" ++
         "    let items = Vec { len: 4 };\n" ++
-        "    consume_vec(items);\n" ++
+        "    consume_vec(own items);\n" ++
         "    return items.len;\n" ++
         "}\n" ++
         "pub fn borrow_conflict() -> usize {\n" ++
         "    var arr: [i64; 4] = [1, 2, 3, 4];\n" ++
         "    let view = head_slice(&arr);\n" ++
-        "    mutate_arr(arr);\n" ++
-        "    return view.len;\n" ++
+        "    mutate_arr(&mut arr);\n" ++
+        "    return view.len();\n" ++
         "}\n" ++
         "pub fn stack_escape() -> &i64 {\n" ++
         "    let local_val: i64 = 77;\n" ++
@@ -1696,7 +1696,7 @@ test "test_snapshot_phase6_mir_drop_elaboration_and_dev_release_parity" {
         "        @drop_trace(self.id);\n" ++
         "    }\n" ++
         "}\n" ++
-        "pub fn consume_guard(own item: sink TrackedGuard) -> i64 {\n" ++
+        "pub fn consume_guard(item: own TrackedGuard) -> i64 {\n" ++
         "    return item.id;\n" ++
         "}\n" ++
         "@no_panic\n" ++
@@ -1707,9 +1707,9 @@ test "test_snapshot_phase6_mir_drop_elaboration_and_dev_release_parity" {
         "    let slice_view: &[i64] = &weights;\n" ++
         "    var total: i64 = 0;\n" ++
         "    if take_branch {\n" ++
-        "        total = consume_guard(cond_guard);\n" ++
+        "        total = consume_guard(own cond_guard);\n" ++
         "    }\n" ++
-        "    if probe_idx < slice_view.len {\n" ++
+        "    if probe_idx < slice_view.len() {\n" ++
         "        total = total +% slice_view[probe_idx];\n" ++
         "    }\n" ++
         "    return total +% outer_guard.id;\n" ++
@@ -1914,13 +1914,13 @@ test "test_snapshot_phase7_codegen_c_and_llvm_showcase" {
         "    pub left_lane: i32,\n" ++
         "    pub right_lane: i32,\n" ++
         "}\n\n" ++
-        "pub fn decode_header(hdr: PacketHeader) -> Result[i32, i32] {\n" ++
+        "pub fn decode_header(hdr: PacketHeader) -> i32!i32 {\n" ++
         "    if hdr.kind_tag == 0 {\n" ++
         "        return .Err(0);\n" ++
         "    }\n" ++
         "    return .Ok((hdr.kind_tag as i32) + (hdr.payload_len as i32));\n" ++
         "}\n\n" ++
-        "pub fn compute_showcase(hdr: PacketHeader, bonus_opt: i32?) -> Result[i32, i32] {\n" ++
+        "pub fn compute_showcase(hdr: PacketHeader, bonus_opt: i32?) -> i32!i32 {\n" ++
         "    let base_val: i32 = decode_header(hdr)?;\n" ++
         "    var pairs: #soa [SamplePair; 4] = @default_init[#soa [SamplePair; 4]]();\n" ++
         "    pairs[0].left_lane = 1;\n" ++

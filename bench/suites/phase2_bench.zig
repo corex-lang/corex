@@ -49,20 +49,20 @@ const IncrementalBenchState = struct {
 /// Representative 16-line `.cx` function block repeated 128 times to form a 64 KiB (`2,048` LOC) module.
 const SYNTHETIC_BLOCK_16_LOC =
     "/// Computes bounded checksum across a borrowed slice of packet frames.\n" ++
-    "pub fn compute_frame_checksum(frames: &[PacketFrame], seed_val: u64) -> Result[u64, FrameError] {\n" ++
-    "    let prime_factor: u64 = 0x9E37_79B9_7F4A_7C15;\n" ++
+    "pub fn compute_frame_checksum(frames: &[PacketFrame], seed_val: u64, /) -> u64!FrameError {\n" ++
+    "    let prime_factor: u64 = 0x9E37_79B9_7F4A_7C15_u64;\n" ++
     "    var acc_hash: u64 = seed_val +% 1_000_000;\n" ++
     "    for idx in 0..frames.len() {\n" ++
-    "        let item = frames[idx];\n" ++
+    "        let item = &frames[idx];\n" ++
     "        if item.is_valid and not item.is_empty {\n" ++
     "            acc_hash = (acc_hash *% prime_factor) ^ item.payload_len.max(1);\n" ++
     "        }\n" ++
     "    }\n" ++
     "    /* Verify non-zero state before returning to caller */\n" ++
-    "    let status_msg = \"hash={acc_hash} count={frames.len()}\\n\";\n" ++
-    "    let raw_tag = r#\"corex::net::frame_v1\"#;\n" ++
-    "    let sep_char = ':';\n" ++
-    "    return Ok(acc_hash);\n" ++
+    "    let status_msg = \"hash={acc_hash:#018x} count={frames.len()}\\n\";\n" ++
+    "    let raw_tag = b\"corex.net.frame_v1\";\n" ++
+    "    let sep_char = b':';\n" ++
+    "    return .Ok(acc_hash);\n" ++
     "}\n";
 /// Complete 64 KiB (`2,048` LOC, `128` functions) synthetic `.cx` module.
 const SYNTHETIC_MODULE_64K: [SYNTHETIC_BLOCK_16_LOC.len * 128]u8 = blk: {
@@ -78,8 +78,8 @@ const SYNTHETIC_MODULE_64K: [SYNTHETIC_BLOCK_16_LOC.len * 128]u8 = blk: {
 const MID_FUNCTION_EDIT_START: u32 = @intCast(
     64 * SYNTHETIC_BLOCK_16_LOC.len +
         ("/// Computes bounded checksum across a borrowed slice of packet frames.\n" ++
-            "pub fn compute_frame_checksum(frames: &[PacketFrame], seed_val: u64) -> Result[u64, FrameError] {\n" ++
-            "    let prime_factor: u64 = 0x9E37_79B9_7F4A_7C15;\n" ++
+            "pub fn compute_frame_checksum(frames: &[PacketFrame], seed_val: u64, /) -> u64!FrameError {\n" ++
+            "    let prime_factor: u64 = 0x9E37_79B9_7F4A_7C15_u64;\n" ++
             "    var acc_hash: u64 = seed_val +% ").len,
 );
 /// End byte offset of the `1_000_000` literal inside function #64 of `SYNTHETIC_MODULE_64K`.
@@ -96,13 +96,13 @@ const PRATT_EXPR_CHUNK_16 =
     "    let e01 = (x +% y *% 3) << 2 ^ (x -| y *| 5) & 0xFF;\n" ++
     "    let e02 = x |> transform(y) |> finalize[i64]() catch 0;\n" ++
     "    let e03 = not (x < y) and (y >= 0 or x != -1);\n" ++
-    "    let e04 = -x + ~y - (*ptr as i64) + (&x).abs();\n" ++
-    "    let e05 = alloc[u64](16)[0] as i64 +% (x / 2 % 7);\n" ++
+    "    let e04 = -x + ~y - (ptr.* as i64) + (&x).abs();\n" ++
+    "    let e05 = alloc[u64](16)[0, 1] as i64 +% (x / 2 % 7);\n" ++
     "    let e06 = try_fetch(x)? |> decode() catch |err| { 0 };\n" ++
     "    let e07 = Card(padding: 8) { Text(val: x); };\n" ++
     "    let e08 = ((x + 1) * (y - 2)) |> clamp(0, 100) catch 42;\n" ++
-    "    let e09 = (x | y) & (x ^ 0xDEAD_BEEF) >> 4;\n" ++
-    "    let e10 = state.metrics[0].count.max[i64](y) + 1;\n" ++
+    "    let e09 = (x | y) & (x ^ 0xDEAD_BEEF_i64) >> 4;\n" ++
+    "    let e10 = state.metrics[0].count.max[i64](y) + (&raw x as usize as i64);\n" ++
     "    let e11 = if x > 0 { x +% 10 } else { y -% 10 };\n" ++
     "    let e12 = future_val.await? |> normalize() catch -1;\n" ++
     "    let e13 = (x +| y) * (x -| 1) + (y *% 9);\n" ++

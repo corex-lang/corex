@@ -99,7 +99,7 @@ const SYNTHETIC_PHASE7_PREAMBLE =
     "pub fn mix_scalar(lhs_v: i64, rhs_v: i64) -> i64 {\n" ++
     "    return (lhs_v ^ (rhs_v << 3)) +% 17;\n" ++
     "}\n\n" ++
-    "pub fn validate_frame(frame_in: BenchFrame) -> Result[i64, i32] {\n" ++
+    "pub fn validate_frame(frame_in: BenchFrame) -> i64!i32 {\n" ++
     "    if frame_in.opcode == 0 {\n" ++
     "        return .Err(0);\n" ++
     "    }\n" ++
@@ -111,7 +111,7 @@ const SYNTHETIC_PHASE7_PREAMBLE =
     "        .None => 5,\n" ++
     "    };\n" ++
     "}\n\n" ++
-    "pub fn bump_counter(mut slot_ref: inout AlignedCounter, step: u64) -> u64 {\n" ++
+    "pub fn bump_counter(slot_ref: &mut AlignedCounter, step: u64) -> u64 {\n" ++
     "    slot_ref.ticks = slot_ref.ticks +% step;\n" ++
     "    return slot_ref.ticks;\n" ++
     "}\n\n";
@@ -179,11 +179,11 @@ fn buildSyntheticPhase7Source(allocator: std.mem.Allocator) ![]u8 {
     while (fn_idx < SYNTHETIC_WORKER_COUNT) : (fn_idx += 1) {
         const worker_text = try std.fmt.bufPrint(
             &worker_buf,
-            "pub fn codegen_worker_{d:0>3}(seed_val: i32, seq_in: u64) -> Result[i64, i32] {{\n" ++
+            "pub fn codegen_worker_{d:0>3}(seed_val: i32, seq_in: u64) -> i64!i32 {{\n" ++
                 "    let frame_item = BenchFrame {{ opcode: 1, payload: seed_val +% {d}, seq_id: seq_in }};\n" ++
                 "    let checked_sum: i64 = validate_frame(frame_item)?;\n" ++
                 "    var local_cnt = AlignedCounter {{ ticks: seq_in }};\n" ++
-                "    let bumped_u64: u64 = bump_counter(local_cnt, {d});\n" ++
+                "    let bumped_u64: u64 = bump_counter(&mut local_cnt, {d});\n" ++
                 "    let simd_vec: [i32; 4] = @simd_add(@simd_splat[[i32; 4]](seed_val), [1, 2, 3, 4]);\n" ++
                 "    let simd_sum: i32 = @simd_reduce_add(simd_vec) +% unwrap_opt_delta(.Some({d}));\n" ++
                 "    return .Ok(mix_scalar(checked_sum, (bumped_u64 as i64) +% (simd_sum as i64)));\n" ++

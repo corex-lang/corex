@@ -113,8 +113,8 @@ const SYNTHETIC_PREAMBLE_32_LOC =
     "    return val * factor + val;\n" ++
     "}\n" ++
     "\n" ++
-    "/// Fallible helper exercising `Result` `?` propagation and `catch` fallback.\n" ++
-    "pub fn lift_seed(val: i32) -> Result[i32, u32] {\n" ++
+    "/// Fallible helper exercising `T!E` `?` propagation and `catch` fallback.\n" ++
+    "pub fn lift_seed(val: i32) -> i32!u32 {\n" ++
     "    if val < 0 {\n" ++
     "        return .Err(1);\n" ++
     "    }\n" ++
@@ -137,7 +137,7 @@ const SYNTHETIC_PREAMBLE_32_LOC =
 /// Representative 16-line `.cx` worker function repeated 126 times (`2 + 126 = 128` functions, `2,048` LOC).
 const SYNTHETIC_WORKER_16_LOC =
     "/// Evaluates pipelines, `?`/`catch`, `match`, `for` loops, structs, and `defer`.\n" ++
-    "pub fn eval_phase5_work000(seed_val: i32, flag_byte: u8) -> Result[i32, u32] {\n" ++
+    "pub fn eval_phase5_work000(seed_val: i32, flag_byte: u8) -> i32!u32 {\n" ++
     "    var cleanup_acc: i32 = 0;\n" ++
     "    defer { cleanup_acc += 1; }\n" ++
     "    let checked: i32 = lift_seed(seed_val |> pipe_boost(2))? + (lift_seed(seed_val) catch 5);\n" ++

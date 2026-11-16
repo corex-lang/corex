@@ -1,14 +1,15 @@
 //! Fault-Tolerant Incremental Parser & Lossless CST-to-AST Lowerer
 //!
 //! Implements the explicit-stack `LL(k)` recursive-descent and 15-tier Pratt precedence-climbing
-//! parser for the CoreX v1.0 surface grammar (`DR-03` Sections 5.3–5.5 & `DR-21` Section 3.2),
-//! producing a pre-order `LosslessCstArena` and lowered Structure-of-Arrays `AstArena` in a single
-//! pass.
+//! parser for the CoreX v1.0 surface grammar (`DR-03` Sections 5.3–5.5, `DR-21` Section 3.2 & `DR-22`
+//! Sections 3.2–3.3), producing a pre-order `LosslessCstArena` and lowered Structure-of-Arrays
+//! `AstArena` in a single pass.
 //!
 //! Enforces `MAX_PARSE_DEPTH` (`512`, `E0203`), $O(1)$ 128-bit `TokenSet128` anchor synchronization
-//! (`E0201`, `E0202`), cross-namespace casing recovery with in-place `W0201` autofixes, mid-keystroke
-//! IDE completion nodes (`incomplete_member_access`, `incomplete_call`), and $O(K)$ top-level item
-//! incremental re-parsing (`reparseIncremental`, `DR-12` Sections 1–2).
+//! (`E0201`, `E0202`), cross-namespace casing recovery with in-place `W0201` autofixes, `DR-22`
+//! syntax canonicalization diagnostics (`E0219`–`E0228`), mid-keystroke IDE completion nodes
+//! (`incomplete_member_access`, `incomplete_call`), and $O(K)$ top-level item incremental re-parsing
+//! (`reparseIncremental`, `DR-12` Sections 1–2).
 
 const std = @import("std");
 const mem_foundation = @import("mem_foundation.zig");
@@ -52,7 +53,7 @@ const TextEdit = diagnostic.TextEdit;
 
 // --------------------- Token Sets & Edits ---------------------
 
-/// 128-bit bitset indexing all 117 `TokenKind` variants (`0..116`) for $O(1)$ membership queries.
+/// 128-bit bitset indexing all 120 `TokenKind` variants (`0..119`) for $O(1)$ membership queries.
 pub const TokenSet128 = struct {
     /// Underlying 128-bit bitmask where bit `@intFromEnum(kind)` encodes presence.
     mask: u128 = 0,
@@ -130,6 +131,8 @@ pub const ParserOptions = struct {
     max_depth: usize = syntax_arenas.MAX_PARSE_DEPTH,
     /// When `true`, emits `W0201` warnings with `.machine_applicable` autofixes on casing mismatches.
     is_casing_warning_enabled: bool = true,
+    /// When `true`, includes top-level `test` and `bench` declarations in `root`'s AST item slice.
+    is_including_tests: bool = true,
 };
 
 /// Pratt infix binding power pair `(left_bp, right_bp)` and non-associativity flag (`DR-03` Section 5.3).
@@ -190,6 +193,7 @@ pub const ITEM_STARTER_SET: TokenSet128 = TokenSet128.initMany(&.{
     .kw_trait,
     .kw_impl,
     .kw_comptime,
+    .kw_subscript,
     .kw_async,
     .kw_unsafe,
     .kw_extern,
@@ -206,6 +210,7 @@ pub const STMT_STARTER_SET: TokenSet128 = TokenSet128.initMany(&.{
     .kw_return,
     .kw_break,
     .kw_continue,
+    .kw_yield,
     .kw_unreachable,
     .kw_for,
     .kw_while,
@@ -215,14 +220,13 @@ pub const STMT_STARTER_SET: TokenSet128 = TokenSet128.initMany(&.{
     .kw_match,
     .kw_comptime,
 });
-/// Tokens that can legally begin a `PrimaryType` expression (`DR-03` Section 5.4 Part 5 & `DR-21`).
+/// Tokens that can legally begin a `Type` expression (`DR-22` Section 3.3).
 pub const TYPE_STARTER_SET: TokenSet128 = TokenSet128.initMany(&.{
     .prim_type,
     .kw_self_type,
     .amp,
     .star,
     .kw_own,
-    .kw_ref,
     .hash_soa,
     .tilde,
     .lbracket,
@@ -232,12 +236,13 @@ pub const TYPE_STARTER_SET: TokenSet128 = TokenSet128.initMany(&.{
     .at,
     .kw_async,
     .kw_unsafe,
+    .kw_extern,
     .kw_fn,
     .ident,
     .type_ident,
     .const_ident,
 });
-/// Tokens (excluding `.lbrace`) that can begin a prefix or primary expression (`DR-21` Section 3.2).
+/// Tokens (excluding `.lbrace`) that can begin a prefix or primary expression (`DR-22` Section 3.2).
 pub const EXPR_STARTER_NO_LBRACE_SET: TokenSet128 = TokenSet128.initMany(&.{
     .minus,
     .minus_percent,
@@ -247,16 +252,18 @@ pub const EXPR_STARTER_NO_LBRACE_SET: TokenSet128 = TokenSet128.initMany(&.{
     .star,
     .amp,
     .kw_own,
-    .kw_ref,
     .dotdot,
     .dotdoteq,
     .int_lit,
     .float_lit,
     .string_lit,
     .char_lit,
+    .byte_lit,
+    .byte_string_lit,
     .kw_true,
     .kw_false,
     .dollar,
+    .underscore,
     .ident,
     .type_ident,
     .const_ident,
@@ -322,6 +329,7 @@ pub const MEMBER_STOP_SET: TokenSet128 = TokenSet128.initMany(&.{
     .kw_type,
     .kw_const,
     .kw_comptime,
+    .kw_subscript,
     .kw_async,
     .kw_unsafe,
     .kw_extern,
@@ -338,10 +346,13 @@ pub const PARAM_STOP_SET: TokenSet128 = TokenSet128.initMany(&.{
     .eq,
     .lbrace,
     .semi,
+    .slash,
+    .star,
+    .dotdotdot,
+    .kw_var,
     .kw_comptime,
     .kw_mut,
     .kw_own,
-    .kw_ref,
     .amp,
     .kw_self_val,
     .ident,
@@ -386,8 +397,9 @@ pub const MATCH_ARM_STOP_SET: TokenSet128 = TokenSet128.initMany(&.{
     .dotdot,
     .dotdoteq,
     .minus,
+    .amp,
+    .kw_var,
     .kw_mut,
-    .kw_ref,
     .kw_own,
     .type_ident,
     .const_ident,
@@ -396,6 +408,8 @@ pub const MATCH_ARM_STOP_SET: TokenSet128 = TokenSet128.initMany(&.{
     .float_lit,
     .string_lit,
     .char_lit,
+    .byte_lit,
+    .byte_string_lit,
     .kw_true,
     .kw_false,
     .lparen,
@@ -459,7 +473,7 @@ inline fn isIdentifierKind(kind: TokenKind) bool {
     return kind == .ident or kind == .type_ident or kind == .const_ident;
 }
 
-/// Returns `true` if `kind` is one of the 49 language keywords (`0..48`).
+/// Returns `true` if `kind` is one of the 50 language keywords (`0..49`).
 inline fn isKeywordKind(kind: TokenKind) bool {
     return @backingInt(kind) <= @backingInt(TokenKind.kw_self_type);
 }
@@ -485,10 +499,32 @@ inline fn isRangeOp(kind: TokenKind) bool {
     return RANGE_OP_SET.contains(kind);
 }
 
-/// Returns `true` if `kind` is a scalar value literal (`int`, `float`, `string`, `char`, `bool`).
+/// Returns `true` if `kind` is a scalar or byte literal (`int`, `float`, `string`, `char`, `byte`, `bool`).
 inline fn isLiteralToken(kind: TokenKind) bool {
     return switch (kind) {
-        .int_lit, .float_lit, .string_lit, .char_lit, .kw_true, .kw_false => true,
+        .int_lit,
+        .float_lit,
+        .string_lit,
+        .char_lit,
+        .byte_lit,
+        .byte_string_lit,
+        .kw_true,
+        .kw_false,
+        => true,
+        else => false,
+    };
+}
+
+/// Returns `true` if `byte_val` can continue an ASCII identifier (`[A-Za-z0-9_]`).
+inline fn isAsciiIdentContinue(byte_val: u8) bool {
+    return std.ascii.isAlphanumeric(byte_val) or byte_val == '_';
+}
+
+/// Returns `true` if `kind` is an unambiguous place/value starter after contextual `&out` or `&raw`.
+inline fn isUnambiguousAddrOperandStart(kind: TokenKind, next_after_lparen: TokenKind) bool {
+    return switch (kind) {
+        .ident, .type_ident, .kw_self_val, .star => true,
+        .lparen => next_after_lparen != .rparen,
         else => false,
     };
 }
@@ -516,7 +552,7 @@ inline fn isBlockBodiedAstTag(tag: AstTag) bool {
     };
 }
 
-/// Returns the right binding power (`28`) for unary prefix operators (`DR-21` Section 3.2 Tier 14).
+/// Returns the right binding power (`28`) for unary prefix operators (`DR-22` Section 3.2 Tier 14).
 inline fn getPrefixRightBindingPower(kind: TokenKind) ?u8 {
     return switch (kind) {
         .minus,
@@ -527,13 +563,12 @@ inline fn getPrefixRightBindingPower(kind: TokenKind) ?u8 {
         .star,
         .amp,
         .kw_own,
-        .kw_ref,
         => 28,
         else => null,
     };
 }
 
-/// Returns the Pratt `(left_bp, right_bp, is_non_associative)` descriptor for `kind` (`DR-21` Section 3.2).
+/// Returns the Pratt `(left_bp, right_bp, is_non_associative)` descriptor for `kind` (`DR-22` Section 3.2).
 fn getInfixBindingPower(kind: TokenKind) ?InfixBindingPower {
     return switch (kind) {
         // Tier 13 – Explicit Type Cast (`as Type`):
@@ -565,10 +600,10 @@ fn getInfixBindingPower(kind: TokenKind) ?InfixBindingPower {
             .right_bp = 7,
             .is_non_associative = true,
         },
-        // Tier 2 – Logical Short-Circuit AND (`&&`, `and`):
-        .ampamp, .kw_and => .{ .left_bp = 4, .right_bp = 5 },
-        // Tier 1 – Logical Short-Circuit OR (`||`, `or`):
-        .pipepipe, .kw_or => .{ .left_bp = 2, .right_bp = 3 },
+        // Tier 2 – Logical Short-Circuit AND (`and`):
+        .kw_and => .{ .left_bp = 4, .right_bp = 5 },
+        // Tier 1 – Logical Short-Circuit OR (`or`):
+        .kw_or => .{ .left_bp = 2, .right_bp = 3 },
         else => null,
     };
 }
@@ -804,6 +839,8 @@ pub const Parser = struct {
     has_last_expr_block_body: bool = false,
     /// `true` while parsing the candidate LHS lvalue of a block expression/assignment statement.
     is_in_stmt_lhs: bool = false,
+    /// `true` while parsing destructuring place targets (`_ = …`, `(a, _) = …`, `Point { x: _ } = …`).
+    is_in_lhs_place: bool = false,
     /// `true` while parsing the top-level condition header of an `if` or `while` expression.
     is_in_cond_header: bool = false,
 
@@ -871,7 +908,11 @@ pub const Parser = struct {
         while (self.peekKind() != .eof) {
             const cursor_before = self.cursor;
             self.is_recovering_depth_overflow = false;
-            try item_indices.append(self.ast.allocator, (try self.parseItem()).asInt());
+            const parsed_item = try self.parseItem();
+            const parsed_tag = self.ast.getNode(parsed_item).tag;
+            if (self.options.is_including_tests or (parsed_tag != .test_decl and parsed_tag != .bench_decl)) {
+                try item_indices.append(self.ast.allocator, parsed_item.asInt());
+            }
 
             // Guarantee strict monotonic forward progress at top level:
             if (self.cursor == cursor_before and self.peekKind() != .eof) {
@@ -1352,6 +1393,80 @@ pub const Parser = struct {
         });
     }
 
+    /// Emits a parser diagnostic at `primary_span` with an optional `.machine_applicable` `TextEdit`.
+    fn emitDiagnosticWithFix(
+        self: *Parser,
+        code: DiagnosticCode,
+        primary_span: Span,
+        message: []const u8,
+        label_text: []const u8,
+        opt_fix_span: ?Span,
+        opt_replacement: ?[]const u8,
+        opt_fix_message: ?[]const u8,
+    ) !void {
+        self.cst.has_parse_errors = true;
+        const sink = self.diagnostic_sink orelse return;
+        const labels = [_]LabeledSpan{.{
+            .span = primary_span,
+            .label = label_text,
+            .style = .primary,
+        }};
+        var fix_slice: []const SuggestedFix = &.{};
+        var local_edit: [1]TextEdit = undefined;
+        var local_fix: [1]SuggestedFix = undefined;
+        if (opt_fix_span != null and opt_replacement != null and self.interner != null) {
+            const fix_span = opt_fix_span.?;
+            local_edit[0] = .{
+                .file_id = self.file_id,
+                .start_byte = fix_span.start_byte,
+                .end_byte = fix_span.end_byte,
+                .replacement_id = try self.interner.?.intern(opt_replacement.?),
+            };
+            local_fix[0] = .{
+                .message = opt_fix_message orelse "replace with canonical CoreX syntax",
+                .applicability = .machine_applicable,
+                .priority = .syntax_canonicalization,
+                .edits = &local_edit,
+            };
+            fix_slice = &local_fix;
+        }
+        try sink.emit(.{
+            .code = code,
+            .severity = .err,
+            .primary_span = primary_span,
+            .message = message,
+            .labels = &labels,
+            .suggestions = fix_slice,
+        });
+    }
+
+    /// Emits `E0219` (`e0219_retired_logical_or`) for an infix `||` token with a spacing-safe `or` autofix.
+    fn emitRetiredLogicalOr(self: *Parser, op_tok: TokenIndex) !void {
+        const op_span = self.getTokenSpan(op_tok);
+        const needs_left_space = op_span.start_byte > 0 and
+            op_span.start_byte <= self.source.len and
+            isAsciiIdentContinue(self.source[op_span.start_byte - 1]);
+        const needs_right_space = op_span.end_byte < self.source.len and
+            isAsciiIdentContinue(self.source[op_span.end_byte]);
+        const replacement: []const u8 = if (needs_left_space and needs_right_space)
+            " or "
+        else if (needs_left_space)
+            " or"
+        else if (needs_right_space)
+            "or "
+        else
+            "or";
+        try self.emitDiagnosticWithFix(
+            .e0219_retired_logical_or,
+            op_span,
+            "infix `||` logical OR operator has been retired; use `or` instead (`||` is reserved for 0-argument closures)",
+            "retired logical `||`; write `or` here",
+            op_span,
+            replacement,
+            "replace `||` with `or`",
+        );
+    }
+
     /// Emits `E0215` (`e0215_invalid_walrus_position`) for an unparenthesized or non-header `:=` binding.
     fn emitWalrusPositionError(
         self: *Parser,
@@ -1503,13 +1618,15 @@ pub const Parser = struct {
         self.is_in_cond_header = true;
         defer self.is_in_cond_header = saved_cond_header;
         while (self.peekKind() == .kw_and or
-            self.peekKind() == .ampamp or
             self.peekKind() == .kw_or or
             self.peekKind() == .pipepipe)
         {
             const logic_tok = try self.consumeLeaf(.token_leaf, .{});
             const logic_kind = self.token_buffer.getToken(logic_tok).kind;
-            const right_bp: u8 = if (logic_kind == .kw_and or logic_kind == .ampamp) 6 else 4;
+            if (logic_kind == .pipepipe) {
+                try self.emitRetiredLogicalOr(logic_tok);
+            }
+            const right_bp: u8 = if (logic_kind == .kw_and) 6 else 4;
             const guard_rhs = try self.parseExprBp(right_bp, false);
             cond_expr = try self.ast.appendNodeWithCst(.{
                 .tag = .binary_expr,
@@ -1632,14 +1749,32 @@ pub const Parser = struct {
         self.cst.finishNode(err_cst, .{ .has_error = true });
     }
 
-    /// Parses a single `@attr(…)` annotation list into `self.cst`.
+    /// Parses a sequence of `@attr(key: val)` annotations into `self.cst` (`ADR-22E`).
     fn parseAttributes(self: *Parser, has_error: *bool) anyerror!void {
         while (self.peekKind() == .at) {
             const attr_cst = try self.startCstNode(.attribute);
-            _ = try self.consumeLeaf(.token_leaf, .{});
+            var has_attr_err = false;
+            const at_tok = try self.consumeLeaf(.token_leaf, .{});
             if (isIdentifierKind(self.peekKind()) or isKeywordKind(self.peekKind())) {
-                _ = try self.consumeLeaf(.token_leaf, .{});
+                const name_tok = try self.consumeLeaf(.token_leaf, .{});
+                if (std.mem.eql(u8, self.getTokenLexeme(name_tok), "noalloc")) {
+                    has_attr_err = true;
+                    has_error.* = true;
+                    const at_span = self.getTokenSpan(at_tok);
+                    const name_span = self.getTokenSpan(name_tok);
+                    const full_span = Span.init(self.file_id, at_span.start_byte, name_span.end_byte);
+                    try self.emitDiagnosticWithFix(
+                        .e0225_retired_noalloc_attribute,
+                        full_span,
+                        "`@noalloc` attribute spelling has been retired; use `@no_alloc` instead",
+                        "retired `@noalloc`; write `@no_alloc`",
+                        full_span,
+                        "@no_alloc",
+                        "replace `@noalloc` with `@no_alloc`",
+                    );
+                }
             } else {
+                has_attr_err = true;
                 has_error.* = true;
                 try self.emitUnexpectedToken(
                     self.peekTokenIndexNth(0),
@@ -1659,7 +1794,21 @@ pub const Parser = struct {
                         (self.peekKindNth(1) == .eq or self.peekKindNth(1) == .colon))
                     {
                         _ = try self.consumeLeaf(.token_leaf, .{});
-                        _ = try self.consumeLeaf(.token_leaf, .{});
+                        const sep_tok = try self.consumeLeaf(.token_leaf, .{});
+                        if (self.token_buffer.getToken(sep_tok).kind == .eq) {
+                            has_attr_err = true;
+                            has_error.* = true;
+                            const eq_span = self.getTokenSpan(sep_tok);
+                            try self.emitDiagnosticWithFix(
+                                .e0223_retired_attribute_eq,
+                                eq_span,
+                                "`=` key-value separator inside `@attr(…)` has been retired; use `:` instead",
+                                "retired `=` in attribute argument; write `:`",
+                                eq_span,
+                                ":",
+                                "replace `=` with `:`",
+                            );
+                        }
                     }
                     _ = try self.parseExpr(true);
                     if (self.peekKind() == .comma) {
@@ -1672,15 +1821,80 @@ pub const Parser = struct {
                 try self.expectClosingDelimiter(
                     .rparen,
                     open_paren,
-                    has_error,
+                    &has_attr_err,
                     "expected `)` to close attribute argument list",
                 );
+                if (has_attr_err) has_error.* = true;
             }
-            self.cst.finishNode(attr_cst, .{ .has_error = has_error.* });
+            self.cst.finishNode(attr_cst, .{ .has_error = has_attr_err });
         }
     }
 
-    /// Parses a single top-level `Item` (`DR-03` Section 5.4 Part 1).
+    /// Parses optional `Vis = "pub" [ "(" ( "pkg" | "super" ) ")" ]` into `.visibility_modifier` CST (`ADR-22E`).
+    fn parseVisibility(self: *Parser, has_error: *bool) anyerror!void {
+        if (self.peekKind() != .kw_pub) return;
+        if (self.peekKindNth(1) != .lparen) {
+            _ = try self.consumeLeaf(.visibility_modifier, .{});
+            return;
+        }
+
+        const vis_cst = try self.startCstNode(.visibility_modifier);
+        var has_vis_err = false;
+        _ = try self.consumeLeaf(.token_leaf, .{});
+        const open_paren = try self.consumeLeaf(.token_leaf, .{});
+        if (self.peekKind() == .ident and
+            (std.mem.eql(u8, self.peekLexemeNth(0), "pkg") or
+                std.mem.eql(u8, self.peekLexemeNth(0), "super")))
+        {
+            _ = try self.consumeLeaf(.token_leaf, .{});
+        } else {
+            has_vis_err = true;
+            has_error.* = true;
+            const err_tok = self.peekTokenIndexNth(0);
+            try self.emitUnexpectedToken(
+                err_tok,
+                "expected `pkg` or `super` inside `pub(…)` visibility modifier",
+                "expected `pkg` or `super` here",
+            );
+            if (self.peekKind() != .rparen and
+                self.peekKind() != .rbrace and
+                self.peekKind() != .semi and
+                self.peekKind() != .eof)
+            {
+                _ = try self.consumeLeaf(.invalid_parse_leaf, .{ .has_error = true });
+            }
+        }
+        try self.expectClosingDelimiter(
+            .rparen,
+            open_paren,
+            &has_vis_err,
+            "expected `)` to close `pub(…)` visibility modifier",
+        );
+        if (has_vis_err) has_error.* = true;
+        self.cst.finishNode(vis_cst, .{ .has_error = has_vis_err });
+    }
+
+    /// Consumes a `,` or retired `;` member separator, emitting `E0224` when `;` is used (`ADR-22D`).
+    fn consumeMemberSeparator(self: *Parser, has_member_err: *bool) !void {
+        if (self.peekKind() == .comma) {
+            _ = try self.consumeLeaf(.token_leaf, .{});
+        } else if (self.peekKind() == .semi) {
+            const semi_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+            has_member_err.* = true;
+            const semi_span = self.getTokenSpan(semi_tok);
+            try self.emitDiagnosticWithFix(
+                .e0224_retired_semicolon_member_sep,
+                semi_span,
+                "`;` member separator has been retired; separate `struct`, `union`, `enum`, and `bit_field` members with `,`",
+                "retired `;` separator; write `,` here",
+                semi_span,
+                ",",
+                "replace `;` with `,`",
+            );
+        }
+    }
+
+    /// Parses a single top-level `Item` (`DR-22` Section 3.3).
     pub fn parseItem(self: *Parser) anyerror!NodeIndex {
         const item_cst = try self.startCstNode(.placeholder);
         self.pushState(.item_dispatch, item_cst) catch |err| switch (err) {
@@ -1693,10 +1907,7 @@ pub const Parser = struct {
 
         var has_error = false;
         try self.parseAttributes(&has_error);
-
-        if (self.peekKind() == .kw_pub) {
-            _ = try self.consumeLeaf(.visibility_modifier, .{});
-        }
+        try self.parseVisibility(&has_error);
 
         switch (self.peekKind()) {
             .kw_mod => return self.parseModItem(item_cst, &has_error),
@@ -1709,9 +1920,10 @@ pub const Parser = struct {
             .kw_enum => return self.parseEnumItem(item_cst, &has_error),
             .kw_trait => return self.parseTraitItem(item_cst, &has_error),
             .kw_impl => return self.parseImplItem(item_cst, &has_error),
+            .kw_subscript => return self.parseSubscriptItem(item_cst, &has_error),
             .kw_comptime => {
                 if (self.peekKindNth(1) != .lbrace) {
-                    return self.parseFunctionOrSubscriptItem(item_cst, &has_error);
+                    return self.parseFunctionItem(item_cst, &has_error);
                 }
                 self.cst.nodes.items(.kind)[item_cst.asInt()] = .block;
                 _ = try self.consumeLeaf(.token_leaf, .{});
@@ -1720,6 +1932,13 @@ pub const Parser = struct {
                 return block_node;
             },
             .kw_async, .kw_unsafe, .kw_extern, .kw_fn => {
+                if (self.peekKind() == .kw_async and
+                    self.peekKindNth(1) == .ident and
+                    std.mem.eql(u8, self.peekLexemeNth(1), "test") and
+                    self.peekKindNth(2) == .string_lit)
+                {
+                    return self.parseTestItem(item_cst, &has_error);
+                }
                 if (self.peekKind() == .kw_unsafe and self.peekKindNth(1) == .kw_impl) {
                     _ = try self.consumeLeaf(.token_leaf, .{});
                     return self.parseImplItem(item_cst, &has_error);
@@ -1728,11 +1947,16 @@ pub const Parser = struct {
                     _ = try self.consumeLeaf(.token_leaf, .{});
                     return self.parseTraitItem(item_cst, &has_error);
                 }
-                return self.parseFunctionOrSubscriptItem(item_cst, &has_error);
+                return self.parseFunctionItem(item_cst, &has_error);
             },
             .ident => {
-                if (std.mem.eql(u8, self.peekLexemeNth(0), "subscript")) {
-                    return self.parseFunctionOrSubscriptItem(item_cst, &has_error);
+                if (self.peekKindNth(1) == .string_lit) {
+                    const kw_lexeme = self.peekLexemeNth(0);
+                    if (std.mem.eql(u8, kw_lexeme, "test")) {
+                        return self.parseTestItem(item_cst, &has_error);
+                    } else if (std.mem.eql(u8, kw_lexeme, "bench")) {
+                        return self.parseBenchItem(item_cst, &has_error);
+                    }
                 }
             },
             else => {},
@@ -1777,7 +2001,11 @@ pub const Parser = struct {
 
             while (self.peekKind() != .rbrace and self.peekKind() != .eof) {
                 const before_cur = self.cursor;
-                try inner_items.append(self.ast.allocator, (try self.parseItem()).asInt());
+                const inner_item = try self.parseItem();
+                const inner_tag = self.ast.getNode(inner_item).tag;
+                if (self.options.is_including_tests or (inner_tag != .test_decl and inner_tag != .bench_decl)) {
+                    try inner_items.append(self.ast.allocator, inner_item.asInt());
+                }
                 if (self.cursor == before_cur and self.peekKind() != .rbrace and self.peekKind() != .eof) {
                     _ = try self.consumeLeaf(.invalid_parse_leaf, .{ .has_error = true });
                 }
@@ -1987,7 +2215,7 @@ pub const Parser = struct {
         }, item_cst);
     }
 
-    /// Parses `TypeAliasItem = "type" TYPE_IDENT [ TypeParams ] [ ":" TypeBounds ] [ "=" ( "bit_field" … | Type [ "is" Pattern ] ) ] ";" ;`.
+    /// Parses `TypeAliasItem = "type" TYPE_IDENT [ TypeParams ] [ ":" ConstraintExpr ] [ "=" ( Type | ConstraintExpr ) ] ";" ;`.
     fn parseTypeAliasItem(
         self: *Parser,
         item_cst: CstNodeIndex,
@@ -2007,7 +2235,7 @@ pub const Parser = struct {
         }
         if (self.peekKind() == .colon) {
             _ = try self.consumeLeaf(.token_leaf, .{});
-            try self.parseTypeBounds(has_error);
+            _ = try self.parseConstraintExpr(has_error);
         }
 
         var target_type_op: PackedOperand = .NONE;
@@ -2016,7 +2244,13 @@ pub const Parser = struct {
         if (self.peekKind() == .eq) {
             _ = try self.consumeLeaf(.token_leaf, .{});
             if (self.peekKind() == .kw_bit_field) {
-                _ = try self.consumeLeaf(.token_leaf, .{});
+                has_error.* = true;
+                const bf_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                try self.emitUnexpectedToken(
+                    bf_tok,
+                    "`type Name = bit_field …` has been retired; declare `bit_field Name: BackingInt { … }` directly",
+                    "retired `type … = bit_field`; use top-level `bit_field Name: Type { … }`",
+                );
                 if (self.peekKind() == .lparen) {
                     const open_paren = try self.consumeLeaf(.token_leaf, .{});
                     target_type_op = PackedOperand.initNode(try self.parseType());
@@ -2027,6 +2261,9 @@ pub const Parser = struct {
                         "expected `)` after `bit_field` backing integer type",
                     );
                 } else {
+                    if (self.peekKind() == .colon) {
+                        _ = try self.consumeLeaf(.token_leaf, .{});
+                    }
                     target_type_op = PackedOperand.initNode(try self.parseType());
                 }
                 if (self.peekKind() == .lbrace) {
@@ -2035,7 +2272,7 @@ pub const Parser = struct {
                 if (self.peekKind() == .semi) {
                     _ = try self.consumeLeaf(.token_leaf, .{});
                 }
-                self.cst.finishNode(item_cst, .{ .has_error = has_error.* });
+                self.cst.finishNode(item_cst, .{ .has_error = true });
                 return self.ast.appendNodeWithCst(.{
                     .tag = .type_alias_decl,
                     .main_token = type_tok,
@@ -2044,7 +2281,7 @@ pub const Parser = struct {
                 }, item_cst);
             }
 
-            const first_target = try self.parseTypeWithMode(.none);
+            const first_target = try self.parseIntersectBound(.none);
             if (self.peekKind() == .pipe) {
                 var union_members: std.ArrayList(u32) = .empty;
                 defer union_members.deinit(self.ast.allocator);
@@ -2053,7 +2290,7 @@ pub const Parser = struct {
                     _ = try self.consumeLeaf(.token_leaf, .{});
                     try union_members.append(
                         self.ast.allocator,
-                        (try self.parseTypeWithMode(.none)).asInt(),
+                        (try self.parseIntersectBound(.none)).asInt(),
                     );
                 }
                 target_type_op = PackedOperand.initExtra(try self.ast.appendExtraSlice(union_members.items));
@@ -2062,7 +2299,7 @@ pub const Parser = struct {
                 target_type_op = PackedOperand.initNode(first_target);
                 if (self.peekKind() == .kw_is) {
                     _ = try self.consumeLeaf(.token_leaf, .{});
-                    refine_pat_op = PackedOperand.initNode(try self.parsePattern(false));
+                    refine_pat_op = PackedOperand.initNode(try self.parsePatternWithOptions(false, false));
                 } else if (self.peekKind() == .kw_where) {
                     _ = try self.consumeLeaf(.token_leaf, .{});
                     refine_pat_op = PackedOperand.initNode(try self.parseExpr(false));
@@ -2162,9 +2399,7 @@ pub const Parser = struct {
             var has_field_err = false;
 
             try self.parseAttributes(&has_field_err);
-            if (self.peekKind() == .kw_pub) {
-                _ = try self.consumeLeaf(.visibility_modifier, .{});
-            }
+            try self.parseVisibility(&has_field_err);
 
             if (isIdentifierKind(self.peekKind())) {
                 _ = try self.expectIdentifierWithCasing(
@@ -2185,9 +2420,7 @@ pub const Parser = struct {
                     _ = try self.consumeLeaf(.token_leaf, .{});
                     _ = try self.parseExpr(true);
                 }
-                if (self.peekKind() == .comma or self.peekKind() == .semi) {
-                    _ = try self.consumeLeaf(.token_leaf, .{});
-                }
+                try self.consumeMemberSeparator(&has_field_err);
             } else {
                 has_field_err = true;
                 has_error.* = true;
@@ -2217,7 +2450,7 @@ pub const Parser = struct {
         );
     }
 
-    /// Parses `BitFieldItem = "bit_field" TYPE_IDENT ":" Type "{" { BitFieldMember } "}" ;`.
+    /// Parses `BitFieldItem = "bit_field" TYPE_IDENT ":" Type "{" { BitFieldMember } "}" ;` (`ADR-22D`).
     fn parseBitFieldItem(
         self: *Parser,
         item_cst: CstNodeIndex,
@@ -2232,14 +2465,49 @@ pub const Parser = struct {
             "expected `PascalCase` identifier after `bit_field`",
         );
         const backing_ty = if (self.peekKind() == .lparen) blk: {
-            const open_paren = try self.consumeLeaf(.token_leaf, .{});
+            has_error.* = true;
+            const open_paren = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+            const ty_start_tok = self.peekTokenIndexNth(0);
             const inner_ty = try self.parseType();
+            const ty_end_tok = if (self.cursor > 0)
+                TokenIndex.fromInt(self.cursor - 1)
+            else
+                ty_start_tok;
             try self.expectClosingDelimiter(
                 .rparen,
                 open_paren,
                 has_error,
                 "expected `)` after `bit_field` backing integer type",
             );
+            const close_end_tok = if (self.cursor > 0)
+                TokenIndex.fromInt(self.cursor - 1)
+            else
+                open_paren;
+            const paren_span = Span.init(
+                self.file_id,
+                self.getTokenSpan(open_paren).start_byte,
+                self.getTokenSpan(close_end_tok).end_byte,
+            );
+            if (self.diagnostic_sink) |sink| {
+                const ty_start_span = self.getTokenSpan(ty_start_tok);
+                const ty_end_span = self.getTokenSpan(ty_end_tok);
+                var opt_rep: ?[]const u8 = null;
+                if (ty_start_span.start_byte <= ty_end_span.end_byte and ty_end_span.end_byte <= self.source.len) {
+                    const ty_slice = std.mem.trim(u8, self.source[ty_start_span.start_byte..ty_end_span.end_byte], " \t\r\n");
+                    if (ty_slice.len > 0) {
+                        opt_rep = try std.fmt.allocPrint(sink.arena.asAllocator(), ": {s}", .{ty_slice});
+                    }
+                }
+                try self.emitDiagnosticWithFix(
+                    .e0201_unexpected_token,
+                    paren_span,
+                    "parenthesized `bit_field Name(Type)` syntax has been retired; write `bit_field Name: Type` instead",
+                    "retired `(Type)` backing syntax; use `: Type`",
+                    paren_span,
+                    opt_rep,
+                    "replace `(Type)` with `: Type`",
+                );
+            }
             break :blk inner_ty;
         } else blk: {
             _ = try self.expectToken(
@@ -2270,7 +2538,7 @@ pub const Parser = struct {
         }, item_cst);
     }
 
-    /// Parses `"{ " { BitFieldMember } "}"` where `BitFieldMember = { Attribute } [ "pub" ] IDENT ":" Type "|" INT_LIT [ "," | ";" ]`.
+    /// Parses `"{ " { BitFieldMember } "}"` where `BitFieldMember = { Attribute } [ Vis ] IDENT ":" Type "|" INT_LIT [ "," ]`.
     fn parseBitFieldBody(self: *Parser, has_error: *bool) anyerror!void {
         const open_brace = try self.consumeLeaf(.token_leaf, .{});
         while (self.peekKind() != .rbrace and self.peekKind() != .eof) {
@@ -2279,9 +2547,7 @@ pub const Parser = struct {
             var has_mem_err = false;
 
             try self.parseAttributes(&has_mem_err);
-            if (self.peekKind() == .kw_pub) {
-                _ = try self.consumeLeaf(.visibility_modifier, .{});
-            }
+            try self.parseVisibility(&has_mem_err);
 
             if (isIdentifierKind(self.peekKind())) {
                 _ = try self.expectIdentifierWithCasing(
@@ -2306,9 +2572,7 @@ pub const Parser = struct {
                         "expected bit width here",
                     );
                 }
-                if (self.peekKind() == .comma or self.peekKind() == .semi) {
-                    _ = try self.consumeLeaf(.token_leaf, .{});
-                }
+                try self.consumeMemberSeparator(&has_mem_err);
             } else {
                 has_mem_err = true;
                 has_error.* = true;
@@ -2338,7 +2602,7 @@ pub const Parser = struct {
         );
     }
 
-    /// Parses `EnumItem = "enum" TYPE_IDENT [ TypeParams ] [ WhereClause ] "{" { EnumVariant } "}" ;`.
+    /// Parses `EnumItem = "enum" TYPE_IDENT [ TypeParams ] [ ":" Type ] [ WhereClause ] "{" { EnumVariant } "}" ;` (`ADR-22D`).
     fn parseEnumItem(
         self: *Parser,
         item_cst: CstNodeIndex,
@@ -2355,6 +2619,11 @@ pub const Parser = struct {
 
         if (self.peekKind() == .lbracket) {
             try self.parseTypeParams(has_error);
+        }
+        var backing_type_op: PackedOperand = .NONE;
+        if (self.peekKind() == .colon) {
+            _ = try self.consumeLeaf(.token_leaf, .{});
+            backing_type_op = PackedOperand.initNode(try self.parseTypeWithMode(.none));
         }
         if (self.peekKind() == .kw_where) {
             try self.parseWhereClause(has_error);
@@ -2406,9 +2675,7 @@ pub const Parser = struct {
                         _ = try self.consumeLeaf(.token_leaf, .{});
                         _ = try self.parseExpr(true);
                     }
-                    if (self.peekKind() == .comma or self.peekKind() == .semi) {
-                        _ = try self.consumeLeaf(.token_leaf, .{});
-                    }
+                    try self.consumeMemberSeparator(&has_var_err);
                 } else {
                     has_var_err = true;
                     has_error.* = true;
@@ -2449,10 +2716,11 @@ pub const Parser = struct {
         return self.ast.appendNodeWithCst(.{
             .tag = .enum_decl,
             .main_token = enum_tok,
+            .lhs = backing_type_op,
         }, item_cst);
     }
 
-    /// Parses `TraitItem = "trait" TYPE_IDENT [ TypeParams ] [ ":" TypeBounds ] [ WhereClause ] "{" { TraitMember } "}" ;`.
+    /// Parses `TraitItem = "trait" TYPE_IDENT [ TypeParams ] [ ":" ConstraintExpr ] [ WhereClause ] "{" { TraitMember } "}" ;`.
     fn parseTraitItem(
         self: *Parser,
         item_cst: CstNodeIndex,
@@ -2472,7 +2740,7 @@ pub const Parser = struct {
         }
         if (self.peekKind() == .colon) {
             _ = try self.consumeLeaf(.token_leaf, .{});
-            try self.parseTypeBounds(has_error);
+            _ = try self.parseConstraintExpr(has_error);
         }
         if (self.peekKind() == .kw_where) {
             try self.parseWhereClause(has_error);
@@ -2489,44 +2757,23 @@ pub const Parser = struct {
                 var has_mem_err = false;
 
                 try self.parseAttributes(&has_mem_err);
-                if (self.peekKind() == .kw_pub) {
-                    _ = try self.consumeLeaf(.visibility_modifier, .{});
-                }
+                try self.parseVisibility(&has_mem_err);
 
                 const member_node = switch (self.peekKind()) {
                     .kw_type => try self.parseTypeAliasItem(mem_cst, &has_mem_err),
                     .kw_const => try self.parseConstItem(mem_cst, &has_mem_err),
+                    .kw_subscript => try self.parseSubscriptItem(mem_cst, &has_mem_err),
                     .kw_async, .kw_unsafe, .kw_extern, .kw_comptime, .kw_fn => blk: {
-                        const fn_node = try self.parseFunctionOrSubscriptItem(mem_cst, &has_mem_err);
+                        const fn_node = try self.parseFunctionItem(mem_cst, &has_mem_err);
                         self.cst.nodes.items(.kind)[mem_cst.asInt()] = .trait_member;
                         break :blk fn_node;
-                    },
-                    .ident => blk: {
-                        if (std.mem.eql(u8, self.peekLexemeNth(0), "subscript")) {
-                            const sub_node = try self.parseFunctionOrSubscriptItem(mem_cst, &has_mem_err);
-                            self.cst.nodes.items(.kind)[mem_cst.asInt()] = .trait_member;
-                            break :blk sub_node;
-                        }
-                        has_mem_err = true;
-                        const err_tok = self.peekTokenIndexNth(0);
-                        try self.emitUnexpectedToken(
-                            err_tok,
-                            "expected `fn`, `type`, `const`, or `subscript` inside `trait`",
-                            "unexpected token in `trait` body",
-                        );
-                        try self.skipToRecoveryAnchor(ITEM_CONSUME_SET, MEMBER_STOP_SET, false);
-                        self.cst.finishNode(mem_cst, .{ .has_error = true });
-                        break :blk try self.ast.appendNodeWithCst(.{
-                            .tag = .item_hole,
-                            .main_token = err_tok,
-                        }, mem_cst);
                     },
                     else => blk: {
                         has_mem_err = true;
                         const err_tok = self.peekTokenIndexNth(0);
                         try self.emitUnexpectedToken(
                             err_tok,
-                            "expected `fn`, `type`, or `const` member declaration in `trait`",
+                            "expected `fn`, `subscript`, `type`, or `const` member declaration in `trait`",
                             "unexpected token in `trait` body",
                         );
                         try self.skipToRecoveryAnchor(ITEM_CONSUME_SET, MEMBER_STOP_SET, false);
@@ -2605,44 +2852,23 @@ pub const Parser = struct {
                 var has_mem_err = false;
 
                 try self.parseAttributes(&has_mem_err);
-                if (self.peekKind() == .kw_pub) {
-                    _ = try self.consumeLeaf(.visibility_modifier, .{});
-                }
+                try self.parseVisibility(&has_mem_err);
 
                 const member_node = switch (self.peekKind()) {
                     .kw_type => try self.parseTypeAliasItem(mem_cst, &has_mem_err),
                     .kw_const => try self.parseConstItem(mem_cst, &has_mem_err),
+                    .kw_subscript => try self.parseSubscriptItem(mem_cst, &has_mem_err),
                     .kw_async, .kw_unsafe, .kw_extern, .kw_comptime, .kw_fn => blk: {
-                        const fn_node = try self.parseFunctionOrSubscriptItem(mem_cst, &has_mem_err);
+                        const fn_node = try self.parseFunctionItem(mem_cst, &has_mem_err);
                         self.cst.nodes.items(.kind)[mem_cst.asInt()] = .impl_member;
                         break :blk fn_node;
-                    },
-                    .ident => blk: {
-                        if (std.mem.eql(u8, self.peekLexemeNth(0), "subscript")) {
-                            const sub_node = try self.parseFunctionOrSubscriptItem(mem_cst, &has_mem_err);
-                            self.cst.nodes.items(.kind)[mem_cst.asInt()] = .impl_member;
-                            break :blk sub_node;
-                        }
-                        has_mem_err = true;
-                        const err_tok = self.peekTokenIndexNth(0);
-                        try self.emitUnexpectedToken(
-                            err_tok,
-                            "expected `fn`, `type`, `const`, or `subscript` inside `impl`",
-                            "unexpected token in `impl` body",
-                        );
-                        try self.skipToRecoveryAnchor(ITEM_CONSUME_SET, MEMBER_STOP_SET, false);
-                        self.cst.finishNode(mem_cst, .{ .has_error = true });
-                        break :blk try self.ast.appendNodeWithCst(.{
-                            .tag = .item_hole,
-                            .main_token = err_tok,
-                        }, mem_cst);
                     },
                     else => blk: {
                         has_mem_err = true;
                         const err_tok = self.peekTokenIndexNth(0);
                         try self.emitUnexpectedToken(
                             err_tok,
-                            "expected `fn`, `type`, or `const` member declaration in `impl`",
+                            "expected `fn`, `subscript`, `type`, or `const` member declaration in `impl`",
                             "unexpected token in `impl` body",
                         );
                         try self.skipToRecoveryAnchor(ITEM_CONSUME_SET, MEMBER_STOP_SET, false);
@@ -2687,8 +2913,8 @@ pub const Parser = struct {
         }, item_cst);
     }
 
-    /// Parses `FunctionItem` (`[async] [unsafe] [extern] ("fn" | "subscript") FnSignature (Block | ";")`).
-    fn parseFunctionOrSubscriptItem(
+    /// Parses `FunctionItem = [comptime] [async] [unsafe] [extern [STRING_LIT]] "fn" FnSignature (Block | "=" Expr ";" | ";")`.
+    fn parseFunctionItem(
         self: *Parser,
         item_cst: CstNodeIndex,
         has_error: *bool,
@@ -2706,9 +2932,7 @@ pub const Parser = struct {
             }
         }
 
-        const is_subscript = self.peekKind() == .ident and
-            std.mem.eql(u8, self.peekLexemeNth(0), "subscript");
-        const fn_tok = if (self.peekKind() == .kw_fn or is_subscript)
+        const fn_tok = if (self.peekKind() == .kw_fn)
             try self.consumeLeaf(.fn_introducer, .{})
         else
             try self.expectToken(
@@ -2719,7 +2943,9 @@ pub const Parser = struct {
             );
 
         const sig_cst = try self.startCstNode(.fn_sig);
-        if (!is_subscript or self.peekKind() != .lparen) {
+        if (self.hasPascalExemptFnAttr(item_cst) and self.peekKind() == .type_ident) {
+            _ = try self.consumeLeaf(.token_leaf, .{});
+        } else {
             _ = try self.expectIdentifierWithCasing(
                 .ident,
                 .snake_case,
@@ -2744,7 +2970,7 @@ pub const Parser = struct {
         }
 
         var ret_type_op: PackedOperand = .NONE;
-        if (self.peekKind() == .arrow or (is_subscript and self.peekKind() == .colon)) {
+        if (self.peekKind() == .arrow) {
             const ret_cst = try self.startCstNode(.return_type);
             _ = try self.consumeLeaf(.token_leaf, .{});
             ret_type_op = PackedOperand.initNode(try self.parseTypeWithMode(.is_only));
@@ -2799,7 +3025,328 @@ pub const Parser = struct {
         }, item_cst);
     }
 
-    /// Parses `ParamList = "(" [ (SelfParam | FnParam) { "," FnParam } [ "," ] ] ")" ;`.
+    /// Parses `SubscriptItem = [Vis] "subscript" [TypeParams] "(" [ParamList] ")" "->" Type [WhereClause] ("{" SubscriptArm+ "}" | ";")` (`SE-21`).
+    fn parseSubscriptItem(
+        self: *Parser,
+        item_cst: CstNodeIndex,
+        has_error: *bool,
+    ) anyerror!NodeIndex {
+        self.cst.nodes.items(.kind)[item_cst.asInt()] = .subscript_item;
+        const subscript_tok = try self.consumeLeaf(.subscript_introducer, .{});
+
+        const sig_cst = try self.startCstNode(.fn_sig);
+        if (self.peekKind() == .lbracket) {
+            try self.parseTypeParams(has_error);
+        }
+
+        if (self.peekKind() == .lparen) {
+            try self.parseParamList(has_error);
+        } else {
+            has_error.* = true;
+            try self.emitUnexpectedToken(
+                self.peekTokenIndexNth(0),
+                "expected `(` to start `subscript` parameter list",
+                "expected `(` here",
+            );
+        }
+
+        var ret_type_op: PackedOperand = .NONE;
+        if (self.peekKind() == .arrow or self.peekKind() == .colon) {
+            const ret_cst = try self.startCstNode(.return_type);
+            var has_ret_err = false;
+            if (self.peekKind() == .colon) {
+                has_ret_err = true;
+                has_error.* = true;
+                const colon_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                const colon_span = self.getTokenSpan(colon_tok);
+                try self.emitDiagnosticWithFix(
+                    .e0201_unexpected_token,
+                    colon_span,
+                    "`subscript` return type uses `-> Type` instead of `: Type`",
+                    "expected `->` before `subscript` element type",
+                    colon_span,
+                    " ->",
+                    "replace `:` with ` ->`",
+                );
+            } else {
+                _ = try self.consumeLeaf(.token_leaf, .{});
+            }
+            ret_type_op = PackedOperand.initNode(try self.parseTypeWithMode(.is_only));
+            self.cst.finishNode(ret_cst, .{ .has_error = has_ret_err });
+        } else {
+            has_error.* = true;
+            try self.emitUnexpectedToken(
+                self.peekTokenIndexNth(0),
+                "expected `->` and element type in `subscript` declaration",
+                "expected `-> Type` here",
+            );
+        }
+
+        if (self.peekKind() == .kw_where) {
+            try self.parseWhereClause(has_error);
+        }
+        self.cst.finishNode(sig_cst, .{ .has_error = has_error.* });
+
+        var rhs_op: PackedOperand = .NONE;
+        if (self.peekKind() == .semi) {
+            _ = try self.consumeLeaf(.token_leaf, .{});
+        } else if (self.peekKind() == .lbrace) {
+            const body_cst = try self.startCstNode(.block);
+            const open_brace = try self.consumeLeaf(.token_leaf, .{});
+            var arm_words: std.ArrayList(u32) = .empty;
+            defer arm_words.deinit(self.ast.allocator);
+            try arm_words.append(self.ast.allocator, 0);
+            var arm_count: u32 = 0;
+
+            while (self.peekKind() != .rbrace and self.peekKind() != .eof) {
+                const loop_start = self.cursor;
+                const arm_cst = try self.startCstNode(.subscript_arm);
+                var has_arm_err = false;
+                var arm_mode: u32 = 0;
+
+                if (self.peekKind() == .kw_let) {
+                    _ = try self.consumeLeaf(.token_leaf, .{});
+                    arm_mode = 0;
+                } else if (self.peekKind() == .ident and std.mem.eql(u8, self.peekLexemeNth(0), "inout")) {
+                    _ = try self.consumeLeaf(.token_leaf, .{});
+                    arm_mode = 1;
+                } else {
+                    has_arm_err = true;
+                    has_error.* = true;
+                    try self.emitUnexpectedToken(
+                        self.peekTokenIndexNth(0),
+                        "expected `let` or `inout` accessor arm inside `subscript` body",
+                        "expected `let { … }` or `inout { … }` here",
+                    );
+                    if (self.peekKind() != .lbrace and self.peekKind() != .rbrace and self.peekKind() != .eof) {
+                        _ = try self.consumeLeaf(.invalid_parse_leaf, .{ .has_error = true });
+                    }
+                }
+
+                if (self.peekKind() == .lbrace) {
+                    const arm_blk = try self.parseBlock();
+                    try arm_words.append(self.ast.allocator, arm_mode);
+                    try arm_words.append(self.ast.allocator, arm_blk.asInt());
+                    arm_count += 1;
+                } else {
+                    has_arm_err = true;
+                    has_error.* = true;
+                    try self.emitUnexpectedToken(
+                        self.peekTokenIndexNth(0),
+                        "expected `{` block after `subscript` accessor arm introducer",
+                        "expected `{` here",
+                    );
+                    try self.skipToRecoveryAnchor(BLOCK_STMT_CONSUME_SET, BLOCK_STMT_STOP_SET, false);
+                }
+
+                self.cst.finishNode(arm_cst, .{ .has_error = has_arm_err });
+                if (self.cursor == loop_start) {
+                    _ = try self.consumeLeaf(.invalid_parse_leaf, .{ .has_error = true });
+                }
+            }
+
+            if (arm_count == 0) {
+                has_error.* = true;
+                try self.emitUnexpectedToken(
+                    self.peekTokenIndexNth(0),
+                    "`subscript` body must declare at least one `let` or `inout` accessor arm",
+                    "empty `subscript` body",
+                );
+            }
+            arm_words.items[0] = arm_count;
+
+            try self.expectClosingDelimiter(
+                .rbrace,
+                open_brace,
+                has_error,
+                "expected `}` to close `subscript` body",
+            );
+            self.cst.finishNode(body_cst, .{ .has_error = has_error.* });
+            rhs_op = PackedOperand.initExtra(try self.ast.appendExtraSlice(arm_words.items));
+        } else {
+            has_error.* = true;
+            try self.emitUnexpectedToken(
+                self.peekTokenIndexNth(0),
+                "expected `{` accessor body or `;` after `subscript` signature",
+                "expected `{` or `;` here",
+            );
+        }
+
+        self.cst.finishNode(item_cst, .{ .has_error = has_error.* });
+        return self.ast.appendNodeWithCst(.{
+            .tag = .subscript_decl,
+            .main_token = subscript_tok,
+            .lhs = ret_type_op,
+            .rhs = rhs_op,
+        }, item_cst);
+    }
+
+    /// Parses `TestItem = [ "async" ] "test" STRING_LIT [ "(" FnParam { "," FnParam } [ "," ] ")" ] [ "->" Type ] Block` (`SE-16`).
+    fn parseTestItem(
+        self: *Parser,
+        item_cst: CstNodeIndex,
+        has_error: *bool,
+    ) anyerror!NodeIndex {
+        self.cst.nodes.items(.kind)[item_cst.asInt()] = .test_item;
+        if (self.peekKind() == .kw_async) {
+            _ = try self.consumeLeaf(.token_leaf, .{});
+        }
+        _ = try self.consumeLeaf(.test_introducer, .{});
+        const name_str_tok = try self.expectToken(
+            .string_lit,
+            has_error,
+            "expected string literal test name after `test`",
+            "expected test name string literal here",
+        );
+
+        if (self.peekKind() == .lparen) {
+            try self.parseParamList(has_error);
+        }
+
+        var ret_type_op: PackedOperand = .NONE;
+        if (self.peekKind() == .arrow) {
+            const ret_cst = try self.startCstNode(.return_type);
+            _ = try self.consumeLeaf(.token_leaf, .{});
+            ret_type_op = PackedOperand.initNode(try self.parseTypeWithMode(.is_only));
+            self.cst.finishNode(ret_cst, .{ .has_error = has_error.* });
+        }
+
+        const body_op: PackedOperand = if (self.options.is_including_tests)
+            PackedOperand.initNode(try self.parseBlock())
+        else blk_skip: {
+            try self.skipTestOrBenchBlockCst(has_error);
+            break :blk_skip .NONE;
+        };
+        self.cst.finishNode(item_cst, .{ .has_error = has_error.* });
+        return self.ast.appendNodeWithCst(.{
+            .tag = .test_decl,
+            .main_token = name_str_tok,
+            .lhs = ret_type_op,
+            .rhs = body_op,
+        }, item_cst);
+    }
+
+    /// Parses `BenchItem = "bench" STRING_LIT "(" FnParam ")" [ "->" Type ] Block` (`SE-16`).
+    fn parseBenchItem(
+        self: *Parser,
+        item_cst: CstNodeIndex,
+        has_error: *bool,
+    ) anyerror!NodeIndex {
+        self.cst.nodes.items(.kind)[item_cst.asInt()] = .bench_item;
+        _ = try self.consumeLeaf(.bench_introducer, .{});
+        const name_str_tok = try self.expectToken(
+            .string_lit,
+            has_error,
+            "expected string literal benchmark name after `bench`",
+            "expected benchmark name string literal here",
+        );
+
+        if (self.peekKind() == .lparen) {
+            try self.parseParamList(has_error);
+        } else {
+            has_error.* = true;
+            try self.emitUnexpectedToken(
+                self.peekTokenIndexNth(0),
+                "expected `(` and `&mut Bencher` parameter after `bench` name",
+                "expected `(b: &mut Bencher)` here",
+            );
+        }
+
+        var ret_type_op: PackedOperand = .NONE;
+        if (self.peekKind() == .arrow) {
+            const ret_cst = try self.startCstNode(.return_type);
+            _ = try self.consumeLeaf(.token_leaf, .{});
+            ret_type_op = PackedOperand.initNode(try self.parseTypeWithMode(.is_only));
+            self.cst.finishNode(ret_cst, .{ .has_error = has_error.* });
+        }
+
+        const body_op: PackedOperand = if (self.options.is_including_tests)
+            PackedOperand.initNode(try self.parseBlock())
+        else blk_skip: {
+            try self.skipTestOrBenchBlockCst(has_error);
+            break :blk_skip .NONE;
+        };
+        self.cst.finishNode(item_cst, .{ .has_error = has_error.* });
+        return self.ast.appendNodeWithCst(.{
+            .tag = .bench_decl,
+            .main_token = name_str_tok,
+            .lhs = ret_type_op,
+            .rhs = body_op,
+        }, item_cst);
+    }
+
+    /// Returns `true` if `item_cst` carries a leading `@constructor` or `@builder_item` attribute (`SE-22`).
+    fn hasPascalExemptFnAttr(self: *const Parser, item_cst: CstNodeIndex) bool {
+        if (item_cst.isNone()) return false;
+        const total = self.cst.countNodes();
+        var cursor: usize = item_cst.asInt() + 1;
+        while (cursor < total) {
+            const child = self.cst.getNode(CstNodeIndex.fromInt(@intCast(cursor)));
+            if (child.kind == .attribute) {
+                const attr_end = @min(cursor + @max(@as(usize, child.subtree_size), 1), total);
+                var tok_cur = cursor + 1;
+                while (tok_cur < attr_end) : (tok_cur += 1) {
+                    const leaf = self.cst.getNode(CstNodeIndex.fromInt(@intCast(tok_cur)));
+                    if (leaf.subtree_size <= 1 and !leaf.token.isNone() and
+                        leaf.token.asInt() < self.token_buffer.countTokens())
+                    {
+                        const tok_rec = self.token_buffer.getToken(leaf.token);
+                        if (tok_rec.kind == .at) continue;
+                        const start_b: usize = tok_rec.byte_offset;
+                        const end_b: usize = @min(start_b + @as(usize, tok_rec.byte_len), self.source.len);
+                        const lex = self.source[start_b..end_b];
+                        if (std.mem.eql(u8, lex, "constructor") or std.mem.eql(u8, lex, "builder_item")) {
+                            return true;
+                        }
+                        break;
+                    }
+                }
+                cursor = attr_end;
+                continue;
+            }
+            cursor += @max(@as(usize, child.subtree_size), 1);
+        }
+        return false;
+    }
+
+    /// Consumes a balanced `{ … }` block strictly into `LosslessCstArena` with zero body `AstNode` work (`SE-16`).
+    fn skipTestOrBenchBlockCst(self: *Parser, has_error: *bool) anyerror!void {
+        const blk_cst = try self.startCstNode(.block);
+        if (self.peekKind() != .lbrace) {
+            has_error.* = true;
+            try self.emitUnexpectedToken(
+                self.peekTokenIndexNth(0),
+                "expected `{` to start block body",
+                "expected `{` here",
+            );
+            self.cst.finishNode(blk_cst, .{ .has_error = true });
+            return;
+        }
+        const open_brace = try self.consumeLeaf(.token_leaf, .{});
+        var brace_depth: u32 = 1;
+        while (brace_depth > 0 and self.peekKind() != .eof) {
+            const cur_kind = self.peekKind();
+            if (cur_kind == .lbrace) {
+                brace_depth += 1;
+                _ = try self.consumeLeaf(.token_leaf, .{});
+            } else if (cur_kind == .rbrace) {
+                brace_depth -= 1;
+                if (brace_depth == 0) {
+                    try self.expectClosingDelimiter(.rbrace, open_brace, has_error, "expected `}` to close block");
+                    break;
+                }
+                _ = try self.consumeLeaf(.token_leaf, .{});
+            } else {
+                _ = try self.consumeLeaf(.token_leaf, .{});
+            }
+        }
+        if (brace_depth > 0) {
+            try self.expectClosingDelimiter(.rbrace, open_brace, has_error, "expected `}` to close block");
+        }
+        self.cst.finishNode(blk_cst, .{ .has_error = has_error.* });
+    }
+
+    /// Parses `ParamList` with `/` positional-only and `*` keyword-only zone separators and `...` variadics (`ADR-22B`, `SE-11`).
     fn parseParamList(self: *Parser, has_error: *bool) anyerror!void {
         const list_cst = try self.startCstNode(.param_list);
         self.pushState(.fn_sig_after_params, list_cst) catch |err| switch (err) {
@@ -2813,6 +3360,13 @@ pub const Parser = struct {
         defer self.popStates(1);
 
         const open_paren = try self.consumeLeaf(.token_leaf, .{});
+        var has_seen_slash = false;
+        var has_seen_star = false;
+        var has_seen_variadic = false;
+        var non_self_before_slash: u32 = 0;
+        var params_after_star: u32 = 0;
+        var last_star_span: Span = self.getTokenSpan(open_paren);
+
         while (self.peekKind() != .rparen and
             self.peekKind() != .lbrace and
             self.peekKind() != .rbrace and
@@ -2820,94 +3374,391 @@ pub const Parser = struct {
             self.peekKind() != .eof)
         {
             const loop_start = self.cursor;
+
+            // [1] Parameter zone separators `/` (positional-only) and `*` (keyword-only) (`SE-11`):
+            if (self.peekKind() == .slash or
+                (self.peekKind() == .star and
+                    (self.peekKindNth(1) == .comma or
+                        self.peekKindNth(1) == .rparen or
+                        self.peekKindNth(1) == .slash or
+                        self.peekKindNth(1) == .star)))
+            {
+                const sep_cst = try self.startCstNode(.param_zone_sep);
+                const is_slash = self.peekKind() == .slash;
+                const sep_tok = try self.consumeLeaf(.token_leaf, .{});
+                const sep_span = self.getTokenSpan(sep_tok);
+                var has_sep_err = false;
+
+                if (is_slash) {
+                    if (has_seen_slash) {
+                        has_sep_err = true;
+                        try self.emitDiagnosticWithFix(
+                            .e0228_invalid_param_zone_separator,
+                            sep_span,
+                            "duplicate `/` positional-only parameter zone separator",
+                            "duplicate `/` separator here",
+                            null,
+                            null,
+                            null,
+                        );
+                    } else if (has_seen_star) {
+                        has_sep_err = true;
+                        try self.emitDiagnosticWithFix(
+                            .e0228_invalid_param_zone_separator,
+                            sep_span,
+                            "`/` positional-only parameter separator must appear before `*` keyword-only separator",
+                            "`/` cannot appear after `*`",
+                            null,
+                            null,
+                            null,
+                        );
+                    } else if (non_self_before_slash == 0) {
+                        has_sep_err = true;
+                        try self.emitDiagnosticWithFix(
+                            .e0228_invalid_param_zone_separator,
+                            sep_span,
+                            "`/` positional-only separator requires at least one preceding non-receiver parameter",
+                            "empty positional-only parameter zone before `/`",
+                            null,
+                            null,
+                            null,
+                        );
+                    }
+                    has_seen_slash = true;
+                } else {
+                    if (has_seen_star) {
+                        has_sep_err = true;
+                        try self.emitDiagnosticWithFix(
+                            .e0228_invalid_param_zone_separator,
+                            sep_span,
+                            "duplicate `*` keyword-only parameter zone separator",
+                            "duplicate `*` separator here",
+                            null,
+                            null,
+                            null,
+                        );
+                    }
+                    has_seen_star = true;
+                    last_star_span = sep_span;
+                }
+
+                if (has_sep_err) has_error.* = true;
+                self.cst.finishNode(sep_cst, .{ .has_error = has_sep_err });
+                if (self.peekKind() == .comma) {
+                    _ = try self.consumeLeaf(.token_leaf, .{});
+                } else if (self.peekKind() != .rparen and !has_sep_err) {
+                    break;
+                }
+                continue;
+            }
+
+            // [2] Trailing C variadic parameter `...` (`ADR-22F`):
+            if (self.peekKind() == .dotdotdot) {
+                const var_cst = try self.startCstNode(.variadic_param);
+                const dots_tok = try self.consumeLeaf(.token_leaf, .{});
+                var has_var_err = false;
+                if (has_seen_variadic) {
+                    has_var_err = true;
+                    try self.emitUnexpectedToken(
+                        dots_tok,
+                        "duplicate `...` variadic parameter in parameter list",
+                        "duplicate `...` here",
+                    );
+                }
+                has_seen_variadic = true;
+                if (self.peekKind() == .comma and self.peekKindNth(1) != .rparen) {
+                    has_var_err = true;
+                    try self.emitUnexpectedToken(
+                        dots_tok,
+                        "`...` variadic parameter must be the final parameter in the parameter list",
+                        "`...` must appear last",
+                    );
+                }
+                if (has_var_err) has_error.* = true;
+                self.cst.finishNode(var_cst, .{ .has_error = has_var_err });
+                if (self.peekKind() == .comma) {
+                    _ = try self.consumeLeaf(.token_leaf, .{});
+                } else if (self.peekKind() != .rparen and !has_var_err) {
+                    break;
+                }
+                continue;
+            }
+
+            // [3] Receiver `SelfParam` or regular `FnParam`:
             const param_cst = try self.startCstNode(.fn_param);
             var has_param_err = false;
 
             try self.parseAttributes(&has_param_err);
 
+            var has_leading_var = false;
+            if (self.peekKind() == .kw_var) {
+                has_leading_var = true;
+                _ = try self.consumeLeaf(.token_leaf, .{});
+            }
+
             if (self.peekKind() == .kw_comptime) {
                 _ = try self.consumeLeaf(.token_leaf, .{});
-            }
-
-            // Check for `SelfParam` (`[ "&" ["mut"] | "mut" | "own" | "ref" ["mut"] ] "self"`):
-            if (self.peekKind() == .amp) {
-                _ = try self.consumeLeaf(.token_leaf, .{});
-                if (self.peekKind() == .kw_mut) {
-                    _ = try self.consumeLeaf(.token_leaf, .{});
-                }
-            } else if (self.peekKind() == .kw_mut or
-                self.peekKind() == .kw_own or
-                self.peekKind() == .kw_ref)
-            {
-                _ = try self.consumeLeaf(.token_leaf, .{});
-                if (self.peekKind() == .kw_mut) {
+                if (!has_leading_var and self.peekKind() == .kw_var) {
+                    has_leading_var = true;
                     _ = try self.consumeLeaf(.token_leaf, .{});
                 }
             }
 
-            if (self.peekKind() == .kw_self_val) {
-                _ = try self.consumeLeaf(.token_leaf, .{});
+            // Check for `SelfParam` (`&self`, `&mut self`, `[var] [own] self`, `self: Type`, or retired `mut`/`ref`/`&inout self`):
+            const is_amp_self = self.peekKind() == .amp;
+            const is_own_self = self.peekKind() == .kw_own and self.peekKindNth(1) == .kw_self_val;
+            const is_mut_self = self.peekKind() == .kw_mut and self.peekKindNth(1) == .kw_self_val;
+            const is_ref_self = self.peekKind() == .ident and
+                std.mem.eql(u8, self.peekLexemeNth(0), "ref") and
+                (self.peekKindNth(1) == .kw_self_val or
+                    (self.peekKindNth(1) == .kw_mut and self.peekKindNth(2) == .kw_self_val));
+
+            if (is_amp_self or is_own_self or is_mut_self or is_ref_self or self.peekKind() == .kw_self_val) {
+                if (is_amp_self) {
+                    const amp_tok = try self.consumeLeaf(.token_leaf, .{});
+                    if (self.peekKind() == .kw_mut) {
+                        _ = try self.consumeLeaf(.token_leaf, .{});
+                    } else if (self.peekKind() == .ident and
+                        std.mem.eql(u8, self.peekLexemeNth(0), "inout") and
+                        self.peekKindNth(1) == .kw_self_val)
+                    {
+                        has_param_err = true;
+                        const inout_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                        const fix_span = Span.init(
+                            self.file_id,
+                            self.getTokenSpan(amp_tok).start_byte,
+                            self.getTokenSpan(inout_tok).end_byte,
+                        );
+                        try self.emitDiagnosticWithFix(
+                            .e0221_retired_mutability_or_param_mode,
+                            fix_span,
+                            "`&inout self` receiver syntax has been retired; use `&mut self` instead",
+                            "retired `&inout`; write `&mut`",
+                            fix_span,
+                            "&mut",
+                            "replace `&inout` with `&mut`",
+                        );
+                    }
+                } else if (is_own_self) {
+                    _ = try self.consumeLeaf(.token_leaf, .{});
+                } else if (is_mut_self) {
+                    has_param_err = true;
+                    const mut_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                    const self_tok = try self.consumeLeaf(.token_leaf, .{});
+                    const fix_span = Span.init(
+                        self.file_id,
+                        self.getTokenSpan(mut_tok).start_byte,
+                        self.getTokenSpan(self_tok).end_byte,
+                    );
+                    try self.emitDiagnosticWithFix(
+                        .e0221_retired_mutability_or_param_mode,
+                        fix_span,
+                        "`mut self` receiver syntax has been retired; use `&mut self` for mutable borrow or `var self` for mutable value copy",
+                        "retired `mut self`; write `&mut self`",
+                        fix_span,
+                        "&mut self",
+                        "replace `mut self` with `&mut self`",
+                    );
+                    self.cst.finishNode(param_cst, .{ .has_error = true });
+                    has_error.* = true;
+                    if (self.peekKind() == .comma) {
+                        _ = try self.consumeLeaf(.token_leaf, .{});
+                    } else if (self.peekKind() != .rparen) {
+                        break;
+                    }
+                    continue;
+                } else if (is_ref_self) {
+                    has_param_err = true;
+                    const ref_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                    var is_ref_mut = false;
+                    if (self.peekKind() == .kw_mut) {
+                        is_ref_mut = true;
+                        _ = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                    }
+                    const self_tok = try self.consumeLeaf(.token_leaf, .{});
+                    const fix_span = Span.init(
+                        self.file_id,
+                        self.getTokenSpan(ref_tok).start_byte,
+                        self.getTokenSpan(self_tok).end_byte,
+                    );
+                    try self.emitDiagnosticWithFix(
+                        .e0221_retired_mutability_or_param_mode,
+                        fix_span,
+                        "`ref self` receiver syntax has been retired; use `&self` or `&mut self` instead",
+                        "retired `ref` receiver; use `&`",
+                        fix_span,
+                        if (is_ref_mut) "&mut self" else "&self",
+                        if (is_ref_mut) "replace `ref mut self` with `&mut self`" else "replace `ref self` with `&self`",
+                    );
+                    self.cst.finishNode(param_cst, .{ .has_error = true });
+                    has_error.* = true;
+                    if (self.peekKind() == .comma) {
+                        _ = try self.consumeLeaf(.token_leaf, .{});
+                    } else if (self.peekKind() != .rparen) {
+                        break;
+                    }
+                    continue;
+                }
+
+                _ = try self.expectToken(
+                    .kw_self_val,
+                    &has_param_err,
+                    "expected `self` in receiver parameter",
+                    "expected `self` here",
+                );
                 if (self.peekKind() == .colon) {
                     _ = try self.consumeLeaf(.token_leaf, .{});
-                    if (self.peekKind() == .kw_let or
-                        (self.peekKind() == .ident and
-                            (std.mem.eql(u8, self.peekLexemeNth(0), "inout") or
-                                std.mem.eql(u8, self.peekLexemeNth(0), "sink") or
-                                std.mem.eql(u8, self.peekLexemeNth(0), "set") or
-                                std.mem.eql(u8, self.peekLexemeNth(0), "yielded"))))
-                    {
-                        if (self.peekKindNth(1) != .comma and self.peekKindNth(1) != .rparen) {
-                            _ = try self.consumeLeaf(.token_leaf, .{});
-                        }
-                    }
+                    try self.consumeRetiredPostColonParamMode(&has_param_err);
                     _ = try self.parseType();
                 }
-            } else if (isIdentifierKind(self.peekKind()) or self.peekKind() == .underscore) {
-                if (self.peekKind() == .underscore) {
-                    _ = try self.consumeLeaf(.token_leaf, .{});
-                } else {
-                    _ = try self.expectIdentifierWithCasing(
-                        .ident,
-                        .snake_case,
-                        &has_param_err,
-                        "expected `snake_case` parameter name",
+            } else {
+                // Handle retired leading parameter modifiers (`mut x: T`, `own x: T`, `ref [mut] x: T`) -> `E0221`:
+                var opt_retired_own_tok: ?TokenIndex = null;
+                var opt_retired_ref_tok: ?TokenIndex = null;
+                var is_retired_ref_mut = false;
+
+                if (self.peekKind() == .kw_mut) {
+                    has_param_err = true;
+                    const mut_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                    const mut_span = self.getTokenSpan(mut_tok);
+                    try self.emitDiagnosticWithFix(
+                        .e0221_retired_mutability_or_param_mode,
+                        mut_span,
+                        "`mut` parameter binding modifier has been retired; use `var` for local rebinding or `&mut T` for mutable reference",
+                        "retired `mut` before parameter name; write `var`",
+                        mut_span,
+                        "var",
+                        "replace `mut` with `var`",
                     );
-                }
-                _ = try self.expectToken(
-                    .colon,
-                    &has_param_err,
-                    "expected `:` and parameter type after parameter name",
-                    "expected `:` here",
-                );
-                // Support optional Hylo/DR-02 parameter convention keywords (`inout`, `sink`, `set`, `let`, `yielded`):
-                if (self.peekKind() == .kw_let or
-                    (self.peekKind() == .ident and
-                        (std.mem.eql(u8, self.peekLexemeNth(0), "inout") or
-                            std.mem.eql(u8, self.peekLexemeNth(0), "sink") or
-                            std.mem.eql(u8, self.peekLexemeNth(0), "set") or
-                            std.mem.eql(u8, self.peekLexemeNth(0), "yielded"))))
+                } else if (self.peekKind() == .kw_own) {
+                    has_param_err = true;
+                    opt_retired_own_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                    if (self.peekKind() == .kw_mut) {
+                        has_leading_var = true;
+                        _ = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                    }
+                } else if (self.peekKind() == .ident and
+                    std.mem.eql(u8, self.peekLexemeNth(0), "ref") and
+                    (self.peekKindNth(1) == .kw_mut or
+                        isIdentifierKind(self.peekKindNth(1)) or
+                        self.peekKindNth(1) == .underscore))
                 {
-                    if (self.peekKindNth(1) != .comma and self.peekKindNth(1) != .rparen) {
-                        _ = try self.consumeLeaf(.token_leaf, .{});
+                    has_param_err = true;
+                    opt_retired_ref_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                    if (self.peekKind() == .kw_mut) {
+                        is_retired_ref_mut = true;
+                        _ = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
                     }
                 }
-                _ = try self.parseType();
-                if (self.peekKind() == .eq) {
-                    _ = try self.consumeLeaf(.token_leaf, .{});
-                    const saved_cond_header = self.is_in_cond_header;
-                    self.is_in_cond_header = false;
-                    _ = try self.parseExpr(true);
-                    self.is_in_cond_header = saved_cond_header;
+
+                if (isIdentifierKind(self.peekKind()) or self.peekKind() == .underscore) {
+                    const name_tok = if (self.peekKind() == .underscore)
+                        try self.consumeLeaf(.token_leaf, .{})
+                    else
+                        try self.expectIdentifierWithCasing(
+                            .ident,
+                            .snake_case,
+                            &has_param_err,
+                            "expected `snake_case` parameter name",
+                        );
+                    _ = try self.expectToken(
+                        .colon,
+                        &has_param_err,
+                        "expected `:` and parameter type after parameter name",
+                        "expected `:` here",
+                    );
+                    try self.consumeRetiredPostColonParamMode(&has_param_err);
+                    const ty_start_tok = self.peekTokenIndexNth(0);
+                    _ = try self.parseType();
+                    const ty_end_tok = if (self.cursor > 0)
+                        TokenIndex.fromInt(self.cursor - 1)
+                    else
+                        ty_start_tok;
+
+                    if (opt_retired_own_tok) |own_tok| {
+                        const own_span = self.getTokenSpan(own_tok);
+                        const ty_end_span = self.getTokenSpan(ty_end_tok);
+                        const full_span = Span.init(self.file_id, own_span.start_byte, ty_end_span.end_byte);
+                        var opt_rep: ?[]const u8 = null;
+                        if (self.diagnostic_sink) |sink| {
+                            const name_lex = self.getTokenLexeme(name_tok);
+                            const ty_start_span = self.getTokenSpan(ty_start_tok);
+                            if (ty_start_span.start_byte <= ty_end_span.end_byte and ty_end_span.end_byte <= self.source.len) {
+                                const ty_lex = std.mem.trim(
+                                    u8,
+                                    self.source[ty_start_span.start_byte..ty_end_span.end_byte],
+                                    " \t\r\n",
+                                );
+                                if (name_lex.len > 0 and ty_lex.len > 0) {
+                                    opt_rep = if (has_leading_var)
+                                        try std.fmt.allocPrint(sink.arena.asAllocator(), "var {s}: own {s}", .{ name_lex, ty_lex })
+                                    else
+                                        try std.fmt.allocPrint(sink.arena.asAllocator(), "{s}: own {s}", .{ name_lex, ty_lex });
+                                }
+                            }
+                        }
+                        try self.emitDiagnosticWithFix(
+                            .e0221_retired_mutability_or_param_mode,
+                            full_span,
+                            "`own x: T` parameter syntax has been retired; place `own` on the type as `x: own T` (`[var] x: own T` if rebound)",
+                            "retired leading `own`; write `x: own T`",
+                            full_span,
+                            opt_rep,
+                            "move `own` to the parameter type",
+                        );
+                    } else if (opt_retired_ref_tok) |ref_tok| {
+                        const ref_span = self.getTokenSpan(ref_tok);
+                        const ty_end_span = self.getTokenSpan(ty_end_tok);
+                        const full_span = Span.init(self.file_id, ref_span.start_byte, ty_end_span.end_byte);
+                        var opt_rep: ?[]const u8 = null;
+                        if (self.diagnostic_sink) |sink| {
+                            const name_lex = self.getTokenLexeme(name_tok);
+                            const ty_start_span = self.getTokenSpan(ty_start_tok);
+                            if (ty_start_span.start_byte <= ty_end_span.end_byte and ty_end_span.end_byte <= self.source.len) {
+                                const ty_lex = std.mem.trim(
+                                    u8,
+                                    self.source[ty_start_span.start_byte..ty_end_span.end_byte],
+                                    " \t\r\n",
+                                );
+                                if (name_lex.len > 0 and ty_lex.len > 0) {
+                                    opt_rep = if (is_retired_ref_mut)
+                                        try std.fmt.allocPrint(sink.arena.asAllocator(), "{s}: &mut {s}", .{ name_lex, ty_lex })
+                                    else
+                                        try std.fmt.allocPrint(sink.arena.asAllocator(), "{s}: &{s}", .{ name_lex, ty_lex });
+                                }
+                            }
+                        }
+                        try self.emitDiagnosticWithFix(
+                            .e0221_retired_mutability_or_param_mode,
+                            full_span,
+                            "`ref` parameter binding modifier has been retired; write `x: &T` or `x: &mut T` instead",
+                            "retired `ref` parameter modifier",
+                            full_span,
+                            opt_rep,
+                            "rewrite parameter with `&` reference type",
+                        );
+                    }
+
+                    if (!has_seen_slash) non_self_before_slash += 1;
+                    if (has_seen_star) params_after_star += 1;
+
+                    if (self.peekKind() == .eq) {
+                        _ = try self.consumeLeaf(.token_leaf, .{});
+                        const saved_cond_header = self.is_in_cond_header;
+                        self.is_in_cond_header = false;
+                        _ = try self.parseExpr(true);
+                        self.is_in_cond_header = saved_cond_header;
+                    }
+                } else {
+                    has_param_err = true;
+                    has_error.* = true;
+                    try self.emitUnexpectedToken(
+                        self.peekTokenIndexNth(0),
+                        "expected parameter declaration in parameter list",
+                        "unexpected token in parameter list",
+                    );
+                    try self.skipToRecoveryAnchor(PARAM_CONSUME_SET, PARAM_STOP_SET, false);
                 }
-            } else {
-                has_param_err = true;
-                has_error.* = true;
-                try self.emitUnexpectedToken(
-                    self.peekTokenIndexNth(0),
-                    "expected parameter declaration in parameter list",
-                    "unexpected token in parameter list",
-                );
-                try self.skipToRecoveryAnchor(PARAM_CONSUME_SET, PARAM_STOP_SET, false);
             }
 
             if (has_param_err) has_error.* = true;
@@ -2922,6 +3773,20 @@ pub const Parser = struct {
                 _ = try self.consumeLeaf(.invalid_parse_leaf, .{ .has_error = true });
             }
         }
+
+        if (has_seen_star and params_after_star == 0) {
+            has_error.* = true;
+            try self.emitDiagnosticWithFix(
+                .e0228_invalid_param_zone_separator,
+                last_star_span,
+                "`*` keyword-only parameter separator must be followed by at least one keyword-only parameter",
+                "empty keyword-only parameter zone after `*`",
+                null,
+                null,
+                null,
+            );
+        }
+
         try self.expectClosingDelimiter(
             .rparen,
             open_paren,
@@ -2929,6 +3794,69 @@ pub const Parser = struct {
             "expected `)` to close parameter list",
         );
         self.cst.finishNode(list_cst, .{ .has_error = has_error.* });
+    }
+
+    /// Diagnoses and recovers from retired post-`:` parameter modes (`inout`, `sink`, `set`, `let`, `yielded`).
+    fn consumeRetiredPostColonParamMode(self: *Parser, has_param_err: *bool) !void {
+        if (self.peekKind() == .kw_let) {
+            has_param_err.* = true;
+            const let_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+            const next_span = self.getTokenSpan(self.peekTokenIndexNth(0));
+            const let_span = self.getTokenSpan(let_tok);
+            const fix_span = Span.init(self.file_id, let_span.start_byte, @max(let_span.end_byte, next_span.start_byte));
+            try self.emitDiagnosticWithFix(
+                .e0221_retired_mutability_or_param_mode,
+                let_span,
+                "explicit `let` parameter convention keyword has been retired; bare `x: T` is immutable by default",
+                "retired `let` parameter mode",
+                fix_span,
+                "",
+                "remove retired `let` mode keyword",
+            );
+            return;
+        }
+        if (self.peekKind() != .ident) return;
+        const next_kind = self.peekKindNth(1);
+        if (next_kind == .dot or next_kind == .comma or next_kind == .rparen or next_kind == .eq) return;
+        if (!TYPE_STARTER_SET.contains(next_kind)) return;
+
+        const mode_lex = self.peekLexemeNth(0);
+        var opt_replacement: ?[]const u8 = null;
+        var opt_msg: ?[]const u8 = null;
+        if (std.mem.eql(u8, mode_lex, "inout")) {
+            opt_replacement = "&mut ";
+            opt_msg = "`inout` parameter mode has been retired; write `&mut T` instead";
+        } else if (std.mem.eql(u8, mode_lex, "sink")) {
+            opt_replacement = "own ";
+            opt_msg = "`sink` parameter mode has been retired; write `own T` instead";
+        } else if (std.mem.eql(u8, mode_lex, "set")) {
+            opt_replacement = "&out ";
+            opt_msg = "`set` parameter mode has been retired; write `&out T` instead";
+        } else if (std.mem.eql(u8, mode_lex, "yielded")) {
+            opt_replacement = "&mut ";
+            opt_msg = "`yielded` parameter mode has been retired; write `&mut T` instead";
+        }
+
+        if (opt_replacement) |rep_text| {
+            has_param_err.* = true;
+            const mode_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+            const mode_span = self.getTokenSpan(mode_tok);
+            const next_span = self.getTokenSpan(self.peekTokenIndexNth(0));
+            const fix_span = Span.init(
+                self.file_id,
+                mode_span.start_byte,
+                @max(mode_span.end_byte, next_span.start_byte),
+            );
+            try self.emitDiagnosticWithFix(
+                .e0221_retired_mutability_or_param_mode,
+                mode_span,
+                opt_msg.?,
+                "retired parameter convention keyword",
+                fix_span,
+                rep_text,
+                "replace retired parameter mode with canonical `DR-22` type",
+            );
+        }
     }
 
     /// Parses `TypeParams = "[" TypeParam { "," TypeParam } [ "," ] "]" ;`.
@@ -2986,7 +3914,7 @@ pub const Parser = struct {
                 );
                 if (self.peekKind() == .colon) {
                     _ = try self.consumeLeaf(.token_leaf, .{});
-                    try self.parseTypeBounds(&has_param_err);
+                    _ = try self.parseConstraintExpr(&has_param_err);
                 }
                 if (self.peekKind() == .eq) {
                     _ = try self.consumeLeaf(.token_leaf, .{});
@@ -3022,14 +3950,67 @@ pub const Parser = struct {
         self.cst.finishNode(params_cst, .{ .has_error = has_error.* });
     }
 
-    /// Parses `TypeBounds = Type { "+" Type } ;`.
-    fn parseTypeBounds(self: *Parser, has_error: *bool) anyerror!void {
-        _ = has_error;
-        _ = try self.parseTypeWithMode(.is_only);
+    /// Parses `IntersectBound = Type { "+" Type }` (`SE-09`).
+    fn parseIntersectBound(self: *Parser, mode: TypeRefinementMode) anyerror!NodeIndex {
+        try self.flushCarrierTokens();
+        const cst_start = CstNodeIndex.fromInt(@intCast(self.cst.countNodes()));
+        const ast_start = self.ast.countNodes();
+
+        const first_ty = try self.parseTypeWithMode(mode);
+        if (self.peekKind() != .plus) return first_ty;
+
+        const first_plus_tok = self.peekTokenIndexNth(0);
+        _ = try self.precedeNode(cst_start, ast_start, .intersect_bound_type, first_plus_tok);
+
+        var members: std.ArrayList(u32) = .empty;
+        defer members.deinit(self.ast.allocator);
+        try members.append(self.ast.allocator, first_ty.asInt());
+
         while (self.peekKind() == .plus) {
             _ = try self.consumeLeaf(.token_leaf, .{});
-            _ = try self.parseTypeWithMode(.is_only);
+            try members.append(self.ast.allocator, (try self.parseTypeWithMode(mode)).asInt());
         }
+        self.cst.finishNode(cst_start, .{});
+
+        const extra_start = try self.ast.appendExtraSlice(members.items);
+        return self.ast.appendNodeWithCst(.{
+            .tag = .intersect_bound_type,
+            .main_token = first_plus_tok,
+            .lhs = PackedOperand.initExtra(extra_start),
+            .rhs = .{ .tag = .extra, .payload = @intCast(members.items.len) },
+        }, cst_start);
+    }
+
+    /// Parses `ConstraintExpr = IntersectBound { "|" IntersectBound }` (`SE-09`).
+    fn parseConstraintExpr(self: *Parser, has_error: *bool) anyerror!NodeIndex {
+        _ = has_error;
+        try self.flushCarrierTokens();
+        const cst_start = CstNodeIndex.fromInt(@intCast(self.cst.countNodes()));
+        const ast_start = self.ast.countNodes();
+
+        const first_bound = try self.parseIntersectBound(.is_only);
+        if (self.peekKind() != .pipe) return first_bound;
+
+        const first_pipe_tok = self.peekTokenIndexNth(0);
+        _ = try self.precedeNode(cst_start, ast_start, .union_bound_type, first_pipe_tok);
+
+        var members: std.ArrayList(u32) = .empty;
+        defer members.deinit(self.ast.allocator);
+        try members.append(self.ast.allocator, first_bound.asInt());
+
+        while (self.peekKind() == .pipe) {
+            _ = try self.consumeLeaf(.token_leaf, .{});
+            try members.append(self.ast.allocator, (try self.parseIntersectBound(.is_only)).asInt());
+        }
+        self.cst.finishNode(cst_start, .{});
+
+        const extra_start = try self.ast.appendExtraSlice(members.items);
+        return self.ast.appendNodeWithCst(.{
+            .tag = .union_bound_type,
+            .main_token = first_pipe_tok,
+            .lhs = PackedOperand.initExtra(extra_start),
+            .rhs = .{ .tag = .extra, .payload = @intCast(members.items.len) },
+        }, cst_start);
     }
 
     /// Parses `WhereClause = "where" WherePred { "," WherePred } [ "," ] ;`.
@@ -3051,7 +4032,7 @@ pub const Parser = struct {
                 "expected `:` in `where` clause predicate",
                 "expected `:` before trait bounds",
             );
-            try self.parseTypeBounds(has_error);
+            _ = try self.parseConstraintExpr(has_error);
             self.cst.finishNode(pred_cst, .{ .has_error = has_error.* });
 
             if (self.peekKind() == .comma) {
@@ -3064,12 +4045,59 @@ pub const Parser = struct {
         self.cst.finishNode(where_cst, .{ .has_error = has_error.* });
     }
 
-    /// Parses `Type = PrimaryType { "?" } [ ("is" Pattern | "where" Expr) ] ;` (`DR-21` Section 3.2).
+    /// Returns `true` if `peek(start_lookahead)` starts a `SliceRefType` (`&[T]` or `&mut [T]`, excluding `&[T; N]`).
+    fn isSliceRefTypeAt(self: *const Parser, start_lookahead: usize) bool {
+        if (self.peekKindNth(start_lookahead) != .amp) return false;
+        const bracket_off: usize = if (self.peekKindNth(start_lookahead + 1) == .kw_mut)
+            start_lookahead + 2
+        else
+            start_lookahead + 1;
+        if (self.peekKindNth(bracket_off) != .lbracket) return false;
+
+        var scan_off: usize = bracket_off + 1;
+        var steps: usize = 0;
+        var bracket_depth: u32 = 1;
+        var paren_depth: u32 = 0;
+        while (steps < MAX_TYPE_LOOKAHEAD) : (steps += 1) {
+            const cur_kind = self.peekKindNth(scan_off);
+            if (cur_kind == .eof) return false;
+            if (bracket_depth == 1 and paren_depth == 0) {
+                if (cur_kind == .semi) return false;
+                if (cur_kind == .rbracket) return true;
+            }
+            if (cur_kind == .lbracket) {
+                bracket_depth += 1;
+            } else if (cur_kind == .rbracket) {
+                if (bracket_depth == 0) return false;
+                bracket_depth -= 1;
+            } else if (cur_kind == .lparen) {
+                paren_depth += 1;
+            } else if (cur_kind == .rparen) {
+                if (paren_depth > 0) paren_depth -= 1;
+            }
+            scan_off += 1;
+        }
+        return true;
+    }
+
+    /// Returns `true` if `peek(start_lookahead)` starts an `own` closure type (`own [async] |…|`).
+    fn isOwnClosureTypeAt(self: *const Parser, start_lookahead: usize) bool {
+        if (self.peekKindNth(start_lookahead) != .kw_own) return false;
+        const next_kind = self.peekKindNth(start_lookahead + 1);
+        if (next_kind == .pipe or next_kind == .pipepipe) return true;
+        if (next_kind == .kw_async) {
+            const after_async = self.peekKindNth(start_lookahead + 2);
+            return after_async == .pipe or after_async == .pipepipe;
+        }
+        return false;
+    }
+
+    /// Parses a unified 4-tier `Type` expression (`DR-22` Sections 1.3 & 3.3).
     pub fn parseType(self: *Parser) anyerror!NodeIndex {
         return self.parseTypeWithMode(.all);
     }
 
-    /// Parses a `Type` expression under an explicit `TypeRefinementMode`.
+    /// Parses Tier 1 (`T ! E` + optional `is`/`where` refinement) over Tier 2–4 types (`ADR-22C`).
     fn parseTypeWithMode(self: *Parser, refinement_mode: TypeRefinementMode) anyerror!NodeIndex {
         const saved_cond_header = self.is_in_cond_header;
         self.is_in_cond_header = false;
@@ -3086,12 +4114,210 @@ pub const Parser = struct {
             },
             else => return err,
         };
+        defer self.popStates(1);
+
+        var type_node = try self.parsePrefixOrPostfixType();
+
+        // Tier 1 non-associative result type sugar (`Ok ! Err`, emitting `E0222` on `A ! B ! C`):
+        if (!self.is_recovering_depth_overflow and self.peekKind() == .bang) {
+            const bang_tok = self.peekTokenIndexNth(0);
+            _ = try self.precedeNode(type_cst_start, type_ast_start, .result_type, bang_tok);
+            _ = try self.consumeLeaf(.token_leaf, .{});
+            const err_ty = try self.parsePrefixOrPostfixType();
+
+            var has_chain_err = false;
+            while (!self.is_recovering_depth_overflow and self.peekKind() == .bang) {
+                has_chain_err = true;
+                const extra_bang = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                const extra_span = self.getTokenSpan(extra_bang);
+                try self.emitDiagnosticWithFix(
+                    .e0222_chained_result_type,
+                    extra_span,
+                    "result type operator `!` is non-associative; parenthesize nested result types explicitly as `(A ! B) ! C` or `A ! (B ! C)`",
+                    "chained `!` in result type requires explicit parentheses",
+                    null,
+                    null,
+                    null,
+                );
+                _ = try self.parsePrefixOrPostfixType();
+            }
+
+            self.cst.finishNode(type_cst_start, .{ .has_error = has_chain_err });
+            type_node = try self.ast.appendNodeWithCst(.{
+                .tag = .result_type,
+                .main_token = bang_tok,
+                .lhs = PackedOperand.initNode(type_node),
+                .rhs = PackedOperand.initNode(err_ty),
+            }, type_cst_start);
+        }
+
+        // Optional refinement clause (`Type is SinglePatternNoStruct` or `Type where Expr`):
+        const has_consumable_is = refinement_mode != .none and self.peekKind() == .kw_is;
+        const has_consumable_where = refinement_mode == .all and self.peekKind() == .kw_where;
+        if (!self.is_recovering_depth_overflow and (has_consumable_is or has_consumable_where)) {
+            const ref_tok = self.peekTokenIndexNth(0);
+            _ = try self.precedeNode(type_cst_start, type_ast_start, .refined_type, ref_tok);
+            const ref_kind = self.peekKind();
+            _ = try self.consumeLeaf(.token_leaf, .{});
+            if (ref_kind == .kw_is) {
+                _ = try self.parsePatternWithOptions(false, false);
+            } else {
+                _ = try self.parseExpr(false);
+            }
+            self.cst.finishNode(type_cst_start, .{});
+        }
+        return type_node;
+    }
+
+    /// Parses Tier 2 (`&PostfixType`, `&mut PostfixType`, `&out PostfixType`, `own PostfixType`) or Tier 3.
+    fn parsePrefixOrPostfixType(self: *Parser) anyerror!NodeIndex {
+        if (self.peekKind() == .amp and !self.isSliceRefTypeAt(0)) {
+            const ref_cst = try self.startCstNode(.ref_type);
+            self.pushState(.type_parse, ref_cst) catch |err| switch (err) {
+                error.ParseDepthExceeded => {
+                    return self.recoverDepthOverflow(ref_cst, TYPE_ARG_STOP_SET, .type_hole);
+                },
+                else => return err,
+            };
+            defer self.popStates(1);
+
+            var has_ref_err = false;
+            const amp_tok = try self.consumeLeaf(.token_leaf, .{});
+            var main_tok = amp_tok;
+
+            if (self.peekKind() == .kw_mut) {
+                main_tok = try self.consumeLeaf(.token_leaf, .{});
+            } else if (self.peekKind() == .ident and
+                std.mem.eql(u8, self.peekLexemeNth(0), "out") and
+                self.peekKindNth(1) != .dot and
+                TYPE_STARTER_SET.contains(self.peekKindNth(1)))
+            {
+                main_tok = try self.consumeLeaf(.token_leaf, .{});
+            } else if (self.peekKind() == .ident and
+                std.mem.eql(u8, self.peekLexemeNth(0), "inout") and
+                self.peekKindNth(1) != .dot and
+                TYPE_STARTER_SET.contains(self.peekKindNth(1)))
+            {
+                has_ref_err = true;
+                const inout_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                main_tok = inout_tok;
+                const fix_span = Span.init(
+                    self.file_id,
+                    self.getTokenSpan(amp_tok).start_byte,
+                    self.getTokenSpan(inout_tok).end_byte,
+                );
+                try self.emitDiagnosticWithFix(
+                    .e0221_retired_mutability_or_param_mode,
+                    fix_span,
+                    "`&inout T` type syntax has been retired; write `&mut T` instead",
+                    "retired `&inout`; write `&mut`",
+                    fix_span,
+                    "&mut",
+                    "replace `&inout` with `&mut`",
+                );
+            } else if (self.peekKind() == .kw_let) {
+                has_ref_err = true;
+                const let_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                const next_span = self.getTokenSpan(self.peekTokenIndexNth(0));
+                const fix_span = Span.init(
+                    self.file_id,
+                    self.getTokenSpan(amp_tok).start_byte,
+                    @max(self.getTokenSpan(let_tok).end_byte, next_span.start_byte),
+                );
+                try self.emitDiagnosticWithFix(
+                    .e0221_retired_mutability_or_param_mode,
+                    fix_span,
+                    "`&let T` type syntax has been retired; write `&T` instead",
+                    "retired `&let`; write `&`",
+                    fix_span,
+                    "&",
+                    "replace `&let ` with `&`",
+                );
+            }
+
+            const inner_ty = try self.parsePrefixOrPostfixType();
+            self.cst.finishNode(ref_cst, .{ .has_error = has_ref_err });
+            return self.ast.appendNodeWithCst(.{
+                .tag = .ref_type,
+                .main_token = main_tok,
+                .lhs = PackedOperand.initNode(inner_ty),
+            }, ref_cst);
+        }
+
+        if (self.peekKind() == .kw_own and !self.isOwnClosureTypeAt(0)) {
+            const mode_cst = try self.startCstNode(.mode_type);
+            self.pushState(.type_parse, mode_cst) catch |err| switch (err) {
+                error.ParseDepthExceeded => {
+                    return self.recoverDepthOverflow(mode_cst, TYPE_ARG_STOP_SET, .type_hole);
+                },
+                else => return err,
+            };
+            defer self.popStates(1);
+
+            const own_tok = try self.consumeLeaf(.token_leaf, .{});
+            const inner_ty = try self.parsePrefixOrPostfixType();
+            self.cst.finishNode(mode_cst, .{});
+            return self.ast.appendNodeWithCst(.{
+                .tag = .mode_type,
+                .main_token = own_tok,
+                .lhs = PackedOperand.initNode(inner_ty),
+            }, mode_cst);
+        }
+
+        // Recover retired `ref T` / `ref mut T` in type position with `E0221`:
+        if (self.peekKind() == .ident and
+            std.mem.eql(u8, self.peekLexemeNth(0), "ref") and
+            (self.peekKindNth(1) == .kw_mut or
+                (self.peekKindNth(1) != .dot and TYPE_STARTER_SET.contains(self.peekKindNth(1)))))
+        {
+            const ref_cst = try self.startCstNode(.ref_type);
+            const ref_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+            var main_tok = ref_tok;
+            var is_mut = false;
+            if (self.peekKind() == .kw_mut) {
+                is_mut = true;
+                main_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+            }
+            const next_span = self.getTokenSpan(self.peekTokenIndexNth(0));
+            const ref_span = self.getTokenSpan(ref_tok);
+            const end_span = self.getTokenSpan(main_tok);
+            const fix_span = Span.init(
+                self.file_id,
+                ref_span.start_byte,
+                @max(end_span.end_byte, next_span.start_byte),
+            );
+            try self.emitDiagnosticWithFix(
+                .e0221_retired_mutability_or_param_mode,
+                Span.init(self.file_id, ref_span.start_byte, end_span.end_byte),
+                "`ref` reference type keyword has been retired; write `&T` or `&mut T` instead",
+                "retired `ref` type syntax",
+                fix_span,
+                if (is_mut) "&mut " else "&",
+                if (is_mut) "replace `ref mut ` with `&mut `" else "replace `ref ` with `&`",
+            );
+            const inner_ty = try self.parsePrefixOrPostfixType();
+            self.cst.finishNode(ref_cst, .{ .has_error = true });
+            return self.ast.appendNodeWithCst(.{
+                .tag = .ref_type,
+                .main_token = main_tok,
+                .lhs = PackedOperand.initNode(inner_ty),
+            }, ref_cst);
+        }
+
+        return self.parsePostfixType();
+    }
+
+    /// Parses Tier 3 (`PostfixType = PrimaryType { "?" } ;`, binding tighter than `&`, `own`, and `!`).
+    fn parsePostfixType(self: *Parser) anyerror!NodeIndex {
+        try self.flushCarrierTokens();
+        const type_cst_start = CstNodeIndex.fromInt(@intCast(self.cst.countNodes()));
+        const type_ast_start = self.ast.countNodes();
+
         var chain_pushes: usize = 0;
-        defer self.popStates(1 + chain_pushes);
+        defer self.popStates(chain_pushes);
 
         var type_node = try self.parsePrimaryType();
 
-        // Postfix `?` optional type sugar (`T?`, chainable and depth-bounded):
         while (!self.is_recovering_depth_overflow and self.peekKind() == .question) {
             self.pushState(.type_parse, type_cst_start) catch |err| switch (err) {
                 error.ParseDepthExceeded => {
@@ -3117,26 +4343,10 @@ pub const Parser = struct {
                 .lhs = PackedOperand.initNode(type_node),
             }, type_cst_start);
         }
-
-        // Optional refinement clause (`Type is Pattern` or `Type where Expr`):
-        const has_consumable_is = refinement_mode != .none and self.peekKind() == .kw_is;
-        const has_consumable_where = refinement_mode == .all and self.peekKind() == .kw_where;
-        if (!self.is_recovering_depth_overflow and (has_consumable_is or has_consumable_where)) {
-            const ref_tok = self.peekTokenIndexNth(0);
-            _ = try self.precedeNode(type_cst_start, type_ast_start, .refined_type, ref_tok);
-            const ref_kind = self.peekKind();
-            _ = try self.consumeLeaf(.token_leaf, .{});
-            if (ref_kind == .kw_is) {
-                _ = try self.parsePatternWithOptions(false, false);
-            } else {
-                _ = try self.parseExpr(false);
-            }
-            self.cst.finishNode(type_cst_start, .{});
-        }
         return type_node;
     }
 
-    /// Parses one of the 11 disjoint `PrimaryType` productions (`DR-03` Section 5.4 Part 5).
+    /// Parses Tier 4 `PrimaryType` (`DR-22` Section 3.3, including `&[T]`, `*T`, `*mut T`, `FnType`, `ClosureType`).
     fn parsePrimaryType(self: *Parser) anyerror!NodeIndex {
         switch (self.peekKind()) {
             .prim_type => {
@@ -3147,94 +4357,77 @@ pub const Parser = struct {
                     .main_token = tok,
                 }, leaf_cst);
             },
-            .pipe, .pipepipe => {
-                const closure_cst = try self.startCstNode(.closure_type);
-                var has_err = false;
-                const open_tok = try self.consumeLeaf(.token_leaf, .{});
-                var param_types: std.ArrayList(u32) = .empty;
-                defer param_types.deinit(self.ast.allocator);
-
-                if (self.token_buffer.getToken(open_tok).kind == .pipe) {
-                    while (self.peekKind() != .pipe and
-                        self.peekKind() != .rbrace and
-                        self.peekKind() != .semi and
-                        self.peekKind() != .eof)
-                    {
-                        const loop_start = self.cursor;
-                        if (isIdentifierKind(self.peekKind()) and self.peekKindNth(1) == .colon) {
-                            _ = try self.consumeLeaf(.token_leaf, .{});
-                            _ = try self.consumeLeaf(.token_leaf, .{});
-                        }
-                        try param_types.append(self.ast.allocator, (try self.parseType()).asInt());
-                        if (self.peekKind() == .comma) {
-                            _ = try self.consumeLeaf(.token_leaf, .{});
-                        } else {
-                            break;
-                        }
-                        if (self.cursor == loop_start) break;
-                    }
-                    try self.expectClosingDelimiter(
-                        .pipe,
-                        open_tok,
-                        &has_err,
-                        "expected `|` to close closure type parameters",
-                    );
-                }
-
-                var ret_op: PackedOperand = .NONE;
-                if (self.peekKind() == .arrow) {
-                    _ = try self.consumeLeaf(.token_leaf, .{});
-                    ret_op = PackedOperand.initNode(try self.parseType());
-                }
-                self.cst.finishNode(closure_cst, .{ .has_error = has_err });
-                var lhs_op: PackedOperand = .NONE;
-                if (param_types.items.len > 0) {
-                    lhs_op = PackedOperand.initExtra(try self.ast.appendExtraSlice(param_types.items));
-                }
-                return self.ast.appendNodeWithCst(.{
-                    .tag = .fn_type,
-                    .main_token = open_tok,
-                    .lhs = lhs_op,
-                    .rhs = ret_op,
-                }, closure_cst);
-            },
             .amp => {
                 const ref_cst = try self.startCstNode(.ref_type);
                 const amp_tok = try self.consumeLeaf(.token_leaf, .{});
-                if (self.peekKind() == .kw_mut or self.peekKind() == .kw_let or
-                    (self.peekKind() == .ident and std.mem.eql(u8, self.peekLexemeNth(0), "inout")))
-                {
-                    _ = try self.consumeLeaf(.token_leaf, .{});
-                }
-                const inner_ty = try self.parseType();
+                const main_tok = if (self.peekKind() == .kw_mut)
+                    try self.consumeLeaf(.token_leaf, .{})
+                else
+                    amp_tok;
+                const inner_ty = if (self.peekKind() == .lbracket)
+                    try self.parsePrimaryType()
+                else
+                    try self.parsePrefixOrPostfixType();
                 self.cst.finishNode(ref_cst, .{});
                 return self.ast.appendNodeWithCst(.{
                     .tag = .ref_type,
-                    .main_token = amp_tok,
+                    .main_token = main_tok,
                     .lhs = PackedOperand.initNode(inner_ty),
                 }, ref_cst);
             },
             .star => {
                 const ptr_cst = try self.startCstNode(.ptr_type);
+                self.pushState(.type_parse, ptr_cst) catch |err| switch (err) {
+                    error.ParseDepthExceeded => {
+                        return self.recoverDepthOverflow(ptr_cst, TYPE_ARG_STOP_SET, .type_hole);
+                    },
+                    else => return err,
+                };
+                defer self.popStates(1);
+
+                var has_ptr_err = false;
                 const star_tok = try self.consumeLeaf(.token_leaf, .{});
+                var main_tok = star_tok;
                 if (self.peekKind() == .kw_mut) {
-                    _ = try self.consumeLeaf(.token_leaf, .{});
+                    main_tok = try self.consumeLeaf(.token_leaf, .{});
+                } else if (self.peekKind() == .kw_const) {
+                    has_ptr_err = true;
+                    const const_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                    const star_span = self.getTokenSpan(star_tok);
+                    const const_span = self.getTokenSpan(const_tok);
+                    const next_span = self.getTokenSpan(self.peekTokenIndexNth(0));
+                    const diag_span = Span.init(self.file_id, star_span.start_byte, const_span.end_byte);
+                    const fix_span = Span.init(
+                        self.file_id,
+                        star_span.start_byte,
+                        @max(const_span.end_byte, next_span.start_byte),
+                    );
+                    try self.emitDiagnosticWithFix(
+                        .e0226_retired_const_raw_ptr,
+                        diag_span,
+                        "`*const T` raw pointer spelling has been retired; bare `*T` is const by default (`*mut T` for mutable)",
+                        "retired `*const T`; write `*T`",
+                        fix_span,
+                        "*",
+                        "replace `*const ` with `*`",
+                    );
                 }
-                const inner_ty = try self.parseType();
-                self.cst.finishNode(ptr_cst, .{});
+                const inner_ty = try self.parsePrimaryType();
+                self.cst.finishNode(ptr_cst, .{ .has_error = has_ptr_err });
                 return self.ast.appendNodeWithCst(.{
                     .tag = .ptr_type,
-                    .main_token = star_tok,
+                    .main_token = main_tok,
                     .lhs = PackedOperand.initNode(inner_ty),
                 }, ptr_cst);
             },
-            .kw_own, .kw_ref, .hash_soa, .tilde => {
+            .hash_soa, .tilde => {
                 const mode_cst = try self.startCstNode(.mode_type);
+                const mode_kind = self.peekKind();
                 const mode_tok = try self.consumeLeaf(.token_leaf, .{});
-                if (self.peekKind() == .kw_mut) {
-                    _ = try self.consumeLeaf(.token_leaf, .{});
-                }
-                const inner_ty = try self.parseType();
+                const inner_ty = if (mode_kind == .hash_soa)
+                    try self.parsePrimaryType()
+                else
+                    try self.parsePrefixOrPostfixType();
                 self.cst.finishNode(mode_cst, .{});
                 return self.ast.appendNodeWithCst(.{
                     .tag = .mode_type,
@@ -3315,19 +4508,104 @@ pub const Parser = struct {
                     .rhs = rhs_op,
                 }, tup_cst);
             },
-            .at, .kw_async, .kw_unsafe, .kw_fn => {
-                const fn_cst = try self.startCstNode(.fn_type);
+            .at, .pipe, .pipepipe, .kw_own, .kw_async, .kw_unsafe, .kw_extern, .kw_fn => {
+                if (self.peekKind() == .kw_own and !self.isOwnClosureTypeAt(0)) {
+                    const mode_cst = try self.startCstNode(.mode_type);
+                    const own_tok = try self.consumeLeaf(.token_leaf, .{});
+                    const inner_ty = try self.parsePrefixOrPostfixType();
+                    self.cst.finishNode(mode_cst, .{});
+                    return self.ast.appendNodeWithCst(.{
+                        .tag = .mode_type,
+                        .main_token = own_tok,
+                        .lhs = PackedOperand.initNode(inner_ty),
+                    }, mode_cst);
+                }
+
+                const callable_cst = try self.startCstNode(.fn_type);
                 var has_err = false;
                 if (self.peekKind() == .at) {
                     try self.parseAttributes(&has_err);
                 }
-                while (self.peekKind() == .kw_async or self.peekKind() == .kw_unsafe) {
+
+                // Check for `ClosureType = { Attribute } [ "own" ] [ "async" ] ( "||" | "|" … "|" ) [ "->" Type ]`:
+                const is_closure_after_attrs = self.peekKind() == .pipe or
+                    self.peekKind() == .pipepipe or
+                    self.isOwnClosureTypeAt(0) or
+                    (self.peekKind() == .kw_async and
+                        (self.peekKindNth(1) == .pipe or self.peekKindNth(1) == .pipepipe));
+
+                if (is_closure_after_attrs) {
+                    self.cst.nodes.items(.kind)[callable_cst.asInt()] = .closure_type;
+                    if (self.peekKind() == .kw_own) {
+                        _ = try self.consumeLeaf(.token_leaf, .{});
+                    }
+                    if (self.peekKind() == .kw_async) {
+                        _ = try self.consumeLeaf(.token_leaf, .{});
+                    }
+                    const open_tok = try self.consumeLeaf(.token_leaf, .{});
+                    var param_types: std.ArrayList(u32) = .empty;
+                    defer param_types.deinit(self.ast.allocator);
+
+                    if (self.token_buffer.getToken(open_tok).kind == .pipe) {
+                        while (self.peekKind() != .pipe and
+                            self.peekKind() != .rbrace and
+                            self.peekKind() != .semi and
+                            self.peekKind() != .eof)
+                        {
+                            const loop_start = self.cursor;
+                            if (isIdentifierKind(self.peekKind()) and self.peekKindNth(1) == .colon) {
+                                _ = try self.consumeLeaf(.token_leaf, .{});
+                                _ = try self.consumeLeaf(.token_leaf, .{});
+                            }
+                            try param_types.append(self.ast.allocator, (try self.parseType()).asInt());
+                            if (self.peekKind() == .comma) {
+                                _ = try self.consumeLeaf(.token_leaf, .{});
+                            } else {
+                                break;
+                            }
+                            if (self.cursor == loop_start) break;
+                        }
+                        try self.expectClosingDelimiter(
+                            .pipe,
+                            open_tok,
+                            &has_err,
+                            "expected `|` to close closure type parameters",
+                        );
+                    }
+
+                    var ret_op: PackedOperand = .NONE;
+                    if (self.peekKind() == .arrow) {
+                        _ = try self.consumeLeaf(.token_leaf, .{});
+                        ret_op = PackedOperand.initNode(try self.parseType());
+                    }
+                    self.cst.finishNode(callable_cst, .{ .has_error = has_err });
+                    var rhs_op: PackedOperand = .NONE;
+                    if (param_types.items.len > 0) {
+                        rhs_op = PackedOperand.initExtra(try self.ast.appendExtraSlice(param_types.items));
+                    }
+                    return self.ast.appendNodeWithCst(.{
+                        .tag = .closure_type,
+                        .main_token = open_tok,
+                        .lhs = ret_op,
+                        .rhs = rhs_op,
+                    }, callable_cst);
+                }
+
+                // Otherwise `FnType = { Attribute } [ "async" ] [ "unsafe" ] [ "extern" [ STRING_LIT ] ] "fn" "(" … ")" [ "->" Type ]`:
+                while (self.peekKind() == .kw_async or
+                    self.peekKind() == .kw_unsafe or
+                    self.peekKind() == .kw_extern)
+                {
+                    const qual_kind = self.peekKind();
                     _ = try self.consumeLeaf(.token_leaf, .{});
+                    if (qual_kind == .kw_extern and self.peekKind() == .string_lit) {
+                        _ = try self.consumeLeaf(.token_leaf, .{});
+                    }
                 }
                 const fn_tok = try self.expectToken(
                     .kw_fn,
                     &has_err,
-                    "expected `fn` in function type",
+                    "expected `fn` or `|…|` in callable type",
                     "expected `fn` here",
                 );
                 var param_types: std.ArrayList(u32) = .empty;
@@ -3341,6 +4619,15 @@ pub const Parser = struct {
                         self.peekKind() != .eof)
                     {
                         const loop_start = self.cursor;
+                        if (self.peekKind() == .dotdotdot) {
+                            const var_cst = try self.startCstNode(.variadic_param);
+                            _ = try self.consumeLeaf(.token_leaf, .{});
+                            self.cst.finishNode(var_cst, .{});
+                            if (self.peekKind() == .comma) {
+                                _ = try self.consumeLeaf(.token_leaf, .{});
+                            }
+                            break;
+                        }
                         if (isIdentifierKind(self.peekKind()) and self.peekKindNth(1) == .colon) {
                             _ = try self.consumeLeaf(.token_leaf, .{});
                             _ = try self.consumeLeaf(.token_leaf, .{});
@@ -3365,7 +4652,7 @@ pub const Parser = struct {
                     _ = try self.consumeLeaf(.token_leaf, .{});
                     ret_op = PackedOperand.initNode(try self.parseType());
                 }
-                self.cst.finishNode(fn_cst, .{ .has_error = has_err });
+                self.cst.finishNode(callable_cst, .{ .has_error = has_err });
                 var lhs_op: PackedOperand = .NONE;
                 if (param_types.items.len > 0) {
                     lhs_op = PackedOperand.initExtra(try self.ast.appendExtraSlice(param_types.items));
@@ -3375,7 +4662,7 @@ pub const Parser = struct {
                     .main_token = fn_tok,
                     .lhs = lhs_op,
                     .rhs = ret_op,
-                }, fn_cst);
+                }, callable_cst);
             },
             .kw_self_type, .ident, .type_ident, .const_ident => {
                 if (self.peekKind() == .kw_self_type and
@@ -3397,9 +4684,13 @@ pub const Parser = struct {
                         std.mem.eql(u8, self.peekLexemeNth(0), "distinct")) and
                     TYPE_STARTER_SET.contains(self.peekKindNth(1)))
                 {
+                    const is_distinct = std.mem.eql(u8, self.peekLexemeNth(0), "distinct");
                     const mode_cst = try self.startCstNode(.mode_type);
                     const mode_tok = try self.consumeLeaf(.token_leaf, .{});
-                    const inner_ty = try self.parseType();
+                    const inner_ty = if (is_distinct)
+                        try self.parseType()
+                    else
+                        try self.parsePrimaryType();
                     self.cst.finishNode(mode_cst, .{});
                     return self.ast.appendNodeWithCst(.{
                         .tag = .mode_type,
@@ -3510,8 +4801,13 @@ pub const Parser = struct {
         defer self.popStates(1);
 
         const saved_cond_header = self.is_in_cond_header;
+        const saved_lhs_place = self.is_in_lhs_place;
         self.is_in_cond_header = false;
-        defer self.is_in_cond_header = saved_cond_header;
+        self.is_in_lhs_place = false;
+        defer {
+            self.is_in_cond_header = saved_cond_header;
+            self.is_in_lhs_place = saved_lhs_place;
+        }
 
         const open_bracket = try self.consumeLeaf(.token_leaf, .{});
         while (self.peekKind() != .rbracket and
@@ -3548,8 +4844,13 @@ pub const Parser = struct {
     /// Parses `Block = "{" { Stmt } [ TailExpr ] "}" ;` (`DR-03` Section 5.4 Part 6).
     pub fn parseBlock(self: *Parser) anyerror!NodeIndex {
         const saved_cond_header = self.is_in_cond_header;
+        const saved_lhs_place = self.is_in_lhs_place;
         self.is_in_cond_header = false;
-        defer self.is_in_cond_header = saved_cond_header;
+        self.is_in_lhs_place = false;
+        defer {
+            self.is_in_cond_header = saved_cond_header;
+            self.is_in_lhs_place = saved_lhs_place;
+        }
 
         const block_cst = try self.startCstNode(.block);
         self.pushState(.block_stmt_loop, block_cst) catch |err| switch (err) {
@@ -3657,9 +4958,11 @@ pub const Parser = struct {
             .kw_fn,
             .kw_defer,
             .kw_errdefer,
+            .kw_yield,
             .kw_for,
             .kw_while,
             .kw_loop,
+            .kw_match,
             .kw_with,
             .kw_comptime,
             => true,
@@ -3731,6 +5034,7 @@ pub const Parser = struct {
             },
             .kw_defer, .kw_errdefer => return self.parseDeferStmt(),
             .kw_return => return self.parseReturnStmt(),
+            .kw_yield => return self.parseYieldStmt(),
             .kw_break => return self.parseBreakStmt(),
             .kw_continue => return self.parseContinueStmt(),
             .kw_comptime => {
@@ -3751,9 +5055,14 @@ pub const Parser = struct {
 
         self.has_last_expr_block_body = false;
         const saved_stmt_lhs = self.is_in_stmt_lhs;
+        const saved_lhs_place = self.is_in_lhs_place;
         self.is_in_stmt_lhs = true;
+        self.is_in_lhs_place = true;
         const expr_node = blk_stmt_expr: {
-            defer self.is_in_stmt_lhs = saved_stmt_lhs;
+            defer {
+                self.is_in_stmt_lhs = saved_stmt_lhs;
+                self.is_in_lhs_place = saved_lhs_place;
+            }
             break :blk_stmt_expr try self.parseExpr(true);
         };
         const expr_tag = self.ast.getNode(expr_node).tag;
@@ -3816,7 +5125,7 @@ pub const Parser = struct {
         return expr_node;
     }
 
-    /// Parses `LocalDeclStmt = ("let" | "var") ["mut"] Pattern [":" Type] ["=" Expr ["else" Block]] ";" ;`.
+    /// Parses `LocalDeclStmt = ("let" | "var") Pattern [":" Type] ["=" Expr ["else" Block]] ";" ;` (`ADR-22B`).
     fn parseLocalDeclStmtWithCst(
         self: *Parser,
         decl_cst: CstNodeIndex,
@@ -3833,7 +5142,22 @@ pub const Parser = struct {
         var has_error = has_initial_err;
         const kw_tok = try self.consumeLeaf(.local_decl_introducer, .{});
         if (self.peekKind() == .kw_mut) {
-            _ = try self.consumeLeaf(.token_leaf, .{});
+            has_error = true;
+            const mut_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+            const intro_span = Span.init(
+                self.file_id,
+                self.getTokenSpan(kw_tok).start_byte,
+                self.getTokenSpan(mut_tok).end_byte,
+            );
+            try self.emitDiagnosticWithFix(
+                .e0221_retired_mutability_or_param_mode,
+                intro_span,
+                "`let mut` / `var mut` has been retired (`ADR-22B`); write `var` for mutable local bindings",
+                "retired `mut` local binding introducer",
+                intro_span,
+                "var",
+                "replace with `var`",
+            );
         }
 
         const pat_node = try self.parsePattern(true);
@@ -3972,6 +5296,27 @@ pub const Parser = struct {
         }, ret_cst);
     }
 
+    /// Parses `YieldStmt = "yield" Expr ";" ;` (`SE-21`).
+    fn parseYieldStmt(self: *Parser) anyerror!NodeIndex {
+        const yield_cst = try self.startCstNode(.yield_stmt);
+        var has_error = false;
+        const yield_tok = try self.consumeLeaf(.token_leaf, .{});
+        const val_expr = try self.parseExpr(true);
+        _ = try self.expectToken(
+            .semi,
+            &has_error,
+            "expected `;` after `yield` statement",
+            "expected `;` here",
+        );
+
+        self.cst.finishNode(yield_cst, .{ .has_error = has_error });
+        return self.ast.appendNodeWithCst(.{
+            .tag = .yield_stmt,
+            .main_token = yield_tok,
+            .lhs = PackedOperand.initNode(val_expr),
+        }, yield_cst);
+    }
+
     /// Parses `BreakStmt = "break" [ ":" IDENT ] [ Expr ] ";" ;`.
     fn parseBreakStmt(self: *Parser) anyerror!NodeIndex {
         const brk_cst = try self.startCstNode(.break_stmt);
@@ -4012,7 +5357,7 @@ pub const Parser = struct {
         }, brk_cst);
     }
 
-    /// Parses `ContinueStmt = "continue" [ ":" IDENT ] ";" ;`.
+    /// Parses `ContinueStmt = "continue" [ ":" IDENT ] [ Expr ] ";" ;` (`SE-23`).
     fn parseContinueStmt(self: *Parser) anyerror!NodeIndex {
         const cont_cst = try self.startCstNode(.continue_stmt);
         var has_error = false;
@@ -4026,10 +5371,15 @@ pub const Parser = struct {
                 .ident,
                 .snake_case,
                 &has_error,
-                "expected `snake_case` loop label after `:`",
+                "expected `snake_case` loop or `match` label after `:`",
             );
             self.cst.finishNode(label_cst, .{ .has_error = has_error });
             label_op = PackedOperand.initToken(label_tok);
+        }
+
+        var val_op: PackedOperand = .NONE;
+        if (isExprStart(self.peekKind(), true)) {
+            val_op = PackedOperand.initNode(try self.parseExpr(true));
         }
 
         _ = try self.expectToken(
@@ -4043,6 +5393,7 @@ pub const Parser = struct {
             .tag = .continue_stmt,
             .main_token = cont_tok,
             .lhs = label_op,
+            .rhs = val_op,
         }, cont_cst);
     }
 
@@ -4051,8 +5402,13 @@ pub const Parser = struct {
         const div_cst = try self.startCstNode(.diverging_expr);
         var has_error = false;
         const saved_cond_header = self.is_in_cond_header;
+        const saved_lhs_place = self.is_in_lhs_place;
         self.is_in_cond_header = false;
-        defer self.is_in_cond_header = saved_cond_header;
+        self.is_in_lhs_place = false;
+        defer {
+            self.is_in_cond_header = saved_cond_header;
+            self.is_in_lhs_place = saved_lhs_place;
+        }
 
         switch (self.peekKind()) {
             .kw_return => {
@@ -4105,22 +5461,27 @@ pub const Parser = struct {
                         .ident,
                         .snake_case,
                         &has_error,
-                        "expected `snake_case` loop label after `:`",
+                        "expected `snake_case` loop or `match` label after `:`",
                     );
                     self.cst.finishNode(label_cst, .{ .has_error = has_error });
                     label_op = PackedOperand.initToken(label_tok);
+                }
+                var val_op: PackedOperand = .NONE;
+                if (isExprStart(self.peekKind(), is_struct_lit_allowed)) {
+                    val_op = PackedOperand.initNode(try self.parseExpr(is_struct_lit_allowed));
                 }
                 self.cst.finishNode(div_cst, .{ .has_error = has_error });
                 return self.ast.appendNodeWithCst(.{
                     .tag = .continue_stmt,
                     .main_token = cont_tok,
                     .lhs = label_op,
+                    .rhs = val_op,
                 }, div_cst);
             },
         }
     }
 
-    /// Parses `ForExpr = [label ":"] ["comptime"] "for" ["ref" ["mut"] | "&" ["mut"]] Pattern ["," IDENT] "in" ExprNoStruct Block`.
+    /// Parses `ForExpr = [label ":"] ["comptime"] "for" ["&" ["mut"]] Pattern ["," IDENT] "in" ExprNoStruct Block`.
     fn parseForExpr(
         self: *Parser,
         opt_existing_cst: ?CstNodeIndex,
@@ -4136,11 +5497,16 @@ pub const Parser = struct {
 
         const header_cst = try self.startCstNode(.for_header);
         const saved_cond_header = self.is_in_cond_header;
+        const saved_lhs_place = self.is_in_lhs_place;
         self.is_in_cond_header = false;
-        defer self.is_in_cond_header = saved_cond_header;
+        self.is_in_lhs_place = false;
+        defer {
+            self.is_in_cond_header = saved_cond_header;
+            self.is_in_lhs_place = saved_lhs_place;
+        }
 
         var ref_mode: u32 = 0;
-        if (self.peekKind() == .kw_ref or self.peekKind() == .amp) {
+        if (self.peekKind() == .amp) {
             _ = try self.consumeLeaf(.token_leaf, .{});
             if (self.peekKind() == .kw_mut) {
                 _ = try self.consumeLeaf(.token_leaf, .{});
@@ -4148,6 +5514,51 @@ pub const Parser = struct {
             } else {
                 ref_mode = 1;
             }
+        } else if (self.peekKind() == .ident and
+            std.mem.eql(u8, self.peekLexemeNth(0), "ref") and
+            (self.peekKindNth(1) == .kw_mut or
+                self.peekKindNth(1) == .underscore or
+                self.peekKindNth(1) == .lparen or
+                self.peekKindNth(1) == .lbracket or
+                isIdentifierKind(self.peekKindNth(1))))
+        {
+            has_error = true;
+            const ref_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+            var end_mod_tok = ref_tok;
+            if (self.peekKind() == .kw_mut) {
+                end_mod_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                ref_mode = 2;
+            } else {
+                ref_mode = 1;
+            }
+            const ref_span = self.getTokenSpan(ref_tok);
+            const end_span = self.getTokenSpan(end_mod_tok);
+            const next_tok = self.peekTokenIndexNth(0);
+            const next_span = self.getTokenSpan(next_tok);
+            const has_only_spaces = blk_spaces: {
+                for (self.token_buffer.getLeadingTrivia(next_tok)) |piece| {
+                    if (piece.kind != .spaces) break :blk_spaces false;
+                }
+                break :blk_spaces !self.peekNth(0).flags.has_leading_newline;
+            };
+            const diag_span = Span.init(self.file_id, ref_span.start_byte, end_span.end_byte);
+            const fix_end = if (has_only_spaces and next_span.start_byte >= end_span.end_byte)
+                next_span.start_byte
+            else
+                end_span.end_byte;
+            const replacement = if (ref_mode == 2)
+                (if (fix_end > end_span.end_byte) "&mut " else "&mut")
+            else
+                "&";
+            try self.emitDiagnosticWithFix(
+                .e0221_retired_mutability_or_param_mode,
+                diag_span,
+                "`for ref` loop header modifier has been retired (`ADR-22B`); write `for &` or `for &mut` instead",
+                "retired `ref` loop binding modifier",
+                Span.init(self.file_id, ref_span.start_byte, fix_end),
+                replacement,
+                if (ref_mode == 2) "replace `ref mut` with `&mut`" else "replace `ref` with `&`",
+            );
         }
 
         const pat_node = try self.parsePatternWithOptions(true, false);
@@ -4206,6 +5617,9 @@ pub const Parser = struct {
         const while_tok = try self.consumeLeaf(.while_introducer, .{});
 
         const header_cst = try self.startCstNode(.while_header);
+        const saved_lhs_place = self.is_in_lhs_place;
+        self.is_in_lhs_place = false;
+        defer self.is_in_lhs_place = saved_lhs_place;
         var cond_node: NodeIndex = .none;
         if (self.peekKind() == .kw_let) {
             cond_node = try self.parseRetiredIfWhileLet(header_cst, "while", &has_error);
@@ -4337,6 +5751,112 @@ pub const Parser = struct {
         return err_tok;
     }
 
+    /// Returns `true` if `peek(lookahead)` starts a retired `ref [mut] ident` binding modifier (`ADR-22B`).
+    fn isRetiredRefPatAt(self: *const Parser, lookahead: usize) bool {
+        if (self.peekKindNth(lookahead) != .ident or
+            !std.mem.eql(u8, self.peekLexemeNth(lookahead), "ref"))
+        {
+            return false;
+        }
+        const after_ref = self.peekKindNth(lookahead + 1);
+        return after_ref == .kw_mut or after_ref == .underscore or isIdentifierKind(after_ref);
+    }
+
+    /// Consumes a canonical (`var`, `&`, `&mut`) or retired (`mut`, `own`, `ref [mut]`) pattern modifier (`ADR-22B`).
+    fn consumePatternBindingModifier(self: *Parser, has_err: *bool) !TokenIndex {
+        switch (self.peekKind()) {
+            .kw_var => return self.consumeLeaf(.token_leaf, .{}),
+            .amp => {
+                const amp_tok = try self.consumeLeaf(.token_leaf, .{});
+                if (self.peekKind() == .kw_mut) {
+                    _ = try self.consumeLeaf(.token_leaf, .{});
+                }
+                return amp_tok;
+            },
+            .kw_mut => {
+                has_err.* = true;
+                const mut_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                const mut_span = self.getTokenSpan(mut_tok);
+                try self.emitDiagnosticWithFix(
+                    .e0221_retired_mutability_or_param_mode,
+                    mut_span,
+                    "`mut` pattern binding modifier has been retired (`ADR-22B`); write `var` instead",
+                    "retired `mut` pattern modifier; write `var`",
+                    mut_span,
+                    "var",
+                    "replace `mut` with `var`",
+                );
+                return mut_tok;
+            },
+            .kw_own => {
+                has_err.* = true;
+                const own_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                const own_span = self.getTokenSpan(own_tok);
+                const next_tok = self.peekTokenIndexNth(0);
+                const next_span = self.getTokenSpan(next_tok);
+                const has_only_spaces = blk_spaces: {
+                    for (self.token_buffer.getLeadingTrivia(next_tok)) |piece| {
+                        if (piece.kind != .spaces) break :blk_spaces false;
+                    }
+                    break :blk_spaces !self.peekNth(0).flags.has_leading_newline;
+                };
+                const fix_end = if (has_only_spaces and next_span.start_byte >= own_span.end_byte)
+                    next_span.start_byte
+                else
+                    own_span.end_byte;
+                try self.emitDiagnosticWithFix(
+                    .e0221_retired_mutability_or_param_mode,
+                    own_span,
+                    "`own` pattern binding modifier has been retired (`ADR-22B`); bare pattern bindings move by default",
+                    "retired `own` pattern modifier",
+                    Span.init(self.file_id, own_span.start_byte, fix_end),
+                    "",
+                    "remove redundant `own` modifier",
+                );
+                return own_tok;
+            },
+            else => {
+                has_err.* = true;
+                const ref_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                var end_mod_tok = ref_tok;
+                var is_mut = false;
+                if (self.peekKind() == .kw_mut) {
+                    is_mut = true;
+                    end_mod_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                }
+                const ref_span = self.getTokenSpan(ref_tok);
+                const end_span = self.getTokenSpan(end_mod_tok);
+                const next_tok = self.peekTokenIndexNth(0);
+                const next_span = self.getTokenSpan(next_tok);
+                const has_only_spaces = blk_spaces: {
+                    for (self.token_buffer.getLeadingTrivia(next_tok)) |piece| {
+                        if (piece.kind != .spaces) break :blk_spaces false;
+                    }
+                    break :blk_spaces !self.peekNth(0).flags.has_leading_newline;
+                };
+                const diag_span = Span.init(self.file_id, ref_span.start_byte, end_span.end_byte);
+                const fix_end = if (has_only_spaces and next_span.start_byte >= end_span.end_byte)
+                    next_span.start_byte
+                else
+                    end_span.end_byte;
+                const replacement = if (is_mut)
+                    (if (fix_end > end_span.end_byte) "&mut " else "&mut")
+                else
+                    "&";
+                try self.emitDiagnosticWithFix(
+                    .e0221_retired_mutability_or_param_mode,
+                    diag_span,
+                    "`ref` pattern binding modifier has been retired (`ADR-22B`); write `&` or `&mut` instead",
+                    "retired `ref` pattern modifier",
+                    Span.init(self.file_id, ref_span.start_byte, fix_end),
+                    replacement,
+                    if (is_mut) "replace `ref mut` with `&mut`" else "replace `ref` with `&`",
+                );
+                return ref_tok;
+            },
+        }
+    }
+
     /// Parses a single pattern (`_`, literal/range, tuple, slice, `@`, binding, `.Variant`, or `PathPattern`).
     fn parseSinglePattern(
         self: *Parser,
@@ -4368,7 +5888,7 @@ pub const Parser = struct {
                     .rhs = if (has_err) .NONE else PackedOperand.initToken(end_tok),
                 }, range_cst);
             },
-            .minus, .int_lit, .float_lit, .string_lit, .char_lit, .kw_true, .kw_false => {
+            .minus, .int_lit, .float_lit, .string_lit, .char_lit, .byte_lit, .byte_string_lit, .kw_true, .kw_false => {
                 var lit_tok = self.peekTokenIndexNth(0);
                 if (self.peekKind() == .minus) {
                     const neg_cst = try self.startCstNode(.literal_pat);
@@ -4476,24 +5996,22 @@ pub const Parser = struct {
                     const loop_start = self.cursor;
                     if (self.peekKind() == .dotdot) {
                         const next_kind = self.peekKindNth(1);
-                        const has_rest_binding = next_kind == .kw_mut or
-                            next_kind == .kw_ref or
-                            next_kind == .kw_own or
+                        const has_rest_binding = next_kind == .kw_var or
                             next_kind == .amp or
+                            next_kind == .kw_mut or
+                            next_kind == .kw_own or
                             isIdentifierKind(next_kind);
                         if (has_rest_binding) {
                             const rest_cst = try self.startCstNode(.ident_pat);
                             var has_rest_err = false;
                             const dotdot_tok = try self.consumeLeaf(.token_leaf, .{});
-                            if (self.peekKind() == .kw_mut or
-                                self.peekKind() == .kw_ref or
+                            if (self.peekKind() == .kw_var or
+                                self.peekKind() == .amp or
+                                self.peekKind() == .kw_mut or
                                 self.peekKind() == .kw_own or
-                                self.peekKind() == .amp)
+                                self.isRetiredRefPatAt(0))
                             {
-                                _ = try self.consumeLeaf(.token_leaf, .{});
-                                if (self.peekKind() == .kw_mut) {
-                                    _ = try self.consumeLeaf(.token_leaf, .{});
-                                }
+                                _ = try self.consumePatternBindingModifier(&has_rest_err);
                             }
                             const ident_tok = try self.expectIdentifierWithCasing(
                                 .ident,
@@ -4586,13 +6104,10 @@ pub const Parser = struct {
                     .rhs = rhs_op,
                 }, var_cst);
             },
-            .kw_mut, .kw_ref, .kw_own, .amp => {
+            .kw_var, .amp, .kw_mut, .kw_own => {
                 const bind_cst = try self.startCstNode(.ident_pat);
                 var has_err = false;
-                const first_mod_tok = try self.consumeLeaf(.token_leaf, .{});
-                if (self.peekKind() == .kw_mut) {
-                    _ = try self.consumeLeaf(.token_leaf, .{});
-                }
+                const first_mod_tok = try self.consumePatternBindingModifier(&has_err);
                 const ident_tok = try self.expectIdentifierWithCasing(
                     .ident,
                     .snake_case,
@@ -4677,6 +6192,38 @@ pub const Parser = struct {
                 }, hole_cst);
             },
             .ident, .type_ident, .const_ident, .kw_self_type => {
+                if (self.isRetiredRefPatAt(0)) {
+                    const bind_cst = try self.startCstNode(.ident_pat);
+                    var has_err = false;
+                    const first_mod_tok = try self.consumePatternBindingModifier(&has_err);
+                    const ident_tok = try self.expectIdentifierWithCasing(
+                        .ident,
+                        .snake_case,
+                        &has_err,
+                        "expected `snake_case` binding identifier",
+                    );
+                    if (self.peekKind() == .at) {
+                        self.cst.nodes.items(.kind)[bind_cst.asInt()] = .at_pat;
+                        _ = try self.consumeLeaf(.token_leaf, .{});
+                        const subpat_node = try self.parseSinglePattern(
+                            is_binding_slot,
+                            is_struct_pat_allowed,
+                        );
+                        self.cst.finishNode(bind_cst, .{ .has_error = has_err });
+                        return self.ast.appendNodeWithCst(.{
+                            .tag = .at_pat,
+                            .main_token = ident_tok,
+                            .lhs = PackedOperand.initToken(first_mod_tok),
+                            .rhs = PackedOperand.initNode(subpat_node),
+                        }, bind_cst);
+                    }
+                    self.cst.finishNode(bind_cst, .{ .has_error = has_err });
+                    return self.ast.appendNodeWithCst(.{
+                        .tag = .bind_pat,
+                        .main_token = ident_tok,
+                    }, bind_cst);
+                }
+
                 // Subpattern `@` binding (`ident @ SinglePattern`):
                 if (self.peekKindNth(1) == .at) {
                     const at_cst = try self.startCstNode(.at_pat);
@@ -4857,11 +6404,15 @@ pub const Parser = struct {
             if (self.peekKind() == .dotdot) {
                 _ = try self.consumeLeaf(.token_leaf, .{});
             } else {
-                if (self.peekKind() == .kw_mut or
-                    self.peekKind() == .kw_ref or
-                    self.peekKind() == .kw_own)
+                var has_shorthand_mod = false;
+                if (self.peekKind() == .kw_var or
+                    self.peekKind() == .amp or
+                    self.peekKind() == .kw_mut or
+                    self.peekKind() == .kw_own or
+                    self.isRetiredRefPatAt(0))
                 {
-                    _ = try self.consumeLeaf(.token_leaf, .{});
+                    has_shorthand_mod = true;
+                    _ = try self.consumePatternBindingModifier(&has_field_err);
                 }
                 const field_tok = try self.expectIdentifierWithCasing(
                     .ident,
@@ -4870,7 +6421,15 @@ pub const Parser = struct {
                     "expected `snake_case` field name in struct pattern",
                 );
                 if (self.peekKind() == .colon) {
-                    _ = try self.consumeLeaf(.token_leaf, .{});
+                    const colon_tok = try self.consumeLeaf(.token_leaf, .{});
+                    if (has_shorthand_mod) {
+                        has_field_err = true;
+                        try self.emitUnexpectedToken(
+                            colon_tok,
+                            "shorthand binding modifier cannot precede `field: pattern` renaming",
+                            "move `var` or `&` into the renamed sub-pattern",
+                        );
+                    }
                     try payload_pats.append(
                         self.ast.allocator,
                         (try self.parsePattern(is_binding_slot)).asInt(),
@@ -4910,7 +6469,7 @@ pub const Parser = struct {
         return self.isTypeStart(1);
     }
 
-    /// Returns `true` if the token at `start_lookahead` begins a `Type` (`DR-21` Section 1.3).
+    /// Returns `true` if the token at `start_lookahead` begins a `Type` (`DR-22` Section 3.3).
     fn isTypeStart(self: *const Parser, start_lookahead: usize) bool {
         var raw_idx: usize = self.peekTokenIndexNth(start_lookahead).asInt();
         var steps: usize = 0;
@@ -4928,14 +6487,37 @@ pub const Parser = struct {
                 },
                 .kw_const,
                 .kw_own,
-                .kw_ref,
                 .hash_soa,
                 .tilde,
                 .kw_fn,
                 .kw_async,
                 .kw_unsafe,
+                .kw_extern,
                 .pipepipe,
                 => return true,
+                .at => {
+                    const name_raw = self.advanceNonCarrierRawIndex(raw_idx, 1);
+                    const name_kind = self.rawTokenKindAt(name_raw);
+                    if (!isIdentifierKind(name_kind) and !isKeywordKind(name_kind)) return false;
+                    var after_attr = self.advanceNonCarrierRawIndex(name_raw, 1);
+                    if (self.rawTokenKindAt(after_attr) == .lbracket) return false;
+                    if (self.rawTokenKindAt(after_attr) == .lparen) {
+                        var paren_depth: u32 = 1;
+                        after_attr = self.advanceNonCarrierRawIndex(after_attr, 1);
+                        while (steps < MAX_TYPE_LOOKAHEAD and paren_depth > 0) : (steps += 1) {
+                            const inner_kind = self.rawTokenKindAt(after_attr);
+                            if (inner_kind == .eof) return false;
+                            if (inner_kind == .lparen) {
+                                paren_depth += 1;
+                            } else if (inner_kind == .rparen) {
+                                paren_depth -= 1;
+                            }
+                            after_attr = self.advanceNonCarrierRawIndex(after_attr, 1);
+                        }
+                        if (paren_depth != 0) return false;
+                    }
+                    raw_idx = after_attr;
+                },
                 .star => {
                     const next_raw = self.advanceNonCarrierRawIndex(raw_idx, 1);
                     const next_kind = self.rawTokenKindAt(next_raw);
@@ -4955,8 +6537,10 @@ pub const Parser = struct {
                             const after_pipe = self.rawTokenKindAt(self.advanceNonCarrierRawIndex(scan_raw, 1));
                             return after_pipe == .arrow or
                                 after_pipe == .rbracket or
+                                after_pipe == .rparen or
                                 after_pipe == .comma or
-                                after_pipe == .question;
+                                after_pipe == .question or
+                                after_pipe == .bang;
                         }
                         if (tok_kind == .lparen or tok_kind == .lbracket) {
                             nested_depth += 1;
@@ -5005,10 +6589,22 @@ pub const Parser = struct {
                 },
                 .amp => {
                     const next_raw = self.advanceNonCarrierRawIndex(raw_idx, 1);
-                    raw_idx = if (self.rawTokenKindAt(next_raw) == .kw_mut)
-                        self.advanceNonCarrierRawIndex(next_raw, 1)
-                    else
-                        next_raw;
+                    const next_kind = self.rawTokenKindAt(next_raw);
+                    if (next_kind == .kw_mut) {
+                        raw_idx = self.advanceNonCarrierRawIndex(next_raw, 1);
+                    } else if (next_kind == .ident) {
+                        const next_tok_id = TokenIndex.fromInt(@intCast(self.skipCarrierRawIndex(next_raw)));
+                        const after_out = self.advanceNonCarrierRawIndex(next_raw, 1);
+                        if (std.mem.eql(u8, self.getTokenLexeme(next_tok_id), "out") and
+                            self.rawTokenKindAt(after_out) != .dot)
+                        {
+                            raw_idx = after_out;
+                        } else {
+                            raw_idx = next_raw;
+                        }
+                    } else {
+                        raw_idx = next_raw;
+                    }
                 },
                 .lparen => {
                     const next_raw = self.advanceNonCarrierRawIndex(raw_idx, 1);
@@ -5155,6 +6751,7 @@ pub const Parser = struct {
         if (third_kind == .kw_for or
             third_kind == .kw_while or
             third_kind == .kw_loop or
+            third_kind == .kw_match or
             (third_kind == .kw_comptime and self.peekKindNth(4) == .kw_for))
         {
             return false;
@@ -5188,11 +6785,11 @@ pub const Parser = struct {
         return false;
     }
 
-    /// Returns `true` if `peek(0)` starts a labeled loop (`label: for`, `label: while`, `label: loop`).
+    /// Returns `true` if `peek(0)` starts a labeled loop or `match` (`label: for`, `label: while`, `label: loop`, `label: match`).
     fn isLabeledLoopStart(self: *const Parser) bool {
         if (self.peekKind() != .ident or self.peekKindNth(1) != .colon) return false;
         return switch (self.peekKindNth(2)) {
-            .kw_for, .kw_while, .kw_loop => true,
+            .kw_for, .kw_while, .kw_loop, .kw_match => true,
             .kw_comptime => self.peekKindNth(3) == .kw_for,
             else => false,
         };
@@ -5440,6 +7037,7 @@ pub const Parser = struct {
             // [2] Reject bare unparenthesized `:=` bindings (`E0215`) cleanly without cascading:
             if (cur_kind == .colon_eq) {
                 self.is_in_stmt_lhs = false;
+                self.is_in_lhs_place = false;
                 const walrus_tok = self.peekTokenIndexNth(0);
                 try self.emitWalrusPositionError(
                     self.getTokenSpan(walrus_tok),
@@ -5464,6 +7062,7 @@ pub const Parser = struct {
             // [3] Break on outer statement-level assignment, or reject nested assignment inside expressions:
             if (isAssignOp(cur_kind)) {
                 if (self.is_in_stmt_lhs) break;
+                self.is_in_lhs_place = false;
                 const assign_tok = self.peekTokenIndexNth(0);
                 try self.emitUnexpectedToken(
                     assign_tok,
@@ -5483,10 +7082,56 @@ pub const Parser = struct {
                 continue;
             }
 
+            // [3b] Retired infix `||` (`ADR-22A`, `E0219`); preserve newline 0-arg closure after block expr:
+            if (cur_kind == .pipepipe and 2 >= min_bp) {
+                if ((self.has_last_expr_block_body or
+                    isBlockBodiedAstTag(self.ast.getNode(lhs_node).tag)) and
+                    self.peekNth(0).flags.has_leading_newline)
+                {
+                    break;
+                }
+                self.is_in_stmt_lhs = false;
+                self.is_in_lhs_place = false;
+
+                self.pushState(.expr_pratt_loop, lhs_cst_start) catch |err| switch (err) {
+                    error.ParseDepthExceeded => {
+                        _ = try self.precedeNode(
+                            lhs_cst_start,
+                            lhs_ast_start,
+                            .invalid_parse_subtree,
+                            self.peekTokenIndexNth(0),
+                        );
+                        return self.recoverDepthOverflow(
+                            lhs_cst_start,
+                            EXPR_SYNC_STOP_SET,
+                            .expr_hole,
+                        );
+                    },
+                    else => return err,
+                };
+                chain_pushes += 1;
+
+                const op_tok = self.peekTokenIndexNth(0);
+                _ = try self.precedeNode(lhs_cst_start, lhs_ast_start, .infix_expr, op_tok);
+                _ = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                try self.emitRetiredLogicalOr(op_tok);
+                const rhs_node = try self.parseExprBp(3, is_struct_lit_allowed);
+                self.cst.finishNode(lhs_cst_start, .{ .has_error = true });
+                self.has_last_expr_block_body = false;
+                lhs_node = try self.ast.appendNodeWithCst(.{
+                    .tag = .binary_expr,
+                    .main_token = op_tok,
+                    .lhs = PackedOperand.initNode(lhs_node),
+                    .rhs = PackedOperand.initNode(rhs_node),
+                }, lhs_cst_start);
+                continue;
+            }
+
             // [4] Infix Operators (Tiers 13 down to 1):
             if (getInfixBindingPower(cur_kind)) |bp_info| {
                 if (bp_info.left_bp < min_bp) break;
                 self.is_in_stmt_lhs = false;
+                self.is_in_lhs_place = false;
 
                 self.pushState(.expr_pratt_loop, lhs_cst_start) catch |err| switch (err) {
                     error.ParseDepthExceeded => {
@@ -5704,7 +7349,7 @@ pub const Parser = struct {
         return lhs_node;
     }
 
-    /// Parses postfix `.await`, `.field`, `.0`, `.method[T](args)`, or mid-keystroke `expr.` (`incomplete_member_access`).
+    /// Parses postfix `.*`, `.await`, `.field`, `.0`, `.method[T](args)`, or mid-keystroke `expr.`.
     fn parseDotPostfix(
         self: *Parser,
         lhs_node: NodeIndex,
@@ -5713,6 +7358,19 @@ pub const Parser = struct {
         is_struct_lit_allowed: bool,
     ) anyerror!NodeIndex {
         const dot_tok = self.peekTokenIndexNth(0);
+        if (self.peekKindNth(1) == .star) {
+            _ = try self.precedeNode(lhs_cst_start, lhs_ast_start, .postfix_deref_expr, dot_tok);
+            _ = try self.consumeLeaf(.token_leaf, .{});
+            const star_tok = try self.consumeLeaf(.token_leaf, .{});
+            self.cst.finishNode(lhs_cst_start, .{});
+            self.has_last_expr_block_body = false;
+            return self.ast.appendNodeWithCst(.{
+                .tag = .deref_expr,
+                .main_token = star_tok,
+                .lhs = PackedOperand.initNode(lhs_node),
+            }, lhs_cst_start);
+        }
+
         if (self.peekKindNth(1) == .kw_await) {
             _ = try self.precedeNode(lhs_cst_start, lhs_ast_start, .postfix_await_expr, dot_tok);
             _ = try self.consumeLeaf(.token_leaf, .{});
@@ -5803,7 +7461,7 @@ pub const Parser = struct {
         // Mid-keystroke trailing `.`; synthesize missing leaf and lower to `.incomplete_member_access`:
         try self.emitUnexpectedToken(
             dot_tok,
-            "expected field, method, or `await` after `.`",
+            "expected field, method, `*`, or `await` after `.`",
             "incomplete member access after `.`",
         );
         _ = try self.cst.appendLeafNode(.invalid_parse_leaf, dot_tok, .{
@@ -5820,7 +7478,7 @@ pub const Parser = struct {
         }, lhs_cst_start);
     }
 
-    /// Parses postfix generic call `callee[T](args)` or index expression `base[index]`.
+    /// Parses postfix generic call `callee[T](args)` or index expression `base[i]` / `base[i, j]` (`SE-21`).
     fn parseBracketPostfix(
         self: *Parser,
         lhs_node: NodeIndex,
@@ -5829,8 +7487,13 @@ pub const Parser = struct {
         is_struct_lit_allowed: bool,
     ) anyerror!NodeIndex {
         const saved_stmt_lhs = self.is_in_stmt_lhs;
+        const saved_lhs_place = self.is_in_lhs_place;
         self.is_in_stmt_lhs = false;
-        defer self.is_in_stmt_lhs = saved_stmt_lhs;
+        self.is_in_lhs_place = false;
+        defer {
+            self.is_in_stmt_lhs = saved_stmt_lhs;
+            self.is_in_lhs_place = saved_lhs_place;
+        }
         const bracket_tok = self.peekTokenIndexNth(0);
         const lhs_ast = self.ast.getNode(lhs_node);
         const is_intrinsic_callee = lhs_ast.tag == .ident_expr and
@@ -5874,7 +7537,7 @@ pub const Parser = struct {
             }, lhs_cst_start);
         }
 
-        // Array, slice, or multi-index subscript expression (`base[index]`):
+        // Array, slice, or multi-index subscript expression (`base[i]` or `base[i, j]`):
         _ = try self.precedeNode(lhs_cst_start, lhs_ast_start, .index_expr, bracket_tok);
         var has_err = false;
         const open_bracket = try self.consumeLeaf(.token_leaf, .{});
@@ -5882,11 +7545,14 @@ pub const Parser = struct {
         self.is_in_cond_header = false;
         defer self.is_in_cond_header = saved_cond_header;
 
+        var idx_nodes: std.ArrayList(u32) = .empty;
+        defer idx_nodes.deinit(self.ast.allocator);
         const first_idx = try self.parseExpr(true);
+        try idx_nodes.append(self.ast.allocator, first_idx.asInt());
         while (self.peekKind() == .comma) {
             _ = try self.consumeLeaf(.token_leaf, .{});
             if (self.peekKind() == .rbracket) break;
-            _ = try self.parseExpr(true);
+            try idx_nodes.append(self.ast.allocator, (try self.parseExpr(true)).asInt());
         }
         try self.expectClosingDelimiter(
             .rbracket,
@@ -5896,11 +7562,15 @@ pub const Parser = struct {
         );
         self.cst.finishNode(lhs_cst_start, .{ .has_error = has_err });
         self.has_last_expr_block_body = false;
+        const rhs_op: PackedOperand = if (idx_nodes.items.len <= 1)
+            PackedOperand.initNode(first_idx)
+        else
+            PackedOperand.initExtra(try self.ast.appendExtraSlice(idx_nodes.items));
         return self.ast.appendNodeWithCst(.{
             .tag = .index_expr,
             .main_token = open_bracket,
             .lhs = PackedOperand.initNode(lhs_node),
-            .rhs = PackedOperand.initNode(first_idx),
+            .rhs = rhs_op,
         }, lhs_cst_start);
     }
 
@@ -5951,11 +7621,14 @@ pub const Parser = struct {
         is_incomplete_out: *bool,
     ) anyerror!void {
         const saved_stmt_lhs = self.is_in_stmt_lhs;
+        const saved_lhs_place = self.is_in_lhs_place;
         const saved_cond_header = self.is_in_cond_header;
         self.is_in_stmt_lhs = false;
+        self.is_in_lhs_place = false;
         self.is_in_cond_header = false;
         defer {
             self.is_in_stmt_lhs = saved_stmt_lhs;
+            self.is_in_lhs_place = saved_lhs_place;
             self.is_in_cond_header = saved_cond_header;
         }
         const open_paren = try self.consumeLeaf(.token_leaf, .{});
@@ -6076,9 +7749,18 @@ pub const Parser = struct {
         }
     }
 
-    /// Parses `PrefixExpr = [ UnaryOp | RangePrefix ] PrimaryExpr` (`DR-21` Section 3.2 Tier 14, `r_bp = 28`).
+    /// Parses `PrefixExpr = [ UnaryOp | RangePrefix ] PrimaryExpr` (`DR-22` Section 3.2 Tier 14, `r_bp = 28`).
     fn parsePrefixExpr(self: *Parser, is_struct_lit_allowed: bool) anyerror!NodeIndex {
         const cur_kind = self.peekKind();
+        if (cur_kind == .kw_own and
+            (self.peekKindNth(1) == .pipe or
+                self.peekKindNth(1) == .pipepipe or
+                (self.peekKindNth(1) == .kw_async and
+                    (self.peekKindNth(2) == .pipe or self.peekKindNth(2) == .pipepipe))))
+        {
+            return self.parseClosureExpr(is_struct_lit_allowed);
+        }
+
         if (cur_kind == .dotdot or cur_kind == .dotdoteq) {
             const pref_cst = try self.startCstNode(.prefix_expr);
             self.pushState(.expr_prefix_finish, pref_cst) catch |err| switch (err) {
@@ -6090,8 +7772,13 @@ pub const Parser = struct {
             defer self.popStates(1);
 
             const saved_stmt_lhs = self.is_in_stmt_lhs;
+            const saved_lhs_place = self.is_in_lhs_place;
             self.is_in_stmt_lhs = false;
-            defer self.is_in_stmt_lhs = saved_stmt_lhs;
+            self.is_in_lhs_place = false;
+            defer {
+                self.is_in_stmt_lhs = saved_stmt_lhs;
+                self.is_in_lhs_place = saved_lhs_place;
+            }
 
             const range_tok = try self.consumeLeaf(.token_leaf, .{});
             var end_op: PackedOperand = .NONE;
@@ -6123,6 +7810,89 @@ pub const Parser = struct {
             }, pref_cst);
         }
 
+        // Retired standalone call-site / borrow prefix (`ref [mut] place`, `inout place`, `sink expr`, `set place`):
+        if (cur_kind == .ident) {
+            const mode_lexeme = self.peekLexemeNth(0);
+            const next_kind = self.peekKindNth(1);
+            const is_retired_ref = std.mem.eql(u8, mode_lexeme, "ref") and
+                (next_kind == .kw_mut or next_kind == .ident or next_kind == .kw_self_val);
+            const is_retired_mode = (std.mem.eql(u8, mode_lexeme, "inout") or
+                std.mem.eql(u8, mode_lexeme, "sink") or
+                std.mem.eql(u8, mode_lexeme, "set")) and
+                (next_kind == .ident or next_kind == .kw_self_val);
+            if (is_retired_ref or is_retired_mode) {
+                const pref_cst = try self.startCstNode(.prefix_expr);
+                self.pushState(.expr_prefix_finish, pref_cst) catch |err| switch (err) {
+                    error.ParseDepthExceeded => {
+                        return self.recoverDepthOverflow(pref_cst, EXPR_SYNC_STOP_SET, .expr_hole);
+                    },
+                    else => return err,
+                };
+                defer self.popStates(1);
+
+                const first_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                var end_tok = first_tok;
+                var is_ref_mut = false;
+                if (is_retired_ref and self.peekKind() == .kw_mut) {
+                    is_ref_mut = true;
+                    end_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                }
+                const first_span = self.getTokenSpan(first_tok);
+                const end_span = self.getTokenSpan(end_tok);
+                const next_tok = self.peekTokenIndexNth(0);
+                const next_span = self.getTokenSpan(next_tok);
+                const has_only_spaces = blk_spaces: {
+                    for (self.token_buffer.getLeadingTrivia(next_tok)) |piece| {
+                        if (piece.kind != .spaces) break :blk_spaces false;
+                    }
+                    break :blk_spaces !self.peekNth(0).flags.has_leading_newline;
+                };
+                const diag_span = Span.init(self.file_id, first_span.start_byte, end_span.end_byte);
+                const fix_end = if (has_only_spaces and next_span.start_byte >= end_span.end_byte)
+                    next_span.start_byte
+                else
+                    end_span.end_byte;
+                const with_space = fix_end > end_span.end_byte;
+                const replacement = if (is_retired_ref)
+                    (if (is_ref_mut) (if (with_space) "&mut " else "&mut") else "&")
+                else if (std.mem.eql(u8, mode_lexeme, "inout"))
+                    (if (with_space) "&mut " else "&mut")
+                else if (std.mem.eql(u8, mode_lexeme, "sink"))
+                    (if (with_space) "own " else "own")
+                else
+                    (if (with_space) "&out " else "&out");
+
+                try self.emitDiagnosticWithFix(
+                    .e0221_retired_mutability_or_param_mode,
+                    diag_span,
+                    "retired call-site / borrow prefix (`ADR-22B`); use `&`, `&mut`, `&out`, or `own`",
+                    "retired call-site or borrow prefix",
+                    Span.init(self.file_id, first_span.start_byte, fix_end),
+                    replacement,
+                    "replace with canonical CoreX borrow/ownership prefix",
+                );
+
+                const saved_stmt_lhs = self.is_in_stmt_lhs;
+                const saved_lhs_place = self.is_in_lhs_place;
+                self.is_in_stmt_lhs = false;
+                self.is_in_lhs_place = false;
+                const operand = blk_ret_pref: {
+                    defer {
+                        self.is_in_stmt_lhs = saved_stmt_lhs;
+                        self.is_in_lhs_place = saved_lhs_place;
+                    }
+                    break :blk_ret_pref try self.parseExprBp(28, is_struct_lit_allowed);
+                };
+                self.cst.finishNode(pref_cst, .{ .has_error = true });
+                self.has_last_expr_block_body = false;
+                return self.ast.appendNodeWithCst(.{
+                    .tag = .unary_expr,
+                    .main_token = first_tok,
+                    .lhs = PackedOperand.initNode(operand),
+                }, pref_cst);
+            }
+        }
+
         if (getPrefixRightBindingPower(cur_kind)) |right_bp| {
             const pref_cst = try self.startCstNode(.prefix_expr);
             self.pushState(.expr_prefix_finish, pref_cst) catch |err| switch (err) {
@@ -6133,29 +7903,162 @@ pub const Parser = struct {
             };
             defer self.popStates(1);
 
+            var has_pref_err = false;
             const op_kind = self.peekKind();
             const op_tok = try self.consumeLeaf(.token_leaf, .{});
-            if ((op_kind == .amp or op_kind == .kw_own or op_kind == .kw_ref) and
-                (self.peekKind() == .kw_mut or self.peekKind() == .kw_let or
-                    (self.peekKind() == .ident and
-                        (std.mem.eql(u8, self.peekLexemeNth(0), "inout") or
-                            std.mem.eql(u8, self.peekLexemeNth(0), "sink") or
-                            std.mem.eql(u8, self.peekLexemeNth(0), "set")))))
-            {
-                if (self.peekKind() == .kw_mut or self.peekKind() == .kw_let or
-                    !EXPR_SYNC_STOP_SET.contains(self.peekKindNth(1)))
-                {
+
+            if (op_kind == .amp) {
+                if (self.peekKind() == .kw_mut) {
                     _ = try self.consumeLeaf(.token_leaf, .{});
+                } else if (self.peekKind() == .ident) {
+                    const mod_lexeme = self.peekLexemeNth(0);
+                    const after_mod = self.peekKindNth(1);
+                    const after_lparen = self.peekKindNth(2);
+                    if (std.mem.eql(u8, mod_lexeme, "out") and
+                        isUnambiguousAddrOperandStart(after_mod, after_lparen))
+                    {
+                        _ = try self.consumeLeaf(.token_leaf, .{});
+                    } else if (std.mem.eql(u8, mod_lexeme, "raw") and
+                        (after_mod == .kw_mut or
+                            isUnambiguousAddrOperandStart(after_mod, after_lparen)))
+                    {
+                        _ = try self.consumeLeaf(.token_leaf, .{});
+                        if (self.peekKind() == .kw_mut) {
+                            _ = try self.consumeLeaf(.token_leaf, .{});
+                        }
+                    } else if ((std.mem.eql(u8, mod_lexeme, "inout") or
+                        std.mem.eql(u8, mod_lexeme, "sink") or
+                        std.mem.eql(u8, mod_lexeme, "set")) and
+                        isUnambiguousAddrOperandStart(after_mod, after_lparen))
+                    {
+                        has_pref_err = true;
+                        const mod_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                        const amp_span = self.getTokenSpan(op_tok);
+                        const mod_span = self.getTokenSpan(mod_tok);
+                        const diag_span = Span.init(self.file_id, amp_span.start_byte, mod_span.end_byte);
+                        const replacement = if (std.mem.eql(u8, mod_lexeme, "inout"))
+                            "&mut"
+                        else if (std.mem.eql(u8, mod_lexeme, "sink"))
+                            "own"
+                        else
+                            "&out";
+                        try self.emitDiagnosticWithFix(
+                            .e0221_retired_mutability_or_param_mode,
+                            diag_span,
+                            "retired `&inout` / `&sink` / `&set` spelling (`ADR-22B`); write `&mut`, `own`, or `&out`",
+                            "retired borrow/projection modifier",
+                            diag_span,
+                            replacement,
+                            "replace with canonical CoreX prefix",
+                        );
+                    }
+                } else if (self.peekKind() == .kw_let and
+                    isUnambiguousAddrOperandStart(self.peekKindNth(1), self.peekKindNth(2)))
+                {
+                    has_pref_err = true;
+                    const let_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                    const amp_span = self.getTokenSpan(op_tok);
+                    const let_span = self.getTokenSpan(let_tok);
+                    const next_span = self.getTokenSpan(self.peekTokenIndexNth(0));
+                    const diag_span = Span.init(self.file_id, amp_span.start_byte, let_span.end_byte);
+                    const fix_span = Span.init(
+                        self.file_id,
+                        amp_span.start_byte,
+                        @max(let_span.end_byte, next_span.start_byte),
+                    );
+                    try self.emitDiagnosticWithFix(
+                        .e0221_retired_mutability_or_param_mode,
+                        diag_span,
+                        "`&let` borrow spelling has been retired (`ADR-22B`); write `&` instead",
+                        "retired `&let`; write `&`",
+                        fix_span,
+                        "&",
+                        "replace `&let ` with `&`",
+                    );
                 }
             }
 
+            const first_operand_tok = self.peekTokenIndexNth(0);
             const saved_stmt_lhs = self.is_in_stmt_lhs;
+            const saved_lhs_place = self.is_in_lhs_place;
             self.is_in_stmt_lhs = saved_stmt_lhs and (op_kind == .star);
+            self.is_in_lhs_place = saved_lhs_place and (op_kind == .star);
             const operand = blk_pref: {
-                defer self.is_in_stmt_lhs = saved_stmt_lhs;
+                defer {
+                    self.is_in_stmt_lhs = saved_stmt_lhs;
+                    self.is_in_lhs_place = saved_lhs_place;
+                }
                 break :blk_pref try self.parseExprBp(right_bp, is_struct_lit_allowed);
             };
-            self.cst.finishNode(pref_cst, .{});
+
+            if (op_kind == .bang) {
+                has_pref_err = true;
+                const bang_span = self.getTokenSpan(op_tok);
+                const has_following_space = bang_span.end_byte < self.source.len and
+                    (self.source[bang_span.end_byte] == ' ' or self.source[bang_span.end_byte] == '\t');
+                try self.emitDiagnosticWithFix(
+                    .e0220_retired_bang_prefix,
+                    bang_span,
+                    "prefix `!` has been retired (`ADR-22A`); write `not expr` for boolean negation or `~expr` for bitwise NOT",
+                    "retired `!` prefix operator",
+                    bang_span,
+                    if (has_following_space) "not" else "not ",
+                    "replace `!` with `not` (or `~` for integer bitwise NOT)",
+                );
+            } else if (op_kind == .star) {
+                has_pref_err = true;
+                const star_span = self.getTokenSpan(op_tok);
+                var full_span = star_span;
+                var opt_fix_text: ?[]u8 = null;
+                defer if (opt_fix_text) |allocated| self.ast.allocator.free(allocated);
+
+                if (!first_operand_tok.isNone() and self.cursor > first_operand_tok.asInt()) {
+                    const last_operand_tok = TokenIndex.fromInt(self.cursor - 1);
+                    const op_start = self.getTokenSpan(first_operand_tok).start_byte;
+                    const op_end = self.getTokenSpan(last_operand_tok).end_byte;
+                    if (op_end >= op_start and op_end <= self.source.len) {
+                        full_span = Span.init(self.file_id, star_span.start_byte, op_end);
+                        const op_slice = self.source[op_start..op_end];
+                        const is_postfix_tight = switch (self.ast.getNode(operand).tag) {
+                            .ident_expr,
+                            .self_val,
+                            .field_access,
+                            .method_call,
+                            .call_expr,
+                            .generic_call,
+                            .index_expr,
+                            .deref_expr,
+                            .try_expr,
+                            .await_expr,
+                            .tuple_lit,
+                            => true,
+                            else => false,
+                        };
+                        opt_fix_text = if (is_postfix_tight)
+                            try std.fmt.allocPrint(self.ast.allocator, "{s}.*", .{op_slice})
+                        else
+                            try std.fmt.allocPrint(self.ast.allocator, "({s}).*", .{op_slice});
+                    }
+                }
+                try self.emitDiagnosticWithFix(
+                    .e0227_retired_prefix_deref,
+                    full_span,
+                    "prefix `*ptr` dereference has been retired (`ADR-22F`); write postfix `ptr.*` instead",
+                    "retired prefix `*` dereference; write `.*`",
+                    if (opt_fix_text != null) full_span else null,
+                    opt_fix_text,
+                    "rewrite as postfix `.*` dereference",
+                );
+                self.cst.finishNode(pref_cst, .{ .has_error = true });
+                self.has_last_expr_block_body = false;
+                return self.ast.appendNodeWithCst(.{
+                    .tag = .deref_expr,
+                    .main_token = op_tok,
+                    .lhs = PackedOperand.initNode(operand),
+                }, pref_cst);
+            }
+
+            self.cst.finishNode(pref_cst, .{ .has_error = has_pref_err });
             self.has_last_expr_block_body = false;
             return self.ast.appendNodeWithCst(.{
                 .tag = .unary_expr,
@@ -6166,9 +8069,43 @@ pub const Parser = struct {
         return self.parsePrimaryExpr(is_struct_lit_allowed);
     }
 
-    /// Parses a `PrimaryExpr` (`DR-03` Section 5.4 Part 8).
+    /// Returns `true` if `@` at `peek(0)` begins an attributed closure expression (`@attr [own] [async] |…|`).
+    fn isAttributedClosureExpr(self: *const Parser) bool {
+        var lookahead: usize = 0;
+        var steps: usize = 0;
+        while (steps < 256 and self.peekKindNth(lookahead) == .at) : (steps += 1) {
+            lookahead += 1;
+            const name_kind = self.peekKindNth(lookahead);
+            if (!isIdentifierKind(name_kind) and !isKeywordKind(name_kind)) return false;
+            lookahead += 1;
+            if (self.peekKindNth(lookahead) == .lbracket) return false;
+            if (self.peekKindNth(lookahead) == .lparen) {
+                var paren_depth: u32 = 1;
+                lookahead += 1;
+                while (steps < 256 and paren_depth > 0) : (steps += 1) {
+                    const inner_kind = self.peekKindNth(lookahead);
+                    if (inner_kind == .eof) return false;
+                    if (inner_kind == .lparen) {
+                        paren_depth += 1;
+                    } else if (inner_kind == .rparen) {
+                        paren_depth -= 1;
+                    }
+                    lookahead += 1;
+                }
+                if (paren_depth != 0) return false;
+            }
+        }
+        if (lookahead == 0) return false;
+        if (self.peekKindNth(lookahead) == .kw_own) lookahead += 1;
+        if (self.peekKindNth(lookahead) == .kw_async) lookahead += 1;
+        const open_kind = self.peekKindNth(lookahead);
+        return open_kind == .pipe or open_kind == .pipepipe;
+    }
+
+    /// Parses a `PrimaryExpr` (`DR-03` Section 5.4 Part 8 & `DR-22` Section 3.3).
     fn parsePrimaryExpr(self: *Parser, is_struct_lit_allowed: bool) anyerror!NodeIndex {
         const saved_stmt_lhs = self.is_in_stmt_lhs;
+        const saved_lhs_place = self.is_in_lhs_place;
         self.is_in_stmt_lhs = false;
         defer self.is_in_stmt_lhs = saved_stmt_lhs;
         self.has_last_expr_block_body = false;
@@ -6193,10 +8130,43 @@ pub const Parser = struct {
                 const leaf_cst = CstNodeIndex.fromInt(@intCast(self.cst.countNodes() - 1));
                 return self.ast.appendNodeWithCst(.{ .tag = .char_lit, .main_token = tok }, leaf_cst);
             },
+            .byte_lit => {
+                const tok = try self.consumeLeaf(.literal_expr, .{});
+                const leaf_cst = CstNodeIndex.fromInt(@intCast(self.cst.countNodes() - 1));
+                return self.ast.appendNodeWithCst(.{ .tag = .byte_lit, .main_token = tok }, leaf_cst);
+            },
+            .byte_string_lit => {
+                const tok = try self.consumeLeaf(.literal_expr, .{});
+                const leaf_cst = CstNodeIndex.fromInt(@intCast(self.cst.countNodes() - 1));
+                return self.ast.appendNodeWithCst(.{ .tag = .byte_string_lit, .main_token = tok }, leaf_cst);
+            },
             .kw_true, .kw_false => {
                 const tok = try self.consumeLeaf(.literal_expr, .{});
                 const leaf_cst = CstNodeIndex.fromInt(@intCast(self.cst.countNodes() - 1));
                 return self.ast.appendNodeWithCst(.{ .tag = .bool_lit, .main_token = tok }, leaf_cst);
+            },
+            .underscore => {
+                if (saved_lhs_place and (!saved_stmt_lhs or isAssignOp(self.peekKindNth(1)))) {
+                    const tok = try self.consumeLeaf(.wildcard_pat, .{});
+                    const leaf_cst = CstNodeIndex.fromInt(@intCast(self.cst.countNodes() - 1));
+                    return self.ast.appendNodeWithCst(.{
+                        .tag = .wildcard_pat,
+                        .main_token = tok,
+                    }, leaf_cst);
+                }
+                const err_tok = self.peekTokenIndexNth(0);
+                try self.emitUnexpectedToken(
+                    err_tok,
+                    "`_` discard placeholder is only valid on the left-hand side of an assignment or in a pattern",
+                    "unexpected `_` in expression",
+                );
+                const hole_cst = try self.startCstNode(.invalid_parse_subtree);
+                _ = try self.consumeLeaf(.invalid_parse_leaf, .{ .has_error = true });
+                self.cst.finishNode(hole_cst, .{ .has_error = true });
+                return self.ast.appendNodeWithCst(.{
+                    .tag = .expr_hole,
+                    .main_token = err_tok,
+                }, hole_cst);
             },
             .kw_self_val => {
                 const tok = try self.consumeLeaf(.self_expr, .{});
@@ -6391,15 +8361,13 @@ pub const Parser = struct {
             },
             .pipe, .pipepipe => return self.parseClosureExpr(is_struct_lit_allowed),
             .kw_if => return self.parseIfExpr(),
-            .kw_match => return self.parseMatchExpr(),
+            .kw_match => return self.parseMatchExpr(null),
             .kw_for => return self.parseForExpr(null, .none),
             .kw_while => return self.parseWhileExpr(null, .none),
             .kw_loop => return self.parseLoopExpr(null, .none),
             .kw_with => return self.parseWithExpr(),
             .at => {
-                if ((isIdentifierKind(self.peekKindNth(1)) or isKeywordKind(self.peekKindNth(1))) and
-                    (self.peekKindNth(2) == .pipe or self.peekKindNth(2) == .pipepipe))
-                {
+                if (self.isAttributedClosureExpr()) {
                     return self.parseClosureExpr(is_struct_lit_allowed);
                 }
                 const intr_cst = try self.startCstNode(.path_pat);
@@ -6433,6 +8401,10 @@ pub const Parser = struct {
                 };
                 defer self.popStates(1);
 
+                const saved_place = self.is_in_lhs_place;
+                self.is_in_lhs_place = false;
+                defer self.is_in_lhs_place = saved_place;
+
                 const comp_tok = try self.consumeLeaf(.token_leaf, .{});
                 var has_inner_block = false;
                 const inner_node = switch (self.peekKind()) {
@@ -6447,7 +8419,7 @@ pub const Parser = struct {
                         break :blk parsed_if;
                     },
                     .kw_match => blk: {
-                        const parsed_match = try self.parseMatchExpr();
+                        const parsed_match = try self.parseMatchExpr(null);
                         has_inner_block = true;
                         break :blk parsed_match;
                     },
@@ -6467,10 +8439,18 @@ pub const Parser = struct {
                 }, comp_cst);
             },
             .kw_unsafe, .kw_async => {
+                if (self.peekKind() == .kw_async and
+                    (self.peekKindNth(1) == .pipe or self.peekKindNth(1) == .pipepipe))
+                {
+                    return self.parseClosureExpr(is_struct_lit_allowed);
+                }
                 const blk_cst = try self.startCstNode(.block);
                 _ = try self.consumeLeaf(.token_leaf, .{});
                 const inner_blk = try self.parseBlock();
                 self.cst.finishNode(blk_cst, .{});
+                if (!inner_blk.isNone() and inner_blk.asInt() < self.ast.ast_to_cst.items.len) {
+                    self.ast.ast_to_cst.items[inner_blk.asInt()] = blk_cst;
+                }
                 self.has_last_expr_block_body = true;
                 return inner_blk;
             },
@@ -6695,15 +8675,17 @@ pub const Parser = struct {
         }, with_cst);
     }
 
-    /// Parses an identifier, type, primitive type, labeled loop, or `yield` primary expression.
+    /// Parses an identifier, type, primitive type, or labeled loop/`match` primary expression.
     fn parsePathOrConstructExpr(self: *Parser, is_struct_lit_allowed: bool) anyerror!NodeIndex {
+        _ = is_struct_lit_allowed;
         try self.flushCarrierTokens();
 
-        // Labeled loop (`label: for …`, `label: while …`, `label: loop …`, `label: comptime for …`):
+        // Labeled loop or `match` (`label: for …`, `label: while …`, `label: loop …`, `label: match …`):
         if (self.isLabeledLoopStart()) {
             const loop_kind = switch (self.peekKindNth(2)) {
                 .kw_while => CstNodeKind.while_stmt,
                 .kw_loop => CstNodeKind.loop_expr,
+                .kw_match => CstNodeKind.match_expr,
                 else => CstNodeKind.for_stmt,
             };
             const outer_cst = try self.startCstNode(loop_kind);
@@ -6713,7 +8695,7 @@ pub const Parser = struct {
                 .ident,
                 .snake_case,
                 &has_label_err,
-                "expected `snake_case` loop label",
+                "expected `snake_case` loop or `match` label",
             );
             _ = try self.consumeLeaf(.token_leaf, .{});
             self.cst.finishNode(label_cst, .{ .has_error = has_label_err });
@@ -6721,26 +8703,9 @@ pub const Parser = struct {
             return switch (loop_kind) {
                 .while_stmt => self.parseWhileExpr(outer_cst, label_tok),
                 .loop_expr => self.parseLoopExpr(outer_cst, label_tok),
+                .match_expr => self.parseMatchExpr(outer_cst),
                 else => self.parseForExpr(outer_cst, label_tok),
             };
-        }
-
-        // Support `yield expr` inside `subscript` blocks (`DR-02` Section 2.2):
-        if (self.peekKind() == .ident and
-            std.mem.eql(u8, self.peekLexemeNth(0), "yield") and
-            !EXPR_SYNC_STOP_SET.contains(self.peekKindNth(1)) and
-            self.peekKindNth(1) != .lparen and
-            self.peekKindNth(1) != .dot)
-        {
-            const yield_cst = try self.startCstNode(.return_stmt);
-            const yield_tok = try self.consumeLeaf(.token_leaf, .{});
-            const yielded_expr = try self.parseExpr(is_struct_lit_allowed);
-            self.cst.finishNode(yield_cst, .{});
-            return self.ast.appendNodeWithCst(.{
-                .tag = .unary_expr,
-                .main_token = yield_tok,
-                .lhs = PackedOperand.initNode(yielded_expr),
-            }, yield_cst);
         }
 
         const first_tok = try self.consumeLeaf(.ident_pat, .{});
@@ -6751,15 +8716,20 @@ pub const Parser = struct {
         }, first_leaf_cst);
     }
 
-    /// Parses `StructLiteral = "{" [ FieldInit { "," FieldInit } [ "," ] ] [ ".." Expr [ "," ] ] "}" ;`.
+    /// Parses `StructLiteral = "{" [ FieldInit { "," FieldInit } [ "," ] ] [ ".." [ ["own"] Expr ] [ "," ] ] "}" ;` (`SE-14`).
     fn parseStructLiteralBody(
         self: *Parser,
         field_nodes: *std.ArrayList(u32),
         has_error: *bool,
     ) anyerror!void {
         const saved_cond_header = self.is_in_cond_header;
+        const saved_lhs_place = self.is_in_lhs_place;
         self.is_in_cond_header = false;
-        defer self.is_in_cond_header = saved_cond_header;
+        self.is_in_lhs_place = false;
+        defer {
+            self.is_in_cond_header = saved_cond_header;
+            self.is_in_lhs_place = saved_lhs_place;
+        }
         const open_brace = try self.consumeLeaf(.struct_lit_start, .{});
         self.pushState(.struct_lit_fields_loop, CstNodeIndex.fromInt(@intCast(self.cst.countNodes() - 1))) catch |err| switch (err) {
             error.ParseDepthExceeded => {
@@ -6778,11 +8748,25 @@ pub const Parser = struct {
             var has_field_err = false;
 
             if (self.peekKind() == .dotdot) {
-                _ = try self.consumeLeaf(.token_leaf, .{});
-                try field_nodes.append(self.ast.allocator, (try self.parseExpr(true)).asInt());
+                const dotdot_tok = try self.consumeLeaf(.token_leaf, .{});
+                if (self.peekKind() != .rbrace and
+                    self.peekKind() != .comma and
+                    self.peekKind() != .eof)
+                {
+                    try field_nodes.append(self.ast.allocator, (try self.parseExpr(true)).asInt());
+                }
                 self.cst.finishNode(field_cst, .{});
                 if (self.peekKind() == .comma) {
                     _ = try self.consumeLeaf(.token_leaf, .{});
+                }
+                if (self.peekKind() != .rbrace and self.peekKind() != .eof) {
+                    has_error.* = true;
+                    try self.emitUnexpectedToken(
+                        dotdot_tok,
+                        "`..` struct spread/default rest must be the final entry in a struct literal",
+                        "move `..` to the end of the struct literal",
+                    );
+                    continue;
                 }
                 break;
             }
@@ -6837,16 +8821,27 @@ pub const Parser = struct {
         );
     }
 
-    /// Parses `ClosureExpr = { Attribute } ("||" | "|" [ClosureParam {"," ClosureParam} [","]] "|") ["->" Type] (Block | Expr)`.
+    /// Parses `ClosureExpr = { Attribute } ["own"] ["async"] ("||" | "|" … "|") ["->" Type] (Block | Expr)` (`SE-19`, `SE-20`).
     fn parseClosureExpr(self: *Parser, is_struct_lit_allowed: bool) anyerror!NodeIndex {
         const saved_cond_header = self.is_in_cond_header;
+        const saved_lhs_place = self.is_in_lhs_place;
         self.is_in_cond_header = false;
-        defer self.is_in_cond_header = saved_cond_header;
+        self.is_in_lhs_place = false;
+        defer {
+            self.is_in_cond_header = saved_cond_header;
+            self.is_in_lhs_place = saved_lhs_place;
+        }
 
         const clos_cst = try self.startCstNode(.closure_expr);
         var has_error = false;
         if (self.peekKind() == .at) {
             try self.parseAttributes(&has_error);
+        }
+        if (self.peekKind() == .kw_own) {
+            _ = try self.consumeLeaf(.token_leaf, .{});
+        }
+        if (self.peekKind() == .kw_async) {
+            _ = try self.consumeLeaf(.token_leaf, .{});
         }
         const open_tok = try self.consumeLeaf(.closure_start, .{});
 
@@ -6864,11 +8859,13 @@ pub const Parser = struct {
                 const param_cst = try self.startCstNode(.closure_param);
                 var has_param_err = false;
 
-                if (self.peekKind() == .kw_mut or
+                if (self.peekKind() == .kw_var or
+                    self.peekKind() == .amp or
+                    self.peekKind() == .kw_mut or
                     self.peekKind() == .kw_own or
-                    self.peekKind() == .kw_ref)
+                    self.isRetiredRefPatAt(0))
                 {
-                    _ = try self.consumeLeaf(.token_leaf, .{});
+                    _ = try self.consumePatternBindingModifier(&has_param_err);
                 }
                 if (self.peekKind() == .underscore) {
                     try param_tokens.append(
@@ -6943,6 +8940,10 @@ pub const Parser = struct {
         };
         defer self.popStates(1);
 
+        const saved_lhs_place = self.is_in_lhs_place;
+        self.is_in_lhs_place = false;
+        defer self.is_in_lhs_place = saved_lhs_place;
+
         var has_error = false;
         const if_tok = try self.consumeLeaf(.if_introducer, .{});
 
@@ -6986,9 +8987,9 @@ pub const Parser = struct {
         }, if_cst);
     }
 
-    /// Parses `MatchExpr = "match" ExprNoStruct "{" { MatchArm } "}" ;`.
-    fn parseMatchExpr(self: *Parser) anyerror!NodeIndex {
-        const match_cst = try self.startCstNode(.match_expr);
+    /// Parses `MatchExpr = [IDENT ":"] "match" ExprNoStruct "{" { MatchArm } "}" ;` (`SE-23`).
+    fn parseMatchExpr(self: *Parser, opt_existing_cst: ?CstNodeIndex) anyerror!NodeIndex {
+        const match_cst = opt_existing_cst orelse try self.startCstNode(.match_expr);
         self.pushState(.match_arms_loop, match_cst) catch |err| switch (err) {
             error.ParseDepthExceeded => {
                 return self.recoverDepthOverflow(match_cst, EXPR_SYNC_STOP_SET, .expr_hole);
@@ -6996,6 +8997,10 @@ pub const Parser = struct {
             else => return err,
         };
         defer self.popStates(1);
+
+        const saved_lhs_place = self.is_in_lhs_place;
+        self.is_in_lhs_place = false;
+        defer self.is_in_lhs_place = saved_lhs_place;
 
         var has_error = false;
         const match_tok = try self.consumeLeaf(.match_introducer, .{});
@@ -7164,7 +9169,11 @@ pub fn reparseIncremental(
         var has_potential_lexer_warn_in_reused = false;
         if (diagnostic_sink != null) {
             for (token_buffer.tokens.items(.kind)) |tok_kind| {
-                if (tok_kind == .string_lit or tok_kind == .char_lit) {
+                if (tok_kind == .string_lit or
+                    tok_kind == .char_lit or
+                    tok_kind == .byte_lit or
+                    tok_kind == .byte_string_lit)
+                {
                     has_potential_lexer_warn_in_reused = true;
                     break;
                 }
@@ -7451,15 +9460,15 @@ test "test_parser_all_four_dr21_domain_showcases_zero_errors" {
         \\use cx.io.{IoError, Stdout};
         \\use cx.mem.Arena;
         \\const DEFAULT_BUF_CAP: usize = 65_536;
-        \\@cli_command(name = "cx-scan", version = "1.0.0")
+        \\@cli_command(name: "cx-scan", version: "1.0.0")
         \\pub struct ScanOptions {
-        \\    @arg(short = 'p', long = "pattern")
+        \\    @arg(short: 'p', long: "pattern")
         \\    pub pattern: str,
-        \\    @arg(short = 'f', long = "file")
+        \\    @arg(short: 'f', long: "file")
         \\    pub file_path: str,
-        \\    @flag(short = 'i', long = "ignore-case")
+        \\    @flag(short: 'i', long: "ignore-case")
         \\    pub ignore_case: bool = false,
-        \\    @arg(short = 'm', long = "max-matches")
+        \\    @arg(short: 'm', long: "max-matches")
         \\    pub max_matches: usize = 1_000,
         \\}
         \\pub struct ScanStats {
@@ -7467,7 +9476,7 @@ test "test_parser_all_four_dr21_domain_showcases_zero_errors" {
         \\    pub matches_found: u64,
         \\    pub bytes_processed: u64,
         \\}
-        \\pub fn scan_file(arena: &mut Arena, opts: &ScanOptions, out: &mut Stdout) -> Result[ScanStats, IoError] {
+        \\pub fn scan_file(arena: &mut Arena, opts: &ScanOptions, out: &mut Stdout) -> ScanStats ! IoError {
         \\    let file = File.open(opts.file_path)?;
         \\    defer file.close();
         \\    var reader = BufReader.with_capacity(arena, file, DEFAULT_BUF_CAP);
@@ -7553,8 +9562,8 @@ test "test_parser_all_four_dr21_domain_showcases_zero_errors" {
         \\        .DatabaseError(_) => Response.status(StatusCode.InternalServerError),
         \\    };
         \\}
-        \\@route(method = "POST", path = "/v1/users")
-        \\pub async fn create_user(req: &mut Request, pool: &PgPool) -> Result[Json[CreateUserResp], ApiError] {
+        \\@route(method: "POST", path: "/v1/users")
+        \\pub async fn create_user(req: &mut Request, pool: &PgPool) -> Json[CreateUserResp] ! ApiError {
         \\    let body_bytes = req.read_body_bounded(MAX_BODY_BYTES).await?;
         \\    let payload = body_bytes
         \\        |> Json.parse[CreateUserReq]()
@@ -7608,18 +9617,18 @@ test "test_parser_all_four_dr21_domain_showcases_zero_errors" {
         \\        pool: PoolAllocator.new[AvlNode[K, V]](cap),
         \\        len: 0,
         \\    };
-        \\    fn rotate_right(mut right_root: OwnPtr[AvlNode[K, V]]) -> OwnPtr[AvlNode[K, V]] {
-        \\        let mut pivot = right_root.left.take() orelse return right_root;
+        \\    fn rotate_right(var right_root: own OwnPtr[AvlNode[K, V]]) -> OwnPtr[AvlNode[K, V]] {
+        \\        var pivot = right_root.left.take() orelse return right_root;
         \\        right_root.left = pivot.right.take();
         \\        Self.update_height(&mut right_root);
         \\        pivot.right = .Some(own right_root);
         \\        Self.update_height(&mut pivot);
         \\        pivot
         \\    }
-        \\    fn rebalance(mut node: OwnPtr[AvlNode[K, V]]) -> OwnPtr[AvlNode[K, V]] {
+        \\    fn rebalance(var node: own OwnPtr[AvlNode[K, V]]) -> OwnPtr[AvlNode[K, V]] {
         \\        let bf = Self.balance_factor(&node);
         \\        if bf > 1 {
-        \\            if node.left is .Some(ref left_child) and Self.balance_factor(left_child) < 0 {
+        \\            if node.left is .Some(&left_child) and Self.balance_factor(left_child) < 0 {
         \\                let left_owned = node.left.take() orelse unreachable;
         \\                node.left = .Some(Self.rotate_left(own left_owned));
         \\            }
@@ -8205,8 +10214,8 @@ test "test_parse_leading_stmt_attribute_before_comptime_constructs" {
         "    @check_block comptime {\n" ++
         "        @compile_assert(helper() == 7, \"ok\");\n" ++
         "    };\n" ++
-        "    *slot = 20;\n" ++
-        "    let local_cb = @local |delta: i32| delta + *slot;\n" ++
+        "    slot.* = 20;\n" ++
+        "    let local_cb = @local |delta: i32| delta + slot.*;\n" ++
         "    return local_cb(helper());\n" ++
         "}\n";
 
@@ -8247,8 +10256,8 @@ test "test_parser_dr21_surface_elevations_contracts_and_diagnostics" {
         \\        let full = items[..];
         \\        let dyn_call = table[ColumnKey.Primary](tail[$-1]);
         \\        let piped = items[0] |> add_scaled(scale: 3, pred: |val| val > 0) orelse return 0;
-        \\        let found = search: for ref item, idx in items {
-        \\            if *item == piped {
+        \\        let found = search: for &item, idx in items {
+        \\            if item.* == piped {
         \\                break :search idx as i32;
         \\            }
         \\            continue :search;
@@ -8355,4 +10364,288 @@ test "test_parser_dr21_surface_elevations_contracts_and_diagnostics" {
         &cst_arena,
         &ast_arena,
     );
+}
+
+test "test_parser_dr22_canonical_showcases_types_elevations_and_autofixes" {
+    var token_buf = TokenBuffer.init(std.testing.allocator);
+    defer token_buf.deinit();
+    var cst_arena = LosslessCstArena.init(std.testing.allocator);
+    defer cst_arena.deinit();
+    var ast_arena = AstArena.init(std.testing.allocator);
+    defer ast_arena.deinit();
+    var sink = DiagnosticSink.init(std.testing.allocator);
+    defer sink.deinit();
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    // [1] Valid `DR-22` canonical constructs (`ADR-22A`–`ADR-22F` & `SE-09`–`SE-23`):
+    const valid_dr22_src =
+        \\mod dr22_showcase;
+        \\pub(pkg) use cx.mem.{Bencher, UiScope};
+        \\
+        \\@derive(Copy, Equatable)
+        \\pub enum MemoryOrder: u8 {
+        \\    Relaxed = 0,
+        \\    Consume = 1,
+        \\    Acquire = 2,
+        \\    Release = 3,
+        \\    AcqRel = 4,
+        \\    SeqCst = 5,
+        \\}
+        \\
+        \\pub(super) bit_field ControlReg: u32 {
+        \\    pub(pkg) is_enabled: bool | 1,
+        \\    mode_bits: u8 | 3,
+        \\}
+        \\
+        \\pub type NumericOrOrd = Copy + Send | Ord;
+        \\
+        \\pub struct Matrix[T: Copy | Send + Sync = f32, const N: usize = 4] {
+        \\    pub(pkg) cells: [T; N],
+        \\    pub(super) raw_ptr: *mut u8?,
+        \\    pub slice_opt: &[u8]?,
+        \\    pub borrowed_opt: &MemoryOrder?,
+        \\}
+        \\
+        \\extern "C" fn printf(fmt: *u8, ...) -> i32;
+        \\
+        \\impl[T: Copy, const N: usize] Matrix[T, N] {
+        \\    @inline @no_alloc @no_panic
+        \\    pub fn swap_ptrs(left: *mut T, right: *mut T, /, *, var count: usize = 1, dst: &out T) {
+        \\        (left.*, right.*, _) = (right.*, left.*, count);
+        \\        let raw_addr = &raw left.*;
+        \\        let raw_mut_addr = &raw mut right.*;
+        \\        unsafe {
+        \\            dst.* = left.*;
+        \\        }
+        \\        _ = (raw_addr, raw_mut_addr);
+        \\    }
+        \\
+        \\    pub subscript(row: usize, col: usize) -> &T {
+        \\        let {
+        \\            yield &self.cells[row + col];
+        \\        }
+        \\        inout {
+        \\            yield &mut self.cells[row + col];
+        \\        }
+        \\    }
+        \\}
+        \\
+        \\pub fn check_contextual_out_raw(
+        \\    out: &mut ControlReg,
+        \\    raw: &[u8],
+        \\    mod_buf: &out_mod.Buffer,
+        \\    ui_children: @builder |&mut UiScope|,
+        \\    escaping_cb: own |i32| -> i32 ! MemoryOrder,
+        \\) -> i32 ! MemoryOrder {
+        \\    let borrow_out = &out;
+        \\    let borrow_field = &out.is_enabled;
+        \\    let borrow_raw_elem = &raw[0];
+        \\    let header_byte = b'\n';
+        \\    let magic_bytes = b"CX22";
+        \\    let inverted = ~0x0f_u32;
+        \\    let merged = Matrix { cells: [0.0_f32; 4], .. };
+        \\    let moved_spread = Matrix { ..own merged };
+        \\    let Matrix { var cells, &slice_opt, raw_ptr: renamed_ptr, .. } = moved_spread;
+        \\    _ = (borrow_out, borrow_field, borrow_raw_elem, mod_buf, ui_children, escaping_cb);
+        \\    _ = (header_byte, magic_bytes, inverted, cells, slice_opt, renamed_ptr);
+        \\    let final_code = fsm: match MemoryOrder.Relaxed {
+        \\        .Relaxed => continue :fsm .Acquire,
+        \\        .Acquire => 42_i32,
+        \\        _ => 0_i32,
+        \\    };
+        \\    .Ok(final_code)
+        \\}
+        \\
+        \\test "matrix multi-index and async closure" {
+        \\    let mat = Matrix { cells: [1.0_f32; 4], raw_ptr: .None, slice_opt: .None, borrowed_opt: .None };
+        \\    let elem = &mat[0, 1];
+        \\    let worker = own async |step: i32| step + 1;
+        \\    _ = (elem, worker);
+        \\}
+        \\
+        \\bench "matrix swap throughput" (bencher: &mut Bencher) {
+        \\    _ = bencher;
+        \\}
+    ;
+
+    _ = try parseSource(
+        valid_dr22_src,
+        FileId.fromInt(0),
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+        &sink,
+        &interner,
+    );
+    try std.testing.expectEqual(@as(usize, 0), sink.countDiagnostics());
+    try std.testing.expect(!cst_arena.has_parse_errors);
+    try verifyCstAndAstInvariants(
+        std.testing.allocator,
+        valid_dr22_src,
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+    );
+
+    // Verify `[P0-B]` `unsafe { … }` CST origin carries `.kw_unsafe` token leaf:
+    var has_unsafe_origin = false;
+    var has_result_type = false;
+    var has_subscript_decl = false;
+    var has_yield_stmt = false;
+    var has_test_decl = false;
+    var has_bench_decl = false;
+    var has_byte_lit = false;
+    var has_byte_string_lit = false;
+    for (0..ast_arena.countNodes()) |node_i| {
+        const node_id = NodeIndex.fromInt(@intCast(node_i));
+        const node = ast_arena.getNode(node_id);
+        switch (node.tag) {
+            .result_type => has_result_type = true,
+            .subscript_decl => has_subscript_decl = true,
+            .yield_stmt => has_yield_stmt = true,
+            .test_decl => has_test_decl = true,
+            .bench_decl => has_bench_decl = true,
+            .byte_lit => has_byte_lit = true,
+            .byte_string_lit => has_byte_string_lit = true,
+            .block => {
+                const origin_cst = ast_arena.getCstOrigin(node_id);
+                if (!origin_cst.isNone()) {
+                    const cst_rec = cst_arena.getNode(origin_cst);
+                    if (!cst_rec.token.isNone() and
+                        token_buf.getToken(cst_rec.token).kind == .kw_unsafe)
+                    {
+                        has_unsafe_origin = true;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(has_unsafe_origin);
+    try std.testing.expect(has_result_type);
+    try std.testing.expect(has_subscript_decl);
+    try std.testing.expect(has_yield_stmt);
+    try std.testing.expect(has_test_decl);
+    try std.testing.expect(has_bench_decl);
+    try std.testing.expect(has_byte_lit);
+    try std.testing.expect(has_byte_string_lit);
+
+    // Verify `is_including_tests = false` omits `.test_decl` / `.bench_decl` from AST root while keeping CST lossless:
+    cst_arena.nodes.shrinkRetainingCapacity(0);
+    cst_arena.parse_stack.clearRetainingCapacity();
+    cst_arena.has_parse_errors = false;
+    ast_arena.nodes.shrinkRetainingCapacity(0);
+    ast_arena.extra_data.clearRetainingCapacity();
+    ast_arena.ast_to_cst.clearRetainingCapacity();
+    var prod_parser = Parser.initWithOptions(
+        valid_dr22_src,
+        FileId.fromInt(0),
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+        &sink,
+        &interner,
+        .{ .is_including_tests = false },
+    );
+    const prod_root = try prod_parser.parse();
+    const prod_root_node = ast_arena.getNode(prod_root);
+    const prod_items = ast_arena.extra_data.items[prod_root_node.lhs.payload .. prod_root_node.lhs.payload + prod_root_node.rhs.payload];
+    for (prod_items) |item_raw_id| {
+        const tag_val = ast_arena.getNode(NodeIndex.fromInt(item_raw_id)).tag;
+        try std.testing.expect(tag_val != .test_decl and tag_val != .bench_decl);
+    }
+    try verifyCstAndAstInvariants(
+        std.testing.allocator,
+        valid_dr22_src,
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+    );
+
+    // [2] Verify all 10 `DR-22` retired-syntax diagnostics (`E0219`–`E0228`) + autofixes:
+    const retired_src =
+        \\@noalloc
+        \\@cfg(os = "linux")
+        \\struct LegacyStruct {
+        \\    first: *const u8;
+        \\    second: i32 ! u32 ! bool,
+        \\}
+        \\fn legacy_fn(mut self, /, *, a: inout i32, *) {
+        \\    let mut flag = !true || false;
+        \\    let val = *a;
+        \\    _ = (flag, val);
+        \\}
+    ;
+    sink.diagnostics.clearRetainingCapacity();
+    sink.error_count = 0;
+    sink.warning_count = 0;
+    _ = try parseSource(
+        retired_src,
+        FileId.fromInt(1),
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+        &sink,
+        &interner,
+    );
+    try verifyCstAndAstInvariants(
+        std.testing.allocator,
+        retired_src,
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+    );
+
+    var seen_codes: [10]bool = @splat(false);
+    for (sink.asSlice()) |diag| {
+        switch (diag.code) {
+            .e0219_retired_logical_or => seen_codes[0] = true,
+            .e0220_retired_bang_prefix => seen_codes[1] = true,
+            .e0221_retired_mutability_or_param_mode => seen_codes[2] = true,
+            .e0222_chained_result_type => seen_codes[3] = true,
+            .e0223_retired_attribute_eq => seen_codes[4] = true,
+            .e0224_retired_semicolon_member_sep => seen_codes[5] = true,
+            .e0225_retired_noalloc_attribute => seen_codes[6] = true,
+            .e0226_retired_const_raw_ptr => seen_codes[7] = true,
+            .e0227_retired_prefix_deref => seen_codes[8] = true,
+            .e0228_invalid_param_zone_separator => seen_codes[9] = true,
+            else => {},
+        }
+    }
+    for (seen_codes) |was_seen| {
+        try std.testing.expect(was_seen);
+    }
+
+    // [3] Verify `[P1 Trap B]` `reparseIncremental` falls back on invalid `.byte_lit` (`E0117`) to preserve lexer diagnostics:
+    const byte_src_ok = "fn check_byte() -> u8 { b'a' }\n";
+    const byte_src_bad = "fn check_byte() -> u8 { b'\\u{100}' }\n";
+    sink.diagnostics.clearRetainingCapacity();
+    sink.error_count = 0;
+    sink.warning_count = 0;
+    _ = try parseSource(
+        byte_src_ok,
+        FileId.fromInt(2),
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+        &sink,
+        &interner,
+    );
+    try std.testing.expectEqual(@as(usize, 0), sink.countDiagnostics());
+    _ = try reparseIncremental(
+        byte_src_bad,
+        FileId.fromInt(2),
+        .{ .start_byte = 26, .old_end_byte = 27, .new_end_byte = 33 },
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+        &sink,
+        &interner,
+    );
+    var has_e0117 = false;
+    for (sink.asSlice()) |diag| {
+        if (diag.code == .e0117_non_ascii_byte_literal) has_e0117 = true;
+    }
+    try std.testing.expect(has_e0117);
 }

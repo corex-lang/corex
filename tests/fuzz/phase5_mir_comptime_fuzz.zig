@@ -1,17 +1,16 @@
-//! Phase 5 & Phase 7.5 Deterministic HIR, MIR, Comptime VM, Optimizer & `DR-21` Fuzzing Suite (`tests/fuzz/phase5_mir_comptime_fuzz.zig`)
+//! Phase 5, Phase 7.5 & Phase 7.6 Deterministic HIR, MIR, Comptime VM, Optimizer & `DR-22` Fuzzing Suite (`tests/fuzz/phase5_mir_comptime_fuzz.zig`)
 //!
-//! Exercises three complementary verification invariants across the Phase 5 & Phase 7.5 middle-end:
-//! 1. **Fault Tolerance & Verifier Soundness (`>= 400` iterations):** Combines Phase 5 & `DR-21`
-//!    `.cx` constructs (`|>`, `?`/`catch`, `let … else`, `is`, `:=`, `orelse`, `$` indexing/slicing,
+//! Exercises three complementary verification invariants across the Phase 5–7.6 middle-end:
+//! 1. **Fault Tolerance & Verifier Soundness (`>= 400` iterations):** Combines Phase 5, `DR-21`, & `DR-22`
+//!    `.cx` constructs (`|>`, `T!E` `?`/`catch`, `let … else`, `is`, `:=`, `orelse`, `$` indexing/slicing,
 //!    indexed `for item, idx in`, labeled `T?` value-`break` loops, `= expr;`, named/default args,
-//!    `with context`, `#soa`, `bit_field`, `@derive`, `comptime if`/`for`, `defer`/`errdefer`, and
-//!    `subscript`/`yield`) with malformed snippets and byte perturbations, asserting zero leaks and
-//!    `V1`–`V6` `MirVerifier` acceptance whenever `!diagnostics.hasErrors()`.
+//!    `with context`, `#soa`, `bit_field`, `@derive(From)`, `comptime if`/`for`, `defer`/`errdefer`,
+//!    `&out`, `own T`, `ptr.*`, `&raw`, `..base`, `(a, b) = (b, a)`, `fsm: match`, and `subscript`/`yield`)
+//!    with malformed snippets and byte perturbations, asserting zero leaks and `V1`–`V6` `MirVerifier`
+//!    acceptance whenever `!diagnostics.hasErrors()`.
 //! 2. **Differential `--dev` vs `--release` `MirVm` Parity (`>= 200` programs x 2 target layouts):**
-//!    Generates structure-aware, well-typed multi-function `.cx` programs exercising `DR-21` `is`,
-//!    `:=`, `orelse` & `orelse return`, `$` slice indexing/slicing, indexed `for`, labeled `search:`
-//!    value-`break` + `orelse`, `= expr;`, named/dependent-default call args, and `with context`,
-//!    evaluating `entry_main(seed)` on `--dev` vs `--release` across `NATIVE_64` and `WASM32`.
+//!    Generates structure-aware, well-typed multi-function `.cx` programs exercising `DR-21` & `DR-22`
+//!    features and evaluates `entry_main(seed)` on `--dev` vs `--release` across `NATIVE_64` and `WASM32`.
 //! 3. **Incremental `CompilerDb` Stages 10–13 Parity (`>= 120` revisions):** Mutates a multi-item `.cx`
 //!    module in a persistent `CompilerDb` vs a fresh scratch `CompilerDb`, asserting 100% fingerprint
 //!    and value parity across `lowerDefHir`, `buildDefMir`, `evalComptimeDef`, and `optimizeMirModule`.
@@ -58,21 +57,21 @@ const DIFFERENTIAL_DEV_RELEASE_ITERATIONS: usize = 210;
 /// Number of incremental `CompilerDb` revision steps verified in `test_fuzz_phase5_incremental_compiler_db_stages_10_to_13_parity`.
 const INCREMENTAL_DB_ITERATIONS: usize = 128;
 
-/// Valid Phase 5 & Phase 7.5 (`DR-21`) seed items covering all `AST -> HIR -> MIR` desugarings.
+/// Valid Phase 5, Phase 7.5 (`DR-21`), & Phase 7.6 (`DR-22`) seed items covering all `AST -> HIR -> MIR` desugarings.
 const PHASE5_SEED_ITEMS = [_][]const u8{
     "pub const ENABLE_FAST_PATH: bool = true;\n",
     "pub struct IoFault { pub code: i32 }\n",
-    "pub enum PipelineErr { @from Io(IoFault), BadInput, }\n",
+    "@derive(From)\npub enum PipelineErr { Io(IoFault), BadInput, }\n",
     "@derive(Eq, Clone)\npub struct RowPoint { pub x: i32, pub y: i32 }\n",
-    "pub bit_field RegControl : u16 { pub is_active: bool | 1, pub mode_bits: u16 | 15 }\n",
+    "pub bit_field RegControl: u16 { pub is_active: bool | 1, pub mode_bits: u16 | 15 }\n",
     "pub fn scale_pipe(val: i32, factor: i32) -> i32 = val * factor + 1;\n",
     "pub fn generic_mix(lhs: Number, rhs: Number) -> Number = lhs + rhs;\n",
-    "pub fn fetch_checked(is_ok: bool) -> Result[i32, IoFault] {\n" ++
+    "pub fn fetch_checked(is_ok: bool) -> i32!IoFault {\n" ++
         "    if is_ok { return .Ok(12); }\n" ++
         "    return .Err(IoFault { code: 7 });\n" ++
         "}\n",
     "pub fn affine_default(lhs: i32, rhs: i32 = lhs + 3, scale: i32 = 2) -> i32 = lhs * scale + rhs;\n",
-    "pub fn lift_pipeline(is_ok: bool, seed: i32) -> Result[i32, PipelineErr] {\n" ++
+    "pub fn lift_pipeline(is_ok: bool, seed: i32) -> i32!PipelineErr {\n" ++
         "    var err_trace: i32 = 0;\n" ++
         "    errdefer { err_trace += 1; }\n" ++
         "    let base = fetch_checked(is_ok)?;\n" ++
@@ -103,8 +102,12 @@ const PHASE5_SEED_ITEMS = [_][]const u8{
         "    defer { unrolled += 0; }\n" ++
         "    return pts[0].x + pts[1].y + (reg.mode_bits as i32) + bonus + unrolled;\n" ++
         "}\n",
-    "pub subscript lane_at(lanes: &mut [i32; 2], idx: usize) -> i32 {\n" ++
-        "    yield lanes[idx];\n" ++
+    "pub struct LanePair {\n    pub lanes: [i32; 2],\n}\n" ++
+        "impl LanePair {\n" ++
+        "    pub subscript(idx: usize, /) -> i32 {\n" ++
+        "        let { yield self.lanes[idx]; }\n" ++
+        "        inout { yield &mut self.lanes[idx]; }\n" ++
+        "    }\n" ++
         "}\n",
     "pub fn dr21_flow_and_search(opt_in: i32?, seed_in: i32) -> i32 {\n" ++
         "    let base_val: i32 = opt_in orelse return 5;\n" ++
@@ -132,6 +135,27 @@ const PHASE5_SEED_ITEMS = [_][]const u8{
         "    return with context.cancel_token = local_tok {\n" ++
         "        (context.cancel_token._handle as i64) + (context.rng_seed as i64)\n" ++
         "    };\n" ++
+        "}\n",
+    "pub fn consume_fault_into(fault_in: own IoFault, out_code: &out i32, /) {\n" ++
+        "    out_code.* = fault_in.code + (b'A' as i32);\n" ++
+        "}\n" ++
+        "pub fn dr22_mvs_fsm_and_swap(flag: bool) -> i32 {\n" ++
+        "    enum FsmStep: u8 { Start = 0, Advance = 1, Done = 2 }\n" ++
+        "    let fault = IoFault { code: 6_i32 };\n" ++
+        "    var out_v: i32;\n" ++
+        "    consume_fault_into(own fault, &out out_v);\n" ++
+        "    let pt_base = RowPoint { x: 2, y: 8 };\n" ++
+        "    let pt_next = RowPoint { x: out_v, ..pt_base };\n" ++
+        "    var swap_a: i32 = pt_next.x;\n" ++
+        "    var swap_b: i32 = pt_next.y + (flag as i32) + (b\"ok\".len() as i32);\n" ++
+        "    (swap_a, swap_b) = (swap_b, swap_a);\n" ++
+        "    let raw_p: *i32 = &raw swap_a;\n" ++
+        "    let fsm_bonus: i32 = fsm: match FsmStep.Start {\n" ++
+        "        .Start => continue :fsm .Advance,\n" ++
+        "        .Advance => continue :fsm .Done,\n" ++
+        "        .Done => (FsmStep.Done as u8 as i32),\n" ++
+        "    };\n" ++
+        "    return unsafe { raw_p.* } + swap_b + fsm_bonus;\n" ++
         "}\n",
 };
 
@@ -228,7 +252,9 @@ fn generateWellTypedDifferentialProgram(
         allocator,
         "pub struct AccPair {\n    pub left: i64,\n    pub right: i64,\n}\n" ++
             "pub enum StepMode {\n    Idle,\n    Shift(i64),\n    Scale(i64),\n}\n" ++
-            "pub fn bump_defer_log(slot: &mut i64, delta: i64) {\n    *slot = *slot + delta;\n}\n" ++
+            "@derive(Copy, Eq)\npub enum FsmPhase: u8 {\n    Init = 0,\n    Next = 1,\n    Done = 2,\n}\n" ++
+            "pub fn bump_defer_log(slot: &mut i64, delta: i64) {\n    slot.* = slot.* + delta;\n}\n" ++
+            "pub fn write_out_slot(dst: &out i64, val_in: i64, /) {\n    dst.* = val_in + (b'B' as i64);\n}\n" ++
             "pub fn generic_combine(lhs: Number, rhs: Number) -> Number = lhs + rhs;\n" ++
             "pub fn opt_probe(raw_seed: i64, thresh: i64) -> i64? {\n" ++
             "    if raw_seed > thresh { return .Some((raw_seed & 31) + 4); }\n" ++
@@ -285,14 +311,14 @@ fn generateWellTypedDifferentialProgram(
     else
         "    return pair.left + pair.right + tup.0 - tup.1 + matched + mode_val + audit_acc + (small_sum as i64) + dr21_total;\n}\n";
 
-    var main_buf: [3072]u8 = undefined;
+    var main_buf: [4096]u8 = undefined;
     try src_buf.appendSlice(
         allocator,
         try std.fmt.bufPrint(
             &main_buf,
             "pub fn entry_main(seed: i64) -> i64 {{\n" ++
-                "    let safe_seed: i64 = (seed & 31) + 1;\n" ++
-                "    let two_i64: i64 = 2;\n" ++
+                "    let safe_seed: i64 = (seed & 31) + 1_i64;\n" ++
+                "    let two_i64: i64 = 2_i64;\n" ++
                 "    var pair = AccPair {{ left: safe_seed, right: {d} }};\n" ++
                 "    let tup: (i64, i64) = (safe_seed + 2, 4);\n" ++
                 "    if (safe_seed & 1) == 0 {{\n" ++
@@ -308,6 +334,17 @@ fn generateWellTypedDifferentialProgram(
                 "    for step_num in 0..{d} {{\n" ++
                 "        pair.right = pair.right + (step_num as i64);\n" ++
                 "    }}\n" ++
+                "    let spread_pair = AccPair {{ left: pair.left + 1, ..pair }};\n" ++
+                "    (pair.left, pair.right) = (spread_pair.right, spread_pair.left);\n" ++
+                "    var out_slot_val: i64;\n" ++
+                "    write_out_slot(&out out_slot_val, safe_seed);\n" ++
+                "    let raw_left_ptr: *i64 = &raw pair.left;\n" ++
+                "    let raw_read_val: i64 = unsafe {{ raw_left_ptr.* }};\n" ++
+                "    let fsm_term: i64 = fsm: match FsmPhase.Init {{\n" ++
+                "        .Init => continue :fsm .Next,\n" ++
+                "        .Next => continue :fsm .Done,\n" ++
+                "        .Done => (FsmPhase.Done as u8 as i64) + ((safe_seed > 2) as i64),\n" ++
+                "    }};\n" ++
                 "    let matched: i64 = match safe_seed {{\n" ++
                 "        0..=4 => pair.left + 3,\n" ++
                 "        5 | 6 | 7 => pair.right + 5,\n" ++
@@ -347,7 +384,8 @@ fn generateWellTypedDifferentialProgram(
                 "    let ctx_val: i64 = with context.cancel_token = tok_override {{\n" ++
                 "        (context.cancel_token._handle as i64) + (context.rng_seed as i64)\n" ++
                 "    }};\n" ++
-                "    let dr21_total: i64 = is_val + walrus_val + orelse_val + indexed_sum + search_val + named_val + ctx_val;\n" ++
+                "    let dr21_total: i64 = is_val + walrus_val + orelse_val + indexed_sum + search_val + named_val + ctx_val +\n" ++
+                "        out_slot_val + raw_read_val + fsm_term + (b\"ok\".len() as i64);\n" ++
                 "{s}",
             .{
                 const_bias,
@@ -572,6 +610,14 @@ test "test_fuzz_phase5_differential_dev_vs_release_mir_vm_parity" {
                 .{},
             );
             defer bundle.deinit();
+            if (bundle.hir_bundle.diagnostics.hasErrors()) {
+                for (bundle.hir_bundle.diagnostics.diagnostics.items) |diag_item| {
+                    std.debug.print(
+                        "Unexpected Phase 5 diff diag [{s}]: {s}\n",
+                        .{ diag_item.code.asCodeStr(), diag_item.message },
+                    );
+                }
+            }
             try std.testing.expect(!bundle.hir_bundle.diagnostics.hasErrors());
 
             for (bundle.mir_bundle.bodies.items) |*raw_body| {

@@ -1,6 +1,6 @@
 //! Unit Tests for Lossless CST, TokenBuffer & AST Arenas (`tests/unit/syntax_arenas_test.zig`)
 //!
-//! Verifies the 117-variant `TokenKind` table, SoA `TokenBuffer` and `TriviaPiece` storage,
+//! Verifies the 120-variant `TokenKind` table, SoA `TokenBuffer` and `TriviaPiece` storage,
 //! `LosslessCstArena` pre-order `subtree_size` skipping and source reconstruction, and `AstArena`.
 //!
 //! Enforces zero memory leaks and tests resource caps (`MAX_PARSE_DEPTH`) and semantic hole nodes.
@@ -25,18 +25,23 @@ const AstStore = corex.AstStore;
 // ----------------- TokenBuffer & Trivia Tests -----------------
 
 test "test_token_kind_taxonomy_and_soa_token_buffer" {
-    // [1] Verify 117-variant `TokenKind` taxonomy, `DR-21` ordinals, and canonical aliases:
-    try std.testing.expectEqual(@as(usize, 117), @typeInfo(TokenKind).@"enum".field_names.len);
+    // [1] Verify 120-variant `TokenKind` taxonomy, `DR-22` ordinals, and canonical aliases:
+    try std.testing.expectEqual(@as(usize, 120), @typeInfo(TokenKind).@"enum".field_names.len);
     try std.testing.expectEqual(TokenKind.lbrace, TokenKind.l_brace);
     try std.testing.expectEqual(TokenKind.rbrace, TokenKind.r_brace);
     try std.testing.expectEqual(TokenKind.lparen, TokenKind.l_paren);
     try std.testing.expectEqual(TokenKind.rparen, TokenKind.r_paren);
-    try std.testing.expectEqual(@as(u8, 38), @intFromEnum(TokenKind.kw_orelse));
-    try std.testing.expectEqual(@as(u8, 39), @intFromEnum(TokenKind.kw_with));
-    try std.testing.expectEqual(@as(u8, 40), @intFromEnum(TokenKind.kw_context));
-    try std.testing.expectEqual(@as(u8, 41), @intFromEnum(TokenKind.kw_unreachable));
-    try std.testing.expectEqual(@as(u8, 66), @intFromEnum(TokenKind.colon_eq));
-    try std.testing.expectEqual(@as(u8, 75), @intFromEnum(TokenKind.dollar));
+    try std.testing.expectEqual(@as(u8, 16), @backingInt(TokenKind.kw_subscript));
+    try std.testing.expectEqual(@as(u8, 27), @backingInt(TokenKind.kw_with));
+    try std.testing.expectEqual(@as(u8, 28), @backingInt(TokenKind.kw_context));
+    try std.testing.expectEqual(@as(u8, 40), @backingInt(TokenKind.kw_orelse));
+    try std.testing.expectEqual(@as(u8, 41), @backingInt(TokenKind.kw_unreachable));
+    try std.testing.expectEqual(@as(u8, 42), @backingInt(TokenKind.kw_yield));
+    try std.testing.expectEqual(@as(u8, 58), @backingInt(TokenKind.byte_lit));
+    try std.testing.expectEqual(@as(u8, 59), @backingInt(TokenKind.byte_string_lit));
+    try std.testing.expectEqual(@as(u8, 72), @backingInt(TokenKind.dotdotdot));
+    try std.testing.expectEqual(@as(u8, 80), @backingInt(TokenKind.colon_eq));
+    try std.testing.expectEqual(@as(u8, 81), @backingInt(TokenKind.dollar));
     try std.testing.expectEqual(TokenKind.invalid_token, TokenKind.invalid);
 
     var token_buffer = TokenBuffer.init(std.testing.allocator);

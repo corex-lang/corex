@@ -38,9 +38,7 @@ pub const U64_MAX: u64 = 18_446_744_073_709_551_615;
 
 // ------------------------------------- PUBLIC API --------------------------------------
 /// Returns the smaller of `left_val` and `right_val` (`i32`).
-@inline
-@no_alloc
-@no_panic
+@inline @no_alloc @no_panic
 pub fn min_i32(left_val: i32, right_val: i32) -> i32 {
     if left_val < right_val {
         return left_val;
@@ -49,9 +47,7 @@ pub fn min_i32(left_val: i32, right_val: i32) -> i32 {
 }
 
 /// Returns the larger of `left_val` and `right_val` (`i32`).
-@inline
-@no_alloc
-@no_panic
+@inline @no_alloc @no_panic
 pub fn max_i32(left_val: i32, right_val: i32) -> i32 {
     if left_val > right_val {
         return left_val;
@@ -60,9 +56,7 @@ pub fn max_i32(left_val: i32, right_val: i32) -> i32 {
 }
 
 /// Clamps `input_val` into the inclusive range `[lower_bound, upper_bound]` (`i32`).
-@inline
-@no_alloc
-@no_panic
+@inline @no_alloc @no_panic
 pub fn clamp_i32(input_val: i32, lower_bound: i32, upper_bound: i32) -> i32 {
     if input_val < lower_bound {
         return lower_bound;
@@ -73,9 +67,7 @@ pub fn clamp_i32(input_val: i32, lower_bound: i32, upper_bound: i32) -> i32 {
 }
 
 /// Returns the smaller of `left_val` and `right_val` (`i64`).
-@inline
-@no_alloc
-@no_panic
+@inline @no_alloc @no_panic
 pub fn min_i64(left_val: i64, right_val: i64) -> i64 {
     if left_val < right_val {
         return left_val;
@@ -84,9 +76,7 @@ pub fn min_i64(left_val: i64, right_val: i64) -> i64 {
 }
 
 /// Returns the larger of `left_val` and `right_val` (`i64`).
-@inline
-@no_alloc
-@no_panic
+@inline @no_alloc @no_panic
 pub fn max_i64(left_val: i64, right_val: i64) -> i64 {
     if left_val > right_val {
         return left_val;
@@ -95,9 +85,7 @@ pub fn max_i64(left_val: i64, right_val: i64) -> i64 {
 }
 
 /// Clamps `input_val` into the inclusive range `[lower_bound, upper_bound]` (`i64`).
-@inline
-@no_alloc
-@no_panic
+@inline @no_alloc @no_panic
 pub fn clamp_i64(input_val: i64, lower_bound: i64, upper_bound: i64) -> i64 {
     if input_val < lower_bound {
         return lower_bound;
@@ -108,9 +96,7 @@ pub fn clamp_i64(input_val: i64, lower_bound: i64, upper_bound: i64) -> i64 {
 }
 
 /// Returns the smaller of `left_val` and `right_val` (`usize`).
-@inline
-@no_alloc
-@no_panic
+@inline @no_alloc @no_panic
 pub fn min_usize(left_val: usize, right_val: usize) -> usize {
     if left_val < right_val {
         return left_val;
@@ -119,9 +105,7 @@ pub fn min_usize(left_val: usize, right_val: usize) -> usize {
 }
 
 /// Returns the larger of `left_val` and `right_val` (`usize`).
-@inline
-@no_alloc
-@no_panic
+@inline @no_alloc @no_panic
 pub fn max_usize(left_val: usize, right_val: usize) -> usize {
     if left_val > right_val {
         return left_val;
@@ -130,9 +114,7 @@ pub fn max_usize(left_val: usize, right_val: usize) -> usize {
 }
 
 /// Clamps `input_val` into the inclusive range `[lower_bound, upper_bound]` (`usize`).
-@inline
-@no_alloc
-@no_panic
+@inline @no_alloc @no_panic
 pub fn clamp_usize(input_val: usize, lower_bound: usize, upper_bound: usize) -> usize {
     if input_val < lower_bound {
         return lower_bound;
@@ -143,9 +125,7 @@ pub fn clamp_usize(input_val: usize, lower_bound: usize, upper_bound: usize) -> 
 }
 
 /// Computes the exact unsigned distance `|left_val - right_val|` (`u32`) without overflow.
-@inline
-@no_alloc
-@no_panic
+@inline @no_alloc @no_panic
 pub fn abs_diff_u32(left_val: u32, right_val: u32) -> u32 {
     if left_val >= right_val {
         return left_val -% right_val;
@@ -154,9 +134,7 @@ pub fn abs_diff_u32(left_val: u32, right_val: u32) -> u32 {
 }
 
 /// Computes the exact unsigned distance `|left_val - right_val|` (`u64`) without overflow.
-@inline
-@no_alloc
-@no_panic
+@inline @no_alloc @no_panic
 pub fn abs_diff_u64(left_val: u64, right_val: u64) -> u64 {
     if left_val >= right_val {
         return left_val -% right_val;

@@ -160,8 +160,8 @@ fn buildOver64SimultaneousLoansSource(allocator: std.mem.Allocator, has_conflict
         "pub fn borrow_cell(cell: &[i64; 1]) -> &[i64; 1] {\n" ++
             "    return cell;\n" ++
             "}\n" ++
-            "pub fn mutate_cell(mut cell: inout [i64; 1]) {\n" ++
-            "    cell[0] = 777;\n" ++
+            "pub fn mutate_cell(cell: &mut [i64; 1]) {\n" ++
+            "    cell.*[0] = 777;\n" ++
             "}\n" ++
             "pub fn stress_seventy_loans() -> i64 {\n",
     );
@@ -182,7 +182,7 @@ fn buildOver64SimultaneousLoansSource(allocator: std.mem.Allocator, has_conflict
     }
 
     if (has_conflict) {
-        try src_buf.appendSlice(allocator, "    mutate_cell(cell_68);\n");
+        try src_buf.appendSlice(allocator, "    mutate_cell(&mut cell_68);\n");
     }
 
     try src_buf.appendSlice(allocator, "    var total: i64 = 0;\n");
@@ -197,7 +197,7 @@ fn buildOver64SimultaneousLoansSource(allocator: std.mem.Allocator, has_conflict
     if (!has_conflict) {
         try src_buf.appendSlice(
             allocator,
-            "    mutate_cell(cell_68);\n" ++
+            "    mutate_cell(&mut cell_68);\n" ++
                 "    total = total +% cell_68[0];\n",
         );
     }
@@ -363,7 +363,7 @@ test "test_phase6_ownership_tiers_trivial_arena_drop_secret_context_and_wire_e03
         \\    let _ = seed_val;
         \\    let _ = decoded;
         \\    let _ = viewed;
-        \\    return encoded.len;
+        \\    return encoded.len();
         \\}
     ;
     var ok_bundle = try verifyCleanSast(allocator, 101, tier_src, .{});
@@ -612,7 +612,7 @@ test "test_phase6_ownership_tiers_trivial_arena_drop_secret_context_and_wire_e03
         \\    let _ = ptr_bytes;
         \\    let _ = sec_bytes;
         \\    let _ = bad_bool;
-        \\    return pad_bytes.len;
+        \\    return pad_bytes.len();
         \\}
     ;
     var bad_wire_bundle = try corex.lowerAndVerifySourceMirSast(
@@ -660,9 +660,9 @@ test "test_phase6_typestate_uaf_e0301_partial_move_reinit_e0302_and_uninit_e0303
         \\    var raw_ptr: *i64 = 0 as *i64;
         \\    {
         \\        let inner_slot: i64 = 99;
-        \\        raw_ptr = (&inner_slot) as *i64;
+        \\        raw_ptr = &raw inner_slot;
         \\    }
-        \\    return unsafe { *raw_ptr };
+        \\    return unsafe { raw_ptr.* };
         \\}
     ;
     try expectSastDiagnostic(allocator, 202, uaf_dangling_ptr_src, .{}, .e0301_use_after_free);
@@ -676,13 +676,13 @@ test "test_phase6_typestate_uaf_e0301_partial_move_reinit_e0302_and_uninit_e0303
         \\    pub left: Vec[i64],
         \\    pub right: Vec[i64],
         \\}
-        \\pub fn consume_vec(own buf: sink Vec[i64]) {}
+        \\pub fn consume_vec(buf: own Vec[i64]) {}
         \\pub fn read_sibling_after_partial_move() -> usize {
         \\    var pair = DualBuffers {
         \\        left: Vec { len: 4 },
         \\        right: Vec { len: 9 },
         \\    };
-        \\    consume_vec(pair.left);
+        \\    consume_vec(own pair.left);
         \\    return pair.right.len;
         \\}
     ;
@@ -697,15 +697,15 @@ test "test_phase6_typestate_uaf_e0301_partial_move_reinit_e0302_and_uninit_e0303
         \\    pub left: Vec[i64],
         \\    pub right: Vec[i64],
         \\}
-        \\pub fn consume_vec(own buf: sink Vec[i64]) {}
-        \\pub fn consume_dual(own whole: sink DualBuffers) {}
+        \\pub fn consume_vec(buf: own Vec[i64]) {}
+        \\pub fn consume_dual(whole: own DualBuffers) {}
         \\pub fn bad_whole_use_after_field_move() {
         \\    var pair = DualBuffers {
         \\        left: Vec { len: 4 },
         \\        right: Vec { len: 9 },
         \\    };
-        \\    consume_vec(pair.left);
-        \\    consume_dual(pair);
+        \\    consume_vec(own pair.left);
+        \\    consume_dual(own pair);
         \\}
     ;
     try expectSastDiagnostic(allocator, 204, parent_after_partial_src, .{}, .e0302_use_after_move);
@@ -719,8 +719,8 @@ test "test_phase6_typestate_uaf_e0301_partial_move_reinit_e0302_and_uninit_e0303
         \\    pub left: Vec[i64],
         \\    pub right: Vec[i64],
         \\}
-        \\pub fn consume_vec(own buf: sink Vec[i64]) {}
-        \\pub fn consume_dual(own whole: sink DualBuffers) -> usize {
+        \\pub fn consume_vec(buf: own Vec[i64]) {}
+        \\pub fn consume_dual(whole: own DualBuffers) -> usize {
         \\    return whole.left.len + whole.right.len;
         \\}
         \\pub fn reinit_then_consume_whole() -> usize {
@@ -728,15 +728,15 @@ test "test_phase6_typestate_uaf_e0301_partial_move_reinit_e0302_and_uninit_e0303
         \\        left: Vec { len: 4 },
         \\        right: Vec { len: 9 },
         \\    };
-        \\    consume_vec(pair.left);
+        \\    consume_vec(own pair.left);
         \\    pair.left = Vec { len: 12 };
-        \\    return consume_dual(pair);
+        \\    return consume_dual(own pair);
         \\}
     ;
     var reinit_bundle = try verifyCleanSast(allocator, 205, reinit_restores_parent_src, .{});
     defer reinit_bundle.deinit();
 
-    // [3] `E0303` uninitialized variable read & `set` parameter normal return vs `Result.Err` exemption:
+    // [3] `E0303` uninitialized variable read & `&out` (`E0422`) normal return vs `Result.Err` exemption:
     const uninit_local_src =
         \\pub fn read_maybe_uninit(cond: bool) -> i64 {
         \\    var pending: i64;
@@ -749,20 +749,20 @@ test "test_phase6_typestate_uaf_e0301_partial_move_reinit_e0302_and_uninit_e0303
     try expectSastDiagnostic(allocator, 206, uninit_local_src, .{}, .e0303_uninitialized_memory_read);
 
     const uninit_set_src =
-        \\pub fn bad_set_out(mut out_val: set i64, flag: bool) {
+        \\pub fn bad_set_out(out_val: &out i64, flag: bool) {
         \\    if flag {
-        \\        out_val = 42;
+        \\        out_val.* = 42;
         \\    }
         \\}
     ;
-    try expectSastDiagnostic(allocator, 207, uninit_set_src, .{}, .e0303_uninitialized_memory_read);
+    try expectSastDiagnostic(allocator, 207, uninit_set_src, .{}, .e0422_out_param_contract_violation);
 
     const fallible_set_ok_src =
-        \\pub fn init_set_or_err(mut out_val: set i64, should_fail: bool) -> Result[i64, i32] {
+        \\pub fn init_set_or_err(out_val: &out i64, should_fail: bool) -> i64!i32 {
         \\    if should_fail {
         \\        return .Err(500);
         \\    }
-        \\    out_val = 88;
+        \\    out_val.* = 88;
         \\    return .Ok(1);
         \\}
     ;
@@ -779,49 +779,49 @@ test "test_phase6_linear_completeness_e0304_defer_errdefer_and_double_close_e031
         \\pub struct SocketLease {
         \\    pub port: u16,
         \\}
-        \\pub fn may_fail(flag: bool) -> Result[i32, i32] {
+        \\pub fn may_fail(flag: bool) -> i32!i32 {
         \\    if flag { return .Err(1); }
         \\    return .Ok(0);
         \\}
-        \\pub fn close_lease(own lease: sink SocketLease) {
+        \\pub fn close_lease(lease: own SocketLease) {
         \\    let SocketLease { port: _ } = lease;
         \\}
-        \\pub fn leak_on_try_unwind(flag: bool) -> Result[i32, i32] {
+        \\pub fn leak_on_try_unwind(flag: bool) -> i32!i32 {
         \\    let lease = SocketLease { port: 8080 };
         \\    let step = may_fail(flag)?;
-        \\    close_lease(lease);
+        \\    close_lease(own lease);
         \\    return .Ok(step);
         \\}
     ;
     try expectSastDiagnostic(allocator, 210, linear_leak_src, .{}, .e0304_resource_or_memory_leak);
 
-    // [2] Valid consumption via `defer` AND via `errdefer` + normal `sink` (`0` errors):
+    // [2] Valid consumption via `defer` AND via `errdefer` + normal `own` (`0` errors):
     const linear_clean_src =
         \\@linear
         \\pub struct TxSession {
         \\    pub tx_id: i64,
         \\}
-        \\pub fn step_op(should_err: bool) -> Result[i64, i32] {
+        \\pub fn step_op(should_err: bool) -> i64!i32 {
         \\    if should_err { return .Err(7); }
         \\    return .Ok(100);
         \\}
-        \\pub fn commit_tx(own session: sink TxSession) {
+        \\pub fn commit_tx(session: own TxSession) {
         \\    let TxSession { tx_id: _ } = session;
         \\}
-        \\pub fn rollback_tx(own session: sink TxSession) {
+        \\pub fn rollback_tx(session: own TxSession) {
         \\    let TxSession { tx_id: _ } = session;
         \\}
         \\pub fn run_with_defer(flag: bool) -> i64 {
         \\    let session = TxSession { tx_id: 1 };
-        \\    defer { commit_tx(session); }
+        \\    defer { commit_tx(own session); }
         \\    if flag { return 10; }
         \\    return 20;
         \\}
-        \\pub fn run_with_errdefer(should_err: bool) -> Result[i64, i32] {
+        \\pub fn run_with_errdefer(should_err: bool) -> i64!i32 {
         \\    let session = TxSession { tx_id: 2 };
-        \\    errdefer { rollback_tx(session); }
+        \\    errdefer { rollback_tx(own session); }
         \\    let val = step_op(should_err)?;
-        \\    commit_tx(session);
+        \\    commit_tx(own session);
         \\    return .Ok(val);
         \\}
     ;
@@ -842,13 +842,13 @@ test "test_phase6_linear_completeness_e0304_defer_errdefer_and_double_close_e031
         \\        self.bytes = 0;
         \\    }
         \\}
-        \\pub fn close_file(own tok: sink FileToken) {
+        \\pub fn close_file(tok: own FileToken) {
         \\    let FileToken { handle: _ } = tok;
         \\}
         \\pub fn bad_double_cleanup() {
         \\    let tok = FileToken { handle: 4 };
-        \\    close_file(tok);
-        \\    close_file(tok);
+        \\    close_file(own tok);
+        \\    close_file(own tok);
         \\    var chunk = PoolChunk { bytes: 128 };
         \\    chunk.free();
         \\    chunk.free();
@@ -875,14 +875,14 @@ test "test_phase6_nll_exclusivity_e0305_over_64_loans_mut_move_out_and_set_drop_
         \\pub fn head_slice(arr: &[i64]) -> &[i64] {
         \\    return arr;
         \\}
-        \\pub fn write_head(mut arr: inout [i64; 4]) {
-        \\    arr[0] = 55;
+        \\pub fn write_head(arr: &mut [i64; 4]) {
+        \\    arr.*[0] = 55;
         \\}
         \\pub fn ok_shortened_borrow() -> i64 {
         \\    var arr: [i64; 4] = [1, 2, 3, 4];
         \\    let view = head_slice(&arr);
         \\    let _ = view;
-        \\    write_head(arr);
+        \\    write_head(&mut arr);
         \\    return arr[0];
         \\}
     ;
@@ -893,14 +893,14 @@ test "test_phase6_nll_exclusivity_e0305_over_64_loans_mut_move_out_and_set_drop_
         \\pub fn head_slice(arr: &[i64]) -> &[i64] {
         \\    return arr;
         \\}
-        \\pub fn write_head(mut arr: inout [i64; 4]) {
-        \\    arr[0] = 55;
+        \\pub fn write_head(arr: &mut [i64; 4]) {
+        \\    arr.*[0] = 55;
         \\}
         \\pub fn bad_interleaved_borrow() -> usize {
         \\    var arr: [i64; 4] = [1, 2, 3, 4];
         \\    let view = head_slice(&arr);
-        \\    write_head(arr);
-        \\    return view.len;
+        \\    write_head(&mut arr);
+        \\    return view.len();
         \\}
     ;
     try expectSastDiagnostic(allocator, 221, nll_conflict_src, .{}, .e0305_exclusivity_violation);
@@ -915,7 +915,7 @@ test "test_phase6_nll_exclusivity_e0305_over_64_loans_mut_move_out_and_set_drop_
     var seventy_ok_bundle = try verifyCleanSast(allocator, 223, seventy_clean_src, .{});
     defer seventy_ok_bundle.deinit();
 
-    // [3] `[CRITICAL-07]` `&mut Wrapper` / `inout Wrapper` temporary non-`Copy` field move-out:
+    // [3] `[CRITICAL-07]` `&mut Wrapper` temporary non-`Copy` field move-out:
     const mut_move_missing_reinit_src =
         \\pub struct Vec[T] {
         \\    pub len: usize,
@@ -923,12 +923,12 @@ test "test_phase6_nll_exclusivity_e0305_over_64_loans_mut_move_out_and_set_drop_
         \\pub struct Wrapper {
         \\    pub inner: Vec[i64],
         \\}
-        \\pub fn take_vec(own items: sink Vec[i64]) {}
+        \\pub fn take_vec(items: own Vec[i64]) {}
         \\pub fn bad_mut_ref_move_out(wrap_ref: &mut Wrapper) {
-        \\    take_vec(wrap_ref.inner);
+        \\    take_vec(own wrap_ref.inner);
         \\}
-        \\pub fn bad_inout_read_before_reinit(mut wrap_io: inout Wrapper) -> usize {
-        \\    take_vec(wrap_io.inner);
+        \\pub fn bad_inout_read_before_reinit(wrap_io: &mut Wrapper) -> usize {
+        \\    take_vec(own wrap_io.inner);
         \\    let bad_len = wrap_io.inner.len;
         \\    wrap_io.inner = Vec { len: 1 };
         \\    return bad_len;
@@ -956,9 +956,9 @@ test "test_phase6_nll_exclusivity_e0305_over_64_loans_mut_move_out_and_set_drop_
         \\pub struct Wrapper {
         \\    pub inner: Vec[i64],
         \\}
-        \\pub fn take_vec(own items: sink Vec[i64]) {}
+        \\pub fn take_vec(items: own Vec[i64]) {}
         \\pub fn swap_mut_ref_field(wrap_ref: &mut Wrapper, cond: bool) {
-        \\    take_vec(wrap_ref.inner);
+        \\    take_vec(own wrap_ref.inner);
         \\    if cond {
         \\        wrap_ref.inner = Vec { len: 10 };
         \\    } else {
@@ -969,7 +969,7 @@ test "test_phase6_nll_exclusivity_e0305_over_64_loans_mut_move_out_and_set_drop_
     var mut_ok_bundle = try verifyCleanSast(allocator, 225, mut_move_reinit_ok_src, .{});
     defer mut_ok_bundle.deinit();
 
-    // [4] `[MAJOR-11]` Conditional `set` parameter initialization updates `_drop_flag` cleanly in `MirVm`:
+    // [4] `[MAJOR-11]` Conditional `&out` parameter initialization updates `_drop_flag` cleanly in `MirVm`:
     const cond_set_drop_src =
         \\pub struct TrackedBox {
         \\    pub tag: i64,
@@ -979,13 +979,13 @@ test "test_phase6_nll_exclusivity_e0305_over_64_loans_mut_move_out_and_set_drop_
         \\        @drop_trace(self.tag);
         \\    }
         \\}
-        \\pub fn populate_box(mut out_box: set TrackedBox, val: i64) {
-        \\    out_box = TrackedBox { tag: val };
+        \\pub fn populate_box(out_box: &out TrackedBox, val: i64) {
+        \\    out_box.* = TrackedBox { tag: val };
         \\}
         \\pub fn run_conditional_set(should_init: bool) -> i64 {
         \\    var slot: TrackedBox;
         \\    if should_init {
-        \\        populate_box(slot, 707);
+        \\        populate_box(&out slot, 707);
         \\    }
         \\    return 1;
         \\}
@@ -1038,7 +1038,7 @@ test "test_phase6_w0308_per_arena_tracking_and_d04_scratch_ping_pong_e0328" {
         \\    pub fn reset(&mut self) {
         \\        self.cursor = 0;
         \\    }
-        \\    pub fn deinit(own self: sink BumpArena) {
+        \\    pub fn deinit(own self) {
         \\        let BumpArena { cursor: _ } = self;
         \\    }
         \\}
@@ -1076,7 +1076,7 @@ test "test_phase6_w0308_per_arena_tracking_and_d04_scratch_ping_pong_e0328" {
         \\    pub fn reset(&mut self) {
         \\        self.cursor = 0;
         \\    }
-        \\    pub fn deinit(own self: sink BumpArena) {
+        \\    pub fn deinit(own self) {
         \\        let BumpArena { cursor: _ } = self;
         \\    }
         \\}
@@ -1122,15 +1122,15 @@ test "test_phase6_w0308_per_arena_tracking_and_d04_scratch_ping_pong_e0328" {
         \\    pub allocator: usize,
         \\    pub scratch: [ScratchArena; 2],
         \\}
-        \\pub fn helper_using_slot_one(mut ctx: inout Context) -> usize {
+        \\pub fn helper_using_slot_one(ctx: &mut Context) -> usize {
         \\    ctx.scratch[1].reset();
         \\    let sub_slice = ctx.scratch[1].alloc_slice();
-        \\    return sub_slice.len;
+        \\    return sub_slice.len();
         \\}
-        \\pub fn caller_ping_pong_ok(mut ctx: inout Context) -> usize {
+        \\pub fn caller_ping_pong_ok(ctx: &mut Context) -> usize {
         \\    let live_zero = ctx.scratch[0].alloc_slice();
-        \\    let sub_len = helper_using_slot_one(ctx);
-        \\    return live_zero.len +% sub_len;
+        \\    let sub_len = helper_using_slot_one(&mut ctx.*);
+        \\    return live_zero.len() +% sub_len;
         \\}
     ;
     var scratch_ok_bundle = try verifyCleanSast(allocator, 232, scratch_ping_pong_ok_src, .{});
@@ -1152,13 +1152,13 @@ test "test_phase6_w0308_per_arena_tracking_and_d04_scratch_ping_pong_e0328" {
         \\    pub allocator: usize,
         \\    pub scratch: [ScratchArena; 2],
         \\}
-        \\pub fn helper_rewinding_slot_zero(mut ctx: inout Context) {
+        \\pub fn helper_rewinding_slot_zero(ctx: &mut Context) {
         \\    ctx.scratch[0].reset();
         \\}
-        \\pub fn caller_ping_pong_conflict(mut ctx: inout Context) -> usize {
+        \\pub fn caller_ping_pong_conflict(ctx: &mut Context) -> usize {
         \\    let live_zero = ctx.scratch[0].alloc_slice();
-        \\    helper_rewinding_slot_zero(ctx);
-        \\    return live_zero.len;
+        \\    helper_rewinding_slot_zero(&mut ctx.*);
+        \\    return live_zero.len();
         \\}
     ;
     try expectSastDiagnostic(
@@ -1183,7 +1183,7 @@ test "test_phase6_elaborate_drops_mir_vm_lifo_trace_and_comptime_drop_eval" {
         \\        @drop_trace(self.id);
         \\    }
         \\}
-        \\pub fn consume_early(own item: sink GuardItem) {
+        \\pub fn consume_early(item: own GuardItem) {
         \\    @drop_trace(1000 + item.id);
         \\}
         \\pub fn run_lifo_and_branch(take_middle: bool) -> i64 {
@@ -1191,7 +1191,7 @@ test "test_phase6_elaborate_drops_mir_vm_lifo_trace_and_comptime_drop_eval" {
         \\    let middle = GuardItem { id: 20 };
         \\    let third = GuardItem { id: 30 };
         \\    if take_middle {
-        \\        consume_early(middle);
+        \\        consume_early(own middle);
         \\    }
         \\    return first.id + third.id;
         \\}
@@ -1249,13 +1249,13 @@ test "test_phase6_elaborate_drops_mir_vm_lifo_trace_and_comptime_drop_eval" {
         \\        @drop_trace(self.code);
         \\    }
         \\}
-        \\pub fn take_ct_guard(own item: sink CtGuard) -> i64 {
+        \\pub fn take_ct_guard(item: own CtGuard) -> i64 {
         \\    return item.code;
         \\}
         \\pub fn compute_ct_value(cond: bool) -> i64 {
         \\    let guard = CtGuard { code: 55 };
         \\    if cond {
-        \\        return take_ct_guard(guard) + 5;
+        \\        return take_ct_guard(own guard) + 5;
         \\    }
         \\    return 0;
         \\}
@@ -1285,16 +1285,16 @@ test "test_phase6_region_escape_e0306_return_param_flow_wrapper_and_closures" {
 
     // [2] `[CRITICAL-05]` `param_flow_matrix` exact `src_ord * 8 + dst_ord` bit direction (`bit 8`, NOT `1`):
     const param_flow_ok_src =
-        \\pub fn assign_ref_slot(mut dst_slot: inout &i64, src_ref: &i64) {
-        \\    dst_slot = src_ref;
+        \\pub fn assign_ref_slot(dst_slot: &mut &i64, src_ref: &i64) {
+        \\    dst_slot.* = src_ref;
         \\}
         \\pub fn outer_into_inner_is_sound(seed: &i64) -> i64 {
         \\    let outer_val: i64 = 42;
         \\    let outer_ref: &i64 = &outer_val;
         \\    {
         \\        var inner_slot: &i64 = seed;
-        \\        assign_ref_slot(inner_slot, outer_ref);
-        \\        return *inner_slot;
+        \\        assign_ref_slot(&mut inner_slot, outer_ref);
+        \\        return inner_slot.*;
         \\    }
         \\}
     ;
@@ -1319,16 +1319,16 @@ test "test_phase6_region_escape_e0306_return_param_flow_wrapper_and_closures" {
     try std.testing.expect(has_assign_summary);
 
     const param_flow_escape_src =
-        \\pub fn assign_ref_slot(mut dst_slot: inout &i64, src_ref: &i64) {
-        \\    dst_slot = src_ref;
+        \\pub fn assign_ref_slot(dst_slot: &mut &i64, src_ref: &i64) {
+        \\    dst_slot.* = src_ref;
         \\}
         \\pub fn inner_into_outer_escapes(seed: &i64) -> i64 {
         \\    var outer_slot: &i64 = seed;
         \\    {
         \\        let inner_val: i64 = 99;
-        \\        assign_ref_slot(outer_slot, &inner_val);
+        \\        assign_ref_slot(&mut outer_slot, &inner_val);
         \\    }
-        \\    return *outer_slot;
+        \\    return outer_slot.*;
         \\}
     ;
     try expectSastDiagnostic(allocator, 303, param_flow_escape_src, .{}, .e0306_region_escape_violation);
@@ -1350,7 +1350,7 @@ test "test_phase6_region_escape_e0306_return_param_flow_wrapper_and_closures" {
         \\pub fn eval_local_borrow_closure() -> i64 {
         \\    let base_num: i64 = 40;
         \\    let base_ref: &i64 = &base_num;
-        \\    @local let add_to_base = || -> i64 { *base_ref +% 2 };
+        \\    @local let add_to_base = || -> i64 { base_ref.* +% 2 };
         \\    return add_to_base();
         \\}
     ;
@@ -1365,16 +1365,16 @@ test "test_phase6_region_escape_e0306_return_param_flow_wrapper_and_closures" {
         \\    pub fn view_bytes(&mut self) -> &[u8] {
         \\        return &self.buf;
         \\    }
-        \\    pub fn deinit(own self: sink BumpArena) {
+        \\    pub fn deinit(own self) {
         \\        let BumpArena { buf: _ } = self;
         \\    }
         \\}
         \\pub fn escape_inner_region_via_closure(fallback: &[u8]) -> usize {
-        \\    var outer_clos = || -> usize { fallback.len };
+        \\    var outer_clos = || -> usize { fallback.len() };
         \\    {
         \\        var inner_arena = BumpArena { buf: [1, 2, 3, 4, 5, 6, 7, 8] };
         \\        let inner_view = inner_arena.view_bytes();
-        \\        outer_clos = || -> usize { inner_view.len };
+        \\        outer_clos = || -> usize { inner_view.len() };
         \\        inner_arena.deinit();
         \\    }
         \\    return outer_clos();
@@ -1616,7 +1616,7 @@ test "test_phase6_fix17_gates_a_to_f_sandbox_policies_and_fix06b_vacated_w0329" 
     const bypass_attr_src =
         \\@link_section(".init_array")
         \\pub fn ctor_hook() {}
-        \\@std_cap_boundary(emits = [fs])
+        \\@std_cap_boundary(emits: [fs])
         \\pub fn spoofed_boundary() {}
     ;
     var bypass_bundle = try corex.lowerAndVerifySourceMirSast(
@@ -1631,13 +1631,13 @@ test "test_phase6_fix17_gates_a_to_f_sandbox_policies_and_fix06b_vacated_w0329" 
         countDiagnosticCode(&bypass_bundle.diagnostics, .e0327_forbidden_sandbox_bypass_attribute) >= 2,
     );
 
-    // Inside `std` (`Durability.high`), `@std_cap_boundary(clears = [ffi_unsafe], emits = [fs])` firewalls FFI:
+    // Inside `std` (`Durability.high`), `@std_cap_boundary(clears: [ffi_unsafe], emits: [fs])` firewalls FFI:
     var db = try CompilerDb.init(allocator);
     defer db.deinit();
     const std_file = FileId.fromInt(321);
     const std_firewall_src =
         \\extern "C" fn sys_open_raw() -> i32;
-        \\@std_cap_boundary(clears = [ffi_unsafe], emits = [fs])
+        \\@std_cap_boundary(clears: [ffi_unsafe], emits: [fs])
         \\pub fn std_fs_open() -> i32 {
         \\    return unsafe { sys_open_raw() };
         \\}
@@ -1659,9 +1659,9 @@ test "test_phase6_fix17_gates_a_to_f_sandbox_policies_and_fix06b_vacated_w0329" 
 
     const embed_file = FileId.fromInt(322);
     const embed_src =
-        \\pub const OK_LEN: usize = @embed_bytes("assets/banner.txt").len;
-        \\pub const ESCAPE_LEN: usize = @embed_bytes("../secret.key").len;
-        \\pub const DEVICE_LEN: usize = @embed_bytes("CON.txt").len;
+        \\pub const OK_LEN: usize = @embed_bytes("assets/banner.txt").len();
+        \\pub const ESCAPE_LEN: usize = @embed_bytes("../secret.key").len();
+        \\pub const DEVICE_LEN: usize = @embed_bytes("CON.txt").len();
     ;
     _ = try db.setInput(embed_file, embed_src, .low);
     const embed_tree = try db.extractItemTree(embed_file);
@@ -1765,24 +1765,33 @@ test "test_phase6_fix17_gates_a_to_f_sandbox_policies_and_fix06b_vacated_w0329" 
         \\pub struct NonCopySlot {
         \\    pub buf: Vec[i64],
         \\}
-        \\pub subscript mut_slot_at(mut slots: inout [NonCopySlot; 2], idx: usize) -> NonCopySlot {
-        \\    yield slots[idx];
+        \\pub struct SlotPair {
+        \\    pub items: [NonCopySlot; 2],
+        \\}
+        \\impl SlotPair {
+        \\    pub subscript(idx: usize) -> NonCopySlot {
+        \\        inout {
+        \\            yield &mut self.items[idx];
+        \\        }
+        \\    }
         \\}
         \\pub fn write_through_vacated_branch(
         \\    use_branch_a: bool,
         \\    lookup_idx: usize,
         \\) -> usize {
-        \\    var slots: [NonCopySlot; 2] = [
-        \\        NonCopySlot { buf: Vec { len: 1 } },
-        \\        NonCopySlot { buf: Vec { len: 2 } },
-        \\    ];
+        \\    var slots = SlotPair {
+        \\        items: [
+        \\            NonCopySlot { buf: Vec { len: 1 } },
+        \\            NonCopySlot { buf: Vec { len: 2 } },
+        \\        ],
+        \\    };
         \\    let table: [usize; 2] = [10, 20];
-        \\    mut_slot_at(slots, 0) = if use_branch_a {
+        \\    slots[0] = if use_branch_a {
         \\        NonCopySlot { buf: Vec { len: table[lookup_idx] } }
         \\    } else {
         \\        NonCopySlot { buf: Vec { len: 99 } }
         \\    };
-        \\    return slots[0].buf.len;
+        \\    return slots.items[0].buf.len;
         \\}
     ;
     var vacated_bundle = try verifyCleanSast(allocator, 327, vacated_subscript_src, .{});
@@ -1841,13 +1850,20 @@ test "test_phase6_fix17_gates_a_to_f_sandbox_policies_and_fix06b_vacated_w0329" 
         \\pub struct NonCopySlot {
         \\    pub buf: Vec[i64],
         \\}
-        \\pub subscript mut_slot_at(mut slots: inout [NonCopySlot; 2], idx: usize) -> NonCopySlot {
-        \\    yield slots[idx];
+        \\pub struct SlotPair {
+        \\    pub items: [NonCopySlot; 2],
+        \\}
+        \\impl SlotPair {
+        \\    pub subscript(idx: usize) -> NonCopySlot {
+        \\        inout {
+        \\            yield &mut self.items[idx];
+        \\        }
+        \\    }
         \\}
         \\@no_panic
-        \\pub fn bad_no_panic_vacated(mut slots: inout [NonCopySlot; 2], table: &[usize], idx: usize) {
-        \\    if slots.len > 0 {
-        \\        mut_slot_at(slots, 0) = NonCopySlot { buf: Vec { len: table[idx] } };
+        \\pub fn bad_no_panic_vacated(slots: &mut SlotPair, table: &[usize], idx: usize) {
+        \\    if slots.items.len() > 0 {
+        \\        slots.*[0] = NonCopySlot { buf: Vec { len: table[idx] } };
         \\    }
         \\}
     ;
@@ -2080,19 +2096,19 @@ test "test_phase6_pentagon_bce_for_range_rem_u_static_oob_e0307_and_strict_w0314
     ;
     try expectSastDiagnostic(allocator, 410, static_oob_src, .{}, .e0307_static_buffer_overflow);
 
-    // [2] Pentagon relational BCE (`if idx < slice.len`, `for i in 0..slice.len`, and `raw % slice.len`):
+    // [2] Pentagon relational BCE (`if idx < slice.len()`, `for i in 0..slice.len()`, and `raw % slice.len()`):
     const pentagon_bce_src =
         \\@no_panic
         \\pub fn sum_verified_patterns(slice: &[i64], idx: usize, raw: usize) -> i64 {
         \\    var total: i64 = 0;
-        \\    if idx < slice.len {
+        \\    if idx < slice.len() {
         \\        total = total +% slice[idx];
         \\    }
-        \\    for i in 0..slice.len {
+        \\    for i in 0..slice.len() {
         \\        total = total +% slice[i];
         \\    }
-        \\    if slice.len > 0 {
-        \\        total = total +% slice[raw % slice.len];
+        \\    if slice.len() > 0 {
+        \\        total = total +% slice[raw % slice.len()];
         \\    }
         \\    return total;
         \\}
@@ -2129,12 +2145,12 @@ test "test_phase6_pentagon_bce_for_range_rem_u_static_oob_e0307_and_strict_w0314
 test "test_phase6_critical01_mutable_slice_reassignment_zero_mod_and_d11_narrow_e0406" {
     const allocator = std.testing.allocator;
 
-    // [1] `[CRITICAL-01]` Reassigning mutable `var cur_slice` after `if idx < cur_slice.len` MUST NOT elide BCE:
+    // [1] `[CRITICAL-01]` Reassigning mutable `var cur_slice` after `if idx < cur_slice.len()` MUST NOT elide BCE:
     const mut_slice_reassign_src =
         \\@no_panic
         \\pub fn bad_reassigned_slice_bce(long_s: &[i64], short_s: &[i64], idx: usize) -> i64 {
         \\    var cur_slice: &[i64] = long_s;
-        \\    if idx < cur_slice.len {
+        \\    if idx < cur_slice.len() {
         \\        cur_slice = short_s;
         \\        return cur_slice[idx];
         \\    }
@@ -2142,7 +2158,7 @@ test "test_phase6_critical01_mutable_slice_reassignment_zero_mod_and_d11_narrow_
         \\}
         \\pub fn warn_reassigned_slice_bce(long_s: &[i64], short_s: &[i64], idx: usize) -> i64 {
         \\    var cur_slice: &[i64] = long_s;
-        \\    if idx < cur_slice.len {
+        \\    if idx < cur_slice.len() {
         \\        cur_slice = short_s;
         \\        return cur_slice[idx];
         \\    }
@@ -2169,7 +2185,7 @@ test "test_phase6_critical01_mutable_slice_reassignment_zero_mod_and_d11_narrow_
     const unguarded_mod_src =
         \\@no_panic
         \\pub fn bad_zero_possible_modulo(slice: &[i64], raw: usize) -> i64 {
-        \\    return slice[raw % slice.len];
+        \\    return slice[raw % slice.len()];
         \\}
     ;
     var zero_mod_bundle = try corex.lowerAndVerifySourceMirSast(
@@ -2253,7 +2269,7 @@ test "test_phase6_audit_regressions_overflow_params_drops_and_cross_file_caps" {
     // [2] Pass 4 conditional formal-parameter overwrite & `&mut [T]` deref slice length soundness:
     const mut_param_overwrite_src =
         \\@no_panic
-        \\pub fn bad_mut_param(mut idx: usize, should_clobber: bool, arr: &[i64; 4]) -> i64 {
+        \\pub fn bad_mut_param(var idx: usize, should_clobber: bool, arr: &[i64; 4]) -> i64 {
         \\    if idx < 2 {
         \\        if should_clobber {
         \\            idx = 9;
@@ -2277,14 +2293,14 @@ test "test_phase6_audit_regressions_overflow_params_drops_and_cross_file_caps" {
     );
 
     const mut_slice_deref_src =
-        \\pub fn shrink_slice(mut slot: inout &[i64], empty: &[i64]) {
-        \\    slot = empty;
+        \\pub fn shrink_slice(slot: &mut &[i64], empty: &[i64]) {
+        \\    slot.* = empty;
         \\}
         \\@no_panic
-        \\pub fn bad_deref_slice_len(mut slot: inout &[i64], empty: &[i64], idx: usize) -> i64 {
-        \\    if idx < slot.len {
+        \\pub fn bad_deref_slice_len(slot: &mut &[i64], empty: &[i64], idx: usize) -> i64 {
+        \\    if idx < slot.*.len() {
         \\        shrink_slice(slot, empty);
-        \\        return slot[idx];
+        \\        return slot.*[idx];
         \\    }
         \\    return 0;
         \\}
@@ -2302,7 +2318,7 @@ test "test_phase6_audit_regressions_overflow_params_drops_and_cross_file_caps" {
         hasDiagnosticCode(&mut_deref_bundle.diagnostics, .e0321_no_panic_contract_violation),
     );
 
-    // [3] Pass 2 projected `sink` partial move, conditional `.deinit()` `_drop_flag` clear, & composite `@linear`:
+    // [3] Pass 2 projected `own` partial move, conditional `.deinit()` `_drop_flag` clear, & composite `@linear`:
     const sink_partial_and_deinit_src =
         \\pub struct TrackedBuf {
         \\    pub id: i64,
@@ -2311,7 +2327,7 @@ test "test_phase6_audit_regressions_overflow_params_drops_and_cross_file_caps" {
         \\    pub fn drop(&mut self) {
         \\        @drop_trace(self.id);
         \\    }
-        \\    pub fn deinit(own self: sink TrackedBuf) {
+        \\    pub fn deinit(own self) {
         \\        @drop_trace(100 + self.id);
         \\        let TrackedBuf { id: _ } = self;
         \\    }
@@ -2320,7 +2336,7 @@ test "test_phase6_audit_regressions_overflow_params_drops_and_cross_file_caps" {
         \\    pub first: TrackedBuf,
         \\    pub second: TrackedBuf,
         \\}
-        \\pub fn take_first_or_explicit_deinit(own pair: sink BufPair, is_explicit: bool) -> i64 {
+        \\pub fn take_first_or_explicit_deinit(pair: own BufPair, is_explicit: bool) -> i64 {
         \\    var local_buf = TrackedBuf { id: 7 };
         \\    if is_explicit {
         \\        local_buf.deinit();
@@ -2333,7 +2349,7 @@ test "test_phase6_audit_regressions_overflow_params_drops_and_cross_file_caps" {
         \\        first: TrackedBuf { id: 1 },
         \\        second: TrackedBuf { id: 2 },
         \\    };
-        \\    return take_first_or_explicit_deinit(pair, is_explicit);
+        \\    return take_first_or_explicit_deinit(own pair, is_explicit);
         \\}
     ;
     var sink_drop_bundle = try verifyCleanSast(allocator, 434, sink_partial_and_deinit_src, .{});
@@ -2391,12 +2407,12 @@ test "test_phase6_audit_regressions_overflow_params_drops_and_cross_file_caps" {
         \\    pub left: LinearLease,
         \\    pub right: LinearLease,
         \\}
-        \\pub fn release_lease(own lease: sink LinearLease) {
+        \\pub fn release_lease(lease: own LinearLease) {
         \\    let LinearLease { handle: _ } = lease;
         \\}
-        \\pub fn split_and_release_both(own pair: sink LeasePair) {
-        \\    release_lease(pair.left);
-        \\    release_lease(pair.right);
+        \\pub fn split_and_release_both(pair: own LeasePair) {
+        \\    release_lease(own pair.left);
+        \\    release_lease(own pair.right);
         \\}
     ;
     var comp_linear_bundle = try verifyCleanSast(allocator, 435, composite_linear_src, .{});
@@ -2419,11 +2435,11 @@ test "test_phase6_audit_regressions_overflow_params_drops_and_cross_file_caps" {
         \\    pub allocator: usize,
         \\    pub scratch: [ScratchArena; 2],
         \\}
-        \\pub fn rewind_and_read(mut ctx: inout Context, borrowed: &[u8]) -> usize {
+        \\pub fn rewind_and_read(ctx: &mut Context, borrowed: &[u8]) -> usize {
         \\    ctx.scratch[0].reset();
-        \\    return borrowed.len;
+        \\    return borrowed.len();
         \\}
-        \\pub fn pass_scratch_into_rewinder(mut ctx: inout Context) -> usize {
+        \\pub fn pass_scratch_into_rewinder(ctx: &mut Context) -> usize {
         \\    let scratch_view = ctx.scratch[0].alloc_slice();
         \\    return rewind_and_read(ctx, scratch_view);
         \\}
@@ -2443,7 +2459,7 @@ test "test_phase6_audit_regressions_overflow_params_drops_and_cross_file_caps" {
     const std_env_file = FileId.fromInt(437);
     const std_env_src =
         \\extern "C" fn host_getenv_raw() -> i32;
-        \\@std_cap_boundary(clears = [ffi, unsafe_op], emits = [env])
+        \\@std_cap_boundary(clears: [ffi, unsafe_op], emits: [env])
         \\pub fn read_env_flag() -> i32 {
         \\    return unsafe { host_getenv_raw() };
         \\}
@@ -2579,7 +2595,7 @@ test "test_phase75_cond_scope_pre_else_drop_elaboration_and_linear_e0304_se01_se
         \\pub struct LinearToken {
         \\    pub id_num: i64,
         \\}
-        \\pub fn release_token(own tok_in: sink LinearToken) -> i64 {
+        \\pub fn release_token(tok_in: own LinearToken) -> i64 {
         \\    let LinearToken { id_num } = tok_in;
         \\    return id_num;
         \\}
@@ -2591,7 +2607,7 @@ test "test_phase75_cond_scope_pre_else_drop_elaboration_and_linear_e0304_se01_se
         \\}
         \\pub fn consume_if_some(is_ready: bool) -> i64 {
         \\    if maybe_token(is_ready) is .Some(live_tok) {
-        \\        return release_token(live_tok);
+        \\        return release_token(own live_tok);
         \\    }
         \\    return 0;
         \\}
@@ -2605,7 +2621,7 @@ test "test_phase75_cond_scope_pre_else_drop_elaboration_and_linear_e0304_se01_se
         \\pub struct LinearToken {
         \\    pub id_num: i64,
         \\}
-        \\pub fn release_token(own tok_in: sink LinearToken) -> i64 {
+        \\pub fn release_token(tok_in: own LinearToken) -> i64 {
         \\    let LinearToken { id_num } = tok_in;
         \\    return id_num;
         \\}
@@ -2617,7 +2633,7 @@ test "test_phase75_cond_scope_pre_else_drop_elaboration_and_linear_e0304_se01_se
         \\}
         \\pub fn leak_on_guard_false(is_ready: bool, is_allowed: bool) -> i64 {
         \\    if maybe_token(is_ready) is .Some(live_tok) and is_allowed {
-        \\        return release_token(live_tok);
+        \\        return release_token(own live_tok);
         \\    }
         \\    return 0;
         \\}
@@ -2632,10 +2648,10 @@ test "test_phase75_pentagon_dollar_bce_static_e0307_and_unreachable_e0321_se04_s
     const pentagon_dollar_ok_src =
         \\@no_panic
         \\pub fn sum_tail_and_trim(items: &[i64]) -> i64 {
-        \\    if items.len >= 3 {
+        \\    if items.len() >= 3 {
         \\        let sub_mid: &[i64] = items[1..$ - 1];
         \\        let sub_incl: &[i64] = items[0..=1];
-        \\        return items[$ - 1] +% items[$ - 2] +% (sub_mid.len as i64) +% (sub_incl.len as i64);
+        \\        return items[$ - 1] +% items[$ - 2] +% (sub_mid.len() as i64) +% (sub_incl.len() as i64);
         \\    }
         \\    if 2 + 2 == 5 {
         \\        unreachable;
@@ -2799,7 +2815,7 @@ test "test_phase75_context_layout_64b_32b_and_with_allocator_escape_e0306_se08" 
         \\    let active_alloc: Allocator = context.allocator;
         \\    return OwnedBuffer { raw_handle: active_alloc._handle, len: size_n };
         \\}
-        \\pub fn grow_buffer(mut buf_ref: inout OwnedBuffer, extra_n: usize) {
+        \\pub fn grow_buffer(buf_ref: &mut OwnedBuffer, extra_n: usize) {
         \\    let active_alloc: Allocator = context.allocator;
         \\    buf_ref.raw_handle = active_alloc._handle;
         \\    buf_ref.len = buf_ref.len + extra_n;
@@ -2808,7 +2824,7 @@ test "test_phase75_context_layout_64b_32b_and_with_allocator_escape_e0306_se08" 
         \\    var outer_buf = alloc_buffer(4);
         \\    let local_alloc = Allocator { _handle: 16384 };
         \\    with context.allocator = local_alloc {
-        \\        grow_buffer(outer_buf, 12);
+        \\        grow_buffer(&mut outer_buf, 12);
         \\    }
         \\    return outer_buf.len;
         \\}
@@ -2839,7 +2855,7 @@ test "test_regression_linear_complement_scalar_and_multi_autodrop_discharge" {
         \\    Msg(DropGuard),
         \\    Code(usize),
         \\}
-        \\pub fn consume_token(tok_in: sink LinearToken) -> i64 {
+        \\pub fn consume_token(tok_in: own LinearToken) -> i64 {
         \\    let LinearToken { id_num } = tok_in;
         \\    return id_num;
         \\}
@@ -2852,7 +2868,7 @@ test "test_regression_linear_complement_scalar_and_multi_autodrop_discharge" {
         \\        .Code(0xDEADBEEF)
         \\    };
         \\    if out_val is .Ok(live_tok) {
-        \\        return consume_token(live_tok);
+        \\        return consume_token(own live_tok);
         \\    }
         \\    return 99;
         \\}
@@ -2910,7 +2926,7 @@ test "test_regression_linear_complement_scalar_and_multi_autodrop_discharge" {
         \\    PathErr(DropGuard),
         \\    PairErr(DropGuard, DropGuard),
         \\}
-        \\pub fn consume_token(tok_in: sink LinearToken) -> i64 {
+        \\pub fn consume_token(tok_in: own LinearToken) -> i64 {
         \\    let LinearToken { id_num } = tok_in;
         \\    return id_num;
         \\}
@@ -2925,7 +2941,7 @@ test "test_regression_linear_complement_scalar_and_multi_autodrop_discharge" {
         \\        .PairErr(DropGuard { tag: 31 }, DropGuard { tag: 32 })
         \\    };
         \\    if res_val is .Ok(live_tok) {
-        \\        return consume_token(live_tok);
+        \\        return consume_token(own live_tok);
         \\    }
         \\    return -1;
         \\}
@@ -2991,7 +3007,7 @@ test "test_regression_partial_enum_variant_move_wildcard_autodrop" {
         \\}
         \\pub fn run_pure_ref_wildcard() -> i64 {
         \\    let pair_val: GuardPair = .Both(DropGuard { tag: 40 }, DropGuard { tag: 50 });
-        \\    if pair_val is .Both(ref first_ref, _) {
+        \\    if pair_val is .Both(&first_ref, _) {
         \\        @drop_trace(200);
         \\        return first_ref.tag;
         \\    }
@@ -3306,7 +3322,7 @@ test "test_regression_hir_if_condition_autodrop_scope_and_inclusive_slice_e0307"
         \\}
         \\pub fn run_if_cond_scope(is_inverted: bool) -> i64 {
         \\    if is_inverted {
-        \\        if !(make_opt_guard(true, 5) is not .None) {
+        \\        if not (make_opt_guard(true, 5) is not .None) {
         \\            @drop_trace(10);
         \\            return 1;
         \\        } else {
@@ -3444,5 +3460,89 @@ test "test_regression_const_initializer_cond_if_is_match_sast_gate_f" {
     try expectSastDiagnostic(allocator, 546, bad_const_guard_oob_src, .{}, .e0307_static_buffer_overflow);
 }
 
+test "test_phase76_dr22_sast_raw_uninit_out_leak_e0422_struct_move_and_parallel_swap" {
+    const allocator = std.testing.allocator;
 
+    // [1] `&raw mut uninit_buf` is safe (`0` SAST errors) while `..own base` moves `AutoDrop` fields cleanly:
+    const dr22_clean_src =
+        \\pub struct Vec[T] {
+        \\    pub len: usize,
+        \\}
+        \\pub struct PacketOwned {
+        \\    pub tag: u32,
+        \\    pub payload: Vec[u8],
+        \\}
+        \\pub fn raw_and_struct_move(left: &mut u32, right: &mut u32) -> u32 {
+        \\    var uninit_buf: [u8; 8];
+        \\    let raw_mut_ptr = &raw mut uninit_buf;
+        \\    unsafe {
+        \\        raw_mut_ptr.*[0] = 7;
+        \\    }
+        \\    (left.*, right.*) = (right.*, left.*);
+        \\    let pkt_a = PacketOwned { tag: 1, payload: Vec { len: 4 } };
+        \\    let pkt_b = PacketOwned { tag: 2, ..own pkt_a };
+        \\    return pkt_b.tag + left.*;
+        \\}
+    ;
+    var clean_bundle = try verifyCleanSast(allocator, 550, dr22_clean_src, .{});
+    defer clean_bundle.deinit();
 
+    // [2] Passing a live `AutoDrop` variable to `&out` emits `E0422`:
+    const out_overwrite_src =
+        \\pub struct OwnedBuf {
+        \\    pub len: usize,
+        \\}
+        \\impl OwnedBuf {
+        \\    pub fn drop(&mut self) {}
+        \\}
+        \\pub fn init_buf(dst: &out OwnedBuf) {
+        \\    dst.* = OwnedBuf { len: 1 };
+        \\}
+        \\pub fn bad_live_out() {
+        \\    var live_v = OwnedBuf { len: 5 };
+        \\    init_buf(&out live_v);
+        \\}
+    ;
+    try expectSastDiagnostic(allocator, 551, out_overwrite_src, .{}, .e0422_out_param_contract_violation);
+
+    // [3] Overlapping LHS places in parallel destructuring assignment `(val, val) = (1, 2)` emit `E0305`:
+    const overlap_swap_src =
+        \\pub fn bad_overlap_assign() -> i64 {
+        \\    var val: i64 = 0;
+        \\    (val, val) = (1, 2);
+        \\    return val;
+        \\}
+    ;
+    try expectSastDiagnostic(allocator, 552, overlap_swap_src, .{}, .e0305_exclusivity_violation);
+
+    // [4] `@no_alloc` formatted `@panic("…{x=}…")` + partial-move non-`own` `..base` spread pass SAST cleanly:
+    const no_alloc_panic_and_partial_spread_src =
+        \\pub struct DropHandle {
+        \\    pub id: u32,
+        \\}
+        \\impl DropHandle {
+        \\    pub fn drop(&mut self) {}
+        \\}
+        \\pub struct PacketMixed {
+        \\    pub code: u32,
+        \\    pub guard_keep: DropHandle,
+        \\}
+        \\@no_alloc
+        \\pub fn check_code_no_alloc(code: u32, label: str) -> u32 {
+        \\    if code == 0 {
+        \\        @panic("invalid {code=:#06x} in {label}");
+        \\    }
+        \\    if code == 999 {
+        \\        @panic(label);
+        \\    }
+        \\    return code;
+        \\}
+        \\pub fn move_field_with_copy_spread() -> u32 {
+        \\    let pkt_1 = PacketMixed { code: 42, guard_keep: DropHandle { id: 9 } };
+        \\    let pkt_2 = PacketMixed { guard_keep: own pkt_1.guard_keep, ..pkt_1 };
+        \\    return pkt_2.code + pkt_2.guard_keep.id;
+        \\}
+    ;
+    var spread_bundle = try verifyCleanSast(allocator, 553, no_alloc_panic_and_partial_spread_src, .{});
+    defer spread_bundle.deinit();
+}

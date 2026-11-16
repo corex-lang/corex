@@ -22,23 +22,23 @@ const BenchCase = corex.bench_harness.BenchCase;
 
 // --------------------------------------- CONSTS ----------------------------------------
 
-/// Representative 16-line `.cx` code block (`512` bytes) repeated 128 times to form a 64 KiB (`2,048` LOC) module.
+/// Representative 16-line `.cx` code block (`~512` bytes) repeated 128 times to form a 64 KiB (`2,048` LOC) module.
 const SYNTHETIC_BLOCK_16_LOC =
     "/// Computes bounded checksum across a borrowed slice of packet frames.\n" ++
-    "pub fn compute_frame_checksum(frames: &[PacketFrame], seed_val: u64) -> Result[u64, FrameError] {\n" ++
-    "    const PRIME_MULT: u64 = 0x9E37_79B9_7F4A_7C15;\n" ++
-    "    var acc_hash: u64 = seed_val +% 1_000_000;\n" ++
+    "pub fn compute_frame_checksum(frames: &[PacketFrame], seed_val: u64, /) -> u64!FrameError {\n" ++
+    "    const PRIME_MULT: u64 = 0x9E37_79B9_7F4A_7C15_u64;\n" ++
+    "    var acc_hash: u64 = seed_val +% 1_000_000_u64;\n" ++
     "    for idx in 0..frames.len() {\n" ++
-    "        let item = frames[idx];\n" ++
+    "        let item = &frames[idx];\n" ++
     "        if item.is_valid and not item.is_empty {\n" ++
     "            acc_hash = (acc_hash *% PRIME_MULT) ^ item.payload_len.max(1);\n" ++
     "        }\n" ++
     "    }\n" ++
     "    /* Verify non-zero state before returning to caller */\n" ++
-    "    let status_msg = \"hash={acc_hash} count={frames.len()}\\n\";\n" ++
-    "    let raw_tag = r#\"corex::net::frame_v1\"#;\n" ++
-    "    let sep_char = ':';\n" ++
-    "    return Ok(acc_hash);\n" ++
+    "    let status_msg = \"hash={acc_hash:#018x} count={frames.len()}\\n\";\n" ++
+    "    let raw_tag = b\"corex.net.frame_v1\";\n" ++
+    "    let sep_char = b':';\n" ++
+    "    return .Ok(acc_hash);\n" ++
     "}\n";
 
 /// Complete 64 KiB (`2,048` LOC) synthetic `.cx` module evaluated in `benchSyntheticModuleLex`.
@@ -52,13 +52,16 @@ const SYNTHETIC_MODULE_64K: [SYNTHETIC_BLOCK_16_LOC.len * 128]u8 = blk: {
     break :blk buf;
 };
 
-/// Literal-heavy `.cx` workload exercising radix integers, floats, nested `{expr}` strings, and raw strings.
+/// Literal-heavy `.cx` workload exercising radix integers, suffixes, multiline/byte/interp/raw strings, and chars.
 const LITERAL_WORKLOAD_CHUNK =
-    "const HEX_MASK: u64 = 0xDEAD_BEEF_CAFE_BABE;\n" ++
-    "const BIN_FLAGS: u32 = 0b1010_0101_1111_0000;\n" ++
-    "const OCT_PERMS: u16 = 0o755;\n" ++
-    "const FLOAT_TOL: f64 = 3.141_592_653e-12;\n" ++
-    "let msg = \"val={if x > 0 { \"inner {r#\"raw\"#}\" } else { \"zero\" }} \\x7F \\u{03B1}\\n\";\n" ++
+    "const HEX_MASK: u64 = 0xDEAD_BEEF_CAFE_BABE_u64;\n" ++
+    "const BIN_FLAGS: u32 = 0b1010_0101_1111_0000_u32;\n" ++
+    "const OCT_PERMS: u16 = 0o755_u16;\n" ++
+    "const FLOAT_TOL: f64 = 3.141_592_653e-12_f64;\n" ++
+    "let msg = \"{{v1}} val={if x > 0 { \"inner {r#\"raw\"#}\" } else { \"zero\" }} \\x7F \\u{03B1}\\n\";\n" ++
+    "let wire_bytes = b\"HTTP/1.1 200 OK\\r\\n\";\n" ++
+    "let sep_byte = b':';\n" ++
+    "let banner = \"\"\"\n    line {x=}\n    \"\"\";\n" ++
     "let regex_pat = r##\"^[a-zA-Z_][a-zA-Z0-9_]*$\"##;\n" ++
     "let glyphs = ['a', 'é', '─', '𐍈', '\\n', '\\t', '\\''];\n";
 
@@ -76,10 +79,10 @@ const LITERAL_WORKLOAD_BUFFER: [LITERAL_WORKLOAD_CHUNK.len * 64]u8 = blk: {
 /// Representative mix of 32 keywords, primitive types, `snake_case`, `PascalCase`, and `SCREAMING_SNAKE_CASE` lexemes.
 const IDENTIFIER_CLASSIFICATION_CORPUS = [_][]const u8{
     "pub",                "fn",                   "struct",              "enum",
-    "trait",              "impl",                 "comptime",            "bit_field",
+    "subscript",          "yield",                "comptime",            "bit_field",
     "errdefer",           "catch",                "return",              "while",
     "i32",                "u64",                  "usize",               "f64",
-    "bool",               "str",                  "never",               "unit",
+    "bool",               "str",                  "never",               "opaque",
     "_",                  "resolve_path",         "parse_expression",    "emit_diagnostic",
     "count_instructions", "has_side_effects",     "TokenBuffer",         "LosslessCstArena",
     "DiagnosticRenderer", "TransactionalPatcher", "MAX_TOKENS_PER_FILE", "DEFAULT_SLAB_SIZE",

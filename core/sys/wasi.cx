@@ -29,7 +29,7 @@ pub const WASI_STDERR_FD: i32 = 2;
 pub const WASI_ERRNO_SUCCESS: u16 = 0;
 
 // ------------------------------------- PUBLIC API --------------------------------------
-/// WASI Preview 1 `fd_write(fd, iovs_ptr, iovs_len, nwritten_out)` import prototype.
+/// WASI Preview 1 `fd_write(file_desc, iovs_ptr, iovs_len, nwritten_out)` import prototype.
 @link_name("fd_write")
 pub extern "C" fn wasi_fd_write(
     file_desc: i32,
@@ -43,23 +43,19 @@ pub extern "C" fn wasi_fd_write(
 pub extern "C" fn wasi_proc_exit(exit_code: i32) -> never;
 
 /// Safe wrapper writing `text` to WASI standard output (`fd = 1`).
-@inline
-@no_alloc
+@inline @no_alloc
 pub fn write_stdout(text: str) -> isize {
     return @sys_write(WASI_STDOUT_FD, text);
 }
 
 /// Safe wrapper writing `text` to WASI standard error (`fd = 2`).
-@inline
-@no_alloc
+@inline @no_alloc
 pub fn write_stderr(text: str) -> isize {
     return @sys_write(WASI_STDERR_FD, text);
 }
 
 /// Safe wrapper terminating the WASI instance with `status_code`.
-@cold
-@noinline
-@no_alloc
+@cold @no_alloc @noinline
 pub fn exit_process(status_code: i32) -> never {
     @sys_exit(status_code);
 }

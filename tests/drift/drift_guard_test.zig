@@ -1,8 +1,8 @@
 //! Repository-Wide Drift Guards (`tests/drift/drift_guard_test.zig`)
 //!
 //! Enforces zero colored emojis across the entire repository, 100% parity between `router.zig`
-//! tables and `corex --help`, `DIAGNOSTIC_CATALOG` subsystem prefix integrity, Phase 1–7.5 IR/VM/
-//! SAST/ABI struct layouts, `DR-20`/`DR-21` seams, enum contiguity, and diagnostic test coverage,
+//! tables and `corex --help`, `DIAGNOSTIC_CATALOG` subsystem prefix integrity, Phase 1–7.6 IR/VM/
+//! SAST/ABI struct layouts, `DR-20`–`DR-22` seams, enum contiguity, and diagnostic coverage,
 //! plus `< 150` column line length and 90-character top-level dividers across all `.zig`/`.cx` files.
 //!
 //! Prevents code/documentation drift and stylistic regressions automatically during `zig build test`.
@@ -121,6 +121,12 @@ fn checkZigFileFormattingAndDividers(
 
         const trimmed = std.mem.trimStart(u8, line, " ");
         if (std.mem.startsWith(u8, trimmed, "// ---") and std.mem.endsWith(u8, trimmed, "---")) {
+            if (trimmed.len != 90 and trimmed.len != 65) {
+                std.debug.print(
+                    "Drift Guard 4 divider width violation: `{s}:{d}` has {d} bytes (expected 90 or 65)\n",
+                    .{ zig_path, line_num, trimmed.len },
+                );
+            }
             try std.testing.expect(trimmed.len == 90 or trimmed.len == 65);
             const after_prefix = trimmed[3..];
             var left_dashes: usize = 0;
@@ -181,6 +187,7 @@ fn markReferencedIdentifiersInDir(
 
     while (try walker.next(io)) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig")) continue;
+        if (std.mem.endsWith(u8, entry.path, "diagnostic.zig")) continue;
         const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.path });
         defer allocator.free(full_path);
         const content = try std.Io.Dir.cwd().readFileAlloc(
@@ -325,8 +332,8 @@ test "test_drift_guard_phase1_token_kind_contiguity_and_keyword_table" {
     @setEvalBranchQuota(20_000);
     const token_enum_info = @typeInfo(TokenKind).@"enum";
     const token_values = std.enums.values(TokenKind);
-    try std.testing.expectEqual(@as(usize, 117), token_enum_info.field_names.len);
-    try std.testing.expectEqual(@as(usize, 117), token_values.len);
+    try std.testing.expectEqual(@as(usize, 120), token_enum_info.field_names.len);
+    try std.testing.expectEqual(@as(usize, 120), token_values.len);
 
     inline for (token_values, 0..) |tok_val, i| {
         try std.testing.expectEqual(@as(u8, @intCast(i)), @backingInt(tok_val));
@@ -336,13 +343,13 @@ test "test_drift_guard_phase1_token_kind_contiguity_and_keyword_table" {
 
     const keys = lexer.KEYWORD_OR_PRIM_MAP.keys();
     const values = lexer.KEYWORD_OR_PRIM_MAP.values();
-    try std.testing.expectEqual(@as(usize, 68), keys.len);
+    try std.testing.expectEqual(@as(usize, 70), keys.len);
 
-    var has_seen_keyword: [49]bool = @splat(false);
+    var has_seen_keyword: [50]bool = @splat(false);
     var prim_count: usize = 0;
     for (values) |kind_val| {
         const backing = @backingInt(kind_val);
-        if (backing < 49) {
+        if (backing < 50) {
             try std.testing.expect(!has_seen_keyword[backing]);
             has_seen_keyword[backing] = true;
         } else {
@@ -353,7 +360,8 @@ test "test_drift_guard_phase1_token_kind_contiguity_and_keyword_table" {
     for (has_seen_keyword) |has_seen| {
         try std.testing.expect(has_seen);
     }
-    try std.testing.expectEqual(@as(usize, 19), prim_count);
+    try std.testing.expectEqual(@as(usize, 20), prim_count);
+    try std.testing.expectEqual(TokenKind.prim_type, lexer.KEYWORD_OR_PRIM_MAP.get("opaque").?);
 }
 
 test "test_drift_guard_phase2_cst_node_kind_ast_tag_and_parser_diagnostics" {
@@ -378,9 +386,9 @@ test "test_drift_guard_phase2_cst_node_kind_ast_tag_and_parser_diagnostics" {
         try std.testing.expectEqualStrings(ast_enum_info.field_names[i], @tagName(ast_val));
     }
 
-    // [3] Verify `TokenSet128` covers all 117 `TokenKind`s (`@backingInt(tok) < 128`):
+    // [3] Verify `TokenSet128` covers all 120 `TokenKind`s (`@backingInt(tok) < 128`):
     const token_values = std.enums.values(TokenKind);
-    try std.testing.expectEqual(@as(usize, 117), token_values.len);
+    try std.testing.expectEqual(@as(usize, 120), token_values.len);
     var full_set = TokenSet128.EMPTY;
     for (token_values) |tok_val| {
         try std.testing.expect(@backingInt(tok_val) < 128);
@@ -421,9 +429,10 @@ test "test_drift_guard_phase3_query_db_fmt_engine_and_cli_flags" {
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(corex.QueryKey));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(corex.MemoHeader));
 
-    // [2] Verify `DocOp`, `GroupMode`, and 8-byte `DocInst` layout parity (`DR-14` Section 1.2):
+    // [2] Verify `DocOp`, `GroupMode`, and 8-byte `DocInst` layout parity (`DR-14` Section 1.2 & `DR-22` §3.4):
     const doc_op_values = std.enums.values(corex.DocOp);
-    try std.testing.expectEqual(@as(usize, 13), doc_op_values.len);
+    try std.testing.expectEqual(@as(usize, 14), doc_op_values.len);
+    try std.testing.expectEqual(@as(u8, 13), @backingInt(corex.DocOp.multiline_string));
     inline for (doc_op_values, 0..) |op_val, i| {
         try std.testing.expectEqual(@as(u8, @intCast(i)), @backingInt(op_val));
     }
@@ -467,12 +476,18 @@ test "test_drift_guard_phase4_type_node_layout_type_groups_and_diagnostics" {
         try std.testing.expectEqual(@as(u8, @intCast(i)), @backingInt(tag_val));
     }
 
-    // [2] Verify 13 Constrained Type Groups in `TypeGroupMask` (`32..44`):
+    // [2] Verify Constrained Type Groups in `TypeGroupMask` (`32..44`, slot `37` retired by `ADR-22D`):
     var grp_slot: u32 = 32;
     while (grp_slot <= 44) : (grp_slot += 1) {
         const grp_id = corex.TypeId.fromInt(grp_slot);
-        try std.testing.expect(grp_id.isBuiltinGroup());
-        try std.testing.expect(corex.TypeGroupMask.forBuiltinGroup(grp_id) != 0);
+        if (grp_slot == 37) {
+            try std.testing.expectEqual(corex.TypeId._retired_group_numeric, grp_id);
+            try std.testing.expect(!grp_id.isBuiltinGroup());
+            try std.testing.expectEqual(@as(u32, 0), corex.TypeGroupMask.forBuiltinGroup(grp_id));
+        } else {
+            try std.testing.expect(grp_id.isBuiltinGroup());
+            try std.testing.expect(corex.TypeGroupMask.forBuiltinGroup(grp_id) != 0);
+        }
     }
 
     // [3] Verify Phase 4 diagnostic codes (`E0400`–`E0415`, `W0401`, `W0402`, `E0502`):
@@ -908,15 +923,23 @@ test "test_drift_guard_phase7_abi_codegen_seam_layouts_and_core" {
 }
 
 test "test_drift_guard_phase7_5_dr21_surface_syntax_and_diagnostics" {
-    // [1] Verify `TokenKind` retired `.coloncolon` / `.colon_colon` and exact `DR-21` token ordinals:
+    // [1] Verify retired tokens and canonical `120`-variant `TokenKind` ordinals (`DR-21` & `DR-22` §3.1):
     try std.testing.expect(!@hasField(TokenKind, "coloncolon"));
     try std.testing.expect(!@hasDecl(TokenKind, "colon_colon"));
-    try std.testing.expectEqual(@as(u8, 38), @backingInt(TokenKind.kw_orelse));
-    try std.testing.expectEqual(@as(u8, 39), @backingInt(TokenKind.kw_with));
-    try std.testing.expectEqual(@as(u8, 40), @backingInt(TokenKind.kw_context));
+    try std.testing.expect(!@hasField(TokenKind, "kw_ref"));
+    try std.testing.expect(!@hasField(TokenKind, "ampamp"));
+    try std.testing.expect(!@hasDecl(TokenKind, "amp_amp"));
+    try std.testing.expectEqual(@as(u8, 16), @backingInt(TokenKind.kw_subscript));
+    try std.testing.expectEqual(@as(u8, 27), @backingInt(TokenKind.kw_with));
+    try std.testing.expectEqual(@as(u8, 28), @backingInt(TokenKind.kw_context));
+    try std.testing.expectEqual(@as(u8, 40), @backingInt(TokenKind.kw_orelse));
     try std.testing.expectEqual(@as(u8, 41), @backingInt(TokenKind.kw_unreachable));
-    try std.testing.expectEqual(@as(u8, 66), @backingInt(TokenKind.colon_eq));
-    try std.testing.expectEqual(@as(u8, 75), @backingInt(TokenKind.dollar));
+    try std.testing.expectEqual(@as(u8, 42), @backingInt(TokenKind.kw_yield));
+    try std.testing.expectEqual(@as(u8, 58), @backingInt(TokenKind.byte_lit));
+    try std.testing.expectEqual(@as(u8, 59), @backingInt(TokenKind.byte_string_lit));
+    try std.testing.expectEqual(@as(u8, 72), @backingInt(TokenKind.dotdotdot));
+    try std.testing.expectEqual(@as(u8, 80), @backingInt(TokenKind.colon_eq));
+    try std.testing.expectEqual(@as(u8, 81), @backingInt(TokenKind.dollar));
 
     // [2] Verify `--internal-core` CLI flag parsing and subcommand `--help` parity across `check`, `fmt`, and `upgrade`:
     var internal_sink = corex.DiagnosticSink.init(std.testing.allocator);
@@ -974,8 +997,8 @@ test "test_drift_guard_phase7_5_dr21_surface_syntax_and_diagnostics" {
         try std.testing.expectEqual(@as(u8, @intCast(i)), resolved.?.slot_ordinal);
     }
 
-    // [4] Verify all 8 `DR-21` `DiagnosticCode` tags (`78` total catalog entries) and test coverage:
-    try std.testing.expectEqual(@as(usize, 78), diagnostic.DIAGNOSTIC_CATALOG.len);
+    // [4] Verify all 8 `DR-21` `DiagnosticCode` tags (`111` total catalog entries) and test coverage:
+    try std.testing.expectEqual(@as(usize, 111), diagnostic.DIAGNOSTIC_CATALOG.len);
     const dr21_specs = [_]struct {
         /// Canonical Phase 7.5 `DR-21` `DiagnosticCode` tag.
         code: DiagnosticCode,
@@ -1025,5 +1048,155 @@ test "test_drift_guard_phase7_5_dr21_surface_syntax_and_diagnostics" {
             );
         }
         try std.testing.expect(has_ref);
+    }
+}
+
+test "test_drift_guard_phase7_6_dr22_surface_syntax_upgrade_rules_and_diagnostics" {
+    // [1] Verify 15-rule `UPGRADE_RULE_CATALOG` (`UR-21-00`–`UR-21-07` & `UR-22-00`–`UR-22-06`):
+    try expectContiguousEnum(corex.UpgradeRuleId);
+    const upgrade_catalog = corex.upgrade_rules.UPGRADE_RULE_CATALOG;
+    try std.testing.expectEqual(@as(usize, 15), upgrade_catalog.len);
+
+    const expected_rule_codes = [_][]const u8{
+        "UR-21-00",
+        "UR-21-01",
+        "UR-21-02",
+        "UR-21-03",
+        "UR-21-04",
+        "UR-21-05",
+        "UR-21-06",
+        "UR-21-07",
+        "UR-22-00",
+        "UR-22-01",
+        "UR-22-02",
+        "UR-22-03",
+        "UR-22-04",
+        "UR-22-05",
+        "UR-22-06",
+    };
+    for (upgrade_catalog, 0..) |rule_desc, i| {
+        try std.testing.expectEqual(i, @as(usize, @backingInt(rule_desc.id)));
+        try std.testing.expectEqualStrings(expected_rule_codes[i], rule_desc.rule_code);
+        try std.testing.expect(rule_desc.summary.len > 0);
+        try std.testing.expectEqual(
+            rule_desc.id,
+            corex.upgrade_rules.lookupUpgradeRule(rule_desc.rule_code).?,
+        );
+        var j: usize = i + 1;
+        while (j < upgrade_catalog.len) : (j += 1) {
+            try std.testing.expect(!std.mem.eql(u8, rule_desc.rule_code, upgrade_catalog[j].rule_code));
+        }
+    }
+
+    // [2] Verify `DR-22` built-in attributes (`builder`, `builder_item`, `cfg`, `constructor`) & `FmtSpec`:
+    const required_dr22_attrs = [_][]const u8{
+        "builder",
+        "builder_item",
+        "cfg",
+        "constructor",
+    };
+    for (required_dr22_attrs) |attr_name| {
+        try std.testing.expect(corex.type_system.BUILTIN_ATTRIBUTE_MAP.has(attr_name));
+    }
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(corex.FmtSpec));
+    try std.testing.expectEqual(@as(u32, 22), corex.TypeId.opaque_ty.toU32());
+    try std.testing.expectEqual(@as(u32, 45), corex.TypeId.source_loc_ty.toU32());
+    try std.testing.expectEqual(@as(u32, 46), corex.TypeId.fmt_spec_ty.toU32());
+    try std.testing.expectEqual(@as(u32, 47), corex.TypeId.fmt_args_ty.toU32());
+    try std.testing.expectEqual(@as(u32, 48), corex.TypeId.bencher_ty.toU32());
+    try std.testing.expectEqual(@as(u32, 49), corex.TypeId.task_group_base_ty.toU32());
+    try std.testing.expectEqual(@as(u32, 50), corex.TypeId.task_handle_base_ty.toU32());
+
+    // [3] Verify all 33 `DR-22` `DiagnosticCode` tags (`E0113`–`E0117`, `E0219`–`E0228`, `E0420`–`E0437`):
+    const dr22_specs = [_]struct {
+        /// Canonical Phase 7.6 `DR-22` `DiagnosticCode` tag.
+        code: DiagnosticCode,
+        /// Expected 5-character CLI code string.
+        expected_str: []const u8,
+    }{
+        .{ .code = .e0113_retired_logical_and, .expected_str = "E0113" },
+        .{ .code = .e0114_invalid_brace_escape, .expected_str = "E0114" },
+        .{ .code = .e0115_multiline_string_opening, .expected_str = "E0115" },
+        .{ .code = .e0116_multiline_string_indent, .expected_str = "E0116" },
+        .{ .code = .e0117_non_ascii_byte_literal, .expected_str = "E0117" },
+        .{ .code = .e0219_retired_logical_or, .expected_str = "E0219" },
+        .{ .code = .e0220_retired_bang_prefix, .expected_str = "E0220" },
+        .{ .code = .e0221_retired_mutability_or_param_mode, .expected_str = "E0221" },
+        .{ .code = .e0222_chained_result_type, .expected_str = "E0222" },
+        .{ .code = .e0223_retired_attribute_eq, .expected_str = "E0223" },
+        .{ .code = .e0224_retired_semicolon_member_sep, .expected_str = "E0224" },
+        .{ .code = .e0225_retired_noalloc_attribute, .expected_str = "E0225" },
+        .{ .code = .e0226_retired_const_raw_ptr, .expected_str = "E0226" },
+        .{ .code = .e0227_retired_prefix_deref, .expected_str = "E0227" },
+        .{ .code = .e0228_invalid_param_zone_separator, .expected_str = "E0228" },
+        .{ .code = .e0420_missing_call_site_own, .expected_str = "E0420" },
+        .{ .code = .e0421_non_copy_value_parameter, .expected_str = "E0421" },
+        .{ .code = .e0422_out_param_contract_violation, .expected_str = "E0422" },
+        .{ .code = .e0423_invalid_bitfield_or_enum_cast, .expected_str = "E0423" },
+        .{ .code = .e0424_retired_slice_field_access, .expected_str = "E0424" },
+        .{ .code = .e0425_invalid_opaque_type_usage, .expected_str = "E0425" },
+        .{ .code = .e0426_non_trailing_generic_default, .expected_str = "E0426" },
+        .{ .code = .e0427_invalid_error_composition, .expected_str = "E0427" },
+        .{ .code = .e0428_named_arg_for_positional_only, .expected_str = "E0428" },
+        .{ .code = .e0429_positional_arg_for_keyword_only, .expected_str = "E0429" },
+        .{ .code = .e0430_non_default_after_default_param, .expected_str = "E0430" },
+        .{ .code = .e0431_invalid_format_specifier, .expected_str = "E0431" },
+        .{ .code = .e0432_missing_struct_field_initializer, .expected_str = "E0432" },
+        .{ .code = .e0433_inaccessible_field_or_visibility, .expected_str = "E0433" },
+        .{ .code = .e0434_invalid_parallel_assign_target, .expected_str = "E0434" },
+        .{ .code = .e0435_invalid_cfg_predicate, .expected_str = "E0435" },
+        .{ .code = .e0436_builder_item_outside_scope, .expected_str = "E0436" },
+        .{ .code = .e0437_invalid_labeled_match_continue, .expected_str = "E0437" },
+    };
+    try std.testing.expectEqual(@as(usize, 33), dr22_specs.len);
+
+    var tag_identifiers: [dr22_specs.len][]const u8 = undefined;
+    var has_src_reference: [dr22_specs.len]bool = @splat(false);
+    var has_test_reference: [dr22_specs.len]bool = @splat(false);
+    for (dr22_specs, 0..) |spec, i| {
+        const entry = diagnostic.DIAGNOSTIC_CATALOG[@backingInt(spec.code)];
+        try std.testing.expectEqualStrings(spec.expected_str, spec.code.asCodeStr());
+        try std.testing.expectEqualStrings(spec.expected_str, entry.code_str);
+        try std.testing.expect(entry.title.len > 0);
+        try std.testing.expect(entry.explanation.len > 0);
+        tag_identifiers[i] = @tagName(spec.code);
+    }
+
+    try markReferencedIdentifiersInDir(
+        std.testing.allocator,
+        std.testing.io,
+        "stage0/src",
+        &tag_identifiers,
+        &has_src_reference,
+    );
+    try markReferencedIdentifiersInDir(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/unit",
+        &tag_identifiers,
+        &has_test_reference,
+    );
+    try markReferencedIdentifiersInDir(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/snapshots",
+        &tag_identifiers,
+        &has_test_reference,
+    );
+    for (0..dr22_specs.len) |i| {
+        if (!has_src_reference[i]) {
+            std.debug.print(
+                "Phase 7.6 diagnostic `{s}` is not referenced in `stage0/src/`\n",
+                .{tag_identifiers[i]},
+            );
+        }
+        try std.testing.expect(has_src_reference[i]);
+        if (!has_test_reference[i]) {
+            std.debug.print(
+                "Phase 7.6 diagnostic `{s}` is not referenced in `tests/unit/` or `tests/snapshots/`\n",
+                .{tag_identifiers[i]},
+            );
+        }
+        try std.testing.expect(has_test_reference[i]);
     }
 }

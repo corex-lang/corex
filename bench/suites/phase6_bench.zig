@@ -7,7 +7,7 @@
 //!    synthetic `.cx` module with borrows, custom `Drop` glue, contracts, and slice loops.
 //! 2. `sast_pentagon_4k_ssa_bce`: `Pass 4` `Intv` + Demand-Sliced Sparse ABCD Pentagon solver on a
 //!    single heavy function (`>= 4,000` SSA instructions) with guarded array/slice accesses and
-//!    modular indexing (`raw % slice.len`), enforcing `peak_pentagon_bytes < 2 MiB` (`Fix-06A`).
+//!    modular indexing (`raw % slice.len()`), enforcing `peak_pentagon_bytes < 2 MiB` (`Fix-06A`).
 //! 3. `sast_early_cutoff_db_128fn`: Incremental `CompilerDb` re-verification across a `128`-function
 //!    call chain when the leaf function's private implementation mutates without changing its
 //!    34-byte caller-observable `SAST_SUMMARY_PROJ_FLAG` summary.
@@ -165,7 +165,7 @@ const SYNTHETIC_PHASE6_PREAMBLE =
     "    }\n" ++
     "}\n" ++
     "\n" ++
-    "pub fn consume_guard(own guard: sink TrackedGuard) -> i64 {\n" ++
+    "pub fn consume_guard(guard: own TrackedGuard) -> i64 {\n" ++
     "    return guard.id;\n" ++
     "}\n" ++
     "\n" ++
@@ -192,14 +192,14 @@ const SYNTHETIC_PHASE6_WORKER =
     "    let slice_view: &[i64] = borrow_slice_view(&local_lanes);\n" ++
     "    var acc: i64 = outer_guard.id;\n" ++
     "    if take_move {\n" ++
-    "        acc = mask_lane(acc, consume_guard(branch_guard));\n" ++
+    "        acc = mask_lane(acc, consume_guard(own branch_guard));\n" ++
     "    }\n" ++
-    "    if slice_view.len > 0 {\n" ++
-    "        acc = mask_lane(acc, slice_view[probe_idx % slice_view.len]);\n" ++
+    "    if slice_view.len() > 0 {\n" ++
+    "        acc = mask_lane(acc, slice_view[probe_idx % slice_view.len()]);\n" ++
     "    }\n" ++
     "    var step_idx: usize = 0;\n" ++
     "    while step_idx < 4 {\n" ++
-    "        if step_idx < slice_view.len {\n" ++
+    "        if step_idx < slice_view.len() {\n" ++
     "            acc = mask_lane(acc, slice_view[step_idx]);\n" ++
     "        }\n" ++
     "        step_idx += 1;\n" ++
@@ -255,7 +255,7 @@ fn buildPentagon4kKernelSource(allocator: std.mem.Allocator) ![]u8 {
             "pub fn heavy_pentagon_kernel(data: &[i64], raw_idx: usize) -> i64 {\n" ++
             "    let fixed_lut: [i64; 8] = [3, 5, 7, 11, 13, 17, 19, 23];\n" ++
             "    var acc: i64 = fixed_lut[raw_idx & 7];\n" ++
-            "    if data.len > 0 {\n",
+            "    if data.len() > 0 {\n",
     );
 
     var i: usize = 0;
@@ -264,10 +264,10 @@ fn buildPentagon4kKernelSource(allocator: std.mem.Allocator) ![]u8 {
         const block_text = try std.fmt.bufPrint(
             &block_buf,
             "        let idx_{d}: usize = (raw_idx & 255) + {d};\n" ++
-                "        if idx_{d} < data.len {{\n" ++
+                "        if idx_{d} < data.len() {{\n" ++
                 "            let direct_v_{d} = data[idx_{d}];\n" ++
-                "            let mod_a_{d} = data[(idx_{d} + 1) % data.len];\n" ++
-                "            let mod_b_{d} = data[(idx_{d} + 3) % data.len];\n" ++
+                "            let mod_a_{d} = data[(idx_{d} + 1) % data.len()];\n" ++
+                "            let mod_b_{d} = data[(idx_{d} + 3) % data.len()];\n" ++
                 "            let lut_v_{d} = fixed_lut[idx_{d} & 7];\n" ++
                 "            acc = ((acc ^ direct_v_{d}) | (mod_a_{d} & 1023)) ^ (mod_b_{d} & lut_v_{d});\n" ++
                 "        }}\n",

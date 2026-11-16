@@ -1,15 +1,15 @@
 //! Unit & Differential Execution Tests for Stage-1 `core` (`tests/unit/core_stdlib_test.zig`)
 //!
-//! Verifies all Phase 7 Stage-1 minimal `core` library invariants (`DR-08`, `phase7_spec.md` §5.1):
+//! Verifies all Phase 7.6 (`DR-22`) Stage-1 minimal `core` library invariants:
 //! - All 12 `core/**/*.cx` files satisfy 3-part `//!` headers, `< 150` column line limits,
 //!   canonical 90-char / 65-char section dividers, and `formatSourceWithOptions` idempotency
 //!   (`is_changed == false`, zero parse errors).
 //! - Full multi-file `core` hierarchy resolves, typechecks, lowers to `HIR`/`MIR`, and passes
-//!   4-pass `mir_sast` with zero errors and zero warnings.
-//! - `@cache_aligned` `core.mem.CachePadded[u64]` (`cx.mem.CachePadded[u64]`) resolves to `64B` alignment on `x86_64` and
-//!   `128B` alignment on `aarch64-macos` (`D-10A`), cross-compiles to `.o` across `x86_64-linux`,
-//!   `aarch64-macos`, and `wasm32-wasi` in both Tier A and Tier B, and passes the 4-tier
-//!   `diff_oracle` (`MirVm --dev`, `MirVm --release`, Tier A C99, Tier B LLVM).
+//!   4-pass `mir_sast` (`@std_cap_boundary(clears: [unsafe_op])`) with zero errors and warnings.
+//! - `@cache_aligned` `core.mem.CachePadded[u64]` (`cx.mem.CachePadded[u64]`) resolves to `64B`
+//!   alignment on `x86_64`, `128B` alignment on `aarch64-macos` (`D-10A`), cross-compiles to `.o`
+//!   across `x86_64-linux`, `aarch64-macos`, `x86_64-windows` (`*mut opaque`), and `wasm32-wasi`
+//!   in both Tier A and Tier B, and passes the 4-tier `diff_oracle`.
 
 const std = @import("std");
 const corex = @import("corex");
@@ -177,6 +177,7 @@ test "test_core_stdlib_all_12_files_canonical_format_headers_and_zero_diagnostic
     try db.setInternalCore(true);
     const core_fids = try loadCoreTreeIntoDb(allocator, io, &db, 0);
 
+    var has_seen_atomic_inline_test = false;
     for (core_fids, 0..) |fid, i| {
         const mod_label = CORE_MODULE_PATHS[i];
         const parsed_art = try db.parseCst(fid);
@@ -194,6 +195,9 @@ test "test_core_stdlib_all_12_files_canonical_format_headers_and_zero_diagnostic
 
         const item_entries = (try db.extractItemTree(fid)).entries;
         for (item_entries) |entry| {
+            if (entry.kind == .test_decl) {
+                has_seen_atomic_inline_test = true;
+            }
             const body_art = try db.typecheckBody(entry.def_id);
             if (db.getBodyDiagnostics(entry.def_id)) |body_sink| {
                 if (body_sink.diagnostics.items.len > 0) dumpSinkOnFailure(mod_label, body_sink);
@@ -209,6 +213,7 @@ test "test_core_stdlib_all_12_files_canonical_format_headers_and_zero_diagnostic
             try std.testing.expect(sast_art.is_verified_sound);
         }
     }
+    try std.testing.expect(has_seen_atomic_inline_test);
 }
 
 test "test_core_mem_cache_padded_target_dependent_64b_vs_128b_apple_silicon" {
@@ -285,6 +290,7 @@ test "test_core_mem_cache_padded_target_dependent_64b_vs_128b_apple_silicon" {
             },
         );
         defer c_art.deinit(allocator);
+        if (sink.hasErrors()) dumpSinkOnFailure("cache_padded_c99", &sink);
         try std.testing.expect(!sink.hasErrors());
         try std.testing.expect(
             std.mem.indexOf(u8, c_art.emitted_text, case_item.expected_c_attr) != null,
@@ -314,20 +320,25 @@ test "test_core_stdlib_cross_target_tier_a_and_tier_b_compilation" {
     const io = std.testing.io;
 
     const harness_src =
-        "//! Cross-Target Stage-1 `core` Smoke Consumer\n" ++
+        "//! Cross-Target Stage-1 `core` Smoke Consumer (`DR-22`)\n" ++
         "use cx.primitives.clamp_i32;\n" ++
-        "use cx.mem.{align_up_usize, size_of_type};\n" ++
-        "use cx.atomic.{ORDER_SEQ_CST, atomic_u32_fetch_add, atomic_u32_new};\n" ++
+        "use cx.mem.{align_up, init_slot, size_of_type, swap};\n" ++
+        "use cx.atomic.{AtomicU32, Ordering, fence};\n" ++
         "use cx.simd.{add_v4i32, reduce_add_v4i32, splat_v4i32};\n" ++
         "use cx.runtime.poll_reload;\n" ++
         "\n" ++
         "pub fn exercise_core_cross_target(raw_input: i32) -> i32 {\n" ++
         "    poll_reload();\n" ++
         "    let clamped: i32 = clamp_i32(raw_input, -50, 50);\n" ++
-        "    var counter = atomic_u32_new(10);\n" ++
-        "    let prev_count: u32 = atomic_u32_fetch_add(counter, 5, ORDER_SEQ_CST);\n" ++
-        "    let vec_sum = add_v4i32(splat_v4i32(clamped), splat_v4i32(3));\n" ++
-        "    let aligned_sz: usize = align_up_usize(size_of_type[u64](), 16);\n" ++
+        "    let counter = AtomicU32.new(10);\n" ++
+        "    let prev_count: u32 = counter.fetch_add(5);\n" ++
+        "    fence(order: Ordering.Acquire);\n" ++
+        "    var slot_left: i32 = 3;\n" ++
+        "    var slot_right: i32;\n" ++
+        "    init_slot(&out slot_right, clamped);\n" ++
+        "    swap(&mut slot_left, &mut slot_right);\n" ++
+        "    let vec_sum = add_v4i32(splat_v4i32(slot_left), splat_v4i32(slot_right));\n" ++
+        "    let aligned_sz: usize = align_up(size_of_type[u64](), 16);\n" ++
         "    return reduce_add_v4i32(vec_sum) + (prev_count as i32) + (aligned_sz as i32);\n" ++
         "}\n";
 
@@ -387,7 +398,7 @@ test "test_core_stdlib_cross_target_tier_a_and_tier_b_compilation" {
 
         var ll_sink = DiagnosticSink.init(allocator);
         defer ll_sink.deinit();
-        var ll_art = try db.compileModuleArtifact(
+        var ll_art = db.compileModuleArtifact(
             app_fid,
             .{
                 .tier_b_llvm = .{
@@ -401,7 +412,10 @@ test "test_core_stdlib_cross_target_tier_a_and_tier_b_compilation" {
                 .io = io,
                 .diagnostic_sink = &ll_sink,
             },
-        );
+        ) catch |err| {
+            dumpSinkOnFailure("core_cross_llvm", &ll_sink);
+            return err;
+        };
         defer ll_art.deinit(allocator);
         if (ll_sink.hasErrors()) dumpSinkOnFailure("core_cross_llvm", &ll_sink);
         try std.testing.expect(!ll_sink.hasErrors());
@@ -413,17 +427,14 @@ test "test_core_stdlib_four_tier_differential_oracle_end_to_end" {
     const io = std.testing.io;
 
     const app_source =
-        "//! End-to-End 4-Tier Differential `core` Verification Program\n" ++
+        "//! End-to-End 4-Tier Differential `core` Verification Program (`DR-22`)\n" ++
         "use cx.primitives.{abs_diff_u32, clamp_i32, max_i64, min_i32};\n" ++
         "use cx.mem.{\n" ++
-        "    align_of_type, align_up_usize, cache_padded_new,\n" ++
-        "    is_power_of_two_usize, size_of_type, zeroed_value,\n" ++
+        "    CachePadded, align_of_type, align_up, align_up_usize, cache_padded_new,\n" ++
+        "    copy_nonoverlapping, init_slot, is_power_of_two_usize, read_volatile_u64,\n" ++
+        "    size_of_type, swap, write_volatile_u64, zeroed_value,\n" ++
         "};\n" ++
-        "use cx.atomic.{\n" ++
-        "    MemoryOrder, ORDER_SEQ_CST, atomic_bool_new, atomic_bool_swap,\n" ++
-        "    atomic_u32_compare_exchange, atomic_u32_fetch_add,\n" ++
-        "    atomic_u32_load, atomic_u32_new, fence, order_to_code,\n" ++
-        "};\n" ++
+        "use cx.atomic.{AtomicBool, AtomicU32, MemoryOrder, Ordering, fence};\n" ++
         "use cx.simd.{\n" ++
         "    add_v16u8, add_v4i32, mul_v4i32, reduce_add_v16u8,\n" ++
         "    reduce_add_v4i32, splat_v16u8, splat_v4i32,\n" ++
@@ -434,7 +445,7 @@ test "test_core_stdlib_four_tier_differential_oracle_end_to_end" {
         "\n" ++
         "pub fn main() -> i32 {\n" ++
         "    poll_reload();\n" ++
-        "    assert_true(!has_pending_reload(), \"stage0 reload flag must be false\");\n" ++
+        "    assert_true(not has_pending_reload(), \"stage0 reload flag must be false\");\n" ++
         "    assert_true(size_of_type[u32]() == 4, \"u32 size must be 4\");\n" ++
         "    assert_true(align_of_type[u64]() == 8, \"u64 align must be 8\");\n" ++
         "    assert_true(is_power_of_two_usize(align_of_type[u64]()), \"u64 align pow2\");\n" ++
@@ -442,26 +453,41 @@ test "test_core_stdlib_four_tier_differential_oracle_end_to_end" {
         "    let clamped_val: i32 = clamp_i32(min_i32(99, 42), 0, 30);\n" ++
         "    let diff_val: u32 = abs_diff_u32(15, 40);\n" ++
         "    let max_wide: i64 = max_i64(zeroed_value[i64](), 7);\n" ++
-        "    let padded_slot = cache_padded_new[i32](clamped_val);\n" ++
-        "    let rounded_off: usize = align_up_usize(size_of_type[u32]() + 1, 8);\n" ++
+        "    let padded_slot: CachePadded[i32] = cache_padded_new[i32](clamped_val);\n" ++
+        "    let rounded_off: usize = align_up(size_of_type[u32]() + 1, 8);\n" ++
+        "    assert_true(align_up_usize(5, 8) == rounded_off, \"align_up_usize alias parity\");\n" ++
         "\n" ++
-        "    var flag_cell = atomic_bool_new(false);\n" ++
-        "    let ord_mode: MemoryOrder = .SeqCst;\n" ++
-        "    let was_set: bool = atomic_bool_swap(flag_cell, true, order_to_code(ord_mode));\n" ++
-        "    assert_true(!was_set, \"initial atomic bool must be false\");\n" ++
+        "    var out_slot: i32;\n" ++
+        "    init_slot(&out out_slot, 12);\n" ++
+        "    var partner_slot: i32 = 5;\n" ++
+        "    swap(&mut out_slot, &mut partner_slot);\n" ++
+        "    assert_true(out_slot == 5 and partner_slot == 12, \"swap + init_slot MVS check\");\n" ++
         "\n" ++
-        "    var counter_cell = atomic_u32_new(10);\n" ++
-        "    let prev_u32: u32 = atomic_u32_fetch_add(counter_cell, diff_val, ORDER_SEQ_CST);\n" ++
-        "    let (_, did_swap) = atomic_u32_compare_exchange(\n" ++
-        "        counter_cell,\n" ++
-        "        35,\n" ++
-        "        40,\n" ++
-        "        ORDER_SEQ_CST,\n" ++
-        "        ORDER_SEQ_CST,\n" ++
-        "    );\n" ++
-        "    assert_true(did_swap, \"cmpxchg expected 35 -> 40\");\n" ++
-        "    fence(ORDER_SEQ_CST);\n" ++
-        "    let final_u32: u32 = atomic_u32_load(&counter_cell, ORDER_SEQ_CST);\n" ++
+        "    let src_arr: [i32; 2] = [3, 4];\n" ++
+        "    var dst_arr: [i32; 2] = [0, 0];\n" ++
+        "    let copied_len: usize = copy_nonoverlapping[i32](&mut dst_arr, &src_arr) catch 0;\n" ++
+        "    assert_true(copied_len == 2 and dst_arr[1] == 4, \"copy_nonoverlapping check\");\n" ++
+        "\n" ++
+        "    var mmio_reg: u64 = 0;\n" ++
+        "    unsafe {\n" ++
+        "        write_volatile_u64(&raw mut mmio_reg, 9_u64);\n" ++
+        "    }\n" ++
+        "    let mmio_read: u64 = unsafe { read_volatile_u64(&raw mmio_reg) };\n" ++
+        "    assert_true(mmio_read == 9_u64, \"volatile raw pointer roundtrip\");\n" ++
+        "\n" ++
+        "    let flag_cell = AtomicBool.new(false);\n" ++
+        "    let ord_mode: Ordering = MemoryOrder.SeqCst;\n" ++
+        "    let was_set: bool = flag_cell.swap(true, order: ord_mode);\n" ++
+        "    assert_true(not was_set and flag_cell.load(), \"initial atomic bool must swap false -> true\");\n" ++
+        "\n" ++
+        "    let counter = AtomicU32.new(10);\n" ++
+        "    let prev_u32: u32 = counter.fetch_add(5);\n" ++
+        "    let prev_u32_2: u32 = counter.fetch_add(diff_val - 5);\n" ++
+        "    assert_true(prev_u32_2 == 15, \"second fetch_add observed 15\");\n" ++
+        "    assert_true(counter.compare_exchange(35, 40) is .Ok(35), \"cmpxchg expected 35 -> 40\");\n" ++
+        "    assert_true(counter.compare_exchange(35, 99) is .Err(40), \"cmpxchg mismatch observes 40\");\n" ++
+        "    fence();\n" ++
+        "    let final_u32: u32 = counter.load(order: .Acquire);\n" ++
         "\n" ++
         "    let v4_sum = mul_v4i32(add_v4i32(splat_v4i32(2), splat_v4i32(3)), splat_v4i32(2));\n" ++
         "    let v16_sum = add_v16u8(splat_v16u8(1), splat_v16u8(2));\n" ++
@@ -477,7 +503,10 @@ test "test_core_stdlib_four_tier_differential_oracle_end_to_end" {
         "        reduce_add_v4i32(v4_sum) +\n" ++
         "        (reduce_add_v16u8(v16_sum) as i32) +\n" ++
         "        (rounded_off as i32) +\n" ++
-        "        (max_wide as i32);\n" ++
+        "        (max_wide as i32) +\n" ++
+        "        partner_slot +\n" ++
+        "        dst_arr[0] +\n" ++
+        "        (mmio_read as i32);\n" ++
         "}\n";
 
     var db = try CompilerDb.init(allocator);
@@ -488,6 +517,25 @@ test "test_core_stdlib_four_tier_differential_oracle_end_to_end" {
     const app_fid = FileId.fromInt(0);
     _ = try db.setInput(app_fid, app_source, .low);
 
+    const parsed_app = try db.parseCst(app_fid);
+    if (parsed_app.diagnostics.diagnostics.items.len > 0) {
+        dumpSinkOnFailure("app_parse", &parsed_app.diagnostics);
+    }
+    _ = try db.resolveSignatures(app_fid);
+    if (db.getSignatureDiagnostics(app_fid)) |sig_sink| {
+        if (sig_sink.diagnostics.items.len > 0) dumpSinkOnFailure("app_sig", sig_sink);
+    }
+    for ((try db.extractItemTree(app_fid)).entries) |entry| {
+        _ = try db.typecheckBody(entry.def_id);
+        if (db.getBodyDiagnostics(entry.def_id)) |body_sink| {
+            if (body_sink.diagnostics.items.len > 0) dumpSinkOnFailure("app_body", body_sink);
+        }
+        _ = try db.verifySastMir(entry.def_id);
+        if (db.getSastDiagnostics(entry.def_id)) |sast_sink| {
+            if (sast_sink.diagnostics.items.len > 0) dumpSinkOnFailure("app_sast", sast_sink);
+        }
+    }
+
     var report = try corex.runFourTierDiffOracleOnDb(allocator, &db, app_fid, .{ .io = io });
     defer report.deinit(allocator);
 
@@ -496,8 +544,8 @@ test "test_core_stdlib_four_tier_differential_oracle_end_to_end" {
     }
     try std.testing.expect(report.is_all_matching);
     try std.testing.expect(!report.outcomes[0].has_trapped);
-    // 30 + 10 + 40 + 40 + 48 + 8 + 7 = 183
-    try std.testing.expectEqual(@as(i64, 183), report.outcomes[0].return_scalar_i64);
+    // 30 + 10 + 40 + 40 + 48 + 8 + 7 + 12 + 3 + 9 = 207
+    try std.testing.expectEqual(@as(i64, 207), report.outcomes[0].return_scalar_i64);
     try std.testing.expectEqualStrings("core-stdout-ok\n", report.outcomes[0].stdout_bytes);
     try std.testing.expectEqualStrings("core-stderr-ok\n", report.outcomes[0].stderr_bytes);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 101, 202 }, report.outcomes[0].drop_trace);
@@ -523,6 +571,26 @@ test "test_regression_core_sys_externs_dedup_and_compile_to_object" {
         "    return wrote_a + wrote_b;\n" ++
         "}\n";
 
+    const win32_src =
+        "//! Regression probe for `core.sys.windows` `*mut opaque` `HANDLE` / `LPOVERLAPPED` prototypes\n" ++
+        "use core.sys.windows.{\n" ++
+        "    STD_OUTPUT_HANDLE, win32_exit_process, win32_get_std_handle, win32_write_file,\n" ++
+        "};\n\n" ++
+        "pub fn exercise_win32_externs(flag: i32) -> i32 {\n" ++
+        "    if flag == -666 {\n" ++
+        "        unsafe { win32_exit_process(1); }\n" ++
+        "    }\n" ++
+        "    var written: u32 = 0;\n" ++
+        "    let sample_byte: u8 = b'X';\n" ++
+        "    let std_handle: *mut opaque = unsafe {\n" ++
+        "        win32_get_std_handle(STD_OUTPUT_HANDLE as u32)\n" ++
+        "    };\n" ++
+        "    let null_overlapped: *mut opaque = 0 as *mut opaque;\n" ++
+        "    return unsafe {\n" ++
+        "        win32_write_file(std_handle, &raw sample_byte, 1, &raw mut written, null_overlapped)\n" ++
+        "    };\n" ++
+        "}\n";
+
     const wasi_src =
         "//! Regression probe for `core.sys.wasi` `wasi_snapshot_preview1` imports\n" ++
         "use core.sys.wasi.{WasiCiovec, wasi_fd_write, wasi_proc_exit};\n\n" ++
@@ -532,7 +600,7 @@ test "test_regression_core_sys_externs_dedup_and_compile_to_object" {
         "    }\n" ++
         "    var written: usize = 0;\n" ++
         "    let iov = WasiCiovec { buf_ptr: 0 as *u8, buf_len: 0 };\n" ++
-        "    return unsafe { wasi_fd_write(1, &iov as *WasiCiovec, 1, &mut written as *mut usize) };\n" ++
+        "    return unsafe { wasi_fd_write(1, &raw iov, 1, &raw mut written) };\n" ++
         "}\n";
 
     const cases = [_]struct {
@@ -545,6 +613,7 @@ test "test_regression_core_sys_externs_dedup_and_compile_to_object" {
     }{
         .{ .spec = TargetSpec.X86_64_LINUX, .src = posix_src, .stem = ".zig-cache/core_sys_linux" },
         .{ .spec = TargetSpec.AARCH64_MACOS, .src = posix_src, .stem = ".zig-cache/core_sys_macos" },
+        .{ .spec = TargetSpec.X86_64_WINDOWS, .src = win32_src, .stem = ".zig-cache/core_sys_windows" },
         .{ .spec = TargetSpec.WASM32_WASI, .src = wasi_src, .stem = ".zig-cache/core_sys_wasi" },
     };
 

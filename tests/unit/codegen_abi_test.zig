@@ -515,7 +515,7 @@ test "test_phase7_loop_contracts_raw_blob_proven_ranges_and_17_intrinsics_in_vm"
     // [2] `computeBodyProvenRanges` decodes `SIGN_BIAS_U64` on signed values (`[MAJOR-08]`):
     const range_src =
         \\pub fn clamp_signed(val: i32) -> i32 {
-        \\    if val >= -5 && val <= 12 {
+        \\    if val >= -5 and val <= 12 {
         \\        return val + 1;
         \\    }
         \\    return 0;
@@ -603,7 +603,7 @@ test "test_phase7_loop_contracts_raw_blob_proven_ranges_and_17_intrinsics_in_vm"
         \\    let lane_total = @simd_reduce_add(vec_prod);
         \\    let has_reloaded = @poll_reload(&mut cell);
         \\    let wrote = @sys_write(1, "ok!");
-        \\    if has_reloaded || !cx_pair.1 || prev_add != 25 || prev_sub != 30 || prev_xchg != 27 {
+        \\    if has_reloaded or not cx_pair.1 or prev_add != 25 or prev_sub != 30 or prev_xchg != 27 {
         \\        @trap();
         \\    }
         \\    return cur_atomic + lane_total + (wrote as i32);
@@ -772,4 +772,48 @@ test "test_regression_wasm32_context_recipe_uniform_64b_8b_aligned_rv2_crit05" {
     try std.testing.expect(fn_wasm.has_implicit_context);
     try std.testing.expectEqual(@as(u32, 64), fn_wasm.context_recipe.lowered_size_bytes);
     try std.testing.expectEqual(@as(u16, 8), fn_wasm.context_recipe.pointee_align_bytes);
+}
+
+test "test_phase76_dr22_opaque_ptr_source_loc_fmt_bencher_layouts_and_c_variadic" {
+    const src =
+        \\extern "C" fn c_snprintf(dst: *mut u8, cap: usize, fmt_str: *u8, ...) -> i32;
+        \\pub fn use_opaque(ctx: *mut opaque, ro: *opaque) -> bool {
+        \\    return unsafe { ctx != (0 as *mut opaque) and ro != (0 as *opaque) };
+        \\}
+    ;
+    var tc_res = try corex.typecheckSource(std.testing.allocator, FileId.fromInt(11), src);
+    defer tc_res.deinit();
+    try std.testing.expect(!tc_res.diagnostics.hasErrors());
+
+    const raw_opaque = try tc_res.type_pool.internRawPtr(.opaque_ty, false);
+    const opt_loc = try tc_res.type_pool.internOptional(.source_loc_ty);
+
+    var res_x64 = TypeLayoutResolver.init(
+        std.testing.allocator,
+        &tc_res.type_pool,
+        &tc_res.symbol_table,
+        TargetSpec.X86_64_LINUX,
+    );
+    defer res_x64.deinit();
+
+    try std.testing.expectEqual(@as(u64, 8), (try res_x64.resolveType(raw_opaque)).size_bytes);
+    try std.testing.expectEqual(@as(u64, 8), (try res_x64.resolveType(.source_loc_ty)).size_bytes);
+    try std.testing.expectEqual(@as(u64, 8), (try res_x64.resolveType(opt_loc)).size_bytes);
+    try std.testing.expectEqual(@as(u64, 8), (try res_x64.resolveType(.fmt_spec_ty)).size_bytes);
+    try std.testing.expectEqual(@as(u64, 32), (try res_x64.resolveType(.fmt_args_ty)).size_bytes);
+    try std.testing.expectEqual(@as(u64, 16), (try res_x64.resolveType(.bencher_ty)).size_bytes);
+
+    var res_wasm = TypeLayoutResolver.init(
+        std.testing.allocator,
+        &tc_res.type_pool,
+        &tc_res.symbol_table,
+        TargetSpec.WASM32_WASI,
+    );
+    defer res_wasm.deinit();
+
+    try std.testing.expectEqual(@as(u64, 4), (try res_wasm.resolveType(raw_opaque)).size_bytes);
+    try std.testing.expectEqual(@as(u64, 4), (try res_wasm.resolveType(.source_loc_ty)).size_bytes);
+    try std.testing.expectEqual(@as(u64, 8), (try res_wasm.resolveType(.fmt_spec_ty)).size_bytes);
+    try std.testing.expectEqual(@as(u64, 16), (try res_wasm.resolveType(.fmt_args_ty)).size_bytes);
+    try std.testing.expectEqual(@as(u64, 8), (try res_wasm.resolveType(.bencher_ty)).size_bytes);
 }

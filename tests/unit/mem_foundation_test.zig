@@ -67,7 +67,7 @@ test "test_typed_handles_roundtrip_and_sentinel_invariants" {
     try std.testing.expect(MirBlockId.none.isNone());
     try std.testing.expect(MirValueId.none.isNone());
 
-    // [2] Verify reserved zero indices and pre-interned `TypeId` constants (`DR-01` §4.1):
+    // [2] Verify reserved zero indices and pre-interned `TypeId` constants (`DR-01` §4.1, `DR-22` §1):
     try std.testing.expectEqual(@as(u32, 0), StringId.empty.asInt());
     try std.testing.expectEqual(@as(u32, 0), NodeIndex.root.asInt());
     try std.testing.expectEqual(@as(u32, 0), ScopeId.root.asInt());
@@ -76,8 +76,21 @@ test "test_typed_handles_roundtrip_and_sentinel_invariants" {
     try std.testing.expectEqual(@as(u32, 0), MirValueId.return_place.asInt());
     try std.testing.expectEqual(@as(u32, 0), TypeId.unit_ty.asInt());
     try std.testing.expectEqual(@as(u32, 21), TypeId.err_ty.asInt());
+    try std.testing.expectEqual(@as(u32, 22), TypeId.opaque_ty.asInt());
+    try std.testing.expect(TypeId.opaque_ty.isPrimitive());
+    try std.testing.expect(!TypeId.opaque_ty.isSizedPrimitive());
     try std.testing.expectEqual(@as(u32, 32), TypeId.group_signed.asInt());
+    try std.testing.expectEqual(@as(u32, 36), TypeId.group_number.asInt());
+    try std.testing.expectEqual(@as(u32, 37), TypeId._retired_group_numeric.asInt());
+    try std.testing.expect(TypeId.group_number.isBuiltinGroup());
+    try std.testing.expect(!TypeId._retired_group_numeric.isBuiltinGroup());
     try std.testing.expectEqual(@as(u32, 42), TypeId.group_copy.asInt());
+    try std.testing.expectEqual(@as(u32, 45), TypeId.source_loc_ty.asInt());
+    try std.testing.expectEqual(@as(u32, 46), TypeId.fmt_spec_ty.asInt());
+    try std.testing.expectEqual(@as(u32, 47), TypeId.fmt_args_ty.asInt());
+    try std.testing.expectEqual(@as(u32, 48), TypeId.bencher_ty.asInt());
+    try std.testing.expectEqual(@as(u32, 49), TypeId.task_group_base_ty.asInt());
+    try std.testing.expectEqual(@as(u32, 50), TypeId.task_handle_base_ty.asInt());
     try std.testing.expectEqual(@as(u32, 64), TypeId.first_dynamic.asInt());
 
     // [3] Verify `fromInt` / `asInt` roundtrip for non-sentinel indices:

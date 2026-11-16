@@ -380,13 +380,13 @@ test "test_hir_desugar_try_operator_from_upcast_and_catch_expressions" {
         "    @from Io(IoError),\n" ++
         "    Invalid,\n" ++
         "}\n" ++
-        "pub fn read_port(is_ok: bool) -> Result[i32, IoError] {\n" ++
+        "pub fn read_port(is_ok: bool) -> i32!IoError {\n" ++
         "    if is_ok {\n" ++
         "        return .Ok(25);\n" ++
         "    }\n" ++
         "    return .Err(IoError { code: 404 });\n" ++
         "}\n" ++
-        "pub fn lift_port(is_ok: bool) -> Result[i32, AppError] {\n" ++
+        "pub fn lift_port(is_ok: bool) -> i32!AppError {\n" ++
         "    let port_val = read_port(is_ok)?;\n" ++
         "    return .Ok(port_val + 5);\n" ++
         "}\n" ++
@@ -669,7 +669,7 @@ test "test_hir_desugar_soa_projection_inversion_and_lsb_bitfield_rmw" {
         "    return items.vy[idx];\n" ++
         "}\n" ++
         "pub fn bump_trace(log: &mut i32, digit: i32, ret_idx: usize) -> usize {\n" ++
-        "    *log = *log * 10 + digit;\n" ++
+        "    log.* = log.* * 10 + digit;\n" ++
         "    return ret_idx;\n" ++
         "}\n" ++
         "pub fn eval_bitfield_order_and_sign() -> i32 {\n" ++
@@ -775,13 +775,13 @@ test "test_hir_bit_field_literal_initialization_without_error_hole" {
 
 test "test_hir_desugar_overload_operator_autoref_two_phase_derive_and_attr_schema" {
     const trait_src =
-        "@attribute_schema(targets = [.StructField])\n" ++
+        "@attribute_schema(targets: [.StructField])\n" ++
         "pub struct WireTag {\n" ++
         "    pub tag_num: i32 = 0,\n" ++
         "}\n" ++
         "@derive(Eq, Hash, Debug, Clone)\n" ++
         "pub struct Point2D {\n" ++
-        "    @WireTag(tag_num = 9)\n" ++
+        "    @WireTag(tag_num: 9)\n" ++
         "    pub px: i32,\n" ++
         "    pub py: i32,\n" ++
         "}\n" ++
@@ -992,11 +992,11 @@ test "test_hir_desugar_string_interpolation_and_hylo_post_arg_sequencing" {
         "    }\n" ++
         "}\n" ++
         "pub fn log_arg(trace: &mut i32, digit: i32, out_val: i32) -> i32 {\n" ++
-        "    *trace = *trace * 10 + digit;\n" ++
+        "    trace.* = trace.* * 10 + digit;\n" ++
         "    return out_val;\n" ++
         "}\n" ++
         "pub fn make_adder(trace: &mut i32, digit: i32) -> AdderBox {\n" ++
-        "    *trace = *trace * 10 + digit;\n" ++
+        "    trace.* = trace.* * 10 + digit;\n" ++
         "    return AdderBox { bias: 0 };\n" ++
         "}\n" ++
         "pub fn format_banner(label: str) -> str {\n" ++
@@ -1273,4 +1273,74 @@ test "test_hir_float_pi_and_tau_associated_constants_lowering_and_vm_parity" {
         10_000,
     );
     try std.testing.expectEqual(@as(i64, 1), vm_res);
+}
+
+// ------------- DR-22 SourceLoc, Builder & FSM HIR -------------
+
+test "test_hir_dr22_caller_location_builder_blocks_struct_update_and_labeled_fsm" {
+    const dr22_hir_src =
+        "pub struct ScopeAcc {\n" ++
+        "    pub total: i32,\n" ++
+        "}\n" ++
+        "@builder_item\n" ++
+        "pub fn add_weight(scope: &mut ScopeAcc, weight: i32) {\n" ++
+        "    scope.total = scope.total + weight;\n" ++
+        "}\n" ++
+        "pub fn run_builder(body: @builder |&mut ScopeAcc|) -> i32 {\n" ++
+        "    var scope = ScopeAcc { total: 0 };\n" ++
+        "    body(&mut scope);\n" ++
+        "    return scope.total;\n" ++
+        "}\n" ++
+        "pub struct ConfigBox {\n" ++
+        "    pub port: i32 = 80,\n" ++
+        "    pub retries: i32 = 3,\n" ++
+        "}\n" ++
+        "pub enum StepFsm {\n" ++
+        "    Init,\n" ++
+        "    Step(i32),\n" ++
+        "    Done(i32),\n" ++
+        "}\n" ++
+        "pub fn caller_line(loc: SourceLoc = @caller_location()) -> i32 {\n" ++
+        "    return loc.line as i32;\n" ++
+        "}\n" ++
+        "pub fn eval_dr22_hir() -> i32 {\n" ++
+        "    let base_cfg = ConfigBox { port: 400, .. };\n" ++
+        "    let next_cfg = ConfigBox { retries: 7, ..base_cfg };\n" ++
+        "    let built_val = run_builder() {\n" ++
+        "        add_weight(10);\n" ++
+        "        add_weight(25);\n" ++
+        "    };\n" ++
+        "    let line_bonus: i32 = if caller_line() > 0 { 5 } else { 0 };\n" ++
+        "    let fsm_res: i32 = fsm: match StepFsm.Init {\n" ++
+        "        .Init => continue :fsm .Step(next_cfg.port + next_cfg.retries),\n" ++
+        "        .Step(cur) => continue :fsm .Done(cur + built_val),\n" ++
+        "        .Done(final_v) => final_v,\n" ++
+        "    };\n" ++
+        "    return fsm_res + line_bonus;\n" ++
+        "}\n";
+
+    var bundle = try hir.lowerSourceToHir(
+        std.testing.allocator,
+        dr22_hir_src,
+        TargetLayout.NATIVE_64,
+    );
+    defer bundle.deinit();
+    try std.testing.expect(!bundle.diagnostics.hasErrors());
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countTagInRange(&bundle.hir_store, 0, bundle.hir_store.countNodes(), .hir_error_hole),
+    );
+
+    // `400 + 7 + 35 + 5 = 447`:
+    try std.testing.expectEqual(
+        @as(i64, 447),
+        try evalSourceFnI64(
+            std.testing.allocator,
+            dr22_hir_src,
+            TargetLayout.NATIVE_64,
+            "eval_dr22_hir",
+            &.{},
+            20_000,
+        ),
+    );
 }

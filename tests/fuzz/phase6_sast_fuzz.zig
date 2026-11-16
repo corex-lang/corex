@@ -1,14 +1,12 @@
-//! Phase 6 & Phase 7.5 (`DR-21`) Deterministic SAST, Drop Elaboration & Pentagon BCE Fuzz Suite (`tests/fuzz/phase6_sast_fuzz.zig`)
+//! Phase 6, Phase 7.5 & Phase 7.6 (`DR-22`) Deterministic SAST, Drop Elaboration & Pentagon BCE Fuzz Suite (`tests/fuzz/phase6_sast_fuzz.zig`)
 //!
-//! Exercises three complementary verification invariants across Phase 6 & Phase 7.5 (`DR-06`, `DR-17`, `DR-20`, `DR-21`):
-//! 1. **Fault Tolerance, Scratch Cap & Verifier Soundness (`>= 360` iterations):** Combines Phase 6 & `DR-21`
+//! Exercises three complementary verification invariants across Phase 6–7.6 (`DR-06`, `DR-17`, `DR-20`, `DR-21`, `DR-22`):
+//! 1. **Fault Tolerance, Scratch Cap & Verifier Soundness (`>= 360` iterations):** Combines Phase 6, `DR-21`, & `DR-22`
 //!    `.cx` seed items (`AutoDrop` pre-`else` `ConditionScope` drops, `@linear` across `orelse` / loops,
-//!    `defer`/`errdefer`, `&`/`&mut` views, `@no_alloc`/`@no_panic`/`@no_block`, `@max_stack`, `.narrow()`,
-//!    Pentagon `$` backward-offset slice indexing/slicing, `with context.allocator = &mut local_arena`,
-//!    and `subscript … yield`) with error-triggering SAST snippets (`E0302`, `E0304`–`E0307`, `E0320`–`E0322`)
-//!    and random byte perturbations across `NATIVE_64` and `WASM32` (`is_sast_strict` toggled), asserting zero
-//!    panics, zero leaks, `peak_pentagon_bytes <= 1536 * 1024`, and `V1`–`V6` `MirVerifier` acceptance whenever
-//!    `!bundle.diagnostics.hasErrors()`.
+//!    `defer`/`errdefer`, `&`/`&mut`/`&out`/`own T`, `@no_alloc`/`@no_panic`/`@no_block`, `@max_stack`, `.narrow()`,
+//!    Pentagon `$` backward-offset slice indexing/slicing, `..own` spread drops, `(a, b) = (b, a)` `AutoDrop` swaps,
+//!    `fsm: match` + `continue :fsm`, `with context.allocator = &mut local_arena`, and `subscript … yield`) with
+//!    error-triggering SAST snippets (`E0302`, `E0304`–`E0307`, `E0320`–`E0322`, `E0422`) and byte perturbations.
 //! 2. **Differential `--dev` vs `--release` Drop Elaboration & BCE Parity (`>= 180` programs x 2 layouts):**
 //!    Generates well-typed multi-function `.cx` programs exercising `@drop_trace(id)`, `ConditionScope` pre-`else`
 //!    `is` / `:=` drop ordering, `@linear` across `orelse` / loops, Pentagon `$` backward-offset slice indexing
@@ -82,7 +80,7 @@ const INCREMENTAL_SAST_DB_ITERATIONS: usize = 116;
 /// Maximum Demand-Sliced Sparse ABCD Pentagon scratch budget (`1.5 MiB`, `DR-20` `Fix-06A`).
 const MAX_PENTAGON_SCRATCH_BYTES: usize = 1536 * 1024;
 
-/// Valid Phase 6 & Phase 7.5 (`DR-21`) seed items covering `AutoDrop`, `@linear`, Pentagon `$` BCE, and `with context.allocator`.
+/// Valid Phase 6, Phase 7.5 (`DR-21`), & Phase 7.6 (`DR-22`) seed items covering `AutoDrop`, `@linear`, `&out`, `..own`, and BCE.
 const PHASE6_SEED_ITEMS = [_][]const u8{
     "pub trait Drop {\n    fn drop(&mut self);\n}\n",
     "pub struct TrackedBuf {\n    pub tag: i64,\n}\n" ++
@@ -93,7 +91,7 @@ const PHASE6_SEED_ITEMS = [_][]const u8{
         "    return .None;\n" ++
         "}\n",
     "@linear\npub struct LinearTicket {\n    pub code: i64,\n}\n" ++
-        "pub fn close_ticket(own ticket: sink LinearTicket) -> i64 {\n" ++
+        "pub fn close_ticket(ticket: own LinearTicket) -> i64 {\n" ++
         "    let LinearTicket { code: extracted } = ticket;\n" ++
         "    return extracted;\n" ++
         "}\n" ++
@@ -101,11 +99,11 @@ const PHASE6_SEED_ITEMS = [_][]const u8{
         "    if is_ready { return .Some(LinearTicket { code: code_val }); }\n" ++
         "    return .None;\n" ++
         "}\n",
-    "pub fn consume_buf(own item: sink TrackedBuf) -> i64 = item.tag;\n",
+    "pub fn consume_buf(item: own TrackedBuf) -> i64 = item.tag;\n",
     "pub fn view_head_slice(items: &[i64]) -> &[i64] = items;\n",
     "pub fn bump_first_slot(target: &mut [i64; 4], delta: i64) {\n    target[0] = delta;\n}\n",
     "pub struct Arena {\n    pub bump_tag: usize,\n}\n" ++
-        "pub fn close_arena(own arena_in: sink Arena) {\n    let Arena { bump_tag: _ } = arena_in;\n}\n" ++
+        "pub fn close_arena(arena_in: own Arena) {\n    let Arena { bump_tag: _ } = arena_in;\n}\n" ++
         "pub struct OwnedHeapBuf {\n    pub raw_handle: usize,\n    pub byte_len: usize,\n}\n" ++
         "impl OwnedHeapBuf {\n    pub fn drop(&mut self) {}\n}\n" ++
         "pub fn alloc_ctx_buf(size_n: usize) -> OwnedHeapBuf {\n" ++
@@ -114,8 +112,8 @@ const PHASE6_SEED_ITEMS = [_][]const u8{
         "}\n",
     "@no_alloc\n@no_panic\n@no_block\n@max_stack(512)\n" ++
         "pub fn strict_pentagon_probe(data: &[u8], raw_idx: usize, clamped_val: i32) -> u8 {\n" ++
-        "    if data.len > 0 and clamped_val >= 0 and clamped_val <= 200 {\n" ++
-        "        let elem_byte = data[raw_idx % data.len];\n" ++
+        "    if data.len() > 0 and clamped_val >= 0 and clamped_val <= 200 {\n" ++
+        "        let elem_byte = data[raw_idx % data.len()];\n" ++
         "        let narrowed_byte: u8 = clamped_val.narrow[u8]();\n" ++
         "        return elem_byte & narrowed_byte;\n" ++
         "    }\n" ++
@@ -123,9 +121,9 @@ const PHASE6_SEED_ITEMS = [_][]const u8{
         "}\n",
     "@no_panic\n" ++
         "pub fn pentagon_dollar_tail_probe(items: &[i64]) -> i64 {\n" ++
-        "    if items.len >= 3 {\n" ++
+        "    if items.len() >= 3 {\n" ++
         "        let head_trim: &[i64] = items[..$ - 2];\n" ++
-        "        return items[$ - 1] +% items[$ - 2] +% (head_trim.len as i64);\n" ++
+        "        return items[$ - 1] +% items[$ - 2] +% (head_trim.len() as i64);\n" ++
         "    }\n" ++
         "    return 0;\n" ++
         "}\n",
@@ -142,60 +140,87 @@ const PHASE6_SEED_ITEMS = [_][]const u8{
         "}\n",
     "pub fn linear_orelse_and_loop(is_ready: bool) -> i64 {\n" ++
         "    let live_tok = maybe_ticket(is_ready, 19) orelse return 0;\n" ++
-        "    defer { let _ = close_ticket(live_tok); }\n" ++
+        "    defer { let _ = close_ticket(own live_tok); }\n" ++
         "    var loop_sum: i64 = 0;\n" ++
         "    var step_idx: i64 = 0;\n" ++
         "    while step_idx < 2 {\n" ++
         "        let iter_tok = LinearTicket { code: 10 +% step_idx };\n" ++
-        "        loop_sum = loop_sum +% close_ticket(iter_tok);\n" ++
+        "        loop_sum = loop_sum +% close_ticket(own iter_tok);\n" ++
         "        step_idx += 1;\n" ++
         "    }\n" ++
         "    return loop_sum;\n" ++
         "}\n",
     "pub fn scoped_arena_non_escaping() -> usize {\n" ++
         "    var local_arena = Arena { bump_tag: 64 };\n" ++
-        "    defer { close_arena(local_arena); }\n" ++
+        "    defer { close_arena(own local_arena); }\n" ++
         "    return with context.allocator = &mut local_arena {\n" ++
         "        let temp_buf = alloc_ctx_buf(32);\n" ++
         "        temp_buf.byte_len\n" ++
         "    };\n" ++
         "}\n",
-    "pub fn linear_defer_and_errdefer(is_ok: bool) -> Result[i64, u32] {\n" ++
+    "pub fn linear_defer_and_errdefer(is_ok: bool) -> i64!u32 {\n" ++
         "    let ticket = LinearTicket { code: 19 };\n" ++
-        "    defer { let _ = close_ticket(ticket); }\n" ++
+        "    defer { let _ = close_ticket(own ticket); }\n" ++
         "    var rollback_note: i64 = 0;\n" ++
         "    errdefer { rollback_note = 1; }\n" ++
-        "    if !is_ok { return .Err(3); }\n" ++
+        "    if not is_ok { return .Err(3); }\n" ++
         "    return .Ok(42 + rollback_note);\n" ++
         "}\n",
     "pub fn sequential_nll_and_branch_drop(cond_flag: bool) -> usize {\n" ++
         "    var local_arr: [i64; 4] = [2, 4, 6, 8];\n" ++
         "    let borrowed = view_head_slice(&local_arr);\n" ++
-        "    let snap_len = borrowed.len;\n" ++
+        "    let snap_len = borrowed.len();\n" ++
         "    bump_first_slot(&mut local_arr, 99);\n" ++
         "    let guard_buf = TrackedBuf { tag: 77 };\n" ++
         "    if cond_flag {\n" ++
-        "        let _ = consume_buf(guard_buf);\n" ++
+        "        let _ = consume_buf(own guard_buf);\n" ++
         "    }\n" ++
         "    return snap_len;\n" ++
         "}\n",
-    "pub subscript checked_lane(mut lanes: inout [i64; 4], lane_idx: usize) -> i64 {\n" ++
-        "    yield lanes[lane_idx % 4];\n" ++
+    "pub struct CheckedLanes {\n    pub lanes: [i64; 4],\n}\n" ++
+        "impl CheckedLanes {\n" ++
+        "    pub subscript(lane_idx: usize, /) -> i64 {\n" ++
+        "        let { yield self.lanes[lane_idx % 4]; }\n" ++
+        "        inout { yield &mut self.lanes[lane_idx % 4]; }\n" ++
+        "    }\n" ++
+        "}\n",
+    "@derive(Copy, Eq)\n" ++
+        "pub enum FsmTag: u8 {\n    First = 0,\n    Second = 1,\n}\n" ++
+        "pub struct GuardPair {\n    pub primary: TrackedBuf,\n    pub secondary: TrackedBuf,\n}\n" ++
+        "pub fn init_out_buf(out_buf: &out TrackedBuf, tag_v: i64, /) {\n" ++
+        "    out_buf.* = TrackedBuf { tag: tag_v };\n" ++
+        "}\n" ++
+        "pub fn dr22_out_spread_swap_and_fsm() -> i64 {\n" ++
+        "    var slot_a: TrackedBuf;\n" ++
+        "    var slot_b = TrackedBuf { tag: 22 };\n" ++
+        "    init_out_buf(&out slot_a, 11);\n" ++
+        "    (slot_a, slot_b) = (slot_b, slot_a);\n" ++
+        "    let pair_init = GuardPair { primary: own slot_a, secondary: own slot_b };\n" ++
+        "    let pair_upd = GuardPair { primary: TrackedBuf { tag: 33 }, ..own pair_init };\n" ++
+        "    let fsm_v: i64 = fsm: match FsmTag.First {\n" ++
+        "        .First => {\n" ++
+        "            let arm_guard = TrackedBuf { tag: 44 };\n" ++
+        "            let _ = arm_guard.tag;\n" ++
+        "            continue :fsm .Second;\n" ++
+        "        }\n" ++
+        "        .Second => pair_upd.primary.tag +% pair_upd.secondary.tag,\n" ++
+        "    };\n" ++
+        "    return fsm_v;\n" ++
         "}\n",
 };
 
-/// Deliberately invalid SAST & syntax snippets (`E0302`, `E0304`–`E0307`, `E0320`–`E0322`) for fault-tolerance fuzzing.
+/// Deliberately invalid SAST & syntax snippets (`E0302`, `E0304`–`E0307`, `E0320`–`E0322`, `E0422`) for fault-tolerance fuzzing.
 const PHASE6_MUTATION_SNIPPETS = [_][]const u8{
     "pub fn bad_use_after_move() -> i64 {\n" ++
         "    let owned_buf = TrackedBuf { tag: 11 };\n" ++
-        "    let _ = consume_buf(owned_buf);\n" ++
+        "    let _ = consume_buf(own owned_buf);\n" ++
         "    return owned_buf.tag;\n" ++
         "}\n",
     "pub fn bad_loan_conflict() -> usize {\n" ++
         "    var local_arr: [i64; 4] = [1, 2, 3, 4];\n" ++
         "    let view = view_head_slice(&local_arr);\n" ++
         "    bump_first_slot(&mut local_arr, 55);\n" ++
-        "    return view.len;\n" ++
+        "    return view.len();\n" ++
         "}\n",
     "pub fn bad_stack_escape() -> &i64 {\n" ++
         "    let ephemeral_val: i64 = 123;\n" ++
@@ -211,7 +236,7 @@ const PHASE6_MUTATION_SNIPPETS = [_][]const u8{
         "}\n",
     "pub fn bad_arena_escape_return() -> OwnedHeapBuf {\n" ++
         "    var local_arena = Arena { bump_tag: 64 };\n" ++
-        "    defer { close_arena(local_arena); }\n" ++
+        "    defer { close_arena(own local_arena); }\n" ++
         "    with context.allocator = &mut local_arena {\n" ++
         "        return alloc_ctx_buf(48);\n" ++
         "    }\n" ++
@@ -219,7 +244,7 @@ const PHASE6_MUTATION_SNIPPETS = [_][]const u8{
     "pub fn bad_arena_escape_outer_var() -> usize {\n" ++
         "    var outer_buf = alloc_ctx_buf(8);\n" ++
         "    var local_arena = Arena { bump_tag: 128 };\n" ++
-        "    defer { close_arena(local_arena); }\n" ++
+        "    defer { close_arena(own local_arena); }\n" ++
         "    with context.allocator = &mut local_arena {\n" ++
         "        outer_buf = alloc_ctx_buf(24);\n" ++
         "    }\n" ++
@@ -227,9 +252,12 @@ const PHASE6_MUTATION_SNIPPETS = [_][]const u8{
         "}\n",
     "pub fn bad_linear_cond_b2_leak(is_ready: bool, allow_gate: bool) -> i64 {\n" ++
         "    if maybe_ticket(is_ready, 7) is .Some(live_tok) and allow_gate {\n" ++
-        "        return close_ticket(live_tok);\n" ++
+        "        return close_ticket(own live_tok);\n" ++
         "    }\n" ++
         "    return 0;\n" ++
+        "}\n",
+    "pub fn bad_uninit_out_param(slot: &out TrackedBuf, skip_init: bool) {\n" ++
+        "    if not skip_init { slot.* = TrackedBuf { tag: 1 }; }\n" ++
         "}\n",
     "@no_alloc\npub fn bad_no_alloc_concat(left_s: str, right_s: str) -> str {\n    return left_s + right_s;\n}\n",
     "@no_panic\npub fn bad_no_panic_index(items: &[i64], raw_idx: usize) -> i64 {\n    return items[raw_idx];\n}\n",
@@ -262,14 +290,14 @@ const INCREMENTAL_LEAF_VARIANTS = [_][]const u8{
 const INCREMENTAL_CALLER_VARIANTS = [_][]const u8{
     "    let fixed_arr: [i64; 4] = [input_val, SCALE_FACTOR, 7, 11];\n" ++
         "    let view: &[i64] = &fixed_arr;\n" ++
-        "    if probe_idx < view.len {\n" ++
+        "    if probe_idx < view.len() {\n" ++
         "        return leaf_helper(view[probe_idx]);\n" ++
         "    }\n" ++
         "    return leaf_helper(SCALE_FACTOR);\n",
     "    let fixed_arr: [i64; 4] = [3, 5, 9, 13];\n" ++
         "    let view: &[i64] = &fixed_arr;\n" ++
-        "    if view.len > 0 {\n" ++
-        "        let mod_elem = view[probe_idx % view.len];\n" ++
+        "    if view.len() > 0 {\n" ++
+        "        let mod_elem = view[probe_idx % view.len()];\n" ++
         "        return leaf_helper(mod_elem) + SCALE_FACTOR;\n" ++
         "    }\n" ++
         "    return 0;\n",
@@ -285,9 +313,9 @@ const INCREMENTAL_CALLER_VARIANTS = [_][]const u8{
         "    return SCALE_FACTOR;\n",
     "    let fixed_arr: [i64; 4] = [input_val, SCALE_FACTOR, 7, 11];\n" ++
         "    let view: &[i64] = &fixed_arr;\n" ++
-        "    if view.len >= 3 {\n" ++
+        "    if view.len() >= 3 {\n" ++
         "        let sub_trim: &[i64] = view[..$ - 2];\n" ++
-        "        return leaf_helper(view[$ - 1] + view[$ - 2] + (sub_trim.len as i64));\n" ++
+        "        return leaf_helper(view[$ - 1] + view[$ - 2] + (sub_trim.len() as i64));\n" ++
         "    }\n" ++
         "    return SCALE_FACTOR;\n",
     "    let opt_in: i64? = if (probe_idx & 1) == 0 { .Some(input_val) } else { .None };\n" ++
@@ -356,14 +384,18 @@ fn generateWellTypedPhase6Program(
             "        @drop_trace(self.id);\n" ++
             "    }\n" ++
             "}\n" ++
-            "pub fn consume_guard(own guard: sink TrackedGuard) -> i64 = guard.id;\n" ++
+            "pub struct GuardPair {\n    pub left_g: TrackedGuard,\n    pub right_g: TrackedGuard,\n}\n" ++
+            "pub fn consume_guard(guard: own TrackedGuard) -> i64 = guard.id;\n" ++
+            "pub fn init_guard_out(slot: &out TrackedGuard, guard_id: i64, /) {\n" ++
+            "    slot.* = TrackedGuard { id: guard_id };\n" ++
+            "}\n" ++
             "pub fn make_guard(guard_id: i64) -> TrackedGuard = TrackedGuard { id: guard_id };\n" ++
             "pub fn maybe_guard(is_present: bool, guard_id: i64) -> TrackedGuard? {\n" ++
             "    if is_present { return .Some(TrackedGuard { id: guard_id }); }\n" ++
             "    return .None;\n" ++
             "}\n" ++
             "@linear\npub struct LinearTicket {\n    pub code: i64,\n}\n" ++
-            "pub fn close_ticket(own ticket: sink LinearTicket) -> i64 {\n" ++
+            "pub fn close_ticket(ticket: own LinearTicket) -> i64 {\n" ++
             "    let LinearTicket { code: extracted } = ticket;\n" ++
             "    return extracted;\n" ++
             "}\n" ++
@@ -371,12 +403,12 @@ fn generateWellTypedPhase6Program(
             "    if is_ready { return .Some(LinearTicket { code: code_val }); }\n" ++
             "    return .None;\n" ++
             "}\n" ++
-            "pub fn consume_opt_ticket(own opt_ticket: sink LinearTicket?, fallback_val: i64) -> i64 {\n" ++
+            "pub fn consume_opt_ticket(opt_ticket: own LinearTicket?, fallback_val: i64) -> i64 {\n" ++
             "    let live_ticket = opt_ticket orelse return fallback_val;\n" ++
-            "    return close_ticket(live_ticket);\n" ++
+            "    return close_ticket(own live_ticket);\n" ++
             "}\n" ++
             "pub struct Arena {\n    pub bump_tag: usize,\n}\n" ++
-            "pub fn close_arena(own arena_in: sink Arena) {\n" ++
+            "pub fn close_arena(arena_in: own Arena) {\n" ++
             "    let Arena { bump_tag: _ } = arena_in;\n" ++
             "}\n",
     );
@@ -391,14 +423,14 @@ fn generateWellTypedPhase6Program(
                 "pub fn slice_and_narrow_step(items: &[i64], raw_idx: usize, raw_byte: i32) -> i64 {{\n" ++
                 "    let scoped_helper_guard = TrackedGuard {{ id: {d} }};\n" ++
                 "    var total: i64 = scoped_helper_guard.id & 15;\n" ++
-                "    if items.len > 0 {{\n" ++
-                "        total = mix_lane(total, items[raw_idx % items.len]);\n" ++
+                "    if items.len() > 0 {{\n" ++
+                "        total = mix_lane(total, items[raw_idx % items.len()]);\n" ++
                 "    }}\n" ++
-                "    if items.len >= 3 {{\n" ++
+                "    if items.len() >= 3 {{\n" ++
                 "        let head_trim: &[i64] = items[..$ - 2];\n" ++
-                "        total = total + items[$ - 1] + items[$ - 2] + (head_trim.len as i64);\n" ++
+                "        total = total + items[$ - 1] + items[$ - 2] + (head_trim.len() as i64);\n" ++
                 "    }}\n" ++
-                "    if raw_idx < items.len {{\n" ++
+                "    if raw_idx < items.len() {{\n" ++
                 "        total = total + items[raw_idx];\n" ++
                 "    }}\n" ++
                 "    if raw_byte >= 0 and raw_byte <= 200 {{\n" ++
@@ -416,7 +448,7 @@ fn generateWellTypedPhase6Program(
     else
         "    return acc + outer_guard.id;\n}\n";
 
-    var main_buf: [3072]u8 = undefined;
+    var main_buf: [4096]u8 = undefined;
     try src_buf.appendSlice(
         allocator,
         try std.fmt.bufPrint(
@@ -429,10 +461,17 @@ fn generateWellTypedPhase6Program(
                 "    let view_slice: &[i64] = &weights;\n" ++
                 "    var acc: i64 = 0;\n" ++
                 "    if (safe_seed & 1) == 0 {{\n" ++
-                "        acc = acc + consume_guard(branch_guard);\n" ++
+                "        acc = acc + consume_guard(own branch_guard);\n" ++
                 "    }} else {{\n" ++
                 "        acc = acc + 5;\n" ++
                 "    }}\n" ++
+                "    var out_g1: TrackedGuard;\n" ++
+                "    var out_g2 = TrackedGuard {{ id: 610 }};\n" ++
+                "    init_guard_out(&out out_g1, 605);\n" ++
+                "    (out_g1, out_g2) = (out_g2, out_g1);\n" ++
+                "    let gp_init = GuardPair {{ left_g: own out_g1, right_g: own out_g2 }};\n" ++
+                "    let gp_upd = GuardPair {{ left_g: TrackedGuard {{ id: 620 }}, ..own gp_init }};\n" ++
+                "    acc = acc + (gp_upd.left_g.id & 7) + (gp_upd.right_g.id & 7);\n" ++
                 "    if maybe_guard((safe_seed & 2) == 0, {d}) is .Some(cond_first) and\n" ++
                 "        (cond_second := make_guard({d})).id > {d}\n" ++
                 "    {{\n" ++
@@ -446,7 +485,7 @@ fn generateWellTypedPhase6Program(
                 "    let arena_bonus: i64 = with context.allocator = &mut local_arena {{\n" ++
                 "        if context.allocator._handle != 0 {{ 9 }} else {{ 1 }}\n" ++
                 "    }};\n" ++
-                "    close_arena(local_arena);\n" ++
+                "    close_arena(own local_arena);\n" ++
                 "    acc = acc + arena_bonus;\n" ++
                 "    var iter_idx: i64 = 0;\n" ++
                 "    while iter_idx < {d} {{\n" ++
@@ -456,7 +495,7 @@ fn generateWellTypedPhase6Program(
                 "        let probe_pos: usize = ((safe_seed + iter_idx) as usize) & 7;\n" ++
                 "        let narrow_cand: i32 = ((safe_seed as i32) & 63) + {d};\n" ++
                 "        acc = acc + slice_and_narrow_step(view_slice, probe_pos, narrow_cand) + (loop_guard.id & 7) +\n" ++
-                "            close_ticket(loop_ticket) + opt_ticket_val;\n" ++
+                "            close_ticket(own loop_ticket) + opt_ticket_val;\n" ++
                 "        iter_idx += 1;\n" ++
                 "    }}\n" ++
                 "{s}",

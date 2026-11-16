@@ -137,6 +137,8 @@ const ClosureThunkSpec = struct {
     closure_ty: TypeId,
     /// Captured environment field `TypeId`s in capture order (owned by `allocator`).
     capture_types: []TypeId,
+    /// `true` when `closure_ty` uses the Tier-2 3-word `{ env_ptr, call_fn, drop_fn }` layout (`DR-22`).
+    is_three_word: bool = false,
 };
 
 /// Lowered `MirPlace` address or compile-time array length constant.
@@ -416,6 +418,16 @@ const LlvmModuleEmitter = struct {
     has_fmt_u128_helper: bool = false,
     /// `true` once `@_cx_rt_fmt_i128` has been emitted into `synth_globals`.
     has_fmt_i128_helper: bool = false,
+    /// `true` once the `SE-12` formatting runtime helpers have been requested.
+    has_fmt_rt_helpers: bool = false,
+    /// Deduplicated `MirConst.source_loc` descriptors emitted as `@_cx_loc_<idx>`.
+    source_loc_consts: std.ArrayListUnmanaged(mir.SourceLocConst) = .empty,
+    /// Map `(file_sym << 96) | (fn_sym << 64) | (line << 32) | col -> loc_idx`.
+    source_loc_map: std.AutoHashMapUnmanaged(u128, u32) = .empty,
+    /// Ordered `TypeId`s requiring generated `@_cx_fmt_fn_ty_<id>` helpers.
+    fmt_type_list: std.ArrayListUnmanaged(TypeId) = .empty,
+    /// Membership set of `fmt_type_list`.
+    fmt_type_set: std.AutoHashMapUnmanaged(u32, void) = .empty,
     /// Deduplication set of already-declared external C/WASI symbol names (`[CRITICAL-08]`).
     declared_externs: std.StringHashMapUnmanaged(void) = .empty,
     /// Owned symbol name strings backing `declared_externs`.
@@ -473,6 +485,10 @@ const LlvmModuleEmitter = struct {
         for (self.owned_intrinsic_decls.items) |decl_s| self.allocator.free(decl_s);
         self.owned_intrinsic_decls.deinit(self.allocator);
         self.synth_globals.deinit(self.allocator);
+        self.source_loc_consts.deinit(self.allocator);
+        self.source_loc_map.deinit(self.allocator);
+        self.fmt_type_list.deinit(self.allocator);
+        self.fmt_type_set.deinit(self.allocator);
         self.declared_externs.deinit(self.allocator);
         for (self.owned_declared_externs.items) |ext_s| self.allocator.free(ext_s);
         self.owned_declared_externs.deinit(self.allocator);
@@ -541,6 +557,26 @@ const LlvmModuleEmitter = struct {
     }
 };
 
+/// Captured field slot inside a heap closure environment requiring reverse-order `Drop` execution.
+const CapDropSlot = struct {
+    /// Byte offset of the captured field within the heap environment block.
+    byte_offset: u64,
+    /// Unwrapped concrete `TypeId` whose destructor must run.
+    drop_ty: TypeId,
+};
+
+/// Classifies single-ordering atomic operations for `MemoryOrder` (`0..5`) clamping.
+const AtomicOpClass = enum {
+    /// Standalone `@atomic_fence(order)` barrier operation.
+    fence_op,
+    /// Single-ordering `@atomic_load(ptr, order)` read operation.
+    load_op,
+    /// Single-ordering `@atomic_store(ptr, val, order)` write operation.
+    store_op,
+    /// Single-ordering `@atomic_xchg` or `@atomic_fetch_*` read-modify-write operation.
+    rmw_op,
+};
+
 // --------------------------------------- CONSTS ----------------------------------------
 
 /// Maximum structural recursion depth for composite type registration (`AGENTS.md` §2).
@@ -563,12 +599,17 @@ const ABI_TYPE_BYTE_SIZE_MAP = std.StaticStringMap(u64).initComptime(.{
     .{ "{ double, double }", 16 },
     .{ "{ double, float }", 12 },
     .{ "{ double, i64 }", 16 },
+    .{ "{ i32, i16, i16 }", 8 },
+    .{ "{ i32, i32, i32 }", 12 },
     .{ "{ i64, double }", 16 },
     .{ "{ i64, float }", 12 },
     .{ "{ i64, i64 }", 16 },
     .{ "{ i64, i64, i64 }", 24 },
     .{ "{ i64, i64, i64, i64 }", 32 },
+    .{ "{ ptr, i32 }", 8 },
+    .{ "{ ptr, i32, ptr, i32 }", 16 },
     .{ "{ ptr, i64 }", 16 },
+    .{ "{ ptr, i64, ptr, i64 }", 32 },
     .{ "{ ptr, ptr }", 16 },
 });
 
@@ -639,11 +680,38 @@ fn fnUnwindAttrs(emitter: *const LlvmModuleEmitter) []const u8 {
     return if (emitter.cfg.target.isWasm()) "nounwind" else "nounwind uwtable(sync)";
 }
 
-/// Returns `true` when `raw_ty` resolves to a zero-sized type (`size_bytes == 0`).
+/// Returns `true` when `raw_ty` resolves to a sized zero-byte type (`size_bytes == 0` and not `opaque`).
 fn isZeroSizedType(emitter: *LlvmModuleEmitter, raw_ty: TypeId) !bool {
     const unwrapped = emitter.input.pool.unwrapUnderlyingType(raw_ty);
+    if (unwrapped == .opaque_ty) return false;
     if (unwrapped.isError() or unwrapped == .unit_ty or unwrapped == .never_ty) return true;
-    return (try emitter.resolver.resolveType(unwrapped)).size_bytes == 0;
+    const resolved = try emitter.resolver.resolveType(unwrapped);
+    return resolved.size_bytes == 0 and !resolved.reprFlags().is_unsized;
+}
+
+/// Returns `true` when `ty` is a built-in runtime type lowered directly without a `%_cx_ty_<id>` declaration.
+fn isBuiltInRuntimeTypeLlvm(pool: *const type_system.InternPool, ty: TypeId) bool {
+    return ty == .source_loc_ty or
+        ty == .fmt_spec_ty or
+        ty == .fmt_args_ty or
+        ty == .bencher_ty or
+        ty == .task_group_base_ty or
+        ty == .task_handle_base_ty or
+        pool.isTaskGroupType(ty) or
+        pool.isTaskHandleType(ty);
+}
+
+/// Resolves `(byte_offset, field_ty, align_bytes)` inside static `SourceLocData` for field ordinal `fld_ord`.
+fn resolveSourceLocFieldLayout(
+    ptr_bytes: u32,
+    fld_ord: u32,
+) struct { byte_offset: u64, field_ty: TypeId, align_bytes: u32 } {
+    return switch (fld_ord) {
+        0 => .{ .byte_offset = 0, .field_ty = .str_ty, .align_bytes = ptr_bytes },
+        1 => .{ .byte_offset = 2 * @as(u64, ptr_bytes), .field_ty = .str_ty, .align_bytes = ptr_bytes },
+        2 => .{ .byte_offset = 4 * @as(u64, ptr_bytes), .field_ty = .u32_ty, .align_bytes = 4 },
+        else => .{ .byte_offset = 4 * @as(u64, ptr_bytes) + 4, .field_ty = .u32_ty, .align_bytes = 4 },
+    };
 }
 
 /// Resolves scalar integer bit-width and signedness for `raw_ty`, or `null` if non-integer.
@@ -653,6 +721,10 @@ fn resolveIntegerInfo(emitter: *const LlvmModuleEmitter, raw_ty: TypeId) ?IntSca
         const cur_node = emitter.input.pool.getNode(ty);
         if (cur_node.tag == .bit_field_ty) {
             ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(cur_node.lhs));
+        } else if (cur_node.tag == .enum_ty) {
+            if (emitter.input.pool.getEnumBackingIntType(ty)) |backing_ty| {
+                ty = emitter.input.pool.unwrapUnderlyingType(backing_ty);
+            }
         }
     }
     const ptr_bits: u16 = @as(u16, emitter.cfg.target.ptrBytes()) * 8;
@@ -673,14 +745,21 @@ fn resolveIntegerInfo(emitter: *const LlvmModuleEmitter, raw_ty: TypeId) ?IntSca
     };
 }
 
-/// Unwraps transparent `Result[T, never]` (`SumReprKind.transparent_ok`) and type aliases/newtypes.
+/// Unwraps transparent `Result[T, never]`, `bit_field` backing types, and type aliases/newtypes.
 fn unwrapTransparentType(emitter: *LlvmModuleEmitter, raw_ty: TypeId) !TypeId {
     var cur_ty = emitter.input.pool.unwrapUnderlyingType(raw_ty);
-    while (!cur_ty.isPrimitiveOrSentinel() and emitter.input.pool.getNode(cur_ty).tag == .result_ty) {
-        if (try emitter.resolver.getSumDetail(cur_ty)) |detail| {
-            if (detail.repr == .transparent_ok) {
-                cur_ty = emitter.input.pool.unwrapUnderlyingType(detail.payload_ty);
-                continue;
+    while (!cur_ty.isPrimitiveOrSentinel()) {
+        const cur_node = emitter.input.pool.getNode(cur_ty);
+        if (cur_node.tag == .bit_field_ty) {
+            cur_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(cur_node.lhs));
+            continue;
+        }
+        if (cur_node.tag == .result_ty) {
+            if (try emitter.resolver.getSumDetail(cur_ty)) |detail| {
+                if (detail.repr == .transparent_ok) {
+                    cur_ty = emitter.input.pool.unwrapUnderlyingType(detail.payload_ty);
+                    continue;
+                }
             }
         }
         break;
@@ -692,8 +771,10 @@ fn unwrapTransparentType(emitter: *LlvmModuleEmitter, raw_ty: TypeId) !TypeId {
 fn isNamedCompositeType(emitter: *LlvmModuleEmitter, raw_ty: TypeId) !bool {
     const ty = try unwrapTransparentType(emitter, raw_ty);
     if (try isZeroSizedType(emitter, ty)) return false;
-    if (ty.isPrimitiveOrSentinel()) return false;
-    return switch (emitter.input.pool.getNode(ty).tag) {
+    if (ty.isPrimitiveOrSentinel() or isBuiltInRuntimeTypeLlvm(emitter.input.pool, ty)) return false;
+    const node = emitter.input.pool.getNode(ty);
+    if (node.tag == .enum_ty and emitter.input.pool.getEnumBackingIntType(ty) != null) return false;
+    return switch (node.tag) {
         .struct_ty,
         .tuple_ty,
         .soa_array_ty,
@@ -709,14 +790,33 @@ fn isNamedCompositeType(emitter: *LlvmModuleEmitter, raw_ty: TypeId) !bool {
 /// Formats the canonical LLVM SSA value type for `raw_ty` (caller owns returned slice).
 fn formatLlvmValueType(emitter: *LlvmModuleEmitter, raw_ty: TypeId) ![]u8 {
     const ty = try unwrapTransparentType(emitter, raw_ty);
+    if (ty == .opaque_ty) return emitter.allocator.dupe(u8, "i8");
     if (try isZeroSizedType(emitter, ty)) {
         return emitter.allocator.dupe(u8, "void");
     }
     if (ty == .bool_ty) return emitter.allocator.dupe(u8, "i1");
     if (ty == .f32_ty) return emitter.allocator.dupe(u8, "float");
     if (ty == .f64_ty or ty == .untyped_float_ty) return emitter.allocator.dupe(u8, "double");
-    if (ty == .str_ty) {
+    if (ty == .str_ty or ty == .bencher_ty) {
         return std.fmt.allocPrint(emitter.allocator, "{{ ptr, {s} }}", .{ptrIntType(emitter)});
+    }
+    if (ty == .source_loc_ty or
+        ty == .task_group_base_ty or
+        ty == .task_handle_base_ty or
+        emitter.input.pool.isTaskGroupType(ty) or
+        emitter.input.pool.isTaskHandleType(ty))
+    {
+        return emitter.allocator.dupe(u8, "ptr");
+    }
+    if (ty == .fmt_spec_ty) {
+        return emitter.allocator.dupe(u8, "{ i32, i16, i16 }");
+    }
+    if (ty == .fmt_args_ty) {
+        return std.fmt.allocPrint(
+            emitter.allocator,
+            "{{ ptr, {s}, ptr, {s} }}",
+            .{ ptrIntType(emitter), ptrIntType(emitter) },
+        );
     }
     if (resolveIntegerInfo(emitter, ty)) |int_info| {
         return std.fmt.allocPrint(emitter.allocator, "i{d}", .{int_info.bits});
@@ -726,7 +826,13 @@ fn formatLlvmValueType(emitter: *LlvmModuleEmitter, raw_ty: TypeId) ![]u8 {
     const node = emitter.input.pool.getNode(ty);
     return switch (node.tag) {
         .ref_ty, .mut_ref_ty, .raw_ptr_ty, .fn_ty => emitter.allocator.dupe(u8, "ptr"),
-        .closure_ty => emitter.allocator.dupe(u8, "{ ptr, ptr }"),
+        .closure_ty => emitter.allocator.dupe(
+            u8,
+            if (codegen_abi.isThreeWordClosureType(emitter.input.pool, ty))
+                "{ ptr, ptr, ptr }"
+            else
+                "{ ptr, ptr }",
+        ),
         .slice_ty, .soa_slice_ty => std.fmt.allocPrint(
             emitter.allocator,
             "{{ ptr, {s} }}",
@@ -776,9 +882,10 @@ fn collectCompositeType(emitter: *LlvmModuleEmitter, raw_ty: TypeId, depth: u32)
     if (depth > MAX_COMPOSITE_COLLECT_DEPTH) return;
     const ty = try unwrapTransparentType(emitter, raw_ty);
     if (try isZeroSizedType(emitter, ty)) return;
-    if (ty.isPrimitiveOrSentinel()) return;
+    if (ty.isPrimitiveOrSentinel() or isBuiltInRuntimeTypeLlvm(emitter.input.pool, ty)) return;
 
     const node = emitter.input.pool.getNode(ty);
+    if (node.tag == .enum_ty and emitter.input.pool.getEnumBackingIntType(ty) != null) return;
     switch (node.tag) {
         .ref_ty, .mut_ref_ty, .raw_ptr_ty, .slice_ty, .soa_slice_ty, .fn_ty, .closure_ty => return,
         .array_ty => {
@@ -1013,14 +1120,24 @@ fn classifyFnTypeAbi(
             .is_non_escaping = true,
         };
     }
+    const is_ext = is_extern_c or sig_view.is_variadic;
     const is_ctxless = force_contextless orelse
-        (is_extern_c or sig_view.contracts.has_no_alloc);
+        (is_ext or sig_view.contracts.has_no_alloc);
     return AbiClassifier.classifyFn(emitter.allocator, &emitter.resolver, .{
         .params = param_specs,
         .ret_ty = sig_view.ret_ty,
-        .is_extern_c = is_extern_c,
+        .is_extern_c = is_ext,
         .is_contextless = is_ctxless,
+        .is_variadic = sig_view.is_variadic,
     });
+}
+
+/// Computes a deterministic 128-bit deduplication key for `MirConst.source_loc`.
+fn computeSourceLocKey(sloc: mir.SourceLocConst) u128 {
+    return (@as(u128, sloc.file_sym.asInt()) << 96) |
+        (@as(u128, sloc.fn_sym.asInt()) << 64) |
+        (@as(u128, sloc.line) << 32) |
+        @as(u128, sloc.col);
 }
 
 /// Registers `raw_ty` and its constituent fields/elements/variants for `@_cx_drop_ty_<id>` generation.
@@ -1080,6 +1197,64 @@ fn registerDropTypeRecursive(emitter: *LlvmModuleEmitter, raw_ty: TypeId, depth:
         else => {},
     }
     try emitter.drop_type_list.append(emitter.allocator, ty);
+}
+
+/// Registers `raw_ty` and any recursively formatted child types for `@_cx_fmt_fn_ty_<id>` generation.
+fn registerFmtTypeRecursive(emitter: *LlvmModuleEmitter, raw_ty: TypeId, depth: u32) !void {
+    if (depth >= 64) return;
+    const ty = try unwrapTransparentType(emitter, raw_ty);
+    if (ty.isError()) return;
+    if ((try emitter.fmt_type_set.getOrPut(emitter.allocator, ty.toU32())).found_existing) return;
+
+    emitter.has_fmt_rt_helpers = true;
+    try collectCompositeType(emitter, ty, 0);
+    if (!ty.isPrimitiveOrSentinel() and !isBuiltInRuntimeTypeLlvm(emitter.input.pool, ty)) {
+        const node = emitter.input.pool.getNode(ty);
+        switch (node.tag) {
+            .ref_ty, .mut_ref_ty => {
+                try registerFmtTypeRecursive(emitter, TypeId.fromInt(node.lhs), depth + 1);
+            },
+            .slice_ty, .array_ty => {
+                try registerFmtTypeRecursive(emitter, TypeId.fromInt(node.lhs), depth + 1);
+            },
+            .struct_ty, .tuple_ty => {
+                const lay = try emitter.resolver.resolveType(ty);
+                var fld_i: u32 = 0;
+                while (fld_i < lay.aux_len) : (fld_i += 1) {
+                    const fld = emitter.resolver.fields_by_decl.items[lay.aux_start + fld_i];
+                    try registerFmtTypeRecursive(emitter, fld.field_ty, depth + 1);
+                }
+            },
+            .optional_ty => {
+                try registerFmtTypeRecursive(emitter, TypeId.fromInt(node.lhs), depth + 1);
+            },
+            .result_ty => {
+                try registerFmtTypeRecursive(emitter, TypeId.fromInt(node.lhs), depth + 1);
+                try registerFmtTypeRecursive(emitter, TypeId.fromInt(node.rhs), depth + 1);
+            },
+            .enum_ty => {
+                const sym_idx = SymbolIndex.fromInt(node.rhs);
+                if (!sym_idx.isNone() and sym_idx.asInt() < emitter.input.sym_table.symbols.items.len) {
+                    const enum_sym = emitter.input.sym_table.getSymbol(sym_idx).*;
+                    if (!enum_sym.target_scope.isNone()) {
+                        var var_ord: u32 = 0;
+                        for (emitter.input.sym_table.getScopeMembers(enum_sym.target_scope)) |mem_idx| {
+                            if (emitter.input.sym_table.getSymbol(mem_idx).kind != .enum_variant_sym) continue;
+                            const var_pay = resolveEnumVariantPayloadType(emitter, ty, var_ord);
+                            if (var_pay != .unit_ty) {
+                                try registerFmtTypeRecursive(emitter, var_pay, depth + 1);
+                            }
+                            var_ord += 1;
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+    } else if (ty == .fmt_args_ty) {
+        try registerFmtTypeRecursive(emitter, .str_ty, depth + 1);
+    }
+    try emitter.fmt_type_list.append(emitter.allocator, ty);
 }
 
 /// Records an `extern` function symbol if referenced without a local `MirBody`.
@@ -1174,7 +1349,7 @@ fn isFnAddrUsedAsValue(body_ptr: *const MirBody, fn_val_raw: u32) bool {
                             }
                         }
                     },
-                    .tuple_agg, .struct_agg, .array_elems, .str_concat => {
+                    .tuple_agg, .struct_agg, .array_elems, .str_concat, .fmt_args_make => {
                         for (0..other_inst.operands.rhs) |elem_i| {
                             if (other_inst.operands.lhs + elem_i < body_ptr.extra_args.items.len and
                                 body_ptr.extra_args.items[other_inst.operands.lhs + elem_i] == fn_val_raw)
@@ -1317,6 +1492,20 @@ fn indexModuleEntities(emitter: *LlvmModuleEmitter) !void {
                         try emitter.blob_ids.append(emitter.allocator, rb_const.blob_id);
                     }
                 },
+                .source_loc => |sloc| {
+                    if (!(try str_set.getOrPut(emitter.allocator, sloc.file_sym.asInt())).found_existing) {
+                        try emitter.str_sym_ids.append(emitter.allocator, sloc.file_sym.asInt());
+                    }
+                    if (!(try str_set.getOrPut(emitter.allocator, sloc.fn_sym.asInt())).found_existing) {
+                        try emitter.str_sym_ids.append(emitter.allocator, sloc.fn_sym.asInt());
+                    }
+                    const loc_key = computeSourceLocKey(sloc);
+                    if (!emitter.source_loc_map.contains(loc_key)) {
+                        const loc_idx: u32 = @intCast(emitter.source_loc_consts.items.len);
+                        try emitter.source_loc_consts.append(emitter.allocator, sloc);
+                        try emitter.source_loc_map.put(emitter.allocator, loc_key, loc_idx);
+                    }
+                },
                 else => {},
             }
         }
@@ -1353,6 +1542,8 @@ fn indexModuleEntities(emitter: *LlvmModuleEmitter) !void {
                     if (resolveBodyIndex(emitter, DefId.fromInt(inst.operands.lhs), .none)) |callee_b| {
                         const key: u64 = (@as(u64, b_idx) << 32) | @as(u64, @intCast(inst_raw));
                         if (!emitter.closure_thunk_map.contains(key)) {
+                            const clos_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
+                            const is_three_w = codegen_abi.isThreeWordClosureType(emitter.input.pool, clos_ty);
                             const cap_len: usize = if (inst.operands.rhs < body_ptr.extra_args.items.len)
                                 body_ptr.extra_args.items[inst.operands.rhs]
                             else
@@ -1366,22 +1557,76 @@ fn indexModuleEntities(emitter: *LlvmModuleEmitter) !void {
                                 if (!(try cand_set.getOrPut(emitter.allocator, cap_tys[cap_i].toU32())).found_existing) {
                                     try candidate_types.append(emitter.allocator, cap_tys[cap_i]);
                                 }
+                                if (is_three_w) {
+                                    try registerDropTypeRecursive(emitter, cap_tys[cap_i], 0);
+                                }
+                            }
+                            if (is_three_w) {
+                                try registerDropTypeRecursive(emitter, clos_ty, 0);
                             }
                             const thunk_idx: u32 = @intCast(emitter.closure_thunks.items.len);
                             try emitter.closure_thunks.append(emitter.allocator, .{
                                 .owner_body_idx = b_idx,
                                 .inst_val_raw = @intCast(inst_raw),
                                 .callee_body_idx = callee_b,
-                                .closure_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id),
+                                .closure_ty = clos_ty,
                                 .capture_types = cap_tys,
+                                .is_three_word = is_three_w,
                             });
                             try emitter.closure_thunk_map.put(emitter.allocator, key, thunk_idx);
+                        }
+                    }
+                } else if (agg_kind == .fmt_args_make) {
+                    emitter.has_fmt_rt_helpers = true;
+                    if (inst.operands.rhs >= 1 and
+                        inst.operands.lhs + inst.operands.rhs <= body_ptr.extra_args.items.len)
+                    {
+                        const words = body_ptr.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs];
+                        const p_inst = body_ptr.getInst(MirValueId.fromInt(words[0]));
+                        var piece_count: usize = 0;
+                        if (p_inst.op == .const_scalar and p_inst.operands.lhs < body_ptr.consts.items.len) {
+                            switch (body_ptr.consts.items[p_inst.operands.lhs]) {
+                                .int_val => |iv| piece_count = @intCast(@as(u128, @bitCast(iv))),
+                                else => {},
+                            }
+                        }
+                        if (1 + piece_count <= words.len) {
+                            const hole_count = (words.len - 1 - piece_count) / 3;
+                            var hole_j: usize = 0;
+                            while (hole_j < hole_count) : (hole_j += 1) {
+                                const href_raw = words[1 + piece_count + hole_j * 3];
+                                const href_ty = try unwrapTransparentType(
+                                    emitter,
+                                    body_ptr.getInst(MirValueId.fromInt(href_raw)).type_id,
+                                );
+                                const href_node = emitter.input.pool.getNode(href_ty);
+                                const hval_ty = if (href_node.tag == .ref_ty or
+                                    href_node.tag == .mut_ref_ty or
+                                    href_node.tag == .raw_ptr_ty)
+                                    TypeId.fromInt(href_node.lhs)
+                                else
+                                    href_ty;
+                                try registerFmtTypeRecursive(emitter, hval_ty, 0);
+                            }
                         }
                     }
                 }
             } else if (inst.op == .intrinsic_op) {
                 const ikind: mir.MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
-                if (ikind == .drop_in_place or ikind == .drop_if_live) {
+                if (ikind == .fmt_value or ikind == .derive_debug_fmt) {
+                    emitter.has_fmt_rt_helpers = true;
+                    if (inst.operands.rhs >= 1 and inst.operands.lhs < body_ptr.extra_args.items.len) {
+                        const val_raw = body_ptr.extra_args.items[inst.operands.lhs];
+                        try registerFmtTypeRecursive(emitter, body_ptr.getInst(MirValueId.fromInt(val_raw)).type_id, 0);
+                    }
+                } else if (ikind == .panic) {
+                    if (inst.operands.rhs >= 1 and inst.operands.lhs < body_ptr.extra_args.items.len) {
+                        const p_raw = body_ptr.extra_args.items[inst.operands.lhs];
+                        if ((try unwrapTransparentType(emitter, body_ptr.getInst(MirValueId.fromInt(p_raw)).type_id)) == .fmt_args_ty) {
+                            emitter.has_fmt_rt_helpers = true;
+                        }
+                    }
+                } else if (ikind == .drop_in_place or ikind == .drop_if_live) {
                     const place_ty = resolvePlaceResultType(emitter, body_ptr, PlaceId.fromInt(inst.operands.lhs));
                     const dropped_ty = if (inst.type_id != .unit_ty and !inst.type_id.isError())
                         inst.type_id
@@ -1508,6 +1753,17 @@ fn formatAbiParamOrRetType(
                     return std.fmt.allocPrint(emitter.allocator, "i{d}", .{int_info.bits});
                 }
             }
+            if (ty == .source_loc_ty or
+                ty == .task_group_base_ty or
+                ty == .task_handle_base_ty or
+                emitter.input.pool.isTaskGroupType(ty) or
+                emitter.input.pool.isTaskHandleType(ty))
+            {
+                return emitter.allocator.dupe(u8, "ptr");
+            }
+            if (ty == .fmt_spec_ty) {
+                return emitter.allocator.dupe(u8, "i64");
+            }
             if (!ty.isPrimitiveOrSentinel()) {
                 const tag = emitter.input.pool.getNode(ty).tag;
                 if (tag == .ref_ty or tag == .mut_ref_ty or tag == .raw_ptr_ty or tag == .fn_ty) {
@@ -1519,7 +1775,7 @@ fn formatAbiParamOrRetType(
                     return emitter.allocator.dupe(u8, "i64");
                 }
             }
-            if (ty == .str_ty and emitter.cfg.target.isWasm()) {
+            if ((ty == .str_ty or ty == .bencher_ty) and emitter.cfg.target.isWasm()) {
                 return emitter.allocator.dupe(u8, "i64");
             }
             if (param_rec.bank_0 == .xmm_vec) {
@@ -1535,11 +1791,13 @@ fn formatAbiParamOrRetType(
             return emitter.allocator.dupe(u8, "i64");
         },
         .direct_pair => {
-            if (ty == .i128_ty or ty == .u128_ty) {
-                return emitter.allocator.dupe(u8, "i128");
+            if (resolveIntegerInfo(emitter, ty)) |int_info| {
+                if (int_info.bits == 128) {
+                    return emitter.allocator.dupe(u8, "i128");
+                }
             }
             if (!emitter.cfg.target.isWasm()) {
-                if (ty == .str_ty) return emitter.allocator.dupe(u8, "{ ptr, i64 }");
+                if (ty == .str_ty or ty == .bencher_ty) return emitter.allocator.dupe(u8, "{ ptr, i64 }");
                 if (!ty.isPrimitiveOrSentinel()) {
                     const tag = emitter.input.pool.getNode(ty).tag;
                     if (tag == .slice_ty or tag == .soa_slice_ty) {
@@ -1558,8 +1816,23 @@ fn formatAbiParamOrRetType(
             return std.fmt.allocPrint(emitter.allocator, "{{ {s}, {s} }}", .{ p0, p1 });
         },
         .direct_quad => {
+            if (!ty.isPrimitiveOrSentinel() and
+                emitter.input.pool.getNode(ty).tag == .closure_ty and
+                param_rec.piece_count <= 3)
+            {
+                return emitter.allocator.dupe(u8, "{ ptr, ptr, ptr }");
+            }
+            if (ty == .fmt_args_ty) {
+                return emitter.allocator.dupe(
+                    u8,
+                    if (emitter.cfg.target.isWasm()) "{ ptr, i32, ptr, i32 }" else "{ ptr, i64, ptr, i64 }",
+                );
+            }
             if (param_rec.piece_count <= 3) {
-                return emitter.allocator.dupe(u8, "{ i64, i64, i64 }");
+                return emitter.allocator.dupe(
+                    u8,
+                    if (param_rec.lowered_size_bytes <= 12) "{ i32, i32, i32 }" else "{ i64, i64, i64 }",
+                );
             }
             return emitter.allocator.dupe(u8, "{ i64, i64, i64, i64 }");
         },
@@ -1573,7 +1846,10 @@ fn formatAbiParamOrRetType(
 
 /// Computes the byte size of an ABI register piece/aggregate type string in O(1).
 fn computeAbiTypeByteSize(emitter: *const LlvmModuleEmitter, abi_ty: []const u8) u64 {
-    if (std.mem.eql(u8, abi_ty, "ptr")) return emitter.cfg.target.ptrBytes();
+    const ptr_bytes: u64 = emitter.cfg.target.ptrBytes();
+    if (std.mem.eql(u8, abi_ty, "ptr")) return ptr_bytes;
+    if (std.mem.eql(u8, abi_ty, "{ ptr, ptr }")) return 2 * ptr_bytes;
+    if (std.mem.eql(u8, abi_ty, "{ ptr, ptr, ptr }")) return 3 * ptr_bytes;
     if (ABI_TYPE_BYTE_SIZE_MAP.get(abi_ty)) |fixed_sz| return fixed_sz;
     if (abi_ty.len > 4 and abi_ty[0] == '[') {
         if (std.mem.indexOfScalar(u8, abi_ty, ' ')) |sp_idx| {
@@ -1913,6 +2189,42 @@ fn emitRodataAndRuntimeHelpers(
         );
         try writeLlvmByteStringLiteral(emitter, rendered);
         try emitter.writeAll(", align 1\n");
+    }
+    for (emitter.source_loc_consts.items, 0..) |sloc, loc_idx| {
+        const file_bytes = emitter.input.interner.get(sloc.file_sym);
+        const fn_bytes = emitter.input.interner.get(sloc.fn_sym);
+        const file_ptr_s = if (file_bytes.len == 0)
+            try std.fmt.allocPrint(emitter.allocator, "inttoptr ({s} 1 to ptr)", .{ptr_int})
+        else
+            try std.fmt.allocPrint(emitter.allocator, "@_cx_str_bytes_{d}", .{sloc.file_sym.asInt()});
+        defer emitter.allocator.free(file_ptr_s);
+        const fn_ptr_s = if (fn_bytes.len == 0)
+            try std.fmt.allocPrint(emitter.allocator, "inttoptr ({s} 1 to ptr)", .{ptr_int})
+        else
+            try std.fmt.allocPrint(emitter.allocator, "@_cx_str_bytes_{d}", .{sloc.fn_sym.asInt()});
+        defer emitter.allocator.free(fn_ptr_s);
+        try emitter.print(
+            "@_cx_loc_{d} = private unnamed_addr constant " ++
+                "{{ {{ ptr, {s} }}, {{ ptr, {s} }}, i32, i32 }} " ++
+                "{{ {{ ptr, {s} }} {{ ptr {s}, {s} {d} }}, " ++
+                "{{ ptr, {s} }} {{ ptr {s}, {s} {d} }}, i32 {d}, i32 {d} }}, align {d}\n",
+            .{
+                loc_idx,
+                ptr_int,
+                ptr_int,
+                ptr_int,
+                file_ptr_s,
+                ptr_int,
+                file_bytes.len,
+                ptr_int,
+                fn_ptr_s,
+                ptr_int,
+                fn_bytes.len,
+                sloc.line,
+                sloc.col,
+                emitter.cfg.target.ptrBytes(),
+            },
+        );
     }
 
     // [3] `@embed_bytes` raw binary blobs (`MirBlobStore`, `DR-20` `D-03`, `[CRITICAL-07]`):
@@ -2264,6 +2576,10 @@ fn emitExternDeclarations(emitter: *LlvmModuleEmitter) !void {
             try emitter.writeAll(piece_s);
             param_count_emitted += 1;
         }
+        if (sig_view.is_variadic) {
+            if (param_count_emitted > 0) try emitter.writeAll(", ...");
+            if (param_count_emitted == 0) try emitter.writeAll("...");
+        }
         if (emitter.cfg.target.os == .wasi and WASI_PREVIEW1_IMPORT_SET.has(ext_name)) {
             const esc_imp = try escapeMetadataStringAlloc(emitter.allocator, ext_name);
             defer emitter.allocator.free(esc_imp);
@@ -2355,6 +2671,44 @@ fn resolveUnionFieldType(
     return .unit_ty;
 }
 
+/// Resolves the custom or sequential `i128` discriminant value of fieldless enum variant `tag_ord`.
+fn resolveScalarEnumDiscrimI128(
+    emitter: *const LlvmModuleEmitter,
+    enum_ty: TypeId,
+    tag_ord: u32,
+) i128 {
+    return emitter.input.pool.getEnumVariantDiscriminant(enum_ty, tag_ord) orelse @as(i128, tag_ord);
+}
+
+/// Counts enum variants declared inside `enum_ty` (`0` if non-enum).
+fn countEnumVariantsLlvm(emitter: *const LlvmModuleEmitter, enum_ty: TypeId) u32 {
+    if (enum_ty.isPrimitiveOrSentinel() or emitter.input.pool.getNode(enum_ty).tag != .enum_ty) return 0;
+    const sym_idx = SymbolIndex.fromInt(emitter.input.pool.getNode(enum_ty).rhs);
+    if (sym_idx.isNone() or sym_idx.asInt() >= emitter.input.sym_table.symbols.items.len) return 0;
+    const enum_sym = emitter.input.sym_table.getSymbol(sym_idx).*;
+    if (enum_sym.target_scope.isNone()) return 0;
+    var count: u32 = 0;
+    for (emitter.input.sym_table.getScopeMembers(enum_sym.target_scope)) |mem_idx| {
+        if (emitter.input.sym_table.getSymbol(mem_idx).kind == .enum_variant_sym) count += 1;
+    }
+    return count;
+}
+
+/// Formats an `i128` integer literal masked/sign-canonicalized to `bits` for LLVM IR (`i<bits>`).
+fn formatScalarIntLiteralAlloc(
+    allocator: std.mem.Allocator,
+    bits: u16,
+    raw_val: i128,
+) ![]u8 {
+    const raw_u: u128 = @bitCast(raw_val);
+    if (bits >= 128) {
+        return std.fmt.allocPrint(allocator, "{d}", .{raw_val});
+    }
+    const mask: u128 = (@as(u128, 1) << @intCast(bits)) - 1;
+    const masked: u128 = raw_u & mask;
+    return std.fmt.allocPrint(allocator, "{d}", .{masked});
+}
+
 /// Reads the active `i32` discriminant ordinal of `raw_sum_ty` stored in memory at `base_ptr`.
 fn emitReadSumDiscriminantFromPtr(
     emitter: *LlvmModuleEmitter,
@@ -2366,6 +2720,54 @@ fn emitReadSumDiscriminantFromPtr(
     const sum_ty = emitter.input.pool.unwrapUnderlyingType(raw_sum_ty);
     const detail_opt = try emitter.resolver.getSumDetail(sum_ty);
     if (detail_opt == null) {
+        if (!sum_ty.isPrimitiveOrSentinel() and emitter.input.pool.getNode(sum_ty).tag == .enum_ty) {
+            if (resolveIntegerInfo(emitter, sum_ty)) |e_info| {
+                const eff_align = @min(@max(base_align, 1), @max(@as(u32, e_info.bits / 8), 1));
+                const ld_tmp = state.nextTmp();
+                try state.print(
+                    "  %_bed_ld_{d} = load i{d}, ptr {s}, align {d}\n",
+                    .{ ld_tmp, e_info.bits, base_ptr, eff_align },
+                );
+                const var_count = countEnumVariantsLlvm(emitter, sum_ty);
+                if (emitter.input.pool.getEnumBackingIntType(sum_ty) != null and var_count > 0) {
+                    var cur_ssa = try emitter.allocator.dupe(u8, "0");
+                    errdefer emitter.allocator.free(cur_ssa);
+                    var ord_i: u32 = 0;
+                    while (ord_i < var_count) : (ord_i += 1) {
+                        const disc_lit = try formatScalarIntLiteralAlloc(
+                            emitter.allocator,
+                            e_info.bits,
+                            resolveScalarEnumDiscrimI128(emitter, sum_ty, ord_i),
+                        );
+                        defer emitter.allocator.free(disc_lit);
+                        const step_tmp = state.nextTmp();
+                        try state.print(
+                            "  %_bed_eq_{d} = icmp eq i{d} %_bed_ld_{d}, {s}\n" ++
+                                "  %_bed_sl_{d} = select i1 %_bed_eq_{d}, i32 {d}, i32 {s}\n",
+                            .{ step_tmp, e_info.bits, ld_tmp, disc_lit, step_tmp, step_tmp, ord_i, cur_ssa },
+                        );
+                        emitter.allocator.free(cur_ssa);
+                        cur_ssa = try std.fmt.allocPrint(emitter.allocator, "%_bed_sl_{d}", .{step_tmp});
+                    }
+                    return cur_ssa;
+                }
+                if (e_info.bits == 32) {
+                    return std.fmt.allocPrint(emitter.allocator, "%_bed_ld_{d}", .{ld_tmp});
+                } else if (e_info.bits < 32) {
+                    try state.print(
+                        "  %_bed_32_{d} = zext i{d} %_bed_ld_{d} to i32\n",
+                        .{ ld_tmp, e_info.bits, ld_tmp },
+                    );
+                    return std.fmt.allocPrint(emitter.allocator, "%_bed_32_{d}", .{ld_tmp});
+                } else {
+                    try state.print(
+                        "  %_bed_32_{d} = trunc i{d} %_bed_ld_{d} to i32\n",
+                        .{ ld_tmp, e_info.bits, ld_tmp },
+                    );
+                    return std.fmt.allocPrint(emitter.allocator, "%_bed_32_{d}", .{ld_tmp});
+                }
+            }
+        }
         return emitter.allocator.dupe(u8, "0");
     }
     const detail = detail_opt.?;
@@ -2472,7 +2874,23 @@ fn emitWriteSumDiscriminantToPtr(
     tag_ord: u32,
 ) !void {
     const sum_ty = emitter.input.pool.unwrapUnderlyingType(raw_sum_ty);
-    const detail = (try emitter.resolver.getSumDetail(sum_ty)) orelse return;
+    const detail = (try emitter.resolver.getSumDetail(sum_ty)) orelse {
+        if (!sum_ty.isPrimitiveOrSentinel() and emitter.input.pool.getNode(sum_ty).tag == .enum_ty) {
+            const enum_info = resolveIntegerInfo(emitter, sum_ty) orelse return;
+            const disc_lit = try formatScalarIntLiteralAlloc(
+                emitter.allocator,
+                enum_info.bits,
+                resolveScalarEnumDiscrimI128(emitter, sum_ty, tag_ord),
+            );
+            defer emitter.allocator.free(disc_lit);
+            const eff_align = @min(@max(base_align, 1), @max(@as(u32, enum_info.bits / 8), 1));
+            try state.print(
+                "  store i{d} {s}, ptr {s}, align {d}\n",
+                .{ enum_info.bits, disc_lit, base_ptr, eff_align },
+            );
+        }
+        return;
+    };
     switch (detail.repr) {
         .not_sum, .transparent_ok => {},
         .explicit_tag => {
@@ -2551,14 +2969,1765 @@ fn lookupDropBodyIndexForType(emitter: *const LlvmModuleEmitter, drop_ty: TypeId
     return null;
 }
 
+/// Resolves the declared field name for ordinal `field_ord` on nominal `struct_ty`.
+fn resolveStructFieldNameLlvm(
+    emitter: *const LlvmModuleEmitter,
+    struct_ty: TypeId,
+    field_ord: u32,
+) []const u8 {
+    if (struct_ty.isPrimitiveOrSentinel()) return "_";
+    const sym_idx = SymbolIndex.fromInt(emitter.input.pool.getNode(struct_ty).rhs);
+    if (sym_idx.isNone() or sym_idx.asInt() >= emitter.input.sym_table.symbols.items.len) return "_";
+    const st_sym = emitter.input.sym_table.getSymbol(sym_idx).*;
+    if (st_sym.target_scope.isNone()) return "_";
+    var cur_ord: u32 = 0;
+    for (emitter.input.sym_table.getScopeMembers(st_sym.target_scope)) |mem_idx| {
+        const mem_sym = emitter.input.sym_table.getSymbol(mem_idx).*;
+        if (mem_sym.kind != .field_sym) continue;
+        if (cur_ord == field_ord) return mem_sym.name_text;
+        cur_ord += 1;
+    }
+    return "_";
+}
+
+/// Resolves the declared variant name for ordinal `variant_ord` on nominal `enum_ty`.
+fn resolveEnumVariantNameLlvm(
+    emitter: *const LlvmModuleEmitter,
+    enum_ty: TypeId,
+    variant_ord: u32,
+) []const u8 {
+    if (enum_ty.isPrimitiveOrSentinel()) return "_";
+    const sym_idx = SymbolIndex.fromInt(emitter.input.pool.getNode(enum_ty).rhs);
+    if (sym_idx.isNone() or sym_idx.asInt() >= emitter.input.sym_table.symbols.items.len) return "_";
+    const enum_sym = emitter.input.sym_table.getSymbol(sym_idx).*;
+    if (enum_sym.target_scope.isNone()) return "_";
+    var cur_ord: u32 = 0;
+    for (emitter.input.sym_table.getScopeMembers(enum_sym.target_scope)) |mem_idx| {
+        const mem_sym = emitter.input.sym_table.getSymbol(mem_idx).*;
+        if (mem_sym.kind != .enum_variant_sym) continue;
+        if (cur_ord == variant_ord) return mem_sym.name_text;
+        cur_ord += 1;
+    }
+    return "_";
+}
+
+/// Interns `text` as a private LLVM byte constant in `synth_globals` and returns its `ptr` token.
+fn emitSynthConstBytesPtr(emitter: *LlvmModuleEmitter, text: []const u8) ![]u8 {
+    if (text.len == 0) return emitter.allocator.dupe(u8, "null");
+    const sid = emitter.nextSynthGlobalId();
+    const hdr_s = try std.fmt.allocPrint(
+        emitter.allocator,
+        "@_cx_fstr_{d} = private unnamed_addr constant [{d} x i8] ",
+        .{ sid, text.len },
+    );
+    defer emitter.allocator.free(hdr_s);
+    try emitter.synth_globals.appendSlice(emitter.allocator, hdr_s);
+    try appendByteStringLiteralToBuf(emitter.allocator, &emitter.synth_globals, text);
+    try emitter.synth_globals.appendSlice(emitter.allocator, ", align 1\n");
+    return std.fmt.allocPrint(emitter.allocator, "@_cx_fstr_{d}", .{sid});
+}
+
+/// Appends a literal string `text` into `%_cb` via `@_cx_rt_buf_push_bytes`.
+fn emitBufPushStringLiteralLlvm(
+    emitter: *LlvmModuleEmitter,
+    buf_var: []const u8,
+    text: []const u8,
+) !void {
+    if (text.len == 0) return;
+    const str_ptr = try emitSynthConstBytesPtr(emitter, text);
+    defer emitter.allocator.free(str_ptr);
+    try emitter.print(
+        "  call void @_cx_rt_buf_push_bytes(ptr {s}, ptr {s}, i64 {d})\n",
+        .{ buf_var, str_ptr, text.len },
+    );
+}
+
+/// Emits shared LLVM IR runtime helpers for `MirIntrinsicKind.fmt_value` and `FmtArgs` (`SE-12`).
+fn ensureFmtRuntimeHelpers(emitter: *LlvmModuleEmitter) !void {
+    const ptr_int = ptrIntType(emitter);
+    const ptr_bytes: u32 = emitter.cfg.target.ptrBytes();
+    const fn_attrs = fnUnwindAttrs(emitter);
+    const is_wasm = emitter.cfg.target.isWasm();
+
+    if (!emitter.declared_externs.contains("realloc")) {
+        try emitter.requireIntrinsicDecl(
+            if (is_wasm)
+                "declare ptr @realloc(ptr, i32) nounwind"
+            else
+                "declare ptr @realloc(ptr, i64) nounwind",
+        );
+    }
+    if (!emitter.declared_externs.contains("free")) {
+        try emitter.requireIntrinsicDecl("declare void @free(ptr) nounwind");
+    }
+    try emitter.requireIntrinsicDecl(
+        "declare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, " ++
+            "ptr noalias nocapture readonly, i64, i1 immarg)",
+    );
+
+    try emitter.writeAll(
+        \\@.cx_frt_hex_lo = private unnamed_addr constant [16 x i8] c"0123456789abcdef", align 1
+        \\@.cx_frt_hex_up = private unnamed_addr constant [16 x i8] c"0123456789ABCDEF", align 1
+        \\@.cx_frt_nan = private unnamed_addr constant [3 x i8] c"nan", align 1
+        \\@.cx_frt_nan_up = private unnamed_addr constant [3 x i8] c"NAN", align 1
+        \\@.cx_frt_inf = private unnamed_addr constant [3 x i8] c"inf", align 1
+        \\@.cx_frt_ninf = private unnamed_addr constant [4 x i8] c"-inf", align 1
+        \\@.cx_frt_pinf = private unnamed_addr constant [4 x i8] c"+inf", align 1
+        \\@.cx_frt_inf_up = private unnamed_addr constant [3 x i8] c"INF", align 1
+        \\@.cx_frt_ninf_up = private unnamed_addr constant [4 x i8] c"-INF", align 1
+        \\@.cx_frt_pinf_up = private unnamed_addr constant [4 x i8] c"+INF", align 1
+        \\@.cx_frt_g15 = private unnamed_addr constant [6 x i8] c"%.15g\00", align 1
+        \\@.cx_frt_null = private unnamed_addr constant [3 x i8] c"0x0", align 1
+        \\@.cx_frt_esc_bs = private unnamed_addr constant [2 x i8] c"\5C\5C", align 1
+        \\@.cx_frt_esc_n = private unnamed_addr constant [2 x i8] c"\5C\6E", align 1
+        \\@.cx_frt_esc_r = private unnamed_addr constant [2 x i8] c"\5C\72", align 1
+        \\@.cx_frt_esc_t = private unnamed_addr constant [2 x i8] c"\5C\74", align 1
+        \\@.cx_frt_esc_0 = private unnamed_addr constant [2 x i8] c"\5C\30", align 1
+        \\
+    );
+
+    // `@_cx_rt_eff_verb`:
+    try emitter.print(
+        "define internal i32 @_cx_rt_eff_verb(i32 %spec_lo) {s} {{\n" ++
+            "entry:\n" ++
+            "  %vc_sh = lshr i32 %spec_lo, 27\n" ++
+            "  %vc = and i32 %vc_sh, 15\n" ++
+            "  %eq_sh = lshr i32 %spec_lo, 31\n" ++
+            "  %is_eq = icmp ne i32 %eq_sh, 0\n" ++
+            "  %is_d0 = icmp eq i32 %vc, 0\n" ++
+            "  %up = and i1 %is_d0, %is_eq\n" ++
+            "  %res = select i1 %up, i32 1, i32 %vc\n" ++
+            "  ret i32 %res\n" ++
+            "}}\n\n",
+        .{fn_attrs},
+    );
+
+    // `@_cx_rt_buf_reserve`:
+    const realloc_conv = if (is_wasm)
+        "  %r_sz = trunc i64 %fc to i32\n"
+    else
+        "  %r_sz = add i64 %fc, 0\n";
+    try emitter.print(
+        "define internal void @_cx_rt_buf_reserve(ptr %b, i64 %extra) {s} {{\n" ++
+            "entry:\n" ++
+            "  %nc_slot = alloca i64, align 8\n" ++
+            "  %isz = icmp eq i64 %extra, 0\n" ++
+            "  br i1 %isz, label %done, label %chk\n" ++
+            "chk:\n" ++
+            "  %lp = getelementptr inbounds {{ ptr, i64, i64 }}, ptr %b, i32 0, i32 1\n" ++
+            "  %cp = getelementptr inbounds {{ ptr, i64, i64 }}, ptr %b, i32 0, i32 2\n" ++
+            "  %len = load i64, ptr %lp, align 8\n" ++
+            "  %cap = load i64, ptr %cp, align 8\n" ++
+            "  %rem = sub i64 %cap, %len\n" ++
+            "  %fits = icmp ule i64 %extra, %rem\n" ++
+            "  br i1 %fits, label %done, label %grow_init\n" ++
+            "grow_init:\n" ++
+            "  %need = add i64 %len, %extra\n" ++
+            "  %ovf = icmp ult i64 %need, %len\n" ++
+            "  br i1 %ovf, label %trap_oom, label %calc_cap\n" ++
+            "calc_cap:\n" ++
+            "  %c_z = icmp eq i64 %cap, 0\n" ++
+            "  %c0 = select i1 %c_z, i64 64, i64 %cap\n" ++
+            "  store i64 %c0, ptr %nc_slot, align 8\n" ++
+            "  br label %grow_loop\n" ++
+            "grow_loop:\n" ++
+            "  %nc = load i64, ptr %nc_slot, align 8\n" ++
+            "  %lt = icmp ult i64 %nc, %need\n" ++
+            "  br i1 %lt, label %grow_check, label %do_realloc\n" ++
+            "grow_check:\n" ++
+            "  %big = icmp ugt i64 %nc, 9223372036854775807\n" ++
+            "  br i1 %big, label %clamp_need, label %grow_step\n" ++
+            "grow_step:\n" ++
+            "  %nc2 = shl i64 %nc, 1\n" ++
+            "  store i64 %nc2, ptr %nc_slot, align 8\n" ++
+            "  br label %grow_loop\n" ++
+            "clamp_need:\n" ++
+            "  store i64 %need, ptr %nc_slot, align 8\n" ++
+            "  br label %do_realloc\n" ++
+            "do_realloc:\n" ++
+            "  %fc = load i64, ptr %nc_slot, align 8\n" ++
+            "  %old_d = load ptr, ptr %b, align 8\n" ++
+            "{s}" ++
+            "  %new_d = call ptr @realloc(ptr %old_d, {s} %r_sz)\n" ++
+            "  %is_null = icmp eq ptr %new_d, null\n" ++
+            "  br i1 %is_null, label %trap_oom, label %save\n" ++
+            "save:\n" ++
+            "  store ptr %new_d, ptr %b, align 8\n" ++
+            "  store i64 %fc, ptr %cp, align 8\n" ++
+            "  br label %done\n" ++
+            "trap_oom:\n" ++
+            "  call void @_cx_rt_trap(i32 0)\n" ++
+            "  unreachable\n" ++
+            "done:\n" ++
+            "  ret void\n" ++
+            "}}\n\n",
+        .{ fn_attrs, realloc_conv, ptr_int },
+    );
+
+    // `@_cx_rt_buf_push_bytes` & `@_cx_rt_buf_push_byte`:
+    try emitter.print(
+        "define internal void @_cx_rt_buf_push_bytes(ptr %b, ptr %src, i64 %n) {s} {{\n" ++
+            "entry:\n" ++
+            "  %isz = icmp eq i64 %n, 0\n" ++
+            "  %isn = icmp eq ptr %src, null\n" ++
+            "  %skip = or i1 %isz, %isn\n" ++
+            "  br i1 %skip, label %done, label %do_push\n" ++
+            "do_push:\n" ++
+            "  call void @_cx_rt_buf_reserve(ptr %b, i64 %n)\n" ++
+            "  %d = load ptr, ptr %b, align 8\n" ++
+            "  %lp = getelementptr inbounds {{ ptr, i64, i64 }}, ptr %b, i32 0, i32 1\n" ++
+            "  %len = load i64, ptr %lp, align 8\n" ++
+            "  %dst = getelementptr inbounds i8, ptr %d, i64 %len\n" ++
+            "  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %dst, ptr align 1 %src, i64 %n, i1 false)\n" ++
+            "  %nlen = add i64 %len, %n\n" ++
+            "  store i64 %nlen, ptr %lp, align 8\n" ++
+            "  br label %done\n" ++
+            "done:\n" ++
+            "  ret void\n" ++
+            "}}\n\n" ++
+            "define internal void @_cx_rt_buf_push_byte(ptr %b, i8 %ch) {s} {{\n" ++
+            "entry:\n" ++
+            "  call void @_cx_rt_buf_reserve(ptr %b, i64 1)\n" ++
+            "  %d = load ptr, ptr %b, align 8\n" ++
+            "  %lp = getelementptr inbounds {{ ptr, i64, i64 }}, ptr %b, i32 0, i32 1\n" ++
+            "  %len = load i64, ptr %lp, align 8\n" ++
+            "  %dst = getelementptr inbounds i8, ptr %d, i64 %len\n" ++
+            "  store i8 %ch, ptr %dst, align 1\n" ++
+            "  %nlen = add i64 %len, 1\n" ++
+            "  store i64 %nlen, ptr %lp, align 8\n" ++
+            "  ret void\n" ++
+            "}}\n\n",
+        .{ fn_attrs, fn_attrs },
+    );
+
+    // `@_cx_rt_encode_utf8` & `@_cx_rt_buf_push_repeat_cp`:
+    try emitter.print(
+        "define internal i64 @_cx_rt_encode_utf8(i32 %raw_cp, ptr %out) {s} {{\n" ++
+            "entry:\n" ++
+            "  %hi_bad = icmp ugt i32 %raw_cp, 1114111\n" ++
+            "  %sg_lo = icmp uge i32 %raw_cp, 55296\n" ++
+            "  %sg_hi = icmp ule i32 %raw_cp, 57343\n" ++
+            "  %sg_bad = and i1 %sg_lo, %sg_hi\n" ++
+            "  %bad = or i1 %hi_bad, %sg_bad\n" ++
+            "  %cp = select i1 %bad, i32 65533, i32 %raw_cp\n" ++
+            "  %le1 = icmp ule i32 %cp, 127\n" ++
+            "  br i1 %le1, label %u1, label %chk2\n" ++
+            "u1:\n" ++
+            "  %b1_0 = trunc i32 %cp to i8\n" ++
+            "  store i8 %b1_0, ptr %out, align 1\n" ++
+            "  ret i64 1\n" ++
+            "chk2:\n" ++
+            "  %le2 = icmp ule i32 %cp, 2047\n" ++
+            "  br i1 %le2, label %u2, label %chk3\n" ++
+            "u2:\n" ++
+            "  %s2_0 = lshr i32 %cp, 6\n" ++
+            "  %m2_0 = and i32 %s2_0, 31\n" ++
+            "  %o2_0 = or i32 %m2_0, 192\n" ++
+            "  %b2_0 = trunc i32 %o2_0 to i8\n" ++
+            "  %m2_1 = and i32 %cp, 63\n" ++
+            "  %o2_1 = or i32 %m2_1, 128\n" ++
+            "  %b2_1 = trunc i32 %o2_1 to i8\n" ++
+            "  store i8 %b2_0, ptr %out, align 1\n" ++
+            "  %p2_1 = getelementptr inbounds i8, ptr %out, i64 1\n" ++
+            "  store i8 %b2_1, ptr %p2_1, align 1\n" ++
+            "  ret i64 2\n" ++
+            "chk3:\n" ++
+            "  %le3 = icmp ule i32 %cp, 65535\n" ++
+            "  br i1 %le3, label %u3, label %u4\n" ++
+            "u3:\n" ++
+            "  %s3_0 = lshr i32 %cp, 12\n" ++
+            "  %m3_0 = and i32 %s3_0, 15\n" ++
+            "  %o3_0 = or i32 %m3_0, 224\n" ++
+            "  %b3_0 = trunc i32 %o3_0 to i8\n" ++
+            "  %s3_1 = lshr i32 %cp, 6\n" ++
+            "  %m3_1 = and i32 %s3_1, 63\n" ++
+            "  %o3_1 = or i32 %m3_1, 128\n" ++
+            "  %b3_1 = trunc i32 %o3_1 to i8\n" ++
+            "  %m3_2 = and i32 %cp, 63\n" ++
+            "  %o3_2 = or i32 %m3_2, 128\n" ++
+            "  %b3_2 = trunc i32 %o3_2 to i8\n" ++
+            "  store i8 %b3_0, ptr %out, align 1\n" ++
+            "  %p3_1 = getelementptr inbounds i8, ptr %out, i64 1\n" ++
+            "  store i8 %b3_1, ptr %p3_1, align 1\n" ++
+            "  %p3_2 = getelementptr inbounds i8, ptr %out, i64 2\n" ++
+            "  store i8 %b3_2, ptr %p3_2, align 1\n" ++
+            "  ret i64 3\n" ++
+            "u4:\n" ++
+            "  %s4_0 = lshr i32 %cp, 18\n" ++
+            "  %m4_0 = and i32 %s4_0, 7\n" ++
+            "  %o4_0 = or i32 %m4_0, 240\n" ++
+            "  %b4_0 = trunc i32 %o4_0 to i8\n" ++
+            "  %s4_1 = lshr i32 %cp, 12\n" ++
+            "  %m4_1 = and i32 %s4_1, 63\n" ++
+            "  %o4_1 = or i32 %m4_1, 128\n" ++
+            "  %b4_1 = trunc i32 %o4_1 to i8\n" ++
+            "  %s4_2 = lshr i32 %cp, 6\n" ++
+            "  %m4_2 = and i32 %s4_2, 63\n" ++
+            "  %o4_2 = or i32 %m4_2, 128\n" ++
+            "  %b4_2 = trunc i32 %o4_2 to i8\n" ++
+            "  %m4_3 = and i32 %cp, 63\n" ++
+            "  %o4_3 = or i32 %m4_3, 128\n" ++
+            "  %b4_3 = trunc i32 %o4_3 to i8\n" ++
+            "  store i8 %b4_0, ptr %out, align 1\n" ++
+            "  %p4_1 = getelementptr inbounds i8, ptr %out, i64 1\n" ++
+            "  store i8 %b4_1, ptr %p4_1, align 1\n" ++
+            "  %p4_2 = getelementptr inbounds i8, ptr %out, i64 2\n" ++
+            "  store i8 %b4_2, ptr %p4_2, align 1\n" ++
+            "  %p4_3 = getelementptr inbounds i8, ptr %out, i64 3\n" ++
+            "  store i8 %b4_3, ptr %p4_3, align 1\n" ++
+            "  ret i64 4\n" ++
+            "}}\n\n" ++
+            "define internal void @_cx_rt_buf_push_repeat_cp(ptr %b, i32 %cp, i64 %count) {s} {{\n" ++
+            "entry:\n" ++
+            "  %enc = alloca [4 x i8], align 1\n" ++
+            "  %i_slot = alloca i64, align 8\n" ++
+            "  %isz = icmp eq i64 %count, 0\n" ++
+            "  br i1 %isz, label %done, label %prep\n" ++
+            "prep:\n" ++
+            "  %elen = call i64 @_cx_rt_encode_utf8(i32 %cp, ptr %enc)\n" ++
+            "  store i64 0, ptr %i_slot, align 8\n" ++
+            "  br label %loop\n" ++
+            "loop:\n" ++
+            "  %iv = load i64, ptr %i_slot, align 8\n" ++
+            "  %lt = icmp ult i64 %iv, %count\n" ++
+            "  br i1 %lt, label %body, label %done\n" ++
+            "body:\n" ++
+            "  call void @_cx_rt_buf_push_bytes(ptr %b, ptr %enc, i64 %elen)\n" ++
+            "  %nx = add i64 %iv, 1\n" ++
+            "  store i64 %nx, ptr %i_slot, align 8\n" ++
+            "  br label %loop\n" ++
+            "done:\n" ++
+            "  ret void\n" ++
+            "}}\n\n",
+        .{ fn_attrs, fn_attrs },
+    );
+
+    // `@_cx_rt_count_utf8_cps` & `@_cx_rt_utf8_prefix_bytes`:
+    try emitter.print(
+        "define internal i64 @_cx_rt_count_utf8_cps(ptr %s, i64 %n) {s} {{\n" ++
+            "entry:\n" ++
+            "  %i_slot = alloca i64, align 8\n" ++
+            "  %c_slot = alloca i64, align 8\n" ++
+            "  store i64 0, ptr %i_slot, align 8\n" ++
+            "  store i64 0, ptr %c_slot, align 8\n" ++
+            "  br label %loop\n" ++
+            "loop:\n" ++
+            "  %iv = load i64, ptr %i_slot, align 8\n" ++
+            "  %lt = icmp ult i64 %iv, %n\n" ++
+            "  br i1 %lt, label %body, label %done\n" ++
+            "body:\n" ++
+            "  %bp = getelementptr inbounds i8, ptr %s, i64 %iv\n" ++
+            "  %bv = load i8, ptr %bp, align 1\n" ++
+            "  %bm = and i8 %bv, -64\n" ++
+            "  %lead = icmp ne i8 %bm, -128\n" ++
+            "  %cv = load i64, ptr %c_slot, align 8\n" ++
+            "  %inc = zext i1 %lead to i64\n" ++
+            "  %ncv = add i64 %cv, %inc\n" ++
+            "  store i64 %ncv, ptr %c_slot, align 8\n" ++
+            "  %nx = add i64 %iv, 1\n" ++
+            "  store i64 %nx, ptr %i_slot, align 8\n" ++
+            "  br label %loop\n" ++
+            "done:\n" ++
+            "  %res = load i64, ptr %c_slot, align 8\n" ++
+            "  ret i64 %res\n" ++
+            "}}\n\n" ++
+            "define internal i64 @_cx_rt_utf8_prefix_bytes(ptr %s, i64 %n, i64 %max_cps) {s} {{\n" ++
+            "entry:\n" ++
+            "  %i_slot = alloca i64, align 8\n" ++
+            "  %c_slot = alloca i64, align 8\n" ++
+            "  store i64 0, ptr %i_slot, align 8\n" ++
+            "  store i64 0, ptr %c_slot, align 8\n" ++
+            "  br label %loop\n" ++
+            "loop:\n" ++
+            "  %iv = load i64, ptr %i_slot, align 8\n" ++
+            "  %lt = icmp ult i64 %iv, %n\n" ++
+            "  br i1 %lt, label %body, label %ret_n\n" ++
+            "body:\n" ++
+            "  %bp = getelementptr inbounds i8, ptr %s, i64 %iv\n" ++
+            "  %bv = load i8, ptr %bp, align 1\n" ++
+            "  %bm = and i8 %bv, -64\n" ++
+            "  %lead = icmp ne i8 %bm, -128\n" ++
+            "  br i1 %lead, label %on_lead, label %next_b\n" ++
+            "on_lead:\n" ++
+            "  %cv = load i64, ptr %c_slot, align 8\n" ++
+            "  %hit = icmp eq i64 %cv, %max_cps\n" ++
+            "  br i1 %hit, label %ret_i, label %inc_c\n" ++
+            "inc_c:\n" ++
+            "  %ncv = add i64 %cv, 1\n" ++
+            "  store i64 %ncv, ptr %c_slot, align 8\n" ++
+            "  br label %next_b\n" ++
+            "next_b:\n" ++
+            "  %nx = add i64 %iv, 1\n" ++
+            "  store i64 %nx, ptr %i_slot, align 8\n" ++
+            "  br label %loop\n" ++
+            "ret_i:\n" ++
+            "  ret i64 %iv\n" ++
+            "ret_n:\n" ++
+            "  ret i64 %n\n" ++
+            "}}\n\n",
+        .{ fn_attrs, fn_attrs },
+    );
+
+    // `@_cx_rt_buf_pad_str` & `@_cx_rt_buf_pad_num`:
+    try emitter.print(
+        "define internal void @_cx_rt_buf_pad_str(ptr %b, ptr %s, i64 %n, i32 %spec_lo, i32 %spec_hi, i32 %def_r) {s} {{\n" ++
+            "entry:\n" ++
+            "  %wu = and i32 %spec_hi, 65535\n" ++
+            "  %no_w = icmp eq i32 %wu, 65535\n" ++
+            "  br i1 %no_w, label %fast, label %chk_len\n" ++
+            "chk_len:\n" ++
+            "  %cpl = call i64 @_cx_rt_count_utf8_cps(ptr %s, i64 %n)\n" ++
+            "  %w64 = zext i32 %wu to i64\n" ++
+            "  %ge = icmp uge i64 %cpl, %w64\n" ++
+            "  br i1 %ge, label %fast, label %do_pad\n" ++
+            "fast:\n" ++
+            "  call void @_cx_rt_buf_push_bytes(ptr %b, ptr %s, i64 %n)\n" ++
+            "  ret void\n" ++
+            "do_pad:\n" ++
+            "  %pad = sub i64 %w64, %cpl\n" ++
+            "  %rf = and i32 %spec_lo, 2097151\n" ++
+            "  %fz = icmp eq i32 %rf, 0\n" ++
+            "  %fill = select i1 %fz, i32 32, i32 %rf\n" ++
+            "  %ash = lshr i32 %spec_lo, 21\n" ++
+            "  %am_r = and i32 %ash, 3\n" ++
+            "  %dr_nz = icmp ne i32 %def_r, 0\n" ++
+            "  %def_am = select i1 %dr_nz, i32 3, i32 1\n" ++
+            "  %am_z = icmp eq i32 %am_r, 0\n" ++
+            "  %am = select i1 %am_z, i32 %def_am, i32 %am_r\n" ++
+            "  %is_r = icmp eq i32 %am, 3\n" ++
+            "  %is_c = icmp eq i32 %am, 2\n" ++
+            "  %half = lshr i64 %pad, 1\n" ++
+            "  %lp0 = select i1 %is_c, i64 %half, i64 0\n" ++
+            "  %lpad = select i1 %is_r, i64 %pad, i64 %lp0\n" ++
+            "  %rpad = sub i64 %pad, %lpad\n" ++
+            "  call void @_cx_rt_buf_push_repeat_cp(ptr %b, i32 %fill, i64 %lpad)\n" ++
+            "  call void @_cx_rt_buf_push_bytes(ptr %b, ptr %s, i64 %n)\n" ++
+            "  call void @_cx_rt_buf_push_repeat_cp(ptr %b, i32 %fill, i64 %rpad)\n" ++
+            "  ret void\n" ++
+            "}}\n\n" ++
+            "define internal void @_cx_rt_buf_pad_num(ptr %b, ptr %pfx, i64 %pn, ptr %dig, i64 %dn, i32 %spec_lo, i32 %spec_hi) {s} {{\n" ++
+            "entry:\n" ++
+            "  %tot = add i64 %pn, %dn\n" ++
+            "  %wu = and i32 %spec_hi, 65535\n" ++
+            "  %no_w = icmp eq i32 %wu, 65535\n" ++
+            "  %w64 = zext i32 %wu to i64\n" ++
+            "  %ge = icmp uge i64 %tot, %w64\n" ++
+            "  %skip = or i1 %no_w, %ge\n" ++
+            "  br i1 %skip, label %fast, label %chk_zp\n" ++
+            "fast:\n" ++
+            "  call void @_cx_rt_buf_push_bytes(ptr %b, ptr %pfx, i64 %pn)\n" ++
+            "  call void @_cx_rt_buf_push_bytes(ptr %b, ptr %dig, i64 %dn)\n" ++
+            "  ret void\n" ++
+            "chk_zp:\n" ++
+            "  %pad = sub i64 %w64, %tot\n" ++
+            "  %ash = lshr i32 %spec_lo, 21\n" ++
+            "  %am_r = and i32 %ash, 3\n" ++
+            "  %zsh = lshr i32 %spec_lo, 26\n" ++
+            "  %zp_b = and i32 %zsh, 1\n" ++
+            "  %is_zp = icmp ne i32 %zp_b, 0\n" ++
+            "  %am_z = icmp eq i32 %am_r, 0\n" ++
+            "  %do_zp = and i1 %is_zp, %am_z\n" ++
+            "  br i1 %do_zp, label %zero_pad, label %fill_pad\n" ++
+            "zero_pad:\n" ++
+            "  call void @_cx_rt_buf_push_bytes(ptr %b, ptr %pfx, i64 %pn)\n" ++
+            "  call void @_cx_rt_buf_push_repeat_cp(ptr %b, i32 48, i64 %pad)\n" ++
+            "  call void @_cx_rt_buf_push_bytes(ptr %b, ptr %dig, i64 %dn)\n" ++
+            "  ret void\n" ++
+            "fill_pad:\n" ++
+            "  %rf = and i32 %spec_lo, 2097151\n" ++
+            "  %fz = icmp eq i32 %rf, 0\n" ++
+            "  %fill = select i1 %fz, i32 32, i32 %rf\n" ++
+            "  %am = select i1 %am_z, i32 3, i32 %am_r\n" ++
+            "  %is_r = icmp eq i32 %am, 3\n" ++
+            "  %is_c = icmp eq i32 %am, 2\n" ++
+            "  %half = lshr i64 %pad, 1\n" ++
+            "  %lp0 = select i1 %is_c, i64 %half, i64 0\n" ++
+            "  %lpad = select i1 %is_r, i64 %pad, i64 %lp0\n" ++
+            "  %rpad = sub i64 %pad, %lpad\n" ++
+            "  call void @_cx_rt_buf_push_repeat_cp(ptr %b, i32 %fill, i64 %lpad)\n" ++
+            "  call void @_cx_rt_buf_push_bytes(ptr %b, ptr %pfx, i64 %pn)\n" ++
+            "  call void @_cx_rt_buf_push_bytes(ptr %b, ptr %dig, i64 %dn)\n" ++
+            "  call void @_cx_rt_buf_push_repeat_cp(ptr %b, i32 %fill, i64 %rpad)\n" ++
+            "  ret void\n" ++
+            "}}\n\n",
+        .{ fn_attrs, fn_attrs },
+    );
+
+    // `@_cx_rt_fmt_u128_spec` & `@_cx_rt_fmt_i128_spec`:
+    try emitter.print(
+        "define internal void @_cx_rt_fmt_u128_spec(ptr %b, i128 %mag, i32 %is_neg, i32 %spec_lo, i32 %spec_hi) {s} {{\n" ++
+            "entry:\n" ++
+            "  %raw = alloca [132 x i8], align 1\n" ++
+            "  %pos_s = alloca i64, align 8\n" ++
+            "  %cur_s = alloca i128, align 16\n" ++
+            "  %pfx = alloca [8 x i8], align 1\n" ++
+            "  %pn_s = alloca i64, align 8\n" ++
+            "  %vsh = lshr i32 %spec_lo, 27\n" ++
+            "  %vc = and i32 %vsh, 15\n" ++
+            "  %is_x = icmp eq i32 %vc, 2\n" ++
+            "  %is_X = icmp eq i32 %vc, 3\n" ++
+            "  %is_p = icmp eq i32 %vc, 9\n" ++
+            "  %hx1 = or i1 %is_x, %is_X\n" ++
+            "  %is_hex = or i1 %hx1, %is_p\n" ++
+            "  %is_bin = icmp eq i32 %vc, 4\n" ++
+            "  %is_oct = icmp eq i32 %vc, 5\n" ++
+            "  %r0 = select i1 %is_oct, i128 8, i128 10\n" ++
+            "  %r1 = select i1 %is_bin, i128 2, i128 %r0\n" ++
+            "  %rad = select i1 %is_hex, i128 16, i128 %r1\n" ++
+            "  %dtbl = select i1 %is_X, ptr @.cx_frt_hex_up, ptr @.cx_frt_hex_lo\n" ++
+            "  %mz = icmp eq i128 %mag, 0\n" ++
+            "  br i1 %mz, label %on_zero, label %init_loop\n" ++
+            "on_zero:\n" ++
+            "  %zp = getelementptr inbounds i8, ptr %raw, i64 131\n" ++
+            "  store i8 48, ptr %zp, align 1\n" ++
+            "  store i64 131, ptr %pos_s, align 8\n" ++
+            "  br label %mk_pfx\n" ++
+            "init_loop:\n" ++
+            "  store i64 132, ptr %pos_s, align 8\n" ++
+            "  store i128 %mag, ptr %cur_s, align 16\n" ++
+            "  br label %d_loop\n" ++
+            "d_loop:\n" ++
+            "  %cv = load i128, ptr %cur_s, align 16\n" ++
+            "  %cnz = icmp ne i128 %cv, 0\n" ++
+            "  br i1 %cnz, label %d_step, label %mk_pfx\n" ++
+            "d_step:\n" ++
+            "  %rem = urem i128 %cv, %rad\n" ++
+            "  %nxt = udiv i128 %cv, %rad\n" ++
+            "  store i128 %nxt, ptr %cur_s, align 16\n" ++
+            "  %rem64 = trunc i128 %rem to i64\n" ++
+            "  %dp = getelementptr inbounds i8, ptr %dtbl, i64 %rem64\n" ++
+            "  %dc = load i8, ptr %dp, align 1\n" ++
+            "  %op = load i64, ptr %pos_s, align 8\n" ++
+            "  %np = sub i64 %op, 1\n" ++
+            "  store i64 %np, ptr %pos_s, align 8\n" ++
+            "  %wp = getelementptr inbounds i8, ptr %raw, i64 %np\n" ++
+            "  store i8 %dc, ptr %wp, align 1\n" ++
+            "  br label %d_loop\n" ++
+            "mk_pfx:\n" ++
+            "  store i64 0, ptr %pn_s, align 8\n" ++
+            "  %ssh = lshr i32 %spec_lo, 23\n" ++
+            "  %sm = and i32 %ssh, 3\n" ++
+            "  %neg_b = icmp ne i32 %is_neg, 0\n" ++
+            "  br i1 %neg_b, label %put_minus, label %chk_plus\n" ++
+            "put_minus:\n" ++
+            "  store i8 45, ptr %pfx, align 1\n" ++
+            "  store i64 1, ptr %pn_s, align 8\n" ++
+            "  br label %chk_alt\n" ++
+            "chk_plus:\n" ++
+            "  %want_p = icmp eq i32 %sm, 1\n" ++
+            "  br i1 %want_p, label %put_plus, label %chk_alt\n" ++
+            "put_plus:\n" ++
+            "  store i8 43, ptr %pfx, align 1\n" ++
+            "  store i64 1, ptr %pn_s, align 8\n" ++
+            "  br label %chk_alt\n" ++
+            "chk_alt:\n" ++
+            "  %alsh = lshr i32 %spec_lo, 25\n" ++
+            "  %alb = and i32 %alsh, 1\n" ++
+            "  %is_alt = icmp ne i32 %alb, 0\n" ++
+            "  %do_alt = or i1 %is_p, %is_alt\n" ++
+            "  br i1 %do_alt, label %emit_alt, label %finish\n" ++
+            "emit_alt:\n" ++
+            "  %xp = or i1 %is_x, %is_p\n" ++
+            "  %ac0 = select i1 %is_oct, i8 111, i8 0\n" ++
+            "  %ac1 = select i1 %is_bin, i8 98, i8 %ac0\n" ++
+            "  %ac2 = select i1 %is_X, i8 88, i8 %ac1\n" ++
+            "  %ac = select i1 %xp, i8 120, i8 %ac2\n" ++
+            "  %has_ac = icmp ne i8 %ac, 0\n" ++
+            "  br i1 %has_ac, label %wr_alt, label %finish\n" ++
+            "wr_alt:\n" ++
+            "  %pn0 = load i64, ptr %pn_s, align 8\n" ++
+            "  %ap0 = getelementptr inbounds i8, ptr %pfx, i64 %pn0\n" ++
+            "  store i8 48, ptr %ap0, align 1\n" ++
+            "  %pn1 = add i64 %pn0, 1\n" ++
+            "  %ap1 = getelementptr inbounds i8, ptr %pfx, i64 %pn1\n" ++
+            "  store i8 %ac, ptr %ap1, align 1\n" ++
+            "  %pn2 = add i64 %pn0, 2\n" ++
+            "  store i64 %pn2, ptr %pn_s, align 8\n" ++
+            "  br label %finish\n" ++
+            "finish:\n" ++
+            "  %fpos = load i64, ptr %pos_s, align 8\n" ++
+            "  %fpn = load i64, ptr %pn_s, align 8\n" ++
+            "  %dig_p = getelementptr inbounds i8, ptr %raw, i64 %fpos\n" ++
+            "  %dig_n = sub i64 132, %fpos\n" ++
+            "  call void @_cx_rt_buf_pad_num(ptr %b, ptr %pfx, i64 %fpn, ptr %dig_p, i64 %dig_n, i32 %spec_lo, i32 %spec_hi)\n" ++
+            "  ret void\n" ++
+            "}}\n\n" ++
+            "define internal void @_cx_rt_fmt_i128_spec(ptr %b, i128 %val, i32 %spec_lo, i32 %spec_hi) {s} {{\n" ++
+            "entry:\n" ++
+            "  %vsh = lshr i32 %spec_lo, 27\n" ++
+            "  %vc = and i32 %vsh, 15\n" ++
+            "  %ge2 = icmp uge i32 %vc, 2\n" ++
+            "  %le5 = icmp ule i32 %vc, 5\n" ++
+            "  %is_rad = and i1 %ge2, %le5\n" ++
+            "  br i1 %is_rad, label %as_u, label %as_s\n" ++
+            "as_u:\n" ++
+            "  call void @_cx_rt_fmt_u128_spec(ptr %b, i128 %val, i32 0, i32 %spec_lo, i32 %spec_hi)\n" ++
+            "  ret void\n" ++
+            "as_s:\n" ++
+            "  %neg = icmp slt i128 %val, 0\n" ++
+            "  %nv = sub i128 0, %val\n" ++
+            "  %mag = select i1 %neg, i128 %nv, i128 %val\n" ++
+            "  %ni = zext i1 %neg to i32\n" ++
+            "  call void @_cx_rt_fmt_u128_spec(ptr %b, i128 %mag, i32 %ni, i32 %spec_lo, i32 %spec_hi)\n" ++
+            "  ret void\n" ++
+            "}}\n\n",
+        .{ fn_attrs, fn_attrs },
+    );
+
+    // `@_cx_rt_fmt_f64_spec`:
+    try emitter.print(
+        "define internal void @_cx_rt_fmt_f64_spec(ptr %b, double %val, i32 %spec_lo, i32 %spec_hi) {s} {{\n" ++
+            "entry:\n" ++
+            "  %pfx = alloca [4 x i8], align 1\n" ++
+            "  %fmt_s = alloca [8 x i8], align 1\n" ++
+            "  %nbuf = alloca [128 x i8], align 1\n" ++
+            "  %len_s = alloca i64, align 8\n" ++
+            "  %ep_s = alloca i64, align 8\n" ++
+            "  %rd_s = alloca i64, align 8\n" ++
+            "  %wr_s = alloca i64, align 8\n" ++
+            "  %vc = call i32 @_cx_rt_eff_verb(i32 %spec_lo)\n" ++
+            "  %is_E = icmp eq i32 %vc, 7\n" ++
+            "  %bits = bitcast double %val to i64\n" ++
+            "  %abs_b = and i64 %bits, 9223372036854775807\n" ++
+            "  %is_neg = icmp slt i64 %bits, 0\n" ++
+            "  %ssh = lshr i32 %spec_lo, 23\n" ++
+            "  %sm = and i32 %ssh, 3\n" ++
+            "  %is_nan = icmp ugt i64 %abs_b, 9218868437227405312\n" ++
+            "  br i1 %is_nan, label %on_nan, label %chk_inf\n" ++
+            "on_nan:\n" ++
+            "  %nan_p = select i1 %is_E, ptr @.cx_frt_nan_up, ptr @.cx_frt_nan\n" ++
+            "  call void @_cx_rt_buf_pad_str(ptr %b, ptr %nan_p, i64 3, i32 %spec_lo, i32 %spec_hi, i32 1)\n" ++
+            "  ret void\n" ++
+            "chk_inf:\n" ++
+            "  %is_inf = icmp eq i64 %abs_b, 9218868437227405312\n" ++
+            "  br i1 %is_inf, label %on_inf, label %finite\n" ++
+            "on_inf:\n" ++
+            "  %wp = icmp eq i32 %sm, 1\n" ++
+            "  %inf_b = select i1 %is_E, ptr @.cx_frt_inf_up, ptr @.cx_frt_inf\n" ++
+            "  %pinf_b = select i1 %is_E, ptr @.cx_frt_pinf_up, ptr @.cx_frt_pinf\n" ++
+            "  %ninf_b = select i1 %is_E, ptr @.cx_frt_ninf_up, ptr @.cx_frt_ninf\n" ++
+            "  %ip0 = select i1 %wp, ptr %pinf_b, ptr %inf_b\n" ++
+            "  %il0 = select i1 %wp, i64 4, i64 3\n" ++
+            "  %ip = select i1 %is_neg, ptr %ninf_b, ptr %ip0\n" ++
+            "  %il = select i1 %is_neg, i64 4, i64 %il0\n" ++
+            "  call void @_cx_rt_buf_pad_str(ptr %b, ptr %ip, i64 %il, i32 %spec_lo, i32 %spec_hi, i32 1)\n" ++
+            "  ret void\n" ++
+            "finite:\n" ++
+            "  %abs_v = bitcast i64 %abs_b to double\n" ++
+            "  %want_p = icmp eq i32 %sm, 1\n" ++
+            "  %sc0 = select i1 %want_p, i8 43, i8 0\n" ++
+            "  %sc = select i1 %is_neg, i8 45, i8 %sc0\n" ++
+            "  store i8 %sc, ptr %pfx, align 1\n" ++
+            "  %has_sc = icmp ne i8 %sc, 0\n" ++
+            "  %pn = zext i1 %has_sc to i64\n" ++
+            "  %pr_r = lshr i32 %spec_hi, 16\n" ++
+            "  %has_pr = icmp ne i32 %pr_r, 65535\n" ++
+            "  %pr_gt = icmp ugt i32 %pr_r, 32\n" ++
+            "  %pr_cl = select i1 %pr_gt, i32 32, i32 %pr_r\n" ++
+            "  %is_e = icmp eq i32 %vc, 6\n" ++
+            "  %is_f = icmp eq i32 %vc, 8\n" ++
+            "  %is_sci = or i1 %is_e, %is_E\n" ++
+            "  %is_exp_fix = or i1 %is_sci, %is_f\n" ++
+            "  %use_prec = or i1 %is_exp_fix, %has_pr\n" ++
+            "  br i1 %use_prec, label %fmt_prec, label %fmt_gen\n" ++
+            "fmt_prec:\n" ++
+            "  %eff_pr = select i1 %has_pr, i32 %pr_cl, i32 6\n" ++
+            "  %cc0 = select i1 %is_E, i8 69, i8 102\n" ++
+            "  %cc = select i1 %is_e, i8 101, i8 %cc0\n" ++
+            "  store i8 37, ptr %fmt_s, align 1\n" ++
+            "  %fs1 = getelementptr inbounds i8, ptr %fmt_s, i64 1\n" ++
+            "  store i8 46, ptr %fs1, align 1\n" ++
+            "  %fs2 = getelementptr inbounds i8, ptr %fmt_s, i64 2\n" ++
+            "  store i8 42, ptr %fs2, align 1\n" ++
+            "  %fs3 = getelementptr inbounds i8, ptr %fmt_s, i64 3\n" ++
+            "  store i8 %cc, ptr %fs3, align 1\n" ++
+            "  %fs4 = getelementptr inbounds i8, ptr %fmt_s, i64 4\n" ++
+            "  store i8 0, ptr %fs4, align 1\n" ++
+            "  %snp32 = call i32 (ptr, {s}, ptr, ...) @snprintf(ptr %nbuf, {s} 128, ptr %fmt_s, i32 %eff_pr, double %abs_v)\n" ++
+            "  %snp_pos = icmp sgt i32 %snp32, 0\n" ++
+            "  %snp_c0 = select i1 %snp_pos, i32 %snp32, i32 0\n" ++
+            "  %snp_ov = icmp sgt i32 %snp_c0, 127\n" ++
+            "  %snp_c1 = select i1 %snp_ov, i32 127, i32 %snp_c0\n" ++
+            "  %snp64 = zext i32 %snp_c1 to i64\n" ++
+            "  store i64 %snp64, ptr %len_s, align 8\n" ++
+            "  br i1 %is_sci, label %sci_scan_init, label %emit_out\n" ++
+            "sci_scan_init:\n" ++
+            "  store i64 0, ptr %ep_s, align 8\n" ++
+            "  br label %sci_scan\n" ++
+            "sci_scan:\n" ++
+            "  %sep = load i64, ptr %ep_s, align 8\n" ++
+            "  %slt = icmp ult i64 %sep, %snp64\n" ++
+            "  br i1 %slt, label %sci_scan_b, label %emit_out\n" ++
+            "sci_scan_b:\n" ++
+            "  %sdp = getelementptr inbounds i8, ptr %nbuf, i64 %sep\n" ++
+            "  %sch = load i8, ptr %sdp, align 1\n" ++
+            "  %se_lo = icmp eq i8 %sch, 101\n" ++
+            "  %se_up = icmp eq i8 %sch, 69\n" ++
+            "  %se_hit = or i1 %se_lo, %se_up\n" ++
+            "  br i1 %se_hit, label %sci_chk3, label %sci_scan_nx\n" ++
+            "sci_scan_nx:\n" ++
+            "  %snx = add i64 %sep, 1\n" ++
+            "  store i64 %snx, ptr %ep_s, align 8\n" ++
+            "  br label %sci_scan\n" ++
+            "sci_chk3:\n" ++
+            "  %sp2 = add i64 %sep, 2\n" ++
+            "  %srem_ok = icmp uge i64 %snp64, %sp2\n" ++
+            "  %srem = sub i64 %snp64, %sp2\n" ++
+            "  %sge3 = icmp uge i64 %srem, 3\n" ++
+            "  %scan_ok = and i1 %srem_ok, %sge3\n" ++
+            "  br i1 %scan_ok, label %sci_chk0, label %emit_out\n" ++
+            "sci_chk0:\n" ++
+            "  %szp = getelementptr inbounds i8, ptr %nbuf, i64 %sp2\n" ++
+            "  %szc = load i8, ptr %szp, align 1\n" ++
+            "  %sis0 = icmp eq i8 %szc, 48\n" ++
+            "  br i1 %sis0, label %sci_shift_init, label %emit_out\n" ++
+            "sci_shift_init:\n" ++
+            "  store i64 %sp2, ptr %wr_s, align 8\n" ++
+            "  %sp3 = add i64 %sep, 3\n" ++
+            "  store i64 %sp3, ptr %rd_s, align 8\n" ++
+            "  br label %sci_shift\n" ++
+            "sci_shift:\n" ++
+            "  %srd = load i64, ptr %rd_s, align 8\n" ++
+            "  %swr = load i64, ptr %wr_s, align 8\n" ++
+            "  %sslt = icmp ult i64 %srd, %snp64\n" ++
+            "  br i1 %sslt, label %sci_shift_b, label %sci_shift_done\n" ++
+            "sci_shift_b:\n" ++
+            "  %ssrc = getelementptr inbounds i8, ptr %nbuf, i64 %srd\n" ++
+            "  %sdst = getelementptr inbounds i8, ptr %nbuf, i64 %swr\n" ++
+            "  %sbv = load i8, ptr %ssrc, align 1\n" ++
+            "  store i8 %sbv, ptr %sdst, align 1\n" ++
+            "  %srd_nx = add i64 %srd, 1\n" ++
+            "  %swr_nx = add i64 %swr, 1\n" ++
+            "  store i64 %srd_nx, ptr %rd_s, align 8\n" ++
+            "  store i64 %swr_nx, ptr %wr_s, align 8\n" ++
+            "  br label %sci_shift\n" ++
+            "sci_shift_done:\n" ++
+            "  store i64 %swr, ptr %len_s, align 8\n" ++
+            "  br label %emit_out\n" ++
+            "fmt_gen:\n" ++
+            "  %sng32 = call i32 (ptr, {s}, ptr, ...) @snprintf(ptr %nbuf, {s} 128, ptr @.cx_frt_g15, double %abs_v)\n" ++
+            "  %sng_pos = icmp sgt i32 %sng32, 0\n" ++
+            "  %sng_c0 = select i1 %sng_pos, i32 %sng32, i32 0\n" ++
+            "  %sng_ov = icmp sgt i32 %sng_c0, 127\n" ++
+            "  %sng_c1 = select i1 %sng_ov, i32 127, i32 %sng_c0\n" ++
+            "  %sng64 = zext i32 %sng_c1 to i64\n" ++
+            "  store i64 %sng64, ptr %len_s, align 8\n" ++
+            "  store i64 0, ptr %ep_s, align 8\n" ++
+            "  br label %gen_scan\n" ++
+            "gen_scan:\n" ++
+            "  %gep = load i64, ptr %ep_s, align 8\n" ++
+            "  %glt = icmp ult i64 %gep, %sng64\n" ++
+            "  br i1 %glt, label %gen_scan_b, label %emit_out\n" ++
+            "gen_scan_b:\n" ++
+            "  %gdp = getelementptr inbounds i8, ptr %nbuf, i64 %gep\n" ++
+            "  %gch = load i8, ptr %gdp, align 1\n" ++
+            "  %ge_lo = icmp eq i8 %gch, 101\n" ++
+            "  %ge_up = icmp eq i8 %gch, 69\n" ++
+            "  %ge_hit = or i1 %ge_lo, %ge_up\n" ++
+            "  br i1 %ge_hit, label %gen_norm_sgn, label %gen_scan_nx\n" ++
+            "gen_scan_nx:\n" ++
+            "  %gnx = add i64 %gep, 1\n" ++
+            "  store i64 %gnx, ptr %ep_s, align 8\n" ++
+            "  br label %gen_scan\n" ++
+            "gen_norm_sgn:\n" ++
+            "  %gp1 = add i64 %gep, 1\n" ++
+            "  store i64 %gp1, ptr %rd_s, align 8\n" ++
+            "  store i64 %gp1, ptr %wr_s, align 8\n" ++
+            "  %ghs = icmp ult i64 %gp1, %sng64\n" ++
+            "  br i1 %ghs, label %gen_chk_sgn, label %emit_out\n" ++
+            "gen_chk_sgn:\n" ++
+            "  %gsp = getelementptr inbounds i8, ptr %nbuf, i64 %gp1\n" ++
+            "  %gsc = load i8, ptr %gsp, align 1\n" ++
+            "  %gis_m = icmp eq i8 %gsc, 45\n" ++
+            "  br i1 %gis_m, label %gen_on_minus, label %gen_chk_plus\n" ++
+            "gen_on_minus:\n" ++
+            "  store i8 45, ptr %gsp, align 1\n" ++
+            "  %gp2_m = add i64 %gp1, 1\n" ++
+            "  store i64 %gp2_m, ptr %rd_s, align 8\n" ++
+            "  store i64 %gp2_m, ptr %wr_s, align 8\n" ++
+            "  br label %gen_skip0\n" ++
+            "gen_chk_plus:\n" ++
+            "  %gis_p = icmp eq i8 %gsc, 43\n" ++
+            "  %gp2_p = add i64 %gp1, 1\n" ++
+            "  %grd_p = select i1 %gis_p, i64 %gp2_p, i64 %gp1\n" ++
+            "  store i64 %grd_p, ptr %rd_s, align 8\n" ++
+            "  br label %gen_skip0\n" ++
+            "gen_skip0:\n" ++
+            "  %grd0 = load i64, ptr %rd_s, align 8\n" ++
+            "  %grd0_nx = add i64 %grd0, 1\n" ++
+            "  %gcan_sk = icmp ult i64 %grd0_nx, %sng64\n" ++
+            "  br i1 %gcan_sk, label %gen_skip0_b, label %gen_copy\n" ++
+            "gen_skip0_b:\n" ++
+            "  %gzp = getelementptr inbounds i8, ptr %nbuf, i64 %grd0\n" ++
+            "  %gzc = load i8, ptr %gzp, align 1\n" ++
+            "  %gis_z = icmp eq i8 %gzc, 48\n" ++
+            "  br i1 %gis_z, label %gen_skip0_nx, label %gen_copy\n" ++
+            "gen_skip0_nx:\n" ++
+            "  store i64 %grd0_nx, ptr %rd_s, align 8\n" ++
+            "  br label %gen_skip0\n" ++
+            "gen_copy:\n" ++
+            "  %grd = load i64, ptr %rd_s, align 8\n" ++
+            "  %gwr = load i64, ptr %wr_s, align 8\n" ++
+            "  %gclt = icmp ult i64 %grd, %sng64\n" ++
+            "  br i1 %gclt, label %gen_copy_b, label %gen_done\n" ++
+            "gen_copy_b:\n" ++
+            "  %gsrc = getelementptr inbounds i8, ptr %nbuf, i64 %grd\n" ++
+            "  %gdst = getelementptr inbounds i8, ptr %nbuf, i64 %gwr\n" ++
+            "  %gbv = load i8, ptr %gsrc, align 1\n" ++
+            "  store i8 %gbv, ptr %gdst, align 1\n" ++
+            "  %grd_inc = add i64 %grd, 1\n" ++
+            "  %gwr_inc = add i64 %gwr, 1\n" ++
+            "  store i64 %grd_inc, ptr %rd_s, align 8\n" ++
+            "  store i64 %gwr_inc, ptr %wr_s, align 8\n" ++
+            "  br label %gen_copy\n" ++
+            "gen_done:\n" ++
+            "  store i64 %gwr, ptr %len_s, align 8\n" ++
+            "  br label %emit_out\n" ++
+            "emit_out:\n" ++
+            "  %flen = load i64, ptr %len_s, align 8\n" ++
+            "  call void @_cx_rt_buf_pad_num(ptr %b, ptr %pfx, i64 %pn, ptr %nbuf, i64 %flen, i32 %spec_lo, i32 %spec_hi)\n" ++
+            "  ret void\n" ++
+            "}}\n\n",
+        .{ fn_attrs, ptr_int, ptr_int, ptr_int, ptr_int },
+    );
+
+    // `@_cx_rt_fmt_bool_spec`, `@_cx_rt_buf_push_escaped_bytes`, `@_cx_rt_fmt_char_spec`,
+    // `@_cx_rt_fmt_str_spec`, & `@_cx_rt_fmt_ptr_spec`:
+    try emitter.print(
+        "define internal void @_cx_rt_fmt_bool_spec(ptr %b, i8 %val, i32 %spec_lo, i32 %spec_hi) {s} {{\n" ++
+            "entry:\n" ++
+            "  %vsh = lshr i32 %spec_lo, 27\n" ++
+            "  %vc = and i32 %vsh, 15\n" ++
+            "  %ge2 = icmp uge i32 %vc, 2\n" ++
+            "  %le5 = icmp ule i32 %vc, 5\n" ++
+            "  %is_rad = and i1 %ge2, %le5\n" ++
+            "  %b1 = and i8 %val, 1\n" ++
+            "  br i1 %is_rad, label %as_int, label %as_txt\n" ++
+            "as_int:\n" ++
+            "  %u = zext i8 %b1 to i128\n" ++
+            "  call void @_cx_rt_fmt_u128_spec(ptr %b, i128 %u, i32 0, i32 %spec_lo, i32 %spec_hi)\n" ++
+            "  ret void\n" ++
+            "as_txt:\n" ++
+            "  %nz = icmp ne i8 %b1, 0\n" ++
+            "  %sp = select i1 %nz, ptr @.cx_str_true, ptr @.cx_str_false\n" ++
+            "  %sl = select i1 %nz, i64 4, i64 5\n" ++
+            "  call void @_cx_rt_buf_pad_str(ptr %b, ptr %sp, i64 %sl, i32 %spec_lo, i32 %spec_hi, i32 0)\n" ++
+            "  ret void\n" ++
+            "}}\n\n" ++
+            "define internal void @_cx_rt_buf_push_escaped_bytes(ptr %b, ptr %s, i64 %n, i8 %qch) {s} {{\n" ++
+            "entry:\n" ++
+            "  %i_s = alloca i64, align 8\n" ++
+            "  call void @_cx_rt_buf_push_byte(ptr %b, i8 %qch)\n" ++
+            "  store i64 0, ptr %i_s, align 8\n" ++
+            "  br label %loop\n" ++
+            "loop:\n" ++
+            "  %iv = load i64, ptr %i_s, align 8\n" ++
+            "  %lt = icmp ult i64 %iv, %n\n" ++
+            "  br i1 %lt, label %body, label %done\n" ++
+            "body:\n" ++
+            "  %cp = getelementptr inbounds i8, ptr %s, i64 %iv\n" ++
+            "  %ch = load i8, ptr %cp, align 1\n" ++
+            "  %eq_q = icmp eq i8 %ch, %qch\n" ++
+            "  br i1 %eq_q, label %on_q, label %chk_bs\n" ++
+            "on_q:\n" ++
+            "  call void @_cx_rt_buf_push_byte(ptr %b, i8 92)\n" ++
+            "  call void @_cx_rt_buf_push_byte(ptr %b, i8 %qch)\n" ++
+            "  br label %step\n" ++
+            "chk_bs:\n" ++
+            "  switch i8 %ch, label %chk_ctrl [\n" ++
+            "    i8 92, label %on_bs\n" ++
+            "    i8 10, label %on_n\n" ++
+            "    i8 13, label %on_r\n" ++
+            "    i8 9, label %on_t\n" ++
+            "    i8 0, label %on_0\n" ++
+            "  ]\n" ++
+            "on_bs:\n" ++
+            "  call void @_cx_rt_buf_push_bytes(ptr %b, ptr @.cx_frt_esc_bs, i64 2)\n" ++
+            "  br label %step\n" ++
+            "on_n:\n" ++
+            "  call void @_cx_rt_buf_push_bytes(ptr %b, ptr @.cx_frt_esc_n, i64 2)\n" ++
+            "  br label %step\n" ++
+            "on_r:\n" ++
+            "  call void @_cx_rt_buf_push_bytes(ptr %b, ptr @.cx_frt_esc_r, i64 2)\n" ++
+            "  br label %step\n" ++
+            "on_t:\n" ++
+            "  call void @_cx_rt_buf_push_bytes(ptr %b, ptr @.cx_frt_esc_t, i64 2)\n" ++
+            "  br label %step\n" ++
+            "on_0:\n" ++
+            "  call void @_cx_rt_buf_push_bytes(ptr %b, ptr @.cx_frt_esc_0, i64 2)\n" ++
+            "  br label %step\n" ++
+            "chk_ctrl:\n" ++
+            "  %lt32 = icmp ult i8 %ch, 32\n" ++
+            "  %eq127 = icmp eq i8 %ch, 127\n" ++
+            "  %is_ct = or i1 %lt32, %eq127\n" ++
+            "  br i1 %is_ct, label %on_hex, label %on_raw\n" ++
+            "on_hex:\n" ++
+            "  call void @_cx_rt_buf_push_byte(ptr %b, i8 92)\n" ++
+            "  call void @_cx_rt_buf_push_byte(ptr %b, i8 120)\n" ++
+            "  %hi8 = lshr i8 %ch, 4\n" ++
+            "  %lo8 = and i8 %ch, 15\n" ++
+            "  %hi64 = zext i8 %hi8 to i64\n" ++
+            "  %lo64 = zext i8 %lo8 to i64\n" ++
+            "  %hip = getelementptr inbounds i8, ptr @.cx_frt_hex_lo, i64 %hi64\n" ++
+            "  %lop = getelementptr inbounds i8, ptr @.cx_frt_hex_lo, i64 %lo64\n" ++
+            "  %hic = load i8, ptr %hip, align 1\n" ++
+            "  %loc = load i8, ptr %lop, align 1\n" ++
+            "  call void @_cx_rt_buf_push_byte(ptr %b, i8 %hic)\n" ++
+            "  call void @_cx_rt_buf_push_byte(ptr %b, i8 %loc)\n" ++
+            "  br label %step\n" ++
+            "on_raw:\n" ++
+            "  call void @_cx_rt_buf_push_byte(ptr %b, i8 %ch)\n" ++
+            "  br label %step\n" ++
+            "step:\n" ++
+            "  %nx = add i64 %iv, 1\n" ++
+            "  store i64 %nx, ptr %i_s, align 8\n" ++
+            "  br label %loop\n" ++
+            "done:\n" ++
+            "  call void @_cx_rt_buf_push_byte(ptr %b, i8 %qch)\n" ++
+            "  ret void\n" ++
+            "}}\n\n" ++
+            "define internal void @_cx_rt_fmt_char_spec(ptr %b, i32 %cp, i32 %spec_lo, i32 %spec_hi) {s} {{\n" ++
+            "entry:\n" ++
+            "  %enc = alloca [4 x i8], align 1\n" ++
+            "  %tb = alloca {{ ptr, i64, i64 }}, align 8\n" ++
+            "  %vc = call i32 @_cx_rt_eff_verb(i32 %spec_lo)\n" ++
+            "  %ge2 = icmp uge i32 %vc, 2\n" ++
+            "  %le5 = icmp ule i32 %vc, 5\n" ++
+            "  %is_rad = and i1 %ge2, %le5\n" ++
+            "  br i1 %is_rad, label %as_int, label %as_ch\n" ++
+            "as_int:\n" ++
+            "  %u = zext i32 %cp to i128\n" ++
+            "  call void @_cx_rt_fmt_u128_spec(ptr %b, i128 %u, i32 0, i32 %spec_lo, i32 %spec_hi)\n" ++
+            "  ret void\n" ++
+            "as_ch:\n" ++
+            "  %elen = call i64 @_cx_rt_encode_utf8(i32 %cp, ptr %enc)\n" ++
+            "  %is_dbg = icmp eq i32 %vc, 1\n" ++
+            "  br i1 %is_dbg, label %dbg_ch, label %disp_ch\n" ++
+            "dbg_ch:\n" ++
+            "  store {{ ptr, i64, i64 }} zeroinitializer, ptr %tb, align 8\n" ++
+            "  call void @_cx_rt_buf_push_escaped_bytes(ptr %tb, ptr %enc, i64 %elen, i8 39)\n" ++
+            "  %td = load ptr, ptr %tb, align 8\n" ++
+            "  %tlp = getelementptr inbounds {{ ptr, i64, i64 }}, ptr %tb, i32 0, i32 1\n" ++
+            "  %tl = load i64, ptr %tlp, align 8\n" ++
+            "  call void @_cx_rt_buf_pad_str(ptr %b, ptr %td, i64 %tl, i32 %spec_lo, i32 %spec_hi, i32 0)\n" ++
+            "  call void @free(ptr %td)\n" ++
+            "  ret void\n" ++
+            "disp_ch:\n" ++
+            "  call void @_cx_rt_buf_pad_str(ptr %b, ptr %enc, i64 %elen, i32 %spec_lo, i32 %spec_hi, i32 0)\n" ++
+            "  ret void\n" ++
+            "}}\n\n" ++
+            "define internal void @_cx_rt_fmt_str_spec(ptr %b, ptr %s_ptr, i64 %s_len, i32 %spec_lo, i32 %spec_hi) {s} {{\n" ++
+            "entry:\n" ++
+            "  %tb = alloca {{ ptr, i64, i64 }}, align 8\n" ++
+            "  %pr_u = lshr i32 %spec_hi, 16\n" ++
+            "  %has_pr = icmp ne i32 %pr_u, 65535\n" ++
+            "  br i1 %has_pr, label %do_trunc, label %aft_trunc\n" ++
+            "do_trunc:\n" ++
+            "  %pr64 = zext i32 %pr_u to i64\n" ++
+            "  %tlen = call i64 @_cx_rt_utf8_prefix_bytes(ptr %s_ptr, i64 %s_len, i64 %pr64)\n" ++
+            "  br label %aft_trunc\n" ++
+            "aft_trunc:\n" ++
+            "  %elen = phi i64 [ %tlen, %do_trunc ], [ %s_len, %entry ]\n" ++
+            "  %vc = call i32 @_cx_rt_eff_verb(i32 %spec_lo)\n" ++
+            "  %is_dbg = icmp eq i32 %vc, 1\n" ++
+            "  br i1 %is_dbg, label %dbg_s, label %disp_s\n" ++
+            "dbg_s:\n" ++
+            "  store {{ ptr, i64, i64 }} zeroinitializer, ptr %tb, align 8\n" ++
+            "  call void @_cx_rt_buf_push_escaped_bytes(ptr %tb, ptr %s_ptr, i64 %elen, i8 34)\n" ++
+            "  %td = load ptr, ptr %tb, align 8\n" ++
+            "  %tlp = getelementptr inbounds {{ ptr, i64, i64 }}, ptr %tb, i32 0, i32 1\n" ++
+            "  %tl = load i64, ptr %tlp, align 8\n" ++
+            "  call void @_cx_rt_buf_pad_str(ptr %b, ptr %td, i64 %tl, i32 %spec_lo, i32 %spec_hi, i32 0)\n" ++
+            "  call void @free(ptr %td)\n" ++
+            "  ret void\n" ++
+            "disp_s:\n" ++
+            "  call void @_cx_rt_buf_pad_str(ptr %b, ptr %s_ptr, i64 %elen, i32 %spec_lo, i32 %spec_hi, i32 0)\n" ++
+            "  ret void\n" ++
+            "}}\n\n" ++
+            "define internal void @_cx_rt_fmt_ptr_spec(ptr %b, ptr %pval, i32 %spec_lo, i32 %spec_hi) {s} {{\n" ++
+            "entry:\n" ++
+            "  %isn = icmp eq ptr %pval, null\n" ++
+            "  br i1 %isn, label %on_null, label %on_ptr\n" ++
+            "on_null:\n" ++
+            "  call void @_cx_rt_buf_pad_str(ptr %b, ptr @.cx_frt_null, i64 3, i32 %spec_lo, i32 %spec_hi, i32 1)\n" ++
+            "  ret void\n" ++
+            "on_ptr:\n" ++
+            "  %pi = ptrtoint ptr %pval to {s}\n" ++
+            "  %pu128 = zext {s} %pi to i128\n" ++
+            "  %clr = and i32 %spec_lo, -2013265921\n" ++
+            "  %pspec = or i32 %clr, 1241513984\n" ++
+            "  call void @_cx_rt_fmt_u128_spec(ptr %b, i128 %pu128, i32 0, i32 %pspec, i32 %spec_hi)\n" ++
+            "  ret void\n" ++
+            "}}\n\n",
+        .{ fn_attrs, fn_attrs, fn_attrs, fn_attrs, fn_attrs, ptr_int, ptr_int },
+    );
+
+    // `@_cx_rt_fmt_source_loc_spec`, `@_cx_rt_fmt_args_into`, `@_cx_rt_fmt_args_spec`,
+    // `@_cx_rt_buf_finish`, & `@_cx_rt_panic_fmt_args`:
+    const pt_to_64_fl = if (is_wasm) "  %fl64 = zext i32 %fl_pt to i64\n" else "  %fl64 = add i64 %fl_pt, 0\n";
+    const pt_to_64_pl = if (is_wasm) "  %pl64 = zext i32 %pl_pt to i64\n" else "  %pl64 = add i64 %pl_pt, 0\n";
+    const i64_to_pt_fin = if (is_wasm) "  %len_pt = trunc i64 %len to i32\n" else "  %len_pt = add i64 %len, 0\n";
+    const arg_stride: u64 = std.mem.alignForward(u64, 2 * @as(u64, ptr_bytes) + 8, @as(u64, ptr_bytes));
+    const piece_stride: u64 = 2 * @as(u64, ptr_bytes);
+
+    try emitter.print(
+        "define internal void @_cx_rt_fmt_source_loc_spec(ptr %b, ptr %loc, i32 %spec_lo, i32 %spec_hi) {s} {{\n" ++
+            "entry:\n" ++
+            "  %tb = alloca {{ ptr, i64, i64 }}, align 8\n" ++
+            "  %isn = icmp eq ptr %loc, null\n" ++
+            "  br i1 %isn, label %done, label %fmt\n" ++
+            "fmt:\n" ++
+            "  store {{ ptr, i64, i64 }} zeroinitializer, ptr %tb, align 8\n" ++
+            "  %fp = load ptr, ptr %loc, align {d}\n" ++
+            "  %flp = getelementptr inbounds i8, ptr %loc, {s} {d}\n" ++
+            "  %fl_pt = load {s}, ptr %flp, align {d}\n" ++
+            "{s}" ++
+            "  %lnp = getelementptr inbounds i8, ptr %loc, {s} {d}\n" ++
+            "  %ln32 = load i32, ptr %lnp, align 4\n" ++
+            "  %ln128 = zext i32 %ln32 to i128\n" ++
+            "  %clp = getelementptr inbounds i8, ptr %loc, {s} {d}\n" ++
+            "  %cl32 = load i32, ptr %clp, align 4\n" ++
+            "  %cl128 = zext i32 %cl32 to i128\n" ++
+            "  call void @_cx_rt_buf_push_bytes(ptr %tb, ptr %fp, i64 %fl64)\n" ++
+            "  call void @_cx_rt_buf_push_byte(ptr %tb, i8 58)\n" ++
+            "  call void @_cx_rt_fmt_u128_spec(ptr %tb, i128 %ln128, i32 0, i32 0, i32 -1)\n" ++
+            "  call void @_cx_rt_buf_push_byte(ptr %tb, i8 58)\n" ++
+            "  call void @_cx_rt_fmt_u128_spec(ptr %tb, i128 %cl128, i32 0, i32 0, i32 -1)\n" ++
+            "  %td = load ptr, ptr %tb, align 8\n" ++
+            "  %tlp = getelementptr inbounds {{ ptr, i64, i64 }}, ptr %tb, i32 0, i32 1\n" ++
+            "  %tl = load i64, ptr %tlp, align 8\n" ++
+            "  call void @_cx_rt_buf_pad_str(ptr %b, ptr %td, i64 %tl, i32 %spec_lo, i32 %spec_hi, i32 0)\n" ++
+            "  call void @free(ptr %td)\n" ++
+            "  br label %done\n" ++
+            "done:\n" ++
+            "  ret void\n" ++
+            "}}\n\n",
+        .{
+            fn_attrs, ptr_bytes,               ptr_int, ptr_bytes,                   ptr_int, ptr_bytes, pt_to_64_fl,
+            ptr_int,  4 * @as(u64, ptr_bytes), ptr_int, 4 * @as(u64, ptr_bytes) + 4,
+        },
+    );
+    try emitter.print(
+        "define internal void @_cx_rt_fmt_args_into(ptr %b, ptr %fa) {s} {{\n" ++
+            "entry:\n" ++
+            "  %i_s = alloca {s}, align {d}\n" ++
+            "  %pp = load ptr, ptr %fa, align 1\n" ++
+            "  %plp = getelementptr inbounds i8, ptr %fa, {s} {d}\n" ++
+            "  %plen = load {s}, ptr %plp, align 1\n" ++
+            "  %ap_p = getelementptr inbounds i8, ptr %fa, {s} {d}\n" ++
+            "  %ap = load ptr, ptr %ap_p, align 1\n" ++
+            "  %alp = getelementptr inbounds i8, ptr %fa, {s} {d}\n" ++
+            "  %alen = load {s}, ptr %alp, align 1\n" ++
+            "  store {s} 0, ptr %i_s, align {d}\n" ++
+            "  br label %loop\n" ++
+            "loop:\n" ++
+            "  %iv = load {s}, ptr %i_s, align {d}\n" ++
+            "  %lt = icmp ult {s} %iv, %plen\n" ++
+            "  br i1 %lt, label %piece, label %done\n" ++
+            "piece:\n" ++
+            "  %poff = mul {s} %iv, {d}\n" ++
+            "  %pe = getelementptr inbounds i8, ptr %pp, {s} %poff\n" ++
+            "  %ps_p = load ptr, ptr %pe, align 1\n" ++
+            "  %ps_lp = getelementptr inbounds i8, ptr %pe, {s} {d}\n" ++
+            "  %pl_pt = load {s}, ptr %ps_lp, align 1\n" ++
+            "{s}" ++
+            "  call void @_cx_rt_buf_push_bytes(ptr %b, ptr %ps_p, i64 %pl64)\n" ++
+            "  %ha = icmp ult {s} %iv, %alen\n" ++
+            "  br i1 %ha, label %hole, label %step\n",
+        .{
+            fn_attrs,  ptr_int,                 ptr_bytes,   ptr_int,
+            ptr_bytes, ptr_int,                 ptr_int,     2 * @as(u64, ptr_bytes),
+            ptr_int,   3 * @as(u64, ptr_bytes), ptr_int,     ptr_int,
+            ptr_bytes, ptr_int,                 ptr_bytes,   ptr_int,
+            ptr_int,   piece_stride,            ptr_int,     ptr_int,
+            ptr_bytes, ptr_int,                 pt_to_64_pl, ptr_int,
+        },
+    );
+    try emitter.print(
+        "hole:\n" ++
+            "  %aoff = mul {s} %iv, {d}\n" ++
+            "  %ae = getelementptr inbounds i8, ptr %ap, {s} %aoff\n" ++
+            "  %ad = load ptr, ptr %ae, align 1\n" ++
+            "  %afp = getelementptr inbounds i8, ptr %ae, {s} {d}\n" ++
+            "  %afn = load ptr, ptr %afp, align 1\n" ++
+            "  %alp2 = getelementptr inbounds i8, ptr %ae, {s} {d}\n" ++
+            "  %aslo = load i32, ptr %alp2, align 1\n" ++
+            "  %awp = getelementptr inbounds i8, ptr %ae, {s} {d}\n" ++
+            "  %aw16 = load i16, ptr %awp, align 1\n" ++
+            "  %app = getelementptr inbounds i8, ptr %ae, {s} {d}\n" ++
+            "  %ap16 = load i16, ptr %app, align 1\n" ++
+            "  %aw32 = zext i16 %aw16 to i32\n" ++
+            "  %ap32 = zext i16 %ap16 to i32\n" ++
+            "  %apsh = shl i32 %ap32, 16\n" ++
+            "  %ashi = or i32 %aw32, %apsh\n" ++
+            "  %fnn = icmp ne ptr %afn, null\n" ++
+            "  br i1 %fnn, label %call_fn, label %step\n" ++
+            "call_fn:\n" ++
+            "  call void %afn(ptr %b, ptr %ad, i32 %aslo, i32 %ashi)\n" ++
+            "  br label %step\n" ++
+            "step:\n" ++
+            "  %nx = add {s} %iv, 1\n" ++
+            "  store {s} %nx, ptr %i_s, align {d}\n" ++
+            "  br label %loop\n" ++
+            "done:\n" ++
+            "  ret void\n" ++
+            "}}\n\n",
+        .{
+            ptr_int,                 arg_stride,                  ptr_int,
+            ptr_int,                 ptr_bytes,                   ptr_int,
+            2 * @as(u64, ptr_bytes), ptr_int,                     2 * @as(u64, ptr_bytes) + 4,
+            ptr_int,                 2 * @as(u64, ptr_bytes) + 6, ptr_int,
+            ptr_int,                 ptr_bytes,
+        },
+    );
+    try emitter.print(
+        "define internal void @_cx_rt_fmt_args_spec(ptr %b, ptr %fa, i32 %spec_lo, i32 %spec_hi) {s} {{\n" ++
+            "entry:\n" ++
+            "  %tb = alloca {{ ptr, i64, i64 }}, align 8\n" ++
+            "  store {{ ptr, i64, i64 }} zeroinitializer, ptr %tb, align 8\n" ++
+            "  call void @_cx_rt_fmt_args_into(ptr %tb, ptr %fa)\n" ++
+            "  %td = load ptr, ptr %tb, align 8\n" ++
+            "  %tlp = getelementptr inbounds {{ ptr, i64, i64 }}, ptr %tb, i32 0, i32 1\n" ++
+            "  %tl = load i64, ptr %tlp, align 8\n" ++
+            "  call void @_cx_rt_buf_pad_str(ptr %b, ptr %td, i64 %tl, i32 %spec_lo, i32 %spec_hi, i32 0)\n" ++
+            "  call void @free(ptr %td)\n" ++
+            "  ret void\n" ++
+            "}}\n\n" ++
+            "define internal {{ ptr, {s} }} @_cx_rt_buf_finish(ptr %b) {s} {{\n" ++
+            "entry:\n" ++
+            "  %d = load ptr, ptr %b, align 8\n" ++
+            "  %lp = getelementptr inbounds {{ ptr, i64, i64 }}, ptr %b, i32 0, i32 1\n" ++
+            "  %len = load i64, ptr %lp, align 8\n" ++
+            "  %isz = icmp eq i64 %len, 0\n" ++
+            "  br i1 %isz, label %empty, label %non_empty\n" ++
+            "empty:\n" ++
+            "  call void @free(ptr %d)\n" ++
+            "  %e0 = insertvalue {{ ptr, {s} }} zeroinitializer, ptr inttoptr ({s} 1 to ptr), 0\n" ++
+            "  %e1 = insertvalue {{ ptr, {s} }} %e0, {s} 0, 1\n" ++
+            "  ret {{ ptr, {s} }} %e1\n" ++
+            "non_empty:\n" ++
+            "{s}" ++
+            "  %r0 = insertvalue {{ ptr, {s} }} zeroinitializer, ptr %d, 0\n" ++
+            "  %r1 = insertvalue {{ ptr, {s} }} %r0, {s} %len_pt, 1\n" ++
+            "  ret {{ ptr, {s} }} %r1\n" ++
+            "}}\n\n" ++
+            "define internal void @_cx_rt_panic_fmt_args(ptr %fa) cold noreturn {s} {{\n" ++
+            "entry:\n" ++
+            "  %tb = alloca {{ ptr, i64, i64 }}, align 8\n" ++
+            "  store {{ ptr, i64, i64 }} zeroinitializer, ptr %tb, align 8\n" ++
+            "  call void @_cx_rt_fmt_args_into(ptr %tb, ptr %fa)\n" ++
+            "  %d = load ptr, ptr %tb, align 8\n" ++
+            "  %lp = getelementptr inbounds {{ ptr, i64, i64 }}, ptr %tb, i32 0, i32 1\n" ++
+            "  %len = load i64, ptr %lp, align 8\n" ++
+            "{s}" ++
+            "  call void @_cx_rt_panic(ptr %d, {s} %len_pt)\n" ++
+            "  unreachable\n" ++
+            "}}\n\n",
+        .{
+            fn_attrs, ptr_int,  fn_attrs,      ptr_int, ptr_int, ptr_int,
+            ptr_int,  ptr_int,  i64_to_pt_fin, ptr_int, ptr_int, ptr_int,
+            ptr_int,  fn_attrs, i64_to_pt_fin, ptr_int,
+        },
+    );
+}
+
+/// Emits monomorphic `@_cx_fmt_ty_<id>(ptr %_out_b, ptr %_val_p, i32 %_spec_lo, i32 %_spec_hi)`.
+fn emitFmtHelperForType(emitter: *LlvmModuleEmitter, raw_ty: TypeId) !void {
+    const fmt_ty = try unwrapTransparentType(emitter, raw_ty);
+    const ptr_int = ptrIntType(emitter);
+    const ptr_bytes: u32 = emitter.cfg.target.ptrBytes();
+    const fn_attrs = fnUnwindAttrs(emitter);
+    const is_wasm = emitter.cfg.target.isWasm();
+
+    try emitter.print(
+        "define internal void @_cx_fmt_ty_{d}(ptr %_out_b, ptr %_val_p, i32 %_spec_lo, i32 %_spec_hi) {s} {{\n" ++
+            "entry:\n",
+        .{ fmt_ty.toU32(), fn_attrs },
+    );
+
+    if (fmt_ty == .unit_ty) {
+        try emitBufPushStringLiteralPadAndRet(emitter, "()");
+        return;
+    }
+    if (fmt_ty == .bool_ty) {
+        try emitter.writeAll(
+            "  %_bv = load i8, ptr %_val_p, align 1\n" ++
+                "  call void @_cx_rt_fmt_bool_spec(ptr %_out_b, i8 %_bv, i32 %_spec_lo, i32 %_spec_hi)\n" ++
+                "  ret void\n}\n\n",
+        );
+        return;
+    }
+    if (fmt_ty == .char_ty) {
+        try emitter.writeAll(
+            "  %_cp = load i32, ptr %_val_p, align 1\n" ++
+                "  call void @_cx_rt_fmt_char_spec(ptr %_out_b, i32 %_cp, i32 %_spec_lo, i32 %_spec_hi)\n" ++
+                "  ret void\n}\n\n",
+        );
+        return;
+    }
+    if (fmt_ty == .str_ty) {
+        const len_conv = if (is_wasm) "  %_sl64 = zext i32 %_sl_pt to i64\n" else "  %_sl64 = add i64 %_sl_pt, 0\n";
+        try emitter.print(
+            "  %_sp = load ptr, ptr %_val_p, align 1\n" ++
+                "  %_slp = getelementptr inbounds i8, ptr %_val_p, {s} {d}\n" ++
+                "  %_sl_pt = load {s}, ptr %_slp, align 1\n" ++
+                "{s}" ++
+                "  call void @_cx_rt_fmt_str_spec(ptr %_out_b, ptr %_sp, i64 %_sl64, i32 %_spec_lo, i32 %_spec_hi)\n" ++
+                "  ret void\n}}\n\n",
+            .{ ptr_int, ptr_bytes, ptr_int, len_conv },
+        );
+        return;
+    }
+    if (fmt_ty == .f32_ty) {
+        try emitter.writeAll(
+            "  %_fv32 = load float, ptr %_val_p, align 1\n" ++
+                "  %_fv64 = fpext float %_fv32 to double\n" ++
+                "  call void @_cx_rt_fmt_f64_spec(ptr %_out_b, double %_fv64, i32 %_spec_lo, i32 %_spec_hi)\n" ++
+                "  ret void\n}\n\n",
+        );
+        return;
+    }
+    if (fmt_ty == .f64_ty or fmt_ty == .untyped_float_ty) {
+        try emitter.writeAll(
+            "  %_fv64 = load double, ptr %_val_p, align 1\n" ++
+                "  call void @_cx_rt_fmt_f64_spec(ptr %_out_b, double %_fv64, i32 %_spec_lo, i32 %_spec_hi)\n" ++
+                "  ret void\n}\n\n",
+        );
+        return;
+    }
+    if (fmt_ty == .source_loc_ty) {
+        try emitter.writeAll(
+            "  %_sl = load ptr, ptr %_val_p, align 1\n" ++
+                "  call void @_cx_rt_fmt_source_loc_spec(ptr %_out_b, ptr %_sl, i32 %_spec_lo, i32 %_spec_hi)\n" ++
+                "  ret void\n}\n\n",
+        );
+        return;
+    }
+    if (fmt_ty == .fmt_args_ty) {
+        try emitter.writeAll(
+            "  call void @_cx_rt_fmt_args_spec(ptr %_out_b, ptr %_val_p, i32 %_spec_lo, i32 %_spec_hi)\n" ++
+                "  ret void\n}\n\n",
+        );
+        return;
+    }
+    if (fmt_ty == .fmt_spec_ty) {
+        try emitBufPushStringLiteralPadAndRet(emitter, "FmtSpec");
+        return;
+    }
+    if (fmt_ty == .task_group_base_ty or
+        fmt_ty == .task_handle_base_ty or
+        emitter.input.pool.isTaskGroupType(fmt_ty) or
+        emitter.input.pool.isTaskHandleType(fmt_ty))
+    {
+        try emitter.writeAll(
+            "  %_pv = load ptr, ptr %_val_p, align 1\n" ++
+                "  call void @_cx_rt_fmt_ptr_spec(ptr %_out_b, ptr %_pv, i32 %_spec_lo, i32 %_spec_hi)\n" ++
+                "  ret void\n}\n\n",
+        );
+        return;
+    }
+
+    // Backed `enum` (`getSumDetail == null`): variant name under Display/Debug, backing int under radix verbs:
+    if (!fmt_ty.isPrimitiveOrSentinel() and
+        emitter.input.pool.getNode(fmt_ty).tag == .enum_ty and
+        (try emitter.resolver.getSumDetail(fmt_ty)) == null)
+    {
+        if (try isZeroSizedType(emitter, fmt_ty)) {
+            try emitBufPushStringLiteralPadAndRet(emitter, resolveEnumVariantNameLlvm(emitter, fmt_ty, 0));
+            return;
+        }
+        if (resolveIntegerInfo(emitter, fmt_ty)) |enum_int| {
+            try emitter.print(
+                "  %_ev = load i{d}, ptr %_val_p, align 1\n" ++
+                    "  %_evb = call i32 @_cx_rt_eff_verb(i32 %_spec_lo)\n" ++
+                    "  %_is_dd = icmp ule i32 %_evb, 1\n" ++
+                    "  br i1 %_is_dd, label %_en_chk_0, label %_en_as_int\n",
+                .{enum_int.bits},
+            );
+            const var_count = countEnumVariantsLlvm(emitter, fmt_ty);
+            if (var_count == 0) {
+                try emitter.writeAll("_en_chk_0:\n  br label %_en_as_int\n");
+            } else {
+                var var_ord: u32 = 0;
+                while (var_ord < var_count) : (var_ord += 1) {
+                    const disc_lit = try formatScalarIntLiteralAlloc(
+                        emitter.allocator,
+                        enum_int.bits,
+                        resolveScalarEnumDiscrimI128(emitter, fmt_ty, var_ord),
+                    );
+                    defer emitter.allocator.free(disc_lit);
+                    const var_name = resolveEnumVariantNameLlvm(emitter, fmt_ty, var_ord);
+                    const vn_ptr = try emitSynthConstBytesPtr(emitter, var_name);
+                    defer emitter.allocator.free(vn_ptr);
+                    const next_lbl = if (var_ord + 1 < var_count)
+                        try std.fmt.allocPrint(emitter.allocator, "_en_chk_{d}", .{var_ord + 1})
+                    else
+                        try emitter.allocator.dupe(u8, "_en_as_int");
+                    defer emitter.allocator.free(next_lbl);
+                    try emitter.print(
+                        "_en_chk_{d}:\n" ++
+                            "  %_em_{d} = icmp eq i{d} %_ev, {s}\n" ++
+                            "  br i1 %_em_{d}, label %_en_hit_{d}, label %{s}\n" ++
+                            "_en_hit_{d}:\n" ++
+                            "  call void @_cx_rt_buf_pad_str(ptr %_out_b, ptr {s}, i64 {d}, i32 %_spec_lo, i32 %_spec_hi, i32 0)\n" ++
+                            "  ret void\n",
+                        .{
+                            var_ord, var_ord,      enum_int.bits, disc_lit,
+                            var_ord, var_ord,      next_lbl,      var_ord,
+                            vn_ptr,  var_name.len,
+                        },
+                    );
+                }
+            }
+            try emitter.writeAll("_en_as_int:\n");
+            try emitFormatLoadedScalarInt(emitter, enum_int, "%_ev");
+            try emitter.writeAll("}\n\n");
+            return;
+        }
+    }
+
+    if (resolveIntegerInfo(emitter, fmt_ty)) |int_info| {
+        try emitter.print("  %_iv = load i{d}, ptr %_val_p, align 1\n", .{int_info.bits});
+        try emitFormatLoadedScalarInt(emitter, int_info, "%_iv");
+        try emitter.writeAll("}\n\n");
+        return;
+    }
+
+    if (fmt_ty.isPrimitiveOrSentinel()) {
+        try emitter.writeAll("  ret void\n}\n\n");
+        return;
+    }
+
+    const node = emitter.input.pool.getNode(fmt_ty);
+    switch (node.tag) {
+        .ref_ty, .mut_ref_ty => {
+            const pointee_ty = try unwrapTransparentType(emitter, TypeId.fromInt(node.lhs));
+            try emitter.print(
+                "  %_rp = load ptr, ptr %_val_p, align 1\n" ++
+                    "  %_vsh = lshr i32 %_spec_lo, 27\n" ++
+                    "  %_vc = and i32 %_vsh, 15\n" ++
+                    "  %_is_p = icmp eq i32 %_vc, 9\n" ++
+                    "  br i1 %_is_p, label %_as_p, label %_as_val\n" ++
+                    "_as_p:\n" ++
+                    "  call void @_cx_rt_fmt_ptr_spec(ptr %_out_b, ptr %_rp, i32 %_spec_lo, i32 %_spec_hi)\n" ++
+                    "  ret void\n" ++
+                    "_as_val:\n" ++
+                    "  call void @_cx_fmt_ty_{d}(ptr %_out_b, ptr %_rp, i32 %_spec_lo, i32 %_spec_hi)\n" ++
+                    "  ret void\n}}\n\n",
+                .{pointee_ty.toU32()},
+            );
+        },
+        .raw_ptr_ty, .fn_ty => {
+            try emitter.writeAll(
+                "  %_pv = load ptr, ptr %_val_p, align 1\n" ++
+                    "  call void @_cx_rt_fmt_ptr_spec(ptr %_out_b, ptr %_pv, i32 %_spec_lo, i32 %_spec_hi)\n" ++
+                    "  ret void\n}\n\n",
+            );
+        },
+        .struct_ty => {
+            const sym_idx = SymbolIndex.fromInt(node.rhs);
+            const st_name = if (!sym_idx.isNone() and sym_idx.asInt() < emitter.input.sym_table.symbols.items.len)
+                emitter.input.sym_table.getSymbol(sym_idx).name_text
+            else
+                "struct";
+            const lay = try emitter.resolver.resolveType(fmt_ty);
+            try emitter.writeAll(
+                "  %_cb = alloca { ptr, i64, i64 }, align 8\n" ++
+                    "  store { ptr, i64, i64 } zeroinitializer, ptr %_cb, align 8\n" ++
+                    "  %_ev = call i32 @_cx_rt_eff_verb(i32 %_spec_lo)\n" ++
+                    "  %_id = icmp eq i32 %_ev, 1\n" ++
+                    "  %_fspec = select i1 %_id, i32 134217728, i32 0\n",
+            );
+            try emitBufPushStringLiteralLlvm(emitter, "%_cb", st_name);
+            try emitBufPushStringLiteralLlvm(emitter, "%_cb", " { ");
+            var fld_i: u32 = 0;
+            while (fld_i < lay.aux_len) : (fld_i += 1) {
+                if (fld_i > 0) try emitBufPushStringLiteralLlvm(emitter, "%_cb", ", ");
+                const fld = emitter.resolver.fields_by_decl.items[lay.aux_start + fld_i];
+                const fld_ty = try unwrapTransparentType(emitter, fld.field_ty);
+                try emitBufPushStringLiteralLlvm(emitter, "%_cb", resolveStructFieldNameLlvm(emitter, fmt_ty, fld_i));
+                try emitBufPushStringLiteralLlvm(emitter, "%_cb", ": ");
+                try emitter.print(
+                    "  %_fp_{d} = getelementptr inbounds i8, ptr %_val_p, {s} {d}\n" ++
+                        "  call void @_cx_fmt_ty_{d}(ptr %_cb, ptr %_fp_{d}, i32 %_fspec, i32 -1)\n",
+                    .{ fld_i, ptr_int, fld.byte_offset, fld_ty.toU32(), fld_i },
+                );
+            }
+            try emitBufPushStringLiteralLlvm(emitter, "%_cb", " }");
+            try emitFinishScratchBufPadAndRet(emitter);
+        },
+        .tuple_ty => {
+            const lay = try emitter.resolver.resolveType(fmt_ty);
+            try emitter.writeAll(
+                "  %_cb = alloca { ptr, i64, i64 }, align 8\n" ++
+                    "  store { ptr, i64, i64 } zeroinitializer, ptr %_cb, align 8\n" ++
+                    "  %_ev = call i32 @_cx_rt_eff_verb(i32 %_spec_lo)\n" ++
+                    "  %_id = icmp eq i32 %_ev, 1\n" ++
+                    "  %_fspec = select i1 %_id, i32 134217728, i32 0\n" ++
+                    "  call void @_cx_rt_buf_push_byte(ptr %_cb, i8 40)\n",
+            );
+            var fld_i: u32 = 0;
+            while (fld_i < lay.aux_len) : (fld_i += 1) {
+                if (fld_i > 0) try emitBufPushStringLiteralLlvm(emitter, "%_cb", ", ");
+                const fld = emitter.resolver.fields_by_decl.items[lay.aux_start + fld_i];
+                const fld_ty = try unwrapTransparentType(emitter, fld.field_ty);
+                try emitter.print(
+                    "  %_tp_{d} = getelementptr inbounds i8, ptr %_val_p, {s} {d}\n" ++
+                        "  call void @_cx_fmt_ty_{d}(ptr %_cb, ptr %_tp_{d}, i32 %_fspec, i32 -1)\n",
+                    .{ fld_i, ptr_int, fld.byte_offset, fld_ty.toU32(), fld_i },
+                );
+            }
+            if (lay.aux_len == 1) {
+                try emitter.writeAll("  call void @_cx_rt_buf_push_byte(ptr %_cb, i8 44)\n");
+            }
+            try emitter.writeAll("  call void @_cx_rt_buf_push_byte(ptr %_cb, i8 41)\n");
+            try emitFinishScratchBufPadAndRet(emitter);
+        },
+        .array_ty => {
+            const elem_ty = try unwrapTransparentType(emitter, TypeId.fromInt(node.lhs));
+            const elem_lay = try emitter.resolver.resolveType(elem_ty);
+            const arr_len: u64 = node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+            const sep_ptr = try emitSynthConstBytesPtr(emitter, ", ");
+            defer emitter.allocator.free(sep_ptr);
+            try emitter.print(
+                "  %_cb = alloca {{ ptr, i64, i64 }}, align 8\n" ++
+                    "  %_ai_s = alloca i64, align 8\n" ++
+                    "  store {{ ptr, i64, i64 }} zeroinitializer, ptr %_cb, align 8\n" ++
+                    "  %_ev = call i32 @_cx_rt_eff_verb(i32 %_spec_lo)\n" ++
+                    "  %_id = icmp eq i32 %_ev, 1\n" ++
+                    "  %_fspec = select i1 %_id, i32 134217728, i32 0\n" ++
+                    "  call void @_cx_rt_buf_push_byte(ptr %_cb, i8 91)\n" ++
+                    "  store i64 0, ptr %_ai_s, align 8\n" ++
+                    "  br label %_al_hdr\n" ++
+                    "_al_hdr:\n" ++
+                    "  %_ai = load i64, ptr %_ai_s, align 8\n" ++
+                    "  %_alt = icmp ult i64 %_ai, {d}\n" ++
+                    "  br i1 %_alt, label %_al_b, label %_al_end\n" ++
+                    "_al_b:\n" ++
+                    "  %_agz = icmp ugt i64 %_ai, 0\n" ++
+                    "  br i1 %_agz, label %_al_sep, label %_al_el\n" ++
+                    "_al_sep:\n" ++
+                    "  call void @_cx_rt_buf_push_bytes(ptr %_cb, ptr {s}, i64 2)\n" ++
+                    "  br label %_al_el\n" ++
+                    "_al_el:\n" ++
+                    "  %_aoff = mul i64 %_ai, {d}\n" ++
+                    "  %_aep = getelementptr inbounds i8, ptr %_val_p, i64 %_aoff\n" ++
+                    "  call void @_cx_fmt_ty_{d}(ptr %_cb, ptr %_aep, i32 %_fspec, i32 -1)\n" ++
+                    "  %_anx = add i64 %_ai, 1\n" ++
+                    "  store i64 %_anx, ptr %_ai_s, align 8\n" ++
+                    "  br label %_al_hdr\n" ++
+                    "_al_end:\n" ++
+                    "  call void @_cx_rt_buf_push_byte(ptr %_cb, i8 93)\n",
+                .{ arr_len, sep_ptr, elem_lay.stride_bytes, elem_ty.toU32() },
+            );
+            try emitFinishScratchBufPadAndRet(emitter);
+        },
+        .slice_ty => {
+            const elem_ty = try unwrapTransparentType(emitter, TypeId.fromInt(node.lhs));
+            const elem_lay = try emitter.resolver.resolveType(elem_ty);
+            const sep_ptr = try emitSynthConstBytesPtr(emitter, ", ");
+            defer emitter.allocator.free(sep_ptr);
+            const sl_conv = if (is_wasm) "  %_sln = zext i32 %_sl_pt to i64\n" else "  %_sln = add i64 %_sl_pt, 0\n";
+            try emitter.print(
+                "  %_cb = alloca {{ ptr, i64, i64 }}, align 8\n" ++
+                    "  %_ai_s = alloca i64, align 8\n" ++
+                    "  store {{ ptr, i64, i64 }} zeroinitializer, ptr %_cb, align 8\n" ++
+                    "  %_sl_p = load ptr, ptr %_val_p, align 1\n" ++
+                    "  %_sll_p = getelementptr inbounds i8, ptr %_val_p, {s} {d}\n" ++
+                    "  %_sl_pt = load {s}, ptr %_sll_p, align 1\n" ++
+                    "{s}" ++
+                    "  %_ev = call i32 @_cx_rt_eff_verb(i32 %_spec_lo)\n" ++
+                    "  %_id = icmp eq i32 %_ev, 1\n" ++
+                    "  %_fspec = select i1 %_id, i32 134217728, i32 0\n" ++
+                    "  call void @_cx_rt_buf_push_byte(ptr %_cb, i8 91)\n" ++
+                    "  store i64 0, ptr %_ai_s, align 8\n" ++
+                    "  br label %_sl_hdr\n" ++
+                    "_sl_hdr:\n" ++
+                    "  %_ai = load i64, ptr %_ai_s, align 8\n" ++
+                    "  %_alt = icmp ult i64 %_ai, %_sln\n" ++
+                    "  br i1 %_alt, label %_sl_b, label %_sl_end\n" ++
+                    "_sl_b:\n" ++
+                    "  %_agz = icmp ugt i64 %_ai, 0\n" ++
+                    "  br i1 %_agz, label %_sl_sep, label %_sl_el\n" ++
+                    "_sl_sep:\n" ++
+                    "  call void @_cx_rt_buf_push_bytes(ptr %_cb, ptr {s}, i64 2)\n" ++
+                    "  br label %_sl_el\n" ++
+                    "_sl_el:\n" ++
+                    "  %_aoff = mul i64 %_ai, {d}\n" ++
+                    "  %_aep = getelementptr inbounds i8, ptr %_sl_p, i64 %_aoff\n" ++
+                    "  call void @_cx_fmt_ty_{d}(ptr %_cb, ptr %_aep, i32 %_fspec, i32 -1)\n" ++
+                    "  %_anx = add i64 %_ai, 1\n" ++
+                    "  store i64 %_anx, ptr %_ai_s, align 8\n" ++
+                    "  br label %_sl_hdr\n" ++
+                    "_sl_end:\n" ++
+                    "  call void @_cx_rt_buf_push_byte(ptr %_cb, i8 93)\n",
+                .{ ptr_int, ptr_bytes, ptr_int, sl_conv, sep_ptr, elem_lay.stride_bytes, elem_ty.toU32() },
+            );
+            try emitFinishScratchBufPadAndRet(emitter);
+        },
+        .optional_ty => {
+            const some_ty = try unwrapTransparentType(emitter, TypeId.fromInt(node.lhs));
+            const sum_detail = (try emitter.resolver.getSumDetail(fmt_ty)) orelse {
+                try emitter.writeAll("  ret void\n}\n\n");
+                return;
+            };
+            var state = try initScratchFmtBodyState(emitter);
+            defer state.deinit();
+            const discr_s = try emitReadSumDiscriminantFromPtr(emitter, &state, fmt_ty, "%_val_p", 1);
+            defer emitter.allocator.free(discr_s);
+            if (state.entry_allocas.items.len > 0) try emitter.writeAll(state.entry_allocas.items);
+            try emitter.writeAll(
+                "  %_cb = alloca { ptr, i64, i64 }, align 8\n" ++
+                    "  store { ptr, i64, i64 } zeroinitializer, ptr %_cb, align 8\n",
+            );
+            try emitter.writeAll(state.cur_buf.items);
+            try emitter.print(
+                "  %_is_none = icmp eq i32 {s}, 0\n" ++
+                    "  br i1 %_is_none, label %_opt_none, label %_opt_some\n" ++
+                    "_opt_none:\n",
+                .{discr_s},
+            );
+            try emitBufPushStringLiteralLlvm(emitter, "%_cb", "None");
+            try emitter.writeAll("  br label %_opt_end\n_opt_some:\n");
+            try emitBufPushStringLiteralLlvm(emitter, "%_cb", "Some(");
+            try emitter.print(
+                "  %_osp = getelementptr inbounds i8, ptr %_val_p, {s} {d}\n" ++
+                    "  call void @_cx_fmt_ty_{d}(ptr %_cb, ptr %_osp, i32 134217728, i32 -1)\n" ++
+                    "  call void @_cx_rt_buf_push_byte(ptr %_cb, i8 41)\n" ++
+                    "  br label %_opt_end\n" ++
+                    "_opt_end:\n",
+                .{ ptr_int, sum_detail.payload_offset, some_ty.toU32() },
+            );
+            try emitFinishScratchBufPadAndRet(emitter);
+        },
+        .result_ty => {
+            if (try isZeroSizedType(emitter, fmt_ty)) {
+                try emitBufPushStringLiteralPadAndRet(emitter, "Ok(())");
+                return;
+            }
+            const ok_ty = try unwrapTransparentType(emitter, TypeId.fromInt(node.lhs));
+            const err_ty = try unwrapTransparentType(emitter, TypeId.fromInt(node.rhs));
+            const sum_detail = (try emitter.resolver.getSumDetail(fmt_ty)) orelse {
+                try emitter.writeAll("  ret void\n}\n\n");
+                return;
+            };
+            var state = try initScratchFmtBodyState(emitter);
+            defer state.deinit();
+            const discr_s = try emitReadSumDiscriminantFromPtr(emitter, &state, fmt_ty, "%_val_p", 1);
+            defer emitter.allocator.free(discr_s);
+            if (state.entry_allocas.items.len > 0) try emitter.writeAll(state.entry_allocas.items);
+            try emitter.writeAll(
+                "  %_cb = alloca { ptr, i64, i64 }, align 8\n" ++
+                    "  store { ptr, i64, i64 } zeroinitializer, ptr %_cb, align 8\n",
+            );
+            try emitter.writeAll(state.cur_buf.items);
+            try emitter.print(
+                "  %_is_ok = icmp eq i32 {s}, 0\n" ++
+                    "  br i1 %_is_ok, label %_res_ok, label %_res_err\n" ++
+                    "_res_ok:\n",
+                .{discr_s},
+            );
+            try emitBufPushStringLiteralLlvm(emitter, "%_cb", "Ok(");
+            try emitter.print(
+                "  %_rop = getelementptr inbounds i8, ptr %_val_p, {s} {d}\n" ++
+                    "  call void @_cx_fmt_ty_{d}(ptr %_cb, ptr %_rop, i32 134217728, i32 -1)\n" ++
+                    "  call void @_cx_rt_buf_push_byte(ptr %_cb, i8 41)\n" ++
+                    "  br label %_res_end\n" ++
+                    "_res_err:\n",
+                .{ ptr_int, sum_detail.payload_offset, ok_ty.toU32() },
+            );
+            try emitBufPushStringLiteralLlvm(emitter, "%_cb", "Err(");
+            try emitter.print(
+                "  %_rep = getelementptr inbounds i8, ptr %_val_p, {s} {d}\n" ++
+                    "  call void @_cx_fmt_ty_{d}(ptr %_cb, ptr %_rep, i32 134217728, i32 -1)\n" ++
+                    "  call void @_cx_rt_buf_push_byte(ptr %_cb, i8 41)\n" ++
+                    "  br label %_res_end\n" ++
+                    "_res_end:\n",
+                .{ ptr_int, sum_detail.payload_offset, err_ty.toU32() },
+            );
+            try emitFinishScratchBufPadAndRet(emitter);
+        },
+        .enum_ty => {
+            if (try isZeroSizedType(emitter, fmt_ty)) {
+                try emitBufPushStringLiteralPadAndRet(emitter, resolveEnumVariantNameLlvm(emitter, fmt_ty, 0));
+                return;
+            }
+            const sum_detail = (try emitter.resolver.getSumDetail(fmt_ty)) orelse {
+                try emitter.writeAll("  ret void\n}\n\n");
+                return;
+            };
+            var state = try initScratchFmtBodyState(emitter);
+            defer state.deinit();
+            const discr_s = try emitReadSumDiscriminantFromPtr(emitter, &state, fmt_ty, "%_val_p", 1);
+            defer emitter.allocator.free(discr_s);
+            if (state.entry_allocas.items.len > 0) try emitter.writeAll(state.entry_allocas.items);
+            try emitter.writeAll(
+                "  %_cb = alloca { ptr, i64, i64 }, align 8\n" ++
+                    "  store { ptr, i64, i64 } zeroinitializer, ptr %_cb, align 8\n",
+            );
+            try emitter.writeAll(state.cur_buf.items);
+            const var_count = countEnumVariantsLlvm(emitter, fmt_ty);
+            if (var_count > 0) {
+                try emitter.writeAll("  br label %_ev_chk_0\n");
+                var var_ord: u32 = 0;
+                while (var_ord < var_count) : (var_ord += 1) {
+                    const next_lbl = if (var_ord + 1 < var_count)
+                        try std.fmt.allocPrint(emitter.allocator, "_ev_chk_{d}", .{var_ord + 1})
+                    else
+                        try emitter.allocator.dupe(u8, "_ev_end");
+                    defer emitter.allocator.free(next_lbl);
+                    try emitter.print(
+                        "_ev_chk_{d}:\n" ++
+                            "  %_evc_{d} = icmp eq i32 {s}, {d}\n" ++
+                            "  br i1 %_evc_{d}, label %_ev_hit_{d}, label %{s}\n" ++
+                            "_ev_hit_{d}:\n",
+                        .{ var_ord, var_ord, discr_s, var_ord, var_ord, var_ord, next_lbl, var_ord },
+                    );
+                    try emitBufPushStringLiteralLlvm(emitter, "%_cb", resolveEnumVariantNameLlvm(emitter, fmt_ty, var_ord));
+                    const var_pay = try unwrapTransparentType(
+                        emitter,
+                        resolveEnumVariantPayloadType(emitter, fmt_ty, var_ord),
+                    );
+                    if (var_pay != .unit_ty and !var_pay.isError()) {
+                        try emitter.writeAll("  call void @_cx_rt_buf_push_byte(ptr %_cb, i8 40)\n");
+                        if (!var_pay.isPrimitiveOrSentinel() and emitter.input.pool.getNode(var_pay).tag == .tuple_ty) {
+                            const tup_lay = try emitter.resolver.resolveType(var_pay);
+                            var tf_i: u32 = 0;
+                            while (tf_i < tup_lay.aux_len) : (tf_i += 1) {
+                                if (tf_i > 0) try emitBufPushStringLiteralLlvm(emitter, "%_cb", ", ");
+                                const tf = emitter.resolver.fields_by_decl.items[tup_lay.aux_start + tf_i];
+                                const tf_ty = try unwrapTransparentType(emitter, tf.field_ty);
+                                try emitter.print(
+                                    "  %_evtp_{d}_{d} = getelementptr inbounds i8, ptr %_val_p, {s} {d}\n" ++
+                                        "  call void @_cx_fmt_ty_{d}(ptr %_cb, ptr %_evtp_{d}_{d}, i32 134217728, i32 -1)\n",
+                                    .{
+                                        var_ord,                                    tf_i,          ptr_int,
+                                        sum_detail.payload_offset + tf.byte_offset, tf_ty.toU32(), var_ord,
+                                        tf_i,
+                                    },
+                                );
+                            }
+                        } else {
+                            try emitter.print(
+                                "  %_evp_{d} = getelementptr inbounds i8, ptr %_val_p, {s} {d}\n" ++
+                                    "  call void @_cx_fmt_ty_{d}(ptr %_cb, ptr %_evp_{d}, i32 134217728, i32 -1)\n",
+                                .{ var_ord, ptr_int, sum_detail.payload_offset, var_pay.toU32(), var_ord },
+                            );
+                        }
+                        try emitter.writeAll("  call void @_cx_rt_buf_push_byte(ptr %_cb, i8 41)\n");
+                    }
+                    try emitter.writeAll("  br label %_ev_end\n");
+                }
+                try emitter.writeAll("_ev_end:\n");
+            }
+            try emitFinishScratchBufPadAndRet(emitter);
+        },
+        else => {
+            var name_buf: [256]u8 = undefined;
+            const rendered = emitter.input.pool.formatType(fmt_ty, emitter.input.sym_table, &name_buf);
+            try emitBufPushStringLiteralPadAndRet(emitter, rendered);
+        },
+    }
+}
+
+/// Initializes an empty `BodyEmitState` for discriminant extraction inside `@_cx_fmt_ty_<id>`.
+fn initScratchFmtBodyState(emitter: *LlvmModuleEmitter) !BodyEmitState {
+    return BodyEmitState{
+        .allocator = emitter.allocator,
+        .cur_label = try emitter.allocator.dupe(u8, "entry"),
+        .local_ptrs = try emitter.allocator.alloc([]u8, 0),
+        .local_aligns = try emitter.allocator.alloc(u32, 0),
+        .edge_pred_labels = try emitter.allocator.alloc([]u8, 0),
+        .edge_call_ret_vals = try emitter.allocator.alloc([]u8, 0),
+        .edge_trampoline = try emitter.allocator.alloc(?u32, 0),
+        .block_access_group = try emitter.allocator.alloc(u32, 0),
+    };
+}
+
+/// Pads a constant literal `text` into `%_out_b` and closes `@_cx_fmt_ty_<id>`.
+fn emitBufPushStringLiteralPadAndRet(emitter: *LlvmModuleEmitter, text: []const u8) !void {
+    const str_ptr = try emitSynthConstBytesPtr(emitter, text);
+    defer emitter.allocator.free(str_ptr);
+    try emitter.print(
+        "  call void @_cx_rt_buf_pad_str(ptr %_out_b, ptr {s}, i64 {d}, i32 %_spec_lo, i32 %_spec_hi, i32 0)\n" ++
+            "  ret void\n}}\n\n",
+        .{ str_ptr, text.len },
+    );
+}
+
+/// Pads `%_cb` into `%_out_b`, frees `%_cb.data`, and closes `@_cx_fmt_ty_<id>`.
+fn emitFinishScratchBufPadAndRet(emitter: *LlvmModuleEmitter) !void {
+    try emitter.writeAll(
+        "  %_cbd = load ptr, ptr %_cb, align 8\n" ++
+            "  %_cblp = getelementptr inbounds { ptr, i64, i64 }, ptr %_cb, i32 0, i32 1\n" ++
+            "  %_cbl = load i64, ptr %_cblp, align 8\n" ++
+            "  call void @_cx_rt_buf_pad_str(ptr %_out_b, ptr %_cbd, i64 %_cbl, i32 %_spec_lo, i32 %_spec_hi, i32 0)\n" ++
+            "  call void @free(ptr %_cbd)\n" ++
+            "  ret void\n}\n\n",
+    );
+}
+
+/// Emits signed/unsigned scalar integer formatting (`i8..i128` / `u8..u128`) into `%_out_b`.
+fn emitFormatLoadedScalarInt(
+    emitter: *LlvmModuleEmitter,
+    int_info: IntScalarInfo,
+    ssa_name: []const u8,
+) !void {
+    if (int_info.bits == 128) {
+        if (int_info.is_signed) {
+            try emitter.print(
+                "  call void @_cx_rt_fmt_i128_spec(ptr %_out_b, i128 {s}, i32 %_spec_lo, i32 %_spec_hi)\n" ++
+                    "  ret void\n",
+                .{ssa_name},
+            );
+        } else {
+            try emitter.print(
+                "  call void @_cx_rt_fmt_u128_spec(ptr %_out_b, i128 {s}, i32 0, i32 %_spec_lo, i32 %_spec_hi)\n" ++
+                    "  ret void\n",
+                .{ssa_name},
+            );
+        }
+        return;
+    }
+    if (!int_info.is_signed) {
+        try emitter.print(
+            "  %_iu128 = zext i{d} {s} to i128\n" ++
+                "  call void @_cx_rt_fmt_u128_spec(ptr %_out_b, i128 %_iu128, i32 0, i32 %_spec_lo, i32 %_spec_hi)\n" ++
+                "  ret void\n",
+            .{ int_info.bits, ssa_name },
+        );
+        return;
+    }
+    try emitter.print(
+        "  %_ivsh = lshr i32 %_spec_lo, 27\n" ++
+            "  %_ivc = and i32 %_ivsh, 15\n" ++
+            "  %_ige2 = icmp uge i32 %_ivc, 2\n" ++
+            "  %_ile5 = icmp ule i32 %_ivc, 5\n" ++
+            "  %_irad = and i1 %_ige2, %_ile5\n" ++
+            "  br i1 %_irad, label %_int_rad, label %_int_sgn\n" ++
+            "_int_rad:\n" ++
+            "  %_iu128 = zext i{d} {s} to i128\n" ++
+            "  call void @_cx_rt_fmt_u128_spec(ptr %_out_b, i128 %_iu128, i32 0, i32 %_spec_lo, i32 %_spec_hi)\n" ++
+            "  ret void\n" ++
+            "_int_sgn:\n" ++
+            "  %_is128 = sext i{d} {s} to i128\n" ++
+            "  call void @_cx_rt_fmt_i128_spec(ptr %_out_b, i128 %_is128, i32 %_spec_lo, i32 %_spec_hi)\n" ++
+            "  ret void\n",
+        .{ int_info.bits, ssa_name, int_info.bits, ssa_name },
+    );
+}
+
 /// Emits `@_cx_drop_ty_<id>(ptr %_self_ptr)` helpers for all registered `drop_type_list` types.
 fn emitDropHelpersAndClosureThunks(emitter: *LlvmModuleEmitter) !void {
     const ptr_int = ptrIntType(emitter);
     const fn_attrs = fnUnwindAttrs(emitter);
 
-    // [1] Synthesized closure forwarding thunks `@_cx_cthunk_<idx>`:
+    // [1] Synthesized closure forwarding thunks `@_cx_cthunk_<idx>` and 3-word env drop thunks:
     for (emitter.closure_thunks.items, 0..) |thunk, thunk_idx| {
         try emitSingleClosureThunk(emitter, thunk, @intCast(thunk_idx));
+        if (thunk.is_three_word) {
+            try emitSingleClosureEnvDropThunk(emitter, thunk, @intCast(thunk_idx));
+        }
     }
 
     // [1b] Synthesized stateful `fn(…)` `%_cx_ctx` adapter thunks `@_cx_fn_ctxwrap_<target_b>`:
@@ -2802,6 +4971,29 @@ fn emitDropHelpersAndClosureThunks(emitter: *LlvmModuleEmitter) !void {
                     }
                 }
             },
+            .closure_ty => {
+                if (codegen_abi.isThreeWordClosureType(emitter.input.pool, drop_ty)) {
+                    const t_id = state.nextTmp();
+                    const dfn_off: u64 = 2 * @as(u64, emitter.cfg.target.ptrBytes());
+                    try state.print(
+                        "  %_cl_env_{d} = load ptr, ptr %_self_ptr, align 1\n" ++
+                            "  %_cl_dfp_{d} = getelementptr inbounds i8, ptr %_self_ptr, {s} {d}\n" ++
+                            "  %_cl_dfn_{d} = load ptr, ptr %_cl_dfp_{d}, align 1\n" ++
+                            "  %_cl_hdf_{d} = icmp ne ptr %_cl_dfn_{d}, null\n" ++
+                            "  br i1 %_cl_hdf_{d}, label %_cl_do_{d}, label %_cl_nx_{d}\n" ++
+                            "_cl_do_{d}:\n" ++
+                            "  store ptr null, ptr %_cl_dfp_{d}, align 1\n" ++
+                            "  call void %_cl_dfn_{d}(ptr %_cl_env_{d})\n" ++
+                            "  br label %_cl_nx_{d}\n" ++
+                            "_cl_nx_{d}:\n",
+                        .{
+                            t_id, t_id, ptr_int, dfn_off, t_id, t_id, t_id, t_id,
+                            t_id, t_id, t_id,    t_id,    t_id, t_id, t_id, t_id,
+                            t_id,
+                        },
+                    );
+                }
+            },
             else => {},
         }
 
@@ -2811,6 +5003,14 @@ fn emitDropHelpersAndClosureThunks(emitter: *LlvmModuleEmitter) !void {
         }
         try emitter.writeAll(state.cur_buf.items);
         try emitter.writeAll("  br label %done_drop\ndone_drop:\n  ret void\n}\n\n");
+    }
+
+    // [3] Synthesized string interpolation & `FmtArgs` formatting helpers (`SE-12`):
+    if (emitter.has_fmt_rt_helpers) {
+        try ensureFmtRuntimeHelpers(emitter);
+        for (emitter.fmt_type_list.items) |fmt_ty| {
+            try emitFmtHelperForType(emitter, fmt_ty);
+        }
     }
 }
 
@@ -2880,6 +5080,65 @@ fn emitForwardAdaptedParamLlvm(
     return formatAbiParamDeclPiece(emitter, param_ty, dst_rec, coerced_v);
 }
 
+/// Emits a synthesized 3-word heap-closure environment drop thunk `@_cx_cdrop_<idx>(ptr %_env)`.
+fn emitSingleClosureEnvDropThunk(
+    emitter: *LlvmModuleEmitter,
+    thunk: ClosureThunkSpec,
+    thunk_idx: u32,
+) !void {
+    if (!emitter.declared_externs.contains("free")) {
+        try emitter.requireIntrinsicDecl("declare void @free(ptr) nounwind");
+    }
+    const ptr_int = ptrIntType(emitter);
+    try emitter.print(
+        "define internal void @_cx_cdrop_{d}(ptr %_env) {s} {{\n" ++
+            "entry:\n" ++
+            "  %_isn = icmp eq ptr %_env, null\n" ++
+            "  br i1 %_isn, label %done_cdrop, label %run_cdrop\n" ++
+            "run_cdrop:\n",
+        .{ thunk_idx, fnUnwindAttrs(emitter) },
+    );
+
+    var cap_slots: std.ArrayListUnmanaged(CapDropSlot) = .empty;
+    defer cap_slots.deinit(emitter.allocator);
+
+    var cur_off: u64 = 0;
+    for (thunk.capture_types) |cap_ty| {
+        const cap_lay = try emitter.resolver.resolveType(cap_ty);
+        if (cap_lay.size_bytes == 0) continue;
+        cur_off = std.mem.alignForward(u64, cur_off, @max(@as(u64, cap_lay.alignBytes()), 1));
+        const unwrapped_cap = try unwrapTransparentType(emitter, cap_ty);
+        if (emitter.drop_type_set.contains(unwrapped_cap.toU32()) and
+            !(try isZeroSizedType(emitter, unwrapped_cap)))
+        {
+            try cap_slots.append(emitter.allocator, .{
+                .byte_offset = cur_off,
+                .drop_ty = unwrapped_cap,
+            });
+        }
+        cur_off += cap_lay.size_bytes;
+    }
+
+    var rev_i: usize = cap_slots.items.len;
+    while (rev_i > 0) {
+        rev_i -= 1;
+        const slot = cap_slots.items[rev_i];
+        try emitter.print(
+            "  %_cenv_d_{d} = getelementptr inbounds i8, ptr %_env, {s} {d}\n" ++
+                "  call void @_cx_drop_ty_{d}(ptr %_cenv_d_{d})\n",
+            .{ rev_i, ptr_int, slot.byte_offset, slot.drop_ty.toU32(), rev_i },
+        );
+    }
+
+    try emitter.writeAll(
+        "  call void @free(ptr %_env)\n" ++
+            "  br label %done_cdrop\n" ++
+            "done_cdrop:\n" ++
+            "  ret void\n" ++
+            "}\n\n",
+    );
+}
+
 /// Emits a synthesized closure forwarding thunk `@_cx_cthunk_<idx>(ptr %_env, …)`.
 fn emitSingleClosureThunk(
     emitter: *LlvmModuleEmitter,
@@ -2915,7 +5174,7 @@ fn emitSingleClosureThunk(
         hdr_count += 1;
     }
     if (hdr_count > 0) try emitter.writeAll(", ");
-    try emitter.writeAll("ptr nonnull noundef %_env");
+    try emitter.writeAll(if (thunk.is_three_word) "ptr noundef %_env" else "ptr nonnull noundef %_env");
     hdr_count += 1;
 
     for (clos_recipe.param_recipes, 0..) |p_rec, idx| {
@@ -3605,6 +5864,10 @@ fn resolvePlaceResultType(
                             cur_ty = emitter.input.pool.unwrapUnderlyingType(sub_fld.field_ty);
                         }
                     }
+                } else if (cur_ty == .source_loc_ty) {
+                    cur_ty = resolveSourceLocFieldLayout(emitter.cfg.target.ptrBytes(), proj.payload).field_ty;
+                } else if (cur_ty == .fmt_spec_ty) {
+                    cur_ty = if (proj.payload == 0) .u32_ty else .u16_ty;
                 } else if (node.tag == .union_ty) {
                     cur_ty = resolveUnionFieldType(emitter, cur_ty, proj.payload);
                 } else if (emitter.resolver.getFieldByDeclOrdinal(cur_ty, proj.payload) catch null) |fld| {
@@ -3831,6 +6094,47 @@ fn lowerPlaceLlvm(
                     }
                     cur_ty = final_ty;
                     cur_align = @min(@max(cur_align, 1), effectiveOffsetAlign(total_off, f_lay.alignBytes()));
+                } else if (cur_ty == .source_loc_ty) {
+                    const sloc_fld = resolveSourceLocFieldLayout(emitter.cfg.target.ptrBytes(), proj.payload);
+                    const ptr_load_align = @min(@max(cur_align, 1), @max(emitter.cfg.target.ptrBytes(), 1));
+                    const t_id = state.nextTmp();
+                    try state.print(
+                        "  %_sloc_p_{d} = load ptr, ptr {s}, align {d}\n",
+                        .{ t_id, cur_ptr, ptr_load_align },
+                    );
+                    emitter.allocator.free(cur_ptr);
+                    if (sloc_fld.byte_offset > 0) {
+                        try state.print(
+                            "  %_sloc_f_{d} = getelementptr inbounds i8, ptr %_sloc_p_{d}, {s} {d}\n",
+                            .{ t_id, t_id, ptr_int, sloc_fld.byte_offset },
+                        );
+                        cur_ptr = try std.fmt.allocPrint(emitter.allocator, "%_sloc_f_{d}", .{t_id});
+                    } else {
+                        cur_ptr = try std.fmt.allocPrint(emitter.allocator, "%_sloc_p_{d}", .{t_id});
+                    }
+                    cur_ty = sloc_fld.field_ty;
+                    cur_align = sloc_fld.align_bytes;
+                    active_mvs_param = 0;
+                    can_enter_param_ptr = false;
+                } else if (cur_ty == .fmt_spec_ty) {
+                    const spec_off: u64 = switch (proj.payload) {
+                        0 => 0,
+                        1 => 4,
+                        else => 6,
+                    };
+                    const spec_ty: TypeId = if (proj.payload == 0) .u32_ty else .u16_ty;
+                    const spec_align: u32 = if (proj.payload == 0) 4 else 2;
+                    if (spec_off > 0) {
+                        const t_id = state.nextTmp();
+                        try state.print(
+                            "  %_fsp_f_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n",
+                            .{ t_id, cur_ptr, ptr_int, spec_off },
+                        );
+                        emitter.allocator.free(cur_ptr);
+                        cur_ptr = try std.fmt.allocPrint(emitter.allocator, "%_fsp_f_{d}", .{t_id});
+                    }
+                    cur_ty = spec_ty;
+                    cur_align = @min(@max(cur_align, 1), spec_align);
                 } else if (node.tag == .union_ty) {
                     const fld_ty = try unwrapTransparentType(
                         emitter,
@@ -4608,6 +6912,19 @@ fn emitMirInstLlvm(
                                 .{ dst_raw, ptr_expr, ptr_expr },
                             );
                         }
+                    } else if (dst_node.tag == .array_ty) {
+                        const elem_count: u64 = dst_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+                        if (elem_count == 0 or raw_bytes.len == 0) {
+                            try state.print(
+                                "  %_v_{d} = select i1 true, [{d} x i8] zeroinitializer, [{d} x i8] zeroinitializer\n",
+                                .{ dst_raw, elem_count, elem_count },
+                            );
+                        } else {
+                            try state.print(
+                                "  %_v_{d} = load [{d} x i8], ptr {s}, align 1\n",
+                                .{ dst_raw, elem_count, ptr_expr },
+                            );
+                        }
                     } else {
                         const tmp_id = state.nextTmp();
                         try state.print(
@@ -4638,12 +6955,32 @@ fn emitMirInstLlvm(
                                 .{ dst_raw, rb.blob_id, rb.blob_id },
                             );
                         }
+                    } else if (dst_node.tag == .array_ty) {
+                        const elem_count: u64 = dst_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+                        if (elem_count == 0 or rb.byte_len == 0) {
+                            try state.print(
+                                "  %_v_{d} = select i1 true, [{d} x i8] zeroinitializer, [{d} x i8] zeroinitializer\n",
+                                .{ dst_raw, elem_count, elem_count },
+                            );
+                        } else {
+                            try state.print(
+                                "  %_v_{d} = load [{d} x i8], ptr @_cx_blob_{d}, align 1\n",
+                                .{ dst_raw, elem_count, rb.blob_id },
+                            );
+                        }
                     } else {
                         try state.print(
                             "  %_v_{d} = load {{ ptr, {s} }}, ptr @_cx_blob_slice_{d}, align {d}\n",
                             .{ dst_raw, ptr_int, rb.blob_id, emitter.cfg.target.ptrBytes() },
                         );
                     }
+                },
+                .source_loc => |sloc| {
+                    const loc_idx = emitter.source_loc_map.get(computeSourceLocKey(sloc)) orelse 0;
+                    try state.print(
+                        "  %_v_{d} = select i1 true, ptr @_cx_loc_{d}, ptr @_cx_loc_{d}\n",
+                        .{ dst_raw, loc_idx, loc_idx },
+                    );
                 },
             }
         },
@@ -4710,6 +7047,39 @@ fn emitMirInstLlvm(
             const src_raw = inst.operands.lhs;
             const fld_ord = inst.operands.rhs;
             const src_ty = try unwrapTransparentType(emitter, body.getInst(MirValueId.fromInt(src_raw)).type_id);
+            if (src_ty == .source_loc_ty) {
+                const sloc_fld = resolveSourceLocFieldLayout(emitter.cfg.target.ptrBytes(), fld_ord);
+                const sloc_ptr = if (sloc_fld.byte_offset == 0)
+                    try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{src_raw})
+                else blk: {
+                    const tmp_id = state.nextTmp();
+                    try state.print(
+                        "  %_sloc_ep_{d} = getelementptr inbounds i8, ptr %_v_{d}, {s} {d}\n",
+                        .{ tmp_id, src_raw, ptr_int, sloc_fld.byte_offset },
+                    );
+                    break :blk try std.fmt.allocPrint(emitter.allocator, "%_sloc_ep_{d}", .{tmp_id});
+                };
+                defer emitter.allocator.free(sloc_ptr);
+                const loaded_sloc = try emitLoadValueFromPtr(
+                    emitter,
+                    state,
+                    inst.type_id,
+                    sloc_ptr,
+                    sloc_fld.align_bytes,
+                    lookupProvenRange(emitter, body_idx, dst_raw),
+                    0,
+                    0,
+                    0,
+                );
+                defer emitter.allocator.free(loaded_sloc);
+                const dst_sloc_ty = try formatLlvmValueType(emitter, inst.type_id);
+                defer emitter.allocator.free(dst_sloc_ty);
+                try state.print(
+                    "  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n",
+                    .{ dst_raw, dst_sloc_ty, loaded_sloc, dst_sloc_ty, loaded_sloc },
+                );
+                return;
+            }
             const src_lay = try emitter.resolver.resolveType(src_ty);
             const scratch = try state.allocEntryBytes(src_lay.size_bytes, src_lay.alignBytes());
             defer emitter.allocator.free(scratch);
@@ -4720,7 +7090,14 @@ fn emitMirInstLlvm(
             const src_node = emitter.input.pool.getNode(src_ty);
             var elem_off: u64 = 0;
             var elem_align: u32 = 1;
-            if (src_node.tag == .array_ty) {
+            if (src_ty == .fmt_spec_ty) {
+                elem_off = switch (fld_ord) {
+                    0 => 0,
+                    1 => 4,
+                    else => 6,
+                };
+                elem_align = if (fld_ord == 0) 4 else 2;
+            } else if (src_node.tag == .array_ty) {
                 const elem_lay = try emitter.resolver.resolveType(inst.type_id);
                 elem_off = @as(u64, fld_ord) * elem_lay.stride_bytes;
                 elem_align = @min(src_lay.alignBytes(), effectiveOffsetAlign(elem_off, elem_lay.alignBytes()));
@@ -4838,8 +7215,93 @@ fn emitMirInstLlvm(
 
         .bitfield_extract => {
             const spec = hir.BitSpec.fromU32(inst.operands.rhs);
-            const back_bits: u16 = @max(@as(u16, spec.backing_bits), 8);
+            const src_unwrapped = try unwrapTransparentType(
+                emitter,
+                body.getInst(MirValueId.fromInt(inst.operands.lhs)).type_id,
+            );
+            const dst_unwrapped = try unwrapTransparentType(emitter, inst.type_id);
             const tmp_id = state.nextTmp();
+
+            if (!src_unwrapped.isPrimitiveOrSentinel() and emitter.input.pool.getNode(src_unwrapped).tag == .array_ty) {
+                const arr_len: u32 = emitter.input.pool.getNode(src_unwrapped).rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+                const bit_start: u32 = spec.fullBitOffset();
+                const start_byte: u32 = bit_start / 8;
+                const end_byte: u32 = @min((bit_start + @as(u32, spec.bit_width) + 7) / 8, arr_len);
+                const span_len: usize = if (end_byte > start_byte) @intCast(end_byte - start_byte) else 0;
+                const intra_bit: u8 = @intCast(bit_start % 8);
+                try state.print("  %_bfea_0_{d} = add i128 0, 0\n", .{tmp_id});
+                for (0..span_len) |byte_k| {
+                    const byte_idx: u32 = start_byte + @as(u32, @intCast(byte_k));
+                    try state.print(
+                        "  %_bfeb_{d}_{d} = extractvalue [{d} x i8] %_v_{d}, {d}\n",
+                        .{ tmp_id, byte_k, arr_len, inst.operands.lhs, byte_idx },
+                    );
+                    if (byte_k == 0) {
+                        if (intra_bit == 0) {
+                            try state.print(
+                                "  %_bfez_{d}_{d} = zext i8 %_bfeb_{d}_{d} to i128\n" ++
+                                    "  %_bfea_{d}_{d} = or i128 %_bfea_{d}_{d}, %_bfez_{d}_{d}\n",
+                                .{ tmp_id, byte_k, tmp_id, byte_k, byte_k + 1, tmp_id, byte_k, tmp_id, tmp_id, byte_k },
+                            );
+                        } else {
+                            try state.print(
+                                "  %_bfes_{d}_{d} = lshr i8 %_bfeb_{d}_{d}, {d}\n" ++
+                                    "  %_bfez_{d}_{d} = zext i8 %_bfes_{d}_{d} to i128\n" ++
+                                    "  %_bfea_{d}_{d} = or i128 %_bfea_{d}_{d}, %_bfez_{d}_{d}\n",
+                                .{
+                                    tmp_id, byte_k, tmp_id, byte_k, intra_bit,
+                                    tmp_id, byte_k, tmp_id, byte_k, byte_k + 1,
+                                    tmp_id, byte_k, tmp_id, tmp_id, byte_k,
+                                },
+                            );
+                        }
+                    } else {
+                        const shift_amt: usize = byte_k * 8 - intra_bit;
+                        try state.print(
+                            "  %_bfez_{d}_{d} = zext i8 %_bfeb_{d}_{d} to i128\n" ++
+                                "  %_bfes_{d}_{d} = shl i128 %_bfez_{d}_{d}, {d}\n" ++
+                                "  %_bfea_{d}_{d} = or i128 %_bfea_{d}_{d}, %_bfes_{d}_{d}\n",
+                            .{
+                                tmp_id, byte_k, tmp_id,    byte_k,     tmp_id, byte_k,
+                                tmp_id, byte_k, shift_amt, byte_k + 1, tmp_id, byte_k,
+                                tmp_id, tmp_id, byte_k,
+                            },
+                        );
+                    }
+                }
+                const mask_128: u128 = if (spec.bit_width >= 128)
+                    std.math.maxInt(u128)
+                else
+                    (@as(u128, 1) << @intCast(spec.bit_width)) - 1;
+                if (spec.is_signed and spec.bit_width > 0 and spec.bit_width < 128) {
+                    const sh_amt: u8 = 128 - spec.bit_width;
+                    try state.print(
+                        "  %_bfel_{d} = shl i128 %_bfea_{d}_{d}, {d}\n" ++
+                            "  %_bfe_r_{d} = ashr i128 %_bfel_{d}, {d}\n",
+                        .{ tmp_id, span_len, tmp_id, sh_amt, tmp_id, tmp_id, sh_amt },
+                    );
+                } else {
+                    try state.print(
+                        "  %_bfe_r_{d} = and i128 %_bfea_{d}_{d}, {d}\n",
+                        .{ tmp_id, span_len, tmp_id, @as(i128, @bitCast(mask_128)) },
+                    );
+                }
+                if (dst_unwrapped == .bool_ty) {
+                    try state.print("  %_v_{d} = trunc i128 %_bfe_r_{d} to i1\n", .{ dst_raw, tmp_id });
+                } else if (resolveIntegerInfo(emitter, dst_unwrapped)) |dst_info| {
+                    if (dst_info.bits == 128) {
+                        try state.print("  %_v_{d} = add i128 %_bfe_r_{d}, 0\n", .{ dst_raw, tmp_id });
+                    } else {
+                        try state.print(
+                            "  %_v_{d} = trunc i128 %_bfe_r_{d} to i{d}\n",
+                            .{ dst_raw, tmp_id, dst_info.bits },
+                        );
+                    }
+                }
+                return;
+            }
+
+            const back_bits: u16 = @max(@as(u16, spec.backing_bits), 8);
             if (spec.is_signed) {
                 const sh_left: u16 = back_bits -| (@as(u16, spec.bit_offset) + @as(u16, spec.bit_width));
                 const sh_right: u16 = back_bits -| @as(u16, spec.bit_width);
@@ -4872,7 +7334,6 @@ fn emitMirInstLlvm(
                     );
                 }
             }
-            const dst_unwrapped = try unwrapTransparentType(emitter, inst.type_id);
             if (dst_unwrapped == .bool_ty) {
                 try state.print("  %_v_{d} = trunc i{d} %_bfe_r_{d} to i1\n", .{ dst_raw, back_bits, tmp_id });
             } else if (resolveIntegerInfo(emitter, dst_unwrapped)) |dst_info| {
@@ -4895,11 +7356,94 @@ fn emitMirInstLlvm(
 
         .bitfield_insert => {
             const spec = hir.BitSpec.fromU32(inst.operands.rhs);
-            const back_bits: u16 = @max(@as(u16, spec.backing_bits), 8);
             const base_raw = body.extra_args.items[inst.operands.lhs];
             const ins_raw = body.extra_args.items[inst.operands.lhs + 1];
             const ins_ty = try unwrapTransparentType(emitter, body.getInst(MirValueId.fromInt(ins_raw)).type_id);
+            const dst_arr_ty = try unwrapTransparentType(emitter, inst.type_id);
             const tmp_id = state.nextTmp();
+
+            if (!dst_arr_ty.isPrimitiveOrSentinel() and emitter.input.pool.getNode(dst_arr_ty).tag == .array_ty) {
+                const arr_len: u32 = emitter.input.pool.getNode(dst_arr_ty).rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+                if (ins_ty == .bool_ty) {
+                    try state.print("  %_bfia_c_{d} = zext i1 %_v_{d} to i128\n", .{ tmp_id, ins_raw });
+                } else if (resolveIntegerInfo(emitter, ins_ty)) |ins_info| {
+                    if (ins_info.bits == 128) {
+                        try state.print("  %_bfia_c_{d} = add i128 %_v_{d}, 0\n", .{ tmp_id, ins_raw });
+                    } else {
+                        try state.print(
+                            "  %_bfia_c_{d} = zext i{d} %_v_{d} to i128\n",
+                            .{ tmp_id, ins_info.bits, ins_raw },
+                        );
+                    }
+                } else {
+                    try state.print("  %_bfia_c_{d} = add i128 0, 0\n", .{tmp_id});
+                }
+                const arr_wmask: u128 = if (spec.bit_width >= 128)
+                    std.math.maxInt(u128)
+                else
+                    (@as(u128, 1) << @intCast(spec.bit_width)) - 1;
+                try state.print(
+                    "  %_bfia_m_{d} = and i128 %_bfia_c_{d}, {d}\n",
+                    .{ tmp_id, tmp_id, @as(i128, @bitCast(arr_wmask)) },
+                );
+
+                const bit_start: u32 = spec.fullBitOffset();
+                const bit_end: u32 = bit_start + @as(u32, spec.bit_width);
+                const start_byte: u32 = bit_start / 8;
+                const end_byte: u32 = @min((bit_end + 7) / 8, arr_len);
+                const span_len: usize = if (end_byte > start_byte) @intCast(end_byte - start_byte) else 0;
+                if (span_len == 0) {
+                    try state.print("  %_v_{d} = insertvalue [{d} x i8] %_v_{d}, i8 0, 0\n", .{ dst_raw, arr_len, base_raw });
+                    return;
+                }
+                for (0..span_len) |byte_k| {
+                    const byte_idx: u32 = start_byte + @as(u32, @intCast(byte_k));
+                    const bit_lo: u8 = if (bit_start > byte_idx * 8) @intCast(bit_start - byte_idx * 8) else 0;
+                    const bit_hi: u8 = if (bit_end < byte_idx * 8 + 8) @intCast(bit_end - byte_idx * 8) else 8;
+                    const byte_mask: u8 = @intCast(((@as(u16, 1) << @intCast(bit_hi - bit_lo)) - 1) << @intCast(bit_lo));
+                    const clr_byte_mask: u8 = ~byte_mask;
+                    const ins_shift: u32 = (byte_idx * 8 + bit_lo) - bit_start;
+                    const prev_agg = if (byte_k == 0)
+                        try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{base_raw})
+                    else
+                        try std.fmt.allocPrint(emitter.allocator, "%_bfia_agg_{d}_{d}", .{ tmp_id, byte_k - 1 });
+                    defer emitter.allocator.free(prev_agg);
+                    const next_agg = if (byte_k + 1 == span_len)
+                        try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{dst_raw})
+                    else
+                        try std.fmt.allocPrint(emitter.allocator, "%_bfia_agg_{d}_{d}", .{ tmp_id, byte_k });
+                    defer emitter.allocator.free(next_agg);
+
+                    try state.print(
+                        "  %_bfia_ob_{d}_{d} = extractvalue [{d} x i8] {s}, {d}\n" ++
+                            "  %_bfia_cb_{d}_{d} = and i8 %_bfia_ob_{d}_{d}, {d}\n" ++
+                            "  %_bfia_sr_{d}_{d} = lshr i128 %_bfia_m_{d}, {d}\n" ++
+                            "  %_bfia_tr_{d}_{d} = trunc i128 %_bfia_sr_{d}_{d} to i8\n",
+                        .{
+                            tmp_id, byte_k, arr_len, prev_agg,  byte_idx,
+                            tmp_id, byte_k, tmp_id,  byte_k,    @as(i8, @bitCast(clr_byte_mask)),
+                            tmp_id, byte_k, tmp_id,  ins_shift, tmp_id,
+                            byte_k, tmp_id, byte_k,
+                        },
+                    );
+                    try state.print(
+                        "  %_bfia_sl_{d}_{d} = shl i8 %_bfia_tr_{d}_{d}, {d}\n" ++
+                            "  %_bfia_pc_{d}_{d} = and i8 %_bfia_sl_{d}_{d}, {d}\n" ++
+                            "  %_bfia_nb_{d}_{d} = or i8 %_bfia_cb_{d}_{d}, %_bfia_pc_{d}_{d}\n" ++
+                            "  {s} = insertvalue [{d} x i8] {s}, i8 %_bfia_nb_{d}_{d}, {d}\n",
+                        .{
+                            tmp_id, byte_k,   tmp_id,  byte_k,   bit_lo,
+                            tmp_id, byte_k,   tmp_id,  byte_k,   @as(i8, @bitCast(byte_mask)),
+                            tmp_id, byte_k,   tmp_id,  byte_k,   tmp_id,
+                            byte_k, next_agg, arr_len, prev_agg, tmp_id,
+                            byte_k, byte_idx,
+                        },
+                    );
+                }
+                return;
+            }
+
+            const back_bits: u16 = @max(@as(u16, spec.backing_bits), 8);
 
             if (ins_ty == .bool_ty) {
                 try state.print("  %_bfi_c_{d} = zext i1 %_v_{d} to i{d}\n", .{ tmp_id, ins_raw, back_bits });
@@ -5608,6 +8152,32 @@ fn emitStructuralPtrEqLlvm(
         return std.fmt.allocPrint(emitter.allocator, "%_peqi_eq_{d}", .{tmp_id});
     }
 
+    if (ty == .source_loc_ty or
+        ty == .task_group_base_ty or
+        ty == .task_handle_base_ty or
+        emitter.input.pool.isTaskGroupType(ty) or
+        emitter.input.pool.isTaskHandleType(ty))
+    {
+        const tmp_id = state.nextTmp();
+        try state.print(
+            "  %_peqp_l_{d} = load ptr, ptr {s}, align 1\n" ++
+                "  %_peqp_r_{d} = load ptr, ptr {s}, align 1\n" ++
+                "  %_peqp_eq_{d} = icmp eq ptr %_peqp_l_{d}, %_peqp_r_{d}\n",
+            .{ tmp_id, lhs_ptr, tmp_id, rhs_ptr, tmp_id, tmp_id, tmp_id },
+        );
+        return std.fmt.allocPrint(emitter.allocator, "%_peqp_eq_{d}", .{tmp_id});
+    }
+    if (ty == .fmt_spec_ty) {
+        const tmp_id = state.nextTmp();
+        try state.print(
+            "  %_peqfs_l_{d} = load i64, ptr {s}, align 1\n" ++
+                "  %_peqfs_r_{d} = load i64, ptr {s}, align 1\n" ++
+                "  %_peqfs_eq_{d} = icmp eq i64 %_peqfs_l_{d}, %_peqfs_r_{d}\n",
+            .{ tmp_id, lhs_ptr, tmp_id, rhs_ptr, tmp_id, tmp_id, tmp_id },
+        );
+        return std.fmt.allocPrint(emitter.allocator, "%_peqfs_eq_{d}", .{tmp_id});
+    }
+
     if (ty.isPrimitiveOrSentinel()) return emitter.allocator.dupe(u8, "false");
     const node = emitter.input.pool.getNode(ty);
 
@@ -6128,6 +8698,34 @@ fn emitBinOpLlvm(
     }
 
     // [3] Pointer relational and equality comparisons + composite structural equality (`Option`, `Result`, etc.):
+    if ((kind == .eq or kind == .ne) and
+        (op_ty == .source_loc_ty or
+            op_ty == .task_group_base_ty or
+            op_ty == .task_handle_base_ty or
+            emitter.input.pool.isTaskGroupType(op_ty) or
+            emitter.input.pool.isTaskHandleType(op_ty)))
+    {
+        const pred = if (kind == .eq) "eq" else "ne";
+        try state.print("  %_v_{d} = icmp {s} ptr %_v_{d}, %_v_{d}\n", .{ dst_raw, pred, l_raw, r_raw });
+        return;
+    }
+    if ((kind == .eq or kind == .ne) and op_ty == .fmt_spec_ty) {
+        const l_slot = try state.allocEntryBytes(8, 4);
+        defer emitter.allocator.free(l_slot);
+        const r_slot = try state.allocEntryBytes(8, 4);
+        defer emitter.allocator.free(r_slot);
+        const tmp_id = state.nextTmp();
+        const pred = if (kind == .eq) "eq" else "ne";
+        try state.print(
+            "  store {{ i32, i16, i16 }} %_v_{d}, ptr {s}, align 4\n" ++
+                "  store {{ i32, i16, i16 }} %_v_{d}, ptr {s}, align 4\n" ++
+                "  %_fse_l_{d} = load i64, ptr {s}, align 4\n" ++
+                "  %_fse_r_{d} = load i64, ptr {s}, align 4\n" ++
+                "  %_v_{d} = icmp {s} i64 %_fse_l_{d}, %_fse_r_{d}\n",
+            .{ l_raw, l_slot, r_raw, r_slot, tmp_id, l_slot, tmp_id, r_slot, dst_raw, pred, tmp_id, tmp_id },
+        );
+        return;
+    }
     if (!op_ty.isPrimitiveOrSentinel()) {
         const op_tag = emitter.input.pool.getNode(op_ty).tag;
         if (op_tag == .ref_ty or op_tag == .mut_ref_ty or op_tag == .raw_ptr_ty or op_tag == .fn_ty) {
@@ -6525,6 +9123,64 @@ fn emitUnaryOpLlvm(
                 try state.print("  %_v_{d} = xor i1 %_v_{d}, true\n", .{ dst_raw, s_raw });
             } else if (resolveIntegerInfo(emitter, unwrapped_dst)) |info| {
                 try state.print("  %_v_{d} = xor i{d} %_v_{d}, -1\n", .{ dst_raw, info.bits, s_raw });
+            } else if (!unwrapped_dst.isPrimitiveOrSentinel() and
+                emitter.input.pool.getNode(unwrapped_dst).tag == .array_ty)
+            {
+                const arr_node = emitter.input.pool.getNode(unwrapped_dst);
+                const lane_ty = try unwrapTransparentType(emitter, TypeId.fromInt(arr_node.lhs));
+                const lanes: u64 = arr_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+                if (lanes == 0) {
+                    const empty_ty = try formatLlvmValueType(emitter, unwrapped_dst);
+                    defer emitter.allocator.free(empty_ty);
+                    try state.print(
+                        "  %_v_{d} = select i1 true, {s} zeroinitializer, {s} zeroinitializer\n",
+                        .{ dst_raw, empty_ty, empty_ty },
+                    );
+                } else {
+                    const arr_lay = try emitter.resolver.resolveType(unwrapped_dst);
+                    const lane_mem = try formatLlvmMemoryType(emitter, lane_ty);
+                    defer emitter.allocator.free(lane_mem);
+                    const lane_bits: u16 = if (lane_ty == .bool_ty)
+                        8
+                    else if (resolveIntegerInfo(emitter, lane_ty)) |lane_info|
+                        lane_info.bits
+                    else
+                        8;
+                    const mask_lit = if (lane_ty == .bool_ty) "1" else "-1";
+                    var mask_buf: std.ArrayListUnmanaged(u8) = .empty;
+                    defer mask_buf.deinit(emitter.allocator);
+                    try mask_buf.append(emitter.allocator, '<');
+                    var lane_i: u64 = 0;
+                    while (lane_i < lanes) : (lane_i += 1) {
+                        if (lane_i > 0) try mask_buf.appendSlice(emitter.allocator, ", ");
+                        const piece = try std.fmt.allocPrint(emitter.allocator, "i{d} {s}", .{ lane_bits, mask_lit });
+                        defer emitter.allocator.free(piece);
+                        try mask_buf.appendSlice(emitter.allocator, piece);
+                    }
+                    try mask_buf.append(emitter.allocator, '>');
+
+                    const vec_align = @max(arr_lay.alignBytes(), 16);
+                    const vec_store_bytes = std.math.ceilPowerOfTwo(u64, @max(arr_lay.size_bytes, 1)) catch arr_lay.size_bytes;
+                    const slot = try state.allocEntryBytes(vec_store_bytes, vec_align);
+                    defer emitter.allocator.free(slot);
+                    const tmp_id = state.nextTmp();
+                    try state.print(
+                        "  store [{d} x {s}] %_v_{d}, ptr {s}, align {d}\n" ++
+                            "  %_bnv_{d} = load <{d} x i{d}>, ptr {s}, align {d}\n" ++
+                            "  %_bno_{d} = xor <{d} x i{d}> %_bnv_{d}, {s}\n" ++
+                            "  store <{d} x i{d}> %_bno_{d}, ptr {s}, align {d}\n" ++
+                            "  %_v_{d} = load [{d} x {s}], ptr {s}, align {d}\n",
+                        .{
+                            lanes,     lane_mem,  s_raw,          slot,
+                            vec_align, tmp_id,    lanes,          lane_bits,
+                            slot,      vec_align, tmp_id,         lanes,
+                            lane_bits, tmp_id,    mask_buf.items, lanes,
+                            lane_bits, tmp_id,    slot,           vec_align,
+                            dst_raw,   lanes,     lane_mem,       slot,
+                            vec_align,
+                        },
+                    );
+                }
             }
         },
 
@@ -6742,7 +9398,9 @@ fn emitUnaryOpLlvm(
             defer emitter.allocator.free(src_ssa);
             try emitStoreValueToPtr(emitter, state, src_ty, src_ssa, scratch, src_lay.alignBytes(), 0, 0, 0);
 
-            if ((try emitter.resolver.getSumDetail(src_ty)) != null) {
+            if ((try emitter.resolver.getSumDetail(src_ty)) != null or
+                (!src_ty.isPrimitiveOrSentinel() and emitter.input.pool.getNode(src_ty).tag == .enum_ty))
+            {
                 const disc_32 = try emitReadSumDiscriminantFromPtr(
                     emitter,
                     state,
@@ -6851,11 +9509,13 @@ fn emitAggregateMakeLlvm(
 
     switch (kind) {
         .closure_make => {
+            const is_three_w = codegen_abi.isThreeWordClosureType(emitter.input.pool, agg_ty);
+            const clos_val_ty = if (is_three_w) "{ ptr, ptr, ptr }" else "{ ptr, ptr }";
             const key: u64 = (@as(u64, body_idx) << 32) | @as(u64, dst_raw);
             const thunk_idx = emitter.closure_thunk_map.get(key) orelse {
                 try state.print(
-                    "  %_v_{d} = select i1 true, {{ ptr, ptr }} zeroinitializer, {{ ptr, ptr }} zeroinitializer\n",
-                    .{dst_raw},
+                    "  %_v_{d} = select i1 true, {s} zeroinitializer, {s} zeroinitializer\n",
+                    .{ dst_raw, clos_val_ty, clos_val_ty },
                 );
                 return;
             };
@@ -6876,8 +9536,30 @@ fn emitAggregateMakeLlvm(
                     .{ ptr_int, emitter.cfg.target.ptrBytes() },
                 )
             else blk: {
-                const env_slot = try state.allocEntryBytes(env_size, env_align);
-                try emitMemsetZero(emitter, state, env_slot, env_size, env_align);
+                const env_slot = if (thunk.is_three_word) heap: {
+                    if (!emitter.declared_externs.contains("calloc")) {
+                        try emitter.requireIntrinsicDecl(
+                            if (emitter.cfg.target.isWasm())
+                                "declare ptr @calloc(i32, i32) nounwind"
+                            else
+                                "declare ptr @calloc(i64, i64) nounwind",
+                        );
+                    }
+                    const hp_id = state.nextTmp();
+                    try state.print(
+                        "  %_cenv_hp_{d} = call ptr @calloc({s} 1, {s} {d})\n" ++
+                            "  %_cenv_oom_{d} = icmp eq ptr %_cenv_hp_{d}, null\n",
+                        .{ hp_id, ptr_int, ptr_int, env_size, hp_id, hp_id },
+                    );
+                    const oom_s = try std.fmt.allocPrint(emitter.allocator, "%_cenv_oom_{d}", .{hp_id});
+                    defer emitter.allocator.free(oom_s);
+                    try emitInlineTrapIfTrue(emitter, state, oom_s, 0);
+                    break :heap try std.fmt.allocPrint(emitter.allocator, "%_cenv_hp_{d}", .{hp_id});
+                } else stack: {
+                    const s_slot = try state.allocEntryBytes(env_size, env_align);
+                    try emitMemsetZero(emitter, state, s_slot, env_size, env_align);
+                    break :stack s_slot;
+                };
                 var cur_off: u64 = 0;
                 for (thunk.capture_types, 0..) |cap_ty, cap_i| {
                     const cap_lay = try emitter.resolver.resolveType(cap_ty);
@@ -6897,7 +9579,11 @@ fn emitAggregateMakeLlvm(
                     defer emitter.allocator.free(dst_p);
                     const cap_ssa = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{cap_val_raw});
                     defer emitter.allocator.free(cap_ssa);
-                    try emitStoreValueToPtr(emitter, state, cap_ty, cap_ssa, dst_p, cap_lay.alignBytes(), 0, 0, 0);
+                    const eff_cap_align = if (thunk.is_three_word)
+                        @min(@max(emitter.cfg.target.ptrBytes(), 8), effectiveOffsetAlign(cur_off, cap_lay.alignBytes()))
+                    else
+                        cap_lay.alignBytes();
+                    try emitStoreValueToPtr(emitter, state, cap_ty, cap_ssa, dst_p, eff_cap_align, 0, 0, 0);
                     cur_off += cap_lay.size_bytes;
                 }
                 break :blk env_slot;
@@ -6905,10 +9591,233 @@ fn emitAggregateMakeLlvm(
             defer emitter.allocator.free(env_ptr_s);
 
             const tmp_id = state.nextTmp();
+            if (thunk.is_three_word) {
+                const drop_fn_s = if (env_size == 0)
+                    try emitter.allocator.dupe(u8, "null")
+                else
+                    try std.fmt.allocPrint(emitter.allocator, "@_cx_cdrop_{d}", .{thunk_idx});
+                defer emitter.allocator.free(drop_fn_s);
+                try state.print(
+                    "  %_cm0_{d} = insertvalue {{ ptr, ptr, ptr }} zeroinitializer, ptr {s}, 0\n" ++
+                        "  %_cm1_{d} = insertvalue {{ ptr, ptr, ptr }} %_cm0_{d}, ptr @_cx_cthunk_{d}, 1\n" ++
+                        "  %_v_{d} = insertvalue {{ ptr, ptr, ptr }} %_cm1_{d}, ptr {s}, 2\n",
+                    .{ tmp_id, env_ptr_s, tmp_id, tmp_id, thunk_idx, dst_raw, tmp_id, drop_fn_s },
+                );
+            } else {
+                try state.print(
+                    "  %_cm0_{d} = insertvalue {{ ptr, ptr }} zeroinitializer, ptr {s}, 0\n" ++
+                        "  %_v_{d} = insertvalue {{ ptr, ptr }} %_cm0_{d}, ptr @_cx_cthunk_{d}, 1\n",
+                    .{ tmp_id, env_ptr_s, dst_raw, tmp_id, thunk_idx },
+                );
+            }
+            return;
+        },
+
+        .fmt_args_make => {
+            const words = body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs];
+            var piece_count: usize = 0;
+            if (words.len >= 1) {
+                const p_inst = body.getInst(MirValueId.fromInt(words[0]));
+                if (p_inst.op == .const_scalar and p_inst.operands.lhs < body.consts.items.len) {
+                    switch (body.consts.items[p_inst.operands.lhs]) {
+                        .int_val => |iv| piece_count = @intCast(@as(u128, @bitCast(iv))),
+                        else => {},
+                    }
+                }
+            }
+            const hole_count: usize = if (1 + piece_count <= words.len) (words.len - 1 - piece_count) / 3 else 0;
+            const ptr_bytes: u32 = emitter.cfg.target.ptrBytes();
+
+            // `[P0-C]` Static `.rodata` fast-path for 0-hole constant `FmtArgs` literals:
+            if (hole_count == 0 and piece_count >= 1 and 1 + piece_count <= words.len) {
+                var is_all_const_str = true;
+                for (words[1 .. 1 + piece_count]) |piece_raw| {
+                    const p_inst = body.getInst(MirValueId.fromInt(piece_raw));
+                    if (p_inst.op != .const_scalar or p_inst.operands.lhs >= body.consts.items.len) {
+                        is_all_const_str = false;
+                        break;
+                    }
+                    switch (body.consts.items[p_inst.operands.lhs]) {
+                        .str_val => {},
+                        else => {
+                            is_all_const_str = false;
+                            break;
+                        },
+                    }
+                }
+                if (is_all_const_str) {
+                    const sid = emitter.nextSynthGlobalId();
+                    const hdr_s = try std.fmt.allocPrint(
+                        emitter.allocator,
+                        "@_cx_fsp_{d} = private unnamed_addr constant [{d} x {{ ptr, {s} }}] [",
+                        .{ sid, piece_count, ptr_int },
+                    );
+                    defer emitter.allocator.free(hdr_s);
+                    try emitter.synth_globals.appendSlice(emitter.allocator, hdr_s);
+                    for (words[1 .. 1 + piece_count], 0..) |piece_raw, p_idx| {
+                        if (p_idx > 0) try emitter.synth_globals.appendSlice(emitter.allocator, ", ");
+                        const p_inst = body.getInst(MirValueId.fromInt(piece_raw));
+                        const sym_id = body.consts.items[p_inst.operands.lhs].str_val;
+                        const raw_s = emitter.input.interner.get(sym_id);
+                        const p_expr = if (raw_s.len == 0)
+                            try std.fmt.allocPrint(emitter.allocator, "inttoptr ({s} 1 to ptr)", .{ptr_int})
+                        else
+                            try std.fmt.allocPrint(emitter.allocator, "@_cx_str_bytes_{d}", .{sym_id.asInt()});
+                        defer emitter.allocator.free(p_expr);
+                        const elem_s = try std.fmt.allocPrint(
+                            emitter.allocator,
+                            "{{ ptr, {s} }} {{ ptr {s}, {s} {d} }}",
+                            .{ ptr_int, p_expr, ptr_int, raw_s.len },
+                        );
+                        defer emitter.allocator.free(elem_s);
+                        try emitter.synth_globals.appendSlice(emitter.allocator, elem_s);
+                    }
+                    const tail_s = try std.fmt.allocPrint(emitter.allocator, "], align {d}\n", .{ptr_bytes});
+                    defer emitter.allocator.free(tail_s);
+                    try emitter.synth_globals.appendSlice(emitter.allocator, tail_s);
+
+                    const tmp_id = state.nextTmp();
+                    try state.print(
+                        "  %_fa0_{d} = insertvalue {{ ptr, {s}, ptr, {s} }} zeroinitializer, ptr @_cx_fsp_{d}, 0\n" ++
+                            "  %_fa1_{d} = insertvalue {{ ptr, {s}, ptr, {s} }} %_fa0_{d}, {s} {d}, 1\n" ++
+                            "  %_fa2_{d} = insertvalue {{ ptr, {s}, ptr, {s} }} %_fa1_{d}, ptr null, 2\n" ++
+                            "  %_v_{d} = insertvalue {{ ptr, {s}, ptr, {s} }} %_fa2_{d}, {s} 0, 3\n",
+                        .{
+                            tmp_id,  ptr_int,     ptr_int, sid,
+                            tmp_id,  ptr_int,     ptr_int, tmp_id,
+                            ptr_int, piece_count, tmp_id,  ptr_int,
+                            ptr_int, tmp_id,      dst_raw, ptr_int,
+                            ptr_int, tmp_id,      ptr_int,
+                        },
+                    );
+                    return;
+                }
+            }
+
+            const piece_stride: u64 = 2 * @as(u64, ptr_bytes);
+            const pieces_slot = try state.allocEntryBytes(@max(@as(u64, piece_count) * piece_stride, 1), ptr_bytes);
+            defer emitter.allocator.free(pieces_slot);
+            if (1 + piece_count <= words.len) {
+                for (words[1 .. 1 + piece_count], 0..) |piece_raw, p_idx| {
+                    const p_off: u64 = @as(u64, p_idx) * piece_stride;
+                    const p_dst = if (p_off == 0)
+                        try emitter.allocator.dupe(u8, pieces_slot)
+                    else blk: {
+                        const sub_id = state.nextTmp();
+                        try state.print(
+                            "  %_fap_p_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n",
+                            .{ sub_id, pieces_slot, ptr_int, p_off },
+                        );
+                        break :blk try std.fmt.allocPrint(emitter.allocator, "%_fap_p_{d}", .{sub_id});
+                    };
+                    defer emitter.allocator.free(p_dst);
+                    try state.print(
+                        "  store {{ ptr, {s} }} %_v_{d}, ptr {s}, align {d}\n",
+                        .{ ptr_int, piece_raw, p_dst, ptr_bytes },
+                    );
+                }
+            }
+
+            const arg_stride: u64 = std.mem.alignForward(u64, 2 * @as(u64, ptr_bytes) + 8, @as(u64, ptr_bytes));
+            const args_ptr_s = if (hole_count == 0)
+                try emitter.allocator.dupe(u8, "null")
+            else blk: {
+                const args_slot = try state.allocEntryBytes(@as(u64, hole_count) * arg_stride, ptr_bytes);
+                var hole_j: usize = 0;
+                while (hole_j < hole_count) : (hole_j += 1) {
+                    const href_raw = words[1 + piece_count + hole_j * 3];
+                    const spec_lo_raw = words[1 + piece_count + hole_j * 3 + 1];
+                    const spec_hi_raw = words[1 + piece_count + hole_j * 3 + 2];
+
+                    const href_ty = try unwrapTransparentType(
+                        emitter,
+                        body.getInst(MirValueId.fromInt(href_raw)).type_id,
+                    );
+                    const href_node = emitter.input.pool.getNode(href_ty);
+                    const is_ptr_arg = href_node.tag == .ref_ty or
+                        href_node.tag == .mut_ref_ty or
+                        href_node.tag == .raw_ptr_ty;
+                    const hval_ty = try unwrapTransparentType(
+                        emitter,
+                        if (is_ptr_arg) TypeId.fromInt(href_node.lhs) else href_ty,
+                    );
+                    const data_ptr_s = if (is_ptr_arg)
+                        try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{href_raw})
+                    else spill: {
+                        const h_lay = try emitter.resolver.resolveType(hval_ty);
+                        const h_slot = try state.allocEntryBytes(@max(h_lay.size_bytes, 1), h_lay.alignBytes());
+                        if (!(try isZeroSizedType(emitter, hval_ty))) {
+                            const h_ssa = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{href_raw});
+                            defer emitter.allocator.free(h_ssa);
+                            try emitStoreValueToPtr(emitter, state, hval_ty, h_ssa, h_slot, h_lay.alignBytes(), 0, 0, 0);
+                        }
+                        break :spill h_slot;
+                    };
+                    defer emitter.allocator.free(data_ptr_s);
+
+                    const base_off: u64 = @as(u64, hole_j) * arg_stride;
+                    const sub_id = state.nextTmp();
+                    const d_ptr = if (base_off == 0)
+                        try emitter.allocator.dupe(u8, args_slot)
+                    else dp: {
+                        try state.print(
+                            "  %_faa_d_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n",
+                            .{ sub_id, args_slot, ptr_int, base_off },
+                        );
+                        break :dp try std.fmt.allocPrint(emitter.allocator, "%_faa_d_{d}", .{sub_id});
+                    };
+                    defer emitter.allocator.free(d_ptr);
+
+                    try state.print(
+                        "  store ptr {s}, ptr {s}, align {d}\n" ++
+                            "  %_faa_f_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                            "  store ptr @_cx_fmt_ty_{d}, ptr %_faa_f_{d}, align {d}\n" ++
+                            "  %_faa_l_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                            "  store i32 %_v_{d}, ptr %_faa_l_{d}, align 4\n",
+                        .{
+                            data_ptr_s,           d_ptr,                              ptr_bytes,
+                            sub_id,               args_slot,                          ptr_int,
+                            base_off + ptr_bytes, hval_ty.toU32(),                    sub_id,
+                            ptr_bytes,            sub_id,                             args_slot,
+                            ptr_int,              base_off + 2 * @as(u64, ptr_bytes), spec_lo_raw,
+                            sub_id,
+                        },
+                    );
+                    try state.print(
+                        "  %_faa_w_{d} = trunc i32 %_v_{d} to i16\n" ++
+                            "  %_faa_hs_{d} = lshr i32 %_v_{d}, 16\n" ++
+                            "  %_faa_pr_{d} = trunc i32 %_faa_hs_{d} to i16\n" ++
+                            "  %_faa_wp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                            "  store i16 %_faa_w_{d}, ptr %_faa_wp_{d}, align 2\n" ++
+                            "  %_faa_pp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                            "  store i16 %_faa_pr_{d}, ptr %_faa_pp_{d}, align 2\n",
+                        .{
+                            sub_id,  spec_hi_raw,                            sub_id,  spec_hi_raw,
+                            sub_id,  sub_id,                                 sub_id,  args_slot,
+                            ptr_int, base_off + 2 * @as(u64, ptr_bytes) + 4, sub_id,  sub_id,
+                            sub_id,  args_slot,                              ptr_int, base_off + 2 * @as(u64, ptr_bytes) + 6,
+                            sub_id,  sub_id,
+                        },
+                    );
+                }
+                break :blk args_slot;
+            };
+            defer emitter.allocator.free(args_ptr_s);
+
+            const tmp_id = state.nextTmp();
             try state.print(
-                "  %_cm0_{d} = insertvalue {{ ptr, ptr }} zeroinitializer, ptr {s}, 0\n" ++
-                    "  %_v_{d} = insertvalue {{ ptr, ptr }} %_cm0_{d}, ptr @_cx_cthunk_{d}, 1\n",
-                .{ tmp_id, env_ptr_s, dst_raw, tmp_id, thunk_idx },
+                "  %_fa0_{d} = insertvalue {{ ptr, {s}, ptr, {s} }} zeroinitializer, ptr {s}, 0\n" ++
+                    "  %_fa1_{d} = insertvalue {{ ptr, {s}, ptr, {s} }} %_fa0_{d}, {s} {d}, 1\n" ++
+                    "  %_fa2_{d} = insertvalue {{ ptr, {s}, ptr, {s} }} %_fa1_{d}, ptr {s}, 2\n" ++
+                    "  %_v_{d} = insertvalue {{ ptr, {s}, ptr, {s} }} %_fa2_{d}, {s} {d}, 3\n",
+                .{
+                    tmp_id,     ptr_int,     ptr_int,    pieces_slot,
+                    tmp_id,     ptr_int,     ptr_int,    tmp_id,
+                    ptr_int,    piece_count, tmp_id,     ptr_int,
+                    ptr_int,    tmp_id,      args_ptr_s, dst_raw,
+                    ptr_int,    ptr_int,     tmp_id,     ptr_int,
+                    hole_count,
+                },
             );
             return;
         },
@@ -7517,12 +10426,18 @@ fn emitAggregateMakeLlvm(
                     tag_ord,
                 );
             } else if (resolveIntegerInfo(emitter, agg_ty)) |enum_int| {
-                try state.print("  %_v_{d} = add i{d} 0, {d}\n", .{ dst_raw, enum_int.bits, tag_ord });
+                const disc_lit = try formatScalarIntLiteralAlloc(
+                    emitter.allocator,
+                    enum_int.bits,
+                    resolveScalarEnumDiscrimI128(emitter, agg_ty, tag_ord),
+                );
+                defer emitter.allocator.free(disc_lit);
+                try state.print("  %_v_{d} = add i{d} 0, {s}\n", .{ dst_raw, enum_int.bits, disc_lit });
                 return;
             }
         },
 
-        .closure_make, .str_concat => unreachable,
+        .closure_make, .str_concat, .fmt_args_make => unreachable,
     }
 
     const loaded = try emitLoadValueFromPtr(emitter, state, agg_ty, scratch, agg_lay.alignBytes(), null, 0, 0, 0);
@@ -7535,7 +10450,136 @@ fn emitAggregateMakeLlvm(
     );
 }
 
-/// Emits `MirOp.intrinsic_op` across all 38 surface and internal intrinsics (`DR-19`, `phase7_spec.md` §3).
+/// Extracts a compile-time constant `u64` `MemoryOrder` from `maybe_val_raw` (`5` when omitted).
+fn extractConstU64FromMirBody(body: *const MirBody, maybe_val_raw: ?u32) ?u64 {
+    const val_raw = maybe_val_raw orelse return 5;
+    const ord_inst = body.getInst(MirValueId.fromInt(val_raw));
+    if (ord_inst.op != .const_scalar or ord_inst.operands.lhs >= body.consts.items.len) return null;
+    return switch (body.consts.items[ord_inst.operands.lhs]) {
+        .int_val => |iv| if (iv < 0) 6 else @intCast(@min(@as(u128, @intCast(iv)), 6)),
+        else => null,
+    };
+}
+
+/// Extracts a compile-time constant `bool` `is_weak` flag from `maybe_val_raw` (`false` when omitted).
+fn extractConstWeakFromMirBody(body: *const MirBody, maybe_val_raw: ?u32) ?bool {
+    const val_raw = maybe_val_raw orelse return false;
+    const wk_inst = body.getInst(MirValueId.fromInt(val_raw));
+    if (wk_inst.op != .const_scalar or wk_inst.operands.lhs >= body.consts.items.len) return null;
+    return switch (body.consts.items[wk_inst.operands.lhs]) {
+        .bool_val => |bv| bv,
+        .int_val => |iv| iv != 0,
+        else => null,
+    };
+}
+
+/// Coerces a runtime `is_weak` operand (`bool` or integer) to an `i1` SSA token.
+fn emitCoerceWeakToI1Llvm(
+    emitter: *LlvmModuleEmitter,
+    state: *BodyEmitState,
+    body: *const MirBody,
+    val_raw: u32,
+) ![]u8 {
+    const wk_ty = try unwrapTransparentType(emitter, body.getInst(MirValueId.fromInt(val_raw)).type_id);
+    if (wk_ty == .bool_ty) {
+        return std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{val_raw});
+    }
+    const wk_info = resolveIntegerInfo(emitter, wk_ty) orelse
+        IntScalarInfo{ .bits = 8, .is_signed = false };
+    const tmp_id = state.nextTmp();
+    try state.print(
+        "  %_awk_{d} = icmp ne i{d} %_v_{d}, 0\n",
+        .{ tmp_id, wk_info.bits, val_raw },
+    );
+    return std.fmt.allocPrint(emitter.allocator, "%_awk_{d}", .{tmp_id});
+}
+
+/// Maps `MemoryOrder` (`0..5`) to the legal LLVM IR ordering keyword (`""` for relaxed `fence`).
+fn resolveLlvmAtomicOrderKeyword(ord_val: u64, op_class: AtomicOpClass) ?[]const u8 {
+    if (ord_val > 5) return null;
+    return switch (op_class) {
+        .fence_op => switch (ord_val) {
+            0 => "",
+            1, 2 => "acquire",
+            3 => "release",
+            4 => "acq_rel",
+            else => "seq_cst",
+        },
+        .load_op => switch (ord_val) {
+            0, 3 => "monotonic",
+            1, 2, 4 => "acquire",
+            else => "seq_cst",
+        },
+        .store_op => switch (ord_val) {
+            0, 1, 2 => "monotonic",
+            3, 4 => "release",
+            else => "seq_cst",
+        },
+        .rmw_op => switch (ord_val) {
+            0 => "monotonic",
+            1, 2 => "acquire",
+            3 => "release",
+            4 => "acq_rel",
+            else => "seq_cst",
+        },
+    };
+}
+
+/// Maps `(succ_ord, fail_ord)` (`0..5`) to the canonical 0..8 LLVM `cmpxchg` ordering pair index.
+fn resolveLlvmCmpxchgPairIndex(succ_ord: u64, fail_ord: u64) ?u8 {
+    if (succ_ord > 5 or fail_ord > 5) return null;
+    if (fail_ord == 5) return 8;
+    if (fail_ord == 1 or fail_ord == 2 or fail_ord == 4) {
+        if (succ_ord == 5) return 7;
+        if (succ_ord >= 3) return 6;
+        return 5;
+    }
+    return @intCast(switch (succ_ord) {
+        0 => @as(u8, 0),
+        1, 2 => @as(u8, 1),
+        3 => @as(u8, 2),
+        4 => @as(u8, 3),
+        else => @as(u8, 4),
+    });
+}
+
+/// Canonical `(succ_kw, fail_kw)` table indexed by `resolveLlvmCmpxchgPairIndex` (`0..8`).
+const CMPXCHG_ORDER_PAIRS: [9]struct { succ_kw: []const u8, fail_kw: []const u8 } = .{
+    .{ .succ_kw = "monotonic", .fail_kw = "monotonic" },
+    .{ .succ_kw = "acquire", .fail_kw = "monotonic" },
+    .{ .succ_kw = "release", .fail_kw = "monotonic" },
+    .{ .succ_kw = "acq_rel", .fail_kw = "monotonic" },
+    .{ .succ_kw = "seq_cst", .fail_kw = "monotonic" },
+    .{ .succ_kw = "acquire", .fail_kw = "acquire" },
+    .{ .succ_kw = "acq_rel", .fail_kw = "acquire" },
+    .{ .succ_kw = "seq_cst", .fail_kw = "acquire" },
+    .{ .succ_kw = "seq_cst", .fail_kw = "seq_cst" },
+};
+
+/// Coerces a runtime `MemoryOrder` operand (`u8` / integer) to an `i32` SSA token.
+fn emitCoerceOrderToI32Llvm(
+    emitter: *LlvmModuleEmitter,
+    state: *BodyEmitState,
+    body: *const MirBody,
+    maybe_val_raw: ?u32,
+) ![]u8 {
+    const val_raw = maybe_val_raw orelse return emitter.allocator.dupe(u8, "5");
+    const ord_ty = body.getInst(MirValueId.fromInt(val_raw)).type_id;
+    const ord_info = resolveIntegerInfo(emitter, ord_ty) orelse
+        IntScalarInfo{ .bits = 8, .is_signed = false };
+    if (ord_info.bits == 32) {
+        return std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{val_raw});
+    }
+    const tmp_id = state.nextTmp();
+    const cast_op = if (ord_info.bits < 32) "zext" else "trunc";
+    try state.print(
+        "  %_ao32_{d} = {s} i{d} %_v_{d} to i32\n",
+        .{ tmp_id, cast_op, ord_info.bits, val_raw },
+    );
+    return std.fmt.allocPrint(emitter.allocator, "%_ao32_{d}", .{tmp_id});
+}
+
+/// Emits `MirOp.intrinsic_op` across all surface and internal intrinsics (`DR-19`, `DR-22`).
 fn emitIntrinsicOpLlvm(
     emitter: *LlvmModuleEmitter,
     state: *BodyEmitState,
@@ -7575,34 +10619,39 @@ fn emitIntrinsicOpLlvm(
 
         .derive_debug_fmt => {
             if (args.len >= 1) {
-                var name_buf: [256]u8 = undefined;
-                const arg_ty = body.getInst(MirValueId.fromInt(args[0])).type_id;
-                const rendered = emitter.input.pool.formatType(arg_ty, emitter.input.sym_table, &name_buf);
-                if (rendered.len == 0) {
-                    const tmp_id = state.nextTmp();
-                    try state.print(
-                        "  %_ddf0_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr inttoptr ({s} 1 to ptr), 0\n" ++
-                            "  %_v_{d} = insertvalue {{ ptr, {s} }} %_ddf0_{d}, {s} 0, 1\n",
-                        .{ tmp_id, ptr_int, ptr_int, dst_raw, ptr_int, tmp_id, ptr_int },
+                const arg_ty = try unwrapTransparentType(
+                    emitter,
+                    body.getInst(MirValueId.fromInt(args[0])).type_id,
+                );
+                const val_ptr: []u8 = if (try isZeroSizedType(emitter, arg_ty))
+                    try std.fmt.allocPrint(emitter.allocator, "inttoptr ({s} 1 to ptr)", .{ptr_int})
+                else blk: {
+                    const arg_lay = try emitter.resolver.resolveType(arg_ty);
+                    const slot = try state.allocEntryBytes(arg_lay.size_bytes, arg_lay.alignBytes());
+                    const src_ssa = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
+                    defer emitter.allocator.free(src_ssa);
+                    try emitStoreValueToPtr(
+                        emitter,
+                        state,
+                        arg_ty,
+                        src_ssa,
+                        slot,
+                        arg_lay.alignBytes(),
+                        0,
+                        0,
+                        0,
                     );
-                } else {
-                    const sid = emitter.nextSynthGlobalId();
-                    const hdr_s = try std.fmt.allocPrint(
-                        emitter.allocator,
-                        "@_cx_dbg_{d} = private unnamed_addr constant [{d} x i8] ",
-                        .{ sid, rendered.len },
-                    );
-                    defer emitter.allocator.free(hdr_s);
-                    try emitter.synth_globals.appendSlice(emitter.allocator, hdr_s);
-                    try appendByteStringLiteralToBuf(emitter.allocator, &emitter.synth_globals, rendered);
-                    try emitter.synth_globals.appendSlice(emitter.allocator, ", align 1\n");
-                    const tmp_id = state.nextTmp();
-                    try state.print(
-                        "  %_ddf0_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr @_cx_dbg_{d}, 0\n" ++
-                            "  %_v_{d} = insertvalue {{ ptr, {s} }} %_ddf0_{d}, {s} {d}, 1\n",
-                        .{ tmp_id, ptr_int, sid, dst_raw, ptr_int, tmp_id, ptr_int, rendered.len },
-                    );
-                }
+                    break :blk slot;
+                };
+                defer emitter.allocator.free(val_ptr);
+                const buf_slot = try state.allocEntryBytes(24, 8);
+                defer emitter.allocator.free(buf_slot);
+                try state.print(
+                    "  store {{ ptr, i64, i64 }} zeroinitializer, ptr {s}, align 8\n" ++
+                        "  call void @_cx_fmt_ty_{d}(ptr {s}, ptr {s}, i32 134217728, i32 -1)\n" ++
+                        "  %_v_{d} = call {{ ptr, {s} }} @_cx_rt_buf_finish(ptr {s})\n",
+                    .{ buf_slot, arg_ty.toU32(), buf_slot, val_ptr, dst_raw, ptr_int, buf_slot },
+                );
             } else {
                 try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
             }
@@ -8155,8 +11204,44 @@ fn emitIntrinsicOpLlvm(
         },
 
         .atomic_fence => {
-            try state.writeAll("  fence seq_cst\n");
-            try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+            const maybe_ord = if (args.len >= 1) args[0] else null;
+            if (extractConstU64FromMirBody(body, maybe_ord)) |const_ord| {
+                const ord_kw = resolveLlvmAtomicOrderKeyword(const_ord, .fence_op) orelse {
+                    try state.writeAll("  call void @_cx_rt_trap(i32 3)\n");
+                    try emitUnreachableAndDeadBlock(emitter, state, dst_raw);
+                    return;
+                };
+                if (ord_kw.len > 0) {
+                    try state.print("  fence {s}\n", .{ord_kw});
+                }
+                try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+            } else {
+                const ord32 = try emitCoerceOrderToI32Llvm(emitter, state, body, maybe_ord);
+                defer emitter.allocator.free(ord32);
+                const tmp_id = state.nextTmp();
+                try state.print(
+                    "  switch i32 {s}, label %_af_bad_{d} [\n" ++
+                        "    i32 0, label %_af_jn_{d}\n" ++
+                        "    i32 1, label %_af_ac_{d}\n" ++
+                        "    i32 2, label %_af_ac_{d}\n" ++
+                        "    i32 3, label %_af_rl_{d}\n" ++
+                        "    i32 4, label %_af_ar_{d}\n" ++
+                        "    i32 5, label %_af_sc_{d}\n" ++
+                        "  ]\n" ++
+                        "_af_ac_{d}:\n  fence acquire\n  br label %_af_jn_{d}\n" ++
+                        "_af_rl_{d}:\n  fence release\n  br label %_af_jn_{d}\n" ++
+                        "_af_ar_{d}:\n  fence acq_rel\n  br label %_af_jn_{d}\n" ++
+                        "_af_sc_{d}:\n  fence seq_cst\n  br label %_af_jn_{d}\n" ++
+                        "_af_bad_{d}:\n  call void @_cx_rt_trap(i32 3)\n  unreachable\n" ++
+                        "_af_jn_{d}:\n  %_v_{d} = add i8 0, 0\n",
+                    .{
+                        ord32,  tmp_id, tmp_id,  tmp_id, tmp_id, tmp_id, tmp_id, tmp_id,
+                        tmp_id, tmp_id, tmp_id,  tmp_id, tmp_id, tmp_id, tmp_id, tmp_id,
+                        tmp_id, tmp_id, dst_raw,
+                    },
+                );
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_af_jn_{d}", .{tmp_id}));
+            }
         },
 
         .atomic_load => {
@@ -8166,21 +11251,85 @@ fn emitIntrinsicOpLlvm(
             }
             const dst_ty = try unwrapTransparentType(emitter, inst.type_id);
             const lay = try emitter.resolver.resolveType(dst_ty);
-            if (dst_ty == .bool_ty) {
+            const val_align = @max(lay.alignBytes(), 1);
+            const maybe_ord = if (args.len >= 2) args[1] else null;
+
+            if (extractConstU64FromMirBody(body, maybe_ord)) |const_ord| {
+                const ord_kw = resolveLlvmAtomicOrderKeyword(const_ord, .load_op) orelse {
+                    try state.writeAll("  call void @_cx_rt_trap(i32 3)\n");
+                    try emitUnreachableAndDeadBlock(emitter, state, dst_raw);
+                    return;
+                };
+                if (dst_ty == .bool_ty) {
+                    const tmp_id = state.nextTmp();
+                    try state.print(
+                        "  %_ald8_{d} = load atomic i8, ptr %_v_{d} {s}, align 1\n" ++
+                            "  %_alda_{d} = and i8 %_ald8_{d}, 1\n" ++
+                            "  %_v_{d} = trunc i8 %_alda_{d} to i1\n",
+                        .{ tmp_id, args[0], ord_kw, tmp_id, tmp_id, dst_raw, tmp_id },
+                    );
+                } else {
+                    const val_ty = try formatLlvmValueType(emitter, dst_ty);
+                    defer emitter.allocator.free(val_ty);
+                    try state.print(
+                        "  %_v_{d} = load atomic {s}, ptr %_v_{d} {s}, align {d}\n",
+                        .{ dst_raw, val_ty, args[0], ord_kw, val_align },
+                    );
+                }
+            } else {
+                const ord32 = try emitCoerceOrderToI32Llvm(emitter, state, body, maybe_ord);
+                defer emitter.allocator.free(ord32);
+                const res_slot = try state.allocEntryBytes(@max(lay.size_bytes, 1), val_align);
+                defer emitter.allocator.free(res_slot);
                 const tmp_id = state.nextTmp();
                 try state.print(
-                    "  %_ald8_{d} = load atomic i8, ptr %_v_{d} seq_cst, align 1\n" ++
-                        "  %_alda_{d} = and i8 %_ald8_{d}, 1\n" ++
-                        "  %_v_{d} = trunc i8 %_alda_{d} to i1\n",
-                    .{ tmp_id, args[0], tmp_id, tmp_id, dst_raw, tmp_id },
+                    "  switch i32 {s}, label %_ald_bad_{d} [\n" ++
+                        "    i32 0, label %_ald_c0_{d}\n" ++
+                        "    i32 3, label %_ald_c0_{d}\n" ++
+                        "    i32 1, label %_ald_c1_{d}\n" ++
+                        "    i32 2, label %_ald_c1_{d}\n" ++
+                        "    i32 4, label %_ald_c1_{d}\n" ++
+                        "    i32 5, label %_ald_c2_{d}\n" ++
+                        "  ]\n",
+                    .{ ord32, tmp_id, tmp_id, tmp_id, tmp_id, tmp_id, tmp_id, tmp_id },
                 );
-            } else {
-                const val_ty = try formatLlvmValueType(emitter, dst_ty);
+                const load_kws = [_][]const u8{ "monotonic", "acquire", "seq_cst" };
+                const val_ty = if (dst_ty == .bool_ty)
+                    try emitter.allocator.dupe(u8, "i8")
+                else
+                    try formatLlvmValueType(emitter, dst_ty);
                 defer emitter.allocator.free(val_ty);
+                const eff_align: u32 = if (dst_ty == .bool_ty) 1 else val_align;
+                for (load_kws, 0..) |ord_kw, case_i| {
+                    try state.print(
+                        "_ald_c{d}_{d}:\n" ++
+                            "  %_aldr_{d}_{d} = load atomic {s}, ptr %_v_{d} {s}, align {d}\n" ++
+                            "  store {s} %_aldr_{d}_{d}, ptr {s}, align {d}\n" ++
+                            "  br label %_ald_jn_{d}\n",
+                        .{
+                            case_i,    tmp_id, case_i, tmp_id, val_ty,   args[0],   ord_kw,
+                            eff_align, val_ty, case_i, tmp_id, res_slot, eff_align, tmp_id,
+                        },
+                    );
+                }
                 try state.print(
-                    "  %_v_{d} = load atomic {s}, ptr %_v_{d} seq_cst, align {d}\n",
-                    .{ dst_raw, val_ty, args[0], @max(lay.alignBytes(), 1) },
+                    "_ald_bad_{d}:\n  call void @_cx_rt_trap(i32 3)\n  unreachable\n_ald_jn_{d}:\n",
+                    .{ tmp_id, tmp_id },
                 );
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_ald_jn_{d}", .{tmp_id}));
+                if (dst_ty == .bool_ty) {
+                    try state.print(
+                        "  %_ald8_{d} = load i8, ptr {s}, align 1\n" ++
+                            "  %_alda_{d} = and i8 %_ald8_{d}, 1\n" ++
+                            "  %_v_{d} = trunc i8 %_alda_{d} to i1\n",
+                        .{ tmp_id, res_slot, tmp_id, tmp_id, dst_raw, tmp_id },
+                    );
+                } else {
+                    try state.print(
+                        "  %_v_{d} = load {s}, ptr {s}, align {d}\n",
+                        .{ dst_raw, val_ty, res_slot, eff_align },
+                    );
+                }
             }
         },
 
@@ -8190,22 +11339,79 @@ fn emitIntrinsicOpLlvm(
                     emitter,
                     body.getInst(MirValueId.fromInt(args[1])).type_id,
                 );
-                if (!(try isZeroSizedType(emitter, val_ty))) {
-                    const lay = try emitter.resolver.resolveType(val_ty);
-                    if (val_ty == .bool_ty) {
-                        const tmp_id = state.nextTmp();
-                        try state.print(
-                            "  %_ast8_{d} = zext i1 %_v_{d} to i8\n" ++
-                                "  store atomic i8 %_ast8_{d}, ptr %_v_{d} seq_cst, align 1\n",
-                            .{ tmp_id, args[1], tmp_id, args[0] },
-                        );
+                const maybe_ord = if (args.len >= 3) args[2] else null;
+                if (extractConstU64FromMirBody(body, maybe_ord)) |const_ord| {
+                    const ord_kw = resolveLlvmAtomicOrderKeyword(const_ord, .store_op) orelse {
+                        try state.writeAll("  call void @_cx_rt_trap(i32 3)\n");
+                        try emitUnreachableAndDeadBlock(emitter, state, dst_raw);
+                        return;
+                    };
+                    if (!(try isZeroSizedType(emitter, val_ty))) {
+                        const lay = try emitter.resolver.resolveType(val_ty);
+                        if (val_ty == .bool_ty) {
+                            const tmp_id = state.nextTmp();
+                            try state.print(
+                                "  %_ast8_{d} = zext i1 %_v_{d} to i8\n" ++
+                                    "  store atomic i8 %_ast8_{d}, ptr %_v_{d} {s}, align 1\n",
+                                .{ tmp_id, args[1], tmp_id, args[0], ord_kw },
+                            );
+                        } else {
+                            const val_llvm = try formatLlvmValueType(emitter, val_ty);
+                            defer emitter.allocator.free(val_llvm);
+                            try state.print(
+                                "  store atomic {s} %_v_{d}, ptr %_v_{d} {s}, align {d}\n",
+                                .{ val_llvm, args[1], args[0], ord_kw, @max(lay.alignBytes(), 1) },
+                            );
+                        }
+                    }
+                } else {
+                    const ord32 = try emitCoerceOrderToI32Llvm(emitter, state, body, maybe_ord);
+                    defer emitter.allocator.free(ord32);
+                    const tmp_id = state.nextTmp();
+                    if (try isZeroSizedType(emitter, val_ty)) {
+                        try state.print("  %_ast_ob_{d} = icmp ugt i32 {s}, 5\n", .{ tmp_id, ord32 });
+                        const bad_ssa = try std.fmt.allocPrint(emitter.allocator, "%_ast_ob_{d}", .{tmp_id});
+                        defer emitter.allocator.free(bad_ssa);
+                        try emitInlineTrapIfTrue(emitter, state, bad_ssa, 3);
                     } else {
-                        const val_llvm = try formatLlvmValueType(emitter, val_ty);
+                        const lay = try emitter.resolver.resolveType(val_ty);
+                        const eff_align: u32 = if (val_ty == .bool_ty) 1 else @max(lay.alignBytes(), 1);
+                        const val_llvm = if (val_ty == .bool_ty)
+                            try emitter.allocator.dupe(u8, "i8")
+                        else
+                            try formatLlvmValueType(emitter, val_ty);
                         defer emitter.allocator.free(val_llvm);
+                        const val_op = if (val_ty == .bool_ty) blk: {
+                            try state.print("  %_ast8_{d} = zext i1 %_v_{d} to i8\n", .{ tmp_id, args[1] });
+                            break :blk try std.fmt.allocPrint(emitter.allocator, "%_ast8_{d}", .{tmp_id});
+                        } else try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[1]});
+                        defer emitter.allocator.free(val_op);
+
                         try state.print(
-                            "  store atomic {s} %_v_{d}, ptr %_v_{d} seq_cst, align {d}\n",
-                            .{ val_llvm, args[1], args[0], @max(lay.alignBytes(), 1) },
+                            "  switch i32 {s}, label %_ast_bad_{d} [\n" ++
+                                "    i32 0, label %_ast_c0_{d}\n" ++
+                                "    i32 1, label %_ast_c0_{d}\n" ++
+                                "    i32 2, label %_ast_c0_{d}\n" ++
+                                "    i32 3, label %_ast_c1_{d}\n" ++
+                                "    i32 4, label %_ast_c1_{d}\n" ++
+                                "    i32 5, label %_ast_c2_{d}\n" ++
+                                "  ]\n",
+                            .{ ord32, tmp_id, tmp_id, tmp_id, tmp_id, tmp_id, tmp_id, tmp_id },
                         );
+                        const store_kws = [_][]const u8{ "monotonic", "release", "seq_cst" };
+                        for (store_kws, 0..) |ord_kw, case_i| {
+                            try state.print(
+                                "_ast_c{d}_{d}:\n" ++
+                                    "  store atomic {s} {s}, ptr %_v_{d} {s}, align {d}\n" ++
+                                    "  br label %_ast_jn_{d}\n",
+                                .{ case_i, tmp_id, val_llvm, val_op, args[0], ord_kw, eff_align, tmp_id },
+                            );
+                        }
+                        try state.print(
+                            "_ast_bad_{d}:\n  call void @_cx_rt_trap(i32 3)\n  unreachable\n_ast_jn_{d}:\n",
+                            .{ tmp_id, tmp_id },
+                        );
+                        state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_ast_jn_{d}", .{tmp_id}));
                     }
                 }
             }
@@ -8219,27 +11425,97 @@ fn emitIntrinsicOpLlvm(
             }
             const dst_ty = try unwrapTransparentType(emitter, inst.type_id);
             const lay = try emitter.resolver.resolveType(dst_ty);
+            const val_align = @max(lay.alignBytes(), 1);
             const rmw_op = switch (ikind) {
                 .atomic_rmw_add => "add",
                 .atomic_rmw_sub => "sub",
                 else => "xchg",
             };
-            if (dst_ty == .bool_ty) {
-                const tmp_id = state.nextTmp();
-                try state.print(
-                    "  %_armwb_{d} = zext i1 %_v_{d} to i8\n" ++
-                        "  %_armwr_{d} = atomicrmw {s} ptr %_v_{d}, i8 %_armwb_{d} seq_cst, align 1\n" ++
-                        "  %_armwa_{d} = and i8 %_armwr_{d}, 1\n" ++
-                        "  %_v_{d} = trunc i8 %_armwa_{d} to i1\n",
-                    .{ tmp_id, args[1], tmp_id, rmw_op, args[0], tmp_id, tmp_id, tmp_id, dst_raw, tmp_id },
-                );
+            const maybe_ord = if (args.len >= 3) args[2] else null;
+
+            if (extractConstU64FromMirBody(body, maybe_ord)) |const_ord| {
+                const ord_kw = resolveLlvmAtomicOrderKeyword(const_ord, .rmw_op) orelse {
+                    try state.writeAll("  call void @_cx_rt_trap(i32 3)\n");
+                    try emitUnreachableAndDeadBlock(emitter, state, dst_raw);
+                    return;
+                };
+                if (dst_ty == .bool_ty) {
+                    const tmp_id = state.nextTmp();
+                    try state.print(
+                        "  %_armwb_{d} = zext i1 %_v_{d} to i8\n" ++
+                            "  %_armwr_{d} = atomicrmw {s} ptr %_v_{d}, i8 %_armwb_{d} {s}, align 1\n" ++
+                            "  %_armwa_{d} = and i8 %_armwr_{d}, 1\n" ++
+                            "  %_v_{d} = trunc i8 %_armwa_{d} to i1\n",
+                        .{ tmp_id, args[1], tmp_id, rmw_op, args[0], tmp_id, ord_kw, tmp_id, tmp_id, dst_raw, tmp_id },
+                    );
+                } else {
+                    const val_llvm = try formatLlvmValueType(emitter, dst_ty);
+                    defer emitter.allocator.free(val_llvm);
+                    try state.print(
+                        "  %_v_{d} = atomicrmw {s} ptr %_v_{d}, {s} %_v_{d} {s}, align {d}\n",
+                        .{ dst_raw, rmw_op, args[0], val_llvm, args[1], ord_kw, val_align },
+                    );
+                }
             } else {
-                const val_llvm = try formatLlvmValueType(emitter, dst_ty);
+                const ord32 = try emitCoerceOrderToI32Llvm(emitter, state, body, maybe_ord);
+                defer emitter.allocator.free(ord32);
+                const eff_align: u32 = if (dst_ty == .bool_ty) 1 else val_align;
+                const res_slot = try state.allocEntryBytes(@max(lay.size_bytes, 1), eff_align);
+                defer emitter.allocator.free(res_slot);
+                const tmp_id = state.nextTmp();
+                const val_llvm = if (dst_ty == .bool_ty)
+                    try emitter.allocator.dupe(u8, "i8")
+                else
+                    try formatLlvmValueType(emitter, dst_ty);
                 defer emitter.allocator.free(val_llvm);
+                const val_op = if (dst_ty == .bool_ty) blk: {
+                    try state.print("  %_armwb_{d} = zext i1 %_v_{d} to i8\n", .{ tmp_id, args[1] });
+                    break :blk try std.fmt.allocPrint(emitter.allocator, "%_armwb_{d}", .{tmp_id});
+                } else try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[1]});
+                defer emitter.allocator.free(val_op);
+
                 try state.print(
-                    "  %_v_{d} = atomicrmw {s} ptr %_v_{d}, {s} %_v_{d} seq_cst, align {d}\n",
-                    .{ dst_raw, rmw_op, args[0], val_llvm, args[1], @max(lay.alignBytes(), 1) },
+                    "  switch i32 {s}, label %_arm_bad_{d} [\n" ++
+                        "    i32 0, label %_arm_c0_{d}\n" ++
+                        "    i32 1, label %_arm_c1_{d}\n" ++
+                        "    i32 2, label %_arm_c1_{d}\n" ++
+                        "    i32 3, label %_arm_c2_{d}\n" ++
+                        "    i32 4, label %_arm_c3_{d}\n" ++
+                        "    i32 5, label %_arm_c4_{d}\n" ++
+                        "  ]\n",
+                    .{ ord32, tmp_id, tmp_id, tmp_id, tmp_id, tmp_id, tmp_id, tmp_id },
                 );
+                const rmw_kws = [_][]const u8{ "monotonic", "acquire", "release", "acq_rel", "seq_cst" };
+                for (rmw_kws, 0..) |ord_kw, case_i| {
+                    try state.print(
+                        "_arm_c{d}_{d}:\n" ++
+                            "  %_armr_{d}_{d} = atomicrmw {s} ptr %_v_{d}, {s} {s} {s}, align {d}\n" ++
+                            "  store {s} %_armr_{d}_{d}, ptr {s}, align {d}\n" ++
+                            "  br label %_arm_jn_{d}\n",
+                        .{
+                            case_i, tmp_id,    case_i,   tmp_id, rmw_op, args[0],  val_llvm,  val_op,
+                            ord_kw, eff_align, val_llvm, case_i, tmp_id, res_slot, eff_align, tmp_id,
+                        },
+                    );
+                }
+                try state.print(
+                    "_arm_bad_{d}:\n  call void @_cx_rt_trap(i32 3)\n  unreachable\n_arm_jn_{d}:\n",
+                    .{ tmp_id, tmp_id },
+                );
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_arm_jn_{d}", .{tmp_id}));
+                if (dst_ty == .bool_ty) {
+                    try state.print(
+                        "  %_armwr_{d} = load i8, ptr {s}, align 1\n" ++
+                            "  %_armwa_{d} = and i8 %_armwr_{d}, 1\n" ++
+                            "  %_v_{d} = trunc i8 %_armwa_{d} to i1\n",
+                        .{ tmp_id, res_slot, tmp_id, tmp_id, dst_raw, tmp_id },
+                    );
+                } else {
+                    try state.print(
+                        "  %_v_{d} = load {s}, ptr {s}, align {d}\n",
+                        .{ dst_raw, val_llvm, res_slot, eff_align },
+                    );
+                }
             }
         },
 
@@ -8253,48 +11529,272 @@ fn emitIntrinsicOpLlvm(
                 body.getInst(MirValueId.fromInt(args[1])).type_id,
             );
             const val_lay = try emitter.resolver.resolveType(val_ty);
+            const eff_align: u32 = if (val_ty == .bool_ty) 1 else @max(val_lay.alignBytes(), 1);
             const tup_ty = try unwrapTransparentType(emitter, inst.type_id);
             const tup_lay = try emitter.resolver.resolveType(tup_ty);
             const tmp_id = state.nextTmp();
 
-            const old_ssa: []u8 = blk: {
+            const const_succ = extractConstU64FromMirBody(body, if (args.len >= 4) args[3] else null);
+            const const_fail = if (args.len >= 5) extractConstU64FromMirBody(body, args[4]) else const_succ;
+            const const_weak = extractConstWeakFromMirBody(body, if (args.len >= 6) args[5] else null);
+
+            if (const_succ != null and const_fail != null and const_weak != null) {
+                const pair_idx = resolveLlvmCmpxchgPairIndex(const_succ.?, const_fail.?) orelse {
+                    try state.writeAll("  call void @_cx_rt_trap(i32 3)\n");
+                    try emitUnreachableAndDeadBlock(emitter, state, dst_raw);
+                    return;
+                };
+                const pair = CMPXCHG_ORDER_PAIRS[pair_idx];
+                const cx_kw = if (const_weak.?) "cmpxchg weak" else "cmpxchg";
                 if (val_ty == .bool_ty) {
                     try state.print(
                         "  %_cx_e8_{d} = zext i1 %_v_{d} to i8\n" ++
                             "  %_cx_d8_{d} = zext i1 %_v_{d} to i8\n" ++
-                            "  %_cx_pr_{d} = cmpxchg ptr %_v_{d}, i8 %_cx_e8_{d}, i8 %_cx_d8_{d} seq_cst seq_cst, align 1\n" ++
+                            "  %_cx_pr_{d} = {s} ptr %_v_{d}, i8 %_cx_e8_{d}, i8 %_cx_d8_{d} {s} {s}, align 1\n" ++
                             "  %_cx_o8_{d} = extractvalue {{ i8, i1 }} %_cx_pr_{d}, 0\n" ++
                             "  %_cx_oa_{d} = and i8 %_cx_o8_{d}, 1\n" ++
                             "  %_cx_old_{d} = trunc i8 %_cx_oa_{d} to i1\n" ++
                             "  %_cx_ok_{d} = extractvalue {{ i8, i1 }} %_cx_pr_{d}, 1\n",
                         .{
-                            tmp_id, args[1],
-                            tmp_id, args[2],
-                            tmp_id, args[0],
-                            tmp_id, tmp_id,
-                            tmp_id, tmp_id,
-                            tmp_id, tmp_id,
-                            tmp_id, tmp_id,
-                            tmp_id, tmp_id,
+                            tmp_id,       args[1],
+                            tmp_id,       args[2],
+                            tmp_id,       cx_kw,
+                            args[0],      tmp_id,
+                            tmp_id,       pair.succ_kw,
+                            pair.fail_kw, tmp_id,
+                            tmp_id,       tmp_id,
+                            tmp_id,       tmp_id,
+                            tmp_id,       tmp_id,
+                            tmp_id,
                         },
                     );
-                    break :blk try std.fmt.allocPrint(emitter.allocator, "%_cx_old_{d}", .{tmp_id});
+                } else {
+                    const val_llvm = try formatLlvmValueType(emitter, val_ty);
+                    defer emitter.allocator.free(val_llvm);
+                    try state.print(
+                        "  %_cx_pr_{d} = {s} ptr %_v_{d}, {s} %_v_{d}, {s} %_v_{d} {s} {s}, align {d}\n" ++
+                            "  %_cx_old_{d} = extractvalue {{ {s}, i1 }} %_cx_pr_{d}, 0\n" ++
+                            "  %_cx_ok_{d} = extractvalue {{ {s}, i1 }} %_cx_pr_{d}, 1\n",
+                        .{
+                            tmp_id,  cx_kw,        args[0],      val_llvm,  args[1], val_llvm,
+                            args[2], pair.succ_kw, pair.fail_kw, eff_align, tmp_id,  val_llvm,
+                            tmp_id,  tmp_id,       val_llvm,     tmp_id,
+                        },
+                    );
                 }
-                const val_llvm = try formatLlvmValueType(emitter, val_ty);
-                defer emitter.allocator.free(val_llvm);
-                try state.print(
-                    "  %_cx_pr_{d} = cmpxchg ptr %_v_{d}, {s} %_v_{d}, {s} %_v_{d} seq_cst seq_cst, align {d}\n" ++
-                        "  %_cx_old_{d} = extractvalue {{ {s}, i1 }} %_cx_pr_{d}, 0\n" ++
-                        "  %_cx_ok_{d} = extractvalue {{ {s}, i1 }} %_cx_pr_{d}, 1\n",
-                    .{
-                        tmp_id, args[0],  val_llvm, args[1], val_llvm, args[2], @max(val_lay.alignBytes(), 1),
-                        tmp_id, val_llvm, tmp_id,   tmp_id,  val_llvm, tmp_id,
-                    },
-                );
-                break :blk try std.fmt.allocPrint(emitter.allocator, "%_cx_old_{d}", .{tmp_id});
-            };
-            defer emitter.allocator.free(old_ssa);
+            } else {
+                if (const_succ != null and const_fail != null) {
+                    if (resolveLlvmCmpxchgPairIndex(const_succ.?, const_fail.?) == null) {
+                        try state.writeAll("  call void @_cx_rt_trap(i32 3)\n");
+                        try emitUnreachableAndDeadBlock(emitter, state, dst_raw);
+                        return;
+                    }
+                }
+                const old_slot = try state.allocEntryBytes(@max(val_lay.size_bytes, 1), eff_align);
+                defer emitter.allocator.free(old_slot);
+                const ok_slot = try state.allocEntryBytes(1, 1);
+                defer emitter.allocator.free(ok_slot);
 
+                const val_llvm = if (val_ty == .bool_ty)
+                    try emitter.allocator.dupe(u8, "i8")
+                else
+                    try formatLlvmValueType(emitter, val_ty);
+                defer emitter.allocator.free(val_llvm);
+
+                const exp_op = if (val_ty == .bool_ty) blk: {
+                    try state.print("  %_cx_e8_{d} = zext i1 %_v_{d} to i8\n", .{ tmp_id, args[1] });
+                    break :blk try std.fmt.allocPrint(emitter.allocator, "%_cx_e8_{d}", .{tmp_id});
+                } else try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[1]});
+                defer emitter.allocator.free(exp_op);
+
+                const des_op = if (val_ty == .bool_ty) blk: {
+                    try state.print("  %_cx_d8_{d} = zext i1 %_v_{d} to i8\n", .{ tmp_id, args[2] });
+                    break :blk try std.fmt.allocPrint(emitter.allocator, "%_cx_d8_{d}", .{tmp_id});
+                } else try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[2]});
+                defer emitter.allocator.free(des_op);
+
+                if (const_succ != null and const_fail != null) {
+                    const pair = CMPXCHG_ORDER_PAIRS[resolveLlvmCmpxchgPairIndex(const_succ.?, const_fail.?).?];
+                    const weak_i1 = try emitCoerceWeakToI1Llvm(emitter, state, body, args[5]);
+                    defer emitter.allocator.free(weak_i1);
+                    try state.print(
+                        "  br i1 {s}, label %_acx_wk_{d}, label %_acx_st_{d}\n" ++
+                            "_acx_wk_{d}:\n" ++
+                            "  %_acxpw_{d} = cmpxchg weak ptr %_v_{d}, {s} {s}, {s} {s} {s} {s}, align {d}\n" ++
+                            "  %_acxow_{d} = extractvalue {{ {s}, i1 }} %_acxpw_{d}, 0\n" ++
+                            "  %_acxkw_{d} = extractvalue {{ {s}, i1 }} %_acxpw_{d}, 1\n" ++
+                            "  %_acxzw_{d} = zext i1 %_acxkw_{d} to i8\n" ++
+                            "  store {s} %_acxow_{d}, ptr {s}, align {d}\n" ++
+                            "  store i8 %_acxzw_{d}, ptr {s}, align 1\n" ++
+                            "  br label %_acx_jn_{d}\n",
+                        .{
+                            weak_i1,   tmp_id, tmp_id,   tmp_id,   tmp_id,       args[0],
+                            val_llvm,  exp_op, val_llvm, des_op,   pair.succ_kw, pair.fail_kw,
+                            eff_align, tmp_id, val_llvm, tmp_id,   tmp_id,       val_llvm,
+                            tmp_id,    tmp_id, tmp_id,   val_llvm, tmp_id,       old_slot,
+                            eff_align, tmp_id, ok_slot,  tmp_id,
+                        },
+                    );
+                    try state.print(
+                        "_acx_st_{d}:\n" ++
+                            "  %_acxps_{d} = cmpxchg ptr %_v_{d}, {s} {s}, {s} {s} {s} {s}, align {d}\n" ++
+                            "  %_acxos_{d} = extractvalue {{ {s}, i1 }} %_acxps_{d}, 0\n" ++
+                            "  %_acxks_{d} = extractvalue {{ {s}, i1 }} %_acxps_{d}, 1\n" ++
+                            "  %_acxzs_{d} = zext i1 %_acxks_{d} to i8\n" ++
+                            "  store {s} %_acxos_{d}, ptr {s}, align {d}\n" ++
+                            "  store i8 %_acxzs_{d}, ptr {s}, align 1\n" ++
+                            "  br label %_acx_jn_{d}\n" ++
+                            "_acx_jn_{d}:\n",
+                        .{
+                            tmp_id,   tmp_id,       args[0],      val_llvm,  exp_op, val_llvm,
+                            des_op,   pair.succ_kw, pair.fail_kw, eff_align, tmp_id, val_llvm,
+                            tmp_id,   tmp_id,       val_llvm,     tmp_id,    tmp_id, tmp_id,
+                            val_llvm, tmp_id,       old_slot,     eff_align, tmp_id, ok_slot,
+                            tmp_id,   tmp_id,
+                        },
+                    );
+                } else {
+                    const succ32 = try emitCoerceOrderToI32Llvm(
+                        emitter,
+                        state,
+                        body,
+                        if (args.len >= 4) args[3] else null,
+                    );
+                    defer emitter.allocator.free(succ32);
+                    const fail32 = if (args.len >= 5)
+                        try emitCoerceOrderToI32Llvm(emitter, state, body, args[4])
+                    else
+                        try emitter.allocator.dupe(u8, succ32);
+                    defer emitter.allocator.free(fail32);
+
+                    try state.print(
+                        "  %_cx_bs_{d} = icmp ugt i32 {s}, 5\n" ++
+                            "  %_cx_bf_{d} = icmp ugt i32 {s}, 5\n" ++
+                            "  %_cx_bo_{d} = or i1 %_cx_bs_{d}, %_cx_bf_{d}\n",
+                        .{ tmp_id, succ32, tmp_id, fail32, tmp_id, tmp_id, tmp_id },
+                    );
+                    const bad_ord_ssa = try std.fmt.allocPrint(emitter.allocator, "%_cx_bo_{d}", .{tmp_id});
+                    defer emitter.allocator.free(bad_ord_ssa);
+                    try emitInlineTrapIfTrue(emitter, state, bad_ord_ssa, 3);
+
+                    if (const_weak == null) {
+                        const weak_i1 = try emitCoerceWeakToI1Llvm(emitter, state, body, args[5]);
+                        defer emitter.allocator.free(weak_i1);
+                        try state.print(
+                            "  %_cx_fm6_{d} = mul i32 {s}, 6\n" ++
+                                "  %_cx_cmb0_{d} = add i32 %_cx_fm6_{d}, {s}\n" ++
+                                "  %_cx_wo_{d} = select i1 {s}, i32 36, i32 0\n" ++
+                                "  %_cx_cmb_{d} = add i32 %_cx_cmb0_{d}, %_cx_wo_{d}\n" ++
+                                "  switch i32 %_cx_cmb_{d}, label %_acx_bad_{d} [\n",
+                            .{
+                                tmp_id,  fail32, tmp_id, tmp_id, succ32, tmp_id,
+                                weak_i1, tmp_id, tmp_id, tmp_id, tmp_id, tmp_id,
+                            },
+                        );
+                    } else {
+                        try state.print(
+                            "  %_cx_fm6_{d} = mul i32 {s}, 6\n" ++
+                                "  %_cx_cmb_{d} = add i32 %_cx_fm6_{d}, {s}\n" ++
+                                "  switch i32 %_cx_cmb_{d}, label %_acx_bad_{d} [\n",
+                            .{ tmp_id, fail32, tmp_id, tmp_id, succ32, tmp_id, tmp_id },
+                        );
+                    }
+                    var fail_k: u64 = 0;
+                    while (fail_k <= 5) : (fail_k += 1) {
+                        var succ_k: u64 = 0;
+                        while (succ_k <= 5) : (succ_k += 1) {
+                            const pair_idx = resolveLlvmCmpxchgPairIndex(succ_k, fail_k).?;
+                            try state.print(
+                                "    i32 {d}, label %_acx_c{d}_{d}\n",
+                                .{ fail_k * 6 + succ_k, pair_idx, tmp_id },
+                            );
+                            if (const_weak == null) {
+                                try state.print(
+                                    "    i32 {d}, label %_acx_cw{d}_{d}\n",
+                                    .{ 36 + fail_k * 6 + succ_k, pair_idx, tmp_id },
+                                );
+                            }
+                        }
+                    }
+                    try state.writeAll("  ]\n");
+                    const base_cx_kw = if (const_weak != null and const_weak.?) "cmpxchg weak" else "cmpxchg";
+                    for (CMPXCHG_ORDER_PAIRS, 0..) |pair, case_i| {
+                        try state.print(
+                            "_acx_c{d}_{d}:\n" ++
+                                "  %_acxp_{d}_{d} = {s} ptr %_v_{d}, {s} {s}, {s} {s} {s} {s}, align {d}\n" ++
+                                "  %_acxo_{d}_{d} = extractvalue {{ {s}, i1 }} %_acxp_{d}_{d}, 0\n" ++
+                                "  %_acxk_{d}_{d} = extractvalue {{ {s}, i1 }} %_acxp_{d}_{d}, 1\n",
+                            .{
+                                case_i,    tmp_id, case_i,   tmp_id,   base_cx_kw,   args[0],
+                                val_llvm,  exp_op, val_llvm, des_op,   pair.succ_kw, pair.fail_kw,
+                                eff_align, case_i, tmp_id,   val_llvm, case_i,       tmp_id,
+                                case_i,    tmp_id, val_llvm, case_i,   tmp_id,
+                            },
+                        );
+                        try state.print(
+                            "  %_acxz_{d}_{d} = zext i1 %_acxk_{d}_{d} to i8\n" ++
+                                "  store {s} %_acxo_{d}_{d}, ptr {s}, align {d}\n" ++
+                                "  store i8 %_acxz_{d}_{d}, ptr {s}, align 1\n" ++
+                                "  br label %_acx_jn_{d}\n",
+                            .{
+                                case_i,   tmp_id,    case_i, tmp_id, val_llvm, case_i, tmp_id,
+                                old_slot, eff_align, case_i, tmp_id, ok_slot,  tmp_id,
+                            },
+                        );
+                        if (const_weak == null) {
+                            try state.print(
+                                "_acx_cw{d}_{d}:\n" ++
+                                    "  %_acxwp_{d}_{d} = cmpxchg weak ptr %_v_{d}, {s} {s}, {s} {s} {s} {s}, align {d}\n" ++
+                                    "  %_acxwo_{d}_{d} = extractvalue {{ {s}, i1 }} %_acxwp_{d}_{d}, 0\n" ++
+                                    "  %_acxwk_{d}_{d} = extractvalue {{ {s}, i1 }} %_acxwp_{d}_{d}, 1\n",
+                                .{
+                                    case_i, tmp_id,   case_i,   tmp_id,       args[0],      val_llvm,
+                                    exp_op, val_llvm, des_op,   pair.succ_kw, pair.fail_kw, eff_align,
+                                    case_i, tmp_id,   val_llvm, case_i,       tmp_id,       case_i,
+                                    tmp_id, val_llvm, case_i,   tmp_id,
+                                },
+                            );
+                            try state.print(
+                                "  %_acxwz_{d}_{d} = zext i1 %_acxwk_{d}_{d} to i8\n" ++
+                                    "  store {s} %_acxwo_{d}_{d}, ptr {s}, align {d}\n" ++
+                                    "  store i8 %_acxwz_{d}_{d}, ptr {s}, align 1\n" ++
+                                    "  br label %_acx_jn_{d}\n",
+                                .{
+                                    case_i,   tmp_id,    case_i, tmp_id, val_llvm, case_i, tmp_id,
+                                    old_slot, eff_align, case_i, tmp_id, ok_slot,  tmp_id,
+                                },
+                            );
+                        }
+                    }
+                    try state.print(
+                        "_acx_bad_{d}:\n  call void @_cx_rt_trap(i32 3)\n  unreachable\n_acx_jn_{d}:\n",
+                        .{ tmp_id, tmp_id },
+                    );
+                }
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_acx_jn_{d}", .{tmp_id}));
+                if (val_ty == .bool_ty) {
+                    try state.print(
+                        "  %_cx_o8_{d} = load i8, ptr {s}, align 1\n" ++
+                            "  %_cx_oa_{d} = and i8 %_cx_o8_{d}, 1\n" ++
+                            "  %_cx_old_{d} = trunc i8 %_cx_oa_{d} to i1\n",
+                        .{ tmp_id, old_slot, tmp_id, tmp_id, tmp_id, tmp_id },
+                    );
+                } else {
+                    try state.print(
+                        "  %_cx_old_{d} = load {s}, ptr {s}, align {d}\n",
+                        .{ tmp_id, val_llvm, old_slot, eff_align },
+                    );
+                }
+                try state.print(
+                    "  %_cx_kb8_{d} = load i8, ptr {s}, align 1\n" ++
+                        "  %_cx_kba_{d} = and i8 %_cx_kb8_{d}, 1\n" ++
+                        "  %_cx_ok_{d} = trunc i8 %_cx_kba_{d} to i1\n",
+                    .{ tmp_id, ok_slot, tmp_id, tmp_id, tmp_id, tmp_id },
+                );
+            }
+
+            const old_ssa = try std.fmt.allocPrint(emitter.allocator, "%_cx_old_{d}", .{tmp_id});
+            defer emitter.allocator.free(old_ssa);
             const ok_ssa = try std.fmt.allocPrint(emitter.allocator, "%_cx_ok_{d}", .{tmp_id});
             defer emitter.allocator.free(ok_ssa);
 
@@ -8404,9 +11904,10 @@ fn emitIntrinsicOpLlvm(
             };
 
             const vec_align = @max(vec_lay.alignBytes(), 16);
-            const slot_l = try state.allocEntryBytes(vec_lay.size_bytes, vec_align);
+            const vec_store_bytes = std.math.ceilPowerOfTwo(u64, @max(vec_lay.size_bytes, 1)) catch vec_lay.size_bytes;
+            const slot_l = try state.allocEntryBytes(vec_store_bytes, vec_align);
             defer emitter.allocator.free(slot_l);
-            const slot_r = try state.allocEntryBytes(vec_lay.size_bytes, vec_align);
+            const slot_r = try state.allocEntryBytes(vec_store_bytes, vec_align);
             defer emitter.allocator.free(slot_r);
             const tmp_id = state.nextTmp();
             try state.print(
@@ -8450,7 +11951,8 @@ fn emitIntrinsicOpLlvm(
             defer emitter.allocator.free(lane_llvm);
 
             const vec_align = @max(vec_lay.alignBytes(), 16);
-            const slot_v = try state.allocEntryBytes(vec_lay.size_bytes, vec_align);
+            const vec_store_bytes = std.math.ceilPowerOfTwo(u64, @max(vec_lay.size_bytes, 1)) catch vec_lay.size_bytes;
+            const slot_v = try state.allocEntryBytes(vec_store_bytes, vec_align);
             defer emitter.allocator.free(slot_v);
             const tmp_id = state.nextTmp();
             try state.print(
@@ -8534,13 +12036,37 @@ fn emitIntrinsicOpLlvm(
 
         .panic => {
             if (args.len >= 1) {
-                const span_s = try emitExtractByteSpanLlvm(emitter, state, body, MirValueId.fromInt(args[0]));
-                defer emitter.allocator.free(span_s.ptr_ssa);
-                defer emitter.allocator.free(span_s.len_ssa);
-                try state.print(
-                    "  call void @_cx_rt_panic(ptr {s}, {s} {s})\n",
-                    .{ span_s.ptr_ssa, ptr_int, span_s.len_ssa },
+                const msg_ty = try unwrapTransparentType(
+                    emitter,
+                    body.getInst(MirValueId.fromInt(args[0])).type_id,
                 );
+                if (msg_ty == .fmt_args_ty) {
+                    const fa_lay = try emitter.resolver.resolveType(.fmt_args_ty);
+                    const fa_slot = try state.allocEntryBytes(fa_lay.size_bytes, fa_lay.alignBytes());
+                    defer emitter.allocator.free(fa_slot);
+                    const src_ssa = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
+                    defer emitter.allocator.free(src_ssa);
+                    try emitStoreValueToPtr(
+                        emitter,
+                        state,
+                        .fmt_args_ty,
+                        src_ssa,
+                        fa_slot,
+                        fa_lay.alignBytes(),
+                        0,
+                        0,
+                        0,
+                    );
+                    try state.print("  call void @_cx_rt_panic_fmt_args(ptr {s})\n", .{fa_slot});
+                } else {
+                    const span_s = try emitExtractByteSpanLlvm(emitter, state, body, MirValueId.fromInt(args[0]));
+                    defer emitter.allocator.free(span_s.ptr_ssa);
+                    defer emitter.allocator.free(span_s.len_ssa);
+                    try state.print(
+                        "  call void @_cx_rt_panic(ptr {s}, {s} {s})\n",
+                        .{ span_s.ptr_ssa, ptr_int, span_s.len_ssa },
+                    );
+                }
             } else {
                 try state.print("  call void @_cx_rt_panic(ptr null, {s} 0)\n", .{ptr_int});
             }
@@ -8712,9 +12238,9 @@ fn emitIntrinsicOpLlvm(
                     "  %_sm_ptr_{d} = getelementptr i8, ptr {s}, {s} %_sm_off_{d}\n" ++
                     "  %_sm_len_{d} = sub {s} {s}, {s}\n",
                 .{
-                    tmp_id, ptr_int, lo_ssa,        elem_stride,
+                    tmp_id, ptr_int,       lo_ssa,  elem_stride,
                     tmp_id, base_data_ptr, ptr_int, tmp_id,
-                    tmp_id, ptr_int, hi_ssa,        lo_ssa,
+                    tmp_id, ptr_int,       hi_ssa,  lo_ssa,
                 },
             );
             if (is_ref_dst) {
@@ -8729,10 +12255,10 @@ fn emitIntrinsicOpLlvm(
                         "  store {s} %_sm_len_{d}, ptr %_sm_lp_{d}, align {d}\n" ++
                         "  %_v_{d} = select i1 true, ptr {s}, ptr {s}\n",
                     .{
-                        tmp_id,                         fat_slot, emitter.cfg.target.ptrBytes(),
-                        tmp_id,                         ptr_int,  fat_slot,
-                        ptr_int,                        tmp_id,   tmp_id,
-                        emitter.cfg.target.ptrBytes(),  dst_raw,  fat_slot,
+                        tmp_id,                        fat_slot, emitter.cfg.target.ptrBytes(),
+                        tmp_id,                        ptr_int,  fat_slot,
+                        ptr_int,                       tmp_id,   tmp_id,
+                        emitter.cfg.target.ptrBytes(), dst_raw,  fat_slot,
                         fat_slot,
                     },
                 );
@@ -8907,6 +12433,49 @@ fn emitIntrinsicOpLlvm(
 
         .ghost_ctx_region_push, .ghost_ctx_region_pop => {
             try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+        },
+
+        .fmt_value => {
+            if (args.len >= 3) {
+                const val_ty = try unwrapTransparentType(
+                    emitter,
+                    body.getInst(MirValueId.fromInt(args[0])).type_id,
+                );
+                const val_ptr: []u8 = if (try isZeroSizedType(emitter, val_ty))
+                    try std.fmt.allocPrint(emitter.allocator, "inttoptr ({s} 1 to ptr)", .{ptr_int})
+                else blk: {
+                    const val_lay = try emitter.resolver.resolveType(val_ty);
+                    const slot = try state.allocEntryBytes(val_lay.size_bytes, val_lay.alignBytes());
+                    const src_ssa = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
+                    defer emitter.allocator.free(src_ssa);
+                    try emitStoreValueToPtr(
+                        emitter,
+                        state,
+                        val_ty,
+                        src_ssa,
+                        slot,
+                        val_lay.alignBytes(),
+                        0,
+                        0,
+                        0,
+                    );
+                    break :blk slot;
+                };
+                defer emitter.allocator.free(val_ptr);
+                const buf_slot = try state.allocEntryBytes(24, 8);
+                defer emitter.allocator.free(buf_slot);
+                try state.print(
+                    "  store {{ ptr, i64, i64 }} zeroinitializer, ptr {s}, align 8\n" ++
+                        "  call void @_cx_fmt_ty_{d}(ptr {s}, ptr {s}, i32 %_v_{d}, i32 %_v_{d})\n" ++
+                        "  %_v_{d} = call {{ ptr, {s} }} @_cx_rt_buf_finish(ptr {s})\n",
+                    .{ buf_slot, val_ty.toU32(), buf_slot, val_ptr, args[1], args[2], dst_raw, ptr_int, buf_slot },
+                );
+            } else {
+                try state.print(
+                    "  %_v_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr inttoptr ({s} 1 to ptr), 0\n",
+                    .{ dst_raw, ptr_int, ptr_int },
+                );
+            }
         },
     }
 }
@@ -9668,6 +13237,7 @@ fn emitMirTerminatorLlvm(
             var callee_ret_ty: TypeId = call_site.ret_ty;
             var callee_sig_view: ?FnSignatureView = null;
             var is_closure_call = false;
+            var is_three_word_closure = false;
             var closure_env_ssa: ?[]u8 = null;
             defer if (closure_env_ssa) |env_s| emitter.allocator.free(env_s);
 
@@ -9721,6 +13291,8 @@ fn emitMirTerminatorLlvm(
                 callee_sig_view = emitter.input.pool.getFnSignatureView(callee_ty);
                 if (callee_sig_view) |sv| callee_ret_ty = sv.ret_ty;
                 is_closure_call = emitter.input.pool.getNode(callee_ty).tag == .closure_ty;
+                is_three_word_closure = is_closure_call and
+                    codegen_abi.isThreeWordClosureType(emitter.input.pool, callee_ty);
                 owned_recipe = try classifyFnTypeAbi(
                     emitter,
                     callee_ty,
@@ -9730,10 +13302,11 @@ fn emitMirTerminatorLlvm(
                 callee_recipe = &owned_recipe.?;
                 if (is_closure_call) {
                     const cl_id = state.nextTmp();
+                    const cl_repr = if (is_three_word_closure) "{ ptr, ptr, ptr }" else "{ ptr, ptr }";
                     try state.print(
-                        "  %_cl_env_{d} = extractvalue {{ ptr, ptr }} %_v_{d}, 0\n" ++
-                            "  %_cl_fn_{d} = extractvalue {{ ptr, ptr }} %_v_{d}, 1\n",
-                        .{ cl_id, call_site.callee_val.asInt(), cl_id, call_site.callee_val.asInt() },
+                        "  %_cl_env_{d} = extractvalue {s} %_v_{d}, 0\n" ++
+                            "  %_cl_fn_{d} = extractvalue {s} %_v_{d}, 1\n",
+                        .{ cl_id, cl_repr, call_site.callee_val.asInt(), cl_id, cl_repr, call_site.callee_val.asInt() },
                     );
                     closure_env_ssa = try std.fmt.allocPrint(emitter.allocator, "%_cl_env_{d}", .{cl_id});
                     break :blk try std.fmt.allocPrint(emitter.allocator, "%_cl_fn_{d}", .{cl_id});
@@ -9742,9 +13315,15 @@ fn emitMirTerminatorLlvm(
             };
             defer emitter.allocator.free(callee_op);
 
+            const is_variadic_call = call_site.is_c_variadic or callee_recipe.is_variadic;
+
             var call_args_buf: std.ArrayListUnmanaged(u8) = .empty;
             defer call_args_buf.deinit(emitter.allocator);
             var emitted_arg_count: usize = 0;
+
+            var fixed_param_tys: std.ArrayListUnmanaged(u8) = .empty;
+            defer fixed_param_tys.deinit(emitter.allocator);
+            var fixed_ty_count: usize = 0;
 
             var sret_slot: ?[]u8 = null;
             defer if (sret_slot) |s_ptr| emitter.allocator.free(s_ptr);
@@ -9770,6 +13349,10 @@ fn emitMirTerminatorLlvm(
                 defer emitter.allocator.free(sret_piece);
                 try call_args_buf.appendSlice(emitter.allocator, sret_piece);
                 emitted_arg_count += 1;
+                if (is_variadic_call) {
+                    try fixed_param_tys.appendSlice(emitter.allocator, "ptr");
+                    fixed_ty_count += 1;
+                }
                 sret_slot = slot;
             }
 
@@ -9777,12 +13360,17 @@ fn emitMirTerminatorLlvm(
                 if (emitted_arg_count > 0) try call_args_buf.appendSlice(emitter.allocator, ", ");
                 const env_piece = try std.fmt.allocPrint(
                     emitter.allocator,
-                    "ptr nonnull noundef {s}",
-                    .{closure_env_ssa.?},
+                    "ptr {s} {s}",
+                    .{ if (is_three_word_closure) "noundef" else "nonnull noundef", closure_env_ssa.? },
                 );
                 defer emitter.allocator.free(env_piece);
                 try call_args_buf.appendSlice(emitter.allocator, env_piece);
                 emitted_arg_count += 1;
+                if (is_variadic_call) {
+                    if (fixed_ty_count > 0) try fixed_param_tys.appendSlice(emitter.allocator, ", ");
+                    try fixed_param_tys.appendSlice(emitter.allocator, "ptr");
+                    fixed_ty_count += 1;
+                }
             } else if (callee_recipe.has_implicit_context) {
                 const caller_has_ctx = emitter.body_recipes.items[body_idx].has_implicit_context;
                 const ctx_op = if (caller_has_ctx) "%_cx_ctx" else "@_cx_default_ctx";
@@ -9796,6 +13384,11 @@ fn emitMirTerminatorLlvm(
                 if (emitted_arg_count > 0) try call_args_buf.appendSlice(emitter.allocator, ", ");
                 try call_args_buf.appendSlice(emitter.allocator, ctx_piece);
                 emitted_arg_count += 1;
+                if (is_variadic_call) {
+                    if (fixed_ty_count > 0) try fixed_param_tys.appendSlice(emitter.allocator, ", ");
+                    try fixed_param_tys.appendSlice(emitter.allocator, "ptr");
+                    fixed_ty_count += 1;
+                }
             }
 
             var inout_writebacks: std.ArrayListUnmanaged(InoutBounceWriteback) = .empty;
@@ -9897,6 +13490,81 @@ fn emitMirTerminatorLlvm(
                 if (emitted_arg_count > 0) try call_args_buf.appendSlice(emitter.allocator, ", ");
                 try call_args_buf.appendSlice(emitter.allocator, arg_piece);
                 emitted_arg_count += 1;
+                if (is_variadic_call) {
+                    const bare_param_ty = try formatAbiParamOrRetType(emitter, formal_ty, p_rec);
+                    defer emitter.allocator.free(bare_param_ty);
+                    if (fixed_ty_count > 0) try fixed_param_tys.appendSlice(emitter.allocator, ", ");
+                    try fixed_param_tys.appendSlice(emitter.allocator, bare_param_ty);
+                    fixed_ty_count += 1;
+                }
+            }
+
+            if (is_variadic_call) {
+                while (arg_i < call_site.args_len) : (arg_i += 1) {
+                    const word = body.extra_args.items[call_site.args_start + arg_i];
+                    const val_ty = try unwrapTransparentType(
+                        emitter,
+                        body.getInst(MirValueId.fromInt(word)).type_id,
+                    );
+                    if (try isZeroSizedType(emitter, val_ty)) continue;
+
+                    const va_piece: []u8 = if (val_ty == .bool_ty) blk: {
+                        const va_tmp = state.nextTmp();
+                        try state.print("  %_va_b_{d} = zext i1 %_v_{d} to i32\n", .{ va_tmp, word });
+                        break :blk try std.fmt.allocPrint(emitter.allocator, "i32 %_va_b_{d}", .{va_tmp});
+                    } else if (resolveIntegerInfo(emitter, val_ty)) |va_int| blk: {
+                        if (va_int.bits < 32) {
+                            const va_tmp = state.nextTmp();
+                            const ext_op = if (va_int.is_signed) "sext" else "zext";
+                            try state.print(
+                                "  %_va_i_{d} = {s} i{d} %_v_{d} to i32\n",
+                                .{ va_tmp, ext_op, va_int.bits, word },
+                            );
+                            break :blk try std.fmt.allocPrint(emitter.allocator, "i32 %_va_i_{d}", .{va_tmp});
+                        }
+                        break :blk try std.fmt.allocPrint(emitter.allocator, "i{d} %_v_{d}", .{ va_int.bits, word });
+                    } else if (val_ty == .f32_ty) blk: {
+                        const va_tmp = state.nextTmp();
+                        try state.print("  %_va_f_{d} = fpext float %_v_{d} to double\n", .{ va_tmp, word });
+                        break :blk try std.fmt.allocPrint(emitter.allocator, "double %_va_f_{d}", .{va_tmp});
+                    } else if (val_ty == .f64_ty or val_ty == .untyped_float_ty) blk: {
+                        break :blk try std.fmt.allocPrint(emitter.allocator, "double %_v_{d}", .{word});
+                    } else blk: {
+                        var va_fn_rec = try AbiClassifier.classifyFn(emitter.allocator, &emitter.resolver, .{
+                            .params = &[_]FnParamSpec{.{
+                                .type_id = val_ty,
+                                .mode = .let_mode,
+                                .is_non_escaping = true,
+                            }},
+                            .ret_ty = .unit_ty,
+                            .is_extern_c = true,
+                            .is_contextless = true,
+                        });
+                        defer va_fn_rec.deinit(emitter.allocator);
+                        const va_rec = va_fn_rec.param_recipes[0];
+                        if (va_rec.pass_mode == .ignore_zst) continue;
+                        const val_ssa = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{word});
+                        defer emitter.allocator.free(val_ssa);
+                        if (va_rec.pass_mode == .indirect_by_ref or va_rec.pass_mode == .indirect_byval) {
+                            const v_lay = try emitter.resolver.resolveType(val_ty);
+                            const copy_align = @max(v_lay.alignBytes(), va_rec.pointee_align_bytes);
+                            const copy_slot = try state.allocEntryBytes(v_lay.size_bytes, copy_align);
+                            defer emitter.allocator.free(copy_slot);
+                            try emitMemsetZero(emitter, state, copy_slot, v_lay.size_bytes, copy_align);
+                            try emitStoreValueToPtr(emitter, state, val_ty, val_ssa, copy_slot, copy_align, 0, 0, 0);
+                            break :blk try formatAbiParamDeclPiece(emitter, val_ty, va_rec, copy_slot);
+                        }
+                        const va_abi_ty = try formatAbiParamOrRetType(emitter, val_ty, va_rec);
+                        defer emitter.allocator.free(va_abi_ty);
+                        const va_coerced = try emitCoerceValueToAbi(emitter, state, val_ty, val_ssa, va_abi_ty);
+                        defer emitter.allocator.free(va_coerced);
+                        break :blk try formatAbiParamDeclPiece(emitter, val_ty, va_rec, va_coerced);
+                    };
+                    defer emitter.allocator.free(va_piece);
+                    if (emitted_arg_count > 0) try call_args_buf.appendSlice(emitter.allocator, ", ");
+                    try call_args_buf.appendSlice(emitter.allocator, va_piece);
+                    emitted_arg_count += 1;
+                }
             }
 
             if (callee_recipe.swifterror_kind != .none) {
@@ -9936,19 +13604,28 @@ fn emitMirTerminatorLlvm(
                 }
             }
 
+            const proto_sig: []u8 = if (!is_variadic_call)
+                try emitter.allocator.dupe(u8, "")
+            else if (fixed_ty_count > 0)
+                try std.fmt.allocPrint(emitter.allocator, "({s}, ...) ", .{fixed_param_tys.items})
+            else
+                try emitter.allocator.dupe(u8, "(...) ");
+            defer emitter.allocator.free(proto_sig);
+
             const call_tmp = state.nextTmp();
             if (is_void_abi) {
                 try state.print(
-                    "  call {s}void {s}({s})",
-                    .{ resolveCallingConvPrefix(callee_recipe), callee_op, call_args_buf.items },
+                    "  call {s}void {s}{s}({s})",
+                    .{ resolveCallingConvPrefix(callee_recipe), proto_sig, callee_op, call_args_buf.items },
                 );
             } else {
                 try state.print(
-                    "  %_call_rv_{d} = call {s}{s} {s}({s})",
+                    "  %_call_rv_{d} = call {s}{s} {s}{s}({s})",
                     .{
                         call_tmp,
                         resolveCallingConvPrefix(callee_recipe),
                         ret_decl.full_decl,
+                        proto_sig,
                         callee_op,
                         call_args_buf.items,
                     },
@@ -11312,4 +14989,332 @@ pub fn emitModule(
         .dev_seam_bytes = dev_seam_bytes,
         .written_output_path = written_path,
     };
+}
+
+// ---------------------------------------- MAIN -----------------------------------------
+
+test "codegen_llvm. Phase 7.6 SourceLoc, FmtSpec/FmtArgs, raw addr, atomics, variadics, opaque, and byte literals" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const host_spec = TargetSpec.host();
+
+    // [1] Variadic `extern "C" fn` + `*opaque` / `*mut opaque` LLVM IR emission and object compilation:
+    const variadic_src =
+        \\extern "C" fn c_var_log(ctx: *mut opaque, tag: *opaque, fmt: *u8, ...) -> i32;
+        \\pub fn invoke_variadic(ctx: *mut opaque, tag: *opaque) -> i32 {
+        \\    let fmt_bytes: &[u8; 6] = b"%d-%x\x00";
+        \\    let flag: bool = true;
+        \\    let small: u8 = 7;
+        \\    let ratio: f32 = 1.5;
+        \\    return unsafe {
+        \\        c_var_log(ctx, tag, (&raw fmt_bytes[0]), flag, small, ratio, 0x2a_i32)
+        \\    };
+        \\}
+    ;
+    var var_bundle = try mir.lowerSourceToMir(
+        allocator,
+        FileId.fromInt(211),
+        variadic_src,
+        host_spec.asTargetLayout(),
+        .{},
+    );
+    defer var_bundle.deinit();
+    try std.testing.expect(!var_bundle.hir_bundle.diagnostics.hasErrors());
+
+    const obj_out_path = std.fmt.allocPrint(
+        allocator,
+        ".zig-cache/test_phase76_llvm_var{s}",
+        .{host_spec.objectExtension()},
+    ) catch unreachable;
+    defer allocator.free(obj_out_path);
+    defer std.Io.Dir.cwd().deleteFile(io, obj_out_path) catch {};
+
+    var var_art = try emitModule(
+        allocator,
+        .{ .target = host_spec },
+        .{
+            .bodies = var_bundle.mir_bundle.bodies.items,
+            .pool = &var_bundle.hir_bundle.pool,
+            .sym_table = &var_bundle.hir_bundle.sym_table,
+            .interner = &var_bundle.hir_bundle.interner,
+            .module_name = "test_llvm_variadic",
+            .artifact_kind = .object_file,
+            .output_path = obj_out_path,
+            .io = io,
+        },
+    );
+    defer var_art.deinit(allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, var_art.emitted_text, "declare i32 @c_var_log(ptr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, var_art.emitted_text, "(ptr, ptr, ptr, ...) @c_var_log(") != null);
+
+    // [2] End-to-end executable verification: `SourceLoc` (both `.field` & `aggregate_extract`), `fmt_value`,
+    // static 0-hole `FmtArgs` (`[P0-C]`), `Atomic*` interior mutability (`MemoryOrder` `0..5`), `b"…"`, & `~vec`:
+    const exec_src =
+        \\pub enum MemoryOrder: u8 {
+        \\    Relaxed = 0,
+        \\    Consume = 1,
+        \\    Acquire = 2,
+        \\    Release = 3,
+        \\    AcqRel = 4,
+        \\    SeqCst = 5,
+        \\}
+        \\pub struct AtomicBox {
+        \\    pub val: u32,
+        \\}
+        \\impl AtomicBox {
+        \\    pub fn fetch_add(&self, delta: u32, order: MemoryOrder) -> u32 {
+        \\        return unsafe { @atomic_rmw_add((&raw self.val) as *mut u32, delta, order as u8) };
+        \\    }
+        \\    pub fn load(&self, order: MemoryOrder) -> u32 {
+        \\        return unsafe { @atomic_load(&raw self.val, order as u8) };
+        \\    }
+        \\}
+        \\pub fn read_loc(loc: SourceLoc = @caller_location()) -> u32 {
+        \\    let fn_len: u32 = loc.fn_name.len() as u32;
+        \\    return loc.line * 10 + (@caller_location().col) + fn_len;
+        \\}
+        \\pub enum SignedKind: i16 {
+        \\    Low = -5,
+        \\    High = 9,
+        \\}
+        \\pub fn static_fmt_msg() -> FmtArgs {
+        \\    let msg: FmtArgs = "ok";
+        \\    return msg;
+        \\}
+        \\pub fn main() -> i32 {
+        \\    let counter = AtomicBox { val: 10 };
+        \\    let p0: u32 = counter.fetch_add(5, .Relaxed);
+        \\    let p1: u32 = counter.fetch_add(7, .Consume);
+        \\    let p2: u32 = counter.fetch_add(3, .SeqCst);
+        \\    let cur: u32 = counter.load(.Acquire);
+        \\    var scratch: u32 = 1;
+        \\    let opaque_mut: *mut opaque = (&raw mut scratch) as *mut opaque;
+        \\    unsafe { (opaque_mut as *mut u32).* = 9; }
+        \\    let b_lit: &[u8; 3] = b"ABC";
+        \\    let vec: [u8; 4] = [0xF0, 0x0F, 0xAA, 0x55];
+        \\    let inv: [u8; 4] = ~vec;
+        \\    let _keep: FmtArgs = static_fmt_msg();
+        \\    let loc_score: u32 = read_loc();
+        \\    let label: str = "hi";
+        \\    let num: u32 = 0x2a;
+        \\    let neg: i32 = -1;
+        \\    let sk: SignedKind = .Low;
+        \\    let sk_tag: u32 = match sk {
+        \\        .Low => 1,
+        \\        .High => 2,
+        \\    };
+        \\    let dyn_fa: FmtArgs = "k={num:02x},{sk:?}";
+        \\    let formatted: str = "{num:08x}|{label:>6}|{num=}|{neg:x}|{dyn_fa}";
+        \\    let _written: isize = @sys_write(1, formatted);
+        \\    let total: u32 = p0 + p1 + p2 + cur + scratch + (b_lit[0] as u32) + (inv[0] as u32) + sk_tag;
+        \\    if total == 162 and loc_score > 200 {
+        \\        return 0;
+        \\    }
+        \\    return 1;
+        \\}
+    ;
+    var exec_bundle = try mir.lowerSourceToMir(
+        allocator,
+        FileId.fromInt(212),
+        exec_src,
+        host_spec.asTargetLayout(),
+        .{},
+    );
+    defer exec_bundle.deinit();
+    try std.testing.expect(!exec_bundle.hir_bundle.diagnostics.hasErrors());
+
+    const exe_out_path = std.fmt.allocPrint(
+        allocator,
+        ".zig-cache/test_phase76_llvm_exec{s}",
+        .{host_spec.executableExtension()},
+    ) catch unreachable;
+    defer allocator.free(exe_out_path);
+    defer std.Io.Dir.cwd().deleteFile(io, exe_out_path) catch {};
+
+    var exec_art = try emitModule(
+        allocator,
+        .{ .target = host_spec },
+        .{
+            .bodies = exec_bundle.mir_bundle.bodies.items,
+            .pool = &exec_bundle.hir_bundle.pool,
+            .sym_table = &exec_bundle.hir_bundle.sym_table,
+            .interner = &exec_bundle.hir_bundle.interner,
+            .module_name = "test_llvm_exec",
+            .artifact_kind = .executable,
+            .output_path = exe_out_path,
+            .io = io,
+        },
+    );
+    defer exec_art.deinit(allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, exec_art.emitted_text, "@_cx_loc_0 = private unnamed_addr constant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exec_art.emitted_text, "@_cx_fsp_") != null);
+
+    const run_res = try std.process.run(allocator, io, .{ .argv = &.{exe_out_path} });
+    defer allocator.free(run_res.stdout);
+    defer allocator.free(run_res.stderr);
+    try std.testing.expect(run_res.term.success());
+    try std.testing.expectEqualStrings("0000002a|    hi|num=42|ffffffff|k=2a,Low", run_res.stdout);
+}
+
+test "Phase 7.6 Stage-4 LLVM regressions: 0-byte own closure niche, 128-bit enum ABI, 6-arg cmpxchg, float fmt" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const host_spec = TargetSpec.host();
+
+    const reg_src =
+        \\pub enum Mask128: u128 {
+        \\    Low = 1,
+        \\    High = 2,
+        \\}
+        \\@export
+        \\pub extern "C" fn bounce_mask128(mask_in: Mask128) -> Mask128 {
+        \\    return mask_in;
+        \\}
+        \\pub fn eval_zero_env_own_niche() -> i32 {
+        \\    let some_cb: (own |i32| -> i32)? = .Some(own |val: i32| -> i32 { return val + 40; });
+        \\    let none_cb: (own |i32| -> i32)? = .None;
+        \\    let hit_val: i32 = match some_cb {
+        \\        .Some(cb_fn) => cb_fn(2),
+        \\        .None => -100,
+        \\    };
+        \\    let miss_val: i32 = match none_cb {
+        \\        .Some(cb_fn2) => cb_fn2(2),
+        \\        .None => 7,
+        \\    };
+        \\    return hit_val + miss_val;
+        \\}
+        \\pub fn probe_cmpxchg_six_arg(weak_flag: u8) -> u32 {
+        \\    var cell: u32 = 10;
+        \\    let (prev_val, is_ok) = unsafe {
+        \\        @atomic_cmpxchg(&raw mut cell, 10_u32, 25_u32, 5_u8, 5_u8, weak_flag != 0)
+        \\    };
+        \\    if is_ok {
+        \\        return prev_val + cell;
+        \\    }
+        \\    return cell;
+        \\}
+        \\pub fn render_float_parity(seed_five: f64) -> str {
+        \\    let f_tiny: f64 = 1.0e-13;
+        \\    let f_small: f64 = 1.0e-5;
+        \\    let f_big: f64 = 1.0e16;
+        \\    let zero_f: f64 = seed_five - 5.0;
+        \\    let f_nan: f64 = zero_f / zero_f;
+        \\    let f_inf: f64 = 1.0 / zero_f;
+        \\    let f_ninf: f64 = -1.0 / zero_f;
+        \\    let part_a: str = "{seed_five}|{seed_five:?}|{f_tiny}|{f_small}|{f_big}";
+        \\    let part_b: str = "{f_nan}|{f_nan:+}|{f_nan:E}|{f_inf}|{f_inf:+}|{f_ninf}|{f_inf:E}|{f_ninf:E}";
+        \\    return "{part_a}|{part_b}";
+        \\}
+        \\pub fn main() -> i32 {
+        \\    let niche_sum: i32 = eval_zero_env_own_niche();
+        \\    let cx_res: u32 = probe_cmpxchg_six_arg(1);
+        \\    let bounced: Mask128 = bounce_mask128(.High);
+        \\    let m_tag: i32 = match bounced {
+        \\        .Low => 1,
+        \\        .High => 2,
+        \\    };
+        \\    let rendered: str = render_float_parity(5.0);
+        \\    let _wrote: isize = @sys_write(1, rendered);
+        \\    if niche_sum == 49 and (cx_res == 35 or cx_res == 10) and m_tag == 2 {
+        \\        return 0;
+        \\    }
+        \\    return 1;
+        \\}
+    ;
+
+    // [1] Verify `AAPCS64` & `wasm32` LLVM IR emit `i128` (never `{ i64, i64 }`) for `Mask128`:
+    var arm_bundle = try mir.lowerSourceToMir(
+        allocator,
+        FileId.fromInt(213),
+        reg_src,
+        TargetSpec.AARCH64_LINUX.asTargetLayout(),
+        .{},
+    );
+    defer arm_bundle.deinit();
+    var arm_ir = try emitModule(
+        allocator,
+        .{ .target = TargetSpec.AARCH64_LINUX },
+        .{
+            .bodies = arm_bundle.mir_bundle.bodies.items,
+            .pool = &arm_bundle.hir_bundle.pool,
+            .sym_table = &arm_bundle.hir_bundle.sym_table,
+            .interner = &arm_bundle.hir_bundle.interner,
+            .module_name = "test_stage4_arm64",
+            .artifact_kind = .source_text,
+        },
+    );
+    defer arm_ir.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, arm_ir.emitted_text, "i128 @bounce_mask128(i128") != null);
+
+    var wasm_bundle = try mir.lowerSourceToMir(
+        allocator,
+        FileId.fromInt(214),
+        reg_src,
+        TargetSpec.WASM32_WASI.asTargetLayout(),
+        .{},
+    );
+    defer wasm_bundle.deinit();
+    var wasm_ir = try emitModule(
+        allocator,
+        .{ .target = TargetSpec.WASM32_WASI },
+        .{
+            .bodies = wasm_bundle.mir_bundle.bodies.items,
+            .pool = &wasm_bundle.hir_bundle.pool,
+            .sym_table = &wasm_bundle.hir_bundle.sym_table,
+            .interner = &wasm_bundle.hir_bundle.interner,
+            .module_name = "test_stage4_wasm32",
+            .artifact_kind = .source_text,
+        },
+    );
+    defer wasm_ir.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_ir.emitted_text, "@bounce_mask128(ptr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_ir.emitted_text, ", i128") != null);
+
+    // [2] Native execution of 0-byte `own` closure niche, 6-arg `cmpxchg weak`, `Mask128`, & float formatting:
+    var reg_bundle = try mir.lowerSourceToMir(
+        allocator,
+        FileId.fromInt(215),
+        reg_src,
+        host_spec.asTargetLayout(),
+        .{},
+    );
+    defer reg_bundle.deinit();
+    try std.testing.expect(!reg_bundle.hir_bundle.diagnostics.hasErrors());
+
+    const exe_path = try std.fmt.allocPrint(
+        allocator,
+        ".zig-cache/test_stage4_llvm_reg{s}",
+        .{host_spec.executableExtension()},
+    );
+    defer allocator.free(exe_path);
+    defer std.Io.Dir.cwd().deleteFile(io, exe_path) catch {};
+
+    var reg_art = try emitModule(
+        allocator,
+        .{ .target = host_spec },
+        .{
+            .bodies = reg_bundle.mir_bundle.bodies.items,
+            .pool = &reg_bundle.hir_bundle.pool,
+            .sym_table = &reg_bundle.hir_bundle.sym_table,
+            .interner = &reg_bundle.hir_bundle.interner,
+            .module_name = "test_stage4_llvm",
+            .artifact_kind = .executable,
+            .output_path = exe_path,
+            .io = io,
+        },
+    );
+    defer reg_art.deinit(allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, reg_art.emitted_text, "cmpxchg weak ptr") != null);
+
+    const run_out = try std.process.run(allocator, io, .{ .argv = &.{exe_path} });
+    defer allocator.free(run_out.stdout);
+    defer allocator.free(run_out.stderr);
+    try std.testing.expect(run_out.term.success());
+    try std.testing.expectEqualStrings(
+        "5|5|1e-13|1e-5|1e16|nan|nan|NAN|inf|+inf|-inf|INF|-INF",
+        run_out.stdout,
+    );
 }

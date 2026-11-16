@@ -47,6 +47,8 @@ const LabeledSpan = diagnostic.LabeledSpan;
 const ScopeId = symbol_resolver.ScopeId;
 const SymbolIndex = symbol_resolver.SymbolIndex;
 const SymbolTable = symbol_resolver.SymbolTable;
+pub const Visibility = symbol_resolver.Visibility;
+pub const PackageId = symbol_resolver.PackageId;
 const InternPool = type_system.InternPool;
 const TypeChecker = type_system.TypeChecker;
 const TargetLayout = type_system.TargetLayout;
@@ -561,7 +563,7 @@ pub const ItemKind = enum(u8) {
     mod_decl = 0,
     /// Import declaration (`use`).
     use_decl = 1,
-    /// Function or subscript declaration (`fn` / `subscript`).
+    /// Function declaration (`fn`).
     fn_decl = 2,
     /// Struct or `bit_field` declaration (`struct` / `bit_field`).
     struct_decl = 3,
@@ -579,6 +581,12 @@ pub const ItemKind = enum(u8) {
     const_decl = 9,
     /// Top-level `comptime` or extern block item.
     extern_block = 10,
+    /// Dedicated `subscript(…) -> T { let { … } inout { … } }` declaration (`SE-21`).
+    subscript_decl = 11,
+    /// First-class `test "…" { … }` declaration (`SE-16`).
+    test_decl = 12,
+    /// First-class `bench "…" (b: &var Bencher) { … }` declaration (`SE-16`).
+    bench_decl = 13,
 };
 
 /// Single top-level declaration entry in a file's position-independent `ItemTree`.
@@ -587,9 +595,9 @@ pub const ItemTreeEntry = struct {
     def_id: DefId,
     /// Declaration category tag.
     kind: ItemKind,
-    /// `true` if the declaration carries a top-level `pub` visibility modifier.
-    is_pub: bool,
-    /// Interned symbol handle for the declaration's primary identifier.
+    /// Four-tier visibility (`private`, `pub_super`, `pub_pkg`, `public`; `ADR-22E`).
+    visibility: Visibility = .private,
+    /// Interned symbol handle for the declaration's primary identifier or test/bench description.
     name_symbol: SymbolId,
     /// Borrowed NUL-terminated slice from `CompilerDb.interner` for `name_symbol`.
     name_text: []const u8,
@@ -597,14 +605,19 @@ pub const ItemTreeEntry = struct {
     ast_node: NodeIndex,
     /// Originating CST node index inside `ParsedCstArtifact.cst_arena`.
     cst_node: CstNodeIndex,
-    /// Body AST node index (`block` for `fn_decl`, initializer expr for `const_decl`, `.none` otherwise).
+    /// Body AST node index (`block`/expr for `fn_decl`/`subscript_decl`/`test_decl`/`bench_decl`, init for `const_decl`).
     body_ast_node: NodeIndex,
-    /// Body CST node index (`block` CST node for `fn_decl`, initializer CST for `const_decl`, `.none` otherwise).
+    /// Body CST node index (`block` CST node for functions/tests/benches, init CST for `const_decl`, `.none` otherwise).
     body_cst_node: CstNodeIndex,
-    /// Position-independent 128-bit fingerprint of the item's signature (excluding function body blocks).
+    /// Position-independent 128-bit fingerprint of the item's signature (excluding function/accessor body blocks).
     signature_fingerprint: Fingerprint128,
     /// Position-independent 128-bit fingerprint of the item's body block or initializer.
     body_fingerprint: Fingerprint128,
+
+    /// Returns `true` only when exported across package boundaries and `.cxi` interfaces (`visibility == .public`).
+    pub inline fn isPublicOutsidePkg(self: ItemTreeEntry) bool {
+        return self.visibility.isPublicOutsidePkg();
+    }
 };
 
 /// Stage 3 position-independent `ItemTree` firewall for a single source file.
@@ -613,6 +626,8 @@ pub const ItemTree = struct {
     entries: []ItemTreeEntry = &.{},
     /// Owning source file identifier.
     file_id: FileId = .none,
+    /// Whether `test` and `bench` declarations were retained when extracting `entries`.
+    is_including_tests: bool = true,
     /// 128-bit fingerprint of all item signatures in this file (excluding function bodies).
     tree_fingerprint: Fingerprint128 = Fingerprint128.ZERO,
     /// Combined 128-bit fingerprint covering both `tree_fingerprint` and all `body_fingerprint`s.
@@ -671,12 +686,14 @@ pub const ResolvedSignaturesArtifact = struct {
     module_scope: ScopeId = .none,
     /// Total number of top-level items resolved in `file_id`.
     item_count: u32,
-    /// Total number of `pub`-exported items in `file_id`.
+    /// Total number of externally exported `pub` (`Visibility.public`) items in `file_id`.
     public_item_count: u32,
     /// Total number of name-resolution or signature errors emitted in `file_id`.
     error_count: u32 = 0,
-    /// 128-bit fingerprint of the resolved module signature map.
+    /// 128-bit fingerprint of the intra-package resolved module signature map.
     signatures_fingerprint: Fingerprint128,
+    /// `.cxi` cross-package export firewall digest covering ONLY `Visibility.public` items (`ADR-22E`).
+    public_interface_fingerprint: Fingerprint128 = Fingerprint128.ZERO,
 };
 
 /// Stage 7 resolved definition signature summary for a single `DefId`.
@@ -685,18 +702,25 @@ pub const DefSignatureArtifact = struct {
     def_id: DefId,
     /// Declaration category tag.
     kind: ItemKind,
-    /// `true` if exported with `pub`.
-    is_pub: bool,
+    /// Four-tier visibility (`private`, `pub_super`, `pub_pkg`, `public`; `ADR-22E`).
+    visibility: Visibility = .private,
     /// Interned symbol identifier.
     name_symbol: SymbolId,
     /// Resolved symbol handle in `CompilerDb.symbol_table`.
     symbol_index: SymbolIndex = .none,
     /// Resolved canonical `TypeId` in `CompilerDb.type_pool`.
     type_id: TypeId = .err_ty,
-    /// Borrowed per-parameter named/default descriptors from `CompilerDb.symbol_table` (`SE-07`).
+    /// Borrowed per-parameter zone/named/default descriptors from `CompilerDb.symbol_table` (`SE-07`, `SE-11`).
     param_specs: []const symbol_resolver.FnParamSpec = &.{},
+    /// Borrowed generic parameter default descriptors from `CompilerDb.symbol_table` (`SE-10`).
+    generic_specs: []const symbol_resolver.GenericParamSpec = &.{},
     /// 128-bit fingerprint of this definition's signature.
     signature_fingerprint: Fingerprint128,
+
+    /// Returns `true` only when exported across package boundaries and `.cxi` interfaces (`visibility == .public`).
+    pub inline fn isPublicOutsidePkg(self: DefSignatureArtifact) bool {
+        return self.visibility.isPublicOutsidePkg();
+    }
 };
 
 /// Read-only syntax and file-level semantic side-table view for cross-file default argument lowering (`SE-07`).
@@ -889,6 +913,14 @@ pub const QueryTelemetry = struct {
 /// Optional callback hook invoked at the start of `computeStage` for deterministic cycle testing.
 pub const CustomStageHook = *const fn (db: *CompilerDb, key: QueryKey) QueryError!void;
 
+/// Active `.param_list` range containing a positional-only `/` zone separator (`ADR-22F`).
+const ParamSlashScope = struct {
+    /// Exclusive ending CST node index of the enclosing `.param_list` subtree.
+    list_end: usize,
+    /// CST node index of the `/` separator leaf inside the `.param_list`.
+    slash_idx: usize,
+};
+
 // --------------------------------------- CONSTS ----------------------------------------
 
 /// Total number of `QueryStage` variants in the canonical pipeline (`14`).
@@ -909,6 +941,8 @@ pub const CONFIG_KEY_EMBED_SANDBOX: u32 = 0xFFFF_FFF2;
 pub const CONFIG_KEY_SAST_STRICT: u32 = 0xFFFF_FFF3;
 /// Reserved synthetic `.source_text` entity index tracking `--internal-core` (`CompilerDb.is_internal_core`).
 pub const CONFIG_KEY_INTERNAL_CORE: u32 = 0xFFFF_FFF4;
+/// Reserved synthetic `.source_text` entity index tracking test/bench inclusion (`CompilerDb.is_including_tests`).
+pub const CONFIG_KEY_INCLUDE_TESTS: u32 = 0xFFFF_FFF5;
 /// Flag bit on `.source_text` `QueryKey.flags` identifying a tracked `@embed_bytes` file dependency (`[CRITICAL-02]`).
 pub const EMBED_FILE_KEY_FLAG: u8 = 0x01;
 /// Flag bit on `.verify_sast_mir` `QueryKey.flags` projecting only the 34 caller-observable `FnRegionSummary` bytes.
@@ -1059,7 +1093,143 @@ pub fn computeAstFingerprint(
     return hasher.final();
 }
 
-/// Computes the position-independent signature fingerprint of `item_cst_node`, skipping `.block` bodies.
+/// Locates the direct child CST index of a `/` positional-only zone separator inside `param_list_cst` (`0` if none).
+fn findPositionalOnlySlashInParamList(
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    param_list_cst: CstNodeIndex,
+) usize {
+    if (param_list_cst.isNone() or param_list_cst.asInt() >= cst_arena.countNodes()) return 0;
+    const start_idx: usize = param_list_cst.asInt();
+    const list_rec = cst_arena.getNode(param_list_cst);
+    const end_idx: usize = @min(
+        start_idx + @max(@as(usize, list_rec.subtree_size), 1),
+        cst_arena.countNodes(),
+    );
+    var child_cursor: usize = start_idx + 1;
+    while (child_cursor < end_idx) {
+        const child = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(child_cursor)));
+        const step_size: usize = @max(@as(usize, child.subtree_size), 1);
+        if (child.kind == .param_zone_sep) {
+            const sep_end = @min(child_cursor + step_size, end_idx);
+            var sub_cursor: usize = child_cursor;
+            while (sub_cursor < sep_end) : (sub_cursor += 1) {
+                const sub_node = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(sub_cursor)));
+                const is_leaf = sub_node.subtree_size <= 1 and !sub_node.flags.is_bracketed;
+                if (is_leaf and !sub_node.flags.is_missing_or_injected and
+                    !sub_node.token.isNone() and sub_node.token.asInt() < token_buffer.countTokens() and
+                    token_buffer.getToken(sub_node.token).kind == .slash)
+                {
+                    return child_cursor;
+                }
+            }
+        } else if (child.subtree_size <= 1 and !child.flags.is_bracketed and
+            !child.flags.is_missing_or_injected and !child.token.isNone() and
+            child.token.asInt() < token_buffer.countTokens() and
+            token_buffer.getToken(child.token).kind == .slash)
+        {
+            return child_cursor;
+        }
+        child_cursor += step_size;
+    }
+    return 0;
+}
+
+/// Locates the parameter identifier leaf CST index inside a positional-only `.fn_param` (`0` for `self` or unnamed).
+fn findPositionalOnlyParamNameCst(
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    fn_param_cst: CstNodeIndex,
+) usize {
+    if (fn_param_cst.isNone() or fn_param_cst.asInt() >= cst_arena.countNodes()) return 0;
+    const start_idx: usize = fn_param_cst.asInt();
+    const param_rec = cst_arena.getNode(fn_param_cst);
+    const end_idx: usize = @min(
+        start_idx + @max(@as(usize, param_rec.subtree_size), 1),
+        cst_arena.countNodes(),
+    );
+    var cursor: usize = start_idx + 1;
+    while (cursor < end_idx) {
+        const node = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cursor)));
+        if (node.kind == .attribute) {
+            cursor += @max(@as(usize, node.subtree_size), 1);
+            continue;
+        }
+        const is_leaf = node.subtree_size <= 1 and !node.flags.is_bracketed;
+        if (is_leaf and !node.flags.is_missing_or_injected and
+            !node.token.isNone() and node.token.asInt() < token_buffer.countTokens())
+        {
+            const tok_kind = token_buffer.getToken(node.token).kind;
+            if (tok_kind == .colon or tok_kind == .eq or tok_kind == .comma or tok_kind == .rparen) {
+                return 0;
+            }
+            if (tok_kind == .kw_self_val) return 0;
+            if (tok_kind == .kw_var or tok_kind == .kw_mut or tok_kind == .kw_own or
+                tok_kind == .kw_comptime or tok_kind == .amp)
+            {
+                cursor += 1;
+                continue;
+            }
+            if (isIdentifierTokenKind(tok_kind) or tok_kind == .underscore) return cursor;
+        }
+        cursor += 1;
+    }
+    return 0;
+}
+
+/// Returns `true` if `block_cst` directly wraps `.subscript_arm` nodes (`{ let { … } inout { … } }`).
+fn hasBlockSubscriptArm(cst_arena: *const LosslessCstArena, block_cst: CstNodeIndex) bool {
+    if (block_cst.isNone() or block_cst.asInt() >= cst_arena.countNodes()) return false;
+    const start_idx: usize = block_cst.asInt();
+    const block_rec = cst_arena.getNode(block_cst);
+    const end_idx: usize = @min(
+        start_idx + @max(@as(usize, block_rec.subtree_size), 1),
+        cst_arena.countNodes(),
+    );
+    var child_cursor: usize = start_idx + 1;
+    while (child_cursor < end_idx) {
+        const child = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(child_cursor)));
+        if (child.kind == .subscript_arm) return true;
+        child_cursor += @max(@as(usize, child.subtree_size), 1);
+    }
+    return false;
+}
+
+/// Advances `start_cursor` past a top-level `= expr;` function expression body up to and including `.semi`.
+fn skipFnExprBodyUntilSemi(
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    start_cursor: usize,
+    limit_idx: usize,
+) usize {
+    var paren_depth: u32 = 0;
+    var bracket_depth: u32 = 0;
+    var brace_depth: u32 = 0;
+    var scan_idx: usize = start_cursor;
+    while (scan_idx < limit_idx) : (scan_idx += 1) {
+        const node = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(scan_idx)));
+        const is_leaf = node.subtree_size <= 1 and !node.flags.is_bracketed;
+        if (!is_leaf or node.flags.is_missing_or_injected or node.token.isNone()) continue;
+        if (node.token.asInt() >= token_buffer.countTokens()) continue;
+        switch (token_buffer.getToken(node.token).kind) {
+            .lparen => paren_depth += 1,
+            .rparen => paren_depth -|= 1,
+            .lbracket => bracket_depth += 1,
+            .rbracket => bracket_depth -|= 1,
+            .lbrace => brace_depth += 1,
+            .rbrace => brace_depth -|= 1,
+            .semi => {
+                if (paren_depth == 0 and bracket_depth == 0 and brace_depth == 0) {
+                    return scan_idx + 1;
+                }
+            },
+            else => {},
+        }
+    }
+    return limit_idx;
+}
+
+/// Computes the position-independent signature fingerprint of `item_cst_node`, skipping function/accessor bodies.
 pub fn computeItemSignatureFingerprint(
     source: []const u8,
     token_buffer: *const TokenBuffer,
@@ -1079,24 +1249,57 @@ pub fn computeItemSignatureFingerprint(
         cst_arena.countNodes(),
     );
 
+    var param_slash_stack: [8]ParamSlashScope = undefined;
+    var param_slash_depth: usize = 0;
+    var erased_param_name_cst_idx: usize = 0;
+
     var fn_member_end_idx: usize = if (root_rec.kind == .fn_item or
+        root_rec.kind == .subscript_item or
+        root_rec.kind == .test_item or
+        root_rec.kind == .bench_item or
         root_rec.kind == .trait_member or
         root_rec.kind == .impl_member)
         end_idx
     else
         0;
-    var after_fn_sig_idx: usize = std.math.maxInt(usize);
+    var is_fn_like_member: bool = (root_rec.kind == .fn_item);
+    var is_subscript_member: bool = (root_rec.kind == .subscript_item);
+    var after_fn_sig_idx: usize = if (root_rec.kind == .test_item or root_rec.kind == .bench_item)
+        root_idx + 1
+    else
+        std.math.maxInt(usize);
+    var paren_depth: u32 = 0;
+    var bracket_depth: u32 = 0;
+    var brace_depth: u32 = 0;
+
     var cursor: usize = root_idx;
     while (cursor < end_idx) {
+        while (param_slash_depth > 0 and cursor >= param_slash_stack[param_slash_depth - 1].list_end) {
+            param_slash_depth -= 1;
+        }
+        if (cursor >= fn_member_end_idx) {
+            is_fn_like_member = false;
+            is_subscript_member = false;
+            after_fn_sig_idx = std.math.maxInt(usize);
+        }
+
         const current_cst_id = CstNodeIndex.fromInt(@intCast(cursor));
         const node = cst_arena.getNode(current_cst_id);
         const step_size: usize = @max(@as(usize, node.subtree_size), 1);
+        const is_outer_subscript_block = is_subscript_member and
+            node.kind == .block and
+            hasBlockSubscriptArm(cst_arena, current_cst_id);
 
-        // [1] Skip explicit `body_cst_node`, `comptime` inner `.block`, or direct function/method body `.block`:
-        if (!body_cst_node.isNone() and current_cst_id == body_cst_node) {
-            hasher.updateU8(BODY_BLOCK_OMITTED_MARKER);
-            cursor += step_size;
-            continue;
+        // [1] Skip explicit `body_cst_node`, `comptime` inner `.block`, subscript arm `.block`, or `= expr;` body:
+        if (!body_cst_node.isNone() and current_cst_id == body_cst_node and !is_outer_subscript_block) {
+            if (root_rec.kind != .fn_item or node.kind == .block or node.kind == .fn_expr_body) {
+                hasher.updateU8(BODY_BLOCK_OMITTED_MARKER);
+                cursor += step_size;
+                if (node.kind == .fn_expr_body) {
+                    cursor = skipFnExprBodyUntilSemi(token_buffer, cst_arena, cursor, end_idx);
+                }
+                continue;
+            }
         }
         if (cursor > root_idx) {
             if (root_rec.kind == .block and node.kind == .block) {
@@ -1104,22 +1307,70 @@ pub fn computeItemSignatureFingerprint(
                 cursor += step_size;
                 continue;
             }
-            if ((node.kind == .block or node.kind == .fn_expr_body) and
+            if (is_subscript_member and node.kind == .block and !is_outer_subscript_block and
+                cursor >= after_fn_sig_idx and cursor < fn_member_end_idx)
+            {
+                hasher.updateU8(BODY_BLOCK_OMITTED_MARKER);
+                cursor += step_size;
+                continue;
+            }
+            if ((node.kind == .block or node.kind == .fn_expr_body) and !is_outer_subscript_block and
                 cursor >= after_fn_sig_idx and
                 cursor < fn_member_end_idx)
             {
                 hasher.updateU8(BODY_BLOCK_OMITTED_MARKER);
+                const member_limit = fn_member_end_idx;
                 after_fn_sig_idx = std.math.maxInt(usize);
+                is_fn_like_member = false;
                 cursor += step_size;
+                if (node.kind == .fn_expr_body) {
+                    cursor = skipFnExprBodyUntilSemi(token_buffer, cst_arena, cursor, member_limit);
+                }
                 continue;
             }
         }
 
-        if (node.kind == .fn_item or node.kind == .trait_member or node.kind == .impl_member) {
-            fn_member_end_idx = cursor + step_size;
-            after_fn_sig_idx = std.math.maxInt(usize);
-        } else if (node.kind == .fn_sig and cursor < fn_member_end_idx) {
-            after_fn_sig_idx = cursor + step_size;
+        if (node.kind == .fn_item or
+            node.kind == .subscript_item or
+            node.kind == .test_item or
+            node.kind == .bench_item or
+            node.kind == .trait_member or
+            node.kind == .impl_member)
+        {
+            fn_member_end_idx = @min(cursor + step_size, end_idx);
+            is_fn_like_member = (node.kind == .fn_item);
+            is_subscript_member = (node.kind == .subscript_item);
+            after_fn_sig_idx = if (node.kind == .test_item or node.kind == .bench_item)
+                cursor + 1
+            else
+                std.math.maxInt(usize);
+            paren_depth = 0;
+            bracket_depth = 0;
+            brace_depth = 0;
+        } else if ((node.kind == .fn_sig or node.kind == .param_list) and cursor < fn_member_end_idx) {
+            after_fn_sig_idx = @min(cursor + step_size, fn_member_end_idx);
+        }
+
+        if (node.kind == .param_list) {
+            const slash_idx = findPositionalOnlySlashInParamList(token_buffer, cst_arena, current_cst_id);
+            if (slash_idx > 0 and param_slash_depth < param_slash_stack.len) {
+                param_slash_stack[param_slash_depth] = .{
+                    .list_end = @min(cursor + step_size, end_idx),
+                    .slash_idx = slash_idx,
+                };
+                param_slash_depth += 1;
+            }
+        } else if (node.kind == .fn_param and param_slash_depth > 0) {
+            const top_slash = param_slash_stack[param_slash_depth - 1];
+            if (cursor < top_slash.slash_idx) {
+                erased_param_name_cst_idx = findPositionalOnlyParamNameCst(
+                    token_buffer,
+                    cst_arena,
+                    current_cst_id,
+                );
+            }
+        } else if (node.kind == .subscript_arm) {
+            is_subscript_member = true;
         }
 
         // [2] Hash CST node kind and leaf token lexeme while skipping pure trivia carriers:
@@ -1133,17 +1384,62 @@ pub fn computeItemSignatureFingerprint(
                 cursor += 1;
                 continue;
             }
-            hasher.updateU8(@backingInt(node.kind));
-            hasher.updateU8(if (node.flags.has_error) 1 else 0);
             if (!node.token.isNone() and node.token.asInt() < token_buffer.countTokens()) {
                 const tok_rec = token_buffer.getToken(node.token);
-                hasher.updateU8(@backingInt(tok_rec.kind));
-                hasher.updateBytes(getTokenLexeme(source, token_buffer, node.token));
+                if (cursor < fn_member_end_idx) {
+                    if (tok_rec.kind == .kw_fn) {
+                        is_fn_like_member = true;
+                    } else if (tok_rec.kind == .kw_subscript) {
+                        is_subscript_member = true;
+                    } else if (is_fn_like_member and
+                        cursor >= after_fn_sig_idx and
+                        paren_depth == 0 and
+                        bracket_depth == 0 and
+                        brace_depth == 0 and
+                        tok_rec.kind == .eq)
+                    {
+                        hasher.updateU8(BODY_BLOCK_OMITTED_MARKER);
+                        const member_limit = fn_member_end_idx;
+                        after_fn_sig_idx = std.math.maxInt(usize);
+                        is_fn_like_member = false;
+                        cursor = skipFnExprBodyUntilSemi(token_buffer, cst_arena, cursor + 1, member_limit);
+                        continue;
+                    }
+                    switch (tok_rec.kind) {
+                        .lparen => paren_depth += 1,
+                        .rparen => paren_depth -|= 1,
+                        .lbracket => bracket_depth += 1,
+                        .rbracket => bracket_depth -|= 1,
+                        .lbrace => brace_depth += 1,
+                        .rbrace => brace_depth -|= 1,
+                        else => {},
+                    }
+                }
+                hasher.updateU8(@backingInt(node.kind));
+                hasher.updateU8(if (node.flags.has_error) 1 else 0);
+                if (cursor == erased_param_name_cst_idx) {
+                    erased_param_name_cst_idx = 0;
+                    hasher.updateU8(@backingInt(TokenKind.ident));
+                    hasher.updateBytes("_");
+                } else {
+                    hasher.updateU8(@backingInt(tok_rec.kind));
+                    hasher.updateBytes(getTokenLexeme(source, token_buffer, node.token));
+                }
+            } else {
+                hasher.updateU8(@backingInt(node.kind));
+                hasher.updateU8(if (node.flags.has_error) 1 else 0);
             }
         } else {
             hasher.updateU8(@backingInt(node.kind));
             hasher.updateU8(if (node.flags.has_error) 1 else 0);
-            if (cursor > root_idx and node.kind != .trait_member and node.kind != .impl_member) {
+            if (cursor > root_idx and
+                node.kind != .trait_member and
+                node.kind != .impl_member and
+                node.kind != .fn_item and
+                node.kind != .subscript_item and
+                node.kind != .subscript_arm and
+                !is_outer_subscript_block)
+            {
                 hasher.updateU32(node.subtree_size);
             }
         }
@@ -1195,6 +1491,126 @@ fn hashPositionIndependentCstSubtree(
     }
 }
 
+/// Hashes positional-only parameter names (`before /`) into `hasher` so self-body typecheck invalidates cleanly.
+fn hashPositionalOnlyParamNamesForBody(
+    hasher: *StructuralHasher,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    item_cst_node: CstNodeIndex,
+) void {
+    if (item_cst_node.isNone() or item_cst_node.asInt() >= cst_arena.countNodes()) return;
+    const root_idx: usize = item_cst_node.asInt();
+    const root_rec = cst_arena.getNode(item_cst_node);
+    const end_idx: usize = @min(
+        root_idx + @max(@as(usize, root_rec.subtree_size), 1),
+        cst_arena.countNodes(),
+    );
+    var cursor: usize = root_idx + 1;
+    while (cursor < end_idx) : (cursor += 1) {
+        const cur_id = CstNodeIndex.fromInt(@intCast(cursor));
+        const node = cst_arena.getNode(cur_id);
+        if (node.kind != .param_list) continue;
+        const slash_idx = findPositionalOnlySlashInParamList(token_buffer, cst_arena, cur_id);
+        if (slash_idx == 0) continue;
+        var child_cursor: usize = cursor + 1;
+        while (child_cursor < slash_idx) {
+            const child_id = CstNodeIndex.fromInt(@intCast(child_cursor));
+            const child = cst_arena.getNode(child_id);
+            if (child.kind == .fn_param) {
+                const name_cst_idx = findPositionalOnlyParamNameCst(token_buffer, cst_arena, child_id);
+                if (name_cst_idx > 0) {
+                    const name_node = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(name_cst_idx)));
+                    hasher.updateU8(0x50);
+                    hasher.updateBytes(getTokenLexeme(source, token_buffer, name_node.token));
+                }
+            }
+            child_cursor += @max(@as(usize, child.subtree_size), 1);
+        }
+    }
+}
+
+/// Hashes the CST nodes of a top-level `= expr;` function expression body inside `[member_start .. member_end)`.
+fn hashFnExprBodyTokensInRange(
+    hasher: *StructuralHasher,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    member_start: usize,
+    member_end: usize,
+) bool {
+    var after_params_idx: usize = std.math.maxInt(usize);
+    var paren_depth: u32 = 0;
+    var bracket_depth: u32 = 0;
+    var brace_depth: u32 = 0;
+    var has_seen_eq = false;
+    var cursor: usize = member_start;
+    while (cursor < member_end) : (cursor += 1) {
+        const cur_id = CstNodeIndex.fromInt(@intCast(cursor));
+        const node = cst_arena.getNode(cur_id);
+        if (!has_seen_eq) {
+            if (node.kind == .fn_sig or node.kind == .param_list) {
+                after_params_idx = @min(cursor + @max(@as(usize, node.subtree_size), 1), member_end);
+            } else if (node.kind == .fn_expr_body and cursor >= after_params_idx) {
+                hasher.updateU8(2);
+                hashPositionIndependentCstSubtree(hasher, source, token_buffer, cst_arena, cur_id);
+                return true;
+            }
+            const is_leaf = node.subtree_size <= 1 and !node.flags.is_bracketed;
+            if (!is_leaf or node.flags.is_missing_or_injected or node.token.isNone()) continue;
+            if (node.token.asInt() >= token_buffer.countTokens()) continue;
+            const tok_kind = token_buffer.getToken(node.token).kind;
+            if (cursor >= after_params_idx and
+                paren_depth == 0 and
+                bracket_depth == 0 and
+                brace_depth == 0 and
+                tok_kind == .eq)
+            {
+                has_seen_eq = true;
+                hasher.updateU8(2);
+                continue;
+            }
+            switch (tok_kind) {
+                .lparen => paren_depth += 1,
+                .rparen => paren_depth -|= 1,
+                .lbracket => bracket_depth += 1,
+                .rbracket => bracket_depth -|= 1,
+                .lbrace => brace_depth += 1,
+                .rbrace => brace_depth -|= 1,
+                else => {},
+            }
+            continue;
+        }
+
+        const is_leaf = node.subtree_size <= 1 and !node.flags.is_bracketed;
+        if (is_leaf) {
+            if (node.flags.is_missing_or_injected) continue;
+            if (!node.token.isNone() and node.token.asInt() < token_buffer.countTokens()) {
+                const tok_rec = token_buffer.getToken(node.token);
+                if (paren_depth == 0 and bracket_depth == 0 and brace_depth == 0 and tok_rec.kind == .semi) {
+                    break;
+                }
+                switch (tok_rec.kind) {
+                    .lparen => paren_depth += 1,
+                    .rparen => paren_depth -|= 1,
+                    .lbracket => bracket_depth += 1,
+                    .rbracket => bracket_depth -|= 1,
+                    .lbrace => brace_depth += 1,
+                    .rbrace => brace_depth -|= 1,
+                    else => {},
+                }
+                hasher.updateU8(@backingInt(node.kind));
+                hasher.updateU8(@backingInt(tok_rec.kind));
+                hasher.updateBytes(getTokenLexeme(source, token_buffer, node.token));
+            }
+        } else {
+            hasher.updateU8(@backingInt(node.kind));
+            hasher.updateU32(node.subtree_size);
+        }
+    }
+    return has_seen_eq;
+}
+
 /// Computes the position-independent 128-bit fingerprint of an item's body block or initializer.
 pub fn computeItemBodyFingerprint(
     source: []const u8,
@@ -1204,6 +1620,47 @@ pub fn computeItemBodyFingerprint(
     body_cst_node: CstNodeIndex,
 ) Fingerprint128 {
     var hasher = StructuralHasher.init();
+    hashPositionalOnlyParamNamesForBody(&hasher, source, token_buffer, cst_arena, item_cst_node);
+
+    if (!item_cst_node.isNone() and item_cst_node.asInt() < cst_arena.countNodes()) {
+        const root_idx: usize = item_cst_node.asInt();
+        const root_rec = cst_arena.getNode(item_cst_node);
+        const end_idx: usize = @min(
+            root_idx + @max(@as(usize, root_rec.subtree_size), 1),
+            cst_arena.countNodes(),
+        );
+
+        // For `.fn_item` with top-level `= expr;` (where `body_cst_node` is not a `.block`), hash full RHS:
+        if (root_rec.kind == .fn_item) {
+            const has_block_body = !body_cst_node.isNone() and
+                body_cst_node.asInt() < cst_arena.countNodes() and
+                cst_arena.getNode(body_cst_node).kind == .block;
+            if (!has_block_body) {
+                if (hashFnExprBodyTokensInRange(&hasher, source, token_buffer, cst_arena, root_idx + 1, end_idx)) {
+                    return hasher.final();
+                }
+            }
+        }
+
+        // For `.subscript_item`, hash all `.subscript_arm` or accessor `.block` subtrees:
+        if (root_rec.kind == .subscript_item) {
+            var has_arm_body = false;
+            var cursor: usize = root_idx + 1;
+            while (cursor < end_idx) {
+                const sub_id = CstNodeIndex.fromInt(@intCast(cursor));
+                const sub_node = cst_arena.getNode(sub_id);
+                if (sub_node.kind == .subscript_arm) {
+                    has_arm_body = true;
+                    hashPositionIndependentCstSubtree(&hasher, source, token_buffer, cst_arena, sub_id);
+                    cursor += @max(@as(usize, sub_node.subtree_size), 1);
+                    continue;
+                }
+                cursor += 1;
+            }
+            if (has_arm_body) return hasher.final();
+        }
+    }
+
     if (!body_cst_node.isNone() and body_cst_node.asInt() < cst_arena.countNodes()) {
         hasher.updateU8(1);
         hashPositionIndependentCstSubtree(&hasher, source, token_buffer, cst_arena, body_cst_node);
@@ -1222,17 +1679,26 @@ pub fn computeItemBodyFingerprint(
         cst_arena.countNodes(),
     );
 
-    // For `trait` or `impl` containers, hash any default/member method `.block` subtrees:
+    // For `trait` or `impl` containers, hash any default/member method `.block`, `.subscript_arm`, or `= expr;` bodies:
     if (root_rec.kind == .trait_item or root_rec.kind == .impl_item) {
         var has_any_block = false;
         var cursor: usize = root_idx + 1;
         while (cursor < end_idx) {
             const sub_id = CstNodeIndex.fromInt(@intCast(cursor));
             const sub_node = cst_arena.getNode(sub_id);
-            if (sub_node.kind == .block or sub_node.kind == .fn_expr_body) {
+            const sub_step = @max(@as(usize, sub_node.subtree_size), 1);
+            if (sub_node.kind == .fn_item or sub_node.kind == .trait_member or sub_node.kind == .impl_member) {
+                const sub_end = @min(cursor + sub_step, end_idx);
+                if (hashFnExprBodyTokensInRange(&hasher, source, token_buffer, cst_arena, cursor + 1, sub_end)) {
+                    has_any_block = true;
+                    cursor = sub_end;
+                    continue;
+                }
+            }
+            if (sub_node.kind == .block or sub_node.kind == .fn_expr_body or sub_node.kind == .subscript_arm) {
                 has_any_block = true;
                 hashPositionIndependentCstSubtree(&hasher, source, token_buffer, cst_arena, sub_id);
-                cursor += @max(@as(usize, sub_node.subtree_size), 1);
+                cursor += sub_step;
                 continue;
             }
             cursor += 1;
@@ -1283,7 +1749,7 @@ fn astTagToItemKind(tag: AstTag) ?ItemKind {
         .mod_decl => .mod_decl,
         .use_decl => .use_decl,
         .fn_decl => .fn_decl,
-        .struct_decl => .struct_decl,
+        .struct_decl, .bit_field_decl => .struct_decl,
         .enum_decl => .enum_decl,
         .union_decl => .union_decl,
         .trait_decl => .trait_decl,
@@ -1291,17 +1757,22 @@ fn astTagToItemKind(tag: AstTag) ?ItemKind {
         .type_alias_decl => .type_alias_decl,
         .const_decl => .const_decl,
         .block => .extern_block,
+        .subscript_decl => .subscript_decl,
+        .test_decl => .test_decl,
+        .bench_decl => .bench_decl,
         else => null,
     };
 }
 
-/// Returns `true` if `item_cst_node` has a top-level `.visibility_modifier` leaf before `main_token`.
-fn extractItemIsPub(
+/// Extracts the 4-tier `Visibility` (`private`, `pub_super`, `pub_pkg`, `public`) from `item_cst_node`.
+fn extractItemVisibility(
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
     cst_arena: *const LosslessCstArena,
     item_cst_node: CstNodeIndex,
     main_token: TokenIndex,
-) bool {
-    if (item_cst_node.isNone() or item_cst_node.asInt() >= cst_arena.countNodes()) return false;
+) Visibility {
+    if (item_cst_node.isNone() or item_cst_node.asInt() >= cst_arena.countNodes()) return .private;
     const start_idx: usize = item_cst_node.asInt();
     const root_rec = cst_arena.getNode(item_cst_node);
     const end_idx: usize = @min(
@@ -1311,19 +1782,22 @@ fn extractItemIsPub(
 
     var cursor: usize = start_idx + 1;
     while (cursor < end_idx) : (cursor += 1) {
-        const node = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cursor)));
+        const cur_id = CstNodeIndex.fromInt(@intCast(cursor));
+        const node = cst_arena.getNode(cur_id);
         if (!node.token.isNone() and !main_token.isNone() and node.token.asInt() >= main_token.asInt()) {
             break;
         }
-        if (node.kind == .visibility_modifier) return true;
+        if (node.kind == .visibility_modifier) {
+            return symbol_resolver.extractVisibilityFromCst(source, token_buffer, cst_arena, cur_id);
+        }
         if (node.kind == .attribute and node.subtree_size > 1) {
             cursor += @as(usize, node.subtree_size) - 1;
         }
     }
-    return false;
+    return .private;
 }
 
-/// Extracts the primary identifier lexeme of a top-level item from its AST/CST representation.
+/// Extracts the primary identifier or description lexeme of a top-level item from its AST/CST representation.
 fn extractItemNameSlice(
     source: []const u8,
     token_buffer: *const TokenBuffer,
@@ -1333,6 +1807,16 @@ fn extractItemNameSlice(
     item_cst_node: CstNodeIndex,
 ) []const u8 {
     if (item_kind == .extern_block) return "comptime";
+    if (item_kind == .subscript_decl) return "subscript";
+    if (item_kind == .test_decl or item_kind == .bench_decl) {
+        return symbol_resolver.extractTestOrBenchDescriptionSlice(
+            source,
+            token_buffer,
+            cst_arena,
+            item_cst_node,
+            main_token,
+        );
+    }
     if (item_cst_node.isNone() or item_cst_node.asInt() >= cst_arena.countNodes()) return "";
 
     const start_idx: usize = item_cst_node.asInt();
@@ -1347,6 +1831,10 @@ fn extractItemNameSlice(
         var cursor: usize = start_idx + 1;
         while (cursor < end_idx) : (cursor += 1) {
             const node = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cursor)));
+            if ((node.kind == .visibility_modifier or node.kind == .attribute) and node.subtree_size > 1) {
+                cursor += @as(usize, node.subtree_size) - 1;
+                continue;
+            }
             const is_leaf = node.subtree_size <= 1 and !node.flags.is_bracketed;
             if (!is_leaf or node.flags.is_missing_or_injected or node.token.isNone()) continue;
             if (node.token.asInt() >= token_buffer.countTokens()) continue;
@@ -1364,7 +1852,8 @@ fn extractItemNameSlice(
         var cursor: usize = start_idx + 1;
         while (cursor < end_idx) : (cursor += 1) {
             const node = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cursor)));
-            if ((node.kind == .type_params or node.kind == .type_args or node.kind == .where_clause) and
+            if ((node.kind == .type_params or node.kind == .type_args or node.kind == .where_clause or
+                node.kind == .visibility_modifier or node.kind == .attribute) and
                 node.subtree_size > 1)
             {
                 cursor += @as(usize, node.subtree_size) - 1;
@@ -1408,6 +1897,10 @@ fn extractItemNameSlice(
     var cursor: usize = start_idx + 1;
     while (cursor < end_idx) : (cursor += 1) {
         const node = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cursor)));
+        if ((node.kind == .visibility_modifier or node.kind == .attribute) and node.subtree_size > 1) {
+            cursor += @as(usize, node.subtree_size) - 1;
+            continue;
+        }
         const is_leaf = node.subtree_size <= 1 and !node.flags.is_bracketed;
         if (!is_leaf or node.flags.is_missing_or_injected or node.token.isNone()) continue;
         if (!main_token.isNone() and node.token.asInt() <= main_token.asInt()) continue;
@@ -1451,7 +1944,7 @@ fn findDirectBodyBlockCst(
     while (cursor < end_idx) : (cursor += 1) {
         const cur_id = CstNodeIndex.fromInt(@intCast(cursor));
         const node = cst_arena.getNode(cur_id);
-        if (node.kind == .fn_sig and cursor >= sig_end_idx) {
+        if ((node.kind == .fn_sig or node.kind == .param_list) and cursor >= sig_end_idx) {
             sig_end_idx = cursor + @max(@as(usize, node.subtree_size), 1);
             continue;
         }
@@ -1509,6 +2002,7 @@ fn extractItemTreeFromAst(
     file_id: FileId,
     source: []const u8,
     parsed: *const ParsedCstArtifact,
+    is_including_tests: bool,
 ) !ItemTree {
     var entries_list: std.ArrayList(ItemTreeEntry) = .empty;
     errdefer entries_list.deinit(allocator);
@@ -1527,11 +2021,18 @@ fn extractItemTreeFromAst(
 
                 const ast_node = parsed.ast_arena.getNode(item_ast_node);
                 const item_kind = astTagToItemKind(ast_node.tag) orelse continue;
+                if (!is_including_tests and (item_kind == .test_decl or item_kind == .bench_decl)) {
+                    continue;
+                }
                 var item_cst_node = parsed.ast_arena.getCstOrigin(item_ast_node);
 
                 var body_ast_node: NodeIndex = .none;
                 var body_cst_node: CstNodeIndex = .none;
-                if (item_kind == .fn_decl) {
+                if (item_kind == .fn_decl or
+                    item_kind == .subscript_decl or
+                    item_kind == .test_decl or
+                    item_kind == .bench_decl)
+                {
                     if (ast_node.rhs.tag == .node) {
                         body_ast_node = NodeIndex.fromInt(ast_node.rhs.payload);
                         if (body_ast_node.asInt() < parsed.ast_arena.countNodes()) {
@@ -1580,7 +2081,13 @@ fn extractItemTreeFromAst(
                 );
                 const name_symbol = try interner.intern(raw_name);
                 const interned_name = interner.get(name_symbol);
-                const is_pub = extractItemIsPub(&parsed.cst_arena, item_cst_node, ast_node.main_token);
+                const visibility = extractItemVisibility(
+                    source,
+                    &parsed.token_buffer,
+                    &parsed.cst_arena,
+                    item_cst_node,
+                    ast_node.main_token,
+                );
 
                 const sig_fp = computeItemSignatureFingerprint(
                     source,
@@ -1601,7 +2108,7 @@ fn extractItemTreeFromAst(
                 try entries_list.append(allocator, .{
                     .def_id = def_id,
                     .kind = item_kind,
-                    .is_pub = is_pub,
+                    .visibility = visibility,
                     .name_symbol = name_symbol,
                     .name_text = interned_name,
                     .ast_node = item_ast_node,
@@ -1621,7 +2128,7 @@ fn extractItemTreeFromAst(
     for (entries_list.items) |entry| {
         sig_tree_hasher.updateU32(entry.def_id.asInt());
         sig_tree_hasher.updateU8(@backingInt(entry.kind));
-        sig_tree_hasher.updateU8(if (entry.is_pub) 1 else 0);
+        sig_tree_hasher.updateU8(@backingInt(entry.visibility));
         sig_tree_hasher.updateBytes(entry.name_text);
         sig_tree_hasher.updateFingerprint(entry.signature_fingerprint);
     }
@@ -1636,6 +2143,7 @@ fn extractItemTreeFromAst(
     return .{
         .entries = try entries_list.toOwnedSlice(allocator),
         .file_id = file_id,
+        .is_including_tests = is_including_tests,
         .tree_fingerprint = tree_fp,
         .combined_fingerprint = combined_hasher.final(),
         .source_ast_fingerprint = parsed.ast_fingerprint,
@@ -1947,6 +2455,13 @@ fn computeMirBundleFingerprint(
                     hasher.updateU32(rb.blob_id);
                     hasher.updateU8(rb.align_log2);
                     hasher.updateU64(rb.byte_len);
+                },
+                .source_loc => |src_loc| {
+                    hasher.updateU8(8);
+                    hashSymbolTextCanonical(&hasher, interner, src_loc.file_sym);
+                    hashSymbolTextCanonical(&hasher, interner, src_loc.fn_sym);
+                    hasher.updateU32(src_loc.line);
+                    hasher.updateU32(src_loc.col);
                 },
             }
         }
@@ -2500,6 +3015,8 @@ pub const CompilerDb = struct {
     is_sast_strict: bool = false,
     /// Active `--internal-core` privilege flag allowing direct `core.*` kernel root access (`E0218`).
     is_internal_core: bool = false,
+    /// Active test/benchmark inclusion flag (`true` in `corex test` / `corex bench`, `false` in production builds).
+    is_including_tests: bool = true,
     /// Monotonic counter bumped when a file's `Durability.high` stdlib privilege toggles in `setInput`.
     stdlib_privilege_epoch: u64 = 0,
     /// Optional workspace root directory path for VFS-sandboxed `@embed_bytes` (`DR-05` §3.3).
@@ -2510,8 +3027,8 @@ pub const CompilerDb = struct {
     virtual_files: ?*const std.StringHashMapUnmanaged([]const u8) = null,
     /// Monotonic counter bumped on every `setEmbedSandbox` / `setEmbedIo` mutation (`[CRITICAL-17]`).
     embed_sandbox_epoch: u64 = 0,
-    /// Last-changed revisions for synthetic config keys `0xFFFF_FFF0..0xFFFF_FFF4` (`[CRITICAL-17]`).
-    config_changed_at: [5]Revision = .{ .initial, .initial, .initial, .initial, .initial },
+    /// Last-changed revisions for synthetic config keys `0xFFFF_FFF0..0xFFFF_FFF5` (`[CRITICAL-17]`).
+    config_changed_at: [6]Revision = .{ .initial, .initial, .initial, .initial, .initial, .initial },
     /// Deduplicated `.rodata` constant pool shared across `MirVm` evaluations.
     rodata_pool: mir_vm.RodataPool,
     /// Bounded `Wyhash(0)` pure-call memoization cache shared across `MirVm` runs.
@@ -2744,6 +3261,9 @@ pub const CompilerDb = struct {
         hasher.updateU32(config_entity);
         switch (config_entity) {
             CONFIG_KEY_TARGET_LAYOUT => {
+                hasher.updateU8(@backingInt(self.target_spec.arch));
+                hasher.updateU8(@backingInt(self.target_spec.os));
+                hasher.updateU8(@backingInt(self.target_spec.simd_level));
                 hasher.updateU8(self.target_layout.ptr_byte_size);
                 hasher.updateU8(self.target_layout.ptr_align_log2);
                 hasher.updateU8(self.target_layout.cache_line_align_log2);
@@ -2767,6 +3287,9 @@ pub const CompilerDb = struct {
             CONFIG_KEY_INTERNAL_CORE => {
                 hasher.updateU8(@intFromBool(self.is_internal_core));
                 hasher.updateU64(self.stdlib_privilege_epoch);
+            },
+            CONFIG_KEY_INCLUDE_TESTS => {
+                hasher.updateU8(@intFromBool(self.is_including_tests));
             },
             else => {},
         }
@@ -2812,6 +3335,12 @@ pub const CompilerDb = struct {
     pub fn readInternalCore(self: *CompilerDb) bool {
         _ = self.fetchQuery(QueryKey.forConfig(CONFIG_KEY_INTERNAL_CORE)) catch {};
         return self.is_internal_core;
+    }
+
+    /// Reads `is_including_tests` while recording a tracked dependency on `CONFIG_KEY_INCLUDE_TESTS`.
+    pub fn readIncludeTests(self: *CompilerDb) QueryError!bool {
+        _ = try self.fetchQuery(QueryKey.forConfig(CONFIG_KEY_INCLUDE_TESTS));
+        return self.is_including_tests;
     }
 
     /// Records a tracked dependency on `CONFIG_KEY_EMBED_SANDBOX` whenever `@embed_bytes` queries sandbox state.
@@ -2939,8 +3468,18 @@ pub const CompilerDb = struct {
 
     /// Updates `target_spec` and synchronizes `target_layout` (`aarch64-macos` `128B` cache line, `wasm32` `4B` ptrs).
     pub fn setTargetSpec(self: *CompilerDb, new_spec: codegen_abi.TargetSpec) void {
+        const new_layout = new_spec.asTargetLayout();
+        const has_spec_changed = self.target_spec.arch != new_spec.arch or
+            self.target_spec.os != new_spec.os or
+            self.target_spec.simd_level != new_spec.simd_level;
+        const has_layout_changed = self.target_layout.ptr_byte_size != new_layout.ptr_byte_size or
+            self.target_layout.ptr_align_log2 != new_layout.ptr_align_log2 or
+            self.target_layout.cache_line_align_log2 != new_layout.cache_line_align_log2 or
+            self.target_layout.simd_align_log2 != new_layout.simd_align_log2;
+        if (!has_spec_changed and !has_layout_changed) return;
         self.target_spec = new_spec;
-        self.setTargetLayout(new_spec.asTargetLayout());
+        self.target_layout = new_layout;
+        self.bumpConfigInput(CONFIG_KEY_TARGET_LAYOUT);
     }
 
     /// Returns the active Phase 7 `TargetSpec` configured on `self`.
@@ -2955,6 +3494,10 @@ pub const CompilerDb = struct {
         mod_name: []const u8,
         child_file_id: FileId,
     ) !void {
+        const parent_pkg = self.symbol_table.getFilePackageId(parent_file_id);
+        if (parent_pkg != .root and self.symbol_table.getFilePackageId(child_file_id) == .root) {
+            try self.symbol_table.setFilePackageId(child_file_id, parent_pkg);
+        }
         const mod_sym = try self.interner.intern(mod_name);
         const key: u64 = (@as(u64, parent_file_id.asInt()) << 32) | @as(u64, mod_sym.asInt());
         if (self.external_mod_files.get(key)) |existing_fid| {
@@ -2977,6 +3520,9 @@ pub const CompilerDb = struct {
             has_changed = true;
         }
         if (std.mem.eql(u8, mod_name, "core")) {
+            if (self.symbol_table.getFilePackageId(root_file_id) == .root) {
+                try self.symbol_table.setFilePackageId(root_file_id, .std_core);
+            }
             const cx_sym = try self.interner.intern("cx");
             if (!self.root_module_files.contains(cx_sym.asInt())) {
                 try self.root_module_files.put(self.allocator, cx_sym.asInt(), root_file_id);
@@ -2986,6 +3532,18 @@ pub const CompilerDb = struct {
         if (has_changed) {
             self.bumpConfigInput(CONFIG_KEY_TARGET_LAYOUT);
         }
+    }
+
+    /// Assigns `pkg_id` to `file_id` for `pub(pkg)` visibility enforcement (`ADR-22E`).
+    pub fn setFilePackageId(self: *CompilerDb, file_id: FileId, pkg_id: PackageId) !void {
+        if (self.symbol_table.getFilePackageId(file_id) == pkg_id) return;
+        try self.symbol_table.setFilePackageId(file_id, pkg_id);
+        self.bumpConfigInput(CONFIG_KEY_TARGET_LAYOUT);
+    }
+
+    /// Returns the `PackageId` currently assigned to `file_id` (`.root` by default).
+    pub inline fn getFilePackageId(self: *const CompilerDb, file_id: FileId) PackageId {
+        return self.symbol_table.getFilePackageId(file_id);
     }
 
     /// Updates `--sast-strict` (`is_sast_strict`) and bumps `current_revision` when changed.
@@ -3000,6 +3558,14 @@ pub const CompilerDb = struct {
         if (self.is_internal_core == is_enabled) return;
         self.is_internal_core = is_enabled;
         self.bumpConfigInput(CONFIG_KEY_INTERNAL_CORE);
+    }
+
+    /// Updates `is_including_tests` (`test` / `bench` retention) and invalidates `CONFIG_KEY_INCLUDE_TESTS` without reparsing CSTs.
+    pub fn setIncludeTests(self: *CompilerDb, is_enabled: bool) void {
+        if (self.is_including_tests == is_enabled) return;
+        self.is_including_tests = is_enabled;
+        self.symbol_table.is_including_tests = is_enabled;
+        self.bumpConfigInput(CONFIG_KEY_INCLUDE_TESTS);
     }
 
     /// Resolves `target_file`'s signatures (recording query dependency) and returns its syntax + side-table view.
@@ -3867,7 +4433,7 @@ pub const CompilerDb = struct {
                 return embed_memo;
             }
             if (key.entity_index >= CONFIG_KEY_TARGET_LAYOUT and
-                key.entity_index <= CONFIG_KEY_INTERNAL_CORE)
+                key.entity_index <= CONFIG_KEY_INCLUDE_TESTS)
             {
                 const cfg_slot = key.entity_index - CONFIG_KEY_TARGET_LAYOUT;
                 const cfg_memo = MemoHeader{
@@ -4024,7 +4590,7 @@ pub const CompilerDb = struct {
                     break :blk self.probeEmbeddedFileFingerprint(SymbolId.fromInt(key.entity_index));
                 }
                 if (key.entity_index >= CONFIG_KEY_TARGET_LAYOUT and
-                    key.entity_index <= CONFIG_KEY_INTERNAL_CORE)
+                    key.entity_index <= CONFIG_KEY_INCLUDE_TESTS)
                 {
                     break :blk self.computeConfigFingerprint(key.entity_index);
                 }
@@ -4110,14 +4676,17 @@ pub const CompilerDb = struct {
         return artifact.ast_fingerprint;
     }
 
-    /// Ensures `self.item_trees` holds an `ItemTree` matching `lowered.ast_fingerprint` for `file_id`.
+    /// Ensures `self.item_trees` holds an `ItemTree` matching `lowered.ast_fingerprint` and `is_including_tests` for `file_id`.
     fn ensureFreshItemTree(
         self: *CompilerDb,
         file_id: FileId,
         lowered: LoweredAstArtifact,
     ) QueryError!*const ItemTree {
+        const is_including_tests = try self.readIncludeTests();
         if (self.item_trees.getPtr(file_id.asInt())) |existing_tree| {
-            if (Fingerprint128.eql(existing_tree.source_ast_fingerprint, lowered.ast_fingerprint)) {
+            if (Fingerprint128.eql(existing_tree.source_ast_fingerprint, lowered.ast_fingerprint) and
+                existing_tree.is_including_tests == is_including_tests)
+            {
                 return existing_tree;
             }
         }
@@ -4130,6 +4699,7 @@ pub const CompilerDb = struct {
             file_id,
             input_ptr.owned_text,
             parsed_ptr,
+            is_including_tests,
         );
         // Keep module-symbol `ast_node`/`cst_node` synchronized when `resolveSignatures` hits Early Cutoff:
         for (new_tree.entries) |entry| {
@@ -4367,11 +4937,504 @@ pub const CompilerDb = struct {
         return false;
     }
 
+    /// Resolves the body or initializer CST node for a nested AST item inside an inline `mod` or `impl`.
+    fn resolveNestedAstItemBodyCst(
+        parsed: *const ParsedCstArtifact,
+        item_kind: ItemKind,
+        ast_node: syntax_arenas.AstNode,
+        item_cst_node: CstNodeIndex,
+    ) CstNodeIndex {
+        if (item_kind == .fn_decl or item_kind == .subscript_decl or
+            item_kind == .test_decl or item_kind == .bench_decl)
+        {
+            if (ast_node.rhs.tag == .node) {
+                const body_ast = NodeIndex.fromInt(ast_node.rhs.payload);
+                if (body_ast.asInt() < parsed.ast_arena.countNodes()) {
+                    const cst_id = parsed.ast_arena.getCstOrigin(body_ast);
+                    if (!cst_id.isNone()) return cst_id;
+                }
+            }
+            return findDirectBodyBlockCst(&parsed.cst_arena, item_cst_node);
+        }
+        if (item_kind == .const_decl or item_kind == .type_alias_decl) {
+            const init_cst = findConstInitCst(&parsed.token_buffer, &parsed.cst_arena, item_cst_node);
+            if (!init_cst.isNone()) return init_cst;
+            if (ast_node.rhs.tag == .node) {
+                const body_ast = NodeIndex.fromInt(ast_node.rhs.payload);
+                if (body_ast.asInt() < parsed.ast_arena.countNodes()) {
+                    return parsed.ast_arena.getCstOrigin(body_ast);
+                }
+            }
+        }
+        return .none;
+    }
+
+    /// Hashes header CST nodes in `[start_after_root .. header_end_idx)` without hashing the outer container's `subtree_size`.
+    fn hashContainerHeaderRangeForCxi(
+        hasher: *StructuralHasher,
+        source: []const u8,
+        token_buffer: *const TokenBuffer,
+        cst_arena: *const LosslessCstArena,
+        start_after_root: usize,
+        header_end_idx: usize,
+    ) void {
+        var cursor = start_after_root;
+        while (cursor < header_end_idx) : (cursor += 1) {
+            const node = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cursor)));
+            const is_leaf = node.subtree_size <= 1 and !node.flags.is_bracketed;
+            if (is_leaf) {
+                if (node.flags.is_missing_or_injected) {
+                    if (node.flags.has_error) {
+                        hasher.updateU8(@backingInt(node.kind));
+                        hasher.updateU8(INJECTED_ERROR_LEAF_MARKER);
+                    }
+                    continue;
+                }
+                hasher.updateU8(@backingInt(node.kind));
+                hasher.updateU8(if (node.flags.has_error) 1 else 0);
+                if (!node.token.isNone() and node.token.asInt() < token_buffer.countTokens()) {
+                    const tok_rec = token_buffer.getToken(node.token);
+                    hasher.updateU8(@backingInt(tok_rec.kind));
+                    hasher.updateBytes(getTokenLexeme(source, token_buffer, node.token));
+                }
+            } else {
+                hasher.updateU8(@backingInt(node.kind));
+                hasher.updateU8(if (node.flags.has_error) 1 else 0);
+                hasher.updateU32(node.subtree_size);
+            }
+        }
+    }
+
+    /// Returns `true` if `sym_idx` is externally `.public` outside the current package (walking enclosing scopes).
+    fn isSymbolExternallyPublic(sym_table: *const SymbolTable, sym_idx: SymbolIndex) bool {
+        if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.countSymbols()) return false;
+        var sym = sym_table.getSymbol(sym_idx).*;
+        var alias_hops: u8 = 0;
+        while (sym.kind == .use_alias_sym and !sym.target_symbol.isNone() and
+            sym.target_symbol.asInt() < sym_table.countSymbols() and alias_hops < 16) : (alias_hops += 1)
+        {
+            if (sym.visibility != .public) return false;
+            sym = sym_table.getSymbol(sym.target_symbol).*;
+        }
+        if (sym.flags.is_builtin) return true;
+        if (sym.visibility != .public) return false;
+
+        var cur_scope = sym.scope_id;
+        var depth: u8 = 0;
+        while (!cur_scope.isNone() and depth < 32) : (depth += 1) {
+            const scope_rec = sym_table.scope_arena.getScope(cur_scope);
+            if (scope_rec.parent.isNone()) break;
+            for (sym_table.getScopeMembers(scope_rec.parent)) |parent_mem_idx| {
+                const parent_mem = sym_table.getSymbol(parent_mem_idx).*;
+                if (parent_mem.target_scope == cur_scope and parent_mem.kind != .use_alias_sym) {
+                    if (parent_mem.visibility != .public) return false;
+                    break;
+                }
+            }
+            cur_scope = scope_rec.parent;
+        }
+        return true;
+    }
+
+    /// Returns `true` if the `TypePath` (`path_tokens`) referenced in an `impl` header resolves to an externally `.public` type/trait.
+    fn isImplTypePathExternallyPublic(
+        self: *const CompilerDb,
+        enclosing_scope: ScopeId,
+        source: []const u8,
+        token_buffer: *const TokenBuffer,
+        path_tokens: []const TokenIndex,
+    ) bool {
+        if (path_tokens.len == 0) return false;
+        if (path_tokens.len == 1) {
+            const single_tok = path_tokens[0];
+            if (single_tok.isNone() or single_tok.asInt() >= token_buffer.countTokens()) return false;
+            const tok_kind = token_buffer.getToken(single_tok).kind;
+            if (tok_kind == .prim_type) return true;
+            const name_slice = getTokenLexeme(source, token_buffer, single_tok);
+            const sym_id = self.interner.lookup(name_slice) orelse return false;
+            return switch (self.symbol_table.lookupLexical(
+                enclosing_scope,
+                sym_id,
+                symbol_resolver.NamespaceMask.TYPE_ONLY,
+            )) {
+                .found => |sym_idx| isSymbolExternallyPublic(&self.symbol_table, sym_idx),
+                else => false,
+            };
+        }
+
+        var active_scope = enclosing_scope;
+        for (path_tokens[0 .. path_tokens.len - 1], 0..) |mod_tok, seg_idx| {
+            const seg_name = getTokenLexeme(source, token_buffer, mod_tok);
+            const seg_sym_id = self.interner.lookup(seg_name) orelse return false;
+            const found_mod_idx: SymbolIndex = if (seg_idx == 0) switch (self.symbol_table.lookupLexical(
+                active_scope,
+                seg_sym_id,
+                symbol_resolver.NamespaceMask.TYPE_OR_VALUE,
+            )) {
+                .found => |idx| idx,
+                else => {
+                    if (self.symbol_table.named_module_scopes.get(seg_sym_id.asInt())) |named_scope| {
+                        active_scope = named_scope;
+                        continue;
+                    }
+                    return false;
+                },
+            } else self.symbol_table.lookupInScopeDirect(
+                active_scope,
+                seg_sym_id,
+                symbol_resolver.NamespaceMask.TYPE_OR_VALUE,
+            );
+            if (found_mod_idx.isNone() or !isSymbolExternallyPublic(&self.symbol_table, found_mod_idx)) {
+                return false;
+            }
+            active_scope = self.symbol_table.getSymbol(found_mod_idx).target_scope;
+            if (active_scope.isNone()) return false;
+        }
+
+        const leaf_name = getTokenLexeme(source, token_buffer, path_tokens[path_tokens.len - 1]);
+        const leaf_sym_id = self.interner.lookup(leaf_name) orelse return false;
+        const leaf_idx = self.symbol_table.lookupInScopeDirect(
+            active_scope,
+            leaf_sym_id,
+            symbol_resolver.NamespaceMask.TYPE_ONLY,
+        );
+        return !leaf_idx.isNone() and isSymbolExternallyPublic(&self.symbol_table, leaf_idx);
+    }
+
+    /// Appends externally `.public` `impl` headers and member signatures/consts into `public_hasher`.
+    fn hashImplDeclForPublicCxi(
+        self: *CompilerDb,
+        public_hasher: *StructuralHasher,
+        checker: *TypeChecker,
+        enclosing_scope: ScopeId,
+        source: []const u8,
+        parsed: *const ParsedCstArtifact,
+        impl_ast_id: NodeIndex,
+    ) void {
+        const impl_cst = parsed.ast_arena.getCstOrigin(impl_ast_id);
+        if (impl_cst.isNone() or impl_cst.asInt() >= parsed.cst_arena.countNodes()) return;
+        if (!checker.isCstNodeCfgEnabled(impl_cst)) return;
+
+        const start_idx: usize = impl_cst.asInt();
+        const root_rec = parsed.cst_arena.getNode(impl_cst);
+        const end_idx: usize = @min(
+            start_idx + @max(@as(usize, root_rec.subtree_size), 1),
+            parsed.cst_arena.countNodes(),
+        );
+        const impl_main_tok = parsed.ast_arena.getNode(impl_ast_id).main_token;
+
+        var generic_names: [16][]const u8 = undefined;
+        var generic_name_len: usize = 0;
+        var first_path_toks: [8]TokenIndex = undefined;
+        var first_path_len: usize = 0;
+        var target_path_toks: [8]TokenIndex = undefined;
+        var target_path_len: usize = 0;
+        var has_seen_for = false;
+        var header_end_pos: usize = end_idx;
+
+        var cursor: usize = start_idx + 1;
+        while (cursor < end_idx) {
+            const sub_id = CstNodeIndex.fromInt(@intCast(cursor));
+            const sub = parsed.cst_arena.getNode(sub_id);
+            const step_size: usize = @max(@as(usize, sub.subtree_size), 1);
+            if (sub.kind == .type_params) {
+                const tp_end = @min(cursor + step_size, end_idx);
+                var tp_cur = cursor + 1;
+                while (tp_cur < tp_end) : (tp_cur += 1) {
+                    const tp_node = parsed.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(tp_cur)));
+                    if (tp_node.kind == .type_param) {
+                        const param_end = @min(tp_cur + @max(@as(usize, tp_node.subtree_size), 1), tp_end);
+                        var p_cur = tp_cur + 1;
+                        while (p_cur < param_end) : (p_cur += 1) {
+                            const leaf = parsed.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(p_cur)));
+                            if (leaf.subtree_size <= 1 and !leaf.flags.is_missing_or_injected and
+                                !leaf.token.isNone() and leaf.token.asInt() < parsed.token_buffer.countTokens())
+                            {
+                                const tk = parsed.token_buffer.getToken(leaf.token).kind;
+                                if (tk == .colon or tk == .eq) break;
+                                if (isIdentifierTokenKind(tk) and generic_name_len < generic_names.len) {
+                                    generic_names[generic_name_len] = getTokenLexeme(source, &parsed.token_buffer, leaf.token);
+                                    generic_name_len += 1;
+                                    break;
+                                }
+                            }
+                        }
+                        tp_cur = param_end - 1;
+                    }
+                }
+                cursor = tp_end;
+                continue;
+            }
+            if (sub.kind == .type_args or sub.kind == .visibility_modifier or sub.kind == .attribute) {
+                cursor += step_size;
+                continue;
+            }
+            if (sub.kind == .where_clause) {
+                cursor += step_size;
+                continue;
+            }
+            const is_leaf = sub.subtree_size <= 1 and !sub.flags.is_bracketed;
+            if (is_leaf and !sub.flags.is_missing_or_injected and
+                !sub.token.isNone() and sub.token.asInt() < parsed.token_buffer.countTokens())
+            {
+                if (impl_main_tok.isNone() or sub.token.asInt() > impl_main_tok.asInt()) {
+                    const tok_kind = parsed.token_buffer.getToken(sub.token).kind;
+                    if (tok_kind == .lbrace or tok_kind == .semi) {
+                        header_end_pos = cursor;
+                        break;
+                    }
+                    if (tok_kind == .kw_for) {
+                        has_seen_for = true;
+                        cursor += 1;
+                        continue;
+                    }
+                    if (isIdentifierTokenKind(tok_kind) or tok_kind == .prim_type) {
+                        if (!has_seen_for) {
+                            if (first_path_len < first_path_toks.len) {
+                                first_path_toks[first_path_len] = sub.token;
+                                first_path_len += 1;
+                            }
+                        } else if (target_path_len < target_path_toks.len) {
+                            target_path_toks[target_path_len] = sub.token;
+                            target_path_len += 1;
+                        }
+                    }
+                }
+            }
+            cursor += 1;
+        }
+
+        const check_target_slice = if (has_seen_for)
+            target_path_toks[0..target_path_len]
+        else
+            first_path_toks[0..first_path_len];
+        var is_target_generic_param = false;
+        if (check_target_slice.len == 1) {
+            const target_lex = getTokenLexeme(source, &parsed.token_buffer, check_target_slice[0]);
+            for (generic_names[0..generic_name_len]) |g_name| {
+                if (std.mem.eql(u8, g_name, target_lex)) {
+                    is_target_generic_param = true;
+                    break;
+                }
+            }
+        }
+        const is_target_pub = is_target_generic_param or self.isImplTypePathExternallyPublic(
+            enclosing_scope,
+            source,
+            &parsed.token_buffer,
+            check_target_slice,
+        );
+        if (!is_target_pub) return;
+
+        const member_ids = symbol_resolver.extractImplMemberItems(&parsed.ast_arena, impl_ast_id);
+        if (has_seen_for) {
+            const is_trait_pub = self.isImplTypePathExternallyPublic(
+                enclosing_scope,
+                source,
+                &parsed.token_buffer,
+                first_path_toks[0..first_path_len],
+            );
+            if (!is_trait_pub) return;
+
+            public_hasher.updateU8(0xC1);
+            hashContainerHeaderRangeForCxi(
+                public_hasher,
+                source,
+                &parsed.token_buffer,
+                &parsed.cst_arena,
+                start_idx + 1,
+                header_end_pos,
+            );
+            var active_member_count: u32 = 0;
+            for (member_ids) |raw_mem_id| {
+                const mem_ast_id = NodeIndex.fromInt(raw_mem_id);
+                if (mem_ast_id.asInt() >= parsed.ast_arena.countNodes()) continue;
+                const mem_ast = parsed.ast_arena.getNode(mem_ast_id);
+                const mem_kind = astTagToItemKind(mem_ast.tag) orelse continue;
+                const mem_cst = parsed.ast_arena.getCstOrigin(mem_ast_id);
+                if (!checker.isCstNodeCfgEnabled(mem_cst)) continue;
+                active_member_count += 1;
+                const mem_body_cst = resolveNestedAstItemBodyCst(parsed, mem_kind, mem_ast, mem_cst);
+                public_hasher.updateU8(@backingInt(mem_kind));
+                public_hasher.updateFingerprint(computeItemSignatureFingerprint(
+                    source,
+                    &parsed.token_buffer,
+                    &parsed.cst_arena,
+                    mem_cst,
+                    mem_body_cst,
+                ));
+                if (mem_kind == .const_decl or mem_kind == .type_alias_decl) {
+                    public_hasher.updateFingerprint(computeItemBodyFingerprint(
+                        source,
+                        &parsed.token_buffer,
+                        &parsed.cst_arena,
+                        mem_cst,
+                        mem_body_cst,
+                    ));
+                }
+            }
+            public_hasher.updateU32(active_member_count);
+            return;
+        }
+
+        // Inherent `impl Target`: hash header + ONLY `.public` members (skipping entirely if 0 `.public` members):
+        var pub_member_count: u32 = 0;
+        for (member_ids) |raw_mem_id| {
+            const mem_ast_id = NodeIndex.fromInt(raw_mem_id);
+            if (mem_ast_id.asInt() >= parsed.ast_arena.countNodes()) continue;
+            const mem_ast = parsed.ast_arena.getNode(mem_ast_id);
+            const mem_kind = astTagToItemKind(mem_ast.tag) orelse continue;
+            if (mem_kind == .test_decl or mem_kind == .bench_decl) continue;
+            const mem_cst = parsed.ast_arena.getCstOrigin(mem_ast_id);
+            if (!checker.isCstNodeCfgEnabled(mem_cst)) continue;
+            const mem_vis = extractItemVisibility(
+                source,
+                &parsed.token_buffer,
+                &parsed.cst_arena,
+                mem_cst,
+                mem_ast.main_token,
+            );
+            if (mem_vis != .public) continue;
+            if (pub_member_count == 0) {
+                public_hasher.updateU8(0xC2);
+                hashContainerHeaderRangeForCxi(
+                    public_hasher,
+                    source,
+                    &parsed.token_buffer,
+                    &parsed.cst_arena,
+                    start_idx + 1,
+                    header_end_pos,
+                );
+            }
+            pub_member_count += 1;
+            const mem_body_cst = resolveNestedAstItemBodyCst(parsed, mem_kind, mem_ast, mem_cst);
+            public_hasher.updateU8(@backingInt(mem_kind));
+            public_hasher.updateFingerprint(computeItemSignatureFingerprint(
+                source,
+                &parsed.token_buffer,
+                &parsed.cst_arena,
+                mem_cst,
+                mem_body_cst,
+            ));
+            if (mem_kind == .const_decl) {
+                public_hasher.updateFingerprint(computeItemBodyFingerprint(
+                    source,
+                    &parsed.token_buffer,
+                    &parsed.cst_arena,
+                    mem_cst,
+                    mem_body_cst,
+                ));
+            }
+        }
+        if (pub_member_count > 0) {
+            public_hasher.updateU32(pub_member_count);
+        }
+    }
+
+    /// Recursively hashes externally `.public` items inside an inline `pub mod` block.
+    fn hashInlinePublicModForCxi(
+        self: *CompilerDb,
+        public_hasher: *StructuralHasher,
+        checker: *TypeChecker,
+        parent_scope: ScopeId,
+        source: []const u8,
+        parsed: *const ParsedCstArtifact,
+        mod_ast_id: NodeIndex,
+        mod_name_sym: SymbolId,
+        mod_name_text: []const u8,
+        depth: u32,
+    ) void {
+        if (depth >= 32) return;
+        var child_scope: ScopeId = .none;
+        if (!parent_scope.isNone() and !mod_name_sym.isNone()) {
+            const mod_sym_idx = self.symbol_table.lookupInScopeDirect(
+                parent_scope,
+                mod_name_sym,
+                symbol_resolver.NamespaceMask.TYPE_OR_VALUE,
+            );
+            if (!mod_sym_idx.isNone()) {
+                child_scope = self.symbol_table.getSymbol(mod_sym_idx).target_scope;
+            }
+        }
+
+        public_hasher.updateU8(0xD1);
+        public_hasher.updateBytes(mod_name_text);
+        var pub_child_count: u32 = 0;
+        const inner_items = symbol_resolver.extractModInnerItems(&parsed.ast_arena, mod_ast_id);
+        for (inner_items) |raw_child_id| {
+            const child_ast_id = NodeIndex.fromInt(raw_child_id);
+            if (child_ast_id.asInt() >= parsed.ast_arena.countNodes()) continue;
+            const child_ast = parsed.ast_arena.getNode(child_ast_id);
+            const child_kind = astTagToItemKind(child_ast.tag) orelse continue;
+            if (child_kind == .test_decl or child_kind == .bench_decl or child_kind == .extern_block) continue;
+            const child_cst = parsed.ast_arena.getCstOrigin(child_ast_id);
+            if (child_kind == .impl_decl) {
+                self.hashImplDeclForPublicCxi(public_hasher, checker, child_scope, source, parsed, child_ast_id);
+                continue;
+            }
+            if (!checker.isCstNodeCfgEnabled(child_cst)) continue;
+            const child_vis = extractItemVisibility(
+                source,
+                &parsed.token_buffer,
+                &parsed.cst_arena,
+                child_cst,
+                child_ast.main_token,
+            );
+            if (child_vis != .public) continue;
+
+            pub_child_count += 1;
+            const child_name = extractItemNameSlice(
+                source,
+                &parsed.token_buffer,
+                &parsed.cst_arena,
+                child_kind,
+                child_ast.main_token,
+                child_cst,
+            );
+            if (child_kind == .mod_decl and child_ast.rhs.tag == .extra) {
+                const nested_sym = self.interner.lookup(child_name) orelse .none;
+                self.hashInlinePublicModForCxi(
+                    public_hasher,
+                    checker,
+                    child_scope,
+                    source,
+                    parsed,
+                    child_ast_id,
+                    nested_sym,
+                    child_name,
+                    depth + 1,
+                );
+                continue;
+            }
+            const child_body_cst = resolveNestedAstItemBodyCst(parsed, child_kind, child_ast, child_cst);
+            public_hasher.updateU8(@backingInt(child_kind));
+            public_hasher.updateBytes(child_name);
+            public_hasher.updateFingerprint(computeItemSignatureFingerprint(
+                source,
+                &parsed.token_buffer,
+                &parsed.cst_arena,
+                child_cst,
+                child_body_cst,
+            ));
+            if (child_kind == .const_decl) {
+                public_hasher.updateFingerprint(computeItemBodyFingerprint(
+                    source,
+                    &parsed.token_buffer,
+                    &parsed.cst_arena,
+                    child_cst,
+                    child_body_cst,
+                ));
+            }
+        }
+        public_hasher.updateU32(pub_child_count);
+    }
+
     /// Stage 6 implementation: resolves module signatures for `file_id` (shielded by `tree_fingerprint`).
     fn computeResolveSignatures(self: *CompilerDb, file_id: FileId) QueryError!Fingerprint128 {
         const item_tree_init = try self.extractItemTree(file_id);
         const item_entries = item_tree_init.entries;
         const item_tree_fp = item_tree_init.tree_fingerprint;
+        const is_including_tests = item_tree_init.is_including_tests;
         const active_layout = try self.readTargetLayout();
         const is_internal_core = self.readInternalCore();
         const is_stdlib_durability = if (self.source_inputs.get(file_id.asInt())) |inp|
@@ -4384,14 +5447,23 @@ pub const CompilerDb = struct {
         var hasher = StructuralHasher.init();
         hasher.updateU32(file_id.asInt());
         hasher.updateU8(active_layout.ptr_byte_size);
+        hasher.updateU8(@backingInt(self.target_spec.arch));
+        hasher.updateU8(@backingInt(self.target_spec.os));
+        hasher.updateU8(@backingInt(self.target_spec.simd_level));
+        hasher.updateU8(@intFromBool(is_including_tests));
         hasher.updateU8(@intFromBool(is_core_allowed));
         hasher.updateFingerprint(item_tree_fp);
 
-        var public_count: u32 = 0;
+        var public_cxi_hasher = StructuralHasher.init();
+        public_cxi_hasher.updateU32(file_id.asInt());
+        public_cxi_hasher.updateU8(active_layout.ptr_byte_size);
+        public_cxi_hasher.updateU8(@backingInt(self.target_spec.arch));
+        public_cxi_hasher.updateU8(@backingInt(self.target_spec.os));
+        public_cxi_hasher.updateU8(@backingInt(self.target_spec.simd_level));
+
         for (item_entries) |entry| {
             const sig_fp = try self.getItemTreeSigProj(entry.def_id);
             hasher.updateFingerprint(sig_fp);
-            if (entry.is_pub) public_count += 1;
         }
 
         // Resolve registered root packages (`core/root.cx` / `cx`) deduplicating shared `FileId`s:
@@ -4472,11 +5544,20 @@ pub const CompilerDb = struct {
         // Run Phase 4 symbol collection, `use` resolution, and signature type resolution for `file_id`:
         var mod_scope: ScopeId = .none;
         var sig_err_count: u32 = 0;
+        var public_count: u32 = 0;
         if (self.source_inputs.getPtr(file_id.asInt())) |input_ptr| {
             if (self.parsed_artifacts.getPtr(file_id.asInt())) |parsed_ptr| {
                 const was_core_allowed = self.symbol_table.is_internal_core;
+                const had_included_tests = self.symbol_table.is_including_tests;
+                const prev_cfg_env = self.symbol_table.cfg_env;
                 self.symbol_table.is_internal_core = is_core_allowed;
-                defer self.symbol_table.is_internal_core = was_core_allowed;
+                self.symbol_table.is_including_tests = is_including_tests;
+                self.symbol_table.cfg_env = type_system.CfgEnv.fromTargetSpec(self.target_spec, is_including_tests);
+                defer {
+                    self.symbol_table.is_internal_core = was_core_allowed;
+                    self.symbol_table.is_including_tests = had_included_tests;
+                    self.symbol_table.cfg_env = prev_cfg_env;
+                }
 
                 const sig_sink = try resetOrCreateDefDiagSink(
                     &self.sig_diagnostics,
@@ -4499,6 +5580,29 @@ pub const CompilerDb = struct {
                     sig_sink,
                 ) catch return error.OutOfMemory;
                 const sym_end: u32 = self.symbol_table.countSymbols();
+
+                if (!mod_scope.isNone()) {
+                    // Link `parent_module` for both external child modules and any already-resolved parent file:
+                    for (item_entries) |entry| {
+                        if (entry.kind == .mod_decl) {
+                            const ext_key: u64 = (@as(u64, file_id.asInt()) << 32) |
+                                @as(u64, entry.name_symbol.asInt());
+                            if (self.symbol_table.external_module_scopes.get(ext_key)) |child_mod_scope| {
+                                self.symbol_table.scope_arena.setParentModule(child_mod_scope, mod_scope);
+                            }
+                        }
+                    }
+                    var parent_ext_iter = self.external_mod_files.iterator();
+                    while (parent_ext_iter.next()) |ext_kv| {
+                        if (ext_kv.value_ptr.* == file_id) {
+                            const parent_raw_fid: u32 = @truncate(ext_kv.key_ptr.* >> 32);
+                            if (self.symbol_table.file_module_scopes.get(parent_raw_fid)) |parent_mod_scope| {
+                                self.symbol_table.scope_arena.setParentModule(mod_scope, parent_mod_scope);
+                            }
+                            break;
+                        }
+                    }
+                }
 
                 for (root_mod_syms.items) |root_sym_raw| {
                     if (self.root_module_files.get(root_sym_raw) == file_id and !mod_scope.isNone()) {
@@ -4531,11 +5635,93 @@ pub const CompilerDb = struct {
                 defer checker.deinit();
                 checker.db = self;
                 checker.target_layout = active_layout;
+                checker.cfg_env = type_system.CfgEnv.fromTargetSpec(self.target_spec, is_including_tests);
+                checker.is_including_tests = is_including_tests;
                 checker.is_stdlib_file = (input_ptr.durability == .high);
                 checker.is_internal_core = is_core_allowed;
 
                 checker.resolveModuleSignatures() catch return error.OutOfMemory;
                 sig_err_count = sig_sink.error_count;
+
+                // Finalize `.cxi` `public_interface_fingerprint` across public items, inline `pub mod`, `pub const`, and `impl`s:
+                const latest_entries = if (self.item_trees.getPtr(file_id.asInt())) |tree_ptr|
+                    tree_ptr.entries
+                else
+                    item_entries;
+                for (latest_entries) |entry| {
+                    if (entry.kind == .impl_decl) {
+                        self.hashImplDeclForPublicCxi(
+                            &public_cxi_hasher,
+                            &checker,
+                            mod_scope,
+                            input_ptr.owned_text,
+                            parsed_ptr,
+                            entry.ast_node,
+                        );
+                        continue;
+                    }
+                    if (!entry.isPublicOutsidePkg()) continue;
+                    if (!checker.isCstNodeCfgEnabled(entry.cst_node)) continue;
+                    public_count += 1;
+
+                    if (entry.kind == .mod_decl) {
+                        const is_inline_mod = !entry.ast_node.isNone() and
+                            entry.ast_node.asInt() < parsed_ptr.ast_arena.countNodes() and
+                            parsed_ptr.ast_arena.getNode(entry.ast_node).rhs.tag == .extra;
+                        if (is_inline_mod) {
+                            self.hashInlinePublicModForCxi(
+                                &public_cxi_hasher,
+                                &checker,
+                                mod_scope,
+                                input_ptr.owned_text,
+                                parsed_ptr,
+                                entry.ast_node,
+                                entry.name_symbol,
+                                entry.name_text,
+                                0,
+                            );
+                        } else {
+                            public_cxi_hasher.updateU8(@backingInt(entry.kind));
+                            public_cxi_hasher.updateBytes(entry.name_text);
+                            public_cxi_hasher.updateFingerprint(entry.signature_fingerprint);
+                            const ext_key: u64 = (@as(u64, file_id.asInt()) << 32) |
+                                @as(u64, entry.name_symbol.asInt());
+                            if (self.external_mod_files.get(ext_key)) |child_fid| {
+                                if (self.resolved_signatures.get(child_fid.asInt())) |child_sigs| {
+                                    public_cxi_hasher.updateFingerprint(child_sigs.public_interface_fingerprint);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    public_cxi_hasher.updateU8(@backingInt(entry.kind));
+                    public_cxi_hasher.updateBytes(entry.name_text);
+                    public_cxi_hasher.updateFingerprint(entry.signature_fingerprint);
+                    if (entry.kind == .const_decl) {
+                        public_cxi_hasher.updateFingerprint(entry.body_fingerprint);
+                    }
+                }
+                if (!mod_scope.isNone()) {
+                    for (self.symbol_table.getScopeMembers(mod_scope)) |mem_idx| {
+                        const mem_sym = self.symbol_table.getSymbol(mem_idx).*;
+                        if (mem_sym.kind == .use_alias_sym and mem_sym.visibility == .public and
+                            !mem_sym.target_symbol.isNone() and
+                            mem_sym.target_symbol.asInt() < self.symbol_table.countSymbols())
+                        {
+                            const target_sym = self.symbol_table.getSymbol(mem_sym.target_symbol).*;
+                            public_cxi_hasher.updateU8(0xE1);
+                            public_cxi_hasher.updateBytes(mem_sym.name_text);
+                            hashTypeCanonical(
+                                &public_cxi_hasher,
+                                &self.type_pool,
+                                &self.symbol_table,
+                                target_sym.type_id,
+                            );
+                        }
+                    }
+                }
+                public_cxi_hasher.updateU32(public_count);
 
                 var file_st = checker.extractFileSemanticSideTables(self.allocator) catch
                     return error.OutOfMemory;
@@ -4550,6 +5736,19 @@ pub const CompilerDb = struct {
                     .ast_fingerprint = parsed_ptr.ast_fingerprint,
                 });
             }
+        } else {
+            for (item_entries) |entry| {
+                if (entry.isPublicOutsidePkg()) {
+                    public_count += 1;
+                    public_cxi_hasher.updateU8(@backingInt(entry.kind));
+                    public_cxi_hasher.updateBytes(entry.name_text);
+                    public_cxi_hasher.updateFingerprint(entry.signature_fingerprint);
+                    if (entry.kind == .const_decl) {
+                        public_cxi_hasher.updateFingerprint(entry.body_fingerprint);
+                    }
+                }
+            }
+            public_cxi_hasher.updateU32(public_count);
         }
 
         const resolved_fp = hasher.final();
@@ -4560,6 +5759,7 @@ pub const CompilerDb = struct {
             .public_item_count = public_count,
             .error_count = sig_err_count,
             .signatures_fingerprint = resolved_fp,
+            .public_interface_fingerprint = public_cxi_hasher.final(),
         });
         return resolved_fp;
     }
@@ -4570,13 +5770,15 @@ pub const CompilerDb = struct {
         const parsed_ptr = self.parsed_artifacts.getPtr(file_id.asInt()) orelse return;
         if (Fingerprint128.eql(sync_ptr.ast_fingerprint, parsed_ptr.ast_fingerprint)) return;
         const input_ptr = self.source_inputs.getPtr(file_id.asInt()) orelse return;
+        const is_including_tests = try self.readIncludeTests();
 
-        const fn_handles = try symbol_resolver.collectFileFnDeclHandles(
+        const fn_handles = try symbol_resolver.collectFileFnDeclHandlesWithOptions(
             self.allocator,
             input_ptr.owned_text,
             &parsed_ptr.token_buffer,
             &parsed_ptr.cst_arena,
             &parsed_ptr.ast_arena,
+            is_including_tests,
         );
         defer if (fn_handles.len > 0) self.allocator.free(fn_handles);
 
@@ -4630,6 +5832,8 @@ pub const CompilerDb = struct {
             defer checker.deinit();
             checker.db = self;
             checker.target_layout = active_layout;
+            checker.cfg_env = type_system.CfgEnv.fromTargetSpec(self.target_spec, is_including_tests);
+            checker.is_including_tests = is_including_tests;
             checker.is_stdlib_file = (input_ptr.durability == .high);
             checker.is_internal_core = is_core_allowed;
 
@@ -4674,17 +5878,44 @@ pub const CompilerDb = struct {
             self.symbol_table.getFnParamSpecs(sym_idx)
         else
             &.{};
+        const generic_specs = if (!sym_idx.isNone())
+            self.symbol_table.getGenericParamSpecs(sym_idx)
+        else
+            &.{};
 
         var hasher = StructuralHasher.init();
         hasher.updateU32(def_id.asInt());
         hasher.updateU8(@backingInt(entry.kind));
-        hasher.updateU8(if (entry.is_pub) 1 else 0);
+        hasher.updateU8(@backingInt(entry.visibility));
         hasher.updateBytes(entry.name_text);
         hashTypeCanonical(&hasher, &self.type_pool, &self.symbol_table, resolved_ty);
         hasher.updateU32(@intCast(param_specs.len));
         for (param_specs) |pspec| {
-            hashSymbolTextCanonical(&hasher, &self.interner, pspec.name);
+            // Erase positional-only (`before /`) parameter names so caller signatures hit Early Cutoff (`SE-11`):
+            if (pspec.is_positional_only) {
+                hasher.updateU8(1);
+                hasher.updateU32(1);
+                hasher.updateBytes("_");
+            } else {
+                hashSymbolTextCanonical(&hasher, &self.interner, pspec.name);
+            }
             hasher.updateU8(@intFromBool(pspec.has_default));
+            hasher.updateU8(@intFromBool(pspec.is_positional_only));
+            hasher.updateU8(@intFromBool(pspec.is_keyword_only));
+            hasher.updateU8(@intFromBool(pspec.is_variadic));
+            hasher.updateU8(@intFromBool(pspec.is_builder));
+            hasher.updateU8(@intFromBool(pspec.is_caller_location_default));
+        }
+        hasher.updateU32(@intCast(generic_specs.len));
+        for (generic_specs) |gspec| {
+            hashSymbolTextCanonical(&hasher, &self.interner, gspec.name);
+            hasher.updateU8(@intFromBool(gspec.is_const));
+            hasher.updateU8(@intFromBool(gspec.has_default));
+            if (gspec.has_default) {
+                hashTypeCanonical(&hasher, &self.type_pool, &self.symbol_table, gspec.default_type_id);
+                hashSymbolTextCanonical(&hasher, &self.interner, gspec.default_type_sym);
+                hasher.updateU64(gspec.default_syntax_hash);
+            }
         }
         hasher.updateFingerprint(item_sig_fp);
         const def_sig_fp = hasher.final();
@@ -4692,11 +5923,12 @@ pub const CompilerDb = struct {
         try self.def_signatures.put(self.allocator, def_id.asInt(), .{
             .def_id = def_id,
             .kind = entry.kind,
-            .is_pub = entry.is_pub,
+            .visibility = entry.visibility,
             .name_symbol = entry.name_symbol,
             .symbol_index = sym_idx,
             .type_id = resolved_ty,
             .param_specs = param_specs,
+            .generic_specs = generic_specs,
             .signature_fingerprint = def_sig_fp,
         });
         return def_sig_fp;
@@ -4710,6 +5942,7 @@ pub const CompilerDb = struct {
         const def_sig = try self.getDefSignature(def_id);
         const body_window = try self.getBodyAstProj(def_id);
         const active_layout = try self.readTargetLayout();
+        const is_including_tests = try self.readIncludeTests();
         const is_internal_core = self.readInternalCore();
         const is_stdlib_durability = if (self.source_inputs.get(file_id.asInt())) |inp|
             inp.durability == .high
@@ -4748,6 +5981,8 @@ pub const CompilerDb = struct {
                 defer checker.deinit();
                 checker.db = self;
                 checker.target_layout = active_layout;
+                checker.cfg_env = type_system.CfgEnv.fromTargetSpec(self.target_spec, is_including_tests);
+                checker.is_including_tests = is_including_tests;
                 checker.is_stdlib_file = (input_ptr.durability == .high);
                 checker.is_internal_core = is_core_allowed;
 
@@ -6273,7 +7508,8 @@ test "test_set_input_noop_durability_upgrade_and_comment_early_cutoff" {
     const tree_r1 = try db.extractItemTree(file_id);
     try std.testing.expectEqual(@as(usize, 1), tree_r1.entries.len);
     try std.testing.expectEqualStrings("compute", tree_r1.entries[0].name_text);
-    try std.testing.expect(tree_r1.entries[0].is_pub);
+    try std.testing.expectEqual(Visibility.public, tree_r1.entries[0].visibility);
+    try std.testing.expect(tree_r1.entries[0].isPublicOutsidePkg());
     try std.testing.expectEqual(@as(u64, 1), db.telemetry.countExecutions(.parse_cst));
     try std.testing.expectEqual(@as(u64, 1), db.telemetry.countExecutions(.lower_ast));
     try std.testing.expectEqual(@as(u64, 1), db.telemetry.countExecutions(.item_tree));
@@ -6752,7 +7988,7 @@ test "test_phase5_config_invalidation_target_layout_wasm32_step_limit_and_embed_
     db.setEmbedSandbox(null, &vfs_v1);
     const embed_file = FileId.fromInt(41);
     const embed_src =
-        \\pub const EMBED_LEN: usize = @embed_bytes("assets/ver.txt").len;
+        \\pub const EMBED_LEN: usize = @embed_bytes("assets/ver.txt").len();
     ;
     _ = try db.setInput(embed_file, embed_src, .low);
     const embed_tree = try db.extractItemTree(embed_file);
@@ -6882,18 +8118,18 @@ test "test_phase5_pure_call_memo_replays_deps_overflow_deps_red_path_cancel_and_
     const uaf_src =
         \\pub fn loop_uaf() -> i64 {
         \\    var outer_val: i64 = 10;
-        \\    var saved_ref: &i64 = &outer_val;
+        \\    var saved_ptr: *i64 = &raw outer_val;
         \\    var iter: i64 = 0;
         \\    while iter < 2 {
         \\        let inner_val: i64 = 99;
         \\        if iter == 0 {
-        \\            saved_ref = &inner_val;
+        \\            saved_ptr = &raw inner_val;
         \\        } else {
-        \\            return *saved_ref;
+        \\            return comptime { saved_ptr.* };
         \\        }
         \\        iter = iter + 1;
         \\    }
-        \\    return *saved_ref;
+        \\    return comptime { saved_ptr.* };
         \\}
         \\pub const BAD_UAF: i64 = loop_uaf();
     ;
@@ -6996,4 +8232,280 @@ test "test_phase6_sast_summary_early_cutoff_sast_strict_and_comptime_e0325" {
         diagnostic.DiagnosticCode.e0325_comptime_sandbox_violation,
         ct_diags.diagnostics.items[0].code,
     );
+}
+
+// ----- Phase 7.6: Expr-Fn, Slash, Tests & `.cxi` Firewall -----
+
+test "test_phase76_expr_fn_positional_slash_test_bench_items_and_cxi_visibility_firewall" {
+    var db = try CompilerDb.init(std.testing.allocator);
+    defer db.deinit();
+
+    // [1] Expression-bodied `pub fn f() -> i32 = expr;` RHS edit preserves `signature_fingerprint`:
+    const expr_fn_file = FileId.fromInt(70);
+    const expr_v1 =
+        \\pub fn double_inc(val: i32) -> i32 = val * 2 + 1;
+    ;
+    _ = try db.setInput(expr_fn_file, expr_v1, .low);
+    const expr_tree_v1 = try db.extractItemTree(expr_fn_file);
+    try std.testing.expectEqual(@as(usize, 1), expr_tree_v1.entries.len);
+    const expr_sig_v1 = expr_tree_v1.entries[0].signature_fingerprint;
+    const expr_body_v1 = expr_tree_v1.entries[0].body_fingerprint;
+
+    const expr_v2 =
+        \\pub fn double_inc(val: i32) -> i32 = (val + val) + 99;
+    ;
+    _ = try db.setInput(expr_fn_file, expr_v2, .low);
+    const expr_tree_v2 = try db.extractItemTree(expr_fn_file);
+    try std.testing.expect(Fingerprint128.eql(expr_sig_v1, expr_tree_v2.entries[0].signature_fingerprint));
+    try std.testing.expect(!Fingerprint128.eql(expr_body_v1, expr_tree_v2.entries[0].body_fingerprint));
+
+    // [2] Positional-only `/` parameter rename (`dst` -> `target`) preserves `signature_fingerprint` & `DefSignature`:
+    const slash_file = FileId.fromInt(71);
+    const slash_v1 =
+        \\pub fn copy_slot(dst: i32, /, scale: i32 = 1) -> i32 {
+        \\    return dst * scale;
+        \\}
+    ;
+    const slash_rev1 = try db.setInput(slash_file, slash_v1, .low);
+    const slash_tree_v1 = try db.extractItemTree(slash_file);
+    const def_copy_slot = slash_tree_v1.entries[0].def_id;
+    const slash_sig_v1 = slash_tree_v1.entries[0].signature_fingerprint;
+    const slash_def_sig_v1 = (try db.getDefSignature(def_copy_slot)).signature_fingerprint;
+
+    const slash_v2 =
+        \\pub fn copy_slot(target: i32, /, scale: i32 = 1) -> i32 {
+        \\    return target * scale;
+        \\}
+    ;
+    const slash_rev2 = try db.setInput(slash_file, slash_v2, .low);
+    try std.testing.expect(slash_rev2.isAfter(slash_rev1));
+    const slash_tree_v2 = try db.extractItemTree(slash_file);
+    try std.testing.expect(Fingerprint128.eql(slash_sig_v1, slash_tree_v2.entries[0].signature_fingerprint));
+    const slash_def_sig_v2 = (try db.getDefSignature(def_copy_slot)).signature_fingerprint;
+    try std.testing.expect(Fingerprint128.eql(slash_def_sig_v1, slash_def_sig_v2));
+
+    // [3] Multiple `test "…"` / `bench "…"` blocks have distinct names and `setIncludeTests(false)` skips them:
+    const tb_file = FileId.fromInt(72);
+    const tb_src =
+        \\pub fn helper_fn() -> i32 { return 7; }
+        \\test "alpha case" { let _ = helper_fn(); }
+        \\test "beta case" { let _ = helper_fn(); }
+        \\bench "throughput loop" (bencher: &var Bencher) { let _ = bencher; }
+    ;
+    _ = try db.setInput(tb_file, tb_src, .low);
+    const tb_tree_with = try db.extractItemTree(tb_file);
+    try std.testing.expectEqual(@as(usize, 4), tb_tree_with.entries.len);
+    try std.testing.expectEqualStrings("\"alpha case\"", tb_tree_with.entries[1].name_text);
+    try std.testing.expectEqualStrings("\"beta case\"", tb_tree_with.entries[2].name_text);
+    try std.testing.expectEqualStrings("\"throughput loop\"", tb_tree_with.entries[3].name_text);
+
+    const parse_execs_before = db.telemetry.countExecutions(.parse_cst);
+    db.setIncludeTests(false);
+    const tb_tree_without = try db.extractItemTree(tb_file);
+    try std.testing.expectEqual(@as(usize, 1), tb_tree_without.entries.len);
+    try std.testing.expectEqual(parse_execs_before, db.telemetry.countExecutions(.parse_cst));
+    db.setIncludeTests(true);
+
+    // [4] 4-tier `Visibility` `.cxi` `public_interface_fingerprint` shields external packages from `pub(pkg)` edits:
+    const vis_file = FileId.fromInt(73);
+    const vis_v1 =
+        \\fn priv_fn() -> i32 { return 1; }
+        \\pub(super) fn sup_fn() -> i32 { return 2; }
+        \\pub(pkg) fn pkg_fn(val: i32) -> i32 { return val; }
+        \\pub fn exported_api(val: i32) -> i32 { return val + 1; }
+    ;
+    _ = try db.setInput(vis_file, vis_v1, .low);
+    const vis_tree_v1 = try db.extractItemTree(vis_file);
+    try std.testing.expectEqual(Visibility.private, vis_tree_v1.entries[0].visibility);
+    try std.testing.expectEqual(Visibility.pub_super, vis_tree_v1.entries[1].visibility);
+    try std.testing.expectEqual(Visibility.pub_pkg, vis_tree_v1.entries[2].visibility);
+    try std.testing.expectEqual(Visibility.public, vis_tree_v1.entries[3].visibility);
+
+    const vis_sigs_v1 = try db.resolveSignatures(vis_file);
+    try std.testing.expectEqual(@as(u32, 1), vis_sigs_v1.public_item_count);
+    const cxi_fp_v1 = vis_sigs_v1.public_interface_fingerprint;
+    const intra_fp_v1 = vis_sigs_v1.signatures_fingerprint;
+
+    const vis_v2 =
+        \\fn priv_fn() -> i64 { return 10; }
+        \\pub(super) fn sup_fn(extra: i32) -> i32 { return extra; }
+        \\pub(pkg) fn pkg_fn(val: i64, scale: i64) -> i64 { return val * scale; }
+        \\pub fn exported_api(val: i32) -> i32 { return val + 1; }
+    ;
+    _ = try db.setInput(vis_file, vis_v2, .low);
+    const vis_sigs_v2 = try db.resolveSignatures(vis_file);
+    try std.testing.expect(Fingerprint128.eql(cxi_fp_v1, vis_sigs_v2.public_interface_fingerprint));
+    try std.testing.expect(!Fingerprint128.eql(intra_fp_v1, vis_sigs_v2.signatures_fingerprint));
+}
+
+test "test_stage4_cxi_firewall_impl_const_inline_mod_slash_underscore_and_cfg_target" {
+    var db = try CompilerDb.init(std.testing.allocator);
+    defer db.deinit();
+
+    // [1] Positional-only `src: &[u8], /` <-> `_: &[u8], /` preserves `signature_fingerprint`:
+    const slash_u_file = FileId.fromInt(74);
+    const slash_named =
+        \\pub fn scan_bytes(src: &[u8], /) -> usize {
+        \\    return src.len();
+        \\}
+    ;
+    _ = try db.setInput(slash_u_file, slash_named, .low);
+    const tree_named = try db.extractItemTree(slash_u_file);
+    const sig_named = tree_named.entries[0].signature_fingerprint;
+    const def_sig_named = (try db.getDefSignature(tree_named.entries[0].def_id)).signature_fingerprint;
+
+    const slash_wild =
+        \\pub fn scan_bytes(_: &[u8], /) -> usize {
+        \\    return 0;
+        \\}
+    ;
+    _ = try db.setInput(slash_u_file, slash_wild, .low);
+    const tree_wild = try db.extractItemTree(slash_u_file);
+    try std.testing.expect(Fingerprint128.eql(sig_named, tree_wild.entries[0].signature_fingerprint));
+    const def_sig_wild = (try db.getDefSignature(tree_wild.entries[0].def_id)).signature_fingerprint;
+    try std.testing.expect(Fingerprint128.eql(def_sig_named, def_sig_wild));
+
+    // [2] `.cxi` `public_interface_fingerprint`: `pub const` value, `impl` public vs private methods,
+    //     trait `impl` visibility, and inline `pub mod` child visibility filtering:
+    const cxi_file = FileId.fromInt(75);
+    const cxi_base =
+        \\pub const MAX_PACKET: usize = 512;
+        \\pub(pkg) const INTERNAL_CAP: usize = 16;
+        \\pub trait Codec {
+        \\    fn tag(&self) -> u32;
+        \\}
+        \\pub(pkg) trait InternalHook {
+        \\    fn hook(&self) -> u32;
+        \\}
+        \\pub struct Packet {
+        \\    pub id: u32,
+        \\}
+        \\impl Packet {
+        \\    pub fn public_id(&self) -> u32 { return self.id; }
+        \\    pub(pkg) fn pkg_helper(&self, extra: u32) -> u32 { return self.id + extra; }
+        \\    fn priv_helper(&self) -> u32 { return 1; }
+        \\}
+        \\impl InternalHook for Packet {
+        \\    fn hook(&self) -> u32 { return 10; }
+        \\}
+        \\pub mod nested_pub {
+        \\    pub fn exported_nested() -> i32 { return 1; }
+        \\    pub(pkg) fn hidden_pkg_nested(arg: i32) -> i32 { return arg; }
+        \\}
+    ;
+    _ = try db.setInput(cxi_file, cxi_base, .low);
+    const cxi_fp_base = (try db.resolveSignatures(cxi_file)).public_interface_fingerprint;
+
+    // [2a] Editing `pub(pkg)` const, `pub(pkg)` / private `impl` methods, `pub(pkg)` trait `impl`,
+    //      and `pub(pkg)` item inside inline `pub mod` MUST NOT change `public_interface_fingerprint`:
+    const cxi_priv_edits =
+        \\pub const MAX_PACKET: usize = 512;
+        \\pub(pkg) const INTERNAL_CAP: usize = 64;
+        \\pub trait Codec {
+        \\    fn tag(&self) -> u32;
+        \\}
+        \\pub(pkg) trait InternalHook {
+        \\    fn hook(&self) -> u32;
+        \\}
+        \\pub struct Packet {
+        \\    pub id: u32,
+        \\}
+        \\impl Packet {
+        \\    pub fn public_id(&self) -> u32 { return self.id + 99; }
+        \\    pub(pkg) fn pkg_helper(&self, extra: u64, scale: u64) -> u64 { return extra * scale; }
+        \\    fn priv_helper(&self, delta: u32) -> u32 { return delta; }
+        \\    fn extra_priv(&self) -> bool { return true; }
+        \\}
+        \\impl InternalHook for Packet {
+        \\    fn hook(&self) -> u32 { return 999; }
+        \\}
+        \\pub mod nested_pub {
+        \\    pub fn exported_nested() -> i32 { return 2; }
+        \\    pub(pkg) fn hidden_pkg_nested(arg: i64, flag: bool) -> i64 {
+        \\        let _ = flag;
+        \\        return arg;
+        \\    }
+        \\}
+    ;
+    _ = try db.setInput(cxi_file, cxi_priv_edits, .low);
+    const cxi_fp_after_priv = (try db.resolveSignatures(cxi_file)).public_interface_fingerprint;
+    try std.testing.expect(Fingerprint128.eql(cxi_fp_base, cxi_fp_after_priv));
+
+    // [2b] Changing `pub const MAX_PACKET` value invalidates `public_interface_fingerprint`:
+    const cxi_const_edit =
+        \\pub const MAX_PACKET: usize = 1024;
+        \\pub(pkg) const INTERNAL_CAP: usize = 64;
+        \\pub trait Codec {
+        \\    fn tag(&self) -> u32;
+        \\}
+        \\pub(pkg) trait InternalHook {
+        \\    fn hook(&self) -> u32;
+        \\}
+        \\pub struct Packet {
+        \\    pub id: u32,
+        \\}
+        \\impl Packet {
+        \\    pub fn public_id(&self) -> u32 { return self.id; }
+        \\    pub(pkg) fn pkg_helper(&self, extra: u64, scale: u64) -> u64 { return extra * scale; }
+        \\}
+        \\pub mod nested_pub {
+        \\    pub fn exported_nested() -> i32 { return 2; }
+        \\}
+    ;
+    _ = try db.setInput(cxi_file, cxi_const_edit, .low);
+    const cxi_fp_const_edit = (try db.resolveSignatures(cxi_file)).public_interface_fingerprint;
+    try std.testing.expect(!Fingerprint128.eql(cxi_fp_base, cxi_fp_const_edit));
+
+    // [2c] Changing a `pub fn` signature inside `impl Packet` or adding `impl Codec for Packet` invalidates `.cxi`:
+    const cxi_impl_pub_edit =
+        \\pub const MAX_PACKET: usize = 1024;
+        \\pub(pkg) const INTERNAL_CAP: usize = 64;
+        \\pub trait Codec {
+        \\    fn tag(&self) -> u32;
+        \\}
+        \\pub(pkg) trait InternalHook {
+        \\    fn hook(&self) -> u32;
+        \\}
+        \\pub struct Packet {
+        \\    pub id: u32,
+        \\}
+        \\impl Packet {
+        \\    pub fn public_id(&self) -> u64 { return self.id as u64; }
+        \\}
+        \\impl Codec for Packet {
+        \\    fn tag(&self) -> u32 { return self.id; }
+        \\}
+        \\pub mod nested_pub {
+        \\    pub fn exported_nested() -> i32 { return 2; }
+        \\}
+    ;
+    _ = try db.setInput(cxi_file, cxi_impl_pub_edit, .low);
+    const cxi_fp_impl_edit = (try db.resolveSignatures(cxi_file)).public_interface_fingerprint;
+    try std.testing.expect(!Fingerprint128.eql(cxi_fp_const_edit, cxi_fp_impl_edit));
+
+    // [3] `@cfg` target OS & `cfg.test_mode` synchronization across `CompilerDb`:
+    const cfg_file = FileId.fromInt(76);
+    const cfg_src =
+        \\@cfg(os == "linux")
+        \\pub fn linux_only() -> i32 { return 11; }
+        \\@cfg(test_mode)
+        \\pub fn test_mode_only() -> i32 {
+        \\    @compile_error("must be pruned when is_including_tests is false");
+        \\    return 0;
+        \\}
+        \\pub fn portable_fn() -> i32 { return 7; }
+    ;
+    db.setIncludeTests(false);
+    db.setTargetSpec(codegen_abi.TargetSpec.X86_64_WINDOWS);
+    _ = try db.setInput(cfg_file, cfg_src, .low);
+    const win_sigs = try db.resolveSignatures(cfg_file);
+    try std.testing.expectEqual(@as(u32, 0), win_sigs.error_count);
+    try std.testing.expectEqual(@as(u32, 1), win_sigs.public_item_count);
+
+    db.setTargetSpec(codegen_abi.TargetSpec.X86_64_LINUX);
+    const linux_sigs = try db.resolveSignatures(cfg_file);
+    try std.testing.expectEqual(@as(u32, 0), linux_sigs.error_count);
+    try std.testing.expectEqual(@as(u32, 2), linux_sigs.public_item_count);
+    try std.testing.expect(!Fingerprint128.eql(win_sigs.public_interface_fingerprint, linux_sigs.public_interface_fingerprint));
+    db.setIncludeTests(true);
 }

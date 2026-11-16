@@ -277,16 +277,16 @@ test "test_parser_all_top_level_item_declarations_and_attributes" {
         \\}
         \\pub type ByteSlice = &[u8];
         \\pub type NonZeroPort = u16 is 1..=65535;
-        \\pub type RegFlags = bit_field u32 {
+        \\pub bit_field RegFlags: u32 {
         \\    pub enabled: bool | 1,
-        \\    mode: u8 | 3;
-        \\};
+        \\    mode: u8 | 3,
+        \\}
         \\@derive(Clone, Debug)
-        \\@repr(C, align = 16)
+        \\@repr(C, align: 16)
         \\pub struct Packet[T: Copy, const CAP: usize = 64] where T: Sized {
         \\    @field_attr(id: 1)
         \\    pub header: u32 = 0,
-        \\    payload: [T; CAP];
+        \\    payload: [T; CAP],
         \\}
         \\struct UnitMarker;
         \\pub bit_field StatusRegister: u32 {
@@ -298,7 +298,7 @@ test "test_parser_all_top_level_item_declarations_and_attributes" {
         \\    @cold
         \\    Ping = 0,
         \\    Payload(T, u32),
-        \\    Metadata { id: u64, flags: u8 = 1 };
+        \\    Metadata { id: u64, flags: u8 = 1 },
         \\    Close = 255,
         \\}
         \\@repr(C)
@@ -311,17 +311,21 @@ test "test_parser_all_top_level_item_declarations_and_attributes" {
         \\    const MAX_LEN: usize = 1024;
         \\    fn count(&self) -> usize;
         \\    pub async unsafe fn reset(&mut self) { }
-        \\    subscript(&self, index: usize) -> &Elem;
+        \\    subscript(index: usize) -> &Elem;
         \\}
         \\impl[T: Copy, const CAP: usize] Packet[T, const CAP] {
         \\    pub const VERSION: u32 = 1;
         \\    pub type ElemType = T;
         \\    pub fn take_ownership(own self) -> Self { return self; }
-        \\    pub fn borrow_ref(ref self) -> i32 { return 0; }
-        \\    pub fn borrow_ref_mut(ref mut self, _: i32) -> i32 { return 1; }
-        \\    pub fn mutate_self(mut self, self_typed: i32 = 10) -> i32 { return self_typed; }
-        \\    pub fn explicit_self(self: &Self, val: inout i32, out: set i32, owned: sink i32) {}
-        \\    pub subscript(&self, idx: usize): u32 { yield self.header; }
+        \\    pub fn borrow_ref(&self) -> i32 { return 0; }
+        \\    pub fn borrow_ref_mut(&mut self, _: i32) -> i32 { return 1; }
+        \\    pub fn mutate_self(var own self, self_typed: i32 = 10) -> i32 { return self_typed; }
+        \\    pub fn explicit_self(self: &Self, val: &mut i32, out_slot: &out i32, owned: own i32) {}
+        \\    pub subscript(idx: usize) -> u32 {
+        \\        let {
+        \\            yield self.header;
+        \\        }
+        \\    }
         \\}
         \\impl[T: Copy, const CAP: usize] Container[T] for Packet[T, const CAP] where T: Sized {
         \\    fn count(&self) -> usize { return CAP; }
@@ -359,17 +363,14 @@ test "test_parser_all_11_primary_types_and_postfix_optional_chains" {
     const types_source =
         \\pub struct TypeShowcase[T: Clone + Send = i32, const N: usize = 16] {
         \\    pub f_prim: i32,
+        \\    pub f_opaque: *opaque,
         \\    pub f_self: Self,
         \\    pub f_ref: &T,
         \\    pub f_ref_mut: &mut T,
-        \\    pub f_ref_inout: &inout T,
-        \\    pub f_ref_let: &let T,
+        \\    pub f_ref_out: &out T,
         \\    pub f_ptr: *u8,
         \\    pub f_ptr_mut: *mut u8,
         \\    pub f_own: own T,
-        \\    pub f_own_mut: own mut T,
-        \\    pub f_region_ref: ref T,
-        \\    pub f_region_mut: ref mut T,
         \\    pub f_soa_slice: #soa [T],
         \\    pub f_soa_array: #soa [T; N],
         \\    pub f_slice: [u8],
@@ -382,6 +383,7 @@ test "test_parser_all_11_primary_types_and_postfix_optional_chains" {
         \\    pub f_qualified: cx.col.Map[str, T, const 8, 16, true, MAX_CAP],
         \\    pub f_assoc: Container.Item,
         \\    pub f_opt: T?,
+        \\    pub f_res: T!IoErr,
         \\    pub f_nested_opt: (&mut [T; N])??,
         \\}
     ;
@@ -413,7 +415,7 @@ test "test_parser_all_statement_forms_and_all_11_assignment_operators" {
         \\pub fn exercise_statements(input: i32) -> i32 {
         \\    ;
         \\    @state let immut_val: i32 = input;
-        \\    var mut counter: i32 = 0;
+        \\    var counter: i32 = 0;
         \\    let .Ok(extracted) = validate(immut_val) else {
         \\        return -1;
         \\    };
@@ -488,7 +490,7 @@ test "test_parser_all_statement_forms_and_all_11_assignment_operators" {
 test "test_parser_all_refutable_and_irrefutable_patterns" {
     const patterns_source =
         \\pub fn match_patterns(scrutinee: Event) -> i32 {
-        \\    let (mut a_val, ref b_val, own c_val, &d_val, &mut e_val, _) = unpack();
+        \\    let (var a_val, &b_val, c_val, &d_val, &mut e_val, _) = unpack();
         \\    return match scrutinee {
         \\        _ => 0,
         \\        0 | 1 | -42 => 1,
@@ -499,9 +501,9 @@ test "test_parser_all_refutable_and_irrefutable_patterns" {
         \\        "ping" | true | false | 3.14 => 6,
         \\        .Quit => 7,
         \\        .Resize(width, height) if width > 0 => width + height,
-        \\        .Click { x_pos, mut y_pos: 0, .. } => x_pos,
+        \\        .Click { x_pos, y_pos: 0, .. } => x_pos,
         \\        Event.KeyPress(code) => code,
-        \\        Point { x_coord, ref y_coord, z_coord: 10, .. } => x_coord + y_coord,
+        \\        Point { x_coord, &y_coord, z_coord: 10, .. } => x_coord + y_coord,
         \\        (first_item, (second_item, _)) => first_item + second_item,
         \\        fallback_bind => 99,
         \\    };
@@ -529,24 +531,24 @@ test "test_parser_all_refutable_and_irrefutable_patterns" {
 
 test "test_parser_all_15_pratt_precedence_tiers_and_llk_disambiguations" {
     const expr_source =
-        \\pub fn pratt_and_llk(vec: &[i32], point: Point) -> i32 {
+        \\pub fn pratt_and_llk(vec: &[i32], var point: Point) -> i32 {
         \\    let arith = -1 + 2 * 3 +% 4 *% 5 -% 6 +| 7 *| 8 -| 9 / 2 % 3;
         \\    let bits = (1 << 4 >> 1) & 0xFF ^ 0x0F | 0x01;
-        \\    let logic = (arith == bits and not false) or (arith != 0 && bits >= 1 || ~bits == 0);
+        \\    let logic = (arith == bits and not false) or (arith != 0 and bits >= 1 or ~bits == 0);
         \\    let casted = (arith as i64) as i32;
         \\    let piped = arith |> transform_a() |> transform_b(scale: 2);
         \\    let caught = fallible_a() catch fallible_b() catch |err| {
         \\        log_err(err);
         \\        0
         \\    };
-        \\    let prefixes = !false and (not true) or *(&point.x) == *(&mut point.y);
-        \\    let modes = borrow_check(&inout point, &let point, own point, ref point, ref mut point);
+        \\    let prefixes = not false and (not true) or (&point.x).* == (&mut point.y).*;
+        \\    let modes = borrow_check(&mut point, &point, &out point, &raw point, &raw mut point, own point);
         \\    let tuple_and_arr = ((1), (1,), (1, 2), [0; 16], [1, 2, 3,]);
         \\    let generic_calls = alloc[u64](16) + alloc[(u64, i64)](4) + alloc[[u8]](2)
         \\        + alloc[cx.io.File](1) + alloc[dyn Printable](1);
         \\    let indexing = vec[0] + matrix[1, 2] + table[EnumType.VariantKey] + EnumType.Make[i32](1);
         \\    let tuple_field = tuple_and_arr.0;
-        \\    let closures = (|x: i32, mut y: i32| -> i32 { x + y })(1, 2) + (|_| 0)(1) + (|| 42)();
+        \\    let closures = (|x: i32, var y: i32| -> i32 { x + y })(1, 2) + (|_| 0)(1) + (|| 42)();
         \\    let blocks = (async { 1 }) + (unsafe { 2 }) + (comptime { 3 });
         \\    let variants = .UnitVar + .TupleVar(1, 2) + .StructVar { a: 1, b, ..base };
         \\    let struct_val = Point { x: 1, y, ..point };
@@ -660,7 +662,7 @@ test "test_parser_catch_right_associativity_vs_pipe_left_associativity" {
     );
 }
 
-// ------------------- DR-21 Domain Showcases -------------------
+// ------------------- DR-22 Domain Showcases -------------------
 
 test "test_parser_all_four_dr03_showcase_programs_lossless_and_zero_diagnostics" {
     const showcase_1_cli =
@@ -670,21 +672,21 @@ test "test_parser_all_four_dr03_showcase_programs_lossless_and_zero_diagnostics"
         \\use cx.io.{IoError, Stdout};
         \\use cx.mem.Arena;
         \\const DEFAULT_BUF_CAP: usize = 65_536;
-        \\@cli_command(name = "cx-scan", version = "1.0.0")
+        \\@cli_command(name: "cx-scan", version: "1.0.0")
         \\pub struct ScanOptions {
-        \\    @arg(short = 'p', long = "pattern")
+        \\    @arg(short: 'p', long: "pattern")
         \\    pub pattern: str,
-        \\    @arg(short = 'f', long = "file")
+        \\    @arg(short: 'f', long: "file")
         \\    pub file_path: str,
-        \\    @flag(short = 'i', long = "ignore-case")
+        \\    @flag(short: 'i', long: "ignore-case")
         \\    pub ignore_case: bool = false,
-        \\    @arg(short = 'm', long = "max-matches")
+        \\    @arg(short: 'm', long: "max-matches")
         \\    pub max_matches: usize = 1_000,
         \\}
-        \\pub fn scan_file(arena: &mut Arena, opts: &ScanOptions, out: &mut Stdout) -> Result[u64, IoError] {
+        \\pub fn scan_file(arena: &mut Arena, opts: &ScanOptions, out: &mut Stdout) -> u64!IoError {
         \\    let file = File.open(opts.file_path)?;
         \\    defer file.close();
-        \\    var reader = BufReader.with_capacity(arena, file, DEFAULT_BUF_CAP);
+        \\    var reader = BufReader.with_capacity(arena, own file, DEFAULT_BUF_CAP);
         \\    var matches_found: u64 = 0;
         \\    while reader.next_line()? is .Some(line) {
         \\        if line.contains(opts.pattern) {
@@ -706,13 +708,13 @@ test "test_parser_all_four_dr03_showcase_programs_lossless_and_zero_diagnostics"
         \\    pub email: str,
         \\    pub role: UserRole?,
         \\}
-        \\@route(method = "POST", path = "/v1/users")
-        \\pub async fn create_user(req: &mut Request) -> Result[Json[CreateUserReq], ApiError] {
+        \\@route(method: "POST", path: "/v1/users")
+        \\pub async fn create_user(req: &mut Request) -> Json[CreateUserReq]!ApiError {
         \\    let body_bytes = req.read_body_bounded(MAX_BODY_BYTES).await?;
         \\    let payload = body_bytes
         \\        |> Json.parse[CreateUserReq]()
         \\        catch |err| return .Err(ApiError.InvalidJson(err.message()));
-        \\    .Ok(Json.from(payload))
+        \\    .Ok(Json.from(own payload))
         \\}
     ;
 
@@ -727,7 +729,7 @@ test "test_parser_all_four_dr03_showcase_programs_lossless_and_zero_diagnostics"
         \\    pub right: OwnPtr[AvlNode[K, V]]?,
         \\}
         \\impl[K: Ord, V] AvlNode[K, V] {
-        \\    fn rotate_right(mut y_node: OwnPtr[AvlNode[K, V]]) -> OwnPtr[AvlNode[K, V]] {
+        \\    fn rotate_right(var y_node: own OwnPtr[AvlNode[K, V]]) -> OwnPtr[AvlNode[K, V]] {
         \\        var x_node = y_node.left.take() orelse return y_node;
         \\        y_node.left = x_node.right.take();
         \\        x_node.right = .Some(own y_node);
@@ -1289,10 +1291,10 @@ test "test_parser_dr21_index_vs_type_args_const_patterns_and_if_let_guard_fix" {
     var interner = try StringInterner.init(std.testing.allocator);
     defer interner.deinit();
 
-    // [1] Disambiguate `IndexExpr` (`arr[*idx_ptr]`, `map[SlotIdx(0)]`, `arr[Vec[u8].LEN]`) vs `TypeArgs`:
+    // [1] Disambiguate `IndexExpr` (`arr[idx_ptr.*]`, `map[SlotIdx(0)]`, `arr[Vec[u8].LEN]`) vs `TypeArgs`:
     const disambig_index_src =
         \\fn test_indexing(arr: &[i32], idx_ptr: *usize, map: &[i32]) -> i32 {
-        \\    let elem_a = arr[*idx_ptr];
+        \\    let elem_a = arr[idx_ptr.*];
         \\    let elem_b = map[SlotIdx(0)];
         \\    let elem_c = arr[Vec[u8].LEN];
         \\    let elem_d = arr[Pair[u8](1)];
@@ -1458,7 +1460,7 @@ test "test_regression_is_type_start_contextual_any_dyn_distinct_index_and_linear
         \\    let idx_f = arr[any.offset];
         \\    let gen_a = wrap[dyn Reader](idx_a);
         \\    let gen_b = wrap[&dyn cx.io.Reader[u8]](idx_b);
-        \\    let gen_c = wrap[any Numeric](idx_c);
+        \\    let gen_c = wrap[any Number](idx_c);
         \\    return idx_d + idx_e + idx_f + gen_a + gen_b + gen_c;
         \\}
     ;
@@ -1500,4 +1502,128 @@ test "test_regression_is_type_start_contextual_any_dyn_distinct_index_and_linear
     );
     try std.testing.expectEqual(@as(u32, 0), sink.error_count);
     try expectValidCstAndAstInvariants(deep_index_buf.items, &token_buf, &cst_arena, &ast_arena);
+}
+
+// ------------ DR-22 Grammar & Retired Diagnostics -------------
+
+test "test_parser_dr22_visibility_zones_subscript_test_bench_fsm_and_e0219_through_e0228" {
+    var token_buf = TokenBuffer.init(std.testing.allocator);
+    defer token_buf.deinit();
+    var cst_arena = LosslessCstArena.init(std.testing.allocator);
+    defer cst_arena.deinit();
+    var ast_arena = AstArena.init(std.testing.allocator);
+    defer ast_arena.deinit();
+    var sink = DiagnosticSink.init(std.testing.allocator);
+    defer sink.deinit();
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    // [1] Valid `DR-22` constructs (`pub(pkg)`, `pub(super)`, `/` & `*` zones, `...`, `subscript`, `test`, `bench`, `:fsm`):
+    const valid_dr22_src =
+        \\@derive(Copy, Equatable)
+        \\pub enum StepOrder: u8 {
+        \\    Relaxed = 0,
+        \\    Acquire = 2,
+        \\}
+        \\pub(super) bit_field RegBits: u32 {
+        \\    pub(pkg) is_on: bool | 1,
+        \\    rest_bits: u32 | 31,
+        \\}
+        \\pub struct Grid[T: Copy | Send = f32, const N: usize = 4] {
+        \\    pub(pkg) cells: [T; N],
+        \\}
+        \\extern "C" fn c_printf(fmt: *u8, ...) -> i32;
+        \\impl[T: Copy, const N: usize] Grid[T, N] {
+        \\    @inline @no_alloc @no_panic
+        \\    pub fn swap_ptrs(left: *mut T, right: *mut T, /, *, var count: usize = 1, dst: &out T) {
+        \\        (left.*, right.*, _) = (right.*, left.*, count);
+        \\        let ro_ptr = &raw left.*;
+        \\        let rw_ptr = &raw mut right.*;
+        \\        unsafe {
+        \\            dst.* = ro_ptr.*;
+        \\            rw_ptr.* = dst.*;
+        \\        }
+        \\    }
+        \\    pub subscript(row: usize, col: usize) -> &T {
+        \\        let {
+        \\            yield &self.cells[row + col];
+        \\        }
+        \\        inout {
+        \\            yield &mut self.cells[row + col];
+        \\        }
+        \\    }
+        \\}
+        \\pub fn run_fsm(ui_body: @builder |&mut RegBits|) -> i32!StepOrder {
+        \\    let header_byte = b'\n';
+        \\    let magic_bytes = b"CX22";
+        \\    let base_grid = Grid { cells: [0.0_f32; 4] };
+        \\    let next_grid = Grid { ..own base_grid };
+        \\    let _ = (ui_body, header_byte, magic_bytes, next_grid);
+        \\    let code = fsm: match StepOrder.Relaxed {
+        \\        .Relaxed => continue :fsm .Acquire,
+        \\        .Acquire => 42_i32,
+        \\    };
+        \\    .Ok(code)
+        \\}
+        \\test "grid multi-index smoke" {
+        \\    let grid = Grid { cells: [1.0_f32; 4] };
+        \\    let _ = &grid[0, 1];
+        \\}
+        \\bench "grid swap bench" (bencher: &mut Bencher) {
+        \\    let _ = bencher;
+        \\}
+    ;
+    try expectCleanParse(valid_dr22_src, &ast_arena, &cst_arena);
+    try std.testing.expect(hasAstTag(&ast_arena, .result_type));
+    try std.testing.expect(hasAstTag(&ast_arena, .subscript_decl));
+    try std.testing.expect(hasAstTag(&ast_arena, .yield_stmt));
+    try std.testing.expect(hasAstTag(&ast_arena, .test_decl));
+    try std.testing.expect(hasAstTag(&ast_arena, .bench_decl));
+    try std.testing.expect(hasAstTag(&ast_arena, .byte_lit));
+    try std.testing.expect(hasAstTag(&ast_arena, .byte_string_lit));
+
+    // [2] Verify all 10 `DR-22` retired-syntax parser diagnostics (`E0219`–`E0228`):
+    const retired_src =
+        \\@noalloc
+        \\@cfg(os = "linux")
+        \\struct LegacyStruct {
+        \\    first: *const u8;
+        \\    second: i32 ! u32 ! bool,
+        \\}
+        \\fn legacy_fn(mut self, /, *, val: inout i32, *) {
+        \\    let mut flag = !true || false;
+        \\    let derefed = *val;
+        \\    let _ = (flag, derefed);
+        \\}
+    ;
+    _ = try corex.parseSource(
+        retired_src,
+        FileId.fromInt(10),
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+        &sink,
+        &interner,
+    );
+    try expectValidCstAndAstInvariants(retired_src, &token_buf, &cst_arena, &ast_arena);
+
+    var seen_codes: [10]bool = @splat(false);
+    for (sink.asSlice()) |diag_item| {
+        switch (diag_item.code) {
+            .e0219_retired_logical_or => seen_codes[0] = true,
+            .e0220_retired_bang_prefix => seen_codes[1] = true,
+            .e0221_retired_mutability_or_param_mode => seen_codes[2] = true,
+            .e0222_chained_result_type => seen_codes[3] = true,
+            .e0223_retired_attribute_eq => seen_codes[4] = true,
+            .e0224_retired_semicolon_member_sep => seen_codes[5] = true,
+            .e0225_retired_noalloc_attribute => seen_codes[6] = true,
+            .e0226_retired_const_raw_ptr => seen_codes[7] = true,
+            .e0227_retired_prefix_deref => seen_codes[8] = true,
+            .e0228_invalid_param_zone_separator => seen_codes[9] = true,
+            else => {},
+        }
+    }
+    for (seen_codes) |is_seen| {
+        try std.testing.expect(is_seen);
+    }
 }

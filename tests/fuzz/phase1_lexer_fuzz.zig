@@ -81,16 +81,35 @@ const LEXICAL_SEED_FRAGMENTS = [_][]const u8{
     "'ab'",
     "#soa ",
     "#bad ",
+    "subscript ",
+    "yield ",
+    "opaque ",
     "orelse ",
     "with ",
     "context ",
     "unreachable ",
+    "b'x' ",
+    "b'\\x7F' ",
+    "b'é' ",
+    "b\"HTTP/1.1\\r\\n\" ",
+    "br#\"raw \"bytes\"\"# ",
+    "42_u64 ",
+    "0xFF_u8 ",
+    "3.14_f32 ",
+    "10_f64 ",
+    "\"\"\"\n    multiline {val=} {{brace}} {if ok { \"inner\" } else { \"alt\" }}\n    \"\"\"",
+    "r\"\"\"\n  raw multiline \"ok\"\n  \"\"\"",
+    "\"\"\"bad_opening\"\"\"",
+    "\"bad \\{ escape \\}\"",
+    "&& ",
+    "... ",
+    "~ ",
     ":= ",
     "$ ",
     "[..$-1] ",
     "tup.0.1.2 ",
     "0..0.5 ",
-    "+% -% *% +| -| *| |> -> => :: := $ <<= >>= ",
+    "+% -% *% +| -| *| |> -> => ... := $ ~ <<= >>= ",
     "\xEF\xBB\xBF",
     "\r\x0B\x0C",
     "\xFF\xFE\xC3\x28$`",
@@ -163,7 +182,7 @@ fn runFastFuzzWorkerShard(
 ) void {
     var ring_buf: [256]u8 = undefined;
     const seed_pattern =
-        "fn calc(x: i32) { let s = \"a{x}\\n\"; /* c */ 0x1F +% 1..10 := $ 'é' r#\"q\"# #soa }\r\n\xFF";
+        "fn calc(x: i32) { let s = \"a{x=} {{b}}\\n\"; 0x1F_u64 +% 1..10 ... ~ b'x' b\"w\" r#\"q\"# #soa }\r\n\xFF";
     for (&ring_buf, 0..) |*byte_ptr, i| {
         byte_ptr.* = seed_pattern[(i + @as(usize, @intCast(initial_seed & 0x3F))) % seed_pattern.len];
     }

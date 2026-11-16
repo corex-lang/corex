@@ -1,6 +1,6 @@
 //! CoreX Stage-1 Minimal Core Library Root (`core`)
 //!
-//! Exposes foundational freestanding primitives, alignment and layout queries, lock-free atomics,
+//! Exposes foundational freestanding primitives, alignment and MVS slot helpers, lock-free atomics,
 //! portable explicit SIMD vectors, deterministic trap/panic handlers, hot-reload runtime seams,
 //! and platform syscall descriptors (re-exported publicly via `cx.*`).
 //!
@@ -9,10 +9,10 @@
 /// Scalar integer bounds and branch-clean min/max/clamp helpers.
 pub mod primitives;
 
-/// Memory layout queries (`@size_of`, `@align_of`, `@default_init`) and `@cache_aligned` wrappers.
+/// Memory layout queries, alignment arithmetic, safe parallel swaps, and `@cache_aligned` wrappers.
 pub mod mem;
 
-/// Lock-free atomic types and memory-ordering fences backed by `@atomic_*` intrinsics.
+/// Lock-free interior-mutable atomic types and memory-ordering fences (`DR-22` §4.1).
 pub mod atomic;
 
 /// Portable `@repr(C)` fixed-width SIMD vector wrappers backed by `@simd_*` intrinsics.

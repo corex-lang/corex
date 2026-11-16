@@ -70,6 +70,7 @@ test "test_symbol_resolver_scope_arena_and_namespace_mask_invariants" {
     try std.testing.expect(NamespaceMask.ALL.contains(.const_ns));
 
     // [2] `ScopeArena` hierarchical allocation and parent chain:
+    const base_scopes = sym_table.scope_arena.countScopes();
     const mod_scope = try sym_table.scope_arena.allocScope(
         .module_scope,
         .none,
@@ -92,7 +93,7 @@ test "test_symbol_resolver_scope_arena_and_namespace_mask_invariants" {
         .{ .is_inside_loop = true },
     );
 
-    try std.testing.expectEqual(@as(usize, 4), sym_table.scope_arena.countScopes());
+    try std.testing.expectEqual(base_scopes + 3, sym_table.scope_arena.countScopes());
     try std.testing.expectEqual(ScopeKind.module_scope, sym_table.scope_arena.getScope(mod_scope).kind);
     try std.testing.expectEqual(mod_scope, sym_table.scope_arena.getScope(fn_scope).parent);
     try std.testing.expectEqual(fn_scope, sym_table.scope_arena.getScope(loop_scope).parent);
@@ -100,7 +101,7 @@ test "test_symbol_resolver_scope_arena_and_namespace_mask_invariants" {
     try std.testing.expect(sym_table.scope_arena.isWithinModule(loop_scope, mod_scope));
 
     try sym_table.reset(&interner);
-    try std.testing.expectEqual(@as(usize, 1), sym_table.scope_arena.countScopes());
+    try std.testing.expectEqual(base_scopes, sym_table.scope_arena.countScopes());
 }
 
 // -------- Disjoint Namespaces, E0408 & @overload Sets ---------
@@ -420,5 +421,48 @@ test "test_symbol_resolver_retired_std_namespace_and_cx_meta_atomic_scopes" {
     try std.testing.expectEqual(TypeId.f32_ty, symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.get("f32").?);
     try std.testing.expectEqual(TypeId.f64_ty, symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.get("f64").?);
     try std.testing.expectEqual(TypeId.usize_ty, symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.get("usize").?);
+    try std.testing.expectEqual(TypeId.opaque_ty, symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.get("opaque").?);
+    try std.testing.expectEqual(TypeId.group_number, symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.get("Number").?);
+    try std.testing.expect(symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.get("Numeric") == null);
     try std.testing.expect(symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.get("NotABuiltin") == null);
+}
+
+// ------------- 4-Tier Visibility & DR-22 Builtins -------------
+
+test "test_symbol_resolver_dr22_four_tier_visibility_pub_super_and_pub_pkg" {
+    try std.testing.expect(!Visibility.private.isPublicOutsidePkg());
+    try std.testing.expect(!Visibility.pub_super.isPublicOutsidePkg());
+    try std.testing.expect(!Visibility.pub_pkg.isPublicOutsidePkg());
+    try std.testing.expect(Visibility.public.isPublicOutsidePkg());
+
+    // [1] `pub(super)` is visible in the immediate parent module, and `pub(pkg)` across sibling modules:
+    const valid_vis_src =
+        "mod pkg_sibling {\n" ++
+        "    pub(pkg) fn pkg_shared() -> i32 = 10;\n" ++
+        "}\n" ++
+        "mod parent_mod {\n" ++
+        "    mod child_mod {\n" ++
+        "        pub(super) fn up_one() -> i32 = 20;\n" ++
+        "    }\n" ++
+        "    pub fn call_child() -> i32 = child_mod.up_one();\n" ++
+        "}\n" ++
+        "pub fn entry() -> i32 = pkg_sibling.pkg_shared() + parent_mod.call_child();\n";
+    var ok_res = try runResolveAndTypecheck(std.testing.allocator, valid_vis_src);
+    defer ok_res.deinit();
+    try std.testing.expect(!ok_res.diagnostics.hasErrors());
+
+    // [2] Accessing `pub(super)` from grandparent module outside parent hierarchy is rejected:
+    const bad_super_src =
+        "mod outer_mod {\n" ++
+        "    pub mod inner_mod {\n" ++
+        "        pub(super) fn only_outer() -> i32 = 5;\n" ++
+        "    }\n" ++
+        "}\n" ++
+        "pub fn forbidden_grandparent() -> i32 = outer_mod.inner_mod.only_outer();\n";
+    var bad_res = try runResolveAndTypecheck(std.testing.allocator, bad_super_src);
+    defer bad_res.deinit();
+    try std.testing.expect(
+        hasDiagnosticCode(&bad_res.diagnostics, .e0433_inaccessible_field_or_visibility) or
+            hasDiagnosticCode(&bad_res.diagnostics, .e0409_private_symbol_access),
+    );
 }

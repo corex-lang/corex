@@ -1,9 +1,9 @@
 //! Unit Tests for High-Speed Deterministic Lexer & Trivia Scanner (`tests/unit/lexer_test.zig`)
 //!
-//! Verifies all 117 `TokenKind` variants (`0..116`), all 49 language keywords and 19 primitive types,
+//! Verifies all 120 `TokenKind` variants (`0..119`), all 50 language keywords and 20 primitive types,
 //! all 10 `TriviaKind` classifications across `LF` and `CRLF`, disjoint identifier casing (`W0201`),
-//! numeric literals (`E0103`), interpolated/raw strings and character literals (`W0101`, `E0101`, `E0102`),
-//! resource caps (`E0104`, `> 15` trivia coalescing, `> 65,535`-byte tokens), and lossless reconstruction.
+//! numeric literals and suffixes (`E0103`), single/multiline/byte strings and escapes (`W0101`, `E0101`,
+//! `E0102`, `E0113`–`E0117`), resource caps (`E0104`), and lossless CST reconstruction.
 //!
 //! Enforces 100% line and branch coverage of `stage0/src/lexer.zig` with zero memory leaks.
 
@@ -30,7 +30,7 @@ const TransactionalPatcher = corex.TransactionalPatcher;
 
 // --------------------------------------- CONSTS ----------------------------------------
 
-/// Exhaustive table mapping sample `.cx` lexemes to all 116 non-EOF `TokenKind` variants (`0..115`).
+/// Exhaustive table mapping sample `.cx` lexemes to all 119 non-EOF `TokenKind` variants (`0..118`).
 const EXHAUSTIVE_TOKEN_CASES = [_]struct {
     lexeme: []const u8,
     expected: TokenKind,
@@ -51,9 +51,9 @@ const EXHAUSTIVE_TOKEN_CASES = [_]struct {
     .{ .lexeme = "var", .expected = .kw_var },
     .{ .lexeme = "bit_field", .expected = .kw_bit_field },
     .{ .lexeme = "comptime", .expected = .kw_comptime },
+    .{ .lexeme = "subscript", .expected = .kw_subscript },
     .{ .lexeme = "mut", .expected = .kw_mut },
     .{ .lexeme = "own", .expected = .kw_own },
-    .{ .lexeme = "ref", .expected = .kw_ref },
     .{ .lexeme = "where", .expected = .kw_where },
     .{ .lexeme = "extern", .expected = .kw_extern },
     .{ .lexeme = "async", .expected = .kw_async },
@@ -62,6 +62,8 @@ const EXHAUSTIVE_TOKEN_CASES = [_]struct {
     .{ .lexeme = "defer", .expected = .kw_defer },
     .{ .lexeme = "errdefer", .expected = .kw_errdefer },
     .{ .lexeme = "is", .expected = .kw_is },
+    .{ .lexeme = "with", .expected = .kw_with },
+    .{ .lexeme = "context", .expected = .kw_context },
     .{ .lexeme = "if", .expected = .kw_if },
     .{ .lexeme = "else", .expected = .kw_else },
     .{ .lexeme = "match", .expected = .kw_match },
@@ -74,9 +76,8 @@ const EXHAUSTIVE_TOKEN_CASES = [_]struct {
     .{ .lexeme = "continue", .expected = .kw_continue },
     .{ .lexeme = "catch", .expected = .kw_catch },
     .{ .lexeme = "orelse", .expected = .kw_orelse },
-    .{ .lexeme = "with", .expected = .kw_with },
-    .{ .lexeme = "context", .expected = .kw_context },
     .{ .lexeme = "unreachable", .expected = .kw_unreachable },
+    .{ .lexeme = "yield", .expected = .kw_yield },
     .{ .lexeme = "true", .expected = .kw_true },
     .{ .lexeme = "false", .expected = .kw_false },
     .{ .lexeme = "and", .expected = .kw_and },
@@ -92,6 +93,8 @@ const EXHAUSTIVE_TOKEN_CASES = [_]struct {
     .{ .lexeme = "3.14159", .expected = .float_lit },
     .{ .lexeme = "\"corex\"", .expected = .string_lit },
     .{ .lexeme = "'x'", .expected = .char_lit },
+    .{ .lexeme = "b'x'", .expected = .byte_lit },
+    .{ .lexeme = "b\"corex\"", .expected = .byte_string_lit },
     .{ .lexeme = "{", .expected = .lbrace },
     .{ .lexeme = "}", .expected = .rbrace },
     .{ .lexeme = "(", .expected = .lparen },
@@ -101,18 +104,19 @@ const EXHAUSTIVE_TOKEN_CASES = [_]struct {
     .{ .lexeme = ";", .expected = .semi },
     .{ .lexeme = ",", .expected = .comma },
     .{ .lexeme = ":", .expected = .colon },
-    .{ .lexeme = ":=", .expected = .colon_eq },
     .{ .lexeme = ".", .expected = .dot },
     .{ .lexeme = "..", .expected = .dotdot },
     .{ .lexeme = "..=", .expected = .dotdoteq },
+    .{ .lexeme = "...", .expected = .dotdotdot },
     .{ .lexeme = "->", .expected = .arrow },
     .{ .lexeme = "=>", .expected = .fat_arrow },
     .{ .lexeme = "|>", .expected = .pipe_gt },
     .{ .lexeme = "@", .expected = .at },
     .{ .lexeme = "#soa", .expected = .hash_soa },
-    .{ .lexeme = "$", .expected = .dollar },
     .{ .lexeme = "?", .expected = .question },
     .{ .lexeme = "_", .expected = .underscore },
+    .{ .lexeme = ":=", .expected = .colon_eq },
+    .{ .lexeme = "$", .expected = .dollar },
     .{ .lexeme = "+", .expected = .plus },
     .{ .lexeme = "-", .expected = .minus },
     .{ .lexeme = "*", .expected = .star },
@@ -131,7 +135,6 @@ const EXHAUSTIVE_TOKEN_CASES = [_]struct {
     .{ .lexeme = ">", .expected = .gt },
     .{ .lexeme = ">=", .expected = .ge },
     .{ .lexeme = "&", .expected = .amp },
-    .{ .lexeme = "&&", .expected = .ampamp },
     .{ .lexeme = "|", .expected = .pipe },
     .{ .lexeme = "||", .expected = .pipepipe },
     .{ .lexeme = "^", .expected = .caret },
@@ -153,12 +156,12 @@ const EXHAUSTIVE_TOKEN_CASES = [_]struct {
     .{ .lexeme = "`", .expected = .invalid_token },
 };
 
-/// Authoritative list of all 19 primitive type keywords that map to `TokenKind.prim_type` (`49`).
-const ALL_19_PRIMITIVE_TYPES = [_][]const u8{
-    "i8",   "i16", "i32",  "i64",  "i128", "isize",
-    "u8",   "u16", "u32",  "u64",  "u128", "usize",
-    "f32",  "f64", "bool", "char", "str",  "never",
-    "unit",
+/// Authoritative list of all 20 primitive type keywords that map to `TokenKind.prim_type` (`50`).
+const ALL_20_PRIMITIVE_TYPES = [_][]const u8{
+    "i8",   "i16",    "i32",  "i64",  "i128", "isize",
+    "u8",   "u16",    "u32",  "u64",  "u128", "usize",
+    "f32",  "f64",    "bool", "char", "str",  "never",
+    "unit", "opaque",
 };
 
 // -------------------------------------- INTERNALS --------------------------------------
@@ -175,12 +178,12 @@ fn expectLosslessRoundTrip(source: []const u8, token_buffer: *const TokenBuffer)
 
 // ------------------------------------- PUBLIC API --------------------------------------
 
-// ----------------- All 117 TokenKind Variants -----------------
+// ----------------- All 120 TokenKind Variants -----------------
 
-test "test_lexer_all_117_token_kinds_and_19_prim_types_exhaustive" {
-    var seen_variants: [117]bool = @splat(false);
+test "test_lexer_all_120_token_kinds_and_20_prim_types_exhaustive" {
+    var seen_variants: [120]bool = @splat(false);
 
-    // [1] Verify each of the 116 non-EOF token kinds (`0..115`) and final `.eof` (`116`):
+    // [1] Verify each of the 119 non-EOF token kinds (`0..118`) and final `.eof` (`119`):
     for (EXHAUSTIVE_TOKEN_CASES, 0..) |test_case, i| {
         var token_buf = TokenBuffer.init(std.testing.allocator);
         defer token_buf.deinit();
@@ -207,9 +210,9 @@ test "test_lexer_all_117_token_kinds_and_19_prim_types_exhaustive" {
         try std.testing.expect(was_seen);
     }
 
-    // [2] Verify all 19 primitive type keywords map to `TokenKind.prim_type` (`49`) with zero warnings:
-    try std.testing.expectEqual(@as(usize, 19), ALL_19_PRIMITIVE_TYPES.len);
-    for (ALL_19_PRIMITIVE_TYPES) |prim_lexeme| {
+    // [2] Verify all 20 primitive type keywords map to `TokenKind.prim_type` (`50`) with zero warnings:
+    try std.testing.expectEqual(@as(usize, 20), ALL_20_PRIMITIVE_TYPES.len);
+    for (ALL_20_PRIMITIVE_TYPES) |prim_lexeme| {
         const classification = corex.classifyIdentifierOrKeyword(prim_lexeme);
         try std.testing.expectEqual(TokenKind.prim_type, classification.kind);
         try std.testing.expectEqual(IdentifierCase.reserved_or_wildcard, classification.expected_case);
@@ -400,11 +403,11 @@ test "test_lexer_numeric_literals_ranges_method_calls_and_e0103_errors" {
 
     // [2] Exhaustive malformed numeric literals emitting `E0103`:
     const malformed_numbers = [_][]const u8{
-        "0x",      "0X",     "0b",     "0B",       "0o",     "0O",
-        "0x_1",    "0x1_",   "0x1__2", "0x1g",     "0b102",  "0o78",
-        "1__2",    "123_",   "1.2__3", "1.2_",     "1.0e",   "1.0e+",
-        "1.0e-",   "1.0e_2", "1.0e2_", "1.0e2__3", "123abc", "42u64",
-        "3.14f64",
+        "0x",      "0X",      "0b",     "0B",       "0o",     "0O",
+        "0x_1",    "0x1_",    "0x1__2", "0x1g",     "0b102",  "0o78",
+        "1__2",    "123_",    "1.2__3", "1.2_",     "1.0e",   "1.0e+",
+        "1.0e-",   "1.0e_2",  "1.0e2_", "1.0e2__3", "123abc", "0b10_f32",
+        "1.5_u64", "42__u64",
     };
     for (malformed_numbers) |bad_num| {
         var num_buf = TokenBuffer.init(std.testing.allocator);
@@ -423,10 +426,10 @@ test "test_lexer_numeric_literals_ranges_method_calls_and_e0103_errors" {
 // ----------------- Strings, Escapes & Interp ------------------
 
 test "test_lexer_strings_escapes_w0101_e0101_e0102_and_nested_interpolation" {
-    // [1] Valid escapes (`\n`, `\r`, `\t`, `\\`, `\0`, `\"`, `\{`, `\}`, `\x7F`, `\u{1F600}`) and interpolation:
+    // [1] Valid escapes (`\n`, `\r`, `\t`, `\\`, `\0`, `\"`, `{{`, `}}`, `\x7F`, `\u{10FFFF}`) and interpolation:
     const valid_str =
-        "\"\\n\\r\\t\\\\\\0\\\"\\{\\}\\x7F\\u{0}\\u{10FFFF} " ++
-        "{if ok { \"nested {r#\"raw } str\"#} {'}'} /* } */ // }\n\" } else { \"fallback\" }}\"";
+        "\"\\n\\r\\t\\\\\\0\\\"{{}}\\x7F\\u{0}\\u{10FFFF} " ++
+        "{if ok { \"nested {r#\"raw } str\"#} {'}'} /* }} */ // }}\n\" } else { \"fallback\" }}\"";
     var valid_buf = TokenBuffer.init(std.testing.allocator);
     defer valid_buf.deinit();
     var valid_sink = DiagnosticSink.init(std.testing.allocator);
@@ -744,4 +747,134 @@ test "test_lexer_tuple_index_after_dot_rejects_suffixes_hex_and_underscores" {
         try std.testing.expect(bad_buf.getToken(TokenIndex.fromInt(2)).flags.has_lexer_error);
         try expectLosslessRoundTrip(bad_src, &bad_buf);
     }
+}
+
+// ------------- DR-22 Literals, Suffixes & Escapes -------------
+
+test "test_lexer_dr22_retired_ampamp_brace_escapes_multiline_byte_literals_and_fmt_spec" {
+    // [1] Retired `&&` (`E0113`) and `\{` / `\}` (`E0114`) with spacing-safe autofixes:
+    const legacy_source = "let ok = flag_a && flag_b&&flag_c; let text = \"\\{k\\} = {{v}}\"; fn c_fn(fmt: *opaque, ...);";
+    var legacy_buf = TokenBuffer.init(std.testing.allocator);
+    defer legacy_buf.deinit();
+    var legacy_sink = DiagnosticSink.init(std.testing.allocator);
+    defer legacy_sink.deinit();
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    try corex.tokenize(legacy_source, FileId.fromInt(0), &legacy_buf, &legacy_sink, &interner);
+    try std.testing.expectEqual(@as(u32, 4), legacy_sink.error_count);
+    try std.testing.expectEqual(DiagnosticCode.e0113_retired_logical_and, legacy_sink.asSlice()[0].code);
+    try std.testing.expectEqual(DiagnosticCode.e0113_retired_logical_and, legacy_sink.asSlice()[1].code);
+    try std.testing.expectEqual(DiagnosticCode.e0114_invalid_brace_escape, legacy_sink.asSlice()[2].code);
+    try std.testing.expectEqual(DiagnosticCode.e0114_invalid_brace_escape, legacy_sink.asSlice()[3].code);
+    try std.testing.expectEqual(TokenKind.kw_and, legacy_buf.getToken(TokenIndex.fromInt(4)).kind);
+    try std.testing.expectEqual(TokenKind.dotdotdot, legacy_buf.getToken(TokenIndex.fromInt(22)).kind);
+    try expectLosslessRoundTrip(legacy_source, &legacy_buf);
+
+    var fixes: [4]SuggestedFix = .{
+        legacy_sink.asSlice()[0].suggestions[0],
+        legacy_sink.asSlice()[1].suggestions[0],
+        legacy_sink.asSlice()[2].suggestions[0],
+        legacy_sink.asSlice()[3].suggestions[0],
+    };
+    const patch_res = try TransactionalPatcher.apply(
+        std.testing.allocator,
+        legacy_source,
+        FileId.fromInt(0),
+        &fixes,
+        &interner,
+    );
+    defer std.testing.allocator.free(patch_res.patched_source);
+    try std.testing.expectEqual(@as(u32, 4), patch_res.applied_count);
+    try std.testing.expectEqualStrings(
+        "let ok = flag_a and flag_b and flag_c; let text = \"{{k}} = {{v}}\"; fn c_fn(fmt: *opaque, ...);",
+        patch_res.patched_source,
+    );
+
+    // [2] Multiline `"""…"""`, `b'…'`, `b"…"`, and negative `E0115`, `E0116`, `E0117`:
+    const multi_valid =
+        \\let banner = """
+        \\    outer {"inner"} and {
+        \\        """
+        \\        nested "quote"
+        \\        """
+        \\    }
+        \\    """;
+        \\let wire = b"HTTP/1.1\r\n\xFF";
+        \\let sep = b'\r';
+        \\let raw_bytes = br#"A"B"#;
+    ;
+    var multi_buf = TokenBuffer.init(std.testing.allocator);
+    defer multi_buf.deinit();
+    var multi_sink = DiagnosticSink.init(std.testing.allocator);
+    defer multi_sink.deinit();
+    try corex.tokenize(multi_valid, FileId.fromInt(0), &multi_buf, &multi_sink, null);
+    try std.testing.expectEqual(@as(u32, 0), multi_sink.error_count);
+    try std.testing.expectEqual(TokenKind.string_lit, multi_buf.getToken(TokenIndex.fromInt(3)).kind);
+    try std.testing.expectEqual(TokenKind.byte_string_lit, multi_buf.getToken(TokenIndex.fromInt(8)).kind);
+    try std.testing.expectEqual(TokenKind.byte_lit, multi_buf.getToken(TokenIndex.fromInt(13)).kind);
+    try std.testing.expectEqual(TokenKind.byte_string_lit, multi_buf.getToken(TokenIndex.fromInt(18)).kind);
+    try std.testing.expectEqual(@as(?u8, '\r'), lexer.extractByteLiteralValue("b'\\r'"));
+    try std.testing.expectEqual(@as(?u8, 0xFF), lexer.extractByteLiteralValue("b'\\xFF'"));
+    try expectLosslessRoundTrip(multi_valid, &multi_buf);
+
+    const multi_err_src =
+        "let e1 = \"\"\"bad\n\"\"\"; let e2 = \"\"\"\n  under\n    \"\"\"; let e3 = b'é'; let e4 = b\"\\u{41}\";";
+    var multi_err_buf = TokenBuffer.init(std.testing.allocator);
+    defer multi_err_buf.deinit();
+    var multi_err_sink = DiagnosticSink.init(std.testing.allocator);
+    defer multi_err_sink.deinit();
+    try corex.tokenize(multi_err_src, FileId.fromInt(0), &multi_err_buf, &multi_err_sink, null);
+    try std.testing.expectEqual(@as(u32, 4), multi_err_sink.error_count);
+    try std.testing.expectEqual(DiagnosticCode.e0115_multiline_string_opening, multi_err_sink.asSlice()[0].code);
+    try std.testing.expectEqual(DiagnosticCode.e0116_multiline_string_indent, multi_err_sink.asSlice()[1].code);
+    try std.testing.expectEqual(DiagnosticCode.e0117_non_ascii_byte_literal, multi_err_sink.asSlice()[2].code);
+    try std.testing.expectEqual(DiagnosticCode.e0117_non_ascii_byte_literal, multi_err_sink.asSlice()[3].code);
+    try expectLosslessRoundTrip(multi_err_src, &multi_err_buf);
+
+    // [3] Numeric suffixes (`42_u64`, `0.5_f32`, `0x1f32`) and 8-byte `FmtSpec`:
+    const suffix_src = "42_u64 42u64 0x4358_574C_u32 0b1010_i8 0o77_usize 10_f32 0.5_f32 1e-3f64 0x1f32";
+    var suffix_buf = TokenBuffer.init(std.testing.allocator);
+    defer suffix_buf.deinit();
+    var suffix_sink = DiagnosticSink.init(std.testing.allocator);
+    defer suffix_sink.deinit();
+    try corex.tokenize(suffix_src, FileId.fromInt(0), &suffix_buf, &suffix_sink, null);
+    try std.testing.expectEqual(@as(u32, 0), suffix_sink.error_count);
+    try expectLosslessRoundTrip(suffix_src, &suffix_buf);
+
+    const parsed_hex = try lexer.extractNumericSuffix("0x4358_574C_u32");
+    try std.testing.expectEqualStrings("0x4358_574C", parsed_hex.digits_slice);
+    try std.testing.expectEqual(@as(?corex.TypeId, .u32_ty), parsed_hex.suffix_type);
+    try std.testing.expect(parsed_hex.has_underscore_sep);
+    try std.testing.expectEqual(@as(?corex.TypeId, null), (try lexer.extractNumericSuffix("0x1f32")).suffix_type);
+
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(lexer.FmtSpec));
+    const hex_spec = try lexer.parseFormatSpec("#010x", true);
+    try std.testing.expect(hex_spec.hasAltFlag());
+    try std.testing.expect(hex_spec.hasZeroPad());
+    try std.testing.expect(hex_spec.hasDebugEq());
+    try std.testing.expectEqual(@as(?u16, 10), hex_spec.extractWidth());
+    try std.testing.expectEqual(lexer.FmtTypeCode.lower_hex, hex_spec.extractTypeCode());
+
+    // [4] Unmatched closing `}` in interpolated strings emits `E0114` with `"}}"` fix (`SE-12`):
+    const lone_close_src = "let bad = \"hello } world\";";
+    var lone_buf = TokenBuffer.init(std.testing.allocator);
+    defer lone_buf.deinit();
+    var lone_sink = DiagnosticSink.init(std.testing.allocator);
+    defer lone_sink.deinit();
+    var lone_intern = try corex.StringInterner.init(std.testing.allocator);
+    defer lone_intern.deinit();
+    try corex.tokenize(lone_close_src, FileId.fromInt(0), &lone_buf, &lone_sink, &lone_intern);
+    try std.testing.expectEqual(@as(u32, 1), lone_sink.error_count);
+    try std.testing.expectEqual(DiagnosticCode.e0114_invalid_brace_escape, lone_sink.asSlice()[0].code);
+    try std.testing.expectEqual(@as(usize, 1), lone_sink.asSlice()[0].suggestions.len);
+    try std.testing.expectEqualStrings(
+        "}}",
+        lone_intern.get(lone_sink.asSlice()[0].suggestions[0].edits[0].replacement_id),
+    );
+    try expectLosslessRoundTrip(lone_close_src, &lone_buf);
+    try std.testing.expectError(error.InvalidStringLiteral, lexer.cookStringLiteral(std.testing.allocator, "\"a}b\""));
+    const decoded_braces = try lexer.cookStringLiteral(std.testing.allocator, "\"{{ok}}\"");
+    defer std.testing.allocator.free(decoded_braces);
+    try std.testing.expectEqualStrings("{ok}", decoded_braces);
 }

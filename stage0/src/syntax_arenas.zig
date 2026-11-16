@@ -1,6 +1,6 @@
 //! Lossless Concrete Syntax Tree, Token Buffer & Abstract Syntax Tree Arenas
 //!
-//! Defines the 117-variant CoreX `TokenKind` taxonomy, 12-byte SoA `TokenRecord` and 8-byte `TriviaPiece`
+//! Defines the 120-variant CoreX `TokenKind` taxonomy, 12-byte SoA `TokenRecord` and 8-byte `TriviaPiece`
 //! tables (`TokenBuffer`), 10-byte SoA `CstNodeRecord` arena with bounded non-recursive `ParseState` stack
 //! (`LosslessCstArena`), and 13-byte SoA `AstNode` store with `extra_data` trail (`AstArena` / `AstStore`).
 //!
@@ -25,7 +25,7 @@ const Span = mem.Span;
 
 // -------------------- Token & Trivia Types --------------------
 
-/// Authoritative 117-variant lexical token kind table (`0..116`, `DR-03` §5.2, `DR-12` §1.4, `DR-21` §3.1).
+/// Authoritative 120-variant lexical token kind table (`0..119`, `DR-03` §5.2, `DR-12` §1.4, `DR-21` §3.1, `DR-22` §3.1).
 pub const TokenKind = enum(u8) {
     /// Keyword `pub` (`0`).
     kw_pub = 0,
@@ -59,12 +59,12 @@ pub const TokenKind = enum(u8) {
     kw_bit_field = 14,
     /// Keyword `comptime` (`15`).
     kw_comptime = 15,
-    /// Keyword `mut` (`16`).
-    kw_mut = 16,
-    /// Keyword `own` (`17`).
-    kw_own = 17,
-    /// Keyword `ref` (`18`).
-    kw_ref = 18,
+    /// Keyword `subscript` (`16`).
+    kw_subscript = 16,
+    /// Keyword `mut` (`17`).
+    kw_mut = 17,
+    /// Keyword `own` (`18`).
+    kw_own = 18,
     /// Keyword `where` (`19`).
     kw_where = 19,
     /// Keyword `extern` (`20`).
@@ -81,186 +81,192 @@ pub const TokenKind = enum(u8) {
     kw_errdefer = 25,
     /// Keyword `is` (`26`).
     kw_is = 26,
-    /// Keyword `if` (`27`).
-    kw_if = 27,
-    /// Keyword `else` (`28`).
-    kw_else = 28,
-    /// Keyword `match` (`29`).
-    kw_match = 29,
-    /// Keyword `for` (`30`).
-    kw_for = 30,
-    /// Keyword `in` (`31`).
-    kw_in = 31,
-    /// Keyword `while` (`32`).
-    kw_while = 32,
-    /// Keyword `loop` (`33`).
-    kw_loop = 33,
-    /// Keyword `return` (`34`).
-    kw_return = 34,
-    /// Keyword `break` (`35`).
-    kw_break = 35,
-    /// Keyword `continue` (`36`).
-    kw_continue = 36,
-    /// Keyword `catch` (`37`).
-    kw_catch = 37,
-    /// Keyword `orelse` (`38`).
-    kw_orelse = 38,
-    /// Keyword `with` (`39`).
-    kw_with = 39,
-    /// Keyword `context` (`40`).
-    kw_context = 40,
+    /// Keyword `with` (`27`).
+    kw_with = 27,
+    /// Keyword `context` (`28`).
+    kw_context = 28,
+    /// Keyword `if` (`29`).
+    kw_if = 29,
+    /// Keyword `else` (`30`).
+    kw_else = 30,
+    /// Keyword `match` (`31`).
+    kw_match = 31,
+    /// Keyword `for` (`32`).
+    kw_for = 32,
+    /// Keyword `in` (`33`).
+    kw_in = 33,
+    /// Keyword `while` (`34`).
+    kw_while = 34,
+    /// Keyword `loop` (`35`).
+    kw_loop = 35,
+    /// Keyword `return` (`36`).
+    kw_return = 36,
+    /// Keyword `break` (`37`).
+    kw_break = 37,
+    /// Keyword `continue` (`38`).
+    kw_continue = 38,
+    /// Keyword `catch` (`39`).
+    kw_catch = 39,
+    /// Keyword `orelse` (`40`).
+    kw_orelse = 40,
     /// Keyword `unreachable` (`41`).
     kw_unreachable = 41,
-    /// Boolean literal keyword `true` (`42`).
-    kw_true = 42,
-    /// Boolean literal keyword `false` (`43`).
-    kw_false = 43,
-    /// Logical operator keyword `and` (`44`).
-    kw_and = 44,
-    /// Logical operator keyword `or` (`45`).
-    kw_or = 45,
-    /// Logical operator keyword `not` (`46`).
-    kw_not = 46,
-    /// Value receiver keyword `self` (`47`).
-    kw_self_val = 47,
-    /// Type receiver keyword `Self` (`48`).
-    kw_self_type = 48,
-    /// Built-in primitive type keyword (`i8`..`f64`, `bool`, `char`, `str`, `never`, `unit`) (`49`).
-    prim_type = 49,
-    /// Lowercase `snake_case` value/function/module identifier (`50`).
-    ident = 50,
-    /// `PascalCase` type, trait, or enum variant identifier (`51`).
-    type_ident = 51,
-    /// `SCREAMING_SNAKE_CASE` compile-time constant identifier (`52`).
-    const_ident = 52,
-    /// Integer literal token (`53`).
-    int_lit = 53,
-    /// Floating-point literal token (`54`).
-    float_lit = 54,
-    /// UTF-8 string literal token (`55`).
-    string_lit = 55,
-    /// Unicode scalar character literal token (`56`).
-    char_lit = 56,
-    /// Left curly brace `{` (`57`).
-    lbrace = 57,
-    /// Right curly brace `}` (`58`).
-    rbrace = 58,
-    /// Left parenthesis `(` (`59`).
-    lparen = 59,
-    /// Right parenthesis `)` (`60`).
-    rparen = 60,
-    /// Left square bracket `[` (`61`).
-    lbracket = 61,
-    /// Right square bracket `]` (`62`).
-    rbracket = 62,
-    /// Semicolon `;` (`63`).
-    semi = 63,
-    /// Comma `,` (`64`).
-    comma = 64,
-    /// Colon `:` (`65`).
-    colon = 65,
-    /// Condition binding operator `:=` (`66`).
-    colon_eq = 66,
-    /// Unified path, member, and contextual variant period `.` (`67`).
-    dot = 67,
-    /// Exclusive range operator `..` (`68`).
-    dotdot = 68,
-    /// Inclusive range operator `..=` (`69`).
-    dotdoteq = 69,
-    /// Thin return arrow `->` (`70`).
-    arrow = 70,
-    /// Match arm fat arrow `=>` (`71`).
-    fat_arrow = 71,
-    /// Pipeline operator `|>` (`72`).
-    pipe_gt = 72,
-    /// Attribute or pattern-binding introducer `@` (`73`).
-    at = 73,
-    /// Structure-of-Arrays directive `#soa` (`74`).
-    hash_soa = 74,
-    /// Slice/array length sentinel `$` (`75`).
-    dollar = 75,
-    /// Error propagation / optional suffix `?` (`76`).
-    question = 76,
-    /// Wildcard underscore `_` (`77`).
-    underscore = 77,
-    /// Addition operator `+` (`78`).
-    plus = 78,
-    /// Subtraction / negation operator `-` (`79`).
-    minus = 79,
-    /// Multiplication / dereference operator `*` (`80`).
-    star = 80,
-    /// Division operator `/` (`81`).
-    slash = 81,
-    /// Remainder operator `%` (`82`).
-    percent = 82,
-    /// Wrapping addition operator `+%` (`83`).
-    plus_percent = 83,
-    /// Wrapping subtraction operator `-%` (`84`).
-    minus_percent = 84,
-    /// Wrapping multiplication operator `*%` (`85`).
-    star_percent = 85,
-    /// Saturating addition operator `+|` (`86`).
-    plus_pipe = 86,
-    /// Saturating subtraction operator `-|` (`87`).
-    minus_pipe = 87,
-    /// Saturating multiplication operator `*|` (`88`).
-    star_pipe = 88,
-    /// Equality comparison operator `==` (`89`).
-    eqeq = 89,
-    /// Inequality comparison operator `!=` (`90`).
-    bang_eq = 90,
-    /// Less-than operator `<` (`91`).
-    lt = 91,
-    /// Less-than-or-equal operator `<=` (`92`).
-    le = 92,
-    /// Greater-than operator `>` (`93`).
-    gt = 93,
-    /// Greater-than-or-equal operator `>=` (`94`).
-    ge = 94,
-    /// Bitwise AND / borrow operator `&` (`95`).
-    amp = 95,
-    /// Logical short-circuit AND operator `&&` (`96`).
-    ampamp = 96,
-    /// Bitwise OR / closure delimiter `|` (`97`).
-    pipe = 97,
-    /// Logical short-circuit OR operator `||` (`98`).
-    pipepipe = 98,
-    /// Bitwise XOR operator `^` (`99`).
-    caret = 99,
-    /// Logical NOT / error union operator `!` (`100`).
-    bang = 100,
-    /// Bitwise NOT operator `~` (`101`).
-    tilde = 101,
-    /// Bitwise shift-left operator `<<` (`102`).
-    shl = 102,
-    /// Bitwise shift-right operator `>>` (`103`).
-    shr = 103,
-    /// Assignment operator `=` (`104`).
-    eq = 104,
-    /// Addition-assignment operator `+=` (`105`).
-    plus_eq = 105,
-    /// Subtraction-assignment operator `-=` (`106`).
-    minus_eq = 106,
-    /// Multiplication-assignment operator `*=` (`107`).
-    star_eq = 107,
-    /// Division-assignment operator `/=` (`108`).
-    slash_eq = 108,
-    /// Remainder-assignment operator `%=` (`109`).
-    percent_eq = 109,
-    /// Bitwise AND-assignment operator `&=` (`110`).
-    amp_eq = 110,
-    /// Bitwise OR-assignment operator `|=` (`111`).
-    pipe_eq = 111,
-    /// Bitwise XOR-assignment operator `^=` (`112`).
-    caret_eq = 112,
-    /// Shift-left-assignment operator `<<=` (`113`).
-    shl_eq = 113,
-    /// Shift-right-assignment operator `>>=` (`114`).
-    shr_eq = 114,
-    /// Lexer error recovery token (`115`).
-    invalid_token = 115,
-    /// End-of-file sentinel token (`116`).
-    eof = 116,
+    /// Keyword `yield` (`42`).
+    kw_yield = 42,
+    /// Boolean literal keyword `true` (`43`).
+    kw_true = 43,
+    /// Boolean literal keyword `false` (`44`).
+    kw_false = 44,
+    /// Logical operator keyword `and` (`45`).
+    kw_and = 45,
+    /// Logical operator keyword `or` (`46`).
+    kw_or = 46,
+    /// Logical operator keyword `not` (`47`).
+    kw_not = 47,
+    /// Value receiver keyword `self` (`48`).
+    kw_self_val = 48,
+    /// Type receiver keyword `Self` (`49`).
+    kw_self_type = 49,
+    /// Built-in primitive type keyword (`i8`..`f64`, `bool`, `char`, `str`, `never`, `unit`, `opaque`) (`50`).
+    prim_type = 50,
+    /// Lowercase `snake_case` value/function/module identifier (`51`).
+    ident = 51,
+    /// `PascalCase` type, trait, or enum variant identifier (`52`).
+    type_ident = 52,
+    /// `SCREAMING_SNAKE_CASE` compile-time constant identifier (`53`).
+    const_ident = 53,
+    /// Integer literal token (`54`).
+    int_lit = 54,
+    /// Floating-point literal token (`55`).
+    float_lit = 55,
+    /// UTF-8 string literal token (`56`).
+    string_lit = 56,
+    /// Unicode scalar character literal token (`57`).
+    char_lit = 57,
+    /// ASCII byte character literal token `b'…'` (`58`).
+    byte_lit = 58,
+    /// Raw or escaped byte string literal token `b"…"`, `br#"…"#`, `b"""…"""` (`59`).
+    byte_string_lit = 59,
+    /// Left curly brace `{` (`60`).
+    lbrace = 60,
+    /// Right curly brace `}` (`61`).
+    rbrace = 61,
+    /// Left parenthesis `(` (`62`).
+    lparen = 62,
+    /// Right parenthesis `)` (`63`).
+    rparen = 63,
+    /// Left square bracket `[` (`64`).
+    lbracket = 64,
+    /// Right square bracket `]` (`65`).
+    rbracket = 65,
+    /// Semicolon `;` (`66`).
+    semi = 66,
+    /// Comma `,` (`67`).
+    comma = 67,
+    /// Colon `:` (`68`).
+    colon = 68,
+    /// Unified path, member, and contextual variant period `.` (`69`).
+    dot = 69,
+    /// Exclusive range or struct spread operator `..` (`70`).
+    dotdot = 70,
+    /// Inclusive range operator `..=` (`71`).
+    dotdoteq = 71,
+    /// C variadic parameter ellipsis `...` (`72`).
+    dotdotdot = 72,
+    /// Thin return arrow `->` (`73`).
+    arrow = 73,
+    /// Match arm fat arrow `=>` (`74`).
+    fat_arrow = 74,
+    /// Pipeline operator `|>` (`75`).
+    pipe_gt = 75,
+    /// Attribute or pattern-binding introducer `@` (`76`).
+    at = 76,
+    /// Structure-of-Arrays directive `#soa` (`77`).
+    hash_soa = 77,
+    /// Error propagation / optional postfix `?` (`78`).
+    question = 78,
+    /// Wildcard underscore `_` (`79`).
+    underscore = 79,
+    /// Condition binding operator `:=` (`80`).
+    colon_eq = 80,
+    /// Slice/array length sentinel `$` (`81`).
+    dollar = 81,
+    /// Addition operator `+` (`82`).
+    plus = 82,
+    /// Subtraction / negation operator `-` (`83`).
+    minus = 83,
+    /// Multiplication / raw pointer / keyword-only zone / postfix `.*` operator `*` (`84`).
+    star = 84,
+    /// Division / positional-only zone operator `/` (`85`).
+    slash = 85,
+    /// Remainder operator `%` (`86`).
+    percent = 86,
+    /// Wrapping addition operator `+%` (`87`).
+    plus_percent = 87,
+    /// Wrapping subtraction operator `-%` (`88`).
+    minus_percent = 88,
+    /// Wrapping multiplication operator `*%` (`89`).
+    star_percent = 89,
+    /// Saturating addition operator `+|` (`90`).
+    plus_pipe = 90,
+    /// Saturating subtraction operator `-|` (`91`).
+    minus_pipe = 91,
+    /// Saturating multiplication operator `*|` (`92`).
+    star_pipe = 92,
+    /// Equality comparison operator `==` (`93`).
+    eqeq = 93,
+    /// Inequality comparison operator `!=` (`94`).
+    bang_eq = 94,
+    /// Less-than operator `<` (`95`).
+    lt = 95,
+    /// Less-than-or-equal operator `<=` (`96`).
+    le = 96,
+    /// Greater-than operator `>` (`97`).
+    gt = 97,
+    /// Greater-than-or-equal operator `>=` (`98`).
+    ge = 98,
+    /// Bitwise AND / borrow operator `&` (`99`).
+    amp = 99,
+    /// Bitwise OR / closure / union bound delimiter `|` (`100`).
+    pipe = 100,
+    /// Zero-parameter closure delimiter `||` (`101`).
+    pipepipe = 101,
+    /// Bitwise XOR operator `^` (`102`).
+    caret = 102,
+    /// Payload-first result type operator `!` (`T!E`) (`103`).
+    bang = 103,
+    /// Bitwise complement / distinct unwrap operator `~` (`104`).
+    tilde = 104,
+    /// Bitwise shift-left operator `<<` (`105`).
+    shl = 105,
+    /// Bitwise shift-right operator `>>` (`106`).
+    shr = 106,
+    /// Assignment operator `=` (`107`).
+    eq = 107,
+    /// Addition-assignment operator `+=` (`108`).
+    plus_eq = 108,
+    /// Subtraction-assignment operator `-=` (`109`).
+    minus_eq = 109,
+    /// Multiplication-assignment operator `*=` (`110`).
+    star_eq = 110,
+    /// Division-assignment operator `/=` (`111`).
+    slash_eq = 111,
+    /// Remainder-assignment operator `%=` (`112`).
+    percent_eq = 112,
+    /// Bitwise AND-assignment operator `&=` (`113`).
+    amp_eq = 113,
+    /// Bitwise OR-assignment operator `|=` (`114`).
+    pipe_eq = 114,
+    /// Bitwise XOR-assignment operator `^=` (`115`).
+    caret_eq = 115,
+    /// Shift-left-assignment operator `<<=` (`116`).
+    shl_eq = 116,
+    /// Shift-right-assignment operator `>>=` (`117`).
+    shr_eq = 117,
+    /// Lexer error recovery token (`118`).
+    invalid_token = 118,
+    /// End-of-file sentinel token (`119`).
+    eof = 119,
 
     /// Alias for `.lbrace`.
     pub const l_brace: TokenKind = .lbrace;
@@ -278,22 +284,22 @@ pub const TokenKind = enum(u8) {
     pub const dot_dot: TokenKind = .dotdot;
     /// Alias for `.dotdoteq`.
     pub const dot_dot_eq: TokenKind = .dotdoteq;
+    /// Alias for `.dotdotdot`.
+    pub const dot_dot_dot: TokenKind = .dotdotdot;
     /// Alias for `.eqeq`.
     pub const eq_eq: TokenKind = .eqeq;
     /// Alias for `.le`.
     pub const lt_eq: TokenKind = .le;
     /// Alias for `.ge`.
     pub const gt_eq: TokenKind = .ge;
-    /// Alias for `.ampamp`.
-    pub const amp_amp: TokenKind = .ampamp;
     /// Alias for `.pipepipe`.
     pub const pipe_pipe: TokenKind = .pipepipe;
     /// Alias for `.invalid_token`.
     pub const invalid: TokenKind = .invalid_token;
 
-    /// Returns `true` if `self` is one of the 49 reserved CoreX language keywords (`0..48`).
+    /// Returns `true` if `self` is one of the 50 reserved CoreX language keywords (`0..49`).
     pub inline fn isKeyword(self: TokenKind) bool {
-        return @backingInt(self) <= 48;
+        return @backingInt(self) <= 49;
     }
 
     /// Returns `true` if `self` is a lexical identifier token (`.ident`, `.type_ident`, or `.const_ident`).
@@ -320,9 +326,9 @@ pub const TokenKind = enum(u8) {
             .kw_var => "var",
             .kw_bit_field => "bit_field",
             .kw_comptime => "comptime",
+            .kw_subscript => "subscript",
             .kw_mut => "mut",
             .kw_own => "own",
-            .kw_ref => "ref",
             .kw_where => "where",
             .kw_extern => "extern",
             .kw_async => "async",
@@ -331,6 +337,8 @@ pub const TokenKind = enum(u8) {
             .kw_defer => "defer",
             .kw_errdefer => "errdefer",
             .kw_is => "is",
+            .kw_with => "with",
+            .kw_context => "context",
             .kw_if => "if",
             .kw_else => "else",
             .kw_match => "match",
@@ -343,9 +351,8 @@ pub const TokenKind = enum(u8) {
             .kw_continue => "continue",
             .kw_catch => "catch",
             .kw_orelse => "orelse",
-            .kw_with => "with",
-            .kw_context => "context",
             .kw_unreachable => "unreachable",
+            .kw_yield => "yield",
             .kw_true => "true",
             .kw_false => "false",
             .kw_and => "and",
@@ -362,18 +369,19 @@ pub const TokenKind = enum(u8) {
             .semi => ";",
             .comma => ",",
             .colon => ":",
-            .colon_eq => ":=",
             .dot => ".",
             .dotdot => "..",
             .dotdoteq => "..=",
+            .dotdotdot => "...",
             .arrow => "->",
             .fat_arrow => "=>",
             .pipe_gt => "|>",
             .at => "@",
             .hash_soa => "#soa",
-            .dollar => "$",
             .question => "?",
             .underscore => "_",
+            .colon_eq => ":=",
+            .dollar => "$",
             .plus => "+",
             .minus => "-",
             .star => "*",
@@ -392,7 +400,6 @@ pub const TokenKind = enum(u8) {
             .gt => ">",
             .ge => ">=",
             .amp => "&",
-            .ampamp => "&&",
             .pipe => "|",
             .pipepipe => "||",
             .caret => "^",
@@ -419,6 +426,8 @@ pub const TokenKind = enum(u8) {
             .float_lit,
             .string_lit,
             .char_lit,
+            .byte_lit,
+            .byte_string_lit,
             .invalid_token,
             .eof,
             => null,
@@ -571,12 +580,36 @@ pub const CstNodeKind = enum(u8) {
     impl_member,
     /// Complete `impl` declaration item.
     impl_item,
+    /// Bit-field declaration introducer (`bit_field`).
+    bit_field_introducer,
+    /// Single member declaration inside a `bit_field` item.
+    bit_field_member,
+    /// Complete `bit_field` declaration item.
+    bit_field_item,
+    /// Subscript declaration introducer (`subscript`).
+    subscript_introducer,
+    /// Accessor arm (`let { … }` or `inout { … }`) inside a `subscript` item.
+    subscript_arm,
+    /// Complete `subscript` declaration item.
+    subscript_item,
+    /// Inline test block introducer (`test`).
+    test_introducer,
+    /// Complete `test "name" { … }` declaration item.
+    test_item,
+    /// Inline benchmark block introducer (`bench`).
+    bench_introducer,
+    /// Complete `bench "name" (b: &mut Bencher) { … }` declaration item.
+    bench_item,
     /// Function declaration introducer (`fn`).
     fn_introducer,
     /// Opening delimiter of a parameter list.
     param_list_start,
     /// Single function parameter node.
     fn_param,
+    /// Positional-only (`/`) or keyword-only (`*`) parameter zone separator.
+    param_zone_sep,
+    /// Variadic parameter (`...` or `args: ...T`).
+    variadic_param,
     /// Complete function parameter list.
     param_list,
     /// Function return type annotation (`-> Type`).
@@ -611,7 +644,7 @@ pub const CstNodeKind = enum(u8) {
     ref_type,
     /// Raw pointer type (`*T` or `*mut T`).
     ptr_type,
-    /// Ownership/region mode-qualified type (`own T`, `ref T`).
+    /// Ownership mode-qualified type (`own T`).
     mode_type,
     /// Fixed-size array `[T; N]` or slice `[T]` type.
     slice_or_array_type,
@@ -619,12 +652,18 @@ pub const CstNodeKind = enum(u8) {
     tuple_type,
     /// Function pointer/closure type `fn(T) -> U`.
     fn_type,
-    /// Optional type `?T`.
+    /// Postfix optional type `T?`.
     optional_type,
+    /// Payload-first result type `T!E`.
+    result_type,
     /// Refined type (`Type where Pred` / `Type is Range`).
     refined_type,
     /// Closure type (`|T| -> U`).
     closure_type,
+    /// Trait intersection bound (`TraitA & TraitB`).
+    intersect_bound_type,
+    /// Error-set union bound (`ErrA | ErrB`).
+    union_bound_type,
     /// Opening brace `{` of a statement block.
     block_start,
     /// Complete `{ … }` block expression or body.
@@ -643,6 +682,8 @@ pub const CstNodeKind = enum(u8) {
     return_introducer,
     /// Complete `return` statement.
     return_stmt,
+    /// Subscript accessor `yield` statement (`yield expr;`).
+    yield_stmt,
     /// Introducer of a `break` statement.
     break_introducer,
     /// Complete `break` statement.
@@ -739,7 +780,7 @@ pub const CstNodeKind = enum(u8) {
     match_arm,
     /// Complete `match` expression.
     match_expr,
-    /// Unary prefix operator expression (`-x`, `!x`, `&x`, `*x`).
+    /// Unary prefix operator expression (`-x`, `~x`, `&x`, `not x`).
     prefix_expr,
     /// Binary infix operator expression (`lhs op rhs`).
     infix_expr,
@@ -747,6 +788,8 @@ pub const CstNodeKind = enum(u8) {
     postfix_try_expr,
     /// Postfix `.await` expression.
     postfix_await_expr,
+    /// Postfix pointer dereference `.*` expression.
+    postfix_deref_expr,
     /// Field access (`expr.field`) or method call receiver expression.
     field_or_method_expr,
     /// Slice or array indexing expression (`expr[index]`).
@@ -953,6 +996,14 @@ pub const AstTag = enum(u8) {
     trait_decl,
     /// Trait or inherent implementation block (`impl`).
     impl_decl,
+    /// Hardware bit-field declaration (`bit_field`).
+    bit_field_decl,
+    /// Subscript declaration (`subscript`).
+    subscript_decl,
+    /// Inline test declaration (`test "name" { … }`).
+    test_decl,
+    /// Inline benchmark declaration (`bench "name" (b: &mut Bencher) { … }`).
+    bench_decl,
     /// Function declaration (`fn`).
     fn_decl,
     /// Built-in primitive type node.
@@ -965,7 +1016,7 @@ pub const AstTag = enum(u8) {
     ref_type,
     /// Raw pointer type node (`*T` / `*mut T`).
     ptr_type,
-    /// Ownership/region mode-annotated type node.
+    /// Ownership mode-annotated type node (`own T`).
     mode_type,
     /// Fixed-length array type node (`[T; N]`).
     array_type,
@@ -975,8 +1026,16 @@ pub const AstTag = enum(u8) {
     tuple_type,
     /// Function type node (`fn(T) -> U`).
     fn_type,
-    /// Optional type node (`?T`).
+    /// Postfix optional type node (`T?`).
     optional_type,
+    /// Payload-first result type node (`main_token = bang_tok`, `lhs = ok_node`, `rhs = err_node`).
+    result_type,
+    /// Closure type node (`|T| -> U`).
+    closure_type,
+    /// Error-set union bound type node (`ErrA | ErrB`).
+    union_bound_type,
+    /// Trait intersection bound type node (`TraitA & TraitB`).
+    intersect_bound_type,
     /// Lexical statement block (`{ … }`).
     block,
     /// Local `let` or `var` variable declaration.
@@ -985,6 +1044,8 @@ pub const AstTag = enum(u8) {
     defer_stmt,
     /// Function `return` statement.
     return_stmt,
+    /// Subscript accessor `yield` statement (`main_token = kw_yield`, `lhs = val_expr`, `rhs = .NONE`).
+    yield_stmt,
     /// Loop `break` statement.
     break_stmt,
     /// Loop `continue` statement.
@@ -1005,6 +1066,10 @@ pub const AstTag = enum(u8) {
     string_lit,
     /// Unicode scalar character literal expression.
     char_lit,
+    /// Single ASCII byte literal expression (`b'x'`).
+    byte_lit,
+    /// ASCII byte string literal expression (`b"…"` / `br#"…"#` / `b"""…"""`).
+    byte_string_lit,
     /// Boolean literal expression (`true` / `false`).
     bool_lit,
     /// Receiver `self` value expression.
@@ -1027,6 +1092,8 @@ pub const AstTag = enum(u8) {
     try_expr,
     /// Postfix `.await` expression.
     await_expr,
+    /// Postfix `.*` pointer dereference expression (`main_token = star_tok`, `lhs = ptr_expr`, `rhs = .NONE`).
+    deref_expr,
     /// Struct/tuple field access (`lhs.field`).
     field_access,
     /// Method call expression (`receiver.method(args)`).
@@ -1200,14 +1267,19 @@ fn appendTriviaSliceCoalesced(
 }
 
 comptime {
-    std.debug.assert(@typeInfo(TokenKind).@"enum".field_names.len == 117);
-    std.debug.assert(@backingInt(TokenKind.kw_self_type) == 48);
-    std.debug.assert(@backingInt(TokenKind.prim_type) == 49);
-    std.debug.assert(@backingInt(TokenKind.colon_eq) == 66);
-    std.debug.assert(@backingInt(TokenKind.dollar) == 75);
-    std.debug.assert(@backingInt(TokenKind.eof) == 116);
-    std.debug.assert(@typeInfo(CstNodeKind).@"enum".field_names.len == 134);
-    std.debug.assert(@typeInfo(AstTag).@"enum".field_names.len == 82);
+    std.debug.assert(@typeInfo(TokenKind).@"enum".field_names.len == 120);
+    std.debug.assert(@backingInt(TokenKind.kw_subscript) == 16);
+    std.debug.assert(@backingInt(TokenKind.kw_yield) == 42);
+    std.debug.assert(@backingInt(TokenKind.kw_self_type) == 49);
+    std.debug.assert(@backingInt(TokenKind.prim_type) == 50);
+    std.debug.assert(@backingInt(TokenKind.byte_lit) == 58);
+    std.debug.assert(@backingInt(TokenKind.byte_string_lit) == 59);
+    std.debug.assert(@backingInt(TokenKind.dotdotdot) == 72);
+    std.debug.assert(@backingInt(TokenKind.colon_eq) == 80);
+    std.debug.assert(@backingInt(TokenKind.dollar) == 81);
+    std.debug.assert(@backingInt(TokenKind.eof) == 119);
+    std.debug.assert(@typeInfo(CstNodeKind).@"enum".field_names.len == 151);
+    std.debug.assert(@typeInfo(AstTag).@"enum".field_names.len == 94);
     std.debug.assert(@sizeOf(TokenKind) == 1);
     std.debug.assert(@sizeOf(TokenFlags) == 1);
     std.debug.assert(@sizeOf(PackedTriviaSpan) == 4);
@@ -1855,22 +1927,29 @@ test "test_append_token_coalesces_overflow_trivia_into_slot_14" {
     try std.testing.expectEqualSlices(u8, large_buf, reconstructed_large);
 }
 
-test "test_dr21_token_kind_helpers_and_symbol_text_exhaustiveness" {
+test "test_dr21_dr22_token_kind_helpers_and_symbol_text_exhaustiveness" {
     try std.testing.expect(TokenKind.kw_pub.isKeyword());
+    try std.testing.expect(TokenKind.kw_subscript.isKeyword());
+    try std.testing.expect(TokenKind.kw_yield.isKeyword());
     try std.testing.expect(TokenKind.kw_self_type.isKeyword());
     try std.testing.expect(!TokenKind.prim_type.isKeyword());
     try std.testing.expect(TokenKind.ident.isIdentifier());
     try std.testing.expect(TokenKind.type_ident.isIdentifier());
     try std.testing.expect(TokenKind.const_ident.isIdentifier());
     try std.testing.expect(!TokenKind.kw_orelse.isIdentifier());
+    try std.testing.expectEqualStrings("subscript", TokenKind.kw_subscript.asSymbolText().?);
+    try std.testing.expectEqualStrings("yield", TokenKind.kw_yield.asSymbolText().?);
+    try std.testing.expectEqualStrings("...", TokenKind.dotdotdot.asSymbolText().?);
     try std.testing.expectEqualStrings(":=", TokenKind.colon_eq.asSymbolText().?);
     try std.testing.expectEqualStrings("$", TokenKind.dollar.asSymbolText().?);
+    try std.testing.expect(TokenKind.byte_lit.asSymbolText() == null);
+    try std.testing.expect(TokenKind.byte_string_lit.asSymbolText() == null);
 
     var raw_idx: u8 = 0;
-    while (raw_idx < 117) : (raw_idx += 1) {
-        const tok_kind: TokenKind = @enumFromInt(raw_idx);
+    while (raw_idx < 120) : (raw_idx += 1) {
+        const tok_kind: TokenKind = @fromBackingInt(@intCast(raw_idx));
         const maybe_text = tok_kind.asSymbolText();
-        if (raw_idx <= 48 or (raw_idx >= 57 and raw_idx <= 114)) {
+        if (raw_idx <= 49 or (raw_idx >= 60 and raw_idx <= 117)) {
             try std.testing.expect(maybe_text != null and maybe_text.?.len >= 1);
         } else {
             try std.testing.expect(maybe_text == null);

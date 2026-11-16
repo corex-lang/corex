@@ -258,6 +258,18 @@ test "test_cli_router_internal_core_flag_on_fmt_and_upgrade" {
         router.suggestFlagForSubcommand("--internal-cor", .upgrade).?,
     );
 
+    const scratch_cx_path = ".zig-cache/test_cli_router_internal_core.cx";
+    {
+        const scratch_file = try std.Io.Dir.cwd().createFile(std.testing.io, scratch_cx_path, .{});
+        defer scratch_file.close(std.testing.io);
+        try scratch_file.writePositionalAll(
+            std.testing.io,
+            "pub fn identity_byte(val: u8) -> u8 {\n    return val;\n}\n",
+            0,
+        );
+    }
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, scratch_cx_path) catch {};
+
     var out_buf: [4096]u8 = undefined;
     var err_buf: [4096]u8 = undefined;
     var out_writer = std.Io.Writer.fixed(&out_buf);
@@ -266,7 +278,7 @@ test "test_cli_router_internal_core_flag_on_fmt_and_upgrade" {
         std.testing.allocator,
         std.testing.io,
         null,
-        &.{ "--color=never", "upgrade", "--internal-core", "core/primitives.cx" },
+        &.{ "--color=never", "upgrade", "--internal-core", scratch_cx_path },
         &out_writer,
         &err_writer,
     );

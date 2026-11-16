@@ -38,6 +38,24 @@ fn dumpDiagnosticsOnFailure(label: []const u8, sink: *const DiagnosticSink) void
     }
 }
 
+/// Verifies that emitted user C99 after the runtime prelude contains zero unguarded `void*` types.
+fn assertZeroUnscopedVoidPtr(emitted_c: []const u8) !void {
+    const prelude_tail = "_cx_rt_panic(msg_b.data, msg_b.len);\n}\n";
+    const prelude_end = (std.mem.indexOf(u8, emitted_c, prelude_tail) orelse return error.MissingPreludeTail) +
+        prelude_tail.len;
+    const user_c = emitted_c[prelude_end..];
+    try std.testing.expect(std.mem.indexOf(u8, user_c, "void*") == null);
+    var scan_pos: usize = 0;
+    while (std.mem.indexOfPos(u8, user_c, scan_pos, "void *")) |hit_pos| {
+        const after_void = user_c[hit_pos + "void *".len ..];
+        const is_rodata_align_cast = std.mem.startsWith(u8, after_void, ")_cx_blob_") or
+            std.mem.startsWith(u8, after_void, ")_cx_str_bytes_") or
+            std.mem.startsWith(u8, after_void, ")_cx_empty_rodata");
+        try std.testing.expect(is_rodata_align_cast);
+        scan_pos = hit_pos + "void *".len;
+    }
+}
+
 /// Lowers `source_text` through `mir_sast`, optional `@embed_bytes`, and Tier A (`-ofmt=c`).
 fn emitCModuleFromSource(
     allocator: std.mem.Allocator,
@@ -252,8 +270,7 @@ test "test_codegen_c_determinism_layouts_dev_got_and_7_targets" {
 
         // Byte-for-byte determinism (`DR-01`) + strict zero-`void*` rule (`AGENTS.md` §1):
         try std.testing.expectEqualStrings(run_1.emitted_text, run_2.emitted_text);
-        try std.testing.expect(std.mem.indexOf(u8, run_1.emitted_text, "void *") == null);
-        try std.testing.expect(std.mem.indexOf(u8, run_1.emitted_text, "void*") == null);
+        try assertZeroUnscopedVoidPtr(run_1.emitted_text);
         try std.testing.expect(std.mem.indexOf(u8, run_1.emitted_text, "_pad_") != null);
         try std.testing.expect(std.mem.indexOf(u8, run_1.emitted_text, "__attribute__((packed))") != null);
         try std.testing.expect(std.mem.indexOf(u8, run_1.emitted_text, "_cx_blob_") != null);
@@ -351,13 +368,13 @@ test "test_codegen_c_native_executable_execution_and_oracle_trace_parity" {
         \\        @drop_trace(self.tag);
         \\    }
         \\}
-        \\pub fn try_step(code: i32) -> Result[i32, i32] {
+        \\pub fn try_step(code: i32) -> i32!i32 {
         \\    if code == 0 {
         \\        return .Err(0);
         \\    }
         \\    return .Ok(code * 3);
         \\}
-        \\pub fn propagate_sum(flag: i32) -> Result[i32, i32] {
+        \\pub fn propagate_sum(flag: i32) -> i32!i32 {
         \\    let v1 = try_step(flag)?;
         \\    return .Ok(v1 + 4);
         \\}
@@ -373,8 +390,8 @@ test "test_codegen_c_native_executable_execution_and_oracle_trace_parity" {
         \\    }
         \\    return left_v;
         \\}
-        \\pub fn bump_inout(mut slot: inout i32, delta: i32) {
-        \\    slot = slot + delta;
+        \\pub fn bump_inout(slot: &mut i32, delta: i32) {
+        \\    slot.* = slot.* + delta;
         \\}
         \\pub fn main() -> i32 {
         \\    // [1] `@zero_pad` padding bytes must be strictly `0x00`:
@@ -389,7 +406,7 @@ test "test_codegen_c_native_executable_execution_and_oracle_trace_parity" {
         \\    if pad_or != 0 {
         \\        @trap();
         \\    }
-        \\    // [2] Empty-slice non-null niche (`Option[str].Some("") != .None`):
+        \\    // [2] Empty-slice non-null niche (`str?` `.Some("") != .None`):
         \\    let opt_e: str? = .Some("");
         \\    let opt_n: str? = .None;
         \\    if opt_e == opt_n {
@@ -397,11 +414,11 @@ test "test_codegen_c_native_executable_execution_and_oracle_trace_parity" {
         \\    }
         \\    match opt_e {
         \\        .Some(empty_s) => {
-        \\            if empty_s.len != 0 { @trap(); }
+        \\            if empty_s.len() != 0 { @trap(); }
         \\        },
         \\        .None => @trap(),
         \\    }
-        \\    // [3] `Result[i32, i32]` `Err(0)` vs `Ok` `?` propagation:
+        \\    // [3] `i32!i32` `Err(0)` vs `Ok` `?` propagation:
         \\    let err_zero = propagate_sum(0);
         \\    let ok_ten = propagate_sum(5);
         \\    var res_acc: i32 = 0;
@@ -413,7 +430,7 @@ test "test_codegen_c_native_executable_execution_and_oracle_trace_parity" {
         \\        .Ok(ov) => { res_acc = res_acc + ov; },
         \\        .Err(_) => @trap(),
         \\    }
-        \\    // [4] `#soa` array column writes & reads + `inout` mutation:
+        \\    // [4] `#soa` array column writes & reads + `&mut` mutation:
         \\    var pts: #soa [Vec2Col; 4] = @default_init[#soa [Vec2Col; 4]]();
         \\    pts[0].px = 1;
         \\    pts[0].py = 10;
@@ -423,7 +440,7 @@ test "test_codegen_c_native_executable_execution_and_oracle_trace_parity" {
         \\    pts[2].py = 30;
         \\    pts[3].px = 4;
         \\    pts[3].py = 40;
-        \\    bump_inout(res_acc, pts[2].px + pts[1].py);
+        \\    bump_inout(&mut res_acc, pts[2].px + pts[1].py);
         \\    // [5] Atomics, SIMD, 128-bit integer ops, `DropProbe` `@drop_trace`, and `@sys_write`:
         \\    var atom_v: i32 = 4;
         \\    let prev_atom = @atomic_rmw_add(&mut atom_v, 6);
@@ -585,7 +602,7 @@ test "test_regression_codegen_c_extern_write_exit_dedup_and_trigraph_escape" {
         \\    let wr_a: isize = unsafe { posix_write_a(1, 0 as *u8, 0) };
         \\    let wr_b: isize = unsafe { posix_write_b(1, 0 as *u8, 0) };
         \\    let dbg_s: str = (DbgTag { val: val }).debug();
-        \\    return val + (wr_a as i32) + (wr_b as i32) + (dbg_s.len as i32);
+        \\    return val + (wr_a as i32) + (wr_b as i32) + (dbg_s.len() as i32);
         \\}
     ;
 
@@ -636,8 +653,7 @@ test "test_regression_codegen_c_extern_write_exit_dedup_and_trigraph_escape" {
 
     try std.testing.expect(std.mem.indexOf(u8, src_art.emitted_text, "src/trigraph?\\?/probe.cx") != null);
     try std.testing.expect(std.mem.indexOf(u8, src_art.emitted_text, "static const uint8_t _cx_str_bytes_") != null);
-    try std.testing.expect(std.mem.indexOf(u8, src_art.emitted_text, "void *") == null);
-    try std.testing.expect(std.mem.indexOf(u8, src_art.emitted_text, "void*") == null);
+    try assertZeroUnscopedVoidPtr(src_art.emitted_text);
 
     var obj_art = try backend.emitModule(std.testing.allocator, .{
         .bodies = sast_bundle.mir_module.bodies.items,
@@ -654,4 +670,38 @@ test "test_regression_codegen_c_extern_write_exit_dedup_and_trigraph_escape" {
     });
     defer obj_art.deinit(std.testing.allocator);
     try std.testing.expect(!sink.hasErrors());
+}
+
+test "test_phase76_codegen_c_opaque_ptr_variadic_caller_loc_and_fmt_spec" {
+    const dr22_c_src =
+        \\extern "C" fn cx_ext_variadic(ctx: *mut opaque, ro: *opaque, tag: *u8, ...) -> i32;
+        \\pub fn probe_loc_line(loc: SourceLoc = @caller_location()) -> u32 {
+        \\    return loc.line;
+        \\}
+        \\pub fn invoke_variadic_and_fmt(ctx: *mut opaque, ro: *opaque) -> i32 {
+        \\    let bytes_ref: &[u8; 3] = b"XY\x00";
+        \\    let hex_txt: str = "{0x2a_u32:04x}";
+        \\    let loc_line = probe_loc_line() as i32;
+        \\    let ext_rc = unsafe { cx_ext_variadic(ctx, ro, (&raw bytes_ref[0]), 7_i32) };
+        \\    return ext_rc + loc_line + (hex_txt.len() as i32);
+        \\}
+    ;
+
+    var c_art = try emitCModuleFromSource(
+        std.testing.allocator,
+        dr22_c_src,
+        TargetSpec.X86_64_LINUX,
+        true,
+        false,
+        false,
+        .source_text,
+        null,
+        null,
+    );
+    defer c_art.deinit(std.testing.allocator);
+
+    try std.testing.expect(
+        std.mem.indexOf(u8, c_art.emitted_text, "void *, const void *, uint8_t *, ...") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, c_art.emitted_text, "cx_ext_variadic") != null);
 }

@@ -9,7 +9,7 @@
 // ------------------------------------- PUBLIC API --------------------------------------
 /// Polls the `DR-19` hot-reload generation counter at a quiescent safe point (zero-cost in `--release`).
 @inline
-pub fn poll_reload() -> unit {
+pub fn poll_reload() {
     @poll_reload();
 }
 
@@ -21,6 +21,6 @@ pub fn has_pending_reload() -> bool {
 
 /// Appends `trace_id` to the deterministic `@drop_trace` sequence for lifecycle verification.
 @inline
-pub fn record_drop_trace(trace_id: i64) -> unit {
+pub fn record_drop_trace(trace_id: i64) {
     @drop_trace(trace_id);
 }

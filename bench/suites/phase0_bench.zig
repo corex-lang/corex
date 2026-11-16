@@ -63,10 +63,10 @@ fn benchStringInternerWyhash(allocator: std.mem.Allocator) !usize {
 /// Benchmarks `LineIndex` construction and $O(\log L)$ binary search across a multi-line buffer.
 fn benchLineIndexLookup(allocator: std.mem.Allocator) !usize {
     const sample_chunk =
-        "pub fn process_packet(buffer: &[u8]) -> Result[usize, IoError] {\r\n" ++
+        "pub fn process_packet(buffer: &[u8]) -> usize!IoError {\r\n" ++
         "    let header = parse_header(buffer)?;\n" ++
         "    // Verify payload length and checksum:\n" ++
-        "    return Ok(header.payload_len);\r\n" ++
+        "    return .Ok(header.payload_len);\r\n" ++
         "}\n";
 
     var source_builder: std.ArrayList(u8) = .empty;

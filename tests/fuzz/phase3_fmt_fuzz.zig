@@ -35,27 +35,60 @@ const QUERY_DB_FUZZ_ITERATIONS: usize = 300;
 const FMT_SEED_ITEMS = [_][]const u8{
     "use cx.io.{Write, self, Read, BufReader as Br};\n",
     "use cx.mem.{size_of, align_of,};\n",
-    "const MAX_LIMIT: usize = 0x1000;\n",
-    "const MIN_LIMIT: usize = 16;\n",
-    "pub type Port = u16;\n",
-    "pub struct Point[T] { pub x: T, pub y: T, }\n",
+    "const MAX_LIMIT: usize = 0x1000u64;\n",
+    "const MIN_LIMIT: usize = 16_usize;\n",
+    "pub(pkg) type Port = u16;\n",
+    "pub struct Point[T = i32] { pub(super) x: T = 0, pub y: T, }\n",
     "pub enum Status { Idle, Active(u32), Failed { code: i32, }, }\n",
+    "pub enum WireOrder: u8 { Relaxed = 0, SeqCst = 5, }\n",
+    "pub bit_field PacketBits: u16 { pub ready: bool | 1, pub tag: u16 | 15, }\n",
     "pub trait Measurable { fn measure(&self) -> i32; }\n",
     "unsafe impl Send for Point[i32] {}\n",
-    "impl Point[i32] { pub subscript at_idx(idx: usize) -> i32 { return 0; } }\n",
-    "pub fn scale_val(val: i32) -> i32 = val * 2;\n",
+    "impl Point[i32] { pub subscript(idx: usize, /) -> i32 { let { yield self.x; } inout { yield &mut self.x; } } }\n",
+    "@no_panic @inline @no_alloc\npub fn scale_val(val: i32, /, *, factor: i32 = 2) -> i32 = val * factor;\n",
+    "pub fn normalize_sigs[Data: str | &[u8]](\n" ++
+        "    opt_in: Option[Data], out_slot: &out i32, owned_pt: own Point[i32],\n" ++
+        ") -> Result[i32, IoError] {\n" ++
+        "    out_slot.* = owned_pt.x + (b'A' as i32) + (b\"ok\".len() as i32);\n" ++
+        "    let copy_pt = Point { y: 9, ..owned_pt };\n" ++
+        "    let moved_pt = Point { x: 1, ..own copy_pt };\n" ++
+        "    var left_v: i32 = moved_pt.x;\n" ++
+        "    var right_v: i32 = out_slot.*;\n" ++
+        "    (left_v, right_v) = (right_v, left_v);\n" ++
+        "    let raw_p: *i32 = &raw left_v;\n" ++
+        "    return .Ok(unsafe { raw_p.* });\n" ++
+        "}\n",
+    "pub fn multiline_interp_showcase(flag: bool, port: u16, mask: u32) -> str {\n" ++
+        "    if flag {\n" ++
+        "        let nested_banner = \"\"\"\n" ++
+        "            ╭─ Wire {{v1.0}} ────────────────╮\n" ++
+        "            │ {port=} mask={mask:#010x} {if flag { \"inner\" } else { \"\"\"\n" ++
+        "                deep {port}\n" ++
+        "                \"\"\" }}\n" ++
+        "            ╰────────────────────────────────╯\n" ++
+        "            \"\"\";\n" ++
+        "        return nested_banner;\n" ++
+        "    }\n" ++
+        "    return \"\"\"\n" ++
+        "        plain line one\n" ++
+        "          indented line two\n" ++
+        "        \"\"\";\n" ++
+        "}\n",
     "pub fn compute_pipeline(val: i32, flag: bool) -> i32 {\n" ++
         "    ;\n" ++
         "    let neg = - -val;\n" ++
-        "    let inv = !flag;\n" ++
+        "    let inv = not flag;\n" ++
+        "    let comp = ~0xFF_i32;\n" ++
         "    let grid = [ 1, 20, 300, 4, 50, 600, 7, 80, 900, 10 ];\n" ++
         "    let tail = grid[..$-2];\n" ++
         "    let piped = val |> step_one() |> step_two();\n" ++
-        "    let chained = tail.iter().count_all();\n" ++
+        "    let chained = tail.iter().count_all() + comp;\n" ++
         "    if (rem := piped) > 0 { while (neg < rem) { break; }; };\n" ++
         "    with context.allocator = &mut scratch { let _ = opt_v orelse 0; }\n" ++
-        "    return match (piped) { 0 => chained, _ => neg, };\n" ++
+        "    return fsm: match (piped) { 0 => continue :fsm 1, 1 => chained, _ => neg, };\n" ++
         "}\n",
+    "test \"formatter prose test\" (raw: &[u8]) -> unit { let _ = raw.len(); }\n",
+    "bench \"formatter bench\" (b: &mut Bencher) -> unit { let _ = b; }\n",
     "// corex fmt: off\nconst   RAW_UNTOUCHED:   i32  =   777;\n// corex fmt: on\n",
     "@fmt_off\nconst   ATTR_UNTOUCHED:  i32  =   888;\n",
     "const unfixed_const: i32 = 42\nstruct bad_struct { FieldOne: i32 }\nfn BadFunc( ArgVal: i32 ) -> i32 { return ArgVal }\n",

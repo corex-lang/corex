@@ -197,7 +197,8 @@ test "test_query_db_full_10_stage_pipeline_and_input_mutation_semantics" {
 
     const def_sig = try db.getDefSignature(fn_def);
     try std.testing.expectEqual(ItemKind.fn_decl, def_sig.kind);
-    try std.testing.expect(def_sig.is_pub);
+    try std.testing.expectEqual(corex.symbol_resolver.Visibility.public, def_sig.visibility);
+    try std.testing.expect(def_sig.isPublicOutsidePkg());
 
     const typed_body = try db.typecheckBody(fn_def);
     try std.testing.expectEqual(fn_def, typed_body.def_id);
@@ -473,18 +474,18 @@ test "test_query_db_extract_item_tree_all_item_kinds_and_lookup_helpers" {
     const tree = try db.extractItemTree(file_id);
     try std.testing.expectEqual(@as(usize, 12), tree.entries.len);
 
-    // Verify all 11 `ItemKind` categories and extracted symbol names:
+    // Verify `ItemKind` categories, 4-tier `Visibility`, and extracted symbol names:
     try std.testing.expectEqual(ItemKind.mod_decl, tree.entries[0].kind);
     try std.testing.expectEqualStrings("network", tree.entries[0].name_text);
-    try std.testing.expect(tree.entries[0].is_pub);
+    try std.testing.expectEqual(corex.symbol_resolver.Visibility.public, tree.entries[0].visibility);
 
     try std.testing.expectEqual(ItemKind.use_decl, tree.entries[1].kind);
     try std.testing.expectEqualStrings("Write", tree.entries[1].name_text);
-    try std.testing.expect(!tree.entries[1].is_pub);
+    try std.testing.expectEqual(corex.symbol_resolver.Visibility.private, tree.entries[1].visibility);
 
     try std.testing.expectEqual(ItemKind.const_decl, tree.entries[2].kind);
     try std.testing.expectEqualStrings("MAX_RETRY", tree.entries[2].name_text);
-    try std.testing.expect(tree.entries[2].is_pub);
+    try std.testing.expectEqual(corex.symbol_resolver.Visibility.public, tree.entries[2].visibility);
 
     try std.testing.expectEqual(ItemKind.type_alias_decl, tree.entries[3].kind);
     try std.testing.expectEqualStrings("PortNum", tree.entries[3].name_text);
@@ -1161,4 +1162,72 @@ test "test_query_db_root_cx_qualified_path_and_signature_rerun_default_sast_pari
             inc_def_sig.signature_fingerprint,
         ));
     }
+}
+
+// ---------- DR-22 Visibility Firewall & Zone Cutoffs ----------
+
+test "test_query_db_dr22_cxi_public_interface_firewall_positional_erasure_and_test_stripping" {
+    var db = try CompilerDb.init(std.testing.allocator);
+    defer db.deinit();
+
+    const file_id = FileId.fromInt(70);
+    const src_v1 =
+        "pub fn exported_api(old_pos_name: i64, /) -> i64 {\n" ++
+        "    return old_pos_name + 1;\n" ++
+        "}\n" ++
+        "pub(pkg) fn pkg_helper(val: i32) -> i32 {\n" ++
+        "    return val;\n" ++
+        "}\n" ++
+        "test \"smoke check\" {\n" ++
+        "    let _ = exported_api(1);\n" ++
+        "}\n" ++
+        "bench \"api bench\" (bencher: &mut Bencher) {\n" ++
+        "    let _ = bencher;\n" ++
+        "}\n";
+
+    // [1] With `include_tests = true` (default), `extractItemTree` retains `test_decl` and `bench_decl`:
+    _ = try db.setInput(file_id, src_v1, .low);
+    const tree_with_tests = try db.extractItemTree(file_id);
+    try std.testing.expectEqual(@as(usize, 4), tree_with_tests.entries.len);
+    try std.testing.expectEqual(ItemKind.test_decl, tree_with_tests.entries[2].kind);
+    try std.testing.expectEqual(ItemKind.bench_decl, tree_with_tests.entries[3].kind);
+    try std.testing.expectEqual(corex.symbol_resolver.Visibility.pub_pkg, tree_with_tests.entries[1].visibility);
+    try std.testing.expect(!tree_with_tests.entries[1].isPublicOutsidePkg());
+
+    const sigs_v1 = try db.resolveSignatures(file_id);
+    const pub_fn_sig_v1 = try db.getDefSignature(tree_with_tests.entries[0].def_id);
+
+    // [2] Editing `pub(pkg)` signature AND renaming a `/` positional-only parameter keeps `.cxi`
+    // `public_interface_fingerprint` and `exported_api`'s `signature_fingerprint` unchanged:
+    const src_v2 =
+        "pub fn exported_api(new_pos_name: i64, /) -> i64 {\n" ++
+        "    return new_pos_name + 1;\n" ++
+        "}\n" ++
+        "pub(pkg) fn pkg_helper(val: i64) -> i64 {\n" ++
+        "    return val;\n" ++
+        "}\n" ++
+        "test \"smoke check\" {\n" ++
+        "    let _ = exported_api(1);\n" ++
+        "}\n" ++
+        "bench \"api bench\" (bencher: &mut Bencher) {\n" ++
+        "    let _ = bencher;\n" ++
+        "}\n";
+    _ = try db.setInput(file_id, src_v2, .low);
+    const sigs_v2 = try db.resolveSignatures(file_id);
+    const pub_fn_sig_v2 = try db.getDefSignature(DefId.init(file_id, 0));
+
+    try std.testing.expect(!Fingerprint128.eql(sigs_v1.signatures_fingerprint, sigs_v2.signatures_fingerprint));
+    try std.testing.expect(Fingerprint128.eql(
+        sigs_v1.public_interface_fingerprint,
+        sigs_v2.public_interface_fingerprint,
+    ));
+    try std.testing.expect(Fingerprint128.eql(
+        pub_fn_sig_v1.signature_fingerprint,
+        pub_fn_sig_v2.signature_fingerprint,
+    ));
+
+    // [3] Setting `include_tests = false` strips `test_decl` and `bench_decl` from `ItemTree`:
+    db.setIncludeTests(false);
+    const tree_prod = try db.extractItemTree(file_id);
+    try std.testing.expectEqual(@as(usize, 2), tree_prod.entries.len);
 }

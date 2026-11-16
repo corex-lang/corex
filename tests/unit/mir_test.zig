@@ -525,15 +525,15 @@ test "test_mir_maranget_switch_int_or_pat_sharing_destructuring_128bit_ranges_an
 
 test "test_mir_lifo_defer_errdefer_payload_and_loop_scoped_unwind" {
     const defer_src =
-        "pub fn fallible_work(should_fail: bool, trace: &mut i64) -> Result[i64, i64] {\n" ++
+        "pub fn fallible_work(should_fail: bool, trace: &mut i64) -> i64!i64 {\n" ++
         "    defer {\n" ++
-        "        *trace = *trace * 10 + 1;\n" ++
+        "        trace.* = trace.* * 10 + 1;\n" ++
         "    }\n" ++
         "    errdefer |err_code| {\n" ++
-        "        *trace = *trace * 10 + err_code;\n" ++
+        "        trace.* = trace.* * 10 + err_code;\n" ++
         "    }\n" ++
         "    defer {\n" ++
-        "        *trace = *trace * 10 + 3;\n" ++
+        "        trace.* = trace.* * 10 + 3;\n" ++
         "    }\n" ++
         "    if should_fail {\n" ++
         "        return .Err(7);\n" ++
@@ -615,18 +615,27 @@ test "test_mir_subscript_yield_let_read_and_inout_write_zero_call_splicing" {
     const sub_src =
         "pub struct RingPair {\n" ++
         "    pub slots: [i32; 2],\n" ++
-        "    pub events: i32,\n" ++
         "}\n" ++
-        "pub subscript ring_slot(mut ring: inout RingPair, idx: usize) -> i32 {\n" ++
-        "    ring.events = ring.events * 10 + 1;\n" ++
-        "    yield ring.slots[idx];\n" ++
-        "    ring.events = ring.events * 10 + 2;\n" ++
+        "impl RingPair {\n" ++
+        "    pub subscript(events: &mut i32, idx: usize) -> i32 {\n" ++
+        "        let {\n" ++
+        "            events.* = events.* * 10 + 1;\n" ++
+        "            yield self.slots[idx];\n" ++
+        "            events.* = events.* * 10 + 2;\n" ++
+        "        }\n" ++
+        "        inout {\n" ++
+        "            events.* = events.* * 10 + 1;\n" ++
+        "            yield &mut self.slots[idx];\n" ++
+        "            events.* = events.* * 10 + 2;\n" ++
+        "        }\n" ++
+        "    }\n" ++
         "}\n" ++
         "pub fn use_ring_subscript() -> i32 {\n" ++
-        "    var ring = RingPair { slots: [10, 20], events: 0 };\n" ++
-        "    ring_slot(ring, 1) += 15;\n" ++
-        "    let read_back: i32 = ring_slot(ring, 1);\n" ++
-        "    return ring.events * 100 + read_back;\n" ++
+        "    var ring = RingPair { slots: [10, 20] };\n" ++
+        "    var events: i32 = 0;\n" ++
+        "    ring[&mut events, 1] += 15;\n" ++
+        "    let read_back: i32 = ring[&mut events, 1];\n" ++
+        "    return events * 100 + read_back;\n" ++
         "}\n";
 
     var bundle = try mir.lowerSourceToMir(
@@ -1162,7 +1171,7 @@ test "test_mir_poison_projection_recovery_preserves_v3_place_soundness" {
         "    let bad_idx = scalar_val[0];\n" ++
         "    let bad_field = scalar_val.missing_member;\n" ++
         "    let bad_len = scalar_val.len;\n" ++
-        "    let bad_deref = *scalar_val;\n" ++
+        "    let bad_deref = scalar_val.*;\n" ++
         "    let .Some(bad_variant) = scalar_val else { return 0; };\n" ++
         "    let _ignore_len = bad_len;\n" ++
         "    let _ignore_deref = bad_deref;\n" ++
@@ -1201,10 +1210,10 @@ test "test_phase75_mir_cond_scope_se01_se02_orelse_se03_dollar_slice_se04_se05_a
         \\    return .None;
         \\}
         \\pub fn bump_counter(counter: &mut i64, delta: i64) -> i64 {
-        \\    *counter = *counter + delta;
-        \\    return *counter;
+        \\    counter.* = counter.* + delta;
+        \\    return counter.*;
         \\}
-        \\pub fn check_orelse_skips_errdefer(opt_in: i64?) -> Result[i64, i64] {
+        \\pub fn check_orelse_skips_errdefer(opt_in: i64?) -> i64!i64 {
         \\    var trace_log: i64 = 10;
         \\    errdefer {
         \\        trace_log = 999;
@@ -1272,7 +1281,7 @@ test "test_phase75_mir_cond_scope_se01_se02_orelse_se03_dollar_slice_se04_se05_a
         \\    let pat_score: i64 = match window {
         \\        [] => 0,
         \\        [only_elem] => only_elem,
-        \\        [head_elem, ..middle_rest, tail_elem] => head_elem * 100 + (middle_rest.len as i64) * 10 + tail_elem,
+        \\        [head_elem, ..middle_rest, tail_elem] => head_elem * 100 + (middle_rest.len() as i64) * 10 + tail_elem,
         \\    };
         \\    let at_score: i64 = match tag_opt {
         \\        whole_opt @ .Some(inner_v) => if whole_opt is .Some(check_v) { inner_v + check_v } else { 0 },
@@ -1286,7 +1295,7 @@ test "test_phase75_mir_cond_scope_se01_se02_orelse_se03_dollar_slice_se04_se05_a
         \\    let nested_sub: &[i64] = outer_arr[inner_arr[$ - 1]..$ - 1];
         \\    let incl_sub: &[i64] = outer_arr[1..=3];
         \\    let word_mid: str = "corex"[1..$ - 1];
-        \\    let piped_val: i64 = (nested_sub[$ - 1] + incl_sub[$ - 1] + (word_mid.len as i64))
+        \\    let piped_val: i64 = (nested_sub[$ - 1] + incl_sub[$ - 1] + (word_mid.len() as i64))
         \\        |> weighted_add(bias: 7, scale: 3);
         \\    return piped_val + classify_slice(nested_sub, .Some(6));
         \\}
@@ -1309,7 +1318,7 @@ test "test_phase75_mir_cond_scope_se01_se02_orelse_se03_dollar_slice_se04_se05_a
     for (0..run_body.insts.len) |inst_i| {
         const inst = run_body.insts.get(inst_i);
         if (inst.op == .bin_op and inst.flags.is_dollar_sub and
-            inst.aux_u16 == @intFromEnum(mir.BinOpKind.usub_checked))
+            inst.aux_u16 == @backingInt(mir.BinOpKind.usub_checked))
         {
             has_dollar_sub_inst = true;
             break;
@@ -1370,7 +1379,7 @@ test "test_phase75_mir_v6_contextless_ctx_intrinsic_and_vm_with_context_se08" {
     const ctx_val = try ssa.emitInst(entry_bb, .{
         .op = .intrinsic_op,
         .flags = .{ .has_side_effects = true },
-        .aux_u16 = @intFromEnum(mir.MirIntrinsicKind.ctx_get),
+        .aux_u16 = @backingInt(mir.MirIntrinsicKind.ctx_get),
         .type_id = .u64_ty,
         .operands = .{ .lhs = args_start, .rhs = 1 },
     }, TokenIndex.fromInt(0));
@@ -1472,7 +1481,7 @@ test "test_regression_comptime_with_context_allocator_synthetic_ptr_cast" {
     const bad_ptr_cast_src =
         \\pub fn cast_user_ptr() -> usize {
         \\    let local_num: i64 = 7;
-        \\    let raw_ptr: *i64 = &local_num as *i64;
+        \\    let raw_ptr: *i64 = &raw local_num;
         \\    return unsafe { raw_ptr as usize };
         \\}
         \\pub const BAD_PTR_INT: usize = cast_user_ptr();
@@ -1499,4 +1508,55 @@ test "test_regression_comptime_with_context_allocator_synthetic_ptr_cast" {
     try std.testing.expect(has_e0503);
 }
 
+// ----------- Phase 7.6 (DR-22) FSM, Swap & Zext MIR -----------
 
+test "test_phase76_mir_labeled_fsm_parallel_swap_and_bool_int_zext" {
+    const dr22_mir_src =
+        \\pub enum FsmStep {
+        \\    Start(i64),
+        \\    Accum(i64, i64),
+        \\    Done(i64),
+        \\}
+        \\pub fn swap_pair(left: &mut i64, right: &mut i64) {
+        \\    (left.*, right.*) = (right.*, left.*);
+        \\}
+        \\pub fn run_dr22_mir(flag: bool) -> i64 {
+        \\    var first_v: i64 = 12;
+        \\    var second_v: i64 = 30;
+        \\    swap_pair(&mut first_v, &mut second_v);
+        \\    let zext_bit: i64 = flag as i64;
+        \\    let fsm_val: i64 = fsm: match FsmStep.Start(first_v) {
+        \\        .Start(init_v) => continue :fsm .Accum(init_v, 3),
+        \\        .Accum(cur_v, rem_steps) => if rem_steps > 0 {
+        \\            continue :fsm .Accum(cur_v + second_v, rem_steps - 1);
+        \\        } else {
+        \\            continue :fsm .Done(cur_v);
+        \\        },
+        \\        .Done(final_v) => final_v,
+        \\    };
+        \\    return fsm_val * 10 + zext_bit;
+        \\}
+    ;
+
+    // `first_v` becomes `30`, `second_v` becomes `12`; `30 + 3 * 12 = 66`; `66 * 10 + 1 = 661`:
+    try std.testing.expectEqual(
+        @as(i64, 661),
+        try lowerVerifyAndEvalI64(
+            std.testing.allocator,
+            dr22_mir_src,
+            TargetLayout.NATIVE_64,
+            "run_dr22_mir",
+            &[_]mir_vm.RegSlot{.{ .scalar_u64 = 1 }},
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 660),
+        try lowerVerifyAndEvalI64(
+            std.testing.allocator,
+            dr22_mir_src,
+            TargetLayout.NATIVE_64,
+            "run_dr22_mir",
+            &[_]mir_vm.RegSlot{.{ .scalar_u64 = 0 }},
+        ),
+    );
+}

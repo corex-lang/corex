@@ -1702,6 +1702,7 @@ pub fn runCli(
                 if (exec_info.is_internal_core) {
                     try db.setInternalCore(true);
                 }
+                db.setIncludeTests(exec_info.subcommand == .@"test");
                 db.setComptimeStepLimit(exec_info.comptime_step_limit);
                 db.setEmbedSandbox(embed_sandbox_root, null);
                 db.setEmbedIo(io);

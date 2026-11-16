@@ -2270,6 +2270,13 @@ fn stepProjectedType(
                     active_soa_field,
                 );
             }
+            if (cur_ty == .source_loc_ty) {
+                return switch (proj.payload) {
+                    0, 1 => .str_ty,
+                    2, 3 => .u32_ty,
+                    else => .unit_ty,
+                };
+            }
             switch (node.tag) {
                 .tuple_ty => {
                     const elems = pool.getTupleElements(cur_ty);
@@ -2307,6 +2314,9 @@ fn stepProjectedType(
         .index => {
             active_downcast.* = null;
             if (cur_ty == .str_ty) return .u8_ty;
+            if (mir.unionSliceElemType(pool, cur_ty)) |union_elem_ty| {
+                return pool.unwrapUnderlyingType(active_subst.resolve(union_elem_ty));
+            }
             if (node.tag == .array_ty or node.tag == .slice_ty or
                 node.tag == .soa_array_ty or node.tag == .soa_slice_ty)
             {
@@ -2472,7 +2482,10 @@ fn buildMovePathTrie(
                 if (proj.kind == .deref) {
                     if (before_tag == .ref_ty) is_behind_shared = true;
                     if (before_tag == .raw_ptr_ty) is_deref_raw = true;
-                } else if (proj.kind == .index and (before_tag == .slice_ty or unwrapped_before == .str_ty)) {
+                } else if (proj.kind == .index and
+                    (before_tag == .slice_ty or unwrapped_before == .str_ty or
+                        mir.unionSliceElemType(pool, unwrapped_before) != null))
+                {
                     is_behind_shared = true;
                 } else if (proj.kind == .soa_elem and before_tag == .soa_slice_ty and
                     pool.getNode(unwrapped_before).rhs == 0)
@@ -3087,7 +3100,7 @@ fn collectInstReadValues(body: *const MirBody, inst: MirInst, out_buf: *std.Arra
                         }
                     }
                 },
-                .tuple_agg, .struct_agg, .array_elems, .str_concat => {
+                .tuple_agg, .struct_agg, .array_elems, .str_concat, .fmt_args_make => {
                     for (body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs]) |val_raw| {
                         if (val_raw != mir.NONE_U32) try out_buf.append(alloc, val_raw);
                     }
@@ -3277,7 +3290,7 @@ fn computeBodyProvenanceAndNllHorizon(
         for (body.getBlockInsts(bb_id)) |inst_val| {
             const inst = body.getInst(inst_val);
             const tok = body.origin_tokens.items[inst_val.asInt()];
-            if ((inst.op == .place_addr or inst.op == .soa_column_slice) and
+            if (((inst.op == .place_addr and inst.operands.rhs < 2) or inst.op == .soa_column_slice) and
                 inst.operands.lhs < trie.place_map.len)
             {
                 const lookup = trie.place_map[inst.operands.lhs];
@@ -3291,7 +3304,7 @@ fn computeBodyProvenanceAndNllHorizon(
                     &loan_list,
                     arena_alloc,
                     lookup,
-                    inst.op == .place_addr and inst.operands.rhs != 0,
+                    inst.op == .place_addr and inst.operands.rhs == 1,
                     scratch_bits,
                     tok,
                 );
@@ -3555,7 +3568,18 @@ fn computeBodyProvenanceAndNllHorizon(
                                     (is_base_slice and (inst.op == .soa_column_slice or
                                         (projs.len > 0 and (projs[0].kind == .index or projs[0].kind == .soa_elem))));
 
-                                if (is_borrowing_pointee) {
+                                const is_user_raw_addr = inst.op == .place_addr and inst.operands.rhs >= 2;
+                                if (is_user_raw_addr) {
+                                    // `ADR-22F`: `&raw` / `&raw mut` produce `DEPTH_STATIC` (`0`) raw pointers without MVS loans:
+                                    next_p.max_depth = DEPTH_STATIC;
+                                    if (!is_borrowing_pointee) {
+                                        next_p.raw_ptr_state = .valid_live;
+                                        next_p.raw_ptr_local = base_lid;
+                                    } else {
+                                        next_p.raw_ptr_state = local_prov[place_rec.base].raw_ptr_state;
+                                        next_p.raw_ptr_local = local_prov[place_rec.base].raw_ptr_local;
+                                    }
+                                } else if (is_borrowing_pointee) {
                                     next_p = try ValueProvenance.merge(
                                         next_p,
                                         local_prov[place_rec.base],
@@ -3567,7 +3591,7 @@ fn computeBodyProvenanceAndNllHorizon(
                                     const unwrapped = pool.unwrapUnderlyingType(inst.type_id);
                                     const is_raw_ptr_addr = !unwrapped.isError() and
                                         pool.getNode(unwrapped).tag == .raw_ptr_ty;
-                                    if ((inst.op == .place_addr and inst.operands.rhs != 0) or is_raw_ptr_addr) {
+                                    if ((inst.op == .place_addr and inst.operands.rhs == 1) or is_raw_ptr_addr) {
                                         next_p.min_target_depth = @min(next_p.min_target_depth, base_depth);
                                     }
                                     if (local_prov[place_rec.base].param_mask != 0) {
@@ -3584,19 +3608,21 @@ fn computeBodyProvenanceAndNllHorizon(
                                     }
                                 }
 
-                                const scratch_m = detectContextScratchAccess(
-                                    body,
-                                    pool,
-                                    sym_table,
-                                    PlaceId.fromInt(inst.operands.lhs),
-                                );
-                                if (scratch_m != 0) {
-                                    next_p.scratch_mask |= scratch_m;
-                                    if (next_p.scratch_open_token.isNone()) next_p.scratch_open_token = tok;
-                                }
-                                const minted = inst_minted_loan[val_idx];
-                                if (minted != mir.NONE_U32) {
-                                    try setLoanBitAlloc(&next_p.loan_mask, minted, loan_count, arena_alloc);
+                                if (!is_user_raw_addr) {
+                                    const scratch_m = detectContextScratchAccess(
+                                        body,
+                                        pool,
+                                        sym_table,
+                                        PlaceId.fromInt(inst.operands.lhs),
+                                    );
+                                    if (scratch_m != 0) {
+                                        next_p.scratch_mask |= scratch_m;
+                                        if (next_p.scratch_open_token.isNone()) next_p.scratch_open_token = tok;
+                                    }
+                                    const minted = inst_minted_loan[val_idx];
+                                    if (minted != mir.NONE_U32) {
+                                        try setLoanBitAlloc(&next_p.loan_mask, minted, loan_count, arena_alloc);
+                                    }
                                 }
                             }
                         }
@@ -3671,7 +3697,7 @@ fn computeBodyProvenanceAndNllHorizon(
                                     }
                                 }
                             },
-                            .tuple_agg, .struct_agg, .array_elems, .str_concat => {
+                            .tuple_agg, .struct_agg, .array_elems, .str_concat, .fmt_args_make => {
                                 for (body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs]) |v_raw| {
                                     if (v_raw < inst_count) {
                                         next_p = try ValueProvenance.merge(next_p, val_prov[v_raw], arena_alloc);
@@ -3898,7 +3924,8 @@ fn computeBodyProvenanceAndNllHorizon(
                                     }
                                 } else if (dst_word < inst_count) {
                                     const d_inst = body.getInst(MirValueId.fromInt(dst_word));
-                                    if (d_inst.op == .place_addr and d_inst.operands.rhs != 0 and
+                                    if (d_inst.op == .place_addr and
+                                        (d_inst.operands.rhs == 1 or d_inst.operands.rhs == 3) and
                                         d_inst.operands.lhs < body.places.items.len)
                                     {
                                         const d_rec = body.places.items[d_inst.operands.lhs];
@@ -4271,7 +4298,7 @@ fn recordLastUseTokens(loans: []TrackedLoan, mask: DenseBitSet, use_tok: TokenIn
 fn hasMirViewReturnFallback(pool: *const InternPool, sym_table: *const SymbolTable, ret_ty: TypeId) bool {
     if (ret_ty.isError()) return false;
     const unwrapped = pool.unwrapUnderlyingType(ret_ty);
-    if (unwrapped == .str_ty) return true;
+    if (unwrapped == .str_ty or unwrapped == .fmt_args_ty) return true;
     const node = pool.getNode(unwrapped);
     if (node.tag == .ref_ty or node.tag == .mut_ref_ty or node.tag == .slice_ty or node.tag == .soa_slice_ty) {
         return true;
@@ -4449,7 +4476,8 @@ fn extractDirectMutLocalArg(
     }
     if (word < inst_count) {
         const arg_inst = body.getInst(MirValueId.fromInt(word));
-        if (arg_inst.op == .place_addr and arg_inst.operands.rhs != 0 and
+        if (arg_inst.op == .place_addr and
+            (arg_inst.operands.rhs == 1 or arg_inst.operands.rhs == 3) and
             arg_inst.operands.lhs < body.places.items.len)
         {
             const place_rec = body.places.items[arg_inst.operands.lhs];
@@ -4748,7 +4776,9 @@ fn detectInstCtxAllocSlotRead(
             return 0;
         },
         .intrinsic_op => {
-            if (@as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)) == .ctx_get) {
+            const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+            if (ikind == .fmt_value) return 0b01;
+            if (ikind == .ctx_get) {
                 if (extractConstCtxSlotOrd(body, inst)) |slot_ord| {
                     if (slot_ord == 0) {
                         return 0b01;
@@ -5587,7 +5617,226 @@ fn stepTypestateBlockSilent(
     }
 }
 
-/// Applies explicit free/close and `set`-mode out-parameter initialization effects of `call_site` onto `state`.
+/// Returns `true` when `call_site` returns a `Result` (`T!E`) sum type (`ADR-22B`).
+fn isFallibleResultCallSite(pool: *const InternPool, call_site: mir.MirCallSite) bool {
+    const unwrapped_ret = pool.unwrapUnderlyingType(call_site.ret_ty);
+    return !unwrapped_ret.isError() and pool.getNode(unwrapped_ret).tag == .result_ty;
+}
+
+/// Marks `lookup` as potentially initialized (`maybe_init = 1, maybe_uninit = 1`) prior to `.Ok`/`.Err` refinement.
+fn applyPathMaybeWriteToState(
+    trie: *const MovePathTrie,
+    lookup: PlacePathLookup,
+    state: *TypestateState,
+) void {
+    const m_idx = lookup.id.asInt();
+    state.maybe_init.unionInPlace(trie.subtree[m_idx]);
+    state.maybe_uninit.unionInPlace(trie.subtree[m_idx]);
+    if (!lookup.is_partial) {
+        state.ever_moved.differenceInPlace(trie.subtree[m_idx]);
+        state.ever_freed.differenceInPlace(trie.subtree[m_idx]);
+    }
+    var anc = trie.nodes[m_idx].parent;
+    while (!anc.isNone()) {
+        state.maybe_init.set(anc.asInt());
+        anc = trie.nodes[anc.asInt()].parent;
+    }
+}
+
+/// Marks `lookup` as uninitialized along a statically proven `.Err` branch of a fallible `&out` call (`ADR-22B`).
+fn applyPathUninitToState(
+    trie: *const MovePathTrie,
+    lookup: PlacePathLookup,
+    state: *TypestateState,
+) void {
+    const m_idx = lookup.id.asInt();
+    if (!lookup.is_partial) {
+        state.maybe_init.differenceInPlace(trie.subtree[m_idx]);
+    }
+    state.maybe_uninit.unionInPlace(trie.subtree[m_idx]);
+}
+
+/// Resolved `.Ok` (`true`) or `.Err` (`false`) branch refinement for a `Result`-returning `MirCallSite`.
+const FallibleCallBranchSelection = struct {
+    /// Index into `body.calls` of the originating fallible call site.
+    call_idx: u32,
+    /// `true` on the `.Ok` (`0`) edge; `false` on the `.Err` (`1`) edge.
+    is_ok_branch: bool,
+};
+
+/// Traces `res_val` back to `block_param` #0 of a `normal_bb` fed by a fallible `Result` `.call` terminator.
+fn resolveFallibleCallFromResultVal(
+    body: *const MirBody,
+    pool: *const InternPool,
+    raw_res_val: u32,
+) ?u32 {
+    const res_val = peelCopyValId(body, raw_res_val);
+    if (res_val >= body.insts.len) return null;
+    const res_inst = body.getInst(MirValueId.fromInt(res_val));
+    if (res_inst.op != .block_param or res_inst.operands.rhs != 0) return null;
+    const normal_bb_idx = res_inst.operands.lhs;
+    if (normal_bb_idx >= body.blocks.items.len) return null;
+    const pred_edges = body.getPredEdges(MirBlockId.fromInt(normal_bb_idx));
+    if (pred_edges.len != 1) return null;
+    const call_bb = body.extra_edges.items[pred_edges[0].asInt()].src_bb;
+    if (call_bb.asInt() >= body.blocks.items.len) return null;
+    const call_term = body.blocks.items[call_bb.asInt()].terminator;
+    if (call_term.kind != .call or call_term.cond_or_val >= body.calls.items.len) return null;
+    const call_site = body.calls.items[call_term.cond_or_val];
+    if (!isFallibleResultCallSite(pool, call_site)) return null;
+    return call_term.cond_or_val;
+}
+
+/// Detects whether `pred_eid` selects `.Ok` (`0`) or `.Err` (`1`) of a `Result` returned by a `.call` site.
+fn detectFallibleCallResultEdge(
+    body: *const MirBody,
+    pool: *const InternPool,
+    pred_eid: mir.EdgeId,
+) ?FallibleCallBranchSelection {
+    if (pred_eid.asInt() >= body.extra_edges.items.len) return null;
+    const edge = body.extra_edges.items[pred_eid.asInt()];
+    const src_bb_idx = edge.src_bb.asInt();
+    if (src_bb_idx >= body.blocks.items.len) return null;
+    const src_term = body.blocks.items[src_bb_idx].terminator;
+
+    var discr_vid: u32 = mir.NONE_U32;
+    var is_ok_branch = false;
+
+    if (src_term.kind == .switch_int) {
+        var arm_tag_opt: ?i128 = null;
+        if (edge.case_tag_idx < body.switch_values.items.len) {
+            arm_tag_opt = body.switch_values.items[edge.case_tag_idx];
+        } else if (edge.case_tag_idx == std.math.maxInt(u16)) {
+            var has_zero = false;
+            var has_one = false;
+            for (body.getOutgoingEdges(edge.src_bb)) |sib_edge| {
+                if (sib_edge.case_tag_idx < body.switch_values.items.len) {
+                    const sv = body.switch_values.items[sib_edge.case_tag_idx];
+                    if (sv == 0) has_zero = true;
+                    if (sv == 1) has_one = true;
+                }
+            }
+            if (has_one and !has_zero) {
+                arm_tag_opt = 0;
+            } else if (has_zero and !has_one) {
+                arm_tag_opt = 1;
+            }
+        }
+        if (arm_tag_opt) |arm_tag| {
+            if (arm_tag == 0) {
+                is_ok_branch = true;
+            } else if (arm_tag == 1) {
+                is_ok_branch = false;
+            } else {
+                return null;
+            }
+            discr_vid = peelCopyValId(body, src_term.cond_or_val);
+        } else {
+            return null;
+        }
+    } else if (src_term.kind == .cond_br and src_term.edge_len == 2) {
+        const cond_vid = peelCopyValId(body, src_term.cond_or_val);
+        if (cond_vid >= body.insts.len) return null;
+        const cond_inst = body.getInst(MirValueId.fromInt(cond_vid));
+        if (cond_inst.op != .bin_op) return null;
+        const bkind: BinOpKind = @fromBackingInt(@intCast(@as(u8, @truncate(cond_inst.aux_u16))));
+        if (bkind != .eq and bkind != .ne) return null;
+        const lhs_v = peelCopyValId(body, cond_inst.operands.lhs);
+        const rhs_v = peelCopyValId(body, cond_inst.operands.rhs);
+        var const_tag_opt: ?i128 = null;
+        if (rhs_v < body.insts.len and body.getInst(MirValueId.fromInt(rhs_v)).op == .const_scalar) {
+            const c_idx = body.getInst(MirValueId.fromInt(rhs_v)).operands.lhs;
+            if (c_idx < body.consts.items.len and body.consts.items[c_idx] == .int_val) {
+                const_tag_opt = body.consts.items[c_idx].int_val;
+                discr_vid = lhs_v;
+            }
+        } else if (lhs_v < body.insts.len and body.getInst(MirValueId.fromInt(lhs_v)).op == .const_scalar) {
+            const c_idx = body.getInst(MirValueId.fromInt(lhs_v)).operands.lhs;
+            if (c_idx < body.consts.items.len and body.consts.items[c_idx] == .int_val) {
+                const_tag_opt = body.consts.items[c_idx].int_val;
+                discr_vid = rhs_v;
+            }
+        }
+        const cmp_tag = const_tag_opt orelse return null;
+        if (cmp_tag != 0 and cmp_tag != 1) return null;
+        const is_then = (pred_eid.asInt() == src_term.edge_start);
+        const is_equal_branch = if (bkind == .eq) is_then else !is_then;
+        is_ok_branch = if (cmp_tag == 0) is_equal_branch else !is_equal_branch;
+    } else {
+        return null;
+    }
+
+    if (discr_vid >= body.insts.len) return null;
+    const discr_inst = body.getInst(MirValueId.fromInt(discr_vid));
+    if (discr_inst.op == .unary_op) {
+        const uop: UnaryOpKind = @fromBackingInt(@intCast(@as(u8, @truncate(discr_inst.aux_u16))));
+        if (uop == .ssa_discriminant) {
+            if (resolveFallibleCallFromResultVal(body, pool, discr_inst.operands.lhs)) |c_idx| {
+                return .{ .call_idx = c_idx, .is_ok_branch = is_ok_branch };
+            }
+        }
+        return null;
+    }
+
+    if (discr_inst.op == .place_discriminant and discr_inst.operands.lhs < body.places.items.len) {
+        const scrut_pl = body.places.items[discr_inst.operands.lhs];
+        if (scrut_pl.proj_len != 0) return null;
+        const scrut_base = scrut_pl.base;
+
+        // First scan backward across `src_bb_idx` (and up to 2 single-predecessor `br` blocks):
+        var walk_bb = src_bb_idx;
+        var hop: usize = 0;
+        while (hop < 3 and walk_bb < body.blocks.items.len) : (hop += 1) {
+            const insts = body.getBlockInsts(MirBlockId.fromInt(@intCast(walk_bb)));
+            var rev_i = insts.len;
+            while (rev_i > 0) {
+                rev_i -= 1;
+                const cand = body.getInst(insts[rev_i]);
+                if (cand.op == .place_store and cand.operands.lhs < body.places.items.len) {
+                    const st_pl = body.places.items[cand.operands.lhs];
+                    if (st_pl.base == scrut_base) {
+                        if (st_pl.proj_len != 0) return null;
+                        if (resolveFallibleCallFromResultVal(body, pool, cand.operands.rhs)) |c_idx| {
+                            return .{ .call_idx = c_idx, .is_ok_branch = is_ok_branch };
+                        }
+                        return null;
+                    }
+                }
+            }
+            const preds = body.getPredEdges(MirBlockId.fromInt(@intCast(walk_bb)));
+            if (preds.len != 1) break;
+            const prev_bb = body.extra_edges.items[preds[0].asInt()].src_bb.asInt();
+            if (prev_bb >= body.blocks.items.len or body.blocks.items[prev_bb].terminator.kind != .br) break;
+            walk_bb = prev_bb;
+        }
+
+        // Fallback for `let res = foo(&out slot); match res { … }` when `scrut_base` has a single store in `body`:
+        var unique_rhs: u32 = mir.NONE_U32;
+        var store_count: u32 = 0;
+        for (body.blocks.items, 0..) |_, b_usize| {
+            for (body.getBlockInsts(MirBlockId.fromInt(@intCast(b_usize)))) |cand_vid| {
+                const cand = body.getInst(cand_vid);
+                if ((cand.op == .place_store or cand.op == .place_set_discrim) and
+                    cand.operands.lhs < body.places.items.len and
+                    body.places.items[cand.operands.lhs].base == scrut_base)
+                {
+                    store_count += 1;
+                    if (cand.op == .place_store and body.places.items[cand.operands.lhs].proj_len == 0) {
+                        unique_rhs = cand.operands.rhs;
+                    }
+                }
+            }
+        }
+        if (store_count == 1 and unique_rhs != mir.NONE_U32) {
+            if (resolveFallibleCallFromResultVal(body, pool, unique_rhs)) |c_idx| {
+                return .{ .call_idx = c_idx, .is_ok_branch = is_ok_branch };
+            }
+        }
+    }
+    return null;
+}
+
+/// Applies explicit free/close and `&out` (`set`-mode) parameter initialization effects of `call_site` onto `state`.
 fn applyCallStateTransitionSilent(
     body: *const MirBody,
     trie: *const MovePathTrie,
@@ -5599,12 +5848,17 @@ fn applyCallStateTransitionSilent(
     const is_free_call = !call_site.direct_symbol.isNone() and
         call_site.direct_symbol.asInt() < sym_table.symbols.items.len and
         EXPLICIT_FREE_METHOD_MAP.has(sym_table.getSymbol(call_site.direct_symbol).name_text);
+    const is_fallible_result = isFallibleResultCallSite(pool, call_site);
 
     for (0..call_site.args_len) |arg_i| {
         const mode = body.call_arg_modes.items[call_site.modes_start + arg_i];
         const word = body.extra_args.items[call_site.args_start + arg_i];
         if (mode == .set_mode and word < trie.place_map.len) {
-            applyPathWriteToState(trie, trie.place_map[word], state);
+            if (is_fallible_result) {
+                applyPathMaybeWriteToState(trie, trie.place_map[word], state);
+            } else {
+                applyPathWriteToState(trie, trie.place_map[word], state);
+            }
         }
     }
 
@@ -6145,6 +6399,21 @@ fn runPass2TypestateNllAndDrops(
                             }
                         }
                     }
+                    // `ADR-22B`: Refine `&out` (`set_mode`) places across `.Ok` vs `.Err` edges of fallible `T!E` calls:
+                    if (detectFallibleCallResultEdge(body, pool, pred_eid)) |sel| {
+                        const fallible_call = body.calls.items[sel.call_idx];
+                        for (0..fallible_call.args_len) |arg_i| {
+                            const mode = body.call_arg_modes.items[fallible_call.modes_start + arg_i];
+                            const word = body.extra_args.items[fallible_call.args_start + arg_i];
+                            if (mode == .set_mode and word < trie.place_map.len) {
+                                if (sel.is_ok_branch) {
+                                    applyPathWriteToState(trie, trie.place_map[word], &edge_state);
+                                } else {
+                                    applyPathUninitToState(trie, trie.place_map[word], &edge_state);
+                                }
+                            }
+                        }
+                    }
                     _ = work_state.joinAssignChanged(edge_state);
                 }
                 if (in_states[bb_idx].joinAssignChanged(work_state)) {
@@ -6294,7 +6563,7 @@ fn runPass2TypestateNllAndDrops(
                                 "raw pointer may be null here",
                                 null,
                                 null,
-                                "guard the dereference with `if ptr != (0 as *T) { … }` before accessing `*ptr`",
+                                "guard the dereference with `if ptr != (0 as *T) { … }` before accessing `ptr.*`",
                             );
                         }
                     }
@@ -6390,7 +6659,7 @@ fn runPass2TypestateNllAndDrops(
                                             "`&mut` binding goes out of scope leaving referent uninitialized",
                                             null,
                                             null,
-                                            "re-initialize `*ref` on all paths after moving out of it",
+                                            "re-initialize `ref.*` on all paths after moving out of it",
                                         );
                                         break;
                                     }
@@ -6428,7 +6697,7 @@ fn runPass2TypestateNllAndDrops(
                                     .style = .secondary,
                                 },
                                 null,
-                                "register `defer res.close()` / `errdefer res.rollback()` or pass `res` to a `sink` consumer",
+                                "register `defer res.close()` / `errdefer res.rollback()` or pass `own res` to a consumer",
                             );
                         }
 
@@ -6507,9 +6776,12 @@ fn runPass2TypestateNllAndDrops(
                         const has_leading_deref = projs.len > 0 and projs[0].kind == .deref;
                         const is_safe_mut_deref = has_leading_deref and
                             !m_flags.is_behind_shared_ref and !m_flags.is_deref_raw_ptr;
-                        const is_mut_addr = (inst.op == .place_addr and inst.operands.rhs != 0);
+                        const is_raw_addr_of = (inst.op == .place_addr and inst.operands.rhs >= 2);
+                        const is_mut_addr = (inst.op == .place_addr and inst.operands.rhs == 1);
 
-                        scratch_touch |= detectContextScratchAccess(body, pool, sym_table, pl_id);
+                        if (!is_raw_addr_of) {
+                            scratch_touch |= detectContextScratchAccess(body, pool, sym_table, pl_id);
+                        }
 
                         // Typestate read validity (`E0301` / `E0302` / `E0303`; defer to `E0313` on free/`@linear` sink):
                         const is_deferring_to_e0313 = isBlockFeedingFreeOrLinearSink(
@@ -6521,7 +6793,9 @@ fn runPass2TypestateNllAndDrops(
                             pos + 1,
                             lookup.id,
                         );
-                        if ((!has_leading_deref or is_safe_mut_deref) and !is_deferring_to_e0313 and !has_reported_path_diag[m_idx]) {
+                        if (!is_raw_addr_of and (!has_leading_deref or is_safe_mut_deref) and
+                            !is_deferring_to_e0313 and !has_reported_path_diag[m_idx])
+                        {
                             if (work_state.ever_freed.isSet(m_idx)) {
                                 has_reported_path_diag[m_idx] = true;
                                 outcome.emitted_error_count += 1;
@@ -6588,7 +6862,7 @@ fn runPass2TypestateNllAndDrops(
                             }
                         }
                         defer if (has_prior_self_let) work_state.let_loan.set(m_idx);
-                        if (!has_leading_deref and !has_reported_path_diag[m_idx]) {
+                        if (!is_raw_addr_of and !has_leading_deref and !has_reported_path_diag[m_idx]) {
                             const is_scratch_access = detectContextScratchAccess(body, pool, sym_table, pl_id) != 0;
                             if (findExclusivityConflict(
                                 trie,
@@ -6946,8 +7220,9 @@ fn runPass2TypestateNllAndDrops(
                                         (body.locals.items[pl_rec.base].mode() == .inout_mode or
                                             body.locals.items[pl_rec.base].mode() == .set_mode));
                                 const unwrapped_rhs = pool.unwrapUnderlyingType(rhs_ty);
-                                const is_closure_store = !unwrapped_rhs.isError() and
-                                    (pool.getNode(unwrapped_rhs).tag == .closure_ty or
+                                const is_closure_or_fmt_store = !unwrapped_rhs.isError() and
+                                    (unwrapped_rhs == .fmt_args_ty or
+                                        pool.getNode(unwrapped_rhs).tag == .closure_ty or
                                         pool.getNode(unwrapped_rhs).tag == .fn_ty);
                                 const has_synth_same_depth_escape = body.local_scope_depths.items.len != local_count and
                                     rhs_prov.max_depth == horizon.local_decl_depth[pl_rec.base] and
@@ -6955,7 +7230,7 @@ fn runPass2TypestateNllAndDrops(
                                     !rhs_prov.origin_local.isNone() and
                                     pl_rec.base < rhs_prov.origin_local.asInt();
                                 const is_unloaned_local_escape = !has_leading_deref and pl_rec.base != 0 and
-                                    (rhs_prov.loan_mask.isEmpty() or is_closure_store) and
+                                    (rhs_prov.loan_mask.isEmpty() or is_closure_or_fmt_store) and
                                     (rhs_prov.max_depth > horizon.local_decl_depth[pl_rec.base] or
                                         has_synth_same_depth_escape);
                                 if (is_outer_ref_write or is_unloaned_local_escape) {
@@ -7158,7 +7433,7 @@ fn runPass2TypestateNllAndDrops(
                         "local-region value escapes function frame on `return` here",
                         sec_origin,
                         null,
-                        "return an owned value (`Vec`, `String`) or accept a caller `inout Arena` parameter",
+                        "return an owned value (`Vec`, `String`) or accept a caller `&mut Arena` parameter",
                     );
                 }
             } else if (ret_prov.max_depth >= DEPTH_FN_FRAME and
@@ -7194,7 +7469,7 @@ fn runPass2TypestateNllAndDrops(
                 );
             }
 
-            // [b] Check formal parameters (`inout`/`&mut` re-init, `set` normal-return init, `sink` `@linear` & `AutoDrop` drops):
+            // [b] Check formal parameters (`&mut` re-init, `&out` normal-return init / `.Err` drops, `own` `@linear` & `AutoDrop`):
             var param_rev: usize = body.param_count;
             while (param_rev > 0) {
                 param_rev -= 1;
@@ -7213,11 +7488,11 @@ fn runPass2TypestateNllAndDrops(
                             .e0303_uninitialized_memory_read,
                             .err,
                             ret_span,
-                            "`inout` parameter moved from without dominating re-initialization before return",
-                            "function exits while `inout` parameter may be uninitialized",
-                            .{ .span = param_sp, .label = "`inout` parameter declared here", .style = .secondary },
+                            "`&mut` parameter moved from without dominating re-initialization before return",
+                            "function exits while `&mut` parameter may be uninitialized",
+                            .{ .span = param_sp, .label = "`&mut` parameter declared here", .style = .secondary },
                             null,
-                            "re-initialize the `inout` parameter on all normal and `?` return paths",
+                            "re-initialize the `&mut` parameter on all normal and `?` return paths",
                         );
                     }
                 } else if (slot_i < trie.direct_local_limit and isSafeMutRefBase(pool, param_loc.type_id)) {
@@ -7237,30 +7512,67 @@ fn runPass2TypestateNllAndDrops(
                                 .err,
                                 ret_span,
                                 "`&mut` parameter referent moved from without dominating re-initialization before return",
-                                "function exits while `*param` may remain uninitialized",
+                                "function exits while `param.*` may remain uninitialized",
                                 .{ .span = param_sp, .label = "`&mut` parameter declared here", .style = .secondary },
                                 null,
-                                "re-initialize `*param` on all normal and `?` return paths",
+                                "re-initialize `param.*` on all normal and `?` return paths",
                             );
                             break;
                         }
                         walk_ch = trie.nodes[ch_i].next_sibling;
                     }
-                } else if (param_mode == .set_mode and !is_error_ret) {
-                    if (work_state.maybe_uninit.isSet(slot_i) and !has_reported_path_diag[slot_i]) {
-                        has_reported_path_diag[slot_i] = true;
-                        outcome.emitted_error_count += 1;
-                        try emitSastDiag(
-                            eff_config.diagnostic_sink,
-                            .e0303_uninitialized_memory_read,
-                            .err,
-                            ret_span,
-                            "`set` out-parameter is not definitely initialized before normal return",
-                            "normal return reached while `set` parameter may still be uninitialized",
-                            .{ .span = param_sp, .label = "`set` parameter declared here", .style = .secondary },
-                            null,
-                            "assign a value to the `set` parameter on every non-error return path",
-                        );
+                } else if (param_mode == .set_mode) {
+                    const p_flags = trie.nodes[slot_i].flags();
+                    if (!is_error_ret) {
+                        if (trie.subtree[slot_i].intersects(work_state.maybe_uninit) and !has_reported_path_diag[slot_i]) {
+                            has_reported_path_diag[slot_i] = true;
+                            outcome.emitted_error_count += 1;
+                            try emitSastDiag(
+                                eff_config.diagnostic_sink,
+                                .e0422_out_param_contract_violation,
+                                .err,
+                                ret_span,
+                                "`&out` parameter is not definitely initialized before normal return",
+                                "normal return reached while `&out` parameter may still be uninitialized",
+                                .{ .span = param_sp, .label = "`&out` parameter declared here", .style = .secondary },
+                                null,
+                                "initialize the `&out` parameter (and all of its fields) on every non-error return path",
+                            );
+                        }
+                    } else {
+                        if (hasLiveLinearObligation(trie, &work_state, slot_i) and !has_reported_path_diag[slot_i]) {
+                            has_reported_path_diag[slot_i] = true;
+                            outcome.emitted_error_count += 1;
+                            try emitSastDiag(
+                                eff_config.diagnostic_sink,
+                                .e0304_resource_or_memory_leak,
+                                .err,
+                                ret_span,
+                                "`@linear` resource written to `&out` parameter leaks along error return path",
+                                "error return reached while `&out` `@linear` obligation is already live",
+                                .{ .span = param_sp, .label = "`&out` parameter declared here", .style = .secondary },
+                                null,
+                                "only write `@linear` values into `&out` parameters once no subsequent `.Err` return can occur",
+                            );
+                        } else if ((p_flags.is_auto_drop or p_flags.is_linear) and
+                            trie.subtree[slot_i].intersects(work_state.maybe_init))
+                        {
+                            try planDropsForMovePath(
+                                arena_alloc,
+                                perm_alloc,
+                                body,
+                                bb_idx,
+                                mir.NONE_U32,
+                                slot_i,
+                                ret_tok,
+                                trie,
+                                &work_state,
+                                pool,
+                                sym_table,
+                                has_drop_flag_need,
+                                &planned_drops,
+                            );
+                        }
                     }
                 } else if (param_mode == .sink_mode) {
                     const p_flags = trie.nodes[slot_i].flags();
@@ -7272,11 +7584,11 @@ fn runPass2TypestateNllAndDrops(
                             .e0304_resource_or_memory_leak,
                             .err,
                             ret_span,
-                            "`sink` `@linear` parameter is not consumed before function return",
-                            "function returns while `sink` `@linear` parameter remains live",
-                            .{ .span = param_sp, .label = "`sink` `@linear` parameter declared here", .style = .secondary },
+                            "`own` `@linear` parameter is not consumed before function return",
+                            "function returns while `own` `@linear` parameter remains live",
+                            .{ .span = param_sp, .label = "`own` `@linear` parameter declared here", .style = .secondary },
                             null,
-                            "consume or close the `sink` parameter on all normal and `?` return paths",
+                            "consume or close the `own` parameter on all normal and `?` return paths",
                         );
                     } else if ((p_flags.is_auto_drop or p_flags.is_linear) and work_state.maybe_init.isSet(slot_i)) {
                         try planDropsForMovePath(
@@ -7522,6 +7834,22 @@ fn runPass2TypestateNllAndDrops(
     summary.setContractsScratch(cur_contracts);
     summaries[slot_idx] = summary;
 
+    // [2.25] `SE-15` 3-Phase Parallel Assignment Pairwise Disjointness Verification (`E0305`):
+    if (body.parallel_assign_groups.items.len > 0) {
+        try verifyParallelAssignmentGroups(
+            arena_alloc,
+            body,
+            dom,
+            trie,
+            horizon,
+            pool,
+            sym_table,
+            eff_config,
+            decl_fallback_span,
+            &outcome,
+        );
+    }
+
     // [2.3] Materialize `planned_drops` & `_drop_flag` locals without splitting basic blocks:
     if (planned_drops.items.len > 0 and !body.is_sast_elaborated) {
         try materializePlannedDrops(
@@ -7544,7 +7872,23 @@ fn runPass2TypestateNllAndDrops(
     return outcome;
 }
 
-/// Returns `true` if `bb_idx` is a cleanup pad or returns an `Err`/`None` variant (`set` param exemption).
+/// Returns `true` if `raw_val` is an `Err` (`1` on `Result`) variant constructor (`ADR-22B`).
+fn isKnownErrorTaggedVariantVal(
+    body: *const MirBody,
+    ret_tag: type_system.TypeTag,
+    raw_val: u32,
+) bool {
+    const val_idx = peelCopyValId(body, raw_val);
+    if (val_idx >= body.insts.len) return false;
+    const val_inst = body.getInst(MirValueId.fromInt(val_idx));
+    if (val_inst.op != .aggregate_make) return false;
+    const agg_kind: AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(val_inst.aux_u16))));
+    if (agg_kind != .tagged_variant) return false;
+    const tag_ord = val_inst.operands.rhs >> 16;
+    return ret_tag == .result_ty and tag_ord == 1;
+}
+
+/// Returns `true` if `bb_idx` is a cleanup pad or returns a `Result.Err` variant (`&out` param exemption, `ADR-22B`).
 fn isCleanupOrErrorReturnBlock(
     body: *const MirBody,
     pool: *const InternPool,
@@ -7552,16 +7896,632 @@ fn isCleanupOrErrorReturnBlock(
     term: mir.MirTerminator,
 ) bool {
     if (body.blocks.items[bb_idx].isCleanupPad()) return true;
-    if (term.cond_or_val >= body.insts.len) return false;
-    const ret_inst = body.getInst(MirValueId.fromInt(term.cond_or_val));
-    if (ret_inst.op != .aggregate_make) return false;
-    const agg_kind: AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(ret_inst.aux_u16))));
-    if (agg_kind != .tagged_variant) return false;
-    const tag_ord = ret_inst.operands.rhs >> 16;
     const unwrapped_ret = pool.unwrapUnderlyingType(body.ret_ty);
     if (unwrapped_ret.isError()) return false;
     const ret_tag = pool.getNode(unwrapped_ret).tag;
-    return (ret_tag == .result_ty and tag_ord == 1) or (ret_tag == .optional_ty and tag_ord == 0);
+    if (ret_tag != .result_ty) return false;
+
+    const peeled_ret = peelCopyValId(body, term.cond_or_val);
+    if (peeled_ret >= body.insts.len) return false;
+    if (isKnownErrorTaggedVariantVal(body, ret_tag, peeled_ret)) return true;
+
+    // Also handle `place_store(_0, .Err(…))` or `place_set_discrim(_0, 1)` inside an `.Err`-only epilogue block:
+    const ret_inst = body.getInst(MirValueId.fromInt(peeled_ret));
+    if (ret_inst.op == .place_load and ret_inst.operands.lhs < body.places.items.len) {
+        const ret_pl = body.places.items[ret_inst.operands.lhs];
+        if (ret_pl.proj_len == 0) {
+            var walk_bb = bb_idx;
+            var hop: usize = 0;
+            while (hop < 3 and walk_bb < body.blocks.items.len) : (hop += 1) {
+                const insts = body.getBlockInsts(MirBlockId.fromInt(walk_bb));
+                var rev_i = insts.len;
+                while (rev_i > 0) {
+                    rev_i -= 1;
+                    const cand = body.getInst(insts[rev_i]);
+                    if (cand.op == .place_store and cand.operands.lhs < body.places.items.len) {
+                        const st_pl = body.places.items[cand.operands.lhs];
+                        if (st_pl.base == ret_pl.base) {
+                            return st_pl.proj_len == 0 and
+                                isKnownErrorTaggedVariantVal(body, ret_tag, cand.operands.rhs);
+                        }
+                    } else if (cand.op == .place_set_discrim and cand.operands.lhs < body.places.items.len) {
+                        const st_pl = body.places.items[cand.operands.lhs];
+                        if (st_pl.base == ret_pl.base and st_pl.proj_len == 0) {
+                            return ret_tag == .result_ty and cand.operands.rhs == 1;
+                        }
+                    }
+                }
+                const preds = body.getPredEdges(MirBlockId.fromInt(walk_bb));
+                if (preds.len != 1) break;
+                const prev_bb = body.extra_edges.items[preds[0].asInt()].src_bb.asInt();
+                if (prev_bb >= body.blocks.items.len or body.blocks.items[prev_bb].terminator.kind != .br) break;
+                walk_bb = prev_bb;
+            }
+        }
+    }
+    return false;
+}
+
+/// Returns `true` if `pl_id` steps through at least one `.deref` over a `.raw_ptr_ty` (`*const T` / `*mut T`).
+fn hasRawPtrDerefInPlace(
+    body: *const MirBody,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    pl_id: PlaceId,
+) bool {
+    if (pl_id.asInt() >= body.places.items.len) return false;
+    const place_rec = body.places.items[pl_id.asInt()];
+    if (place_rec.base >= body.locals.items.len) return false;
+    var cur_ty = body.locals.items[place_rec.base].type_id;
+    var active_subst: type_system.NominalTypeSubst = .{};
+    var active_downcast: ?u32 = null;
+    var active_soa_field: ?TypeId = null;
+    for (body.getPlaceProjections(pl_id)) |proj| {
+        const unwrapped = pool.unwrapUnderlyingType(active_subst.resolve(cur_ty));
+        if (!unwrapped.isError() and proj.kind == .deref and pool.getNode(unwrapped).tag == .raw_ptr_ty) {
+            return true;
+        }
+        cur_ty = stepProjectedType(
+            pool,
+            sym_table,
+            cur_ty,
+            proj,
+            &active_subst,
+            &active_downcast,
+            &active_soa_field,
+        );
+    }
+    return false;
+}
+
+/// Returns `true` if `local_idx` has its raw address taken via `&raw` / `&raw mut` anywhere in `body`.
+fn hasAnyRawAddrTakenOfLocal(body: *const MirBody, local_idx: u32) bool {
+    for (0..body.insts.len) |v_idx| {
+        const inst = body.getInst(MirValueId.fromInt(@intCast(v_idx)));
+        if (inst.op == .place_addr and inst.operands.rhs >= 2 and inst.operands.lhs < body.places.items.len) {
+            if (body.places.items[inst.operands.lhs].base == local_idx) return true;
+        }
+    }
+    return false;
+}
+
+/// Decomposes `val_raw` into `(canonical_base_val, signed_const_offset)` for checked `base +- const` indices.
+fn extractCanonicalIndexBaseAndOffset(
+    body: *const MirBody,
+    val_raw: u32,
+    canon_val: []const u32,
+) struct { base_val: u32, offset: i128 } {
+    if (val_raw >= canon_val.len) return .{ .base_val = val_raw, .offset = 0 };
+    const canon_v = canon_val[val_raw];
+    if (canon_v >= body.insts.len) return .{ .base_val = canon_v, .offset = 0 };
+    const inst = body.getInst(MirValueId.fromInt(canon_v));
+    if (inst.op == .bin_op and inst.operands.lhs < canon_val.len and inst.operands.rhs < canon_val.len) {
+        const bkind: BinOpKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+        if (bkind == .uadd_checked or bkind == .sadd_checked or
+            bkind == .usub_checked or bkind == .ssub_checked)
+        {
+            const lhs_c = canon_val[inst.operands.lhs];
+            const rhs_c = canon_val[inst.operands.rhs];
+            if (rhs_c < body.insts.len) {
+                const rhs_inst = body.getInst(MirValueId.fromInt(rhs_c));
+                if (rhs_inst.op == .const_scalar and rhs_inst.operands.lhs < body.consts.items.len and
+                    body.consts.items[rhs_inst.operands.lhs] == .int_val)
+                {
+                    const delta = body.consts.items[rhs_inst.operands.lhs].int_val;
+                    const signed_off = if (bkind == .usub_checked or bkind == .ssub_checked) -delta else delta;
+                    return .{ .base_val = lhs_c, .offset = signed_off };
+                }
+            }
+            if ((bkind == .uadd_checked or bkind == .sadd_checked) and lhs_c < body.insts.len) {
+                const lhs_inst = body.getInst(MirValueId.fromInt(lhs_c));
+                if (lhs_inst.op == .const_scalar and lhs_inst.operands.lhs < body.consts.items.len and
+                    body.consts.items[lhs_inst.operands.lhs] == .int_val)
+                {
+                    return .{ .base_val = rhs_c, .offset = body.consts.items[lhs_inst.operands.lhs].int_val };
+                }
+            }
+        }
+    }
+    return .{ .base_val = canon_v, .offset = 0 };
+}
+
+/// Returns `true` when SSA index values `idx_a` and `idx_b` are statically proven unequal (`SE-15`).
+fn isParallelIndexPairDistinct(
+    body: *const MirBody,
+    idx_a: u32,
+    idx_b: u32,
+    solved: *const SolvedBodyIntervals,
+    canon_val: []const u32,
+) bool {
+    if (idx_a < solved.val_domains.len and idx_b < solved.val_domains.len) {
+        const dom_a = solved.val_domains[idx_a];
+        const dom_b = solved.val_domains[idx_b];
+        if (dom_a != null and dom_b != null) {
+            const iv_a = readDomRefinedIntv(
+                body,
+                idx_a,
+                solved.val_intv,
+                solved.val_overrides,
+                solved.local_overrides,
+                solved.slice_len_overrides,
+                solved.local_store_counts,
+                solved.slice_len_store_counts,
+            );
+            const iv_b = readDomRefinedIntv(
+                body,
+                idx_b,
+                solved.val_intv,
+                solved.val_overrides,
+                solved.local_overrides,
+                solved.slice_len_overrides,
+                solved.local_store_counts,
+                solved.slice_len_store_counts,
+            );
+            if (!iv_a.isBottom() and !iv_b.isBottom()) {
+                const bounds_a = decodeIntvToI128(iv_a, dom_a.?);
+                const bounds_b = decodeIntvToI128(iv_b, dom_b.?);
+                if (bounds_a.hi < bounds_b.lo or bounds_b.hi < bounds_a.lo) return true;
+            }
+        }
+    }
+
+    const decomp_a = extractCanonicalIndexBaseAndOffset(body, idx_a, canon_val);
+    const decomp_b = extractCanonicalIndexBaseAndOffset(body, idx_b, canon_val);
+    if (decomp_a.base_val == decomp_b.base_val and decomp_a.offset != decomp_b.offset) {
+        return true;
+    }
+    return false;
+}
+
+/// Reconstructs the static `MirProjection` prefix from `trie` root local down to `loan_path`.
+fn extractLoanPrefixProjections(
+    trie: *const MovePathTrie,
+    loan_path: MovePathId,
+    out_buf: *[256]mir.MirProjection,
+) struct { base_local: u32, len: usize } {
+    if (loan_path.isNone() or loan_path.asInt() >= trie.nodes.len) {
+        return .{ .base_local = mir.NONE_U32, .len = 0 };
+    }
+    const base_local = trie.nodes[loan_path.asInt()].base_local;
+    var rev_steps: [256]mir.MirProjection = undefined;
+    var count: usize = 0;
+    var cur = loan_path;
+    while (!cur.isNone() and cur.asInt() < trie.nodes.len and count < rev_steps.len) {
+        const node = trie.nodes[cur.asInt()];
+        if (node.proj_kind_raw == 0xFF) break;
+        rev_steps[count] = .{
+            .kind = @fromBackingInt(node.proj_kind_raw),
+            .payload = node.field_or_variant_ord,
+        };
+        count += 1;
+        cur = node.parent;
+    }
+    for (0..count) |i| {
+        out_buf[i] = rev_steps[count - 1 - i];
+    }
+    return .{ .base_local = base_local, .len = count };
+}
+
+/// Checks whether two projection chains rooted at the same `base_local` are statically proven disjoint (`SE-15`).
+fn isProjectionPairDisjoint(
+    body: *const MirBody,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    base_local: u32,
+    projs_a: []const mir.MirProjection,
+    projs_b: []const mir.MirProjection,
+    solved: *const SolvedBodyIntervals,
+    canon_val: []const u32,
+) bool {
+    if (base_local >= body.locals.items.len) return true;
+    const min_steps = @min(projs_a.len, projs_b.len);
+    var cur_ty = body.locals.items[base_local].type_id;
+    var active_subst: type_system.NominalTypeSubst = .{};
+    var active_downcast: ?u32 = null;
+    var active_soa_field: ?TypeId = null;
+
+    for (0..min_steps) |step_i| {
+        const proj_a = projs_a[step_i];
+        const proj_b = projs_b[step_i];
+        const unwrapped_cur = pool.unwrapUnderlyingType(active_subst.resolve(cur_ty));
+        if (proj_a.kind != proj_b.kind) return false;
+        switch (proj_a.kind) {
+            .deref => {},
+            .field => {
+                if (proj_a.payload != proj_b.payload) {
+                    if (!unwrapped_cur.isError() and pool.getNode(unwrapped_cur).tag == .union_ty) {
+                        return false;
+                    }
+                    return true;
+                }
+            },
+            .soa_elem => {
+                if (proj_a.payload != proj_b.payload) return true;
+            },
+            .downcast => {
+                if (proj_a.payload != proj_b.payload) return true;
+            },
+            .index => {
+                if (isParallelIndexPairDistinct(body, proj_a.payload, proj_b.payload, solved, canon_val)) {
+                    return true;
+                }
+                if (proj_a.payload != proj_b.payload and
+                    extractCanonicalIndexBaseAndOffset(body, proj_a.payload, canon_val).base_val !=
+                        extractCanonicalIndexBaseAndOffset(body, proj_b.payload, canon_val).base_val)
+                {
+                    return false;
+                }
+                // Identical index expression (`arr[i].x` vs `arr[i].y`) continues checking deeper field projections!
+            },
+            .slice_len => {},
+        }
+        cur_ty = stepProjectedType(
+            pool,
+            sym_table,
+            cur_ty,
+            proj_a,
+            &active_subst,
+            &active_downcast,
+            &active_soa_field,
+        );
+    }
+    return false;
+}
+
+/// Checks whether a virtual target `(target_base, target_projs)` is proven disjoint from `other_pl` (and its loans).
+fn isVirtualTargetDisjointFromPlace(
+    body: *const MirBody,
+    trie: *const MovePathTrie,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    horizon: *const BodyProvenanceHorizon,
+    target_base: u32,
+    target_projs: []const mir.MirProjection,
+    other_pl: PlaceId,
+    is_other_deref: bool,
+    solved: *const SolvedBodyIntervals,
+    canon_val: []const u32,
+) bool {
+    const other_rec = body.places.items[other_pl.asInt()];
+    const other_projs = body.getPlaceProjections(other_pl);
+    if (!is_other_deref) {
+        if (target_base != other_rec.base) return true;
+        return isProjectionPairDisjoint(
+            body,
+            pool,
+            sym_table,
+            target_base,
+            target_projs,
+            other_projs,
+            solved,
+            canon_val,
+        );
+    }
+
+    if (other_rec.base >= horizon.local_prov.len) return false;
+    const other_prov = horizon.local_prov[other_rec.base];
+
+    var loan_bit_opt = other_prov.loan_mask.nextSetBit(0);
+    while (loan_bit_opt) |loan_idx| : (loan_bit_opt = other_prov.loan_mask.nextSetBit(loan_idx + 1)) {
+        if (loan_idx >= horizon.loans.len or horizon.loans[loan_idx].is_overflow_wildcard) return false;
+        const loan = horizon.loans[loan_idx];
+        var vbuf: [256]mir.MirProjection = undefined;
+        const prefix = extractLoanPrefixProjections(trie, loan.path_id, &vbuf);
+        if (prefix.base_local == mir.NONE_U32) return false;
+        var vlen = prefix.len;
+        if (!loan.is_partial and other_projs.len > 1) {
+            const copy_tail = @min(other_projs.len - 1, vbuf.len - vlen);
+            @memcpy(vbuf[vlen .. vlen + copy_tail], other_projs[1 .. 1 + copy_tail]);
+            vlen += copy_tail;
+        }
+        if (target_base == prefix.base_local and
+            !isProjectionPairDisjoint(
+                body,
+                pool,
+                sym_table,
+                target_base,
+                target_projs,
+                vbuf[0..vlen],
+                solved,
+                canon_val,
+            ))
+        {
+            return false;
+        }
+    }
+
+    var param_ord: usize = 0;
+    while (param_ord < 8) : (param_ord += 1) {
+        if (((other_prov.param_mask >> @intCast(param_ord)) & 1) == 0) continue;
+        const param_slot: u32 = @intCast(1 + param_ord);
+        if (param_slot > body.param_count) continue;
+        if (target_base == param_slot and
+            !isProjectionPairDisjoint(
+                body,
+                pool,
+                sym_table,
+                target_base,
+                target_projs,
+                other_projs,
+                solved,
+                canon_val,
+            ))
+        {
+            return false;
+        }
+    }
+
+    if (other_prov.loan_mask.isEmpty() and other_prov.param_mask == 0) {
+        if (other_rec.base >= 1 and other_rec.base <= body.param_count) {
+            if (target_base == other_rec.base and
+                !isProjectionPairDisjoint(
+                    body,
+                    pool,
+                    sym_table,
+                    target_base,
+                    target_projs,
+                    other_projs,
+                    solved,
+                    canon_val,
+                ))
+            {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Returns `true` when LHS parallel assignment places `pl_a` and `pl_b` are statically proven disjoint (`SE-15`).
+fn isParallelLhsPairDisjoint(
+    body: *const MirBody,
+    trie: *const MovePathTrie,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    horizon: *const BodyProvenanceHorizon,
+    pl_a: PlaceId,
+    pl_b: PlaceId,
+    solved: *const SolvedBodyIntervals,
+    canon_val: []const u32,
+) bool {
+    if (pl_a.asInt() >= body.places.items.len or pl_b.asInt() >= body.places.items.len) return true;
+    const rec_a = body.places.items[pl_a.asInt()];
+    const rec_b = body.places.items[pl_b.asInt()];
+    if (rec_a.base >= body.locals.items.len or rec_b.base >= body.locals.items.len) return true;
+
+    const projs_a = body.getPlaceProjections(pl_a);
+    const projs_b = body.getPlaceProjections(pl_b);
+
+    if (rec_a.base != rec_b.base) {
+        const is_raw_a = hasRawPtrDerefInPlace(body, pool, sym_table, pl_a);
+        const is_raw_b = hasRawPtrDerefInPlace(body, pool, sym_table, pl_b);
+        if (is_raw_a and is_raw_b) {
+            if (rec_a.base < horizon.local_prov.len and rec_b.base < horizon.local_prov.len) {
+                const orig_a = horizon.local_prov[rec_a.base].raw_ptr_local;
+                const orig_b = horizon.local_prov[rec_b.base].raw_ptr_local;
+                if (!orig_a.isNone() and !orig_b.isNone() and orig_a != orig_b) return true;
+            }
+            return false;
+        }
+        if (is_raw_a or is_raw_b) {
+            const raw_base = if (is_raw_a) rec_a.base else rec_b.base;
+            const other_pl = if (is_raw_a) pl_b else pl_a;
+            const other_rec = body.places.items[other_pl.asInt()];
+            const other_projs = body.getPlaceProjections(other_pl);
+            const is_other_stack_local = other_projs.len == 0 or other_projs[0].kind != .deref;
+            if (is_other_stack_local) {
+                if (raw_base < horizon.local_prov.len) {
+                    const orig = horizon.local_prov[raw_base].raw_ptr_local;
+                    if (!orig.isNone()) return orig.asInt() != other_rec.base;
+                }
+                return !hasAnyRawAddrTakenOfLocal(body, other_rec.base);
+            }
+            return false;
+        }
+
+        const is_deref_a = projs_a.len > 0 and projs_a[0].kind == .deref;
+        const is_deref_b = projs_b.len > 0 and projs_b[0].kind == .deref;
+        if (!is_deref_a and !is_deref_b) return true;
+
+        const deref_rec = if (is_deref_a) rec_a else rec_b;
+        const deref_projs = if (is_deref_a) projs_a else projs_b;
+        const other_pl = if (is_deref_a) pl_b else pl_a;
+        const is_other_deref = if (is_deref_a) is_deref_b else is_deref_a;
+
+        if (deref_rec.base >= horizon.local_prov.len) return false;
+        const prov = horizon.local_prov[deref_rec.base];
+
+        var loan_bit_opt = prov.loan_mask.nextSetBit(0);
+        while (loan_bit_opt) |loan_idx| : (loan_bit_opt = prov.loan_mask.nextSetBit(loan_idx + 1)) {
+            if (loan_idx >= horizon.loans.len or horizon.loans[loan_idx].is_overflow_wildcard) return false;
+            const loan = horizon.loans[loan_idx];
+            var vbuf: [256]mir.MirProjection = undefined;
+            const prefix = extractLoanPrefixProjections(trie, loan.path_id, &vbuf);
+            if (prefix.base_local == mir.NONE_U32) return false;
+            var vlen = prefix.len;
+            if (!loan.is_partial and deref_projs.len > 1) {
+                const copy_tail = @min(deref_projs.len - 1, vbuf.len - vlen);
+                @memcpy(vbuf[vlen .. vlen + copy_tail], deref_projs[1 .. 1 + copy_tail]);
+                vlen += copy_tail;
+            }
+            if (!isVirtualTargetDisjointFromPlace(
+                body,
+                trie,
+                pool,
+                sym_table,
+                horizon,
+                prefix.base_local,
+                vbuf[0..vlen],
+                other_pl,
+                is_other_deref,
+                solved,
+                canon_val,
+            )) {
+                return false;
+            }
+        }
+
+        var param_ord: usize = 0;
+        while (param_ord < 8) : (param_ord += 1) {
+            if (((prov.param_mask >> @intCast(param_ord)) & 1) == 0) continue;
+            const param_slot: u32 = @intCast(1 + param_ord);
+            if (param_slot > body.param_count) continue;
+            if (!isVirtualTargetDisjointFromPlace(
+                body,
+                trie,
+                pool,
+                sym_table,
+                horizon,
+                param_slot,
+                deref_projs,
+                other_pl,
+                is_other_deref,
+                solved,
+                canon_val,
+            )) {
+                return false;
+            }
+        }
+
+        if (prov.loan_mask.isEmpty() and prov.param_mask == 0) {
+            if (deref_rec.base >= 1 and deref_rec.base <= body.param_count) {
+                return isVirtualTargetDisjointFromPlace(
+                    body,
+                    trie,
+                    pool,
+                    sym_table,
+                    horizon,
+                    deref_rec.base,
+                    deref_projs,
+                    other_pl,
+                    is_other_deref,
+                    solved,
+                    canon_val,
+                );
+            }
+            if (!is_other_deref) {
+                return !hasAnyRawAddrTakenOfLocal(body, body.places.items[other_pl.asInt()].base);
+            }
+            return false;
+        }
+        return true;
+    }
+
+    return isProjectionPairDisjoint(
+        body,
+        pool,
+        sym_table,
+        rec_a.base,
+        projs_a,
+        projs_b,
+        solved,
+        canon_val,
+    );
+}
+
+/// Verifies pairwise disjointness of all `SE-15` parallel assignment LHS target groups (`E0305` on overlap).
+fn verifyParallelAssignmentGroups(
+    arena_alloc: std.mem.Allocator,
+    body: *const MirBody,
+    dom: *const DominatorTree,
+    trie: *const MovePathTrie,
+    horizon: *const BodyProvenanceHorizon,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    config: SastConfig,
+    decl_fallback_span: Span,
+    outcome: *Pass2BodyOutcome,
+) !void {
+    var solved = try solveBodySignBiasedIntervals(arena_alloc, body, dom, pool, sym_table);
+    const inst_count = body.insts.len;
+    const local_count = body.locals.items.len;
+
+    const canon_val = try arena_alloc.alloc(u32, inst_count);
+    for (0..inst_count) |v_idx| {
+        canon_val[v_idx] = peelCopyValId(body, @intCast(v_idx));
+    }
+    const first_unmut_load_val = try arena_alloc.alloc(u32, local_count);
+    @memset(first_unmut_load_val, mir.NONE_U32);
+    for (dom.rpo_blocks) |b_u32| {
+        for (body.getBlockInsts(MirBlockId.fromInt(b_u32))) |inst_vid| {
+            const v_u32 = inst_vid.asInt();
+            const inst = body.getInst(inst_vid);
+            if (inst.op == .place_load and inst.operands.lhs < body.places.items.len) {
+                const pl_rec = body.places.items[inst.operands.lhs];
+                if (pl_rec.proj_len == 0 and pl_rec.base < local_count and solved.local_store_counts[pl_rec.base] <= 1) {
+                    if (first_unmut_load_val[pl_rec.base] == mir.NONE_U32) {
+                        first_unmut_load_val[pl_rec.base] = v_u32;
+                    } else {
+                        canon_val[v_u32] = first_unmut_load_val[pl_rec.base];
+                    }
+                }
+            }
+        }
+    }
+    for (0..inst_count) |v_idx| {
+        canon_val[v_idx] = canon_val[peelCopyValId(body, @intCast(v_idx))];
+    }
+
+    for (body.parallel_assign_groups.items) |grp| {
+        if (grp.places_len < 2 or grp.block_id.isNone()) continue;
+        if (!dom.isReachable(grp.block_id)) continue;
+        const end_idx = @min(
+            body.parallel_assign_places.items.len,
+            @as(usize, grp.places_start) + @as(usize, grp.places_len),
+        );
+        if (end_idx <= grp.places_start + 1) continue;
+
+        populateBlockDomOverrides(
+            body,
+            pool,
+            dom,
+            grp.block_id.asInt(),
+            solved.val_domains,
+            solved.val_intv,
+            solved.local_store_counts,
+            solved.slice_len_store_counts,
+            solved.val_overrides,
+            solved.local_overrides,
+            solved.slice_len_overrides,
+        );
+
+        const group_places = body.parallel_assign_places.items[grp.places_start..end_idx];
+        var has_emitted_group_err = false;
+        for (0..group_places.len) |i| {
+            if (has_emitted_group_err) break;
+            for (i + 1..group_places.len) |j| {
+                if (!isParallelLhsPairDisjoint(
+                    body,
+                    trie,
+                    pool,
+                    sym_table,
+                    horizon,
+                    group_places[i],
+                    group_places[j],
+                    &solved,
+                    canon_val,
+                )) {
+                    has_emitted_group_err = true;
+                    outcome.emitted_error_count += 1;
+                    const grp_span = resolveTokenSpan(body.file_id, grp.origin_token, config, decl_fallback_span);
+                    try emitSastDiag(
+                        config.diagnostic_sink,
+                        .e0305_exclusivity_violation,
+                        .err,
+                        grp_span,
+                        "parallel assignment targets may alias or overlap (`SE-15`)",
+                        "duplicate or potentially aliasing LHS destinations written simultaneously here",
+                        null,
+                        null,
+                        "ensure every LHS place in a parallel assignment targets a distinct binding, field, or proven-disjoint index",
+                    );
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Extracts the base `LocalId.asInt()` of a call argument `(mode, word)` (`null` if pure rvalue).
@@ -7777,11 +8737,37 @@ fn checkAndApplyCallFreeDiagnostics(
     work_state: *TypestateState,
     outcome: *Pass2BodyOutcome,
 ) !void {
+    const is_fallible_result = isFallibleResultCallSite(pool, call_site);
     for (0..call_site.args_len) |arg_i| {
         const mode = body.call_arg_modes.items[call_site.modes_start + arg_i];
         const word = body.extra_args.items[call_site.args_start + arg_i];
         if (mode == .set_mode and word < trie.place_map.len) {
-            applyPathWriteToState(trie, trie.place_map[word], work_state);
+            const lookup = trie.place_map[word];
+            const m_idx = lookup.id.asInt();
+            const m_flags = trie.nodes[m_idx].flags();
+            if ((m_flags.is_auto_drop or m_flags.is_linear) and
+                trie.subtree[m_idx].intersects(work_state.maybe_init) and
+                !has_reported_path_diag[m_idx])
+            {
+                has_reported_path_diag[m_idx] = true;
+                outcome.emitted_error_count += 1;
+                try emitSastDiag(
+                    config.diagnostic_sink,
+                    .e0422_out_param_contract_violation,
+                    .err,
+                    call_span,
+                    "cannot pass initialized or potentially live `AutoDrop`/`@linear` place to `&out` parameter",
+                    "live or partially initialized non-`Copy` destination passed to `&out` here",
+                    null,
+                    null,
+                    "pass an uninitialized `var slot: T;` binding or consume/drop the existing value first",
+                );
+            }
+            if (is_fallible_result) {
+                applyPathMaybeWriteToState(trie, lookup, work_state);
+            } else {
+                applyPathWriteToState(trie, lookup, work_state);
+            }
         }
     }
 
@@ -7856,9 +8842,11 @@ fn materializePlannedDrops(
 
     var false_const_opt: ?u32 = null;
     var true_const_opt: ?u32 = null;
+    var zero_u32_const_opt: ?u32 = null;
     if (flagged_paths.items.len > 0) {
         false_const_opt = try body.appendConst(.{ .bool_val = false });
         true_const_opt = try body.appendConst(.{ .bool_val = true });
+        zero_u32_const_opt = try body.appendConst(.{ .int_val = 0 });
     }
 
     const emitFlagStore = struct {
@@ -8000,6 +8988,8 @@ fn materializePlannedDrops(
         flag_path: usize,
         /// Call-site origin token attached to the synthesized flag store.
         token: TokenIndex,
+        /// Optional `Result` `block_param` SSA value whose `ssa_discriminant == 0` computes `_drop_flag`.
+        fallible_ret_val: MirValueId = .none,
         /// `true` for `set`-mode initialization; `false` for explicit `.free()` / `.close()` / `.deinit()`.
         is_value_true: bool,
     };
@@ -8012,6 +9002,7 @@ fn materializePlannedDrops(
             if (out_edges_slice.len == 0) continue;
             const normal_target_bb = out_edges_slice[0].target_bb.asInt();
             const call_site = body.calls.items[term.cond_or_val];
+            const is_fallible_result = isFallibleResultCallSite(pool, call_site);
             for (0..call_site.args_len) |arg_i| {
                 const mode = body.call_arg_modes.items[call_site.modes_start + arg_i];
                 const word = body.extra_args.items[call_site.args_start + arg_i];
@@ -8019,12 +9010,39 @@ fn materializePlannedDrops(
                     const lk = trie.place_map[word];
                     for (flagged_paths.items) |fm| {
                         if (trie.subtree[lk.id.asInt()].isSet(fm)) {
-                            try call_set_entries.append(arena_alloc, .{
-                                .target_bb = normal_target_bb,
-                                .flag_path = fm,
-                                .token = call_site.origin_token,
-                                .is_value_true = true,
-                            });
+                            if (is_fallible_result) {
+                                const normal_params = body.getBlockParams(MirBlockId.fromInt(normal_target_bb));
+                                if (normal_params.len > 0) {
+                                    try call_set_entries.append(arena_alloc, .{
+                                        .target_bb = normal_target_bb,
+                                        .flag_path = fm,
+                                        .token = call_site.origin_token,
+                                        .fallible_ret_val = normal_params[0],
+                                        .is_value_true = true,
+                                    });
+                                } else {
+                                    for (0..body.extra_edges.items.len) |eid_usize| {
+                                        const eid = mir.EdgeId.fromInt(@intCast(eid_usize));
+                                        if (detectFallibleCallResultEdge(body, pool, eid)) |sel| {
+                                            if (sel.call_idx == term.cond_or_val and sel.is_ok_branch) {
+                                                try call_set_entries.append(arena_alloc, .{
+                                                    .target_bb = body.extra_edges.items[eid_usize].target_bb.asInt(),
+                                                    .flag_path = fm,
+                                                    .token = call_site.origin_token,
+                                                    .is_value_true = true,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                try call_set_entries.append(arena_alloc, .{
+                                    .target_bb = normal_target_bb,
+                                    .flag_path = fm,
+                                    .token = call_site.origin_token,
+                                    .is_value_true = true,
+                                });
+                            }
                         }
                     }
                 }
@@ -8100,15 +9118,48 @@ fn materializePlannedDrops(
             }
             for (call_set_entries.items) |set_entry| {
                 if (set_entry.target_bb == bb_idx) {
-                    const flag_c = if (set_entry.is_value_true) true_const_opt.? else false_const_opt.?;
-                    try emitFlagStore(
-                        body,
-                        &rebuilt_insts,
-                        arena_alloc,
-                        flag_places[set_entry.flag_path],
-                        flag_c,
-                        set_entry.token,
-                    );
+                    if (!set_entry.fallible_ret_val.isNone()) {
+                        const discr_val = try body.appendInst(.{
+                            .op = .unary_op,
+                            .flags = .{ .is_synthetic = true },
+                            .aux_u16 = @backingInt(UnaryOpKind.ssa_discriminant),
+                            .type_id = .u32_ty,
+                            .operands = .{ .lhs = set_entry.fallible_ret_val.asInt(), .rhs = 0 },
+                        }, set_entry.token);
+                        try rebuilt_insts.append(arena_alloc, discr_val);
+                        const zero_val = try body.appendInst(.{
+                            .op = .const_scalar,
+                            .flags = .{ .is_synthetic = true },
+                            .type_id = .u32_ty,
+                            .operands = .{ .lhs = zero_u32_const_opt.?, .rhs = 0 },
+                        }, set_entry.token);
+                        try rebuilt_insts.append(arena_alloc, zero_val);
+                        const is_ok_val = try body.appendInst(.{
+                            .op = .bin_op,
+                            .flags = .{ .is_synthetic = true },
+                            .aux_u16 = @backingInt(BinOpKind.eq),
+                            .type_id = .bool_ty,
+                            .operands = .{ .lhs = discr_val.asInt(), .rhs = zero_val.asInt() },
+                        }, set_entry.token);
+                        try rebuilt_insts.append(arena_alloc, is_ok_val);
+                        const st_val = try body.appendInst(.{
+                            .op = .place_store,
+                            .flags = .{ .has_side_effects = true, .is_synthetic = true },
+                            .type_id = .unit_ty,
+                            .operands = .{ .lhs = flag_places[set_entry.flag_path].asInt(), .rhs = is_ok_val.asInt() },
+                        }, set_entry.token);
+                        try rebuilt_insts.append(arena_alloc, st_val);
+                    } else {
+                        const flag_c = if (set_entry.is_value_true) true_const_opt.? else false_const_opt.?;
+                        try emitFlagStore(
+                            body,
+                            &rebuilt_insts,
+                            arena_alloc,
+                            flag_places[set_entry.flag_path],
+                            flag_c,
+                            set_entry.token,
+                        );
+                    }
                 }
             }
         }
@@ -8290,6 +9341,12 @@ fn classifyScalarIntDomain(
         if (node.tag == .distinct_ty or node.tag == .bit_field_ty) {
             cur_ty = TypeId.fromInt(node.lhs);
             continue;
+        }
+        if (node.tag == .enum_ty) {
+            if (pool.getEnumBackingIntType(cur_ty)) |backing_int_ty| {
+                cur_ty = backing_int_ty;
+                continue;
+            }
         }
         break;
     }
@@ -10006,7 +11063,7 @@ fn runPass4IntervalsAndPentagonBce(
                                 "`$` subtraction underflows proven container length here",
                                 null,
                                 null,
-                                "ensure `offset <= container.len` when indexing with `$ - offset`",
+                                "ensure `offset <= container.len()` when indexing with `$ - offset`",
                             );
                             outcome.emitted_error_count += 1;
                             has_reported_dollar_oob[v_idx] = true;
@@ -10123,7 +11180,7 @@ fn runPass4IntervalsAndPentagonBce(
                                 "index exceeds proven container length here",
                                 null,
                                 null,
-                                "ensure `0 <= index < container.len` before indexing",
+                                "ensure `0 <= index < container.len()` before indexing",
                             );
                             outcome.emitted_error_count += 1;
                             continue;
@@ -10201,7 +11258,7 @@ fn runPass4IntervalsAndPentagonBce(
                                             "out-of-bounds slice range here",
                                             null,
                                             null,
-                                            "ensure `0 <= start <= end <= slice.len` before slicing",
+                                            "ensure `0 <= start <= end <= slice.len()` before slicing",
                                         );
                                         outcome.emitted_error_count += 1;
                                         continue;
@@ -10260,7 +11317,7 @@ fn runPass4IntervalsAndPentagonBce(
                                 "out-of-bounds slice range here",
                                 null,
                                 null,
-                                "ensure `0 <= start <= end <= slice.len` before slicing",
+                                "ensure `0 <= start <= end <= slice.len()` before slicing",
                             );
                             outcome.emitted_error_count += 1;
                             continue;
@@ -10814,11 +11871,11 @@ fn runPass4IntervalsAndPentagonBce(
                                     .e0307_static_buffer_overflow,
                                     .err,
                                     resolveTokenSpan(body.file_id, c_tok, config, decl_fallback_span),
-                                    "index access is statically proven out of bounds (`index >= container.len`)",
-                                    "index is guaranteed `>= container.len` here",
+                                    "index access is statically proven out of bounds (`index >= container.len()`)",
+                                    "index is guaranteed `>= container.len()` here",
                                     null,
                                     null,
-                                    "use `$ - 1` for the last element or ensure `index < container.len`",
+                                    "use `$ - 1` for the last element or ensure `index < container.len()`",
                                 );
                                 outcome.emitted_error_count += 1;
                                 continue;
@@ -10865,7 +11922,7 @@ fn runPass4IntervalsAndPentagonBce(
                                     "out-of-bounds slice range here",
                                     null,
                                     null,
-                                    "ensure `0 <= start <= end <= slice.len` before slicing",
+                                    "ensure `0 <= start <= end <= slice.len()` before slicing",
                                 );
                                 outcome.emitted_error_count += 1;
                                 continue;
@@ -10952,7 +12009,7 @@ fn runPass4IntervalsAndPentagonBce(
                             "runtime bounds check retained here",
                             null,
                             null,
-                            "guard the index with `if idx < slice.len` or use fallible `.get(idx)`",
+                            "guard the index with `if idx < slice.len()` or use fallible `.get(idx)`",
                         );
                     }
                 }
@@ -12009,6 +13066,7 @@ fn runPass3SummaryContractsAndSandbox(
                         .sys_write => direct_eff.fs = true,
                         .sys_exit => direct_eff.process = true,
                         .panic, .trap => direct_eff.may_panic = true,
+                        .fmt_value => direct_eff.alloc = true,
                         .ctx_get => {
                             if (extractConstCtxSlotOrd(body, inst)) |slot_ord| {
                                 if (slot_ord == ContextFieldLayout.CANONICAL_FIELDS[0].slot_ordinal) {
@@ -12373,69 +13431,71 @@ fn runPass3SummaryContractsAndSandbox(
     }
 
     // [3] Sort per-caller `WitnessCallEdge` slices deterministically & pack CSR `FnSummaryStore`:
-    const out_summaries = try allocator.dupe(FnRegionSummary, summaries);
-    errdefer if (out_summaries.len > 0) allocator.free(out_summaries);
+    var store: FnSummaryStore = blk_store: {
+        const out_summaries = try allocator.dupe(FnRegionSummary, summaries);
+        errdefer if (out_summaries.len > 0) allocator.free(out_summaries);
 
-    const out_defs = try allocator.alloc(DefId, fn_count);
-    errdefer if (out_defs.len > 0) allocator.free(out_defs);
-    const out_syms = try allocator.alloc(SymbolIndex, fn_count);
-    errdefer if (out_syms.len > 0) allocator.free(out_syms);
-    const out_files = try allocator.alloc(FileId, fn_count);
-    errdefer if (out_files.len > 0) allocator.free(out_files);
-    const out_names = try allocator.alloc(SymbolId, fn_count);
-    errdefer if (out_names.len > 0) allocator.free(out_names);
+        const out_defs = try allocator.alloc(DefId, fn_count);
+        errdefer if (out_defs.len > 0) allocator.free(out_defs);
+        const out_syms = try allocator.alloc(SymbolIndex, fn_count);
+        errdefer if (out_syms.len > 0) allocator.free(out_syms);
+        const out_files = try allocator.alloc(FileId, fn_count);
+        errdefer if (out_files.len > 0) allocator.free(out_files);
+        const out_names = try allocator.alloc(SymbolId, fn_count);
+        errdefer if (out_names.len > 0) allocator.free(out_names);
 
-    var total_edges: usize = 0;
-    for (bodies, 0..) |*body, s_i| {
-        out_defs[s_i] = body.def_id;
-        out_syms[s_i] = body.symbol_index;
-        out_files[s_i] = body.file_id;
-        out_names[s_i] = body.name;
-        std.mem.sort(WitnessCallEdge, per_body_edges[s_i].items, {}, struct {
-            /// Orders witness edges deterministically by `(site_token ASC, callee_def ASC)`.
-            fn lessThan(_: void, lhs: WitnessCallEdge, rhs: WitnessCallEdge) bool {
-                if (lhs.site_token.asInt() != rhs.site_token.asInt()) {
-                    return lhs.site_token.asInt() < rhs.site_token.asInt();
+        var total_edges: usize = 0;
+        for (bodies, 0..) |*body, s_i| {
+            out_defs[s_i] = body.def_id;
+            out_syms[s_i] = body.symbol_index;
+            out_files[s_i] = body.file_id;
+            out_names[s_i] = body.name;
+            std.mem.sort(WitnessCallEdge, per_body_edges[s_i].items, {}, struct {
+                /// Orders witness edges deterministically by `(site_token ASC, callee_def ASC)`.
+                fn lessThan(_: void, lhs: WitnessCallEdge, rhs: WitnessCallEdge) bool {
+                    if (lhs.site_token.asInt() != rhs.site_token.asInt()) {
+                        return lhs.site_token.asInt() < rhs.site_token.asInt();
+                    }
+                    return lhs.callee_def < rhs.callee_def;
                 }
-                return lhs.callee_def < rhs.callee_def;
-            }
-        }.lessThan);
-        total_edges += per_body_edges[s_i].items.len;
-    }
-
-    const edge_offsets = try allocator.alloc(u32, fn_count + 1);
-    errdefer allocator.free(edge_offsets);
-    const flat_edges = try allocator.alloc(WitnessCallEdge, total_edges);
-    errdefer if (flat_edges.len > 0) allocator.free(flat_edges);
-
-    var cursor: u32 = 0;
-    for (0..fn_count) |s_i| {
-        edge_offsets[s_i] = cursor;
-        const row = per_body_edges[s_i].items;
-        if (row.len > 0) {
-            @memcpy(flat_edges[cursor .. cursor + row.len], row);
-            cursor += @intCast(row.len);
+            }.lessThan);
+            total_edges += per_body_edges[s_i].items.len;
         }
-    }
-    edge_offsets[fn_count] = cursor;
 
-    var cloned_key_map = std.AutoHashMapUnmanaged(u32, u32){};
-    errdefer cloned_key_map.deinit(allocator);
-    var map_it = key_to_slot.iterator();
-    while (map_it.next()) |kv| {
-        try cloned_key_map.put(allocator, kv.key_ptr.*, kv.value_ptr.*);
-    }
+        const edge_offsets = try allocator.alloc(u32, fn_count + 1);
+        errdefer allocator.free(edge_offsets);
+        const flat_edges = try allocator.alloc(WitnessCallEdge, total_edges);
+        errdefer if (flat_edges.len > 0) allocator.free(flat_edges);
 
-    var store = FnSummaryStore{
-        .allocator = allocator,
-        .summaries = out_summaries,
-        .def_ids = out_defs,
-        .symbol_indices = out_syms,
-        .file_ids = out_files,
-        .names = out_names,
-        .edge_offsets = edge_offsets,
-        .edges = flat_edges,
-        .node_key_to_slot = cloned_key_map,
+        var cursor: u32 = 0;
+        for (0..fn_count) |s_i| {
+            edge_offsets[s_i] = cursor;
+            const row = per_body_edges[s_i].items;
+            if (row.len > 0) {
+                @memcpy(flat_edges[cursor .. cursor + row.len], row);
+                cursor += @intCast(row.len);
+            }
+        }
+        edge_offsets[fn_count] = cursor;
+
+        var cloned_key_map = std.AutoHashMapUnmanaged(u32, u32){};
+        errdefer cloned_key_map.deinit(allocator);
+        var map_it = key_to_slot.iterator();
+        while (map_it.next()) |kv| {
+            try cloned_key_map.put(allocator, kv.key_ptr.*, kv.value_ptr.*);
+        }
+
+        break :blk_store FnSummaryStore{
+            .allocator = allocator,
+            .summaries = out_summaries,
+            .def_ids = out_defs,
+            .symbol_indices = out_syms,
+            .file_ids = out_files,
+            .names = out_names,
+            .edge_offsets = edge_offsets,
+            .edges = flat_edges,
+            .node_key_to_slot = cloned_key_map,
+        };
     };
     errdefer store.deinit();
 
@@ -14609,12 +15669,12 @@ test "test_phase6_intv_sign_biased_encoding_and_dense_bitset_modes" {
 test "test_phase6_sast_use_after_move_linear_leak_nll_and_pentagon_bce" {
     const allocator = std.testing.allocator;
 
-    // [1] Valid Pentagon BCE (`if idx < data.len { data[idx] }`) + sequential NLL borrow release:
+    // [1] Valid Pentagon BCE (`if idx < data.len() { data[idx] }`) + sequential NLL borrow release:
     {
         const ok_src =
             \\@no_panic
             \\pub fn safe_read(data: &[i64], idx: usize) -> i64 {
-            \\    if idx < data.len {
+            \\    if idx < data.len() {
             \\        return data[idx];
             \\    }
             \\    return 0;
@@ -14689,19 +15749,19 @@ test "test_phase6_sast_use_after_move_linear_leak_nll_and_pentagon_bce" {
 test "test_phase6_sast_defer_linear_set_param_double_free_and_drop_if_live" {
     const allocator = std.testing.allocator;
 
-    // [1] `@linear` consumed inside `defer` satisfies Completeness Law (`0` errors), while empty `sink` leaks (`E0304`):
+    // [1] `@linear` consumed inside `defer` satisfies Completeness Law (`0` errors), while empty `own` leaks (`E0304`):
     {
         const defer_ok_src =
             \\@linear
             \\pub struct TxGuard {
             \\    pub code: i64,
             \\}
-            \\pub fn close_guard(own guard: sink TxGuard) {
+            \\pub fn close_guard(guard: own TxGuard) {
             \\    let TxGuard { code: _ } = guard;
             \\}
             \\pub fn run_tx(flag: bool) -> i64 {
             \\    let guard = TxGuard { code: 11 };
-            \\    defer { close_guard(guard); }
+            \\    defer { close_guard(own guard); }
             \\    if flag {
             \\        return 1;
             \\    }
@@ -14723,7 +15783,7 @@ test "test_phase6_sast_defer_linear_set_param_double_free_and_drop_if_live" {
             \\pub struct TxGuard {
             \\    pub code: i64,
             \\}
-            \\pub fn bad_sink_leak(own guard: sink TxGuard) {}
+            \\pub fn bad_sink_leak(guard: own TxGuard) {}
         ;
         var sink_leak_bundle = try lowerAndVerifySourceMirSast(
             allocator,
@@ -14750,16 +15810,16 @@ test "test_phase6_sast_defer_linear_set_param_double_free_and_drop_if_live" {
             \\pub struct Vec[T] {
             \\    pub len: usize,
             \\}
-            \\pub fn close_fd(own desc: sink FileDesc) {
+            \\pub fn close_fd(desc: own FileDesc) {
             \\    let FileDesc { fd: _ } = desc;
             \\}
-            \\pub fn take_vec(own items: sink Vec[i64]) {}
+            \\pub fn take_vec(items: own Vec[i64]) {}
             \\pub fn bad_double_and_move() {
             \\    let desc = FileDesc { fd: 3 };
-            \\    close_fd(desc);
-            \\    close_fd(desc);
+            \\    close_fd(own desc);
+            \\    close_fd(own desc);
             \\    let items = Vec { len: 4 };
-            \\    take_vec(items);
+            \\    take_vec(own items);
             \\    let _ = items.len;
             \\}
         ;
@@ -14781,12 +15841,12 @@ test "test_phase6_sast_defer_linear_set_param_double_free_and_drop_if_live" {
         try std.testing.expect(has_seen_e0302);
     }
 
-    // [3] Uninitialized `set` out-parameter on one branch emits `E0303`:
+    // [3] Uninitialized `&out` parameter on one branch emits `E0422` (`ADR-22B`):
     {
         const set_src =
-            \\pub fn maybe_init_out(mut out_slot: set i64, cond: bool) {
+            \\pub fn maybe_init_out(out_slot: &out i64, cond: bool) {
             \\    if cond {
-            \\        out_slot = 99;
+            \\        out_slot.* = 99;
             \\    }
             \\}
         ;
@@ -14798,11 +15858,11 @@ test "test_phase6_sast_defer_linear_set_param_double_free_and_drop_if_live" {
             .{},
         );
         defer set_bundle.deinit();
-        var has_seen_e0303 = false;
+        var has_seen_e0422 = false;
         for (set_bundle.diagnostics.diagnostics.items) |d_item| {
-            if (d_item.code == .e0303_uninitialized_memory_read) has_seen_e0303 = true;
+            if (d_item.code == .e0422_out_param_contract_violation) has_seen_e0422 = true;
         }
-        try std.testing.expect(has_seen_e0303);
+        try std.testing.expect(has_seen_e0422);
     }
 
     // [4] Branch-divergent `AutoDrop` move synthesizes `drop_if_live` without splitting blocks (`V1`–`V6` clean):
@@ -14811,11 +15871,11 @@ test "test_phase6_sast_defer_linear_set_param_double_free_and_drop_if_live" {
             \\pub struct Vec[T] {
             \\    pub len: usize,
             \\}
-            \\pub fn consume_vec(own buf: sink Vec[i64]) {}
+            \\pub fn consume_vec(buf: own Vec[i64]) {}
             \\pub fn branch_drop(cond: bool) -> i64 {
             \\    let buf = Vec { len: 8 };
             \\    if cond {
-            \\        consume_vec(buf);
+            \\        consume_vec(own buf);
             \\    }
             \\    return 5;
             \\}
@@ -14853,14 +15913,14 @@ test "test_phase6_sast_transitive_nll_stack_escape_narrow_and_contracts" {
             \\pub fn head_slice(items: &[i64]) -> &[i64] {
             \\    return items;
             \\}
-            \\pub fn mutate_arr(mut arr: inout [i64; 4]) {
-            \\    arr[0] = 99;
+            \\pub fn mutate_arr(arr: &mut [i64; 4]) {
+            \\    arr.*[0] = 99;
             \\}
             \\pub fn sequential_ok() -> usize {
             \\    var arr: [i64; 4] = [1, 2, 3, 4];
             \\    let view = head_slice(&arr);
-            \\    let count = view.len;
-            \\    mutate_arr(arr);
+            \\    let count = view.len();
+            \\    mutate_arr(&mut arr);
             \\    return count;
             \\}
         ;
@@ -14878,14 +15938,14 @@ test "test_phase6_sast_transitive_nll_stack_escape_narrow_and_contracts" {
             \\pub fn head_slice(items: &[i64]) -> &[i64] {
             \\    return items;
             \\}
-            \\pub fn mutate_arr(mut arr: inout [i64; 4]) {
-            \\    arr[0] = 99;
+            \\pub fn mutate_arr(arr: &mut [i64; 4]) {
+            \\    arr.*[0] = 99;
             \\}
             \\pub fn interleaved_conflict() -> usize {
             \\    var arr: [i64; 4] = [1, 2, 3, 4];
             \\    let view = head_slice(&arr);
-            \\    mutate_arr(arr);
-            \\    return view.len;
+            \\    mutate_arr(&mut arr);
+            \\    return view.len();
             \\}
         ;
         var conf_bundle = try lowerAndVerifySourceMirSast(
@@ -14926,13 +15986,13 @@ test "test_phase6_sast_transitive_nll_stack_escape_narrow_and_contracts" {
         try std.testing.expect(has_seen_e0306);
     }
 
-    // [3] Pentagon `rem_u` (`raw % data.len`) + `.narrow[u8]()` elision vs `E0406` compile-time narrowing error:
+    // [3] Pentagon `rem_u` (`raw % data.len()`) + `.narrow[u8]()` elision vs `E0406` compile-time narrowing error:
     {
         const pent_ok_src =
             \\@no_panic
             \\pub fn mod_and_narrow(data: &[u8], raw_idx: usize, bounded_val: i32) -> u8 {
-            \\    if data.len > 0 and bounded_val >= 0 and bounded_val <= 200 {
-            \\        let elem = data[raw_idx % data.len];
+            \\    if data.len() > 0 and bounded_val >= 0 and bounded_val <= 200 {
+            \\        let elem = data[raw_idx % data.len()];
             \\        let narrowed: u8 = bounded_val.narrow[u8]();
             \\        return elem & narrowed;
             \\    }
@@ -15052,5 +16112,304 @@ test "test_phase6_sast_transitive_nll_stack_escape_narrow_and_contracts" {
             if (d_item.code == .w0330_ambient_dead_capability_in_dep) has_seen_w0330 = true;
         }
         try std.testing.expect(has_seen_w0330);
+    }
+}
+
+test "test_phase76_dr22_raw_ptr_fmt_args_out_param_and_parallel_assign" {
+    const allocator = std.testing.allocator;
+
+    // [1] `ADR-22F`: `&raw mut uninit_buf` is safe (`0` errors, no `E0303`/`E0305`), while `ptr.*` is `unsafe`:
+    {
+        const raw_ok_src =
+            \\@no_alloc
+            \\pub fn take_raw_uninit() -> *mut [u8; 16] {
+            \\    var buf: [u8; 16];
+            \\    let p1 = &raw mut buf;
+            \\    let _p2 = &raw buf;
+            \\    unsafe {
+            \\        p1.*[0] = 42;
+            \\    }
+            \\    return p1;
+            \\}
+        ;
+        var raw_bundle = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(30),
+            raw_ok_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer raw_bundle.deinit();
+        try std.testing.expect(!raw_bundle.diagnostics.hasErrors());
+    }
+
+    // [2] `ADR-22B`: Live `AutoDrop` passed to `&out` emits `E0422`, while `T!E` `&out` initializes on `.Ok` only:
+    {
+        const out_leak_src =
+            \\pub struct Vec[T] {
+            \\    pub len: usize,
+            \\}
+            \\pub fn fill_vec(dest: &out Vec[i64]) {
+            \\    dest.* = Vec { len: 1 };
+            \\}
+            \\pub fn bad_out_overwrite() {
+            \\    var v: own Vec[i64] = Vec { len: 5 };
+            \\    fill_vec(&out v);
+            \\}
+        ;
+        var out_leak_bundle = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(31),
+            out_leak_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer out_leak_bundle.deinit();
+        var has_seen_leak_e0422 = false;
+        for (out_leak_bundle.diagnostics.diagnostics.items) |d_item| {
+            if (d_item.code == .e0422_out_param_contract_violation) has_seen_leak_e0422 = true;
+        }
+        try std.testing.expect(has_seen_leak_e0422);
+
+        const fallible_out_ok_src =
+            \\pub struct Vec[T] {
+            \\    pub len: usize,
+            \\}
+            \\pub fn try_make_vec(dest: &out Vec[i64], ok: bool) -> usize!i32 {
+            \\    if not ok {
+            \\        return .Err(-1);
+            \\    }
+            \\    dest.* = Vec { len: 9 };
+            \\    return .Ok(9);
+            \\}
+            \\pub fn caller_try_out(ok: bool) -> usize!i32 {
+            \\    var slot: own Vec[i64];
+            \\    let n = try_make_vec(&out slot, ok)?;
+            \\    return .Ok(n + slot.len);
+            \\}
+        ;
+        var fallible_ok_bundle = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(32),
+            fallible_out_ok_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer fallible_ok_bundle.deinit();
+        try std.testing.expect(!fallible_ok_bundle.diagnostics.hasErrors());
+    }
+
+    // [3] `SE-15`: `(a.*, b.*) = (b.*, a.*)` swaps `AutoDrop` places cleanly (`0` drops), while `(x, x) = (1, 2)` -> `E0305`:
+    {
+        const swap_ok_src =
+            \\pub struct Vec[T] {
+            \\    pub len: usize,
+            \\}
+            \\pub fn swap_autodrop(a: &mut Vec[i64], b: &mut Vec[i64]) {
+            \\    (a.*, b.*) = (b.*, a.*);
+            \\}
+            \\pub fn swap_const_indices(arr: &mut [i64; 4]) {
+            \\    (arr.*[0], arr.*[1]) = (arr.*[1], arr.*[0]);
+            \\}
+        ;
+        var swap_bundle = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(33),
+            swap_ok_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer swap_bundle.deinit();
+        try std.testing.expect(!swap_bundle.diagnostics.hasErrors());
+        try std.testing.expectEqual(@as(u32, 0), swap_bundle.sast_result.emitted_drops);
+
+        const overlap_bad_src =
+            \\pub fn overlap_assign() -> i64 {
+            \\    var x: i64 = 0;
+            \\    (x, x) = (1, 2);
+            \\    return x;
+            \\}
+        ;
+        var overlap_bundle = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(34),
+            overlap_bad_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer overlap_bundle.deinit();
+        var has_seen_overlap_e0305 = false;
+        for (overlap_bundle.diagnostics.diagnostics.items) |d_item| {
+            if (d_item.code == .e0305_exclusivity_violation) has_seen_overlap_e0305 = true;
+        }
+        try std.testing.expect(has_seen_overlap_e0305);
+    }
+}
+
+test "test_phase76_stage4_sast_out_optional_none_unbranched_fallible_drop_and_mut_ref_parallel_e0305" {
+    const allocator = std.testing.allocator;
+    const mir_vm = @import("mir_vm.zig");
+
+    // [1] Verify `T?` returning `.None` does not exempt `&out` initialization (`E0422`):
+    {
+        const opt_out_bad_src =
+            \\pub fn maybe_fill_out(dest: &out i64, should_fill: bool) -> i64? {
+            \\    if not should_fill {
+            \\        return .None;
+            \\    }
+            \\    dest.* = 42;
+            \\    return .Some(42);
+            \\}
+        ;
+        var opt_out_bundle = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(35),
+            opt_out_bad_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer opt_out_bundle.deinit();
+        var has_seen_opt_e0422 = false;
+        for (opt_out_bundle.diagnostics.diagnostics.items) |d_item| {
+            if (d_item.code == .e0422_out_param_contract_violation) has_seen_opt_e0422 = true;
+        }
+        try std.testing.expect(has_seen_opt_e0422);
+    }
+
+    // [2] Verify unbranched `T!E` `&out` call dynamically sets `_drop_flag` (`drop` iff `.Ok`):
+    {
+        const unbranched_fallible_src =
+            \\pub struct TrackedHandle {
+            \\    pub tag: i64,
+            \\}
+            \\impl Drop for TrackedHandle {
+            \\    pub fn drop(&mut self) {
+            \\        @drop_trace(self.tag);
+            \\    }
+            \\}
+            \\pub fn fallible_open(dest: &out TrackedHandle, is_ok: bool) -> i32!i32 {
+            \\    if not is_ok {
+            \\        return .Err(-1);
+            \\    }
+            \\    dest.* = TrackedHandle { tag: 77 };
+            \\    return .Ok(1);
+            \\}
+            \\pub fn run_unbranched_open(is_ok: bool) -> i32!i32 {
+            \\    var handle: own TrackedHandle;
+            \\    let open_res: i32!i32 = fallible_open(&out handle, is_ok);
+            \\    return open_res;
+            \\}
+        ;
+        var fallible_bundle = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(36),
+            unbranched_fallible_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer fallible_bundle.deinit();
+        try std.testing.expect(!fallible_bundle.diagnostics.hasErrors());
+        try std.testing.expect(fallible_bundle.sast_result.emitted_drops >= 1);
+
+        var rodata_pool = mir_vm.RodataPool.init(allocator);
+        defer rodata_pool.deinit();
+        var vm = try mir_vm.MirVm.init(
+            allocator,
+            &fallible_bundle.interner,
+            &fallible_bundle.pool,
+            &fallible_bundle.sym_table,
+            &rodata_pool,
+            null,
+            null,
+            .{},
+        );
+        defer vm.deinit();
+        for (fallible_bundle.mir_module.bodies.items) |*body_ptr| {
+            _ = try vm.registerBody(body_ptr, .none);
+        }
+        const run_open_body = fallible_bundle.mir_module.findBodyByName(
+            &fallible_bundle.interner,
+            "run_unbranched_open",
+        ).?;
+
+        _ = try vm.evalBody(run_open_body, &.{.{ .scalar_u64 = 0 }});
+        try std.testing.expectEqual(@as(usize, 0), vm.drop_trace.items.len);
+
+        _ = try vm.evalBody(run_open_body, &.{.{ .scalar_u64 = 1 }});
+        try std.testing.expectEqual(@as(usize, 1), vm.drop_trace.items.len);
+        try std.testing.expectEqual(@as(i64, 77), vm.drop_trace.items[0]);
+    }
+
+    // [3] Verify `(mut_ref.*, target) = (v1, v2)` emits `E0305` on overlap and allows disjoint field loans:
+    {
+        const mut_ref_overlap_src =
+            \\pub fn alias_mut_ref_local() -> i64 {
+            \\    var target: i64 = 1;
+            \\    let ref_slot = &mut target;
+            \\    (ref_slot.*, target) = (10_i64, 20_i64);
+            \\    return target;
+            \\}
+        ;
+        var alias_local_bundle = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(37),
+            mut_ref_overlap_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer alias_local_bundle.deinit();
+        var has_local_e0305 = false;
+        for (alias_local_bundle.diagnostics.diagnostics.items) |d_item| {
+            if (d_item.code == .e0305_exclusivity_violation) has_local_e0305 = true;
+        }
+        try std.testing.expect(has_local_e0305);
+
+        const mut_ref_field_overlap_src =
+            \\pub struct Pair {
+            \\    pub left: i64,
+            \\    pub right: i64,
+            \\}
+            \\pub fn alias_mut_ref_field() -> i64 {
+            \\    var pair = Pair { left: 1, right: 2 };
+            \\    let ref_pair = &mut pair;
+            \\    (ref_pair.*.left, pair.left) = (10_i64, 20_i64);
+            \\    return pair.left;
+            \\}
+        ;
+        var alias_field_bundle = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(38),
+            mut_ref_field_overlap_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer alias_field_bundle.deinit();
+        var has_field_e0305 = false;
+        for (alias_field_bundle.diagnostics.diagnostics.items) |d_item| {
+            if (d_item.code == .e0305_exclusivity_violation) has_field_e0305 = true;
+        }
+        try std.testing.expect(has_field_e0305);
+
+        const mut_ref_disjoint_ok_src =
+            \\pub struct Pair {
+            \\    pub left: i64,
+            \\    pub right: i64,
+            \\}
+            \\pub fn disjoint_mut_ref_fields() -> i64 {
+            \\    var pair = Pair { left: 1, right: 2 };
+            \\    let ref_left = &mut pair.left;
+            \\    (ref_left.*, pair.right) = (10_i64, 20_i64);
+            \\    return pair.left + pair.right;
+            \\}
+        ;
+        var disjoint_ok_bundle = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(39),
+            mut_ref_disjoint_ok_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer disjoint_ok_bundle.deinit();
+        try std.testing.expect(!disjoint_ok_bundle.diagnostics.hasErrors());
     }
 }

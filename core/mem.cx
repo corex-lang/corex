@@ -1,11 +1,11 @@
-//! Memory Layout Queries, Alignment Arithmetic, and Cache-Line Padding (`core.mem`)
+//! Memory Layout Queries, Safe Slot Operations, and Cache-Line Padding (`core.mem`)
 //!
-//! Wraps CoreX's compile-time type layout intrinsics (`@size_of`, `@align_of`, `@default_init`)
-//! and provides `@cache_aligned` `CachePadded[T]` containers to eliminate false sharing across
-//! hardware cache lines (`64B` on `x86_64` / `aarch64-linux`, `128B` on `aarch64-macos`).
+//! Wraps CoreX's compile-time type layout intrinsics (`@size_of`, `@align_of`, `@default_init`),
+//! zero-unsafe MVS slot operations (`swap`, `init_slot`, `copy_nonoverlapping`), and `@cache_aligned`
+//! `CachePadded[T]` containers (`64B` on `x86_64` / `aarch64-linux`, `128B` on `aarch64-macos`).
 //!
-//! Alignment arithmetic helpers use wrapping bitmask operations so power-of-two rounding is
-//! branch-minimal and `@no_panic`-clean.
+//! Alignment helpers use bitwise complement `~mask` and wrapping arithmetic so power-of-two rounding
+//! is branch-minimal and `@no_panic`-verified (`DR-22` §4.2).
 // ---------------------------------------- TYPES ----------------------------------------
 /// Cache-line padded wrapper isolating concurrent state from destructive false sharing (`DR-08`).
 @cache_aligned
@@ -16,56 +16,94 @@ pub struct CachePadded[T] {
 
 // ------------------------------------- PUBLIC API --------------------------------------
 /// Returns the byte stride (`sizeof(T)`) of `T` on the active compilation target.
-@inline
-@no_alloc
-@no_panic
+@inline @no_alloc @no_panic
 pub fn size_of_type[T]() -> usize {
     return @size_of[T]();
 }
 
 /// Returns the byte alignment (`alignof(T)`) of `T` on the active compilation target.
-@inline
-@no_alloc
-@no_panic
+@inline @no_alloc @no_panic
 pub fn align_of_type[T]() -> usize {
     return @align_of[T]();
 }
 
-/// Constructs the canonical zero/default-initialized value of `T` (`@default_init[T]()`).
-@inline
-@no_alloc
-pub fn zeroed_value[T]() -> T {
+/// Constructs the canonical zero/default-initialized value of scalar `T` (`@default_init[T]()`).
+@inline @no_alloc @no_panic
+pub fn zeroed_value[T: Scalar]() -> T {
     return @default_init[T]();
 }
 
-/// Wraps `initial_value` in a `@cache_aligned` `CachePadded[T]` slot.
-@inline
-@no_alloc
-@no_panic
-pub fn cache_padded_new[T](initial_value: T) -> CachePadded[T] {
-    return CachePadded[T] { value: initial_value };
+/// Wraps `initial_val` in a `@cache_aligned` `CachePadded[T]` slot.
+@inline @no_alloc @no_panic
+pub fn cache_padded_new[T](initial_val: own T, /) -> CachePadded[T] {
+    return CachePadded[T] { value: own initial_val };
 }
 
 /// Returns `true` if `candidate` is a non-zero power of two (`1`, `2`, `4`, `8`, …).
-@inline
-@no_alloc
-@no_panic
-pub fn is_power_of_two_usize(candidate: usize) -> bool {
+@inline @no_alloc @no_panic
+pub fn is_power_of_two_usize(candidate: usize, /) -> bool {
     if candidate == 0 {
         return false;
     }
     return (candidate & (candidate -% 1)) == 0;
 }
 
-/// Rounds `byte_offset` upward to the next multiple of power-of-two `alignment` (wrapping on max).
-@inline
-@no_alloc
-@no_panic
-pub fn align_up_usize(byte_offset: usize, alignment: usize) -> usize {
+/// Rounds `byte_offset` upward to the next multiple of power-of-two `alignment` (`DR-22` §4.2).
+@inline @no_alloc @no_panic
+pub fn align_up(byte_offset: usize, alignment: usize, /) -> usize {
     if alignment <= 1 {
         return byte_offset;
     }
     let mask: usize = alignment -% 1;
-    let bumped: usize = byte_offset +% mask;
-    return bumped -% (bumped & mask);
+    return (byte_offset +% mask) & ~mask;
+}
+
+/// Alias of `align_up` rounding `byte_offset` upward to power-of-two `alignment`.
+@inline @no_alloc @no_panic
+pub fn align_up_usize(byte_offset: usize, alignment: usize, /) -> usize {
+    return align_up(byte_offset, alignment);
+}
+
+/// Exchanges the values in `left_slot` and `right_slot` via safe MVS parallel assignment (`SE-15`).
+@inline @no_alloc @no_panic
+pub fn swap[T](left_slot: &mut T, right_slot: &mut T, /) {
+    (left_slot.*, right_slot.*) = (right_slot.*, left_slot.*);
+}
+
+/// Initializes an uninitialized `&out T` destination slot with `initial_val` (`ADR-22B`).
+@inline @no_alloc @no_panic
+pub fn init_slot[T: Copy](dest_slot: &out T, initial_val: T, /) {
+    dest_slot.* = initial_val;
+}
+
+/// Copies all elements from `src_slice` into `dest_slice`, returning `.Err(1)` when `dest_slice` is shorter.
+@inline @no_alloc
+pub fn copy_nonoverlapping[T: Copy](dest_slice: &mut [T], src_slice: &[T], /) -> usize!u32 {
+    let copy_len: usize = src_slice.len();
+    if dest_slice.len() < copy_len {
+        return .Err(1);
+    }
+    var i: usize = 0;
+    while i < copy_len {
+        dest_slice[i] = src_slice[i];
+        i = i +% 1;
+    }
+    return .Ok(copy_len);
+}
+
+/// Stores `next_val` through non-null raw 64-bit register pointer `reg_ptr` (`*mut u64`).
+@inline @no_alloc @no_panic
+pub unsafe fn write_volatile_u64(reg_ptr: *mut u64, next_val: u64, /) {
+    if reg_ptr != @default_init[*mut u64]() {
+        reg_ptr.* = next_val;
+    }
+}
+
+/// Loads the current 64-bit value from raw register pointer `reg_ptr` (`*u64`), or `0` if null.
+@inline @no_alloc @no_panic
+pub unsafe fn read_volatile_u64(reg_ptr: *u64, /) -> u64 {
+    if reg_ptr != @default_init[*u64]() {
+        return reg_ptr.*;
+    }
+    return 0;
 }

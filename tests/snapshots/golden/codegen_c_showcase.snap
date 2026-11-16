@@ -26,6 +26,43 @@
 #endif
 
 typedef void (*_cx_fn_slot_t)(void);
+typedef struct cx_str_s { uint8_t *ptr; uintptr_t len; } cx_str_t;
+typedef struct cx_source_loc_data_s {
+    cx_str_t file;
+    cx_str_t fn_name;
+    uint32_t line;
+    uint32_t col;
+} cx_source_loc_data_t;
+typedef const cx_source_loc_data_t *cx_source_loc_t;
+typedef struct cx_fmt_spec_s {
+    uint32_t flags_and_fill;
+    uint16_t width_or_none;
+    uint16_t precision_or_none;
+} cx_fmt_spec_t;
+typedef struct _cx_rt_buf_s {
+    uint8_t *data;
+    size_t len;
+    size_t cap;
+} _cx_rt_buf_t;
+typedef void (*cx_fmt_fn_t)(_cx_rt_buf_t *, const void *, uint32_t, uint32_t);
+typedef struct cx_fmt_arg_s {
+    const void *data;
+    cx_fmt_fn_t fmt_fn;
+    cx_fmt_spec_t spec;
+} cx_fmt_arg_t;
+typedef struct cx_fmt_args_s {
+    const cx_str_t *pieces_ptr;
+    uintptr_t pieces_len;
+    const cx_fmt_arg_t *args_ptr;
+    uintptr_t args_len;
+} cx_fmt_args_t;
+typedef struct cx_bencher_s {
+    void *state_ptr;
+    uintptr_t iters;
+} cx_bencher_t;
+typedef char _cx_sz_assert_fmt_spec[(sizeof(cx_fmt_spec_t) == 8u) ? 1 : -1];
+typedef char _cx_sz_assert_fmt_args[(sizeof(cx_fmt_args_t) == (4u * sizeof(uintptr_t))) ? 1 : -1];
+typedef char _cx_sz_assert_sloc_data[(sizeof(cx_source_loc_data_t) == (4u * sizeof(uintptr_t) + 8u)) ? 1 : -1];
 
 static void _cx_rt_init(void) {
 #if defined(_WIN32)
@@ -133,6 +170,20 @@ static inline uint8_t _cx_str_eq(
     if (lhs_len != rhs_len) return 0u;
     if (lhs_len == 0) return 1u;
     return memcmp(lhs_ptr, rhs_ptr, lhs_len) == 0 ? 1u : 0u;
+}
+
+static inline uint8_t _cx_source_loc_eq(cx_source_loc_t lhs_loc, cx_source_loc_t rhs_loc) {
+    if (lhs_loc == rhs_loc) return 1u;
+    if (lhs_loc == NULL || rhs_loc == NULL) return 0u;
+    if (lhs_loc->line != rhs_loc->line || lhs_loc->col != rhs_loc->col) return 0u;
+    if (!_cx_str_eq(lhs_loc->file.ptr, (size_t)lhs_loc->file.len, rhs_loc->file.ptr, (size_t)rhs_loc->file.len)) return 0u;
+    return _cx_str_eq(lhs_loc->fn_name.ptr, (size_t)lhs_loc->fn_name.len, rhs_loc->fn_name.ptr, (size_t)rhs_loc->fn_name.len);
+}
+
+static inline uint8_t _cx_fmt_spec_eq(cx_fmt_spec_t lhs_s, cx_fmt_spec_t rhs_s) {
+    return (lhs_s.flags_and_fill == rhs_s.flags_and_fill &&
+        lhs_s.width_or_none == rhs_s.width_or_none &&
+        lhs_s.precision_or_none == rhs_s.precision_or_none) ? 1u : 0u;
 }
 
 static const uint8_t __attribute__((aligned(16))) _cx_empty_rodata[1u] = { 0x00u };
@@ -548,8 +599,444 @@ static size_t _cx_fmt_i128(char *out_buf, cx_i128 val) {
     }
     return _cx_fmt_u128(out_buf, u_val);
 }
+static void _cx_rt_buf_reserve(_cx_rt_buf_t *out_b, size_t extra_n) {
+    if (extra_n == 0u) return;
+    if (extra_n > ((size_t)-1) - out_b->len) _cx_rt_trap(1u);
+    size_t needed_cap = out_b->len + extra_n;
+    if (needed_cap <= out_b->cap) return;
+    size_t next_cap = out_b->cap == 0u ? 64u : out_b->cap;
+    while (next_cap < needed_cap) {
+        if (next_cap > (((size_t)-1) >> 1)) { next_cap = needed_cap; break; }
+        next_cap <<= 1;
+    }
+    uint8_t *new_p = (uint8_t *)realloc(out_b->data, next_cap);
+    if (new_p == NULL) _cx_rt_trap(0u);
+    out_b->data = new_p;
+    out_b->cap = next_cap;
+}
+static inline void _cx_rt_buf_push_bytes(_cx_rt_buf_t *out_b, const uint8_t *src_p, size_t src_n) {
+    if (src_n == 0u || src_p == NULL) return;
+    _cx_rt_buf_reserve(out_b, src_n);
+    memcpy(out_b->data + out_b->len, src_p, src_n);
+    out_b->len += src_n;
+}
+static inline void _cx_rt_buf_push_cstr(_cx_rt_buf_t *out_b, const char *c_str) {
+    _cx_rt_buf_push_bytes(out_b, (const uint8_t *)c_str, strlen(c_str));
+}
+static inline void _cx_rt_buf_push_byte(_cx_rt_buf_t *out_b, uint8_t ch_b) {
+    _cx_rt_buf_reserve(out_b, 1u);
+    out_b->data[out_b->len] = ch_b;
+    out_b->len += 1u;
+}
+static size_t _cx_rt_encode_utf8(uint32_t cp_v, uint8_t out_u8[4]) {
+    if (cp_v > 0x10FFFFu || (cp_v >= 0xD800u && cp_v <= 0xDFFFu)) cp_v = 0xFFFDu;
+    if (cp_v < 0x80u) { out_u8[0] = (uint8_t)cp_v; return 1u; }
+    if (cp_v < 0x800u) {
+        out_u8[0] = (uint8_t)(0xC0u | (cp_v >> 6));
+        out_u8[1] = (uint8_t)(0x80u | (cp_v & 0x3Fu));
+        return 2u;
+    }
+    if (cp_v < 0x10000u) {
+        out_u8[0] = (uint8_t)(0xE0u | (cp_v >> 12));
+        out_u8[1] = (uint8_t)(0x80u | ((cp_v >> 6) & 0x3Fu));
+        out_u8[2] = (uint8_t)(0x80u | (cp_v & 0x3Fu));
+        return 3u;
+    }
+    out_u8[0] = (uint8_t)(0xF0u | (cp_v >> 18));
+    out_u8[1] = (uint8_t)(0x80u | ((cp_v >> 12) & 0x3Fu));
+    out_u8[2] = (uint8_t)(0x80u | ((cp_v >> 6) & 0x3Fu));
+    out_u8[3] = (uint8_t)(0x80u | (cp_v & 0x3Fu));
+    return 4u;
+}
+static void _cx_rt_buf_push_cp_rep(_cx_rt_buf_t *out_b, uint32_t cp_v, size_t rep_n) {
+    if (rep_n == 0u) return;
+    if (cp_v == 0u || cp_v > 0x10FFFFu) cp_v = 0x20u;
+    uint8_t u8_seq[4];
+    size_t seq_n = _cx_rt_encode_utf8(cp_v, u8_seq);
+    while (rep_n > 0u) {
+        _cx_rt_buf_push_bytes(out_b, u8_seq, seq_n);
+        rep_n -= 1u;
+    }
+}
+static inline size_t _cx_rt_utf8_seq_len(uint8_t lead_b) {
+    if ((lead_b & 0x80u) == 0u) return 1u;
+    if ((lead_b & 0xE0u) == 0xC0u) return 2u;
+    if ((lead_b & 0xF0u) == 0xE0u) return 3u;
+    if ((lead_b & 0xF8u) == 0xF0u) return 4u;
+    return 1u;
+}
+static size_t _cx_rt_count_utf8_cps(const uint8_t *txt_p, size_t txt_n) {
+    size_t idx_i = 0u, cnt_n = 0u;
+    while (idx_i < txt_n) {
+        size_t step_n = _cx_rt_utf8_seq_len(txt_p[idx_i]);
+        if (idx_i + step_n > txt_n) step_n = txt_n - idx_i;
+        idx_i += step_n;
+        cnt_n += 1u;
+    }
+    return cnt_n;
+}
+static size_t _cx_rt_trunc_utf8_cps(const uint8_t *txt_p, size_t txt_n, size_t max_cps) {
+    size_t idx_i = 0u, seen_n = 0u;
+    while (idx_i < txt_n && seen_n < max_cps) {
+        size_t step_n = _cx_rt_utf8_seq_len(txt_p[idx_i]);
+        if (idx_i + step_n > txt_n) break;
+        idx_i += step_n;
+        seen_n += 1u;
+    }
+    return idx_i;
+}
+static void _cx_rt_buf_pad_str(
+    _cx_rt_buf_t *out_b,
+    const uint8_t *body_p,
+    size_t body_n,
+    uint32_t spec_lo,
+    uint32_t spec_hi,
+    uint8_t def_right
+) {
+    uint32_t width_u16 = spec_hi & 0xFFFFu;
+    if (width_u16 == 0xFFFFu) {
+        _cx_rt_buf_push_bytes(out_b, body_p, body_n);
+        return;
+    }
+    size_t cols_n = _cx_rt_count_utf8_cps(body_p, body_n);
+    if (cols_n >= (size_t)width_u16) {
+        _cx_rt_buf_push_bytes(out_b, body_p, body_n);
+        return;
+    }
+    size_t pad_n = (size_t)width_u16 - cols_n;
+    uint32_t fill_cp = spec_lo & 0x1FFFFFu;
+    if (fill_cp == 0u || fill_cp > 0x10FFFFu) fill_cp = 0x20u;
+    uint32_t align_m = (spec_lo >> 21) & 3u;
+    if (align_m == 0u) align_m = def_right ? 3u : 1u;
+    if (align_m == 1u) {
+        _cx_rt_buf_push_bytes(out_b, body_p, body_n);
+        _cx_rt_buf_push_cp_rep(out_b, fill_cp, pad_n);
+    } else if (align_m == 2u) {
+        size_t pad_l = pad_n / 2u;
+        _cx_rt_buf_push_cp_rep(out_b, fill_cp, pad_l);
+        _cx_rt_buf_push_bytes(out_b, body_p, body_n);
+        _cx_rt_buf_push_cp_rep(out_b, fill_cp, pad_n - pad_l);
+    } else {
+        _cx_rt_buf_push_cp_rep(out_b, fill_cp, pad_n);
+        _cx_rt_buf_push_bytes(out_b, body_p, body_n);
+    }
+}
+static void _cx_rt_fmt_u128_spec(
+    _cx_rt_buf_t *out_b,
+    cx_u128 mag_v,
+    uint8_t is_neg,
+    uint32_t spec_lo,
+    uint32_t spec_hi
+) {
+    uint32_t align_m = (spec_lo >> 21) & 3u;
+    uint32_t sign_m = (spec_lo >> 23) & 3u;
+    uint8_t is_alt = (uint8_t)((spec_lo >> 25) & 1u);
+    uint8_t is_zpad = (uint8_t)((spec_lo >> 26) & 1u);
+    uint32_t verb_c = (spec_lo >> 27) & 0xFu;
+    uint32_t radix_n = 10u;
+    uint8_t is_upper = 0u;
+    const char *alt_pfx = "";
+    if (verb_c == 2u || verb_c == 9u) { radix_n = 16u; if (is_alt || verb_c == 9u) alt_pfx = "0x"; }
+    else if (verb_c == 3u) { radix_n = 16u; is_upper = 1u; if (is_alt) alt_pfx = "0X"; }
+    else if (verb_c == 4u) { radix_n = 2u; if (is_alt) alt_pfx = "0b"; }
+    else if (verb_c == 5u) { radix_n = 8u; if (is_alt) alt_pfx = "0o"; }
+    const char *sign_pfx = is_neg ? "-" : (sign_m == 1u ? "+" : "");
+    uint8_t rev_digs[136];
+    size_t dig_n = 0u;
+    if (_cx_u128_lo(mag_v) == 0ull && _cx_u128_hi(mag_v) == 0ull) {
+        rev_digs[0] = '0';
+        dig_n = 1u;
+    } else {
+        cx_u128 cur_v = mag_v;
+        cx_u128 rad_v = _cx_u128_make((uint64_t)radix_n, 0ull);
+        const char *hex_tab = is_upper ? "0123456789ABCDEF" : "0123456789abcdef";
+        while (_cx_u128_lo(cur_v) != 0ull || _cx_u128_hi(cur_v) != 0ull) {
+            cx_u128 rem_v = _cx_u128_rem_chk(cur_v, rad_v);
+            rev_digs[dig_n] = (uint8_t)hex_tab[_cx_u128_lo(rem_v) & 0xFull];
+            dig_n += 1u;
+            cur_v = _cx_u128_div_chk(cur_v, rad_v);
+        }
+    }
+    size_t sign_len = strlen(sign_pfx);
+    size_t alt_len = strlen(alt_pfx);
+    uint32_t width_u16 = spec_hi & 0xFFFFu;
+    if (is_zpad && align_m == 0u && width_u16 != 0xFFFFu) {
+        size_t cur_tot = sign_len + alt_len + dig_n;
+        _cx_rt_buf_push_bytes(out_b, (const uint8_t *)sign_pfx, sign_len);
+        _cx_rt_buf_push_bytes(out_b, (const uint8_t *)alt_pfx, alt_len);
+        if ((size_t)width_u16 > cur_tot) _cx_rt_buf_push_cp_rep(out_b, '0', (size_t)width_u16 - cur_tot);
+        while (dig_n > 0u) { dig_n -= 1u; _cx_rt_buf_push_byte(out_b, rev_digs[dig_n]); }
+        return;
+    }
+    uint8_t num_tmp[160];
+    size_t pos_n = 0u;
+    if (sign_len > 0u) { memcpy(num_tmp + pos_n, sign_pfx, sign_len); pos_n += sign_len; }
+    if (alt_len > 0u) { memcpy(num_tmp + pos_n, alt_pfx, alt_len); pos_n += alt_len; }
+    while (dig_n > 0u) { dig_n -= 1u; num_tmp[pos_n] = rev_digs[dig_n]; pos_n += 1u; }
+    _cx_rt_buf_pad_str(out_b, num_tmp, pos_n, spec_lo, spec_hi, 1u);
+}
+static void _cx_rt_fmt_i128_spec(_cx_rt_buf_t *out_b, cx_i128 sval, uint32_t spec_lo, uint32_t spec_hi) {
+    uint32_t verb_c = (spec_lo >> 27) & 0xFu;
+    cx_u128 uval = _cx_as_u128(sval);
+    if (verb_c >= 2u && verb_c <= 5u) {
+        _cx_rt_fmt_u128_spec(out_b, uval, 0u, spec_lo, spec_hi);
+        return;
+    }
+    if (((int64_t)_cx_u128_hi(uval)) < 0) {
+        _cx_rt_fmt_u128_spec(out_b, _cx_u128_sub_wrap(_cx_u128_make(0ull, 0ull), uval), 1u, spec_lo, spec_hi);
+    } else {
+        _cx_rt_fmt_u128_spec(out_b, uval, 0u, spec_lo, spec_hi);
+    }
+}
+static void _cx_rt_fmt_f64_spec(_cx_rt_buf_t *out_b, double fval, uint32_t spec_lo, uint32_t spec_hi) {
+    uint32_t align_m = (spec_lo >> 21) & 3u;
+    uint32_t sign_m = (spec_lo >> 23) & 3u;
+    uint8_t is_zpad = (uint8_t)((spec_lo >> 26) & 1u);
+    uint32_t verb_c = (spec_lo >> 27) & 0xFu;
+    uint32_t width_u16 = spec_hi & 0xFFFFu;
+    uint32_t prec_u16 = (spec_hi >> 16) & 0xFFFFu;
+    if (isnan(fval)) {
+        const char *nan_s = verb_c == 7u ? "NAN" : "nan";
+        _cx_rt_buf_pad_str(out_b, (const uint8_t *)nan_s, 3u, spec_lo, spec_hi, 1u);
+        return;
+    }
+    uint64_t fbits = 0ull;
+    memcpy(&fbits, &fval, 8u);
+    uint8_t is_neg = (uint8_t)((fbits >> 63) & 1ull);
+    const char *sign_pfx = is_neg ? "-" : (sign_m == 1u ? "+" : "");
+    size_t sign_len = strlen(sign_pfx);
+    if (isinf(fval)) {
+        char inf_b[8];
+        int inf_n = snprintf(inf_b, sizeof(inf_b), verb_c == 7u ? "%sINF" : "%sinf", sign_pfx);
+        _cx_rt_buf_pad_str(out_b, (const uint8_t *)inf_b, inf_n > 0 ? (size_t)inf_n : 0u, spec_lo, spec_hi, 1u);
+        return;
+    }
+    double abs_v = is_neg ? -fval : fval;
+    char body_b[160];
+    int body_i = 0;
+    if (verb_c == 6u || verb_c == 7u) {
+        int eff_p = prec_u16 == 0xFFFFu ? 6 : (prec_u16 > 32u ? 32 : (int)prec_u16);
+        body_i = snprintf(body_b, sizeof(body_b), verb_c == 7u ? "%.*E" : "%.*e", eff_p, abs_v);
+        if (body_i >= 5) {
+            int exp_pos = body_i - 5;
+            while (exp_pos > 0 && body_b[exp_pos] != 'e' && body_b[exp_pos] != 'E') exp_pos -= 1;
+            if ((body_b[exp_pos] == 'e' || body_b[exp_pos] == 'E') &&
+                (body_b[exp_pos + 1] == '+' || body_b[exp_pos + 1] == '-') &&
+                body_b[exp_pos + 2] == '0' && (body_i - (exp_pos + 2)) >= 3) {
+                memmove(&body_b[exp_pos + 2], &body_b[exp_pos + 3], (size_t)(body_i - (exp_pos + 2)));
+                body_i -= 1;
+            }
+        }
+    } else if (verb_c == 8u || prec_u16 != 0xFFFFu) {
+        int eff_p = prec_u16 == 0xFFFFu ? 6 : (prec_u16 > 32u ? 32 : (int)prec_u16);
+        body_i = snprintf(body_b, sizeof(body_b), "%.*f", eff_p, abs_v);
+    } else {
+        body_i = snprintf(body_b, sizeof(body_b), "%.15g", abs_v);
+        if (body_i > 0) {
+            int ep = 0;
+            while (ep < body_i && body_b[ep] != 'e' && body_b[ep] != 'E') ep += 1;
+            if (ep < body_i) {
+                int rd = ep + 1;
+                int wr = ep + 1;
+                if (rd < body_i && body_b[rd] == '-') { body_b[wr] = '-'; wr += 1; rd += 1; }
+                else if (rd < body_i && body_b[rd] == '+') { rd += 1; }
+                while (rd + 1 < body_i && body_b[rd] == '0') rd += 1;
+                while (rd < body_i) { body_b[wr] = body_b[rd]; wr += 1; rd += 1; }
+                body_i = wr;
+                body_b[body_i] = '\0';
+            }
+        }
+    }
+    size_t body_len = body_i > 0 ? (size_t)body_i : 0u;
+    if (is_zpad && align_m == 0u && width_u16 != 0xFFFFu) {
+        size_t cur_tot = sign_len + body_len;
+        _cx_rt_buf_push_bytes(out_b, (const uint8_t *)sign_pfx, sign_len);
+        if ((size_t)width_u16 > cur_tot) _cx_rt_buf_push_cp_rep(out_b, '0', (size_t)width_u16 - cur_tot);
+        _cx_rt_buf_push_bytes(out_b, (const uint8_t *)body_b, body_len);
+        return;
+    }
+    uint8_t full_b[176];
+    if (sign_len > 0u) memcpy(full_b, sign_pfx, sign_len);
+    if (body_len > 0u) memcpy(full_b + sign_len, body_b, body_len);
+    _cx_rt_buf_pad_str(out_b, full_b, sign_len + body_len, spec_lo, spec_hi, 1u);
+}
+static void _cx_rt_push_escaped_cp(_cx_rt_buf_t *out_b, uint32_t cp_v, uint8_t is_str_ctx) {
+    if (cp_v == '\n') { _cx_rt_buf_push_cstr(out_b, "\\n"); return; }
+    if (cp_v == '\r') { _cx_rt_buf_push_cstr(out_b, "\\r"); return; }
+    if (cp_v == '\t') { _cx_rt_buf_push_cstr(out_b, "\\t"); return; }
+    if (cp_v == '\\') { _cx_rt_buf_push_cstr(out_b, "\\\\"); return; }
+    if (cp_v == 0u) { _cx_rt_buf_push_cstr(out_b, "\\0"); return; }
+    if (cp_v == '"') { _cx_rt_buf_push_cstr(out_b, is_str_ctx ? "\\\"" : "\""); return; }
+    if (cp_v == '\'') { _cx_rt_buf_push_cstr(out_b, is_str_ctx ? "'" : "\\'"); return; }
+    if (cp_v < 0x20u || cp_v == 0x7Fu) {
+        char esc_b[16];
+        int esc_n = snprintf(esc_b, sizeof(esc_b), "\\u{%x}", (unsigned int)cp_v);
+        if (esc_n > 0) _cx_rt_buf_push_bytes(out_b, (const uint8_t *)esc_b, (size_t)esc_n);
+        return;
+    }
+    uint8_t u8_b[4];
+    size_t u8_n = _cx_rt_encode_utf8(cp_v, u8_b);
+    _cx_rt_buf_push_bytes(out_b, u8_b, u8_n);
+}
+static uint32_t _cx_rt_decode_utf8_at(const uint8_t *src_p, size_t rem_n, size_t *step_out) {
+    uint8_t b0 = src_p[0];
+    if ((b0 & 0x80u) == 0u) { *step_out = 1u; return (uint32_t)b0; }
+    if ((b0 & 0xE0u) == 0xC0u && rem_n >= 2u && (src_p[1] & 0xC0u) == 0x80u) {
+        uint32_t cp = ((uint32_t)(b0 & 0x1Fu) << 6) | (uint32_t)(src_p[1] & 0x3Fu);
+        if (cp >= 0x80u) { *step_out = 2u; return cp; }
+    } else if ((b0 & 0xF0u) == 0xE0u && rem_n >= 3u &&
+        (src_p[1] & 0xC0u) == 0x80u && (src_p[2] & 0xC0u) == 0x80u) {
+        uint32_t cp = ((uint32_t)(b0 & 0x0Fu) << 12) |
+            ((uint32_t)(src_p[1] & 0x3Fu) << 6) | (uint32_t)(src_p[2] & 0x3Fu);
+        if (cp >= 0x800u && (cp < 0xD800u || cp > 0xDFFFu)) { *step_out = 3u; return cp; }
+    } else if ((b0 & 0xF8u) == 0xF0u && rem_n >= 4u &&
+        (src_p[1] & 0xC0u) == 0x80u && (src_p[2] & 0xC0u) == 0x80u && (src_p[3] & 0xC0u) == 0x80u) {
+        uint32_t cp = ((uint32_t)(b0 & 0x07u) << 18) | ((uint32_t)(src_p[1] & 0x3Fu) << 12) |
+            ((uint32_t)(src_p[2] & 0x3Fu) << 6) | (uint32_t)(src_p[3] & 0x3Fu);
+        if (cp >= 0x10000u && cp <= 0x10FFFFu) { *step_out = 4u; return cp; }
+    }
+    *step_out = 1u;
+    return 0xFFFDu;
+}
+static uint32_t _cx_rt_eff_verb(uint32_t spec_lo) {
+    uint32_t raw_v = (spec_lo >> 27) & 0xFu;
+    if (raw_v == 0u && ((spec_lo >> 31) & 1u) != 0u) return 1u;
+    return raw_v;
+}
+static void _cx_rt_fmt_str_spec(_cx_rt_buf_t *out_b, cx_str_t str_v, uint32_t spec_lo, uint32_t spec_hi) {
+    uint32_t verb_c = _cx_rt_eff_verb(spec_lo);
+    const uint8_t *raw_p = str_v.ptr;
+    size_t raw_n = (size_t)str_v.len;
+    if (verb_c == 1u) {
+        _cx_rt_buf_t q_buf = { NULL, 0u, 0u };
+        _cx_rt_buf_push_byte(&q_buf, '"');
+        size_t idx_i = 0u;
+        while (idx_i < raw_n) {
+            size_t step_n = 1u;
+            uint32_t cp_v = _cx_rt_decode_utf8_at(raw_p + idx_i, raw_n - idx_i, &step_n);
+            _cx_rt_push_escaped_cp(&q_buf, cp_v, 1u);
+            idx_i += step_n;
+        }
+        _cx_rt_buf_push_byte(&q_buf, '"');
+        _cx_rt_buf_pad_str(out_b, q_buf.data, q_buf.len, spec_lo, spec_hi, 0u);
+        free(q_buf.data);
+        return;
+    }
+    uint32_t prec_u16 = (spec_hi >> 16) & 0xFFFFu;
+    size_t sl_n = prec_u16 == 0xFFFFu ? raw_n : _cx_rt_trunc_utf8_cps(raw_p, raw_n, (size_t)prec_u16);
+    _cx_rt_buf_pad_str(out_b, raw_p, sl_n, spec_lo, spec_hi, 0u);
+}
+static void _cx_rt_fmt_char_spec(_cx_rt_buf_t *out_b, uint32_t cp_v, uint32_t spec_lo, uint32_t spec_hi) {
+    uint32_t verb_c = _cx_rt_eff_verb(spec_lo);
+    if (verb_c >= 2u) {
+        _cx_rt_fmt_u128_spec(out_b, _cx_u128_make((uint64_t)cp_v, 0ull), 0u, spec_lo, spec_hi);
+        return;
+    }
+    if (cp_v > 0x10FFFFu) cp_v = 0xFFFDu;
+    _cx_rt_buf_t c_buf = { NULL, 0u, 0u };
+    if (verb_c == 1u) {
+        _cx_rt_buf_push_byte(&c_buf, '\'');
+        _cx_rt_push_escaped_cp(&c_buf, cp_v, 0u);
+        _cx_rt_buf_push_byte(&c_buf, '\'');
+    } else {
+        uint8_t u8_b[4];
+        size_t u8_n = _cx_rt_encode_utf8(cp_v, u8_b);
+        _cx_rt_buf_push_bytes(&c_buf, u8_b, u8_n);
+    }
+    _cx_rt_buf_pad_str(out_b, c_buf.data, c_buf.len, spec_lo, spec_hi, 0u);
+    free(c_buf.data);
+}
+static void _cx_rt_fmt_bool_spec(_cx_rt_buf_t *out_b, uint8_t bval, uint32_t spec_lo, uint32_t spec_hi) {
+    const char *txt_s = (bval & 1u) ? "true" : "false";
+    _cx_rt_buf_pad_str(out_b, (const uint8_t *)txt_s, strlen(txt_s), spec_lo, spec_hi, 0u);
+}
+static void _cx_rt_fmt_ptr_spec(_cx_rt_buf_t *out_b, uintptr_t pval, uint32_t spec_lo, uint32_t spec_hi) {
+    uint32_t ptr_spec_lo = (spec_lo & ~(0xFu << 27)) | (9u << 27) | (1u << 25);
+    _cx_rt_fmt_u128_spec(out_b, _cx_u128_make((uint64_t)pval, 0ull), 0u, ptr_spec_lo, spec_hi);
+}
+static void _cx_rt_fmt_source_loc_spec(
+    _cx_rt_buf_t *out_b,
+    cx_source_loc_t sloc,
+    uint32_t spec_lo,
+    uint32_t spec_hi
+) {
+    uint32_t verb_c = _cx_rt_eff_verb(spec_lo);
+    _cx_rt_buf_t loc_b = { NULL, 0u, 0u };
+    if (sloc == NULL) {
+        _cx_rt_buf_push_cstr(&loc_b, "<null SourceLoc>");
+    } else if (verb_c == 1u) {
+        _cx_rt_buf_push_cstr(&loc_b, "SourceLoc { file: ");
+        _cx_rt_fmt_str_spec(&loc_b, sloc->file, 1u << 27, 0xFFFFFFFFu);
+        _cx_rt_buf_push_cstr(&loc_b, ", fn_name: ");
+        _cx_rt_fmt_str_spec(&loc_b, sloc->fn_name, 1u << 27, 0xFFFFFFFFu);
+        char lc_b[64];
+        int lc_n = snprintf(lc_b, sizeof(lc_b), ", line: %u, col: %u }", sloc->line, sloc->col);
+        if (lc_n > 0) _cx_rt_buf_push_bytes(&loc_b, (const uint8_t *)lc_b, (size_t)lc_n);
+    } else {
+        _cx_rt_buf_push_bytes(&loc_b, sloc->file.ptr, (size_t)sloc->file.len);
+        char lc_b[48];
+        int lc_n = snprintf(lc_b, sizeof(lc_b), ":%u:%u", sloc->line, sloc->col);
+        if (lc_n > 0) _cx_rt_buf_push_bytes(&loc_b, (const uint8_t *)lc_b, (size_t)lc_n);
+    }
+    _cx_rt_buf_pad_str(out_b, loc_b.data, loc_b.len, spec_lo, spec_hi, 0u);
+    free(loc_b.data);
+}
+static void _cx_rt_fmt_args_into(_cx_rt_buf_t *out_b, const cx_fmt_args_t *fargs) {
+    if (fargs == NULL) return;
+    size_t piece_n = (size_t)fargs->pieces_len;
+    size_t arg_n = (size_t)fargs->args_len;
+    size_t idx_i = 0u;
+    while (idx_i < piece_n) {
+        cx_str_t piece_s = fargs->pieces_ptr[idx_i];
+        _cx_rt_buf_push_bytes(out_b, piece_s.ptr, (size_t)piece_s.len);
+        if (idx_i < arg_n) {
+            cx_fmt_arg_t h_arg = fargs->args_ptr[idx_i];
+            if (h_arg.fmt_fn != NULL) {
+                uint32_t s_hi = ((uint32_t)h_arg.spec.width_or_none) |
+                    (((uint32_t)h_arg.spec.precision_or_none) << 16);
+                h_arg.fmt_fn(out_b, h_arg.data, h_arg.spec.flags_and_fill, s_hi);
+            }
+        }
+        idx_i += 1u;
+    }
+}
+static void _cx_rt_fmt_args_spec(
+    _cx_rt_buf_t *out_b,
+    const cx_fmt_args_t *fargs,
+    uint32_t spec_lo,
+    uint32_t spec_hi
+) {
+    if ((spec_hi & 0xFFFFu) == 0xFFFFu) {
+        _cx_rt_fmt_args_into(out_b, fargs);
+        return;
+    }
+    _cx_rt_buf_t sub_b = { NULL, 0u, 0u };
+    _cx_rt_fmt_args_into(&sub_b, fargs);
+    _cx_rt_buf_pad_str(out_b, sub_b.data, sub_b.len, spec_lo, spec_hi, 0u);
+    free(sub_b.data);
+}
+static inline cx_str_t _cx_rt_buf_finish_str(_cx_rt_buf_t *out_b) {
+    cx_str_t res_s;
+    if (out_b->len == 0u) {
+        free(out_b->data);
+        res_s.ptr = (uint8_t *)((uintptr_t)1u);
+        res_s.len = 0u;
+    } else {
+        res_s.ptr = out_b->data;
+        res_s.len = (uintptr_t)out_b->len;
+    }
+    return res_s;
+}
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noreturn))
+#endif
+static void _cx_rt_panic_fmt_args(const cx_fmt_args_t *fargs) {
+    _cx_rt_buf_t msg_b = { NULL, 0u, 0u };
+    _cx_rt_fmt_args_into(&msg_b, fargs);
+    _cx_rt_panic(msg_b.data, msg_b.len);
+}
 
-typedef struct _cx_ty_4 _cx_ty_4;
+typedef cx_str_t _cx_ty_4;
 typedef struct _cx_ty_64 _cx_ty_64;
 typedef struct _cx_ty_65 _cx_ty_65;
 typedef struct _cx_ty_66 _cx_ty_66;
@@ -557,7 +1044,6 @@ typedef struct _cx_ty_68 _cx_ty_68;
 typedef struct _cx_ty_73 _cx_ty_73;
 typedef struct _cx_ty_74 _cx_ty_74;
 
-struct _cx_ty_4 { uint8_t *ptr; uint64_t len; };
 typedef char _cx_sz_assert_4[(sizeof(_cx_ty_4) == 16u) ? 1 : -1];
 struct __attribute__((aligned(4))) _cx_ty_64 {
     uint8_t _f0;

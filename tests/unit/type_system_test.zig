@@ -266,10 +266,10 @@ test "test_type_system_range_refinements_e0406_bit_field_soa_and_overflow_e0502"
         try std.testing.expect(hasDiag(&res.diagnostics, .e0406_range_refinement_violation));
     }
 
-    // [2] `bit_field(u8)` exact 8-bit sum passes; mismatched 7-bit sum emits `E0406`:
+    // [2] `bit_field Name: u8` exact 8-bit sum passes; mismatched 7-bit sum emits `E0423`:
     {
         const bf_ok_src =
-            "pub bit_field Flags8(u8) {\n" ++
+            "pub bit_field Flags8: u8 {\n" ++
             "    pub mode: u8 | 3,\n" ++
             "    pub status: u8 | 4,\n" ++
             "    pub active: bool | 1,\n" ++
@@ -285,14 +285,14 @@ test "test_type_system_range_refinements_e0406_bit_field_soa_and_overflow_e0502"
 
     {
         const bf_bad_src =
-            "pub bit_field BadFlags(u8) {\n" ++
+            "pub bit_field BadFlags: u8 {\n" ++
             "    pub mode: u8 | 3,\n" ++
             "    pub status: u8 | 4,\n" ++
             "}\n";
 
         var res = try runFullTypecheck(std.testing.allocator, bf_bad_src);
         defer res.deinit();
-        try std.testing.expect(hasDiag(&res.diagnostics, .e0406_range_refinement_violation));
+        try std.testing.expect(hasDiag(&res.diagnostics, .e0423_invalid_bitfield_or_enum_cast));
     }
 
     // [3] `#soa [Particle]` column slice projection (`particles.vx` has type `[f32]`):
@@ -396,11 +396,11 @@ test "test_type_system_contextual_variants_overload_try_from_error_and_must_use"
             "    @from Io(IoError),\n" ++
             "    Other,\n" ++
             "}\n" ++
-            "pub fn read_low(flag: bool) -> Result[i32, IoError] {\n" ++
+            "pub fn read_low(flag: bool) -> i32!IoError {\n" ++
             "    if flag { return .Ok(10); }\n" ++
             "    return .Err(IoError { code: 1 });\n" ++
             "}\n" ++
-            "pub fn run_app(flag: bool) -> Result[i32, AppError] {\n" ++
+            "pub fn run_app(flag: bool) -> i32!AppError {\n" ++
             "    let val = read_low(flag)?;\n" ++
             "    return .Ok(val + 1);\n" ++
             "}\n";
@@ -414,10 +414,10 @@ test "test_type_system_contextual_variants_overload_try_from_error_and_must_use"
         const missing_from_src =
             "pub struct IoError { pub code: i32 }\n" ++
             "pub struct DbError { pub code: i32 }\n" ++
-            "pub fn query_db() -> Result[i32, DbError] {\n" ++
+            "pub fn query_db() -> i32!DbError {\n" ++
             "    return .Ok(1);\n" ++
             "}\n" ++
-            "pub fn handler() -> Result[i32, IoError] {\n" ++
+            "pub fn handler() -> i32!IoError {\n" ++
             "    let val = query_db()?;\n" ++
             "    return .Ok(val);\n" ++
             "}\n";
@@ -429,7 +429,7 @@ test "test_type_system_contextual_variants_overload_try_from_error_and_must_use"
 
     {
         const try_in_infallible_src =
-            "pub fn fallible() -> Result[i32, i32] {\n" ++
+            "pub fn fallible() -> i32!i32 {\n" ++
             "    return .Ok(1);\n" ++
             "}\n" ++
             "pub fn infallible() -> i32 {\n" ++
@@ -444,7 +444,7 @@ test "test_type_system_contextual_variants_overload_try_from_error_and_must_use"
     // [4] `let … else` non-diverging `else` block (`E0412`), unused `Result` (`E0413`), and wildcard `let _ = fallible()` (`E0414`):
     {
         const err_sem_src =
-            "pub fn compute_res(val: i32) -> Result[i32, i32] {\n" ++
+            "pub fn compute_res(val: i32) -> i32!i32 {\n" ++
             "    return .Ok(val);\n" ++
             "}\n" ++
             "pub fn bad_semantics(opt_val: i32?) -> i32 {\n" ++
@@ -510,10 +510,10 @@ test "test_type_system_maranget_exhaustiveness_e0415_w0401_and_incremental_query
         const rev1_src =
             "pub struct LowErr { pub code: i32 }\n" ++
             "pub enum TopErr { @from Wrap(LowErr), Other }\n" ++
-            "pub fn first_fn(val: i32) -> Result[i32, LowErr] {\n" ++
+            "pub fn first_fn(val: i32) -> i32!LowErr {\n" ++
             "    return .Ok(val + 1);\n" ++
             "}\n" ++
-            "pub fn second_fn(val: i32) -> Result[i32, TopErr] {\n" ++
+            "pub fn second_fn(val: i32) -> i32!TopErr {\n" ++
             "    let step = first_fn(val)?;\n" ++
             "    return .Ok(step * 2);\n" ++
             "}\n";
@@ -532,14 +532,14 @@ test "test_type_system_maranget_exhaustiveness_e0415_w0401_and_incremental_query
         const rev2_src =
             "pub struct LowErr { pub code: i32 }\n" ++
             "pub enum TopErr { @from Wrap(LowErr), Other }\n" ++
-            "pub fn first_fn(val: i32) -> Result[i32, LowErr] {\n" ++
+            "pub fn first_fn(val: i32) -> i32!LowErr {\n" ++
             "    let s1 = val + 1;\n" ++
             "    let s2 = s1 + 2;\n" ++
             "    let s3 = s2 + 3;\n" ++
             "    let s4 = s3 + 4;\n" ++
             "    return .Ok(s4);\n" ++
             "}\n" ++
-            "pub fn second_fn(val: i32) -> Result[i32, TopErr] {\n" ++
+            "pub fn second_fn(val: i32) -> i32!TopErr {\n" ++
             "    let step = first_fn(val)?;\n" ++
             "    return .Ok(step * 2);\n" ++
             "}\n";
@@ -674,7 +674,7 @@ test "test_type_system_default_param_rejects_non_copy_earlier_param_e0304" {
         "pub struct LinearTok {\n" ++
         "    pub handle: i32,\n" ++
         "}\n" ++
-        "pub fn consume_pair(tok: LinearTok, dup_tok: LinearTok = tok) -> i32 {\n" ++
+        "pub fn consume_pair(tok: own LinearTok, dup_tok: own LinearTok = tok) -> i32 {\n" ++
         "    let LinearTok { handle: h1 } = tok;\n" ++
         "    let LinearTok { handle: h2 } = dup_tok;\n" ++
         "    return h1 + h2;\n" ++
@@ -819,14 +819,14 @@ test "test_type_system_const_patterns_irrefutable_is_e0418_and_linear_tuple_guar
         try std.testing.expect(hasDiag(&irref_res.diagnostics, .e0418_irrefutable_is_binding));
     }
 
-    // [3] Borrowing linear leaf with `ref` while binding `Copy` leaf by value before `and` succeeds (`0` errors):
+    // [3] Borrowing linear leaf with `&` while binding `Copy` leaf by value before `and` succeeds (`0` errors):
     const linear_ref_guard_ok_src =
         "@linear\n" ++
         "pub struct Handle { pub fd: i32 }\n" ++
         "pub enum Slot { Active(Handle), Empty }\n" ++
-        "pub fn check_slot(pair_lin: (Slot, i32)) -> i32 {\n" ++
+        "pub fn check_slot(pair_lin: own (Slot, i32)) -> i32 {\n" ++
         "    var res: i32 = 0;\n" ++
-        "    if pair_lin is (.Active(ref _h), copy_val) and copy_val > 0 {\n" ++
+        "    if pair_lin is (.Active(&_h), copy_val) and copy_val > 0 {\n" ++
         "        res = copy_val;\n" ++
         "    }\n" ++
         "    let (slot_val, _) = pair_lin;\n" ++
@@ -847,7 +847,7 @@ test "test_type_system_const_patterns_irrefutable_is_e0418_and_linear_tuple_guar
         "@linear\n" ++
         "pub struct Handle { pub fd: i32 }\n" ++
         "pub enum Slot { Active(Handle), Empty }\n" ++
-        "pub fn bad_slot(pair_lin: (Slot, i32)) -> i32 {\n" ++
+        "pub fn bad_slot(pair_lin: own (Slot, i32)) -> i32 {\n" ++
         "    if pair_lin is (.Active(moved_h), copy_val) and copy_val > 0 {\n" ++
         "        let Handle { fd } = moved_h;\n" ++
         "        return fd + copy_val;\n" ++
@@ -1056,4 +1056,149 @@ test "test_type_system_float_pi_and_tau_associated_constants_and_retired_std" {
     );
     defer ok_cx_atomic.deinit();
     try std.testing.expect(!ok_cx_atomic.diagnostics.hasErrors());
+}
+
+// ------------ Phase 7.6 (DR-22) Sema & Diagnostics ------------
+
+test "test_type_system_dr22_positive_features_and_e0420_through_e0437_diagnostics" {
+    // [1] Positive `DR-22` Sema (`T!E` == `Result[T, E]`, `@derive(From)`, zones, `FmtArgs`, `..own`, `subscript`, `@builder`, `:fsm`):
+    const valid_dr22_src =
+        "pub struct IoFail { pub code: i32 }\n" ++
+        "@derive(From)\n" ++
+        "pub enum AppFail { Io(IoFail) }\n" ++
+        "pub struct Vec[T] { pub len: usize }\n" ++
+        "pub struct PanelScope { pub total: u32 }\n" ++
+        "@builder_item\n" ++
+        "pub fn add_row(scope: &mut PanelScope, weight: u32) {\n" ++
+        "    scope.total = scope.total + weight;\n" ++
+        "}\n" ++
+        "pub fn render_panel(body: @builder |&mut PanelScope|) -> u32 {\n" ++
+        "    var scope = PanelScope { total: 0 };\n" ++
+        "    body(&mut scope);\n" ++
+        "    return scope.total;\n" ++
+        "}\n" ++
+        "pub struct Grid2 { pub cells: [i32; 4] }\n" ++
+        "impl Grid2 {\n" ++
+        "    pub subscript(row: usize, col: usize) -> i32 {\n" ++
+        "        let { yield self.cells[row * 2 + col]; }\n" ++
+        "        inout { yield &mut self.cells[row * 2 + col]; }\n" ++
+        "    }\n" ++
+        "}\n" ++
+        "pub enum FsmStep { Start, Done(i32) }\n" ++
+        "pub fn parse_sugar() -> i32!IoFail = .Ok(1);\n" ++
+        "pub fn parse_canon() -> Result[i32, IoFail] = .Ok(1);\n" ++
+        "pub fn dial(host: str, /, port: u16 = 443, *, is_tls: bool = true) -> u16 {\n" ++
+        "    let _ = (host, is_tls);\n" ++
+        "    return port;\n" ++
+        "}\n" ++
+        "pub fn trace_loc(loc: SourceLoc = @caller_location()) -> u32 = loc.line;\n" ++
+        "pub fn run_dr22() -> i32!AppFail {\n" ++
+        "    var grid = Grid2 { cells: [1, 2, 3, 4] };\n" ++
+        "    grid[0, 1] = 9;\n" ++
+        "    let moved_grid = Grid2 { ..own grid };\n" ++
+        "    let panel_sum = render_panel() { add_row(5); };\n" ++
+        "    let port_num = dial(\"corex.dev\", is_tls: false);\n" ++
+        "    let step_val = parse_sugar()?;\n" ++
+        "    let loc_line = trace_loc();\n" ++
+        "    let msg: str = \"v={step_val=:#04x}\";\n" ++
+        "    let _ = (moved_grid, panel_sum, port_num, loc_line, msg);\n" ++
+        "    let out_val = fsm: match FsmStep.Start {\n" ++
+        "        .Start => continue :fsm .Done(step_val),\n" ++
+        "        .Done(res) => res,\n" ++
+        "    };\n" ++
+        "    return .Ok(out_val);\n" ++
+        "}\n";
+    var ok_res = try runFullTypecheck(std.testing.allocator, valid_dr22_src);
+    defer ok_res.deinit();
+    try std.testing.expect(!ok_res.diagnostics.hasErrors());
+
+    var sugar_ret: TypeId = .err_ty;
+    var canon_ret: TypeId = .err_ty;
+    for (ok_res.symbol_table.symbols.items) |sym| {
+        if (sym.kind == .fn_sym and std.mem.eql(u8, sym.name_text, "parse_sugar")) {
+            sugar_ret = ok_res.type_pool.getFnSignatureView(sym.type_id).?.ret_ty;
+        } else if (sym.kind == .fn_sym and std.mem.eql(u8, sym.name_text, "parse_canon")) {
+            canon_ret = ok_res.type_pool.getFnSignatureView(sym.type_id).?.ret_ty;
+        }
+    }
+    try std.testing.expect(!sugar_ret.isError());
+    try std.testing.expectEqual(sugar_ret, canon_ret);
+
+    // [2] Ownership, `&out`, `bit_field`, `.len`, and `opaque` (`E0420`–`E0425`):
+    const e0420_to_e0425_src =
+        "pub struct Vec[T] { pub len: usize }\n" ++
+        "pub fn bad_val_param(buf: Vec[u8]) -> usize { return buf.len; }\n" ++
+        "pub fn take_vec(buf: own Vec[u8]) -> usize { return buf.len; }\n" ++
+        "pub fn init_slot(dst: &out i32) { dst.* = 7; }\n" ++
+        "pub enum WideOp: u16 { Alpha = 1 }\n" ++
+        "pub fn trigger_e0420_to_e0425(slice: &[u8], op: WideOp, void_p: *opaque) -> usize {\n" ++
+        "    let local_vec = Vec { len: 1 };\n" ++
+        "    let _ = take_vec(local_vec);\n" ++
+        "    let immut_slot: i32 = 0;\n" ++
+        "    init_slot(&out immut_slot);\n" ++
+        "    let _ = op as u8;\n" ++
+        "    unsafe { let _ = void_p.*; }\n" ++
+        "    return slice.len;\n" ++
+        "}\n";
+    var res_a = try runFullTypecheck(std.testing.allocator, e0420_to_e0425_src);
+    defer res_a.deinit();
+    try std.testing.expect(hasDiag(&res_a.diagnostics, .e0420_missing_call_site_own));
+    try std.testing.expect(hasDiag(&res_a.diagnostics, .e0421_non_copy_value_parameter));
+    try std.testing.expect(hasDiag(&res_a.diagnostics, .e0422_out_param_contract_violation));
+    try std.testing.expect(hasDiag(&res_a.diagnostics, .e0423_invalid_bitfield_or_enum_cast));
+    try std.testing.expect(hasDiag(&res_a.diagnostics, .e0424_retired_slice_field_access));
+    try std.testing.expect(hasDiag(&res_a.diagnostics, .e0425_invalid_opaque_type_usage));
+
+    // [3] Generic defaults, `@derive(From)`, and parameter zones (`E0426`–`E0430`):
+    const e0426_to_e0430_src =
+        "pub struct BadGen[T = u8, U] { pub first: T, pub second: U }\n" ++
+        "@derive(From)\n" ++
+        "pub enum DupErr { Left(i32), Right(i32) }\n" ++
+        "pub fn bad_default_order(opt_x: i32 = 1, req_y: i32) -> i32 = opt_x + req_y;\n" ++
+        "pub fn zoned(pos_only: i32, /, *, kw_only: i32) -> i32 = pos_only + kw_only;\n" ++
+        "pub fn bad_zone_calls() -> i32 {\n" ++
+        "    return zoned(pos_only: 1, kw_only: 2) + zoned(1, 2);\n" ++
+        "}\n";
+    var res_b = try runFullTypecheck(std.testing.allocator, e0426_to_e0430_src);
+    defer res_b.deinit();
+    try std.testing.expect(hasDiag(&res_b.diagnostics, .e0426_non_trailing_generic_default));
+    try std.testing.expect(hasDiag(&res_b.diagnostics, .e0427_invalid_error_composition));
+    try std.testing.expect(hasDiag(&res_b.diagnostics, .e0428_named_arg_for_positional_only));
+    try std.testing.expect(hasDiag(&res_b.diagnostics, .e0429_positional_arg_for_keyword_only));
+    try std.testing.expect(hasDiag(&res_b.diagnostics, .e0430_non_default_after_default_param));
+
+    // [4] Format specs, missing struct fields, field visibility, parallel assign, `@cfg`, `@builder_item`, `:fsm` (`E0431`–`E0437`):
+    const e0431_to_e0437_src =
+        "@cfg(42)\n" ++
+        "pub fn bad_cfg_fn() {}\n" ++
+        "pub mod locked_mod {\n" ++
+        "    pub struct Locked { secret_id: i32 }\n" ++
+        "}\n" ++
+        "pub struct PairReq { pub left: i32, pub right: i32 }\n" ++
+        "pub struct ScopeBox { pub count: u32 }\n" ++
+        "@builder_item\n" ++
+        "pub fn add_box_item(scope: &mut ScopeBox, delta: u32) { scope.count += delta; }\n" ++
+        "pub enum FsmTag { Alpha, Beta }\n" ++
+        "pub fn trigger_e0431_to_e0437(flag: bool) -> str {\n" ++
+        "    let _ = PairReq { left: 1 };\n" ++
+        "    let _ = locked_mod.Locked { secret_id: 9 };\n" ++
+        "    let immut_lhs: i32 = 1;\n" ++
+        "    var mut_rhs: i32 = 2;\n" ++
+        "    (immut_lhs, mut_rhs) = (3, 4);\n" ++
+        "    add_box_item(5);\n" ++
+        "    let _ = fsm: match FsmTag.Alpha {\n" ++
+        "        .Alpha => continue :fsm,\n" ++
+        "        .Beta => 0,\n" ++
+        "    };\n" ++
+        "    return \"{flag:#x}\";\n" ++
+        "}\n";
+    var res_c = try runFullTypecheck(std.testing.allocator, e0431_to_e0437_src);
+    defer res_c.deinit();
+    try std.testing.expect(hasDiag(&res_c.diagnostics, .e0431_invalid_format_specifier));
+    try std.testing.expect(hasDiag(&res_c.diagnostics, .e0432_missing_struct_field_initializer));
+    try std.testing.expect(hasDiag(&res_c.diagnostics, .e0433_inaccessible_field_or_visibility));
+    try std.testing.expect(hasDiag(&res_c.diagnostics, .e0434_invalid_parallel_assign_target));
+    try std.testing.expect(hasDiag(&res_c.diagnostics, .e0435_invalid_cfg_predicate));
+    try std.testing.expect(hasDiag(&res_c.diagnostics, .e0436_builder_item_outside_scope));
+    try std.testing.expect(hasDiag(&res_c.diagnostics, .e0437_invalid_labeled_match_continue));
 }

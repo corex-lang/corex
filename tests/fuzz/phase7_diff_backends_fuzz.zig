@@ -1,13 +1,14 @@
-//! Phase 7 & Phase 7.5 (`DR-21`) Deterministic 4-Tier Differential Backend Fuzz Suite (`tests/fuzz/phase7_diff_backends_fuzz.zig`)
+//! Phase 7, Phase 7.5 & Phase 7.6 (`DR-22`) Deterministic 4-Tier Differential Backend Fuzz Suite (`tests/fuzz/phase7_diff_backends_fuzz.zig`)
 //!
-//! Exercises two complementary Phase 7 & Phase 7.5 verification invariants (`DR-01`, `DR-20` `D-07A`, `DR-21`):
+//! Exercises two complementary Phase 7–7.6 verification invariants (`DR-01`, `DR-20` `D-07A`, `DR-21`, `DR-22`):
 //! 1. **Full 4-Tier Native + VM Differential Parity (`10` structure-aware PRNG `.cx` programs):**
 //!    Synthesizes randomized, type-safe `.cx` modules combining structs (`@repr(C)` / `@zero_pad`),
-//!    `inout` MVS parameters, `Result[i32, i32]` `?` propagation (`cx_result_cc`), `= expr;` functions,
-//!    named & dependent-default call arguments, `is` / `:=` condition bindings with `AutoDrop` pre-`else`
-//!    `@drop_trace(id)` ordering, `orelse`, `arr[..][$ - 1]` slice end-indexing, indexed `for item, idx in`,
-//!    labeled `T?` value-`break` + `orelse`, `with context.cancel_token` + `let snap = context; snap.rng_seed`,
-//!    `[i32; 4]` SIMD arithmetic, and `@sys_write` streams, asserting 100% 4-tier `runFourTierDiffOracle` parity.
+//!    `&mut` / `&out` / `own T` MVS parameters, `i32!i32` `?` propagation (`cx_result_cc`), `= expr;`
+//!    functions, named & dependent-default call arguments, `is` / `:=` condition bindings with `AutoDrop`
+//!    pre-`else` `@drop_trace(id)` ordering, `orelse`, `..base` spread, `(a, b) = (b, a)` parallel swap,
+//!    `&raw` + `ptr.*`, `b'x'` / `b"…"`, `_i32` suffixes, `fsm: match` + `continue :fsm`, `subscript`/`yield`,
+//!    `arr[..][$ - 1]` slice end-indexing, indexed `for item, idx in`, labeled `T?` value-`break` + `orelse`,
+//!    `with context.cancel_token` + `let snap = context; snap.rng_seed`, `[i32; 4]` SIMD, and `@sys_write`.
 //! 2. **Cross-Target Deterministic IR Emission & VM Parity (`48` PRNG programs x 7 targets):**
 //!    Verifies byte-for-byte deterministic Tier A (`-ofmt=c`, zero `void*`) and Tier B (`LLVM`)
 //!    source emission (`Run 1 == Run 2`) across all 7 canonical `TargetSpec` triples alongside
@@ -70,12 +71,12 @@ fn generateRandomValidCxProgram(allocator: std.mem.Allocator, prng_seed: u64) ![
     var builder: std.ArrayList(u8) = .empty;
     errdefer builder.deinit(allocator);
 
-    var header_buf: [1536]u8 = undefined;
+    var header_buf: [2560]u8 = undefined;
     try builder.appendSlice(
         allocator,
         try std.fmt.bufPrint(
             &header_buf,
-            "//! Generated Structure-Aware Phase 7 & Phase 7.5 (`DR-21`) Differential Fuzz Program\n" ++
+            "//! Generated Structure-Aware Phase 7–7.6 (`DR-22`) Differential Fuzz Program\n" ++
                 "pub trait Drop {{\n" ++
                 "    fn drop(&mut self);\n" ++
                 "}}\n\n" ++
@@ -87,11 +88,18 @@ fn generateRandomValidCxProgram(allocator: std.mem.Allocator, prng_seed: u64) ![
                 "        @drop_trace(self.code);\n" ++
                 "    }}\n" ++
                 "}}\n\n" ++
+                "pub fn take_guard_code(item: own GuardBox, /) -> i32 = item.code as i32;\n\n" ++
                 "pub fn maybe_guard_box(is_present: bool, code_val: i64) -> GuardBox? {{\n" ++
                 "    if is_present {{\n" ++
                 "        return .Some(GuardBox {{ code: code_val }});\n" ++
                 "    }}\n" ++
                 "    return .None;\n" ++
+                "}}\n\n" ++
+                "@derive(Copy, Eq)\n" ++
+                "pub enum FsmStep: u8 {{\n" ++
+                "    Start = 0,\n" ++
+                "    Advance = 1,\n" ++
+                "    Finish = 2,\n" ++
                 "}}\n\n" ++
                 "@repr(C)\n" ++
                 "@zero_pad\n" ++
@@ -99,8 +107,20 @@ fn generateRandomValidCxProgram(allocator: std.mem.Allocator, prng_seed: u64) ![
                 "    pub tag_u8: u8,\n" ++
                 "    pub payload_i32: i32,\n" ++
                 "}}\n\n" ++
-                "pub fn bump_acc(mut acc_slot: inout i32, step_val: i32) -> unit {{\n" ++
-                "    acc_slot = acc_slot +% step_val;\n" ++
+                "pub struct CellGrid {{\n" ++
+                "    pub cells: [i32; 4],\n" ++
+                "}}\n\n" ++
+                "impl CellGrid {{\n" ++
+                "    pub subscript(row: usize, col: usize, /) -> i32 {{\n" ++
+                "        let {{ yield self.cells[(row & 1) * 2 + (col & 1)]; }}\n" ++
+                "        inout {{ yield &mut self.cells[(row & 1) * 2 + (col & 1)]; }}\n" ++
+                "    }}\n" ++
+                "}}\n\n" ++
+                "pub fn bump_acc(acc_slot: &mut i32, step_val: i32, /) {{\n" ++
+                "    acc_slot.* = acc_slot.* +% step_val;\n" ++
+                "}}\n\n" ++
+                "pub fn init_out_val(dst_slot: &out i32, seed_in: i32, /) {{\n" ++
+                "    dst_slot.* = seed_in +% (b'K' as i32);\n" ++
                 "}}\n\n" ++
                 "pub fn affine_calc(lhs_val: i32, mid_val: i32 = lhs_val +% {d}, scale_val: i32 = 2) -> i32 =\n" ++
                 "    lhs_val *% scale_val +% mid_val;\n\n" ++
@@ -108,13 +128,13 @@ fn generateRandomValidCxProgram(allocator: std.mem.Allocator, prng_seed: u64) ![
                 "    let extracted: i32 = opt_val orelse return fallback_val;\n" ++
                 "    return extracted +% 5;\n" ++
                 "}}\n\n" ++
-                "pub fn checked_gate(flag_err: bool, val_in: i32) -> Result[i32, i32] {{\n" ++
+                "pub fn checked_gate(flag_err: bool, val_in: i32) -> i32!i32 {{\n" ++
                 "    if flag_err {{\n" ++
                 "        return .Err(0);\n" ++
                 "    }}\n" ++
                 "    return .Ok(val_in +% 7);\n" ++
                 "}}\n\n" ++
-                "pub fn eval_gate_wrapper(flag_err: bool, val_in: i32) -> Result[i32, i32] {{\n" ++
+                "pub fn eval_gate_wrapper(flag_err: bool, val_in: i32) -> i32!i32 {{\n" ++
                 "    let unwrapped: i32 = checked_gate(flag_err, val_in)?;\n" ++
                 "    return .Ok(unwrapped *% 2);\n" ++
                 "}}\n\n",
@@ -126,17 +146,36 @@ fn generateRandomValidCxProgram(allocator: std.mem.Allocator, prng_seed: u64) ![
         allocator,
         "pub fn main() -> i32 {{\n" ++
             "    let guard_inst = GuardBox {{ code: {d} }};\n" ++
+            "    let moved_guard = GuardBox {{ code: 55_i64 }};\n" ++
             "    defer {{ @drop_trace({d}); }}\n" ++
             "    let pkt = PairPacket {{ tag_u8: {d}, payload_i32: {d} }};\n" ++
-            "    var running_acc: i32 = pkt.payload_i32 +% (pkt.tag_u8 as i32) +% (guard_inst.code as i32);\n" ++
+            "    let pkt_spread = PairPacket {{ payload_i32: pkt.payload_i32 +% 3_i32, ..pkt }};\n" ++
+            "    var running_acc: i32 = pkt_spread.payload_i32 +% (pkt_spread.tag_u8 as i32) +%\n" ++
+            "        (guard_inst.code as i32) +% take_guard_code(own moved_guard);\n" ++
+            "    var out_slot: i32;\n" ++
+            "    init_out_val(&out out_slot, pkt.payload_i32);\n" ++
+            "    var swap_left: i32 = out_slot;\n" ++
+            "    var swap_right: i32 = (b\"cx-v1\".len() as i32) +% ~1_i32;\n" ++
+            "    (swap_left, swap_right) = (swap_right, swap_left);\n" ++
+            "    let raw_pkt_ptr: *i32 = &raw pkt_spread.payload_i32;\n" ++
+            "    let raw_loaded: i32 = unsafe {{ raw_pkt_ptr.* }};\n" ++
+            "    var grid = CellGrid {{ cells: [1, 2, 3, 4] }};\n" ++
+            "    let prev_cell: i32 = grid[0, 1];\n" ++
+            "    grid[0, 1] = prev_cell +% swap_left;\n" ++
+            "    let fsm_term: i32 = fsm: match FsmStep.Start {{\n" ++
+            "        .Start => continue :fsm .Advance,\n" ++
+            "        .Advance => continue :fsm .Finish,\n" ++
+            "        .Finish => (FsmStep.Finish as u8 as i32) +% grid[0, 1],\n" ++
+            "    }};\n" ++
+            "    bump_acc(&mut running_acc, swap_right +% raw_loaded +% fsm_term);\n" ++
             "    if {s} {{\n" ++
-            "        bump_acc(running_acc, {d});\n" ++
+            "        bump_acc(&mut running_acc, {d});\n" ++
             "    }} else {{\n" ++
-            "        bump_acc(running_acc, {d});\n" ++
+            "        bump_acc(&mut running_acc, {d});\n" ++
             "    }}\n" ++
             "    var iter_idx: usize = 0;\n" ++
             "    while iter_idx < {d} {{\n" ++
-            "        bump_acc(running_acc, (iter_idx as i32) +% 1);\n" ++
+            "        bump_acc(&mut running_acc, (iter_idx as i32) +% 1);\n" ++
             "        iter_idx += 1;\n" ++
             "    }}\n" ++
             "    let maybe_bonus: i32? = {s};\n" ++
@@ -146,13 +185,13 @@ fn generateRandomValidCxProgram(allocator: std.mem.Allocator, prng_seed: u64) ![
             "    }};\n" ++
             "    if (cand_opt := maybe_bonus) is .Some(inner_val) and (shifted_val := inner_val +% 3) > {d} {{\n" ++
             "        let _keep = cand_opt;\n" ++
-            "        bump_acc(running_acc, shifted_val);\n" ++
+            "        bump_acc(&mut running_acc, shifted_val);\n" ++
             "    }} else {{\n" ++
-            "        bump_acc(running_acc, -2);\n" ++
+            "        bump_acc(&mut running_acc, -2);\n" ++
             "    }}\n" ++
             "    if maybe_guard_box({s}, {d}) is .Some(cond_guard) and cond_guard.code > {d} {{\n" ++
             "        @drop_trace(300);\n" ++
-            "        bump_acc(running_acc, cond_guard.code as i32);\n" ++
+            "        bump_acc(&mut running_acc, cond_guard.code as i32);\n" ++
             "    }} else {{\n" ++
             "        @drop_trace(400);\n" ++
             "    }}\n" ++
@@ -161,7 +200,7 @@ fn generateRandomValidCxProgram(allocator: std.mem.Allocator, prng_seed: u64) ![
             "    let lane_arr: [i32; 4] = [2, 4, 6, {d}];\n" ++
             "    let dollar_tail: i32 = lane_arr[..][$ - 1];\n" ++
             "    for lane_item, lane_idx in lane_arr {{\n" ++
-            "        bump_acc(running_acc, lane_item +% (lane_idx as i32));\n" ++
+            "        bump_acc(&mut running_acc, lane_item +% (lane_idx as i32));\n" ++
             "    }}\n" ++
             "    let search_term: i32 = search_lane: for lane_item, lane_idx in lane_arr {{\n" ++
             "        if lane_item > {d} {{\n" ++
@@ -179,7 +218,10 @@ fn generateRandomValidCxProgram(allocator: std.mem.Allocator, prng_seed: u64) ![
             "    }};\n" ++
             "    let vec_lanes: [i32; 4] = @simd_add(@simd_splat[[i32; 4]]({d}), [1, 2, 3, 4]);\n" ++
             "    let simd_term: i32 = @simd_reduce_add(vec_lanes);\n" ++
-            "    let _ = @sys_write(1, \"fuzz-ok\\n\");\n" ++
+            "    let banner_str: str = \"\"\"\n" ++
+            "        fuzz-ok\n" ++
+            "        \"\"\";\n" ++
+            "    let _ = @sys_write(1, \"{{banner_str}}\\n\");\n" ++
             "    return running_acc +% opt_term +% orelse_term +% call_term +% dollar_tail +%\n" ++
             "        search_term +% ctx_term +% res_term +% simd_term;\n" ++
             "}}\n",

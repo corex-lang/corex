@@ -1,9 +1,9 @@
 //! CoreX Hybrid Steerable Wadler-Lindig Formatter & 8-Byte `DocArena` (`stage0/src/fmt_engine.zig`)
 //!
 //! Implements the deterministic, comment-preserving source formatter (`corex fmt`) and autofix pass
-//! (`corex fmt --fix`) specified in `DR-03` Section 7 and `DR-14` Section 1. Lowers the lossless
-//! Concrete Syntax Tree (`LosslessCstArena`) and `TokenBuffer` into a flat array of 8-byte `DocInst`
-//! document algebra instructions with $O(1)$ open-group `flat_width` backpatching.
+//! (`corex fmt --fix`) specified in `DR-03` Section 7, `DR-14` Section 1, and `DR-22` Section 3.4.
+//! Lowers the lossless Concrete Syntax Tree (`LosslessCstArena`) and `TokenBuffer` into a flat array
+//! of 8-byte `DocInst` document algebra instructions with $O(1)$ open-group `flat_width` backpatching.
 //!
 //! - **8-Byte `DocInst` & $O(1)$ Group Backpatching:** Packs every document algebra instruction into
 //!   an `extern struct` of exactly 8 bytes (`DocOp` + `mode_or_delta` + `flat_width` + `payload`).
@@ -11,10 +11,11 @@
 //! - **100% Comment Preservation & `line_suffix` Queue:** Pre-classifies inter-token trivia into
 //!   leading comments and same-line trailing comments (`line_suffix`), handles dangling comments in
 //!   empty `{}` / `()` / `[]` containers, and flushes all unconsumed comments up through `.eof`.
-//! - **Steerable Formatting & Columnar Grids:** Respects user trailing commas (`GroupMode.force_break`
-//!   vs `GroupMode.auto_fit`), formats literal arrays with `> 8` elements in `GroupMode.columnar_grid`,
-//!   aligns multiline `|>` pipe and `.` postfix chains, strips redundant outer parentheses on
-//!   `if`/`while`/`for`/`match` headers, sorts braced `use` specifiers, and honors `// corex fmt: off`.
+//! - **Steerable & `DR-22` Canonical Formatting:** Respects user trailing commas (`force_break` vs
+//!   `auto_fit`), formats literal arrays with `> 8` elements in `columnar_grid`, rewrites `Option[T]`
+//!   to `T?` and `Result[T, E]` to `T!E`, strips redundant `-> unit`, groups marker attributes onto
+//!   one sorted line, normalizes `42_u64` suffixes and `extern "C"`, shifts `"""…"""` multiline
+//!   strings by `new_indent - old_indent`, and honors `// corex fmt: off`.
 
 const std = @import("std");
 const mem_foundation = @import("mem_foundation.zig");
@@ -66,6 +67,8 @@ pub const DocOp = enum(u8) {
     line_suffix = 11,
     /// Emits a raw multi-line suppressed slice (`// corex fmt: off` … `on`) verbatim (`12`).
     verbatim_text = 12,
+    /// Emits a `"""…"""` multiline string shifted by `new_indent - old_indent` (`13`, `DR-22` §3.4).
+    multiline_string = 13,
 };
 
 /// Group breaking policy stored in `DocInst.mode_or_delta` on `.group_begin` (`DR-14` Section 1.2).
@@ -112,6 +115,14 @@ pub const IfBreakPair = struct {
     flat_text: []const u8,
 };
 
+/// Stored `"""…"""` multiline string literal and its original source line indentation (`DR-22` §3.4).
+pub const MultilineStringEntry = struct {
+    /// Owned raw UTF-8 lexeme of the triple-quoted string or byte-string literal.
+    raw_lexeme: []u8,
+    /// Leading space indentation of the source line containing the opening `"""` delimiter.
+    old_line_indent: u32,
+};
+
 /// Contiguous arena of 8-byte `DocInst` instructions with $O(1)$ group `flat_width` backpatching.
 pub const DocArena = struct {
     /// Backing allocator for instruction, group frame, and text buffers.
@@ -128,6 +139,8 @@ pub const DocArena = struct {
     if_break_pairs: std.ArrayList(IfBreakPair) = .empty,
     /// Table of verbatim suppressed source slices indexed by `.verbatim_text` `DocInst.payload`.
     verbatim_slices: std.ArrayList([]const u8) = .empty,
+    /// Table of triple-quoted multiline string literals indexed by `.multiline_string` `DocInst.payload`.
+    multiline_strings: std.ArrayList(MultilineStringEntry) = .empty,
     /// Monotonically advancing flat column width counter used to compute group widths in $O(1)$.
     running_width: u32 = 0,
 
@@ -148,12 +161,16 @@ pub const DocArena = struct {
         for (self.verbatim_slices.items) |slice| {
             self.allocator.free(slice);
         }
+        for (self.multiline_strings.items) |entry| {
+            self.allocator.free(entry.raw_lexeme);
+        }
         self.instructions.deinit(self.allocator);
         self.open_groups.deinit(self.allocator);
         self.string_bytes.deinit(self.allocator);
         self.line_suffix_slices.deinit(self.allocator);
         self.if_break_pairs.deinit(self.allocator);
         self.verbatim_slices.deinit(self.allocator);
+        self.multiline_strings.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -199,6 +216,29 @@ pub const DocArena = struct {
             .mode_or_delta = 0,
             .flat_width = INF_WIDTH,
             .payload = slice_idx,
+        });
+    }
+
+    /// Emits a `"""…"""` multiline string literal to be delta-shifted by `DocRenderer` (`DR-22` §3.4).
+    pub fn emitMultilineString(
+        self: *DocArena,
+        raw_lexeme: []const u8,
+        old_line_indent: u32,
+    ) !void {
+        if (raw_lexeme.len == 0) return;
+        self.poisonOpenGroups();
+        const owned_lexeme = try self.allocator.dupe(u8, raw_lexeme);
+        errdefer self.allocator.free(owned_lexeme);
+        const entry_idx: u32 = @intCast(self.multiline_strings.items.len);
+        try self.multiline_strings.append(self.allocator, .{
+            .raw_lexeme = owned_lexeme,
+            .old_line_indent = old_line_indent,
+        });
+        try self.instructions.append(self.allocator, .{
+            .op = .multiline_string,
+            .mode_or_delta = 0,
+            .flat_width = INF_WIDTH,
+            .payload = entry_idx,
         });
     }
 
@@ -374,6 +414,8 @@ pub const DocRenderer = struct {
     current_col: u32 = 0,
     /// Deferred indentation spaces to emit before the first non-empty text on a new line.
     pending_indent_spaces: u32 = 0,
+    /// Materialized leading space count of the currently active output line.
+    current_line_indent: u32 = 0,
     /// Count of consecutive trailing `\n` bytes currently at the end of `out` (`0..2`).
     consecutive_newlines: u8 = 0,
     /// Whether the renderer is positioned at the start of a fresh line awaiting deferred indent.
@@ -406,12 +448,147 @@ pub const DocRenderer = struct {
         if (slice.len == 0) return;
         if (self.is_at_line_start) {
             try self.out.appendNTimes(self.allocator, ' ', self.pending_indent_spaces);
+            self.current_line_indent = self.pending_indent_spaces;
             self.current_col = self.pending_indent_spaces;
             self.is_at_line_start = false;
             self.consecutive_newlines = 0;
         }
         try self.out.appendSlice(self.allocator, slice);
         self.current_col += @intCast(slice.len);
+    }
+
+    /// Appends `slice` to `self.out` while stripping any `\r` carriage returns (`\r\n` -> `\n`).
+    fn appendSliceNormalizedLf(self: *DocRenderer, slice: []const u8) !void {
+        for (slice) |byte_val| {
+            if (byte_val == '\r') continue;
+            try self.out.append(self.allocator, byte_val);
+        }
+    }
+
+    /// Renders a triple-quoted `"""…"""` literal shifted by `emitted_open_line_indent - old_line_indent` (`DR-22` §3.4).
+    fn renderMultilineString(self: *DocRenderer, entry: MultilineStringEntry) !void {
+        const parsed = extractMultilineTripleQuoteParts(entry.raw_lexeme) orelse {
+            try self.writeTextSlice(entry.raw_lexeme);
+            return;
+        };
+
+        try self.writeTextSlice(parsed.open_header);
+        const emitted_open_indent = self.current_line_indent;
+        try self.out.append(self.allocator, '\n');
+
+        const is_interp_allowed = !parsed.is_raw and !parsed.is_byte;
+        var last_outer_lf: ?usize = null;
+        var scan_pos: usize = 0;
+        while (findNextOuterLineFeedInMultiline(parsed.body_after_open_nl, scan_pos, parsed.is_raw, is_interp_allowed)) |lf_pos| {
+            last_outer_lf = lf_pos;
+            scan_pos = lf_pos + 1;
+        }
+
+        const close_prefix = if (last_outer_lf) |lf_idx|
+            parsed.body_after_open_nl[lf_idx + 1 ..]
+        else
+            parsed.body_after_open_nl;
+
+        var is_valid_spaces_only = true;
+        for (close_prefix) |prefix_byte| {
+            if (prefix_byte != ' ') {
+                is_valid_spaces_only = false;
+                break;
+            }
+        }
+        var min_leading_spaces: usize = close_prefix.len;
+
+        if (last_outer_lf) |final_lf_idx| {
+            const content_end: usize = if (final_lf_idx > 0 and parsed.body_after_open_nl[final_lf_idx - 1] == '\r')
+                final_lf_idx - 1
+            else
+                final_lf_idx;
+            const content_bytes = parsed.body_after_open_nl[0..content_end];
+
+            var line_start: usize = 0;
+            while (true) {
+                const maybe_lf = findNextOuterLineFeedInMultiline(content_bytes, line_start, parsed.is_raw, is_interp_allowed);
+                const raw_line_end = maybe_lf orelse content_bytes.len;
+                const clean_line_end = if (raw_line_end > line_start and content_bytes[raw_line_end - 1] == '\r')
+                    raw_line_end - 1
+                else
+                    raw_line_end;
+                const line_slice = content_bytes[line_start..clean_line_end];
+
+                if (line_slice.len > 0) {
+                    if (line_slice[0] == '\t') {
+                        is_valid_spaces_only = false;
+                    } else {
+                        var space_count: usize = 0;
+                        while (space_count < line_slice.len and line_slice[space_count] == ' ') : (space_count += 1) {}
+                        min_leading_spaces = @min(min_leading_spaces, space_count);
+                    }
+                }
+                if (maybe_lf) |lf_pos| {
+                    line_start = lf_pos + 1;
+                } else {
+                    break;
+                }
+            }
+
+            const raw_delta: isize = @as(isize, @intCast(emitted_open_indent)) -
+                @as(isize, @intCast(entry.old_line_indent));
+            const eff_delta: isize = if (!is_valid_spaces_only)
+                0
+            else
+                @max(raw_delta, -@as(isize, @intCast(min_leading_spaces)));
+
+            line_start = 0;
+            while (true) {
+                const maybe_lf = findNextOuterLineFeedInMultiline(content_bytes, line_start, parsed.is_raw, is_interp_allowed);
+                const raw_line_end = maybe_lf orelse content_bytes.len;
+                const clean_line_end = if (raw_line_end > line_start and content_bytes[raw_line_end - 1] == '\r')
+                    raw_line_end - 1
+                else
+                    raw_line_end;
+                const line_slice = content_bytes[line_start..clean_line_end];
+
+                if (line_slice.len > 0) {
+                    if (eff_delta >= 0) {
+                        try self.out.appendNTimes(self.allocator, ' ', @intCast(eff_delta));
+                        try self.appendSliceNormalizedLf(line_slice);
+                    } else {
+                        const drop_spaces: usize = @intCast(-eff_delta);
+                        try self.appendSliceNormalizedLf(line_slice[drop_spaces..]);
+                    }
+                }
+                try self.out.append(self.allocator, '\n');
+
+                if (maybe_lf) |lf_pos| {
+                    line_start = lf_pos + 1;
+                } else {
+                    break;
+                }
+            }
+
+            const new_close_spaces: usize = @intCast(@as(isize, @intCast(close_prefix.len)) + eff_delta);
+            try self.out.appendNTimes(self.allocator, ' ', new_close_spaces);
+            try self.out.appendSlice(self.allocator, parsed.close_delim);
+            self.current_line_indent = @intCast(new_close_spaces);
+            self.current_col = @intCast(new_close_spaces + parsed.close_delim.len);
+            self.is_at_line_start = false;
+            self.consecutive_newlines = 0;
+            return;
+        }
+
+        const raw_delta: isize = @as(isize, @intCast(emitted_open_indent)) -
+            @as(isize, @intCast(entry.old_line_indent));
+        const eff_delta: isize = if (!is_valid_spaces_only)
+            0
+        else
+            @max(raw_delta, -@as(isize, @intCast(min_leading_spaces)));
+        const new_close_spaces: usize = @intCast(@as(isize, @intCast(close_prefix.len)) + eff_delta);
+        try self.out.appendNTimes(self.allocator, ' ', new_close_spaces);
+        try self.out.appendSlice(self.allocator, parsed.close_delim);
+        self.current_line_indent = @intCast(new_close_spaces);
+        self.current_col = @intCast(new_close_spaces + parsed.close_delim.len);
+        self.is_at_line_start = false;
+        self.consecutive_newlines = 0;
     }
 
     /// Flushes all queued `line_suffix` comments and emits a line break (or blank line).
@@ -426,6 +603,7 @@ pub const DocRenderer = struct {
         if (self.line_suffix_queue.items.len > 0) {
             if (self.is_at_line_start) {
                 try self.out.appendNTimes(self.allocator, ' ', self.pending_indent_spaces);
+                self.current_line_indent = self.pending_indent_spaces;
                 self.current_col = self.pending_indent_spaces;
                 self.is_at_line_start = false;
                 self.consecutive_newlines = 0;
@@ -447,6 +625,7 @@ pub const DocRenderer = struct {
         // [2] Avoid emitting leading newlines at the very start of the file:
         if (self.out.items.len == 0) {
             self.current_col = 0;
+            self.current_line_indent = 0;
             self.is_at_line_start = true;
             self.pending_indent_spaces = self.indent_spaces;
             return;
@@ -464,6 +643,7 @@ pub const DocRenderer = struct {
         }
 
         self.current_col = 0;
+        self.current_line_indent = 0;
         self.is_at_line_start = true;
         self.pending_indent_spaces = self.indent_spaces;
     }
@@ -476,6 +656,7 @@ pub const DocRenderer = struct {
         self.indent_spaces = 0;
         self.current_col = 0;
         self.pending_indent_spaces = 0;
+        self.current_line_indent = 0;
         self.consecutive_newlines = 0;
         self.is_at_line_start = true;
 
@@ -490,6 +671,7 @@ pub const DocRenderer = struct {
                     if (raw_slice.len == 0) continue;
                     if (self.is_at_line_start and raw_slice[0] != ' ' and raw_slice[0] != '\t') {
                         try self.out.appendNTimes(self.allocator, ' ', self.pending_indent_spaces);
+                        self.current_line_indent = self.pending_indent_spaces;
                         self.current_col = self.pending_indent_spaces;
                     }
                     self.is_at_line_start = false;
@@ -499,6 +681,7 @@ pub const DocRenderer = struct {
                         try self.out.append(self.allocator, byte_val);
                         if (byte_val == '\n') {
                             self.current_col = 0;
+                            self.current_line_indent = 0;
                             self.is_at_line_start = true;
                             self.pending_indent_spaces = self.indent_spaces;
                             if (self.consecutive_newlines < 2) self.consecutive_newlines += 1;
@@ -508,6 +691,9 @@ pub const DocRenderer = struct {
                             self.consecutive_newlines = 0;
                         }
                     }
+                },
+                .multiline_string => {
+                    try self.renderMultilineString(arena.multiline_strings.items[inst.payload]);
                 },
                 .line => {
                     if (self.isCurrentGroupBroken()) {
@@ -706,6 +892,68 @@ const UseSpecEntry = struct {
     }
 };
 
+/// Parsed prefix, body, and closing delimiter slices of a multiline `"""…"""` literal (`DR-22` §3.4).
+const ParsedMultilineLiteral = struct {
+    /// Opening prefix through `"""` (e.g., `"""`, `r#"""`, `b"""`, `br#"""`), plus any horizontal spaces before `\n`.
+    open_header: []const u8,
+    /// Raw body bytes strictly after the opening `\r?\n` and before the closing `"""[#*]`.
+    body_after_open_nl: []const u8,
+    /// Closing delimiter slice (`"""` followed by matching `#` count).
+    close_delim: []const u8,
+    /// Whether the literal uses raw `r` / `br` escaping rules.
+    is_raw: bool,
+    /// Whether the literal uses byte `b` / `br` prefix rules.
+    is_byte: bool,
+};
+
+/// Sortable entry for parameterless `@marker` attributes (`@inline @no_alloc @no_panic`, `DR-22` §3.4).
+const MarkerAttrEntry = struct {
+    /// CST node index of the parameterless `.attribute` node.
+    node_idx: CstNodeIndex,
+    /// Attribute identifier lexeme used for lexicographical ASCII sorting.
+    sort_name: []const u8,
+    /// Original 0-based position for deterministic tie-breaking on duplicate markers.
+    orig_order: usize,
+
+    /// Compares two `MarkerAttrEntry` items lexicographically by `sort_name`.
+    pub fn lessThan(_: void, lhs: MarkerAttrEntry, rhs: MarkerAttrEntry) bool {
+        const cmp = std.mem.order(u8, lhs.sort_name, rhs.sort_name);
+        if (cmp != .eq) return cmp == .lt;
+        return lhs.orig_order < rhs.orig_order;
+    }
+};
+
+/// Precedence tiers of the unified 4-tier `Type` grammar (`DR-22` Sections 1.3 & 3.3).
+const TypePrec = enum(u8) {
+    /// Unparenthesized open context (`|`, `+`, `is`/`where`, `distinct`).
+    tier0_open = 0,
+    /// Non-associative `Ok ! Err` result type (`Tier 1`).
+    tier1_result = 1,
+    /// Prefix `&T`, `&mut T`, `&out T`, `own T`, `~T` (`Tier 2`).
+    tier2_prefix = 2,
+    /// Postfix `T?` optional type (`Tier 3`).
+    tier3_postfix = 3,
+    /// Atomic/primary types (`T`, `&[T]`, `*T`, `*mut T`, `[T; N]`, `(T, U)`, `fn()`, `|…|`) (`Tier 4`).
+    tier4_primary = 4,
+};
+
+/// Canonicalizable standard-library `Option[T]` or `Result[T, E]` generic `.named_type` (`DR-22` §3.4).
+const CanonicalStdlibType = union(enum) {
+    /// `Option[T]` rewritable to `T?`.
+    option: struct {
+        name_tok: TokenIndex,
+        close_bracket_tok: TokenIndex,
+        inner_type_id: CstNodeIndex,
+    },
+    /// `Result[T, E]` rewritable to `T!E`.
+    result: struct {
+        name_tok: TokenIndex,
+        close_bracket_tok: TokenIndex,
+        ok_type_id: CstNodeIndex,
+        err_type_id: CstNodeIndex,
+    },
+};
+
 // --------------------------------------- CONSTS ----------------------------------------
 
 /// Canonical maximum column width for `corex fmt` (`DR-03` Section 7 & `DR-14` Section 1.2).
@@ -722,6 +970,293 @@ pub const COLUMNAR_GRID_MIN_ELEMENTS: usize = 9;
 pub const COLUMNAR_GRID_MAX_COLS: usize = 8;
 
 // -------------------------------------- INTERNALS --------------------------------------
+
+// ---------------- Multiline String Indentation ----------------
+
+/// Returns whether `slice[start_idx..]` begins with at least `expected_hashes` `'#'` bytes.
+inline fn hasHashPrefixAt(slice: []const u8, start_idx: usize, expected_hashes: usize) bool {
+    if (start_idx + expected_hashes > slice.len) return false;
+    var hash_idx: usize = 0;
+    while (hash_idx < expected_hashes) : (hash_idx += 1) {
+        if (slice[start_idx + hash_idx] != '#') return false;
+    }
+    return true;
+}
+
+/// Returns whether `slice[quote_pos..]` opens a multiline `"""` literal rather than single-line `r#""…""#`.
+inline fn isTripleQuoteRunOpening(
+    slice: []const u8,
+    quote_pos: usize,
+    is_raw: bool,
+    hash_count: usize,
+) bool {
+    var quote_run: usize = 0;
+    while (quote_pos + quote_run < slice.len and slice[quote_pos + quote_run] == '"') : (quote_run += 1) {}
+    if (quote_run < 3) return false;
+    if (is_raw and hash_count > 0 and hasHashPrefixAt(slice, quote_pos + quote_run, hash_count)) {
+        return false;
+    }
+    return true;
+}
+
+/// Splits a multiline triple-quoted string or byte-string `lexeme` (`[b][r[#*]]"""\r?\n…"""[#*]`), or returns `null`.
+fn extractMultilineTripleQuoteParts(lexeme: []const u8) ?ParsedMultilineLiteral {
+    if (lexeme.len < 7) return null;
+    var cursor: usize = 0;
+    var is_byte = false;
+    var is_raw = false;
+
+    if (lexeme[cursor] == 'b') {
+        is_byte = true;
+        cursor += 1;
+    }
+    if (cursor < lexeme.len and lexeme[cursor] == 'r') {
+        is_raw = true;
+        cursor += 1;
+    }
+    var hash_count: usize = 0;
+    if (is_raw) {
+        while (cursor < lexeme.len and lexeme[cursor] == '#') : (cursor += 1) {
+            hash_count += 1;
+        }
+    }
+    if (cursor + 6 + hash_count > lexeme.len) return null;
+    if (!isTripleQuoteRunOpening(lexeme, cursor, is_raw, hash_count)) return null;
+
+    const close_len: usize = 3 + hash_count;
+    const close_pos: usize = lexeme.len - close_len;
+    if (!hasHashPrefixAt(lexeme, lexeme.len - hash_count, hash_count)) return null;
+    if (lexeme[close_pos] != '"' or lexeme[close_pos + 1] != '"' or lexeme[close_pos + 2] != '"') return null;
+
+    // Require an opening line break immediately after `"""` (allowing horizontal whitespace before `\r?\n`):
+    var header_end: usize = cursor + 3;
+    while (header_end < close_pos and (lexeme[header_end] == ' ' or lexeme[header_end] == '\t')) : (header_end += 1) {}
+    var body_start: usize = header_end;
+    if (body_start < close_pos and lexeme[body_start] == '\r') {
+        body_start += 1;
+    }
+    if (body_start >= close_pos or lexeme[body_start] != '\n') return null;
+    body_start += 1;
+
+    return .{
+        .open_header = lexeme[0 .. cursor + 3],
+        .body_after_open_nl = lexeme[body_start..close_pos],
+        .close_delim = lexeme[close_pos..],
+        .is_raw = is_raw,
+        .is_byte = is_byte,
+    };
+}
+
+/// Returns whether `byte_val` is an ASCII identifier continuation character (`[A-Za-z0-9_]`).
+inline fn isAsciiIdentContinueByte(byte_val: u8) bool {
+    return std.ascii.isAlphanumeric(byte_val) or byte_val == '_';
+}
+
+/// Skips a non-interpolated `'…'`, `b'…'`, `b"…"`, or `b"""…"""` literal inside an `{expr}` scan.
+fn skipQuotedLiteralInHole(
+    body_bytes: []const u8,
+    after_open_idx: usize,
+    quote_byte: u8,
+    is_triple: bool,
+) usize {
+    var cursor = after_open_idx;
+    while (cursor < body_bytes.len) {
+        if (body_bytes[cursor] == '\\') {
+            cursor = @min(cursor + 2, body_bytes.len);
+            continue;
+        }
+        if (body_bytes[cursor] == quote_byte) {
+            if (is_triple) {
+                if (cursor + 2 < body_bytes.len and
+                    body_bytes[cursor + 1] == quote_byte and
+                    body_bytes[cursor + 2] == quote_byte)
+                {
+                    return cursor + 3;
+                }
+                cursor += 1;
+                continue;
+            }
+            return cursor + 1;
+        }
+        cursor += 1;
+    }
+    return body_bytes.len;
+}
+
+/// Skips a raw `r#"…"#` or `r#"""…"""#` string literal inside an `{expr}` scan (`after_r_idx` points past `'r'`).
+fn skipRawStringInHole(body_bytes: []const u8, after_r_idx: usize) usize {
+    var cursor = after_r_idx;
+    var hash_count: usize = 0;
+    while (cursor < body_bytes.len and body_bytes[cursor] == '#') : (cursor += 1) {
+        hash_count += 1;
+    }
+    if (cursor >= body_bytes.len or body_bytes[cursor] != '"') return cursor;
+    const is_triple = isTripleQuoteRunOpening(body_bytes, cursor, true, hash_count);
+    const quote_len: usize = if (is_triple) 3 else 1;
+    cursor += quote_len;
+
+    while (cursor < body_bytes.len) {
+        if (body_bytes[cursor] == '"') {
+            if (is_triple) {
+                if (cursor + 2 < body_bytes.len and
+                    body_bytes[cursor + 1] == '"' and
+                    body_bytes[cursor + 2] == '"' and
+                    hasHashPrefixAt(body_bytes, cursor + 3, hash_count))
+                {
+                    return cursor + 3 + hash_count;
+                }
+                cursor += 1;
+                continue;
+            }
+            if (hasHashPrefixAt(body_bytes, cursor + 1, hash_count)) {
+                return cursor + 1 + hash_count;
+            }
+        }
+        cursor += 1;
+    }
+    return body_bytes.len;
+}
+
+/// Skips an interpolated `"…"` or `"""…"""` literal nested inside an `{expr}` scan.
+fn skipInterpolatedStringInHole(body_bytes: []const u8, after_open_idx: usize, is_triple: bool) usize {
+    var cursor = after_open_idx;
+    while (cursor < body_bytes.len) {
+        const cur_byte = body_bytes[cursor];
+        if (cur_byte == '\\') {
+            cursor = @min(cursor + 2, body_bytes.len);
+            continue;
+        }
+        if (cur_byte == '"') {
+            if (is_triple) {
+                if (cursor + 2 < body_bytes.len and
+                    body_bytes[cursor + 1] == '"' and
+                    body_bytes[cursor + 2] == '"')
+                {
+                    return cursor + 3;
+                }
+                cursor += 1;
+                continue;
+            }
+            return cursor + 1;
+        }
+        if (cur_byte == '{') {
+            if (cursor + 1 < body_bytes.len and body_bytes[cursor + 1] == '{') {
+                cursor += 2;
+                continue;
+            }
+            cursor = skipInterpolationHoleInMultiline(body_bytes, cursor);
+            continue;
+        }
+        cursor += 1;
+    }
+    return body_bytes.len;
+}
+
+/// Advances past a `{expr}` interpolation hole inside `body_bytes` starting at `open_brace_idx`.
+fn skipInterpolationHoleInMultiline(body_bytes: []const u8, open_brace_idx: usize) usize {
+    var cursor = open_brace_idx + 1;
+    var brace_depth: u32 = 1;
+    while (cursor < body_bytes.len and brace_depth > 0) {
+        const cur_byte = body_bytes[cursor];
+        if (cur_byte == '{') {
+            brace_depth += 1;
+            cursor += 1;
+        } else if (cur_byte == '}') {
+            brace_depth -= 1;
+            cursor += 1;
+        } else if (cur_byte == 'r' and
+            (cursor == 0 or !isAsciiIdentContinueByte(body_bytes[cursor - 1])) and
+            cursor + 1 < body_bytes.len and
+            (body_bytes[cursor + 1] == '"' or body_bytes[cursor + 1] == '#'))
+        {
+            cursor = skipRawStringInHole(body_bytes, cursor + 1);
+        } else if (cur_byte == 'b' and
+            (cursor == 0 or !isAsciiIdentContinueByte(body_bytes[cursor - 1])) and
+            cursor + 1 < body_bytes.len)
+        {
+            if (body_bytes[cursor + 1] == '\'') {
+                cursor = skipQuotedLiteralInHole(body_bytes, cursor + 2, '\'', false);
+            } else if (body_bytes[cursor + 1] == '"') {
+                const is_triple = cursor + 3 < body_bytes.len and
+                    body_bytes[cursor + 2] == '"' and
+                    body_bytes[cursor + 3] == '"';
+                const step: usize = if (is_triple) 4 else 2;
+                cursor = skipQuotedLiteralInHole(body_bytes, cursor + step, '"', is_triple);
+            } else if (body_bytes[cursor + 1] == 'r' and cursor + 2 < body_bytes.len and
+                (body_bytes[cursor + 2] == '"' or body_bytes[cursor + 2] == '#'))
+            {
+                cursor = skipRawStringInHole(body_bytes, cursor + 2);
+            } else {
+                cursor += 1;
+            }
+        } else if (cur_byte == '"') {
+            const is_triple = cursor + 2 < body_bytes.len and
+                body_bytes[cursor + 1] == '"' and
+                body_bytes[cursor + 2] == '"';
+            const step: usize = if (is_triple) 3 else 1;
+            cursor = skipInterpolatedStringInHole(body_bytes, cursor + step, is_triple);
+        } else if (cur_byte == '\'') {
+            cursor = skipQuotedLiteralInHole(body_bytes, cursor + 1, '\'', false);
+        } else if (cur_byte == '/' and cursor + 1 < body_bytes.len) {
+            if (body_bytes[cursor + 1] == '/') {
+                cursor += 2;
+                while (cursor < body_bytes.len and body_bytes[cursor] != '\n' and body_bytes[cursor] != '\r') {
+                    cursor += 1;
+                }
+            } else if (body_bytes[cursor + 1] == '*') {
+                cursor += 2;
+                var comment_depth: u32 = 1;
+                while (cursor < body_bytes.len and comment_depth > 0) {
+                    if (body_bytes[cursor] == '/' and cursor + 1 < body_bytes.len and body_bytes[cursor + 1] == '*') {
+                        comment_depth += 1;
+                        cursor += 2;
+                    } else if (body_bytes[cursor] == '*' and cursor + 1 < body_bytes.len and body_bytes[cursor + 1] == '/') {
+                        comment_depth -= 1;
+                        cursor += 2;
+                    } else {
+                        cursor += 1;
+                    }
+                }
+            } else {
+                cursor += 1;
+            }
+        } else {
+            cursor += 1;
+        }
+    }
+    return cursor;
+}
+
+/// Scans `body_bytes` from `start_pos` for the next outer `\n`, skipping `{expr}` holes when enabled.
+fn findNextOuterLineFeedInMultiline(
+    body_bytes: []const u8,
+    start_pos: usize,
+    is_raw: bool,
+    is_interpolation_allowed: bool,
+) ?usize {
+    var cursor = start_pos;
+    while (cursor < body_bytes.len) {
+        const cur_byte = body_bytes[cursor];
+        if (cur_byte == '\n') return cursor;
+        if (!is_raw and cur_byte == '\\' and cursor + 1 < body_bytes.len) {
+            const next_byte = body_bytes[cursor + 1];
+            if (next_byte != '\n' and next_byte != '\r') {
+                cursor += 2;
+                continue;
+            }
+        }
+        if (is_interpolation_allowed and !is_raw and cur_byte == '{') {
+            if (cursor + 1 < body_bytes.len and body_bytes[cursor + 1] == '{') {
+                cursor += 2;
+                continue;
+            }
+            cursor = skipInterpolationHoleInMultiline(body_bytes, cursor);
+            continue;
+        }
+        cursor += 1;
+    }
+    return null;
+}
 
 // --------------- Trivia & Suppression Pre-Pass ----------------
 
@@ -1138,6 +1673,7 @@ fn isFixableMissingSemicolonNode(
         .return_stmt,
         .break_stmt,
         .continue_stmt,
+        .yield_stmt,
         .defer_stmt,
         .assign_stmt,
         .expr_stmt,
@@ -1146,6 +1682,7 @@ fn isFixableMissingSemicolonNode(
         .type_alias_item,
         .mod_item,
         .fn_item,
+        .subscript_item,
         .trait_member,
         .impl_member,
         => {},
@@ -1685,6 +2222,25 @@ const CstFormatter = struct {
         }
     }
 
+    /// Computes the leading horizontal column indentation of the line containing `byte_offset` in `self.source`.
+    fn computeLineIndentAtByte(self: *const CstFormatter, byte_offset: u32) u32 {
+        const clamped_off: usize = @min(self.source.len, @as(usize, byte_offset));
+        var line_start: usize = clamped_off;
+        while (line_start > 0 and self.source[line_start - 1] != '\n') : (line_start -= 1) {}
+        var indent_cols: u32 = 0;
+        var scan_idx: usize = line_start;
+        while (scan_idx < self.source.len) : (scan_idx += 1) {
+            if (self.source[scan_idx] == ' ') {
+                indent_cols += 1;
+            } else if (self.source[scan_idx] == '\t') {
+                indent_cols += INDENT_SPACES;
+            } else {
+                break;
+            }
+        }
+        return indent_cols;
+    }
+
     /// Emits `tok_id`'s leading trivia and glyph text without consuming its trailing trivia yet.
     fn emitTokenLeadingAndGlyph(
         self: *CstFormatter,
@@ -1700,6 +2256,29 @@ const CstFormatter = struct {
         if (override_text) |custom_str| {
             try self.doc_arena.emitText(custom_str);
         } else if (!rec.flags.is_synthesized and rec.kind != .eof) {
+            if (!rec.flags.has_lexer_error and (rec.kind == .int_lit or rec.kind == .float_lit)) {
+                const raw_num = self.getTokenLexeme(tok_id);
+                if (lexer.extractNumericSuffix(raw_num)) |parsed_num| {
+                    if (parsed_num.suffix_type != null and !parsed_num.has_underscore_sep) {
+                        try self.doc_arena.emitText(parsed_num.digits_slice);
+                        try self.doc_arena.emitText("_");
+                        try self.doc_arena.emitText(parsed_num.suffix_slice);
+                        return;
+                    }
+                } else |_| {}
+            }
+            if (!rec.flags.has_lexer_error and
+                (rec.kind == .string_lit or rec.kind == .byte_string_lit))
+            {
+                const raw_str = self.getTokenLexeme(tok_id);
+                if (extractMultilineTripleQuoteParts(raw_str) != null) {
+                    try self.doc_arena.emitMultilineString(
+                        raw_str,
+                        self.computeLineIndentAtByte(rec.byte_offset),
+                    );
+                    return;
+                }
+            }
             try self.doc_arena.emitText(self.resolveIdentifierFixText(tok_id, rec.kind));
         }
     }
@@ -1947,14 +2526,49 @@ const CstFormatter = struct {
         return false;
     }
 
+    /// Returns `true` if `node_idx` (`.fn_item`) carries `@constructor` or `@builder_item` (`SE-22`).
+    fn hasPascalExemptFnAttr(self: *const CstFormatter, node_idx: CstNodeIndex) bool {
+        const node = self.cst_arena.getNode(node_idx);
+        const end_idx: usize = node_idx.asInt() + node.subtree_size;
+        var child_cursor: usize = node_idx.asInt() + 1;
+        while (child_cursor < end_idx) {
+            const child_id = CstNodeIndex.fromInt(@intCast(child_cursor));
+            const child = self.cst_arena.getNode(child_id);
+            if (child.kind == .attribute) {
+                const attr_end: usize = child_cursor + child.subtree_size;
+                var tok_cursor: usize = child_cursor + 1;
+                while (tok_cursor < attr_end) : (tok_cursor += 1) {
+                    const leaf = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(tok_cursor)));
+                    if (leaf.subtree_size == 1 and !leaf.token.isNone()) {
+                        const kind = self.token_buffer.getToken(leaf.token).kind;
+                        if (kind == .at) continue;
+                        const lex = self.getTokenLexeme(leaf.token);
+                        if (std.mem.eql(u8, lex, "constructor") or std.mem.eql(u8, lex, "builder_item")) {
+                            return true;
+                        }
+                        break;
+                    }
+                }
+            }
+            child_cursor += @max(@as(usize, 1), child.subtree_size);
+        }
+        return false;
+    }
+
     /// Pre-scans declarations in `--fix` mode to build the `old_name -> new_name` casing rename map.
     fn collectFixRenames(self: *CstFormatter, root_idx: CstNodeIndex) !void {
         const total_nodes = self.cst_arena.countNodes();
+        var exempt_fn_end_idx: usize = 0;
         var idx: usize = root_idx.asInt();
         while (idx < total_nodes) : (idx += 1) {
             const node_id = CstNodeIndex.fromInt(@intCast(idx));
             const node = self.cst_arena.getNode(node_id);
             switch (node.kind) {
+                .fn_item => {
+                    if (self.hasPascalExemptFnAttr(node_id)) {
+                        exempt_fn_end_idx = idx + @max(@as(usize, 1), node.subtree_size);
+                    }
+                },
                 .struct_item, .union_item, .enum_item, .trait_item, .type_alias_item => {
                     if (self.findDeclIdentifierToken(node_id)) |tok_id| {
                         try self.registerFixRename(tok_id, .pascal_case);
@@ -1979,7 +2593,16 @@ const CstFormatter = struct {
                         try self.registerFixRename(tok_id, .screaming_snake_case);
                     }
                 },
-                .fn_sig, .struct_field, .fn_param, .closure_param, .mod_item, .loop_label, .at_pat => {
+                .fn_sig => {
+                    if (self.findFirstIdentTokenInDirectChildren(node_id)) |tok_id| {
+                        const is_pascal_exempt = idx < exempt_fn_end_idx and
+                            self.token_buffer.getToken(tok_id).kind == .type_ident;
+                        if (!is_pascal_exempt) {
+                            try self.registerFixRename(tok_id, .snake_case);
+                        }
+                    }
+                },
+                .struct_field, .fn_param, .closure_param, .mod_item, .loop_label, .at_pat => {
                     if (self.findFirstIdentTokenInDirectChildren(node_id)) |tok_id| {
                         try self.registerFixRename(tok_id, .snake_case);
                     }
@@ -2296,12 +2919,12 @@ const CstFormatter = struct {
         }
     }
 
-    /// Returns whether `node_idx` is a bodyless trait member signature (`type`, `const`, or `fn …;`).
+    /// Returns whether `node_idx` is a bodyless trait member signature (`type`, `const`, `fn …;`, or `subscript …;`).
     fn isCompactTraitSignatureItem(self: *const CstFormatter, node_idx: CstNodeIndex) bool {
         const node = self.cst_arena.getNode(node_idx);
         return switch (node.kind) {
             .type_alias_item, .const_item => true,
-            .trait_member, .fn_item => !self.hasDirectChildKind(node_idx, .block) and
+            .trait_member, .fn_item, .subscript_item => !self.hasDirectChildKind(node_idx, .block) and
                 !self.hasDirectChildKind(node_idx, .fn_expr_body),
             else => false,
         };
@@ -2330,6 +2953,190 @@ const CstFormatter = struct {
         const last_tok = self.findLastTokenInSubtree(node_idx);
         if (first_tok.isNone() or last_tok.isNone()) return;
         try self.flushUnconsumedCommentsInRange(first_tok.asInt(), last_tok.asInt() + 1, true);
+    }
+
+    /// Formats a `.visibility_modifier` CST node (`pub`, `pub(pkg)`, or `pub(super)`, `ADR-22E`).
+    fn formatVisibilityModifier(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
+        const node = self.cst_arena.getNode(node_idx);
+        if (node.subtree_size == 1) {
+            if (!self.shouldSkipLeaf(node)) {
+                try self.emitTokenWithTrivia(node.token, "pub", false);
+            }
+            return;
+        }
+
+        var children: std.ArrayList(CstNodeIndex) = .empty;
+        defer children.deinit(self.allocator);
+        try self.collectDirectChildren(node_idx, &children);
+
+        for (children.items) |child_id| {
+            const child = self.cst_arena.getNode(child_id);
+            if (child.subtree_size == 1 and !child.token.isNone()) {
+                const tok_kind = self.token_buffer.getToken(child.token).kind;
+                if (tok_kind == .kw_pub) {
+                    try self.emitTokenWithTrivia(child.token, "pub", false);
+                } else if (tok_kind == .lparen) {
+                    try self.emitTokenWithTrivia(child.token, "(", false);
+                } else if (tok_kind == .rparen) {
+                    try self.emitTokenWithTrivia(child.token, ")", false);
+                } else {
+                    const scope_lex = self.getTokenLexeme(child.token);
+                    try self.emitTokenWithTrivia(child.token, scope_lex, false);
+                }
+            } else {
+                try self.formatNode(child_id);
+            }
+        }
+    }
+
+    /// Extracts the identifier name of an `.attribute` CST node (`@inline` -> `"inline"`).
+    fn extractAttributeSortName(self: *const CstFormatter, attr_id: CstNodeIndex) []const u8 {
+        const attr_node = self.cst_arena.getNode(attr_id);
+        const end_idx: usize = attr_id.asInt() + attr_node.subtree_size;
+        var cursor: usize = attr_id.asInt() + 1;
+        while (cursor < end_idx) : (cursor += 1) {
+            const leaf = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cursor)));
+            if (leaf.subtree_size == 1 and !self.shouldSkipLeaf(leaf)) {
+                const tok_kind = self.token_buffer.getToken(leaf.token).kind;
+                if (tok_kind != .at) {
+                    return self.getTokenLexeme(leaf.token);
+                }
+            }
+        }
+        return "";
+    }
+
+    /// Formats leading `.attribute` children on items/members: stacks `@attr(…)` above sorted `@marker` line (`DR-22` §3.4).
+    fn formatLeadingStackedAttributes(
+        self: *CstFormatter,
+        children: []const CstNodeIndex,
+    ) anyerror!usize {
+        var attr_end: usize = 0;
+        while (attr_end < children.len and self.cst_arena.getNode(children[attr_end]).kind == .attribute) {
+            attr_end += 1;
+        }
+        if (attr_end == 0) return 0;
+        if (attr_end == 1) {
+            try self.formatAttribute(children[0]);
+            try self.doc_arena.emitHardLine();
+            return 1;
+        }
+
+        const first_tok = self.findFirstTokenInSubtree(children[0]);
+        const last_tok = self.findLastTokenInSubtree(children[attr_end - 1]);
+        if (!first_tok.isNone()) {
+            try self.emitLeadingTrivia(first_tok, false);
+        }
+
+        const has_inner_comments = !first_tok.isNone() and !last_tok.isNone() and
+            (self.hasUnconsumedCommentsInTokenRange(first_tok.asInt(), last_tok.asInt(), true, true) or
+                (!self.token_meta[last_tok.asInt()].is_trailing_consumed and
+                    self.token_meta[last_tok.asInt()].has_trailing_comments));
+
+        if (has_inner_comments) {
+            for (children[0..attr_end]) |attr_id| {
+                try self.formatAttribute(attr_id);
+                try self.doc_arena.emitHardLine();
+            }
+            return attr_end;
+        }
+
+        var param_attrs: std.ArrayList(CstNodeIndex) = .empty;
+        defer param_attrs.deinit(self.allocator);
+        var marker_attrs: std.ArrayList(MarkerAttrEntry) = .empty;
+        defer marker_attrs.deinit(self.allocator);
+
+        for (children[0..attr_end], 0..) |attr_id, order_i| {
+            if (self.hasDirectTokenKind(attr_id, .lparen)) {
+                try param_attrs.append(self.allocator, attr_id);
+            } else {
+                try marker_attrs.append(self.allocator, .{
+                    .node_idx = attr_id,
+                    .sort_name = self.extractAttributeSortName(attr_id),
+                    .orig_order = order_i,
+                });
+            }
+        }
+        std.mem.sort(MarkerAttrEntry, marker_attrs.items, {}, MarkerAttrEntry.lessThan);
+
+        for (param_attrs.items) |param_attr_id| {
+            try self.formatAttribute(param_attr_id);
+            try self.doc_arena.emitHardLine();
+        }
+        if (marker_attrs.items.len > 0) {
+            for (marker_attrs.items, 0..) |entry, marker_i| {
+                if (marker_i > 0) {
+                    try self.doc_arena.emitText(" ");
+                }
+                try self.formatAttribute(entry.node_idx);
+            }
+            try self.doc_arena.emitHardLine();
+        }
+        return attr_end;
+    }
+
+    /// Formats leading inline `.attribute` children (`@builder |…|`, `@unused x: i32`, `@state var x`), sorting markers.
+    fn formatLeadingInlineAttributes(
+        self: *CstFormatter,
+        children: []const CstNodeIndex,
+    ) anyerror!usize {
+        var attr_end: usize = 0;
+        while (attr_end < children.len and self.cst_arena.getNode(children[attr_end]).kind == .attribute) {
+            attr_end += 1;
+        }
+        if (attr_end == 0) return 0;
+        if (attr_end == 1) {
+            try self.formatAttribute(children[0]);
+            try self.doc_arena.emitText(" ");
+            return 1;
+        }
+
+        const first_tok = self.findFirstTokenInSubtree(children[0]);
+        const last_tok = self.findLastTokenInSubtree(children[attr_end - 1]);
+        if (!first_tok.isNone()) {
+            try self.emitLeadingTrivia(first_tok, false);
+        }
+
+        const has_inner_comments = !first_tok.isNone() and !last_tok.isNone() and
+            (self.hasUnconsumedCommentsInTokenRange(first_tok.asInt(), last_tok.asInt(), true, true) or
+                (!self.token_meta[last_tok.asInt()].is_trailing_consumed and
+                    self.token_meta[last_tok.asInt()].has_trailing_comments));
+
+        if (has_inner_comments) {
+            for (children[0..attr_end]) |attr_id| {
+                try self.formatAttribute(attr_id);
+                try self.doc_arena.emitText(" ");
+            }
+            return attr_end;
+        }
+
+        var param_attrs: std.ArrayList(CstNodeIndex) = .empty;
+        defer param_attrs.deinit(self.allocator);
+        var marker_attrs: std.ArrayList(MarkerAttrEntry) = .empty;
+        defer marker_attrs.deinit(self.allocator);
+
+        for (children[0..attr_end], 0..) |attr_id, order_i| {
+            if (self.hasDirectTokenKind(attr_id, .lparen)) {
+                try param_attrs.append(self.allocator, attr_id);
+            } else {
+                try marker_attrs.append(self.allocator, .{
+                    .node_idx = attr_id,
+                    .sort_name = self.extractAttributeSortName(attr_id),
+                    .orig_order = order_i,
+                });
+            }
+        }
+        std.mem.sort(MarkerAttrEntry, marker_attrs.items, {}, MarkerAttrEntry.lessThan);
+
+        for (param_attrs.items) |param_attr_id| {
+            try self.formatAttribute(param_attr_id);
+            try self.doc_arena.emitText(" ");
+        }
+        for (marker_attrs.items) |entry| {
+            try self.formatAttribute(entry.node_idx);
+            try self.doc_arena.emitText(" ");
+        }
+        return attr_end;
     }
 
     /// Formats an `@attribute` CST node (`@attr` or `@attr(args)`).
@@ -2366,23 +3173,24 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats a `.use_item` declaration (`[pub] use a.b.{…};`).
+    /// Formats a `.use_item` declaration (`[Vis] use a.b.{…};`).
     fn formatUseItem(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
         try self.collectDirectChildren(node_idx, &children);
 
+        const start_idx = try self.formatLeadingStackedAttributes(children.items);
         var has_emitted_semi = false;
-        for (children.items) |child_id| {
+        for (children.items[start_idx..]) |child_id| {
             const child = self.cst_arena.getNode(child_id);
-            if (child.kind == .attribute) {
-                try self.formatAttribute(child_id);
-                try self.doc_arena.emitHardLine();
+            if (child.kind == .visibility_modifier) {
+                try self.formatVisibilityModifier(child_id);
+                try self.doc_arena.emitText(" ");
                 continue;
             }
             if (child.subtree_size == 1 and !child.token.isNone()) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
-                if (child.kind == .visibility_modifier or tok_kind == .kw_pub) {
+                if (tok_kind == .kw_pub) {
                     try self.emitTokenWithTrivia(child.token, "pub", false);
                     try self.doc_arena.emitText(" ");
                 } else if (child.kind == .use_introducer or tok_kind == .kw_use) {
@@ -2567,23 +3375,24 @@ const CstFormatter = struct {
         try self.emitTokenWithTrivia(close_brace_tok, "}", false);
     }
 
-    /// Formats a `.const_item` declaration (`[pub] const NAME: Type = expr;`).
+    /// Formats a `.const_item` declaration (`[Vis] const NAME: Type = expr;`).
     fn formatConstItem(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
         try self.collectDirectChildren(node_idx, &children);
 
+        const start_idx = try self.formatLeadingStackedAttributes(children.items);
         var has_emitted_semi = false;
-        for (children.items) |child_id| {
+        for (children.items[start_idx..]) |child_id| {
             const child = self.cst_arena.getNode(child_id);
-            if (child.kind == .attribute) {
-                try self.formatAttribute(child_id);
-                try self.doc_arena.emitHardLine();
+            if (child.kind == .visibility_modifier) {
+                try self.formatVisibilityModifier(child_id);
+                try self.doc_arena.emitText(" ");
                 continue;
             }
             if (child.subtree_size == 1 and !child.token.isNone()) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
-                if (child.kind == .visibility_modifier or tok_kind == .kw_pub) {
+                if (tok_kind == .kw_pub) {
                     try self.emitTokenWithTrivia(child.token, "pub", false);
                     try self.doc_arena.emitText(" ");
                 } else if (child.kind == .const_introducer or tok_kind == .kw_const) {
@@ -2611,7 +3420,7 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats a `.type_alias_item` declaration (`[pub] type Name[T] = Target;`).
+    /// Formats a `.type_alias_item` declaration (`[Vis] type Name[T] = Target;`).
     fn formatTypeAliasItem(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
@@ -2633,17 +3442,18 @@ const CstFormatter = struct {
             return;
         }
 
+        const start_idx = try self.formatLeadingStackedAttributes(children.items);
         var has_emitted_semi = false;
-        for (children.items) |child_id| {
+        for (children.items[start_idx..]) |child_id| {
             const child = self.cst_arena.getNode(child_id);
-            if (child.kind == .attribute) {
-                try self.formatAttribute(child_id);
-                try self.doc_arena.emitHardLine();
+            if (child.kind == .visibility_modifier) {
+                try self.formatVisibilityModifier(child_id);
+                try self.doc_arena.emitText(" ");
                 continue;
             }
             if (child.subtree_size == 1 and !child.token.isNone()) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
-                if (child.kind == .visibility_modifier or tok_kind == .kw_pub) {
+                if (tok_kind == .kw_pub) {
                     try self.emitTokenWithTrivia(child.token, "pub", false);
                     try self.doc_arena.emitText(" ");
                 } else if (child.kind == .type_alias_introducer or tok_kind == .kw_type) {
@@ -2679,7 +3489,7 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats a `.mod_item` declaration (`[pub] mod name;` or `[pub] mod name { … }`).
+    /// Formats a `.mod_item` declaration (`[Vis] mod name;` or `[Vis] mod name { … }`).
     fn formatModItem(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
@@ -2697,17 +3507,18 @@ const CstFormatter = struct {
         }
 
         if (lbrace_pos == null or rbrace_pos == null) {
+            const start_idx = try self.formatLeadingStackedAttributes(children.items);
             var has_semi = false;
-            for (children.items) |child_id| {
+            for (children.items[start_idx..]) |child_id| {
                 const child = self.cst_arena.getNode(child_id);
-                if (child.kind == .attribute) {
-                    try self.formatAttribute(child_id);
-                    try self.doc_arena.emitHardLine();
+                if (child.kind == .visibility_modifier) {
+                    try self.formatVisibilityModifier(child_id);
+                    try self.doc_arena.emitText(" ");
                     continue;
                 }
                 if (child.subtree_size == 1 and !child.token.isNone()) {
                     const tok_kind = self.token_buffer.getToken(child.token).kind;
-                    if (child.kind == .visibility_modifier or tok_kind == .kw_pub) {
+                    if (tok_kind == .kw_pub) {
                         try self.emitTokenWithTrivia(child.token, "pub", false);
                         try self.doc_arena.emitText(" ");
                     } else if (child.kind == .mod_introducer or tok_kind == .kw_mod) {
@@ -2729,14 +3540,15 @@ const CstFormatter = struct {
 
         const lb_idx = lbrace_pos.?;
         const rb_idx = rbrace_pos.?;
-        for (children.items[0..lb_idx]) |child_id| {
+        const start_idx = try self.formatLeadingStackedAttributes(children.items[0..lb_idx]);
+        for (children.items[start_idx..lb_idx]) |child_id| {
             const child = self.cst_arena.getNode(child_id);
-            if (child.kind == .attribute) {
-                try self.formatAttribute(child_id);
-                try self.doc_arena.emitHardLine();
+            if (child.kind == .visibility_modifier) {
+                try self.formatVisibilityModifier(child_id);
+                try self.doc_arena.emitText(" ");
             } else if (child.subtree_size == 1 and !child.token.isNone()) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
-                if (child.kind == .visibility_modifier or tok_kind == .kw_pub) {
+                if (tok_kind == .kw_pub) {
                     try self.emitTokenWithTrivia(child.token, "pub", false);
                     try self.doc_arena.emitText(" ");
                 } else if (child.kind == .mod_introducer or tok_kind == .kw_mod) {
@@ -2781,7 +3593,7 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats a `.struct_item`, `.union_item`, or `.enum_item` declaration.
+    /// Formats a `.struct_item` (including `bit_field`), `.union_item`, or `.enum_item` declaration.
     fn formatStructOrUnionOrEnum(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
@@ -2799,16 +3611,17 @@ const CstFormatter = struct {
         }
 
         const header_end = lbrace_pos orelse children.items.len;
-        for (children.items[0..header_end]) |child_id| {
+        const start_idx = try self.formatLeadingStackedAttributes(children.items[0..header_end]);
+        for (children.items[start_idx..header_end]) |child_id| {
             const child = self.cst_arena.getNode(child_id);
-            if (child.kind == .attribute) {
-                try self.formatAttribute(child_id);
-                try self.doc_arena.emitHardLine();
+            if (child.kind == .visibility_modifier) {
+                try self.formatVisibilityModifier(child_id);
+                try self.doc_arena.emitText(" ");
                 continue;
             }
             if (child.subtree_size == 1 and !child.token.isNone()) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
-                if (child.kind == .visibility_modifier or tok_kind == .kw_pub) {
+                if (tok_kind == .kw_pub) {
                     try self.emitTokenWithTrivia(child.token, "pub", false);
                     try self.doc_arena.emitText(" ");
                 } else if (tok_kind == .kw_struct or tok_kind == .kw_union or
@@ -2903,23 +3716,24 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats a `.struct_field` node, normalizing any legacy `;` separator to `,`.
+    /// Formats a `.struct_field` node, ensuring a trailing `,` separator.
     fn formatStructField(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
         try self.collectDirectChildren(node_idx, &children);
 
+        const start_idx = try self.formatLeadingStackedAttributes(children.items);
         var has_emitted_comma = false;
-        for (children.items) |child_id| {
+        for (children.items[start_idx..]) |child_id| {
             const child = self.cst_arena.getNode(child_id);
-            if (child.kind == .attribute) {
-                try self.formatAttribute(child_id);
-                try self.doc_arena.emitHardLine();
+            if (child.kind == .visibility_modifier) {
+                try self.formatVisibilityModifier(child_id);
+                try self.doc_arena.emitText(" ");
                 continue;
             }
             if (child.subtree_size == 1 and !child.token.isNone()) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
-                if (child.kind == .visibility_modifier or tok_kind == .kw_pub) {
+                if (tok_kind == .kw_pub) {
                     try self.emitTokenWithTrivia(child.token, "pub", false);
                     try self.doc_arena.emitText(" ");
                 } else if (tok_kind == .colon) {
@@ -2948,7 +3762,7 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats an `.enum_variant` node, normalizing any `;` separator to `,`.
+    /// Formats an `.enum_variant` node, ensuring a trailing `,` separator.
     fn formatEnumVariant(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
@@ -2966,8 +3780,9 @@ const CstFormatter = struct {
             }
         }
 
+        const header_end = lbrace_pos orelse children.items.len;
+        var idx = try self.formatLeadingStackedAttributes(children.items[0..header_end]);
         var has_emitted_comma = false;
-        var idx: usize = 0;
         while (idx < children.items.len) : (idx += 1) {
             if (lbrace_pos != null and rbrace_pos != null and idx == lbrace_pos.?) {
                 const lb_idx = lbrace_pos.?;
@@ -2982,9 +3797,9 @@ const CstFormatter = struct {
                     try self.emitTokenWithTrivia(open_brace_tok, "{", false);
                     try self.doc_arena.beginIndent(INDENT_SPACES);
                     try self.doc_arena.emitHardLine();
-                    for (inner_fields, 0..) |f_id, f_i| {
-                        if (f_i > 0) try self.doc_arena.emitHardLine();
-                        try self.formatStructField(f_id);
+                    for (inner_fields, 0..) |field_id, field_i| {
+                        if (field_i > 0) try self.doc_arena.emitHardLine();
+                        try self.formatStructField(field_id);
                     }
                     try self.emitLeadingTriviaBeforeCloseBrace(close_brace_tok);
                     try self.doc_arena.endIndent(INDENT_SPACES);
@@ -3046,20 +3861,23 @@ const CstFormatter = struct {
         }
 
         const header_end = lbrace_pos orelse children.items.len;
+        const start_idx = try self.formatLeadingStackedAttributes(children.items[0..header_end]);
         {
             self.in_type_context += 1;
             defer self.in_type_context -= 1;
             var prev_was_impl_with_type_params = false;
-            for (children.items[0..header_end], 0..) |child_id, idx| {
+            var idx: usize = start_idx;
+            while (idx < header_end) : (idx += 1) {
+                const child_id = children.items[idx];
                 const child = self.cst_arena.getNode(child_id);
-                if (child.kind == .attribute) {
-                    try self.formatAttribute(child_id);
-                    try self.doc_arena.emitHardLine();
+                if (child.kind == .visibility_modifier) {
+                    try self.formatVisibilityModifier(child_id);
+                    try self.doc_arena.emitText(" ");
                     continue;
                 }
                 if (child.subtree_size == 1 and !child.token.isNone()) {
                     const tok_kind = self.token_buffer.getToken(child.token).kind;
-                    if (child.kind == .visibility_modifier or tok_kind == .kw_pub) {
+                    if (tok_kind == .kw_pub) {
                         try self.emitTokenWithTrivia(child.token, "pub", false);
                         try self.doc_arena.emitText(" ");
                     } else if (tok_kind == .kw_unsafe) {
@@ -3124,24 +3942,25 @@ const CstFormatter = struct {
         try self.emitTokenWithTrivia(close_brace_tok, "}", false);
     }
 
-    /// Formats a `.fn_item`, `.trait_member`, or `.impl_member` declaration.
+    /// Formats a `.fn_item`, `.trait_member`, or `.impl_member` declaration (`DR-22` §3.4).
     fn formatFnOrMember(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
         try self.collectDirectChildren(node_idx, &children);
 
+        const start_idx = try self.formatLeadingStackedAttributes(children.items);
         var has_block_body = false;
         var has_emitted_semi = false;
-        for (children.items) |child_id| {
+        for (children.items[start_idx..]) |child_id| {
             const child = self.cst_arena.getNode(child_id);
-            if (child.kind == .attribute) {
-                try self.formatAttribute(child_id);
-                try self.doc_arena.emitHardLine();
+            if (child.kind == .visibility_modifier) {
+                try self.formatVisibilityModifier(child_id);
+                try self.doc_arena.emitText(" ");
                 continue;
             }
             if (child.subtree_size == 1 and !child.token.isNone()) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
-                if (child.kind == .visibility_modifier or tok_kind == .kw_pub) {
+                if (tok_kind == .kw_pub) {
                     try self.emitTokenWithTrivia(child.token, "pub", false);
                     try self.doc_arena.emitText(" ");
                 } else if (tok_kind == .kw_async or tok_kind == .kw_unsafe or
@@ -3150,22 +3969,16 @@ const CstFormatter = struct {
                     try self.emitTokenWithTrivia(child.token, null, false);
                     try self.doc_arena.emitText(" ");
                 } else if (tok_kind == .string_lit) {
-                    try self.emitTokenWithTrivia(child.token, null, false);
+                    const abi_lex = self.getTokenLexeme(child.token);
+                    const abi_override: ?[]const u8 = if (std.ascii.eqlIgnoreCase(abi_lex, "\"c\""))
+                        "\"C\""
+                    else
+                        null;
+                    try self.emitTokenWithTrivia(child.token, abi_override, false);
                     try self.doc_arena.emitText(" ");
                 } else if (child.kind == .fn_introducer or tok_kind == .kw_fn) {
-                    const lex = self.getTokenLexeme(child.token);
-                    try self.emitTokenWithTrivia(child.token, null, false);
-                    if (std.mem.eql(u8, lex, "subscript")) {
-                        const next_tok = if (child.token.asInt() + 1 < self.token_buffer.countTokens())
-                            self.token_buffer.getToken(TokenIndex.fromInt(child.token.asInt() + 1)).kind
-                        else
-                            .eof;
-                        if (next_tok != .lparen and next_tok != .lbracket) {
-                            try self.doc_arena.emitText(" ");
-                        }
-                    } else {
-                        try self.doc_arena.emitText(" ");
-                    }
+                    try self.emitTokenWithTrivia(child.token, "fn", false);
+                    try self.doc_arena.emitText(" ");
                 } else if (tok_kind == .semi) {
                     try self.emitTokenWithTrivia(child.token, ";", false);
                     has_emitted_semi = true;
@@ -3173,7 +3986,7 @@ const CstFormatter = struct {
                     try self.emitTokenWithTrivia(child.token, null, false);
                 }
             } else if (child.kind == .fn_sig) {
-                try self.formatFnSig(child_id);
+                try self.formatFnSigWithOptions(child_id, true);
             } else if (child.kind == .fn_expr_body) {
                 has_emitted_semi = true;
                 try self.formatFnExprBody(child_id);
@@ -3187,6 +4000,117 @@ const CstFormatter = struct {
         }
         if (!has_block_body and !has_emitted_semi) {
             try self.doc_arena.emitText(";");
+        }
+    }
+
+    /// Formats a `.subscript_item` declaration (`[Vis] subscript[T](params) -> Type { let { … } inout { … } }`, `SE-21`).
+    fn formatSubscriptItem(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
+        var children: std.ArrayList(CstNodeIndex) = .empty;
+        defer children.deinit(self.allocator);
+        try self.collectDirectChildren(node_idx, &children);
+
+        const start_idx = try self.formatLeadingStackedAttributes(children.items);
+        var has_block_body = false;
+        var has_emitted_semi = false;
+        for (children.items[start_idx..]) |child_id| {
+            const child = self.cst_arena.getNode(child_id);
+            if (child.kind == .visibility_modifier) {
+                try self.formatVisibilityModifier(child_id);
+                try self.doc_arena.emitText(" ");
+                continue;
+            }
+            if (child.subtree_size == 1 and !child.token.isNone()) {
+                const tok_kind = self.token_buffer.getToken(child.token).kind;
+                if (tok_kind == .kw_pub) {
+                    try self.emitTokenWithTrivia(child.token, "pub", false);
+                    try self.doc_arena.emitText(" ");
+                } else if (child.kind == .subscript_introducer or tok_kind == .kw_subscript) {
+                    try self.emitTokenWithTrivia(child.token, "subscript", false);
+                } else if (tok_kind == .semi) {
+                    try self.emitTokenWithTrivia(child.token, ";", false);
+                    has_emitted_semi = true;
+                } else {
+                    try self.emitTokenWithTrivia(child.token, null, false);
+                }
+            } else if (child.kind == .fn_sig) {
+                try self.formatFnSigWithOptions(child_id, false);
+            } else if (child.kind == .block) {
+                has_block_body = true;
+                try self.doc_arena.emitText(" ");
+                try self.formatBlock(child_id);
+            } else {
+                try self.formatNode(child_id);
+            }
+        }
+        if (!has_block_body and !has_emitted_semi) {
+            try self.doc_arena.emitText(";");
+        }
+    }
+
+    /// Formats a `.subscript_arm` accessor block (`let { yield …; }` or `inout { yield …; }`, `SE-21`).
+    fn formatSubscriptArm(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
+        var children: std.ArrayList(CstNodeIndex) = .empty;
+        defer children.deinit(self.allocator);
+        try self.collectDirectChildren(node_idx, &children);
+
+        for (children.items) |child_id| {
+            const child = self.cst_arena.getNode(child_id);
+            if (child.subtree_size == 1 and !child.token.isNone()) {
+                const tok_kind = self.token_buffer.getToken(child.token).kind;
+                if (tok_kind == .kw_let) {
+                    try self.emitTokenWithTrivia(child.token, "let", false);
+                } else if (tok_kind == .ident and std.mem.eql(u8, self.getTokenLexeme(child.token), "inout")) {
+                    try self.emitTokenWithTrivia(child.token, "inout", false);
+                } else {
+                    try self.emitTokenWithTrivia(child.token, null, false);
+                }
+            } else if (child.kind == .block) {
+                try self.doc_arena.emitText(" ");
+                try self.formatBlock(child_id);
+            } else {
+                try self.formatNode(child_id);
+            }
+        }
+    }
+
+    /// Formats a `.test_item` or `.bench_item` declaration (`[async] test "…" [(params)] [-> Ret] { … }`, `SE-16`).
+    fn formatTestOrBenchItem(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
+        var children: std.ArrayList(CstNodeIndex) = .empty;
+        defer children.deinit(self.allocator);
+        try self.collectDirectChildren(node_idx, &children);
+
+        const start_idx = try self.formatLeadingStackedAttributes(children.items);
+        for (children.items[start_idx..]) |child_id| {
+            const child = self.cst_arena.getNode(child_id);
+            if (child.subtree_size == 1 and !child.token.isNone()) {
+                const tok_kind = self.token_buffer.getToken(child.token).kind;
+                if (tok_kind == .kw_async) {
+                    try self.emitTokenWithTrivia(child.token, "async", false);
+                    try self.doc_arena.emitText(" ");
+                } else if (child.kind == .test_introducer or
+                    (tok_kind == .ident and std.mem.eql(u8, self.getTokenLexeme(child.token), "test")))
+                {
+                    try self.emitTokenWithTrivia(child.token, "test", false);
+                    try self.doc_arena.emitText(" ");
+                } else if (child.kind == .bench_introducer or
+                    (tok_kind == .ident and std.mem.eql(u8, self.getTokenLexeme(child.token), "bench")))
+                {
+                    try self.emitTokenWithTrivia(child.token, "bench", false);
+                    try self.doc_arena.emitText(" ");
+                } else {
+                    try self.emitTokenWithTrivia(child.token, null, false);
+                }
+            } else if (child.kind == .param_list) {
+                try self.doc_arena.emitText(" ");
+                try self.formatParamList(child_id);
+            } else if (child.kind == .return_type) {
+                try self.formatReturnTypeWithOptions(child_id, true);
+            } else if (child.kind == .block) {
+                try self.doc_arena.emitText(" ");
+                try self.formatBlock(child_id);
+            } else {
+                try self.formatNode(child_id);
+            }
         }
     }
 
@@ -3291,8 +4215,17 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats a `.fn_sig` node (`name[T](params) -> Ret where …`).
+    /// Formats a `.fn_sig` node (`name[T](params) -> Ret where …`), stripping redundant `-> unit`.
     fn formatFnSig(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
+        try self.formatFnSigWithOptions(node_idx, true);
+    }
+
+    /// Formats a `.fn_sig` node, stripping `-> unit` when `is_unit_strip_allowed` is `true` (`false` on `subscript`).
+    fn formatFnSigWithOptions(
+        self: *CstFormatter,
+        node_idx: CstNodeIndex,
+        is_unit_strip_allowed: bool,
+    ) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
         try self.collectDirectChildren(node_idx, &children);
@@ -3306,7 +4239,7 @@ const CstFormatter = struct {
             } else if (child.kind == .param_list) {
                 try self.formatParamList(child_id);
             } else if (child.kind == .return_type) {
-                try self.formatReturnType(child_id);
+                try self.formatReturnTypeWithOptions(child_id, is_unit_strip_allowed);
             } else if (child.kind == .where_clause) {
                 try self.formatWhereClause(child_id);
             } else {
@@ -3315,11 +4248,67 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats a `.return_type` node (` -> Type` or `: Type` on `subscript`).
+    /// Returns whether `arrow_tok` + `type_node_id` is a comment-free `-> unit` return annotation (`DR-22` §3.4).
+    fn isStrippableUnitReturnPair(
+        self: *const CstFormatter,
+        arrow_tok: TokenIndex,
+        type_node_id: CstNodeIndex,
+    ) bool {
+        if (arrow_tok.isNone() or arrow_tok.asInt() >= self.token_meta.len) return false;
+        const type_node = self.cst_arena.getNode(type_node_id);
+        if (type_node.kind != .prim_type_node or type_node.subtree_size != 1 or type_node.token.isNone()) {
+            return false;
+        }
+        if (!std.mem.eql(u8, self.getTokenLexeme(type_node.token), "unit")) return false;
+        if (self.hasUnconsumedLeadingComments(arrow_tok)) return false;
+        const arrow_meta = self.token_meta[arrow_tok.asInt()];
+        if (!arrow_meta.is_trailing_consumed and arrow_meta.has_trailing_comments) return false;
+        if (self.hasUnconsumedLeadingComments(type_node.token)) return false;
+        return true;
+    }
+
+    /// Marks a stripped `-> unit` token pair as consumed while preserving any trailing comment on `unit`.
+    fn consumeStrippedUnitReturnPair(
+        self: *CstFormatter,
+        arrow_tok: TokenIndex,
+        type_node_id: CstNodeIndex,
+    ) !void {
+        const unit_tok = self.cst_arena.getNode(type_node_id).token;
+        self.token_meta[arrow_tok.asInt()].is_token_emitted = true;
+        self.token_meta[arrow_tok.asInt()].is_leading_consumed = true;
+        self.token_meta[arrow_tok.asInt()].is_trailing_consumed = true;
+        if (!unit_tok.isNone() and unit_tok.asInt() < self.token_meta.len) {
+            self.token_meta[unit_tok.asInt()].is_token_emitted = true;
+            self.token_meta[unit_tok.asInt()].is_leading_consumed = true;
+            try self.emitTrailingTrivia(unit_tok);
+        }
+    }
+
+    /// Formats a `.return_type` node (` -> Type`), omitting redundant `-> unit` by default (`DR-22` §3.4).
     fn formatReturnType(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
+        try self.formatReturnTypeWithOptions(node_idx, true);
+    }
+
+    /// Formats a `.return_type` node, stripping `-> unit` when `is_unit_strip_allowed` is `true`.
+    fn formatReturnTypeWithOptions(
+        self: *CstFormatter,
+        node_idx: CstNodeIndex,
+        is_unit_strip_allowed: bool,
+    ) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
         try self.collectDirectChildren(node_idx, &children);
+
+        if (is_unit_strip_allowed and children.items.len == 2) {
+            const first_child = self.cst_arena.getNode(children.items[0]);
+            if (first_child.subtree_size == 1 and !first_child.token.isNone() and
+                self.token_buffer.getToken(first_child.token).kind == .arrow and
+                self.isStrippableUnitReturnPair(first_child.token, children.items[1]))
+            {
+                try self.consumeStrippedUnitReturnPair(first_child.token, children.items[1]);
+                return;
+            }
+        }
 
         for (children.items) |child_id| {
             const child = self.cst_arena.getNode(child_id);
@@ -3341,24 +4330,22 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats a `.param_list` node (`(a: i32, b: String)`), respecting trailing-comma steerability.
+    /// Formats a `.param_list` node (including `/`, `*` zone separators and `...` variadics, `DR-22` §3.4).
     fn formatParamList(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
-        try self.formatSteerableDelimitedList(node_idx, .fn_param, .lparen, .rparen, "(", ")", false);
+        try self.formatSteerableDelimitedList(node_idx, null, .lparen, .rparen, "(", ")", false);
     }
 
-    /// Formats a single `.fn_param` node (`[&[mut] | mut] self` or `name: [mode] Type [= default]`).
+    /// Formats a single `.fn_param` node (`[var] [&[mut] | own] self` or `[var] name: Type [= default]`).
     fn formatFnParam(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
         try self.collectDirectChildren(node_idx, &children);
 
-        for (children.items, 0..) |child_id, idx| {
+        const start_idx = try self.formatLeadingInlineAttributes(children.items);
+        var idx: usize = start_idx;
+        while (idx < children.items.len) : (idx += 1) {
+            const child_id = children.items[idx];
             const child = self.cst_arena.getNode(child_id);
-            if (child.kind == .attribute) {
-                try self.formatAttribute(child_id);
-                try self.doc_arena.emitText(" ");
-                continue;
-            }
             if (child.subtree_size == 1 and !child.token.isNone()) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
                 if (tok_kind == .colon) {
@@ -3368,7 +4355,7 @@ const CstFormatter = struct {
                     try self.doc_arena.emitText(" ");
                     try self.emitTokenWithTrivia(child.token, "=", false);
                     try self.doc_arena.emitText(" ");
-                } else if (tok_kind == .kw_mut or tok_kind == .kw_own or tok_kind == .kw_ref or
+                } else if (tok_kind == .kw_var or tok_kind == .kw_mut or tok_kind == .kw_own or
                     tok_kind == .kw_let or tok_kind == .kw_comptime)
                 {
                     try self.emitTokenWithTrivia(child.token, null, false);
@@ -3608,11 +4595,15 @@ const CstFormatter = struct {
                 }
                 try self.doc_arena.emitLine();
             } else {
-                const is_single_elem_tuple = (node_idx.asInt() < self.cst_arena.countNodes() and
-                    self.cst_arena.getNode(node_idx).kind == .tuple_or_paren_expr and
-                    elements.items.len == 1 and has_trailing_comma);
-                if (is_single_elem_tuple) {
-                    try self.doc_arena.emitText(",");
+                const node_kind_opt: ?CstNodeKind = if (node_idx.asInt() < self.cst_arena.countNodes())
+                    self.cst_arena.getNode(node_idx).kind
+                else
+                    null;
+                const is_paren_or_tuple = (node_kind_opt == .tuple_or_paren_expr or node_kind_opt == .tuple_type);
+                if (is_paren_or_tuple and elements.items.len == 1) {
+                    if (has_trailing_comma) {
+                        try self.doc_arena.emitText(",");
+                    }
                 } else {
                     try self.doc_arena.emitIfBreak(",", "");
                 }
@@ -3661,12 +4652,10 @@ const CstFormatter = struct {
         }
         if (wrapper_kw_pos != null and inner_block_pos != null and wrapper_kw_pos.? < inner_block_pos.?) {
             const blk_idx = inner_block_pos.?;
-            for (children.items[0..blk_idx]) |prefix_id| {
+            const start_idx = try self.formatLeadingStackedAttributes(children.items[0..blk_idx]);
+            for (children.items[start_idx..blk_idx]) |prefix_id| {
                 const prefix = self.cst_arena.getNode(prefix_id);
-                if (prefix.kind == .attribute) {
-                    try self.formatAttribute(prefix_id);
-                    try self.doc_arena.emitHardLine();
-                } else if (prefix.subtree_size == 1 and !prefix.token.isNone()) {
+                if (prefix.subtree_size == 1 and !prefix.token.isNone()) {
                     try self.emitTokenWithTrivia(prefix.token, null, false);
                     try self.doc_arena.emitText(" ");
                 } else {
@@ -3784,23 +4773,56 @@ const CstFormatter = struct {
         try self.emitTokenWithTrivia(close_brace_tok, "}", false);
     }
 
-    /// Formats a `.local_decl_stmt` (`let [mut] pat [: Type] [= expr [else { … }]];`).
+    /// Formats a `.local_decl_stmt` (`[@state] (let | var) pat [: Type] [= expr [else { … }]];`).
     fn formatLocalDeclStmt(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
         try self.collectDirectChildren(node_idx, &children);
 
-        var has_emitted_semi = false;
-        for (children.items) |child_id| {
-            const child = self.cst_arena.getNode(child_id);
-            if (child.kind == .attribute) {
-                try self.formatAttribute(child_id);
-                try self.doc_arena.emitHardLine();
-                continue;
+        var attr_end: usize = 0;
+        var is_inline_attr_eligible = true;
+        while (attr_end < children.items.len and
+            self.cst_arena.getNode(children.items[attr_end]).kind == .attribute) : (attr_end += 1)
+        {
+            const attr_id = children.items[attr_end];
+            if (self.hasDirectTokenKind(attr_id, .lparen)) {
+                is_inline_attr_eligible = false;
             }
+            const first_tok = self.findFirstTokenInSubtree(attr_id);
+            const last_tok = self.findLastTokenInSubtree(attr_id);
+            if (!first_tok.isNone() and !last_tok.isNone() and
+                (self.token_meta[last_tok.asInt()].has_trailing_comments or
+                    self.hasUnconsumedCommentsInTokenRange(first_tok.asInt(), last_tok.asInt(), true, true)))
+            {
+                is_inline_attr_eligible = false;
+            }
+        }
+        if (attr_end > 0 and attr_end < children.items.len) {
+            const after_tok = self.findFirstTokenInSubtree(children.items[attr_end]);
+            if (after_tok.isNone() or
+                self.token_meta[after_tok.asInt()].has_leading_newline or
+                self.hasUnconsumedLeadingComments(after_tok))
+            {
+                is_inline_attr_eligible = false;
+            }
+        }
+        const start_idx = if (attr_end > 0 and is_inline_attr_eligible)
+            try self.formatLeadingInlineAttributes(children.items)
+        else
+            try self.formatLeadingStackedAttributes(children.items);
+
+        var has_decl_kw = false;
+        var has_emitted_semi = false;
+        for (children.items[start_idx..]) |child_id| {
+            const child = self.cst_arena.getNode(child_id);
             if (child.subtree_size == 1 and !child.token.isNone()) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
-                if (child.kind == .local_decl_introducer or tok_kind == .kw_let or tok_kind == .kw_var) {
+                if (child.kind == .local_decl_introducer or
+                    tok_kind == .kw_let or
+                    tok_kind == .kw_var or
+                    tok_kind == .kw_const)
+                {
+                    has_decl_kw = true;
                     try self.emitTokenWithTrivia(child.token, null, false);
                     try self.doc_arena.emitText(" ");
                 } else if (tok_kind == .kw_mut) {
@@ -3826,7 +4848,7 @@ const CstFormatter = struct {
                 try self.formatNode(child_id);
             }
         }
-        if (!has_emitted_semi) {
+        if (has_decl_kw and !has_emitted_semi) {
             try self.doc_arena.emitText(";");
         }
     }
@@ -3896,7 +4918,7 @@ const CstFormatter = struct {
             if (child.subtree_size == 1 and !child.token.isNone()) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
                 if (!has_emitted_kw and (tok_kind == .kw_return or tok_kind == .kw_break or
-                    tok_kind == .kw_continue or std.mem.eql(u8, self.getTokenLexeme(child.token), "yield")))
+                    tok_kind == .kw_continue or tok_kind == .kw_yield))
                 {
                     has_emitted_kw = true;
                     try self.emitTokenWithTrivia(child.token, null, false);
@@ -3928,14 +4950,9 @@ const CstFormatter = struct {
                 try self.formatNode(child_id);
             }
         }
-        // Only emit trailing `;` when `node_idx` is a statement (not `diverging_expr` or inline `yield`):
+        // Only emit trailing `;` when `node_idx` is a statement (not `diverging_expr`):
         if (has_required_semi and !has_emitted_semi) {
-            const first_tok = self.findFirstTokenInSubtree(node_idx);
-            const is_yield_expr = !first_tok.isNone() and
-                std.mem.eql(u8, self.getTokenLexeme(first_tok), "yield");
-            if (!is_yield_expr) {
-                try self.doc_arena.emitText(";");
-            }
+            try self.doc_arena.emitText(";");
         }
     }
 
@@ -4346,7 +5363,7 @@ const CstFormatter = struct {
                     try self.emitTokenWithTrivia(child.token, "&", false);
                     continue;
                 } else if (!has_seen_in and
-                    (tok_kind == .kw_mut or tok_kind == .kw_ref or tok_kind == .kw_own))
+                    (tok_kind == .kw_var or tok_kind == .kw_mut or tok_kind == .kw_own))
                 {
                     try self.emitTokenWithTrivia(child.token, null, false);
                     try self.doc_arena.emitText(" ");
@@ -4585,7 +5602,10 @@ const CstFormatter = struct {
 
         for (children.items[0..lb_idx]) |child_id| {
             const child = self.cst_arena.getNode(child_id);
-            if (child.subtree_size == 1 and !child.token.isNone() and
+            if (child.kind == .loop_label) {
+                try self.formatLoopLabel(child_id);
+                try self.doc_arena.emitText(" ");
+            } else if (child.subtree_size == 1 and !child.token.isNone() and
                 (child.kind == .match_introducer or
                     self.token_buffer.getToken(child.token).kind == .kw_match))
             {
@@ -4812,7 +5832,7 @@ const CstFormatter = struct {
         try self.emitTokenWithTrivia(close_tok, "}", false);
     }
 
-    /// Formats a `.field_init` (`name: expr`, shorthand `name`, or `..base`).
+    /// Formats a `.field_init` (`name: expr`, shorthand `name`, `..`, `..base`, or `..own base`).
     fn formatFieldInit(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
@@ -4824,6 +5844,9 @@ const CstFormatter = struct {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
                 if (tok_kind == .colon) {
                     try self.emitTokenWithTrivia(child.token, ":", false);
+                    try self.doc_arena.emitText(" ");
+                } else if (tok_kind == .kw_own) {
+                    try self.emitTokenWithTrivia(child.token, "own", false);
                     try self.doc_arena.emitText(" ");
                 } else if (tok_kind == .comma) {
                     self.token_meta[child.token.asInt()].is_token_emitted = true;
@@ -4869,12 +5892,28 @@ const CstFormatter = struct {
         return false;
     }
 
+    /// Returns the formatted byte length of `tok_id` (accounting for `42u64` -> `42_u64` suffix normalization).
+    fn measureTokenFormattedByteLen(self: *const CstFormatter, tok_id: TokenIndex) usize {
+        if (tok_id.isNone()) return 0;
+        const tok_rec = self.token_buffer.getToken(tok_id);
+        if (tok_rec.flags.is_synthesized) return 0;
+        var byte_len: usize = tok_rec.byte_len;
+        if (!tok_rec.flags.has_lexer_error and (tok_rec.kind == .int_lit or tok_rec.kind == .float_lit)) {
+            if (lexer.extractNumericSuffix(self.getTokenLexeme(tok_id))) |parsed| {
+                if (parsed.suffix_type != null and !parsed.has_underscore_sep) {
+                    byte_len += 1;
+                }
+            } else |_| {}
+        }
+        return byte_len;
+    }
+
     /// Measures the exact formatted column width of scalar literal element `elem_id`.
     fn measureScalarLiteralWidth(self: *const CstFormatter, elem_id: CstNodeIndex) usize {
         const root = self.cst_arena.getNode(elem_id);
         if (root.subtree_size == 1) {
             if (self.shouldSkipLeaf(root)) return 0;
-            return self.token_buffer.getToken(root.token).byte_len;
+            return self.measureTokenFormattedByteLen(root.token);
         }
         var total_bytes: usize = 0;
         const end_idx: usize = elem_id.asInt() + root.subtree_size;
@@ -4882,10 +5921,7 @@ const CstFormatter = struct {
         while (idx < end_idx) : (idx += 1) {
             const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(idx)));
             if (sub.subtree_size == 1 and !self.shouldSkipLeaf(sub)) {
-                const tok_rec = self.token_buffer.getToken(sub.token);
-                if (!tok_rec.flags.is_synthesized) {
-                    total_bytes += tok_rec.byte_len;
-                }
+                total_bytes += self.measureTokenFormattedByteLen(sub.token);
             }
         }
         return total_bytes;
@@ -5026,26 +6062,34 @@ const CstFormatter = struct {
         try self.formatSteerableDelimitedList(node_idx, null, .lparen, .rparen, "(", ")", false);
     }
 
-    /// Formats a `.closure_expr` (`|a: i32, b| expr` or `|| { … }`).
+    /// Formats a `.closure_expr` (`[@builder] [own] [async] |a: i32, b| [-> Ret] expr` or `|| { … }`).
     fn formatClosureExpr(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
         try self.collectDirectChildren(node_idx, &children);
 
+        const start_idx = try self.formatLeadingInlineAttributes(children.items);
         var pipe_count: usize = 0;
         var param_count: usize = 0;
-        for (children.items) |child_id| {
+        for (children.items[start_idx..], start_idx..) |child_id, idx| {
             const child = self.cst_arena.getNode(child_id);
+            const has_return_type_next = idx + 1 < children.items.len and
+                self.cst_arena.getNode(children.items[idx + 1]).kind == .return_type;
             if (child.subtree_size == 1 and !child.token.isNone()) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
-                if (tok_kind == .pipepipe) {
-                    try self.emitTokenWithTrivia(child.token, "||", false);
+                if (tok_kind == .kw_own or tok_kind == .kw_async) {
+                    try self.emitTokenWithTrivia(child.token, null, false);
                     try self.doc_arena.emitText(" ");
+                } else if (tok_kind == .pipepipe) {
+                    try self.emitTokenWithTrivia(child.token, "||", false);
+                    if (!has_return_type_next) {
+                        try self.doc_arena.emitText(" ");
+                    }
                     pipe_count = 2;
                 } else if (tok_kind == .pipe) {
                     pipe_count += 1;
                     try self.emitTokenWithTrivia(child.token, "|", false);
-                    if (pipe_count == 2) {
+                    if (pipe_count == 2 and !has_return_type_next) {
                         try self.doc_arena.emitText(" ");
                     }
                 } else if (tok_kind == .comma) {
@@ -5061,13 +6105,16 @@ const CstFormatter = struct {
                 param_count += 1;
             } else if (child.kind == .return_type) {
                 try self.formatReturnType(child_id);
+                if (idx + 1 < children.items.len) {
+                    try self.doc_arena.emitText(" ");
+                }
             } else {
                 try self.formatNode(child_id);
             }
         }
     }
 
-    /// Formats a `.closure_param` (`[mut] name [: Type]`).
+    /// Formats a `.closure_param` (`[var | &[mut] | own] name [: Type]`).
     fn formatClosureParam(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
@@ -5077,7 +6124,7 @@ const CstFormatter = struct {
             const child = self.cst_arena.getNode(child_id);
             if (child.subtree_size == 1 and !child.token.isNone()) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
-                if (tok_kind == .kw_mut or tok_kind == .kw_own or tok_kind == .kw_ref) {
+                if (tok_kind == .kw_var or tok_kind == .kw_mut or tok_kind == .kw_own) {
                     try self.emitTokenWithTrivia(child.token, null, false);
                     try self.doc_arena.emitText(" ");
                 } else if (tok_kind == .colon) {
@@ -5366,7 +6413,7 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats a `.prefix_expr` (`-x`, `!x`, `not x`, `~x`, `&x`, `&mut x`, `*x`, `..b`, `comptime expr`).
+    /// Formats a `.prefix_expr` (`-x`, `not x`, `~x`, `&x`, `&mut x`, `&out x`, `&raw [mut] x`, `own x`, `..b`).
     fn formatPrefixExpr(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
@@ -5376,7 +6423,7 @@ const CstFormatter = struct {
             const child = self.cst_arena.getNode(child_id);
             if (child.subtree_size == 1 and !child.token.isNone()) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
-                if ((tok_kind == .kw_mut or tok_kind == .kw_own or tok_kind == .kw_ref or
+                if ((tok_kind == .kw_mut or tok_kind == .kw_own or
                     tok_kind == .kw_let or tok_kind == .kw_not or tok_kind == .kw_comptime or
                     tok_kind == .ident) and
                     idx + 1 < children.items.len)
@@ -5398,7 +6445,7 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats a chain of `.field_or_method_expr`, `.postfix_try_expr`, and `.postfix_await_expr` nodes.
+    /// Formats a chain of `.field_or_method_expr`, `.postfix_deref_expr`, `.postfix_try_expr`, and `.postfix_await_expr`.
     fn formatPostfixChain(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var chain_nodes: std.ArrayList(CstNodeIndex) = .empty;
         defer chain_nodes.deinit(self.allocator);
@@ -5410,6 +6457,7 @@ const CstFormatter = struct {
         while (true) {
             const curr = self.cst_arena.getNode(curr_id);
             if (curr.kind != .field_or_method_expr and
+                curr.kind != .postfix_deref_expr and
                 curr.kind != .postfix_try_expr and
                 curr.kind != .postfix_await_expr)
             {
@@ -5601,9 +6649,295 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats a type CST node (`.ref_type`, `.ptr_type`, `.mode_type`, `.refined_type`, `.closure_type`, etc.).
-    fn formatTypeNode(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
+    /// Returns whether `node_idx` is a CST node representing a syntactic `Type` expression.
+    fn isTypeCstNode(self: *const CstFormatter, node_idx: CstNodeIndex) bool {
+        return switch (self.cst_arena.getNode(node_idx).kind) {
+            .prim_type_node,
+            .named_type,
+            .ref_type,
+            .ptr_type,
+            .mode_type,
+            .slice_or_array_type,
+            .tuple_type,
+            .fn_type,
+            .closure_type,
+            .optional_type,
+            .result_type,
+            .refined_type,
+            .intersect_bound_type,
+            .union_bound_type,
+            => true,
+            else => false,
+        };
+    }
+
+    /// Returns whether `node_idx` is a Tier 4 slice reference `&[T]` or `&mut [T]` (`DR-22` Section 1.3).
+    fn isSliceRefTypeNode(self: *const CstFormatter, node_idx: CstNodeIndex) bool {
         const node = self.cst_arena.getNode(node_idx);
+        if (node.kind != .ref_type or node.subtree_size <= 1) return false;
+        const end_idx: usize = node_idx.asInt() + node.subtree_size;
+        var target_id: CstNodeIndex = .none;
+        var cursor: usize = node_idx.asInt() + 1;
+        while (cursor < end_idx) {
+            const child_id = CstNodeIndex.fromInt(@intCast(cursor));
+            const child = self.cst_arena.getNode(child_id);
+            if (self.isTypeCstNode(child_id)) {
+                target_id = child_id;
+                break;
+            }
+            if (child.subtree_size == 1 and !self.shouldSkipLeaf(child)) {
+                const tok_kind = self.token_buffer.getToken(child.token).kind;
+                if (tok_kind != .amp and tok_kind != .kw_mut) return false;
+            }
+            cursor += @max(@as(usize, 1), child.subtree_size);
+        }
+        if (target_id.isNone()) return false;
+        if (self.cst_arena.getNode(target_id).kind != .slice_or_array_type) return false;
+        return !self.hasDirectTokenKind(target_id, .semi);
+    }
+
+    /// Matches comment-free `Option[T]` or `Result[T, E]` `.named_type` nodes for `T?` / `T!E` rewriting (`DR-22` §3.4).
+    fn matchCanonicalStdlibType(
+        self: *const CstFormatter,
+        node_idx: CstNodeIndex,
+    ) !?CanonicalStdlibType {
+        const node = self.cst_arena.getNode(node_idx);
+        if (node.kind != .named_type or node.subtree_size <= 1 or node.flags.has_error) return null;
+
+        var children: std.ArrayList(CstNodeIndex) = .empty;
+        defer children.deinit(self.allocator);
+        try self.collectDirectChildren(node_idx, &children);
+        if (children.items.len != 2) return null;
+
+        const name_child = self.cst_arena.getNode(children.items[0]);
+        const args_id = children.items[1];
+        const args_node = self.cst_arena.getNode(args_id);
+        if (name_child.subtree_size != 1 or name_child.token.isNone() or args_node.kind != .type_args or args_node.flags.has_error) {
+            return null;
+        }
+        const name_tok = name_child.token;
+        const name_rec = self.token_buffer.getToken(name_tok);
+        if (name_rec.flags.is_synthesized or name_rec.kind != .type_ident) return null;
+        const name_lex = self.getTokenLexeme(name_tok);
+        const is_option = std.mem.eql(u8, name_lex, "Option");
+        const is_result = std.mem.eql(u8, name_lex, "Result");
+        if (!is_option and !is_result) return null;
+
+        var arg_children: std.ArrayList(CstNodeIndex) = .empty;
+        defer arg_children.deinit(self.allocator);
+        try self.collectDirectChildren(args_id, &arg_children);
+        if (arg_children.items.len < 3) return null;
+
+        const open_child = self.cst_arena.getNode(arg_children.items[0]);
+        const close_child = self.cst_arena.getNode(arg_children.items[arg_children.items.len - 1]);
+        if (open_child.subtree_size != 1 or open_child.token.isNone() or
+            close_child.subtree_size != 1 or close_child.token.isNone())
+        {
+            return null;
+        }
+        const close_tok = close_child.token;
+        if (self.token_buffer.getToken(open_child.token).kind != .lbracket or
+            self.token_buffer.getToken(close_tok).kind != .rbracket or
+            self.token_buffer.getToken(close_tok).flags.is_synthesized)
+        {
+            return null;
+        }
+        if (self.hasUnconsumedCommentsInTokenRange(name_tok.asInt(), close_tok.asInt(), true, true)) {
+            return null;
+        }
+
+        var type_args_buf: [2]CstNodeIndex = .{ .none, .none };
+        var type_arg_count: usize = 0;
+        for (arg_children.items[1 .. arg_children.items.len - 1]) |arg_child_id| {
+            if (self.isTypeCstNode(arg_child_id)) {
+                if (type_arg_count >= 2) return null;
+                type_args_buf[type_arg_count] = arg_child_id;
+                type_arg_count += 1;
+            } else {
+                const leaf = self.cst_arena.getNode(arg_child_id);
+                if (leaf.subtree_size != 1 or leaf.token.isNone() or
+                    self.token_buffer.getToken(leaf.token).kind != .comma)
+                {
+                    return null;
+                }
+            }
+        }
+
+        if (is_option and type_arg_count == 1) {
+            return .{
+                .option = .{
+                    .name_tok = name_tok,
+                    .close_bracket_tok = close_tok,
+                    .inner_type_id = type_args_buf[0],
+                },
+            };
+        }
+        if (is_result and type_arg_count == 2) {
+            return .{
+                .result = .{
+                    .name_tok = name_tok,
+                    .close_bracket_tok = close_tok,
+                    .ok_type_id = type_args_buf[0],
+                    .err_type_id = type_args_buf[1],
+                },
+            };
+        }
+        return null;
+    }
+
+    /// Computes the intrinsic 4-tier `TypePrec` of `node_idx` (`DR-22` Section 1.3).
+    fn intrinsicTypePrec(self: *const CstFormatter, node_idx: CstNodeIndex) !TypePrec {
+        const node = self.cst_arena.getNode(node_idx);
+        if (node.subtree_size <= 1) return .tier4_primary;
+        return switch (node.kind) {
+            .refined_type, .intersect_bound_type, .union_bound_type => .tier0_open,
+            .result_type => .tier1_result,
+            .optional_type => .tier3_postfix,
+            .ref_type => if (self.isSliceRefTypeNode(node_idx)) .tier4_primary else .tier2_prefix,
+            .mode_type => blk: {
+                const first_tok = self.findFirstTokenInSubtree(node_idx);
+                if (!first_tok.isNone()) {
+                    const tok_kind = self.token_buffer.getToken(first_tok).kind;
+                    if (tok_kind == .kw_own or tok_kind == .tilde) break :blk .tier2_prefix;
+                    if (tok_kind == .ident and std.mem.eql(u8, self.getTokenLexeme(first_tok), "distinct")) {
+                        break :blk .tier0_open;
+                    }
+                }
+                break :blk .tier4_primary;
+            },
+            .named_type => if (try self.matchCanonicalStdlibType(node_idx)) |canon| switch (canon) {
+                .option => .tier3_postfix,
+                .result => .tier1_result,
+            } else .tier4_primary,
+            else => .tier4_primary,
+        };
+    }
+
+    /// Returns whether `node_idx` ends in an unparenthesized `.fn_type` or `.closure_type` tail.
+    fn hasCallableTail(self: *const CstFormatter, node_idx: CstNodeIndex) bool {
+        const node = self.cst_arena.getNode(node_idx);
+        if (node.subtree_size <= 1) return false;
+        return switch (node.kind) {
+            .fn_type, .closure_type => true,
+            .ptr_type, .ref_type, .mode_type => blk: {
+                if (node.kind == .ref_type and self.isSliceRefTypeNode(node_idx)) break :blk false;
+                const end_idx: usize = node_idx.asInt() + node.subtree_size;
+                var last_type_child: CstNodeIndex = .none;
+                var cursor: usize = node_idx.asInt() + 1;
+                while (cursor < end_idx) {
+                    const child_id = CstNodeIndex.fromInt(@intCast(cursor));
+                    const child = self.cst_arena.getNode(child_id);
+                    if (self.isTypeCstNode(child_id)) {
+                        last_type_child = child_id;
+                    }
+                    cursor += @max(@as(usize, 1), child.subtree_size);
+                }
+                if (last_type_child.isNone()) break :blk false;
+                break :blk self.hasCallableTail(last_type_child);
+            },
+            else => false,
+        };
+    }
+
+    /// Marks discarded `Option[…]` / `Result[…]` wrapper tokens as consumed while preserving outer trivia.
+    fn consumeStdlibTypeWrapperTokens(
+        self: *CstFormatter,
+        named_idx: CstNodeIndex,
+        close_bracket_tok: TokenIndex,
+    ) !void {
+        var named_children: std.ArrayList(CstNodeIndex) = .empty;
+        defer named_children.deinit(self.allocator);
+        try self.collectDirectChildren(named_idx, &named_children);
+        if (named_children.items.len != 2) return;
+
+        const name_tok = self.cst_arena.getNode(named_children.items[0]).token;
+        if (!name_tok.isNone() and name_tok.asInt() < self.token_meta.len) {
+            self.token_meta[name_tok.asInt()].is_token_emitted = true;
+            self.token_meta[name_tok.asInt()].is_leading_consumed = true;
+            self.token_meta[name_tok.asInt()].is_trailing_consumed = true;
+        }
+
+        var arg_children: std.ArrayList(CstNodeIndex) = .empty;
+        defer arg_children.deinit(self.allocator);
+        try self.collectDirectChildren(named_children.items[1], &arg_children);
+        for (arg_children.items) |arg_child_id| {
+            if (self.isTypeCstNode(arg_child_id)) continue;
+            const leaf = self.cst_arena.getNode(arg_child_id);
+            if (leaf.subtree_size == 1 and !leaf.token.isNone() and leaf.token.asInt() < self.token_meta.len) {
+                self.token_meta[leaf.token.asInt()].is_token_emitted = true;
+                self.token_meta[leaf.token.asInt()].is_leading_consumed = true;
+                if (leaf.token.asInt() != close_bracket_tok.asInt()) {
+                    self.token_meta[leaf.token.asInt()].is_trailing_consumed = true;
+                }
+            }
+        }
+    }
+
+    /// Formats a type CST node under the unified 4-tier `DR-22` precedence & `Option`/`Result` canonicalization rules.
+    fn formatTypeNode(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
+        try self.formatTypeNodeWithPrec(node_idx, .tier0_open, false, false);
+    }
+
+    /// Formats `node_idx` with contextual minimum precedence `min_prec` and callable-tail parenthesization guards.
+    fn formatTypeNodeWithPrec(
+        self: *CstFormatter,
+        node_idx: CstNodeIndex,
+        min_prec: TypePrec,
+        has_right_suffix: bool,
+        is_wrapping_bare_callable: bool,
+    ) anyerror!void {
+        const node = self.cst_arena.getNode(node_idx);
+        if (node.subtree_size == 1) {
+            if (!self.shouldSkipLeaf(node)) {
+                self.in_type_context += 1;
+                defer self.in_type_context -= 1;
+                try self.emitTokenWithTrivia(node.token, null, false);
+            }
+            return;
+        }
+
+        const own_prec = try self.intrinsicTypePrec(node_idx);
+        const needs_parens = (@backingInt(own_prec) < @backingInt(min_prec)) or
+            ((has_right_suffix or is_wrapping_bare_callable) and self.hasCallableTail(node_idx));
+
+        if (node.kind == .named_type) {
+            if (try self.matchCanonicalStdlibType(node_idx)) |canon| {
+                self.in_type_context += 1;
+                defer self.in_type_context -= 1;
+                switch (canon) {
+                    .option => |opt_info| {
+                        try self.emitLeadingTrivia(opt_info.name_tok, false);
+                        try self.consumeStdlibTypeWrapperTokens(node_idx, opt_info.close_bracket_tok);
+                        if (needs_parens) try self.doc_arena.emitText("(");
+                        try self.formatTypeNodeWithPrec(opt_info.inner_type_id, .tier3_postfix, true, false);
+                        try self.doc_arena.emitText("?");
+                        if (needs_parens) try self.doc_arena.emitText(")");
+                        try self.emitTrailingTrivia(opt_info.close_bracket_tok);
+                        return;
+                    },
+                    .result => |res_info| {
+                        try self.emitLeadingTrivia(res_info.name_tok, false);
+                        try self.consumeStdlibTypeWrapperTokens(node_idx, res_info.close_bracket_tok);
+                        if (needs_parens) try self.doc_arena.emitText("(");
+                        try self.formatTypeNodeWithPrec(res_info.ok_type_id, .tier2_prefix, true, true);
+                        try self.doc_arena.emitText("!");
+                        try self.formatTypeNodeWithPrec(res_info.err_type_id, .tier2_prefix, false, true);
+                        if (needs_parens) try self.doc_arena.emitText(")");
+                        try self.emitTrailingTrivia(res_info.close_bracket_tok);
+                        return;
+                    },
+                }
+            }
+        }
+
+        const first_tok = self.findFirstTokenInSubtree(node_idx);
+        if (needs_parens and !first_tok.isNone()) {
+            try self.emitLeadingTrivia(first_tok, false);
+        }
+        if (needs_parens) {
+            try self.doc_arena.emitText("(");
+        }
+
         if (node.kind == .refined_type) {
             var children: std.ArrayList(CstNodeIndex) = .empty;
             defer children.deinit(self.allocator);
@@ -5612,9 +6946,7 @@ const CstFormatter = struct {
             for (children.items, 0..) |child_id, idx| {
                 const child = self.cst_arena.getNode(child_id);
                 if (idx == 0) {
-                    self.in_type_context += 1;
-                    defer self.in_type_context -= 1;
-                    try self.formatNode(child_id);
+                    try self.formatTypeNodeWithPrec(child_id, .tier1_result, true, false);
                 } else if (child.subtree_size == 1 and !child.token.isNone()) {
                     const tok_kind = self.token_buffer.getToken(child.token).kind;
                     if (tok_kind == .kw_where or tok_kind == .kw_is) {
@@ -5628,6 +6960,7 @@ const CstFormatter = struct {
                     try self.formatNode(child_id);
                 }
             }
+            if (needs_parens) try self.doc_arena.emitText(")");
             return;
         }
 
@@ -5636,6 +6969,7 @@ const CstFormatter = struct {
 
         if (node.kind == .tuple_type) {
             try self.formatSteerableDelimitedList(node_idx, null, .lparen, .rparen, "(", ")", false);
+            if (needs_parens) try self.doc_arena.emitText(")");
             return;
         }
 
@@ -5643,18 +6977,150 @@ const CstFormatter = struct {
         defer children.deinit(self.allocator);
         try self.collectDirectChildren(node_idx, &children);
 
-        for (children.items, 0..) |child_id, idx| {
+        switch (node.kind) {
+            .optional_type => {
+                for (children.items, 0..) |child_id, idx| {
+                    const child = self.cst_arena.getNode(child_id);
+                    if (idx == 0 and self.isTypeCstNode(child_id)) {
+                        try self.formatTypeNodeWithPrec(child_id, .tier3_postfix, true, false);
+                    } else if (child.subtree_size == 1 and !child.token.isNone()) {
+                        try self.emitTokenWithTrivia(child.token, null, false);
+                    } else {
+                        try self.formatNode(child_id);
+                    }
+                }
+                if (needs_parens) try self.doc_arena.emitText(")");
+                return;
+            },
+            .result_type => {
+                var has_seen_bang = false;
+                for (children.items) |child_id| {
+                    const child = self.cst_arena.getNode(child_id);
+                    if (child.subtree_size == 1 and !child.token.isNone() and
+                        self.token_buffer.getToken(child.token).kind == .bang)
+                    {
+                        has_seen_bang = true;
+                        try self.emitTokenWithTrivia(child.token, "!", false);
+                    } else if (self.isTypeCstNode(child_id)) {
+                        try self.formatTypeNodeWithPrec(child_id, .tier2_prefix, !has_seen_bang, true);
+                    } else {
+                        try self.formatNode(child_id);
+                    }
+                }
+                if (needs_parens) try self.doc_arena.emitText(")");
+                return;
+            },
+            .ptr_type => {
+                for (children.items) |child_id| {
+                    const child = self.cst_arena.getNode(child_id);
+                    if (self.isTypeCstNode(child_id)) {
+                        try self.formatTypeNodeWithPrec(child_id, .tier4_primary, false, false);
+                    } else if (child.subtree_size == 1 and !child.token.isNone()) {
+                        const tok_kind = self.token_buffer.getToken(child.token).kind;
+                        try self.emitTokenWithTrivia(child.token, null, false);
+                        if (tok_kind == .kw_mut or tok_kind == .kw_const) {
+                            try self.doc_arena.emitText(" ");
+                        }
+                    } else {
+                        try self.formatNode(child_id);
+                    }
+                }
+                if (needs_parens) try self.doc_arena.emitText(")");
+                return;
+            },
+            .ref_type => {
+                const target_prec: TypePrec = if (self.isSliceRefTypeNode(node_idx)) .tier4_primary else .tier2_prefix;
+                for (children.items, 0..) |child_id, idx| {
+                    const child = self.cst_arena.getNode(child_id);
+                    if (self.isTypeCstNode(child_id)) {
+                        try self.formatTypeNodeWithPrec(child_id, target_prec, false, false);
+                    } else if (child.subtree_size == 1 and !child.token.isNone()) {
+                        const tok_kind = self.token_buffer.getToken(child.token).kind;
+                        try self.emitTokenWithTrivia(child.token, null, false);
+                        if (tok_kind == .kw_mut or tok_kind == .kw_let or
+                            (tok_kind == .ident and idx + 1 < children.items.len))
+                        {
+                            try self.doc_arena.emitText(" ");
+                        }
+                    } else {
+                        try self.formatNode(child_id);
+                    }
+                }
+                if (needs_parens) try self.doc_arena.emitText(")");
+                return;
+            },
+            .mode_type => {
+                const target_prec: TypePrec = switch (own_prec) {
+                    .tier0_open => .tier0_open,
+                    .tier2_prefix => .tier2_prefix,
+                    else => .tier4_primary,
+                };
+                for (children.items, 0..) |child_id, idx| {
+                    const child = self.cst_arena.getNode(child_id);
+                    if (self.isTypeCstNode(child_id)) {
+                        try self.formatTypeNodeWithPrec(child_id, target_prec, false, false);
+                    } else if (child.subtree_size == 1 and !child.token.isNone()) {
+                        const tok_kind = self.token_buffer.getToken(child.token).kind;
+                        try self.emitTokenWithTrivia(child.token, null, false);
+                        if ((tok_kind == .kw_own or tok_kind == .hash_soa or tok_kind == .ident) and
+                            idx + 1 < children.items.len)
+                        {
+                            try self.doc_arena.emitText(" ");
+                        }
+                    } else {
+                        try self.formatNode(child_id);
+                    }
+                }
+                if (needs_parens) try self.doc_arena.emitText(")");
+                return;
+            },
+            .intersect_bound_type, .union_bound_type => {
+                for (children.items) |child_id| {
+                    const child = self.cst_arena.getNode(child_id);
+                    if (child.subtree_size == 1 and !child.token.isNone()) {
+                        const tok_kind = self.token_buffer.getToken(child.token).kind;
+                        if (tok_kind == .plus or tok_kind == .pipe) {
+                            try self.doc_arena.emitText(" ");
+                            try self.emitTokenWithTrivia(child.token, null, false);
+                            try self.doc_arena.emitText(" ");
+                        } else {
+                            try self.emitTokenWithTrivia(child.token, null, false);
+                        }
+                    } else {
+                        try self.formatNode(child_id);
+                    }
+                }
+                if (needs_parens) try self.doc_arena.emitText(")");
+                return;
+            },
+            else => {},
+        }
+
+        const start_idx = if (node.kind == .fn_type or node.kind == .closure_type)
+            try self.formatLeadingInlineAttributes(children.items)
+        else
+            0;
+
+        var idx: usize = start_idx;
+        while (idx < children.items.len) : (idx += 1) {
+            const child_id = children.items[idx];
             const child = self.cst_arena.getNode(child_id);
             if (child.subtree_size == 1 and !child.token.isNone()) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
-                if (tok_kind == .kw_mut or tok_kind == .kw_own or tok_kind == .kw_ref or
+                if (tok_kind == .kw_mut or tok_kind == .kw_own or
                     tok_kind == .kw_const or tok_kind == .kw_let or
-                    tok_kind == .kw_async or tok_kind == .kw_unsafe or
-                    tok_kind == .hash_soa or
-                    (tok_kind == .ident and idx + 1 < children.items.len and
-                        (node.kind == .mode_type or node.kind == .ref_type)))
+                    tok_kind == .kw_async or tok_kind == .kw_unsafe or tok_kind == .kw_extern or
+                    tok_kind == .hash_soa)
                 {
                     try self.emitTokenWithTrivia(child.token, null, false);
+                    try self.doc_arena.emitText(" ");
+                } else if (tok_kind == .string_lit and node.kind == .fn_type) {
+                    const abi_lex = self.getTokenLexeme(child.token);
+                    const abi_override: ?[]const u8 = if (std.ascii.eqlIgnoreCase(abi_lex, "\"c\""))
+                        "\"C\""
+                    else
+                        null;
+                    try self.emitTokenWithTrivia(child.token, abi_override, false);
                     try self.doc_arena.emitText(" ");
                 } else if (tok_kind == .colon) {
                     try self.emitTokenWithTrivia(child.token, ":", false);
@@ -5672,6 +7138,14 @@ const CstFormatter = struct {
                         if (!is_close) try self.doc_arena.emitText(" ");
                     }
                 } else if (tok_kind == .arrow) {
+                    if ((node.kind == .fn_type or node.kind == .closure_type) and
+                        idx + 1 < children.items.len and
+                        self.isStrippableUnitReturnPair(child.token, children.items[idx + 1]))
+                    {
+                        try self.consumeStrippedUnitReturnPair(child.token, children.items[idx + 1]);
+                        idx += 1;
+                        continue;
+                    }
                     try self.doc_arena.emitText(" ");
                     try self.emitTokenWithTrivia(child.token, "->", false);
                     try self.doc_arena.emitText(" ");
@@ -5683,6 +7157,9 @@ const CstFormatter = struct {
             } else {
                 try self.formatNode(child_id);
             }
+        }
+        if (needs_parens) {
+            try self.doc_arena.emitText(")");
         }
     }
 
@@ -5835,7 +7312,7 @@ const CstFormatter = struct {
             const child = self.cst_arena.getNode(child_id);
             if (child.subtree_size == 1 and !child.token.isNone()) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
-                if (tok_kind == .kw_mut or tok_kind == .kw_own or tok_kind == .kw_ref) {
+                if (tok_kind == .kw_var or tok_kind == .kw_mut or tok_kind == .kw_own) {
                     try self.emitTokenWithTrivia(child.token, null, false);
                     try self.doc_arena.emitText(" ");
                 } else if (tok_kind == .colon) {
@@ -5878,7 +7355,7 @@ const CstFormatter = struct {
         }
     }
 
-    /// Dispatches CST node `node_idx` to its canonical `DR-03` / `DR-14` / `DR-21` formatting routine.
+    /// Dispatches CST node `node_idx` to its canonical `DR-03` / `DR-14` / `DR-21` / `DR-22` formatting routine.
     fn formatNode(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         const node = self.cst_arena.getNode(node_idx);
         if (node.subtree_size == 1) {
@@ -5891,6 +7368,7 @@ const CstFormatter = struct {
         switch (node.kind) {
             .file_end => try self.formatRoot(),
             .attribute => try self.formatAttribute(node_idx),
+            .visibility_modifier => try self.formatVisibilityModifier(node_idx),
             .use_item => try self.formatUseItem(node_idx),
             .use_tree => try self.formatUseTree(node_idx),
             .const_item => try self.formatConstItem(node_idx),
@@ -5901,6 +7379,9 @@ const CstFormatter = struct {
             .enum_variant => try self.formatEnumVariant(node_idx),
             .trait_item, .impl_item => try self.formatTraitOrImpl(node_idx),
             .fn_item, .trait_member, .impl_member => try self.formatFnOrMember(node_idx),
+            .subscript_item => try self.formatSubscriptItem(node_idx),
+            .subscript_arm => try self.formatSubscriptArm(node_idx),
+            .test_item, .bench_item => try self.formatTestOrBenchItem(node_idx),
             .fn_sig => try self.formatFnSig(node_idx),
             .fn_expr_body => try self.formatFnExprBody(node_idx),
             .return_type => try self.formatReturnType(node_idx),
@@ -5914,7 +7395,7 @@ const CstFormatter = struct {
             .block => try self.formatBlock(node_idx),
             .local_decl_stmt => try self.formatLocalDeclStmt(node_idx),
             .let_else_branch => try self.formatLetElseBranch(node_idx),
-            .return_stmt, .break_stmt, .continue_stmt => try self.formatJumpStmt(node_idx),
+            .return_stmt, .break_stmt, .continue_stmt, .yield_stmt => try self.formatJumpStmt(node_idx),
             .diverging_expr => try self.formatDivergingExpr(node_idx),
             .loop_label => try self.formatLoopLabel(node_idx),
             .defer_stmt => try self.formatDeferStmt(node_idx),
@@ -5945,7 +7426,7 @@ const CstFormatter = struct {
             .closure_param => try self.formatClosureParam(node_idx),
             .infix_expr => try self.formatInfixExpr(node_idx),
             .prefix_expr => try self.formatPrefixExpr(node_idx),
-            .field_or_method_expr, .postfix_try_expr, .postfix_await_expr => {
+            .field_or_method_expr, .postfix_deref_expr, .postfix_try_expr, .postfix_await_expr => {
                 try self.formatPostfixChain(node_idx);
             },
             .index_expr => try self.formatIndexExpr(node_idx),
@@ -5960,7 +7441,10 @@ const CstFormatter = struct {
             .fn_type,
             .closure_type,
             .optional_type,
+            .result_type,
             .refined_type,
+            .intersect_bound_type,
+            .union_bound_type,
             => try self.formatTypeNode(node_idx),
             .wildcard_pat,
             .literal_pat,
@@ -6223,7 +7707,7 @@ test "test_format_preserves_100_percent_comments_and_is_idempotent" {
     const src =
         "// Module header comment\n" ++
         "struct Point {\n" ++
-        "    x: i32; // trailing on x\n" ++
+        "    x: i32, // trailing on x\n" ++
         "    // leading on y\n" ++
         "    y: i32\n" ++
         "}\n" ++
@@ -6317,11 +7801,13 @@ test "test_format_red_team_syntax_constructs_and_patterns" {
         "type Callback = unsafe fn(lhs: i32, rhs: i32) -> i32;\n" ++
         "type AsyncTask = async fn(input_val: i32) -> i32;\n\n" ++
         "impl Grid {\n" ++
-        "    subscript cell_at(idx: usize) -> i32 {\n" ++
-        "        return 0;\n" ++
-        "    }\n\n" ++
-        "    subscript(idx: usize) -> i32 {\n" ++
-        "        return 0;\n" ++
+        "    subscript(idx: usize) -> &i32 {\n" ++
+        "        let {\n" ++
+        "            yield &self.cells[idx];\n" ++
+        "        }\n\n" ++
+        "        inout {\n" ++
+        "            yield &mut self.cells[idx];\n" ++
+        "        }\n" ++
         "    }\n" ++
         "}\n\n" ++
         "fn evaluate(point_val: Point, opt_val: Option) -> i32 {\n" ++
@@ -6490,4 +7976,130 @@ test "test_format_dr21_surface_elevations_and_legacy_coloncolon_bailout" {
     try std.testing.expect(legacy_res.has_syntax_errors);
     try std.testing.expect(!legacy_res.is_changed);
     try std.testing.expectEqualStrings(legacy_src, legacy_res.formatted_text);
+}
+
+test "test_format_dr22_canonical_rules_multiline_strings_and_idempotency" {
+    const src =
+        "pub(pkg) extern \"c\" fn printf(fmt: *u8, ...) -> i32;\n\n" ++
+        "@no_panic\n" ++
+        "@cfg(target_os: \"linux\")\n" ++
+        "@inline\n" ++
+        "@no_alloc\n" ++
+        "pub(super) fn compute[T: Clone + Hash | Default](\n" ++
+        "    ptr: *mut Option[u8],\n" ++
+        "    opt_ptr: Option[*mut u8],\n" ++
+        "    slice_opt: Option[&[u8]],\n" ++
+        "    ref_opt: Option[&u8],\n" ++
+        "    cb_opt: Option[fn() -> unit],\n" ++
+        "    nested_res: Result[Result[u32, E1], E2],\n" ++
+        "    ref_res: &Result[u32, IoError],\n" ++
+        "    /,\n" ++
+        "    *,\n" ++
+        "    out_slot: &out u64,\n" ++
+        ") -> unit {\n" ++
+        "    @state var paused: bool = false;\n" ++
+        "    let count = 42u64;\n" ++
+        "    let ratio = 0.5f32;\n" ++
+        "    let raw_p = &raw mut out_slot;\n" ++
+        "    out_slot = raw_p.* + count + (ratio as u64);\n" ++
+        "    let updated = Config { enabled: not paused, ..own base_cfg };\n" ++
+        "    let task = own async || -> unit {\n" ++
+        "  let msg = \"\"\"\n" ++
+        "  line one\n" ++
+        "    line two\n" ++
+        "  \"\"\";\n" ++
+        "            let dedented = \"\"\"\n" ++
+        "            alpha\n" ++
+        "              beta\n" ++
+        "            \"\"\";\n" ++
+        "    };\n" ++
+        "    fsm: match state {\n" ++
+        "        0 => continue :fsm 1,\n" ++
+        "        _ => {},\n" ++
+        "    }\n" ++
+        "}\n\n" ++
+        "fn render(body: @builder |&mut UiScope| -> unit) -> unit {\n" ++
+        "    Card(title: \"Demo\") {\n" ++
+        "        body(&mut scope);\n" ++
+        "    }\n" ++
+        "}\n\n" ++
+        "test \"unit return stripped\" (fx: &Fixture) -> unit {\n" ++
+        "    let ok = fx.check();\n" ++
+        "}\n";
+
+    var pass1 = try formatSource(std.testing.allocator, src, FileId.fromInt(0));
+    defer pass1.deinit(std.testing.allocator);
+    try std.testing.expect(!pass1.has_syntax_errors);
+
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "pub(pkg) extern \"C\" fn printf(fmt: *u8, ...) -> i32;") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        pass1.formatted_text,
+        "@cfg(target_os: \"linux\")\n@inline @no_alloc @no_panic\npub(super) fn compute[T: Clone + Hash | Default](",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "ptr: *mut (u8?),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "opt_ptr: *mut u8?,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "slice_opt: &[u8]?,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "ref_opt: (&u8)?,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "cb_opt: (fn())?,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "nested_res: (u32!E1)!E2,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "ref_res: &(u32!IoError),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "out_slot: &out u64,\n) {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "    @state var paused: bool = false;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "    let count = 42_u64;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "    let ratio = 0.5_f32;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "    let raw_p = &raw mut out_slot;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "    out_slot = raw_p.* + count + (ratio as u64);\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "..own base_cfg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "    let task = own async || {\n") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        pass1.formatted_text,
+        "        let msg = \"\"\"\n        line one\n          line two\n        \"\"\";\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        pass1.formatted_text,
+        "        let dedented = \"\"\"\n        alpha\n          beta\n        \"\"\";\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "    fsm: match state {\n        0 => continue :fsm 1,\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "fn render(body: @builder |&mut UiScope|) {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "test \"unit return stripped\" (fx: &Fixture) {\n") != null);
+
+    var pass2 = try formatSource(std.testing.allocator, pass1.formatted_text, FileId.fromInt(0));
+    defer pass2.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(pass1.formatted_text, pass2.formatted_text);
+    try std.testing.expect(!pass2.is_changed);
+}
+
+test "test_stage4_attributed_block_match_no_spurious_semi_and_raw_quote_runs" {
+    const src =
+        "pub fn run(state: i32, ptr: *i32) -> i32 {\n" ++
+        "    let quoted = r#\"\"\"\"#;\n" ++
+        "    let doc = \"\"\"\n" ++
+        "        prefix {r#\"\"\"\"#} suffix\n" ++
+        "        \"\"\";\n" ++
+        "    @cfg(debug)\n" ++
+        "    comptime {\n" ++
+        "        let _ = 1;\n" ++
+        "    }\n" ++
+        "    @cfg(debug)\n" ++
+        "    fsm: match state {\n" ++
+        "        0 => continue :fsm 1,\n" ++
+        "        _ => state,\n" ++
+        "    }\n" ++
+        "}\n";
+
+    var pass1 = try formatSource(std.testing.allocator, src, FileId.fromInt(0));
+    defer pass1.deinit(std.testing.allocator);
+    try std.testing.expect(!pass1.has_syntax_errors);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "let quoted = r#\"\"\"\"#;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "    comptime {\n        let _ = 1;\n    }\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "    comptime {\n        let _ = 1;\n    };") == null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "        _ => state,\n    }\n}\n") != null);
+
+    var pass2 = try formatSource(std.testing.allocator, pass1.formatted_text, FileId.fromInt(0));
+    defer pass2.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(pass1.formatted_text, pass2.formatted_text);
+    try std.testing.expect(!pass2.is_changed);
 }

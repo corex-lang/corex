@@ -8,7 +8,7 @@ pub struct Metric[T] {
     pub val: T,
 }
 
-pub fn render_dashboard[T](opt_val: Option[T], raw_score: i32) -> View {
+pub fn render_dashboard[T](opt_val: T?, raw_score: i32) -> View {
     let .Some(item) = opt_val else {
         return Empty;
     };

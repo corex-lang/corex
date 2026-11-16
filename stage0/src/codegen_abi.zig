@@ -457,9 +457,9 @@ pub const ResolvedTypeLayout = extern struct {
         return @as(u32, 1) << @intCast(self.align_log2);
     }
 
-    /// Returns `true` when `size_bytes == 0`.
+    /// Returns `true` when `size_bytes == 0` and the type is sized (excludes `opaque`).
     pub inline fn isZst(self: ResolvedTypeLayout) bool {
-        return self.size_bytes == 0;
+        return self.size_bytes == 0 and !self.reprFlags().is_unsized;
     }
 
     /// Returns `true` when `niche_idx != NO_NICHE_IDX`.
@@ -591,6 +591,8 @@ pub const FnSignatureView = struct {
     is_extern_c: bool = false,
     /// `true` when implicit `Context*` parameter is elided (`@no_alloc` / `contextless` / `D5` proven).
     is_contextless: bool = true,
+    /// `true` for C variadic prototypes (`extern "C" fn(fixed…, ...)`, `SE-11`).
+    is_variadic: bool = false,
 };
 
 /// Complete lowered machine calling-convention recipe for a function or indirect call site.
@@ -615,6 +617,8 @@ pub const AbiFnRecipe = struct {
     ok_ty: TypeId = .unit_ty,
     /// Unwrapped `E` error `TypeId` when `calling_conv == .cx_result_cc`.
     err_ty: TypeId = .unit_ty,
+    /// `true` when calling or declaring a C variadic prototype (`extern "C" fn(fixed…, ...)`, `SE-11`).
+    is_variadic: bool = false,
     /// Lowered formal parameter recipes (`params.len` entries, owned by `allocator`).
     param_recipes: []AbiParamRecipe,
 
@@ -632,6 +636,7 @@ pub const AbiFnRecipe = struct {
             @intFromBool(self.has_sret),
             @intFromBool(self.has_implicit_context),
             @backingInt(self.swifterror_kind),
+            @intFromBool(self.is_variadic),
         });
         hasher.update(std.mem.asBytes(&self.ret_recipe));
         if (self.has_sret) hasher.update(std.mem.asBytes(&self.sret_recipe));
@@ -897,6 +902,33 @@ fn leafNicheToSpec(leaf: type_system.LeafNicheInfo) NicheSpec {
     };
 }
 
+/// Returns `true` when `raw_ty` is one of the Phase 7.6 built-in runtime `TypeId` slots (`45..50` or `TaskGroup`/`TaskHandle`).
+fn isBuiltInRuntimeType(pool: *const InternPool, raw_ty: TypeId) bool {
+    return switch (raw_ty) {
+        .source_loc_ty,
+        .fmt_spec_ty,
+        .fmt_args_ty,
+        .bencher_ty,
+        .task_group_base_ty,
+        .task_handle_base_ty,
+        => true,
+        else => pool.isTaskGroupType(raw_ty) or pool.isTaskHandleType(raw_ty),
+    };
+}
+
+/// Unwraps `distinct` / `refined` / `bit_field` wrappers and explicit integer-backed `enum` types.
+fn unwrapScalarOrBackedEnum(pool: *const InternPool, raw_ty: TypeId) TypeId {
+    const unwrapped = pool.unwrapUnderlyingType(raw_ty);
+    if (!unwrapped.isPrimitiveOrSentinel() and !isBuiltInRuntimeType(pool, unwrapped)) {
+        if (pool.getNode(unwrapped).tag == .enum_ty) {
+            if (pool.getEnumBackingIntType(unwrapped)) |backing_int_ty| {
+                return pool.unwrapUnderlyingType(backing_int_ty);
+            }
+        }
+    }
+    return unwrapped;
+}
+
 /// Returns `true` if `ty` unwraps to a single IEEE-754 floating-point scalar (`f32` or `f64`).
 fn isScalarFloatType(pool: *const InternPool, raw_ty: TypeId) bool {
     const unwrapped = pool.unwrapUnderlyingType(raw_ty);
@@ -905,22 +937,34 @@ fn isScalarFloatType(pool: *const InternPool, raw_ty: TypeId) bool {
 
 /// Returns `true` if `ty` unwraps to a narrow `< 32`-bit unsigned integer or `bool`.
 fn isNarrowZeroExtType(pool: *const InternPool, raw_ty: TypeId) bool {
-    const unwrapped = pool.unwrapUnderlyingType(raw_ty);
+    const unwrapped = unwrapScalarOrBackedEnum(pool, raw_ty);
     return unwrapped == .bool_ty or unwrapped == .u8_ty or unwrapped == .u16_ty;
 }
 
 /// Returns `true` if `ty` unwraps to a narrow `< 32`-bit signed integer (`i8` or `i16`).
 fn isNarrowSignExtType(pool: *const InternPool, raw_ty: TypeId) bool {
-    const unwrapped = pool.unwrapUnderlyingType(raw_ty);
+    const unwrapped = unwrapScalarOrBackedEnum(pool, raw_ty);
     return unwrapped == .i8_ty or unwrapped == .i16_ty;
 }
 
-/// Returns `true` if `ty` unwraps to a non-null single pointer (`&T`, `&mut T`, or `fn`).
+/// Returns `true` if `ty` unwraps to a non-null single pointer (`&T`, `&mut T`, `fn`, or `SourceLoc`).
 fn isSingleNonNullPointerType(pool: *const InternPool, raw_ty: TypeId) bool {
     const unwrapped = pool.unwrapUnderlyingType(raw_ty);
-    if (unwrapped.isPrimitiveOrSentinel()) return false;
+    if (unwrapped == .source_loc_ty) return true;
+    if (unwrapped.isPrimitiveOrSentinel() or isBuiltInRuntimeType(pool, unwrapped)) return false;
     const tag = pool.getNode(unwrapped).tag;
     return tag == .ref_ty or tag == .mut_ref_ty or tag == .fn_ty;
+}
+
+/// Returns `true` if `closure_ty` requires a 3-word `{ env_ptr, fn_ptr, drop_fn }` layout (`SE-19`).
+pub fn isThreeWordClosureType(pool: *const InternPool, raw_ty: TypeId) bool {
+    const unwrapped = pool.unwrapUnderlyingType(raw_ty);
+    if (unwrapped.isPrimitiveOrSentinel() or isBuiltInRuntimeType(pool, unwrapped)) return false;
+    if (pool.getNode(unwrapped).tag != .closure_ty) return false;
+    if (pool.getFnSignatureView(unwrapped)) |sig_view| {
+        return sig_view.capture_tier != .copy_tier or sig_view.has_linear_capture;
+    }
+    return false;
 }
 
 /// Detects an `AAPCS64` / `Apple ARM64` Homogeneous Floating-Point Aggregate (`1..4` identical `f32`/`f64` lanes).
@@ -941,7 +985,7 @@ fn inspectAarch64HfaBounded(
     const unwrapped = resolver.pool.unwrapUnderlyingType(raw_ty);
     if (unwrapped == .f32_ty) return .{ .elem_bytes = 4, .lane_count = 1 };
     if (unwrapped == .f64_ty) return .{ .elem_bytes = 8, .lane_count = 1 };
-    if (unwrapped.isPrimitiveOrSentinel()) return null;
+    if (unwrapped.isPrimitiveOrSentinel() or isBuiltInRuntimeType(resolver.pool, unwrapped)) return null;
 
     const layout = try resolver.resolveTypeBounded(unwrapped, depth + 1);
     if (layout.size_bytes == 0 or layout.size_bytes > 32 or layout.reprFlags().is_packed) return null;
@@ -1056,7 +1100,7 @@ fn classifySysVAmd64EightbytesBounded(
         mergeSysVGprSpan(byte_offset, layout.size_bytes, classes);
         return;
     }
-    if (unwrapped.isPrimitive()) {
+    if (unwrapped.isPrimitive() or isBuiltInRuntimeType(resolver.pool, unwrapped)) {
         if ((byte_offset & (@as(u64, layout.alignBytes()) - 1)) != 0) {
             has_unaligned.* = true;
             return;
@@ -1149,14 +1193,26 @@ fn classifySysVAmd64EightbytesBounded(
 fn unwrapWasmCSingleScalar(resolver: *TypeLayoutResolver, raw_ty: TypeId, depth: u32) !?TypeId {
     if (depth >= 16) return null;
     const unwrapped = resolver.pool.unwrapUnderlyingType(raw_ty);
-    if (unwrapped == .unit_ty or unwrapped == .never_ty or unwrapped == .i128_ty or unwrapped == .u128_ty) {
+    if (unwrapped == .unit_ty or unwrapped == .never_ty or unwrapped == .opaque_ty or
+        unwrapped == .i128_ty or unwrapped == .u128_ty)
+    {
         return null;
     }
-    if (unwrapped == .str_ty) return null;
+    if (unwrapped == .str_ty or unwrapped == .fmt_spec_ty or unwrapped == .fmt_args_ty or unwrapped == .bencher_ty) {
+        return null;
+    }
+    if (unwrapped == .source_loc_ty or unwrapped == .task_group_base_ty or unwrapped == .task_handle_base_ty or
+        resolver.pool.isTaskGroupType(unwrapped) or resolver.pool.isTaskHandleType(unwrapped))
+    {
+        return .usize_ty;
+    }
     if (unwrapped.isPrimitive()) return unwrapped;
     switch (resolver.pool.getNode(unwrapped).tag) {
         .ref_ty, .mut_ref_ty, .raw_ptr_ty, .fn_ty => return unwrapped,
         .enum_ty => {
+            if (resolver.pool.getEnumBackingIntType(unwrapped)) |backing_int_ty| {
+                return unwrapWasmCSingleScalar(resolver, backing_int_ty, depth + 1);
+            }
             const layout = try resolver.resolveTypeBounded(unwrapped, depth + 1);
             if (layout.sum_repr == .explicit_tag and layout.size_bytes <= 8) {
                 if (resolver.sum_details.get(unwrapped.toU32())) |detail| {
@@ -1267,10 +1323,18 @@ pub const TypeLayoutResolver = struct {
             };
         }
 
+        const unwrapped = self.pool.unwrapUnderlyingType(raw_ty);
+        const layout_query_ty = if (!unwrapped.isPrimitiveOrSentinel() and
+            !isBuiltInRuntimeType(self.pool, unwrapped) and
+            self.pool.getNode(unwrapped).tag == .enum_ty and
+            SymbolIndex.fromInt(self.pool.getNode(unwrapped).rhs).isNone())
+            (self.pool.getEnumBackingIntType(unwrapped) orelse raw_ty)
+        else
+            raw_ty;
         const base_layout = type_system.computeTypeLayoutWithPool(
             self.pool,
             self.sym_table,
-            raw_ty,
+            layout_query_ty,
             self.target_layout,
         );
         const leaf_niche = type_system.computeLeafNiche(
@@ -1286,15 +1350,14 @@ pub const TypeLayoutResolver = struct {
         }
 
         var repr_flags: ReprFlags = .{
-            .is_zst = base_layout.byte_size == 0,
+            .is_zst = base_layout.byte_size == 0 and base_layout.is_sized,
             .is_unsized = !base_layout.is_sized,
         };
         var aux_start: u32 = 0;
         var aux_len: u32 = 0;
         var sum_repr: SumReprKind = .not_sum;
 
-        const unwrapped = self.pool.unwrapUnderlyingType(raw_ty);
-        if (!unwrapped.isPrimitiveOrSentinel()) {
+        if (!unwrapped.isPrimitiveOrSentinel() and !isBuiltInRuntimeType(self.pool, unwrapped)) {
             const node = self.pool.getNode(unwrapped);
             switch (node.tag) {
                 .soa_array_ty => {
@@ -1348,29 +1411,31 @@ pub const TypeLayoutResolver = struct {
                             repr_flags.is_zero_pad = en_sym.contract_flags.is_zero_pad;
                         }
                     }
-                    const sum_mem = type_system.computeSumMemoryLayout(
-                        self.pool,
-                        self.sym_table,
-                        unwrapped,
-                        self.target_layout,
-                    );
-                    sum_repr = switch (sum_mem.repr) {
-                        .transparent_ok => .transparent_ok,
-                        .niche_single => .niche_single,
-                        .explicit_tag => .explicit_tag,
-                    };
-                    const detail: ResolvedSumDetail = .{
-                        .repr = sum_repr,
-                        .tag_bytes = sum_mem.tag_bytes,
-                        .payload_offset = sum_mem.payload_offset,
-                        .zst_discriminant = sum_mem.zst_discriminant,
-                        .payload_discriminant = sum_mem.payload_discriminant,
-                        .payload_ty = sum_mem.payload_ty,
-                        .niche = leafNicheToSpec(sum_mem.niche),
-                    };
-                    try self.sum_details.put(self.allocator, raw_ty.toU32(), detail);
-                    if (raw_ty != unwrapped) {
-                        try self.sum_details.put(self.allocator, unwrapped.toU32(), detail);
+                    if (node.tag != .enum_ty or self.pool.getEnumBackingIntType(unwrapped) == null) {
+                        const sum_mem = type_system.computeSumMemoryLayout(
+                            self.pool,
+                            self.sym_table,
+                            unwrapped,
+                            self.target_layout,
+                        );
+                        sum_repr = switch (sum_mem.repr) {
+                            .transparent_ok => .transparent_ok,
+                            .niche_single => .niche_single,
+                            .explicit_tag => .explicit_tag,
+                        };
+                        const detail: ResolvedSumDetail = .{
+                            .repr = sum_repr,
+                            .tag_bytes = sum_mem.tag_bytes,
+                            .payload_offset = sum_mem.payload_offset,
+                            .zst_discriminant = sum_mem.zst_discriminant,
+                            .payload_discriminant = sum_mem.payload_discriminant,
+                            .payload_ty = sum_mem.payload_ty,
+                            .niche = leafNicheToSpec(sum_mem.niche),
+                        };
+                        try self.sum_details.put(self.allocator, raw_ty.toU32(), detail);
+                        if (raw_ty != unwrapped) {
+                            try self.sum_details.put(self.allocator, unwrapped.toU32(), detail);
+                        }
                     }
                 },
                 else => {},
@@ -1775,13 +1840,22 @@ pub const AbiClassifier = struct {
         const param_recipes = try allocator.alloc(AbiParamRecipe, sig.params.len);
         errdefer allocator.free(param_recipes);
 
+        var effective_sig = sig;
+        if (effective_sig.is_variadic) {
+            effective_sig.is_extern_c = true;
+            effective_sig.is_contextless = true;
+        }
         if (target.isWasm()) {
-            return classifyWasmMvpFn(resolver, sig, param_recipes);
+            var wasm_recipe = try classifyWasmMvpFn(resolver, effective_sig, param_recipes);
+            wasm_recipe.is_variadic = effective_sig.is_variadic;
+            return wasm_recipe;
         }
-        if (sig.is_extern_c) {
-            return classifyCSystemFn(resolver, sig, param_recipes);
+        if (effective_sig.is_extern_c) {
+            var c_recipe = try classifyCSystemFn(resolver, effective_sig, param_recipes);
+            c_recipe.is_variadic = effective_sig.is_variadic;
+            return c_recipe;
         }
-        return classifyCxNativeFn(resolver, sig, param_recipes);
+        return classifyCxNativeFn(resolver, effective_sig, param_recipes);
     }
 
     /// Classifies native `x86_64` / `aarch64` CoreX functions (`cx_native` & `cx_result_cc` `Fix-07` / `[CRITICAL-06]`).
@@ -2279,7 +2353,7 @@ pub const AbiClassifier = struct {
         }
 
         const ret_layout = try resolver.resolveType(sig.ret_ty);
-        const unwrapped_ret = resolver.pool.unwrapUnderlyingType(sig.ret_ty);
+        const unwrapped_ret = unwrapScalarOrBackedEnum(resolver.pool, sig.ret_ty);
         if (ret_layout.size_bytes == 0) {
             recipe.ret_recipe = .{ .pointee_align_bytes = ret_layout.alignBytes(), .pass_mode = .ignore_zst };
         } else if (sig.is_extern_c) {
@@ -2336,7 +2410,7 @@ pub const AbiClassifier = struct {
                 };
                 continue;
             }
-            const unwrapped_p = resolver.pool.unwrapUnderlyingType(param.type_id);
+            const unwrapped_p = unwrapScalarOrBackedEnum(resolver.pool, param.type_id);
             if (sig.is_extern_c) {
                 if (unwrapped_p == .i128_ty or unwrapped_p == .u128_ty) {
                     param_recipes[i] = .{
@@ -2560,6 +2634,8 @@ pub fn resolveZigExecutable(
     return allocator.dupe(u8, exe_name);
 }
 
+// ---------------------------------------- MAIN -----------------------------------------
+
 comptime {
     std.debug.assert(@sizeOf(TargetSpec) == 4 and @alignOf(TargetSpec) == 1);
     std.debug.assert(@sizeOf(NicheSpec) == 24 and @alignOf(NicheSpec) == 8);
@@ -2569,4 +2645,100 @@ comptime {
     std.debug.assert(@sizeOf(AbiParamRecipe) == 16 and @alignOf(AbiParamRecipe) == 4);
     std.debug.assert(@sizeOf(ProvenValueRange) == 24 and @alignOf(ProvenValueRange) == 8);
     std.debug.assert(@typeInfo(CodegenBackend) == .@"union");
+}
+
+test "Phase 7.6 built-in TypeId layouts, 3-tier closures, and variadic ABI recipes" {
+    const allocator = std.testing.allocator;
+    var interner = try StringInterner.init(allocator);
+    defer interner.deinit();
+    var pool = try InternPool.init(allocator);
+    defer pool.deinit();
+    var sym_table = try SymbolTable.init(allocator, &interner);
+    defer sym_table.deinit();
+
+    var resolver64 = TypeLayoutResolver.init(allocator, &pool, &sym_table, TargetSpec.X86_64_LINUX);
+    defer resolver64.deinit();
+    var resolver32 = TypeLayoutResolver.init(allocator, &pool, &sym_table, TargetSpec.WASM32_WASI);
+    defer resolver32.deinit();
+
+    const opaque_layout = try resolver64.resolveType(.opaque_ty);
+    try std.testing.expectEqual(@as(u64, 0), opaque_layout.size_bytes);
+    try std.testing.expect(opaque_layout.reprFlags().is_unsized);
+    try std.testing.expect(!opaque_layout.isZst());
+
+    const loc64 = try resolver64.resolveType(.source_loc_ty);
+    try std.testing.expectEqual(@as(u64, 8), loc64.size_bytes);
+    try std.testing.expectEqual(@as(u32, 8), loc64.alignBytes());
+    try std.testing.expect(loc64.hasNiche());
+    const opt_loc_ty = try pool.internOptional(.source_loc_ty);
+    try std.testing.expectEqual(@as(u64, 8), (try resolver64.resolveType(opt_loc_ty)).size_bytes);
+
+    const loc32 = try resolver32.resolveType(.source_loc_ty);
+    try std.testing.expectEqual(@as(u64, 4), loc32.size_bytes);
+
+    const spec_layout = try resolver64.resolveType(.fmt_spec_ty);
+    try std.testing.expectEqual(@as(u64, 8), spec_layout.size_bytes);
+    try std.testing.expectEqual(@as(u32, 4), spec_layout.alignBytes());
+
+    try std.testing.expectEqual(@as(u64, 32), (try resolver64.resolveType(.fmt_args_ty)).size_bytes);
+    try std.testing.expectEqual(@as(u64, 16), (try resolver32.resolveType(.fmt_args_ty)).size_bytes);
+    try std.testing.expectEqual(@as(u64, 16), (try resolver64.resolveType(.bencher_ty)).size_bytes);
+    try std.testing.expectEqual(@as(u64, 8), (try resolver64.resolveType(.task_group_base_ty)).size_bytes);
+    try std.testing.expectEqual(@as(u64, 8), (try resolver64.resolveType(.task_handle_base_ty)).size_bytes);
+
+    const tier1_closure = try pool.internClosureSignatureExt(&.{.i32_ty}, &.{.let_mode}, .i32_ty, .{}, .copy_tier, false, false, true);
+    const tier2_closure = try pool.internClosureSignatureExt(&.{.i32_ty}, &.{.let_mode}, .i32_ty, .{}, .auto_drop_tier, false, false, true);
+    try std.testing.expect(!isThreeWordClosureType(&pool, tier1_closure));
+    try std.testing.expect(isThreeWordClosureType(&pool, tier2_closure));
+    try std.testing.expectEqual(@as(u64, 16), (try resolver64.resolveType(tier1_closure)).size_bytes);
+    try std.testing.expectEqual(@as(u64, 24), (try resolver64.resolveType(tier2_closure)).size_bytes);
+
+    const raw_u8_ptr = try pool.internRawPtr(.u8_ty, false);
+    var var_recipe = try AbiClassifier.classifyFn(allocator, &resolver64, .{
+        .params = &.{.{ .type_id = raw_u8_ptr }},
+        .ret_ty = .i32_ty,
+        .is_extern_c = true,
+        .is_contextless = false,
+        .is_variadic = true,
+    });
+    defer var_recipe.deinit(allocator);
+    try std.testing.expect(var_recipe.is_variadic);
+    try std.testing.expectEqual(CallingConvKind.c_system, var_recipe.calling_conv);
+    try std.testing.expect(!var_recipe.has_implicit_context);
+
+    const backed_enum_ty = try pool.internNominal(.enum_ty, 0, .none, true, false, false);
+    try pool.setEnumBackingIntType(backed_enum_ty, .i16_ty);
+    const backed_layout = try resolver64.resolveType(backed_enum_ty);
+    try std.testing.expectEqual(@as(u64, 2), backed_layout.size_bytes);
+    try std.testing.expectEqual(SumReprKind.not_sum, backed_layout.sum_repr);
+    try std.testing.expectEqual(@as(?ResolvedSumDetail, null), try resolver64.getSumDetail(backed_enum_ty));
+
+    // Verify 128-bit backed `enum Mask128: u128` ABI classification on `wasm32` and `AAPCS64`:
+    const mask128_enum_ty = try pool.internNominal(.enum_ty, 1, .none, true, false, false);
+    try pool.setEnumBackingIntType(mask128_enum_ty, .u128_ty);
+    var wasm_c_rec = try AbiClassifier.classifyFn(allocator, &resolver32, .{
+        .params = &.{.{ .type_id = mask128_enum_ty }},
+        .ret_ty = mask128_enum_ty,
+        .is_extern_c = true,
+    });
+    defer wasm_c_rec.deinit(allocator);
+    try std.testing.expectEqual(AbiPassMode.direct_pair, wasm_c_rec.param_recipes[0].pass_mode);
+    try std.testing.expectEqual(@as(u8, 2), wasm_c_rec.param_recipes[0].piece_count);
+    try std.testing.expectEqual(@as(u32, 16), wasm_c_rec.param_recipes[0].lowered_size_bytes);
+    try std.testing.expect(wasm_c_rec.has_sret);
+
+    var resolver_arm64 = TypeLayoutResolver.init(allocator, &pool, &sym_table, TargetSpec.AARCH64_LINUX);
+    defer resolver_arm64.deinit();
+    const mask128_arm_lay = try resolver_arm64.resolveType(mask128_enum_ty);
+    try std.testing.expectEqual(@as(u64, 16), mask128_arm_lay.size_bytes);
+    try std.testing.expectEqual(@as(u32, 16), mask128_arm_lay.alignBytes());
+    var arm_c_rec = try AbiClassifier.classifyFn(allocator, &resolver_arm64, .{
+        .params = &.{.{ .type_id = mask128_enum_ty }},
+        .ret_ty = mask128_enum_ty,
+        .is_extern_c = true,
+    });
+    defer arm_c_rec.deinit(allocator);
+    try std.testing.expectEqual(AbiPassMode.direct_pair, arm_c_rec.param_recipes[0].pass_mode);
+    try std.testing.expectEqual(@as(u8, 16), arm_c_rec.param_recipes[0].pointee_align_bytes);
+    try std.testing.expectEqual(AbiPassMode.direct_pair, arm_c_rec.ret_recipe.pass_mode);
 }

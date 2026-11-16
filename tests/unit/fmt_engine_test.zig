@@ -308,17 +308,24 @@ test "test_fmt_advanced_declarations_function_types_unary_ops_and_patterns" {
         "    return base * 2;\n" ++
         "}\n\n" ++
         "type UnsafeHandler = unsafe fn(code: i32, flags: u32) -> i32;\n" ++
-        "type AsyncWorker = async fn(task_id: u64) -> Result[u32, IoError];\n\n" ++
+        "type AsyncWorker = async fn(task_id: u64) -> u32!IoError;\n\n" ++
         "impl Matrix {\n" ++
-        "    pub subscript row_slice(row_idx: usize) -> &[f64] {\n" ++
-        "        return self.rows;\n" ++
+        "    pub subscript(row_idx: usize, col_idx: usize) -> &[f64] {\n" ++
+        "        let {\n" ++
+        "            yield self.rows;\n" ++
+        "        }\n" ++
         "    }\n\n" ++
         "    pub subscript(idx: usize) -> f64 {\n" ++
-        "        return 0.0;\n" ++
+        "        let {\n" ++
+        "            yield 0.0;\n" ++
+        "        }\n" ++
+        "        inout {\n" ++
+        "            yield &mut self.slot;\n" ++
+        "        }\n" ++
         "    }\n" ++
         "}\n\n" ++
         "pub fn inspect_pattern(pt: Point, role: Role, flag: bool) -> i32 {\n" ++
-        "    let inv_flag = !flag;\n" ++
+        "    let inv_flag = not flag;\n" ++
         "    let neg_x = -pt.x;\n" ++
         "    let double_neg = - -neg_x;\n" ++
         "    match pt {\n" ++
@@ -668,4 +675,85 @@ test "test_fmt_preserves_comments_across_slot14_coalesced_trivia" {
         "    @trap();\n" ++
         "}\n";
     try expectCanonicalFormat(coalesced_header_src, expected_canonical_src, .{});
+}
+
+test "test_fmt_dr22_type_canonicalization_multiline_strings_and_attributes" {
+    const uncanonical_src =
+        "pub(pkg) extern \"c\" fn printf(fmt: *u8, ...) -> i32;\n\n" ++
+        "@no_panic\n" ++
+        "@cfg(os == \"windows\")\n" ++
+        "@inline\n" ++
+        "@no_alloc\n" ++
+        "pub(super) fn normalize(\n" ++
+        "    opt_val: Option[u32],\n" ++
+        "    res_val: Result[u32, IoError],\n" ++
+        "    /,\n" ++
+        "    *,\n" ++
+        "    out_slot: &out u64,\n" ++
+        ") -> unit {\n" ++
+        "    let count = 42u64;\n" ++
+        "    let ratio = 0.5f32;\n" ++
+        "    let raw_p = &raw mut out_slot;\n" ++
+        "    out_slot.* = raw_p.* + count + (ratio as u64);\n" ++
+        "    let updated = Config { enabled: true, ..own base_cfg };\n" ++
+        "  let msg = \"\"\"\n" ++
+        "  line one\n" ++
+        "    line two\n" ++
+        "  \"\"\";\n" ++
+        "    let _ = (opt_val, res_val, updated, msg);\n" ++
+        "    fsm: match state {\n" ++
+        "        0 => continue :fsm 1,\n" ++
+        "        _ => {},\n" ++
+        "    }\n" ++
+        "}\n";
+
+    var pass1 = try fmt_engine.formatSource(std.testing.allocator, uncanonical_src, FileId.fromInt(0));
+    defer pass1.deinit(std.testing.allocator);
+    try std.testing.expect(!pass1.has_syntax_errors);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "pub(pkg) extern \"C\" fn printf(fmt: *u8, ...) -> i32;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "@inline @no_alloc @no_panic\npub(super) fn normalize(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "opt_val: u32?,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "res_val: u32!IoError,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "out_slot: &out u64,\n) {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "let count = 42_u64;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "let ratio = 0.5_f32;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "..own base_cfg") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        pass1.formatted_text,
+        "    let msg = \"\"\"\n    line one\n      line two\n    \"\"\";\n",
+    ) != null);
+
+    try expectCanonicalFormat(pass1.formatted_text, pass1.formatted_text, .{});
+
+    // `@constructor` and `@builder_item` functions preserve `PascalCase` with zero `W0201` warnings (`SE-22`):
+    const pascal_exempt_src =
+        "@constructor\n" ++
+        "pub fn Button(label: str) -> i32 {\n" ++
+        "    let _ = label;\n" ++
+        "    return 1;\n" ++
+        "}\n\n" ++
+        "@builder_item\n" ++
+        "pub fn TextRow(scope: &mut i32, count: i32) {\n" ++
+        "    scope.* += count;\n" ++
+        "}\n";
+    var exempt_tok = TokenBuffer.init(std.testing.allocator);
+    defer exempt_tok.deinit();
+    var exempt_cst = LosslessCstArena.init(std.testing.allocator);
+    defer exempt_cst.deinit();
+    var exempt_ast = AstArena.init(std.testing.allocator);
+    defer exempt_ast.deinit();
+    var exempt_sink = DiagnosticSink.init(std.testing.allocator);
+    defer exempt_sink.deinit();
+    _ = try corex.parseSource(
+        pascal_exempt_src,
+        FileId.fromInt(0),
+        &exempt_tok,
+        &exempt_cst,
+        &exempt_ast,
+        &exempt_sink,
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 0), exempt_sink.diagnostics.items.len);
+    try expectCanonicalFormat(pascal_exempt_src, pascal_exempt_src, .{ .is_fix_mode = true });
 }

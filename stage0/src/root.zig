@@ -25,6 +25,8 @@ pub const parser = @import("parser.zig");
 pub const query_db = @import("query_db.zig");
 /// Hybrid steerable Wadler-Lindig formatter (`corex fmt`), 8-byte `DocArena`, and `--fix` engine.
 pub const fmt_engine = @import("fmt_engine.zig");
+/// Zero-legacy `corex upgrade` three-tier rule catalog (`DR-14`, `DR-21`, & `DR-22`).
+pub const upgrade_rules = @import("upgrade_rules.zig");
 /// Module & lexical scope name resolution, `SymbolTable`, `ScopeArena`, and Levenshtein typo engine.
 pub const symbol_resolver = @import("symbol_resolver.zig");
 /// Canonical 14-byte SoA `TypeNode` `InternPool` (`TypeArena`), Constrained Type Groups, and bidirectional type checker.
@@ -121,7 +123,7 @@ pub const LineIndex = vfs_sourcemap.LineIndex;
 pub const VfsSourceMap = vfs_sourcemap.VfsSourceMap;
 /// Ergonomic alias for `VfsSourceMap`.
 pub const SourceMap = vfs_sourcemap.SourceMap;
-/// 117-variant lexical token taxonomy (`DR-03` & `DR-21`).
+/// 120-variant lexical token taxonomy (`DR-03`, `DR-21`, & `DR-22`).
 pub const TokenKind = syntax_arenas.TokenKind;
 /// 1-byte bit-packed token trivia and lexical recovery flags.
 pub const TokenFlags = syntax_arenas.TokenFlags;
@@ -155,7 +157,7 @@ pub const Lexer = lexer.Lexer;
 pub const tokenize = lexer.tokenize;
 /// Canonical alias for `tokenize`.
 pub const lexFile = lexer.lexFile;
-/// Looks up a lexeme in the 49-keyword + 19-primitive-type table.
+/// Looks up a lexeme in the 50-keyword + 20-primitive-type table.
 pub const lookupKeywordOrPrim = lexer.lookupKeywordOrPrim;
 /// Classifies an identifier or keyword under the `DR-03` disjoint casing invariant.
 pub const classifyIdentifierOrKeyword = lexer.classifyIdentifierOrKeyword;
@@ -165,6 +167,30 @@ pub const toSnakeCase = lexer.toSnakeCase;
 pub const toPascalCase = lexer.toPascalCase;
 /// Converts an identifier to canonical `SCREAMING_SNAKE_CASE`.
 pub const toScreamingSnakeCase = lexer.toScreamingSnakeCase;
+/// Alignment directive inside an 8-byte `FmtSpec` (`DR-22` §1.7).
+pub const FmtAlignMode = lexer.FmtAlignMode;
+/// Sign rendering mode inside an 8-byte `FmtSpec` (`DR-22` §1.7).
+pub const FmtSignMode = lexer.FmtSignMode;
+/// Format presentation type code inside an 8-byte `FmtSpec` (`DR-22` §1.7).
+pub const FmtTypeCode = lexer.FmtTypeCode;
+/// Exact 8-byte stack-allocated format specifier descriptor (`DR-22` §1.7).
+pub const FmtSpec = lexer.FmtSpec;
+/// Decomposed numeric literal digits, radix, and explicit type suffix (`DR-22` §1.5).
+pub const ParsedNumericSuffix = lexer.ParsedNumericSuffix;
+/// Parses an interpolation format specifier body after `:` into an 8-byte `FmtSpec`.
+pub const parseFormatSpec = lexer.parseFormatSpec;
+/// Splits a numeric literal lexeme into its digit body, radix, and optional `TypeId` suffix.
+pub const extractNumericSuffix = lexer.extractNumericSuffix;
+/// Returns `true` if `lexeme` is a triple-quoted multiline string or byte-string literal.
+pub const isMultilineStringLexeme = lexer.isMultilineStringLexeme;
+/// Extracts and closing-quote dedents a `"""…"""` multiline string lexeme without decoding escapes.
+pub const extractMultilineStringContent = lexer.extractMultilineStringContent;
+/// Canonical alias for `extractMultilineStringContent`.
+pub const extractMultilineString = lexer.extractMultilineString;
+/// Cooks a non-interpolated string or byte-string literal lexeme (dedent + escape decoding).
+pub const cookStringLiteral = lexer.cookStringLiteral;
+/// Decodes a single-byte `b'x'` literal lexeme into its `u8` value.
+pub const extractByteLiteralValue = lexer.extractByteLiteralValue;
 /// 128-bit token kind bitset for $O(1)$ synchronization and lookahead checks.
 pub const TokenSet128 = parser.TokenSet128;
 /// Source byte edit descriptor for incremental re-lexing and re-parsing.
@@ -252,6 +278,26 @@ pub const formatSourceWithOptions = fmt_engine.formatSourceWithOptions;
 /// Tokenizes, parses, and formats `source` using default `FormatOptions`.
 pub const formatSource = fmt_engine.formatSource;
 
+// ------------------ Upgrade Rules Re-Exports ------------------
+/// Three-tier execution stage in `corex upgrade` (`DR-14` §2.2).
+pub const UpgradeEngineTier = upgrade_rules.UpgradeEngineTier;
+/// Specification wave introducing an upgrade rule (`DR-21` or `DR-22`).
+pub const UpgradeWave = upgrade_rules.UpgradeWave;
+/// Contiguous 1-byte identifier for canonical `corex upgrade` rules (`0..14`).
+pub const UpgradeRuleId = upgrade_rules.UpgradeRuleId;
+/// Static metadata descriptor for a `corex upgrade` transformation rule.
+pub const UpgradeRuleDescriptor = upgrade_rules.UpgradeRuleDescriptor;
+/// Total number of canonical `corex upgrade` rules (`15`).
+pub const UPGRADE_RULE_COUNT = upgrade_rules.UPGRADE_RULE_COUNT;
+/// Maximum fixed-point synergy passes executed by `corex upgrade` (`4`).
+pub const MAX_SYNERGY_PASSES = upgrade_rules.MAX_SYNERGY_PASSES;
+/// Dense 15-entry `corex upgrade` rule catalog (`UR-21-00`–`UR-22-06`).
+pub const UPGRADE_RULE_CATALOG = upgrade_rules.UPGRADE_RULE_CATALOG;
+/// Resolves a `"UR-XX-YY"` rule code to its `UpgradeRuleId` in $O(1)$ time.
+pub const lookupUpgradeRule = upgrade_rules.lookupUpgradeRule;
+/// Resolves a `"UR-XX-YY"` rule code to its `UpgradeRuleDescriptor` in $O(1)$ time.
+pub const resolveUpgradeRuleDescriptor = upgrade_rules.resolveUpgradeRuleDescriptor;
+
 // --------- Symbol Resolution & Type System Re-Exports ---------
 /// Disjoint symbol namespace (`type_ns`, `value_ns`, `const_ns`).
 pub const Namespace = symbol_resolver.Namespace;
@@ -315,7 +361,7 @@ pub const WireLayoutViolation = type_system.WireLayoutViolation;
 pub const NarrowCallKind = type_system.NarrowCallKind;
 /// Side-table record emitted by `TypeChecker` for `.narrow` / `.try_narrow` calls (`D-11`).
 pub const NarrowCallInfo = type_system.NarrowCallInfo;
-/// Evaluates Constrained Type Group satisfaction (`FromBytes`, `IntoBytes`, `Copy`, `Numeric`, …).
+/// Evaluates Constrained Type Group satisfaction (`FromBytes`, `IntoBytes`, `Copy`, `Number`, …).
 pub const checkGroupSatisfaction = type_system.checkGroupSatisfaction;
 /// Parameter passing convention mode (`DR-02`).
 pub const ParamMode = type_system.ParamMode;
@@ -451,7 +497,7 @@ pub const RawBlobConst = mir.RawBlobConst;
 pub const MirBlobStore = mir.MirBlobStore;
 /// Pre-codegen `@embed_bytes` materializer converting constant paths into `MirConst.raw_blob`.
 pub const materializeModuleEmbedBytes = mir.materializeModuleEmbedBytes;
-/// Vacated non-`Copy` `inout` `subscript` projection window recorded on `MirBody` (`Fix-06B`).
+/// Vacated non-`Copy` `&mut` `subscript` projection window recorded on `MirBody` (`Fix-06B`).
 pub const VacatedProjectionWindow = mir.VacatedProjectionWindow;
 /// Block-Argument SSA representation of a lowered function or constant body.
 pub const MirBody = mir.MirBody;
@@ -689,6 +735,7 @@ test "test_root_module_references_all_phase0_submodules" {
     _ = parser;
     _ = query_db;
     _ = fmt_engine;
+    _ = upgrade_rules;
     _ = symbol_resolver;
     _ = type_system;
     _ = hir;

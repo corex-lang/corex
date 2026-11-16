@@ -170,9 +170,9 @@ test "test_mir_vm_three_way_value_repr_execution_across_all_types" {
         "    return (seed << shift_bits) | low_tag;\n" ++
         "}\n" ++
         "pub fn read_ptr_val(ptr_in: &i64) -> i64 {\n" ++
-        "    return *ptr_in;\n" ++
+        "    return ptr_in.*;\n" ++
         "}\n" ++
-        "pub fn read_slice_head(items: [i64]) -> i64 {\n" ++
+        "pub fn read_slice_head(items: &[i64]) -> i64 {\n" ++
         "    return items[0];\n" ++
         "}\n" ++
         "pub fn run_all_reprs() -> i64 {\n" ++
@@ -203,7 +203,7 @@ test "test_mir_vm_three_way_value_repr_execution_across_all_types" {
         "    let fixed_i64: [i64; 2] = [6, 9];\n" ++
         "    let slice_first = read_slice_head(&fixed_i64);\n" ++
         "    return high_part + tup.0 + soa_arr[1].weight + (compact.code as i64) +\n" ++
-        "        (wide_bf.high_half as i64) + via_ref + slice_first + (tup.1.len as i64);\n" ++
+        "        (wide_bf.high_half as i64) + via_ref + slice_first + (tup.1.len() as i64);\n" ++
         "}\n";
 
     const layouts = [_]TargetLayout{ TargetLayout.NATIVE_64, TargetLayout.WASM32 };
@@ -329,7 +329,7 @@ test "test_mir_vm_comptime_diagnostics_e0501_e0502_e0507_and_e0510_with_stack_tr
         "}\n" ++
         "pub fn assert_callee(is_err_intr: bool, flag: bool) -> i32 {\n" ++
         "    if is_err_intr {\n" ++
-        "        if !flag {\n" ++
+        "        if not flag {\n" ++
         "            @compile_error(\"explicit user error\");\n" ++
         "        }\n" ++
         "        return 1;\n" ++
@@ -524,7 +524,7 @@ test "test_mir_vm_comptime_diagnostics_e0503_ffi_ptr_cast_and_embed_escapes" {
         "    return call_ffi_inner();\n" ++
         "}\n" ++
         "pub fn expose_ptr_inner(val_ref: &i32) -> usize {\n" ++
-        "    return unsafe { (val_ref as *const i32) as usize };\n" ++
+        "    return unsafe { (val_ref as *i32) as usize };\n" ++
         "}\n" ++
         "pub fn expose_ptr_outer() -> usize {\n" ++
         "    let local_num: i32 = 5;\n" ++
@@ -532,9 +532,9 @@ test "test_mir_vm_comptime_diagnostics_e0503_ffi_ptr_cast_and_embed_escapes" {
         "}\n" ++
         "pub fn bad_embed_escape(which_mode: i32) -> usize {\n" ++
         "    if which_mode == 0 {\n" ++
-        "        return @embed_bytes(\"../escape.bin\").len;\n" ++
+        "        return @embed_bytes(\"../escape.bin\").len();\n" ++
         "    }\n" ++
-        "    return @embed_bytes(\"CON\").len;\n" ++
+        "    return @embed_bytes(\"CON\").len();\n" ++
         "}\n";
 
     var bundle = try mir.lowerSourceToMir(
@@ -610,7 +610,7 @@ test "test_mir_vm_comptime_diagnostics_e0504_spatial_oob_and_negative_index" {
         "pub struct Cell {\n" ++
         "    pub val: i32,\n" ++
         "}\n" ++
-        "pub fn slice_read_oob(items: [i32], idx: usize) -> i32 {\n" ++
+        "pub fn slice_read_oob(items: &[i32], idx: usize) -> i32 {\n" ++
         "    return items[idx];\n" ++
         "}\n" ++
         "pub fn trigger_oob_inner(kind: i32, raw_idx: i32) -> i32 {\n" ++
@@ -802,7 +802,7 @@ test "test_mir_vm_comptime_diagnostics_e0506_temporal_uaf_null_and_rodata_write"
     const ptr_src =
         "pub fn leak_stack_ptr() -> *i32 {\n" ++
         "    var local_slot: i32 = 77;\n" ++
-        "    return unsafe { &local_slot as *i32 };\n" ++
+        "    return &raw local_slot;\n" ++
         "}\n" ++
         "pub fn loop_uaf_deref() -> i64 {\n" ++
         "    var keeper: i64 = 100;\n" ++
@@ -813,11 +813,11 @@ test "test_mir_vm_comptime_diagnostics_e0506_temporal_uaf_null_and_rodata_write"
         "        if step == 0 {\n" ++
         "            saved_ref = &iter_local;\n" ++
         "        } else {\n" ++
-        "            return *saved_ref;\n" ++
+        "            return saved_ref.*;\n" ++
         "        }\n" ++
         "        step = step + 1;\n" ++
         "    }\n" ++
-        "    return *saved_ref;\n" ++
+        "    return saved_ref.*;\n" ++
         "}\n";
 
     var bundle = try mir.lowerSourceToMir(
@@ -992,7 +992,7 @@ test "test_mir_vm_comptime_diagnostics_e0508_recursion_memory_caps_and_e0509_cyc
 
 test "test_mir_vm_all_nine_reflection_intrinsics_native64_vs_wasm32" {
     const refl_src =
-        "@attribute_schema(targets = [.StructField])\n" ++
+        "@attribute_schema(targets: [.StructField])\n" ++
         "pub struct FieldMeta {\n" ++
         "    pub slot_id: i32 = 0,\n" ++
         "}\n" ++
@@ -1001,7 +1001,7 @@ test "test_mir_vm_all_nine_reflection_intrinsics_native64_vs_wasm32" {
         "}\n" ++
         "pub struct PtrRecord {\n" ++
         "    pub ptr_ref: &i32,\n" ++
-        "    @FieldMeta(slot_id = 42)\n" ++
+        "    @FieldMeta(slot_id: 42)\n" ++
         "    pub tag_word: usize,\n" ++
         "}\n" ++
         "impl Identifiable for PtrRecord {\n" ++
@@ -1029,8 +1029,8 @@ test "test_mir_vm_all_nine_reflection_intrinsics_native64_vs_wasm32" {
         "        .None => 0,\n" ++
         "    };\n" ++
         "    let blob = @embed_bytes(\"assets/header.bin\");\n" ++
-        "    return sz * 1000 + al * 100 + fld + tname.len + has_yes + has_no +\n" ++
-        "        impl_yes + impl_no + attr_val + blob.len;\n" ++
+        "    return sz * 1000 + al * 100 + fld + tname.len() + has_yes + has_no +\n" ++
+        "        impl_yes + impl_no + attr_val + blob.len();\n" ++
         "}\n";
 
     var vfs_map: std.StringHashMapUnmanaged([]const u8) = .empty;
@@ -1121,9 +1121,9 @@ test "test_mir_vm_all_nine_reflection_intrinsics_native64_vs_wasm32" {
 
 test "test_mir_vm_pure_call_memo_cache_eviction_and_rodata_deduplication" {
     const memo_src =
-        "pub fn pure_checksum(slice_in: [u8], bias: i64) -> i64 {\n" ++
+        "pub fn pure_checksum(slice_in: &[u8], bias: i64) -> i64 {\n" ++
         "    var acc: i64 = bias;\n" ++
-        "    for idx in 0..slice_in.len {\n" ++
+        "    for idx in 0..slice_in.len() {\n" ++
         "        acc = acc * 31 + (slice_in[idx] as i64);\n" ++
         "    }\n" ++
         "    return acc;\n" ++
@@ -1185,18 +1185,16 @@ test "test_mir_vm_pure_call_memo_cache_eviction_and_rodata_deduplication" {
         &bundle.hir_bundle.interner,
         "pure_checksum",
     ).?;
-    const slice_u8_ty = try bundle.hir_bundle.pool.internSlice(.u8_ty, false);
     const ro_bytes_id = try rodata_pool.internBlob(&[_]u8{ 1, 2, 3 }, &.{}, 0);
-    const ro_slice_a = try vm_engine.makeFatSliceSlot(
-        slice_u8_ty,
-        .{ .alloc_id = ro_bytes_id, .byte_offset = 0 },
+    var fat_ro_bytes: [16]u8 = @splat(0);
+    std.mem.writeInt(u64, fat_ro_bytes[8..16], 3, .little);
+    const ro_fat_id = try rodata_pool.internBlob(
+        &fat_ro_bytes,
+        &[_]mir_vm.RodataReloc{.{ .byte_offset = 0, .target_alloc = ro_bytes_id }},
         3,
     );
-    const ro_slice_b = try vm_engine.makeFatSliceSlot(
-        slice_u8_ty,
-        .{ .alloc_id = ro_bytes_id, .byte_offset = 0 },
-        3,
-    );
+    const ro_slice_a = RegSlot{ .sym_ptr = .{ .alloc_id = ro_fat_id, .byte_offset = 0 } };
+    const ro_slice_b = RegSlot{ .sym_ptr = .{ .alloc_id = ro_fat_id, .byte_offset = 0 } };
     const ro_first = try vm_engine.evalBody(
         checksum_body,
         &[_]RegSlot{ ro_slice_a, .{ .scalar_i64 = 5 } },
@@ -1302,4 +1300,55 @@ test "test_mir_vm_standalone_pure_memo_structural_body_identity_without_db" {
     try std.testing.expectEqual(@as(i64, 13), add_second.slot.scalar_i64);
     try std.testing.expectEqual(@as(i64, 30), mul_second.slot.scalar_i64);
     try std.testing.expectEqual(@as(u64, 2), memo_cache.hit_count);
+}
+
+test "test_mir_vm_dr22_byte_literals_raw_ptr_deref_and_caller_location" {
+    const dr22_vm_src =
+        "pub fn caller_line(loc: SourceLoc = @caller_location()) -> i64 {\n" ++
+        "    return (loc.line as i64) + (loc.fn_name.len() as i64);\n" ++
+        "}\n" ++
+        "pub fn eval_dr22_vm() -> i64 {\n" ++
+        "    let magic: &[u8] = b\"CX\";\n" ++
+        "    let nl_byte: u8 = b'\\n';\n" ++
+        "    var local_cell: i64 = 100;\n" ++
+        "    let rw_ptr: *mut i64 = &raw mut local_cell;\n" ++
+        "    let ro_ptr: *i64 = &raw local_cell;\n" ++
+        "    unsafe {\n" ++
+        "        rw_ptr.* = ro_ptr.* + (magic[0] as i64) + (nl_byte as i64);\n" ++
+        "    }\n" ++
+        "    return local_cell + caller_line();\n" ++
+        "}\n";
+
+    var bundle = try mir.lowerSourceToMir(
+        std.testing.allocator,
+        FileId.fromInt(1),
+        dr22_vm_src,
+        TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer bundle.deinit();
+    try std.testing.expect(!bundle.hir_bundle.diagnostics.hasErrors());
+
+    var rodata_pool = RodataPool.init(std.testing.allocator);
+    defer rodata_pool.deinit();
+    var vm_engine = try MirVm.init(
+        std.testing.allocator,
+        &bundle.hir_bundle.interner,
+        &bundle.hir_bundle.pool,
+        &bundle.hir_bundle.sym_table,
+        &rodata_pool,
+        null,
+        &bundle.hir_bundle.diagnostics,
+        .{ .target_layout = TargetLayout.NATIVE_64 },
+    );
+    defer vm_engine.deinit();
+    try registerAllBodies(&vm_engine, &bundle);
+
+    const entry_body = bundle.mir_bundle.findBodyByName(
+        &bundle.hir_bundle.interner,
+        "eval_dr22_vm",
+    ).?;
+    // `local_cell = 100 + 67 ('C') + 10 ('\n') = 177`; `caller_line()` at line 13 inside `"eval_dr22_vm"` (`12` bytes) = `25` -> `202`:
+    const eval_res = try vm_engine.evalBody(entry_body, &.{});
+    try std.testing.expectEqual(@as(i64, 202), eval_res.slot.scalar_i64);
 }

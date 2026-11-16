@@ -258,8 +258,15 @@ test "test_mir_opt_dev_pipeline_d1_to_d4_subscript_dead_trap_ghost_strip_and_pru
         \\    pub cells: [i64; 4],
         \\}
         \\
-        \\pub subscript grid_cell(mut row: inout GridRow, idx: usize) -> i64 {
-        \\    yield row.cells[idx];
+        \\impl GridRow {
+        \\    pub subscript(idx: usize) -> i64 {
+        \\        let {
+        \\            yield self.cells[idx];
+        \\        }
+        \\        inout {
+        \\            yield &mut self.cells[idx];
+        \\        }
+        \\    }
         \\}
         \\
         \\@inline(always)
@@ -272,9 +279,9 @@ test "test_mir_opt_dev_pipeline_d1_to_d4_subscript_dead_trap_ghost_strip_and_pru
         \\        return 1 / 0;
         \\    }
         \\    var row = GridRow { cells: [2, 4, 6, 8] };
-        \\    grid_cell(row, 1) += seed;
-        \\    let cell_ref: &i64 = &grid_cell(row, 1);
-        \\    return scale_up(*cell_ref) + (5 * 4);
+        \\    row[1] += seed;
+        \\    let cell_ref: &i64 = &row[1];
+        \\    return scale_up(cell_ref.*) + (5 * 4);
         \\}
     ;
 
@@ -491,7 +498,7 @@ test "test_mir_opt_d5_layout_shape_dedup_positive_and_negative_soundness_guards"
         \\    let i_right: i32 = 44;
         \\    let chosen_u = select_ref(true, &u_left, &u_right);
         \\    let chosen_i = select_ref(false, &i_left, &i_right);
-        \\    return (*chosen_u as i64) + (*chosen_i as i64);
+        \\    return (chosen_u.* as i64) + (chosen_i.* as i64);
         \\}
     ;
 
@@ -570,7 +577,7 @@ test "test_mir_opt_d5_layout_shape_dedup_positive_and_negative_soundness_guards"
         \\    let sec_a = extract_second(tup_narrow_first) as i64;
         \\    let sec_b = extract_second(tup_wide_first) as i64;
         \\    var total: i64 = (signed_res.0 as i64) + ((unsigned_res.0 / div_u32) as i64);
-        \\    if signed_res.1 and !unsigned_res.1 {
+        \\    if signed_res.1 and not unsigned_res.1 {
         \\        total += sec_a + sec_b;
         \\    }
         \\    return total;
@@ -866,7 +873,7 @@ test "test_mir_opt_release_r3_vrp_assert_folding_and_u128_high_bit_soundness" {
         \\
         \\pub fn vrp_high_bit_u128(is_top_bit: bool) -> i64 {
         \\    var wide_num: u128 = 170141183460469231731687303715884105729;
-        \\    if !is_top_bit {
+        \\    if not is_top_bit {
         \\        wide_num = 25;
         \\    }
         \\    if wide_num < 10 {

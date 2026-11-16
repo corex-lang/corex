@@ -11,6 +11,7 @@ const std = @import("std");
 const mem_foundation = @import("mem_foundation.zig");
 const syntax_arenas = @import("syntax_arenas.zig");
 const diagnostic = @import("diag/diagnostic.zig");
+const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const symbol_resolver = @import("symbol_resolver.zig");
 const type_system = @import("type_system.zig");
@@ -46,6 +47,9 @@ const InternPool = type_system.InternPool;
 const ParamMode = type_system.ParamMode;
 const IntrinsicKind = type_system.IntrinsicKind;
 const TargetLayout = type_system.TargetLayout;
+const CfgEnv = type_system.CfgEnv;
+const StringInterpMeta = type_system.StringInterpMeta;
+const InterpHoleSpec = type_system.InterpHoleSpec;
 const BodySemanticSideTables = type_system.BodySemanticSideTables;
 const AttrArgValue = type_system.AttrArgValue;
 
@@ -214,18 +218,23 @@ pub const HirNode = struct {
 
 // ------------------ Operators, Casts & Specs ------------------
 
-/// Packed 32-bit bit-slice specification for LSB-first `bit_field` extraction and RMW (`DR-13` §2.2).
+/// Packed 32-bit bit-slice specification for LSB-first `bit_field` extraction and RMW (`DR-13` §2.2, `ADR-22D`).
 pub const BitSpec = packed struct(u32) {
-    /// Zero-based bit offset from the least-significant bit of the backing integer (`0..127`).
+    /// Low 8 bits of zero-based bit offset (`0..255`).
     bit_offset: u8 = 0,
     /// Width of the bit-field member in bits (`1..128`).
     bit_width: u8 = 0,
-    /// Width of the enclosing `bit_field` backing integer in bits (`8, 16, 32, 64, 128`).
+    /// Width of the enclosing scalar backing integer in bits (`8..128`, or `0` for `[u8; N]` backing).
     backing_bits: u8 = 0,
     /// `true` if the extracted field type requires arithmetic sign-extension.
     is_signed: bool = false,
-    /// Reserved zero padding bits.
-    _pad: u7 = 0,
+    /// Upper 7 bits of zero-based bit offset (`fullBitOffset() <= 32767` for `[u8; N]` backing).
+    bit_offset_hi: u7 = 0,
+
+    /// Returns the full 15-bit zero-based bit offset (`0..32767`).
+    pub inline fn fullBitOffset(self: BitSpec) u15 {
+        return @as(u15, self.bit_offset) | (@as(u15, self.bit_offset_hi) << 8);
+    }
 
     /// Represents `self` as a raw 32-bit unsigned integer.
     pub inline fn asU32(self: BitSpec) u32 {
@@ -252,16 +261,20 @@ pub const ReturnErrorKind = enum(u8) {
 pub const HirUnaryOp = enum(u8) {
     /// Two's-complement or IEEE-754 negation (`-x`).
     neg = 0,
-    /// Boolean logical negation (`not b` / `!b` on `bool`).
+    /// Boolean logical negation (`not b`).
     logical_not = 1,
-    /// Bitwise complement (`!x` on integers).
+    /// Bitwise complement (`~x` on integers, `bit_field`, and integer SIMD vectors).
     bit_not = 2,
     /// Shared address-of borrow (`&place`).
     addr_of = 3,
-    /// Exclusive mutable address-of borrow (`&mut place`).
+    /// Exclusive mutable or out-reference address-of borrow (`&mut place` / `&out place`).
     addr_of_mut = 4,
-    /// Pointer or reference dereference (`*ptr`).
+    /// Pointer or reference dereference (`ptr.*`).
     deref = 5,
+    /// Shared raw pointer address-of (`&raw place` -> `*T`, zero MVS loan).
+    addr_of_raw = 6,
+    /// Mutable raw pointer address-of (`&raw mut place` -> `*mut T`, zero MVS loan, allows uninitialized place).
+    addr_of_raw_mut = 7,
 };
 
 /// Compiler-internal `HIR` intrinsic sub-kinds encoded via `HIR_INTERNAL_INTRINSIC_FLAG` (`D-11`).
@@ -372,6 +385,10 @@ pub const HirConstructKind = enum(u8) {
     bitfield_zero = 9,
     /// Runtime string interpolation sequence (`extra = {part_len, part_0_hir, …}`).
     str_interp = 10,
+    /// Zero-allocation `FmtArgs` descriptor (`extra = {elem_len, piece_0..piece_k, arg_ref_0, spec_0, …}`).
+    fmt_args = 11,
+    /// Single-value formatted `str` conversion (`extra = {2, val_hir, spec_u64_hir}`).
+    fmt_value = 12,
 };
 
 // ---------------- Locals, Constants & Patterns ----------------
@@ -424,14 +441,18 @@ pub const HirFnMeta = struct {
     body_hir: HirIndex = .none,
     /// `true` if declared with `subscript` (`yield` projection).
     is_subscript: bool = false,
-    /// `true` if annotated or inferred as `contextless` / `@noalloc`.
+    /// `true` if this `HirFnMeta` represents the `inout` arm of a dual-arm `subscript` (`SE-21`).
+    is_subscript_inout_arm: bool = false,
+    /// `true` if annotated or inferred as `contextless` / `@no_alloc`.
     is_contextless: bool = false,
     /// `true` if declared `comptime fn`.
     is_comptime: bool = false,
     /// `true` if synthesized for `@derive(Eq, Hash, Debug, Clone)`.
     is_derived: bool = false,
-    /// `true` if this closure carries an explicit `@local` attribute (`CRIT-05`).
+    /// `true` if this closure carries an explicit `@local` attribute or Tier-1 borrow capture (`CRIT-05`, `SE-19`).
     is_local_closure: bool = false,
+    /// `true` if this closure captures outer bindings by ownership transfer (`own |…|`, Tier-2 `SE-19`).
+    is_move_closure: bool = false,
     /// Capture local pairs `(outer_local_id, inner_local_id)` range in `HirStore.extra_data` for closures.
     capture_extra_start: u32 = 0,
     /// Number of captured bindings for closures (`0` for non-capturing functions).
@@ -729,10 +750,30 @@ pub const HirStore = struct {
     loop_contracts: std.AutoHashMapUnmanaged(u32, LoopContractMeta) = .empty,
     /// Sparse explicit/inferred generic type-argument spans keyed by `hir_call` `HirIndex`.
     call_type_args: std.AutoHashMapUnmanaged(u32, CallTypeArgsSpan) = .empty,
+    /// Synthetic `hir_block` statement spans grouping Phase 3 parallel assignment commit stores (`SE-15`).
+    parallel_assign_blocks: std.AutoHashMapUnmanaged(u32, ParallelAssignSpan) = .empty,
+    /// Labeled `fsm: match` metadata keyed by `hir_match` `HirIndex` (`SE-23`).
+    labeled_matches: std.AutoHashMapUnmanaged(u32, LabeledMatchMeta) = .empty,
     /// Root `hir_module` or single-item `HirIndex` (`.none` when empty).
     root_hir: HirIndex = .none,
     /// `true` if `MAX_HIR_NODES` or `MAX_HIR_LOWER_DEPTH` was exceeded (`E0508`).
     has_overflowed_limits: bool = false,
+
+    /// Contiguous statement slice `[first_assign_idx .. first_assign_idx + assign_count)` inside a parallel `hir_block`.
+    pub const ParallelAssignSpan = struct {
+        /// First `hir_assign` index within the enclosing `hir_block` statement list.
+        first_assign_idx: u32,
+        /// Number of parallel leaf `hir_assign` statements committed together.
+        assign_count: u32,
+    };
+
+    /// Metadata recorded for a labeled `fsm: match` expression (`SE-23`).
+    pub const LabeledMatchMeta = struct {
+        /// Tagged FSM identifier (`LABELED_MATCH_CONTINUE_FLAG | ordinal`) matched by `hir_continue.lhs`.
+        fsm_id: u32,
+        /// Mutable temporary `LocalId` holding the active FSM scrutinee across `continue :fsm next` transitions.
+        scrutinee_local: u32,
+    };
 
     /// Initializes an empty `HirStore` bound to `allocator` and `file_id`.
     pub fn init(allocator: std.mem.Allocator, file_id: FileId) HirStore {
@@ -755,6 +796,8 @@ pub const HirStore = struct {
         self.const_elements.deinit(self.allocator);
         self.loop_contracts.deinit(self.allocator);
         self.call_type_args.deinit(self.allocator);
+        self.parallel_assign_blocks.deinit(self.allocator);
+        self.labeled_matches.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -895,6 +938,9 @@ pub const FIELD_ORDINAL_LEN: u32 = 0xFFFF_FFFE;
 /// High-bit tag in `hir_intrinsic_call.data.lhs` selecting `HirInternalIntrinsic` over `IntrinsicKind`.
 pub const HIR_INTERNAL_INTRINSIC_FLAG: u32 = 1 << 16;
 
+/// High-bit tag in `hir_continue.data.lhs` selecting a labeled `fsm: match` target (`SE-23`).
+pub const LABELED_MATCH_CONTINUE_FLAG: u32 = 1 << 31;
+
 /// Sentinel value indicating no `HirIndex` or optional child (`0xFFFF_FFFF`).
 pub const NONE_U32: u32 = std.math.maxInt(u32);
 
@@ -977,6 +1023,28 @@ const ActiveLoopEntry = struct {
     payload_ty: TypeId = .unit_ty,
     /// Concrete `Option[T]` `TypeId` when `result_opt_local != NONE_U32` (`.unit_ty` otherwise).
     opt_ty: TypeId = .unit_ty,
+};
+
+/// Active `@builder` block state binding on `HirLowerer.builder_scope_stack` (`SE-22`).
+const BuilderScopeEntry = struct {
+    /// Underlying builder state struct `TypeId` (`S` in `&mut S`).
+    state_ty: TypeId,
+    /// Local slot holding `&mut S` or `S` inside the trailing `@builder` block.
+    local_id: u32,
+};
+
+/// Active labeled `fsm: match` entry on `HirLowerer.labeled_match_stack` (`SE-23`).
+const ActiveLabeledMatch = struct {
+    /// AST `NodeIndex` of the enclosing `.match_expr`.
+    match_ast: NodeIndex = .none,
+    /// Tagged FSM identifier (`LABELED_MATCH_CONTINUE_FLAG | ordinal`).
+    fsm_id: u32,
+    /// Interned `:label` identifier (`SymbolId.empty` when unnamed).
+    label_id: SymbolId = .empty,
+    /// Mutable temporary `LocalId` holding the active FSM scrutinee.
+    scrutinee_local: u32,
+    /// Expected scrutinee `TypeId` for `continue :fsm next_state`.
+    scrutinee_ty: TypeId,
 };
 
 /// Stateful `AST -> HIR` desugaring, `@derive` synthesis, and `comptime` unrolling engine.
@@ -1065,6 +1133,8 @@ const HirLowerer = struct {
     interp_override_token: TokenIndex = .none,
     /// Override outer span used while lowering sub-parsed `{expr}` string interpolation HIR nodes (`MAJ-08`).
     interp_override_span: ?Span = null,
+    /// Override caller source buffer paired with `interp_override_span` for cross-file `@caller_location()` (`SE-17`).
+    interp_override_source: ?[]const u8 = null,
     /// Stack of active loops in the current function for `:label` and `Option[T]` `break` resolution (`SE-05`/`SE-06`).
     loop_stack: std.ArrayListUnmanaged(ActiveLoopEntry) = .empty,
     /// Floor index in `loop_stack` isolating inner closures from outer function loops.
@@ -1075,6 +1145,22 @@ const HirLowerer = struct {
     is_in_cond_scope: bool = false,
     /// `true` while lowering the direct target place of an assignment, `&mut`, or `inout` / `set` receiver (`SE-04`).
     is_mut_lvalue_ctx: bool = false,
+    /// Target `@cfg(…)` evaluation context matching `store.target_layout` (`SE-18`).
+    cfg_env: CfgEnv = .{},
+    /// Interned name of the currently lowering function or method (`SE-17`).
+    active_fn_name: SymbolId = .empty,
+    /// Formal `loc: SourceLoc = @caller_location()` parameter slot in the active function (`null` if none, `SE-17`).
+    active_caller_loc_local: ?u32 = null,
+    /// `true` while lowering the body of an `inout` `subscript` arm (`SE-21`).
+    is_in_subscript_inout_arm: bool = false,
+    /// Active `@builder` state stack for implicit `@builder_item` receiver injection (`SE-22`).
+    builder_scope_stack: std.ArrayListUnmanaged(BuilderScopeEntry) = .empty,
+    /// Active labeled `fsm: match` stack for `continue :fsm next` state transitions (`SE-23`).
+    labeled_match_stack: std.ArrayListUnmanaged(ActiveLabeledMatch) = .empty,
+    /// Monotonic counter assigning unique `fsm_id` handles to labeled `match` expressions (`SE-23`).
+    next_fsm_id: u32 = 0,
+    /// Pre-evaluated LHS index/pointer HIR nodes keyed by `NodeIndex.asInt()` during Phase-0 parallel assignment (`SE-15`).
+    parallel_pre_eval: std.AutoHashMapUnmanaged(u32, HirIndex) = .empty,
 
     /// Initializes a `HirLowerer` with precomputed $O(1)$ AST/CST auxiliary index maps.
     fn init(
@@ -1094,6 +1180,12 @@ const HirLowerer = struct {
         const extra_ends = try syntax_arenas.computeAstNodeExtraEnds(allocator, ast_arena);
         errdefer if (extra_ends.len > 0) allocator.free(extra_ends);
         const cst_map = try syntax_arenas.computeCstToAstMap(allocator, cst_arena.countNodes(), ast_arena);
+        const derived_cfg: CfgEnv = if (store.target_layout.ptr_byte_size == 4)
+            .{ .os = .wasi, .arch = .wasm32, .abi = .wasi, .ptr_width = 32 }
+        else if (store.target_layout.cache_line_align_log2 == 7)
+            .{ .os = .macos, .arch = .aarch64, .abi = .apple, .ptr_width = 64 }
+        else
+            .{};
         return .{
             .allocator = allocator,
             .store = store,
@@ -1110,6 +1202,7 @@ const HirLowerer = struct {
             .node_extra_end = extra_ends,
             .cst_to_ast = cst_map,
             .zip_arena = std.heap.ArenaAllocator.init(allocator),
+            .cfg_env = derived_cfg,
         };
     }
 
@@ -1128,6 +1221,9 @@ const HirLowerer = struct {
         self.zip_shadow_log.deinit(self.allocator);
         self.loop_stack.deinit(self.allocator);
         self.dollar_len_stack.deinit(self.allocator);
+        self.builder_scope_stack.deinit(self.allocator);
+        self.labeled_match_stack.deinit(self.allocator);
+        self.parallel_pre_eval.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -1247,6 +1343,44 @@ const HirLowerer = struct {
             }
         }
         return cur;
+    }
+
+    /// Returns the element `TypeId` when `ty` is an `SE-09` union-bounded slice/str type variable (`[Data: str | &[u8]]`).
+    fn unionSliceElemType(self: *const HirLowerer, ty: TypeId) ?TypeId {
+        const node = self.pool.getNode(ty);
+        if (node.tag != .type_param and node.tag != .bind_once_group_var and node.tag != .bind_many_any_var) {
+            return null;
+        }
+        const grp_ty = TypeId.fromInt(node.lhs);
+        const grp_node = self.pool.getNode(grp_ty);
+        if (grp_node.tag != .user_group or grp_node.rhs == type_system.INTERSECT_GROUP_SENTINEL) return null;
+        const view = self.pool.getUserGroupView(grp_ty) orelse return null;
+        var member_count: usize = 0;
+        var common_elem: TypeId = .u8_ty;
+        const combined_prim_mask = view.prim_mask | view.tilde_prim_mask;
+        var prim_idx: u32 = 0;
+        while (prim_idx <= 18) : (prim_idx += 1) {
+            const prim_tid = TypeId.fromInt(prim_idx);
+            if (!type_system.TypeGroupMask.containsPrimitive(combined_prim_mask, prim_tid)) continue;
+            if (prim_tid != .str_ty) return null;
+            if (member_count == 0) common_elem = .u8_ty else if (common_elem != .u8_ty) common_elem = .u8_ty;
+            member_count += 1;
+        }
+        const lists = [2][]const u32{ view.exact_members, view.tilde_members };
+        for (lists) |mem_list| {
+            for (mem_list) |raw_mem| {
+                const unwrapped_mem = self.unwrapRefType(self.pool.unwrapUnderlyingType(TypeId.fromInt(raw_mem)));
+                var mem_elem: TypeId = .u8_ty;
+                if (unwrapped_mem != .str_ty) {
+                    const mem_node = self.pool.getNode(unwrapped_mem);
+                    if (mem_node.tag != .slice_ty and mem_node.tag != .array_ty) return null;
+                    mem_elem = TypeId.fromInt(mem_node.lhs);
+                }
+                if (member_count == 0) common_elem = mem_elem else if (common_elem != mem_elem) common_elem = .u8_ty;
+                member_count += 1;
+            }
+        }
+        return if (member_count > 0) common_elem else null;
     }
 
     /// Queries `side_tables` for the resolved `TypeId` of `node_id`, falling back to lexical/literal types.
@@ -1525,7 +1659,7 @@ const HirLowerer = struct {
         return mod_hir;
     }
 
-    /// Lowers a single `DefId` item (and any `@derive` methods if `DefId` is a nominal type) in isolation.
+    /// Lowers a single `DefId` item (and any `@derive` methods or referenced same-file `subscript`s) in isolation.
     fn lowerSingleDef(self: *HirLowerer, def_id: DefId) !HirIndex {
         if (def_id.isNone()) return .none;
         self.active_owner_def_id = def_id;
@@ -1534,6 +1668,7 @@ const HirLowerer = struct {
             self.sym_table.prelude_scope;
         self.current_scope = mod_scope;
 
+        var root_result: HirIndex = .none;
         if (self.sym_table.def_to_symbol.get(def_id.asInt())) |sym_idx| {
             const sym = self.sym_table.getSymbol(sym_idx).*;
             self.current_scope = sym.scope_id;
@@ -1551,11 +1686,8 @@ const HirLowerer = struct {
                     }
                 }
             }
-            self.store.root_hir = lowered;
-            return lowered;
-        }
-
-        if (self.ast_arena.countNodes() > 0) {
+            root_result = lowered;
+        } else if (self.ast_arena.countNodes() > 0) {
             const root_node = self.ast_arena.getNode(.root);
             if (root_node.lhs.tag == .extra and root_node.rhs.tag == .extra and root_node.rhs.payload > 0) {
                 const item_slice = self.ast_arena.getExtraSlice(
@@ -1581,6 +1713,7 @@ const HirLowerer = struct {
                                 const cand_sym = self.sym_table.getSymbol(cand_sym_idx).*;
                                 if (cand_sym.owner_def_id != def_id) continue;
                                 if (cand_sym.kind != .fn_sym and cand_sym.kind != .const_sym) continue;
+                                if (!self.isSymbolCfgEnabled(cand_sym_idx)) continue;
 
                                 var matched_ast_override: ?NodeIndex = null;
                                 while (mem_cursor < impl_members.len) {
@@ -1588,9 +1721,12 @@ const HirLowerer = struct {
                                     mem_cursor += 1;
                                     if (mem_ast_idx.asInt() >= self.ast_arena.countNodes()) continue;
                                     const mem_ast = self.ast_arena.getNode(mem_ast_idx);
-                                    const is_kind_match = (cand_sym.kind == .fn_sym and mem_ast.tag == .fn_decl) or
+                                    const is_fn_like = mem_ast.tag == .fn_decl or mem_ast.tag == .subscript_decl or
+                                        mem_ast.tag == .test_decl or mem_ast.tag == .bench_decl;
+                                    const is_kind_match = (cand_sym.kind == .fn_sym and is_fn_like) or
                                         (cand_sym.kind == .const_sym and mem_ast.tag == .const_decl);
                                     if (!is_kind_match) continue;
+                                    if (!self.isCstNodeCfgEnabled(self.ast_arena.getCstOrigin(mem_ast_idx))) continue;
                                     matched_ast_override = mem_ast_idx;
                                     break;
                                 }
@@ -1606,7 +1742,7 @@ const HirLowerer = struct {
                             }
 
                             const extra_start = try self.store.appendExtraSlice(lowered_members.items);
-                            const impl_mod_hir = try self.emitNode(.{
+                            root_result = try self.emitNode(.{
                                 .tag = .hir_module,
                                 .flags = .{ .category = .rvalue },
                                 .type_id = .unit_ty,
@@ -1616,19 +1752,132 @@ const HirLowerer = struct {
                                     .rhs = @intCast(lowered_members.items.len),
                                 },
                             }, item_id);
-                            self.store.root_hir = impl_mod_hir;
-                            return impl_mod_hir;
+                        } else {
+                            root_result = try self.lowerBlockExpr(item_id, .unit_ty, false);
                         }
-
-                        const lowered = try self.lowerBlockExpr(item_id, .unit_ty, false);
-                        self.store.root_hir = lowered;
-                        return lowered;
+                        break;
                     }
                     if (ordinal < std.math.maxInt(u12)) ordinal += 1;
                 }
             }
         }
-        return .none;
+
+        if (!root_result.isNone()) {
+            try self.populateReferencedSameFileSubscripts();
+            self.store.root_hir = root_result;
+        }
+        return root_result;
+    }
+
+    /// Scans `self.store.nodes` to a bounded fixpoint and lowers any referenced same-file `subscript` templates
+    /// declared in separate `impl` or top-level `DefId`s so `MirLowerer` can splice both `let` and `inout` arms.
+    fn populateReferencedSameFileSubscripts(self: *HirLowerer) !void {
+        var scan_idx: usize = 0;
+        while (scan_idx < self.store.nodes.len) : (scan_idx += 1) {
+            const cur_node = self.store.nodes.get(scan_idx);
+            if (cur_node.tag != .hir_subscript_call) continue;
+            const callee_hir = HirIndex.fromInt(cur_node.data.lhs);
+            if (callee_hir.isNone() or callee_hir.asInt() >= self.store.nodes.len) continue;
+            const callee_node = self.store.getNode(callee_hir);
+            if (callee_node.tag != .hir_global_ref) continue;
+            const sub_sym_idx = SymbolIndex.fromInt(callee_node.data.rhs);
+            if (sub_sym_idx.isNone() or sub_sym_idx.asInt() >= self.sym_table.symbols.items.len) continue;
+
+            var has_existing = false;
+            for (self.store.functions.items) |fn_meta| {
+                if (fn_meta.is_subscript and fn_meta.symbol_index == sub_sym_idx) {
+                    has_existing = true;
+                    break;
+                }
+            }
+            if (has_existing) continue;
+
+            const sub_sym = self.sym_table.getSymbol(sub_sym_idx).*;
+            if (!sub_sym.decl_span.file_id.isNone() and sub_sym.decl_span.file_id != self.store.file_id) continue;
+            if (!self.isSymbolCfgEnabled(sub_sym_idx)) continue;
+
+            const matched_ast = self.resolveSameFileSubscriptAst(sub_sym_idx);
+            const saved_tables = self.side_tables;
+            const saved_scope = self.current_scope;
+            self.side_tables = null;
+            self.current_scope = sub_sym.scope_id;
+            defer {
+                self.side_tables = saved_tables;
+                self.current_scope = saved_scope;
+            }
+            _ = try self.lowerSymbolItemWithAstOverride(sub_sym_idx, matched_ast);
+        }
+    }
+
+    /// Resolves the `.subscript_decl` `NodeIndex` for `sub_sym_idx` inside `self.ast_arena` when `ast_node` was cleared.
+    fn resolveSameFileSubscriptAst(
+        self: *const HirLowerer,
+        sub_sym_idx: SymbolIndex,
+    ) ?NodeIndex {
+        const sub_sym = self.sym_table.getSymbol(sub_sym_idx).*;
+        if (!sub_sym.ast_node.isNone() and sub_sym.ast_node.asInt() < self.ast_arena.countNodes() and
+            self.ast_arena.getNode(sub_sym.ast_node).tag == .subscript_decl)
+        {
+            return sub_sym.ast_node;
+        }
+        if (!sub_sym.owner_def_id.isNone() and self.ast_arena.countNodes() > 0) {
+            const root_node = self.ast_arena.getNode(.root);
+            if (root_node.lhs.tag == .extra and root_node.rhs.tag == .extra and root_node.rhs.payload > 0) {
+                const item_slice = self.ast_arena.getExtraSlice(
+                    ExtraIndex.fromInt(root_node.lhs.payload),
+                    root_node.rhs.payload,
+                );
+                var ordinal: u12 = 0;
+                for (item_slice) |raw_idx| {
+                    const item_id = NodeIndex.fromInt(raw_idx);
+                    if (item_id.asInt() >= self.ast_arena.countNodes()) continue;
+                    if (self.ast_arena.getNode(item_id).tag == .item_hole) continue;
+                    if (ordinal == sub_sym.owner_def_id.itemIndex()) {
+                        if (self.ast_arena.getNode(item_id).tag == .impl_decl) {
+                            const impl_members = symbol_resolver.extractImplMemberItems(self.ast_arena, item_id);
+                            var mem_cursor: usize = 0;
+                            var sym_raw: u32 = 0;
+                            while (sym_raw < self.sym_table.symbols.items.len) : (sym_raw += 1) {
+                                const cand_sym_idx = SymbolIndex.fromInt(sym_raw);
+                                const cand_sym = self.sym_table.getSymbol(cand_sym_idx).*;
+                                if (cand_sym.owner_def_id != sub_sym.owner_def_id) continue;
+                                if (cand_sym.kind != .fn_sym and cand_sym.kind != .const_sym) continue;
+                                if (!self.isSymbolCfgEnabled(cand_sym_idx)) continue;
+
+                                var matched_override: ?NodeIndex = null;
+                                while (mem_cursor < impl_members.len) {
+                                    const mem_ast_idx = NodeIndex.fromInt(impl_members[mem_cursor]);
+                                    mem_cursor += 1;
+                                    if (mem_ast_idx.asInt() >= self.ast_arena.countNodes()) continue;
+                                    const mem_ast = self.ast_arena.getNode(mem_ast_idx);
+                                    const is_fn_like = mem_ast.tag == .fn_decl or mem_ast.tag == .subscript_decl or
+                                        mem_ast.tag == .test_decl or mem_ast.tag == .bench_decl;
+                                    const is_kind_match = (cand_sym.kind == .fn_sym and is_fn_like) or
+                                        (cand_sym.kind == .const_sym and mem_ast.tag == .const_decl);
+                                    if (!is_kind_match) continue;
+                                    if (!self.isCstNodeCfgEnabled(self.ast_arena.getCstOrigin(mem_ast_idx))) continue;
+                                    matched_override = mem_ast_idx;
+                                    break;
+                                }
+                                if (cand_sym_idx == sub_sym_idx) return matched_override;
+                            }
+                        }
+                        break;
+                    }
+                    if (ordinal < std.math.maxInt(u12)) ordinal += 1;
+                }
+            }
+        }
+        var raw_node_idx: u32 = 0;
+        while (raw_node_idx < self.ast_arena.countNodes()) : (raw_node_idx += 1) {
+            const cand_id = NodeIndex.fromInt(raw_node_idx);
+            const cand_node = self.ast_arena.getNode(cand_id);
+            if (cand_node.tag != .subscript_decl or cand_node.main_token.isNone() or
+                cand_node.main_token.asInt() >= self.tokens.countTokens()) continue;
+            const tok_span = self.tokens.getTokenSpan(self.store.file_id, cand_node.main_token);
+            if (tok_span.start_byte == sub_sym.decl_span.start_byte) return cand_id;
+        }
+        return null;
     }
 
     /// Lowers a slice of AST module items inside `scope_id`, appending resulting `HirIndex` handles to `out_items`.
@@ -1647,6 +1896,7 @@ const HirLowerer = struct {
             const sym = self.sym_table.getSymbol(sym_idx).*;
             if (sym.flags.is_builtin or sym.flags.is_imported) continue;
             if (!sym.decl_span.file_id.isNone() and sym.decl_span.file_id != self.store.file_id) continue;
+            if (!self.isSymbolCfgEnabled(sym_idx)) continue;
 
             switch (sym.kind) {
                 .fn_sym, .const_sym => {
@@ -1660,6 +1910,7 @@ const HirLowerer = struct {
                         for (self.sym_table.getScopeMembers(sym.target_scope)) |member_idx| {
                             const member_sym = self.sym_table.getSymbol(member_idx).*;
                             if (member_sym.kind == .fn_sym and !member_sym.flags.is_imported) {
+                                if (!self.isSymbolCfgEnabled(member_idx)) continue;
                                 const method_hir = if (member_sym.flags.is_prototype_only and sym.derive_mask.hasAny())
                                     try self.synthesizeDerivedMethodHir(sym_idx, member_idx)
                                 else
@@ -1774,21 +2025,25 @@ const HirLowerer = struct {
         const eff_ast = ast_override orelse fn_sym.ast_node;
         if (fn_sym.flags.is_prototype_only and !eff_ast.isNone()) {
             const proto_ast = self.ast_arena.getNode(eff_ast);
-            if (proto_ast.rhs.tag != .node) return .none;
+            if (proto_ast.rhs.tag != .node and proto_ast.rhs.tag != .extra) return .none;
         }
         if (eff_ast.isNone()) return .none;
 
         const fn_ast = self.ast_arena.getNode(eff_ast);
         const sig_view = self.pool.getFnSignatureView(fn_sym.type_id) orelse return .none;
 
-        const is_subscript = !fn_ast.main_token.isNone() and
+        const is_subscript = fn_ast.tag == .subscript_decl or (!fn_ast.main_token.isNone() and
             fn_ast.main_token.asInt() < self.tokens.countTokens() and
             std.mem.eql(
                 u8,
                 symbol_resolver.extractTokenSlice(self.source, self.tokens, fn_ast.main_token),
                 "subscript",
-            );
-        const is_contextless = self.hasContextlessAttr(fn_sym_idx);
+            ));
+        const is_contextless = self.hasContextlessAttr(fn_sym_idx) or sig_view.is_c_abi;
+
+        if (fn_ast.tag == .subscript_decl and fn_ast.rhs.tag == .extra) {
+            return self.lowerSubscriptDeclArms(fn_sym_idx, eff_ast, sig_view, is_contextless);
+        }
 
         const saved_scope = self.current_scope;
         const saved_ret_ty = self.current_fn_ret_ty;
@@ -1796,17 +2051,27 @@ const HirLowerer = struct {
         const saved_closure_ceil = self.closure_outer_local_ceil;
         const saved_owner_def = self.active_owner_def_id;
         const saved_closure_ord = self.closure_ordinal_in_owner;
+        const saved_fn_name = self.active_fn_name;
+        const saved_caller_loc = self.active_caller_loc_local;
+        const saved_in_sub_inout = self.is_in_subscript_inout_arm;
+        const builder_floor = self.builder_scope_stack.items.len;
+        const fsm_floor = self.labeled_match_stack.items.len;
         const local_checkpoint = self.local_shadow_log.items.len;
         const ct_checkpoint = self.comptime_shadow_log.items.len;
         defer {
             self.popComptimeBindingsTo(ct_checkpoint);
             self.popLexicalLocalsTo(local_checkpoint);
+            self.builder_scope_stack.items.len = builder_floor;
+            self.labeled_match_stack.items.len = fsm_floor;
             self.current_scope = saved_scope;
             self.current_fn_ret_ty = saved_ret_ty;
             self.current_loop_id = saved_loop_id;
             self.closure_outer_local_ceil = saved_closure_ceil;
             self.active_owner_def_id = saved_owner_def;
             self.closure_ordinal_in_owner = saved_closure_ord;
+            self.active_fn_name = saved_fn_name;
+            self.active_caller_loc_local = saved_caller_loc;
+            self.is_in_subscript_inout_arm = saved_in_sub_inout;
         }
 
         self.current_scope = if (!fn_sym.target_scope.isNone()) fn_sym.target_scope else fn_sym.scope_id;
@@ -1817,6 +2082,9 @@ const HirLowerer = struct {
         self.dollar_len_stack.clearRetainingCapacity();
         self.is_in_cond_scope = false;
         self.closure_outer_local_ceil = 0;
+        self.active_fn_name = fn_sym.name;
+        self.active_caller_loc_local = null;
+        self.is_in_subscript_inout_arm = false;
         if (!fn_sym.def_id.isNone()) {
             self.active_owner_def_id = fn_sym.def_id;
             self.closure_ordinal_in_owner = 0;
@@ -1846,6 +2114,7 @@ const HirLowerer = struct {
                 }
             }
         }
+        const fn_param_specs = self.sym_table.fn_param_specs.get(fn_sym_idx.asInt());
 
         var param_idx: usize = 0;
         while (param_idx < sig_view.paramCount()) : (param_idx += 1) {
@@ -1871,6 +2140,11 @@ const HirLowerer = struct {
                 .is_comptime = !p_sym_idx.isNone() and self.sym_table.getSymbol(p_sym_idx).flags.is_comptime,
                 .symbol_index = p_sym_idx,
             });
+            if (fn_param_specs) |specs| {
+                if (param_idx < specs.len and specs[param_idx].is_caller_location_default) {
+                    self.active_caller_loc_local = slot_id;
+                }
+            }
             if (!p_sym_idx.isNone()) {
                 try self.symbol_to_local.put(self.allocator, p_sym_idx.asInt(), slot_id);
             }
@@ -1998,11 +2272,551 @@ const HirLowerer = struct {
         return false;
     }
 
-    /// Checks whether `fn_sym_idx` carries a `@noalloc` or `@contextless` attribute in CST.
+    /// Lowers `subscript(…) -> Elem { let { … } inout { … } }` accessor arms into `HirStore.functions` (`SE-21`).
+    fn lowerSubscriptDeclArms(
+        self: *HirLowerer,
+        fn_sym_idx: SymbolIndex,
+        eff_ast: NodeIndex,
+        sig_view: type_system.FnSignatureView,
+        is_contextless: bool,
+    ) anyerror!HirIndex {
+        const fn_sym = self.sym_table.getSymbol(fn_sym_idx).*;
+        const fn_ast = self.ast_arena.getNode(eff_ast);
+        const extra_start: usize = fn_ast.rhs.payload;
+        if (extra_start >= self.ast_arena.extra_data.items.len) return .none;
+        const arm_count: usize = self.ast_arena.extra_data.items[extra_start];
+        if (arm_count == 0) return .none;
+
+        const self_sym_id = try self.interner.intern("self");
+        const self_type_sym_id = try self.interner.intern("Self");
+        const base_fn_scope = if (!fn_sym.target_scope.isNone()) fn_sym.target_scope else fn_sym.scope_id;
+        const has_explicit_self = self.hasSubscriptExplicitSelf(fn_sym_idx);
+        const enclosing_self_ty: TypeId = switch (self.sym_table.lookupLexical(
+            fn_sym.scope_id,
+            self_type_sym_id,
+            NamespaceMask.TYPE_ONLY,
+        )) {
+            .found => |self_ty_idx| self.sym_table.getSymbol(self_ty_idx).type_id,
+            else => .err_ty,
+        };
+
+        const param_syms = try self.allocator.alloc(SymbolIndex, sig_view.paramCount());
+        defer if (param_syms.len > 0) self.allocator.free(param_syms);
+        @memset(param_syms, .none);
+        if (!fn_sym.target_scope.isNone()) {
+            for (self.sym_table.getScopeMembers(fn_sym.target_scope)) |mem_idx| {
+                const mem_sym = self.sym_table.getSymbol(mem_idx).*;
+                if (mem_sym.kind == .param_sym and mem_sym.member_ordinal < param_syms.len) {
+                    param_syms[mem_sym.member_ordinal] = mem_idx;
+                }
+            }
+        }
+
+        const saved_scope = self.current_scope;
+        const saved_ret_ty = self.current_fn_ret_ty;
+        const saved_loop_id = self.current_loop_id;
+        const saved_closure_ceil = self.closure_outer_local_ceil;
+        const saved_owner_def = self.active_owner_def_id;
+        const saved_closure_ord = self.closure_ordinal_in_owner;
+        const saved_fn_name = self.active_fn_name;
+        const saved_caller_loc = self.active_caller_loc_local;
+        const saved_in_sub_inout = self.is_in_subscript_inout_arm;
+        defer {
+            self.current_scope = saved_scope;
+            self.current_fn_ret_ty = saved_ret_ty;
+            self.current_loop_id = saved_loop_id;
+            self.closure_outer_local_ceil = saved_closure_ceil;
+            self.active_owner_def_id = saved_owner_def;
+            self.closure_ordinal_in_owner = saved_closure_ord;
+            self.active_fn_name = saved_fn_name;
+            self.active_caller_loc_local = saved_caller_loc;
+            self.is_in_subscript_inout_arm = saved_in_sub_inout;
+        }
+
+        if (!fn_sym.def_id.isNone()) {
+            self.active_owner_def_id = fn_sym.def_id;
+            self.closure_ordinal_in_owner = 0;
+        }
+
+        var first_decl_hir: HirIndex = .none;
+        var arm_idx: usize = 0;
+        while (arm_idx < arm_count) : (arm_idx += 1) {
+            const pair_base = extra_start + 1 + arm_idx * 2;
+            if (pair_base + 1 >= self.ast_arena.extra_data.items.len) break;
+            const arm_mode = self.ast_arena.extra_data.items[pair_base];
+            const arm_blk_id = NodeIndex.fromInt(self.ast_arena.extra_data.items[pair_base + 1]);
+            if (arm_blk_id.isNone() or arm_blk_id.asInt() >= self.ast_arena.countNodes()) continue;
+
+            const local_checkpoint = self.local_shadow_log.items.len;
+            const ct_checkpoint = self.comptime_shadow_log.items.len;
+            defer {
+                self.popComptimeBindingsTo(ct_checkpoint);
+                self.popLexicalLocalsTo(local_checkpoint);
+            }
+
+            self.current_scope = base_fn_scope;
+            self.current_fn_ret_ty = sig_view.ret_ty;
+            self.current_loop_id = null;
+            self.loop_stack.clearRetainingCapacity();
+            self.closure_loop_stack_floor = 0;
+            self.dollar_len_stack.clearRetainingCapacity();
+            self.is_in_cond_scope = false;
+            self.closure_outer_local_ceil = 0;
+            self.active_fn_name = fn_sym.name;
+            self.active_caller_loc_local = null;
+            self.is_in_subscript_inout_arm = (arm_mode == 1);
+
+            const return_local_id = try self.store.appendLocal(.{
+                .name = .empty,
+                .type_id = self.concreteType(sig_view.ret_ty),
+                .decl_span = fn_sym.decl_span,
+                .mode = .set_mode,
+                .is_mut = true,
+                .is_param = false,
+                .is_temp = true,
+            });
+            const param_local_start: u32 = @intCast(self.store.locals.items.len);
+            var total_params: u32 = 0;
+
+            if (!has_explicit_self and !enclosing_self_ty.isError()) {
+                const arm_self_ty = try self.pool.internRef(self.concreteType(enclosing_self_ty), arm_mode == 1);
+                const self_slot = try self.store.appendLocal(.{
+                    .name = self_sym_id,
+                    .type_id = arm_self_ty,
+                    .decl_span = fn_sym.decl_span,
+                    .mode = .let_mode,
+                    .is_mut = false,
+                    .is_param = true,
+                    .is_temp = false,
+                });
+                try self.pushLexicalLocal(self_sym_id, self_slot);
+                _ = try self.emitNode(.{
+                    .tag = .hir_param_decl,
+                    .flags = .{ .category = .place_imm },
+                    .type_id = arm_self_ty,
+                    .origin_token = fn_ast.main_token,
+                    .data = .{ .lhs = self_slot, .rhs = @backingInt(ParamMode.let_mode) },
+                }, .none);
+                total_params += 1;
+            }
+
+            var param_i: usize = 0;
+            while (param_i < sig_view.paramCount()) : (param_i += 1) {
+                const p_ty = self.concreteType(sig_view.getParamType(param_i));
+                const p_mode = sig_view.getParamMode(param_i);
+                const p_sym_idx = if (param_i < param_syms.len) param_syms[param_i] else SymbolIndex.none;
+                const p_name = if (!p_sym_idx.isNone()) self.sym_table.getSymbol(p_sym_idx).name else SymbolId.empty;
+                const p_span = if (!p_sym_idx.isNone())
+                    self.sym_table.getSymbol(p_sym_idx).decl_span
+                else
+                    fn_sym.decl_span;
+                const p_is_mut = (!p_sym_idx.isNone() and self.sym_table.getSymbol(p_sym_idx).flags.is_mut) or
+                    p_mode == .inout_mode or p_mode == .set_mode;
+
+                const slot_id = try self.store.appendLocal(.{
+                    .name = p_name,
+                    .type_id = p_ty,
+                    .decl_span = p_span,
+                    .mode = p_mode,
+                    .is_mut = p_is_mut,
+                    .is_param = true,
+                    .is_temp = false,
+                    .is_comptime = !p_sym_idx.isNone() and self.sym_table.getSymbol(p_sym_idx).flags.is_comptime,
+                    .symbol_index = p_sym_idx,
+                });
+                if (!p_sym_idx.isNone()) {
+                    try self.symbol_to_local.put(self.allocator, p_sym_idx.asInt(), slot_id);
+                }
+                try self.pushLexicalLocal(p_name, slot_id);
+                _ = try self.emitNode(.{
+                    .tag = .hir_param_decl,
+                    .flags = .{ .category = if (p_is_mut) .place_mut else .place_imm },
+                    .type_id = p_ty,
+                    .origin_token = fn_ast.main_token,
+                    .data = .{ .lhs = slot_id, .rhs = @backingInt(p_mode) },
+                }, .none);
+                total_params += 1;
+            }
+
+            const arm_meta_idx: u32 = @intCast(self.store.functions.items.len);
+            try self.store.functions.append(self.allocator, .{
+                .def_id = fn_sym.def_id,
+                .symbol_index = fn_sym_idx,
+                .name = fn_sym.name,
+                .fn_ty = fn_sym.type_id,
+                .ret_ty = self.concreteType(sig_view.ret_ty),
+                .return_local_id = return_local_id,
+                .param_local_start = param_local_start,
+                .param_len = total_params,
+                .is_subscript = true,
+                .is_subscript_inout_arm = (arm_mode == 1),
+                .is_contextless = is_contextless,
+                .is_comptime = fn_sym.flags.is_comptime,
+                .is_derived = false,
+            });
+
+            const arm_body_hir = try self.lowerBlockExpr(arm_blk_id, .unit_ty, false);
+            const total_locals: u32 = @intCast(self.store.locals.items.len - return_local_id);
+            self.store.functions.items[arm_meta_idx].body_hir = arm_body_hir;
+            self.store.functions.items[arm_meta_idx].total_local_len = total_locals;
+
+            const decl_hir = try self.emitNode(.{
+                .tag = .hir_fn_decl,
+                .flags = .{ .category = .rvalue },
+                .type_id = fn_sym.type_id,
+                .origin_token = fn_ast.main_token,
+                .data = .{ .lhs = arm_meta_idx, .rhs = arm_body_hir.asInt() },
+            }, eff_ast);
+            if (first_decl_hir.isNone()) first_decl_hir = decl_hir;
+        }
+        return first_decl_hir;
+    }
+
+    /// Checks whether `fn_sym_idx` carries a `@contextless` attribute in CST.
     fn hasContextlessAttr(self: *const HirLowerer, fn_sym_idx: SymbolIndex) bool {
         const sym = self.sym_table.getSymbol(fn_sym_idx).*;
-        return self.hasAttrNamedInCst(sym.cst_node, "noalloc") or
-            self.hasAttrNamedInCst(sym.cst_node, "contextless");
+        return self.hasAttrNamedInCst(sym.cst_node, "contextless");
+    }
+
+    /// Returns `true` unless `sym_idx` was pruned by `@cfg(…)` in `TypeChecker` or CST evaluation (`SE-18`).
+    fn isSymbolCfgEnabled(self: *const HirLowerer, sym_idx: SymbolIndex) bool {
+        if (sym_idx.isNone() or sym_idx.asInt() >= self.sym_table.symbols.items.len) return false;
+        const sym = self.sym_table.getSymbol(sym_idx).*;
+        if (sym.flags.is_builtin or sym.flags.is_imported) return true;
+        if (!self.hasAttrNamedInCst(sym.cst_node, "cfg")) return true;
+        if (!sym.scope_id.isNone()) {
+            const scoped_key: u64 = (@as(u64, sym.name.asInt()) << 32) |
+                (@as(u64, @backingInt(sym.namespace)) << 30) |
+                @as(u64, sym.scope_id.asInt() & 0x3FFF_FFFF);
+            if (!self.sym_table.scoped_map.contains(scoped_key)) return false;
+        }
+        return self.isCstNodeCfgEnabled(sym.cst_node);
+    }
+
+    /// Returns `true` unless statement `stmt_id` was pruned by `@cfg(…)` (`SE-18`).
+    fn isAstStmtCfgEnabled(self: *const HirLowerer, stmt_id: NodeIndex) bool {
+        if (stmt_id.isNone() or stmt_id.asInt() >= self.ast_arena.countNodes()) return false;
+        const stmt_cst = self.ast_arena.getCstOrigin(stmt_id);
+        if (!self.hasAttrNamedInCst(stmt_cst, "cfg")) return true;
+        if (self.side_tables != null) {
+            const stmt_node = self.ast_arena.getNode(stmt_id);
+            if (stmt_node.lhs.tag == .node) {
+                const lhs_id = NodeIndex.fromInt(stmt_node.lhs.payload);
+                if (!lhs_id.isNone() and lhs_id.asInt() < self.ast_arena.countNodes()) {
+                    return !self.nodeType(lhs_id).isError();
+                }
+            }
+            if (stmt_node.rhs.tag == .node) {
+                const rhs_id = NodeIndex.fromInt(stmt_node.rhs.payload);
+                if (!rhs_id.isNone() and rhs_id.asInt() < self.ast_arena.countNodes()) {
+                    return !self.nodeType(rhs_id).isError();
+                }
+            }
+        }
+        return self.isCstNodeCfgEnabled(stmt_cst);
+    }
+
+    /// Evaluates leading `@cfg(…)` CST attributes on `cst_id` against `self.cfg_env` (`SE-18`).
+    fn isCstNodeCfgEnabled(self: *const HirLowerer, cst_id: CstNodeIndex) bool {
+        if (cst_id.isNone() or cst_id.asInt() >= self.cst_arena.countNodes()) return true;
+        const start_idx: usize = cst_id.asInt();
+        const root_rec = self.cst_arena.getNode(cst_id);
+        const end_idx: usize = @min(
+            start_idx + @max(@as(usize, root_rec.subtree_size), 1),
+            self.cst_arena.countNodes(),
+        );
+        var cursor: usize = start_idx + 1;
+        while (cursor < end_idx) : (cursor += 1) {
+            const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cursor)));
+            if (sub.kind == .block or sub.kind == .fn_expr_body or sub.kind == .param_list or
+                sub.kind == .type_params or sub.kind == .struct_introducer or
+                sub.kind == .enum_introducer or sub.kind == .union_introducer)
+            {
+                break;
+            }
+            if (sub.subtree_size <= 1 and !sub.token.isNone() and
+                sub.token.asInt() < self.tokens.countTokens() and
+                self.tokens.getToken(sub.token).kind == .lbrace)
+            {
+                break;
+            }
+            if (sub.kind == .attribute) {
+                const attr_end = @min(cursor + @max(@as(usize, sub.subtree_size), 1), end_idx);
+                if (!self.isSingleCfgAttrActive(cursor, attr_end)) return false;
+                if (sub.subtree_size > 1) cursor += @as(usize, sub.subtree_size) - 1;
+            }
+        }
+        return true;
+    }
+
+    /// Evaluates a single `.attribute` CST range `[attr_start .. attr_end)` if named `cfg`.
+    fn isSingleCfgAttrActive(self: *const HirLowerer, attr_start: usize, attr_end: usize) bool {
+        var attr_tokens: [128]TokenIndex = undefined;
+        var tok_count: usize = 0;
+        var has_name = false;
+        var has_lparen = false;
+        var paren_depth: u32 = 0;
+
+        var cur = attr_start + 1;
+        while (cur < attr_end) : (cur += 1) {
+            const leaf = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+            if (leaf.subtree_size > 1 or leaf.flags.is_missing_or_injected or
+                leaf.token.isNone() or leaf.token.asInt() >= self.tokens.countTokens())
+            {
+                continue;
+            }
+            const tok = leaf.token;
+            const kind = self.tokens.getToken(tok).kind;
+            if (kind == .at) continue;
+            if (!has_name) {
+                has_name = true;
+                const attr_lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, tok);
+                if (!std.mem.eql(u8, attr_lex, "cfg")) return true;
+                continue;
+            }
+            if (!has_lparen) {
+                if (kind == .lparen) {
+                    has_lparen = true;
+                    paren_depth = 1;
+                }
+                continue;
+            }
+            if (kind == .lparen) {
+                paren_depth += 1;
+            } else if (kind == .rparen) {
+                if (paren_depth == 1) break;
+                if (paren_depth > 0) paren_depth -= 1;
+            }
+            if (tok_count < attr_tokens.len) {
+                attr_tokens[tok_count] = tok;
+                tok_count += 1;
+            }
+        }
+        if (!has_lparen or tok_count == 0) return true;
+        var pos: usize = 0;
+        return self.evalCfgOrTokens(attr_tokens[0..tok_count], &pos);
+    }
+
+    /// Evaluates `OrExpr = AndExpr { "or" AndExpr }` over `@cfg` tokens (`SE-18`).
+    fn evalCfgOrTokens(self: *const HirLowerer, cfg_tokens: []const TokenIndex, pos: *usize) bool {
+        var lhs = self.evalCfgAndTokens(cfg_tokens, pos);
+        while (pos.* < cfg_tokens.len and self.tokens.getToken(cfg_tokens[pos.*]).kind == .kw_or) {
+            pos.* += 1;
+            const rhs = self.evalCfgAndTokens(cfg_tokens, pos);
+            lhs = lhs or rhs;
+        }
+        return lhs;
+    }
+
+    /// Evaluates `AndExpr = UnaryExpr { "and" UnaryExpr }` over `@cfg` tokens (`SE-18`).
+    fn evalCfgAndTokens(self: *const HirLowerer, cfg_tokens: []const TokenIndex, pos: *usize) bool {
+        var lhs = self.evalCfgUnaryTokens(cfg_tokens, pos);
+        while (pos.* < cfg_tokens.len and self.tokens.getToken(cfg_tokens[pos.*]).kind == .kw_and) {
+            pos.* += 1;
+            const rhs = self.evalCfgUnaryTokens(cfg_tokens, pos);
+            lhs = lhs and rhs;
+        }
+        return lhs;
+    }
+
+    /// Evaluates `UnaryExpr = "not" UnaryExpr | AtomExpr` over `@cfg` tokens (`SE-18`).
+    fn evalCfgUnaryTokens(self: *const HirLowerer, cfg_tokens: []const TokenIndex, pos: *usize) bool {
+        if (pos.* >= cfg_tokens.len) return true;
+        if (self.tokens.getToken(cfg_tokens[pos.*]).kind == .kw_not) {
+            pos.* += 1;
+            return !self.evalCfgUnaryTokens(cfg_tokens, pos);
+        }
+        return self.evalCfgAtomTokens(cfg_tokens, pos);
+    }
+
+    /// Evaluates an atomic `@cfg` predicate against `self.cfg_env` (`SE-18`).
+    fn evalCfgAtomTokens(self: *const HirLowerer, cfg_tokens: []const TokenIndex, pos: *usize) bool {
+        if (pos.* >= cfg_tokens.len) return true;
+        const start_tok = cfg_tokens[pos.*];
+        const start_kind = self.tokens.getToken(start_tok).kind;
+        if (start_kind == .lparen) {
+            pos.* += 1;
+            const inner = self.evalCfgOrTokens(cfg_tokens, pos);
+            if (pos.* < cfg_tokens.len and self.tokens.getToken(cfg_tokens[pos.*]).kind == .rparen) pos.* += 1;
+            return inner;
+        }
+        if (start_kind == .kw_true) {
+            pos.* += 1;
+            return true;
+        }
+        if (start_kind == .kw_false) {
+            pos.* += 1;
+            return false;
+        }
+        var segs: [4][]const u8 = undefined;
+        var seg_count: usize = 0;
+        if (!symbol_resolver.isIdentifierToken(start_kind) and start_kind != .kw_pub and start_kind != .prim_type) {
+            pos.* += 1;
+            return true;
+        }
+        segs[0] = symbol_resolver.extractTokenSlice(self.source, self.tokens, start_tok);
+        seg_count = 1;
+        pos.* += 1;
+        while (seg_count < segs.len and pos.* + 1 < cfg_tokens.len and
+            self.tokens.getToken(cfg_tokens[pos.*]).kind == .dot)
+        {
+            const next_tok = cfg_tokens[pos.* + 1];
+            if (!symbol_resolver.isIdentifierToken(self.tokens.getToken(next_tok).kind)) break;
+            segs[seg_count] = symbol_resolver.extractTokenSlice(self.source, self.tokens, next_tok);
+            seg_count += 1;
+            pos.* += 2;
+        }
+        var eff_segs: []const []const u8 = segs[0..seg_count];
+        if (eff_segs.len >= 2 and std.mem.eql(u8, eff_segs[0], "core")) eff_segs = eff_segs[1..];
+        if (eff_segs.len >= 2 and (std.mem.eql(u8, eff_segs[0], "target") or std.mem.eql(u8, eff_segs[0], "cfg"))) {
+            eff_segs = eff_segs[1..];
+        }
+        if (eff_segs.len == 2 and std.mem.eql(u8, eff_segs[0], "feature")) {
+            for (self.cfg_env.enabled_features) |feat| {
+                if (std.mem.eql(u8, feat, eff_segs[1])) return true;
+            }
+            return false;
+        }
+        if (eff_segs.len != 1) return true;
+        const key = eff_segs[0];
+        if (std.mem.eql(u8, key, "feature") or std.mem.eql(u8, key, "cpu_has")) {
+            if (pos.* + 2 < cfg_tokens.len and
+                self.tokens.getToken(cfg_tokens[pos.*]).kind == .lparen and
+                self.tokens.getToken(cfg_tokens[pos.* + 1]).kind == .string_lit and
+                self.tokens.getToken(cfg_tokens[pos.* + 2]).kind == .rparen)
+            {
+                const raw_lit = symbol_resolver.extractTokenSlice(self.source, self.tokens, cfg_tokens[pos.* + 1]);
+                pos.* += 3;
+                const item_name = if (raw_lit.len >= 2) raw_lit[1 .. raw_lit.len - 1] else "";
+                const slice = if (std.mem.eql(u8, key, "feature"))
+                    self.cfg_env.enabled_features
+                else
+                    self.cfg_env.enabled_cpu_features;
+                for (slice) |entry| {
+                    if (std.mem.eql(u8, entry, item_name)) return true;
+                }
+                return false;
+            }
+            return false;
+        }
+        if (std.mem.eql(u8, key, "debug") or std.mem.eql(u8, key, "test") or
+            std.mem.eql(u8, key, "test_mode") or std.mem.eql(u8, key, "sim_mode") or
+            std.mem.eql(u8, key, "fuzz_mode"))
+        {
+            const flag_val = if (std.mem.eql(u8, key, "debug"))
+                self.cfg_env.is_debug
+            else if (std.mem.eql(u8, key, "test") or std.mem.eql(u8, key, "test_mode"))
+                self.cfg_env.is_test_mode
+            else if (std.mem.eql(u8, key, "sim_mode"))
+                self.cfg_env.is_sim_mode
+            else
+                self.cfg_env.is_fuzz_mode;
+            if (pos.* + 1 < cfg_tokens.len) {
+                const op_kind = self.tokens.getToken(cfg_tokens[pos.*]).kind;
+                const rhs_kind = self.tokens.getToken(cfg_tokens[pos.* + 1]).kind;
+                if ((op_kind == .eqeq or op_kind == .bang_eq) and (rhs_kind == .kw_true or rhs_kind == .kw_false)) {
+                    pos.* += 2;
+                    const rhs_bool = (rhs_kind == .kw_true);
+                    return if (op_kind == .eqeq) flag_val == rhs_bool else flag_val != rhs_bool;
+                }
+            }
+            return flag_val;
+        }
+        if (std.mem.eql(u8, key, "ptr_width") and pos.* + 1 < cfg_tokens.len) {
+            const op_kind = self.tokens.getToken(cfg_tokens[pos.*]).kind;
+            const val_tok = cfg_tokens[pos.* + 1];
+            if ((op_kind == .eqeq or op_kind == .bang_eq) and self.tokens.getToken(val_tok).kind == .int_lit) {
+                const lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, val_tok);
+                pos.* += 2;
+                if (std.fmt.parseInt(u16, lex, 10) catch null) |parsed_w| {
+                    return if (op_kind == .eqeq) parsed_w == self.cfg_env.ptr_width else parsed_w != self.cfg_env.ptr_width;
+                }
+            }
+            return true;
+        }
+        if (pos.* < cfg_tokens.len) {
+            const op_kind = self.tokens.getToken(cfg_tokens[pos.*]).kind;
+            if (op_kind == .eqeq or op_kind == .bang_eq) {
+                pos.* += 1;
+                const is_matched = self.isMatchingCfgTargetToken(key, cfg_tokens, pos);
+                return if (op_kind == .eqeq) is_matched else !is_matched;
+            }
+            if (op_kind == .kw_is) {
+                pos.* += 1;
+                var is_neg = false;
+                if (pos.* < cfg_tokens.len and self.tokens.getToken(cfg_tokens[pos.*]).kind == .kw_not) {
+                    is_neg = true;
+                    pos.* += 1;
+                }
+                const has_paren = pos.* < cfg_tokens.len and self.tokens.getToken(cfg_tokens[pos.*]).kind == .lparen;
+                if (has_paren) pos.* += 1;
+                var has_any_matched = false;
+                while (pos.* < cfg_tokens.len) {
+                    if (self.isMatchingCfgTargetToken(key, cfg_tokens, pos)) has_any_matched = true;
+                    if (pos.* < cfg_tokens.len and self.tokens.getToken(cfg_tokens[pos.*]).kind == .pipe) {
+                        pos.* += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if (has_paren and pos.* < cfg_tokens.len and self.tokens.getToken(cfg_tokens[pos.*]).kind == .rparen) {
+                    pos.* += 1;
+                }
+                return if (is_neg) !has_any_matched else has_any_matched;
+            }
+        }
+        return true;
+    }
+
+    /// Matches a single `.Variant` or `"string"` value against `key` (`os`, `arch`, `abi`, `endian`) in `self.cfg_env`.
+    fn isMatchingCfgTargetToken(self: *const HirLowerer, key: []const u8, cfg_tokens: []const TokenIndex, pos: *usize) bool {
+        if (pos.* >= cfg_tokens.len) return false;
+        var val_text: []const u8 = "";
+        if (self.tokens.getToken(cfg_tokens[pos.*]).kind == .dot and pos.* + 1 < cfg_tokens.len) {
+            val_text = symbol_resolver.extractTokenSlice(self.source, self.tokens, cfg_tokens[pos.* + 1]);
+            pos.* += 2;
+        } else if (self.tokens.getToken(cfg_tokens[pos.*]).kind == .string_lit) {
+            const raw = symbol_resolver.extractTokenSlice(self.source, self.tokens, cfg_tokens[pos.*]);
+            val_text = if (raw.len >= 2) raw[1 .. raw.len - 1] else "";
+            pos.* += 1;
+        } else {
+            val_text = symbol_resolver.extractTokenSlice(self.source, self.tokens, cfg_tokens[pos.*]);
+            pos.* += 1;
+        }
+        if (std.mem.eql(u8, key, "os")) {
+            return switch (self.cfg_env.os) {
+                .linux => std.ascii.eqlIgnoreCase(val_text, "linux"),
+                .macos => std.ascii.eqlIgnoreCase(val_text, "macos"),
+                .windows => std.ascii.eqlIgnoreCase(val_text, "windows"),
+                .wasi => std.ascii.eqlIgnoreCase(val_text, "wasi"),
+                .freestanding => std.ascii.eqlIgnoreCase(val_text, "freestanding") or std.ascii.eqlIgnoreCase(val_text, "none"),
+            };
+        }
+        if (std.mem.eql(u8, key, "arch")) {
+            return switch (self.cfg_env.arch) {
+                .x86_64 => std.ascii.eqlIgnoreCase(val_text, "x86_64"),
+                .aarch64 => std.ascii.eqlIgnoreCase(val_text, "aarch64"),
+                .wasm32 => std.ascii.eqlIgnoreCase(val_text, "wasm32"),
+                .riscv64 => std.ascii.eqlIgnoreCase(val_text, "riscv64"),
+            };
+        }
+        if (std.mem.eql(u8, key, "abi")) {
+            return switch (self.cfg_env.abi) {
+                .gnu => std.ascii.eqlIgnoreCase(val_text, "gnu"),
+                .msvc => std.ascii.eqlIgnoreCase(val_text, "msvc"),
+                .musl => std.ascii.eqlIgnoreCase(val_text, "musl"),
+                .apple => std.ascii.eqlIgnoreCase(val_text, "apple"),
+                .wasi => std.ascii.eqlIgnoreCase(val_text, "wasi"),
+                .none => std.ascii.eqlIgnoreCase(val_text, "none"),
+            };
+        }
+        if (std.mem.eql(u8, key, "endian")) {
+            return switch (self.cfg_env.endian) {
+                .little => std.ascii.eqlIgnoreCase(val_text, "little"),
+                .big => std.ascii.eqlIgnoreCase(val_text, "big"),
+            };
+        }
+        return false;
     }
 
     /// Extracts leading `@must_vectorize` and `@vectorize_width(N)` CST attributes on `ast_id` into `store.loop_contracts`.
@@ -2173,7 +2987,7 @@ const HirLowerer = struct {
             var field_ord: u32 = 0;
             for (self.sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
                 const mem_sym = self.sym_table.getSymbol(mem_idx).*;
-                if (mem_sym.kind != .field_sym) continue;
+                if (mem_sym.kind != .field_sym or !self.isSymbolCfgEnabled(mem_idx)) continue;
                 const self_ref = try self.emitVarRef(self_local, tok, .none);
                 const self_deref = try self.emitSyntheticDeref(self_ref, nom_sym.type_id, tok);
                 const lhs_proj = try self.emitNode(.{
@@ -2213,7 +3027,7 @@ const HirLowerer = struct {
             var var_ord: u32 = 0;
             for (self.sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
                 const mem_sym = self.sym_table.getSymbol(mem_idx).*;
-                if (mem_sym.kind != .enum_variant_sym) continue;
+                if (mem_sym.kind != .enum_variant_sym or !self.isSymbolCfgEnabled(mem_idx)) continue;
 
                 const is_copy_pay = self.pool.getFlags(mem_sym.type_id).is_copy;
                 var lhs_sub_start: u32 = 0;
@@ -2638,7 +3452,7 @@ const HirLowerer = struct {
             var field_ord: u32 = 0;
             for (self.sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
                 const mem_sym = self.sym_table.getSymbol(mem_idx).*;
-                if (mem_sym.kind != .field_sym) continue;
+                if (mem_sym.kind != .field_sym or !self.isSymbolCfgEnabled(mem_idx)) continue;
                 const self_deref = try self.emitSyntheticDeref(
                     try self.emitVarRef(self_local, tok, .none),
                     nom_sym.type_id,
@@ -2666,7 +3480,7 @@ const HirLowerer = struct {
             var var_ord: u32 = 0;
             for (self.sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
                 const mem_sym = self.sym_table.getSymbol(mem_idx).*;
-                if (mem_sym.kind != .enum_variant_sym) continue;
+                if (mem_sym.kind != .enum_variant_sym or !self.isSymbolCfgEnabled(mem_idx)) continue;
 
                 var arm_stmts: std.ArrayListUnmanaged(u32) = .empty;
                 defer arm_stmts.deinit(self.allocator);
@@ -2813,7 +3627,7 @@ const HirLowerer = struct {
             var field_ord: u32 = 0;
             for (self.sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
                 const mem_sym = self.sym_table.getSymbol(mem_idx).*;
-                if (mem_sym.kind != .field_sym) continue;
+                if (mem_sym.kind != .field_sym or !self.isSymbolCfgEnabled(mem_idx)) continue;
                 const self_deref = try self.emitSyntheticDeref(
                     try self.emitVarRef(self_local, tok, .none),
                     nom_sym.type_id,
@@ -2854,7 +3668,7 @@ const HirLowerer = struct {
             var var_ord: u32 = 0;
             for (self.sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
                 const mem_sym = self.sym_table.getSymbol(mem_idx).*;
-                if (mem_sym.kind != .enum_variant_sym) continue;
+                if (mem_sym.kind != .enum_variant_sym or !self.isSymbolCfgEnabled(mem_idx)) continue;
 
                 var sub_start: u32 = 0;
                 var sub_len: u32 = 0;
@@ -2989,6 +3803,26 @@ const HirLowerer = struct {
         const m_id = try self.interner.intern(method_name);
         const found = self.sym_table.lookupInScopeDirect(nom_sym.target_scope, m_id, NamespaceMask.VALUE_ONLY);
         return if (found.isNone()) null else found;
+    }
+
+    /// Returns `true` if `hir_id` is a side-effect-free place expression (`var_ref`, `field_proj`, or `*deref`).
+    fn isPurePlaceHir(self: *const HirLowerer, hir_id: HirIndex) bool {
+        var cur_id = hir_id;
+        var depth: u32 = 0;
+        while (!cur_id.isNone() and cur_id.asInt() < self.store.nodes.len and depth < 32) : (depth += 1) {
+            const node = self.store.getNode(cur_id);
+            switch (node.tag) {
+                .hir_var_ref => return true,
+                .hir_field_proj => cur_id = HirIndex.fromInt(node.data.lhs),
+                .hir_unary_op => {
+                    const uop: HirUnaryOp = @fromBackingInt(@intCast(@as(u8, @truncate(node.data.lhs))));
+                    if (uop != .deref) return false;
+                    cur_id = HirIndex.fromInt(node.data.rhs);
+                },
+                else => return false,
+            }
+        }
+        return false;
     }
 
     /// Emits a synthetic dereference `*ptr_hir`.
@@ -3156,7 +3990,9 @@ const HirLowerer = struct {
 
         var has_diverged = false;
         for (self.getAstExtraSlice(block_id, false)) |raw_stmt_id| {
-            try self.lowerStmt(NodeIndex.fromInt(raw_stmt_id), &stmts, &has_diverged);
+            const stmt_id = NodeIndex.fromInt(raw_stmt_id);
+            if (!self.isAstStmtCfgEnabled(stmt_id)) continue;
+            try self.lowerStmt(stmt_id, &stmts, &has_diverged);
             if (self.comptime_loop_state != .normal) break;
         }
 
@@ -3267,6 +4103,9 @@ const HirLowerer = struct {
                 try out_stmts.append(self.allocator, hole.asInt());
             },
             .fn_decl,
+            .subscript_decl,
+            .test_decl,
+            .bench_decl,
             .struct_decl,
             .enum_decl,
             .union_decl,
@@ -3284,6 +4123,46 @@ const HirLowerer = struct {
             .return_stmt => {
                 const ret_hir = try self.lowerReturnNode(stmt_id);
                 if (!ret_hir.isNone()) try out_stmts.append(self.allocator, ret_hir.asInt());
+                has_diverged.* = true;
+            },
+            .yield_stmt => {
+                var val_hir = if (stmt_node.lhs.tag == .node)
+                    try self.lowerPlaceWithMutCtx(
+                        NodeIndex.fromInt(stmt_node.lhs.payload),
+                        self.current_fn_ret_ty,
+                        self.is_in_subscript_inout_arm,
+                    )
+                else
+                    try self.emitUnitConst(stmt_node.main_token, .none);
+                if (!val_hir.isNone()) {
+                    const val_node = self.store.getNode(val_hir);
+                    if (val_node.tag == .hir_unary_op) {
+                        const un_op: HirUnaryOp = @fromBackingInt(@as(u8, @truncate(val_node.data.lhs)));
+                        if (un_op == .addr_of or un_op == .addr_of_mut or
+                            un_op == .addr_of_raw or un_op == .addr_of_raw_mut)
+                        {
+                            val_hir = HirIndex.fromInt(val_node.data.rhs);
+                        }
+                    }
+                }
+                const yielded_ty = if (!val_hir.isNone())
+                    self.store.getNode(val_hir).type_id
+                else
+                    self.concreteType(self.current_fn_ret_ty);
+                const yield_hir = try self.emitNode(.{
+                    .tag = .hir_yield,
+                    .flags = .{
+                        .category = if (self.is_in_subscript_inout_arm) .place_mut else .place_imm,
+                        .is_unsafe = self.is_in_unsafe,
+                    },
+                    .type_id = yielded_ty,
+                    .origin_token = stmt_node.main_token,
+                    .data = .{
+                        .lhs = val_hir.asInt(),
+                        .rhs = @intFromBool(self.is_in_subscript_inout_arm),
+                    },
+                }, stmt_id);
+                try out_stmts.append(self.allocator, yield_hir.asInt());
                 has_diverged.* = true;
             },
             .break_stmt => {
@@ -3392,7 +4271,7 @@ const HirLowerer = struct {
             self.ast_arena.getNode(pat_id).tag == .bind_pat)
         {
             const pat_cst = self.ast_arena.getCstOrigin(pat_id);
-            const is_ref_pat = self.hasKeywordInCst(pat_cst, .kw_ref) or self.hasKeywordInCst(pat_cst, .amp);
+            const is_ref_pat = self.hasKeywordInCst(pat_cst, .amp);
             const is_ref_mut = self.hasKeywordInCst(pat_cst, .kw_mut);
 
             var init_hir: HirIndex = .none;
@@ -3532,8 +4411,9 @@ const HirLowerer = struct {
     ) !u32 {
         const pat_node = self.ast_arena.getNode(pat_id);
         const pat_cst = self.ast_arena.getCstOrigin(pat_id);
-        const is_ref_pat = self.hasKeywordInCst(pat_cst, .kw_ref) or self.hasKeywordInCst(pat_cst, .amp);
-        const is_mut = is_decl_mut or (!is_ref_pat and self.hasKeywordInCst(pat_cst, .kw_mut));
+        const is_ref_pat = self.hasKeywordInCst(pat_cst, .amp);
+        const is_mut = is_decl_mut or
+            (!is_ref_pat and (self.hasKeywordInCst(pat_cst, .kw_mut) or self.hasKeywordInCst(pat_cst, .kw_var)));
         const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, pat_node.main_token);
         const name_id = if (lexeme.len > 0 and !std.mem.eql(u8, lexeme, "_"))
             try self.interner.intern(lexeme)
@@ -3813,11 +4693,59 @@ const HirLowerer = struct {
         }, node_id);
     }
 
-    /// Lowers `continue [:label]` (in statement or expression position) into `hir_continue` (`never`).
+    /// Resolves the innermost matching `ActiveLabeledMatch` (`SE-23`) for `node_id` / `label_tok`.
+    fn findTargetLabeledMatch(self: *const HirLowerer, node_id: NodeIndex, label_tok: TokenIndex) ?ActiveLabeledMatch {
+        if (self.labeled_match_stack.items.len == 0) return null;
+        if (self.side_tables) |tables| {
+            if (tables.getLabeledMatchContinueTarget(node_id)) |target_match_ast| {
+                var rev_idx = self.labeled_match_stack.items.len;
+                while (rev_idx > 0) {
+                    rev_idx -= 1;
+                    const entry = self.labeled_match_stack.items[rev_idx];
+                    if (entry.match_ast == target_match_ast) return entry;
+                }
+            }
+        }
+        if (label_tok.isNone() or label_tok.asInt() >= self.tokens.countTokens()) return null;
+        var lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, label_tok);
+        if (lexeme.len > 0 and lexeme[0] == ':') lexeme = lexeme[1..];
+        if (lexeme.len > 0 and lexeme[lexeme.len - 1] == ':') lexeme = lexeme[0 .. lexeme.len - 1];
+        const target_id = self.interner.lookup(lexeme) orelse return null;
+        var rev_idx = self.labeled_match_stack.items.len;
+        while (rev_idx > 0) {
+            rev_idx -= 1;
+            if (self.labeled_match_stack.items[rev_idx].label_id == target_id) {
+                return self.labeled_match_stack.items[rev_idx];
+            }
+        }
+        return null;
+    }
+
+    /// Lowers `continue [:label] [next_state]` (`SE-23`) into `hir_continue` (`never`).
     fn lowerContinueNode(self: *HirLowerer, node_id: NodeIndex, is_stmt_pos: bool) anyerror!HirIndex {
         const stmt_node = self.ast_arena.getNode(node_id);
         const tok = stmt_node.main_token;
         const label_tok = if (stmt_node.lhs.tag == .token) TokenIndex.fromInt(stmt_node.lhs.payload) else .none;
+
+        // `SE-23`: `continue :fsm next_state;` targeting a labeled `match` expression:
+        if (stmt_node.rhs.tag == .node) {
+            const next_val_ast = NodeIndex.fromInt(stmt_node.rhs.payload);
+            const match_entry = self.findTargetLabeledMatch(node_id, label_tok);
+            const expected_scrut_ty = if (match_entry) |entry| entry.scrutinee_ty else .err_ty;
+            const next_val_hir = try self.lowerExpr(next_val_ast, expected_scrut_ty);
+            const fsm_target_id = if (match_entry) |entry|
+                entry.fsm_id
+            else
+                (LABELED_MATCH_CONTINUE_FLAG | 0);
+            return self.emitNode(.{
+                .tag = .hir_continue,
+                .flags = .{ .category = .diverging, .is_unsafe = self.is_in_unsafe },
+                .type_id = .never_ty,
+                .origin_token = tok,
+                .data = .{ .lhs = fsm_target_id, .rhs = next_val_hir.asInt() },
+            }, node_id);
+        }
+
         const target_entry = self.findTargetLoop(label_tok);
 
         const is_ct_target = if (target_entry) |entry| entry.is_comptime_for else self.is_in_comptime_for;
@@ -3841,7 +4769,7 @@ const HirLowerer = struct {
             .flags = .{ .category = .diverging, .is_unsafe = self.is_in_unsafe },
             .type_id = .never_ty,
             .origin_token = tok,
-            .data = .{ .lhs = target_loop_id, .rhs = 0 },
+            .data = .{ .lhs = target_loop_id, .rhs = NONE_U32 },
         }, node_id);
     }
 
@@ -4092,7 +5020,7 @@ const HirLowerer = struct {
                             var ord: u32 = 0;
                             for (self.sym_table.getScopeMembers(nom_sym.target_scope)) |m_idx| {
                                 const m_sym = self.sym_table.getSymbol(m_idx).*;
-                                if (m_sym.kind != .field_sym) continue;
+                                if (m_sym.kind != .field_sym or !self.isSymbolCfgEnabled(m_idx)) continue;
                                 if (out_elems.items.len >= MAX_UNROLL) return true;
                                 const field_offset = if (ty_rec.tag == .struct_ty)
                                     type_system.computeStructFieldOffset(
@@ -4125,7 +5053,7 @@ const HirLowerer = struct {
                             var ord: u32 = 0;
                             for (self.sym_table.getScopeMembers(nom_sym.target_scope)) |m_idx| {
                                 const m_sym = self.sym_table.getSymbol(m_idx).*;
-                                if (m_sym.kind != .enum_variant_sym) continue;
+                                if (m_sym.kind != .enum_variant_sym or !self.isSymbolCfgEnabled(m_idx)) continue;
                                 if (out_elems.items.len >= MAX_UNROLL) return true;
                                 try out_elems.append(self.allocator, .{
                                     .variant_info_mirror = .{
@@ -4205,7 +5133,7 @@ const HirLowerer = struct {
             self.ast_arena.getNode(pat_id).tag == .bind_pat)
         {
             const pat_cst = self.ast_arena.getCstOrigin(pat_id);
-            if (self.hasKeywordInCst(pat_cst, .kw_ref) or self.hasKeywordInCst(pat_cst, .amp)) {
+            if (self.hasKeywordInCst(pat_cst, .amp)) {
                 return .{ .val_hir = elem_hir, .val_ty = concrete_elem };
             }
         }
@@ -4949,7 +5877,7 @@ const HirLowerer = struct {
         return self.lowerExpr(place_ast_id, target_ty);
     }
 
-    /// Lowers `lhs = rhs;` and compound assignments (`+=`, `-=`, etc.), synthesizing `hir_bitfield_rmw` on `bit_field`s.
+    /// Lowers `lhs = rhs;`, `_ = rhs;`, `SE-15` parallel destructuring `(a, b) = (b, a);`, and compound assignments (`+=`, `-=`, etc.).
     fn lowerAssignStmt(self: *HirLowerer, stmt_id: NodeIndex) anyerror!HirIndex {
         const stmt_node = self.ast_arena.getNode(stmt_id);
         const tok = stmt_node.main_token;
@@ -4960,6 +5888,38 @@ const HirLowerer = struct {
             self.tokens.getToken(tok).kind
         else
             TokenKind.eq;
+
+        // [0] Wildcard discard `_ = rhs;` and `SE-15` 3-phase parallel destructuring assignment:
+        if (op_kind == .eq and !lhs_id.isNone() and lhs_id.asInt() < self.ast_arena.countNodes()) {
+            const lhs_ast = self.ast_arena.getNode(lhs_id);
+            if (lhs_ast.tag == .wildcard_pat) {
+                if (rhs_id.isNone()) return self.emitUnitConst(tok, stmt_id);
+                const discarded_hir = try self.lowerExpr(rhs_id, self.nodeType(lhs_id));
+                const tmp_slot = try self.allocTempLocal(self.store.getNode(discarded_hir).type_id, tok, false);
+                return self.emitNode(.{
+                    .tag = .hir_local_decl,
+                    .flags = .{ .category = .rvalue, .is_synthetic = true, .is_unsafe = self.is_in_unsafe },
+                    .type_id = .unit_ty,
+                    .origin_token = tok,
+                    .data = .{ .lhs = tmp_slot, .rhs = discarded_hir.asInt() },
+                }, stmt_id);
+            }
+            const is_parallel = switch (lhs_ast.tag) {
+                .tuple_lit => blk: {
+                    const elems = self.getAstExtraSlice(lhs_id, false);
+                    break :blk elems.len != 1 or type_system.hasShallowCommaInTupleCst(
+                        self.cst_arena,
+                        self.tokens,
+                        self.ast_arena.getCstOrigin(lhs_id),
+                    );
+                },
+                .array_lit, .struct_lit => true,
+                else => false,
+            };
+            if (is_parallel) {
+                return self.lowerParallelAssignStmt(stmt_id, lhs_id, rhs_id, tok);
+            }
+        }
 
         // [1] Direct `=` assignment:
         if (op_kind == .eq) {
@@ -5110,6 +6070,442 @@ const HirLowerer = struct {
             .unit_ty,
             tok,
         );
+    }
+
+    /// Lowers a 3-phase parallel place destructuring assignment (`(a.*, b.*) = (b.*, a.*);`, `SE-15`).
+    fn lowerParallelAssignStmt(
+        self: *HirLowerer,
+        stmt_id: NodeIndex,
+        lhs_id: NodeIndex,
+        rhs_id: NodeIndex,
+        tok: TokenIndex,
+    ) anyerror!HirIndex {
+        var stmts: std.ArrayListUnmanaged(u32) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        // Phase 0: Pre-evaluate dynamic LHS index/pointer sub-expressions L-to-R into immutable SSA temps
+        // without opening `.ghost_access_inout` loans yet (`SE-15`).
+        try self.preEvalParallelPlaceSubexprs(lhs_id, lhs_id, tok, &stmts);
+
+        // Phase 1: Evaluate RHS into an immutable temporary (`ghost_storage_move` + `place_load` on `~Copy` places).
+        const rhs_expected = self.nodeType(lhs_id);
+        const rhs_hir = try self.lowerExpr(rhs_id, rhs_expected);
+        const rhs_ty = self.store.getNode(rhs_hir).type_id;
+        const rhs_root_slot = try self.allocTempLocal(rhs_ty, tok, false);
+        try stmts.append(self.allocator, (try self.emitLocalDeclNode(rhs_root_slot, rhs_hir, tok)).asInt());
+
+        // Phase 2 & 3: Project each RHS leaf into its own temp, then commit LHS stores L-to-R and record
+        // the contiguous store slice in `store.parallel_assign_blocks` for `mir_sast.zig` `E0305` verification.
+        var leaf_stores: std.ArrayListUnmanaged(u32) = .empty;
+        defer leaf_stores.deinit(self.allocator);
+        const rhs_root_ref = try self.emitVarRef(rhs_root_slot, tok, .none);
+        try self.lowerParallelDestructureTargets(lhs_id, rhs_root_ref, rhs_ty, tok, &stmts, &leaf_stores);
+
+        const first_assign_idx: u32 = @intCast(stmts.items.len);
+        const assign_count: u32 = @intCast(leaf_stores.items.len);
+        try stmts.appendSlice(self.allocator, leaf_stores.items);
+
+        const blk_hir = try self.emitSyntheticBlock(stmts.items, .none, .unit_ty, tok);
+        self.store.origin_ast.items[blk_hir.asInt()] = stmt_id;
+        if (assign_count >= 2) {
+            try self.store.parallel_assign_blocks.put(self.allocator, blk_hir.asInt(), .{
+                .first_assign_idx = first_assign_idx,
+                .assign_count = assign_count,
+            });
+        }
+        return blk_hir;
+    }
+
+    /// Returns `true` if `sub_id` is a bare `.ident_expr` / `.self_val` directly overwritten as a leaf in `root_lhs_id`.
+    fn hasDirectIdentTargetInParallelLhs(
+        self: *const HirLowerer,
+        cur_lhs_id: NodeIndex,
+        target_ident_ast: NodeIndex,
+    ) bool {
+        if (cur_lhs_id.isNone() or cur_lhs_id.asInt() >= self.ast_arena.countNodes()) return false;
+        if (cur_lhs_id == target_ident_ast) return false;
+        const target_node = self.ast_arena.getNode(target_ident_ast);
+        const target_lex = if (target_node.tag == .self_val)
+            "self"
+        else if (target_node.tag == .ident_expr)
+            symbol_resolver.extractTokenSlice(self.source, self.tokens, target_node.main_token)
+        else
+            return false;
+
+        const cur_node = self.ast_arena.getNode(cur_lhs_id);
+        switch (cur_node.tag) {
+            .ident_expr => return std.mem.eql(
+                u8,
+                symbol_resolver.extractTokenSlice(self.source, self.tokens, cur_node.main_token),
+                target_lex,
+            ),
+            .self_val => return std.mem.eql(u8, "self", target_lex),
+            .tuple_lit, .array_lit => {
+                for (self.getAstExtraSlice(cur_lhs_id, false)) |raw_elem| {
+                    if (self.hasDirectIdentTargetInParallelLhs(NodeIndex.fromInt(raw_elem), target_ident_ast)) {
+                        return true;
+                    }
+                }
+                return false;
+            },
+            .struct_lit => {
+                for (self.getAstExtraSlice(cur_lhs_id, true)) |raw_field| {
+                    if (self.hasDirectIdentTargetInParallelLhs(NodeIndex.fromInt(raw_field), target_ident_ast)) {
+                        return true;
+                    }
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    /// Recursively pre-evaluates dynamic index and pointer rvalues inside `lhs_id` during Phase 0 (`SE-15`).
+    fn preEvalParallelPlaceSubexprs(
+        self: *HirLowerer,
+        root_lhs_id: NodeIndex,
+        lhs_id: NodeIndex,
+        tok: TokenIndex,
+        out_stmts: *std.ArrayListUnmanaged(u32),
+    ) anyerror!void {
+        if (lhs_id.isNone() or lhs_id.asInt() >= self.ast_arena.countNodes()) return;
+        const node = self.ast_arena.getNode(lhs_id);
+        switch (node.tag) {
+            .wildcard_pat => {},
+            .tuple_lit, .array_lit => {
+                for (self.getAstExtraSlice(lhs_id, false)) |raw_elem| {
+                    try self.preEvalParallelPlaceSubexprs(root_lhs_id, NodeIndex.fromInt(raw_elem), tok, out_stmts);
+                }
+            },
+            .struct_lit => {
+                for (self.getAstExtraSlice(lhs_id, true)) |raw_field| {
+                    try self.preEvalParallelPlaceSubexprs(root_lhs_id, NodeIndex.fromInt(raw_field), tok, out_stmts);
+                }
+            },
+            .field_access => {
+                if (node.lhs.tag == .node) {
+                    try self.preEvalParallelPlaceSubexprs(
+                        root_lhs_id,
+                        NodeIndex.fromInt(node.lhs.payload),
+                        tok,
+                        out_stmts,
+                    );
+                }
+            },
+            .deref_expr => {
+                if (node.lhs.tag == .node) {
+                    const ptr_ast = NodeIndex.fromInt(node.lhs.payload);
+                    const ptr_tag = self.ast_arena.getNode(ptr_ast).tag;
+                    const ptr_ty = self.pool.unwrapUnderlyingType(self.nodeType(ptr_ast));
+                    const is_mut_ref = !ptr_ty.isError() and self.pool.getNode(ptr_ty).tag == .mut_ref_ty;
+                    if (!is_mut_ref or
+                        (ptr_tag != .ident_expr and ptr_tag != .self_val) or
+                        self.hasDirectIdentTargetInParallelLhs(root_lhs_id, ptr_ast))
+                    {
+                        const ptr_hir = try self.lowerExpr(ptr_ast, .err_ty);
+                        const ptr_slot = try self.allocTempLocal(self.store.getNode(ptr_hir).type_id, tok, false);
+                        try out_stmts.append(
+                            self.allocator,
+                            (try self.emitLocalDeclNode(ptr_slot, ptr_hir, tok)).asInt(),
+                        );
+                        try self.parallel_pre_eval.put(
+                            self.allocator,
+                            ptr_ast.asInt(),
+                            try self.emitVarRef(ptr_slot, tok, .none),
+                        );
+                    }
+                }
+            },
+            .unary_expr => {
+                if (!node.main_token.isNone() and self.tokens.getToken(node.main_token).kind == .star and
+                    node.lhs.tag == .node)
+                {
+                    const ptr_ast = NodeIndex.fromInt(node.lhs.payload);
+                    const ptr_tag = self.ast_arena.getNode(ptr_ast).tag;
+                    const ptr_ty = self.pool.unwrapUnderlyingType(self.nodeType(ptr_ast));
+                    const is_mut_ref = !ptr_ty.isError() and self.pool.getNode(ptr_ty).tag == .mut_ref_ty;
+                    if (!is_mut_ref or
+                        (ptr_tag != .ident_expr and ptr_tag != .self_val) or
+                        self.hasDirectIdentTargetInParallelLhs(root_lhs_id, ptr_ast))
+                    {
+                        const ptr_hir = try self.lowerExpr(ptr_ast, .err_ty);
+                        const ptr_slot = try self.allocTempLocal(self.store.getNode(ptr_hir).type_id, tok, false);
+                        try out_stmts.append(
+                            self.allocator,
+                            (try self.emitLocalDeclNode(ptr_slot, ptr_hir, tok)).asInt(),
+                        );
+                        try self.parallel_pre_eval.put(
+                            self.allocator,
+                            ptr_ast.asInt(),
+                            try self.emitVarRef(ptr_slot, tok, .none),
+                        );
+                    }
+                }
+            },
+            .index_expr => {
+                if (node.lhs.tag == .node) {
+                    try self.preEvalParallelPlaceSubexprs(
+                        root_lhs_id,
+                        NodeIndex.fromInt(node.lhs.payload),
+                        tok,
+                        out_stmts,
+                    );
+                }
+                if (node.rhs.tag == .node) {
+                    const idx_ast = NodeIndex.fromInt(node.rhs.payload);
+                    if (self.extractRangeAstInfo(idx_ast) == null and !self.hasDollarAst(idx_ast)) {
+                        const idx_hir = try self.lowerExpr(idx_ast, .usize_ty);
+                        const idx_slot = try self.allocTempLocal(self.store.getNode(idx_hir).type_id, tok, false);
+                        try out_stmts.append(
+                            self.allocator,
+                            (try self.emitLocalDeclNode(idx_slot, idx_hir, tok)).asInt(),
+                        );
+                        try self.parallel_pre_eval.put(
+                            self.allocator,
+                            idx_ast.asInt(),
+                            try self.emitVarRef(idx_slot, tok, .none),
+                        );
+                    }
+                } else if (node.rhs.tag == .extra) {
+                    for (self.getAstExtraSlice(lhs_id, true)) |raw_idx| {
+                        const idx_ast = NodeIndex.fromInt(raw_idx);
+                        if (!self.hasDollarAst(idx_ast)) {
+                            const idx_hir = try self.lowerExpr(idx_ast, .usize_ty);
+                            const idx_slot = try self.allocTempLocal(self.store.getNode(idx_hir).type_id, tok, false);
+                            try out_stmts.append(
+                                self.allocator,
+                                (try self.emitLocalDeclNode(idx_slot, idx_hir, tok)).asInt(),
+                            );
+                            try self.parallel_pre_eval.put(
+                                self.allocator,
+                                idx_ast.asInt(),
+                                try self.emitVarRef(idx_slot, tok, .none),
+                            );
+                        }
+                    }
+                }
+            },
+            .call_expr, .method_call => {
+                const call_hir = try self.lowerExpr(lhs_id, .err_ty);
+                const call_slot = try self.allocTempLocal(self.store.getNode(call_hir).type_id, tok, false);
+                try out_stmts.append(
+                    self.allocator,
+                    (try self.emitLocalDeclNode(call_slot, call_hir, tok)).asInt(),
+                );
+                try self.parallel_pre_eval.put(
+                    self.allocator,
+                    lhs_id.asInt(),
+                    try self.emitVarRef(call_slot, tok, .none),
+                );
+            },
+            else => {},
+        }
+    }
+
+    /// Recursively decomposes `lhs_id` against `rhs_val_hir` (`rhs_ty`), emitting temp projections into `out_stmts`
+    /// and leaf `hir_assign` / `hir_bitfield_rmw` nodes into `out_stores` (`SE-15`).
+    fn lowerParallelDestructureTargets(
+        self: *HirLowerer,
+        lhs_id: NodeIndex,
+        rhs_val_hir: HirIndex,
+        rhs_ty: TypeId,
+        tok: TokenIndex,
+        out_stmts: *std.ArrayListUnmanaged(u32),
+        out_stores: *std.ArrayListUnmanaged(u32),
+    ) anyerror!void {
+        if (lhs_id.isNone() or lhs_id.asInt() >= self.ast_arena.countNodes()) return;
+        const lhs_node = self.ast_arena.getNode(lhs_id);
+        const unwrapped_rhs = self.pool.unwrapUnderlyingType(rhs_ty);
+        switch (lhs_node.tag) {
+            .wildcard_pat => return,
+            .tuple_lit => {
+                const elems = self.getAstExtraSlice(lhs_id, false);
+                if (elems.len == 1 and !type_system.hasShallowCommaInTupleCst(
+                    self.cst_arena,
+                    self.tokens,
+                    self.ast_arena.getCstOrigin(lhs_id),
+                )) {
+                    return self.lowerParallelDestructureTargets(
+                        NodeIndex.fromInt(elems[0]),
+                        rhs_val_hir,
+                        rhs_ty,
+                        tok,
+                        out_stmts,
+                        out_stores,
+                    );
+                }
+                const tup_elems = self.pool.getTupleElements(unwrapped_rhs);
+                for (elems, 0..) |raw_sub, i| {
+                    const sub_id = NodeIndex.fromInt(raw_sub);
+                    if (sub_id.isNone() or self.ast_arena.getNode(sub_id).tag == .wildcard_pat) continue;
+                    const elem_ty = self.concreteType(
+                        if (i < tup_elems.len) TypeId.fromInt(tup_elems[i]) else self.nodeType(sub_id),
+                    );
+                    const proj_hir = try self.emitNode(.{
+                        .tag = .hir_field_proj,
+                        .flags = .{ .category = .place_imm, .is_synthetic = true },
+                        .type_id = elem_ty,
+                        .origin_token = tok,
+                        .data = .{ .lhs = rhs_val_hir.asInt(), .rhs = @intCast(i) },
+                    }, .none);
+                    const sub_slot = try self.allocTempLocal(elem_ty, tok, false);
+                    try out_stmts.append(
+                        self.allocator,
+                        (try self.emitLocalDeclNode(sub_slot, proj_hir, tok)).asInt(),
+                    );
+                    try self.lowerParallelDestructureTargets(
+                        sub_id,
+                        try self.emitVarRef(sub_slot, tok, .none),
+                        elem_ty,
+                        tok,
+                        out_stmts,
+                        out_stores,
+                    );
+                }
+                return;
+            },
+            .array_lit => {
+                const elems = self.getAstExtraSlice(lhs_id, false);
+                const arr_node = self.pool.getNode(unwrapped_rhs);
+                const elem_ty = self.concreteType(
+                    if (arr_node.tag == .array_ty or arr_node.tag == .slice_ty)
+                        TypeId.fromInt(arr_node.lhs)
+                    else
+                        .unit_ty,
+                );
+                for (elems, 0..) |raw_sub, i| {
+                    const sub_id = NodeIndex.fromInt(raw_sub);
+                    if (sub_id.isNone() or self.ast_arena.getNode(sub_id).tag == .wildcard_pat) continue;
+                    const idx_const = try self.emitConstVal(.{ .int_val = @intCast(i) }, .usize_ty, tok, .none, true);
+                    const proj_hir = try self.emitNode(.{
+                        .tag = .hir_index_proj,
+                        .flags = .{ .category = .place_imm, .is_synthetic = true },
+                        .type_id = elem_ty,
+                        .origin_token = tok,
+                        .data = .{ .lhs = rhs_val_hir.asInt(), .rhs = idx_const.asInt() },
+                    }, .none);
+                    const sub_slot = try self.allocTempLocal(elem_ty, tok, false);
+                    try out_stmts.append(
+                        self.allocator,
+                        (try self.emitLocalDeclNode(sub_slot, proj_hir, tok)).asInt(),
+                    );
+                    try self.lowerParallelDestructureTargets(
+                        sub_id,
+                        try self.emitVarRef(sub_slot, tok, .none),
+                        elem_ty,
+                        tok,
+                        out_stmts,
+                        out_stores,
+                    );
+                }
+                return;
+            },
+            .struct_lit => {
+                const field_exprs = self.getAstExtraSlice(lhs_id, true);
+                var init_names: std.ArrayListUnmanaged(TokenIndex) = .empty;
+                defer init_names.deinit(self.allocator);
+                var has_spread = false;
+                const lit_cst = self.ast_arena.getCstOrigin(lhs_id);
+                if (!lit_cst.isNone() and lit_cst.asInt() < self.cst_arena.countNodes()) {
+                    const start_idx: usize = lit_cst.asInt();
+                    const rec = self.cst_arena.getNode(lit_cst);
+                    const end_idx: usize = @min(
+                        start_idx + @max(@as(usize, rec.subtree_size), 1),
+                        self.cst_arena.countNodes(),
+                    );
+                    var cur = start_idx + 1;
+                    while (cur < end_idx) {
+                        const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+                        if (sub.kind == .field_init) {
+                            const f_end = @min(cur + @max(@as(usize, sub.subtree_size), 1), end_idx);
+                            var f_cur = cur + 1;
+                            while (f_cur < f_end) : (f_cur += 1) {
+                                const leaf = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(f_cur)));
+                                if (leaf.subtree_size <= 1 and !leaf.token.isNone() and
+                                    leaf.token.asInt() < self.tokens.countTokens())
+                                {
+                                    const lk = self.tokens.getToken(leaf.token).kind;
+                                    if (lk == .dotdot) {
+                                        has_spread = true;
+                                        break;
+                                    }
+                                    if (symbol_resolver.isIdentifierToken(lk)) {
+                                        try init_names.append(self.allocator, leaf.token);
+                                        break;
+                                    }
+                                }
+                            }
+                            cur = f_end;
+                            continue;
+                        }
+                        cur += 1;
+                    }
+                }
+                const named_len = if (has_spread and field_exprs.len > 0) field_exprs.len - 1 else field_exprs.len;
+                for (field_exprs[0..named_len], 0..) |raw_sub, i| {
+                    const sub_id = NodeIndex.fromInt(raw_sub);
+                    if (sub_id.isNone() or self.ast_arena.getNode(sub_id).tag == .wildcard_pat) continue;
+                    var f_ord: u32 = @intCast(i);
+                    var f_ty: TypeId = self.nodeType(sub_id);
+                    if (i < init_names.items.len and !init_names.items[i].isNone()) {
+                        const f_lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, init_names.items[i]);
+                        if (self.findStructFieldInfo(unwrapped_rhs, f_lex)) |f_info| {
+                            f_ord = f_info.ordinal;
+                            f_ty = self.concreteType(f_info.field_ty);
+                        }
+                    }
+                    const proj_hir = try self.emitNode(.{
+                        .tag = .hir_field_proj,
+                        .flags = .{ .category = .place_imm, .is_synthetic = true },
+                        .type_id = f_ty,
+                        .origin_token = tok,
+                        .data = .{ .lhs = rhs_val_hir.asInt(), .rhs = f_ord },
+                    }, .none);
+                    const sub_slot = try self.allocTempLocal(f_ty, tok, false);
+                    try out_stmts.append(
+                        self.allocator,
+                        (try self.emitLocalDeclNode(sub_slot, proj_hir, tok)).asInt(),
+                    );
+                    try self.lowerParallelDestructureTargets(
+                        sub_id,
+                        try self.emitVarRef(sub_slot, tok, .none),
+                        f_ty,
+                        tok,
+                        out_stmts,
+                        out_stores,
+                    );
+                }
+                return;
+            },
+            else => {},
+        }
+
+        const lhs_place_hir = try self.lowerPlaceWithMutCtx(lhs_id, .err_ty, true);
+        const lhs_place_node = self.store.getNode(lhs_place_hir);
+        const coerced_rhs = try self.applyImplicitCoercionIfNeeded(rhs_val_hir, lhs_place_node.type_id, tok);
+        if (lhs_place_node.tag == .hir_bitfield_read) {
+            const rmw_extra = try self.store.appendExtraSlice(&[2]u32{
+                lhs_place_node.data.rhs,
+                coerced_rhs.asInt(),
+            });
+            self.store.nodes.set(lhs_place_hir.asInt(), .{
+                .tag = .hir_bitfield_rmw,
+                .flags = .{ .category = .rvalue, .is_synthetic = true, .is_unsafe = self.is_in_unsafe },
+                .type_id = .unit_ty,
+                .origin_token = tok,
+                .data = .{ .lhs = lhs_place_node.data.lhs, .rhs = rmw_extra },
+            });
+            try out_stores.append(self.allocator, lhs_place_hir.asInt());
+            return;
+        }
+        const assign_hir = try self.emitNode(.{
+            .tag = .hir_assign,
+            .flags = .{ .category = .rvalue, .is_unsafe = self.is_in_unsafe },
+            .type_id = .unit_ty,
+            .origin_token = tok,
+            .data = .{ .lhs = lhs_place_hir.asInt(), .rhs = coerced_rhs.asInt() },
+        }, lhs_id);
+        try out_stores.append(self.allocator, assign_hir.asInt());
     }
 
     /// Emits a synthetic `hir_local_decl` node initializing `local_id` with `init_hir`.
@@ -5283,7 +6679,7 @@ const HirLowerer = struct {
         if (pat_tag == .wildcard_pat) return;
         if (pat_tag == .bind_pat) {
             const pat_cst = self.ast_arena.getCstOrigin(pat_id);
-            const is_ref_pat = self.hasKeywordInCst(pat_cst, .kw_ref) or self.hasKeywordInCst(pat_cst, .amp);
+            const is_ref_pat = self.hasKeywordInCst(pat_cst, .amp);
             const is_ref_mut = self.hasKeywordInCst(pat_cst, .kw_mut);
             if (is_ref_pat) {
                 const ref_ty = try self.pool.internRef(self.concreteType(elem_ty), is_ref_mut);
@@ -5323,6 +6719,9 @@ const HirLowerer = struct {
     fn lowerExpr(self: *HirLowerer, expr_id: NodeIndex, expected_ty: TypeId) anyerror!HirIndex {
         if (expr_id.isNone() or expr_id.asInt() >= self.ast_arena.countNodes()) {
             return self.emitUnitConst(TokenIndex.fromInt(0), .none);
+        }
+        if (self.parallel_pre_eval.fetchRemove(expr_id.asInt())) |pre_kv| {
+            return pre_kv.value;
         }
         const ast_node = self.ast_arena.getNode(expr_id);
         if (!try self.enterDepth(expr_id)) {
@@ -5388,13 +6787,41 @@ const HirLowerer = struct {
                     false,
                 );
             },
-            .string_lit => try self.lowerStringLitOrInterp(expr_id),
+            .byte_lit => blk: {
+                const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, ast_node.main_token);
+                const byte_val = lexer.extractByteLiteralValue(lexeme) orelse 0;
+                break :blk try self.emitConstVal(
+                    .{ .int_val = byte_val },
+                    .u8_ty,
+                    ast_node.main_token,
+                    expr_id,
+                    false,
+                );
+            },
+            .byte_string_lit => blk: {
+                const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, ast_node.main_token);
+                const cooked = lexer.cookStringLiteral(self.allocator, lexeme) catch
+                    try self.allocator.dupe(u8, "");
+                defer self.allocator.free(cooked);
+                const bytes_sym = try self.interner.intern(cooked);
+                const arr_ty = try self.pool.internArray(.u8_ty, @intCast(cooked.len), false);
+                const ref_arr_ty = try self.pool.internRef(arr_ty, false);
+                break :blk try self.emitConstVal(
+                    .{ .bytes_val = bytes_sym },
+                    ref_arr_ty,
+                    ast_node.main_token,
+                    expr_id,
+                    false,
+                );
+            },
+            .string_lit => try self.lowerStringLitOrInterp(expr_id, target_ty),
             .self_val, .ident_expr, .path_expr => try self.lowerIdentOrPathExpr(expr_id, target_ty),
             .contextual_variant => try self.lowerContextualVariant(expr_id, target_ty),
             .tuple_lit => try self.lowerTupleLit(expr_id, target_ty),
             .array_lit => try self.lowerArrayLit(expr_id, target_ty),
             .struct_lit => try self.lowerStructLit(expr_id, target_ty),
             .unary_expr => try self.lowerUnaryExpr(expr_id, target_ty),
+            .deref_expr => try self.lowerPostfixDerefExpr(expr_id, target_ty),
             .cast_expr => try self.lowerCastExpr(expr_id, target_ty),
             .pipe_expr => try self.lowerPipeExpr(expr_id, target_ty),
             .try_expr => try self.lowerTryExpr(expr_id, target_ty),
@@ -5436,7 +6863,8 @@ const HirLowerer = struct {
             else => try self.emitErrorHole(ast_node.main_token, expr_id, target_ty),
         };
 
-        return self.applyImplicitCoercionIfNeeded(raw_hir, expected_ty, ast_node.main_token);
+        const coerce_ty = if (!expected_ty.isError()) expected_ty else target_ty;
+        return self.applyImplicitCoercionIfNeeded(raw_hir, coerce_ty, ast_node.main_token);
     }
 
     /// Unwraps `.named_arg` (`label = expr`) to its inner value `NodeIndex`, leaving positional args unchanged.
@@ -5928,7 +7356,7 @@ const HirLowerer = struct {
         return self.emitSyntheticBlock(with_stmts.items, body_hir, final_ty, tok);
     }
 
-    /// Inserts an explicit `hir_cast` node when `expected_ty` requires mutability relaxation or borrowed slice coercion.
+    /// Inserts an explicit `hir_cast` or zero-hole `fmt_args` node when `expected_ty` requires implicit coercion.
     fn applyImplicitCoercionIfNeeded(
         self: *HirLowerer,
         hir_id: HirIndex,
@@ -5940,6 +7368,17 @@ const HirLowerer = struct {
         const actual_ty = self.store.getNode(hir_id).type_id;
         if (actual_ty == concrete_exp or actual_ty == .never_ty or actual_ty.isError()) return hir_id;
 
+        if (actual_ty == .str_ty and concrete_exp == .fmt_args_ty) {
+            const fmt_extra = try self.store.appendExtraSlice(&[3]u32{ 1, 0, hir_id.asInt() });
+            return self.emitNode(.{
+                .tag = .hir_construct,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = .fmt_args_ty,
+                .origin_token = tok,
+                .data = .{ .lhs = @backingInt(HirConstructKind.fmt_args), .rhs = fmt_extra },
+            }, .none);
+        }
+
         const act_node = self.pool.getNode(actual_ty);
         const exp_node = self.pool.getNode(concrete_exp);
 
@@ -5950,6 +7389,26 @@ const HirLowerer = struct {
                 .type_id = concrete_exp,
                 .origin_token = tok,
                 .data = .{ .lhs = hir_id.asInt(), .rhs = @backingInt(HirCastKind.ref_coerce) },
+            }, .none);
+        }
+        if (act_node.tag == .mut_ref_ty and exp_node.tag == .mut_ref_ty and
+            act_node.lhs == exp_node.lhs and act_node.rhs != exp_node.rhs)
+        {
+            return self.emitNode(.{
+                .tag = .hir_cast,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = concrete_exp,
+                .origin_token = tok,
+                .data = .{ .lhs = hir_id.asInt(), .rhs = @backingInt(HirCastKind.ref_coerce) },
+            }, .none);
+        }
+        if (act_node.tag == .closure_ty and exp_node.tag == .fn_ty) {
+            return self.emitNode(.{
+                .tag = .hir_cast,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = concrete_exp,
+                .origin_token = tok,
+                .data = .{ .lhs = hir_id.asInt(), .rhs = @backingInt(HirCastKind.ptr_cast) },
             }, .none);
         }
         if (act_node.tag == .ref_ty or act_node.tag == .mut_ref_ty) {
@@ -5981,66 +7440,214 @@ const HirLowerer = struct {
         return hir_id;
     }
 
-    /// Lowers `.string_lit` and raw `r"…"` literals, expanding `"{expr}"` interpolations (`DR-13` §2.2 Rule 5).
-    fn lowerStringLitOrInterp(self: *HirLowerer, expr_id: NodeIndex) !HirIndex {
+    /// Lowers `.string_lit`, `"""…"""`, and `r"…"` literals, supporting dual-mode `FmtArgs` vs `String` (`SE-12`).
+    fn lowerStringLitOrInterp(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) !HirIndex {
         const ast_node = self.ast_arena.getNode(expr_id);
-        const raw_lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, ast_node.main_token);
+        const tok = ast_node.main_token;
+        const raw_lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, tok);
+        const interp_meta_opt = if (self.side_tables) |tables| tables.getStringInterp(expr_id) else null;
+        const is_fmt_args_mode = (if (interp_meta_opt) |meta| meta.is_fmt_args_mode else false) or
+            target_ty == .fmt_args_ty;
 
-        // Check raw string literal `r"…"` (`MAJ-08`) with verbatim UTF-8 bytes and zero escape processing:
-        if (type_system.extractRawStringContent(raw_lex)) |raw_body| {
-            const raw_id = try self.interner.intern(raw_body);
-            return self.emitConstVal(.{ .str_val = raw_id }, .str_ty, ast_node.main_token, expr_id, false);
+        // Check raw string literal `r"…"`, `r#"…"#`, `r"""…"""`, or `r#"""…"""#` with verbatim UTF-8 bytes:
+        if (raw_lex.len > 0 and raw_lex[0] == 'r') {
+            const cooked_raw = lexer.cookStringLiteral(self.allocator, raw_lex) catch
+                try self.allocator.dupe(u8, type_system.extractRawStringContent(raw_lex) orelse "");
+            defer self.allocator.free(cooked_raw);
+            const raw_id = try self.interner.intern(cooked_raw);
+            const str_hir = try self.emitConstVal(.{ .str_val = raw_id }, .str_ty, tok, expr_id, false);
+            if (is_fmt_args_mode) {
+                const fmt_extra = try self.store.appendExtraSlice(&[3]u32{ 1, 0, str_hir.asInt() });
+                return self.emitNode(.{
+                    .tag = .hir_construct,
+                    .flags = .{ .category = .rvalue, .is_synthetic = true },
+                    .type_id = .fmt_args_ty,
+                    .origin_token = tok,
+                    .data = .{ .lhs = @backingInt(HirConstructKind.fmt_args), .rhs = fmt_extra },
+                }, expr_id);
+            }
+            return str_hir;
         }
 
-        const body_slice = extractQuotedBody(raw_lex);
-        if (type_system.scanNextInterpolationSegment(body_slice, 0) == null) {
-            const decoded = try type_system.decodeStandardStringSegment(self.allocator, body_slice);
-            defer self.allocator.free(decoded);
-            const str_id = try self.interner.intern(decoded);
-            return self.emitConstVal(.{ .str_val = str_id }, .str_ty, ast_node.main_token, expr_id, false);
-        }
-
-        var part_hirs: std.ArrayListUnmanaged(u32) = .empty;
-        defer part_hirs.deinit(self.allocator);
-
-        var scan_pos: usize = 0;
-        while (type_system.scanNextInterpolationSegment(body_slice, scan_pos)) |seg| {
-            if (seg.open_brace > scan_pos) {
-                const decoded_lit = try type_system.decodeStandardStringSegment(
-                    self.allocator,
-                    body_slice[scan_pos..seg.open_brace],
-                );
-                defer self.allocator.free(decoded_lit);
-                if (decoded_lit.len > 0) {
-                    const seg_id = try self.interner.intern(decoded_lit);
-                    const seg_hir = try self.emitConstVal(
-                        .{ .str_val = seg_id },
-                        .str_ty,
-                        ast_node.main_token,
-                        .none,
-                        true,
-                    );
-                    try part_hirs.append(self.allocator, seg_hir.asInt());
+        const is_multiline = raw_lex.len >= 6 and std.mem.startsWith(u8, raw_lex, "\"\"\"") and
+            std.mem.endsWith(u8, raw_lex, "\"\"\"");
+        var body_slice = if (is_multiline) raw_lex[3 .. raw_lex.len - 3] else extractQuotedBody(raw_lex);
+        var dedent_cols: usize = 0;
+        if (is_multiline) {
+            if (body_slice.len >= 2 and body_slice[0] == '\r' and body_slice[1] == '\n') {
+                body_slice = body_slice[2..];
+            } else if (body_slice.len >= 1 and body_slice[0] == '\n') {
+                body_slice = body_slice[1..];
+            }
+            if (std.mem.lastIndexOfScalar(u8, body_slice, '\n')) |last_nl| {
+                const closing_indent = body_slice[last_nl + 1 ..];
+                var is_all_ws = true;
+                for (closing_indent) |ch| {
+                    if (ch != ' ' and ch != '\t') {
+                        is_all_ws = false;
+                        break;
+                    }
+                }
+                if (is_all_ws) {
+                    dedent_cols = closing_indent.len;
+                    body_slice = if (last_nl > 0 and body_slice[last_nl - 1] == '\r')
+                        body_slice[0 .. last_nl - 1]
+                    else
+                        body_slice[0..last_nl];
                 }
             }
-            const interp_text = std.mem.trim(u8, body_slice[seg.expr_start..seg.expr_end], " \t\r\n");
-            const interp_hir = try self.lowerInterpolatedSegment(interp_text, ast_node.main_token);
-            try part_hirs.append(self.allocator, interp_hir.asInt());
+        }
+
+        if (type_system.scanNextInterpolationSegment(body_slice, 0) == null) {
+            const cooked = lexer.cookStringLiteral(self.allocator, raw_lex) catch
+                try type_system.decodeStandardStringSegment(self.allocator, body_slice);
+            defer self.allocator.free(cooked);
+            const str_id = try self.interner.intern(cooked);
+            const str_hir = try self.emitConstVal(.{ .str_val = str_id }, .str_ty, tok, expr_id, false);
+            if (is_fmt_args_mode) {
+                const fmt_extra = try self.store.appendExtraSlice(&[3]u32{ 1, 0, str_hir.asInt() });
+                return self.emitNode(.{
+                    .tag = .hir_construct,
+                    .flags = .{ .category = .rvalue, .is_synthetic = true },
+                    .type_id = .fmt_args_ty,
+                    .origin_token = tok,
+                    .data = .{ .lhs = @backingInt(HirConstructKind.fmt_args), .rhs = fmt_extra },
+                }, expr_id);
+            }
+            return str_hir;
+        }
+
+        var piece_hirs: std.ArrayListUnmanaged(u32) = .empty;
+        defer piece_hirs.deinit(self.allocator);
+        var hole_hirs: std.ArrayListUnmanaged(HirIndex) = .empty;
+        defer hole_hirs.deinit(self.allocator);
+        var hole_specs: std.ArrayListUnmanaged(u64) = .empty;
+        defer hole_specs.deinit(self.allocator);
+        var hole_has_spec: std.ArrayListUnmanaged(bool) = .empty;
+        defer hole_has_spec.deinit(self.allocator);
+
+        var scan_pos: usize = 0;
+        var is_at_line_start = is_multiline;
+        while (type_system.scanNextInterpolationSegment(body_slice, scan_pos)) |seg| {
+            const raw_seg = body_slice[scan_pos..seg.open_brace];
+            const hole_raw = body_slice[seg.expr_start..seg.expr_end];
+            const split = type_system.splitInterpolationHole(hole_raw);
+
+            var piece_buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer piece_buf.deinit(self.allocator);
+            const decoded_lit = try decodeInterpolatedStaticPiece(
+                self.allocator,
+                raw_seg,
+                dedent_cols,
+                &is_at_line_start,
+            );
+            defer self.allocator.free(decoded_lit);
+            try piece_buf.appendSlice(self.allocator, decoded_lit);
+            if (split.has_debug_eq) {
+                try piece_buf.appendSlice(self.allocator, split.debug_prefix_slice);
+            }
+            const piece_id = try self.interner.intern(piece_buf.items);
+            const piece_hir = try self.emitConstVal(.{ .str_val = piece_id }, .str_ty, tok, .none, true);
+            try piece_hirs.append(self.allocator, piece_hir.asInt());
+
+            const expr_trimmed = std.mem.trim(u8, split.expr_slice, " \t\r\n");
+            const lowered_hole = try self.lowerInterpolatedSegment(expr_trimmed, tok);
+            const fmt_spec = lexer.parseFormatSpec(split.spec_slice orelse "", split.has_debug_eq) catch
+                lexer.FmtSpec.pack(
+                    ' ',
+                    .none,
+                    .default,
+                    false,
+                    false,
+                    if (split.has_debug_eq) .debug else .display,
+                    split.has_debug_eq,
+                    null,
+                    null,
+                );
+            const packed_spec: u64 = @as(u64, fmt_spec.flags_and_fill) |
+                (@as(u64, fmt_spec.width_or_none) << 32) |
+                (@as(u64, fmt_spec.precision_or_none) << 48);
+            try hole_hirs.append(self.allocator, lowered_hole);
+            try hole_specs.append(self.allocator, packed_spec);
+            try hole_has_spec.append(self.allocator, split.spec_slice != null or split.has_debug_eq);
+
+            is_at_line_start = false;
             scan_pos = seg.after_close;
         }
-        if (scan_pos < body_slice.len) {
-            const decoded_tail = try type_system.decodeStandardStringSegment(self.allocator, body_slice[scan_pos..]);
-            defer self.allocator.free(decoded_tail);
-            if (decoded_tail.len > 0) {
-                const tail_id = try self.interner.intern(decoded_tail);
-                const tail_hir = try self.emitConstVal(
-                    .{ .str_val = tail_id },
-                    .str_ty,
-                    ast_node.main_token,
-                    .none,
-                    true,
-                );
-                try part_hirs.append(self.allocator, tail_hir.asInt());
+
+        const tail_decoded = try decodeInterpolatedStaticPiece(
+            self.allocator,
+            body_slice[scan_pos..],
+            dedent_cols,
+            &is_at_line_start,
+        );
+        defer self.allocator.free(tail_decoded);
+        const tail_id = try self.interner.intern(tail_decoded);
+        const tail_hir = try self.emitConstVal(.{ .str_val = tail_id }, .str_ty, tok, .none, true);
+        try piece_hirs.append(self.allocator, tail_hir.asInt());
+
+        // [1] Checking Mode (`FmtArgs`, `SE-12`): stack-scoped `[FmtArg; k]` + static `pieces` with zero `alloc` taint!
+        if (is_fmt_args_mode) {
+            var extra_words: std.ArrayListUnmanaged(u32) = .empty;
+            defer extra_words.deinit(self.allocator);
+            try extra_words.append(self.allocator, @intCast(piece_hirs.items.len));
+            try extra_words.append(self.allocator, @intCast(hole_hirs.items.len));
+            try extra_words.appendSlice(self.allocator, piece_hirs.items);
+
+            for (hole_hirs.items, 0..) |h_hir, idx| {
+                const spec_u64 = hole_specs.items[idx];
+                try extra_words.append(self.allocator, h_hir.asInt());
+                try extra_words.append(self.allocator, @truncate(spec_u64));
+                try extra_words.append(self.allocator, @truncate(spec_u64 >> 32));
+            }
+            const fmt_extra = try self.store.appendExtraSlice(extra_words.items);
+            return self.emitNode(.{
+                .tag = .hir_construct,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = .fmt_args_ty,
+                .origin_token = tok,
+                .data = .{ .lhs = @backingInt(HirConstructKind.fmt_args), .rhs = fmt_extra },
+            }, expr_id);
+        }
+
+        // [2] Synthesis Mode (`str` / `String`, `SE-12`): interleave non-empty pieces and formatted hole values!
+        var part_hirs: std.ArrayListUnmanaged(u32) = .empty;
+        defer part_hirs.deinit(self.allocator);
+        for (hole_hirs.items, 0..) |h_hir, idx| {
+            const p_hir = HirIndex.fromInt(piece_hirs.items[idx]);
+            const p_node = self.store.getNode(p_hir);
+            if (p_node.tag == .hir_const_val and p_node.data.lhs < self.store.const_pool.items.len) {
+                const cval = self.store.const_pool.items[p_node.data.lhs];
+                if (cval == .str_val and self.interner.get(cval.str_val).len > 0) {
+                    try part_hirs.append(self.allocator, p_hir.asInt());
+                }
+            }
+            const h_ty = self.store.getNode(h_hir).type_id;
+            if (h_ty == .str_ty and !hole_has_spec.items[idx]) {
+                try part_hirs.append(self.allocator, h_hir.asInt());
+            } else {
+                const spec_u64 = hole_specs.items[idx];
+                const fv_extra = try self.store.appendExtraSlice(&[3]u32{
+                    h_hir.asInt(),
+                    @truncate(spec_u64),
+                    @truncate(spec_u64 >> 32),
+                });
+                const fv_hir = try self.emitNode(.{
+                    .tag = .hir_construct,
+                    .flags = .{ .category = .rvalue, .is_synthetic = true },
+                    .type_id = .str_ty,
+                    .origin_token = tok,
+                    .data = .{ .lhs = @backingInt(HirConstructKind.fmt_value), .rhs = fv_extra },
+                }, .none);
+                try part_hirs.append(self.allocator, fv_hir.asInt());
+            }
+        }
+        const last_p_hir = HirIndex.fromInt(piece_hirs.items[piece_hirs.items.len - 1]);
+        const last_p_node = self.store.getNode(last_p_hir);
+        if (last_p_node.tag == .hir_const_val and last_p_node.data.lhs < self.store.const_pool.items.len) {
+            const cval = self.store.const_pool.items[last_p_node.data.lhs];
+            if (cval == .str_val and self.interner.get(cval.str_val).len > 0) {
+                try part_hirs.append(self.allocator, last_p_hir.asInt());
             }
         }
 
@@ -6049,7 +7656,7 @@ const HirLowerer = struct {
             .tag = .hir_construct,
             .flags = .{ .category = .rvalue, .is_synthetic = true },
             .type_id = .str_ty,
-            .origin_token = ast_node.main_token,
+            .origin_token = tok,
             .data = .{ .lhs = @backingInt(HirConstructKind.str_interp), .rhs = extra_idx },
         }, expr_id);
     }
@@ -6133,7 +7740,9 @@ const HirLowerer = struct {
         );
         defer if (sub_cst_map.len > 0) self.allocator.free(sub_cst_map);
 
-        const outer_span = if (!tok.isNone() and tok.asInt() < self.tokens.countTokens())
+        const outer_span = if (self.interp_override_span) |existing_span|
+            existing_span
+        else if (!tok.isNone() and tok.asInt() < self.tokens.countTokens())
             self.tokens.getTokenSpan(self.store.file_id, tok)
         else
             Span.init(self.store.file_id, 0, 0);
@@ -6147,6 +7756,7 @@ const HirLowerer = struct {
         const saved_cst_map = self.cst_to_ast;
         const saved_ov_tok = self.interp_override_token;
         const saved_ov_span = self.interp_override_span;
+        const saved_ov_src = self.interp_override_source;
 
         self.source = wrapper_buf.items;
         self.tokens = &sub_tokens;
@@ -6155,8 +7765,9 @@ const HirLowerer = struct {
         self.side_tables = null;
         self.node_extra_end = sub_extra_ends;
         self.cst_to_ast = sub_cst_map;
-        self.interp_override_token = tok;
+        self.interp_override_token = if (!saved_ov_tok.isNone()) saved_ov_tok else tok;
         self.interp_override_span = outer_span;
+        if (self.interp_override_source == null) self.interp_override_source = saved_source;
         defer {
             self.source = saved_source;
             self.tokens = saved_tokens;
@@ -6167,6 +7778,7 @@ const HirLowerer = struct {
             self.cst_to_ast = saved_cst_map;
             self.interp_override_token = saved_ov_tok;
             self.interp_override_span = saved_ov_span;
+            self.interp_override_source = saved_ov_src;
         }
 
         const root_node = sub_ast.getNode(.root);
@@ -6479,27 +8091,31 @@ const HirLowerer = struct {
             return self.emitErrorHole(tok, expr_id, target_ty);
         }
 
-        // Collect canonical struct / `bit_field` member declarations dynamically (`CRIT-11`):
+        // Collect canonical `@cfg`-enabled struct / `bit_field` member declarations dynamically (`CRIT-11`, `SE-18`):
         var canonical_tys: std.ArrayListUnmanaged(TypeId) = .empty;
         defer canonical_tys.deinit(self.allocator);
         var canonical_names: std.ArrayListUnmanaged(SymbolId) = .empty;
         defer canonical_names.deinit(self.allocator);
         var canonical_texts: std.ArrayListUnmanaged([]const u8) = .empty;
         defer canonical_texts.deinit(self.allocator);
+        var canonical_syms: std.ArrayListUnmanaged(SymbolIndex) = .empty;
+        defer canonical_syms.deinit(self.allocator);
         const struct_subst = type_system.NominalTypeSubst.init(self.pool, self.sym_table, target_ty);
         for (self.sym_table.getScopeMembers(struct_sym.target_scope)) |mem_idx| {
             const mem_sym = self.sym_table.getSymbol(mem_idx).*;
             if (mem_sym.kind != .field_sym) continue;
+            if (!self.isSymbolCfgEnabled(mem_idx)) continue;
             try canonical_tys.append(
                 self.allocator,
                 try struct_subst.applyMut(self.allocator, self.pool, mem_sym.type_id),
             );
             try canonical_names.append(self.allocator, mem_sym.name);
             try canonical_texts.append(self.allocator, mem_sym.name_text);
+            try canonical_syms.append(self.allocator, mem_idx);
         }
         const total_fields = canonical_tys.items.len;
 
-        // Extract field names (and optional trailing `..spread`) from CST `.field_init` subtrees:
+        // Extract field names (and optional trailing `..` / `..base` / `..own base`) from CST `.field_init` subtrees:
         var init_names: std.ArrayListUnmanaged(TokenIndex) = .empty;
         defer init_names.deinit(self.allocator);
         var has_spread = false;
@@ -6536,10 +8152,17 @@ const HirLowerer = struct {
                     cur = f_end;
                     continue;
                 }
+                if (sub.subtree_size <= 1 and !sub.token.isNone() and
+                    sub.token.asInt() < self.tokens.countTokens() and
+                    self.tokens.getToken(sub.token).kind == .dotdot)
+                {
+                    has_spread = true;
+                }
                 cur += 1;
             }
         }
 
+        const has_spread_base = has_spread and field_exprs.len > init_names.items.len and field_exprs.len > 0;
         var stmts: std.ArrayListUnmanaged(u32) = .empty;
         defer stmts.deinit(self.allocator);
         var field_slots = try self.allocator.alloc(HirIndex, total_fields);
@@ -6548,7 +8171,7 @@ const HirLowerer = struct {
         var is_out_of_order = false;
         var prev_ord: usize = 0;
 
-        const named_expr_len = if (has_spread and field_exprs.len > 0) field_exprs.len - 1 else field_exprs.len;
+        const named_expr_len = if (has_spread_base) field_exprs.len - 1 else field_exprs.len;
         for (field_exprs[0..named_expr_len], 0..) |raw_val_expr, i| {
             var target_ord: usize = @min(i, if (total_fields > 0) total_fields - 1 else 0);
             if (i < init_names.items.len and !init_names.items[i].isNone()) {
@@ -6578,7 +8201,7 @@ const HirLowerer = struct {
             if (!has_spread and stmts.items.len == 0) {
                 return self.emitDefaultInitValue(target_ty, tok);
             }
-            const base_bf_hir = if (has_spread and field_exprs.len > 0)
+            const base_bf_hir = if (has_spread_base)
                 try self.lowerExpr(NodeIndex.fromInt(field_exprs[field_exprs.len - 1]), target_ty)
             else
                 try self.emitDefaultInitValue(target_ty, tok);
@@ -6615,23 +8238,123 @@ const HirLowerer = struct {
             );
         }
 
-        if (has_spread and field_exprs.len > 0) {
-            const spread_hir = try self.lowerExpr(NodeIndex.fromInt(field_exprs[field_exprs.len - 1]), target_ty);
-            const spread_local = try self.allocTempLocal(target_ty, tok, false);
-            try stmts.append(self.allocator, (try self.emitLocalDeclNode(spread_local, spread_hir, tok)).asInt());
-            for (0..total_fields) |ord_idx| {
-                if (field_slots[ord_idx].isNone()) {
-                    field_slots[ord_idx] = try self.emitNode(.{
-                        .tag = .hir_field_proj,
-                        .flags = .{ .category = .place_imm, .is_synthetic = true },
-                        .type_id = self.concreteType(canonical_tys.items[ord_idx]),
-                        .origin_token = tok,
-                        .data = .{
-                            .lhs = (try self.emitVarRef(spread_local, tok, .none)).asInt(),
-                            .rhs = @intCast(ord_idx),
-                        },
-                    }, .none);
+        if (has_spread_base) {
+            const raw_spread_id = NodeIndex.fromInt(field_exprs[field_exprs.len - 1]);
+            const spread_ast = self.ast_arena.getNode(raw_spread_id);
+            const is_own_spread = spread_ast.tag == .unary_expr and spread_ast.lhs.tag == .node and
+                !spread_ast.main_token.isNone() and
+                (self.tokens.getToken(spread_ast.main_token).kind == .kw_own or
+                    std.mem.eql(u8, symbol_resolver.extractTokenSlice(self.source, self.tokens, spread_ast.main_token), "own"));
+            const base_expr_id = if (is_own_spread) NodeIndex.fromInt(spread_ast.lhs.payload) else raw_spread_id;
+
+            if (is_own_spread) {
+                // `..own base` (`SE-14`): move `base` into `spread_local`; omitted fields move out, while
+                // overridden `AutoDrop` fields drop at scope exit and overridden `@linear` fields trigger `E0304`!
+                const spread_hir = try self.lowerExpr(base_expr_id, target_ty);
+                const spread_local = try self.allocTempLocal(target_ty, tok, false);
+                try stmts.append(self.allocator, (try self.emitLocalDeclNode(spread_local, spread_hir, tok)).asInt());
+                for (0..total_fields) |ord_idx| {
+                    if (field_slots[ord_idx].isNone()) {
+                        field_slots[ord_idx] = try self.emitNode(.{
+                            .tag = .hir_field_proj,
+                            .flags = .{ .category = .place_imm, .is_synthetic = true },
+                            .type_id = self.concreteType(canonical_tys.items[ord_idx]),
+                            .origin_token = tok,
+                            .data = .{
+                                .lhs = (try self.emitVarRef(spread_local, tok, .none)).asInt(),
+                                .rhs = @intCast(ord_idx),
+                            },
+                        }, .none);
+                    }
                 }
+            } else {
+                // `..base` (`SE-14`): project omitted `Copy` fields directly on pure places so moving an overridden
+                // `own` field from `base` never conflicts with a whole-struct `&base` borrow, or bind rvalue `base` once:
+                const base_place_hir = try self.lowerPlaceWithMutCtx(base_expr_id, target_ty, false);
+                if (self.isPurePlaceHir(base_place_hir)) {
+                    var has_used_first_place = false;
+                    for (0..total_fields) |ord_idx| {
+                        if (field_slots[ord_idx].isNone()) {
+                            const proj_base = if (!has_used_first_place) blk_first: {
+                                has_used_first_place = true;
+                                break :blk_first base_place_hir;
+                            } else try self.lowerPlaceWithMutCtx(base_expr_id, target_ty, false);
+                            field_slots[ord_idx] = try self.emitNode(.{
+                                .tag = .hir_field_proj,
+                                .flags = .{ .category = .place_imm, .is_synthetic = true },
+                                .type_id = self.concreteType(canonical_tys.items[ord_idx]),
+                                .origin_token = tok,
+                                .data = .{
+                                    .lhs = proj_base.asInt(),
+                                    .rhs = @intCast(ord_idx),
+                                },
+                            }, .none);
+                        }
+                    }
+                } else if (self.store.getNode(base_place_hir).flags.category == .rvalue) {
+                    const spread_local = try self.allocTempLocal(target_ty, tok, false);
+                    try stmts.append(
+                        self.allocator,
+                        (try self.emitLocalDeclNode(spread_local, base_place_hir, tok)).asInt(),
+                    );
+                    for (0..total_fields) |ord_idx| {
+                        if (field_slots[ord_idx].isNone()) {
+                            field_slots[ord_idx] = try self.emitNode(.{
+                                .tag = .hir_field_proj,
+                                .flags = .{ .category = .place_imm, .is_synthetic = true },
+                                .type_id = self.concreteType(canonical_tys.items[ord_idx]),
+                                .origin_token = tok,
+                                .data = .{
+                                    .lhs = (try self.emitVarRef(spread_local, tok, .none)).asInt(),
+                                    .rhs = @intCast(ord_idx),
+                                },
+                            }, .none);
+                        }
+                    }
+                } else {
+                    const ref_ty = try self.pool.internRef(target_ty, false);
+                    const addr_hir = try self.emitSyntheticAddrOf(base_place_hir, ref_ty, false, tok);
+                    const ref_local = try self.allocTempLocal(ref_ty, tok, false);
+                    try stmts.append(self.allocator, (try self.emitLocalDeclNode(ref_local, addr_hir, tok)).asInt());
+                    for (0..total_fields) |ord_idx| {
+                        if (field_slots[ord_idx].isNone()) {
+                            const deref_base = try self.emitSyntheticDeref(
+                                try self.emitVarRef(ref_local, tok, .none),
+                                target_ty,
+                                tok,
+                            );
+                            field_slots[ord_idx] = try self.emitNode(.{
+                                .tag = .hir_field_proj,
+                                .flags = .{ .category = .place_imm, .is_synthetic = true },
+                                .type_id = self.concreteType(canonical_tys.items[ord_idx]),
+                                .origin_token = tok,
+                                .data = .{
+                                    .lhs = deref_base.asInt(),
+                                    .rhs = @intCast(ord_idx),
+                                },
+                            }, .none);
+                        }
+                    }
+                }
+            }
+        } else if (has_spread) {
+            // `S { explicit…, .. }` (`SE-14`): evaluate omitted fields' declared `= default_expr` in field order!
+            const field_scope = if (!struct_sym.target_scope.isNone())
+                struct_sym.target_scope
+            else
+                struct_sym.scope_id;
+            for (0..total_fields) |ord_idx| {
+                if (!field_slots[ord_idx].isNone()) continue;
+                const f_ty = self.concreteType(canonical_tys.items[ord_idx]);
+                const def_hir = try self.lowerStructFieldDefaultExpr(
+                    field_scope,
+                    canonical_syms.items[ord_idx],
+                    f_ty,
+                    tok,
+                );
+                const tmp_local = try self.allocTempLocal(self.store.getNode(def_hir).type_id, tok, false);
+                try stmts.append(self.allocator, (try self.emitLocalDeclNode(tmp_local, def_hir, tok)).asInt());
+                field_slots[ord_idx] = try self.emitVarRef(tmp_local, tok, .none);
             }
         }
 
@@ -6649,7 +8372,7 @@ const HirLowerer = struct {
                 const f_hir = if (!field_slots[ord_idx].isNone())
                     field_slots[ord_idx]
                 else
-                    try self.emitDefaultInitValue(canonical_tys.items[ord_idx], tok);
+                    try self.emitErrorHole(tok, expr_id, self.concreteType(canonical_tys.items[ord_idx]));
                 final_fields.appendAssumeCapacity(f_hir.asInt());
             }
         }
@@ -6668,13 +8391,220 @@ const HirLowerer = struct {
         return construct_hir;
     }
 
-    /// Lowers prefix unary operations (`comptime`, `yield`, `-`, `not`, `!`, `&`, `&mut`, `*`).
+    /// Resolves the `= default_expr` `NodeIndex` inside a `.struct_field` CST subtree (`SE-14`).
+    fn extractStructFieldDefaultAst(
+        field_sym: symbol_resolver.SymbolRecord,
+        ast_arena: *const AstArena,
+        cst_arena: *const LosslessCstArena,
+        tokens: *const TokenBuffer,
+        cst_map: []const NodeIndex,
+    ) NodeIndex {
+        if (!field_sym.ast_node.isNone() and field_sym.ast_node.asInt() < ast_arena.countNodes()) {
+            const f_ast = ast_arena.getNode(field_sym.ast_node);
+            if (f_ast.rhs.tag == .node) return NodeIndex.fromInt(f_ast.rhs.payload);
+        }
+
+        var field_cst = field_sym.cst_node;
+        if (field_cst.isNone() or field_cst.asInt() >= cst_arena.countNodes() or
+            cst_arena.getNode(field_cst).kind != .struct_field)
+        {
+            field_cst = .none;
+            var scan_cst: u32 = 0;
+            while (scan_cst < cst_arena.countNodes()) : (scan_cst += 1) {
+                const cand_cst = CstNodeIndex.fromInt(scan_cst);
+                const cand_rec = cst_arena.getNode(cand_cst);
+                if (cand_rec.kind != .struct_field) continue;
+                const f_end = @min(
+                    @as(usize, scan_cst) + @max(@as(usize, cand_rec.subtree_size), 1),
+                    cst_arena.countNodes(),
+                );
+                var leaf_cur: usize = @as(usize, scan_cst) + 1;
+                while (leaf_cur < f_end) : (leaf_cur += 1) {
+                    const leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(leaf_cur)));
+                    if (leaf.subtree_size <= 1 and !leaf.token.isNone() and
+                        leaf.token.asInt() < tokens.countTokens())
+                    {
+                        const tok_kind = tokens.getToken(leaf.token).kind;
+                        if (symbol_resolver.isIdentifierToken(tok_kind)) {
+                            const span = tokens.getTokenSpan(field_sym.decl_span.file_id, leaf.token);
+                            if (span.start_byte == field_sym.decl_span.start_byte) {
+                                field_cst = cand_cst;
+                            }
+                            break;
+                        }
+                    }
+                }
+                if (!field_cst.isNone()) break;
+            }
+        }
+        if (field_cst.isNone() or field_cst.asInt() >= cst_arena.countNodes()) return .none;
+
+        const start_idx: usize = field_cst.asInt();
+        const rec = cst_arena.getNode(field_cst);
+        const end_idx: usize = @min(
+            start_idx + @max(@as(usize, rec.subtree_size), 1),
+            cst_arena.countNodes(),
+        );
+        var has_seen_colon = false;
+        var bracket_depth: u32 = 0;
+        var eq_pos: ?usize = null;
+        var cur = start_idx + 1;
+        while (cur < end_idx) : (cur += 1) {
+            const sub = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+            if (sub.subtree_size <= 1 and !sub.token.isNone() and sub.token.asInt() < tokens.countTokens()) {
+                const kind = tokens.getToken(sub.token).kind;
+                switch (kind) {
+                    .lparen, .lbracket, .lbrace => bracket_depth += 1,
+                    .rparen, .rbracket, .rbrace => {
+                        if (bracket_depth > 0) bracket_depth -= 1;
+                    },
+                    .colon => {
+                        if (bracket_depth == 0) has_seen_colon = true;
+                    },
+                    .eq => {
+                        if (has_seen_colon and bracket_depth == 0) {
+                            eq_pos = cur;
+                            break;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+        const found_eq = eq_pos orelse return .none;
+        const clamped_end = @min(end_idx, cst_map.len);
+        var map_cur = found_eq + 1;
+        while (map_cur < clamped_end) : (map_cur += 1) {
+            const mapped = cst_map[map_cur];
+            if (!mapped.isNone()) return mapped;
+        }
+        return .none;
+    }
+
+    /// Lowers a declared `field: T = DefaultExpr` initializer on `struct_sym` when `S { .. }` omits `field_sym_idx` (`SE-14`).
+    fn lowerStructFieldDefaultExpr(
+        self: *HirLowerer,
+        field_scope: symbol_resolver.ScopeId,
+        field_sym_idx: SymbolIndex,
+        field_ty: TypeId,
+        lit_tok: TokenIndex,
+    ) anyerror!HirIndex {
+        const field_sym = self.sym_table.getSymbol(field_sym_idx).*;
+        const decl_file = field_sym.decl_span.file_id;
+
+        const saved_scope = self.current_scope;
+        const saved_mut_ctx = self.is_mut_lvalue_ctx;
+        self.current_scope = field_scope;
+        self.is_mut_lvalue_ctx = false;
+        defer {
+            self.current_scope = saved_scope;
+            self.is_mut_lvalue_ctx = saved_mut_ctx;
+        }
+
+        if (decl_file.isNone() or decl_file == self.store.file_id) {
+            const same_def_ast = extractStructFieldDefaultAst(
+                field_sym,
+                self.ast_arena,
+                self.cst_arena,
+                self.tokens,
+                self.cst_to_ast,
+            );
+            if (!same_def_ast.isNone()) {
+                const saved_tables = self.side_tables;
+                const saved_ov_tok = self.interp_override_token;
+                if (self.interp_override_token.isNone()) self.interp_override_token = lit_tok;
+                defer {
+                    self.side_tables = saved_tables;
+                    self.interp_override_token = saved_ov_tok;
+                }
+                if (self.eval_hook.compiler_db) |db| {
+                    if (try db.getExternalFileSyntaxView(self.store.file_id)) |same_view| {
+                        if (same_view.file_side_tables) |file_st| self.side_tables = file_st;
+                    }
+                }
+                return self.lowerExpr(same_def_ast, field_ty);
+            }
+            return self.emitDefaultInitValue(field_ty, lit_tok);
+        }
+
+        const db = self.eval_hook.compiler_db orelse return self.emitDefaultInitValue(field_ty, lit_tok);
+        const ext_view = (try db.getExternalFileSyntaxView(decl_file)) orelse
+            return self.emitDefaultInitValue(field_ty, lit_tok);
+
+        const ext_extra_ends = try syntax_arenas.computeAstNodeExtraEnds(self.allocator, ext_view.ast_arena);
+        defer if (ext_extra_ends.len > 0) self.allocator.free(ext_extra_ends);
+        const ext_cst_map = try syntax_arenas.computeCstToAstMap(
+            self.allocator,
+            ext_view.cst_arena.countNodes(),
+            ext_view.ast_arena,
+        );
+        defer if (ext_cst_map.len > 0) self.allocator.free(ext_cst_map);
+
+        const ext_def_ast = extractStructFieldDefaultAst(
+            field_sym,
+            ext_view.ast_arena,
+            ext_view.cst_arena,
+            ext_view.tokens,
+            ext_cst_map,
+        );
+        if (ext_def_ast.isNone()) return self.emitDefaultInitValue(field_ty, lit_tok);
+
+        const outer_span = if (self.interp_override_span) |existing_span|
+            existing_span
+        else if (!lit_tok.isNone() and lit_tok.asInt() < self.tokens.countTokens())
+            self.tokens.getTokenSpan(self.store.file_id, lit_tok)
+        else
+            Span.init(self.store.file_id, 0, 0);
+
+        const saved_source = self.source;
+        const saved_tokens = self.tokens;
+        const saved_cst = self.cst_arena;
+        const saved_ast = self.ast_arena;
+        const saved_tables = self.side_tables;
+        const saved_extra_ends = self.node_extra_end;
+        const saved_cst_map = self.cst_to_ast;
+        const saved_ov_tok = self.interp_override_token;
+        const saved_ov_span = self.interp_override_span;
+        const saved_ov_src = self.interp_override_source;
+
+        self.source = ext_view.source;
+        self.tokens = ext_view.tokens;
+        self.cst_arena = ext_view.cst_arena;
+        self.ast_arena = ext_view.ast_arena;
+        self.side_tables = ext_view.file_side_tables;
+        self.node_extra_end = ext_extra_ends;
+        self.cst_to_ast = ext_cst_map;
+        self.interp_override_token = if (!saved_ov_tok.isNone()) saved_ov_tok else lit_tok;
+        self.interp_override_span = outer_span;
+        if (self.interp_override_source == null) self.interp_override_source = saved_source;
+        defer {
+            self.source = saved_source;
+            self.tokens = saved_tokens;
+            self.cst_arena = saved_cst;
+            self.ast_arena = saved_ast;
+            self.side_tables = saved_tables;
+            self.node_extra_end = saved_extra_ends;
+            self.cst_to_ast = saved_cst_map;
+            self.interp_override_token = saved_ov_tok;
+            self.interp_override_span = saved_ov_span;
+            self.interp_override_source = saved_ov_src;
+        }
+        return self.lowerExpr(ext_def_ast, field_ty);
+    }
+
+    /// Lowers prefix unary operations (`comptime`, `own`, `yield`, `-`, `not`, `~`, `&`, `&mut`, `&out`, `&raw [mut]`).
     fn lowerUnaryExpr(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) !HirIndex {
         const ast_node = self.ast_arena.getNode(expr_id);
         const tok = ast_node.main_token;
         if (ast_node.lhs.tag != .node) return self.emitErrorHole(tok, expr_id, target_ty);
         const inner_id = NodeIndex.fromInt(ast_node.lhs.payload);
         const op_kind = self.tokens.getToken(tok).kind;
+        const op_lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, tok);
+
+        // [0] `own expr` explicit ownership-transfer prefix (`ADR-22B`):
+        if (op_kind == .kw_own or (op_kind == .ident and std.mem.eql(u8, op_lex, "own"))) {
+            return self.lowerExpr(inner_id, target_ty);
+        }
 
         // [1] `comptime` prefix (`comptime if`, `comptime match`, `comptime { … }`, `comptime expr`):
         if (op_kind == .kw_comptime) {
@@ -6703,20 +8633,33 @@ const HirLowerer = struct {
         }
 
         // [2] `yield place_expr` inside `subscript` (`DR-02` §2.2):
-        if (op_kind == .ident and
-            std.mem.eql(u8, symbol_resolver.extractTokenSlice(self.source, self.tokens, tok), "yield"))
-        {
-            const yielded_hir = try self.lowerExpr(inner_id, self.current_fn_ret_ty);
+        if (op_kind == .ident and std.mem.eql(u8, op_lex, "yield")) {
+            var yielded_hir = try self.lowerPlaceWithMutCtx(
+                inner_id,
+                self.current_fn_ret_ty,
+                self.is_in_subscript_inout_arm,
+            );
+            if (!yielded_hir.isNone()) {
+                const yn = self.store.getNode(yielded_hir);
+                if (yn.tag == .hir_unary_op) {
+                    const u_op: HirUnaryOp = @fromBackingInt(@as(u8, @truncate(yn.data.lhs)));
+                    if (u_op == .addr_of or u_op == .addr_of_mut or
+                        u_op == .addr_of_raw or u_op == .addr_of_raw_mut)
+                    {
+                        yielded_hir = HirIndex.fromInt(yn.data.rhs);
+                    }
+                }
+            }
             return self.emitNode(.{
                 .tag = .hir_yield,
                 .flags = .{ .category = .rvalue, .is_unsafe = self.is_in_unsafe },
                 .type_id = self.store.getNode(yielded_hir).type_id,
                 .origin_token = tok,
-                .data = .{ .lhs = yielded_hir.asInt(), .rhs = 0 },
+                .data = .{ .lhs = yielded_hir.asInt(), .rhs = @intFromBool(self.is_in_subscript_inout_arm) },
             }, expr_id);
         }
 
-        // [3] Fold negated integer literal (`-128i8`, `-170141183460469231731687303715884105728i128`) directly:
+        // [3] Fold negated integer literal (`-128_i8`, `-170141183460469231731687303715884105728_i128`) directly:
         if (op_kind == .minus and self.ast_arena.getNode(inner_id).tag == .int_lit) {
             const inner_tok = self.ast_arena.getNode(inner_id).main_token;
             const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, inner_tok);
@@ -6725,9 +8668,12 @@ const HirLowerer = struct {
             return self.emitConstVal(.{ .int_val = neg_val }, int_ty, tok, expr_id, false);
         }
 
-        const is_mut_borrow_op = (op_kind == .amp or op_kind == .kw_ref) and
-            (self.hasKeywordInCst(self.ast_arena.getCstOrigin(expr_id), .kw_mut) or
-                self.pool.getTag(target_ty) == .mut_ref_ty);
+        const expr_cst = self.ast_arena.getCstOrigin(expr_id);
+        const has_raw = self.hasModifierInCst(expr_cst, .ident, "raw");
+        const has_mut = self.hasKeywordInCst(expr_cst, .kw_mut);
+        const has_out = self.hasModifierInCst(expr_cst, .ident, "out");
+        const is_mut_borrow_op = op_kind == .amp and
+            (has_mut or has_out or (!has_raw and self.pool.getTag(target_ty) == .mut_ref_ty));
         const inner_hir = try self.lowerPlaceWithMutCtx(inner_id, .err_ty, is_mut_borrow_op);
         const inner_node = self.store.getNode(inner_hir);
 
@@ -6746,6 +8692,13 @@ const HirLowerer = struct {
                 .origin_token = tok,
                 .data = .{ .lhs = @backingInt(HirUnaryOp.logical_not), .rhs = inner_hir.asInt() },
             }, expr_id),
+            .tilde => return self.emitNode(.{
+                .tag = .hir_unary_op,
+                .flags = .{ .category = .rvalue },
+                .type_id = if (!target_ty.isError()) target_ty else inner_node.type_id,
+                .origin_token = tok,
+                .data = .{ .lhs = @backingInt(HirUnaryOp.bit_not), .rhs = inner_hir.asInt() },
+            }, expr_id),
             .bang => {
                 const un_op: HirUnaryOp = if (inner_node.type_id == .bool_ty) .logical_not else .bit_not;
                 return self.emitNode(.{
@@ -6756,9 +8709,25 @@ const HirLowerer = struct {
                     .data = .{ .lhs = @backingInt(un_op), .rhs = inner_hir.asInt() },
                 }, expr_id);
             },
-            .amp, .kw_ref => {
+            .amp => {
+                if (has_raw) {
+                    const raw_ptr_ty = if (!target_ty.isError())
+                        target_ty
+                    else
+                        try self.pool.internRawPtr(inner_node.type_id, has_mut);
+                    const raw_op: HirUnaryOp = if (has_mut) .addr_of_raw_mut else .addr_of_raw;
+                    return self.emitNode(.{
+                        .tag = .hir_unary_op,
+                        .flags = .{ .category = .rvalue, .is_unsafe = self.is_in_unsafe },
+                        .type_id = raw_ptr_ty,
+                        .origin_token = tok,
+                        .data = .{ .lhs = @backingInt(raw_op), .rhs = inner_hir.asInt() },
+                    }, expr_id);
+                }
                 const ref_ty = if (!target_ty.isError())
                     target_ty
+                else if (has_out)
+                    try self.pool.internOutRef(inner_node.type_id)
                 else
                     try self.pool.internRef(inner_node.type_id, is_mut_borrow_op);
                 return self.emitNode(.{
@@ -6772,32 +8741,111 @@ const HirLowerer = struct {
                     },
                 }, expr_id);
             },
-            .star => {
-                const ptr_ty_node = self.pool.getNode(inner_node.type_id);
-                const is_mut_deref = ptr_ty_node.tag == .mut_ref_ty or
-                    (ptr_ty_node.tag == .raw_ptr_ty and ptr_ty_node.rhs != 0);
-                const pointee_ty = if (!target_ty.isError())
-                    target_ty
-                else switch (ptr_ty_node.tag) {
-                    .ref_ty, .mut_ref_ty, .raw_ptr_ty => TypeId.fromInt(ptr_ty_node.lhs),
-                    else => .unit_ty,
-                };
-                return self.emitNode(.{
-                    .tag = .hir_unary_op,
-                    .flags = .{
-                        .category = if (is_mut_deref) .place_mut else .place_imm,
-                        .is_unsafe = self.is_in_unsafe or ptr_ty_node.tag == .raw_ptr_ty,
-                    },
-                    .type_id = self.concreteType(pointee_ty),
-                    .origin_token = tok,
-                    .data = .{ .lhs = @backingInt(HirUnaryOp.deref), .rhs = inner_hir.asInt() },
-                }, expr_id);
-            },
+            .star => return self.emitPostfixOrPrefixDeref(expr_id, inner_hir, target_ty, tok),
             else => return inner_hir,
         }
     }
 
-    /// Lowers `src as TargetType` into `hir_cast` with exact `HirCastKind`.
+    /// Lowers postfix `ptr.*` (`AstTag.deref_expr`) into `hir_unary_op(.deref)` (`ADR-22A`, `ADR-22D`).
+    fn lowerPostfixDerefExpr(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) !HirIndex {
+        const ast_node = self.ast_arena.getNode(expr_id);
+        const tok = ast_node.main_token;
+        if (ast_node.lhs.tag != .node) return self.emitErrorHole(tok, expr_id, target_ty);
+        const inner_id = NodeIndex.fromInt(ast_node.lhs.payload);
+        const inner_hir = try self.lowerPlaceWithMutCtx(inner_id, .err_ty, false);
+        return self.emitPostfixOrPrefixDeref(expr_id, inner_hir, target_ty, tok);
+    }
+
+    /// Emits `hir_unary_op(.deref)` over `inner_hir`, flagging `is_unsafe = true` when dereferencing `*T` / `*mut T`.
+    fn emitPostfixOrPrefixDeref(
+        self: *HirLowerer,
+        expr_id: NodeIndex,
+        inner_hir: HirIndex,
+        target_ty: TypeId,
+        tok: TokenIndex,
+    ) !HirIndex {
+        const inner_node = self.store.getNode(inner_hir);
+        const ptr_ty_node = self.pool.getNode(inner_node.type_id);
+        const is_mut_deref = ptr_ty_node.tag == .mut_ref_ty or
+            (ptr_ty_node.tag == .raw_ptr_ty and ptr_ty_node.rhs != 0);
+        const pointee_ty = if (!target_ty.isError())
+            target_ty
+        else switch (ptr_ty_node.tag) {
+            .ref_ty, .mut_ref_ty, .raw_ptr_ty => TypeId.fromInt(ptr_ty_node.lhs),
+            else => .unit_ty,
+        };
+        return self.emitNode(.{
+            .tag = .hir_unary_op,
+            .flags = .{
+                .category = if (is_mut_deref) .place_mut else .place_imm,
+                .is_unsafe = self.is_in_unsafe or ptr_ty_node.tag == .raw_ptr_ty,
+            },
+            .type_id = self.concreteType(pointee_ty),
+            .origin_token = tok,
+            .data = .{ .lhs = @backingInt(HirUnaryOp.deref), .rhs = inner_hir.asInt() },
+        }, expr_id);
+    }
+
+    /// Summarizes whether a generic / Type-Group variable bound admits integer-like or float members (`SE-09`).
+    const TypeVarNumericInfo = struct {
+        /// `true` if the bound admits at least one integer, `bool`, `char`, `bit_field`, or backed `enum` member.
+        has_int: bool = false,
+        /// `true` if the bound admits at least one floating-point (`f32` / `f64`) member.
+        has_float: bool = false,
+    };
+
+    /// Inspects a `.type_param`, `.bind_once_group_var`, or `.bind_many_any_var` bound for numeric cast lowering.
+    fn classifyTypeVarNumericInfo(self: *const HirLowerer, ty: TypeId) TypeVarNumericInfo {
+        if (ty.isError()) return .{};
+        const node = self.pool.getNode(ty);
+        if (node.tag != .type_param and node.tag != .bind_once_group_var and node.tag != .bind_many_any_var) {
+            return .{};
+        }
+        const grp_ty = TypeId.fromInt(node.lhs);
+        if (grp_ty.isError()) return .{};
+        if (grp_ty.isBuiltinGroup()) {
+            const mask = type_system.TypeGroupMask.forBuiltinGroup(grp_ty);
+            const int_like_mask = type_system.TypeGroupMask.INTEGER |
+                TypeId.bool_ty.primitiveBit() |
+                TypeId.char_ty.primitiveBit();
+            return .{
+                .has_int = (mask & int_like_mask) != 0,
+                .has_float = (mask & type_system.TypeGroupMask.FLOAT) != 0,
+            };
+        }
+        if (self.pool.getTag(grp_ty) == .user_group) {
+            if (self.pool.getUserGroupView(grp_ty)) |view| {
+                const mask = view.prim_mask | view.tilde_prim_mask;
+                const int_like_mask = type_system.TypeGroupMask.INTEGER |
+                    TypeId.bool_ty.primitiveBit() |
+                    TypeId.char_ty.primitiveBit();
+                var info = TypeVarNumericInfo{
+                    .has_int = (mask & int_like_mask) != 0,
+                    .has_float = (mask & type_system.TypeGroupMask.FLOAT) != 0,
+                };
+                const member_lists = [2][]const u32{ view.exact_members, view.tilde_members };
+                for (member_lists) |mem_list| {
+                    for (mem_list) |raw_mem| {
+                        const unwrapped_mem = self.pool.unwrapUnderlyingType(TypeId.fromInt(raw_mem));
+                        if (unwrapped_mem.isError()) continue;
+                        const mem_tag = self.pool.getTag(unwrapped_mem);
+                        if (unwrapped_mem.isIntegerPrimitive() or unwrapped_mem == .bool_ty or
+                            unwrapped_mem == .char_ty or mem_tag == .bit_field_ty or
+                            self.pool.getEnumBackingIntType(unwrapped_mem) != null)
+                        {
+                            info.has_int = true;
+                        } else if (unwrapped_mem.isFloatPrimitive()) {
+                            info.has_float = true;
+                        }
+                    }
+                }
+                return info;
+            }
+        }
+        return .{};
+    }
+
+    /// Lowers `src as TargetType` into `hir_cast` with exact `HirCastKind` (`ADR-22C`).
     fn lowerCastExpr(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) !HirIndex {
         const ast_node = self.ast_arena.getNode(expr_id);
         if (ast_node.lhs.tag != .node) {
@@ -6816,21 +8864,38 @@ const HirLowerer = struct {
         const dst_ty = if (!resolved_dst_ty.isError()) resolved_dst_ty else src_ty;
         const src_tag = self.pool.getTag(src_ty);
         const dst_tag = self.pool.getTag(dst_ty);
+        const src_var_num = self.classifyTypeVarNumericInfo(src_ty);
+        const dst_var_num = self.classifyTypeVarNumericInfo(dst_ty);
+        const is_src_scalar_bf = src_tag == .bit_field_ty and
+            self.pool.getTag(self.pool.unwrapUnderlyingType(TypeId.fromInt(
+                self.pool.getNode(self.pool.unwrapUnderlyingType(src_ty)).lhs,
+            ))) != .array_ty;
+        const is_dst_scalar_bf = dst_tag == .bit_field_ty and
+            self.pool.getTag(self.pool.unwrapUnderlyingType(TypeId.fromInt(
+                self.pool.getNode(self.pool.unwrapUnderlyingType(dst_ty)).lhs,
+            ))) != .array_ty;
+        const is_src_int_like = src_ty.isIntegerPrimitive() or src_ty == .bool_ty or src_ty == .char_ty or
+            is_src_scalar_bf or self.pool.getEnumBackingIntType(src_ty) != null or src_var_num.has_int;
+        const is_dst_int_like = dst_ty.isIntegerPrimitive() or dst_ty == .char_ty or
+            is_dst_scalar_bf or self.pool.getEnumBackingIntType(dst_ty) != null or dst_var_num.has_int;
+        const is_src_float_like = src_ty.isFloatPrimitive() or src_var_num.has_float;
+        const is_dst_float_like = dst_ty.isFloatPrimitive() or dst_var_num.has_float;
 
         const cast_kind: HirCastKind = if (src_tag == .distinct_ty and dst_tag != .distinct_ty)
             .distinct_unwrap
         else if (src_tag != .distinct_ty and dst_tag == .distinct_ty)
             .distinct_wrap
-        else if ((src_ty.isIntegerPrimitive() or src_ty == .bool_ty or src_ty == .char_ty) and
-            (dst_ty.isIntegerPrimitive() or dst_ty == .char_ty))
+        else if (is_src_int_like and is_dst_int_like)
             .int_to_int
-        else if (src_ty.isIntegerPrimitive() and dst_ty.isFloatPrimitive())
+        else if (is_src_int_like and is_dst_float_like)
             .int_to_float
-        else if (src_ty.isFloatPrimitive() and dst_ty.isIntegerPrimitive())
+        else if (is_src_float_like and is_dst_int_like)
             .float_to_int
-        else if (src_ty.isFloatPrimitive() and dst_ty.isFloatPrimitive())
+        else if (is_src_float_like and is_dst_float_like)
             .float_to_float
-        else if (src_tag == .raw_ptr_ty or dst_tag == .raw_ptr_ty or src_tag == .ref_ty or src_tag == .mut_ref_ty)
+        else if (src_tag == .raw_ptr_ty or dst_tag == .raw_ptr_ty or
+            src_tag == .ref_ty or src_tag == .mut_ref_ty or
+            (src_tag == .closure_ty and dst_tag == .fn_ty))
             .ptr_cast
         else
             .noop;
@@ -7543,12 +9608,67 @@ const HirLowerer = struct {
                             has_converted_err = true;
                         }
                     }
+                } else if (tables.getTryFromVariant(expr_id)) |variant_ord| {
+                    // `SE-10` `@derive(From)` zero-overhead enum variant wrap:
+                    const unwrapped_outer_err = self.pool.unwrapUnderlyingType(outer_err_ty);
+                    const wrap_extra = try self.store.appendLenPrefixedExtra(&[1]u32{converted_err.asInt()});
+                    converted_err = try self.emitNode(.{
+                        .tag = .hir_construct,
+                        .flags = .{ .category = .rvalue, .is_synthetic = true },
+                        .type_id = unwrapped_outer_err,
+                        .origin_token = tok,
+                        .data = .{
+                            .lhs = @as(u32, @backingInt(HirConstructKind.enum_variant)) |
+                                (@as(u32, variant_ord) << 8),
+                            .rhs = wrap_extra,
+                        },
+                    }, .none);
+                    if (unwrapped_outer_err != outer_err_ty) {
+                        converted_err = try self.emitNode(.{
+                            .tag = .hir_cast,
+                            .flags = .{ .category = .rvalue, .is_synthetic = true },
+                            .type_id = outer_err_ty,
+                            .origin_token = tok,
+                            .data = .{
+                                .lhs = converted_err.asInt(),
+                                .rhs = @backingInt(HirCastKind.distinct_wrap),
+                            },
+                        }, .none);
+                    }
+                    has_converted_err = true;
                 }
             }
             if (!has_converted_err and err_ty != outer_err_ty) {
                 const unwrapped_outer_err = self.pool.unwrapUnderlyingType(outer_err_ty);
+                if (self.pool.getDerivedFromVariant(err_ty, unwrapped_outer_err)) |derived_ord| {
+                    const wrap_extra = try self.store.appendLenPrefixedExtra(&[1]u32{converted_err.asInt()});
+                    converted_err = try self.emitNode(.{
+                        .tag = .hir_construct,
+                        .flags = .{ .category = .rvalue, .is_synthetic = true },
+                        .type_id = unwrapped_outer_err,
+                        .origin_token = tok,
+                        .data = .{
+                            .lhs = @as(u32, @backingInt(HirConstructKind.enum_variant)) |
+                                (@as(u32, derived_ord) << 8),
+                            .rhs = wrap_extra,
+                        },
+                    }, .none);
+                    if (unwrapped_outer_err != outer_err_ty) {
+                        converted_err = try self.emitNode(.{
+                            .tag = .hir_cast,
+                            .flags = .{ .category = .rvalue, .is_synthetic = true },
+                            .type_id = outer_err_ty,
+                            .origin_token = tok,
+                            .data = .{
+                                .lhs = converted_err.asInt(),
+                                .rhs = @backingInt(HirCastKind.distinct_wrap),
+                            },
+                        }, .none);
+                    }
+                    has_converted_err = true;
+                }
                 const outer_err_node = self.pool.getNode(unwrapped_outer_err);
-                if (outer_err_node.tag == .enum_ty) {
+                if (!has_converted_err and outer_err_node.tag == .enum_ty) {
                     const enum_sym = self.sym_table.getSymbol(SymbolIndex.fromInt(outer_err_node.rhs)).*;
                     if (!enum_sym.target_scope.isNone()) {
                         for (self.sym_table.getScopeMembers(enum_sym.target_scope)) |member_idx| {
@@ -7729,11 +9849,7 @@ const HirLowerer = struct {
 
         const lhs_hir = try self.lowerExpr(lhs_id, .err_ty);
         const lhs_ty = self.store.getNode(lhs_hir).type_id;
-        const rhs_expected = if (op_kind == .ampamp or op_kind == .kw_and or
-            op_kind == .pipepipe or op_kind == .kw_or)
-            .bool_ty
-        else
-            lhs_ty;
+        const rhs_expected = if (op_kind == .kw_and or op_kind == .kw_or) .bool_ty else lhs_ty;
         const rhs_hir = try self.lowerExpr(rhs_id, rhs_expected);
 
         if (op_kind == .eqeq or op_kind == .bang_eq) {
@@ -7786,8 +9902,8 @@ const HirLowerer = struct {
             .le => .le,
             .gt => .gt,
             .ge => .ge,
-            .ampamp, .kw_and => .logical_and,
-            .pipepipe, .kw_or => .logical_or,
+            .kw_and => .logical_and,
+            .kw_or => .logical_or,
             else => .add,
         };
 
@@ -8183,13 +10299,38 @@ const HirLowerer = struct {
 
         if (std.mem.eql(u8, member_name, "len") and
             (recv_node.tag == .slice_ty or recv_node.tag == .array_ty or
-                recv_node.tag == .soa_slice_ty or recv_node.tag == .soa_array_ty or recv_ty == .str_ty))
+                recv_node.tag == .soa_slice_ty or recv_node.tag == .soa_array_ty or
+                recv_ty == .str_ty or self.unionSliceElemType(recv_ty) != null))
         {
             return self.emitSequenceLen(raw_recv_hir, raw_recv_ty, tok);
         }
 
         const deref_base = try self.autoDerefPlace(raw_recv_hir, tok);
         const base_cat = self.store.getNode(deref_base).flags.category;
+
+        // Built-in `SourceLoc` (`SE-17`) fields: `.file` (`0`), `.fn_name` (`1`), `.line` (`2`), `.col` (`3`):
+        if (recv_ty == .source_loc_ty) {
+            const loc_field_ord: ?u32 = if (std.mem.eql(u8, member_name, "file"))
+                0
+            else if (std.mem.eql(u8, member_name, "fn_name"))
+                1
+            else if (std.mem.eql(u8, member_name, "line"))
+                2
+            else if (std.mem.eql(u8, member_name, "col"))
+                3
+            else
+                null;
+            if (loc_field_ord) |f_ord| {
+                const f_ty: TypeId = if (f_ord <= 1) .str_ty else .u32_ty;
+                return self.emitNode(.{
+                    .tag = .hir_field_proj,
+                    .flags = .{ .category = if (base_cat == .place_mut) .place_mut else .place_imm },
+                    .type_id = f_ty,
+                    .origin_token = tok,
+                    .data = .{ .lhs = deref_base.asInt(), .rhs = f_ord },
+                }, ast_origin);
+            }
+        }
 
         // `#soa [S]` column slice projection `items.field -> [FieldTy]` (`is_soa = false`):
         if (recv_node.tag == .soa_slice_ty or recv_node.tag == .soa_array_ty) {
@@ -8248,37 +10389,156 @@ const HirLowerer = struct {
         return self.hasDollarAstDepth(root_id, 0);
     }
 
-    /// Bounded recursive helper for `hasDollarAst` stopping at nested `.index_expr` RHS and closures.
+    /// Bounded recursive helper for `hasDollarAst` stopping at nested `.index_expr` RHS, items, types, and closures.
     fn hasDollarAstDepth(self: *const HirLowerer, node_id: NodeIndex, depth: u32) bool {
-        if (depth > 128 or node_id.isNone() or node_id.asInt() >= self.ast_arena.countNodes()) return false;
+        if (depth > 128 or node_id.isNone() or node_id == .root or node_id.asInt() >= self.ast_arena.countNodes()) {
+            return false;
+        }
         const node = self.ast_arena.getNode(node_id);
+        if (isTypeAstTag(node.tag)) return false;
         switch (node.tag) {
             .dollar_expr => return true,
-            .closure_expr, .fn_decl => return false,
+            .root,
+            .mod_decl,
+            .use_decl,
+            .const_decl,
+            .type_alias_decl,
+            .struct_decl,
+            .enum_decl,
+            .union_decl,
+            .trait_decl,
+            .impl_decl,
+            .bit_field_decl,
+            .subscript_decl,
+            .test_decl,
+            .bench_decl,
+            .fn_decl,
+            .closure_expr,
+            .wildcard_pat,
+            .bind_pat,
+            .lit_pat,
+            .variant_pat,
+            .struct_pat,
+            .tuple_pat,
+            .or_pat,
+            .at_pat,
+            .slice_pat,
+            .item_hole,
+            .stmt_hole,
+            .expr_hole,
+            .type_hole,
+            .pattern_hole,
+            => return false,
             .index_expr => {
                 // Only `lhs` (inner base) sees the outer `$`; `rhs` rebinds `$` to the inner receiver:
-                if (node.lhs.tag == .node) {
-                    return self.hasDollarAstDepth(NodeIndex.fromInt(node.lhs.payload), depth + 1);
+                return if (node.lhs.tag == .node)
+                    self.hasDollarAstDepth(NodeIndex.fromInt(node.lhs.payload), depth + 1)
+                else
+                    false;
+            },
+            .method_call => {
+                if (node.lhs.tag == .node and
+                    self.hasDollarAstDepth(NodeIndex.fromInt(node.lhs.payload), depth + 1))
+                {
+                    return true;
+                }
+                const raw_items = self.getAstExtraSlice(node_id, true);
+                if (raw_items.len > 1) {
+                    for (raw_items[1..]) |raw_arg| {
+                        if (self.hasDollarAstDepth(NodeIndex.fromInt(raw_arg), depth + 1)) return true;
+                    }
                 }
                 return false;
             },
-            else => {},
+            .walrus_expr => {
+                const extra = self.getAstExtraSlice(node_id, true);
+                return extra.len >= 3 and self.hasDollarAstDepth(NodeIndex.fromInt(extra[2]), depth + 1);
+            },
+            .with_expr => {
+                const extra = self.getAstExtraSlice(node_id, false);
+                if (extra.len >= 1) {
+                    const pair_count: usize = extra[0];
+                    var pair_idx: usize = 0;
+                    while (pair_idx < pair_count and 2 + pair_idx * 2 < extra.len) : (pair_idx += 1) {
+                        if (self.hasDollarAstDepth(NodeIndex.fromInt(extra[2 + pair_idx * 2]), depth + 1)) {
+                            return true;
+                        }
+                    }
+                }
+                return node.rhs.tag == .node and
+                    self.hasDollarAstDepth(NodeIndex.fromInt(node.rhs.payload), depth + 1);
+            },
+            .for_stmt => {
+                const extra = self.getAstExtraSlice(node_id, false);
+                if (extra.len >= 2 and self.hasDollarAstDepth(NodeIndex.fromInt(extra[1]), depth + 1)) {
+                    return true;
+                }
+                return node.rhs.tag == .node and
+                    self.hasDollarAstDepth(NodeIndex.fromInt(node.rhs.payload), depth + 1);
+            },
+            .local_var_decl => {
+                if (node.lhs.tag == .extra) {
+                    const extra = self.getAstExtraSlice(node_id, false);
+                    if (extra.len >= 3 and self.hasDollarAstDepth(NodeIndex.fromInt(extra[2]), depth + 1)) {
+                        return true;
+                    }
+                    if (extra.len >= 4 and self.hasDollarAstDepth(NodeIndex.fromInt(extra[3]), depth + 1)) {
+                        return true;
+                    }
+                    return false;
+                }
+                return node.rhs.tag == .node and
+                    self.hasDollarAstDepth(NodeIndex.fromInt(node.rhs.payload), depth + 1);
+            },
+            .array_lit => {
+                const elems = if (node.lhs.tag == .extra and node.rhs.tag == .extra)
+                    self.ast_arena.getExtraSlice(ExtraIndex.fromInt(node.lhs.payload), node.rhs.payload)
+                else
+                    self.getAstExtraSlice(node_id, false);
+                for (elems) |raw_elem| {
+                    if (self.hasDollarAstDepth(NodeIndex.fromInt(raw_elem), depth + 1)) return true;
+                }
+                return false;
+            },
+            .tuple_lit, .block => {
+                if (node.lhs.tag == .extra) {
+                    for (self.getAstExtraSlice(node_id, false)) |raw_child| {
+                        if (self.hasDollarAstDepth(NodeIndex.fromInt(raw_child), depth + 1)) return true;
+                    }
+                }
+                return node.rhs.tag == .node and
+                    self.hasDollarAstDepth(NodeIndex.fromInt(node.rhs.payload), depth + 1);
+            },
+            .call_expr, .generic_call, .contextual_variant, .struct_lit, .if_expr, .match_expr => {
+                if (node.lhs.tag == .node and
+                    self.hasDollarAstDepth(NodeIndex.fromInt(node.lhs.payload), depth + 1))
+                {
+                    return true;
+                }
+                if (node.rhs.tag == .node) {
+                    return self.hasDollarAstDepth(NodeIndex.fromInt(node.rhs.payload), depth + 1);
+                }
+                if (node.rhs.tag == .extra) {
+                    for (self.getAstExtraSlice(node_id, true)) |raw_child| {
+                        if (self.hasDollarAstDepth(NodeIndex.fromInt(raw_child), depth + 1)) return true;
+                    }
+                }
+                return false;
+            },
+            else => {
+                if (node.lhs.tag == .node and
+                    self.hasDollarAstDepth(NodeIndex.fromInt(node.lhs.payload), depth + 1))
+                {
+                    return true;
+                }
+                if (node.rhs.tag == .node and
+                    self.hasDollarAstDepth(NodeIndex.fromInt(node.rhs.payload), depth + 1))
+                {
+                    return true;
+                }
+                return false;
+            },
         }
-        if (node.lhs.tag == .node) {
-            if (self.hasDollarAstDepth(NodeIndex.fromInt(node.lhs.payload), depth + 1)) return true;
-        } else if (node.lhs.tag == .extra) {
-            for (self.getAstExtraSlice(node_id, false)) |raw_child| {
-                if (self.hasDollarAstDepth(NodeIndex.fromInt(raw_child), depth + 1)) return true;
-            }
-        }
-        if (node.rhs.tag == .node) {
-            if (self.hasDollarAstDepth(NodeIndex.fromInt(node.rhs.payload), depth + 1)) return true;
-        } else if (node.rhs.tag == .extra) {
-            for (self.getAstExtraSlice(node_id, true)) |raw_child| {
-                if (self.hasDollarAstDepth(NodeIndex.fromInt(raw_child), depth + 1)) return true;
-            }
-        }
-        return false;
     }
 
     /// Evaluates an indexing receiver once and binds its length (`usize`) into a temp local for `$` (`SE-04`).
@@ -8444,7 +10704,7 @@ const HirLowerer = struct {
         return self.emitSyntheticBlock(seq_stmts.items, soa_ptr, field_ty, tok);
     }
 
-    /// Lowers `base[index]` and `base[start..end]`, supporting `$` length sugar, `#soa`, and `subscript`s (`SE-04`).
+    /// Lowers `base[index]`, `base[i, j, …]` (`SE-21`), and `base[start..end]` (`SE-04`, `SE-09`).
     fn lowerIndexExpr(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) !HirIndex {
         const outer_mut_ctx = self.is_mut_lvalue_ctx;
         self.is_mut_lvalue_ctx = false;
@@ -8452,10 +10712,134 @@ const HirLowerer = struct {
 
         const ast_node = self.ast_arena.getNode(expr_id);
         const tok = ast_node.main_token;
-        if (ast_node.lhs.tag != .node or ast_node.rhs.tag != .node) {
+        if (ast_node.lhs.tag != .node) {
             return self.emitErrorHole(tok, expr_id, target_ty);
         }
         const base_ast_id = NodeIndex.fromInt(ast_node.lhs.payload);
+
+        // [-1] Multi-index `base[i, j, …]` (`SE-21` `subscript(r, c, …)`):
+        if (ast_node.rhs.tag == .extra) {
+            const raw_indices = self.getAstExtraSlice(expr_id, true);
+            if (raw_indices.len == 0) return self.emitErrorHole(tok, expr_id, target_ty);
+            const raw_base_ty = self.nodeType(base_ast_id);
+            const unwrapped_base = self.unwrapRefType(raw_base_ty);
+            const recorded_sym = self.nodeSymbol(expr_id);
+            const sub_sym_idx = if (!recorded_sym.isNone() and !self.sym_table.getSymbol(recorded_sym).flags.is_overload)
+                recorded_sym
+            else
+                (try self.lookupMethodOnType(unwrapped_base, "subscript")) orelse
+                    return self.emitErrorHole(tok, expr_id, target_ty);
+            const sub_sym = self.sym_table.getSymbol(sub_sym_idx).*;
+            const sig_view = self.pool.getFnSignatureView(sub_sym.type_id);
+            const has_explicit_self = self.hasSubscriptExplicitSelf(sub_sym_idx);
+            const idx_param_offset: usize = if (has_explicit_self) 1 else 0;
+            const is_inout_arm_call = outer_mut_ctx and sub_sym.flags.is_mut;
+            const recv_param_ty = if (has_explicit_self)
+                (if (sig_view) |sv| self.concreteType(sv.getParamType(0)) else raw_base_ty)
+            else
+                try self.pool.internRef(self.concreteType(unwrapped_base), is_inout_arm_call);
+            const recv_mode: ParamMode = if (has_explicit_self)
+                (if (sig_view) |sv| sv.getParamMode(0) else .let_mode)
+            else
+                .let_mode;
+            const is_mut_sub_needed = outer_mut_ctx or recv_mode == .inout_mode or recv_mode == .set_mode or
+                self.pool.getTag(recv_param_ty) == .mut_ref_ty;
+
+            var has_any_dollar = false;
+            for (raw_indices) |raw_idx| {
+                if (self.hasDollarAst(NodeIndex.fromInt(raw_idx))) {
+                    has_any_dollar = true;
+                    break;
+                }
+            }
+
+            var seq_stmts: std.ArrayListUnmanaged(u32) = .empty;
+            defer seq_stmts.deinit(self.allocator);
+            var idx_slots = try self.allocator.alloc(u32, raw_indices.len);
+            defer self.allocator.free(idx_slots);
+
+            var base_hir: HirIndex = .none;
+            if (has_any_dollar) {
+                const bound = try self.bindIndexReceiverForDollar(base_ast_id, is_mut_sub_needed, tok, &seq_stmts);
+                base_hir = bound.base_hir;
+                try self.dollar_len_stack.append(self.allocator, bound.len_slot);
+                defer _ = self.dollar_len_stack.pop();
+                for (raw_indices, 0..) |raw_idx, i| {
+                    const param_ord = idx_param_offset + i;
+                    const param_ty = if (sig_view) |sv|
+                        (if (param_ord < sv.paramCount()) self.concreteType(sv.getParamType(param_ord)) else .usize_ty)
+                    else
+                        .usize_ty;
+                    const idx_hir = try self.lowerExpr(NodeIndex.fromInt(raw_idx), param_ty);
+                    idx_slots[i] = try self.allocTempLocal(self.store.getNode(idx_hir).type_id, tok, false);
+                    try seq_stmts.append(self.allocator, (try self.emitLocalDeclNode(idx_slots[i], idx_hir, tok)).asInt());
+                }
+            } else {
+                for (raw_indices, 0..) |raw_idx, i| {
+                    const param_ord = idx_param_offset + i;
+                    const param_ty = if (sig_view) |sv|
+                        (if (param_ord < sv.paramCount()) self.concreteType(sv.getParamType(param_ord)) else .usize_ty)
+                    else
+                        .usize_ty;
+                    const idx_hir = try self.lowerExpr(NodeIndex.fromInt(raw_idx), param_ty);
+                    idx_slots[i] = try self.allocTempLocal(self.store.getNode(idx_hir).type_id, tok, false);
+                    try seq_stmts.append(self.allocator, (try self.emitLocalDeclNode(idx_slots[i], idx_hir, tok)).asInt());
+                }
+                base_hir = try self.lowerPlaceWithMutCtx(base_ast_id, .err_ty, is_mut_sub_needed);
+            }
+
+            var wrapped_sub_args: std.ArrayListUnmanaged(u32) = .empty;
+            defer wrapped_sub_args.deinit(self.allocator);
+            const adjusted_recv = try self.adjustReceiverForParam(base_hir, recv_param_ty, tok);
+            try wrapped_sub_args.append(
+                self.allocator,
+                (try self.wrapArgProjection(adjusted_recv, recv_mode, tok)).asInt(),
+            );
+            for (idx_slots, 0..) |slot_id, i| {
+                const param_ord = idx_param_offset + i;
+                const idx_mode = if (sig_view) |sv|
+                    (if (param_ord < sv.paramCount()) sv.getParamMode(param_ord) else .let_mode)
+                else
+                    .let_mode;
+                const idx_ref = try self.emitVarRef(slot_id, tok, .none);
+                try wrapped_sub_args.append(
+                    self.allocator,
+                    (try self.wrapArgProjection(idx_ref, idx_mode, tok)).asInt(),
+                );
+            }
+            const callee_hir = try self.emitNode(.{
+                .tag = .hir_global_ref,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = sub_sym.type_id,
+                .origin_token = tok,
+                .data = .{ .lhs = sub_sym.def_id.asInt(), .rhs = sub_sym_idx.asInt() },
+            }, .none);
+            const extra_idx = try self.store.appendLenPrefixedExtra(wrapped_sub_args.items);
+            const expr_ty = self.nodeType(expr_id);
+            const ret_ty = if (!expr_ty.isError())
+                expr_ty
+            else if (!target_ty.isError())
+                target_ty
+            else if (sig_view) |sv|
+                self.concreteType(sv.ret_ty)
+            else
+                .unit_ty;
+            const sub_call = try self.emitNode(.{
+                .tag = .hir_subscript_call,
+                .flags = .{
+                    .category = if (is_inout_arm_call) .place_mut else .place_imm,
+                    .is_synthetic = true,
+                },
+                .type_id = ret_ty,
+                .origin_token = tok,
+                .data = .{ .lhs = callee_hir.asInt(), .rhs = extra_idx },
+            }, expr_id);
+            return self.emitSyntheticBlock(seq_stmts.items, sub_call, ret_ty, tok);
+        }
+
+        if (ast_node.rhs.tag != .node) {
+            return self.emitErrorHole(tok, expr_id, target_ty);
+        }
         const idx_ast_id = NodeIndex.fromInt(ast_node.rhs.payload);
         const base_ast = self.ast_arena.getNode(base_ast_id);
 
@@ -8540,8 +10924,8 @@ const HirLowerer = struct {
             }
             const slice_res_ty = if (!target_ty.isError())
                 self.concreteType(target_ty)
-            else if (base_node.type_id == .str_ty)
-                .str_ty
+            else if (base_node.type_id == .str_ty or self.unionSliceElemType(base_node.type_id) != null)
+                base_node.type_id
             else switch (base_ty_node.tag) {
                 .slice_ty, .array_ty => try self.pool.internRef(
                     try self.pool.internSlice(TypeId.fromInt(base_ty_node.lhs), false),
@@ -8595,16 +10979,35 @@ const HirLowerer = struct {
 
         const has_dollar = self.hasDollarAst(idx_ast_id);
 
-        // [2] Check if `base` is a nominal type defining `subscript(&self, idx)`:
+        // [2] Check if `base` is a nominal type defining `subscript(idx)` (`SE-21`):
         const raw_base_ty = self.nodeType(base_ast_id);
         const unwrapped_base = self.unwrapRefType(raw_base_ty);
-        if (try self.lookupMethodOnType(unwrapped_base, "subscript")) |sub_sym_idx| {
+        const recorded_single_sub = self.nodeSymbol(expr_id);
+        const maybe_sub_sym_idx: ?SymbolIndex = if (!recorded_single_sub.isNone() and
+            !self.sym_table.getSymbol(recorded_single_sub).flags.is_overload)
+            recorded_single_sub
+        else
+            try self.lookupMethodOnType(unwrapped_base, "subscript");
+        if (maybe_sub_sym_idx) |sub_sym_idx| {
             const sub_sym = self.sym_table.getSymbol(sub_sym_idx).*;
             const sig_view = self.pool.getFnSignatureView(sub_sym.type_id);
-            const recv_param_ty = if (sig_view) |sv| sv.getParamType(0) else raw_base_ty;
-            const recv_mode = if (sig_view) |sv| sv.getParamMode(0) else .let_mode;
+            const has_explicit_self = self.hasSubscriptExplicitSelf(sub_sym_idx);
+            const idx_param_ord: usize = if (has_explicit_self) 1 else 0;
+            const is_inout_arm_call = outer_mut_ctx and sub_sym.flags.is_mut;
+            const recv_param_ty = if (has_explicit_self)
+                (if (sig_view) |sv| self.concreteType(sv.getParamType(0)) else raw_base_ty)
+            else
+                try self.pool.internRef(self.concreteType(unwrapped_base), is_inout_arm_call);
+            const recv_mode: ParamMode = if (has_explicit_self)
+                (if (sig_view) |sv| sv.getParamMode(0) else .let_mode)
+            else
+                .let_mode;
+            const idx_param_ty = if (sig_view) |sv|
+                (if (idx_param_ord < sv.paramCount()) self.concreteType(sv.getParamType(idx_param_ord)) else .usize_ty)
+            else
+                .usize_ty;
             const idx_mode = if (sig_view) |sv|
-                (if (sv.paramCount() > 1) sv.getParamMode(1) else .let_mode)
+                (if (idx_param_ord < sv.paramCount()) sv.getParamMode(idx_param_ord) else .let_mode)
             else
                 .let_mode;
             const is_mut_sub_needed = outer_mut_ctx or recv_mode == .inout_mode or recv_mode == .set_mode or
@@ -8621,12 +11024,12 @@ const HirLowerer = struct {
                 try self.dollar_len_stack.append(self.allocator, bound.len_slot);
                 const idx_hir = blk_sub_idx: {
                     defer _ = self.dollar_len_stack.pop();
-                    break :blk_sub_idx try self.lowerExpr(idx_ast_id, .usize_ty);
+                    break :blk_sub_idx try self.lowerExpr(idx_ast_id, idx_param_ty);
                 };
                 idx_slot = try self.allocTempLocal(self.store.getNode(idx_hir).type_id, tok, false);
                 try seq_stmts.append(self.allocator, (try self.emitLocalDeclNode(idx_slot, idx_hir, tok)).asInt());
             } else {
-                const idx_hir = try self.lowerExpr(idx_ast_id, .usize_ty);
+                const idx_hir = try self.lowerExpr(idx_ast_id, idx_param_ty);
                 idx_slot = try self.allocTempLocal(self.store.getNode(idx_hir).type_id, tok, false);
                 try seq_stmts.append(self.allocator, (try self.emitLocalDeclNode(idx_slot, idx_hir, tok)).asInt());
                 base_hir = try self.lowerPlaceWithMutCtx(base_ast_id, .err_ty, is_mut_sub_needed);
@@ -8643,7 +11046,10 @@ const HirLowerer = struct {
                 .data = .{ .lhs = sub_sym.def_id.asInt(), .rhs = sub_sym_idx.asInt() },
             }, .none);
             const extra_idx = try self.store.appendLenPrefixedExtra(&[2]u32{ proj_recv.asInt(), proj_idx.asInt() });
-            const ret_ty = if (!target_ty.isError())
+            const expr_ty = self.nodeType(expr_id);
+            const ret_ty = if (!expr_ty.isError())
+                expr_ty
+            else if (!target_ty.isError())
                 target_ty
             else if (sig_view) |sv|
                 self.concreteType(sv.ret_ty)
@@ -8651,7 +11057,10 @@ const HirLowerer = struct {
                 .unit_ty;
             const sub_call = try self.emitNode(.{
                 .tag = .hir_subscript_call,
-                .flags = .{ .category = .place_imm, .is_synthetic = true },
+                .flags = .{
+                    .category = if (is_inout_arm_call) .place_mut else .place_imm,
+                    .is_synthetic = true,
+                },
                 .type_id = ret_ty,
                 .origin_token = tok,
                 .data = .{ .lhs = callee_hir.asInt(), .rhs = extra_idx },
@@ -8728,6 +11137,12 @@ const HirLowerer = struct {
         }
         const specs = self.sym_table.fn_param_specs.get(active_callee_sym.asInt()) orelse
             return self.emitDefaultInitValue(concrete_param_ty, call_tok);
+        if (full_param_idx < specs.len and specs[full_param_idx].is_caller_location_default) {
+            if (self.active_caller_loc_local) |loc_slot| {
+                return self.emitVarRef(loc_slot, call_tok, .none);
+            }
+            return self.emitCallerLocationConst(call_tok, .none);
+        }
         if (full_param_idx >= specs.len or !specs[full_param_idx].has_default or
             specs[full_param_idx].default_ast_node.isNone())
         {
@@ -8780,7 +11195,12 @@ const HirLowerer = struct {
 
         if (spec.decl_file_id.isNone() or spec.decl_file_id == self.store.file_id) {
             const saved_tables = self.side_tables;
-            defer self.side_tables = saved_tables;
+            const saved_ov_tok = self.interp_override_token;
+            if (self.interp_override_token.isNone()) self.interp_override_token = call_tok;
+            defer {
+                self.side_tables = saved_tables;
+                self.interp_override_token = saved_ov_tok;
+            }
             if (self.eval_hook.compiler_db) |db| {
                 if (try db.getExternalFileSyntaxView(self.store.file_id)) |same_view| {
                     if (same_view.file_side_tables) |file_st| {
@@ -8805,7 +11225,9 @@ const HirLowerer = struct {
         );
         defer if (ext_cst_map.len > 0) self.allocator.free(ext_cst_map);
 
-        const outer_span = if (!call_tok.isNone() and call_tok.asInt() < self.tokens.countTokens())
+        const outer_span = if (self.interp_override_span) |existing_span|
+            existing_span
+        else if (!call_tok.isNone() and call_tok.asInt() < self.tokens.countTokens())
             self.tokens.getTokenSpan(self.store.file_id, call_tok)
         else
             Span.init(self.store.file_id, 0, 0);
@@ -8819,6 +11241,7 @@ const HirLowerer = struct {
         const saved_cst_map = self.cst_to_ast;
         const saved_ov_tok = self.interp_override_token;
         const saved_ov_span = self.interp_override_span;
+        const saved_ov_src = self.interp_override_source;
 
         self.source = ext_view.source;
         self.tokens = ext_view.tokens;
@@ -8827,8 +11250,9 @@ const HirLowerer = struct {
         self.side_tables = ext_view.file_side_tables;
         self.node_extra_end = ext_extra_ends;
         self.cst_to_ast = ext_cst_map;
-        self.interp_override_token = call_tok;
+        self.interp_override_token = if (!saved_ov_tok.isNone()) saved_ov_tok else call_tok;
         self.interp_override_span = outer_span;
+        if (self.interp_override_source == null) self.interp_override_source = saved_source;
         defer {
             self.source = saved_source;
             self.tokens = saved_tokens;
@@ -8839,9 +11263,298 @@ const HirLowerer = struct {
             self.cst_to_ast = saved_cst_map;
             self.interp_override_token = saved_ov_tok;
             self.interp_override_span = saved_ov_span;
+            self.interp_override_source = saved_ov_src;
         }
 
         return self.lowerExpr(spec.default_ast_node, concrete_param_ty);
+    }
+
+    /// Evaluates `@caller_location()` at `tok` into `ComptimeValue.aggregate` (`type_id = .source_loc_ty`, `SE-17`).
+    fn evalCallerLocationValue(self: *HirLowerer, tok: TokenIndex) !ComptimeValue {
+        const eff_tok = if (!self.interp_override_token.isNone()) self.interp_override_token else tok;
+        const src_bytes = if (self.interp_override_span != null)
+            (self.interp_override_source orelse self.source)
+        else
+            self.source;
+        var byte_off: u32 = 0;
+        if (self.interp_override_span) |ov_span| {
+            byte_off = ov_span.start_byte;
+        } else if (!eff_tok.isNone() and eff_tok.asInt() < self.tokens.countTokens()) {
+            byte_off = self.tokens.getTokenSpan(self.store.file_id, eff_tok).start_byte;
+        }
+        var line: u32 = 1;
+        var col: u32 = 1;
+        const limit = @min(@as(usize, byte_off), src_bytes.len);
+        for (src_bytes[0..limit]) |byte_ch| {
+            if (byte_ch == '\n') {
+                line += 1;
+                col = 1;
+            } else if (byte_ch != '\r') {
+                col += 1;
+            }
+        }
+        var file_name_buf: [64]u8 = undefined;
+        const file_label = if (!self.store.file_id.isNone())
+            std.fmt.bufPrint(&file_name_buf, "file_{d}.cx", .{self.store.file_id.asInt()}) catch "<source>"
+        else
+            "<source>";
+        const file_sym = try self.interner.intern(file_label);
+        const fn_sym = if (self.active_fn_name != .empty)
+            self.active_fn_name
+        else
+            try self.interner.intern("<top>");
+        const loc_elems = [4]u32{
+            try self.store.appendConst(.{ .str_val = file_sym }),
+            try self.store.appendConst(.{ .str_val = fn_sym }),
+            try self.store.appendConst(.{ .int_val = @as(i128, line) }),
+            try self.store.appendConst(.{ .int_val = @as(i128, col) }),
+        };
+        const elem_start: u32 = @intCast(self.store.const_elements.items.len);
+        try self.store.const_elements.appendSlice(self.allocator, &loc_elems);
+        return .{
+            .aggregate = .{
+                .type_id = .source_loc_ty,
+                .elem_start = elem_start,
+                .elem_len = 4,
+            },
+        };
+    }
+
+    /// Emits a `.source_loc_ty` constant HIR node for `@caller_location()` (`SE-17`).
+    fn emitCallerLocationConst(self: *HirLowerer, tok: TokenIndex, ast_origin: NodeIndex) !HirIndex {
+        const loc_val = try self.evalCallerLocationValue(tok);
+        return self.emitConstVal(loc_val, .source_loc_ty, tok, ast_origin, true);
+    }
+
+    /// Applies C default argument promotions (`bool`/`i8`/`u8`/`i16`/`u16` -> `i32`, `f32` -> `f64`) (`ADR-22F`).
+    fn applyCVariadicPromotionIfNeeded(
+        self: *HirLowerer,
+        arg_hir: HirIndex,
+        sig_view: ?type_system.FnSignatureView,
+        full_param_idx: usize,
+        tok: TokenIndex,
+    ) !HirIndex {
+        const sv = sig_view orelse return arg_hir;
+        if (!sv.is_variadic or !sv.is_c_abi or full_param_idx < sv.paramCount() or arg_hir.isNone()) {
+            return arg_hir;
+        }
+        const arg_ty = self.pool.unwrapUnderlyingType(self.store.getNode(arg_hir).type_id);
+        if (arg_ty == .bool_ty or arg_ty == .i8_ty or arg_ty == .u8_ty or
+            arg_ty == .i16_ty or arg_ty == .u16_ty)
+        {
+            return self.emitNode(.{
+                .tag = .hir_cast,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = .i32_ty,
+                .origin_token = tok,
+                .data = .{ .lhs = arg_hir.asInt(), .rhs = @backingInt(HirCastKind.int_to_int) },
+            }, .none);
+        }
+        if (arg_ty == .f32_ty) {
+            return self.emitNode(.{
+                .tag = .hir_cast,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = .f64_ty,
+                .origin_token = tok,
+                .data = .{ .lhs = arg_hir.asInt(), .rhs = @backingInt(HirCastKind.float_to_float) },
+            }, .none);
+        }
+        return arg_hir;
+    }
+
+    /// Unwraps explicit `&place` / `&mut place` / `&out place` address-of wrappers on `.inout_mode`/`.set_mode` arguments.
+    fn unwrapPlaceProjectionArg(self: *const HirLowerer, arg_hir: HirIndex, mode: ParamMode) HirIndex {
+        if ((mode != .inout_mode and mode != .set_mode) or arg_hir.isNone()) return arg_hir;
+        var inner_hir = arg_hir;
+        var cur_node = self.store.getNode(inner_hir);
+        if (cur_node.tag == .hir_cast and cur_node.data.rhs == @backingInt(HirCastKind.ref_coerce)) {
+            inner_hir = HirIndex.fromInt(cur_node.data.lhs);
+            cur_node = self.store.getNode(inner_hir);
+        }
+        if (cur_node.tag == .hir_unary_op) {
+            const un_op: HirUnaryOp = @fromBackingInt(@intCast(@as(u8, @truncate(cur_node.data.lhs))));
+            if (un_op == .addr_of or un_op == .addr_of_mut) {
+                inner_hir = HirIndex.fromInt(cur_node.data.rhs);
+            }
+        }
+        return inner_hir;
+    }
+
+    /// Synthesizes a closure HIR node for a trailing `{ … }` `@builder` or `TaskGroup.spawn` block (`SE-20`, `SE-22`).
+    fn lowerBuilderTrailingBlockClosure(
+        self: *HirLowerer,
+        block_id: NodeIndex,
+        state_ty: TypeId,
+        closure_sig_ty: TypeId,
+        tok: TokenIndex,
+    ) anyerror!HirIndex {
+        const sig_view = self.pool.getFnSignatureView(closure_sig_ty);
+        const has_builder_param = state_ty != .unit_ty and
+            (if (sig_view) |sv| sv.paramCount() >= 1 else true);
+        const ret_ty = if (sig_view) |sv|
+            self.concreteType(sv.ret_ty)
+        else blk_ret: {
+            const blk_ty = self.nodeType(block_id);
+            break :blk_ret if (!blk_ty.isError()) self.concreteType(blk_ty) else .unit_ty;
+        };
+        const out_clos_ty = if (!closure_sig_ty.isError())
+            self.concreteType(closure_sig_ty)
+        else blk_cty: {
+            if (has_builder_param) {
+                const p_ref = try self.pool.internRef(self.concreteType(state_ty), true);
+                break :blk_cty try self.pool.internClosureSignatureExt(
+                    &[1]TypeId{p_ref},
+                    &[1]ParamMode{.let_mode},
+                    ret_ty,
+                    .{},
+                    .copy_tier,
+                    false,
+                    false,
+                    true,
+                );
+            }
+            break :blk_cty try self.pool.internClosureSignatureExt(
+                &.{},
+                &.{},
+                ret_ty,
+                .{},
+                .copy_tier,
+                false,
+                false,
+                true,
+            );
+        };
+
+        const saved_ret_ty = self.current_fn_ret_ty;
+        const saved_loop_id = self.current_loop_id;
+        const saved_loop_floor = self.closure_loop_stack_floor;
+        const saved_in_ct_for = self.is_in_comptime_for;
+        const was_in_cond_scope = self.is_in_cond_scope;
+        const saved_ceil = self.closure_outer_local_ceil;
+        const saved_caller_loc = self.active_caller_loc_local;
+        const saved_captures_len = self.active_closure_captures.items.len;
+        const local_checkpoint = self.local_shadow_log.items.len;
+        defer {
+            self.popLexicalLocalsTo(local_checkpoint);
+            self.active_closure_captures.shrinkRetainingCapacity(saved_captures_len);
+            self.active_caller_loc_local = saved_caller_loc;
+            self.closure_outer_local_ceil = saved_ceil;
+            self.is_in_cond_scope = was_in_cond_scope;
+            self.is_in_comptime_for = saved_in_ct_for;
+            self.closure_loop_stack_floor = saved_loop_floor;
+            self.current_loop_id = saved_loop_id;
+            self.current_fn_ret_ty = saved_ret_ty;
+        }
+
+        const return_local_id = try self.store.appendLocal(.{
+            .name = .empty,
+            .type_id = ret_ty,
+            .decl_span = self.astSpan(block_id),
+            .mode = .set_mode,
+            .is_mut = true,
+            .is_param = false,
+            .is_temp = true,
+        });
+        const param_local_start: u32 = @intCast(self.store.locals.items.len);
+        self.closure_outer_local_ceil = return_local_id;
+        self.active_caller_loc_local = null;
+        self.current_fn_ret_ty = ret_ty;
+        self.current_loop_id = null;
+        self.closure_loop_stack_floor = self.loop_stack.items.len;
+        self.is_in_comptime_for = false;
+        self.is_in_cond_scope = false;
+
+        var builder_slot_opt: ?u32 = null;
+        if (has_builder_param) {
+            const b_param_ty = if (sig_view) |sv|
+                (if (sv.paramCount() >= 1) self.concreteType(sv.getParamType(0)) else try self.pool.internRef(self.concreteType(state_ty), true))
+            else
+                try self.pool.internRef(self.concreteType(state_ty), true);
+            const b_slot = try self.store.appendLocal(.{
+                .name = .empty,
+                .type_id = b_param_ty,
+                .decl_span = self.astSpan(block_id),
+                .mode = .let_mode,
+                .is_mut = false,
+                .is_param = true,
+                .is_temp = true,
+            });
+            builder_slot_opt = b_slot;
+            try self.builder_scope_stack.append(self.allocator, .{
+                .state_ty = self.concreteType(state_ty),
+                .local_id = b_slot,
+            });
+        }
+        defer if (builder_slot_opt != null) {
+            _ = self.builder_scope_stack.pop();
+        };
+
+        const is_move_clos = if (sig_view) |sv| sv.capture_tier != .copy_tier else false;
+        const fn_meta_idx: u32 = @intCast(self.store.functions.items.len);
+        const clos_ord = self.closure_ordinal_in_owner;
+        self.closure_ordinal_in_owner += 1;
+        const file_bits: u32 = if (!self.store.file_id.isNone()) self.store.file_id.asInt() & 0x01FF else 0;
+        const owner_bits: u32 = if (!self.active_owner_def_id.isNone())
+            @as(u32, self.active_owner_def_id.itemIndex()) & 0x0FFF
+        else
+            0x0FFF;
+        const synth_closure_def = DefId.fromInt(
+            0x5000_0000 + (file_bits << 20) + (owner_bits << 8) + (clos_ord & 0x00FF),
+        );
+        try self.store.functions.append(self.allocator, .{
+            .def_id = synth_closure_def,
+            .fn_ty = out_clos_ty,
+            .ret_ty = ret_ty,
+            .return_local_id = return_local_id,
+            .param_local_start = param_local_start,
+            .param_len = if (has_builder_param) 1 else 0,
+            .is_local_closure = !is_move_clos,
+            .is_move_closure = is_move_clos,
+        });
+
+        const body_hir = try self.lowerBlockExpr(block_id, ret_ty, true);
+        const cap_slice = self.active_closure_captures.items[saved_captures_len..];
+        const cap_extra_start = if (cap_slice.len > 0) try self.store.appendExtraSlice(cap_slice) else 0;
+
+        self.store.functions.items[fn_meta_idx].body_hir = body_hir;
+        self.store.functions.items[fn_meta_idx].total_local_len =
+            @intCast(self.store.locals.items.len - return_local_id);
+        self.store.functions.items[fn_meta_idx].capture_extra_start = cap_extra_start;
+        self.store.functions.items[fn_meta_idx].capture_len = @intCast(cap_slice.len / 2);
+
+        return self.emitNode(.{
+            .tag = .hir_closure,
+            .flags = .{ .category = .rvalue, .is_synthetic = true },
+            .type_id = out_clos_ty,
+            .origin_token = tok,
+            .data = .{ .lhs = fn_meta_idx, .rhs = body_hir.asInt() },
+        }, block_id);
+    }
+
+    /// Finds the innermost active `@builder` scope local matching `sig_view`'s parameter `0` (`SE-22`).
+    fn findMatchingBuilderLocal(self: *HirLowerer, sig_view: ?type_system.FnSignatureView, tok: TokenIndex) !?HirIndex {
+        if (self.builder_scope_stack.items.len == 0) return null;
+        const wanted_state_ty: ?TypeId = if (sig_view) |sv| blk_w: {
+            if (sv.paramCount() == 0) break :blk_w null;
+            break :blk_w self.unwrapRefType(self.pool.unwrapUnderlyingType(sv.getParamType(0)));
+        } else null;
+        const wanted_base: ?TypeId = if (wanted_state_ty) |ws|
+            self.pool.unwrapNominalInstantiationBase(ws)
+        else
+            null;
+
+        var idx = self.builder_scope_stack.items.len;
+        while (idx > 0) {
+            idx -= 1;
+            const entry = self.builder_scope_stack.items[idx];
+            if (wanted_state_ty == null or
+                entry.state_ty == wanted_state_ty.? or
+                self.pool.unwrapNominalInstantiationBase(entry.state_ty) == wanted_base.?)
+            {
+                return try self.emitVarRef(entry.local_id, tok, .none);
+            }
+        }
+        return null;
     }
 
     /// Evaluates positional, named, and omitted default arguments for a direct `fn_sym` call (`SE-07`).
@@ -8860,9 +11573,20 @@ const HirLowerer = struct {
         const sig_view = self.pool.getFnSignatureView(callee_sig_ty);
         const param_offset: usize = if (has_self_receiver) 1 else 0;
 
+        const builder_block_state_opt = if (self.side_tables) |st|
+            st.getBuilderBlockStateType(call_ast_id)
+        else
+            null;
+
         if (self.side_tables) |tables| {
             if (tables.getCallArgMapping(call_ast_id)) |mapping| {
-                const total_non_self: usize = mapping.total_params;
+                const formal_non_self: usize = mapping.total_params;
+                var total_non_self: usize = formal_non_self;
+                for (mapping.provided_slots) |slot| {
+                    if (@as(usize, slot.param_index) + 1 > total_non_self) {
+                        total_non_self = @as(usize, slot.param_index) + 1;
+                    }
+                }
                 const slot_hirs = try self.allocator.alloc(HirIndex, total_non_self);
                 defer self.allocator.free(slot_hirs);
                 @memset(slot_hirs, .none);
@@ -8870,7 +11594,7 @@ const HirLowerer = struct {
                 defer self.allocator.free(slot_locals);
                 @memset(slot_locals, NONE_U32);
 
-                const has_omitted_default = mapping.provided_slots.len < total_non_self;
+                const has_omitted_default = mapping.provided_slots.len < formal_non_self;
                 const must_sequence = has_self_receiver or mapping.has_reordered_or_default or has_omitted_default;
                 for (mapping.provided_slots) |slot| {
                     if (slot.param_index >= total_non_self) continue;
@@ -8885,11 +11609,23 @@ const HirLowerer = struct {
                         .let_mode;
 
                     const is_mut_arg = p_mode == .inout_mode or p_mode == .set_mode;
-                    const arg_hir = try self.lowerPlaceWithMutCtx(
-                        self.unwrapCallArgAst(slot.arg_ast_node),
-                        p_ty,
-                        is_mut_arg,
-                    );
+                    const unwrapped_arg_ast = self.unwrapCallArgAst(slot.arg_ast_node);
+                    var arg_hir = if (builder_block_state_opt != null and
+                        !unwrapped_arg_ast.isNone() and
+                        self.ast_arena.getNode(unwrapped_arg_ast).tag == .block)
+                        try self.lowerBuilderTrailingBlockClosure(
+                            unwrapped_arg_ast,
+                            builder_block_state_opt.?,
+                            p_ty,
+                            tok,
+                        )
+                    else
+                        try self.lowerPlaceWithMutCtx(unwrapped_arg_ast, p_ty, is_mut_arg);
+                    if (is_mut_arg) {
+                        arg_hir = self.unwrapPlaceProjectionArg(arg_hir, p_mode);
+                    } else {
+                        arg_hir = try self.applyCVariadicPromotionIfNeeded(arg_hir, sig_view, full_idx, tok);
+                    }
                     if (!must_sequence) {
                         slot_hirs[slot.param_index] = arg_hir;
                     } else if (is_mut_arg) {
@@ -8927,7 +11663,7 @@ const HirLowerer = struct {
                     }
                 }
 
-                for (0..total_non_self) |rel_idx| {
+                for (0..formal_non_self) |rel_idx| {
                     if (!slot_hirs[rel_idx].isNone()) continue;
                     const full_idx = param_offset + rel_idx;
                     const p_ty = if (sig_view) |sv|
@@ -8951,7 +11687,9 @@ const HirLowerer = struct {
                     slot_hirs[rel_idx] = try self.emitVarRef(tmp_slot, tok, .none);
                 }
 
-                try out_arg_hirs.appendSlice(self.allocator, slot_hirs);
+                for (slot_hirs) |sh| {
+                    if (!sh.isNone()) try out_arg_hirs.append(self.allocator, sh);
+                }
                 return;
             }
         }
@@ -8964,7 +11702,8 @@ const HirLowerer = struct {
             specs.len
         else
             param_offset + raw_val_args.len;
-        const total_non_self: usize = @max(formal_total -| param_offset, raw_val_args.len);
+        const formal_non_self_fb: usize = formal_total -| param_offset;
+        const total_non_self: usize = @max(formal_non_self_fb, raw_val_args.len);
         const slot_hirs = try self.allocator.alloc(HirIndex, total_non_self);
         defer self.allocator.free(slot_hirs);
         @memset(slot_hirs, .none);
@@ -8981,7 +11720,7 @@ const HirLowerer = struct {
                 break;
             }
         }
-        const has_omitted_fallback = raw_val_args.len < total_non_self;
+        const has_omitted_fallback = raw_val_args.len < formal_non_self_fb;
         const is_seq_fallback_required = has_self_receiver or has_any_named or has_omitted_fallback;
 
         for (raw_val_args, 0..) |raw_arg, call_i| {
@@ -9011,7 +11750,23 @@ const HirLowerer = struct {
             else
                 .let_mode;
             const is_mut_arg = p_mode == .inout_mode or p_mode == .set_mode;
-            const arg_hir = try self.lowerPlaceWithMutCtx(self.unwrapCallArgAst(raw_arg), p_ty, is_mut_arg);
+            const unwrapped_arg_ast = self.unwrapCallArgAst(raw_arg);
+            var arg_hir = if (builder_block_state_opt != null and
+                !unwrapped_arg_ast.isNone() and
+                self.ast_arena.getNode(unwrapped_arg_ast).tag == .block)
+                try self.lowerBuilderTrailingBlockClosure(
+                    unwrapped_arg_ast,
+                    builder_block_state_opt.?,
+                    p_ty,
+                    tok,
+                )
+            else
+                try self.lowerPlaceWithMutCtx(unwrapped_arg_ast, p_ty, is_mut_arg);
+            if (is_mut_arg) {
+                arg_hir = self.unwrapPlaceProjectionArg(arg_hir, p_mode);
+            } else {
+                arg_hir = try self.applyCVariadicPromotionIfNeeded(arg_hir, sig_view, full_idx, tok);
+            }
             if (is_seq_fallback_required and !is_mut_arg) {
                 const tmp_slot = try self.allocTempLocal(self.store.getNode(arg_hir).type_id, tok, false);
                 try out_seq_stmts.append(
@@ -9028,7 +11783,7 @@ const HirLowerer = struct {
             }
         }
 
-        for (0..total_non_self) |rel_idx| {
+        for (0..formal_non_self_fb) |rel_idx| {
             if (!slot_hirs[rel_idx].isNone()) continue;
             const full_idx = param_offset + rel_idx;
             const p_ty = if (sig_view) |sv|
@@ -9051,7 +11806,9 @@ const HirLowerer = struct {
             slot_locals[rel_idx] = tmp_slot;
             slot_hirs[rel_idx] = try self.emitVarRef(tmp_slot, tok, .none);
         }
-        try out_arg_hirs.appendSlice(self.allocator, slot_hirs);
+        for (slot_hirs) |sh| {
+            if (!sh.isNone()) try out_arg_hirs.append(self.allocator, sh);
+        }
     }
 
     /// Lowers built-in `Option.Some(x)`, `Result.Ok(x)`, `Result.Err(e)`, and `Enum.Variant(args)` under Unified `.`.
@@ -9346,16 +12103,31 @@ const HirLowerer = struct {
             );
         }
 
-        // [2] Enum tuple-variant or static `Option.Some` / `Result.Ok` / endian helper constructor:
+        // [2] Enum tuple-variant, `@constructor` nominal call (`SE-22`), or static `Option.Some` / `Result.Ok` / endian helper:
         const call_sym_idx = self.nodeSymbol(expr_id);
         var resolved_sym_idx = if (!call_sym_idx.isNone()) call_sym_idx else self.nodeSymbol(callee_ast_id);
         if (resolved_sym_idx.isNone() and callee_ast.tag == .ident_expr and !callee_ast.main_token.isNone()) {
             const callee_lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, callee_ast.main_token);
             if (self.interner.lookup(callee_lex)) |callee_id| {
                 if (!self.active_name_to_local.contains(callee_id.asInt())) {
-                    switch (self.sym_table.lookupLexical(self.current_scope, callee_id, NamespaceMask.VALUE_ONLY)) {
+                    switch (self.sym_table.lookupLexical(self.current_scope, callee_id, NamespaceMask.TYPE_OR_VALUE)) {
                         .found => |found_sym| resolved_sym_idx = found_sym,
                         else => {},
+                    }
+                }
+            }
+        }
+        if (!resolved_sym_idx.isNone()) {
+            const cand_sym = self.sym_table.getSymbol(resolved_sym_idx).*;
+            if ((cand_sym.kind == .struct_sym or cand_sym.kind == .enum_sym or cand_sym.kind == .distinct_type_sym) and
+                !cand_sym.target_scope.isNone())
+            {
+                for (self.sym_table.getScopeMembers(cand_sym.target_scope)) |mem_idx| {
+                    if (!self.isSymbolCfgEnabled(mem_idx)) continue;
+                    const mem_sym = self.sym_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind == .fn_sym and mem_sym.extra_flags.is_constructor) {
+                        resolved_sym_idx = mem_idx;
+                        break;
                     }
                 }
             }
@@ -9442,37 +12214,86 @@ const HirLowerer = struct {
         defer wrapped_args.deinit(self.allocator);
 
         if (is_direct_sym) {
+            const has_implicit_builder = if (self.side_tables) |tables|
+                tables.getImplicitBuilderParamIndex(expr_id) != null
+            else
+                false;
             var ordered_args: std.ArrayListUnmanaged(HirIndex) = .empty;
             defer ordered_args.deinit(self.allocator);
             try self.lowerMappedDirectArgs(
                 expr_id,
                 resolved_sym_idx,
                 callee_sig_ty,
-                false,
+                has_implicit_builder,
                 val_args,
                 tok,
                 &seq_stmts,
                 &ordered_args,
             );
+            if (has_implicit_builder) {
+                const self_mode = if (sig_view) |sv|
+                    (if (sv.paramCount() > 0) sv.getParamMode(0) else .let_mode)
+                else
+                    .let_mode;
+                const self_ty = if (sig_view) |sv|
+                    (if (sv.paramCount() > 0) sv.getParamType(0) else .err_ty)
+                else
+                    .err_ty;
+                const raw_builder_ref = (try self.findMatchingBuilderLocal(sig_view, tok)) orelse
+                    try self.emitErrorHole(tok, expr_id, self_ty);
+                const adj_builder = if (!self_ty.isError())
+                    try self.adjustReceiverForParam(raw_builder_ref, self_ty, tok)
+                else
+                    raw_builder_ref;
+                try wrapped_args.append(
+                    self.allocator,
+                    (try self.wrapArgProjection(adj_builder, self_mode, tok)).asInt(),
+                );
+            }
+            const param_offset: usize = if (has_implicit_builder) 1 else 0;
             for (ordered_args.items, 0..) |arg_hir, i| {
+                const param_idx = param_offset + i;
                 const p_mode = if (sig_view) |sv|
-                    (if (i < sv.paramCount()) sv.getParamMode(i) else .let_mode)
+                    (if (param_idx < sv.paramCount()) sv.getParamMode(param_idx) else .let_mode)
                 else
                     .let_mode;
                 try wrapped_args.append(self.allocator, (try self.wrapArgProjection(arg_hir, p_mode, tok)).asInt());
             }
         } else {
+            const fixed_arity: usize = if (sig_view) |sv| sv.paramCount() else 0;
+            const is_c_variadic = if (sig_view) |sv| sv.is_variadic else false;
+            const builder_state_ty = if (self.side_tables) |tables|
+                tables.getBuilderBlockStateType(expr_id)
+            else
+                null;
             for (val_args, 0..) |arg_id, i| {
+                const unwrapped_arg = self.unwrapCallArgAst(arg_id);
                 const p_ty = if (sig_view) |sv|
-                    (if (i < sv.paramCount()) sv.getParamType(i) else .err_ty)
+                    (if (i < fixed_arity) sv.getParamType(i) else .err_ty)
                 else
                     .err_ty;
                 const p_mode = if (sig_view) |sv|
-                    (if (i < sv.paramCount()) sv.getParamMode(i) else .let_mode)
+                    (if (i < fixed_arity) sv.getParamMode(i) else .let_mode)
                 else
                     .let_mode;
-                const is_mut_arg = p_mode == .inout_mode or p_mode == .set_mode;
-                var arg_hir = try self.lowerPlaceWithMutCtx(self.unwrapCallArgAst(arg_id), p_ty, is_mut_arg);
+                var arg_hir: HirIndex = .none;
+                if (builder_state_ty != null and i + 1 == val_args.len and
+                    self.ast_arena.getNode(unwrapped_arg).tag == .block)
+                {
+                    arg_hir = try self.lowerBuilderTrailingBlockClosure(
+                        unwrapped_arg,
+                        builder_state_ty.?,
+                        p_ty,
+                        tok,
+                    );
+                } else {
+                    const is_mut_arg = p_mode == .inout_mode or p_mode == .set_mode;
+                    arg_hir = try self.lowerPlaceWithMutCtx(unwrapped_arg, p_ty, is_mut_arg);
+                    arg_hir = self.unwrapPlaceProjectionArg(arg_hir, p_mode);
+                    if (is_c_variadic and i >= fixed_arity) {
+                        arg_hir = try self.applyCVariadicPromotionIfNeeded(arg_hir, sig_view, i, tok);
+                    }
+                }
                 if (p_mode == .let_mode) {
                     const tmp_slot = try self.allocTempLocal(self.store.getNode(arg_hir).type_id, tok, false);
                     try seq_stmts.append(self.allocator, (try self.emitLocalDeclNode(tmp_slot, arg_hir, tok)).asInt());
@@ -9603,6 +12424,11 @@ const HirLowerer = struct {
             }
         }
 
+        // [0] `@caller_location()` (`SE-17`):
+        if (intr_kind == .caller_location) {
+            return self.emitCallerLocationConst(intr_tok, call_id);
+        }
+
         // [1] `@field(target, comptime field_spec)` -> direct `hir_field_proj` / `hir_bitfield_read` (`DR-05` Tier-1):
         if (intr_kind == .field and val_args.len >= 2) {
             const base_hir = try self.lowerExpr(self.unwrapCallArgAst(val_args[0]), .err_ty);
@@ -9669,7 +12495,8 @@ const HirLowerer = struct {
         }
         for (val_args) |v_arg_id| {
             const unwrapped_v = self.unwrapCallArgAst(v_arg_id);
-            try payload_words.append(self.allocator, (try self.lowerExpr(unwrapped_v, .err_ty)).asInt());
+            const expected_arg_ty: TypeId = if (intr_kind == .panic) .fmt_args_ty else .err_ty;
+            try payload_words.append(self.allocator, (try self.lowerExpr(unwrapped_v, expected_arg_ty)).asInt());
         }
         const extra_idx = try self.store.appendExtraSlice(payload_words.items);
         const checked_call_ty = if (!target_ty.isError()) target_ty else self.nodeType(call_id);
@@ -9747,16 +12574,87 @@ const HirLowerer = struct {
         }
         const val_args = val_arg_nodes.items;
 
-        // Built-in `.len()` method on slices, arrays, `#soa`, and `str`:
-        if (!is_static_dot_call and val_args.len == 0 and std.mem.eql(u8, member_name, "len")) {
+        // Built-in `.len()`, `.is_empty()`, `.as_ptr()`, and `.as_mut_ptr()` methods on slices, arrays, `#soa`, `str`, and `SE-09` bounds:
+        if (!is_static_dot_call and val_args.len == 0) {
             const raw_recv_ty = self.nodeType(recv_id);
-            const unwrapped_recv = self.unwrapRefType(raw_recv_ty);
+            const unwrapped_recv = self.pool.unwrapUnderlyingType(self.unwrapRefType(raw_recv_ty));
             const recv_tag = self.pool.getTag(unwrapped_recv);
-            if (recv_tag == .slice_ty or recv_tag == .array_ty or
-                recv_tag == .soa_slice_ty or recv_tag == .soa_array_ty or unwrapped_recv == .str_ty)
-            {
+            const union_elem_opt = self.unionSliceElemType(unwrapped_recv);
+            const is_seq_ty = recv_tag == .slice_ty or recv_tag == .array_ty or
+                recv_tag == .soa_slice_ty or recv_tag == .soa_array_ty or
+                unwrapped_recv == .str_ty or union_elem_opt != null;
+            if (is_seq_ty and std.mem.eql(u8, member_name, "len")) {
                 const recv_hir = try self.lowerExpr(recv_id, .err_ty);
                 return self.emitSequenceLen(recv_hir, self.store.getNode(recv_hir).type_id, tok);
+            }
+            if (is_seq_ty and std.mem.eql(u8, member_name, "is_empty")) {
+                const recv_hir = try self.lowerExpr(recv_id, .err_ty);
+                const len_hir = try self.emitSequenceLen(recv_hir, self.store.getNode(recv_hir).type_id, tok);
+                const zero_hir = try self.emitConstVal(.{ .int_val = 0 }, .usize_ty, tok, .none, true);
+                const eq_extra = try self.store.appendExtraSlice(&[2]u32{ len_hir.asInt(), zero_hir.asInt() });
+                return self.emitNode(.{
+                    .tag = .hir_binary_op,
+                    .flags = .{ .category = .rvalue, .is_synthetic = true },
+                    .type_id = .bool_ty,
+                    .origin_token = tok,
+                    .data = .{ .lhs = eq_extra, .rhs = @backingInt(HirBinaryOp.eq) },
+                }, expr_id);
+            }
+            const is_as_ptr = std.mem.eql(u8, member_name, "as_ptr");
+            const is_as_mut_ptr = std.mem.eql(u8, member_name, "as_mut_ptr");
+            if ((is_as_ptr or is_as_mut_ptr) and
+                (recv_tag == .slice_ty or recv_tag == .array_ty or
+                    unwrapped_recv == .str_ty or union_elem_opt != null))
+            {
+                const elem_ty: TypeId = if (unwrapped_recv == .str_ty)
+                    .u8_ty
+                else if (union_elem_opt) |u_elem|
+                    self.concreteType(u_elem)
+                else
+                    self.concreteType(TypeId.fromInt(self.pool.getNode(unwrapped_recv).lhs));
+                const resolved_ptr_ty = if (!target_ty.isError())
+                    target_ty
+                else blk_ptr_ty: {
+                    const node_ty = self.nodeType(expr_id);
+                    break :blk_ptr_ty if (!node_ty.isError())
+                        node_ty
+                    else
+                        try self.pool.internRawPtr(elem_ty, is_as_mut_ptr);
+                };
+                const raw_recv_hir = try self.lowerPlaceWithMutCtx(recv_id, .err_ty, is_as_mut_ptr);
+                const deref_recv_hir = try self.autoDerefPlace(raw_recv_hir, tok);
+                if (recv_tag == .array_ty) {
+                    const arr_ptr_ty = try self.pool.internRawPtr(
+                        self.store.getNode(deref_recv_hir).type_id,
+                        is_as_mut_ptr,
+                    );
+                    const raw_addr = try self.emitNode(.{
+                        .tag = .hir_unary_op,
+                        .flags = .{ .category = .rvalue, .is_synthetic = true },
+                        .type_id = arr_ptr_ty,
+                        .origin_token = tok,
+                        .data = .{
+                            .lhs = @backingInt(
+                                if (is_as_mut_ptr) HirUnaryOp.addr_of_raw_mut else HirUnaryOp.addr_of_raw,
+                            ),
+                            .rhs = deref_recv_hir.asInt(),
+                        },
+                    }, .none);
+                    return self.emitNode(.{
+                        .tag = .hir_cast,
+                        .flags = .{ .category = .rvalue, .is_synthetic = true },
+                        .type_id = self.concreteType(resolved_ptr_ty),
+                        .origin_token = tok,
+                        .data = .{ .lhs = raw_addr.asInt(), .rhs = @backingInt(HirCastKind.ptr_cast) },
+                    }, expr_id);
+                }
+                return self.emitNode(.{
+                    .tag = .hir_field_proj,
+                    .flags = .{ .category = .rvalue, .is_synthetic = true },
+                    .type_id = self.concreteType(resolved_ptr_ty),
+                    .origin_token = tok,
+                    .data = .{ .lhs = deref_recv_hir.asInt(), .rhs = 0 },
+                }, expr_id);
             }
         }
 
@@ -9888,29 +12786,96 @@ const HirLowerer = struct {
                     tok,
                 )) |endian_hir| return endian_hir;
 
-                // Built-in `.as_bytes()` wire view on `IntoBytes` values / `&T` when unshadowed (`DR-20` `D-01`):
+                // Built-in `.as_bytes()` view on `str`, `SE-09` `[Data: str | &[u8]]`, `[u8]`, and `IntoBytes` (`DR-20` `D-01`):
                 if (val_args.len == 0 and std.mem.eql(u8, member_name, "as_bytes")) {
-                    const raw_recv_hir = try self.lowerExpr(recv_id, .err_ty);
-                    const deref_recv_hir = try self.autoDerefPlace(raw_recv_hir, tok);
-                    const inner_ty = self.store.getNode(deref_recv_hir).type_id;
-                    const ref_ty = try self.pool.internRef(inner_ty, false);
-                    const ref_hir = try self.emitSyntheticAddrOf(deref_recv_hir, ref_ty, false, tok);
-                    const as_bytes_payload = [3]u32{ 0, 1, ref_hir.asInt() };
-                    const extra_idx = try self.store.appendExtraSlice(&as_bytes_payload);
-                    const resolved_ty = if (!target_ty.isError()) target_ty else self.nodeType(expr_id);
                     const fallback_slice_ty = try self.pool.internRef(
                         try self.pool.internSlice(.u8_ty, false),
                         false,
                     );
+                    const resolved_ty = self.concreteType(blk_bytes_ty: {
+                        const checked_ty = if (!target_ty.isError()) target_ty else self.nodeType(expr_id);
+                        break :blk_bytes_ty if (!checked_ty.isError()) checked_ty else fallback_slice_ty;
+                    });
+                    const raw_recv_hir = try self.lowerExpr(recv_id, .err_ty);
+                    const raw_recv_ty = self.store.getNode(raw_recv_hir).type_id;
+                    const deref_recv_hir = try self.autoDerefPlace(raw_recv_hir, tok);
+                    const inner_ty = self.pool.unwrapUnderlyingType(self.store.getNode(deref_recv_hir).type_id);
+                    const inner_tag = self.pool.getTag(inner_ty);
+                    if (inner_ty == .str_ty or self.unionSliceElemType(inner_ty) != null) {
+                        return self.emitNode(.{
+                            .tag = .hir_cast,
+                            .flags = .{ .category = .rvalue, .is_synthetic = true },
+                            .type_id = resolved_ty,
+                            .origin_token = tok,
+                            .data = .{ .lhs = deref_recv_hir.asInt(), .rhs = @backingInt(HirCastKind.noop) },
+                        }, expr_id);
+                    }
+                    if (inner_tag == .slice_ty and TypeId.fromInt(self.pool.getNode(inner_ty).lhs) == .u8_ty) {
+                        if (raw_recv_ty == resolved_ty) return raw_recv_hir;
+                        return self.emitSyntheticAddrOf(deref_recv_hir, resolved_ty, false, tok);
+                    }
+                    const ref_ty = try self.pool.internRef(self.store.getNode(deref_recv_hir).type_id, false);
+                    const ref_hir = try self.emitSyntheticAddrOf(deref_recv_hir, ref_ty, false, tok);
+                    if (inner_tag == .array_ty and TypeId.fromInt(self.pool.getNode(inner_ty).lhs) == .u8_ty) {
+                        return self.emitNode(.{
+                            .tag = .hir_cast,
+                            .flags = .{ .category = .rvalue, .is_synthetic = true },
+                            .type_id = resolved_ty,
+                            .origin_token = tok,
+                            .data = .{ .lhs = ref_hir.asInt(), .rhs = @backingInt(HirCastKind.array_to_slice) },
+                        }, expr_id);
+                    }
+                    const as_bytes_payload = [3]u32{ 0, 1, ref_hir.asInt() };
+                    const extra_idx = try self.store.appendExtraSlice(&as_bytes_payload);
                     return self.emitNode(.{
                         .tag = .hir_intrinsic_call,
                         .flags = .{ .category = .rvalue, .is_synthetic = true },
-                        .type_id = self.concreteType(
-                            if (!resolved_ty.isError()) resolved_ty else fallback_slice_ty,
-                        ),
+                        .type_id = resolved_ty,
                         .origin_token = tok,
                         .data = .{ .lhs = @backingInt(IntrinsicKind.as_bytes), .rhs = extra_idx },
                     }, expr_id);
+                }
+
+                // Built-in `TaskGroup` (`spawn`, `spawn_local`, `cancel`) and `TaskHandle` (`join`) fallback (`SE-20`):
+                const recv_unwrapped = self.pool.unwrapUnderlyingType(self.unwrapRefType(self.nodeType(recv_id)));
+                if (self.pool.isTaskGroupType(recv_unwrapped) or self.pool.isTaskHandleType(recv_unwrapped)) {
+                    var tg_stmts: std.ArrayListUnmanaged(u32) = .empty;
+                    defer tg_stmts.deinit(self.allocator);
+                    const is_mut_tg = self.pool.isTaskGroupType(recv_unwrapped);
+                    const tg_recv = try self.lowerPlaceWithMutCtx(recv_id, .err_ty, is_mut_tg);
+                    const recv_tmp = try self.allocTempLocal(self.store.getNode(tg_recv).type_id, tok, false);
+                    try tg_stmts.append(
+                        self.allocator,
+                        (try self.emitLocalDeclNode(recv_tmp, tg_recv, tok)).asInt(),
+                    );
+                    const builder_state_ty = if (self.side_tables) |tables|
+                        tables.getBuilderBlockStateType(expr_id)
+                    else
+                        null;
+                    for (val_args, 0..) |arg_id, arg_i| {
+                        const unwrapped_arg = self.unwrapCallArgAst(arg_id);
+                        const arg_hir = if (builder_state_ty != null and arg_i + 1 == val_args.len and
+                            self.ast_arena.getNode(unwrapped_arg).tag == .block)
+                            try self.lowerBuilderTrailingBlockClosure(
+                                unwrapped_arg,
+                                builder_state_ty.?,
+                                .err_ty,
+                                tok,
+                            )
+                        else
+                            try self.lowerExpr(unwrapped_arg, .err_ty);
+                        const arg_tmp = try self.allocTempLocal(self.store.getNode(arg_hir).type_id, tok, false);
+                        try tg_stmts.append(
+                            self.allocator,
+                            (try self.emitLocalDeclNode(arg_tmp, arg_hir, tok)).asInt(),
+                        );
+                    }
+                    const tg_ret_ty = self.concreteType(blk_tg_ret: {
+                        const checked_ty = if (!target_ty.isError()) target_ty else self.nodeType(expr_id);
+                        break :blk_tg_ret if (!checked_ty.isError()) checked_ty else .unit_ty;
+                    });
+                    const tail_hir = try self.emitDefaultInitValue(tg_ret_ty, tok);
+                    return self.emitSyntheticBlock(tg_stmts.items, tail_hir, tg_ret_ty, tok);
                 }
             }
             return self.emitErrorHole(tok, expr_id, target_ty);
@@ -10105,7 +13070,7 @@ const HirLowerer = struct {
             .binary_expr => {
                 if (!node.main_token.isNone() and node.main_token.asInt() < self.tokens.countTokens()) {
                     const op_kind = self.tokens.getToken(node.main_token).kind;
-                    if (op_kind == .kw_or or op_kind == .pipepipe) return false;
+                    if (op_kind == .kw_or) return false;
                     if (op_kind == .kw_orelse or op_kind == .kw_catch) {
                         return node.lhs.tag == .node and
                             self.hasDominatingWalrusAst(NodeIndex.fromInt(node.lhs.payload), depth + 1);
@@ -10177,7 +13142,7 @@ const HirLowerer = struct {
         return self.hasConditionScopeDepth(cond_id, 0);
     }
 
-    /// Bounded recursive helper for `hasConditionScope` along the top-level `and` / `&&` spine.
+    /// Bounded recursive helper for `hasConditionScope` along the top-level `and` spine.
     fn hasConditionScopeDepth(self: *const HirLowerer, cond_id: NodeIndex, depth: u32) bool {
         if (depth >= MAX_HIR_LOWER_DEPTH) return false;
         if (cond_id.isNone() or cond_id.asInt() >= self.ast_arena.countNodes()) return false;
@@ -10186,7 +13151,7 @@ const HirLowerer = struct {
             !node.main_token.isNone() and node.main_token.asInt() < self.tokens.countTokens())
         {
             const op_kind = self.tokens.getToken(node.main_token).kind;
-            if (op_kind == .kw_and or op_kind == .ampamp) {
+            if (op_kind == .kw_and) {
                 return self.hasConditionScopeDepth(NodeIndex.fromInt(node.lhs.payload), depth + 1) or
                     self.hasConditionScopeDepth(NodeIndex.fromInt(node.rhs.payload), depth + 1);
             }
@@ -10194,7 +13159,7 @@ const HirLowerer = struct {
         return self.isPositiveIsClauseAst(cond_id) or self.hasDominatingWalrusAst(cond_id, depth);
     }
 
-    /// Flattens top-level `.kw_and` / `.ampamp` conjunctions left-to-right for `hir_cond_if` and `hir_cond_while`.
+    /// Flattens top-level `.kw_and` conjunctions left-to-right for `hir_cond_if` and `hir_cond_while`.
     fn collectConjunctiveClauses(
         self: *const HirLowerer,
         cond_id: NodeIndex,
@@ -10207,7 +13172,7 @@ const HirLowerer = struct {
             !node.main_token.isNone() and node.main_token.asInt() < self.tokens.countTokens())
         {
             const op_kind = self.tokens.getToken(node.main_token).kind;
-            if (op_kind == .kw_and or op_kind == .ampamp) {
+            if (op_kind == .kw_and) {
                 try self.collectConjunctiveClauses(
                     NodeIndex.fromInt(node.lhs.payload),
                     out_clauses,
@@ -10393,9 +13358,33 @@ const HirLowerer = struct {
             }
         }
 
-        const scrut_hir = try self.lowerExpr(scrutinee_id, .err_ty);
-        const scrut_ty = self.store.getNode(scrut_hir).type_id;
+        const raw_scrut_hir = try self.lowerExpr(scrutinee_id, .err_ty);
+        const scrut_ty = self.store.getNode(raw_scrut_hir).type_id;
         const res_ty = if (!target_ty.isError()) target_ty else .unit_ty;
+        const label_tok = self.extractMatchLabelToken(expr_id);
+        const is_labeled_fsm = !label_tok.isNone();
+
+        var fsm_id: u32 = 0;
+        var scrut_local: u32 = NONE_U32;
+        var decl_hir: HirIndex = .none;
+        const scrut_hir = if (is_labeled_fsm) blk_fsm_scrut: {
+            const raw_fsm_id = self.next_fsm_id;
+            self.next_fsm_id += 1;
+            fsm_id = LABELED_MATCH_CONTINUE_FLAG | raw_fsm_id;
+            scrut_local = try self.allocTempLocal(scrut_ty, tok, true);
+            decl_hir = try self.emitLocalDeclNode(scrut_local, raw_scrut_hir, tok);
+            try self.labeled_match_stack.append(self.allocator, .{
+                .match_ast = expr_id,
+                .fsm_id = fsm_id,
+                .label_id = try self.internLabelToken(label_tok),
+                .scrutinee_local = scrut_local,
+                .scrutinee_ty = scrut_ty,
+            });
+            break :blk_fsm_scrut try self.emitVarRef(scrut_local, tok, .none);
+        } else raw_scrut_hir;
+        defer if (is_labeled_fsm) {
+            _ = self.labeled_match_stack.pop();
+        };
 
         if (self.is_in_comptime_for) self.comptime_runtime_cond_depth += 1;
         defer if (self.is_in_comptime_for) {
@@ -10433,13 +13422,21 @@ const HirLowerer = struct {
         const arm_start: u32 = @intCast(self.store.match_arms.items.len);
         try self.store.match_arms.appendSlice(self.allocator, temp_arms.items);
         const match_extra = try self.store.appendExtraSlice(&[2]u32{ arm_start, @intCast(temp_arms.items.len) });
-        return self.emitNode(.{
+        const match_hir = try self.emitNode(.{
             .tag = .hir_match,
             .flags = .{ .category = .rvalue, .is_unsafe = self.is_in_unsafe },
             .type_id = self.concreteType(res_ty),
             .origin_token = tok,
             .data = .{ .lhs = scrut_hir.asInt(), .rhs = match_extra },
         }, expr_id);
+        if (is_labeled_fsm) {
+            try self.store.labeled_matches.put(self.allocator, match_hir.asInt(), .{
+                .fsm_id = fsm_id,
+                .scrutinee_local = scrut_local,
+            });
+            return self.emitSyntheticBlock(&[1]u32{decl_hir.asInt()}, match_hir, self.concreteType(res_ty), tok);
+        }
+        return match_hir;
     }
 
     /// Lowers `loop { … }` (`loop_expr`) into `hir_loop` with its `break` value type and optional `:label` (`SE-06`).
@@ -10499,11 +13496,13 @@ const HirLowerer = struct {
         const saved_in_ct_for = self.is_in_comptime_for;
         const was_in_cond_scope = self.is_in_cond_scope;
         const saved_ceil = self.closure_outer_local_ceil;
+        const saved_caller_loc = self.active_caller_loc_local;
         const saved_captures_len = self.active_closure_captures.items.len;
         const local_checkpoint = self.local_shadow_log.items.len;
         defer {
             self.popLexicalLocalsTo(local_checkpoint);
             self.active_closure_captures.shrinkRetainingCapacity(saved_captures_len);
+            self.active_caller_loc_local = saved_caller_loc;
             self.closure_outer_local_ceil = saved_ceil;
             self.is_in_cond_scope = was_in_cond_scope;
             self.is_in_comptime_for = saved_in_ct_for;
@@ -10523,6 +13522,7 @@ const HirLowerer = struct {
         });
         const param_local_start: u32 = @intCast(self.store.locals.items.len);
         self.closure_outer_local_ceil = return_local_id;
+        self.active_caller_loc_local = null;
         self.current_fn_ret_ty = ret_ty;
         self.current_loop_id = null;
         self.closure_loop_stack_floor = self.loop_stack.items.len;
@@ -10556,7 +13556,10 @@ const HirLowerer = struct {
             try self.pushLexicalLocal(p_name, slot_id);
         }
 
-        const is_local_clos = self.hasAttrNamedInCst(self.ast_arena.getCstOrigin(expr_id), "local");
+        const clos_cst = self.ast_arena.getCstOrigin(expr_id);
+        const is_local_clos = self.hasAttrNamedInCst(clos_cst, "local");
+        const is_move_clos = self.hasModifierInCst(clos_cst, .kw_own, "own") or
+            (if (sig_view) |sv| sv.capture_tier != .copy_tier else false);
         const fn_meta_idx: u32 = @intCast(self.store.functions.items.len);
         const clos_ord = self.closure_ordinal_in_owner;
         self.closure_ordinal_in_owner += 1;
@@ -10576,6 +13579,7 @@ const HirLowerer = struct {
             .param_local_start = param_local_start,
             .param_len = @intCast(param_tokens.len),
             .is_local_closure = is_local_clos,
+            .is_move_closure = is_move_clos,
         });
 
         const body_hir = if (ast_node.rhs.tag == .node) blk: {
@@ -10595,6 +13599,9 @@ const HirLowerer = struct {
             @intCast(self.store.locals.items.len - return_local_id);
         self.store.functions.items[fn_meta_idx].capture_extra_start = cap_extra_start;
         self.store.functions.items[fn_meta_idx].capture_len = @intCast(cap_slice.len / 2);
+        if (!is_move_clos and cap_slice.len > 0) {
+            self.store.functions.items[fn_meta_idx].is_local_closure = true;
+        }
 
         return self.emitNode(.{
             .tag = .hir_closure,
@@ -10635,6 +13642,86 @@ const HirLowerer = struct {
             cur += 1;
         }
         return false;
+    }
+
+    /// Returns `true` if a shallow prefix modifier token (`own`, `raw`, `mut`, `out`) appears on `cst_id`.
+    fn hasModifierInCst(
+        self: *const HirLowerer,
+        cst_id: CstNodeIndex,
+        target_kind: TokenKind,
+        target_lexeme: []const u8,
+    ) bool {
+        if (cst_id.isNone() or cst_id.asInt() >= self.cst_arena.countNodes()) return false;
+        const start_idx: usize = cst_id.asInt();
+        const rec = self.cst_arena.getNode(cst_id);
+        const end_idx: usize = @min(
+            start_idx + @max(@as(usize, rec.subtree_size), 1),
+            self.cst_arena.countNodes(),
+        );
+        var cur = start_idx + 1;
+        while (cur < end_idx) {
+            const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+            if (sub.subtree_size > 1) {
+                cur += sub.subtree_size;
+                continue;
+            }
+            if (!sub.flags.is_missing_or_injected and
+                !sub.token.isNone() and sub.token.asInt() < self.tokens.countTokens())
+            {
+                if (rec.kind == .prefix_expr and cur + 1 >= end_idx) break;
+                const leaf_kind = self.tokens.getToken(sub.token).kind;
+                if (rec.kind == .closure_expr and (leaf_kind == .pipe or leaf_kind == .lbrace)) break;
+                if (target_kind != .ident and leaf_kind == target_kind) return true;
+                if (symbol_resolver.isIdentifierToken(leaf_kind) and
+                    std.mem.eql(u8, symbol_resolver.extractTokenSlice(self.source, self.tokens, sub.token), target_lexeme))
+                {
+                    return true;
+                }
+            }
+            cur += 1;
+        }
+        return false;
+    }
+
+    /// Extracts the optional `label:` identifier token preceding `match` inside `match_expr_id`'s CST (`SE-23`).
+    fn extractMatchLabelToken(self: *const HirLowerer, match_expr_id: NodeIndex) TokenIndex {
+        if (match_expr_id.isNone() or match_expr_id.asInt() >= self.ast_arena.countNodes()) return .none;
+        const match_node = self.ast_arena.getNode(match_expr_id);
+        if (match_node.rhs.tag == .token) {
+            return TokenIndex.fromInt(match_node.rhs.payload);
+        }
+        const match_cst = self.ast_arena.getCstOrigin(match_expr_id);
+        if (match_cst.isNone() or match_cst.asInt() >= self.cst_arena.countNodes()) return .none;
+        const start_idx: usize = match_cst.asInt();
+        const rec = self.cst_arena.getNode(match_cst);
+        const end_idx: usize = @min(
+            start_idx + @max(@as(usize, rec.subtree_size), 1),
+            self.cst_arena.countNodes(),
+        );
+        var cur = start_idx + 1;
+        while (cur < end_idx) {
+            const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+            if (sub.kind == .loop_label) {
+                const lbl_end = @min(cur + @max(@as(usize, sub.subtree_size), 1), end_idx);
+                var inner = cur + 1;
+                while (inner < lbl_end) : (inner += 1) {
+                    const leaf = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(inner)));
+                    if (leaf.subtree_size <= 1 and !leaf.token.isNone() and
+                        leaf.token.asInt() < self.tokens.countTokens() and
+                        symbol_resolver.isIdentifierToken(self.tokens.getToken(leaf.token).kind))
+                    {
+                        return leaf.token;
+                    }
+                }
+                return .none;
+            }
+            if (sub.subtree_size > 1) break;
+            if (!sub.token.isNone() and sub.token.asInt() < self.tokens.countTokens()) {
+                if (self.tokens.getToken(sub.token).kind == .kw_match) break;
+            }
+            cur += 1;
+        }
+        return .none;
     }
 
     /// Extracts optional `label:` identifiers from `.call_arg` CST children of `call_id`.
@@ -10842,19 +13929,20 @@ const HirLowerer = struct {
         return self.autoDerefPlace(raw_recv_hir, tok);
     }
 
-    /// Wraps `arg_hir` in `hir_project_arg(mode, arg_hir)` (`DR-02` §2.2).
+    /// Wraps `arg_hir` in `hir_project_arg(mode, arg_hir)` (`DR-02` §2.2 & `ADR-22B`).
     fn wrapArgProjection(
         self: *HirLowerer,
         arg_hir: HirIndex,
         mode: ParamMode,
         tok: TokenIndex,
     ) !HirIndex {
+        const inner_hir = self.unwrapPlaceProjectionArg(arg_hir, mode);
         return self.emitNode(.{
             .tag = .hir_project_arg,
             .flags = .{ .category = .rvalue, .is_synthetic = true },
-            .type_id = self.store.getNode(arg_hir).type_id,
+            .type_id = self.store.getNode(inner_hir).type_id,
             .origin_token = tok,
-            .data = .{ .lhs = @backingInt(mode), .rhs = arg_hir.asInt() },
+            .data = .{ .lhs = @backingInt(mode), .rhs = inner_hir.asInt() },
         }, .none);
     }
 
@@ -10876,6 +13964,19 @@ const HirLowerer = struct {
         );
     }
 
+    /// Returns `true` if `sub_sym_idx` declares an explicit `self` parameter in its signature scope (`SE-21`).
+    fn hasSubscriptExplicitSelf(self: *const HirLowerer, sub_sym_idx: SymbolIndex) bool {
+        if (sub_sym_idx.isNone()) return false;
+        const self_sym_id = self.interner.lookup("self") orelse return false;
+        const sub_sym = self.sym_table.getSymbol(sub_sym_idx).*;
+        const base_fn_scope = if (!sub_sym.target_scope.isNone()) sub_sym.target_scope else sub_sym.scope_id;
+        return !self.sym_table.lookupInScopeDirect(
+            base_fn_scope,
+            self_sym_id,
+            NamespaceMask.VALUE_ONLY,
+        ).isNone();
+    }
+
     /// Looks up `field_name`'s zero-based declaration ordinal and `TypeId` on a `struct` or `union` type.
     fn findStructFieldInfo(
         self: *const HirLowerer,
@@ -10893,6 +13994,7 @@ const HirLowerer = struct {
         const nom_subst = type_system.NominalTypeSubst.init(self.pool, self.sym_table, unwrapped);
         var ord: u32 = 0;
         for (self.sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
+            if (!self.isSymbolCfgEnabled(mem_idx)) continue;
             const mem_sym = self.sym_table.getSymbol(mem_idx).*;
             if (mem_sym.kind != .field_sym) continue;
             if (std.mem.eql(u8, mem_sym.name_text, field_name)) {
@@ -10916,7 +14018,7 @@ const HirLowerer = struct {
         const backing_bits: u8 = if (type_system.getTargetPrimitiveIntBits(backing_ty, self.store.target_layout)) |bits|
             @intCast(bits)
         else
-            32;
+            0;
 
         const sym_idx = SymbolIndex.fromInt(ty_node.rhs);
         if (sym_idx.isNone() or sym_idx.asInt() >= self.sym_table.symbols.items.len) return null;
@@ -10925,6 +14027,7 @@ const HirLowerer = struct {
 
         var running_offset: u16 = 0;
         for (self.sym_table.getScopeMembers(bf_sym.target_scope)) |mem_idx| {
+            if (!self.isSymbolCfgEnabled(mem_idx)) continue;
             const mem_sym = self.sym_table.getSymbol(mem_idx).*;
             if (mem_sym.kind != .field_sym) continue;
             const base_field_ty = self.pool.unwrapUnderlyingType(mem_sym.type_id);
@@ -10942,12 +14045,14 @@ const HirLowerer = struct {
                     .i8_ty, .i16_ty, .i32_ty, .i64_ty, .i128_ty, .isize_ty => true,
                     else => false,
                 };
+                const capped_off: u15 = @intCast(@min(running_offset, 32767));
                 return .{
                     .spec = .{
-                        .bit_offset = @intCast(@min(running_offset, 127)),
+                        .bit_offset = @truncate(capped_off),
                         .bit_width = @intCast(@min(width, 128)),
                         .backing_bits = backing_bits,
                         .is_signed = is_signed,
+                        .bit_offset_hi = @intCast(capped_off >> 8),
                     },
                     .field_ty = mem_sym.type_id,
                 };
@@ -11043,6 +14148,7 @@ const HirLowerer = struct {
                 if (!struct_sym.target_scope.isNone()) {
                     const st_subst = type_system.NominalTypeSubst.init(self.pool, self.sym_table, ty);
                     for (self.sym_table.getScopeMembers(struct_sym.target_scope)) |mem_idx| {
+                        if (!self.isSymbolCfgEnabled(mem_idx)) continue;
                         const mem_sym = self.sym_table.getSymbol(mem_idx).*;
                         if (mem_sym.kind != .field_sym) continue;
                         const subst_f_ty = try st_subst.applyMut(self.allocator, self.pool, mem_sym.type_id);
@@ -11123,8 +14229,8 @@ const HirLowerer = struct {
             },
             .bind_pat => {
                 const pat_cst = self.ast_arena.getCstOrigin(pat_id);
-                const is_ref = self.hasKeywordInCst(pat_cst, .kw_ref) or self.hasKeywordInCst(pat_cst, .amp);
-                const has_pat_mut = self.hasKeywordInCst(pat_cst, .kw_mut);
+                const is_ref = self.hasKeywordInCst(pat_cst, .amp);
+                const has_pat_mut = self.hasKeywordInCst(pat_cst, .kw_mut) or self.hasKeywordInCst(pat_cst, .kw_var);
                 if (!is_ref and !has_pat_mut and !is_decl_mut) {
                     if (try self.tryEvalConstPatternValue(pat_id, concrete_scrut)) |const_val| {
                         return self.emitConstPatternVal(const_val, concrete_scrut, tok);
@@ -11215,24 +14321,36 @@ const HirLowerer = struct {
                     },
                     .string_lit => {
                         const raw_str = symbol_resolver.extractTokenSlice(self.source, self.tokens, tok);
-                        if (type_system.extractRawStringContent(raw_str)) |raw_body| {
-                            const raw_id = try self.interner.intern(raw_body);
-                            return self.store.appendPat(.{
-                                .type_id = .str_ty,
-                                .origin_token = tok,
-                                .kind = .{ .lit_str = raw_id },
-                            });
-                        }
-                        const unescaped = try type_system.decodeStandardStringSegment(
-                            self.allocator,
-                            extractQuotedBody(raw_str),
-                        );
+                        const unescaped = lexer.cookStringLiteral(self.allocator, raw_str) catch blk_fallback: {
+                            if (raw_str.len > 0 and raw_str[0] == 'r') {
+                                break :blk_fallback try self.allocator.dupe(
+                                    u8,
+                                    type_system.extractRawStringContent(raw_str) orelse "",
+                                );
+                            }
+                            break :blk_fallback try type_system.decodeStandardStringSegment(
+                                self.allocator,
+                                extractQuotedBody(raw_str),
+                            );
+                        };
                         defer self.allocator.free(unescaped);
                         const str_id = try self.interner.intern(unescaped);
                         return self.store.appendPat(.{
                             .type_id = .str_ty,
                             .origin_token = tok,
                             .kind = .{ .lit_str = str_id },
+                        });
+                    },
+                    .byte_string_lit => {
+                        const raw_str = symbol_resolver.extractTokenSlice(self.source, self.tokens, tok);
+                        const cooked = lexer.cookStringLiteral(self.allocator, raw_str) catch
+                            try self.allocator.dupe(u8, "");
+                        defer self.allocator.free(cooked);
+                        const bytes_id = try self.interner.intern(cooked);
+                        return self.store.appendPat(.{
+                            .type_id = concrete_scrut,
+                            .origin_token = tok,
+                            .kind = .{ .lit_str = bytes_id },
                         });
                     },
                     .float_lit => {
@@ -11286,6 +14404,14 @@ const HirLowerer = struct {
                 var pairs: std.ArrayListUnmanaged(u32) = .empty;
                 defer pairs.deinit(self.allocator);
                 for (sub_nodes, 0..) |raw_sub, i| {
+                    const sub_id = NodeIndex.fromInt(raw_sub);
+                    if (i >= field_names.items.len and
+                        !sub_id.isNone() and
+                        sub_id.asInt() < self.ast_arena.countNodes() and
+                        self.ast_arena.getNode(sub_id).tag == .wildcard_pat)
+                    {
+                        continue;
+                    }
                     var f_ord: u32 = @intCast(i);
                     var f_ty: TypeId = .unit_ty;
                     if (i < field_names.items.len and !field_names.items[i].isNone()) {
@@ -11295,7 +14421,7 @@ const HirLowerer = struct {
                             f_ty = f_info.field_ty;
                         }
                     }
-                    const sub_pat_idx = try self.lowerPattern(NodeIndex.fromInt(raw_sub), f_ty, is_decl_mut);
+                    const sub_pat_idx = try self.lowerPattern(sub_id, f_ty, is_decl_mut);
                     try pairs.append(self.allocator, f_ord);
                     try pairs.append(self.allocator, sub_pat_idx);
                 }
@@ -11348,6 +14474,7 @@ const HirLowerer = struct {
                             const enum_subst = type_system.NominalTypeSubst.init(self.pool, self.sym_table, unwrapped);
                             var ord: u32 = 0;
                             for (self.sym_table.getScopeMembers(enum_sym.target_scope)) |m_idx| {
+                                if (!self.isSymbolCfgEnabled(m_idx)) continue;
                                 const m_sym = self.sym_table.getSymbol(m_idx).*;
                                 if (m_sym.kind != .enum_variant_sym) continue;
                                 if (std.mem.eql(u8, m_sym.name_text, var_name)) {
@@ -11408,14 +14535,14 @@ const HirLowerer = struct {
             },
             .at_pat => {
                 const pat_cst = self.ast_arena.getCstOrigin(pat_id);
-                var is_ref = self.hasKeywordInCst(pat_cst, .kw_ref) or self.hasKeywordInCst(pat_cst, .amp);
-                var has_pat_mut = self.hasKeywordInCst(pat_cst, .kw_mut);
+                var is_ref = self.hasKeywordInCst(pat_cst, .amp);
+                var has_pat_mut = self.hasKeywordInCst(pat_cst, .kw_mut) or self.hasKeywordInCst(pat_cst, .kw_var);
                 if (pat_node.lhs.tag == .token) {
                     const mod_tok = TokenIndex.fromInt(pat_node.lhs.payload);
                     if (!mod_tok.isNone() and mod_tok.asInt() < self.tokens.countTokens()) {
                         const mod_kind = self.tokens.getToken(mod_tok).kind;
-                        if (mod_kind == .kw_ref or mod_kind == .amp) is_ref = true;
-                        if (mod_kind == .kw_mut) has_pat_mut = true;
+                        if (mod_kind == .amp) is_ref = true;
+                        if (mod_kind == .kw_mut or mod_kind == .kw_var) has_pat_mut = true;
                     }
                 }
                 const is_ref_mut = is_ref and has_pat_mut;
@@ -11496,9 +14623,9 @@ const HirLowerer = struct {
                                 );
                                 if (rest_lex.len > 0 and !std.mem.eql(u8, rest_lex, "_")) {
                                     const rest_cst = self.ast_arena.getCstOrigin(sub_id);
-                                    is_rest_ref = self.hasKeywordInCst(rest_cst, .kw_ref) or
-                                        self.hasKeywordInCst(rest_cst, .amp);
-                                    const has_rest_mut = self.hasKeywordInCst(rest_cst, .kw_mut);
+                                    is_rest_ref = self.hasKeywordInCst(rest_cst, .amp);
+                                    const has_rest_mut = self.hasKeywordInCst(rest_cst, .kw_mut) or
+                                        self.hasKeywordInCst(rest_cst, .kw_var);
                                     is_rest_mut = is_decl_mut or has_rest_mut;
                                     const subslice_ty = try self.pool.internRef(
                                         try self.pool.internSlice(elem_ty, false),
@@ -11806,6 +14933,7 @@ const HirLowerer = struct {
         };
         const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, tok);
         if (tok_rec.kind == .char_lit) return @as(i128, extractCharValue(lexeme));
+        if (tok_rec.kind == .byte_lit) return @as(i128, lexer.extractByteLiteralValue(lexeme) orelse 0);
         if (tok_rec.kind == .int_lit) {
             return if (is_preceded_by_minus)
                 (extractNegatedIntValue(lexeme) orelse 0)
@@ -11911,8 +15039,8 @@ const HirLowerer = struct {
             .wildcard_pat => return true,
             .bind_pat => {
                 const pat_cst = self.ast_arena.getCstOrigin(pat_id);
-                const is_ref = self.hasKeywordInCst(pat_cst, .kw_ref) or self.hasKeywordInCst(pat_cst, .amp);
-                const has_pat_mut = self.hasKeywordInCst(pat_cst, .kw_mut);
+                const is_ref = self.hasKeywordInCst(pat_cst, .amp);
+                const has_pat_mut = self.hasKeywordInCst(pat_cst, .kw_mut) or self.hasKeywordInCst(pat_cst, .kw_var);
                 if (!is_ref and !has_pat_mut) {
                     if (try self.tryEvalConstPatternValue(pat_id, scrut_ty)) |const_val| {
                         return self.isMatchingConstPatternVal(scrut_val, const_val);
@@ -11969,22 +15097,28 @@ const HirLowerer = struct {
                 if (tk == .kw_true or tk == .kw_false) {
                     return scrut_val == .bool_val and scrut_val.bool_val == (tk == .kw_true);
                 }
-                if (tk == .string_lit) {
-                    if (scrut_val != .str_val) return false;
+                if (tk == .string_lit or tk == .byte_string_lit) {
+                    if (scrut_val != .str_val and scrut_val != .bytes_val) return false;
+                    const scrut_str_id = if (scrut_val == .str_val) scrut_val.str_val else scrut_val.bytes_val;
                     const raw_str = symbol_resolver.extractTokenSlice(
                         self.source,
                         self.tokens,
                         pat_node.main_token,
                     );
-                    if (type_system.extractRawStringContent(raw_str)) |raw_body| {
-                        return std.mem.eql(u8, self.interner.get(scrut_val.str_val), raw_body);
-                    }
-                    const unescaped = try type_system.decodeStandardStringSegment(
-                        self.allocator,
-                        extractQuotedBody(raw_str),
-                    );
+                    const unescaped = lexer.cookStringLiteral(self.allocator, raw_str) catch blk_fallback: {
+                        if (raw_str.len > 0 and raw_str[0] == 'r') {
+                            break :blk_fallback try self.allocator.dupe(
+                                u8,
+                                type_system.extractRawStringContent(raw_str) orelse "",
+                            );
+                        }
+                        break :blk_fallback try type_system.decodeStandardStringSegment(
+                            self.allocator,
+                            extractQuotedBody(raw_str),
+                        );
+                    };
                     defer self.allocator.free(unescaped);
-                    return std.mem.eql(u8, self.interner.get(scrut_val.str_val), unescaped);
+                    return std.mem.eql(u8, self.interner.get(scrut_str_id), unescaped);
                 }
                 const expected_int = self.evalLitPatScalar(pat_id);
                 return switch (scrut_val) {
@@ -11992,6 +15126,49 @@ const HirLowerer = struct {
                     .char_val => |cv| @as(i128, cv) == expected_int,
                     else => false,
                 };
+            },
+            .struct_pat => {
+                if (scrut_val != .aggregate) return false;
+                const sub_nodes = self.getAstExtraSlice(pat_id, false);
+                var field_names: std.ArrayListUnmanaged(TokenIndex) = .empty;
+                defer field_names.deinit(self.allocator);
+                try self.extractStructPatFieldTokens(pat_id, &field_names);
+                const unwrapped = self.unwrapRefType(scrut_ty);
+                const checkpoint = self.comptime_shadow_log.items.len;
+                for (sub_nodes, 0..) |raw_sub, i| {
+                    const sub_id = NodeIndex.fromInt(raw_sub);
+                    if (i >= field_names.items.len and
+                        !sub_id.isNone() and
+                        sub_id.asInt() < self.ast_arena.countNodes() and
+                        self.ast_arena.getNode(sub_id).tag == .wildcard_pat)
+                    {
+                        continue;
+                    }
+                    var f_ord: u32 = @intCast(i);
+                    var f_ty: TypeId = .err_ty;
+                    if (i < field_names.items.len and !field_names.items[i].isNone()) {
+                        const f_lex = symbol_resolver.extractTokenSlice(
+                            self.source,
+                            self.tokens,
+                            field_names.items[i],
+                        );
+                        if (self.findStructFieldInfo(unwrapped, f_lex)) |f_info| {
+                            f_ord = f_info.ordinal;
+                            f_ty = f_info.field_ty;
+                        }
+                    }
+                    if (f_ord >= scrut_val.aggregate.elem_len) {
+                        self.popComptimeBindingsTo(checkpoint);
+                        return false;
+                    }
+                    const elem_const_idx = self.store.const_elements.items[scrut_val.aggregate.elem_start + f_ord];
+                    const elem_val = self.store.const_pool.items[elem_const_idx];
+                    if (!try self.matchComptimePattern(sub_id, elem_val, f_ty)) {
+                        self.popComptimeBindingsTo(checkpoint);
+                        return false;
+                    }
+                }
+                return true;
             },
             .variant_pat => {
                 if (self.getAstExtraSlice(pat_id, false).len == 0) {
@@ -12027,6 +15204,7 @@ const HirLowerer = struct {
                         if (!enum_sym.target_scope.isNone()) {
                             var ord: u32 = 0;
                             for (self.sym_table.getScopeMembers(enum_sym.target_scope)) |m_idx| {
+                                if (!self.isSymbolCfgEnabled(m_idx)) continue;
                                 const m_sym = self.sym_table.getSymbol(m_idx).*;
                                 if (m_sym.kind != .enum_variant_sym) continue;
                                 if (std.mem.eql(u8, m_sym.name_text, var_name)) {
@@ -12254,16 +15432,29 @@ const HirLowerer = struct {
                 const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, tok);
                 return .{ .char_val = extractCharValue(lexeme) };
             },
+            .byte_lit => {
+                const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, tok);
+                return .{ .int_val = lexer.extractByteLiteralValue(lexeme) orelse return null };
+            },
+            .byte_string_lit => {
+                const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, tok);
+                const cooked = lexer.cookStringLiteral(self.allocator, lexeme) catch return null;
+                defer self.allocator.free(cooked);
+                return .{ .bytes_val = try self.interner.intern(cooked) };
+            },
             .string_lit => {
                 const raw_lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, tok);
-                if (type_system.extractRawStringContent(raw_lex)) |raw_body| {
-                    return .{ .str_val = try self.interner.intern(raw_body) };
+                if (raw_lex.len > 0 and raw_lex[0] == 'r') {
+                    const cooked_raw = lexer.cookStringLiteral(self.allocator, raw_lex) catch return null;
+                    defer self.allocator.free(cooked_raw);
+                    return .{ .str_val = try self.interner.intern(cooked_raw) };
                 }
                 const body = extractQuotedBody(raw_lex);
                 if (type_system.scanNextInterpolationSegment(body, 0) != null) return null;
-                const unescaped = try type_system.decodeStandardStringSegment(self.allocator, body);
-                defer self.allocator.free(unescaped);
-                return .{ .str_val = try self.interner.intern(unescaped) };
+                const cooked = lexer.cookStringLiteral(self.allocator, raw_lex) catch
+                    try type_system.decodeStandardStringSegment(self.allocator, body);
+                defer self.allocator.free(cooked);
+                return .{ .str_val = try self.interner.intern(cooked) };
             },
             .tuple_lit, .array_lit => {
                 const elems = self.getAstExtraSlice(expr_id, false);
@@ -12396,6 +15587,7 @@ const HirLowerer = struct {
                         const enum_sym = self.sym_table.getSymbol(SymbolIndex.fromInt(ty_node.rhs)).*;
                         if (!enum_sym.target_scope.isNone()) {
                             for (self.sym_table.getScopeMembers(enum_sym.target_scope)) |mem_idx| {
+                                if (!self.isSymbolCfgEnabled(mem_idx)) continue;
                                 const mem_sym = self.sym_table.getSymbol(mem_idx).*;
                                 if (mem_sym.kind != .enum_variant_sym) continue;
                                 if (std.mem.eql(u8, mem_sym.name_text, var_name)) {
@@ -12442,9 +15634,12 @@ const HirLowerer = struct {
                         else => null,
                     },
                     .kw_not => if (sub_val == .bool_val) .{ .bool_val = !sub_val.bool_val } else null,
+                    .tilde => switch (sub_val) {
+                        .int_val => |iv| .{ .int_val = ~iv },
+                        else => null,
+                    },
                     .bang => switch (sub_val) {
                         .bool_val => |bv| .{ .bool_val = !bv },
-                        .int_val => |iv| .{ .int_val = ~iv },
                         else => null,
                     },
                     else => null,
@@ -12455,11 +15650,11 @@ const HirLowerer = struct {
                 const op_kind = self.tokens.getToken(tok).kind;
                 const lhs_id = NodeIndex.fromInt(ast_node.lhs.payload);
                 const lhs_val = (try self.tryEvalAstComptime(lhs_id, .err_ty)) orelse return null;
-                if ((op_kind == .ampamp or op_kind == .kw_and) and lhs_val == .bool_val) {
+                if (op_kind == .kw_and and lhs_val == .bool_val) {
                     if (!lhs_val.bool_val) return .{ .bool_val = false };
                     return self.tryEvalAstComptime(NodeIndex.fromInt(ast_node.rhs.payload), .bool_ty);
                 }
-                if ((op_kind == .pipepipe or op_kind == .kw_or) and lhs_val == .bool_val) {
+                if (op_kind == .kw_or and lhs_val == .bool_val) {
                     if (lhs_val.bool_val) return .{ .bool_val = true };
                     return self.tryEvalAstComptime(NodeIndex.fromInt(ast_node.rhs.payload), .bool_ty);
                 }
@@ -12613,6 +15808,22 @@ const HirLowerer = struct {
                         }
                     },
                     .aggregate => |agg| {
+                        if (agg.type_id == .source_loc_ty and agg.elem_len == 4) {
+                            const loc_ord: ?u32 = if (std.mem.eql(u8, member_name, "file"))
+                                0
+                            else if (std.mem.eql(u8, member_name, "fn_name"))
+                                1
+                            else if (std.mem.eql(u8, member_name, "line"))
+                                2
+                            else if (std.mem.eql(u8, member_name, "col"))
+                                3
+                            else
+                                null;
+                            if (loc_ord) |ord| {
+                                const c_idx = self.store.const_elements.items[agg.elem_start + ord];
+                                return self.store.const_pool.items[c_idx];
+                            }
+                        }
                         const ty_rec = self.pool.getNode(agg.type_id);
                         if (ty_rec.tag == .struct_ty) {
                             if (self.findStructFieldInfo(agg.type_id, member_name)) |f_info| {
@@ -12933,6 +16144,9 @@ const HirLowerer = struct {
                             expected_ty,
                         );
                     },
+                    .caller_location => {
+                        return try self.evalCallerLocationValue(intr_tok);
+                    },
                     else => return null,
                 }
             },
@@ -12990,6 +16204,7 @@ const HirLowerer = struct {
         var target_member_sym: SymbolIndex = .none;
         var cur_ord: u32 = 0;
         for (self.sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
+            if (!self.isSymbolCfgEnabled(mem_idx)) continue;
             const mem_sym = self.sym_table.getSymbol(mem_idx).*;
             if (mem_sym.kind != .field_sym and mem_sym.kind != .enum_variant_sym) continue;
             if (cur_ord == member_ord) {
@@ -13160,12 +16375,19 @@ fn extractNegatedIntValue(lexeme: []const u8) ?i128 {
     return parsed.value;
 }
 
-/// Parses a floating-point literal lexeme (`_`, `f32`/`f64` suffixes) into `f64`.
+/// Parses a floating-point literal lexeme (`_`, `_f32`/`_f64` suffixes) into `f64` (`SE-13`).
 fn extractFloatValue(raw_lexeme: []const u8) ?f64 {
-    var trimmed = raw_lexeme;
-    if (std.mem.endsWith(u8, trimmed, "f32") or std.mem.endsWith(u8, trimmed, "f64")) {
-        trimmed = trimmed[0 .. trimmed.len - 3];
-    }
+    const trimmed = if (lexer.extractNumericSuffix(raw_lexeme)) |split|
+        split.digits_slice
+    else |_| blk_fb: {
+        var fb = raw_lexeme;
+        if (std.mem.endsWith(u8, fb, "_f32") or std.mem.endsWith(u8, fb, "_f64")) {
+            fb = fb[0 .. fb.len - 4];
+        } else if (std.mem.endsWith(u8, fb, "f32") or std.mem.endsWith(u8, fb, "f64")) {
+            fb = fb[0 .. fb.len - 3];
+        }
+        break :blk_fb fb;
+    };
     var clean_buf: [128]u8 = undefined;
     var clean_len: usize = 0;
     for (trimmed) |ch| {
@@ -13178,14 +16400,78 @@ fn extractFloatValue(raw_lexeme: []const u8) ?f64 {
     return std.fmt.parseFloat(f64, clean_buf[0..clean_len]) catch null;
 }
 
+/// Decodes an interpolated static piece, applying multiline `dedent_cols` and unescaping `{{`/`}}` + standard escapes.
+fn decodeInterpolatedStaticPiece(
+    allocator: std.mem.Allocator,
+    raw_seg: []const u8,
+    dedent_cols: usize,
+    is_at_line_start: *bool,
+) ![]u8 {
+    var pre_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer pre_buf.deinit(allocator);
+    var cursor: usize = 0;
+    while (cursor < raw_seg.len) {
+        if (is_at_line_start.* and dedent_cols > 0) {
+            var stripped: usize = 0;
+            while (stripped < dedent_cols and cursor < raw_seg.len and
+                (raw_seg[cursor] == ' ' or raw_seg[cursor] == '\t'))
+            {
+                stripped += 1;
+                cursor += 1;
+            }
+            is_at_line_start.* = false;
+            if (cursor >= raw_seg.len) break;
+        }
+        if (raw_seg[cursor] == '\r' and cursor + 1 < raw_seg.len and raw_seg[cursor + 1] == '\n') {
+            try pre_buf.append(allocator, '\n');
+            cursor += 2;
+            is_at_line_start.* = true;
+            continue;
+        }
+        if (raw_seg[cursor] == '\n') {
+            try pre_buf.append(allocator, '\n');
+            cursor += 1;
+            is_at_line_start.* = true;
+            continue;
+        }
+        is_at_line_start.* = false;
+        if (cursor + 1 < raw_seg.len and
+            ((raw_seg[cursor] == '{' and raw_seg[cursor + 1] == '{') or
+                (raw_seg[cursor] == '}' and raw_seg[cursor + 1] == '}')))
+        {
+            try pre_buf.append(allocator, raw_seg[cursor]);
+            cursor += 2;
+            continue;
+        }
+        try pre_buf.append(allocator, raw_seg[cursor]);
+        cursor += 1;
+    }
+    return type_system.decodeStandardStringSegment(allocator, pre_buf.items);
+}
+
 /// Decodes a `'c'`, `'\n'`, `'\xHH'`, or `'\u{…}'` character literal lexeme into its Unicode scalar `u21`.
 fn extractCharValue(raw_lexeme: []const u8) u21 {
     return type_system.extractCharLiteralCodepoint(raw_lexeme) orelse 0;
 }
 
-/// Strips enclosing `"…"`, `r"…"`, or `'…'` delimiters from `raw_lexeme`.
+/// Strips enclosing `"…"`, `"""…"""`, `r"…"`, `r#"""…"""#`, or `'…'` delimiters from `raw_lexeme`.
 fn extractQuotedBody(raw_lexeme: []const u8) []const u8 {
-    if (type_system.extractRawStringContent(raw_lexeme)) |raw_body| return raw_body;
+    if (raw_lexeme.len > 0 and raw_lexeme[0] == 'r') {
+        var hash_count: usize = 0;
+        while (1 + hash_count < raw_lexeme.len and raw_lexeme[1 + hash_count] == '#') : (hash_count += 1) {}
+        if (1 + hash_count + 6 + hash_count <= raw_lexeme.len and
+            std.mem.startsWith(u8, raw_lexeme[1 + hash_count ..], "\"\"\"") and
+            std.mem.endsWith(u8, raw_lexeme[0 .. raw_lexeme.len - hash_count], "\"\"\""))
+        {
+            return raw_lexeme[1 + hash_count + 3 .. raw_lexeme.len - hash_count - 3];
+        }
+        if (type_system.extractRawStringContent(raw_lexeme)) |raw_body| return raw_body;
+    }
+    if (raw_lexeme.len >= 6 and std.mem.startsWith(u8, raw_lexeme, "\"\"\"") and
+        std.mem.endsWith(u8, raw_lexeme, "\"\"\""))
+    {
+        return raw_lexeme[3 .. raw_lexeme.len - 3];
+    }
     if (raw_lexeme.len >= 2 and
         ((raw_lexeme[0] == '"' and raw_lexeme[raw_lexeme.len - 1] == '"') or
             (raw_lexeme[0] == '\'' and raw_lexeme[raw_lexeme.len - 1] == '\'')))
@@ -13249,6 +16535,9 @@ fn writeTypeName(
         .f64_ty, .untyped_float_ty => return out_buf.appendSlice(allocator, "f64"),
         .char_ty => return out_buf.appendSlice(allocator, "char"),
         .str_ty => return out_buf.appendSlice(allocator, "str"),
+        .fmt_args_ty => return out_buf.appendSlice(allocator, "FmtArgs"),
+        .source_loc_ty => return out_buf.appendSlice(allocator, "SourceLoc"),
+        .opaque_ty => return out_buf.appendSlice(allocator, "opaque"),
         .err_ty => return out_buf.appendSlice(allocator, "<err>"),
         else => {},
     }
@@ -13267,7 +16556,7 @@ fn writeTypeName(
             try writeTypeName(allocator, pool, sym_table, TypeId.fromInt(ty_node.lhs), out_buf);
         },
         .mut_ref_ty => {
-            try out_buf.appendSlice(allocator, "&mut ");
+            try out_buf.appendSlice(allocator, if (pool.isOutRef(ty)) "&out " else "&mut ");
             try writeTypeName(allocator, pool, sym_table, TypeId.fromInt(ty_node.lhs), out_buf);
         },
         .raw_ptr_ty => {
@@ -13649,7 +16938,7 @@ fn renderHirNodeRecursive(
                 var clause_i: u32 = 0;
                 while (clause_i < clause_count and cursor < store.extra_data.items.len) : (clause_i += 1) {
                     const clause_kind = store.extra_data.items[cursor];
-                    if (clause_kind == @intFromEnum(HirCondClauseKind.bool_pred) and
+                    if (clause_kind == @backingInt(HirCondClauseKind.bool_pred) and
                         cursor + 1 < store.extra_data.items.len)
                     {
                         try renderHirNodeRecursive(
@@ -13663,7 +16952,7 @@ fn renderHirNodeRecursive(
                             out_buf,
                         );
                         cursor += 2;
-                    } else if (clause_kind == @intFromEnum(HirCondClauseKind.is_match) and
+                    } else if (clause_kind == @backingInt(HirCondClauseKind.is_match) and
                         cursor + 2 < store.extra_data.items.len)
                     {
                         try renderHirNodeRecursive(
@@ -14238,7 +17527,7 @@ test "test_hir_pipeline_try_catch_let_else_if_let_and_pattern_is_desugarings" {
     try std.testing.expect(countHirNodesByTag(&pipe_bundle.hir_store, .hir_project_arg) >= 1);
 
     const err_src =
-        \\pub fn helper_opt(maybe_num: i32?, fallible_res: Result[i32, i32]) -> i32? {
+        \\pub fn helper_opt(maybe_num: i32?, fallible_res: i32!i32) -> i32? {
         \\    let unwrapped = maybe_num?;
         \\    let fallback_opt = maybe_num orelse 0;
         \\    let safe_val = fallible_res catch 0;
@@ -14347,7 +17636,7 @@ test "test_hir_soa_element_projection_equivalence_and_bit_field_lsb_lowering" {
         \\    pub mode: u8 | 3,
         \\    pub count: u16 | 12,
         \\}
-        \\pub fn update_reg(reg: inout StatusReg) -> bool {
+        \\pub fn update_reg(reg: &mut StatusReg) -> bool {
         \\    reg.enabled = true;
         \\    return reg.enabled;
         \\}
@@ -14379,12 +17668,12 @@ test "test_hir_two_phase_derive_synthesis_and_attribute_schema_folding" {
     try std.testing.expectEqual(@as(usize, 4), derived_fn_count);
 
     const attr_src =
-        \\@attribute_schema(targets = [.StructField])
+        \\@attribute_schema(targets: [.StructField])
         \\pub struct Column {
         \\    pub width: i32 = 8,
         \\}
         \\pub struct Row {
-        \\    @Column(width = 32)
+        \\    @Column(width: 32)
         \\    pub id: i32,
         \\}
         \\pub fn first_col() -> Column? {
@@ -14560,21 +17849,21 @@ test "test_redteam_3a_hir_conjunctive_is_shadow_isolation_comptime_for_and_opera
 
     // [3] `MAJ-02`, `MAJ-03`, `MAJ-04`: compound assign `rhs`-before-`&mut lhs`, post-arg index order, and `for` mutability:
     const eval_order_src =
-        \\pub fn bump_and_get(mut counter: inout usize) -> usize {
-        \\    counter = counter + 1;
-        \\    return counter - 1;
+        \\pub fn bump_and_get(counter: &mut usize) -> usize {
+        \\    counter.* = counter.* + 1;
+        \\    return counter.* - 1;
         \\}
         \\pub fn loop_and_assign(slice_mut: &mut [i32]) -> i32 {
         \\    var arr: [i32; 4] = [10, 20, 30, 40];
         \\    var cursor: usize = 0;
-        \\    let picked: i32 = arr[bump_and_get(cursor)];
+        \\    let picked: i32 = arr[bump_and_get(&mut cursor)];
         \\    var total: i32 = picked;
         \\    total += arr[0];
-        \\    for ref elem_ref in 0..3 {
-        \\        total += *elem_ref;
+        \\    for &elem_ref in 0..3 {
+        \\        total += elem_ref.*;
         \\    }
-        \\    for ref mut slot_ref in slice_mut {
-        \\        *slot_ref = *slot_ref + 1;
+        \\    for &mut slot_ref in slice_mut {
+        \\        slot_ref.* = slot_ref.* + 1;
         \\    }
         \\    return total;
         \\}
@@ -14608,4 +17897,294 @@ test "test_redteam_3a_hir_conjunctive_is_shadow_isolation_comptime_for_and_opera
     var wide_bundle = try lowerSourceToHir(allocator, big_struct_buf.items, TargetLayout.NATIVE_64);
     defer wide_bundle.deinit();
     try std.testing.expect(!wide_bundle.diagnostics.hasErrors());
+}
+
+test "test_phase76_stage4_hir_subscript_single_def_raw_multiline_caller_loc_and_parallel_lhs" {
+    const allocator = std.testing.allocator;
+
+    // [1] Verify `lowerDefToHir` populates referenced same-file `subscript` templates (`let` & `inout`):
+    {
+        const sub_src =
+            \\pub struct Grid {
+            \\    pub cells: [i32; 2],
+            \\}
+            \\impl Grid {
+            \\    pub subscript(idx: usize) -> i32 {
+            \\        let {
+            \\            yield self.cells[idx];
+            \\        }
+            \\        inout {
+            \\            yield &mut self.cells[idx];
+            \\        }
+            \\    }
+            \\}
+            \\pub fn touch_grid(grid: &mut Grid) -> i32 {
+            \\    grid.*[0] = 42;
+            \\    return grid.*[0];
+            \\}
+        ;
+        var full_bundle = try lowerSourceToHir(allocator, sub_src, TargetLayout.NATIVE_64);
+        defer full_bundle.deinit();
+        try std.testing.expect(!full_bundle.diagnostics.hasErrors());
+
+        var touch_def: DefId = DefId.NONE;
+        for (full_bundle.sym_table.symbols.items) |sym_item| {
+            if (sym_item.kind == .fn_sym and std.mem.eql(u8, sym_item.name_text, "touch_grid")) {
+                touch_def = sym_item.def_id;
+                break;
+            }
+        }
+        try std.testing.expect(!touch_def.isNone());
+
+        var single_sink = DiagnosticSink.init(allocator);
+        defer single_sink.deinit();
+        var single_store = try lowerDefToHir(
+            allocator,
+            touch_def,
+            sub_src,
+            &full_bundle.tokens,
+            &full_bundle.cst_arena,
+            &full_bundle.ast_arena,
+            &full_bundle.interner,
+            &full_bundle.pool,
+            &full_bundle.sym_table,
+            &full_bundle.side_tables,
+            &single_sink,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer single_store.deinit();
+        try std.testing.expect(!single_sink.hasErrors());
+
+        var has_let_sub = false;
+        var has_inout_sub = false;
+        for (single_store.functions.items) |fn_meta| {
+            if (!fn_meta.is_subscript) continue;
+            if (fn_meta.is_subscript_inout_arm) {
+                has_inout_sub = true;
+            } else {
+                has_let_sub = true;
+            }
+        }
+        try std.testing.expect(has_let_sub);
+        try std.testing.expect(has_inout_sub);
+    }
+
+    // [2] Verify inner closure `@caller_location()` isolation and raw multiline strings:
+    {
+        const closure_and_raw_src =
+            \\pub fn capture_line(loc: SourceLoc = @caller_location()) -> u32 {
+            \\    return loc.line;
+            \\}
+            \\pub fn outer_caller(loc: SourceLoc = @caller_location()) -> u32 {
+            \\    let zero_cap_fn: fn() -> u32 = || -> u32 {
+            \\        return capture_line();
+            \\    };
+            \\    let raw_multi: str = r"""
+            \\        alpha\n
+            \\        beta
+            \\        """;
+            \\    let raw_hashed: str = r#"""
+            \\        "quoted"
+            \\        """#;
+            \\    let matched_tag: u32 = match raw_multi {
+            \\        r"""
+            \\            alpha\n
+            \\            beta
+            \\            """ => 10,
+            \\        _ => 0,
+            \\    };
+            \\    let _ = raw_hashed;
+            \\    return loc.line + zero_cap_fn() + matched_tag;
+            \\}
+        ;
+        var cr_bundle = try lowerSourceToHir(allocator, closure_and_raw_src, TargetLayout.NATIVE_64);
+        defer cr_bundle.deinit();
+        try std.testing.expect(!cr_bundle.diagnostics.hasErrors());
+
+        var has_seen_zero_capture_closure = false;
+        for (cr_bundle.hir_store.functions.items) |fn_meta| {
+            if (fn_meta.symbol_index.isNone()) {
+                has_seen_zero_capture_closure = true;
+                try std.testing.expectEqual(@as(u16, 0), fn_meta.capture_len);
+            }
+        }
+        try std.testing.expect(has_seen_zero_capture_closure);
+
+        var has_seen_stripped_raw_multi = false;
+        var has_seen_stripped_raw_hashed = false;
+        var has_seen_closure_line_6 = false;
+        for (cr_bundle.hir_store.const_pool.items) |const_item| {
+            switch (const_item) {
+                .str_val => |str_sym| {
+                    const text = cr_bundle.interner.get(str_sym);
+                    if (std.mem.eql(u8, text, "alpha\\n\nbeta")) has_seen_stripped_raw_multi = true;
+                    if (std.mem.eql(u8, text, "\"quoted\"")) has_seen_stripped_raw_hashed = true;
+                },
+                .aggregate => |agg_val| {
+                    if (agg_val.type_id == .source_loc_ty and agg_val.elem_len >= 3) {
+                        const line_const_idx = cr_bundle.hir_store.const_elements.items[agg_val.elem_start + 2];
+                        const line_item = cr_bundle.hir_store.const_pool.items[line_const_idx];
+                        if (line_item == .int_val and line_item.int_val == 6) has_seen_closure_line_6 = true;
+                    }
+                },
+                else => {},
+            }
+        }
+        try std.testing.expect(has_seen_stripped_raw_multi);
+        try std.testing.expect(has_seen_stripped_raw_hashed);
+        try std.testing.expect(has_seen_closure_line_6);
+    }
+
+    // [3] Verify Phase-0 parallel LHS freezes `.deref_expr` on `.ident_expr` and `.call_expr` place roots:
+    {
+        const par_lhs_src =
+            \\pub fn rebind_raw(slot: &mut *mut i32, next_ptr: *mut i32) -> i32 {
+            \\    slot.* = next_ptr;
+            \\    return 99;
+            \\}
+            \\pub fn view_arr(arr: &mut [i32; 2]) -> *mut [i32; 2] {
+            \\    return &raw mut arr.*;
+            \\}
+            \\pub fn parallel_freeze() -> i32 {
+            \\    var val_a: i32 = 10;
+            \\    var val_b: i32 = 20;
+            \\    var side_out: i32 = 0;
+            \\    var arr_a: [i32; 2] = [1, 2];
+            \\    var arr_b: [i32; 2] = [3, 4];
+            \\    var raw_p: *mut i32 = &raw mut val_a;
+            \\    unsafe {
+            \\        (raw_p.*, side_out) = (rebind_raw(&mut raw_p, &raw mut val_b), 55);
+            \\        (view_arr(&mut arr_a).*[0], view_arr(&mut arr_b).*[0]) = (7, 8);
+            \\    }
+            \\    return val_a + val_b + side_out + arr_a[0] + arr_b[0];
+            \\}
+        ;
+        var par_bundle = try lowerSourceToHir(allocator, par_lhs_src, TargetLayout.NATIVE_64);
+        defer par_bundle.deinit();
+        try std.testing.expect(!par_bundle.diagnostics.hasErrors());
+        try std.testing.expectEqual(@as(u32, 2), par_bundle.hir_store.parallel_assign_blocks.count());
+
+        var block_iter = par_bundle.hir_store.parallel_assign_blocks.iterator();
+        while (block_iter.next()) |entry| {
+            const blk_node = par_bundle.hir_store.getNode(HirIndex.fromInt(entry.key_ptr.*));
+            try std.testing.expectEqual(HirTag.hir_block, blk_node.tag);
+            const stmts = par_bundle.hir_store.getLenPrefixedExtra(blk_node.data.lhs);
+            try std.testing.expect(stmts.len >= 4);
+            const first_stmt = par_bundle.hir_store.getNode(HirIndex.fromInt(stmts[0]));
+            try std.testing.expectEqual(HirTag.hir_local_decl, first_stmt.tag);
+            const pre_eval_ty = par_bundle.hir_store.locals.items[first_stmt.data.lhs].type_id;
+            try std.testing.expectEqual(type_system.TypeTag.raw_ptr_ty, par_bundle.pool.getTag(pre_eval_ty));
+        }
+    }
+
+    // [4] Verify same-file `S { .. }` and cross-file `CompilerDb` `@caller_location()` span slicing without OOB:
+    {
+        var db = try query_db.CompilerDb.init(allocator);
+        defer db.deinit();
+
+        const lib_file = FileId.fromInt(81);
+        const caller_file = FileId.fromInt(82);
+        const short_lib_src =
+            \\pub struct ExtStamp { pub tag: i32 = 1, pub loc: SourceLoc = @caller_location() }
+            \\pub fn ext_line(tag: i32 = 0, loc: SourceLoc = @caller_location()) -> u32 { return loc.line; }
+        ;
+        const padded_caller_src =
+            \\use stamp_lib.{ExtStamp, ext_line};
+            \\// padding line 2 ensuring caller byte offset exceeds short_lib_src.len (178 bytes)
+            \\// padding line 3: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+            \\// padding line 4: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+            \\pub struct LocalStamp {
+            \\    pub id: i32,
+            \\    pub loc: SourceLoc = @caller_location(),
+            \\}
+            \\pub fn make_stamps() -> u32 {
+            \\    let same_s = LocalStamp { id: 5, .. };
+            \\    let ext_s = ExtStamp { .. };
+            \\    let ext_ln = ext_line();
+            \\    return same_s.loc.line + ext_s.loc.line + ext_ln;
+            \\}
+        ;
+        try db.registerRootModule("stamp_lib", lib_file);
+        _ = try db.setInput(lib_file, short_lib_src, .low);
+        _ = try db.setInput(caller_file, padded_caller_src, .low);
+
+        const caller_tree = try db.extractItemTree(caller_file);
+        var make_stamps_def: DefId = DefId.NONE;
+        for (caller_tree.entries) |tree_entry| {
+            if (std.mem.eql(u8, tree_entry.name_text, "make_stamps")) {
+                make_stamps_def = tree_entry.def_id;
+                break;
+            }
+        }
+        try std.testing.expect(!make_stamps_def.isNone());
+        const caller_hir = try db.lowerDefHir(make_stamps_def);
+
+        var has_seen_line_10 = false;
+        var has_seen_line_11 = false;
+        var has_seen_line_12 = false;
+        for (caller_hir.const_pool.items) |const_item| {
+            if (const_item == .aggregate and const_item.aggregate.type_id == .source_loc_ty and
+                const_item.aggregate.elem_len >= 3)
+            {
+                const line_const_idx = caller_hir.const_elements.items[const_item.aggregate.elem_start + 2];
+                const line_item = caller_hir.const_pool.items[line_const_idx];
+                if (line_item == .int_val) {
+                    if (line_item.int_val == 10) has_seen_line_10 = true;
+                    if (line_item.int_val == 11) has_seen_line_11 = true;
+                    if (line_item.int_val == 12) has_seen_line_12 = true;
+                }
+            }
+        }
+        try std.testing.expect(has_seen_line_10);
+        try std.testing.expect(has_seen_line_11);
+        try std.testing.expect(has_seen_line_12);
+    }
+
+    // [5] Regression guard: `.method_call` `member_tok` colliding with `.subscript_decl` `NodeIndex` inside
+    // `hasDollarAstDepth` must never reinterpret `TokenIndex` or `arm_mode = 0` (`NodeIndex.root`) as AST children:
+    {
+        const collision_src =
+            \\pub fn scoped_arena_non_escaping() -> usize {
+            \\    var local_arena = Arena { bump_tag: 64 };
+            \\    defer { close_arena(own local_arena); }
+            \\    return with context.allocator = &mut local_arena {
+            \\        let temp_buf = alloc_ctx_buf(32);
+            \\        temp_buf.byte_len
+            \\    };
+            \\}
+            \\@no_alloc
+            \\@no_panic
+            \\@no_block
+            \\@max_stack(512)
+            \\pub fn strict_pentagon_probe(data: &[u8], raw_idx: usize, clamped_val: i32) -> u8 {
+            \\    if data.len() > 0 and clamped_val >= 0 and clamped_val <= 200 {
+            \\        let elem_byte = data[raw_idx % data.len()];
+            \\        let narrowed_byte: u8 = clamped_val.narrow[u8]();
+            \\        return elem_byte & narrowed_byte;
+            \\    }
+            \\    return 0;
+            \\}
+            \\pub fn bad_static_oob() -> i64 {
+            \\    let fixed_vals: [i64; 3] = [10, 20, 30];
+            \\    return fixed_vals[3];
+            \\}
+            \\pub struct CheckedLanes {
+            \\    pub lanes: [i64; 4],
+            \\}
+            \\impl CheckedLanes {
+            \\    pub subscript(lane_idx: usize, /) -> i64 {
+            \\        let { yield self.lanes[lane_idx % 4]; }
+            \\        inout { yield &mut self.lanes[lane_idx % 4]; }
+            \\    }
+            \\}
+        ;
+        var col_bundle = try lowerSourceToHir(
+            allocator,
+            collision_src,
+            TargetLayout.NATIVE_64,
+        );
+        defer col_bundle.deinit();
+        try std.testing.expect(col_bundle.diagnostics.hasErrors());
+    }
 }

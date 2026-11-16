@@ -1,12 +1,12 @@
-//! Phase 4 & Phase 7.5 Deterministic Name Resolution, Type System & `DR-21` Fuzzing Suite (`tests/fuzz/phase4_typecheck_fuzz.zig`)
+//! Phase 4, Phase 7.5 & Phase 7.6 Deterministic Name Resolution, Type System & `DR-22` Fuzzing Suite (`tests/fuzz/phase4_typecheck_fuzz.zig`)
 //!
 //! Exercises structure-aware and mutated `.cx` programs combining Phase 4 (`Number`, `any Signed`,
-//! `~Unsigned`, `distinct`, `is` range refinements, `bit_field`, `#soa`, `Result[T, E]` / `T?` `?`,
-//! `catch |err|`, `let … else`, `match` exhaustiveness, and recovery holes) with Phase 7.5 (`DR-21`
-//! Unified `.` static/associated calls, `is` / `is not` flow narrowing, `(val := expr)` walrus
-//! conditions, `orelse` / `unreachable`, `$` slice length, `= expr;` functions, named/default call
-//! arguments, indexed `for item, idx in`, labeled `T?` value-`break` loops, `with context`, and
-//! `use cx.*` vs `use core.*`) through `symbol_resolver` and `type_system`.
+//! `~Unsigned`, `distinct`, `is` range refinements, `bit_field`, `#soa`, `T!E` / `T?` `?`,
+//! `catch |err|`, `let … else`, `match` exhaustiveness, and recovery holes) with Phase 7.5 (`DR-21`)
+//! and Phase 7.6 (`DR-22` inline union bounds, generic defaults, `@derive(From)`, `/` & `*` zones,
+//! `FmtArgs` / `{x=}` / `"""…"""`, `b'x'` / `b"…"`, `_u64` suffixes, `..base`, `(a, b) = (b, a)`,
+//! `&out` / `own T` / `&raw` / `ptr.*`, `@caller_location()`, `@cfg`, `fsm: match`, `subscript`)
+//! through `symbol_resolver` and `type_system`.
 //!
 //! - Asserts zero crashes, zero leaks, and poison-type (`TypeId.err_ty`) soundness across mutated ASTs.
 //! - Asserts 100% fingerprint parity between an incrementally mutated `CompilerDb` and a fresh
@@ -42,33 +42,74 @@ const PHASE4_IMPORT_VARIANTS = [_][]const u8{
     "",
 };
 
-/// Type-level and declaration seed items for Phase 4 & Phase 7.5 (`DR-21`) structure-aware fuzzing.
+/// Type-level and declaration seed items for Phase 4, Phase 7.5 (`DR-21`), & Phase 7.6 (`DR-22`) fuzzing.
 const PHASE4_SEED_ITEMS = [_][]const u8{
     "pub type UserId = distinct u64;\n",
     "pub type PortNum = u16 is 1..=1024;\n",
     "pub type NumericId = u32 | ~u64;\n",
     "pub struct IoError { pub code: i32 }\n",
-    "pub enum AppError { @from Io(IoError), InvalidPort, }\n",
-    "pub struct Vec2 { pub x: f32, pub y: f32 }\n",
-    "pub bit_field HeaderBits(u8) { pub ver: u8 | 3, pub flags: u8 | 5 }\n",
+    "@derive(From)\npub enum AppError { Io(IoError), InvalidPort, }\n",
+    "@derive(Copy)\npub struct Vec2 { pub x: f32 = 0.0_f32, pub y: f32 = 1.0_f32 }\n",
+    "pub bit_field HeaderBits: u8 { pub ver: u8 | 3, pub flags: u8 | 5 }\n",
+    "@derive(Copy, Eq)\npub enum WireOrder: u8 { Relaxed = 0, Acquire = 2, SeqCst = 5 }\n",
+    "pub struct OwnedBox { pub payload: i32 }\n" ++
+        "pub(pkg) fn take_owned_box(item: own OwnedBox, out_slot: &out i32, /) {\n" ++
+        "    out_slot.* = item.payload;\n" ++
+        "}\n" ++
+        "pub fn move_and_out_probe() -> i32 {\n" ++
+        "    let boxed = OwnedBox { payload: 42_i32 };\n" ++
+        "    var result_slot: i32;\n" ++
+        "    take_owned_box(own boxed, &out result_slot);\n" ++
+        "    let raw_p: *i32 = &raw result_slot;\n" ++
+        "    return unsafe { raw_p.* };\n" ++
+        "}\n",
     "pub struct PairCounter { pub count: i32 }\n" ++
         "impl PairCounter {\n" ++
         "    pub const DEFAULT_SEED: i32 = 4;\n" ++
         "    pub fn with_seed(seed_val: i32) -> PairCounter = PairCounter { count: seed_val };\n" ++
+        "    pub subscript(offset: i32, /) -> i32 {\n" ++
+        "        let { yield self.count + offset; }\n" ++
+        "    }\n" ++
         "}\n",
     "pub fn add_numbers(lhs: Number, rhs: Number) -> Number = lhs + rhs;\n",
     "pub fn compare_any(lhs: any Signed, rhs: any Signed) -> bool { let _lhs = lhs; let _rhs = rhs; return true; }\n",
     "pub fn unwrap_id(uid: ~u64) -> ~u64 = uid;\n",
+    "pub fn strip_head[Data: str | &[u8]](data: Data, /, *, skip_space: bool = true) -> usize {\n" ++
+        "    let raw_bytes = data.as_bytes();\n" ++
+        "    if skip_space and raw_bytes.len() > 0 and raw_bytes[0] == b' ' {\n" ++
+        "        return raw_bytes.len() - 1_usize;\n" ++
+        "    }\n" ++
+        "    return b\"ok\".len() + raw_bytes.len();\n" ++
+        "}\n",
+    "pub fn spread_swap_and_fsm(flag: bool, *, loc: SourceLoc = @caller_location()) -> i32 {\n" ++
+        "    let base_v = Vec2 { .. };\n" ++
+        "    let next_v = Vec2 { x: 2.5_f32, ..base_v };\n" ++
+        "    var left_n: i32 = (next_v.x as i32) + (loc.line as i32);\n" ++
+        "    var right_n: i32 = (WireOrder.SeqCst as u8 as i32) + (flag as i32);\n" ++
+        "    (left_n, right_n) = (right_n, left_n);\n" ++
+        "    let msg = \"\"\"\n" ++
+        "        {{hdr}} {left_n=} hex={right_n:#06x}\n" ++
+        "        \"\"\";\n" ++
+        "    let _ = msg;\n" ++
+        "    return fsm: match WireOrder.Relaxed {\n" ++
+        "        .Relaxed => continue :fsm .SeqCst,\n" ++
+        "        .Acquire => left_n,\n" ++
+        "        .SeqCst => left_n + right_n,\n" ++
+        "    };\n" ++
+        "}\n",
+    "@cfg(target.ptr_width == 64 or target.ptr_width == 32)\n" ++
+        "pub fn cfg_guarded_helper() -> i32 = ~0_i32;\n",
+    "test \"typecheck prose test\" (raw_in: &[u8]) { let _ = raw_in.len(); }\n",
     "pub fn affine_calc(base: i32, scale: i32 = 2, bias: i32 = base + 1) -> i32 = base * scale + bias;\n",
     "pub fn read_assoc_and_tuple(nested: ((i32, i32), i32)) -> i32 =\n" ++
         "    PairCounter.with_seed(PairCounter.DEFAULT_SEED).count + nested.0.1 + nested.1;\n",
     "pub fn call_named_and_defaults(val_in: i32) -> i32 =\n" ++
         "    affine_calc(val_in) + affine_calc(bias: 5, base: val_in) + affine_calc(val_in, scale: 3);\n",
-    "pub fn read_port(raw: u16) -> Result[PortNum, IoError] {\n" ++
+    "pub fn read_port(raw: u16) -> PortNum!IoError {\n" ++
         "    if raw == 80 { return .Ok(80); }\n" ++
         "    return .Err(IoError { code: 404 });\n" ++
         "}\n",
-    "pub fn handle_request(raw: u16) -> Result[u16, AppError] {\n" ++
+    "pub fn handle_request(raw: u16) -> u16!AppError {\n" ++
         "    let port = read_port(raw)?;\n" ++
         "    let safe_val: u16 = port;\n" ++
         "    return .Ok(safe_val);\n" ++
@@ -97,7 +138,7 @@ const PHASE4_SEED_ITEMS = [_][]const u8{
         "    for item_val, item_idx in items {\n" ++
         "        acc_sum += item_val + (item_idx as i32);\n" ++
         "    }\n" ++
-        "    let tail_bonus: i32 = if (total_len := items.len) >= 2 {\n" ++
+        "    let tail_bonus: i32 = if (total_len := items.len()) >= 2 {\n" ++
         "        let trimmed: &[i32] = items[..$ - 1];\n" ++
         "        items[$ - 1] + trimmed[$ - 1] + (total_len as i32)\n" ++
         "    } else {\n" ++
@@ -122,7 +163,7 @@ const PHASE4_SEED_ITEMS = [_][]const u8{
         "}\n",
 };
 
-/// Deliberately malformed or error-triggering snippets stressing `DR-21` diagnostics & poison soundness (`TypeId.err_ty`).
+/// Deliberately malformed or error-triggering snippets stressing `DR-21` & `DR-22` diagnostics & poison soundness.
 const PHASE4_MUTATION_SNIPPETS = [_][]const u8{
     "pub fn broken_hole(arg_val: i32) -> i32 { let x: = ; return x + arg_val; }\n",
     "pub fn conflict_call(lhs: i32, rhs: i64) -> i32 { return add_numbers(lhs, rhs); }\n",
@@ -151,11 +192,25 @@ const PHASE4_MUTATION_SNIPPETS = [_][]const u8{
         "    return 0;\n" ++
         "}\n",
     "pub fn bad_named_arg_order() -> i32 = affine_calc(scale: 2, 10);\n",
+    "pub fn bad_slice_len_field(items: &[i32]) -> usize = items.len;\n",
+    "pub fn bad_opaque_deref(ptr: *opaque) { unsafe { let _ = ptr.*; } }\n",
+    "pub fn bad_noncopy_val_param(err: IoError) -> i32 = err.code;\n",
+    "pub fn bad_missing_own_arg() {\n" ++
+        "    let box_v = OwnedBox { payload: 1 };\n" ++
+        "    var slot: i32;\n" ++
+        "    take_owned_box(box_v, &out slot);\n" ++
+        "}\n",
+    "pub bit_field BadBitSum: u8 { pub low_bits: u8 | 3, pub high_bits: u8 | 3 }\n",
+    "pub fn bad_zone_call() -> usize = strip_head(data: \"hi\");\n",
+    "pub fn bad_fmt_spec(name: str) -> str = \"{name:#x}\";\n",
+    "pub fn bad_missing_field() -> IoError = IoError {};\n",
+    "pub fn bad_par_assign(lhs_v: i32) { var rhs_v: i32 = 0; (lhs_v + 1, rhs_v) = (1, 2); }\n",
+    "pub fn bad_fsm_continue(step_v: i32) -> i32 = fsm: match step_v { 0 => continue :fsm, _ => 1 };\n",
     "use core.mem;\npub fn bad_core_import() -> i32 = 0;\n",
     "use cx.mem;\npub fn unresolved_cx_standalone() -> i32 = 0;\n",
 };
 
-/// Function body variants for incremental `CompilerDb` Phase 4 & Phase 7.5 (`DR-21`) parity fuzzing.
+/// Function body variants for incremental `CompilerDb` Phase 4, Phase 7.5, & Phase 7.6 (`DR-22`) parity fuzzing.
 const PHASE4_BODY_VARIANTS = [_][]const u8{
     "    let step = add_generic(input_val, 10);\n    return .Ok(step);\n",
     "    // Comment edit only:\n    let step = add_generic(input_val, 10);\n\n    return .Ok(step);\n",
@@ -180,6 +235,14 @@ const PHASE4_BODY_VARIANTS = [_][]const u8{
         "        context.cancel_token._handle as i32\n" ++
         "    };\n" ++
         "    return .Ok(scale_step(input_val) + tok_bonus);\n",
+    "    var left_v: i32 = input_val + (b'A' as i32);\n" ++
+        "    var right_v: i32 = ~3_i32;\n" ++
+        "    (left_v, right_v) = (right_v, left_v);\n" ++
+        "    let fsm_v: i32 = fsm: match left_v {\n" ++
+        "        0 => continue :fsm 1,\n" ++
+        "        _ => left_v + right_v,\n" ++
+        "    };\n" ++
+        "    return .Ok(fsm_v);\n",
     "    let cx_word_sz: i32 = cx.mem.word_bytes();\n    return .Ok(input_val + cx_word_sz);\n",
     "    let direct_core_err: i32 = core.mem.word_bytes();\n    return .Ok(direct_core_err);\n",
     "    let bad_mismatch: bool = input_val;\n    let _keep = bad_mismatch;\n    return .Ok(0);\n",
@@ -214,7 +277,7 @@ fn buildIncrementalTypecheckModule(
             allocator,
             try std.fmt.bufPrint(
                 &hdr_buf,
-                "pub fn worker_{d}(input_val: i32) -> Result[i32, i32] {{\n",
+                "pub fn worker_{d}(input_val: i32) -> i32!i32 {{\n",
                 .{fn_i},
             ),
         );

@@ -1,7 +1,7 @@
 //! High-Speed Deterministic Lexer & Lossless Trivia Scanner
 //!
 //! Scans UTF-8 source buffers into a contiguous Structure-of-Arrays (SoA) `TokenBuffer` in a single
-//! non-backtracking $O(N)$ linear pass while enforcing the `DR-03` & `DR-21` 117-token lexical taxonomy.
+//! non-backtracking $O(N)$ linear pass while enforcing the `DR-03`, `DR-21`, & `DR-22` 120-token lexical taxonomy.
 //!
 //! Preserves 100% of source bytes across leading/trailing `TriviaPiece` slices (`<= 65,535`-byte chunking,
 //! slot-14 coalescing, carrier token flushing past `983,025` trivia bytes, and `E0104` tail preservation)
@@ -16,6 +16,7 @@ const FileId = mem_foundation.FileId;
 const Span = mem_foundation.Span;
 const StringInterner = mem_foundation.StringInterner;
 const TokenIndex = mem_foundation.TokenIndex;
+const TypeId = mem_foundation.TypeId;
 const TokenKind = syntax_arenas.TokenKind;
 const TokenFlags = syntax_arenas.TokenFlags;
 const TriviaKind = syntax_arenas.TriviaKind;
@@ -76,6 +77,157 @@ pub const LexerOptions = struct {
     is_casing_warning_enabled: bool = true,
     /// Whether to emit `W0101` warnings on redundant character/string escape sequences.
     is_escape_warning_enabled: bool = true,
+};
+
+// --------------------- Format Specifiers ----------------------
+
+/// Alignment mode encoded in bits `21..22` of `FmtSpec.flags_and_fill` (`DR-22` Section 2.2).
+pub const FmtAlignMode = enum(u2) {
+    /// Type-default alignment (left for strings, right for numbers).
+    none = 0,
+    /// Explicit left alignment (`<`).
+    left = 1,
+    /// Explicit center alignment (`^`).
+    center = 2,
+    /// Explicit right alignment (`>`).
+    right = 3,
+};
+
+/// Sign display mode encoded in bits `23..24` of `FmtSpec.flags_and_fill` (`DR-22` Section 2.2).
+pub const FmtSignMode = enum(u2) {
+    /// Default sign behavior (`-` on negative values only).
+    default = 0,
+    /// Explicit leading `+` on non-negative numeric values (`+`).
+    plus = 1,
+    /// Explicit `-` sign mode (`-`).
+    minus = 2,
+};
+
+/// Presentation verb encoded in bits `27..30` of `FmtSpec.flags_and_fill` (`DR-22` Section 2.2).
+pub const FmtTypeCode = enum(u4) {
+    /// Default `Display` formatting (empty verb).
+    display = 0,
+    /// Structured `Debug` formatting (`?`).
+    debug = 1,
+    /// Lowercase hexadecimal integer formatting (`x`).
+    lower_hex = 2,
+    /// Uppercase hexadecimal integer formatting (`X`).
+    upper_hex = 3,
+    /// Binary integer formatting (`b`).
+    binary = 4,
+    /// Octal integer formatting (`o`).
+    octal = 5,
+    /// Lowercase scientific notation formatting (`e`).
+    lower_exp = 6,
+    /// Uppercase scientific notation formatting (`E`).
+    upper_exp = 7,
+    /// Fixed-point decimal floating-point formatting (`f`).
+    fixed = 8,
+    /// Pointer address hexadecimal formatting (`p`).
+    pointer = 9,
+};
+
+/// Exact 8-byte (`align 4`) compile-time format descriptor for `SE-12` `FmtArgs` (`DR-22` Section 2.2).
+pub const FmtSpec = extern struct {
+    /// Packed `u32`: `fill_char: u21` (`0..20`) | `align: u2` (`21..22`) | `sign: u2` (`23..24`) |
+    /// `is_alt: u1` (`25`) | `is_zero_pad: u1` (`26`) | `type_code: u4` (`27..30`) | `is_debug_eq: u1` (`31`).
+    flags_and_fill: u32 = 0x20,
+    /// Minimum field width (`0..65534`), or `SPEC_NONE` (`0xFFFF`) when unspecified.
+    width_or_none: u16 = SPEC_NONE,
+    /// Floating-point/string precision (`0..65534`), or `SPEC_NONE` (`0xFFFF`) when unspecified.
+    precision_or_none: u16 = SPEC_NONE,
+
+    /// Sentinel `u16` value indicating an omitted width or precision field.
+    pub const SPEC_NONE: u16 = 0xFFFF;
+    /// Default `Display` format specification (`fill = ' '`, no width/precision).
+    pub const DEFAULT: FmtSpec = .{};
+
+    /// Packs all bitfields into a canonical 8-byte `FmtSpec` record.
+    pub inline fn pack(
+        fill_cp: u21,
+        align_val: FmtAlignMode,
+        sign_val: FmtSignMode,
+        is_alt: bool,
+        is_zero_pad: bool,
+        verb: FmtTypeCode,
+        is_debug_eq: bool,
+        width_val: ?u16,
+        precision_val: ?u16,
+    ) FmtSpec {
+        const packed_flags: u32 = @as(u32, fill_cp) |
+            (@as(u32, @backingInt(align_val)) << 21) |
+            (@as(u32, @backingInt(sign_val)) << 23) |
+            (@as(u32, @intFromBool(is_alt)) << 25) |
+            (@as(u32, @intFromBool(is_zero_pad)) << 26) |
+            (@as(u32, @backingInt(verb)) << 27) |
+            (@as(u32, @intFromBool(is_debug_eq)) << 31);
+        return .{
+            .flags_and_fill = packed_flags,
+            .width_or_none = width_val orelse SPEC_NONE,
+            .precision_or_none = precision_val orelse SPEC_NONE,
+        };
+    }
+
+    /// Extracts the Unicode scalar fill character (`bits 0..20`, default `' '`).
+    pub inline fn extractFillChar(self: FmtSpec) u21 {
+        return @intCast(self.flags_and_fill & 0x1F_FFFF);
+    }
+
+    /// Extracts the alignment mode (`bits 21..22`).
+    pub inline fn extractAlignMode(self: FmtSpec) FmtAlignMode {
+        return @fromBackingInt(@intCast(@as(u2, @intCast((self.flags_and_fill >> 21) & 0x3))));
+    }
+
+    /// Extracts the sign mode (`bits 23..24`).
+    pub inline fn extractSignMode(self: FmtSpec) FmtSignMode {
+        return @fromBackingInt(@intCast(@as(u2, @intCast((self.flags_and_fill >> 23) & 0x3))));
+    }
+
+    /// Returns `true` if the alternate `#` flag (`bit 25`) is set.
+    pub inline fn hasAltFlag(self: FmtSpec) bool {
+        return ((self.flags_and_fill >> 25) & 0x1) != 0;
+    }
+
+    /// Returns `true` if the zero-padding `0` flag (`bit 26`) is set.
+    pub inline fn hasZeroPad(self: FmtSpec) bool {
+        return ((self.flags_and_fill >> 26) & 0x1) != 0;
+    }
+
+    /// Extracts the presentation type verb (`bits 27..30`).
+    pub inline fn extractTypeCode(self: FmtSpec) FmtTypeCode {
+        return @fromBackingInt(@intCast(@as(u4, @intCast((self.flags_and_fill >> 27) & 0xF))));
+    }
+
+    /// Returns `true` if self-debugging `=` (`bit 31`) was written on this interpolation hole.
+    pub inline fn hasDebugEq(self: FmtSpec) bool {
+        return ((self.flags_and_fill >> 31) & 0x1) != 0;
+    }
+
+    /// Returns the explicit width (`0..65534`), or `null` when `width_or_none == SPEC_NONE`.
+    pub inline fn extractWidth(self: FmtSpec) ?u16 {
+        return if (self.width_or_none == SPEC_NONE) null else self.width_or_none;
+    }
+
+    /// Returns the explicit precision (`0..65534`), or `null` when `precision_or_none == SPEC_NONE`.
+    pub inline fn extractPrecision(self: FmtSpec) ?u16 {
+        return if (self.precision_or_none == SPEC_NONE) null else self.precision_or_none;
+    }
+};
+
+/// Zero-allocation decomposition of a numeric literal lexeme and its optional `SE-13` type suffix.
+pub const ParsedNumericSuffix = struct {
+    /// Leading numeric body slice excluding any `_` suffix separator and type suffix.
+    digits_slice: []const u8,
+    /// Trailing primitive suffix slice (e.g., `"u64"`, `"f32"`), or `""` when unsuffixed.
+    suffix_slice: []const u8,
+    /// Resolved primitive `TypeId` (`.i8_ty`..`.f64_ty`), or `null` when unsuffixed.
+    suffix_type: ?TypeId,
+    /// `true` if a `_` separator immediately preceded `suffix_slice` (`42_u64` vs. `42u64`).
+    has_underscore_sep: bool,
+    /// Integer radix (`2`, `8`, `10`, or `16`; always `10` for floating-point literals).
+    radix: u8,
+    /// `true` if `digits_slice` contains a fractional `.` or scientific `e`/`E` exponent.
+    is_float_syntax: bool,
 };
 
 // --------------------- Trivia Accumulator ---------------------
@@ -253,7 +405,7 @@ pub const CHAR_CLASS_TABLE: [256]u8 = blk: {
     break :blk table;
 };
 
-/// Authoritative compile-time lookup map for all 49 language keywords and 19 primitive types (`DR-03` & `DR-21`).
+/// Authoritative compile-time lookup map for all 50 language keywords and 20 primitive types (`DR-03`, `DR-21`, & `DR-22`).
 pub const KEYWORD_OR_PRIM_MAP = std.StaticStringMap(TokenKind).initComptime(.{
     .{ "Self", .kw_self_type },
     .{ "and", .kw_and },
@@ -296,15 +448,16 @@ pub const KEYWORD_OR_PRIM_MAP = std.StaticStringMap(TokenKind).initComptime(.{
     .{ "mut", .kw_mut },
     .{ "never", .prim_type },
     .{ "not", .kw_not },
+    .{ "opaque", .prim_type },
     .{ "or", .kw_or },
     .{ "orelse", .kw_orelse },
     .{ "own", .kw_own },
     .{ "pub", .kw_pub },
-    .{ "ref", .kw_ref },
     .{ "return", .kw_return },
     .{ "self", .kw_self_val },
     .{ "str", .prim_type },
     .{ "struct", .kw_struct },
+    .{ "subscript", .kw_subscript },
     .{ "trait", .kw_trait },
     .{ "true", .kw_true },
     .{ "type", .kw_type },
@@ -323,6 +476,25 @@ pub const KEYWORD_OR_PRIM_MAP = std.StaticStringMap(TokenKind).initComptime(.{
     .{ "where", .kw_where },
     .{ "while", .kw_while },
     .{ "with", .kw_with },
+    .{ "yield", .kw_yield },
+});
+
+/// Authoritative compile-time lookup map for all 14 `SE-13` numeric literal type suffixes (`DR-22` Section 2.2).
+pub const NUMERIC_SUFFIX_MAP = std.StaticStringMap(TypeId).initComptime(.{
+    .{ "f32", .f32_ty },
+    .{ "f64", .f64_ty },
+    .{ "i128", .i128_ty },
+    .{ "i16", .i16_ty },
+    .{ "i32", .i32_ty },
+    .{ "i64", .i64_ty },
+    .{ "i8", .i8_ty },
+    .{ "isize", .isize_ty },
+    .{ "u128", .u128_ty },
+    .{ "u16", .u16_ty },
+    .{ "u32", .u32_ty },
+    .{ "u64", .u64_ty },
+    .{ "u8", .u8_ty },
+    .{ "usize", .usize_ty },
 });
 
 // -------------------------------------- INTERNALS --------------------------------------
@@ -387,6 +559,542 @@ inline fn hexDigitValue(byte_val: u8) u21 {
     return 10 + (byte_val - 'A');
 }
 
+/// Returns `true` if `byte_val` is `[a-zA-Z]` (excluding `'_'`) in $O(1)$ table lookup time.
+inline fn isAsciiAlpha(byte_val: u8) bool {
+    return isIdentStart(byte_val) and byte_val != '_';
+}
+
+/// Returns `true` if `source_bytes[start_pos..]` begins with at least `hash_count` `'#'` characters.
+inline fn hasExactHashesAt(source_bytes: []const u8, start_pos: usize, hash_count: usize) bool {
+    if (start_pos + hash_count > source_bytes.len) return false;
+    var idx: usize = 0;
+    while (idx < hash_count) : (idx += 1) {
+        if (source_bytes[start_pos + idx] != '#') return false;
+    }
+    return true;
+}
+
+/// Returns `true` if `source_bytes[quote_pos..]` opens a `"""` multiline string rather than single-line `r#""…""#`.
+inline fn isTripleQuoteOpening(
+    source_bytes: []const u8,
+    quote_pos: usize,
+    is_raw: bool,
+    hash_count: usize,
+) bool {
+    var quote_run: usize = 0;
+    while (quote_pos + quote_run < source_bytes.len and source_bytes[quote_pos + quote_run] == '"') : (quote_run += 1) {}
+    if (quote_run < 3) return false;
+    if (is_raw and hash_count > 0 and hasExactHashesAt(source_bytes, quote_pos + quote_run, hash_count)) {
+        return false;
+    }
+    return true;
+}
+
+/// Lexical context passed to `Lexer.scanEscapeSequence` to enforce mode-specific escape rules.
+const EscapeContext = enum(u8) {
+    /// Standard `"…"` or `"""…"""` UTF-8 string (`\{` / `\}` -> `E0114`, `\'` -> `W0101`, `\u{…}` valid).
+    interpolated_string = 0,
+    /// Unicode scalar `'c'` literal (`\"`, `\{`, `\}` -> `W0101`, `\u{…}` valid).
+    char_literal = 1,
+    /// Single ASCII byte `b'x'` literal (`\xHH` valid for `0x00..0xFF`, `\u{…}` -> `E0117`).
+    byte_char = 2,
+    /// ASCII byte string `b"…"` / `b"""…"""` (`\xHH` valid, `\u{…}` -> `E0117`, `\'` -> `W0101`).
+    byte_string = 3,
+};
+
+/// Saved outer string frame for nested `{expr}` string interpolations (`[P1 Trap A]`).
+const InterpStackFrame = struct {
+    /// Active `{ … }` brace nesting depth at the moment the inner string opened.
+    brace_depth: u32,
+    /// `true` if the suspended outer string was opened by `"""` rather than `"`.
+    is_triple_quote: bool,
+    /// `true` if the suspended outer `"""` satisfied the immediate newline rule (`E0115`).
+    has_valid_opening: bool,
+    /// Byte offset of the suspended outer string's opening quote delimiter.
+    open_quote_offset: u32,
+    /// Byte offset immediately following the suspended outer string's opening delimiter/newline.
+    body_start_offset: u32,
+};
+
+/// Decomposed delimiter metadata for any single-line or multiline string / byte-string lexeme.
+const ParsedStringDelimiters = struct {
+    /// Inner slice strictly between opening quote(s) and closing quote(s).
+    raw_inner: []const u8,
+    /// `true` if the literal uses raw `r` or `br` rules (no backslash escapes).
+    is_raw: bool,
+    /// `true` if the literal is a byte string (`b"…"`, `b"""…"""`, `br#"…"#`, `br#"""…"""#`).
+    is_byte: bool,
+    /// `true` if the literal uses triple-quote `"""` closing-quote dedent rules.
+    is_triple_quote: bool,
+};
+
+/// Parses the prefix and matching quote/`#` delimiters of a string or byte-string `lexeme`.
+fn parseStringDelimiters(lexeme: []const u8) ?ParsedStringDelimiters {
+    if (lexeme.len < 2) return null;
+    var cursor: usize = 0;
+    var is_byte = false;
+    var is_raw = false;
+
+    if (lexeme[cursor] == 'b') {
+        is_byte = true;
+        cursor += 1;
+    }
+    if (cursor < lexeme.len and lexeme[cursor] == 'r') {
+        is_raw = true;
+        cursor += 1;
+    }
+    var hash_count: usize = 0;
+    if (is_raw) {
+        while (cursor < lexeme.len and lexeme[cursor] == '#') : (cursor += 1) {
+            hash_count += 1;
+        }
+    }
+    if (cursor >= lexeme.len or lexeme[cursor] != '"') return null;
+
+    // Distinguish single-line `r#"""#` / `r#""""#` / `br#""""#` from multiline `r#"""\n…\n"""#`:
+    const can_be_triple = cursor + 6 + hash_count <= lexeme.len and
+        isTripleQuoteOpening(lexeme, cursor, is_raw, hash_count);
+
+    const quote_len: usize = if (can_be_triple) 3 else 1;
+    const suffix_len: usize = quote_len + hash_count;
+    if (cursor + quote_len + suffix_len > lexeme.len) return null;
+    if (!hasExactHashesAt(lexeme, lexeme.len - hash_count, hash_count)) return null;
+
+    const close_quote_pos = lexeme.len - suffix_len;
+    var q_idx: usize = 0;
+    while (q_idx < quote_len) : (q_idx += 1) {
+        if (lexeme[close_quote_pos + q_idx] != '"') return null;
+    }
+
+    return .{
+        .raw_inner = lexeme[cursor + quote_len .. close_quote_pos],
+        .is_raw = is_raw,
+        .is_byte = is_byte,
+        .is_triple_quote = can_be_triple,
+    };
+}
+
+/// Counts consecutive trailing `\` bytes at the end of `line_slice`.
+inline fn countTrailingBackslashes(line_slice: []const u8) usize {
+    var count: usize = 0;
+    while (count < line_slice.len and line_slice[line_slice.len - 1 - count] == '\\') {
+        count += 1;
+    }
+    return count;
+}
+
+/// Advances past a `{expr}` interpolation hole inside `body_bytes` starting at `open_brace_idx`.
+fn skipInterpolationHoleInBody(body_bytes: []const u8, open_brace_idx: usize) usize {
+    var cursor = open_brace_idx + 1;
+    var brace_depth: u32 = 1;
+    while (cursor < body_bytes.len and brace_depth > 0) {
+        const cur_byte = body_bytes[cursor];
+        if (cur_byte == '{') {
+            brace_depth += 1;
+            cursor += 1;
+        } else if (cur_byte == '}') {
+            brace_depth -= 1;
+            cursor += 1;
+        } else if (cur_byte == 'r' and
+            (cursor == 0 or !isIdentContinue(body_bytes[cursor - 1])) and
+            cursor + 1 < body_bytes.len and
+            (body_bytes[cursor + 1] == '"' or body_bytes[cursor + 1] == '#'))
+        {
+            cursor = skipRawStringInExpr(body_bytes, cursor + 1);
+        } else if (cur_byte == 'b' and (cursor == 0 or !isIdentContinue(body_bytes[cursor - 1])) and
+            cursor + 1 < body_bytes.len)
+        {
+            if (body_bytes[cursor + 1] == '\'') {
+                cursor = skipQuotedNonRawInExpr(body_bytes, cursor + 2, '\'', false);
+            } else if (body_bytes[cursor + 1] == '"') {
+                const is_triple = cursor + 3 < body_bytes.len and
+                    body_bytes[cursor + 2] == '"' and
+                    body_bytes[cursor + 3] == '"';
+                cursor = skipQuotedNonRawInExpr(body_bytes, cursor + (if (is_triple) @as(usize, 4) else 2), '"', is_triple);
+            } else if (body_bytes[cursor + 1] == 'r' and cursor + 2 < body_bytes.len and
+                (body_bytes[cursor + 2] == '"' or body_bytes[cursor + 2] == '#'))
+            {
+                cursor = skipRawStringInExpr(body_bytes, cursor + 2);
+            } else {
+                cursor += 1;
+            }
+        } else if (cur_byte == '"') {
+            const is_triple = cursor + 2 < body_bytes.len and
+                body_bytes[cursor + 1] == '"' and
+                body_bytes[cursor + 2] == '"';
+            cursor = skipInterpolatedStringInExpr(body_bytes, cursor + (if (is_triple) @as(usize, 3) else 1), is_triple);
+        } else if (cur_byte == '\'') {
+            cursor = skipQuotedNonRawInExpr(body_bytes, cursor + 1, '\'', false);
+        } else if (cur_byte == '/' and cursor + 1 < body_bytes.len) {
+            if (body_bytes[cursor + 1] == '/') {
+                cursor += 2;
+                while (cursor < body_bytes.len and body_bytes[cursor] != '\n' and body_bytes[cursor] != '\r') {
+                    cursor += 1;
+                }
+            } else if (body_bytes[cursor + 1] == '*') {
+                cursor += 2;
+                var comment_depth: u32 = 1;
+                while (cursor < body_bytes.len and comment_depth > 0) {
+                    if (body_bytes[cursor] == '/' and cursor + 1 < body_bytes.len and body_bytes[cursor + 1] == '*') {
+                        comment_depth += 1;
+                        cursor += 2;
+                    } else if (body_bytes[cursor] == '*' and cursor + 1 < body_bytes.len and body_bytes[cursor + 1] == '/') {
+                        comment_depth -= 1;
+                        cursor += 2;
+                    } else {
+                        cursor += 1;
+                    }
+                }
+            } else {
+                cursor += 1;
+            }
+        } else {
+            cursor += 1;
+        }
+    }
+    return cursor;
+}
+
+/// Skips a non-interpolated `'…'`, `b'…'`, `b"…"`, or `b"""…"""` literal inside an `{expr}` scan.
+fn skipQuotedNonRawInExpr(body_bytes: []const u8, after_open_idx: usize, quote_byte: u8, is_triple: bool) usize {
+    var cursor = after_open_idx;
+    while (cursor < body_bytes.len) {
+        if (body_bytes[cursor] == '\\') {
+            cursor = @min(cursor + 2, body_bytes.len);
+            continue;
+        }
+        if (body_bytes[cursor] == quote_byte) {
+            if (is_triple) {
+                if (cursor + 2 < body_bytes.len and
+                    body_bytes[cursor + 1] == quote_byte and
+                    body_bytes[cursor + 2] == quote_byte)
+                {
+                    return cursor + 3;
+                }
+                cursor += 1;
+                continue;
+            }
+            return cursor + 1;
+        }
+        cursor += 1;
+    }
+    return body_bytes.len;
+}
+
+/// Skips a raw `r#"…"#` or `r#"""…"""#` string literal inside an `{expr}` scan (`after_r_idx` points past `'r'`).
+fn skipRawStringInExpr(body_bytes: []const u8, after_r_idx: usize) usize {
+    var cursor = after_r_idx;
+    var hash_count: usize = 0;
+    while (cursor < body_bytes.len and body_bytes[cursor] == '#') : (cursor += 1) {
+        hash_count += 1;
+    }
+    if (cursor >= body_bytes.len or body_bytes[cursor] != '"') return cursor;
+    const is_triple = isTripleQuoteOpening(body_bytes, cursor, true, hash_count);
+    const quote_len: usize = if (is_triple) 3 else 1;
+    cursor += quote_len;
+
+    while (cursor < body_bytes.len) {
+        if (body_bytes[cursor] == '"') {
+            if (is_triple) {
+                if (cursor + 2 < body_bytes.len and
+                    body_bytes[cursor + 1] == '"' and
+                    body_bytes[cursor + 2] == '"' and
+                    hasExactHashesAt(body_bytes, cursor + 3, hash_count))
+                {
+                    return cursor + 3 + hash_count;
+                }
+                cursor += 1;
+                continue;
+            }
+            if (hasExactHashesAt(body_bytes, cursor + 1, hash_count)) {
+                return cursor + 1 + hash_count;
+            }
+        }
+        cursor += 1;
+    }
+    return body_bytes.len;
+}
+
+/// Skips an interpolated `"…"` or `"""…"""` literal nested inside an `{expr}` scan.
+fn skipInterpolatedStringInExpr(body_bytes: []const u8, after_open_idx: usize, is_triple: bool) usize {
+    var cursor = after_open_idx;
+    while (cursor < body_bytes.len) {
+        const cur_byte = body_bytes[cursor];
+        if (cur_byte == '\\') {
+            cursor = @min(cursor + 2, body_bytes.len);
+            continue;
+        }
+        if (cur_byte == '"') {
+            if (is_triple) {
+                if (cursor + 2 < body_bytes.len and body_bytes[cursor + 1] == '"' and body_bytes[cursor + 2] == '"') {
+                    return cursor + 3;
+                }
+                cursor += 1;
+                continue;
+            }
+            return cursor + 1;
+        }
+        if (cur_byte == '{') {
+            if (cursor + 1 < body_bytes.len and body_bytes[cursor + 1] == '{') {
+                cursor += 2;
+                continue;
+            }
+            cursor = skipInterpolationHoleInBody(body_bytes, cursor);
+            continue;
+        }
+        cursor += 1;
+    }
+    return body_bytes.len;
+}
+
+/// Scans `body_after_open_nl` for the next outer line break (`\n`), skipping `{expr}` holes when enabled.
+fn findNextOuterLineFeed(
+    body_bytes: []const u8,
+    start_pos: usize,
+    is_raw: bool,
+    is_interpolation_allowed: bool,
+) ?usize {
+    var cursor = start_pos;
+    while (cursor < body_bytes.len) {
+        const cur_byte = body_bytes[cursor];
+        if (cur_byte == '\n') return cursor;
+        if (!is_raw and cur_byte == '\\' and cursor + 1 < body_bytes.len) {
+            const next_byte = body_bytes[cursor + 1];
+            if (next_byte != '\n' and next_byte != '\r') {
+                cursor += 2;
+                continue;
+            }
+        }
+        if (is_interpolation_allowed and !is_raw and cur_byte == '{') {
+            if (cursor + 1 < body_bytes.len and body_bytes[cursor + 1] == '{') {
+                cursor += 2;
+                continue;
+            }
+            cursor = skipInterpolationHoleInBody(body_bytes, cursor);
+            continue;
+        }
+        cursor += 1;
+    }
+    return null;
+}
+
+/// Validates (and optionally materializes into `maybe_out`) a multiline string body after its opening newline.
+fn processMultilineStringBody(
+    body_after_open_nl: []const u8,
+    is_raw: bool,
+    is_interpolation_allowed: bool,
+    allocator: ?std.mem.Allocator,
+    maybe_out: ?*std.ArrayList(u8),
+) error{ InvalidMultilineIndent, OutOfMemory }!void {
+    // [1] Locate the last outer `\n` separating content lines from the closing `"""` indentation prefix:
+    var last_outer_lf: ?usize = null;
+    var scan_pos: usize = 0;
+    while (findNextOuterLineFeed(body_after_open_nl, scan_pos, is_raw, is_interpolation_allowed)) |lf_pos| {
+        last_outer_lf = lf_pos;
+        scan_pos = lf_pos + 1;
+    }
+
+    const close_prefix = if (last_outer_lf) |lf_idx|
+        body_after_open_nl[lf_idx + 1 ..]
+    else
+        body_after_open_nl;
+
+    // Closing `"""` must sit on its own line preceded exclusively by `' '` spaces (`W_close`):
+    for (close_prefix) |prefix_byte| {
+        if (prefix_byte != ' ') return error.InvalidMultilineIndent;
+    }
+    const close_indent: usize = close_prefix.len;
+
+    // Zero content lines (`"""\n    """`): valid empty string!
+    const final_lf_idx = last_outer_lf orelse return;
+    const content_end: usize = if (final_lf_idx > 0 and body_after_open_nl[final_lf_idx - 1] == '\r')
+        final_lf_idx - 1
+    else
+        final_lf_idx;
+    const content_bytes = body_after_open_nl[0..content_end];
+
+    // [2] Validate `W_close` and zero space/tab mixing on every content line (materializing if requested):
+    var line_start: usize = 0;
+    while (true) {
+        const maybe_lf = findNextOuterLineFeed(content_bytes, line_start, is_raw, is_interpolation_allowed);
+        const raw_line_end = maybe_lf orelse content_bytes.len;
+        const clean_line_end = if (raw_line_end > line_start and content_bytes[raw_line_end - 1] == '\r')
+            raw_line_end - 1
+        else
+            raw_line_end;
+        const line_slice = content_bytes[line_start..clean_line_end];
+
+        if (line_slice.len > 0) {
+            if (line_slice.len < close_indent) return error.InvalidMultilineIndent;
+            var ws_idx: usize = 0;
+            var has_leading_space = false;
+            var has_leading_tab = false;
+            while (ws_idx < line_slice.len and (line_slice[ws_idx] == ' ' or line_slice[ws_idx] == '\t')) : (ws_idx += 1) {
+                if (line_slice[ws_idx] == ' ') {
+                    has_leading_space = true;
+                } else {
+                    has_leading_tab = true;
+                }
+            }
+            if (has_leading_space and has_leading_tab) return error.InvalidMultilineIndent;
+            if (close_indent > 0 and ws_idx < close_indent) return error.InvalidMultilineIndent;
+            if (close_indent > 0 and has_leading_tab) return error.InvalidMultilineIndent;
+
+            var dedented_slice = line_slice[close_indent..];
+            const has_line_continuation = !is_raw and (countTrailingBackslashes(dedented_slice) % 2 == 1);
+            if (has_line_continuation) {
+                dedented_slice = dedented_slice[0 .. dedented_slice.len - 1];
+            }
+            if (maybe_out) |out_buf| {
+                const alloc = allocator.?;
+                try out_buf.appendSlice(alloc, dedented_slice);
+                if (maybe_lf != null and !has_line_continuation) {
+                    try out_buf.append(alloc, '\n');
+                }
+            }
+        } else if (maybe_out) |out_buf| {
+            if (maybe_lf != null) {
+                try out_buf.append(allocator.?, '\n');
+            }
+        }
+
+        if (maybe_lf) |lf_pos| {
+            line_start = lf_pos + 1;
+        } else {
+            break;
+        }
+    }
+}
+
+/// Decodes backslash escape sequences (and `{{`/`}}` when `is_interpolated`) into `out_buf`.
+fn decodeEscapedStringSlice(
+    allocator: std.mem.Allocator,
+    raw_slice: []const u8,
+    is_byte_mode: bool,
+    is_interpolated: bool,
+    out_buf: *std.ArrayList(u8),
+) error{ InvalidStringLiteral, OutOfMemory }!void {
+    var cursor: usize = 0;
+    while (cursor < raw_slice.len) {
+        if (raw_slice[cursor] == '\\') {
+            if (cursor + 1 >= raw_slice.len) return error.InvalidStringLiteral;
+            const esc_byte = raw_slice[cursor + 1];
+            switch (esc_byte) {
+                'n' => {
+                    try out_buf.append(allocator, '\n');
+                    cursor += 2;
+                },
+                'r' => {
+                    try out_buf.append(allocator, '\r');
+                    cursor += 2;
+                },
+                't' => {
+                    try out_buf.append(allocator, '\t');
+                    cursor += 2;
+                },
+                '0' => {
+                    try out_buf.append(allocator, 0);
+                    cursor += 2;
+                },
+                '\\', '"', '\'' => {
+                    try out_buf.append(allocator, esc_byte);
+                    cursor += 2;
+                },
+                '\n' => {
+                    cursor += 2;
+                },
+                '\r' => {
+                    cursor += if (cursor + 2 < raw_slice.len and raw_slice[cursor + 2] == '\n') 3 else 2;
+                },
+                'x' => {
+                    if (cursor + 3 >= raw_slice.len or
+                        !isHexDigit(raw_slice[cursor + 2]) or
+                        !isHexDigit(raw_slice[cursor + 3]))
+                    {
+                        return error.InvalidStringLiteral;
+                    }
+                    const decoded_byte: u8 = @intCast(
+                        (hexDigitValue(raw_slice[cursor + 2]) << 4) | hexDigitValue(raw_slice[cursor + 3]),
+                    );
+                    try out_buf.append(allocator, decoded_byte);
+                    cursor += 4;
+                },
+                'u' => {
+                    if (is_byte_mode or cursor + 3 >= raw_slice.len or raw_slice[cursor + 2] != '{') {
+                        return error.InvalidStringLiteral;
+                    }
+                    const close_pos = std.mem.indexOfScalarPos(u8, raw_slice, cursor + 3, '}') orelse
+                        return error.InvalidStringLiteral;
+                    const hex_digits = raw_slice[cursor + 3 .. close_pos];
+                    if (hex_digits.len == 0 or hex_digits.len > 6) return error.InvalidStringLiteral;
+                    var scalar_val: u32 = 0;
+                    for (hex_digits) |digit_byte| {
+                        if (!isHexDigit(digit_byte)) return error.InvalidStringLiteral;
+                        scalar_val = (scalar_val << 4) | @as(u32, hexDigitValue(digit_byte));
+                    }
+                    if (scalar_val > 0x10FFFF or !std.unicode.utf8ValidCodepoint(@intCast(scalar_val))) {
+                        return error.InvalidStringLiteral;
+                    }
+                    var utf8_bytes: [4]u8 = undefined;
+                    const encoded_len = std.unicode.utf8Encode(@intCast(scalar_val), &utf8_bytes) catch
+                        return error.InvalidStringLiteral;
+                    try out_buf.appendSlice(allocator, utf8_bytes[0..encoded_len]);
+                    cursor = close_pos + 1;
+                },
+                '{', '}' => {
+                    if (is_interpolated) return error.InvalidStringLiteral;
+                    try out_buf.append(allocator, esc_byte);
+                    cursor += 2;
+                },
+                else => {
+                    try out_buf.append(allocator, esc_byte);
+                    cursor += 2;
+                },
+            }
+            continue;
+        }
+        if (is_interpolated and (raw_slice[cursor] == '{' or raw_slice[cursor] == '}')) {
+            if (cursor + 1 >= raw_slice.len or raw_slice[cursor + 1] != raw_slice[cursor]) {
+                return error.InvalidStringLiteral;
+            }
+            try out_buf.append(allocator, raw_slice[cursor]);
+            cursor += 2;
+            continue;
+        }
+        if (is_byte_mode and raw_slice[cursor] >= 0x80) {
+            return error.InvalidStringLiteral;
+        }
+        try out_buf.append(allocator, raw_slice[cursor]);
+        cursor += 1;
+    }
+}
+
+/// Parses an unsigned decimal integer (`0..65534`) at `spec_text[cursor..]` for `parseFormatSpec`.
+fn parseFormatSpecU16(spec_text: []const u8, cursor: *usize) error{InvalidFormatSpec}!u16 {
+    if (cursor.* >= spec_text.len or !isDecimalDigit(spec_text[cursor.*])) {
+        return error.InvalidFormatSpec;
+    }
+    var acc_val: u32 = 0;
+    var is_prev_underscore = false;
+    while (cursor.* < spec_text.len) {
+        const cur_byte = spec_text[cursor.*];
+        if (isDecimalDigit(cur_byte)) {
+            acc_val = acc_val * 10 + @as(u32, cur_byte - '0');
+            if (acc_val >= FmtSpec.SPEC_NONE) return error.InvalidFormatSpec;
+            is_prev_underscore = false;
+            cursor.* += 1;
+        } else if (cur_byte == '_') {
+            if (is_prev_underscore) return error.InvalidFormatSpec;
+            is_prev_underscore = true;
+            cursor.* += 1;
+        } else {
+            break;
+        }
+    }
+    if (is_prev_underscore) return error.InvalidFormatSpec;
+    return @intCast(acc_val);
+}
+
 // ------------------ Case Conversion Helpers -------------------
 
 /// Returns `true` if a word boundary occurs immediately before `index` inside `trimmed_ident`.
@@ -408,14 +1116,17 @@ fn isIdentifierWordBoundary(trimmed_ident: []const u8, index: usize) bool {
 }
 
 comptime {
-    std.debug.assert(KEYWORD_OR_PRIM_MAP.keys().len == 68);
+    std.debug.assert(KEYWORD_OR_PRIM_MAP.keys().len == 70);
+    std.debug.assert(NUMERIC_SUFFIX_MAP.keys().len == 14);
+    std.debug.assert(@sizeOf(FmtSpec) == 8);
+    std.debug.assert(@alignOf(FmtSpec) == 4);
 }
 
 // ------------------------------------- PUBLIC API --------------------------------------
 
 // --------------------- Identifier Casing ----------------------
 
-/// Looks up `lexeme` in the compile-time table of 49 language keywords and 19 primitive types.
+/// Looks up `lexeme` in the compile-time table of 50 language keywords and 20 primitive types.
 pub inline fn lookupKeywordOrPrim(lexeme: []const u8) ?TokenKind {
     return KEYWORD_OR_PRIM_MAP.get(lexeme);
 }
@@ -674,6 +1385,420 @@ pub fn toScreamingSnakeCase(allocator: std.mem.Allocator, raw_ident: []const u8)
     return builder.toOwnedSlice(allocator);
 }
 
+// ------------------ Numeric & String Helpers ------------------
+
+/// Parses a `SE-12` `FormatSpec` slice (`[ [FillChar] Align ] [Sign] [#] [0] [Width] [.Prec] [Type]`)
+/// into a packed 8-byte `FmtSpec` record (`DR-22` Section 2.2).
+pub fn parseFormatSpec(spec_text: []const u8, has_debug_eq: bool) error{InvalidFormatSpec}!FmtSpec {
+    var cursor: usize = 0;
+    var fill_cp: u21 = ' ';
+    var align_mode: FmtAlignMode = .none;
+
+    // [1] Optional `[ FillChar ] ( "<" | "^" | ">" )`:
+    if (cursor < spec_text.len) {
+        const first_len = std.unicode.utf8ByteSequenceLength(spec_text[cursor]) catch
+            return error.InvalidFormatSpec;
+        if (cursor + first_len <= spec_text.len and cursor + first_len < spec_text.len) {
+            const second_byte = spec_text[cursor + first_len];
+            if (second_byte == '<' or second_byte == '^' or second_byte == '>') {
+                fill_cp = std.unicode.utf8Decode(spec_text[cursor .. cursor + first_len]) catch
+                    return error.InvalidFormatSpec;
+                align_mode = switch (second_byte) {
+                    '<' => .left,
+                    '^' => .center,
+                    '>' => .right,
+                    else => unreachable,
+                };
+                cursor += first_len + 1;
+            }
+        }
+        if (align_mode == .none) {
+            switch (spec_text[cursor]) {
+                '<' => {
+                    align_mode = .left;
+                    cursor += 1;
+                },
+                '^' => {
+                    align_mode = .center;
+                    cursor += 1;
+                },
+                '>' => {
+                    align_mode = .right;
+                    cursor += 1;
+                },
+                else => {},
+            }
+        }
+    }
+
+    // [2] Optional sign (`+` | `-`), alternate `#`, and zero-padding `0`:
+    var sign_mode: FmtSignMode = .default;
+    if (cursor < spec_text.len) {
+        if (spec_text[cursor] == '+') {
+            sign_mode = .plus;
+            cursor += 1;
+        } else if (spec_text[cursor] == '-') {
+            sign_mode = .minus;
+            cursor += 1;
+        }
+    }
+
+    var is_alt = false;
+    if (cursor < spec_text.len and spec_text[cursor] == '#') {
+        is_alt = true;
+        cursor += 1;
+    }
+
+    var is_zero_pad = false;
+    if (cursor < spec_text.len and spec_text[cursor] == '0') {
+        is_zero_pad = true;
+        cursor += 1;
+    }
+
+    // [3] Optional minimum `Width` (`0..65534`) and `.Precision` (`0..65534`):
+    var width_val: ?u16 = null;
+    if (cursor < spec_text.len and isDecimalDigit(spec_text[cursor])) {
+        width_val = try parseFormatSpecU16(spec_text, &cursor);
+    }
+
+    var precision_val: ?u16 = null;
+    if (cursor < spec_text.len and spec_text[cursor] == '.') {
+        cursor += 1;
+        precision_val = try parseFormatSpecU16(spec_text, &cursor);
+    }
+
+    // [4] Optional presentation verb (`?`, `x`, `X`, `b`, `o`, `e`, `E`, `f`, `p`):
+    var verb: FmtTypeCode = if (has_debug_eq) .debug else .display;
+    if (cursor < spec_text.len) {
+        verb = switch (spec_text[cursor]) {
+            '?' => .debug,
+            'x' => .lower_hex,
+            'X' => .upper_hex,
+            'b' => .binary,
+            'o' => .octal,
+            'e' => .lower_exp,
+            'E' => .upper_exp,
+            'f' => .fixed,
+            'p' => .pointer,
+            else => return error.InvalidFormatSpec,
+        };
+        cursor += 1;
+    }
+
+    if (cursor != spec_text.len) return error.InvalidFormatSpec;
+    return FmtSpec.pack(
+        fill_cp,
+        align_mode,
+        sign_mode,
+        is_alt,
+        is_zero_pad,
+        verb,
+        has_debug_eq,
+        width_val,
+        precision_val,
+    );
+}
+
+/// Decomposes an `INT_LIT` or `FLOAT_LIT` `lexeme` into its numeric digits and optional `SE-13` primitive suffix.
+pub fn extractNumericSuffix(lexeme: []const u8) error{InvalidNumericSuffix}!ParsedNumericSuffix {
+    if (lexeme.len == 0 or !isDecimalDigit(lexeme[0])) return error.InvalidNumericSuffix;
+
+    // [1] Non-decimal radix (`0x`, `0b`, `0o`):
+    if (lexeme[0] == '0' and lexeme.len >= 2) {
+        const maybe_radix: ?u8 = switch (lexeme[1]) {
+            'x', 'X' => 16,
+            'b', 'B' => 2,
+            'o', 'O' => 8,
+            else => null,
+        };
+        if (maybe_radix) |radix| {
+            var cursor: usize = 2;
+            var digit_count: usize = 0;
+            var is_prev_underscore = false;
+            if (cursor < lexeme.len and lexeme[cursor] == '_') return error.InvalidNumericSuffix;
+
+            while (cursor < lexeme.len) {
+                const cur_byte = lexeme[cursor];
+                if (isValidDigitForRadix(cur_byte, radix)) {
+                    digit_count += 1;
+                    is_prev_underscore = false;
+                    cursor += 1;
+                } else if (cur_byte == '_') {
+                    if (!is_prev_underscore and
+                        digit_count > 0 and
+                        cursor + 1 < lexeme.len and
+                        isAsciiAlpha(lexeme[cursor + 1]) and
+                        !isValidDigitForRadix(lexeme[cursor + 1], radix))
+                    {
+                        break;
+                    }
+                    if (is_prev_underscore) return error.InvalidNumericSuffix;
+                    is_prev_underscore = true;
+                    cursor += 1;
+                } else {
+                    break;
+                }
+            }
+            if (digit_count == 0 or is_prev_underscore) return error.InvalidNumericSuffix;
+
+            const digits_end = cursor;
+            if (cursor == lexeme.len) {
+                return .{
+                    .digits_slice = lexeme,
+                    .suffix_slice = "",
+                    .suffix_type = null,
+                    .has_underscore_sep = false,
+                    .radix = radix,
+                    .is_float_syntax = false,
+                };
+            }
+
+            var has_sep = false;
+            if (lexeme[cursor] == '_') {
+                has_sep = true;
+                cursor += 1;
+            }
+            const suffix_slice = lexeme[cursor..];
+            const suffix_ty = NUMERIC_SUFFIX_MAP.get(suffix_slice) orelse return error.InvalidNumericSuffix;
+            if (suffix_ty == .f32_ty or suffix_ty == .f64_ty) return error.InvalidNumericSuffix;
+            return .{
+                .digits_slice = lexeme[0..digits_end],
+                .suffix_slice = suffix_slice,
+                .suffix_type = suffix_ty,
+                .has_underscore_sep = has_sep,
+                .radix = radix,
+                .is_float_syntax = false,
+            };
+        }
+    }
+
+    // [2] Base-10 integer or floating-point literal:
+    var cursor: usize = 0;
+    var is_prev_underscore = false;
+    while (cursor < lexeme.len) {
+        const cur_byte = lexeme[cursor];
+        if (isDecimalDigit(cur_byte)) {
+            is_prev_underscore = false;
+            cursor += 1;
+        } else if (cur_byte == '_') {
+            if (!is_prev_underscore and cursor + 1 < lexeme.len and isAsciiAlpha(lexeme[cursor + 1])) {
+                break;
+            }
+            if (is_prev_underscore) return error.InvalidNumericSuffix;
+            is_prev_underscore = true;
+            cursor += 1;
+        } else {
+            break;
+        }
+    }
+    if (is_prev_underscore) return error.InvalidNumericSuffix;
+
+    var is_float_syntax = false;
+    if (cursor + 1 < lexeme.len and lexeme[cursor] == '.' and isDecimalDigit(lexeme[cursor + 1])) {
+        is_float_syntax = true;
+        cursor += 1;
+        while (cursor < lexeme.len) {
+            const cur_byte = lexeme[cursor];
+            if (isDecimalDigit(cur_byte)) {
+                is_prev_underscore = false;
+                cursor += 1;
+            } else if (cur_byte == '_') {
+                if (!is_prev_underscore and cursor + 1 < lexeme.len and isAsciiAlpha(lexeme[cursor + 1])) {
+                    break;
+                }
+                if (is_prev_underscore) return error.InvalidNumericSuffix;
+                is_prev_underscore = true;
+                cursor += 1;
+            } else {
+                break;
+            }
+        }
+        if (is_prev_underscore) return error.InvalidNumericSuffix;
+    }
+
+    if (cursor < lexeme.len and (lexeme[cursor] == 'e' or lexeme[cursor] == 'E')) {
+        is_float_syntax = true;
+        cursor += 1;
+        if (cursor < lexeme.len and (lexeme[cursor] == '+' or lexeme[cursor] == '-')) {
+            cursor += 1;
+        }
+        if (cursor >= lexeme.len or lexeme[cursor] == '_') return error.InvalidNumericSuffix;
+        var exp_digits: usize = 0;
+        while (cursor < lexeme.len) {
+            const cur_byte = lexeme[cursor];
+            if (isDecimalDigit(cur_byte)) {
+                exp_digits += 1;
+                is_prev_underscore = false;
+                cursor += 1;
+            } else if (cur_byte == '_') {
+                if (!is_prev_underscore and
+                    exp_digits > 0 and
+                    cursor + 1 < lexeme.len and
+                    isAsciiAlpha(lexeme[cursor + 1]))
+                {
+                    break;
+                }
+                if (is_prev_underscore) return error.InvalidNumericSuffix;
+                is_prev_underscore = true;
+                cursor += 1;
+            } else {
+                break;
+            }
+        }
+        if (exp_digits == 0 or is_prev_underscore) return error.InvalidNumericSuffix;
+    }
+
+    const digits_end = cursor;
+    if (cursor == lexeme.len) {
+        return .{
+            .digits_slice = lexeme,
+            .suffix_slice = "",
+            .suffix_type = null,
+            .has_underscore_sep = false,
+            .radix = 10,
+            .is_float_syntax = is_float_syntax,
+        };
+    }
+
+    var has_sep = false;
+    if (lexeme[cursor] == '_') {
+        has_sep = true;
+        cursor += 1;
+    }
+    const suffix_slice = lexeme[cursor..];
+    const suffix_ty = NUMERIC_SUFFIX_MAP.get(suffix_slice) orelse return error.InvalidNumericSuffix;
+    if (is_float_syntax and suffix_ty != .f32_ty and suffix_ty != .f64_ty) {
+        return error.InvalidNumericSuffix;
+    }
+    return .{
+        .digits_slice = lexeme[0..digits_end],
+        .suffix_slice = suffix_slice,
+        .suffix_type = suffix_ty,
+        .has_underscore_sep = has_sep,
+        .radix = 10,
+        .is_float_syntax = is_float_syntax,
+    };
+}
+
+/// Returns `true` if `lexeme` is a triple-quoted multiline string or byte-string literal (`"""…"""`).
+pub inline fn isMultilineStringLexeme(lexeme: []const u8) bool {
+    const parsed = parseStringDelimiters(lexeme) orelse return false;
+    return parsed.is_triple_quote;
+}
+
+/// Extracts and closing-quote dedents a `"""…"""`, `r#"""…"""#`, `b"""…"""`, or `br#"""…"""#` `lexeme`
+/// without decoding `\n` / `\xHH` / `{{` escapes (preserving `{expr}` holes for downstream Sema/HIR).
+pub fn extractMultilineStringContent(
+    allocator: std.mem.Allocator,
+    lexeme: []const u8,
+) error{ InvalidMultilineOpening, InvalidMultilineIndent, InvalidStringLiteral, OutOfMemory }![]u8 {
+    const parsed = parseStringDelimiters(lexeme) orelse return error.InvalidStringLiteral;
+    if (!parsed.is_triple_quote) return error.InvalidStringLiteral;
+
+    var after_open_nl: usize = 0;
+    if (parsed.raw_inner.len >= 1 and parsed.raw_inner[0] == '\n') {
+        after_open_nl = 1;
+    } else if (parsed.raw_inner.len >= 2 and parsed.raw_inner[0] == '\r' and parsed.raw_inner[1] == '\n') {
+        after_open_nl = 2;
+    } else {
+        return error.InvalidMultilineOpening;
+    }
+
+    var out_buf: std.ArrayList(u8) = .empty;
+    errdefer out_buf.deinit(allocator);
+    try out_buf.ensureTotalCapacity(allocator, parsed.raw_inner.len - after_open_nl);
+    try processMultilineStringBody(
+        parsed.raw_inner[after_open_nl..],
+        parsed.is_raw,
+        !parsed.is_raw and !parsed.is_byte,
+        allocator,
+        &out_buf,
+    );
+    return out_buf.toOwnedSlice(allocator);
+}
+
+/// Canonical alias for `extractMultilineStringContent`.
+pub const extractMultilineString = extractMultilineStringContent;
+
+/// Fully cooks any non-interpolated string or byte-string `lexeme` (`"…"`, `"""…"""`, `r#"…"#`,
+/// `r#"""…"""#`, `b"…"`, `b"""…"""`, `br#"…"#`, `br#"""…"""#`), applying multiline dedent and escape decoding.
+pub fn cookStringLiteral(
+    allocator: std.mem.Allocator,
+    lexeme: []const u8,
+) error{ InvalidMultilineOpening, InvalidMultilineIndent, InvalidStringLiteral, OutOfMemory }![]u8 {
+    const parsed = parseStringDelimiters(lexeme) orelse return error.InvalidStringLiteral;
+
+    if (parsed.is_triple_quote) {
+        const dedented = try extractMultilineStringContent(allocator, lexeme);
+        if (parsed.is_raw) {
+            if (parsed.is_byte) {
+                for (dedented) |raw_byte| {
+                    if (raw_byte >= 0x80) {
+                        allocator.free(dedented);
+                        return error.InvalidStringLiteral;
+                    }
+                }
+            }
+            return dedented;
+        }
+        defer allocator.free(dedented);
+        var out_buf: std.ArrayList(u8) = .empty;
+        errdefer out_buf.deinit(allocator);
+        try out_buf.ensureTotalCapacity(allocator, dedented.len);
+        try decodeEscapedStringSlice(allocator, dedented, parsed.is_byte, !parsed.is_byte, &out_buf);
+        return out_buf.toOwnedSlice(allocator);
+    }
+
+    if (parsed.is_raw) {
+        if (parsed.is_byte) {
+            for (parsed.raw_inner) |raw_byte| {
+                if (raw_byte >= 0x80) return error.InvalidStringLiteral;
+            }
+        }
+        return allocator.dupe(u8, parsed.raw_inner);
+    }
+
+    var out_buf: std.ArrayList(u8) = .empty;
+    errdefer out_buf.deinit(allocator);
+    try out_buf.ensureTotalCapacity(allocator, parsed.raw_inner.len);
+    try decodeEscapedStringSlice(allocator, parsed.raw_inner, parsed.is_byte, !parsed.is_byte, &out_buf);
+    return out_buf.toOwnedSlice(allocator);
+}
+
+/// Decodes a single-byte `b'x'` literal `lexeme` (`0x00..0x7F` or `\xHH`/`\n`/`\r`/`\t`/`\0`/`\\`/`\'`) into `u8`.
+pub fn extractByteLiteralValue(lexeme: []const u8) ?u8 {
+    if (lexeme.len < 4 or lexeme[0] != 'b' or lexeme[1] != '\'' or lexeme[lexeme.len - 1] != '\'') {
+        return null;
+    }
+    const body = lexeme[2 .. lexeme.len - 1];
+    if (body.len == 1) {
+        if (body[0] == '\\' or body[0] == '\'' or body[0] == '\n' or body[0] == '\r' or body[0] >= 0x80) {
+            return null;
+        }
+        return body[0];
+    }
+    if (body[0] != '\\') return null;
+    if (body.len == 2) {
+        return switch (body[1]) {
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            '0' => 0,
+            '\\' => '\\',
+            '\'' => '\'',
+            '"' => '"',
+            else => if (body[1] < 0x80 and body[1] != 'x' and body[1] != 'u' and body[1] != '\n' and body[1] != '\r')
+                body[1]
+            else
+                null,
+        };
+    }
+    if (body.len == 4 and body[1] == 'x' and isHexDigit(body[2]) and isHexDigit(body[3])) {
+        return @intCast((hexDigitValue(body[2]) << 4) | hexDigitValue(body[3]));
+    }
+    return null;
+}
+
 // ------------------- Stateful Lexer Scanner -------------------
 
 /// Stateless-grammar deterministic maximal-munch lexer scanning UTF-8 source into `TokenBuffer`.
@@ -684,7 +1809,7 @@ pub const Lexer = struct {
     file_id: FileId,
     /// Target Structure-of-Arrays token and trivia buffer.
     token_buffer: *TokenBuffer,
-    /// Optional diagnostic sink receiving `E0101`–`E0112`, `W0101`, and `W0201` diagnostics.
+    /// Optional diagnostic sink receiving `E0101`–`E0117`, `W0101`, and `W0201` diagnostics.
     diagnostic_sink: ?*DiagnosticSink,
     /// Optional string interner used to intern `SuggestedFix` replacement text.
     interner: ?*StringInterner,
@@ -1121,6 +2246,15 @@ pub const Lexer = struct {
             token_start + 1 < self.source.len and
             (self.source[token_start + 1] == '"' or self.source[token_start + 1] == '#'))
             try self.scanRawStringLiteral(&has_lexer_error)
+        else if (first_byte == 'b' and token_start + 1 < self.source.len and self.source[token_start + 1] == '\'')
+            try self.scanByteLiteral(&has_lexer_error)
+        else if (first_byte == 'b' and token_start + 1 < self.source.len and self.source[token_start + 1] == '"')
+            try self.scanByteStringLiteral(&has_lexer_error)
+        else if (first_byte == 'b' and
+            token_start + 2 < self.source.len and
+            self.source[token_start + 1] == 'r' and
+            (self.source[token_start + 2] == '"' or self.source[token_start + 2] == '#'))
+            try self.scanRawByteStringLiteral(&has_lexer_error)
         else if (isIdentStart(first_byte))
             try self.scanIdentifierOrKeyword(&has_lexer_error)
         else if (isDecimalDigit(first_byte))
@@ -1195,9 +2329,15 @@ pub const Lexer = struct {
             },
             '.' => blk: {
                 if (self.cursor + 1 < self.source.len and self.source[self.cursor + 1] == '.') {
-                    if (self.cursor + 2 < self.source.len and self.source[self.cursor + 2] == '=') {
-                        self.cursor += 3;
-                        break :blk .dotdoteq;
+                    if (self.cursor + 2 < self.source.len) {
+                        if (self.source[self.cursor + 2] == '.') {
+                            self.cursor += 3;
+                            break :blk .dotdotdot;
+                        }
+                        if (self.source[self.cursor + 2] == '=') {
+                            self.cursor += 3;
+                            break :blk .dotdoteq;
+                        }
                     }
                     self.cursor += 2;
                     break :blk .dotdot;
@@ -1352,8 +2492,11 @@ pub const Lexer = struct {
             '&' => blk: {
                 if (self.cursor + 1 < self.source.len) {
                     if (self.source[self.cursor + 1] == '&') {
+                        const op_start: u32 = @intCast(self.cursor);
                         self.cursor += 2;
-                        break :blk .ampamp;
+                        has_lexer_error = true;
+                        try self.emitRetiredLogicalAndError(op_start, op_start + 2);
+                        break :blk .kw_and;
                     }
                     if (self.source[self.cursor + 1] == '=') {
                         self.cursor += 2;
@@ -1503,22 +2646,54 @@ pub const Lexer = struct {
                 if (self.cursor < self.source.len and self.source[self.cursor] == '_') {
                     is_malformed = true;
                 }
-                while (self.cursor < self.source.len and isIdentContinue(self.source[self.cursor])) {
+                while (self.cursor < self.source.len) {
                     const byte_val = self.source[self.cursor];
-                    if (byte_val == '_') {
-                        if (is_prev_underscore) is_malformed = true;
-                        is_prev_underscore = true;
-                    } else if (isValidDigitForRadix(byte_val, radix)) {
+                    if (isValidDigitForRadix(byte_val, radix)) {
                         digit_count += 1;
                         is_prev_underscore = false;
+                        self.cursor += 1;
+                    } else if (byte_val == '_') {
+                        if (!is_prev_underscore and
+                            digit_count > 0 and
+                            self.cursor + 1 < self.source.len and
+                            isAsciiAlpha(self.source[self.cursor + 1]) and
+                            !isValidDigitForRadix(self.source[self.cursor + 1], radix))
+                        {
+                            break;
+                        }
+                        if (is_prev_underscore) is_malformed = true;
+                        is_prev_underscore = true;
+                        self.cursor += 1;
                     } else {
-                        is_malformed = true;
-                        is_prev_underscore = false;
+                        break;
                     }
-                    self.cursor += 1;
                 }
                 if (digit_count == 0 or is_prev_underscore) {
                     is_malformed = true;
+                }
+
+                // Optional `[_](i8..usize)` integer suffix (`f32`/`f64` prohibited on non-base-10):
+                if (self.cursor < self.source.len and isIdentContinue(self.source[self.cursor])) {
+                    if (self.source[self.cursor] == '_') {
+                        if (self.cursor + 1 < self.source.len and isAsciiAlpha(self.source[self.cursor + 1])) {
+                            self.cursor += 1;
+                        } else {
+                            is_malformed = true;
+                        }
+                    }
+                    const suffix_start = self.cursor;
+                    while (self.cursor < self.source.len and isIdentContinue(self.source[self.cursor])) {
+                        self.cursor += 1;
+                    }
+                    if (!is_malformed) {
+                        if (NUMERIC_SUFFIX_MAP.get(self.source[suffix_start..self.cursor])) |suffix_ty| {
+                            if (suffix_ty == .f32_ty or suffix_ty == .f64_ty) {
+                                is_malformed = true;
+                            }
+                        } else {
+                            is_malformed = true;
+                        }
+                    }
                 }
                 if (is_malformed) {
                     has_lexer_error.* = true;
@@ -1536,6 +2711,12 @@ pub const Lexer = struct {
                 is_prev_underscore = false;
                 self.cursor += 1;
             } else if (byte_val == '_') {
+                if (!is_prev_underscore and
+                    self.cursor + 1 < self.source.len and
+                    isAsciiAlpha(self.source[self.cursor + 1]))
+                {
+                    break;
+                }
                 if (is_prev_underscore) is_malformed = true;
                 is_prev_underscore = true;
                 self.cursor += 1;
@@ -1562,6 +2743,12 @@ pub const Lexer = struct {
                     is_prev_underscore = false;
                     self.cursor += 1;
                 } else if (byte_val == '_') {
+                    if (!is_prev_underscore and
+                        self.cursor + 1 < self.source.len and
+                        isAsciiAlpha(self.source[self.cursor + 1]))
+                    {
+                        break;
+                    }
                     if (is_prev_underscore) is_malformed = true;
                     is_prev_underscore = true;
                     self.cursor += 1;
@@ -1597,6 +2784,13 @@ pub const Lexer = struct {
                     is_prev_underscore = false;
                     self.cursor += 1;
                 } else if (byte_val == '_') {
+                    if (!is_prev_underscore and
+                        exp_digits > 0 and
+                        self.cursor + 1 < self.source.len and
+                        isAsciiAlpha(self.source[self.cursor + 1]))
+                    {
+                        break;
+                    }
                     if (is_prev_underscore) is_malformed = true;
                     is_prev_underscore = true;
                     self.cursor += 1;
@@ -1609,11 +2803,37 @@ pub const Lexer = struct {
             }
         }
 
-        // [5] Reject attached identifier or type suffixes (`123abc`, `42u64`):
+        // [5] Optional `[_](i8..usize|f32|f64)` suffix on base-10 `INT_LIT` or `[_](f32|f64)` on `FLOAT_LIT`:
         if (self.cursor < self.source.len and isIdentContinue(self.source[self.cursor])) {
-            is_malformed = true;
+            if (self.source[self.cursor] == '_') {
+                if (self.cursor + 1 < self.source.len and isAsciiAlpha(self.source[self.cursor + 1])) {
+                    self.cursor += 1;
+                } else {
+                    is_malformed = true;
+                }
+            }
+            const suffix_start = self.cursor;
             while (self.cursor < self.source.len and isIdentContinue(self.source[self.cursor])) {
                 self.cursor += 1;
+            }
+            if (!is_malformed) {
+                if (NUMERIC_SUFFIX_MAP.get(self.source[suffix_start..self.cursor])) |suffix_ty| {
+                    if (is_float and suffix_ty != .f32_ty and suffix_ty != .f64_ty) {
+                        is_malformed = true;
+                    }
+                } else {
+                    is_malformed = true;
+                }
+            }
+            if (is_malformed and
+                (self.source[self.cursor - 1] == 'e' or self.source[self.cursor - 1] == 'E') and
+                self.cursor < self.source.len and
+                (self.source[self.cursor] == '+' or self.source[self.cursor] == '-'))
+            {
+                self.cursor += 1;
+                while (self.cursor < self.source.len and isIdentContinue(self.source[self.cursor])) {
+                    self.cursor += 1;
+                }
             }
         }
 
@@ -1624,18 +2844,84 @@ pub const Lexer = struct {
         return if (is_float) .float_lit else .int_lit;
     }
 
-    /// Scans a standard `"…"` string literal, validating escapes, UTF-8, and `{expr}` interpolation.
+    /// Scans a standard `"…"` or multiline `"""…"""` string literal, validating escapes, UTF-8, and `{expr}` holes.
     fn scanStandardStringLiteral(self: *Lexer, has_lexer_error: *bool) !TokenKind {
         try self.scanStandardStringBody(has_lexer_error);
         return .string_lit;
     }
 
-    /// Scans from an opening `"` through its matching closing `"`, supporting nested `{expr}` blocks.
+    /// Checks and consumes the mandatory `\n` or `\r\n` immediately following an opening `"""` (`E0115`).
+    fn consumeMultilineOpeningNewline(self: *Lexer, open_quote_offset: u32, has_lexer_error: *bool) !bool {
+        if (self.cursor < self.source.len and self.source[self.cursor] == '\n') {
+            self.cursor += 1;
+            return true;
+        }
+        if (self.cursor + 1 < self.source.len and
+            self.source[self.cursor] == '\r' and
+            self.source[self.cursor + 1] == '\n')
+        {
+            self.cursor += 2;
+            return true;
+        }
+        has_lexer_error.* = true;
+        try self.emitSimpleError(
+            .e0115_multiline_string_opening,
+            Span.init(self.file_id, open_quote_offset, open_quote_offset + 3),
+            "opening `\"\"\"` of multiline string literal must be followed immediately by a newline",
+            "insert a line break immediately after `\"\"\"`",
+        );
+        return false;
+    }
+
+    /// Validates closing-quote indentation (`W_close`) and tab/space discipline on a multiline string body (`E0116`).
+    fn validateMultilineIndentation(
+        self: *Lexer,
+        body_start_offset: u32,
+        close_quote_offset: usize,
+        literal_span: Span,
+        is_raw: bool,
+        is_interpolation_allowed: bool,
+        has_lexer_error: *bool,
+    ) !void {
+        processMultilineStringBody(
+            self.source[body_start_offset..close_quote_offset],
+            is_raw,
+            is_interpolation_allowed,
+            null,
+            null,
+        ) catch {
+            has_lexer_error.* = true;
+            try self.emitSimpleError(
+                .e0116_multiline_string_indent,
+                literal_span,
+                "invalid multiline string indentation or mixed leading tabs and spaces",
+                "closing `\"\"\"` must sit on its own space-indented line and every non-empty line must match its indent",
+            );
+        };
+    }
+
+    /// Scans from an opening `"` or `"""` through its matching closing delimiter, tracking `is_triple_quote`
+    /// per `{expr}` brace-nesting level (`[P1 Trap A]`).
     fn scanStandardStringBody(self: *Lexer, has_lexer_error: *bool) !void {
         const start_offset = self.cursor;
-        self.cursor += 1;
+        var is_triple_quote = false;
+        var open_quote_offset: u32 = @intCast(start_offset);
+        var has_valid_opening = true;
+
+        if (self.cursor + 2 < self.source.len and
+            self.source[self.cursor + 1] == '"' and
+            self.source[self.cursor + 2] == '"')
+        {
+            is_triple_quote = true;
+            self.cursor += 3;
+            has_valid_opening = try self.consumeMultilineOpeningNewline(open_quote_offset, has_lexer_error);
+        } else {
+            self.cursor += 1;
+        }
+        var body_start_offset: u32 = @intCast(self.cursor);
+
         var interp_depth: u32 = 0;
-        var interp_brace_stack: [syntax_arenas.MAX_PARSE_DEPTH]u32 = undefined;
+        var interp_brace_stack: [syntax_arenas.MAX_PARSE_DEPTH]InterpStackFrame = undefined;
         var nested_str_depth: usize = 0;
         var has_emitted_depth_error = false;
 
@@ -1643,24 +2929,80 @@ pub const Lexer = struct {
             const byte_val = self.source[self.cursor];
             if (interp_depth == 0) {
                 if (byte_val == '"') {
-                    self.cursor += 1;
-                    if (nested_str_depth == 0) {
-                        return;
+                    if (is_triple_quote) {
+                        if (self.cursor + 2 < self.source.len and
+                            self.source[self.cursor + 1] == '"' and
+                            self.source[self.cursor + 2] == '"')
+                        {
+                            const close_quote_offset = self.cursor;
+                            self.cursor += 3;
+                            if (has_valid_opening) {
+                                try self.validateMultilineIndentation(
+                                    body_start_offset,
+                                    close_quote_offset,
+                                    Span.init(self.file_id, open_quote_offset, @intCast(self.cursor)),
+                                    false,
+                                    true,
+                                    has_lexer_error,
+                                );
+                            }
+                            if (nested_str_depth == 0) return;
+                            nested_str_depth -= 1;
+                            if (nested_str_depth < syntax_arenas.MAX_PARSE_DEPTH) {
+                                const saved_frame = interp_brace_stack[nested_str_depth];
+                                interp_depth = saved_frame.brace_depth;
+                                is_triple_quote = saved_frame.is_triple_quote;
+                                has_valid_opening = saved_frame.has_valid_opening;
+                                open_quote_offset = saved_frame.open_quote_offset;
+                                body_start_offset = saved_frame.body_start_offset;
+                            } else {
+                                interp_depth = 1;
+                                is_triple_quote = false;
+                            }
+                            continue;
+                        }
+                        self.cursor += 1;
+                        continue;
                     }
+
+                    self.cursor += 1;
+                    if (nested_str_depth == 0) return;
                     nested_str_depth -= 1;
-                    interp_depth = if (nested_str_depth < syntax_arenas.MAX_PARSE_DEPTH)
-                        interp_brace_stack[nested_str_depth]
-                    else
-                        1;
+                    if (nested_str_depth < syntax_arenas.MAX_PARSE_DEPTH) {
+                        const saved_frame = interp_brace_stack[nested_str_depth];
+                        interp_depth = saved_frame.brace_depth;
+                        is_triple_quote = saved_frame.is_triple_quote;
+                        has_valid_opening = saved_frame.has_valid_opening;
+                        open_quote_offset = saved_frame.open_quote_offset;
+                        body_start_offset = saved_frame.body_start_offset;
+                    } else {
+                        interp_depth = 1;
+                        is_triple_quote = false;
+                    }
                     continue;
                 }
                 if (byte_val == '\\') {
-                    try self.scanEscapeSequence(true, has_lexer_error);
+                    try self.scanEscapeSequence(.interpolated_string, has_lexer_error);
                     continue;
                 }
                 if (byte_val == '{') {
+                    if (self.cursor + 1 < self.source.len and self.source[self.cursor + 1] == '{') {
+                        self.cursor += 2;
+                        continue;
+                    }
                     interp_depth = 1;
                     self.cursor += 1;
+                    continue;
+                }
+                if (byte_val == '}') {
+                    if (self.cursor + 1 < self.source.len and self.source[self.cursor + 1] == '}') {
+                        self.cursor += 2;
+                        continue;
+                    }
+                    has_lexer_error.* = true;
+                    const brace_offset: u32 = @intCast(self.cursor);
+                    self.cursor += 1;
+                    try self.emitUnmatchedCloseBraceInStringError(brace_offset, brace_offset + 1);
                     continue;
                 }
                 if (byte_val < 0x80) {
@@ -1669,7 +3011,7 @@ pub const Lexer = struct {
                     try self.validateAndAdvanceUtf8Codepoint(has_lexer_error);
                 }
             } else {
-                // Inside `{expr}` interpolation; track nested braces, strings, chars, and comments:
+                // Inside `{expr}` interpolation; track nested braces, strings, byte literals, chars, and comments:
                 if (byte_val == '{') {
                     interp_depth += 1;
                     self.cursor += 1;
@@ -1678,7 +3020,13 @@ pub const Lexer = struct {
                     self.cursor += 1;
                 } else if (byte_val == '"') {
                     if (nested_str_depth < syntax_arenas.MAX_PARSE_DEPTH) {
-                        interp_brace_stack[nested_str_depth] = interp_depth;
+                        interp_brace_stack[nested_str_depth] = .{
+                            .brace_depth = interp_depth,
+                            .is_triple_quote = is_triple_quote,
+                            .has_valid_opening = has_valid_opening,
+                            .open_quote_offset = open_quote_offset,
+                            .body_start_offset = body_start_offset,
+                        };
                     } else if (!has_emitted_depth_error) {
                         has_lexer_error.* = true;
                         has_emitted_depth_error = true;
@@ -1695,7 +3043,39 @@ pub const Lexer = struct {
                     }
                     nested_str_depth += 1;
                     interp_depth = 0;
-                    self.cursor += 1;
+                    open_quote_offset = @intCast(self.cursor);
+                    if (self.cursor + 2 < self.source.len and
+                        self.source[self.cursor + 1] == '"' and
+                        self.source[self.cursor + 2] == '"')
+                    {
+                        is_triple_quote = true;
+                        self.cursor += 3;
+                        has_valid_opening = try self.consumeMultilineOpeningNewline(
+                            open_quote_offset,
+                            has_lexer_error,
+                        );
+                    } else {
+                        is_triple_quote = false;
+                        has_valid_opening = true;
+                        self.cursor += 1;
+                    }
+                    body_start_offset = @intCast(self.cursor);
+                } else if (byte_val == 'b' and
+                    (self.cursor == 0 or !isIdentContinue(self.source[self.cursor - 1])) and
+                    self.cursor + 1 < self.source.len)
+                {
+                    if (self.source[self.cursor + 1] == '\'') {
+                        _ = try self.scanByteLiteral(has_lexer_error);
+                    } else if (self.source[self.cursor + 1] == '"') {
+                        _ = try self.scanByteStringLiteral(has_lexer_error);
+                    } else if (self.source[self.cursor + 1] == 'r' and
+                        self.cursor + 2 < self.source.len and
+                        (self.source[self.cursor + 2] == '"' or self.source[self.cursor + 2] == '#'))
+                    {
+                        _ = try self.scanRawByteStringLiteral(has_lexer_error);
+                    } else {
+                        self.cursor += 1;
+                    }
                 } else if (byte_val == 'r' and
                     (self.cursor == 0 or !isIdentContinue(self.source[self.cursor - 1])) and
                     self.cursor + 1 < self.source.len and
@@ -1730,10 +3110,22 @@ pub const Lexer = struct {
         );
     }
 
-    /// Scans a raw string literal `r"…"` or `r#"…"#` (`0..255` `#` delimiters).
+    /// Scans a raw string literal `r"…"`, `r#"…"#`, `r"""…"""`, or `r#"""…"""#` (`0..255` `#` delimiters).
     fn scanRawStringLiteral(self: *Lexer, has_lexer_error: *bool) !TokenKind {
+        try self.scanRawStringCommon(false, has_lexer_error);
+        return .string_lit;
+    }
+
+    /// Scans a raw byte string literal `br"…"`, `br#"…"#`, `br"""…"""`, or `br#"""…"""#` (`.byte_string_lit`).
+    fn scanRawByteStringLiteral(self: *Lexer, has_lexer_error: *bool) !TokenKind {
+        try self.scanRawStringCommon(true, has_lexer_error);
+        return .byte_string_lit;
+    }
+
+    /// Shared scanner for `r` (UTF-8) and `br` (ASCII-only `E0117`) single-line and multiline raw strings.
+    fn scanRawStringCommon(self: *Lexer, is_byte_mode: bool, has_lexer_error: *bool) !void {
         const start_offset = self.cursor;
-        self.cursor += 1; // Advance past `'r'`.
+        self.cursor += if (is_byte_mode) @as(usize, 2) else 1;
 
         var hash_count: usize = 0;
         while (self.cursor < self.source.len and self.source[self.cursor] == '#') {
@@ -1741,7 +3133,6 @@ pub const Lexer = struct {
             self.cursor += 1;
         }
 
-        // If `r#…` is not followed by `"`, consume attached identifier characters and emit `E0102`:
         if (self.cursor >= self.source.len or self.source[self.cursor] != '"') {
             while (self.cursor < self.source.len and isIdentContinue(self.source[self.cursor])) {
                 self.cursor += 1;
@@ -1750,20 +3141,66 @@ pub const Lexer = struct {
             try self.emitSimpleError(
                 .e0102_unterminated_string_literal,
                 Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
-                "malformed or unterminated raw string literal",
+                if (is_byte_mode)
+                    "malformed or unterminated raw byte string literal"
+                else
+                    "malformed or unterminated raw string literal",
                 "expected opening `\"` after raw string prefix",
             );
-            return .string_lit;
+            return;
         }
 
         if (hash_count > MAX_RAW_STRING_HASHES) {
             has_lexer_error.* = true;
         }
-        self.cursor += 1; // Advance past opening `'"'`.
+
+        const open_quote_offset: u32 = @intCast(self.cursor);
+        const is_triple_quote = isTripleQuoteOpening(self.source, self.cursor, true, hash_count);
+
+        var has_valid_opening = true;
+        if (is_triple_quote) {
+            self.cursor += 3;
+            has_valid_opening = try self.consumeMultilineOpeningNewline(open_quote_offset, has_lexer_error);
+        } else {
+            self.cursor += 1;
+        }
+        const body_start_offset: u32 = @intCast(self.cursor);
 
         while (self.cursor < self.source.len) {
             const byte_val = self.source[self.cursor];
             if (byte_val == '"') {
+                if (is_triple_quote) {
+                    if (self.cursor + 2 < self.source.len and
+                        self.source[self.cursor + 1] == '"' and
+                        self.source[self.cursor + 2] == '"' and
+                        hasExactHashesAt(self.source, self.cursor + 3, hash_count))
+                    {
+                        const close_quote_offset = self.cursor;
+                        self.cursor += 3 + hash_count;
+                        if (hash_count > MAX_RAW_STRING_HASHES) {
+                            try self.emitSimpleError(
+                                .e0102_unterminated_string_literal,
+                                Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
+                                "raw string delimiter exceeds maximum of 255 `#` characters",
+                                "reduce `#` delimiter count to at most 255",
+                            );
+                        }
+                        if (has_valid_opening) {
+                            try self.validateMultilineIndentation(
+                                body_start_offset,
+                                close_quote_offset,
+                                Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
+                                true,
+                                false,
+                                has_lexer_error,
+                            );
+                        }
+                        return;
+                    }
+                    self.cursor += 1;
+                    continue;
+                }
+
                 self.cursor += 1;
                 var matched_hashes: usize = 0;
                 while (matched_hashes < hash_count and
@@ -1782,10 +3219,23 @@ pub const Lexer = struct {
                             "reduce `#` delimiter count to at most 255",
                         );
                     }
-                    return .string_lit;
+                    return;
                 }
             } else if (byte_val < 0x80) {
                 self.cursor += 1;
+            } else if (is_byte_mode) {
+                const non_ascii_start = self.cursor;
+                var is_bad_utf8 = false;
+                try self.validateAndAdvanceUtf8Codepoint(&is_bad_utf8);
+                has_lexer_error.* = true;
+                if (!is_bad_utf8) {
+                    try self.emitSimpleError(
+                        .e0117_non_ascii_byte_literal,
+                        Span.init(self.file_id, @intCast(non_ascii_start), @intCast(self.cursor)),
+                        "raw byte string literal may only contain ASCII characters (`0x00..0x7F`)",
+                        "non-ASCII character is not allowed in byte string literal",
+                    );
+                }
             } else {
                 try self.validateAndAdvanceUtf8Codepoint(has_lexer_error);
             }
@@ -1795,10 +3245,144 @@ pub const Lexer = struct {
         try self.emitSimpleError(
             .e0102_unterminated_string_literal,
             Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
-            "unterminated raw string literal",
+            if (is_byte_mode) "unterminated raw byte string literal" else "unterminated raw string literal",
             "raw string literal was not closed by matching delimiter before end of file",
         );
-        return .string_lit;
+    }
+
+    /// Scans a cooked byte string literal `b"…"` or `b"""…"""` (`.byte_string_lit`, interpolation disabled).
+    fn scanByteStringLiteral(self: *Lexer, has_lexer_error: *bool) !TokenKind {
+        const start_offset = self.cursor;
+        self.cursor += 1; // Advance past `'b'`.
+        const open_quote_offset: u32 = @intCast(self.cursor);
+        const is_triple_quote = self.cursor + 2 < self.source.len and
+            self.source[self.cursor + 1] == '"' and
+            self.source[self.cursor + 2] == '"';
+
+        var has_valid_opening = true;
+        if (is_triple_quote) {
+            self.cursor += 3;
+            has_valid_opening = try self.consumeMultilineOpeningNewline(open_quote_offset, has_lexer_error);
+        } else {
+            self.cursor += 1;
+        }
+        const body_start_offset: u32 = @intCast(self.cursor);
+
+        while (self.cursor < self.source.len) {
+            const byte_val = self.source[self.cursor];
+            if (byte_val == '"') {
+                if (is_triple_quote) {
+                    if (self.cursor + 2 < self.source.len and
+                        self.source[self.cursor + 1] == '"' and
+                        self.source[self.cursor + 2] == '"')
+                    {
+                        const close_quote_offset = self.cursor;
+                        self.cursor += 3;
+                        if (has_valid_opening) {
+                            try self.validateMultilineIndentation(
+                                body_start_offset,
+                                close_quote_offset,
+                                Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
+                                false,
+                                false,
+                                has_lexer_error,
+                            );
+                        }
+                        return .byte_string_lit;
+                    }
+                    self.cursor += 1;
+                    continue;
+                }
+                self.cursor += 1;
+                return .byte_string_lit;
+            }
+            if (byte_val == '\\') {
+                try self.scanEscapeSequence(.byte_string, has_lexer_error);
+                continue;
+            }
+            if (byte_val < 0x80) {
+                self.cursor += 1;
+            } else {
+                const non_ascii_start = self.cursor;
+                var is_bad_utf8 = false;
+                try self.validateAndAdvanceUtf8Codepoint(&is_bad_utf8);
+                has_lexer_error.* = true;
+                if (!is_bad_utf8) {
+                    try self.emitSimpleError(
+                        .e0117_non_ascii_byte_literal,
+                        Span.init(self.file_id, @intCast(non_ascii_start), @intCast(self.cursor)),
+                        "byte string literal may only contain ASCII bytes (`0x00..0x7F`) or `\\xHH` escapes",
+                        "replace non-ASCII character with explicit `\\xHH` byte escapes",
+                    );
+                }
+            }
+        }
+
+        has_lexer_error.* = true;
+        try self.emitSimpleError(
+            .e0102_unterminated_string_literal,
+            Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
+            "unterminated byte string literal",
+            "byte string literal opened here was not closed before end of file",
+        );
+        return .byte_string_lit;
+    }
+
+    /// Scans a single-byte literal `b'x'` (`.byte_lit`), emitting `E0117` on non-ASCII bytes or `\u{…}` escapes.
+    fn scanByteLiteral(self: *Lexer, has_lexer_error: *bool) !TokenKind {
+        const start_offset = self.cursor;
+        self.cursor += 2; // Advance past `"b'"`.
+        var byte_unit_count: usize = 0;
+        var has_closing_quote = false;
+
+        while (self.cursor < self.source.len) {
+            const byte_val = self.source[self.cursor];
+            if (byte_val == '\'') {
+                self.cursor += 1;
+                has_closing_quote = true;
+                break;
+            }
+            if (byte_val == '\n' or byte_val == '\r') {
+                break;
+            }
+            if (byte_val == '\\') {
+                try self.scanEscapeSequence(.byte_char, has_lexer_error);
+                byte_unit_count += 1;
+            } else if (byte_val < 0x80) {
+                self.cursor += 1;
+                byte_unit_count += 1;
+            } else {
+                const non_ascii_start = self.cursor;
+                var is_bad_utf8 = false;
+                try self.validateAndAdvanceUtf8Codepoint(&is_bad_utf8);
+                has_lexer_error.* = true;
+                if (!is_bad_utf8) {
+                    try self.emitSimpleError(
+                        .e0117_non_ascii_byte_literal,
+                        Span.init(self.file_id, @intCast(non_ascii_start), @intCast(self.cursor)),
+                        "byte literal `b'…'` may only contain an ASCII byte (`0x00..0x7F`) or `\\xHH` escape",
+                        "non-ASCII character is not valid in `b'…'`; use `'…'` (`char`) or `b'\\xHH'`",
+                    );
+                }
+                byte_unit_count += 1;
+            }
+        }
+
+        if (!has_closing_quote or byte_unit_count != 1) {
+            has_lexer_error.* = true;
+            try self.emitSimpleError(
+                .e0102_unterminated_string_literal,
+                Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
+                if (!has_closing_quote)
+                    "unterminated byte literal"
+                else if (byte_unit_count == 0)
+                    "empty byte literal `b''`"
+                else
+                    "byte literal may only contain a single ASCII byte or `\\xHH` escape",
+                "expected a single ASCII byte or escape sequence enclosed in `b'…'`",
+            );
+        }
+        return .byte_lit;
     }
 
     /// Scans a character literal `'c'`, validating escapes, codepoint count, and line termination.
@@ -1819,7 +3403,7 @@ pub const Lexer = struct {
                 break;
             }
             if (byte_val == '\\') {
-                try self.scanEscapeSequence(false, has_lexer_error);
+                try self.scanEscapeSequence(.char_literal, has_lexer_error);
                 codepoint_count += 1;
             } else if (byte_val < 0x80) {
                 self.cursor += 1;
@@ -1847,16 +3431,18 @@ pub const Lexer = struct {
         return .char_lit;
     }
 
-    /// Validates a `\` escape sequence at `self.cursor` inside a string (`is_string = true`) or char literal.
-    fn scanEscapeSequence(self: *Lexer, is_string: bool, has_lexer_error: *bool) !void {
+    /// Validates a `\` escape sequence at `self.cursor` under `escape_ctx`.
+    fn scanEscapeSequence(self: *Lexer, escape_ctx: EscapeContext, has_lexer_error: *bool) !void {
         const escape_start = self.cursor;
         self.cursor += 1; // Advance past `'\\'`.
         if (self.cursor >= self.source.len) return;
 
+        const is_string_like = escape_ctx == .interpolated_string or escape_ctx == .byte_string;
+        const is_byte_mode = escape_ctx == .byte_char or escape_ctx == .byte_string;
         const esc_byte = self.source[self.cursor];
         switch (esc_byte) {
             '\n', '\r' => {
-                if (!is_string) {
+                if (!is_string_like) {
                     return;
                 }
                 if (esc_byte == '\r' and
@@ -1871,15 +3457,28 @@ pub const Lexer = struct {
             'n', 'r', 't', '\\', '0' => {
                 self.cursor += 1;
             },
-            '"', '{', '}' => {
+            '"' => {
                 self.cursor += 1;
-                if (!is_string and self.options.is_escape_warning_enabled) {
+                if (!is_string_like and self.options.is_escape_warning_enabled) {
+                    try self.emitRedundantEscapeWarning(@intCast(escape_start), @intCast(self.cursor));
+                }
+            },
+            '{', '}' => {
+                self.cursor += 1;
+                if (escape_ctx == .interpolated_string) {
+                    has_lexer_error.* = true;
+                    try self.emitInvalidBraceEscapeError(
+                        @intCast(escape_start),
+                        @intCast(self.cursor),
+                        esc_byte == '{',
+                    );
+                } else if (self.options.is_escape_warning_enabled) {
                     try self.emitRedundantEscapeWarning(@intCast(escape_start), @intCast(self.cursor));
                 }
             },
             '\'' => {
                 self.cursor += 1;
-                if (is_string and self.options.is_escape_warning_enabled) {
+                if (is_string_like and self.options.is_escape_warning_enabled) {
                     try self.emitRedundantEscapeWarning(@intCast(escape_start), @intCast(self.cursor));
                 }
             },
@@ -1911,10 +3510,13 @@ pub const Lexer = struct {
                 if (self.cursor >= self.source.len or self.source[self.cursor] != '{') {
                     has_lexer_error.* = true;
                     try self.emitSimpleError(
-                        .e0101_invalid_utf8_sequence,
+                        if (is_byte_mode) .e0117_non_ascii_byte_literal else .e0101_invalid_utf8_sequence,
                         Span.init(self.file_id, @intCast(escape_start), @intCast(self.cursor)),
-                        "malformed Unicode escape sequence `\\u{…}`",
-                        "expected `{` after `\\u`",
+                        if (is_byte_mode)
+                            "Unicode escape `\\u{…}` is not permitted in byte literals; use `\\xHH` instead"
+                        else
+                            "malformed Unicode escape sequence `\\u{…}`",
+                        if (is_byte_mode) "replace `\\u{…}` with `\\xHH`" else "expected `{` after `\\u`",
                     );
                     return;
                 }
@@ -1943,6 +3545,17 @@ pub const Lexer = struct {
                 if (has_closing_brace) {
                     self.cursor += 1;
                 }
+                if (is_byte_mode) {
+                    has_lexer_error.* = true;
+                    try self.emitSimpleError(
+                        .e0117_non_ascii_byte_literal,
+                        Span.init(self.file_id, @intCast(escape_start), @intCast(self.cursor)),
+                        "Unicode escape `\\u{…}` is not permitted in byte literals; use `\\xHH` instead",
+                        "byte literals only support single-byte `\\xHH` escapes",
+                    );
+                    return;
+                }
+
                 const is_valid_codepoint = digit_count >= 1 and
                     digit_count <= 6 and
                     !has_invalid_hex and
@@ -1967,8 +3580,19 @@ pub const Lexer = struct {
                         try self.emitRedundantEscapeWarning(@intCast(escape_start), @intCast(self.cursor));
                     }
                 } else {
-                    try self.validateAndAdvanceUtf8Codepoint(has_lexer_error);
-                    if (self.options.is_escape_warning_enabled) {
+                    var is_bad_utf8 = false;
+                    try self.validateAndAdvanceUtf8Codepoint(&is_bad_utf8);
+                    if (is_bad_utf8) {
+                        has_lexer_error.* = true;
+                    } else if (is_byte_mode) {
+                        has_lexer_error.* = true;
+                        try self.emitSimpleError(
+                            .e0117_non_ascii_byte_literal,
+                            Span.init(self.file_id, @intCast(escape_start), @intCast(self.cursor)),
+                            "non-ASCII character is not permitted in byte literal",
+                            "use `\\xHH` for raw byte values",
+                        );
+                    } else if (self.options.is_escape_warning_enabled) {
                         try self.emitRedundantEscapeWarning(@intCast(escape_start), @intCast(self.cursor));
                     }
                 }
@@ -2105,6 +3729,153 @@ pub const Lexer = struct {
         }
     }
 
+    /// Emits `E0113` (`e0113_retired_logical_and`) with a `.machine_applicable` fix replacing `&&` with `and`.
+    fn emitRetiredLogicalAndError(self: *Lexer, op_start: u32, op_end: u32) !void {
+        const sink = self.diagnostic_sink orelse return;
+        const op_span = Span.init(self.file_id, op_start, op_end);
+        const primary_labels = [_]LabeledSpan{.{
+            .span = op_span,
+            .label = "retired `&&` operator; use `and` instead",
+            .style = .primary,
+        }};
+
+        if (self.interner) |str_interner| {
+            const needs_left_space = op_start > 0 and isIdentContinue(self.source[op_start - 1]);
+            const needs_right_space = @as(usize, op_end) < self.source.len and
+                isIdentContinue(self.source[op_end]);
+            const replacement_text: []const u8 = if (needs_left_space and needs_right_space)
+                " and "
+            else if (needs_left_space)
+                " and"
+            else if (needs_right_space)
+                "and "
+            else
+                "and";
+
+            const fix_edits = [_]TextEdit{.{
+                .file_id = self.file_id,
+                .start_byte = op_start,
+                .end_byte = op_end,
+                .replacement_id = try str_interner.intern(replacement_text),
+            }};
+            const fixes = [_]SuggestedFix{.{
+                .message = "replace '&&' with 'and'",
+                .applicability = .machine_applicable,
+                .priority = .syntax_canonicalization,
+                .edits = &fix_edits,
+            }};
+            try sink.emit(.{
+                .code = .e0113_retired_logical_and,
+                .severity = .err,
+                .primary_span = op_span,
+                .message = "logical AND operator '&&' has been retired in favor of 'and'",
+                .labels = &primary_labels,
+                .suggestions = &fixes,
+            });
+        } else {
+            try sink.emit(.{
+                .code = .e0113_retired_logical_and,
+                .severity = .err,
+                .primary_span = op_span,
+                .message = "logical AND operator '&&' has been retired in favor of 'and'",
+                .labels = &primary_labels,
+            });
+        }
+    }
+
+    /// Emits `E0114` (`e0114_invalid_brace_escape`) with a `.machine_applicable` fix replacing `\{`/`\}` with `{{`/`}}`.
+    fn emitInvalidBraceEscapeError(
+        self: *Lexer,
+        escape_start: u32,
+        escape_end: u32,
+        is_open_brace: bool,
+    ) !void {
+        const sink = self.diagnostic_sink orelse return;
+        const escape_span = Span.init(self.file_id, escape_start, escape_end);
+        const primary_labels = [_]LabeledSpan{.{
+            .span = escape_span,
+            .label = if (is_open_brace)
+                "invalid `\\{` brace escape; write `{{` for a literal `{`"
+            else
+                "invalid `\\}` brace escape; write `}}` for a literal `}`",
+            .style = .primary,
+        }};
+
+        if (self.interner) |str_interner| {
+            const replacement_text: []const u8 = if (is_open_brace) "{{" else "}}";
+            const fix_edits = [_]TextEdit{.{
+                .file_id = self.file_id,
+                .start_byte = escape_start,
+                .end_byte = escape_end,
+                .replacement_id = try str_interner.intern(replacement_text),
+            }};
+            const fixes = [_]SuggestedFix{.{
+                .message = if (is_open_brace) "replace '\\{' with '{{'" else "replace '\\}' with '}}'",
+                .applicability = .machine_applicable,
+                .priority = .syntax_canonicalization,
+                .edits = &fix_edits,
+            }};
+            try sink.emit(.{
+                .code = .e0114_invalid_brace_escape,
+                .severity = .err,
+                .primary_span = escape_span,
+                .message = "retired backslash brace escape in interpolated string literal; use '{{' or '}}'",
+                .labels = &primary_labels,
+                .suggestions = &fixes,
+            });
+        } else {
+            try sink.emit(.{
+                .code = .e0114_invalid_brace_escape,
+                .severity = .err,
+                .primary_span = escape_span,
+                .message = "retired backslash brace escape in interpolated string literal; use '{{' or '}}'",
+                .labels = &primary_labels,
+            });
+        }
+    }
+
+    /// Emits `E0114` (`e0114_invalid_brace_escape`) with a `.machine_applicable` fix replacing a lone `}` with `}}`.
+    fn emitUnmatchedCloseBraceInStringError(self: *Lexer, brace_start: u32, brace_end: u32) !void {
+        const sink = self.diagnostic_sink orelse return;
+        const brace_span = Span.init(self.file_id, brace_start, brace_end);
+        const primary_labels = [_]LabeledSpan{.{
+            .span = brace_span,
+            .label = "unmatched `}` in interpolated string literal; write `}}` for a literal `}`",
+            .style = .primary,
+        }};
+
+        if (self.interner) |str_interner| {
+            const fix_edits = [_]TextEdit{.{
+                .file_id = self.file_id,
+                .start_byte = brace_start,
+                .end_byte = brace_end,
+                .replacement_id = try str_interner.intern("}}"),
+            }};
+            const fixes = [_]SuggestedFix{.{
+                .message = "replace '}' with '}}'",
+                .applicability = .machine_applicable,
+                .priority = .syntax_canonicalization,
+                .edits = &fix_edits,
+            }};
+            try sink.emit(.{
+                .code = .e0114_invalid_brace_escape,
+                .severity = .err,
+                .primary_span = brace_span,
+                .message = "unmatched '}' in interpolated string literal; escape literal closing braces as '}}'",
+                .labels = &primary_labels,
+                .suggestions = &fixes,
+            });
+        } else {
+            try sink.emit(.{
+                .code = .e0114_invalid_brace_escape,
+                .severity = .err,
+                .primary_span = brace_span,
+                .message = "unmatched '}' in interpolated string literal; escape literal closing braces as '}}'",
+                .labels = &primary_labels,
+            });
+        }
+    }
+
     /// Emits `W0101` (`w0101_redundant_escape_sequence`) with a `.machine_applicable` fix replacing `\c` with `c`.
     fn emitRedundantEscapeWarning(self: *Lexer, escape_start: u32, escape_end: u32) !void {
         const sink = self.diagnostic_sink orelse return;
@@ -2225,11 +3996,13 @@ pub const lexFile = tokenize;
 
 // ------------------------- Unit Tests -------------------------
 
-test "test_all_49_keywords_19_prim_types_and_disjoint_casing" {
+test "test_all_50_keywords_20_prim_types_and_disjoint_casing" {
     try std.testing.expectEqual(@as(?TokenKind, .kw_pub), lookupKeywordOrPrim("pub"));
     try std.testing.expectEqual(@as(?TokenKind, .kw_self_val), lookupKeywordOrPrim("self"));
     try std.testing.expectEqual(@as(?TokenKind, .kw_self_type), lookupKeywordOrPrim("Self"));
     try std.testing.expectEqual(@as(?TokenKind, .kw_bit_field), lookupKeywordOrPrim("bit_field"));
+    try std.testing.expectEqual(@as(?TokenKind, .kw_subscript), lookupKeywordOrPrim("subscript"));
+    try std.testing.expectEqual(@as(?TokenKind, .kw_yield), lookupKeywordOrPrim("yield"));
     try std.testing.expectEqual(@as(?TokenKind, .kw_orelse), lookupKeywordOrPrim("orelse"));
     try std.testing.expectEqual(@as(?TokenKind, .kw_with), lookupKeywordOrPrim("with"));
     try std.testing.expectEqual(@as(?TokenKind, .kw_context), lookupKeywordOrPrim("context"));
@@ -2238,6 +4011,8 @@ test "test_all_49_keywords_19_prim_types_and_disjoint_casing" {
     try std.testing.expectEqual(@as(?TokenKind, .prim_type), lookupKeywordOrPrim("usize"));
     try std.testing.expectEqual(@as(?TokenKind, .prim_type), lookupKeywordOrPrim("never"));
     try std.testing.expectEqual(@as(?TokenKind, .prim_type), lookupKeywordOrPrim("unit"));
+    try std.testing.expectEqual(@as(?TokenKind, .prim_type), lookupKeywordOrPrim("opaque"));
+    try std.testing.expectEqual(@as(?TokenKind, null), lookupKeywordOrPrim("ref"));
     try std.testing.expectEqual(@as(?TokenKind, null), lookupKeywordOrPrim("custom_ident"));
 
     // Standalone `_` vs canonical/non-canonical `.ident`, `.type_ident`, and `.const_ident`:
@@ -2334,7 +4109,7 @@ test "test_numeric_range_disambiguation_and_string_interpolation_roundtrip" {
         \\fn demo() {
         \\    for i in 0..10 {
         \\        let m = 10.max(20);
-        \\        let msg = "val={if i > 0 { "ok /* } */" } else { r#"raw } str"# }}\n";
+        \\        let msg = "val={if i > 0 { "ok /* }} */" } else { r#"raw } str"# }}\n";
         \\        let arr: #soa [u32] = [];
         \\    }
         \\}
@@ -2364,7 +4139,7 @@ test "test_numeric_range_disambiguation_and_string_interpolation_roundtrip" {
 }
 
 test "test_malformed_literals_escapes_and_e0104_tail_preservation" {
-    const bad_source = "0x 0x_1 0b102 0o78 1__2 1.0e+ 42u64 'ab' '' \"\\z\" r#bad";
+    const bad_source = "0x 0x_1 0b102 0o78 1__2 1.0e+ 42u99 'ab' '' \"\\z\" r#bad";
     var token_buf = TokenBuffer.init(std.testing.allocator);
     defer token_buf.deinit();
     var sink = DiagnosticSink.init(std.testing.allocator);
@@ -2735,4 +4510,208 @@ test "test_dr21_walrus_dollar_retired_coloncolon_and_tuple_projection_lexing" {
     try tokenize("`", FileId.fromInt(0), &inv_buf, &inv_sink, null);
     try std.testing.expectEqual(@as(u32, 1), inv_sink.error_count);
     try std.testing.expectEqual(TokenKind.invalid_token, inv_buf.getToken(TokenIndex.fromInt(0)).kind);
+}
+
+test "test_dr22_retired_ampamp_dotdotdot_brace_escapes_and_autofixes" {
+    const legacy_source = "let ok = flag_a && flag_b&&flag_c; let s = \"\\{k\\} = {{v}}\"; fn c_fn(fmt: *opaque, ...);";
+    var token_buf = TokenBuffer.init(std.testing.allocator);
+    defer token_buf.deinit();
+    var sink = DiagnosticSink.init(std.testing.allocator);
+    defer sink.deinit();
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    try tokenize(legacy_source, FileId.fromInt(0), &token_buf, &sink, &interner);
+    try std.testing.expectEqual(@as(u32, 4), sink.error_count);
+    try std.testing.expectEqual(DiagnosticCode.e0113_retired_logical_and, sink.asSlice()[0].code);
+    try std.testing.expectEqual(DiagnosticCode.e0113_retired_logical_and, sink.asSlice()[1].code);
+    try std.testing.expectEqual(DiagnosticCode.e0114_invalid_brace_escape, sink.asSlice()[2].code);
+    try std.testing.expectEqual(DiagnosticCode.e0114_invalid_brace_escape, sink.asSlice()[3].code);
+
+    // Recovery token for `&&` is `.kw_and` with exact 2-byte span and lossless CST reconstruction:
+    const recovered_and = token_buf.getToken(TokenIndex.fromInt(4));
+    try std.testing.expectEqual(TokenKind.kw_and, recovered_and.kind);
+    try std.testing.expectEqual(@as(u16, 2), recovered_and.byte_len);
+    try std.testing.expect(recovered_and.flags.has_lexer_error);
+
+    // Verify `.dotdotdot` (`...`) before `)`:
+    try std.testing.expectEqual(TokenKind.dotdotdot, token_buf.getToken(TokenIndex.fromInt(22)).kind);
+
+    var cst_arena = syntax_arenas.LosslessCstArena.init(std.testing.allocator);
+    defer cst_arena.deinit();
+    const reconstructed = try cst_arena.reconstructSource(std.testing.allocator, legacy_source, &token_buf);
+    defer std.testing.allocator.free(reconstructed);
+    try std.testing.expectEqualStrings(legacy_source, reconstructed);
+
+    var fixes: [4]SuggestedFix = .{
+        sink.asSlice()[0].suggestions[0],
+        sink.asSlice()[1].suggestions[0],
+        sink.asSlice()[2].suggestions[0],
+        sink.asSlice()[3].suggestions[0],
+    };
+    const patch_res = try diagnostic.TransactionalPatcher.apply(
+        std.testing.allocator,
+        legacy_source,
+        FileId.fromInt(0),
+        &fixes,
+        &interner,
+    );
+    defer std.testing.allocator.free(patch_res.patched_source);
+    try std.testing.expectEqual(@as(u32, 4), patch_res.applied_count);
+    try std.testing.expectEqualStrings(
+        "let ok = flag_a and flag_b and flag_c; let s = \"{{k}} = {{v}}\"; fn c_fn(fmt: *opaque, ...);",
+        patch_res.patched_source,
+    );
+}
+
+test "test_dr22_multiline_strings_nested_interp_trap_a_and_byte_literals" {
+    // [1] `[P1 Trap A]`: `"""outer {"inner"} and {"""nested"""} tail"""` + byte literals:
+    const valid_source =
+        \\let banner = """
+        \\    outer {"inner"} and {
+        \\        """
+        \\        nested "quote" ""pair""
+        \\        """
+        \\    } \
+        \\    tail {{v1.0}}
+        \\    """;
+        \\let raw_multi = r#"""
+        \\    line 1 /\
+        \\    line 2 "triple"
+        \\    """#;
+        \\let wire = b"HTTP/1.1\r\n\xFF";
+        \\let sep = b'\r';
+        \\let raw_bytes = br#"A"B"#;
+    ;
+    var token_buf = TokenBuffer.init(std.testing.allocator);
+    defer token_buf.deinit();
+    var sink = DiagnosticSink.init(std.testing.allocator);
+    defer sink.deinit();
+
+    try tokenize(valid_source, FileId.fromInt(0), &token_buf, &sink, null);
+    try std.testing.expectEqual(@as(u32, 0), sink.error_count);
+    try std.testing.expectEqual(@as(u32, 0), sink.warning_count);
+
+    try std.testing.expectEqual(TokenKind.string_lit, token_buf.getToken(TokenIndex.fromInt(3)).kind);
+    try std.testing.expectEqual(TokenKind.string_lit, token_buf.getToken(TokenIndex.fromInt(8)).kind);
+    try std.testing.expectEqual(TokenKind.byte_string_lit, token_buf.getToken(TokenIndex.fromInt(13)).kind);
+    try std.testing.expectEqual(TokenKind.byte_lit, token_buf.getToken(TokenIndex.fromInt(18)).kind);
+    try std.testing.expectEqual(TokenKind.byte_string_lit, token_buf.getToken(TokenIndex.fromInt(23)).kind);
+
+    // Verify `cookStringLiteral`, `extractMultilineStringContent`, and `extractByteLiteralValue`:
+    const raw_rec = token_buf.getToken(TokenIndex.fromInt(8));
+    const raw_lexeme = valid_source[raw_rec.byte_offset .. raw_rec.byte_offset + raw_rec.byte_len];
+    try std.testing.expect(isMultilineStringLexeme(raw_lexeme));
+    const cooked_raw = try cookStringLiteral(std.testing.allocator, raw_lexeme);
+    defer std.testing.allocator.free(cooked_raw);
+    try std.testing.expectEqualStrings("line 1 /\\\nline 2 \"triple\"", cooked_raw);
+
+    const wire_rec = token_buf.getToken(TokenIndex.fromInt(13));
+    const cooked_wire = try cookStringLiteral(
+        std.testing.allocator,
+        valid_source[wire_rec.byte_offset .. wire_rec.byte_offset + wire_rec.byte_len],
+    );
+    defer std.testing.allocator.free(cooked_wire);
+    try std.testing.expectEqualSlices(u8, "HTTP/1.1\r\n\xFF", cooked_wire);
+    try std.testing.expectEqual(@as(?u8, '\r'), extractByteLiteralValue("b'\\r'"));
+    try std.testing.expectEqual(@as(?u8, 0xFF), extractByteLiteralValue("b'\\xFF'"));
+    try std.testing.expectEqual(@as(?u8, 'A'), extractByteLiteralValue("b'A'"));
+
+    // [2] Negative diagnostics `E0115`, `E0116`, and `E0117`:
+    const err_source =
+        "let e1 = \"\"\"bad\n\"\"\"; let e2 = \"\"\"\n  under\n    \"\"\"; let e3 = b'é'; let e4 = b\"\\u{41}\";";
+    var err_buf = TokenBuffer.init(std.testing.allocator);
+    defer err_buf.deinit();
+    var err_sink = DiagnosticSink.init(std.testing.allocator);
+    defer err_sink.deinit();
+
+    try tokenize(err_source, FileId.fromInt(0), &err_buf, &err_sink, null);
+    try std.testing.expectEqual(@as(u32, 4), err_sink.error_count);
+    try std.testing.expectEqual(DiagnosticCode.e0115_multiline_string_opening, err_sink.asSlice()[0].code);
+    try std.testing.expectEqual(DiagnosticCode.e0116_multiline_string_indent, err_sink.asSlice()[1].code);
+    try std.testing.expectEqual(DiagnosticCode.e0117_non_ascii_byte_literal, err_sink.asSlice()[2].code);
+    try std.testing.expectEqual(DiagnosticCode.e0117_non_ascii_byte_literal, err_sink.asSlice()[3].code);
+}
+
+test "test_dr22_numeric_suffixes_and_8byte_fmt_spec_parser" {
+    const num_source = "42_u64 42u64 0x4358_574C_u32 0b1010_i8 0o77_usize 10_f32 0.5_f32 1e-3f64 0x1f32";
+    var num_buf = TokenBuffer.init(std.testing.allocator);
+    defer num_buf.deinit();
+    var num_sink = DiagnosticSink.init(std.testing.allocator);
+    defer num_sink.deinit();
+
+    try tokenize(num_source, FileId.fromInt(0), &num_buf, &num_sink, null);
+    try std.testing.expectEqual(@as(u32, 0), num_sink.error_count);
+
+    const parsed_hex = try extractNumericSuffix("0x4358_574C_u32");
+    try std.testing.expectEqualStrings("0x4358_574C", parsed_hex.digits_slice);
+    try std.testing.expectEqualStrings("u32", parsed_hex.suffix_slice);
+    try std.testing.expectEqual(@as(?TypeId, .u32_ty), parsed_hex.suffix_type);
+    try std.testing.expect(parsed_hex.has_underscore_sep);
+    try std.testing.expectEqual(@as(u8, 16), parsed_hex.radix);
+
+    const parsed_pure_hex = try extractNumericSuffix("0x1f32");
+    try std.testing.expectEqual(@as(?TypeId, null), parsed_pure_hex.suffix_type);
+    try std.testing.expectEqualStrings("0x1f32", parsed_pure_hex.digits_slice);
+
+    const parsed_int_flt = try extractNumericSuffix("10_f32");
+    try std.testing.expectEqual(@as(?TypeId, .f32_ty), parsed_int_flt.suffix_type);
+    try std.testing.expect(!parsed_int_flt.is_float_syntax);
+
+    // Reject float suffix on binary/octal and int suffix on float literal (`E0103`):
+    var bad_num_buf = TokenBuffer.init(std.testing.allocator);
+    defer bad_num_buf.deinit();
+    var bad_num_sink = DiagnosticSink.init(std.testing.allocator);
+    defer bad_num_sink.deinit();
+    try tokenize("0b10_f32 1.5_u64 42__u64 42_", FileId.fromInt(0), &bad_num_buf, &bad_num_sink, null);
+    try std.testing.expectEqual(@as(u32, 4), bad_num_sink.error_count);
+
+    // Verify 8-byte `FmtSpec` packing and `parseFormatSpec`:
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(FmtSpec));
+    const hex_spec = try parseFormatSpec("#010x", true);
+    try std.testing.expect(hex_spec.hasAltFlag());
+    try std.testing.expect(hex_spec.hasZeroPad());
+    try std.testing.expect(hex_spec.hasDebugEq());
+    try std.testing.expectEqual(@as(?u16, 10), hex_spec.extractWidth());
+    try std.testing.expectEqual(@as(?u16, null), hex_spec.extractPrecision());
+    try std.testing.expectEqual(FmtTypeCode.lower_hex, hex_spec.extractTypeCode());
+
+    const debug_eq_default = try parseFormatSpec("", true);
+    try std.testing.expectEqual(FmtTypeCode.debug, debug_eq_default.extractTypeCode());
+    try std.testing.expect(debug_eq_default.hasDebugEq());
+
+    const unicode_fill = try parseFormatSpec("─^20.2f", false);
+    try std.testing.expectEqual(@as(u21, '─'), unicode_fill.extractFillChar());
+    try std.testing.expectEqual(FmtAlignMode.center, unicode_fill.extractAlignMode());
+    try std.testing.expectEqual(@as(?u16, 20), unicode_fill.extractWidth());
+    try std.testing.expectEqual(@as(?u16, 2), unicode_fill.extractPrecision());
+    try std.testing.expectEqual(FmtTypeCode.fixed, unicode_fill.extractTypeCode());
+}
+
+test "test_stage4_single_line_hashed_raw_quote_runs_and_nested_interp" {
+    const src = "r#\"\"\"\"# br#\"\"\"\"# r##\"\"\"\"\"## \"outer {r#\"\"\"\"#} ok\"";
+    var tok_buf = TokenBuffer.init(std.testing.allocator);
+    defer tok_buf.deinit();
+    var sink = DiagnosticSink.init(std.testing.allocator);
+    defer sink.deinit();
+
+    try tokenize(src, FileId.fromInt(0), &tok_buf, &sink, null);
+    try std.testing.expectEqual(@as(u32, 0), sink.error_count);
+    try std.testing.expectEqual(@as(usize, 5), tok_buf.countTokens());
+    try std.testing.expectEqual(TokenKind.string_lit, tok_buf.getToken(TokenIndex.fromInt(0)).kind);
+    try std.testing.expectEqual(TokenKind.byte_string_lit, tok_buf.getToken(TokenIndex.fromInt(1)).kind);
+    try std.testing.expectEqual(TokenKind.string_lit, tok_buf.getToken(TokenIndex.fromInt(2)).kind);
+    try std.testing.expectEqual(TokenKind.string_lit, tok_buf.getToken(TokenIndex.fromInt(3)).kind);
+
+    const cooked_two_quotes = try cookStringLiteral(std.testing.allocator, "r#\"\"\"\"#");
+    defer std.testing.allocator.free(cooked_two_quotes);
+    try std.testing.expectEqualStrings("\"\"", cooked_two_quotes);
+
+    const cooked_byte_quotes = try cookStringLiteral(std.testing.allocator, "br#\"\"\"\"#");
+    defer std.testing.allocator.free(cooked_byte_quotes);
+    try std.testing.expectEqualStrings("\"\"", cooked_byte_quotes);
+
+    const cooked_three_quotes = try cookStringLiteral(std.testing.allocator, "r##\"\"\"\"\"##");
+    defer std.testing.allocator.free(cooked_three_quotes);
+    try std.testing.expectEqualStrings("\"\"\"", cooked_three_quotes);
 }

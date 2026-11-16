@@ -29,7 +29,7 @@ pub const SYS_WRITE_AARCH64: i64 = 64;
 pub const SYS_EXIT_GROUP_AARCH64: i64 = 94;
 
 // ------------------------------------- PUBLIC API --------------------------------------
-/// POSIX `write(fd, buf_ptr, byte_len)` C-ABI prototype (`unistd.h`).
+/// POSIX `write(file_desc, buf_ptr, byte_len)` C-ABI prototype (`unistd.h`).
 @link_name("write")
 pub extern "C" fn linux_posix_write(file_desc: i32, buf_ptr: *u8, byte_len: usize) -> isize;
 
@@ -38,23 +38,19 @@ pub extern "C" fn linux_posix_write(file_desc: i32, buf_ptr: *u8, byte_len: usiz
 pub extern "C" fn linux_posix_exit(status_code: i32) -> never;
 
 /// Safe wrapper writing `text` to Linux `STDOUT_FILENO` (`1`).
-@inline
-@no_alloc
+@inline @no_alloc
 pub fn write_stdout(text: str) -> isize {
     return @sys_write(STDOUT_FILENO, text);
 }
 
 /// Safe wrapper writing `text` to Linux `STDERR_FILENO` (`2`).
-@inline
-@no_alloc
+@inline @no_alloc
 pub fn write_stderr(text: str) -> isize {
     return @sys_write(STDERR_FILENO, text);
 }
 
 /// Safe wrapper terminating the process with `status_code`.
-@cold
-@noinline
-@no_alloc
+@cold @no_alloc @noinline
 pub fn exit_process(status_code: i32) -> never {
     @sys_exit(status_code);
 }

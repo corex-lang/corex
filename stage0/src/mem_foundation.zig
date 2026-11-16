@@ -301,6 +301,8 @@ pub const TypeId = enum(u32) {
     untyped_float_ty = 20,
     /// Gradual error/hole recovery type sentinel (`21`).
     err_ty = 21,
+    /// Built-in unsized FFI target type `opaque` (`22`).
+    opaque_ty = 22,
     /// Constrained type group `Signed` (`32`).
     group_signed = 32,
     /// Constrained type group `Unsigned` (`33`).
@@ -311,8 +313,8 @@ pub const TypeId = enum(u32) {
     group_float = 35,
     /// Constrained type group `Number` (`36`).
     group_number = 36,
-    /// Constrained type group `Numeric` (`37`).
-    group_numeric = 37,
+    /// Retired built-in group tombstone (`37`; superseded by `Number` at `36`).
+    _retired_group_numeric = 37,
     /// Constrained type group `Comparable` (`38`).
     group_comparable = 38,
     /// Constrained type group `Equatable` (`39`).
@@ -327,6 +329,18 @@ pub const TypeId = enum(u32) {
     group_from_bytes = 43,
     /// Constrained type group `IntoBytes` (`44`).
     group_into_bytes = 44,
+    /// Built-in call-site location descriptor `SourceLoc` (`45`).
+    source_loc_ty = 45,
+    /// Built-in 8-byte format specifier `FmtSpec` (`46`).
+    fmt_spec_ty = 46,
+    /// Built-in zero-allocation borrowed `FmtArgs` view (`47`).
+    fmt_args_ty = 47,
+    /// Built-in benchmark harness receiver `Bencher` (`48`).
+    bencher_ty = 48,
+    /// Built-in structured concurrency `TaskGroup` base slot (`49`).
+    task_group_base_ty = 49,
+    /// Built-in linear `TaskHandle` base slot (`50`).
+    task_handle_base_ty = 50,
     /// First dynamically interned user/composite type index (`64`).
     first_dynamic = 64,
     /// Sentinel value representing no type.
@@ -358,20 +372,27 @@ pub const TypeId = enum(u32) {
         return self == .err_ty;
     }
 
-    /// Returns true if `self` is one of the 19 reserved primitive types (`0..18`).
-    pub inline fn isPrimitive(self: TypeId) bool {
+    /// Returns true if `self` is one of the 19 sized primitive types (`0..18`, excluding `opaque`).
+    pub inline fn isSizedPrimitive(self: TypeId) bool {
         return @backingInt(self) <= @backingInt(TypeId.f64_ty);
     }
 
-    /// Returns true if `self` is a primitive type or inference/error sentinel (`0..21`).
-    pub inline fn isPrimitiveOrSentinel(self: TypeId) bool {
-        return @backingInt(self) <= @backingInt(TypeId.err_ty);
+    /// Returns true if `self` is one of the 20 reserved primitive types (`0..18` or `opaque` at `22`).
+    pub inline fn isPrimitive(self: TypeId) bool {
+        return @backingInt(self) <= @backingInt(TypeId.f64_ty) or self == .opaque_ty;
     }
 
-    /// Returns true if `self` is one of the 13 built-in Constrained Type Groups (`32..44`).
+    /// Returns true if `self` is a primitive type or inference/error sentinel (`0..22`).
+    pub inline fn isPrimitiveOrSentinel(self: TypeId) bool {
+        return @backingInt(self) <= @backingInt(TypeId.opaque_ty);
+    }
+
+    /// Returns true if `self` is one of the 12 active built-in Constrained Type Groups (`32..44`, excluding `37`).
     pub inline fn isBuiltinGroup(self: TypeId) bool {
         const raw = @backingInt(self);
-        return raw >= @backingInt(TypeId.group_signed) and raw <= @backingInt(TypeId.group_into_bytes);
+        return raw >= @backingInt(TypeId.group_signed) and
+            raw <= @backingInt(TypeId.group_into_bytes) and
+            raw != @backingInt(TypeId._retired_group_numeric);
     }
 
     /// Returns true if `self` is a signed integer primitive (`i8`..`isize`).
@@ -403,7 +424,7 @@ pub const TypeId = enum(u32) {
         return raw >= @backingInt(TypeId.i8_ty) and raw <= @backingInt(TypeId.f64_ty);
     }
 
-    /// Returns the 32-bit `TypeGroupMask` bit (`1 << self`) for primitive types (`0..18`).
+    /// Returns the 32-bit `TypeGroupMask` bit (`1 << self`) for sized primitive types (`0..18`).
     pub inline fn primitiveBit(self: TypeId) u32 {
         std.debug.assert(@backingInt(self) <= @backingInt(TypeId.f64_ty));
         return @as(u32, 1) << @as(u5, @intCast(@backingInt(self)));
@@ -1096,4 +1117,29 @@ test "test_string_interner_deduplication_and_empty_sentinel" {
     try std.testing.expectEqual(first_id, interner.lookup("corex_identifier").?);
     try std.testing.expect(interner.lookup("missing_symbol") == null);
     try std.testing.expectEqualStrings("corex_identifier", interner.get(first_id));
+}
+
+test "test_dr22_type_id_static_slots_opaque_and_retired_numeric_group" {
+    try std.testing.expectEqual(@as(u32, 22), TypeId.opaque_ty.asInt());
+    try std.testing.expectEqual(@as(u32, 37), TypeId._retired_group_numeric.asInt());
+    try std.testing.expectEqual(@as(u32, 45), TypeId.source_loc_ty.asInt());
+    try std.testing.expectEqual(@as(u32, 46), TypeId.fmt_spec_ty.asInt());
+    try std.testing.expectEqual(@as(u32, 47), TypeId.fmt_args_ty.asInt());
+    try std.testing.expectEqual(@as(u32, 48), TypeId.bencher_ty.asInt());
+    try std.testing.expectEqual(@as(u32, 49), TypeId.task_group_base_ty.asInt());
+    try std.testing.expectEqual(@as(u32, 50), TypeId.task_handle_base_ty.asInt());
+    try std.testing.expectEqual(@as(u32, 64), TypeId.first_dynamic.asInt());
+
+    try std.testing.expect(TypeId.f64_ty.isSizedPrimitive());
+    try std.testing.expect(TypeId.f64_ty.isPrimitive());
+    try std.testing.expect(!TypeId.opaque_ty.isSizedPrimitive());
+    try std.testing.expect(TypeId.opaque_ty.isPrimitive());
+    try std.testing.expect(TypeId.opaque_ty.isPrimitiveOrSentinel());
+    try std.testing.expect(!TypeId.untyped_int_ty.isPrimitive());
+    try std.testing.expect(TypeId.untyped_int_ty.isPrimitiveOrSentinel());
+
+    try std.testing.expect(TypeId.group_number.isBuiltinGroup());
+    try std.testing.expect(TypeId.group_into_bytes.isBuiltinGroup());
+    try std.testing.expect(!TypeId._retired_group_numeric.isBuiltinGroup());
+    try std.testing.expect(!TypeId.source_loc_ty.isBuiltinGroup());
 }

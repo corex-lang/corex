@@ -166,34 +166,34 @@ test "test_codegen_llvm_determinism_swifterror_mvs_hoist_pentagon_and_7_targets"
         \\    pub px: f32,
         \\    pub py: f32,
         \\}
-        \\pub fn fallible_tag56(code: i32) -> Result[i64, i32] {
+        \\pub fn fallible_tag56(code: i32) -> i64!i32 {
         \\    if code <= 0 {
         \\        return .Err(0);
         \\    }
         \\    return .Ok((code as i64) * 10);
         \\}
-        \\pub fn fallible_zst(flag: bool) -> Result[i32, unit] {
-        \\    if !flag {
+        \\pub fn fallible_zst(flag: bool) -> i32!unit {
+        \\    if not flag {
         \\        return .Err(());
         \\    }
         \\    return .Ok(77);
         \\}
         \\pub fn mvs_soa_kernel(
-        \\    mut dst_pts: inout #soa [Particle; 8],
-        \\    mut aux_sum: inout i32,
+        \\    dst_pts: &mut #soa [Particle; 8],
+        \\    aux_sum: &mut i32,
         \\    scale_vec: [i32; 4]
         \\) -> i32 {
         \\    var idx: usize = 0;
         \\    @must_vectorize
         \\    @vectorize_width(4)
         \\    while idx < 8 {
-        \\        dst_pts[idx].px = dst_pts[idx].px + 1.0;
+        \\        dst_pts.*[idx].px = dst_pts.*[idx].px + 1.0;
         \\        idx = idx + 1;
         \\    }
         \\    let doubled = @simd_add(scale_vec, @simd_splat[[i32; 4]](2));
         \\    let red = @simd_reduce_add(doubled);
-        \\    aux_sum = aux_sum + red;
-        \\    return aux_sum;
+        \\    aux_sum.* = aux_sum.* + red;
+        \\    return aux_sum.*;
         \\}
         \\pub fn multi_arm_switch(tag_v: i32) -> i32 {
         \\    var bonus: i32 = 1;
@@ -204,6 +204,9 @@ test "test_codegen_llvm_determinism_swifterror_mvs_hoist_pentagon_and_7_targets"
         \\        _ => { bonus = 10; },
         \\    }
         \\    return bonus;
+        \\}
+        \\pub fn write_out_slot(dst_slot: &out i32, seed_v: i32) {
+        \\    dst_slot.* = seed_v + 1;
         \\}
     ;
 
@@ -300,7 +303,7 @@ test "test_codegen_llvm_determinism_swifterror_mvs_hoist_pentagon_and_7_targets"
     const pentagon_src =
         \\pub fn load_bounded(ptr_ref: &i32) -> i32 {
         \\    let copied_ptr: &i32 = ptr_ref;
-        \\    let loaded_v = *copied_ptr;
+        \\    let loaded_v = copied_ptr.*;
         \\    return loaded_v + 1;
         \\}
     ;
@@ -382,7 +385,7 @@ test "test_codegen_llvm_determinism_swifterror_mvs_hoist_pentagon_and_7_targets"
 
 test "test_codegen_llvm_cross_target_object_verifier_linux_macos_wasm" {
     const cross_src =
-        \\pub fn checked_err(val: i32) -> Result[i32, i32] {
+        \\pub fn checked_err(val: i32) -> i32!i32 {
         \\    if val == 0 {
         \\        return .Err(0);
         \\    }
@@ -459,19 +462,19 @@ test "test_codegen_llvm_native_release_execution_and_fuzz_sancov_edge_hits" {
         \\        @drop_trace(self.tag);
         \\    }
         \\}
-        \\pub fn step_tag56(code: i32) -> Result[i32, i32] {
+        \\pub fn step_tag56(code: i32) -> i32!i32 {
         \\    if code == 0 {
         \\        return .Err(0);
         \\    }
         \\    return .Ok(code * 4);
         \\}
-        \\pub fn step_zst(ok_flag: bool) -> Result[i32, unit] {
-        \\    if !ok_flag {
+        \\pub fn step_zst(ok_flag: bool) -> i32!unit {
+        \\    if not ok_flag {
         \\        return .Err(());
         \\    }
         \\    return .Ok(9);
         \\}
-        \\pub fn chain_swifterror(val: i32) -> Result[i32, i32] {
+        \\pub fn chain_swifterror(val: i32) -> i32!i32 {
         \\    let first = step_tag56(val)?;
         \\    return .Ok(first + 3);
         \\}
@@ -487,8 +490,8 @@ test "test_codegen_llvm_native_release_execution_and_fuzz_sancov_edge_hits" {
         \\    }
         \\    return a_val;
         \\}
-        \\pub fn add_to_slot(mut target_slot: inout i32, amount: i32) {
-        \\    target_slot = target_slot + amount;
+        \\pub fn add_to_slot(target_slot: &mut i32, amount: i32) {
+        \\    target_slot.* = target_slot.* + amount;
         \\}
         \\pub fn main() -> i32 {
         \\    // [1] `@zero_pad` `0x00` verification:
@@ -503,7 +506,7 @@ test "test_codegen_llvm_native_release_execution_and_fuzz_sancov_edge_hits" {
         \\    if pad_acc != 0 {
         \\        @trap();
         \\    }
-        \\    // [2] Niche `Option[str]` empty-string invariant:
+        \\    // [2] Niche `str?` empty-string invariant:
         \\    let s_some: str? = .Some("");
         \\    let s_none: str? = .None;
         \\    if s_some == s_none {
@@ -511,7 +514,7 @@ test "test_codegen_llvm_native_release_execution_and_fuzz_sancov_edge_hits" {
         \\    }
         \\    match s_some {
         \\        .Some(empty_s) => {
-        \\            if empty_s.len != 0 { @trap(); }
+        \\            if empty_s.len() != 0 { @trap(); }
         \\        },
         \\        .None => @trap(),
         \\    }
@@ -536,7 +539,7 @@ test "test_codegen_llvm_native_release_execution_and_fuzz_sancov_edge_hits" {
         \\        .Ok(z_ok) => { total = total + z_ok; },
         \\        .Err(_) => @trap(),
         \\    }
-        \\    // [4] `#soa` + `@must_vectorize` + MVS `inout` + `<4 x i32>` SIMD + atomics:
+        \\    // [4] `#soa` + `@must_vectorize` + MVS `&mut` + `<4 x i32>` SIMD + atomics:
         \\    var soa_buf: #soa [Particle; 4] = @default_init[#soa [Particle; 4]]();
         \\    soa_buf[0].vx = 1;
         \\    soa_buf[0].vy = 2;
@@ -553,7 +556,7 @@ test "test_codegen_llvm_native_release_execution_and_fuzz_sancov_edge_hits" {
         \\        soa_buf[li].vx = soa_buf[li].vx + 2;
         \\        li = li + 1;
         \\    }
-        \\    add_to_slot(total, soa_buf[0].vx + soa_buf[3].vy);
+        \\    add_to_slot(&mut total, soa_buf[0].vx + soa_buf[3].vy);
         \\    var atom_cell: i32 = 10;
         \\    let old_atom = @atomic_rmw_add(&mut atom_cell, 4);
         \\    let vec_res = @simd_reduce_add(@simd_add(@simd_splat[[i32; 4]](3), [1, 2, 3, 4]));
@@ -678,7 +681,7 @@ test "test_codegen_llvm_native_release_execution_and_fuzz_sancov_edge_hits" {
         \\    let opt_a: str? = .Some("");
         \\    let opt_b: str? = .None;
         \\    let opt_c: str? = .Some("");
-        \\    if !(opt_a != opt_b) || !(opt_a == opt_c) {
+        \\    if not (opt_a != opt_b) or not (opt_a == opt_c) {
         \\        @trap();
         \\    }
         \\    let sum_v = classify_byte(65) + classify_byte(120) + classify_byte(7);
@@ -759,7 +762,7 @@ test "test_regression_codegen_llvm_wasi_import_module_extern_dedup_and_quoted_id
         \\    let dbg_s: str = (DbgTag { val: x_in }).debug();
         \\    let err_a: u16 = unsafe { wasi_fd_write_a(1, 0 as *u8, 0, 0 as *usize) };
         \\    let err_b: u16 = unsafe { wasi_fd_write_b(1, 0 as *u8, 0, 0 as *usize) };
-        \\    return (dbg_s.len as i32) + (err_a as i32) + (err_b as i32) + unsafe { ext_dollar_hyphen(x_in) };
+        \\    return (dbg_s.len() as i32) + (err_a as i32) + (err_b as i32) + unsafe { ext_dollar_hyphen(x_in) };
         \\}
     ;
 
