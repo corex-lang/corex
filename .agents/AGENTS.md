@@ -87,6 +87,7 @@ Every `corex` terminal interaction (`corex` help menus, build progress, test run
     -   Never use em dashes (`—`); use `; `, a new sentence, or an en dash (`–`). Always write `e.g.,` with a trailing comma.
 -   **Markdown Linting:** All Markdown files (`.md`) must strictly adhere to the rules defined in `.markdownlint.json`.
 -   **Changelog Maintenance:** Document every user-visible change to the language, compiler, CLI, or standard library under the current unreleased section at the top of `CHANGELOG.md` using canonical headings in order (`### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`, `### Security`, `### Breaking Changes` – include only non-empty sections). Never modify published release entries. New modules or subsystems added in the unreleased version must be summarized as a single entry under `### Added` rather than logging intermediate development iterations.
+-   **Comparison & Launch Roadmap Maintenance:** Whenever a phase lands or modifies a user-facing language advantage, static verification guarantee, CLI subcommand, or ecosystem/release deliverable, synchronize `docs/COMPARISONS.md` (promoting `[v0.0.1]` / `[0.x]` status tags to `[Live]` as features ship and adding any new CoreX advantages or showcases) and `docs/LAUNCH.md` so launch and website source material never drifts.
 
 ## 8. Rule & Skill Authoring (Single Source of Truth)
 
@@ -95,6 +96,7 @@ To keep agent guidelines clean, maintainable, and free of contradictions, adhere
 -   **Define Once:** Every rule, standard, or workflow must be defined in exactly ONE canonical location:
     -   **`AGENTS.md`:** Repository-wide core policies (strict typing, performance and memory discipline, zero-legacy policy, validation, CLI aesthetics, code structure, naming, typography, and changelog maintenance).
     -   **`PLAN.md` & `docs/research/`:** Master phase roadmap, canonical compiler data structures, `RDG-01`–`RDG-22` Research Decision Gates, upfront research prompts (`docs/research/PROMPTS.md`), and resolved research specifications (`docs/research/DR-XX.md`).
+    -   **`docs/COMPARISONS.md` & `docs/LAUNCH.md`:** Canonical cross-language advantage catalog (with side-by-side `.cx` showcases) and post-Phase-12 website, playground, distribution, history-squash, and GitHub Linguist adoption roadmap.
     -   **`.agents/ORCHESTRATION.md`:** Autonomous multi-subagent quality orchestration workflow.
     -   **Skills (`.agents/skills/<skill>/SKILL.md`):** Specialized domain workflows and detailed formatting specifications (`docs` for doc comments, comments, and section separators; `build` for compilation, cross-targets, and self-hosting bootstrap; `test` for verification suites, snapshots, and fuzzing; `bench` for performance benchmarking; `audit` for comprehensive codebase audits).
 -   **Reference, Never Duplicate:** When a rule defined in one location applies in another, do NOT duplicate or re-explain the rule. Point directly to its canonical definition in `AGENTS.md` or the respective skill.

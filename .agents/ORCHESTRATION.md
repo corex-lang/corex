@@ -61,7 +61,7 @@ Never accept a subagent's output blindly: verify its claims, run the full valida
 2.  State clearly which Phase and task you are executing and which `RDG` gates are active.
 3.  Execute the 5-stage subagent quality pipeline (`Specify` → `Critique` → `Implement` → `Red-Team Verify` → `Test/Fuzz/Audit`).
 4.  Run all formatters, linters, type checkers, tests, and benchmarks; fix every error, warning, or coverage gap until the workspace is 100% clean.
-5.  Update `CHANGELOG.md` per `.agents/AGENTS.md` Section 7 and report your verification summary.
+5.  Update `CHANGELOG.md` (and synchronize `docs/COMPARISONS.md` / `docs/LAUNCH.md` when user-facing capabilities or CLI deliverables ship) per `.agents/AGENTS.md` Section 7 and report your verification summary.
 
 ---
 
