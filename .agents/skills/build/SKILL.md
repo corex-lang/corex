@@ -17,18 +17,19 @@ Before packaging or running release builds, always run the full validation suite
 
 ## 2. Build Modes & Pipeline Stages
 
-The CoreX build system supports both the initial bootstrap compiler (Stage 0) and the self-hosted `.cx` compiler (Stages 1–2):
+The CoreX build system supports both the initial bootstrap compiler (Stage 0, retained side-by-side through `PLAN.md` `Phase 12.6`) and the self-hosted `.cx` compiler (Stages 1–3, plus the permanent C99 + `stage1/corex1.wasm.zst` offline bootstrap seed from `Phase 12.7` onward):
 
-1.  **Stage 0 (Bootstrap Compiler):** Built from the Stage 0 Zig source tree (`stage0/`, configured via `build.zig` with unified binary name `corex`) into `build/stage0/corex` (or `build/stage0/corex.exe` on Windows) with strict Zig compiler checks and zero warnings; `zig build test` executes all Stage 0 unit, snapshot, and drift-guard suites.
-2.  **Stage 1 (First Self-Hosted Build):** Built by invoking `build/stage0/corex build` on the self-hosted compiler source tree (`compiler/*.cx`), producing `build/stage1/corex`.
-3.  **Stage 2 (Reproducibility Verification Build):** Built by invoking `build/stage1/corex build` on the identical `compiler/*.cx` source tree, producing `build/stage2/corex`.
+1.  **Stage 0 (Bootstrap Compiler / Differential Oracle):** Built from the Stage 0 Zig source tree (`stage0/`, configured via `build.zig` with unified binary name `corex`) into `build/stage0/corex` (or `build/stage0/corex.exe` on Windows) with strict Zig compiler checks and zero warnings; `zig build test` executes all Stage 0 unit, snapshot, and drift-guard suites. From `Phase 12.7` onward, fresh C99-only hosts replace `stage0/` with `bootstrap.c` + `stage1/corex1.wasm.zst` (`DR-01` §5) to produce `corex1`.
+2.  **Stage 1 (First Self-Hosted Build):** Built by invoking `build/stage0/corex build` (or `corex1` in C99 bootstrap mode) on the self-hosted compiler source tree (`compiler/*.cx`), producing `build/stage1/corex`.
+3.  **Stage 2 (Self-Compiled Build):** Built by invoking `build/stage1/corex build` on the identical `compiler/*.cx` source tree, producing `build/stage2/corex`.
+4.  **Stage 3 (Fixed-Point Verification Build):** Built by invoking `build/stage2/corex build` on the identical `compiler/*.cx` source tree, producing `build/stage3/corex`.
 
 ### Self-Hosting Determinism Gate
 
-Once Stage 1 is operational, every compiler build verification **must** assert deterministic fixed-point compilation:
+Once self-hosted codegen (`Phase 12.6`) is operational, every compiler build verification **must** assert deterministic fixed-point compilation:
 
--   Compare `build/stage1/corex` and `build/stage2/corex` byte-for-byte (SHA-256 digest match).
--   Any binary divergence between Stage 1 and Stage 2 indicates non-deterministic iteration order (e.g., unseeded hash map iteration), uninitialized memory padding, or a miscompilation bug that must be fixed immediately.
+-   Compare `build/stage2/corex` and `build/stage3/corex` byte-for-byte (SHA-256 digest match).
+-   Any binary divergence between Stage 2 and Stage 3 indicates non-deterministic iteration order (e.g., unseeded hash map iteration), uninitialized memory padding, or a miscompilation bug that must be fixed immediately.
 
 ---
 

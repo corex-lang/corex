@@ -26,30 +26,30 @@ flowchart TD
     CST --> TOOLING["Unified Tooling Engine: corex fmt, corex upgrade (RDG-14), corex lsp (RDG-12)"]
 ```
 
-| Gate ID      | Research Specification Report                      | Blocking Phase         | Modular Boundary / Interface Governed                                                                             |
-| ------------ | -------------------------------------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| **`RDG-01`** | [`docs/research/DR-01.md`](docs/research/DR-01.md) | Phase 0                | Bootstrap implementation language, build scripts, arena allocator primitives, self-hosting seed strategy          |
-| **`RDG-02`** | [`docs/research/DR-02.md`](docs/research/DR-02.md) | Phase 2                | Programming paradigm, expression vs. statement semantics, mutability defaults, data composition model             |
-| **`RDG-03`** | [`docs/research/DR-03.md`](docs/research/DR-03.md) | Phase 1 / 2            | Ergonomic syntax, `TokenKind` table, block/generic delimiters, grammar production rules, casing rules             |
-| **`RDG-04`** | [`docs/research/DR-04.md`](docs/research/DR-04.md) | Phase 4                | `TypeArena`, bidirectional constraint solver, constrained type groups (`Number`), variance rules                  |
-| **`RDG-05`** | [`docs/research/DR-05.md`](docs/research/DR-05.md) | Phase 5                | `MirInterpreter` / `comptime` evaluator, type-level evaluation, compile-time reflection hooks                     |
-| **`RDG-06`** | [`docs/research/DR-06.md`](docs/research/DR-06.md) | Phase 6                | Zero-GC automatic scope cleanup, interprocedural escape/alias inference, manual allocators, `MIR` SAST engine     |
-| **`RDG-07`** | [`docs/research/DR-07.md`](docs/research/DR-07.md) | Phase 4 / 6 / 7        | Zero-overhead error union representation, `swiftcc` + `swifterror` ABI lowering, exhaustiveness diagnostics       |
-| **`RDG-08`** | [`docs/research/DR-08.md`](docs/research/DR-08.md) | Phase 8 / 11 / 13.1    | Structured concurrency, coroutine/task lowering, data-race verification, OS I/O completion reactor                |
-| **`RDG-09`** | [`docs/research/DR-09.md`](docs/research/DR-09.md) | Phase 7 / 13.0         | `CodegenBackend` trait, `-ofmt=c` & `--release` LLVM AOT (`Phase 7`), self-hosted Tier C `--dev` (`Phase 13.0`)   |
-| **`RDG-10`** | [`docs/research/DR-10.md`](docs/research/DR-10.md) | Phase 8 / 13.3         | Cross-compilation target descriptors, standalone static/dynamic linking, C FFI ABI marshaler, `wasm32` emitter    |
-| **`RDG-11`** | [`docs/research/DR-11.md`](docs/research/DR-11.md) | Phase 9                | Zero-friction URL/registry imports, content-addressable store (`~/.corex/cache`), `corex.lock` schema             |
-| **`RDG-12`** | [`docs/research/DR-12.md`](docs/research/DR-12.md) | Phase 2 / 3 / 10       | Fault-tolerant lossless CST, incremental query database (`CompilerDb`), early-cutoff invalidation, `corex lsp`    |
-| **`RDG-13`** | [`docs/research/DR-13.md`](docs/research/DR-13.md) | Phase 5                | Desugared `HIR` nodes, basic-block SSA `MIR` with place projections, SROA/inlining/DCE/monomorphization           |
-| **`RDG-14`** | [`docs/research/DR-14.md`](docs/research/DR-14.md) | Phase 3 / 10           | Canonical CST pretty-printer (`corex fmt`), zero-legacy automated spec migration engine (`corex upgrade`)         |
-| **`RDG-15`** | [`docs/research/DR-15.md`](docs/research/DR-15.md) | Phase 11 / 13.1–13.4   | Bootstrap `.cx` `cx.*` (`Phase 11`) and post-`v0.0.1` `HTTP/2`, `TLS 1.3`, `cx.tui`, & `cx.ui` (`Phase 13`)        |
-| **`RDG-16`** | [`docs/research/DR-16.md`](docs/research/DR-16.md) | Phase 9 (Seam) / 13.2  | Dependency-conflict solution synthesis, security-aware ranking, and lossless `corex.toml` interactive/LSP fix     |
-| **`RDG-17`** | [`docs/research/DR-17.md`](docs/research/DR-17.md) | Phase 6 / 9 / 10       | Zero-annotation `MIR` call-graph capability inference, supply-chain sandboxing, and `@no_alloc` / `@no_panic`     |
-| **`RDG-18`** | [`docs/research/DR-18.md`](docs/research/DR-18.md) | Phase 7 / 8 / 11       | Deterministic `Context` simulation testing (`corex test --sim`) and native coverage fuzzing (`corex test --fuzz`) |
-| **`RDG-19`** | [`docs/research/DR-19.md`](docs/research/DR-19.md) | Phase 7 (Seam) / 13    | Stateful live hot-code reloading (`corex run --watch`), `@must_vectorize` SIMD contracts, and VOPR cluster sim    |
-| **`RDG-20`** | [`docs/research/DR-20.md`](docs/research/DR-20.md) | Phases 6–13             | Holistic superpower catalog (`D-01`–`D-11`), soundness/ABI fixes (`Prune-01`–`07`), and `195-LOC` seam map        |
-| **`RDG-21`** | [`docs/research/DR-21.md`](docs/research/DR-21.md) | Phase 7.5 / Phases 8–13 | `cx.*` standard namespace, unified `.` path separator (retiring `::`), and `SE-01`–`SE-08` surface elevations     |
-| **`RDG-22`** | [`docs/research/DR-22.md`](docs/research/DR-22.md) | Phase 7.6 / Phases 8–13 | Canonical CoreX v1.0 surface lock (`ADR-22A`–`22F`), `120`-token table, and `SE-09`–`SE-23` zero-cost advantages  |
+| Gate ID      | Research Specification Report                      | Blocking Phase           | Modular Boundary / Interface Governed                                                                             |
+| ------------ | -------------------------------------------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| **`RDG-01`** | [`docs/research/DR-01.md`](docs/research/DR-01.md) | Phase 0 / 12.1–12.7      | Bootstrap implementation language, build scripts, arena allocator primitives, self-hosting seed strategy          |
+| **`RDG-02`** | [`docs/research/DR-02.md`](docs/research/DR-02.md) | Phase 2                  | Programming paradigm, expression vs. statement semantics, mutability defaults, data composition model             |
+| **`RDG-03`** | [`docs/research/DR-03.md`](docs/research/DR-03.md) | Phase 1 / 2              | Ergonomic syntax, `TokenKind` table, block/generic delimiters, grammar production rules, casing rules             |
+| **`RDG-04`** | [`docs/research/DR-04.md`](docs/research/DR-04.md) | Phase 4                  | `TypeArena`, bidirectional constraint solver, constrained type groups (`Number`), variance rules                  |
+| **`RDG-05`** | [`docs/research/DR-05.md`](docs/research/DR-05.md) | Phase 5                  | `MirInterpreter` / `comptime` evaluator, type-level evaluation, compile-time reflection hooks                     |
+| **`RDG-06`** | [`docs/research/DR-06.md`](docs/research/DR-06.md) | Phase 6                  | Zero-GC automatic scope cleanup, interprocedural escape/alias inference, manual allocators, `MIR` SAST engine     |
+| **`RDG-07`** | [`docs/research/DR-07.md`](docs/research/DR-07.md) | Phase 4 / 6 / 7          | Zero-overhead error union representation, `swiftcc` + `swifterror` ABI lowering, exhaustiveness diagnostics       |
+| **`RDG-08`** | [`docs/research/DR-08.md`](docs/research/DR-08.md) | Phase 8 / 11.2 / 13.1    | Structured concurrency, coroutine/task lowering, data-race verification, OS I/O completion reactor                |
+| **`RDG-09`** | [`docs/research/DR-09.md`](docs/research/DR-09.md) | Phase 7 / 12.6 / 13.0    | `CodegenBackend` trait, `-ofmt=c` & `--release` LLVM AOT (`Phase 7`), self-hosted Tier C `--dev` (`Phase 13.0`)   |
+| **`RDG-10`** | [`docs/research/DR-10.md`](docs/research/DR-10.md) | Phase 8 / 12.6 / 13.3    | Cross-compilation target descriptors, standalone static/dynamic linking, C FFI ABI marshaler, `wasm32` emitter    |
+| **`RDG-11`** | [`docs/research/DR-11.md`](docs/research/DR-11.md) | Phase 9 / 12.7           | Zero-friction URL/registry imports, content-addressable store (`~/.corex/cache`), `corex.lock` schema             |
+| **`RDG-12`** | [`docs/research/DR-12.md`](docs/research/DR-12.md) | Phase 2 / 3 / 10 / 10.5  | Fault-tolerant lossless CST, incremental query database (`CompilerDb`), early-cutoff invalidation, `corex lsp`    |
+| **`RDG-13`** | [`docs/research/DR-13.md`](docs/research/DR-13.md) | Phase 5                  | Desugared `HIR` nodes, basic-block SSA `MIR` with place projections, SROA/inlining/DCE/monomorphization           |
+| **`RDG-14`** | [`docs/research/DR-14.md`](docs/research/DR-14.md) | Phase 3 / 10 / 10.5      | Canonical CST pretty-printer (`corex fmt`), zero-legacy automated spec migration engine (`corex upgrade`)         |
+| **`RDG-15`** | [`docs/research/DR-15.md`](docs/research/DR-15.md) | Phase 11.1–11.3 / 13     | Bootstrap `.cx` `cx.*` (`Phase 11.1`–`11.3`) and post-`v0.0.1` `HTTP/2`, `TLS 1.3`, `cx.tui`, & `cx.ui` (`13`)    |
+| **`RDG-16`** | [`docs/research/DR-16.md`](docs/research/DR-16.md) | Phase 9 (Seam) / 13.2    | Dependency-conflict solution synthesis, security-aware ranking, and lossless `corex.toml` interactive/LSP fix     |
+| **`RDG-17`** | [`docs/research/DR-17.md`](docs/research/DR-17.md) | Phase 6 / 9 / 10         | Zero-annotation `MIR` call-graph capability inference, supply-chain sandboxing, and `@no_alloc` / `@no_panic`     |
+| **`RDG-18`** | [`docs/research/DR-18.md`](docs/research/DR-18.md) | Phase 7 / 8 / 11.3       | Deterministic `Context` simulation testing (`corex test --sim`) and native coverage fuzzing (`corex test --fuzz`) |
+| **`RDG-19`** | [`docs/research/DR-19.md`](docs/research/DR-19.md) | Phase 7 (Seam) / 13      | Stateful live hot-code reloading (`corex run --watch`), `@must_vectorize` SIMD contracts, and VOPR cluster sim    |
+| **`RDG-20`** | [`docs/research/DR-20.md`](docs/research/DR-20.md) | Phases 6–13              | Holistic superpower catalog (`D-01`–`D-11`), soundness/ABI fixes (`Prune-01`–`07`), and `195-LOC` seam map        |
+| **`RDG-21`** | [`docs/research/DR-21.md`](docs/research/DR-21.md) | Phase 7.5 / Phases 8–13  | `cx.*` standard namespace, unified `.` path separator (retiring `::`), and `SE-01`–`SE-08` surface elevations     |
+| **`RDG-22`** | [`docs/research/DR-22.md`](docs/research/DR-22.md) | Phase 7.6 / Phases 8–13  | Canonical CoreX v1.0 surface lock (`ADR-22A`–`22F`), `120`-token table, and `SE-09`–`SE-23` zero-cost advantages  |
 
 ---
 
@@ -88,7 +88,7 @@ Regardless of the specific surface grammar (`RDG-03`) or backend (`RDG-09`) sele
     -   `DiagnosticSink` enforces an explicit upper bound on emitted errors (`max_errors: u32 = 100`) per `AGENTS.md` Section 2 before halting emission with a summary note.
     -   Renders exclusively through the centralized terminal renderer (`.agents/skills/docs/SKILL.md` §4 and `DR-15.md` §2.1.2) using ANSI escape sequences and monochrome Unicode box-drawing characters (`╭`, `│`, `╰`, `├`, `─`, `▸`, `•`, `✓`, `✗`, `⚠`), respecting `NO_COLOR`, `--color=always|auto|never`, and terminal width detection.
 6.  **Canonical Cross-Report Specification Invariants (`DR-01`–`DR-22`):**
-    -   **Unified Binary Name:** The compiler and toolchain binary is always **`corex`** (`build/stage0/corex`, `build/stage1/corex`, `build/stage2/corex`).
+    -   **Unified Binary Name:** The compiler and toolchain binary is always **`corex`** (`build/stage0/corex`, `build/stage1/corex`, `build/stage2/corex`, `build/stage3/corex`).
     -   **Error Handling Model & ABI (`DR-03`, `DR-07`, `DR-20` `Fix-07` / `Prune-03`–`04`, `DR-21` `SE-03`, `DR-22` `ADR-22C`):** CoreX uses payload-first algebraic **`T!E`** (`Result[T, E]`) and **`T?`** (`Option[T]`) with postfix **`expr?`** propagation, infix **`expr catch |err| { … }`** (for `T!E`), infix **`expr orelse fallback`** (for `T?`, retiring `Option.unwrap` and `Option.unwrap_or`), `@derive(From)` nominal error upcasting (`SE-10`), and lexical **`defer` / `errdefer`**. On unmodified LLVM 20–23 (`corex_llvm.cpp`), `cx_result_cc` lowers onto `swiftcc` + `swifterror` (`R12` on `x86_64`, `X21` on `AArch64`, `X19` on `Arm64EC`, plus 4 payload GPRs) with zero C++ LSDA personality bloat and mandatory minimal `.pdata`/`.xdata` frame unwind descriptors on Windows.
     -   **Parameter Modes & Surface Borrowing (`DR-02`, `DR-03`, `DR-06`, `DR-15`, `DR-20` `Fix-06B`, `DR-22` `ADR-22B`):** Surface `.cx` syntax uses **`[var] x: T`** (`Copy` by-value, `var` mutates callee copy only), **`x: &T`** (shared immutable borrow), **`x: &mut T`** (exclusive mutable borrow), **`[var] x: own T`** (consuming move transfer requiring active call-site `own` on named `~Copy` values), and **`x: &out T`** (uninitialized out-parameter, retiring `ref`, `inout`, `sink`, `set`, and `let mut`), lowering 1-to-1 into `HIR`/`MIR` parameter modes **`let`**, **`inout`**, **`sink`**, and **`set`**, with post-`yield` `subscript` writebacks lowered onto all normal and `?` exit edges (`DR-20` `Fix-06B`, `DR-22` `SE-21`).
     -   **Square-Bracket Generics (`DR-03`, `DR-22` `SE-09`–`SE-10`):** Generic parameters and arguments always use square brackets **`[T]`** (`Vec[T]`, `SlotMap[K, V]`, inline union bounds `[Data: str | &[u8]]`, and type/const defaults `[H: Hasher = WyHasher]`).
@@ -272,32 +272,124 @@ Regardless of the specific surface grammar (`RDG-03`) or backend (`RDG-09`) sele
     -   LSP replay benchmark asserting `< 10 ms` P99 keystroke-to-diagnostic and completion latency on a 100,000-LOC workspace.
     -   Migration round-trip tests verifying automated `.cx` upgrades across synthetic specification changes.
 
+### Phase 10.5: Local IDE Support – Official VS Code Extension v0.1 (`vscode-ext-corex`)
+
+-   **Prerequisite Gates:** **`Phase 10`** (`corex lsp` & `corex fmt` live in `build/stage0/corex`), **`RDG-12`** ([`docs/research/DR-12.md`](docs/research/DR-12.md) – LSP Protocol & Semantic Tokens), **`RDG-14`** ([`docs/research/DR-14.md`](docs/research/DR-14.md) – `corex fmt` Integration), **`RDG-21`** ([`docs/research/DR-21.md`](docs/research/DR-21.md)), **`RDG-22`** ([`docs/research/DR-22.md`](docs/research/DR-22.md) – `120` `TokenKind`s & `70` Keywords/Primitives).
+-   **Target Workspace, Gold-Standard Reference Repos & Rationale:** Implemented in the dedicated sibling repository **`corex-lang/vscode-ext-corex`** (cloned locally alongside `corex` at `../vscode-ext-corex`, keeping `corex-lang/corex` 100% free of Node/TypeScript extension packaging artifacts per [`docs/LAUNCH.md`](docs/LAUNCH.md) §1), using **`xulbux/vscode-theme-isolux`** (`../vscode-theme-isolux`) and **`xulbux/vscode-ext-color-tracr`** (`../vscode-ext-color-tracr`) as canonical gold-standard reference repositories for directory layout, `README.md` / `CHANGELOG.md` / asset structure, TypeScript/bundler/linter configuration (`pnpm`, `esbuild`, `vitest`, `.oxfmtrc.json`, `.oxlintrc.json`, `.markdownlint.json`), and code style. Building and locally dogfooding the extension immediately after `Phase 10` provides full IDE syntax highlighting, live `corex lsp` diagnostics/hover/navigation, and format-on-save (`corex fmt`) *before* authoring ~35K–60K lines of `.cx` across `stdlib/cx/` (`Phase 11.1`–`11.3`) and `compiler/` (`Phase 12.1`–`12.7`).
+-   **Deliverables:**
+    1.  **Agent Rules, Skills & Tooling Bootstrap (Mandatory First Step):**
+        -   Before writing any extension code or documentation, inspect `../vscode-theme-isolux` and `../vscode-ext-color-tracr` (`xulbux/vscode-theme-isolux` & `xulbux/vscode-ext-color-tracr`), synthesize and copy their `.agents/AGENTS.md` policies and `.agents/skills/*` workflows (plus `.oxfmtrc.json`, `.oxlintrc.json`, `.markdownlint.json`, and `tsconfig.json` baselines) into `../vscode-ext-corex/.agents/`, and enforce those rules strictly from the very first file onward.
+    2.  **Complete CoreX v1.0 TextMate Grammar (`syntaxes/corex.tmLanguage.json`, root scope `source.corex`):**
+        -   Cover all `120` `TokenKind`s and `70` keywords/primitives locked in `DR-22`: control, declaration, MVS ownership, and boolean keywords (`fn`, `struct`, `enum`, `bit_field`, `trait`, `impl`, `subscript`, `yield`, `use`, `pub`, `own`, `with`, `context`, `orelse`, `is`, `and`, `or`, `not`, `async`, `await`, `test`, `bench`, `unsafe`, `comptime`), all `20` built-in primitives (`i8`–`i128`, `u8`–`u128`, `isize`, `usize`, `f32`, `f64`, `bool`, `char`, `str`, `unit`, `never`, `opaque`), built-in Constrained Type Groups (`Number`, `Integer`, `Signed`, `Unsigned`, `Float`, `ByteSlice`), `PascalCase` nominal types/variants, `SCREAMING_SNAKE_CASE` constants, `@attr(k: v)` annotations, `:label` / `label:` loop and `match` labels, single-line `"…"`, indent-stripped multiline `"""…"""`, raw `r#"…"#` / `r#"""…"""#`, byte `b'x'` / `b"…"` / `br#"…"#`, nested `{expr=:#06x}` interpolation holes, `{{` / `}}` escapes, and `_`-separated numeric suffixes (`0x4358_u32`, `0.5_f32`).
+        -   Assign standard TextMate scope names (`keyword.control.corex`, `storage.type.corex`, `entity.name.function.corex`, `entity.name.type.corex`, etc.) so future `github-linguist/linguist` submodule vendoring highlights `.cx` cleanly without semantic-token fallback.
+    3.  **Language Configuration (`language-configuration.json`):**
+        -   Configure `//`, `///`, and `//!` line comments, `/* … */` block comments, bracket matching and auto-closing pairs (`{}`, `[]`, `()`, `""`, `"""…"""`), smart block indentation, and syntax folding markers.
+    4.  **Zero-Config `corex lsp` & `corex fmt` Client (`src/extension.ts`):**
+        -   Lightweight `vscode-languageclient` integration spawning `corex lsp` over JSON-RPC stdio, wiring document formatting and format-on-save to `corex fmt`, and resolving the `corex` binary via `corex.executablePath` or workspace auto-discovery (`build/stage0/corex` during `Phase 11`–`12.5` and self-hosted `corex` from `Phase 12.6` onward).
+    5.  **Local `.vsix` Packaging & Dogfooding Install:**
+        -   Package and install `vscode-ext-corex` locally into VS Code / Antigravity / VSCodium for `Phase 11`–`12` development (deferring public Visual Studio Marketplace and OpenVSX publishing to [`docs/LAUNCH.md`](docs/LAUNCH.md) Stage `L1` at `v0.0.1` launch).
+-   **Verification Gate:**
+    -   Automated TextMate grammar snapshot suite across all `core/**/*.cx` files and [`docs/COMPARISONS.md`](docs/COMPARISONS.md) showcases asserting zero un-scoped syntax tokens, paired with headless LSP client smoke tests (`diagnostics`, `hover`, `definition`, `formatting`) against `build/stage0/corex lsp`.
+
 ### Phase 11: Bootstrap `cx.*` Standard Library & Verification Harnesses (`--sim` & `--fuzz`)
 
 -   **Prerequisite Gates:** **`RDG-08`** ([`docs/research/DR-08.md`](docs/research/DR-08.md) – Structured Concurrency), **`RDG-15`** ([`docs/research/DR-15.md`](docs/research/DR-15.md) – Core Standard Library Architecture), **`RDG-18`** ([`docs/research/DR-18.md`](docs/research/DR-18.md) – Deterministic `--sim` & `--fuzz`), **`RDG-20`** ([`docs/research/DR-20.md`](docs/research/DR-20.md) – Audit 3.6 & `Prune-07` Self-Hosting Partition), **`RDG-21`** ([`docs/research/DR-21.md`](docs/research/DR-21.md) – `cx.*` Namespace & Surface Idioms), **`RDG-22`** ([`docs/research/DR-22.md`](docs/research/DR-22.md) – Canonical v1.0 Surface & `FmtArgs` / `test` / `@builder` Seams).
--   **Deliverables:**
-    Implement the tree-shakeable bootstrap `cx.*` standard modules in `.cx` (`stdlib/cx/*.cx`) required to self-host `compiler/*.cx`, `corex lsp`, `corex fmt`, and `corex pkg` (deferring non-bootstrap UI/HTTP2/TUI megaprojects to `Phase 13.1`–`13.4` per `DR-20` `Prune-07`):
-    1.  `cx` prelude, `cx.mem` & `cx.col` – Allocators (`Arena`, `Pool`, `FixedBuffer`, `System`, 2-slot `Context.scratch`), zero-`unsafe` `view_bytes` / `as_bytes` (`D-01`), `Vec`, `#soa Vec`, `String`, `SmallVec`, `Deque`, `SlotMap`, and `Context.rng`-seeded `Map`/`Set` (`DR-20` `Fix-18A`).
-    2.  `cx.str`, `cx.io` & `cx.fs` – UTF-8 formatting, buffered/zero-copy readers and writers, `resolve_path` / `resolve_or_create_path`, filesystem watcher, and memory-mapped files.
-    3.  `cx.cli` & `cx.serde` – Declarative zero-allocation CLI argument/subcommand parser, monochrome Unicode box-drawing/diff/progress renderers, `simdjson`-style JSON tape codec (for `corex lsp`), and lossless `corex.toml` parser.
-    4.  `cx.crypto`, `cx.time`, `cx.async` & `cx.net`/`cx.http` (Bootstrap Subset) – `blake3`, `sha256`, and `ed25519_verify`, monotonic clocks, deterministic single-threaded `TaskGroup` runner validating `RDG-08` lowering, and a `Span16` HTTP/1.1 client + OS socket/TLS sysroot wrapper for `corex pkg` downloads.
-    5.  `cx.test` & `cx.bench` – Unit/snapshot assertions, **single-process deterministic virtual-time/scheduler/`OOM` simulation (`corex test --sim --seed`, `RDG-18`, warning on `&x as usize` casts per `Fix-18A`)**, **zero-config coverage-guided native fuzzing & shrinking (`corex test --fuzz`, `RDG-18`)**, `MirVm` differential oracle, and monotonic wall-clock micro-benchmarking.
--   **Verification Gate:**
-    -   100% test coverage of all Phase 11 `cx.*` modules compiled and executed via `corex test` (including `--sim` seed replay and `--fuzz` shrinking tests) across Linux, macOS, Windows, and `wasm32`.
-    -   Tree-shaking verification: a minimal `cx.cli` hello-world program links only referenced functions and meets the binary size and `< 1.5 ms` cold-start budget.
+-   **Bootstrap Scope Boundary (`DR-20` `Prune-07`):** Implement the tree-shakeable bootstrap `cx.*` standard modules in `.cx` (`stdlib/cx/*.cx`) required to write and verify `compiler/*.cx`, `corex lsp`, `corex fmt`, `corex upgrade`, and `corex` package management across three independently gated sub-phases (`Phase 11.1`–`11.3`), while deferring non-bootstrap application megaprojects (`HTTP/2`, `TLS 1.3`, `cx.tui`, and `cx.ui`) to `Phase 13.1`–`13.4` so they are engineered once on the self-hosted toolchain.
 
-### Phase 12: Self-Hosting Compiler Rewrite (`.cx`), Bootstrap Fixed-Point & `v0.0.1` Initial Release
+#### Phase 11.1: Core Memory, Strings & Data-Oriented Collections (`cx` Prelude, `cx.mem`, `cx.str`, `cx.col`)
 
--   **Prerequisite Gate:** All prior phases (`Phase 0`–`Phase 11`), `RDG-01`–`RDG-15`, `RDG-17`, `RDG-18`, `RDG-20`–`RDG-22`, and all seven `Pre-v0.0.1` seams (`195 LOC` per [`docs/research/DR-20.md`](docs/research/DR-20.md)) complete.
 -   **Deliverables:**
-    1.  Rewrite the entire CoreX compiler, memory/SAST & capability verifier, `-ofmt=c` & LLVM backend drivers, package manager, formatter, upgrader, and LSP in **CoreX itself** (`compiler/*.cx`), utilizing `cx.cli` for monochrome terminal diagnostics and progress rendering.
-    2.  Execute the **3-Stage Bootstrap Verification Pipeline** (`build` skill):
-        -   `Stage 0` (host bootstrap compiler) compiles `compiler/*.cx` → produces `stage1/corex`.
-        -   `Stage 1` (`stage1/corex`) compiles `compiler/*.cx` → produces `stage2/corex`.
-        -   `Stage 2` (`stage2/corex`) compiles `compiler/*.cx` → produces `stage3/corex`.
-        -   Verify **byte-for-byte SHA-256 identity** between `stage2/corex` and `stage3/corex` across all target platforms.
-    3.  Retire the Stage 0 Zig source tree in favor of the committed `stage1/corex1.wasm.zst` (`-ofmt=c`) seed + ~4,000-LOC C99 `wasm2c` shim (`RDG-01`, `DR-20` Audit 3.1) so `corex-lang/corex` is 100% self-hosted in `.cx`.
-    4.  Run a 72-hour continuous differential fuzzing campaign (`corex test --diff-backends` & `--fuzz`), full SAST self-verification (`corex check compiler/`), and full C/Rust benchmark suite comparison for the **CoreX `v0.0.1`** initial self-hosted release.
+    1.  **`cx` Prelude & `cx.mem` (`stdlib/cx/{mod,mem}.cx`):** `Allocator` trait, 1-bit LSB-tagged `AllocatorHandle` (`context.allocator` implicit path vs. explicit `&mut Arena` override with static `TrivialDrop` destructor elision), `@linear` 64 KiB page-slab `Arena` (`BumpArena`), `Pool`, `FixedBuffer`, `System`, 2-slot `Context.scratch[0..2]` ping-pong helpers (`D-04`), `Span16`, and zero-`unsafe` layout-verified `view_bytes` / `as_bytes` (`FromBytes` / `IntoBytes`, `D-01`).
+    2.  **`cx.col` (`stdlib/cx/col.cx`):** 24-byte `AutoDrop` `Vec[T]`, `#soa Vec[T]`, `SmallVec[T, N]`, `Deque[T]` (`RingBuf[T]`), generational `SlotMap[K, V]`, and `Context.rng`-seeded SwissTable `Map[K, V]` & `Set[T]` (`DR-20` `Fix-18A`) engineered for Pointer-Shape ICF deduplication.
+    3.  **`cx.str` (`stdlib/cx/str.cx`):** 24-byte SSO `String`, SIMD UTF-8 validation, `comptime`-frozen `.rodata` Unicode width (`wcwidth`) and grapheme (`UAX #29`) lookup tables (zero pre-`main` runtime initializers), and zero-allocation `FmtArgs` / `FormatSpec` formatters (`SE-12`).
+-   **Verification Gate (`11.1`):**
+    -   100% `corex test` coverage, `corex check --sast-strict` cleanliness, and 4-tier `--diff-backends` (`Pre-Opt MirVm`, `Post-Opt MirVm`, `-ofmt=c`, `LLVM`) parity across Linux, macOS, Windows, and `wasm32`, verifying zero-instruction `Arena` `TrivialDrop` elision.
+
+#### Phase 11.2: I/O, Filesystem, Clocks, Crypto, Structured Async & Bootstrap Networking (`cx.io`, `cx.fs`, `cx.time`, `cx.crypto`, `cx.async`, `cx.net`/`cx.http`)
+
+-   **Deliverables:**
+    1.  **`cx.io`, `cx.fs` & `cx.time` (`stdlib/cx/{io,fs,time}.cx`):** Buffered and zero-copy readers/writers, `@linear` `File` / `Dir` / `Mmap` (`< 16 KiB` arena read vs. `>= 16 KiB` read-only `mmap`), `resolve_path` and `resolve_or_create_path`, `UnlinkAndReplace` atomic file publishing (`Prune-02`), filesystem change watcher, and monotonic/wall clocks routed through `Context.reactor`.
+    2.  **`cx.crypto` (`stdlib/cx/crypto.cx`):** `blake3` (including keyed `.cxi` and Bao chunk tree hashing), `sha256`, `ed25519_verify`, `Wyhash`, and `Csprng` (`Context.rng`).
+    3.  **`cx.async` & Bootstrap `cx.net` / `cx.http` (`stdlib/cx/{async,net,http}.cx`):** Deterministic single-threaded `TaskGroup[E]` / `@linear` `TaskHandle[T]` runner + `CompletionReaper` validating Phase 8 `RDG-08` lowering, paired with the `Span16` HTTP/1.1 client and OS socket/TLS sysroot wrapper required for self-hosted package downloads (`Prune-07`).
+-   **Verification Gate (`11.2`):**
+    -   100% cross-platform `corex test` coverage (Windows, POSIX, and `wasm32-wasi` VFS paths), official NIST/BLAKE3/Ed25519 cryptographic test vectors, structured cancellation/reaper leak verification (`E0304`), and local loopback HTTP/1.1 fetch tests.
+
+#### Phase 11.3: CLI Renderer, JSON/TOML Codecs & Verification Harnesses (`cx.cli`, `cx.serde`, `cx.test`, `cx.bench`)
+
+-   **Deliverables:**
+    1.  **`cx.cli` (`stdlib/cx/cli.cx`):** Declarative `comptime`-validated zero-allocation `argv` subcommand/flag parser and the canonical monochrome Unicode + ANSI terminal rendering engine (`╭`, `│`, `╰`, `├`, `─`, `▸`, `•`, `✓`, `✗`, `⚠`, multi-span source snippets, `TextEdit` diff previews, tables, and progress indicators).
+    2.  **`cx.serde` (`stdlib/cx/serde.cx`):** Two-stage `simdjson`-style 64-bit `JsonTape` codec (powering self-hosted `corex lsp` JSON-RPC) and lossless CST-backed `corex.toml` / `corex.lock` parser and surgical patcher.
+    3.  **`cx.test` & `cx.bench` (`stdlib/cx/{test,bench}.cx`):** Unit and golden-snapshot assertions, **single-process deterministic virtual-time/scheduler/`OOM` simulation (`corex test --sim --seed`, `RDG-18`, enforcing `W0332` / `Fix-18A` determinism guards)**, **zero-config coverage-guided native fuzzing & input shrinking (`corex test --fuzz`, `RDG-18`)**, `MirVm` differential oracle integration, and MAD-filtered monotonic wall-clock micro-benchmarking.
+-   **Verification Gate (`11.3`):**
+    -   100% test coverage across all `Phase 11.1`–`11.3` `stdlib/cx/*.cx` modules, bit-exact `--sim --seed` deterministic replay verification, `--fuzz` crash-discovery & shrinking tests, and tree-shaking verification confirming a minimal `cx.cli` hello-world binary links only referenced symbols (`< 1.5 ms` cold-start, `< 10 KB` freestanding `.wasm`).
+
+### Phase 12: Modular Self-Hosting Compiler Rewrite (`compiler/*.cx`), Bootstrap Fixed-Point & `v0.0.1` Initial Release
+
+-   **Prerequisite Gate:** All prior phases (`Phase 0`–`Phase 11.3`, including local IDE support in `Phase 10.5`), `RDG-01`–`RDG-15`, `RDG-17`, `RDG-18`, `RDG-20`–`RDG-22`, and all seven `Pre-v0.0.1` seams (`195 LOC` per [`docs/research/DR-20.md`](docs/research/DR-20.md)) complete.
+-   **Zero-Breakage Side-by-Side Rewrite Strategy:**
+    -   Throughout `Phase 12.1`–`12.6`, the verified Stage-0 Zig compiler (`stage0/` → `build/stage0/corex`) remains **100% intact on `main`** side-by-side with the new self-hosted `compiler/*.cx` tree, so an in-progress `.cx` compiler change can never break the host toolchain.
+    -   `build/stage0/corex` acts simultaneously as the stable host compiler building `compiler/*.cx` (`build/stage1/corex`) and as an **automated differential reference oracle** verifying byte-for-byte behavioral parity at the end of every single sub-phase before advancing.
+    -   The existing C++20 LLVM 20–23 / `lld` static bridge (`corex_llvm.h` / `corex_llvm.cpp`) is linked directly by `compiler/*.cx` via Phase 8 `extern "C"` FFI with **zero C++ rewrite**.
+    -   Completing self-hosting prior to tagging `v0.0.1` eliminates maintaining dual Zig + `.cx` compiler codebases across `0.x` releases (`Phase 13.0`–`13.4` are written `1x` in `.cx`), while `Phase 12.7` commits the portable C99 + `corex1.wasm.zst` bootstrap seed and saves an offline `stage0` archive bundle before retiring `stage0/`.
+
+#### Phase 12.1: Foundation Arenas, VFS, Diagnostics & High-Speed Lexer (`compiler/{mem,vfs,diag,lexer}.cx`)
+
+-   **Deliverables:**
+    1.  Port `BumpArena`, `StringInterner` (`Wyhash(0)`), compact 32-bit entity handles (`FileId`, `Span`, `SymbolId`, `TokenId`, `CstNodeId`, `AstNodeId`, `HirId`, `MirBlockId`, `MirValueId`, `TypeId`, `ScopeId`, `RegionId`, `DiagId`), and `VfsSourceMap` (`< 16 KiB` arena buffers, `>= 16 KiB` `mmap`, `.cxtree` virtual mounts, and SIMD `LineIndex`).
+    2.  Port `DiagnosticSink` (`DIAGNOSTIC_CATALOG`, 100-error cap), `TransactionalPatcher`, monochrome `DiagnosticRenderer` (powered by `cx.cli`), and the non-backtracking `120`-token DFA `Lexer` (`TokenBuffer` SoA + lossless `TriviaPiece` streams).
+-   **Differential Gate (`12.1`):**
+    -   100% byte-for-byte `TokenBuffer`, `TriviaPiece`, `LineIndex`, and `E01xx`/`W01xx` diagnostic parity between `stage0` and `stage1` across `core/`, `stdlib/cx/`, `tests/`, and 1,000,000 fuzzed inputs (`>= 2 GB/sec` lexer throughput).
+
+#### Phase 12.2: Incremental Lossless CST/AST Parser, Formatter (`fmt`) & Upgrader (`compiler/{syntax,parser,fmt,upgrade}.cx`)
+
+-   **Deliverables:**
+    1.  Port `LosslessCstArena`, `AstArena` (`13B` zero-padding SoA nodes + `extra_data`), and the fault-tolerant recursive-descent + 15-tier Pratt `Parser` (`TokenSet128` recovery anchors, `MAX_PARSE_DEPTH = 512`, semantic holes, and item-boundary `reparseIncremental`).
+    2.  Port the steerable Wadler–Lindig `DocArena` formatter (`corex fmt`) and rule-driven CST migration engine (`corex upgrade` covering `UR-21-00`–`UR-21-07` and `UR-22-00`–`UR-22-06`).
+-   **Differential Gate (`12.2`):**
+    -   Bit-for-bit CST lossless round-tripping and **100% byte-for-byte `corex fmt` and `corex upgrade` output identity** (`stage0 fmt` === `stage1 fmt`) across `core/`, `stdlib/cx/`, `compiler/`, and the Phase 2–3 fuzz corpora.
+
+#### Phase 12.3: Incremental `CompilerDb`, Name Resolution & Bidirectional Type System (`compiler/{query_db,resolve,types}.cx`)
+
+-   **Deliverables:**
+    1.  Port the demand-driven incremental `CompilerDb` (`Fingerprint128`, 3-tier `Durability`, Early Cutoff backdating, `ItemTree` signature/body firewall projections, cycle detection, and cooperative cancellation).
+    2.  Port `ScopeArena` / `SymbolTable` (4-tier `private` < `pub(super)` < `pub(pkg)` < `pub` visibility, per-package root scopes, typo suggestions) and the `14B` SoA `TypeArena` bidirectional constraint solver (Constrained Type Groups, `[T: A | B]` union bounds, `T!E` / `T?`, MVS parameter modes, `/` & `*` zones, `@cfg`, `@derive(From)`, Maranget exhaustiveness, and `.cxi` `cxi_blake3` digest seam).
+-   **Differential Gate (`12.3`):**
+    -   Identical resolved `DefId` bindings, interned `TypeLayout` sizes/alignments/field offsets, `.cxi` BLAKE3 digests, and `E04xx`/`W04xx` diagnostics between `stage0` and `stage1` across the entire `compile_fail` and `run_pass` suites.
+
+#### Phase 12.4: `HIR`, SSA `MIR`, Stackless `async`, `MirVm` (`comptime`) & `MIR` Optimizer (`compiler/{hir,mir,mir_async,mir_vm,mir_opt}.cx`)
+
+-   **Deliverables:**
+    1.  Port `AST → HIR` desugaring, Braun single-pass forward SSA `MIR` construction (`16B` `MirInst`, `32B` `MirBasicBlock`, place projections, `switch_int` decision trees, LIFO `defer`/`errdefer`, Ghost borrow/storage ops, and mandatory `MirVerifier` `V1`–`V6`), and stackless `mir_async` coroutine/nursery lowering (`<= 16 KiB` inline frame caps + `sim_seam`).
+    2.  Port the hermetic `MirVm` `comptime` interpreter (`RegSlot`, spatial/temporal provenance, `--comptime-limit` fuel, reflection builtins, `RodataPool`, `PureCallMemoCache`) and dual-mode `mir_opt` (`--dev` `D1`–`D5`, `--release` `R1`–`R6`, and `LayoutShapeKey` monomorphizer).
+-   **Differential Gate (`12.4`):**
+    -   100% `MirVerifier` pass cleanliness and bit-identical `MirVm` evaluation outputs, `.rodata` blobs, and `E05xx`/`W05xx` diagnostics between `stage0` and `stage1` across both `--dev` and `--release`.
+
+#### Phase 12.5: Zero-GC Drop Elaboration & 4-Pass `SAST` Verifier (`compiler/mir_sast.cx`)
+
+-   **Deliverables:**
+    1.  Port `ElaborateDrops` (`Copy`, `AutoDrop`, `@linear`, `AllocatorHandle` arena destructor elision, `subscript` `yield` vacate guards, `FromBytes`/`IntoBytes`/`@zero_pad`, and 2-slot `Context.scratch[0..2]` exclusivity) and Pass 2 `MovePathNode` RPO typestate + backward NLL loan tightening (`E0301`–`E0306`, `E0313`, `W0308`).
+    2.  Port Pass 3 Tarjan $O(V + E)$ SCC region/escape + `EffectCapabilityMask` + `@max_stack(N)` + `@no_alloc`/`@no_panic`/`@no_block` + FFI `@null_terminated`/`@slice_len`/`@consumes` contract verification, Pass 4 `Intv` + Demand-Sliced Sparse ABCD Pentagon (`MAX_SUB_VARS = 256`) bounds-check elimination (`E0307`), and Phase 6 seams (`is_secret`, `trace_sink`).
+-   **Differential Gate (`12.5`):**
+    -   Zero false positives and zero false negatives vs. `stage0` across every `compile_fail/memory/` CWE suite, **plus `stage1` SAST-verifies `core/`, `stdlib/cx/`, and its own `compiler/*.cx` source tree (`corex check --sast-strict compiler/`) with zero errors or warnings**.
+
+#### Phase 12.6: Native/Wasm Codegen Drivers (`-ofmt=c` & `LLVM`), C11/C23 FFI & 3-Stage Fixed-Point Bootstrap (`compiler/{codegen_abi,codegen_c,codegen_llvm,codegen_link,c_frontend,c_translate}.cx`)
+
+-   **Deliverables:**
+    1.  Port `AbiClassifier` (all 11 targets + `swiftcc`/`swifterror` `cx_result_cc`), Tier A (`codegen_c.cx` deterministic ISO C99 emitter), Tier B (`codegen_llvm.cx` emitting LLVM 20–23 IR + linking `corex_llvm.{h,cpp}` directly via `extern "C"` alongside `codegen_dev_seam` and `--fuzz` `SanitizerCoverage`), `codegen_link.cx` (in-process `lld` flavors, archive & PE `.def`→`.lib` synthesis, `UnlinkAndReplace`), and zero-`libclang` `c_frontend.cx` + `c_translate.cx` (`@c_import` & `corex translate-c`).
+    2.  Execute the **3-Stage Self-Hosting Fixed-Point Pipeline** (`build` skill):
+        -   `Stage 0` (`build/stage0/corex`, Zig) compiles `compiler/*.cx` → produces `build/stage1/corex`.
+        -   `Stage 1` (`build/stage1/corex`, CoreX) compiles `compiler/*.cx` → produces `build/stage2/corex`.
+        -   `Stage 2` (`build/stage2/corex`, CoreX) compiles `compiler/*.cx` → produces `build/stage3/corex`.
+-   **Verification Gate (`12.6`):**
+    -   **Byte-for-byte SHA-256 identity between `build/stage2/corex` and `build/stage3/corex`** across Linux, macOS, Windows, and `wasm32`, plus 100% 4-tier `diff_oracle` parity across the entire repository test corpus.
+
+#### Phase 12.7: Self-Hosted Package Manager, `corex lsp`, Unified CLI, `corex1.wasm.zst` Seed & `stage0/` Retirement (`v0.0.1`)
+
+-   **Deliverables:**
+    1.  Port `pkg_manifest.cx`, `pkg_cache.cx`, and `pkg_resolver.cx` (Bounded-MVS + PubGrub + `pkg_conflict_seam` + `pkg_cxi_seam` + `corex.lock` supply-chain capability sandboxing), `lsp_server.cx` (`< 10 ms` P99 latency over `cx.serde` JSON-RPC, seamlessly backing `vscode-ext-corex`), and the unified `compiler/main.cx` CLI router (`bench`, `build`, `check`, `fmt`, `lsp`, `run`, `test`, `translate-c`, `upgrade`).
+    2.  Relocate `corex_llvm.{h,cpp}` into `compiler/llvm_bridge/` and generate the permanent zero-Zig C99 bootstrap seed (`bootstrap.c`, `stage1/wasm2c.c`, `stage1/wasi.c`, `stage1/compiler_rt.c`, and compressed `stage1/corex1.wasm.zst` per [`docs/research/DR-01.md`](docs/research/DR-01.md) §5) so any fresh Linux, macOS, or Windows host with only a C99 compiler (`cc`, `clang`, `gcc`, or `cl.exe`) builds `corex1 → stage2 → stage3` offline with `stage2 === stage3` SHA-256 identity.
+    3.  Archive the full pre-retirement Stage-0 Zig history into a private/local Git bundle (`../corex-stage0-zig-archive.bundle`, kept off the public squashed `main` history per [`docs/LAUNCH.md`](docs/LAUNCH.md) Stage `L4`) and retire `stage0/` + Zig-only build files so `corex-lang/corex` is 100% self-hosted in `.cx`.
+    4.  Run a 72-hour continuous differential fuzzing campaign (`corex test --diff-backends` & `--fuzz`), full self-hosted SAST audit (`corex check --sast-strict core/ stdlib/ compiler/`), and full C/Rust benchmark suite comparison (`bench` skill) for the **CoreX `v0.0.1`** initial self-hosted release.
 
 ### Phase 13: Post-`v0.0.1` (`0.x` → `v1.0.0` Stable) Self-Hosted Capabilities (Written `1x` in `.cx`)
 

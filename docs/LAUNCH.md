@@ -11,7 +11,7 @@ Keeping web assets, editor grammars, and starter templates in dedicated reposito
 | Repository | Purpose | License |
 | :--- | :--- | :--- |
 | `corex-lang/corex` | Self-hosted CoreX compiler, SAST/MVS verifier, `cx.*` standard library, and unified `corex` CLI (`bench`, `build`, `check`, `doc`, `fmt`, `init`, `lsp`, `run`, `test`, `translate-c`, `upgrade`). | MIT / Apache-2.0 |
-| `corex-lang/vscode-ext-corex` | Official VS Code & OpenVSX extension (`syntaxes/corex.tmLanguage.json` TextMate grammar + `corex lsp` client). Vendored as a Git submodule by `github-linguist/linguist`. | MIT |
+| `corex-lang/vscode-ext-corex` | Official VS Code & OpenVSX extension (`syntaxes/corex.tmLanguage.json` TextMate grammar + `corex lsp` client; developed locally in sibling workspace `../vscode-ext-corex` during `Phase 10.5` and published publicly in Stage `L1`). Vendored as a Git submodule by `github-linguist/linguist`. | MIT |
 | `corex-lang/website` | Official CoreX website, client-side WASM playground, interactive comparisons, benchmarks, language tour, and searchable `cx.*` API documentation. | MIT |
 | `corex-lang/setup-corex` | Official GitHub Action (`uses: corex-lang/setup-corex@v1`) installing pre-built `corex` binaries in `< 2 s` for CI workflows. | MIT |
 | `corex-lang/corex-starter` | Official minimal **GitHub Template Repository** (`corex.toml`, `src/main.cx`, CI workflow, `.gitattributes`). | MIT-0 / MIT |
@@ -48,20 +48,21 @@ Immediately after `Phase 12` achieves 3-stage self-hosting SHA-256 fixed-point p
 
 ---
 
-## 3. Stage `L1` – Editor Polish & GitHub PrettyLights Readiness (`vscode-ext-corex`)
+## 3. Stage `L1` – Editor Polish, PrettyLights Verification & Marketplace Publishing (`vscode-ext-corex`)
 
-GitHub's web code viewer (**PrettyLights**) highlights `.cx` files and ```` ```cx ```` Markdown blocks purely via static **TextMate regular expressions** (`syntaxes/corex.tmLanguage.json`); it never runs `corex lsp`.
+The core extension (`syntaxes/corex.tmLanguage.json`, `language-configuration.json`, and the `corex lsp` / `corex fmt` client inside sibling workspace `../vscode-ext-corex`, modeled strictly after `xulbux/vscode-theme-isolux` and `xulbux/vscode-ext-color-tracr` and their `.agents/` rules/skills) is built and dogfooded locally starting in [`PLAN.md`](../PLAN.md) **`Phase 10.5`** so `Phase 11` (`stdlib/cx/*.cx`) and `Phase 12` (`compiler/*.cx`) are authored with full IDE support. Because GitHub's web code viewer (**PrettyLights**) highlights `.cx` files and ```` ```cx ```` Markdown blocks purely via static **TextMate regular expressions** without running `corex lsp`, Stage `L1` performs final grammar verification, branding polish, and public Marketplace release:
 
-1.  **Comprehensive v1.0 TextMate Grammar (`corex.tmLanguage.json`):**
-    -   Cover all 120 `TokenKind`s and 70 keywords/primitives locked in `DR-22`:
+1.  **v1.0 TextMate Grammar & Release Binary Audit (`corex.tmLanguage.json` & `src/extension.ts`):**
+    -   Verify complete scope coverage across all 120 `TokenKind`s and 70 keywords/primitives locked in `DR-22` (plus any standard-library attributes finalized in `Phase 11`–`12`):
         -   Control, declaration, ownership, and boolean keywords (`fn`, `struct`, `enum`, `bit_field`, `trait`, `impl`, `subscript`, `yield`, `use`, `pub`, `own`, `with`, `context`, `orelse`, `is`, `and`, `or`, `not`, `async`, `await`, `test`, `bench`, `unsafe`, `comptime`).
         -   All 20 built-in primitives (`i8`–`i128`, `u8`–`u128`, `isize`, `usize`, `f32`, `f64`, `bool`, `char`, `str`, `unit`, `never`, `opaque`) and built-in Constrained Type Groups (`Number`, `Integer`, `Signed`, `Unsigned`, `Float`, `ByteSlice`).
         -   `PascalCase` nominal types/variants (`entity.name.type.corex`), `SCREAMING_SNAKE_CASE` constants (`constant.other.corex`), `@attribute` annotations (`storage.modifier.attribute.corex`), and `:label` / `label:` loop and `match` labels (`entity.name.label.corex`).
         -   Single-line `"…"`, indent-stripped multiline `"""…"""`, raw `r#"…"#` / `r#"""…"""#`, byte `b'x'` / `b"…"` / `br#"…"#`, nested `{expr=:#06x}` string interpolation holes, `{{` / `}}` brace escapes, and `_`-separated numeric suffixes (`0x4358_u32`, `0.5_f32`).
+    -   Update default `corex` binary discovery to prioritize the installed `v0.0.1` toolchain (`PATH` and `~/.corex/bin/corex`) while keeping workspace `build/` overrides for compiler contributors.
 2.  **Local PrettyLights Verification (`@wooorm/starry-night`):**
-    -   Render `core/**/*.cx`, `stdlib/cx/**/*.cx`, and all showcase snippets through `@wooorm/starry-night` locally across GitHub Light, Dark, and High-Contrast palettes to verify crisp highlighting before publishing.
+    -   Render `core/**/*.cx`, `stdlib/cx/**/*.cx`, `compiler/**/*.cx`, and all [`docs/COMPARISONS.md`](COMPARISONS.md) showcase snippets through `@wooorm/starry-night` locally across GitHub Light, Dark, and High-Contrast palettes to verify crisp highlighting before publishing.
 3.  **Dual Marketplace Publishing:**
-    -   Publish `vscode-ext-corex` to both the **Visual Studio Marketplace** (`code --install-extension`) and **OpenVSX** (serving Cursor, Windsurf, VSCodium, and Eclipse Theia users out of the box), bundling zero-config `corex lsp` auto-discovery and format-on-save (`corex fmt`).
+    -   Add final release branding (official CoreX icon, marketplace `README.md` and `CHANGELOG.md` matching `xulbux/vscode-theme-isolux` and `xulbux/vscode-ext-color-tracr` quality standards) and publish `vscode-ext-corex` publicly to both the **Visual Studio Marketplace** (`code --install-extension`) and **OpenVSX** (serving Cursor, Antigravity, Windsurf, VSCodium, and Eclipse Theia users out of the box).
 
 ---
 
@@ -109,11 +110,12 @@ Most developers discovering a new systems language on Hacker News, Reddit, or Lo
 
 Before publishing `v0.0.1` or announcing CoreX publicly, collapse the development/agent commit log into a spotless initial release history while preserving intentional project files.
 
-### Step 1: Pre-Squash File Retention Checkpoint
+### Step 1: Pre-Squash File Retention & Stage-0 Archive Checkpoint
 
-Decide explicitly at the `v0.0.1` release boundary how internal engineering documents should be arranged:
+Decide explicitly at the `v0.0.1` release boundary how internal engineering documents should be arranged, and preserve a local/private archive of the pre-squash bootstrap history:
 
--   **Keep in `corex-lang/corex`:** Source code (`compiler/`, `stdlib/`, `core/`, `tests/`, `bench/`), `README.md`, `CHANGELOG.md`, `LICENSE*`, `.markdownlint.json`, and `.agents/` (rules and skills intentionally retained).
+-   **Archive Pre-Squash History Locally (Off Public Remote):** Save an offline Git bundle (`../corex-pre-v0.0.1-archive.bundle`, supplementing the `Phase 12.7` `../corex-stage0-zig-archive.bundle`) on local/private storage before force-pushing `clean-main` so the entire Stage-0 Zig bootstrap history remains privately inspectable forever without appearing in public GitHub commit graphs.
+-   **Keep in `corex-lang/corex`:** Self-hosted source code (`compiler/`, `stdlib/`, `core/`, `tests/`, `bench/`), zero-Zig C99 offline bootstrap seed (`bootstrap.c` and `stage1/`), `README.md`, `CHANGELOG.md`, `LICENSE*`, `.markdownlint.json`, and `.agents/` (rules and skills intentionally retained).
 -   **Decide at `v0.0.1` Gate (`PLAN.md`, `docs/LAUNCH.md`, `docs/COMPARISONS.md`, `docs/research/DR-01.md`–`DR-22.md`):**
     -   *Option A (Keep in `docs/`):* Systems programmers on Hacker News and Lobste.rs strongly respect deep architectural RFCs (`DR-01`–`DR-22`); keeping them in `docs/research/` proves serious compiler engineering rigor.
     -   *Option B (Move to `corex-lang/rfcs`):* Move completed design/planning docs into a dedicated `corex-lang/rfcs` repository if you want the main `corex` tree focused exclusively on code and user docs.
@@ -123,6 +125,9 @@ Decide explicitly at the `v0.0.1` release boundary how internal engineering docu
 Execute this procedure **before** cutting any Git tags or GitHub Releases (since GitHub keeps commits reachable via tag URLs even after force-pushing `main`) and coordinate with collaborators before they open local branches or forks:
 
 ```bash
+# 0. Save an offline local Git bundle of the full pre-squash history:
+git bundle create ../corex-pre-v0.0.1-archive.bundle --all
+
 # 1. Verify 100% clean build, 3-stage self-host SHA-256 identity, and test/lint gates:
 corex fmt --check .
 corex check .
@@ -173,7 +178,7 @@ GitHub Linguist requires a language extension to have **at least 200 unique publ
 2.  **Disambiguating `.cx` in Linguist Heuristics:**
     -   Check whether any legacy language in Linguist's `languages.yml` claims `.cx`; add deterministic `heuristics.yml` rules matching CoreX signatures (`^\s*(pub(\((pkg|super)\))?\s+)?(fn|struct|enum|bit_field|trait|impl|subscript|use|mod|test|bench)\b`, `:=`, `->`, `@(cfg|derive|no_alloc|no_panic|inline)\b`).
 3.  **Submitting the `github-linguist/linguist` Pull Request:**
-    -   Add `CoreX` to `lib/linguist/languages.yml` (`type: programming`, `color: "<brand-hex>"`, `extensions: [".cx"]`, `tm_scope: "source.corex"`, `ace_mode: "text"`, `codemirror_mode: "clike"`).
+    -   Add `CoreX` to `lib/linguist/languages.yml` using CoreX's official primary brand indigo **`#6352FF`** (`type: programming`, `color: "#6352ff"`, `extensions: [".cx"]`, `tm_scope: "source.corex"`, `ace_mode: "text"`, `codemirror_mode: "clike"`).
     -   Run `script/add-grammar https://github.com/corex-lang/vscode-ext-corex` to vendor the MIT-licensed grammar submodule into `vendor/grammars/`.
     -   Add representative `.cx` sample files under `samples/CoreX/` and unit tests verifying heuristic classification.
 4.  **Post-Merge Cleanup:**
