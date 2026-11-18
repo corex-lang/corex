@@ -10,7 +10,7 @@ Keeping web assets, editor grammars, and starter templates in dedicated reposito
 
 | Repository | Purpose | License |
 | :--- | :--- | :--- |
-| `corex-lang/corex` | Self-hosted CoreX compiler, SAST/MVS verifier, `cx.*` standard library, and unified `corex` CLI (`build`, `run`, `check`, `test`, `fmt`, `upgrade`, `lsp`, `bench`, `init`, `doc`). | MIT / Apache-2.0 |
+| `corex-lang/corex` | Self-hosted CoreX compiler, SAST/MVS verifier, `cx.*` standard library, and unified `corex` CLI (`bench`, `build`, `check`, `doc`, `fmt`, `init`, `lsp`, `run`, `test`, `translate-c`, `upgrade`). | MIT / Apache-2.0 |
 | `corex-lang/vscode-ext-corex` | Official VS Code & OpenVSX extension (`syntaxes/corex.tmLanguage.json` TextMate grammar + `corex lsp` client). Vendored as a Git submodule by `github-linguist/linguist`. | MIT |
 | `corex-lang/website` | Official CoreX website, client-side WASM playground, interactive comparisons, benchmarks, language tour, and searchable `cx.*` API documentation. | MIT |
 | `corex-lang/setup-corex` | Official GitHub Action (`uses: corex-lang/setup-corex@v1`) installing pre-built `corex` binaries in `< 2 s` for CI workflows. | MIT |

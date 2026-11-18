@@ -1596,7 +1596,7 @@ fn hasBlockingSyntaxErrors(
     var tok_i: usize = 0;
     while (tok_i < token_count) : (tok_i += 1) {
         const rec = token_buffer.getToken(TokenIndex.fromInt(@intCast(tok_i)));
-        if (rec.flags.has_lexer_error) return true;
+        if (rec.flags.has_lexer_error and !isRenamableIdentifierKind(rec.kind)) return true;
         if (rec.kind == .invalid_token and !rec.flags.is_synthesized) return true;
     }
 
@@ -1679,8 +1679,10 @@ fn isFixableMissingSemicolonNode(
         .expr_stmt,
         .use_item,
         .const_item,
+        .extern_static_item,
         .type_alias_item,
         .mod_item,
+        .extern_block_item,
         .fn_item,
         .subscript_item,
         .trait_member,
@@ -1689,6 +1691,8 @@ fn isFixableMissingSemicolonNode(
         else => return false,
     }
     const end_idx: usize = node_idx.asInt() + node.subtree_size;
+    var has_closing_rbrace = false;
+    var has_error_child = false;
     var child_idx: usize = node_idx.asInt() + 1;
     while (child_idx < end_idx) : (child_idx += 1) {
         const child_id = CstNodeIndex.fromInt(@intCast(child_idx));
@@ -1696,12 +1700,21 @@ fn isFixableMissingSemicolonNode(
         if (child.kind == .invalid_parse_subtree or child.kind == .invalid_parse_leaf) {
             return false;
         }
+        if (child.flags.has_error) {
+            has_error_child = true;
+        }
         if (child.subtree_size == 1 and !child.token.isNone()) {
             const tok_rec = token_buffer.getToken(child.token);
             if (tok_rec.flags.is_synthesized and tok_rec.kind != .semi) {
                 return false;
             }
+            if (!tok_rec.flags.is_synthesized and tok_rec.kind == .rbrace) {
+                has_closing_rbrace = true;
+            }
         }
+    }
+    if (node.kind == .extern_block_item) {
+        return has_closing_rbrace and has_error_child;
     }
     return true;
 }
@@ -2559,14 +2572,25 @@ const CstFormatter = struct {
     fn collectFixRenames(self: *CstFormatter, root_idx: CstNodeIndex) !void {
         const total_nodes = self.cst_arena.countNodes();
         var exempt_fn_end_idx: usize = 0;
+        var extern_fn_end_idx: usize = 0;
+        var extern_block_end_idx: usize = 0;
         var idx: usize = root_idx.asInt();
         while (idx < total_nodes) : (idx += 1) {
             const node_id = CstNodeIndex.fromInt(@intCast(idx));
             const node = self.cst_arena.getNode(node_id);
             switch (node.kind) {
+                .extern_block_item => {
+                    extern_block_end_idx = @max(
+                        extern_block_end_idx,
+                        idx + @max(@as(usize, 1), node.subtree_size),
+                    );
+                },
                 .fn_item => {
-                    if (self.hasPascalExemptFnAttr(node_id)) {
-                        exempt_fn_end_idx = idx + @max(@as(usize, 1), node.subtree_size);
+                    const fn_end_idx = idx + @max(@as(usize, 1), node.subtree_size);
+                    if (idx < extern_block_end_idx or self.hasDirectTokenKind(node_id, .kw_extern)) {
+                        extern_fn_end_idx = @max(extern_fn_end_idx, fn_end_idx);
+                    } else if (self.hasPascalExemptFnAttr(node_id)) {
+                        exempt_fn_end_idx = @max(exempt_fn_end_idx, fn_end_idx);
                     }
                 },
                 .struct_item, .union_item, .enum_item, .trait_item, .type_alias_item => {
@@ -2595,9 +2619,10 @@ const CstFormatter = struct {
                 },
                 .fn_sig => {
                     if (self.findFirstIdentTokenInDirectChildren(node_id)) |tok_id| {
+                        const is_extern_exempt = idx < extern_fn_end_idx;
                         const is_pascal_exempt = idx < exempt_fn_end_idx and
                             self.token_buffer.getToken(tok_id).kind == .type_ident;
-                        if (!is_pascal_exempt) {
+                        if (!is_extern_exempt and !is_pascal_exempt) {
                             try self.registerFixRename(tok_id, .snake_case);
                         }
                     }
@@ -2919,11 +2944,11 @@ const CstFormatter = struct {
         }
     }
 
-    /// Returns whether `node_idx` is a bodyless trait member signature (`type`, `const`, `fn …;`, or `subscript …;`).
+    /// Returns whether `node_idx` is a bodyless member signature (`type`, `const`, `static`, `fn …;`, or `subscript …;`).
     fn isCompactTraitSignatureItem(self: *const CstFormatter, node_idx: CstNodeIndex) bool {
         const node = self.cst_arena.getNode(node_idx);
         return switch (node.kind) {
-            .type_alias_item, .const_item => true,
+            .type_alias_item, .const_item, .extern_static_item => true,
             .trait_member, .fn_item, .subscript_item => !self.hasDirectChildKind(node_idx, .block) and
                 !self.hasDirectChildKind(node_idx, .fn_expr_body),
             else => false,
@@ -4003,6 +4028,146 @@ const CstFormatter = struct {
         }
     }
 
+    /// Formats an `.extern_block_item` declaration (`[attrs] [vis] [unsafe] extern ["C"] { … }`).
+    fn formatExternBlockItem(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
+        var children: std.ArrayList(CstNodeIndex) = .empty;
+        defer children.deinit(self.allocator);
+        try self.collectDirectChildren(node_idx, &children);
+
+        var lbrace_pos: ?usize = null;
+        var rbrace_pos: ?usize = null;
+        for (children.items, 0..) |child_id, idx| {
+            const child = self.cst_arena.getNode(child_id);
+            if (child.subtree_size == 1 and !child.token.isNone()) {
+                const tok_kind = self.token_buffer.getToken(child.token).kind;
+                if (tok_kind == .lbrace and lbrace_pos == null) lbrace_pos = idx;
+                if (tok_kind == .rbrace) rbrace_pos = idx;
+            }
+        }
+
+        const header_end = lbrace_pos orelse children.items.len;
+        const start_idx = try self.formatLeadingStackedAttributes(children.items[0..header_end]);
+        for (children.items[start_idx..header_end]) |child_id| {
+            const child = self.cst_arena.getNode(child_id);
+            if (child.kind == .visibility_modifier) {
+                try self.formatVisibilityModifier(child_id);
+                try self.doc_arena.emitText(" ");
+                continue;
+            }
+            if (child.subtree_size == 1 and !child.token.isNone()) {
+                const tok_kind = self.token_buffer.getToken(child.token).kind;
+                if (tok_kind == .kw_pub) {
+                    try self.emitTokenWithTrivia(child.token, "pub", false);
+                    try self.doc_arena.emitText(" ");
+                } else if (tok_kind == .kw_unsafe) {
+                    try self.emitTokenWithTrivia(child.token, "unsafe", false);
+                    try self.doc_arena.emitText(" ");
+                } else if (tok_kind == .kw_extern) {
+                    try self.emitTokenWithTrivia(child.token, "extern", false);
+                } else if (tok_kind == .string_lit) {
+                    try self.doc_arena.emitText(" ");
+                    const abi_lex = self.getTokenLexeme(child.token);
+                    const abi_override: ?[]const u8 = if (std.ascii.eqlIgnoreCase(abi_lex, "\"c\""))
+                        "\"C\""
+                    else
+                        null;
+                    try self.emitTokenWithTrivia(child.token, abi_override, false);
+                } else {
+                    try self.emitTokenWithTrivia(child.token, null, false);
+                }
+            } else {
+                try self.formatNode(child_id);
+            }
+        }
+
+        if (lbrace_pos == null or rbrace_pos == null) return;
+        const lb_idx = lbrace_pos.?;
+        const rb_idx = rbrace_pos.?;
+        const open_brace_tok = self.cst_arena.getNode(children.items[lb_idx]).token;
+        const close_brace_tok = self.cst_arena.getNode(children.items[rb_idx]).token;
+
+        try self.doc_arena.emitText(" ");
+        const body_items = children.items[lb_idx + 1 .. rb_idx];
+        if (body_items.len == 0) {
+            try self.formatEmptyContainer(open_brace_tok, close_brace_tok, "{", "}");
+            return;
+        }
+
+        try self.emitTokenWithTrivia(open_brace_tok, "{", false);
+        try self.doc_arena.beginIndent(INDENT_SPACES);
+        try self.doc_arena.emitHardLine();
+        try self.formatItemSequence(body_items, false);
+        try self.emitLeadingTriviaBeforeCloseBrace(close_brace_tok);
+        try self.doc_arena.endIndent(INDENT_SPACES);
+        try self.doc_arena.emitHardLine();
+        try self.emitTokenWithTrivia(close_brace_tok, "}", false);
+    }
+
+    /// Formats an `.extern_static_item` declaration (`[attrs] [vis] [unsafe] [extern ["ABI"]] static [mut] name: Type;`).
+    fn formatExternStaticItem(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
+        var children: std.ArrayList(CstNodeIndex) = .empty;
+        defer children.deinit(self.allocator);
+        try self.collectDirectChildren(node_idx, &children);
+
+        const start_idx = try self.formatLeadingStackedAttributes(children.items);
+        var has_seen_static_kw = false;
+        var has_seen_colon = false;
+        var has_emitted_semi = false;
+
+        for (children.items[start_idx..]) |child_id| {
+            const child = self.cst_arena.getNode(child_id);
+            if (child.kind == .visibility_modifier) {
+                try self.formatVisibilityModifier(child_id);
+                try self.doc_arena.emitText(" ");
+                continue;
+            }
+            if (child.subtree_size == 1 and !child.token.isNone()) {
+                const tok_kind = self.token_buffer.getToken(child.token).kind;
+                if (tok_kind == .kw_pub) {
+                    try self.emitTokenWithTrivia(child.token, "pub", false);
+                    try self.doc_arena.emitText(" ");
+                } else if (tok_kind == .kw_unsafe) {
+                    try self.emitTokenWithTrivia(child.token, "unsafe", false);
+                    try self.doc_arena.emitText(" ");
+                } else if (tok_kind == .kw_extern) {
+                    try self.emitTokenWithTrivia(child.token, "extern", false);
+                    try self.doc_arena.emitText(" ");
+                } else if (tok_kind == .string_lit and !has_seen_static_kw) {
+                    const abi_lex = self.getTokenLexeme(child.token);
+                    const abi_override: ?[]const u8 = if (std.ascii.eqlIgnoreCase(abi_lex, "\"c\""))
+                        "\"C\""
+                    else
+                        null;
+                    try self.emitTokenWithTrivia(child.token, abi_override, false);
+                    try self.doc_arena.emitText(" ");
+                } else if (tok_kind == .ident and !has_seen_static_kw and
+                    std.mem.eql(u8, self.getTokenLexeme(child.token), "static"))
+                {
+                    has_seen_static_kw = true;
+                    try self.emitTokenWithTrivia(child.token, "static", false);
+                    try self.doc_arena.emitText(" ");
+                } else if (tok_kind == .kw_mut and !has_seen_colon) {
+                    try self.emitTokenWithTrivia(child.token, "mut", false);
+                    try self.doc_arena.emitText(" ");
+                } else if (tok_kind == .colon) {
+                    has_seen_colon = true;
+                    try self.emitTokenWithTrivia(child.token, ":", false);
+                    try self.doc_arena.emitText(" ");
+                } else if (tok_kind == .semi) {
+                    try self.emitTokenWithTrivia(child.token, ";", false);
+                    has_emitted_semi = true;
+                } else {
+                    try self.emitTokenWithTrivia(child.token, null, false);
+                }
+            } else {
+                try self.formatNode(child_id);
+            }
+        }
+        if (!has_emitted_semi) {
+            try self.doc_arena.emitText(";");
+        }
+    }
+
     /// Formats a `.subscript_item` declaration (`[Vis] subscript[T](params) -> Type { let { … } inout { … } }`, `SE-21`).
     fn formatSubscriptItem(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
@@ -4562,6 +4727,22 @@ const CstFormatter = struct {
             return;
         }
 
+        const is_call_node = node_idx.asInt() < self.cst_arena.countNodes() and
+            self.cst_arena.getNode(node_idx).kind == .call_expr;
+        if (is_call_node and elements.items.len == 1 and
+            self.isHuggedSingleClosureCallArg(
+                elements.items[0].elem_id,
+                open_tok,
+                close_tok,
+                has_trailing_comma,
+            ))
+        {
+            try self.emitTokenWithTrivia(open_tok, open_str, false);
+            try self.formatCallArg(elements.items[0].elem_id);
+            try self.emitTokenWithTrivia(close_tok, close_str, false);
+            return;
+        }
+
         try self.emitTokenLeadingAndGlyph(open_tok, open_str, false);
         const group_mode: GroupMode = if (has_trailing_comma) .force_break else .auto_fit;
         _ = try self.doc_arena.beginGroup(group_mode);
@@ -4599,8 +4780,18 @@ const CstFormatter = struct {
                     self.cst_arena.getNode(node_idx).kind
                 else
                     null;
+                const elem_node = self.cst_arena.getNode(entry.elem_id);
+                const is_variadic_or_slice_rest = elem_node.kind == .variadic_param or
+                    (node_kind_opt == .slice_pat and
+                        ((elem_node.kind == .wildcard_pat and
+                            !elem_node.token.isNone() and
+                            self.token_buffer.getToken(elem_node.token).kind == .dotdot) or
+                            (elem_node.kind == .ident_pat and
+                                self.hasDirectTokenKind(entry.elem_id, .dotdot))));
                 const is_paren_or_tuple = (node_kind_opt == .tuple_or_paren_expr or node_kind_opt == .tuple_type);
-                if (is_paren_or_tuple and elements.items.len == 1) {
+                if (is_variadic_or_slice_rest) {
+                    // Never emit a trailing comma after `...` variadic param or `.slice_pat` `..` rest pattern.
+                } else if (is_paren_or_tuple and elements.items.len == 1) {
                     if (has_trailing_comma) {
                         try self.doc_arena.emitText(",");
                     }
@@ -6484,7 +6675,20 @@ const CstFormatter = struct {
         const base_id = curr_id;
         std.mem.reverse(CstNodeIndex, chain_nodes.items);
 
-        if (dot_link_count >= 2 or has_user_newline) {
+        var is_qualified_path_prefix = self.cst_arena.getNode(base_id).subtree_size == 1;
+        if (is_qualified_path_prefix and chain_nodes.items.len > 1) {
+            for (chain_nodes.items[0 .. chain_nodes.items.len - 1]) |prefix_link_id| {
+                const prefix_link = self.cst_arena.getNode(prefix_link_id);
+                if (prefix_link.kind != .field_or_method_expr or
+                    self.hasDirectTokenKind(prefix_link_id, .lparen))
+                {
+                    is_qualified_path_prefix = false;
+                    break;
+                }
+            }
+        }
+
+        if ((dot_link_count >= 2 and !is_qualified_path_prefix) or has_user_newline) {
             const mode: GroupMode = if (has_user_newline) .force_break else .auto_fit;
             _ = try self.doc_arena.beginGroup(mode);
             try self.formatNode(base_id);
@@ -6573,6 +6777,20 @@ const CstFormatter = struct {
                 return;
             }
 
+            if (args.items.len == 1 and
+                self.isHuggedSingleClosureCallArg(
+                    args.items[0].arg_id,
+                    open_tok,
+                    close_tok,
+                    has_trailing_comma,
+                ))
+            {
+                try self.emitTokenWithTrivia(open_tok, "(", false);
+                try self.formatCallArg(args.items[0].arg_id);
+                try self.emitTokenWithTrivia(close_tok, ")", false);
+                return;
+            }
+
             try self.emitTokenLeadingAndGlyph(open_tok, "(", false);
             const arg_mode: GroupMode = if (has_trailing_comma) .force_break else .auto_fit;
             _ = try self.doc_arena.beginGroup(arg_mode);
@@ -6619,6 +6837,45 @@ const CstFormatter = struct {
                 try self.formatNode(child_id);
             }
         }
+    }
+
+    /// Returns whether `call_arg_id` is a single block-bodied closure argument that hugs `(` and `)`.
+    fn isHuggedSingleClosureCallArg(
+        self: *const CstFormatter,
+        call_arg_id: CstNodeIndex,
+        open_tok: TokenIndex,
+        close_tok: TokenIndex,
+        has_trailing_comma: bool,
+    ) bool {
+        if (has_trailing_comma or open_tok.isNone() or close_tok.isNone()) return false;
+        const open_meta = self.token_meta[open_tok.asInt()];
+        if (!open_meta.is_trailing_consumed and open_meta.has_trailing_comments) return false;
+        if (self.hasUnconsumedLeadingComments(close_tok)) return false;
+
+        const arg_node = self.cst_arena.getNode(call_arg_id);
+        if (arg_node.kind != .call_arg or arg_node.subtree_size <= 1) return false;
+        const first_arg_tok = self.findFirstTokenInSubtree(call_arg_id);
+        if (first_arg_tok.isNone() or self.token_meta[first_arg_tok.asInt()].has_leading_newline) {
+            return false;
+        }
+
+        const end_idx: usize = call_arg_id.asInt() + arg_node.subtree_size;
+        var expr_id: CstNodeIndex = .none;
+        var cursor: usize = call_arg_id.asInt() + 1;
+        while (cursor < end_idx) {
+            const child_id = CstNodeIndex.fromInt(@intCast(cursor));
+            const child = self.cst_arena.getNode(child_id);
+            if (child.subtree_size == 1 and self.shouldSkipLeaf(child)) {
+                cursor += 1;
+                continue;
+            }
+            if (!expr_id.isNone()) return false;
+            expr_id = child_id;
+            cursor += @max(@as(usize, 1), child.subtree_size);
+        }
+        if (expr_id.isNone()) return false;
+        if (self.cst_arena.getNode(expr_id).kind != .closure_expr) return false;
+        return self.hasDirectChildKind(expr_id, .block);
     }
 
     /// Formats an `.index_expr` (`base[i, j]`).
@@ -7109,7 +7366,8 @@ const CstFormatter = struct {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
                 if (tok_kind == .kw_mut or tok_kind == .kw_own or
                     tok_kind == .kw_const or tok_kind == .kw_let or
-                    tok_kind == .kw_async or tok_kind == .kw_unsafe or tok_kind == .kw_extern or
+                    (tok_kind == .kw_async and node.kind != .named_type) or
+                    tok_kind == .kw_unsafe or tok_kind == .kw_extern or
                     tok_kind == .hash_soa)
                 {
                     try self.emitTokenWithTrivia(child.token, null, false);
@@ -7129,13 +7387,21 @@ const CstFormatter = struct {
                     try self.emitTokenWithTrivia(child.token, ";", false);
                     try self.doc_arena.emitText(" ");
                 } else if (tok_kind == .comma) {
-                    try self.emitTokenWithTrivia(child.token, ",", false);
-                    if (idx + 1 < children.items.len) {
-                        const next_c = self.cst_arena.getNode(children.items[idx + 1]);
-                        const is_close = next_c.subtree_size == 1 and !next_c.token.isNone() and
-                            (self.token_buffer.getToken(next_c.token).kind == .rparen or
-                                self.token_buffer.getToken(next_c.token).kind == .pipe);
-                        if (!is_close) try self.doc_arena.emitText(" ");
+                    const is_after_variadic = idx > 0 and
+                        self.cst_arena.getNode(children.items[idx - 1]).kind == .variadic_param;
+                    if (is_after_variadic) {
+                        try self.emitLeadingTrivia(child.token, false);
+                        self.token_meta[child.token.asInt()].is_token_emitted = true;
+                        try self.emitTrailingTrivia(child.token);
+                    } else {
+                        try self.emitTokenWithTrivia(child.token, ",", false);
+                        if (idx + 1 < children.items.len) {
+                            const next_c = self.cst_arena.getNode(children.items[idx + 1]);
+                            const is_close = next_c.subtree_size == 1 and !next_c.token.isNone() and
+                                (self.token_buffer.getToken(next_c.token).kind == .rparen or
+                                    self.token_buffer.getToken(next_c.token).kind == .pipe);
+                            if (!is_close) try self.doc_arena.emitText(" ");
+                        }
                     }
                 } else if (tok_kind == .arrow) {
                     if ((node.kind == .fn_type or node.kind == .closure_type) and
@@ -7378,6 +7644,8 @@ const CstFormatter = struct {
             .struct_field => try self.formatStructField(node_idx),
             .enum_variant => try self.formatEnumVariant(node_idx),
             .trait_item, .impl_item => try self.formatTraitOrImpl(node_idx),
+            .extern_block_item => try self.formatExternBlockItem(node_idx),
+            .extern_static_item => try self.formatExternStaticItem(node_idx),
             .fn_item, .trait_member, .impl_member => try self.formatFnOrMember(node_idx),
             .subscript_item => try self.formatSubscriptItem(node_idx),
             .subscript_arm => try self.formatSubscriptArm(node_idx),
@@ -8102,4 +8370,109 @@ test "test_stage4_attributed_block_match_no_spurious_semi_and_raw_quote_runs" {
     defer pass2.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(pass1.formatted_text, pass2.formatted_text);
     try std.testing.expect(!pass2.is_changed);
+}
+
+test "test_format_extern_blocks_extern_static_and_comments_idempotency" {
+    const raw_src =
+        "// Leading extern block comment\n" ++
+        "pub extern \"c\" {\n" ++
+        "    // Foreign allocator signature\n" ++
+        "    pub fn CreateFileW(path: *u16, access: u32) -> *mut opaque; // inline comment\n" ++
+        "    fn EVP_DigestInit_ex(ctx: *mut opaque) -> i32;\n" ++
+        "    pub(pkg) static mut _errno: i32;\n" ++
+        "    const INVALID_HANDLE: usize = 0;\n" ++
+        "    // Dangling comment before close\n" ++
+        "}\n\n" ++
+        "extern {}\n\n" ++
+        "@link_name(\"_errno\")\n" ++
+        "pub extern \"c\" static mut __errno_ptr: *mut i32;\n";
+
+    var pass1 = try formatSource(std.testing.allocator, raw_src, FileId.fromInt(0));
+    defer pass1.deinit(std.testing.allocator);
+    try std.testing.expect(!pass1.has_syntax_errors);
+
+    const expected =
+        "// Leading extern block comment\n" ++
+        "pub extern \"C\" {\n" ++
+        "    // Foreign allocator signature\n" ++
+        "    pub fn CreateFileW(path: *u16, access: u32) -> *mut opaque; // inline comment\n" ++
+        "    fn EVP_DigestInit_ex(ctx: *mut opaque) -> i32;\n" ++
+        "    pub(pkg) static mut _errno: i32;\n" ++
+        "    const INVALID_HANDLE: usize = 0;\n" ++
+        "    // Dangling comment before close\n" ++
+        "}\n\n" ++
+        "extern {}\n\n" ++
+        "@link_name(\"_errno\")\n" ++
+        "pub extern \"C\" static mut __errno_ptr: *mut i32;\n";
+    try std.testing.expectEqualStrings(expected, pass1.formatted_text);
+
+    var pass2 = try formatSource(std.testing.allocator, pass1.formatted_text, FileId.fromInt(0));
+    defer pass2.deinit(std.testing.allocator);
+    try std.testing.expect(!pass2.has_syntax_errors);
+    try std.testing.expect(!pass2.is_changed);
+    try std.testing.expectEqualStrings(expected, pass2.formatted_text);
+
+    // Verify `--fix` mode preserves foreign C symbol names while inserting missing `;`:
+    const fix_src =
+        "extern \"C\" {\n" ++
+        "    fn CreateFileW(path: *u16) -> *mut opaque;\n" ++
+        "    static mut _errno_Val: i32\n" ++
+        "}\n";
+    var fix_res = try formatSourceWithOptions(
+        std.testing.allocator,
+        fix_src,
+        FileId.fromInt(1),
+        .{ .is_fix_mode = true },
+    );
+    defer fix_res.deinit(std.testing.allocator);
+    try std.testing.expect(!fix_res.has_syntax_errors);
+    try std.testing.expect(std.mem.indexOf(u8, fix_res.formatted_text, "fn CreateFileW(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fix_res.formatted_text, "static mut _errno_Val: i32;") != null);
+}
+
+test "test_format_kw_async_module_paths_canonical_unchanged" {
+    const canonical_src =
+        "pub mod async;\n\n" ++
+        "use cx.async.{TaskGroup, TaskHandle};\n\n" ++
+        "pub async fn spawn_all(grp: &mut cx.async.TaskGroup[IoError], sub: &async.TaskGroup[IoError]) {\n" ++
+        "    async.yield_now().await;\n" ++
+        "    cx.async.task_group(|group| {\n" ++
+        "        let _ = group;\n" ++
+        "    });\n" ++
+        "}\n";
+
+    var res = try formatSource(std.testing.allocator, canonical_src, FileId.fromInt(0));
+    defer res.deinit(std.testing.allocator);
+    try std.testing.expect(!res.has_syntax_errors);
+    try std.testing.expect(!res.is_changed);
+    try std.testing.expectEqualStrings(canonical_src, res.formatted_text);
+}
+
+test "test_format_r1_wrapped_variadic_extern_fn_and_slice_rest_pattern_no_trailing_comma" {
+    const raw_src =
+        "pub extern \"C\" fn cx_format_diagnostic_variadic_record(" ++
+        "sink_handle: *mut DiagnosticSink, format_template_utf8: *u8, severity_level: u32, ...) -> i32;\n\n" ++
+        "pub fn inspect_long_slice(elements: &[i32]) -> i32 {\n" ++
+        "    match elements {\n" ++
+        "        [first_header_word, second_header_word, third_header_word, " ++
+        "fourth_header_word, ..trailing_payload_words] => first_header_word,\n" ++
+        "        [only_first_long_element_binding, only_second_long_element_binding, " ++
+        "only_third_long_element_binding, ..] => only_first_long_element_binding,\n" ++
+        "        _ => 0,\n" ++
+        "    }\n" ++
+        "}\n";
+
+    var pass1 = try formatSource(std.testing.allocator, raw_src, FileId.fromInt(0));
+    defer pass1.deinit(std.testing.allocator);
+    try std.testing.expect(!pass1.has_syntax_errors);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "...,") == null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "..trailing_payload_words,") == null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "..,") == null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "    ...\n) -> i32;") != null);
+
+    var pass2 = try formatSource(std.testing.allocator, pass1.formatted_text, FileId.fromInt(0));
+    defer pass2.deinit(std.testing.allocator);
+    try std.testing.expect(!pass2.has_syntax_errors);
+    try std.testing.expect(!pass2.is_changed);
+    try std.testing.expectEqualStrings(pass1.formatted_text, pass2.formatted_text);
 }

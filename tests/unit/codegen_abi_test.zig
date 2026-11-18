@@ -365,7 +365,7 @@ test "test_abi_classifier_cx_native_cx_result_cc_swifterror_and_7_target_c_abis"
     try std.testing.expectEqual(SwifterrorKind.zst_err, fn_zst.swifterror_kind);
     try std.testing.expectEqual(@as(u8, 0), fn_zst.swifterror_recipe.attr_bits);
     try std.testing.expect(fn_zst.has_implicit_context);
-    try std.testing.expectEqual(@as(u32, 64), fn_zst.context_recipe.lowered_size_bytes);
+    try std.testing.expectEqual(@as(u32, 80), fn_zst.context_recipe.lowered_size_bytes);
     try std.testing.expectEqual(AbiPassMode.indirect_by_ref, fn_zst.param_recipes[0].pass_mode);
     try std.testing.expect(fn_zst.param_recipes[0].attrs().is_readonly);
 
@@ -746,7 +746,7 @@ test "test_regression_sysv_eightbyte_span_c_union_abi_and_refined_niche_layout" 
     try std.testing.expectEqual(RegBank.gpr, fn_arm_union.ret_recipe.bank_0);
 }
 
-test "test_regression_wasm32_context_recipe_uniform_64b_8b_aligned_rv2_crit05" {
+test "test_regression_wasm32_context_recipe_40b_4b_aligned_rv2_crit05" {
     const src =
         \\pub fn read_seed() -> u64 {
         \\    return context.rng_seed;
@@ -770,8 +770,8 @@ test "test_regression_wasm32_context_recipe_uniform_64b_8b_aligned_rv2_crit05" {
     });
     defer fn_wasm.deinit(std.testing.allocator);
     try std.testing.expect(fn_wasm.has_implicit_context);
-    try std.testing.expectEqual(@as(u32, 64), fn_wasm.context_recipe.lowered_size_bytes);
-    try std.testing.expectEqual(@as(u16, 8), fn_wasm.context_recipe.pointee_align_bytes);
+    try std.testing.expectEqual(@as(u32, 40), fn_wasm.context_recipe.lowered_size_bytes);
+    try std.testing.expectEqual(@as(u16, 4), fn_wasm.context_recipe.pointee_align_bytes);
 }
 
 test "test_phase76_dr22_opaque_ptr_source_loc_fmt_bencher_layouts_and_c_variadic" {

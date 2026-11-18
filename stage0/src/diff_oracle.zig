@@ -408,10 +408,11 @@ fn executeNativeTierOnDb(
 ) DiffOracleError!OracleTierOutcome {
     const host_spec = backend.targetSpec();
     const seq_id = next_oracle_scratch_seq.fetchAdd(1, .monotonic);
+    const proc_salt = @intFromPtr(&next_oracle_scratch_seq) ^ (@intFromPtr(&seq_id) >> 4);
     const scratch_dir = try std.fmt.allocPrint(
         allocator,
-        ".zig-cache/cx_oracle_{s}_{d}",
-        .{ tier_tag, seq_id },
+        ".zig-cache/cx_oracle_{s}_{x}_{d}",
+        .{ tier_tag, proc_salt, seq_id },
     );
     defer allocator.free(scratch_dir);
     defer std.Io.Dir.cwd().deleteTree(options.io, scratch_dir) catch {};
@@ -906,4 +907,213 @@ test "test_diff_oracle_monochrome_table_rendering_on_simulated_divergence" {
     try std.testing.expect(std.mem.indexOf(u8, rendered.rendered_table, "─") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered.rendered_table, "✓") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered.rendered_table, "✗") != null);
+}
+
+test "Phase 8 Wave 3C-2 4-tier async coroutines, FIFO TaskGroup, FramePinned borrows, and cancellation parity" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const runCheckedAsyncOracle = struct {
+        /// Runs `runFourTierDiffOracleOnDb` and prints exact compiler/linker diagnostics on failure.
+        fn run(alloc: std.mem.Allocator, test_io: std.Io, src_text: []const u8) !DiffOracleReport {
+            var db = try CompilerDb.init(alloc);
+            defer db.deinit();
+            const fid = FileId.fromInt(0);
+            _ = try db.setInput(fid, src_text, .low);
+            var sink = diagnostic.DiagnosticSink.init(alloc);
+            defer sink.deinit();
+            return runFourTierDiffOracleOnDb(alloc, &db, fid, .{
+                .io = test_io,
+                .diagnostic_sink = &sink,
+            }) catch |err| {
+                for ((try db.parseCst(fid)).diagnostics.diagnostics.items) |diag_item| {
+                    std.debug.print("[parse] {s}: {s}\n", .{ @tagName(diag_item.code), diag_item.message });
+                }
+                if (db.getSignatureDiagnostics(fid)) |sig_sink| {
+                    for (sig_sink.diagnostics.items) |diag_item| {
+                        std.debug.print("[resolve] {s}: {s}\n", .{ @tagName(diag_item.code), diag_item.message });
+                    }
+                }
+                for ((try db.extractItemTree(fid)).entries) |entry| {
+                    if (db.getBodyDiagnostics(entry.def_id)) |body_sink| {
+                        for (body_sink.diagnostics.items) |diag_item| {
+                            std.debug.print("[typecheck] {s}: {s}\n", .{ @tagName(diag_item.code), diag_item.message });
+                        }
+                    }
+                    if (db.getSastDiagnostics(entry.def_id)) |sast_sink| {
+                        for (sast_sink.diagnostics.items) |diag_item| {
+                            std.debug.print("[sast] {s}: {s}\n", .{ @tagName(diag_item.code), diag_item.message });
+                        }
+                    }
+                }
+                for (sink.diagnostics.items) |diag_item| {
+                    std.debug.print("[backend] {s}: {s}\n", .{ @tagName(diag_item.code), diag_item.message });
+                }
+                return err;
+            };
+        }
+    }.run;
+
+    // [1] Lazy `Future`, multi-suspend `cx.async.yield_now().await`, nested `.await`, `FramePinned` `&mut`,
+    //     FIFO `task_group` `1 -> 2 -> 3 -> 4` interleaving, `handle.cancel().await` (unpolled + suspended LIFO `defer`),
+    //     and `group.cancel_all()` / `group.is_cancelled()` via `cx.async.block_on`:
+    const sync_async_src =
+        \\pub async fn lazy_step(tag: i64, val: i32) -> i32 {
+        \\    @drop_trace(tag);
+        \\    cx.async.yield_now().await;
+        \\    return val + 1;
+        \\}
+        \\
+        \\pub async fn mutate_pinned(target: &mut i32) -> i32 {
+        \\    target.* += 10;
+        \\    cx.async.yield_now().await;
+        \\    target.* += 20;
+        \\    return target.*;
+        \\}
+        \\
+        \\pub async fn run_workflow() -> i32 {
+        \\    let lazy_fut = lazy_step(90, 4);
+        \\    @drop_trace(80);
+        \\    let lazy_val: i32 = lazy_fut.await;
+        \\
+        \\    var pinned_val: i32 = 7;
+        \\    let after_pin: i32 = mutate_pinned(&mut pinned_val).await;
+        \\
+        \\    let fifo_sum: i32 = cx.async.task_group(|grp| {
+        \\        let h1 = grp.spawn(own async {
+        \\            @drop_trace(1);
+        \\            cx.async.yield_now().await;
+        \\            @drop_trace(3);
+        \\            10
+        \\        });
+        \\        let h2 = grp.spawn(own async {
+        \\            @drop_trace(2);
+        \\            cx.async.yield_now().await;
+        \\            @drop_trace(4);
+        \\            22
+        \\        });
+        \\        let j1 = h1.join();
+        \\        let j2 = h2.join();
+        \\        j1.await + j2.await
+        \\    }).await;
+        \\
+        \\    let cancel_score: i32 = cx.async.task_group(|grp| {
+        \\        let unpolled = grp.spawn(own async {
+        \\            @drop_trace(999);
+        \\            1
+        \\        });
+        \\        unpolled.cancel().await;
+        \\        let suspended = grp.spawn(own async {
+        \\            defer { @drop_trace(701); }
+        \\            defer { @drop_trace(702); }
+        \\            cx.async.yield_now().await;
+        \\            @drop_trace(998);
+        \\            1
+        \\        });
+        \\        let cancel_suspended = suspended.cancel();
+        \\        cx.async.yield_now().await;
+        \\        cancel_suspended.await;
+        \\        let bg = grp.spawn(own async {
+        \\            defer { @drop_trace(703); }
+        \\            cx.async.yield_now().await;
+        \\            cx.async.yield_now().await;
+        \\            1
+        \\        });
+        \\        let _bg_join = bg.join();
+        \\        cx.async.yield_now().await;
+        \\        grp.cancel_all();
+        \\        if grp.is_cancelled() { 5 } else { 0 }
+        \\    }).await;
+        \\
+        \\    return lazy_val + pinned_val + after_pin + fifo_sum + cancel_score - 74;
+        \\}
+        \\
+        \\pub fn main() -> i32 {
+        \\    return cx.async.block_on(own run_workflow());
+        \\}
+    ;
+
+    var report_sync = try runCheckedAsyncOracle(allocator, io, sync_async_src);
+    defer report_sync.deinit(allocator);
+    if (!report_sync.is_all_matching) {
+        std.debug.print("\n{s}\n", .{report_sync.rendered_diff_table});
+    }
+    try std.testing.expect(report_sync.is_all_matching);
+    try std.testing.expectEqual(@as(i64, 42), report_sync.outcomes[0].return_scalar_i64);
+    try std.testing.expectEqualSlices(
+        i64,
+        &[_]i64{ 80, 90, 1, 2, 3, 4, 702, 701, 703 },
+        report_sync.outcomes[0].drop_trace,
+    );
+
+    // [2] Direct `async fn main()` + `with context.cancel_token` isolation across sibling tasks:
+    const async_main_src =
+        \\pub async fn main() -> i32 {
+        \\    let total: i32 = cx.async.task_group(|grp| {
+        \\        let t1 = grp.spawn(own async {
+        \\            let tok1 = CancelToken { _handle: 11_usize };
+        \\            with context.cancel_token = tok1 {
+        \\                cx.async.yield_now().await;
+        \\                context.cancel_token._handle as i32
+        \\            }
+        \\        });
+        \\        let t2 = grp.spawn(own async {
+        \\            let tok2 = CancelToken { _handle: 31_usize };
+        \\            with context.cancel_token = tok2 {
+        \\                cx.async.yield_now().await;
+        \\                context.cancel_token._handle as i32
+        \\            }
+        \\        });
+        \\        let j1 = t1.join();
+        \\        let j2 = t2.join();
+        \\        j1.await + j2.await + (context.cancel_token._handle as i32)
+        \\    }).await;
+        \\    return total;
+        \\}
+    ;
+
+    var report_async_main = try runCheckedAsyncOracle(allocator, io, async_main_src);
+    defer report_async_main.deinit(allocator);
+    if (!report_async_main.is_all_matching) {
+        std.debug.print("\n{s}\n", .{report_async_main.rendered_diff_table});
+    }
+    try std.testing.expect(report_async_main.is_all_matching);
+    try std.testing.expectEqual(@as(i64, 42), report_async_main.outcomes[0].return_scalar_i64);
+
+    // [3] Sibling `Result::Err` automatic cancellation cascade + nursery drain on exit:
+    const err_cascade_src =
+        \\pub async fn fallible_worker(should_fail: bool) -> i32!i32 {
+        \\    if should_fail {
+        \\        return .Err(9);
+        \\    }
+        \\    defer { @drop_trace(801); }
+        \\    cx.async.yield_now().await;
+        \\    cx.async.yield_now().await;
+        \\    @drop_trace(899);
+        \\    return .Ok(100);
+        \\}
+        \\
+        \\pub async fn main() -> i32 {
+        \\    let outcome: i32 = cx.async.task_group(|grp| {
+        \\        let slow_ok = grp.spawn(own fallible_worker(false));
+        \\        let fast_err = grp.spawn(own fallible_worker(true));
+        \\        let _j_slow = slow_ok.join();
+        \\        let j_err = fast_err.join();
+        \\        match j_err.await {
+        \\            .Ok(v) => v,
+        \\            .Err(code) => code + 33,
+        \\        }
+        \\    }).await;
+        \\    return outcome;
+        \\}
+    ;
+
+    var report_err = try runCheckedAsyncOracle(allocator, io, err_cascade_src);
+    defer report_err.deinit(allocator);
+    if (!report_err.is_all_matching) {
+        std.debug.print("\n{s}\n", .{report_err.rendered_diff_table});
+    }
+    try std.testing.expect(report_err.is_all_matching);
+    try std.testing.expectEqual(@as(i64, 42), report_err.outcomes[0].return_scalar_i64);
+    try std.testing.expectEqualSlices(i64, &[_]i64{801}, report_err.outcomes[0].drop_trace);
 }

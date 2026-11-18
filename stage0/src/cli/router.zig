@@ -1,10 +1,11 @@
 //! CLI Command Router, Dynamic Metadata Registry & Typo Suggestion Engine
 //!
-//! Defines the canonical `SUBCOMMANDS` (`build`, `run`, `check`, `test`, `fmt`, `upgrade`, `lsp`, `bench`)
-//! and `GLOBAL_FLAGS` (`-h`/`--help`, `-V`/`--version`, `--color=<when>`) metadata tables.
+//! Defines the canonical `CLI_SUBCOMMANDS` (`SUBCOMMANDS`), `GLOBAL_FLAGS`, `COMPILE_FLAGS`,
+//! `TRANSLATE_C_FLAGS`, `FMT_FLAGS`, and `UPGRADE_FLAGS` metadata tables.
 //!
-//! Parses command-line arguments in a single pass, emits `E0001`/`E0002` diagnostics with stack-allocated
-//! Levenshtein typo suggestions (`help: did you mean \`…\`?`), and renders the monochrome help menu.
+//! Parses command-line arguments in a single pass, dispatches compilation, C11/C23 header translation,
+//! formatting, and verification workflows, emits `E0001`–`E0006` diagnostics with stack-allocated
+//! Levenshtein typo suggestions (`help: did you mean \`…\`?`), and renders monochrome help menus.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -19,6 +20,8 @@ const fmt_engine = @import("../fmt_engine.zig");
 const query_db = @import("../query_db.zig");
 const codegen_abi = @import("../codegen_abi.zig");
 const diff_oracle = @import("../diff_oracle.zig");
+const c_frontend = @import("../c_frontend.zig");
+const c_translate = @import("../c_translate.zig");
 
 const ColorMode = style.ColorMode;
 const Glyphs = style.Glyphs;
@@ -29,24 +32,26 @@ const DiagnosticRenderer = renderer.DiagnosticRenderer;
 
 // ---------------------------------------- TYPES ----------------------------------------
 
-/// Canonical CoreX CLI subcommand identifiers indexed 1-to-1 into `SUBCOMMANDS`.
+/// Canonical CoreX CLI subcommand identifiers indexed 1-to-1 (alphabetically) into `SUBCOMMANDS`.
 pub const SubcommandId = enum(u8) {
-    /// `corex build` – compile package or source file into a native or WebAssembly artifact.
-    build = 0,
-    /// `corex run` – compile and immediately execute a CoreX binary.
-    run = 1,
-    /// `corex check` – run fast syntax, type, region, and SAST verification without codegen.
+    /// `corex bench` – run statistical performance benchmarks and emit monochrome report tables (`0`).
+    bench = 0,
+    /// `corex build` – compile package or source file into a native or WebAssembly artifact (`1`).
+    build = 1,
+    /// `corex check` – run fast syntax, type, region, and SAST verification without codegen (`2`).
     check = 2,
-    /// `corex test` – compile and execute unit, snapshot, and safety verification suites.
-    @"test" = 3,
-    /// `corex fmt` – format CoreX source files canonically using the lossless CST.
-    fmt = 4,
-    /// `corex upgrade` – apply automated AST/CST migrations and machine-applicable fixes.
-    upgrade = 5,
-    /// `corex lsp` – start the CoreX Language Server Protocol (LSP) daemon over stdio.
-    lsp = 6,
-    /// `corex bench` – run statistical performance benchmarks and emit monochrome report tables.
-    bench = 7,
+    /// `corex fmt` – format CoreX source files canonically using the lossless CST (`3`).
+    fmt = 3,
+    /// `corex lsp` – start the CoreX Language Server Protocol (LSP) daemon over stdio (`4`).
+    lsp = 4,
+    /// `corex run` – compile and immediately execute a CoreX binary (`5`).
+    run = 5,
+    /// `corex test` – compile and execute unit, snapshot, and safety verification suites (`6`).
+    @"test" = 6,
+    /// `corex translate-c` – translate a C11/C23 header into canonical CoreX (`.cx`) bindings (`7`).
+    translate_c = 7,
+    /// `corex upgrade` – apply automated AST/CST migrations and machine-applicable fixes (`8`).
+    upgrade = 8,
 
     /// Ergonomic identifier alias for `.@"test"`.
     pub const test_cmd: SubcommandId = .@"test";
@@ -61,14 +66,9 @@ pub const SubcommandId = enum(u8) {
         return self.asDescriptor().name;
     }
 
-    /// Resolves a CLI token string to its `SubcommandId` if it matches a canonical subcommand.
-    pub fn fromName(name_str: []const u8) ?SubcommandId {
-        for (SUBCOMMANDS) |descriptor| {
-            if (std.mem.eql(u8, descriptor.name, name_str)) {
-                return descriptor.id;
-            }
-        }
-        return null;
+    /// Resolves a CLI token string to its `SubcommandId` in $O(1)$ time via `SUBCOMMAND_NAME_MAP`.
+    pub inline fn fromName(name_str: []const u8) ?SubcommandId {
+        return SUBCOMMAND_NAME_MAP.get(name_str);
     }
 };
 
@@ -144,6 +144,34 @@ pub const UpgradeFlagDescriptor = struct {
     summary: []const u8,
 };
 
+/// Subcommand-specific CLI option identifiers for `corex translate-c` (`TRANSLATE_C_FLAGS`).
+pub const TranslateCFlagId = enum(u8) {
+    /// `--define=<name[=val]>` / `-D` – define C preprocessor macro (`0`).
+    define = 0,
+    /// `--include-dir=<dir>` / `-I` – add C `#include` search directory (`1`).
+    include_dir = 1,
+    /// `--internal-core` – emit `use core.ffi.*` instead of `use cx.ffi.*` (`2`).
+    internal_core = 2,
+    /// `--output=<path>` / `-o` – write translated `.cx` bindings to `<path>` (`3`).
+    output = 3,
+    /// `--target=<triple>` – select target C ABI triple (`4`).
+    target = 4,
+};
+
+/// Static metadata entry in `TRANSLATE_C_FLAGS` describing `corex translate-c` flags.
+pub const TranslateCFlagDescriptor = struct {
+    /// Strongly typed `corex translate-c` flag enum tag.
+    id: TranslateCFlagId,
+    /// Optional short flag token (e.g., `"-D"`, `"-I"`, `"-o"`).
+    short_flag: ?[]const u8 = null,
+    /// Canonical long flag token (e.g., `"--define"`).
+    long_flag: []const u8,
+    /// Optional value placeholder suffix (e.g., `"=<dir>"`).
+    value_suffix: ?[]const u8 = null,
+    /// Concise one-line summary displayed in `corex translate-c --help`.
+    summary: []const u8,
+};
+
 /// Codegen backend family selectable via `--ofmt=<c|llvm>` / `-ofmt=<c|llvm>`.
 pub const OutputFormat = enum(u8) {
     /// Tier A deterministic ISO C99 backend (`-ofmt=c`).
@@ -163,34 +191,48 @@ pub const OutputFormat = enum(u8) {
 pub const CompileFlagId = enum(u8) {
     /// `--comptime-limit=<steps>` – configure `MirVm` compile-time execution step budget (`0`).
     comptime_limit = 0,
-    /// `--dev` – compile in fast development mode (`1`).
-    dev = 1,
-    /// `--diff-backends` – run 4-tier `MirVm` / C99 / LLVM differential oracle (`2`).
-    diff_backends = 2,
-    /// `--emit-c` – emit deterministic ISO C99 source text (`3`).
-    emit_c = 3,
-    /// `--emit-llvm` – emit deterministic LLVM 20–23 `.ll` IR text (`4`).
-    emit_llvm = 4,
-    /// `--fuzz` – instrument output with `SanitizerCoverage` edge counters (`5`).
-    fuzz = 5,
-    /// `--internal-core` – permit direct `core.*` kernel imports without `E0218` (`6`).
-    internal_core = 6,
-    /// `--ofmt=<c|llvm>` – select Tier A (`c`) or Tier B (`llvm`) codegen backend (`7`).
-    ofmt = 7,
-    /// `--output=<path>` – write compiled artifact to `<path>` (`8`).
-    output = 8,
-    /// `--release` – compile in production release mode (`9`).
-    release = 9,
-    /// `--sast-strict` – emit `W0314` warnings on unproven bounds checks (`10`).
-    sast_strict = 10,
-    /// `--target=<triple>` – select cross-compilation target triple (`11`).
-    target = 11,
+    /// `--define=<name[=val]>` / `-D` – define C preprocessor macro for `@c_import` (`1`).
+    define = 1,
+    /// `--dev` – compile in fast development mode (`2`).
+    dev = 2,
+    /// `--diff-backends` – run 4-tier `MirVm` / C99 / LLVM differential oracle (`3`).
+    diff_backends = 3,
+    /// `--emit-c` – emit deterministic ISO C99 source text (`4`).
+    emit_c = 4,
+    /// `--emit-llvm` – emit deterministic LLVM 20–23 `.ll` IR text (`5`).
+    emit_llvm = 5,
+    /// `--emit-obj` – emit relocatable `.o` / `.obj` object file without linking (`6`).
+    emit_obj = 6,
+    /// `--fuzz` – instrument output with `SanitizerCoverage` edge counters (`7`).
+    fuzz = 7,
+    /// `--include-dir=<dir>` / `-I` – add C `#include` search directory (`8`).
+    include_dir = 8,
+    /// `--internal-core` – permit direct `core.*` kernel imports without `E0218` (`9`).
+    internal_core = 9,
+    /// `--lib=<name_or_def>` / `-l` – link C library or `.def`/`.lib`/`.a` input (`10`).
+    lib = 10,
+    /// `--lib-dir=<dir>` / `-L` – add library search directory (`11`).
+    lib_dir = 11,
+    /// `--link=<auto|static|dynamic>` – configure binary linkage mode (`12`).
+    link = 12,
+    /// `--ofmt=<c|llvm>` – select Tier A (`c`) or Tier B (`llvm`) codegen backend (`13`).
+    ofmt = 13,
+    /// `--output=<path>` / `-o` – write compiled artifact to `<path>` (`14`).
+    output = 14,
+    /// `--release` – compile in production release mode (`15`).
+    release = 15,
+    /// `--sast-strict` – emit `W0314` warnings on unproven bounds checks (`16`).
+    sast_strict = 16,
+    /// `--target=<triple>` – select cross-compilation target triple (`17`).
+    target = 17,
 };
 
 /// Static metadata entry in `COMPILE_FLAGS` describing `build`/`run`/`check`/`test` flags.
 pub const CompileFlagDescriptor = struct {
     /// Strongly typed compilation flag enum tag.
     id: CompileFlagId,
+    /// Optional short flag token (e.g., `"-D"`, `"-I"`, `"-l"`, `"-L"`, `"-o"`).
+    short_flag: ?[]const u8 = null,
     /// Canonical long flag token (e.g., `"--comptime-limit"`).
     long_flag: []const u8,
     /// Optional value placeholder suffix (e.g., `"=<steps>"`).
@@ -231,12 +273,24 @@ pub const CommandAction = union(enum) {
         is_emit_c: bool = false,
         /// Whether `--emit-llvm` textual LLVM `.ll` IR emission was requested.
         is_emit_llvm: bool = false,
+        /// Whether `--emit-obj` relocatable object file emission was requested.
+        is_emit_obj: bool = false,
         /// Whether `--fuzz` `SanitizerCoverage` instrumentation was requested.
         is_fuzz_enabled: bool = false,
         /// Whether `--internal-core` was passed to permit direct `core.*` kernel imports.
         is_internal_core: bool = false,
         /// Selected codegen backend family (`llvm` by default, or `c` with `-ofmt=c`).
         output_format: OutputFormat = .llvm,
+        /// Selected binary linkage mode (`auto` by default, `static`, or `dynamic`).
+        link_mode: codegen_abi.LinkMode = .auto,
+        /// Arena-allocated `-D` / `--define` C preprocessor macro definitions.
+        c_defines: []const c_frontend.MacroDefine = &.{},
+        /// Arena-allocated `-I` / `--include-dir` C `#include` search directories.
+        include_dirs: []const []const u8 = &.{},
+        /// Arena-allocated `-l` / `--lib` C libraries or `.def`/`.lib`/`.a` inputs.
+        extra_libs: []const []const u8 = &.{},
+        /// Arena-allocated `-L` / `--lib-dir` library search directories.
+        lib_dirs: []const []const u8 = &.{},
         /// Optional explicit output artifact path (`-o <path>` / `--output=<path>`).
         output_path: ?[]const u8 = null,
         /// Optional explicit target specification (`--target=<triple>`).
@@ -268,12 +322,24 @@ pub const ParsedCommand = struct {
     is_emit_c: bool = false,
     /// Whether `--emit-llvm` was passed on a compile subcommand.
     is_emit_llvm: bool = false,
+    /// Whether `--emit-obj` was passed on a compile subcommand.
+    is_emit_obj: bool = false,
     /// Whether `--fuzz` was passed on a compile subcommand.
     is_fuzz_enabled: bool = false,
-    /// Whether `--internal-core` was passed on a compile/check subcommand.
+    /// Whether `--internal-core` was passed on a compile/check/translate-c/fmt/upgrade subcommand.
     is_internal_core: bool = false,
     /// Selected codegen backend family (`llvm` by default).
     output_format: OutputFormat = .llvm,
+    /// Selected binary linkage mode (`auto` by default, `static`, or `dynamic`).
+    link_mode: codegen_abi.LinkMode = .auto,
+    /// Arena-allocated `-D` / `--define` C preprocessor macro definitions.
+    c_defines: []const c_frontend.MacroDefine = &.{},
+    /// Arena-allocated `-I` / `--include-dir` C `#include` search directories.
+    include_dirs: []const []const u8 = &.{},
+    /// Arena-allocated `-l` / `--lib` C libraries or `.def`/`.lib`/`.a` inputs.
+    extra_libs: []const []const u8 = &.{},
+    /// Arena-allocated `-L` / `--lib-dir` library search directories.
+    lib_dirs: []const []const u8 = &.{},
     /// Optional explicit output path (`-o` / `--output`).
     output_path: ?[]const u8 = null,
     /// Optional explicit target specification (`--target`).
@@ -291,19 +357,19 @@ pub const DEFAULT_COMPTIME_STEP_LIMIT: u64 = 10_000_000;
 /// Maximum Levenshtein edit distance eligible for typo suggestions.
 pub const MAX_EDIT_DISTANCE: usize = 2;
 
-/// Canonical subcommand table (`phase0_spec.md` Section 9.1).
+/// Canonical alphabetical subcommand table (`PLAN.md` Phase 8 & `AGENTS.md` Section 6).
 pub const SUBCOMMANDS = [_]SubcommandDescriptor{
+    .{
+        .id = .bench,
+        .name = "bench",
+        .usage = "[filter]",
+        .summary = "Run statistical performance benchmarks and emit monochrome report tables",
+    },
     .{
         .id = .build,
         .name = "build",
         .usage = "[path]",
         .summary = "Compile a CoreX package or source file into a native or WebAssembly artifact",
-    },
-    .{
-        .id = .run,
-        .name = "run",
-        .usage = "[path] [-- args…]",
-        .summary = "Compile and immediately execute a CoreX binary",
     },
     .{
         .id = .check,
@@ -312,22 +378,10 @@ pub const SUBCOMMANDS = [_]SubcommandDescriptor{
         .summary = "Run fast syntax, type, region, and SAST verification without codegen",
     },
     .{
-        .id = .@"test",
-        .name = "test",
-        .usage = "[filter]",
-        .summary = "Compile and execute unit, snapshot, and safety verification suites",
-    },
-    .{
         .id = .fmt,
         .name = "fmt",
         .usage = "[path…]",
         .summary = "Format CoreX source files canonically using the lossless CST",
-    },
-    .{
-        .id = .upgrade,
-        .name = "upgrade",
-        .usage = "[path…]",
-        .summary = "Apply automated AST/CST migrations and machine-applicable fixes",
     },
     .{
         .id = .lsp,
@@ -336,12 +390,42 @@ pub const SUBCOMMANDS = [_]SubcommandDescriptor{
         .summary = "Start the CoreX Language Server Protocol (LSP) daemon over stdio",
     },
     .{
-        .id = .bench,
-        .name = "bench",
+        .id = .run,
+        .name = "run",
+        .usage = "[path] [-- args…]",
+        .summary = "Compile and immediately execute a CoreX binary",
+    },
+    .{
+        .id = .@"test",
+        .name = "test",
         .usage = "[filter]",
-        .summary = "Run statistical performance benchmarks and emit monochrome report tables",
+        .summary = "Compile and execute unit, snapshot, and safety verification suites",
+    },
+    .{
+        .id = .translate_c,
+        .name = "translate-c",
+        .usage = "<header.h>",
+        .summary = "Translate a C11/C23 header into canonical CoreX (.cx) bindings",
+    },
+    .{
+        .id = .upgrade,
+        .name = "upgrade",
+        .usage = "[path…]",
+        .summary = "Apply automated AST/CST migrations and machine-applicable fixes",
     },
 };
+
+/// Canonical Phase 8 alias for the 9-entry alphabetical `SUBCOMMANDS` registry.
+pub const CLI_SUBCOMMANDS = SUBCOMMANDS;
+
+/// $O(1)$ compile-time lookup table mapping CLI subcommand tokens to `SubcommandId`.
+const SUBCOMMAND_NAME_MAP = std.StaticStringMap(SubcommandId).initComptime(blk: {
+    var entries: [SUBCOMMANDS.len]struct { []const u8, SubcommandId } = undefined;
+    for (SUBCOMMANDS, 0..) |descriptor, i| {
+        entries[i] = .{ descriptor.name, descriptor.id };
+    }
+    break :blk entries;
+});
 
 /// Canonical global option table (`phase0_spec.md` Section 9.1).
 pub const GLOBAL_FLAGS = [_]GlobalFlagDescriptor{
@@ -396,7 +480,46 @@ pub const UPGRADE_FLAGS = [_]UpgradeFlagDescriptor{
     },
 };
 
-/// Canonical compilation and verification option table (`build`, `run`, `check`, `test`).
+/// Canonical alphabetical `corex translate-c` option table (`DR-10` Section 2 & `PLAN.md` Phase 8).
+pub const TRANSLATE_C_FLAGS = [_]TranslateCFlagDescriptor{
+    .{
+        .id = .define,
+        .short_flag = "-D",
+        .long_flag = "--define",
+        .value_suffix = "=<name[=val]>",
+        .summary = "Define C preprocessor macro (`-D <name[=val]>`)",
+    },
+    .{
+        .id = .include_dir,
+        .short_flag = "-I",
+        .long_flag = "--include-dir",
+        .value_suffix = "=<dir>",
+        .summary = "Add C `#include` search directory (`-I <dir>`)",
+    },
+    .{
+        .id = .internal_core,
+        .short_flag = null,
+        .long_flag = "--internal-core",
+        .value_suffix = null,
+        .summary = "Emit `use core.ffi.*` instead of `use cx.ffi.*`",
+    },
+    .{
+        .id = .output,
+        .short_flag = "-o",
+        .long_flag = "--output",
+        .value_suffix = "=<path>",
+        .summary = "Write translated `.cx` bindings atomically to `<path>`",
+    },
+    .{
+        .id = .target,
+        .short_flag = null,
+        .long_flag = "--target",
+        .value_suffix = "=<triple>",
+        .summary = "Select target C ABI triple (default: host)",
+    },
+};
+
+/// Canonical alphabetical compilation and verification option table (`build`, `run`, `check`, `test`).
 pub const COMPILE_FLAGS = [_]CompileFlagDescriptor{
     .{
         .id = .comptime_limit,
@@ -406,6 +529,13 @@ pub const COMPILE_FLAGS = [_]CompileFlagDescriptor{
             "Set maximum compile-time VM step budget (default: {d})",
             .{DEFAULT_COMPTIME_STEP_LIMIT},
         ),
+    },
+    .{
+        .id = .define,
+        .short_flag = "-D",
+        .long_flag = "--define",
+        .value_suffix = "=<name[=val]>",
+        .summary = "Define C preprocessor macro (`-D <name[=val]>`)",
     },
     .{
         .id = .dev,
@@ -432,16 +562,49 @@ pub const COMPILE_FLAGS = [_]CompileFlagDescriptor{
         .summary = "Emit deterministic LLVM 20–23 IR text without linking",
     },
     .{
+        .id = .emit_obj,
+        .long_flag = "--emit-obj",
+        .value_suffix = null,
+        .summary = "Emit relocatable `.o` / `.obj` object file without linking",
+    },
+    .{
         .id = .fuzz,
         .long_flag = "--fuzz",
         .value_suffix = null,
         .summary = "Instrument compiled output with SanitizerCoverage counters",
     },
     .{
+        .id = .include_dir,
+        .short_flag = "-I",
+        .long_flag = "--include-dir",
+        .value_suffix = "=<dir>",
+        .summary = "Add C `#include` search directory (`-I <dir>`)",
+    },
+    .{
         .id = .internal_core,
         .long_flag = "--internal-core",
         .value_suffix = null,
         .summary = "Permit direct `core.*` kernel imports without `E0218`",
+    },
+    .{
+        .id = .lib,
+        .short_flag = "-l",
+        .long_flag = "--lib",
+        .value_suffix = "=<name_or_def>",
+        .summary = "Link C library or `.def`/`.lib`/`.a` input (`-l <name>`)",
+    },
+    .{
+        .id = .lib_dir,
+        .short_flag = "-L",
+        .long_flag = "--lib-dir",
+        .value_suffix = "=<dir>",
+        .summary = "Add library search directory (`-L <dir>`)",
+    },
+    .{
+        .id = .link,
+        .long_flag = "--link",
+        .value_suffix = "=<auto|static|dynamic>",
+        .summary = "Configure binary linkage mode (`auto`, `static`, or `dynamic`)",
     },
     .{
         .id = .ofmt,
@@ -451,6 +614,7 @@ pub const COMPILE_FLAGS = [_]CompileFlagDescriptor{
     },
     .{
         .id = .output,
+        .short_flag = "-o",
         .long_flag = "--output",
         .value_suffix = "=<path>",
         .summary = "Write compiled binary, object, or IR artifact to `<path>`",
@@ -515,6 +679,89 @@ fn extractPositiveStepLimit(raw_val: []const u8) ?u64 {
     return if (parsed_val > 0) parsed_val else null;
 }
 
+/// Extracts a C preprocessor `MacroDefine` (`NAME` or `NAME=VALUE`), validating the ASCII identifier.
+fn extractMacroDefine(
+    arena_alloc: std.mem.Allocator,
+    raw_spec: []const u8,
+) !?c_frontend.MacroDefine {
+    if (raw_spec.len == 0) return null;
+    const eq_idx_opt = std.mem.indexOfScalar(u8, raw_spec, '=');
+    const raw_name = if (eq_idx_opt) |eq_idx| raw_spec[0..eq_idx] else raw_spec;
+    if (raw_name.len == 0) return null;
+    if (!std.ascii.isAlphabetic(raw_name[0]) and raw_name[0] != '_') return null;
+    for (raw_name[1..]) |byte_val| {
+        if (!std.ascii.isAlphanumeric(byte_val) and byte_val != '_') return null;
+    }
+    const owned_name = try arena_alloc.dupe(u8, raw_name);
+    const owned_val: ?[]const u8 = if (eq_idx_opt) |eq_idx|
+        try arena_alloc.dupe(u8, raw_spec[eq_idx + 1 ..])
+    else
+        null;
+    return .{ .name = owned_name, .value = owned_val };
+}
+
+/// Emits an `E0003` diagnostic for a missing CLI option argument.
+fn emitMissingCliArgDiagnostic(
+    sink: *DiagnosticSink,
+    message_text: []const u8,
+    help_note: []const u8,
+) !void {
+    try sink.emit(.{
+        .code = .e0003_missing_cli_argument,
+        .severity = .err,
+        .message = message_text,
+        .notes = &.{help_note},
+    });
+}
+
+/// Matches `--long=<val>`, `--long <val>`, `-S<val>`, or `-S <val>` and extracts its arena-cloned value.
+fn tryExtractStringFlagValue(
+    raw_args: []const []const u8,
+    arg_idx: *usize,
+    long_flag: []const u8,
+    short_flag: []const u8,
+    missing_msg: []const u8,
+    missing_help: []const u8,
+    sink: *DiagnosticSink,
+    out_value: *?[]const u8,
+) !bool {
+    const arg_text = raw_args[arg_idx.*];
+    if (std.mem.startsWith(u8, arg_text, long_flag) and
+        arg_text.len > long_flag.len and
+        arg_text[long_flag.len] == '=')
+    {
+        const raw_val = arg_text[long_flag.len + 1 ..];
+        if (raw_val.len == 0) {
+            try emitMissingCliArgDiagnostic(sink, missing_msg, missing_help);
+            out_value.* = null;
+        } else {
+            out_value.* = try sink.arena.asAllocator().dupe(u8, raw_val);
+        }
+        return true;
+    }
+    if (std.mem.eql(u8, arg_text, long_flag) or std.mem.eql(u8, arg_text, short_flag)) {
+        if (arg_idx.* + 1 >= raw_args.len or raw_args[arg_idx.* + 1].len == 0) {
+            try emitMissingCliArgDiagnostic(sink, missing_msg, missing_help);
+            out_value.* = null;
+        } else {
+            arg_idx.* += 1;
+            out_value.* = try sink.arena.asAllocator().dupe(u8, raw_args[arg_idx.*]);
+        }
+        return true;
+    }
+    if (short_flag.len == 2 and std.mem.startsWith(u8, arg_text, short_flag) and arg_text.len > 2) {
+        const raw_val = if (arg_text[2] == '=') arg_text[3..] else arg_text[2..];
+        if (raw_val.len == 0) {
+            try emitMissingCliArgDiagnostic(sink, missing_msg, missing_help);
+            out_value.* = null;
+        } else {
+            out_value.* = try sink.arena.asAllocator().dupe(u8, raw_val);
+        }
+        return true;
+    }
+    return false;
+}
+
 /// Emits an `E0001` diagnostic when `--comptime-limit` receives a non-numeric, negative, or zero value.
 fn emitInvalidComptimeLimitDiagnostic(sink: *DiagnosticSink, raw_step_val: []const u8) !void {
     try sink.emit(.{
@@ -529,6 +776,34 @@ fn emitInvalidComptimeLimitDiagnostic(sink: *DiagnosticSink, raw_step_val: []con
     });
 }
 
+/// Emits an `E0001` diagnostic when `--define` / `-D` receives an invalid C macro identifier.
+fn emitInvalidMacroDefineDiagnostic(sink: *DiagnosticSink, raw_define_spec: []const u8) !void {
+    try sink.emit(.{
+        .code = .e0001_unknown_cli_flag,
+        .severity = .err,
+        .message = try std.fmt.allocPrint(
+            sink.arena.asAllocator(),
+            "invalid C macro definition `{s}` for `--define` / `-D`",
+            .{raw_define_spec},
+        ),
+        .notes = &.{"help: pass a valid C identifier such as `-DFOO` or `--define=FOO=1`"},
+    });
+}
+
+/// Emits an `E0001` diagnostic when `--link` receives an unsupported linkage mode.
+fn emitInvalidLinkModeDiagnostic(sink: *DiagnosticSink, raw_link_val: []const u8) !void {
+    try sink.emit(.{
+        .code = .e0001_unknown_cli_flag,
+        .severity = .err,
+        .message = try std.fmt.allocPrint(
+            sink.arena.asAllocator(),
+            "invalid linkage mode `{s}` for `--link`",
+            .{raw_link_val},
+        ),
+        .notes = &.{"help: valid modes for `--link` are `auto`, `static`, or `dynamic`"},
+    });
+}
+
 /// Emits an `E0001` diagnostic when both `--dev` and `--release` are passed together.
 fn emitConflictingOptFlagsDiagnostic(sink: *DiagnosticSink) !void {
     try sink.emit(.{
@@ -539,13 +814,13 @@ fn emitConflictingOptFlagsDiagnostic(sink: *DiagnosticSink) !void {
     });
 }
 
-/// Emits an `E0001` diagnostic when both `--emit-c` and `--emit-llvm` are passed together.
+/// Emits an `E0001` diagnostic when mutually exclusive `--emit-c`, `--emit-llvm`, or `--emit-obj` flags collide.
 fn emitConflictingEmitFlagsDiagnostic(sink: *DiagnosticSink) !void {
     try sink.emit(.{
         .code = .e0001_unknown_cli_flag,
         .severity = .err,
-        .message = "conflicting CLI emission flags `--emit-c` and `--emit-llvm`",
-        .notes = &.{"help: pass either `--emit-c` or `--emit-llvm`, not both"},
+        .message = "conflicting CLI emission flags among `--emit-c`, `--emit-llvm`, and `--emit-obj`",
+        .notes = &.{"help: pass at most one of `--emit-c`, `--emit-llvm`, or `--emit-obj`"},
     });
 }
 
@@ -679,6 +954,9 @@ fn discoverExternalSubmodulesRecursive(
         has_core_mention_out.* = true;
     }
     _ = try db.setInput(parent_fid, parent_src, durability);
+    if (pkg_id != .root) {
+        try db.setFilePackageId(parent_fid, pkg_id);
+    }
 
     var ext_mod_names: std.ArrayListUnmanaged([]const u8) = .empty;
     defer ext_mod_names.deinit(allocator);
@@ -903,6 +1181,206 @@ fn buildConfiguredBackend(
     };
 }
 
+/// Renders a single aligned CLI option row (`short_flag`, `long_flag`, `value_suffix`, and `summary`).
+fn renderOptionLine(
+    writer: *std.Io.Writer,
+    style_config: StyleConfig,
+    short_flag: ?[]const u8,
+    long_flag: []const u8,
+    value_suffix: ?[]const u8,
+    col_width: usize,
+    summary: []const u8,
+) std.Io.Writer.Error!void {
+    var flag_buf: [64]u8 = undefined;
+    var flag_writer = std.Io.Writer.fixed(&flag_buf);
+    if (short_flag) |short_str| {
+        flag_writer.print("{s}, {s}", .{ short_str, long_flag }) catch unreachable;
+    } else {
+        flag_writer.print("    {s}", .{long_flag}) catch unreachable;
+    }
+    if (value_suffix) |suffix_str| {
+        flag_writer.writeAll(suffix_str) catch unreachable;
+    }
+    const formatted_flag = flag_writer.buffered();
+    try writer.writeAll("  ");
+    try style_config.writeStyled(writer, .bold, formatted_flag);
+    if (formatted_flag.len < col_width) {
+        try writer.splatByteAll(' ', col_width - formatted_flag.len);
+    } else {
+        try writer.writeByte(' ');
+    }
+    try writer.writeAll(summary);
+    try writer.writeByte('\n');
+}
+
+/// Loads `file_path` into `source_map` with its `LineIndex`, emitting `E0004` or `E0005` on failure.
+fn loadSourceFileIntoVfs(
+    io: std.Io,
+    source_map: *vfs.VfsSourceMap,
+    file_path: []const u8,
+    sink: *DiagnosticSink,
+) !?mem.FileId {
+    const file_id = source_map.resolveOrCreatePath(io, file_path, .root) catch |vfs_err| switch (vfs_err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.FileTooLarge => {
+            try sink.emit(.{
+                .code = .e0005_source_file_size_exceeded,
+                .severity = .err,
+                .message = try std.fmt.allocPrint(
+                    sink.arena.asAllocator(),
+                    "source file `{s}` exceeds the 64 MiB maximum size limit",
+                    .{file_path},
+                ),
+            });
+            return null;
+        },
+        else => {
+            try sink.emit(.{
+                .code = .e0004_source_file_io_error,
+                .severity = .err,
+                .message = try std.fmt.allocPrint(
+                    sink.arena.asAllocator(),
+                    "failed to open or read source file `{s}`",
+                    .{file_path},
+                ),
+            });
+            return null;
+        },
+    };
+    _ = try source_map.getLineIndex(file_id);
+    return file_id;
+}
+
+/// Executes `corex translate-c <header.h>` and writes canonical `.cx` bindings to `-o <path>` or `stdout_writer`.
+fn executeTranslateCSubcommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_map: *vfs.VfsSourceMap,
+    interner: *mem.StringInterner,
+    sink: *DiagnosticSink,
+    positional_args: []const []const u8,
+    target_spec_opt: ?codegen_abi.TargetSpec,
+    c_defines: []const c_frontend.MacroDefine,
+    include_dirs: []const []const u8,
+    is_internal_core: bool,
+    output_path_opt: ?[]const u8,
+    stdout_style: StyleConfig,
+    stderr_style: StyleConfig,
+    stdout_writer: *std.Io.Writer,
+    stderr_writer: *std.Io.Writer,
+) !u8 {
+    // [1] Require a single `<header.h>` positional input path:
+    if (positional_args.len == 0) {
+        try emitMissingCliArgDiagnostic(
+            sink,
+            "missing required `<header.h>` argument for `corex translate-c`",
+            "help: run `corex translate-c <header.h>` or `corex translate-c -o bindings.cx <header.h>`",
+        );
+        try DiagnosticRenderer.init(source_map, interner, stderr_style).renderAll(stderr_writer, sink);
+        return 1;
+    }
+    if (positional_args.len > 1) {
+        try sink.emit(.{
+            .code = .e0001_unknown_cli_flag,
+            .severity = .err,
+            .message = try std.fmt.allocPrint(
+                sink.arena.asAllocator(),
+                "unexpected extra positional argument `{s}` for `corex translate-c`",
+                .{positional_args[1]},
+            ),
+            .notes = &.{"help: `corex translate-c` accepts a single `<header.h>` path"},
+        });
+        try DiagnosticRenderer.init(source_map, interner, stderr_style).renderAll(stderr_writer, sink);
+        return 1;
+    }
+
+    // [2] Load `<header.h>` into `VfsSourceMap` so `E0009` C spans render with source snippets:
+    const header_path = positional_args[0];
+    const active_target = target_spec_opt orelse codegen_abi.TargetSpec.host();
+    const header_fid = (try loadSourceFileIntoVfs(io, source_map, header_path, sink)) orelse {
+        try DiagnosticRenderer.init(source_map, interner, stderr_style).renderAll(stderr_writer, sink);
+        return 1;
+    };
+    const header_source = source_map.getFileSource(header_fid) orelse "";
+
+    // [3] Assemble `-I` search directories plus `<header.h>`'s parent directory for `#include "…"`:
+    var effective_include_dirs: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer effective_include_dirs.deinit(allocator);
+    try effective_include_dirs.appendSlice(allocator, include_dirs);
+    const header_dir = std.fs.path.dirname(header_path) orelse ".";
+    var has_header_dir = false;
+    for (effective_include_dirs.items) |existing_dir| {
+        if (std.mem.eql(u8, existing_dir, header_dir)) {
+            has_header_dir = true;
+            break;
+        }
+    }
+    if (!has_header_dir) {
+        try effective_include_dirs.append(allocator, header_dir);
+    }
+
+    // [4] Preprocess, parse, and translate C11/C23 declarations into formatted CoreX v1.0 `.cx` source:
+    const translated_cx = c_translate.translateHeaderSource(
+        allocator,
+        header_source,
+        header_path,
+        header_fid,
+        .{
+            .target = active_target,
+            .defines = c_defines,
+            .include_dirs = effective_include_dirs.items,
+            .include_loader = .{ .host_fs = io },
+        },
+        .{
+            .is_internal_core = is_internal_core,
+        },
+        sink,
+    ) catch |trans_err| switch (trans_err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            if (sink.hasErrors()) {
+                try DiagnosticRenderer.init(source_map, interner, stderr_style).renderAll(stderr_writer, sink);
+            }
+            return 1;
+        },
+    };
+    defer allocator.free(translated_cx);
+
+    if (sink.hasErrors()) {
+        try DiagnosticRenderer.init(source_map, interner, stderr_style).renderAll(stderr_writer, sink);
+        return 1;
+    }
+
+    // [5] Emit atomically to `-o <path>` or write directly to `stdout_writer`:
+    if (output_path_opt) |dest_path| {
+        codegen_abi.writeArtifactAtomic(io, allocator, dest_path, translated_cx) catch {
+            try sink.emit(.{
+                .code = .e0004_source_file_io_error,
+                .severity = .err,
+                .message = try std.fmt.allocPrint(
+                    sink.arena.asAllocator(),
+                    "failed to write translated CoreX bindings file `{s}`",
+                    .{dest_path},
+                ),
+            });
+            try DiagnosticRenderer.init(source_map, interner, stderr_style).renderAll(stderr_writer, sink);
+            return 1;
+        };
+        try stdout_style.writeStatusHeader(
+            stdout_writer,
+            .success,
+            Glyphs.SUCCESS,
+            "translate-c",
+            dest_path,
+        );
+        try stdout_writer.writeByte('\n');
+        return 0;
+    }
+
+    try stdout_writer.writeAll(translated_cx);
+    return 0;
+}
+
 // ------------------------------------- PUBLIC API --------------------------------------
 
 /// Computes bounded Wagner–Fischer Levenshtein edit distance using a fixed stack buffer (zero heap allocations).
@@ -968,6 +1446,7 @@ pub fn suggestFlagForSubcommand(unknown_flag: []const u8, subcommand: ?Subcomman
         unknown_flag[0..eq_idx]
     else
         unknown_flag;
+    const is_long_input = std.mem.startsWith(u8, flag_name, "--");
 
     var best_match: ?[]const u8 = null;
     var best_distance: usize = MAX_EDIT_DISTANCE + 1;
@@ -1001,6 +1480,23 @@ pub fn suggestFlagForSubcommand(unknown_flag: []const u8, subcommand: ?Subcomman
                 best_match = upg_desc.long_flag;
             }
         }
+    } else if (subcommand == .translate_c) {
+        for (TRANSLATE_C_FLAGS) |tc_desc| {
+            const tc_dist = computeLevenshteinDistance(flag_name, tc_desc.long_flag);
+            if (tc_dist < best_distance) {
+                best_distance = tc_dist;
+                best_match = tc_desc.long_flag;
+            }
+            if (!is_long_input) {
+                if (tc_desc.short_flag) |short_str| {
+                    const short_dist = computeLevenshteinDistance(flag_name, short_str);
+                    if (short_dist < best_distance) {
+                        best_distance = short_dist;
+                        best_match = short_str;
+                    }
+                }
+            }
+        }
     } else if (subcommand) |sub_id| {
         if (isCompileSubcommand(sub_id)) {
             for (COMPILE_FLAGS) |comp_desc| {
@@ -1008,6 +1504,15 @@ pub fn suggestFlagForSubcommand(unknown_flag: []const u8, subcommand: ?Subcomman
                 if (comp_dist < best_distance) {
                     best_distance = comp_dist;
                     best_match = comp_desc.long_flag;
+                }
+                if (!is_long_input) {
+                    if (comp_desc.short_flag) |short_str| {
+                        const short_dist = computeLevenshteinDistance(flag_name, short_str);
+                        if (short_dist < best_distance) {
+                            best_distance = short_dist;
+                            best_match = short_str;
+                        }
+                    }
                 }
             }
         }
@@ -1017,6 +1522,7 @@ pub fn suggestFlagForSubcommand(unknown_flag: []const u8, subcommand: ?Subcomman
 
 /// Parses CLI arguments (excluding `argv[0]`), emitting `E0001`/`E0002`/`E0003`/`E0006` into `sink` on error.
 pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCommand {
+    const arena_alloc = sink.arena.asAllocator();
     var color_mode: ColorMode = .auto;
     var has_help_flag = false;
     var has_version_flag = false;
@@ -1029,13 +1535,19 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
     var is_diff_backends = false;
     var is_emit_c = false;
     var is_emit_llvm = false;
+    var is_emit_obj = false;
     var is_fuzz_enabled = false;
     var is_internal_core = false;
     var output_format: OutputFormat = .llvm;
+    var link_mode: codegen_abi.LinkMode = .auto;
+    var c_defines_list: std.ArrayListUnmanaged(c_frontend.MacroDefine) = .empty;
+    var include_dirs_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    var extra_libs_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    var lib_dirs_list: std.ArrayListUnmanaged([]const u8) = .empty;
     var output_path: ?[]const u8 = null;
     var target_spec: ?codegen_abi.TargetSpec = null;
     var selected_subcommand: ?SubcommandId = null;
-    var positional_list: std.ArrayList([]const u8) = .empty;
+    var positional_list: std.ArrayListUnmanaged([]const u8) = .empty;
     var is_after_double_dash = false;
     var pre_dash_count: ?usize = null;
 
@@ -1050,6 +1562,11 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
 
         if (!is_after_double_dash and std.mem.startsWith(u8, arg_text, "-")) {
             const is_compile_sub = selected_subcommand != null and isCompileSubcommand(selected_subcommand.?);
+            const is_compile_or_translate = is_compile_sub or selected_subcommand == .translate_c;
+            const is_ofmt_spelling = std.mem.eql(u8, arg_text, "-ofmt") or
+                std.mem.startsWith(u8, arg_text, "-ofmt=");
+            var extracted_str: ?[]const u8 = null;
+
             if (std.mem.eql(u8, arg_text, "-h") or std.mem.eql(u8, arg_text, "--help")) {
                 has_help_flag = true;
             } else if (std.mem.eql(u8, arg_text, "-V") or std.mem.eql(u8, arg_text, "--version")) {
@@ -1079,23 +1596,106 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
             } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--diff-backends")) {
                 is_diff_backends = true;
             } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--emit-c")) {
-                if (is_emit_llvm) {
+                if (is_emit_llvm or is_emit_obj) {
                     try emitConflictingEmitFlagsDiagnostic(sink);
                 }
                 is_emit_c = true;
                 output_format = .c;
             } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--emit-llvm")) {
-                if (is_emit_c) {
+                if (is_emit_c or is_emit_obj) {
                     try emitConflictingEmitFlagsDiagnostic(sink);
                 }
                 is_emit_llvm = true;
                 output_format = .llvm;
+            } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--emit-obj")) {
+                if (is_emit_c or is_emit_llvm) {
+                    try emitConflictingEmitFlagsDiagnostic(sink);
+                }
+                is_emit_obj = true;
             } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--fuzz")) {
                 is_fuzz_enabled = true;
-            } else if (is_compile_sub and
+            } else if (is_compile_or_translate and
                 std.mem.eql(u8, arg_text, COMPILE_FLAGS[@backingInt(CompileFlagId.internal_core)].long_flag))
             {
                 is_internal_core = true;
+            } else if (is_compile_or_translate and try tryExtractStringFlagValue(
+                raw_args,
+                &arg_idx,
+                "--define",
+                "-D",
+                "missing macro definition for `--define` / `-D`",
+                "help: pass `--define=<name[=val]>` or `-D <name[=val]>`",
+                sink,
+                &extracted_str,
+            )) {
+                if (extracted_str) |raw_spec| {
+                    if (try extractMacroDefine(arena_alloc, raw_spec)) |macro_def| {
+                        try c_defines_list.append(arena_alloc, macro_def);
+                    } else {
+                        try emitInvalidMacroDefineDiagnostic(sink, raw_spec);
+                    }
+                }
+            } else if (is_compile_or_translate and try tryExtractStringFlagValue(
+                raw_args,
+                &arg_idx,
+                "--include-dir",
+                "-I",
+                "missing directory path for `--include-dir` / `-I`",
+                "help: pass `--include-dir=<dir>` or `-I <dir>`",
+                sink,
+                &extracted_str,
+            )) {
+                if (extracted_str) |dir_str| {
+                    try include_dirs_list.append(arena_alloc, dir_str);
+                }
+            } else if (is_compile_sub and try tryExtractStringFlagValue(
+                raw_args,
+                &arg_idx,
+                "--lib",
+                "-l",
+                "missing library name or `.def`/`.lib`/`.a` path for `--lib` / `-l`",
+                "help: pass `--lib=<name_or_def>` or `-l <name>`",
+                sink,
+                &extracted_str,
+            )) {
+                if (extracted_str) |lib_str| {
+                    try extra_libs_list.append(arena_alloc, lib_str);
+                }
+            } else if (is_compile_sub and try tryExtractStringFlagValue(
+                raw_args,
+                &arg_idx,
+                "--lib-dir",
+                "-L",
+                "missing directory path for `--lib-dir` / `-L`",
+                "help: pass `--lib-dir=<dir>` or `-L <dir>`",
+                sink,
+                &extracted_str,
+            )) {
+                if (extracted_str) |lib_dir_str| {
+                    try lib_dirs_list.append(arena_alloc, lib_dir_str);
+                }
+            } else if (is_compile_sub and std.mem.startsWith(u8, arg_text, "--link=")) {
+                const raw_link = arg_text["--link=".len..];
+                if (codegen_abi.LinkMode.fromStr(raw_link)) |parsed_link| {
+                    link_mode = parsed_link;
+                } else {
+                    try emitInvalidLinkModeDiagnostic(sink, raw_link);
+                }
+            } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--link")) {
+                if (arg_idx + 1 >= raw_args.len) {
+                    try emitMissingCliArgDiagnostic(
+                        sink,
+                        "missing linkage mode for `--link`; expected `auto`, `static`, or `dynamic`",
+                        "help: pass `--link=auto`, `--link=static`, or `--link=dynamic`",
+                    );
+                } else {
+                    arg_idx += 1;
+                    if (codegen_abi.LinkMode.fromStr(raw_args[arg_idx])) |parsed_link| {
+                        link_mode = parsed_link;
+                    } else {
+                        try emitInvalidLinkModeDiagnostic(sink, raw_args[arg_idx]);
+                    }
+                }
             } else if (is_compile_sub and (std.mem.startsWith(u8, arg_text, "--ofmt=") or
                 std.mem.startsWith(u8, arg_text, "-ofmt=")))
             {
@@ -1110,12 +1710,11 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                 std.mem.eql(u8, arg_text, "-ofmt")))
             {
                 if (arg_idx + 1 >= raw_args.len) {
-                    try sink.emit(.{
-                        .code = .e0003_missing_cli_argument,
-                        .severity = .err,
-                        .message = "missing backend format for `--ofmt`; expected `c` or `llvm`",
-                        .notes = &.{"help: pass `--ofmt=c` (`-ofmt=c`) or `--ofmt=llvm` (`-ofmt=llvm`)"},
-                    });
+                    try emitMissingCliArgDiagnostic(
+                        sink,
+                        "missing backend format for `--ofmt`; expected `c` or `llvm`",
+                        "help: pass `--ofmt=c` (`-ofmt=c`) or `--ofmt=llvm` (`-ofmt=llvm`)",
+                    );
                 } else {
                     arg_idx += 1;
                     const next_fmt = raw_args[arg_idx];
@@ -1125,50 +1724,33 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                         try emitInvalidOutputFormatDiagnostic(sink, next_fmt);
                     }
                 }
-            } else if (is_compile_sub and (std.mem.startsWith(u8, arg_text, "--output=") or
-                std.mem.startsWith(u8, arg_text, "-o=")))
-            {
-                const eq_pos = std.mem.indexOfScalar(u8, arg_text, '=').?;
-                const raw_out = arg_text[eq_pos + 1 ..];
-                if (raw_out.len == 0) {
-                    try sink.emit(.{
-                        .code = .e0003_missing_cli_argument,
-                        .severity = .err,
-                        .message = "missing file path for `--output` / `-o`",
-                        .notes = &.{"help: pass `--output=<path>` or `-o <path>`"},
-                    });
-                } else {
-                    output_path = try sink.arena.asAllocator().dupe(u8, raw_out);
+            } else if (is_compile_or_translate and !is_ofmt_spelling and try tryExtractStringFlagValue(
+                raw_args,
+                &arg_idx,
+                "--output",
+                "-o",
+                "missing file path for `--output` / `-o`",
+                "help: pass `--output=<path>` or `-o <path>`",
+                sink,
+                &extracted_str,
+            )) {
+                if (extracted_str) |out_str| {
+                    output_path = out_str;
                 }
-            } else if (is_compile_sub and (std.mem.eql(u8, arg_text, "--output") or
-                std.mem.eql(u8, arg_text, "-o")))
-            {
-                if (arg_idx + 1 >= raw_args.len or raw_args[arg_idx + 1].len == 0) {
-                    try sink.emit(.{
-                        .code = .e0003_missing_cli_argument,
-                        .severity = .err,
-                        .message = "missing file path for `--output` / `-o`",
-                        .notes = &.{"help: pass `--output=<path>` or `-o <path>`"},
-                    });
-                } else {
-                    arg_idx += 1;
-                    output_path = try sink.arena.asAllocator().dupe(u8, raw_args[arg_idx]);
-                }
-            } else if (is_compile_sub and std.mem.startsWith(u8, arg_text, "--target=")) {
+            } else if (is_compile_or_translate and std.mem.startsWith(u8, arg_text, "--target=")) {
                 const raw_triple = arg_text["--target=".len..];
                 target_spec = try codegen_abi.TargetSpec.parseOrEmitInvalidTarget(
                     raw_triple,
                     mem.Span.ZERO,
                     sink,
                 );
-            } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--target")) {
+            } else if (is_compile_or_translate and std.mem.eql(u8, arg_text, "--target")) {
                 if (arg_idx + 1 >= raw_args.len) {
-                    try sink.emit(.{
-                        .code = .e0003_missing_cli_argument,
-                        .severity = .err,
-                        .message = "missing target triple for `--target`",
-                        .notes = &.{"help: pass `--target=<triple>` (e.g., `--target=wasm32-wasi`)"},
-                    });
+                    try emitMissingCliArgDiagnostic(
+                        sink,
+                        "missing target triple for `--target`",
+                        "help: pass `--target=<triple>` (e.g., `--target=wasm32-wasi`)",
+                    );
                 } else {
                     arg_idx += 1;
                     target_spec = try codegen_abi.TargetSpec.parseOrEmitInvalidTarget(
@@ -1186,12 +1768,11 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                 }
             } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--comptime-limit")) {
                 if (arg_idx + 1 >= raw_args.len) {
-                    try sink.emit(.{
-                        .code = .e0003_missing_cli_argument,
-                        .severity = .err,
-                        .message = "missing step count for `--comptime-limit`; expected positive integer",
-                        .notes = &.{"help: pass `--comptime-limit=<steps>` (e.g., `--comptime-limit=10000000`)"},
-                    });
+                    try emitMissingCliArgDiagnostic(
+                        sink,
+                        "missing step count for `--comptime-limit`; expected positive integer",
+                        "help: pass `--comptime-limit=<steps>` (e.g., `--comptime-limit=10000000`)",
+                    );
                 } else {
                     arg_idx += 1;
                     const next_val = raw_args[arg_idx];
@@ -1210,12 +1791,11 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                 }
             } else if (std.mem.eql(u8, arg_text, "--color")) {
                 if (arg_idx + 1 >= raw_args.len) {
-                    try sink.emit(.{
-                        .code = .e0003_missing_cli_argument,
-                        .severity = .err,
-                        .message = "missing value for `--color`; expected `auto`, `always`, or `never`",
-                        .notes = &.{"help: pass `--color=auto`, `--color=always`, or `--color=never`"},
-                    });
+                    try emitMissingCliArgDiagnostic(
+                        sink,
+                        "missing value for `--color`; expected `auto`, `always`, or `never`",
+                        "help: pass `--color=auto`, `--color=always`, or `--color=never`",
+                    );
                 } else {
                     arg_idx += 1;
                     const next_val = raw_args[arg_idx];
@@ -1238,7 +1818,7 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                 try emitUnknownSubcommandDiagnostic(sink, arg_text);
             }
         } else {
-            try positional_list.append(sink.arena.asAllocator(), arg_text);
+            try positional_list.append(arena_alloc, arg_text);
         }
     }
 
@@ -1264,9 +1844,15 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
             .is_diff_backends = is_diff_backends,
             .is_emit_c = is_emit_c,
             .is_emit_llvm = is_emit_llvm,
+            .is_emit_obj = is_emit_obj,
             .is_fuzz_enabled = is_fuzz_enabled,
             .is_internal_core = is_internal_core,
             .output_format = output_format,
+            .link_mode = link_mode,
+            .c_defines = c_defines_list.items,
+            .include_dirs = include_dirs_list.items,
+            .extra_libs = extra_libs_list.items,
+            .lib_dirs = lib_dirs_list.items,
             .output_path = output_path,
             .target_spec = target_spec,
             .run_args = forwarded_run_args,
@@ -1284,9 +1870,15 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                     .is_diff_backends = is_diff_backends,
                     .is_emit_c = is_emit_c,
                     .is_emit_llvm = is_emit_llvm,
+                    .is_emit_obj = is_emit_obj,
                     .is_fuzz_enabled = is_fuzz_enabled,
                     .is_internal_core = is_internal_core,
                     .output_format = output_format,
+                    .link_mode = link_mode,
+                    .c_defines = c_defines_list.items,
+                    .include_dirs = include_dirs_list.items,
+                    .extra_libs = extra_libs_list.items,
+                    .lib_dirs = lib_dirs_list.items,
                     .output_path = output_path,
                     .target_spec = target_spec,
                 },
@@ -1309,7 +1901,7 @@ pub fn renderHelp(writer: *std.Io.Writer, style_config: StyleConfig) std.Io.Writ
     );
     try writer.writeByte('\n');
 
-    // [2] Render canonical `SUBCOMMANDS` section:
+    // [2] Render canonical alphabetical `SUBCOMMANDS` section:
     try style_config.writeStyled(writer, .bold, "Commands:");
     try writer.writeByte('\n');
     for (SUBCOMMANDS) |descriptor| {
@@ -1317,11 +1909,8 @@ pub fn renderHelp(writer: *std.Io.Writer, style_config: StyleConfig) std.Io.Writ
         try style_config.writeStyled(writer, .dim, Glyphs.POINTER_SOLID);
         try writer.writeByte(' ');
         try style_config.writeStyled(writer, .bold, descriptor.name);
-        if (descriptor.name.len < 10) {
-            try writer.splatByteAll(' ', 10 - descriptor.name.len);
-        } else {
-            try writer.writeByte(' ');
-        }
+        const pad_spaces: usize = if (descriptor.name.len < 13) 13 - descriptor.name.len else 2;
+        try writer.splatByteAll(' ', pad_spaces);
         try writer.writeAll(descriptor.summary);
         try writer.writeByte('\n');
     }
@@ -1331,27 +1920,15 @@ pub fn renderHelp(writer: *std.Io.Writer, style_config: StyleConfig) std.Io.Writ
     try style_config.writeStyled(writer, .bold, "Global Options:");
     try writer.writeByte('\n');
     for (GLOBAL_FLAGS) |flag_desc| {
-        var flag_label_buf: [64]u8 = undefined;
-        var label_writer = std.Io.Writer.fixed(&flag_label_buf);
-        if (flag_desc.short_flag) |short_str| {
-            label_writer.print("{s}, {s}", .{ short_str, flag_desc.long_flag }) catch unreachable;
-        } else {
-            label_writer.print("    {s}", .{flag_desc.long_flag}) catch unreachable;
-        }
-        if (flag_desc.value_suffix) |suffix_str| {
-            label_writer.writeAll(suffix_str) catch unreachable;
-        }
-        const formatted_flag = label_writer.buffered();
-
-        try writer.writeAll("  ");
-        try style_config.writeStyled(writer, .bold, formatted_flag);
-        if (formatted_flag.len < 20) {
-            try writer.splatByteAll(' ', 20 - formatted_flag.len);
-        } else {
-            try writer.writeByte(' ');
-        }
-        try writer.writeAll(flag_desc.summary);
-        try writer.writeByte('\n');
+        try renderOptionLine(
+            writer,
+            style_config,
+            flag_desc.short_flag,
+            flag_desc.long_flag,
+            flag_desc.value_suffix,
+            20,
+            flag_desc.summary,
+        );
     }
 }
 
@@ -1385,60 +1962,60 @@ pub fn renderSubcommandHelp(
         try style_config.writeStyled(writer, .bold, "Compile Options:");
         try writer.writeByte('\n');
         for (COMPILE_FLAGS) |comp_desc| {
-            var flag_buf: [64]u8 = undefined;
-            var flag_writer = std.Io.Writer.fixed(&flag_buf);
-            flag_writer.print("    {s}", .{comp_desc.long_flag}) catch unreachable;
-            if (comp_desc.value_suffix) |suffix_str| {
-                flag_writer.writeAll(suffix_str) catch unreachable;
-            }
-            const formatted_flag = flag_writer.buffered();
-            try writer.writeAll("  ");
-            try style_config.writeStyled(writer, .bold, formatted_flag);
-            if (formatted_flag.len < 28) {
-                try writer.splatByteAll(' ', 28 - formatted_flag.len);
-            } else {
-                try writer.writeByte(' ');
-            }
-            try writer.writeAll(comp_desc.summary);
-            try writer.writeByte('\n');
+            try renderOptionLine(
+                writer,
+                style_config,
+                comp_desc.short_flag,
+                comp_desc.long_flag,
+                comp_desc.value_suffix,
+                34,
+                comp_desc.summary,
+            );
+        }
+        try writer.writeByte('\n');
+    } else if (subcommand == .translate_c) {
+        try style_config.writeStyled(writer, .bold, "Translate-C Options:");
+        try writer.writeByte('\n');
+        for (TRANSLATE_C_FLAGS) |tc_desc| {
+            try renderOptionLine(
+                writer,
+                style_config,
+                tc_desc.short_flag,
+                tc_desc.long_flag,
+                tc_desc.value_suffix,
+                28,
+                tc_desc.summary,
+            );
         }
         try writer.writeByte('\n');
     } else if (subcommand == .fmt) {
         try style_config.writeStyled(writer, .bold, "Format Options:");
         try writer.writeByte('\n');
         for (FMT_FLAGS) |fmt_desc| {
-            var flag_buf: [64]u8 = undefined;
-            var flag_writer = std.Io.Writer.fixed(&flag_buf);
-            flag_writer.print("    {s}", .{fmt_desc.long_flag}) catch unreachable;
-            const formatted_flag = flag_writer.buffered();
-            try writer.writeAll("  ");
-            try style_config.writeStyled(writer, .bold, formatted_flag);
-            if (formatted_flag.len < 22) {
-                try writer.splatByteAll(' ', 22 - formatted_flag.len);
-            } else {
-                try writer.writeByte(' ');
-            }
-            try writer.writeAll(fmt_desc.summary);
-            try writer.writeByte('\n');
+            try renderOptionLine(
+                writer,
+                style_config,
+                null,
+                fmt_desc.long_flag,
+                null,
+                22,
+                fmt_desc.summary,
+            );
         }
         try writer.writeByte('\n');
     } else if (subcommand == .upgrade) {
         try style_config.writeStyled(writer, .bold, "Upgrade Options:");
         try writer.writeByte('\n');
         for (UPGRADE_FLAGS) |upg_desc| {
-            var flag_buf: [64]u8 = undefined;
-            var flag_writer = std.Io.Writer.fixed(&flag_buf);
-            flag_writer.print("    {s}", .{upg_desc.long_flag}) catch unreachable;
-            const formatted_flag = flag_writer.buffered();
-            try writer.writeAll("  ");
-            try style_config.writeStyled(writer, .bold, formatted_flag);
-            if (formatted_flag.len < 22) {
-                try writer.splatByteAll(' ', 22 - formatted_flag.len);
-            } else {
-                try writer.writeByte(' ');
-            }
-            try writer.writeAll(upg_desc.summary);
-            try writer.writeByte('\n');
+            try renderOptionLine(
+                writer,
+                style_config,
+                null,
+                upg_desc.long_flag,
+                null,
+                22,
+                upg_desc.summary,
+            );
         }
         try writer.writeByte('\n');
     }
@@ -1446,27 +2023,15 @@ pub fn renderSubcommandHelp(
     try style_config.writeStyled(writer, .bold, "Global Options:");
     try writer.writeByte('\n');
     for (GLOBAL_FLAGS) |flag_desc| {
-        var flag_label_buf: [64]u8 = undefined;
-        var label_writer = std.Io.Writer.fixed(&flag_label_buf);
-        if (flag_desc.short_flag) |short_str| {
-            label_writer.print("{s}, {s}", .{ short_str, flag_desc.long_flag }) catch unreachable;
-        } else {
-            label_writer.print("    {s}", .{flag_desc.long_flag}) catch unreachable;
-        }
-        if (flag_desc.value_suffix) |suffix_str| {
-            label_writer.writeAll(suffix_str) catch unreachable;
-        }
-        const formatted_flag = label_writer.buffered();
-
-        try writer.writeAll("  ");
-        try style_config.writeStyled(writer, .bold, formatted_flag);
-        if (formatted_flag.len < 20) {
-            try writer.splatByteAll(' ', 20 - formatted_flag.len);
-        } else {
-            try writer.writeByte(' ');
-        }
-        try writer.writeAll(flag_desc.summary);
-        try writer.writeByte('\n');
+        try renderOptionLine(
+            writer,
+            style_config,
+            flag_desc.short_flag,
+            flag_desc.long_flag,
+            flag_desc.value_suffix,
+            20,
+            flag_desc.summary,
+        );
     }
 }
 
@@ -1522,6 +2087,25 @@ pub fn runCli(
             if (exec_info.subcommand == .bench) {
                 try bench_harness.runDefaultPhase0Suite(allocator, io, stdout_writer, stdout_style);
                 return 0;
+            }
+            if (exec_info.subcommand == .translate_c) {
+                return executeTranslateCSubcommand(
+                    allocator,
+                    io,
+                    &source_map,
+                    &interner,
+                    &sink,
+                    exec_info.positional_args,
+                    exec_info.target_spec,
+                    exec_info.c_defines,
+                    exec_info.include_dirs,
+                    exec_info.is_internal_core,
+                    exec_info.output_path,
+                    stdout_style,
+                    stderr_style,
+                    stdout_writer,
+                    stderr_writer,
+                );
             }
             if (exec_info.subcommand == .fmt) {
                 var expanded_fmt_paths: std.ArrayListUnmanaged([]u8) = .empty;
@@ -1667,19 +2251,7 @@ pub fn runCli(
             var embed_sandbox_root: []const u8 = ".";
 
             for (expanded_paths.items) |file_arg| {
-                const file_id = source_map.resolveOrCreatePath(io, file_arg, .root) catch {
-                    try sink.emit(.{
-                        .code = .e0004_source_file_io_error,
-                        .severity = .err,
-                        .message = try std.fmt.allocPrint(
-                            sink.arena.asAllocator(),
-                            "failed to open or read source file `{s}`",
-                            .{file_arg},
-                        ),
-                    });
-                    continue;
-                };
-                _ = try source_map.getLineIndex(file_id);
+                const file_id = (try loadSourceFileIntoVfs(io, &source_map, file_arg, &sink)) orelse continue;
                 if (std.mem.endsWith(u8, file_arg, ".cx")) {
                     if (cx_file_ids.items.len == 0) {
                         embed_sandbox_root = std.fs.path.dirname(file_arg) orelse ".";
@@ -1758,6 +2330,8 @@ pub fn runCli(
                         const artifact_kind: codegen_abi.OutputArtifactKind =
                             if (exec_info.is_emit_c or exec_info.is_emit_llvm)
                                 .source_text
+                            else if (exec_info.is_emit_obj)
+                                .object_file
                             else if (has_main)
                                 .executable
                             else
@@ -1768,6 +2342,8 @@ pub fn runCli(
                             .source_text => if (exec_info.output_format == .c) ".c" else ".ll",
                             .executable => active_target.executableExtension(),
                             .object_file => active_target.objectExtension(),
+                            .static_library => active_target.defaultStaticLibExtension(),
+                            .shared_library => active_target.defaultSharedLibExtension(),
                         };
                         const default_out = try std.fmt.allocPrint(
                             allocator,
@@ -1789,6 +2365,9 @@ pub fn runCli(
                             .vfs_source_map = &source_map,
                             .is_dev_got_enabled = false,
                             .artifact_kind = artifact_kind,
+                            .link_mode = exec_info.link_mode,
+                            .extra_libs = exec_info.extra_libs,
+                            .lib_dirs = exec_info.lib_dirs,
                             .output_path = final_out_path,
                             .io = io,
                             .environ_map = environ_map,
@@ -1839,10 +2418,16 @@ pub fn runCli(
                         defer std.Io.Dir.cwd().deleteTree(io, scratch_dir) catch {};
 
                         const stem = std.fs.path.stem(cx_file_paths.items[0]);
+                        const run_artifact_kind: codegen_abi.OutputArtifactKind =
+                            if (exec_info.is_emit_obj) .object_file else .executable;
+                        const run_ext = if (exec_info.is_emit_obj)
+                            host_target.objectExtension()
+                        else
+                            host_target.executableExtension();
                         const temp_exe_path = try std.fmt.allocPrint(
                             allocator,
                             "{s}/{s}{s}",
-                            .{ scratch_dir, stem, host_target.executableExtension() },
+                            .{ scratch_dir, stem, run_ext },
                         );
                         defer allocator.free(temp_exe_path);
                         const final_exe_path = exec_info.output_path orelse temp_exe_path;
@@ -1858,7 +2443,10 @@ pub fn runCli(
                             .extra_file_ids = cx_file_ids.items[1..],
                             .vfs_source_map = &source_map,
                             .is_dev_got_enabled = false,
-                            .artifact_kind = .executable,
+                            .artifact_kind = run_artifact_kind,
+                            .link_mode = exec_info.link_mode,
+                            .extra_libs = exec_info.extra_libs,
+                            .lib_dirs = exec_info.lib_dirs,
                             .output_path = final_exe_path,
                             .io = io,
                             .environ_map = environ_map,
@@ -1873,6 +2461,18 @@ pub fn runCli(
                             },
                         };
                         defer run_art.deinit(allocator);
+
+                        if (exec_info.is_emit_obj) {
+                            try stdout_style.writeStatusHeader(
+                                stdout_writer,
+                                .success,
+                                Glyphs.SUCCESS,
+                                "run",
+                                final_exe_path,
+                            );
+                            try stdout_writer.writeByte('\n');
+                            return 0;
+                        }
 
                         var child_argv: std.ArrayListUnmanaged([]const u8) = .empty;
                         defer child_argv.deinit(allocator);
@@ -1970,8 +2570,15 @@ pub fn runCli(
 // ---------------------------------------- MAIN -----------------------------------------
 
 comptime {
+    std.debug.assert(SUBCOMMANDS.len == 9);
+    std.debug.assert(CLI_SUBCOMMANDS.len == SUBCOMMANDS.len);
+    std.debug.assert(SUBCOMMAND_NAME_MAP.keys().len == SUBCOMMANDS.len);
     for (SUBCOMMANDS, 0..) |descriptor, i| {
         std.debug.assert(@backingInt(descriptor.id) == i);
+        std.debug.assert(SubcommandId.fromName(descriptor.name) == descriptor.id);
+        if (i > 0) {
+            std.debug.assert(std.mem.order(u8, SUBCOMMANDS[i - 1].name, descriptor.name) == .lt);
+        }
     }
     for (GLOBAL_FLAGS, 0..) |flag_desc, i| {
         std.debug.assert(@backingInt(flag_desc.id) == i);
@@ -1984,19 +2591,33 @@ comptime {
     for (UPGRADE_FLAGS, 0..) |upg_desc, i| {
         std.debug.assert(@backingInt(upg_desc.id) == i);
     }
-    std.debug.assert(COMPILE_FLAGS.len == 12);
+    std.debug.assert(TRANSLATE_C_FLAGS.len == 5);
+    for (TRANSLATE_C_FLAGS, 0..) |tc_desc, i| {
+        std.debug.assert(@backingInt(tc_desc.id) == i);
+        if (i > 0) {
+            std.debug.assert(std.mem.order(u8, TRANSLATE_C_FLAGS[i - 1].long_flag, tc_desc.long_flag) == .lt);
+        }
+    }
+    std.debug.assert(COMPILE_FLAGS.len == 18);
     for (COMPILE_FLAGS, 0..) |comp_desc, i| {
         std.debug.assert(@backingInt(comp_desc.id) == i);
+        if (i > 0) {
+            std.debug.assert(std.mem.order(u8, COMPILE_FLAGS[i - 1].long_flag, comp_desc.long_flag) == .lt);
+        }
     }
 }
 
 test "test_cli_router_subcommands_flags_and_typo_suggestions" {
-    try std.testing.expectEqual(@as(usize, 12), COMPILE_FLAGS.len);
+    try std.testing.expectEqual(@as(usize, 9), CLI_SUBCOMMANDS.len);
+    try std.testing.expectEqual(@as(usize, 5), TRANSLATE_C_FLAGS.len);
+    try std.testing.expectEqual(@as(usize, 18), COMPILE_FLAGS.len);
     try std.testing.expectEqualStrings("build", suggestSubcommand("biuld").?);
     try std.testing.expectEqualStrings("check", suggestSubcommand("chck").?);
+    try std.testing.expectEqualStrings("translate-c", suggestSubcommand("translate-x").?);
     try std.testing.expectEqualStrings("--help", suggestGlobalFlag("--hlp").?);
     try std.testing.expectEqualStrings("--version", suggestGlobalFlag("--verison").?);
     try std.testing.expectEqualStrings("--internal-core", suggestFlagForSubcommand("--internal-cor", .build).?);
+    try std.testing.expectEqualStrings("--include-dir", suggestFlagForSubcommand("--include-dr", .translate_c).?);
 
     var sink = DiagnosticSink.init(std.testing.allocator);
     defer sink.deinit();

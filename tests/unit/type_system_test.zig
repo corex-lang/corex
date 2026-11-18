@@ -989,7 +989,7 @@ test "test_type_system_tuple_leading_zero_loop_labels_break_typing_and_context_l
         try std.testing.expect(hasDiag(&ctx_err_res.diagnostics, .e0401_type_mismatch));
     }
 
-    // [5] Populated `Context` layout matches 8-field struct layout (`80B` on 64-bit, `48B` on `wasm32`, align `8`):
+    // [5] Populated `Context` layout matches 10-field struct layout (`80B` on 64-bit, `40B` on `wasm32`):
     var ctx_layout_res = try runFullTypecheck(
         std.testing.allocator,
         "pub fn capture_ctx() -> u64 { let snap = context; return snap.rng_seed; }\n",
@@ -1021,8 +1021,8 @@ test "test_type_system_tuple_leading_zero_loop_labels_break_typing_and_context_l
         ctx_type_id,
         type_system.TargetLayout.WASM32,
     );
-    try std.testing.expectEqual(@as(u64, 48), layout_wasm32.byte_size);
-    try std.testing.expectEqual(@as(u32, 8), layout_wasm32.align_bytes);
+    try std.testing.expectEqual(@as(u64, 40), layout_wasm32.byte_size);
+    try std.testing.expectEqual(@as(u32, 4), layout_wasm32.align_bytes);
 }
 
 test "test_type_system_float_pi_and_tau_associated_constants_and_retired_std" {

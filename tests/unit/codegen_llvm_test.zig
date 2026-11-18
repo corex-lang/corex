@@ -815,7 +815,7 @@ test "test_regression_codegen_llvm_wasi_import_module_extern_dedup_and_quoted_id
     defer obj_art.deinit(std.testing.allocator);
 }
 
-test "test_regression_codegen_llvm_tls_64b_context_and_wasm32_rng_seed_rv2_crit05_high04" {
+test "test_regression_codegen_llvm_tls_80b_40b_context_and_wasm32_rng_seed_rv2_crit05_high04" {
     const ctx_wasm_src =
         \\pub fn read_ctx_snapshot_seed() -> u64 {
         \\    let snap_ctx = context;
@@ -847,7 +847,7 @@ test "test_regression_codegen_llvm_tls_64b_context_and_wasm32_rng_seed_rv2_crit0
         std.mem.indexOf(
             u8,
             linux_ir.emitted_text,
-            "@_cx_default_ctx = internal thread_local global [64 x i8] zeroinitializer, align 8",
+            "@_cx_default_ctx = internal thread_local global [80 x i8] zeroinitializer, align 8",
         ) != null,
     );
 
@@ -869,7 +869,7 @@ test "test_regression_codegen_llvm_tls_64b_context_and_wasm32_rng_seed_rv2_crit0
         std.mem.indexOf(
             u8,
             wasm_ir.emitted_text,
-            "@_cx_default_ctx = internal global [64 x i8] zeroinitializer, align 8",
+            "@_cx_default_ctx = internal global [40 x i8] zeroinitializer, align 4",
         ) != null,
     );
     try std.testing.expect(std.mem.indexOf(u8, wasm_ir.emitted_text, "@_cx_ctx_wide_2") == null);

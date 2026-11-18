@@ -115,7 +115,7 @@ pub const HirTag = enum(u8) {
     /// Closure expression (`lhs = fn_meta_index, rhs = body_hir`).
     hir_closure = 24,
 
-    // Control Flow, Scopes & Recovery (`25..43`):
+    // Control Flow, Scopes & Recovery (`25..44`):
     /// Lexical statement block with optional tail expression (`lhs = extra{stmt_len, stmts…}, rhs = tail_hir_or_none`).
     hir_block = 25,
     /// Conditional branch (`lhs = cond_hir, rhs = extra{then_hir, else_hir_or_none}`).
@@ -154,6 +154,8 @@ pub const HirTag = enum(u8) {
     hir_slice_range = 42,
     /// Error-recovery poison node preserving downstream IR invariants (`lhs = 0, rhs = 0`).
     hir_error_hole = 43,
+    /// Postfix `.await` suspension point (`lhs = fut_hir, rhs = 0`).
+    hir_await = 44,
 };
 
 /// Clause discriminant encoded inside `hir_cond_if` and `hir_cond_while` `extra_data` streams (`DR-21` `SE-01`/`SE-02`).
@@ -277,12 +279,28 @@ pub const HirUnaryOp = enum(u8) {
     addr_of_raw_mut = 7,
 };
 
-/// Compiler-internal `HIR` intrinsic sub-kinds encoded via `HIR_INTERNAL_INTRINSIC_FLAG` (`D-11`).
+/// Compiler-internal `HIR` intrinsic sub-kinds encoded via `HIR_INTERNAL_INTRINSIC_FLAG` (`D-11`, `DR-08`).
 pub const HirInternalIntrinsic = enum(u8) {
     /// Checked `.narrow[Dst]()` conversion (`extra = [1, 3, dst_ty, src_hir, min_hir, max_hir]`).
     narrow_check = 0,
     /// Fallible `.try_narrow[Dst]()` conversion (`extra = [1, 3, dst_ty, src_hir, min_hir, max_hir]`).
     try_narrow = 1,
+    /// Inline `Future[T]` frame construction (`extra = [0, 3 + N, def_const, sym_const, callee_hir, args…]`).
+    async_future_make = 2,
+    /// Structured `TaskGroup` nursery scope entry (`extra = [0, 0]`).
+    async_task_group_enter = 3,
+    /// Nursery child task spawn (`extra = [0, 3 + K, is_local_const, group_hir, task_hir, loan_hirs…]`).
+    async_spawn = 4,
+    /// Linear `TaskHandle.join()` future construction (`extra = [0, 1, handle_hir]`).
+    async_join = 5,
+    /// Linear `TaskHandle.cancel()` or `TaskGroup.cancel_all()` (`extra = [0, 1, target_hir]`).
+    async_cancel = 6,
+    /// Structured `TaskGroup` nursery exit barrier (`extra = [0, 1, group_hir]`).
+    async_task_group_exit = 7,
+    /// Cooperative reactor yield future construction (`extra = [0, 0]`).
+    async_yield = 8,
+    /// Synchronous root executor entry (`block_on(fut)`, `extra = [0, 1, fut_hir]`).
+    async_block_on = 9,
 };
 
 /// Canonical binary operators in `HIR` (short-circuiting `and`/`or` remain explicit until `MIR` CFG lowering).
@@ -453,6 +471,8 @@ pub const HirFnMeta = struct {
     is_local_closure: bool = false,
     /// `true` if this closure captures outer bindings by ownership transfer (`own |…|`, Tier-2 `SE-19`).
     is_move_closure: bool = false,
+    /// `true` if lowered from `async fn`, `async |…|`, `async { … }`, `async test`, or `task_group` nursery body.
+    is_async: bool = false,
     /// Capture local pairs `(outer_local_id, inner_local_id)` range in `HirStore.extra_data` for closures.
     capture_extra_start: u32 = 0,
     /// Number of captured bindings for closures (`0` for non-capturing functions).
@@ -1047,6 +1067,14 @@ const ActiveLabeledMatch = struct {
     scrutinee_ty: TypeId,
 };
 
+/// Enclosing closure capture frame tracking per-level `(outer_local_id, inner_local_id)` pairs.
+const ClosureCaptureFrame = struct {
+    /// Function boundary local floor (`return_local_id`) of this closure/async frame.
+    ceil: u32,
+    /// Dedicated `(outer_local_id, inner_local_id)` pair buffer for this frame.
+    captures: std.ArrayListUnmanaged(u32) = .empty,
+};
+
 /// Stateful `AST -> HIR` desugaring, `@derive` synthesis, and `comptime` unrolling engine.
 const HirLowerer = struct {
     /// Backing allocator for temporary scratch containers.
@@ -1090,6 +1118,8 @@ const HirLowerer = struct {
     next_loop_id: u32 = 0,
     /// `true` while lowering inside an `unsafe { … }` block.
     is_in_unsafe: bool = false,
+    /// `true` while lowering inside a `task_group` nursery callback body.
+    is_in_nursery_body: bool = false,
     /// `true` if `E0508` has already been emitted for this `HirStore` (prevents diagnostic floods).
     has_emitted_limit_diag: bool = false,
     /// Active function boundary local floor for closure capture detection (`0` at module level).
@@ -1098,8 +1128,10 @@ const HirLowerer = struct {
     active_owner_def_id: DefId = .NONE,
     /// Monotonic closure ordinal within `active_owner_def_id` (deterministic across module vs per-`DefId` lowering).
     closure_ordinal_in_owner: u32 = 0,
-    /// Collected `(outer_local_id, inner_local_id)` pairs for the currently lowering closure.
+    /// Collected `(outer_local_id, inner_local_id)` pairs for single-level fallback capture tracking.
     active_closure_captures: std.ArrayListUnmanaged(u32) = .empty,
+    /// Stack of active nested closure / `async` block / `task_group` capture frames.
+    closure_frame_stack: std.ArrayListUnmanaged(ClosureCaptureFrame) = .empty,
 
     /// $O(1)$ map from `SymbolIndex` to `LocalId` in `store.locals`.
     symbol_to_local: std.AutoHashMapUnmanaged(u32, u32) = .empty,
@@ -1211,6 +1243,8 @@ const HirLowerer = struct {
         if (self.node_extra_end.len > 0) self.allocator.free(self.node_extra_end);
         if (self.cst_to_ast.len > 0) self.allocator.free(self.cst_to_ast);
         self.zip_arena.deinit();
+        for (self.closure_frame_stack.items) |*frame| frame.captures.deinit(self.allocator);
+        self.closure_frame_stack.deinit(self.allocator);
         self.active_closure_captures.deinit(self.allocator);
         self.symbol_to_local.deinit(self.allocator);
         self.active_name_to_local.deinit(self.allocator);
@@ -1599,8 +1633,44 @@ const HirLowerer = struct {
         }, ast_origin);
     }
 
-    /// Records or reuses an inner capture slot when a closure references an outer function's `local_id`.
+    /// Records or reuses an inner capture slot across all enclosing closure/async frames (`outer -> … -> inner`).
     fn captureOuterLocalInClosure(self: *HirLowerer, outer_local_id: u32) !u32 {
+        if (self.closure_frame_stack.items.len > 0) {
+            var cur_slot = outer_local_id;
+            var has_entered_chain = false;
+            for (self.closure_frame_stack.items) |*frame| {
+                if (!has_entered_chain) {
+                    if (cur_slot >= frame.ceil) continue;
+                    has_entered_chain = true;
+                }
+                var found_inner: ?u32 = null;
+                var i: usize = 0;
+                while (i + 1 < frame.captures.items.len) : (i += 2) {
+                    if (frame.captures.items[i] == cur_slot) {
+                        found_inner = frame.captures.items[i + 1];
+                        break;
+                    }
+                }
+                if (found_inner) |existing_inner| {
+                    cur_slot = existing_inner;
+                } else {
+                    const outer_decl = self.store.locals.items[cur_slot];
+                    const inner_local = try self.store.appendLocal(.{
+                        .name = outer_decl.name,
+                        .type_id = outer_decl.type_id,
+                        .decl_span = outer_decl.decl_span,
+                        .mode = .let_mode,
+                        .is_mut = outer_decl.is_mut,
+                        .is_param = true,
+                        .is_temp = false,
+                    });
+                    try frame.captures.append(self.allocator, cur_slot);
+                    try frame.captures.append(self.allocator, inner_local);
+                    cur_slot = inner_local;
+                }
+            }
+            return cur_slot;
+        }
         var i: usize = 0;
         while (i + 1 < self.active_closure_captures.items.len) : (i += 2) {
             if (self.active_closure_captures.items[i] == outer_local_id) {
@@ -1672,7 +1742,12 @@ const HirLowerer = struct {
         if (self.sym_table.def_to_symbol.get(def_id.asInt())) |sym_idx| {
             const sym = self.sym_table.getSymbol(sym_idx).*;
             self.current_scope = sym.scope_id;
-            const lowered = try self.lowerSymbolItem(sym_idx);
+            const fresh_override: ?NodeIndex = if (sym.owner_def_id.isNone() and
+                def_id.fileId() == self.store.file_id)
+                self.findTopLevelDefAstNode(def_id.itemIndex())
+            else
+                null;
+            const lowered = try self.lowerSymbolItemWithAstOverride(sym_idx, fresh_override);
             if ((sym.kind == .struct_sym or sym.kind == .enum_sym or
                 sym.kind == .union_sym or sym.kind == .bit_field_sym) and
                 !sym.target_scope.isNone() and sym.derive_mask.hasAny())
@@ -1698,9 +1773,22 @@ const HirLowerer = struct {
                 for (item_slice) |raw_idx| {
                     const item_id = NodeIndex.fromInt(raw_idx);
                     if (item_id.asInt() >= self.ast_arena.countNodes()) continue;
-                    if (self.ast_arena.getNode(item_id).tag == .item_hole) continue;
+                    const item_tag = self.ast_arena.getNode(item_id).tag;
+                    if (item_tag == .item_hole) continue;
+                    if (item_tag == .extern_block_decl) {
+                        for (self.ast_arena.getExternBlockItems(item_id)) |ext_raw_idx| {
+                            const ext_id = NodeIndex.fromInt(ext_raw_idx);
+                            if (ext_id.asInt() >= self.ast_arena.countNodes()) continue;
+                            const ext_tag = self.ast_arena.getNode(ext_id).tag;
+                            if (ext_tag == .fn_decl or ext_tag == .extern_static_decl or ext_tag == .const_decl) {
+                                if (ordinal == def_id.itemIndex()) break;
+                                if (ordinal < std.math.maxInt(u12)) ordinal += 1;
+                            }
+                        }
+                        if (ordinal == def_id.itemIndex()) break;
+                        continue;
+                    }
                     if (ordinal == def_id.itemIndex()) {
-                        const item_tag = self.ast_arena.getNode(item_id).tag;
                         if (item_tag == .impl_decl) {
                             const impl_members = symbol_resolver.extractImplMemberItems(self.ast_arena, item_id);
                             var lowered_members: std.ArrayListUnmanaged(u32) = .empty;
@@ -1769,6 +1857,40 @@ const HirLowerer = struct {
         return root_result;
     }
 
+    /// Resolves the flattened top-level `AstArena` node matching `target_ordinal`, expanding `extern_block_decl` items.
+    fn findTopLevelDefAstNode(self: *const HirLowerer, target_ordinal: u12) ?NodeIndex {
+        if (self.ast_arena.countNodes() == 0) return null;
+        const root_node = self.ast_arena.getNode(.root);
+        if (root_node.lhs.tag != .extra or root_node.rhs.tag != .extra or root_node.rhs.payload == 0) return null;
+        const item_slice = self.ast_arena.getExtraSlice(
+            ExtraIndex.fromInt(root_node.lhs.payload),
+            root_node.rhs.payload,
+        );
+        var ordinal: u12 = 0;
+        for (item_slice) |raw_idx| {
+            const item_id = NodeIndex.fromInt(raw_idx);
+            if (item_id.asInt() >= self.ast_arena.countNodes()) continue;
+            const item_tag = self.ast_arena.getNode(item_id).tag;
+            if (item_tag == .item_hole) continue;
+            if (!self.sym_table.is_including_tests and (item_tag == .test_decl or item_tag == .bench_decl)) continue;
+            if (item_tag == .extern_block_decl) {
+                for (self.ast_arena.getExternBlockItems(item_id)) |ext_raw_idx| {
+                    const ext_id = NodeIndex.fromInt(ext_raw_idx);
+                    if (ext_id.asInt() >= self.ast_arena.countNodes()) continue;
+                    const ext_tag = self.ast_arena.getNode(ext_id).tag;
+                    if (ext_tag == .fn_decl or ext_tag == .extern_static_decl or ext_tag == .const_decl) {
+                        if (ordinal == target_ordinal) return ext_id;
+                        if (ordinal < std.math.maxInt(u12)) ordinal += 1;
+                    }
+                }
+                continue;
+            }
+            if (ordinal == target_ordinal) return item_id;
+            if (ordinal < std.math.maxInt(u12)) ordinal += 1;
+        }
+        return null;
+    }
+
     /// Scans `self.store.nodes` to a bounded fixpoint and lowers any referenced same-file `subscript` templates
     /// declared in separate `impl` or top-level `DefId`s so `MirLowerer` can splice both `let` and `inout` arms.
     fn populateReferencedSameFileSubscripts(self: *HirLowerer) !void {
@@ -1831,9 +1953,21 @@ const HirLowerer = struct {
                 for (item_slice) |raw_idx| {
                     const item_id = NodeIndex.fromInt(raw_idx);
                     if (item_id.asInt() >= self.ast_arena.countNodes()) continue;
-                    if (self.ast_arena.getNode(item_id).tag == .item_hole) continue;
+                    const item_tag = self.ast_arena.getNode(item_id).tag;
+                    if (item_tag == .item_hole) continue;
+                    if (item_tag == .extern_block_decl) {
+                        for (self.ast_arena.getExternBlockItems(item_id)) |ext_raw_idx| {
+                            const ext_id = NodeIndex.fromInt(ext_raw_idx);
+                            if (ext_id.asInt() >= self.ast_arena.countNodes()) continue;
+                            const ext_tag = self.ast_arena.getNode(ext_id).tag;
+                            if (ext_tag == .fn_decl or ext_tag == .extern_static_decl or ext_tag == .const_decl) {
+                                if (ordinal < std.math.maxInt(u12)) ordinal += 1;
+                            }
+                        }
+                        continue;
+                    }
                     if (ordinal == sub_sym.owner_def_id.itemIndex()) {
-                        if (self.ast_arena.getNode(item_id).tag == .impl_decl) {
+                        if (item_tag == .impl_decl) {
                             const impl_members = symbol_resolver.extractImplMemberItems(self.ast_arena, item_id);
                             var mem_cursor: usize = 0;
                             var sym_raw: u32 = 0;
@@ -2039,7 +2173,9 @@ const HirLowerer = struct {
                 symbol_resolver.extractTokenSlice(self.source, self.tokens, fn_ast.main_token),
                 "subscript",
             ));
-        const is_contextless = self.hasContextlessAttr(fn_sym_idx) or sig_view.is_c_abi;
+        const is_async_fn = sig_view.is_async or
+            self.hasKeywordInCst(self.ast_arena.getCstOrigin(eff_ast), .kw_async);
+        const is_contextless = !is_async_fn and (self.hasContextlessAttr(fn_sym_idx) or sig_view.is_c_abi);
 
         if (fn_ast.tag == .subscript_decl and fn_ast.rhs.tag == .extra) {
             return self.lowerSubscriptDeclArms(fn_sym_idx, eff_ast, sig_view, is_contextless);
@@ -2054,11 +2190,18 @@ const HirLowerer = struct {
         const saved_fn_name = self.active_fn_name;
         const saved_caller_loc = self.active_caller_loc_local;
         const saved_in_sub_inout = self.is_in_subscript_inout_arm;
+        const saved_in_unsafe = self.is_in_unsafe;
+        const saved_in_nursery = self.is_in_nursery_body;
+        const saved_closure_frames = self.closure_frame_stack;
+        self.closure_frame_stack = .empty;
         const builder_floor = self.builder_scope_stack.items.len;
         const fsm_floor = self.labeled_match_stack.items.len;
         const local_checkpoint = self.local_shadow_log.items.len;
         const ct_checkpoint = self.comptime_shadow_log.items.len;
         defer {
+            for (self.closure_frame_stack.items) |*frame| frame.captures.deinit(self.allocator);
+            self.closure_frame_stack.deinit(self.allocator);
+            self.closure_frame_stack = saved_closure_frames;
             self.popComptimeBindingsTo(ct_checkpoint);
             self.popLexicalLocalsTo(local_checkpoint);
             self.builder_scope_stack.items.len = builder_floor;
@@ -2072,8 +2215,12 @@ const HirLowerer = struct {
             self.active_fn_name = saved_fn_name;
             self.active_caller_loc_local = saved_caller_loc;
             self.is_in_subscript_inout_arm = saved_in_sub_inout;
+            self.is_in_unsafe = saved_in_unsafe;
+            self.is_in_nursery_body = saved_in_nursery;
         }
+        self.is_in_nursery_body = false;
 
+        self.is_in_unsafe = if (self.sym_table.getFfiContract(fn_sym_idx)) |fc| fc.is_unsafe_extern else false;
         self.current_scope = if (!fn_sym.target_scope.isNone()) fn_sym.target_scope else fn_sym.scope_id;
         self.current_fn_ret_ty = sig_view.ret_ty;
         self.current_loop_id = null;
@@ -2172,6 +2319,7 @@ const HirLowerer = struct {
             .is_contextless = is_contextless,
             .is_comptime = fn_sym.flags.is_comptime,
             .is_derived = false,
+            .is_async = is_async_fn,
         });
 
         // [3] Lower function body block or single-expression `= Expr;` body if present:
@@ -3952,7 +4100,7 @@ const HirLowerer = struct {
         self.recursion_depth -= 1;
     }
 
-    /// Lowers a lexical `.block` expression, optionally synthesizing a trailing `hir_return` for function bodies.
+    /// Lowers a lexical `.block` expression, routing `async { … }` blocks to `lowerAsyncBlockExpr`.
     fn lowerBlockExpr(
         self: *HirLowerer,
         block_id: NodeIndex,
@@ -3962,6 +4110,21 @@ const HirLowerer = struct {
         if (block_id.isNone() or block_id.asInt() >= self.ast_arena.countNodes()) {
             return self.emitUnitConst(TokenIndex.fromInt(0), .none);
         }
+        if (!is_auto_return_fn_body and
+            self.hasKeywordInCst(self.ast_arena.getCstOrigin(block_id), .kw_async))
+        {
+            return self.lowerAsyncBlockExpr(block_id, expected_ty);
+        }
+        return self.lowerBlockBodyContents(block_id, expected_ty, is_auto_return_fn_body);
+    }
+
+    /// Lowers the statement sequence and optional tail expression of `block_id` into a `hir_block`.
+    fn lowerBlockBodyContents(
+        self: *HirLowerer,
+        block_id: NodeIndex,
+        expected_ty: TypeId,
+        is_auto_return_fn_body: bool,
+    ) anyerror!HirIndex {
         const block_node = self.ast_arena.getNode(block_id);
         if (!try self.enterDepth(block_id)) {
             return self.emitErrorHole(block_node.main_token, block_id, expected_ty);
@@ -4102,7 +4265,14 @@ const HirLowerer = struct {
                 const hole = try self.emitErrorHole(stmt_node.main_token, stmt_id, .unit_ty);
                 try out_stmts.append(self.allocator, hole.asInt());
             },
-            .fn_decl,
+            .fn_decl => {
+                const nested_sym = self.nodeSymbol(stmt_id);
+                if (!nested_sym.isNone() and nested_sym.asInt() < self.sym_table.symbols.items.len and
+                    self.sym_table.getSymbol(nested_sym).kind == .fn_sym)
+                {
+                    _ = try self.lowerFnDeclSymbolWithAstOverride(nested_sym, stmt_id);
+                }
+            },
             .subscript_decl,
             .test_decl,
             .bench_decl,
@@ -4113,6 +4283,8 @@ const HirLowerer = struct {
             .trait_decl,
             .impl_decl,
             .use_decl,
+            .extern_block_decl,
+            .extern_static_decl,
             => {},
             .local_var_decl => try self.lowerLocalVarDecl(stmt_id, out_stmts),
             .const_decl => try self.lowerLocalConstDecl(stmt_id, out_stmts),
@@ -6856,10 +7028,7 @@ const HirLowerer = struct {
             else
                 try self.emitErrorHole(ast_node.main_token, expr_id, target_ty),
             .closure_expr => try self.lowerClosureExpr(expr_id, target_ty),
-            .await_expr => if (ast_node.lhs.tag == .node)
-                try self.lowerExpr(NodeIndex.fromInt(ast_node.lhs.payload), target_ty)
-            else
-                try self.emitErrorHole(ast_node.main_token, expr_id, target_ty),
+            .await_expr => try self.lowerAwaitExpr(expr_id, target_ty),
             else => try self.emitErrorHole(ast_node.main_token, expr_id, target_ty),
         };
 
@@ -7136,6 +7305,14 @@ const HirLowerer = struct {
             .cancel_token => {
                 if (self.lookupNominalTypeByName("CancelToken")) |found_ty| return found_ty;
                 return self.pool.internOptional(try self.pool.internRawPtr(.u8_ty, true));
+            },
+            .reactor => {
+                if (self.lookupNominalTypeByName("Reactor")) |found_ty| return found_ty;
+                return self.pool.internRawPtr(.u8_ty, false);
+            },
+            .reactor_ctx => {
+                if (self.lookupNominalTypeByName("ReactorCtx")) |found_ty| return found_ty;
+                return self.pool.internRawPtr(.u8_ty, true);
             },
         }
     }
@@ -7846,9 +8023,10 @@ const HirLowerer = struct {
             if (self.symbol_to_local.get(sym_idx.asInt())) |mapped_local| {
                 return self.emitVarRef(mapped_local, tok, expr_id);
             }
-            const sym = self.sym_table.getSymbol(sym_idx).*;
+            const resolved_sym_idx = self.unwrapAliasSymbolIdx(sym_idx);
+            const sym = self.sym_table.getSymbol(resolved_sym_idx).*;
             if (sym.kind == .const_sym) {
-                if (try self.evalConstSymbol(sym_idx)) |folded_const| {
+                if (try self.evalConstSymbol(resolved_sym_idx)) |folded_const| {
                     const const_ty = if (!target_ty.isError()) target_ty else sym.type_id;
                     return self.emitConstVal(folded_const, const_ty, tok, expr_id, true);
                 }
@@ -7865,12 +8043,16 @@ const HirLowerer = struct {
                     .data = .{ .lhs = encoded_lhs, .rhs = extra_idx },
                 }, expr_id);
             }
+            const ref_cat: ValueCategory = if (sym.kind == .extern_static_sym)
+                (if (sym.flags.is_mut) .place_mut else .place_imm)
+            else
+                .rvalue;
             return self.emitNode(.{
                 .tag = .hir_global_ref,
-                .flags = .{ .category = .rvalue },
+                .flags = .{ .category = ref_cat, .is_unsafe = self.is_in_unsafe },
                 .type_id = if (!target_ty.isError()) target_ty else self.concreteType(sym.type_id),
                 .origin_token = tok,
-                .data = .{ .lhs = sym.def_id.asInt(), .rhs = sym_idx.asInt() },
+                .data = .{ .lhs = sym.def_id.asInt(), .rhs = resolved_sym_idx.asInt() },
             }, expr_id);
         }
 
@@ -8601,8 +8783,13 @@ const HirLowerer = struct {
         const op_kind = self.tokens.getToken(tok).kind;
         const op_lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, tok);
 
-        // [0] `own expr` explicit ownership-transfer prefix (`ADR-22B`):
+        // [0] `own expr` explicit ownership-transfer prefix (`ADR-22B`, including `own async { … }`):
         if (op_kind == .kw_own or (op_kind == .ident and std.mem.eql(u8, op_lex, "own"))) {
+            if (self.ast_arena.getNode(inner_id).tag == .block and
+                self.hasKeywordInCst(self.ast_arena.getCstOrigin(inner_id), .kw_async))
+            {
+                return self.lowerAsyncBlockExprWithMode(inner_id, target_ty, true);
+            }
             return self.lowerExpr(inner_id, target_ty);
         }
 
@@ -8919,23 +9106,24 @@ const HirLowerer = struct {
         type_ns = 2,
     };
 
+    /// Unwraps `.use_alias_sym` hops up to a bounded depth (`16`) to reach the defining `SymbolIndex`.
+    fn unwrapAliasSymbolIdx(self: *const HirLowerer, sym_idx: SymbolIndex) SymbolIndex {
+        var cur = sym_idx;
+        var hops: u8 = 0;
+        while (!cur.isNone() and cur.asInt() < self.sym_table.countSymbols() and hops < 16) : (hops += 1) {
+            const sym = self.sym_table.getSymbol(cur).*;
+            if (sym.kind != .use_alias_sym or sym.target_symbol.isNone()) break;
+            cur = sym.target_symbol;
+        }
+        return cur;
+    }
+
     /// Classifies whether `recv_id` denotes a static module or type namespace rather than a runtime value.
     fn resolveStaticDotTargetAst(self: *const HirLowerer, recv_id: NodeIndex) StaticDotKind {
         if (recv_id.isNone() or recv_id.asInt() >= self.ast_arena.countNodes()) return .none;
         const recv_node = self.ast_arena.getNode(recv_id);
         if (recv_node.tag == .index_expr and recv_node.lhs.tag == .node) {
             return self.resolveStaticDotTargetAst(NodeIndex.fromInt(recv_node.lhs.payload));
-        }
-        if (recv_node.tag == .ident_expr and !recv_node.main_token.isNone()) {
-            const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, recv_node.main_token);
-            if (self.interner.lookup(lexeme)) |name_id| {
-                if (self.active_name_to_local.contains(name_id.asInt()) or
-                    self.active_comptime_vals.contains(name_id.asInt()) or
-                    self.active_zip_bindings.contains(name_id.asInt()))
-                {
-                    return .none;
-                }
-            }
         }
         var sym_idx = self.nodeSymbol(recv_id);
         if (sym_idx.isNone() and recv_node.tag == .ident_expr and !recv_node.main_token.isNone()) {
@@ -8948,8 +9136,30 @@ const HirLowerer = struct {
             }
         }
         if (!sym_idx.isNone()) {
-            if (self.symbol_to_local.contains(sym_idx.asInt())) return .none;
-            return switch (self.sym_table.getSymbol(sym_idx).kind) {
+            const resolved_idx = self.unwrapAliasSymbolIdx(sym_idx);
+            const sym = self.sym_table.getSymbol(resolved_idx).*;
+            if (!sym.target_scope.isNone() and
+                (sym.kind == .module_sym or sym.kind == .const_sym or
+                    sym.kind == .local_let_sym or sym.kind == .local_var_sym))
+            {
+                return .module_ns;
+            }
+        }
+        if (recv_node.tag == .ident_expr and !recv_node.main_token.isNone()) {
+            const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, recv_node.main_token);
+            if (self.interner.lookup(lexeme)) |name_id| {
+                if (self.active_name_to_local.contains(name_id.asInt()) or
+                    self.active_comptime_vals.contains(name_id.asInt()) or
+                    self.active_zip_bindings.contains(name_id.asInt()))
+                {
+                    return .none;
+                }
+            }
+        }
+        if (!sym_idx.isNone()) {
+            const resolved_idx = self.unwrapAliasSymbolIdx(sym_idx);
+            if (self.symbol_to_local.contains(resolved_idx.asInt())) return .none;
+            return switch (self.sym_table.getSymbol(resolved_idx).kind) {
                 .module_sym => .module_ns,
                 .struct_sym,
                 .enum_sym,
@@ -8963,6 +9173,35 @@ const HirLowerer = struct {
                 => .type_ns,
                 else => .none,
             };
+        }
+        if (recv_node.tag == .field_access and recv_node.lhs.tag == .node and recv_node.rhs.tag == .token) {
+            const base_id = NodeIndex.fromInt(recv_node.lhs.payload);
+            const field_lex = symbol_resolver.extractTokenSlice(
+                self.source,
+                self.tokens,
+                TokenIndex.fromInt(recv_node.rhs.payload),
+            );
+            if (std.mem.eql(u8, field_lex, "async") or std.mem.eql(u8, field_lex, "ffi")) {
+                var base_sym = self.nodeSymbol(base_id);
+                if (base_sym.isNone() and self.ast_arena.getNode(base_id).tag == .ident_expr) {
+                    const base_tok = self.ast_arena.getNode(base_id).main_token;
+                    if (!base_tok.isNone()) {
+                        const base_lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, base_tok);
+                        if (self.interner.lookup(base_lex)) |base_name_id| {
+                            switch (self.sym_table.lookupLexical(self.current_scope, base_name_id, NamespaceMask.ALL)) {
+                                .found => |found_idx| base_sym = found_idx,
+                                else => {},
+                            }
+                        }
+                    }
+                }
+                if (!base_sym.isNone()) {
+                    const unwrapped_base = self.unwrapAliasSymbolIdx(base_sym);
+                    if (self.sym_table.getSymbol(unwrapped_base).target_scope == self.sym_table.cx_root_scope) {
+                        return .module_ns;
+                    }
+                }
+            }
         }
         if (recv_node.tag == .ident_expr and !recv_node.main_token.isNone()) {
             const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, recv_node.main_token);
@@ -9383,6 +9622,7 @@ const HirLowerer = struct {
                 else
                     .let_mode;
                 var arg_hir = try self.lowerExpr(self.unwrapCallArgAst(val_item_id), param_ty);
+                arg_hir = try self.applyCVariadicPromotionIfNeeded(arg_hir, sig_view, i, tok);
                 if (param_mode_pre != .inout_mode and param_mode_pre != .set_mode) {
                     const tmp_slot = try self.allocTempLocal(self.store.getNode(arg_hir).type_id, tok, false);
                     try seq_stmts.append(self.allocator, (try self.emitLocalDeclNode(tmp_slot, arg_hir, tok)).asInt());
@@ -9419,6 +9659,8 @@ const HirLowerer = struct {
             if (sig_view) |sv| {
                 if (i < sv.paramCount()) {
                     adj_arg = try self.adjustReceiverForParam(adj_arg, sv.getParamType(i), tok);
+                } else if (!is_direct_sym) {
+                    adj_arg = try self.applyCVariadicPromotionIfNeeded(adj_arg, sig_view, i, tok);
                 }
             }
             try wrapped_args.append(self.allocator, (try self.wrapArgProjection(adj_arg, param_mode, tok)).asInt());
@@ -10149,9 +10391,10 @@ const HirLowerer = struct {
             static_sym_idx = self.lookupStaticMemberSymbolFallback(recv_id, member_lexeme);
         }
         if (!static_sym_idx.isNone()) {
-            const sym = self.sym_table.getSymbol(static_sym_idx).*;
+            const resolved_static_idx = self.unwrapAliasSymbolIdx(static_sym_idx);
+            const sym = self.sym_table.getSymbol(resolved_static_idx).*;
             if (sym.kind == .const_sym) {
-                if (try self.evalConstSymbol(static_sym_idx)) |folded_const| {
+                if (try self.evalConstSymbol(resolved_static_idx)) |folded_const| {
                     const const_ty = if (!target_ty.isError()) target_ty else sym.type_id;
                     return self.emitConstVal(folded_const, const_ty, tok, expr_id, true);
                 }
@@ -10160,7 +10403,7 @@ const HirLowerer = struct {
                     .flags = .{ .category = .rvalue },
                     .type_id = if (!target_ty.isError()) target_ty else self.concreteType(sym.type_id),
                     .origin_token = tok,
-                    .data = .{ .lhs = sym.def_id.asInt(), .rhs = static_sym_idx.asInt() },
+                    .data = .{ .lhs = sym.def_id.asInt(), .rhs = resolved_static_idx.asInt() },
                 }, expr_id);
             }
             if (sym.kind == .enum_variant_sym and sym.type_id == .unit_ty) {
@@ -10175,13 +10418,17 @@ const HirLowerer = struct {
                     .data = .{ .lhs = encoded_lhs, .rhs = extra_idx },
                 }, expr_id);
             }
-            if (sym.kind == .fn_sym) {
+            if (sym.kind == .fn_sym or sym.kind == .extern_static_sym) {
+                const ref_cat: ValueCategory = if (sym.kind == .extern_static_sym)
+                    (if (sym.flags.is_mut) .place_mut else .place_imm)
+                else
+                    .rvalue;
                 return self.emitNode(.{
                     .tag = .hir_global_ref,
-                    .flags = .{ .category = .rvalue },
+                    .flags = .{ .category = ref_cat, .is_unsafe = self.is_in_unsafe },
                     .type_id = if (!target_ty.isError()) target_ty else self.concreteType(sym.type_id),
                     .origin_token = tok,
-                    .data = .{ .lhs = sym.def_id.asInt(), .rhs = static_sym_idx.asInt() },
+                    .data = .{ .lhs = sym.def_id.asInt(), .rhs = resolved_static_idx.asInt() },
                 }, expr_id);
             }
         }
@@ -10413,6 +10660,8 @@ const HirLowerer = struct {
             .test_decl,
             .bench_decl,
             .fn_decl,
+            .extern_block_decl,
+            .extern_static_decl,
             .closure_expr,
             .wildcard_pat,
             .bind_pat,
@@ -11099,15 +11348,18 @@ const HirLowerer = struct {
         else if (base_node.type_id == .str_ty)
             .u8_ty
         else switch (base_ty_node.tag) {
-            .slice_ty, .soa_slice_ty, .array_ty, .soa_array_ty => TypeId.fromInt(base_ty_node.lhs),
+            .slice_ty, .soa_slice_ty, .array_ty, .soa_array_ty, .raw_ptr_ty => TypeId.fromInt(base_ty_node.lhs),
             else => .unit_ty,
         });
-        const is_mut_seq = base_node.flags.category == .place_mut or
-            ((base_ty_node.tag == .slice_ty or base_ty_node.tag == .soa_slice_ty) and base_ty_node.rhs != 0);
+        const is_mut_seq = if (base_ty_node.tag == .raw_ptr_ty)
+            base_ty_node.rhs != 0
+        else
+            base_node.flags.category == .place_mut or
+                ((base_ty_node.tag == .slice_ty or base_ty_node.tag == .soa_slice_ty) and base_ty_node.rhs != 0);
         const idx_ref = try self.emitVarRef(idx_slot, tok, .none);
         const proj_hir = try self.emitNode(.{
             .tag = .hir_index_proj,
-            .flags = .{ .category = if (is_mut_seq) .place_mut else .place_imm },
+            .flags = .{ .category = if (is_mut_seq) .place_mut else .place_imm, .is_unsafe = self.is_in_unsafe },
             .type_id = elem_ty,
             .origin_token = tok,
             .data = .{ .lhs = deref_base.asInt(), .rhs = idx_ref.asInt() },
@@ -11326,7 +11578,7 @@ const HirLowerer = struct {
         return self.emitConstVal(loc_val, .source_loc_ty, tok, ast_origin, true);
     }
 
-    /// Applies C default argument promotions (`bool`/`i8`/`u8`/`i16`/`u16` -> `i32`, `f32` -> `f64`) (`ADR-22F`).
+    /// Applies C default argument promotions (`enum`/`bit_field` unwrap, `< 32`-bit int/bool -> `i32`, `f32` -> `f64`) (`Fix-07`).
     fn applyCVariadicPromotionIfNeeded(
         self: *HirLowerer,
         arg_hir: HirIndex,
@@ -11338,28 +11590,55 @@ const HirLowerer = struct {
         if (!sv.is_variadic or !sv.is_c_abi or full_param_idx < sv.paramCount() or arg_hir.isNone()) {
             return arg_hir;
         }
-        const arg_ty = self.pool.unwrapUnderlyingType(self.store.getNode(arg_hir).type_id);
-        if (arg_ty == .bool_ty or arg_ty == .i8_ty or arg_ty == .u8_ty or
-            arg_ty == .i16_ty or arg_ty == .u16_ty)
+        var cur_hir = arg_hir;
+        var cur_ty = self.pool.unwrapRefinementBase(
+            self.pool.unwrapUnderlyingType(self.store.getNode(cur_hir).type_id),
+        );
+        const cur_tag = self.pool.getTag(cur_ty);
+        if (cur_tag == .enum_ty) {
+            const backing_int = self.pool.getEnumBackingIntType(cur_ty) orelse .i32_ty;
+            cur_hir = try self.emitNode(.{
+                .tag = .hir_cast,
+                .flags = .{ .category = .rvalue, .is_synthetic = true, .is_unsafe = self.is_in_unsafe },
+                .type_id = backing_int,
+                .origin_token = tok,
+                .data = .{ .lhs = cur_hir.asInt(), .rhs = @backingInt(HirCastKind.int_to_int) },
+            }, .none);
+            cur_ty = backing_int;
+        } else if (cur_tag == .bit_field_ty) {
+            const bf_backing = self.pool.unwrapUnderlyingType(TypeId.fromInt(self.pool.getNode(cur_ty).lhs));
+            if (bf_backing.isIntegerPrimitive()) {
+                cur_hir = try self.emitNode(.{
+                    .tag = .hir_cast,
+                    .flags = .{ .category = .rvalue, .is_synthetic = true, .is_unsafe = self.is_in_unsafe },
+                    .type_id = bf_backing,
+                    .origin_token = tok,
+                    .data = .{ .lhs = cur_hir.asInt(), .rhs = @backingInt(HirCastKind.int_to_int) },
+                }, .none);
+                cur_ty = bf_backing;
+            }
+        }
+        if (cur_ty == .bool_ty or cur_ty == .i8_ty or cur_ty == .u8_ty or
+            cur_ty == .i16_ty or cur_ty == .u16_ty)
         {
             return self.emitNode(.{
                 .tag = .hir_cast,
-                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .flags = .{ .category = .rvalue, .is_synthetic = true, .is_unsafe = self.is_in_unsafe },
                 .type_id = .i32_ty,
                 .origin_token = tok,
-                .data = .{ .lhs = arg_hir.asInt(), .rhs = @backingInt(HirCastKind.int_to_int) },
+                .data = .{ .lhs = cur_hir.asInt(), .rhs = @backingInt(HirCastKind.int_to_int) },
             }, .none);
         }
-        if (arg_ty == .f32_ty) {
+        if (cur_ty == .f32_ty) {
             return self.emitNode(.{
                 .tag = .hir_cast,
-                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .flags = .{ .category = .rvalue, .is_synthetic = true, .is_unsafe = self.is_in_unsafe },
                 .type_id = .f64_ty,
                 .origin_token = tok,
-                .data = .{ .lhs = arg_hir.asInt(), .rhs = @backingInt(HirCastKind.float_to_float) },
+                .data = .{ .lhs = cur_hir.asInt(), .rhs = @backingInt(HirCastKind.float_to_float) },
             }, .none);
         }
-        return arg_hir;
+        return cur_hir;
     }
 
     /// Unwraps explicit `&place` / `&mut place` / `&out place` address-of wrappers on `.inout_mode`/`.set_mode` arguments.
@@ -11457,6 +11736,11 @@ const HirLowerer = struct {
         });
         const param_local_start: u32 = @intCast(self.store.locals.items.len);
         self.closure_outer_local_ceil = return_local_id;
+        try self.closure_frame_stack.append(self.allocator, .{ .ceil = return_local_id });
+        defer {
+            var popped_frame = self.closure_frame_stack.pop().?;
+            popped_frame.captures.deinit(self.allocator);
+        }
         self.active_caller_loc_local = null;
         self.current_fn_ret_ty = ret_ty;
         self.current_loop_id = null;
@@ -11490,6 +11774,7 @@ const HirLowerer = struct {
         };
 
         const is_move_clos = if (sig_view) |sv| sv.capture_tier != .copy_tier else false;
+        const is_async_clos = if (sig_view) |sv| sv.is_async else false;
         const fn_meta_idx: u32 = @intCast(self.store.functions.items.len);
         const clos_ord = self.closure_ordinal_in_owner;
         self.closure_ordinal_in_owner += 1;
@@ -11510,10 +11795,11 @@ const HirLowerer = struct {
             .param_len = if (has_builder_param) 1 else 0,
             .is_local_closure = !is_move_clos,
             .is_move_closure = is_move_clos,
+            .is_async = is_async_clos,
         });
 
         const body_hir = try self.lowerBlockExpr(block_id, ret_ty, true);
-        const cap_slice = self.active_closure_captures.items[saved_captures_len..];
+        const cap_slice = self.closure_frame_stack.items[self.closure_frame_stack.items.len - 1].captures.items;
         const cap_extra_start = if (cap_slice.len > 0) try self.store.appendExtraSlice(cap_slice) else 0;
 
         self.store.functions.items[fn_meta_idx].body_hir = body_hir;
@@ -12199,6 +12485,17 @@ const HirLowerer = struct {
             }
         }
 
+        // [2b] Structured `core.async` entry functions (`yield_now`, `block_on`, `task_group`):
+        if (try self.tryLowerStructuredAsyncEntryCall(
+            expr_id,
+            resolved_sym_idx,
+            callee_ast_id,
+            null,
+            val_args,
+            target_ty,
+            tok,
+        )) |async_entry_hir| return async_entry_hir;
+
         // [3] Resolve concrete `@overload`, named/default `fn_sym` call (`SE-07`), or indirect closure/fn-ptr call:
         const is_direct_sym = !resolved_sym_idx.isNone() and
             self.sym_table.getSymbol(resolved_sym_idx).kind == .fn_sym;
@@ -12314,27 +12611,47 @@ const HirLowerer = struct {
             }, callee_ast_id);
         } else try self.lowerExpr(callee_ast_id, .err_ty);
 
+        const is_async_call = if (sig_view) |sv| sv.is_async else false;
         const ret_ty = if (!target_ty.isError())
             target_ty
-        else if (sig_view) |sv|
-            self.concreteType(sv.ret_ty)
-        else
-            .unit_ty;
-        const extra_idx = try self.store.appendLenPrefixedExtra(wrapped_args.items);
-        const is_sub = self.isCalleeSubscript(callee_hir);
-        const call_hir = try self.emitNode(.{
-            .tag = if (is_sub) .hir_subscript_call else .hir_call,
-            .flags = .{
-                .category = if (is_sub) .place_imm else .rvalue,
-                .is_unsafe = self.is_in_unsafe,
-            },
-            .type_id = ret_ty,
-            .origin_token = tok,
-            .data = .{ .lhs = callee_hir.asInt(), .rhs = extra_idx },
-        }, expr_id);
-        if (!is_sub) {
-            try self.recordCallTypeArgs(expr_id, call_hir, type_arg_nodes.items);
-        }
+        else if (sig_view) |sv| blk_async_ret: {
+            const inner_ret = self.concreteType(sv.ret_ty);
+            if (sv.is_async) {
+                const prod_id = if (is_direct_sym) resolved_sym_idx.asInt() else 0;
+                break :blk_async_ret try self.pool.internFuture(inner_ret, prod_id);
+            }
+            break :blk_async_ret inner_ret;
+        } else .unit_ty;
+        const call_hir = if (is_async_call) blk_fut_call: {
+            const prod_def = if (is_direct_sym) self.sym_table.getSymbol(resolved_sym_idx).def_id else DefId.NONE;
+            const prod_sym = if (is_direct_sym) resolved_sym_idx else SymbolIndex.none;
+            break :blk_fut_call try self.emitAsyncFutureMake(
+                prod_def,
+                prod_sym,
+                callee_hir,
+                wrapped_args.items,
+                self.concreteType(ret_ty),
+                tok,
+                expr_id,
+            );
+        } else blk_sync_call: {
+            const extra_idx = try self.store.appendLenPrefixedExtra(wrapped_args.items);
+            const is_sub = self.isCalleeSubscript(callee_hir);
+            const emitted_call = try self.emitNode(.{
+                .tag = if (is_sub) .hir_subscript_call else .hir_call,
+                .flags = .{
+                    .category = if (is_sub) .place_imm else .rvalue,
+                    .is_unsafe = self.is_in_unsafe,
+                },
+                .type_id = ret_ty,
+                .origin_token = tok,
+                .data = .{ .lhs = callee_hir.asInt(), .rhs = extra_idx },
+            }, expr_id);
+            if (!is_sub) {
+                try self.recordCallTypeArgs(expr_id, emitted_call, type_arg_nodes.items);
+            }
+            break :blk_sync_call emitted_call;
+        };
 
         if (seq_stmts.items.len > 0) {
             return self.emitSyntheticBlock(seq_stmts.items, call_hir, ret_ty, tok);
@@ -12424,7 +12741,10 @@ const HirLowerer = struct {
             }
         }
 
-        // [0] `@caller_location()` (`SE-17`):
+        // [0] `@c_import("header.h")` & `@caller_location()` (`SE-17`):
+        if (intr_kind == .c_import) {
+            return self.emitUnitConst(intr_tok, call_id);
+        }
         if (intr_kind == .caller_location) {
             return self.emitCallerLocationConst(intr_tok, call_id);
         }
@@ -12720,6 +13040,29 @@ const HirLowerer = struct {
             }
         }
 
+        // Structured `core.async` static calls (`cx.async.task_group`, `cx.async.yield_now`, `cx.async.block_on`):
+        if (is_static_dot_call) {
+            if (try self.tryLowerStructuredAsyncEntryCall(
+                expr_id,
+                method_sym_idx,
+                recv_id,
+                member_name,
+                val_args,
+                target_ty,
+                tok,
+            )) |async_static_hir| return async_static_hir;
+        } else {
+            // Structured `TaskGroup` (`spawn`, `spawn_local`, `cancel_all`, `is_cancelled`) and `TaskHandle` (`join`, `cancel`):
+            if (try self.tryLowerTaskGroupOrHandleMethod(
+                expr_id,
+                recv_id,
+                member_name,
+                val_args,
+                target_ty,
+                tok,
+            )) |nursery_method_hir| return nursery_method_hir;
+        }
+
         // Static `Enum.Variant(args)` constructor resolved via `nodeSymbol` or `target_scope`:
         if (!method_sym_idx.isNone() and self.sym_table.getSymbol(method_sym_idx).kind == .enum_variant_sym) {
             const v_sym = self.sym_table.getSymbol(method_sym_idx).*;
@@ -12946,24 +13289,41 @@ const HirLowerer = struct {
             .origin_token = tok,
             .data = .{ .lhs = method_sym.def_id.asInt(), .rhs = method_sym_idx.asInt() },
         }, .none);
-        const extra_idx = try self.store.appendLenPrefixedExtra(wrapped_args.items);
+        const is_async_method = if (sig_view) |sv| sv.is_async else false;
         const ret_ty = if (!target_ty.isError())
             target_ty
-        else if (sig_view) |sv|
-            self.concreteType(sv.ret_ty)
-        else
-            .unit_ty;
-        const is_sub_method = self.isCalleeSubscript(callee_hir);
-        const call_hir = try self.emitNode(.{
-            .tag = if (is_sub_method) .hir_subscript_call else .hir_call,
-            .flags = .{ .category = .rvalue, .is_unsafe = self.is_in_unsafe },
-            .type_id = ret_ty,
-            .origin_token = tok,
-            .data = .{ .lhs = callee_hir.asInt(), .rhs = extra_idx },
-        }, expr_id);
-        if (!is_sub_method) {
-            try self.recordCallTypeArgs(expr_id, call_hir, type_arg_nodes.items);
-        }
+        else if (sig_view) |sv| blk_method_ret: {
+            const inner_ret = self.concreteType(sv.ret_ty);
+            if (sv.is_async) {
+                break :blk_method_ret try self.pool.internFuture(inner_ret, method_sym_idx.asInt());
+            }
+            break :blk_method_ret inner_ret;
+        } else .unit_ty;
+        const call_hir = if (is_async_method)
+            try self.emitAsyncFutureMake(
+                method_sym.def_id,
+                method_sym_idx,
+                callee_hir,
+                wrapped_args.items,
+                self.concreteType(ret_ty),
+                tok,
+                expr_id,
+            )
+        else blk_sync_mcall: {
+            const extra_idx = try self.store.appendLenPrefixedExtra(wrapped_args.items);
+            const is_sub_method = self.isCalleeSubscript(callee_hir);
+            const emitted_mcall = try self.emitNode(.{
+                .tag = if (is_sub_method) .hir_subscript_call else .hir_call,
+                .flags = .{ .category = .rvalue, .is_unsafe = self.is_in_unsafe },
+                .type_id = ret_ty,
+                .origin_token = tok,
+                .data = .{ .lhs = callee_hir.asInt(), .rhs = extra_idx },
+            }, expr_id);
+            if (!is_sub_method) {
+                try self.recordCallTypeArgs(expr_id, emitted_mcall, type_arg_nodes.items);
+            }
+            break :blk_sync_mcall emitted_mcall;
+        };
 
         if (seq_stmts.items.len > 0) {
             return self.emitSyntheticBlock(seq_stmts.items, call_hir, ret_ty, tok);
@@ -13522,6 +13882,11 @@ const HirLowerer = struct {
         });
         const param_local_start: u32 = @intCast(self.store.locals.items.len);
         self.closure_outer_local_ceil = return_local_id;
+        try self.closure_frame_stack.append(self.allocator, .{ .ceil = return_local_id });
+        defer {
+            var popped_frame = self.closure_frame_stack.pop().?;
+            popped_frame.captures.deinit(self.allocator);
+        }
         self.active_caller_loc_local = null;
         self.current_fn_ret_ty = ret_ty;
         self.current_loop_id = null;
@@ -13560,17 +13925,9 @@ const HirLowerer = struct {
         const is_local_clos = self.hasAttrNamedInCst(clos_cst, "local");
         const is_move_clos = self.hasModifierInCst(clos_cst, .kw_own, "own") or
             (if (sig_view) |sv| sv.capture_tier != .copy_tier else false);
+        const is_async_clos = if (sig_view) |sv| sv.is_async else self.hasModifierInCst(clos_cst, .kw_async, "async");
         const fn_meta_idx: u32 = @intCast(self.store.functions.items.len);
-        const clos_ord = self.closure_ordinal_in_owner;
-        self.closure_ordinal_in_owner += 1;
-        const file_bits: u32 = if (!self.store.file_id.isNone()) self.store.file_id.asInt() & 0x01FF else 0;
-        const owner_bits: u32 = if (!self.active_owner_def_id.isNone())
-            @as(u32, self.active_owner_def_id.itemIndex()) & 0x0FFF
-        else
-            0x0FFF;
-        const synth_closure_def = DefId.fromInt(
-            0x5000_0000 + (file_bits << 20) + (owner_bits << 8) + (clos_ord & 0x00FF),
-        );
+        const synth_closure_def = self.mintSyntheticClosureDefId();
         try self.store.functions.append(self.allocator, .{
             .def_id = synth_closure_def,
             .fn_ty = self.concreteType(target_ty),
@@ -13580,6 +13937,7 @@ const HirLowerer = struct {
             .param_len = @intCast(param_tokens.len),
             .is_local_closure = is_local_clos,
             .is_move_closure = is_move_clos,
+            .is_async = is_async_clos,
         });
 
         const body_hir = if (ast_node.rhs.tag == .node) blk: {
@@ -13591,7 +13949,7 @@ const HirLowerer = struct {
             break :blk try self.wrapSyntheticReturnBlock(expr_body, ret_ty, tok);
         } else try self.emitUnitConst(tok, .none);
 
-        const cap_slice = self.active_closure_captures.items[saved_captures_len..];
+        const cap_slice = self.closure_frame_stack.items[self.closure_frame_stack.items.len - 1].captures.items;
         const cap_extra_start = if (cap_slice.len > 0) try self.store.appendExtraSlice(cap_slice) else 0;
 
         self.store.functions.items[fn_meta_idx].body_hir = body_hir;
@@ -13610,6 +13968,1072 @@ const HirLowerer = struct {
             .origin_token = tok,
             .data = .{ .lhs = fn_meta_idx, .rhs = body_hir.asInt() },
         }, expr_id);
+    }
+
+    // -------- Structured Async & Nursery Lowering Helpers ---------
+
+    /// Mints a deterministic synthetic `DefId` within `active_owner_def_id` for closures, `async` blocks, and nurseries.
+    fn mintSyntheticClosureDefId(self: *HirLowerer) DefId {
+        const clos_ord = self.closure_ordinal_in_owner;
+        self.closure_ordinal_in_owner += 1;
+        const file_bits: u32 = if (!self.store.file_id.isNone()) self.store.file_id.asInt() & 0x01FF else 0;
+        const owner_bits: u32 = if (!self.active_owner_def_id.isNone())
+            @as(u32, self.active_owner_def_id.itemIndex()) & 0x0FFF
+        else
+            0x0FFF;
+        return DefId.fromInt(0x5000_0000 + (file_bits << 20) + (owner_bits << 8) + (clos_ord & 0x00FF));
+    }
+
+    /// Emits a `hir_intrinsic_call` tagged with `HIR_INTERNAL_INTRINSIC_FLAG | internal_kind`.
+    fn emitInternalIntrinsic(
+        self: *HirLowerer,
+        internal_kind: HirInternalIntrinsic,
+        val_arg_hirs: []const u32,
+        out_ty: TypeId,
+        tok: TokenIndex,
+        ast_origin: NodeIndex,
+    ) !HirIndex {
+        var extra_words: std.ArrayListUnmanaged(u32) = .empty;
+        defer extra_words.deinit(self.allocator);
+        try extra_words.ensureTotalCapacity(self.allocator, 2 + val_arg_hirs.len);
+        extra_words.appendAssumeCapacity(0);
+        extra_words.appendAssumeCapacity(@intCast(val_arg_hirs.len));
+        extra_words.appendSliceAssumeCapacity(val_arg_hirs);
+        const extra_idx = try self.store.appendExtraSlice(extra_words.items);
+        return self.emitNode(.{
+            .tag = .hir_intrinsic_call,
+            .flags = .{ .category = .rvalue, .is_synthetic = true, .is_unsafe = self.is_in_unsafe },
+            .type_id = self.concreteType(out_ty),
+            .origin_token = tok,
+            .data = .{
+                .lhs = HIR_INTERNAL_INTRINSIC_FLAG | @backingInt(internal_kind),
+                .rhs = extra_idx,
+            },
+        }, ast_origin);
+    }
+
+    /// Emits `HirInternalIntrinsic.async_future_make` (`[def_const, sym_const, callee_hir, call_args…] -> Future[T]`).
+    fn emitAsyncFutureMake(
+        self: *HirLowerer,
+        prod_def: DefId,
+        prod_sym: SymbolIndex,
+        callee_hir: HirIndex,
+        call_args: []const u32,
+        fut_ty: TypeId,
+        tok: TokenIndex,
+        ast_origin: NodeIndex,
+    ) !HirIndex {
+        const def_const = try self.emitConstVal(.{ .int_val = @as(i128, prod_def.asInt()) }, .u32_ty, tok, .none, true);
+        const sym_const = try self.emitConstVal(.{ .int_val = @as(i128, prod_sym.asInt()) }, .u32_ty, tok, .none, true);
+        var make_args: std.ArrayListUnmanaged(u32) = .empty;
+        defer make_args.deinit(self.allocator);
+        try make_args.ensureTotalCapacity(self.allocator, 3 + call_args.len);
+        make_args.appendAssumeCapacity(def_const.asInt());
+        make_args.appendAssumeCapacity(sym_const.asInt());
+        make_args.appendAssumeCapacity(callee_hir.asInt());
+        make_args.appendSliceAssumeCapacity(call_args);
+        return self.emitInternalIntrinsic(.async_future_make, make_args.items, fut_ty, tok, ast_origin);
+    }
+
+    /// Lowers postfix `.await` (`AstTag.await_expr`) into `HirTag.hir_await` (`lhs = fut_hir`).
+    fn lowerAwaitExpr(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) anyerror!HirIndex {
+        const ast_node = self.ast_arena.getNode(expr_id);
+        const tok = ast_node.main_token;
+        if (ast_node.lhs.tag != .node) return self.emitErrorHole(tok, expr_id, target_ty);
+
+        const inner_ast_id = NodeIndex.fromInt(ast_node.lhs.payload);
+        const raw_out_ty = if (!target_ty.isError()) target_ty else self.nodeType(expr_id);
+        const out_ty = self.concreteType(if (!raw_out_ty.isError()) raw_out_ty else .unit_ty);
+        const inner_checked = self.nodeType(inner_ast_id);
+        const inner_expected = if (!inner_checked.isError())
+            self.concreteType(inner_checked)
+        else
+            try self.pool.internFuture(out_ty, 0);
+        const fut_hir = try self.lowerExpr(inner_ast_id, inner_expected);
+        return self.emitNode(.{
+            .tag = .hir_await,
+            .flags = .{ .category = .rvalue, .is_unsafe = self.is_in_unsafe },
+            .type_id = out_ty,
+            .origin_token = tok,
+            .data = .{ .lhs = fut_hir.asInt(), .rhs = 0 },
+        }, expr_id);
+    }
+
+    /// Lowers `async { … }` into a dedicated `is_async = true` `HirFnMeta` + `async_future_make` `Future[T]`.
+    fn lowerAsyncBlockExpr(self: *HirLowerer, block_id: NodeIndex, expected_ty: TypeId) anyerror!HirIndex {
+        return self.lowerAsyncBlockExprWithMode(block_id, expected_ty, false);
+    }
+
+    /// Lowers `async { … }` / `own async { … }` into an `is_async = true` `HirFnMeta` + `async_future_make`.
+    fn lowerAsyncBlockExprWithMode(
+        self: *HirLowerer,
+        block_id: NodeIndex,
+        expected_ty: TypeId,
+        is_forced_own: bool,
+    ) anyerror!HirIndex {
+        const block_node = self.ast_arena.getNode(block_id);
+        const tok = block_node.main_token;
+        const checked_ty = if (!expected_ty.isError())
+            self.concreteType(expected_ty)
+        else
+            self.concreteType(self.nodeType(block_id));
+        const ret_ty = if (self.pool.getFutureOutputType(checked_ty)) |out_t|
+            self.concreteType(out_t)
+        else if (!checked_ty.isError())
+            checked_ty
+        else
+            .unit_ty;
+
+        const block_cst = self.ast_arena.getCstOrigin(block_id);
+        const has_own_mod = is_forced_own or self.hasModifierInCst(block_cst, .kw_own, "own");
+        const clos_sig_ty = try self.pool.internClosureSignatureExt(
+            &.{},
+            &.{},
+            ret_ty,
+            .{},
+            if (has_own_mod) .auto_drop_tier else .copy_tier,
+            false,
+            true,
+            true,
+        );
+
+        const saved_ret_ty = self.current_fn_ret_ty;
+        const saved_loop_id = self.current_loop_id;
+        const saved_loop_floor = self.closure_loop_stack_floor;
+        const saved_in_ct_for = self.is_in_comptime_for;
+        const was_in_cond_scope = self.is_in_cond_scope;
+        const saved_ceil = self.closure_outer_local_ceil;
+        const saved_caller_loc = self.active_caller_loc_local;
+        const local_checkpoint = self.local_shadow_log.items.len;
+        defer {
+            self.popLexicalLocalsTo(local_checkpoint);
+            self.active_caller_loc_local = saved_caller_loc;
+            self.closure_outer_local_ceil = saved_ceil;
+            self.is_in_cond_scope = was_in_cond_scope;
+            self.is_in_comptime_for = saved_in_ct_for;
+            self.closure_loop_stack_floor = saved_loop_floor;
+            self.current_loop_id = saved_loop_id;
+            self.current_fn_ret_ty = saved_ret_ty;
+        }
+
+        const return_local_id = try self.store.appendLocal(.{
+            .name = .empty,
+            .type_id = ret_ty,
+            .decl_span = self.astSpan(block_id),
+            .mode = .set_mode,
+            .is_mut = true,
+            .is_param = false,
+            .is_temp = true,
+        });
+        const param_local_start: u32 = @intCast(self.store.locals.items.len);
+        self.closure_outer_local_ceil = return_local_id;
+        try self.closure_frame_stack.append(self.allocator, .{ .ceil = return_local_id });
+        defer {
+            var popped_frame = self.closure_frame_stack.pop().?;
+            popped_frame.captures.deinit(self.allocator);
+        }
+        self.active_caller_loc_local = null;
+        self.current_fn_ret_ty = ret_ty;
+        self.current_loop_id = null;
+        self.closure_loop_stack_floor = self.loop_stack.items.len;
+        self.is_in_comptime_for = false;
+        self.is_in_cond_scope = false;
+
+        const fn_meta_idx: u32 = @intCast(self.store.functions.items.len);
+        const synth_def = self.mintSyntheticClosureDefId();
+        try self.store.functions.append(self.allocator, .{
+            .def_id = synth_def,
+            .fn_ty = clos_sig_ty,
+            .ret_ty = ret_ty,
+            .return_local_id = return_local_id,
+            .param_local_start = param_local_start,
+            .param_len = 0,
+            .is_local_closure = !has_own_mod,
+            .is_move_closure = has_own_mod,
+            .is_async = true,
+        });
+
+        const body_hir = try self.lowerBlockBodyContents(block_id, ret_ty, true);
+        const cap_slice = self.closure_frame_stack.items[self.closure_frame_stack.items.len - 1].captures.items;
+        const cap_extra_start = if (cap_slice.len > 0) try self.store.appendExtraSlice(cap_slice) else 0;
+
+        self.store.functions.items[fn_meta_idx].body_hir = body_hir;
+        self.store.functions.items[fn_meta_idx].total_local_len =
+            @intCast(self.store.locals.items.len - return_local_id);
+        self.store.functions.items[fn_meta_idx].capture_extra_start = cap_extra_start;
+        self.store.functions.items[fn_meta_idx].capture_len = @intCast(cap_slice.len / 2);
+
+        const clos_hir = try self.emitNode(.{
+            .tag = .hir_closure,
+            .flags = .{ .category = .rvalue, .is_synthetic = true },
+            .type_id = clos_sig_ty,
+            .origin_token = tok,
+            .data = .{ .lhs = fn_meta_idx, .rhs = body_hir.asInt() },
+        }, block_id);
+
+        var loan_args: std.ArrayListUnmanaged(u32) = .empty;
+        defer loan_args.deinit(self.allocator);
+        if (!has_own_mod) {
+            try self.appendClosureBorrowCaptureLoans(
+                fn_meta_idx,
+                !self.is_in_nursery_body,
+                tok,
+                &loan_args,
+            );
+        }
+
+        const out_fut_ty = try self.pool.internFuture(ret_ty, synth_def.asInt());
+        return self.emitAsyncFutureMake(synth_def, .none, clos_hir, loan_args.items, out_fut_ty, tok, block_id);
+    }
+
+    /// Returns `true` if `sym_idx` belongs to `core.async` or is a built-in `cx.async` entry function.
+    fn isCoreAsyncEntrySymbol(self: *const HirLowerer, sym_idx: SymbolIndex, recv_ast_id: NodeIndex) bool {
+        if (!sym_idx.isNone()) {
+            const unwrapped_idx = self.unwrapAliasSymbolIdx(sym_idx);
+            const sym = self.sym_table.getSymbol(unwrapped_idx).*;
+            if (sym.flags.is_builtin) return true;
+            if (self.sym_table.getFilePackageId(sym.decl_span.file_id) == .std_core) return true;
+            if (!self.sym_table.cx_root_scope.isNone() and !sym.scope_id.isNone()) {
+                for (self.sym_table.getScopeMembers(self.sym_table.cx_root_scope)) |cx_mem| {
+                    const mem_sym = self.sym_table.getSymbol(cx_mem).*;
+                    if (mem_sym.kind == .module_sym and mem_sym.target_scope == sym.scope_id and
+                        std.mem.eql(u8, mem_sym.name_text, "async"))
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        if (recv_ast_id.isNone() or recv_ast_id.asInt() >= self.ast_arena.countNodes()) return false;
+        const recv_node = self.ast_arena.getNode(recv_ast_id);
+        if (recv_node.tag == .field_access and recv_node.lhs.tag == .node and recv_node.rhs.tag == .token) {
+            const field_lex = symbol_resolver.extractTokenSlice(
+                self.source,
+                self.tokens,
+                TokenIndex.fromInt(recv_node.rhs.payload),
+            );
+            if (!std.mem.eql(u8, field_lex, "async")) return false;
+            const base_id = NodeIndex.fromInt(recv_node.lhs.payload);
+            var base_sym = self.nodeSymbol(base_id);
+            if (base_sym.isNone() and self.ast_arena.getNode(base_id).tag == .ident_expr) {
+                const base_tok = self.ast_arena.getNode(base_id).main_token;
+                if (!base_tok.isNone()) {
+                    const base_lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, base_tok);
+                    if (self.interner.lookup(base_lex)) |base_name_id| {
+                        switch (self.sym_table.lookupLexical(self.current_scope, base_name_id, NamespaceMask.ALL)) {
+                            .found => |found_idx| base_sym = found_idx,
+                            else => {},
+                        }
+                    }
+                }
+            }
+            if (!base_sym.isNone()) {
+                const unwrapped_base = self.unwrapAliasSymbolIdx(base_sym);
+                return self.sym_table.getSymbol(unwrapped_base).target_scope == self.sym_table.cx_root_scope;
+            }
+        }
+        return false;
+    }
+
+    /// Lowers `core.async` / `cx.async` `yield_now()`, `block_on(fut)`, and `task_group(cb)` calls.
+    fn tryLowerStructuredAsyncEntryCall(
+        self: *HirLowerer,
+        expr_id: NodeIndex,
+        resolved_sym_idx: SymbolIndex,
+        callee_or_recv_ast: NodeIndex,
+        explicit_member_name: ?[]const u8,
+        val_args: []const NodeIndex,
+        target_ty: TypeId,
+        tok: TokenIndex,
+    ) anyerror!?HirIndex {
+        const entry_name: []const u8 = if (explicit_member_name) |member_lex|
+            member_lex
+        else if (!resolved_sym_idx.isNone())
+            self.sym_table.getSymbol(self.unwrapAliasSymbolIdx(resolved_sym_idx)).name_text
+        else blk_name: {
+            const callee_node = self.ast_arena.getNode(callee_or_recv_ast);
+            if (callee_node.tag == .field_access and callee_node.rhs.tag == .token) {
+                break :blk_name symbol_resolver.extractTokenSlice(
+                    self.source,
+                    self.tokens,
+                    TokenIndex.fromInt(callee_node.rhs.payload),
+                );
+            }
+            if (callee_node.tag == .ident_expr and !callee_node.main_token.isNone()) {
+                break :blk_name symbol_resolver.extractTokenSlice(self.source, self.tokens, callee_node.main_token);
+            }
+            return null;
+        };
+
+        if (!std.mem.eql(u8, entry_name, "yield_now") and
+            !std.mem.eql(u8, entry_name, "block_on") and
+            !std.mem.eql(u8, entry_name, "task_group"))
+        {
+            return null;
+        }
+
+        const recv_for_check = if (explicit_member_name != null)
+            callee_or_recv_ast
+        else blk_recv: {
+            const callee_node = self.ast_arena.getNode(callee_or_recv_ast);
+            if (callee_node.tag == .field_access and callee_node.lhs.tag == .node) {
+                break :blk_recv NodeIndex.fromInt(callee_node.lhs.payload);
+            }
+            break :blk_recv NodeIndex.none;
+        };
+        if (!self.isCoreAsyncEntrySymbol(resolved_sym_idx, recv_for_check)) return null;
+
+        const raw_out_ty = if (!target_ty.isError()) target_ty else self.nodeType(expr_id);
+        const out_ty = self.concreteType(if (!raw_out_ty.isError()) raw_out_ty else .unit_ty);
+
+        if (std.mem.eql(u8, entry_name, "yield_now")) {
+            return try self.emitInternalIntrinsic(.async_yield, &.{}, out_ty, tok, expr_id);
+        }
+        if (std.mem.eql(u8, entry_name, "block_on")) {
+            if (val_args.len == 0) return try self.emitErrorHole(tok, expr_id, out_ty);
+            const fut_ast = self.unwrapCallArgAst(val_args[0]);
+            const fut_hir = try self.lowerExpr(fut_ast, .err_ty);
+            return try self.emitInternalIntrinsic(
+                .async_block_on,
+                &[1]u32{fut_hir.asInt()},
+                out_ty,
+                tok,
+                expr_id,
+            );
+        }
+        if (val_args.len == 0) return try self.emitErrorHole(tok, expr_id, out_ty);
+        return try self.lowerStructuredTaskGroupCall(
+            expr_id,
+            self.unwrapCallArgAst(val_args[0]),
+            out_ty,
+            tok,
+        );
+    }
+
+    /// Lowers `task_group(cb)` into an `is_async = true` nursery `HirFnMeta` guarded by `async_task_group_enter`/`exit`.
+    fn lowerStructuredTaskGroupCall(
+        self: *HirLowerer,
+        expr_id: NodeIndex,
+        cb_ast_id: NodeIndex,
+        out_fut_ty: TypeId,
+        tok: TokenIndex,
+    ) anyerror!HirIndex {
+        const res_ty = if (self.pool.getFutureOutputType(out_fut_ty)) |inner_res|
+            self.concreteType(inner_res)
+        else if (!out_fut_ty.isError())
+            out_fut_ty
+        else
+            .unit_ty;
+
+        const cb_ty = self.nodeType(cb_ast_id);
+        const cb_sig = self.pool.getFnSignatureView(cb_ty);
+        const group_ref_ty = if (cb_sig) |sv|
+            (if (sv.paramCount() >= 1)
+                self.concreteType(sv.getParamType(0))
+            else
+                try self.pool.internRef(try self.pool.internTaskGroup(.never_ty), true))
+        else
+            try self.pool.internRef(try self.pool.internTaskGroup(.never_ty), true);
+        const group_val_ty = self.concreteType(self.unwrapRefType(group_ref_ty));
+
+        const nursery_clos_ty = try self.pool.internClosureSignatureExt(
+            &.{},
+            &.{},
+            res_ty,
+            .{},
+            .copy_tier,
+            false,
+            true,
+            true,
+        );
+
+        const saved_ret_ty = self.current_fn_ret_ty;
+        const saved_loop_id = self.current_loop_id;
+        const saved_loop_floor = self.closure_loop_stack_floor;
+        const saved_in_ct_for = self.is_in_comptime_for;
+        const was_in_cond_scope = self.is_in_cond_scope;
+        const saved_ceil = self.closure_outer_local_ceil;
+        const saved_caller_loc = self.active_caller_loc_local;
+        const saved_in_nursery = self.is_in_nursery_body;
+        const local_checkpoint = self.local_shadow_log.items.len;
+        defer {
+            self.popLexicalLocalsTo(local_checkpoint);
+            self.is_in_nursery_body = saved_in_nursery;
+            self.active_caller_loc_local = saved_caller_loc;
+            self.closure_outer_local_ceil = saved_ceil;
+            self.is_in_cond_scope = was_in_cond_scope;
+            self.is_in_comptime_for = saved_in_ct_for;
+            self.closure_loop_stack_floor = saved_loop_floor;
+            self.current_loop_id = saved_loop_id;
+            self.current_fn_ret_ty = saved_ret_ty;
+        }
+
+        const return_local_id = try self.store.appendLocal(.{
+            .name = .empty,
+            .type_id = res_ty,
+            .decl_span = self.astSpan(expr_id),
+            .mode = .set_mode,
+            .is_mut = true,
+            .is_param = false,
+            .is_temp = true,
+        });
+        const param_local_start: u32 = @intCast(self.store.locals.items.len);
+        self.closure_outer_local_ceil = return_local_id;
+        try self.closure_frame_stack.append(self.allocator, .{ .ceil = return_local_id });
+        defer {
+            var popped_frame = self.closure_frame_stack.pop().?;
+            popped_frame.captures.deinit(self.allocator);
+        }
+        self.active_caller_loc_local = null;
+        self.current_fn_ret_ty = res_ty;
+        self.current_loop_id = null;
+        self.closure_loop_stack_floor = self.loop_stack.items.len;
+        self.is_in_comptime_for = false;
+        self.is_in_cond_scope = false;
+        self.is_in_nursery_body = true;
+
+        const fn_meta_idx: u32 = @intCast(self.store.functions.items.len);
+        const synth_def = self.mintSyntheticClosureDefId();
+        try self.store.functions.append(self.allocator, .{
+            .def_id = synth_def,
+            .fn_ty = nursery_clos_ty,
+            .ret_ty = res_ty,
+            .return_local_id = return_local_id,
+            .param_local_start = param_local_start,
+            .param_len = 0,
+            .is_local_closure = true,
+            .is_move_closure = false,
+            .is_async = true,
+        });
+
+        // [1] Enter nursery (`let mut _group = async_task_group_enter()`) & register LIFO `defer` exit barrier:
+        var outer_stmts: std.ArrayListUnmanaged(u32) = .empty;
+        defer outer_stmts.deinit(self.allocator);
+
+        const group_val_slot = try self.allocTempLocal(group_val_ty, tok, true);
+        const enter_hir = try self.emitInternalIntrinsic(.async_task_group_enter, &.{}, group_val_ty, tok, .none);
+        try outer_stmts.append(self.allocator, (try self.emitLocalDeclNode(group_val_slot, enter_hir, tok)).asInt());
+
+        const exit_group_ref = try self.emitVarRef(group_val_slot, tok, .none);
+        const exit_hir = try self.emitInternalIntrinsic(
+            .async_task_group_exit,
+            &[1]u32{exit_group_ref.asInt()},
+            .unit_ty,
+            tok,
+            .none,
+        );
+        const defer_hir = try self.emitNode(.{
+            .tag = .hir_defer,
+            .flags = .{ .category = .rvalue, .is_synthetic = true },
+            .type_id = .unit_ty,
+            .origin_token = tok,
+            .data = .{ .lhs = 0, .rhs = exit_hir.asInt() },
+        }, .none);
+        try outer_stmts.append(self.allocator, defer_hir.asInt());
+
+        // [2] Bind `&mut _group` to callback parameter and lower callback body inline inside the nursery frame:
+        const cb_node = self.ast_arena.getNode(cb_ast_id);
+        var callback_res_hir: HirIndex = .none;
+        if (cb_node.tag == .closure_expr) {
+            const param_tokens = self.getAstExtraSlice(cb_ast_id, false);
+            var param_name = SymbolId.empty;
+            var param_span = self.astSpan(cb_ast_id);
+            if (param_tokens.len >= 1) {
+                const param_tok = TokenIndex.fromInt(param_tokens[0]);
+                const param_lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, param_tok);
+                if (param_lex.len > 0 and !std.mem.eql(u8, param_lex, "_")) {
+                    param_name = try self.interner.intern(param_lex);
+                }
+                param_span = self.tokens.getTokenSpan(self.store.file_id, param_tok);
+            }
+            const group_borrow_hir = try self.emitSyntheticAddrOf(
+                try self.emitVarRef(group_val_slot, tok, .none),
+                group_ref_ty,
+                true,
+                tok,
+            );
+            const group_param_slot = try self.store.appendLocal(.{
+                .name = param_name,
+                .type_id = group_ref_ty,
+                .decl_span = param_span,
+                .mode = .let_mode,
+                .is_mut = false,
+                .is_param = false,
+                .is_temp = false,
+            });
+            try outer_stmts.append(
+                self.allocator,
+                (try self.emitLocalDeclNode(group_param_slot, group_borrow_hir, tok)).asInt(),
+            );
+            try self.pushLexicalLocal(param_name, group_param_slot);
+
+            if (cb_node.rhs.tag == .node) {
+                const cb_body_id = NodeIndex.fromInt(cb_node.rhs.payload);
+                const cb_ret_expected = if (cb_sig) |sv| self.concreteType(sv.ret_ty) else res_ty;
+                if (self.ast_arena.getNode(cb_body_id).tag == .block) {
+                    callback_res_hir = try self.lowerBlockBodyContents(cb_body_id, cb_ret_expected, false);
+                } else {
+                    callback_res_hir = try self.lowerExpr(cb_body_id, cb_ret_expected);
+                }
+            } else {
+                callback_res_hir = try self.emitUnitConst(tok, .none);
+            }
+        } else {
+            const callee_hir = try self.lowerExpr(cb_ast_id, .err_ty);
+            const group_borrow_hir = try self.emitSyntheticAddrOf(
+                try self.emitVarRef(group_val_slot, tok, .none),
+                group_ref_ty,
+                true,
+                tok,
+            );
+            const proj_arg = try self.wrapArgProjection(group_borrow_hir, .let_mode, tok);
+            if (cb_sig != null and cb_sig.?.is_async) {
+                const inner_fut_ty = try self.pool.internFuture(res_ty, 0);
+                const inner_fut_hir = try self.emitAsyncFutureMake(
+                    .NONE,
+                    .none,
+                    callee_hir,
+                    &[1]u32{proj_arg.asInt()},
+                    inner_fut_ty,
+                    tok,
+                    .none,
+                );
+                callback_res_hir = try self.emitNode(.{
+                    .tag = .hir_await,
+                    .flags = .{ .category = .rvalue, .is_synthetic = true },
+                    .type_id = res_ty,
+                    .origin_token = tok,
+                    .data = .{ .lhs = inner_fut_hir.asInt(), .rhs = 0 },
+                }, .none);
+            } else {
+                const call_extra = try self.store.appendLenPrefixedExtra(&[1]u32{proj_arg.asInt()});
+                callback_res_hir = try self.emitNode(.{
+                    .tag = .hir_call,
+                    .flags = .{ .category = .rvalue, .is_synthetic = true },
+                    .type_id = res_ty,
+                    .origin_token = tok,
+                    .data = .{ .lhs = callee_hir.asInt(), .rhs = call_extra },
+                }, .none);
+            }
+        }
+
+        if (!callback_res_hir.isNone() and self.store.getNode(callback_res_hir).type_id == .never_ty) {
+            try outer_stmts.append(self.allocator, callback_res_hir.asInt());
+        } else {
+            const ret_val_hir = if (!callback_res_hir.isNone())
+                try self.applyImplicitCoercionIfNeeded(callback_res_hir, res_ty, tok)
+            else
+                try self.emitUnitConst(tok, .none);
+            const err_kind = self.classifyReturnExpr(ret_val_hir, res_ty);
+            const ret_node = try self.emitNode(.{
+                .tag = .hir_return,
+                .flags = .{ .category = .diverging, .is_synthetic = true, .is_unsafe = self.is_in_unsafe },
+                .type_id = .never_ty,
+                .origin_token = tok,
+                .data = .{ .lhs = ret_val_hir.asInt(), .rhs = @backingInt(err_kind) },
+            }, .none);
+            try outer_stmts.append(self.allocator, ret_node.asInt());
+        }
+
+        const body_extra = try self.store.appendLenPrefixedExtra(outer_stmts.items);
+        const body_hir = try self.emitNode(.{
+            .tag = .hir_block,
+            .flags = .{ .category = .diverging, .is_synthetic = true, .is_unsafe = self.is_in_unsafe },
+            .type_id = .never_ty,
+            .origin_token = tok,
+            .data = .{ .lhs = body_extra, .rhs = HirIndex.none.asInt() },
+        }, .none);
+
+        const cap_slice = self.closure_frame_stack.items[self.closure_frame_stack.items.len - 1].captures.items;
+        const cap_extra_start = if (cap_slice.len > 0) try self.store.appendExtraSlice(cap_slice) else 0;
+        self.store.functions.items[fn_meta_idx].body_hir = body_hir;
+        self.store.functions.items[fn_meta_idx].total_local_len =
+            @intCast(self.store.locals.items.len - return_local_id);
+        self.store.functions.items[fn_meta_idx].capture_extra_start = cap_extra_start;
+        self.store.functions.items[fn_meta_idx].capture_len = @intCast(cap_slice.len / 2);
+
+        const clos_hir = try self.emitNode(.{
+            .tag = .hir_closure,
+            .flags = .{ .category = .rvalue, .is_synthetic = true },
+            .type_id = nursery_clos_ty,
+            .origin_token = tok,
+            .data = .{ .lhs = fn_meta_idx, .rhs = body_hir.asInt() },
+        }, expr_id);
+
+        var loan_args: std.ArrayListUnmanaged(u32) = .empty;
+        defer loan_args.deinit(self.allocator);
+        try self.appendClosureBorrowCaptureLoans(fn_meta_idx, false, tok, &loan_args);
+
+        const final_fut_ty = try self.pool.internFuture(res_ty, synth_def.asInt());
+        return self.emitAsyncFutureMake(synth_def, .none, clos_hir, loan_args.items, final_fut_ty, tok, expr_id);
+    }
+
+    /// Returns `true` if `ty` is built-in `TaskGroup[E]` or `core.async.TaskGroup[E]`.
+    fn isTaskGroupLikeType(self: *const HirLowerer, raw_ty: TypeId) bool {
+        const ty = self.pool.unwrapUnderlyingType(raw_ty);
+        if (self.pool.isTaskGroupType(ty)) return true;
+        if (self.pool.getTag(ty) == .struct_ty) {
+            const sym_idx = SymbolIndex.fromInt(self.pool.getNode(ty).rhs);
+            if (!sym_idx.isNone()) {
+                return std.mem.eql(u8, self.sym_table.getSymbol(sym_idx).name_text, "TaskGroup");
+            }
+        }
+        return false;
+    }
+
+    /// Returns `true` if `ty` is built-in `TaskHandle[T]` or `core.async.TaskHandle[T]`.
+    fn isTaskHandleLikeType(self: *const HirLowerer, raw_ty: TypeId) bool {
+        const ty = self.pool.unwrapUnderlyingType(raw_ty);
+        if (self.pool.isTaskHandleType(ty)) return true;
+        if (self.pool.getTag(ty) == .struct_ty) {
+            const sym_idx = SymbolIndex.fromInt(self.pool.getNode(ty).rhs);
+            if (!sym_idx.isNone()) {
+                return std.mem.eql(u8, self.sym_table.getSymbol(sym_idx).name_text, "TaskHandle");
+            }
+        }
+        return false;
+    }
+
+    /// Lowers `TaskGroup` (`spawn`, `spawn_local`, `cancel_all`, `is_cancelled`) and `TaskHandle` (`join`, `cancel`) calls.
+    fn tryLowerTaskGroupOrHandleMethod(
+        self: *HirLowerer,
+        expr_id: NodeIndex,
+        recv_id: NodeIndex,
+        member_name: []const u8,
+        val_args: []const NodeIndex,
+        target_ty: TypeId,
+        tok: TokenIndex,
+    ) anyerror!?HirIndex {
+        const recv_unwrapped = self.pool.unwrapUnderlyingType(self.unwrapRefType(self.nodeType(recv_id)));
+        const raw_out_ty = if (!target_ty.isError()) target_ty else self.nodeType(expr_id);
+        const out_ty = self.concreteType(if (!raw_out_ty.isError()) raw_out_ty else .unit_ty);
+
+        if (self.isTaskGroupLikeType(recv_unwrapped)) {
+            const is_spawn = std.mem.eql(u8, member_name, "spawn");
+            const is_spawn_local = std.mem.eql(u8, member_name, "spawn_local");
+            if (is_spawn or is_spawn_local) {
+                if (val_args.len == 0) return try self.emitErrorHole(tok, expr_id, out_ty);
+                const raw_group_hir = try self.lowerPlaceWithMutCtx(recv_id, .err_ty, true);
+                const group_ref_hir = try self.reborrowOrAddrOfTaskGroup(raw_group_hir, true, tok);
+
+                const task_ast = self.unwrapCallArgAst(val_args[0]);
+                const builder_state_ty = if (self.side_tables) |tables|
+                    tables.getBuilderBlockStateType(expr_id)
+                else
+                    null;
+                const raw_task_hir = if (builder_state_ty != null and self.ast_arena.getNode(task_ast).tag == .block)
+                    try self.lowerBuilderTrailingBlockClosure(task_ast, builder_state_ty.?, .err_ty, tok)
+                else
+                    try self.lowerExpr(task_ast, .err_ty);
+
+                var spawn_args: std.ArrayListUnmanaged(u32) = .empty;
+                defer spawn_args.deinit(self.allocator);
+                const local_flag = try self.emitConstVal(
+                    .{ .int_val = if (is_spawn_local) 1 else 0 },
+                    .u32_ty,
+                    tok,
+                    .none,
+                    true,
+                );
+                try spawn_args.append(self.allocator, local_flag.asInt());
+                try spawn_args.append(self.allocator, group_ref_hir.asInt());
+
+                if (!raw_task_hir.isNone() and self.store.getNode(raw_task_hir).tag == .hir_closure) {
+                    const clos_meta_idx = self.store.getNode(raw_task_hir).data.lhs;
+                    const clos_meta = self.store.functions.items[clos_meta_idx];
+                    const fut_ty = try self.pool.internFuture(clos_meta.ret_ty, clos_meta.def_id.asInt());
+                    const wrapped_fut = try self.emitAsyncFutureMake(
+                        clos_meta.def_id,
+                        .none,
+                        raw_task_hir,
+                        &.{},
+                        fut_ty,
+                        tok,
+                        .none,
+                    );
+                    try spawn_args.append(self.allocator, wrapped_fut.asInt());
+                    if (!clos_meta.is_move_closure) {
+                        try self.appendClosureBorrowCaptureLoans(clos_meta_idx, false, tok, &spawn_args);
+                    }
+                } else {
+                    try spawn_args.append(self.allocator, raw_task_hir.asInt());
+                }
+
+                return try self.emitInternalIntrinsic(.async_spawn, spawn_args.items, out_ty, tok, expr_id);
+            }
+            if (std.mem.eql(u8, member_name, "cancel_all") or std.mem.eql(u8, member_name, "cancel")) {
+                const raw_group_hir = try self.lowerPlaceWithMutCtx(recv_id, .err_ty, true);
+                const group_ref_hir = try self.reborrowOrAddrOfTaskGroup(raw_group_hir, true, tok);
+                return try self.emitInternalIntrinsic(
+                    .async_cancel,
+                    &[1]u32{group_ref_hir.asInt()},
+                    .unit_ty,
+                    tok,
+                    expr_id,
+                );
+            }
+            if (std.mem.eql(u8, member_name, "is_cancelled")) {
+                const raw_group_hir = try self.lowerPlaceWithMutCtx(recv_id, .err_ty, false);
+                const group_ref_hir = try self.reborrowOrAddrOfTaskGroup(raw_group_hir, false, tok);
+                const query_flag = try self.emitConstVal(.{ .int_val = 1 }, .u32_ty, tok, .none, true);
+                return try self.emitInternalIntrinsic(
+                    .async_cancel,
+                    &[2]u32{ group_ref_hir.asInt(), query_flag.asInt() },
+                    .bool_ty,
+                    tok,
+                    expr_id,
+                );
+            }
+        }
+
+        if (self.isTaskHandleLikeType(recv_unwrapped)) {
+            if (std.mem.eql(u8, member_name, "join")) {
+                const handle_hir = try self.lowerExpr(recv_id, .err_ty);
+                return try self.emitInternalIntrinsic(
+                    .async_join,
+                    &[1]u32{handle_hir.asInt()},
+                    out_ty,
+                    tok,
+                    expr_id,
+                );
+            }
+            if (std.mem.eql(u8, member_name, "cancel")) {
+                const handle_hir = try self.lowerExpr(recv_id, .err_ty);
+                return try self.emitInternalIntrinsic(
+                    .async_cancel,
+                    &[1]u32{handle_hir.asInt()},
+                    out_ty,
+                    tok,
+                    expr_id,
+                );
+            }
+        }
+        return null;
+    }
+
+    /// Reborrows `&mut (group.*)` when `raw_group_hir` is `&mut TaskGroup` so `group` is not moved on method calls.
+    fn reborrowOrAddrOfTaskGroup(
+        self: *HirLowerer,
+        raw_group_hir: HirIndex,
+        is_mut: bool,
+        tok: TokenIndex,
+    ) !HirIndex {
+        const raw_group_ty = self.pool.unwrapUnderlyingType(self.store.getNode(raw_group_hir).type_id);
+        const tag = self.pool.getTag(raw_group_ty);
+        if (tag == .mut_ref_ty) {
+            const pointee_ty = self.concreteType(TypeId.fromInt(self.pool.getNode(raw_group_ty).lhs));
+            const deref_hir = try self.emitNode(.{
+                .tag = .hir_unary_op,
+                .flags = .{ .category = .place_mut, .is_synthetic = true },
+                .type_id = pointee_ty,
+                .origin_token = tok,
+                .data = .{
+                    .lhs = @backingInt(HirUnaryOp.deref),
+                    .rhs = raw_group_hir.asInt(),
+                },
+            }, .none);
+            return self.emitSyntheticAddrOf(
+                deref_hir,
+                try self.pool.internRef(pointee_ty, is_mut),
+                is_mut,
+                tok,
+            );
+        }
+        if (tag == .ref_ty and !is_mut) {
+            return raw_group_hir;
+        }
+        return self.emitSyntheticAddrOf(
+            raw_group_hir,
+            try self.pool.internRef(raw_group_ty, is_mut),
+            is_mut,
+            tok,
+        );
+    }
+
+    /// Emits `&outer_local` / `&mut outer_local` loan arguments for outer bindings borrowed by `fn_meta_idx`.
+    fn appendClosureBorrowCaptureLoans(
+        self: *HirLowerer,
+        fn_meta_idx: u32,
+        is_skip_immutable_copy: bool,
+        tok: TokenIndex,
+        out_args: *std.ArrayListUnmanaged(u32),
+    ) !void {
+        if (fn_meta_idx >= self.store.functions.items.len) return;
+        const fn_meta = self.store.functions.items[fn_meta_idx];
+        if (fn_meta.is_move_closure) return;
+        for (0..fn_meta.capture_len) |cap_i| {
+            const outer_slot = self.store.extra_data.items[fn_meta.capture_extra_start + cap_i * 2];
+            const inner_slot = self.store.extra_data.items[fn_meta.capture_extra_start + cap_i * 2 + 1];
+            if (outer_slot >= self.store.locals.items.len) continue;
+            const outer_decl = self.store.locals.items[outer_slot];
+            const outer_tag = self.pool.getTag(self.pool.unwrapUnderlyingType(outer_decl.type_id));
+            // Reference-typed captures (`&T` / `&mut T`) already propagate their NLL loan via `closure_make`:
+            if (outer_tag == .ref_ty or outer_tag == .mut_ref_ty) continue;
+            if (fn_meta.is_move_closure and !self.pool.getFlags(outer_decl.type_id).is_copy) continue;
+
+            const is_mutated = self.isHirSlotMutatedInSubtree(fn_meta.body_hir, inner_slot);
+            if (!is_mutated and is_skip_immutable_copy and !outer_decl.is_mut) continue;
+
+            const var_ref_hir = try self.emitNode(.{
+                .tag = .hir_var_ref,
+                .flags = .{
+                    .category = if (outer_decl.is_mut or outer_decl.mode == .inout_mode or outer_decl.mode == .set_mode)
+                        .place_mut
+                    else
+                        .place_imm,
+                    .is_synthetic = true,
+                },
+                .type_id = outer_decl.type_id,
+                .origin_token = tok,
+                .data = .{ .lhs = outer_slot, .rhs = 0 },
+            }, .none);
+            const ref_ty = try self.pool.internRef(outer_decl.type_id, is_mutated);
+            const borrow_hir = try self.emitSyntheticAddrOf(var_ref_hir, ref_ty, is_mutated, tok);
+            try out_args.append(self.allocator, borrow_hir.asInt());
+        }
+    }
+
+    /// Returns `true` if `target_slot` is assigned or mutably borrowed anywhere inside `root_hir`.
+    fn isHirSlotMutatedInSubtree(self: *const HirLowerer, root_hir: HirIndex, target_slot: u32) bool {
+        return self.isHirSlotMutatedInSubtreeDepth(root_hir, target_slot, 0);
+    }
+
+    /// Bounded recursive helper checking whether `target_slot` is mutated across nested expressions and closures.
+    fn isHirSlotMutatedInSubtreeDepth(
+        self: *const HirLowerer,
+        root_hir: HirIndex,
+        target_slot: u32,
+        depth: u32,
+    ) bool {
+        if (depth >= 32 or root_hir.isNone() or root_hir.asInt() >= self.store.nodes.len) return false;
+        var visit_stack: std.ArrayListUnmanaged(u32) = .empty;
+        defer visit_stack.deinit(self.allocator);
+        visit_stack.append(self.allocator, root_hir.asInt()) catch return false;
+
+        while (visit_stack.pop()) |cur_raw| {
+            if (cur_raw == NONE_U32 or cur_raw >= self.store.nodes.len) continue;
+            const cur_node = self.store.getNode(HirIndex.fromInt(cur_raw));
+            switch (cur_node.tag) {
+                .hir_assign, .hir_bitfield_rmw => {
+                    if (self.extractRootHirSlot(HirIndex.fromInt(cur_node.data.lhs)) == target_slot) return true;
+                    visit_stack.append(self.allocator, cur_node.data.lhs) catch {};
+                    if (cur_node.tag == .hir_assign) {
+                        visit_stack.append(self.allocator, cur_node.data.rhs) catch {};
+                    } else if (cur_node.data.rhs + 2 <= self.store.extra_data.items.len) {
+                        visit_stack.append(self.allocator, self.store.extra_data.items[cur_node.data.rhs + 1]) catch {};
+                    }
+                },
+                .hir_unary_op => {
+                    const un_op: HirUnaryOp = @fromBackingInt(@intCast(@as(u8, @truncate(cur_node.data.lhs))));
+                    if ((un_op == .addr_of_mut or un_op == .addr_of_raw_mut) and
+                        self.extractRootHirSlot(HirIndex.fromInt(cur_node.data.rhs)) == target_slot)
+                    {
+                        return true;
+                    }
+                    visit_stack.append(self.allocator, cur_node.data.rhs) catch {};
+                },
+                .hir_project_arg => {
+                    const mode: ParamMode = @fromBackingInt(@intCast(@as(u2, @truncate(cur_node.data.lhs))));
+                    if ((mode == .inout_mode or mode == .set_mode) and
+                        self.extractRootHirSlot(HirIndex.fromInt(cur_node.data.rhs)) == target_slot)
+                    {
+                        return true;
+                    }
+                    visit_stack.append(self.allocator, cur_node.data.rhs) catch {};
+                },
+                .hir_block => {
+                    for (self.store.getLenPrefixedExtra(cur_node.data.lhs)) |stmt_raw| {
+                        visit_stack.append(self.allocator, stmt_raw) catch {};
+                    }
+                    visit_stack.append(self.allocator, cur_node.data.rhs) catch {};
+                },
+                .hir_local_decl, .hir_const_decl, .hir_defer, .hir_ctx_set, .hir_ctx_region_push, .hir_break => {
+                    visit_stack.append(self.allocator, cur_node.data.rhs) catch {};
+                },
+                .hir_field_proj, .hir_bitfield_read, .hir_cast, .hir_return, .hir_yield, .hir_loop, .hir_await => {
+                    visit_stack.append(self.allocator, cur_node.data.lhs) catch {};
+                },
+                .hir_index_proj, .hir_orelse => {
+                    visit_stack.append(self.allocator, cur_node.data.lhs) catch {};
+                    visit_stack.append(self.allocator, cur_node.data.rhs) catch {};
+                },
+                .hir_soa_field_ptr => {
+                    visit_stack.append(self.allocator, cur_node.data.lhs) catch {};
+                    if (cur_node.data.rhs + 2 <= self.store.extra_data.items.len) {
+                        visit_stack.append(self.allocator, self.store.extra_data.items[cur_node.data.rhs + 1]) catch {};
+                    }
+                },
+                .hir_slice_range => {
+                    visit_stack.append(self.allocator, cur_node.data.lhs) catch {};
+                    if (cur_node.data.rhs + 3 <= self.store.extra_data.items.len) {
+                        visit_stack.append(self.allocator, self.store.extra_data.items[cur_node.data.rhs]) catch {};
+                        visit_stack.append(self.allocator, self.store.extra_data.items[cur_node.data.rhs + 1]) catch {};
+                    }
+                },
+                .hir_binary_op => {
+                    if (cur_node.data.lhs + 2 <= self.store.extra_data.items.len) {
+                        visit_stack.append(self.allocator, self.store.extra_data.items[cur_node.data.lhs]) catch {};
+                        visit_stack.append(self.allocator, self.store.extra_data.items[cur_node.data.lhs + 1]) catch {};
+                    }
+                },
+                .hir_if => {
+                    visit_stack.append(self.allocator, cur_node.data.lhs) catch {};
+                    if (cur_node.data.rhs + 2 <= self.store.extra_data.items.len) {
+                        visit_stack.append(self.allocator, self.store.extra_data.items[cur_node.data.rhs]) catch {};
+                        visit_stack.append(self.allocator, self.store.extra_data.items[cur_node.data.rhs + 1]) catch {};
+                    }
+                },
+                .hir_cond_if, .hir_cond_while => {
+                    if (cur_node.data.lhs < self.store.extra_data.items.len) {
+                        const clause_count = self.store.extra_data.items[cur_node.data.lhs];
+                        var cursor: usize = cur_node.data.lhs + 1;
+                        var clause_i: u32 = 0;
+                        while (clause_i < clause_count and cursor < self.store.extra_data.items.len) : (clause_i += 1) {
+                            const clause_kind = self.store.extra_data.items[cursor];
+                            if (clause_kind == @backingInt(HirCondClauseKind.bool_pred) and
+                                cursor + 1 < self.store.extra_data.items.len)
+                            {
+                                visit_stack.append(self.allocator, self.store.extra_data.items[cursor + 1]) catch {};
+                                cursor += 2;
+                            } else if (clause_kind == @backingInt(HirCondClauseKind.is_match) and
+                                cursor + 2 < self.store.extra_data.items.len)
+                            {
+                                visit_stack.append(self.allocator, self.store.extra_data.items[cursor + 1]) catch {};
+                                cursor += 3;
+                            } else {
+                                break;
+                            }
+                        }
+                        if (cursor < self.store.extra_data.items.len) {
+                            visit_stack.append(self.allocator, self.store.extra_data.items[cursor]) catch {};
+                        }
+                        if (cur_node.tag == .hir_cond_if and cursor + 1 < self.store.extra_data.items.len) {
+                            visit_stack.append(self.allocator, self.store.extra_data.items[cursor + 1]) catch {};
+                        }
+                    }
+                },
+                .hir_construct => {
+                    const ckind: HirConstructKind = @fromBackingInt(@intCast(@as(u8, @truncate(cur_node.data.lhs))));
+                    switch (ckind) {
+                        .struct_init,
+                        .tuple_init,
+                        .array_elements,
+                        .enum_variant,
+                        .optional_some,
+                        .result_ok,
+                        .result_err,
+                        .str_interp,
+                        => {
+                            for (self.store.getLenPrefixedExtra(cur_node.data.rhs)) |elem_raw| {
+                                visit_stack.append(self.allocator, elem_raw) catch {};
+                            }
+                        },
+                        .array_repeat => {
+                            if (cur_node.data.rhs + 2 <= self.store.extra_data.items.len) {
+                                visit_stack.append(
+                                    self.allocator,
+                                    self.store.extra_data.items[cur_node.data.rhs + 1],
+                                ) catch {};
+                            }
+                        },
+                        .fmt_value => {
+                            if (cur_node.data.rhs + 3 <= self.store.extra_data.items.len) {
+                                visit_stack.append(self.allocator, self.store.extra_data.items[cur_node.data.rhs]) catch {};
+                            }
+                        },
+                        .fmt_args => {
+                            if (cur_node.data.rhs + 2 <= self.store.extra_data.items.len) {
+                                const piece_len = self.store.extra_data.items[cur_node.data.rhs];
+                                const hole_len = self.store.extra_data.items[cur_node.data.rhs + 1];
+                                const holes_start: usize = cur_node.data.rhs + 2 + piece_len;
+                                var hole_i: usize = 0;
+                                while (hole_i < hole_len) : (hole_i += 1) {
+                                    const hole_pos = holes_start + hole_i * 3;
+                                    if (hole_pos >= self.store.extra_data.items.len) break;
+                                    visit_stack.append(self.allocator, self.store.extra_data.items[hole_pos]) catch {};
+                                }
+                            }
+                        },
+                        .optional_none, .bitfield_zero => {},
+                    }
+                },
+                .hir_closure => {
+                    if (cur_node.data.lhs < self.store.functions.items.len) {
+                        const sub_fn_meta = self.store.functions.items[cur_node.data.lhs];
+                        if (!sub_fn_meta.is_move_closure) {
+                            for (0..sub_fn_meta.capture_len) |cap_i| {
+                                const pair_pos = sub_fn_meta.capture_extra_start + cap_i * 2;
+                                if (pair_pos + 1 >= self.store.extra_data.items.len) break;
+                                const outer_slot = self.store.extra_data.items[pair_pos];
+                                const sub_inner_slot = self.store.extra_data.items[pair_pos + 1];
+                                if (outer_slot == target_slot and
+                                    self.isHirSlotMutatedInSubtreeDepth(sub_fn_meta.body_hir, sub_inner_slot, depth + 1))
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                },
+                .hir_match => {
+                    visit_stack.append(self.allocator, cur_node.data.lhs) catch {};
+                    if (cur_node.data.rhs + 2 <= self.store.extra_data.items.len) {
+                        const arm_start = self.store.extra_data.items[cur_node.data.rhs];
+                        const arm_len = self.store.extra_data.items[cur_node.data.rhs + 1];
+                        for (self.store.match_arms.items[arm_start .. arm_start + arm_len]) |arm| {
+                            visit_stack.append(self.allocator, arm.guard_hir.asInt()) catch {};
+                            visit_stack.append(self.allocator, arm.body_hir.asInt()) catch {};
+                        }
+                    }
+                },
+                .hir_call, .hir_subscript_call => {
+                    visit_stack.append(self.allocator, cur_node.data.lhs) catch {};
+                    for (self.store.getLenPrefixedExtra(cur_node.data.rhs)) |arg_raw| {
+                        visit_stack.append(self.allocator, arg_raw) catch {};
+                    }
+                },
+                .hir_intrinsic_call => {
+                    if (cur_node.data.rhs + 2 <= self.store.extra_data.items.len) {
+                        const type_len = self.store.extra_data.items[cur_node.data.rhs];
+                        const val_len = self.store.extra_data.items[cur_node.data.rhs + 1];
+                        const val_start = cur_node.data.rhs + 2 + type_len;
+                        if (val_start + val_len <= self.store.extra_data.items.len) {
+                            for (self.store.extra_data.items[val_start .. val_start + val_len]) |arg_raw| {
+                                visit_stack.append(self.allocator, arg_raw) catch {};
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    /// Extracts the underlying root `store.locals` slot of a place chain (`var_ref`, `field_proj`, `index_proj`, `#soa`).
+    fn extractRootHirSlot(self: *const HirLowerer, place_hir: HirIndex) ?u32 {
+        var cur_hir = place_hir;
+        var steps: u32 = 0;
+        while (!cur_hir.isNone() and cur_hir.asInt() < self.store.nodes.len and steps < 32) : (steps += 1) {
+            const cur_node = self.store.getNode(cur_hir);
+            switch (cur_node.tag) {
+                .hir_var_ref => return cur_node.data.lhs,
+                .hir_block => {
+                    cur_hir = HirIndex.fromInt(cur_node.data.rhs);
+                },
+                .hir_field_proj,
+                .hir_index_proj,
+                .hir_soa_field_ptr,
+                .hir_bitfield_read,
+                .hir_slice_range,
+                => {
+                    cur_hir = HirIndex.fromInt(cur_node.data.lhs);
+                },
+                else => return null,
+            }
+        }
+        return null;
     }
 
     // ---------- CST, Member, Pattern & Comptime Helpers -----------
@@ -13917,10 +15341,23 @@ const HirLowerer = struct {
         if (param_node.tag == .ref_ty or param_node.tag == .mut_ref_ty) {
             const wanted_inner = TypeId.fromInt(param_node.lhs);
             const deref_recv = try self.autoDerefPlace(raw_recv_hir, tok);
-            if (self.store.getNode(deref_recv).type_id == wanted_inner) {
+            const deref_ty = self.store.getNode(deref_recv).type_id;
+            const is_same_nominal_family = blk_nom: {
+                const uw_deref = self.pool.unwrapUnderlyingType(deref_ty);
+                const uw_wanted = self.pool.unwrapUnderlyingType(wanted_inner);
+                if (uw_deref == uw_wanted) break :blk_nom true;
+                const sym_a = self.sym_table.type_to_symbol.get(uw_deref.toU32()) orelse break :blk_nom false;
+                const sym_b = self.sym_table.type_to_symbol.get(uw_wanted.toU32()) orelse break :blk_nom false;
+                break :blk_nom !sym_a.isNone() and sym_a == sym_b;
+            };
+            if (deref_ty == wanted_inner or is_same_nominal_family or self.pool.getFlags(wanted_inner).has_type_vars) {
+                const actual_ref_ty = if (deref_ty == wanted_inner)
+                    param_ty
+                else
+                    try self.pool.internRef(deref_ty, param_node.tag == .mut_ref_ty);
                 return self.emitSyntheticAddrOf(
                     deref_recv,
-                    param_ty,
+                    actual_ref_ty,
                     param_node.tag == .mut_ref_ty,
                     tok,
                 );
@@ -16799,7 +18236,7 @@ fn renderHirNodeRecursive(
                 out_buf,
             );
         },
-        .hir_field_proj, .hir_bitfield_read, .hir_cast, .hir_return, .hir_yield => {
+        .hir_field_proj, .hir_bitfield_read, .hir_cast, .hir_return, .hir_yield, .hir_await => {
             try out_buf.append(allocator, '\n');
             try renderHirNodeRecursive(
                 allocator,
@@ -18187,4 +19624,117 @@ test "test_phase76_stage4_hir_subscript_single_def_raw_multiline_caller_loc_and_
         defer col_bundle.deinit();
         try std.testing.expect(col_bundle.diagnostics.hasErrors());
     }
+}
+
+test "test_r3_async_block_borrow_loans_nested_mutation_scan_and_pipe_variadic_promotion" {
+    const allocator = std.testing.allocator;
+
+    // [1] `[CRITICAL-01]` & `[CRITICAL-03]`: non-`own` `async { … }` + `hir_cond_if` + `#soa` + nested `task_group` mint `&mut` loans:
+    const async_loan_src =
+        \\use cx.async.task_group;
+        \\pub struct Particle {
+        \\    pub x: i32,
+        \\    pub y: i32,
+        \\}
+        \\pub async fn capture_mutations(opt_v: i32?) -> i32 {
+        \\    var count: i32 = 0;
+        \\    var parts: #soa [Particle; 2] = @default_init[#soa [Particle; 2]]();
+        \\    let fut_a = async {
+        \\        if opt_v is .Some(val) {
+        \\            count += val;
+        \\            parts[0].x += val;
+        \\        }
+        \\        count
+        \\    };
+        \\    let a_out = fut_a.await;
+        \\    let nested_fut = task_group(|g| {
+        \\        let h = g.spawn(|| {
+        \\            count += 1;
+        \\            count
+        \\        });
+        \\        h.join().await
+        \\    });
+        \\    let n_out = nested_fut.await;
+        \\    let moved_fut = own async { count };
+        \\    return a_out + n_out + moved_fut.await;
+        \\}
+    ;
+    var loan_bundle = try lowerSourceToHir(allocator, async_loan_src, TargetLayout.NATIVE_64);
+    defer loan_bundle.deinit();
+    try std.testing.expect(!loan_bundle.diagnostics.hasErrors());
+
+    var mut_loan_intrinsic_count: usize = 0;
+    var has_seen_borrow_async_clos = false;
+    var has_seen_move_async_clos = false;
+    for (loan_bundle.hir_store.functions.items) |fn_meta| {
+        if (fn_meta.is_async and fn_meta.def_id.asInt() >= 0x5000_0000) {
+            if (fn_meta.is_local_closure and !fn_meta.is_move_closure) has_seen_borrow_async_clos = true;
+            if (!fn_meta.is_local_closure and fn_meta.is_move_closure) has_seen_move_async_clos = true;
+        }
+    }
+    try std.testing.expect(has_seen_borrow_async_clos);
+    try std.testing.expect(has_seen_move_async_clos);
+
+    for (0..loan_bundle.hir_store.nodes.len) |n_idx| {
+        const node = loan_bundle.hir_store.getNode(HirIndex.fromInt(@intCast(n_idx)));
+        if (node.tag == .hir_intrinsic_call and (node.data.lhs & HIR_INTERNAL_INTRINSIC_FLAG) != 0) {
+            const sub_kind: HirInternalIntrinsic = @fromBackingInt(@intCast(@as(u8, @truncate(node.data.lhs))));
+            if (sub_kind == .async_future_make) {
+                const val_len = loan_bundle.hir_store.extra_data.items[node.data.rhs + 1];
+                if (val_len > 3) {
+                    const loan_slice = loan_bundle.hir_store.extra_data.items[node.data.rhs + 2 + 3 .. node.data.rhs + 2 + val_len];
+                    for (loan_slice) |loan_raw| {
+                        const loan_node = loan_bundle.hir_store.getNode(HirIndex.fromInt(loan_raw));
+                        if (loan_node.tag == .hir_unary_op and
+                            loan_node.data.lhs == @backingInt(HirUnaryOp.addr_of_mut))
+                        {
+                            mut_loan_intrinsic_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // `fut_a` mints `&mut count` + `&mut parts` (2), and `nested_fut` mints `&mut count` (1) -> >= 3 `&mut` loans:
+    try std.testing.expect(mut_loan_intrinsic_count >= 3);
+
+    // [2] `[MINOR-02]`: Indirect C variadic function-pointer call through `|>` promotes `bool`/`i8` -> `i32` & `f32` -> `f64`:
+    const pipe_var_src =
+        \\pub fn invoke_pipe_variadic(
+        \\    fp: extern "C" fn(*u8, ...) -> i32,
+        \\    fmt_ptr: *u8,
+        \\    small_i8: i8,
+        \\    flag: bool,
+        \\    half_flt: f32,
+        \\) -> i32 {
+        \\    return unsafe { fmt_ptr |> fp(small_i8, flag, half_flt) };
+        \\}
+    ;
+    var pipe_bundle = try lowerSourceToHir(allocator, pipe_var_src, TargetLayout.NATIVE_64);
+    defer pipe_bundle.deinit();
+    try std.testing.expect(!pipe_bundle.diagnostics.hasErrors());
+
+    var has_verified_pipe_call = false;
+    for (0..pipe_bundle.hir_store.nodes.len) |n_idx| {
+        const node = pipe_bundle.hir_store.getNode(HirIndex.fromInt(@intCast(n_idx)));
+        if (node.tag == .hir_call) {
+            const call_args = pipe_bundle.hir_store.getLenPrefixedExtra(node.data.rhs);
+            if (call_args.len == 4) {
+                has_verified_pipe_call = true;
+                try std.testing.expectEqual(
+                    TypeId.i32_ty,
+                    pipe_bundle.hir_store.getNode(HirIndex.fromInt(call_args[1])).type_id,
+                );
+                try std.testing.expectEqual(
+                    TypeId.i32_ty,
+                    pipe_bundle.hir_store.getNode(HirIndex.fromInt(call_args[2])).type_id,
+                );
+                try std.testing.expectEqual(
+                    TypeId.f64_ty,
+                    pipe_bundle.hir_store.getNode(HirIndex.fromInt(call_args[3])).type_id,
+                );
+            }
+        }
+    }
+    try std.testing.expect(has_verified_pipe_call);
 }

@@ -1,0 +1,245 @@
+//! Structured Cooperative Async Concurrency, Nurseries, and Reactor Primitives (`core.async`)
+//!
+//! Defines stackless coroutine polling (`Poll[T]`, `Waker`), cooperative cancellation tokens
+//! (`CancelToken`, `CancelSource`), the 32-byte inline `TaskHeader`, `@linear` structured concurrency
+//! handles (`TaskGroup[E]`, `TaskHandle[T]`), and reactor-routed `yield_now` / `block_on` / `task_group`
+//! entry points (`DR-08`, `DR-17` §3.2, `DR-18` §2.1, `SE-08`, `SE-20`).
+//!
+//! Every `async` frame is statically bounded at `16 KiB` (`ASYNC_INLINE_CAP_BYTES`) with zero hidden
+//! per-await heap allocations and deterministic `defer` cancellation cleanup across all 4 execution tiers.
+// ---------------------------------------- TYPES ----------------------------------------
+/// Cooperative step outcome returned when polling an asynchronous state machine (`DR-08` §3.1).
+pub enum Poll[T] {
+    /// State machine completed and produced its final output value.
+    Ready(T),
+    /// State machine suspended awaiting reactor readiness or cooperative reschedule.
+    Pending,
+}
+
+/// C-ABI wakeup handle notified by a reactor or completion source when a suspended task becomes runnable.
+@repr(C)
+pub struct Waker {
+    /// Opaque wakeup target state pointer passed to `wake_fn`.
+    pub data: *mut opaque,
+    /// Optional C-ABI wakeup callback invoked on readiness notification.
+    pub wake_fn: (extern "C" fn(data: *mut opaque))?,
+}
+
+/// Lightweight `Copy` cooperative cancellation capability propagated via `context.cancel_token` (`SE-08`).
+@repr(C)
+pub struct CancelToken {
+    /// Shared pointer to the atomic cancellation flag word (`0` = active, non-zero = cancelled).
+    flag_ptr: *u64,
+}
+
+/// Owned cancellation flag source paired with `CancelToken` readers inside structured nurseries.
+@repr(C)
+@align(8)
+pub struct CancelSource {
+    /// Backing 64-bit atomic cancellation flag (`0` = active, `1` = cancelled).
+    flag: u64,
+}
+
+/// Canonical 32-byte (on 64-bit targets) intrusive coroutine task control header (`DR-08` §4.1).
+@repr(C)
+pub struct TaskHeader {
+    /// Type-erased coroutine poll function address (`0` when uninitialized).
+    pub poll_fn: usize,
+    /// Type-erased coroutine cancellation/drop function address (`0` when trivial).
+    pub drop_fn: usize,
+    /// Enclosing nursery or waiter link word.
+    pub parent_or_waker: usize,
+    /// Packed state discriminant and cancellation/completion status flags.
+    pub state_and_flags: u64,
+}
+
+/// Dispatch vtable routed through `context.reactor` (`slot 8`, `DR-08` §5.3, `DR-18` §2.1).
+@repr(C)
+pub struct ReactorVTable {
+    /// Submission hook for non-blocking I/O or timer operations.
+    pub submit_fn: usize,
+    /// Single-turn readiness polling hook driving runnable tasks.
+    pub poll_fn: usize,
+    /// Cross-thread or local task wakeup hook.
+    pub wake_fn: usize,
+    /// Monotonic timer registration hook.
+    pub timer_fn: usize,
+}
+
+/// `Copy` reactor dispatch capability stored in `context.reactor` (`slot 8`, `SE-08`).
+@repr(C)
+pub struct Reactor {
+    /// Pointer to the active reactor dispatch table (`null` selects the default local executor).
+    pub vtable: *ReactorVTable,
+}
+
+/// `Copy` reactor state capability stored in `context.reactor_ctx` (`slot 9`, `SE-08`).
+@repr(C)
+pub struct ReactorCtx {
+    /// Opaque mutable pointer to the active reactor or deterministic simulation state.
+    pub state: *mut opaque,
+}
+
+/// Single-suspension awaitable returned by `yield_now()` for cooperative scheduler fairness.
+@repr(C)
+@must_use
+pub struct YieldNow {
+    /// `true` once this awaitable has yielded control once to the active executor.
+    pub has_yielded: bool,
+}
+
+/// Must-consume `@linear` handle to a child task spawned inside an enclosing `TaskGroup` (`SE-20`).
+@linear
+pub struct TaskHandle[T] {
+    /// Deterministic task slot identifier within the owning `TaskGroup` nursery.
+    pub task_id: u64,
+}
+
+/// Must-consume `@linear` structured concurrency nursery bounding all spawned child tasks (`DR-08`, `SE-20`).
+@linear
+pub struct TaskGroup[E = never] {
+    /// Deterministic nursery scope identifier in the active executor.
+    pub group_id: u64,
+    /// `true` once cooperative cancellation has been requested across sibling tasks.
+    pub is_cancelling: bool,
+}
+
+// --------------------------------------- CONSTS ----------------------------------------
+/// Byte size of `TaskHeader` on 64-bit targets (`4 * 8 = 32` bytes, `DR-08` §4.1).
+pub const TASK_HEADER_BYTES_64: usize = 32;
+
+/// Compile-time inline `async` coroutine state-machine frame cap (`16 KiB`, `DR-17` §3.2, `E0317`).
+pub const ASYNC_INLINE_CAP_BYTES: usize = 16_384;
+
+// ------------------------------------- PUBLIC API --------------------------------------
+impl[T] Poll[T] {
+    /// Returns `true` if `self` is `.Ready(_)`.
+    @inline @no_alloc @no_panic
+    pub fn is_ready(&self) -> bool {
+        return match self {
+            .Ready(_) => true,
+            .Pending => false,
+        };
+    }
+
+    /// Returns `true` if `self` is `.Pending`.
+    @inline @no_alloc @no_panic
+    pub fn is_pending(&self) -> bool {
+        return match self {
+            .Ready(_) => false,
+            .Pending => true,
+        };
+    }
+}
+
+impl Waker {
+    /// Returns a no-op `Waker` suitable for single-threaded synchronous `block_on` polling.
+    @inline @no_alloc @no_panic
+    pub fn noop() -> Waker {
+        return Waker {
+            data: @default_init[*mut opaque](),
+            wake_fn: .None,
+        };
+    }
+
+    /// Returns `true` when `self` carries no wakeup callback.
+    @inline @no_alloc @no_panic
+    pub fn is_noop(&self) -> bool {
+        return match self.wake_fn {
+            .Some(_) => false,
+            .None => true,
+        };
+    }
+
+    /// Invokes the underlying wakeup callback if present.
+    @std_cap_boundary(clears: [ffi, unsafe_op])
+    @inline
+    pub fn wake(&self) {
+        if self.wake_fn is .Some(wake_cb) {
+            unsafe {
+                wake_cb(self.data);
+            }
+        }
+    }
+}
+
+impl CancelToken {
+    /// Returns an inert `CancelToken` that never signals cancellation.
+    @inline @no_alloc @no_panic
+    pub fn none() -> CancelToken {
+        return CancelToken { flag_ptr: @default_init[*u64]() };
+    }
+
+    /// Returns `true` if cooperative cancellation has been requested on the associated `CancelSource`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub fn is_cancelled(&self) -> bool {
+        if self.flag_ptr == @default_init[*u64]() {
+            return false;
+        }
+        return unsafe {
+            @atomic_load(self.flag_ptr, 2_u8) != 0_u64
+        };
+    }
+}
+
+impl CancelSource {
+    /// Constructs a fresh uncancelled `CancelSource`.
+    @inline @no_alloc @no_panic
+    pub fn new() -> CancelSource {
+        return CancelSource { flag: 0_u64 };
+    }
+
+    /// Borrows a `Copy` `CancelToken` observing `self` (`with context.cancel_token = src.as_token()`).
+    @inline @no_alloc @no_panic
+    pub fn as_token(&self) -> CancelToken {
+        return CancelToken { flag_ptr: &raw self.flag };
+    }
+
+    /// Signals cooperative cancellation to all holders of tokens derived from `self`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub fn cancel(&mut self) {
+        unsafe {
+            @atomic_store((&raw mut self.flag) as *mut u64, 1_u64, 3_u8);
+        }
+    }
+
+    /// Returns `true` if `cancel()` has been invoked on `self`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub fn is_cancelled(&self) -> bool {
+        return unsafe {
+            @atomic_load(&raw self.flag, 2_u8) != 0_u64
+        };
+    }
+}
+
+impl TaskHeader {
+    /// Constructs a zero-initialized `TaskHeader`.
+    @inline @no_alloc @no_panic
+    pub fn empty() -> TaskHeader {
+        return TaskHeader {
+            poll_fn: 0,
+            drop_fn: 0,
+            parent_or_waker: 0,
+            state_and_flags: 0_u64,
+        };
+    }
+}
+
+/// Cooperatively yields execution once to the active reactor / task queue before resuming.
+@inline @no_alloc @no_panic
+pub async fn yield_now() {
+    (YieldNow { has_yielded: false }).await;
+}
+
+/// Drives `fut` to completion on the current OS thread using `context.reactor` (blocking the caller thread).
+pub fn block_on[T](fut: own Future[T]) -> T {
+    return block_on(own fut);
+}
+
+/// Enters a structured concurrency nursery that joins or cancels all spawned child tasks before returning.
+pub async fn task_group[R](scope_fn: |&mut TaskGroup[never]| -> R) -> R {
+    return task_group(scope_fn).await;
+}

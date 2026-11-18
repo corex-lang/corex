@@ -1,7 +1,7 @@
 //! CoreX Stage 0 Master Verification Suite Runner (`tests/test_runner.zig`)
 //!
 //! Aggregates and executes all Phase 0, Phase 1, Phase 2, Phase 3, Phase 4, Phase 5, Phase 6,
-//! Phase 7, Phase 7.5 (`DR-21`), and Phase 7.6 (`DR-22` v1.0 surface-syntax lock & elevations)
+//! Phase 7, Phase 7.5 (`DR-21`), Phase 7.6 (`DR-22`), and Phase 8 (`DR-08`, `DR-10`, `DR-18`)
 //! isolated unit tests (`tests/unit/`), golden snapshot tests (`tests/snapshots/`), deterministic
 //! PRNG fuzzers (`tests/fuzz/`), and repository drift guards (`tests/drift/`).
 //!
@@ -51,6 +51,8 @@ pub const codegen_llvm_test = @import("unit/codegen_llvm_test.zig");
 pub const core_stdlib_test = @import("unit/core_stdlib_test.zig");
 /// Unit & CLI end-to-end tests for `diff_oracle.zig` and Phase 7 subcommands (`build`, `run`, `test --diff-backends`).
 pub const diff_oracle_test = @import("unit/diff_oracle_test.zig");
+/// Comprehensive Phase 8 11-target cross-compilation, C11/C23 FFI, `async`/`await`, & SAST safety suite.
+pub const phase8_test = @import("unit/phase8_test.zig");
 /// Unit tests for `diag/diagnostic.zig` and `diag/renderer.zig` (`DiagnosticSink`, `TransactionalPatcher`).
 pub const diagnostic_test = @import("unit/diagnostic_test.zig");
 /// Unit tests for `cli/style.zig`, `cli/box_draw.zig`, and `cli/router.zig`.
@@ -75,10 +77,12 @@ pub const phase5_mir_comptime_fuzz = @import("fuzz/phase5_mir_comptime_fuzz.zig"
 pub const phase6_sast_fuzz = @import("fuzz/phase6_sast_fuzz.zig");
 /// Phase 7 deterministic PRNG fuzzing suite (`DR-22` 4-tier differential backend oracle & cross-target IR determinism).
 pub const phase7_diff_backends_fuzz = @import("fuzz/phase7_diff_backends_fuzz.zig");
+/// Phase 8 deterministic PRNG fuzzing suite (C11/C23 `translate-c`, `.def`/archive determinism, & `async` 4-tier parity).
+pub const phase8_ffi_async_fuzz = @import("fuzz/phase8_ffi_async_fuzz.zig");
 /// Repository-wide drift guards (zero colored emojis, CLI parity, diagnostic catalog, `< 150` col format).
 pub const drift_guard_test = @import("drift/drift_guard_test.zig");
 
-test "test_runner_references_all_phase0_to_phase7_verification_suites" {
+test "test_runner_references_all_phase0_to_phase8_verification_suites" {
     std.testing.refAllDecls(@This());
     _ = mem_foundation_test;
     _ = vfs_sourcemap_test;
@@ -100,6 +104,7 @@ test "test_runner_references_all_phase0_to_phase7_verification_suites" {
     _ = codegen_llvm_test;
     _ = core_stdlib_test;
     _ = diff_oracle_test;
+    _ = phase8_test;
     _ = diagnostic_test;
     _ = cli_router_test;
     _ = bench_harness_test;
@@ -112,5 +117,6 @@ test "test_runner_references_all_phase0_to_phase7_verification_suites" {
     _ = phase5_mir_comptime_fuzz;
     _ = phase6_sast_fuzz;
     _ = phase7_diff_backends_fuzz;
+    _ = phase8_ffi_async_fuzz;
     _ = drift_guard_test;
 }

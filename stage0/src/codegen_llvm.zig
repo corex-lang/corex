@@ -1,10 +1,10 @@
 //! CoreX Stage-0 Tier B Backend (LLVM 20–23 Opaque-Pointer `.ll` Emitter & Driver)
 //!
-//! Lowers canonical Block-Argument SSA `MirBody` modules (`DR-07`, `DR-09`, `DR-18`, `DR-19`,
-//! `DR-20`, and `phase7_spec.md` §3–§4) into deterministic LLVM 20–23 opaque-pointer (`ptr`)
-//! textual IR across all 7 supported targets (`x86_64-linux`, `x86_64-macos`, `x86_64-windows`,
-//! `aarch64-linux`, `aarch64-macos`, `aarch64-windows`, and `wasm32-wasi`), and compiles objects
-//! or executables via the optional `-Dllvm-prefix` C++20 `PassBuilder` static bridge or `zig cc`.
+//! Lowers canonical Block-Argument SSA `MirBody` modules (`DR-07`, `DR-09`, `DR-10`, `DR-18`,
+//! `DR-19`, `DR-20`, and `phase7_spec.md` §3–§4) into deterministic LLVM 20–23 opaque-pointer (`ptr`)
+//! textual IR across all 11 supported targets (GNU/musl Linux, macOS, MSVC/GNU Windows, WASI, and
+//! freestanding WebAssembly), and compiles objects, static archives, shared libraries, or executables
+//! via the optional `-Dllvm-prefix` C++20 `PassBuilder` static bridge or `zig cc`.
 //!
 //! Key Invariants:
 //! - Two-pass basic-block emission collects all `alloca`s (including a single `swifterror` caller
@@ -32,7 +32,9 @@ const type_system = @import("type_system.zig");
 const query_db = @import("query_db.zig");
 const hir = @import("hir.zig");
 const mir = @import("mir.zig");
+const mir_async = @import("mir_async.zig");
 const codegen_abi = @import("codegen_abi.zig");
+const codegen_link = @import("codegen_link.zig");
 const codegen_dev_seam = @import("codegen_dev_seam.zig");
 const codegen_c = @import("codegen_c.zig");
 
@@ -231,6 +233,14 @@ const BodyEmitState = struct {
     subprogram_md: u32 = 0,
     /// Active `!DILocation` metadata ID (`0` when unset).
     active_dbg_loc_md: u32 = 0,
+    /// `true` when emitting a stackless `@_cx_coro_poll_<b_idx>` coroutine poll body (`DR-08`).
+    is_coro_poll_body: bool = false,
+    /// Pointer-sized integer type name (`"i32"` on `wasm32`, `"i64"` on 64-bit) used by `allocEntryBytes`.
+    ptr_int_name: []const u8 = "i64",
+    /// Persistent coroutine frame byte cursor advanced by `allocEntryBytes` when `is_coro_poll_body` is `true`.
+    coro_scratch_cursor: u64 = 0,
+    /// Maximum coroutine frame alignment in bytes required across locals and `%_scratch_*` slots.
+    coro_max_align: u32 = 16,
 
     /// Releases all per-function buffers and owned label slices.
     fn deinit(self: *BodyEmitState) void {
@@ -282,11 +292,25 @@ const BodyEmitState = struct {
         try self.cur_buf.appendSlice(self.allocator, formatted);
     }
 
-    /// Allocates a fixed-size byte scratch slot in `_bb_0` and returns its owned `%_scratch_<id>` name.
+    /// Allocates a fixed-size byte scratch slot in `_bb_0` (or persistent `%_frame` when `is_coro_poll_body`).
     fn allocEntryBytes(self: *BodyEmitState, size_bytes: u64, align_bytes: u32) ![]u8 {
         const tmp_id = self.nextTmp();
         const clamped_sz = @max(size_bytes, 1);
         const eff_align = @max(align_bytes, 8);
+        if (self.is_coro_poll_body) {
+            self.coro_max_align = @max(self.coro_max_align, eff_align);
+            const align_u64: u64 = eff_align;
+            const aligned_off = (self.coro_scratch_cursor + (align_u64 - 1)) & ~(align_u64 - 1);
+            self.coro_scratch_cursor = aligned_off + clamped_sz;
+            const gep_line = try std.fmt.allocPrint(
+                self.allocator,
+                "  %_scratch_{d} = getelementptr inbounds i8, ptr %_frame, {s} {d}\n",
+                .{ tmp_id, self.ptr_int_name, aligned_off },
+            );
+            defer self.allocator.free(gep_line);
+            try self.entry_allocas.appendSlice(self.allocator, gep_line);
+            return std.fmt.allocPrint(self.allocator, "%_scratch_{d}", .{tmp_id});
+        }
         const line = try std.fmt.allocPrint(
             self.allocator,
             "  %_scratch_{d} = alloca [{d} x i8], align {d}\n",
@@ -336,6 +360,26 @@ const InoutBounceWriteback = struct {
     dst_align: u32,
     /// Payload byte size copied back after the call.
     size_bytes: u64,
+};
+
+/// Resolved Phase 8 FFI/Wasm/linker metadata extracted for a `SymbolIndex`.
+const SymFfiMetaLlvm = struct {
+    /// `true` when annotated with `@export`.
+    is_export: bool = false,
+    /// `true` when annotated with `@thread_local`.
+    is_thread_local: bool = false,
+    /// Optional explicit `@link_name("…")` override.
+    link_name: []const u8 = "",
+    /// Optional explicit `@link_section("…")` target section name.
+    link_section: []const u8 = "",
+    /// Optional `@wasm_import("module", "name")` module identifier.
+    wasm_import_module: []const u8 = "",
+    /// Optional `@wasm_import("module", "name")` symbol identifier.
+    wasm_import_name: []const u8 = "",
+    /// Optional `@wasm_export("name")` export symbol identifier.
+    wasm_export_name: []const u8 = "",
+    /// Optional `@link_lib("name")` native library linkage directive.
+    link_lib_name: []const u8 = "",
 };
 
 /// Deterministic module-wide LLVM 20–23 `.ll` emitter state.
@@ -392,6 +436,14 @@ const LlvmModuleEmitter = struct {
     drop_type_set: std.AutoHashMapUnmanaged(u32, void) = .empty,
     /// Referenced `extern` function `SymbolIndex` list sorted ascending.
     extern_syms: std.ArrayListUnmanaged(SymbolIndex) = .empty,
+    /// Referenced `extern static [mut]` global `SymbolIndex` list sorted ascending.
+    extern_global_syms: std.ArrayListUnmanaged(SymbolIndex) = .empty,
+    /// O(1) membership set of `extern_global_syms` (`SymbolIndex.asInt()`).
+    extern_global_sym_set: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Deduplicated `@link_lib("…")` native library names collected across referenced symbols.
+    collected_link_libs: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// `true` while emitting an `@export`, `@wasm_export`, or `extern "C"` C-ABI boundary body.
+    is_in_c_abi_body: bool = false,
     /// Interned string/byte literal `SymbolId.asInt()` values sorted ascending.
     str_sym_ids: std.ArrayListUnmanaged(u32) = .empty,
     /// Reflected `@type_name[T]()` `TypeId.toU32()` values sorted ascending.
@@ -433,9 +485,23 @@ const LlvmModuleEmitter = struct {
     /// Owned symbol name strings backing `declared_externs`.
     owned_declared_externs: std.ArrayListUnmanaged([]u8) = .empty,
     /// Per-slot overflow byte sizes for `Context` slots exceeding `ptrBytes()` (`0` when inline).
-    ctx_wide_slot_sizes: [8]u64 = @splat(0),
+    ctx_wide_slot_sizes: [10]u64 = @splat(0),
     /// Per-slot alignments for wide `Context` globals (`@_cx_ctx_wide_<slot>`).
-    ctx_wide_slot_aligns: [8]u32 = @splat(8),
+    ctx_wide_slot_aligns: [10]u32 = @splat(8),
+    /// Optional cloned MIR bodies demoted in-place by `mir_async` when unlowered async bodies arrive.
+    owned_async_bodies: ?[]MirBody = null,
+    /// Stackless coroutine frame layouts and state-machine plans (`DR-08` §2–§3).
+    async_plan: ?mir_async.AsyncModulePlan = null,
+    /// `true` when any `MirBody` uses `is_async`, `.coro_suspend`, or async intrinsics (`44..51`).
+    has_async_ops: bool = false,
+    /// Final per-body coroutine frame sizes in bytes (including persistent `%_scratch_*` slots).
+    coro_final_frame_sizes: []u64 = &.{},
+    /// Final per-body coroutine frame alignments in bytes (`>= 16`).
+    coro_final_frame_aligns: []u32 = &.{},
+    /// Membership set of `Result` `TypeId.toU32()`s requiring `@_cx_res_is_err_<id>` helpers.
+    res_err_check_set: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Ordered `Result` `TypeId`s requiring `@_cx_res_is_err_<id>` helpers for `TaskGroup` `Err` cascade.
+    ordered_res_err_types: std.ArrayListUnmanaged(TypeId) = .empty,
 
     /// Initializes `LlvmModuleEmitter` for `cfg` and `input`.
     fn init(
@@ -471,6 +537,9 @@ const LlvmModuleEmitter = struct {
         self.drop_type_list.deinit(self.allocator);
         self.drop_type_set.deinit(self.allocator);
         self.extern_syms.deinit(self.allocator);
+        self.extern_global_syms.deinit(self.allocator);
+        self.extern_global_sym_set.deinit(self.allocator);
+        self.collected_link_libs.deinit(self.allocator);
         self.str_sym_ids.deinit(self.allocator);
         self.type_name_ids.deinit(self.allocator);
         self.blob_ids.deinit(self.allocator);
@@ -492,6 +561,15 @@ const LlvmModuleEmitter = struct {
         self.declared_externs.deinit(self.allocator);
         for (self.owned_declared_externs.items) |ext_s| self.allocator.free(ext_s);
         self.owned_declared_externs.deinit(self.allocator);
+        if (self.async_plan) |*aplan| aplan.deinit();
+        if (self.owned_async_bodies) |abodies| {
+            for (abodies) |*ab| ab.deinit();
+            self.allocator.free(abodies);
+        }
+        if (self.coro_final_frame_sizes.len > 0) self.allocator.free(self.coro_final_frame_sizes);
+        if (self.coro_final_frame_aligns.len > 0) self.allocator.free(self.coro_final_frame_aligns);
+        self.res_err_check_set.deinit(self.allocator);
+        self.ordered_res_err_types.deinit(self.allocator);
     }
 
     /// Appends raw text to `self.out`.
@@ -782,6 +860,7 @@ fn isNamedCompositeType(emitter: *LlvmModuleEmitter, raw_ty: TypeId) !bool {
         .enum_ty,
         .optional_ty,
         .result_ty,
+        .future_ty,
         => true,
         else => false,
     };
@@ -905,13 +984,18 @@ fn collectCompositeType(emitter: *LlvmModuleEmitter, raw_ty: TypeId, depth: u32)
             }
             try emitter.ordered_composites.append(emitter.allocator, ty);
         },
-        .soa_array_ty, .union_ty, .enum_ty, .optional_ty, .result_ty => {
+        .soa_array_ty, .union_ty, .enum_ty, .optional_ty, .result_ty, .future_ty => {
             if (emitter.composite_set.contains(ty.toU32())) return;
             try emitter.composite_set.put(emitter.allocator, ty.toU32(), {});
             if (node.tag == .soa_array_ty) {
                 try collectCompositeType(emitter, TypeId.fromInt(node.lhs), depth + 1);
             } else if (node.tag == .optional_ty) {
                 try collectCompositeType(emitter, TypeId.fromInt(node.lhs), depth + 1);
+            } else if (node.tag == .future_ty) {
+                try collectCompositeType(emitter, TypeId.fromInt(node.lhs), depth + 1);
+                if (emitter.has_async_ops) {
+                    try registerDropTypeRecursive(emitter, ty, depth + 1);
+                }
             } else if (node.tag == .result_ty) {
                 try collectCompositeType(emitter, TypeId.fromInt(node.lhs), depth + 1);
                 try collectCompositeType(emitter, TypeId.fromInt(node.rhs), depth + 1);
@@ -1063,12 +1147,64 @@ fn resolveBodyIndex(
     return null;
 }
 
-/// Returns `true` if `body` carries `@export` or `@link_name` external C-ABI visibility.
+/// Extracts Phase 8 FFI, WebAssembly, TLS, and section metadata for `sym_idx`.
+fn extractSymFfiMetaLlvm(emitter: *const LlvmModuleEmitter, sym_idx: SymbolIndex) SymFfiMetaLlvm {
+    if (sym_idx.isNone() or sym_idx.asInt() >= emitter.input.sym_table.symbols.items.len) return .{};
+    const sym_rec = emitter.input.sym_table.getSymbol(sym_idx).*;
+    var meta = SymFfiMetaLlvm{
+        .is_export = sym_rec.contract_flags.is_export,
+        .link_name = if (sym_rec.contract_flags.has_link_name) sym_rec.link_name_text else "",
+        .link_section = if (sym_rec.contract_flags.has_link_section) sym_rec.link_section_name else "",
+    };
+    if (emitter.input.sym_table.getFfiContract(sym_idx)) |ffi_c| {
+        meta.is_thread_local = ffi_c.is_thread_local;
+        if (ffi_c.wasm_import_module != .empty and !ffi_c.wasm_import_module.isNone()) {
+            meta.wasm_import_module = emitter.input.interner.get(ffi_c.wasm_import_module);
+        }
+        if (ffi_c.wasm_import_name != .empty and !ffi_c.wasm_import_name.isNone()) {
+            meta.wasm_import_name = emitter.input.interner.get(ffi_c.wasm_import_name);
+        }
+        if (ffi_c.wasm_export_name != .empty and !ffi_c.wasm_export_name.isNone()) {
+            meta.wasm_export_name = emitter.input.interner.get(ffi_c.wasm_export_name);
+        }
+        if (ffi_c.link_lib_name != .empty and !ffi_c.link_lib_name.isNone()) {
+            meta.link_lib_name = emitter.input.interner.get(ffi_c.link_lib_name);
+        }
+    }
+    return meta;
+}
+
+/// Appends `lib_name` from `@link_lib("…")` into `emitter.collected_link_libs` without duplicates.
+fn recordCollectedLinkLibLlvm(emitter: *LlvmModuleEmitter, lib_name: []const u8) !void {
+    if (lib_name.len == 0) return;
+    for (emitter.collected_link_libs.items) |existing| {
+        if (std.mem.eql(u8, existing, lib_name)) return;
+    }
+    try emitter.collected_link_libs.append(emitter.allocator, lib_name);
+}
+
+/// Returns `true` if `body` carries `@export`, `@wasm_export`, or `@link_name` external symbol visibility.
 fn isBodyExternallyVisible(emitter: *const LlvmModuleEmitter, body: *const MirBody) bool {
     if (body.symbol_index.isNone() or
         body.symbol_index.asInt() >= emitter.input.sym_table.symbols.items.len) return false;
     const sym_rec = emitter.input.sym_table.getSymbol(body.symbol_index).*;
-    return sym_rec.contract_flags.is_export or sym_rec.contract_flags.has_link_name;
+    if (sym_rec.contract_flags.is_export or sym_rec.contract_flags.has_link_name) return true;
+    return extractSymFfiMetaLlvm(emitter, body.symbol_index).wasm_export_name.len > 0;
+}
+
+/// Returns `true` if `body` is an `@export`, `@wasm_export`, `@link_name`, or `extern "C"` C-ABI boundary (`Fix-07`).
+fn isBodyCAbiBoundaryLlvm(emitter: *const LlvmModuleEmitter, body: *const MirBody) bool {
+    if (body.symbol_index.isNone() or
+        body.symbol_index.asInt() >= emitter.input.sym_table.symbols.items.len) return false;
+    const sym_rec = emitter.input.sym_table.getSymbol(body.symbol_index).*;
+    if (sym_rec.flags.is_extern or
+        sym_rec.contract_flags.is_export or
+        sym_rec.contract_flags.has_link_name) return true;
+    if (extractSymFfiMetaLlvm(emitter, body.symbol_index).wasm_export_name.len > 0) return true;
+    if (emitter.input.pool.getFnSignatureView(sym_rec.type_id)) |sig_view| {
+        if (sig_view.is_c_abi) return true;
+    }
+    return false;
 }
 
 /// Classifies `body`'s machine calling convention via `AbiClassifier.classifyFn`.
@@ -1085,11 +1221,12 @@ fn classifyBodyAbi(emitter: *LlvmModuleEmitter, body: *const MirBody) !AbiFnReci
             .is_non_escaping = true,
         };
     }
+    const is_c_abi = isBodyCAbiBoundaryLlvm(emitter, body);
     return AbiClassifier.classifyFn(emitter.allocator, &emitter.resolver, .{
         .params = param_specs,
         .ret_ty = body.ret_ty,
-        .is_extern_c = isBodyExternallyVisible(emitter, body),
-        .is_contextless = body.is_contextless,
+        .is_extern_c = is_c_abi,
+        .is_contextless = body.is_contextless or is_c_abi,
     });
 }
 
@@ -1120,7 +1257,7 @@ fn classifyFnTypeAbi(
             .is_non_escaping = true,
         };
     }
-    const is_ext = is_extern_c or sig_view.is_variadic;
+    const is_ext = is_extern_c or sig_view.is_c_abi or sig_view.is_variadic;
     const is_ctxless = force_contextless orelse
         (is_ext or sig_view.contracts.has_no_alloc);
     return AbiClassifier.classifyFn(emitter.allocator, &emitter.resolver, .{
@@ -1178,6 +1315,9 @@ fn registerDropTypeRecursive(emitter: *LlvmModuleEmitter, raw_ty: TypeId, depth:
         .result_ty => {
             try registerDropTypeRecursive(emitter, TypeId.fromInt(node.lhs), depth + 1);
             try registerDropTypeRecursive(emitter, TypeId.fromInt(node.rhs), depth + 1);
+        },
+        .future_ty => {
+            try registerDropTypeRecursive(emitter, TypeId.fromInt(node.lhs), depth + 1);
         },
         .enum_ty => {
             const sym_idx = SymbolIndex.fromInt(node.rhs);
@@ -1257,7 +1397,7 @@ fn registerFmtTypeRecursive(emitter: *LlvmModuleEmitter, raw_ty: TypeId, depth: 
     try emitter.fmt_type_list.append(emitter.allocator, ty);
 }
 
-/// Records an `extern` function symbol if referenced without a local `MirBody`.
+/// Records an `extern` function or `extern static` global symbol if referenced without a local `MirBody`.
 fn maybeRegisterExternSymbol(
     emitter: *LlvmModuleEmitter,
     seen_set: *std.AutoHashMapUnmanaged(u32, void),
@@ -1267,14 +1407,22 @@ fn maybeRegisterExternSymbol(
     if (resolveBodyIndex(emitter, def_id, sym_idx) != null) return;
     if (sym_idx.isNone() or sym_idx.asInt() >= emitter.input.sym_table.symbols.items.len) return;
     const sym_rec = emitter.input.sym_table.getSymbol(sym_idx).*;
-    if (sym_rec.kind != .fn_sym) return;
-    if (!(try seen_set.getOrPut(emitter.allocator, sym_idx.asInt())).found_existing) {
-        try emitter.extern_syms.append(emitter.allocator, sym_idx);
-        if (emitter.input.pool.getFnSignatureView(sym_rec.type_id)) |sig| {
-            try collectCompositeType(emitter, sig.ret_ty, 0);
-            for (0..sig.paramCount()) |idx| {
-                try collectCompositeType(emitter, sig.getParamType(idx), 0);
+    const ffi_meta = extractSymFfiMetaLlvm(emitter, sym_idx);
+    try recordCollectedLinkLibLlvm(emitter, ffi_meta.link_lib_name);
+    if (sym_rec.kind == .fn_sym) {
+        if (!(try seen_set.getOrPut(emitter.allocator, sym_idx.asInt())).found_existing) {
+            try emitter.extern_syms.append(emitter.allocator, sym_idx);
+            if (emitter.input.pool.getFnSignatureView(sym_rec.type_id)) |sig| {
+                try collectCompositeType(emitter, sig.ret_ty, 0);
+                for (0..sig.paramCount()) |idx| {
+                    try collectCompositeType(emitter, sig.getParamType(idx), 0);
+                }
             }
+        }
+    } else if (sym_rec.kind == .extern_static_sym or sym_rec.flags.is_extern) {
+        if (!(try emitter.extern_global_sym_set.getOrPut(emitter.allocator, sym_idx.asInt())).found_existing) {
+            try emitter.extern_global_syms.append(emitter.allocator, sym_idx);
+            try collectCompositeType(emitter, sym_rec.type_id, 0);
         }
     }
 }
@@ -1286,7 +1434,7 @@ fn isFnAddrCtxWrapperNeeded(emitter: *const LlvmModuleEmitter, target_b: u32, fn
     const unwrapped = emitter.input.pool.unwrapUnderlyingType(fn_ty);
     if (emitter.input.pool.getNode(unwrapped).tag != .fn_ty) return false;
     const sig_view = emitter.input.pool.getFnSignatureView(unwrapped) orelse return false;
-    return !sig_view.contracts.has_no_alloc;
+    return !sig_view.is_c_abi and !sig_view.is_variadic and !sig_view.contracts.has_no_alloc;
 }
 
 /// Returns `true` when `MirOp.fn_addr` value `fn_val_raw` in `body_ptr` is reified beyond a direct `callee_val`.
@@ -1416,6 +1564,19 @@ fn isFnAddrUsedAsValue(body_ptr: *const MirBody, fn_val_raw: u32) bool {
     return false;
 }
 
+/// Registers a non-transparent `Result[T, E]` type for `@_cx_res_is_err_<id>` synthesis (`DR-08`).
+fn maybeRegisterResultErrCheckTypeLlvm(emitter: *LlvmModuleEmitter, raw_ty: TypeId) !void {
+    const unwrapped = emitter.input.pool.unwrapUnderlyingType(raw_ty);
+    if (unwrapped.isPrimitiveOrSentinel() or emitter.input.pool.getNode(unwrapped).tag != .result_ty) return;
+    if (try isZeroSizedType(emitter, unwrapped)) return;
+    const detail = (try emitter.resolver.getSumDetail(unwrapped)) orelse return;
+    if (detail.repr == .not_sum or detail.repr == .transparent_ok) return;
+    if (!(try emitter.res_err_check_set.getOrPut(emitter.allocator, unwrapped.toU32())).found_existing) {
+        try collectCompositeType(emitter, unwrapped, 0);
+        try emitter.ordered_res_err_types.append(emitter.allocator, unwrapped);
+    }
+}
+
 /// Indexes all `MirBody` functions, composite types, string/blob constants, externs, closures, and drops.
 fn indexModuleEntities(emitter: *LlvmModuleEmitter) !void {
     for (emitter.input.bodies, 0..) |*body_ptr, body_i| {
@@ -1429,26 +1590,31 @@ fn indexModuleEntities(emitter: *LlvmModuleEmitter) !void {
 
         const raw_name = emitter.input.interner.get(body_ptr.name);
         var is_export_sym = false;
+        var has_wasm_export = false;
         var link_name_override: ?[]const u8 = null;
         if (!body_ptr.symbol_index.isNone() and
             body_ptr.symbol_index.asInt() < emitter.input.sym_table.symbols.items.len)
         {
-            const sym_rec = emitter.input.sym_table.getSymbol(body_ptr.symbol_index).*;
-            is_export_sym = sym_rec.contract_flags.is_export;
-            if (sym_rec.contract_flags.has_link_name and sym_rec.link_name_text.len > 0) {
-                link_name_override = sym_rec.link_name_text;
+            const ffi_meta = extractSymFfiMetaLlvm(emitter, body_ptr.symbol_index);
+            try recordCollectedLinkLibLlvm(emitter, ffi_meta.link_lib_name);
+            is_export_sym = ffi_meta.is_export;
+            has_wasm_export = ffi_meta.wasm_export_name.len > 0;
+            if (ffi_meta.link_name.len > 0) {
+                link_name_override = ffi_meta.link_name;
             }
         }
-        if (std.mem.eql(u8, raw_name, "main")) {
+        const is_exported_main = std.mem.eql(u8, raw_name, "main") and (is_export_sym or has_wasm_export);
+        if (std.mem.eql(u8, raw_name, "main") and !is_exported_main) {
             emitter.entry_main_body_idx = b_idx;
         }
 
         const llvm_name = if (link_name_override) |lnk_str|
-            (if (std.mem.eql(u8, lnk_str, "main"))
+            (if (std.mem.eql(u8, lnk_str, "main") and !is_exported_main)
                 try emitter.allocator.dupe(u8, "_cx_user_main")
             else
                 try emitter.allocator.dupe(u8, lnk_str))
-        else if (is_export_sym and !std.mem.eql(u8, raw_name, "main"))
+        else if ((is_export_sym or has_wasm_export) and
+            (!std.mem.eql(u8, raw_name, "main") or emitter.cfg.target.isWasm()))
             try emitter.allocator.dupe(u8, raw_name)
         else blk: {
             const clean_suffix = try sanitizeLlvmIdentAlloc(emitter.allocator, raw_name);
@@ -1475,9 +1641,23 @@ fn indexModuleEntities(emitter: *LlvmModuleEmitter) !void {
         if (!(try cand_set.getOrPut(emitter.allocator, body_ptr.ret_ty.toU32())).found_existing) {
             try candidate_types.append(emitter.allocator, body_ptr.ret_ty);
         }
-        for (body_ptr.locals.items) |loc_decl| {
+        if (emitter.has_async_ops and body_ptr.is_async) {
+            try maybeRegisterResultErrCheckTypeLlvm(emitter, body_ptr.ret_ty);
+        }
+        for (body_ptr.locals.items, 0..) |loc_decl, loc_i| {
             if (!(try cand_set.getOrPut(emitter.allocator, loc_decl.type_id.toU32())).found_existing) {
                 try candidate_types.append(emitter.allocator, loc_decl.type_id);
+            }
+            if (emitter.has_async_ops and body_ptr.is_async and
+                loc_i >= 1 and loc_i <= body_ptr.param_count)
+            {
+                const param_mode = loc_decl.mode();
+                if (param_mode != .inout_mode and param_mode != .set_mode) {
+                    const unwrapped_param = emitter.input.pool.unwrapUnderlyingType(loc_decl.type_id);
+                    if (!emitter.input.pool.getFlags(unwrapped_param).is_copy) {
+                        try registerDropTypeRecursive(emitter, unwrapped_param, 0);
+                    }
+                }
             }
         }
         for (body_ptr.consts.items) |mir_const| {
@@ -1577,7 +1757,9 @@ fn indexModuleEntities(emitter: *LlvmModuleEmitter) !void {
                         }
                     }
                 } else if (agg_kind == .fmt_args_make) {
-                    emitter.has_fmt_rt_helpers = true;
+                    if (!emitter.cfg.target.isFreestanding()) {
+                        emitter.has_fmt_rt_helpers = true;
+                    }
                     if (inst.operands.rhs >= 1 and
                         inst.operands.lhs + inst.operands.rhs <= body_ptr.extra_args.items.len)
                     {
@@ -1619,7 +1801,7 @@ fn indexModuleEntities(emitter: *LlvmModuleEmitter) !void {
                         const val_raw = body_ptr.extra_args.items[inst.operands.lhs];
                         try registerFmtTypeRecursive(emitter, body_ptr.getInst(MirValueId.fromInt(val_raw)).type_id, 0);
                     }
-                } else if (ikind == .panic) {
+                } else if (ikind == .panic and !emitter.cfg.target.isFreestanding()) {
                     if (inst.operands.rhs >= 1 and inst.operands.lhs < body_ptr.extra_args.items.len) {
                         const p_raw = body_ptr.extra_args.items[inst.operands.lhs];
                         if ((try unwrapTransparentType(emitter, body_ptr.getInst(MirValueId.fromInt(p_raw)).type_id)) == .fmt_args_ty) {
@@ -1654,12 +1836,13 @@ fn indexModuleEntities(emitter: *LlvmModuleEmitter) !void {
                     else
                         .unit_ty;
                     const slot_lay = try emitter.resolver.resolveType(slot_val_ty);
-                    if (slot_lay.size_bytes > 8 and call_args.len >= 1) {
+                    const ctx_stride: u64 = emitter.cfg.target.ptrBytes();
+                    if (slot_lay.size_bytes > ctx_stride and call_args.len >= 1) {
                         const ord_inst = body_ptr.getInst(MirValueId.fromInt(call_args[0]));
                         if (ord_inst.op == .const_scalar and ord_inst.operands.lhs < body_ptr.consts.items.len) {
                             switch (body_ptr.consts.items[ord_inst.operands.lhs]) {
                                 .int_val => |iv| {
-                                    const ord_u: usize = @intCast(@as(u128, @bitCast(iv)) & 7);
+                                    const ord_u: usize = @intCast(@as(u128, @bitCast(iv)) % 10);
                                     emitter.ctx_wide_slot_sizes[ord_u] = @max(
                                         emitter.ctx_wide_slot_sizes[ord_u],
                                         slot_lay.size_bytes,
@@ -1672,7 +1855,7 @@ fn indexModuleEntities(emitter: *LlvmModuleEmitter) !void {
                                 else => {},
                             }
                         } else {
-                            for (0..8) |ord_u| {
+                            for (0..10) |ord_u| {
                                 emitter.ctx_wide_slot_sizes[ord_u] = @max(
                                     emitter.ctx_wide_slot_sizes[ord_u],
                                     slot_lay.size_bytes,
@@ -1682,6 +1865,19 @@ fn indexModuleEntities(emitter: *LlvmModuleEmitter) !void {
                                     slot_lay.alignBytes(),
                                 );
                             }
+                        }
+                    }
+                } else if (ikind == .async_spawn and emitter.has_async_ops) {
+                    const spawn_args = body_ptr.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs];
+                    if (spawn_args.len >= 3) {
+                        const fut_ty = emitter.input.pool.unwrapUnderlyingType(
+                            body_ptr.getInst(MirValueId.fromInt(spawn_args[2])).type_id,
+                        );
+                        if (emitter.input.pool.isFutureType(fut_ty)) {
+                            try maybeRegisterResultErrCheckTypeLlvm(
+                                emitter,
+                                emitter.input.pool.getFutureOutputType(fut_ty) orelse .unit_ty,
+                            );
                         }
                     }
                 }
@@ -1718,6 +1914,12 @@ fn indexModuleEntities(emitter: *LlvmModuleEmitter) !void {
     std.mem.sort(u32, emitter.blob_ids.items, {}, std.sort.asc(u32));
     std.mem.sort(SymbolIndex, emitter.extern_syms.items, {}, struct {
         /// Orders external `SymbolIndex` handles ascending by raw integer index.
+        fn lessThan(_: void, lhs_s: SymbolIndex, rhs_s: SymbolIndex) bool {
+            return lhs_s.asInt() < rhs_s.asInt();
+        }
+    }.lessThan);
+    std.mem.sort(SymbolIndex, emitter.extern_global_syms.items, {}, struct {
+        /// Orders external global `SymbolIndex` handles ascending by raw integer index.
         fn lessThan(_: void, lhs_s: SymbolIndex, rhs_s: SymbolIndex) bool {
             return lhs_s.asInt() < rhs_s.asInt();
         }
@@ -2149,14 +2351,16 @@ fn emitRodataAndRuntimeHelpers(
 ) !void {
     const ptr_int = ptrIntType(emitter);
 
-    // [1] Default 64-byte thread-local `Context` storage (`8 * 8B` slots, `align 8`):
+    // [1] Default 10-slot thread-local `Context` storage (`80B` on 64-bit, `40B` on `wasm32`):
     const ctx_tls_kw = if (emitter.cfg.target.isWasm()) "internal global" else "internal thread_local global";
+    const ctx_ptr_bytes: u32 = emitter.cfg.target.ptrBytes();
+    const ctx_bytes = type_system.ContextFieldLayout.byteSizeForPtrWidth(emitter.cfg.target.ptrBytes());
     try emitter.print(
-        "@_cx_default_ctx = {s} [{d} x i8] zeroinitializer, align 8\n",
-        .{ ctx_tls_kw, type_system.ContextFieldLayout.BYTE_SIZE_64 },
+        "@_cx_default_ctx = {s} [{d} x i8] zeroinitializer, align {d}\n",
+        .{ ctx_tls_kw, ctx_bytes, ctx_ptr_bytes },
     );
     for (emitter.ctx_wide_slot_sizes, 0..) |wide_sz, slot_i| {
-        if (wide_sz > 8) {
+        if (wide_sz > ctx_ptr_bytes) {
             try emitter.print(
                 "@_cx_ctx_wide_{d} = {s} [{d} x i8] zeroinitializer, align {d}\n",
                 .{ slot_i, ctx_tls_kw, wide_sz, emitter.ctx_wide_slot_aligns[slot_i] },
@@ -2308,195 +2512,235 @@ fn emitRodataAndRuntimeHelpers(
     }
 
     // [7] Runtime string constants & libc declarations for oracle tracing, panic, trap, and syscalls:
-    try emitter.writeAll(
-        \\@.cx_env_oracle = private unnamed_addr constant [24 x i8] c"COREX_ORACLE_TRACE_FILE\00", align 1
-        \\@.cx_fmode_ab = private unnamed_addr constant [3 x i8] c"ab\00", align 1
-        \\@.cx_msg_trap = private unnamed_addr constant [8 x i8] c"TRAP:1\0A\00", align 1
-        \\@.cx_msg_ret0 = private unnamed_addr constant [7 x i8] c"RET:0\0A\00", align 1
-        \\@.cx_msg_err1 = private unnamed_addr constant [7 x i8] c"ERR:1\0A\00", align 1
-        \\@.cx_fmt_ret_s = private unnamed_addr constant [10 x i8] c"RET:%lld\0A\00", align 1
-        \\@.cx_fmt_ret_u = private unnamed_addr constant [10 x i8] c"RET:%llu\0A\00", align 1
-        \\@.cx_fmt_drop = private unnamed_addr constant [11 x i8] c"DROP:%lld\0A\00", align 1
-        \\@.cx_fmt_exit = private unnamed_addr constant [9 x i8] c"EXIT:%d\0A\00", align 1
-        \\@.cx_panic_pfx = private unnamed_addr constant [7 x i8] c"panic: ", align 1
-        \\@.cx_panic_nl = private unnamed_addr constant [1 x i8] c"\0A", align 1
-        \\@.cx_str_true = private unnamed_addr constant [4 x i8] c"true", align 1
-        \\@.cx_str_false = private unnamed_addr constant [5 x i8] c"false", align 1
-        \\@.cx_fmt_i64 = private unnamed_addr constant [5 x i8] c"%lld\00", align 1
-        \\@.cx_fmt_u64 = private unnamed_addr constant [5 x i8] c"%llu\00", align 1
-        \\
-        \\declare void @llvm.trap() cold noreturn nounwind
-        \\declare ptr @getenv(ptr) nounwind
-        \\declare ptr @fopen(ptr, ptr) nounwind
-        \\declare i32 @fflush(ptr) nounwind
-        \\declare i32 @fclose(ptr) nounwind
-        \\declare void @_exit(i32) noreturn nounwind
-        \\
-    );
-    _ = try emitter.markExternDeclared("getenv");
-    _ = try emitter.markExternDeclared("fopen");
-    _ = try emitter.markExternDeclared("fflush");
-    _ = try emitter.markExternDeclared("fclose");
-    _ = try emitter.markExternDeclared("_exit");
-    _ = try emitter.markExternDeclared("fwrite");
-    _ = try emitter.markExternDeclared("snprintf");
-    try emitter.print(
-        "declare {s} @fwrite(ptr, {s}, {s}, ptr) nounwind\n" ++
-            "declare i32 @snprintf(ptr, {s}, ptr, ...) nounwind\n",
-        .{ ptr_int, ptr_int, ptr_int, ptr_int },
-    );
-    if (emitter.cfg.target.isWindows()) {
-        _ = try emitter.markExternDeclared("_setmode");
-        _ = try emitter.markExternDeclared("_write");
-        try emitter.writeAll(
-            "declare i32 @_setmode(i32, i32) nounwind\n" ++
-                "declare i32 @_write(i32, ptr, i32) nounwind\n\n",
-        );
-    } else {
-        _ = try emitter.markExternDeclared("write");
-        try emitter.print("declare {s} @write(i32, ptr, {s}) nounwind\n\n", .{ ptr_int, ptr_int });
-    }
-
     const fn_attrs = fnUnwindAttrs(emitter);
-
-    // `@_cx_rt_init` sets `_O_BINARY` (`0x8000`) on Windows `stdout`/`stderr` so `\n` is never mangled.
-    try emitter.print("define internal void @_cx_rt_init() {s} {{\nentry:\n", .{fn_attrs});
-    if (emitter.cfg.target.isWindows()) {
-        try emitter.writeAll(
-            "  %_sm1 = call i32 @_setmode(i32 1, i32 32768)\n" ++
-                "  %_sm2 = call i32 @_setmode(i32 2, i32 32768)\n",
-        );
-    }
-    try emitter.writeAll("  ret void\n}\n\n");
-
-    // `@_cx_rt_trace_append(ptr %line_ptr, <usize> %line_len)`:
-    try emitter.print(
-        "define internal void @_cx_rt_trace_append(ptr %line_ptr, {s} %line_len) {s} {{\n" ++
-            "entry:\n" ++
-            "  %path = call ptr @getenv(ptr @.cx_env_oracle)\n" ++
-            "  %has_p = icmp ne ptr %path, null\n" ++
-            "  br i1 %has_p, label %chk_nonempty, label %done\n" ++
-            "chk_nonempty:\n" ++
-            "  %ch0 = load i8, ptr %path, align 1\n" ++
-            "  %ok0 = icmp ne i8 %ch0, 0\n" ++
-            "  br i1 %ok0, label %open_f, label %done\n" ++
-            "open_f:\n" ++
-            "  %fp = call ptr @fopen(ptr %path, ptr @.cx_fmode_ab)\n" ++
-            "  %ok_fp = icmp ne ptr %fp, null\n" ++
-            "  br i1 %ok_fp, label %do_wr, label %done\n" ++
-            "do_wr:\n" ++
-            "  %_w = call {s} @fwrite(ptr %line_ptr, {s} 1, {s} %line_len, ptr %fp)\n" ++
-            "  %_f = call i32 @fflush(ptr %fp)\n" ++
-            "  %_c = call i32 @fclose(ptr %fp)\n" ++
-            "  br label %done\n" ++
-            "done:\n" ++
-            "  ret void\n" ++
-            "}}\n\n",
-        .{ ptr_int, fn_attrs, ptr_int, ptr_int, ptr_int },
-    );
-
-    // `@_cx_rt_trap(i32 %reason)` writes `TRAP:1\n` + `_exit(101)` under oracle mode, else `@llvm.trap()`.
-    try emitter.print(
-        "define internal void @_cx_rt_trap(i32 %reason) cold noreturn {s} {{\n" ++
-            "entry:\n" ++
-            "  %path = call ptr @getenv(ptr @.cx_env_oracle)\n" ++
-            "  %has_p = icmp ne ptr %path, null\n" ++
-            "  br i1 %has_p, label %chk_ch, label %hard_trap\n" ++
-            "chk_ch:\n" ++
-            "  %ch0 = load i8, ptr %path, align 1\n" ++
-            "  %ok0 = icmp ne i8 %ch0, 0\n" ++
-            "  br i1 %ok0, label %oracle_exit, label %hard_trap\n" ++
-            "oracle_exit:\n" ++
-            "  call void @_cx_rt_trace_append(ptr @.cx_msg_trap, {s} 7)\n" ++
-            "  %_fl_t = call i32 @fflush(ptr null)\n" ++
-            "  call void @_exit(i32 101)\n" ++
-            "  unreachable\n" ++
-            "hard_trap:\n" ++
-            "  call void @llvm.trap()\n" ++
-            "  unreachable\n" ++
-            "}}\n\n",
-        .{ fn_attrs, ptr_int },
-    );
-
-    // `@_cx_rt_sys_write(i32 %fd, ptr %buf, <usize> %len) -> <isize>`:
-    try emitter.print(
-        "define internal {s} @_cx_rt_sys_write(i32 %fd, ptr %buf, {s} %len) {s} {{\nentry:\n",
-        .{ ptr_int, ptr_int, fn_attrs },
-    );
-    if (emitter.cfg.target.isWindows()) {
-        try emitter.writeAll(
-            "  %is_z = icmp eq i64 %len, 0\n" ++
-                "  br i1 %is_z, label %ret_z, label %do_w\n" ++
-                "ret_z:\n" ++
-                "  ret i64 0\n" ++
-                "do_w:\n" ++
-                "  %clamped = call i64 @llvm.umin.i64(i64 %len, i64 2147483647)\n" ++
-                "  %len32 = trunc i64 %clamped to i32\n" ++
-                "  %res32 = call i32 @_write(i32 %fd, ptr %buf, i32 %len32)\n" ++
-                "  %res64 = sext i32 %res32 to i64\n" ++
-                "  ret i64 %res64\n}\n\n",
-        );
-        try emitter.requireIntrinsicDecl("declare i64 @llvm.umin.i64(i64, i64)");
-    } else {
+    if (emitter.cfg.target.isFreestanding()) {
+        if (emitter.has_fmt_rt_helpers) {
+            try emitter.writeAll(
+                \\@.cx_str_true = private unnamed_addr constant [4 x i8] c"true", align 1
+                \\@.cx_str_false = private unnamed_addr constant [5 x i8] c"false", align 1
+                \\@.cx_fmt_i64 = private unnamed_addr constant [5 x i8] c"%lld\00", align 1
+                \\@.cx_fmt_u64 = private unnamed_addr constant [5 x i8] c"%llu\00", align 1
+                \\
+            );
+            _ = try emitter.markExternDeclared("snprintf");
+            try emitter.print("declare i32 @snprintf(ptr, {s}, ptr, ...) nounwind\n", .{ptr_int});
+        }
+        try emitter.writeAll("declare void @llvm.trap() cold noreturn nounwind\n\n");
         try emitter.print(
-            "  %res = call {s} @write(i32 %fd, ptr %buf, {s} %len)\n  ret {s} %res\n}}\n\n",
-            .{ ptr_int, ptr_int, ptr_int },
-        );
-    }
-
-    // `@_cx_rt_panic(ptr %msg_ptr, <usize> %msg_len)` and `@_cx_rt_sys_exit(i32 %code)`:
-    try emitter.print(
-        "define internal void @_cx_rt_panic(ptr %msg_ptr, {s} %msg_len) cold noreturn {s} {{\n" ++
-            "entry:\n" ++
-            "  %_pfx = call {s} @_cx_rt_sys_write(i32 2, ptr @.cx_panic_pfx, {s} 7)\n" ++
-            "  %has_m = icmp ne ptr %msg_ptr, null\n" ++
-            "  %has_l = icmp ne {s} %msg_len, 0\n" ++
-            "  %do_p = and i1 %has_m, %has_l\n" ++
-            "  br i1 %do_p, label %wr_m, label %go_trap\n" ++
-            "wr_m:\n" ++
-            "  %_ign = call {s} @_cx_rt_sys_write(i32 2, ptr %msg_ptr, {s} %msg_len)\n" ++
-            "  br label %go_trap\n" ++
-            "go_trap:\n" ++
-            "  %_nl = call {s} @_cx_rt_sys_write(i32 2, ptr @.cx_panic_nl, {s} 1)\n" ++
-            "  call void @_cx_rt_trap(i32 1)\n" ++
-            "  unreachable\n" ++
-            "}}\n\n" ++
-            "define internal void @_cx_rt_sys_exit(i32 %code) noreturn {s} {{\n" ++
-            "entry:\n" ++
-            "  %ebuf = alloca [64 x i8], align 8\n" ++
-            "  %en32 = call i32 (ptr, {s}, ptr, ...) @snprintf(ptr %ebuf, {s} 64, ptr @.cx_fmt_exit, i32 %code)\n" ++
-            "  %eok = icmp sgt i32 %en32, 0\n" ++
-            "  %ecl = select i1 %eok, i32 %en32, i32 0\n",
-        .{
-            ptr_int,
-            fn_attrs,
-            ptr_int,
-            ptr_int,
-            ptr_int,
-            ptr_int,
-            ptr_int,
-            ptr_int,
-            ptr_int,
-            fn_attrs,
-            ptr_int,
-            ptr_int,
-        },
-    );
-    if (emitter.cfg.target.isWasm()) {
-        try emitter.writeAll(
-            "  call void @_cx_rt_trace_append(ptr %ebuf, i32 %ecl)\n" ++
-                "  %_fl = call i32 @fflush(ptr null)\n" ++
-                "  call void @_exit(i32 %code)\n" ++
-                "  unreachable\n}\n\n",
+            "define internal void @_cx_rt_init() {s} {{\nentry:\n  ret void\n}}\n\n" ++
+                "define internal void @_cx_rt_trace_append(ptr %line_ptr, {s} %line_len) {s} {{\n" ++
+                "entry:\n  ret void\n}}\n\n" ++
+                "define internal void @_cx_rt_trap(i32 %reason) cold noreturn {s} {{\n" ++
+                "entry:\n  call void @llvm.trap()\n  unreachable\n}}\n\n" ++
+                "define internal {s} @_cx_rt_sys_write(i32 %fd, ptr %buf, {s} %len) {s} {{\n" ++
+                "entry:\n  ret {s} -1\n}}\n\n" ++
+                "define internal void @_cx_rt_panic(ptr %msg_ptr, {s} %msg_len) cold noreturn {s} {{\n" ++
+                "entry:\n  call void @llvm.trap()\n  unreachable\n}}\n\n" ++
+                "define internal void @_cx_rt_sys_exit(i32 %code) noreturn {s} {{\n" ++
+                "entry:\n  call void @llvm.trap()\n  unreachable\n}}\n\n",
+            .{
+                fn_attrs,
+                ptr_int,
+                fn_attrs,
+                fn_attrs,
+                ptr_int,
+                ptr_int,
+                fn_attrs,
+                ptr_int,
+                ptr_int,
+                fn_attrs,
+                fn_attrs,
+            },
         );
     } else {
         try emitter.writeAll(
-            "  %eln = zext i32 %ecl to i64\n" ++
-                "  call void @_cx_rt_trace_append(ptr %ebuf, i64 %eln)\n" ++
-                "  %_fl = call i32 @fflush(ptr null)\n" ++
-                "  call void @_exit(i32 %code)\n" ++
-                "  unreachable\n}\n\n",
+            \\@.cx_env_oracle = private unnamed_addr constant [24 x i8] c"COREX_ORACLE_TRACE_FILE\00", align 1
+            \\@.cx_fmode_ab = private unnamed_addr constant [3 x i8] c"ab\00", align 1
+            \\@.cx_msg_trap = private unnamed_addr constant [8 x i8] c"TRAP:1\0A\00", align 1
+            \\@.cx_msg_ret0 = private unnamed_addr constant [7 x i8] c"RET:0\0A\00", align 1
+            \\@.cx_msg_err1 = private unnamed_addr constant [7 x i8] c"ERR:1\0A\00", align 1
+            \\@.cx_fmt_ret_s = private unnamed_addr constant [10 x i8] c"RET:%lld\0A\00", align 1
+            \\@.cx_fmt_ret_u = private unnamed_addr constant [10 x i8] c"RET:%llu\0A\00", align 1
+            \\@.cx_fmt_drop = private unnamed_addr constant [11 x i8] c"DROP:%lld\0A\00", align 1
+            \\@.cx_fmt_exit = private unnamed_addr constant [9 x i8] c"EXIT:%d\0A\00", align 1
+            \\@.cx_panic_pfx = private unnamed_addr constant [7 x i8] c"panic: ", align 1
+            \\@.cx_panic_nl = private unnamed_addr constant [1 x i8] c"\0A", align 1
+            \\@.cx_str_true = private unnamed_addr constant [4 x i8] c"true", align 1
+            \\@.cx_str_false = private unnamed_addr constant [5 x i8] c"false", align 1
+            \\@.cx_fmt_i64 = private unnamed_addr constant [5 x i8] c"%lld\00", align 1
+            \\@.cx_fmt_u64 = private unnamed_addr constant [5 x i8] c"%llu\00", align 1
+            \\
+            \\declare void @llvm.trap() cold noreturn nounwind
+            \\declare ptr @getenv(ptr) nounwind
+            \\declare ptr @fopen(ptr, ptr) nounwind
+            \\declare i32 @fflush(ptr) nounwind
+            \\declare i32 @fclose(ptr) nounwind
+            \\declare void @_exit(i32) noreturn nounwind
+            \\
         );
+        _ = try emitter.markExternDeclared("getenv");
+        _ = try emitter.markExternDeclared("fopen");
+        _ = try emitter.markExternDeclared("fflush");
+        _ = try emitter.markExternDeclared("fclose");
+        _ = try emitter.markExternDeclared("_exit");
+        _ = try emitter.markExternDeclared("fwrite");
+        _ = try emitter.markExternDeclared("snprintf");
+        try emitter.print(
+            "declare {s} @fwrite(ptr, {s}, {s}, ptr) nounwind\n" ++
+                "declare i32 @snprintf(ptr, {s}, ptr, ...) nounwind\n",
+            .{ ptr_int, ptr_int, ptr_int, ptr_int },
+        );
+        if (emitter.cfg.target.isWindows()) {
+            _ = try emitter.markExternDeclared("_setmode");
+            _ = try emitter.markExternDeclared("_write");
+            try emitter.writeAll(
+                "declare i32 @_setmode(i32, i32) nounwind\n" ++
+                    "declare i32 @_write(i32, ptr, i32) nounwind\n\n",
+            );
+        } else {
+            _ = try emitter.markExternDeclared("write");
+            try emitter.print("declare {s} @write(i32, ptr, {s}) nounwind\n\n", .{ ptr_int, ptr_int });
+        }
+
+        // `@_cx_rt_init` sets `_O_BINARY` (`0x8000`) on Windows `stdout`/`stderr` so `\n` is never mangled.
+        try emitter.print("define internal void @_cx_rt_init() {s} {{\nentry:\n", .{fn_attrs});
+        if (emitter.cfg.target.isWindows()) {
+            try emitter.writeAll(
+                "  %_sm1 = call i32 @_setmode(i32 1, i32 32768)\n" ++
+                    "  %_sm2 = call i32 @_setmode(i32 2, i32 32768)\n",
+            );
+        }
+        try emitter.writeAll("  ret void\n}\n\n");
+
+        // `@_cx_rt_trace_append(ptr %line_ptr, <usize> %line_len)`:
+        try emitter.print(
+            "define internal void @_cx_rt_trace_append(ptr %line_ptr, {s} %line_len) {s} {{\n" ++
+                "entry:\n" ++
+                "  %path = call ptr @getenv(ptr @.cx_env_oracle)\n" ++
+                "  %has_p = icmp ne ptr %path, null\n" ++
+                "  br i1 %has_p, label %chk_nonempty, label %done\n" ++
+                "chk_nonempty:\n" ++
+                "  %ch0 = load i8, ptr %path, align 1\n" ++
+                "  %ok0 = icmp ne i8 %ch0, 0\n" ++
+                "  br i1 %ok0, label %open_f, label %done\n" ++
+                "open_f:\n" ++
+                "  %fp = call ptr @fopen(ptr %path, ptr @.cx_fmode_ab)\n" ++
+                "  %ok_fp = icmp ne ptr %fp, null\n" ++
+                "  br i1 %ok_fp, label %do_wr, label %done\n" ++
+                "do_wr:\n" ++
+                "  %_w = call {s} @fwrite(ptr %line_ptr, {s} 1, {s} %line_len, ptr %fp)\n" ++
+                "  %_f = call i32 @fflush(ptr %fp)\n" ++
+                "  %_c = call i32 @fclose(ptr %fp)\n" ++
+                "  br label %done\n" ++
+                "done:\n" ++
+                "  ret void\n" ++
+                "}}\n\n",
+            .{ ptr_int, fn_attrs, ptr_int, ptr_int, ptr_int },
+        );
+
+        // `@_cx_rt_trap(i32 %reason)` writes `TRAP:1\n` + `_exit(101)` under oracle mode, else `@llvm.trap()`.
+        try emitter.print(
+            "define internal void @_cx_rt_trap(i32 %reason) cold noreturn {s} {{\n" ++
+                "entry:\n" ++
+                "  %path = call ptr @getenv(ptr @.cx_env_oracle)\n" ++
+                "  %has_p = icmp ne ptr %path, null\n" ++
+                "  br i1 %has_p, label %chk_ch, label %hard_trap\n" ++
+                "chk_ch:\n" ++
+                "  %ch0 = load i8, ptr %path, align 1\n" ++
+                "  %ok0 = icmp ne i8 %ch0, 0\n" ++
+                "  br i1 %ok0, label %oracle_exit, label %hard_trap\n" ++
+                "oracle_exit:\n" ++
+                "  call void @_cx_rt_trace_append(ptr @.cx_msg_trap, {s} 7)\n" ++
+                "  %_fl_t = call i32 @fflush(ptr null)\n" ++
+                "  call void @_exit(i32 101)\n" ++
+                "  unreachable\n" ++
+                "hard_trap:\n" ++
+                "  call void @llvm.trap()\n" ++
+                "  unreachable\n" ++
+                "}}\n\n",
+            .{ fn_attrs, ptr_int },
+        );
+
+        // `@_cx_rt_sys_write(i32 %fd, ptr %buf, <usize> %len) -> <isize>`:
+        try emitter.print(
+            "define internal {s} @_cx_rt_sys_write(i32 %fd, ptr %buf, {s} %len) {s} {{\nentry:\n",
+            .{ ptr_int, ptr_int, fn_attrs },
+        );
+        if (emitter.cfg.target.isWindows()) {
+            try emitter.writeAll(
+                "  %is_z = icmp eq i64 %len, 0\n" ++
+                    "  br i1 %is_z, label %ret_z, label %do_w\n" ++
+                    "ret_z:\n" ++
+                    "  ret i64 0\n" ++
+                    "do_w:\n" ++
+                    "  %clamped = call i64 @llvm.umin.i64(i64 %len, i64 2147483647)\n" ++
+                    "  %len32 = trunc i64 %clamped to i32\n" ++
+                    "  %res32 = call i32 @_write(i32 %fd, ptr %buf, i32 %len32)\n" ++
+                    "  %res64 = sext i32 %res32 to i64\n" ++
+                    "  ret i64 %res64\n}\n\n",
+            );
+            try emitter.requireIntrinsicDecl("declare i64 @llvm.umin.i64(i64, i64)");
+        } else {
+            try emitter.print(
+                "  %res = call {s} @write(i32 %fd, ptr %buf, {s} %len)\n  ret {s} %res\n}}\n\n",
+                .{ ptr_int, ptr_int, ptr_int },
+            );
+        }
+
+        // `@_cx_rt_panic(ptr %msg_ptr, <usize> %msg_len)` and `@_cx_rt_sys_exit(i32 %code)`:
+        try emitter.print(
+            "define internal void @_cx_rt_panic(ptr %msg_ptr, {s} %msg_len) cold noreturn {s} {{\n" ++
+                "entry:\n" ++
+                "  %_pfx = call {s} @_cx_rt_sys_write(i32 2, ptr @.cx_panic_pfx, {s} 7)\n" ++
+                "  %has_m = icmp ne ptr %msg_ptr, null\n" ++
+                "  %has_l = icmp ne {s} %msg_len, 0\n" ++
+                "  %do_p = and i1 %has_m, %has_l\n" ++
+                "  br i1 %do_p, label %wr_m, label %go_trap\n" ++
+                "wr_m:\n" ++
+                "  %_ign = call {s} @_cx_rt_sys_write(i32 2, ptr %msg_ptr, {s} %msg_len)\n" ++
+                "  br label %go_trap\n" ++
+                "go_trap:\n" ++
+                "  %_nl = call {s} @_cx_rt_sys_write(i32 2, ptr @.cx_panic_nl, {s} 1)\n" ++
+                "  call void @_cx_rt_trap(i32 1)\n" ++
+                "  unreachable\n" ++
+                "}}\n\n" ++
+                "define internal void @_cx_rt_sys_exit(i32 %code) noreturn {s} {{\n" ++
+                "entry:\n" ++
+                "  %ebuf = alloca [64 x i8], align 8\n" ++
+                "  %en32 = call i32 (ptr, {s}, ptr, ...) @snprintf(ptr %ebuf, {s} 64, ptr @.cx_fmt_exit, i32 %code)\n" ++
+                "  %eok = icmp sgt i32 %en32, 0\n" ++
+                "  %ecl = select i1 %eok, i32 %en32, i32 0\n",
+            .{
+                ptr_int,
+                fn_attrs,
+                ptr_int,
+                ptr_int,
+                ptr_int,
+                ptr_int,
+                ptr_int,
+                ptr_int,
+                ptr_int,
+                fn_attrs,
+                ptr_int,
+                ptr_int,
+            },
+        );
+        if (emitter.cfg.target.isWasm()) {
+            try emitter.writeAll(
+                "  call void @_cx_rt_trace_append(ptr %ebuf, i32 %ecl)\n" ++
+                    "  %_fl = call i32 @fflush(ptr null)\n" ++
+                    "  call void @_exit(i32 %code)\n" ++
+                    "  unreachable\n}\n\n",
+            );
+        } else {
+            try emitter.writeAll(
+                "  %eln = zext i32 %ecl to i64\n" ++
+                    "  call void @_cx_rt_trace_append(ptr %ebuf, i64 %eln)\n" ++
+                    "  %_fl = call i32 @fflush(ptr null)\n" ++
+                    "  call void @_exit(i32 %code)\n" ++
+                    "  unreachable\n}\n\n",
+            );
+        }
     }
 
     // `@_cx_record_err_ret(<usize> %site_tag)` in `--dev` mode:
@@ -2526,18 +2770,1172 @@ fn emitRodataAndRuntimeHelpers(
             },
         );
     }
+
+    if (emitter.has_async_ops and !emitter.cfg.target.isFreestanding()) {
+        try emitAsyncRuntimeHelpersLlvm(emitter);
+    }
 }
 
-/// Emits external `declare` prototypes for all referenced `extern` FFI symbols.
+/// Emits LLVM 20–23 stackless coroutine runtime types, FIFO `TaskGroup` scheduler, and `ReactorVTable` yield seam.
+fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
+    const ptr_int = ptrIntType(emitter);
+    const ptr_bytes: u32 = emitter.cfg.target.ptrBytes();
+    const fn_attrs = fnUnwindAttrs(emitter);
+    const is_wasm = emitter.cfg.target.isWasm();
+    const tls_kw = if (is_wasm) "internal global" else "internal thread_local global";
+    const ctx_bytes: u64 = type_system.ContextFieldLayout.byteSizeForPtrWidth(emitter.cfg.target.ptrBytes());
+
+    var total_ctx_save_bytes: u64 = ctx_bytes;
+    for (emitter.ctx_wide_slot_sizes) |wide_sz| {
+        if (wide_sz > ptr_bytes) total_ctx_save_bytes += wide_sz;
+    }
+
+    if (!emitter.declared_externs.contains("calloc")) {
+        try emitter.requireIntrinsicDecl(
+            if (is_wasm)
+                "declare ptr @calloc(i32, i32) nounwind"
+            else
+                "declare ptr @calloc(i64, i64) nounwind",
+        );
+    }
+    if (!emitter.declared_externs.contains("realloc")) {
+        try emitter.requireIntrinsicDecl(
+            if (is_wasm)
+                "declare ptr @realloc(ptr, i32) nounwind"
+            else
+                "declare ptr @realloc(ptr, i64) nounwind",
+        );
+    }
+    if (!emitter.declared_externs.contains("free")) {
+        try emitter.requireIntrinsicDecl("declare void @free(ptr) nounwind");
+    }
+    try emitter.requireIntrinsicDecl(
+        "declare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, " ++
+            "ptr noalias nocapture readonly, i64, i1 immarg)",
+    );
+
+    try emitter.print(
+        "%_cx_fut_raw_t = type {{ ptr, {s}, {s}, {s} }}\n" ++
+            "%_cx_task_node_t = type {{ ptr, %_cx_fut_raw_t, ptr, {s}, ptr, [{d} x i8], {s}, i8, i8, i8 }}\n" ++
+            "%_cx_task_group_t = type {{ ptr, {s}, {s}, i8, i8 }}\n" ++
+            "@_cx_exec_q = {s} ptr null, align {d}\n" ++
+            "@_cx_exec_q_len = {s} {s} 0, align {d}\n" ++
+            "@_cx_exec_q_cap = {s} {s} 0, align {d}\n" ++
+            "@_cx_active_poll_item = {s} {s} 1, align {d}\n" ++
+            "@_cx_coro_is_cancelling = {s} i8 0, align 1\n\n",
+        .{
+            ptr_int,   ptr_int,              ptr_int,
+            ptr_int,   total_ctx_save_bytes, ptr_int,
+            ptr_int,   ptr_int,              tls_kw,
+            ptr_bytes, tls_kw,               ptr_int,
+            ptr_bytes, tls_kw,               ptr_int,
+            ptr_bytes, tls_kw,               ptr_int,
+            ptr_bytes, tls_kw,
+        },
+    );
+
+    // `@_cx_ctx_save(ptr %dst)` and `@_cx_ctx_restore(ptr %src)`:
+    try emitter.print(
+        "define internal void @_cx_ctx_save(ptr %dst) {s} {{\nentry:\n" ++
+            "  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %dst, ptr align {d} @_cx_default_ctx, i64 {d}, i1 false)\n",
+        .{ fn_attrs, ptr_bytes, ctx_bytes },
+    );
+    var wide_off: u64 = ctx_bytes;
+    for (emitter.ctx_wide_slot_sizes, 0..) |wide_sz, slot_i| {
+        if (wide_sz > ptr_bytes) {
+            try emitter.print(
+                "  %wdst_{d} = getelementptr inbounds i8, ptr %dst, {s} {d}\n" ++
+                    "  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %wdst_{d}, ptr align {d} @_cx_ctx_wide_{d}, i64 {d}, i1 false)\n",
+                .{ slot_i, ptr_int, wide_off, slot_i, emitter.ctx_wide_slot_aligns[slot_i], slot_i, wide_sz },
+            );
+            wide_off += wide_sz;
+        }
+    }
+    try emitter.writeAll("  ret void\n}\n\n");
+
+    try emitter.print(
+        "define internal void @_cx_ctx_restore(ptr %src) {s} {{\nentry:\n" ++
+            "  call void @llvm.memcpy.p0.p0.i64(ptr align {d} @_cx_default_ctx, ptr align 1 %src, i64 {d}, i1 false)\n",
+        .{ fn_attrs, ptr_bytes, ctx_bytes },
+    );
+    wide_off = ctx_bytes;
+    for (emitter.ctx_wide_slot_sizes, 0..) |wide_sz, slot_i| {
+        if (wide_sz > ptr_bytes) {
+            try emitter.print(
+                "  %wsrc_{d} = getelementptr inbounds i8, ptr %src, {s} {d}\n" ++
+                    "  call void @llvm.memcpy.p0.p0.i64(ptr align {d} @_cx_ctx_wide_{d}, ptr align 1 %wsrc_{d}, i64 {d}, i1 false)\n",
+                .{ slot_i, ptr_int, wide_off, emitter.ctx_wide_slot_aligns[slot_i], slot_i, slot_i, wide_sz },
+            );
+            wide_off += wide_sz;
+        }
+    }
+    try emitter.writeAll("  ret void\n}\n\n");
+
+    // `@_cx_exec_push(<ptr_int> %item)` and `@_cx_reactor_notify_yield(i8 %reason)`:
+    const max_q_elems: u64 = if (is_wasm)
+        (std.math.maxInt(u32) / ptr_bytes)
+    else
+        (std.math.maxInt(u64) / @as(u64, ptr_bytes));
+    const reactor_slot_off: u64 = 8 * @as(u64, ptr_bytes);
+    const reactor_ctx_off: u64 = 9 * @as(u64, ptr_bytes);
+    try emitter.print(
+        "define internal void @_cx_exec_push({s} %item) {s} {{\n" ++
+            "entry:\n" ++
+            "  %len = load {s}, ptr @_cx_exec_q_len, align {d}\n" ++
+            "  %cap = load {s}, ptr @_cx_exec_q_cap, align {d}\n" ++
+            "  %need = icmp uge {s} %len, %cap\n" ++
+            "  br i1 %need, label %grow, label %push\n" ++
+            "grow:\n" ++
+            "  %isz = icmp eq {s} %cap, 0\n" ++
+            "  %dbl = mul {s} %cap, 2\n" ++
+            "  %nc = select i1 %isz, {s} 64, {s} %dbl\n" ++
+            "  %ov1 = icmp ule {s} %nc, %cap\n" ++
+            "  %ov2 = icmp ugt {s} %nc, {d}\n" ++
+            "  %ov = or i1 %ov1, %ov2\n" ++
+            "  br i1 %ov, label %trap, label %do_realloc\n" ++
+            "do_realloc:\n" ++
+            "  %nb = mul {s} %nc, {d}\n" ++
+            "  %oldq = load ptr, ptr @_cx_exec_q, align {d}\n" ++
+            "  %newq = call ptr @realloc(ptr %oldq, {s} %nb)\n" ++
+            "  %oom = icmp eq ptr %newq, null\n" ++
+            "  br i1 %oom, label %trap, label %grown\n" ++
+            "trap:\n" ++
+            "  call void @_cx_rt_trap(i32 0)\n" ++
+            "  unreachable\n" ++
+            "grown:\n" ++
+            "  store ptr %newq, ptr @_cx_exec_q, align {d}\n" ++
+            "  store {s} %nc, ptr @_cx_exec_q_cap, align {d}\n" ++
+            "  br label %push\n" ++
+            "push:\n" ++
+            "  %q = load ptr, ptr @_cx_exec_q, align {d}\n" ++
+            "  %ep = getelementptr inbounds {s}, ptr %q, {s} %len\n" ++
+            "  store {s} %item, ptr %ep, align {d}\n" ++
+            "  %nlen = add {s} %len, 1\n" ++
+            "  store {s} %nlen, ptr @_cx_exec_q_len, align {d}\n" ++
+            "  ret void\n" ++
+            "}}\n\n",
+        .{
+            ptr_int,   fn_attrs,
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_int,
+            ptr_int,   ptr_int,
+            ptr_int,   ptr_int,
+            ptr_int,   max_q_elems,
+            ptr_int,   ptr_bytes,
+            ptr_bytes, ptr_int,
+            ptr_bytes, ptr_int,
+            ptr_bytes, ptr_bytes,
+            ptr_int,   ptr_int,
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_int,
+            ptr_bytes,
+        },
+    );
+    try emitter.print(
+        "define internal void @_cx_reactor_notify_yield(i8 %reason) {s} {{\n" ++
+            "entry:\n" ++
+            "  %vtp = getelementptr inbounds i8, ptr @_cx_default_ctx, {s} {d}\n" ++
+            "  %rcp = getelementptr inbounds i8, ptr @_cx_default_ctx, {s} {d}\n" ++
+            "  %vt = load ptr, ptr %vtp, align {d}\n" ++
+            "  %rctx = load ptr, ptr %rcp, align {d}\n" ++
+            "  %hvt = icmp ne ptr %vt, null\n" ++
+            "  br i1 %hvt, label %chk_fn, label %done\n" ++
+            "chk_fn:\n" ++
+            "  %yfnp = getelementptr inbounds ptr, ptr %vt, {s} 6\n" ++
+            "  %yfn = load ptr, ptr %yfnp, align {d}\n" ++
+            "  %hfn = icmp ne ptr %yfn, null\n" ++
+            "  br i1 %hfn, label %do_call, label %done\n" ++
+            "do_call:\n" ++
+            "  call void %yfn(ptr %rctx, i8 %reason)\n" ++
+            "  br label %done\n" ++
+            "done:\n" ++
+            "  ret void\n" ++
+            "}}\n\n",
+        .{
+            fn_attrs,
+            ptr_int,
+            reactor_slot_off,
+            ptr_int,
+            reactor_ctx_off,
+            ptr_bytes,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+        },
+    );
+
+    // `@_cx_coro_alloc`, `@_cx_coro_free`, `@_cx_async_fut_cancel`, and `@_cx_async_fut_poll`:
+    const res_sz_i64_conv = if (is_wasm)
+        "  %rsz64 = zext i32 %rsz to i64\n"
+    else
+        "  %rsz64 = add i64 %rsz, 0\n";
+    try emitter.print(
+        "define internal ptr @_cx_coro_alloc(i32 %b_idx) {s} {{\n" ++
+            "entry:\n" ++
+            "  %raw_sz = call {s} @_cx_coro_frame_size(i32 %b_idx)\n" ++
+            "  %raw_al = call {s} @_cx_coro_frame_align(i32 %b_idx)\n" ++
+            "  %lt16_s = icmp ult {s} %raw_sz, 16\n" ++
+            "  %sz = select i1 %lt16_s, {s} 16, {s} %raw_sz\n" ++
+            "  %lt16_a = icmp ult {s} %raw_al, 16\n" ++
+            "  %al = select i1 %lt16_a, {s} 16, {s} %raw_al\n" ++
+            "  %max_sz = sub {s} -1, %al\n" ++
+            "  %ov_sz = icmp ugt {s} %sz, %max_sz\n" ++
+            "  %ov_al = icmp ugt {s} %al, 65536\n" ++
+            "  %bad_sz = or i1 %ov_sz, %ov_al\n" ++
+            "  br i1 %bad_sz, label %trap, label %do_alloc\n" ++
+            "trap:\n" ++
+            "  call void @_cx_rt_trap(i32 0)\n" ++
+            "  unreachable\n" ++
+            "do_alloc:\n" ++
+            "  %tot = add {s} %sz, %al\n" ++
+            "  %raw = call ptr @calloc({s} 1, {s} %tot)\n" ++
+            "  %oom = icmp eq ptr %raw, null\n" ++
+            "  br i1 %oom, label %trap, label %ok\n" ++
+            "ok:\n" ++
+            "  %raw_i = ptrtoint ptr %raw to {s}\n" ++
+            "  %am1 = sub {s} %al, 1\n" ++
+            "  %nmask = xor {s} %am1, -1\n" ++
+            "  %sum_i = add {s} %raw_i, %am1\n" ++
+            "  %al_i = and {s} %sum_i, %nmask\n" ++
+            "  %diff = sub {s} %al_i, %raw_i\n" ++
+            "  %d16 = trunc {s} %diff to i16\n" ++
+            "  %fr = getelementptr inbounds i8, ptr %raw, {s} %diff\n" ++
+            "  %bp = getelementptr inbounds i8, ptr %fr, {s} 4\n" ++
+            "  store i32 %b_idx, ptr %bp, align 4\n" ++
+            "  %dp = getelementptr inbounds i8, ptr %fr, {s} 12\n" ++
+            "  store i16 %d16, ptr %dp, align 2\n" ++
+            "  ret ptr %fr\n" ++
+            "}}\n\n",
+        .{
+            fn_attrs, ptr_int, ptr_int, ptr_int, ptr_int, ptr_int, ptr_int, ptr_int, ptr_int,
+            ptr_int,  ptr_int, ptr_int, ptr_int, ptr_int, ptr_int, ptr_int, ptr_int, ptr_int,
+            ptr_int,  ptr_int, ptr_int, ptr_int, ptr_int, ptr_int, ptr_int,
+        },
+    );
+    try emitter.print(
+        "define internal void @_cx_coro_free(ptr %fr) {s} {{\n" ++
+            "entry:\n" ++
+            "  %isn = icmp eq ptr %fr, null\n" ++
+            "  br i1 %isn, label %done, label %do_free\n" ++
+            "do_free:\n" ++
+            "  %dp = getelementptr inbounds i8, ptr %fr, {s} 12\n" ++
+            "  %d16 = load i16, ptr %dp, align 2\n" ++
+            "  %d_ext = zext i16 %d16 to {s}\n" ++
+            "  %neg_d = sub {s} 0, %d_ext\n" ++
+            "  %raw = getelementptr inbounds i8, ptr %fr, {s} %neg_d\n" ++
+            "  call void @free(ptr %raw)\n" ++
+            "  br label %done\n" ++
+            "done:\n" ++
+            "  ret void\n" ++
+            "}}\n\n" ++
+            "define internal void @_cx_async_fut_cancel(ptr %raw_fut) {s} {{\n" ++
+            "entry:\n" ++
+            "  %isn = icmp eq ptr %raw_fut, null\n" ++
+            "  br i1 %isn, label %done, label %chk\n" ++
+            "chk:\n" ++
+            "  %kp = getelementptr inbounds %_cx_fut_raw_t, ptr %raw_fut, i32 0, i32 1\n" ++
+            "  %k = load {s}, ptr %kp, align 1\n" ++
+            "  %h = load ptr, ptr %raw_fut, align 1\n" ++
+            "  store {s} 0, ptr %kp, align 1\n" ++
+            "  store ptr null, ptr %raw_fut, align 1\n" ++
+            "  %isk1 = icmp eq {s} %k, 1\n" ++
+            "  %hh = icmp ne ptr %h, null\n" ++
+            "  %do_c = and i1 %isk1, %hh\n" ++
+            "  br i1 %do_c, label %canc_coro, label %done\n" ++
+            "canc_coro:\n" ++
+            "  %bp = getelementptr inbounds i8, ptr %h, {s} 4\n" ++
+            "  %b_idx = load i32, ptr %bp, align 4\n" ++
+            "  %prev_c = load i8, ptr @_cx_coro_is_cancelling, align 1\n" ++
+            "  store i8 1, ptr @_cx_coro_is_cancelling, align 1\n" ++
+            "  %_ign = call i32 @_cx_coro_poll_dispatch(i32 %b_idx, ptr %h, ptr null, i32 1, ptr null)\n" ++
+            "  store i8 %prev_c, ptr @_cx_coro_is_cancelling, align 1\n" ++
+            "  call void @_cx_coro_free(ptr %h)\n" ++
+            "  br label %done\n" ++
+            "done:\n" ++
+            "  ret void\n" ++
+            "}}\n\n",
+        .{
+            fn_attrs, ptr_int, ptr_int, ptr_int, ptr_int,
+            fn_attrs, ptr_int, ptr_int, ptr_int, ptr_int,
+        },
+    );
+    try emitter.print(
+        "define internal i32 @_cx_async_fut_poll(ptr %raw_fut, ptr %out_ptr, ptr %parked_out) {s} {{\n" ++
+            "entry:\n" ++
+            "  %kp = getelementptr inbounds %_cx_fut_raw_t, ptr %raw_fut, i32 0, i32 1\n" ++
+            "  %ap = getelementptr inbounds %_cx_fut_raw_t, ptr %raw_fut, i32 0, i32 2\n" ++
+            "  %k = load {s}, ptr %kp, align 1\n" ++
+            "  switch {s} %k, label %ret_rdy [\n" ++
+            "    {s} 1, label %on_coro\n" ++
+            "    {s} 2, label %on_yield\n" ++
+            "    {s} 3, label %on_join\n" ++
+            "    {s} 4, label %on_cancel_h\n" ++
+            "  ]\n" ++
+            "on_yield:\n" ++
+            "  %ya = load {s}, ptr %ap, align 1\n" ++
+            "  %y0 = icmp eq {s} %ya, 0\n" ++
+            "  br i1 %y0, label %yld_first, label %yld_done\n" ++
+            "yld_first:\n" ++
+            "  store {s} 1, ptr %ap, align 1\n" ++
+            "  call void @_cx_reactor_notify_yield(i8 0)\n" ++
+            "  ret i32 0\n" ++
+            "yld_done:\n" ++
+            "  store {s} 4294967294, ptr %ap, align 1\n" ++
+            "  store {s} 0, ptr %kp, align 1\n" ++
+            "  ret i32 1\n" ++
+            "on_join:\n" ++
+            "  %jtn = load ptr, ptr %raw_fut, align 1\n" ++
+            "  %jnull = icmp eq ptr %jtn, null\n" ++
+            "  br i1 %jnull, label %j_clear, label %j_chk\n" ++
+            "j_chk:\n" ++
+            "  %jcp = getelementptr inbounds %_cx_task_node_t, ptr %jtn, i32 0, i32 7\n" ++
+            "  %jc = load i8, ptr %jcp, align 1\n" ++
+            "  %jdone = icmp ne i8 %jc, 0\n" ++
+            "  br i1 %jdone, label %j_copy, label %j_park\n" ++
+            "j_copy:\n" ++
+            "  %jrbp = getelementptr inbounds %_cx_task_node_t, ptr %jtn, i32 0, i32 2\n" ++
+            "  %jrszp = getelementptr inbounds %_cx_task_node_t, ptr %jtn, i32 0, i32 3\n" ++
+            "  %rb = load ptr, ptr %jrbp, align {d}\n" ++
+            "  %rsz = load {s}, ptr %jrszp, align {d}\n" ++
+            "  %ho = icmp ne ptr %out_ptr, null\n" ++
+            "  %hrb = icmp ne ptr %rb, null\n" ++
+            "  %hsz = icmp ne {s} %rsz, 0\n" ++
+            "  %c1 = and i1 %ho, %hrb\n" ++
+            "  %do_cp = and i1 %c1, %hsz\n" ++
+            "  br i1 %do_cp, label %j_memcpy, label %j_clear\n" ++
+            "j_memcpy:\n" ++
+            "{s}" ++
+            "  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %out_ptr, ptr align 1 %rb, i64 %rsz64, i1 false)\n" ++
+            "  br label %j_clear\n" ++
+            "j_clear:\n" ++
+            "  store {s} 0, ptr %kp, align 1\n" ++
+            "  ret i32 1\n" ++
+            "j_park:\n" ++
+            "  %jwp = getelementptr inbounds %_cx_task_node_t, ptr %jtn, i32 0, i32 6\n" ++
+            "  %act = load {s}, ptr @_cx_active_poll_item, align {d}\n" ++
+            "  store {s} %act, ptr %jwp, align {d}\n" ++
+            "  %hpk = icmp ne ptr %parked_out, null\n" ++
+            "  br i1 %hpk, label %j_set_pk, label %j_ret0\n" ++
+            "j_set_pk:\n" ++
+            "  store i8 1, ptr %parked_out, align 1\n" ++
+            "  br label %j_ret0\n" ++
+            "j_ret0:\n" ++
+            "  ret i32 0\n" ++
+            "on_cancel_h:\n" ++
+            "  %ctn = load ptr, ptr %raw_fut, align 1\n" ++
+            "  %chtn = icmp ne ptr %ctn, null\n" ++
+            "  br i1 %chtn, label %c_do, label %c_done\n" ++
+            "c_do:\n" ++
+            "  call void @_cx_async_cancel_node(ptr %ctn)\n" ++
+            "  br label %c_done\n" ++
+            "c_done:\n" ++
+            "  store {s} 0, ptr %kp, align 1\n" ++
+            "  ret i32 1\n" ++
+            "on_coro:\n" ++
+            "  %fr = load ptr, ptr %raw_fut, align 1\n" ++
+            "  %fnull = icmp eq ptr %fr, null\n" ++
+            "  br i1 %fnull, label %j_clear, label %coro_go\n" ++
+            "coro_go:\n" ++
+            "  %fbp = getelementptr inbounds i8, ptr %fr, {s} 4\n" ++
+            "  %fb_idx = load i32, ptr %fbp, align 4\n" ++
+            "  %pr = call i32 @_cx_coro_poll_dispatch(i32 %fb_idx, ptr %fr, ptr %out_ptr, i32 0, ptr %parked_out)\n" ++
+            "  %pdone = icmp ne i32 %pr, 0\n" ++
+            "  br i1 %pdone, label %coro_fin, label %coro_pend\n" ++
+            "coro_fin:\n" ++
+            "  store {s} 0, ptr %kp, align 1\n" ++
+            "  store ptr null, ptr %raw_fut, align 1\n" ++
+            "  call void @_cx_coro_free(ptr %fr)\n" ++
+            "  ret i32 1\n" ++
+            "coro_pend:\n" ++
+            "  ret i32 0\n" ++
+            "ret_rdy:\n" ++
+            "  ret i32 1\n" ++
+            "}}\n\n",
+        .{
+            fn_attrs,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            res_sz_i64_conv,
+            ptr_int,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+        },
+    );
+
+    // `@_cx_async_group_cancel_all`, `@_cx_async_cancel_node`, and `@_cx_exec_step_task`:
+    try emitter.print(
+        "define internal void @_cx_async_group_cancel_all(ptr %grp) {s} {{\n" ++
+            "entry:\n" ++
+            "  %ri_s = alloca {s}, align {d}\n" ++
+            "  %gn = icmp eq ptr %grp, null\n" ++
+            "  br i1 %gn, label %done, label %init\n" ++
+            "init:\n" ++
+            "  %gcp = getelementptr inbounds %_cx_task_group_t, ptr %grp, i32 0, i32 3\n" ++
+            "  store i8 1, ptr %gcp, align 1\n" ++
+            "  %glp = getelementptr inbounds %_cx_task_group_t, ptr %grp, i32 0, i32 1\n" ++
+            "  %glen = load {s}, ptr %glp, align {d}\n" ++
+            "  store {s} %glen, ptr %ri_s, align {d}\n" ++
+            "  br label %loop\n" ++
+            "loop:\n" ++
+            "  %ri = load {s}, ptr %ri_s, align {d}\n" ++
+            "  %gt0 = icmp ugt {s} %ri, 0\n" ++
+            "  br i1 %gt0, label %body, label %done\n" ++
+            "body:\n" ++
+            "  %nri = sub {s} %ri, 1\n" ++
+            "  store {s} %nri, ptr %ri_s, align {d}\n" ++
+            "  %gtp = load ptr, ptr %grp, align {d}\n" ++
+            "  %tep = getelementptr inbounds ptr, ptr %gtp, {s} %nri\n" ++
+            "  %tn = load ptr, ptr %tep, align {d}\n" ++
+            "  %tni = ptrtoint ptr %tn to {s}\n" ++
+            "  %act = load {s}, ptr @_cx_active_poll_item, align {d}\n" ++
+            "  %isself = icmp eq {s} %tni, %act\n" ++
+            "  br i1 %isself, label %loop, label %do_c\n" ++
+            "do_c:\n" ++
+            "  call void @_cx_async_cancel_node(ptr %tn)\n" ++
+            "  br label %loop\n" ++
+            "done:\n" ++
+            "  ret void\n" ++
+            "}}\n\n",
+        .{
+            fn_attrs,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+            ptr_bytes,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+        },
+    );
+    try emitter.print(
+        "define internal void @_cx_async_cancel_node(ptr %tn) {s} {{\n" ++
+            "entry:\n" ++
+            "  %sctx = alloca [{d} x i8], align 16\n" ++
+            "  %isn = icmp eq ptr %tn, null\n" ++
+            "  br i1 %isn, label %done, label %chk\n" ++
+            "chk:\n" ++
+            "  %cp = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 7\n" ++
+            "  %xp = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 8\n" ++
+            "  %cv = load i8, ptr %cp, align 1\n" ++
+            "  %xv = load i8, ptr %xp, align 1\n" ++
+            "  %any = or i8 %cv, %xv\n" ++
+            "  %skip = icmp ne i8 %any, 0\n" ++
+            "  br i1 %skip, label %done, label %run\n" ++
+            "run:\n" ++
+            "  store i8 1, ptr %xp, align 1\n" ++
+            "  store i8 1, ptr %cp, align 1\n" ++
+            "  %spoll = load {s}, ptr @_cx_active_poll_item, align {d}\n" ++
+            "  call void @_cx_ctx_save(ptr %sctx)\n" ++
+            "  %tctx = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 5\n" ++
+            "  call void @_cx_ctx_restore(ptr %tctx)\n" ++
+            "  %tni = ptrtoint ptr %tn to {s}\n" ++
+            "  store {s} %tni, ptr @_cx_active_poll_item, align {d}\n" ++
+            "  %tfut = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 1\n" ++
+            "  call void @_cx_async_fut_cancel(ptr %tfut)\n" ++
+            "  store {s} %spoll, ptr @_cx_active_poll_item, align {d}\n" ++
+            "  call void @_cx_ctx_restore(ptr %sctx)\n" ++
+            "  %jwp = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 6\n" ++
+            "  %jw = load {s}, ptr %jwp, align {d}\n" ++
+            "  %hw = icmp ne {s} %jw, 0\n" ++
+            "  br i1 %hw, label %wake, label %done\n" ++
+            "wake:\n" ++
+            "  store {s} 0, ptr %jwp, align {d}\n" ++
+            "  %not1 = icmp ne {s} %jw, 1\n" ++
+            "  br i1 %not1, label %clr_pk, label %push_w\n" ++
+            "clr_pk:\n" ++
+            "  %wp = inttoptr {s} %jw to ptr\n" ++
+            "  %wpp = getelementptr inbounds %_cx_task_node_t, ptr %wp, i32 0, i32 9\n" ++
+            "  store i8 0, ptr %wpp, align 1\n" ++
+            "  br label %push_w\n" ++
+            "push_w:\n" ++
+            "  call void @_cx_exec_push({s} %jw)\n" ++
+            "  br label %done\n" ++
+            "done:\n" ++
+            "  ret void\n" ++
+            "}}\n\n",
+        .{
+            fn_attrs,
+            total_ctx_save_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+        },
+    );
+    try emitter.print(
+        "define internal void @_cx_exec_step_task(ptr %tn) {s} {{\n" ++
+            "entry:\n" ++
+            "  %sctx = alloca [{d} x i8], align 16\n" ++
+            "  %pk_s = alloca i8, align 1\n" ++
+            "  %isn = icmp eq ptr %tn, null\n" ++
+            "  br i1 %isn, label %done, label %chk\n" ++
+            "chk:\n" ++
+            "  %cp = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 7\n" ++
+            "  %cv = load i8, ptr %cp, align 1\n" ++
+            "  %isd = icmp ne i8 %cv, 0\n" ++
+            "  br i1 %isd, label %done, label %step\n" ++
+            "step:\n" ++
+            "  %spoll = load {s}, ptr @_cx_active_poll_item, align {d}\n" ++
+            "  call void @_cx_ctx_save(ptr %sctx)\n" ++
+            "  %tctx = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 5\n" ++
+            "  call void @_cx_ctx_restore(ptr %tctx)\n" ++
+            "  %tni = ptrtoint ptr %tn to {s}\n" ++
+            "  store {s} %tni, ptr @_cx_active_poll_item, align {d}\n" ++
+            "  %pkp = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 9\n" ++
+            "  store i8 0, ptr %pkp, align 1\n" ++
+            "  store i8 0, ptr %pk_s, align 1\n" ++
+            "  %tfut = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 1\n" ++
+            "  %trbp = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 2\n" ++
+            "  %trb = load ptr, ptr %trbp, align {d}\n" ++
+            "  %rdy = call i32 @_cx_async_fut_poll(ptr %tfut, ptr %trb, ptr %pk_s)\n" ++
+            "  call void @_cx_ctx_save(ptr %tctx)\n" ++
+            "  store {s} %spoll, ptr @_cx_active_poll_item, align {d}\n" ++
+            "  call void @_cx_ctx_restore(ptr %sctx)\n" ++
+            "  %pend = icmp eq i32 %rdy, 0\n" ++
+            "  br i1 %pend, label %on_pend, label %on_rdy\n" ++
+            "on_pend:\n" ++
+            "  %pkv = load i8, ptr %pk_s, align 1\n" ++
+            "  store i8 %pkv, ptr %pkp, align 1\n" ++
+            "  %ispk = icmp ne i8 %pkv, 0\n" ++
+            "  br i1 %ispk, label %done, label %requeue\n" ++
+            "requeue:\n" ++
+            "  call void @_cx_exec_push({s} %tni)\n" ++
+            "  br label %done\n" ++
+            "on_rdy:\n" ++
+            "  store i8 1, ptr %cp, align 1\n" ++
+            "  %ecp = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 4\n" ++
+            "  %ecfn = load ptr, ptr %ecp, align {d}\n" ++
+            "  %hec = icmp ne ptr %ecfn, null\n" ++
+            "  %hrb = icmp ne ptr %trb, null\n" ++
+            "  %doec = and i1 %hec, %hrb\n" ++
+            "  br i1 %doec, label %chk_err, label %chk_wake\n" ++
+            "chk_err:\n" ++
+            "  %iserr = call i8 %ecfn(ptr %trb)\n" ++
+            "  %errnz = icmp ne i8 %iserr, 0\n" ++
+            "  br i1 %errnz, label %casc_err, label %chk_wake\n" ++
+            "casc_err:\n" ++
+            "  %tgrp = load ptr, ptr %tn, align {d}\n" ++
+            "  call void @_cx_async_group_cancel_all(ptr %tgrp)\n" ++
+            "  br label %chk_wake\n" ++
+            "chk_wake:\n" ++
+            "  %jwp = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 6\n" ++
+            "  %jw = load {s}, ptr %jwp, align {d}\n" ++
+            "  %hw = icmp ne {s} %jw, 0\n" ++
+            "  br i1 %hw, label %wake, label %done\n" ++
+            "wake:\n" ++
+            "  store {s} 0, ptr %jwp, align {d}\n" ++
+            "  %not1 = icmp ne {s} %jw, 1\n" ++
+            "  br i1 %not1, label %clr_pk, label %push_w\n" ++
+            "clr_pk:\n" ++
+            "  %wp = inttoptr {s} %jw to ptr\n" ++
+            "  %wpp = getelementptr inbounds %_cx_task_node_t, ptr %wp, i32 0, i32 9\n" ++
+            "  store i8 0, ptr %wpp, align 1\n" ++
+            "  br label %push_w\n" ++
+            "push_w:\n" ++
+            "  call void @_cx_exec_push({s} %jw)\n" ++
+            "  br label %done\n" ++
+            "done:\n" ++
+            "  ret void\n" ++
+            "}}\n\n",
+        .{
+            fn_attrs,
+            total_ctx_save_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_int,
+            ptr_bytes,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+        },
+    );
+
+    // `@_cx_async_group_enter`, `@_cx_async_spawn`, `@_cx_async_group_exit`, and `@_cx_async_block_on`:
+    const fut_raw_bytes: u64 = 4 * @as(u64, ptr_bytes);
+    try emitter.print(
+        "define internal ptr @_cx_async_group_enter() {s} {{\n" ++
+            "entry:\n" ++
+            "  %gep = getelementptr %_cx_task_group_t, ptr null, i32 1\n" ++
+            "  %gsz = ptrtoint ptr %gep to {s}\n" ++
+            "  %g = call ptr @calloc({s} 1, {s} %gsz)\n" ++
+            "  %oom = icmp eq ptr %g, null\n" ++
+            "  br i1 %oom, label %trap, label %ok\n" ++
+            "trap:\n" ++
+            "  call void @_cx_rt_trap(i32 0)\n" ++
+            "  unreachable\n" ++
+            "ok:\n" ++
+            "  ret ptr %g\n" ++
+            "}}\n\n" ++
+            "define internal ptr @_cx_async_spawn(ptr %grp, ptr %raw_fut, {s} %out_sz, ptr %echk) {s} {{\n" ++
+            "entry:\n" ++
+            "  %tgep = getelementptr %_cx_task_node_t, ptr null, i32 1\n" ++
+            "  %tsz = ptrtoint ptr %tgep to {s}\n" ++
+            "  %tn = call ptr @calloc({s} 1, {s} %tsz)\n" ++
+            "  %oom1 = icmp eq ptr %tn, null\n" ++
+            "  br i1 %oom1, label %trap, label %init_tn\n" ++
+            "trap:\n" ++
+            "  call void @_cx_rt_trap(i32 0)\n" ++
+            "  unreachable\n" ++
+            "init_tn:\n" ++
+            "  store ptr %grp, ptr %tn, align {d}\n" ++
+            "  %tfut = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 1\n" ++
+            "  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %tfut, ptr align 1 %raw_fut, i64 {d}, i1 false)\n" ++
+            "  %skp = getelementptr inbounds %_cx_fut_raw_t, ptr %raw_fut, i32 0, i32 1\n" ++
+            "  store {s} 0, ptr %skp, align 1\n" ++
+            "  store ptr null, ptr %raw_fut, align 1\n" ++
+            "  %tszp = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 3\n" ++
+            "  store {s} %out_sz, ptr %tszp, align {d}\n" ++
+            "  %hsz = icmp ne {s} %out_sz, 0\n" ++
+            "  br i1 %hsz, label %alloc_res, label %after_res\n" ++
+            "alloc_res:\n" ++
+            "  %rb = call ptr @calloc({s} 1, {s} %out_sz)\n" ++
+            "  %oom2 = icmp eq ptr %rb, null\n" ++
+            "  br i1 %oom2, label %trap, label %set_res\n" ++
+            "set_res:\n" ++
+            "  %trbp = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 2\n" ++
+            "  store ptr %rb, ptr %trbp, align {d}\n" ++
+            "  br label %after_res\n",
+        .{
+            fn_attrs,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+            fn_attrs,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+            ptr_bytes,
+            fut_raw_bytes,
+            ptr_int,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+            ptr_bytes,
+        },
+    );
+    try emitter.print(
+        "after_res:\n" ++
+            "  %tecp = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 4\n" ++
+            "  store ptr %echk, ptr %tecp, align {d}\n" ++
+            "  %tctx = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 5\n" ++
+            "  call void @_cx_ctx_save(ptr %tctx)\n" ++
+            "  %hgrp = icmp ne ptr %grp, null\n" ++
+            "  br i1 %hgrp, label %grp_add, label %enq\n" ++
+            "grp_add:\n" ++
+            "  %glp = getelementptr inbounds %_cx_task_group_t, ptr %grp, i32 0, i32 1\n" ++
+            "  %gcp = getelementptr inbounds %_cx_task_group_t, ptr %grp, i32 0, i32 2\n" ++
+            "  %glen = load {s}, ptr %glp, align {d}\n" ++
+            "  %gcap = load {s}, ptr %gcp, align {d}\n" ++
+            "  %gneed = icmp uge {s} %glen, %gcap\n" ++
+            "  br i1 %gneed, label %grp_grow, label %grp_push\n" ++
+            "grp_grow:\n" ++
+            "  %g0 = icmp eq {s} %gcap, 0\n" ++
+            "  %gdbl = mul {s} %gcap, 2\n" ++
+            "  %gnc = select i1 %g0, {s} 8, {s} %gdbl\n" ++
+            "  %gov1 = icmp ule {s} %gnc, %gcap\n" ++
+            "  %gov2 = icmp ugt {s} %gnc, {d}\n" ++
+            "  %gov = or i1 %gov1, %gov2\n" ++
+            "  br i1 %gov, label %trap, label %grp_realloc\n" ++
+            "grp_realloc:\n" ++
+            "  %gnb = mul {s} %gnc, {d}\n" ++
+            "  %gold = load ptr, ptr %grp, align {d}\n" ++
+            "  %gnew = call ptr @realloc(ptr %gold, {s} %gnb)\n" ++
+            "  %oom3 = icmp eq ptr %gnew, null\n" ++
+            "  br i1 %oom3, label %trap, label %grp_grown\n" ++
+            "grp_grown:\n" ++
+            "  store ptr %gnew, ptr %grp, align {d}\n" ++
+            "  store {s} %gnc, ptr %gcp, align {d}\n" ++
+            "  br label %grp_push\n" ++
+            "grp_push:\n" ++
+            "  %gtarr = load ptr, ptr %grp, align {d}\n" ++
+            "  %gtep = getelementptr inbounds ptr, ptr %gtarr, {s} %glen\n" ++
+            "  store ptr %tn, ptr %gtep, align {d}\n" ++
+            "  %nglen = add {s} %glen, 1\n" ++
+            "  store {s} %nglen, ptr %glp, align {d}\n" ++
+            "  br label %enq\n" ++
+            "enq:\n" ++
+            "  %tni = ptrtoint ptr %tn to {s}\n" ++
+            "  call void @_cx_exec_push({s} %tni)\n" ++
+            "  ret ptr %tn\n" ++
+            "}}\n\n",
+        .{
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+            ptr_int,
+            max_q_elems,
+            ptr_int,
+            ptr_bytes,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_int,
+        },
+    );
+    try emitter.print(
+        "define internal void @_cx_async_group_exit(ptr %grp, i8 %is_err) {s} {{\n" ++
+            "entry:\n" ++
+            "  %pend_s = alloca i8, align 1\n" ++
+            "  %prog_s = alloca i8, align 1\n" ++
+            "  %ti_s = alloca {s}, align {d}\n" ++
+            "  %qi_s = alloca {s}, align {d}\n" ++
+            "  %fi_s = alloca {s}, align {d}\n" ++
+            "  %gn = icmp eq ptr %grp, null\n" ++
+            "  br i1 %gn, label %done, label %chk_ex\n" ++
+            "chk_ex:\n" ++
+            "  %gexp = getelementptr inbounds %_cx_task_group_t, ptr %grp, i32 0, i32 4\n" ++
+            "  %gex = load i8, ptr %gexp, align 1\n" ++
+            "  %already = icmp ne i8 %gex, 0\n" ++
+            "  br i1 %already, label %done, label %chk_abort\n" ++
+            "chk_abort:\n" ++
+            "  %gcp = getelementptr inbounds %_cx_task_group_t, ptr %grp, i32 0, i32 3\n" ++
+            "  %gc = load i8, ptr %gcp, align 1\n" ++
+            "  %cc = load i8, ptr @_cx_coro_is_cancelling, align 1\n" ++
+            "  %o1 = or i8 %is_err, %cc\n" ++
+            "  %o2 = or i8 %o1, %gc\n" ++
+            "  %ab = icmp ne i8 %o2, 0\n" ++
+            "  br i1 %ab, label %do_abort, label %outer_loop\n" ++
+            "do_abort:\n" ++
+            "  call void @_cx_async_group_cancel_all(ptr %grp)\n" ++
+            "  br label %cleanup\n" ++
+            "outer_loop:\n" ++
+            "  store i8 0, ptr %pend_s, align 1\n" ++
+            "  store i8 0, ptr %prog_s, align 1\n" ++
+            "  store {s} 0, ptr %ti_s, align {d}\n" ++
+            "  br label %inner_loop\n" ++
+            "inner_loop:\n" ++
+            "  %ti = load {s}, ptr %ti_s, align {d}\n" ++
+            "  %glp = getelementptr inbounds %_cx_task_group_t, ptr %grp, i32 0, i32 1\n" ++
+            "  %glen = load {s}, ptr %glp, align {d}\n" ++
+            "  %ilt = icmp ult {s} %ti, %glen\n" ++
+            "  br i1 %ilt, label %inner_body, label %inner_end\n" ++
+            "inner_body:\n" ++
+            "  %gtarr = load ptr, ptr %grp, align {d}\n" ++
+            "  %tep = getelementptr inbounds ptr, ptr %gtarr, {s} %ti\n" ++
+            "  %tn = load ptr, ptr %tep, align {d}\n" ++
+            "  %tcp = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 7\n" ++
+            "  %tc = load i8, ptr %tcp, align 1\n" ++
+            "  %tdone = icmp ne i8 %tc, 0\n" ++
+            "  br i1 %tdone, label %inner_next, label %inner_pend\n" ++
+            "inner_pend:\n" ++
+            "  store i8 1, ptr %pend_s, align 1\n" ++
+            "  %tpkp = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 9\n" ++
+            "  %tpk = load i8, ptr %tpkp, align 1\n" ++
+            "  %ispk = icmp ne i8 %tpk, 0\n" ++
+            "  br i1 %ispk, label %inner_next, label %inner_step\n" ++
+            "inner_step:\n" ++
+            "  store i8 1, ptr %prog_s, align 1\n" ++
+            "  call void @_cx_exec_step_task(ptr %tn)\n" ++
+            "  %gc2 = load i8, ptr %gcp, align 1\n" ++
+            "  %isc2 = icmp ne i8 %gc2, 0\n" ++
+            "  br i1 %isc2, label %do_abort, label %inner_next\n" ++
+            "inner_next:\n" ++
+            "  %nti = add {s} %ti, 1\n" ++
+            "  store {s} %nti, ptr %ti_s, align {d}\n" ++
+            "  br label %inner_loop\n" ++
+            "inner_end:\n" ++
+            "  %pv = load i8, ptr %pend_s, align 1\n" ++
+            "  %hp = icmp ne i8 %pv, 0\n" ++
+            "  br i1 %hp, label %chk_prog, label %cleanup\n" ++
+            "chk_prog:\n" ++
+            "  %pgv = load i8, ptr %prog_s, align 1\n" ++
+            "  %hpg = icmp ne i8 %pgv, 0\n" ++
+            "  br i1 %hpg, label %outer_loop, label %outer_q_init\n",
+        .{
+            fn_attrs,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_int,
+            ptr_bytes,
+        },
+    );
+    try emitter.print(
+        "outer_q_init:\n" ++
+            "  store {s} 0, ptr %qi_s, align {d}\n" ++
+            "  br label %outer_q_loop\n" ++
+            "outer_q_loop:\n" ++
+            "  %oqi = load {s}, ptr %qi_s, align {d}\n" ++
+            "  %oqlen = load {s}, ptr @_cx_exec_q_len, align {d}\n" ++
+            "  %oqlt = icmp ult {s} %oqi, %oqlen\n" ++
+            "  br i1 %oqlt, label %outer_q_body, label %deadlock_trap\n" ++
+            "outer_q_body:\n" ++
+            "  %oqarr = load ptr, ptr @_cx_exec_q, align {d}\n" ++
+            "  %oqep = getelementptr inbounds {s}, ptr %oqarr, {s} %oqi\n" ++
+            "  %oqit = load {s}, ptr %oqep, align {d}\n" ++
+            "  %oqgt1 = icmp ugt {s} %oqit, 1\n" ++
+            "  %oact = load {s}, ptr @_cx_active_poll_item, align {d}\n" ++
+            "  %oqns = icmp ne {s} %oqit, %oact\n" ++
+            "  %oqok = and i1 %oqgt1, %oqns\n" ++
+            "  br i1 %oqok, label %outer_q_chk_tn, label %outer_q_next\n" ++
+            "outer_q_chk_tn:\n" ++
+            "  %otn = inttoptr {s} %oqit to ptr\n" ++
+            "  %otcp = getelementptr inbounds %_cx_task_node_t, ptr %otn, i32 0, i32 7\n" ++
+            "  %otpkp = getelementptr inbounds %_cx_task_node_t, ptr %otn, i32 0, i32 9\n" ++
+            "  %otc = load i8, ptr %otcp, align 1\n" ++
+            "  %otpk = load i8, ptr %otpkp, align 1\n" ++
+            "  %otany = or i8 %otc, %otpk\n" ++
+            "  %otrun = icmp eq i8 %otany, 0\n" ++
+            "  br i1 %otrun, label %outer_q_step, label %outer_q_next\n" ++
+            "outer_q_step:\n" ++
+            "  store {s} 0, ptr %oqep, align {d}\n" ++
+            "  call void @_cx_exec_step_task(ptr %otn)\n" ++
+            "  br label %outer_loop\n" ++
+            "outer_q_next:\n" ++
+            "  %noqi = add {s} %oqi, 1\n" ++
+            "  store {s} %noqi, ptr %qi_s, align {d}\n" ++
+            "  br label %outer_q_loop\n" ++
+            "deadlock_trap:\n" ++
+            "  call void @_cx_rt_trap(i32 0)\n" ++
+            "  unreachable\n",
+        .{
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_int,
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_int,
+            ptr_bytes, ptr_int,
+            ptr_int,   ptr_int,
+            ptr_bytes, ptr_int,
+            ptr_int,   ptr_bytes,
+        },
+    );
+    try emitter.print(
+        "cleanup:\n" ++
+            "  store i8 1, ptr %gexp, align 1\n" ++
+            "  store {s} 0, ptr %qi_s, align {d}\n" ++
+            "  br label %scrub_loop\n" ++
+            "scrub_loop:\n" ++
+            "  %sqi = load {s}, ptr %qi_s, align {d}\n" ++
+            "  %sqlen = load {s}, ptr @_cx_exec_q_len, align {d}\n" ++
+            "  %sqlt = icmp ult {s} %sqi, %sqlen\n" ++
+            "  br i1 %sqlt, label %scrub_body, label %free_tasks_init\n" ++
+            "scrub_body:\n" ++
+            "  %sqarr = load ptr, ptr @_cx_exec_q, align {d}\n" ++
+            "  %sqep = getelementptr inbounds {s}, ptr %sqarr, {s} %sqi\n" ++
+            "  %sqit = load {s}, ptr %sqep, align {d}\n" ++
+            "  %sqgt1 = icmp ugt {s} %sqit, 1\n" ++
+            "  br i1 %sqgt1, label %scrub_chk_grp, label %scrub_next\n" ++
+            "scrub_chk_grp:\n" ++
+            "  %stn = inttoptr {s} %sqit to ptr\n" ++
+            "  %stgrp = load ptr, ptr %stn, align {d}\n" ++
+            "  %same_g = icmp eq ptr %stgrp, %grp\n" ++
+            "  br i1 %same_g, label %scrub_zero, label %scrub_next\n" ++
+            "scrub_zero:\n" ++
+            "  store {s} 0, ptr %sqep, align {d}\n" ++
+            "  br label %scrub_next\n" ++
+            "scrub_next:\n" ++
+            "  %nsqi = add {s} %sqi, 1\n" ++
+            "  store {s} %nsqi, ptr %qi_s, align {d}\n" ++
+            "  br label %scrub_loop\n",
+        .{
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_int,
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_int,
+            ptr_bytes, ptr_int,
+            ptr_bytes, ptr_int,
+            ptr_int,   ptr_bytes,
+        },
+    );
+    try emitter.print(
+        "free_tasks_init:\n" ++
+            "  store {s} 0, ptr %fi_s, align {d}\n" ++
+            "  br label %free_tasks_loop\n" ++
+            "free_tasks_loop:\n" ++
+            "  %fi = load {s}, ptr %fi_s, align {d}\n" ++
+            "  %fglp = getelementptr inbounds %_cx_task_group_t, ptr %grp, i32 0, i32 1\n" ++
+            "  %fglen = load {s}, ptr %fglp, align {d}\n" ++
+            "  %filt = icmp ult {s} %fi, %fglen\n" ++
+            "  br i1 %filt, label %free_task_body, label %free_grp_arr\n" ++
+            "free_task_body:\n" ++
+            "  %fgtarr = load ptr, ptr %grp, align {d}\n" ++
+            "  %ftep = getelementptr inbounds ptr, ptr %fgtarr, {s} %fi\n" ++
+            "  %ftn = load ptr, ptr %ftep, align {d}\n" ++
+            "  %ftnn = icmp ne ptr %ftn, null\n" ++
+            "  br i1 %ftnn, label %free_tn_do, label %free_task_next\n" ++
+            "free_tn_do:\n" ++
+            "  %ftfut = getelementptr inbounds %_cx_task_node_t, ptr %ftn, i32 0, i32 1\n" ++
+            "  call void @_cx_async_fut_cancel(ptr %ftfut)\n" ++
+            "  %ftrbp = getelementptr inbounds %_cx_task_node_t, ptr %ftn, i32 0, i32 2\n" ++
+            "  %ftrb = load ptr, ptr %ftrbp, align {d}\n" ++
+            "  %fhrb = icmp ne ptr %ftrb, null\n" ++
+            "  br i1 %fhrb, label %free_tn_rb, label %free_tn_node\n" ++
+            "free_tn_rb:\n" ++
+            "  call void @free(ptr %ftrb)\n" ++
+            "  br label %free_tn_node\n" ++
+            "free_tn_node:\n" ++
+            "  call void @free(ptr %ftn)\n" ++
+            "  br label %free_task_next\n" ++
+            "free_task_next:\n" ++
+            "  %nfi = add {s} %fi, 1\n" ++
+            "  store {s} %nfi, ptr %fi_s, align {d}\n" ++
+            "  br label %free_tasks_loop\n" ++
+            "free_grp_arr:\n" ++
+            "  %fgarr = load ptr, ptr %grp, align {d}\n" ++
+            "  %fhgarr = icmp ne ptr %fgarr, null\n" ++
+            "  br i1 %fhgarr, label %free_grp_arr_do, label %free_grp_self\n" ++
+            "free_grp_arr_do:\n" ++
+            "  call void @free(ptr %fgarr)\n" ++
+            "  br label %free_grp_self\n" ++
+            "free_grp_self:\n" ++
+            "  call void @free(ptr %grp)\n" ++
+            "  br label %done\n" ++
+            "done:\n" ++
+            "  ret void\n" ++
+            "}}\n\n",
+        .{
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_bytes,
+            ptr_bytes, ptr_int,
+            ptr_int,   ptr_bytes,
+            ptr_bytes,
+        },
+    );
+    try emitter.print(
+        "define internal void @_cx_async_block_on(ptr %raw_fut, ptr %out_ptr) {s} {{\n" ++
+            "entry:\n" ++
+            "  %rf = alloca %_cx_fut_raw_t, align {d}\n" ++
+            "  %bctx = alloca [{d} x i8], align 16\n" ++
+            "  %rctx = alloca [{d} x i8], align 16\n" ++
+            "  %rpk = alloca i8, align 1\n" ++
+            "  %qh_s = alloca {s}, align {d}\n" ++
+            "  call void @llvm.memcpy.p0.p0.i64(ptr align {d} %rf, ptr align 1 %raw_fut, i64 {d}, i1 false)\n" ++
+            "  %skp = getelementptr inbounds %_cx_fut_raw_t, ptr %raw_fut, i32 0, i32 1\n" ++
+            "  store {s} 0, ptr %skp, align 1\n" ++
+            "  store ptr null, ptr %raw_fut, align 1\n" ++
+            "  %qbase = load {s}, ptr @_cx_exec_q_len, align {d}\n" ++
+            "  %spoll = load {s}, ptr @_cx_active_poll_item, align {d}\n" ++
+            "  call void @_cx_ctx_save(ptr %bctx)\n" ++
+            "  call void @_cx_ctx_save(ptr %rctx)\n" ++
+            "  store i8 0, ptr %rpk, align 1\n" ++
+            "  call void @_cx_exec_push({s} 1)\n" ++
+            "  store {s} %qbase, ptr %qh_s, align {d}\n" ++
+            "  br label %loop\n",
+        .{
+            fn_attrs,
+            ptr_bytes,
+            total_ctx_save_bytes,
+            total_ctx_save_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_bytes,
+            fut_raw_bytes,
+            ptr_int,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_bytes,
+            ptr_int,
+            ptr_int,
+            ptr_bytes,
+        },
+    );
+    try emitter.print(
+        "loop:\n" ++
+            "  %qh = load {s}, ptr %qh_s, align {d}\n" ++
+            "  %qlen = load {s}, ptr @_cx_exec_q_len, align {d}\n" ++
+            "  %empty = icmp uge {s} %qh, %qlen\n" ++
+            "  br i1 %empty, label %deadlock_root, label %chk_zero\n" ++
+            "chk_zero:\n" ++
+            "  %qarr = load ptr, ptr @_cx_exec_q, align {d}\n" ++
+            "  %qep = getelementptr inbounds {s}, ptr %qarr, {s} %qh\n" ++
+            "  %it = load {s}, ptr %qep, align {d}\n" ++
+            "  %isz0 = icmp eq {s} %it, 0\n" ++
+            "  br i1 %isz0, label %skip_zero, label %pop\n" ++
+            "skip_zero:\n" ++
+            "  %zqh = add {s} %qh, 1\n" ++
+            "  store {s} %zqh, ptr %qh_s, align {d}\n" ++
+            "  br label %loop\n" ++
+            "deadlock_root:\n" ++
+            "  call void @_cx_rt_trap(i32 0)\n" ++
+            "  unreachable\n" ++
+            "pop:\n" ++
+            "  store {s} 0, ptr %qep, align {d}\n" ++
+            "  %nqh = add {s} %qh, 1\n" ++
+            "  %at_end = icmp eq {s} %nqh, %qlen\n" ++
+            "  br i1 %at_end, label %reset_q, label %adv_q\n" ++
+            "reset_q:\n" ++
+            "  store {s} %qbase, ptr %qh_s, align {d}\n" ++
+            "  store {s} %qbase, ptr @_cx_exec_q_len, align {d}\n" ++
+            "  br label %dispatch\n" ++
+            "adv_q:\n" ++
+            "  store {s} %nqh, ptr %qh_s, align {d}\n" ++
+            "  br label %dispatch\n" ++
+            "dispatch:\n" ++
+            "  %isr = icmp eq {s} %it, 1\n" ++
+            "  br i1 %isr, label %poll_root, label %step_task\n",
+        .{
+            ptr_int, ptr_bytes,
+            ptr_int, ptr_bytes,
+            ptr_int, ptr_bytes,
+            ptr_int, ptr_int,
+            ptr_int, ptr_bytes,
+            ptr_int, ptr_int,
+            ptr_int, ptr_bytes,
+            ptr_int, ptr_bytes,
+            ptr_int, ptr_int,
+            ptr_int, ptr_bytes,
+            ptr_int, ptr_bytes,
+            ptr_int, ptr_bytes,
+            ptr_int,
+        },
+    );
+    try emitter.print(
+        "poll_root:\n" ++
+            "  call void @_cx_ctx_restore(ptr %rctx)\n" ++
+            "  store {s} 1, ptr @_cx_active_poll_item, align {d}\n" ++
+            "  store i8 0, ptr %rpk, align 1\n" ++
+            "  %rdone = call i32 @_cx_async_fut_poll(ptr %rf, ptr %out_ptr, ptr %rpk)\n" ++
+            "  call void @_cx_ctx_save(ptr %rctx)\n" ++
+            "  call void @_cx_ctx_restore(ptr %bctx)\n" ++
+            "  %isfin = icmp ne i32 %rdone, 0\n" ++
+            "  br i1 %isfin, label %finish, label %root_pend\n" ++
+            "root_pend:\n" ++
+            "  %pkv = load i8, ptr %rpk, align 1\n" ++
+            "  %ispk = icmp ne i8 %pkv, 0\n" ++
+            "  br i1 %ispk, label %loop, label %enq_root\n" ++
+            "enq_root:\n" ++
+            "  call void @_cx_exec_push({s} 1)\n" ++
+            "  br label %loop\n" ++
+            "step_task:\n" ++
+            "  %tnp = inttoptr {s} %it to ptr\n" ++
+            "  call void @_cx_exec_step_task(ptr %tnp)\n" ++
+            "  call void @_cx_ctx_restore(ptr %bctx)\n" ++
+            "  br label %loop\n" ++
+            "finish:\n" ++
+            "  call void @_cx_ctx_restore(ptr %rctx)\n" ++
+            "  store {s} %spoll, ptr @_cx_active_poll_item, align {d}\n" ++
+            "  store {s} %qbase, ptr @_cx_exec_q_len, align {d}\n" ++
+            "  %qb0 = icmp eq {s} %qbase, 0\n" ++
+            "  %fqarr = load ptr, ptr @_cx_exec_q, align {d}\n" ++
+            "  %fqnn = icmp ne ptr %fqarr, null\n" ++
+            "  %dofq = and i1 %qb0, %fqnn\n" ++
+            "  br i1 %dofq, label %free_q, label %ret_blk\n" ++
+            "free_q:\n" ++
+            "  call void @free(ptr %fqarr)\n" ++
+            "  store ptr null, ptr @_cx_exec_q, align {d}\n" ++
+            "  store {s} 0, ptr @_cx_exec_q_cap, align {d}\n" ++
+            "  br label %ret_blk\n" ++
+            "ret_blk:\n" ++
+            "  ret void\n" ++
+            "}}\n\n",
+        .{
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_int,
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_bytes,
+            ptr_bytes, ptr_int,
+            ptr_bytes,
+        },
+    );
+}
+
+/// Emits external `declare` prototypes and `external global` symbols for all referenced `extern` FFI symbols.
 fn emitExternDeclarations(emitter: *LlvmModuleEmitter) !void {
     var emitted_decls: usize = 0;
     for (emitter.extern_syms.items) |sym_idx| {
         const sym_rec = emitter.input.sym_table.getSymbol(sym_idx).*;
         const sig_view = emitter.input.pool.getFnSignatureView(sym_rec.type_id) orelse continue;
-        const ext_name = if (sym_rec.contract_flags.has_link_name and sym_rec.link_name_text.len > 0)
-            sym_rec.link_name_text
-        else
-            sym_rec.name_text;
+        const ffi_meta = extractSymFfiMetaLlvm(emitter, sym_idx);
+        const ext_name = if (ffi_meta.link_name.len > 0) ffi_meta.link_name else sym_rec.name_text;
 
         if (!(try emitter.markExternDeclared(ext_name))) continue;
 
@@ -2580,17 +3978,53 @@ fn emitExternDeclarations(emitter: *LlvmModuleEmitter) !void {
             if (param_count_emitted > 0) try emitter.writeAll(", ...");
             if (param_count_emitted == 0) try emitter.writeAll("...");
         }
-        if (emitter.cfg.target.os == .wasi and WASI_PREVIEW1_IMPORT_SET.has(ext_name)) {
-            const esc_imp = try escapeMetadataStringAlloc(emitter.allocator, ext_name);
-            defer emitter.allocator.free(esc_imp);
-            try emitter.print(
-                ") nounwind \"wasm-import-module\"=\"wasi_snapshot_preview1\" " ++
-                    "\"wasm-import-name\"=\"{s}\"\n",
-                .{esc_imp},
-            );
+        if (emitter.cfg.target.isWasm()) {
+            const is_wasi_import = emitter.cfg.target.os == .wasi and WASI_PREVIEW1_IMPORT_SET.has(ext_name);
+            const has_explicit_wasm = ffi_meta.wasm_import_module.len > 0 or ffi_meta.wasm_import_name.len > 0;
+            if (has_explicit_wasm or is_wasi_import or emitter.cfg.target.isFreestanding()) {
+                const mod_raw = if (ffi_meta.wasm_import_module.len > 0)
+                    ffi_meta.wasm_import_module
+                else if (is_wasi_import)
+                    "wasi_snapshot_preview1"
+                else
+                    "env";
+                const imp_raw = if (ffi_meta.wasm_import_name.len > 0) ffi_meta.wasm_import_name else ext_name;
+                const esc_mod = try escapeMetadataStringAlloc(emitter.allocator, mod_raw);
+                defer emitter.allocator.free(esc_mod);
+                const esc_imp = try escapeMetadataStringAlloc(emitter.allocator, imp_raw);
+                defer emitter.allocator.free(esc_imp);
+                try emitter.print(
+                    ") nounwind \"wasm-import-module\"=\"{s}\" \"wasm-import-name\"=\"{s}\"\n",
+                    .{ esc_mod, esc_imp },
+                );
+            } else {
+                try emitter.writeAll(") nounwind\n");
+            }
         } else {
             try emitter.writeAll(") nounwind\n");
         }
+        emitted_decls += 1;
+    }
+
+    for (emitter.extern_global_syms.items) |glob_sym_idx| {
+        const glob_rec = emitter.input.sym_table.getSymbol(glob_sym_idx).*;
+        const ffi_meta = extractSymFfiMetaLlvm(emitter, glob_sym_idx);
+        const ext_name = if (ffi_meta.link_name.len > 0) ffi_meta.link_name else glob_rec.name_text;
+        if (!(try emitter.markExternDeclared(ext_name))) continue;
+
+        const ext_ident = try formatLlvmGlobalIdent(emitter.allocator, ext_name);
+        defer emitter.allocator.free(ext_ident);
+        const mem_ty = if (try isZeroSizedType(emitter, glob_rec.type_id))
+            try emitter.allocator.dupe(u8, "i8")
+        else
+            try formatLlvmMemoryType(emitter, glob_rec.type_id);
+        defer emitter.allocator.free(mem_ty);
+        const glob_lay = try emitter.resolver.resolveType(glob_rec.type_id);
+        const tls_kw = if (ffi_meta.is_thread_local) "thread_local " else "";
+        try emitter.print(
+            "{s} = external {s}global {s}, align {d}\n",
+            .{ ext_ident, tls_kw, mem_ty, glob_lay.alignBytes() },
+        );
         emitted_decls += 1;
     }
     if (emitted_decls > 0) try emitter.writeAll("\n");
@@ -4994,6 +6428,11 @@ fn emitDropHelpersAndClosureThunks(emitter: *LlvmModuleEmitter) !void {
                     );
                 }
             },
+            .future_ty => {
+                if (emitter.has_async_ops and !emitter.cfg.target.isFreestanding()) {
+                    try state.writeAll("  call void @_cx_async_fut_cancel(ptr %_self_ptr)\n");
+                }
+            },
             else => {},
         }
 
@@ -6177,7 +7616,7 @@ fn lowerPlaceLlvm(
                 const idx_ssa = try coerceIndexToPtrInt(emitter, state, body, proj.payload);
                 defer emitter.allocator.free(idx_ssa);
                 const t_id = state.nextTmp();
-                if (cur_ty == .str_ty or node.tag == .slice_ty) {
+                if (cur_ty == .str_ty or node.tag == .slice_ty or node.tag == .raw_ptr_ty) {
                     const hdr_align = @min(@max(cur_align, 1), emitter.cfg.target.ptrBytes());
                     try state.print(
                         "  %_sl_dp_{d} = load ptr, ptr {s}, align {d}\n" ++
@@ -7542,16 +8981,49 @@ fn emitMirInstLlvm(
                 }
             } else if (!sym_idx.isNone() and sym_idx.asInt() < emitter.input.sym_table.symbols.items.len) {
                 const sym_rec = emitter.input.sym_table.getSymbol(sym_idx).*;
-                const ext_name = if (sym_rec.contract_flags.has_link_name and sym_rec.link_name_text.len > 0)
-                    sym_rec.link_name_text
-                else
-                    sym_rec.name_text;
+                const ffi_meta = extractSymFfiMetaLlvm(emitter, sym_idx);
+                const ext_name = if (ffi_meta.link_name.len > 0) ffi_meta.link_name else sym_rec.name_text;
                 const ext_ident = try formatLlvmGlobalIdent(emitter.allocator, ext_name);
                 defer emitter.allocator.free(ext_ident);
-                try state.print(
-                    "  %_v_{d} = select i1 true, ptr {s}, ptr {s}\n",
-                    .{ dst_raw, ext_ident, ext_ident },
-                );
+                if (emitter.extern_global_sym_set.contains(sym_idx.asInt())) {
+                    const sym_ty = try unwrapTransparentType(emitter, sym_rec.type_id);
+                    const inst_ty = try unwrapTransparentType(emitter, inst.type_id);
+                    if (inst_ty == sym_ty) {
+                        if (try isZeroSizedType(emitter, inst.type_id)) {
+                            try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+                        } else {
+                            const glob_lay = try emitter.resolver.resolveType(sym_ty);
+                            const loaded_s = try emitLoadValueFromPtr(
+                                emitter,
+                                state,
+                                inst.type_id,
+                                ext_ident,
+                                glob_lay.alignBytes(),
+                                null,
+                                0,
+                                0,
+                                0,
+                            );
+                            defer emitter.allocator.free(loaded_s);
+                            const val_ty = try formatLlvmValueType(emitter, inst.type_id);
+                            defer emitter.allocator.free(val_ty);
+                            try state.print(
+                                "  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n",
+                                .{ dst_raw, val_ty, loaded_s, val_ty, loaded_s },
+                            );
+                        }
+                    } else {
+                        try state.print(
+                            "  %_v_{d} = select i1 true, ptr {s}, ptr {s}\n",
+                            .{ dst_raw, ext_ident, ext_ident },
+                        );
+                    }
+                } else {
+                    try state.print(
+                        "  %_v_{d} = select i1 true, ptr {s}, ptr {s}\n",
+                        .{ dst_raw, ext_ident, ext_ident },
+                    );
+                }
             } else {
                 try state.print(
                     "  %_v_{d} = select i1 true, ptr inttoptr ({s} 1 to ptr), ptr null\n",
@@ -12035,6 +13507,13 @@ fn emitIntrinsicOpLlvm(
         },
 
         .panic => {
+            if (emitter.cfg.target.isFreestanding() or
+                (emitter.is_in_c_abi_body and !emitter.input.is_oracle_trace_enabled))
+            {
+                try state.writeAll("  call void @llvm.trap()\n");
+                try emitUnreachableAndDeadBlock(emitter, state, dst_raw);
+                return;
+            }
             if (args.len >= 1) {
                 const msg_ty = try unwrapTransparentType(
                     emitter,
@@ -12074,7 +13553,13 @@ fn emitIntrinsicOpLlvm(
         },
 
         .trap => {
-            try state.writeAll("  call void @_cx_rt_trap(i32 0)\n");
+            if (emitter.cfg.target.isFreestanding() or
+                (emitter.is_in_c_abi_body and !emitter.input.is_oracle_trace_enabled))
+            {
+                try state.writeAll("  call void @llvm.trap()\n");
+            } else {
+                try state.writeAll("  call void @_cx_rt_trap(i32 0)\n");
+            }
             try emitUnreachableAndDeadBlock(emitter, state, dst_raw);
         },
 
@@ -12286,8 +13771,9 @@ fn emitIntrinsicOpLlvm(
                 const snap_ptr = try state.allocEntryBytes(@max(ctx_lay.size_bytes, 1), ctx_lay.alignBytes());
                 defer emitter.allocator.free(snap_ptr);
                 try emitMemsetZero(emitter, state, snap_ptr, ctx_lay.size_bytes, ctx_lay.alignBytes());
+                const ctx_stride: u64 = emitter.cfg.target.ptrBytes();
                 var decl_ord: u32 = 0;
-                while (decl_ord < ctx_lay.aux_len and decl_ord < 8) : (decl_ord += 1) {
+                while (decl_ord < ctx_lay.aux_len and decl_ord < 10) : (decl_ord += 1) {
                     const fld = emitter.resolver.fields_by_decl.items[ctx_lay.aux_start + decl_ord];
                     if (fld.size_bytes == 0) continue;
                     const dst_fld_ptr = if (fld.byte_offset == 0)
@@ -12302,19 +13788,27 @@ fn emitIntrinsicOpLlvm(
                     };
                     defer emitter.allocator.free(dst_fld_ptr);
                     const dst_fld_align = effectiveOffsetAlign(fld.byte_offset, ctx_lay.alignBytes());
-                    if (fld.size_bytes <= 8) {
+                    if (fld.size_bytes <= ctx_stride) {
                         const src_slot_ptr = if (decl_ord == 0)
                             try emitter.allocator.dupe(u8, "@_cx_default_ctx")
                         else blk_src_gep: {
                             const src_tmp = state.nextTmp();
                             try state.print(
                                 "  %_cgs_src_{d} = getelementptr inbounds i8, ptr @_cx_default_ctx, {s} {d}\n",
-                                .{ src_tmp, ptr_int, @as(u64, decl_ord) * 8 },
+                                .{ src_tmp, ptr_int, @as(u64, decl_ord) * ctx_stride },
                             );
                             break :blk_src_gep try std.fmt.allocPrint(emitter.allocator, "%_cgs_src_{d}", .{src_tmp});
                         };
                         defer emitter.allocator.free(src_slot_ptr);
-                        try emitMemcpyBytes(emitter, state, dst_fld_ptr, dst_fld_align, src_slot_ptr, 8, fld.size_bytes);
+                        try emitMemcpyBytes(
+                            emitter,
+                            state,
+                            dst_fld_ptr,
+                            dst_fld_align,
+                            src_slot_ptr,
+                            emitter.cfg.target.ptrBytes(),
+                            fld.size_bytes,
+                        );
                     } else if (emitter.ctx_wide_slot_sizes[decl_ord] >= fld.size_bytes) {
                         const wide_src_ptr = try std.fmt.allocPrint(emitter.allocator, "@_cx_ctx_wide_{d}", .{decl_ord});
                         defer emitter.allocator.free(wide_src_ptr);
@@ -12336,13 +13830,14 @@ fn emitIntrinsicOpLlvm(
                 return;
             }
             const dst_lay = try emitter.resolver.resolveType(dst_ty);
-            var slot_align: u32 = 8;
-            const slot_ptr_ssa: []u8 = if (dst_lay.size_bytes > 8) blk_wide: {
+            const ctx_stride: u64 = emitter.cfg.target.ptrBytes();
+            var slot_align: u32 = emitter.cfg.target.ptrBytes();
+            const slot_ptr_ssa: []u8 = if (dst_lay.size_bytes > ctx_stride) blk_wide: {
                 var ord_u: usize = 0;
                 const ord_inst = body.getInst(MirValueId.fromInt(args[0]));
                 if (ord_inst.op == .const_scalar and ord_inst.operands.lhs < body.consts.items.len) {
                     switch (body.consts.items[ord_inst.operands.lhs]) {
-                        .int_val => |iv| ord_u = @intCast(@as(u128, @bitCast(iv)) & 7),
+                        .int_val => |iv| ord_u = @intCast(@as(u128, @bitCast(iv)) % 10),
                         else => {},
                     }
                 }
@@ -12353,10 +13848,10 @@ fn emitIntrinsicOpLlvm(
                 defer emitter.allocator.free(ord_ssa);
                 const tmp_id = state.nextTmp();
                 try state.print(
-                    "  %_cg_msk_{d} = and {s} {s}, 7\n" ++
-                        "  %_cg_off_{d} = mul {s} %_cg_msk_{d}, 8\n" ++
+                    "  %_cg_msk_{d} = urem {s} {s}, 10\n" ++
+                        "  %_cg_off_{d} = mul {s} %_cg_msk_{d}, {d}\n" ++
                         "  %_cg_ptr_{d} = getelementptr inbounds i8, ptr @_cx_default_ctx, {s} %_cg_off_{d}\n",
-                    .{ tmp_id, ptr_int, ord_ssa, tmp_id, ptr_int, tmp_id, tmp_id, ptr_int, tmp_id },
+                    .{ tmp_id, ptr_int, ord_ssa, tmp_id, ptr_int, tmp_id, ctx_stride, tmp_id, ptr_int, tmp_id },
                 );
                 break :blk_inline try std.fmt.allocPrint(emitter.allocator, "%_cg_ptr_{d}", .{tmp_id});
             };
@@ -12387,13 +13882,14 @@ fn emitIntrinsicOpLlvm(
                 const val_ty = try unwrapTransparentType(emitter, body.getInst(MirValueId.fromInt(args[1])).type_id);
                 if (!(try isZeroSizedType(emitter, val_ty))) {
                     const val_lay = try emitter.resolver.resolveType(val_ty);
-                    var slot_align: u32 = 8;
-                    const slot_ptr_ssa: []u8 = if (val_lay.size_bytes > 8) blk_wide: {
+                    const ctx_stride: u64 = emitter.cfg.target.ptrBytes();
+                    var slot_align: u32 = emitter.cfg.target.ptrBytes();
+                    const slot_ptr_ssa: []u8 = if (val_lay.size_bytes > ctx_stride) blk_wide: {
                         var ord_u: usize = 0;
                         const ord_inst = body.getInst(MirValueId.fromInt(args[0]));
                         if (ord_inst.op == .const_scalar and ord_inst.operands.lhs < body.consts.items.len) {
                             switch (body.consts.items[ord_inst.operands.lhs]) {
-                                .int_val => |iv| ord_u = @intCast(@as(u128, @bitCast(iv)) & 7),
+                                .int_val => |iv| ord_u = @intCast(@as(u128, @bitCast(iv)) % 10),
                                 else => {},
                             }
                         }
@@ -12404,10 +13900,10 @@ fn emitIntrinsicOpLlvm(
                         defer emitter.allocator.free(ord_ssa);
                         const tmp_id = state.nextTmp();
                         try state.print(
-                            "  %_cs_msk_{d} = and {s} {s}, 7\n" ++
-                                "  %_cs_off_{d} = mul {s} %_cs_msk_{d}, 8\n" ++
+                            "  %_cs_msk_{d} = urem {s} {s}, 10\n" ++
+                                "  %_cs_off_{d} = mul {s} %_cs_msk_{d}, {d}\n" ++
                                 "  %_cs_ptr_{d} = getelementptr inbounds i8, ptr @_cx_default_ctx, {s} %_cs_off_{d}\n",
-                            .{ tmp_id, ptr_int, ord_ssa, tmp_id, ptr_int, tmp_id, tmp_id, ptr_int, tmp_id },
+                            .{ tmp_id, ptr_int, ord_ssa, tmp_id, ptr_int, tmp_id, ctx_stride, tmp_id, ptr_int, tmp_id },
                         );
                         break :blk_inline try std.fmt.allocPrint(emitter.allocator, "%_cs_ptr_{d}", .{tmp_id});
                     };
@@ -12477,7 +13973,631 @@ fn emitIntrinsicOpLlvm(
                 );
             }
         },
+
+        .async_future_make => {
+            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops or args.len < 3) {
+                const val_ty = try formatLlvmValueType(emitter, inst.type_id);
+                defer emitter.allocator.free(val_ty);
+                const zero_s = resolveZeroLiteralForLlvmType(val_ty);
+                try state.print("  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n", .{ dst_raw, val_ty, zero_s, val_ty, zero_s });
+            } else {
+                try emitAsyncFutureMakeLlvm(emitter, state, body, dst_raw, inst.type_id, args);
+            }
+        },
+
+        .async_task_group_enter => {
+            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops) {
+                try state.print("  %_v_{d} = select i1 true, ptr null, ptr null\n", .{dst_raw});
+            } else {
+                try state.print("  %_v_{d} = call ptr @_cx_async_group_enter()\n", .{dst_raw});
+            }
+        },
+
+        .async_spawn => {
+            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops or args.len < 3) {
+                try state.print("  %_v_{d} = select i1 true, ptr null, ptr null\n", .{dst_raw});
+            } else {
+                const fut_ty = try unwrapTransparentType(
+                    emitter,
+                    body.getInst(MirValueId.fromInt(args[2])).type_id,
+                );
+                const fut_lay = try emitter.resolver.resolveType(fut_ty);
+                const fut_slot = try state.allocEntryBytes(fut_lay.size_bytes, fut_lay.alignBytes());
+                defer emitter.allocator.free(fut_slot);
+                try emitMemsetZero(emitter, state, fut_slot, fut_lay.size_bytes, fut_lay.alignBytes());
+                const fut_ssa = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[2]});
+                defer emitter.allocator.free(fut_ssa);
+                try emitStoreValueToPtr(emitter, state, fut_ty, fut_ssa, fut_slot, fut_lay.alignBytes(), 0, 0, 0);
+
+                const out_ty = emitter.input.pool.unwrapUnderlyingType(
+                    emitter.input.pool.getFutureOutputType(fut_ty) orelse .unit_ty,
+                );
+                const out_lay = try emitter.resolver.resolveType(out_ty);
+                const err_fn_s = if (emitter.res_err_check_set.contains(out_ty.toU32()))
+                    try std.fmt.allocPrint(emitter.allocator, "@_cx_res_is_err_{d}", .{out_ty.toU32()})
+                else
+                    try emitter.allocator.dupe(u8, "null");
+                defer emitter.allocator.free(err_fn_s);
+
+                const tmp_id = state.nextTmp();
+                try state.print(
+                    "  %_sp_gp_{d} = load ptr, ptr %_v_{d}, align 1\n" ++
+                        "  %_v_{d} = call ptr @_cx_async_spawn(ptr %_sp_gp_{d}, ptr {s}, {s} {d}, ptr {s})\n",
+                    .{ tmp_id, args[1], dst_raw, tmp_id, fut_slot, ptr_int, out_lay.size_bytes, err_fn_s },
+                );
+            }
+        },
+
+        .async_join => {
+            const fut_ty = try unwrapTransparentType(emitter, inst.type_id);
+            const fut_lay = try emitter.resolver.resolveType(fut_ty);
+            const fut_slot = try state.allocEntryBytes(fut_lay.size_bytes, fut_lay.alignBytes());
+            defer emitter.allocator.free(fut_slot);
+            try emitMemsetZero(emitter, state, fut_slot, fut_lay.size_bytes, fut_lay.alignBytes());
+            if (!emitter.cfg.target.isFreestanding() and emitter.has_async_ops and args.len >= 1) {
+                const out_ty = emitter.input.pool.getFutureOutputType(fut_ty) orelse .unit_ty;
+                const out_lay = try emitter.resolver.resolveType(out_ty);
+                const tmp_id = state.nextTmp();
+                try state.print(
+                    "  store ptr %_v_{d}, ptr {s}, align 1\n" ++
+                        "  %_aj_kp_{d} = getelementptr inbounds %_cx_fut_raw_t, ptr {s}, i32 0, i32 1\n" ++
+                        "  %_aj_sp_{d} = getelementptr inbounds %_cx_fut_raw_t, ptr {s}, i32 0, i32 3\n" ++
+                        "  store {s} 3, ptr %_aj_kp_{d}, align 1\n" ++
+                        "  store {s} {d}, ptr %_aj_sp_{d}, align 1\n",
+                    .{ args[0], fut_slot, tmp_id, fut_slot, tmp_id, fut_slot, ptr_int, tmp_id, ptr_int, out_lay.size_bytes, tmp_id },
+                );
+            }
+            const loaded = try emitLoadValueFromPtr(emitter, state, fut_ty, fut_slot, fut_lay.alignBytes(), null, 0, 0, 0);
+            defer emitter.allocator.free(loaded);
+            const val_ty = try formatLlvmValueType(emitter, fut_ty);
+            defer emitter.allocator.free(val_ty);
+            try state.print("  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n", .{ dst_raw, val_ty, loaded, val_ty, loaded });
+        },
+
+        .async_cancel => {
+            const dst_ty = try unwrapTransparentType(emitter, inst.type_id);
+            if (args.len >= 2 or dst_ty == .bool_ty) {
+                if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops or args.len < 1) {
+                    try state.print("  %_v_{d} = select i1 true, i1 false, i1 false\n", .{dst_raw});
+                } else {
+                    const tmp_id = state.nextTmp();
+                    const prev_lbl = try emitter.allocator.dupe(u8, state.cur_label);
+                    defer emitter.allocator.free(prev_lbl);
+                    try state.print(
+                        "  %_ac_gp_{d} = load ptr, ptr %_v_{d}, align 1\n" ++
+                            "  %_ac_hn_{d} = icmp ne ptr %_ac_gp_{d}, null\n" ++
+                            "  br i1 %_ac_hn_{d}, label %_ac_ld_{d}, label %_ac_jn_{d}\n" ++
+                            "_ac_ld_{d}:\n" ++
+                            "  %_ac_cp_{d} = getelementptr inbounds %_cx_task_group_t, ptr %_ac_gp_{d}, i32 0, i32 3\n" ++
+                            "  %_ac_cv_{d} = load i8, ptr %_ac_cp_{d}, align 1\n" ++
+                            "  %_ac_b_{d} = icmp ne i8 %_ac_cv_{d}, 0\n" ++
+                            "  br label %_ac_jn_{d}\n" ++
+                            "_ac_jn_{d}:\n" ++
+                            "  %_v_{d} = phi i1 [ %_ac_b_{d}, %_ac_ld_{d} ], [ false, %{s} ]\n",
+                        .{
+                            tmp_id,  args[0], tmp_id, tmp_id,   tmp_id, tmp_id, tmp_id, tmp_id,
+                            tmp_id,  tmp_id,  tmp_id, tmp_id,   tmp_id, tmp_id, tmp_id, tmp_id,
+                            dst_raw, tmp_id,  tmp_id, prev_lbl,
+                        },
+                    );
+                    state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_ac_jn_{d}", .{tmp_id}));
+                }
+            } else if (emitter.input.pool.isFutureType(dst_ty)) {
+                const fut_lay = try emitter.resolver.resolveType(dst_ty);
+                const fut_slot = try state.allocEntryBytes(fut_lay.size_bytes, fut_lay.alignBytes());
+                defer emitter.allocator.free(fut_slot);
+                try emitMemsetZero(emitter, state, fut_slot, fut_lay.size_bytes, fut_lay.alignBytes());
+                if (!emitter.cfg.target.isFreestanding() and emitter.has_async_ops and args.len >= 1) {
+                    const tmp_id = state.nextTmp();
+                    try state.print(
+                        "  store ptr %_v_{d}, ptr {s}, align 1\n" ++
+                            "  %_ac_kp_{d} = getelementptr inbounds %_cx_fut_raw_t, ptr {s}, i32 0, i32 1\n" ++
+                            "  store {s} 4, ptr %_ac_kp_{d}, align 1\n",
+                        .{ args[0], fut_slot, tmp_id, fut_slot, ptr_int, tmp_id },
+                    );
+                }
+                const loaded = try emitLoadValueFromPtr(emitter, state, dst_ty, fut_slot, fut_lay.alignBytes(), null, 0, 0, 0);
+                defer emitter.allocator.free(loaded);
+                const val_ty = try formatLlvmValueType(emitter, dst_ty);
+                defer emitter.allocator.free(val_ty);
+                try state.print("  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n", .{ dst_raw, val_ty, loaded, val_ty, loaded });
+            } else {
+                if (!emitter.cfg.target.isFreestanding() and emitter.has_async_ops and args.len >= 1) {
+                    const tmp_id = state.nextTmp();
+                    try state.print(
+                        "  %_ac_ca_{d} = load ptr, ptr %_v_{d}, align 1\n" ++
+                            "  call void @_cx_async_group_cancel_all(ptr %_ac_ca_{d})\n",
+                        .{ tmp_id, args[0], tmp_id },
+                    );
+                }
+                try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+            }
+        },
+
+        .async_task_group_exit => {
+            if (!emitter.cfg.target.isFreestanding() and emitter.has_async_ops and args.len >= 1) {
+                try emitAsyncTaskGroupExitLlvm(emitter, state, body, bb_idx, args[0]);
+            }
+            try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+        },
+
+        .async_yield => {
+            const fut_ty = try unwrapTransparentType(emitter, inst.type_id);
+            const fut_lay = try emitter.resolver.resolveType(fut_ty);
+            const fut_slot = try state.allocEntryBytes(fut_lay.size_bytes, fut_lay.alignBytes());
+            defer emitter.allocator.free(fut_slot);
+            try emitMemsetZero(emitter, state, fut_slot, fut_lay.size_bytes, fut_lay.alignBytes());
+            if (!emitter.cfg.target.isFreestanding() and emitter.has_async_ops) {
+                const tmp_id = state.nextTmp();
+                try state.print(
+                    "  %_ay_kp_{d} = getelementptr inbounds %_cx_fut_raw_t, ptr {s}, i32 0, i32 1\n" ++
+                        "  store {s} 2, ptr %_ay_kp_{d}, align 1\n",
+                    .{ tmp_id, fut_slot, ptr_int, tmp_id },
+                );
+            }
+            const loaded = try emitLoadValueFromPtr(emitter, state, fut_ty, fut_slot, fut_lay.alignBytes(), null, 0, 0, 0);
+            defer emitter.allocator.free(loaded);
+            const val_ty = try formatLlvmValueType(emitter, fut_ty);
+            defer emitter.allocator.free(val_ty);
+            try state.print("  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n", .{ dst_raw, val_ty, loaded, val_ty, loaded });
+        },
+
+        .async_block_on => {
+            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops or args.len < 1) {
+                if (try isZeroSizedType(emitter, inst.type_id)) {
+                    try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+                } else {
+                    const val_ty = try formatLlvmValueType(emitter, inst.type_id);
+                    defer emitter.allocator.free(val_ty);
+                    const zero_s = resolveZeroLiteralForLlvmType(val_ty);
+                    try state.print("  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n", .{ dst_raw, val_ty, zero_s, val_ty, zero_s });
+                }
+            } else {
+                const fut_ty = try unwrapTransparentType(
+                    emitter,
+                    body.getInst(MirValueId.fromInt(args[0])).type_id,
+                );
+                const fut_lay = try emitter.resolver.resolveType(fut_ty);
+                const fut_slot = try state.allocEntryBytes(fut_lay.size_bytes, fut_lay.alignBytes());
+                defer emitter.allocator.free(fut_slot);
+                try emitMemsetZero(emitter, state, fut_slot, fut_lay.size_bytes, fut_lay.alignBytes());
+                const fut_ssa = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
+                defer emitter.allocator.free(fut_ssa);
+                try emitStoreValueToPtr(emitter, state, fut_ty, fut_ssa, fut_slot, fut_lay.alignBytes(), 0, 0, 0);
+
+                if (try isZeroSizedType(emitter, inst.type_id)) {
+                    try state.print("  call void @_cx_async_block_on(ptr {s}, ptr null)\n  %_v_{d} = add i8 0, 0\n", .{ fut_slot, dst_raw });
+                } else {
+                    const dst_ty = try unwrapTransparentType(emitter, inst.type_id);
+                    const dst_lay = try emitter.resolver.resolveType(dst_ty);
+                    const out_slot = try state.allocEntryBytes(dst_lay.size_bytes, dst_lay.alignBytes());
+                    defer emitter.allocator.free(out_slot);
+                    try emitMemsetZero(emitter, state, out_slot, dst_lay.size_bytes, dst_lay.alignBytes());
+                    try state.print("  call void @_cx_async_block_on(ptr {s}, ptr {s})\n", .{ fut_slot, out_slot });
+                    const loaded = try emitLoadValueFromPtr(emitter, state, dst_ty, out_slot, dst_lay.alignBytes(), null, 0, 0, 0);
+                    defer emitter.allocator.free(loaded);
+                    const val_ty = try formatLlvmValueType(emitter, dst_ty);
+                    defer emitter.allocator.free(val_ty);
+                    try state.print("  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n", .{ dst_raw, val_ty, loaded, val_ty, loaded });
+                }
+            }
+        },
     }
+    _ = access_grp;
+}
+
+/// Extracts a compile-time `u32` constant from SSA `val_raw` in `body` (`null` if non-constant).
+fn extractConstU32Llvm(body: *const MirBody, val_raw: u32) ?u32 {
+    if (val_raw >= body.insts.len) return null;
+    const inst = body.insts.get(val_raw);
+    if (inst.op != .const_scalar or inst.operands.lhs >= body.consts.items.len) return null;
+    return switch (body.consts.items[inst.operands.lhs]) {
+        .int_val => |int_val| if (int_val >= 0) @truncate(@as(u128, @bitCast(int_val))) else null,
+        else => null,
+    };
+}
+
+/// Emits LLVM IR storing `target_b`'s coroutine formal parameters and closure captures into `frame_ptr_ssa`.
+fn emitPopulateCoroFrameArgsLlvm(
+    emitter: *LlvmModuleEmitter,
+    state: *BodyEmitState,
+    caller_body: *const MirBody,
+    target_b: u32,
+    callee_ty: TypeId,
+    callee_val_raw: u32,
+    frame_ptr_ssa: []const u8,
+    formal_args: []const u32,
+) !void {
+    const ptr_int = ptrIntType(emitter);
+    const callee_body = &emitter.input.bodies[target_b];
+    const callee_plan = emitter.async_plan.?.getBodyPlan(target_b);
+    const is_closure = !callee_ty.isPrimitiveOrSentinel() and
+        emitter.input.pool.getNode(callee_ty).tag == .closure_ty;
+    const formal_count: usize = if (is_closure)
+        (if (emitter.input.pool.getFnSignatureView(callee_ty)) |sv| sv.paramCount() else 0)
+    else
+        callee_body.param_count;
+    const capture_count: usize = callee_body.param_count -| formal_count;
+
+    if (is_closure) {
+        var matched_thunk: ?ClosureThunkSpec = null;
+        for (emitter.closure_thunks.items) |cand_thunk| {
+            if (cand_thunk.callee_body_idx == target_b) {
+                matched_thunk = cand_thunk;
+                break;
+            }
+        }
+        if (matched_thunk) |thunk| {
+            if (capture_count > 0 and thunk.capture_types.len > 0) {
+                const clos_llvm_ty = if (thunk.is_three_word) "{ ptr, ptr, ptr }" else "{ ptr, ptr }";
+                const env_id = state.nextTmp();
+                try state.print(
+                    "  %_afm_env_{d} = extractvalue {s} %_v_{d}, 0\n",
+                    .{ env_id, clos_llvm_ty, callee_val_raw },
+                );
+                var cur_env_off: u64 = 0;
+                const copy_caps = @min(capture_count, thunk.capture_types.len);
+                for (0..copy_caps) |cap_i| {
+                    const cap_ty = thunk.capture_types[cap_i];
+                    const cap_lay = try emitter.resolver.resolveType(cap_ty);
+                    if (cap_lay.size_bytes == 0) continue;
+                    cur_env_off = std.mem.alignForward(u64, cur_env_off, @max(@as(u64, cap_lay.alignBytes()), 1));
+                    const cap_decl = callee_body.locals.items[1 + cap_i];
+                    const cap_off = callee_plan.getLocalOffset(@intCast(1 + cap_i));
+                    if (!(try isZeroSizedType(emitter, cap_decl.type_id))) {
+                        const cp_id = state.nextTmp();
+                        try state.print(
+                            "  %_afm_cs_{d} = getelementptr inbounds i8, ptr %_afm_env_{d}, {s} {d}\n" ++
+                                "  %_afm_cd_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n",
+                            .{ cp_id, env_id, ptr_int, cur_env_off, cp_id, frame_ptr_ssa, ptr_int, cap_off },
+                        );
+                        if (cap_decl.mode() == .inout_mode or cap_decl.mode() == .set_mode) {
+                            try state.print("  store ptr %_afm_cs_{d}, ptr %_afm_cd_{d}, align 1\n", .{ cp_id, cp_id });
+                        } else {
+                            const src_s = try std.fmt.allocPrint(emitter.allocator, "%_afm_cs_{d}", .{cp_id});
+                            defer emitter.allocator.free(src_s);
+                            const dst_s = try std.fmt.allocPrint(emitter.allocator, "%_afm_cd_{d}", .{cp_id});
+                            defer emitter.allocator.free(dst_s);
+                            try emitMemcpyBytes(emitter, state, dst_s, 1, src_s, 1, cap_lay.size_bytes);
+                        }
+                    }
+                    cur_env_off += cap_lay.size_bytes;
+                }
+            }
+        }
+    }
+
+    const avail_args = @min(formal_count, formal_args.len);
+    for (0..avail_args) |arg_i| {
+        const param_idx: u32 = @intCast(1 + capture_count + arg_i);
+        const param_decl = callee_body.locals.items[param_idx];
+        const param_off = callee_plan.getLocalOffset(param_idx);
+        const arg_raw = formal_args[arg_i];
+        _ = caller_body;
+        if (try isZeroSizedType(emitter, param_decl.type_id)) continue;
+        const ap_id = state.nextTmp();
+        try state.print(
+            "  %_afm_ap_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n",
+            .{ ap_id, frame_ptr_ssa, ptr_int, param_off },
+        );
+        if (param_decl.mode() == .inout_mode or param_decl.mode() == .set_mode) {
+            try state.print("  store ptr %_v_{d}, ptr %_afm_ap_{d}, align 1\n", .{ arg_raw, ap_id });
+        } else {
+            const dst_s = try std.fmt.allocPrint(emitter.allocator, "%_afm_ap_{d}", .{ap_id});
+            defer emitter.allocator.free(dst_s);
+            const arg_ssa = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{arg_raw});
+            defer emitter.allocator.free(arg_ssa);
+            try emitStoreValueToPtr(emitter, state, param_decl.type_id, arg_ssa, dst_s, 1, 0, 0, 0);
+        }
+    }
+}
+
+/// Returns `true` when `cand_idx` matches an indirect `async_future_make` signature (`[CRITICAL-02]`).
+fn isCompatibleIndirectAsyncCandidateLlvm(
+    emitter: *LlvmModuleEmitter,
+    caller_body: *const MirBody,
+    cand_idx: u32,
+    callee_ty: TypeId,
+    out_ty: TypeId,
+    formal_args: []const u32,
+) !bool {
+    const pool = emitter.input.pool;
+    const cand_body = &emitter.input.bodies[cand_idx];
+    if (!cand_body.is_async) return false;
+    if ((try unwrapTransparentType(emitter, cand_body.ret_ty)) != (try unwrapTransparentType(emitter, out_ty))) {
+        return false;
+    }
+
+    const is_closure = !callee_ty.isPrimitiveOrSentinel() and pool.getNode(callee_ty).tag == .closure_ty;
+    const sig_opt = pool.getFnSignatureView(callee_ty);
+    if (sig_opt) |sig_view| {
+        if (sig_view.paramCount() != formal_args.len) return false;
+    }
+
+    var capture_count: usize = 0;
+    if (is_closure) {
+        const is_expected_three_word = codegen_abi.isThreeWordClosureType(pool, callee_ty);
+        var matched_thunk: ?ClosureThunkSpec = null;
+        for (emitter.closure_thunks.items) |cand_thunk| {
+            if (cand_thunk.callee_body_idx == cand_idx) {
+                matched_thunk = cand_thunk;
+                break;
+            }
+        }
+        const thunk = matched_thunk orelse return false;
+        if (thunk.is_three_word != is_expected_three_word) return false;
+        capture_count = thunk.capture_types.len;
+        if (cand_body.param_count != capture_count + formal_args.len) return false;
+    } else {
+        for (emitter.closure_thunks.items) |cand_thunk| {
+            if (cand_thunk.callee_body_idx == cand_idx and cand_thunk.capture_types.len > 0) return false;
+        }
+        if (cand_body.param_count != formal_args.len) return false;
+    }
+
+    for (formal_args, 0..) |arg_raw, i| {
+        const param_idx = 1 + capture_count + i;
+        if (param_idx >= cand_body.locals.items.len or arg_raw >= caller_body.insts.len) return false;
+        const param_decl = cand_body.locals.items[param_idx];
+        const param_mode = param_decl.mode();
+        if (sig_opt) |sig_view| {
+            if (sig_view.getParamMode(i) != param_mode) return false;
+        }
+        const cand_param_ty = try unwrapTransparentType(emitter, param_decl.type_id);
+        const caller_arg_ty = try unwrapTransparentType(emitter, caller_body.insts.get(arg_raw).type_id);
+        const caller_llvm_ty = try formatLlvmValueType(emitter, caller_arg_ty);
+        defer emitter.allocator.free(caller_llvm_ty);
+
+        if (param_mode == .inout_mode or param_mode == .set_mode) {
+            if (!std.mem.eql(u8, caller_llvm_ty, "ptr")) return false;
+            if (caller_arg_ty.isPrimitiveOrSentinel()) return false;
+            const arg_node = pool.getNode(caller_arg_ty);
+            if (arg_node.tag != .ref_ty and arg_node.tag != .mut_ref_ty and arg_node.tag != .raw_ptr_ty) {
+                return false;
+            }
+            if ((try unwrapTransparentType(emitter, TypeId.fromInt(arg_node.lhs))) != cand_param_ty) return false;
+        } else {
+            if (caller_arg_ty != cand_param_ty) return false;
+            const param_llvm_ty = try formatLlvmValueType(emitter, cand_param_ty);
+            defer emitter.allocator.free(param_llvm_ty);
+            if (!std.mem.eql(u8, caller_llvm_ty, param_llvm_ty)) return false;
+        }
+    }
+    return true;
+}
+
+/// Emits LLVM IR lazy unpolled coroutine allocation for `MirIntrinsicKind.async_future_make`.
+fn emitAsyncFutureMakeLlvm(
+    emitter: *LlvmModuleEmitter,
+    state: *BodyEmitState,
+    body: *const MirBody,
+    dst_raw: u32,
+    fut_raw_ty: TypeId,
+    args: []const u32,
+) !void {
+    const ptr_int = ptrIntType(emitter);
+    const fut_ty = try unwrapTransparentType(emitter, fut_raw_ty);
+    const fut_lay = try emitter.resolver.resolveType(fut_ty);
+    const out_ty = emitter.input.pool.unwrapUnderlyingType(
+        emitter.input.pool.getFutureOutputType(fut_ty) orelse .unit_ty,
+    );
+    const out_lay = try emitter.resolver.resolveType(out_ty);
+
+    const def_raw: u32 = extractConstU32Llvm(body, args[0]) orelse mir.NONE_U32;
+    const sym_raw: u32 = extractConstU32Llvm(body, args[1]) orelse mir.NONE_U32;
+    const callee_ty = try unwrapTransparentType(emitter, body.getInst(MirValueId.fromInt(args[2])).type_id);
+    const is_closure = !callee_ty.isPrimitiveOrSentinel() and
+        emitter.input.pool.getNode(callee_ty).tag == .closure_ty;
+
+    const fut_slot = try state.allocEntryBytes(fut_lay.size_bytes, fut_lay.alignBytes());
+    defer emitter.allocator.free(fut_slot);
+    try emitMemsetZero(emitter, state, fut_slot, fut_lay.size_bytes, fut_lay.alignBytes());
+
+    var resolved_b = resolveBodyIndex(emitter, DefId.fromInt(def_raw), SymbolIndex.fromInt(sym_raw));
+    if (resolved_b == null and args[2] < body.insts.len) {
+        const callee_inst = body.insts.get(args[2]);
+        if (callee_inst.op == .aggregate_make) {
+            const ak: mir.AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(callee_inst.aux_u16))));
+            if (ak == .closure_make) {
+                resolved_b = resolveBodyIndex(emitter, DefId.fromInt(callee_inst.operands.lhs), .none);
+            }
+        } else if (callee_inst.op == .fn_addr) {
+            resolved_b = resolveBodyIndex(
+                emitter,
+                DefId.fromInt(callee_inst.operands.lhs),
+                SymbolIndex.fromInt(callee_inst.operands.rhs),
+            );
+        }
+    }
+
+    if (resolved_b) |target_b| {
+        const tmp_id = state.nextTmp();
+        try state.print("  %_afm_fr_{d} = call ptr @_cx_coro_alloc(i32 {d})\n", .{ tmp_id, target_b });
+        const fr_ssa = try std.fmt.allocPrint(emitter.allocator, "%_afm_fr_{d}", .{tmp_id});
+        defer emitter.allocator.free(fr_ssa);
+        try emitPopulateCoroFrameArgsLlvm(emitter, state, body, target_b, callee_ty, args[2], fr_ssa, args[3..]);
+        try state.print(
+            "  store ptr %_afm_fr_{d}, ptr {s}, align 1\n" ++
+                "  %_afm_kp_{d} = getelementptr inbounds %_cx_fut_raw_t, ptr {s}, i32 0, i32 1\n" ++
+                "  %_afm_xp_{d} = getelementptr inbounds %_cx_fut_raw_t, ptr {s}, i32 0, i32 2\n" ++
+                "  %_afm_sp_{d} = getelementptr inbounds %_cx_fut_raw_t, ptr {s}, i32 0, i32 3\n" ++
+                "  store {s} 1, ptr %_afm_kp_{d}, align 1\n" ++
+                "  store {s} {d}, ptr %_afm_xp_{d}, align 1\n" ++
+                "  store {s} {d}, ptr %_afm_sp_{d}, align 1\n",
+            .{
+                tmp_id,  fut_slot, tmp_id,  fut_slot, tmp_id, fut_slot, tmp_id,             fut_slot,
+                ptr_int, tmp_id,   ptr_int, target_b, tmp_id, ptr_int,  out_lay.size_bytes, tmp_id,
+            },
+        );
+    } else {
+        const tmp_id = state.nextTmp();
+        if (is_closure) {
+            const clos_ty_s = if (codegen_abi.isThreeWordClosureType(emitter.input.pool, callee_ty))
+                "{ ptr, ptr, ptr }"
+            else
+                "{ ptr, ptr }";
+            try state.print(
+                "  %_afm_fp_{d} = extractvalue {s} %_v_{d}, 1\n",
+                .{ tmp_id, clos_ty_s, args[2] },
+            );
+        } else {
+            try state.print("  %_afm_fp_{d} = select i1 true, ptr %_v_{d}, ptr %_v_{d}\n", .{ tmp_id, args[2], args[2] });
+        }
+        var compat_cands: std.ArrayListUnmanaged(u32) = .empty;
+        defer compat_cands.deinit(emitter.allocator);
+        for (0..emitter.input.bodies.len) |i| {
+            if (try isCompatibleIndirectAsyncCandidateLlvm(
+                emitter,
+                body,
+                @intCast(i),
+                callee_ty,
+                out_ty,
+                args[3..],
+            )) {
+                try compat_cands.append(emitter.allocator, @intCast(i));
+            }
+        }
+
+        try state.print(
+            "  %_afm_db_{d} = call i32 @_cx_coro_lookup_fn(ptr %_afm_fp_{d})\n" ++
+                "  %_afm_fr_{d} = call ptr @_cx_coro_alloc(i32 %_afm_db_{d})\n" ++
+                "  switch i32 %_afm_db_{d}, label %_afm_sw_end_{d} [\n",
+            .{ tmp_id, tmp_id, tmp_id, tmp_id, tmp_id, tmp_id },
+        );
+        for (compat_cands.items) |cand_idx| {
+            try state.print("    i32 {d}, label %_afm_sw_{d}_{d}\n", .{ cand_idx, tmp_id, cand_idx });
+        }
+        try state.writeAll("  ]\n");
+
+        const fr_ssa = try std.fmt.allocPrint(emitter.allocator, "%_afm_fr_{d}", .{tmp_id});
+        defer emitter.allocator.free(fr_ssa);
+        for (compat_cands.items) |cand_idx| {
+            try state.print("_afm_sw_{d}_{d}:\n", .{ tmp_id, cand_idx });
+            state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_afm_sw_{d}_{d}", .{ tmp_id, cand_idx }));
+            try emitPopulateCoroFrameArgsLlvm(
+                emitter,
+                state,
+                body,
+                cand_idx,
+                callee_ty,
+                args[2],
+                fr_ssa,
+                args[3..],
+            );
+            try state.print("  br label %_afm_sw_end_{d}\n", .{tmp_id});
+        }
+        try state.print("_afm_sw_end_{d}:\n", .{tmp_id});
+        state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_afm_sw_end_{d}", .{tmp_id}));
+        const db_ext = if (emitter.cfg.target.isWasm())
+            try std.fmt.allocPrint(emitter.allocator, "%_afm_db_{d}", .{tmp_id})
+        else blk_ext: {
+            try state.print("  %_afm_db64_{d} = zext i32 %_afm_db_{d} to i64\n", .{ tmp_id, tmp_id });
+            break :blk_ext try std.fmt.allocPrint(emitter.allocator, "%_afm_db64_{d}", .{tmp_id});
+        };
+        defer emitter.allocator.free(db_ext);
+        try state.print(
+            "  store ptr %_afm_fr_{d}, ptr {s}, align 1\n" ++
+                "  %_afm_kp_{d} = getelementptr inbounds %_cx_fut_raw_t, ptr {s}, i32 0, i32 1\n" ++
+                "  %_afm_xp_{d} = getelementptr inbounds %_cx_fut_raw_t, ptr {s}, i32 0, i32 2\n" ++
+                "  %_afm_sp_{d} = getelementptr inbounds %_cx_fut_raw_t, ptr {s}, i32 0, i32 3\n" ++
+                "  store {s} 1, ptr %_afm_kp_{d}, align 1\n" ++
+                "  store {s} {s}, ptr %_afm_xp_{d}, align 1\n" ++
+                "  store {s} {d}, ptr %_afm_sp_{d}, align 1\n",
+            .{
+                tmp_id,  fut_slot, tmp_id,  fut_slot, tmp_id, fut_slot, tmp_id,             fut_slot,
+                ptr_int, tmp_id,   ptr_int, db_ext,   tmp_id, ptr_int,  out_lay.size_bytes, tmp_id,
+            },
+        );
+    }
+
+    const loaded = try emitLoadValueFromPtr(emitter, state, fut_ty, fut_slot, fut_lay.alignBytes(), null, 0, 0, 0);
+    defer emitter.allocator.free(loaded);
+    const val_ty = try formatLlvmValueType(emitter, fut_ty);
+    defer emitter.allocator.free(val_ty);
+    try state.print("  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n", .{ dst_raw, val_ty, loaded, val_ty, loaded });
+}
+
+/// Emits LLVM IR nursery barrier (`async_task_group_exit`) cancelling on `Err`/cleanup or draining FIFO.
+fn emitAsyncTaskGroupExitLlvm(
+    emitter: *LlvmModuleEmitter,
+    state: *BodyEmitState,
+    body: *const MirBody,
+    bb_idx: u32,
+    group_val_raw: u32,
+) !void {
+    const bb_rec = body.blocks.items[bb_idx];
+    if (bb_rec.isCleanupPad()) {
+        try state.print("  call void @_cx_async_group_exit(ptr %_v_{d}, i8 1)\n", .{group_val_raw});
+        return;
+    }
+
+    const tmp_id = state.nextTmp();
+    var err_i8_ssa: []u8 = if (state.is_coro_poll_body) blk_act: {
+        try state.print(
+            "  %_ge_ac_{d} = icmp eq i32 %_action, 1\n" ++
+                "  %_ge_a8_{d} = zext i1 %_ge_ac_{d} to i8\n",
+            .{ tmp_id, tmp_id, tmp_id },
+        );
+        break :blk_act try std.fmt.allocPrint(emitter.allocator, "%_ge_a8_{d}", .{tmp_id});
+    } else try emitter.allocator.dupe(u8, "0");
+    defer emitter.allocator.free(err_i8_ssa);
+
+    if (bb_rec.terminator.kind == .ret) {
+        const unwrapped_ret = emitter.input.pool.unwrapUnderlyingType(body.ret_ty);
+        if (!unwrapped_ret.isPrimitiveOrSentinel() and
+            emitter.input.pool.getNode(unwrapped_ret).tag == .result_ty and
+            !(try isZeroSizedType(emitter, unwrapped_ret)))
+        {
+            if ((try emitter.resolver.getSumDetail(unwrapped_ret)) != null) {
+                const ret_lay = try emitter.resolver.resolveType(unwrapped_ret);
+                var ret_ptr_s: []u8 = &.{};
+                defer if (ret_ptr_s.len > 0) emitter.allocator.free(ret_ptr_s);
+                if (bb_rec.terminator.cond_or_val != mir.NONE_U32) {
+                    ret_ptr_s = try state.allocEntryBytes(ret_lay.size_bytes, ret_lay.alignBytes());
+                    try emitMemsetZero(emitter, state, ret_ptr_s, ret_lay.size_bytes, ret_lay.alignBytes());
+                    const rv_ssa = try std.fmt.allocPrint(
+                        emitter.allocator,
+                        "%_v_{d}",
+                        .{bb_rec.terminator.cond_or_val},
+                    );
+                    defer emitter.allocator.free(rv_ssa);
+                    try emitStoreValueToPtr(
+                        emitter,
+                        state,
+                        unwrapped_ret,
+                        rv_ssa,
+                        ret_ptr_s,
+                        ret_lay.alignBytes(),
+                        0,
+                        0,
+                        0,
+                    );
+                } else if (state.local_ptrs.len > 0 and state.local_ptrs[0].len > 0) {
+                    ret_ptr_s = try emitter.allocator.dupe(u8, state.local_ptrs[0]);
+                }
+                if (ret_ptr_s.len > 0) {
+                    const discr_s = try emitReadSumDiscriminantFromPtr(
+                        emitter,
+                        state,
+                        unwrapped_ret,
+                        ret_ptr_s,
+                        1,
+                    );
+                    defer emitter.allocator.free(discr_s);
+                    try state.print(
+                        "  %_ge_re_{d} = icmp eq i32 {s}, 1\n" ++
+                            "  %_ge_r8_{d} = zext i1 %_ge_re_{d} to i8\n" ++
+                            "  %_ge_or_{d} = or i8 {s}, %_ge_r8_{d}\n",
+                        .{ tmp_id, discr_s, tmp_id, tmp_id, tmp_id, err_i8_ssa, tmp_id },
+                    );
+                    emitter.allocator.free(err_i8_ssa);
+                    err_i8_ssa = try std.fmt.allocPrint(emitter.allocator, "%_ge_or_{d}", .{tmp_id});
+                }
+            }
+        }
+    }
+
+    try state.print("  call void @_cx_async_group_exit(ptr %_v_{d}, i8 {s})\n", .{ group_val_raw, err_i8_ssa });
 }
 
 // ----------- DWARF v5 LineTablesOnly Debug Metadata -----------
@@ -12885,12 +15005,22 @@ fn emitMirTerminatorLlvm(
         },
 
         .trap => {
-            try state.print("  call void @_cx_rt_trap(i32 {d})", .{term.aux_u8});
+            if (emitter.cfg.target.isFreestanding() or
+                (emitter.is_in_c_abi_body and !emitter.input.is_oracle_trace_enabled))
+            {
+                try state.writeAll("  call void @llvm.trap()");
+            } else {
+                try state.print("  call void @_cx_rt_trap(i32 {d})", .{term.aux_u8});
+            }
             try appendTerminatorMetaSuffix(state, 0);
             try state.writeAll("  unreachable\n");
         },
 
         .ret => {
+            if (state.is_coro_poll_body) {
+                try emitCoroPollRetTerminatorLlvm(emitter, state, body_idx, body, bb_idx, term);
+                return;
+            }
             const recipe = &emitter.body_recipes.items[body_idx];
             const ret_decl = try formatAbiReturnDecl(emitter, body.ret_ty, recipe);
             defer emitter.allocator.free(ret_decl.full_decl);
@@ -13779,7 +15909,124 @@ fn emitMirTerminatorLlvm(
             defer emitter.allocator.free(dest_lbl);
             try state.print("  br label %{s}\n", .{dest_lbl});
         },
+
+        .coro_suspend => {
+            if (state.is_coro_poll_body) {
+                if (emitter.async_plan) |*aplan| {
+                    const plan = aplan.getBodyPlan(body_idx);
+                    if (plan.findSuspendByBlock(MirBlockId.fromInt(bb_idx))) |sp_idx| {
+                        const sp_meta = plan.suspend_points[sp_idx];
+                        const fut_ty = plan.suspend_future_types[sp_idx];
+                        const fut_lay = try emitter.resolver.resolveType(fut_ty);
+                        const tmp_id = state.nextTmp();
+                        try state.print(
+                            "  %_cs_cfp_{d} = getelementptr inbounds i8, ptr %_frame, {s} {d}\n",
+                            .{ tmp_id, ptr_int, sp_meta.child_frame_offset },
+                        );
+                        const cfp_ssa = try std.fmt.allocPrint(emitter.allocator, "%_cs_cfp_{d}", .{tmp_id});
+                        defer emitter.allocator.free(cfp_ssa);
+                        try emitMemsetZero(emitter, state, cfp_ssa, fut_lay.size_bytes, 1);
+                        const fut_ssa = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{term.cond_or_val});
+                        defer emitter.allocator.free(fut_ssa);
+                        try emitStoreValueToPtr(emitter, state, fut_ty, fut_ssa, cfp_ssa, 1, 0, 0, 0);
+                        try state.print(
+                            "  store i32 {d}, ptr %_frame, align 4\n" ++
+                                "  br label %_coro_disp_{d}\n",
+                            .{ sp_meta.state_tag, sp_meta.state_tag },
+                        );
+                        return;
+                    }
+                }
+            }
+            try state.writeAll("  call void @_cx_rt_trap(i32 0)\n  unreachable\n");
+        },
     }
+}
+
+/// Emits `.ret` inside `@_cx_coro_poll_<body_idx>`, writing ready output and marking state completed/cancelled.
+fn emitCoroPollRetTerminatorLlvm(
+    emitter: *LlvmModuleEmitter,
+    state: *BodyEmitState,
+    body_idx: u32,
+    body: *const MirBody,
+    bb_idx: u32,
+    term: mir.MirTerminator,
+) !void {
+    const ptr_int = ptrIntType(emitter);
+    const tmp_id = state.nextTmp();
+    try state.print(
+        "  %_cr_isc_{d} = icmp eq i32 %_action, 1\n" ++
+            "  br i1 %_cr_isc_{d}, label %_cr_canc_{d}, label %_cr_ok_{d}\n" ++
+            "_cr_canc_{d}:\n" ++
+            "  store i32 -1, ptr %_frame, align 4\n" ++
+            "  ret i32 1\n" ++
+            "_cr_ok_{d}:\n",
+        .{ tmp_id, tmp_id, tmp_id, tmp_id, tmp_id, tmp_id },
+    );
+    state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_cr_ok_{d}", .{tmp_id}));
+
+    const is_zst_ret = try isZeroSizedType(emitter, body.ret_ty);
+    if (!is_zst_ret) {
+        const unwrapped_ret = emitter.input.pool.unwrapUnderlyingType(body.ret_ty);
+        const ret_lay = try emitter.resolver.resolveType(unwrapped_ret);
+        const is_result_ret = !unwrapped_ret.isPrimitiveOrSentinel() and
+            emitter.input.pool.getNode(unwrapped_ret).tag == .result_ty;
+
+        var ret_mem_ptr: []u8 = &.{};
+        defer if (ret_mem_ptr.len > 0) emitter.allocator.free(ret_mem_ptr);
+        if (term.cond_or_val != mir.NONE_U32) {
+            ret_mem_ptr = try state.allocEntryBytes(ret_lay.size_bytes, ret_lay.alignBytes());
+            try emitMemsetZero(emitter, state, ret_mem_ptr, ret_lay.size_bytes, ret_lay.alignBytes());
+            const rv_ssa = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{term.cond_or_val});
+            defer emitter.allocator.free(rv_ssa);
+            try emitStoreValueToPtr(
+                emitter,
+                state,
+                unwrapped_ret,
+                rv_ssa,
+                ret_mem_ptr,
+                ret_lay.alignBytes(),
+                0,
+                0,
+                0,
+            );
+        } else if (state.local_ptrs.len > 0 and state.local_ptrs[0].len > 0) {
+            ret_mem_ptr = try emitter.allocator.dupe(u8, state.local_ptrs[0]);
+        }
+
+        if (!emitter.cfg.is_release_mode and is_result_ret and ret_mem_ptr.len > 0) {
+            const discr_s = try emitReadSumDiscriminantFromPtr(emitter, state, unwrapped_ret, ret_mem_ptr, 1);
+            defer emitter.allocator.free(discr_s);
+            const site_tag: u64 = (@as(u64, body_idx + 1) << 16) | @as(u64, bb_idx);
+            try state.print(
+                "  %_cr_ie_{d} = icmp eq i32 {s}, 1\n" ++
+                    "  br i1 %_cr_ie_{d}, label %_cr_er_{d}, label %_cr_ec_{d}\n" ++
+                    "_cr_er_{d}:\n" ++
+                    "  call void @_cx_record_err_ret({s} {d})\n" ++
+                    "  br label %_cr_ec_{d}\n" ++
+                    "_cr_ec_{d}:\n",
+                .{ tmp_id, discr_s, tmp_id, tmp_id, tmp_id, tmp_id, ptr_int, site_tag, tmp_id, tmp_id },
+            );
+            state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_cr_ec_{d}", .{tmp_id}));
+        }
+
+        if (ret_mem_ptr.len > 0 and ret_lay.size_bytes > 0) {
+            try state.print(
+                "  %_cr_ho_{d} = icmp ne ptr %_out_ptr, null\n" ++
+                    "  br i1 %_cr_ho_{d}, label %_cr_cp_{d}, label %_cr_dn_{d}\n" ++
+                    "_cr_cp_{d}:\n",
+                .{ tmp_id, tmp_id, tmp_id, tmp_id, tmp_id },
+            );
+            try emitMemcpyBytes(emitter, state, "%_out_ptr", 1, ret_mem_ptr, 1, ret_lay.size_bytes);
+            try state.print("  br label %_cr_dn_{d}\n_cr_dn_{d}:\n", .{ tmp_id, tmp_id });
+            state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_cr_dn_{d}", .{tmp_id}));
+        }
+    }
+
+    try state.writeAll(
+        "  store i32 -2, ptr %_frame, align 4\n" ++
+            "  ret i32 1\n",
+    );
 }
 
 /// Returns `true` when formal parameter `loc_decl` / `p_rec` participates in MVS `!alias.scope` metadata.
@@ -14060,6 +16307,15 @@ fn precomputeDuplicateEdgeTrampolines(
 
 /// Emits a complete `MirBody` as an LLVM 20–23 `define` function using two-pass `PHINode` stitching.
 fn emitMirBody(emitter: *LlvmModuleEmitter, body_idx: u32, body: *const MirBody) !void {
+    if (body.is_async) {
+        try emitAsyncBodyEntryAndPollLlvm(emitter, body_idx, body);
+        return;
+    }
+
+    const prev_c_abi = emitter.is_in_c_abi_body;
+    emitter.is_in_c_abi_body = isBodyCAbiBoundaryLlvm(emitter, body);
+    defer emitter.is_in_c_abi_body = prev_c_abi;
+
     const recipe = &emitter.body_recipes.items[body_idx];
     const ret_decl = try formatAbiReturnDecl(emitter, body.ret_ty, recipe);
     defer emitter.allocator.free(ret_decl.full_decl);
@@ -14141,6 +16397,25 @@ fn emitMirBody(emitter: *LlvmModuleEmitter, body_idx: u32, body: *const MirBody)
         try emitter.writeAll("ptr swifterror %_cx_err_slot");
     }
     try emitter.print(") {s}", .{fnUnwindAttrs(emitter)});
+    const body_ffi = extractSymFfiMetaLlvm(emitter, body.symbol_index);
+    if (emitter.cfg.target.isWasm()) {
+        const exp_name = if (body_ffi.wasm_export_name.len > 0)
+            body_ffi.wasm_export_name
+        else if (body_ffi.is_export)
+            (if (body_ffi.link_name.len > 0) body_ffi.link_name else emitter.input.interner.get(body.name))
+        else
+            "";
+        if (exp_name.len > 0) {
+            const esc_exp = try escapeMetadataStringAlloc(emitter.allocator, exp_name);
+            defer emitter.allocator.free(esc_exp);
+            try emitter.print(" \"wasm-export-name\"=\"{s}\"", .{esc_exp});
+        }
+    }
+    if (body_ffi.link_section.len > 0 and !emitter.cfg.target.isWasm()) {
+        const esc_sec = try escapeMetadataStringAlloc(emitter.allocator, body_ffi.link_section);
+        defer emitter.allocator.free(esc_sec);
+        try emitter.print(" section \"{s}\"", .{esc_sec});
+    }
     if (state.subprogram_md != 0) {
         try emitter.print(" !dbg !{d}", .{state.subprogram_md});
     }
@@ -14415,6 +16690,749 @@ fn emitMirBody(emitter: *LlvmModuleEmitter, body_idx: u32, body: *const MirBody)
     try emitter.writeAll("}\n\n");
 }
 
+/// Emits the synchronous `main`/GOT wrapper `@<body_llvm_name>` and `@_cx_coro_poll_<body_idx>` for `is_async`.
+fn emitAsyncBodyEntryAndPollLlvm(emitter: *LlvmModuleEmitter, body_idx: u32, body: *const MirBody) !void {
+    const recipe = &emitter.body_recipes.items[body_idx];
+    const ret_decl = try formatAbiReturnDecl(emitter, body.ret_ty, recipe);
+    defer emitter.allocator.free(ret_decl.full_decl);
+    defer emitter.allocator.free(ret_decl.bare_ty);
+
+    const linkage_kw = if (isBodyExternallyVisible(emitter, body)) "" else "internal ";
+    const fn_ident = try formatLlvmGlobalIdent(emitter.allocator, emitter.body_llvm_names.items[body_idx]);
+    defer emitter.allocator.free(fn_ident);
+    try emitter.print(
+        "define {s}{s}{s} {s}(",
+        .{ linkage_kw, resolveCallingConvPrefix(recipe), ret_decl.full_decl, fn_ident },
+    );
+
+    var sig_arg_count: usize = 0;
+    if (recipe.has_sret) {
+        const sret_s = try formatAbiParamDeclPiece(emitter, body.ret_ty, recipe.sret_recipe, "%_sret");
+        defer emitter.allocator.free(sret_s);
+        try emitter.writeAll(sret_s);
+        sig_arg_count += 1;
+    }
+    if (recipe.has_implicit_context) {
+        const ctx_s = try formatAbiParamDeclPiece(emitter, .usize_ty, recipe.context_recipe, "%_cx_ctx");
+        defer emitter.allocator.free(ctx_s);
+        if (sig_arg_count > 0) try emitter.writeAll(", ");
+        try emitter.writeAll(ctx_s);
+        sig_arg_count += 1;
+    }
+    var param_i: u32 = 0;
+    while (param_i < body.param_count and param_i < recipe.param_recipes.len) : (param_i += 1) {
+        const p_rec = recipe.param_recipes[param_i];
+        if (p_rec.pass_mode == .ignore_zst) continue;
+        const p_ty = body.locals.items[1 + param_i].type_id;
+        const p_name = try std.fmt.allocPrint(emitter.allocator, "%_arg_p{d}", .{param_i});
+        defer emitter.allocator.free(p_name);
+        const piece_s = try formatAbiParamDeclPiece(emitter, p_ty, p_rec, p_name);
+        defer emitter.allocator.free(piece_s);
+        if (sig_arg_count > 0) try emitter.writeAll(", ");
+        try emitter.writeAll(piece_s);
+        sig_arg_count += 1;
+    }
+    if (recipe.swifterror_kind != .none) {
+        if (sig_arg_count > 0) try emitter.writeAll(", ");
+        try emitter.writeAll("ptr swifterror %_cx_err_slot");
+    }
+    try emitter.print(") {s} {{\nentry:\n", .{fnUnwindAttrs(emitter)});
+
+    const stub_local_ptrs = try emitter.allocator.alloc([]u8, 1);
+    stub_local_ptrs[0] = &[_]u8{};
+    const stub_local_aligns = try emitter.allocator.alloc(u32, 1);
+    stub_local_aligns[0] = 8;
+    var stub_state = BodyEmitState{
+        .allocator = emitter.allocator,
+        .cur_label = try emitter.allocator.dupe(u8, "entry"),
+        .has_ctx_param = recipe.has_implicit_context,
+        .local_ptrs = stub_local_ptrs,
+        .local_aligns = stub_local_aligns,
+        .edge_pred_labels = try emitter.allocator.alloc([]u8, 0),
+        .edge_call_ret_vals = try emitter.allocator.alloc([]u8, 0),
+        .edge_trampoline = try emitter.allocator.alloc(?u32, 0),
+        .block_access_group = try emitter.allocator.alloc(u32, 0),
+    };
+    defer stub_state.deinit();
+
+    const is_zst_ret = try isZeroSizedType(emitter, body.ret_ty);
+    const ret_lay = try emitter.resolver.resolveType(body.ret_ty);
+    if (!is_zst_ret) {
+        const ret_slot = try stub_state.allocEntryBytes(ret_lay.size_bytes, @max(ret_lay.alignBytes(), 8));
+        try emitMemsetZero(emitter, &stub_state, ret_slot, ret_lay.size_bytes, @max(ret_lay.alignBytes(), 8));
+        stub_state.local_ptrs[0] = ret_slot;
+        stub_state.local_aligns[0] = @max(ret_lay.alignBytes(), 8);
+    }
+
+    if (emitter.entry_main_body_idx != null and
+        emitter.entry_main_body_idx.? == body_idx and
+        body.param_count == 0 and
+        emitter.has_async_ops and
+        !emitter.cfg.target.isFreestanding())
+    {
+        const ptr_int = ptrIntType(emitter);
+        const fut_raw_sz: u64 = 4 * @as(u64, emitter.cfg.target.ptrBytes());
+        const mfut_slot = try stub_state.allocEntryBytes(fut_raw_sz, emitter.cfg.target.ptrBytes());
+        defer emitter.allocator.free(mfut_slot);
+        try emitMemsetZero(emitter, &stub_state, mfut_slot, fut_raw_sz, emitter.cfg.target.ptrBytes());
+        const out_arg = if (is_zst_ret) "null" else stub_state.local_ptrs[0];
+        try stub_state.print(
+            "  %_am_fr = call ptr @_cx_coro_alloc(i32 {d})\n" ++
+                "  store ptr %_am_fr, ptr {s}, align 1\n" ++
+                "  %_am_kp = getelementptr inbounds %_cx_fut_raw_t, ptr {s}, i32 0, i32 1\n" ++
+                "  %_am_xp = getelementptr inbounds %_cx_fut_raw_t, ptr {s}, i32 0, i32 2\n" ++
+                "  %_am_sp = getelementptr inbounds %_cx_fut_raw_t, ptr {s}, i32 0, i32 3\n" ++
+                "  store {s} 1, ptr %_am_kp, align 1\n" ++
+                "  store {s} {d}, ptr %_am_xp, align 1\n" ++
+                "  store {s} {d}, ptr %_am_sp, align 1\n" ++
+                "  call void @_cx_async_block_on(ptr {s}, ptr {s})\n",
+            .{
+                body_idx,
+                mfut_slot,
+                mfut_slot,
+                mfut_slot,
+                mfut_slot,
+                ptr_int,
+                ptr_int,
+                body_idx,
+                ptr_int,
+                ret_lay.size_bytes,
+                mfut_slot,
+                out_arg,
+            },
+        );
+    }
+
+    try emitMirTerminatorLlvm(
+        emitter,
+        &stub_state,
+        body_idx,
+        body,
+        0,
+        .{
+            .kind = .ret,
+            .aux_u8 = 0,
+            .edge_len = 0,
+            .cond_or_val = mir.NONE_U32,
+            .edge_start = 0,
+        },
+    );
+    if (stub_state.entry_allocas.items.len > 0) {
+        try emitter.writeAll(stub_state.entry_allocas.items);
+    }
+    try emitter.writeAll(stub_state.cur_buf.items);
+    try emitter.writeAll("}\n\n");
+
+    if (emitter.has_async_ops and !emitter.cfg.target.isFreestanding()) {
+        try emitAsyncCoroPollBodyLlvm(emitter, body_idx, body);
+    }
+}
+
+/// Emits the stackless state-machine poll function `@_cx_coro_poll_<body_idx>` (`DR-08` §2–§3).
+fn emitAsyncCoroPollBodyLlvm(emitter: *LlvmModuleEmitter, body_idx: u32, body: *const MirBody) !void {
+    const plan_mod = &(emitter.async_plan orelse return);
+    const plan = plan_mod.getBodyPlan(body_idx);
+    const ptr_int = ptrIntType(emitter);
+
+    const local_count = body.locals.items.len;
+    const edge_count = body.extra_edges.items.len;
+    const block_count = body.blocks.items.len;
+
+    const local_ptrs = try emitter.allocator.alloc([]u8, local_count);
+    @memset(local_ptrs, &[_]u8{});
+    const local_aligns = try emitter.allocator.alloc(u32, local_count);
+    @memset(local_aligns, 1);
+    const edge_pred_labels = try emitter.allocator.alloc([]u8, edge_count);
+    @memset(edge_pred_labels, &[_]u8{});
+    const edge_call_ret_vals = try emitter.allocator.alloc([]u8, edge_count);
+    @memset(edge_call_ret_vals, &[_]u8{});
+    const edge_trampoline = try emitter.allocator.alloc(?u32, edge_count);
+    @memset(edge_trampoline, null);
+    const block_access_group = try emitter.allocator.alloc(u32, block_count);
+    @memset(block_access_group, 0);
+
+    const base_frame_align: u32 = @max(plan.frame_align, 16);
+    var state = BodyEmitState{
+        .allocator = emitter.allocator,
+        .cur_label = try emitter.allocator.dupe(u8, "_bb_0"),
+        .has_ctx_param = true,
+        .local_ptrs = local_ptrs,
+        .local_aligns = local_aligns,
+        .edge_pred_labels = edge_pred_labels,
+        .edge_call_ret_vals = edge_call_ret_vals,
+        .edge_trampoline = edge_trampoline,
+        .block_access_group = block_access_group,
+        .subprogram_md = try createBodySubprogramMd(emitter, body_idx, body),
+        .is_coro_poll_body = true,
+        .ptr_int_name = ptr_int,
+        .coro_scratch_cursor = std.mem.alignForward(
+            u64,
+            @max(@as(u64, plan.frame_layout.total_frame_bytes), 16),
+            @as(u64, base_frame_align),
+        ),
+        .coro_max_align = base_frame_align,
+    };
+    defer state.deinit();
+
+    var entry_geps: std.ArrayListUnmanaged(u8) = .empty;
+    defer entry_geps.deinit(emitter.allocator);
+    try entry_geps.appendSlice(
+        emitter.allocator,
+        "  %_cx_ctx = getelementptr inbounds i8, ptr @_cx_default_ctx, i32 0\n",
+    );
+
+    for (plan.suspend_points, 0..) |sp_meta, sp_idx| {
+        const ready_ty = plan.suspend_ready_types[sp_idx];
+        if (try isZeroSizedType(emitter, ready_ty)) continue;
+        const ready_lay = try emitter.resolver.resolveType(ready_ty);
+        const rslot_line = try std.fmt.allocPrint(
+            emitter.allocator,
+            "  %_coro_rslot_{d} = alloca [{d} x i8], align {d}\n",
+            .{ sp_meta.state_tag, @max(ready_lay.size_bytes, 1), @max(ready_lay.alignBytes(), 8) },
+        );
+        defer emitter.allocator.free(rslot_line);
+        try state.entry_allocas.appendSlice(emitter.allocator, rslot_line);
+    }
+
+    for (body.locals.items, 0..) |loc_decl, loc_i| {
+        const is_zst = try isZeroSizedType(emitter, loc_decl.type_id);
+        const lay = try emitter.resolver.resolveType(loc_decl.type_id);
+        state.local_aligns[loc_i] = lay.alignBytes();
+        if (is_zst) continue;
+
+        const frame_off = plan.getLocalOffset(@intCast(loc_i));
+        const is_param = loc_i >= 1 and loc_i <= body.param_count;
+        const p_mode = loc_decl.mode();
+        if (is_param and (p_mode == .inout_mode or p_mode == .set_mode)) {
+            const gep_s = try std.fmt.allocPrint(
+                emitter.allocator,
+                "  %_pptr_s_{d} = getelementptr inbounds i8, ptr %_frame, {s} {d}\n" ++
+                    "  %_loc_{d} = load ptr, ptr %_pptr_s_{d}, align 1\n",
+                .{ loc_i, ptr_int, frame_off, loc_i, loc_i },
+            );
+            defer emitter.allocator.free(gep_s);
+            try entry_geps.appendSlice(emitter.allocator, gep_s);
+            state.local_ptrs[loc_i] = try std.fmt.allocPrint(emitter.allocator, "%_loc_{d}", .{loc_i});
+        } else {
+            const gep_s = try std.fmt.allocPrint(
+                emitter.allocator,
+                "  %_loc_{d} = getelementptr inbounds i8, ptr %_frame, {s} {d}\n",
+                .{ loc_i, ptr_int, frame_off },
+            );
+            defer emitter.allocator.free(gep_s);
+            try entry_geps.appendSlice(emitter.allocator, gep_s);
+            state.local_ptrs[loc_i] = try std.fmt.allocPrint(emitter.allocator, "%_loc_{d}", .{loc_i});
+            state.local_aligns[loc_i] = effectiveOffsetAlign(frame_off, base_frame_align);
+        }
+    }
+
+    try buildFunctionLoopMetadata(emitter, &state, body);
+    try precomputeDuplicateEdgeTrampolines(emitter, body, &state);
+
+    var per_block_ir = try emitter.allocator.alloc([]u8, block_count);
+    @memset(per_block_ir, &[_]u8{});
+    defer {
+        for (per_block_ir) |buf_s| {
+            if (buf_s.len > 0) emitter.allocator.free(buf_s);
+        }
+        emitter.allocator.free(per_block_ir);
+    }
+
+    for (body.blocks.items, 0..) |bb, bb_i| {
+        const bb_id = MirBlockId.fromInt(@intCast(bb_i));
+        state.cur_buf.clearRetainingCapacity();
+        state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_bb_{d}", .{bb_i}));
+        state.active_dbg_loc_md = 0;
+
+        if (bb_i == 0) {
+            for (body.getBlockParams(MirBlockId.fromInt(0)), 0..) |bp_val, bp_idx| {
+                const bp_ty = body.getInst(bp_val).type_id;
+                if (try isZeroSizedType(emitter, bp_ty)) {
+                    try state.print("  %_v_{d} = add i8 0, 0\n", .{bp_val.asInt()});
+                } else if (1 + bp_idx < state.local_ptrs.len and state.local_ptrs[1 + bp_idx].len > 0) {
+                    const loaded_p = try emitLoadValueFromPtr(
+                        emitter,
+                        &state,
+                        bp_ty,
+                        state.local_ptrs[1 + bp_idx],
+                        state.local_aligns[1 + bp_idx],
+                        null,
+                        0,
+                        0,
+                        0,
+                    );
+                    defer emitter.allocator.free(loaded_p);
+                    const val_ty = try formatLlvmValueType(emitter, bp_ty);
+                    defer emitter.allocator.free(val_ty);
+                    try state.print(
+                        "  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n",
+                        .{ bp_val.asInt(), val_ty, loaded_p, val_ty, loaded_p },
+                    );
+                }
+            }
+        } else {
+            for (plan.suspend_points, 0..) |sp_meta, sp_idx| {
+                if (sp_meta.resume_block == bb_id) {
+                    const ready_ty = plan.suspend_ready_types[sp_idx];
+                    for (body.getBlockParams(bb_id)) |bp_val| {
+                        const bp_ty = body.getInst(bp_val).type_id;
+                        if (try isZeroSizedType(emitter, bp_ty)) {
+                            try state.print("  %_v_{d} = add i8 0, 0\n", .{bp_val.asInt()});
+                        } else {
+                            const ready_lay = try emitter.resolver.resolveType(ready_ty);
+                            const rslot_s = try std.fmt.allocPrint(
+                                emitter.allocator,
+                                "%_coro_rslot_{d}",
+                                .{sp_meta.state_tag},
+                            );
+                            defer emitter.allocator.free(rslot_s);
+                            const loaded_r = try emitLoadValueFromPtr(
+                                emitter,
+                                &state,
+                                bp_ty,
+                                rslot_s,
+                                @max(ready_lay.alignBytes(), 8),
+                                null,
+                                0,
+                                0,
+                                0,
+                            );
+                            defer emitter.allocator.free(loaded_r);
+                            const val_ty = try formatLlvmValueType(emitter, bp_ty);
+                            defer emitter.allocator.free(val_ty);
+                            try state.print(
+                                "  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n",
+                                .{ bp_val.asInt(), val_ty, loaded_r, val_ty, loaded_r },
+                            );
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        for (body.getBlockInsts(bb_id)) |val_id| {
+            const tok_idx = if (val_id.asInt() < body.origin_tokens.items.len)
+                body.origin_tokens.items[val_id.asInt()]
+            else
+                TokenIndex.none;
+            if (!tok_idx.isNone() and state.subprogram_md != 0) {
+                state.active_dbg_loc_md = try resolveTokenDebugLocMd(
+                    emitter,
+                    state.subprogram_md,
+                    body.file_id,
+                    tok_idx,
+                );
+            }
+            try emitMirInstLlvm(emitter, &state, body_idx, body, @intCast(bb_i), val_id);
+        }
+
+        try emitMirTerminatorLlvm(emitter, &state, body_idx, body, @intCast(bb_i), bb.terminator);
+        per_block_ir[bb_i] = try emitter.allocator.dupe(u8, state.cur_buf.items);
+    }
+
+    if (body_idx < emitter.coro_final_frame_sizes.len) {
+        const final_align: u32 = @max(state.coro_max_align, 16);
+        emitter.coro_final_frame_aligns[body_idx] = final_align;
+        emitter.coro_final_frame_sizes[body_idx] = std.mem.alignForward(
+            u64,
+            state.coro_scratch_cursor,
+            @as(u64, final_align),
+        );
+    }
+
+    try emitter.print(
+        "define internal i32 @_cx_coro_poll_{d}(ptr %_frame, ptr %_out_ptr, i32 %_action, ptr %_parked_out) {s}",
+        .{ body_idx, fnUnwindAttrs(emitter) },
+    );
+    if (state.subprogram_md != 0) {
+        try emitter.print(" !dbg !{d}", .{state.subprogram_md});
+    }
+    try emitter.writeAll(" {\nentry:\n");
+    if (state.entry_allocas.items.len > 0) {
+        try emitter.writeAll(state.entry_allocas.items);
+    }
+    try emitter.writeAll(entry_geps.items);
+
+    try emitter.writeAll(
+        "  %_coro_st = load i32, ptr %_frame, align 4\n" ++
+            "  switch i32 %_coro_st, label %_coro_done_ret [\n" ++
+            "    i32 0, label %_coro_st0\n",
+    );
+    for (plan.suspend_points) |sp_meta| {
+        try emitter.print(
+            "    i32 {d}, label %_coro_disp_{d}\n",
+            .{ sp_meta.state_tag, sp_meta.state_tag },
+        );
+    }
+    try emitter.writeAll(
+        "  ]\n" ++
+            "_coro_done_ret:\n" ++
+            "  ret i32 1\n" ++
+            "_coro_st0:\n" ++
+            "  %_st0_isc = icmp eq i32 %_action, 1\n" ++
+            "  br i1 %_st0_isc, label %_coro_st0_canc, label %_coro_st0_go\n" ++
+            "_coro_st0_canc:\n" ++
+            "  store i32 -1, ptr %_frame, align 4\n",
+    );
+
+    var rev_p: u32 = body.param_count;
+    while (rev_p > 0) {
+        const p_decl = body.locals.items[rev_p];
+        const p_mode = p_decl.mode();
+        if (p_mode != .inout_mode and p_mode != .set_mode) {
+            const unwrapped_p = emitter.input.pool.unwrapUnderlyingType(p_decl.type_id);
+            if (!emitter.input.pool.getFlags(unwrapped_p).is_copy and
+                emitter.drop_type_set.contains(unwrapped_p.toU32()) and
+                !(try isZeroSizedType(emitter, unwrapped_p)) and
+                state.local_ptrs[rev_p].len > 0)
+            {
+                try emitter.print(
+                    "  call void @_cx_drop_ty_{d}(ptr {s})\n",
+                    .{ unwrapped_p.toU32(), state.local_ptrs[rev_p] },
+                );
+            }
+        }
+        rev_p -= 1;
+    }
+
+    try emitter.writeAll(
+        "  ret i32 1\n" ++
+            "_coro_st0_go:\n" ++
+            "  store i32 -2, ptr %_frame, align 4\n",
+    );
+    if (block_count > 0) {
+        try emitter.writeAll("  br label %_bb_0\n");
+    } else {
+        try emitter.writeAll("  ret i32 1\n");
+    }
+
+    for (plan.suspend_points, 0..) |sp_meta, sp_idx| {
+        const state_tag = sp_meta.state_tag;
+        const ready_ty = plan.suspend_ready_types[sp_idx];
+        const is_ready_zst = try isZeroSizedType(emitter, ready_ty);
+        try emitter.print(
+            "_coro_disp_{d}:\n" ++
+                "  %_cd_isc_{d} = icmp eq i32 %_action, 1\n" ++
+                "  br i1 %_cd_isc_{d}, label %_coro_canc_{d}, label %_coro_poll_{d}\n" ++
+                "_coro_canc_{d}:\n" ++
+                "  store i32 -1, ptr %_frame, align 4\n" ++
+                "  %_cc_fp_{d} = getelementptr inbounds i8, ptr %_frame, {s} {d}\n" ++
+                "  call void @_cx_async_fut_cancel(ptr %_cc_fp_{d})\n" ++
+                "  br label %_bb_{d}\n" ++
+                "_coro_poll_{d}:\n" ++
+                "  %_cp_fp_{d} = getelementptr inbounds i8, ptr %_frame, {s} {d}\n",
+            .{
+                state_tag,
+                state_tag,
+                state_tag,
+                state_tag,
+                state_tag,
+                state_tag,
+                state_tag,
+                ptr_int,
+                sp_meta.child_frame_offset,
+                state_tag,
+                sp_meta.cancel_block.asInt(),
+                state_tag,
+                state_tag,
+                ptr_int,
+                sp_meta.child_frame_offset,
+            },
+        );
+        if (is_ready_zst) {
+            try emitter.print(
+                "  %_cp_r_{d} = call i32 @_cx_async_fut_poll(ptr %_cp_fp_{d}, ptr null, ptr %_parked_out)\n",
+                .{ state_tag, state_tag },
+            );
+        } else {
+            const ready_lay = try emitter.resolver.resolveType(ready_ty);
+            try emitter.requireIntrinsicDecl(
+                "declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg)",
+            );
+            try emitter.print(
+                "  call void @llvm.memset.p0.i64(ptr align {d} %_coro_rslot_{d}, i8 0, i64 {d}, i1 false)\n" ++
+                    "  %_cp_r_{d} = call i32 @_cx_async_fut_poll(ptr %_cp_fp_{d}, ptr %_coro_rslot_{d}, ptr %_parked_out)\n",
+                .{
+                    @max(ready_lay.alignBytes(), 8),
+                    state_tag,
+                    @max(ready_lay.size_bytes, 1),
+                    state_tag,
+                    state_tag,
+                    state_tag,
+                },
+            );
+        }
+        try emitter.print(
+            "  %_cp_p_{d} = icmp eq i32 %_cp_r_{d}, 0\n" ++
+                "  br i1 %_cp_p_{d}, label %_coro_pend_{d}, label %_coro_rdy_{d}\n" ++
+                "_coro_pend_{d}:\n" ++
+                "  ret i32 0\n" ++
+                "_coro_rdy_{d}:\n" ++
+                "  store i32 -2, ptr %_frame, align 4\n" ++
+                "  br label %_bb_{d}\n",
+            .{
+                state_tag,
+                state_tag,
+                state_tag,
+                state_tag,
+                state_tag,
+                state_tag,
+                state_tag,
+                sp_meta.resume_block.asInt(),
+            },
+        );
+    }
+
+    for (0..block_count) |bb_i| {
+        try emitter.print("_bb_{d}:\n", .{bb_i});
+        if (bb_i > 0) {
+            const bb_id = MirBlockId.fromInt(@intCast(bb_i));
+            var is_resume_bb = false;
+            for (plan.suspend_points) |sp_meta| {
+                if (sp_meta.resume_block == bb_id) {
+                    is_resume_bb = true;
+                    break;
+                }
+            }
+            const bb_params = body.getBlockParams(bb_id);
+            if (!is_resume_bb and bb_params.len > 0) {
+                var pred_edge_indices: std.ArrayListUnmanaged(usize) = .empty;
+                defer pred_edge_indices.deinit(emitter.allocator);
+                for (body.extra_edges.items, 0..) |edge, e_idx| {
+                    if (edge.target_bb == bb_id and state.edge_pred_labels[e_idx].len > 0) {
+                        try pred_edge_indices.append(emitter.allocator, e_idx);
+                    }
+                }
+                for (bb_params, 0..) |bp_val, param_k| {
+                    const bp_ty = body.getInst(bp_val).type_id;
+                    if (try isZeroSizedType(emitter, bp_ty)) continue;
+                    const val_ty = try formatLlvmValueType(emitter, bp_ty);
+                    defer emitter.allocator.free(val_ty);
+                    if (pred_edge_indices.items.len == 0) {
+                        const zero_s = resolveZeroLiteralForLlvmType(val_ty);
+                        try emitter.print(
+                            "  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n",
+                            .{ bp_val.asInt(), val_ty, zero_s, val_ty, zero_s },
+                        );
+                        continue;
+                    }
+                    try emitter.print("  %_v_{d} = phi {s} ", .{ bp_val.asInt(), val_ty });
+                    for (pred_edge_indices.items, 0..) |e_idx, p_ord| {
+                        if (p_ord > 0) try emitter.writeAll(", ");
+                        const edge = body.extra_edges.items[e_idx];
+                        const pred_lbl = state.edge_pred_labels[e_idx];
+                        if (param_k == 0 and state.edge_call_ret_vals[e_idx].len > 0) {
+                            try emitter.print("[ {s}, %{s} ]", .{ state.edge_call_ret_vals[e_idx], pred_lbl });
+                        } else if (param_k < edge.args_len) {
+                            const arg_v = body.extra_args.items[edge.args_start + param_k];
+                            try emitter.print("[ %_v_{d}, %{s} ]", .{ arg_v, pred_lbl });
+                        } else {
+                            try emitter.print(
+                                "[ {s}, %{s} ]",
+                                .{ resolveZeroLiteralForLlvmType(val_ty), pred_lbl },
+                            );
+                        }
+                    }
+                    try emitter.writeAll("\n");
+                }
+                for (bb_params) |bp_val| {
+                    if (try isZeroSizedType(emitter, body.getInst(bp_val).type_id)) {
+                        try emitter.print("  %_v_{d} = add i8 0, 0\n", .{bp_val.asInt()});
+                    }
+                }
+            }
+        }
+        try emitter.writeAll(per_block_ir[bb_i]);
+    }
+
+    for (state.trampolines.items) |tramp| {
+        try emitter.print(
+            "_bb_edge_{d}:\n  br label %_bb_{d}\n",
+            .{ tramp.tramp_idx, tramp.target_bb.asInt() },
+        );
+    }
+
+    try emitter.writeAll("}\n\n");
+}
+
+/// Appends `@_cx_res_is_err_*`, `@_cx_coro_frame_size`, `@_cx_coro_poll_dispatch`, and `@_cx_coro_lookup_fn`.
+fn emitAsyncDispatchTablesLlvm(emitter: *LlvmModuleEmitter) !void {
+    const ptr_int = ptrIntType(emitter);
+    const fn_attrs = fnUnwindAttrs(emitter);
+
+    for (emitter.ordered_res_err_types.items) |res_ty| {
+        var helper_state = BodyEmitState{
+            .allocator = emitter.allocator,
+            .cur_label = try emitter.allocator.dupe(u8, "entry"),
+            .local_ptrs = try emitter.allocator.alloc([]u8, 0),
+            .local_aligns = try emitter.allocator.alloc(u32, 0),
+            .edge_pred_labels = try emitter.allocator.alloc([]u8, 0),
+            .edge_call_ret_vals = try emitter.allocator.alloc([]u8, 0),
+            .edge_trampoline = try emitter.allocator.alloc(?u32, 0),
+            .block_access_group = try emitter.allocator.alloc(u32, 0),
+        };
+        defer helper_state.deinit();
+
+        const discr_s = try emitReadSumDiscriminantFromPtr(emitter, &helper_state, res_ty, "%_res_p", 1);
+        defer emitter.allocator.free(discr_s);
+        try helper_state.print(
+            "  %_ie = icmp eq i32 {s}, 1\n" ++
+                "  %_r8 = zext i1 %_ie to i8\n" ++
+                "  ret i8 %_r8\n",
+            .{discr_s},
+        );
+        const hdr_s = try std.fmt.allocPrint(
+            emitter.allocator,
+            "define internal i8 @_cx_res_is_err_{d}(ptr %_res_p) {s} {{\nentry:\n",
+            .{ res_ty.toU32(), fn_attrs },
+        );
+        defer emitter.allocator.free(hdr_s);
+        try emitter.synth_globals.appendSlice(emitter.allocator, hdr_s);
+        if (helper_state.entry_allocas.items.len > 0) {
+            try emitter.synth_globals.appendSlice(emitter.allocator, helper_state.entry_allocas.items);
+        }
+        try emitter.synth_globals.appendSlice(emitter.allocator, helper_state.cur_buf.items);
+        try emitter.synth_globals.appendSlice(emitter.allocator, "}\n\n");
+    }
+
+    const appendFmt = struct {
+        /// Appends formatted text to `buf` using `alloc`.
+        fn run(alloc: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), comptime fmt: []const u8, args: anytype) !void {
+            const line = try std.fmt.allocPrint(alloc, fmt, args);
+            defer alloc.free(line);
+            try buf.appendSlice(alloc, line);
+        }
+    }.run;
+    const sbuf = &emitter.synth_globals;
+    const alloc = emitter.allocator;
+
+    try appendFmt(
+        alloc,
+        sbuf,
+        "define internal {s} @_cx_coro_frame_size(i32 %_b_idx) {s} {{\n" ++
+            "entry:\n" ++
+            "  switch i32 %_b_idx, label %def [\n",
+        .{ ptr_int, fn_attrs },
+    );
+    for (emitter.input.bodies, 0..) |*cand_b, b_i| {
+        if (!cand_b.is_async) continue;
+        try appendFmt(alloc, sbuf, "    i32 {d}, label %b_{d}\n", .{ b_i, b_i });
+    }
+    try sbuf.appendSlice(alloc, "  ]\n");
+    for (emitter.input.bodies, 0..) |*cand_b, b_i| {
+        if (!cand_b.is_async) continue;
+        const sz_bytes = if (b_i < emitter.coro_final_frame_sizes.len and emitter.coro_final_frame_sizes[b_i] >= 16)
+            emitter.coro_final_frame_sizes[b_i]
+        else
+            16;
+        try appendFmt(alloc, sbuf, "b_{d}:\n  ret {s} {d}\n", .{ b_i, ptr_int, sz_bytes });
+    }
+    try appendFmt(alloc, sbuf, "def:\n  ret {s} 16\n}}\n\n", .{ptr_int});
+
+    try appendFmt(
+        alloc,
+        sbuf,
+        "define internal {s} @_cx_coro_frame_align(i32 %_b_idx) {s} {{\n" ++
+            "entry:\n" ++
+            "  switch i32 %_b_idx, label %def [\n",
+        .{ ptr_int, fn_attrs },
+    );
+    for (emitter.input.bodies, 0..) |*cand_b, b_i| {
+        if (!cand_b.is_async) continue;
+        try appendFmt(alloc, sbuf, "    i32 {d}, label %b_{d}\n", .{ b_i, b_i });
+    }
+    try sbuf.appendSlice(alloc, "  ]\n");
+    for (emitter.input.bodies, 0..) |*cand_b, b_i| {
+        if (!cand_b.is_async) continue;
+        const al_bytes = if (b_i < emitter.coro_final_frame_aligns.len and emitter.coro_final_frame_aligns[b_i] >= 16)
+            emitter.coro_final_frame_aligns[b_i]
+        else
+            16;
+        try appendFmt(alloc, sbuf, "b_{d}:\n  ret {s} {d}\n", .{ b_i, ptr_int, al_bytes });
+    }
+    try appendFmt(alloc, sbuf, "def:\n  ret {s} 16\n}}\n\n", .{ptr_int});
+
+    try appendFmt(
+        alloc,
+        sbuf,
+        "define internal i32 @_cx_coro_poll_dispatch(i32 %_b_idx, ptr %_fr, ptr %_out, i32 %_act, ptr %_pk) {s} {{\n" ++
+            "entry:\n" ++
+            "  switch i32 %_b_idx, label %def [\n",
+        .{fn_attrs},
+    );
+    for (emitter.input.bodies, 0..) |*cand_b, b_i| {
+        if (!cand_b.is_async) continue;
+        try appendFmt(alloc, sbuf, "    i32 {d}, label %b_{d}\n", .{ b_i, b_i });
+    }
+    try sbuf.appendSlice(alloc, "  ]\n");
+    for (emitter.input.bodies, 0..) |*cand_b, b_i| {
+        if (!cand_b.is_async) continue;
+        try appendFmt(
+            alloc,
+            sbuf,
+            "b_{d}:\n  %r_{d} = call i32 @_cx_coro_poll_{d}(ptr %_fr, ptr %_out, i32 %_act, ptr %_pk)\n  ret i32 %r_{d}\n",
+            .{ b_i, b_i, b_i, b_i },
+        );
+    }
+    try sbuf.appendSlice(alloc, "def:\n  ret i32 1\n}\n\n");
+
+    try appendFmt(
+        alloc,
+        sbuf,
+        "define internal i32 @_cx_coro_lookup_fn(ptr %_fn_p) {s} {{\nentry:\n",
+        .{fn_attrs},
+    );
+    var cmp_step: u32 = 0;
+    for (emitter.input.bodies, 0..) |*cand_b, b_i| {
+        if (!cand_b.is_async) continue;
+        const fn_ident = try formatLlvmGlobalIdent(alloc, emitter.body_llvm_names.items[b_i]);
+        defer alloc.free(fn_ident);
+        try appendFmt(
+            alloc,
+            sbuf,
+            "  %m_{d} = icmp eq ptr %_fn_p, {s}\n" ++
+                "  br i1 %m_{d}, label %hit_{d}, label %nx_{d}\n" ++
+                "hit_{d}:\n  ret i32 {d}\n" ++
+                "nx_{d}:\n",
+            .{ cmp_step, fn_ident, cmp_step, cmp_step, cmp_step, cmp_step, b_i, cmp_step },
+        );
+        cmp_step += 1;
+        if (emitter.ctx_wrap_map.contains(@intCast(b_i))) {
+            try appendFmt(
+                alloc,
+                sbuf,
+                "  %m_{d} = icmp eq ptr %_fn_p, @_cx_fn_ctxwrap_{d}\n" ++
+                    "  br i1 %m_{d}, label %hit_{d}, label %nx_{d}\n" ++
+                    "hit_{d}:\n  ret i32 {d}\n" ++
+                    "nx_{d}:\n",
+                .{ cmp_step, b_i, cmp_step, cmp_step, cmp_step, cmp_step, b_i, cmp_step },
+            );
+            cmp_step += 1;
+        }
+    }
+    for (emitter.closure_thunks.items, 0..) |thunk, thunk_idx| {
+        if (thunk.callee_body_idx < emitter.input.bodies.len and
+            emitter.input.bodies[thunk.callee_body_idx].is_async)
+        {
+            try appendFmt(
+                alloc,
+                sbuf,
+                "  %m_{d} = icmp eq ptr %_fn_p, @_cx_cthunk_{d}\n" ++
+                    "  br i1 %m_{d}, label %hit_{d}, label %nx_{d}\n" ++
+                    "hit_{d}:\n  ret i32 {d}\n" ++
+                    "nx_{d}:\n",
+                .{
+                    cmp_step,              thunk_idx, cmp_step, cmp_step, cmp_step, cmp_step,
+                    thunk.callee_body_idx, cmp_step,
+                },
+            );
+            cmp_step += 1;
+        }
+    }
+    try sbuf.appendSlice(alloc, "  call void @_cx_rt_trap(i32 0)\n  unreachable\n}\n\n");
+}
+
 /// Emits the C-ABI `define i32 @main()` wrapper invoking CoreX `main` (`cx_native` or `cx_result_cc`).
 fn emitMainEntrypointWrapperLlvm(emitter: *LlvmModuleEmitter) !void {
     const main_b = emitter.entry_main_body_idx orelse return;
@@ -14522,7 +17540,48 @@ fn emitMainEntrypointWrapperLlvm(emitter: *LlvmModuleEmitter) !void {
         );
     }
 
-    if (main_rec.swifterror_kind != .none) {
+    if (emitter.cfg.target.isFreestanding()) {
+        if (main_rec.swifterror_kind != .none) {
+            try state.writeAll(
+                "  %_m_err = load ptr, ptr %_cx_call_err, align 8\n" ++
+                    "  %_m_he = icmp ne ptr %_m_err, null\n" ++
+                    "  %_m_ec = select i1 %_m_he, i32 1, i32 0\n" ++
+                    "  ret i32 %_m_ec\n",
+            );
+        } else {
+            const ret_ty = emitter.input.pool.unwrapUnderlyingType(main_body.ret_ty);
+            if (resolveIntegerInfo(emitter, ret_ty)) |int_info| {
+                if (int_info.bits <= 64 and !(try isZeroSizedType(emitter, ret_ty))) {
+                    const unpacked_s = try emitCoerceAbiToValue(
+                        emitter,
+                        &state,
+                        ret_ty,
+                        ret_decl.bare_ty,
+                        "%_m_rv",
+                    );
+                    defer emitter.allocator.free(unpacked_s);
+                    if (int_info.bits == 32) {
+                        try state.print("  ret i32 {s}\n", .{unpacked_s});
+                    } else if (int_info.bits < 32) {
+                        const ext32 = if (int_info.is_signed) "sext" else "zext";
+                        try state.print(
+                            "  %_mr32 = {s} i{d} {s} to i32\n  ret i32 %_mr32\n",
+                            .{ ext32, int_info.bits, unpacked_s },
+                        );
+                    } else {
+                        try state.print(
+                            "  %_mr32 = trunc i{d} {s} to i32\n  ret i32 %_mr32\n",
+                            .{ int_info.bits, unpacked_s },
+                        );
+                    }
+                } else {
+                    try state.writeAll("  ret i32 0\n");
+                }
+            } else {
+                try state.writeAll("  ret i32 0\n");
+            }
+        }
+    } else if (main_rec.swifterror_kind != .none) {
         try state.print(
             "  %_m_err = load ptr, ptr %_cx_call_err, align 8\n" ++
                 "  %_m_he = icmp ne ptr %_m_err, null\n" ++
@@ -14676,11 +17735,12 @@ fn resolveTargetFeatureFlag(spec: TargetSpec) []const u8 {
     return "";
 }
 
-/// Compiles `ir_source` to `.object_file` or `.executable` via `corex_llvm` bridge and/or `zig cc`.
+/// Compiles `ir_source` to object, static archive, shared library, or executable via `corex_llvm` / `zig cc`.
 fn compileLlvmIrWithDriver(
     allocator: std.mem.Allocator,
     cfg: LlvmBackendConfig,
     input: CodegenModuleInput,
+    collected_link_libs: []const []const u8,
     has_dwarf_tables: bool,
     ir_source: []const u8,
 ) LlvmCodegenError![]u8 {
@@ -14688,10 +17748,11 @@ fn compileLlvmIrWithDriver(
     const io = input.io orelse return error.MissingOutputConfig;
 
     const seq_id = next_llvm_scratch_seq.fetchAdd(1, .monotonic);
+    const proc_salt = @intFromPtr(&next_llvm_scratch_seq) ^ (@intFromPtr(&seq_id) >> 4);
     const scratch_dir = std.fmt.allocPrint(
         allocator,
-        ".zig-cache/cx_llvm_drv_{d}",
-        .{seq_id},
+        ".zig-cache/cx_llvm_drv_{x}_{d}",
+        .{ proc_salt, seq_id },
     ) catch return error.OutOfMemory;
     defer allocator.free(scratch_dir);
     defer std.Io.Dir.cwd().deleteTree(io, scratch_dir) catch {};
@@ -14699,7 +17760,7 @@ fn compileLlvmIrWithDriver(
     const mod_obj_path = std.fmt.allocPrint(
         allocator,
         "{s}/module{s}",
-        .{ scratch_dir, cfg.target.objectExtension() },
+        .{ scratch_dir, cfg.target.defaultObjExtension() },
     ) catch return error.OutOfMemory;
     defer allocator.free(mod_obj_path);
 
@@ -14759,6 +17820,8 @@ fn compileLlvmIrWithDriver(
     const zig_triple = cfg.target.asZigTargetTriple();
     const opt_flag = resolveOptLevelDriverFlag(cfg.opt_level);
     const is_linux_elf = cfg.target.os == .linux;
+    const is_sdkless_msvc_obj = cfg.target.os == .windows and cfg.target.abi == .msvc and
+        (input.artifact_kind == .object_file or input.artifact_kind == .static_library);
 
     if (!is_built_via_cpp_bridge) {
         const ir_path = std.fmt.allocPrint(allocator, "{s}/module.ll", .{scratch_dir}) catch
@@ -14776,9 +17839,17 @@ fn compileLlvmIrWithDriver(
             "-target",
             zig_triple,
             "-Wno-override-module",
+            "-ffunction-sections",
+            "-fdata-sections",
             opt_flag,
         }) catch return error.OutOfMemory;
 
+        if (cfg.target.isFreestanding() or is_sdkless_msvc_obj) {
+            obj_argv.appendSlice(allocator, &.{ "-ffreestanding", "-nostdlib" }) catch return error.OutOfMemory;
+        }
+        if (input.artifact_kind == .shared_library and !cfg.target.isWasm() and !cfg.target.isWindows()) {
+            obj_argv.append(allocator, "-fPIC") catch return error.OutOfMemory;
+        }
         if (cfg.target.arch == .x86_64) {
             if (cfg.target.simd_level == .avx2) {
                 obj_argv.appendSlice(allocator, &.{ "-mavx2", "-mfma" }) catch return error.OutOfMemory;
@@ -14814,6 +17885,44 @@ fn compileLlvmIrWithDriver(
     if (input.artifact_kind == .object_file) {
         codegen_abi.publishStagedFileAtomic(io, allocator, mod_obj_path, out_path) catch
             return error.BackendFailure;
+        return allocator.dupe(u8, out_path) catch return error.OutOfMemory;
+    }
+
+    if (!cfg.is_fuzz_instrumented or input.artifact_kind != .executable) {
+        var merged_libs: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer merged_libs.deinit(allocator);
+        merged_libs.appendSlice(allocator, input.extra_libs) catch return error.OutOfMemory;
+        for (collected_link_libs) |lib_name| {
+            var has_dup = false;
+            for (merged_libs.items) |existing| {
+                if (std.mem.eql(u8, existing, lib_name)) {
+                    has_dup = true;
+                    break;
+                }
+            }
+            if (!has_dup) {
+                merged_libs.append(allocator, lib_name) catch return error.OutOfMemory;
+            }
+        }
+
+        codegen_link.linkCrossTarget(io, allocator, .{
+            .target = cfg.target,
+            .object_paths = &.{mod_obj_path},
+            .output_path = out_path,
+            .artifact_kind = input.artifact_kind,
+            .link_mode = input.link_mode,
+            .is_release_mode = cfg.is_release_mode,
+            .has_dwarf_tables = has_dwarf_tables,
+            .is_nostdlib = cfg.target.isFreestanding(),
+            .extra_libs = merged_libs.items,
+            .lib_dirs = input.lib_dirs,
+            .environ_map = input.environ_map,
+            .diagnostic_sink = input.diagnostic_sink,
+        }) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.LinkerFailed => error.CompilerDriverFailed,
+            else => error.BackendFailure,
+        };
         return allocator.dupe(u8, out_path) catch return error.OutOfMemory;
     }
 
@@ -14907,6 +18016,48 @@ pub fn emitModule(
     emitter.print("target triple = \"{s}\"\n\n", .{cfg.target.asLlvmTargetTriple()}) catch
         return error.OutOfMemory;
 
+    var has_any_async = false;
+    for (input.bodies) |*body_ptr| {
+        if (mir_async.hasBodyAsyncOperations(body_ptr)) {
+            has_any_async = true;
+            break;
+        }
+    }
+    if (has_any_async and !cfg.target.isFreestanding()) {
+        const cloned_bodies = allocator.alloc(MirBody, input.bodies.len) catch return error.OutOfMemory;
+        var cloned_count: usize = 0;
+        errdefer {
+            for (cloned_bodies[0..cloned_count]) |*cb| cb.deinit();
+            allocator.free(cloned_bodies);
+        }
+        for (input.bodies, 0..) |*src_b, idx| {
+            cloned_bodies[idx] = src_b.clone(allocator) catch return error.OutOfMemory;
+            cloned_count += 1;
+        }
+        var plan = mir_async.prepareAndAnalyzeAsyncModule(
+            allocator,
+            cloned_bodies,
+            input.pool,
+            input.sym_table,
+            emitter.target_layout,
+            null,
+        ) catch |err| {
+            return if (@as(anyerror, err) == error.OutOfMemory) error.OutOfMemory else error.BackendFailure;
+        };
+        errdefer plan.deinit();
+        const frame_sizes = allocator.alloc(u64, cloned_bodies.len) catch return error.OutOfMemory;
+        errdefer allocator.free(frame_sizes);
+        @memset(frame_sizes, 16);
+        const frame_aligns = allocator.alloc(u32, cloned_bodies.len) catch return error.OutOfMemory;
+        @memset(frame_aligns, 16);
+        emitter.owned_async_bodies = cloned_bodies;
+        emitter.async_plan = plan;
+        emitter.coro_final_frame_sizes = frame_sizes;
+        emitter.coro_final_frame_aligns = frame_aligns;
+        emitter.input.bodies = cloned_bodies;
+        emitter.has_async_ops = true;
+    }
+
     indexModuleEntities(&emitter) catch |err| {
         return if (@as(anyerror, err) == error.OutOfMemory) error.OutOfMemory else error.BackendFailure;
     };
@@ -14923,8 +18074,14 @@ pub fn emitModule(
         return if (@as(anyerror, err) == error.OutOfMemory) error.OutOfMemory else error.BackendFailure;
     };
 
-    for (input.bodies, 0..) |*body_ptr, b_idx| {
+    for (emitter.input.bodies, 0..) |*body_ptr, b_idx| {
         emitMirBody(&emitter, @intCast(b_idx), body_ptr) catch |err| {
+            return if (@as(anyerror, err) == error.OutOfMemory) error.OutOfMemory else error.BackendFailure;
+        };
+    }
+
+    if (emitter.has_async_ops and !cfg.target.isFreestanding()) {
+        emitAsyncDispatchTablesLlvm(&emitter) catch |err| {
             return if (@as(anyerror, err) == error.OutOfMemory) error.OutOfMemory else error.BackendFailure;
         };
     }
@@ -14981,7 +18138,14 @@ pub fn emitModule(
             written_path = allocator.dupe(u8, out_path) catch return error.OutOfMemory;
         }
     } else {
-        written_path = try compileLlvmIrWithDriver(allocator, cfg, input, has_dwarf, emitted_ll);
+        written_path = try compileLlvmIrWithDriver(
+            allocator,
+            cfg,
+            input,
+            emitter.collected_link_libs.items,
+            has_dwarf,
+            emitted_ll,
+        );
     }
 
     return .{
@@ -15317,4 +18481,185 @@ test "Phase 7.6 Stage-4 LLVM regressions: 0-byte own closure niche, 128-bit enum
         "5|5|1e-13|1e-5|1e16|nan|nan|NAN|inf|+inf|-inf|INF|-INF",
         run_out.stdout,
     );
+}
+
+test "Phase 8 Tier B LLVM: Fix-07 C ABI indirect/export/variadic, < 10 KB freestanding Wasm, and aarch64-msvc .obj/.lib" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // [1] Fix-07 #1/#2/#3: indirect `extern "C" fn` calls, `@export` unwind-abort + section, and indirect variadics:
+    const fix07_src =
+        \\pub type CVarFn = extern "C" fn(*u8, ...) -> i32;
+        \\extern "C" fn c_var_direct(fmt_ptr: *u8, ...) -> i32;
+        \\
+        \\@export
+        \\@link_name("cx_c_entry")
+        \\@link_section(".cx_ffi")
+        \\pub fn exported_entry(val: i32) -> i32 {
+        \\    if val < 0 {
+        \\        @panic("abort across C frame");
+        \\    }
+        \\    return val + 1;
+        \\}
+        \\
+        \\pub fn invoke_c_fn_ptr(cb_ptr: extern "C" fn(i32, i32) -> i32, lhs_val: i32, rhs_val: i32) -> i32 {
+        \\    return unsafe { cb_ptr(lhs_val, rhs_val) };
+        \\}
+        \\
+        \\pub fn invoke_c_var_ptr(var_cb: CVarFn, fmt_ptr: *u8) -> i32 {
+        \\    let is_ready: bool = true;
+        \\    let ratio: f32 = 2.5;
+        \\    return unsafe { c_var_direct(fmt_ptr, is_ready) + var_cb(fmt_ptr, is_ready, ratio) };
+        \\}
+    ;
+    var fix07_bundle = try mir.lowerSourceToMir(
+        allocator,
+        FileId.fromInt(220),
+        fix07_src,
+        TargetSpec.X86_64_LINUX.asTargetLayout(),
+        .{},
+    );
+    defer fix07_bundle.deinit();
+    try std.testing.expect(!fix07_bundle.hir_bundle.diagnostics.hasErrors());
+
+    var fix07_ir = try emitModule(
+        allocator,
+        .{ .target = TargetSpec.X86_64_LINUX },
+        .{
+            .bodies = fix07_bundle.mir_bundle.bodies.items,
+            .pool = &fix07_bundle.hir_bundle.pool,
+            .sym_table = &fix07_bundle.hir_bundle.sym_table,
+            .interner = &fix07_bundle.hir_bundle.interner,
+            .module_name = "test_phase8_fix07_llvm",
+            .artifact_kind = .source_text,
+        },
+    );
+    defer fix07_ir.deinit(allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, fix07_ir.emitted_text, "define i32 @cx_c_entry(i32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fix07_ir.emitted_text, "section \".cx_ffi\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fix07_ir.emitted_text, "call i32 %_v_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fix07_ir.emitted_text, "call swiftcc i32 %_v_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fix07_ir.emitted_text, "(ptr, ...) %_v_") != null);
+
+    // [2] Freestanding `wasm32-unknown-freestanding` (`< 10 KB` `.wasm`, `@wasm_import`/`@wasm_export`, zero libc):
+    const wasm_src =
+        \\@wasm_import("host_env", "host_tick")
+        \\extern "C" fn host_tick(delta: i32) -> i32;
+        \\
+        \\@wasm_export("wasm_step")
+        \\pub fn wasm_step(seed: i32) -> i32 {
+        \\    if seed < 0 {
+        \\        @panic("negative seed");
+        \\    }
+        \\    return unsafe { host_tick(seed + 1) };
+        \\}
+    ;
+    var wasm_bundle = try mir.lowerSourceToMir(
+        allocator,
+        FileId.fromInt(221),
+        wasm_src,
+        TargetSpec.WASM32_UNKNOWN_FREESTANDING.asTargetLayout(),
+        .{},
+    );
+    defer wasm_bundle.deinit();
+    try std.testing.expect(!wasm_bundle.hir_bundle.diagnostics.hasErrors());
+
+    const wasm_path = ".zig-cache/test_phase8_llvm_freestanding.wasm";
+    defer std.Io.Dir.cwd().deleteFile(io, wasm_path) catch {};
+
+    var wasm_art = try emitModule(
+        allocator,
+        .{ .target = TargetSpec.WASM32_UNKNOWN_FREESTANDING, .is_release_mode = true },
+        .{
+            .bodies = wasm_bundle.mir_bundle.bodies.items,
+            .pool = &wasm_bundle.hir_bundle.pool,
+            .sym_table = &wasm_bundle.hir_bundle.sym_table,
+            .interner = &wasm_bundle.hir_bundle.interner,
+            .module_name = "test_wasm_fs_llvm",
+            .artifact_kind = .executable,
+            .output_path = wasm_path,
+            .io = io,
+        },
+    );
+    defer wasm_art.deinit(allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, wasm_art.emitted_text, "declare ptr @getenv") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_art.emitted_text, "declare i32 @snprintf") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_art.emitted_text, "@write(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_art.emitted_text, "define i32 @main(") == null);
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            wasm_art.emitted_text,
+            "\"wasm-import-module\"=\"host_env\" \"wasm-import-name\"=\"host_tick\"",
+        ) != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, wasm_art.emitted_text, "\"wasm-export-name\"=\"wasm_step\"") != null,
+    );
+
+    const wasm_file = try std.Io.Dir.cwd().openFile(io, wasm_path, .{ .mode = .read_only });
+    defer wasm_file.close(io);
+    const wasm_size: usize = @intCast((try wasm_file.stat(io)).size);
+    try std.testing.expect(wasm_size >= 8 and wasm_size < 10_240);
+
+    // [3] SDK-less `aarch64-windows-msvc` `.obj` and `.lib` static archive emission:
+    const arm64_src =
+        \\@export
+        \\@link_name("cx_arm64_llvm_add")
+        \\pub fn arm64_llvm_add(lhs_val: i32, rhs_val: i32) -> i32 {
+        \\    return lhs_val +% rhs_val;
+        \\}
+    ;
+    var arm64_bundle = try mir.lowerSourceToMir(
+        allocator,
+        FileId.fromInt(222),
+        arm64_src,
+        TargetSpec.AARCH64_WINDOWS_MSVC.asTargetLayout(),
+        .{},
+    );
+    defer arm64_bundle.deinit();
+    try std.testing.expect(!arm64_bundle.hir_bundle.diagnostics.hasErrors());
+
+    const arm64_obj_path = ".zig-cache/test_phase8_llvm_arm64.obj";
+    const arm64_lib_path = ".zig-cache/test_phase8_llvm_arm64.lib";
+    defer std.Io.Dir.cwd().deleteFile(io, arm64_obj_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, arm64_lib_path) catch {};
+
+    var obj_art = try emitModule(
+        allocator,
+        .{ .target = TargetSpec.AARCH64_WINDOWS_MSVC, .is_release_mode = true },
+        .{
+            .bodies = arm64_bundle.mir_bundle.bodies.items,
+            .pool = &arm64_bundle.hir_bundle.pool,
+            .sym_table = &arm64_bundle.hir_bundle.sym_table,
+            .interner = &arm64_bundle.hir_bundle.interner,
+            .module_name = "test_arm64_msvc_llvm",
+            .artifact_kind = .object_file,
+            .output_path = arm64_obj_path,
+            .io = io,
+        },
+    );
+    defer obj_art.deinit(allocator);
+
+    var lib_art = try emitModule(
+        allocator,
+        .{ .target = TargetSpec.AARCH64_WINDOWS_MSVC, .is_release_mode = true },
+        .{
+            .bodies = arm64_bundle.mir_bundle.bodies.items,
+            .pool = &arm64_bundle.hir_bundle.pool,
+            .sym_table = &arm64_bundle.hir_bundle.sym_table,
+            .interner = &arm64_bundle.hir_bundle.interner,
+            .module_name = "test_arm64_msvc_llvm_lib",
+            .artifact_kind = .static_library,
+            .output_path = arm64_lib_path,
+            .io = io,
+        },
+    );
+    defer lib_art.deinit(allocator);
+
+    const lib_file = try std.Io.Dir.cwd().openFile(io, arm64_lib_path, .{ .mode = .read_only });
+    defer lib_file.close(io);
+    try std.testing.expect((try lib_file.stat(io)).size > 8);
 }

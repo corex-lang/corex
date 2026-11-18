@@ -4,14 +4,15 @@
 ╰─────────────────────────────────────────────────────────────╯
 
 Commands:
-  ▸ build     Compile a CoreX package or source file into a native or WebAssembly artifact
-  ▸ run       Compile and immediately execute a CoreX binary
-  ▸ check     Run fast syntax, type, region, and SAST verification without codegen
-  ▸ test      Compile and execute unit, snapshot, and safety verification suites
-  ▸ fmt       Format CoreX source files canonically using the lossless CST
-  ▸ upgrade   Apply automated AST/CST migrations and machine-applicable fixes
-  ▸ lsp       Start the CoreX Language Server Protocol (LSP) daemon over stdio
-  ▸ bench     Run statistical performance benchmarks and emit monochrome report tables
+  ▸ bench        Run statistical performance benchmarks and emit monochrome report tables
+  ▸ build        Compile a CoreX package or source file into a native or WebAssembly artifact
+  ▸ check        Run fast syntax, type, region, and SAST verification without codegen
+  ▸ fmt          Format CoreX source files canonically using the lossless CST
+  ▸ lsp          Start the CoreX Language Server Protocol (LSP) daemon over stdio
+  ▸ run          Compile and immediately execute a CoreX binary
+  ▸ test         Compile and execute unit, snapshot, and safety verification suites
+  ▸ translate-c  Translate a C11/C23 header into canonical CoreX (.cx) bindings
+  ▸ upgrade      Apply automated AST/CST migrations and machine-applicable fixes
 
 Global Options:
   -h, --help          Display this help menu or subcommand documentation

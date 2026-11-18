@@ -1,4 +1,4 @@
-//! Sandboxed 64-Bit Register `MirVm`, Reflection Intrinsics, Memoization & `.rodata` Promotion.
+//! Sandboxed 64-Bit Register `MirVm`, Reflection Intrinsics, Memoization & `.rodata` Promotion
 //!
 //! Architectural Role:
 //! - Executes target-independent Block-Argument SSA `MirBody` graphs at compile time (`DR-05`
@@ -33,6 +33,8 @@ const type_system = @import("type_system.zig");
 const query_db = @import("query_db.zig");
 const hir = @import("hir.zig");
 const mir = @import("mir.zig");
+const mir_async = @import("mir_async.zig");
+const sim_seam = @import("sim_seam.zig");
 
 const FileId = mem_foundation.FileId;
 const Span = mem_foundation.Span;
@@ -671,6 +673,8 @@ const VmCallFrame = struct {
     owned_stack_allocs: []ComptimeAllocId,
     /// Dynamic frame-scoped stack allocations (e.g., `FmtArgs` buffers) invalidated on frame exit.
     extra_stack_allocs: std.ArrayListUnmanaged(ComptimeAllocId) = .empty,
+    /// Currently executing basic block in this frame.
+    cur_bb: MirBlockId = .fromInt(0),
     /// Call-site `Span` in caller that invoked this frame (for stack-trace `LabeledSpan` notes).
     call_site_span: Span,
 };
@@ -693,6 +697,100 @@ const CapDropSlot = struct {
     byte_offset: u64,
     /// Concrete `TypeId` of the captured field.
     cap_ty: TypeId,
+};
+
+/// Discriminant stored at word `1` (`offset ptr_byte_size`) of a `Future[T]` snapshot.
+const VmFutureKind = enum(u64) {
+    /// Consumed, empty, or already-dropped future (`0`).
+    empty = 0,
+    /// Unpolled or suspended `is_async` `MirBody` coroutine frame (`1`).
+    coro_frame = 1,
+    /// Single-step cooperative yield future returned by `yield_now()` (`2`).
+    yield_once = 2,
+    /// `TaskHandle[T].join()` future awaiting spawned task completion (`3`).
+    join_task = 3,
+    /// `TaskHandle[T].cancel()` future cancelling a spawned task (`4`).
+    cancel_task = 4,
+};
+
+/// Poll result returned by a single cooperative step in `MirVm`.
+const VmPollOutcome = union(enum) {
+    /// Task suspended cooperatively (`Poll.Pending`).
+    pending,
+    /// Task produced its final output `RegSlot` (`Poll.Ready`).
+    ready: RegSlot,
+};
+
+/// Per-task 10-slot `Context` capability snapshot isolated across `TaskGroup` switches (`DR-08` §5.3).
+const VmContextSnapshot = struct {
+    /// Saved register values for `ContextFieldLayout.CANONICAL_FIELDS` (`0..9`).
+    slots: [10]RegSlot = @splat(.{ .scalar_u64 = 0 }),
+    /// Per-slot initialization flags.
+    inits: [10]bool = @splat(false),
+    /// Per-slot stored `TypeId`s.
+    types: [10]TypeId = @splat(.unit_ty),
+};
+
+/// Persistent stackless coroutine activation record stored in `MirVm.coro_frames`.
+const VmCoroFrame = struct {
+    /// Target `is_async` `MirBody`.
+    body: *const MirBody,
+    /// Current `CoroStateTag` (`unpolled = 0`, `1..K`, `completed`, `cancelled`).
+    state: mir_async.CoroStateTag = .unpolled,
+    /// Persistent SSA register file across suspensions.
+    regs: []RegSlot = &.{},
+    /// Persistent local variable pointers (`_0 .. _N`).
+    local_ptrs: []SymbolicPtr = &.{},
+    /// Owned local `ComptimeAllocId`s invalidated only when the coroutine frame terminates.
+    owned_local_allocs: []ComptimeAllocId = &.{},
+    /// Dynamic frame-scoped allocations (e.g., `FmtArgs` buffers) invalidated on coroutine exit.
+    extra_allocs: std.ArrayListUnmanaged(ComptimeAllocId) = .empty,
+    /// Pointer to snapshot holding the currently awaited child `Future[T]` while suspended.
+    active_child_fut_ptr: SymbolicPtr = SymbolicPtr.NULL,
+    /// Concrete `Future[T]` `TypeId` of `active_child_fut_ptr`.
+    active_child_fut_ty: TypeId = .unit_ty,
+    /// Concrete output `TypeId` expected by `active_resume_bb`.
+    active_ready_ty: TypeId = .unit_ty,
+    /// Target `resume_bb` receiving `%ready_val` when `active_child_fut_ptr` completes.
+    active_resume_bb: MirBlockId = .none,
+    /// Target `cancel_bb` cleanup pad executed if cancelled at this suspension point.
+    active_cancel_bb: MirBlockId = .none,
+    /// `true` once frame buffers and owned local allocations have been released.
+    is_released: bool = false,
+};
+
+/// Spawned child task state inside a `VmTaskGroup` (`DR-08` §2.1).
+const VmTaskNode = struct {
+    /// Owning `VmTaskGroup` index in `MirVm.task_groups`.
+    group_id: u32,
+    /// Snapshot pointer holding the spawned `Future[T]`.
+    fut_ptr: SymbolicPtr,
+    /// Concrete `Future[T]` `TypeId`.
+    fut_ty: TypeId,
+    /// Unwrapped task output `TypeId` (`T`).
+    out_ty: TypeId,
+    /// Evaluated output `RegSlot` populated when `is_completed` becomes `true`.
+    result_slot: RegSlot = .{ .scalar_u64 = 0 },
+    /// Task-isolated 10-slot `Context` state saved/restored across polls.
+    ctx_snapshot: VmContextSnapshot = .{},
+    /// `true` once the task has finished (`Ready` or `Cancelled`).
+    is_completed: bool = false,
+    /// `true` if cancelled before or during execution.
+    is_cancelled: bool = false,
+    /// `true` while parked on another task's `join_waiter_item`.
+    is_parked_on_join: bool = false,
+    /// Waiting executor item (`0` = root `block_on` task, `task_idx + 1` = spawned task, `maxInt(u32)` = none).
+    join_waiter_item: u32 = std.math.maxInt(u32),
+};
+
+/// Structured concurrency `TaskGroup` nursery state (`DR-08` §2.1).
+const VmTaskGroup = struct {
+    /// Spawned `VmTaskNode` indices in registration order (`LIFO` reverse order on cancellation).
+    task_ids: std.ArrayListUnmanaged(u32) = .empty,
+    /// `true` once `cancel_all()`, sibling `Err`, or parent cancellation triggers group-wide cancellation.
+    is_cancelled: bool = false,
+    /// `true` once `async_task_group_exit` has drained/reaped this group.
+    is_exited: bool = false,
 };
 
 // --------------------------------------- CONSTS ----------------------------------------
@@ -1233,16 +1331,28 @@ pub const MirVm = struct {
     has_aborted_vacated_panic: bool = false,
     /// Non-null dangling `0`-byte sentinel allocation for empty slices (`[CRITICAL-04]`).
     dangling_empty_alloc: ComptimeAllocId = .null_ptr,
-    /// Dynamic 8-slot `Context` capability register bank (`DR-21` `SE-08`).
-    context_slots: [8]RegSlot = @splat(.{ .scalar_u64 = 0 }),
+    /// Dynamic 10-slot `Context` capability register bank (`DR-08` §5.3, `DR-21` `SE-08`).
+    context_slots: [10]RegSlot = @splat(.{ .scalar_u64 = 0 }),
     /// Per-slot initialization flags for `context_slots` (`false` returns zero-initialized default).
-    context_slots_init: [8]bool = @splat(false),
+    context_slots_init: [10]bool = @splat(false),
     /// Per-slot stored `TypeId` for `context_slots` (coerces synthetic capability handles across slots).
-    context_slot_types: [8]TypeId = @splat(.unit_ty),
+    context_slot_types: [10]TypeId = @splat(.unit_ty),
     /// Monotonic counter incremented on any `Context` read/write/region operation (`SE-08` memo guard).
     context_op_counter: u64 = 0,
     /// Process exit code recorded when `@sys_exit(code)` runs under `is_oracle_runtime_mode`.
     exited_with_code: ?i32 = null,
+    /// Suspended/unpolled stackless coroutine frames indexed by `handle_id - 1`.
+    coro_frames: std.ArrayListUnmanaged(VmCoroFrame) = .empty,
+    /// Spawned `TaskGroup` task nodes indexed by `task_id`.
+    task_nodes: std.ArrayListUnmanaged(VmTaskNode) = .empty,
+    /// Structured concurrency `TaskGroup` nurseries indexed by `group_id`.
+    task_groups: std.ArrayListUnmanaged(VmTaskGroup) = .empty,
+    /// Active FIFO cooperative ready queue (`0` = root `block_on`, `task_id + 1` = spawned task).
+    exec_ready_queue: std.ArrayListUnmanaged(u32) = .empty,
+    /// Currently polling executor item (`0` = root, `task_id + 1` = spawned task, `maxInt(u32)` = none).
+    active_polling_item: u32 = std.math.maxInt(u32),
+    /// `true` while executing a coroutine `cancel_bb` cleanup pad so `async_task_group_exit` cancels children.
+    active_coro_is_cancelling: bool = false,
 
     /// Initializes a `MirVm` instance with reserved slot `0` (`.null_ptr`) in `allocations`.
     pub fn init(
@@ -1299,6 +1409,23 @@ pub const MirVm = struct {
             frame.extra_stack_allocs.deinit(self.allocator);
         }
         self.call_stack.deinit(self.allocator);
+
+        for (self.coro_frames.items) |*coro| {
+            if (!coro.is_released) {
+                if (coro.regs.len > 0) self.allocator.free(coro.regs);
+                if (coro.local_ptrs.len > 0) self.allocator.free(coro.local_ptrs);
+                if (coro.owned_local_allocs.len > 0) self.allocator.free(coro.owned_local_allocs);
+                coro.extra_allocs.deinit(self.allocator);
+                coro.is_released = true;
+            }
+        }
+        self.coro_frames.deinit(self.allocator);
+        for (self.task_groups.items) |*grp| {
+            grp.task_ids.deinit(self.allocator);
+        }
+        self.task_groups.deinit(self.allocator);
+        self.task_nodes.deinit(self.allocator);
+        self.exec_ready_queue.deinit(self.allocator);
 
         for (self.allocations.items) |*alloc_rec| {
             alloc_rec.provenance.deinit(self.allocator);
@@ -1449,12 +1576,15 @@ pub const MirVm = struct {
         arg_slots: []const RegSlot,
     ) VmEvalError!VmEvalResult {
         self.active_inst_span = Span.init(body.file_id, 0, 0);
-        const ret_slot = try self.invokeBodyInternal(
-            body,
-            arg_slots,
-            &.{},
-            Span.init(body.file_id, 0, 0),
-        );
+        const ret_slot = if (body.is_async)
+            try self.evalAsyncBodyBlocking(body, arg_slots)
+        else
+            try self.invokeBodyInternal(
+                body,
+                arg_slots,
+                &.{},
+                Span.init(body.file_id, 0, 0),
+            );
         const ret_repr = classifyValueRepr(self.pool, self.sym_table, body.ret_ty, self.options.target_layout);
         // Verify no dangling stack pointer escaped in the top-level return value (`E0506`):
         try self.verifyNoEscapingStackPointers(body.ret_ty, ret_repr, ret_slot);
@@ -3597,6 +3727,15 @@ pub const MirVm = struct {
                         const delta = try self.mulOffsetChecked(idx_u128, elem_lay.byte_size);
                         cur_ptr = try self.advanceSymbolicPtr(cur_ptr, delta);
                         cur_ty = elem_ty;
+                    } else if (ty_node.tag == .raw_ptr_ty) {
+                        const raw_ptr = try self.readPointerAt(
+                            cur_ptr,
+                            if (is_unaligned) 0 else self.options.target_layout.ptr_align_log2,
+                        );
+                        const delta = try self.mulOffsetChecked(idx_u128, elem_lay.byte_size);
+                        cur_ptr = try self.advanceSymbolicPtr(raw_ptr, delta);
+                        cur_ty = elem_ty;
+                        is_unaligned = false;
                     } else if (ty_node.tag == .slice_ty) {
                         const fat = try self.readFatSliceParts(cur_ptr);
                         if (idx_u128 >= fat.elem_len) {
@@ -4143,6 +4282,7 @@ pub const MirVm = struct {
 
         while (true) {
             const frame_idx = self.call_stack.items.len - 1;
+            self.call_stack.items[frame_idx].cur_bb = cur_bb;
             const bb_rec = body.blocks.items[cur_bb.asInt()];
 
             for (body.getBlockInsts(cur_bb)) |inst_val| {
@@ -4274,6 +4414,15 @@ pub const MirVm = struct {
                         self.call_stack.items[frame_idx].regs[dst_params[0].asInt()] = ret_slot;
                     }
                     cur_bb = normal_edge.target_bb;
+                },
+                .coro_suspend => {
+                    return self.failWithTrap(
+                        error.ForbiddenOperation,
+                        .e0503_forbidden_comptime_operation,
+                        "`.await` suspension point executed outside async coroutine stepper",
+                        "unexpected synchronous `.await` here",
+                        null,
+                    );
                 },
             }
         }
@@ -4875,10 +5024,28 @@ pub const MirVm = struct {
     fn evalConstScalar(self: *MirVm, mir_const: mir.MirConst, raw_ty: TypeId) VmEvalError!RegSlot {
         const ty = self.pool.unwrapUnderlyingType(raw_ty);
         switch (mir_const) {
-            .unit_val => return .{ .scalar_u64 = 0 },
+            .unit_val => {
+                if (ty != .unit_ty and
+                    classifyValueRepr(self.pool, self.sym_table, ty, self.options.target_layout) == .by_value_snapshot)
+                {
+                    const snap = try self.allocSnapshotForType(ty, true);
+                    self.sealSnapshot(snap);
+                    return .{ .sym_ptr = snap };
+                }
+                return .{ .scalar_u64 = 0 };
+            },
             .bool_val => |flag| return .{ .scalar_u64 = @intFromBool(flag) },
             .char_val => |cp| return .{ .scalar_u64 = cp },
-            .int_val => |int_v| return self.makeIntSlot(ty, @bitCast(int_v)),
+            .int_val => |int_v| {
+                if (int_v == 0 and ty != .i128_ty and ty != .u128_ty and
+                    classifyValueRepr(self.pool, self.sym_table, ty, self.options.target_layout) == .by_value_snapshot)
+                {
+                    const snap = try self.allocSnapshotForType(ty, true);
+                    self.sealSnapshot(snap);
+                    return .{ .sym_ptr = snap };
+                }
+                return self.makeIntSlot(ty, @bitCast(int_v));
+            },
             .float_val => |flt_v| {
                 if (ty == .f32_ty) return packF32Slot(@floatCast(flt_v));
                 return .{ .scalar_f64 = canonicalizeF64(flt_v) };
@@ -6675,6 +6842,9 @@ pub const MirVm = struct {
                     }
                 }
             },
+            .future_ty => {
+                try self.cancelFutureAtPtr(place_ptr, ty);
+            },
             else => {},
         }
     }
@@ -7805,7 +7975,7 @@ pub const MirVm = struct {
                     self.call_stack.items[frame_idx].regs[args[0]],
                     slot_ty,
                 );
-                const slot_ord: usize = @intCast(slot_bits & 7);
+                const slot_ord: usize = if (slot_bits < 10) @intCast(slot_bits) else 0;
                 const dst_ty = self.pool.unwrapUnderlyingType(inst.type_id);
                 if (type_system.ContextFieldLayout.resolveRefPointee(self.pool, self.sym_table, dst_ty)) |ctx_struct_ty| {
                     const ctx_snap = try self.allocSnapshotForType(ctx_struct_ty, true);
@@ -7943,7 +8113,7 @@ pub const MirVm = struct {
                         self.call_stack.items[frame_idx].regs[args[0]],
                         slot_ty,
                     );
-                    const slot_ord: usize = @intCast(slot_bits & 7);
+                    const slot_ord: usize = if (slot_bits < 10) @intCast(slot_bits) else 0;
                     const val_ty = self.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[1])).type_id);
                     self.context_slots[slot_ord] = self.call_stack.items[frame_idx].regs[args[1]];
                     self.context_slot_types[slot_ord] = val_ty;
@@ -7955,6 +8125,1141 @@ pub const MirVm = struct {
                 self.context_op_counter += 1;
                 return .{ .scalar_u64 = 0 };
             },
+            .async_future_make => {
+                self.context_op_counter += 1;
+                return self.evalAsyncFutureMake(frame_idx, args, inst.type_id);
+            },
+            .async_task_group_enter => {
+                self.context_op_counter += 1;
+                const grp_id: u32 = @intCast(self.task_groups.items.len);
+                self.task_groups.append(self.allocator, .{}) catch return error.OutOfMemory;
+                return .{
+                    .sym_ptr = .{
+                        .alloc_id = self.dangling_empty_alloc,
+                        .byte_offset = grp_id + 1,
+                    },
+                };
+            },
+            .async_spawn => {
+                self.context_op_counter += 1;
+                return self.evalAsyncSpawn(frame_idx, args);
+            },
+            .async_join => {
+                self.context_op_counter += 1;
+                if (args.len < 1) return .{ .scalar_u64 = 0 };
+                const handle_slot = self.call_stack.items[frame_idx].regs[args[0]];
+                const task_handle_id = handle_slot.sym_ptr.byte_offset;
+                const fut_ty = self.pool.unwrapUnderlyingType(inst.type_id);
+                const out_ty = self.pool.getFutureOutputType(fut_ty) orelse .unit_ty;
+                return self.makeFutureSnapshot(fut_ty, task_handle_id, .join_task, 0, out_ty);
+            },
+            .async_cancel => {
+                self.context_op_counter += 1;
+                return self.evalAsyncCancel(frame_idx, args, inst.type_id);
+            },
+            .async_task_group_exit => {
+                self.context_op_counter += 1;
+                try self.evalAsyncTaskGroupExit(frame_idx, args);
+                return .{ .scalar_u64 = 0 };
+            },
+            .async_yield => {
+                self.context_op_counter += 1;
+                const fut_ty = self.pool.unwrapUnderlyingType(inst.type_id);
+                return self.makeFutureSnapshot(fut_ty, 0, .yield_once, 0, .unit_ty);
+            },
+            .async_block_on => {
+                self.context_op_counter += 1;
+                if (args.len < 1) return .{ .scalar_u64 = 0 };
+                const fut_vid = MirValueId.fromInt(args[0]);
+                const fut_ty = self.pool.unwrapUnderlyingType(body.getInst(fut_vid).type_id);
+                const fut_slot = self.call_stack.items[frame_idx].regs[args[0]];
+                return self.blockOnFutureInVm(fut_slot.sym_ptr, fut_ty, inst.type_id);
+            },
+        }
+    }
+
+    // ------- Stackless Coroutine & FIFO TaskGroup Scheduler -------
+
+    /// Allocates a mutable, zero-initialized `Future[T]` snapshot with its 4-word header populated.
+    fn makeFutureSnapshot(
+        self: *MirVm,
+        fut_ty: TypeId,
+        handle_id: u64,
+        fut_kind: VmFutureKind,
+        aux_u64: u64,
+        out_ty: TypeId,
+    ) VmEvalError!RegSlot {
+        const ptr_width: u32 = self.options.target_layout.ptr_byte_size;
+        const lay = type_system.computeTypeLayoutWithPool(
+            self.pool,
+            self.sym_table,
+            fut_ty,
+            self.options.target_layout,
+        );
+        const min_bytes = @max(lay.byte_size, @as(u64, ptr_width) * 4);
+        const alloc_id = try self.allocMemory(
+            min_bytes,
+            @max(lay.align_log2, self.options.target_layout.ptr_align_log2),
+            true,
+            false,
+            true,
+            0,
+            self.active_inst_span,
+        );
+        const snap = SymbolicPtr{ .alloc_id = alloc_id, .byte_offset = 0 };
+        try self.writeUsizeAt(snap, handle_id);
+        try self.writeUsizeAt(try self.advanceSymbolicPtr(snap, ptr_width), @backingInt(fut_kind));
+        try self.writeUsizeAt(try self.advanceSymbolicPtr(snap, ptr_width * 2), aux_u64);
+        try self.writeUsizeAt(try self.advanceSymbolicPtr(snap, ptr_width * 3), out_ty.toU32());
+        return .{ .sym_ptr = snap };
+    }
+
+    /// Captures the active 10-slot `Context` bank into a `VmContextSnapshot`.
+    fn captureContextSnapshot(self: *const MirVm) VmContextSnapshot {
+        return .{
+            .slots = self.context_slots,
+            .inits = self.context_slots_init,
+            .types = self.context_slot_types,
+        };
+    }
+
+    /// Restores `snap` into the active 10-slot `Context` bank.
+    fn restoreContextSnapshot(self: *MirVm, snap: VmContextSnapshot) void {
+        self.context_slots = snap.slots;
+        self.context_slots_init = snap.inits;
+        self.context_slot_types = snap.types;
+    }
+
+    /// Evaluates an `is_async` entrypoint (`async fn main`) by constructing an unpolled coroutine and blocking on it.
+    fn evalAsyncBodyBlocking(
+        self: *MirVm,
+        body: *const MirBody,
+        arg_slots: []const RegSlot,
+    ) VmEvalError!RegSlot {
+        const fut_ty = self.pool.internFuture(body.ret_ty, body.def_id.asInt()) catch return error.OutOfMemory;
+        const coro_id = try self.createCoroFrame(body, arg_slots, &.{});
+        const fut_slot = try self.makeFutureSnapshot(fut_ty, coro_id + 1, .coro_frame, 0, body.ret_ty);
+        return self.blockOnFutureInVm(fut_slot.sym_ptr, fut_ty, body.ret_ty);
+    }
+
+    /// Resolves `async_future_make` (`[def_id, sym_idx, callee_val, args…]`) into a lazy unpolled `Future[T]`.
+    fn evalAsyncFutureMake(
+        self: *MirVm,
+        frame_idx: usize,
+        args: []const u32,
+        fut_raw_ty: TypeId,
+    ) VmEvalError!RegSlot {
+        if (args.len < 3) return .{ .scalar_u64 = 0 };
+        const caller_body = self.call_stack.items[frame_idx].body;
+        const def_bits = try self.readIntBitsFromSlot(
+            self.call_stack.items[frame_idx].regs[args[0]],
+            caller_body.getInst(MirValueId.fromInt(args[0])).type_id,
+        );
+        const sym_bits = try self.readIntBitsFromSlot(
+            self.call_stack.items[frame_idx].regs[args[1]],
+            caller_body.getInst(MirValueId.fromInt(args[1])).type_id,
+        );
+        const direct_def = DefId.fromInt(@truncate(def_bits));
+        const direct_sym = SymbolIndex.fromInt(@truncate(sym_bits));
+        const callee_vid = MirValueId.fromInt(args[2]);
+        const callee_slot = self.call_stack.items[frame_idx].regs[args[2]];
+        const callee_ty = self.pool.unwrapUnderlyingType(caller_body.getInst(callee_vid).type_id);
+        const callee_node = self.pool.getNode(callee_ty);
+
+        var val_args: std.ArrayListUnmanaged(RegSlot) = .empty;
+        defer val_args.deinit(self.allocator);
+        var alias_places: std.ArrayListUnmanaged(SymbolicPtr) = .empty;
+        defer alias_places.deinit(self.allocator);
+
+        var target_body_opt: ?*const MirBody = null;
+        var formal_count: usize = 0;
+
+        if (callee_node.tag == .closure_ty) {
+            const sig_view = self.pool.getFnSignatureView(callee_ty);
+            formal_count = if (sig_view) |sv| sv.paramCount() else 0;
+            var fn_idx_opt: ?u32 = null;
+            if (!direct_def.isNone() or !direct_sym.isNone()) {
+                fn_idx_opt = try self.tryResolveOrLoadCallable(direct_def, direct_sym);
+            }
+            if (fn_idx_opt == null) {
+                const fn_ptr = try self.readPointerAt(
+                    try self.advanceSymbolicPtr(callee_slot.sym_ptr, self.options.target_layout.ptr_byte_size),
+                    self.options.target_layout.ptr_align_log2,
+                );
+                if (fn_ptr.alloc_id.isFnAddr()) fn_idx_opt = fn_ptr.alloc_id.payloadIndex();
+            }
+            if (fn_idx_opt) |fn_idx| {
+                if (fn_idx < self.callables.items.len) {
+                    target_body_opt = self.callables.items[fn_idx].body;
+                }
+            }
+            if (target_body_opt) |closure_body| {
+                const capture_count = closure_body.param_count -| formal_count;
+                const cap_env_ptr = try self.readPointerAt(
+                    callee_slot.sym_ptr,
+                    self.options.target_layout.ptr_align_log2,
+                );
+                if (capture_count > 0) {
+                    var cur_off: u64 = 0;
+                    for (0..capture_count) |cap_i| {
+                        const cap_ty = closure_body.locals.items[1 + cap_i].type_id;
+                        const cap_lay = type_system.computeTypeLayoutWithPool(
+                            self.pool,
+                            self.sym_table,
+                            cap_ty,
+                            self.options.target_layout,
+                        );
+                        if (cap_lay.byte_size == 0) {
+                            val_args.append(self.allocator, .{ .scalar_u64 = 0 }) catch return error.OutOfMemory;
+                            continue;
+                        }
+                        cur_off = std.mem.alignForward(u64, cur_off, @max(@as(u64, cap_lay.align_bytes), 1));
+                        const cap_ptr = try self.advanceSymbolicPtr(cap_env_ptr, cur_off);
+                        const cap_slot = try self.loadTypedSlotFromMemory(cap_ptr, cap_ty);
+                        val_args.append(self.allocator, cap_slot) catch return error.OutOfMemory;
+                        cur_off += cap_lay.byte_size;
+                    }
+                }
+            }
+        } else {
+            var fn_idx_opt: ?u32 = null;
+            if (!direct_def.isNone() or !direct_sym.isNone()) {
+                fn_idx_opt = try self.tryResolveOrLoadCallable(direct_def, direct_sym);
+            }
+            if (fn_idx_opt == null and callee_slot.sym_ptr.alloc_id.isFnAddr()) {
+                fn_idx_opt = callee_slot.sym_ptr.alloc_id.payloadIndex();
+            }
+            if (fn_idx_opt) |fn_idx| {
+                if (fn_idx < self.callables.items.len) {
+                    target_body_opt = self.callables.items[fn_idx].body;
+                }
+            }
+            if (target_body_opt) |fn_body| {
+                formal_count = fn_body.param_count;
+            }
+        }
+
+        const target_body = target_body_opt orelse {
+            return self.failWithTrap(
+                error.UnresolvedCallee,
+                .e0503_forbidden_comptime_operation,
+                "cannot resolve target `async` function body",
+                "unresolved `async` callee here",
+                null,
+            );
+        };
+
+        const capture_base: usize = target_body.param_count -| formal_count;
+        const avail_args = @min(formal_count, args.len - 3);
+        for (0..avail_args) |arg_i| {
+            const param_decl = target_body.locals.items[1 + capture_base + arg_i];
+            const raw_slot = self.call_stack.items[frame_idx].regs[args[3 + arg_i]];
+            if (param_decl.mode() == .inout_mode or param_decl.mode() == .set_mode) {
+                alias_places.append(self.allocator, raw_slot.sym_ptr) catch return error.OutOfMemory;
+            } else {
+                val_args.append(self.allocator, raw_slot) catch return error.OutOfMemory;
+            }
+        }
+
+        const coro_id = try self.createCoroFrame(target_body, val_args.items, alias_places.items);
+        const fut_ty = self.pool.unwrapUnderlyingType(fut_raw_ty);
+        const out_ty = self.pool.getFutureOutputType(fut_ty) orelse target_body.ret_ty;
+        return self.makeFutureSnapshot(fut_ty, coro_id + 1, .coro_frame, 0, out_ty);
+    }
+
+    /// Allocates an unpolled `VmCoroFrame` (`state == .unpolled`) with parameter slots initialized.
+    fn createCoroFrame(
+        self: *MirVm,
+        body: *const MirBody,
+        arg_slots: []const RegSlot,
+        alias_places: []const SymbolicPtr,
+    ) VmEvalError!u32 {
+        const reg_count = body.insts.len;
+        const local_count = body.locals.items.len;
+
+        const regs: []RegSlot = if (reg_count > 0)
+            self.allocator.alloc(RegSlot, reg_count) catch return error.OutOfMemory
+        else
+            &.{};
+        errdefer if (regs.len > 0) self.allocator.free(regs);
+        if (regs.len > 0) @memset(regs, .{ .scalar_u64 = 0 });
+
+        const local_ptrs: []SymbolicPtr = if (local_count > 0)
+            self.allocator.alloc(SymbolicPtr, local_count) catch return error.OutOfMemory
+        else
+            &.{};
+        errdefer if (local_ptrs.len > 0) self.allocator.free(local_ptrs);
+        if (local_ptrs.len > 0) @memset(local_ptrs, SymbolicPtr.NULL);
+
+        const owned_local_allocs: []ComptimeAllocId = if (local_count > 0)
+            self.allocator.alloc(ComptimeAllocId, local_count) catch return error.OutOfMemory
+        else
+            &.{};
+        errdefer if (owned_local_allocs.len > 0) self.allocator.free(owned_local_allocs);
+        if (owned_local_allocs.len > 0) @memset(owned_local_allocs, .none);
+
+        var val_cursor: usize = 0;
+        var alias_cursor: usize = 0;
+
+        for (body.locals.items, 0..) |loc_decl, loc_i| {
+            const is_param = loc_i >= 1 and loc_i <= body.param_count;
+            if (is_param and (loc_decl.mode() == .inout_mode or loc_decl.mode() == .set_mode) and
+                alias_cursor < alias_places.len)
+            {
+                local_ptrs[loc_i] = alias_places[alias_cursor];
+                alias_cursor += 1;
+                continue;
+            }
+
+            const lay = type_system.computeTypeLayoutWithPool(
+                self.pool,
+                self.sym_table,
+                loc_decl.type_id,
+                self.options.target_layout,
+            );
+            const unwrapped_loc = self.pool.unwrapUnderlyingType(loc_decl.type_id);
+            const loc_node = self.pool.getNode(unwrapped_loc);
+            const soa_cap: u32 = if (loc_node.tag == .soa_array_ty)
+                (loc_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG)
+            else
+                0;
+            const loc_span = self.resolveTokenSpan(body.file_id, loc_decl.origin_token);
+            const alloc_id = try self.allocMemory(
+                lay.byte_size,
+                lay.align_log2,
+                true,
+                false,
+                true,
+                soa_cap,
+                loc_span,
+            );
+            local_ptrs[loc_i] = .{ .alloc_id = alloc_id, .byte_offset = 0 };
+            owned_local_allocs[loc_i] = alloc_id;
+
+            if (is_param and val_cursor < arg_slots.len) {
+                if (loc_decl.mode() != .set_mode) {
+                    try self.storeTypedSlotToMemory(local_ptrs[loc_i], loc_decl.type_id, arg_slots[val_cursor]);
+                }
+                val_cursor += 1;
+            }
+        }
+
+        const coro_id: u32 = @intCast(self.coro_frames.items.len);
+        self.coro_frames.append(self.allocator, .{
+            .body = body,
+            .state = .unpolled,
+            .regs = regs,
+            .local_ptrs = local_ptrs,
+            .owned_local_allocs = owned_local_allocs,
+        }) catch return error.OutOfMemory;
+        return coro_id;
+    }
+
+    /// Marks all coroutine-owned local allocations dead (`is_live = false`) and frees frame buffers.
+    fn releaseCoroFrame(self: *MirVm, coro_id: u32) void {
+        if (coro_id >= self.coro_frames.items.len) return;
+        const coro = &self.coro_frames.items[coro_id];
+        if (coro.is_released) return;
+        for (coro.owned_local_allocs) |owned_aid| {
+            if (owned_aid != .none and owned_aid.domain() == .vm_alloc) {
+                const slot_i = owned_aid.payloadIndex();
+                if (slot_i > 1 and slot_i < self.allocations.items.len) {
+                    self.allocations.items[slot_i].is_live = false;
+                }
+            }
+        }
+        for (coro.extra_allocs.items) |extra_aid| {
+            if (extra_aid != .none and extra_aid.domain() == .vm_alloc) {
+                const slot_i = extra_aid.payloadIndex();
+                if (slot_i > 1 and slot_i < self.allocations.items.len) {
+                    self.allocations.items[slot_i].is_live = false;
+                }
+            }
+        }
+        coro.extra_allocs.deinit(self.allocator);
+        if (coro.owned_local_allocs.len > 0) self.allocator.free(coro.owned_local_allocs);
+        if (coro.local_ptrs.len > 0) self.allocator.free(coro.local_ptrs);
+        if (coro.regs.len > 0) self.allocator.free(coro.regs);
+        coro.regs = &.{};
+        coro.local_ptrs = &.{};
+        coro.owned_local_allocs = &.{};
+        coro.is_released = true;
+    }
+
+    /// Evaluates `async_spawn`: registers a `VmTaskNode` on `group` and appends it to the FIFO ready queue.
+    fn evalAsyncSpawn(
+        self: *MirVm,
+        frame_idx: usize,
+        args: []const u32,
+    ) VmEvalError!RegSlot {
+        if (args.len < 3) return .{ .scalar_u64 = 0 };
+        const caller_body = self.call_stack.items[frame_idx].body;
+        const group_ref_ptr = self.call_stack.items[frame_idx].regs[args[1]].sym_ptr;
+        const group_handle = try self.readPointerAt(group_ref_ptr, self.options.target_layout.ptr_align_log2);
+        const group_id = group_handle.byte_offset -| 1;
+
+        const fut_vid = MirValueId.fromInt(args[2]);
+        const fut_ty = self.pool.unwrapUnderlyingType(caller_body.getInst(fut_vid).type_id);
+        const out_ty = if (self.pool.getFutureOutputType(fut_ty)) |out_t|
+            self.pool.unwrapUnderlyingType(out_t)
+        else
+            TypeId.unit_ty;
+        const src_fut_ptr = self.call_stack.items[frame_idx].regs[args[2]].sym_ptr;
+
+        const ptr_width: u32 = self.options.target_layout.ptr_byte_size;
+        const fut_lay = type_system.computeTypeLayoutWithPool(
+            self.pool,
+            self.sym_table,
+            fut_ty,
+            self.options.target_layout,
+        );
+        const owned_fut_id = try self.allocMemory(
+            @max(fut_lay.byte_size, @as(u64, ptr_width) * 4),
+            @max(fut_lay.align_log2, self.options.target_layout.ptr_align_log2),
+            true,
+            false,
+            true,
+            0,
+            self.active_inst_span,
+        );
+        const owned_fut_ptr = SymbolicPtr{ .alloc_id = owned_fut_id, .byte_offset = 0 };
+        try self.copyMemoryRange(owned_fut_ptr, src_fut_ptr, fut_lay.byte_size, 0);
+        if (src_fut_ptr.alloc_id.domain() == .vm_alloc) {
+            const src_idx = src_fut_ptr.alloc_id.payloadIndex();
+            if (src_idx > 1 and src_idx < self.allocations.items.len and self.allocations.items[src_idx].is_mutable) {
+                try self.writeUsizeAt(try self.advanceSymbolicPtr(src_fut_ptr, ptr_width), 0);
+            }
+        }
+
+        const task_id: u32 = @intCast(self.task_nodes.items.len);
+        self.task_nodes.append(self.allocator, .{
+            .group_id = group_id,
+            .fut_ptr = owned_fut_ptr,
+            .fut_ty = fut_ty,
+            .out_ty = out_ty,
+            .ctx_snapshot = self.captureContextSnapshot(),
+        }) catch return error.OutOfMemory;
+
+        if (group_id < self.task_groups.items.len) {
+            self.task_groups.items[group_id].task_ids.append(self.allocator, task_id) catch return error.OutOfMemory;
+        }
+        self.exec_ready_queue.append(self.allocator, task_id + 1) catch return error.OutOfMemory;
+
+        return .{
+            .sym_ptr = .{
+                .alloc_id = self.dangling_empty_alloc,
+                .byte_offset = task_id + 1,
+            },
+        };
+    }
+
+    /// Evaluates `async_cancel` (`handle.cancel()`, `group.cancel_all()`, and `group.is_cancelled()`).
+    fn evalAsyncCancel(
+        self: *MirVm,
+        frame_idx: usize,
+        args: []const u32,
+        ret_raw_ty: TypeId,
+    ) VmEvalError!RegSlot {
+        if (args.len < 1) return .{ .scalar_u64 = 0 };
+        const ret_ty = self.pool.unwrapUnderlyingType(ret_raw_ty);
+
+        // [1] `group.is_cancelled()` (`args.len >= 2`, returns `bool`):
+        if (args.len >= 2 or ret_ty == .bool_ty) {
+            const group_ref_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+            const group_handle = try self.readPointerAt(group_ref_ptr, self.options.target_layout.ptr_align_log2);
+            const group_id = group_handle.byte_offset -| 1;
+            const is_canc = group_id < self.task_groups.items.len and self.task_groups.items[group_id].is_cancelled;
+            return .{ .scalar_u64 = @intFromBool(is_canc) };
+        }
+
+        // [2] `handle.cancel()` (`ret_ty` is `Future[unit]`):
+        if (self.pool.isFutureType(ret_ty)) {
+            const handle_slot = self.call_stack.items[frame_idx].regs[args[0]];
+            return self.makeFutureSnapshot(ret_ty, handle_slot.sym_ptr.byte_offset, .cancel_task, 0, .unit_ty);
+        }
+
+        // [3] `group.cancel_all()` (`ret_ty == .unit_ty`):
+        const group_ref_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+        const group_handle = try self.readPointerAt(group_ref_ptr, self.options.target_layout.ptr_align_log2);
+        const group_id = group_handle.byte_offset -| 1;
+        try self.cancelAllTasksInGroup(group_id);
+        return .{ .scalar_u64 = 0 };
+    }
+
+    /// Cancels all uncompleted sibling tasks in `group_id` in reverse registration (`LIFO`) order.
+    fn cancelAllTasksInGroup(self: *MirVm, group_id: u32) VmEvalError!void {
+        if (group_id >= self.task_groups.items.len) return;
+        self.task_groups.items[group_id].is_cancelled = true;
+        var rev_idx = self.task_groups.items[group_id].task_ids.items.len;
+        while (rev_idx > 0) {
+            rev_idx -= 1;
+            const task_id = self.task_groups.items[group_id].task_ids.items[rev_idx];
+            if (self.active_polling_item == task_id + 1) continue;
+            try self.cancelSpawnedTask(task_id);
+        }
+    }
+
+    /// Cancels a single `VmTaskNode` (`state == 0` drops captured args; `state in 1..K` runs `cancel_bb`).
+    fn cancelSpawnedTask(self: *MirVm, task_id: u32) VmEvalError!void {
+        if (task_id >= self.task_nodes.items.len) return;
+        if (self.task_nodes.items[task_id].is_completed or self.task_nodes.items[task_id].is_cancelled) return;
+        self.task_nodes.items[task_id].is_cancelled = true;
+        self.task_nodes.items[task_id].is_completed = true;
+
+        const saved_ctx = self.captureContextSnapshot();
+        const saved_polling = self.active_polling_item;
+        self.restoreContextSnapshot(self.task_nodes.items[task_id].ctx_snapshot);
+        self.active_polling_item = task_id + 1;
+        defer {
+            self.active_polling_item = saved_polling;
+            self.restoreContextSnapshot(saved_ctx);
+        }
+
+        const fut_ptr = self.task_nodes.items[task_id].fut_ptr;
+        const fut_ty = self.task_nodes.items[task_id].fut_ty;
+        try self.cancelFutureAtPtr(fut_ptr, fut_ty);
+
+        const waiter = self.task_nodes.items[task_id].join_waiter_item;
+        if (waiter != std.math.maxInt(u32)) {
+            self.task_nodes.items[task_id].join_waiter_item = std.math.maxInt(u32);
+            if (waiter >= 1 and waiter - 1 < self.task_nodes.items.len) {
+                self.task_nodes.items[waiter - 1].is_parked_on_join = false;
+            }
+            self.exec_ready_queue.append(self.allocator, waiter) catch return error.OutOfMemory;
+        }
+    }
+
+    /// Cancels an unconsumed or suspended `Future[T]` at `fut_ptr` (`no-op` if already completed/empty).
+    fn cancelFutureAtPtr(self: *MirVm, fut_ptr: SymbolicPtr, fut_ty: TypeId) VmEvalError!void {
+        _ = fut_ty;
+        if (fut_ptr.alloc_id.isNullOrNone() or fut_ptr.alloc_id.domain() != .vm_alloc) return;
+        const alloc_idx = fut_ptr.alloc_id.payloadIndex();
+        if (alloc_idx <= 1 or alloc_idx >= self.allocations.items.len) return;
+        if (!self.allocations.items[alloc_idx].is_live) return;
+        const ptr_width: u32 = self.options.target_layout.ptr_byte_size;
+        if (@as(u64, fut_ptr.byte_offset) + ptr_width * 2 > self.allocations.items[alloc_idx].bytes.len) return;
+
+        const handle_id = try self.readUsizeAt(fut_ptr);
+        const kind_raw = try self.readUsizeAt(try self.advanceSymbolicPtr(fut_ptr, ptr_width));
+        if (self.allocations.items[alloc_idx].is_mutable) {
+            try self.writeUsizeAt(try self.advanceSymbolicPtr(fut_ptr, ptr_width), 0);
+        }
+        if (kind_raw == @backingInt(VmFutureKind.coro_frame) and handle_id > 0) {
+            try self.cancelCoroFrame(@intCast(handle_id - 1));
+        }
+    }
+
+    /// Cancels `coro_frames[coro_id]`: drops unpolled non-`Copy` args at `state == 0` or runs `cancel_bb`.
+    fn cancelCoroFrame(self: *MirVm, coro_id: u32) VmEvalError!void {
+        if (coro_id >= self.coro_frames.items.len) return;
+        const cur_state = self.coro_frames.items[coro_id].state;
+        if (cur_state == .completed or cur_state == .cancelled or self.coro_frames.items[coro_id].is_released) return;
+
+        const body = self.coro_frames.items[coro_id].body;
+        if (cur_state == .unpolled) {
+            self.coro_frames.items[coro_id].state = .cancelled;
+            var rev_param: usize = body.param_count;
+            while (rev_param > 0) {
+                const param_decl = body.locals.items[rev_param];
+                if (param_decl.mode() != .inout_mode and param_decl.mode() != .set_mode) {
+                    const param_ptr = self.coro_frames.items[coro_id].local_ptrs[rev_param];
+                    try self.dropPlaceInVm(param_ptr, param_decl.type_id);
+                }
+                rev_param -= 1;
+            }
+            self.releaseCoroFrame(coro_id);
+            return;
+        }
+
+        const child_ptr = self.coro_frames.items[coro_id].active_child_fut_ptr;
+        const child_ty = self.coro_frames.items[coro_id].active_child_fut_ty;
+        const cancel_bb = self.coro_frames.items[coro_id].active_cancel_bb;
+        self.coro_frames.items[coro_id].state = .cancelled;
+
+        try self.cancelFutureAtPtr(child_ptr, child_ty);
+        if (!cancel_bb.isNone()) {
+            const prev_cancelling = self.active_coro_is_cancelling;
+            self.active_coro_is_cancelling = true;
+            defer self.active_coro_is_cancelling = prev_cancelling;
+            _ = try self.runCoroBlocksFrom(coro_id, cancel_bb, true);
+        }
+        self.releaseCoroFrame(coro_id);
+    }
+
+    /// Evaluates `async_task_group_exit(group)`: cancels remaining tasks on error/cancel, else drains FIFO.
+    fn evalAsyncTaskGroupExit(
+        self: *MirVm,
+        frame_idx: usize,
+        args: []const u32,
+    ) VmEvalError!void {
+        if (args.len < 1) return;
+        const group_slot = self.call_stack.items[frame_idx].regs[args[0]];
+        const group_id = group_slot.sym_ptr.byte_offset -| 1;
+        if (group_id >= self.task_groups.items.len) return;
+        if (self.task_groups.items[group_id].is_exited) return;
+
+        const body = self.call_stack.items[frame_idx].body;
+        const cur_bb = self.call_stack.items[frame_idx].cur_bb;
+        var is_err_or_cancel = self.active_coro_is_cancelling or self.task_groups.items[group_id].is_cancelled;
+        if (!is_err_or_cancel and cur_bb.asInt() < body.blocks.items.len) {
+            const bb_rec = body.blocks.items[cur_bb.asInt()];
+            if (bb_rec.isCleanupPad()) {
+                is_err_or_cancel = true;
+            } else if (bb_rec.terminator.kind == .ret) {
+                const ret_unwrapped = self.pool.unwrapUnderlyingType(body.ret_ty);
+                if (!ret_unwrapped.isError() and self.pool.getNode(ret_unwrapped).tag == .result_ty) {
+                    const ret_slot = if (bb_rec.terminator.cond_or_val != mir.NONE_U32)
+                        self.call_stack.items[frame_idx].regs[bb_rec.terminator.cond_or_val]
+                    else
+                        try self.loadTypedSlotFromMemory(
+                            self.call_stack.items[frame_idx].local_ptrs[0],
+                            ret_unwrapped,
+                        );
+                    if (try self.isResultSlotErr(ret_slot, ret_unwrapped)) {
+                        is_err_or_cancel = true;
+                    }
+                }
+            }
+        }
+
+        if (is_err_or_cancel) {
+            try self.cancelAllTasksInGroup(group_id);
+            self.task_groups.items[group_id].is_exited = true;
+            return;
+        }
+
+        // Normal nursery exit: drive any unjoined tasks in `group_id` round-robin to completion:
+        while (true) {
+            var has_pending = false;
+            var has_progressed = false;
+            const task_count = self.task_groups.items[group_id].task_ids.items.len;
+            for (0..task_count) |idx| {
+                const task_id = self.task_groups.items[group_id].task_ids.items[idx];
+                if (!self.task_nodes.items[task_id].is_completed) {
+                    has_pending = true;
+                    if (!self.task_nodes.items[task_id].is_parked_on_join) {
+                        has_progressed = true;
+                        try self.stepSpawnedTaskOnce(task_id);
+                        if (self.task_groups.items[group_id].is_cancelled) {
+                            try self.cancelAllTasksInGroup(group_id);
+                            self.task_groups.items[group_id].is_exited = true;
+                            return;
+                        }
+                    }
+                }
+            }
+            if (!has_pending) break;
+            if (!has_progressed) {
+                var has_stepped_outer = false;
+                for (0..self.task_nodes.items.len) |outer_i| {
+                    if (self.active_polling_item == outer_i + 1) continue;
+                    if (!self.task_nodes.items[outer_i].is_completed and
+                        !self.task_nodes.items[outer_i].is_parked_on_join)
+                    {
+                        has_stepped_outer = true;
+                        try self.stepSpawnedTaskOnce(@intCast(outer_i));
+                        break;
+                    }
+                }
+                if (!has_stepped_outer) {
+                    return self.failWithTrap(
+                        error.ArithmeticTrap,
+                        .e0507_comptime_arithmetic_trap,
+                        "deadlock detected at `TaskGroup` exit barrier with zero runnable tasks",
+                        "`TaskGroup` deadlocked here",
+                        null,
+                    );
+                }
+            }
+        }
+        self.task_groups.items[group_id].is_exited = true;
+    }
+
+    /// Returns `true` when `res_slot` of `.result_ty` carries discriminant `1` (`.Err`).
+    fn isResultSlotErr(self: *MirVm, res_slot: RegSlot, res_ty: TypeId) VmEvalError!bool {
+        const unwrapped = self.pool.unwrapUnderlyingType(res_ty);
+        if (unwrapped.isError() or self.pool.getNode(unwrapped).tag != .result_ty) return false;
+        const repr = classifyValueRepr(self.pool, self.sym_table, unwrapped, self.options.target_layout);
+        if (repr == .by_value_snapshot) {
+            return (try self.readSumDiscriminantAt(res_slot.sym_ptr, unwrapped)) != 0;
+        }
+        const snap = try self.allocSnapshotForType(unwrapped, true);
+        try self.storeTypedSlotToMemory(snap, unwrapped, res_slot);
+        return (try self.readSumDiscriminantAt(snap, unwrapped)) != 0;
+    }
+
+    /// Drives `root_fut_ptr` and all spawned `TaskGroup` tasks in deterministic FIFO round-robin order.
+    fn blockOnFutureInVm(
+        self: *MirVm,
+        root_fut_ptr: SymbolicPtr,
+        root_fut_ty: TypeId,
+        out_ty: TypeId,
+    ) VmEvalError!RegSlot {
+        const ptr_width: u32 = self.options.target_layout.ptr_byte_size;
+        const fut_lay = type_system.computeTypeLayoutWithPool(
+            self.pool,
+            self.sym_table,
+            root_fut_ty,
+            self.options.target_layout,
+        );
+        const owned_root_id = try self.allocMemory(
+            @max(fut_lay.byte_size, @as(u64, ptr_width) * 4),
+            @max(fut_lay.align_log2, self.options.target_layout.ptr_align_log2),
+            true,
+            false,
+            true,
+            0,
+            self.active_inst_span,
+        );
+        const owned_root_ptr = SymbolicPtr{ .alloc_id = owned_root_id, .byte_offset = 0 };
+        try self.copyMemoryRange(owned_root_ptr, root_fut_ptr, fut_lay.byte_size, 0);
+        if (root_fut_ptr.alloc_id.domain() == .vm_alloc) {
+            const src_idx = root_fut_ptr.alloc_id.payloadIndex();
+            if (src_idx > 1 and src_idx < self.allocations.items.len and self.allocations.items[src_idx].is_mutable) {
+                try self.writeUsizeAt(try self.advanceSymbolicPtr(root_fut_ptr, ptr_width), 0);
+            }
+        }
+
+        const saved_queue_base = self.exec_ready_queue.items.len;
+        defer self.exec_ready_queue.items.len = saved_queue_base;
+        const saved_polling = self.active_polling_item;
+        defer self.active_polling_item = saved_polling;
+
+        const baseline_ctx = self.captureContextSnapshot();
+        var root_ctx = baseline_ctx;
+        var is_root_parked_on_join = false;
+
+        self.exec_ready_queue.append(self.allocator, 0) catch return error.OutOfMemory;
+        var queue_head: usize = saved_queue_base;
+
+        while (true) {
+            try self.tickStepBudget();
+            if (queue_head >= self.exec_ready_queue.items.len) {
+                return self.failWithTrap(
+                    error.ArithmeticTrap,
+                    .e0507_comptime_arithmetic_trap,
+                    "deadlock detected in `block_on`: root `Future` is `Pending` with zero runnable tasks",
+                    "`block_on` deadlocked here",
+                    null,
+                );
+            }
+            const item = self.exec_ready_queue.items[queue_head];
+            queue_head += 1;
+
+            if (item == 0) {
+                self.restoreContextSnapshot(root_ctx);
+                self.active_polling_item = 0;
+                is_root_parked_on_join = false;
+                const poll_res = try self.pollFutureAtPtr(owned_root_ptr, root_fut_ty, out_ty, &is_root_parked_on_join);
+                root_ctx = self.captureContextSnapshot();
+                self.restoreContextSnapshot(baseline_ctx);
+                switch (poll_res) {
+                    .ready => |final_slot| {
+                        self.restoreContextSnapshot(root_ctx);
+                        return final_slot;
+                    },
+                    .pending => {
+                        if (!is_root_parked_on_join) {
+                            self.exec_ready_queue.append(self.allocator, 0) catch return error.OutOfMemory;
+                        }
+                    },
+                }
+            } else {
+                const task_id = item - 1;
+                if (task_id < self.task_nodes.items.len and !self.task_nodes.items[task_id].is_completed) {
+                    try self.stepSpawnedTaskOnce(task_id);
+                    self.restoreContextSnapshot(baseline_ctx);
+                }
+            }
+        }
+    }
+
+    /// Polls `task_nodes[task_id]` by one cooperative step, handling sibling `Err` cascade and join wakeups.
+    fn stepSpawnedTaskOnce(self: *MirVm, task_id: u32) VmEvalError!void {
+        if (task_id >= self.task_nodes.items.len or self.task_nodes.items[task_id].is_completed) return;
+
+        const saved_ctx = self.captureContextSnapshot();
+        const saved_polling = self.active_polling_item;
+        self.restoreContextSnapshot(self.task_nodes.items[task_id].ctx_snapshot);
+        self.active_polling_item = task_id + 1;
+        self.task_nodes.items[task_id].is_parked_on_join = false;
+
+        var is_parked = false;
+        const fut_ptr = self.task_nodes.items[task_id].fut_ptr;
+        const fut_ty = self.task_nodes.items[task_id].fut_ty;
+        const out_ty = self.task_nodes.items[task_id].out_ty;
+        const poll_res = try self.pollFutureAtPtr(fut_ptr, fut_ty, out_ty, &is_parked);
+
+        self.task_nodes.items[task_id].ctx_snapshot = self.captureContextSnapshot();
+        self.active_polling_item = saved_polling;
+        self.restoreContextSnapshot(saved_ctx);
+
+        switch (poll_res) {
+            .pending => {
+                self.task_nodes.items[task_id].is_parked_on_join = is_parked;
+                if (!is_parked) {
+                    self.exec_ready_queue.append(self.allocator, task_id + 1) catch return error.OutOfMemory;
+                }
+            },
+            .ready => |res_slot| {
+                self.task_nodes.items[task_id].result_slot = res_slot;
+                self.task_nodes.items[task_id].is_completed = true;
+                const grp_id = self.task_nodes.items[task_id].group_id;
+
+                // Structured concurrency sibling failure cascade (`DR-08` §2.1):
+                if (try self.isResultSlotErr(res_slot, out_ty)) {
+                    try self.cancelAllTasksInGroup(grp_id);
+                }
+
+                const waiter = self.task_nodes.items[task_id].join_waiter_item;
+                if (waiter != std.math.maxInt(u32)) {
+                    self.task_nodes.items[task_id].join_waiter_item = std.math.maxInt(u32);
+                    if (waiter >= 1 and waiter - 1 < self.task_nodes.items.len) {
+                        self.task_nodes.items[waiter - 1].is_parked_on_join = false;
+                    }
+                    self.exec_ready_queue.append(self.allocator, waiter) catch return error.OutOfMemory;
+                }
+            },
+        }
+    }
+
+    /// Polls any `Future[T]` snapshot (`coro_frame`, `yield_once`, `join_task`, `cancel_task`) by one step.
+    fn pollFutureAtPtr(
+        self: *MirVm,
+        fut_ptr: SymbolicPtr,
+        fut_ty: TypeId,
+        out_ty: TypeId,
+        is_parked_on_join_out: *bool,
+    ) VmEvalError!VmPollOutcome {
+        _ = fut_ty;
+        const ptr_width: u32 = self.options.target_layout.ptr_byte_size;
+        const handle_id = try self.readUsizeAt(fut_ptr);
+        const raw_kind = try self.readUsizeAt(try self.advanceSymbolicPtr(fut_ptr, ptr_width));
+        const aux_ptr = try self.advanceSymbolicPtr(fut_ptr, ptr_width * 2);
+        const aux_val = try self.readUsizeAt(aux_ptr);
+
+        if (raw_kind == @backingInt(VmFutureKind.yield_once)) {
+            if (aux_val == 0) {
+                try self.writeUsizeAt(aux_ptr, 1);
+                return .pending;
+            }
+            try self.writeUsizeAt(aux_ptr, 0xFFFF_FFFE);
+            try self.writeUsizeAt(try self.advanceSymbolicPtr(fut_ptr, ptr_width), 0);
+            return .{ .ready = .{ .scalar_u64 = 0 } };
+        }
+
+        if (raw_kind == @backingInt(VmFutureKind.join_task)) {
+            if (handle_id == 0 or handle_id - 1 >= self.task_nodes.items.len) {
+                const unwrapped_out = self.pool.unwrapUnderlyingType(out_ty);
+                if (!unwrapped_out.isError() and
+                    classifyValueRepr(self.pool, self.sym_table, unwrapped_out, self.options.target_layout) ==
+                        .by_value_snapshot)
+                {
+                    const zero_snap = try self.allocSnapshotForType(unwrapped_out, true);
+                    if (!self.pool.isFutureType(unwrapped_out)) self.sealSnapshot(zero_snap);
+                    return .{ .ready = .{ .sym_ptr = zero_snap } };
+                }
+                return .{ .ready = .{ .scalar_u64 = 0 } };
+            }
+            const task_id: u32 = @intCast(handle_id - 1);
+            if (self.task_nodes.items[task_id].is_completed) {
+                try self.writeUsizeAt(try self.advanceSymbolicPtr(fut_ptr, ptr_width), 0);
+                var res_slot = self.task_nodes.items[task_id].result_slot;
+                const unwrapped_out = self.pool.unwrapUnderlyingType(out_ty);
+                if (!unwrapped_out.isError() and
+                    self.task_nodes.items[task_id].is_cancelled and
+                    res_slot.scalar_u64 == 0 and
+                    classifyValueRepr(self.pool, self.sym_table, unwrapped_out, self.options.target_layout) ==
+                        .by_value_snapshot)
+                {
+                    const zero_snap = try self.allocSnapshotForType(unwrapped_out, true);
+                    if (!self.pool.isFutureType(unwrapped_out)) self.sealSnapshot(zero_snap);
+                    res_slot = .{ .sym_ptr = zero_snap };
+                }
+                return .{ .ready = res_slot };
+            }
+            self.task_nodes.items[task_id].join_waiter_item = self.active_polling_item;
+            is_parked_on_join_out.* = true;
+            return .pending;
+        }
+
+        if (raw_kind == @backingInt(VmFutureKind.cancel_task)) {
+            if (handle_id > 0 and handle_id - 1 < self.task_nodes.items.len) {
+                try self.cancelSpawnedTask(@intCast(handle_id - 1));
+            }
+            try self.writeUsizeAt(try self.advanceSymbolicPtr(fut_ptr, ptr_width), 0);
+            return .{ .ready = .{ .scalar_u64 = 0 } };
+        }
+
+        if (raw_kind == @backingInt(VmFutureKind.coro_frame) and handle_id > 0) {
+            const coro_id: u32 = @intCast(handle_id - 1);
+            const coro_res = try self.pollCoroFrame(coro_id, is_parked_on_join_out);
+            if (coro_res == .ready) {
+                try self.writeUsizeAt(try self.advanceSymbolicPtr(fut_ptr, ptr_width), 0);
+            }
+            return coro_res;
+        }
+
+        return .{ .ready = .{ .scalar_u64 = 0 } };
+    }
+
+    /// Advances `coro_frames[coro_id]` from `.unpolled` (`^bb0`) or its suspended child `.await` point.
+    fn pollCoroFrame(
+        self: *MirVm,
+        coro_id: u32,
+        is_parked_on_join_out: *bool,
+    ) VmEvalError!VmPollOutcome {
+        if (coro_id >= self.coro_frames.items.len) return .{ .ready = .{ .scalar_u64 = 0 } };
+        const cur_state = self.coro_frames.items[coro_id].state;
+        if (cur_state == .completed or cur_state == .cancelled) return .{ .ready = .{ .scalar_u64 = 0 } };
+
+        var entry_bb = MirBlockId.fromInt(0);
+        if (cur_state.isSuspended()) {
+            const child_ptr = self.coro_frames.items[coro_id].active_child_fut_ptr;
+            const child_ty = self.coro_frames.items[coro_id].active_child_fut_ty;
+            const ready_ty = self.coro_frames.items[coro_id].active_ready_ty;
+            const child_res = try self.pollFutureAtPtr(child_ptr, child_ty, ready_ty, is_parked_on_join_out);
+            switch (child_res) {
+                .pending => return .pending,
+                .ready => |ready_slot| {
+                    const resume_bb = self.coro_frames.items[coro_id].active_resume_bb;
+                    const dst_params = self.coro_frames.items[coro_id].body.getBlockParams(resume_bb);
+                    if (dst_params.len >= 1) {
+                        self.coro_frames.items[coro_id].regs[dst_params[0].asInt()] = ready_slot;
+                    }
+                    entry_bb = resume_bb;
+                },
+            }
+        }
+
+        const run_res = try self.runCoroBlocksFrom(coro_id, entry_bb, false);
+        switch (run_res) {
+            .ready => |ret_slot| {
+                self.coro_frames.items[coro_id].state = .completed;
+                self.releaseCoroFrame(coro_id);
+                return .{ .ready = ret_slot };
+            },
+            .pending => {
+                // Immediately poll the newly stored child future once so synchronous children don't stall:
+                return self.pollCoroFrame(coro_id, is_parked_on_join_out);
+            },
+        }
+    }
+
+    /// Executes `coro_frames[coro_id]` starting at `start_bb` until `.coro_suspend` (`.pending`) or `.ret` (`.ready`).
+    fn runCoroBlocksFrom(
+        self: *MirVm,
+        coro_id: u32,
+        start_bb: MirBlockId,
+        is_cancelling: bool,
+    ) VmEvalError!VmPollOutcome {
+        const body = self.coro_frames.items[coro_id].body;
+        if (body.blocks.items.len == 0) return .{ .ready = .{ .scalar_u64 = 0 } };
+
+        self.call_stack.append(self.allocator, .{
+            .body = body,
+            .regs = self.coro_frames.items[coro_id].regs,
+            .local_ptrs = self.coro_frames.items[coro_id].local_ptrs,
+            .owned_stack_allocs = &.{},
+            .cur_bb = start_bb,
+            .call_site_span = self.active_inst_span,
+        }) catch return error.OutOfMemory;
+        defer {
+            var popped = self.call_stack.pop().?;
+            for (popped.extra_stack_allocs.items) |extra_aid| {
+                self.coro_frames.items[coro_id].extra_allocs.append(self.allocator, extra_aid) catch {};
+            }
+            popped.extra_stack_allocs.deinit(self.allocator);
+        }
+
+        var cur_bb = start_bb;
+        var edge_arg_scratch: std.ArrayListUnmanaged(RegSlot) = .empty;
+        defer edge_arg_scratch.deinit(self.allocator);
+
+        while (true) {
+            const frame_idx = self.call_stack.items.len - 1;
+            self.call_stack.items[frame_idx].cur_bb = cur_bb;
+            const bb_rec = body.blocks.items[cur_bb.asInt()];
+
+            for (body.getBlockInsts(cur_bb)) |inst_val| {
+                try self.tickStepBudget();
+                if (inst_val.asInt() < body.origin_tokens.items.len) {
+                    const tok = body.origin_tokens.items[inst_val.asInt()];
+                    if (!tok.isNone()) {
+                        self.active_inst_span = self.resolveTokenSpan(body.file_id, tok);
+                    }
+                }
+                const inst_rec = body.getInst(inst_val);
+                if (inst_rec.flags.is_abort_on_panic) self.abort_on_panic_depth += 1;
+                defer if (inst_rec.flags.is_abort_on_panic) {
+                    self.abort_on_panic_depth -= 1;
+                };
+                const res_slot = try self.evalInst(frame_idx, inst_val);
+                self.call_stack.items[frame_idx].regs[inst_val.asInt()] = res_slot;
+            }
+
+            try self.tickStepBudget();
+            const term = bb_rec.terminator;
+            switch (term.kind) {
+                .unreachable_term => {
+                    return self.failWithTrap(
+                        error.ArithmeticTrap,
+                        .e0507_comptime_arithmetic_trap,
+                        "reached statically `unreachable` control-flow point in `async` coroutine",
+                        "`unreachable` executed here",
+                        null,
+                    );
+                },
+                .trap => {
+                    const is_abort_trap = (term.aux_u8 & mir.TRAP_ABORT_ON_PANIC_FLAG) != 0;
+                    if (is_abort_trap) self.abort_on_panic_depth += 1;
+                    defer if (is_abort_trap) {
+                        self.abort_on_panic_depth -= 1;
+                    };
+                    const reason: MirTrapReason = @fromBackingInt(@intCast(@as(u2, @truncate(term.aux_u8))));
+                    return switch (reason) {
+                        .assertion_failed => if (self.abort_on_panic_depth > 0) blk: {
+                            self.has_aborted_vacated_panic = true;
+                            break :blk error.AbortedVacatedPanic;
+                        } else error.CompileAssertionFailed,
+                        .bounds_check => self.failWithTrap(
+                            error.OutOfBounds,
+                            .e0504_comptime_out_of_bounds,
+                            "bounds check failed in `async` coroutine",
+                            "out-of-bounds access here",
+                            null,
+                        ),
+                        .arithmetic_overflow => self.failWithTrap(
+                            error.IntegerOverflow,
+                            .e0502_integer_constant_overflow,
+                            "integer overflow trapped in `async` coroutine",
+                            "arithmetic trap here",
+                            null,
+                        ),
+                        .unreachable_reached => self.failWithTrap(
+                            error.ArithmeticTrap,
+                            .e0507_comptime_arithmetic_trap,
+                            "trap instruction executed in `async` coroutine",
+                            "trap reached here",
+                            null,
+                        ),
+                    };
+                },
+                .ret => {
+                    if (is_cancelling) return .{ .ready = .{ .scalar_u64 = 0 } };
+                    if (term.cond_or_val != mir.NONE_U32) {
+                        return .{ .ready = self.call_stack.items[frame_idx].regs[term.cond_or_val] };
+                    }
+                    return .{
+                        .ready = try self.loadTypedSlotFromMemory(
+                            self.call_stack.items[frame_idx].local_ptrs[0],
+                            body.ret_ty,
+                        ),
+                    };
+                },
+                .br => {
+                    const edge = body.extra_edges.items[term.edge_start];
+                    try self.transferEdgeArgs(frame_idx, edge, &edge_arg_scratch);
+                    cur_bb = edge.target_bb;
+                },
+                .cond_br => {
+                    const cond_slot = self.call_stack.items[frame_idx].regs[term.cond_or_val];
+                    const edge_offset: u32 = if ((cond_slot.scalar_u64 & 1) != 0) 0 else 1;
+                    const edge = body.extra_edges.items[term.edge_start + edge_offset];
+                    try self.transferEdgeArgs(frame_idx, edge, &edge_arg_scratch);
+                    cur_bb = edge.target_bb;
+                },
+                .switch_int => {
+                    const discr_val = MirValueId.fromInt(term.cond_or_val);
+                    const discr_ty = body.getInst(discr_val).type_id;
+                    const discr_slot = self.call_stack.items[frame_idx].regs[term.cond_or_val];
+                    const raw_bits = try self.readIntBitsFromSlot(discr_slot, discr_ty);
+                    const int_info = resolveIntInfo(self.pool, discr_ty, self.options.target_layout);
+                    const discr_i128: i128 = if (int_info != null and int_info.?.is_signed)
+                        signExtendToI128(raw_bits, int_info.?.bits)
+                    else
+                        @bitCast(raw_bits);
+
+                    var chosen_edge_idx: u32 = term.edge_start + term.edge_len - 1;
+                    var case_i: u32 = 0;
+                    while (case_i + 1 < term.edge_len) : (case_i += 1) {
+                        const cand_edge = body.extra_edges.items[term.edge_start + case_i];
+                        if (cand_edge.case_tag_idx < body.switch_values.items.len and
+                            body.switch_values.items[cand_edge.case_tag_idx] == discr_i128)
+                        {
+                            chosen_edge_idx = term.edge_start + case_i;
+                            break;
+                        }
+                    }
+                    const chosen_edge = body.extra_edges.items[chosen_edge_idx];
+                    try self.transferEdgeArgs(frame_idx, chosen_edge, &edge_arg_scratch);
+                    cur_bb = chosen_edge.target_bb;
+                },
+                .call => {
+                    const call_site = body.calls.items[term.cond_or_val];
+                    if (!call_site.origin_token.isNone()) {
+                        self.active_inst_span = self.resolveTokenSpan(body.file_id, call_site.origin_token);
+                    }
+                    const call_span = self.active_inst_span;
+                    if (call_site.is_abort_on_panic) self.abort_on_panic_depth += 1;
+                    defer if (call_site.is_abort_on_panic) {
+                        self.abort_on_panic_depth -= 1;
+                    };
+                    const ret_slot = try self.evalCallSite(frame_idx, call_site, call_span);
+                    const normal_edge = body.extra_edges.items[term.edge_start];
+                    const dst_params = body.getBlockParams(normal_edge.target_bb);
+                    if (dst_params.len >= 1) {
+                        self.call_stack.items[frame_idx].regs[dst_params[0].asInt()] = ret_slot;
+                    }
+                    cur_bb = normal_edge.target_bb;
+                },
+                .coro_suspend => {
+                    const fut_vid = MirValueId.fromInt(term.cond_or_val);
+                    const fut_ty = self.pool.unwrapUnderlyingType(body.getInst(fut_vid).type_id);
+                    const src_fut_ptr = self.call_stack.items[frame_idx].regs[term.cond_or_val].sym_ptr;
+                    const resume_bb = body.extra_edges.items[term.edge_start].target_bb;
+                    const cancel_bb = body.extra_edges.items[term.edge_start + 1].target_bb;
+                    const ready_ty = if (self.pool.isFutureType(fut_ty))
+                        self.pool.unwrapUnderlyingType(self.pool.getFutureOutputType(fut_ty) orelse .unit_ty)
+                    else
+                        TypeId.unit_ty;
+
+                    const ptr_width: u32 = self.options.target_layout.ptr_byte_size;
+                    const fut_lay = type_system.computeTypeLayoutWithPool(
+                        self.pool,
+                        self.sym_table,
+                        fut_ty,
+                        self.options.target_layout,
+                    );
+                    const child_id = try self.allocMemory(
+                        @max(fut_lay.byte_size, @as(u64, ptr_width) * 4),
+                        @max(fut_lay.align_log2, self.options.target_layout.ptr_align_log2),
+                        true,
+                        false,
+                        true,
+                        0,
+                        self.active_inst_span,
+                    );
+                    const child_ptr = SymbolicPtr{ .alloc_id = child_id, .byte_offset = 0 };
+                    try self.copyMemoryRange(child_ptr, src_fut_ptr, fut_lay.byte_size, 0);
+                    if (src_fut_ptr.alloc_id.domain() == .vm_alloc) {
+                        const src_idx = src_fut_ptr.alloc_id.payloadIndex();
+                        if (src_idx > 1 and src_idx < self.allocations.items.len and
+                            self.allocations.items[src_idx].is_mutable)
+                        {
+                            try self.writeUsizeAt(try self.advanceSymbolicPtr(src_fut_ptr, ptr_width), 0);
+                        }
+                    }
+
+                    self.coro_frames.items[coro_id].active_child_fut_ptr = child_ptr;
+                    self.coro_frames.items[coro_id].active_child_fut_ty = fut_ty;
+                    self.coro_frames.items[coro_id].active_ready_ty = ready_ty;
+                    self.coro_frames.items[coro_id].active_resume_bb = resume_bb;
+                    self.coro_frames.items[coro_id].active_cancel_bb = cancel_bb;
+                    self.coro_frames.items[coro_id].state = mir_async.CoroStateTag.fromSuspendIndex(cur_bb.asInt());
+                    return .pending;
+                },
+            }
         }
     }
 

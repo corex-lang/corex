@@ -294,6 +294,8 @@ pub const SymbolKind = enum(u8) {
     enum_variant_sym = 19,
     /// Field inside a `struct`, `union`, or `bit_field` declaration (`20`).
     field_sym = 20,
+    /// Foreign linker `extern static [mut]` variable declaration (`21`).
+    extern_static_sym = 21,
 };
 
 /// 1-byte bit-packed mask of compiler-synthesized `@derive(…)` traits (`DR-05` §2.3 & `DR-22` `SE-10B`).
@@ -323,8 +325,8 @@ pub const DeriveMask = packed struct(u8) {
     }
 };
 
-/// 1-byte bit-packed Phase 7.6 declaration attributes and item kind discriminators (`DR-22`).
-pub const DeclExtraFlags = packed struct(u8) {
+/// 2-byte bit-packed Phase 7.6 & Phase 8 declaration attributes and item kind discriminators (`DR-22`, `DR-08`).
+pub const DeclExtraFlags = packed struct(u16) {
     /// `true` if annotated with `@constructor` (`SE-22` constructor delegation).
     is_constructor: bool = false,
     /// `true` if annotated with `@builder` (`SE-22` declarative builder parameter/closure).
@@ -341,9 +343,17 @@ pub const DeclExtraFlags = packed struct(u8) {
     is_bench: bool = false,
     /// `true` if the parameter list ends with C FFI variadic `...` (`ADR-22F`).
     is_variadic: bool = false,
+    /// `true` if annotated with `@not_send` (`DR-08` cross-thread `!Send` marker).
+    is_not_send: bool = false,
+    /// `true` if annotated with `@not_sync` (`DR-08` shared-reference `!Sync` marker).
+    is_not_sync: bool = false,
+    /// `true` if annotated with `@thread_local` (`DR-08` / `DR-10` thread-local storage marker).
+    is_thread_local: bool = false,
+    /// Reserved zero padding bits (`0`).
+    reserved: u5 = 0,
 
     comptime {
-        std.debug.assert(@sizeOf(DeclExtraFlags) == 1);
+        std.debug.assert(@sizeOf(DeclExtraFlags) == 2);
     }
 };
 
@@ -686,17 +696,20 @@ pub const CfgEnv = struct {
                 .macos => .macos,
                 .windows => .windows,
                 .wasi => .wasi,
+                .freestanding => .freestanding,
             },
             .arch = switch (spec.arch) {
                 .x86_64 => .x86_64,
                 .aarch64 => .aarch64,
                 .wasm32 => .wasm32,
             },
-            .abi = switch (spec.os) {
-                .windows => .msvc,
-                .macos => .apple,
+            .abi = switch (spec.abi) {
+                .gnu => .gnu,
+                .msvc => .msvc,
+                .musl => .musl,
+                .apple => .apple,
                 .wasi => .wasi,
-                .linux => .gnu,
+                .none => .none,
             },
             .endian = .little,
             .ptr_width = @as(u16, spec.ptrBytes()) * 8,
@@ -704,6 +717,77 @@ pub const CfgEnv = struct {
         };
     }
 };
+
+/// Bit-packed 32-bit FFI boundary SAST contract for a single `extern` function parameter (`DR-10` §2.3).
+pub const FfiParamContract = packed struct(u32) {
+    /// `true` if annotated with `@slice_len(param_ident)` (`len * sizeof(T)` spatial bound).
+    has_slice_len: bool = false,
+    /// `true` if annotated with `@byte_len(param_ident)` (raw byte-length spatial bound).
+    has_byte_len: bool = false,
+    /// Zero-based ordinal of the paired integer length parameter when `has_slice_len` or `has_byte_len` is `true`.
+    len_param_ordinal: u8 = 0,
+    /// `true` if annotated with `@null_terminated` (`E0308` NUL-termination proof required).
+    is_null_terminated: bool = false,
+    /// `true` if annotated with `@consumes` (transfers linear ownership / frees pointer, `E0310` / `E0301`).
+    is_consumes: bool = false,
+    /// `true` if annotated with `@escapes` (forbids stack/local-region pointers, `E0306`).
+    is_escapes: bool = false,
+    /// `true` if annotated with `@borrowed` (non-escaping foreign borrow).
+    is_borrowed: bool = false,
+    /// `true` if annotated with `@out_param` (permits `&raw mut uninit` and marks initialized on return).
+    is_out_param: bool = false,
+    /// `true` if annotated with `@may_be_null` (permits nullable pointer arguments; formal param starts `maybe_null`).
+    is_may_be_null: bool = false,
+    /// `true` if annotated with `@non_null` (explicitly forbids `maybe_null` pointers, `E0311`).
+    is_non_null: bool = false,
+    /// Reserved zero padding (`0`).
+    reserved: u15 = 0,
+
+    comptime {
+        std.debug.assert(@sizeOf(FfiParamContract) == 4);
+    }
+};
+
+/// Sparse FFI linkage and SAST contract metadata stored in `SymbolTable.ffi_contracts` (`0` overhead on pure `.cx`).
+pub const FfiFnContract = struct {
+    /// `true` if annotated with `@trusted` (safe to call/read outside `unsafe { … }`, still emits `.ffi`).
+    is_trusted: bool = false,
+    /// `true` if annotated with `@thread_local` on an `extern static` variable.
+    is_thread_local: bool = false,
+    /// `true` if declared inside `unsafe extern { … }` or with explicit `unsafe`.
+    is_unsafe_extern: bool = false,
+    /// `true` if return value is annotated with `@owned_by_caller` (linear leak obligation, `E0304`).
+    ret_owned_by_caller: bool = false,
+    /// `true` if return pointer is annotated with `@may_be_null` (unchecked deref/use emits `E0311`).
+    ret_may_be_null: bool = false,
+    /// `true` if return pointer is annotated with `@non_null`.
+    ret_non_null: bool = false,
+    /// `true` if return pointer is annotated with `@null_terminated` (satisfies downstream `E0308`).
+    ret_null_terminated: bool = false,
+    /// Expected `@consumes` deallocator `SymbolIndex` resolved from `@free_with(fn_ident)` (`.none` when unconstrained).
+    ret_free_with_sym: SymbolIndex = .none,
+    /// Interned ABI string literal (e.g., `"C"`, `"system"`, `"C-unwind"`, `"wasm"`, `.empty` for default `"C"`).
+    abi_name: SymbolId = .empty,
+    /// Interned Wasm host import module name from `@wasm_import("mod", "name")` (`.empty` when absent).
+    wasm_import_module: SymbolId = .empty,
+    /// Interned Wasm host import symbol name from `@wasm_import("mod", "name")` (`.empty` when absent).
+    wasm_import_name: SymbolId = .empty,
+    /// Interned Wasm export name from `@wasm_export("name")` (`.empty` when absent).
+    wasm_export_name: SymbolId = .empty,
+    /// Interned native library link directive from `@link_lib("name")` (`.empty` when absent).
+    link_lib_name: SymbolId = .empty,
+    /// Owned per-parameter FFI contract slice indexed by fixed parameter ordinal (`&.{}` when none).
+    param_contracts: []FfiParamContract = &.{},
+};
+
+/// Strongly typed callback invoked when `@c_import("header.h")` is evaluated on an uncached header path.
+pub const CImportModuleLoader = *const fn (
+    sym_table: *SymbolTable,
+    interner: *StringInterner,
+    caller_file_id: FileId,
+    header_path: []const u8,
+    diagnostic_sink: ?*DiagnosticSink,
+) anyerror!SymbolIndex;
 
 /// Per-parameter metadata stored on `SymbolTable` for parameter zones, defaults, and builders (`SE-07`, `SE-11`, `SE-22`).
 pub const FnParamSpec = struct {
@@ -835,6 +919,8 @@ const HeaderAttrKind = enum(u8) {
     ifunc,
     /// `@linear` Tier 3 must-consume ownership attribute (`DR-06`).
     linear,
+    /// `@link_lib("…")` native library link directive attribute (`DR-10`).
+    link_lib,
     /// `@link_name(…)` custom linker symbol name attribute.
     link_name,
     /// `@link_section(…)` custom object section attribute (`E0327` checked).
@@ -853,6 +939,10 @@ const HeaderAttrKind = enum(u8) {
     no_panic,
     /// Retired `@noalloc` spelling emitting `E0225` with `@no_alloc` fix (`ADR-22D`).
     noalloc,
+    /// `@not_send` negative concurrency marker (`DR-08` `!Send`).
+    not_send,
+    /// `@not_sync` negative concurrency marker (`DR-08` `!Sync`).
+    not_sync,
     /// `@overload` explicit function overload group attribute (`DR-02`).
     overload,
     /// `@packed` 1-byte field alignment attribute.
@@ -865,6 +955,14 @@ const HeaderAttrKind = enum(u8) {
     soa,
     /// `@std_cap_boundary(…)` stdlib capability boundary attribute (`DR-17`).
     std_cap_boundary,
+    /// `@thread_local` foreign thread-local static storage attribute (`DR-10`).
+    thread_local,
+    /// `@trusted` safe-callable FFI contract attribute (`DR-10` §2.3).
+    trusted,
+    /// `@wasm_export("name")` WebAssembly module export attribute (`DR-10`).
+    wasm_export,
+    /// `@wasm_import("mod", "name")` WebAssembly host import attribute (`DR-10`).
+    wasm_import,
     /// `@zero_pad` deterministic padding zeroing attribute (`DR-20`).
     zero_pad,
 };
@@ -1110,6 +1208,23 @@ const REPR_TAG_BITS_MAP = std.StaticStringMap(u8).initComptime(.{
     .{ "usize", 64 },
 });
 
+/// $O(1)$ static lookup map of the 13 canonical C primitive type aliases exempt from `W0201` `PascalCase` checks.
+pub const C_PRIMITIVE_TYPE_ALIAS_MAP = std.StaticStringMap(void).initComptime(.{
+    .{ "c_char", {} },
+    .{ "c_int", {} },
+    .{ "c_long", {} },
+    .{ "c_longdouble", {} },
+    .{ "c_longlong", {} },
+    .{ "c_schar", {} },
+    .{ "c_short", {} },
+    .{ "c_uchar", {} },
+    .{ "c_uint", {} },
+    .{ "c_ulong", {} },
+    .{ "c_ulonglong", {} },
+    .{ "c_ushort", {} },
+    .{ "c_void", {} },
+});
+
 /// $O(1)$ static lookup map from declaration `@attr` identifiers to `HeaderAttrKind`.
 const HEADER_ATTR_MAP = std.StaticStringMap(HeaderAttrKind).initComptime(.{
     .{ "align", .align_attr },
@@ -1124,6 +1239,7 @@ const HEADER_ATTR_MAP = std.StaticStringMap(HeaderAttrKind).initComptime(.{
     .{ "from", .from },
     .{ "ifunc", .ifunc },
     .{ "linear", .linear },
+    .{ "link_lib", .link_lib },
     .{ "link_name", .link_name },
     .{ "link_section", .link_section },
     .{ "local", .local },
@@ -1133,12 +1249,18 @@ const HEADER_ATTR_MAP = std.StaticStringMap(HeaderAttrKind).initComptime(.{
     .{ "no_block", .no_block },
     .{ "no_panic", .no_panic },
     .{ "noalloc", .noalloc },
+    .{ "not_send", .not_send },
+    .{ "not_sync", .not_sync },
     .{ "overload", .overload },
     .{ "packed", .packed_attr },
     .{ "repr", .repr },
     .{ "secret", .secret },
     .{ "soa", .soa },
     .{ "std_cap_boundary", .std_cap_boundary },
+    .{ "thread_local", .thread_local },
+    .{ "trusted", .trusted },
+    .{ "wasm_export", .wasm_export },
+    .{ "wasm_import", .wasm_import },
     .{ "zero_pad", .zero_pad },
 });
 
@@ -1155,6 +1277,32 @@ const DERIVE_TRAIT_MAP = std.StaticStringMap(DeriveMask).initComptime(.{
 // -------------------------------------- INTERNALS --------------------------------------
 
 // -------------- Scoped Hash Key & Lexeme Helpers --------------
+
+/// Computes target-ABI `c_char`, `c_long`, and `c_ulong` `TypeId`s from `cfg_env` (`DR-10` §2.1).
+fn computeTargetCFfiTypes(cfg_env: CfgEnv) struct {
+    c_char_ty: TypeId,
+    c_long_ty: TypeId,
+    c_ulong_ty: TypeId,
+} {
+    const c_char_ty: TypeId = if (cfg_env.arch == .aarch64 and
+        cfg_env.os != .macos and cfg_env.os != .windows)
+        .u8_ty
+    else
+        .i8_ty;
+    const c_long_ty: TypeId = if (cfg_env.os == .windows or cfg_env.ptr_width == 32)
+        .i32_ty
+    else
+        .i64_ty;
+    const c_ulong_ty: TypeId = if (cfg_env.os == .windows or cfg_env.ptr_width == 32)
+        .u32_ty
+    else
+        .u64_ty;
+    return .{
+        .c_char_ty = c_char_ty,
+        .c_long_ty = c_long_ty,
+        .c_ulong_ty = c_ulong_ty,
+    };
+}
 
 /// Packs `(scope_id, symbol_id, namespace)` into a collision-free 64-bit lookup key.
 inline fn packScopedSymbolKey(scope_id: ScopeId, name: SymbolId, namespace: Namespace) u64 {
@@ -1366,6 +1514,20 @@ fn collectFnDeclHandlesInSlice(
                 try collectFnDeclHandlesInSlice(
                     allocator,
                     computeRhsExtraSliceWithEnds(ast_arena, item_node_idx, extra_ends),
+                    source,
+                    token_buffer,
+                    cst_arena,
+                    ast_arena,
+                    extra_ends,
+                    is_including_tests,
+                    out_handles,
+                    depth + 1,
+                );
+            },
+            .extern_block_decl => {
+                try collectFnDeclHandlesInSlice(
+                    allocator,
+                    ast_arena.getExternBlockItems(item_node_idx),
                     source,
                     token_buffer,
                     cst_arena,
@@ -1620,6 +1782,12 @@ pub const SymbolTable = struct {
     fn_param_specs: std.AutoHashMapUnmanaged(u32, []FnParamSpec) = .empty,
     /// Maps a generic item `SymbolIndex.asInt()` to its owned slice of `GenericParamSpec` metadata (`SE-10`).
     generic_param_specs: std.AutoHashMapUnmanaged(u32, []GenericParamSpec) = .empty,
+    /// Sparse map of `extern` function/static FFI linkage and SAST contract metadata (`DR-10` §2.3).
+    ffi_contracts: std.AutoHashMapUnmanaged(SymbolIndex, FfiFnContract) = .empty,
+    /// Pre-registered or cached `@c_import("header.h")` synthetic module `SymbolIndex` handles.
+    c_import_modules: std.StringHashMapUnmanaged(SymbolIndex) = .empty,
+    /// Optional on-demand loader invoked when `@c_import("header.h")` misses `c_import_modules`.
+    c_import_loader: ?CImportModuleLoader = null,
     /// Deferred `use` imports queued during Pass 1 for Pass 2 cross-module resolution.
     pending_imports: std.ArrayListUnmanaged(PendingUseImport) = .empty,
     /// Global prelude `ScopeId` (`ScopeId.fromInt(0)`).
@@ -1673,6 +1841,15 @@ pub const SymbolTable = struct {
         }
         self.generic_param_specs.deinit(self.allocator);
 
+        var ffi_contract_iter = self.ffi_contracts.valueIterator();
+        while (ffi_contract_iter.next()) |contract_ptr| {
+            if (contract_ptr.param_contracts.len > 0) {
+                self.allocator.free(contract_ptr.param_contracts);
+            }
+        }
+        self.ffi_contracts.deinit(self.allocator);
+        self.c_import_modules.deinit(self.allocator);
+
         self.symbols.deinit(self.allocator);
         self.scoped_map.deinit(self.allocator);
         self.file_module_scopes.deinit(self.allocator);
@@ -1713,6 +1890,16 @@ pub const SymbolTable = struct {
             self.allocator.free(spec_slice_ptr.*);
         }
         self.generic_param_specs.clearRetainingCapacity();
+
+        var ffi_reset_iter = self.ffi_contracts.valueIterator();
+        while (ffi_reset_iter.next()) |contract_ptr| {
+            if (contract_ptr.param_contracts.len > 0) {
+                self.allocator.free(contract_ptr.param_contracts);
+            }
+        }
+        self.ffi_contracts.clearRetainingCapacity();
+        self.c_import_modules.clearRetainingCapacity();
+        self.c_import_loader = null;
 
         self.symbols.clearRetainingCapacity();
         self.scoped_map.clearRetainingCapacity();
@@ -1828,6 +2015,45 @@ pub const SymbolTable = struct {
     pub fn getGenericParamSpecsMut(self: *SymbolTable, sym_idx: SymbolIndex) []GenericParamSpec {
         if (sym_idx.isNone()) return &.{};
         return self.generic_param_specs.get(sym_idx.asInt()) orelse &.{};
+    }
+
+    /// Stores `contract` (duplicating `param_contracts` when non-empty) in `ffi_contracts` for `sym_idx`.
+    pub fn setFfiContract(
+        self: *SymbolTable,
+        sym_idx: SymbolIndex,
+        contract: FfiFnContract,
+        param_contracts: []const FfiParamContract,
+    ) !void {
+        if (sym_idx.isNone()) return;
+        const owned_params: []FfiParamContract = if (param_contracts.len > 0)
+            try self.allocator.dupe(FfiParamContract, param_contracts)
+        else
+            &.{};
+        errdefer if (owned_params.len > 0) self.allocator.free(owned_params);
+        var stored_contract = contract;
+        stored_contract.param_contracts = owned_params;
+        if (try self.ffi_contracts.fetchPut(self.allocator, sym_idx, stored_contract)) |prev_kv| {
+            if (prev_kv.value.param_contracts.len > 0) {
+                self.allocator.free(prev_kv.value.param_contracts);
+            }
+        }
+    }
+
+    /// Returns a read-only pointer to the `FfiFnContract` registered for `sym_idx`, or `null` if none exists.
+    pub fn getFfiContract(self: *const SymbolTable, sym_idx: SymbolIndex) ?*const FfiFnContract {
+        if (sym_idx.isNone()) return null;
+        return self.ffi_contracts.getPtr(sym_idx);
+    }
+
+    /// Registers a translated `@c_import("header.h")` synthetic module `mod_sym_idx` under `header_path`.
+    pub fn registerCImportModule(
+        self: *SymbolTable,
+        interner: *StringInterner,
+        header_path: []const u8,
+        mod_sym_idx: SymbolIndex,
+    ) !void {
+        const interned_id = try interner.intern(header_path);
+        try self.c_import_modules.put(self.allocator, interner.get(interned_id), mod_sym_idx);
     }
 
     /// Binds an external `mod <name>;` declaration in `parent_file_id` to `target_scope`.
@@ -2135,11 +2361,100 @@ pub const SymbolTable = struct {
             .{ .name = "TaskGroup", .type_id = .task_group_base_ty },
             .{ .name = "TaskHandle", .type_id = .task_handle_base_ty },
         });
+        const async_mod_id = try interner.intern("async");
+        const async_mod_idx = self.lookupInScopeDirect(root_scope, async_mod_id, NamespaceMask.VALUE_ONLY);
+        if (!async_mod_idx.isNone() and !self.getSymbol(async_mod_idx).target_scope.isNone()) {
+            const async_sub_scope = self.getSymbol(async_mod_idx).target_scope;
+            for ([_][]const u8{ "block_on", "task_group", "yield_now" }) |async_fn_name| {
+                const fn_sym_id = try interner.intern(async_fn_name);
+                if (self.lookupInScopeDirect(async_sub_scope, fn_sym_id, NamespaceMask.VALUE_ONLY).isNone()) {
+                    _ = try self.defineSymbol(.{
+                        .name = fn_sym_id,
+                        .name_text = interner.get(fn_sym_id),
+                        .kind = .fn_sym,
+                        .namespace = .value_ns,
+                        .visibility = .public,
+                        .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+                        .scope_id = async_sub_scope,
+                        .type_id = .err_ty,
+                    }, null);
+                }
+            }
+        }
+        const target_c_tys = computeTargetCFfiTypes(self.cfg_env);
         try self.populateStandaloneTypeSubmoduleStub(interner, root_scope, "ffi", &.{
+            .{ .name = "c_char", .type_id = target_c_tys.c_char_ty },
+            .{ .name = "c_schar", .type_id = .i8_ty },
+            .{ .name = "c_uchar", .type_id = .u8_ty },
+            .{ .name = "c_short", .type_id = .i16_ty },
+            .{ .name = "c_ushort", .type_id = .u16_ty },
+            .{ .name = "c_int", .type_id = .i32_ty },
+            .{ .name = "c_uint", .type_id = .u32_ty },
+            .{ .name = "c_long", .type_id = target_c_tys.c_long_ty },
+            .{ .name = "c_ulong", .type_id = target_c_tys.c_ulong_ty },
+            .{ .name = "c_longlong", .type_id = .i64_ty },
+            .{ .name = "c_ulonglong", .type_id = .u64_ty },
+            .{ .name = "c_longdouble", .type_id = .f64_ty },
             .{ .name = "c_void", .type_id = .opaque_ty },
         });
 
         return root_scope;
+    }
+
+    /// Refreshes target-dependent `cx.ffi` built-in type aliases (`c_char`, `c_long`, `c_ulong`) in-place from `self.cfg_env`.
+    pub fn refreshCxFfiTargetAliases(self: *SymbolTable, interner: *const StringInterner) void {
+        if (self.cx_root_scope.isNone()) return;
+        const ffi_sym_id = interner.lookup("ffi") orelse return;
+        const ffi_mod_idx = self.lookupInScopeDirect(self.cx_root_scope, ffi_sym_id, NamespaceMask.VALUE_ONLY);
+        if (ffi_mod_idx.isNone()) return;
+        const ffi_scope = self.getSymbol(ffi_mod_idx).target_scope;
+        if (ffi_scope.isNone()) return;
+
+        const target_c_tys = computeTargetCFfiTypes(self.cfg_env);
+        const target_updates = [3]struct { name: []const u8, ty: TypeId }{
+            .{ .name = "c_char", .ty = target_c_tys.c_char_ty },
+            .{ .name = "c_long", .ty = target_c_tys.c_long_ty },
+            .{ .name = "c_ulong", .ty = target_c_tys.c_ulong_ty },
+        };
+        var updated_syms: [3]SymbolIndex = @splat(.none);
+        var prev_targets: [3]SymbolIndex = @splat(.none);
+        var next_targets: [3]SymbolIndex = @splat(.none);
+        for (target_updates, 0..) |upd, i| {
+            const name_id = interner.lookup(upd.name) orelse continue;
+            const sym_idx = self.lookupInScopeDirect(ffi_scope, name_id, NamespaceMask.TYPE_ONLY);
+            if (!sym_idx.isNone() and self.getSymbol(sym_idx).flags.is_builtin) {
+                const target_prelude = self.type_to_symbol.get(upd.ty.toU32()) orelse SymbolIndex.none;
+                const target_member_scope = if (!target_prelude.isNone())
+                    self.getSymbol(target_prelude).target_scope
+                else
+                    ScopeId.none;
+                const sym_mut = self.getSymbolMut(sym_idx);
+                prev_targets[i] = sym_mut.target_symbol;
+                next_targets[i] = target_prelude;
+                sym_mut.type_id = upd.ty;
+                sym_mut.target_symbol = target_prelude;
+                sym_mut.target_scope = target_member_scope;
+                updated_syms[i] = sym_idx;
+            }
+        }
+        for (self.symbols.items) |*sym_rec| {
+            if (sym_rec.kind == .use_alias_sym and !sym_rec.target_symbol.isNone()) {
+                for (updated_syms, prev_targets, next_targets, target_updates) |upd_sym, prev_tgt, next_tgt, upd| {
+                    if (upd_sym.isNone()) continue;
+                    const is_direct_alias = (sym_rec.target_symbol == upd_sym);
+                    const is_unwrapped_ffi_alias = (!prev_tgt.isNone() and
+                        sym_rec.target_symbol == prev_tgt and
+                        std.mem.eql(u8, sym_rec.name_text, upd.name));
+                    if (is_direct_alias or is_unwrapped_ffi_alias) {
+                        sym_rec.type_id = upd.ty;
+                        if (is_unwrapped_ffi_alias and !next_tgt.isNone()) {
+                            sym_rec.target_symbol = next_tgt;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// Populates a built-in unit-variant `enum` stub inside `parent_scope` when `core/` sources are absent.
@@ -2221,12 +2536,23 @@ pub const SymbolTable = struct {
         };
         for (entries) |entry| {
             const ty_sym_id = try interner.intern(entry.name);
-            if (!self.lookupInScopeDirect(sub_scope, ty_sym_id, NamespaceMask.TYPE_ONLY).isNone()) continue;
             const target_prelude = self.type_to_symbol.get(entry.type_id.toU32()) orelse SymbolIndex.none;
             const target_member_scope = if (!target_prelude.isNone())
                 self.getSymbol(target_prelude).target_scope
             else
                 ScopeId.none;
+            const existing_idx = self.lookupInScopeDirect(sub_scope, ty_sym_id, NamespaceMask.TYPE_ONLY);
+            if (!existing_idx.isNone()) {
+                const sym_mut = self.getSymbolMut(existing_idx);
+                if (sym_mut.flags.is_builtin) {
+                    sym_mut.kind = if (!target_prelude.isNone()) .use_alias_sym else .type_alias_sym;
+                    sym_mut.flags.is_imported = !target_prelude.isNone();
+                    sym_mut.type_id = entry.type_id;
+                    sym_mut.target_symbol = target_prelude;
+                    sym_mut.target_scope = target_member_scope;
+                }
+                continue;
+            }
             _ = try self.defineSymbol(.{
                 .name = ty_sym_id,
                 .name_text = interner.get(ty_sym_id),
@@ -3269,6 +3595,26 @@ pub const ItemHeaderMetadata = struct {
     repr_int_token: TokenIndex = .none,
     /// `true` if `@cfg(…)` appears on this item header (`SE-18`).
     has_cfg_attr: bool = false,
+    /// `true` if `@trusted` appears on this item or `extern` block header (`DR-10` §2.3).
+    is_trusted: bool = false,
+    /// `true` if `@thread_local` appears on this `extern static` item header (`DR-10`).
+    is_thread_local: bool = false,
+    /// Inline decoded library name buffer when `@link_lib("…")` is present.
+    link_lib_buf: [256]u8 = undefined,
+    /// Valid byte length inside `link_lib_buf`.
+    link_lib_len: u16 = 0,
+    /// Inline decoded Wasm import module buffer when `@wasm_import("mod", "name")` is present.
+    wasm_import_mod_buf: [256]u8 = undefined,
+    /// Valid byte length inside `wasm_import_mod_buf`.
+    wasm_import_mod_len: u16 = 0,
+    /// Inline decoded Wasm import symbol buffer when `@wasm_import("mod", "name")` is present.
+    wasm_import_name_buf: [256]u8 = undefined,
+    /// Valid byte length inside `wasm_import_name_buf`.
+    wasm_import_name_len: u16 = 0,
+    /// Inline decoded Wasm export symbol buffer when `@wasm_export("name")` is present.
+    wasm_export_buf: [256]u8 = undefined,
+    /// Valid byte length inside `wasm_export_buf`.
+    wasm_export_len: u16 = 0,
 
     /// Returns the decoded `@link_section` byte slice.
     pub inline fn asLinkSectionSlice(self: *const ItemHeaderMetadata) []const u8 {
@@ -3278,6 +3624,26 @@ pub const ItemHeaderMetadata = struct {
     /// Returns the decoded `@link_name` byte slice.
     pub inline fn asLinkNameSlice(self: *const ItemHeaderMetadata) []const u8 {
         return self.link_name_buf[0..self.link_name_len];
+    }
+
+    /// Returns the decoded `@link_lib` byte slice.
+    pub inline fn asLinkLibSlice(self: *const ItemHeaderMetadata) []const u8 {
+        return self.link_lib_buf[0..self.link_lib_len];
+    }
+
+    /// Returns the decoded `@wasm_import` module name byte slice.
+    pub inline fn asWasmImportModSlice(self: *const ItemHeaderMetadata) []const u8 {
+        return self.wasm_import_mod_buf[0..self.wasm_import_mod_len];
+    }
+
+    /// Returns the decoded `@wasm_import` symbol name byte slice.
+    pub inline fn asWasmImportNameSlice(self: *const ItemHeaderMetadata) []const u8 {
+        return self.wasm_import_name_buf[0..self.wasm_import_name_len];
+    }
+
+    /// Returns the decoded `@wasm_export` symbol name byte slice.
+    pub inline fn asWasmExportSlice(self: *const ItemHeaderMetadata) []const u8 {
+        return self.wasm_export_buf[0..self.wasm_export_len];
     }
 };
 
@@ -3945,6 +4311,76 @@ fn extractMaxStackAttr(
     }
 }
 
+/// Extracts a single string literal argument inside `[arg_start .. attr_end)` into `dest_buf` and `dest_len`.
+fn extractSingleStringAttrIntoBuf(
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    arg_start: usize,
+    attr_end: usize,
+    dest_buf: *[256]u8,
+    dest_len: *u16,
+) void {
+    var arg_cur = arg_start;
+    while (arg_cur < attr_end) : (arg_cur += 1) {
+        const arg_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cur)));
+        if (arg_leaf.subtree_size <= 1 and !arg_leaf.token.isNone() and
+            arg_leaf.token.asInt() < token_buffer.countTokens())
+        {
+            const arg_kind = token_buffer.getToken(arg_leaf.token).kind;
+            if (arg_kind == .string_lit or arg_kind == .byte_string_lit) {
+                var unesc_buf: [256]u8 = undefined;
+                const unquoted = unquoteAttrStringLexeme(
+                    extractTokenSlice(source, token_buffer, arg_leaf.token),
+                    &unesc_buf,
+                );
+                const copy_len = @min(unquoted.len, dest_buf.len);
+                @memcpy(dest_buf[0..copy_len], unquoted[0..copy_len]);
+                dest_len.* = @intCast(copy_len);
+                break;
+            }
+        }
+    }
+}
+
+/// Extracts `@wasm_import("mod", "name")` string literal arguments inside `[arg_start .. attr_end)`.
+fn extractWasmImportAttr(
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    arg_start: usize,
+    attr_end: usize,
+    meta: *ItemHeaderMetadata,
+) void {
+    var seen_strings: u8 = 0;
+    var arg_cur = arg_start;
+    while (arg_cur < attr_end and seen_strings < 2) : (arg_cur += 1) {
+        const arg_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cur)));
+        if (arg_leaf.subtree_size <= 1 and !arg_leaf.token.isNone() and
+            arg_leaf.token.asInt() < token_buffer.countTokens())
+        {
+            const arg_kind = token_buffer.getToken(arg_leaf.token).kind;
+            if (arg_kind == .string_lit or arg_kind == .byte_string_lit) {
+                var unesc_buf: [256]u8 = undefined;
+                const unquoted = unquoteAttrStringLexeme(
+                    extractTokenSlice(source, token_buffer, arg_leaf.token),
+                    &unesc_buf,
+                );
+                if (seen_strings == 0) {
+                    const copy_len = @min(unquoted.len, meta.wasm_import_mod_buf.len);
+                    @memcpy(meta.wasm_import_mod_buf[0..copy_len], unquoted[0..copy_len]);
+                    meta.wasm_import_mod_len = @intCast(copy_len);
+                } else {
+                    const copy_len = @min(unquoted.len, meta.wasm_import_name_buf.len);
+                    @memcpy(meta.wasm_import_name_buf[0..copy_len], unquoted[0..copy_len]);
+                    meta.wasm_import_name_len = @intCast(copy_len);
+                }
+                seen_strings += 1;
+            }
+        }
+    }
+}
+
 /// Extracts item flags, `comptime` modifier, `@derive(…)`, and `@attribute_schema(…)` metadata from `item_cst`.
 pub fn extractItemHeaderMetadata(
     source: []const u8,
@@ -4157,6 +4593,8 @@ fn extractItemHeaderMetadataWithInterner(
                                 },
                                 .no_panic => meta.contract_flags.is_no_panic = true,
                                 .no_block => meta.contract_flags.is_no_block = true,
+                                .not_send => meta.extra_flags.is_not_send = true,
+                                .not_sync => meta.extra_flags.is_not_sync = true,
                                 .linear => meta.contract_flags.is_linear = true,
                                 .zero_pad => meta.contract_flags.is_zero_pad = true,
                                 .secret => meta.contract_flags.is_secret = true,
@@ -4164,6 +4602,37 @@ fn extractItemHeaderMetadataWithInterner(
                                 .local => meta.contract_flags.is_local_only = true,
                                 .cache_aligned => meta.contract_flags.is_cache_aligned = true,
                                 .packed_attr => meta.contract_flags.is_packed = true,
+                                .trusted => meta.is_trusted = true,
+                                .thread_local => {
+                                    meta.is_thread_local = true;
+                                    meta.extra_flags.is_thread_local = true;
+                                },
+                                .link_lib => extractSingleStringAttrIntoBuf(
+                                    source,
+                                    token_buffer,
+                                    cst_arena,
+                                    attr_cur + 1,
+                                    attr_end,
+                                    &meta.link_lib_buf,
+                                    &meta.link_lib_len,
+                                ),
+                                .wasm_export => extractSingleStringAttrIntoBuf(
+                                    source,
+                                    token_buffer,
+                                    cst_arena,
+                                    attr_cur + 1,
+                                    attr_end,
+                                    &meta.wasm_export_buf,
+                                    &meta.wasm_export_len,
+                                ),
+                                .wasm_import => extractWasmImportAttr(
+                                    source,
+                                    token_buffer,
+                                    cst_arena,
+                                    attr_cur + 1,
+                                    attr_end,
+                                    &meta,
+                                ),
                                 .align_attr => extractAlignAttr(
                                     source,
                                     token_buffer,
@@ -4362,7 +4831,11 @@ pub fn findItemNameToken(
         {
             break;
         }
-        if (isIdentifierToken(tok_kind)) {
+        if (isIdentifierToken(tok_kind) or
+            (tok_kind == .kw_async and !main_token.isNone() and
+                main_token.asInt() < token_buffer.countTokens() and
+                token_buffer.getToken(main_token).kind == .kw_mod))
+        {
             return node.token;
         }
     }
@@ -5537,6 +6010,223 @@ fn emitRetiredEnumReprIntDiagnostic(
     });
 }
 
+/// Removes parser `W0201` `PascalCase` warnings on the 13 canonical C primitive type aliases (`c_char`..`c_void`).
+pub fn suppressCPrimitiveTypeCasingWarnings(
+    diagnostic_sink: ?*DiagnosticSink,
+    file_id: FileId,
+    source: []const u8,
+) void {
+    const sink = diagnostic_sink orelse return;
+    if (file_id.isNone()) return;
+    var write_idx: usize = 0;
+    for (sink.diagnostics.items) |diag_item| {
+        var is_exempt_c_alias = false;
+        if (diag_item.code == .w0201_non_canonical_identifier_case and
+            diag_item.primary_span.file_id == file_id and
+            diag_item.primary_span.start_byte < diag_item.primary_span.end_byte and
+            diag_item.primary_span.end_byte <= source.len)
+        {
+            const is_pascal_expectation = if (diag_item.labels.len > 0)
+                std.mem.indexOf(u8, diag_item.labels[0].label, "PascalCase") != null
+            else
+                true;
+            if (is_pascal_expectation) {
+                const span_lexeme = source[diag_item.primary_span.start_byte..diag_item.primary_span.end_byte];
+                is_exempt_c_alias = C_PRIMITIVE_TYPE_ALIAS_MAP.has(span_lexeme);
+            }
+        }
+        if (is_exempt_c_alias) {
+            if (diag_item.severity == .warning) {
+                sink.warning_count -|= 1;
+            } else if (diag_item.severity == .err) {
+                sink.error_count -|= 1;
+                if (sink.error_count < sink.max_errors) {
+                    sink.has_reached_limit = false;
+                }
+            }
+        } else {
+            sink.diagnostics.items[write_idx] = diag_item;
+            write_idx += 1;
+        }
+    }
+    sink.diagnostics.items.len = write_idx;
+}
+
+/// Evaluates `@cfg` predicates on symbols in `scope_id` against `sym_table.cfg_env` to keep `scoped_map` synchronized
+/// for cross-file `use` resolution before `TypeChecker` runs (`core/ffi.cx` `@cfg` `c_char` twins).
+fn pruneScopeMapWithCfgEnvQuiet(
+    sym_table: *SymbolTable,
+    file_id: FileId,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    scope_id: ScopeId,
+    depth: u32,
+) !void {
+    if (scope_id.isNone() or depth >= MAX_SCOPE_DEPTH) return;
+    const members_copy = try sym_table.allocator.dupe(
+        SymbolIndex,
+        sym_table.getScopeMembers(scope_id),
+    );
+    defer sym_table.allocator.free(members_copy);
+
+    for (members_copy) |sym_idx| {
+        const sym = sym_table.getSymbol(sym_idx).*;
+        if (sym.flags.is_builtin or sym.flags.is_imported) continue;
+        if (sym.kind == .overload_group_sym) continue;
+
+        if (sym.has_cfg_attr) {
+            const is_own_enabled = if (!sym.cst_node.isNone())
+                (evaluateCstNodeCfgWithEnv(
+                    &sym_table.cfg_env,
+                    file_id,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                    sym.cst_node,
+                    null,
+                ) catch true)
+            else
+                true;
+            const is_enc_enabled = if (!sym.enclosing_cfg_cst.isNone())
+                (evaluateCstNodeCfgWithEnv(
+                    &sym_table.cfg_env,
+                    file_id,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                    sym.enclosing_cfg_cst,
+                    null,
+                ) catch true)
+            else
+                true;
+            const key = packScopedSymbolKey(scope_id, sym.name, sym.namespace);
+            if (!(is_own_enabled and is_enc_enabled)) {
+                if (sym_table.scoped_map.get(key)) |mapped_idx| {
+                    if (mapped_idx == sym_idx) {
+                        _ = sym_table.scoped_map.remove(key);
+                    }
+                }
+                continue;
+            }
+            if (sym_table.scoped_map.get(key) == null) {
+                try sym_table.scoped_map.put(sym_table.allocator, key, sym_idx);
+            }
+        }
+
+        if (!sym.target_scope.isNone() and
+            sym_table.scope_arena.getScope(sym.target_scope).file_id == file_id)
+        {
+            try pruneScopeMapWithCfgEnvQuiet(
+                sym_table,
+                file_id,
+                source,
+                token_buffer,
+                cst_arena,
+                sym.target_scope,
+                depth + 1,
+            );
+        }
+    }
+}
+
+/// Extracts any explicit `extern "ABI"` string and `unsafe` prefix before `main_token` in `item_cst`.
+fn extractItemExternAbiAndUnsafe(
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    item_cst: CstNodeIndex,
+    main_token: TokenIndex,
+    abi_out_buf: *[256]u8,
+) struct { abi_slice: []const u8, is_unsafe: bool } {
+    var abi_slice: []const u8 = "";
+    var is_unsafe = false;
+    if (item_cst.isNone() or item_cst.asInt() >= cst_arena.countNodes()) {
+        return .{ .abi_slice = abi_slice, .is_unsafe = is_unsafe };
+    }
+    const start_idx: usize = item_cst.asInt();
+    const root_rec = cst_arena.getNode(item_cst);
+    const end_idx: usize = @min(
+        start_idx + @max(@as(usize, root_rec.subtree_size), 1),
+        cst_arena.countNodes(),
+    );
+    var has_seen_extern = false;
+    var cursor: usize = start_idx + 1;
+    while (cursor < end_idx) : (cursor += 1) {
+        const node = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cursor)));
+        if (node.kind == .attribute or node.kind == .visibility_modifier) {
+            if (node.subtree_size > 1) cursor += @as(usize, node.subtree_size) - 1;
+            continue;
+        }
+        if (!node.token.isNone() and !main_token.isNone() and node.token.asInt() >= main_token.asInt()) {
+            break;
+        }
+        if (node.subtree_size <= 1 and !node.flags.is_bracketed and !node.token.isNone() and
+            node.token.asInt() < token_buffer.countTokens())
+        {
+            const tok_kind = token_buffer.getToken(node.token).kind;
+            if (tok_kind == .kw_unsafe) {
+                is_unsafe = true;
+                has_seen_extern = false;
+            } else if (tok_kind == .kw_extern) {
+                has_seen_extern = true;
+            } else if (has_seen_extern and tok_kind == .string_lit) {
+                abi_slice = unquoteAttrStringLexeme(
+                    extractTokenSlice(source, token_buffer, node.token),
+                    abi_out_buf,
+                );
+                has_seen_extern = false;
+            } else {
+                has_seen_extern = false;
+            }
+        }
+    }
+    return .{ .abi_slice = abi_slice, .is_unsafe = is_unsafe };
+}
+
+/// Populates or updates initial linkage/trust `FfiFnContract` metadata on `sym_idx` when FFI attributes are present.
+fn recordHeaderFfiContractIfPresent(
+    sym_table: *SymbolTable,
+    interner: *StringInterner,
+    sym_idx: SymbolIndex,
+    is_extern: bool,
+    is_unsafe_extern: bool,
+    abi_slice: []const u8,
+    header_meta: *const ItemHeaderMetadata,
+) !void {
+    const link_lib_slice = header_meta.asLinkLibSlice();
+    const wasm_mod_slice = header_meta.asWasmImportModSlice();
+    const wasm_name_slice = header_meta.asWasmImportNameSlice();
+    const wasm_exp_slice = header_meta.asWasmExportSlice();
+    const has_any = header_meta.is_trusted or
+        header_meta.is_thread_local or
+        is_unsafe_extern or
+        abi_slice.len > 0 or
+        link_lib_slice.len > 0 or
+        wasm_mod_slice.len > 0 or
+        wasm_name_slice.len > 0 or
+        wasm_exp_slice.len > 0;
+    if (!has_any and !is_extern) return;
+    if (!has_any) return;
+
+    const abi_id: SymbolId = if (abi_slice.len > 0) try interner.intern(abi_slice) else .empty;
+    const link_lib_id: SymbolId = if (link_lib_slice.len > 0) try interner.intern(link_lib_slice) else .empty;
+    const wasm_mod_id: SymbolId = if (wasm_mod_slice.len > 0) try interner.intern(wasm_mod_slice) else .empty;
+    const wasm_name_id: SymbolId = if (wasm_name_slice.len > 0) try interner.intern(wasm_name_slice) else .empty;
+    const wasm_exp_id: SymbolId = if (wasm_exp_slice.len > 0) try interner.intern(wasm_exp_slice) else .empty;
+
+    try sym_table.setFfiContract(sym_idx, .{
+        .is_trusted = header_meta.is_trusted,
+        .is_thread_local = header_meta.is_thread_local,
+        .is_unsafe_extern = is_unsafe_extern,
+        .abi_name = abi_id,
+        .wasm_import_module = wasm_mod_id,
+        .wasm_import_name = wasm_name_id,
+        .wasm_export_name = wasm_exp_id,
+        .link_lib_name = link_lib_id,
+    }, &.{});
+}
+
 /// Collects all top-level items inside `file_id` (and nested inline `mod` blocks) into `sym_table`.
 pub fn collectFileModuleItems(
     sym_table: *SymbolTable,
@@ -5548,6 +6238,8 @@ pub fn collectFileModuleItems(
     ast_arena: *const AstArena,
     diagnostic_sink: ?*DiagnosticSink,
 ) !ScopeId {
+    suppressCPrimitiveTypeCasingWarnings(diagnostic_sink, file_id, source);
+
     var write_idx: usize = 0;
     for (sym_table.pending_imports.items) |pending_imp| {
         if (pending_imp.file_id != file_id) {
@@ -5615,6 +6307,15 @@ pub fn collectFileModuleItems(
             ast_arena,
             extra_ends,
             diagnostic_sink,
+        );
+        try pruneScopeMapWithCfgEnvQuiet(
+            sym_table,
+            file_id,
+            source,
+            token_buffer,
+            cst_arena,
+            file_scope,
+            0,
         );
     }
     return file_scope;
@@ -5687,7 +6388,40 @@ fn collectItemSliceInScope(
     extra_ends: []const u32,
     diagnostic_sink: ?*DiagnosticSink,
 ) anyerror!void {
-    var top_item_ordinal: u12 = 0;
+    var root_top_ordinal: u12 = 0;
+    return collectItemSliceInScopeWithOrdinal(
+        sym_table,
+        interner,
+        file_id,
+        enclosing_scope,
+        if (is_file_top_level) &root_top_ordinal else null,
+        enclosing_owner_def,
+        item_slice,
+        source,
+        token_buffer,
+        cst_arena,
+        ast_arena,
+        extra_ends,
+        diagnostic_sink,
+    );
+}
+
+/// Collects AST items into `enclosing_scope`, advancing `top_ordinal_ptr` across flattened top-level `extern` blocks.
+fn collectItemSliceInScopeWithOrdinal(
+    sym_table: *SymbolTable,
+    interner: *StringInterner,
+    file_id: FileId,
+    enclosing_scope: ScopeId,
+    top_ordinal_ptr: ?*u12,
+    enclosing_owner_def: DefId,
+    item_slice: []const u32,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    ast_arena: *const AstArena,
+    extra_ends: []const u32,
+    diagnostic_sink: ?*DiagnosticSink,
+) anyerror!void {
     for (item_slice) |raw_node_idx| {
         const item_node_idx = NodeIndex.fromInt(raw_node_idx);
         if (item_node_idx.asInt() >= ast_arena.countNodes()) continue;
@@ -5697,10 +6431,13 @@ fn collectItemSliceInScope(
             continue;
         }
 
-        const def_id: DefId = if (is_file_top_level) blk: {
-            const current_def = DefId.init(file_id, top_item_ordinal);
-            if (top_item_ordinal < std.math.maxInt(u12)) top_item_ordinal += 1;
-            break :blk current_def;
+        const def_id: DefId = if (ast_node.tag != .extern_block_decl) blk: {
+            if (top_ordinal_ptr) |ord_ptr| {
+                const current_def = DefId.init(file_id, ord_ptr.*);
+                if (ord_ptr.* < std.math.maxInt(u12)) ord_ptr.* += 1;
+                break :blk current_def;
+            }
+            break :blk .NONE;
         } else .NONE;
 
         const item_cst = ast_arena.getCstOrigin(item_node_idx);
@@ -6221,6 +6958,180 @@ fn collectItemSliceInScope(
                 if (gen_specs.len > 0) {
                     try sym_table.setGenericParamSpecs(defined_sym_idx, gen_specs);
                 }
+                var fn_abi_buf: [256]u8 = undefined;
+                const fn_ext_info = extractItemExternAbiAndUnsafe(
+                    source,
+                    token_buffer,
+                    cst_arena,
+                    item_cst,
+                    ast_node.main_token,
+                    &fn_abi_buf,
+                );
+                try recordHeaderFfiContractIfPresent(
+                    sym_table,
+                    interner,
+                    defined_sym_idx,
+                    flags.is_extern,
+                    fn_ext_info.is_unsafe,
+                    fn_ext_info.abi_slice,
+                    &header_meta,
+                );
+            },
+            .extern_static_decl => {
+                const static_extra = ast_arena.getExternStaticExtra(item_node_idx);
+                const name_tok = ast_node.main_token;
+                const name_str = extractTokenSlice(source, token_buffer, name_tok);
+                if (name_str.len == 0) continue;
+                const name_sym = try interner.intern(name_str);
+                const name_span = token_buffer.getTokenSpan(file_id, name_tok);
+
+                const static_vis: Visibility = if (visibility != .private)
+                    visibility
+                else
+                    @fromBackingInt(@backingInt(static_extra.flags.visibility));
+                flags.is_pub = (static_vis == .public);
+                flags.is_extern = static_extra.flags.has_extern;
+                flags.is_mut = static_extra.flags.is_mut;
+
+                const defined_sym_idx = try sym_table.defineSymbol(.{
+                    .name = name_sym,
+                    .name_text = interner.get(name_sym),
+                    .kind = .extern_static_sym,
+                    .namespace = .value_ns,
+                    .visibility = static_vis,
+                    .flags = flags,
+                    .extra_flags = extra_flags,
+                    .scope_id = enclosing_scope,
+                    .def_id = def_id,
+                    .owner_def_id = enclosing_owner_def,
+                    .ast_node = item_node_idx,
+                    .cst_node = item_cst,
+                    .decl_span = name_span,
+                    .contract_flags = header_meta.contract_flags,
+                    .link_section_name = interned_link_sec,
+                    .link_name_text = interned_link_name,
+                    .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
+                    .has_cfg_attr = header_meta.has_cfg_attr,
+                }, diagnostic_sink);
+
+                var static_abi_buf: [256]u8 = undefined;
+                const static_abi_slice: []const u8 = if (!static_extra.abi_tok.isNone())
+                    unquoteAttrStringLexeme(
+                        extractTokenSlice(source, token_buffer, static_extra.abi_tok),
+                        &static_abi_buf,
+                    )
+                else
+                    "";
+                try recordHeaderFfiContractIfPresent(
+                    sym_table,
+                    interner,
+                    defined_sym_idx,
+                    flags.is_extern,
+                    static_extra.flags.is_unsafe,
+                    static_abi_slice,
+                    &header_meta,
+                );
+            },
+            .extern_block_decl => {
+                const block_hdr = ast_arena.getExternBlockHeader(item_node_idx);
+                const member_items = ast_arena.getExternBlockItems(item_node_idx);
+                const outer_vis: Visibility = if (visibility != .private)
+                    visibility
+                else
+                    @fromBackingInt(@backingInt(block_hdr.flags.visibility));
+
+                var block_abi_buf: [256]u8 = undefined;
+                const block_abi_slice: []const u8 = if (!block_hdr.abi_tok.isNone())
+                    unquoteAttrStringLexeme(
+                        extractTokenSlice(source, token_buffer, block_hdr.abi_tok),
+                        &block_abi_buf,
+                    )
+                else
+                    "C";
+                const block_abi_id: SymbolId = if (block_abi_slice.len > 0)
+                    try interner.intern(block_abi_slice)
+                else
+                    .empty;
+                const block_link_lib = header_meta.asLinkLibSlice();
+                const block_link_lib_id: SymbolId = if (block_link_lib.len > 0)
+                    try interner.intern(block_link_lib)
+                else
+                    .empty;
+                const block_wasm_mod = header_meta.asWasmImportModSlice();
+                const block_wasm_mod_id: SymbolId = if (block_wasm_mod.len > 0)
+                    try interner.intern(block_wasm_mod)
+                else
+                    .empty;
+                const block_wasm_name = header_meta.asWasmImportNameSlice();
+                const block_wasm_name_id: SymbolId = if (block_wasm_name.len > 0)
+                    try interner.intern(block_wasm_name)
+                else
+                    .empty;
+
+                const effective_owner_def = if (!def_id.isNone()) def_id else enclosing_owner_def;
+                const pre_sym_len = sym_table.symbols.items.len;
+                try collectItemSliceInScopeWithOrdinal(
+                    sym_table,
+                    interner,
+                    file_id,
+                    enclosing_scope,
+                    top_ordinal_ptr,
+                    effective_owner_def,
+                    member_items,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                    ast_arena,
+                    extra_ends,
+                    diagnostic_sink,
+                );
+
+                var sym_i = pre_sym_len;
+                while (sym_i < sym_table.symbols.items.len) : (sym_i += 1) {
+                    const added_idx = SymbolIndex.fromInt(@intCast(sym_i));
+                    const added_sym = &sym_table.symbols.items[sym_i];
+                    if (added_sym.scope_id != enclosing_scope) continue;
+                    if (added_sym.kind == .overload_group_sym) continue;
+
+                    if (outer_vis != .private and added_sym.visibility == .private) {
+                        added_sym.visibility = outer_vis;
+                        added_sym.flags.is_pub = (outer_vis == .public);
+                    }
+                    if (header_meta.has_cfg_attr) {
+                        added_sym.has_cfg_attr = true;
+                        if (added_sym.enclosing_cfg_cst.isNone()) {
+                            added_sym.enclosing_cfg_cst = item_cst;
+                        }
+                    }
+                    if (added_sym.kind == .fn_sym or added_sym.kind == .extern_static_sym) {
+                        added_sym.flags.is_extern = true;
+                        const existing_contract = if (sym_table.getFfiContract(added_idx)) |ptr|
+                            ptr.*
+                        else
+                            FfiFnContract{};
+                        const has_inherited = header_meta.is_trusted or
+                            header_meta.is_thread_local or
+                            block_hdr.flags.is_unsafe or
+                            block_abi_id != .empty or
+                            block_link_lib_id != .empty or
+                            block_wasm_mod_id != .empty or
+                            block_wasm_name_id != .empty;
+                        if (header_meta.is_thread_local) {
+                            added_sym.extra_flags.is_thread_local = true;
+                        }
+                        if (has_inherited or sym_table.getFfiContract(added_idx) != null) {
+                            var merged = existing_contract;
+                            if (header_meta.is_trusted) merged.is_trusted = true;
+                            if (header_meta.is_thread_local) merged.is_thread_local = true;
+                            if (block_hdr.flags.is_unsafe) merged.is_unsafe_extern = true;
+                            if (merged.abi_name == .empty) merged.abi_name = block_abi_id;
+                            if (merged.link_lib_name == .empty) merged.link_lib_name = block_link_lib_id;
+                            if (merged.wasm_import_module == .empty) merged.wasm_import_module = block_wasm_mod_id;
+                            if (merged.wasm_import_name == .empty) merged.wasm_import_name = block_wasm_name_id;
+                            try sym_table.setFfiContract(added_idx, merged, existing_contract.param_contracts);
+                        }
+                    }
+                }
             },
             .subscript_decl => {
                 const sub_sym = try interner.intern("subscript");
@@ -6505,7 +7416,7 @@ fn resolveImplTargetScope(
                 has_seen_for = true;
                 continue;
             }
-            if (isIdentifierToken(tok_kind) or tok_kind == .prim_type) {
+            if (isIdentifierToken(tok_kind) or tok_kind == .prim_type or tok_kind == .kw_async) {
                 if (!has_seen_for) {
                     if (before_for_len < before_for_toks.len) {
                         before_for_toks[before_for_len] = node.token;
@@ -7070,7 +7981,8 @@ fn resolveUseTreeCst(
             } else if (has_seen_as and (isIdentifierToken(tok_kind) or tok_kind == .underscore)) {
                 alias_tok = sub.token;
             } else if (!has_seen_as and
-                (isIdentifierToken(tok_kind) or tok_kind == .kw_self_val or tok_kind == .kw_self_type))
+                (isIdentifierToken(tok_kind) or tok_kind == .kw_self_val or
+                    tok_kind == .kw_self_type or tok_kind == .kw_async))
             {
                 if (seg_count < segments.len) {
                     segments[seg_count] = sub.token;
@@ -7106,6 +8018,18 @@ fn resolveUseTreeCst(
 
         for (members_snapshot) |member_idx| {
             const member = sym_table.getSymbol(member_idx).*;
+            if (member.has_cfg_attr) {
+                const scoped_key = packScopedSymbolKey(target_scope, member.name, member.namespace);
+                if (sym_table.scoped_map.get(scoped_key)) |active_idx| {
+                    if (active_idx != member_idx and
+                        sym_table.getSymbol(active_idx).kind != .overload_group_sym)
+                    {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
             const vis_check = sym_table.checkSymbolVisibility(member_idx, dest_module_scope);
             if (vis_check != .found) continue;
 
@@ -7426,9 +8350,9 @@ pub fn resolveModulePathSegments(
             }
         }
         const lookup_res = if (i == 0 and cur_scope == caller_scope)
-            sym_table.lookupLexical(cur_scope, seg_sym_id, NamespaceMask.TYPE_OR_VALUE)
+            sym_table.lookupLexical(cur_scope, seg_sym_id, NamespaceMask.ALL)
         else
-            sym_table.lookupInTargetScope(cur_scope, caller_scope, seg_sym_id, NamespaceMask.TYPE_OR_VALUE);
+            sym_table.lookupInTargetScope(cur_scope, caller_scope, seg_sym_id, NamespaceMask.ALL);
 
         switch (lookup_res) {
             .found => |sym_idx| {
@@ -7733,4 +8657,251 @@ test "test_stage4_trailing_mod_impl_extra_bounds_and_use_visibility_escalation" 
     const kept_pub_idx = sym_table.lookupInScopeDirect(glob_scope, try interner.intern("pub_fn"), NamespaceMask.VALUE_ONLY);
     try std.testing.expectEqual(Visibility.pub_pkg, sym_table.getSymbol(clamped_pkg_idx).visibility);
     try std.testing.expectEqual(Visibility.public, sym_table.getSymbol(kept_pub_idx).visibility);
+}
+
+test "test_phase8_cfg_11_target_sync_extern_blocks_kw_async_and_c_casing" {
+    const parser_mod = @import("parser.zig");
+    const allocator = std.testing.allocator;
+
+    // [1] Verify `CfgEnv.fromTargetSpec` across `musl`, `freestanding`, `none`, `wasi`, `apple`, `msvc`, and `gnu`:
+    const musl_env = CfgEnv.fromTargetSpec(codegen_abi.TargetSpec.X86_64_LINUX_MUSL, false);
+    try std.testing.expectEqual(CfgOs.linux, musl_env.os);
+    try std.testing.expectEqual(CfgAbi.musl, musl_env.abi);
+
+    const free_env = CfgEnv.fromTargetSpec(codegen_abi.TargetSpec.WASM32_UNKNOWN_FREESTANDING, false);
+    try std.testing.expectEqual(CfgOs.freestanding, free_env.os);
+    try std.testing.expectEqual(CfgAbi.none, free_env.abi);
+    try std.testing.expectEqual(@as(u16, 32), free_env.ptr_width);
+
+    const wasi_env = CfgEnv.fromTargetSpec(codegen_abi.TargetSpec.WASM32_UNKNOWN_WASI, false);
+    try std.testing.expectEqual(CfgOs.wasi, wasi_env.os);
+    try std.testing.expectEqual(CfgAbi.wasi, wasi_env.abi);
+
+    const apple_env = CfgEnv.fromTargetSpec(codegen_abi.TargetSpec.AARCH64_APPLE_DARWIN, false);
+    try std.testing.expectEqual(CfgAbi.apple, apple_env.abi);
+
+    // [2] Verify `@cfg(target.abi == "musl")` / `freestanding` / `none`, `c_*` casing exemption, `.kw_async`, & `extern` blocks:
+    const ffi_src =
+        \\@cfg(target.abi == "musl")
+        \\pub fn only_on_musl() -> i32 { return 11; }
+        \\@cfg(target.os == "freestanding" and target.abi == "none")
+        \\pub fn only_on_freestanding() -> i32 { return 22; }
+        \\
+        \\@cfg(target.arch == "aarch64")
+        \\pub type c_char = u8;
+        \\@cfg(not (target.arch == "aarch64"))
+        \\pub type c_char = i8;
+        \\pub type c_schar = i8;
+        \\pub type c_uchar = u8;
+        \\pub type c_short = i16;
+        \\pub type c_ushort = u16;
+        \\pub type c_int = i32;
+        \\pub type c_uint = u32;
+        \\pub type c_long = i64;
+        \\pub type c_ulong = u64;
+        \\pub type c_longlong = i64;
+        \\pub type c_ulonglong = u64;
+        \\pub type c_longdouble = f64;
+        \\pub type c_void = opaque;
+        \\
+        \\pub mod async {
+        \\    pub fn task_group() -> i32 { return 7; }
+        \\}
+        \\use async.{ task_group };
+        \\
+        \\@link_lib("z")
+        \\@trusted
+        \\extern "C" {
+        \\    pub fn zlib_version() -> *c_char;
+        \\    @thread_local
+        \\    pub static mut ERRNO_TLS: c_int;
+        \\    pub static ZLIB_MAGIC: c_uint;
+        \\    pub const Z_OK: c_int = 0;
+        \\}
+        \\@trusted
+        \\pub extern "C" static TOP_EXTERN_VAL: c_int;
+    ;
+
+    var tok_buf = TokenBuffer.init(allocator);
+    defer tok_buf.deinit();
+    var cst_arena = LosslessCstArena.init(allocator);
+    defer cst_arena.deinit();
+    var ast_arena = AstArena.init(allocator);
+    defer ast_arena.deinit();
+    var sink = DiagnosticSink.init(allocator);
+    defer sink.deinit();
+    var interner = try StringInterner.init(allocator);
+    defer interner.deinit();
+
+    _ = try parser_mod.parseSource(ffi_src, FileId.fromInt(95), &tok_buf, &cst_arena, &ast_arena, &sink, &interner);
+
+    var sym_table = try SymbolTable.init(allocator, &interner);
+    defer sym_table.deinit();
+    sym_table.cfg_env = musl_env;
+    const mod_scope = try collectFileModuleItems(
+        &sym_table,
+        &interner,
+        FileId.fromInt(95),
+        ffi_src,
+        &tok_buf,
+        &cst_arena,
+        &ast_arena,
+        &sink,
+    );
+    try resolveFileUseImports(&sym_table, &interner, FileId.fromInt(95), ffi_src, &tok_buf, &cst_arena, &sink);
+
+    // Zero errors and zero `W0201` casing warnings on `c_*` aliases or `@cfg` `c_char` twins:
+    try std.testing.expectEqual(@as(usize, 0), sink.countDiagnostics());
+
+    // `@cfg(target.abi == "musl")` kept `only_on_musl` and pruned `only_on_freestanding`:
+    try std.testing.expect(
+        !sym_table.lookupInScopeDirect(mod_scope, try interner.intern("only_on_musl"), NamespaceMask.VALUE_ONLY).isNone(),
+    );
+    try std.testing.expect(
+        sym_table.lookupInScopeDirect(mod_scope, try interner.intern("only_on_freestanding"), NamespaceMask.VALUE_ONLY).isNone(),
+    );
+    try std.testing.expect(
+        !sym_table.lookupInScopeDirect(mod_scope, try interner.intern("c_char"), NamespaceMask.TYPE_ONLY).isNone(),
+    );
+
+    // `.kw_async` module and `use async.{ task_group };` resolved cleanly:
+    const tg_alias = sym_table.lookupInScopeDirect(mod_scope, try interner.intern("task_group"), NamespaceMask.VALUE_ONLY);
+    try std.testing.expect(!tg_alias.isNone());
+
+    // Standalone `extern "C"` block members inherited `is_extern`, `@link_lib("z")`, `@trusted`, and `@thread_local`:
+    const zlib_fn = sym_table.lookupInScopeDirect(mod_scope, try interner.intern("zlib_version"), NamespaceMask.VALUE_ONLY);
+    try std.testing.expect(!zlib_fn.isNone());
+    try std.testing.expect(sym_table.getSymbol(zlib_fn).flags.is_extern);
+    const zlib_contract = sym_table.getFfiContract(zlib_fn).?;
+    try std.testing.expect(zlib_contract.is_trusted);
+    try std.testing.expectEqualStrings("z", interner.get(zlib_contract.link_lib_name));
+
+    const errno_sym = sym_table.lookupInScopeDirect(mod_scope, try interner.intern("ERRNO_TLS"), NamespaceMask.VALUE_ONLY);
+    try std.testing.expect(!errno_sym.isNone());
+    try std.testing.expectEqual(SymbolKind.extern_static_sym, sym_table.getSymbol(errno_sym).kind);
+    try std.testing.expect(sym_table.getSymbol(errno_sym).flags.is_extern);
+    try std.testing.expect(sym_table.getSymbol(errno_sym).flags.is_mut);
+    try std.testing.expect(sym_table.getFfiContract(errno_sym).?.is_thread_local);
+
+    const z_ok_sym = sym_table.lookupInScopeDirect(mod_scope, try interner.intern("Z_OK"), NamespaceMask.CONST_ONLY);
+    try std.testing.expect(!z_ok_sym.isNone());
+
+    // [3] Re-run under `WASM32_UNKNOWN_FREESTANDING` to confirm `@cfg(target.os == "freestanding" and target.abi == "none")`:
+    var free_sym_table = try SymbolTable.init(allocator, &interner);
+    defer free_sym_table.deinit();
+    free_sym_table.cfg_env = free_env;
+    const free_scope = try collectFileModuleItems(
+        &free_sym_table,
+        &interner,
+        FileId.fromInt(95),
+        ffi_src,
+        &tok_buf,
+        &cst_arena,
+        &ast_arena,
+        &sink,
+    );
+    try std.testing.expect(
+        !free_sym_table.lookupInScopeDirect(free_scope, try interner.intern("only_on_freestanding"), NamespaceMask.VALUE_ONLY).isNone(),
+    );
+    try std.testing.expect(
+        free_sym_table.lookupInScopeDirect(free_scope, try interner.intern("only_on_musl"), NamespaceMask.VALUE_ONLY).isNone(),
+    );
+}
+
+test "test_r3_not_send_not_sync_flags_and_cx_ffi_target_refresh" {
+    const parser_mod = @import("parser.zig");
+    const allocator = std.testing.allocator;
+
+    const conc_src =
+        \\@not_send
+        \\pub struct LocalHandle {
+        \\    pub id: u32,
+        \\}
+        \\@not_sync
+        \\pub struct InteriorCell {
+        \\    pub val: i32,
+        \\}
+        \\@thread_local
+        \\extern "C" {
+        \\    pub static mut TLS_COUNTER: i32;
+        \\}
+    ;
+
+    var tok_buf = TokenBuffer.init(allocator);
+    defer tok_buf.deinit();
+    var cst_arena = LosslessCstArena.init(allocator);
+    defer cst_arena.deinit();
+    var ast_arena = AstArena.init(allocator);
+    defer ast_arena.deinit();
+    var sink = DiagnosticSink.init(allocator);
+    defer sink.deinit();
+    var interner = try StringInterner.init(allocator);
+    defer interner.deinit();
+
+    _ = try parser_mod.parseSource(conc_src, FileId.fromInt(96), &tok_buf, &cst_arena, &ast_arena, &sink, &interner);
+
+    var sym_table = try SymbolTable.init(allocator, &interner);
+    defer sym_table.deinit();
+    const mod_scope = try collectFileModuleItems(
+        &sym_table,
+        &interner,
+        FileId.fromInt(96),
+        conc_src,
+        &tok_buf,
+        &cst_arena,
+        &ast_arena,
+        &sink,
+    );
+    try std.testing.expectEqual(@as(usize, 0), sink.countDiagnostics());
+
+    const local_handle_idx = sym_table.lookupInScopeDirect(
+        mod_scope,
+        try interner.intern("LocalHandle"),
+        NamespaceMask.TYPE_ONLY,
+    );
+    try std.testing.expect(!local_handle_idx.isNone());
+    try std.testing.expect(sym_table.getSymbol(local_handle_idx).extra_flags.is_not_send);
+    try std.testing.expect(!sym_table.getSymbol(local_handle_idx).extra_flags.is_not_sync);
+
+    const interior_cell_idx = sym_table.lookupInScopeDirect(
+        mod_scope,
+        try interner.intern("InteriorCell"),
+        NamespaceMask.TYPE_ONLY,
+    );
+    try std.testing.expect(!interior_cell_idx.isNone());
+    try std.testing.expect(sym_table.getSymbol(interior_cell_idx).extra_flags.is_not_sync);
+    try std.testing.expect(!sym_table.getSymbol(interior_cell_idx).extra_flags.is_not_send);
+
+    const tls_idx = sym_table.lookupInScopeDirect(
+        mod_scope,
+        try interner.intern("TLS_COUNTER"),
+        NamespaceMask.VALUE_ONLY,
+    );
+    try std.testing.expect(!tls_idx.isNone());
+    try std.testing.expect(sym_table.getSymbol(tls_idx).extra_flags.is_thread_local);
+    try std.testing.expect(sym_table.getFfiContract(tls_idx).?.is_thread_local);
+
+    // Verify `ensureCxRootScope` + `refreshCxFfiTargetAliases` update `c_char`, `c_long`, and `c_ulong` in-place:
+    sym_table.cfg_env = CfgEnv.fromTargetSpec(codegen_abi.TargetSpec.X86_64_LINUX_GNU, false);
+    const cx_root = try sym_table.ensureCxRootScope(&interner);
+    const ffi_mod = sym_table.lookupInScopeDirect(cx_root, try interner.intern("ffi"), NamespaceMask.VALUE_ONLY);
+    const ffi_scope = sym_table.getSymbol(ffi_mod).target_scope;
+    const c_char_sym = sym_table.lookupInScopeDirect(ffi_scope, try interner.intern("c_char"), NamespaceMask.TYPE_ONLY);
+    const c_long_sym = sym_table.lookupInScopeDirect(ffi_scope, try interner.intern("c_long"), NamespaceMask.TYPE_ONLY);
+    const c_ulong_sym = sym_table.lookupInScopeDirect(ffi_scope, try interner.intern("c_ulong"), NamespaceMask.TYPE_ONLY);
+
+    try std.testing.expectEqual(TypeId.i8_ty, sym_table.getSymbol(c_char_sym).type_id);
+    try std.testing.expectEqual(TypeId.i64_ty, sym_table.getSymbol(c_long_sym).type_id);
+    try std.testing.expectEqual(TypeId.u64_ty, sym_table.getSymbol(c_ulong_sym).type_id);
+
+    sym_table.cfg_env = CfgEnv.fromTargetSpec(codegen_abi.TargetSpec.AARCH64_LINUX_GNU, false);
+    sym_table.refreshCxFfiTargetAliases(&interner);
+    try std.testing.expectEqual(TypeId.u8_ty, sym_table.getSymbol(c_char_sym).type_id);
+    try std.testing.expectEqual(TypeId.i64_ty, sym_table.getSymbol(c_long_sym).type_id);
+
+    sym_table.cfg_env = CfgEnv.fromTargetSpec(codegen_abi.TargetSpec.X86_64_WINDOWS_MSVC, false);
+    _ = try sym_table.ensureCxRootScope(&interner);
+    try std.testing.expectEqual(TypeId.i8_ty, sym_table.getSymbol(c_char_sym).type_id);
+    try std.testing.expectEqual(TypeId.i32_ty, sym_table.getSymbol(c_long_sym).type_id);
+    try std.testing.expectEqual(TypeId.u32_ty, sym_table.getSymbol(c_ulong_sym).type_id);
 }

@@ -1,15 +1,13 @@
 //! Unit & Differential Execution Tests for Stage-1 `core` (`tests/unit/core_stdlib_test.zig`)
 //!
-//! Verifies all Phase 7.6 (`DR-22`) Stage-1 minimal `core` library invariants:
-//! - All 12 `core/**/*.cx` files satisfy 3-part `//!` headers, `< 150` column line limits,
+//! Verifies all Phase 7.6 (`DR-22`) & Phase 8 (`DR-08`, `DR-10`) Stage-1 `core` library invariants:
+//! - All 14 `core/**/*.cx` files satisfy 3-part `//!` headers, `< 150` column line limits,
 //!   canonical 90-char / 65-char section dividers, and `formatSourceWithOptions` idempotency
 //!   (`is_changed == false`, zero parse errors).
 //! - Full multi-file `core` hierarchy resolves, typechecks, lowers to `HIR`/`MIR`, and passes
 //!   4-pass `mir_sast` (`@std_cap_boundary(clears: [unsafe_op])`) with zero errors and warnings.
-//! - `@cache_aligned` `core.mem.CachePadded[u64]` (`cx.mem.CachePadded[u64]`) resolves to `64B`
-//!   alignment on `x86_64`, `128B` alignment on `aarch64-macos` (`D-10A`), cross-compiles to `.o`
-//!   across `x86_64-linux`, `aarch64-macos`, `x86_64-windows` (`*mut opaque`), and `wasm32-wasi`
-//!   in both Tier A and Tier B, and passes the 4-tier `diff_oracle`.
+//! - `core.mem.CachePadded[u64]`, `core.ffi.CStr` / C scalar aliases, and `core.async` (`Poll`,
+//!   `CancelSource`, `yield_now`, `block_on`, `task_group`) cross-compile and pass 4-tier `diff_oracle`.
 
 const std = @import("std");
 const corex = @import("corex");
@@ -24,7 +22,7 @@ const TypeLayoutResolver = corex.TypeLayoutResolver;
 
 // --------------------------------------- CONSTS ----------------------------------------
 
-/// Canonical Stage-1 `core` source file paths in deterministic module order (`12` files).
+/// Canonical Stage-1 `core` source file paths in deterministic module order (`14` files).
 const CORE_MODULE_PATHS = [_][]const u8{
     "core/root.cx",
     "core/primitives.cx",
@@ -38,6 +36,8 @@ const CORE_MODULE_PATHS = [_][]const u8{
     "core/sys/macos.cx",
     "core/sys/windows.cx",
     "core/sys/wasi.cx",
+    "core/ffi.cx",
+    "core/async.cx",
 };
 
 // -------------------------------------- INTERNALS --------------------------------------
@@ -95,7 +95,7 @@ fn verifyCxStyleAndDividers(cx_path: []const u8, normalized_source: []const u8) 
     }
 }
 
-/// Loads all 12 `core/**/*.cx` files into `db` starting at `base_file_id` and binds `mod` edges.
+/// Loads all 14 `core/**/*.cx` files into `db` starting at `base_file_id` and binds `mod` edges.
 fn loadCoreTreeIntoDb(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -128,6 +128,8 @@ fn loadCoreTreeIntoDb(
     try db.bindExternalModule(core_root_fid, "panic", file_ids[5]);
     try db.bindExternalModule(core_root_fid, "runtime", file_ids[6]);
     try db.bindExternalModule(core_root_fid, "sys", file_ids[7]);
+    try db.bindExternalModule(core_root_fid, "ffi", file_ids[12]);
+    try db.bindExternalModule(core_root_fid, "async", file_ids[13]);
 
     const sys_mod_fid = file_ids[7];
     try db.bindExternalModule(sys_mod_fid, "linux", file_ids[8]);
@@ -140,7 +142,7 @@ fn loadCoreTreeIntoDb(
 
 // ------------------------------------- PUBLIC API --------------------------------------
 
-test "test_core_stdlib_all_12_files_canonical_format_headers_and_zero_diagnostics" {
+test "test_core_stdlib_all_14_files_canonical_format_headers_and_zero_diagnostics" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -178,41 +180,51 @@ test "test_core_stdlib_all_12_files_canonical_format_headers_and_zero_diagnostic
     const core_fids = try loadCoreTreeIntoDb(allocator, io, &db, 0);
 
     var has_seen_atomic_inline_test = false;
+    var total_diag_count: usize = 0;
     for (core_fids, 0..) |fid, i| {
         const mod_label = CORE_MODULE_PATHS[i];
         const parsed_art = try db.parseCst(fid);
         if (parsed_art.diagnostics.diagnostics.items.len > 0) {
             dumpSinkOnFailure(mod_label, &parsed_art.diagnostics);
+            total_diag_count += parsed_art.diagnostics.diagnostics.items.len;
         }
-        try std.testing.expectEqual(@as(usize, 0), parsed_art.diagnostics.diagnostics.items.len);
 
         const sig_art = try db.resolveSignatures(fid);
         if (db.getSignatureDiagnostics(fid)) |sig_sink| {
-            if (sig_sink.diagnostics.items.len > 0) dumpSinkOnFailure(mod_label, sig_sink);
-            try std.testing.expectEqual(@as(usize, 0), sig_sink.diagnostics.items.len);
+            if (sig_sink.diagnostics.items.len > 0) {
+                dumpSinkOnFailure(mod_label, sig_sink);
+                total_diag_count += sig_sink.diagnostics.items.len;
+            }
         }
-        try std.testing.expectEqual(@as(u32, 0), sig_art.error_count);
+        total_diag_count += sig_art.error_count;
 
-        const item_entries = (try db.extractItemTree(fid)).entries;
-        for (item_entries) |entry| {
+        const entry_count = (try db.extractItemTree(fid)).entries.len;
+        var entry_i: usize = 0;
+        while (entry_i < entry_count) : (entry_i += 1) {
+            const entry = (try db.extractItemTree(fid)).entries[entry_i];
             if (entry.kind == .test_decl) {
                 has_seen_atomic_inline_test = true;
             }
             const body_art = try db.typecheckBody(entry.def_id);
             if (db.getBodyDiagnostics(entry.def_id)) |body_sink| {
-                if (body_sink.diagnostics.items.len > 0) dumpSinkOnFailure(mod_label, body_sink);
-                try std.testing.expectEqual(@as(usize, 0), body_sink.diagnostics.items.len);
+                if (body_sink.diagnostics.items.len > 0) {
+                    dumpSinkOnFailure(mod_label, body_sink);
+                    total_diag_count += body_sink.diagnostics.items.len;
+                }
             }
-            try std.testing.expectEqual(@as(u32, 0), body_art.error_count);
+            total_diag_count += body_art.error_count;
 
             const sast_art = try db.verifySastMir(entry.def_id);
             if (db.getSastDiagnostics(entry.def_id)) |sast_sink| {
-                if (sast_sink.diagnostics.items.len > 0) dumpSinkOnFailure(mod_label, sast_sink);
-                try std.testing.expectEqual(@as(usize, 0), sast_sink.diagnostics.items.len);
+                if (sast_sink.diagnostics.items.len > 0) {
+                    dumpSinkOnFailure(mod_label, sast_sink);
+                    total_diag_count += sast_sink.diagnostics.items.len;
+                }
             }
-            try std.testing.expect(sast_art.is_verified_sound);
+            if (!sast_art.is_verified_sound) total_diag_count += 1;
         }
     }
+    try std.testing.expectEqual(@as(usize, 0), total_diag_count);
     try std.testing.expect(has_seen_atomic_inline_test);
 }
 
@@ -632,11 +644,14 @@ test "test_regression_core_sys_externs_dedup_and_compile_to_object" {
 
         var c_sink = DiagnosticSink.init(allocator);
         defer c_sink.deinit();
-        var c_art = try db.compileModuleArtifact(
+        var c_art = db.compileModuleArtifact(
             app_fid,
             .{ .tier_a_c99 = .{ .target = tc.spec, .is_release_mode = true, .has_line_directives = false } },
             .{ .artifact_kind = .object_file, .output_path = c_obj, .io = io, .diagnostic_sink = &c_sink },
-        );
+        ) catch |err| {
+            dumpSinkOnFailure("core_sys_c", &c_sink);
+            return err;
+        };
         defer c_art.deinit(allocator);
         if (c_sink.hasErrors()) dumpSinkOnFailure("core_sys_c", &c_sink);
         try std.testing.expect(!c_sink.hasErrors());
@@ -700,4 +715,252 @@ test "test_core_direct_import_without_internal_core_emits_e0218" {
     try db.setInternalCore(true);
     const ok_sig = try db.resolveSignatures(app_fid);
     try std.testing.expectEqual(@as(u32, 0), ok_sig.error_count);
+}
+
+test "test_core_ffi_and_async_cross_target_layouts_and_object_emission" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const cross_probe_src =
+        "//! Cross-Target `cx.ffi` + `cx.async` Layout & Object Compilation Probe\n" ++
+        "use cx.ffi.{CStr, VaList, c_char, c_long};\n" ++
+        "use cx.async.{CancelSource, Poll, TaskHeader};\n\n" ++
+        "pub fn probe_c_long(val: c_long) -> c_long = val;\n" ++
+        "pub fn probe_c_char(ch: c_char) -> c_char = ch;\n" ++
+        "pub fn probe_va_list(va_in: VaList) -> VaList = va_in;\n" ++
+        "pub fn probe_cstr_and_async() -> usize {\n" ++
+        "    let poll_item: Poll[i32] = .Ready(7);\n" ++
+        "    var cancel_src = CancelSource.new();\n" ++
+        "    let cancel_tok = cancel_src.as_token();\n" ++
+        "    cancel_src.cancel();\n" ++
+        "    let hdr = TaskHeader.empty();\n" ++
+        "    let nul_bytes: [u8; 4] = [b'o', b'k', b'!', 0_u8];\n" ++
+        "    let cstr_len: usize = match CStr.from_bytes_with_nul(&nul_bytes) {\n" ++
+        "        .Some(valid_cstr) => valid_cstr.count_bytes(),\n" ++
+        "        .None => 0,\n" ++
+        "    };\n" ++
+        "    if poll_item.is_ready() and cancel_tok.is_cancelled() {\n" ++
+        "        return cstr_len + hdr.poll_fn;\n" ++
+        "    }\n" ++
+        "    return 0;\n" ++
+        "}\n";
+
+    const target_cases = [_]struct {
+        /// Target architecture/OS/ABI triple under test.
+        spec: TargetSpec,
+        /// Expected byte width of `c_long`.
+        expected_c_long_bytes: u64,
+        /// Expected byte width of `VaList` struct storage.
+        expected_va_bytes: u64,
+        /// Scratch object file prefix inside `.zig-cache/`.
+        stem: []const u8,
+    }{
+        .{
+            .spec = TargetSpec.X86_64_LINUX_GNU,
+            .expected_c_long_bytes = 8,
+            .expected_va_bytes = 24,
+            .stem = ".zig-cache/core_p8_x64_linux",
+        },
+        .{
+            .spec = TargetSpec.AARCH64_LINUX_GNU,
+            .expected_c_long_bytes = 8,
+            .expected_va_bytes = 32,
+            .stem = ".zig-cache/core_p8_arm64_linux",
+        },
+        .{
+            .spec = TargetSpec.AARCH64_APPLE_DARWIN,
+            .expected_c_long_bytes = 8,
+            .expected_va_bytes = 8,
+            .stem = ".zig-cache/core_p8_arm64_macos",
+        },
+        .{
+            .spec = TargetSpec.X86_64_WINDOWS_MSVC,
+            .expected_c_long_bytes = 4,
+            .expected_va_bytes = 8,
+            .stem = ".zig-cache/core_p8_x64_win",
+        },
+        .{
+            .spec = TargetSpec.WASM32_UNKNOWN_WASI,
+            .expected_c_long_bytes = 4,
+            .expected_va_bytes = 4,
+            .stem = ".zig-cache/core_p8_wasm32_wasi",
+        },
+    };
+
+    for (target_cases) |target_case| {
+        var db = try CompilerDb.init(allocator);
+        defer db.deinit();
+        db.setTargetSpec(target_case.spec);
+        _ = try loadCoreTreeIntoDb(allocator, io, &db, 1);
+
+        const app_fid = FileId.fromInt(0);
+        _ = try db.setInput(app_fid, cross_probe_src, .low);
+
+        const opt_mod = try db.optimizeMirModule(app_fid, true);
+        var resolver = TypeLayoutResolver.init(
+            allocator,
+            &db.type_pool,
+            &db.symbol_table,
+            target_case.spec,
+        );
+        defer resolver.deinit();
+
+        const long_body = opt_mod.findBodyByName(&db.interner, "probe_c_long").?;
+        const va_body = opt_mod.findBodyByName(&db.interner, "probe_va_list").?;
+        try std.testing.expectEqual(
+            target_case.expected_c_long_bytes,
+            (try resolver.resolveType(long_body.ret_ty)).size_bytes,
+        );
+        try std.testing.expectEqual(
+            target_case.expected_va_bytes,
+            (try resolver.resolveType(va_body.ret_ty)).size_bytes,
+        );
+
+        const c_obj = try std.fmt.allocPrint(allocator, "{s}_c.o", .{target_case.stem});
+        defer allocator.free(c_obj);
+        defer std.Io.Dir.cwd().deleteFile(io, c_obj) catch {};
+
+        var c_sink = DiagnosticSink.init(allocator);
+        defer c_sink.deinit();
+        var c_art = db.compileModuleArtifact(
+            app_fid,
+            .{
+                .tier_a_c99 = .{
+                    .target = target_case.spec,
+                    .is_release_mode = true,
+                    .has_line_directives = false,
+                },
+            },
+            .{
+                .artifact_kind = .object_file,
+                .output_path = c_obj,
+                .io = io,
+                .diagnostic_sink = &c_sink,
+            },
+        ) catch |err| {
+            dumpSinkOnFailure("core_p8_c", &c_sink);
+            return err;
+        };
+        defer c_art.deinit(allocator);
+        if (c_sink.hasErrors()) dumpSinkOnFailure("core_p8_c", &c_sink);
+        try std.testing.expect(!c_sink.hasErrors());
+
+        const ll_obj = try std.fmt.allocPrint(allocator, "{s}_ll.o", .{target_case.stem});
+        defer allocator.free(ll_obj);
+        defer std.Io.Dir.cwd().deleteFile(io, ll_obj) catch {};
+
+        var ll_sink = DiagnosticSink.init(allocator);
+        defer ll_sink.deinit();
+        var ll_art = try db.compileModuleArtifact(
+            app_fid,
+            .{ .tier_b_llvm = .{ .target = target_case.spec, .is_release_mode = true } },
+            .{
+                .artifact_kind = .object_file,
+                .output_path = ll_obj,
+                .io = io,
+                .diagnostic_sink = &ll_sink,
+            },
+        );
+        defer ll_art.deinit(allocator);
+        if (ll_sink.hasErrors()) dumpSinkOnFailure("core_p8_ll", &ll_sink);
+        try std.testing.expect(!ll_sink.hasErrors());
+    }
+}
+
+test "test_core_ffi_cstr_and_async_nursery_four_tier_differential_oracle" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const app_source =
+        "//! End-to-End 4-Tier Differential `cx.ffi` + `cx.async` Verification Program\n" ++
+        "use cx.ffi.CStr;\n" ++
+        "use cx.async.{CancelSource, Poll, Waker, block_on, task_group, yield_now};\n" ++
+        "use cx.panic.assert_true;\n" ++
+        "use cx.runtime.record_drop_trace;\n\n" ++
+        "pub async fn async_compute_pipeline(base_len: i32) -> i32 {\n" ++
+        "    yield_now().await;\n" ++
+        "    let group_total: i32 = task_group(|grp| {\n" ++
+        "        let first_h = grp.spawn(own async {\n" ++
+        "            record_drop_trace(501);\n" ++
+        "            yield_now().await;\n" ++
+        "            record_drop_trace(503);\n" ++
+        "            10\n" ++
+        "        });\n" ++
+        "        let second_h = grp.spawn_local(own async {\n" ++
+        "            record_drop_trace(502);\n" ++
+        "            yield_now().await;\n" ++
+        "            record_drop_trace(504);\n" ++
+        "            25\n" ++
+        "        });\n" ++
+        "        let first_join = first_h.join();\n" ++
+        "        let second_join = second_h.join();\n" ++
+        "        first_join.await + second_join.await\n" ++
+        "    }).await;\n" ++
+        "    return base_len + group_total;\n" ++
+        "}\n\n" ++
+        "pub fn main() -> i32 {\n" ++
+        "    let valid_bytes: [u8; 6] = [b'c', b'o', b'r', b'e', b'x', 0_u8];\n" ++
+        "    let empty_bytes: [u8; 1] = [0_u8];\n" ++
+        "    let bad_interior_nul: [u8; 3] = [b'a', 0_u8, 0_u8];\n" ++
+        "    let bad_missing_nul: [u8; 2] = [b'x', b'y'];\n" ++
+        "    let parsed_cstr = CStr.from_bytes_with_nul(&valid_bytes);\n" ++
+        "    let empty_cstr = CStr.from_bytes_with_nul(&empty_bytes);\n" ++
+        "    assert_true(CStr.from_bytes_with_nul(&bad_interior_nul) is .None, \"interior nul\");\n" ++
+        "    assert_true(CStr.from_bytes_with_nul(&bad_missing_nul) is .None, \"missing nul\");\n" ++
+        "    let cstr_len: i32 = match parsed_cstr {\n" ++
+        "        .Some(cs_val) => if not cs_val.is_empty() { cs_val.count_bytes() as i32 } else { -1 },\n" ++
+        "        .None => -2,\n" ++
+        "    };\n" ++
+        "    let empty_ok: i32 = match empty_cstr {\n" ++
+        "        .Some(emp_val) => if emp_val.is_empty() and emp_val.count_bytes() == 0 { 2 } else { 0 },\n" ++
+        "        .None => 0,\n" ++
+        "    };\n" ++
+        "    let ready_poll: Poll[i32] = .Ready(4);\n" ++
+        "    let pending_poll: Poll[i32] = .Pending;\n" ++
+        "    assert_true(ready_poll.is_ready() and not ready_poll.is_pending(), \"poll ready\");\n" ++
+        "    assert_true(pending_poll.is_pending() and not pending_poll.is_ready(), \"poll pending\");\n" ++
+        "    let noop_waker = Waker.noop();\n" ++
+        "    assert_true(noop_waker.is_noop(), \"noop waker\");\n" ++
+        "    noop_waker.wake();\n" ++
+        "    var cancel_src = CancelSource.new();\n" ++
+        "    let tok_view = cancel_src.as_token();\n" ++
+        "    assert_true(not cancel_src.is_cancelled() and not tok_view.is_cancelled(), \"init active\");\n" ++
+        "    cancel_src.cancel();\n" ++
+        "    assert_true(cancel_src.is_cancelled() and tok_view.is_cancelled(), \"cancelled view\");\n" ++
+        "    return block_on(own async_compute_pipeline(cstr_len + empty_ok));\n" ++
+        "}\n";
+
+    var db = try CompilerDb.init(allocator);
+    defer db.deinit();
+    db.setTargetSpec(TargetSpec.host());
+    _ = try loadCoreTreeIntoDb(allocator, io, &db, 1);
+
+    const app_fid = FileId.fromInt(0);
+    _ = try db.setInput(app_fid, app_source, .low);
+
+    var sink = DiagnosticSink.init(allocator);
+    defer sink.deinit();
+    var report = corex.runFourTierDiffOracleOnDb(
+        allocator,
+        &db,
+        app_fid,
+        .{ .io = io, .diagnostic_sink = &sink },
+    ) catch |err| {
+        dumpSinkOnFailure("core_p8_oracle", &sink);
+        return err;
+    };
+    defer report.deinit(allocator);
+
+    if (!report.is_all_matching) {
+        std.debug.print("{s}\n", .{report.rendered_diff_table});
+    }
+    try std.testing.expect(report.is_all_matching);
+    try std.testing.expect(!report.outcomes[0].has_trapped);
+    // 5 + 2 + 10 + 25 = 42
+    try std.testing.expectEqual(@as(i64, 42), report.outcomes[0].return_scalar_i64);
+    try std.testing.expectEqualSlices(
+        i64,
+        &[_]i64{ 501, 502, 503, 504 },
+        report.outcomes[0].drop_trace,
+    );
 }

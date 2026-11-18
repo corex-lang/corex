@@ -2717,16 +2717,19 @@ test "test_phase75_pentagon_dollar_bce_static_e0307_and_unreachable_e0321_se04_s
     try expectSastDiagnostic(allocator, 514, reachable_unreach_src, .{}, .e0321_no_panic_contract_violation);
 }
 
-test "test_phase75_context_layout_64b_32b_and_with_allocator_escape_e0306_se08" {
+test "test_phase75_context_layout_80b_40b_and_with_allocator_escape_e0306_se08" {
     const allocator = std.testing.allocator;
 
-    // [1] `SE-08` Canonical 8-slot `Context` layout (`64B` single cache line, `0..7` slot ordinals):
-    try std.testing.expectEqual(@as(u32, 64), ContextFieldLayout.BYTE_SIZE_64);
-    try std.testing.expectEqual(@as(usize, 8), ContextFieldLayout.CANONICAL_FIELDS.len);
+    // [1] `SE-08` & `DR-08` Canonical 10-slot `Context` layout (`80B` on 64-bit, `40B` on `wasm32`, `0..9` ordinals):
+    try std.testing.expectEqual(@as(u32, 80), ContextFieldLayout.BYTE_SIZE_64);
+    try std.testing.expectEqual(@as(u32, 40), ContextFieldLayout.BYTE_SIZE_32);
+    try std.testing.expectEqual(@as(usize, 10), ContextFieldLayout.CANONICAL_FIELDS.len);
     try std.testing.expectEqual(@as(u8, 0), ContextFieldLayout.fromFieldName("allocator").?.slot_ordinal);
     try std.testing.expectEqual(@as(u8, 2), ContextFieldLayout.fromFieldName("rng_seed").?.slot_ordinal);
     try std.testing.expectEqual(@as(u8, 4), ContextFieldLayout.fromFieldName("temp_allocator").?.slot_ordinal);
     try std.testing.expectEqual(@as(u8, 7), ContextFieldLayout.fromFieldName("cancel_token").?.slot_ordinal);
+    try std.testing.expectEqual(@as(u8, 8), ContextFieldLayout.fromFieldName("reactor").?.slot_ordinal);
+    try std.testing.expectEqual(@as(u8, 9), ContextFieldLayout.fromFieldName("reactor_ctx").?.slot_ordinal);
 
     // [2] Normal `context.allocator` allocation returned to caller passes (`0` errors),
     // and returning a `Copy` scalar computed inside `with context.allocator = …` passes (`0` errors):

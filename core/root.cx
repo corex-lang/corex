@@ -2,7 +2,7 @@
 //!
 //! Exposes foundational freestanding primitives, alignment and MVS slot helpers, lock-free atomics,
 //! portable explicit SIMD vectors, deterministic trap/panic handlers, hot-reload runtime seams,
-//! and platform syscall descriptors (re-exported publicly via `cx.*`).
+//! platform syscall descriptors, C ABI FFI types, and structured async primitives (via `cx.*`).
 //!
 //! All modules inside `core` are strictly typed, heap-allocation-free (`@no_alloc` compatible),
 //! and verified across `MirVm`, Tier A (`-ofmt=c`), and Tier B (`LLVM`).
@@ -26,3 +26,9 @@ pub mod runtime;
 
 /// Platform syscall descriptors and safe standard-stream / process-exit wrappers.
 pub mod sys;
+
+/// Target-calibrated C ABI scalar aliases, `VaList`, and `CStr` wrappers (`DR-10`, `ADR-22F`).
+pub mod ffi;
+
+/// Structured cooperative `async`/`await`, `TaskGroup`, `TaskHandle`, and `CancelToken` primitives (`DR-08`).
+pub mod async;

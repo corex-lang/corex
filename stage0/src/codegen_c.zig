@@ -28,7 +28,9 @@ const query_db = @import("query_db.zig");
 const hir = @import("hir.zig");
 const mir = @import("mir.zig");
 const codegen_abi = @import("codegen_abi.zig");
+const codegen_link = @import("codegen_link.zig");
 const codegen_dev_seam = @import("codegen_dev_seam.zig");
+const mir_async = @import("mir_async.zig");
 
 const FileId = mem_foundation.FileId;
 const Span = mem_foundation.Span;
@@ -115,6 +117,30 @@ const LoweredPlaceC = union(enum) {
     const_len: u64,
 };
 
+/// Resolved FFI, linker-section, TLS, and WebAssembly import/export metadata for a `SymbolIndex`.
+const SymFfiMeta = struct {
+    /// `true` when declared with `extern` (`flags.is_extern`).
+    is_extern: bool = false,
+    /// `true` when annotated with `@export` (`contract_flags.is_export`).
+    is_export: bool = false,
+    /// `true` when declared `static mut` (`flags.is_mut`).
+    is_mut: bool = false,
+    /// `true` when annotated with `@thread_local`.
+    is_thread_local: bool = false,
+    /// Explicit `@link_name("…")` override (`""` when absent).
+    link_name: []const u8 = "",
+    /// Explicit `@link_section("…")` override (`""` when absent).
+    link_section: []const u8 = "",
+    /// Explicit `@wasm_import("module", …)` host module (`""` when absent).
+    wasm_import_module: []const u8 = "",
+    /// Explicit `@wasm_import(…, "name")` host symbol (`""` when absent).
+    wasm_import_name: []const u8 = "",
+    /// Explicit `@wasm_export("name")` symbol (`""` when absent).
+    wasm_export_name: []const u8 = "",
+    /// Optional `@link_lib("name")` native library directive (`""` when absent).
+    link_lib_name: []const u8 = "",
+};
+
 /// Stateful deterministic Tier A C99 module emitter.
 const CModuleEmitter = struct {
     /// Backing allocator for transient tables and output buffers.
@@ -163,6 +189,12 @@ const CModuleEmitter = struct {
     extern_syms: std.ArrayListUnmanaged(SymbolIndex) = .empty,
     /// Set deduplicating `extern_syms` by `SymbolIndex.asInt()`.
     extern_sym_set: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Externally referenced `extern static` global `SymbolIndex` declarations.
+    extern_global_syms: std.ArrayListUnmanaged(SymbolIndex) = .empty,
+    /// Set deduplicating `extern_global_syms` by `SymbolIndex.asInt()`.
+    extern_global_sym_set: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Deduplicated `@link_lib("…")` library names collected across referenced FFI symbols.
+    collected_link_libs: std.ArrayListUnmanaged([]const u8) = .empty,
     /// Interned string/byte `SymbolId.asInt()` literals referenced in `MirConst`, sorted deterministically.
     string_const_ids: std.ArrayListUnmanaged(u32) = .empty,
     /// Set deduplicating `string_const_ids`.
@@ -185,6 +217,22 @@ const CModuleEmitter = struct {
     has_context_ops: bool = false,
     /// Aligned per-slot byte stride for `_cx_tls_ctx` (`>= 8`, expanded for wide nominal slots).
     ctx_slot_stride_bytes: u64 = 8,
+    /// Cloned `MirBody` array when `Pass D5.5` SSA demotion is prepared locally by `emitModule`.
+    owned_async_bodies: ?[]MirBody = null,
+    /// Computed stackless coroutine frame layout & state-machine plan (`mir_async`).
+    async_plan: ?mir_async.AsyncModulePlan = null,
+    /// `true` when at least one `is_async` body or async intrinsic (`44..51`) is present.
+    has_async_ops: bool = false,
+    /// Active coroutine `body_idx` while emitting `_cx_coro_poll_<idx>` (`null` in sync functions).
+    active_coro_body_idx: ?u32 = null,
+    /// Active basic block `MirBlockId` while emitting instructions inside a basic block.
+    active_bb_id: MirBlockId = .none,
+    /// Set of `Result` `TypeId.toU32()` handles requiring `_cx_is_err_ty_<id>` sibling-cascade helpers.
+    res_err_check_set: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Deterministic ordered list of `Result` `TypeId`s for `_cx_is_err_ty_<id>` emission.
+    ordered_res_err_types: std.ArrayListUnmanaged(TypeId) = .empty,
+    /// `true` while emitting an `@export`, `@wasm_export`, or `extern "C"` C-ABI function body.
+    is_in_c_abi_body: bool = false,
     /// Monotonic per-function temporary counter reset at the start of each `MirBody`.
     temp_counter: u32 = 0,
 
@@ -205,6 +253,19 @@ const CModuleEmitter = struct {
 
     /// Releases all transient emitter state (`out` is transferred to caller when taken).
     fn deinit(self: *CModuleEmitter) void {
+        if (self.async_plan) |*plan| {
+            plan.deinit();
+            self.async_plan = null;
+        }
+        if (self.owned_async_bodies) |owned_slice| {
+            for (owned_slice) |*owned_body| {
+                owned_body.deinit();
+            }
+            self.allocator.free(owned_slice);
+            self.owned_async_bodies = null;
+        }
+        self.res_err_check_set.deinit(self.allocator);
+        self.ordered_res_err_types.deinit(self.allocator);
         self.resolver.deinit();
         self.out.deinit(self.allocator);
         self.discovered_type_set.deinit(self.allocator);
@@ -227,6 +288,9 @@ const CModuleEmitter = struct {
         self.body_c_names.deinit(self.allocator);
         self.extern_syms.deinit(self.allocator);
         self.extern_sym_set.deinit(self.allocator);
+        self.extern_global_syms.deinit(self.allocator);
+        self.extern_global_sym_set.deinit(self.allocator);
+        self.collected_link_libs.deinit(self.allocator);
         self.string_const_ids.deinit(self.allocator);
         self.string_const_set.deinit(self.allocator);
         self.raw_blob_ids.deinit(self.allocator);
@@ -936,6 +1000,11 @@ const C99_ARITH_HELPERS: []const u8 =
     \\    }
     \\    return _cx_as_i128(_cx_f64_to_u128(tr_v));
     \\}
+    \\
+;
+
+/// Hosted 128-bit integer decimal formatting helpers (`snprintf`-backed, omitted in `-nostdlib` freestanding mode).
+const C99_HOSTED_ARITH_FMT: []const u8 =
     \\static size_t _cx_fmt_u128(char *out_buf, cx_u128 val) {
     \\    if (_cx_u128_hi(val) == 0ull) {
     \\        int len_n = snprintf(out_buf, 64u, "%llu", (unsigned long long)_cx_u128_lo(val));
@@ -966,6 +1035,200 @@ const C99_ARITH_HELPERS: []const u8 =
     \\        return 1u + _cx_fmt_u128(out_buf + 1, _cx_u128_sub_wrap(_cx_u128_make(0ull, 0ull), u_val));
     \\    }
     \\    return _cx_fmt_u128(out_buf, u_val);
+    \\}
+    \\
+;
+
+/// Minimal zero-libc freestanding C99 preamble (`<stdint.h>`, `<stddef.h>`, `<stdbool.h>`, `<float.h>` only).
+const C99_FREESTANDING_PREAMBLE: []const u8 =
+    \\#include <stdint.h>
+    \\#include <stddef.h>
+    \\#include <stdbool.h>
+    \\#include <float.h>
+    \\
+    \\#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__wasm__)
+    \\#define CX_THREAD_LOCAL _Thread_local
+    \\#elif defined(_MSC_VER)
+    \\#define CX_THREAD_LOCAL __declspec(thread)
+    \\#elif (defined(__GNUC__) || defined(__clang__)) && !defined(__wasm__)
+    \\#define CX_THREAD_LOCAL __thread
+    \\#else
+    \\#define CX_THREAD_LOCAL
+    \\#endif
+    \\
+    \\static inline void _cx_fs_memcpy(uint8_t *dst_p, const uint8_t *src_p, size_t byte_n) {
+    \\    size_t idx_i = 0u;
+    \\    while (idx_i < byte_n) { dst_p[idx_i] = src_p[idx_i]; idx_i += 1u; }
+    \\}
+    \\static inline void _cx_fs_memset(uint8_t *dst_p, uint8_t fill_b, size_t byte_n) {
+    \\    size_t idx_i = 0u;
+    \\    while (idx_i < byte_n) { dst_p[idx_i] = fill_b; idx_i += 1u; }
+    \\}
+    \\static inline int _cx_fs_memcmp(const uint8_t *lhs_p, const uint8_t *rhs_p, size_t byte_n) {
+    \\    size_t idx_i = 0u;
+    \\    while (idx_i < byte_n) {
+    \\        if (lhs_p[idx_i] != rhs_p[idx_i]) return (int)lhs_p[idx_i] - (int)rhs_p[idx_i];
+    \\        idx_i += 1u;
+    \\    }
+    \\    return 0;
+    \\}
+    \\#define memcpy(dst_p, src_p, byte_n) _cx_fs_memcpy((uint8_t *)(dst_p), (const uint8_t *)(src_p), (size_t)(byte_n))
+    \\#define memset(dst_p, fill_b, byte_n) _cx_fs_memset((uint8_t *)(dst_p), (uint8_t)(fill_b), (size_t)(byte_n))
+    \\#define memcmp(lhs_p, rhs_p, byte_n) _cx_fs_memcmp((const uint8_t *)(lhs_p), (const uint8_t *)(rhs_p), (size_t)(byte_n))
+    \\
+    \\static inline int _cx_fs_isnan(double val) {
+    \\    uint64_t bits_u = 0ull;
+    \\    _cx_fs_memcpy((uint8_t *)&bits_u, (const uint8_t *)&val, 8u);
+    \\    return ((bits_u & 0x7FF0000000000000ull) == 0x7FF0000000000000ull) && ((bits_u & 0x000FFFFFFFFFFFFFull) != 0ull);
+    \\}
+    \\static inline int _cx_fs_isinf(double val) {
+    \\    uint64_t bits_u = 0ull;
+    \\    _cx_fs_memcpy((uint8_t *)&bits_u, (const uint8_t *)&val, 8u);
+    \\    return ((bits_u & 0x7FFFFFFFFFFFFFFFull) == 0x7FF0000000000000ull);
+    \\}
+    \\static inline double _cx_fs_trunc(double val) {
+    \\    uint64_t bits_u = 0ull;
+    \\    _cx_fs_memcpy((uint8_t *)&bits_u, (const uint8_t *)&val, 8u);
+    \\    int32_t exp_e = (int32_t)((bits_u >> 52u) & 0x7FFull) - 1023;
+    \\    if (exp_e < 0) {
+    \\        uint64_t zero_s = bits_u & 0x8000000000000000ull;
+    \\        double out_z = 0.0;
+    \\        _cx_fs_memcpy((uint8_t *)&out_z, (const uint8_t *)&zero_s, 8u);
+    \\        return out_z;
+    \\    }
+    \\    if (exp_e >= 52) return val;
+    \\    uint64_t frac_mask = (1ull << (uint32_t)(52 - exp_e)) - 1ull;
+    \\    uint64_t masked_u = bits_u & ~frac_mask;
+    \\    double out_v = 0.0;
+    \\    _cx_fs_memcpy((uint8_t *)&out_v, (const uint8_t *)&masked_u, 8u);
+    \\    return out_v;
+    \\}
+    \\#define isnan _cx_fs_isnan
+    \\#define isinf _cx_fs_isinf
+    \\#define trunc _cx_fs_trunc
+    \\
+    \\typedef void (*_cx_fn_slot_t)(void);
+    \\typedef struct cx_str_s { uint8_t *ptr; uintptr_t len; } cx_str_t;
+    \\typedef struct cx_source_loc_data_s {
+    \\    cx_str_t file;
+    \\    cx_str_t fn_name;
+    \\    uint32_t line;
+    \\    uint32_t col;
+    \\} cx_source_loc_data_t;
+    \\typedef const cx_source_loc_data_t *cx_source_loc_t;
+    \\typedef struct cx_fmt_spec_s {
+    \\    uint32_t flags_and_fill;
+    \\    uint16_t width_or_none;
+    \\    uint16_t precision_or_none;
+    \\} cx_fmt_spec_t;
+    \\typedef struct _cx_rt_buf_s {
+    \\    uint8_t *data;
+    \\    size_t len;
+    \\    size_t cap;
+    \\} _cx_rt_buf_t;
+    \\typedef void (*cx_fmt_fn_t)(_cx_rt_buf_t *, const uint8_t *, uint32_t, uint32_t);
+    \\typedef struct cx_fmt_arg_s {
+    \\    const uint8_t *data;
+    \\    cx_fmt_fn_t fmt_fn;
+    \\    cx_fmt_spec_t spec;
+    \\} cx_fmt_arg_t;
+    \\typedef struct cx_fmt_args_s {
+    \\    const cx_str_t *pieces_ptr;
+    \\    uintptr_t pieces_len;
+    \\    const cx_fmt_arg_t *args_ptr;
+    \\    uintptr_t args_len;
+    \\} cx_fmt_args_t;
+    \\typedef struct cx_bencher_s {
+    \\    uint8_t *state_ptr;
+    \\    uintptr_t iters;
+    \\} cx_bencher_t;
+    \\
+    \\static inline void _cx_rt_drop_trace(int64_t drop_id) { (void)drop_id; }
+    \\#if defined(__GNUC__) || defined(__clang__)
+    \\__attribute__((noreturn))
+    \\#endif
+    \\static void _cx_rt_trap(uint32_t trap_reason) {
+    \\    (void)trap_reason;
+    \\    __builtin_trap();
+    \\}
+    \\static inline intptr_t _cx_rt_sys_write(int32_t fd_num, const uint8_t *buf_ptr, size_t buf_len) {
+    \\    (void)fd_num; (void)buf_ptr; (void)buf_len;
+    \\    return (intptr_t)(-1);
+    \\}
+    \\#if defined(__GNUC__) || defined(__clang__)
+    \\__attribute__((noreturn))
+    \\#endif
+    \\static void _cx_rt_sys_exit(int32_t status_code) {
+    \\    (void)status_code;
+    \\    __builtin_trap();
+    \\}
+    \\#if defined(__GNUC__) || defined(__clang__)
+    \\__attribute__((noreturn))
+    \\#endif
+    \\static void _cx_rt_panic(const uint8_t *msg_ptr, size_t msg_len) {
+    \\    (void)msg_ptr; (void)msg_len;
+    \\    __builtin_trap();
+    \\}
+    \\static inline uint8_t _cx_str_eq(
+    \\    const uint8_t *lhs_ptr,
+    \\    size_t lhs_len,
+    \\    const uint8_t *rhs_ptr,
+    \\    size_t rhs_len
+    \\) {
+    \\    if (lhs_len != rhs_len) return 0u;
+    \\    if (lhs_len == 0u) return 1u;
+    \\    return _cx_fs_memcmp(lhs_ptr, rhs_ptr, lhs_len) == 0 ? 1u : 0u;
+    \\}
+    \\static inline uint8_t _cx_source_loc_eq(cx_source_loc_t lhs_loc, cx_source_loc_t rhs_loc) {
+    \\    if (lhs_loc == rhs_loc) return 1u;
+    \\    if (lhs_loc == NULL || rhs_loc == NULL) return 0u;
+    \\    if (lhs_loc->line != rhs_loc->line || lhs_loc->col != rhs_loc->col) return 0u;
+    \\    if (!_cx_str_eq(lhs_loc->file.ptr, (size_t)lhs_loc->file.len, rhs_loc->file.ptr, (size_t)rhs_loc->file.len)) return 0u;
+    \\    return _cx_str_eq(lhs_loc->fn_name.ptr, (size_t)lhs_loc->fn_name.len, rhs_loc->fn_name.ptr, (size_t)rhs_loc->fn_name.len);
+    \\}
+    \\static inline uint8_t _cx_fmt_spec_eq(cx_fmt_spec_t lhs_s, cx_fmt_spec_t rhs_s) {
+    \\    return (lhs_s.flags_and_fill == rhs_s.flags_and_fill &&
+    \\        lhs_s.width_or_none == rhs_s.width_or_none &&
+    \\        lhs_s.precision_or_none == rhs_s.precision_or_none) ? 1u : 0u;
+    \\}
+    \\static const uint8_t __attribute__((aligned(16))) _cx_empty_rodata[1u] = { 0x00u };
+    \\static inline uint8_t _cx_read_u8(const uint8_t *base_p, size_t off_b) { return base_p[off_b]; }
+    \\static inline uint16_t _cx_read_u16(const uint8_t *base_p, size_t off_b) {
+    \\    uint16_t out_v = 0u; _cx_fs_memcpy((uint8_t *)&out_v, base_p + off_b, sizeof(out_v)); return out_v;
+    \\}
+    \\static inline uint32_t _cx_read_u32(const uint8_t *base_p, size_t off_b) {
+    \\    uint32_t out_v = 0u; _cx_fs_memcpy((uint8_t *)&out_v, base_p + off_b, sizeof(out_v)); return out_v;
+    \\}
+    \\static inline uint64_t _cx_read_u64(const uint8_t *base_p, size_t off_b) {
+    \\    uint64_t out_v = 0u; _cx_fs_memcpy((uint8_t *)&out_v, base_p + off_b, sizeof(out_v)); return out_v;
+    \\}
+    \\static inline void _cx_write_u8(uint8_t *base_p, size_t off_b, uint8_t val) { base_p[off_b] = val; }
+    \\static inline void _cx_write_u16(uint8_t *base_p, size_t off_b, uint16_t val) {
+    \\    _cx_fs_memcpy(base_p + off_b, (const uint8_t *)&val, sizeof(val));
+    \\}
+    \\static inline void _cx_write_u32(uint8_t *base_p, size_t off_b, uint32_t val) {
+    \\    _cx_fs_memcpy(base_p + off_b, (const uint8_t *)&val, sizeof(val));
+    \\}
+    \\static inline void _cx_write_u64(uint8_t *base_p, size_t off_b, uint64_t val) {
+    \\    _cx_fs_memcpy(base_p + off_b, (const uint8_t *)&val, sizeof(val));
+    \\}
+    \\
+;
+
+/// Freestanding tail closing the runtime prelude after `C99_ARITH_HELPERS`.
+const C99_FREESTANDING_TAIL: []const u8 =
+    \\static inline cx_str_t _cx_rt_buf_finish_str(_cx_rt_buf_t *out_b) {
+    \\    (void)out_b;
+    \\    cx_str_t res_s = { (uint8_t *)((uintptr_t)1u), 0u };
+    \\    return res_s;
+    \\}
+    \\#if defined(__GNUC__) || defined(__clang__)
+    \\__attribute__((noreturn))
+    \\#endif
+    \\static void _cx_rt_panic_fmt_args(const cx_fmt_args_t *fargs) {
+    \\    _cx_rt_buf_t msg_b = { NULL, 0u, 0u };
+    \\    (void)fargs;
+    \\    _cx_rt_panic(msg_b.data, msg_b.len);
     \\}
     \\
 ;
@@ -1517,6 +1780,7 @@ fn needsCompositeTypedef(emitter: *CModuleEmitter, unwrapped: TypeId) !bool {
         .result_ty,
         .fn_ty,
         .closure_ty,
+        .future_ty,
         => !(try isZeroSizedType(emitter, unwrapped)) or node.tag == .fn_ty,
         .enum_ty => (try emitter.resolver.getSumDetail(unwrapped)) != null and
             !(try isZeroSizedType(emitter, unwrapped)),
@@ -1743,6 +2007,12 @@ fn discoverTypeRecursive(emitter: *CModuleEmitter, raw_ty: TypeId, depth: u32) !
         .bit_field_ty => {
             try discoverTypeRecursive(emitter, TypeId.fromInt(node.lhs), depth + 1);
         },
+        .future_ty => {
+            try discoverTypeRecursive(emitter, TypeId.fromInt(node.lhs), depth + 1);
+            if (emitter.has_async_ops) {
+                try registerDropTypeRecursive(emitter, unwrapped, 0);
+            }
+        },
         else => {},
     }
 }
@@ -1864,12 +2134,29 @@ fn visitTypeTopoDfs(emitter: *CModuleEmitter, ty: TypeId, depth: u32) !void {
                     }
                 }
             },
+            .future_ty => {
+                const out_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+                if (try needsCompositeTypedef(emitter, out_ty)) {
+                    try visitTypeTopoDfs(emitter, out_ty, depth + 1);
+                }
+            },
             else => {},
         }
     }
 
     try emitter.topo_state.put(emitter.allocator, raw_id, 2);
     try emitter.ordered_types.append(emitter.allocator, ty);
+}
+
+/// Registers `.result_ty` `raw_ty` for a synthesized `_cx_is_err_ty_<id>` helper when non-ZST.
+fn maybeRegisterResultErrCheckType(emitter: *CModuleEmitter, raw_ty: TypeId) !void {
+    const unwrapped = emitter.input.pool.unwrapUnderlyingType(raw_ty);
+    if (unwrapped.isError() or unwrapped.isPrimitiveOrSentinel()) return;
+    if (emitter.input.pool.getNode(unwrapped).tag != .result_ty) return;
+    if (try isZeroSizedType(emitter, unwrapped)) return;
+    if (!(try emitter.res_err_check_set.getOrPut(emitter.allocator, unwrapped.toU32())).found_existing) {
+        try emitter.ordered_res_err_types.append(emitter.allocator, unwrapped);
+    }
 }
 
 /// Registers `raw_ty` and its constituent field/element/variant types for synthesized `_cx_drop_ty_<id>`.
@@ -2079,6 +2366,78 @@ fn extractConstStrSymFromBody(body: *const MirBody, val_raw: u32) ?SymbolId {
     };
 }
 
+/// Extracts resolved FFI, TLS, linker-section, and Wasm import/export metadata for `sym_idx`.
+fn extractSymFfiMeta(emitter: *const CModuleEmitter, sym_idx: SymbolIndex) SymFfiMeta {
+    if (sym_idx.isNone() or sym_idx.asInt() >= emitter.input.sym_table.symbols.items.len) return .{};
+    const sym_rec = emitter.input.sym_table.getSymbol(sym_idx).*;
+    var meta = SymFfiMeta{
+        .is_extern = sym_rec.flags.is_extern,
+        .is_export = sym_rec.contract_flags.is_export,
+        .is_mut = sym_rec.flags.is_mut,
+        .link_name = if (sym_rec.contract_flags.has_link_name) sym_rec.link_name_text else "",
+        .link_section = if (sym_rec.contract_flags.has_link_section) sym_rec.link_section_name else "",
+    };
+    if (emitter.input.sym_table.getFfiContract(sym_idx)) |ffi_c| {
+        meta.is_thread_local = ffi_c.is_thread_local;
+        if (ffi_c.wasm_import_module != .empty and ffi_c.wasm_import_module != .none) {
+            meta.wasm_import_module = emitter.input.interner.get(ffi_c.wasm_import_module);
+        }
+        if (ffi_c.wasm_import_name != .empty and ffi_c.wasm_import_name != .none) {
+            meta.wasm_import_name = emitter.input.interner.get(ffi_c.wasm_import_name);
+        }
+        if (ffi_c.wasm_export_name != .empty and ffi_c.wasm_export_name != .none) {
+            meta.wasm_export_name = emitter.input.interner.get(ffi_c.wasm_export_name);
+        }
+        if (ffi_c.link_lib_name != .empty and ffi_c.link_lib_name != .none) {
+            meta.link_lib_name = emitter.input.interner.get(ffi_c.link_lib_name);
+        }
+    }
+    return meta;
+}
+
+/// Records an `@link_lib("…")` library directive into `emitter.collected_link_libs` without duplicates.
+fn recordCollectedLinkLib(emitter: *CModuleEmitter, lib_name: []const u8) !void {
+    if (lib_name.len == 0) return;
+    for (emitter.collected_link_libs.items) |existing| {
+        if (std.mem.eql(u8, existing, lib_name)) return;
+    }
+    try emitter.collected_link_libs.append(emitter.allocator, lib_name);
+}
+
+/// Returns `true` if `body` is an `@export`, `@wasm_export`, or `extern "C"` C-ABI unwind-abort boundary.
+fn isBodyCAbiBoundary(emitter: *const CModuleEmitter, body: *const MirBody) bool {
+    if (body.symbol_index.isNone() or
+        body.symbol_index.asInt() >= emitter.input.sym_table.symbols.items.len) return false;
+    const sym_rec = emitter.input.sym_table.getSymbol(body.symbol_index).*;
+    if (sym_rec.flags.is_extern or sym_rec.contract_flags.is_export) return true;
+    const ffi_meta = extractSymFfiMeta(emitter, body.symbol_index);
+    if (ffi_meta.wasm_export_name.len > 0) return true;
+    if (emitter.input.pool.getFnSignatureView(sym_rec.type_id)) |sig_view| {
+        if (sig_view.is_c_abi) return true;
+    }
+    return false;
+}
+
+/// Returns `true` if `lay` contains any scalar floating-point field (`float`/`double`) requiring SSE/HFA classification.
+fn hasFloatFieldForCAbi(emitter: *const CModuleEmitter, lay: ResolvedTypeLayout) bool {
+    var phys_i: u32 = 0;
+    while (phys_i < lay.aux_len) : (phys_i += 1) {
+        const decl_ord = emitter.resolver.phys_to_decl.items[lay.aux_start + phys_i];
+        const fld = emitter.resolver.fields_by_decl.items[lay.aux_start + decl_ord];
+        const fld_ty = emitter.input.pool.unwrapUnderlyingType(fld.field_ty);
+        if (fld_ty == .f32_ty or fld_ty == .f64_ty) return true;
+    }
+    return false;
+}
+
+/// Formats the header-comment target identifier (`"x86_64-linux"` on default GNU Linux for golden parity).
+fn formatC99BannerTargetName(target: TargetSpec) []const u8 {
+    if (target.arch == .x86_64 and target.os == .linux and target.abi == .gnu) {
+        return "x86_64-linux";
+    }
+    return target.asTripleStr();
+}
+
 /// Scans all `MirBody` items, indexing callables, C identifiers, constants, drops, and reachable `TypeId`s.
 fn indexModuleEntities(emitter: *CModuleEmitter) !void {
     try discoverTypeRecursive(emitter, .str_ty, 0);
@@ -2094,27 +2453,31 @@ fn indexModuleEntities(emitter: *CModuleEmitter) !void {
 
         const raw_name = emitter.input.interner.get(body_ptr.name);
         var is_export_sym = false;
+        var has_wasm_export = false;
         var link_name_override: ?[]const u8 = null;
         if (!body_ptr.symbol_index.isNone() and
             body_ptr.symbol_index.asInt() < emitter.input.sym_table.symbols.items.len)
         {
-            const sym_rec = emitter.input.sym_table.getSymbol(body_ptr.symbol_index).*;
-            is_export_sym = sym_rec.contract_flags.is_export;
-            if (sym_rec.contract_flags.has_link_name and sym_rec.link_name_text.len > 0) {
-                link_name_override = sym_rec.link_name_text;
+            const ffi_meta = extractSymFfiMeta(emitter, body_ptr.symbol_index);
+            try recordCollectedLinkLib(emitter, ffi_meta.link_lib_name);
+            is_export_sym = ffi_meta.is_export;
+            has_wasm_export = ffi_meta.wasm_export_name.len > 0;
+            if (ffi_meta.link_name.len > 0) {
+                link_name_override = ffi_meta.link_name;
             }
         }
 
-        if (std.mem.eql(u8, raw_name, "main")) {
+        const is_exported_main = std.mem.eql(u8, raw_name, "main") and (is_export_sym or has_wasm_export);
+        if (std.mem.eql(u8, raw_name, "main") and !is_exported_main) {
             emitter.entry_main_body_idx = b_idx;
         }
 
         const c_name = if (link_name_override) |lnk_str|
-            (if (std.mem.eql(u8, lnk_str, "main"))
+            (if (std.mem.eql(u8, lnk_str, "main") and !is_exported_main)
                 try emitter.allocator.dupe(u8, "_cx_user_main")
             else
                 try emitter.allocator.dupe(u8, lnk_str))
-        else if (is_export_sym and !std.mem.eql(u8, raw_name, "main"))
+        else if ((is_export_sym or has_wasm_export) and (!std.mem.eql(u8, raw_name, "main") or emitter.cfg.target.isWasm()))
             try sanitizeIdentifierAlloc(emitter.allocator, raw_name)
         else blk: {
             const clean_suffix = try sanitizeIdentifierAlloc(emitter.allocator, raw_name);
@@ -2127,8 +2490,20 @@ fn indexModuleEntities(emitter: *CModuleEmitter) !void {
     for (emitter.input.bodies, 0..) |*body_ptr, body_i| {
         const b_idx: u32 = @intCast(body_i);
         try discoverTypeRecursive(emitter, body_ptr.ret_ty, 0);
-        for (body_ptr.locals.items) |loc_decl| {
+        if (emitter.has_async_ops and body_ptr.is_async) {
+            try maybeRegisterResultErrCheckType(emitter, body_ptr.ret_ty);
+        }
+        for (body_ptr.locals.items, 0..) |loc_decl, loc_i| {
             try discoverTypeRecursive(emitter, loc_decl.type_id, 0);
+            if (emitter.has_async_ops and body_ptr.is_async and loc_i >= 1 and loc_i <= body_ptr.param_count) {
+                const p_mode = loc_decl.mode();
+                if (p_mode != .inout_mode and p_mode != .set_mode) {
+                    const unwrapped_p = emitter.input.pool.unwrapUnderlyingType(loc_decl.type_id);
+                    if (!emitter.input.pool.getFlags(unwrapped_p).is_copy) {
+                        try registerDropTypeRecursive(emitter, unwrapped_p, 0);
+                    }
+                }
+            }
         }
         for (body_ptr.consts.items) |mir_const| {
             switch (mir_const) {
@@ -2239,6 +2614,16 @@ fn indexModuleEntities(emitter: *CModuleEmitter) !void {
                     if (aligned_sz > emitter.ctx_slot_stride_bytes) {
                         emitter.ctx_slot_stride_bytes = aligned_sz;
                     }
+                } else if (ikind == .async_spawn) {
+                    const sp_args = body_ptr.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs];
+                    if (sp_args.len >= 3) {
+                        const fut_ty = emitter.input.pool.unwrapUnderlyingType(
+                            body_ptr.getInst(MirValueId.fromInt(sp_args[2])).type_id,
+                        );
+                        if (emitter.input.pool.getFutureOutputType(fut_ty)) |out_ty| {
+                            try maybeRegisterResultErrCheckType(emitter, out_ty);
+                        }
+                    }
                 }
             }
         }
@@ -2272,7 +2657,7 @@ fn indexModuleEntities(emitter: *CModuleEmitter) !void {
     }.lessThan);
 }
 
-/// Records an `extern` function symbol when referenced by a call or `fn_addr` without a local `MirBody`.
+/// Records an `extern` function or `extern static` global symbol when referenced without a local `MirBody`.
 fn maybeRegisterExternSymbol(
     emitter: *CModuleEmitter,
     def_id: DefId,
@@ -2281,10 +2666,20 @@ fn maybeRegisterExternSymbol(
     if (resolveBodyIndex(emitter, def_id, sym_idx) != null) return;
     if (sym_idx.isNone() or sym_idx.asInt() >= emitter.input.sym_table.symbols.items.len) return;
     const sym_rec = emitter.input.sym_table.getSymbol(sym_idx).*;
-    if (sym_rec.kind != .fn_sym) return;
-    if (!(try emitter.extern_sym_set.getOrPut(emitter.allocator, sym_idx.asInt())).found_existing) {
-        try emitter.extern_syms.append(emitter.allocator, sym_idx);
-        try discoverTypeRecursive(emitter, sym_rec.type_id, 0);
+    const ffi_meta = extractSymFfiMeta(emitter, sym_idx);
+    try recordCollectedLinkLib(emitter, ffi_meta.link_lib_name);
+    if (sym_rec.kind == .fn_sym) {
+        if (!(try emitter.extern_sym_set.getOrPut(emitter.allocator, sym_idx.asInt())).found_existing) {
+            try emitter.extern_syms.append(emitter.allocator, sym_idx);
+            try discoverTypeRecursive(emitter, sym_rec.type_id, 0);
+        }
+        return;
+    }
+    if (sym_rec.kind == .extern_static_sym or sym_rec.flags.is_extern) {
+        if (!(try emitter.extern_global_sym_set.getOrPut(emitter.allocator, sym_idx.asInt())).found_existing) {
+            try emitter.extern_global_syms.append(emitter.allocator, sym_idx);
+            try discoverTypeRecursive(emitter, sym_rec.type_id, 0);
+        }
     }
 }
 
@@ -2539,6 +2934,8 @@ fn emitTypeDeclarations(emitter: *CModuleEmitter) !void {
                 }
                 const fld_start = lay.aux_start;
                 const fld_len = lay.aux_len;
+                const is_natural_c_float = rflags.is_repr_c and !rflags.is_packed and
+                    hasFloatFieldForCAbi(emitter, lay);
                 var cur_byte: u64 = 0;
                 var pad_idx: u32 = 0;
                 var phys_i: u32 = 0;
@@ -2546,7 +2943,12 @@ fn emitTypeDeclarations(emitter: *CModuleEmitter) !void {
                     const decl_ord = emitter.resolver.phys_to_decl.items[fld_start + phys_i];
                     const fld = emitter.resolver.fields_by_decl.items[fld_start + decl_ord];
                     if (fld.size_bytes == 0) continue;
-                    if (fld.byte_offset > cur_byte) {
+                    const natural_off = std.mem.alignForward(
+                        u64,
+                        cur_byte,
+                        @as(u64, 1) << @intCast(fld.align_log2),
+                    );
+                    if (fld.byte_offset > cur_byte and !(is_natural_c_float and natural_off == fld.byte_offset)) {
                         try emitter.print(
                             "    uint8_t _pad_{d}[{d}u];\n",
                             .{ pad_idx, fld.byte_offset - cur_byte },
@@ -2558,7 +2960,8 @@ fn emitTypeDeclarations(emitter: *CModuleEmitter) !void {
                     try emitter.print("    {s} _f{d};\n", .{ fld_c, decl_ord });
                     cur_byte = fld.byte_offset + fld.size_bytes;
                 }
-                if (lay.size_bytes > cur_byte) {
+                const natural_end = std.mem.alignForward(u64, cur_byte, lay.alignBytes());
+                if (lay.size_bytes > cur_byte and !(is_natural_c_float and natural_end == lay.size_bytes)) {
                     try emitter.print(
                         "    uint8_t _pad_{d}[{d}u];\n",
                         .{ pad_idx, lay.size_bytes - cur_byte },
@@ -2622,6 +3025,18 @@ fn emitTypeDeclarations(emitter: *CModuleEmitter) !void {
                         }
                     },
                     .not_sum => {},
+                }
+                try emitter.writeAll("};\n");
+            },
+            .future_ty => {
+                const hdr_bytes: u64 = @as(u64, emitter.cfg.target.ptrBytes()) * 4;
+                try emitter.print(
+                    "struct __attribute__((aligned({d}))) _cx_ty_{d} {{\n" ++
+                        "    void *_handle;\n    uintptr_t _kind;\n    uintptr_t _aux;\n    uintptr_t _out_sz;\n",
+                    .{ lay.alignBytes(), ty_u32 },
+                );
+                if (lay.size_bytes > hdr_bytes) {
+                    try emitter.print("    uint8_t _out_pad[{d}u];\n", .{lay.size_bytes - hdr_bytes});
                 }
                 try emitter.writeAll("};\n");
             },
@@ -2768,8 +3183,12 @@ fn emitRodataAndDevSeam(emitter: *CModuleEmitter, dev_seam_out: *?[]u8) !void {
     if (emitter.has_context_ops) {
         try emitter.print(
             "static CX_THREAD_LOCAL uint8_t __attribute__((aligned(16))) _cx_tls_ctx[{d}u] = {{0}};\n",
-            .{8 * emitter.ctx_slot_stride_bytes},
+            .{10 * emitter.ctx_slot_stride_bytes},
         );
+    }
+
+    if (emitter.has_async_ops and !emitter.cfg.target.isFreestanding()) {
+        try emitAsyncRuntimeHelpersC(emitter);
     }
 
     if (emitter.input.is_dev_got_enabled) {
@@ -2793,6 +3212,383 @@ fn emitRodataAndDevSeam(emitter: *CModuleEmitter, dev_seam_out: *?[]u8) !void {
         dev_seam_out.* = try buildDevSeamBytes(emitter);
     }
     try emitter.writeAll("\n");
+}
+
+/// Emits the C99 stackless coroutine handle, FIFO `TaskGroup` scheduler, and `ReactorVTable` yield seam (`DR-08`).
+fn emitAsyncRuntimeHelpersC(emitter: *CModuleEmitter) !void {
+    const ctx_stride = emitter.ctx_slot_stride_bytes;
+    const ctx_bytes = 10 * ctx_stride;
+    try emitter.print(
+        "#define _CX_CTX_STRIDE {d}u\n#define _CX_CTX_BYTES {d}u\n",
+        .{ ctx_stride, ctx_bytes },
+    );
+    try emitter.writeAll(
+        \\typedef struct _cx_fut_raw_s {
+        \\    void *_handle;
+        \\    uintptr_t _kind;
+        \\    uintptr_t _aux;
+        \\    uintptr_t _out_sz;
+        \\} _cx_fut_raw_t;
+        \\typedef uint8_t (*_cx_err_chk_fn_t)(const void *);
+        \\struct _cx_task_group_s;
+        \\typedef struct _cx_task_node_s {
+        \\    struct _cx_task_group_s *group;
+        \\    _cx_fut_raw_t fut;
+        \\    uint8_t *res_buf;
+        \\    size_t res_sz;
+        \\    _cx_err_chk_fn_t err_chk;
+        \\    uint8_t ctx_buf[_CX_CTX_BYTES];
+        \\    uintptr_t join_waiter;
+        \\    uint8_t is_completed;
+        \\    uint8_t is_cancelled;
+        \\    uint8_t is_parked_on_join;
+        \\} _cx_task_node_t;
+        \\typedef struct _cx_task_group_s {
+        \\    _cx_task_node_t **tasks;
+        \\    size_t len;
+        \\    size_t cap;
+        \\    uint8_t is_cancelled;
+        \\    uint8_t is_exited;
+        \\} _cx_task_group_t;
+        \\static size_t _cx_coro_frame_size(uint32_t _b_idx);
+        \\static size_t _cx_coro_frame_align(uint32_t _b_idx);
+        \\static uint32_t _cx_coro_poll_dispatch(uint32_t _b_idx, uint8_t *_frame, void *_out_ptr, uint32_t _action, uint8_t *_parked_out);
+        \\static CX_THREAD_LOCAL uintptr_t *_cx_exec_q = NULL;
+        \\static CX_THREAD_LOCAL size_t _cx_exec_q_len = 0u;
+        \\static CX_THREAD_LOCAL size_t _cx_exec_q_cap = 0u;
+        \\static CX_THREAD_LOCAL uintptr_t _cx_active_poll_item = 1u;
+        \\static CX_THREAD_LOCAL uint8_t _cx_coro_is_cancelling = 0u;
+        \\static void _cx_exec_push(uintptr_t _item) {
+        \\    if (_cx_exec_q_len >= _cx_exec_q_cap) {
+        \\        size_t _nc = _cx_exec_q_cap == 0u ? 64u : (_cx_exec_q_cap * 2u);
+        \\        if (_nc <= _cx_exec_q_cap || _nc > (((size_t)-1) / sizeof(uintptr_t))) _cx_rt_trap(0u);
+        \\        uintptr_t *_nq = (uintptr_t *)realloc(_cx_exec_q, _nc * sizeof(uintptr_t));
+        \\        if (_nq == NULL) _cx_rt_trap(0u);
+        \\        _cx_exec_q = _nq;
+        \\        _cx_exec_q_cap = _nc;
+        \\    }
+        \\    _cx_exec_q[_cx_exec_q_len] = _item;
+        \\    _cx_exec_q_len += 1u;
+        \\}
+        \\static inline void _cx_reactor_notify_yield(uint8_t _reason) {
+        \\    const void *_vt = NULL;
+        \\    void *_rctx = NULL;
+        \\    memcpy(&_vt, &_cx_tls_ctx[8u * _CX_CTX_STRIDE], sizeof(void *));
+        \\    memcpy(&_rctx, &_cx_tls_ctx[9u * _CX_CTX_STRIDE], sizeof(void *));
+        \\    if (_vt != NULL) {
+        \\        typedef void (*_cx_yield_fn_t)(void *, uint8_t);
+        \\        _cx_yield_fn_t _yfn = NULL;
+        \\        memcpy(&_yfn, ((const uint8_t *)_vt) + 6u * sizeof(void *), sizeof(_yfn));
+        \\        if (_yfn != NULL) _yfn(_rctx, _reason);
+        \\    }
+        \\}
+        \\static uint8_t *_cx_coro_alloc(uint32_t _b_idx) {
+        \\    size_t _sz = _cx_coro_frame_size(_b_idx);
+        \\    size_t _al = _cx_coro_frame_align(_b_idx);
+        \\    if (_sz < 16u) _sz = 16u;
+        \\    if (_al < 16u) _al = 16u;
+        \\    if (_sz > (((size_t)-1) - _al)) _cx_rt_trap(0u);
+        \\    uint8_t *_raw = (uint8_t *)calloc(1u, _sz + _al);
+        \\    if (_raw == NULL) _cx_rt_trap(0u);
+        \\    uintptr_t _raw_a = (uintptr_t)_raw;
+        \\    uintptr_t _al_a = (_raw_a + ((uintptr_t)_al - 1u)) & ~((uintptr_t)_al - 1u);
+        \\    uint16_t _delta = (uint16_t)(_al_a - _raw_a);
+        \\    uint8_t *_fr = _raw + (size_t)_delta;
+        \\    memcpy(_fr + 4u, &_b_idx, 4u);
+        \\    memcpy(_fr + 12u, &_delta, 2u);
+        \\    return _fr;
+        \\}
+        \\static void _cx_coro_free(uint8_t *_fr) {
+        \\    if (_fr == NULL) return;
+        \\    uint16_t _delta = 0u;
+        \\    memcpy(&_delta, _fr + 12u, 2u);
+        \\    free(_fr - (size_t)_delta);
+        \\}
+        \\static void _cx_async_cancel_node(_cx_task_node_t *_tn);
+        \\static void _cx_async_fut_cancel(void *_raw_fut) {
+        \\    if (_raw_fut == NULL) return;
+        \\    _cx_fut_raw_t *_f = (_cx_fut_raw_t *)_raw_fut;
+        \\    uintptr_t _k = _f->_kind;
+        \\    void *_h = _f->_handle;
+        \\    _f->_kind = 0u;
+        \\    _f->_handle = NULL;
+        \\    if (_k == 1u && _h != NULL) {
+        \\        uint32_t _b_idx = 0u;
+        \\        memcpy(&_b_idx, ((uint8_t *)_h) + 4u, 4u);
+        \\        uint8_t _prev_c = _cx_coro_is_cancelling;
+        \\        _cx_coro_is_cancelling = 1u;
+        \\        (void)_cx_coro_poll_dispatch(_b_idx, (uint8_t *)_h, NULL, 1u, NULL);
+        \\        _cx_coro_is_cancelling = _prev_c;
+        \\        _cx_coro_free((uint8_t *)_h);
+        \\    }
+        \\}
+        \\static uint32_t _cx_async_fut_poll(void *_raw_fut, void *_out_ptr, uint8_t *_parked_out) {
+        \\    _cx_fut_raw_t *_f = (_cx_fut_raw_t *)_raw_fut;
+        \\    if (_f->_kind == 2u) {
+        \\        if (_f->_aux == 0u) {
+        \\            _f->_aux = 1u;
+        \\            _cx_reactor_notify_yield(0u);
+        \\            return 0u;
+        \\        }
+        \\        _f->_aux = 0xFFFFFFFEu;
+        \\        _f->_kind = 0u;
+        \\        return 1u;
+        \\    }
+        \\    if (_f->_kind == 3u) {
+        \\        _cx_task_node_t *_tn = (_cx_task_node_t *)_f->_handle;
+        \\        if (_tn == NULL) { _f->_kind = 0u; return 1u; }
+        \\        if (_tn->is_completed) {
+        \\            if (_out_ptr != NULL && _tn->res_sz > 0u && _tn->res_buf != NULL) {
+        \\                memcpy(_out_ptr, _tn->res_buf, _tn->res_sz);
+        \\            }
+        \\            _f->_kind = 0u;
+        \\            return 1u;
+        \\        }
+        \\        _tn->join_waiter = _cx_active_poll_item;
+        \\        if (_parked_out != NULL) *_parked_out = 1u;
+        \\        return 0u;
+        \\    }
+        \\    if (_f->_kind == 4u) {
+        \\        _cx_task_node_t *_tn = (_cx_task_node_t *)_f->_handle;
+        \\        if (_tn != NULL) _cx_async_cancel_node(_tn);
+        \\        _f->_kind = 0u;
+        \\        return 1u;
+        \\    }
+        \\    if (_f->_kind == 1u) {
+        \\        uint8_t *_fr = (uint8_t *)_f->_handle;
+        \\        if (_fr == NULL) { _f->_kind = 0u; return 1u; }
+        \\        uint32_t _b_idx = 0u;
+        \\        memcpy(&_b_idx, _fr + 4u, 4u);
+        \\        if (_cx_coro_poll_dispatch(_b_idx, _fr, _out_ptr, 0u, _parked_out) != 0u) {
+        \\            _f->_kind = 0u;
+        \\            _f->_handle = NULL;
+        \\            _cx_coro_free(_fr);
+        \\            return 1u;
+        \\        }
+        \\        return 0u;
+        \\    }
+        \\    return 1u;
+        \\}
+        \\static void _cx_async_group_cancel_all(_cx_task_group_t *_grp) {
+        \\    if (_grp == NULL) return;
+        \\    _grp->is_cancelled = 1u;
+        \\    size_t _ri = _grp->len;
+        \\    while (_ri > 0u) {
+        \\        _ri -= 1u;
+        \\        _cx_task_node_t *_tn = _grp->tasks[_ri];
+        \\        if ((uintptr_t)_tn == _cx_active_poll_item) continue;
+        \\        _cx_async_cancel_node(_tn);
+        \\    }
+        \\}
+        \\static void _cx_async_cancel_node(_cx_task_node_t *_tn) {
+        \\    if (_tn == NULL || _tn->is_completed || _tn->is_cancelled) return;
+        \\    _tn->is_cancelled = 1u;
+        \\    _tn->is_completed = 1u;
+        \\    uint8_t _sctx[_CX_CTX_BYTES];
+        \\    uintptr_t _spoll = _cx_active_poll_item;
+        \\    memcpy(_sctx, _cx_tls_ctx, _CX_CTX_BYTES);
+        \\    memcpy(_cx_tls_ctx, _tn->ctx_buf, _CX_CTX_BYTES);
+        \\    _cx_active_poll_item = (uintptr_t)_tn;
+        \\    _cx_async_fut_cancel(&_tn->fut);
+        \\    _cx_active_poll_item = _spoll;
+        \\    memcpy(_cx_tls_ctx, _sctx, _CX_CTX_BYTES);
+        \\    if (_tn->join_waiter != 0u) {
+        \\        uintptr_t _w = _tn->join_waiter;
+        \\        _tn->join_waiter = 0u;
+        \\        if (_w != 1u) ((_cx_task_node_t *)_w)->is_parked_on_join = 0u;
+        \\        _cx_exec_push(_w);
+        \\    }
+        \\}
+        \\static void _cx_exec_step_task(_cx_task_node_t *_tn) {
+        \\    if (_tn == NULL || _tn->is_completed) return;
+        \\    uint8_t _sctx[_CX_CTX_BYTES];
+        \\    uintptr_t _spoll = _cx_active_poll_item;
+        \\    memcpy(_sctx, _cx_tls_ctx, _CX_CTX_BYTES);
+        \\    memcpy(_cx_tls_ctx, _tn->ctx_buf, _CX_CTX_BYTES);
+        \\    _cx_active_poll_item = (uintptr_t)_tn;
+        \\    _tn->is_parked_on_join = 0u;
+        \\    uint8_t _parked = 0u;
+        \\    uint32_t _rdy = _cx_async_fut_poll(&_tn->fut, _tn->res_buf, &_parked);
+        \\    memcpy(_tn->ctx_buf, _cx_tls_ctx, _CX_CTX_BYTES);
+        \\    _cx_active_poll_item = _spoll;
+        \\    memcpy(_cx_tls_ctx, _sctx, _CX_CTX_BYTES);
+        \\    if (_rdy == 0u) {
+        \\        _tn->is_parked_on_join = _parked;
+        \\        if (!_parked) _cx_exec_push((uintptr_t)_tn);
+        \\    } else {
+        \\        _tn->is_completed = 1u;
+        \\        if (_tn->err_chk != NULL && _tn->res_buf != NULL && _tn->err_chk(_tn->res_buf) != 0u) {
+        \\            _cx_async_group_cancel_all(_tn->group);
+        \\        }
+        \\        if (_tn->join_waiter != 0u) {
+        \\            uintptr_t _w = _tn->join_waiter;
+        \\            _tn->join_waiter = 0u;
+        \\            if (_w != 1u) ((_cx_task_node_t *)_w)->is_parked_on_join = 0u;
+        \\            _cx_exec_push(_w);
+        \\        }
+        \\    }
+        \\}
+        \\static void *_cx_async_group_enter(void) {
+        \\    _cx_task_group_t *_g = (_cx_task_group_t *)calloc(1u, sizeof(_cx_task_group_t));
+        \\    if (_g == NULL) _cx_rt_trap(0u);
+        \\    return (void *)_g;
+        \\}
+        \\static void *_cx_async_spawn(void *_grp_ptr, void *_raw_fut, size_t _out_sz, _cx_err_chk_fn_t _echk) {
+        \\    _cx_task_group_t *_g = (_cx_task_group_t *)_grp_ptr;
+        \\    _cx_task_node_t *_tn = (_cx_task_node_t *)calloc(1u, sizeof(_cx_task_node_t));
+        \\    if (_tn == NULL) _cx_rt_trap(0u);
+        \\    _tn->group = _g;
+        \\    memcpy(&_tn->fut, _raw_fut, sizeof(_cx_fut_raw_t));
+        \\    ((_cx_fut_raw_t *)_raw_fut)->_kind = 0u;
+        \\    ((_cx_fut_raw_t *)_raw_fut)->_handle = NULL;
+        \\    _tn->res_sz = _out_sz;
+        \\    if (_out_sz > 0u) {
+        \\        _tn->res_buf = (uint8_t *)calloc(1u, _out_sz);
+        \\        if (_tn->res_buf == NULL) _cx_rt_trap(0u);
+        \\    }
+        \\    _tn->err_chk = _echk;
+        \\    memcpy(_tn->ctx_buf, _cx_tls_ctx, _CX_CTX_BYTES);
+        \\    if (_g != NULL) {
+        \\        if (_g->len >= _g->cap) {
+        \\            size_t _nc = _g->cap == 0u ? 8u : (_g->cap * 2u);
+        \\            if (_nc <= _g->cap || _nc > (((size_t)-1) / sizeof(_cx_task_node_t *))) _cx_rt_trap(0u);
+        \\            _cx_task_node_t **_nt = (_cx_task_node_t **)realloc(_g->tasks, _nc * sizeof(_cx_task_node_t *));
+        \\            if (_nt == NULL) _cx_rt_trap(0u);
+        \\            _g->tasks = _nt;
+        \\            _g->cap = _nc;
+        \\        }
+        \\        _g->tasks[_g->len] = _tn;
+        \\        _g->len += 1u;
+        \\    }
+        \\    _cx_exec_push((uintptr_t)_tn);
+        \\    return (void *)_tn;
+        \\}
+        \\static void _cx_async_group_exit(void *_grp_ptr, uint8_t _is_err_or_cancel) {
+        \\    _cx_task_group_t *_g = (_cx_task_group_t *)_grp_ptr;
+        \\    if (_g == NULL || _g->is_exited) return;
+        \\    if (_is_err_or_cancel || _cx_coro_is_cancelling || _g->is_cancelled) {
+        \\        _cx_async_group_cancel_all(_g);
+        \\    } else {
+        \\        for (;;) {
+        \\            uint8_t _pend = 0u;
+        \\            uint8_t _prog = 0u;
+        \\            size_t _ti = 0u;
+        \\            while (_ti < _g->len) {
+        \\                _cx_task_node_t *_tn = _g->tasks[_ti];
+        \\                if (!_tn->is_completed) {
+        \\                    _pend = 1u;
+        \\                    if (!_tn->is_parked_on_join) {
+        \\                        _prog = 1u;
+        \\                        _cx_exec_step_task(_tn);
+        \\                        if (_g->is_cancelled) {
+        \\                            _cx_async_group_cancel_all(_g);
+        \\                            _pend = 0u;
+        \\                            break;
+        \\                        }
+        \\                    }
+        \\                }
+        \\                _ti += 1u;
+        \\            }
+        \\            if (!_pend) break;
+        \\            if (!_prog) {
+        \\                uint8_t _stepped_q = 0u;
+        \\                size_t _qi = 0u;
+        \\                while (_qi < _cx_exec_q_len) {
+        \\                    uintptr_t _qit = _cx_exec_q[_qi];
+        \\                    if (_qit > 1u && _qit != _cx_active_poll_item) {
+        \\                        _cx_task_node_t *_otn = (_cx_task_node_t *)_qit;
+        \\                        if (!_otn->is_completed && !_otn->is_parked_on_join) {
+        \\                            _cx_exec_q[_qi] = 0u;
+        \\                            _stepped_q = 1u;
+        \\                            _cx_exec_step_task(_otn);
+        \\                            break;
+        \\                        }
+        \\                    }
+        \\                    _qi += 1u;
+        \\                }
+        \\                if (!_stepped_q) _cx_rt_trap(0u);
+        \\            }
+        \\        }
+        \\    }
+        \\    _g->is_exited = 1u;
+        \\    {
+        \\        size_t _qi = 0u;
+        \\        while (_qi < _cx_exec_q_len) {
+        \\            uintptr_t _qit = _cx_exec_q[_qi];
+        \\            if (_qit > 1u && ((_cx_task_node_t *)_qit)->group == _g) {
+        \\                _cx_exec_q[_qi] = 0u;
+        \\            }
+        \\            _qi += 1u;
+        \\        }
+        \\        size_t _fi = 0u;
+        \\        while (_fi < _g->len) {
+        \\            _cx_task_node_t *_tn = _g->tasks[_fi];
+        \\            if (_tn != NULL) {
+        \\                _cx_async_fut_cancel(&_tn->fut);
+        \\                if (_tn->res_buf != NULL) free(_tn->res_buf);
+        \\                free(_tn);
+        \\            }
+        \\            _fi += 1u;
+        \\        }
+        \\        if (_g->tasks != NULL) free(_g->tasks);
+        \\        free(_g);
+        \\    }
+        \\}
+        \\static void _cx_async_block_on(void *_raw_fut, void *_out_ptr) {
+        \\    _cx_fut_raw_t _rf;
+        \\    memcpy(&_rf, _raw_fut, sizeof(_cx_fut_raw_t));
+        \\    ((_cx_fut_raw_t *)_raw_fut)->_kind = 0u;
+        \\    ((_cx_fut_raw_t *)_raw_fut)->_handle = NULL;
+        \\    size_t _q_base = _cx_exec_q_len;
+        \\    uintptr_t _spoll = _cx_active_poll_item;
+        \\    uint8_t _base_ctx[_CX_CTX_BYTES];
+        \\    uint8_t _root_ctx[_CX_CTX_BYTES];
+        \\    memcpy(_base_ctx, _cx_tls_ctx, _CX_CTX_BYTES);
+        \\    memcpy(_root_ctx, _cx_tls_ctx, _CX_CTX_BYTES);
+        \\    uint8_t _root_parked = 0u;
+        \\    _cx_exec_push(1u);
+        \\    size_t _q_head = _q_base;
+        \\    for (;;) {
+        \\        while (_q_head < _cx_exec_q_len && _cx_exec_q[_q_head] == 0u) {
+        \\            _q_head += 1u;
+        \\        }
+        \\        if (_q_head >= _cx_exec_q_len) {
+        \\            _cx_rt_trap(0u);
+        \\        }
+        \\        uintptr_t _it = _cx_exec_q[_q_head];
+        \\        _cx_exec_q[_q_head] = 0u;
+        \\        _q_head += 1u;
+        \\        if (_q_head == _cx_exec_q_len) {
+        \\            _q_head = _q_base;
+        \\            _cx_exec_q_len = _q_base;
+        \\        }
+        \\        if (_it == 1u) {
+        \\            memcpy(_cx_tls_ctx, _root_ctx, _CX_CTX_BYTES);
+        \\            _cx_active_poll_item = 1u;
+        \\            _root_parked = 0u;
+        \\            uint32_t _done = _cx_async_fut_poll(&_rf, _out_ptr, &_root_parked);
+        \\            memcpy(_root_ctx, _cx_tls_ctx, _CX_CTX_BYTES);
+        \\            memcpy(_cx_tls_ctx, _base_ctx, _CX_CTX_BYTES);
+        \\            if (_done != 0u) {
+        \\                memcpy(_cx_tls_ctx, _root_ctx, _CX_CTX_BYTES);
+        \\                _cx_active_poll_item = _spoll;
+        \\                _cx_exec_q_len = _q_base;
+        \\                if (_q_base == 0u && _cx_exec_q != NULL) {
+        \\                    free(_cx_exec_q);
+        \\                    _cx_exec_q = NULL;
+        \\                    _cx_exec_q_cap = 0u;
+        \\                }
+        \\                return;
+        \\            }
+        \\            if (!_root_parked) _cx_exec_push(1u);
+        \\        } else if (_it != 0u) {
+        \\            _cx_exec_step_task((_cx_task_node_t *)_it);
+        \\            memcpy(_cx_tls_ctx, _base_ctx, _CX_CTX_BYTES);
+        \\        }
+        \\    }
+        \\}
+        \\
+    );
 }
 
 /// Finds `[u8]` (`slice_ty` of `u8_ty`) in `ordered_types` if referenced in the module.
@@ -2951,12 +3747,50 @@ fn emitBodyParamList(emitter: *CModuleEmitter, body: *const MirBody, has_param_n
     try emitter.writeAll(")");
 }
 
-/// Returns `true` if `body` carries `@export` or `@link_name` external visibility.
+/// Returns `true` if `body` carries `@export`, `@wasm_export`, or `@link_name` external visibility.
 fn isBodyExternallyVisible(emitter: *const CModuleEmitter, body: *const MirBody) bool {
     if (body.symbol_index.isNone() or
         body.symbol_index.asInt() >= emitter.input.sym_table.symbols.items.len) return false;
     const sym_rec = emitter.input.sym_table.getSymbol(body.symbol_index).*;
-    return sym_rec.contract_flags.is_export or sym_rec.contract_flags.has_link_name;
+    if (sym_rec.contract_flags.is_export or sym_rec.contract_flags.has_link_name) return true;
+    const ffi_meta = extractSymFfiMeta(emitter, body.symbol_index);
+    return ffi_meta.wasm_export_name.len > 0;
+}
+
+/// Emits C99 function attributes (`export_name`, `section`, `nothrow`) for `body`.
+fn emitBodyFunctionAttributesC(
+    emitter: *CModuleEmitter,
+    body: *const MirBody,
+    is_definition: bool,
+) !void {
+    if (body.symbol_index.isNone() or
+        body.symbol_index.asInt() >= emitter.input.sym_table.symbols.items.len) return;
+    const sym_rec = emitter.input.sym_table.getSymbol(body.symbol_index).*;
+    const ffi_meta = extractSymFfiMeta(emitter, body.symbol_index);
+
+    if (emitter.cfg.target.isWasm()) {
+        const exp_name = if (ffi_meta.wasm_export_name.len > 0)
+            ffi_meta.wasm_export_name
+        else if (ffi_meta.is_export)
+            (if (ffi_meta.link_name.len > 0) ffi_meta.link_name else sym_rec.name_text)
+        else
+            "";
+        if (exp_name.len > 0) {
+            try emitter.writeAll("__attribute__((export_name(\"");
+            try appendEscapedCStringContents(emitter, exp_name);
+            try emitter.writeAll("\"))) ");
+        }
+    }
+
+    if (is_definition and ffi_meta.link_section.len > 0 and !emitter.cfg.target.isWasm()) {
+        try emitter.writeAll("__attribute__((section(\"");
+        try appendEscapedCStringContents(emitter, ffi_meta.link_section);
+        try emitter.writeAll("\"))) ");
+    }
+
+    if (isBodyCAbiBoundary(emitter, body)) {
+        try emitter.writeAll("__attribute__((nothrow)) ");
+    }
 }
 
 /// Appends `raw_text` as ISO C99 escaped string-literal contents (guarding `??` trigraphs).
@@ -2980,21 +3814,34 @@ fn emitCallablePrototypesAndDrops(emitter: *CModuleEmitter) !void {
     for (emitter.extern_syms.items) |sym_idx| {
         const sym_rec = emitter.input.sym_table.getSymbol(sym_idx).*;
         const sig = emitter.input.pool.getFnSignatureView(sym_rec.type_id) orelse continue;
-        const ext_name = if (sym_rec.contract_flags.has_link_name and sym_rec.link_name_text.len > 0)
-            sym_rec.link_name_text
-        else
-            sym_rec.name_text;
+        const ffi_meta = extractSymFfiMeta(emitter, sym_idx);
+        const ext_name = if (ffi_meta.link_name.len > 0) ffi_meta.link_name else sym_rec.name_text;
         const is_wasi_import = emitter.cfg.target.os == .wasi and WASI_PREVIEW1_IMPORT_SET.has(ext_name);
+        const has_wasm_attr = emitter.cfg.target.isWasm() and
+            (ffi_meta.wasm_import_module.len > 0 or
+                ffi_meta.wasm_import_name.len > 0 or
+                is_wasi_import or
+                emitter.cfg.target.isFreestanding());
         const ret_c = if (try isZeroSizedType(emitter, sig.ret_ty))
             try emitter.allocator.dupe(u8, "void")
         else
             try formatCType(emitter, sig.ret_ty);
         defer emitter.allocator.free(ret_c);
-        if (is_wasi_import) {
-            try emitter.writeAll("__attribute__((import_module(\"wasi_snapshot_preview1\"), import_name(\"");
-            try appendEscapedCStringContents(emitter, ext_name);
+        if (has_wasm_attr) {
+            const mod_name = if (ffi_meta.wasm_import_module.len > 0)
+                ffi_meta.wasm_import_module
+            else if (is_wasi_import)
+                "wasi_snapshot_preview1"
+            else
+                "env";
+            const imp_name = if (ffi_meta.wasm_import_name.len > 0) ffi_meta.wasm_import_name else ext_name;
+            try emitter.writeAll("__attribute__((import_module(\"");
+            try appendEscapedCStringContents(emitter, mod_name);
+            try emitter.writeAll("\"), import_name(\"");
+            try appendEscapedCStringContents(emitter, imp_name);
             try emitter.writeAll("\"))) ");
         }
+        try emitter.writeAll("__attribute__((nothrow)) ");
         try emitter.print("extern {s} _cx_ext_{d}(", .{ ret_c, sym_idx.asInt() });
         var emitted_p: usize = 0;
         var param_i: usize = 0;
@@ -3024,7 +3871,7 @@ fn emitCallablePrototypesAndDrops(emitter: *CModuleEmitter) !void {
         } else if (emitted_p == 0) {
             try emitter.writeAll("void");
         }
-        if (is_wasi_import) {
+        if (has_wasm_attr) {
             try emitter.writeAll(");\n");
         } else {
             try emitter.writeAll(") __asm__(\"");
@@ -3035,6 +3882,29 @@ fn emitCallablePrototypesAndDrops(emitter: *CModuleEmitter) !void {
             try appendEscapedCStringContents(emitter, raw_asm);
             try emitter.writeAll("\");\n");
         }
+    }
+
+    for (emitter.extern_global_syms.items) |glob_sym_idx| {
+        const glob_rec = emitter.input.sym_table.getSymbol(glob_sym_idx).*;
+        const ffi_meta = extractSymFfiMeta(emitter, glob_sym_idx);
+        const ext_name = if (ffi_meta.link_name.len > 0) ffi_meta.link_name else glob_rec.name_text;
+        const glob_c = if (try isZeroSizedType(emitter, glob_rec.type_id))
+            try emitter.allocator.dupe(u8, "uint8_t")
+        else
+            try formatCType(emitter, glob_rec.type_id);
+        defer emitter.allocator.free(glob_c);
+
+        try emitter.writeAll("extern ");
+        if (ffi_meta.is_thread_local) {
+            try emitter.writeAll("CX_THREAD_LOCAL ");
+        }
+        try emitter.print("{s} _cx_ext_glob_{d} __asm__(\"", .{ glob_c, glob_sym_idx.asInt() });
+        if (emitter.cfg.target.os == .macos and ext_name.len > 0 and ext_name[0] != 0x01) {
+            try emitter.writeAll("_");
+        }
+        const raw_asm = if (ext_name.len > 0 and ext_name[0] == 0x01) ext_name[1..] else ext_name;
+        try appendEscapedCStringContents(emitter, raw_asm);
+        try emitter.writeAll("\");\n");
     }
 
     for (emitter.input.bodies, 0..) |*body_ptr, b_idx| {
@@ -3049,6 +3919,7 @@ fn emitCallablePrototypesAndDrops(emitter: *CModuleEmitter) !void {
             try emitBodyParamList(emitter, body_ptr, false);
             try emitter.writeAll(";\n");
         }
+        try emitBodyFunctionAttributesC(emitter, body_ptr, false);
         const storage_kw = if (isBodyExternallyVisible(emitter, body_ptr)) "" else "static ";
         try emitter.print("{s}{s} {s}", .{ storage_kw, ret_c, emitter.body_c_names.items[b_idx] });
         try emitBodyParamList(emitter, body_ptr, true);
@@ -3123,7 +3994,178 @@ fn emitCallablePrototypesAndDrops(emitter: *CModuleEmitter) !void {
     for (emitter.ordered_fmt_types.items) |fmt_ty| {
         try emitFmtHelperDefinition(emitter, fmt_ty);
     }
+
+    if (emitter.has_async_ops and !emitter.cfg.target.isFreestanding()) {
+        try emitAsyncDispatchTablesC(emitter);
+    }
     try emitter.writeAll("\n");
+}
+
+/// Computes total coroutine frame size and alignment including C99 `_fmt_*` / `_stmp_*` / `_ctx_snap_*` scratch slots.
+fn computeCoroFrameTotalAndAlignC(
+    emitter: *CModuleEmitter,
+    body: *const MirBody,
+    plan: *const mir_async.AsyncBodyPlan,
+) !struct { final_bytes: u64, max_align: u32 } {
+    var max_align: u32 = @max(plan.frame_align, 16);
+    var cursor: u64 = std.mem.alignForward(
+        u64,
+        @max(@as(u64, plan.frame_layout.total_frame_bytes), 16),
+        @as(u64, max_align),
+    );
+    const ptr_bytes: u64 = emitter.cfg.target.ptrBytes();
+    const ptr_scratch_align: u64 = @max(ptr_bytes, 8);
+    const piece_stride: u64 = 2 * ptr_bytes;
+    const arg_stride: u64 = std.mem.alignForward(u64, 2 * ptr_bytes + 8, ptr_bytes);
+
+    for (0..body.insts.len) |inst_i| {
+        const inst = body.insts.get(inst_i);
+        if (inst.op.isGhost()) continue;
+        if (inst.op == .aggregate_make) {
+            const agg_k: AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+            if (agg_k == .fmt_args_make and !isStaticConstFmtArgsMake(body, inst)) {
+                const words = body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs];
+                if (words.len >= 1) {
+                    if (extractConstUsizeFromBody(body, words[0])) |piece_count| {
+                        if (piece_count > 0) {
+                            cursor = std.mem.alignForward(u64, cursor, ptr_scratch_align);
+                            cursor += @as(u64, piece_count) * piece_stride;
+                        }
+                        if (words.len >= 1 + piece_count) {
+                            const hole_count = (words.len - 1 - piece_count) / 3;
+                            if (hole_count > 0) {
+                                cursor = std.mem.alignForward(u64, cursor, ptr_scratch_align);
+                                cursor += @as(u64, hole_count) * arg_stride;
+                                for (0..hole_count) |hole_j| {
+                                    const hole_ref_raw = words[1 + piece_count + hole_j * 3];
+                                    const hole_ref_ty = emitter.input.pool.unwrapUnderlyingType(
+                                        body.getInst(MirValueId.fromInt(hole_ref_raw)).type_id,
+                                    );
+                                    const hole_node = emitter.input.pool.getNode(hole_ref_ty);
+                                    const is_ptr_arg = hole_node.tag == .ref_ty or
+                                        hole_node.tag == .mut_ref_ty or
+                                        hole_node.tag == .raw_ptr_ty;
+                                    if (!is_ptr_arg and !(try isZeroSizedType(emitter, hole_ref_ty))) {
+                                        const h_lay = try emitter.resolver.resolveType(hole_ref_ty);
+                                        const h_al = @max(h_lay.alignBytes(), 8);
+                                        max_align = @max(max_align, h_al);
+                                        cursor = std.mem.alignForward(u64, cursor, h_al);
+                                        cursor += @max(h_lay.size_bytes, 1);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (inst.op == .place_addr or inst.op == .unary_op or inst.op == .intrinsic_op) {
+            if (resolveSliceRefPointee(emitter, inst.type_id)) |sl_pointee| {
+                const sl_lay = try emitter.resolver.resolveType(sl_pointee);
+                const sl_al = @max(sl_lay.alignBytes(), 8);
+                max_align = @max(max_align, sl_al);
+                cursor = std.mem.alignForward(u64, cursor, sl_al);
+                cursor += @max(sl_lay.size_bytes, 16);
+            }
+        }
+        if (inst.op == .intrinsic_op and @as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)) == .ctx_get) {
+            if (type_system.ContextFieldLayout.resolveRefPointee(
+                emitter.input.pool,
+                emitter.input.sym_table,
+                inst.type_id,
+            )) |ctx_pointee| {
+                if (!(try isZeroSizedType(emitter, ctx_pointee))) {
+                    const ctx_lay = try emitter.resolver.resolveType(ctx_pointee);
+                    const ctx_al = @max(ctx_lay.alignBytes(), 8);
+                    max_align = @max(max_align, ctx_al);
+                    cursor = std.mem.alignForward(u64, cursor, ctx_al);
+                    cursor += @max(ctx_lay.size_bytes, 8);
+                }
+            }
+        }
+    }
+    return .{
+        .final_bytes = std.mem.alignForward(u64, cursor, max_align),
+        .max_align = max_align,
+    };
+}
+
+/// Emits `_cx_coro_poll_<idx>` prototypes, `_cx_is_err_ty_<id>` helpers, and coroutine dispatch tables.
+fn emitAsyncDispatchTablesC(emitter: *CModuleEmitter) !void {
+    const plan_mod = &(emitter.async_plan orelse return);
+
+    for (emitter.ordered_res_err_types.items) |res_ty| {
+        const res_c = try formatCType(emitter, res_ty);
+        defer emitter.allocator.free(res_c);
+        const sum_detail = (try emitter.resolver.getSumDetail(res_ty)) orelse continue;
+        const discr_expr = try formatSumDiscrReadExpr(emitter, res_ty, sum_detail, "_rv");
+        defer emitter.allocator.free(discr_expr);
+        try emitter.print(
+            "static uint8_t _cx_is_err_ty_{d}(const void *_rp) {{\n" ++
+                "    {s} _rv; memcpy(&_rv, _rp, sizeof(_rv));\n" ++
+                "    return (({s}) == 1u) ? 1u : 0u;\n}}\n",
+            .{ res_ty.toU32(), res_c, discr_expr },
+        );
+    }
+
+    for (emitter.input.bodies, 0..) |*body_ptr, b_idx| {
+        if (!body_ptr.is_async) continue;
+        try emitter.print(
+            "static uint32_t _cx_coro_poll_{d}(uint8_t *_frame, void *_out_ptr, uint32_t _action, uint8_t *_parked_out);\n",
+            .{b_idx},
+        );
+    }
+
+    try emitter.writeAll("static size_t _cx_coro_frame_size(uint32_t _b_idx) {\n    switch (_b_idx) {\n");
+    for (emitter.input.bodies, 0..) |*body_ptr, b_idx| {
+        if (!body_ptr.is_async) continue;
+        const sizing = try computeCoroFrameTotalAndAlignC(emitter, body_ptr, plan_mod.getBodyPlan(b_idx));
+        try emitter.print("    case {d}u: return {d}u;\n", .{ b_idx, sizing.final_bytes });
+    }
+    try emitter.writeAll("    default: return 64u;\n    }\n}\n");
+
+    try emitter.writeAll("static size_t _cx_coro_frame_align(uint32_t _b_idx) {\n    switch (_b_idx) {\n");
+    for (emitter.input.bodies, 0..) |*body_ptr, b_idx| {
+        if (!body_ptr.is_async) continue;
+        const sizing = try computeCoroFrameTotalAndAlignC(emitter, body_ptr, plan_mod.getBodyPlan(b_idx));
+        try emitter.print("    case {d}u: return {d}u;\n", .{ b_idx, sizing.max_align });
+    }
+    try emitter.writeAll("    default: return 16u;\n    }\n}\n");
+
+    try emitter.writeAll(
+        "static uint32_t _cx_coro_poll_dispatch(uint32_t _b_idx, uint8_t *_frame, void *_out_ptr, uint32_t _action, uint8_t *_parked_out) {\n" ++
+            "    switch (_b_idx) {\n",
+    );
+    for (emitter.input.bodies, 0..) |*body_ptr, b_idx| {
+        if (!body_ptr.is_async) continue;
+        try emitter.print(
+            "    case {d}u: return _cx_coro_poll_{d}(_frame, _out_ptr, _action, _parked_out);\n",
+            .{ b_idx, b_idx },
+        );
+    }
+    try emitter.writeAll(
+        "    default: (void)_frame; (void)_out_ptr; (void)_action; (void)_parked_out; return 1u;\n    }\n}\n",
+    );
+
+    try emitter.writeAll("static uint32_t _cx_coro_lookup_fn(const void *_fp) {\n");
+    for (emitter.input.bodies, 0..) |*body_ptr, b_idx| {
+        if (!body_ptr.is_async) continue;
+        try emitter.print(
+            "    if (_fp == (const void *)(uintptr_t){s}) return {d}u;\n",
+            .{ emitter.body_c_names.items[b_idx], b_idx },
+        );
+    }
+    for (emitter.closure_thunks.items) |thunk| {
+        if (thunk.target_body_idx < emitter.input.bodies.len and
+            emitter.input.bodies[thunk.target_body_idx].is_async)
+        {
+            try emitter.print(
+                "    if (_fp == (const void *)(uintptr_t)_cx_cthunk_{d}) return {d}u;\n",
+                .{ thunk.thunk_idx, thunk.target_body_idx },
+            );
+        }
+    }
+    try emitter.writeAll("    (void)_fp; return 0xFFFFFFFFu;\n}\n");
 }
 
 /// Emits a static closure thunk `_cx_cthunk_<idx>(uint8_t *_raw_env, …)` forwarding captures + args.
@@ -3341,6 +4383,11 @@ fn emitDropHelperDefinition(emitter: *CModuleEmitter, drop_ty: TypeId) !void {
                         "_self_ptr->drop_fn(_self_ptr->env_ptr); " ++
                         "_self_ptr->drop_fn = NULL; _self_ptr->env_ptr = NULL; }\n",
                 );
+            }
+        },
+        .future_ty => {
+            if (emitter.has_async_ops and !emitter.cfg.target.isFreestanding()) {
+                try emitter.writeAll("    _cx_async_fut_cancel((void *)_self_ptr);\n");
             }
         },
         else => {},
@@ -4139,10 +5186,32 @@ fn lowerPlaceC(emitter: *CModuleEmitter, body: *const MirBody, place_id: PlaceId
     const base_decl = body.locals.items[place.base];
     const is_ptr_param = place.base >= 1 and place.base <= body.param_count and
         (base_decl.mode() == .inout_mode or base_decl.mode() == .set_mode);
-    var cur_expr = if (is_ptr_param)
-        try std.fmt.allocPrint(emitter.allocator, "(*_loc_{d})", .{place.base})
-    else
-        try std.fmt.allocPrint(emitter.allocator, "_loc_{d}", .{place.base});
+    var cur_expr = blk_base: {
+        if (emitter.active_coro_body_idx) |coro_b_idx| {
+            if (!(try isZeroSizedType(emitter, base_decl.type_id))) {
+                const plan = emitter.async_plan.?.getBodyPlan(coro_b_idx);
+                const frame_off = plan.getLocalOffset(place.base);
+                const base_c = try formatCType(emitter, base_decl.type_id);
+                defer emitter.allocator.free(base_c);
+                if (is_ptr_param) {
+                    break :blk_base try std.fmt.allocPrint(
+                        emitter.allocator,
+                        "(**(({s} **)(_frame + {d}u)))",
+                        .{ base_c, frame_off },
+                    );
+                }
+                break :blk_base try std.fmt.allocPrint(
+                    emitter.allocator,
+                    "(*(({s} *)(_frame + {d}u)))",
+                    .{ base_c, frame_off },
+                );
+            }
+        }
+        if (is_ptr_param) {
+            break :blk_base try std.fmt.allocPrint(emitter.allocator, "(*_loc_{d})", .{place.base});
+        }
+        break :blk_base try std.fmt.allocPrint(emitter.allocator, "_loc_{d}", .{place.base});
+    };
     errdefer emitter.allocator.free(cur_expr);
 
     var cur_ty = emitter.input.pool.unwrapUnderlyingType(base_decl.type_id);
@@ -4277,6 +5346,8 @@ fn lowerPlaceC(emitter: *CModuleEmitter, body: *const MirBody, place_id: PlaceId
                     try std.fmt.allocPrint(emitter.allocator, "(((uint8_t *)(({s}).ptr))[{s}])", .{ cur_expr, idx_expr })
                 else if (node.tag == .array_ty)
                     try std.fmt.allocPrint(emitter.allocator, "(({s})._elems[{s}])", .{ cur_expr, idx_expr })
+                else if (node.tag == .raw_ptr_ty)
+                    try std.fmt.allocPrint(emitter.allocator, "(({s})[{s}])", .{ cur_expr, idx_expr })
                 else
                     try std.fmt.allocPrint(emitter.allocator, "(({s}).ptr[{s}])", .{ cur_expr, idx_expr });
                 emitter.allocator.free(cur_expr);
@@ -4755,6 +5826,9 @@ fn maybeEmitLineDirective(
 /// Emits the complete C99 definition of `body` (`emitter.input.bodies[body_idx]`).
 fn emitMirBody(emitter: *CModuleEmitter, body_idx: u32, body: *const MirBody) !void {
     emitter.temp_counter = 0;
+    emitter.is_in_c_abi_body = isBodyCAbiBoundary(emitter, body);
+    defer emitter.is_in_c_abi_body = false;
+
     const is_void_ret = try isZeroSizedType(emitter, body.ret_ty);
     const ret_c = if (is_void_ret)
         try emitter.allocator.dupe(u8, "void")
@@ -4762,10 +5836,58 @@ fn emitMirBody(emitter: *CModuleEmitter, body_idx: u32, body: *const MirBody) !v
         try formatCType(emitter, body.ret_ty);
     defer emitter.allocator.free(ret_c);
 
+    try emitBodyFunctionAttributesC(emitter, body, true);
     const storage_kw = if (isBodyExternallyVisible(emitter, body)) "" else "static ";
     try emitter.print("{s}{s} {s}", .{ storage_kw, ret_c, emitter.body_c_names.items[body_idx] });
     try emitBodyParamList(emitter, body, true);
     try emitter.writeAll(" {\n");
+
+    if (body.is_async) {
+        var p_i: u32 = 0;
+        while (p_i < body.param_count) : (p_i += 1) {
+            const p_decl = body.locals.items[1 + p_i];
+            const p_mode = p_decl.mode();
+            if (p_mode == .inout_mode or p_mode == .set_mode or !(try isZeroSizedType(emitter, p_decl.type_id))) {
+                try emitter.print("    (void)_arg_{d};\n", .{1 + p_i});
+            }
+        }
+        if (emitter.entry_main_body_idx == body_idx and
+            body.param_count == 0 and
+            emitter.has_async_ops and
+            !emitter.cfg.target.isFreestanding())
+        {
+            const ret_lay = try emitter.resolver.resolveType(body.ret_ty);
+            if (is_void_ret) {
+                try emitter.print(
+                    "    uint8_t *_mf = _cx_coro_alloc({d}u);\n" ++
+                        "    _cx_fut_raw_t _mfut = {{ (void *)_mf, 1u, {d}u, 0u }};\n" ++
+                        "    _cx_async_block_on(&_mfut, NULL);\n" ++
+                        "    return;\n}}\n\n",
+                    .{ body_idx, body_idx },
+                );
+            } else {
+                try emitter.print(
+                    "    {s} _mres; memset(&_mres, 0, sizeof(_mres));\n" ++
+                        "    uint8_t *_mf = _cx_coro_alloc({d}u);\n" ++
+                        "    _cx_fut_raw_t _mfut = {{ (void *)_mf, 1u, {d}u, {d}u }};\n" ++
+                        "    _cx_async_block_on(&_mfut, &_mres);\n" ++
+                        "    return _mres;\n}}\n\n",
+                    .{ ret_c, body_idx, body_idx, ret_lay.size_bytes },
+                );
+            }
+        } else if (is_void_ret) {
+            try emitter.writeAll("    return;\n}\n\n");
+        } else {
+            try emitter.print(
+                "    {s} _zres; memset(&_zres, 0, sizeof(_zres)); return _zres;\n}}\n\n",
+                .{ret_c},
+            );
+        }
+        if (emitter.has_async_ops and !emitter.cfg.target.isFreestanding()) {
+            try emitAsyncCoroPollBodyC(emitter, body_idx, body);
+        }
+        return;
+    }
 
     // [1] Frame local declarations (`_loc_0 .. _loc_{N-1}`), zero-initializing all padding (`D-01`):
     for (body.locals.items, 0..) |loc_decl, loc_i| {
@@ -4840,6 +5962,24 @@ fn emitMirBody(emitter: *CModuleEmitter, body_idx: u32, body: *const MirBody) !v
                                     "    cx_fmt_arg_t _fmt_a_{d}[{d}u]; memset(_fmt_a_{d}, 0, sizeof(_fmt_a_{d}));\n",
                                     .{ inst_i, hole_count, inst_i, inst_i },
                                 );
+                                for (0..hole_count) |hole_j| {
+                                    const hole_ref_raw = words[1 + piece_count + hole_j * 3];
+                                    const hole_ref_ty = emitter.input.pool.unwrapUnderlyingType(
+                                        body.getInst(MirValueId.fromInt(hole_ref_raw)).type_id,
+                                    );
+                                    const hole_node = emitter.input.pool.getNode(hole_ref_ty);
+                                    const is_ptr_arg = hole_node.tag == .ref_ty or
+                                        hole_node.tag == .mut_ref_ty or
+                                        hole_node.tag == .raw_ptr_ty;
+                                    if (!is_ptr_arg and !(try isZeroSizedType(emitter, hole_ref_ty))) {
+                                        const hole_c = try formatCType(emitter, hole_ref_ty);
+                                        defer emitter.allocator.free(hole_c);
+                                        try emitter.print(
+                                            "    {s} _fmt_h_{d}_{d}; memset(&_fmt_h_{d}_{d}, 0, sizeof(_fmt_h_{d}_{d}));\n",
+                                            .{ hole_c, inst_i, hole_j, inst_i, hole_j, inst_i, hole_j },
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -4885,6 +6025,305 @@ fn emitMirBody(emitter: *CModuleEmitter, body_idx: u32, body: *const MirBody) !v
     // [3] Basic blocks:
     for (body.blocks.items, 0..) |bb_rec, bb_i| {
         const bb_id = MirBlockId.fromInt(@intCast(bb_i));
+        emitter.active_bb_id = bb_id;
+        try emitter.print("_bb_{d}: ;\n", .{bb_i});
+        for (body.getBlockInsts(bb_id)) |val_id| {
+            const inst = body.getInst(val_id);
+            if (inst.op.isGhost()) continue;
+            if (val_id.asInt() < body.origin_tokens.items.len) {
+                try maybeEmitLineDirective(emitter, body.file_id, body.origin_tokens.items[val_id.asInt()]);
+            }
+            try emitMirInstC(emitter, body_idx, body, val_id, inst);
+        }
+        try emitMirTerminatorC(emitter, body_idx, body, bb_id, bb_rec.terminator);
+    }
+    emitter.active_bb_id = .none;
+
+    if (body.blocks.items.len == 0) {
+        if (!is_void_ret) try emitter.writeAll("    return _loc_0;\n");
+    }
+    try emitter.writeAll("}\n\n");
+}
+
+/// Emits the stackless state-machine poll function `_cx_coro_poll_<body_idx>` (`DR-08` §2–§3).
+fn emitAsyncCoroPollBodyC(emitter: *CModuleEmitter, body_idx: u32, body: *const MirBody) !void {
+    const plan_mod = &(emitter.async_plan orelse return);
+    const plan = plan_mod.getBodyPlan(body_idx);
+
+    emitter.temp_counter = 0;
+    emitter.active_coro_body_idx = body_idx;
+    defer {
+        emitter.active_coro_body_idx = null;
+        emitter.active_bb_id = .none;
+    }
+
+    var undef_macros: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (undef_macros.items) |macro_name| emitter.allocator.free(macro_name);
+        undef_macros.deinit(emitter.allocator);
+    }
+
+    try emitter.print(
+        "static uint32_t _cx_coro_poll_{d}(uint8_t *_frame, void *_out_ptr, uint32_t _action, uint8_t *_parked_out) {{\n" ++
+            "    (void)_frame; (void)_out_ptr; (void)_action; (void)_parked_out;\n",
+        .{body_idx},
+    );
+
+    // [1] ZST dummy locals (`non-ZST` locals reside at `_frame + plan.getLocalOffset(loc_i)`):
+    for (body.locals.items, 0..) |loc_decl, loc_i| {
+        if (!(try isZeroSizedType(emitter, loc_decl.type_id))) continue;
+        const is_param = loc_i >= 1 and loc_i <= body.param_count;
+        const p_mode = loc_decl.mode();
+        if (is_param and (p_mode == .inout_mode or p_mode == .set_mode)) {
+            try emitter.print(
+                "    uint8_t *_loc_{d} = (uint8_t *)((uintptr_t)1u); (void)_loc_{d};\n",
+                .{ loc_i, loc_i },
+            );
+        } else {
+            try emitter.print("    uint8_t _loc_{d} = 0u; (void)_loc_{d};\n", .{ loc_i, loc_i });
+        }
+    }
+
+    // [2] Intra-block SSA temporaries (`_v_*`) & frame-backed `_cenv_loc_*` / `_fmt_*` / `_stmp_*` / `_ctx_snap_*`:
+    var extra_cursor: u64 = std.mem.alignForward(
+        u64,
+        @max(@as(u64, plan.frame_layout.total_frame_bytes), 16),
+        @as(u64, @max(plan.frame_align, 16)),
+    );
+    const ptr_bytes: u64 = emitter.cfg.target.ptrBytes();
+    const ptr_scratch_align: u64 = @max(ptr_bytes, 8);
+    const piece_stride: u64 = 2 * ptr_bytes;
+    const arg_stride: u64 = std.mem.alignForward(u64, 2 * ptr_bytes + 8, ptr_bytes);
+    for (0..body.insts.len) |inst_i| {
+        const inst = body.insts.get(inst_i);
+        if (inst.op.isGhost()) continue;
+        if (try isZeroSizedType(emitter, inst.type_id)) {
+            try emitter.print("    uint8_t _v_{d} = 0u; (void)_v_{d};\n", .{ inst_i, inst_i });
+        } else {
+            const val_c = try formatCType(emitter, inst.type_id);
+            defer emitter.allocator.free(val_c);
+            try emitter.print(
+                "    {s} _v_{d}; memset(&_v_{d}, 0, sizeof(_v_{d})); (void)_v_{d};\n",
+                .{ val_c, inst_i, inst_i, inst_i, inst_i },
+            );
+        }
+
+        if (inst.op == .aggregate_make) {
+            const agg_k: AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+            if (agg_k == .closure_make) {
+                const key: u64 = (@as(u64, body_idx) << 32) | @as(u64, @intCast(inst_i));
+                if (emitter.closure_thunk_map.get(key)) |thunk_idx| {
+                    const thunk = emitter.closure_thunks.items[thunk_idx];
+                    if (!thunk.is_three_word and thunk.capture_types.len > 0) {
+                        const env_off = plan.findClosureEnvOffset(@intCast(inst_i)) orelse 16;
+                        try emitter.print(
+                            "#define _cenv_loc_{d} (*((_cx_cenv_{d} *)(_frame + {d}u)))\n",
+                            .{ inst_i, thunk_idx, env_off },
+                        );
+                        try undef_macros.append(
+                            emitter.allocator,
+                            try std.fmt.allocPrint(emitter.allocator, "_cenv_loc_{d}", .{inst_i}),
+                        );
+                    }
+                }
+            } else if (agg_k == .fmt_args_make and !isStaticConstFmtArgsMake(body, inst)) {
+                const words = body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs];
+                if (words.len >= 1) {
+                    if (extractConstUsizeFromBody(body, words[0])) |piece_count| {
+                        if (piece_count > 0) {
+                            extra_cursor = std.mem.alignForward(u64, extra_cursor, ptr_scratch_align);
+                            try emitter.print(
+                                "#define _fmt_p_{d} ((cx_str_t *)(_frame + {d}u))\n",
+                                .{ inst_i, extra_cursor },
+                            );
+                            try undef_macros.append(
+                                emitter.allocator,
+                                try std.fmt.allocPrint(emitter.allocator, "_fmt_p_{d}", .{inst_i}),
+                            );
+                            extra_cursor += @as(u64, piece_count) * piece_stride;
+                        }
+                        if (words.len >= 1 + piece_count) {
+                            const hole_count = (words.len - 1 - piece_count) / 3;
+                            if (hole_count > 0) {
+                                extra_cursor = std.mem.alignForward(u64, extra_cursor, ptr_scratch_align);
+                                try emitter.print(
+                                    "#define _fmt_a_{d} ((cx_fmt_arg_t *)(_frame + {d}u))\n",
+                                    .{ inst_i, extra_cursor },
+                                );
+                                try undef_macros.append(
+                                    emitter.allocator,
+                                    try std.fmt.allocPrint(emitter.allocator, "_fmt_a_{d}", .{inst_i}),
+                                );
+                                extra_cursor += @as(u64, hole_count) * arg_stride;
+                                for (0..hole_count) |hole_j| {
+                                    const hole_ref_raw = words[1 + piece_count + hole_j * 3];
+                                    const hole_ref_ty = emitter.input.pool.unwrapUnderlyingType(
+                                        body.getInst(MirValueId.fromInt(hole_ref_raw)).type_id,
+                                    );
+                                    const hole_node = emitter.input.pool.getNode(hole_ref_ty);
+                                    const is_ptr_arg = hole_node.tag == .ref_ty or
+                                        hole_node.tag == .mut_ref_ty or
+                                        hole_node.tag == .raw_ptr_ty;
+                                    if (!is_ptr_arg and !(try isZeroSizedType(emitter, hole_ref_ty))) {
+                                        const hole_lay = try emitter.resolver.resolveType(hole_ref_ty);
+                                        extra_cursor = std.mem.alignForward(
+                                            u64,
+                                            extra_cursor,
+                                            @max(hole_lay.alignBytes(), 8),
+                                        );
+                                        const hole_c = try formatCType(emitter, hole_ref_ty);
+                                        defer emitter.allocator.free(hole_c);
+                                        try emitter.print(
+                                            "#define _fmt_h_{d}_{d} (*(({s} *)(_frame + {d}u)))\n",
+                                            .{ inst_i, hole_j, hole_c, extra_cursor },
+                                        );
+                                        try undef_macros.append(
+                                            emitter.allocator,
+                                            try std.fmt.allocPrint(emitter.allocator, "_fmt_h_{d}_{d}", .{ inst_i, hole_j }),
+                                        );
+                                        extra_cursor += @max(hole_lay.size_bytes, 1);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (inst.op == .place_addr or inst.op == .unary_op or inst.op == .intrinsic_op) {
+            if (resolveSliceRefPointee(emitter, inst.type_id)) |sl_pointee| {
+                const sl_lay = try emitter.resolver.resolveType(sl_pointee);
+                extra_cursor = std.mem.alignForward(u64, extra_cursor, @max(sl_lay.alignBytes(), 8));
+                const sl_c = try formatCType(emitter, sl_pointee);
+                defer emitter.allocator.free(sl_c);
+                try emitter.print(
+                    "#define _stmp_{d} (*(({s} *)(_frame + {d}u)))\n",
+                    .{ inst_i, sl_c, extra_cursor },
+                );
+                try undef_macros.append(
+                    emitter.allocator,
+                    try std.fmt.allocPrint(emitter.allocator, "_stmp_{d}", .{inst_i}),
+                );
+                extra_cursor += @max(sl_lay.size_bytes, 16);
+            }
+        }
+        if (inst.op == .intrinsic_op) {
+            if (@as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)) == .ctx_get) {
+                if (type_system.ContextFieldLayout.resolveRefPointee(
+                    emitter.input.pool,
+                    emitter.input.sym_table,
+                    inst.type_id,
+                )) |ctx_pointee| {
+                    if (try isZeroSizedType(emitter, ctx_pointee)) {
+                        try emitter.print("    uint8_t _ctx_snap_{d} = 0u;\n", .{inst_i});
+                    } else {
+                        const ctx_lay = try emitter.resolver.resolveType(ctx_pointee);
+                        extra_cursor = std.mem.alignForward(u64, extra_cursor, @max(ctx_lay.alignBytes(), 8));
+                        const ctx_c = try formatCType(emitter, ctx_pointee);
+                        defer emitter.allocator.free(ctx_c);
+                        try emitter.print(
+                            "#define _ctx_snap_{d} (*(({s} *)(_frame + {d}u)))\n",
+                            .{ inst_i, ctx_c, extra_cursor },
+                        );
+                        try undef_macros.append(
+                            emitter.allocator,
+                            try std.fmt.allocPrint(emitter.allocator, "_ctx_snap_{d}", .{inst_i}),
+                        );
+                        extra_cursor += @max(ctx_lay.size_bytes, 8);
+                    }
+                }
+            }
+        }
+    }
+
+    // [3] Entry state switch (`0 = unpolled`, `1..K = suspended`, `completed/cancelled = done`):
+    try emitter.writeAll(
+        "    uint32_t _coro_st = 0u;\n" ++
+            "    memcpy(&_coro_st, _frame, 4u);\n" ++
+            "    switch (_coro_st) {\n" ++
+            "    case 0u:\n" ++
+            "        if (_action == 1u) {\n" ++
+            "            uint32_t _cs = 0xFFFFFFFFu;\n" ++
+            "            memcpy(_frame, &_cs, 4u);\n",
+    );
+    var rev_p: u32 = body.param_count;
+    while (rev_p > 0) {
+        const p_decl = body.locals.items[rev_p];
+        const p_mode = p_decl.mode();
+        if (p_mode != .inout_mode and p_mode != .set_mode) {
+            const unwrapped_p = emitter.input.pool.unwrapUnderlyingType(p_decl.type_id);
+            if (!emitter.input.pool.getFlags(unwrapped_p).is_copy and
+                emitter.drop_type_set.contains(unwrapped_p.toU32()) and
+                !(try isZeroSizedType(emitter, unwrapped_p)))
+            {
+                const p_c = try formatCType(emitter, unwrapped_p);
+                defer emitter.allocator.free(p_c);
+                try emitter.print(
+                    "            _cx_drop_ty_{d}(({s} *)(_frame + {d}u));\n",
+                    .{ unwrapped_p.toU32(), p_c, plan.getLocalOffset(rev_p) },
+                );
+            }
+        }
+        rev_p -= 1;
+    }
+    try emitter.writeAll("            return 1u;\n        }\n");
+    if (body.blocks.items.len > 0) {
+        try emitter.writeAll("        goto _bb_0;\n");
+    } else {
+        try emitter.writeAll("        return 1u;\n");
+    }
+    for (plan.suspend_points) |sp_meta| {
+        try emitter.print(
+            "    case {d}u: goto _coro_disp_{d};\n",
+            .{ sp_meta.state_tag, sp_meta.state_tag },
+        );
+    }
+    try emitter.writeAll("    default: return 1u;\n    }\n");
+
+    // [4] Per-suspend-point poll/cancel dispatch pads (`_coro_disp_<k>`):
+    for (plan.suspend_points, 0..) |sp_meta, sp_idx| {
+        const ready_ty = plan.suspend_ready_types[sp_idx];
+        const resume_params = body.getBlockParams(sp_meta.resume_block);
+        try emitter.print(
+            "_coro_disp_{d}: ;\n" ++
+                "    if (_action == 1u) {{\n" ++
+                "        _cx_async_fut_cancel(_frame + {d}u);\n" ++
+                "        goto _bb_{d};\n" ++
+                "    }}\n",
+            .{ sp_meta.state_tag, sp_meta.child_frame_offset, sp_meta.cancel_block.asInt() },
+        );
+        if (try isZeroSizedType(emitter, ready_ty)) {
+            try emitter.print(
+                "    if (_cx_async_fut_poll(_frame + {d}u, NULL, _parked_out) == 0u) return 0u;\n" ++
+                    "    goto _bb_{d};\n",
+                .{ sp_meta.child_frame_offset, sp_meta.resume_block.asInt() },
+            );
+        } else {
+            const ready_c = try formatCType(emitter, ready_ty);
+            defer emitter.allocator.free(ready_c);
+            try emitter.print(
+                "    {{ {s} _rval_{d}; memset(&_rval_{d}, 0, sizeof(_rval_{d}));\n" ++
+                    "      if (_cx_async_fut_poll(_frame + {d}u, &_rval_{d}, _parked_out) == 0u) return 0u;\n",
+                .{
+                    ready_c,
+                    sp_meta.state_tag,
+                    sp_meta.state_tag,
+                    sp_meta.state_tag,
+                    sp_meta.child_frame_offset,
+                    sp_meta.state_tag,
+                },
+            );
+            if (resume_params.len >= 1 and !(try isZeroSizedType(emitter, body.getInst(resume_params[0]).type_id))) {
+                try emitter.print("      _v_{d} = _rval_{d};\n", .{ resume_params[0].asInt(), sp_meta.state_tag });
+            }
+            try emitter.print("      goto _bb_{d}; }}\n", .{sp_meta.resume_block.asInt()});
+        }
+    }
+
+    // [5] Basic blocks:
+    for (body.blocks.items, 0..) |bb_rec, bb_i| {
+        const bb_id = MirBlockId.fromInt(@intCast(bb_i));
+        emitter.active_bb_id = bb_id;
         try emitter.print("_bb_{d}: ;\n", .{bb_i});
         for (body.getBlockInsts(bb_id)) |val_id| {
             const inst = body.getInst(val_id);
@@ -4897,8 +6336,8 @@ fn emitMirBody(emitter: *CModuleEmitter, body_idx: u32, body: *const MirBody) !v
         try emitMirTerminatorC(emitter, body_idx, body, bb_id, bb_rec.terminator);
     }
 
-    if (body.blocks.items.len == 0) {
-        if (!is_void_ret) try emitter.writeAll("    return _loc_0;\n");
+    for (undef_macros.items) |macro_name| {
+        try emitter.print("#undef {s}\n", .{macro_name});
     }
     try emitter.writeAll("}\n\n");
 }
@@ -5411,7 +6850,23 @@ fn emitMirInstC(
             } else if (!target_sym.isNone() and
                 target_sym.asInt() < emitter.input.sym_table.symbols.items.len)
             {
-                try emitter.print("    _v_{d} = ({s})_cx_ext_{d};\n", .{ dst_raw, fn_c, target_sym.asInt() });
+                if (emitter.extern_global_sym_set.contains(target_sym.asInt())) {
+                    const glob_rec = emitter.input.sym_table.getSymbol(target_sym).*;
+                    const sym_ty = emitter.input.pool.unwrapUnderlyingType(glob_rec.type_id);
+                    const inst_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
+                    if (inst_ty == sym_ty) {
+                        if (!(try isZeroSizedType(emitter, inst.type_id))) {
+                            try emitter.print("    _v_{d} = _cx_ext_glob_{d};\n", .{ dst_raw, target_sym.asInt() });
+                        }
+                    } else {
+                        try emitter.print(
+                            "    _v_{d} = ({s})(&_cx_ext_glob_{d});\n",
+                            .{ dst_raw, fn_c, target_sym.asInt() },
+                        );
+                    }
+                } else {
+                    try emitter.print("    _v_{d} = ({s})_cx_ext_{d};\n", .{ dst_raw, fn_c, target_sym.asInt() });
+                }
             }
         },
         .place_load => {
@@ -6557,20 +8012,34 @@ fn emitAggregateMakeC(
                     body.getInst(MirValueId.fromInt(hole_ref_raw)).type_id,
                 );
                 const hole_node = emitter.input.pool.getNode(hole_ref_ty);
-                const hole_ty = if (hole_node.tag == .ref_ty or
+                const is_ptr_arg = hole_node.tag == .ref_ty or
                     hole_node.tag == .mut_ref_ty or
-                    hole_node.tag == .raw_ptr_ty)
+                    hole_node.tag == .raw_ptr_ty;
+                const hole_ty = if (is_ptr_arg)
                     emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(hole_node.lhs))
                 else
                     hole_ref_ty;
+                const data_expr = if (is_ptr_arg)
+                    try std.fmt.allocPrint(emitter.allocator, "(const void *)_v_{d}", .{hole_ref_raw})
+                else if (try isZeroSizedType(emitter, hole_ty))
+                    try emitter.allocator.dupe(u8, "(const void *)((uintptr_t)1u)")
+                else blk_hspill: {
+                    try emitter.print("    _fmt_h_{d}_{d} = _v_{d};\n", .{ dst_raw, hole_j, hole_ref_raw });
+                    break :blk_hspill try std.fmt.allocPrint(
+                        emitter.allocator,
+                        "(const void *)(&_fmt_h_{d}_{d})",
+                        .{ dst_raw, hole_j },
+                    );
+                };
+                defer emitter.allocator.free(data_expr);
                 try emitter.print(
-                    "    _fmt_a_{d}[{d}u].data = (const void *)_v_{d}; " ++
+                    "    _fmt_a_{d}[{d}u].data = {s}; " ++
                         "_fmt_a_{d}[{d}u].fmt_fn = _cx_fmt_fn_ty_{d}; " ++
                         "_fmt_a_{d}[{d}u].spec.flags_and_fill = (uint32_t)_v_{d}; " ++
                         "_fmt_a_{d}[{d}u].spec.width_or_none = (uint16_t)(((uint32_t)_v_{d}) & 0xFFFFu); " ++
                         "_fmt_a_{d}[{d}u].spec.precision_or_none = (uint16_t)(((uint32_t)_v_{d}) >> 16);\n",
                     .{
-                        dst_raw, hole_j, hole_ref_raw,
+                        dst_raw, hole_j, data_expr,
                         dst_raw, hole_j, hole_ty.toU32(),
                         dst_raw, hole_j, spec_lo_raw,
                         dst_raw, hole_j, spec_hi_raw,
@@ -7467,7 +8936,11 @@ fn emitIntrinsicOpC(
             }
         },
         .panic => {
-            if (args.len >= 1) {
+            if (emitter.cfg.target.isFreestanding() or
+                (emitter.is_in_c_abi_body and !emitter.input.is_oracle_trace_enabled))
+            {
+                try emitter.writeAll("    __builtin_trap();\n");
+            } else if (args.len >= 1) {
                 const msg_ty = emitter.input.pool.unwrapUnderlyingType(
                     body.getInst(MirValueId.fromInt(args[0])).type_id,
                 );
@@ -7481,7 +8954,13 @@ fn emitIntrinsicOpC(
             }
         },
         .trap => {
-            try emitter.writeAll("    _cx_rt_trap(0u);\n");
+            if (emitter.cfg.target.isFreestanding() or
+                (emitter.is_in_c_abi_body and !emitter.input.is_oracle_trace_enabled))
+            {
+                try emitter.writeAll("    __builtin_trap();\n");
+            } else {
+                try emitter.writeAll("    _cx_rt_trap(0u);\n");
+            }
         },
         .sys_write => {
             if (args.len < 2) return;
@@ -7596,7 +9075,7 @@ fn emitIntrinsicOpC(
                         .{ dst_raw, dst_raw },
                     );
                     var decl_ord: u32 = 0;
-                    while (decl_ord < ctx_lay.aux_len and decl_ord < 8) : (decl_ord += 1) {
+                    while (decl_ord < ctx_lay.aux_len and decl_ord < 10) : (decl_ord += 1) {
                         const fld = emitter.resolver.fields_by_decl.items[ctx_lay.aux_start + decl_ord];
                         if (fld.size_bytes == 0 or fld.size_bytes > emitter.ctx_slot_stride_bytes) continue;
                         try emitter.print(
@@ -7609,7 +9088,7 @@ fn emitIntrinsicOpC(
                 return;
             }
             try emitter.print(
-                "    memcpy(&_v_{d}, &_cx_tls_ctx[(((size_t)_v_{d}) & 7u) * {d}u], sizeof(_v_{d}));\n",
+                "    memcpy(&_v_{d}, &_cx_tls_ctx[(((size_t)_v_{d}) % 10u) * {d}u], sizeof(_v_{d}));\n",
                 .{ dst_raw, args[0], emitter.ctx_slot_stride_bytes, dst_raw },
             );
         },
@@ -7617,12 +9096,382 @@ fn emitIntrinsicOpC(
             if (args.len < 2) return;
             if (try isZeroSizedType(emitter, body.getInst(MirValueId.fromInt(args[1])).type_id)) return;
             try emitter.print(
-                "    memcpy(&_cx_tls_ctx[(((size_t)_v_{d}) & 7u) * {d}u], &_v_{d}, sizeof(_v_{d}));\n",
+                "    memcpy(&_cx_tls_ctx[(((size_t)_v_{d}) % 10u) * {d}u], &_v_{d}, sizeof(_v_{d}));\n",
                 .{ args[0], emitter.ctx_slot_stride_bytes, args[1], args[1] },
             );
         },
         .ghost_ctx_region_push, .ghost_ctx_region_pop => {},
+        .async_future_make => {
+            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops or args.len < 3) return;
+            try emitAsyncFutureMakeC(emitter, body, dst_raw, inst.type_id, args);
+        },
+        .async_task_group_enter => {
+            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops) return;
+            try emitter.print(
+                "    {{ void *_gp = _cx_async_group_enter(); memcpy(&_v_{d}, &_gp, sizeof(void *)); }}\n",
+                .{dst_raw},
+            );
+        },
+        .async_spawn => {
+            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops or args.len < 3) return;
+            const fut_ty = emitter.input.pool.unwrapUnderlyingType(
+                body.getInst(MirValueId.fromInt(args[2])).type_id,
+            );
+            const out_ty = emitter.input.pool.unwrapUnderlyingType(
+                emitter.input.pool.getFutureOutputType(fut_ty) orelse .unit_ty,
+            );
+            const out_lay = try emitter.resolver.resolveType(out_ty);
+            var err_fn_buf: [64]u8 = undefined;
+            const err_fn_str: []const u8 = if (emitter.res_err_check_set.contains(out_ty.toU32()))
+                try std.fmt.bufPrint(&err_fn_buf, "_cx_is_err_ty_{d}", .{out_ty.toU32()})
+            else
+                "NULL";
+            try emitter.print(
+                "    {{ void *_gp = NULL; memcpy(&_gp, _v_{d}, sizeof(void *)); " ++
+                    "void *_hp = _cx_async_spawn(_gp, &_v_{d}, {d}u, {s}); " ++
+                    "memcpy(&_v_{d}, &_hp, sizeof(void *)); }}\n",
+                .{ args[1], args[2], out_lay.size_bytes, err_fn_str, dst_raw },
+            );
+        },
+        .async_join => {
+            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops or args.len < 1) return;
+            const fut_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
+            const out_ty = emitter.input.pool.getFutureOutputType(fut_ty) orelse .unit_ty;
+            const out_lay = try emitter.resolver.resolveType(out_ty);
+            try emitter.print(
+                "    {{ void *_hp = NULL; memcpy(&_hp, &_v_{d}, sizeof(void *)); " ++
+                    "memset(&_v_{d}, 0, sizeof(_v_{d})); _v_{d}._handle = _hp; " ++
+                    "_v_{d}._kind = 3u; _v_{d}._out_sz = {d}u; }}\n",
+                .{ args[0], dst_raw, dst_raw, dst_raw, dst_raw, dst_raw, out_lay.size_bytes },
+            );
+        },
+        .async_cancel => {
+            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops or args.len < 1) return;
+            const ret_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
+            if (args.len >= 2 or ret_ty == .bool_ty) {
+                try emitter.print(
+                    "    {{ void *_gp = NULL; memcpy(&_gp, _v_{d}, sizeof(void *)); " ++
+                        "_v_{d} = (_gp != NULL && ((_cx_task_group_t *)_gp)->is_cancelled) ? 1u : 0u; }}\n",
+                    .{ args[0], dst_raw },
+                );
+            } else if (emitter.input.pool.isFutureType(ret_ty)) {
+                try emitter.print(
+                    "    {{ void *_hp = NULL; memcpy(&_hp, &_v_{d}, sizeof(void *)); " ++
+                        "memset(&_v_{d}, 0, sizeof(_v_{d})); _v_{d}._handle = _hp; _v_{d}._kind = 4u; }}\n",
+                    .{ args[0], dst_raw, dst_raw, dst_raw, dst_raw },
+                );
+            } else {
+                try emitter.print(
+                    "    {{ void *_gp = NULL; memcpy(&_gp, _v_{d}, sizeof(void *)); " ++
+                        "_cx_async_group_cancel_all((_cx_task_group_t *)_gp); }}\n",
+                    .{args[0]},
+                );
+            }
+        },
+        .async_task_group_exit => {
+            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops or args.len < 1) return;
+            try emitAsyncTaskGroupExitC(emitter, body, args[0]);
+        },
+        .async_yield => {
+            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops) return;
+            try emitter.print(
+                "    memset(&_v_{d}, 0, sizeof(_v_{d})); _v_{d}._kind = 2u; _v_{d}._aux = 0u;\n",
+                .{ dst_raw, dst_raw, dst_raw, dst_raw },
+            );
+        },
+        .async_block_on => {
+            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops or args.len < 1) return;
+            if (try isZeroSizedType(emitter, inst.type_id)) {
+                try emitter.print("    _cx_async_block_on(&_v_{d}, NULL);\n", .{args[0]});
+            } else {
+                try emitter.print("    _cx_async_block_on(&_v_{d}, &_v_{d});\n", .{ args[0], dst_raw });
+            }
+        },
     }
+}
+
+/// Returns `true` when `cand_i` matches an indirect `async_future_make` signature (`[CRITICAL-02]`).
+fn isCompatibleIndirectAsyncCandidateC(
+    emitter: *const CModuleEmitter,
+    caller_body: *const MirBody,
+    cand_i: u32,
+    callee_ty: TypeId,
+    out_ty: TypeId,
+    formal_args: []const u32,
+) bool {
+    const pool = emitter.input.pool;
+    const cand_body = &emitter.input.bodies[cand_i];
+    if (!cand_body.is_async) return false;
+    if (pool.unwrapUnderlyingType(cand_body.ret_ty) != out_ty) return false;
+
+    const is_closure = !callee_ty.isPrimitiveOrSentinel() and pool.getNode(callee_ty).tag == .closure_ty;
+    const sig_opt = pool.getFnSignatureView(callee_ty);
+    if (sig_opt) |sv| {
+        if (sv.paramCount() != formal_args.len) return false;
+    }
+
+    var capture_count: usize = 0;
+    if (is_closure) {
+        const expected_three_word = codegen_abi.isThreeWordClosureType(pool, callee_ty);
+        var matched_thunk: ?ClosureThunkSpec = null;
+        for (emitter.closure_thunks.items) |cand_thunk| {
+            if (cand_thunk.target_body_idx == cand_i) {
+                matched_thunk = cand_thunk;
+                break;
+            }
+        }
+        const thunk = matched_thunk orelse return false;
+        if (thunk.is_three_word != expected_three_word) return false;
+        capture_count = thunk.capture_types.len;
+        if (cand_body.param_count != capture_count + formal_args.len) return false;
+    } else {
+        for (emitter.closure_thunks.items) |cand_thunk| {
+            if (cand_thunk.target_body_idx == cand_i and cand_thunk.capture_types.len > 0) return false;
+        }
+        if (cand_body.param_count != formal_args.len) return false;
+    }
+
+    for (formal_args, 0..) |arg_raw, arg_i| {
+        const param_idx = 1 + capture_count + arg_i;
+        if (param_idx >= cand_body.locals.items.len or arg_raw >= caller_body.insts.len) return false;
+        const param_decl = cand_body.locals.items[param_idx];
+        const param_mode = param_decl.mode();
+        if (sig_opt) |sv| {
+            if (sv.getParamMode(arg_i) != param_mode) return false;
+        }
+        const cand_param_ty = pool.unwrapUnderlyingType(param_decl.type_id);
+        const caller_arg_ty = pool.unwrapUnderlyingType(caller_body.insts.get(arg_raw).type_id);
+        if (param_mode == .inout_mode or param_mode == .set_mode) {
+            if (caller_arg_ty.isPrimitiveOrSentinel()) return false;
+            const arg_node = pool.getNode(caller_arg_ty);
+            if (arg_node.tag != .ref_ty and arg_node.tag != .mut_ref_ty and arg_node.tag != .raw_ptr_ty) {
+                return false;
+            }
+            if (pool.unwrapUnderlyingType(TypeId.fromInt(arg_node.lhs)) != cand_param_ty) return false;
+        } else {
+            if (caller_arg_ty != cand_param_ty) return false;
+        }
+    }
+    return true;
+}
+
+/// Emits C99 statements populating `target_b`'s coroutine frame parameters & closure captures into `_nfr`.
+fn emitPopulateCoroFrameArgsC(
+    emitter: *CModuleEmitter,
+    caller_body: *const MirBody,
+    target_b: u32,
+    callee_ty: TypeId,
+    callee_val_raw: u32,
+    formal_args: []const u32,
+) !void {
+    const callee_body = &emitter.input.bodies[target_b];
+    const callee_plan = emitter.async_plan.?.getBodyPlan(target_b);
+    const is_closure = !callee_ty.isPrimitiveOrSentinel() and
+        emitter.input.pool.getNode(callee_ty).tag == .closure_ty;
+    const formal_count: usize = if (is_closure)
+        (if (emitter.input.pool.getFnSignatureView(callee_ty)) |sv| sv.paramCount() else 0)
+    else
+        callee_body.param_count;
+    const capture_count: usize = callee_body.param_count -| formal_count;
+
+    if (is_closure) {
+        var matched_thunk: ?ClosureThunkSpec = null;
+        for (emitter.closure_thunks.items) |cand_thunk| {
+            if (cand_thunk.target_body_idx == target_b) {
+                matched_thunk = cand_thunk;
+                break;
+            }
+        }
+        if (matched_thunk) |thunk| {
+            if (capture_count > 0 and thunk.capture_types.len > 0) {
+                try emitter.print(
+                    "        _cx_cenv_{d} *_senv = (_cx_cenv_{d} *)_v_{d}.env_ptr;\n",
+                    .{ thunk.thunk_idx, thunk.thunk_idx, callee_val_raw },
+                );
+                const copy_caps = @min(capture_count, thunk.capture_types.len);
+                for (0..copy_caps) |cap_i| {
+                    const cap_decl = callee_body.locals.items[1 + cap_i];
+                    const cap_off = callee_plan.getLocalOffset(@intCast(1 + cap_i));
+                    if (try isZeroSizedType(emitter, cap_decl.type_id)) continue;
+                    if (cap_decl.mode() == .inout_mode or cap_decl.mode() == .set_mode) {
+                        try emitter.print(
+                            "        {{ void *_cp = (void *)&_senv->_c{d}; memcpy(_nfr + {d}u, &_cp, sizeof(void *)); }}\n",
+                            .{ cap_i, cap_off },
+                        );
+                    } else {
+                        try emitter.print(
+                            "        memcpy(_nfr + {d}u, &_senv->_c{d}, sizeof(_senv->_c{d}));\n",
+                            .{ cap_off, cap_i, cap_i },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    const avail_args = @min(formal_count, formal_args.len);
+    for (0..avail_args) |arg_i| {
+        const param_idx: u32 = @intCast(1 + capture_count + arg_i);
+        const param_decl = callee_body.locals.items[param_idx];
+        const param_off = callee_plan.getLocalOffset(param_idx);
+        const arg_raw = formal_args[arg_i];
+        _ = caller_body;
+        if (try isZeroSizedType(emitter, param_decl.type_id)) continue;
+        if (param_decl.mode() == .inout_mode or param_decl.mode() == .set_mode) {
+            try emitter.print(
+                "        memcpy(_nfr + {d}u, &_v_{d}, sizeof(void *));\n",
+                .{ param_off, arg_raw },
+            );
+        } else {
+            try emitter.print(
+                "        memcpy(_nfr + {d}u, &_v_{d}, sizeof(_v_{d}));\n",
+                .{ param_off, arg_raw, arg_raw },
+            );
+        }
+    }
+}
+
+/// Emits C99 lazy unpolled coroutine allocation for `MirIntrinsicKind.async_future_make`.
+fn emitAsyncFutureMakeC(
+    emitter: *CModuleEmitter,
+    body: *const MirBody,
+    dst_raw: u32,
+    fut_raw_ty: TypeId,
+    args: []const u32,
+) !void {
+    const fut_ty = emitter.input.pool.unwrapUnderlyingType(fut_raw_ty);
+    const out_ty = emitter.input.pool.unwrapUnderlyingType(
+        emitter.input.pool.getFutureOutputType(fut_ty) orelse .unit_ty,
+    );
+    const out_lay = try emitter.resolver.resolveType(out_ty);
+    const def_raw: u32 = if (extractConstUsizeFromBody(body, args[0])) |def_val|
+        @truncate(def_val)
+    else
+        mir.NONE_U32;
+    const sym_raw: u32 = if (extractConstUsizeFromBody(body, args[1])) |sym_val|
+        @truncate(sym_val)
+    else
+        mir.NONE_U32;
+    const callee_ty = emitter.input.pool.unwrapUnderlyingType(
+        body.getInst(MirValueId.fromInt(args[2])).type_id,
+    );
+    const is_closure = !callee_ty.isPrimitiveOrSentinel() and
+        emitter.input.pool.getNode(callee_ty).tag == .closure_ty;
+
+    var resolved_b = resolveBodyIndex(emitter, DefId.fromInt(def_raw), SymbolIndex.fromInt(sym_raw));
+    if (resolved_b == null and args[2] < body.insts.len) {
+        const callee_inst = body.insts.get(args[2]);
+        if (callee_inst.op == .aggregate_make) {
+            const agg_kind: AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(callee_inst.aux_u16))));
+            if (agg_kind == .closure_make) {
+                resolved_b = resolveBodyIndex(emitter, DefId.fromInt(callee_inst.operands.lhs), .none);
+            }
+        } else if (callee_inst.op == .fn_addr) {
+            resolved_b = resolveBodyIndex(
+                emitter,
+                DefId.fromInt(callee_inst.operands.lhs),
+                SymbolIndex.fromInt(callee_inst.operands.rhs),
+            );
+        }
+    }
+
+    if (resolved_b) |target_b| {
+        try emitter.print(
+            "    {{\n        uint8_t *_nfr = _cx_coro_alloc({d}u);\n",
+            .{target_b},
+        );
+        try emitPopulateCoroFrameArgsC(emitter, body, target_b, callee_ty, args[2], args[3..]);
+        try emitter.print(
+            "        memset(&_v_{d}, 0, sizeof(_v_{d}));\n" ++
+                "        _v_{d}._handle = (void *)_nfr; _v_{d}._kind = 1u; " ++
+                "_v_{d}._aux = {d}u; _v_{d}._out_sz = {d}u;\n    }}\n",
+            .{ dst_raw, dst_raw, dst_raw, dst_raw, dst_raw, target_b, dst_raw, out_lay.size_bytes },
+        );
+        return;
+    }
+
+    const fn_ptr_expr = if (is_closure)
+        try std.fmt.allocPrint(emitter.allocator, "(const void *)(uintptr_t)_v_{d}.fn_ptr", .{args[2]})
+    else
+        try std.fmt.allocPrint(emitter.allocator, "(const void *)(uintptr_t)_v_{d}", .{args[2]});
+    defer emitter.allocator.free(fn_ptr_expr);
+
+    try emitter.print(
+        "    {{\n        uint32_t _db = _cx_coro_lookup_fn({s});\n" ++
+            "        uint8_t *_nfr = _cx_coro_alloc(_db);\n" ++
+            "        switch (_db) {{\n",
+        .{fn_ptr_expr},
+    );
+    for (0..emitter.input.bodies.len) |cand_i| {
+        if (!isCompatibleIndirectAsyncCandidateC(emitter, body, @intCast(cand_i), callee_ty, out_ty, args[3..])) {
+            continue;
+        }
+        try emitter.print("        case {d}u:\n", .{cand_i});
+        try emitPopulateCoroFrameArgsC(emitter, body, @intCast(cand_i), callee_ty, args[2], args[3..]);
+        try emitter.writeAll("            break;\n");
+    }
+    try emitter.print(
+        "        default: break;\n        }}\n" ++
+            "        memset(&_v_{d}, 0, sizeof(_v_{d}));\n" ++
+            "        _v_{d}._handle = (void *)_nfr; _v_{d}._kind = 1u; " ++
+            "_v_{d}._aux = _db; _v_{d}._out_sz = {d}u;\n    }}\n",
+        .{ dst_raw, dst_raw, dst_raw, dst_raw, dst_raw, dst_raw, out_lay.size_bytes },
+    );
+}
+
+/// Emits C99 nursery barrier (`async_task_group_exit`) cancelling on `Err`/cleanup or draining FIFO.
+fn emitAsyncTaskGroupExitC(emitter: *CModuleEmitter, body: *const MirBody, group_val_raw: u32) !void {
+    var err_cond: []u8 = if (emitter.active_coro_body_idx != null)
+        try emitter.allocator.dupe(u8, "(_action == 1u)")
+    else
+        try emitter.allocator.dupe(u8, "0");
+    defer emitter.allocator.free(err_cond);
+
+    if (!emitter.active_bb_id.isNone() and emitter.active_bb_id.asInt() < body.blocks.items.len) {
+        const bb_rec = body.blocks.items[emitter.active_bb_id.asInt()];
+        if (bb_rec.isCleanupPad()) {
+            emitter.allocator.free(err_cond);
+            err_cond = try emitter.allocator.dupe(u8, "1");
+        } else if (bb_rec.terminator.kind == .ret) {
+            const unwrapped_ret = emitter.input.pool.unwrapUnderlyingType(body.ret_ty);
+            if (!unwrapped_ret.isPrimitiveOrSentinel() and
+                emitter.input.pool.getNode(unwrapped_ret).tag == .result_ty and
+                !(try isZeroSizedType(emitter, unwrapped_ret)))
+            {
+                if (try emitter.resolver.getSumDetail(unwrapped_ret)) |sum_detail| {
+                    const ret_lv = if (bb_rec.terminator.cond_or_val != mir.NONE_U32)
+                        try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{bb_rec.terminator.cond_or_val})
+                    else if (emitter.active_coro_body_idx) |cb_idx| blk_coro_r: {
+                        const ret_c = try formatCType(emitter, unwrapped_ret);
+                        defer emitter.allocator.free(ret_c);
+                        const off_0 = emitter.async_plan.?.getBodyPlan(cb_idx).getLocalOffset(0);
+                        break :blk_coro_r try std.fmt.allocPrint(
+                            emitter.allocator,
+                            "(*(({s} *)(_frame + {d}u)))",
+                            .{ ret_c, off_0 },
+                        );
+                    } else try emitter.allocator.dupe(u8, "_loc_0");
+                    defer emitter.allocator.free(ret_lv);
+
+                    const d_expr = try formatSumDiscrReadExpr(emitter, unwrapped_ret, sum_detail, ret_lv);
+                    defer emitter.allocator.free(d_expr);
+                    const combined = try std.fmt.allocPrint(
+                        emitter.allocator,
+                        "({s} || (({s}) == 1u))",
+                        .{ err_cond, d_expr },
+                    );
+                    emitter.allocator.free(err_cond);
+                    err_cond = combined;
+                }
+            }
+        }
+    }
+
+    try emitter.print(
+        "    {{ void *_gp = NULL; memcpy(&_gp, &_v_{d}, sizeof(void *)); " ++
+            "_cx_async_group_exit(_gp, ({s}) ? 1u : 0u); }}\n",
+        .{ group_val_raw, err_cond },
+    );
 }
 
 /// Emits cycle-safe scoped parallel block-argument moves (`_phi_<k>`) followed by `goto _bb_<target>` (`[CRITICAL-05]`).
@@ -7666,13 +9515,77 @@ fn emitMirTerminatorC(
 ) !void {
     switch (term.kind) {
         .unreachable_term => {
-            try emitter.writeAll("    _cx_rt_trap(0u);\n");
+            if (emitter.cfg.target.isFreestanding() or
+                (emitter.is_in_c_abi_body and !emitter.input.is_oracle_trace_enabled))
+            {
+                try emitter.writeAll("    __builtin_trap();\n");
+            } else {
+                try emitter.writeAll("    _cx_rt_trap(0u);\n");
+            }
         },
         .trap => {
-            try emitter.print("    _cx_rt_trap({d}u);\n", .{term.aux_u8});
+            if (emitter.cfg.target.isFreestanding() or
+                (emitter.is_in_c_abi_body and !emitter.input.is_oracle_trace_enabled))
+            {
+                try emitter.writeAll("    __builtin_trap();\n");
+            } else {
+                try emitter.print("    _cx_rt_trap({d}u);\n", .{term.aux_u8});
+            }
         },
         .ret => {
             const is_void = try isZeroSizedType(emitter, body.ret_ty);
+            if (emitter.active_coro_body_idx) |cb_idx| {
+                const ret_expr = if (term.cond_or_val != mir.NONE_U32)
+                    try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{term.cond_or_val})
+                else if (is_void)
+                    try emitter.allocator.dupe(u8, "0u")
+                else blk_coro_ret: {
+                    const ret_c = try formatCType(emitter, body.ret_ty);
+                    defer emitter.allocator.free(ret_c);
+                    const off_0 = emitter.async_plan.?.getBodyPlan(cb_idx).getLocalOffset(0);
+                    break :blk_coro_ret try std.fmt.allocPrint(
+                        emitter.allocator,
+                        "(*(({s} *)(_frame + {d}u)))",
+                        .{ ret_c, off_0 },
+                    );
+                };
+                defer emitter.allocator.free(ret_expr);
+
+                try emitter.writeAll(
+                    "    if (_action == 1u) {\n" ++
+                        "        uint32_t _cs = 0xFFFFFFFFu;\n" ++
+                        "        memcpy(_frame, &_cs, 4u);\n" ++
+                        "        return 1u;\n" ++
+                        "    }\n",
+                );
+                if (!emitter.cfg.is_release_mode and !is_void) {
+                    const unwrapped_ret = emitter.input.pool.unwrapUnderlyingType(body.ret_ty);
+                    if (emitter.input.pool.getNode(unwrapped_ret).tag == .result_ty) {
+                        if (try emitter.resolver.getSumDetail(unwrapped_ret)) |sum_detail| {
+                            const d_expr = try formatSumDiscrReadExpr(emitter, unwrapped_ret, sum_detail, ret_expr);
+                            defer emitter.allocator.free(d_expr);
+                            const site_tag: u64 = (@as(u64, body_idx + 1) << 16) | @as(u64, bb_id.asInt());
+                            try emitter.print(
+                                "    if (({s}) == 1u) _cx_record_err_ret((uintptr_t){d}ull);\n",
+                                .{ d_expr, site_tag },
+                            );
+                        }
+                    }
+                }
+                if (!is_void) {
+                    const ret_lay = try emitter.resolver.resolveType(body.ret_ty);
+                    try emitter.print(
+                        "    if (_out_ptr != NULL) memcpy(_out_ptr, &({s}), {d}u);\n",
+                        .{ ret_expr, ret_lay.size_bytes },
+                    );
+                }
+                try emitter.writeAll(
+                    "    { uint32_t _cs = 0xFFFFFFFEu; memcpy(_frame, &_cs, 4u); }\n" ++
+                        "    return 1u;\n",
+                );
+                return;
+            }
+
             const ret_expr = if (term.cond_or_val != mir.NONE_U32)
                 try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{term.cond_or_val})
             else
@@ -7771,6 +9684,23 @@ fn emitMirTerminatorC(
                 arg_strs.deinit(emitter.allocator);
             }
 
+            const indirect_sig: ?type_system.FnSignatureView = if (call_site.direct_symbol.isNone() and
+                call_site.direct_def_id.isNone() and
+                !call_site.callee_val.isNone())
+                emitter.input.pool.getFnSignatureView(
+                    emitter.input.pool.unwrapUnderlyingType(body.getInst(call_site.callee_val).type_id),
+                )
+            else
+                null;
+            const is_variadic_call = call_site.is_c_variadic or
+                (indirect_sig != null and indirect_sig.?.is_variadic);
+            const fixed_arity: usize = if (call_site.is_c_variadic)
+                call_site.fixed_arity
+            else if (indirect_sig) |isig|
+                isig.paramCount()
+            else
+                call_site.args_len;
+
             var arg_i: usize = 0;
             while (arg_i < call_site.args_len) : (arg_i += 1) {
                 const mode = body.call_arg_modes.items[call_site.modes_start + arg_i];
@@ -7780,24 +9710,24 @@ fn emitMirTerminatorC(
                         body.getInst(MirValueId.fromInt(word)).type_id,
                     );
                     if (!(try isZeroSizedType(emitter, arg_ty))) {
-                        const is_vararg_tail = call_site.is_c_variadic and arg_i >= call_site.fixed_arity;
+                        const is_vararg_tail = is_variadic_call and arg_i >= fixed_arity;
                         const arg_expr = if (is_vararg_tail and arg_ty == .f32_ty)
                             try std.fmt.allocPrint(emitter.allocator, "((double)_v_{d})", .{word})
                         else if (is_vararg_tail and arg_ty == .bool_ty)
-                            try std.fmt.allocPrint(emitter.allocator, "((int)(_v_{d} & 1u))", .{word})
+                            try std.fmt.allocPrint(emitter.allocator, "((int32_t)(_v_{d} & 1u))", .{word})
                         else if (is_vararg_tail) blk_va: {
                             if (try resolveIntegerInfo(emitter, arg_ty)) |va_int| {
                                 if (va_int.bits < 32) {
                                     if (va_int.is_signed) {
                                         break :blk_va try std.fmt.allocPrint(
                                             emitter.allocator,
-                                            "((int)_v_{d})",
+                                            "((int32_t)_v_{d})",
                                             .{word},
                                         );
                                     }
                                     break :blk_va try std.fmt.allocPrint(
                                         emitter.allocator,
-                                        "((int)((uint32_t)_v_{d}))",
+                                        "((int32_t)((uint32_t)_v_{d}))",
                                         .{word},
                                     );
                                 }
@@ -7887,6 +9817,31 @@ fn emitMirTerminatorC(
             }
             try emitter.print("    goto _bb_{d};\n", .{normal_edge.target_bb.asInt()});
         },
+        .coro_suspend => {
+            if (emitter.active_coro_body_idx) |cb_idx| {
+                const plan = emitter.async_plan.?.getBodyPlan(cb_idx);
+                if (plan.findSuspendByBlock(bb_id)) |sp_idx| {
+                    const sp_meta = plan.suspend_points[sp_idx];
+                    try emitter.print(
+                        "    memcpy(_frame + {d}u, &_v_{d}, sizeof(_v_{d}));\n" ++
+                            "    memset(&_v_{d}, 0, sizeof(_v_{d}));\n" ++
+                            "    {{ uint32_t _ns = {d}u; memcpy(_frame, &_ns, 4u); }}\n" ++
+                            "    goto _coro_disp_{d};\n",
+                        .{
+                            sp_meta.child_frame_offset,
+                            term.cond_or_val,
+                            term.cond_or_val,
+                            term.cond_or_val,
+                            term.cond_or_val,
+                            sp_meta.state_tag,
+                            sp_meta.state_tag,
+                        },
+                    );
+                    return;
+                }
+            }
+            try emitter.writeAll("    _cx_rt_trap(0u);\n");
+        },
     }
 }
 
@@ -7896,7 +9851,6 @@ fn emitMainEntrypointWrapper(emitter: *CModuleEmitter) !void {
     const main_body = &emitter.input.bodies[main_b];
     if (main_body.param_count != 0) return;
 
-    try emitter.writeAll("int main(void) {\n    _cx_rt_init();\n");
     const call_fn = if (emitter.input.is_dev_got_enabled)
         try std.fmt.allocPrint(emitter.allocator, "((_cx_body_fn_t_{d})_cx_dev_got[{d}u])", .{ main_b, main_b })
     else
@@ -7904,6 +9858,19 @@ fn emitMainEntrypointWrapper(emitter: *CModuleEmitter) !void {
     defer emitter.allocator.free(call_fn);
 
     const ret_ty = emitter.input.pool.unwrapUnderlyingType(main_body.ret_ty);
+    if (emitter.cfg.target.isFreestanding()) {
+        try emitter.writeAll("int main(void) {\n");
+        if (try isZeroSizedType(emitter, ret_ty)) {
+            try emitter.print("    {s}();\n    return 0;\n}}\n", .{call_fn});
+        } else {
+            const ret_c = try formatCType(emitter, ret_ty);
+            defer emitter.allocator.free(ret_c);
+            try emitter.print("    {s} _main_res = {s}();\n    return (int)_main_res;\n}}\n", .{ ret_c, call_fn });
+        }
+        return;
+    }
+
+    try emitter.writeAll("int main(void) {\n    _cx_rt_init();\n");
     if (try isZeroSizedType(emitter, ret_ty)) {
         try emitter.print(
             "    {s}();\n    _cx_rt_trace_append(\"RET:0\\n\");\n    return 0;\n}}\n",
@@ -7956,12 +9923,13 @@ fn emitMainEntrypointWrapper(emitter: *CModuleEmitter) !void {
 /// Monotonic atomic counter ensuring concurrent in-process compilations never collide on temp dirs.
 var next_driver_scratch_seq = std.atomic.Value(u32).init(1);
 
-/// Compiles `c_source` via `zig cc` to `.object_file` or `.executable` and atomically publishes `output_path`.
+/// Compiles `c_source` via `zig cc` and `codegen_link` across all 11 targets and publishes `output_path`.
 fn compileCSourceWithZigDriver(
     allocator: std.mem.Allocator,
     cfg: CBackendConfig,
     input: CodegenModuleInput,
     c_source: []const u8,
+    collected_link_libs: []const []const u8,
 ) CCodegenError![]u8 {
     const out_path = input.output_path orelse return error.MissingOutputConfig;
     const io = input.io orelse return error.MissingOutputConfig;
@@ -7971,22 +9939,50 @@ fn compileCSourceWithZigDriver(
     defer allocator.free(zig_exe);
 
     const seq_id = next_driver_scratch_seq.fetchAdd(1, .monotonic);
+    const proc_salt = @intFromPtr(&next_driver_scratch_seq) ^ (@intFromPtr(&seq_id) >> 4);
     const scratch_dir = std.fmt.allocPrint(
         allocator,
-        ".zig-cache/cx_c_drv_{d}",
-        .{seq_id},
+        ".zig-cache/cx_c_drv_{x}_{d}",
+        .{ proc_salt, seq_id },
     ) catch return error.OutOfMemory;
     defer allocator.free(scratch_dir);
     defer std.Io.Dir.cwd().deleteTree(io, scratch_dir) catch {};
 
+    const is_sdkless_msvc_obj = cfg.target.os == .windows and cfg.target.abi == .msvc and
+        (input.artifact_kind == .object_file or input.artifact_kind == .static_library);
+    const is_freestanding_cc = cfg.target.isFreestanding() or is_sdkless_msvc_obj;
+
+    var staged_fs_c: ?[]u8 = null;
+    defer if (staged_fs_c) |fs_buf| allocator.free(fs_buf);
+    const active_c_source: []const u8 = if (is_sdkless_msvc_obj and !cfg.target.isFreestanding()) blk_fs: {
+        const prelude_tail = "_cx_rt_panic(msg_b.data, msg_b.len);\n}\n";
+        if (std.mem.indexOf(u8, c_source, prelude_tail)) |tail_pos| {
+            const user_tail = c_source[tail_pos + prelude_tail.len ..];
+            const hosted_alloc_decls =
+                "void *calloc(size_t, size_t);\n" ++
+                "void *realloc(void *, size_t);\n" ++
+                "void free(void *);\n\n";
+            staged_fs_c = std.fmt.allocPrint(
+                allocator,
+                "{s}{s}{s}{s}{s}",
+                .{ C99_FREESTANDING_PREAMBLE, C99_ARITH_HELPERS, C99_FREESTANDING_TAIL, hosted_alloc_decls, user_tail },
+            ) catch return error.OutOfMemory;
+            break :blk_fs staged_fs_c.?;
+        }
+        break :blk_fs c_source;
+    } else c_source;
+
     const c_src_path = std.fmt.allocPrint(allocator, "{s}/module.c", .{scratch_dir}) catch
         return error.OutOfMemory;
     defer allocator.free(c_src_path);
-    codegen_abi.atomicWriteOutputFile(io, allocator, c_src_path, c_source) catch
+    codegen_abi.atomicWriteOutputFile(io, allocator, c_src_path, active_c_source) catch
         return error.BackendFailure;
 
     const zig_triple = cfg.target.asZigTargetTriple();
-    const opt_flag = if (cfg.is_release_mode) "-O2" else "-O0";
+    const opt_flag = if (cfg.is_release_mode)
+        (if (cfg.target.isWasm()) "-Oz" else "-O2")
+    else
+        "-O0";
 
     if (cfg.is_fuzz_instrumented) {
         const ir_path = std.fmt.allocPrint(allocator, "{s}/module.ll", .{scratch_dir}) catch
@@ -8075,40 +10071,77 @@ fn compileCSourceWithZigDriver(
         return allocator.dupe(u8, out_path) catch return error.OutOfMemory;
     }
 
-    const tmp_artifact = std.fmt.allocPrint(
+    const mod_obj_path = std.fmt.allocPrint(
         allocator,
-        "{s}/artifact{s}",
-        .{
-            scratch_dir,
-            if (input.artifact_kind == .object_file)
-                cfg.target.objectExtension()
-            else
-                cfg.target.executableExtension(),
-        },
+        "{s}/module{s}",
+        .{ scratch_dir, cfg.target.defaultObjExtension() },
     ) catch return error.OutOfMemory;
-    defer allocator.free(tmp_artifact);
+    defer allocator.free(mod_obj_path);
 
-    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer argv.deinit(allocator);
-    argv.appendSlice(allocator, &.{
+    var cc_argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer cc_argv.deinit(allocator);
+    cc_argv.appendSlice(allocator, &.{
         zig_exe,
         "cc",
+        "-c",
         "-target",
         zig_triple,
         "-std=c99",
         "-fno-strict-aliasing",
+        "-ffunction-sections",
+        "-fdata-sections",
         "-Wno-unused-function",
         "-Wno-unused-variable",
         opt_flag,
     }) catch return error.OutOfMemory;
-    if (input.artifact_kind == .object_file) {
-        argv.append(allocator, "-c") catch return error.OutOfMemory;
+    if (is_freestanding_cc) {
+        cc_argv.appendSlice(allocator, &.{ "-ffreestanding", "-nostdlib" }) catch return error.OutOfMemory;
     }
-    argv.appendSlice(allocator, &.{ c_src_path, "-o", tmp_artifact }) catch return error.OutOfMemory;
+    cc_argv.appendSlice(allocator, &.{ c_src_path, "-o", mod_obj_path }) catch return error.OutOfMemory;
 
-    try runZigCcCommand(allocator, io, input.environ_map, input.diagnostic_sink, argv.items);
-    codegen_abi.publishStagedFileAtomic(io, allocator, tmp_artifact, out_path) catch
-        return error.BackendFailure;
+    try runZigCcCommand(allocator, io, input.environ_map, input.diagnostic_sink, cc_argv.items);
+
+    if (input.artifact_kind == .object_file) {
+        codegen_abi.publishStagedFileAtomic(io, allocator, mod_obj_path, out_path) catch
+            return error.BackendFailure;
+        return allocator.dupe(u8, out_path) catch return error.OutOfMemory;
+    }
+
+    var merged_libs: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer merged_libs.deinit(allocator);
+    for (input.extra_libs) |ext_l| {
+        merged_libs.append(allocator, ext_l) catch return error.OutOfMemory;
+    }
+    for (collected_link_libs) |col_l| {
+        var is_dup = false;
+        for (merged_libs.items) |existing_l| {
+            if (std.mem.eql(u8, existing_l, col_l)) {
+                is_dup = true;
+                break;
+            }
+        }
+        if (!is_dup) merged_libs.append(allocator, col_l) catch return error.OutOfMemory;
+    }
+
+    codegen_link.linkCrossTarget(io, allocator, .{
+        .target = cfg.target,
+        .object_paths = &.{mod_obj_path},
+        .output_path = out_path,
+        .artifact_kind = input.artifact_kind,
+        .link_mode = input.link_mode,
+        .is_release_mode = cfg.is_release_mode,
+        .has_dwarf_tables = cfg.has_line_directives and input.vfs_source_map != null,
+        .is_nostdlib = cfg.target.isFreestanding(),
+        .extra_libs = merged_libs.items,
+        .lib_dirs = input.lib_dirs,
+        .environ_map = input.environ_map,
+        .diagnostic_sink = input.diagnostic_sink,
+    }) catch |link_err| switch (link_err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.LinkerFailed => return error.CompilerDriverFailed,
+        else => return error.BackendFailure,
+    };
+
     return allocator.dupe(u8, out_path) catch return error.OutOfMemory;
 }
 
@@ -8168,17 +10201,64 @@ pub fn emitModule(
         }
     }
     emitter.print(" | target: {s} */\n\n", .{
-        cfg.target.canonicalName(),
+        formatC99BannerTargetName(cfg.target),
     }) catch return error.OutOfMemory;
 
-    emitter.writeAll(C99_RUNTIME_PREAMBLE) catch return error.OutOfMemory;
-    emitter.writeAll(C99_ARITH_HELPERS) catch return error.OutOfMemory;
-    emitter.writeAll(C99_FMT_HELPERS) catch return error.OutOfMemory;
+    if (cfg.target.isFreestanding()) {
+        emitter.writeAll(C99_FREESTANDING_PREAMBLE) catch return error.OutOfMemory;
+        emitter.writeAll(C99_ARITH_HELPERS) catch return error.OutOfMemory;
+        emitter.writeAll(C99_FREESTANDING_TAIL) catch return error.OutOfMemory;
+    } else {
+        emitter.writeAll(C99_RUNTIME_PREAMBLE) catch return error.OutOfMemory;
+        emitter.writeAll(C99_ARITH_HELPERS) catch return error.OutOfMemory;
+        emitter.writeAll(C99_HOSTED_ARITH_FMT) catch return error.OutOfMemory;
+        emitter.writeAll(C99_FMT_HELPERS) catch return error.OutOfMemory;
+    }
     emitter.writeAll("\n") catch return error.OutOfMemory;
+
+    var has_any_async = false;
+    for (input.bodies) |*body_ptr| {
+        if (mir_async.hasBodyAsyncOperations(body_ptr)) {
+            has_any_async = true;
+            break;
+        }
+    }
+    if (has_any_async and !cfg.target.isFreestanding()) {
+        const cloned_bodies = allocator.alloc(MirBody, input.bodies.len) catch return error.OutOfMemory;
+        var cloned_count: usize = 0;
+        errdefer {
+            for (cloned_bodies[0..cloned_count]) |*cb| cb.deinit();
+            allocator.free(cloned_bodies);
+        }
+        for (input.bodies, 0..) |*src_b, idx| {
+            cloned_bodies[idx] = src_b.clone(allocator) catch return error.OutOfMemory;
+            cloned_count += 1;
+        }
+        const plan = mir_async.prepareAndAnalyzeAsyncModule(
+            allocator,
+            cloned_bodies,
+            input.pool,
+            input.sym_table,
+            emitter.target_layout,
+            null,
+        ) catch |err| {
+            return if (@as(anyerror, err) == error.OutOfMemory) error.OutOfMemory else error.BackendFailure;
+        };
+        emitter.owned_async_bodies = cloned_bodies;
+        emitter.async_plan = plan;
+        emitter.input.bodies = cloned_bodies;
+        emitter.has_async_ops = true;
+        emitter.has_context_ops = true;
+    }
 
     indexModuleEntities(&emitter) catch |err| {
         return if (@as(anyerror, err) == error.OutOfMemory) error.OutOfMemory else error.BackendFailure;
     };
+    const is_sdkless_msvc_obj = cfg.target.os == .windows and cfg.target.abi == .msvc and
+        (input.artifact_kind == .object_file or input.artifact_kind == .static_library);
+    if (cfg.target.isFreestanding() or is_sdkless_msvc_obj) {
+        emitter.ordered_fmt_types.clearRetainingCapacity();
+    }
     emitTypeDeclarations(&emitter) catch |err| {
         return if (@as(anyerror, err) == error.OutOfMemory) error.OutOfMemory else error.BackendFailure;
     };
@@ -8189,7 +10269,7 @@ pub fn emitModule(
         return if (@as(anyerror, err) == error.OutOfMemory) error.OutOfMemory else error.BackendFailure;
     };
 
-    for (input.bodies, 0..) |*body_ptr, b_idx| {
+    for (emitter.input.bodies, 0..) |*body_ptr, b_idx| {
         emitMirBody(&emitter, @intCast(b_idx), body_ptr) catch |err| {
             return if (@as(anyerror, err) == error.OutOfMemory) error.OutOfMemory else error.BackendFailure;
         };
@@ -8211,7 +10291,13 @@ pub fn emitModule(
             written_path = allocator.dupe(u8, out_path) catch return error.OutOfMemory;
         }
     } else {
-        written_path = try compileCSourceWithZigDriver(allocator, cfg, input, emitted_c);
+        written_path = try compileCSourceWithZigDriver(
+            allocator,
+            cfg,
+            input,
+            emitted_c,
+            emitter.collected_link_libs.items,
+        );
     }
 
     return .{
@@ -8497,4 +10583,125 @@ test "Phase 7.6 Stage-4 C99 regressions: 0-byte own closure niche, 6-arg cmpxchg
         "5|5|1e-13|1e-5|1e16|nan|nan|NAN|inf|+inf|-inf|INF|-INF",
         run_out.stdout,
     );
+}
+
+test "Phase 8 Tier A C99: freestanding < 10 KB Wasm, @wasm_import/@wasm_export, and SDK-less aarch64-msvc .obj" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // [1] Freestanding `wasm32-unknown-freestanding` (`< 10 KB` `.wasm`, zero hosted libc headers, `@wasm_import`/`@wasm_export`):
+    const wasm_src =
+        \\@wasm_import("host_env", "host_tick")
+        \\extern "C" fn host_tick(delta: i32) -> i32;
+        \\
+        \\@wasm_export("wasm_step")
+        \\pub fn wasm_step(seed: i32) -> i32 {
+        \\    if seed < 0 {
+        \\        @panic("negative seed");
+        \\    }
+        \\    return unsafe { host_tick(seed + 1) };
+        \\}
+    ;
+    var wasm_bundle = try mir.lowerSourceToMir(
+        allocator,
+        FileId.fromInt(210),
+        wasm_src,
+        TargetSpec.WASM32_UNKNOWN_FREESTANDING.asTargetLayout(),
+        .{},
+    );
+    defer wasm_bundle.deinit();
+    try std.testing.expect(!wasm_bundle.hir_bundle.diagnostics.hasErrors());
+
+    const wasm_path = ".zig-cache/test_phase8_c_freestanding.wasm";
+    defer std.Io.Dir.cwd().deleteFile(io, wasm_path) catch {};
+
+    var wasm_art = try emitModule(
+        allocator,
+        .{ .target = TargetSpec.WASM32_UNKNOWN_FREESTANDING, .is_release_mode = true },
+        .{
+            .bodies = wasm_bundle.mir_bundle.bodies.items,
+            .pool = &wasm_bundle.hir_bundle.pool,
+            .sym_table = &wasm_bundle.hir_bundle.sym_table,
+            .interner = &wasm_bundle.hir_bundle.interner,
+            .module_name = "test_wasm_fs",
+            .artifact_kind = .executable,
+            .output_path = wasm_path,
+            .io = io,
+        },
+    );
+    defer wasm_art.deinit(allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, wasm_art.emitted_text, "<stdio.h>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_art.emitted_text, "<stdlib.h>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_art.emitted_text, "<string.h>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_art.emitted_text, "<inttypes.h>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_art.emitted_text, "int main(") == null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, wasm_art.emitted_text, "import_module(\"host_env\"), import_name(\"host_tick\")") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, wasm_art.emitted_text, "export_name(\"wasm_step\")") != null);
+
+    const wasm_file = try std.Io.Dir.cwd().openFile(io, wasm_path, .{ .mode = .read_only });
+    defer wasm_file.close(io);
+    const wasm_size: usize = @intCast((try wasm_file.stat(io)).size);
+    try std.testing.expect(wasm_size >= 8 and wasm_size < 10_240);
+
+    // [2] SDK-less `aarch64-windows-msvc` `.obj` and `.lib` static archive emission:
+    const arm64_src =
+        \\@export
+        \\@link_name("cx_arm64_add")
+        \\pub fn arm64_add(lhs_val: i32, rhs_val: i32) -> i32 {
+        \\    return lhs_val +% rhs_val;
+        \\}
+    ;
+    var arm64_bundle = try mir.lowerSourceToMir(
+        allocator,
+        FileId.fromInt(211),
+        arm64_src,
+        TargetSpec.AARCH64_WINDOWS_MSVC.asTargetLayout(),
+        .{},
+    );
+    defer arm64_bundle.deinit();
+    try std.testing.expect(!arm64_bundle.hir_bundle.diagnostics.hasErrors());
+
+    const arm64_obj_path = ".zig-cache/test_phase8_c_arm64.obj";
+    const arm64_lib_path = ".zig-cache/test_phase8_c_arm64.lib";
+    defer std.Io.Dir.cwd().deleteFile(io, arm64_obj_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, arm64_lib_path) catch {};
+
+    var obj_art = try emitModule(
+        allocator,
+        .{ .target = TargetSpec.AARCH64_WINDOWS_MSVC, .is_release_mode = true },
+        .{
+            .bodies = arm64_bundle.mir_bundle.bodies.items,
+            .pool = &arm64_bundle.hir_bundle.pool,
+            .sym_table = &arm64_bundle.hir_bundle.sym_table,
+            .interner = &arm64_bundle.hir_bundle.interner,
+            .module_name = "test_arm64_msvc",
+            .artifact_kind = .object_file,
+            .output_path = arm64_obj_path,
+            .io = io,
+        },
+    );
+    defer obj_art.deinit(allocator);
+
+    var lib_art = try emitModule(
+        allocator,
+        .{ .target = TargetSpec.AARCH64_WINDOWS_MSVC, .is_release_mode = true },
+        .{
+            .bodies = arm64_bundle.mir_bundle.bodies.items,
+            .pool = &arm64_bundle.hir_bundle.pool,
+            .sym_table = &arm64_bundle.hir_bundle.sym_table,
+            .interner = &arm64_bundle.hir_bundle.interner,
+            .module_name = "test_arm64_msvc_lib",
+            .artifact_kind = .static_library,
+            .output_path = arm64_lib_path,
+            .io = io,
+        },
+    );
+    defer lib_art.deinit(allocator);
+
+    const lib_file = try std.Io.Dir.cwd().openFile(io, arm64_lib_path, .{ .mode = .read_only });
+    defer lib_file.close(io);
+    try std.testing.expect((try lib_file.stat(io)).size > 8);
 }

@@ -17,7 +17,7 @@ It serves two roles:
 
 ## 2. Cross-Language Capability Matrix
 
-Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `stage0/` + `core/` (`Phases 0–7.6`); **`[v0.0.1]`** = scheduled in `Phases 8–12` prior to initial release; **`[0.x]`** = scheduled in `Phase 13.0–13.4` prior to `v1.0.0`.
+Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `stage0/` + `core/` (`Phases 0–8`); **`[v0.0.1]`** = scheduled in `Phases 9–12` prior to initial release; **`[0.x]`** = scheduled in `Phase 13.0–13.4` prior to `v1.0.0`.
 
 | Dimension | CoreX | Rust | Zig | C23 / C++23 | Go | Python |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -29,7 +29,7 @@ Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `st
 | **Supply-Chain Capability Sandboxing** | **Lockfile-enforced (`fs`, `net`, `env`, `ffi`, `alloc` per pkg)** `[v0.0.1]` | None (`build.rs` / proc-macros run arbitrary code) | Build runner sandboxing partial | None | None | None (`setup.py` / arbitrary imports) |
 | **Error Handling ABI** | **`T!E` zero-branch register return (`swiftcc` + `swifterror`)** `[Live]` | Stack/register `Result<T, E>` enum | Error union `E!T` | Exceptions (slow unwind) or `errno` | Multi-return `(T, error)` + `if err != nil` | Exceptions |
 | **Zero-Alloc Formatted Panics & Strings** | **8-byte `FmtSpec` + stack `FmtArgs` + `{x=}` (`0` heap allocs)** `[Live]` | `format_args!` (verbose macros, separate `{:?}`/`{}`) | `std.fmt` comptime format strings | `printf` (unsafe) / `std::format` (heavy) | `fmt.Sprintf` (heap/reflection) | `f"{x=}"` (heap-allocated) |
-| **C Header Interop (`@c_import`)** | **Built-in zero-`libclang` C11/C23 translator + FFI SAST contracts** `[v0.0.1]` | External `bindgen` + `libclang` + `unsafe` everywhere | Built-in `@cImport` (bundles heavy `libclang`) | Native | `cgo` (high call overhead) | `ctypes` / `cffi` (runtime overhead) |
+| **C Header Interop (`@c_import`)** | **Built-in zero-`libclang` C11/C23 translator + FFI SAST contracts** `[Live]` | External `bindgen` + `libclang` + `unsafe` everywhere | Built-in `@cImport` (bundles heavy `libclang`) | Native | `cgo` (high call overhead) | `ctypes` / `cffi` (runtime overhead) |
 | **Compile-Time Execution (`comptime`)** | **Hermetic `MirVm` with spatial/temporal provenance & step caps** `[Live]` | Restricted `const fn` + slow proc-macros | Unrestricted `comptime` (no fuel/sandbox cap by default) | `constexpr` / template metaprogramming | None (`go generate`) | Import-time execution |
 | **Built-In Deterministic `--sim` & `--fuzz`** | **First-class `test` / `bench` + `--sim --seed` + `--fuzz`** `[Live]`/`[v0.0.1]` | External crates (`cargo-fuzz`, `loom`, `turmoil`) | `std.testing.fuzz` (no virtual-time sim) | External (`libFuzzer`, custom harnesses) | `go test -fuzz` (no deterministic sim) | `hypothesis` / `atheris` |
 | **Installed Toolchain Footprint** | **`< 1 MB` self-hosted binary + tree-shaken `cx.*` stdlib** `[v0.0.1]` | `~800 MB–1.5 GB` (`rustup` + `rustc` + `cargo` + std rlibs) | `~45–50 MB` compressed (`libclang`/C++ headers) | `~500 MB–2 GB` (Clang/GCC/MSVC SDKs) | `~70–150 MB` | `~50–120 MB` |
@@ -96,8 +96,8 @@ CoreX systematically adopts the highest-leverage ergonomic wins from Python, Swi
     -   **True `@linear` types** that statically guarantee explicit consumption on every path (`[Live]`).
     -   **Named arguments, default parameters, `/` and `*` parameter zones**, and **generic type defaults** (`[Live]`).
     -   **Built-in `@no_alloc` / `@no_panic` / `@max_stack(N)`** verification and **lockfile capability sandboxing** (`[Live]` / `[v0.0.1]`).
-    -   **Zero-`libclang` C header import** (`[v0.0.1]`), **hermetic `MirVm` `comptime`** instead of heavy proc-macro crates (`[Live]`), and a **`< 1 MB` self-hosted toolchain** (`[v0.0.1]`).
--   **Honest Scope Note:** Rust has a massive mature crates.io ecosystem today; CoreX bridges day-one library breadth via zero-ceremony C11/C23 FFI (`Phase 8`) and direct Git URL package imports (`Phase 9`).
+    -   **Zero-`libclang` C header import** (`[Live]`), **hermetic `MirVm` `comptime`** instead of heavy proc-macro crates (`[Live]`), and a **`< 1 MB` self-hosted toolchain** (`[v0.0.1]`).
+-   **Honest Scope Note:** Rust has a massive mature crates.io ecosystem today; CoreX bridges day-one library breadth via zero-ceremony C11/C23 FFI (`[Live]`) and direct Git URL package imports (`Phase 9`).
 
 ### 4.2 CoreX vs. C & C++
 
@@ -113,7 +113,7 @@ CoreX systematically adopts the highest-leverage ergonomic wins from Python, Swi
 -   **How CoreX Wins:**
     -   **Full compile-time memory, borrow, `@linear`, and Pentagon bounds verification** (`Release` builds stay memory-safe without runtime overhead) (`[Live]`).
     -   **Checked generics via Constrained Type Groups** (`[T: Float]`, `[Data: str | &[u8]]`) + **3-tier closures** (`fn`, `|…|`, `own |…|`) + **`subscript`/`yield`** + **named/default arguments** (`[Live]`).
-    -   **In-house zero-`libclang` C11/C23 translator** keeping the entire CoreX toolchain **`< 1 MB`** (`[v0.0.1]`).
+    -   **In-house zero-`libclang` C11/C23 translator** (`[Live]`) keeping the entire CoreX toolchain **`< 1 MB`** (`[v0.0.1]`).
     -   **Implicit `context` (`context.allocator`, `context.rng`, `context.logger`) + `with context.allocator = arena { … }`** (`SE-08`) giving explicit allocator control without threading `allocator: Allocator` through every single function signature (`[Live]`).
 
 ### 4.4 CoreX vs. Go
@@ -122,8 +122,8 @@ CoreX systematically adopts the highest-leverage ergonomic wins from Python, Swi
 -   **How CoreX Wins:**
     -   **Zero GC, deterministic `AutoDrop` / Arena memory, and C-level latency & binary sizes** (`[Live]`).
     -   **Eliminates nil panics (`T?` + `orelse` + `is`) and `if err != nil` walls (`T!E` + postfix `?` + `@derive(From)`)** (`[Live]`).
-    -   **Structured `cx.async.task_group` (`TaskGroup[E]`) with compile-time data-race and escape prevention (`E0309`)** instead of leaked goroutines (`[v0.0.1]`).
-    -   **Zero-overhead native C ABI calls** without `cgo` trampoline penalties (`[v0.0.1]`).
+    -   **Structured `cx.async.task_group` (`TaskGroup[E]`) with compile-time data-race and escape prevention (`E0309`)** instead of leaked goroutines (`[Live]`).
+    -   **Zero-overhead native C ABI calls** without `cgo` trampoline penalties (`[Live]`).
 
 ### 4.5 CoreX vs. Python
 
@@ -324,5 +324,32 @@ pub fn build_toolbar() -> UiList {
         Item(weight: 2);
         Item();
     };
+}
+```
+
+### Showcase 7: `@trusted` C FFI SAST Contracts & Structured `TaskGroup` Concurrency (`[Live]`)
+
+```cx
+use cx.async.{task_group, yield_now};
+use cx.ffi.{CStr, c_int};
+
+extern "C" {
+    // Pentagon proves `len <= buf.len()` (`E0312` / `E0307`) and `CStr` proves NUL termination (`E0308`)!
+    @trusted
+    fn c_hash_named(@null_terminated tag: *u8, @slice_len(len) buf: *u8, len: usize) -> c_int;
+}
+
+pub async fn parallel_digest(label: CStr, payload: &[u8]) -> i32 {
+    return task_group(|grp| {
+        // `spawn_local` runs on the current thread (`CStr` + `&[u8]` safe); dual `&mut` or cross-thread `spawn` fails with `E0309`:
+        let left = grp.spawn_local(own async {
+            yield_now().await;
+            c_hash_named(label.as_ptr(), payload.as_ptr(), payload.len())
+        });
+        let right = grp.spawn_local(own async {
+            c_hash_named(label.as_ptr(), payload.as_ptr(), payload.len())
+        });
+        left.join().await + right.join().await
+    }).await;
 }
 ```

@@ -611,6 +611,22 @@ pub const MirIntrinsicKind = enum(u16) {
     ghost_ctx_region_pop = 42,
     /// Synthesis-mode single-hole string formatting (`extra_args = [val_id, spec_lo_id, spec_hi_id]`, `SE-12`).
     fmt_value = 43,
+    /// Inline `Future[T]` frame construction (`extra_args = [def_val, sym_val, callee_val, args…]`, `DR-08`).
+    async_future_make = 44,
+    /// Structured `TaskGroup` nursery scope entry (`extra_args = []`, `DR-08`).
+    async_task_group_enter = 45,
+    /// Nursery child task spawn (`extra_args = [is_local_val, group_ref_val, task_fut_val, loan_vals…]`, `DR-08`).
+    async_spawn = 46,
+    /// Linear `TaskHandle.join()` future construction (`extra_args = [handle_val]`, `DR-08`).
+    async_join = 47,
+    /// Linear `TaskHandle.cancel()` or `TaskGroup.cancel_all()` (`extra_args = [target_val, opt_query_val]`, `DR-08`).
+    async_cancel = 48,
+    /// Structured `TaskGroup` nursery exit barrier (`extra_args = [group_val]`, `DR-08`).
+    async_task_group_exit = 49,
+    /// Cooperative reactor yield future construction (`extra_args = []`, `DR-08`).
+    async_yield = 50,
+    /// Synchronous root executor entry (`block_on(fut)`, `extra_args = [fut_val]`, `DR-08`).
+    async_block_on = 51,
 
     /// Returns `true` when `operands.lhs` encodes a `PlaceId` rather than `extra_args` or `TypeId`.
     pub inline fn hasPlaceInLhs(self: MirIntrinsicKind) bool {
@@ -667,6 +683,12 @@ pub const MirIntrinsicKind = enum(u16) {
             .ctx_set,
             .ghost_ctx_region_push,
             .ghost_ctx_region_pop,
+            .async_task_group_enter,
+            .async_spawn,
+            .async_join,
+            .async_cancel,
+            .async_task_group_exit,
+            .async_block_on,
             => true,
             else => false,
         };
@@ -683,7 +705,18 @@ pub const MirIntrinsicKind = enum(u16) {
     /// Returns `true` when this intrinsic reads or mutates the implicit `Context` parameter (`V6` / `SE-08`).
     pub inline fn isContextIntrinsic(self: MirIntrinsicKind) bool {
         return switch (self) {
-            .ctx_get, .ctx_set, .ghost_ctx_region_push, .ghost_ctx_region_pop => true,
+            .ctx_get,
+            .ctx_set,
+            .ghost_ctx_region_push,
+            .ghost_ctx_region_pop,
+            .async_task_group_enter,
+            .async_spawn,
+            .async_join,
+            .async_cancel,
+            .async_task_group_exit,
+            .async_yield,
+            .async_block_on,
+            => true,
             else => false,
         };
     }
@@ -749,6 +782,8 @@ pub const TerminatorKind = enum(u8) {
     call = 5,
     /// Deterministic trap (`aux_u8 = MirTrapReason`).
     trap = 6,
+    /// Structured `.await` suspension (`cond_or_val = fut_val_id`, `edge_len = 2`: `[resume_edge, cancel_edge]`).
+    coro_suspend = 7,
 };
 
 /// Trap classification encoded in `MirTerminator.aux_u8` when `kind == .trap`.
@@ -882,6 +917,8 @@ pub const MirCallSite = struct {
     is_abort_on_panic: bool = false,
     /// `true` when calling a C ABI variadic prototype (`extern "C" fn(fixed…, ...)`, `SE-13`).
     is_c_variadic: bool = false,
+    /// `true` when the call expression lies inside an `unsafe { … }` block or `unsafe fn` body.
+    is_unsafe_call: bool = false,
     /// Number of fixed non-variadic parameters when `is_c_variadic` is `true` (`SE-13`).
     fixed_arity: u16 = 0,
     /// Source token of the call expression.
@@ -1081,6 +1118,8 @@ pub const MirBody = struct {
     is_ghost_stripped: bool = false,
     /// `true` when annotated `@noalloc` / `contextless` (`V6` verification).
     is_contextless: bool = false,
+    /// `true` when lowered from an `async fn`, `async |…|`, `async { … }`, `async test`, or `task_group` nursery.
+    is_async: bool = false,
     /// `true` if `MAX_MIR_INSTRUCTIONS`, `MAX_MIR_BLOCKS`, or projection caps overflowed (`E0508`).
     has_overflowed_limits: bool = false,
     /// `true` once Phase 6 `ElaborateDrops` has materialized destructors on this body.
@@ -1180,6 +1219,7 @@ pub const MirBody = struct {
             .has_ghost_instructions = self.has_ghost_instructions,
             .is_ghost_stripped = self.is_ghost_stripped,
             .is_contextless = self.is_contextless,
+            .is_async = self.is_async,
             .has_overflowed_limits = self.has_overflowed_limits,
             .is_sast_elaborated = self.is_sast_elaborated,
         };
@@ -1374,7 +1414,7 @@ pub const MirBody = struct {
         // [3] Rewrite terminator condition/return values and outgoing edge argument slices:
         for (self.blocks.items) |*bb| {
             switch (bb.terminator.kind) {
-                .ret, .cond_br, .switch_int => {
+                .ret, .cond_br, .switch_int, .coro_suspend => {
                     if (bb.terminator.cond_or_val != NONE_U32) {
                         rewriteFn(ctx, &bb.terminator.cond_or_val);
                     }
@@ -1565,11 +1605,13 @@ pub const MirSsaBuilder = struct {
         var builder = MirSsaBuilder.init(allocator, body, var_types, diagnostic_sink);
         errdefer builder.deinit();
 
-        // [1] Detect which blocks are `call` `normal_bb`s (`has_call_ret_param`):
+        // [1] Detect which blocks are `call` `normal_bb`s or `coro_suspend` `resume_bb`s (`has_call_ret_param`):
         var call_cont_blocks: std.AutoHashMapUnmanaged(u32, void) = .empty;
         defer call_cont_blocks.deinit(allocator);
         for (body.blocks.items) |bb| {
-            if (bb.terminator.kind == .call and bb.terminator.edge_len >= 1) {
+            if ((bb.terminator.kind == .call or bb.terminator.kind == .coro_suspend) and
+                bb.terminator.edge_len >= 1)
+            {
                 const normal_edge = body.extra_edges.items[bb.terminator.edge_start];
                 try call_cont_blocks.put(allocator, normal_edge.target_bb.asInt(), {});
             }
@@ -2641,6 +2683,7 @@ const MirLowerer = struct {
             .slice_ty,
             .soa_slice_ty,
             .closure_ty,
+            .future_ty,
             .dyn_trait_ty,
             .type_param,
             .bind_once_group_var,
@@ -2732,7 +2775,7 @@ const MirLowerer = struct {
                     self.scanHirSubtreeForPlaces(HirIndex.fromInt(self.hir_store.extra_data.items[node.data.rhs + 1]));
                 }
             },
-            .hir_field_proj, .hir_bitfield_read, .hir_cast, .hir_return, .hir_yield => {
+            .hir_field_proj, .hir_bitfield_read, .hir_cast, .hir_return, .hir_yield, .hir_await => {
                 self.scanHirSubtreeForPlaces(HirIndex.fromInt(node.data.lhs));
             },
             .hir_index_proj => {
@@ -3810,12 +3853,18 @@ const MirLowerer = struct {
         );
     }
 
+    /// Result of peeling auto-deref reference/pointer layers off a base `PlaceId`.
+    const PeeledPlace = struct {
+        place_id: PlaceId,
+        pointee_ty: TypeId,
+    };
+
     /// Extends `base_place` with `.deref` steps while `running_ty` is a reference or raw pointer.
     fn peelAutoDerefPlace(
         self: *MirLowerer,
         base_place: PlaceId,
         initial_ty: TypeId,
-    ) !struct { place_id: PlaceId, pointee_ty: TypeId } {
+    ) !PeeledPlace {
         var cur_place = base_place;
         var cur_ty = self.pool.unwrapUnderlyingType(initial_ty);
         var depth: usize = 0;
@@ -3898,6 +3947,18 @@ const MirLowerer = struct {
         return self.makePlace(tmp_lid, &.{});
     }
 
+    /// Returns the `SymbolRecord` when `node` is a `.hir_global_ref` targeting an `extern static` item.
+    fn resolveExternStaticGlobalRef(
+        self: *const MirLowerer,
+        node: HirNode,
+    ) ?*const symbol_resolver.SymbolRecord {
+        if (node.tag != .hir_global_ref) return null;
+        const sym_idx = SymbolIndex.fromInt(node.data.rhs);
+        if (sym_idx.isNone() or sym_idx.asInt() >= self.sym_table.symbols.items.len) return null;
+        const sym_rec = self.sym_table.getSymbol(sym_idx);
+        return if (sym_rec.kind == .extern_static_sym) sym_rec else null;
+    }
+
     /// Lowers an addressable `HIR` expression into a `PlaceId` (`DR-13` §3.2).
     fn lowerPlace(self: *MirLowerer, expr_hir: HirIndex) anyerror!PlaceId {
         if (expr_hir.isNone() or expr_hir.asInt() >= self.hir_store.nodes.len) {
@@ -3907,6 +3968,31 @@ const MirLowerer = struct {
         const tok = node.origin_token;
 
         switch (node.tag) {
+            .hir_global_ref => {
+                if (self.resolveExternStaticGlobalRef(node)) |sym_rec| {
+                    const raw_ptr_ty = try self.pool.internRawPtr(node.type_id, sym_rec.flags.is_mut);
+                    const addr_val = try self.ssa.emitInst(self.cur_bb, .{
+                        .op = .fn_addr,
+                        .flags = .{ .is_synthetic = true, .is_unsafe = node.flags.is_unsafe },
+                        .type_id = raw_ptr_ty,
+                        .operands = .{ .lhs = node.data.lhs, .rhs = node.data.rhs },
+                    }, tok);
+                    const ptr_slot = try self.allocTempLocal(raw_ptr_ty, tok, true, false);
+                    const ptr_place = try self.makePlace(ptr_slot, &.{});
+                    try self.markStorageInit(ptr_slot, tok);
+                    _ = try self.ssa.emitInst(self.cur_bb, .{
+                        .op = .place_store,
+                        .flags = .{ .has_side_effects = true, .is_synthetic = true },
+                        .type_id = .unit_ty,
+                        .operands = .{ .lhs = ptr_place.asInt(), .rhs = addr_val.asInt() },
+                    }, tok);
+                    const deref_proj = [1]MirProjection{.{ .kind = .deref, .payload = 0 }};
+                    if (!self.isValidPlaceExtension(ptr_place, &deref_proj)) {
+                        return self.allocErrorFallbackPlace(node.type_id, tok);
+                    }
+                    return self.extendPlace(ptr_place, &deref_proj);
+                }
+            },
             .hir_block => {
                 const stmts = self.hir_store.getLenPrefixedExtra(node.data.lhs);
                 const saved_mut = self.is_mut_place_context;
@@ -3997,10 +4083,14 @@ const MirLowerer = struct {
                 const base_hir = HirIndex.fromInt(node.data.lhs);
                 const idx_hir = HirIndex.fromInt(node.data.rhs);
                 const raw_base = try self.lowerPlace(base_hir);
-                const peeled = try self.peelAutoDerefPlace(
-                    raw_base,
-                    self.hir_store.getNode(base_hir).type_id,
-                );
+                const base_hir_ty = self.pool.unwrapUnderlyingType(self.hir_store.getNode(base_hir).type_id);
+                const peeled: PeeledPlace = if (!base_hir_ty.isError() and self.pool.getNode(base_hir_ty).tag == .raw_ptr_ty)
+                    .{ .place_id = raw_base, .pointee_ty = base_hir_ty }
+                else
+                    try self.peelAutoDerefPlace(
+                        raw_base,
+                        self.hir_store.getNode(base_hir).type_id,
+                    );
                 const saved_mut = self.is_mut_place_context;
                 self.is_mut_place_context = false;
                 const idx_val = try self.lowerRValue(idx_hir);
@@ -4011,13 +4101,16 @@ const MirLowerer = struct {
                 if ((!unwrapped_base.isError() and unwrapped_base != .str_ty and
                     base_tag != .array_ty and base_tag != .slice_ty and
                     base_tag != .soa_array_ty and base_tag != .soa_slice_ty and
+                    base_tag != .raw_ptr_ty and
                     unionSliceElemType(self.pool, unwrapped_base) == null) or
                     !self.isValidPlaceExtension(peeled.place_id, &idx_proj))
                 {
                     return self.allocErrorFallbackPlace(node.type_id, tok);
                 }
-                const is_soa_base = base_tag == .soa_array_ty or base_tag == .soa_slice_ty;
-                try self.emitIndexBoundsCheck(peeled.place_id, unwrapped_base, idx_val, is_soa_base, tok);
+                if (base_tag != .raw_ptr_ty) {
+                    const is_soa_base = base_tag == .soa_array_ty or base_tag == .soa_slice_ty;
+                    try self.emitIndexBoundsCheck(peeled.place_id, unwrapped_base, idx_val, is_soa_base, tok);
+                }
                 return self.extendPlace(peeled.place_id, &idx_proj);
             },
             .hir_soa_field_ptr => {
@@ -4830,7 +4923,11 @@ const MirLowerer = struct {
                 },
                 .index => {
                     active_downcast = null;
-                    if (cur_ty == .str_ty or ty_node.tag == .slice_ty) return true;
+                    if (cur_ty == .str_ty or ty_node.tag == .slice_ty or
+                        (ty_node.tag == .raw_ptr_ty and ty_node.rhs == 0))
+                    {
+                        return true;
+                    }
                     cur_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(ty_node.lhs));
                 },
                 .soa_elem => {
@@ -4904,7 +5001,13 @@ const MirLowerer = struct {
                 const base_node = self.hir_store.getNode(base_hir);
                 const peeled_base_ty = self.unwrapAllRefsType(base_node.type_id);
                 const base_ty_tag = self.pool.getNode(peeled_base_ty).tag;
-                if ((base_ty_tag != .soa_slice_ty and base_ty_tag != .soa_array_ty) and
+                const unwrapped_dst = self.pool.unwrapUnderlyingType(node.type_id);
+                const is_synthetic_slice_ptr = node.flags.is_synthetic and node.data.rhs == 0 and
+                    (peeled_base_ty == .str_ty or base_ty_tag == .slice_ty or
+                        unionSliceElemType(self.pool, peeled_base_ty) != null) and
+                    !unwrapped_dst.isError() and self.pool.getNode(unwrapped_dst).tag == .raw_ptr_ty;
+                if (!is_synthetic_slice_ptr and
+                    (base_ty_tag != .soa_slice_ty and base_ty_tag != .soa_array_ty) and
                     (base_node.flags.category != .rvalue or self.isPtrOrRefType(base_node.type_id) or
                         node.data.rhs == hir.FIELD_ORDINAL_LEN))
                 {
@@ -4915,6 +5018,12 @@ const MirLowerer = struct {
             .hir_index_proj, .hir_soa_field_ptr => {
                 const elem_place = try self.lowerPlace(expr_hir);
                 return self.loadPlaceValue(elem_place, node.type_id, node.origin_token, false);
+            },
+            .hir_global_ref => {
+                if (self.resolveExternStaticGlobalRef(node) != null) {
+                    const ext_place = try self.lowerPlace(expr_hir);
+                    return self.loadPlaceValue(ext_place, node.type_id, node.origin_token, false);
+                }
             },
             .hir_unary_op => {
                 const uop: hir.HirUnaryOp = @fromBackingInt(@intCast(@as(u8, @truncate(node.data.lhs))));
@@ -5055,6 +5164,10 @@ const MirLowerer = struct {
                 return self.ssa.readVariable(lid.asInt(), self.cur_bb);
             },
             .hir_global_ref => {
+                if (self.resolveExternStaticGlobalRef(node) != null) {
+                    const ext_place = try self.lowerPlace(expr_hir);
+                    return self.loadPlaceValue(ext_place, node.type_id, tok, true);
+                }
                 return self.ssa.emitInst(self.cur_bb, .{
                     .op = .fn_addr,
                     .type_id = node.type_id,
@@ -5725,8 +5838,65 @@ const MirLowerer = struct {
                 try self.emitFinalReturnTerminator(yielded_val, tok);
                 return yielded_val;
             },
+            .hir_await => return self.lowerAwaitNode(expr_hir),
             else => return self.ssa.emitDefaultScalarInBlock(.fromInt(0), node.type_id),
         }
+    }
+
+    /// Lowers `hir_await` into `TerminatorKind.coro_suspend -> [resume_bb(%ready_val), cancel_bb]` (`DR-08`).
+    fn lowerAwaitNode(self: *MirLowerer, await_hir: HirIndex) anyerror!MirValueId {
+        const node = self.hir_store.getNode(await_hir);
+        const tok = node.origin_token;
+        const fut_val = try self.lowerRValue(HirIndex.fromInt(node.data.lhs));
+        if (self.cur_bb.isNone() or self.ssa.isBlockTerminated(self.cur_bb)) {
+            return self.ssa.emitDefaultScalarInBlock(.fromInt(0), node.type_id);
+        }
+
+        const suspend_bb = self.cur_bb;
+        const resume_bb = try self.ssa.createBlock(false, false);
+        const cancel_bb = try self.ssa.createBlock(false, true);
+        const ready_val = try self.ssa.addExplicitBlockParam(resume_bb, node.type_id, tok, true);
+
+        const resume_edge = try self.ssa.addOutgoingEdge(
+            suspend_bb,
+            resume_bb,
+            &.{},
+            std.math.maxInt(u16),
+        );
+        _ = try self.ssa.addOutgoingEdge(
+            suspend_bb,
+            cancel_bb,
+            &.{},
+            std.math.maxInt(u16),
+        );
+        self.ssa.setTerminator(suspend_bb, .{
+            .kind = .coro_suspend,
+            .edge_len = 2,
+            .cond_or_val = fut_val.asInt(),
+            .edge_start = resume_edge.asInt(),
+        });
+        try self.ssa.sealBlock(resume_bb);
+        try self.ssa.sealBlock(cancel_bb);
+
+        // Populate `cancel_bb`: close active mid-expression Ghost borrows, run LIFO `defer`s + `ghost_storage_deinit`s:
+        self.cur_bb = cancel_bb;
+        try self.emitBorrowEndsAboveDepth(0, tok);
+        const saved_borrows = try self.allocator.dupe(MirValueId, self.active_expr_borrows.items);
+        defer if (saved_borrows.len > 0) self.allocator.free(saved_borrows);
+        self.active_expr_borrows.clearRetainingCapacity();
+
+        try self.emitInlineNormalCleanupsAbove(0, tok);
+        if (!self.cur_bb.isNone() and !self.ssa.isBlockTerminated(self.cur_bb)) {
+            try self.emitBorrowEndsAboveDepth(0, tok);
+            const cancel_ret_val = try self.ssa.emitDefaultScalarInBlock(self.cur_bb, self.body.ret_ty);
+            try self.emitFinalReturnTerminator(cancel_ret_val, tok);
+        }
+
+        self.active_expr_borrows.clearRetainingCapacity();
+        try self.active_expr_borrows.appendSlice(self.allocator, saved_borrows);
+
+        self.cur_bb = resume_bb;
+        return ready_val;
     }
 
     /// Pending call-scoped Ghost borrow opened right before `.call` (`CRIT-02` + `mir_opt` stack top).
@@ -5887,6 +6057,7 @@ const MirLowerer = struct {
             .ret_ty = call_node.type_id,
             .is_callee_contextless = is_callee_contextless,
             .is_c_variadic = is_c_variadic,
+            .is_unsafe_call = call_node.flags.is_unsafe,
             .fixed_arity = fixed_arity,
             .origin_token = tok,
         });
@@ -5976,16 +6147,49 @@ const MirLowerer = struct {
             0;
         const val_start = extra_base + 2 + type_len;
 
+        const is_internal_intr = (node.data.lhs & hir.HIR_INTERNAL_INTRINSIC_FLAG) != 0;
+        const is_async_future_make = is_internal_intr and
+            @as(hir.HirInternalIntrinsic, @fromBackingInt(@intCast(@as(u8, @truncate(node.data.lhs))))) == .async_future_make;
+
         var lowered_vals: std.ArrayListUnmanaged(u32) = .empty;
         defer lowered_vals.deinit(self.allocator);
         if (val_start + val_len <= self.hir_store.extra_data.items.len) {
             for (self.hir_store.extra_data.items[val_start .. val_start + val_len]) |raw_arg| {
-                const arg_val = try self.lowerRValue(HirIndex.fromInt(raw_arg));
+                const arg_hir = HirIndex.fromInt(raw_arg);
+                if (is_async_future_make and !arg_hir.isNone() and
+                    self.hir_store.getNode(arg_hir).tag == .hir_project_arg)
+                {
+                    const proj_node = self.hir_store.getNode(arg_hir);
+                    const mode: ParamMode = @fromBackingInt(@intCast(@as(u2, @truncate(proj_node.data.lhs))));
+                    if (mode == .inout_mode or mode == .set_mode) {
+                        const inner_hir = HirIndex.fromInt(proj_node.data.rhs);
+                        const arg_place = try self.lowerMutPlace(inner_hir);
+                        const ghost_op: MirOp = if (mode == .inout_mode) .ghost_access_inout else .ghost_access_set;
+                        const borrow_tok = try self.emitGhostOpen(ghost_op, arg_place, .addr_borrow, tok);
+                        try self.active_expr_borrows.append(self.allocator, borrow_tok);
+                        const mut_ref_ty = try self.pool.internRef(self.hir_store.getNode(inner_hir).type_id, true);
+                        const addr_val = try self.ssa.emitInst(self.cur_bb, .{
+                            .op = .place_addr,
+                            .flags = .{ .is_synthetic = true },
+                            .type_id = mut_ref_ty,
+                            .operands = .{ .lhs = arg_place.asInt(), .rhs = 0 },
+                        }, tok);
+                        if (mode == .set_mode) {
+                            const place_rec = self.body.places.items[arg_place.asInt()];
+                            if (place_rec.proj_len == 0) {
+                                try self.markStorageInit(LocalId.fromInt(place_rec.base), tok);
+                            }
+                        }
+                        try lowered_vals.append(self.allocator, addr_val.asInt());
+                        continue;
+                    }
+                }
+                const arg_val = try self.lowerRValue(arg_hir);
                 try lowered_vals.append(self.allocator, arg_val.asInt());
             }
         }
 
-        if ((node.data.lhs & hir.HIR_INTERNAL_INTRINSIC_FLAG) != 0) {
+        if (is_internal_intr) {
             const internal_kind: hir.HirInternalIntrinsic = @fromBackingInt(
                 @intCast(@as(u8, @truncate(node.data.lhs))),
             );
@@ -6006,11 +6210,68 @@ const MirLowerer = struct {
                     .type_id = node.type_id,
                     .operands = .{ .lhs = args_start, .rhs = @intCast(lowered_vals.items.len) },
                 }, tok),
+                .async_future_make => self.ssa.emitInst(self.cur_bb, .{
+                    .op = .intrinsic_op,
+                    .flags = .{ .is_synthetic = true, .is_unsafe = node.flags.is_unsafe },
+                    .aux_u16 = @backingInt(MirIntrinsicKind.async_future_make),
+                    .type_id = node.type_id,
+                    .operands = .{ .lhs = args_start, .rhs = @intCast(lowered_vals.items.len) },
+                }, tok),
+                .async_task_group_enter => self.ssa.emitInst(self.cur_bb, .{
+                    .op = .intrinsic_op,
+                    .flags = .{ .has_side_effects = true, .is_synthetic = true },
+                    .aux_u16 = @backingInt(MirIntrinsicKind.async_task_group_enter),
+                    .type_id = node.type_id,
+                    .operands = .{ .lhs = args_start, .rhs = @intCast(lowered_vals.items.len) },
+                }, tok),
+                .async_spawn => self.ssa.emitInst(self.cur_bb, .{
+                    .op = .intrinsic_op,
+                    .flags = .{ .has_side_effects = true, .is_synthetic = true },
+                    .aux_u16 = @backingInt(MirIntrinsicKind.async_spawn),
+                    .type_id = node.type_id,
+                    .operands = .{ .lhs = args_start, .rhs = @intCast(lowered_vals.items.len) },
+                }, tok),
+                .async_join => self.ssa.emitInst(self.cur_bb, .{
+                    .op = .intrinsic_op,
+                    .flags = .{ .has_side_effects = true, .is_synthetic = true },
+                    .aux_u16 = @backingInt(MirIntrinsicKind.async_join),
+                    .type_id = node.type_id,
+                    .operands = .{ .lhs = args_start, .rhs = @intCast(lowered_vals.items.len) },
+                }, tok),
+                .async_cancel => self.ssa.emitInst(self.cur_bb, .{
+                    .op = .intrinsic_op,
+                    .flags = .{ .has_side_effects = true, .is_synthetic = true },
+                    .aux_u16 = @backingInt(MirIntrinsicKind.async_cancel),
+                    .type_id = node.type_id,
+                    .operands = .{ .lhs = args_start, .rhs = @intCast(lowered_vals.items.len) },
+                }, tok),
+                .async_task_group_exit => self.ssa.emitInst(self.cur_bb, .{
+                    .op = .intrinsic_op,
+                    .flags = .{ .has_side_effects = true, .is_synthetic = true },
+                    .aux_u16 = @backingInt(MirIntrinsicKind.async_task_group_exit),
+                    .type_id = node.type_id,
+                    .operands = .{ .lhs = args_start, .rhs = @intCast(lowered_vals.items.len) },
+                }, tok),
+                .async_yield => self.ssa.emitInst(self.cur_bb, .{
+                    .op = .intrinsic_op,
+                    .flags = .{ .is_synthetic = true },
+                    .aux_u16 = @backingInt(MirIntrinsicKind.async_yield),
+                    .type_id = node.type_id,
+                    .operands = .{ .lhs = args_start, .rhs = @intCast(lowered_vals.items.len) },
+                }, tok),
+                .async_block_on => self.ssa.emitInst(self.cur_bb, .{
+                    .op = .intrinsic_op,
+                    .flags = .{ .has_side_effects = true, .is_synthetic = true },
+                    .aux_u16 = @backingInt(MirIntrinsicKind.async_block_on),
+                    .type_id = node.type_id,
+                    .operands = .{ .lhs = args_start, .rhs = @intCast(lowered_vals.items.len) },
+                }, tok),
             };
         }
 
         const intr_kind: type_system.IntrinsicKind = @fromBackingInt(@intCast(@as(u8, @truncate(node.data.lhs))));
         switch (intr_kind) {
+            .c_import => return self.emitUnitVal(tok),
             .compile_error => {
                 const args_start: u32 = @intCast(self.body.extra_args.items.len);
                 try self.body.extra_args.appendSlice(self.body.allocator, lowered_vals.items);
@@ -10260,7 +10521,8 @@ const MirLowerer = struct {
         self.body.ret_ty = fn_meta.ret_ty;
         self.body.param_count = fn_meta.capture_len + fn_meta.param_len;
         self.body.target_layout = self.hir_store.target_layout;
-        self.body.is_contextless = fn_meta.is_contextless;
+        self.body.is_async = fn_meta.is_async;
+        self.body.is_contextless = fn_meta.is_contextless and !fn_meta.is_async;
         if (fn_meta.is_subscript) {
             for (self.hir_store.functions.items, 0..) |cand_meta, cand_idx| {
                 if (cand_meta.body_hir == fn_meta.body_hir and
@@ -10642,7 +10904,7 @@ pub fn verifyMirBody(
         const is_arity_valid = switch (term.kind) {
             .unreachable_term, .ret, .trap => term.edge_len == 0,
             .br, .call => term.edge_len == 1,
-            .cond_br => term.edge_len == 2,
+            .cond_br, .coro_suspend => term.edge_len == 2,
             .switch_int => term.edge_len >= 1,
         };
         if (!is_arity_valid) return error.V2InvalidTerminatorOrEdge;
@@ -10666,6 +10928,18 @@ pub fn verifyMirBody(
                 // Call Continuation Split-Edge Invariant (`[CRITICAL-05]`):
                 if (dst_bb.pred_len != 1 or dst_bb.paramLen() != 1 or edge.args_len != 0) {
                     return error.V2CallContinuationSplitViolation;
+                }
+            } else if (term.kind == .coro_suspend) {
+                if (off == 0) {
+                    // `resume_bb` receives `%ready_val` via Split-Edge (`pred_len == 1, paramLen() == 1, args_len == 0`):
+                    if (dst_bb.pred_len != 1 or dst_bb.paramLen() != 1 or edge.args_len != 0) {
+                        return error.V2CallContinuationSplitViolation;
+                    }
+                } else {
+                    // `cancel_bb` takes 0 arguments and has `suspend_bb` as sole predecessor:
+                    if (dst_bb.pred_len != 1 or dst_bb.paramLen() != 0 or edge.args_len != 0) {
+                        return error.V2EdgeArgCountMismatch;
+                    }
                 }
             } else {
                 if (edge.args_len != dst_bb.paramLen()) {
@@ -10880,7 +11154,7 @@ pub fn verifyMirBody(
                     try v1_ctx.checkVal(term.cond_or_val, bb_id, term_rank);
                 }
             },
-            .cond_br, .switch_int => {
+            .cond_br, .switch_int, .coro_suspend => {
                 try v1_ctx.checkVal(term.cond_or_val, bb_id, term_rank);
             },
             .call => {
@@ -11016,7 +11290,8 @@ fn isValidProjectionChain(
                     continue;
                 }
                 if (node.tag != .array_ty and node.tag != .slice_ty and
-                    node.tag != .soa_array_ty and node.tag != .soa_slice_ty)
+                    node.tag != .soa_array_ty and node.tag != .soa_slice_ty and
+                    node.tag != .raw_ptr_ty)
                 {
                     return false;
                 }
@@ -11648,6 +11923,9 @@ fn verifyV6ContextAndClosureEscape(
                 }
             }
             const term = body.blocks.items[bb_idx].terminator;
+            if (term.kind == .coro_suspend) {
+                return error.V6ContextlessCallViolation;
+            }
             if (term.kind == .call) {
                 const cs = body.calls.items[term.cond_or_val];
                 if (!cs.is_callee_contextless) {
@@ -12309,6 +12587,7 @@ pub fn renderMir(
         allocator,
         std.fmt.bufPrint(&num_buf, "(params: {d})", .{body.param_count}) catch "",
     );
+    if (body.is_async) try out.appendSlice(allocator, " [async]");
     if (body.is_contextless) try out.appendSlice(allocator, " [contextless]");
     if (body.is_ghost_stripped) try out.appendSlice(allocator, " [ghost_stripped]");
     try out.appendSlice(allocator, " {\n");

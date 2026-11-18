@@ -826,6 +826,10 @@ pub const CstNodeKind = enum(u8) {
     invalid_parse_start,
     /// Complete bracketed syntax error recovery subtree (`DR-12` Section 1.4).
     invalid_parse_subtree,
+    /// Foreign ABI declaration block (`extern ["C"] { fn …; static [mut] …; const …; }`).
+    extern_block_item,
+    /// Foreign static symbol declaration (`[extern ["C"]] static [mut] name: Type;`).
+    extern_static_item,
 
     /// Alias for `.file_end` representing the root source file CST node.
     pub const source_file: CstNodeKind = .file_end;
@@ -1164,6 +1168,14 @@ pub const AstTag = enum(u8) {
     incomplete_member_access,
     /// Incomplete call (`callee(arg1, ` at cursor) preserved for IDE signature help.
     incomplete_call,
+    /// Foreign ABI block (`main_token = kw_extern`; `lhs` = `ExtraIndex` of 4-word `ExternBlockHeader`
+    /// `{ abi_tok, flags, attr_start, attr_len }` (`abi_tok == TokenIndex.none` when omitted, defaulting
+    /// to `"C"`) followed at `lhs + 4` by member `NodeIndex` items (`fn_decl`, `extern_static_decl`,
+    /// `const_decl`, `item_hole`); `rhs` = `.extra` total payload word count `4 + items_len`).
+    extern_block_decl,
+    /// Foreign static declaration (`main_token = name_tok`; `lhs` = declared `Type` `NodeIndex`;
+    /// `rhs` = `ExtraIndex` of 5-word `ExternStaticExtra` `{ static_tok, abi_tok, flags, attr_start, attr_len }`).
+    extern_static_decl,
 
     /// Alias for `.local_var_decl`.
     pub const var_decl: AstTag = .local_var_decl;
@@ -1203,7 +1215,74 @@ pub const AstNode = struct {
     rhs: PackedOperand = .{},
 };
 
+/// Four-tier visibility encoding stored in `ExternBlockFlags` and `ExternStaticFlags` (`ADR-22E`).
+pub const ExternVisibility = enum(u2) {
+    /// Visible only within the defining module and its descendant submodules (`0`).
+    private = 0,
+    /// Visible within the immediate parent module and its descendants (`pub(super)`, `1`).
+    pub_super = 1,
+    /// Visible anywhere inside the defining package (`pub(pkg)`, `2`).
+    pub_pkg = 2,
+    /// Exported publicly across package boundaries (`pub`, `3`).
+    public = 3,
+};
+
+/// Bit-packed 32-bit `flags` word stored in `ExternBlockHeader` (`AstTag.extern_block_decl`).
+pub const ExternBlockFlags = packed struct(u32) {
+    /// Attached outer visibility level on the `extern` block.
+    visibility: ExternVisibility = .private,
+    /// `true` if the `extern` block was explicitly prefixed with `unsafe`.
+    is_unsafe: bool = false,
+    /// Reserved zero padding (`0`).
+    reserved: u29 = 0,
+};
+
+/// Decoded 4-word header stored at `lhs` (`extra_data[lhs .. lhs + 4]`) of `AstTag.extern_block_decl`.
+pub const ExternBlockHeader = struct {
+    /// Optional ABI string literal token (`TokenIndex.none` when omitted, defaulting to `"C"`).
+    abi_tok: TokenIndex = .none,
+    /// Visibility and `unsafe` qualifier flags on the enclosing `extern` block.
+    flags: ExternBlockFlags = .{},
+    /// Starting `CstNodeIndex` of attached outer `.attribute` nodes (`CstNodeIndex.none.asInt()` when `attr_len == 0`).
+    attr_start: u32 = std.math.maxInt(u32),
+    /// Count of attached outer `.attribute` CST nodes preceding the `extern` block.
+    attr_len: u32 = 0,
+};
+
+/// Bit-packed 32-bit `flags` word stored in `ExternStaticExtra` (`AstTag.extern_static_decl`).
+pub const ExternStaticFlags = packed struct(u32) {
+    /// Visibility modifier attached directly to the `static` item.
+    visibility: ExternVisibility = .private,
+    /// `true` when declared as `static mut`.
+    is_mut: bool = false,
+    /// `true` when declared with `extern` (directly or inherited from an enclosing `extern` block).
+    has_extern: bool = true,
+    /// `true` when prefixed with `unsafe` (directly or inherited from an `unsafe extern` block).
+    is_unsafe: bool = false,
+    /// Reserved zero padding (`0`).
+    reserved: u27 = 0,
+};
+
+/// Decoded 5-word payload stored at `rhs` (`extra_data[rhs .. rhs + 5]`) of `AstTag.extern_static_decl`.
+pub const ExternStaticExtra = struct {
+    /// Contextual `static` identifier token index.
+    static_tok: TokenIndex,
+    /// Optional ABI string literal token (`TokenIndex.none` when omitted, defaulting to `"C"`).
+    abi_tok: TokenIndex = .none,
+    /// Bit-packed visibility, mutability (`is_mut`), `has_extern`, and `is_unsafe` flags.
+    flags: ExternStaticFlags = .{},
+    /// Starting `CstNodeIndex` of attached `.attribute` nodes (`CstNodeIndex.none.asInt()` when `attr_len == 0`).
+    attr_start: u32 = std.math.maxInt(u32),
+    /// Count of attached `.attribute` CST nodes preceding the `static` item.
+    attr_len: u32 = 0,
+};
+
 // --------------------------------------- CONSTS ----------------------------------------
+
+/// Number of leading `u32` header words before member `NodeIndex` items in `AstTag.extern_block_decl`.
+pub const EXTERN_BLOCK_HEADER_WORDS: usize = 4;
+/// Number of `u32` payload words stored at `rhs` in `AstTag.extern_static_decl`.
+pub const EXTERN_STATIC_EXTRA_WORDS: usize = 5;
 
 /// Maximum number of lexical tokens allowed in a single source file (`4,194,304`, `E0104`).
 pub const MAX_TOKENS_PER_FILE: usize = 4 * 1024 * 1024;
@@ -1278,8 +1357,8 @@ comptime {
     std.debug.assert(@backingInt(TokenKind.colon_eq) == 80);
     std.debug.assert(@backingInt(TokenKind.dollar) == 81);
     std.debug.assert(@backingInt(TokenKind.eof) == 119);
-    std.debug.assert(@typeInfo(CstNodeKind).@"enum".field_names.len == 151);
-    std.debug.assert(@typeInfo(AstTag).@"enum".field_names.len == 94);
+    std.debug.assert(@typeInfo(CstNodeKind).@"enum".field_names.len == 153);
+    std.debug.assert(@typeInfo(AstTag).@"enum".field_names.len == 96);
     std.debug.assert(@sizeOf(TokenKind) == 1);
     std.debug.assert(@sizeOf(TokenFlags) == 1);
     std.debug.assert(@sizeOf(PackedTriviaSpan) == 4);
@@ -1646,6 +1725,45 @@ pub const AstArena = struct {
     pub inline fn countNodes(self: *const AstArena) usize {
         return self.nodes.len;
     }
+
+    /// Decodes the 4-word `ExternBlockHeader` stored on an `AstTag.extern_block_decl` node.
+    pub inline fn getExternBlockHeader(self: *const AstArena, node_id: NodeIndex) ExternBlockHeader {
+        const node = self.getNode(node_id);
+        std.debug.assert(node.tag == .extern_block_decl);
+        if (node.lhs.tag != .extra) return .{};
+        const words = self.getExtraSlice(ExtraIndex.fromInt(node.lhs.payload), EXTERN_BLOCK_HEADER_WORDS);
+        return .{
+            .abi_tok = TokenIndex.fromInt(words[0]),
+            .flags = @bitCast(words[1]),
+            .attr_start = words[2],
+            .attr_len = words[3],
+        };
+    }
+
+    /// Returns the contiguous `[]const u32` member `NodeIndex` slice of an `AstTag.extern_block_decl` node.
+    pub inline fn getExternBlockItems(self: *const AstArena, node_id: NodeIndex) []const u32 {
+        const node = self.getNode(node_id);
+        std.debug.assert(node.tag == .extern_block_decl);
+        if (node.lhs.tag != .extra or node.rhs.tag != .extra) return &.{};
+        if (node.rhs.payload <= EXTERN_BLOCK_HEADER_WORDS) return &.{};
+        const items_start: usize = @as(usize, node.lhs.payload) + EXTERN_BLOCK_HEADER_WORDS;
+        const items_len: usize = @as(usize, node.rhs.payload) - EXTERN_BLOCK_HEADER_WORDS;
+        return self.extra_data.items[items_start .. items_start + items_len];
+    }
+
+    /// Decodes the 5-word `ExternStaticExtra` payload stored on an `AstTag.extern_static_decl` node.
+    pub inline fn getExternStaticExtra(self: *const AstArena, node_id: NodeIndex) ExternStaticExtra {
+        const node = self.getNode(node_id);
+        std.debug.assert(node.tag == .extern_static_decl and node.rhs.tag == .extra);
+        const words = self.getExtraSlice(ExtraIndex.fromInt(node.rhs.payload), EXTERN_STATIC_EXTRA_WORDS);
+        return .{
+            .static_tok = TokenIndex.fromInt(words[0]),
+            .abi_tok = TokenIndex.fromInt(words[1]),
+            .flags = @bitCast(words[2]),
+            .attr_start = words[3],
+            .attr_len = words[4],
+        };
+    }
 };
 
 /// Canonical alias for `AstArena` (`DR-01` Section 4.1).
@@ -1683,6 +1801,10 @@ pub fn computeAstNodeExtraEnds(allocator: std.mem.Allocator, ast: *const AstAren
             if (node.lhs.payload < extra_len) has_slice_start[node.lhs.payload] = true;
         } else if (node.rhs.tag == .extra) {
             if (node.rhs.payload < extra_len) has_slice_start[node.rhs.payload] = true;
+            if (node.tag == .extern_static_decl) {
+                const static_end: usize = @as(usize, node.rhs.payload) + EXTERN_STATIC_EXTRA_WORDS;
+                if (static_end < extra_len) has_slice_start[static_end] = true;
+            }
         }
     }
 
@@ -1955,4 +2077,69 @@ test "test_dr21_dr22_token_kind_helpers_and_symbol_text_exhaustiveness" {
             try std.testing.expect(maybe_text == null);
         }
     }
+}
+
+test "test_extern_block_and_extern_static_ast_extra_payload_helpers" {
+    var ast_arena = AstArena.init(std.testing.allocator);
+    defer ast_arena.deinit();
+
+    const ty_node = try ast_arena.appendNode(.{
+        .tag = .prim_type,
+        .main_token = TokenIndex.fromInt(5),
+    });
+    const static_words = [_]u32{
+        TokenIndex.fromInt(3).asInt(),
+        TokenIndex.fromInt(1).asInt(),
+        @bitCast(ExternStaticFlags{
+            .visibility = .public,
+            .is_mut = true,
+            .has_extern = true,
+            .is_unsafe = false,
+        }),
+        2,
+        1,
+    };
+    const static_extra = try ast_arena.appendExtraSlice(&static_words);
+    const static_node = try ast_arena.appendNode(.{
+        .tag = .extern_static_decl,
+        .main_token = TokenIndex.fromInt(4),
+        .lhs = PackedOperand.initNode(ty_node),
+        .rhs = PackedOperand.initExtra(static_extra),
+    });
+
+    const block_words = [_]u32{
+        TokenIndex.fromInt(1).asInt(),
+        @bitCast(ExternBlockFlags{ .visibility = .pub_pkg, .is_unsafe = false }),
+        0,
+        2,
+        static_node.asInt(),
+    };
+    const block_extra = try ast_arena.appendExtraSlice(&block_words);
+    const block_node = try ast_arena.appendNode(.{
+        .tag = .extern_block_decl,
+        .main_token = TokenIndex.fromInt(0),
+        .lhs = PackedOperand.initExtra(block_extra),
+        .rhs = .{ .tag = .extra, .payload = block_words.len },
+    });
+
+    const decoded_static = ast_arena.getExternStaticExtra(static_node);
+    try std.testing.expectEqual(TokenIndex.fromInt(3), decoded_static.static_tok);
+    try std.testing.expectEqual(TokenIndex.fromInt(1), decoded_static.abi_tok);
+    try std.testing.expectEqual(ExternVisibility.public, decoded_static.flags.visibility);
+    try std.testing.expect(decoded_static.flags.is_mut);
+    try std.testing.expect(decoded_static.flags.has_extern);
+    try std.testing.expectEqual(@as(u32, 2), decoded_static.attr_start);
+    try std.testing.expectEqual(@as(u32, 1), decoded_static.attr_len);
+
+    const decoded_header = ast_arena.getExternBlockHeader(block_node);
+    try std.testing.expectEqual(TokenIndex.fromInt(1), decoded_header.abi_tok);
+    try std.testing.expectEqual(ExternVisibility.pub_pkg, decoded_header.flags.visibility);
+    try std.testing.expectEqual(@as(u32, 0), decoded_header.attr_start);
+    try std.testing.expectEqual(@as(u32, 2), decoded_header.attr_len);
+    try std.testing.expectEqualSlices(u32, &.{static_node.asInt()}, ast_arena.getExternBlockItems(block_node));
+
+    const extra_ends = try computeAstNodeExtraEnds(std.testing.allocator, &ast_arena);
+    defer std.testing.allocator.free(extra_ends);
+    try std.testing.expectEqual(@as(u32, 5), extra_ends[static_node.asInt()]);
+    try std.testing.expectEqual(@as(u32, 10), extra_ends[block_node.asInt()]);
 }

@@ -1,9 +1,12 @@
-//! CoreX Stage-0 LLVM 20–23 C99 Bridge Header (`corex_llvm.h`)
+//! CoreX Stage-0 LLVM 20–23 & LLD C99 Bridge Header (`corex_llvm.h`)
 //!
 //! Exposes a strictly typed, zero-`void*` ISO C99 FFI boundary (`AGENTS.md` Section 1,
-//! `DR-09` Section 1.2, `[CRITICAL-09]`) between `stage0/src/codegen_llvm.zig` and the
-//! optional `-Dllvm-prefix` C++20 static LLVM `PassBuilder` + `SanitizerCoveragePass`
-//! object emitter (`stage0/src/corex_llvm.cpp`).
+//! `DR-09` Section 1.2, `DR-10` Section 1.4, `[CRITICAL-09]`) between `stage0/src/codegen_llvm.zig`,
+//! `stage0/src/codegen_link.zig`, and the optional `-Dllvm-prefix` C++20 static LLVM/LLD bridge
+//! (`stage0/src/corex_llvm.cpp`).
+//!
+//! All status codes use deterministic 32-bit `CxLlvmResult` (`CxLlvmStatus`) discriminants, and
+//! every diagnostic output buffer is explicitly capacity-bounded and NUL-terminated.
 
 #ifndef COREX_STAGE0_LLVM_BRIDGE_H
 #define COREX_STAGE0_LLVM_BRIDGE_H
@@ -32,14 +35,29 @@ typedef enum CxLlvmOptLevel {
     CX_LLVM_OPT_OZ = 3
 } CxLlvmOptLevel;
 
-/// Deterministic 32-bit status code returned by `cx_llvm_compile_ir_to_object`.
+/// Embedded `lld` target object-format driver flavor (`DR-10` Section 1.4).
+typedef enum CxLldFlavor {
+    /// Linux / Unix ELF64 linker driver (`ld.lld`).
+    CX_LLD_ELF = 0,
+    /// Apple Darwin Mach-O 64-bit linker driver (`ld64.lld`).
+    CX_LLD_MACHO = 1,
+    /// Microsoft Windows PE/COFF linker driver (`lld-link`).
+    CX_LLD_COFF = 2,
+    /// WebAssembly module linker driver (`wasm-ld`).
+    CX_LLD_WASM = 3
+} CxLldFlavor;
+
+/// Deterministic 32-bit status code returned by `corex_llvm` bridge entrypoints.
 typedef int32_t CxLlvmStatus;
 
-/// Status discriminant tags stored inside `CxLlvmStatus`.
+/// Canonical result alias matching Phase 8 linker/archive bridge specifications.
+typedef CxLlvmStatus CxLlvmResult;
+
+/// Status discriminant tags stored inside `CxLlvmStatus` / `CxLlvmResult`.
 enum CxLlvmStatusCode {
-    /// Object emission succeeded cleanly.
+    /// Operation succeeded cleanly.
     CX_LLVM_OK = 0,
-    /// Required pointer field in `CxLlvmCompileRequest` was `NULL`.
+    /// Required pointer or count argument was invalid or `NULL`.
     CX_LLVM_ERR_INVALID_ARG = 1,
     /// Target triple or `llvm::TargetMachine` lookup failed.
     CX_LLVM_ERR_TARGET_LOOKUP = 2,
@@ -50,7 +68,15 @@ enum CxLlvmStatusCode {
     /// Optimization pass pipeline execution failed.
     CX_LLVM_ERR_PASS_PIPELINE = 5,
     /// Object file stream creation or target codegen pass emission failed.
-    CX_LLVM_ERR_EMIT_OBJECT = 6
+    CX_LLVM_ERR_EMIT_OBJECT = 6,
+    /// Embedded `lld` headers/libraries were not linked into `corex_llvm.cpp`.
+    CX_LLVM_ERR_LLD_UNAVAILABLE = 7,
+    /// In-process `lld` link driver returned a non-zero exit status.
+    CX_LLVM_ERR_LLD_LINK = 8,
+    /// Deterministic `.a` / `.lib` static archive creation failed.
+    CX_LLVM_ERR_ARCHIVE_WRITE = 9,
+    /// PE/COFF `.def` parsing or Short-Import `.lib` generation failed.
+    CX_LLVM_ERR_COFF_IMPLIB = 10
 };
 
 /// Strongly typed compilation request passed across the C99 FFI boundary.
@@ -84,12 +110,45 @@ typedef struct CxLlvmCompileRequest {
 /// Returns the linked LLVM major version (`20`–`23`).
 uint32_t cx_llvm_bridge_version_major(void);
 
+/// Returns `1` when embedded `lld` drivers are compiled in (`COREX_HAS_LLD`), `0` otherwise.
+int cx_llvm_has_embedded_lld(void);
+
 /// Parses `ir_text_ptr[0..ir_text_len]`, verifies IR, runs the LLVM 20–23 `PassBuilder` pipeline,
 /// and writes a relocatable object file to `output_obj_path` (recording failures in `err_buf`).
 CxLlvmStatus cx_llvm_compile_ir_to_object(
     const CxLlvmCompileRequest *request,
     char *err_buf,
     size_t err_buf_cap
+);
+
+/// Invokes the embedded `lld` driver (`ld.lld`, `ld64.lld`, `lld-link`, or `wasm-ld`) in-process.
+CxLlvmResult cx_llvm_link_with_lld(
+    CxLldFlavor flavor,
+    const char *const *args_ptr,
+    size_t args_len,
+    char *err_buf,
+    size_t err_cap
+);
+
+/// Writes a deterministic `.a` or `.lib` archive (`K_GNU`, `K_DARWIN`, or `K_COFF`) via `llvm::writeArchive`.
+CxLlvmResult cx_llvm_write_archive(
+    const char *output_path,
+    const char *const *member_paths_ptr,
+    size_t member_paths_len,
+    int is_darwin,
+    int is_coff_thin_or_win,
+    char *err_buf,
+    size_t err_cap
+);
+
+/// Parses `def_contents_ptr[0..def_contents_len]` and writes a PE/COFF Short-Import `.lib` to `output_lib_path`.
+CxLlvmResult cx_llvm_write_coff_import_library(
+    const char *def_contents_ptr,
+    size_t def_contents_len,
+    const char *output_lib_path,
+    uint16_t coff_machine,
+    char *err_buf,
+    size_t err_cap
 );
 
 #ifdef __cplusplus

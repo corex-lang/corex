@@ -41,8 +41,18 @@ pub const mir_sast = @import("mir_sast.zig");
 pub const mir_vm = @import("mir_vm.zig");
 /// Dual-mode `MIR` optimizer (`--dev` `D1`–`D5` & `--release` `R1`–`R6`), monomorphizer, and `LayoutShapeKey` deduplicator.
 pub const mir_opt = @import("mir_opt.zig");
+/// Stackless coroutine state-machine lowering, liveness frame coloring, and `16 KiB` inline frame verifier (`DR-08`).
+pub const mir_async = @import("mir_async.zig");
+/// In-process C11/C23 preprocessor, lexer, and recursive-descent header parser (`DR-10` §2.2).
+pub const c_frontend = @import("c_frontend.zig");
+/// `corex translate-c` AST -> canonical `.cx` emission and `@c_import` synthesis engine (`DR-10` §2.2).
+pub const c_translate = @import("c_translate.zig");
 /// Target specs, unified `TypeLayoutResolver`, `AbiClassifier`, `CodegenBackend`, and `Prune-02` atomic file writer.
 pub const codegen_abi = @import("codegen_abi.zig");
+/// Cross-target `lld`/driver linker, deterministic `.a`/`.lib` archive writer, and COFF `.def` -> `.lib` generator (`DR-10`).
+pub const codegen_link = @import("codegen_link.zig");
+/// Phase-8 `< 250` LOC `InFlightOpSlot` (`64B`), `ReactorVTable`, and `CompletionReaper` simulation/reactor seam (`DR-08`, `DR-18`).
+pub const sim_seam = @import("sim_seam.zig");
 /// Phase-7 `< 200` LOC forward-compatible `--dev` GOT, `CxTypeLayoutRecord`, and `.cx_dev_meta` binary seam (`DR-19`).
 pub const codegen_dev_seam = @import("codegen_dev_seam.zig");
 /// Tier A (`-ofmt=c`) deterministic ISO C99 backend emitter and `zig cc` compilation driver (`DR-01`, `DR-20`).
@@ -643,6 +653,10 @@ pub const optimizeMirModule = mir_opt.optimizeMirModule;
 pub const TargetArch = codegen_abi.TargetArch;
 /// Supported Phase-7 operating systems and ABI environments.
 pub const TargetOs = codegen_abi.TargetOs;
+/// Supported target C/system ABI environments (`gnu`, `musl`, `msvc`, `macos`, `wasi`, `freestanding`).
+pub const TargetAbi = codegen_abi.TargetAbi;
+/// Binary linkage mode (`auto`, `static`, `dynamic`) across cross-target linkers (`DR-10`).
+pub const LinkMode = codegen_abi.LinkMode;
 /// Target SIMD alignment tier (`none`, `sse2_neon_simd128`, `avx2`, `avx512`).
 pub const SimdLevel = codegen_abi.SimdLevel;
 /// 4-byte binary-exact target specification covering all 7 canonical targets.
@@ -699,8 +713,32 @@ pub const DiffOracleReport = diff_oracle.DiffOracleReport;
 pub const runFourTierDiffOracleOnDb = diff_oracle.runFourTierDiffOracleOnDb;
 /// Runs the 4-tier differential backend oracle on a single `.cx` source buffer.
 pub const runFourTierDiffOracle = diff_oracle.runFourTierDiffOracle;
+/// Hard `16 KiB` inline stackless coroutine frame budget (`DR-08` §2.3, `E0317`).
+pub const ASYNC_INLINE_FRAME_CAP_BYTES = mir_async.ASYNC_INLINE_FRAME_CAP_BYTES;
+/// Canonical stackless coroutine state discriminant (`unpolled`, `1..K`, `completed`, `cancelled`).
+pub const CoroStateTag = mir_async.CoroStateTag;
+/// 24-byte `.coro_suspend` state-machine transition metadata (`DR-08` §2.2).
+pub const SuspendPointMeta = mir_async.SuspendPointMeta;
+/// 16-byte liveness-colored coroutine frame local slot record (`DR-08` §2.3).
+pub const CoroLocalSlot = mir_async.CoroLocalSlot;
+/// 16-byte stackless coroutine frame layout summary (`DR-08` §2.3).
+pub const CoroFrameLayout = mir_async.CoroFrameLayout;
+/// Per-body stackless coroutine lowering and frame-coloring plan (`DR-08`).
+pub const AsyncBodyPlan = mir_async.AsyncBodyPlan;
+/// Module-wide stackless coroutine lowering plan (`DR-08`).
+pub const AsyncModulePlan = mir_async.AsyncModulePlan;
+/// 64-byte cache-line-aligned in-flight proactor completion slot (`DR-08` §5.3).
+pub const InFlightOpSlot = sim_seam.InFlightOpSlot;
+/// Normalized 16-byte proactor completion queue entry (`DR-08` §5.3).
+pub const ReactorCqe = sim_seam.ReactorCqe;
+/// C-ABI proactor, clock, entropy, and `buggify` vtable seam (`DR-18` §2.1).
+pub const ReactorVTable = sim_seam.ReactorVTable;
+/// Two-phase DMA quarantine and zombie-CQE slot manager (`DR-08` §4.3, `Fix-08B`).
+pub const CompletionReaper = sim_seam.CompletionReaper;
 
 // ---------------- Diagnostics & CLI Re-Exports ----------------
+/// Canonical alphabetical 9-entry CLI subcommand descriptor table.
+pub const CLI_SUBCOMMANDS = router.CLI_SUBCOMMANDS;
 /// Monochrome Unicode glyph registry.
 pub const Glyphs = style.Glyphs;
 /// Terminal ANSI color policy (`auto`, `always`, `never`).
@@ -743,7 +781,12 @@ test "test_root_module_references_all_phase0_submodules" {
     _ = mir_sast;
     _ = mir_vm;
     _ = mir_opt;
+    _ = mir_async;
+    _ = c_frontend;
+    _ = c_translate;
     _ = codegen_abi;
+    _ = codegen_link;
+    _ = sim_seam;
     _ = codegen_dev_seam;
     _ = codegen_c;
     _ = codegen_llvm;

@@ -152,8 +152,11 @@ test "test_vfs_sourcemap_disk_loading_small_and_large_files" {
     defer source_map.deinit(std.testing.io);
 
     // [1] Load a small file (`< 16 KiB`) from disk and verify `.arena_small` backing + path deduplication:
-    const small_id = try source_map.resolveOrCreatePath(std.testing.io, "build.zig", .root);
-    try std.testing.expectEqual(small_id, try source_map.resolveOrCreatePath(std.testing.io, "./build.zig", .root));
+    const small_id = try source_map.resolveOrCreatePath(std.testing.io, "tests/test_runner.zig", .root);
+    try std.testing.expectEqual(
+        small_id,
+        try source_map.resolveOrCreatePath(std.testing.io, "./tests/test_runner.zig", .root),
+    );
 
     const small_entry = source_map.getFileEntry(small_id).?;
     try std.testing.expectEqual(vfs.BackingKind.arena_small, small_entry.backing_kind);

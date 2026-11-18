@@ -1,8 +1,8 @@
 //! CoreX Stage-0 Target Specification, `TypeLayoutResolver`, `AbiClassifier` & `CodegenBackend`
 //!
-//! Provides the single canonical layout, niche, `#soa` column, and calling-convention authority
-//! shared across `MirVm`, Tier A (`-ofmt=c`), and Tier B (`LLVM 20–23`), eliminating dev/release
-//! ABI or padding divergence (`DR-09` §1.1, `DR-20` `Prune-01`–`Prune-04`, `Fix-07`).
+//! Provides the single canonical 11-target cross-compilation matrix, layout, niche, `#soa` column,
+//! and calling-convention authority shared across `MirVm`, Tier A (`-ofmt=c`), Tier B (`LLVM 20–23`),
+//! and `codegen_link` (`DR-09` §1.1, `DR-10` §1–§3, `DR-20` `Prune-01`–`Prune-04`, `Fix-07`, `D-10A`).
 //!
 //! All binary metadata structs (`TargetSpec` `4B`, `NicheSpec` `24B`, `ResolvedTypeLayout` `32B`,
 //! `AbiParamRecipe` `16B`, `ProvenValueRange` `24B`) carry `comptime` size and alignment guards,
@@ -21,6 +21,8 @@ const syntax_arenas = @import("syntax_arenas.zig");
 const vfs_sourcemap = @import("vfs_sourcemap.zig");
 const codegen_c = @import("codegen_c.zig");
 const codegen_llvm = @import("codegen_llvm.zig");
+/// Re-exported cross-target linker, deterministic archive writer, and COFF `.def` -> `.lib` bridge (`DR-10`).
+pub const codegen_link = @import("codegen_link.zig");
 
 const Span = mem_foundation.Span;
 const TypeId = mem_foundation.TypeId;
@@ -42,7 +44,7 @@ pub const ProvenValueRange = mir_sast.ProvenValueRange;
 
 // ------------------- Target Specifications --------------------
 
-/// Supported Phase-7 hardware instruction-set architectures (`PLAN.md` Phase 7).
+/// Supported Phase-7/8 hardware instruction-set architectures (`PLAN.md` Phases 7–8).
 pub const TargetArch = enum(u8) {
     /// 64-bit x86 (`AMD64` / `Intel 64`).
     x86_64 = 0,
@@ -52,7 +54,7 @@ pub const TargetArch = enum(u8) {
     wasm32 = 2,
 };
 
-/// Supported Phase-7 operating system and runtime ABI environments (`PLAN.md` Phase 7).
+/// Supported operating system and runtime environments (matching `symbol_resolver.CfgOs`).
 pub const TargetOs = enum(u8) {
     /// Linux (`ELF64`, `SysV AMD64` / `AAPCS64`).
     linux = 0,
@@ -62,6 +64,24 @@ pub const TargetOs = enum(u8) {
     windows = 2,
     /// WebAssembly System Interface (`WASI` Preview 1 MVP ABI).
     wasi = 3,
+    /// Bare-metal / browser freestanding environment (`wasm32-unknown-freestanding`, zero host imports).
+    freestanding = 4,
+};
+
+/// Target C ABI / C runtime flavor (matching `symbol_resolver.CfgAbi` discriminant values).
+pub const TargetAbi = enum(u8) {
+    /// System V / GNU / MinGW-w64 C ABI (`gnu`).
+    gnu = 0,
+    /// Microsoft Visual C++ `x64` / `ARM64` C ABI (`msvc`).
+    msvc = 1,
+    /// Standalone static `musl` C ABI (`musl`).
+    musl = 2,
+    /// Apple Darwin `libSystem` ABI (`apple`).
+    apple = 3,
+    /// WebAssembly WASI Preview 1 ABI (`wasi`).
+    wasi = 4,
+    /// Bare-metal freestanding ABI (`none`).
+    none = 5,
 };
 
 /// Target SIMD vector-width tier governing `#soa` column alignment (`DR-09` §1.1, `[CRITICAL-03]`).
@@ -76,31 +96,58 @@ pub const SimdLevel = enum(u8) {
     avx512 = 3,
 };
 
-/// 4-byte binary-exact target specification covering all 7 canonical Phase-7 targets.
+/// 4-byte binary-exact target specification covering all 11 canonical Phase-8 targets (`DR-10`).
 pub const TargetSpec = extern struct {
     /// Target CPU architecture (`1B`).
     arch: TargetArch,
-    /// Target OS / ABI environment (`1B`).
+    /// Target OS / runtime environment (`1B`).
     os: TargetOs,
     /// Target SIMD alignment tier (`1B`).
     simd_level: SimdLevel = .sse2_neon_simd128,
-    /// Explicit zero padding (`1B`).
-    _pad: u8 = 0,
+    /// Target C ABI / C runtime flavor (`1B`, keeping `@sizeOf(TargetSpec) == 4`).
+    abi: TargetAbi = .gnu,
 
-    /// Canonical `x86_64-linux` target (`64B` cache line, `16B` baseline SIMD).
-    pub const X86_64_LINUX: TargetSpec = .{ .arch = .x86_64, .os = .linux };
-    /// Canonical `x86_64-macos` target (`64B` cache line, `16B` baseline SIMD).
-    pub const X86_64_MACOS: TargetSpec = .{ .arch = .x86_64, .os = .macos };
-    /// Canonical `x86_64-windows` target (`64B` cache line, `16B` baseline SIMD).
-    pub const X86_64_WINDOWS: TargetSpec = .{ .arch = .x86_64, .os = .windows };
-    /// Canonical `aarch64-linux` target (`64B` cache line, `16B` NEON SIMD).
-    pub const AARCH64_LINUX: TargetSpec = .{ .arch = .aarch64, .os = .linux };
-    /// Canonical `aarch64-macos` target (`128B` Apple Silicon cache line per `D-10A`, `16B` NEON SIMD).
-    pub const AARCH64_MACOS: TargetSpec = .{ .arch = .aarch64, .os = .macos };
-    /// Canonical `aarch64-windows` target (`64B` cache line, `16B` NEON SIMD).
-    pub const AARCH64_WINDOWS: TargetSpec = .{ .arch = .aarch64, .os = .windows };
-    /// Canonical `wasm32-wasi` target (`32`-bit pointers, `64B` cache line, `16B` SIMD128).
-    pub const WASM32_WASI: TargetSpec = .{ .arch = .wasm32, .os = .wasi };
+    /// Canonical `x86_64-linux-gnu` target (`64B` cache line, `glibc` dynamic/static).
+    pub const X86_64_LINUX_GNU: TargetSpec = .{ .arch = .x86_64, .os = .linux, .abi = .gnu };
+    /// Canonical `x86_64-linux-musl` target (`64B` cache line, standalone static `musl`).
+    pub const X86_64_LINUX_MUSL: TargetSpec = .{ .arch = .x86_64, .os = .linux, .abi = .musl };
+    /// Canonical `aarch64-linux-gnu` target (`64B` cache line, `AAPCS64`, unsigned `c_char`).
+    pub const AARCH64_LINUX_GNU: TargetSpec = .{ .arch = .aarch64, .os = .linux, .abi = .gnu };
+    /// Canonical `aarch64-linux-musl` target (`64B` cache line, standalone static `musl`, unsigned `c_char`).
+    pub const AARCH64_LINUX_MUSL: TargetSpec = .{ .arch = .aarch64, .os = .linux, .abi = .musl };
+    /// Canonical `x86_64-apple-darwin` target (`64B` cache line, Mach-O `libSystem`).
+    pub const X86_64_APPLE_DARWIN: TargetSpec = .{ .arch = .x86_64, .os = .macos, .abi = .apple };
+    /// Canonical `aarch64-apple-darwin` target (`128B` Apple Silicon cache line per `D-10A`).
+    pub const AARCH64_APPLE_DARWIN: TargetSpec = .{ .arch = .aarch64, .os = .macos, .abi = .apple };
+    /// Canonical `x86_64-windows-msvc` target (`64B` cache line, `Win64` MSVC PE32+).
+    pub const X86_64_WINDOWS_MSVC: TargetSpec = .{ .arch = .x86_64, .os = .windows, .abi = .msvc };
+    /// Canonical `x86_64-windows-gnu` target (`64B` cache line, `Win64` MinGW-w64 PE32+).
+    pub const X86_64_WINDOWS_GNU: TargetSpec = .{ .arch = .x86_64, .os = .windows, .abi = .gnu };
+    /// Canonical `aarch64-windows-msvc` target (`64B` cache line, Windows `ARM64` MSVC PE32+).
+    pub const AARCH64_WINDOWS_MSVC: TargetSpec = .{ .arch = .aarch64, .os = .windows, .abi = .msvc };
+    /// Canonical `wasm32-unknown-wasi` target (`32`-bit pointers, WASI Preview 1).
+    pub const WASM32_UNKNOWN_WASI: TargetSpec = .{ .arch = .wasm32, .os = .wasi, .abi = .wasi };
+    /// Canonical `wasm32-unknown-freestanding` target (`32`-bit pointers, zero-OS `< 10 KB` Wasm).
+    pub const WASM32_UNKNOWN_FREESTANDING: TargetSpec = .{ .arch = .wasm32, .os = .freestanding, .abi = .none };
+
+    /// Short alias for `X86_64_LINUX_GNU`.
+    pub const X86_64_LINUX: TargetSpec = X86_64_LINUX_GNU;
+    /// Short alias for `X86_64_APPLE_DARWIN`.
+    pub const X86_64_MACOS: TargetSpec = X86_64_APPLE_DARWIN;
+    /// Short alias for `X86_64_WINDOWS_MSVC`.
+    pub const X86_64_WINDOWS: TargetSpec = X86_64_WINDOWS_MSVC;
+    /// Short alias for `AARCH64_LINUX_GNU`.
+    pub const AARCH64_LINUX: TargetSpec = AARCH64_LINUX_GNU;
+    /// Short alias for `AARCH64_APPLE_DARWIN`.
+    pub const AARCH64_MACOS: TargetSpec = AARCH64_APPLE_DARWIN;
+    /// Short alias for `AARCH64_WINDOWS_MSVC`.
+    pub const AARCH64_WINDOWS: TargetSpec = AARCH64_WINDOWS_MSVC;
+    /// Short alias for `WASM32_UNKNOWN_WASI`.
+    pub const WASM32_WASI: TargetSpec = WASM32_UNKNOWN_WASI;
+    /// Short alias for `WASM32_UNKNOWN_FREESTANDING`.
+    pub const WASM32_FREESTANDING: TargetSpec = WASM32_UNKNOWN_FREESTANDING;
+    /// Canonical 11-target matrix exposed directly on `TargetSpec`.
+    pub const ALL_CANONICAL_TARGETS: [11]TargetSpec = ALL_CANONICAL_TARGETS_LIST;
 
     /// Returns the `TargetSpec` matching the host machine running `stage0/corex`.
     pub fn host() TargetSpec {
@@ -115,19 +162,51 @@ pub const TargetSpec = extern struct {
             .macos => .macos,
             .windows => .windows,
             .wasi => .wasi,
+            .freestanding => .freestanding,
             else => if (host_arch == .wasm32) .wasi else .linux,
         };
-        if (!isValidCombination(host_arch, host_os)) {
-            return if (host_arch == .wasm32) WASM32_WASI else X86_64_LINUX;
+        const host_abi: TargetAbi = switch (host_os) {
+            .windows => if (builtin.abi == .gnu) .gnu else .msvc,
+            .macos => .apple,
+            .linux => if (builtin.abi == .musl or builtin.abi == .musleabi or builtin.abi == .musleabihf) .musl else .gnu,
+            .wasi => .wasi,
+            .freestanding => .none,
+        };
+        if (!isValidTriple(host_arch, host_os, host_abi)) {
+            if (host_arch == .aarch64 and host_os == .windows) return AARCH64_WINDOWS_MSVC;
+            return if (host_arch == .wasm32) WASM32_UNKNOWN_WASI else X86_64_LINUX_GNU;
         }
-        return .{ .arch = host_arch, .os = host_os };
+        return .{ .arch = host_arch, .os = host_os, .abi = host_abi };
     }
 
-    /// Returns `true` iff `(arch, os)` is one of the 7 supported Phase-7 target combinations.
+    /// Returns `true` iff `(arch, os, abi)` is one of the exact 11 supported canonical combinations.
+    pub inline fn isValidTriple(arch: TargetArch, os: TargetOs, abi: TargetAbi) bool {
+        return switch (arch) {
+            .x86_64 => switch (os) {
+                .linux => abi == .gnu or abi == .musl,
+                .macos => abi == .apple,
+                .windows => abi == .msvc or abi == .gnu,
+                .wasi, .freestanding => false,
+            },
+            .aarch64 => switch (os) {
+                .linux => abi == .gnu or abi == .musl,
+                .macos => abi == .apple,
+                .windows => abi == .msvc,
+                .wasi, .freestanding => false,
+            },
+            .wasm32 => switch (os) {
+                .wasi => abi == .wasi,
+                .freestanding => abi == .none,
+                .linux, .macos, .windows => false,
+            },
+        };
+    }
+
+    /// Returns `true` iff `(arch, os)` belongs to a supported target family (including `wasm32-freestanding`).
     pub inline fn isValidCombination(arch: TargetArch, os: TargetOs) bool {
         return switch (arch) {
             .x86_64, .aarch64 => os == .linux or os == .macos or os == .windows,
-            .wasm32 => os == .wasi,
+            .wasm32 => os == .wasi or os == .freestanding,
         };
     }
 
@@ -164,51 +243,80 @@ pub const TargetSpec = extern struct {
         return self.os == .windows;
     }
 
-    /// Returns `true` when targeting `wasm32-wasi`.
+    /// Returns `true` when targeting WebAssembly (`wasm32-unknown-wasi` or `wasm32-unknown-freestanding`).
     pub inline fn isWasm(self: TargetSpec) bool {
         return self.arch == .wasm32;
     }
 
-    /// Packs `(arch, os)` into the 16-bit tag stored in `CxDevSeamHeader.arch_os_tag`.
-    pub inline fn archOsTag(self: TargetSpec) u16 {
-        return (@as(u16, @backingInt(self.arch)) << 8) | @as(u16, @backingInt(self.os));
+    /// Returns `true` when targeting `wasm32-unknown-freestanding` (`os == .freestanding`).
+    pub inline fn isFreestanding(self: TargetSpec) bool {
+        return self.os == .freestanding;
     }
 
-    /// Returns the canonical short CoreX target name (`"x86_64-linux"`, …).
-    pub fn canonicalName(self: TargetSpec) []const u8 {
+    /// Returns `true` when C `char` is signed (`false` on `aarch64-linux-*` `AAPCS64`, `true` on all other targets).
+    pub inline fn isCCharSigned(self: TargetSpec) bool {
+        return !(self.arch == .aarch64 and self.os == .linux);
+    }
+
+    /// Returns the byte width of C `long` / `unsigned long` (`4` on Windows `LLP64` and `wasm32` `ILP32`, `8` on `LP64`).
+    pub inline fn cLongByteSize(self: TargetSpec) u8 {
+        return if (self.os == .windows or self.arch == .wasm32) 4 else 8;
+    }
+
+    /// Packs `(arch, os, abi)` into a collision-free 16-bit tag stored in `CxDevSeamHeader.arch_os_tag`.
+    pub inline fn archOsTag(self: TargetSpec) u16 {
+        return (@as(u16, @backingInt(self.arch)) << 12) |
+            (@as(u16, @backingInt(self.os)) << 6) |
+            @as(u16, @backingInt(self.abi));
+    }
+
+    /// Represents `self` as its canonical 11-target CoreX triple string.
+    pub fn asTripleStr(self: TargetSpec) []const u8 {
         return switch (self.arch) {
             .x86_64 => switch (self.os) {
-                .linux => "x86_64-linux",
-                .macos => "x86_64-macos",
-                .windows => "x86_64-windows",
-                .wasi => "wasm32-wasi",
+                .linux => if (self.abi == .musl) "x86_64-linux-musl" else "x86_64-linux-gnu",
+                .macos => "x86_64-apple-darwin",
+                .windows => if (self.abi == .gnu) "x86_64-windows-gnu" else "x86_64-windows-msvc",
+                .wasi => "wasm32-unknown-wasi",
+                .freestanding => "wasm32-unknown-freestanding",
             },
             .aarch64 => switch (self.os) {
-                .linux => "aarch64-linux",
-                .macos => "aarch64-macos",
-                .windows => "aarch64-windows",
-                .wasi => "wasm32-wasi",
+                .linux => if (self.abi == .musl) "aarch64-linux-musl" else "aarch64-linux-gnu",
+                .macos => "aarch64-apple-darwin",
+                .windows => "aarch64-windows-msvc",
+                .wasi => "wasm32-unknown-wasi",
+                .freestanding => "wasm32-unknown-freestanding",
             },
-            .wasm32 => "wasm32-wasi",
+            .wasm32 => if (self.os == .freestanding or self.abi == .none)
+                "wasm32-unknown-freestanding"
+            else
+                "wasm32-unknown-wasi",
         };
+    }
+
+    /// Returns the canonical CoreX target identifier (`asTripleStr`).
+    pub inline fn canonicalName(self: TargetSpec) []const u8 {
+        return self.asTripleStr();
     }
 
     /// Represents `self` as the `zig cc -target <triple>` string for cross-compilation (`LLD` + bundled sysroots).
     pub fn asZigTargetTriple(self: TargetSpec) []const u8 {
         return switch (self.arch) {
             .x86_64 => switch (self.os) {
-                .linux => "x86_64-linux-gnu",
+                .linux => if (self.abi == .musl) "x86_64-linux-musl" else "x86_64-linux-gnu",
                 .macos => "x86_64-macos",
-                .windows => "x86_64-windows-gnu",
+                .windows => if (self.abi == .gnu) "x86_64-windows-gnu" else "x86_64-windows-msvc",
                 .wasi => "wasm32-wasi",
+                .freestanding => "wasm32-freestanding",
             },
             .aarch64 => switch (self.os) {
-                .linux => "aarch64-linux-gnu",
+                .linux => if (self.abi == .musl) "aarch64-linux-musl" else "aarch64-linux-gnu",
                 .macos => "aarch64-macos",
-                .windows => "aarch64-windows-gnu",
+                .windows => "aarch64-windows-msvc",
                 .wasi => "wasm32-wasi",
+                .freestanding => "wasm32-freestanding",
             },
-            .wasm32 => "wasm32-wasi",
+            .wasm32 => if (self.os == .freestanding or self.abi == .none) "wasm32-freestanding" else "wasm32-wasi",
         };
     }
 
@@ -216,18 +324,23 @@ pub const TargetSpec = extern struct {
     pub fn asLlvmTargetTriple(self: TargetSpec) []const u8 {
         return switch (self.arch) {
             .x86_64 => switch (self.os) {
-                .linux => "x86_64-unknown-linux-gnu",
-                .macos => "x86_64-apple-macosx14.0.0",
-                .windows => "x86_64-w64-windows-gnu",
+                .linux => if (self.abi == .musl) "x86_64-unknown-linux-musl" else "x86_64-unknown-linux-gnu",
+                .macos => "x86_64-apple-macosx13.0.0",
+                .windows => if (self.abi == .gnu) "x86_64-w64-windows-gnu" else "x86_64-pc-windows-msvc",
                 .wasi => "wasm32-unknown-wasi",
+                .freestanding => "wasm32-unknown-unknown",
             },
             .aarch64 => switch (self.os) {
-                .linux => "aarch64-unknown-linux-gnu",
-                .macos => "arm64-apple-macosx14.0.0",
-                .windows => "aarch64-w64-windows-gnu",
+                .linux => if (self.abi == .musl) "aarch64-unknown-linux-musl" else "aarch64-unknown-linux-gnu",
+                .macos => "arm64-apple-macosx13.0.0",
+                .windows => "aarch64-pc-windows-msvc",
                 .wasi => "wasm32-unknown-wasi",
+                .freestanding => "wasm32-unknown-unknown",
             },
-            .wasm32 => "wasm32-unknown-wasi",
+            .wasm32 => if (self.os == .freestanding or self.abi == .none)
+                "wasm32-unknown-unknown"
+            else
+                "wasm32-unknown-wasi",
         };
     }
 
@@ -238,32 +351,56 @@ pub const TargetSpec = extern struct {
                 .linux => "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
                 .macos => "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
                 .windows => "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
-                .wasi => "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-n32:64-S128-ni:1:10:20",
+                .wasi, .freestanding => "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-f128:64-n32:64-S128-ni:1:10:20",
             },
             .aarch64 => switch (self.os) {
                 .linux => "e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32",
                 .macos => "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32",
-                .windows => "e-m:w-p:64:64-i32:32-i64:64-i128:128-n32:64-S128-Fn32",
-                .wasi => "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-n32:64-S128-ni:1:10:20",
+                .windows => "e-m:w-p270:32:32-p271:32:32-p272:64:64-p:64:64-i32:32-i64:64-i128:128-n32:64-S128-Fn32",
+                .wasi, .freestanding => "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-f128:64-n32:64-S128-ni:1:10:20",
             },
-            .wasm32 => "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-n32:64-S128-ni:1:10:20",
+            .wasm32 => "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-f128:64-n32:64-S128-ni:1:10:20",
         };
     }
 
-    /// Returns the default executable file extension for `self` (`".exe"`, `".wasm"`, or `""`).
-    pub fn executableExtension(self: TargetSpec) []const u8 {
+    /// Returns the default executable file extension (`".exe"` on Windows, `".wasm"` on `wasm32`, `""` on POSIX).
+    pub fn defaultExeExtension(self: TargetSpec) []const u8 {
+        if (self.arch == .wasm32 or self.os == .wasi or self.os == .freestanding) return ".wasm";
         return switch (self.os) {
             .windows => ".exe",
-            .wasi => ".wasm",
             .linux, .macos => "",
+            .wasi, .freestanding => ".wasm",
         };
     }
 
-    /// Returns the default relocatable object file extension for `self` (`".obj"` or `".o"`).
-    pub fn objectExtension(self: TargetSpec) []const u8 {
+    /// Alias for `defaultExeExtension` preserved for existing Phase 7 callers.
+    pub inline fn executableExtension(self: TargetSpec) []const u8 {
+        return self.defaultExeExtension();
+    }
+
+    /// Returns the default relocatable object extension (`".obj"` on `windows-msvc`, `".o"` otherwise).
+    pub fn defaultObjExtension(self: TargetSpec) []const u8 {
+        return if (self.os == .windows and self.abi == .msvc) ".obj" else ".o";
+    }
+
+    /// Alias for `defaultObjExtension` preserved for existing Phase 7 callers.
+    pub inline fn objectExtension(self: TargetSpec) []const u8 {
+        return self.defaultObjExtension();
+    }
+
+    /// Returns the default static archive extension (`".lib"` on `windows-msvc`, `".a"` otherwise).
+    pub fn defaultStaticLibExtension(self: TargetSpec) []const u8 {
+        return if (self.os == .windows and self.abi == .msvc) ".lib" else ".a";
+    }
+
+    /// Returns the default shared library extension (`".dll"`, `".dylib"`, `".wasm"`, or `".so"`).
+    pub fn defaultSharedLibExtension(self: TargetSpec) []const u8 {
+        if (self.arch == .wasm32 or self.os == .wasi or self.os == .freestanding) return ".wasm";
         return switch (self.os) {
-            .windows => ".obj",
-            .linux, .macos, .wasi => ".o",
+            .windows => ".dll",
+            .macos => ".dylib",
+            .linux => ".so",
+            .wasi, .freestanding => ".wasm",
         };
     }
 
@@ -297,6 +434,11 @@ pub const TargetSpec = extern struct {
         return spec;
     }
 
+    /// Alias for `parseTargetTriple`.
+    pub inline fn fromTriple(raw_triple: []const u8) ?TargetSpec {
+        return parseTargetTriple(raw_triple);
+    }
+
     /// Parses `raw_triple` or emits `E0006` (`e0006_invalid_target_triple`) into `sink`.
     pub fn parseOrEmitInvalidTarget(
         raw_triple: []const u8,
@@ -316,8 +458,9 @@ pub const TargetSpec = extern struct {
             .primary_span = span,
             .message = msg,
             .notes = &.{
-                "help: supported targets are `x86_64-linux`, `x86_64-macos`, `x86_64-windows`, " ++
-                    "`aarch64-linux`, `aarch64-macos`, `aarch64-windows`, and `wasm32-wasi`",
+                "help: supported targets are `x86_64-linux-gnu`, `x86_64-linux-musl`, `aarch64-linux-gnu`, " ++
+                    "`aarch64-linux-musl`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-windows-msvc`, " ++
+                    "`x86_64-windows-gnu`, `aarch64-windows-msvc`, `wasm32-unknown-wasi`, and `wasm32-unknown-freestanding`",
             },
         });
         return null;
@@ -687,14 +830,46 @@ pub const LlvmBackendConfig = struct {
     is_static_llvm_bridge_enabled: bool = false,
 };
 
+/// Requested binary linkage mode (`--link=auto|static|dynamic`, `DR-10` §1.3).
+pub const LinkMode = enum(u8) {
+    /// Target-default linkage (`static` on `*-linux-musl`, target-standard otherwise).
+    auto = 0,
+    /// Standalone static linkage (`--link=static`).
+    static = 1,
+    /// Shared/dynamic linkage (`--link=dynamic`).
+    dynamic = 2,
+
+    /// Parses `"auto"`, `"static"`, or `"dynamic"` into a `LinkMode`.
+    pub fn fromStr(raw_mode: []const u8) ?LinkMode {
+        const trimmed = std.mem.trim(u8, raw_mode, " \t\r\n");
+        if (std.mem.eql(u8, trimmed, "auto")) return .auto;
+        if (std.mem.eql(u8, trimmed, "static")) return .static;
+        if (std.mem.eql(u8, trimmed, "dynamic")) return .dynamic;
+        return null;
+    }
+
+    /// Represents `self` as its canonical CLI spelling (`"auto"`, `"static"`, or `"dynamic"`).
+    pub inline fn asStr(self: LinkMode) []const u8 {
+        return switch (self) {
+            .auto => "auto",
+            .static => "static",
+            .dynamic => "dynamic",
+        };
+    }
+};
+
 /// Requested output artifact form produced by `CodegenBackend.emitModule`.
 pub const OutputArtifactKind = enum(u8) {
     /// Emit deterministic textual `.c` or `.ll` source in memory (and optionally write to `output_path`).
     source_text = 0,
     /// Emit relocatable `.o` / `.obj` / `.wasm` object file at `output_path`.
     object_file = 1,
-    /// Compile and link a standalone native or WASI executable at `output_path`.
+    /// Compile and link a standalone native or WASI/freestanding executable at `output_path`.
     executable = 2,
+    /// Package relocatable object(s) into a deterministic `.a` or `.lib` static archive at `output_path`.
+    static_library = 3,
+    /// Compile and link a shared library (`.so`, `.dylib`, `.dll`, or `.wasm`) at `output_path`.
+    shared_library = 4,
 };
 
 /// Owned result returned by `CodegenBackend.emitModule`.
@@ -743,9 +918,15 @@ pub const CodegenModuleInput = struct {
     is_dev_got_enabled: bool = false,
     /// `true` to enable `COREX_ORACLE_TRACE_FILE` trap/drop/return instrumentation (`D-07A`).
     is_oracle_trace_enabled: bool = false,
-    /// Requested output artifact kind (`.source_text`, `.object_file`, or `.executable`).
+    /// Requested output artifact kind (`.source_text`, `.object_file`, `.executable`, `.static_library`, `.shared_library`).
     artifact_kind: OutputArtifactKind = .source_text,
-    /// Destination path on disk (required for `.object_file` and `.executable`).
+    /// Requested binary linkage mode (`.auto`, `.static`, or `.dynamic`).
+    link_mode: LinkMode = .auto,
+    /// Additional `-l<lib>` or `.a`/`.lib`/`.def` link inputs forwarded to the linker driver.
+    extra_libs: []const []const u8 = &.{},
+    /// Additional `-L<dir>` library search directories forwarded to the linker driver.
+    lib_dirs: []const []const u8 = &.{},
+    /// Destination path on disk (required for non-`.source_text` artifacts).
     output_path: ?[]const u8 = null,
     /// Zig `Io` handle used for `zig cc` subprocesses and `atomicWriteOutputFile`.
     io: ?std.Io = null,
@@ -754,6 +935,9 @@ pub const CodegenModuleInput = struct {
     /// Optional `DiagnosticSink` receiving `E0007` / `E0008` diagnostics on backend or linker failure.
     diagnostic_sink: ?*DiagnosticSink = null,
 };
+
+/// Canonical alias for `CodegenModuleInput` carrying backend emission and cross-link options.
+pub const BackendEmitOptions = CodegenModuleInput;
 
 /// Exhaustive tagged-union backend dispatcher with zero `*anyopaque` or `void*` (`AGENTS.md` §1, `[CRITICAL-09]`).
 pub const CodegenBackend = union(enum) {
@@ -823,57 +1007,66 @@ pub const MAX_LAYOUT_RESOLVE_DEPTH: u32 = 64;
 /// Sentinel index indicating a type carries no `NicheSpec` (`0xFFFF_FFFF`).
 pub const NO_NICHE_IDX: u32 = std.math.maxInt(u32);
 
-/// Canonical list of all 7 supported Phase-7 `TargetSpec` targets.
-pub const ALL_CANONICAL_TARGETS = [7]TargetSpec{
-    TargetSpec.X86_64_LINUX,
-    TargetSpec.X86_64_MACOS,
-    TargetSpec.X86_64_WINDOWS,
-    TargetSpec.AARCH64_LINUX,
-    TargetSpec.AARCH64_MACOS,
-    TargetSpec.AARCH64_WINDOWS,
-    TargetSpec.WASM32_WASI,
+/// Canonical backing list of all 11 supported Phase-8 `TargetSpec` targets (`DR-10` §1).
+const ALL_CANONICAL_TARGETS_LIST = [11]TargetSpec{
+    TargetSpec.X86_64_LINUX_GNU,
+    TargetSpec.X86_64_LINUX_MUSL,
+    TargetSpec.AARCH64_LINUX_GNU,
+    TargetSpec.AARCH64_LINUX_MUSL,
+    TargetSpec.X86_64_APPLE_DARWIN,
+    TargetSpec.AARCH64_APPLE_DARWIN,
+    TargetSpec.X86_64_WINDOWS_MSVC,
+    TargetSpec.X86_64_WINDOWS_GNU,
+    TargetSpec.AARCH64_WINDOWS_MSVC,
+    TargetSpec.WASM32_UNKNOWN_WASI,
+    TargetSpec.WASM32_UNKNOWN_FREESTANDING,
 };
 
-/// $O(1)$ static lookup map from canonical and vendor-qualified target triples to `TargetSpec`.
+/// Canonical list of all 11 supported Phase-8 `TargetSpec` targets (`DR-10` §1).
+pub const ALL_CANONICAL_TARGETS: [11]TargetSpec = ALL_CANONICAL_TARGETS_LIST;
+
+/// $O(1)$ static lookup map from canonical, short, and vendor-qualified target triples to `TargetSpec`.
 const TARGET_TRIPLE_MAP = std.StaticStringMap(TargetSpec).initComptime(.{
-    .{ "aarch64-apple-darwin", TargetSpec.AARCH64_MACOS },
-    .{ "aarch64-apple-macos", TargetSpec.AARCH64_MACOS },
-    .{ "aarch64-apple-macosx", TargetSpec.AARCH64_MACOS },
-    .{ "aarch64-linux", TargetSpec.AARCH64_LINUX },
-    .{ "aarch64-linux-gnu", TargetSpec.AARCH64_LINUX },
-    .{ "aarch64-linux-musl", TargetSpec.AARCH64_LINUX },
-    .{ "aarch64-macos", TargetSpec.AARCH64_MACOS },
-    .{ "aarch64-macos-none", TargetSpec.AARCH64_MACOS },
-    .{ "aarch64-pc-windows-gnu", TargetSpec.AARCH64_WINDOWS },
-    .{ "aarch64-pc-windows-msvc", TargetSpec.AARCH64_WINDOWS },
-    .{ "aarch64-unknown-linux-gnu", TargetSpec.AARCH64_LINUX },
-    .{ "aarch64-unknown-linux-musl", TargetSpec.AARCH64_LINUX },
-    .{ "aarch64-w64-windows-gnu", TargetSpec.AARCH64_WINDOWS },
-    .{ "aarch64-windows", TargetSpec.AARCH64_WINDOWS },
-    .{ "aarch64-windows-gnu", TargetSpec.AARCH64_WINDOWS },
-    .{ "aarch64-windows-msvc", TargetSpec.AARCH64_WINDOWS },
-    .{ "arm64-apple-darwin", TargetSpec.AARCH64_MACOS },
-    .{ "arm64-apple-macos", TargetSpec.AARCH64_MACOS },
-    .{ "arm64-macos", TargetSpec.AARCH64_MACOS },
-    .{ "wasm32-unknown-wasi", TargetSpec.WASM32_WASI },
-    .{ "wasm32-wasi", TargetSpec.WASM32_WASI },
-    .{ "wasm32-wasip1", TargetSpec.WASM32_WASI },
-    .{ "x86_64-apple-darwin", TargetSpec.X86_64_MACOS },
-    .{ "x86_64-apple-macos", TargetSpec.X86_64_MACOS },
-    .{ "x86_64-apple-macosx", TargetSpec.X86_64_MACOS },
-    .{ "x86_64-linux", TargetSpec.X86_64_LINUX },
-    .{ "x86_64-linux-gnu", TargetSpec.X86_64_LINUX },
-    .{ "x86_64-linux-musl", TargetSpec.X86_64_LINUX },
-    .{ "x86_64-macos", TargetSpec.X86_64_MACOS },
-    .{ "x86_64-macos-none", TargetSpec.X86_64_MACOS },
-    .{ "x86_64-pc-windows-gnu", TargetSpec.X86_64_WINDOWS },
-    .{ "x86_64-pc-windows-msvc", TargetSpec.X86_64_WINDOWS },
-    .{ "x86_64-unknown-linux-gnu", TargetSpec.X86_64_LINUX },
-    .{ "x86_64-unknown-linux-musl", TargetSpec.X86_64_LINUX },
-    .{ "x86_64-w64-windows-gnu", TargetSpec.X86_64_WINDOWS },
-    .{ "x86_64-windows", TargetSpec.X86_64_WINDOWS },
-    .{ "x86_64-windows-gnu", TargetSpec.X86_64_WINDOWS },
-    .{ "x86_64-windows-msvc", TargetSpec.X86_64_WINDOWS },
+    .{ "aarch64-apple-darwin", TargetSpec.AARCH64_APPLE_DARWIN },
+    .{ "aarch64-apple-macos", TargetSpec.AARCH64_APPLE_DARWIN },
+    .{ "aarch64-apple-macosx", TargetSpec.AARCH64_APPLE_DARWIN },
+    .{ "aarch64-linux", TargetSpec.AARCH64_LINUX_GNU },
+    .{ "aarch64-linux-gnu", TargetSpec.AARCH64_LINUX_GNU },
+    .{ "aarch64-linux-musl", TargetSpec.AARCH64_LINUX_MUSL },
+    .{ "aarch64-macos", TargetSpec.AARCH64_APPLE_DARWIN },
+    .{ "aarch64-macos-none", TargetSpec.AARCH64_APPLE_DARWIN },
+    .{ "aarch64-pc-windows-msvc", TargetSpec.AARCH64_WINDOWS_MSVC },
+    .{ "aarch64-unknown-linux-gnu", TargetSpec.AARCH64_LINUX_GNU },
+    .{ "aarch64-unknown-linux-musl", TargetSpec.AARCH64_LINUX_MUSL },
+    .{ "aarch64-windows", TargetSpec.AARCH64_WINDOWS_MSVC },
+    .{ "aarch64-windows-msvc", TargetSpec.AARCH64_WINDOWS_MSVC },
+    .{ "arm64-apple-darwin", TargetSpec.AARCH64_APPLE_DARWIN },
+    .{ "arm64-apple-macos", TargetSpec.AARCH64_APPLE_DARWIN },
+    .{ "arm64-macos", TargetSpec.AARCH64_APPLE_DARWIN },
+    .{ "wasm32-freestanding", TargetSpec.WASM32_UNKNOWN_FREESTANDING },
+    .{ "wasm32-unknown-freestanding", TargetSpec.WASM32_UNKNOWN_FREESTANDING },
+    .{ "wasm32-unknown-unknown", TargetSpec.WASM32_UNKNOWN_FREESTANDING },
+    .{ "wasm32-unknown-wasi", TargetSpec.WASM32_UNKNOWN_WASI },
+    .{ "wasm32-wasi", TargetSpec.WASM32_UNKNOWN_WASI },
+    .{ "wasm32-wasi-preview1", TargetSpec.WASM32_UNKNOWN_WASI },
+    .{ "wasm32-wasip1", TargetSpec.WASM32_UNKNOWN_WASI },
+    .{ "x86_64-apple-darwin", TargetSpec.X86_64_APPLE_DARWIN },
+    .{ "x86_64-apple-macos", TargetSpec.X86_64_APPLE_DARWIN },
+    .{ "x86_64-apple-macosx", TargetSpec.X86_64_APPLE_DARWIN },
+    .{ "x86_64-linux", TargetSpec.X86_64_LINUX_GNU },
+    .{ "x86_64-linux-gnu", TargetSpec.X86_64_LINUX_GNU },
+    .{ "x86_64-linux-musl", TargetSpec.X86_64_LINUX_MUSL },
+    .{ "x86_64-macos", TargetSpec.X86_64_APPLE_DARWIN },
+    .{ "x86_64-macos-none", TargetSpec.X86_64_APPLE_DARWIN },
+    .{ "x86_64-pc-windows-gnu", TargetSpec.X86_64_WINDOWS_GNU },
+    .{ "x86_64-pc-windows-msvc", TargetSpec.X86_64_WINDOWS_MSVC },
+    .{ "x86_64-unknown-linux-gnu", TargetSpec.X86_64_LINUX_GNU },
+    .{ "x86_64-unknown-linux-musl", TargetSpec.X86_64_LINUX_MUSL },
+    .{ "x86_64-w64-mingw32", TargetSpec.X86_64_WINDOWS_GNU },
+    .{ "x86_64-w64-windows-gnu", TargetSpec.X86_64_WINDOWS_GNU },
+    .{ "x86_64-windows", TargetSpec.X86_64_WINDOWS_MSVC },
+    .{ "x86_64-windows-gnu", TargetSpec.X86_64_WINDOWS_GNU },
+    .{ "x86_64-windows-msvc", TargetSpec.X86_64_WINDOWS_MSVC },
 });
 
 // -------------------------------------- INTERNALS --------------------------------------
@@ -1331,7 +1524,7 @@ pub const TypeLayoutResolver = struct {
             (self.pool.getEnumBackingIntType(unwrapped) orelse raw_ty)
         else
             raw_ty;
-        const base_layout = type_system.computeTypeLayoutWithPool(
+        var base_layout = type_system.computeTypeLayoutWithPool(
             self.pool,
             self.sym_table,
             layout_query_ty,
@@ -1379,7 +1572,8 @@ pub const TypeLayoutResolver = struct {
                             raw_ty,
                             unwrapped,
                             st_sym,
-                            base_layout.byte_size,
+                            &base_layout.byte_size,
+                            base_layout.align_bytes,
                             &aux_start,
                             &aux_len,
                             &repr_flags,
@@ -1436,6 +1630,15 @@ pub const TypeLayoutResolver = struct {
                         if (raw_ty != unwrapped) {
                             try self.sum_details.put(self.allocator, unwrapped.toU32(), detail);
                         }
+                    }
+                },
+                .future_ty => {
+                    const out_sub_layout = try self.resolveTypeBounded(TypeId.fromInt(node.lhs), depth + 1);
+                    const hdr_bytes: u64 = @as(u64, self.target_layout.ptr_byte_size) * 4;
+                    if (out_sub_layout.reprFlags().has_padding or
+                        base_layout.byte_size > (hdr_bytes +| out_sub_layout.size_bytes))
+                    {
+                        repr_flags.has_padding = true;
                     }
                 },
                 else => {},
@@ -1626,7 +1829,8 @@ pub const TypeLayoutResolver = struct {
         owner_ty: TypeId,
         unwrapped_ty: TypeId,
         st_sym: SymbolRecord,
-        total_size: u64,
+        total_size_inout: *u64,
+        base_align_bytes: u32,
         aux_start_out: *u32,
         aux_len_out: *u32,
         repr_flags: *ReprFlags,
@@ -1638,9 +1842,9 @@ pub const TypeLayoutResolver = struct {
             if (self.sym_table.getSymbol(mem_idx).kind == .field_sym) field_count += 1;
         }
         if (field_count == 0) {
-            if (total_size > 0) {
+            if (total_size_inout.* > 0) {
                 const pad_start: u32 = @intCast(self.padding_pool.items.len);
-                try self.padding_pool.append(self.allocator, .{ .byte_offset = 0, .byte_len = total_size });
+                try self.padding_pool.append(self.allocator, .{ .byte_offset = 0, .byte_len = total_size_inout.* });
                 repr_flags.has_padding = true;
                 try self.padding_ranges.put(self.allocator, owner_ty.toU32(), .{ .start = pad_start, .len = 1 });
             }
@@ -1747,10 +1951,14 @@ pub const TypeLayoutResolver = struct {
                 }
             }
         }
-        if (total_size > cur_offset) {
+        const aligned_end = type_system.alignUpU64(cur_offset, if (is_packed) 1 else base_align_bytes);
+        if (aligned_end > total_size_inout.*) {
+            total_size_inout.* = aligned_end;
+        }
+        if (total_size_inout.* > cur_offset) {
             try self.padding_pool.append(self.allocator, .{
                 .byte_offset = cur_offset,
-                .byte_len = total_size - cur_offset,
+                .byte_len = total_size_inout.* - cur_offset,
             });
         }
         const pad_len: u32 = @intCast(self.padding_pool.items.len - pad_start);
@@ -1879,8 +2087,10 @@ pub const AbiClassifier = struct {
                 .is_nocapture = true,
             };
             recipe.context_recipe = .{
-                .lowered_size_bytes = type_system.ContextFieldLayout.BYTE_SIZE_64,
-                .pointee_align_bytes = 8,
+                .lowered_size_bytes = type_system.ContextFieldLayout.byteSizeForPtrWidth(
+                    resolver.target_spec.ptrBytes(),
+                ),
+                .pointee_align_bytes = resolver.target_spec.ptrBytes(),
                 .pass_mode = .indirect_by_ref,
                 .bank_0 = .gpr,
                 .attr_bits = @bitCast(ctx_attrs),
@@ -2112,7 +2322,11 @@ pub const AbiClassifier = struct {
                 populateCSret(&recipe, ret_layout);
             }
         } else if (target.arch == .aarch64) {
-            if (try inspectAarch64HfaBounded(resolver, sig.ret_ty, 0)) |hfa| {
+            const ret_hfa = if (isScalarFloatType(resolver.pool, sig.ret_ty))
+                null
+            else
+                try inspectAarch64HfaBounded(resolver, sig.ret_ty, 0);
+            if (ret_hfa) |hfa| {
                 recipe.ret_recipe = .{
                     .lowered_size_bytes = @intCast(ret_layout.size_bytes),
                     .pointee_align_bytes = ret_layout.alignBytes(),
@@ -2217,7 +2431,12 @@ pub const AbiClassifier = struct {
                     };
                 }
             } else if (target.arch == .aarch64) {
-                if (try inspectAarch64HfaBounded(resolver, param.type_id, 0)) |hfa| {
+                const is_win_arm64_variadic = target.isWindows() and sig.is_variadic;
+                const opt_hfa = if (is_win_arm64_variadic or isScalarFloatType(resolver.pool, param.type_id))
+                    null
+                else
+                    try inspectAarch64HfaBounded(resolver, param.type_id, 0);
+                if (opt_hfa) |hfa| {
                     param_recipes[i] = .{
                         .lowered_size_bytes = clamped_sz,
                         .pointee_align_bytes = p_layout.alignBytes(),
@@ -2235,7 +2454,10 @@ pub const AbiClassifier = struct {
                         .lowered_size_bytes = clamped_sz,
                         .pointee_align_bytes = p_layout.alignBytes(),
                         .pass_mode = .direct_scalar,
-                        .bank_0 = if (isScalarFloatType(resolver.pool, param.type_id)) .xmm_vec else .gpr,
+                        .bank_0 = if (!is_win_arm64_variadic and isScalarFloatType(resolver.pool, param.type_id))
+                            .xmm_vec
+                        else
+                            .gpr,
                         .attr_bits = @bitCast(ext_attrs),
                         .piece_count = 1,
                     };
@@ -2343,8 +2565,10 @@ pub const AbiClassifier = struct {
                 .is_nocapture = true,
             };
             recipe.context_recipe = .{
-                .lowered_size_bytes = type_system.ContextFieldLayout.BYTE_SIZE_64,
-                .pointee_align_bytes = 8,
+                .lowered_size_bytes = type_system.ContextFieldLayout.byteSizeForPtrWidth(
+                    resolver.target_spec.ptrBytes(),
+                ),
+                .pointee_align_bytes = resolver.target_spec.ptrBytes(),
                 .pass_mode = .indirect_by_ref,
                 .bank_0 = .gpr,
                 .attr_bits = @bitCast(ctx_attrs),
@@ -2580,6 +2804,9 @@ pub fn atomicWriteOutputFile(
     }
 }
 
+/// Canonical Phase 8 alias for `atomicWriteOutputFile` (`Prune-02` `UnlinkAndReplace`).
+pub const writeArtifactAtomic = atomicWriteOutputFile;
+
 /// Reads `staged_src_path` and atomically publishes it onto `final_dest_path` (`Prune-02`).
 pub fn publishStagedFileAtomic(
     io: std.Io,
@@ -2645,9 +2872,27 @@ comptime {
     std.debug.assert(@sizeOf(AbiParamRecipe) == 16 and @alignOf(AbiParamRecipe) == 4);
     std.debug.assert(@sizeOf(ProvenValueRange) == 24 and @alignOf(ProvenValueRange) == 8);
     std.debug.assert(@typeInfo(CodegenBackend) == .@"union");
+    std.debug.assert(@backingInt(TargetOs.linux) == @backingInt(symbol_resolver.CfgOs.linux));
+    std.debug.assert(@backingInt(TargetOs.macos) == @backingInt(symbol_resolver.CfgOs.macos));
+    std.debug.assert(@backingInt(TargetOs.windows) == @backingInt(symbol_resolver.CfgOs.windows));
+    std.debug.assert(@backingInt(TargetOs.wasi) == @backingInt(symbol_resolver.CfgOs.wasi));
+    std.debug.assert(@backingInt(TargetOs.freestanding) == @backingInt(symbol_resolver.CfgOs.freestanding));
+    std.debug.assert(@backingInt(TargetAbi.gnu) == @backingInt(symbol_resolver.CfgAbi.gnu));
+    std.debug.assert(@backingInt(TargetAbi.msvc) == @backingInt(symbol_resolver.CfgAbi.msvc));
+    std.debug.assert(@backingInt(TargetAbi.musl) == @backingInt(symbol_resolver.CfgAbi.musl));
+    std.debug.assert(@backingInt(TargetAbi.apple) == @backingInt(symbol_resolver.CfgAbi.apple));
+    std.debug.assert(@backingInt(TargetAbi.wasi) == @backingInt(symbol_resolver.CfgAbi.wasi));
+    std.debug.assert(@backingInt(TargetAbi.none) == @backingInt(symbol_resolver.CfgAbi.none));
+    for (ALL_CANONICAL_TARGETS, 0..) |lhs_spec, i| {
+        std.debug.assert(TargetSpec.isValidTriple(lhs_spec.arch, lhs_spec.os, lhs_spec.abi));
+        for (ALL_CANONICAL_TARGETS[i + 1 ..]) |rhs_spec| {
+            std.debug.assert(lhs_spec.archOsTag() != rhs_spec.archOsTag());
+        }
+    }
 }
 
 test "Phase 7.6 built-in TypeId layouts, 3-tier closures, and variadic ABI recipes" {
+    _ = codegen_link;
     const allocator = std.testing.allocator;
     var interner = try StringInterner.init(allocator);
     defer interner.deinit();
@@ -2686,8 +2931,26 @@ test "Phase 7.6 built-in TypeId layouts, 3-tier closures, and variadic ABI recip
     try std.testing.expectEqual(@as(u64, 8), (try resolver64.resolveType(.task_group_base_ty)).size_bytes);
     try std.testing.expectEqual(@as(u64, 8), (try resolver64.resolveType(.task_handle_base_ty)).size_bytes);
 
-    const tier1_closure = try pool.internClosureSignatureExt(&.{.i32_ty}, &.{.let_mode}, .i32_ty, .{}, .copy_tier, false, false, true);
-    const tier2_closure = try pool.internClosureSignatureExt(&.{.i32_ty}, &.{.let_mode}, .i32_ty, .{}, .auto_drop_tier, false, false, true);
+    const tier1_closure = try pool.internClosureSignatureExt(
+        &.{.i32_ty},
+        &.{.let_mode},
+        .i32_ty,
+        .{},
+        .copy_tier,
+        false,
+        false,
+        true,
+    );
+    const tier2_closure = try pool.internClosureSignatureExt(
+        &.{.i32_ty},
+        &.{.let_mode},
+        .i32_ty,
+        .{},
+        .auto_drop_tier,
+        false,
+        false,
+        true,
+    );
     try std.testing.expect(!isThreeWordClosureType(&pool, tier1_closure));
     try std.testing.expect(isThreeWordClosureType(&pool, tier2_closure));
     try std.testing.expectEqual(@as(u64, 16), (try resolver64.resolveType(tier1_closure)).size_bytes);
@@ -2741,4 +3004,202 @@ test "Phase 7.6 built-in TypeId layouts, 3-tier closures, and variadic ABI recip
     try std.testing.expectEqual(AbiPassMode.direct_pair, arm_c_rec.param_recipes[0].pass_mode);
     try std.testing.expectEqual(@as(u8, 16), arm_c_rec.param_recipes[0].pointee_align_bytes);
     try std.testing.expectEqual(AbiPassMode.direct_pair, arm_c_rec.ret_recipe.pass_mode);
+}
+
+test "Phase 8 11-target cross-compilation matrix, C ABI scalar queries, and LinkMode parsing" {
+    for (ALL_CANONICAL_TARGETS) |spec| {
+        const parsed = TargetSpec.parseTargetTriple(spec.asTripleStr()).?;
+        try std.testing.expectEqual(spec, parsed);
+        try std.testing.expect(TargetSpec.isValidTriple(spec.arch, spec.os, spec.abi));
+        try std.testing.expect(spec.asZigTargetTriple().len > 0);
+        try std.testing.expect(spec.asLlvmTargetTriple().len > 0);
+        try std.testing.expect(spec.asLlvmDataLayout().len > 0);
+    }
+
+    try std.testing.expectEqual(TargetSpec.WASM32_UNKNOWN_FREESTANDING, TargetSpec.fromTriple("wasm32-unknown-unknown").?);
+    try std.testing.expectEqual(TargetSpec.X86_64_WINDOWS_GNU, TargetSpec.fromTriple("x86_64-w64-mingw32").?);
+    try std.testing.expectEqual(TargetSpec.X86_64_LINUX_MUSL, TargetSpec.fromTriple("x86_64-unknown-linux-musl").?);
+    try std.testing.expectEqual(TargetSpec.AARCH64_LINUX_MUSL, TargetSpec.fromTriple("aarch64-unknown-linux-musl").?);
+    try std.testing.expectEqual(TargetSpec.WASM32_UNKNOWN_WASI, TargetSpec.fromTriple("wasm32-wasi-preview1").?);
+
+    try std.testing.expect(!TargetSpec.AARCH64_LINUX_GNU.isCCharSigned());
+    try std.testing.expect(!TargetSpec.AARCH64_LINUX_MUSL.isCCharSigned());
+    try std.testing.expect(TargetSpec.AARCH64_APPLE_DARWIN.isCCharSigned());
+    try std.testing.expect(TargetSpec.AARCH64_WINDOWS_MSVC.isCCharSigned());
+    try std.testing.expect(TargetSpec.X86_64_LINUX_GNU.isCCharSigned());
+    try std.testing.expect(TargetSpec.WASM32_UNKNOWN_FREESTANDING.isFreestanding());
+
+    try std.testing.expectEqual(@as(u8, 4), TargetSpec.X86_64_WINDOWS_MSVC.cLongByteSize());
+    try std.testing.expectEqual(@as(u8, 4), TargetSpec.X86_64_WINDOWS_GNU.cLongByteSize());
+    try std.testing.expectEqual(@as(u8, 4), TargetSpec.WASM32_UNKNOWN_WASI.cLongByteSize());
+    try std.testing.expectEqual(@as(u8, 8), TargetSpec.X86_64_LINUX_GNU.cLongByteSize());
+    try std.testing.expectEqual(@as(u8, 8), TargetSpec.AARCH64_APPLE_DARWIN.cLongByteSize());
+
+    try std.testing.expectEqualStrings(".obj", TargetSpec.X86_64_WINDOWS_MSVC.defaultObjExtension());
+    try std.testing.expectEqualStrings(".o", TargetSpec.X86_64_WINDOWS_GNU.defaultObjExtension());
+    try std.testing.expectEqualStrings(".lib", TargetSpec.X86_64_WINDOWS_MSVC.defaultStaticLibExtension());
+    try std.testing.expectEqualStrings(".a", TargetSpec.X86_64_WINDOWS_GNU.defaultStaticLibExtension());
+    try std.testing.expectEqualStrings(".dll", TargetSpec.X86_64_WINDOWS_GNU.defaultSharedLibExtension());
+    try std.testing.expectEqualStrings(".dylib", TargetSpec.AARCH64_APPLE_DARWIN.defaultSharedLibExtension());
+    try std.testing.expectEqualStrings(".so", TargetSpec.X86_64_LINUX_GNU.defaultSharedLibExtension());
+    try std.testing.expectEqualStrings(".wasm", TargetSpec.WASM32_UNKNOWN_FREESTANDING.defaultSharedLibExtension());
+
+    try std.testing.expectEqual(LinkMode.auto, LinkMode.fromStr("auto").?);
+    try std.testing.expectEqual(LinkMode.static, LinkMode.fromStr("static").?);
+    try std.testing.expectEqual(LinkMode.dynamic, LinkMode.fromStr("dynamic").?);
+    try std.testing.expect(LinkMode.fromStr("invalid") == null);
+}
+
+test "Phase 8 R-1 wasm32 & aarch64-windows datalayouts and WinARM64 variadic GPR-only ABI" {
+    const expected_wasm_dl = "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-f128:64-n32:64-S128-ni:1:10:20";
+    const expected_win_arm64_dl = "e-m:w-p270:32:32-p271:32:32-p272:64:64-p:64:64-i32:32-i64:64-i128:128-n32:64-S128-Fn32";
+    try std.testing.expectEqualStrings(expected_wasm_dl, TargetSpec.WASM32_UNKNOWN_WASI.asLlvmDataLayout());
+    try std.testing.expectEqualStrings(expected_wasm_dl, TargetSpec.WASM32_UNKNOWN_FREESTANDING.asLlvmDataLayout());
+    try std.testing.expectEqualStrings(expected_win_arm64_dl, TargetSpec.AARCH64_WINDOWS_MSVC.asLlvmDataLayout());
+
+    const allocator = std.testing.allocator;
+    var interner = try StringInterner.init(allocator);
+    defer interner.deinit();
+    var pool = try InternPool.init(allocator);
+    defer pool.deinit();
+    var sym_table = try SymbolTable.init(allocator, &interner);
+    defer sym_table.deinit();
+
+    const raw_u8_ptr = try pool.internRawPtr(.u8_ty, false);
+    const hfa_f32x2 = try pool.internArray(.f32_ty, 2, false);
+    const hfa_f64x2 = try pool.internArray(.f64_ty, 2, false);
+    const hfa_f64x3 = try pool.internArray(.f64_ty, 3, false);
+
+    var win_arm64_res = TypeLayoutResolver.init(allocator, &pool, &sym_table, TargetSpec.AARCH64_WINDOWS_MSVC);
+    defer win_arm64_res.deinit();
+
+    // [1] Non-variadic `aarch64-windows-msvc` still uses `.xmm_vec` / `.direct_hfa`:
+    var non_var_rec = try AbiClassifier.classifyFn(allocator, &win_arm64_res, .{
+        .params = &.{
+            .{ .type_id = .f64_ty },
+            .{ .type_id = hfa_f32x2 },
+            .{ .type_id = hfa_f64x3 },
+        },
+        .ret_ty = .i32_ty,
+        .is_extern_c = true,
+        .is_variadic = false,
+    });
+    defer non_var_rec.deinit(allocator);
+    try std.testing.expectEqual(AbiPassMode.direct_scalar, non_var_rec.param_recipes[0].pass_mode);
+    try std.testing.expectEqual(RegBank.xmm_vec, non_var_rec.param_recipes[0].bank_0);
+    try std.testing.expectEqual(AbiPassMode.direct_hfa, non_var_rec.param_recipes[1].pass_mode);
+    try std.testing.expectEqual(AbiPassMode.direct_hfa, non_var_rec.param_recipes[2].pass_mode);
+
+    // [2] Variadic `aarch64-windows-msvc` disables FP/SIMD registers and HFA across all parameters:
+    var win_var_rec = try AbiClassifier.classifyFn(allocator, &win_arm64_res, .{
+        .params = &.{
+            .{ .type_id = raw_u8_ptr },
+            .{ .type_id = .f64_ty },
+            .{ .type_id = hfa_f32x2 },
+            .{ .type_id = hfa_f64x2 },
+            .{ .type_id = hfa_f64x3 },
+        },
+        .ret_ty = .i32_ty,
+        .is_extern_c = true,
+        .is_variadic = true,
+    });
+    defer win_var_rec.deinit(allocator);
+    try std.testing.expectEqual(AbiPassMode.direct_scalar, win_var_rec.param_recipes[1].pass_mode);
+    try std.testing.expectEqual(RegBank.gpr, win_var_rec.param_recipes[1].bank_0);
+    try std.testing.expectEqual(AbiPassMode.direct_scalar, win_var_rec.param_recipes[2].pass_mode);
+    try std.testing.expectEqual(RegBank.gpr, win_var_rec.param_recipes[2].bank_0);
+    try std.testing.expectEqual(AbiPassMode.direct_pair, win_var_rec.param_recipes[3].pass_mode);
+    try std.testing.expectEqual(RegBank.gpr, win_var_rec.param_recipes[3].bank_0);
+    try std.testing.expectEqual(RegBank.gpr, win_var_rec.param_recipes[3].bank_1);
+    try std.testing.expectEqual(AbiPassMode.indirect_by_ref, win_var_rec.param_recipes[4].pass_mode);
+    try std.testing.expectEqual(RegBank.gpr, win_var_rec.param_recipes[4].bank_0);
+
+    // [3] Variadic `aarch64-linux-gnu` preserves AAPCS64 `.xmm_vec` / `.direct_hfa` fixed parameters:
+    var linux_arm64_res = TypeLayoutResolver.init(allocator, &pool, &sym_table, TargetSpec.AARCH64_LINUX_GNU);
+    defer linux_arm64_res.deinit();
+    var linux_var_rec = try AbiClassifier.classifyFn(allocator, &linux_arm64_res, .{
+        .params = &.{
+            .{ .type_id = raw_u8_ptr },
+            .{ .type_id = .f64_ty },
+            .{ .type_id = hfa_f64x3 },
+        },
+        .ret_ty = .i32_ty,
+        .is_extern_c = true,
+        .is_variadic = true,
+    });
+    defer linux_var_rec.deinit(allocator);
+    try std.testing.expectEqual(RegBank.xmm_vec, linux_var_rec.param_recipes[1].bank_0);
+    try std.testing.expectEqual(AbiPassMode.direct_hfa, linux_var_rec.param_recipes[2].pass_mode);
+}
+
+test "Phase 8 Wave 3C-2 Future[T] layout and 10-slot Context ABI across 64-bit and wasm32" {
+    const allocator = std.testing.allocator;
+    var interner = try StringInterner.init(allocator);
+    defer interner.deinit();
+    var pool = try InternPool.init(allocator);
+    defer pool.deinit();
+    var sym_table = try SymbolTable.init(allocator, &interner);
+    defer sym_table.deinit();
+
+    const fut_unit = try pool.internFuture(.unit_ty, 0);
+    const fut_i32 = try pool.internFuture(.i32_ty, 0);
+    const fut_u128 = try pool.internFuture(.u128_ty, 0);
+
+    // [1] 64-bit native target (`80B` 10-slot `Context`, `32B` header + aligned output):
+    var res_64 = TypeLayoutResolver.init(allocator, &pool, &sym_table, TargetSpec.X86_64_LINUX_GNU);
+    defer res_64.deinit();
+    const lay_unit_64 = try res_64.resolveType(fut_unit);
+    const lay_i32_64 = try res_64.resolveType(fut_i32);
+    const lay_u128_64 = try res_64.resolveType(fut_u128);
+    try std.testing.expectEqual(@as(u64, 32), lay_unit_64.size_bytes);
+    try std.testing.expectEqual(@as(u32, 8), lay_unit_64.alignBytes());
+    try std.testing.expectEqual(@as(u64, 40), lay_i32_64.size_bytes);
+    try std.testing.expectEqual(@as(u32, 8), lay_i32_64.alignBytes());
+    try std.testing.expectEqual(@as(u64, 48), lay_u128_64.size_bytes);
+    try std.testing.expectEqual(@as(u32, 16), lay_u128_64.alignBytes());
+
+    var rec_64 = try AbiClassifier.classifyFn(allocator, &res_64, .{
+        .params = &.{},
+        .ret_ty = fut_unit,
+        .is_contextless = false,
+    });
+    defer rec_64.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 80), rec_64.context_recipe.lowered_size_bytes);
+    try std.testing.expectEqual(@as(u32, 8), rec_64.context_recipe.pointee_align_bytes);
+
+    // [2] 32-bit `wasm32` target (`40B` 10-slot `Context`, `16B` header + aligned output):
+    var res_wasm = TypeLayoutResolver.init(allocator, &pool, &sym_table, TargetSpec.WASM32_UNKNOWN_WASI);
+    defer res_wasm.deinit();
+    const lay_unit_wasm = try res_wasm.resolveType(fut_unit);
+    const lay_i32_wasm = try res_wasm.resolveType(fut_i32);
+    try std.testing.expectEqual(@as(u64, 16), lay_unit_wasm.size_bytes);
+    try std.testing.expectEqual(@as(u32, 4), lay_unit_wasm.alignBytes());
+    try std.testing.expectEqual(@as(u64, 20), lay_i32_wasm.size_bytes);
+    try std.testing.expectEqual(@as(u32, 4), lay_i32_wasm.alignBytes());
+
+    var rec_wasm = try AbiClassifier.classifyFn(allocator, &res_wasm, .{
+        .params = &.{},
+        .ret_ty = fut_unit,
+        .is_contextless = false,
+    });
+    defer rec_wasm.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 40), rec_wasm.context_recipe.lowered_size_bytes);
+    try std.testing.expectEqual(@as(u32, 4), rec_wasm.context_recipe.pointee_align_bytes);
+
+    // [3] `aarch64` scalar `f64` classifies as `.direct_scalar` while `[f64; 2]` classifies as `.direct_hfa`:
+    const hfa_pair = try pool.internArray(.f64_ty, 2, false);
+    var res_arm64 = TypeLayoutResolver.init(allocator, &pool, &sym_table, TargetSpec.AARCH64_LINUX_GNU);
+    defer res_arm64.deinit();
+    var rec_arm64 = try AbiClassifier.classifyFn(allocator, &res_arm64, .{
+        .params = &.{
+            .{ .type_id = .f64_ty },
+            .{ .type_id = hfa_pair },
+        },
+        .ret_ty = .f64_ty,
+        .is_extern_c = true,
+    });
+    defer rec_arm64.deinit(allocator);
+    try std.testing.expectEqual(AbiPassMode.direct_scalar, rec_arm64.param_recipes[0].pass_mode);
+    try std.testing.expectEqual(RegBank.xmm_vec, rec_arm64.param_recipes[0].bank_0);
+    try std.testing.expectEqual(AbiPassMode.direct_hfa, rec_arm64.param_recipes[1].pass_mode);
 }

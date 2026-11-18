@@ -40,6 +40,9 @@ const LosslessCstArena = syntax_arenas.LosslessCstArena;
 const AstTag = syntax_arenas.AstTag;
 const AstNode = syntax_arenas.AstNode;
 const AstArena = syntax_arenas.AstArena;
+const ExternVisibility = syntax_arenas.ExternVisibility;
+const ExternBlockFlags = syntax_arenas.ExternBlockFlags;
+const ExternStaticFlags = syntax_arenas.ExternStaticFlags;
 const MAX_PARSE_DEPTH: u32 = @intCast(syntax_arenas.MAX_PARSE_DEPTH);
 
 const IdentifierCase = lexer.IdentifierCase;
@@ -171,10 +174,35 @@ const TopLevelItemWindow = struct {
     end_byte: u32,
 };
 
+/// Contiguous outer `.attribute` CST range attached to a parsed declaration header.
+const ParsedAttrSlice = struct {
+    /// Starting `CstNodeIndex` of the first `.attribute` CST node (`CstNodeIndex.none.asInt()` when `attr_len == 0`).
+    attr_start: u32 = std.math.maxInt(u32),
+    /// Total number of `.attribute` CST subtrees parsed on the declaration header.
+    attr_len: u32 = 0,
+};
+
 // --------------------------------------- CONSTS ----------------------------------------
 
 /// Hard upper bound on non-mutating `LL(k)` token lookahead steps (`DR-21` Section 1.5).
 pub const MAX_TYPE_LOOKAHEAD: usize = 64;
+
+/// Canonical C ABI primitive type alias identifiers exempted from `W0201` `PascalCase` checks (`DR-10` §2.1).
+pub const CANONICAL_C_TYPE_ALIASES = std.StaticStringMap(void).initComptime(.{
+    .{ "c_char", {} },
+    .{ "c_int", {} },
+    .{ "c_long", {} },
+    .{ "c_longdouble", {} },
+    .{ "c_longlong", {} },
+    .{ "c_schar", {} },
+    .{ "c_short", {} },
+    .{ "c_uchar", {} },
+    .{ "c_uint", {} },
+    .{ "c_ulong", {} },
+    .{ "c_ulonglong", {} },
+    .{ "c_ushort", {} },
+    .{ "c_void", {} },
+});
 
 // -------------------- Synchronization Sets --------------------
 
@@ -336,6 +364,17 @@ pub const MEMBER_STOP_SET: TokenSet128 = TokenSet128.initMany(&.{
     .kw_fn,
     .eof,
 });
+/// Stop-before anchor set for `extern` block member declaration loops.
+pub const EXTERN_MEMBER_STOP_SET: TokenSet128 = TokenSet128.initMany(&.{
+    .rbrace,
+    .at,
+    .kw_pub,
+    .kw_const,
+    .kw_unsafe,
+    .kw_extern,
+    .kw_fn,
+    .eof,
+});
 /// Consume-anchor set for function parameter lists.
 pub const PARAM_CONSUME_SET: TokenSet128 = TokenSet128.initMany(&.{.comma});
 /// Stop-before anchor set for function parameter lists.
@@ -471,6 +510,11 @@ inline fn isCarrierToken(record: TokenRecord) bool {
 /// Returns `true` if `kind` belongs to one of the three cased identifier categories.
 inline fn isIdentifierKind(kind: TokenKind) bool {
     return kind == .ident or kind == .type_ident or kind == .const_ident;
+}
+
+/// Returns `true` if `kind` is a `snake_case` identifier or `.kw_async` module path segment.
+inline fn isIdentOrModuleSegment(kind: TokenKind) bool {
+    return kind == .ident or kind == .kw_async;
 }
 
 /// Returns `true` if `kind` is one of the 50 language keywords (`0..49`).
@@ -640,9 +684,87 @@ fn hasCleanTokensAndCst(
     var i: usize = 0;
     while (i < token_count) : (i += 1) {
         const flags = flag_slice[i];
-        if (flags.has_lexer_error or flags.is_synthesized) return false;
+        if ((flags.has_lexer_error and !isIdentifierKind(kind_slice[i])) or flags.is_synthesized) {
+            return false;
+        }
     }
     return true;
+}
+
+/// Re-emits lexer-originated `W0201` warnings for spliced identifier tokens carrying `has_lexer_error`.
+fn replayLexerCasingWarnings(
+    source: []const u8,
+    file_id: FileId,
+    token_buffer: *const TokenBuffer,
+    diagnostic_sink: ?*DiagnosticSink,
+    interner: ?*StringInterner,
+) !void {
+    const sink = diagnostic_sink orelse return;
+    const total_tokens = token_buffer.countTokens();
+    const kind_slice = token_buffer.tokens.items(.kind);
+    const flag_slice = token_buffer.tokens.items(.flags);
+
+    var tok_i: usize = 0;
+    while (tok_i < total_tokens) : (tok_i += 1) {
+        if (!flag_slice[tok_i].has_lexer_error or !isIdentifierKind(kind_slice[tok_i])) continue;
+        const tok_id = TokenIndex.fromInt(@intCast(tok_i));
+        const record = token_buffer.getToken(tok_id);
+        const start_off: usize = record.byte_offset;
+        const end_off: usize = @min(start_off + @as(usize, record.byte_len), source.len);
+        const lexeme = source[start_off..end_off];
+        const classification = lexer.classifyIdentifierOrKeyword(lexeme);
+        if (!classification.has_case_violation) continue;
+
+        const ident_span = Span.init(file_id, @intCast(start_off), @intCast(end_off));
+        const label_msg = switch (classification.expected_case) {
+            .snake_case => "value/function identifiers must use `snake_case`",
+            .pascal_case => "type/variant identifiers must use `PascalCase` without underscores",
+            .screaming_snake_case => "constant identifiers must use `SCREAMING_SNAKE_CASE`",
+            .reserved_or_wildcard => "identifier does not follow canonical CoreX casing",
+        };
+        const primary_labels = [_]LabeledSpan{.{
+            .span = ident_span,
+            .label = label_msg,
+            .style = .primary,
+        }};
+
+        if (interner) |str_interner| {
+            const converted = switch (classification.expected_case) {
+                .snake_case => try lexer.toSnakeCase(sink.arena.asAllocator(), lexeme),
+                .pascal_case => try lexer.toPascalCase(sink.arena.asAllocator(), lexeme),
+                .screaming_snake_case => try lexer.toScreamingSnakeCase(sink.arena.asAllocator(), lexeme),
+                .reserved_or_wildcard => lexeme,
+            };
+            const fix_edits = [_]TextEdit{.{
+                .file_id = file_id,
+                .start_byte = ident_span.start_byte,
+                .end_byte = ident_span.end_byte,
+                .replacement_id = try str_interner.intern(converted),
+            }};
+            const fixes = [_]SuggestedFix{.{
+                .message = "convert identifier to canonical CoreX casing",
+                .applicability = .machine_applicable,
+                .priority = .lint_idiom,
+                .edits = &fix_edits,
+            }};
+            try sink.emit(.{
+                .code = .w0201_non_canonical_identifier_case,
+                .severity = .warning,
+                .primary_span = ident_span,
+                .message = "identifier does not follow canonical CoreX casing",
+                .labels = &primary_labels,
+                .suggestions = &fixes,
+            });
+        } else {
+            try sink.emit(.{
+                .code = .w0201_non_canonical_identifier_case,
+                .severity = .warning,
+                .primary_span = ident_span,
+                .message = "identifier does not follow canonical CoreX casing",
+                .labels = &primary_labels,
+            });
+        }
+    }
 }
 
 /// Walks top-level CST children of `.source_file` in $O(K)$ steps using `subtree_size`.
@@ -843,6 +965,14 @@ pub const Parser = struct {
     is_in_lhs_place: bool = false,
     /// `true` while parsing the top-level condition header of an `if` or `while` expression.
     is_in_cond_header: bool = false,
+    /// `true` while parsing inside a declaration or member annotated with `@allow(non_canonical_case)`.
+    is_allowing_non_canonical_case: bool = false,
+    /// `true` while executing `Parser.parse()`, gating scratch casing-exemption sets freed on exit.
+    is_in_full_parse: bool = false,
+    /// Nominal type identifiers declared under `@allow(non_canonical_case)` in the active `parse()` pass.
+    allowed_non_canonical_types: std.StringHashMapUnmanaged(void) = .empty,
+    /// Member, symbol, and foreign `extern` identifiers exempted from `W0201` in the active `parse()` pass.
+    allowed_non_canonical_members: std.StringHashMapUnmanaged(void) = .empty,
 
     /// Initializes a `Parser` with default `ParserOptions`.
     pub fn init(
@@ -893,6 +1023,9 @@ pub const Parser = struct {
     pub fn parse(self: *Parser) !NodeIndex {
         self.cst.parse_stack.clearRetainingCapacity();
         self.is_recovering_depth_overflow = false;
+        self.is_in_full_parse = true;
+        defer self.clearAllowedNonCanonicalNames();
+        try self.precollectAllowedNonCanonicalNames();
 
         try self.flushCarrierTokens();
         const first_tok = self.peekTokenIndexNth(0);
@@ -1079,6 +1212,15 @@ pub const Parser = struct {
 
         const token_id = TokenIndex.fromInt(self.cursor);
         const record = self.token_buffer.getToken(token_id);
+        if (record.flags.has_lexer_error and isIdentifierKind(record.kind)) {
+            const lexeme = self.getTokenLexeme(token_id);
+            if (self.is_allowing_non_canonical_case or
+                self.allowed_non_canonical_types.contains(lexeme) or
+                self.allowed_non_canonical_members.contains(lexeme))
+            {
+                self.suppressCasingWarningAtToken(token_id);
+            }
+        }
         const is_lexer_non_case_err = record.flags.has_lexer_error and !isIdentifierKind(record.kind);
         _ = try self.cst.appendLeafNode(cst_kind, token_id, .{
             .has_error = extra_flags.has_error or is_lexer_non_case_err,
@@ -1153,12 +1295,30 @@ pub const Parser = struct {
             sizes_slice[insert_idx] = 1;
         }
 
-        // Shift `ast_to_cst` origins for AST nodes created inside the LHS subtree:
+        // Shift `ast_to_cst` origins and CST-indexed `attr_start` fields inside the LHS subtree:
         var ast_idx: usize = lhs_ast_start;
         while (ast_idx < self.ast.ast_to_cst.items.len) : (ast_idx += 1) {
             const origin = self.ast.ast_to_cst.items[ast_idx];
             if (!origin.isNone() and origin.asInt() >= insert_idx) {
                 self.ast.ast_to_cst.items[ast_idx] = CstNodeIndex.fromInt(origin.asInt() + 1);
+            }
+            const node = self.ast.nodes.get(ast_idx);
+            if (node.tag == .extern_block_decl and node.lhs.tag == .extra) {
+                const base: usize = node.lhs.payload;
+                if (base + 3 < self.ast.extra_data.items.len and
+                    self.ast.extra_data.items[base + 3] > 0 and
+                    self.ast.extra_data.items[base + 2] >= insert_idx)
+                {
+                    self.ast.extra_data.items[base + 2] += 1;
+                }
+            } else if (node.tag == .extern_static_decl and node.rhs.tag == .extra) {
+                const base: usize = node.rhs.payload;
+                if (base + 4 < self.ast.extra_data.items.len and
+                    self.ast.extra_data.items[base + 4] > 0 and
+                    self.ast.extra_data.items[base + 3] >= insert_idx)
+                {
+                    self.ast.extra_data.items[base + 3] += 1;
+                }
             }
         }
         return lhs_cst_start;
@@ -1638,7 +1798,7 @@ pub const Parser = struct {
         return cond_expr;
     }
 
-    /// Consumes an identifier, recovering cross-namespace casing violations via `W0201`.
+    /// Consumes an identifier, recovering cross-namespace and hybrid casing violations via `W0201`.
     fn expectIdentifierWithCasing(
         self: *Parser,
         expected_kind: TokenKind,
@@ -1646,13 +1806,80 @@ pub const Parser = struct {
         has_error: *bool,
         missing_msg: []const u8,
     ) !TokenIndex {
-        const cur_kind = self.peekKind();
-        if (cur_kind == expected_kind) {
-            return self.consumeLeaf(.token_leaf, .{});
+        const cur_rec = self.peekNth(0);
+        if (isIdentifierKind(cur_rec.kind)) {
+            const preview_lexeme = self.peekLexemeNth(0);
+            const is_exempt_type = expected_case == .pascal_case and
+                (CANONICAL_C_TYPE_ALIASES.has(preview_lexeme) or
+                    self.allowed_non_canonical_types.contains(preview_lexeme));
+            const is_exempt_member = expected_case == .snake_case and
+                self.allowed_non_canonical_members.contains(preview_lexeme);
+            if (self.is_allowing_non_canonical_case or is_exempt_type or is_exempt_member) {
+                const tok_id = try self.consumeLeaf(.token_leaf, .{});
+                self.suppressCasingWarningAtToken(tok_id);
+                if (self.is_allowing_non_canonical_case and self.is_in_full_parse and preview_lexeme.len > 0) {
+                    if (expected_case == .pascal_case) {
+                        try self.allowed_non_canonical_types.put(self.ast.allocator, preview_lexeme, {});
+                    } else {
+                        try self.allowed_non_canonical_members.put(self.ast.allocator, preview_lexeme, {});
+                    }
+                }
+                return tok_id;
+            }
         }
-        if (isIdentifierKind(cur_kind)) {
+        if (cur_rec.kind == expected_kind) {
+            const tok_id = try self.consumeLeaf(.token_leaf, .{});
+            if (cur_rec.flags.has_lexer_error) {
+                try self.emitOrUpdateCasingWarning(tok_id, expected_case);
+            }
+            return tok_id;
+        }
+        if (isIdentifierKind(cur_rec.kind)) {
             const tok_id = try self.consumeLeaf(.token_leaf, .{});
             try self.emitOrUpdateCasingWarning(tok_id, expected_case);
+            return tok_id;
+        }
+        has_error.* = true;
+        const err_tok = self.peekTokenIndexNth(0);
+        try self.emitUnexpectedToken(err_tok, missing_msg, "expected identifier here");
+        return err_tok;
+    }
+
+    /// Removes any pre-emitted lexer `W0201` casing warning at `token_id` for foreign `extern` or `@allow` symbols.
+    fn suppressCasingWarningAtToken(self: *Parser, token_id: TokenIndex) void {
+        const sink = self.diagnostic_sink orelse return;
+        const ident_span = self.getTokenSpan(token_id);
+        var diag_idx: usize = 0;
+        while (diag_idx < sink.diagnostics.items.len) {
+            const existing_diag = sink.diagnostics.items[diag_idx];
+            if (existing_diag.code == .w0201_non_canonical_identifier_case and
+                existing_diag.primary_span.file_id == ident_span.file_id and
+                existing_diag.primary_span.start_byte == ident_span.start_byte and
+                existing_diag.primary_span.end_byte == ident_span.end_byte)
+            {
+                _ = sink.diagnostics.orderedRemove(diag_idx);
+                sink.warning_count -|= 1;
+            } else {
+                diag_idx += 1;
+            }
+        }
+    }
+
+    /// Consumes a foreign `extern` symbol identifier (`CreateFileW`, `sqlite3_open_v2`, `_errno`) without `W0201`.
+    fn expectExternSymbolIdentifier(
+        self: *Parser,
+        has_error: *bool,
+        missing_msg: []const u8,
+    ) !TokenIndex {
+        if (isIdentifierKind(self.peekKind())) {
+            const tok_id = try self.consumeLeaf(.token_leaf, .{});
+            self.suppressCasingWarningAtToken(tok_id);
+            if (self.is_in_full_parse) {
+                const sym_lexeme = self.getTokenLexeme(tok_id);
+                if (sym_lexeme.len > 0) {
+                    try self.allowed_non_canonical_members.put(self.ast.allocator, sym_lexeme, {});
+                }
+            }
             return tok_id;
         }
         has_error.* = true;
@@ -1751,8 +1978,18 @@ pub const Parser = struct {
 
     /// Parses a sequence of `@attr(key: val)` annotations into `self.cst` (`ADR-22E`).
     fn parseAttributes(self: *Parser, has_error: *bool) anyerror!void {
+        _ = try self.parseAttributesWithSlice(has_error);
+    }
+
+    /// Parses a sequence of `@attr(key: val)` annotations and returns their CST slice descriptor.
+    fn parseAttributesWithSlice(self: *Parser, has_error: *bool) anyerror!ParsedAttrSlice {
+        var result: ParsedAttrSlice = .{};
         while (self.peekKind() == .at) {
             const attr_cst = try self.startCstNode(.attribute);
+            if (result.attr_len == 0) {
+                result.attr_start = attr_cst.asInt();
+            }
+            result.attr_len += 1;
             var has_attr_err = false;
             const at_tok = try self.consumeLeaf(.token_leaf, .{});
             if (isIdentifierKind(self.peekKind()) or isKeywordKind(self.peekKind())) {
@@ -1828,24 +2065,32 @@ pub const Parser = struct {
             }
             self.cst.finishNode(attr_cst, .{ .has_error = has_attr_err });
         }
+        return result;
     }
 
     /// Parses optional `Vis = "pub" [ "(" ( "pkg" | "super" ) ")" ]` into `.visibility_modifier` CST (`ADR-22E`).
     fn parseVisibility(self: *Parser, has_error: *bool) anyerror!void {
-        if (self.peekKind() != .kw_pub) return;
+        _ = try self.parseVisibilityWithLevel(has_error);
+    }
+
+    /// Parses optional `Vis` into `.visibility_modifier` CST and returns its decoded `ExternVisibility`.
+    fn parseVisibilityWithLevel(self: *Parser, has_error: *bool) anyerror!ExternVisibility {
+        if (self.peekKind() != .kw_pub) return .private;
         if (self.peekKindNth(1) != .lparen) {
             _ = try self.consumeLeaf(.visibility_modifier, .{});
-            return;
+            return .public;
         }
 
         const vis_cst = try self.startCstNode(.visibility_modifier);
         var has_vis_err = false;
+        var parsed_vis: ExternVisibility = .public;
         _ = try self.consumeLeaf(.token_leaf, .{});
         const open_paren = try self.consumeLeaf(.token_leaf, .{});
-        if (self.peekKind() == .ident and
-            (std.mem.eql(u8, self.peekLexemeNth(0), "pkg") or
-                std.mem.eql(u8, self.peekLexemeNth(0), "super")))
-        {
+        if (self.peekKind() == .ident and std.mem.eql(u8, self.peekLexemeNth(0), "pkg")) {
+            parsed_vis = .pub_pkg;
+            _ = try self.consumeLeaf(.token_leaf, .{});
+        } else if (self.peekKind() == .ident and std.mem.eql(u8, self.peekLexemeNth(0), "super")) {
+            parsed_vis = .pub_super;
             _ = try self.consumeLeaf(.token_leaf, .{});
         } else {
             has_vis_err = true;
@@ -1872,6 +2117,7 @@ pub const Parser = struct {
         );
         if (has_vis_err) has_error.* = true;
         self.cst.finishNode(vis_cst, .{ .has_error = has_vis_err });
+        return parsed_vis;
     }
 
     /// Consumes a `,` or retired `;` member separator, emitting `E0224` when `;` is used (`ADR-22D`).
@@ -1906,8 +2152,13 @@ pub const Parser = struct {
         defer self.popStates(1);
 
         var has_error = false;
-        try self.parseAttributes(&has_error);
-        try self.parseVisibility(&has_error);
+        const outer_attrs = try self.parseAttributesWithSlice(&has_error);
+        const saved_allow_case = self.is_allowing_non_canonical_case;
+        if (self.hasAllowNonCanonicalCaseAttr(item_cst)) {
+            self.is_allowing_non_canonical_case = true;
+        }
+        defer self.is_allowing_non_canonical_case = saved_allow_case;
+        const outer_vis = try self.parseVisibilityWithLevel(&has_error);
 
         switch (self.peekKind()) {
             .kw_mod => return self.parseModItem(item_cst, &has_error),
@@ -1947,6 +2198,40 @@ pub const Parser = struct {
                     _ = try self.consumeLeaf(.token_leaf, .{});
                     return self.parseTraitItem(item_cst, &has_error);
                 }
+                if (self.peekKind() == .kw_extern or
+                    (self.peekKind() == .kw_unsafe and self.peekKindNth(1) == .kw_extern))
+                {
+                    const is_unsafe_extern = self.peekKind() == .kw_unsafe;
+                    const ext_idx: usize = if (is_unsafe_extern) 1 else 0;
+                    const after_abi_idx: usize = if (self.peekKindNth(ext_idx + 1) == .string_lit)
+                        ext_idx + 2
+                    else
+                        ext_idx + 1;
+                    const after_abi_kind = self.peekKindNth(after_abi_idx);
+                    if (after_abi_kind == .lbrace) {
+                        if (is_unsafe_extern) _ = try self.consumeLeaf(.token_leaf, .{});
+                        return self.parseExternBlockItem(
+                            item_cst,
+                            outer_vis,
+                            is_unsafe_extern,
+                            outer_attrs,
+                            &has_error,
+                        );
+                    }
+                    if (after_abi_kind == .ident and
+                        std.mem.eql(u8, self.peekLexemeNth(after_abi_idx), "static"))
+                    {
+                        if (is_unsafe_extern) _ = try self.consumeLeaf(.token_leaf, .{});
+                        return self.parseExternStaticItem(
+                            item_cst,
+                            .none,
+                            outer_vis,
+                            is_unsafe_extern,
+                            outer_attrs,
+                            &has_error,
+                        );
+                    }
+                }
                 return self.parseFunctionItem(item_cst, &has_error);
             },
             .ident => {
@@ -1978,7 +2263,7 @@ pub const Parser = struct {
         }, item_cst);
     }
 
-    /// Parses `ModItem = "mod" IDENT ( ";" | "{" { Item } "}" ) ;`.
+    /// Parses `ModItem = "mod" ( IDENT | "async" ) ( ";" | "{" { Item } "}" ) ;`.
     fn parseModItem(
         self: *Parser,
         item_cst: CstNodeIndex,
@@ -1986,12 +2271,15 @@ pub const Parser = struct {
     ) anyerror!NodeIndex {
         self.cst.nodes.items(.kind)[item_cst.asInt()] = .mod_item;
         const mod_tok = try self.consumeLeaf(.mod_introducer, .{});
-        const name_tok = try self.expectIdentifierWithCasing(
-            .ident,
-            .snake_case,
-            has_error,
-            "expected module name after `mod`",
-        );
+        const name_tok = if (self.peekKind() == .kw_async)
+            try self.consumeLeaf(.token_leaf, .{})
+        else
+            try self.expectIdentifierWithCasing(
+                .ident,
+                .snake_case,
+                has_error,
+                "expected module name after `mod`",
+            );
 
         var subitem_op: PackedOperand = .NONE;
         if (self.peekKind() == .lbrace) {
@@ -2098,7 +2386,11 @@ pub const Parser = struct {
             return;
         }
 
-        if (isIdentifierKind(self.peekKind()) or self.peekKind() == .kw_self_val or self.peekKind() == .kw_self_type) {
+        if (isIdentifierKind(self.peekKind()) or
+            self.peekKind() == .kw_async or
+            self.peekKind() == .kw_self_val or
+            self.peekKind() == .kw_self_type)
+        {
             _ = try self.consumeLeaf(.token_leaf, .{});
         } else {
             has_error.* = true;
@@ -2138,7 +2430,11 @@ pub const Parser = struct {
                 );
                 break;
             }
-            if (isIdentifierKind(self.peekKind()) or self.peekKind() == .kw_self_val or self.peekKind() == .kw_self_type) {
+            if (isIdentifierKind(self.peekKind()) or
+                self.peekKind() == .kw_async or
+                self.peekKind() == .kw_self_val or
+                self.peekKind() == .kw_self_type)
+            {
                 _ = try self.consumeLeaf(.token_leaf, .{});
             } else {
                 has_error.* = true;
@@ -2399,6 +2695,11 @@ pub const Parser = struct {
             var has_field_err = false;
 
             try self.parseAttributes(&has_field_err);
+            const saved_allow_field = self.is_allowing_non_canonical_case;
+            if (self.hasAllowNonCanonicalCaseAttr(field_cst)) {
+                self.is_allowing_non_canonical_case = true;
+            }
+            defer self.is_allowing_non_canonical_case = saved_allow_field;
             try self.parseVisibility(&has_field_err);
 
             if (isIdentifierKind(self.peekKind())) {
@@ -2547,6 +2848,11 @@ pub const Parser = struct {
             var has_mem_err = false;
 
             try self.parseAttributes(&has_mem_err);
+            const saved_allow_mem = self.is_allowing_non_canonical_case;
+            if (self.hasAllowNonCanonicalCaseAttr(member_cst)) {
+                self.is_allowing_non_canonical_case = true;
+            }
+            defer self.is_allowing_non_canonical_case = saved_allow_mem;
             try self.parseVisibility(&has_mem_err);
 
             if (isIdentifierKind(self.peekKind())) {
@@ -2637,6 +2943,11 @@ pub const Parser = struct {
                 var has_var_err = false;
 
                 try self.parseAttributes(&has_var_err);
+                const saved_allow_var = self.is_allowing_non_canonical_case;
+                if (self.hasAllowNonCanonicalCaseAttr(var_cst)) {
+                    self.is_allowing_non_canonical_case = true;
+                }
+                defer self.is_allowing_non_canonical_case = saved_allow_var;
                 if (isIdentifierKind(self.peekKind())) {
                     _ = try self.expectIdentifierWithCasing(
                         .type_ident,
@@ -2757,6 +3068,11 @@ pub const Parser = struct {
                 var has_mem_err = false;
 
                 try self.parseAttributes(&has_mem_err);
+                const saved_allow_mem = self.is_allowing_non_canonical_case;
+                if (self.hasAllowNonCanonicalCaseAttr(mem_cst)) {
+                    self.is_allowing_non_canonical_case = true;
+                }
+                defer self.is_allowing_non_canonical_case = saved_allow_mem;
                 try self.parseVisibility(&has_mem_err);
 
                 const member_node = switch (self.peekKind()) {
@@ -2852,6 +3168,11 @@ pub const Parser = struct {
                 var has_mem_err = false;
 
                 try self.parseAttributes(&has_mem_err);
+                const saved_allow_mem = self.is_allowing_non_canonical_case;
+                if (self.hasAllowNonCanonicalCaseAttr(mem_cst)) {
+                    self.is_allowing_non_canonical_case = true;
+                }
+                defer self.is_allowing_non_canonical_case = saved_allow_mem;
                 try self.parseVisibility(&has_mem_err);
 
                 const member_node = switch (self.peekKind()) {
@@ -2913,13 +3234,285 @@ pub const Parser = struct {
         }, item_cst);
     }
 
+    /// Parses `ExternBlockItem = [unsafe] "extern" [STRING_LIT] "{" { ExternMember } "}" ;`.
+    fn parseExternBlockItem(
+        self: *Parser,
+        item_cst: CstNodeIndex,
+        outer_vis: ExternVisibility,
+        is_unsafe_block: bool,
+        outer_attrs: ParsedAttrSlice,
+        has_error: *bool,
+    ) anyerror!NodeIndex {
+        self.cst.nodes.items(.kind)[item_cst.asInt()] = .extern_block_item;
+        const extern_tok = try self.consumeLeaf(.token_leaf, .{});
+        const block_abi_tok: TokenIndex = if (self.peekKind() == .string_lit)
+            try self.consumeLeaf(.token_leaf, .{})
+        else
+            .none;
+        const open_brace = try self.consumeLeaf(.token_leaf, .{});
+
+        var member_indices: std.ArrayList(u32) = .empty;
+        defer member_indices.deinit(self.ast.allocator);
+
+        while (self.peekKind() != .rbrace and self.peekKind() != .eof) {
+            const loop_start = self.cursor;
+            const mem_cst = try self.startCstNode(.placeholder);
+            const member_node = blk_mem: {
+                self.pushState(.item_dispatch, mem_cst) catch |err| switch (err) {
+                    error.ParseDepthExceeded => {
+                        has_error.* = true;
+                        break :blk_mem try self.recoverDepthOverflow(
+                            mem_cst,
+                            EXTERN_MEMBER_STOP_SET,
+                            .item_hole,
+                        );
+                    },
+                    else => return err,
+                };
+                defer self.popStates(1);
+
+                var has_mem_err = false;
+                const mem_attrs = try self.parseAttributesWithSlice(&has_mem_err);
+                const saved_allow_mem = self.is_allowing_non_canonical_case;
+                if (self.hasAllowNonCanonicalCaseAttr(mem_cst)) {
+                    self.is_allowing_non_canonical_case = true;
+                }
+                defer self.is_allowing_non_canonical_case = saved_allow_mem;
+                const mem_vis = try self.parseVisibilityWithLevel(&has_mem_err);
+
+                const parsed_mem = switch (self.peekKind()) {
+                    .kw_const => try self.parseConstItem(mem_cst, &has_mem_err),
+                    .kw_fn, .kw_unsafe, .kw_extern, .kw_async, .kw_comptime => blk_fn_or_static: {
+                        if (self.peekKind() == .kw_unsafe and
+                            self.peekKindNth(1) == .ident and
+                            std.mem.eql(u8, self.peekLexemeNth(1), "static"))
+                        {
+                            _ = try self.consumeLeaf(.token_leaf, .{});
+                            break :blk_fn_or_static try self.parseExternStaticItem(
+                                mem_cst,
+                                block_abi_tok,
+                                mem_vis,
+                                true,
+                                mem_attrs,
+                                &has_mem_err,
+                            );
+                        }
+                        break :blk_fn_or_static try self.parseFunctionItemWithExtern(
+                            mem_cst,
+                            extern_tok,
+                            block_abi_tok,
+                            true,
+                            &has_mem_err,
+                        );
+                    },
+                    .ident => blk_ident: {
+                        if (std.mem.eql(u8, self.peekLexemeNth(0), "static")) {
+                            break :blk_ident try self.parseExternStaticItem(
+                                mem_cst,
+                                block_abi_tok,
+                                mem_vis,
+                                is_unsafe_block,
+                                mem_attrs,
+                                &has_mem_err,
+                            );
+                        }
+                        break :blk_ident try self.recoverInvalidExternMember(mem_cst, &has_mem_err);
+                    },
+                    else => try self.recoverInvalidExternMember(mem_cst, &has_mem_err),
+                };
+                if (has_mem_err) has_error.* = true;
+                break :blk_mem parsed_mem;
+            };
+
+            try member_indices.append(self.ast.allocator, member_node.asInt());
+            if (self.cursor == loop_start and self.peekKind() != .rbrace and self.peekKind() != .eof) {
+                _ = try self.consumeLeaf(.invalid_parse_leaf, .{ .has_error = true });
+            }
+        }
+
+        try self.expectClosingDelimiter(
+            .rbrace,
+            open_brace,
+            has_error,
+            "expected `}` to close `extern` block",
+        );
+        self.cst.finishNode(item_cst, .{ .has_error = has_error.* });
+
+        var payload_words: std.ArrayList(u32) = .empty;
+        defer payload_words.deinit(self.ast.allocator);
+        try payload_words.ensureTotalCapacity(
+            self.ast.allocator,
+            syntax_arenas.EXTERN_BLOCK_HEADER_WORDS + member_indices.items.len,
+        );
+        payload_words.appendAssumeCapacity(block_abi_tok.asInt());
+        payload_words.appendAssumeCapacity(@bitCast(ExternBlockFlags{
+            .visibility = outer_vis,
+            .is_unsafe = is_unsafe_block,
+        }));
+        payload_words.appendAssumeCapacity(outer_attrs.attr_start);
+        payload_words.appendAssumeCapacity(outer_attrs.attr_len);
+        payload_words.appendSliceAssumeCapacity(member_indices.items);
+
+        const extra_start = try self.ast.appendExtraSlice(payload_words.items);
+        return self.ast.appendNodeWithCst(.{
+            .tag = .extern_block_decl,
+            .main_token = extern_tok,
+            .lhs = PackedOperand.initExtra(extra_start),
+            .rhs = .{ .tag = .extra, .payload = @intCast(payload_words.items.len) },
+        }, item_cst);
+    }
+
+    /// Emits `E0201`, synchronizes to `;`, `}`, or the next `extern` member, and returns an `.item_hole`.
+    fn recoverInvalidExternMember(
+        self: *Parser,
+        mem_cst: CstNodeIndex,
+        has_mem_err: *bool,
+    ) anyerror!NodeIndex {
+        has_mem_err.* = true;
+        const err_tok = self.peekTokenIndexNth(0);
+        try self.emitUnexpectedToken(
+            err_tok,
+            "expected `fn`, `static`, or `const` declaration inside `extern` block",
+            "unexpected token in `extern` block",
+        );
+        var has_consumed_any = false;
+        var nested_depth: u32 = 0;
+        while (self.peekKind() != .eof) {
+            const cur_kind = self.peekKind();
+            if (nested_depth == 0) {
+                if (cur_kind == .semi) {
+                    _ = try self.consumeLeaf(.invalid_parse_leaf, .{ .has_error = true });
+                    break;
+                }
+                if (cur_kind == .rbrace) break;
+                const is_contextual_static = cur_kind == .ident and
+                    std.mem.eql(u8, self.peekLexemeNth(0), "static");
+                if (has_consumed_any and
+                    (EXTERN_MEMBER_STOP_SET.contains(cur_kind) or is_contextual_static))
+                {
+                    break;
+                }
+            }
+            if (cur_kind == .lbrace or cur_kind == .lparen or cur_kind == .lbracket) {
+                nested_depth += 1;
+            } else if (cur_kind == .rbrace or cur_kind == .rparen or cur_kind == .rbracket) {
+                if (nested_depth > 0) nested_depth -= 1;
+            }
+            _ = try self.consumeLeaf(.invalid_parse_leaf, .{ .has_error = true });
+            has_consumed_any = true;
+        }
+        self.cst.nodes.items(.kind)[mem_cst.asInt()] = .invalid_parse_subtree;
+        self.cst.finishNode(mem_cst, .{ .has_error = true });
+        return self.ast.appendNodeWithCst(.{
+            .tag = .item_hole,
+            .main_token = err_tok,
+        }, mem_cst);
+    }
+
+    /// Parses `ExternStaticItem = [extern [STRING_LIT]] "static" ["mut"] IDENT ":" Type ";" ;`.
+    fn parseExternStaticItem(
+        self: *Parser,
+        item_cst: CstNodeIndex,
+        inherited_abi_tok: TokenIndex,
+        item_vis: ExternVisibility,
+        is_unsafe_item: bool,
+        item_attrs: ParsedAttrSlice,
+        has_error: *bool,
+    ) anyerror!NodeIndex {
+        self.cst.nodes.items(.kind)[item_cst.asInt()] = .extern_static_item;
+        var effective_abi_tok = inherited_abi_tok;
+        if (self.peekKind() == .kw_extern) {
+            _ = try self.consumeLeaf(.token_leaf, .{});
+            if (self.peekKind() == .string_lit) {
+                effective_abi_tok = try self.consumeLeaf(.token_leaf, .{});
+            }
+        }
+
+        const static_tok = try self.consumeLeaf(.token_leaf, .{});
+        var is_mut = false;
+        if (self.peekKind() == .kw_mut) {
+            is_mut = true;
+            _ = try self.consumeLeaf(.token_leaf, .{});
+        }
+
+        const name_tok = try self.expectExternSymbolIdentifier(
+            has_error,
+            "expected foreign symbol identifier after `static`",
+        );
+
+        const type_node: NodeIndex = if (self.peekKind() == .colon) blk_ty: {
+            _ = try self.consumeLeaf(.token_leaf, .{});
+            break :blk_ty try self.parseType();
+        } else blk_hole: {
+            has_error.* = true;
+            const err_tok = self.peekTokenIndexNth(0);
+            try self.emitUnexpectedToken(
+                err_tok,
+                "expected `:` and type annotation in `extern static` declaration",
+                "expected `: Type` here",
+            );
+            const hole_cst = try self.startCstNode(.invalid_parse_subtree);
+            self.cst.finishNode(hole_cst, .{ .has_error = true });
+            break :blk_hole try self.ast.appendNodeWithCst(.{
+                .tag = .type_hole,
+                .main_token = err_tok,
+            }, hole_cst);
+        };
+
+        if (self.peekKind() == .semi) {
+            _ = try self.consumeLeaf(.token_leaf, .{});
+        } else {
+            has_error.* = true;
+            try self.emitUnexpectedToken(
+                self.peekTokenIndexNth(0),
+                "expected `;` after `extern static` declaration",
+                "expected `;` here",
+            );
+            try self.skipToRecoveryAnchor(ITEM_CONSUME_SET, EXTERN_MEMBER_STOP_SET, false);
+        }
+
+        self.cst.finishNode(item_cst, .{ .has_error = has_error.* });
+        const extra_words = [syntax_arenas.EXTERN_STATIC_EXTRA_WORDS]u32{
+            static_tok.asInt(),
+            effective_abi_tok.asInt(),
+            @bitCast(ExternStaticFlags{
+                .visibility = item_vis,
+                .is_mut = is_mut,
+                .has_extern = true,
+                .is_unsafe = is_unsafe_item,
+            }),
+            item_attrs.attr_start,
+            item_attrs.attr_len,
+        };
+        const extra_idx = try self.ast.appendExtraSlice(&extra_words);
+        return self.ast.appendNodeWithCst(.{
+            .tag = .extern_static_decl,
+            .main_token = name_tok,
+            .lhs = PackedOperand.initNode(type_node),
+            .rhs = PackedOperand.initExtra(extra_idx),
+        }, item_cst);
+    }
+
     /// Parses `FunctionItem = [comptime] [async] [unsafe] [extern [STRING_LIT]] "fn" FnSignature (Block | "=" Expr ";" | ";")`.
     fn parseFunctionItem(
         self: *Parser,
         item_cst: CstNodeIndex,
         has_error: *bool,
     ) anyerror!NodeIndex {
+        return self.parseFunctionItemWithExtern(item_cst, .none, .none, false, has_error);
+    }
+
+    /// Parses a `FunctionItem`, propagating enclosing `extern` block linkage and `W0201` foreign symbol exemptions.
+    fn parseFunctionItemWithExtern(
+        self: *Parser,
+        item_cst: CstNodeIndex,
+        enclosing_extern_tok: TokenIndex,
+        enclosing_abi_tok: TokenIndex,
+        is_in_extern_block: bool,
+        has_error: *bool,
+    ) anyerror!NodeIndex {
         self.cst.nodes.items(.kind)[item_cst.asInt()] = .fn_item;
+        var has_explicit_extern = false;
         while (self.peekKind() == .kw_async or
             self.peekKind() == .kw_unsafe or
             self.peekKind() == .kw_extern or
@@ -2927,8 +3520,26 @@ pub const Parser = struct {
         {
             const qual_kind = self.peekKind();
             _ = try self.consumeLeaf(.token_leaf, .{});
-            if (qual_kind == .kw_extern and self.peekKind() == .string_lit) {
-                _ = try self.consumeLeaf(.token_leaf, .{});
+            if (qual_kind == .kw_extern) {
+                has_explicit_extern = true;
+                if (self.peekKind() == .string_lit) {
+                    _ = try self.consumeLeaf(.token_leaf, .{});
+                }
+            }
+        }
+
+        if (is_in_extern_block and !has_explicit_extern and !enclosing_extern_tok.isNone()) {
+            _ = try self.cst.appendLeafNode(
+                .token_leaf,
+                enclosing_extern_tok,
+                .{ .is_missing_or_injected = true },
+            );
+            if (!enclosing_abi_tok.isNone()) {
+                _ = try self.cst.appendLeafNode(
+                    .token_leaf,
+                    enclosing_abi_tok,
+                    .{ .is_missing_or_injected = true },
+                );
             }
         }
 
@@ -2942,8 +3553,14 @@ pub const Parser = struct {
                 "expected `fn` here",
             );
 
+        const is_extern_fn = has_explicit_extern or is_in_extern_block;
         const sig_cst = try self.startCstNode(.fn_sig);
-        if (self.hasPascalExemptFnAttr(item_cst) and self.peekKind() == .type_ident) {
+        if (is_extern_fn) {
+            _ = try self.expectExternSymbolIdentifier(
+                has_error,
+                "expected foreign function name",
+            );
+        } else if (self.hasPascalExemptFnAttr(item_cst) and self.peekKind() == .type_ident) {
             _ = try self.consumeLeaf(.token_leaf, .{});
         } else {
             _ = try self.expectIdentifierWithCasing(
@@ -2983,7 +3600,30 @@ pub const Parser = struct {
         self.cst.finishNode(sig_cst, .{ .has_error = has_error.* });
 
         var body_op: PackedOperand = .NONE;
-        if (self.peekKind() == .lbrace) {
+        if (is_in_extern_block) {
+            if (self.peekKind() == .semi) {
+                _ = try self.consumeLeaf(.token_leaf, .{});
+            } else if (self.peekKind() == .lbrace) {
+                has_error.* = true;
+                try self.emitUnexpectedToken(
+                    self.peekTokenIndexNth(0),
+                    "foreign function declaration inside `extern` block cannot have a body; expected `;`",
+                    "unexpected `{ … }` body on `extern` prototype",
+                );
+                _ = try self.parseBlock();
+                if (self.peekKind() == .semi) {
+                    _ = try self.consumeLeaf(.token_leaf, .{});
+                }
+            } else {
+                has_error.* = true;
+                try self.emitUnexpectedToken(
+                    self.peekTokenIndexNth(0),
+                    "expected `;` after foreign function signature inside `extern` block",
+                    "expected `;` here",
+                );
+                try self.skipToRecoveryAnchor(ITEM_CONSUME_SET, EXTERN_MEMBER_STOP_SET, false);
+            }
+        } else if (self.peekKind() == .lbrace) {
             body_op = PackedOperand.initNode(try self.parseBlock());
         } else if (self.peekKind() == .eq) {
             const body_cst = try self.startCstNode(.fn_expr_body);
@@ -3275,6 +3915,212 @@ pub const Parser = struct {
         }, item_cst);
     }
 
+    /// Releases scratch `@allow(non_canonical_case)` casing-exemption sets at the end of a parse pass.
+    fn clearAllowedNonCanonicalNames(self: *Parser) void {
+        self.is_in_full_parse = false;
+        self.allowed_non_canonical_types.deinit(self.ast.allocator);
+        self.allowed_non_canonical_types = .empty;
+        self.allowed_non_canonical_members.deinit(self.ast.allocator);
+        self.allowed_non_canonical_members = .empty;
+    }
+
+    /// Pre-scans `@allow(… non_canonical_case …)` declarations in `token_buffer` for forward-ref and incremental parity.
+    fn precollectAllowedNonCanonicalNames(self: *Parser) !void {
+        const kind_slice = self.token_buffer.tokens.items(.kind);
+        const total = kind_slice.len;
+        var scan_pos: usize = 0;
+        while (std.mem.indexOfScalarPos(TokenKind, kind_slice, scan_pos, .at)) |at_idx| {
+            scan_pos = at_idx + 1;
+            const name_idx = self.skipCarrierRawIndex(at_idx + 1);
+            if (name_idx >= total) break;
+            const name_lex = self.getTokenLexeme(TokenIndex.fromInt(@intCast(name_idx)));
+            if (!std.mem.eql(u8, name_lex, "allow")) continue;
+
+            var cur_idx = self.skipCarrierRawIndex(name_idx + 1);
+            if (cur_idx >= total or kind_slice[cur_idx] != .lparen) continue;
+            cur_idx = self.skipCarrierRawIndex(cur_idx + 1);
+
+            var paren_depth: u32 = 1;
+            var has_non_canonical = false;
+            while (cur_idx < total and paren_depth > 0) {
+                const cur_kind = kind_slice[cur_idx];
+                if (cur_kind == .eof) break;
+                if (cur_kind == .lparen) {
+                    paren_depth += 1;
+                } else if (cur_kind == .rparen) {
+                    paren_depth -= 1;
+                } else if (isIdentifierKind(cur_kind)) {
+                    const arg_lex = self.getTokenLexeme(TokenIndex.fromInt(@intCast(cur_idx)));
+                    if (std.mem.eql(u8, arg_lex, "non_canonical_case")) {
+                        has_non_canonical = true;
+                    }
+                }
+                cur_idx = self.skipCarrierRawIndex(cur_idx + 1);
+            }
+            if (!has_non_canonical or paren_depth != 0) continue;
+
+            // Skip any stacked attributes, visibility `pub(…)`, and item/function qualifiers:
+            while (cur_idx < total) {
+                const cur_kind = kind_slice[cur_idx];
+                if (cur_kind == .at) {
+                    const next_attr = self.skipCarrierRawIndex(cur_idx + 1);
+                    if (next_attr >= total) break;
+                    cur_idx = self.skipCarrierRawIndex(next_attr + 1);
+                    if (cur_idx < total and kind_slice[cur_idx] == .lparen) {
+                        var sub_depth: u32 = 1;
+                        cur_idx = self.skipCarrierRawIndex(cur_idx + 1);
+                        while (cur_idx < total and sub_depth > 0) {
+                            if (kind_slice[cur_idx] == .eof) break;
+                            if (kind_slice[cur_idx] == .lparen) {
+                                sub_depth += 1;
+                            } else if (kind_slice[cur_idx] == .rparen) {
+                                sub_depth -= 1;
+                            }
+                            cur_idx = self.skipCarrierRawIndex(cur_idx + 1);
+                        }
+                    }
+                    continue;
+                }
+                if (cur_kind == .kw_pub) {
+                    cur_idx = self.skipCarrierRawIndex(cur_idx + 1);
+                    if (cur_idx < total and kind_slice[cur_idx] == .lparen) {
+                        var vis_depth: u32 = 1;
+                        cur_idx = self.skipCarrierRawIndex(cur_idx + 1);
+                        while (cur_idx < total and vis_depth > 0) {
+                            if (kind_slice[cur_idx] == .eof) break;
+                            if (kind_slice[cur_idx] == .lparen) {
+                                vis_depth += 1;
+                            } else if (kind_slice[cur_idx] == .rparen) {
+                                vis_depth -= 1;
+                            }
+                            cur_idx = self.skipCarrierRawIndex(cur_idx + 1);
+                        }
+                    }
+                    continue;
+                }
+                if (cur_kind == .kw_async or
+                    cur_kind == .kw_unsafe or
+                    cur_kind == .kw_comptime or
+                    cur_kind == .kw_var or
+                    cur_kind == .kw_let)
+                {
+                    cur_idx = self.skipCarrierRawIndex(cur_idx + 1);
+                    continue;
+                }
+                if (cur_kind == .kw_extern) {
+                    cur_idx = self.skipCarrierRawIndex(cur_idx + 1);
+                    if (cur_idx < total and kind_slice[cur_idx] == .string_lit) {
+                        cur_idx = self.skipCarrierRawIndex(cur_idx + 1);
+                    }
+                    continue;
+                }
+                break;
+            }
+            if (cur_idx >= total) continue;
+
+            const decl_kind = kind_slice[cur_idx];
+            if (decl_kind == .kw_type or
+                decl_kind == .kw_struct or
+                decl_kind == .kw_union or
+                decl_kind == .kw_bit_field or
+                decl_kind == .kw_enum or
+                decl_kind == .kw_trait)
+            {
+                const ident_idx = self.skipCarrierRawIndex(cur_idx + 1);
+                if (ident_idx < total and isIdentifierKind(kind_slice[ident_idx])) {
+                    const ty_lex = self.getTokenLexeme(TokenIndex.fromInt(@intCast(ident_idx)));
+                    if (ty_lex.len > 0) {
+                        try self.allowed_non_canonical_types.put(self.ast.allocator, ty_lex, {});
+                    }
+                    if (decl_kind == .kw_struct or decl_kind == .kw_union or decl_kind == .kw_bit_field) {
+                        var body_scan = self.skipCarrierRawIndex(ident_idx + 1);
+                        while (body_scan < total and
+                            kind_slice[body_scan] != .lbrace and
+                            kind_slice[body_scan] != .semi and
+                            kind_slice[body_scan] != .eof)
+                        {
+                            body_scan = self.skipCarrierRawIndex(body_scan + 1);
+                        }
+                        if (body_scan < total and kind_slice[body_scan] == .lbrace) {
+                            var brace_depth: u32 = 1;
+                            body_scan = self.skipCarrierRawIndex(body_scan + 1);
+                            while (body_scan < total and brace_depth > 0) {
+                                const bk = kind_slice[body_scan];
+                                if (bk == .eof) break;
+                                if (bk == .lbrace) {
+                                    brace_depth += 1;
+                                } else if (bk == .rbrace) {
+                                    brace_depth -= 1;
+                                } else if (brace_depth == 1 and isIdentifierKind(bk)) {
+                                    const after_fld = self.skipCarrierRawIndex(body_scan + 1);
+                                    if (after_fld < total and kind_slice[after_fld] == .colon) {
+                                        const fld_lex = self.getTokenLexeme(TokenIndex.fromInt(@intCast(body_scan)));
+                                        if (fld_lex.len > 0) {
+                                            try self.allowed_non_canonical_members.put(self.ast.allocator, fld_lex, {});
+                                        }
+                                    }
+                                }
+                                body_scan = self.skipCarrierRawIndex(body_scan + 1);
+                            }
+                        }
+                    }
+                }
+            } else if (decl_kind == .kw_fn or decl_kind == .kw_const or decl_kind == .kw_mod) {
+                const ident_idx = self.skipCarrierRawIndex(cur_idx + 1);
+                if (ident_idx < total and isIdentifierKind(kind_slice[ident_idx])) {
+                    const mem_lex = self.getTokenLexeme(TokenIndex.fromInt(@intCast(ident_idx)));
+                    if (mem_lex.len > 0) {
+                        try self.allowed_non_canonical_members.put(self.ast.allocator, mem_lex, {});
+                    }
+                }
+            } else if (isIdentifierKind(decl_kind)) {
+                const mem_lex = self.getTokenLexeme(TokenIndex.fromInt(@intCast(cur_idx)));
+                if (mem_lex.len > 0) {
+                    try self.allowed_non_canonical_members.put(self.ast.allocator, mem_lex, {});
+                }
+            }
+        }
+    }
+
+    /// Returns `true` if `item_cst` carries a leading `@allow(… non_canonical_case …)` attribute (`DR-10`).
+    fn hasAllowNonCanonicalCaseAttr(self: *const Parser, item_cst: CstNodeIndex) bool {
+        if (item_cst.isNone()) return false;
+        const total = self.cst.countNodes();
+        var cursor: usize = item_cst.asInt() + 1;
+        while (cursor < total) {
+            const child = self.cst.getNode(CstNodeIndex.fromInt(@intCast(cursor)));
+            if (child.kind == .attribute) {
+                const attr_end = @min(cursor + @max(@as(usize, child.subtree_size), 1), total);
+                var is_allow_attr = false;
+                var has_seen_attr_name = false;
+                var tok_cur = cursor + 1;
+                while (tok_cur < attr_end) : (tok_cur += 1) {
+                    const leaf = self.cst.getNode(CstNodeIndex.fromInt(@intCast(tok_cur)));
+                    if (leaf.subtree_size <= 1 and !leaf.token.isNone() and
+                        leaf.token.asInt() < self.token_buffer.countTokens())
+                    {
+                        const tok_rec = self.token_buffer.getToken(leaf.token);
+                        if (tok_rec.kind == .at) continue;
+                        const lex = self.getTokenLexeme(leaf.token);
+                        if (!has_seen_attr_name) {
+                            has_seen_attr_name = true;
+                            if (!std.mem.eql(u8, lex, "allow")) break;
+                            is_allow_attr = true;
+                        } else if (is_allow_attr and isIdentifierKind(tok_rec.kind) and
+                            std.mem.eql(u8, lex, "non_canonical_case"))
+                        {
+                            return true;
+                        }
+                    }
+                }
+                cursor = attr_end;
+                continue;
+            }
+            cursor += @max(@as(usize, child.subtree_size), 1);
+        }
+        return false;
+    }
+
     /// Returns `true` if `item_cst` carries a leading `@constructor` or `@builder_item` attribute (`SE-22`).
     fn hasPascalExemptFnAttr(self: *const Parser, item_cst: CstNodeIndex) bool {
         if (item_cst.isNone()) return false;
@@ -3489,6 +4335,11 @@ pub const Parser = struct {
             var has_param_err = false;
 
             try self.parseAttributes(&has_param_err);
+            const saved_allow_param = self.is_allowing_non_canonical_case;
+            if (self.hasAllowNonCanonicalCaseAttr(param_cst)) {
+                self.is_allowing_non_canonical_case = true;
+            }
+            defer self.is_allowing_non_canonical_case = saved_allow_param;
 
             var has_leading_var = false;
             if (self.peekKind() == .kw_var) {
@@ -4271,6 +5122,13 @@ pub const Parser = struct {
                 (self.peekKindNth(1) != .dot and TYPE_STARTER_SET.contains(self.peekKindNth(1)))))
         {
             const ref_cst = try self.startCstNode(.ref_type);
+            self.pushState(.type_parse, ref_cst) catch |err| switch (err) {
+                error.ParseDepthExceeded => {
+                    return self.recoverDepthOverflow(ref_cst, TYPE_ARG_STOP_SET, .type_hole);
+                },
+                else => return err,
+            };
+            defer self.popStates(1);
             const ref_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
             var main_tok = ref_tok;
             var is_mut = false;
@@ -4359,6 +5217,13 @@ pub const Parser = struct {
             },
             .amp => {
                 const ref_cst = try self.startCstNode(.ref_type);
+                self.pushState(.type_parse, ref_cst) catch |err| switch (err) {
+                    error.ParseDepthExceeded => {
+                        return self.recoverDepthOverflow(ref_cst, TYPE_ARG_STOP_SET, .type_hole);
+                    },
+                    else => return err,
+                };
+                defer self.popStates(1);
                 const amp_tok = try self.consumeLeaf(.token_leaf, .{});
                 const main_tok = if (self.peekKind() == .kw_mut)
                     try self.consumeLeaf(.token_leaf, .{})
@@ -4422,6 +5287,13 @@ pub const Parser = struct {
             },
             .hash_soa, .tilde => {
                 const mode_cst = try self.startCstNode(.mode_type);
+                self.pushState(.type_parse, mode_cst) catch |err| switch (err) {
+                    error.ParseDepthExceeded => {
+                        return self.recoverDepthOverflow(mode_cst, TYPE_ARG_STOP_SET, .type_hole);
+                    },
+                    else => return err,
+                };
+                defer self.popStates(1);
                 const mode_kind = self.peekKind();
                 const mode_tok = try self.consumeLeaf(.token_leaf, .{});
                 const inner_ty = if (mode_kind == .hash_soa)
@@ -4509,8 +5381,18 @@ pub const Parser = struct {
                 }, tup_cst);
             },
             .at, .pipe, .pipepipe, .kw_own, .kw_async, .kw_unsafe, .kw_extern, .kw_fn => {
+                if (self.peekKind() == .kw_async and self.peekKindNth(1) == .dot) {
+                    return self.parseNamedOrGenericType();
+                }
                 if (self.peekKind() == .kw_own and !self.isOwnClosureTypeAt(0)) {
                     const mode_cst = try self.startCstNode(.mode_type);
+                    self.pushState(.type_parse, mode_cst) catch |err| switch (err) {
+                        error.ParseDepthExceeded => {
+                            return self.recoverDepthOverflow(mode_cst, TYPE_ARG_STOP_SET, .type_hole);
+                        },
+                        else => return err,
+                    };
+                    defer self.popStates(1);
                     const own_tok = try self.consumeLeaf(.token_leaf, .{});
                     const inner_ty = try self.parsePrefixOrPostfixType();
                     self.cst.finishNode(mode_cst, .{});
@@ -4686,6 +5568,13 @@ pub const Parser = struct {
                 {
                     const is_distinct = std.mem.eql(u8, self.peekLexemeNth(0), "distinct");
                     const mode_cst = try self.startCstNode(.mode_type);
+                    self.pushState(.type_parse, mode_cst) catch |err| switch (err) {
+                        error.ParseDepthExceeded => {
+                            return self.recoverDepthOverflow(mode_cst, TYPE_ARG_STOP_SET, .type_hole);
+                        },
+                        else => return err,
+                    };
+                    defer self.popStates(1);
                     const mode_tok = try self.consumeLeaf(.token_leaf, .{});
                     const inner_ty = if (is_distinct)
                         try self.parseType()
@@ -4699,69 +5588,7 @@ pub const Parser = struct {
                     }, mode_cst);
                 }
 
-                const named_cst = try self.startCstNode(.named_type);
-                var has_err = false;
-                var first_tok = self.peekTokenIndexNth(0);
-
-                if (self.peekKind() == .kw_self_type) {
-                    first_tok = try self.consumeLeaf(.token_leaf, .{});
-                } else {
-                    // Consume optional leading `ident .` module path segments:
-                    while (self.peekKind() == .ident and self.peekKindNth(1) == .dot) {
-                        _ = try self.consumeLeaf(.token_leaf, .{});
-                        _ = try self.consumeLeaf(.token_leaf, .{});
-                    }
-
-                    // Consume the type identifier segment (requiring `.type_ident` `PascalCase`):
-                    first_tok = try self.expectIdentifierWithCasing(
-                        .type_ident,
-                        .pascal_case,
-                        &has_err,
-                        "expected `PascalCase` type name",
-                    );
-                }
-
-                var arg_nodes: std.ArrayList(u32) = .empty;
-                defer arg_nodes.deinit(self.ast.allocator);
-                var has_generic_args = false;
-
-                while (true) {
-                    if (self.peekKind() == .lbracket) {
-                        has_generic_args = true;
-                        try self.parseTypeArgs(&arg_nodes, &has_err);
-                    }
-                    if (self.peekKind() == .dot and isIdentifierKind(self.peekKindNth(1))) {
-                        _ = try self.consumeLeaf(.token_leaf, .{});
-                        _ = try self.expectIdentifierWithCasing(
-                            .type_ident,
-                            .pascal_case,
-                            &has_err,
-                            "expected `PascalCase` associated type name after `.`",
-                        );
-                        continue;
-                    }
-                    break;
-                }
-                self.cst.finishNode(named_cst, .{ .has_error = has_err });
-
-                if (has_generic_args) {
-                    var lhs_op: PackedOperand = .NONE;
-                    var rhs_op: PackedOperand = .NONE;
-                    if (arg_nodes.items.len > 0) {
-                        lhs_op = PackedOperand.initExtra(try self.ast.appendExtraSlice(arg_nodes.items));
-                        rhs_op = .{ .tag = .extra, .payload = @intCast(arg_nodes.items.len) };
-                    }
-                    return self.ast.appendNodeWithCst(.{
-                        .tag = .generic_type,
-                        .main_token = first_tok,
-                        .lhs = lhs_op,
-                        .rhs = rhs_op,
-                    }, named_cst);
-                }
-                return self.ast.appendNodeWithCst(.{
-                    .tag = .named_type,
-                    .main_token = first_tok,
-                }, named_cst);
+                return self.parseNamedOrGenericType();
             },
             else => {
                 const err_tok = self.peekTokenIndexNth(0);
@@ -4781,6 +5608,73 @@ pub const Parser = struct {
                 }, hole_cst);
             },
         }
+    }
+
+    /// Parses a qualified/generic nominal `Type` (`{ (IDENT | "async") "." } TYPE_IDENT [TypeArgs] {"." TYPE_IDENT}`).
+    fn parseNamedOrGenericType(self: *Parser) anyerror!NodeIndex {
+        const named_cst = try self.startCstNode(.named_type);
+        var has_err = false;
+        var first_tok = self.peekTokenIndexNth(0);
+
+        if (self.peekKind() == .kw_self_type) {
+            first_tok = try self.consumeLeaf(.token_leaf, .{});
+        } else {
+            // Consume optional leading `(ident | "async") .` module path segments:
+            while (isIdentOrModuleSegment(self.peekKind()) and self.peekKindNth(1) == .dot) {
+                _ = try self.consumeLeaf(.token_leaf, .{});
+                _ = try self.consumeLeaf(.token_leaf, .{});
+            }
+
+            // Consume the type identifier segment (requiring `.type_ident` `PascalCase`):
+            first_tok = try self.expectIdentifierWithCasing(
+                .type_ident,
+                .pascal_case,
+                &has_err,
+                "expected `PascalCase` type name",
+            );
+        }
+
+        var arg_nodes: std.ArrayList(u32) = .empty;
+        defer arg_nodes.deinit(self.ast.allocator);
+        var has_generic_args = false;
+
+        while (true) {
+            if (self.peekKind() == .lbracket) {
+                has_generic_args = true;
+                try self.parseTypeArgs(&arg_nodes, &has_err);
+            }
+            if (self.peekKind() == .dot and isIdentifierKind(self.peekKindNth(1))) {
+                _ = try self.consumeLeaf(.token_leaf, .{});
+                _ = try self.expectIdentifierWithCasing(
+                    .type_ident,
+                    .pascal_case,
+                    &has_err,
+                    "expected `PascalCase` associated type name after `.`",
+                );
+                continue;
+            }
+            break;
+        }
+        self.cst.finishNode(named_cst, .{ .has_error = has_err });
+
+        if (has_generic_args) {
+            var lhs_op: PackedOperand = .NONE;
+            var rhs_op: PackedOperand = .NONE;
+            if (arg_nodes.items.len > 0) {
+                lhs_op = PackedOperand.initExtra(try self.ast.appendExtraSlice(arg_nodes.items));
+                rhs_op = .{ .tag = .extra, .payload = @intCast(arg_nodes.items.len) };
+            }
+            return self.ast.appendNodeWithCst(.{
+                .tag = .generic_type,
+                .main_token = first_tok,
+                .lhs = lhs_op,
+                .rhs = rhs_op,
+            }, named_cst);
+        }
+        return self.ast.appendNodeWithCst(.{
+            .tag = .named_type,
+            .main_token = first_tok,
+        }, named_cst);
     }
 
     /// Parses `TypeArgs = "[" TypeOrConstArg { "," TypeOrConstArg } [ "," ] "]" ;`.
@@ -4956,6 +5850,8 @@ pub const Parser = struct {
             .kw_union,
             .kw_bit_field,
             .kw_fn,
+            .kw_extern,
+            .kw_use,
             .kw_defer,
             .kw_errdefer,
             .kw_yield,
@@ -4998,7 +5894,7 @@ pub const Parser = struct {
             }
         }
         return switch (self.peekKindNth(lookahead)) {
-            .kw_const, .kw_type, .kw_struct, .kw_enum, .kw_union, .kw_bit_field, .kw_fn => true,
+            .kw_const, .kw_type, .kw_struct, .kw_enum, .kw_union, .kw_bit_field, .kw_fn, .kw_extern, .kw_use => true,
             .kw_comptime => self.peekKindNth(lookahead + 1) == .kw_fn,
             else => false,
         };
@@ -5016,6 +5912,11 @@ pub const Parser = struct {
             const decl_cst = try self.startCstNode(.local_decl_stmt);
             var has_attr_err = false;
             try self.parseAttributes(&has_attr_err);
+            const saved_allow_stmt = self.is_allowing_non_canonical_case;
+            if (self.hasAllowNonCanonicalCaseAttr(decl_cst)) {
+                self.is_allowing_non_canonical_case = true;
+            }
+            defer self.is_allowing_non_canonical_case = saved_allow_stmt;
             if (self.peekKind() == .kw_let or self.peekKind() == .kw_var) {
                 return self.parseLocalDeclStmtWithCst(decl_cst, has_attr_err);
             }
@@ -5042,7 +5943,16 @@ pub const Parser = struct {
                     return self.parseItem();
                 }
             },
-            .kw_const, .kw_type, .kw_struct, .kw_enum, .kw_union, .kw_bit_field, .kw_fn => {
+            .kw_const,
+            .kw_type,
+            .kw_struct,
+            .kw_enum,
+            .kw_union,
+            .kw_bit_field,
+            .kw_fn,
+            .kw_extern,
+            .kw_use,
+            => {
                 return self.parseItem();
             },
             else => {},
@@ -6116,6 +7026,13 @@ pub const Parser = struct {
                 );
                 if (self.peekKind() == .at) {
                     self.cst.nodes.items(.kind)[bind_cst.asInt()] = .at_pat;
+                    self.pushState(.pattern_parse, bind_cst) catch |err| switch (err) {
+                        error.ParseDepthExceeded => {
+                            return self.recoverDepthOverflow(bind_cst, MATCH_ARM_STOP_SET, .pattern_hole);
+                        },
+                        else => return err,
+                    };
+                    defer self.popStates(1);
                     _ = try self.consumeLeaf(.token_leaf, .{});
                     const subpat_node = try self.parseSinglePattern(
                         is_binding_slot,
@@ -6142,7 +7059,7 @@ pub const Parser = struct {
                     const first_tok = try self.consumeLeaf(.token_leaf, .{});
                     while (self.peekKind() == .dot) {
                         _ = try self.consumeLeaf(.token_leaf, .{});
-                        if (isIdentifierKind(self.peekKind())) {
+                        if (isIdentifierKind(self.peekKind()) or self.peekKind() == .kw_async) {
                             _ = try self.consumeLeaf(.token_leaf, .{});
                         } else {
                             has_err = true;
@@ -6191,7 +7108,22 @@ pub const Parser = struct {
                     .main_token = err_tok,
                 }, hole_cst);
             },
-            .ident, .type_ident, .const_ident, .kw_self_type => {
+            .ident, .type_ident, .const_ident, .kw_self_type, .kw_async => {
+                if (self.peekKind() == .kw_async and self.peekKindNth(1) != .dot) {
+                    const err_tok = self.peekTokenIndexNth(0);
+                    try self.emitUnexpectedToken(
+                        err_tok,
+                        "expected pattern",
+                        "unexpected `async` keyword in pattern position",
+                    );
+                    const hole_cst = try self.startCstNode(.invalid_parse_subtree);
+                    _ = try self.consumeLeaf(.invalid_parse_leaf, .{ .has_error = true });
+                    self.cst.finishNode(hole_cst, .{ .has_error = true });
+                    return self.ast.appendNodeWithCst(.{
+                        .tag = .pattern_hole,
+                        .main_token = err_tok,
+                    }, hole_cst);
+                }
                 if (self.isRetiredRefPatAt(0)) {
                     const bind_cst = try self.startCstNode(.ident_pat);
                     var has_err = false;
@@ -6204,6 +7136,13 @@ pub const Parser = struct {
                     );
                     if (self.peekKind() == .at) {
                         self.cst.nodes.items(.kind)[bind_cst.asInt()] = .at_pat;
+                        self.pushState(.pattern_parse, bind_cst) catch |err| switch (err) {
+                            error.ParseDepthExceeded => {
+                                return self.recoverDepthOverflow(bind_cst, MATCH_ARM_STOP_SET, .pattern_hole);
+                            },
+                            else => return err,
+                        };
+                        defer self.popStates(1);
                         _ = try self.consumeLeaf(.token_leaf, .{});
                         const subpat_node = try self.parseSinglePattern(
                             is_binding_slot,
@@ -6227,6 +7166,13 @@ pub const Parser = struct {
                 // Subpattern `@` binding (`ident @ SinglePattern`):
                 if (self.peekKindNth(1) == .at) {
                     const at_cst = try self.startCstNode(.at_pat);
+                    self.pushState(.pattern_parse, at_cst) catch |err| switch (err) {
+                        error.ParseDepthExceeded => {
+                            return self.recoverDepthOverflow(at_cst, MATCH_ARM_STOP_SET, .pattern_hole);
+                        },
+                        else => return err,
+                    };
+                    defer self.popStates(1);
                     var has_err = false;
                     const ident_tok = try self.expectIdentifierWithCasing(
                         .ident,
@@ -6259,7 +7205,7 @@ pub const Parser = struct {
                     const first_tok = try self.consumeLeaf(.token_leaf, .{});
                     while (self.peekKind() == .dot) {
                         _ = try self.consumeLeaf(.token_leaf, .{});
-                        if (isIdentifierKind(self.peekKind())) {
+                        if (isIdentifierKind(self.peekKind()) or self.peekKind() == .kw_async) {
                             _ = try self.consumeLeaf(.token_leaf, .{});
                         } else {
                             has_err = true;
@@ -6490,11 +7436,41 @@ pub const Parser = struct {
                 .hash_soa,
                 .tilde,
                 .kw_fn,
-                .kw_async,
                 .kw_unsafe,
                 .kw_extern,
                 .pipepipe,
                 => return true,
+                .kw_async => {
+                    const next_raw = self.advanceNonCarrierRawIndex(raw_idx, 1);
+                    if (self.rawTokenKindAt(next_raw) != .dot) return true;
+                    var scan_raw: usize = raw_idx;
+                    var seg_steps: usize = 0;
+                    while (seg_steps < MAX_TYPE_LOOKAHEAD and
+                        isIdentOrModuleSegment(self.rawTokenKindAt(scan_raw)) and
+                        self.rawTokenKindAt(self.advanceNonCarrierRawIndex(scan_raw, 1)) == .dot) : (seg_steps += 1)
+                    {
+                        scan_raw = self.advanceNonCarrierRawIndex(scan_raw, 2);
+                    }
+                    if (scan_raw > raw_idx and self.rawTokenKindAt(scan_raw) == .type_ident) {
+                        raw_idx = scan_raw;
+                        continue;
+                    }
+                    if (self.rawTokenKindAt(scan_raw) == .ident) {
+                        const tail_tok = TokenIndex.fromInt(@intCast(self.skipCarrierRawIndex(scan_raw)));
+                        const tail_lexeme = self.getTokenLexeme(tail_tok);
+                        if (CANONICAL_C_TYPE_ALIASES.has(tail_lexeme) or
+                            self.allowed_non_canonical_types.contains(tail_lexeme))
+                        {
+                            const after_tail = self.rawTokenKindAt(
+                                self.advanceNonCarrierRawIndex(scan_raw, 1),
+                            );
+                            return after_tail != .dot and
+                                after_tail != .lparen and
+                                after_tail != .lbrace;
+                        }
+                    }
+                    return false;
+                },
                 .at => {
                     const name_raw = self.advanceNonCarrierRawIndex(raw_idx, 1);
                     const name_kind = self.rawTokenKindAt(name_raw);
@@ -6621,7 +7597,7 @@ pub const Parser = struct {
                     const next_kind = self.rawTokenKindAt(next_raw);
                     if ((std.mem.eql(u8, lexeme, "dyn") or std.mem.eql(u8, lexeme, "any")) and
                         (next_kind == .type_ident or next_kind == .kw_self_type or
-                            (next_kind == .ident and
+                            (isIdentOrModuleSegment(next_kind) and
                                 self.rawTokenKindAt(self.advanceNonCarrierRawIndex(next_raw, 1)) == .dot)))
                     {
                         raw_idx = next_raw;
@@ -6630,7 +7606,7 @@ pub const Parser = struct {
                     var scan_raw: usize = raw_idx;
                     var seg_steps: usize = 0;
                     while (seg_steps < MAX_TYPE_LOOKAHEAD and
-                        self.rawTokenKindAt(scan_raw) == .ident and
+                        isIdentOrModuleSegment(self.rawTokenKindAt(scan_raw)) and
                         self.rawTokenKindAt(self.advanceNonCarrierRawIndex(scan_raw, 1)) == .dot) : (seg_steps += 1)
                     {
                         scan_raw = self.advanceNonCarrierRawIndex(scan_raw, 2);
@@ -6638,6 +7614,20 @@ pub const Parser = struct {
                     if (scan_raw > raw_idx and self.rawTokenKindAt(scan_raw) == .type_ident) {
                         raw_idx = scan_raw;
                         continue;
+                    }
+                    if (self.rawTokenKindAt(scan_raw) == .ident) {
+                        const tail_tok = TokenIndex.fromInt(@intCast(self.skipCarrierRawIndex(scan_raw)));
+                        const tail_lexeme = self.getTokenLexeme(tail_tok);
+                        if (CANONICAL_C_TYPE_ALIASES.has(tail_lexeme) or
+                            self.allowed_non_canonical_types.contains(tail_lexeme))
+                        {
+                            const after_tail = self.rawTokenKindAt(
+                                self.advanceNonCarrierRawIndex(scan_raw, 1),
+                            );
+                            return after_tail != .dot and
+                                after_tail != .lparen and
+                                after_tail != .lbrace;
+                        }
                     }
                     return false;
                 },
@@ -6665,7 +7655,8 @@ pub const Parser = struct {
                     return if (is_type_tail_required)
                         kind == .type_ident or kind == .kw_self_type
                     else
-                        isIdentifierKind(kind) or kind == .kw_self_type or kind == .prim_type;
+                        isIdentifierKind(kind) or kind == .kw_async or
+                            kind == .kw_self_type or kind == .prim_type;
                 },
                 .path_expr => return !is_type_tail_required,
                 .field_access => {
@@ -6674,7 +7665,7 @@ pub const Parser = struct {
                     if (is_type_tail_required) {
                         if (rhs_kind != .type_ident) return false;
                         is_type_tail_required = false;
-                    } else if (!isIdentifierKind(rhs_kind)) {
+                    } else if (!isIdentifierKind(rhs_kind) and rhs_kind != .kw_async) {
                         return false;
                     }
                     cur_node_id = NodeIndex.fromInt(node.lhs.payload);
@@ -7401,9 +8392,9 @@ pub const Parser = struct {
             }, lhs_cst_start);
         }
 
-        if (isIdentifierKind(self.peekKind()) or self.peekKind() == .int_lit) {
+        if (isIdentifierKind(self.peekKind()) or self.peekKind() == .kw_async or self.peekKind() == .int_lit) {
             var has_err = false;
-            const member_tok = if (self.peekKind() == .int_lit)
+            const member_tok = if (self.peekKind() == .int_lit or self.peekKind() == .kw_async)
                 try self.consumeLeaf(.token_leaf, .{})
             else
                 try self.expectIdentifierWithCasing(
@@ -8439,10 +9430,18 @@ pub const Parser = struct {
                 }, comp_cst);
             },
             .kw_unsafe, .kw_async => {
-                if (self.peekKind() == .kw_async and
-                    (self.peekKindNth(1) == .pipe or self.peekKindNth(1) == .pipepipe))
-                {
-                    return self.parseClosureExpr(is_struct_lit_allowed);
+                if (self.peekKind() == .kw_async) {
+                    if (self.peekKindNth(1) == .dot) {
+                        const async_tok = try self.consumeLeaf(.ident_pat, .{});
+                        const leaf_cst = CstNodeIndex.fromInt(@intCast(self.cst.countNodes() - 1));
+                        return self.ast.appendNodeWithCst(.{
+                            .tag = .ident_expr,
+                            .main_token = async_tok,
+                        }, leaf_cst);
+                    }
+                    if (self.peekKindNth(1) == .pipe or self.peekKindNth(1) == .pipepipe) {
+                        return self.parseClosureExpr(is_struct_lit_allowed);
+                    }
                 }
                 const blk_cst = try self.startCstNode(.block);
                 _ = try self.consumeLeaf(.token_leaf, .{});
@@ -9242,10 +10241,21 @@ pub fn reparseIncremental(
                 const has_stray_eof_trivia = is_suffix_reused and
                     window_tokens.getLeadingTrivia(win_eof_tok).len > 0;
 
-                var has_win_lex_err = window_sink.countDiagnostics() > 0 or has_stray_eof_trivia;
+                var has_win_lex_err = has_stray_eof_trivia;
                 if (!has_win_lex_err) {
-                    for (window_tokens.tokens.items(.flags)) |flag_item| {
-                        if (flag_item.has_lexer_error or flag_item.is_synthesized) {
+                    for (window_sink.asSlice()) |diag_item| {
+                        if (diag_item.code != .w0201_non_canonical_identifier_case) {
+                            has_win_lex_err = true;
+                            break;
+                        }
+                    }
+                }
+                if (!has_win_lex_err) {
+                    const win_kinds = window_tokens.tokens.items(.kind);
+                    for (window_tokens.tokens.items(.flags), 0..) |flag_item, win_i| {
+                        if ((flag_item.has_lexer_error and !isIdentifierKind(win_kinds[win_i])) or
+                            flag_item.is_synthesized)
+                        {
                             has_win_lex_err = true;
                             break;
                         }
@@ -9300,6 +10310,8 @@ pub fn reparseIncremental(
                         &window_sink,
                         interner,
                     );
+                    defer win_parser.clearAllowedNonCanonicalNames();
+                    try win_parser.precollectAllowedNonCanonicalNames();
                     win_parser.cursor = @intCast(tok_start);
 
                     var reparsed_items: u32 = 0;
@@ -9322,7 +10334,7 @@ pub fn reparseIncremental(
                         @intCast(token_buffer.countTokens());
 
                     if (!window_cst.has_parse_errors and
-                        window_sink.countDiagnostics() == 0 and
+                        window_sink.error_count == 0 and
                         win_parser.cursor == expected_end_cursor)
                     {
                         const cst_start: usize = if (prefix_count < total_items)
@@ -9349,6 +10361,14 @@ pub fn reparseIncremental(
                         ast_arena.nodes.shrinkRetainingCapacity(0);
                         ast_arena.extra_data.clearRetainingCapacity();
                         ast_arena.ast_to_cst.clearRetainingCapacity();
+
+                        try replayLexerCasingWarnings(
+                            new_source,
+                            file_id,
+                            token_buffer,
+                            diagnostic_sink,
+                            interner,
+                        );
 
                         var verify_cst = LosslessCstArena.init(cst_arena.allocator);
                         defer verify_cst.deinit();
@@ -10648,4 +11668,504 @@ test "test_parser_dr22_canonical_showcases_types_elevations_and_autofixes" {
         if (diag.code == .e0117_non_ascii_byte_literal) has_e0117 = true;
     }
     try std.testing.expect(has_e0117);
+}
+
+test "test_parser_extern_blocks_extern_static_and_c_casing_exemption" {
+    const extern_src =
+        \\@cfg(target.os == "windows")
+        \\pub extern "C" {
+        \\    @link_name("CreateFileW")
+        \\    pub fn CreateFileW(path: *u16, access: u32) -> *mut opaque;
+        \\    pub(pkg) fn sqlite3_open_v2(filename: *u8, pp_db: *mut *mut opaque, flags: i32, vfs: *u8) -> i32;
+        \\    fn EVP_DigestInit_ex(ctx: *mut opaque, md_type: *opaque, impl_ptr: *mut opaque) -> i32;
+        \\    pub static mut _errno: i32;
+        \\    static SQLITE_VERSION_NUMBER: i32;
+        \\    pub const INVALID_HANDLE_VALUE: usize = 0xFFFF_FFFF_FFFF_FFFF;
+        \\}
+        \\
+        \\extern {
+        \\    fn free(ptr: *mut opaque);
+        \\}
+        \\
+        \\@link_section(".bss")
+        \\pub(super) extern "C" static mut __errno_location_cache: *mut i32;
+        \\extern "C" fn WSAStartup(version_req: u16, data_out: *mut opaque) -> i32;
+    ;
+
+    var token_buf = TokenBuffer.init(std.testing.allocator);
+    defer token_buf.deinit();
+    var cst_arena = LosslessCstArena.init(std.testing.allocator);
+    defer cst_arena.deinit();
+    var ast_arena = AstArena.init(std.testing.allocator);
+    defer ast_arena.deinit();
+    var sink = DiagnosticSink.init(std.testing.allocator);
+    defer sink.deinit();
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    const root_id = try parseSource(
+        extern_src,
+        FileId.fromInt(0),
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+        &sink,
+        &interner,
+    );
+    try std.testing.expectEqual(@as(usize, 0), sink.countDiagnostics());
+    try std.testing.expectEqual(@as(u32, 0), sink.warning_count);
+    try std.testing.expect(!cst_arena.has_parse_errors);
+    try verifyCstAndAstInvariants(
+        std.testing.allocator,
+        extern_src,
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+    );
+
+    const root_node = ast_arena.getNode(root_id);
+    const top_items = ast_arena.getExtraSlice(ExtraIndex.fromInt(root_node.lhs.payload), root_node.rhs.payload);
+    try std.testing.expectEqual(@as(usize, 4), top_items.len);
+
+    // [1] First item: `@cfg(...) pub extern "C" { ... }` with 6 members:
+    const block1_id = NodeIndex.fromInt(top_items[0]);
+    try std.testing.expectEqual(AstTag.extern_block_decl, ast_arena.getNode(block1_id).tag);
+    try std.testing.expectEqual(CstNodeKind.extern_block_item, cst_arena.getNode(ast_arena.getCstOrigin(block1_id)).kind);
+    const header1 = ast_arena.getExternBlockHeader(block1_id);
+    try std.testing.expect(!header1.abi_tok.isNone());
+    try std.testing.expectEqual(ExternVisibility.public, header1.flags.visibility);
+    try std.testing.expectEqual(@as(u32, 1), header1.attr_len);
+    const members1 = ast_arena.getExternBlockItems(block1_id);
+    try std.testing.expectEqual(@as(usize, 6), members1.len);
+    try std.testing.expectEqual(AstTag.fn_decl, ast_arena.getNode(NodeIndex.fromInt(members1[0])).tag);
+    try std.testing.expectEqual(AstTag.fn_decl, ast_arena.getNode(NodeIndex.fromInt(members1[1])).tag);
+    try std.testing.expectEqual(AstTag.fn_decl, ast_arena.getNode(NodeIndex.fromInt(members1[2])).tag);
+    try std.testing.expectEqual(AstTag.extern_static_decl, ast_arena.getNode(NodeIndex.fromInt(members1[3])).tag);
+    try std.testing.expectEqual(AstTag.extern_static_decl, ast_arena.getNode(NodeIndex.fromInt(members1[4])).tag);
+    try std.testing.expectEqual(AstTag.const_decl, ast_arena.getNode(NodeIndex.fromInt(members1[5])).tag);
+
+    const static_mut_info = ast_arena.getExternStaticExtra(NodeIndex.fromInt(members1[3]));
+    try std.testing.expect(static_mut_info.flags.is_mut);
+    try std.testing.expect(static_mut_info.flags.has_extern);
+    try std.testing.expectEqual(ExternVisibility.public, static_mut_info.flags.visibility);
+
+    // [2] Second item: bare `extern { fn free(...); }` with omitted ABI token (`TokenIndex.none`):
+    const block2_id = NodeIndex.fromInt(top_items[1]);
+    const header2 = ast_arena.getExternBlockHeader(block2_id);
+    try std.testing.expect(header2.abi_tok.isNone());
+    try std.testing.expectEqual(@as(usize, 1), ast_arena.getExternBlockItems(block2_id).len);
+
+    // [3] Third item: standalone `pub(super) extern "C" static mut`:
+    const standalone_static_id = NodeIndex.fromInt(top_items[2]);
+    try std.testing.expectEqual(AstTag.extern_static_decl, ast_arena.getNode(standalone_static_id).tag);
+    const standalone_info = ast_arena.getExternStaticExtra(standalone_static_id);
+    try std.testing.expectEqual(ExternVisibility.pub_super, standalone_info.flags.visibility);
+    try std.testing.expect(standalone_info.flags.is_mut);
+    try std.testing.expectEqual(@as(u32, 1), standalone_info.attr_len);
+
+    // [4] Error recovery inside `extern "C" { ... }` produces `item_hole` and parses subsequent members:
+    const bad_extern_src =
+        \\extern "C" {
+        \\    let invalid_local = 1;
+        \\    fn valid_after_hole(code: i32) -> i32;
+        \\}
+    ;
+    sink.diagnostics.clearRetainingCapacity();
+    sink.error_count = 0;
+    sink.warning_count = 0;
+    const bad_root = try parseSource(
+        bad_extern_src,
+        FileId.fromInt(1),
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+        &sink,
+        &interner,
+    );
+    try std.testing.expect(sink.error_count >= 1);
+    try verifyCstAndAstInvariants(
+        std.testing.allocator,
+        bad_extern_src,
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+    );
+    const bad_top = ast_arena.getExtraSlice(
+        ExtraIndex.fromInt(ast_arena.getNode(bad_root).lhs.payload),
+        ast_arena.getNode(bad_root).rhs.payload,
+    );
+    const bad_members = ast_arena.getExternBlockItems(NodeIndex.fromInt(bad_top[0]));
+    try std.testing.expectEqual(@as(usize, 2), bad_members.len);
+    try std.testing.expectEqual(AstTag.item_hole, ast_arena.getNode(NodeIndex.fromInt(bad_members[0])).tag);
+    try std.testing.expectEqual(AstTag.fn_decl, ast_arena.getNode(NodeIndex.fromInt(bad_members[1])).tag);
+}
+
+test "test_parser_kw_async_module_path_segments_zero_diagnostics" {
+    const async_mod_src =
+        \\pub mod async;
+        \\mod wrapper {
+        \\    pub mod async {
+        \\        pub struct TaskHeader {
+        \\            pub state: u32,
+        \\        }
+        \\    }
+        \\}
+        \\use cx.async;
+        \\use cx.async.*;
+        \\use cx.async.{TaskGroup, TaskHandle, sleep};
+        \\use core.async.TaskHeader;
+        \\
+        \\pub async fn run_tasks(
+        \\    grp: &mut cx.async.TaskGroup[IoError],
+        \\    local_grp: &async.TaskGroup[IoError],
+        \\    hdr: core.async.TaskHeader,
+        \\) -> unit ! IoError {
+        \\    async.yield_now().await;
+        \\    let fut = async {
+        \\        cx.async.sleep(10).await
+        \\    };
+        \\    let _ = fut.await;
+        \\    cx.async.task_group[IoError](async |sub_group| {
+        \\        match cx.async.Poll.Ready(hdr.state) {
+        \\            cx.async.Poll.Ready(val) => val,
+        \\            async.Poll.Pending => 0,
+        \\        }
+        \\    }).await
+        \\}
+    ;
+
+    var token_buf = TokenBuffer.init(std.testing.allocator);
+    defer token_buf.deinit();
+    var cst_arena = LosslessCstArena.init(std.testing.allocator);
+    defer cst_arena.deinit();
+    var ast_arena = AstArena.init(std.testing.allocator);
+    defer ast_arena.deinit();
+    var sink = DiagnosticSink.init(std.testing.allocator);
+    defer sink.deinit();
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    _ = try parseSource(
+        async_mod_src,
+        FileId.fromInt(0),
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+        &sink,
+        &interner,
+    );
+    try std.testing.expectEqual(@as(usize, 0), sink.countDiagnostics());
+    try std.testing.expect(!cst_arena.has_parse_errors);
+    try verifyCstAndAstInvariants(
+        std.testing.allocator,
+        async_mod_src,
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+    );
+}
+
+test "test_parser_r1_depth_caps_precede_extern_attrs_and_incremental_w0201_parity" {
+    const allocator = std.testing.allocator;
+    var token_buf = TokenBuffer.init(allocator);
+    defer token_buf.deinit();
+    var cst_arena = LosslessCstArena.init(allocator);
+    defer cst_arena.deinit();
+    var ast_arena = AstArena.init(allocator);
+    defer ast_arena.deinit();
+    var sink = DiagnosticSink.init(allocator);
+    defer sink.deinit();
+    var interner = try StringInterner.init(allocator);
+    defer interner.deinit();
+
+    // [1] `[CRITICAL-08]`: Deep `@` subpatterns, `~` / `#soa` types, `dyn` / `any`, and retired `ref` cap at `E0203`:
+    const deep_cases = [_][]const u8{
+        "fn deep_at(val: i32) { match val { a @ b @ c @ d @ e @ f @ g @ h @ _ => {} } }\n",
+        "fn deep_tilde(val: ~ ~ ~ ~ ~ ~ ~ ~ ~ i32) {}\n",
+        "fn deep_soa(val: #soa #soa #soa #soa #soa #soa #soa #soa i32) {}\n",
+        "fn deep_dyn(val: dyn any dyn any dyn any dyn any TraitName) {}\n",
+        "fn deep_ref(val: ref ref ref ref ref ref ref ref i32) {}\n",
+    };
+    for (deep_cases, 0..) |case_src, idx| {
+        token_buf.tokens.shrinkRetainingCapacity(0);
+        token_buf.trivia.clearRetainingCapacity();
+        cst_arena.nodes.shrinkRetainingCapacity(0);
+        cst_arena.parse_stack.clearRetainingCapacity();
+        cst_arena.has_parse_errors = false;
+        ast_arena.nodes.shrinkRetainingCapacity(0);
+        ast_arena.extra_data.clearRetainingCapacity();
+        ast_arena.ast_to_cst.clearRetainingCapacity();
+        sink.diagnostics.clearRetainingCapacity();
+        sink.error_count = 0;
+        sink.warning_count = 0;
+
+        try lexer.tokenize(case_src, FileId.fromInt(@intCast(idx)), &token_buf, &sink, &interner);
+        var capped = Parser.initWithOptions(
+            case_src,
+            FileId.fromInt(@intCast(idx)),
+            &token_buf,
+            &cst_arena,
+            &ast_arena,
+            &sink,
+            &interner,
+            .{ .max_depth = 6 },
+        );
+        _ = try capped.parse();
+        var has_e0203 = false;
+        for (sink.asSlice()) |diag_item| {
+            if (diag_item.code == .e0203_parse_depth_exceeded) has_e0203 = true;
+        }
+        try std.testing.expect(has_e0203);
+        try verifyCstAndAstInvariants(allocator, case_src, &token_buf, &cst_arena, &ast_arena);
+    }
+
+    // [2] `[MAJOR-07]`: `precedeNode` shifts `attr_start` on `.extern_block_decl` and `.extern_static_decl`:
+    const precede_extern_src =
+        "fn check_expr() -> i32 {\n" ++
+        "    return {\n" ++
+        "        @link_name(\"cos\") extern \"C\" { fn c_cos(val: f64) -> f64; }\n" ++
+        "        @link_name(\"errno\") extern \"C\" static mut c_errno: i32;\n" ++
+        "        1\n" ++
+        "    } + 2;\n" ++
+        "}\n";
+    sink.diagnostics.clearRetainingCapacity();
+    sink.error_count = 0;
+    sink.warning_count = 0;
+    _ = try parseSource(
+        precede_extern_src,
+        FileId.fromInt(10),
+        &token_buf,
+        &cst_arena,
+        &ast_arena,
+        &sink,
+        &interner,
+    );
+    try std.testing.expectEqual(@as(u32, 0), sink.error_count);
+    try verifyCstAndAstInvariants(allocator, precede_extern_src, &token_buf, &cst_arena, &ast_arena);
+
+    var checked_block_attr = false;
+    var checked_static_attr = false;
+    var node_i: usize = 0;
+    while (node_i < ast_arena.countNodes()) : (node_i += 1) {
+        const nid = NodeIndex.fromInt(@intCast(node_i));
+        const tag = ast_arena.getNode(nid).tag;
+        if (tag == .extern_block_decl) {
+            const hdr = ast_arena.getExternBlockHeader(nid);
+            try std.testing.expectEqual(@as(u32, 1), hdr.attr_len);
+            try std.testing.expectEqual(
+                CstNodeKind.attribute,
+                cst_arena.getNode(CstNodeIndex.fromInt(hdr.attr_start)).kind,
+            );
+            checked_block_attr = true;
+        } else if (tag == .extern_static_decl) {
+            const ext_info = ast_arena.getExternStaticExtra(nid);
+            try std.testing.expectEqual(@as(u32, 1), ext_info.attr_len);
+            try std.testing.expectEqual(
+                CstNodeKind.attribute,
+                cst_arena.getNode(CstNodeIndex.fromInt(ext_info.attr_start)).kind,
+            );
+            checked_static_attr = true;
+        }
+    }
+    try std.testing.expect(checked_block_attr and checked_static_attr);
+
+    // [3] `[MAJOR-08]`: `reparseIncremental` preserves `W0201` warnings in untouched items identically to `parseSource`:
+    const old_w0201_src =
+        "struct Bad_Struct {}\n\n" ++
+        "const BAD_const: i32 = 1;\n\n" ++
+        "pub fn middle_target(val: i32) -> i32 {\n    return val + 1;\n}\n\n" ++
+        "pub fn suffix_holder() -> i32 {\n    let bad_Camel = 1;\n    return bad_Camel;\n}\n";
+    const new_w0201_src =
+        "struct Bad_Struct {}\n\n" ++
+        "const BAD_const: i32 = 1;\n\n" ++
+        "pub fn middle_target(val: i32) -> i32 {\n    return val + 999;\n}\n\n" ++
+        "pub fn suffix_holder() -> i32 {\n    let bad_Camel = 1;\n    return bad_Camel;\n}\n";
+
+    const edit_off: u32 = @intCast(std.mem.indexOf(u8, old_w0201_src, "val + 1").?);
+    var inc_tokens = TokenBuffer.init(allocator);
+    defer inc_tokens.deinit();
+    var inc_cst = LosslessCstArena.init(allocator);
+    defer inc_cst.deinit();
+    var inc_ast = AstArena.init(allocator);
+    defer inc_ast.deinit();
+    var init_sink = DiagnosticSink.init(allocator);
+    defer init_sink.deinit();
+
+    _ = try parseSource(old_w0201_src, FileId.fromInt(20), &inc_tokens, &inc_cst, &inc_ast, &init_sink, &interner);
+
+    var inc_sink = DiagnosticSink.init(allocator);
+    defer inc_sink.deinit();
+    const inc_stats = try reparseIncremental(
+        new_w0201_src,
+        FileId.fromInt(20),
+        .{ .start_byte = edit_off, .old_end_byte = edit_off + 7, .new_end_byte = edit_off + 9 },
+        &inc_tokens,
+        &inc_cst,
+        &inc_ast,
+        &inc_sink,
+        &interner,
+    );
+    try std.testing.expect(inc_stats.is_fast_splice);
+
+    var scratch_tokens = TokenBuffer.init(allocator);
+    defer scratch_tokens.deinit();
+    var scratch_cst = LosslessCstArena.init(allocator);
+    defer scratch_cst.deinit();
+    var scratch_ast = AstArena.init(allocator);
+    defer scratch_ast.deinit();
+    var scratch_sink = DiagnosticSink.init(allocator);
+    defer scratch_sink.deinit();
+    _ = try parseSource(
+        new_w0201_src,
+        FileId.fromInt(20),
+        &scratch_tokens,
+        &scratch_cst,
+        &scratch_ast,
+        &scratch_sink,
+        &interner,
+    );
+
+    try std.testing.expectEqual(scratch_sink.warning_count, inc_sink.warning_count);
+    try std.testing.expectEqual(@as(u32, 4), inc_sink.warning_count);
+    for (scratch_sink.asSlice(), inc_sink.asSlice()) |expected_d, actual_d| {
+        try std.testing.expectEqual(expected_d.code, actual_d.code);
+        try std.testing.expectEqual(expected_d.primary_span, actual_d.primary_span);
+        try std.testing.expectEqualStrings(expected_d.labels[0].label, actual_d.labels[0].label);
+        try std.testing.expectEqual(
+            expected_d.suggestions[0].edits[0].replacement_id,
+            actual_d.suggestions[0].edits[0].replacement_id,
+        );
+    }
+}
+
+test "test_parser_r4a_allow_non_canonical_case_and_c_scalar_aliases_suppress_w0201" {
+    const allocator = std.testing.allocator;
+    var interner = try StringInterner.init(allocator);
+    defer interner.deinit();
+
+    const old_ffi_src =
+        "pub type c_char = i8;\n" ++
+        "pub type c_ulonglong = u64;\n" ++
+        "pub type c_void = opaque;\n\n" ++
+        "@allow(non_canonical_case)\n" ++
+        "@repr(C)\n" ++
+        "pub struct sqlite3_stmt {\n" ++
+        "    pub pVm: i32,\n" ++
+        "}\n\n" ++
+        "pub struct SqliteRow {\n" ++
+        "    @allow(non_canonical_case)\n" ++
+        "    pub nCol: c_char,\n" ++
+        "}\n\n" ++
+        "impl sqlite3_stmt {\n" ++
+        "    @allow(non_canonical_case)\n" ++
+        "    pub fn isReady(&self) -> bool {\n" ++
+        "        return self.pVm == 1;\n" ++
+        "    }\n" ++
+        "}\n\n" ++
+        "pub fn probe_ffi(stmt: *sqlite3_stmt, row: &SqliteRow) -> i32 {\n" ++
+        "    if stmt != @default_init[*sqlite3_stmt]() {\n" ++
+        "        return (row.nCol as i32) + 1;\n" ++
+        "    }\n" ++
+        "    return 0;\n" ++
+        "}\n";
+
+    const new_ffi_src =
+        "pub type c_char = i8;\n" ++
+        "pub type c_ulonglong = u64;\n" ++
+        "pub type c_void = opaque;\n\n" ++
+        "@allow(non_canonical_case)\n" ++
+        "@repr(C)\n" ++
+        "pub struct sqlite3_stmt {\n" ++
+        "    pub pVm: i32,\n" ++
+        "}\n\n" ++
+        "pub struct SqliteRow {\n" ++
+        "    @allow(non_canonical_case)\n" ++
+        "    pub nCol: c_char,\n" ++
+        "}\n\n" ++
+        "impl sqlite3_stmt {\n" ++
+        "    @allow(non_canonical_case)\n" ++
+        "    pub fn isReady(&self) -> bool {\n" ++
+        "        return self.pVm == 1;\n" ++
+        "    }\n" ++
+        "}\n\n" ++
+        "pub fn probe_ffi(stmt: *sqlite3_stmt, row: &SqliteRow) -> i32 {\n" ++
+        "    if stmt != @default_init[*sqlite3_stmt]() {\n" ++
+        "        return (row.nCol as i32) + 42;\n" ++
+        "    }\n" ++
+        "    return 0;\n" ++
+        "}\n";
+
+    // [1] Full scratch `parseSource` emits `0` errors and `0` `W0201` warnings:
+    var inc_tokens = TokenBuffer.init(allocator);
+    defer inc_tokens.deinit();
+    var inc_cst = LosslessCstArena.init(allocator);
+    defer inc_cst.deinit();
+    var inc_ast = AstArena.init(allocator);
+    defer inc_ast.deinit();
+    var scratch_sink = DiagnosticSink.init(allocator);
+    defer scratch_sink.deinit();
+
+    _ = try parseSource(
+        old_ffi_src,
+        FileId.fromInt(42),
+        &inc_tokens,
+        &inc_cst,
+        &inc_ast,
+        &scratch_sink,
+        &interner,
+    );
+    try std.testing.expectEqual(@as(u32, 0), scratch_sink.error_count);
+    try std.testing.expectEqual(@as(u32, 0), scratch_sink.warning_count);
+    try std.testing.expectEqual(@as(usize, 0), scratch_sink.countDiagnostics());
+    try verifyCstAndAstInvariants(allocator, old_ffi_src, &inc_tokens, &inc_cst, &inc_ast);
+
+    // [2] Incremental `reparseIncremental` fast-splices with `0` `W0201` warnings (matching scratch parse):
+    const edit_off: u32 = @intCast(std.mem.indexOf(u8, old_ffi_src, "+ 1;").?);
+    var inc_sink = DiagnosticSink.init(allocator);
+    defer inc_sink.deinit();
+    const inc_stats = try reparseIncremental(
+        new_ffi_src,
+        FileId.fromInt(42),
+        .{ .start_byte = edit_off, .old_end_byte = edit_off + 4, .new_end_byte = edit_off + 5 },
+        &inc_tokens,
+        &inc_cst,
+        &inc_ast,
+        &inc_sink,
+        &interner,
+    );
+    try std.testing.expect(inc_stats.is_fast_splice);
+    try std.testing.expect(inc_stats.reused_prefix_items >= 5);
+    try std.testing.expectEqual(@as(u32, 0), inc_sink.error_count);
+    try std.testing.expectEqual(@as(u32, 0), inc_sink.warning_count);
+    try std.testing.expectEqual(@as(usize, 0), inc_sink.countDiagnostics());
+    try verifyCstAndAstInvariants(allocator, new_ffi_src, &inc_tokens, &inc_cst, &inc_ast);
+
+    // [3] Verify `core/ffi.cx` parses from disk with `0` errors and `0` `W0201` warnings:
+    const raw_core_ffi = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "core/ffi.cx",
+        allocator,
+        .limited(256 * 1024),
+    );
+    defer allocator.free(raw_core_ffi);
+    var lf_core_ffi: std.ArrayListUnmanaged(u8) = .empty;
+    defer lf_core_ffi.deinit(allocator);
+    for (raw_core_ffi) |byte_val| {
+        if (byte_val != '\r') try lf_core_ffi.append(allocator, byte_val);
+    }
+
+    var core_ffi_sink = DiagnosticSink.init(allocator);
+    defer core_ffi_sink.deinit();
+    _ = try parseSource(
+        lf_core_ffi.items,
+        FileId.fromInt(43),
+        &inc_tokens,
+        &inc_cst,
+        &inc_ast,
+        &core_ffi_sink,
+        &interner,
+    );
+    try std.testing.expectEqual(@as(u32, 0), core_ffi_sink.error_count);
+    try std.testing.expectEqual(@as(u32, 0), core_ffi_sink.warning_count);
+    try verifyCstAndAstInvariants(allocator, lf_core_ffi.items, &inc_tokens, &inc_cst, &inc_ast);
 }
