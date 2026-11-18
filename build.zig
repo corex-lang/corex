@@ -4,7 +4,7 @@
 //! `build/stage0/` and the standard `zig-out/bin/` prefix per `.agents/skills/build/SKILL.md`.
 //!
 //! Provides `zig build`, `zig build run`, `zig build test` (executing both internal module tests and
-//! `tests/test_runner.zig`), and `zig build bench` (executing `phase0_bench` through `phase7_bench`).
+//! `tests/test_runner.zig`), and `zig build bench` (executing `phase0_bench` through `phase8_bench`).
 
 const std = @import("std");
 
@@ -129,8 +129,7 @@ fn extractLlvmStaticArchiveStem(file_name: []const u8) ?[]const u8 {
             return null;
         }
         return stem;
-    }
-    if (std.mem.startsWith(u8, file_name, "LLVM") and std.mem.endsWith(u8, file_name, ".lib")) {
+    } else if (std.mem.startsWith(u8, file_name, "LLVM") and std.mem.endsWith(u8, file_name, ".lib")) {
         const stem = file_name[0 .. file_name.len - ".lib".len];
         if (std.mem.eql(u8, stem, "LLVM") or
             std.mem.eql(u8, stem, "LLVM-C") or

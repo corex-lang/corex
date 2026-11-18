@@ -140,144 +140,13 @@ const ComputedMemberPlacement = union(enum) {
     },
 };
 
-// --------------------------------------- CONSTS ----------------------------------------
-
-/// Canonical alphabetical table of `cx.ffi` / `core.ffi` symbols corresponding to `FfiSymbolKind`.
-const FFI_SYMBOL_TABLE = [13]struct {
-    /// Tracked `FfiSymbolKind` enum discriminant.
-    kind: FfiSymbolKind,
-    /// Exported `.cx` symbol identifier in `cx.ffi` / `core.ffi`.
-    name: []const u8,
-}{
-    .{ .kind = .va_list, .name = "VaList" },
-    .{ .kind = .va_list_param, .name = "VaListParam" },
-    .{ .kind = .c_char, .name = "c_char" },
-    .{ .kind = .c_int, .name = "c_int" },
-    .{ .kind = .c_long, .name = "c_long" },
-    .{ .kind = .c_longlong, .name = "c_longlong" },
-    .{ .kind = .c_schar, .name = "c_schar" },
-    .{ .kind = .c_short, .name = "c_short" },
-    .{ .kind = .c_uchar, .name = "c_uchar" },
-    .{ .kind = .c_uint, .name = "c_uint" },
-    .{ .kind = .c_ulong, .name = "c_ulong" },
-    .{ .kind = .c_ulonglong, .name = "c_ulonglong" },
-    .{ .kind = .c_ushort, .name = "c_ushort" },
+/// Module-scope C enumerator constant alias pending emission after a named `enum` body.
+const ExportedEnumConst = struct {
+    /// Original C enumerator identifier.
+    c_name: []const u8,
+    /// Emitted `PascalCase` variant identifier on the owning `.cx` `enum`.
+    variant_name: []const u8,
 };
-
-// -------------------------------------- INTERNALS --------------------------------------
-
-// --------------------- Identifier Hygiene ---------------------
-
-/// Returns `true` if `ident` collides with any CoreX keyword, primitive type, or `ffi` import name.
-fn isReservedCorexIdent(ident: []const u8) bool {
-    if (ident.len == 0 or std.mem.eql(u8, ident, "_")) return true;
-    return lexer.KEYWORD_OR_PRIM_MAP.has(ident);
-}
-
-/// Returns `true` if `ident` satisfies CoreX canonical `PascalCase` `TYPE_IDENT` rules without `W0201`.
-fn isCanonicalPascalTypeIdent(ident: []const u8) bool {
-    if (isReservedCorexIdent(ident)) return false;
-    const classified = lexer.classifyIdentifierOrKeyword(ident);
-    return classified.kind == .type_ident and classified.is_canonical;
-}
-
-/// Returns `true` if `ident` satisfies CoreX canonical `SCREAMING_SNAKE_CASE` `CONST_IDENT` rules.
-fn isCanonicalScreamingConstIdent(ident: []const u8) bool {
-    if (isReservedCorexIdent(ident)) return false;
-    const classified = lexer.classifyIdentifierOrKeyword(ident);
-    return classified.kind == .const_ident and classified.is_canonical;
-}
-
-/// Returns `true` if `ident` satisfies CoreX canonical `snake_case` `IDENT` rules without `W0201`.
-fn isCanonicalSnakeValueIdent(ident: []const u8) bool {
-    if (isReservedCorexIdent(ident)) return false;
-    const classified = lexer.classifyIdentifierOrKeyword(ident);
-    return classified.kind == .ident and classified.is_canonical;
-}
-
-/// Escapes a C struct/union field or function parameter name into a valid `.cx` identifier.
-fn sanitizeFieldOrParamName(
-    arena: *BumpArena,
-    raw_name: []const u8,
-    is_preserving_c_names: bool,
-) ![]const u8 {
-    if (raw_name.len == 0) return "";
-    const candidate = if (is_preserving_c_names)
-        raw_name
-    else
-        try lexer.toSnakeCase(arena.asAllocator(), raw_name);
-    if (isReservedCorexIdent(candidate)) {
-        return std.fmt.allocPrint(arena.asAllocator(), "{s}_", .{candidate});
-    }
-    return candidate;
-}
-
-/// Escapes a C `extern` function or `extern static` name, returning `(cx_ident, has_link_name_override)`.
-fn sanitizeExternSymbolName(
-    arena: *BumpArena,
-    raw_name: []const u8,
-    is_preserving_c_names: bool,
-) !struct { cx_name: []const u8, has_link_name_override: bool } {
-    const base_name = if (is_preserving_c_names)
-        raw_name
-    else
-        try lexer.toSnakeCase(arena.asAllocator(), raw_name);
-    if (isReservedCorexIdent(base_name)) {
-        const escaped = try std.fmt.allocPrint(arena.asAllocator(), "{s}_", .{base_name});
-        return .{ .cx_name = escaped, .has_link_name_override = true };
-    }
-    return .{
-        .cx_name = base_name,
-        .has_link_name_override = !std.mem.eql(u8, base_name, raw_name),
-    };
-}
-
-/// Escapes a C `struct`, `union`, `enum`, or `typedef` nominal identifier for `.cx` emission.
-fn sanitizeTypeIdent(
-    arena: *BumpArena,
-    raw_name: []const u8,
-    is_preserving_c_names: bool,
-) ![]const u8 {
-    const base_name = if (is_preserving_c_names)
-        raw_name
-    else
-        try lexer.toPascalCase(arena.asAllocator(), raw_name);
-    if (isReservedCorexIdent(base_name)) {
-        return std.fmt.allocPrint(arena.asAllocator(), "{s}Type", .{base_name});
-    }
-    return base_name;
-}
-
-/// Escapes UTF-8 bytes into a valid CoreX double-quoted string literal (`"` / `\` / `\n` / `{` / `}`).
-fn appendEscapedCxStringLiteral(
-    allocator: std.mem.Allocator,
-    out_buf: *std.ArrayListUnmanaged(u8),
-    raw_bytes: []const u8,
-) !void {
-    try out_buf.append(allocator, '"');
-    for (raw_bytes) |byte_val| {
-        switch (byte_val) {
-            '"' => try out_buf.appendSlice(allocator, "\\\""),
-            '\\' => try out_buf.appendSlice(allocator, "\\\\"),
-            '\n' => try out_buf.appendSlice(allocator, "\\n"),
-            '\r' => try out_buf.appendSlice(allocator, "\\r"),
-            '\t' => try out_buf.appendSlice(allocator, "\\t"),
-            0 => try out_buf.appendSlice(allocator, "\\0"),
-            '{' => try out_buf.appendSlice(allocator, "{{"),
-            '}' => try out_buf.appendSlice(allocator, "}}"),
-            else => {
-                if (byte_val >= 0x20 and byte_val <= 0x7E) {
-                    try out_buf.append(allocator, byte_val);
-                } else {
-                    var hex_tmp: [4]u8 = undefined;
-                    const formatted = std.fmt.bufPrint(&hex_tmp, "\\x{X:0>2}", .{byte_val}) catch unreachable;
-                    try out_buf.appendSlice(allocator, formatted);
-                }
-            },
-        }
-    }
-    try out_buf.append(allocator, '"');
-}
 
 /// Zero-intermediate-allocation byte writer backed by `*std.ArrayListUnmanaged(u8)`.
 const ByteWriter = struct {
@@ -296,12 +165,68 @@ const ByteWriter = struct {
         try self.buf.append(self.allocator, byte_val);
     }
 
-    /// Formats `fmt` with `args` directly into `self.buf`'s unused capacity slice.
-    fn print(self: ByteWriter, comptime fmt: []const u8, args: anytype) !void {
-        const needed: usize = @intCast(std.fmt.count(fmt, args));
-        try self.buf.ensureUnusedCapacity(self.allocator, needed);
-        _ = std.fmt.bufPrint(self.buf.unusedCapacitySlice()[0..needed], fmt, args) catch unreachable;
-        self.buf.items.len += needed;
+    /// Appends every slice in `parts` sequentially into `self.buf` with a single capacity reservation.
+    fn writeSlices(self: ByteWriter, parts: []const []const u8) !void {
+        var total_len: usize = 0;
+        for (parts) |part| total_len += part.len;
+        try self.buf.ensureUnusedCapacity(self.allocator, total_len);
+        for (parts) |part| self.buf.appendSliceAssumeCapacity(part);
+    }
+
+    /// Formats unsigned 64-bit integer `val` in base 10 directly into `self.buf`.
+    fn writeUnsigned(self: ByteWriter, val: u64) !void {
+        var num_buf: [24]u8 = undefined;
+        try self.buf.appendSlice(
+            self.allocator,
+            std.fmt.bufPrint(&num_buf, "{d}", .{val}) catch unreachable,
+        );
+    }
+
+    /// Formats signed 128-bit integer `val` in base 10 directly into `self.buf`.
+    fn writeSignedI128(self: ByteWriter, val: i128) !void {
+        var num_buf: [48]u8 = undefined;
+        try self.buf.appendSlice(
+            self.allocator,
+            std.fmt.bufPrint(&num_buf, "{d}", .{val}) catch unreachable,
+        );
+    }
+
+    /// Formats `val` into an overflow-free CoreX signed integer literal or `MIN` expression.
+    fn writeSafeCxSignedLiteral(self: ByteWriter, val: i128, type_suffix: []const u8) !void {
+        if (val == std.math.minInt(i128)) {
+            try self.writeSlices(&.{
+                "-170141183460469231731687303715884105727",
+                type_suffix,
+                " - 1",
+                type_suffix,
+            });
+        } else if (val == std.math.minInt(i64)) {
+            try self.writeSlices(&.{
+                "-9223372036854775807",
+                type_suffix,
+                " - 1",
+                type_suffix,
+            });
+        } else {
+            try self.writeSignedI128(val);
+            if (type_suffix.len > 0) try self.writeAll(type_suffix);
+        }
+    }
+
+    /// Appends `    pub _pad_<pad_index>: [u8; <byte_len>],\n` into `self.buf`.
+    fn writePadField(self: ByteWriter, pad_index: u32, byte_len: u64) !void {
+        try self.writeAll("    pub _pad_");
+        try self.writeUnsigned(pad_index);
+        try self.writeAll(": [u8; ");
+        try self.writeUnsigned(byte_len);
+        try self.writeAll("],\n");
+    }
+
+    /// Appends `self.<field_name>[<byte_index>]` into `self.buf`.
+    fn writeIndexedFieldRef(self: ByteWriter, field_name: []const u8, byte_index: u64) !void {
+        try self.writeSlices(&.{ "self.", field_name, "[" });
+        try self.writeUnsigned(byte_index);
+        try self.writeByte(']');
     }
 };
 
@@ -322,11 +247,11 @@ const CTranslator = struct {
     /// Resolved `.cx` nominal identifier per `CDeclId.asInt()` for records, enums, and typedefs.
     decl_cx_names: []const []const u8 = &.{},
     /// `true` per `CDeclId.asInt()` when a `typedef_decl` was folded into its target `struct`/`union`/`enum`.
-    folded_typedefs: []bool = &.{},
+    is_folded_typedef: []bool = &.{},
     /// $O(1)$ arena-allocated slice marking each `record_decl` that had a `typedef` folded into it.
     is_folded_typedef_target: []bool = &.{},
     /// `true` per `CDeclId.asInt()` once a `record_decl` or `enum_decl` has been emitted.
-    emitted_decls: []bool = &.{},
+    is_emitted_decl: []bool = &.{},
     /// Set of top-level `.cx` names already emitted (preventing duplicate `pub const` / symbol collisions).
     emitted_top_names: std.StringHashMapUnmanaged(void) = .empty,
     /// Output `.cx` body byte builder (preceded by `use cx.ffi.{…};` at final assembly).
@@ -335,8 +260,8 @@ const CTranslator = struct {
     /// Releases translator scratch state.
     fn deinit(self: *CTranslator) void {
         if (self.decl_cx_names.len > 0) self.allocator.free(self.decl_cx_names);
-        if (self.folded_typedefs.len > 0) self.allocator.free(self.folded_typedefs);
-        if (self.emitted_decls.len > 0) self.allocator.free(self.emitted_decls);
+        if (self.is_folded_typedef.len > 0) self.allocator.free(self.is_folded_typedef);
+        if (self.is_emitted_decl.len > 0) self.allocator.free(self.is_emitted_decl);
         self.emitted_top_names.deinit(self.allocator);
         self.body_buf.deinit(self.allocator);
         self.arena.deinit();
@@ -352,12 +277,12 @@ const CTranslator = struct {
         const decl_count = self.unit.decls.items.len;
         const names = try self.allocator.alloc([]const u8, decl_count);
         @memset(names, "");
-        const folded = try self.allocator.alloc(bool, decl_count);
-        @memset(folded, false);
-        const folded_targets = try self.arena.allocSlice(bool, decl_count);
-        @memset(folded_targets, false);
-        const emitted = try self.allocator.alloc(bool, decl_count);
-        @memset(emitted, false);
+        const is_folded = try self.allocator.alloc(bool, decl_count);
+        @memset(is_folded, false);
+        const is_folded_target = try self.arena.allocSlice(bool, decl_count);
+        @memset(is_folded_target, false);
+        const is_emitted = try self.allocator.alloc(bool, decl_count);
+        @memset(is_emitted, false);
 
         // [1] Fold `typedef struct { … } Alias;` and `struct Foo; typedef struct Foo Foo;`:
         for (self.unit.decls.items, 0..) |decl, i| {
@@ -367,43 +292,30 @@ const CTranslator = struct {
                 const td_node = self.unit.getType(td.target_type);
                 if (td_node == .record_ref) {
                     const rec_id = td_node.record_ref;
-                    const rec_decl = self.unit.getDecl(rec_id);
-                    const rec = rec_decl.kind.record_decl;
-                    if (rec.name.len == 0 and names[rec_id.asInt()].len == 0) {
+                    const rec = self.unit.getDecl(rec_id).kind.record_decl;
+                    if ((rec.name.len == 0 and names[rec_id.asInt()].len == 0) or
+                        std.mem.eql(u8, rec.name, td.name))
+                    {
                         names[rec_id.asInt()] = try sanitizeTypeIdent(
                             &self.arena,
                             td.name,
                             self.options.is_preserving_c_names,
                         );
-                        folded[i] = true;
-                        folded_targets[rec_id.asInt()] = true;
-                    } else if (std.mem.eql(u8, rec.name, td.name)) {
-                        names[rec_id.asInt()] = try sanitizeTypeIdent(
-                            &self.arena,
-                            td.name,
-                            self.options.is_preserving_c_names,
-                        );
-                        folded[i] = true;
-                        folded_targets[rec_id.asInt()] = true;
+                        is_folded[i] = true;
+                        is_folded_target[rec_id.asInt()] = true;
                     }
                 } else if (td_node == .enum_ref) {
                     const en_id = td_node.enum_ref;
-                    const en_decl = self.unit.getDecl(en_id);
-                    const en = en_decl.kind.enum_decl;
-                    if (en.name.len == 0 and names[en_id.asInt()].len == 0) {
+                    const en_item = self.unit.getDecl(en_id).kind.enum_decl;
+                    if ((en_item.name.len == 0 and names[en_id.asInt()].len == 0) or
+                        std.mem.eql(u8, en_item.name, td.name))
+                    {
                         names[en_id.asInt()] = try sanitizeTypeIdent(
                             &self.arena,
                             td.name,
                             self.options.is_preserving_c_names,
                         );
-                        folded[i] = true;
-                    } else if (std.mem.eql(u8, en.name, td.name)) {
-                        names[en_id.asInt()] = try sanitizeTypeIdent(
-                            &self.arena,
-                            td.name,
-                            self.options.is_preserving_c_names,
-                        );
-                        folded[i] = true;
+                        is_folded[i] = true;
                     }
                 }
             }
@@ -430,11 +342,11 @@ const CTranslator = struct {
                         anon_counter += 1;
                     }
                 },
-                .enum_decl => |en| {
-                    if (en.name.len > 0) {
+                .enum_decl => |en_item| {
+                    if (en_item.name.len > 0) {
                         names[i] = try sanitizeTypeIdent(
                             &self.arena,
-                            en.name,
+                            en_item.name,
                             self.options.is_preserving_c_names,
                         );
                     }
@@ -451,9 +363,9 @@ const CTranslator = struct {
         }
 
         self.decl_cx_names = names;
-        self.folded_typedefs = folded;
-        self.is_folded_typedef_target = folded_targets;
-        self.emitted_decls = emitted;
+        self.is_folded_typedef = is_folded;
+        self.is_folded_typedef_target = is_folded_target;
+        self.is_emitted_decl = is_emitted;
     }
 
     /// Lowers `prim` to its canonical CoreX v1.0 type string, recording any needed `ffi` import.
@@ -527,7 +439,7 @@ const CTranslator = struct {
         };
     }
 
-    /// Maps an integer `CPrimitiveKind` to a built-in CoreX integer primitive (`i8`..`u64`, `isize`, `usize`).
+    /// Maps an integer `CPrimitiveKind` to a built-in CoreX integer primitive (`i8`..`u128`, `isize`, `usize`).
     fn lowerEnumBackingIntPrimitive(self: *const CTranslator, prim: CPrimitiveKind) []const u8 {
         const target = self.unit.target;
         return switch (prim) {
@@ -550,12 +462,33 @@ const CTranslator = struct {
         };
     }
 
+    /// Selects the canonical backing CoreX integer primitive for an `enum_decl` from its variants or underlying type.
+    fn resolveEnumBackingIntType(
+        self: *const CTranslator,
+        en_decl: @FieldType(c_frontend.CDeclKind, "enum_decl"),
+    ) []const u8 {
+        if (en_decl.underlying_prim) |up| {
+            return self.lowerEnumBackingIntPrimitive(up);
+        }
+        var min_v: i128 = 0;
+        var max_v: i128 = 0;
+        for (self.unit.getEnumVariants(en_decl.variant_start, en_decl.variant_len)) |v_item| {
+            min_v = @min(min_v, v_item.value);
+            max_v = @max(max_v, v_item.value);
+        }
+        if (min_v >= std.math.minInt(i32) and max_v <= std.math.maxInt(i32)) return "i32";
+        if (min_v >= 0 and max_v <= std.math.maxInt(u32)) return "u32";
+        if (min_v >= std.math.minInt(i64) and max_v <= std.math.maxInt(i64)) return "i64";
+        if (min_v >= 0 and max_v <= std.math.maxInt(u64)) return "u64";
+        return "i128";
+    }
+
     /// Ensures any prerequisite anonymous or forward record/enum referenced by `type_id` is emitted first.
     fn ensureReferencedNominalDeclsEmitted(self: *CTranslator, type_id: CTypeId, depth: u32) !void {
         if (type_id.isNone() or depth > c_frontend.MAX_C_PARSE_DEPTH) return;
         switch (self.unit.getType(type_id)) {
             .record_ref => |rec_id| {
-                if (!self.emitted_decls[rec_id.asInt()]) {
+                if (!self.is_emitted_decl[rec_id.asInt()]) {
                     const rec_decl = self.unit.getDecl(rec_id);
                     if (rec_decl.is_from_system_header or rec_decl.kind.record_decl.name.len == 0) {
                         try self.emitRecordDecl(rec_id, depth + 1);
@@ -563,11 +496,11 @@ const CTranslator = struct {
                 }
             },
             .enum_ref => |en_id| {
-                if (!self.emitted_decls[en_id.asInt()]) {
-                    const en_decl = self.unit.getDecl(en_id);
-                    if (!en_decl.is_from_system_header and self.decl_cx_names[en_id.asInt()].len > 0) {
-                        try self.emitEnumDecl(en_id);
-                    }
+                if (!self.is_emitted_decl[en_id.asInt()] and
+                    !self.unit.getDecl(en_id).is_from_system_header and
+                    self.decl_cx_names[en_id.asInt()].len > 0)
+                {
+                    try self.emitEnumDecl(en_id);
                 }
             },
             .pointer => |ptr| try self.ensureReferencedNominalDeclsEmitted(ptr.pointee, depth + 1),
@@ -608,8 +541,7 @@ const CTranslator = struct {
             }
         }
 
-        const node = self.unit.getType(type_id);
-        return switch (node) {
+        return switch (self.unit.getType(type_id)) {
             .primitive => |prim| self.lowerPrimitiveType(prim),
             .atomic_val => |inner| self.lowerType(inner, override_nullability, is_param_position, depth + 1),
             .typedef_ref => |td_id| {
@@ -628,17 +560,14 @@ const CTranslator = struct {
             .enum_ref => |en_id| {
                 const cx_name = self.decl_cx_names[en_id.asInt()];
                 if (cx_name.len > 0) return cx_name;
-                const en = self.unit.getDecl(en_id).kind.enum_decl;
-                if (en.underlying_prim) |up| return self.lowerEnumBackingIntPrimitive(up);
-                return "i32";
+                return self.resolveEnumBackingIntType(self.unit.getDecl(en_id).kind.enum_decl);
             },
             .array => |arr| {
                 const elem_cx = try self.lowerType(arr.elem, .unspecified, false, depth + 1);
-                const elem_count = arr.len orelse 0;
                 return std.fmt.allocPrint(
                     self.arena.asAllocator(),
                     "[{s}; {d}]",
-                    .{ elem_cx, elem_count },
+                    .{ elem_cx, arr.len orelse 0 },
                 );
             },
             .function => |fn_sig| self.lowerBareFnSignature(
@@ -656,8 +585,7 @@ const CTranslator = struct {
                     ptr.nullability;
 
                 // [1] C function pointer (`int (*cb)(void*, int)`) -> `(extern "C" fn(…))?` (`8B` niche):
-                const unwrapped_pointee = self.unit.unwrapTypedefs(ptr.pointee);
-                const pointee_node = self.unit.getType(unwrapped_pointee);
+                const pointee_node = self.unit.getType(self.unit.unwrapTypedefs(ptr.pointee));
                 if (pointee_node == .function) {
                     const fn_sig = pointee_node.function;
                     const bare_fn = try self.lowerBareFnSignature(
@@ -711,7 +639,7 @@ const CTranslator = struct {
             if (i > 0) try sig_buf.appendSlice(self.allocator, ", ");
             const p_name = try self.chooseUniqueParamName(param.name, i, &used_param_names);
             const p_ty = try self.lowerType(param.type_id, param.contract.nullability, true, depth + 1);
-            try sig_writer.print("{s}: {s}", .{ p_name, p_ty });
+            try sig_writer.writeSlices(&.{ p_name, ": ", p_ty });
         }
         if (is_variadic) {
             if (params.len > 0) try sig_buf.appendSlice(self.allocator, ", ");
@@ -724,8 +652,10 @@ const CTranslator = struct {
         } else {
             const ret_unwrapped = self.unit.getType(self.unit.unwrapTypedefs(return_type));
             if (!(ret_unwrapped == .primitive and ret_unwrapped.primitive == .c_void)) {
-                const ret_cx = try self.lowerType(return_type, .unspecified, false, depth + 1);
-                try sig_writer.print(" -> {s}", .{ret_cx});
+                try sig_writer.writeSlices(&.{
+                    " -> ",
+                    try self.lowerType(return_type, .unspecified, false, depth + 1),
+                });
             }
         }
         return self.arena.dupe(u8, sig_buf.items);
@@ -781,29 +711,27 @@ const CTranslator = struct {
         self: *CTranslator,
         type_id: CTypeId,
     ) !struct { cx_type: []const u8, is_bool: bool, is_signed: bool } {
-        const canon_id = self.unit.unwrapTypedefs(type_id);
-        return switch (self.unit.getType(canon_id)) {
+        return switch (self.unit.getType(self.unit.unwrapTypedefs(type_id))) {
             .primitive => |prim| {
                 if (prim == .c_bool) {
                     return .{ .cx_type = "bool", .is_bool = true, .is_signed = false };
                 }
-                const ty_txt = try self.lowerType(type_id, .unspecified, false, 0);
                 return .{
-                    .cx_type = ty_txt,
+                    .cx_type = try self.lowerType(type_id, .unspecified, false, 0),
                     .is_bool = false,
                     .is_signed = prim.isSignedInteger(self.unit.target),
                 };
             },
             .enum_ref => |en_id| {
-                const en = self.unit.getDecl(en_id).kind.enum_decl;
-                if (en.underlying_prim) |up| {
+                const en_item = self.unit.getDecl(en_id).kind.enum_decl;
+                if (en_item.underlying_prim) |up| {
                     return .{
                         .cx_type = self.lowerPrimitiveType(up),
                         .is_bool = up == .c_bool,
                         .is_signed = up.isSignedInteger(self.unit.target),
                     };
                 }
-                const variants = self.unit.getEnumVariants(en.variant_start, en.variant_len);
+                const variants = self.unit.getEnumVariants(en_item.variant_start, en_item.variant_len);
                 var min_v: i128 = 0;
                 var max_v: i128 = 0;
                 for (variants) |variant_item| {
@@ -814,10 +742,16 @@ const CTranslator = struct {
                     if (min_v >= std.math.minInt(i32) and max_v <= std.math.maxInt(i32)) {
                         return .{ .cx_type = self.lowerPrimitiveType(.c_int), .is_bool = false, .is_signed = true };
                     }
-                    return .{ .cx_type = "i64", .is_bool = false, .is_signed = true };
+                    if (min_v >= std.math.minInt(i64) and max_v <= std.math.maxInt(i64)) {
+                        return .{ .cx_type = "i64", .is_bool = false, .is_signed = true };
+                    }
+                    return .{ .cx_type = "i128", .is_bool = false, .is_signed = true };
                 }
-                const is_msvc_enum = self.unit.target.os == .windows and self.unit.target.abi == .msvc;
-                if (variants.len == 0 or (is_msvc_enum and max_v <= std.math.maxInt(i32))) {
+                if (variants.len == 0 or
+                    (self.unit.target.os == .windows and
+                        self.unit.target.abi == .msvc and
+                        max_v <= std.math.maxInt(i32)))
+                {
                     return .{ .cx_type = self.lowerPrimitiveType(.c_int), .is_bool = false, .is_signed = true };
                 }
                 if (max_v <= std.math.maxInt(u32)) {
@@ -854,8 +788,8 @@ const CTranslator = struct {
 
     /// Emits a `@repr(C)` `struct` or `union` declaration (plus `impl` bitfield methods when needed).
     fn emitRecordDecl(self: *CTranslator, rec_id: CDeclId, depth: u32) anyerror!void {
-        if (depth > c_frontend.MAX_C_PARSE_DEPTH or self.emitted_decls[rec_id.asInt()]) return;
-        self.emitted_decls[rec_id.asInt()] = true;
+        if (depth > c_frontend.MAX_C_PARSE_DEPTH or self.is_emitted_decl[rec_id.asInt()]) return;
+        self.is_emitted_decl[rec_id.asInt()] = true;
 
         const rec = self.unit.getDecl(rec_id).kind.record_decl;
         const cx_name = self.decl_cx_names[rec_id.asInt()];
@@ -876,10 +810,12 @@ const CTranslator = struct {
             if (!isCanonicalPascalTypeIdent(cx_name)) {
                 try writer.writeAll("@allow(non_canonical_case)\n");
             }
-            try writer.print(
-                "@repr(C)\npub {s} {s} {{\n    _opaque: [u8; 0],\n}}\n\n",
-                .{ if (rec.is_union) "union" else "struct", cx_name },
-            );
+            try writer.writeSlices(&.{
+                "@repr(C)\npub ",
+                if (rec.is_union) "union " else "struct ",
+                cx_name,
+                " {\n    _opaque: [u8; 0],\n}\n\n",
+            });
             return;
         }
 
@@ -946,12 +882,14 @@ const CTranslator = struct {
             try writer.writeAll("@allow(non_canonical_case)\n");
         }
         if (layout_attrs.explicit_align > 1 or (has_raw_bytes_layout and summary.align_bytes > 1)) {
-            try writer.print("@align({d})\n", .{summary.align_bytes});
+            try writer.writeAll("@align(");
+            try writer.writeUnsigned(summary.align_bytes);
+            try writer.writeAll(")\n");
         }
         if (is_packed_union) {
             try writer.writeAll("@packed\n");
         }
-        try writer.print("@repr(C)\npub union {s} {{\n", .{cx_name});
+        try writer.writeSlices(&.{ "@repr(C)\npub union ", cx_name, " {\n" });
 
         if (fields.len == 0 or summary.size_bytes == 0) {
             try writer.writeAll("    _empty: [u8; 0],\n}\n\n");
@@ -969,9 +907,8 @@ const CTranslator = struct {
             const raw_fname = if (fld.name.len > 0)
                 try sanitizeFieldOrParamName(&self.arena, fld.name, self.options.is_preserving_c_names)
             else blk: {
-                const gen = try std.fmt.allocPrint(self.arena.asAllocator(), "anon_{d}", .{anon_idx});
-                anon_idx += 1;
-                break :blk gen;
+                defer anon_idx += 1;
+                break :blk try std.fmt.allocPrint(self.arena.asAllocator(), "anon_{d}", .{anon_idx});
             };
             const fname = try self.dedupMemberName(raw_fname, &used_field_names);
             const fty = try self.lowerType(fld.type_id, fld.contract.nullability, false, 0);
@@ -979,13 +916,15 @@ const CTranslator = struct {
                 try writer.writeAll("    @allow(non_canonical_case)\n");
             }
             try self.emitInlineFieldContractAttrs(fld.contract);
-            try writer.print("    pub {s}: {s},\n", .{ fname, fty });
+            try writer.writeSlices(&.{ "    pub ", fname, ": ", fty, ",\n" });
         }
 
         var raw_storage_name: []const u8 = "_raw_bytes";
         if (has_raw_bytes_layout) {
             raw_storage_name = try self.dedupMemberName("_raw_bytes", &used_field_names);
-            try writer.print("    pub {s}: [u8; {d}],\n", .{ raw_storage_name, summary.size_bytes });
+            try writer.writeSlices(&.{ "    pub ", raw_storage_name, ": [u8; " });
+            try writer.writeUnsigned(summary.size_bytes);
+            try writer.writeAll("],\n");
         }
         try writer.writeAll("}\n\n");
 
@@ -998,10 +937,9 @@ const CTranslator = struct {
                     fld.name,
                     self.options.is_preserving_c_names,
                 );
-                const acc_name = try self.dedupMemberName(raw_acc_name, &used_field_names);
                 const acc_info = try self.lowerBitfieldAccessorType(fld.type_id);
                 try accessors.append(self.allocator, .{
-                    .field_cx_name = acc_name,
+                    .field_cx_name = try self.dedupMemberName(raw_acc_name, &used_field_names),
                     .field_cx_type = acc_info.cx_type,
                     .storage_field_name = raw_storage_name,
                     .rel_bit_offset = 0,
@@ -1028,12 +966,14 @@ const CTranslator = struct {
             try writer.writeAll("@allow(non_canonical_case)\n");
         }
         if (layout_attrs.explicit_align > 1) {
-            try writer.print("@align({d})\n", .{layout_attrs.explicit_align});
+            try writer.writeAll("@align(");
+            try writer.writeUnsigned(layout_attrs.explicit_align);
+            try writer.writeAll(")\n");
         }
         if (layout_attrs.is_packed or layout_attrs.pragma_pack == 1) {
             try writer.writeAll("@packed\n");
         }
-        try writer.print("@repr(C)\npub struct {s} {{\n", .{cx_name});
+        try writer.writeSlices(&.{ "@repr(C)\npub struct ", cx_name, " {\n" });
 
         if (fields.len == 0) {
             try writer.writeAll("    _empty: [u8; 0],\n}\n\n");
@@ -1048,9 +988,8 @@ const CTranslator = struct {
             const raw_fname = if (fld.name.len > 0)
                 try sanitizeFieldOrParamName(&self.arena, fld.name, self.options.is_preserving_c_names)
             else blk: {
-                const gen = try std.fmt.allocPrint(self.arena.asAllocator(), "anon_{d}", .{anon_idx});
-                anon_idx += 1;
-                break :blk gen;
+                defer anon_idx += 1;
+                break :blk try std.fmt.allocPrint(self.arena.asAllocator(), "anon_{d}", .{anon_idx});
             };
             const fname = try self.dedupMemberName(raw_fname, &used_field_names);
             const fty = try self.lowerType(fld.type_id, fld.contract.nullability, false, 0);
@@ -1058,7 +997,7 @@ const CTranslator = struct {
                 try writer.writeAll("    @allow(non_canonical_case)\n");
             }
             try self.emitInlineFieldContractAttrs(fld.contract);
-            try writer.print("    pub {s}: {s},\n", .{ fname, fty });
+            try writer.writeSlices(&.{ "    pub ", fname, ": ", fty, ",\n" });
         }
         try writer.writeAll("}\n\n");
     }
@@ -1158,8 +1097,7 @@ const CTranslator = struct {
                         if (is_aapcs64_linux) {
                             max_align = @max(max_align, pragma_only_al);
                         }
-                        const z_al_bits: u64 = @as(u64, pragma_only_al) * 8;
-                        bit_cursor = std.mem.alignForward(u64, bit_cursor, @max(z_al_bits, 8));
+                        bit_cursor = std.mem.alignForward(u64, bit_cursor, @max(@as(u64, pragma_only_al) * 8, 8));
                         continue;
                     }
                     if (fld.name.len > 0 or is_aapcs64_linux) {
@@ -1167,9 +1105,7 @@ const CTranslator = struct {
                     }
                     if (!is_fld_packed) {
                         const align_bits: u64 = @as(u64, eff_al) * 8;
-                        const unit_bits: u64 = f_sz * 8;
-                        const base_bit = (bit_cursor / align_bits) * align_bits;
-                        if (bit_cursor - base_bit + bw > unit_bits) {
+                        if (bit_cursor - (bit_cursor / align_bits) * align_bits + bw > f_sz * 8) {
                             bit_cursor = std.mem.alignForward(u64, bit_cursor, align_bits);
                         }
                     }
@@ -1223,12 +1159,14 @@ const CTranslator = struct {
             try writer.writeAll("@allow(non_canonical_case)\n");
         }
         if (max_align > 1) {
-            try writer.print("@align({d})\n", .{max_align});
+            try writer.writeAll("@align(");
+            try writer.writeUnsigned(max_align);
+            try writer.writeAll(")\n");
         }
         if (is_packed_struct_needed) {
             try writer.writeAll("@packed\n");
         }
-        try writer.print("@repr(C)\npub struct {s} {{\n", .{cx_name});
+        try writer.writeSlices(&.{ "@repr(C)\npub struct ", cx_name, " {\n" });
 
         var accessors: std.ArrayListUnmanaged(BitfieldAccessorSpec) = .empty;
         defer accessors.deinit(self.allocator);
@@ -1257,8 +1195,7 @@ const CTranslator = struct {
                     }
 
                     if (first_bf_byte > emitted_byte_cursor) {
-                        const gap = first_bf_byte - emitted_byte_cursor;
-                        try writer.print("    pub _pad_{d}: [u8; {d}],\n", .{ pad_idx, gap });
+                        try writer.writePadField(pad_idx, first_bf_byte - emitted_byte_cursor);
                         pad_idx += 1;
                         emitted_byte_cursor = first_bf_byte;
                     }
@@ -1271,7 +1208,9 @@ const CTranslator = struct {
                     );
                     bf_cluster_idx += 1;
                     const bf_base_byte = emitted_byte_cursor;
-                    try writer.print("    pub {s}: [u8; {d}],\n", .{ bf_field_name, bf_byte_len });
+                    try writer.writeSlices(&.{ "    pub ", bf_field_name, ": [u8; " });
+                    try writer.writeUnsigned(bf_byte_len);
+                    try writer.writeAll("],\n");
                     emitted_byte_cursor += bf_byte_len;
 
                     for (placements.items[run_start..idx]) |bf_item| {
@@ -1282,10 +1221,9 @@ const CTranslator = struct {
                             bf.field.name,
                             self.options.is_preserving_c_names,
                         );
-                        const acc_name = try self.dedupMemberName(raw_acc_name, &used_field_names);
                         const acc_info = try self.lowerBitfieldAccessorType(bf.field.type_id);
                         try accessors.append(self.allocator, .{
-                            .field_cx_name = acc_name,
+                            .field_cx_name = try self.dedupMemberName(raw_acc_name, &used_field_names),
                             .field_cx_type = acc_info.cx_type,
                             .storage_field_name = bf_field_name,
                             .rel_bit_offset = bf.global_bit_offset - bf_base_byte * 8,
@@ -1302,8 +1240,7 @@ const CTranslator = struct {
                     if (reg.byte_offset > natural_next_off or
                         (is_packed_struct_needed and reg.byte_offset > emitted_byte_cursor))
                     {
-                        const gap = reg.byte_offset - emitted_byte_cursor;
-                        try writer.print("    pub _pad_{d}: [u8; {d}],\n", .{ pad_idx, gap });
+                        try writer.writePadField(pad_idx, reg.byte_offset - emitted_byte_cursor);
                         pad_idx += 1;
                         emitted_byte_cursor = reg.byte_offset;
                     } else {
@@ -1317,9 +1254,8 @@ const CTranslator = struct {
                             self.options.is_preserving_c_names,
                         )
                     else blk: {
-                        const gen = try std.fmt.allocPrint(self.arena.asAllocator(), "anon_{d}", .{anon_idx});
-                        anon_idx += 1;
-                        break :blk gen;
+                        defer anon_idx += 1;
+                        break :blk try std.fmt.allocPrint(self.arena.asAllocator(), "anon_{d}", .{anon_idx});
                     };
                     const fname = try self.dedupMemberName(raw_fname, &used_field_names);
                     const fty = try self.lowerType(reg.field.type_id, reg.field.contract.nullability, false, 0);
@@ -1327,7 +1263,7 @@ const CTranslator = struct {
                         try writer.writeAll("    @allow(non_canonical_case)\n");
                     }
                     try self.emitInlineFieldContractAttrs(reg.field.contract);
-                    try writer.print("    pub {s}: {s},\n", .{ fname, fty });
+                    try writer.writeSlices(&.{ "    pub ", fname, ": ", fty, ",\n" });
                     emitted_byte_cursor += reg.byte_size;
                 },
             }
@@ -1340,7 +1276,7 @@ const CTranslator = struct {
             std.mem.alignForward(u64, emitted_byte_cursor, max_align);
         if (total_struct_bytes > auto_rounded_end) {
             const tail_gap = total_struct_bytes - emitted_byte_cursor;
-            try writer.print("    pub _pad_{d}: [u8; {d}],\n", .{ pad_idx, tail_gap });
+            try writer.writePadField(pad_idx, tail_gap);
             emitted_byte_cursor += tail_gap;
         }
         if (emitted_byte_cursor == 0 and total_struct_bytes == 0) {
@@ -1361,7 +1297,7 @@ const CTranslator = struct {
         accessors: []const BitfieldAccessorSpec,
     ) !void {
         const writer = self.bodyWriter();
-        try writer.print("impl {s} {{\n", .{struct_cx_name});
+        try writer.writeSlices(&.{ "impl ", struct_cx_name, " {\n" });
 
         for (accessors, 0..) |acc, acc_i| {
             if (acc_i > 0) try writer.writeByte('\n');
@@ -1379,10 +1315,13 @@ const CTranslator = struct {
                 try writer.writeAll("    @allow(non_canonical_case)\n");
             }
             try writer.writeAll("    @inline @no_alloc @no_panic\n");
-            try writer.print(
-                "    pub fn {s}(&self) -> {s} {{\n        let raw_bits: u64 = (",
-                .{ acc.field_cx_name, acc.field_cx_type },
-            );
+            try writer.writeSlices(&.{
+                "    pub fn ",
+                acc.field_cx_name,
+                "(&self) -> ",
+                acc.field_cx_type,
+                " {\n        let raw_bits: u64 = (",
+            });
 
             var byte_i = first_byte;
             while (byte_i <= last_byte) : (byte_i += 1) {
@@ -1390,26 +1329,31 @@ const CTranslator = struct {
                 if (local_idx > 0) try writer.writeAll(" | ");
                 if (local_idx == 0) {
                     if (intra_bit == 0) {
-                        try writer.print("(self.{s}[{d}] as u64)", .{ acc.storage_field_name, byte_i });
+                        try writer.writeByte('(');
+                        try writer.writeIndexedFieldRef(acc.storage_field_name, byte_i);
+                        try writer.writeAll(" as u64)");
                     } else {
-                        try writer.print(
-                            "((self.{s}[{d}] as u64) >> {d}_u64)",
-                            .{ acc.storage_field_name, byte_i, intra_bit },
-                        );
+                        try writer.writeAll("((");
+                        try writer.writeIndexedFieldRef(acc.storage_field_name, byte_i);
+                        try writer.writeAll(" as u64) >> ");
+                        try writer.writeUnsigned(intra_bit);
+                        try writer.writeAll("_u64)");
                     }
                 } else {
-                    const left_shift = local_idx * 8 - intra_bit;
-                    try writer.print(
-                        "((self.{s}[{d}] as u64) << {d}_u64)",
-                        .{ acc.storage_field_name, byte_i, left_shift },
-                    );
+                    try writer.writeAll("((");
+                    try writer.writeIndexedFieldRef(acc.storage_field_name, byte_i);
+                    try writer.writeAll(" as u64) << ");
+                    try writer.writeUnsigned(local_idx * 8 - intra_bit);
+                    try writer.writeAll("_u64)");
                 }
             }
 
             if (acc.bit_width >= 64) {
                 try writer.writeAll(");\n");
             } else {
-                try writer.print(") & {d}_u64;\n", .{mask_u64});
+                try writer.writeAll(") & ");
+                try writer.writeUnsigned(mask_u64);
+                try writer.writeAll("_u64;\n");
             }
 
             if (acc.is_bool) {
@@ -1419,31 +1363,38 @@ const CTranslator = struct {
                     if (std.mem.eql(u8, acc.field_cx_type, "i64")) {
                         try writer.writeAll("        return raw_bits as i64;\n    }\n\n");
                     } else {
-                        try writer.print(
-                            "        return (raw_bits as i64) as {s};\n    }}\n\n",
-                            .{acc.field_cx_type},
-                        );
+                        try writer.writeSlices(&.{
+                            "        return (raw_bits as i64) as ",
+                            acc.field_cx_type,
+                            ";\n    }\n\n",
+                        });
                     }
                 } else {
                     const sign_bit: u64 = @as(u64, 1) << @intCast(acc.bit_width - 1);
-                    try writer.print(
-                        "        let signed_bits: i64 = ((raw_bits ^ {d}_u64) -% {d}_u64) as i64;\n",
-                        .{ sign_bit, sign_bit },
-                    );
+                    try writer.writeAll("        let signed_bits: i64 = ((raw_bits ^ ");
+                    try writer.writeUnsigned(sign_bit);
+                    try writer.writeAll("_u64) -% ");
+                    try writer.writeUnsigned(sign_bit);
+                    try writer.writeAll("_u64) as i64;\n");
                     if (std.mem.eql(u8, acc.field_cx_type, "i64")) {
                         try writer.writeAll("        return signed_bits;\n    }\n\n");
                     } else {
-                        try writer.print(
-                            "        return signed_bits as {s};\n    }}\n\n",
-                            .{acc.field_cx_type},
-                        );
+                        try writer.writeSlices(&.{
+                            "        return signed_bits as ",
+                            acc.field_cx_type,
+                            ";\n    }\n\n",
+                        });
                     }
                 }
             } else {
                 if (std.mem.eql(u8, acc.field_cx_type, "u64")) {
                     try writer.writeAll("        return raw_bits;\n    }\n\n");
                 } else {
-                    try writer.print("        return raw_bits as {s};\n    }}\n\n", .{acc.field_cx_type});
+                    try writer.writeSlices(&.{
+                        "        return raw_bits as ",
+                        acc.field_cx_type,
+                        ";\n    }\n\n",
+                    });
                 }
             }
 
@@ -1457,27 +1408,30 @@ const CTranslator = struct {
                 try writer.writeAll("    @allow(non_canonical_case)\n");
             }
             try writer.writeAll("    @inline @no_alloc @no_panic\n");
-            try writer.print(
-                "    pub fn {s}(&mut self, value: {s}) {{\n",
-                .{ setter_name, acc.field_cx_type },
-            );
+            try writer.writeSlices(&.{
+                "    pub fn ",
+                setter_name,
+                "(&mut self, value: ",
+                acc.field_cx_type,
+                ") {\n",
+            });
             if (acc.is_bool) {
                 try writer.writeAll("        let masked_val: u64 = if value { 1_u64 } else { 0_u64 };\n");
             } else if (acc.bit_width >= 64) {
                 try writer.writeAll("        let masked_val: u64 = value as u64;\n");
             } else {
-                try writer.print(
-                    "        let masked_val: u64 = (value as u64) & {d}_u64;\n",
-                    .{mask_u64},
-                );
+                try writer.writeAll("        let masked_val: u64 = (value as u64) & ");
+                try writer.writeUnsigned(mask_u64);
+                try writer.writeAll("_u64;\n");
             }
 
             byte_i = first_byte;
             while (byte_i <= last_byte) : (byte_i += 1) {
                 const ov_start = @max(byte_i * 8, acc.rel_bit_offset);
-                const ov_end = @min(byte_i * 8 + 8, acc.rel_bit_offset + acc.bit_width);
                 const in_byte_shift: u3 = @intCast(ov_start - byte_i * 8);
-                const chunk_width: u4 = @intCast(ov_end - ov_start);
+                const chunk_width: u4 = @intCast(
+                    @min(byte_i * 8 + 8, acc.rel_bit_offset + acc.bit_width) - ov_start,
+                );
                 const from_val_shift: u6 = @intCast(ov_start - acc.rel_bit_offset);
                 const field_mask_u8: u8 = if (chunk_width == 8)
                     0xFF
@@ -1485,58 +1439,37 @@ const CTranslator = struct {
                     ((@as(u8, 1) << @intCast(chunk_width)) - 1) << in_byte_shift;
                 const keep_mask_u8: u8 = ~field_mask_u8;
 
+                try writer.writeAll("        ");
+                try writer.writeIndexedFieldRef(acc.storage_field_name, byte_i);
+                try writer.writeAll(" = ");
                 if (keep_mask_u8 == 0) {
                     if (from_val_shift == 0) {
-                        try writer.print(
-                            "        self.{s}[{d}] = (masked_val & 255_u64) as u8;\n",
-                            .{ acc.storage_field_name, byte_i },
-                        );
+                        try writer.writeAll("(masked_val & 255_u64) as u8;\n");
                     } else {
-                        try writer.print(
-                            "        self.{s}[{d}] = ((masked_val >> {d}_u64) & 255_u64) as u8;\n",
-                            .{ acc.storage_field_name, byte_i, from_val_shift },
-                        );
-                    }
-                } else if (from_val_shift == 0) {
-                    if (in_byte_shift == 0) {
-                        try writer.print(
-                            "        self.{s}[{d}] = (self.{s}[{d}] & {d}_u8) | ((masked_val as u8) & {d}_u8);\n",
-                            .{
-                                acc.storage_field_name,
-                                byte_i,
-                                acc.storage_field_name,
-                                byte_i,
-                                keep_mask_u8,
-                                field_mask_u8,
-                            },
-                        );
-                    } else {
-                        try writer.print(
-                            "        self.{s}[{d}] = (self.{s}[{d}] & {d}_u8) | (((masked_val as u8) << {d}_u8) & {d}_u8);\n",
-                            .{
-                                acc.storage_field_name,
-                                byte_i,
-                                acc.storage_field_name,
-                                byte_i,
-                                keep_mask_u8,
-                                in_byte_shift,
-                                field_mask_u8,
-                            },
-                        );
+                        try writer.writeAll("((masked_val >> ");
+                        try writer.writeUnsigned(from_val_shift);
+                        try writer.writeAll("_u64) & 255_u64) as u8;\n");
                     }
                 } else {
-                    try writer.print(
-                        "        self.{s}[{d}] = (self.{s}[{d}] & {d}_u8) | (((masked_val >> {d}_u64) as u8) & {d}_u8);\n",
-                        .{
-                            acc.storage_field_name,
-                            byte_i,
-                            acc.storage_field_name,
-                            byte_i,
-                            keep_mask_u8,
-                            from_val_shift,
-                            field_mask_u8,
-                        },
-                    );
+                    try writer.writeByte('(');
+                    try writer.writeIndexedFieldRef(acc.storage_field_name, byte_i);
+                    try writer.writeAll(" & ");
+                    try writer.writeUnsigned(keep_mask_u8);
+                    if (from_val_shift == 0) {
+                        if (in_byte_shift == 0) {
+                            try writer.writeAll("_u8) | ((masked_val as u8) & ");
+                        } else {
+                            try writer.writeAll("_u8) | (((masked_val as u8) << ");
+                            try writer.writeUnsigned(in_byte_shift);
+                            try writer.writeAll("_u8) & ");
+                        }
+                    } else {
+                        try writer.writeAll("_u8) | (((masked_val >> ");
+                        try writer.writeUnsigned(from_val_shift);
+                        try writer.writeAll("_u64) as u8) & ");
+                    }
+                    try writer.writeUnsigned(field_mask_u8);
+                    try writer.writeAll("_u8);\n");
                 }
             }
             try writer.writeAll("    }\n");
@@ -1567,29 +1500,14 @@ const CTranslator = struct {
 
     /// Emits a named `@repr(C)` integer-backed `enum` or promotes an anonymous C `enum` to `pub const`s.
     fn emitEnumDecl(self: *CTranslator, en_id: CDeclId) !void {
-        if (self.emitted_decls[en_id.asInt()]) return;
-        self.emitted_decls[en_id.asInt()] = true;
+        if (self.is_emitted_decl[en_id.asInt()]) return;
+        self.is_emitted_decl[en_id.asInt()] = true;
 
-        const en = self.unit.getDecl(en_id).kind.enum_decl;
+        const en_item = self.unit.getDecl(en_id).kind.enum_decl;
         const cx_name = self.decl_cx_names[en_id.asInt()];
-        const variants = self.unit.getEnumVariants(en.variant_start, en.variant_len);
+        const variants = self.unit.getEnumVariants(en_item.variant_start, en_item.variant_len);
         const writer = self.bodyWriter();
-
-        // Determine backing primitive integer width:
-        const backing_ty: []const u8 = if (en.underlying_prim) |up|
-            self.lowerEnumBackingIntPrimitive(up)
-        else blk: {
-            var min_v: i128 = 0;
-            var max_v: i128 = 0;
-            for (variants) |v_item| {
-                min_v = @min(min_v, v_item.value);
-                max_v = @max(max_v, v_item.value);
-            }
-            if (min_v >= std.math.minInt(i32) and max_v <= std.math.maxInt(i32)) break :blk "i32";
-            if (min_v >= 0 and max_v <= std.math.maxInt(u32)) break :blk "u32";
-            if (min_v >= std.math.minInt(i64) and max_v <= std.math.maxInt(i64)) break :blk "i64";
-            break :blk "u64";
-        };
+        const backing_ty = self.resolveEnumBackingIntType(en_item);
 
         // Anonymous `enum { A = 1, B = 2 };` -> direct `pub const` integer bindings:
         if (cx_name.len == 0) {
@@ -1603,31 +1521,23 @@ const CTranslator = struct {
         try self.emitted_top_names.put(self.allocator, cx_name, {});
 
         // Incomplete or empty enum -> integer type alias:
-        if (!en.is_complete or variants.len == 0) {
+        if (!en_item.is_complete or variants.len == 0) {
             if (!isCanonicalPascalTypeIdent(cx_name)) {
                 try writer.writeAll("@allow(non_canonical_case)\n");
             }
-            try writer.print("pub type {s} = {s};\n\n", .{ cx_name, backing_ty });
+            try writer.writeSlices(&.{ "pub type ", cx_name, " = ", backing_ty, ";\n\n" });
             return;
         }
 
         if (!isCanonicalPascalTypeIdent(cx_name)) {
             try writer.writeAll("@allow(non_canonical_case)\n");
         }
-        try writer.print("@repr(C)\npub enum {s}: {s} {{\n", .{ cx_name, backing_ty });
+        try writer.writeSlices(&.{ "@repr(C)\npub enum ", cx_name, ": ", backing_ty, " {\n" });
 
         var seen_discrims: std.AutoHashMapUnmanaged(i128, []const u8) = .empty;
         defer seen_discrims.deinit(self.allocator);
         var used_var_names: std.StringHashMapUnmanaged(void) = .empty;
         defer used_var_names.deinit(self.allocator);
-
-        // Module-scope C enumerator constant alias pending emission after the `enum` body:
-        const ExportedEnumConst = struct {
-            /// Original C enumerator identifier.
-            c_name: []const u8,
-            /// Emitted `PascalCase` variant identifier on `cx_name`.
-            variant_name: []const u8,
-        };
         var exported_consts: std.ArrayListUnmanaged(ExportedEnumConst) = .empty;
         defer exported_consts.deinit(self.allocator);
 
@@ -1645,7 +1555,9 @@ const CTranslator = struct {
             }
             const unique_var = try self.dedupMemberName(pascal_var, &used_var_names);
             try seen_discrims.put(self.allocator, v_item.value, unique_var);
-            try writer.print("    {s} = {d},\n", .{ unique_var, v_item.value });
+            try writer.writeSlices(&.{ "    ", unique_var, " = " });
+            try writer.writeSafeCxSignedLiteral(v_item.value, "");
+            try writer.writeAll(",\n");
             try exported_consts.append(self.allocator, .{
                 .c_name = v_item.name,
                 .variant_name = unique_var,
@@ -1662,10 +1574,17 @@ const CTranslator = struct {
             if (const_name.len == 0 or isReservedCorexIdent(const_name)) continue;
             if (self.emitted_top_names.contains(const_name)) continue;
             try self.emitted_top_names.put(self.allocator, const_name, {});
-            try writer.print(
-                "pub const {s}: {s} = {s}.{s};\n",
-                .{ const_name, cx_name, cx_name, ec.variant_name },
-            );
+            try writer.writeSlices(&.{
+                "pub const ",
+                const_name,
+                ": ",
+                cx_name,
+                " = ",
+                cx_name,
+                ".",
+                ec.variant_name,
+                ";\n",
+            });
         }
         if (exported_consts.items.len > 0) try writer.writeByte('\n');
     }
@@ -1684,15 +1603,15 @@ const CTranslator = struct {
         if (const_name.len == 0 or isReservedCorexIdent(const_name)) return;
         if (self.emitted_top_names.contains(const_name)) return;
         try self.emitted_top_names.put(self.allocator, const_name, {});
-        try self.bodyWriter().print(
-            "pub const {s}: {s} = {d};\n",
-            .{ const_name, int_ty, val },
-        );
+        const writer = self.bodyWriter();
+        try writer.writeSlices(&.{ "pub const ", const_name, ": ", int_ty, " = " });
+        try writer.writeSafeCxSignedLiteral(val, "");
+        try writer.writeAll(";\n");
     }
 
     /// Emits a non-folded C `typedef` as `pub type Alias = Target;`.
     fn emitTypedefDecl(self: *CTranslator, td_id: CDeclId) !void {
-        if (self.folded_typedefs[td_id.asInt()]) return;
+        if (self.is_folded_typedef[td_id.asInt()]) return;
         const td = self.unit.getDecl(td_id).kind.typedef_decl;
         const cx_name = self.decl_cx_names[td_id.asInt()];
         if (cx_name.len == 0 or self.emitted_top_names.contains(cx_name)) return;
@@ -1711,7 +1630,7 @@ const CTranslator = struct {
         if (!isCanonicalPascalTypeIdent(cx_name)) {
             try writer.writeAll("@allow(non_canonical_case)\n");
         }
-        try writer.print("pub type {s} = {s};\n\n", .{ cx_name, target_cx });
+        try writer.writeSlices(&.{ "pub type ", cx_name, " = ", target_cx, ";\n\n" });
     }
 
     /// Emits an `extern "C" fn` prototype with SAL/Clang FFI contract attributes (skipping `static` inline bodies).
@@ -1740,12 +1659,15 @@ const CTranslator = struct {
 
         // Emit stacked return-level FFI contract and `@link_name` attributes:
         if (fd.ret_contract.free_with_fn.len > 0) {
-            const free_sym = try sanitizeExternSymbolName(
-                &self.arena,
-                fd.ret_contract.free_with_fn,
-                self.options.is_preserving_c_names,
-            );
-            try writer.print("@free_with({s})\n", .{free_sym.cx_name});
+            try writer.writeSlices(&.{
+                "@free_with(",
+                (try sanitizeExternSymbolName(
+                    &self.arena,
+                    fd.ret_contract.free_with_fn,
+                    self.options.is_preserving_c_names,
+                )).cx_name,
+                ")\n",
+            });
         }
         if (sym_info.has_link_name_override) {
             try writer.writeAll("@link_name(");
@@ -1764,7 +1686,7 @@ const CTranslator = struct {
             try writer.writeAll("@owned_by_caller\n");
         }
 
-        try writer.print("pub extern \"C\" fn {s}(", .{sym_info.cx_name});
+        try writer.writeSlices(&.{ "pub extern \"C\" fn ", sym_info.cx_name, "(" });
         var used_param_names: std.StringHashMapUnmanaged(void) = .empty;
         defer used_param_names.deinit(self.allocator);
 
@@ -1773,7 +1695,7 @@ const CTranslator = struct {
             try self.emitInlineParamContractAttrs(param.contract);
             const p_name = try self.chooseUniqueParamName(param.name, i, &used_param_names);
             const p_ty = try self.lowerType(param.type_id, param.contract.nullability, true, 0);
-            try writer.print("{s}: {s}", .{ p_name, p_ty });
+            try writer.writeSlices(&.{ p_name, ": ", p_ty });
         }
         if (fd.is_variadic) {
             if (params.len > 0) try writer.writeAll(", ");
@@ -1788,8 +1710,11 @@ const CTranslator = struct {
             if (ret_unwrapped == .primitive and ret_unwrapped.primitive == .c_void) {
                 try writer.writeAll(";\n\n");
             } else {
-                const ret_cx = try self.lowerType(fd.return_type, fd.ret_contract.nullability, false, 0);
-                try writer.print(" -> {s};\n\n", .{ret_cx});
+                try writer.writeSlices(&.{
+                    " -> ",
+                    try self.lowerType(fd.return_type, fd.ret_contract.nullability, false, 0),
+                    ";\n\n",
+                });
             }
         }
     }
@@ -1806,7 +1731,7 @@ const CTranslator = struct {
                     contract.slice_len_param,
                     self.options.is_preserving_c_names,
                 );
-            try writer.print("@slice_len({s}) ", .{len_arg});
+            try writer.writeSlices(&.{ "@slice_len(", len_arg, ") " });
         }
         if (contract.nullability == .may_be_null) {
             try writer.writeAll("@may_be_null ");
@@ -1823,10 +1748,12 @@ const CTranslator = struct {
 
     /// Emits struct-field pointer FFI contract attributes (`@slice_len(n)`, `@may_be_null`, `@null_terminated`).
     fn emitInlineFieldContractAttrs(self: *CTranslator, contract: CFfiContract) !void {
-        const has_any = contract.slice_len_param.len > 0 or
-            contract.nullability != .unspecified or
-            contract.is_null_terminated;
-        if (!has_any) return;
+        if (contract.slice_len_param.len == 0 and
+            contract.nullability == .unspecified and
+            !contract.is_null_terminated)
+        {
+            return;
+        }
         const writer = self.bodyWriter();
         try writer.writeAll("    ");
         try self.emitInlineParamContractAttrs(contract);
@@ -1855,18 +1782,19 @@ const CTranslator = struct {
         try self.ensureReferencedNominalDeclsEmitted(vd.type_id, 0);
         try self.emitted_top_names.put(self.allocator, sym_info.cx_name, {});
 
-        const ty_cx = try self.lowerType(vd.type_id, .unspecified, false, 0);
         const writer = self.bodyWriter();
         if (sym_info.has_link_name_override) {
             try writer.writeAll("@link_name(");
             try appendEscapedCxStringLiteral(self.allocator, &self.body_buf, vd.name);
             try writer.writeAll(")\n");
         }
-        if (vd.is_const) {
-            try writer.print("pub extern \"C\" static {s}: {s};\n\n", .{ sym_info.cx_name, ty_cx });
-        } else {
-            try writer.print("pub extern \"C\" static mut {s}: {s};\n\n", .{ sym_info.cx_name, ty_cx });
-        }
+        try writer.writeSlices(&.{
+            if (vd.is_const) "pub extern \"C\" static " else "pub extern \"C\" static mut ",
+            sym_info.cx_name,
+            ": ",
+            try self.lowerType(vd.type_id, .unspecified, false, 0),
+            ";\n\n",
+        });
     }
 
     /// Emits `pub const NAME: <Ty> = <Lit>;` for valid `SCREAMING_SNAKE_CASE` `#define` and `static const` items.
@@ -1878,17 +1806,14 @@ const CTranslator = struct {
         const writer = self.bodyWriter();
         switch (val) {
             .signed_int => |sv| {
-                if (sv == std.math.minInt(i64)) {
-                    try writer.print(
-                        "pub const {s}: i64 = -9223372036854775807_i64 -% 1_i64;\n",
-                        .{raw_name},
-                    );
-                } else {
-                    try writer.print("pub const {s}: i64 = {d}_i64;\n", .{ raw_name, sv });
-                }
+                try writer.writeSlices(&.{ "pub const ", raw_name, ": i64 = " });
+                try writer.writeSafeCxSignedLiteral(sv, "_i64");
+                try writer.writeAll(";\n");
             },
             .unsigned_int => |uv| {
-                try writer.print("pub const {s}: u64 = {d}_u64;\n", .{ raw_name, uv });
+                try writer.writeSlices(&.{ "pub const ", raw_name, ": u64 = " });
+                try writer.writeUnsigned(uv);
+                try writer.writeAll("_u64;\n");
             },
             .float_val => |fv| {
                 if (!std.math.isFinite(fv)) {
@@ -1898,13 +1823,13 @@ const CTranslator = struct {
                 var flt_buf: [64]u8 = undefined;
                 const flt_txt = std.fmt.bufPrint(&flt_buf, "{d}", .{fv}) catch return;
                 if (std.mem.indexOfAny(u8, flt_txt, ".eE") == null) {
-                    try writer.print("pub const {s}: f64 = {s}.0;\n", .{ raw_name, flt_txt });
+                    try writer.writeSlices(&.{ "pub const ", raw_name, ": f64 = ", flt_txt, ".0;\n" });
                 } else {
-                    try writer.print("pub const {s}: f64 = {s};\n", .{ raw_name, flt_txt });
+                    try writer.writeSlices(&.{ "pub const ", raw_name, ": f64 = ", flt_txt, ";\n" });
                 }
             },
             .string_val => |str_bytes| {
-                try writer.print("pub const {s}: str = ", .{raw_name});
+                try writer.writeSlices(&.{ "pub const ", raw_name, ": str = " });
                 try appendEscapedCxStringLiteral(self.allocator, &self.body_buf, str_bytes);
                 try writer.writeAll(";\n");
             },
@@ -1934,12 +1859,12 @@ const CTranslator = struct {
             if (import_count == 1) {
                 for (FFI_SYMBOL_TABLE) |entry| {
                     if (self.ffi_imports.has(entry.kind)) {
-                        try writer.print("use {s}.{s};\n\n", .{ pkg_prefix, entry.name });
+                        try writer.writeSlices(&.{ "use ", pkg_prefix, ".", entry.name, ";\n\n" });
                         break;
                     }
                 }
             } else {
-                try writer.print("use {s}.{{", .{pkg_prefix});
+                try writer.writeSlices(&.{ "use ", pkg_prefix, ".{" });
                 var emitted_i: u32 = 0;
                 for (FFI_SYMBOL_TABLE) |entry| {
                     if (self.ffi_imports.has(entry.kind)) {
@@ -1962,9 +1887,156 @@ const CTranslator = struct {
         defer self.allocator.free(raw_slice);
 
         const fmt_res = try fmt_engine.formatSource(self.allocator, raw_slice, .none);
+        if (fmt_res.has_syntax_errors) {
+            self.allocator.free(fmt_res.formatted_text);
+            return error.InvalidTranslatedSyntax;
+        }
         return fmt_res.formatted_text;
     }
 };
+
+// --------------------------------------- CONSTS ----------------------------------------
+
+/// Canonical alphabetical table of `cx.ffi` / `core.ffi` symbols corresponding to `FfiSymbolKind`.
+const FFI_SYMBOL_TABLE = [13]struct {
+    /// Tracked `FfiSymbolKind` enum discriminant.
+    kind: FfiSymbolKind,
+    /// Exported `.cx` symbol identifier in `cx.ffi` / `core.ffi`.
+    name: []const u8,
+}{
+    .{ .kind = .va_list, .name = "VaList" },
+    .{ .kind = .va_list_param, .name = "VaListParam" },
+    .{ .kind = .c_char, .name = "c_char" },
+    .{ .kind = .c_int, .name = "c_int" },
+    .{ .kind = .c_long, .name = "c_long" },
+    .{ .kind = .c_longlong, .name = "c_longlong" },
+    .{ .kind = .c_schar, .name = "c_schar" },
+    .{ .kind = .c_short, .name = "c_short" },
+    .{ .kind = .c_uchar, .name = "c_uchar" },
+    .{ .kind = .c_uint, .name = "c_uint" },
+    .{ .kind = .c_ulong, .name = "c_ulong" },
+    .{ .kind = .c_ulonglong, .name = "c_ulonglong" },
+    .{ .kind = .c_ushort, .name = "c_ushort" },
+};
+
+// -------------------------------------- INTERNALS --------------------------------------
+
+// --------------------- Identifier Hygiene ---------------------
+
+/// Returns `true` if `ident` collides with any CoreX keyword, primitive type, or `ffi` import name.
+fn isReservedCorexIdent(ident: []const u8) bool {
+    if (ident.len == 0 or std.mem.eql(u8, ident, "_")) return true;
+    return lexer.KEYWORD_OR_PRIM_MAP.has(ident);
+}
+
+/// Returns `true` if `ident` satisfies CoreX canonical `PascalCase` `TYPE_IDENT` rules without `W0201`.
+fn isCanonicalPascalTypeIdent(ident: []const u8) bool {
+    if (isReservedCorexIdent(ident)) return false;
+    const classified = lexer.classifyIdentifierOrKeyword(ident);
+    return classified.kind == .type_ident and classified.is_canonical;
+}
+
+/// Returns `true` if `ident` satisfies CoreX canonical `SCREAMING_SNAKE_CASE` `CONST_IDENT` rules.
+fn isCanonicalScreamingConstIdent(ident: []const u8) bool {
+    if (isReservedCorexIdent(ident)) return false;
+    const classified = lexer.classifyIdentifierOrKeyword(ident);
+    return classified.kind == .const_ident and classified.is_canonical;
+}
+
+/// Returns `true` if `ident` satisfies CoreX canonical `snake_case` `IDENT` rules without `W0201`.
+fn isCanonicalSnakeValueIdent(ident: []const u8) bool {
+    if (isReservedCorexIdent(ident)) return false;
+    const classified = lexer.classifyIdentifierOrKeyword(ident);
+    return classified.kind == .ident and classified.is_canonical;
+}
+
+/// Escapes a C struct/union field or function parameter name into a valid `.cx` identifier.
+fn sanitizeFieldOrParamName(
+    arena: *BumpArena,
+    raw_name: []const u8,
+    is_preserving_c_names: bool,
+) ![]const u8 {
+    if (raw_name.len == 0) return "";
+    const candidate = if (is_preserving_c_names)
+        raw_name
+    else
+        try lexer.toSnakeCase(arena.asAllocator(), raw_name);
+    if (isReservedCorexIdent(candidate)) {
+        return std.fmt.allocPrint(arena.asAllocator(), "{s}_", .{candidate});
+    }
+    return candidate;
+}
+
+/// Escapes a C `extern` function or `extern static` name, returning `(cx_ident, has_link_name_override)`.
+fn sanitizeExternSymbolName(
+    arena: *BumpArena,
+    raw_name: []const u8,
+    is_preserving_c_names: bool,
+) !struct { cx_name: []const u8, has_link_name_override: bool } {
+    const base_name = if (is_preserving_c_names)
+        raw_name
+    else
+        try lexer.toSnakeCase(arena.asAllocator(), raw_name);
+    if (isReservedCorexIdent(base_name)) {
+        return .{
+            .cx_name = try std.fmt.allocPrint(arena.asAllocator(), "{s}_", .{base_name}),
+            .has_link_name_override = true,
+        };
+    }
+    return .{
+        .cx_name = base_name,
+        .has_link_name_override = !std.mem.eql(u8, base_name, raw_name),
+    };
+}
+
+/// Escapes a C `struct`, `union`, `enum`, or `typedef` nominal identifier for `.cx` emission.
+fn sanitizeTypeIdent(
+    arena: *BumpArena,
+    raw_name: []const u8,
+    is_preserving_c_names: bool,
+) ![]const u8 {
+    const base_name = if (is_preserving_c_names)
+        raw_name
+    else
+        try lexer.toPascalCase(arena.asAllocator(), raw_name);
+    if (isReservedCorexIdent(base_name)) {
+        return std.fmt.allocPrint(arena.asAllocator(), "{s}Type", .{base_name});
+    }
+    return base_name;
+}
+
+/// Escapes UTF-8 bytes into a valid CoreX double-quoted string literal (`"` / `\` / `\n` / `{` / `}`).
+fn appendEscapedCxStringLiteral(
+    allocator: std.mem.Allocator,
+    out_buf: *std.ArrayListUnmanaged(u8),
+    raw_bytes: []const u8,
+) !void {
+    try out_buf.append(allocator, '"');
+    for (raw_bytes) |byte_val| {
+        switch (byte_val) {
+            '"' => try out_buf.appendSlice(allocator, "\\\""),
+            '\\' => try out_buf.appendSlice(allocator, "\\\\"),
+            '\n' => try out_buf.appendSlice(allocator, "\\n"),
+            '\r' => try out_buf.appendSlice(allocator, "\\r"),
+            '\t' => try out_buf.appendSlice(allocator, "\\t"),
+            0 => try out_buf.appendSlice(allocator, "\\0"),
+            '{' => try out_buf.appendSlice(allocator, "{{"),
+            '}' => try out_buf.appendSlice(allocator, "}}"),
+            else => {
+                if (byte_val >= 0x20 and byte_val <= 0x7E) {
+                    try out_buf.append(allocator, byte_val);
+                } else {
+                    var hex_tmp: [4]u8 = undefined;
+                    try out_buf.appendSlice(
+                        allocator,
+                        std.fmt.bufPrint(&hex_tmp, "\\x{X:0>2}", .{byte_val}) catch unreachable,
+                    );
+                }
+            },
+        }
+    }
+    try out_buf.append(allocator, '"');
+}
 
 // ------------------------------------- PUBLIC API --------------------------------------
 
@@ -2049,7 +2121,17 @@ pub fn translateHeaderSource(
 
 // ---------------------------------------- MAIN -----------------------------------------
 
-test "c_translate: core/ffi.cx parses, formats idempotently, and typechecks with zero diagnostics" {
+/// Expected `VaList` storage and parameter ABI byte sizes for a target triple under test.
+const TargetExpectation = struct {
+    /// Target architecture, OS, and ABI under test.
+    target: TargetSpec,
+    /// Expected `sizeof(VaList)` when stored in a struct or local (`bytes`).
+    expected_va_storage_bytes: u64,
+    /// Expected `sizeof(VaListParam)` when passed as a C function parameter (`bytes`).
+    expected_va_param_bytes: u64,
+};
+
+test "test_c_translate_core_ffi_parses_formats_idempotently_and_typechecks" {
     const allocator = std.testing.allocator;
     const parser = @import("parser.zig");
     const syntax_arenas = @import("syntax_arenas.zig");
@@ -2179,7 +2261,7 @@ test "c_translate: core/ffi.cx parses, formats idempotently, and typechecks with
     }
 }
 
-test "c_translate: Prune-06 SysV vs MSVC bitfield layout parity and comptime getter/setter execution" {
+test "test_c_translate_sysv_vs_msvc_bitfield_layout_and_comptime_accessors" {
     const allocator = std.testing.allocator;
     const type_system = @import("type_system.zig");
 
@@ -2287,7 +2369,7 @@ test "c_translate: Prune-06 SysV vs MSVC bitfield layout parity and comptime get
     try std.testing.expectEqual(@as(usize, 0), msvc_tc.diagnostics.countDiagnostics());
 }
 
-test "c_translate: ADR-22F pointers, opaque structs, SAL contracts, keyword escaping, and fmt idempotency" {
+test "test_c_translate_pointers_opaque_structs_sal_contracts_and_fmt_idempotency" {
     const allocator = std.testing.allocator;
 
     const c_header =
@@ -2370,7 +2452,7 @@ test "c_translate: ADR-22F pointers, opaque structs, SAL contracts, keyword esca
     try std.testing.expect(std.mem.indexOf(u8, cx_out, "ignored_inline_helper") == null);
 }
 
-test "c_translate: C23 enums with duplicate discriminants, nested anonymous unions, and core.ffi mode" {
+test "test_c_translate_c23_enums_duplicate_discriminants_nested_unions_and_core_ffi" {
     const allocator = std.testing.allocator;
     const type_system = @import("type_system.zig");
 
@@ -2433,7 +2515,7 @@ test "c_translate: C23 enums with duplicate discriminants, nested anonymous unio
     try std.testing.expectEqual(@as(usize, 0), tc_res.diagnostics.countDiagnostics());
 }
 
-test "c_translate: [CRITICAL-03] va_list parameter decay (VaListParam 8B on SysV x86_64 vs 32B on AAPCS64)" {
+test "test_c_translate_va_list_parameter_decay_across_sysv_aapcs64_and_msvc" {
     const allocator = std.testing.allocator;
     const parser = @import("parser.zig");
     const syntax_arenas = @import("syntax_arenas.zig");
@@ -2467,15 +2549,6 @@ test "c_translate: [CRITICAL-03] va_list parameter decay (VaListParam 8B on SysV
         if (byte_val != '\r') try lf_ffi.append(allocator, byte_val);
     }
 
-    // Expected `VaList` storage and parameter ABI byte sizes for a target triple:
-    const TargetExpectation = struct {
-        /// Target architecture, OS, and ABI under test.
-        target: TargetSpec,
-        /// Expected `sizeof(VaList)` when stored in a struct or local (`bytes`).
-        expected_va_storage_bytes: u64,
-        /// Expected `sizeof(VaListParam)` when passed as a C function parameter (`bytes`).
-        expected_va_param_bytes: u64,
-    };
     const matrix = [_]TargetExpectation{
         .{
             .target = TargetSpec.X86_64_LINUX_GNU,
@@ -2638,7 +2711,7 @@ test "c_translate: [CRITICAL-03] va_list parameter decay (VaListParam 8B on SysV
     }
 }
 
-test "c_translate: [MAJOR-02/03/04] enum bitfields, union bitfields, WinHdr MSVC layout, and packed :0 typecheck" {
+test "test_c_translate_enum_and_union_bitfields_msvc_win_hdr_and_packed_zero_width" {
     const allocator = std.testing.allocator;
     const type_system = @import("type_system.zig");
 
@@ -2772,4 +2845,93 @@ test "c_translate: [MAJOR-02/03/04] enum bitfields, union bitfields, WinHdr MSVC
     var msvc_tc = try type_system.typecheckSource(allocator, FileId.fromInt(21), msvc_harness);
     defer msvc_tc.deinit();
     try std.testing.expectEqual(@as(usize, 0), msvc_tc.diagnostics.countDiagnostics());
+}
+
+test "test_c_translate_mixed_sign_i128_enum_min_int_variants_and_syntax_error_guard" {
+    const allocator = std.testing.allocator;
+    const type_system = @import("type_system.zig");
+
+    // [1] Mixed-sign enum exceeding `i64::MAX` lowers to `: i128`, and `INT64_MIN` formats without overflow:
+    const mixed_enum_hdr =
+        \\#define MACRO_MIN_I64 (-9223372036854775807LL - 1LL)
+        \\enum MixedWide {
+        \\    MW_NEG = -5,
+        \\    MW_HUGE = 9223372036854775808ULL,
+        \\};
+        \\enum SignedMin {
+        \\    SM_MIN = (-9223372036854775807LL - 1LL),
+        \\    SM_ZERO = 0,
+        \\};
+        \\enum {
+        \\    ANON_MIN_I64 = (-9223372036854775807LL - 1LL),
+        \\};
+    ;
+
+    var sink = DiagnosticSink.init(allocator);
+    defer sink.deinit();
+    const cx_out = try translateHeaderSource(
+        allocator,
+        mixed_enum_hdr,
+        "mixed_wide.h",
+        .none,
+        .{ .target = TargetSpec.X86_64_LINUX_GNU },
+        .{},
+        &sink,
+    );
+    defer allocator.free(cx_out);
+    try std.testing.expectEqual(@as(u32, 0), sink.error_count);
+    try std.testing.expect(std.mem.indexOf(u8, cx_out, "pub enum MixedWide: i128") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cx_out, "-9223372036854775807 - 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cx_out, "-9223372036854775807_i64 - 1_i64") != null);
+
+    var tc_res = try type_system.typecheckSource(allocator, FileId.fromInt(30), cx_out);
+    defer tc_res.deinit();
+    try std.testing.expectEqual(@as(usize, 0), tc_res.diagnostics.countDiagnostics());
+
+    // [2] `std.math.minInt(i128)` variant formats safely (`-170141183460469231731687303715884105727 - 1`):
+    var i128_unit = CTranslationUnit.init(allocator, TargetSpec.X86_64_LINUX_GNU);
+    defer i128_unit.deinit();
+    try i128_unit.enum_variants.append(allocator, .{
+        .name = "EXTREME_I128_MIN",
+        .value = std.math.minInt(i128),
+        .has_explicit_value = true,
+    });
+    try i128_unit.decls.append(allocator, .{
+        .kind = .{
+            .enum_decl = .{
+                .name = "ExtremeI128",
+                .underlying_prim = .c_int128,
+                .is_complete = true,
+                .variant_start = 0,
+                .variant_len = 1,
+            },
+        },
+    });
+    const i128_cx = try translateUnit(allocator, &i128_unit, .{});
+    defer allocator.free(i128_cx);
+    try std.testing.expect(
+        std.mem.indexOf(u8, i128_cx, "-170141183460469231731687303715884105727 - 1") != null,
+    );
+    var i128_tc = try type_system.typecheckSource(allocator, FileId.fromInt(31), i128_cx);
+    defer i128_tc.deinit();
+    try std.testing.expectEqual(@as(usize, 0), i128_tc.diagnostics.countDiagnostics());
+
+    // [3] `translateUnit` rejects malformed generated syntax with `error.InvalidTranslatedSyntax`:
+    var malformed_unit = CTranslationUnit.init(allocator, TargetSpec.X86_64_LINUX_GNU);
+    defer malformed_unit.deinit();
+    try malformed_unit.decls.append(allocator, .{
+        .kind = .{
+            .record_decl = .{
+                .is_union = false,
+                .name = "Broken Ident{",
+                .is_complete = false,
+                .field_start = 0,
+                .field_len = 0,
+            },
+        },
+    });
+    try std.testing.expectError(
+        error.InvalidTranslatedSyntax,
+        translateUnit(allocator, &malformed_unit, .{ .is_formatted = true }),
+    );
 }

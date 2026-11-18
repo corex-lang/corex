@@ -11865,7 +11865,7 @@ test "test_parser_kw_async_module_path_segments_zero_diagnostics" {
     );
 }
 
-test "test_parser_r1_depth_caps_precede_extern_attrs_and_incremental_w0201_parity" {
+test "test_parser_depth_caps_precede_extern_attrs_and_incremental_w0201_parity" {
     const allocator = std.testing.allocator;
     var token_buf = TokenBuffer.init(allocator);
     defer token_buf.deinit();
@@ -11878,7 +11878,7 @@ test "test_parser_r1_depth_caps_precede_extern_attrs_and_incremental_w0201_parit
     var interner = try StringInterner.init(allocator);
     defer interner.deinit();
 
-    // [1] `[CRITICAL-08]`: Deep `@` subpatterns, `~` / `#soa` types, `dyn` / `any`, and retired `ref` cap at `E0203`:
+    // [1] Deep `@` subpatterns, `~` / `#soa` types, `dyn` / `any`, and retired `ref` cap at `E0203`:
     const deep_cases = [_][]const u8{
         "fn deep_at(val: i32) { match val { a @ b @ c @ d @ e @ f @ g @ h @ _ => {} } }\n",
         "fn deep_tilde(val: ~ ~ ~ ~ ~ ~ ~ ~ ~ i32) {}\n",
@@ -11919,7 +11919,7 @@ test "test_parser_r1_depth_caps_precede_extern_attrs_and_incremental_w0201_parit
         try verifyCstAndAstInvariants(allocator, case_src, &token_buf, &cst_arena, &ast_arena);
     }
 
-    // [2] `[MAJOR-07]`: `precedeNode` shifts `attr_start` on `.extern_block_decl` and `.extern_static_decl`:
+    // [2] `precedeNode` shifts `attr_start` on `.extern_block_decl` and `.extern_static_decl`:
     const precede_extern_src =
         "fn check_expr() -> i32 {\n" ++
         "    return {\n" ++
@@ -11943,8 +11943,8 @@ test "test_parser_r1_depth_caps_precede_extern_attrs_and_incremental_w0201_parit
     try std.testing.expectEqual(@as(u32, 0), sink.error_count);
     try verifyCstAndAstInvariants(allocator, precede_extern_src, &token_buf, &cst_arena, &ast_arena);
 
-    var checked_block_attr = false;
-    var checked_static_attr = false;
+    var has_checked_block_attr = false;
+    var has_checked_static_attr = false;
     var node_i: usize = 0;
     while (node_i < ast_arena.countNodes()) : (node_i += 1) {
         const nid = NodeIndex.fromInt(@intCast(node_i));
@@ -11956,7 +11956,7 @@ test "test_parser_r1_depth_caps_precede_extern_attrs_and_incremental_w0201_parit
                 CstNodeKind.attribute,
                 cst_arena.getNode(CstNodeIndex.fromInt(hdr.attr_start)).kind,
             );
-            checked_block_attr = true;
+            has_checked_block_attr = true;
         } else if (tag == .extern_static_decl) {
             const ext_info = ast_arena.getExternStaticExtra(nid);
             try std.testing.expectEqual(@as(u32, 1), ext_info.attr_len);
@@ -11964,12 +11964,12 @@ test "test_parser_r1_depth_caps_precede_extern_attrs_and_incremental_w0201_parit
                 CstNodeKind.attribute,
                 cst_arena.getNode(CstNodeIndex.fromInt(ext_info.attr_start)).kind,
             );
-            checked_static_attr = true;
+            has_checked_static_attr = true;
         }
     }
-    try std.testing.expect(checked_block_attr and checked_static_attr);
+    try std.testing.expect(has_checked_block_attr and has_checked_static_attr);
 
-    // [3] `[MAJOR-08]`: `reparseIncremental` preserves `W0201` warnings in untouched items identically to `parseSource`:
+    // [3] `reparseIncremental` preserves `W0201` warnings in untouched items identically to `parseSource`:
     const old_w0201_src =
         "struct Bad_Struct {}\n\n" ++
         "const BAD_const: i32 = 1;\n\n" ++
@@ -12038,7 +12038,7 @@ test "test_parser_r1_depth_caps_precede_extern_attrs_and_incremental_w0201_parit
     }
 }
 
-test "test_parser_r4a_allow_non_canonical_case_and_c_scalar_aliases_suppress_w0201" {
+test "test_parser_allow_non_canonical_case_and_c_scalar_aliases_suppress_w0201" {
     const allocator = std.testing.allocator;
     var interner = try StringInterner.init(allocator);
     defer interner.deinit();

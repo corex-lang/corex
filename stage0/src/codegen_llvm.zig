@@ -11,12 +11,11 @@
 //!   slot `%_cx_call_err = alloca swifterror ptr, align 8`) and hoisted MVS
 //!   `@llvm.experimental.noalias.scope.decl` intrinsics into entry block `_bb_0` (`DR-09` §4.1),
 //!   tracks exact post-split predecessor labels for `phi` headers, and synthesizes `_bb_edge_<idx>`
-//!   trampolines whenever a multi-way terminator branches to the same target block more than once
-//!   (`[CRITICAL-05]`).
+//!   trampolines whenever a multi-way terminator branches to the same target block more than once.
 //! - Exact `AbiClassifier` (`AbiFnRecipe`) lowering for `cx_native` (`swiftcc`), `cx_result_cc`
-//!   (`swiftcc` + bare `ptr swifterror %_cx_err_slot`, `[CRITICAL-06]`), platform `c_system` FFI,
+//!   (`swiftcc` + bare `ptr swifterror %_cx_err_slot`), platform `c_system` FFI,
 //!   and `wasm_mvp`.
-//! - Pentagon `ProvenValueRange` lowering (`[MAJOR-08]`): `!range` + `!noundef` strictly on scalar
+//! - Pentagon `ProvenValueRange` lowering: `!range` + `!noundef` strictly on scalar
 //!   integer `load`/`call` instructions when `!is_full_domain` and `bit_width <= 64`,
 //!   `@llvm.assume` `"nonnull"`/`"align"` operand bundles on pointers, and `nsw`/`nuw` promotion.
 //! - Zero C++ unwind LSDA (`nounwind uwtable(sync)` on native, `nounwind` on `wasm32`, `Prune-04`)
@@ -163,7 +162,7 @@ const PlaceLoweringResult = union(enum) {
     },
 };
 
-/// Synthetic duplicate-predecessor trampoline block `_bb_edge_<tramp_idx>` (`[CRITICAL-05]`).
+/// Synthetic duplicate-predecessor trampoline block `_bb_edge_<tramp_idx>`.
 const TrampolineEdge = struct {
     /// Zero-based trampoline index within the enclosing `MirBody`.
     tramp_idx: u32,
@@ -221,7 +220,7 @@ const BodyEmitState = struct {
     edge_call_ret_vals: [][]u8,
     /// Per-edge optional synthetic trampoline index (`null` when direct).
     edge_trampoline: []?u32,
-    /// Synthetic trampolines generated for multi-way duplicate targets (`[CRITICAL-05]`).
+    /// Synthetic trampolines generated for multi-way duplicate targets.
     trampolines: std.ArrayListUnmanaged(TrampolineEdge) = .empty,
     /// MVS alias scopes hoisted into `_bb_0`.
     mvs_scopes: std.ArrayListUnmanaged(MvsParamScope) = .empty,
@@ -480,7 +479,7 @@ const LlvmModuleEmitter = struct {
     fmt_type_list: std.ArrayListUnmanaged(TypeId) = .empty,
     /// Membership set of `fmt_type_list`.
     fmt_type_set: std.AutoHashMapUnmanaged(u32, void) = .empty,
-    /// Deduplication set of already-declared external C/WASI symbol names (`[CRITICAL-08]`).
+    /// Deduplication set of already-declared external C/WASI symbol names.
     declared_externs: std.StringHashMapUnmanaged(void) = .empty,
     /// Owned symbol name strings backing `declared_externs`.
     owned_declared_externs: std.ArrayListUnmanaged([]u8) = .empty,
@@ -660,11 +659,12 @@ const AtomicOpClass = enum {
 /// Maximum structural recursion depth for composite type registration (`AGENTS.md` §2).
 const MAX_COMPOSITE_COLLECT_DEPTH: u32 = 64;
 
-/// Bit-56 tag OR-ed onto `.tagged_int56` `swifterror` payloads so `.Err(0)` is non-null (`[CRITICAL-06]`).
+/// Bit-56 tag OR-ed onto `.tagged_int56` `swifterror` payloads so `.Err(0)` is non-null (`Fix-07`).
 const SWIFTERROR_INT56_TAG: u64 = @as(u64, 1) << 56;
 
 /// O(1) static byte-size lookup table for fixed-size LLVM ABI register piece/aggregate types.
 const ABI_TYPE_BYTE_SIZE_MAP = std.StaticStringMap(u64).initComptime(.{
+    .{ "[2 x i64]", 16 },
     .{ "double", 8 },
     .{ "float", 4 },
     .{ "i1", 1 },
@@ -1202,7 +1202,7 @@ fn isBodyCAbiBoundaryLlvm(emitter: *const LlvmModuleEmitter, body: *const MirBod
         sym_rec.contract_flags.has_link_name) return true;
     if (extractSymFfiMetaLlvm(emitter, body.symbol_index).wasm_export_name.len > 0) return true;
     if (emitter.input.pool.getFnSignatureView(sym_rec.type_id)) |sig_view| {
-        if (sig_view.is_c_abi) return true;
+        if (sig_view.is_c_abi or sig_view.is_variadic) return true;
     }
     return false;
 }
@@ -1221,12 +1221,20 @@ fn classifyBodyAbi(emitter: *LlvmModuleEmitter, body: *const MirBody) !AbiFnReci
             .is_non_escaping = true,
         };
     }
-    const is_c_abi = isBodyCAbiBoundaryLlvm(emitter, body);
+    const is_variadic_body = if (!body.symbol_index.isNone() and
+        body.symbol_index.asInt() < emitter.input.sym_table.symbols.items.len)
+        if (emitter.input.pool.getFnSignatureView(
+            emitter.input.sym_table.getSymbol(body.symbol_index).type_id,
+        )) |sig_view| sig_view.is_variadic else false
+    else
+        false;
+    const is_c_abi = isBodyCAbiBoundaryLlvm(emitter, body) or is_variadic_body;
     return AbiClassifier.classifyFn(emitter.allocator, &emitter.resolver, .{
         .params = param_specs,
         .ret_ty = body.ret_ty,
         .is_extern_c = is_c_abi,
         .is_contextless = body.is_contextless or is_c_abi,
+        .is_variadic = is_variadic_body,
     });
 }
 
@@ -1986,6 +1994,14 @@ fn formatAbiParamOrRetType(
                     if (param_rec.lowered_size_bytes <= 4) "float" else "double",
                 );
             }
+            if (emitter.cfg.target.arch == .aarch64 and
+                emitter.cfg.target.isWindows() and
+                resolveIntegerInfo(emitter, ty) == null and
+                ty != .bool_ty and
+                ty != .char_ty)
+            {
+                return emitter.allocator.dupe(u8, "i64");
+            }
             const sz = param_rec.lowered_size_bytes;
             if (sz <= 1) return emitter.allocator.dupe(u8, "i8");
             if (sz == 2) return emitter.allocator.dupe(u8, "i16");
@@ -2009,6 +2025,12 @@ fn formatAbiParamOrRetType(
                         return emitter.allocator.dupe(u8, "{ ptr, ptr }");
                     }
                 }
+            }
+            if (emitter.cfg.target.arch == .aarch64 and
+                param_rec.bank_0 == .gpr and
+                param_rec.bank_1 == .gpr)
+            {
+                return emitter.allocator.dupe(u8, "[2 x i64]");
             }
             const p0 = if (param_rec.bank_0 == .xmm_vec) "double" else "i64";
             const p1 = if (param_rec.bank_1 == .xmm_vec)
@@ -2077,7 +2099,7 @@ fn formatAbiParamDeclPiece(
     switch (param_rec.pass_mode) {
         .ignore_zst => return buf.toOwnedSlice(emitter.allocator),
         .swifterror_ptr => {
-            // Emit bare `ptr swifterror` with zero extra pointer attributes (`[CRITICAL-06]`).
+            // Emit bare `ptr swifterror` with zero extra pointer attributes:
             try buf.appendSlice(emitter.allocator, "ptr swifterror");
         },
         .sret_ptr => {
@@ -2301,6 +2323,19 @@ fn writeLlvmByteStringLiteral(emitter: *LlvmModuleEmitter, bytes: []const u8) !v
     try emitter.writeAll("\"");
 }
 
+/// Appends an LLVM NUL-terminated byte-array literal `c"…\00"` (`bytes.len + 1` bytes) to `emitter.out`.
+fn writeLlvmNullTerminatedStringLiteral(emitter: *LlvmModuleEmitter, bytes: []const u8) !void {
+    try emitter.writeAll("c\"");
+    for (bytes) |byte_val| {
+        if (byte_val >= 0x20 and byte_val <= 0x7E and byte_val != '"' and byte_val != '\\') {
+            try emitter.out.append(emitter.allocator, byte_val);
+        } else {
+            try emitter.print("\\{X:0>2}", .{byte_val});
+        }
+    }
+    try emitter.writeAll("\\00\"");
+}
+
 /// Builds serialized `.cx_dev_meta` binary metadata (`DR-19` §1.2) for `--dev` GOT builds.
 fn buildDevSeamBytes(emitter: *LlvmModuleEmitter) ![]u8 {
     var got_slots = try emitter.allocator.alloc(
@@ -2369,14 +2404,15 @@ fn emitRodataAndRuntimeHelpers(
     }
 
     // [2] Interned string and byte literals (`@_cx_str_bytes_<id>`) & `@type_name` tables:
+    try emitter.writeAll("@_cx_empty_cstr = private unnamed_addr constant [1 x i8] zeroinitializer, align 1\n");
     for (emitter.str_sym_ids.items) |sym_raw| {
         const bytes = emitter.input.interner.get(SymbolId.fromInt(sym_raw));
         if (bytes.len == 0) continue;
         try emitter.print(
             "@_cx_str_bytes_{d} = private unnamed_addr constant [{d} x i8] ",
-            .{ sym_raw, bytes.len },
+            .{ sym_raw, bytes.len + 1 },
         );
-        try writeLlvmByteStringLiteral(emitter, bytes);
+        try writeLlvmNullTerminatedStringLiteral(emitter, bytes);
         try emitter.writeAll(", align 1\n");
     }
     for (emitter.type_name_ids.items) |ty_u32| {
@@ -2389,21 +2425,21 @@ fn emitRodataAndRuntimeHelpers(
         if (rendered.len == 0) continue;
         try emitter.print(
             "@_cx_tyname_{d} = private unnamed_addr constant [{d} x i8] ",
-            .{ ty_u32, rendered.len },
+            .{ ty_u32, rendered.len + 1 },
         );
-        try writeLlvmByteStringLiteral(emitter, rendered);
+        try writeLlvmNullTerminatedStringLiteral(emitter, rendered);
         try emitter.writeAll(", align 1\n");
     }
     for (emitter.source_loc_consts.items, 0..) |sloc, loc_idx| {
         const file_bytes = emitter.input.interner.get(sloc.file_sym);
         const fn_bytes = emitter.input.interner.get(sloc.fn_sym);
         const file_ptr_s = if (file_bytes.len == 0)
-            try std.fmt.allocPrint(emitter.allocator, "inttoptr ({s} 1 to ptr)", .{ptr_int})
+            try emitter.allocator.dupe(u8, "@_cx_empty_cstr")
         else
             try std.fmt.allocPrint(emitter.allocator, "@_cx_str_bytes_{d}", .{sloc.file_sym.asInt()});
         defer emitter.allocator.free(file_ptr_s);
         const fn_ptr_s = if (fn_bytes.len == 0)
-            try std.fmt.allocPrint(emitter.allocator, "inttoptr ({s} 1 to ptr)", .{ptr_int})
+            try emitter.allocator.dupe(u8, "@_cx_empty_cstr")
         else
             try std.fmt.allocPrint(emitter.allocator, "@_cx_str_bytes_{d}", .{sloc.fn_sym.asInt()});
         defer emitter.allocator.free(fn_ptr_s);
@@ -2431,7 +2467,7 @@ fn emitRodataAndRuntimeHelpers(
         );
     }
 
-    // [3] `@embed_bytes` raw binary blobs (`MirBlobStore`, `DR-20` `D-03`, `[CRITICAL-07]`):
+    // [3] `@embed_bytes` raw binary blobs (`MirBlobStore`, `DR-20` `D-03`):
     if (emitter.input.blob_store) |bstore| {
         for (emitter.blob_ids.items) |blob_id| {
             const payload = bstore.getBytes(blob_id) orelse &[_]u8{};
@@ -2602,7 +2638,7 @@ fn emitRodataAndRuntimeHelpers(
             try emitter.print("declare {s} @write(i32, ptr, {s}) nounwind\n\n", .{ ptr_int, ptr_int });
         }
 
-        // `@_cx_rt_init` sets `_O_BINARY` (`0x8000`) on Windows `stdout`/`stderr` so `\n` is never mangled.
+        // `@_cx_rt_init` sets `_O_BINARY` (`0x8000`) on Windows `stdout`/`stderr` so `\n` is never mangled:
         try emitter.print("define internal void @_cx_rt_init() {s} {{\nentry:\n", .{fn_attrs});
         if (emitter.cfg.target.isWindows()) {
             try emitter.writeAll(
@@ -2638,7 +2674,7 @@ fn emitRodataAndRuntimeHelpers(
             .{ ptr_int, fn_attrs, ptr_int, ptr_int, ptr_int },
         );
 
-        // `@_cx_rt_trap(i32 %reason)` writes `TRAP:1\n` + `_exit(101)` under oracle mode, else `@llvm.trap()`.
+        // `@_cx_rt_trap(i32 %reason)` writes `TRAP:1\n` + `_exit(101)` under oracle mode, else `@llvm.trap()`:
         try emitter.print(
             "define internal void @_cx_rt_trap(i32 %reason) cold noreturn {s} {{\n" ++
                 "entry:\n" ++
@@ -2771,7 +2807,7 @@ fn emitRodataAndRuntimeHelpers(
         );
     }
 
-    if (emitter.has_async_ops and !emitter.cfg.target.isFreestanding()) {
+    if (emitter.has_async_ops) {
         try emitAsyncRuntimeHelpersLlvm(emitter);
     }
 }
@@ -2782,6 +2818,7 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
     const ptr_bytes: u32 = emitter.cfg.target.ptrBytes();
     const fn_attrs = fnUnwindAttrs(emitter);
     const is_wasm = emitter.cfg.target.isWasm();
+    const is_freestanding = emitter.cfg.target.isFreestanding();
     const tls_kw = if (is_wasm) "internal global" else "internal thread_local global";
     const ctx_bytes: u64 = type_system.ContextFieldLayout.byteSizeForPtrWidth(emitter.cfg.target.ptrBytes());
 
@@ -2790,29 +2827,35 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
         if (wide_sz > ptr_bytes) total_ctx_save_bytes += wide_sz;
     }
 
-    if (!emitter.declared_externs.contains("calloc")) {
-        try emitter.requireIntrinsicDecl(
-            if (is_wasm)
-                "declare ptr @calloc(i32, i32) nounwind"
-            else
-                "declare ptr @calloc(i64, i64) nounwind",
-        );
-    }
-    if (!emitter.declared_externs.contains("realloc")) {
-        try emitter.requireIntrinsicDecl(
-            if (is_wasm)
-                "declare ptr @realloc(ptr, i32) nounwind"
-            else
-                "declare ptr @realloc(ptr, i64) nounwind",
-        );
-    }
-    if (!emitter.declared_externs.contains("free")) {
-        try emitter.requireIntrinsicDecl("declare void @free(ptr) nounwind");
-    }
     try emitter.requireIntrinsicDecl(
         "declare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, " ++
             "ptr noalias nocapture readonly, i64, i1 immarg)",
     );
+    if (is_freestanding) {
+        try emitter.requireIntrinsicDecl(
+            "declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg)",
+        );
+    } else {
+        if (!emitter.declared_externs.contains("calloc")) {
+            try emitter.requireIntrinsicDecl(
+                if (is_wasm)
+                    "declare ptr @calloc(i32, i32) nounwind"
+                else
+                    "declare ptr @calloc(i64, i64) nounwind",
+            );
+        }
+        if (!emitter.declared_externs.contains("realloc")) {
+            try emitter.requireIntrinsicDecl(
+                if (is_wasm)
+                    "declare ptr @realloc(ptr, i32) nounwind"
+                else
+                    "declare ptr @realloc(ptr, i64) nounwind",
+            );
+        }
+        if (!emitter.declared_externs.contains("free")) {
+            try emitter.requireIntrinsicDecl("declare void @free(ptr) nounwind");
+        }
+    }
 
     try emitter.print(
         "%_cx_fut_raw_t = type {{ ptr, {s}, {s}, {s} }}\n" ++
@@ -2822,7 +2865,7 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
             "@_cx_exec_q_len = {s} {s} 0, align {d}\n" ++
             "@_cx_exec_q_cap = {s} {s} 0, align {d}\n" ++
             "@_cx_active_poll_item = {s} {s} 1, align {d}\n" ++
-            "@_cx_coro_is_cancelling = {s} i8 0, align 1\n\n",
+            "@_cx_coro_is_cancelling = {s} i8 0, align 1\n",
         .{
             ptr_int,   ptr_int,              ptr_int,
             ptr_int,   total_ctx_save_bytes, ptr_int,
@@ -2833,6 +2876,96 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
             ptr_bytes, tls_kw,
         },
     );
+    if (is_freestanding) {
+        try emitter.print(
+            "@_cx_wasm_async_heap = internal global [65536 x i8] zeroinitializer, align 16\n" ++
+                "@_cx_wasm_async_heap_off = internal global i32 0, align 4\n\n" ++
+                "define internal ptr @_cx_async_zalloc(i32 %raw_n) {s} {{\n" ++
+                "entry:\n" ++
+                "  %z0 = icmp eq i32 %raw_n, 0\n" ++
+                "  %n = select i1 %z0, i32 16, i32 %raw_n\n" ++
+                "  %cur = load i32, ptr @_cx_wasm_async_heap_off, align 4\n" ++
+                "  %ov0 = icmp ugt i32 %cur, 65520\n" ++
+                "  br i1 %ov0, label %trap, label %align_ok\n" ++
+                "align_ok:\n" ++
+                "  %c15 = add i32 %cur, 15\n" ++
+                "  %aoff = and i32 %c15, -16\n" ++
+                "  %rem = sub i32 65536, %aoff\n" ++
+                "  %ov1 = icmp ugt i32 %n, %rem\n" ++
+                "  br i1 %ov1, label %trap, label %ok\n" ++
+                "trap:\n" ++
+                "  call void @llvm.trap()\n" ++
+                "  unreachable\n" ++
+                "ok:\n" ++
+                "  %out = getelementptr inbounds [65536 x i8], ptr @_cx_wasm_async_heap, i32 0, i32 %aoff\n" ++
+                "  %n64 = zext i32 %n to i64\n" ++
+                "  call void @llvm.memset.p0.i64(ptr align 16 %out, i8 0, i64 %n64, i1 false)\n" ++
+                "  %next = add i32 %aoff, %n\n" ++
+                "  store i32 %next, ptr @_cx_wasm_async_heap_off, align 4\n" ++
+                "  ret ptr %out\n" ++
+                "}}\n\n" ++
+                "define internal ptr @_cx_async_grow_buf(ptr %old_p, i32 %old_b, i32 %new_b) {s} {{\n" ++
+                "entry:\n" ++
+                "  %np = call ptr @_cx_async_zalloc(i32 %new_b)\n" ++
+                "  %hn = icmp ne ptr %old_p, null\n" ++
+                "  %hz = icmp ne i32 %old_b, 0\n" ++
+                "  %do_cp = and i1 %hn, %hz\n" ++
+                "  br i1 %do_cp, label %cp, label %done\n" ++
+                "cp:\n" ++
+                "  %lt = icmp ult i32 %old_b, %new_b\n" ++
+                "  %min_b = select i1 %lt, i32 %old_b, i32 %new_b\n" ++
+                "  %m64 = zext i32 %min_b to i64\n" ++
+                "  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %np, ptr align 1 %old_p, i64 %m64, i1 false)\n" ++
+                "  br label %done\n" ++
+                "done:\n" ++
+                "  ret ptr %np\n" ++
+                "}}\n\n" ++
+                "define internal void @_cx_async_free(ptr %unused_p) {s} {{\n" ++
+                "entry:\n" ++
+                "  ret void\n" ++
+                "}}\n\n",
+            .{ fn_attrs, fn_attrs, fn_attrs },
+        );
+    } else {
+        try emitter.print(
+            "\ndefine internal ptr @_cx_async_zalloc({s} %raw_n) {s} {{\n" ++
+                "entry:\n" ++
+                "  %z0 = icmp eq {s} %raw_n, 0\n" ++
+                "  %n = select i1 %z0, {s} 1, {s} %raw_n\n" ++
+                "  %out = call ptr @calloc({s} 1, {s} %n)\n" ++
+                "  %oom = icmp eq ptr %out, null\n" ++
+                "  br i1 %oom, label %trap, label %ok\n" ++
+                "trap:\n" ++
+                "  call void @_cx_rt_trap(i32 0)\n" ++
+                "  unreachable\n" ++
+                "ok:\n" ++
+                "  ret ptr %out\n" ++
+                "}}\n\n" ++
+                "define internal ptr @_cx_async_grow_buf(ptr %old_p, {s} %old_b, {s} %new_b) {s} {{\n" ++
+                "entry:\n" ++
+                "  %z0 = icmp eq {s} %new_b, 0\n" ++
+                "  %nb = select i1 %z0, {s} 1, {s} %new_b\n" ++
+                "  %np = call ptr @realloc(ptr %old_p, {s} %nb)\n" ++
+                "  %oom = icmp eq ptr %np, null\n" ++
+                "  br i1 %oom, label %trap, label %ok\n" ++
+                "trap:\n" ++
+                "  call void @_cx_rt_trap(i32 0)\n" ++
+                "  unreachable\n" ++
+                "ok:\n" ++
+                "  ret ptr %np\n" ++
+                "}}\n\n" ++
+                "define internal void @_cx_async_free(ptr %raw_p) {s} {{\n" ++
+                "entry:\n" ++
+                "  call void @free(ptr %raw_p)\n" ++
+                "  ret void\n" ++
+                "}}\n\n",
+            .{
+                ptr_int,  fn_attrs, ptr_int,  ptr_int, ptr_int, ptr_int, ptr_int,
+                ptr_int,  ptr_int,  fn_attrs, ptr_int, ptr_int, ptr_int, ptr_int,
+                fn_attrs,
+            },
+        );
+    }
 
     // `@_cx_ctx_save(ptr %dst)` and `@_cx_ctx_restore(ptr %src)`:
     try emitter.print(
@@ -2894,11 +3027,11 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
             "  %ov = or i1 %ov1, %ov2\n" ++
             "  br i1 %ov, label %trap, label %do_realloc\n" ++
             "do_realloc:\n" ++
+            "  %oldb = mul {s} %cap, {d}\n" ++
             "  %nb = mul {s} %nc, {d}\n" ++
             "  %oldq = load ptr, ptr @_cx_exec_q, align {d}\n" ++
-            "  %newq = call ptr @realloc(ptr %oldq, {s} %nb)\n" ++
-            "  %oom = icmp eq ptr %newq, null\n" ++
-            "  br i1 %oom, label %trap, label %grown\n" ++
+            "  %newq = call ptr @_cx_async_grow_buf(ptr %oldq, {s} %oldb, {s} %nb)\n" ++
+            "  br label %grown\n" ++
             "trap:\n" ++
             "  call void @_cx_rt_trap(i32 0)\n" ++
             "  unreachable\n" ++
@@ -2923,13 +3056,14 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
             ptr_int,   ptr_int,
             ptr_int,   max_q_elems,
             ptr_int,   ptr_bytes,
-            ptr_bytes, ptr_int,
-            ptr_bytes, ptr_int,
-            ptr_bytes, ptr_bytes,
-            ptr_int,   ptr_int,
             ptr_int,   ptr_bytes,
+            ptr_bytes, ptr_int,
+            ptr_int,   ptr_bytes,
+            ptr_int,   ptr_bytes,
+            ptr_bytes, ptr_int,
             ptr_int,   ptr_int,
-            ptr_bytes,
+            ptr_bytes, ptr_int,
+            ptr_int,   ptr_bytes,
         },
     );
     try emitter.print(
@@ -2989,10 +3123,7 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
             "  unreachable\n" ++
             "do_alloc:\n" ++
             "  %tot = add {s} %sz, %al\n" ++
-            "  %raw = call ptr @calloc({s} 1, {s} %tot)\n" ++
-            "  %oom = icmp eq ptr %raw, null\n" ++
-            "  br i1 %oom, label %trap, label %ok\n" ++
-            "ok:\n" ++
+            "  %raw = call ptr @_cx_async_zalloc({s} %tot)\n" ++
             "  %raw_i = ptrtoint ptr %raw to {s}\n" ++
             "  %am1 = sub {s} %al, 1\n" ++
             "  %nmask = xor {s} %am1, -1\n" ++
@@ -3010,7 +3141,7 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
         .{
             fn_attrs, ptr_int, ptr_int, ptr_int, ptr_int, ptr_int, ptr_int, ptr_int, ptr_int,
             ptr_int,  ptr_int, ptr_int, ptr_int, ptr_int, ptr_int, ptr_int, ptr_int, ptr_int,
-            ptr_int,  ptr_int, ptr_int, ptr_int, ptr_int, ptr_int, ptr_int,
+            ptr_int,  ptr_int, ptr_int, ptr_int, ptr_int, ptr_int,
         },
     );
     try emitter.print(
@@ -3024,7 +3155,7 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
             "  %d_ext = zext i16 %d16 to {s}\n" ++
             "  %neg_d = sub {s} 0, %d_ext\n" ++
             "  %raw = getelementptr inbounds i8, ptr %fr, {s} %neg_d\n" ++
-            "  call void @free(ptr %raw)\n" ++
+            "  call void @_cx_async_free(ptr %raw)\n" ++
             "  br label %done\n" ++
             "done:\n" ++
             "  ret void\n" ++
@@ -3411,26 +3542,14 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
             "entry:\n" ++
             "  %gep = getelementptr %_cx_task_group_t, ptr null, i32 1\n" ++
             "  %gsz = ptrtoint ptr %gep to {s}\n" ++
-            "  %g = call ptr @calloc({s} 1, {s} %gsz)\n" ++
-            "  %oom = icmp eq ptr %g, null\n" ++
-            "  br i1 %oom, label %trap, label %ok\n" ++
-            "trap:\n" ++
-            "  call void @_cx_rt_trap(i32 0)\n" ++
-            "  unreachable\n" ++
-            "ok:\n" ++
+            "  %g = call ptr @_cx_async_zalloc({s} %gsz)\n" ++
             "  ret ptr %g\n" ++
             "}}\n\n" ++
             "define internal ptr @_cx_async_spawn(ptr %grp, ptr %raw_fut, {s} %out_sz, ptr %echk) {s} {{\n" ++
             "entry:\n" ++
             "  %tgep = getelementptr %_cx_task_node_t, ptr null, i32 1\n" ++
             "  %tsz = ptrtoint ptr %tgep to {s}\n" ++
-            "  %tn = call ptr @calloc({s} 1, {s} %tsz)\n" ++
-            "  %oom1 = icmp eq ptr %tn, null\n" ++
-            "  br i1 %oom1, label %trap, label %init_tn\n" ++
-            "trap:\n" ++
-            "  call void @_cx_rt_trap(i32 0)\n" ++
-            "  unreachable\n" ++
-            "init_tn:\n" ++
+            "  %tn = call ptr @_cx_async_zalloc({s} %tsz)\n" ++
             "  store ptr %grp, ptr %tn, align {d}\n" ++
             "  %tfut = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 1\n" ++
             "  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %tfut, ptr align 1 %raw_fut, i64 {d}, i1 false)\n" ++
@@ -3441,11 +3560,11 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
             "  store {s} %out_sz, ptr %tszp, align {d}\n" ++
             "  %hsz = icmp ne {s} %out_sz, 0\n" ++
             "  br i1 %hsz, label %alloc_res, label %after_res\n" ++
+            "trap:\n" ++
+            "  call void @_cx_rt_trap(i32 0)\n" ++
+            "  unreachable\n" ++
             "alloc_res:\n" ++
-            "  %rb = call ptr @calloc({s} 1, {s} %out_sz)\n" ++
-            "  %oom2 = icmp eq ptr %rb, null\n" ++
-            "  br i1 %oom2, label %trap, label %set_res\n" ++
-            "set_res:\n" ++
+            "  %rb = call ptr @_cx_async_zalloc({s} %out_sz)\n" ++
             "  %trbp = getelementptr inbounds %_cx_task_node_t, ptr %tn, i32 0, i32 2\n" ++
             "  store ptr %rb, ptr %trbp, align {d}\n" ++
             "  br label %after_res\n",
@@ -3454,9 +3573,7 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
             ptr_int,
             ptr_int,
             ptr_int,
-            ptr_int,
             fn_attrs,
-            ptr_int,
             ptr_int,
             ptr_int,
             ptr_bytes,
@@ -3464,7 +3581,6 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
             ptr_int,
             ptr_int,
             ptr_bytes,
-            ptr_int,
             ptr_int,
             ptr_int,
             ptr_bytes,
@@ -3494,11 +3610,11 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
             "  %gov = or i1 %gov1, %gov2\n" ++
             "  br i1 %gov, label %trap, label %grp_realloc\n" ++
             "grp_realloc:\n" ++
+            "  %goldb = mul {s} %gcap, {d}\n" ++
             "  %gnb = mul {s} %gnc, {d}\n" ++
             "  %gold = load ptr, ptr %grp, align {d}\n" ++
-            "  %gnew = call ptr @realloc(ptr %gold, {s} %gnb)\n" ++
-            "  %oom3 = icmp eq ptr %gnew, null\n" ++
-            "  br i1 %oom3, label %trap, label %grp_grown\n" ++
+            "  %gnew = call ptr @_cx_async_grow_buf(ptr %gold, {s} %goldb, {s} %gnb)\n" ++
+            "  br label %grp_grown\n" ++
             "grp_grown:\n" ++
             "  store ptr %gnew, ptr %grp, align {d}\n" ++
             "  store {s} %gnc, ptr %gcp, align {d}\n" ++
@@ -3531,7 +3647,10 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
             max_q_elems,
             ptr_int,
             ptr_bytes,
+            ptr_int,
             ptr_bytes,
+            ptr_bytes,
+            ptr_int,
             ptr_int,
             ptr_bytes,
             ptr_int,
@@ -3755,10 +3874,10 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
             "  %fhrb = icmp ne ptr %ftrb, null\n" ++
             "  br i1 %fhrb, label %free_tn_rb, label %free_tn_node\n" ++
             "free_tn_rb:\n" ++
-            "  call void @free(ptr %ftrb)\n" ++
+            "  call void @_cx_async_free(ptr %ftrb)\n" ++
             "  br label %free_tn_node\n" ++
             "free_tn_node:\n" ++
-            "  call void @free(ptr %ftn)\n" ++
+            "  call void @_cx_async_free(ptr %ftn)\n" ++
             "  br label %free_task_next\n" ++
             "free_task_next:\n" ++
             "  %nfi = add {s} %fi, 1\n" ++
@@ -3769,10 +3888,10 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
             "  %fhgarr = icmp ne ptr %fgarr, null\n" ++
             "  br i1 %fhgarr, label %free_grp_arr_do, label %free_grp_self\n" ++
             "free_grp_arr_do:\n" ++
-            "  call void @free(ptr %fgarr)\n" ++
+            "  call void @_cx_async_free(ptr %fgarr)\n" ++
             "  br label %free_grp_self\n" ++
             "free_grp_self:\n" ++
-            "  call void @free(ptr %grp)\n" ++
+            "  call void @_cx_async_free(ptr %grp)\n" ++
             "  br label %done\n" ++
             "done:\n" ++
             "  ret void\n" ++
@@ -3909,7 +4028,7 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
             "  %dofq = and i1 %qb0, %fqnn\n" ++
             "  br i1 %dofq, label %free_q, label %ret_blk\n" ++
             "free_q:\n" ++
-            "  call void @free(ptr %fqarr)\n" ++
+            "  call void @_cx_async_free(ptr %fqarr)\n" ++
             "  store ptr null, ptr @_cx_exec_q, align {d}\n" ++
             "  store {s} 0, ptr @_cx_exec_q_cap, align {d}\n" ++
             "  br label %ret_blk\n" ++
@@ -4020,7 +4139,7 @@ fn emitExternDeclarations(emitter: *LlvmModuleEmitter) !void {
             try formatLlvmMemoryType(emitter, glob_rec.type_id);
         defer emitter.allocator.free(mem_ty);
         const glob_lay = try emitter.resolver.resolveType(glob_rec.type_id);
-        const tls_kw = if (ffi_meta.is_thread_local) "thread_local " else "";
+        const tls_kw = if (ffi_meta.is_thread_local and !emitter.cfg.target.isWasm()) "thread_local " else "";
         try emitter.print(
             "{s} = external {s}global {s}, align {d}\n",
             .{ ext_ident, tls_kw, mem_ty, glob_lay.alignBytes() },
@@ -5529,17 +5648,20 @@ fn ensureFmtRuntimeHelpers(emitter: *LlvmModuleEmitter) !void {
             "}}\n\n" ++
             "define internal {{ ptr, {s} }} @_cx_rt_buf_finish(ptr %b) {s} {{\n" ++
             "entry:\n" ++
-            "  %d = load ptr, ptr %b, align 8\n" ++
             "  %lp = getelementptr inbounds {{ ptr, i64, i64 }}, ptr %b, i32 0, i32 1\n" ++
             "  %len = load i64, ptr %lp, align 8\n" ++
             "  %isz = icmp eq i64 %len, 0\n" ++
             "  br i1 %isz, label %empty, label %non_empty\n" ++
             "empty:\n" ++
-            "  call void @free(ptr %d)\n" ++
-            "  %e0 = insertvalue {{ ptr, {s} }} zeroinitializer, ptr inttoptr ({s} 1 to ptr), 0\n" ++
+            "  %ed = load ptr, ptr %b, align 8\n" ++
+            "  call void @free(ptr %ed)\n" ++
+            "  %e0 = insertvalue {{ ptr, {s} }} zeroinitializer, ptr @_cx_empty_cstr, 0\n" ++
             "  %e1 = insertvalue {{ ptr, {s} }} %e0, {s} 0, 1\n" ++
             "  ret {{ ptr, {s} }} %e1\n" ++
             "non_empty:\n" ++
+            "  call void @_cx_rt_buf_push_byte(ptr %b, i8 0)\n" ++
+            "  %d = load ptr, ptr %b, align 8\n" ++
+            "  store i64 %len, ptr %lp, align 8\n" ++
             "{s}" ++
             "  %r0 = insertvalue {{ ptr, {s} }} zeroinitializer, ptr %d, 0\n" ++
             "  %r1 = insertvalue {{ ptr, {s} }} %r0, {s} %len_pt, 1\n" ++
@@ -5558,9 +5680,9 @@ fn ensureFmtRuntimeHelpers(emitter: *LlvmModuleEmitter) !void {
             "  unreachable\n" ++
             "}}\n\n",
         .{
-            fn_attrs, ptr_int,  fn_attrs,      ptr_int, ptr_int, ptr_int,
-            ptr_int,  ptr_int,  i64_to_pt_fin, ptr_int, ptr_int, ptr_int,
-            ptr_int,  fn_attrs, i64_to_pt_fin, ptr_int,
+            fn_attrs, ptr_int, fn_attrs,      ptr_int,       ptr_int,
+            ptr_int,  ptr_int, i64_to_pt_fin, ptr_int,       ptr_int,
+            ptr_int,  ptr_int, fn_attrs,      i64_to_pt_fin, ptr_int,
         },
     );
 }
@@ -6429,7 +6551,7 @@ fn emitDropHelpersAndClosureThunks(emitter: *LlvmModuleEmitter) !void {
                 }
             },
             .future_ty => {
-                if (emitter.has_async_ops and !emitter.cfg.target.isFreestanding()) {
+                if (emitter.has_async_ops) {
                     try state.writeAll("  call void @_cx_async_fut_cancel(ptr %_self_ptr)\n");
                 }
             },
@@ -7043,7 +7165,7 @@ fn getOrInternValidRangeMd(
         hi_incl_w = clamped_max & mask;
     }
     const hi_excl_w: u64 = (hi_incl_w +% 1) & mask;
-    // LLVM Verifier rule (`[MAJOR-08]`): `lo_w == hi_excl_w` is full `2^W` domain and MUST NOT emit `!range`.
+    // LLVM Verifier rule: `lo_w == hi_excl_w` is full `2^W` domain and MUST NOT emit `!range`:
     if (lo_w == hi_excl_w) return null;
 
     var hasher = std.hash.Wyhash.init(0x524E_4745);
@@ -7391,7 +7513,7 @@ fn emitDynamicSoaColByteOffset(
     return .{ .off_ssa = cur_ssa, .col_align_bytes = final_align };
 }
 
-/// Lowers `place_id` to an addressable `ptr` operand or compile-time array length (`[CRITICAL-03]`).
+/// Lowers `place_id` to an addressable `ptr` operand or compile-time array length.
 fn lowerPlaceLlvm(
     emitter: *LlvmModuleEmitter,
     state: *BodyEmitState,
@@ -8190,7 +8312,7 @@ fn tryEmitSliceArrayPtrCoercionLlvm(
                     .str_val, .bytes_val => |sym_id| {
                         const raw_bytes = emitter.input.interner.get(sym_id);
                         const ptr_expr = if (raw_bytes.len == 0)
-                            try std.fmt.allocPrint(emitter.allocator, "inttoptr ({s} 1 to ptr)", .{ptr_int})
+                            try emitter.allocator.dupe(u8, "@_cx_empty_cstr")
                         else
                             try std.fmt.allocPrint(emitter.allocator, "@_cx_str_bytes_{d}", .{sym_id.asInt()});
                         defer emitter.allocator.free(ptr_expr);
@@ -8324,7 +8446,7 @@ fn emitMirInstLlvm(
                     const raw_bytes = emitter.input.interner.get(sym_id);
                     const dst_node = emitter.input.pool.getNode(dst_ty);
                     const ptr_expr = if (raw_bytes.len == 0)
-                        try std.fmt.allocPrint(emitter.allocator, "inttoptr ({s} 1 to ptr)", .{ptr_int})
+                        try emitter.allocator.dupe(u8, "@_cx_empty_cstr")
                     else
                         try std.fmt.allocPrint(emitter.allocator, "@_cx_str_bytes_{d}", .{sym_id.asInt()});
                     defer emitter.allocator.free(ptr_expr);
@@ -9187,7 +9309,7 @@ fn emitMirInstLlvm(
                         break :blk dpn.tag == .slice_ty or dpn.tag == .soa_slice_ty;
                     };
 
-                    // Coercion `&[T; N]` / `&mut [T; N]` -> fat slice `[T]` or `&[T]` (`[CRITICAL-03]`):
+                    // Coercion `&[T; N]` / `&mut [T; N]` -> fat slice `[T]` or `&[T]`:
                     if ((dst_node.tag == .slice_ty or dst_node.tag == .soa_slice_ty) and
                         (src_node.tag == .array_ty or src_node.tag == .soa_array_ty))
                     {
@@ -11100,7 +11222,7 @@ fn emitAggregateMakeLlvm(
             const hole_count: usize = if (1 + piece_count <= words.len) (words.len - 1 - piece_count) / 3 else 0;
             const ptr_bytes: u32 = emitter.cfg.target.ptrBytes();
 
-            // `[P0-C]` Static `.rodata` fast-path for 0-hole constant `FmtArgs` literals:
+            // Static `.rodata` fast-path for 0-hole constant `FmtArgs` literals:
             if (hole_count == 0 and piece_count >= 1 and 1 + piece_count <= words.len) {
                 var is_all_const_str = true;
                 for (words[1 .. 1 + piece_count]) |piece_raw| {
@@ -11132,7 +11254,7 @@ fn emitAggregateMakeLlvm(
                         const sym_id = body.consts.items[p_inst.operands.lhs].str_val;
                         const raw_s = emitter.input.interner.get(sym_id);
                         const p_expr = if (raw_s.len == 0)
-                            try std.fmt.allocPrint(emitter.allocator, "inttoptr ({s} 1 to ptr)", .{ptr_int})
+                            try emitter.allocator.dupe(u8, "@_cx_empty_cstr")
                         else
                             try std.fmt.allocPrint(emitter.allocator, "@_cx_str_bytes_{d}", .{sym_id.asInt()});
                         defer emitter.allocator.free(p_expr);
@@ -11398,7 +11520,7 @@ fn emitAggregateMakeLlvm(
                     part_ptrs[pk] = fmt_buf;
                     part_lens[pk] = try std.fmt.allocPrint(emitter.allocator, "%_scl_{d}", .{sub_id});
                 } else {
-                    part_ptrs[pk] = try std.fmt.allocPrint(emitter.allocator, "inttoptr ({s} 1 to ptr)", .{ptr_int});
+                    part_ptrs[pk] = try emitter.allocator.dupe(u8, "@_cx_empty_cstr");
                     part_lens[pk] = try emitter.allocator.dupe(u8, "0");
                 }
                 const add_id = state.nextTmp();
@@ -11425,9 +11547,21 @@ fn emitAggregateMakeLlvm(
                 "  %_sc_isz_{d} = icmp eq {s} {s}, 0\n" ++
                     "  br i1 %_sc_isz_{d}, label %_sc_empty_{d}, label %_sc_alloc_{d}\n" ++
                     "_sc_alloc_{d}:\n" ++
-                    "  %_sc_buf_{d} = call ptr @malloc({s} {s})\n" ++
+                    "  %_sc_ov1_{d} = call {{ {s}, i1 }} @llvm.uadd.with.overflow.{s}({s} {s}, {s} 1)\n" ++
+                    "  %_sc_ovf_{d} = extractvalue {{ {s}, i1 }} %_sc_ov1_{d}, 1\n",
+                .{
+                    tmp_id,  ptr_int, tot_ssa, tmp_id,  tmp_id, tmp_id,  tmp_id, tmp_id, ptr_int,
+                    ptr_int, ptr_int, tot_ssa, ptr_int, tmp_id, ptr_int, tmp_id,
+                },
+            );
+            const nul_ov_ssa = try std.fmt.allocPrint(emitter.allocator, "%_sc_ovf_{d}", .{tmp_id});
+            defer emitter.allocator.free(nul_ov_ssa);
+            try emitInlineTrapIfTrue(emitter, state, nul_ov_ssa, 1);
+            try state.print(
+                "  %_sc_alsz_{d} = extractvalue {{ {s}, i1 }} %_sc_ov1_{d}, 0\n" ++
+                    "  %_sc_buf_{d} = call ptr @malloc({s} %_sc_alsz_{d})\n" ++
                     "  %_sc_oom_{d} = icmp eq ptr %_sc_buf_{d}, null\n",
-                .{ tmp_id, ptr_int, tot_ssa, tmp_id, tmp_id, tmp_id, tmp_id, tmp_id, ptr_int, tot_ssa, tmp_id, tmp_id },
+                .{ tmp_id, ptr_int, tmp_id, tmp_id, ptr_int, tmp_id, tmp_id, tmp_id },
             );
             const oom_ssa = try std.fmt.allocPrint(emitter.allocator, "%_sc_oom_{d}", .{tmp_id});
             defer emitter.allocator.free(oom_ssa);
@@ -11463,14 +11597,21 @@ fn emitAggregateMakeLlvm(
             defer emitter.allocator.free(alloc_end_lbl);
 
             try state.print(
-                "  br label %_sc_done_{d}\n" ++
+                "  %_sc_nulp_{d} = getelementptr inbounds i8, ptr %_sc_buf_{d}, {s} {s}\n" ++
+                    "  store i8 0, ptr %_sc_nulp_{d}, align 1\n" ++
+                    "  br label %_sc_done_{d}\n" ++
                     "_sc_empty_{d}:\n" ++
                     "  br label %_sc_done_{d}\n" ++
                     "_sc_done_{d}:\n" ++
-                    "  %_sc_fp_{d} = phi ptr [ %_sc_buf_{d}, %{s} ], [ inttoptr ({s} 1 to ptr), %_sc_empty_{d} ]\n" ++
+                    "  %_sc_fp_{d} = phi ptr [ %_sc_buf_{d}, %{s} ], [ @_cx_empty_cstr, %_sc_empty_{d} ]\n" ++
                     "  %_sc_f0_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr %_sc_fp_{d}, 0\n" ++
                     "  %_v_{d} = insertvalue {{ ptr, {s} }} %_sc_f0_{d}, {s} {s}, 1\n",
                 .{
+                    tmp_id,
+                    tmp_id,
+                    ptr_int,
+                    tot_ssa,
+                    tmp_id,
                     tmp_id,
                     tmp_id,
                     tmp_id,
@@ -11478,7 +11619,6 @@ fn emitAggregateMakeLlvm(
                     tmp_id,
                     tmp_id,
                     alloc_end_lbl,
-                    ptr_int,
                     tmp_id,
                     tmp_id,
                     ptr_int,
@@ -12150,9 +12290,9 @@ fn emitIntrinsicOpLlvm(
             const tmp_id = state.nextTmp();
             if (rendered.len == 0) {
                 try state.print(
-                    "  %_tn0_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr inttoptr ({s} 1 to ptr), 0\n" ++
+                    "  %_tn0_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr @_cx_empty_cstr, 0\n" ++
                         "  %_v_{d} = insertvalue {{ ptr, {s} }} %_tn0_{d}, {s} 0, 1\n",
-                    .{ tmp_id, ptr_int, ptr_int, dst_raw, ptr_int, tmp_id, ptr_int },
+                    .{ tmp_id, ptr_int, dst_raw, ptr_int, tmp_id, ptr_int },
                 );
             } else {
                 try state.print(
@@ -13968,14 +14108,14 @@ fn emitIntrinsicOpLlvm(
                 );
             } else {
                 try state.print(
-                    "  %_v_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr inttoptr ({s} 1 to ptr), 0\n",
-                    .{ dst_raw, ptr_int, ptr_int },
+                    "  %_v_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr @_cx_empty_cstr, 0\n",
+                    .{ dst_raw, ptr_int },
                 );
             }
         },
 
         .async_future_make => {
-            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops or args.len < 3) {
+            if (!emitter.has_async_ops or args.len < 3) {
                 const val_ty = try formatLlvmValueType(emitter, inst.type_id);
                 defer emitter.allocator.free(val_ty);
                 const zero_s = resolveZeroLiteralForLlvmType(val_ty);
@@ -13986,7 +14126,7 @@ fn emitIntrinsicOpLlvm(
         },
 
         .async_task_group_enter => {
-            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops) {
+            if (!emitter.has_async_ops) {
                 try state.print("  %_v_{d} = select i1 true, ptr null, ptr null\n", .{dst_raw});
             } else {
                 try state.print("  %_v_{d} = call ptr @_cx_async_group_enter()\n", .{dst_raw});
@@ -13994,7 +14134,7 @@ fn emitIntrinsicOpLlvm(
         },
 
         .async_spawn => {
-            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops or args.len < 3) {
+            if (!emitter.has_async_ops or args.len < 3) {
                 try state.print("  %_v_{d} = select i1 true, ptr null, ptr null\n", .{dst_raw});
             } else {
                 const fut_ty = try unwrapTransparentType(
@@ -14034,7 +14174,7 @@ fn emitIntrinsicOpLlvm(
             const fut_slot = try state.allocEntryBytes(fut_lay.size_bytes, fut_lay.alignBytes());
             defer emitter.allocator.free(fut_slot);
             try emitMemsetZero(emitter, state, fut_slot, fut_lay.size_bytes, fut_lay.alignBytes());
-            if (!emitter.cfg.target.isFreestanding() and emitter.has_async_ops and args.len >= 1) {
+            if (emitter.has_async_ops and args.len >= 1) {
                 const out_ty = emitter.input.pool.getFutureOutputType(fut_ty) orelse .unit_ty;
                 const out_lay = try emitter.resolver.resolveType(out_ty);
                 const tmp_id = state.nextTmp();
@@ -14057,7 +14197,7 @@ fn emitIntrinsicOpLlvm(
         .async_cancel => {
             const dst_ty = try unwrapTransparentType(emitter, inst.type_id);
             if (args.len >= 2 or dst_ty == .bool_ty) {
-                if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops or args.len < 1) {
+                if (!emitter.has_async_ops or args.len < 1) {
                     try state.print("  %_v_{d} = select i1 true, i1 false, i1 false\n", .{dst_raw});
                 } else {
                     const tmp_id = state.nextTmp();
@@ -14087,7 +14227,7 @@ fn emitIntrinsicOpLlvm(
                 const fut_slot = try state.allocEntryBytes(fut_lay.size_bytes, fut_lay.alignBytes());
                 defer emitter.allocator.free(fut_slot);
                 try emitMemsetZero(emitter, state, fut_slot, fut_lay.size_bytes, fut_lay.alignBytes());
-                if (!emitter.cfg.target.isFreestanding() and emitter.has_async_ops and args.len >= 1) {
+                if (emitter.has_async_ops and args.len >= 1) {
                     const tmp_id = state.nextTmp();
                     try state.print(
                         "  store ptr %_v_{d}, ptr {s}, align 1\n" ++
@@ -14102,7 +14242,7 @@ fn emitIntrinsicOpLlvm(
                 defer emitter.allocator.free(val_ty);
                 try state.print("  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n", .{ dst_raw, val_ty, loaded, val_ty, loaded });
             } else {
-                if (!emitter.cfg.target.isFreestanding() and emitter.has_async_ops and args.len >= 1) {
+                if (emitter.has_async_ops and args.len >= 1) {
                     const tmp_id = state.nextTmp();
                     try state.print(
                         "  %_ac_ca_{d} = load ptr, ptr %_v_{d}, align 1\n" ++
@@ -14115,7 +14255,7 @@ fn emitIntrinsicOpLlvm(
         },
 
         .async_task_group_exit => {
-            if (!emitter.cfg.target.isFreestanding() and emitter.has_async_ops and args.len >= 1) {
+            if (emitter.has_async_ops and args.len >= 1) {
                 try emitAsyncTaskGroupExitLlvm(emitter, state, body, bb_idx, args[0]);
             }
             try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
@@ -14127,7 +14267,7 @@ fn emitIntrinsicOpLlvm(
             const fut_slot = try state.allocEntryBytes(fut_lay.size_bytes, fut_lay.alignBytes());
             defer emitter.allocator.free(fut_slot);
             try emitMemsetZero(emitter, state, fut_slot, fut_lay.size_bytes, fut_lay.alignBytes());
-            if (!emitter.cfg.target.isFreestanding() and emitter.has_async_ops) {
+            if (emitter.has_async_ops) {
                 const tmp_id = state.nextTmp();
                 try state.print(
                     "  %_ay_kp_{d} = getelementptr inbounds %_cx_fut_raw_t, ptr {s}, i32 0, i32 1\n" ++
@@ -14143,7 +14283,7 @@ fn emitIntrinsicOpLlvm(
         },
 
         .async_block_on => {
-            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops or args.len < 1) {
+            if (!emitter.has_async_ops or args.len < 1) {
                 if (try isZeroSizedType(emitter, inst.type_id)) {
                     try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
                 } else {
@@ -14292,7 +14432,7 @@ fn emitPopulateCoroFrameArgsLlvm(
     }
 }
 
-/// Returns `true` when `cand_idx` matches an indirect `async_future_make` signature (`[CRITICAL-02]`).
+/// Returns `true` when `cand_idx` matches an indirect `async_future_make` signature.
 fn isCompatibleIndirectAsyncCandidateLlvm(
     emitter: *LlvmModuleEmitter,
     caller_body: *const MirBody,
@@ -14917,7 +15057,7 @@ fn emitStoreSwifterrorFromPayloadPtr(
     }
 }
 
-/// Decodes a non-null `swifterror` pointer `err_ptr_ssa` into `err_pay_ptr` at a call site (`[CRITICAL-06]`).
+/// Decodes a non-null `swifterror` pointer `err_ptr_ssa` into `err_pay_ptr` at a call site.
 fn emitDecodeSwifterrorToPayloadPtr(
     emitter: *LlvmModuleEmitter,
     state: *BodyEmitState,
@@ -15669,6 +15809,7 @@ fn emitMirTerminatorLlvm(
                             .ret_ty = .unit_ty,
                             .is_extern_c = true,
                             .is_contextless = true,
+                            .is_variadic = true,
                         });
                         defer va_fn_rec.deinit(emitter.allocator);
                         const va_rec = va_fn_rec.param_recipes[0];
@@ -15682,7 +15823,12 @@ fn emitMirTerminatorLlvm(
                             defer emitter.allocator.free(copy_slot);
                             try emitMemsetZero(emitter, state, copy_slot, v_lay.size_bytes, copy_align);
                             try emitStoreValueToPtr(emitter, state, val_ty, val_ssa, copy_slot, copy_align, 0, 0, 0);
-                            break :blk try formatAbiParamDeclPiece(emitter, val_ty, va_rec, copy_slot);
+                            var eff_va_rec = va_rec;
+                            if (va_rec.pass_mode == .indirect_by_ref and emitter.cfg.target.arch == .wasm32) {
+                                eff_va_rec.pass_mode = .indirect_byval;
+                                eff_va_rec.pointee_align_bytes = copy_align;
+                            }
+                            break :blk try formatAbiParamDeclPiece(emitter, val_ty, eff_va_rec, copy_slot);
                         }
                         const va_abi_ty = try formatAbiParamOrRetType(emitter, val_ty, va_rec);
                         defer emitter.allocator.free(va_abi_ty);
@@ -15715,7 +15861,7 @@ fn emitMirTerminatorLlvm(
                 dst_params.len >= 1 and
                 !(try isZeroSizedType(emitter, body.getInst(dst_params[0]).type_id));
 
-            // Check Pentagon `!range` on direct scalar integer call returns (`[MAJOR-08]`).
+            // Check Pentagon `!range` on direct scalar integer call returns:
             var call_range_md: ?u32 = null;
             if (!is_void_abi and callee_recipe.swifterror_kind == .none and has_ret_dest) {
                 const dst_ty = body.getInst(dst_params[0]).type_id;
@@ -15785,7 +15931,7 @@ fn emitMirTerminatorLlvm(
             }
 
             if (callee_recipe.swifterror_kind != .none) {
-                // LLVM `SwiftErrorVerifier` invariant: load `%_cx_call_err` immediately in the same block!
+                // LLVM `SwiftErrorVerifier` invariant: load `%_cx_call_err` immediately in the same block:
                 try state.print(
                     "  %_cerr_v_{d} = load ptr, ptr %_cx_call_err, align 8\n",
                     .{call_tmp},
@@ -16277,7 +16423,7 @@ fn precomputeDuplicateEdgeTrampolines(
             else
                 (@as(u128, 1) << @intCast(switch_bits)) - 1;
 
-            // Default arm (`edge_start + edge_len - 1`) claims its target first, then unique cases.
+            // Default arm (`edge_start + edge_len - 1`) claims its target first, then unique cases:
             const def_idx: u32 = term.edge_start + term.edge_len - 1;
             const def_target = body.extra_edges.items[def_idx].target_bb;
             try seen_targets.put(allocator, def_target.asInt(), {});
@@ -16356,7 +16502,7 @@ fn emitMirBody(emitter: *LlvmModuleEmitter, body_idx: u32, body: *const MirBody)
     try buildFunctionLoopMetadata(emitter, &state, body);
     try precomputeDuplicateEdgeTrampolines(emitter, body, &state);
 
-    // [1] Emit `define` header with exact `AbiFnRecipe` attributes.
+    // [1] Emit `define` header with exact `AbiFnRecipe` attributes:
     const linkage_kw = if (isBodyExternallyVisible(emitter, body)) "" else "internal ";
     const fn_ident = try formatLlvmGlobalIdent(emitter.allocator, emitter.body_llvm_names.items[body_idx]);
     defer emitter.allocator.free(fn_ident);
@@ -16421,7 +16567,7 @@ fn emitMirBody(emitter: *LlvmModuleEmitter, body_idx: u32, body: *const MirBody)
     }
     try emitter.writeAll(" {\n");
 
-    // [2] Allocate frame locals (`%_loc_0..N`) and entry prologue setup (`_bb_0` prologue buffer).
+    // [2] Allocate frame locals (`%_loc_0..N`) and entry prologue setup (`_bb_0` prologue buffer):
     var entry_prologue = BodyEmitState{
         .allocator = emitter.allocator,
         .cur_label = try emitter.allocator.dupe(u8, "_bb_0"),
@@ -16434,7 +16580,7 @@ fn emitMirBody(emitter: *LlvmModuleEmitter, body_idx: u32, body: *const MirBody)
     };
     defer entry_prologue.deinit();
 
-    // Hoist MVS `@llvm.experimental.noalias.scope.decl` strictly into `_bb_0` (`DR-09` §4.1).
+    // Hoist MVS `@llvm.experimental.noalias.scope.decl` strictly into `_bb_0` (`DR-09` §4.1):
     if (state.mvs_scopes.items.len > 0) {
         try emitter.requireIntrinsicDecl("declare void @llvm.experimental.noalias.scope.decl(metadata)");
         for (state.mvs_scopes.items) |mvs_sc| {
@@ -16518,13 +16664,13 @@ fn emitMirBody(emitter: *LlvmModuleEmitter, body_idx: u32, body: *const MirBody)
         }
     }
 
-    // Merge any scratch allocas allocated while unpacking direct ABI aggregates in `entry_prologue`.
+    // Merge any scratch allocas allocated while unpacking direct ABI aggregates in `entry_prologue`:
     if (entry_prologue.entry_allocas.items.len > 0) {
         try state.entry_allocas.appendSlice(emitter.allocator, entry_prologue.entry_allocas.items);
     }
     state.next_tmp_id = entry_prologue.next_tmp_id;
 
-    // [3] Pass 1 – Emit each basic block's instructions + terminator into `per_block_ir[bb_i]`.
+    // [3] Pass 1 – Emit each basic block's instructions + terminator into `per_block_ir[bb_i]`:
     var per_block_ir = try emitter.allocator.alloc([]u8, block_count);
     @memset(per_block_ir, &[_]u8{});
     defer {
@@ -16539,7 +16685,7 @@ fn emitMirBody(emitter: *LlvmModuleEmitter, body_idx: u32, body: *const MirBody)
         state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_bb_{d}", .{bb_i}));
         state.active_dbg_loc_md = 0;
 
-        // Bind `_bb_0` block_params if any exist on the entry block.
+        // Bind `_bb_0` `block_params` if any exist on the entry block:
         if (bb_i == 0) {
             for (body.getBlockParams(MirBlockId.fromInt(0)), 0..) |bp_val, bp_idx| {
                 const bp_ty = body.getInst(bp_val).type_id;
@@ -16568,7 +16714,7 @@ fn emitMirBody(emitter: *LlvmModuleEmitter, body_idx: u32, body: *const MirBody)
             }
         }
 
-        // Emit Pentagon `@llvm.assume` pointer facts on `block_param` pointers (entry `_bb_0` + `phi` headers).
+        // Emit Pentagon `@llvm.assume` pointer facts on `block_param` pointers (entry `_bb_0` + `phi` headers):
         for (body.getBlockParams(MirBlockId.fromInt(@intCast(bb_i)))) |bp_val| {
             const bp_ty = try unwrapTransparentType(emitter, body.getInst(bp_val).type_id);
             if (!bp_ty.isPrimitiveOrSentinel()) {
@@ -16607,7 +16753,7 @@ fn emitMirBody(emitter: *LlvmModuleEmitter, body_idx: u32, body: *const MirBody)
         per_block_ir[bb_i] = try emitter.allocator.dupe(u8, state.cur_buf.items);
     }
 
-    // [4] Pass 2 – Stitch `_bb_0` (`entry_allocas` + `entry_prologue`), `_bb_1..N` (`phi` headers), and trampolines.
+    // [4] Pass 2 – Stitch `_bb_0` (`entry_allocas` + `entry_prologue`), `_bb_1..N` (`phi` headers), and trampolines:
     for (0..block_count) |bb_i| {
         try emitter.print("_bb_{d}:\n", .{bb_i});
         if (bb_i == 0) {
@@ -16621,7 +16767,7 @@ fn emitMirBody(emitter: *LlvmModuleEmitter, body_idx: u32, body: *const MirBody)
             const bb_id = MirBlockId.fromInt(@intCast(bb_i));
             const bb_params = body.getBlockParams(bb_id);
             if (bb_params.len > 0) {
-                // Collect active syntactic predecessor edges targeting `bb_id`.
+                // Collect active syntactic predecessor edges targeting `bb_id`:
                 var pred_edge_indices: std.ArrayListUnmanaged(usize) = .empty;
                 defer pred_edge_indices.deinit(emitter.allocator);
                 for (body.extra_edges.items, 0..) |edge, e_idx| {
@@ -16668,7 +16814,7 @@ fn emitMirBody(emitter: *LlvmModuleEmitter, body_idx: u32, body: *const MirBody)
                     try emitter.writeAll("\n");
                 }
 
-                // Emit ZST placeholder definitions after all `phi` nodes in the block header.
+                // Emit ZST placeholder definitions after all `phi` nodes in the block header:
                 for (bb_params) |bp_val| {
                     if (try isZeroSizedType(emitter, body.getInst(bp_val).type_id)) {
                         try emitter.print("  %_v_{d} = add i8 0, 0\n", .{bp_val.asInt()});
@@ -16679,7 +16825,7 @@ fn emitMirBody(emitter: *LlvmModuleEmitter, body_idx: u32, body: *const MirBody)
         try emitter.writeAll(per_block_ir[bb_i]);
     }
 
-    // Emit synthetic `_bb_edge_<tramp_idx>` trampolines for duplicate multi-way branches (`[CRITICAL-05]`).
+    // Emit synthetic `_bb_edge_<tramp_idx>` trampolines for duplicate multi-way branches:
     for (state.trampolines.items) |tramp| {
         try emitter.print(
             "_bb_edge_{d}:\n  br label %_bb_{d}\n",
@@ -16767,8 +16913,7 @@ fn emitAsyncBodyEntryAndPollLlvm(emitter: *LlvmModuleEmitter, body_idx: u32, bod
     if (emitter.entry_main_body_idx != null and
         emitter.entry_main_body_idx.? == body_idx and
         body.param_count == 0 and
-        emitter.has_async_ops and
-        !emitter.cfg.target.isFreestanding())
+        emitter.has_async_ops)
     {
         const ptr_int = ptrIntType(emitter);
         const fut_raw_sz: u64 = 4 * @as(u64, emitter.cfg.target.ptrBytes());
@@ -16823,7 +16968,7 @@ fn emitAsyncBodyEntryAndPollLlvm(emitter: *LlvmModuleEmitter, body_idx: u32, bod
     try emitter.writeAll(stub_state.cur_buf.items);
     try emitter.writeAll("}\n\n");
 
-    if (emitter.has_async_ops and !emitter.cfg.target.isFreestanding()) {
+    if (emitter.has_async_ops) {
         try emitAsyncCoroPollBodyLlvm(emitter, body_idx, body);
     }
 }
@@ -17296,28 +17441,30 @@ fn emitAsyncDispatchTablesLlvm(emitter: *LlvmModuleEmitter) !void {
         try emitter.synth_globals.appendSlice(emitter.allocator, "}\n\n");
     }
 
-    const appendFmt = struct {
-        /// Appends formatted text to `buf` using `alloc`.
-        fn run(alloc: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), comptime fmt: []const u8, args: anytype) !void {
-            const line = try std.fmt.allocPrint(alloc, fmt, args);
-            defer alloc.free(line);
-            try buf.appendSlice(alloc, line);
-        }
-    }.run;
     const sbuf = &emitter.synth_globals;
     const alloc = emitter.allocator;
+    const appendOwned = struct {
+        /// Appends `owned_line` to `buf` and frees `owned_line`.
+        fn run(allocator_ref: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), owned_line: []u8) !void {
+            defer allocator_ref.free(owned_line);
+            try buf.appendSlice(allocator_ref, owned_line);
+        }
+    }.run;
 
-    try appendFmt(
+    try appendOwned(
         alloc,
         sbuf,
-        "define internal {s} @_cx_coro_frame_size(i32 %_b_idx) {s} {{\n" ++
-            "entry:\n" ++
-            "  switch i32 %_b_idx, label %def [\n",
-        .{ ptr_int, fn_attrs },
+        try std.fmt.allocPrint(
+            alloc,
+            "define internal {s} @_cx_coro_frame_size(i32 %_b_idx) {s} {{\n" ++
+                "entry:\n" ++
+                "  switch i32 %_b_idx, label %def [\n",
+            .{ ptr_int, fn_attrs },
+        ),
     );
     for (emitter.input.bodies, 0..) |*cand_b, b_i| {
         if (!cand_b.is_async) continue;
-        try appendFmt(alloc, sbuf, "    i32 {d}, label %b_{d}\n", .{ b_i, b_i });
+        try appendOwned(alloc, sbuf, try std.fmt.allocPrint(alloc, "    i32 {d}, label %b_{d}\n", .{ b_i, b_i }));
     }
     try sbuf.appendSlice(alloc, "  ]\n");
     for (emitter.input.bodies, 0..) |*cand_b, b_i| {
@@ -17326,21 +17473,28 @@ fn emitAsyncDispatchTablesLlvm(emitter: *LlvmModuleEmitter) !void {
             emitter.coro_final_frame_sizes[b_i]
         else
             16;
-        try appendFmt(alloc, sbuf, "b_{d}:\n  ret {s} {d}\n", .{ b_i, ptr_int, sz_bytes });
+        try appendOwned(
+            alloc,
+            sbuf,
+            try std.fmt.allocPrint(alloc, "b_{d}:\n  ret {s} {d}\n", .{ b_i, ptr_int, sz_bytes }),
+        );
     }
-    try appendFmt(alloc, sbuf, "def:\n  ret {s} 16\n}}\n\n", .{ptr_int});
+    try appendOwned(alloc, sbuf, try std.fmt.allocPrint(alloc, "def:\n  ret {s} 16\n}}\n\n", .{ptr_int}));
 
-    try appendFmt(
+    try appendOwned(
         alloc,
         sbuf,
-        "define internal {s} @_cx_coro_frame_align(i32 %_b_idx) {s} {{\n" ++
-            "entry:\n" ++
-            "  switch i32 %_b_idx, label %def [\n",
-        .{ ptr_int, fn_attrs },
+        try std.fmt.allocPrint(
+            alloc,
+            "define internal {s} @_cx_coro_frame_align(i32 %_b_idx) {s} {{\n" ++
+                "entry:\n" ++
+                "  switch i32 %_b_idx, label %def [\n",
+            .{ ptr_int, fn_attrs },
+        ),
     );
     for (emitter.input.bodies, 0..) |*cand_b, b_i| {
         if (!cand_b.is_async) continue;
-        try appendFmt(alloc, sbuf, "    i32 {d}, label %b_{d}\n", .{ b_i, b_i });
+        try appendOwned(alloc, sbuf, try std.fmt.allocPrint(alloc, "    i32 {d}, label %b_{d}\n", .{ b_i, b_i }));
     }
     try sbuf.appendSlice(alloc, "  ]\n");
     for (emitter.input.bodies, 0..) |*cand_b, b_i| {
@@ -17349,64 +17503,83 @@ fn emitAsyncDispatchTablesLlvm(emitter: *LlvmModuleEmitter) !void {
             emitter.coro_final_frame_aligns[b_i]
         else
             16;
-        try appendFmt(alloc, sbuf, "b_{d}:\n  ret {s} {d}\n", .{ b_i, ptr_int, al_bytes });
+        try appendOwned(
+            alloc,
+            sbuf,
+            try std.fmt.allocPrint(alloc, "b_{d}:\n  ret {s} {d}\n", .{ b_i, ptr_int, al_bytes }),
+        );
     }
-    try appendFmt(alloc, sbuf, "def:\n  ret {s} 16\n}}\n\n", .{ptr_int});
+    try appendOwned(alloc, sbuf, try std.fmt.allocPrint(alloc, "def:\n  ret {s} 16\n}}\n\n", .{ptr_int}));
 
-    try appendFmt(
+    try appendOwned(
         alloc,
         sbuf,
-        "define internal i32 @_cx_coro_poll_dispatch(i32 %_b_idx, ptr %_fr, ptr %_out, i32 %_act, ptr %_pk) {s} {{\n" ++
-            "entry:\n" ++
-            "  switch i32 %_b_idx, label %def [\n",
-        .{fn_attrs},
+        try std.fmt.allocPrint(
+            alloc,
+            "define internal i32 @_cx_coro_poll_dispatch(i32 %_b_idx, ptr %_fr, ptr %_out, i32 %_act, ptr %_pk) {s} {{\n" ++
+                "entry:\n" ++
+                "  switch i32 %_b_idx, label %def [\n",
+            .{fn_attrs},
+        ),
     );
     for (emitter.input.bodies, 0..) |*cand_b, b_i| {
         if (!cand_b.is_async) continue;
-        try appendFmt(alloc, sbuf, "    i32 {d}, label %b_{d}\n", .{ b_i, b_i });
+        try appendOwned(alloc, sbuf, try std.fmt.allocPrint(alloc, "    i32 {d}, label %b_{d}\n", .{ b_i, b_i }));
     }
     try sbuf.appendSlice(alloc, "  ]\n");
     for (emitter.input.bodies, 0..) |*cand_b, b_i| {
         if (!cand_b.is_async) continue;
-        try appendFmt(
+        try appendOwned(
             alloc,
             sbuf,
-            "b_{d}:\n  %r_{d} = call i32 @_cx_coro_poll_{d}(ptr %_fr, ptr %_out, i32 %_act, ptr %_pk)\n  ret i32 %r_{d}\n",
-            .{ b_i, b_i, b_i, b_i },
+            try std.fmt.allocPrint(
+                alloc,
+                "b_{d}:\n  %r_{d} = call i32 @_cx_coro_poll_{d}(ptr %_fr, ptr %_out, i32 %_act, ptr %_pk)\n  ret i32 %r_{d}\n",
+                .{ b_i, b_i, b_i, b_i },
+            ),
         );
     }
     try sbuf.appendSlice(alloc, "def:\n  ret i32 1\n}\n\n");
 
-    try appendFmt(
+    try appendOwned(
         alloc,
         sbuf,
-        "define internal i32 @_cx_coro_lookup_fn(ptr %_fn_p) {s} {{\nentry:\n",
-        .{fn_attrs},
+        try std.fmt.allocPrint(
+            alloc,
+            "define internal i32 @_cx_coro_lookup_fn(ptr %_fn_p) {s} {{\nentry:\n",
+            .{fn_attrs},
+        ),
     );
     var cmp_step: u32 = 0;
     for (emitter.input.bodies, 0..) |*cand_b, b_i| {
         if (!cand_b.is_async) continue;
         const fn_ident = try formatLlvmGlobalIdent(alloc, emitter.body_llvm_names.items[b_i]);
         defer alloc.free(fn_ident);
-        try appendFmt(
+        try appendOwned(
             alloc,
             sbuf,
-            "  %m_{d} = icmp eq ptr %_fn_p, {s}\n" ++
-                "  br i1 %m_{d}, label %hit_{d}, label %nx_{d}\n" ++
-                "hit_{d}:\n  ret i32 {d}\n" ++
-                "nx_{d}:\n",
-            .{ cmp_step, fn_ident, cmp_step, cmp_step, cmp_step, cmp_step, b_i, cmp_step },
-        );
-        cmp_step += 1;
-        if (emitter.ctx_wrap_map.contains(@intCast(b_i))) {
-            try appendFmt(
+            try std.fmt.allocPrint(
                 alloc,
-                sbuf,
-                "  %m_{d} = icmp eq ptr %_fn_p, @_cx_fn_ctxwrap_{d}\n" ++
+                "  %m_{d} = icmp eq ptr %_fn_p, {s}\n" ++
                     "  br i1 %m_{d}, label %hit_{d}, label %nx_{d}\n" ++
                     "hit_{d}:\n  ret i32 {d}\n" ++
                     "nx_{d}:\n",
-                .{ cmp_step, b_i, cmp_step, cmp_step, cmp_step, cmp_step, b_i, cmp_step },
+                .{ cmp_step, fn_ident, cmp_step, cmp_step, cmp_step, cmp_step, b_i, cmp_step },
+            ),
+        );
+        cmp_step += 1;
+        if (emitter.ctx_wrap_map.contains(@intCast(b_i))) {
+            try appendOwned(
+                alloc,
+                sbuf,
+                try std.fmt.allocPrint(
+                    alloc,
+                    "  %m_{d} = icmp eq ptr %_fn_p, @_cx_fn_ctxwrap_{d}\n" ++
+                        "  br i1 %m_{d}, label %hit_{d}, label %nx_{d}\n" ++
+                        "hit_{d}:\n  ret i32 {d}\n" ++
+                        "nx_{d}:\n",
+                    .{ cmp_step, b_i, cmp_step, cmp_step, cmp_step, cmp_step, b_i, cmp_step },
+                ),
             );
             cmp_step += 1;
         }
@@ -17415,17 +17588,20 @@ fn emitAsyncDispatchTablesLlvm(emitter: *LlvmModuleEmitter) !void {
         if (thunk.callee_body_idx < emitter.input.bodies.len and
             emitter.input.bodies[thunk.callee_body_idx].is_async)
         {
-            try appendFmt(
+            try appendOwned(
                 alloc,
                 sbuf,
-                "  %m_{d} = icmp eq ptr %_fn_p, @_cx_cthunk_{d}\n" ++
-                    "  br i1 %m_{d}, label %hit_{d}, label %nx_{d}\n" ++
-                    "hit_{d}:\n  ret i32 {d}\n" ++
-                    "nx_{d}:\n",
-                .{
-                    cmp_step,              thunk_idx, cmp_step, cmp_step, cmp_step, cmp_step,
-                    thunk.callee_body_idx, cmp_step,
-                },
+                try std.fmt.allocPrint(
+                    alloc,
+                    "  %m_{d} = icmp eq ptr %_fn_p, @_cx_cthunk_{d}\n" ++
+                        "  br i1 %m_{d}, label %hit_{d}, label %nx_{d}\n" ++
+                        "hit_{d}:\n  ret i32 {d}\n" ++
+                        "nx_{d}:\n",
+                    .{
+                        cmp_step,              thunk_idx, cmp_step, cmp_step, cmp_step, cmp_step,
+                        thunk.callee_body_idx, cmp_step,
+                    },
+                ),
             );
             cmp_step += 1;
         }
@@ -18001,7 +18177,7 @@ pub fn emitModule(
     var dev_seam_bytes: ?[]u8 = null;
     errdefer if (dev_seam_bytes) |buf| allocator.free(buf);
 
-    // Reserve `!0 = !{}` up front so `0` is an unambiguous absent sentinel for all metadata IDs.
+    // Reserve `!0 = !{}` up front so `0` is an unambiguous absent sentinel for all metadata IDs:
     _ = emitter.addMetadataNode("!{}") catch return error.OutOfMemory;
     emitter.di_empty_tuple_md = emitter.addMetadataNode("!{}") catch return error.OutOfMemory;
 
@@ -18023,7 +18199,7 @@ pub fn emitModule(
             break;
         }
     }
-    if (has_any_async and !cfg.target.isFreestanding()) {
+    if (has_any_async) {
         const cloned_bodies = allocator.alloc(MirBody, input.bodies.len) catch return error.OutOfMemory;
         var cloned_count: usize = 0;
         errdefer {
@@ -18080,7 +18256,7 @@ pub fn emitModule(
         };
     }
 
-    if (emitter.has_async_ops and !cfg.target.isFreestanding()) {
+    if (emitter.has_async_ops) {
         emitAsyncDispatchTablesLlvm(&emitter) catch |err| {
             return if (@as(anyerror, err) == error.OutOfMemory) error.OutOfMemory else error.BackendFailure;
         };
@@ -18095,7 +18271,7 @@ pub fn emitModule(
         emitter.writeAll("\n") catch return error.OutOfMemory;
     }
 
-    // Emit sorted `@llvm.*` intrinsic declarations collected across the module.
+    // Emit sorted `@llvm.*` intrinsic declarations collected across the module:
     if (emitter.owned_intrinsic_decls.items.len > 0) {
         std.mem.sort([]u8, emitter.owned_intrinsic_decls.items, {}, struct {
             /// Orders two LLVM `declare` lines lexicographically.
@@ -18109,7 +18285,7 @@ pub fn emitModule(
         emitter.writeAll("\n") catch return error.OutOfMemory;
     }
 
-    // Emit DWARF v5 `LineTablesOnly` module flags when debug info was generated.
+    // Emit DWARF v5 `LineTablesOnly` module flags when debug info was generated:
     const has_dwarf = emitter.di_cu_md != 0;
     if (has_dwarf) {
         const dwarf_ver_md = emitter.addMetadataNode("!{i32 7, !\"Dwarf Version\", i32 5}") catch
@@ -18157,7 +18333,7 @@ pub fn emitModule(
 
 // ---------------------------------------- MAIN -----------------------------------------
 
-test "codegen_llvm. Phase 7.6 SourceLoc, FmtSpec/FmtArgs, raw addr, atomics, variadics, opaque, and byte literals" {
+test "test_codegen_llvm_source_loc_fmt_atomics_variadics_and_bytes" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const host_spec = TargetSpec.host();
@@ -18213,7 +18389,7 @@ test "codegen_llvm. Phase 7.6 SourceLoc, FmtSpec/FmtArgs, raw addr, atomics, var
     try std.testing.expect(std.mem.indexOf(u8, var_art.emitted_text, "(ptr, ptr, ptr, ...) @c_var_log(") != null);
 
     // [2] End-to-end executable verification: `SourceLoc` (both `.field` & `aggregate_extract`), `fmt_value`,
-    // static 0-hole `FmtArgs` (`[P0-C]`), `Atomic*` interior mutability (`MemoryOrder` `0..5`), `b"…"`, & `~vec`:
+    // static 0-hole `FmtArgs`, `Atomic*` interior mutability (`MemoryOrder` `0..5`), `b"…"`, & `~vec`:
     const exec_src =
         \\pub enum MemoryOrder: u8 {
         \\    Relaxed = 0,
@@ -18322,7 +18498,7 @@ test "codegen_llvm. Phase 7.6 SourceLoc, FmtSpec/FmtArgs, raw addr, atomics, var
     try std.testing.expectEqualStrings("0000002a|    hi|num=42|ffffffff|k=2a,Low", run_res.stdout);
 }
 
-test "Phase 7.6 Stage-4 LLVM regressions: 0-byte own closure niche, 128-bit enum ABI, 6-arg cmpxchg, float fmt" {
+test "test_codegen_llvm_zero_env_own_closure_enum128_and_float_fmt" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const host_spec = TargetSpec.host();
@@ -18483,11 +18659,11 @@ test "Phase 7.6 Stage-4 LLVM regressions: 0-byte own closure niche, 128-bit enum
     );
 }
 
-test "Phase 8 Tier B LLVM: Fix-07 C ABI indirect/export/variadic, < 10 KB freestanding Wasm, and aarch64-msvc .obj/.lib" {
+test "test_codegen_llvm_c_abi_variadic_freestanding_wasm_and_arm64_msvc" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // [1] Fix-07 #1/#2/#3: indirect `extern "C" fn` calls, `@export` unwind-abort + section, and indirect variadics:
+    // [1] Indirect `extern "C" fn` calls, `@export` unwind-abort + section, and indirect variadics:
     const fix07_src =
         \\pub type CVarFn = extern "C" fn(*u8, ...) -> i32;
         \\extern "C" fn c_var_direct(fmt_ptr: *u8, ...) -> i32;

@@ -3,12 +3,11 @@
 //! Architectural Role:
 //! - Executes target-independent Block-Argument SSA `MirBody` graphs at compile time (`DR-05`
 //!   Deliverable 3) using fixed 8-byte `RegSlot` registers, 4-byte tagged `ComptimeAllocId`
-//!   handles (`[CRITICAL-02]`), out-of-band `init_mask` bitsets, and sorted `ProvenanceEntry`
-//!   pointer provenance tables (`[CRITICAL-10]`).
+//!   handles, out-of-band `init_mask` bitsets, and sorted `ProvenanceEntry` pointer provenance
+//!   tables.
 //! - Supports arbitrary scalar, pointer, and `> 8B` by-value SSA values (`i128`, `u128`, `str`,
 //!   `[T]`, `#soa [T]`, structs, tuples, payload enums/`Option`/`Result`, `[T; N]`) via a 3-way
-//!   `VmValueRepr` (`[CRITICAL-04]`) parameterized by `TargetLayout` (`NATIVE_64` vs `WASM32`,
-//!   `[MAJOR-06]`).
+//!   `VmValueRepr` parameterized by `TargetLayout` (`NATIVE_64` vs `WASM32`).
 //! - Enforces deterministic compile-time UB traps (`E0501`–`E0510`) with ordered call-stack
 //!   `LabeledSpan` traces, canonical IEEE-754 quiet NaNs, all 9 `DR-05` reflection intrinsics
 //!   (including VFS-sandboxed `@embed_bytes`), bounded `Wyhash(0)` pure-call memoization with
@@ -16,7 +15,7 @@
 //!
 //! Key Design Choices:
 //! - Host allocations inside `BumpArena` clamp alignment to `<= 16` bytes while checking exact
-//!   virtual `align_log2` on `SymbolicPtr.byte_offset` (`[CRITICAL-03]`).
+//!   virtual `align_log2` on `SymbolicPtr.byte_offset`.
 //! - Pure `comptime` calls serialize canonical argument bytes + transitive provenance into a
 //!   `Wyhash(0)` key and restore `BumpArena` checkpoints on completion when no mutable allocation
 //!   escapes, bounding memory across recursive `comptime` metaprogramming.
@@ -84,7 +83,7 @@ const MirBody = mir.MirBody;
 
 // ---------------- Comptime Allocation Handles -----------------
 
-/// Disjoint 2-bit top tag partitioning the 32-bit `ComptimeAllocId` space (`[CRITICAL-02]`).
+/// Disjoint 2-bit top tag partitioning the 32-bit `ComptimeAllocId` space.
 pub const AllocDomain = enum(u2) {
     /// `0b00`: Mutable, stack-frame, or value-snapshot `MirVm` allocation (`0` = null pointer).
     vm_alloc = 0,
@@ -96,7 +95,7 @@ pub const AllocDomain = enum(u2) {
     fn_or_none = 3,
 };
 
-/// Strongly typed 4-byte allocation handle with disjoint 2-bit domain tags (`[CRITICAL-02]`).
+/// Strongly typed 4-byte allocation handle with disjoint 2-bit domain tags.
 pub const ComptimeAllocId = enum(u32) {
     /// Null pointer sentinel (`0x0000_0000`, traps `E0506` on dereference).
     null_ptr = 0,
@@ -175,7 +174,7 @@ pub const SymbolicPtr = extern struct {
     pub const NULL: SymbolicPtr = .{ .alloc_id = .null_ptr, .byte_offset = 0 };
 };
 
-/// Fixed 8-byte SSA virtual register slot in `MirVm` (`DR-05` §3.1, `[CRITICAL-04]`).
+/// Fixed 8-byte SSA virtual register slot in `MirVm` (`DR-05` §3.1).
 pub const RegSlot = extern union {
     /// Unsigned 64-bit integer, boolean, `char`, or packed bitfield payload.
     scalar_u64: u64,
@@ -187,7 +186,7 @@ pub const RegSlot = extern union {
     sym_ptr: SymbolicPtr,
 };
 
-/// 8-byte out-of-band pointer provenance entry sorted by `byte_offset` (`[CRITICAL-10]`).
+/// 8-byte out-of-band pointer provenance entry sorted by `byte_offset`.
 pub const ProvenanceEntry = extern struct {
     /// Starting byte offset of the stored pointer within the owning allocation (`4B`).
     byte_offset: u32,
@@ -195,7 +194,7 @@ pub const ProvenanceEntry = extern struct {
     alloc_id: ComptimeAllocId,
 };
 
-/// 3-way runtime value representation inside `MirVm` (`[CRITICAL-04]`).
+/// 3-way runtime value representation inside `MirVm`.
 pub const VmValueRepr = enum(u8) {
     /// Scalar `<= 8` bytes (`unit`, `bool`, `char`, `i8`..`i64`, `u8`..`u64`, `isize`, `usize`, `f32`, `f64`).
     inline_scalar = 0,
@@ -208,7 +207,7 @@ pub const VmValueRepr = enum(u8) {
 
 // ----------------- Memory Model & Rodata Pool -----------------
 
-/// Tracked compile-time memory object in `MirVm` (`[CRITICAL-03]`, `[CRITICAL-10]`).
+/// Tracked compile-time memory object in `MirVm`.
 pub const ComptimeAllocation = struct {
     /// Raw backing byte slice in `MirVm.arena` (host alignment clamped to `<= 16`).
     bytes: []u8,
@@ -341,6 +340,21 @@ pub const RodataPool = struct {
         return ComptimeAllocId.fromRodataIndex(new_idx);
     }
 
+    /// Interns `raw_bytes` with a trailing `0x00` NUL byte (`raw_bytes.len + 1` bytes, align 1).
+    pub fn internNullTerminated(self: *RodataPool, raw_bytes: []const u8) !ComptimeAllocId {
+        var stack_buf: [256]u8 = undefined;
+        if (raw_bytes.len < stack_buf.len) {
+            if (raw_bytes.len > 0) @memcpy(stack_buf[0..raw_bytes.len], raw_bytes);
+            stack_buf[raw_bytes.len] = 0;
+            return self.internBlob(stack_buf[0 .. raw_bytes.len + 1], &.{}, 0);
+        }
+        const heap_buf = try self.allocator.alloc(u8, raw_bytes.len + 1);
+        defer self.allocator.free(heap_buf);
+        @memcpy(heap_buf[0..raw_bytes.len], raw_bytes);
+        heap_buf[raw_bytes.len] = 0;
+        return self.internBlob(heap_buf, &.{}, 0);
+    }
+
     /// Fetches a `RodataBlob` by its 0-based pool index.
     pub inline fn getBlob(self: *const RodataPool, blob_idx: u32) ?RodataBlob {
         if (blob_idx >= self.blobs.items.len) return null;
@@ -350,7 +364,7 @@ pub const RodataPool = struct {
 
 // ---------------- Pure-Call Memoization Cache -----------------
 
-/// Transitive `CompilerDb` dependency recorded during a memoized pure `MirVm` call (`[CRITICAL-01]`).
+/// Transitive `CompilerDb` dependency recorded during a memoized pure `MirVm` call.
 const MemoQueryDep = struct {
     /// Observed `CompilerDb` `QueryKey` (`build_def_mir`, `eval_comptime_def`, or Stage-0 config/embed input).
     key: query_db.QueryKey,
@@ -376,7 +390,7 @@ const MemoCachedResult = struct {
     snapshot_init: []u64 = &.{},
     /// Owned `ProvenanceEntry` slice when `repr == .by_value_snapshot`.
     snapshot_prov: []ProvenanceEntry = &.{},
-    /// Owned transitive `CompilerDb` query dependencies replayed on every cache hit (`[CRITICAL-01]`).
+    /// Owned transitive `CompilerDb` query dependencies replayed on every cache hit.
     query_deps: []MemoQueryDep = &.{},
     /// Sub-slice byte offset inside `snapshot_bytes` when `repr == .by_value_snapshot`.
     snapshot_offset: u32 = 0,
@@ -393,7 +407,7 @@ const MemoCachedResult = struct {
 /// Bounded `Wyhash(0)` memoization cache for pure `comptime` calls (`AGENTS.md` §2).
 ///
 /// Enforces both `MAX_MEMO_ENTRIES` (`4,096`) and `MAX_MEMO_BYTES` (`16 MiB`) with $O(1)$ FIFO
-/// eviction and `free_slots` index reuse so `entries` never grows unboundedly (`[MAJOR-08]`).
+/// eviction and `free_slots` index reuse so `entries` never grows unboundedly.
 pub const PureCallMemoCache = struct {
     /// Backing allocator for owned snapshot buffers and slot tables.
     allocator: std.mem.Allocator,
@@ -401,7 +415,7 @@ pub const PureCallMemoCache = struct {
     index_by_hash: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     /// Bounded slot storage of active memo entries (`null` once evicted; `len <= MAX_MEMO_ENTRIES`).
     entries: std.ArrayListUnmanaged(?MemoCachedResult) = .empty,
-    /// Reusable vacant indices inside `entries` reclaimed on eviction or hash overwrite (`[MAJOR-08]`).
+    /// Reusable vacant indices inside `entries` reclaimed on eviction or hash overwrite.
     free_slots: std.ArrayListUnmanaged(u32) = .empty,
     /// Oldest live slot in the intrusive FIFO doubly-linked list (`maxInt(u32)` when empty).
     fifo_head: u32 = std.math.maxInt(u32),
@@ -530,7 +544,7 @@ pub const PureCallMemoCache = struct {
         return entry;
     }
 
-    /// Inserts a serialized pure return value, evicting oldest entries and recycling vacant slots (`[MAJOR-08]`).
+    /// Inserts a serialized pure return value, evicting oldest entries and recycling vacant slots.
     fn insert(self: *PureCallMemoCache, candidate: MemoCachedResult) !void {
         var is_transferred = false;
         errdefer if (!is_transferred) self.freeEntryBuffers(candidate);
@@ -593,7 +607,7 @@ pub const VmExecOptions = struct {
     mem_limit: u64 = DEFAULT_MEM_LIMIT,
     /// Maximum nested `MirVm` call depth before `E0508` (`512` default).
     max_call_depth: u32 = MAX_CALL_DEPTH,
-    /// Target pointer size and alignment (`NATIVE_64` vs `WASM32`, `[MAJOR-06]`).
+    /// Target pointer size and alignment (`NATIVE_64` vs `WASM32`).
     target_layout: TargetLayout = TargetLayout.NATIVE_64,
     /// Optional workspace root directory path for VFS-sandboxed `@embed_bytes`.
     workspace_root: ?[]const u8 = null,
@@ -605,7 +619,7 @@ pub const VmExecOptions = struct {
     file_tokens: ?*const std.AutoHashMapUnmanaged(u32, *const TokenBuffer) = null,
     /// Optional `CompilerDb` for on-demand cross-definition `buildDefMir` / `evalComptimeDef` resolution.
     compiler_db: ?*query_db.CompilerDb = null,
-    /// Optional pre-materialized `MirBlobStore` for `MirConst.raw_blob` (`@embed_bytes`, `[CRITICAL-07]`).
+    /// Optional pre-materialized `MirBlobStore` for `MirConst.raw_blob` (`@embed_bytes`).
     blob_store: ?*const mir.MirBlobStore = null,
     /// Optional `stdout` capture buffer when `is_oracle_runtime_mode` is `true` (`D-07A`).
     stdout_capture: ?*std.ArrayListUnmanaged(u8) = null,
@@ -812,11 +826,11 @@ pub const CANONICAL_F32_QNAN_BITS: u32 = 0x7FC0_0000;
 
 /// Lower 30-bit payload mask for `ComptimeAllocId`.
 const ALLOC_PAYLOAD_MASK: u32 = 0x3FFF_FFFF;
-/// Maximum host alignment supported by `BumpArena.allocAligned` (`16` bytes, `[CRITICAL-03]`).
+/// Maximum host alignment supported by `BumpArena.allocAligned` (`16` bytes).
 const MAX_HOST_ALIGN_BYTES: usize = 16;
 
 comptime {
-    // Enforce exact Phase 5 `MirVm` byte-size invariants (`[CRITICAL-02]`, `DR-05` §3.1):
+    // Enforce exact Phase 5 `MirVm` byte-size invariants (`DR-05` §3.1):
     std.debug.assert(@sizeOf(ComptimeAllocId) == 4);
     std.debug.assert(@sizeOf(SymbolicPtr) == 8);
     std.debug.assert(@sizeOf(RegSlot) == 8);
@@ -841,7 +855,7 @@ fn isRelocSliceEqual(lhs_slice: []const RodataReloc, rhs_slice: []const RodataRe
     return true;
 }
 
-/// Classifies `raw_ty` into its 3-way `VmValueRepr` (`[CRITICAL-04]`).
+/// Classifies `raw_ty` into its 3-way `VmValueRepr`.
 pub fn classifyValueRepr(
     pool: *const InternPool,
     sym_table: *const SymbolTable,
@@ -956,7 +970,7 @@ fn isThreeWordClosureInVm(pool: *const InternPool, raw_ty: TypeId) bool {
     return false;
 }
 
-/// Returns `true` when `order_code` is a valid `DR-22` `MemoryOrder` (`0..5`, `[P0-A]`).
+/// Returns `true` when `order_code` is a valid `DR-22` `MemoryOrder` (`0..5`).
 inline fn isValidMemoryOrderCode(order_code: u128) bool {
     return order_code <= 5;
 }
@@ -1173,7 +1187,7 @@ fn computeSoaColumnOffsetAndType(
 // -------------- Reflection & VFS Sandbox Helpers --------------
 
 /// Returns `true` if `stem` matches a reserved Windows DOS device name (`CON`, `PRN`, `AUX`, `NUL`,
-/// `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive, `[CRITICAL-02]`).
+/// `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive).
 fn isReservedWindowsDeviceStem(stem: []const u8) bool {
     if (stem.len == 3) {
         return std.ascii.eqlIgnoreCase(stem, "CON") or
@@ -1219,7 +1233,7 @@ pub fn isValidSandboxedEmbedPath(rel_path: []const u8) bool {
 }
 
 /// Returns `true` if canonical file path `canon_target` is strictly nested inside canonical directory
-/// `canon_root` on a path-component boundary (`[CRITICAL-02]`).
+/// `canon_root` on a path-component boundary.
 pub fn isCanonicalPathWithinRoot(canon_root: []const u8, canon_target: []const u8) bool {
     if (canon_root.len == 0 or canon_target.len == 0) return false;
     const root_trimmed = std.mem.trimEnd(u8, canon_root, "/\\");
@@ -1309,9 +1323,9 @@ pub const MirVm = struct {
     def_to_callable: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     /// Lookup map `SymbolIndex.asInt() -> callable_idx`.
     sym_to_callable: std.AutoHashMapUnmanaged(u32, u32) = .empty,
-    /// Set of `DefId.asInt()` callables loaded on demand from `CompilerDb.buildDefMir` (`[CRITICAL-01]`).
+    /// Set of `DefId.asInt()` callables loaded on demand from `CompilerDb.buildDefMir`.
     db_backed_defs: std.AutoHashMapUnmanaged(u32, void) = .empty,
-    /// Transitive `CompilerDb` `QueryKey`s observed during frame execution (`[CRITICAL-01]`).
+    /// Transitive `CompilerDb` `QueryKey`s observed during frame execution.
     observed_query_deps: std.ArrayListUnmanaged(query_db.QueryKey) = .empty,
     /// Active `MirVm` call-stack frames (`len <= options.max_call_depth`).
     call_stack: std.ArrayListUnmanaged(VmCallFrame) = .empty,
@@ -1325,11 +1339,11 @@ pub const MirVm = struct {
     drop_trace: std.ArrayListUnmanaged(i64) = .empty,
     /// Count of currently live virtual heap/container allocations (`0` on leak-free completion).
     live_heap_allocs: u32 = 0,
-    /// Nesting depth of active `[abort_on_panic]` vacated projection windows (`[MAJOR-10]`).
+    /// Nesting depth of active `[abort_on_panic]` vacated projection windows.
     abort_on_panic_depth: u32 = 0,
-    /// Set to `true` when a trap inside an `[abort_on_panic]` window triggered immediate abort (`[MAJOR-10]`).
+    /// Set to `true` when a trap inside an `[abort_on_panic]` window triggered immediate abort.
     has_aborted_vacated_panic: bool = false,
-    /// Non-null dangling `0`-byte sentinel allocation for empty slices (`[CRITICAL-04]`).
+    /// Non-null dangling `0`-byte sentinel allocation for empty slices.
     dangling_empty_alloc: ComptimeAllocId = .null_ptr,
     /// Dynamic 10-slot `Context` capability register bank (`DR-08` §5.3, `DR-21` `SE-08`).
     context_slots: [10]RegSlot = @splat(.{ .scalar_u64 = 0 }),
@@ -1352,7 +1366,7 @@ pub const MirVm = struct {
     /// Currently polling executor item (`0` = root, `task_id + 1` = spawned task, `maxInt(u32)` = none).
     active_polling_item: u32 = std.math.maxInt(u32),
     /// `true` while executing a coroutine `cancel_bb` cleanup pad so `async_task_group_exit` cancels children.
-    active_coro_is_cancelling: bool = false,
+    is_active_coro_cancelling: bool = false,
 
     /// Initializes a `MirVm` instance with reserved slot `0` (`.null_ptr`) in `allocations`.
     pub fn init(
@@ -1387,7 +1401,7 @@ pub const MirVm = struct {
             .is_live = false,
             .is_stack_frame = false,
         });
-        // Reserve index `1` as the live, aligned, `0`-byte dangling slice sentinel (`[CRITICAL-04]`):
+        // Reserve index `1` as the live, aligned, `0`-byte dangling slice sentinel:
         try vm.allocations.append(allocator, .{
             .bytes = &.{},
             .init_mask = &.{},
@@ -1679,7 +1693,7 @@ pub const MirVm = struct {
 
     // ---------- Allocation, `init_mask` & Provenance API ----------
 
-    /// Allocates a new `ComptimeAllocation` in `self.arena` (`[CRITICAL-03]` clamped `<= 16B` host align).
+    /// Allocates a new `ComptimeAllocation` in `self.arena` (clamped `<= 16B` host align).
     pub fn allocMemory(
         self: *MirVm,
         byte_size: u64,
@@ -1782,7 +1796,7 @@ pub const MirVm = struct {
         }
     }
 
-    /// Removes any `ProvenanceEntry` in `alloc_rec` overlapping `[offset .. offset + len)` (`[CRITICAL-03]`).
+    /// Removes any `ProvenanceEntry` in `alloc_rec` overlapping `[offset .. offset + len)`.
     fn clearOverlappingProvenance(
         self: *const MirVm,
         alloc_rec: *ComptimeAllocation,
@@ -1858,7 +1872,7 @@ pub const MirVm = struct {
         return @as(u64, items[low].byte_offset) < read_end;
     }
 
-    /// Inserts `entry` into `alloc_rec.provenance` maintaining sorted `byte_offset` order (`[CRITICAL-03]`).
+    /// Inserts `entry` into `alloc_rec.provenance` maintaining sorted `byte_offset` order.
     fn insertProvenanceSorted(
         self: *MirVm,
         alloc_rec: *ComptimeAllocation,
@@ -2118,7 +2132,8 @@ pub const MirVm = struct {
                     );
                 }
                 const str_slice = self.interner.get(SymbolId.fromInt(ptr.alloc_id.payloadIndex()));
-                if (end_off > str_slice.len) {
+                const cstr_cap = str_slice.len + 1;
+                if (end_off > cstr_cap) {
                     return self.failWithTrap(
                         error.OutOfBounds,
                         .e0504_comptime_out_of_bounds,
@@ -2127,7 +2142,7 @@ pub const MirVm = struct {
                         null,
                     );
                 }
-                return str_slice.len;
+                return cstr_cap;
             },
             .fn_or_none => unreachable,
         }
@@ -2190,13 +2205,19 @@ pub const MirVm = struct {
             },
             .string_lit => {
                 const str_slice = self.interner.get(SymbolId.fromInt(ptr.alloc_id.payloadIndex()));
-                @memcpy(dest_buf, str_slice[start_off .. start_off + dest_buf.len]);
+                const copy_end = @min(start_off + dest_buf.len, str_slice.len);
+                if (start_off < copy_end) {
+                    @memcpy(dest_buf[0 .. copy_end - start_off], str_slice[start_off..copy_end]);
+                }
+                if (start_off + dest_buf.len > copy_end) {
+                    @memset(dest_buf[copy_end - start_off ..], 0);
+                }
             },
             .fn_or_none => unreachable,
         }
     }
 
-    /// Writes `src_bytes` into `ptr`, setting `init_mask` bits and erasing overlapping provenance (`[CRITICAL-10]`).
+    /// Writes `src_bytes` into `ptr`, setting `init_mask` bits and erasing overlapping provenance.
     pub fn writeScalarBytes(
         self: *MirVm,
         ptr: SymbolicPtr,
@@ -2213,7 +2234,7 @@ pub const MirVm = struct {
         self.clearOverlappingProvenance(alloc_rec, ptr.byte_offset, @intCast(src_bytes.len));
     }
 
-    /// Stores `sym_ptr` at `dest_ptr` under `target_layout`, recording exact `ProvenanceEntry` (`[CRITICAL-10]`).
+    /// Stores `sym_ptr` at `dest_ptr` under `target_layout`, recording exact `ProvenanceEntry`.
     pub fn writePointerAt(
         self: *MirVm,
         dest_ptr: SymbolicPtr,
@@ -2333,7 +2354,7 @@ pub const MirVm = struct {
     }
 
     /// Copies `byte_len` bytes, `init_mask` bits (preserving uninitialized padding), and interior
-    /// `ProvenanceEntry` records from `src_ptr` into `dst_ptr` (`[CRITICAL-10]`).
+    /// `ProvenanceEntry` records from `src_ptr` into `dst_ptr`.
     pub fn copyMemoryRange(
         self: *MirVm,
         dst_ptr: SymbolicPtr,
@@ -2454,7 +2475,13 @@ pub const MirVm = struct {
             },
             .string_lit => {
                 const str_slice = self.interner.get(SymbolId.fromInt(src_ptr.alloc_id.payloadIndex()));
-                @memcpy(tmp_bytes, str_slice[src_start .. src_start + len_usize]);
+                const copy_end = @min(src_start + len_usize, str_slice.len);
+                if (src_start < copy_end) {
+                    @memcpy(tmp_bytes[0 .. copy_end - src_start], str_slice[src_start..copy_end]);
+                }
+                if (src_start + len_usize > copy_end) {
+                    @memset(tmp_bytes[copy_end - src_start ..], 0);
+                }
                 @memset(tmp_init, true);
             },
             .fn_or_none => unreachable,
@@ -2595,7 +2622,7 @@ pub const MirVm = struct {
         return .{ .sym_ptr = snap };
     }
 
-    /// Loads a typed `RegSlot` from `place_ptr` (`[CRITICAL-04]`, `[CRITICAL-10]`).
+    /// Loads a typed `RegSlot` from `place_ptr`.
     pub fn loadTypedSlotFromMemory(
         self: *MirVm,
         place_ptr: SymbolicPtr,
@@ -2669,7 +2696,7 @@ pub const MirVm = struct {
         }
     }
 
-    /// Stores a typed `RegSlot` into `place_ptr` (`[CRITICAL-04]`, `[CRITICAL-10]`).
+    /// Stores a typed `RegSlot` into `place_ptr`.
     pub fn storeTypedSlotToMemory(
         self: *MirVm,
         place_ptr: SymbolicPtr,
@@ -2750,7 +2777,7 @@ pub const MirVm = struct {
         return .{ .sym_ptr = snap };
     }
 
-    /// Reads the active variant ordinal (`0 .. V - 1`) of `raw_sum_ty` at `base_ptr` (`[CRITICAL-04]`).
+    /// Reads the active variant ordinal (`0 .. V - 1`) of `raw_sum_ty` at `base_ptr`.
     pub fn readSumDiscriminantAt(
         self: *MirVm,
         base_ptr: SymbolicPtr,
@@ -2814,7 +2841,7 @@ pub const MirVm = struct {
         }
     }
 
-    /// Writes the active variant ordinal (`tag_ord`) of `raw_sum_ty` into `base_ptr` (`[CRITICAL-04]`).
+    /// Writes the active variant ordinal (`tag_ord`) of `raw_sum_ty` into `base_ptr`.
     pub fn writeSumDiscriminantAt(
         self: *MirVm,
         base_ptr: SymbolicPtr,
@@ -2957,13 +2984,13 @@ pub const MirVm = struct {
         }
     }
 
-    /// Records a transitive `CompilerDb` `QueryKey` observed during `MirVm` execution (`[CRITICAL-01]`).
+    /// Records a transitive `CompilerDb` `QueryKey` observed during `MirVm` execution.
     fn recordObservedQueryDep(self: *MirVm, key: query_db.QueryKey) VmEvalError!void {
         if (self.options.compiler_db == null) return;
         self.observed_query_deps.append(self.allocator, key) catch return error.OutOfMemory;
     }
 
-    /// Maps a `CompilerDb` `QueryError` into the corresponding `VmEvalError` (`[MAJOR-05]`).
+    /// Maps a `CompilerDb` `QueryError` into the corresponding `VmEvalError`.
     fn mapDbQueryError(self: *MirVm, err: query_db.QueryError) VmEvalError {
         return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
@@ -2979,7 +3006,7 @@ pub const MirVm = struct {
         };
     }
 
-    /// Returns `true` if `alloc_id` can be safely hashed and retained across `MirVm` sessions (`[CRITICAL-01]`).
+    /// Returns `true` if `alloc_id` can be safely hashed and retained across `MirVm` sessions.
     fn isMemoSafePtrTarget(self: *const MirVm, alloc_id: ComptimeAllocId, depth: u32) bool {
         if (depth > 32) return false;
         if (alloc_id == .null_ptr) return true;
@@ -2996,7 +3023,7 @@ pub const MirVm = struct {
         };
     }
 
-    /// Hashes the canonical cross-session content and relocations of `alloc_id` into `hasher` (`[CRITICAL-01]`).
+    /// Hashes the canonical cross-session content and relocations of `alloc_id` into `hasher`.
     fn hashMemoPtrTarget(
         self: *const MirVm,
         hasher: *std.hash.Wyhash,
@@ -3135,7 +3162,7 @@ pub const MirVm = struct {
         }
     }
 
-    /// Returns `true` if `body` + `arg_slots` is eligible for `Wyhash(0)` pure-call memoization (`[CRITICAL-01]`).
+    /// Returns `true` if `body` + `arg_slots` is eligible for `Wyhash(0)` pure-call memoization.
     fn isPureMemoizableCall(
         self: *const MirVm,
         body: *const MirBody,
@@ -3201,7 +3228,7 @@ pub const MirVm = struct {
                     },
                     .string_lit => {
                         const str_bytes = self.interner.get(SymbolId.fromInt(snap_ptr.alloc_id.payloadIndex()));
-                        if (end_off > str_bytes.len) return false;
+                        if (end_off > str_bytes.len + 1) return false;
                     },
                     .fn_or_none => return false,
                 }
@@ -3210,7 +3237,7 @@ pub const MirVm = struct {
         return true;
     }
 
-    /// Computes a deterministic `Wyhash(0)` digest over `(callee_key, target_layout, arg_slots)` (`[CRITICAL-01]`).
+    /// Computes a deterministic `Wyhash(0)` digest over `(callee_key, target_layout, arg_slots)`.
     fn computePureCallHash(
         self: *const MirVm,
         callee_key: u64,
@@ -3313,7 +3340,13 @@ pub const MirVm = struct {
                         },
                         .string_lit => {
                             const str_bytes = self.interner.get(SymbolId.fromInt(sym_ptr.alloc_id.payloadIndex()));
-                            hasher.update(str_bytes[byte_off .. byte_off + byte_len]);
+                            const copy_end = @min(byte_off + byte_len, str_bytes.len);
+                            if (byte_off < copy_end) {
+                                hasher.update(str_bytes[byte_off..copy_end]);
+                            }
+                            if (byte_off + byte_len > copy_end) {
+                                hasher.update(&[1]u8{0});
+                            }
                         },
                         .fn_or_none => {},
                     }
@@ -3372,7 +3405,7 @@ pub const MirVm = struct {
     }
 
     /// Attempts to serialize a pure call's return `RegSlot` for `PureCallMemoCache` (returns `null` if it
-    /// references session-local `.vm_alloc` or `.fn_or_none` handles, `[CRITICAL-01]`).
+    /// references session-local `.vm_alloc` or `.fn_or_none` handles).
     fn trySerializeMemoResult(
         self: *const MirVm,
         cache_alloc: std.mem.Allocator,
@@ -3502,7 +3535,7 @@ pub const MirVm = struct {
     };
 
     /// Allocates a fresh uninitialized stack `ComptimeAllocId` for `local_idx` inside `call_stack[frame_idx]`
-    /// after a scope/loop-iteration `ghost_storage_deinit` invalidated the prior slot (`[MAJOR-06]`).
+    /// after a scope/loop-iteration `ghost_storage_deinit` invalidated the prior slot.
     fn ensureLocalStackAllocation(self: *MirVm, frame_idx: usize, local_idx: usize) VmEvalError!void {
         const body = self.call_stack.items[frame_idx].body;
         if (local_idx <= body.param_count or local_idx >= self.call_stack.items[frame_idx].owned_stack_allocs.len) {
@@ -3537,7 +3570,7 @@ pub const MirVm = struct {
         self.call_stack.items[frame_idx].owned_stack_allocs[local_idx] = fresh_id;
     }
 
-    /// Evaluates `place_id` inside `call_stack[frame_idx]`, enforcing `E0504` spatial bounds (`[CRITICAL-04]`).
+    /// Evaluates `place_id` inside `call_stack[frame_idx]`, enforcing `E0504` spatial bounds.
     fn evalPlace(
         self: *MirVm,
         frame_idx: usize,
@@ -3858,7 +3891,7 @@ pub const MirVm = struct {
         }
     }
 
-    /// Attempts to resolve `(def_id, sym_idx)` without trapping when the body is not registered (`[MAJOR-05]`).
+    /// Attempts to resolve `(def_id, sym_idx)` without trapping when the body is not registered.
     fn tryResolveOrLoadCallable(
         self: *MirVm,
         def_id: DefId,
@@ -5052,11 +5085,12 @@ pub const MirVm = struct {
             },
             .str_val => |sym_id| {
                 const text = self.interner.get(sym_id);
-                const data_ptr = SymbolicPtr{
-                    .alloc_id = ComptimeAllocId.fromStringId(sym_id),
-                    .byte_offset = 0,
-                };
-                return self.makeFatSliceSlot(ty, data_ptr, text.len);
+                const rodata_id = self.rodata_pool.internNullTerminated(text) catch return error.OutOfMemory;
+                return self.makeFatSliceSlot(
+                    ty,
+                    .{ .alloc_id = rodata_id, .byte_offset = 0 },
+                    text.len,
+                );
             },
             .bytes_val => |sym_id| {
                 const bytes = self.interner.get(sym_id);
@@ -5144,9 +5178,9 @@ pub const MirVm = struct {
                 const ptr_width: u32 = self.options.target_layout.ptr_byte_size;
                 const file_bytes = self.interner.get(loc_const.file_sym);
                 const fn_bytes = self.interner.get(loc_const.fn_sym);
-                const file_aid = self.rodata_pool.internBlob(file_bytes, &.{}, 0) catch
+                const file_aid = self.rodata_pool.internNullTerminated(file_bytes) catch
                     return error.OutOfMemory;
-                const fn_aid = self.rodata_pool.internBlob(fn_bytes, &.{}, 0) catch
+                const fn_aid = self.rodata_pool.internNullTerminated(fn_bytes) catch
                     return error.OutOfMemory;
                 var desc_buf: [40]u8 = @splat(0);
                 const desc_len: usize = if (ptr_width == 8) 40 else 24;
@@ -6309,10 +6343,10 @@ pub const MirVm = struct {
                     const part_slot = self.call_stack.items[frame_idx].regs[part_raw];
                     try self.appendFormattedValue(&builder, part_ty, part_slot);
                 }
-                const sym_id = self.interner.intern(builder.items) catch return error.OutOfMemory;
+                const rodata_id = self.rodata_pool.internNullTerminated(builder.items) catch return error.OutOfMemory;
                 return self.makeFatSliceSlot(
                     agg_ty,
-                    .{ .alloc_id = ComptimeAllocId.fromStringId(sym_id), .byte_offset = 0 },
+                    .{ .alloc_id = rodata_id, .byte_offset = 0 },
                     builder.items.len,
                 );
             },
@@ -7046,10 +7080,10 @@ pub const MirVm = struct {
                     const spec_hi: u32 = @truncate(self.call_stack.items[frame_idx].regs[args[2]].scalar_u64);
                     try self.appendFormattedWithSpec(&builder, val_ty, val_slot, spec_lo, spec_hi);
                 }
-                const sym_id = self.interner.intern(builder.items) catch return error.OutOfMemory;
+                const rodata_id = self.rodata_pool.internNullTerminated(builder.items) catch return error.OutOfMemory;
                 return self.makeFatSliceSlot(
                     inst.type_id,
-                    .{ .alloc_id = ComptimeAllocId.fromStringId(sym_id), .byte_offset = 0 },
+                    .{ .alloc_id = rodata_id, .byte_offset = 0 },
                     builder.items.len,
                 );
             },
@@ -7081,10 +7115,10 @@ pub const MirVm = struct {
                         true,
                     );
                 }
-                const sym_id = self.interner.intern(builder.items) catch return error.OutOfMemory;
+                const rodata_id = self.rodata_pool.internNullTerminated(builder.items) catch return error.OutOfMemory;
                 return self.makeFatSliceSlot(
                     inst.type_id,
-                    .{ .alloc_id = ComptimeAllocId.fromStringId(sym_id), .byte_offset = 0 },
+                    .{ .alloc_id = rodata_id, .byte_offset = 0 },
                     builder.items.len,
                 );
             },
@@ -7114,10 +7148,10 @@ pub const MirVm = struct {
                     TypeId.fromInt(inst.operands.lhs),
                 ) catch return error.OutOfMemory;
                 defer self.allocator.free(rendered);
-                const sym_id = self.interner.intern(rendered) catch return error.OutOfMemory;
+                const rodata_id = self.rodata_pool.internNullTerminated(rendered) catch return error.OutOfMemory;
                 return self.makeFatSliceSlot(
                     inst.type_id,
-                    .{ .alloc_id = ComptimeAllocId.fromStringId(sym_id), .byte_offset = 0 },
+                    .{ .alloc_id = rodata_id, .byte_offset = 0 },
                     rendered.len,
                 );
             },
@@ -8678,9 +8712,9 @@ pub const MirVm = struct {
 
         try self.cancelFutureAtPtr(child_ptr, child_ty);
         if (!cancel_bb.isNone()) {
-            const prev_cancelling = self.active_coro_is_cancelling;
-            self.active_coro_is_cancelling = true;
-            defer self.active_coro_is_cancelling = prev_cancelling;
+            const prev_cancelling = self.is_active_coro_cancelling;
+            self.is_active_coro_cancelling = true;
+            defer self.is_active_coro_cancelling = prev_cancelling;
             _ = try self.runCoroBlocksFrom(coro_id, cancel_bb, true);
         }
         self.releaseCoroFrame(coro_id);
@@ -8700,7 +8734,7 @@ pub const MirVm = struct {
 
         const body = self.call_stack.items[frame_idx].body;
         const cur_bb = self.call_stack.items[frame_idx].cur_bb;
-        var is_err_or_cancel = self.active_coro_is_cancelling or self.task_groups.items[group_id].is_cancelled;
+        var is_err_or_cancel = self.is_active_coro_cancelling or self.task_groups.items[group_id].is_cancelled;
         if (!is_err_or_cancel and cur_bb.asInt() < body.blocks.items.len) {
             const bb_rec = body.blocks.items[cur_bb.asInt()];
             if (bb_rec.isCleanupPad()) {
@@ -9263,7 +9297,7 @@ pub const MirVm = struct {
         }
     }
 
-    /// Validates that an atomic `MemoryOrder` operand is in `0..5` (`DR-22` `[P0-A]`).
+    /// Validates that an atomic `MemoryOrder` operand is in `0..5` (`DR-22`).
     fn validateAtomicOrderOperand(
         self: *MirVm,
         frame_idx: usize,
@@ -9307,7 +9341,7 @@ pub const MirVm = struct {
         return self.storeTypedSlotToMemory(place_ptr, raw_ty, slot);
     }
 
-    /// Materializes `AggregateKind.fmt_args_make` (`SE-12`), promoting static 0-hole pieces to `.rodata` (`[P0-C]`).
+    /// Materializes `AggregateKind.fmt_args_make` (`SE-12`), promoting static 0-hole pieces to `.rodata`.
     fn evalFmtArgsMake(
         self: *MirVm,
         frame_idx: usize,
@@ -9370,7 +9404,7 @@ pub const MirVm = struct {
                 const str_aid = if (piece_bytes.len == 0)
                     empty_rodata_aid
                 else
-                    (self.rodata_pool.internBlob(piece_bytes, &.{}, 0) catch return error.OutOfMemory);
+                    (self.rodata_pool.internNullTerminated(piece_bytes) catch return error.OutOfMemory);
                 const piece_off: usize = piece_i * @as(usize, str_stride);
                 if (ptr_width == 8) {
                     std.mem.writeInt(u64, pieces_raw[piece_off + 8 ..][0..8], piece_bytes.len, .little);
@@ -11059,7 +11093,7 @@ pub const MirVm = struct {
         return self.promoteSnapshotToRodata(snap, eval_res.type_id);
     }
 
-    /// Recursively promotes a `SymbolicPtr` allocation slice of `raw_ty` into `RodataPool` (`[MAJOR-07]`).
+    /// Recursively promotes a `SymbolicPtr` allocation slice of `raw_ty` into `RodataPool`.
     pub fn promoteSnapshotToRodata(
         self: *MirVm,
         src_ptr: SymbolicPtr,
@@ -11184,7 +11218,10 @@ pub const MirVm = struct {
         } else if (src_ptr.alloc_id.domain() == .string_lit) {
             const text = self.interner.get(SymbolId.fromInt(src_ptr.alloc_id.payloadIndex()));
             const base_off: usize = src_ptr.byte_offset;
-            @memcpy(canonical_bytes, text[base_off .. base_off + byte_len]);
+            const copy_end = @min(base_off + byte_len, text.len);
+            if (base_off < copy_end) {
+                @memcpy(canonical_bytes[0 .. copy_end - base_off], text[base_off..copy_end]);
+            }
         }
 
         return self.rodata_pool.internBlob(canonical_bytes, relocs.items, lay.align_log2) catch
@@ -11192,7 +11229,7 @@ pub const MirVm = struct {
     }
 
     /// Walks non-padding leaf fields of `raw_ty` inside `alloc_rec` at `base_off`, trapping `E0505` if any
-    /// non-padding byte is uninitialized when `is_emitting_diag` is `true` (`[MAJOR-07]`).
+    /// non-padding byte is uninitialized when `is_emitting_diag` is `true`.
     fn isTypeLeafFieldsInitialized(
         self: *MirVm,
         alloc_rec: *const ComptimeAllocation,
@@ -11508,7 +11545,7 @@ pub const MirVm = struct {
         return true;
     }
 
-    /// Promotes an untyped nested `vm_alloc` (e.g., slice backing buffer) into `RodataPool` (`[MAJOR-07]`).
+    /// Promotes an untyped nested `vm_alloc` (e.g., slice backing buffer) into `RodataPool`.
     fn promoteVmAllocRawToRodata(
         self: *MirVm,
         vm_idx: u32,
@@ -11596,7 +11633,7 @@ pub const MirVm = struct {
         return self.slotToComptimeValue(eval_res.type_id, eval_res.repr, eval_res.slot, out_store);
     }
 
-    /// Converts an evaluated `(raw_ty, repr, slot)` into a `hir.ComptimeValue` (`[CRITICAL-03]`, `[CRITICAL-04]`).
+    /// Converts an evaluated `(raw_ty, repr, slot)` into a `hir.ComptimeValue`.
     pub fn slotToComptimeValue(
         self: *MirVm,
         raw_ty: TypeId,
@@ -12153,7 +12190,7 @@ fn hookEvalConstDefBridge(
 
 // ---------------------------------------- MAIN -----------------------------------------
 
-test "MirVm layout invariants and disjoint ComptimeAllocId domains" {
+test "test_mir_vm_layout_invariants_and_disjoint_alloc_domains" {
     try std.testing.expectEqual(@as(usize, 4), @sizeOf(ComptimeAllocId));
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(SymbolicPtr));
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(RegSlot));
@@ -12186,7 +12223,7 @@ test "MirVm layout invariants and disjoint ComptimeAllocId domains" {
     try std.testing.expectEqual(@as(u64, CANONICAL_F32_QNAN_BITS), quiet_f32_slot.scalar_u64);
 }
 
-test "MirVm executes loops, inout/set mutation, >8B aggregates, memoization, and rodata promotion" {
+test "test_mir_vm_loops_inout_mutation_aggregates_memoization_and_rodata" {
     const allocator = std.testing.allocator;
     const source =
         \\pub struct Pair {
@@ -12264,7 +12301,7 @@ test "MirVm executes loops, inout/set mutation, >8B aggregates, memoization, and
     }
 }
 
-test "MirVm TargetLayout NATIVE_64 vs WASM32 usize width and provenance traps" {
+test "test_mir_vm_target_layout_native64_vs_wasm32_and_provenance_traps" {
     const allocator = std.testing.allocator;
     const source =
         \\pub fn max_plus_wrap() -> usize {
@@ -12330,7 +12367,7 @@ test "MirVm TargetLayout NATIVE_64 vs WASM32 usize width and provenance traps" {
     try std.testing.expectError(error.ForbiddenOperation, vm_64.readPointerAt(base_ptr, 3));
 }
 
-test "MirVm traps E0501 step budget with stack trace, E0502 overflow, E0507 div zero, E0510 assert, and reflection" {
+test "test_mir_vm_traps_step_budget_overflow_div_zero_assert_and_reflection" {
     const allocator = std.testing.allocator;
     const trap_source =
         \\pub fn spin_inner(count: i64) -> i64 {
@@ -12550,7 +12587,7 @@ test "test_mir_vm_pure_call_memo_pointer_offset_rodata_fn_ptr_and_slot_recycling
         }
     }
 
-    // [CRITICAL-01]: Same `vm_alloc` at `byte_offset = 0` (`10`) vs `byte_offset = 8` (`20`) MUST NOT collide:
+    // Same `vm_alloc` at `byte_offset = 0` (`10`) vs `byte_offset = 8` (`20`) MUST NOT collide:
     const arr_alloc = try vm.allocMemory(16, 3, true, false, false, 0, Span.init(FileId.fromInt(20), 0, 0));
     var elem0_bytes: [8]u8 = undefined;
     var elem1_bytes: [8]u8 = undefined;
@@ -12570,7 +12607,7 @@ test "test_mir_vm_pure_call_memo_pointer_offset_rodata_fn_ptr_and_slot_recycling
     try std.testing.expectEqual(@as(i64, 10), elem0_res.slot.scalar_i64);
     try std.testing.expectEqual(@as(i64, 20), elem1_res.slot.scalar_i64);
 
-    // [CRITICAL-01]: Distinct `.rodata_blob` pointees (`111` vs `222`) MUST NOT collide in `PureCallMemoCache`:
+    // Distinct `.rodata_blob` pointees (`111` vs `222`) MUST NOT collide in `PureCallMemoCache`:
     var rodata_a_bytes: [8]u8 = undefined;
     var rodata_b_bytes: [8]u8 = undefined;
     std.mem.writeInt(i64, &rodata_a_bytes, 111, .little);
@@ -12589,7 +12626,7 @@ test "test_mir_vm_pure_call_memo_pointer_offset_rodata_fn_ptr_and_slot_recycling
     try std.testing.expectEqual(@as(i64, 111), ro_res_a.slot.scalar_i64);
     try std.testing.expectEqual(@as(i64, 222), ro_res_b.slot.scalar_i64);
 
-    // [CRITICAL-01]: `.fn_or_none` function-pointer arguments disable `PureCallMemoCache` insertion:
+    // `.fn_or_none` function-pointer arguments disable `PureCallMemoCache` insertion:
     const inserts_before_fn_ptr = memo_cache.insert_count;
     const cb_res_one = try vm.evalBody(
         apply_cb_body.?,
@@ -12604,7 +12641,7 @@ test "test_mir_vm_pure_call_memo_pointer_offset_rodata_fn_ptr_and_slot_recycling
     // `apply_cb` itself was NOT memoized (`inc_one` and `inc_ten` scalar subcalls were):
     try std.testing.expectEqual(inserts_before_fn_ptr + 2, memo_cache.insert_count);
 
-    // [MAJOR-08]: Churning `5,000` distinct pure calls recycles `free_slots` so `entries.items.len <= MAX_MEMO_ENTRIES`:
+    // Churning `5,000` distinct pure calls recycles `free_slots` so `entries.items.len <= MAX_MEMO_ENTRIES`:
     var call_idx: i64 = 0;
     while (call_idx < 5_000) : (call_idx += 1) {
         const dbl_res = try vm.evalBody(pure_double_body.?, &.{.{ .scalar_i64 = call_idx }});
@@ -12701,7 +12738,7 @@ test "test_mir_vm_array_repeat_provenance_linear_time_and_step_budget_e0501" {
     var rodata_pool = RodataPool.init(allocator);
     defer rodata_pool.deinit();
 
-    // [CRITICAL-03]: Tight step budget (`500`) traps `[&target_val; 50000]` deterministically with `E0501`:
+    // Tight step budget (`500`) traps `[&target_val; 50000]` deterministically with `E0501`:
     var sink_limited = DiagnosticSink.init(allocator);
     defer sink_limited.deinit();
     var vm_limited = try MirVm.init(
@@ -12724,7 +12761,7 @@ test "test_mir_vm_array_repeat_provenance_linear_time_and_step_budget_e0501" {
         sink_limited.diagnostics.items[0].code,
     );
 
-    // [CRITICAL-03]: Monotonic tail fast-path completes `50,000` pointer elements in $O(N)$ linear time:
+    // Monotonic tail fast-path completes `50,000` pointer elements in $O(N)$ linear time:
     var vm_fast = try MirVm.init(
         allocator,
         &bundle.hir_bundle.interner,
@@ -12793,7 +12830,7 @@ test "test_mir_vm_advance_symbolic_ptr_u32_overflow_loop_uaf_e0506_and_alias_imp
     );
     defer vm.deinit();
 
-    // [CRITICAL-04]: `advanceSymbolicPtr` traps with `E0504` on `u32` byte-offset overflow instead of wrapping:
+    // `advanceSymbolicPtr` traps with `E0504` on `u32` byte-offset overflow instead of wrapping:
     const dummy_alloc = try vm.allocMemory(32, 3, true, false, true, 0, Span.init(FileId.fromInt(22), 0, 0));
     try std.testing.expectError(
         error.OutOfBounds,
@@ -12804,7 +12841,7 @@ test "test_mir_vm_advance_symbolic_ptr_u32_overflow_loop_uaf_e0506_and_alias_imp
         diag_sink.diagnostics.items[0].code,
     );
 
-    // [MAJOR-06]: Loop-scoped stack local invalidated on `ghost_storage_deinit` traps with `E0506` on next iteration:
+    // Loop-scoped stack local invalidated on `ghost_storage_deinit` traps with `E0506` on next iteration:
     const uaf_body = bundle.mir_bundle.findBodyByName(&bundle.hir_bundle.interner, "loop_uaf").?;
     try std.testing.expectError(error.InvalidPointer, vm.evalBody(uaf_body, &.{}));
     try std.testing.expectEqual(
@@ -12812,7 +12849,7 @@ test "test_mir_vm_advance_symbolic_ptr_u32_overflow_loop_uaf_e0506_and_alias_imp
         diag_sink.diagnostics.items[1].code,
     );
 
-    // [MINOR-09]: `@implements[CounterAlias, Number]()` unwraps `type` alias and evaluates to `true`:
+    // `@implements[CounterAlias, Number]()` unwraps `type` alias and evaluates to `true`:
     const impl_body = bundle.mir_bundle.findBodyByName(&bundle.hir_bundle.interner, "check_alias_implements").?;
     const impl_res = try vm.evalBody(impl_body, &.{});
     try std.testing.expectEqual(@as(u64, 1), impl_res.slot.scalar_u64);
@@ -12872,7 +12909,7 @@ test "test_mir_vm_rodata_promotion_uninit_leaf_e0505_padding_subslice_and_cycle_
     );
     defer vm.deinit();
 
-    // [MAJOR-07] (a): Uninitialized non-padding leaf field (`count` at offset `8..16`) MUST trap with `E0505`:
+    // [1] Uninitialized non-padding leaf field (`count` at offset `8..16`) MUST trap with `E0505`:
     const partial_alloc = try vm.allocMemory(16, 3, true, false, false, 0, Span.init(FileId.fromInt(23), 0, 0));
     try vm.writeScalarBytes(.{ .alloc_id = partial_alloc, .byte_offset = 0 }, 0, &.{9});
     try std.testing.expectError(
@@ -12884,7 +12921,7 @@ test "test_mir_vm_rodata_promotion_uninit_leaf_e0505_padding_subslice_and_cycle_
         diag_sink.diagnostics.items[0].code,
     );
 
-    // [MAJOR-07] (b): Initialized leaf fields with uninitialized alignment padding (`1..8`) canonicalize padding to `0`:
+    // [2] Initialized leaf fields with uninitialized alignment padding (`1..8`) canonicalize padding to `0`:
     @memset(vm.allocations.items[partial_alloc.payloadIndex()].bytes[1..8], 0xAA);
     var count_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &count_bytes, 99, .little);
@@ -12910,7 +12947,7 @@ test "test_mir_vm_rodata_promotion_uninit_leaf_e0505_padding_subslice_and_cycle_
         try std.testing.expectEqual(@as(u8, 0), pad_byte);
     }
 
-    // [MAJOR-07] (c): `.string_lit` sub-slice promotion (`byte_offset = 2`, `[u8; 3]`) copies exact sub-slice bytes:
+    // [3] `.string_lit` sub-slice promotion (`byte_offset = 2`, `[u8; 3]`) copies exact sub-slice bytes:
     const lit_sym = try bundle.hir_bundle.interner.intern("xxABCzz");
     const arr_u8_3 = try bundle.hir_bundle.pool.internArray(.u8_ty, 3, false);
     const sub_blob_id = try vm.promoteSnapshotToRodata(
@@ -12919,7 +12956,7 @@ test "test_mir_vm_rodata_promotion_uninit_leaf_e0505_padding_subslice_and_cycle_
     );
     try std.testing.expectEqualStrings("ABC", rodata_pool.getBlob(sub_blob_id.payloadIndex()).?.bytes);
 
-    // [MAJOR-07] (d): Cyclic `vm_alloc` pointer provenance graph (`node_a <-> node_b`) traps cleanly with `E0503`:
+    // [4] Cyclic `vm_alloc` pointer provenance graph (`node_a <-> node_b`) traps cleanly with `E0503`:
     const ptr_u8_ty = try bundle.hir_bundle.pool.internRawPtr(.u8_ty, false);
     const node_a = try vm.allocMemory(8, 3, true, false, false, 0, Span.init(FileId.fromInt(23), 0, 0));
     const node_b = try vm.allocMemory(8, 3, true, false, false, 0, Span.init(FileId.fromInt(23), 0, 0));
@@ -12935,7 +12972,7 @@ test "test_mir_vm_rodata_promotion_uninit_leaf_e0505_padding_subslice_and_cycle_
     );
 }
 
-test "test_phase6_mir_vm_narrow_wire_zero_pad_drops_subscript_defer_and_e0326" {
+test "test_mir_vm_narrow_wire_zero_pad_drops_subscript_defer_and_e0326" {
     const allocator = std.testing.allocator;
     const source =
         \\@zero_pad
@@ -13162,7 +13199,7 @@ test "test_phase6_mir_vm_narrow_wire_zero_pad_drops_subscript_defer_and_e0326" {
     );
 }
 
-test "Phase 7.6 MirVm SourceLoc projections, FmtSpec/FmtArgs, raw addr, atomics, byte literals, and SIMD bit_not" {
+test "test_mir_vm_source_loc_fmt_atomics_bytes_and_simd_bit_not" {
     const allocator = std.testing.allocator;
     const source =
         \\pub enum MemoryOrder: u8 {
@@ -13262,7 +13299,7 @@ test "Phase 7.6 MirVm SourceLoc projections, FmtSpec/FmtArgs, raw addr, atomics,
     const loc_res = try vm.evalBody(loc_body, &.{});
     try std.testing.expect(loc_res.slot.scalar_u64 > 2500);
 
-    // [2] `[P0-C]`: 0-hole `FmtArgs` returned across stack frame boundary without dangling stack pointer (`E0506`):
+    // [2] 0-hole `FmtArgs` returned across stack frame boundary without dangling stack pointer (`E0506`):
     const static_fmt_body = bundle.mir_bundle.findBodyByName(&bundle.hir_bundle.interner, "static_fmt_args").?;
     const static_fmt_res = try vm.evalBody(static_fmt_body, &.{});
     const static_fmt_bytes = try vm.readStrOrFmtArgsSlotBytes(.fmt_args_ty, static_fmt_res.slot);
@@ -13289,7 +13326,7 @@ test "Phase 7.6 MirVm SourceLoc projections, FmtSpec/FmtArgs, raw addr, atomics,
     try std.testing.expectEqual(@as(u64, 162), atomic_res.slot.scalar_u64);
 }
 
-test "Phase 7.6 Stage-4 regressions: 0-byte own closure niche, heap closure UAF, 6-arg cmpxchg, float fmt" {
+test "test_mir_vm_zero_env_own_closure_uaf_cmpxchg_and_float_fmt" {
     const allocator = std.testing.allocator;
     const source =
         \\pub struct DropCounter {

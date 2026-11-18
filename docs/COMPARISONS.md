@@ -30,6 +30,8 @@ Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `st
 | **Error Handling ABI** | **`T!E` zero-branch register return (`swiftcc` + `swifterror`)** `[Live]` | Stack/register `Result<T, E>` enum | Error union `E!T` | Exceptions (slow unwind) or `errno` | Multi-return `(T, error)` + `if err != nil` | Exceptions |
 | **Zero-Alloc Formatted Panics & Strings** | **8-byte `FmtSpec` + stack `FmtArgs` + `{x=}` (`0` heap allocs)** `[Live]` | `format_args!` (verbose macros, separate `{:?}`/`{}`) | `std.fmt` comptime format strings | `printf` (unsafe) / `std::format` (heavy) | `fmt.Sprintf` (heap/reflection) | `f"{x=}"` (heap-allocated) |
 | **C Header Interop (`@c_import`)** | **Built-in zero-`libclang` C11/C23 translator + FFI SAST contracts** `[Live]` | External `bindgen` + `libclang` + `unsafe` everywhere | Built-in `@cImport` (bundles heavy `libclang`) | Native | `cgo` (high call overhead) | `ctypes` / `cffi` (runtime overhead) |
+| **Zero-SDK Cross-Compilation & Wasm** | **11 targets + embedded `lld` + `.def`→`.lib` + `< 10 KB` `.wasm`** `[Live]` | Needs target linkers / MSVC SDK / `wasm-bindgen` | Built-in (`~45–50 MB` compiler archive) | Per-target cross-SDKs & sysroots | Built-in (`2–10 MB+` `.wasm` / binaries) | Interpreter / heavy bundlers |
+| **Structured Concurrency & Frame Caps** | **`<= 16 KiB` stackless `async`/`await` + `@linear` `TaskGroup` (`E0309`, `E0317`)** `[Live]` | Unstructured `tokio::spawn` + `Pin<&mut Self>` + `'static` | Rebuilding `Io` interface (no `async`/`await`) | `std::coroutine` (heap HALO lottery, no race proofs) | Unstructured goroutines (GC + data races) | `asyncio` (slow, unverified cancellation) |
 | **Compile-Time Execution (`comptime`)** | **Hermetic `MirVm` with spatial/temporal provenance & step caps** `[Live]` | Restricted `const fn` + slow proc-macros | Unrestricted `comptime` (no fuel/sandbox cap by default) | `constexpr` / template metaprogramming | None (`go generate`) | Import-time execution |
 | **Built-In Deterministic `--sim` & `--fuzz`** | **First-class `test` / `bench` + `--sim --seed` + `--fuzz`** `[Live]`/`[v0.0.1]` | External crates (`cargo-fuzz`, `loom`, `turmoil`) | `std.testing.fuzz` (no virtual-time sim) | External (`libFuzzer`, custom harnesses) | `go test -fuzz` (no deterministic sim) | `hypothesis` / `atheris` |
 | **Installed Toolchain Footprint** | **`< 1 MB` self-hosted binary + tree-shaken `cx.*` stdlib** `[v0.0.1]` | `~800 MB–1.5 GB` (`rustup` + `rustc` + `cargo` + std rlibs) | `~45–50 MB` compressed (`libclang`/C++ headers) | `~500 MB–2 GB` (Clang/GCC/MSVC SDKs) | `~70–150 MB` | `~50–120 MB` |
@@ -84,6 +86,17 @@ CoreX systematically adopts the highest-leverage ergonomic wins from Python, Swi
 -   **Labeled `fsm: match` State-Machine Loops (`SE-23`):** `fsm: match state { .Idle => continue :fsm .Header, … }` compiles protocol parsers, lexers, and bytecode VMs directly into tail-dispatched CFG jump blocks without `loop { match … }` nesting.
 -   **Simultaneous Tuple Swaps & Functional Struct Spread (`SE-14`, `SE-15`):** `(left, right) = (right, left);` executes in 3 interference-free phases, while `Config { port: 8080, ..base_cfg }` and `Packet { header: h, ..own prev_pkt }` enforce MVS partial-move and `@linear` leak laws statically.
 
+### 3.7 Zero-`libclang` C11/C23 Interop, FFI SAST Contracts & 11-Target Cross-Compilation (`[Live]`)
+
+-   **In-House C11/C23 Translator (`corex translate-c` & `@c_import`):** Preprocesses and translates C11/C23 headers directly into canonical `.cx` without bundling `libclang`, lowering `MSVC` vs. `SysV` / `AAPCS64` / `Wasm32` C bitfields into byte-exact `Prune-06` storage wrappers.
+-   **Declarative FFI SAST Contracts:** `@null_terminated` (`E0308`), `@owned_by_caller` / `@free_with` / `@consumes` (`E0310`), `@may_be_null` / `@non_null` (`E0311`), `@slice_len` / `@byte_len` (`E0312` / `E0307` Pentagon proofs), and `@escapes` (`E0306`) turn unsafe C boundaries into compile-time-verified contracts.
+-   **SDK-Less 11-Target Linking & `< 10 KB` Freestanding `wasm32`:** Emits Linux (`gnu`/`musl`), macOS (`x86_64`/`aarch64`), Windows (`msvc`/`gnu` with programmatic PE/COFF `.def` → Short-Import `.lib` synthesis), `wasm32-unknown-wasi`, and `< 10 KB` `wasm32-unknown-freestanding` artifacts with deterministic `K_GNU`/`K_BSD`/`K_COFF` archives.
+
+### 3.8 `Pin`-Free `16 KiB` Stackless `async`/`await` & `@linear` `TaskGroup` Nurseries (`[Live]`)
+
+-   **Zero-Heap-Per-Await State Machines (`E0317`):** `async fn` and `async` blocks lower into liveness-colored stackless frames with `FramePinned` interior-borrow stability (no `Pin<&mut Self>` boilerplate) and a static `<= 16 KiB` inline frame cap (`E0317`).
+-   **Lexical `@linear` `cx.async.task_group` Nurseries (`E0309`):** Spawned `TaskHandle[T]` values are `@linear` obligations (`E0304` if forgotten on normal exit, automatically cancelled and reaped on `?` error or parent cancellation), while SAST proves concurrent borrow exclusivity, `Send`/`Sync`/`@thread_local` safety, and zero parent-scope escapes (`E0309`).
+
 ---
 
 ## 4. Head-to-Head Language Comparisons
@@ -94,6 +107,7 @@ CoreX systematically adopts the highest-leverage ergonomic wins from Python, Swi
 -   **How CoreX Wins:**
     -   **Zero `'a` lifetime annotations** via MVS + interprocedural region inference (`[Live]`).
     -   **True `@linear` types** that statically guarantee explicit consumption on every path (`[Live]`).
+    -   **`Pin`-free stackless `async`/`await` (`<= 16 KiB` inline frame budget `E0317`) and `@linear` `cx.async.task_group` nurseries (`E0309`)** without `'static` or `Arc<Mutex<T>>` ceremony (`[Live]`).
     -   **Named arguments, default parameters, `/` and `*` parameter zones**, and **generic type defaults** (`[Live]`).
     -   **Built-in `@no_alloc` / `@no_panic` / `@max_stack(N)`** verification and **lockfile capability sandboxing** (`[Live]` / `[v0.0.1]`).
     -   **Zero-`libclang` C header import** (`[Live]`), **hermetic `MirVm` `comptime`** instead of heavy proc-macro crates (`[Live]`), and a **`< 1 MB` self-hosted toolchain** (`[v0.0.1]`).
@@ -130,6 +144,7 @@ CoreX systematically adopts the highest-leverage ergonomic wins from Python, Swi
 -   **Where Python Hurts:** `50–200x` slower execution, GIL/multiprocessing friction, runtime `TypeError`/`KeyError`/`AttributeError` surprises in production, fragile packaging/virtualenv sprawl, and inability to ship a tiny standalone native binary or `< 10 KB` WASM module.
 -   **How CoreX Wins:**
     -   **Preserves the exact ergonomic features Python developers love most** – `and` / `or` / `not`, `(x := expr)` walrus bindings, `x is Pattern` / `is not`, `"{val=:#06x}"` self-documenting interpolation, `"""…"""` multiline strings, `/` and `*` keyword-only parameter zones, `= default` parameters, `[Data: str | &[u8]]` inline union bounds, and `[T = f64]` generic defaults – **compiled to 100% statically verified native machine code at C speed** (`[Live]`).
+    -   **Ships zero-dependency standalone binaries across all 11 desktop/server targets and `< 10 KB` `wasm32-unknown-freestanding` modules** from a single command (`[Live]`).
 
 ---
 

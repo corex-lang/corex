@@ -117,8 +117,7 @@ fn buildMutatedAdversarialCHeader(allocator: std.mem.Allocator, rng: std.Random,
     const mode = rng.uintLessThan(u8, 4);
 
     if (mode == 0) {
-        const cut_len = rng.uintLessThan(usize, base_text.len);
-        return allocator.dupe(u8, base_text[0..cut_len]);
+        return allocator.dupe(u8, base_text[0..rng.uintLessThan(usize, base_text.len)]);
     } else if (mode == 1) {
         const mutated = try allocator.dupe(u8, base_text);
         const flip_count = rng.intRangeAtMost(usize, 1, 4);
@@ -141,8 +140,7 @@ fn buildMutatedAdversarialCHeader(allocator: std.mem.Allocator, rng: std.Random,
         try nested.appendSlice(allocator, ";\n");
         return nested.toOwnedSlice(allocator);
     } else {
-        const rand_len = rng.intRangeAtMost(usize, 8, 96);
-        const scratch = try allocator.alloc(u8, rand_len);
+        const scratch = try allocator.alloc(u8, rng.intRangeAtMost(usize, 8, 96));
         for (scratch) |*byte_slot| {
             byte_slot.* = rng.int(u8);
         }
@@ -169,9 +167,8 @@ fn buildRandomValidModuleDef(allocator: std.mem.Allocator, rng: std.Random, seed
     const export_count = rng.intRangeAtMost(usize, 1, 8);
     var exp_idx: usize = 0;
     while (exp_idx < export_count) : (exp_idx += 1) {
-        const flavor = rng.uintLessThan(u8, 5);
         const ord_num = rng.intRangeAtMost(u16, 1, 500);
-        const export_line = switch (flavor) {
+        const export_line = switch (rng.uintLessThan(u8, 5)) {
             0 => try std.fmt.bufPrint(&line_buf, "    FuzzSym_{d}_{d}\n", .{ seed_idx, exp_idx }),
             1 => try std.fmt.bufPrint(&line_buf, "    FuzzOrd_{d}_{d} @{d}\n", .{ seed_idx, exp_idx, ord_num }),
             2 => try std.fmt.bufPrint(
@@ -296,8 +293,7 @@ fn evalMainOnMirVm(
     }
 
     const eval_res = try vm_engine.evalBody(main_body, &.{});
-    const ct_val = try vm_engine.slotToComptimeValue(eval_res.type_id, eval_res.repr, eval_res.slot, null);
-    const scalar_i64: i64 = switch (ct_val) {
+    const scalar_i64: i64 = switch (try vm_engine.slotToComptimeValue(eval_res.type_id, eval_res.repr, eval_res.slot, null)) {
         .int_val => |iv| @bitCast(@as(u64, @truncate(@as(u128, @bitCast(iv))))),
         else => 0,
     };
@@ -369,8 +365,7 @@ test "test_fuzz_phase8_c_frontend_translate_c_idempotency_and_adversarial_header
         )) |parsed_unit| {
             var owned_unit = parsed_unit;
             defer owned_unit.deinit();
-            const maybe_cx = try c_translate.translateUnit(allocator, &owned_unit, .{});
-            allocator.free(maybe_cx);
+            allocator.free(try c_translate.translateUnit(allocator, &owned_unit, .{}));
         } else |parse_err| switch (parse_err) {
             error.TranslationFailed => try std.testing.expect(sink.hasErrors()),
             error.OutOfMemory => return error.OutOfMemory,
@@ -413,12 +408,10 @@ test "test_fuzz_phase8_module_def_and_multi_member_archive_determinism" {
     };
     var bad_i: usize = 0;
     while (bad_i < ADVERSARIAL_MODULE_DEF_SEEDS) : (bad_i += 1) {
-        const raw_template = bad_def_templates[bad_i % bad_def_templates.len];
-        const buf = try allocator.dupe(u8, raw_template);
+        const buf = try allocator.dupe(u8, bad_def_templates[bad_i % bad_def_templates.len]);
         defer allocator.free(buf);
         if (bad_i >= bad_def_templates.len and buf.len > 0) {
-            const idx = rng.uintLessThan(usize, buf.len);
-            buf[idx] = rng.int(u8);
+            buf[rng.uintLessThan(usize, buf.len)] = rng.int(u8);
         }
         if (codegen_link.parseModuleDef(allocator, buf, "fb.dll")) |ok_def| {
             var mut_def = ok_def;
@@ -456,12 +449,10 @@ test "test_fuzz_phase8_module_def_and_multi_member_archive_determinism" {
         }
 
         while (init_n < member_count) : (init_n += 1) {
-            const payload_len = rng.intRangeAtMost(usize, 17, 93);
-            payloads[init_n] = try allocator.alloc(u8, payload_len);
+            payloads[init_n] = try allocator.alloc(u8, rng.intRangeAtMost(usize, 17, 93));
             for (payloads[init_n]) |*byte_p| byte_p.* = rng.int(u8);
 
-            const is_long_name = rng.boolean();
-            names[init_n] = if (is_long_name)
+            names[init_n] = if (rng.boolean())
                 try std.fmt.allocPrint(allocator, "very_long_archive_member_{d}_{d}.o", .{ ar_seed, init_n })
             else
                 try std.fmt.allocPrint(allocator, "m_{d}_{d}.o", .{ ar_seed, init_n });

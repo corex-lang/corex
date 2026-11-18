@@ -77,7 +77,7 @@ Most developers discovering a new systems language on Hacker News, Reddit, or Lo
         -   **Run (`MirVm`):** Executes `main()` deterministically in `< 5 ms` and streams `stdout` / panic traces with `@caller_location()` source lines.
         -   **Diagnostics & SAST:** Renders CoreX's exact ANSI + Unicode box-drawing diagnostics (`╭─▸`, underline spans, and clickable `Apply SuggestedFix` buttons for `E0xxx`/`W0xxx`).
         -   **Inspect (`MIR` / `C99` / `Fmt`):** Lets systems engineers inspect generated `-ofmt=c` output, Drop/Move elaboration, and `corex fmt` canonicalization live.
-    -   **Curated Preset Dropdown:** 10–12 interactive examples demonstrating compile-time UAF/OOB prevention, zero-annotation MVS partial moves, `T!E` + `is` + `:=` ergonomics, `@no_alloc` stack `FmtArgs`, `@builder` declarative trees, `subscript`/`yield`, and `fsm: match` state machines, plus compressed URL-hash snippet sharing.
+    -   **Curated Preset Dropdown:** 10–12 interactive examples demonstrating compile-time UAF/OOB prevention, zero-annotation MVS partial moves, `T!E` + `is` + `:=` ergonomics, `@no_alloc` stack `FmtArgs`, `@trusted` C FFI SAST spatial/NUL contracts, `cx.async.task_group` structured concurrency, `@builder` declarative trees, `subscript`/`yield`, and `fsm: match` state machines, plus compressed URL-hash snippet sharing.
 3.  **Documentation & Migration Guides (`/docs` & `/api`):**
     -   *5-Minute Quickstart* (`install` → `corex init` → `corex run` → `corex test`).
     -   *CoreX Language Tour* (structured walkthrough of types, MVS ownership, `T!E`/`T?`, generics & Type Groups, C FFI, concurrency, and `comptime`).

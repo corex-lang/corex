@@ -17,10 +17,10 @@
 //! Key Design Choices:
 //! - `D2` evaluates constant expressions strictly along constant-aware reachable CFG paths from
 //!   `^bb0`, guaranteeing `if false { 1 / 0 }` never emits bogus compile-time traps.
-//! - `D5` (`[CRITICAL-09]`) merges monomorphizations only when `(generic_def_id, LayoutShapeKey,
+//! - `D5` merges monomorphizations only when `(generic_def_id, LayoutShapeKey,
 //!   OpSemanticsTag, field_offsets_digest, resolved_callees)` all match identically.
-//! - `R5` preserves the Call Continuation Split-Edge Invariant (`[CRITICAL-05]`) and visits
-//!   `MirProjection.index` operands (`[CRITICAL-06]`).
+//! - `R5` preserves the Call Continuation Split-Edge Invariant and visits
+//!   `MirProjection.index` operands.
 
 const std = @import("std");
 const mem_foundation = @import("mem_foundation.zig");
@@ -114,7 +114,7 @@ pub const NicheKind = enum(u8) {
     enum_tag_ceil = 4,
 };
 
-/// Exact 16-byte physical layout shape descriptor (`DR-13` §5.3, `[CRITICAL-09]`, `[MINOR-03]`).
+/// Exact 16-byte physical layout shape descriptor (`DR-13` §5.3).
 pub const LayoutShapeKey = extern struct {
     /// Total padded byte size (`4B`).
     size_bytes: u32,
@@ -142,7 +142,7 @@ pub const LayoutShapeKey = extern struct {
     }
 };
 
-/// Arithmetic/comparison operational semantics tag guarding `LayoutShapeKey` deduplication (`[CRITICAL-09]`).
+/// Arithmetic/comparison operational semantics tag guarding `LayoutShapeKey` deduplication.
 pub const OpSemanticsTag = enum(u8) {
     /// Unit / zero-sized value.
     unit_sem = 0,
@@ -264,106 +264,6 @@ pub const MirOptModuleResult = struct {
     }
 };
 
-// --------------------------------------- CONSTS ----------------------------------------
-
-/// Hard cap on generic specialization nesting depth (`DR-13` §5.1, `E0508`).
-pub const MAX_MONOMORPH_DEPTH: u32 = 64;
-/// Hard cap on total monomorphized instances per module (`DR-13` §5.1, `E0508`).
-pub const MAX_MONOMORPH_INSTANCES: u32 = 65_536;
-/// Hard cap on specialized `is_async` coroutine instances per module (`E0508`).
-pub const MAX_ASYNC_MONOMORPH_INSTANCES: u32 = 4_096;
-/// Instruction cost budget for explicit `@inline` functions in `R1` (`W0501` when exceeded).
-pub const INLINE_HINT_BUDGET: u32 = 64;
-/// Instruction cost budget for unannotated small helper auto-inlining in `R1`.
-pub const AUTO_INLINE_BUDGET: u32 = 24;
-/// Caller instruction growth ceiling preventing quadratic code blowup during inlining.
-pub const MAX_CALLER_INLINE_INSTS: u32 = 2_048;
-/// Maximum scalar field count for composite local decomposition in `R2` SROA.
-pub const MAX_SROA_COMPOSITE_FIELDS: u32 = 8;
-
-/// Canonical quiet `f64` `NaN` payload matching `mir_vm.CANONICAL_F64_QNAN_BITS`.
-const CANONICAL_F64_QNAN_BITS: u64 = 0x7FF8_0000_0000_0000;
-/// Canonical quiet `f32` `NaN` payload matching `mir_vm.CANONICAL_F32_QNAN_BITS`.
-const CANONICAL_F32_QNAN_BITS: u32 = 0x7FC0_0000;
-
-comptime {
-    // Enforce exact Phase 5 `LayoutShapeKey` cache-density byte-size invariants (`[CRITICAL-09]`):
-    std.debug.assert(@sizeOf(AbiPassClass) == 1);
-    std.debug.assert(@sizeOf(NicheKind) == 1);
-    std.debug.assert(@sizeOf(LayoutShapeKey) == 16);
-}
-
-// -------------------------------------- INTERNALS --------------------------------------
-
-// -------- Layout Shape, Semantics & Attribute Helpers ---------
-
-/// Resolves signedness and bit-width of an integer/bool/char/bitfield `TypeId`.
-const OptIntInfo = struct {
-    /// Width in bits (`1..128`).
-    bits: u16,
-    /// `true` if two's-complement signed.
-    is_signed: bool,
-};
-
-/// Returns `OptIntInfo` when `raw_ty` is an integer, `bool`, `char`, `bit_field`, or backed `enum`.
-fn resolveOptIntInfo(
-    pool: *const InternPool,
-    raw_ty: TypeId,
-    target_layout: TargetLayout,
-) ?OptIntInfo {
-    const ty = pool.unwrapUnderlyingType(raw_ty);
-    return switch (ty) {
-        .bool_ty => .{ .bits = 1, .is_signed = false },
-        .i8_ty => .{ .bits = 8, .is_signed = true },
-        .i16_ty => .{ .bits = 16, .is_signed = true },
-        .i32_ty => .{ .bits = 32, .is_signed = true },
-        .i64_ty, .untyped_int_ty => .{ .bits = 64, .is_signed = true },
-        .i128_ty => .{ .bits = 128, .is_signed = true },
-        .isize_ty => .{ .bits = @as(u16, target_layout.ptr_byte_size) * 8, .is_signed = true },
-        .u8_ty => .{ .bits = 8, .is_signed = false },
-        .u16_ty => .{ .bits = 16, .is_signed = false },
-        .u32_ty, .char_ty => .{ .bits = 32, .is_signed = false },
-        .u64_ty => .{ .bits = 64, .is_signed = false },
-        .u128_ty => .{ .bits = 128, .is_signed = false },
-        .usize_ty => .{ .bits = @as(u16, target_layout.ptr_byte_size) * 8, .is_signed = false },
-        else => blk: {
-            const node = pool.getNode(ty);
-            if (node.tag == .bit_field_ty) {
-                break :blk resolveOptIntInfo(pool, TypeId.fromInt(node.lhs), target_layout);
-            }
-            if (node.tag == .enum_ty) {
-                if (pool.getEnumBackingIntType(ty)) |backing_ty| {
-                    break :blk resolveOptIntInfo(pool, backing_ty, target_layout);
-                }
-            }
-            break :blk null;
-        },
-    };
-}
-
-/// Classifies `raw_ty` into an `OpSemanticsTag` so `LayoutShapeKey` deduplication never conflates
-/// signed, unsigned, and IEEE-754 operations (`[CRITICAL-09]`).
-fn classifyOpSemantics(
-    pool: *const InternPool,
-    raw_ty: TypeId,
-    target_layout: TargetLayout,
-) OpSemanticsTag {
-    const ty = pool.unwrapUnderlyingType(raw_ty);
-    if (ty == .unit_ty or ty == .never_ty) return .unit_sem;
-    if (ty == .bool_ty) return .bool_sem;
-    if (ty == .f32_ty) return .ieee_f32;
-    if (ty == .f64_ty or ty == .untyped_float_ty) return .ieee_f64;
-    if (ty == .source_loc_ty) return .pointer_or_ref;
-    if (resolveOptIntInfo(pool, ty, target_layout)) |info| {
-        return if (info.is_signed) .signed_int else .unsigned_int;
-    }
-    const node = pool.getNode(ty);
-    return switch (node.tag) {
-        .ref_ty, .mut_ref_ty, .raw_ptr_ty, .fn_ty => .pointer_or_ref,
-        else => .aggregate_bytes,
-    };
-}
-
 /// Zero-allocation 128-slot (`64` 2-way sets) stack memo for `computeDeepTypeSemanticsDigest`.
 const TypeSemanticsDigestMemo = struct {
     /// Validity bitset for the 128 slots (`16` bytes zeroed at init).
@@ -446,6 +346,275 @@ const TypeSemanticsDigestMemo = struct {
         self.setSlot(slot_idx);
     }
 };
+
+/// Zero-allocation 128-slot (`64` 2-way sets) visited set for `populatePtrWordMask` over ZST and composite DAGs.
+const PtrWordMaskVisited = struct {
+    /// Validity bitset for the 128 slots (`16` bytes zeroed at init).
+    has_bits: [2]u64 = @splat(0),
+    /// Exact `TypeId.toU32()` keys for visited slots.
+    type_raws: [128]u32 = undefined,
+    /// Exact `byte_base` offsets (`< ptr_size * 32 <= 256`) for visited slots.
+    byte_bases: [128]u64 = undefined,
+    /// Exact recursion depths for visited slots.
+    depths: [128]u16 = undefined,
+
+    /// Returns `true` if slot `slot_idx` holds a valid entry.
+    inline fn hasSlot(self: *const PtrWordMaskVisited, slot_idx: u7) bool {
+        const word_idx: usize = slot_idx >> 6;
+        const bit_pos: u6 = @truncate(slot_idx);
+        return (self.has_bits[word_idx] & (@as(u64, 1) << bit_pos)) != 0;
+    }
+
+    /// Marks slot `slot_idx` valid.
+    inline fn setSlot(self: *PtrWordMaskVisited, slot_idx: u7) void {
+        const word_idx: usize = slot_idx >> 6;
+        const bit_pos: u6 = @truncate(slot_idx);
+        self.has_bits[word_idx] |= (@as(u64, 1) << bit_pos);
+    }
+
+    /// Computes the 2-way set base index (`0, 2, …, 126`) for `(type_raw, byte_base, depth_u16)`.
+    inline fn computeSetBase(type_raw: u32, byte_base: u64, depth_u16: u16) u7 {
+        const base_u32: u32 = @truncate(byte_base);
+        var mix: u32 = (type_raw *% 0x9E37_79B1) ^
+            (base_u32 *% 0xC2B2_AE35) ^
+            (@as(u32, depth_u16) *% 0x85EB_CA6B);
+        mix ^= mix >> 16;
+        mix *%= 0x7FEB_352D;
+        mix ^= mix >> 15;
+        return @as(u7, @truncate(mix)) & 0x7E;
+    }
+
+    /// Returns `true` if `(type_raw, byte_base, depth)` has already been visited.
+    inline fn hasVisited(self: *const PtrWordMaskVisited, type_raw: u32, byte_base: u64, depth: u32) bool {
+        const depth_u16: u16 = @intCast(depth);
+        const base_slot = computeSetBase(type_raw, byte_base, depth_u16);
+        if (self.hasSlot(base_slot) and
+            self.type_raws[base_slot] == type_raw and
+            self.byte_bases[base_slot] == byte_base and
+            self.depths[base_slot] == depth_u16)
+        {
+            return true;
+        }
+        const second_slot = base_slot | 1;
+        return self.hasSlot(second_slot) and
+            self.type_raws[second_slot] == type_raw and
+            self.byte_bases[second_slot] == byte_base and
+            self.depths[second_slot] == depth_u16;
+    }
+
+    /// Marks `(type_raw, byte_base, depth)` as visited using `depth & 1` parity selection.
+    inline fn recordVisited(self: *PtrWordMaskVisited, type_raw: u32, byte_base: u64, depth: u32) void {
+        const depth_u16: u16 = @intCast(depth);
+        const base_slot = computeSetBase(type_raw, byte_base, depth_u16);
+        const second_slot = base_slot | 1;
+        const parity_way: u7 = @intCast(depth & 1);
+        const parity_slot = base_slot | parity_way;
+        const alt_slot = base_slot | (parity_way ^ 1);
+        const slot_idx: u7 = if (self.hasSlot(base_slot) and
+            self.type_raws[base_slot] == type_raw and
+            self.byte_bases[base_slot] == byte_base and
+            self.depths[base_slot] == depth_u16)
+            base_slot
+        else if (self.hasSlot(second_slot) and
+            self.type_raws[second_slot] == type_raw and
+            self.byte_bases[second_slot] == byte_base and
+            self.depths[second_slot] == depth_u16)
+            second_slot
+        else if (!self.hasSlot(parity_slot))
+            parity_slot
+        else if (!self.hasSlot(alt_slot))
+            alt_slot
+        else
+            parity_slot;
+        self.type_raws[slot_idx] = type_raw;
+        self.byte_bases[slot_idx] = byte_base;
+        self.depths[slot_idx] = depth_u16;
+        self.setSlot(slot_idx);
+    }
+};
+
+/// Zero-allocation 128-slot (`64` 2-way sets) stack memo for `substituteMirType` over generic DAGs.
+const SubstituteMirTypeMemo = struct {
+    /// Validity bitset for the 128 slots (`16` bytes zeroed at init).
+    has_bits: [2]u64 = @splat(0),
+    /// Exact `TypeId.toU32()` keys for populated slots.
+    type_raws: [128]u32 = undefined,
+    /// Exact recursion depths for populated slots.
+    depths: [128]u16 = undefined,
+    /// Substituted `TypeId` values for populated slots.
+    vals: [128]TypeId = undefined,
+
+    /// Returns `true` if slot `slot_idx` holds a valid entry.
+    inline fn hasSlot(self: *const SubstituteMirTypeMemo, slot_idx: u7) bool {
+        const word_idx: usize = slot_idx >> 6;
+        const bit_pos: u6 = @truncate(slot_idx);
+        return (self.has_bits[word_idx] & (@as(u64, 1) << bit_pos)) != 0;
+    }
+
+    /// Marks slot `slot_idx` valid.
+    inline fn setSlot(self: *SubstituteMirTypeMemo, slot_idx: u7) void {
+        const word_idx: usize = slot_idx >> 6;
+        const bit_pos: u6 = @truncate(slot_idx);
+        self.has_bits[word_idx] |= (@as(u64, 1) << bit_pos);
+    }
+
+    /// Computes the 2-way set base index (`0, 2, …, 126`) for `(type_raw, depth_u16)`.
+    inline fn computeSetBase(type_raw: u32, depth_u16: u16) u7 {
+        var mix: u32 = (type_raw *% 0x9E37_79B1) ^ (@as(u32, depth_u16) *% 0x85EB_CA6B);
+        mix ^= mix >> 16;
+        mix *%= 0x7FEB_352D;
+        mix ^= mix >> 15;
+        return @as(u7, @truncate(mix)) & 0x7E;
+    }
+
+    /// Looks up a cached substituted `TypeId` for `(type_raw, depth)` (`null` on miss).
+    inline fn lookup(self: *const SubstituteMirTypeMemo, type_raw: u32, depth: u32) ?TypeId {
+        const depth_u16: u16 = @intCast(depth);
+        const base_slot = computeSetBase(type_raw, depth_u16);
+        if (self.hasSlot(base_slot) and
+            self.type_raws[base_slot] == type_raw and
+            self.depths[base_slot] == depth_u16)
+        {
+            return self.vals[base_slot];
+        }
+        const second_slot = base_slot | 1;
+        if (self.hasSlot(second_slot) and
+            self.type_raws[second_slot] == type_raw and
+            self.depths[second_slot] == depth_u16)
+        {
+            return self.vals[second_slot];
+        }
+        return null;
+    }
+
+    /// Stores `result_ty` under `(type_raw, depth)` using `depth & 1` parity selection.
+    inline fn store(self: *SubstituteMirTypeMemo, type_raw: u32, depth: u32, result_ty: TypeId) void {
+        const depth_u16: u16 = @intCast(depth);
+        const base_slot = computeSetBase(type_raw, depth_u16);
+        const second_slot = base_slot | 1;
+        const parity_way: u7 = @intCast(depth & 1);
+        const parity_slot = base_slot | parity_way;
+        const alt_slot = base_slot | (parity_way ^ 1);
+        const slot_idx: u7 = if (self.hasSlot(base_slot) and
+            self.type_raws[base_slot] == type_raw and
+            self.depths[base_slot] == depth_u16)
+            base_slot
+        else if (self.hasSlot(second_slot) and
+            self.type_raws[second_slot] == type_raw and
+            self.depths[second_slot] == depth_u16)
+            second_slot
+        else if (!self.hasSlot(parity_slot))
+            parity_slot
+        else if (!self.hasSlot(alt_slot))
+            alt_slot
+        else
+            parity_slot;
+        self.type_raws[slot_idx] = type_raw;
+        self.depths[slot_idx] = depth_u16;
+        self.vals[slot_idx] = result_ty;
+        self.setSlot(slot_idx);
+    }
+};
+
+// --------------------------------------- CONSTS ----------------------------------------
+
+/// Hard cap on generic specialization nesting depth (`DR-13` §5.1, `E0508`).
+pub const MAX_MONOMORPH_DEPTH: u32 = 64;
+/// Hard cap on total monomorphized instances per module (`DR-13` §5.1, `E0508`).
+pub const MAX_MONOMORPH_INSTANCES: u32 = 65_536;
+/// Hard cap on specialized `is_async` coroutine instances per module (`E0508`).
+pub const MAX_ASYNC_MONOMORPH_INSTANCES: u32 = 4_096;
+/// Instruction cost budget for explicit `@inline` functions in `R1` (`W0501` when exceeded).
+pub const INLINE_HINT_BUDGET: u32 = 64;
+/// Instruction cost budget for unannotated small helper auto-inlining in `R1`.
+pub const AUTO_INLINE_BUDGET: u32 = 24;
+/// Caller instruction growth ceiling preventing quadratic code blowup during inlining.
+pub const MAX_CALLER_INLINE_INSTS: u32 = 2_048;
+/// Maximum scalar field count for composite local decomposition in `R2` SROA.
+pub const MAX_SROA_COMPOSITE_FIELDS: u32 = 8;
+
+/// Canonical quiet `f64` `NaN` payload matching `mir_vm.CANONICAL_F64_QNAN_BITS`.
+const CANONICAL_F64_QNAN_BITS: u64 = 0x7FF8_0000_0000_0000;
+/// Canonical quiet `f32` `NaN` payload matching `mir_vm.CANONICAL_F32_QNAN_BITS`.
+const CANONICAL_F32_QNAN_BITS: u32 = 0x7FC0_0000;
+
+comptime {
+    // Enforce exact Phase 5 `LayoutShapeKey` cache-density byte-size invariants:
+    std.debug.assert(@sizeOf(AbiPassClass) == 1);
+    std.debug.assert(@sizeOf(NicheKind) == 1);
+    std.debug.assert(@sizeOf(LayoutShapeKey) == 16);
+}
+
+// -------------------------------------- INTERNALS --------------------------------------
+
+// -------- Layout Shape, Semantics & Attribute Helpers ---------
+
+/// Resolves signedness and bit-width of an integer/bool/char/bitfield `TypeId`.
+const OptIntInfo = struct {
+    /// Width in bits (`1..128`).
+    bits: u16,
+    /// `true` if two's-complement signed.
+    is_signed: bool,
+};
+
+/// Returns `OptIntInfo` when `raw_ty` is an integer, `bool`, `char`, `bit_field`, or backed `enum`.
+fn resolveOptIntInfo(
+    pool: *const InternPool,
+    raw_ty: TypeId,
+    target_layout: TargetLayout,
+) ?OptIntInfo {
+    const ty = pool.unwrapUnderlyingType(raw_ty);
+    return switch (ty) {
+        .bool_ty => .{ .bits = 1, .is_signed = false },
+        .i8_ty => .{ .bits = 8, .is_signed = true },
+        .i16_ty => .{ .bits = 16, .is_signed = true },
+        .i32_ty => .{ .bits = 32, .is_signed = true },
+        .i64_ty, .untyped_int_ty => .{ .bits = 64, .is_signed = true },
+        .i128_ty => .{ .bits = 128, .is_signed = true },
+        .isize_ty => .{ .bits = @as(u16, target_layout.ptr_byte_size) * 8, .is_signed = true },
+        .u8_ty => .{ .bits = 8, .is_signed = false },
+        .u16_ty => .{ .bits = 16, .is_signed = false },
+        .u32_ty, .char_ty => .{ .bits = 32, .is_signed = false },
+        .u64_ty => .{ .bits = 64, .is_signed = false },
+        .u128_ty => .{ .bits = 128, .is_signed = false },
+        .usize_ty => .{ .bits = @as(u16, target_layout.ptr_byte_size) * 8, .is_signed = false },
+        else => blk: {
+            const node = pool.getNode(ty);
+            if (node.tag == .bit_field_ty) {
+                break :blk resolveOptIntInfo(pool, TypeId.fromInt(node.lhs), target_layout);
+            }
+            if (node.tag == .enum_ty) {
+                if (pool.getEnumBackingIntType(ty)) |backing_ty| {
+                    break :blk resolveOptIntInfo(pool, backing_ty, target_layout);
+                }
+            }
+            break :blk null;
+        },
+    };
+}
+
+/// Classifies `raw_ty` into an `OpSemanticsTag` so `LayoutShapeKey` deduplication never conflates
+/// signed, unsigned, and IEEE-754 operations.
+fn classifyOpSemantics(
+    pool: *const InternPool,
+    raw_ty: TypeId,
+    target_layout: TargetLayout,
+) OpSemanticsTag {
+    const ty = pool.unwrapUnderlyingType(raw_ty);
+    if (ty == .unit_ty or ty == .never_ty) return .unit_sem;
+    if (ty == .bool_ty) return .bool_sem;
+    if (ty == .f32_ty) return .ieee_f32;
+    if (ty == .f64_ty or ty == .untyped_float_ty) return .ieee_f64;
+    if (ty == .source_loc_ty) return .pointer_or_ref;
+    if (resolveOptIntInfo(pool, ty, target_layout)) |info| {
+        return if (info.is_signed) .signed_int else .unsigned_int;
+    }
+    const node = pool.getNode(ty);
+    return switch (node.tag) {
+        .ref_ty, .mut_ref_ty, .raw_ptr_ty, .fn_ty => .pointer_or_ref,
+        else => .aggregate_bytes,
+    };
+}
 
 /// Computes a recursive 64-bit `Wyhash` digest of `raw_ty`'s layout shape and interior lane/pointee/field
 /// `OpSemanticsTag`s so `.intrinsic_op` (`@simd_*`, `@atomic_*`, wire casts) never conflates `[f32; 4]` with `[i32; 4]`.
@@ -599,92 +768,6 @@ fn computeDeepTypeSemanticsDigestMemo(
     }
     return final_dig;
 }
-
-/// Zero-allocation 128-slot (`64` 2-way sets) visited set for `populatePtrWordMask` over ZST and composite DAGs.
-const PtrWordMaskVisited = struct {
-    /// Validity bitset for the 128 slots (`16` bytes zeroed at init).
-    has_bits: [2]u64 = @splat(0),
-    /// Exact `TypeId.toU32()` keys for visited slots.
-    type_raws: [128]u32 = undefined,
-    /// Exact `byte_base` offsets (`< ptr_size * 32 <= 256`) for visited slots.
-    byte_bases: [128]u64 = undefined,
-    /// Exact recursion depths for visited slots.
-    depths: [128]u16 = undefined,
-
-    /// Returns `true` if slot `slot_idx` holds a valid entry.
-    inline fn hasSlot(self: *const PtrWordMaskVisited, slot_idx: u7) bool {
-        const word_idx: usize = slot_idx >> 6;
-        const bit_pos: u6 = @truncate(slot_idx);
-        return (self.has_bits[word_idx] & (@as(u64, 1) << bit_pos)) != 0;
-    }
-
-    /// Marks slot `slot_idx` valid.
-    inline fn setSlot(self: *PtrWordMaskVisited, slot_idx: u7) void {
-        const word_idx: usize = slot_idx >> 6;
-        const bit_pos: u6 = @truncate(slot_idx);
-        self.has_bits[word_idx] |= (@as(u64, 1) << bit_pos);
-    }
-
-    /// Computes the 2-way set base index (`0, 2, …, 126`) for `(type_raw, byte_base, depth_u16)`.
-    inline fn computeSetBase(type_raw: u32, byte_base: u64, depth_u16: u16) u7 {
-        const base_u32: u32 = @truncate(byte_base);
-        var mix: u32 = (type_raw *% 0x9E37_79B1) ^
-            (base_u32 *% 0xC2B2_AE35) ^
-            (@as(u32, depth_u16) *% 0x85EB_CA6B);
-        mix ^= mix >> 16;
-        mix *%= 0x7FEB_352D;
-        mix ^= mix >> 15;
-        return @as(u7, @truncate(mix)) & 0x7E;
-    }
-
-    /// Returns `true` if `(type_raw, byte_base, depth)` has already been visited.
-    inline fn hasVisited(self: *const PtrWordMaskVisited, type_raw: u32, byte_base: u64, depth: u32) bool {
-        const depth_u16: u16 = @intCast(depth);
-        const base_slot = computeSetBase(type_raw, byte_base, depth_u16);
-        if (self.hasSlot(base_slot) and
-            self.type_raws[base_slot] == type_raw and
-            self.byte_bases[base_slot] == byte_base and
-            self.depths[base_slot] == depth_u16)
-        {
-            return true;
-        }
-        const second_slot = base_slot | 1;
-        return self.hasSlot(second_slot) and
-            self.type_raws[second_slot] == type_raw and
-            self.byte_bases[second_slot] == byte_base and
-            self.depths[second_slot] == depth_u16;
-    }
-
-    /// Marks `(type_raw, byte_base, depth)` as visited using `depth & 1` parity selection.
-    inline fn recordVisited(self: *PtrWordMaskVisited, type_raw: u32, byte_base: u64, depth: u32) void {
-        const depth_u16: u16 = @intCast(depth);
-        const base_slot = computeSetBase(type_raw, byte_base, depth_u16);
-        const second_slot = base_slot | 1;
-        const parity_way: u7 = @intCast(depth & 1);
-        const parity_slot = base_slot | parity_way;
-        const alt_slot = base_slot | (parity_way ^ 1);
-        const slot_idx: u7 = if (self.hasSlot(base_slot) and
-            self.type_raws[base_slot] == type_raw and
-            self.byte_bases[base_slot] == byte_base and
-            self.depths[base_slot] == depth_u16)
-            base_slot
-        else if (self.hasSlot(second_slot) and
-            self.type_raws[second_slot] == type_raw and
-            self.byte_bases[second_slot] == byte_base and
-            self.depths[second_slot] == depth_u16)
-            second_slot
-        else if (!self.hasSlot(parity_slot))
-            parity_slot
-        else if (!self.hasSlot(alt_slot))
-            alt_slot
-        else
-            parity_slot;
-        self.type_raws[slot_idx] = type_raw;
-        self.byte_bases[slot_idx] = byte_base;
-        self.depths[slot_idx] = depth_u16;
-        self.setSlot(slot_idx);
-    }
-};
 
 /// Populates pointer-word bits inside `mask` for words `[0..31]` carrying pointer provenance.
 fn populatePtrWordMask(
@@ -1121,8 +1204,8 @@ fn rebuildPredsAndSweepUnreachable(allocator: std.mem.Allocator, body: *MirBody)
     body.loop_contracts.items.len = lc_write;
 }
 
-///Applies a map `old_val_raw -> new_val_raw` transitively across every SSA value use in `body`
-/// (including `MirProjection.index` via `forEachInstAndProjValueMut`, `[CRITICAL-06]`).
+/// Applies a map `old_val_raw -> new_val_raw` transitively across every SSA value use in `body`
+/// (including `MirProjection.index` via `forEachInstAndProjValueMut`).
 fn applyValueRewriteMap(
     body: *MirBody,
     replacements: *const std.AutoHashMapUnmanaged(u32, u32),
@@ -1199,7 +1282,7 @@ fn spliceDirectCallSite(
     if (callee.is_async or mir_async.hasBodyAsyncOperations(callee)) return;
     if (callee.blocks.items.len == 0 or call_site.args_len != callee.param_count) return;
 
-    // Pre-validate `[CRITICAL-15]` combined `MirPlace` projection depth before mutating `caller`:
+    // Pre-validate combined `MirPlace` projection depth before mutating `caller`:
     for (callee.places.items) |cal_pl| {
         var base_proj_len: usize = 0;
         if (cal_pl.base >= 1 and cal_pl.base <= callee.param_count) {
@@ -1766,7 +1849,7 @@ fn spliceDirectCallSite(
 
 // ----------- Pass `D1`: Mandatory `@inline(always)` -----------
 
-/// $O(1)$ lookup table mapping `DefId` and `SymbolIndex` to their `MirBody` slice index (`[MAJOR-19]`).
+/// $O(1)$ lookup table mapping `DefId` and `SymbolIndex` to their `MirBody` slice index.
 const BodyDefMap = struct {
     /// Hash map from `DefId.asInt()` to first matching `bodies` index.
     def_to_body: std.AutoHashMapUnmanaged(u32, usize) = .empty,
@@ -2777,7 +2860,7 @@ fn extractKnownScalarConst(body: *const MirBody, raw_val: u32) ?MirConst {
 }
 
 /// Pass `D4`: Folds constant `cond_br` / `switch_int` terminators into unconditional `.br`,
-/// detaches untaken `EdgeId`s, and prunes unreachable basic blocks in a single BFS sweep (`[MAJOR-01]`).
+/// detaches untaken `EdgeId`s, and prunes unreachable basic blocks in a single BFS sweep.
 fn runPassD4BranchFoldAndPrune(allocator: std.mem.Allocator, body: *MirBody) !void {
     for (body.blocks.items) |*bb| {
         switch (bb.terminator.kind) {
@@ -3141,89 +3224,6 @@ fn unifyTemplateTypeBinding(
     }
 }
 
-/// Zero-allocation 128-slot (`64` 2-way sets) stack memo for `substituteMirType` over generic DAGs.
-const SubstituteMirTypeMemo = struct {
-    /// Validity bitset for the 128 slots (`16` bytes zeroed at init).
-    has_bits: [2]u64 = @splat(0),
-    /// Exact `TypeId.toU32()` keys for populated slots.
-    type_raws: [128]u32 = undefined,
-    /// Exact recursion depths for populated slots.
-    depths: [128]u16 = undefined,
-    /// Substituted `TypeId` values for populated slots.
-    vals: [128]TypeId = undefined,
-
-    /// Returns `true` if slot `slot_idx` holds a valid entry.
-    inline fn hasSlot(self: *const SubstituteMirTypeMemo, slot_idx: u7) bool {
-        const word_idx: usize = slot_idx >> 6;
-        const bit_pos: u6 = @truncate(slot_idx);
-        return (self.has_bits[word_idx] & (@as(u64, 1) << bit_pos)) != 0;
-    }
-
-    /// Marks slot `slot_idx` valid.
-    inline fn setSlot(self: *SubstituteMirTypeMemo, slot_idx: u7) void {
-        const word_idx: usize = slot_idx >> 6;
-        const bit_pos: u6 = @truncate(slot_idx);
-        self.has_bits[word_idx] |= (@as(u64, 1) << bit_pos);
-    }
-
-    /// Computes the 2-way set base index (`0, 2, …, 126`) for `(type_raw, depth_u16)`.
-    inline fn computeSetBase(type_raw: u32, depth_u16: u16) u7 {
-        var mix: u32 = (type_raw *% 0x9E37_79B1) ^ (@as(u32, depth_u16) *% 0x85EB_CA6B);
-        mix ^= mix >> 16;
-        mix *%= 0x7FEB_352D;
-        mix ^= mix >> 15;
-        return @as(u7, @truncate(mix)) & 0x7E;
-    }
-
-    /// Looks up a cached substituted `TypeId` for `(type_raw, depth)` (`null` on miss).
-    inline fn lookup(self: *const SubstituteMirTypeMemo, type_raw: u32, depth: u32) ?TypeId {
-        const depth_u16: u16 = @intCast(depth);
-        const base_slot = computeSetBase(type_raw, depth_u16);
-        if (self.hasSlot(base_slot) and
-            self.type_raws[base_slot] == type_raw and
-            self.depths[base_slot] == depth_u16)
-        {
-            return self.vals[base_slot];
-        }
-        const second_slot = base_slot | 1;
-        if (self.hasSlot(second_slot) and
-            self.type_raws[second_slot] == type_raw and
-            self.depths[second_slot] == depth_u16)
-        {
-            return self.vals[second_slot];
-        }
-        return null;
-    }
-
-    /// Stores `result_ty` under `(type_raw, depth)` using `depth & 1` parity selection.
-    inline fn store(self: *SubstituteMirTypeMemo, type_raw: u32, depth: u32, result_ty: TypeId) void {
-        const depth_u16: u16 = @intCast(depth);
-        const base_slot = computeSetBase(type_raw, depth_u16);
-        const second_slot = base_slot | 1;
-        const parity_way: u7 = @intCast(depth & 1);
-        const parity_slot = base_slot | parity_way;
-        const alt_slot = base_slot | (parity_way ^ 1);
-        const slot_idx: u7 = if (self.hasSlot(base_slot) and
-            self.type_raws[base_slot] == type_raw and
-            self.depths[base_slot] == depth_u16)
-            base_slot
-        else if (self.hasSlot(second_slot) and
-            self.type_raws[second_slot] == type_raw and
-            self.depths[second_slot] == depth_u16)
-            second_slot
-        else if (!self.hasSlot(parity_slot))
-            parity_slot
-        else if (!self.hasSlot(alt_slot))
-            alt_slot
-        else
-            parity_slot;
-        self.type_raws[slot_idx] = type_raw;
-        self.depths[slot_idx] = depth_u16;
-        self.vals[slot_idx] = result_ty;
-        self.setSlot(slot_idx);
-    }
-};
-
 /// Substitutes generic/group variables inside `ty` using `subst`, interning new structural types in `pool`.
 fn substituteMirType(
     allocator: std.mem.Allocator,
@@ -3386,7 +3386,7 @@ fn substituteMirTypeMemo(
     return result_ty;
 }
 
-/// Adapts signed/unsigned/float `BinOpKind` after generic / Type-Group substitution (`[CRITICAL-09]`).
+/// Adapts signed/unsigned/float `BinOpKind` after generic / Type-Group substitution.
 fn specializeBinOpForSemantics(kind: BinOpKind, sem: OpSemanticsTag) BinOpKind {
     return switch (sem) {
         .unsigned_int => switch (kind) {
@@ -3439,7 +3439,7 @@ fn specializeBinOpForSemantics(kind: BinOpKind, sem: OpSemanticsTag) BinOpKind {
     };
 }
 
-/// Adapts `UnaryOpKind` after generic / Type-Group substitution (`[CRITICAL-09]`).
+/// Adapts `UnaryOpKind` after generic / Type-Group substitution.
 fn specializeUnaryOpForSemantics(kind: UnaryOpKind, sem: OpSemanticsTag) UnaryOpKind {
     if (sem == .ieee_f32 or sem == .ieee_f64) {
         if (kind == .sneg_checked or kind == .neg_wrap) return .fneg;
@@ -3941,7 +3941,7 @@ fn isCalleeTargetEqual(
 }
 
 /// Computes a 64-bit `Wyhash(0)` digest of all projected field byte offsets, interior field shapes,
-/// folded constants, and resolved callees inside a specialized `MirBody` (`[CRITICAL-09]`, `[CRITICAL-12]`).
+/// folded constants, and resolved callees inside a specialized `MirBody`.
 fn computeFieldOffsetsAndCalleesDigest(
     body: *const MirBody,
     pool: *const InternPool,
@@ -4165,7 +4165,7 @@ const MonoWorkItem = struct {
     is_async_future_make: bool = false,
 };
 
-/// Sound deduplication record for `LayoutShapeKey`-equivalent monomorphizations (`[CRITICAL-09]`, `[CRITICAL-12]`).
+/// Sound deduplication record for `LayoutShapeKey`-equivalent monomorphizations.
 const MonoDedupEntry = struct {
     /// Originating generic template `(DefId, SymbolIndex)` packed 64-bit key.
     template_key: u64,
@@ -4338,7 +4338,7 @@ fn promoteContextlessTarjanScc(
 }
 
 /// Pass `D5`: FIFO worklist monomorphization (`MAX_MONOMORPH_DEPTH = 64`, `MAX_MONOMORPH_INSTANCES = 65,536`),
-/// sound `LayoutShapeKey` deduplication (`[CRITICAL-09]`, `[CRITICAL-12]`), and Tarjan SCC `contextless` promotion.
+/// sound `LayoutShapeKey` deduplication, and Tarjan SCC `contextless` promotion.
 fn runPassD5MonomorphizeAndPromote(
     allocator: std.mem.Allocator,
     in_bodies: *std.ArrayListUnmanaged(MirBody),
@@ -4726,7 +4726,7 @@ fn runPassD5MonomorphizeAndPromote(
             try runPassD3StripGhostInstructions(allocator, &spec);
             try runPassD4BranchFoldAndPrune(allocator, &spec);
 
-            // Compute sound `[CRITICAL-09]` / `[CRITICAL-12]` deduplication signature:
+            // Compute sound monomorphization deduplication signature:
             const p_type_ids = try allocator.alloc(TypeId, ordered_vars.items.len);
             errdefer allocator.free(p_type_ids);
             const p_shapes = try allocator.alloc(LayoutShapeKey, ordered_vars.items.len);
@@ -4755,7 +4755,7 @@ fn runPassD5MonomorphizeAndPromote(
             shape_hasher.update(std.mem.asBytes(&offsets_callees));
             const shape_digest = shape_hasher.final();
 
-            // Check if an existing monomorphization matches all `[CRITICAL-09]` / `[CRITICAL-12]` soundness criteria:
+            // Check if an existing monomorphization matches all soundness criteria:
             var matched_def: ?DefId = null;
             for (dedup_entries.items) |entry| {
                 if (entry.template_key != tmpl_key or entry.param_type_ids.len != p_type_ids.len) {
@@ -5094,7 +5094,7 @@ fn estimateBodyLocalAndSpillBytes(
 }
 
 /// Returns `true` if inlining `callee_body` into `is_async` `caller_body` could push its frame past `16 KiB`.
-fn wouldAsyncInlineExceedFrameCap(
+fn isAsyncInlineExceedingFrameCap(
     caller_body: *const MirBody,
     callee_body: *const MirBody,
     pool: *const InternPool,
@@ -5150,7 +5150,7 @@ fn runPassR1CostModelInliner(
                 const dir = directives[callee_idx];
                 if (dir == .inline_never) continue;
                 if (bodies[callee_idx].is_async or mir_async.hasBodyAsyncOperations(&bodies[callee_idx])) continue;
-                if (bodies[caller_idx].is_async and wouldAsyncInlineExceedFrameCap(
+                if (bodies[caller_idx].is_async and isAsyncInlineExceedingFrameCap(
                     &bodies[caller_idx],
                     &bodies[callee_idx],
                     pool,
@@ -5320,7 +5320,7 @@ fn decomposeSmallCompositeFields(
 }
 
 /// Pass `R2`: Scalar Replacement of Aggregates (`Place`-to-SSA promotion) using
-/// `MirSsaBuilder.initFromExistingBody` (`[MAJOR-01]`).
+/// `MirSsaBuilder.initFromExistingBody`.
 fn runPassR2SroaPromotion(
     allocator: std.mem.Allocator,
     body: *MirBody,
@@ -5454,7 +5454,7 @@ fn runPassR2SroaPromotion(
     );
     defer ssa.deinit();
 
-    // Unseal loop headers (`[CRITICAL-10]`: back-edges `dom.rpo_index[src] >= dom.rpo_index[dst]`)
+    // Unseal loop headers (back-edges `dom.rpo_index[src] >= dom.rpo_index[dst]`)
     // and seal each block only after all reachable predecessors are rewritten in RPO:
     const unvisited_preds = try allocator.alloc(u32, body.blocks.items.len);
     defer allocator.free(unvisited_preds);
@@ -5817,7 +5817,7 @@ fn runPassR3ValueRangeProp(
                                         try ctx.setScopedRange(raw, .{ .min_val = norm, .max_val = norm });
                                     } else if (iv >= 0) {
                                         // Unsigned `128`-bit constants `< 2^127` fit in `[0, maxInt(i128)]`;
-                                        // values `>= 2^127` wrap negative in `i128` (`[CRITICAL-13]`) and stay unconstrained:
+                                        // values `>= 2^127` wrap negative in `i128` and stay unconstrained:
                                         try ctx.setScopedRange(raw, .{ .min_val = iv, .max_val = iv });
                                     }
                                 }
@@ -6664,7 +6664,7 @@ fn runPassR4SccpSwitchFusionAndGvn(
 
 // -------- Pass `R5`: Projection-Aware DCE & CFG Merge ---------
 
-/// Marks all dynamic `ProjKind.index` operands of `place_raw` live on `worklist` (`[CRITICAL-06]`).
+/// Marks all dynamic `ProjKind.index` operands of `place_raw` live on `worklist`.
 fn markPlaceIndicesLive(
     allocator: std.mem.Allocator,
     body: *const MirBody,
@@ -6694,7 +6694,7 @@ inline fn markSsaValLive(
     }
 }
 
-/// Eliminates dead side-effect-free non-trapping instructions across reachable blocks (`[CRITICAL-06]`).
+/// Eliminates dead side-effect-free non-trapping instructions across reachable blocks.
 fn eliminateDeadSsaInstructions(allocator: std.mem.Allocator, body: *MirBody) !void {
     const inst_total = body.insts.len;
     if (inst_total == 0 or body.blocks.items.len == 0) return;
@@ -6868,8 +6868,8 @@ fn eliminateDeadSsaInstructions(allocator: std.mem.Allocator, body: *MirBody) !v
     body.block_insts = compacted;
 }
 
-/// Pass `R5`: `MirProjection`-aware DCE (`[CRITICAL-06]`), empty-trampoline jump-threading, and
-/// single-predecessor/single-successor block merging respecting Call Continuation Split-Edge (`[CRITICAL-05]`).
+/// Pass `R5`: `MirProjection`-aware DCE, empty-trampoline jump-threading, and
+/// single-predecessor/single-successor block merging respecting Call Continuation Split-Edge.
 fn runPassR5DceJumpThreadAndMerge(allocator: std.mem.Allocator, body: *MirBody) !void {
     if (body.blocks.items.len == 0) return;
 
@@ -6950,7 +6950,7 @@ fn runPassR5DceJumpThreadAndMerge(allocator: std.mem.Allocator, body: *MirBody) 
             const succ_bb = body.blocks.items[succ_i];
             if (succ_bb.pred_len != 1) continue;
 
-            // Bind `succ_bb`'s formal block parameters directly to `br_edge` arguments (`[MAJOR-01]`):
+            // Bind `succ_bb`'s formal block parameters directly to `br_edge` arguments:
             const succ_params = body.getBlockParams(MirBlockId.fromInt(@intCast(succ_i)));
             if (succ_params.len != br_edge.args_len) continue;
             for (succ_params, 0..) |sp, pi| {
@@ -7011,7 +7011,7 @@ fn runPassR5DceJumpThreadAndMerge(allocator: std.mem.Allocator, body: *MirBody) 
 // -------- Pass `R6`: `Wyhash(0)` Structural `MIR` ICF ---------
 
 /// Computes a `Wyhash` digest of a single `MirPlace` including normalized dynamic `.index` SSA operands
-/// and exact composite/variant byte offsets (`[CRITICAL-09]`, `[CRITICAL-11]`).
+/// and exact composite/variant byte offsets.
 fn computeSinglePlaceByteDigest(
     body: *const MirBody,
     place_id: PlaceId,
@@ -7120,7 +7120,7 @@ fn computeSinglePlaceByteDigest(
     return place_hasher.final();
 }
 
-/// Collision-free structural equality predicate for two `MirPlace`s (`[CRITICAL-11]`).
+/// Collision-free structural equality predicate for two `MirPlace`s.
 fn isPlaceStructurallyEqual(
     body_a: *const MirBody,
     place_a_id: PlaceId,
@@ -7825,7 +7825,7 @@ fn computeMirBodyStructuralHashWithInterner(
     return hasher.final();
 }
 
-/// Deterministic collision-free structural comparator guarding `D5` & `R6` ICF (`[CRITICAL-09]`, `[CRITICAL-11]`).
+/// Deterministic collision-free structural comparator guarding `D5` & `R6` ICF.
 pub fn isMirBodyStructurallyEqual(
     allocator: std.mem.Allocator,
     body_a: *const MirBody,
@@ -8405,7 +8405,7 @@ pub fn isMirBodyStructurallyEqual(
 }
 
 /// Pass `R6`: `Wyhash(0)` structural Identical Code Folding (ICF) backed by full deterministic
-/// `isMirBodyStructurallyEqual` (`[CRITICAL-09]`).
+/// `isMirBodyStructurallyEqual`.
 fn runPassR6StructuralIcf(
     allocator: std.mem.Allocator,
     bodies: *std.ArrayListUnmanaged(MirBody),
@@ -9318,7 +9318,7 @@ test "test_mir_opt_r3_u128_top_bit_vrp_and_d2_shift_rhs_type_e0502_without_casca
     const allocator = std.testing.allocator;
     const mir_vm = @import("mir_vm.zig");
 
-    // [1] `[CRITICAL-13]`: `u128` value `>= 2^127` MUST NOT misfold `wide_val < 10` to `true` in `R3` VRP:
+    // [1] `u128` value `>= 2^127` MUST NOT misfold `wide_val < 10` to `true` in `R3` VRP:
     const u128_src =
         \\pub fn check_high_u128(is_top_bit: bool) -> bool {
         \\    var wide_val: u128 = 170141183460469231731687303715884105728;
@@ -9372,7 +9372,7 @@ test "test_mir_opt_r3_u128_top_bit_vrp_and_d2_shift_rhs_type_e0502_without_casca
     const high_out = try vm.evalBody(high_body, &.{.{ .scalar_u64 = 1 }});
     try std.testing.expectEqual(@as(u64, 0), high_out.slot.scalar_u64);
 
-    // [2] `[CRITICAL-14]`: `foldConstBinOp` uses `rhs_ty` (`1_i8 << 256_u32` and `1_u8 << -256_i32` trap `E0502`):
+    // [2] `foldConstBinOp` uses `rhs_ty` (`1_i8 << 256_u32` and `1_u8 << -256_i32` trap `E0502`):
     var pool = try InternPool.init(allocator);
     defer pool.deinit();
     const shl_u32_fold = foldConstBinOp(
@@ -9399,7 +9399,7 @@ test "test_mir_opt_r3_u128_top_bit_vrp_and_d2_shift_rhs_type_e0502_without_casca
     );
     try std.testing.expect(shl_neg_i32_fold == .trap_overflow);
 
-    // [3] `[MAJOR-16]`: `10_i8 / (127_i8 + 1_i8)` emits `E0502` once without cascading bogus `E0507`:
+    // [3] `10_i8 / (127_i8 + 1_i8)` emits `E0502` once without cascading bogus `E0507`:
     const cascade_src =
         \\pub fn overflow_then_div() -> i8 {
         \\    let max_byte: i8 = 127;
@@ -10001,10 +10001,10 @@ test "test_mir_opt_d5_asyncmono_specializes_sync_callees_size_of_and_rejects_pol
         \\}
         \\
         \\pub fn run_async_mono() -> usize {
-        \\    let a = block_on(generic_async(7_u16));
-        \\    let b = block_on(generic_async(7_u16));
-        \\    let c = block_on(generic_async(99_u64));
-        \\    return a + b + c;
+        \\    let val_a = block_on(generic_async(7_u16));
+        \\    let val_b = block_on(generic_async(7_u16));
+        \\    let val_c = block_on(generic_async(99_u64));
+        \\    return val_a + val_b + val_c;
         \\}
     ;
     var pos_bundle = try mir.lowerSourceToMir(allocator, .fromInt(910), pos_src, TargetLayout.NATIVE_64, .{});

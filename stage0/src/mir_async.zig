@@ -121,17 +121,6 @@ pub const ClosureEnvSlot = extern struct {
     align_bytes: u32,
 };
 
-comptime {
-    std.debug.assert(@sizeOf(SuspendPointMeta) == 24);
-    std.debug.assert(@alignOf(SuspendPointMeta) == 4);
-    std.debug.assert(@sizeOf(CoroLocalSlot) == 16);
-    std.debug.assert(@alignOf(CoroLocalSlot) == 4);
-    std.debug.assert(@sizeOf(CoroFrameLayout) == 16);
-    std.debug.assert(@alignOf(CoroFrameLayout) == 4);
-    std.debug.assert(@sizeOf(ClosureEnvSlot) == 16);
-    std.debug.assert(@alignOf(ClosureEnvSlot) == 4);
-}
-
 /// Complete lowered state-machine & frame-coloring plan for a single `MirBody`.
 pub const AsyncBodyPlan = struct {
     /// Zero-based index of this body in `module.bodies`.
@@ -290,6 +279,24 @@ const CalleeBodyIndexMap = struct {
     }
 };
 
+/// Unplaced 2-word `@local` closure environment capture buffer discovered during block scanning.
+const RawClosureEnv = struct {
+    /// `MirValueId` raw index of the `closure_make` instruction.
+    inst_val_id: u32,
+    /// Total byte size of captured values (`> 0`).
+    byte_size: u32,
+    /// Required byte alignment of the environment buffer.
+    align_bytes: u32,
+};
+
+/// Half-open coroutine frame byte range `[start .. end)` occupied by an interfering local.
+const Interval = struct {
+    /// Inclusive starting frame byte offset.
+    start: u32,
+    /// Exclusive ending frame byte offset.
+    end: u32,
+};
+
 // --------------------------------------- CONSTS ----------------------------------------
 
 /// Maximum inline stackless coroutine frame subtree size (`16 KiB`, `DR-08` §2.3, `E0317`).
@@ -302,7 +309,7 @@ pub const CORO_CTX_SLOT_COUNT: u32 = type_system.ContextFieldLayout.CANONICAL_FI
 const FIRST_ASYNC_INTRINSIC: u16 = @backingInt(MirIntrinsicKind.async_future_make);
 /// Last async `MirIntrinsicKind` backing integer (`async_block_on = 51`).
 const LAST_ASYNC_INTRINSIC: u16 = @backingInt(MirIntrinsicKind.async_block_on);
-/// Maximum call-chain depth when tracing `Future` returns through synchronous forwarding wrappers (`[MAJOR-03]`).
+/// Maximum call-chain depth when tracing `Future` returns through synchronous forwarding wrappers.
 const MAX_SYNC_WRAPPER_DEPTH: u8 = 8;
 
 // -------------------------------------- INTERNALS --------------------------------------
@@ -317,26 +324,21 @@ inline fn alignUpU32(value: u32, align_bytes: u32) u32 {
 
 /// Returns `true` when bit `bit_idx` is set inside a `u64`-word bitset row.
 inline fn isBitSet(words: []const u64, bit_idx: usize) bool {
-    const word_idx = bit_idx >> 6;
-    const shift: u6 = @truncate(bit_idx);
-    return (words[word_idx] & (@as(u64, 1) << shift)) != 0;
+    return (words[bit_idx >> 6] & (@as(u64, 1) << @as(u6, @truncate(bit_idx)))) != 0;
 }
 
 /// Sets bit `bit_idx` inside a `u64`-word bitset row and returns `true` if newly set.
 inline fn setBit(words: []u64, bit_idx: usize) bool {
-    const word_idx = bit_idx >> 6;
-    const shift: u6 = @truncate(bit_idx);
-    const mask = @as(u64, 1) << shift;
-    const is_new = (words[word_idx] & mask) == 0;
-    words[word_idx] |= mask;
-    return is_new;
+    const word_ptr = &words[bit_idx >> 6];
+    const mask = @as(u64, 1) << @as(u6, @truncate(bit_idx));
+    if ((word_ptr.* & mask) != 0) return false;
+    word_ptr.* |= mask;
+    return true;
 }
 
 /// Clears bit `bit_idx` inside a `u64`-word bitset row.
 inline fn clearBit(words: []u64, bit_idx: usize) void {
-    const word_idx = bit_idx >> 6;
-    const shift: u6 = @truncate(bit_idx);
-    words[word_idx] &= ~(@as(u64, 1) << shift);
+    words[bit_idx >> 6] &= ~(@as(u64, 1) << @as(u6, @truncate(bit_idx)));
 }
 
 /// Computes the storage byte size and alignment of `loc_decl` inside a coroutine frame.
@@ -352,10 +354,10 @@ fn computeLocalFrameSizeAndAlign(
             .align_bytes = target_layout.ptrAlignBytes(),
         };
     }
-    const lay = type_system.computeTypeLayoutWithPool(pool, sym_table, loc_decl.type_id, target_layout);
+    const type_layout = type_system.computeTypeLayoutWithPool(pool, sym_table, loc_decl.type_id, target_layout);
     return .{
-        .byte_size = @intCast(@min(lay.byte_size, ASYNC_INLINE_FRAME_CAP_BYTES * 2)),
-        .align_bytes = @max(lay.align_bytes, 1),
+        .byte_size = @intCast(@min(type_layout.byte_size, ASYNC_INLINE_FRAME_CAP_BYTES * 2)),
+        .align_bytes = @max(type_layout.align_bytes, 1),
     };
 }
 
@@ -366,12 +368,12 @@ fn markIfCrossBlockUse(
     val_raw: u32,
     bb_idx: u32,
     def_bb_of_val: []const u32,
-    needs_demote: []bool,
+    is_demote_needed: []bool,
 ) void {
     if (val_raw >= def_bb_of_val.len) return;
     const def_bb = def_bb_of_val[val_raw];
     if (def_bb != mir.NONE_U32 and def_bb != bb_idx) {
-        needs_demote[val_raw] = true;
+        is_demote_needed[val_raw] = true;
     }
 }
 
@@ -381,12 +383,12 @@ fn scanPlaceIndexUses(
     place_id: PlaceId,
     bb_idx: u32,
     def_bb_of_val: []const u32,
-    needs_demote: []bool,
+    is_demote_needed: []bool,
 ) void {
     if (place_id.isNone() or place_id.asInt() >= body.places.items.len) return;
     for (body.getPlaceProjections(place_id)) |proj| {
         if (proj.kind == .index) {
-            markIfCrossBlockUse(proj.payload, bb_idx, def_bb_of_val, needs_demote);
+            markIfCrossBlockUse(proj.payload, bb_idx, def_bb_of_val, is_demote_needed);
         }
     }
 }
@@ -497,8 +499,7 @@ fn reloadOrRematValueInBlock(
     }
 
     // [2] Rematerialize zero-sized values (`unit`, empty tuple/struct/array) without frame loads:
-    const lay = type_system.computeTypeLayoutWithPool(pool, sym_table, orig_inst.type_id, body.target_layout);
-    if (lay.byte_size == 0) {
+    if (type_system.computeTypeLayoutWithPool(pool, sym_table, orig_inst.type_id, body.target_layout).byte_size == 0) {
         const unit_c_idx: u32 = @intCast(body.consts.items.len);
         try body.consts.append(body.allocator, .unit_val);
         const zst_vid = try appendSynthInstToList(body, emit_list, .{
@@ -593,8 +594,7 @@ fn applyBackwardInstLiveness(
             }
         },
         .intrinsic_op => {
-            const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
-            if (ikind.hasPlaceInLhs()) {
+            if (@as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)).hasPlaceInLhs()) {
                 const pid = PlaceId.fromInt(inst.operands.lhs);
                 if (!pid.isNone() and pid.asInt() < body.places.items.len) {
                     const base_loc = body.places.items[pid.asInt()].base;
@@ -623,8 +623,7 @@ fn addConflictsWithLiveSet(
         row_slice[word_i] |= word_bits;
         var rem_bits = word_bits;
         while (rem_bits != 0) {
-            const bit_off: usize = @ctz(rem_bits);
-            const other_loc = (word_i << 6) + bit_off;
+            const other_loc = (word_i << 6) + @as(usize, @ctz(rem_bits));
             _ = setBit(conflict_matrix[other_loc * words_per_row .. (other_loc + 1) * words_per_row], loc_usize);
             rem_bits &= rem_bits - 1;
         }
@@ -643,8 +642,7 @@ fn appendUniqueAsyncCallee(
     callee_idx: u32,
 ) !void {
     if (callee_idx >= bodies.len or !bodies[callee_idx].is_async) return;
-    const gop = try seen_callees.getOrPut(allocator, callee_idx);
-    if (!gop.found_existing) {
+    if (!(try seen_callees.getOrPut(allocator, callee_idx)).found_existing) {
         try callee_list.append(allocator, callee_idx);
     }
 }
@@ -709,13 +707,14 @@ fn traceAwaitedValueToAsyncCallees(
     var step_count: usize = 0;
     while (worklist.pop()) |val_raw| {
         if (val_raw >= cur_body.insts.len or step_count >= 64) continue;
-        const gop = try visited.getOrPut(allocator, val_raw);
-        if (gop.found_existing) continue;
+        if ((try visited.getOrPut(allocator, val_raw)).found_existing) continue;
         step_count += 1;
 
         const inst = cur_body.insts.get(val_raw);
-        const val_fut_ty = pool.unwrapUnderlyingType(inst.type_id);
-        if (resolveFutureProducerBodyIndex(callee_map, pool.getFutureProducerId(val_fut_ty))) |prod_b_idx| {
+        if (resolveFutureProducerBodyIndex(
+            callee_map,
+            pool.getFutureProducerId(pool.unwrapUnderlyingType(inst.type_id)),
+        )) |prod_b_idx| {
             try appendUniqueAsyncCallee(allocator, bodies, callee_list, seen_callees, prod_b_idx);
         }
 
@@ -865,8 +864,10 @@ fn collectAwaitedCalleesForBody(
                 &callee_list,
                 &seen_callees,
             );
-            const fut_ty = pool.unwrapUnderlyingType(body.insts.get(blk_rec.terminator.cond_or_val).type_id);
-            if (resolveFutureProducerBodyIndex(callee_map, pool.getFutureProducerId(fut_ty))) |b_idx| {
+            if (resolveFutureProducerBodyIndex(
+                callee_map,
+                pool.getFutureProducerId(pool.unwrapUnderlyingType(body.insts.get(blk_rec.terminator.cond_or_val).type_id)),
+            )) |b_idx| {
                 try appendUniqueAsyncCallee(allocator, bodies, &callee_list, &seen_callees, b_idx);
             }
         }
@@ -897,8 +898,7 @@ fn computeSubtreeFrameBytesDfs(
         if (sub_bytes > max_callee_subtree) max_callee_subtree = sub_bytes;
     }
 
-    const base_child_fut_bytes = plans[body_idx].frame_layout.max_child_bytes;
-    const effective_child = @max(base_child_fut_bytes, max_callee_subtree);
+    const effective_child = @max(plans[body_idx].frame_layout.max_child_bytes, max_callee_subtree);
     const own_prefix = plans[body_idx].frame_layout.header_bytes + plans[body_idx].frame_layout.colored_locals_bytes;
     const total_sub = alignUpU32(own_prefix +| effective_child, plans[body_idx].frame_align);
     if (total_sub > ASYNC_INLINE_FRAME_CAP_BYTES or plans[body_idx].has_unboxed_recursion) {
@@ -940,9 +940,9 @@ pub fn demoteCrossSuspendSsaValues(
     }
 
     // [1] Identify every SSA value referenced outside its defining basic block:
-    const needs_demote = try allocator.alloc(bool, orig_inst_len);
-    defer allocator.free(needs_demote);
-    @memset(needs_demote, false);
+    const is_demote_needed = try allocator.alloc(bool, orig_inst_len);
+    defer allocator.free(is_demote_needed);
+    @memset(is_demote_needed, false);
 
     for (body.blocks.items, 0..) |blk_rec, bb_i| {
         const bb_u32: u32 = @intCast(bb_i);
@@ -952,10 +952,10 @@ pub fn demoteCrossSuspendSsaValues(
             switch (inst.op) {
                 .block_param, .const_scalar, .fn_addr => {},
                 .ghost_access_let, .ghost_access_inout, .ghost_access_set => {
-                    scanPlaceIndexUses(body, PlaceId.fromInt(inst.operands.lhs), bb_u32, def_bb_of_val, needs_demote);
+                    scanPlaceIndexUses(body, PlaceId.fromInt(inst.operands.lhs), bb_u32, def_bb_of_val, is_demote_needed);
                 },
                 .ghost_access_end => {
-                    markIfCrossBlockUse(inst.operands.lhs, bb_u32, def_bb_of_val, needs_demote);
+                    markIfCrossBlockUse(inst.operands.lhs, bb_u32, def_bb_of_val, is_demote_needed);
                 },
                 .ghost_storage_init, .ghost_storage_deinit => {},
                 .ghost_storage_move,
@@ -965,23 +965,23 @@ pub fn demoteCrossSuspendSsaValues(
                 .place_addr,
                 .soa_column_slice,
                 => {
-                    scanPlaceIndexUses(body, PlaceId.fromInt(inst.operands.lhs), bb_u32, def_bb_of_val, needs_demote);
+                    scanPlaceIndexUses(body, PlaceId.fromInt(inst.operands.lhs), bb_u32, def_bb_of_val, is_demote_needed);
                 },
                 .place_store => {
-                    scanPlaceIndexUses(body, PlaceId.fromInt(inst.operands.lhs), bb_u32, def_bb_of_val, needs_demote);
-                    markIfCrossBlockUse(inst.operands.rhs, bb_u32, def_bb_of_val, needs_demote);
+                    scanPlaceIndexUses(body, PlaceId.fromInt(inst.operands.lhs), bb_u32, def_bb_of_val, is_demote_needed);
+                    markIfCrossBlockUse(inst.operands.rhs, bb_u32, def_bb_of_val, is_demote_needed);
                 },
                 .copy_val, .unary_op, .aggregate_extract, .bitfield_extract => {
-                    markIfCrossBlockUse(inst.operands.lhs, bb_u32, def_bb_of_val, needs_demote);
+                    markIfCrossBlockUse(inst.operands.lhs, bb_u32, def_bb_of_val, is_demote_needed);
                 },
                 .bin_op => {
-                    markIfCrossBlockUse(inst.operands.lhs, bb_u32, def_bb_of_val, needs_demote);
-                    markIfCrossBlockUse(inst.operands.rhs, bb_u32, def_bb_of_val, needs_demote);
+                    markIfCrossBlockUse(inst.operands.lhs, bb_u32, def_bb_of_val, is_demote_needed);
+                    markIfCrossBlockUse(inst.operands.rhs, bb_u32, def_bb_of_val, is_demote_needed);
                 },
                 .aggregate_make => {
                     const akind: AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
                     switch (akind) {
-                        .array_repeat => markIfCrossBlockUse(inst.operands.lhs, bb_u32, def_bb_of_val, needs_demote),
+                        .array_repeat => markIfCrossBlockUse(inst.operands.lhs, bb_u32, def_bb_of_val, is_demote_needed),
                         .closure_make => {
                             const cap_len = body.extra_args.items[inst.operands.rhs];
                             for (0..cap_len) |cap_i| {
@@ -989,41 +989,41 @@ pub fn demoteCrossSuspendSsaValues(
                                     body.extra_args.items[inst.operands.rhs + 1 + cap_i],
                                     bb_u32,
                                     def_bb_of_val,
-                                    needs_demote,
+                                    is_demote_needed,
                                 );
                             }
                         },
                         .tagged_variant => {
                             const extra_len = inst.operands.rhs & 0xFFFF;
                             for (body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + extra_len]) |word_val| {
-                                markIfCrossBlockUse(word_val, bb_u32, def_bb_of_val, needs_demote);
+                                markIfCrossBlockUse(word_val, bb_u32, def_bb_of_val, is_demote_needed);
                             }
                         },
                         .tuple_agg, .struct_agg, .array_elems, .str_concat, .fmt_args_make => {
                             for (body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs]) |word_val| {
-                                markIfCrossBlockUse(word_val, bb_u32, def_bb_of_val, needs_demote);
+                                markIfCrossBlockUse(word_val, bb_u32, def_bb_of_val, is_demote_needed);
                             }
                         },
                     }
                 },
                 .aggregate_insert => {
-                    markIfCrossBlockUse(inst.operands.lhs, bb_u32, def_bb_of_val, needs_demote);
-                    markIfCrossBlockUse(body.extra_args.items[inst.operands.rhs + 1], bb_u32, def_bb_of_val, needs_demote);
+                    markIfCrossBlockUse(inst.operands.lhs, bb_u32, def_bb_of_val, is_demote_needed);
+                    markIfCrossBlockUse(body.extra_args.items[inst.operands.rhs + 1], bb_u32, def_bb_of_val, is_demote_needed);
                 },
                 .bitfield_insert => {
-                    markIfCrossBlockUse(body.extra_args.items[inst.operands.lhs], bb_u32, def_bb_of_val, needs_demote);
-                    markIfCrossBlockUse(body.extra_args.items[inst.operands.lhs + 1], bb_u32, def_bb_of_val, needs_demote);
+                    markIfCrossBlockUse(body.extra_args.items[inst.operands.lhs], bb_u32, def_bb_of_val, is_demote_needed);
+                    markIfCrossBlockUse(body.extra_args.items[inst.operands.lhs + 1], bb_u32, def_bb_of_val, is_demote_needed);
                 },
                 .intrinsic_op => {
                     const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
                     if (ikind.hasPlaceInLhs()) {
-                        scanPlaceIndexUses(body, PlaceId.fromInt(inst.operands.lhs), bb_u32, def_bb_of_val, needs_demote);
+                        scanPlaceIndexUses(body, PlaceId.fromInt(inst.operands.lhs), bb_u32, def_bb_of_val, is_demote_needed);
                         if (ikind.hasSsaFlagInRhs()) {
-                            markIfCrossBlockUse(inst.operands.rhs, bb_u32, def_bb_of_val, needs_demote);
+                            markIfCrossBlockUse(inst.operands.rhs, bb_u32, def_bb_of_val, is_demote_needed);
                         }
                     } else if (ikind.hasExtraArgs()) {
                         for (body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs]) |word_val| {
-                            markIfCrossBlockUse(word_val, bb_u32, def_bb_of_val, needs_demote);
+                            markIfCrossBlockUse(word_val, bb_u32, def_bb_of_val, is_demote_needed);
                         }
                     }
                 },
@@ -1034,24 +1034,24 @@ pub fn demoteCrossSuspendSsaValues(
         switch (term.kind) {
             .ret => {
                 if (term.cond_or_val != mir.NONE_U32) {
-                    markIfCrossBlockUse(term.cond_or_val, bb_u32, def_bb_of_val, needs_demote);
+                    markIfCrossBlockUse(term.cond_or_val, bb_u32, def_bb_of_val, is_demote_needed);
                 }
             },
             .cond_br, .switch_int, .coro_suspend => {
-                markIfCrossBlockUse(term.cond_or_val, bb_u32, def_bb_of_val, needs_demote);
+                markIfCrossBlockUse(term.cond_or_val, bb_u32, def_bb_of_val, is_demote_needed);
             },
             .call => {
                 const csite = body.calls.items[term.cond_or_val];
                 if (!csite.callee_val.isNone()) {
-                    markIfCrossBlockUse(csite.callee_val.asInt(), bb_u32, def_bb_of_val, needs_demote);
+                    markIfCrossBlockUse(csite.callee_val.asInt(), bb_u32, def_bb_of_val, is_demote_needed);
                 }
                 for (0..csite.args_len) |arg_i| {
                     const mode = body.call_arg_modes.items[csite.modes_start + arg_i];
                     const word = body.extra_args.items[csite.args_start + arg_i];
                     if (mode == .inout_mode or mode == .set_mode) {
-                        scanPlaceIndexUses(body, PlaceId.fromInt(word), bb_u32, def_bb_of_val, needs_demote);
+                        scanPlaceIndexUses(body, PlaceId.fromInt(word), bb_u32, def_bb_of_val, is_demote_needed);
                     } else {
-                        markIfCrossBlockUse(word, bb_u32, def_bb_of_val, needs_demote);
+                        markIfCrossBlockUse(word, bb_u32, def_bb_of_val, is_demote_needed);
                     }
                 }
             },
@@ -1060,13 +1060,13 @@ pub fn demoteCrossSuspendSsaValues(
         for (0..term.edge_len) |edge_k| {
             const edge = body.extra_edges.items[term.edge_start + edge_k];
             for (0..edge.args_len) |ea_i| {
-                markIfCrossBlockUse(body.extra_args.items[edge.args_start + ea_i], bb_u32, def_bb_of_val, needs_demote);
+                markIfCrossBlockUse(body.extra_args.items[edge.args_start + ea_i], bb_u32, def_bb_of_val, is_demote_needed);
             }
         }
     }
 
     var has_any_demote = false;
-    for (needs_demote) |flag| {
+    for (is_demote_needed) |flag| {
         if (flag) {
             has_any_demote = true;
             break;
@@ -1080,11 +1080,12 @@ pub fn demoteCrossSuspendSsaValues(
     @memset(spill_places, .none);
 
     for (0..orig_inst_len) |val_i| {
-        if (!needs_demote[val_i]) continue;
+        if (!is_demote_needed[val_i]) continue;
         const inst = body.insts.get(val_i);
         if (inst.op.isGhost() or inst.op == .const_scalar or inst.op == .fn_addr) continue;
-        const lay = type_system.computeTypeLayoutWithPool(pool, sym_table, inst.type_id, body.target_layout);
-        if (lay.byte_size == 0) continue;
+        if (type_system.computeTypeLayoutWithPool(pool, sym_table, inst.type_id, body.target_layout).byte_size == 0) {
+            continue;
+        }
 
         const tok = if (val_i < body.origin_tokens.items.len) body.origin_tokens.items[val_i] else TokenIndex.none;
         const spill_lid = LocalId.fromInt(@intCast(body.locals.items.len));
@@ -1305,10 +1306,9 @@ pub fn demoteCrossSuspendSsaValues(
                         &new_block_insts,
                         tok,
                     );
-                    const old_ins = body.extra_args.items[inst.operands.rhs + 1];
                     const new_ins = try reloadOrRematValueInBlock(
                         body,
-                        old_ins,
+                        body.extra_args.items[inst.operands.rhs + 1],
                         bb_u32,
                         def_bb_of_val,
                         spill_places,
@@ -1580,15 +1580,6 @@ pub fn analyzeAsyncBody(
         }
     }
 
-    // Unplaced 2-word `@local` closure environment capture buffer discovered during block scanning:
-    const RawClosureEnv = struct {
-        /// `MirValueId` raw index of the `closure_make` instruction.
-        inst_val_id: u32,
-        /// Total byte size of captured values (`> 0`).
-        byte_size: u32,
-        /// Required byte alignment of the environment buffer.
-        align_bytes: u32,
-    };
     var raw_closure_envs: std.ArrayListUnmanaged(RawClosureEnv) = .empty;
     defer raw_closure_envs.deinit(allocator);
 
@@ -1606,8 +1597,7 @@ pub fn analyzeAsyncBody(
                     if (base_loc < local_count) is_pinned_local[base_loc] = true;
                 }
             } else if (inst.op == .intrinsic_op) {
-                const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
-                if (ikind == .ctx_set and inst.operands.rhs >= 1) {
+                if (@as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)) == .ctx_set and inst.operands.rhs >= 1) {
                     if (extractConstU32(body, body.extra_args.items[inst.operands.lhs])) |slot_ord| {
                         if (slot_ord < CORO_CTX_SLOT_COUNT) {
                             ctx_override_mask |= @as(u16, 1) << @intCast(slot_ord);
@@ -1617,9 +1607,7 @@ pub fn analyzeAsyncBody(
             } else if (inst.op == .aggregate_make and
                 @as(AggregateKind, @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))))) == .closure_make)
             {
-                const clos_ty = pool.unwrapUnderlyingType(inst.type_id);
-                const sig_view = pool.getFnSignatureView(clos_ty);
-                const is_three_word = if (sig_view) |sv|
+                const is_three_word = if (pool.getFnSignatureView(pool.unwrapUnderlyingType(inst.type_id))) |sv|
                     (sv.capture_tier != .copy_tier or sv.has_linear_capture)
                 else
                     false;
@@ -1628,11 +1616,10 @@ pub fn analyzeAsyncBody(
                     var env_sz: u32 = 0;
                     var env_al: u32 = ptr_align;
                     for (0..cap_len) |cap_i| {
-                        const cap_vid = MirValueId.fromInt(body.extra_args.items[inst.operands.rhs + 1 + cap_i]);
                         const cap_lay = type_system.computeTypeLayoutWithPool(
                             pool,
                             sym_table,
-                            body.insts.get(cap_vid.asInt()).type_id,
+                            body.insts.get(body.extra_args.items[inst.operands.rhs + 1 + cap_i]).type_id,
                             target_layout,
                         );
                         if (cap_lay.byte_size == 0) continue;
@@ -1847,7 +1834,7 @@ pub fn analyzeAsyncBody(
     }
     std.mem.sort(ColorCandidate, candidates.items, {}, compareColorCandidate);
 
-    // Pin every `is_pinned_local` against all other non-ZST locals (`[CRITICAL-01]`):
+    // Pin every `is_pinned_local` against all other non-ZST locals:
     for (candidates.items, 0..) |cand_a, idx_a| {
         for (candidates.items[idx_a + 1 ..]) |cand_b| {
             if (is_pinned_local[cand_a.local_id] or is_pinned_local[cand_b.local_id]) {
@@ -1870,13 +1857,6 @@ pub fn analyzeAsyncBody(
     defer allocator.free(is_placed);
     @memset(is_placed, false);
 
-    // Half-open coroutine frame byte range `[start .. end)` occupied by an interfering local:
-    const Interval = struct {
-        /// Inclusive starting frame byte offset.
-        start: u32,
-        /// Exclusive ending frame byte offset.
-        end: u32,
-    };
     var forbidden: std.ArrayListUnmanaged(Interval) = .empty;
     defer forbidden.deinit(allocator);
 
@@ -2099,7 +2079,19 @@ pub fn prepareAndAnalyzeAsyncModule(
 
 // ---------------------------------------- MAIN -----------------------------------------
 
-test "Phase 8 Wave 3C-2 mir_async sequential await liveness coloring reuses frame slots" {
+// Enforce binary coroutine metadata byte sizes and alignments at compile time:
+comptime {
+    std.debug.assert(@sizeOf(SuspendPointMeta) == 24);
+    std.debug.assert(@alignOf(SuspendPointMeta) == 4);
+    std.debug.assert(@sizeOf(CoroLocalSlot) == 16);
+    std.debug.assert(@alignOf(CoroLocalSlot) == 4);
+    std.debug.assert(@sizeOf(CoroFrameLayout) == 16);
+    std.debug.assert(@alignOf(CoroFrameLayout) == 4);
+    std.debug.assert(@sizeOf(ClosureEnvSlot) == 16);
+    std.debug.assert(@alignOf(ClosureEnvSlot) == 4);
+}
+
+test "test_mir_async_sequential_await_liveness_coloring_reuses_frame_slots" {
     const allocator = std.testing.allocator;
     var interner = try mem_foundation.StringInterner.init(allocator);
     defer interner.deinit();
@@ -2298,7 +2290,7 @@ test "Phase 8 Wave 3C-2 mir_async sequential await liveness coloring reuses fram
     try std.testing.expectEqual(@as(usize, 0), sync_mod.body_plans.len);
 }
 
-test "Phase 8 Wave 3C-2 mir_async E0317 rejects > 16 KiB inline frames and unboxed recursion" {
+test "test_mir_async_e0317_rejects_oversized_inline_frames_and_unboxed_recursion" {
     const allocator = std.testing.allocator;
     var interner = try mem_foundation.StringInterner.init(allocator);
     defer interner.deinit();

@@ -5,10 +5,9 @@
 //! - Byte-for-byte deterministic LLVM 20–23 opaque-pointer (`ptr`) `.ll` IR across all 7 targets,
 //!   `nounwind uwtable(sync)` on native (`nounwind` on `wasm32`), zero C++ LSDA, and DWARF v5
 //!   `LineTablesOnly` metadata.
-//! - Two-pass `PHINode` creation + synthetic `_bb_edge_<idx>` duplicate-predecessor trampolines
-//!   (`[CRITICAL-05]`).
+//! - Two-pass `PHINode` creation + synthetic `_bb_edge_<idx>` duplicate-predecessor trampolines.
 //! - `cx_result_cc` (`swiftcc` + bare `ptr swifterror %_cx_err_slot`, `Err(0)` `tagged_int56`,
-//!   `zst_err`, `PackedOk`, `[CRITICAL-06]`).
+//!   `zst_err`, and `PackedOk`).
 //! - MVS `noalias` parameter attributes + function-entry hoisted `@llvm.experimental.noalias.scope.decl`
 //!   (`DR-09` §4.1 – never inside loop blocks!).
 //! - Pentagon `!range` + `!noundef`, `@llvm.assume` `"nonnull"`/`"align"`, `#soa` + `@must_vectorize`
@@ -255,7 +254,7 @@ test "test_codegen_llvm_determinism_swifterror_mvs_hoist_pentagon_and_7_targets"
             try std.testing.expect(std.mem.indexOf(u8, run_1.emitted_text, "uwtable") == null);
             try std.testing.expect(std.mem.indexOf(u8, run_1.emitted_text, "swifterror") == null);
         } else {
-            // [2] Native `cx_result_cc`: `swiftcc` + bare `ptr swifterror %_cx_err_slot` (`[CRITICAL-06]`):
+            // [2] Native `cx_result_cc`: `swiftcc` + bare `ptr swifterror %_cx_err_slot`:
             try std.testing.expect(std.mem.indexOf(u8, run_1.emitted_text, "nounwind uwtable(sync)") != null);
             try std.testing.expect(std.mem.indexOf(u8, run_1.emitted_text, "swiftcc ") != null);
             try std.testing.expect(std.mem.indexOf(u8, run_1.emitted_text, "ptr swifterror %_cx_err_slot") != null);
@@ -794,7 +793,7 @@ test "test_regression_codegen_llvm_wasi_import_module_extern_dedup_and_quoted_id
         countSubstrings(ir_art.emitted_text, "\"wasm-import-module\"=\"wasi_snapshot_preview1\""),
     );
     try std.testing.expect(std.mem.indexOf(u8, ir_art.emitted_text, "@\"custom$sym-name\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ir_art.emitted_text, "c\"DbgTag\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ir_art.emitted_text, "c\"DbgTag\\00\"") != null);
 
     const wasm_obj = ".zig-cache/test_tier_b_wasi_dedup.o";
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, wasm_obj) catch {};

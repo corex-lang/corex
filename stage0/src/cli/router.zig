@@ -181,8 +181,11 @@ pub const OutputFormat = enum(u8) {
 
     /// Parses `"c"` or `"llvm"` into an `OutputFormat`.
     pub fn parse(raw_format: []const u8) ?OutputFormat {
-        if (std.mem.eql(u8, raw_format, "c")) return .c;
-        if (std.mem.eql(u8, raw_format, "llvm")) return .llvm;
+        if (std.mem.eql(u8, raw_format, "c")) {
+            return .c;
+        } else if (std.mem.eql(u8, raw_format, "llvm")) {
+            return .llvm;
+        }
         return null;
     }
 };
@@ -1571,17 +1574,25 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                 has_help_flag = true;
             } else if (std.mem.eql(u8, arg_text, "-V") or std.mem.eql(u8, arg_text, "--version")) {
                 has_version_flag = true;
-            } else if (selected_subcommand == .fmt and matchFmtFlag(arg_text) != null) {
-                switch (matchFmtFlag(arg_text).?) {
-                    .check => is_check_only = true,
-                    .fix => is_fix_mode = true,
-                    .internal_core => is_internal_core = true,
+            } else if (selected_subcommand == .fmt and blk_fmt: {
+                if (matchFmtFlag(arg_text)) |fmt_flag| {
+                    switch (fmt_flag) {
+                        .check => is_check_only = true,
+                        .fix => is_fix_mode = true,
+                        .internal_core => is_internal_core = true,
+                    }
+                    break :blk_fmt true;
                 }
-            } else if (selected_subcommand == .upgrade and matchUpgradeFlag(arg_text) != null) {
-                switch (matchUpgradeFlag(arg_text).?) {
-                    .internal_core => is_internal_core = true,
+                break :blk_fmt false;
+            }) {} else if (selected_subcommand == .upgrade and blk_upg: {
+                if (matchUpgradeFlag(arg_text)) |upg_flag| {
+                    switch (upg_flag) {
+                        .internal_core => is_internal_core = true,
+                    }
+                    break :blk_upg true;
                 }
-            } else if (is_compile_sub and std.mem.eql(u8, arg_text, "--dev")) {
+                break :blk_upg false;
+            }) {} else if (is_compile_sub and std.mem.eql(u8, arg_text, "--dev")) {
                 if (has_seen_release) {
                     try emitConflictingOptFlagsDiagnostic(sink);
                 }

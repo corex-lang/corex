@@ -61,6 +61,7 @@ pub type c_void = opaque;
 /// System V AMD64 C `va_list` storage wrapper (`24` bytes on `x86_64-linux-*` and `x86_64-apple-darwin`).
 @cfg(target.arch == "x86_64" and (target.os == "linux" or target.os == "macos"))
 @repr(C)
+@not_send
 pub struct VaList {
     /// Three pointer-width ABI words matching `struct __va_list_tag`.
     _storage: [usize; 3],
@@ -69,6 +70,7 @@ pub struct VaList {
 /// AAPCS64 Linux C `va_list` storage wrapper (`32` bytes on `aarch64-linux-*`).
 @cfg(target.arch == "aarch64" and target.os == "linux")
 @repr(C)
+@not_send
 pub struct VaList {
     /// Four pointer-width ABI words matching `struct __va_list`.
     _storage: [usize; 4],
@@ -77,6 +79,7 @@ pub struct VaList {
 /// Single-pointer C `va_list` storage wrapper (`windows`, `aarch64-apple-darwin`, and `wasm32`).
 @cfg(target.os == "windows" or (target.arch == "aarch64" and target.os == "macos") or target.arch == "wasm32")
 @repr(C)
+@not_send
 pub struct VaList {
     /// Backing variadic argument stack cursor (`char*`).
     _storage: *mut u8,

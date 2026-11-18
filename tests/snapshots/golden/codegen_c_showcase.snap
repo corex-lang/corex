@@ -1019,11 +1019,12 @@ static inline cx_str_t _cx_rt_buf_finish_str(_cx_rt_buf_t *out_b) {
     cx_str_t res_s;
     if (out_b->len == 0u) {
         free(out_b->data);
-        res_s.ptr = (uint8_t *)((uintptr_t)1u);
+        res_s.ptr = (uint8_t *)_cx_empty_rodata;
         res_s.len = 0u;
     } else {
+        _cx_rt_buf_push_byte(out_b, 0u);
         res_s.ptr = out_b->data;
-        res_s.len = (uintptr_t)out_b->len;
+        res_s.len = (uintptr_t)(out_b->len - 1u);
     }
     return res_s;
 }

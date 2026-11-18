@@ -349,8 +349,10 @@ pub const DeclExtraFlags = packed struct(u16) {
     is_not_sync: bool = false,
     /// `true` if annotated with `@thread_local` (`DR-08` / `DR-10` thread-local storage marker).
     is_thread_local: bool = false,
+    /// `true` if annotated with `@trusted` (`DR-10` §2.3 safe FFI contract).
+    is_trusted_ffi: bool = false,
     /// Reserved zero padding bits (`0`).
-    reserved: u5 = 0,
+    reserved: u4 = 0,
 
     comptime {
         std.debug.assert(@sizeOf(DeclExtraFlags) == 2);
@@ -757,13 +759,13 @@ pub const FfiFnContract = struct {
     /// `true` if declared inside `unsafe extern { … }` or with explicit `unsafe`.
     is_unsafe_extern: bool = false,
     /// `true` if return value is annotated with `@owned_by_caller` (linear leak obligation, `E0304`).
-    ret_owned_by_caller: bool = false,
+    is_ret_owned_by_caller: bool = false,
     /// `true` if return pointer is annotated with `@may_be_null` (unchecked deref/use emits `E0311`).
-    ret_may_be_null: bool = false,
+    is_ret_may_be_null: bool = false,
     /// `true` if return pointer is annotated with `@non_null`.
-    ret_non_null: bool = false,
+    is_ret_non_null: bool = false,
     /// `true` if return pointer is annotated with `@null_terminated` (satisfies downstream `E0308`).
-    ret_null_terminated: bool = false,
+    is_ret_null_terminated: bool = false,
     /// Expected `@consumes` deallocator `SymbolIndex` resolved from `@free_with(fn_ident)` (`.none` when unconstrained).
     ret_free_with_sym: SymbolIndex = .none,
     /// Interned ABI string literal (e.g., `"C"`, `"system"`, `"C-unwind"`, `"wasm"`, `.empty` for default `"C"`).
@@ -1575,6 +1577,1149 @@ fn hasBuilderAttributeInCstRange(
         }
     }
     return false;
+}
+
+/// Extracts a single string literal argument inside `[arg_start .. attr_end)` into `dest_buf` and `dest_len`.
+fn extractSingleStringAttrIntoBuf(
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    arg_start: usize,
+    attr_end: usize,
+    dest_buf: *[256]u8,
+    dest_len: *u16,
+) void {
+    var arg_cur = arg_start;
+    while (arg_cur < attr_end) : (arg_cur += 1) {
+        const arg_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cur)));
+        if (arg_leaf.subtree_size <= 1 and !arg_leaf.token.isNone() and
+            arg_leaf.token.asInt() < token_buffer.countTokens())
+        {
+            const arg_kind = token_buffer.getToken(arg_leaf.token).kind;
+            if (arg_kind == .string_lit or arg_kind == .byte_string_lit) {
+                var unesc_buf: [256]u8 = undefined;
+                const unquoted = unquoteAttrStringLexeme(
+                    extractTokenSlice(source, token_buffer, arg_leaf.token),
+                    &unesc_buf,
+                );
+                const copy_len = @min(unquoted.len, dest_buf.len);
+                @memcpy(dest_buf[0..copy_len], unquoted[0..copy_len]);
+                dest_len.* = @intCast(copy_len);
+                break;
+            }
+        }
+    }
+}
+
+/// Extracts `@wasm_import("mod", "name")` string literal arguments inside `[arg_start .. attr_end)`.
+fn extractWasmImportAttr(
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    arg_start: usize,
+    attr_end: usize,
+    meta: *ItemHeaderMetadata,
+) void {
+    var seen_strings: u8 = 0;
+    var arg_cur = arg_start;
+    while (arg_cur < attr_end and seen_strings < 2) : (arg_cur += 1) {
+        const arg_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cur)));
+        if (arg_leaf.subtree_size <= 1 and !arg_leaf.token.isNone() and
+            arg_leaf.token.asInt() < token_buffer.countTokens())
+        {
+            const arg_kind = token_buffer.getToken(arg_leaf.token).kind;
+            if (arg_kind == .string_lit or arg_kind == .byte_string_lit) {
+                var unesc_buf: [256]u8 = undefined;
+                const unquoted = unquoteAttrStringLexeme(
+                    extractTokenSlice(source, token_buffer, arg_leaf.token),
+                    &unesc_buf,
+                );
+                if (seen_strings == 0) {
+                    const copy_len = @min(unquoted.len, meta.wasm_import_mod_buf.len);
+                    @memcpy(meta.wasm_import_mod_buf[0..copy_len], unquoted[0..copy_len]);
+                    meta.wasm_import_mod_len = @intCast(copy_len);
+                } else {
+                    const copy_len = @min(unquoted.len, meta.wasm_import_name_buf.len);
+                    @memcpy(meta.wasm_import_name_buf[0..copy_len], unquoted[0..copy_len]);
+                    meta.wasm_import_name_len = @intCast(copy_len);
+                }
+                seen_strings += 1;
+            }
+        }
+    }
+}
+
+/// Evaluates `@cfg` predicates on symbols in `scope_id` against `sym_table.cfg_env` to keep `scoped_map` synchronized
+/// for cross-file `use` resolution before `TypeChecker` runs (`core/ffi.cx` `@cfg` `c_char` twins).
+fn pruneScopeMapWithCfgEnvQuiet(
+    sym_table: *SymbolTable,
+    file_id: FileId,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    scope_id: ScopeId,
+    depth: u32,
+) !void {
+    if (scope_id.isNone() or depth >= MAX_SCOPE_DEPTH) return;
+    const members_copy = try sym_table.allocator.dupe(
+        SymbolIndex,
+        sym_table.getScopeMembers(scope_id),
+    );
+    defer sym_table.allocator.free(members_copy);
+
+    for (members_copy) |sym_idx| {
+        const sym = sym_table.getSymbol(sym_idx).*;
+        if (sym.flags.is_builtin or sym.flags.is_imported) continue;
+        if (sym.kind == .overload_group_sym) continue;
+
+        if (sym.has_cfg_attr) {
+            const is_own_enabled = if (!sym.cst_node.isNone())
+                (evaluateCstNodeCfgWithEnv(
+                    &sym_table.cfg_env,
+                    file_id,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                    sym.cst_node,
+                    null,
+                ) catch true)
+            else
+                true;
+            const is_enc_enabled = if (!sym.enclosing_cfg_cst.isNone())
+                (evaluateCstNodeCfgWithEnv(
+                    &sym_table.cfg_env,
+                    file_id,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                    sym.enclosing_cfg_cst,
+                    null,
+                ) catch true)
+            else
+                true;
+            const key = packScopedSymbolKey(scope_id, sym.name, sym.namespace);
+            if (!(is_own_enabled and is_enc_enabled)) {
+                if (sym_table.scoped_map.get(key)) |mapped_idx| {
+                    if (mapped_idx == sym_idx) {
+                        _ = sym_table.scoped_map.remove(key);
+                    }
+                }
+                continue;
+            }
+            if (sym_table.scoped_map.get(key) == null) {
+                try sym_table.scoped_map.put(sym_table.allocator, key, sym_idx);
+            }
+        }
+
+        if (!sym.target_scope.isNone() and
+            sym_table.scope_arena.getScope(sym.target_scope).file_id == file_id)
+        {
+            try pruneScopeMapWithCfgEnvQuiet(
+                sym_table,
+                file_id,
+                source,
+                token_buffer,
+                cst_arena,
+                sym.target_scope,
+                depth + 1,
+            );
+        }
+    }
+}
+
+/// Extracts any explicit `extern "ABI"` string and `unsafe` prefix before `main_token` in `item_cst`.
+fn extractItemExternAbiAndUnsafe(
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    item_cst: CstNodeIndex,
+    main_token: TokenIndex,
+    abi_out_buf: *[256]u8,
+) struct { abi_slice: []const u8, is_unsafe: bool } {
+    var abi_slice: []const u8 = "";
+    var is_unsafe = false;
+    if (item_cst.isNone() or item_cst.asInt() >= cst_arena.countNodes()) {
+        return .{ .abi_slice = abi_slice, .is_unsafe = is_unsafe };
+    }
+    const start_idx: usize = item_cst.asInt();
+    const root_rec = cst_arena.getNode(item_cst);
+    const end_idx: usize = @min(
+        start_idx + @max(@as(usize, root_rec.subtree_size), 1),
+        cst_arena.countNodes(),
+    );
+    var has_seen_extern = false;
+    var cursor: usize = start_idx + 1;
+    while (cursor < end_idx) : (cursor += 1) {
+        const node = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cursor)));
+        if (node.kind == .attribute or node.kind == .visibility_modifier) {
+            if (node.subtree_size > 1) cursor += @as(usize, node.subtree_size) - 1;
+            continue;
+        }
+        if (!node.token.isNone() and !main_token.isNone() and node.token.asInt() >= main_token.asInt()) {
+            break;
+        }
+        if (node.subtree_size <= 1 and !node.flags.is_bracketed and !node.token.isNone() and
+            node.token.asInt() < token_buffer.countTokens())
+        {
+            const tok_kind = token_buffer.getToken(node.token).kind;
+            if (tok_kind == .kw_unsafe) {
+                is_unsafe = true;
+                has_seen_extern = false;
+            } else if (tok_kind == .kw_extern) {
+                has_seen_extern = true;
+            } else if (has_seen_extern and tok_kind == .string_lit) {
+                abi_slice = unquoteAttrStringLexeme(
+                    extractTokenSlice(source, token_buffer, node.token),
+                    abi_out_buf,
+                );
+                has_seen_extern = false;
+            } else {
+                has_seen_extern = false;
+            }
+        }
+    }
+    return .{ .abi_slice = abi_slice, .is_unsafe = is_unsafe };
+}
+
+/// Populates or updates initial linkage/trust `FfiFnContract` metadata on `sym_idx` when FFI attributes are present.
+fn recordHeaderFfiContractIfPresent(
+    sym_table: *SymbolTable,
+    interner: *StringInterner,
+    sym_idx: SymbolIndex,
+    is_extern: bool,
+    is_unsafe_extern: bool,
+    abi_slice: []const u8,
+    header_meta: *const ItemHeaderMetadata,
+) !void {
+    const link_lib_slice = header_meta.asLinkLibSlice();
+    const wasm_mod_slice = header_meta.asWasmImportModSlice();
+    const wasm_name_slice = header_meta.asWasmImportNameSlice();
+    const wasm_exp_slice = header_meta.asWasmExportSlice();
+    const has_any = header_meta.is_trusted or
+        header_meta.is_thread_local or
+        is_unsafe_extern or
+        abi_slice.len > 0 or
+        link_lib_slice.len > 0 or
+        wasm_mod_slice.len > 0 or
+        wasm_name_slice.len > 0 or
+        wasm_exp_slice.len > 0;
+    if (!has_any and !is_extern) return;
+    if (!has_any) return;
+
+    const abi_id: SymbolId = if (abi_slice.len > 0) try interner.intern(abi_slice) else .empty;
+    const link_lib_id: SymbolId = if (link_lib_slice.len > 0) try interner.intern(link_lib_slice) else .empty;
+    const wasm_mod_id: SymbolId = if (wasm_mod_slice.len > 0) try interner.intern(wasm_mod_slice) else .empty;
+    const wasm_name_id: SymbolId = if (wasm_name_slice.len > 0) try interner.intern(wasm_name_slice) else .empty;
+    const wasm_exp_id: SymbolId = if (wasm_exp_slice.len > 0) try interner.intern(wasm_exp_slice) else .empty;
+
+    try sym_table.setFfiContract(sym_idx, .{
+        .is_trusted = header_meta.is_trusted,
+        .is_thread_local = header_meta.is_thread_local,
+        .is_unsafe_extern = is_unsafe_extern,
+        .abi_name = abi_id,
+        .wasm_import_module = wasm_mod_id,
+        .wasm_import_name = wasm_name_id,
+        .wasm_export_name = wasm_exp_id,
+        .link_lib_name = link_lib_id,
+    }, &.{});
+}
+
+/// Collects AST items into `enclosing_scope`, advancing `top_ordinal_ptr` across flattened top-level `extern` blocks.
+fn collectItemSliceInScopeWithOrdinal(
+    sym_table: *SymbolTable,
+    interner: *StringInterner,
+    file_id: FileId,
+    enclosing_scope: ScopeId,
+    top_ordinal_ptr: ?*u12,
+    enclosing_owner_def: DefId,
+    item_slice: []const u32,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    ast_arena: *const AstArena,
+    extra_ends: []const u32,
+    diagnostic_sink: ?*DiagnosticSink,
+) anyerror!void {
+    for (item_slice) |raw_node_idx| {
+        const item_node_idx = NodeIndex.fromInt(raw_node_idx);
+        if (item_node_idx.asInt() >= ast_arena.countNodes()) continue;
+        const ast_node = ast_arena.getNode(item_node_idx);
+        if (ast_node.tag == .item_hole) continue;
+        if (!sym_table.is_including_tests and (ast_node.tag == .test_decl or ast_node.tag == .bench_decl)) {
+            continue;
+        }
+
+        const def_id: DefId = if (ast_node.tag != .extern_block_decl) blk: {
+            if (top_ordinal_ptr) |ord_ptr| {
+                const current_def = DefId.init(file_id, ord_ptr.*);
+                if (ord_ptr.* < std.math.maxInt(u12)) ord_ptr.* += 1;
+                break :blk current_def;
+            }
+            break :blk .NONE;
+        } else .NONE;
+
+        const item_cst = ast_arena.getCstOrigin(item_node_idx);
+        const header_meta = try extractItemHeaderMetadataWithInterner(
+            source,
+            file_id,
+            token_buffer,
+            cst_arena,
+            item_cst,
+            ast_node.main_token,
+            interner,
+            diagnostic_sink,
+        );
+        const visibility = header_meta.visibility;
+        var flags = header_meta.flags;
+        flags.is_pub = (visibility == .public);
+        var extra_flags = header_meta.extra_flags;
+        const link_sec_slice = header_meta.asLinkSectionSlice();
+        const interned_link_sec: []const u8 = if (link_sec_slice.len > 0)
+            interner.get(try interner.intern(link_sec_slice))
+        else
+            "";
+        const link_name_slice = header_meta.asLinkNameSlice();
+        const interned_link_name: []const u8 = if (link_name_slice.len > 0)
+            interner.get(try interner.intern(link_name_slice))
+        else
+            "";
+
+        switch (ast_node.tag) {
+            .mod_decl => {
+                const name_tok = if (ast_node.lhs.tag == .token)
+                    TokenIndex.fromInt(ast_node.lhs.payload)
+                else
+                    findItemNameToken(token_buffer, cst_arena, item_cst, ast_node.main_token);
+                const name_str = extractTokenSlice(source, token_buffer, name_tok);
+                if (name_str.len == 0) continue;
+                const name_sym = try interner.intern(name_str);
+                const name_span = token_buffer.getTokenSpan(file_id, name_tok);
+
+                const bound_ext_scope: ScopeId = if (ast_node.rhs.tag != .extra) blk: {
+                    const direct_ext = sym_table.getExternalModuleScope(file_id, name_sym);
+                    if (!direct_ext.isNone()) break :blk direct_ext;
+                    break :blk sym_table.named_module_scopes.get(name_sym.asInt()) orelse .none;
+                } else .none;
+                const mod_scope = if (!bound_ext_scope.isNone()) blk: {
+                    const parent_mod = sym_table.scope_arena.getScope(enclosing_scope).enclosing_module;
+                    if (!parent_mod.isNone()) {
+                        sym_table.scope_arena.setParentModule(bound_ext_scope, parent_mod);
+                    }
+                    break :blk bound_ext_scope;
+                } else blk: {
+                    const fresh_scope = try sym_table.scope_arena.allocScope(
+                        .module_scope,
+                        enclosing_scope,
+                        def_id,
+                        file_id,
+                        .{},
+                    );
+                    try sym_table.named_module_scopes.put(sym_table.allocator, name_sym.asInt(), fresh_scope);
+                    break :blk fresh_scope;
+                };
+
+                _ = try sym_table.defineSymbol(.{
+                    .name = name_sym,
+                    .name_text = interner.get(name_sym),
+                    .kind = .module_sym,
+                    .namespace = .value_ns,
+                    .visibility = visibility,
+                    .flags = flags,
+                    .extra_flags = extra_flags,
+                    .scope_id = enclosing_scope,
+                    .def_id = def_id,
+                    .ast_node = item_node_idx,
+                    .cst_node = item_cst,
+                    .decl_span = name_span,
+                    .target_scope = mod_scope,
+                    .has_cfg_attr = header_meta.has_cfg_attr,
+                }, diagnostic_sink);
+
+                // Collect inline `mod foo { … }` sub-items:
+                if (ast_node.rhs.tag == .extra) {
+                    const inner_items = computeRhsExtraSliceWithEnds(ast_arena, item_node_idx, extra_ends);
+                    try collectItemSliceInScope(
+                        sym_table,
+                        interner,
+                        file_id,
+                        mod_scope,
+                        false,
+                        .NONE,
+                        inner_items,
+                        source,
+                        token_buffer,
+                        cst_arena,
+                        ast_arena,
+                        extra_ends,
+                        diagnostic_sink,
+                    );
+                }
+            },
+            .use_decl => {
+                try sym_table.pending_imports.append(sym_table.allocator, .{
+                    .module_scope = enclosing_scope,
+                    .file_id = file_id,
+                    .def_id = def_id,
+                    .visibility = visibility,
+                    .ast_node = item_node_idx,
+                    .cst_node = item_cst,
+                });
+            },
+            .struct_decl, .union_decl, .bit_field_decl => {
+                const is_bit_field = ast_node.tag == .bit_field_decl or
+                    (!ast_node.main_token.isNone() and
+                        ast_node.main_token.asInt() < token_buffer.countTokens() and
+                        token_buffer.getToken(ast_node.main_token).kind == .kw_bit_field);
+                const name_tok = findItemNameToken(token_buffer, cst_arena, item_cst, ast_node.main_token);
+                const name_str = extractTokenSlice(source, token_buffer, name_tok);
+                if (name_str.len == 0) continue;
+                const name_sym = try interner.intern(name_str);
+                const name_span = token_buffer.getTokenSpan(file_id, name_tok);
+
+                const member_scope = try sym_table.scope_arena.allocScope(
+                    .nominal_type_scope,
+                    enclosing_scope,
+                    def_id,
+                    file_id,
+                    .{},
+                );
+                const sym_kind: SymbolKind = if (is_bit_field)
+                    .bit_field_sym
+                else if (ast_node.tag == .union_decl)
+                    .union_sym
+                else
+                    .struct_sym;
+
+                const defined_sym_idx = try sym_table.defineSymbol(.{
+                    .name = name_sym,
+                    .name_text = interner.get(name_sym),
+                    .kind = sym_kind,
+                    .namespace = .type_ns,
+                    .visibility = visibility,
+                    .flags = flags,
+                    .extra_flags = extra_flags,
+                    .scope_id = enclosing_scope,
+                    .def_id = def_id,
+                    .ast_node = item_node_idx,
+                    .cst_node = item_cst,
+                    .decl_span = name_span,
+                    .target_scope = member_scope,
+                    .derive_mask = header_meta.derive_mask,
+                    .attr_target_mask = header_meta.attr_target_mask,
+                    .contract_flags = header_meta.contract_flags,
+                    .max_stack_bytes = header_meta.max_stack_bytes,
+                    .cap_emits_mask = header_meta.cap_emits_mask,
+                    .cap_clears_mask = header_meta.cap_clears_mask,
+                    .link_section_name = interned_link_sec,
+                    .link_name_text = interned_link_name,
+                    .repr_tag_bits = header_meta.repr_tag_bits,
+                    .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
+                    .has_cfg_attr = header_meta.has_cfg_attr,
+                }, diagnostic_sink);
+
+                const gen_specs = try extractGenericParamSpecsFromItemCst(
+                    sym_table.allocator,
+                    interner,
+                    item_cst,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                );
+                defer sym_table.allocator.free(gen_specs);
+                if (gen_specs.len > 0) {
+                    try sym_table.setGenericParamSpecs(defined_sym_idx, gen_specs);
+                }
+
+                try collectStructOrBitFieldMembers(
+                    sym_table,
+                    interner,
+                    file_id,
+                    member_scope,
+                    item_cst,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                    diagnostic_sink,
+                );
+            },
+            .enum_decl => {
+                const name_tok = findItemNameToken(token_buffer, cst_arena, item_cst, ast_node.main_token);
+                const name_str = extractTokenSlice(source, token_buffer, name_tok);
+                if (name_str.len == 0) continue;
+                const name_sym = try interner.intern(name_str);
+                const name_span = token_buffer.getTokenSpan(file_id, name_tok);
+
+                if (extra_flags.has_repr_int) {
+                    if (diagnostic_sink) |sink| {
+                        try emitRetiredEnumReprIntDiagnostic(
+                            sink,
+                            file_id,
+                            source,
+                            token_buffer,
+                            name_str,
+                            header_meta.repr_int_token,
+                        );
+                    }
+                }
+
+                const variant_scope = try sym_table.scope_arena.allocScope(
+                    .nominal_type_scope,
+                    enclosing_scope,
+                    def_id,
+                    file_id,
+                    .{},
+                );
+                const defined_sym_idx = try sym_table.defineSymbol(.{
+                    .name = name_sym,
+                    .name_text = interner.get(name_sym),
+                    .kind = .enum_sym,
+                    .namespace = .type_ns,
+                    .visibility = visibility,
+                    .flags = flags,
+                    .extra_flags = extra_flags,
+                    .scope_id = enclosing_scope,
+                    .def_id = def_id,
+                    .ast_node = item_node_idx,
+                    .cst_node = item_cst,
+                    .decl_span = name_span,
+                    .target_scope = variant_scope,
+                    .derive_mask = header_meta.derive_mask,
+                    .attr_target_mask = header_meta.attr_target_mask,
+                    .contract_flags = header_meta.contract_flags,
+                    .max_stack_bytes = header_meta.max_stack_bytes,
+                    .cap_emits_mask = header_meta.cap_emits_mask,
+                    .cap_clears_mask = header_meta.cap_clears_mask,
+                    .link_section_name = interned_link_sec,
+                    .link_name_text = interned_link_name,
+                    .repr_tag_bits = header_meta.repr_tag_bits,
+                    .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
+                    .has_cfg_attr = header_meta.has_cfg_attr,
+                }, diagnostic_sink);
+
+                const gen_specs = try extractGenericParamSpecsFromItemCst(
+                    sym_table.allocator,
+                    interner,
+                    item_cst,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                );
+                defer sym_table.allocator.free(gen_specs);
+                if (gen_specs.len > 0) {
+                    try sym_table.setGenericParamSpecs(defined_sym_idx, gen_specs);
+                }
+
+                try collectEnumVariants(
+                    sym_table,
+                    interner,
+                    file_id,
+                    variant_scope,
+                    visibility,
+                    item_cst,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                    diagnostic_sink,
+                );
+            },
+            .trait_decl => {
+                const name_tok = findItemNameToken(token_buffer, cst_arena, item_cst, ast_node.main_token);
+                const name_str = extractTokenSlice(source, token_buffer, name_tok);
+                if (name_str.len == 0) continue;
+                const name_sym = try interner.intern(name_str);
+                const name_span = token_buffer.getTokenSpan(file_id, name_tok);
+
+                const trait_scope = try sym_table.scope_arena.allocScope(
+                    .trait_scope,
+                    enclosing_scope,
+                    def_id,
+                    file_id,
+                    .{},
+                );
+                const defined_sym_idx = try sym_table.defineSymbol(.{
+                    .name = name_sym,
+                    .name_text = interner.get(name_sym),
+                    .kind = .trait_sym,
+                    .namespace = .type_ns,
+                    .visibility = visibility,
+                    .flags = flags,
+                    .extra_flags = extra_flags,
+                    .scope_id = enclosing_scope,
+                    .def_id = def_id,
+                    .ast_node = item_node_idx,
+                    .cst_node = item_cst,
+                    .decl_span = name_span,
+                    .target_scope = trait_scope,
+                    .contract_flags = header_meta.contract_flags,
+                    .has_cfg_attr = header_meta.has_cfg_attr,
+                }, diagnostic_sink);
+
+                const gen_specs = try extractGenericParamSpecsFromItemCst(
+                    sym_table.allocator,
+                    interner,
+                    item_cst,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                );
+                defer sym_table.allocator.free(gen_specs);
+                if (gen_specs.len > 0) {
+                    try sym_table.setGenericParamSpecs(defined_sym_idx, gen_specs);
+                }
+
+                if (ast_node.lhs.tag == .extra and ast_node.rhs.tag == .extra and ast_node.rhs.payload > 0) {
+                    const member_slice = ast_arena.getExtraSlice(
+                        ExtraIndex.fromInt(ast_node.lhs.payload),
+                        ast_node.rhs.payload,
+                    );
+                    try collectItemSliceInScope(
+                        sym_table,
+                        interner,
+                        file_id,
+                        trait_scope,
+                        false,
+                        .NONE,
+                        member_slice,
+                        source,
+                        token_buffer,
+                        cst_arena,
+                        ast_arena,
+                        extra_ends,
+                        diagnostic_sink,
+                    );
+                }
+            },
+            .type_alias_decl => {
+                const name_tok = findItemNameToken(token_buffer, cst_arena, item_cst, ast_node.main_token);
+                const name_str = extractTokenSlice(source, token_buffer, name_tok);
+                if (name_str.len == 0) continue;
+                const name_sym = try interner.intern(name_str);
+                const name_span = token_buffer.getTokenSpan(file_id, name_tok);
+
+                const gen_specs = try extractGenericParamSpecsFromItemCst(
+                    sym_table.allocator,
+                    interner,
+                    item_cst,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                );
+                defer sym_table.allocator.free(gen_specs);
+
+                // Classify whether this `type` item is a `bit_field`, Type Group (`|`/`+`), `is` refinement, or `distinct`:
+                var alias_kind: SymbolKind = .type_alias_sym;
+                var bf_member_scope: ScopeId = .none;
+                if (hasKeywordInCst(token_buffer, cst_arena, item_cst, .kw_bit_field)) {
+                    alias_kind = .bit_field_sym;
+                    bf_member_scope = try sym_table.scope_arena.allocScope(
+                        .nominal_type_scope,
+                        enclosing_scope,
+                        def_id,
+                        file_id,
+                        .{},
+                    );
+                } else if (ast_node.lhs.tag == .extra and ast_node.rhs.tag == .extra) {
+                    alias_kind = .type_group_sym;
+                    flags.is_type_group = true;
+                } else if (ast_node.rhs.tag == .node) {
+                    alias_kind = .refined_type_sym;
+                    flags.is_refined = true;
+                } else if (ast_node.lhs.tag == .node) {
+                    const target_ast = ast_arena.getNode(NodeIndex.fromInt(ast_node.lhs.payload));
+                    if (target_ast.tag == .union_bound_type or target_ast.tag == .intersect_bound_type) {
+                        alias_kind = .type_group_sym;
+                        flags.is_type_group = true;
+                    } else if (target_ast.tag == .mode_type) {
+                        const mode_lexeme = extractTokenSlice(source, token_buffer, target_ast.main_token);
+                        if (std.mem.eql(u8, mode_lexeme, "distinct")) {
+                            alias_kind = .distinct_type_sym;
+                            flags.is_distinct = true;
+                        }
+                    }
+                }
+                if (bf_member_scope.isNone() and gen_specs.len > 0) {
+                    bf_member_scope = try sym_table.scope_arena.allocScope(
+                        .nominal_type_scope,
+                        enclosing_scope,
+                        def_id,
+                        file_id,
+                        .{},
+                    );
+                }
+
+                const defined_sym_idx = try sym_table.defineSymbol(.{
+                    .name = name_sym,
+                    .name_text = interner.get(name_sym),
+                    .kind = alias_kind,
+                    .namespace = .type_ns,
+                    .visibility = visibility,
+                    .flags = flags,
+                    .extra_flags = extra_flags,
+                    .scope_id = enclosing_scope,
+                    .def_id = def_id,
+                    .ast_node = item_node_idx,
+                    .cst_node = item_cst,
+                    .decl_span = name_span,
+                    .target_scope = bf_member_scope,
+                    .contract_flags = header_meta.contract_flags,
+                    .link_section_name = interned_link_sec,
+                    .link_name_text = interned_link_name,
+                    .repr_tag_bits = header_meta.repr_tag_bits,
+                    .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
+                    .has_cfg_attr = header_meta.has_cfg_attr,
+                }, diagnostic_sink);
+
+                if (gen_specs.len > 0) {
+                    try sym_table.setGenericParamSpecs(defined_sym_idx, gen_specs);
+                }
+
+                if (alias_kind == .bit_field_sym and !bf_member_scope.isNone()) {
+                    try collectStructOrBitFieldMembers(
+                        sym_table,
+                        interner,
+                        file_id,
+                        bf_member_scope,
+                        item_cst,
+                        source,
+                        token_buffer,
+                        cst_arena,
+                        diagnostic_sink,
+                    );
+                }
+            },
+            .const_decl => {
+                const name_tok = findItemNameToken(token_buffer, cst_arena, item_cst, ast_node.main_token);
+                const name_str = extractTokenSlice(source, token_buffer, name_tok);
+                if (name_str.len == 0) continue;
+                const name_sym = try interner.intern(name_str);
+                const name_span = token_buffer.getTokenSpan(file_id, name_tok);
+
+                _ = try sym_table.defineSymbol(.{
+                    .name = name_sym,
+                    .name_text = interner.get(name_sym),
+                    .kind = .const_sym,
+                    .namespace = .const_ns,
+                    .visibility = visibility,
+                    .flags = flags,
+                    .extra_flags = extra_flags,
+                    .scope_id = enclosing_scope,
+                    .def_id = def_id,
+                    .owner_def_id = enclosing_owner_def,
+                    .ast_node = item_node_idx,
+                    .cst_node = item_cst,
+                    .decl_span = name_span,
+                    .contract_flags = header_meta.contract_flags,
+                    .link_section_name = interned_link_sec,
+                    .link_name_text = interned_link_name,
+                    .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
+                    .has_cfg_attr = header_meta.has_cfg_attr,
+                }, diagnostic_sink);
+            },
+            .fn_decl => {
+                const name_tok = findItemNameToken(token_buffer, cst_arena, item_cst, ast_node.main_token);
+                const name_str = extractTokenSlice(source, token_buffer, name_tok);
+                if (name_str.len == 0) continue;
+                const name_sym = try interner.intern(name_str);
+                const name_span = token_buffer.getTokenSpan(file_id, name_tok);
+                flags.is_prototype_only = (ast_node.rhs.tag == .none);
+
+                const effective_owner_def = if (!def_id.isNone()) def_id else enclosing_owner_def;
+                const extracted_params = try extractFnParamSpecsFromItemCst(
+                    sym_table.allocator,
+                    interner,
+                    file_id,
+                    effective_owner_def,
+                    item_cst,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                );
+                defer sym_table.allocator.free(extracted_params.specs);
+                extra_flags.is_variadic = extracted_params.is_variadic;
+
+                const defined_sym_idx = try sym_table.defineSymbol(.{
+                    .name = name_sym,
+                    .name_text = interner.get(name_sym),
+                    .kind = .fn_sym,
+                    .namespace = .value_ns,
+                    .visibility = visibility,
+                    .flags = flags,
+                    .extra_flags = extra_flags,
+                    .scope_id = enclosing_scope,
+                    .def_id = def_id,
+                    .owner_def_id = enclosing_owner_def,
+                    .ast_node = item_node_idx,
+                    .cst_node = item_cst,
+                    .decl_span = name_span,
+                    .contract_flags = header_meta.contract_flags,
+                    .max_stack_bytes = header_meta.max_stack_bytes,
+                    .cap_emits_mask = header_meta.cap_emits_mask,
+                    .cap_clears_mask = header_meta.cap_clears_mask,
+                    .link_section_name = interned_link_sec,
+                    .link_name_text = interned_link_name,
+                    .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
+                    .has_cfg_attr = header_meta.has_cfg_attr,
+                }, diagnostic_sink);
+
+                if (extracted_params.specs.len > 0) {
+                    try sym_table.setFnParamSpecs(defined_sym_idx, extracted_params.specs);
+                }
+                const gen_specs = try extractGenericParamSpecsFromItemCst(
+                    sym_table.allocator,
+                    interner,
+                    item_cst,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                );
+                defer sym_table.allocator.free(gen_specs);
+                if (gen_specs.len > 0) {
+                    try sym_table.setGenericParamSpecs(defined_sym_idx, gen_specs);
+                }
+                var fn_abi_buf: [256]u8 = undefined;
+                const fn_ext_info = extractItemExternAbiAndUnsafe(
+                    source,
+                    token_buffer,
+                    cst_arena,
+                    item_cst,
+                    ast_node.main_token,
+                    &fn_abi_buf,
+                );
+                try recordHeaderFfiContractIfPresent(
+                    sym_table,
+                    interner,
+                    defined_sym_idx,
+                    flags.is_extern,
+                    fn_ext_info.is_unsafe,
+                    fn_ext_info.abi_slice,
+                    &header_meta,
+                );
+            },
+            .extern_static_decl => {
+                const static_extra = ast_arena.getExternStaticExtra(item_node_idx);
+                const name_tok = ast_node.main_token;
+                const name_str = extractTokenSlice(source, token_buffer, name_tok);
+                if (name_str.len == 0) continue;
+                const name_sym = try interner.intern(name_str);
+                const name_span = token_buffer.getTokenSpan(file_id, name_tok);
+
+                const static_vis: Visibility = if (visibility != .private)
+                    visibility
+                else
+                    @fromBackingInt(@backingInt(static_extra.flags.visibility));
+                flags.is_pub = (static_vis == .public);
+                flags.is_extern = static_extra.flags.has_extern;
+                flags.is_mut = static_extra.flags.is_mut;
+
+                const defined_sym_idx = try sym_table.defineSymbol(.{
+                    .name = name_sym,
+                    .name_text = interner.get(name_sym),
+                    .kind = .extern_static_sym,
+                    .namespace = .value_ns,
+                    .visibility = static_vis,
+                    .flags = flags,
+                    .extra_flags = extra_flags,
+                    .scope_id = enclosing_scope,
+                    .def_id = def_id,
+                    .owner_def_id = enclosing_owner_def,
+                    .ast_node = item_node_idx,
+                    .cst_node = item_cst,
+                    .decl_span = name_span,
+                    .contract_flags = header_meta.contract_flags,
+                    .link_section_name = interned_link_sec,
+                    .link_name_text = interned_link_name,
+                    .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
+                    .has_cfg_attr = header_meta.has_cfg_attr,
+                }, diagnostic_sink);
+
+                var static_abi_buf: [256]u8 = undefined;
+                const static_abi_slice: []const u8 = if (!static_extra.abi_tok.isNone())
+                    unquoteAttrStringLexeme(
+                        extractTokenSlice(source, token_buffer, static_extra.abi_tok),
+                        &static_abi_buf,
+                    )
+                else
+                    "";
+                try recordHeaderFfiContractIfPresent(
+                    sym_table,
+                    interner,
+                    defined_sym_idx,
+                    flags.is_extern,
+                    static_extra.flags.is_unsafe,
+                    static_abi_slice,
+                    &header_meta,
+                );
+            },
+            .extern_block_decl => {
+                const block_hdr = ast_arena.getExternBlockHeader(item_node_idx);
+                const member_items = ast_arena.getExternBlockItems(item_node_idx);
+                const outer_vis: Visibility = if (visibility != .private)
+                    visibility
+                else
+                    @fromBackingInt(@backingInt(block_hdr.flags.visibility));
+
+                var block_abi_buf: [256]u8 = undefined;
+                const block_abi_slice: []const u8 = if (!block_hdr.abi_tok.isNone())
+                    unquoteAttrStringLexeme(
+                        extractTokenSlice(source, token_buffer, block_hdr.abi_tok),
+                        &block_abi_buf,
+                    )
+                else
+                    "C";
+                const block_abi_id: SymbolId = if (block_abi_slice.len > 0)
+                    try interner.intern(block_abi_slice)
+                else
+                    .empty;
+                const block_link_lib = header_meta.asLinkLibSlice();
+                const block_link_lib_id: SymbolId = if (block_link_lib.len > 0)
+                    try interner.intern(block_link_lib)
+                else
+                    .empty;
+                const block_wasm_mod = header_meta.asWasmImportModSlice();
+                const block_wasm_mod_id: SymbolId = if (block_wasm_mod.len > 0)
+                    try interner.intern(block_wasm_mod)
+                else
+                    .empty;
+                const block_wasm_name = header_meta.asWasmImportNameSlice();
+                const block_wasm_name_id: SymbolId = if (block_wasm_name.len > 0)
+                    try interner.intern(block_wasm_name)
+                else
+                    .empty;
+
+                const effective_owner_def = if (!def_id.isNone()) def_id else enclosing_owner_def;
+                const pre_sym_len = sym_table.symbols.items.len;
+                try collectItemSliceInScopeWithOrdinal(
+                    sym_table,
+                    interner,
+                    file_id,
+                    enclosing_scope,
+                    top_ordinal_ptr,
+                    effective_owner_def,
+                    member_items,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                    ast_arena,
+                    extra_ends,
+                    diagnostic_sink,
+                );
+
+                var sym_i = pre_sym_len;
+                while (sym_i < sym_table.symbols.items.len) : (sym_i += 1) {
+                    const added_idx = SymbolIndex.fromInt(@intCast(sym_i));
+                    const added_sym = &sym_table.symbols.items[sym_i];
+                    if (added_sym.scope_id != enclosing_scope) continue;
+                    if (added_sym.kind == .overload_group_sym) continue;
+
+                    if (outer_vis != .private and added_sym.visibility == .private) {
+                        added_sym.visibility = outer_vis;
+                        added_sym.flags.is_pub = (outer_vis == .public);
+                    }
+                    if (header_meta.has_cfg_attr) {
+                        added_sym.has_cfg_attr = true;
+                        if (added_sym.enclosing_cfg_cst.isNone()) {
+                            added_sym.enclosing_cfg_cst = item_cst;
+                        }
+                    }
+                    if (added_sym.kind == .fn_sym or added_sym.kind == .extern_static_sym) {
+                        added_sym.flags.is_extern = true;
+                        const existing_contract = if (sym_table.getFfiContract(added_idx)) |ptr|
+                            ptr.*
+                        else
+                            FfiFnContract{};
+                        const has_inherited = header_meta.is_trusted or
+                            header_meta.is_thread_local or
+                            block_hdr.flags.is_unsafe or
+                            block_abi_id != .empty or
+                            block_link_lib_id != .empty or
+                            block_wasm_mod_id != .empty or
+                            block_wasm_name_id != .empty;
+                        if (header_meta.is_trusted) {
+                            added_sym.extra_flags.is_trusted_ffi = true;
+                        }
+                        if (header_meta.is_thread_local) {
+                            added_sym.extra_flags.is_thread_local = true;
+                        }
+                        if (has_inherited or sym_table.getFfiContract(added_idx) != null) {
+                            var merged = existing_contract;
+                            if (header_meta.is_trusted) merged.is_trusted = true;
+                            if (header_meta.is_thread_local) merged.is_thread_local = true;
+                            if (block_hdr.flags.is_unsafe) merged.is_unsafe_extern = true;
+                            if (merged.abi_name == .empty) merged.abi_name = block_abi_id;
+                            if (merged.link_lib_name == .empty) merged.link_lib_name = block_link_lib_id;
+                            if (merged.wasm_import_module == .empty) merged.wasm_import_module = block_wasm_mod_id;
+                            if (merged.wasm_import_name == .empty) merged.wasm_import_name = block_wasm_name_id;
+                            try sym_table.setFfiContract(added_idx, merged, existing_contract.param_contracts);
+                        }
+                    }
+                }
+            },
+            .subscript_decl => {
+                const sub_sym = try interner.intern("subscript");
+                const sub_span = token_buffer.getTokenSpan(file_id, ast_node.main_token);
+                flags.is_prototype_only = (ast_node.rhs.tag == .none);
+                extra_flags.is_subscript = true;
+
+                const effective_owner_def = if (!def_id.isNone()) def_id else enclosing_owner_def;
+                const extracted_params = try extractFnParamSpecsFromItemCst(
+                    sym_table.allocator,
+                    interner,
+                    file_id,
+                    effective_owner_def,
+                    item_cst,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                );
+                defer sym_table.allocator.free(extracted_params.specs);
+                extra_flags.is_variadic = extracted_params.is_variadic;
+
+                const defined_sym_idx = try sym_table.defineSymbol(.{
+                    .name = sub_sym,
+                    .name_text = interner.get(sub_sym),
+                    .kind = .fn_sym,
+                    .namespace = .value_ns,
+                    .visibility = visibility,
+                    .flags = flags,
+                    .extra_flags = extra_flags,
+                    .scope_id = enclosing_scope,
+                    .def_id = def_id,
+                    .owner_def_id = enclosing_owner_def,
+                    .ast_node = item_node_idx,
+                    .cst_node = item_cst,
+                    .decl_span = sub_span,
+                    .contract_flags = header_meta.contract_flags,
+                    .max_stack_bytes = header_meta.max_stack_bytes,
+                    .cap_emits_mask = header_meta.cap_emits_mask,
+                    .cap_clears_mask = header_meta.cap_clears_mask,
+                    .link_section_name = interned_link_sec,
+                    .link_name_text = interned_link_name,
+                    .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
+                    .has_cfg_attr = header_meta.has_cfg_attr,
+                }, diagnostic_sink);
+
+                if (extracted_params.specs.len > 0) {
+                    try sym_table.setFnParamSpecs(defined_sym_idx, extracted_params.specs);
+                }
+                const gen_specs = try extractGenericParamSpecsFromItemCst(
+                    sym_table.allocator,
+                    interner,
+                    item_cst,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                );
+                defer sym_table.allocator.free(gen_specs);
+                if (gen_specs.len > 0) {
+                    try sym_table.setGenericParamSpecs(defined_sym_idx, gen_specs);
+                }
+            },
+            .test_decl, .bench_decl => {
+                const desc_slice = extractTestOrBenchDescriptionSlice(
+                    source,
+                    token_buffer,
+                    cst_arena,
+                    item_cst,
+                    ast_node.main_token,
+                );
+                if (desc_slice.len == 0) continue;
+                const desc_sym = try interner.intern(desc_slice);
+                const desc_span = token_buffer.getTokenSpan(file_id, ast_node.main_token);
+                flags.is_used = true;
+                extra_flags.is_test = (ast_node.tag == .test_decl);
+                extra_flags.is_bench = (ast_node.tag == .bench_decl);
+
+                const effective_owner_def = if (!def_id.isNone()) def_id else enclosing_owner_def;
+                const extracted_params = try extractFnParamSpecsFromItemCst(
+                    sym_table.allocator,
+                    interner,
+                    file_id,
+                    effective_owner_def,
+                    item_cst,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                );
+                defer sym_table.allocator.free(extracted_params.specs);
+
+                const defined_sym_idx = try sym_table.defineSymbol(.{
+                    .name = desc_sym,
+                    .name_text = interner.get(desc_sym),
+                    .kind = .fn_sym,
+                    .namespace = .value_ns,
+                    .visibility = visibility,
+                    .flags = flags,
+                    .extra_flags = extra_flags,
+                    .scope_id = enclosing_scope,
+                    .def_id = def_id,
+                    .owner_def_id = enclosing_owner_def,
+                    .ast_node = item_node_idx,
+                    .cst_node = item_cst,
+                    .decl_span = desc_span,
+                    .contract_flags = header_meta.contract_flags,
+                    .max_stack_bytes = header_meta.max_stack_bytes,
+                    .has_cfg_attr = header_meta.has_cfg_attr,
+                }, diagnostic_sink);
+
+                if (extracted_params.specs.len > 0) {
+                    try sym_table.setFnParamSpecs(defined_sym_idx, extracted_params.specs);
+                }
+            },
+            .impl_decl => {
+                // Collect methods inside `impl [Trait for] TargetType { … }` into `TargetType`'s member scope:
+                const impl_target = try resolveImplTargetScope(
+                    sym_table,
+                    interner,
+                    file_id,
+                    enclosing_scope,
+                    def_id,
+                    item_cst,
+                    ast_node,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                    ast_arena,
+                );
+                const member_items = computeRhsExtraSliceWithEnds(ast_arena, item_node_idx, extra_ends);
+                const pre_sym_len = sym_table.symbols.items.len;
+                try collectItemSliceInScope(
+                    sym_table,
+                    interner,
+                    file_id,
+                    impl_target.target_scope,
+                    false,
+                    def_id,
+                    member_items,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                    ast_arena,
+                    extra_ends,
+                    diagnostic_sink,
+                );
+                if (header_meta.has_cfg_attr or !impl_target.trait_sym_idx.isNone()) {
+                    var sym_i = pre_sym_len;
+                    while (sym_i < sym_table.symbols.items.len) : (sym_i += 1) {
+                        const added_sym = &sym_table.symbols.items[sym_i];
+                        if (added_sym.scope_id == impl_target.target_scope) {
+                            if (header_meta.has_cfg_attr) {
+                                added_sym.has_cfg_attr = true;
+                                added_sym.enclosing_cfg_cst = item_cst;
+                            }
+                            if (!impl_target.trait_sym_idx.isNone() and added_sym.kind == .fn_sym) {
+                                try sym_table.impl_method_trait.put(
+                                    sym_table.allocator,
+                                    @intCast(sym_i),
+                                    impl_target.trait_sym_idx,
+                                );
+                            }
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+    }
 }
 
 // ------------------------------------- PUBLIC API --------------------------------------
@@ -4311,76 +5456,6 @@ fn extractMaxStackAttr(
     }
 }
 
-/// Extracts a single string literal argument inside `[arg_start .. attr_end)` into `dest_buf` and `dest_len`.
-fn extractSingleStringAttrIntoBuf(
-    source: []const u8,
-    token_buffer: *const TokenBuffer,
-    cst_arena: *const LosslessCstArena,
-    arg_start: usize,
-    attr_end: usize,
-    dest_buf: *[256]u8,
-    dest_len: *u16,
-) void {
-    var arg_cur = arg_start;
-    while (arg_cur < attr_end) : (arg_cur += 1) {
-        const arg_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cur)));
-        if (arg_leaf.subtree_size <= 1 and !arg_leaf.token.isNone() and
-            arg_leaf.token.asInt() < token_buffer.countTokens())
-        {
-            const arg_kind = token_buffer.getToken(arg_leaf.token).kind;
-            if (arg_kind == .string_lit or arg_kind == .byte_string_lit) {
-                var unesc_buf: [256]u8 = undefined;
-                const unquoted = unquoteAttrStringLexeme(
-                    extractTokenSlice(source, token_buffer, arg_leaf.token),
-                    &unesc_buf,
-                );
-                const copy_len = @min(unquoted.len, dest_buf.len);
-                @memcpy(dest_buf[0..copy_len], unquoted[0..copy_len]);
-                dest_len.* = @intCast(copy_len);
-                break;
-            }
-        }
-    }
-}
-
-/// Extracts `@wasm_import("mod", "name")` string literal arguments inside `[arg_start .. attr_end)`.
-fn extractWasmImportAttr(
-    source: []const u8,
-    token_buffer: *const TokenBuffer,
-    cst_arena: *const LosslessCstArena,
-    arg_start: usize,
-    attr_end: usize,
-    meta: *ItemHeaderMetadata,
-) void {
-    var seen_strings: u8 = 0;
-    var arg_cur = arg_start;
-    while (arg_cur < attr_end and seen_strings < 2) : (arg_cur += 1) {
-        const arg_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cur)));
-        if (arg_leaf.subtree_size <= 1 and !arg_leaf.token.isNone() and
-            arg_leaf.token.asInt() < token_buffer.countTokens())
-        {
-            const arg_kind = token_buffer.getToken(arg_leaf.token).kind;
-            if (arg_kind == .string_lit or arg_kind == .byte_string_lit) {
-                var unesc_buf: [256]u8 = undefined;
-                const unquoted = unquoteAttrStringLexeme(
-                    extractTokenSlice(source, token_buffer, arg_leaf.token),
-                    &unesc_buf,
-                );
-                if (seen_strings == 0) {
-                    const copy_len = @min(unquoted.len, meta.wasm_import_mod_buf.len);
-                    @memcpy(meta.wasm_import_mod_buf[0..copy_len], unquoted[0..copy_len]);
-                    meta.wasm_import_mod_len = @intCast(copy_len);
-                } else {
-                    const copy_len = @min(unquoted.len, meta.wasm_import_name_buf.len);
-                    @memcpy(meta.wasm_import_name_buf[0..copy_len], unquoted[0..copy_len]);
-                    meta.wasm_import_name_len = @intCast(copy_len);
-                }
-                seen_strings += 1;
-            }
-        }
-    }
-}
-
 /// Extracts item flags, `comptime` modifier, `@derive(…)`, and `@attribute_schema(…)` metadata from `item_cst`.
 pub fn extractItemHeaderMetadata(
     source: []const u8,
@@ -4602,7 +5677,10 @@ fn extractItemHeaderMetadataWithInterner(
                                 .local => meta.contract_flags.is_local_only = true,
                                 .cache_aligned => meta.contract_flags.is_cache_aligned = true,
                                 .packed_attr => meta.contract_flags.is_packed = true,
-                                .trusted => meta.is_trusted = true,
+                                .trusted => {
+                                    meta.is_trusted = true;
+                                    meta.extra_flags.is_trusted_ffi = true;
+                                },
                                 .thread_local => {
                                     meta.is_thread_local = true;
                                     meta.extra_flags.is_thread_local = true;
@@ -6052,181 +7130,6 @@ pub fn suppressCPrimitiveTypeCasingWarnings(
     sink.diagnostics.items.len = write_idx;
 }
 
-/// Evaluates `@cfg` predicates on symbols in `scope_id` against `sym_table.cfg_env` to keep `scoped_map` synchronized
-/// for cross-file `use` resolution before `TypeChecker` runs (`core/ffi.cx` `@cfg` `c_char` twins).
-fn pruneScopeMapWithCfgEnvQuiet(
-    sym_table: *SymbolTable,
-    file_id: FileId,
-    source: []const u8,
-    token_buffer: *const TokenBuffer,
-    cst_arena: *const LosslessCstArena,
-    scope_id: ScopeId,
-    depth: u32,
-) !void {
-    if (scope_id.isNone() or depth >= MAX_SCOPE_DEPTH) return;
-    const members_copy = try sym_table.allocator.dupe(
-        SymbolIndex,
-        sym_table.getScopeMembers(scope_id),
-    );
-    defer sym_table.allocator.free(members_copy);
-
-    for (members_copy) |sym_idx| {
-        const sym = sym_table.getSymbol(sym_idx).*;
-        if (sym.flags.is_builtin or sym.flags.is_imported) continue;
-        if (sym.kind == .overload_group_sym) continue;
-
-        if (sym.has_cfg_attr) {
-            const is_own_enabled = if (!sym.cst_node.isNone())
-                (evaluateCstNodeCfgWithEnv(
-                    &sym_table.cfg_env,
-                    file_id,
-                    source,
-                    token_buffer,
-                    cst_arena,
-                    sym.cst_node,
-                    null,
-                ) catch true)
-            else
-                true;
-            const is_enc_enabled = if (!sym.enclosing_cfg_cst.isNone())
-                (evaluateCstNodeCfgWithEnv(
-                    &sym_table.cfg_env,
-                    file_id,
-                    source,
-                    token_buffer,
-                    cst_arena,
-                    sym.enclosing_cfg_cst,
-                    null,
-                ) catch true)
-            else
-                true;
-            const key = packScopedSymbolKey(scope_id, sym.name, sym.namespace);
-            if (!(is_own_enabled and is_enc_enabled)) {
-                if (sym_table.scoped_map.get(key)) |mapped_idx| {
-                    if (mapped_idx == sym_idx) {
-                        _ = sym_table.scoped_map.remove(key);
-                    }
-                }
-                continue;
-            }
-            if (sym_table.scoped_map.get(key) == null) {
-                try sym_table.scoped_map.put(sym_table.allocator, key, sym_idx);
-            }
-        }
-
-        if (!sym.target_scope.isNone() and
-            sym_table.scope_arena.getScope(sym.target_scope).file_id == file_id)
-        {
-            try pruneScopeMapWithCfgEnvQuiet(
-                sym_table,
-                file_id,
-                source,
-                token_buffer,
-                cst_arena,
-                sym.target_scope,
-                depth + 1,
-            );
-        }
-    }
-}
-
-/// Extracts any explicit `extern "ABI"` string and `unsafe` prefix before `main_token` in `item_cst`.
-fn extractItemExternAbiAndUnsafe(
-    source: []const u8,
-    token_buffer: *const TokenBuffer,
-    cst_arena: *const LosslessCstArena,
-    item_cst: CstNodeIndex,
-    main_token: TokenIndex,
-    abi_out_buf: *[256]u8,
-) struct { abi_slice: []const u8, is_unsafe: bool } {
-    var abi_slice: []const u8 = "";
-    var is_unsafe = false;
-    if (item_cst.isNone() or item_cst.asInt() >= cst_arena.countNodes()) {
-        return .{ .abi_slice = abi_slice, .is_unsafe = is_unsafe };
-    }
-    const start_idx: usize = item_cst.asInt();
-    const root_rec = cst_arena.getNode(item_cst);
-    const end_idx: usize = @min(
-        start_idx + @max(@as(usize, root_rec.subtree_size), 1),
-        cst_arena.countNodes(),
-    );
-    var has_seen_extern = false;
-    var cursor: usize = start_idx + 1;
-    while (cursor < end_idx) : (cursor += 1) {
-        const node = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cursor)));
-        if (node.kind == .attribute or node.kind == .visibility_modifier) {
-            if (node.subtree_size > 1) cursor += @as(usize, node.subtree_size) - 1;
-            continue;
-        }
-        if (!node.token.isNone() and !main_token.isNone() and node.token.asInt() >= main_token.asInt()) {
-            break;
-        }
-        if (node.subtree_size <= 1 and !node.flags.is_bracketed and !node.token.isNone() and
-            node.token.asInt() < token_buffer.countTokens())
-        {
-            const tok_kind = token_buffer.getToken(node.token).kind;
-            if (tok_kind == .kw_unsafe) {
-                is_unsafe = true;
-                has_seen_extern = false;
-            } else if (tok_kind == .kw_extern) {
-                has_seen_extern = true;
-            } else if (has_seen_extern and tok_kind == .string_lit) {
-                abi_slice = unquoteAttrStringLexeme(
-                    extractTokenSlice(source, token_buffer, node.token),
-                    abi_out_buf,
-                );
-                has_seen_extern = false;
-            } else {
-                has_seen_extern = false;
-            }
-        }
-    }
-    return .{ .abi_slice = abi_slice, .is_unsafe = is_unsafe };
-}
-
-/// Populates or updates initial linkage/trust `FfiFnContract` metadata on `sym_idx` when FFI attributes are present.
-fn recordHeaderFfiContractIfPresent(
-    sym_table: *SymbolTable,
-    interner: *StringInterner,
-    sym_idx: SymbolIndex,
-    is_extern: bool,
-    is_unsafe_extern: bool,
-    abi_slice: []const u8,
-    header_meta: *const ItemHeaderMetadata,
-) !void {
-    const link_lib_slice = header_meta.asLinkLibSlice();
-    const wasm_mod_slice = header_meta.asWasmImportModSlice();
-    const wasm_name_slice = header_meta.asWasmImportNameSlice();
-    const wasm_exp_slice = header_meta.asWasmExportSlice();
-    const has_any = header_meta.is_trusted or
-        header_meta.is_thread_local or
-        is_unsafe_extern or
-        abi_slice.len > 0 or
-        link_lib_slice.len > 0 or
-        wasm_mod_slice.len > 0 or
-        wasm_name_slice.len > 0 or
-        wasm_exp_slice.len > 0;
-    if (!has_any and !is_extern) return;
-    if (!has_any) return;
-
-    const abi_id: SymbolId = if (abi_slice.len > 0) try interner.intern(abi_slice) else .empty;
-    const link_lib_id: SymbolId = if (link_lib_slice.len > 0) try interner.intern(link_lib_slice) else .empty;
-    const wasm_mod_id: SymbolId = if (wasm_mod_slice.len > 0) try interner.intern(wasm_mod_slice) else .empty;
-    const wasm_name_id: SymbolId = if (wasm_name_slice.len > 0) try interner.intern(wasm_name_slice) else .empty;
-    const wasm_exp_id: SymbolId = if (wasm_exp_slice.len > 0) try interner.intern(wasm_exp_slice) else .empty;
-
-    try sym_table.setFfiContract(sym_idx, .{
-        .is_trusted = header_meta.is_trusted,
-        .is_thread_local = header_meta.is_thread_local,
-        .is_unsafe_extern = is_unsafe_extern,
-        .abi_name = abi_id,
-        .wasm_import_module = wasm_mod_id,
-        .wasm_import_name = wasm_name_id,
-        .wasm_export_name = wasm_exp_id,
-        .link_lib_name = link_lib_id,
-    }, &.{});
-}
-
 /// Collects all top-level items inside `file_id` (and nested inline `mod` blocks) into `sym_table`.
 pub fn collectFileModuleItems(
     sym_table: *SymbolTable,
@@ -6404,901 +7307,6 @@ fn collectItemSliceInScope(
         extra_ends,
         diagnostic_sink,
     );
-}
-
-/// Collects AST items into `enclosing_scope`, advancing `top_ordinal_ptr` across flattened top-level `extern` blocks.
-fn collectItemSliceInScopeWithOrdinal(
-    sym_table: *SymbolTable,
-    interner: *StringInterner,
-    file_id: FileId,
-    enclosing_scope: ScopeId,
-    top_ordinal_ptr: ?*u12,
-    enclosing_owner_def: DefId,
-    item_slice: []const u32,
-    source: []const u8,
-    token_buffer: *const TokenBuffer,
-    cst_arena: *const LosslessCstArena,
-    ast_arena: *const AstArena,
-    extra_ends: []const u32,
-    diagnostic_sink: ?*DiagnosticSink,
-) anyerror!void {
-    for (item_slice) |raw_node_idx| {
-        const item_node_idx = NodeIndex.fromInt(raw_node_idx);
-        if (item_node_idx.asInt() >= ast_arena.countNodes()) continue;
-        const ast_node = ast_arena.getNode(item_node_idx);
-        if (ast_node.tag == .item_hole) continue;
-        if (!sym_table.is_including_tests and (ast_node.tag == .test_decl or ast_node.tag == .bench_decl)) {
-            continue;
-        }
-
-        const def_id: DefId = if (ast_node.tag != .extern_block_decl) blk: {
-            if (top_ordinal_ptr) |ord_ptr| {
-                const current_def = DefId.init(file_id, ord_ptr.*);
-                if (ord_ptr.* < std.math.maxInt(u12)) ord_ptr.* += 1;
-                break :blk current_def;
-            }
-            break :blk .NONE;
-        } else .NONE;
-
-        const item_cst = ast_arena.getCstOrigin(item_node_idx);
-        const header_meta = try extractItemHeaderMetadataWithInterner(
-            source,
-            file_id,
-            token_buffer,
-            cst_arena,
-            item_cst,
-            ast_node.main_token,
-            interner,
-            diagnostic_sink,
-        );
-        const visibility = header_meta.visibility;
-        var flags = header_meta.flags;
-        flags.is_pub = (visibility == .public);
-        var extra_flags = header_meta.extra_flags;
-        const link_sec_slice = header_meta.asLinkSectionSlice();
-        const interned_link_sec: []const u8 = if (link_sec_slice.len > 0)
-            interner.get(try interner.intern(link_sec_slice))
-        else
-            "";
-        const link_name_slice = header_meta.asLinkNameSlice();
-        const interned_link_name: []const u8 = if (link_name_slice.len > 0)
-            interner.get(try interner.intern(link_name_slice))
-        else
-            "";
-
-        switch (ast_node.tag) {
-            .mod_decl => {
-                const name_tok = if (ast_node.lhs.tag == .token)
-                    TokenIndex.fromInt(ast_node.lhs.payload)
-                else
-                    findItemNameToken(token_buffer, cst_arena, item_cst, ast_node.main_token);
-                const name_str = extractTokenSlice(source, token_buffer, name_tok);
-                if (name_str.len == 0) continue;
-                const name_sym = try interner.intern(name_str);
-                const name_span = token_buffer.getTokenSpan(file_id, name_tok);
-
-                const bound_ext_scope: ScopeId = if (ast_node.rhs.tag != .extra) blk: {
-                    const direct_ext = sym_table.getExternalModuleScope(file_id, name_sym);
-                    if (!direct_ext.isNone()) break :blk direct_ext;
-                    break :blk sym_table.named_module_scopes.get(name_sym.asInt()) orelse .none;
-                } else .none;
-                const mod_scope = if (!bound_ext_scope.isNone()) blk: {
-                    const parent_mod = sym_table.scope_arena.getScope(enclosing_scope).enclosing_module;
-                    if (!parent_mod.isNone()) {
-                        sym_table.scope_arena.setParentModule(bound_ext_scope, parent_mod);
-                    }
-                    break :blk bound_ext_scope;
-                } else blk: {
-                    const fresh_scope = try sym_table.scope_arena.allocScope(
-                        .module_scope,
-                        enclosing_scope,
-                        def_id,
-                        file_id,
-                        .{},
-                    );
-                    try sym_table.named_module_scopes.put(sym_table.allocator, name_sym.asInt(), fresh_scope);
-                    break :blk fresh_scope;
-                };
-
-                _ = try sym_table.defineSymbol(.{
-                    .name = name_sym,
-                    .name_text = interner.get(name_sym),
-                    .kind = .module_sym,
-                    .namespace = .value_ns,
-                    .visibility = visibility,
-                    .flags = flags,
-                    .extra_flags = extra_flags,
-                    .scope_id = enclosing_scope,
-                    .def_id = def_id,
-                    .ast_node = item_node_idx,
-                    .cst_node = item_cst,
-                    .decl_span = name_span,
-                    .target_scope = mod_scope,
-                    .has_cfg_attr = header_meta.has_cfg_attr,
-                }, diagnostic_sink);
-
-                // Collect inline `mod foo { … }` sub-items:
-                if (ast_node.rhs.tag == .extra) {
-                    const inner_items = computeRhsExtraSliceWithEnds(ast_arena, item_node_idx, extra_ends);
-                    try collectItemSliceInScope(
-                        sym_table,
-                        interner,
-                        file_id,
-                        mod_scope,
-                        false,
-                        .NONE,
-                        inner_items,
-                        source,
-                        token_buffer,
-                        cst_arena,
-                        ast_arena,
-                        extra_ends,
-                        diagnostic_sink,
-                    );
-                }
-            },
-            .use_decl => {
-                try sym_table.pending_imports.append(sym_table.allocator, .{
-                    .module_scope = enclosing_scope,
-                    .file_id = file_id,
-                    .def_id = def_id,
-                    .visibility = visibility,
-                    .ast_node = item_node_idx,
-                    .cst_node = item_cst,
-                });
-            },
-            .struct_decl, .union_decl, .bit_field_decl => {
-                const is_bit_field = ast_node.tag == .bit_field_decl or
-                    (!ast_node.main_token.isNone() and
-                        ast_node.main_token.asInt() < token_buffer.countTokens() and
-                        token_buffer.getToken(ast_node.main_token).kind == .kw_bit_field);
-                const name_tok = findItemNameToken(token_buffer, cst_arena, item_cst, ast_node.main_token);
-                const name_str = extractTokenSlice(source, token_buffer, name_tok);
-                if (name_str.len == 0) continue;
-                const name_sym = try interner.intern(name_str);
-                const name_span = token_buffer.getTokenSpan(file_id, name_tok);
-
-                const member_scope = try sym_table.scope_arena.allocScope(
-                    .nominal_type_scope,
-                    enclosing_scope,
-                    def_id,
-                    file_id,
-                    .{},
-                );
-                const sym_kind: SymbolKind = if (is_bit_field)
-                    .bit_field_sym
-                else if (ast_node.tag == .union_decl)
-                    .union_sym
-                else
-                    .struct_sym;
-
-                const defined_sym_idx = try sym_table.defineSymbol(.{
-                    .name = name_sym,
-                    .name_text = interner.get(name_sym),
-                    .kind = sym_kind,
-                    .namespace = .type_ns,
-                    .visibility = visibility,
-                    .flags = flags,
-                    .extra_flags = extra_flags,
-                    .scope_id = enclosing_scope,
-                    .def_id = def_id,
-                    .ast_node = item_node_idx,
-                    .cst_node = item_cst,
-                    .decl_span = name_span,
-                    .target_scope = member_scope,
-                    .derive_mask = header_meta.derive_mask,
-                    .attr_target_mask = header_meta.attr_target_mask,
-                    .contract_flags = header_meta.contract_flags,
-                    .max_stack_bytes = header_meta.max_stack_bytes,
-                    .cap_emits_mask = header_meta.cap_emits_mask,
-                    .cap_clears_mask = header_meta.cap_clears_mask,
-                    .link_section_name = interned_link_sec,
-                    .link_name_text = interned_link_name,
-                    .repr_tag_bits = header_meta.repr_tag_bits,
-                    .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
-                    .has_cfg_attr = header_meta.has_cfg_attr,
-                }, diagnostic_sink);
-
-                const gen_specs = try extractGenericParamSpecsFromItemCst(
-                    sym_table.allocator,
-                    interner,
-                    item_cst,
-                    source,
-                    token_buffer,
-                    cst_arena,
-                );
-                defer sym_table.allocator.free(gen_specs);
-                if (gen_specs.len > 0) {
-                    try sym_table.setGenericParamSpecs(defined_sym_idx, gen_specs);
-                }
-
-                try collectStructOrBitFieldMembers(
-                    sym_table,
-                    interner,
-                    file_id,
-                    member_scope,
-                    item_cst,
-                    source,
-                    token_buffer,
-                    cst_arena,
-                    diagnostic_sink,
-                );
-            },
-            .enum_decl => {
-                const name_tok = findItemNameToken(token_buffer, cst_arena, item_cst, ast_node.main_token);
-                const name_str = extractTokenSlice(source, token_buffer, name_tok);
-                if (name_str.len == 0) continue;
-                const name_sym = try interner.intern(name_str);
-                const name_span = token_buffer.getTokenSpan(file_id, name_tok);
-
-                if (extra_flags.has_repr_int) {
-                    if (diagnostic_sink) |sink| {
-                        try emitRetiredEnumReprIntDiagnostic(
-                            sink,
-                            file_id,
-                            source,
-                            token_buffer,
-                            name_str,
-                            header_meta.repr_int_token,
-                        );
-                    }
-                }
-
-                const variant_scope = try sym_table.scope_arena.allocScope(
-                    .nominal_type_scope,
-                    enclosing_scope,
-                    def_id,
-                    file_id,
-                    .{},
-                );
-                const defined_sym_idx = try sym_table.defineSymbol(.{
-                    .name = name_sym,
-                    .name_text = interner.get(name_sym),
-                    .kind = .enum_sym,
-                    .namespace = .type_ns,
-                    .visibility = visibility,
-                    .flags = flags,
-                    .extra_flags = extra_flags,
-                    .scope_id = enclosing_scope,
-                    .def_id = def_id,
-                    .ast_node = item_node_idx,
-                    .cst_node = item_cst,
-                    .decl_span = name_span,
-                    .target_scope = variant_scope,
-                    .derive_mask = header_meta.derive_mask,
-                    .attr_target_mask = header_meta.attr_target_mask,
-                    .contract_flags = header_meta.contract_flags,
-                    .max_stack_bytes = header_meta.max_stack_bytes,
-                    .cap_emits_mask = header_meta.cap_emits_mask,
-                    .cap_clears_mask = header_meta.cap_clears_mask,
-                    .link_section_name = interned_link_sec,
-                    .link_name_text = interned_link_name,
-                    .repr_tag_bits = header_meta.repr_tag_bits,
-                    .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
-                    .has_cfg_attr = header_meta.has_cfg_attr,
-                }, diagnostic_sink);
-
-                const gen_specs = try extractGenericParamSpecsFromItemCst(
-                    sym_table.allocator,
-                    interner,
-                    item_cst,
-                    source,
-                    token_buffer,
-                    cst_arena,
-                );
-                defer sym_table.allocator.free(gen_specs);
-                if (gen_specs.len > 0) {
-                    try sym_table.setGenericParamSpecs(defined_sym_idx, gen_specs);
-                }
-
-                try collectEnumVariants(
-                    sym_table,
-                    interner,
-                    file_id,
-                    variant_scope,
-                    visibility,
-                    item_cst,
-                    source,
-                    token_buffer,
-                    cst_arena,
-                    diagnostic_sink,
-                );
-            },
-            .trait_decl => {
-                const name_tok = findItemNameToken(token_buffer, cst_arena, item_cst, ast_node.main_token);
-                const name_str = extractTokenSlice(source, token_buffer, name_tok);
-                if (name_str.len == 0) continue;
-                const name_sym = try interner.intern(name_str);
-                const name_span = token_buffer.getTokenSpan(file_id, name_tok);
-
-                const trait_scope = try sym_table.scope_arena.allocScope(
-                    .trait_scope,
-                    enclosing_scope,
-                    def_id,
-                    file_id,
-                    .{},
-                );
-                const defined_sym_idx = try sym_table.defineSymbol(.{
-                    .name = name_sym,
-                    .name_text = interner.get(name_sym),
-                    .kind = .trait_sym,
-                    .namespace = .type_ns,
-                    .visibility = visibility,
-                    .flags = flags,
-                    .extra_flags = extra_flags,
-                    .scope_id = enclosing_scope,
-                    .def_id = def_id,
-                    .ast_node = item_node_idx,
-                    .cst_node = item_cst,
-                    .decl_span = name_span,
-                    .target_scope = trait_scope,
-                    .contract_flags = header_meta.contract_flags,
-                    .has_cfg_attr = header_meta.has_cfg_attr,
-                }, diagnostic_sink);
-
-                const gen_specs = try extractGenericParamSpecsFromItemCst(
-                    sym_table.allocator,
-                    interner,
-                    item_cst,
-                    source,
-                    token_buffer,
-                    cst_arena,
-                );
-                defer sym_table.allocator.free(gen_specs);
-                if (gen_specs.len > 0) {
-                    try sym_table.setGenericParamSpecs(defined_sym_idx, gen_specs);
-                }
-
-                if (ast_node.lhs.tag == .extra and ast_node.rhs.tag == .extra and ast_node.rhs.payload > 0) {
-                    const member_slice = ast_arena.getExtraSlice(
-                        ExtraIndex.fromInt(ast_node.lhs.payload),
-                        ast_node.rhs.payload,
-                    );
-                    try collectItemSliceInScope(
-                        sym_table,
-                        interner,
-                        file_id,
-                        trait_scope,
-                        false,
-                        .NONE,
-                        member_slice,
-                        source,
-                        token_buffer,
-                        cst_arena,
-                        ast_arena,
-                        extra_ends,
-                        diagnostic_sink,
-                    );
-                }
-            },
-            .type_alias_decl => {
-                const name_tok = findItemNameToken(token_buffer, cst_arena, item_cst, ast_node.main_token);
-                const name_str = extractTokenSlice(source, token_buffer, name_tok);
-                if (name_str.len == 0) continue;
-                const name_sym = try interner.intern(name_str);
-                const name_span = token_buffer.getTokenSpan(file_id, name_tok);
-
-                const gen_specs = try extractGenericParamSpecsFromItemCst(
-                    sym_table.allocator,
-                    interner,
-                    item_cst,
-                    source,
-                    token_buffer,
-                    cst_arena,
-                );
-                defer sym_table.allocator.free(gen_specs);
-
-                // Classify whether this `type` item is a `bit_field`, Type Group (`|`/`+`), `is` refinement, or `distinct`:
-                var alias_kind: SymbolKind = .type_alias_sym;
-                var bf_member_scope: ScopeId = .none;
-                if (hasKeywordInCst(token_buffer, cst_arena, item_cst, .kw_bit_field)) {
-                    alias_kind = .bit_field_sym;
-                    bf_member_scope = try sym_table.scope_arena.allocScope(
-                        .nominal_type_scope,
-                        enclosing_scope,
-                        def_id,
-                        file_id,
-                        .{},
-                    );
-                } else if (ast_node.lhs.tag == .extra and ast_node.rhs.tag == .extra) {
-                    alias_kind = .type_group_sym;
-                    flags.is_type_group = true;
-                } else if (ast_node.rhs.tag == .node) {
-                    alias_kind = .refined_type_sym;
-                    flags.is_refined = true;
-                } else if (ast_node.lhs.tag == .node) {
-                    const target_ast = ast_arena.getNode(NodeIndex.fromInt(ast_node.lhs.payload));
-                    if (target_ast.tag == .union_bound_type or target_ast.tag == .intersect_bound_type) {
-                        alias_kind = .type_group_sym;
-                        flags.is_type_group = true;
-                    } else if (target_ast.tag == .mode_type) {
-                        const mode_lexeme = extractTokenSlice(source, token_buffer, target_ast.main_token);
-                        if (std.mem.eql(u8, mode_lexeme, "distinct")) {
-                            alias_kind = .distinct_type_sym;
-                            flags.is_distinct = true;
-                        }
-                    }
-                }
-                if (bf_member_scope.isNone() and gen_specs.len > 0) {
-                    bf_member_scope = try sym_table.scope_arena.allocScope(
-                        .nominal_type_scope,
-                        enclosing_scope,
-                        def_id,
-                        file_id,
-                        .{},
-                    );
-                }
-
-                const defined_sym_idx = try sym_table.defineSymbol(.{
-                    .name = name_sym,
-                    .name_text = interner.get(name_sym),
-                    .kind = alias_kind,
-                    .namespace = .type_ns,
-                    .visibility = visibility,
-                    .flags = flags,
-                    .extra_flags = extra_flags,
-                    .scope_id = enclosing_scope,
-                    .def_id = def_id,
-                    .ast_node = item_node_idx,
-                    .cst_node = item_cst,
-                    .decl_span = name_span,
-                    .target_scope = bf_member_scope,
-                    .contract_flags = header_meta.contract_flags,
-                    .link_section_name = interned_link_sec,
-                    .link_name_text = interned_link_name,
-                    .repr_tag_bits = header_meta.repr_tag_bits,
-                    .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
-                    .has_cfg_attr = header_meta.has_cfg_attr,
-                }, diagnostic_sink);
-
-                if (gen_specs.len > 0) {
-                    try sym_table.setGenericParamSpecs(defined_sym_idx, gen_specs);
-                }
-
-                if (alias_kind == .bit_field_sym and !bf_member_scope.isNone()) {
-                    try collectStructOrBitFieldMembers(
-                        sym_table,
-                        interner,
-                        file_id,
-                        bf_member_scope,
-                        item_cst,
-                        source,
-                        token_buffer,
-                        cst_arena,
-                        diagnostic_sink,
-                    );
-                }
-            },
-            .const_decl => {
-                const name_tok = findItemNameToken(token_buffer, cst_arena, item_cst, ast_node.main_token);
-                const name_str = extractTokenSlice(source, token_buffer, name_tok);
-                if (name_str.len == 0) continue;
-                const name_sym = try interner.intern(name_str);
-                const name_span = token_buffer.getTokenSpan(file_id, name_tok);
-
-                _ = try sym_table.defineSymbol(.{
-                    .name = name_sym,
-                    .name_text = interner.get(name_sym),
-                    .kind = .const_sym,
-                    .namespace = .const_ns,
-                    .visibility = visibility,
-                    .flags = flags,
-                    .extra_flags = extra_flags,
-                    .scope_id = enclosing_scope,
-                    .def_id = def_id,
-                    .owner_def_id = enclosing_owner_def,
-                    .ast_node = item_node_idx,
-                    .cst_node = item_cst,
-                    .decl_span = name_span,
-                    .contract_flags = header_meta.contract_flags,
-                    .link_section_name = interned_link_sec,
-                    .link_name_text = interned_link_name,
-                    .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
-                    .has_cfg_attr = header_meta.has_cfg_attr,
-                }, diagnostic_sink);
-            },
-            .fn_decl => {
-                const name_tok = findItemNameToken(token_buffer, cst_arena, item_cst, ast_node.main_token);
-                const name_str = extractTokenSlice(source, token_buffer, name_tok);
-                if (name_str.len == 0) continue;
-                const name_sym = try interner.intern(name_str);
-                const name_span = token_buffer.getTokenSpan(file_id, name_tok);
-                flags.is_prototype_only = (ast_node.rhs.tag == .none);
-
-                const effective_owner_def = if (!def_id.isNone()) def_id else enclosing_owner_def;
-                const extracted_params = try extractFnParamSpecsFromItemCst(
-                    sym_table.allocator,
-                    interner,
-                    file_id,
-                    effective_owner_def,
-                    item_cst,
-                    source,
-                    token_buffer,
-                    cst_arena,
-                );
-                defer sym_table.allocator.free(extracted_params.specs);
-                extra_flags.is_variadic = extracted_params.is_variadic;
-
-                const defined_sym_idx = try sym_table.defineSymbol(.{
-                    .name = name_sym,
-                    .name_text = interner.get(name_sym),
-                    .kind = .fn_sym,
-                    .namespace = .value_ns,
-                    .visibility = visibility,
-                    .flags = flags,
-                    .extra_flags = extra_flags,
-                    .scope_id = enclosing_scope,
-                    .def_id = def_id,
-                    .owner_def_id = enclosing_owner_def,
-                    .ast_node = item_node_idx,
-                    .cst_node = item_cst,
-                    .decl_span = name_span,
-                    .contract_flags = header_meta.contract_flags,
-                    .max_stack_bytes = header_meta.max_stack_bytes,
-                    .cap_emits_mask = header_meta.cap_emits_mask,
-                    .cap_clears_mask = header_meta.cap_clears_mask,
-                    .link_section_name = interned_link_sec,
-                    .link_name_text = interned_link_name,
-                    .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
-                    .has_cfg_attr = header_meta.has_cfg_attr,
-                }, diagnostic_sink);
-
-                if (extracted_params.specs.len > 0) {
-                    try sym_table.setFnParamSpecs(defined_sym_idx, extracted_params.specs);
-                }
-                const gen_specs = try extractGenericParamSpecsFromItemCst(
-                    sym_table.allocator,
-                    interner,
-                    item_cst,
-                    source,
-                    token_buffer,
-                    cst_arena,
-                );
-                defer sym_table.allocator.free(gen_specs);
-                if (gen_specs.len > 0) {
-                    try sym_table.setGenericParamSpecs(defined_sym_idx, gen_specs);
-                }
-                var fn_abi_buf: [256]u8 = undefined;
-                const fn_ext_info = extractItemExternAbiAndUnsafe(
-                    source,
-                    token_buffer,
-                    cst_arena,
-                    item_cst,
-                    ast_node.main_token,
-                    &fn_abi_buf,
-                );
-                try recordHeaderFfiContractIfPresent(
-                    sym_table,
-                    interner,
-                    defined_sym_idx,
-                    flags.is_extern,
-                    fn_ext_info.is_unsafe,
-                    fn_ext_info.abi_slice,
-                    &header_meta,
-                );
-            },
-            .extern_static_decl => {
-                const static_extra = ast_arena.getExternStaticExtra(item_node_idx);
-                const name_tok = ast_node.main_token;
-                const name_str = extractTokenSlice(source, token_buffer, name_tok);
-                if (name_str.len == 0) continue;
-                const name_sym = try interner.intern(name_str);
-                const name_span = token_buffer.getTokenSpan(file_id, name_tok);
-
-                const static_vis: Visibility = if (visibility != .private)
-                    visibility
-                else
-                    @fromBackingInt(@backingInt(static_extra.flags.visibility));
-                flags.is_pub = (static_vis == .public);
-                flags.is_extern = static_extra.flags.has_extern;
-                flags.is_mut = static_extra.flags.is_mut;
-
-                const defined_sym_idx = try sym_table.defineSymbol(.{
-                    .name = name_sym,
-                    .name_text = interner.get(name_sym),
-                    .kind = .extern_static_sym,
-                    .namespace = .value_ns,
-                    .visibility = static_vis,
-                    .flags = flags,
-                    .extra_flags = extra_flags,
-                    .scope_id = enclosing_scope,
-                    .def_id = def_id,
-                    .owner_def_id = enclosing_owner_def,
-                    .ast_node = item_node_idx,
-                    .cst_node = item_cst,
-                    .decl_span = name_span,
-                    .contract_flags = header_meta.contract_flags,
-                    .link_section_name = interned_link_sec,
-                    .link_name_text = interned_link_name,
-                    .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
-                    .has_cfg_attr = header_meta.has_cfg_attr,
-                }, diagnostic_sink);
-
-                var static_abi_buf: [256]u8 = undefined;
-                const static_abi_slice: []const u8 = if (!static_extra.abi_tok.isNone())
-                    unquoteAttrStringLexeme(
-                        extractTokenSlice(source, token_buffer, static_extra.abi_tok),
-                        &static_abi_buf,
-                    )
-                else
-                    "";
-                try recordHeaderFfiContractIfPresent(
-                    sym_table,
-                    interner,
-                    defined_sym_idx,
-                    flags.is_extern,
-                    static_extra.flags.is_unsafe,
-                    static_abi_slice,
-                    &header_meta,
-                );
-            },
-            .extern_block_decl => {
-                const block_hdr = ast_arena.getExternBlockHeader(item_node_idx);
-                const member_items = ast_arena.getExternBlockItems(item_node_idx);
-                const outer_vis: Visibility = if (visibility != .private)
-                    visibility
-                else
-                    @fromBackingInt(@backingInt(block_hdr.flags.visibility));
-
-                var block_abi_buf: [256]u8 = undefined;
-                const block_abi_slice: []const u8 = if (!block_hdr.abi_tok.isNone())
-                    unquoteAttrStringLexeme(
-                        extractTokenSlice(source, token_buffer, block_hdr.abi_tok),
-                        &block_abi_buf,
-                    )
-                else
-                    "C";
-                const block_abi_id: SymbolId = if (block_abi_slice.len > 0)
-                    try interner.intern(block_abi_slice)
-                else
-                    .empty;
-                const block_link_lib = header_meta.asLinkLibSlice();
-                const block_link_lib_id: SymbolId = if (block_link_lib.len > 0)
-                    try interner.intern(block_link_lib)
-                else
-                    .empty;
-                const block_wasm_mod = header_meta.asWasmImportModSlice();
-                const block_wasm_mod_id: SymbolId = if (block_wasm_mod.len > 0)
-                    try interner.intern(block_wasm_mod)
-                else
-                    .empty;
-                const block_wasm_name = header_meta.asWasmImportNameSlice();
-                const block_wasm_name_id: SymbolId = if (block_wasm_name.len > 0)
-                    try interner.intern(block_wasm_name)
-                else
-                    .empty;
-
-                const effective_owner_def = if (!def_id.isNone()) def_id else enclosing_owner_def;
-                const pre_sym_len = sym_table.symbols.items.len;
-                try collectItemSliceInScopeWithOrdinal(
-                    sym_table,
-                    interner,
-                    file_id,
-                    enclosing_scope,
-                    top_ordinal_ptr,
-                    effective_owner_def,
-                    member_items,
-                    source,
-                    token_buffer,
-                    cst_arena,
-                    ast_arena,
-                    extra_ends,
-                    diagnostic_sink,
-                );
-
-                var sym_i = pre_sym_len;
-                while (sym_i < sym_table.symbols.items.len) : (sym_i += 1) {
-                    const added_idx = SymbolIndex.fromInt(@intCast(sym_i));
-                    const added_sym = &sym_table.symbols.items[sym_i];
-                    if (added_sym.scope_id != enclosing_scope) continue;
-                    if (added_sym.kind == .overload_group_sym) continue;
-
-                    if (outer_vis != .private and added_sym.visibility == .private) {
-                        added_sym.visibility = outer_vis;
-                        added_sym.flags.is_pub = (outer_vis == .public);
-                    }
-                    if (header_meta.has_cfg_attr) {
-                        added_sym.has_cfg_attr = true;
-                        if (added_sym.enclosing_cfg_cst.isNone()) {
-                            added_sym.enclosing_cfg_cst = item_cst;
-                        }
-                    }
-                    if (added_sym.kind == .fn_sym or added_sym.kind == .extern_static_sym) {
-                        added_sym.flags.is_extern = true;
-                        const existing_contract = if (sym_table.getFfiContract(added_idx)) |ptr|
-                            ptr.*
-                        else
-                            FfiFnContract{};
-                        const has_inherited = header_meta.is_trusted or
-                            header_meta.is_thread_local or
-                            block_hdr.flags.is_unsafe or
-                            block_abi_id != .empty or
-                            block_link_lib_id != .empty or
-                            block_wasm_mod_id != .empty or
-                            block_wasm_name_id != .empty;
-                        if (header_meta.is_thread_local) {
-                            added_sym.extra_flags.is_thread_local = true;
-                        }
-                        if (has_inherited or sym_table.getFfiContract(added_idx) != null) {
-                            var merged = existing_contract;
-                            if (header_meta.is_trusted) merged.is_trusted = true;
-                            if (header_meta.is_thread_local) merged.is_thread_local = true;
-                            if (block_hdr.flags.is_unsafe) merged.is_unsafe_extern = true;
-                            if (merged.abi_name == .empty) merged.abi_name = block_abi_id;
-                            if (merged.link_lib_name == .empty) merged.link_lib_name = block_link_lib_id;
-                            if (merged.wasm_import_module == .empty) merged.wasm_import_module = block_wasm_mod_id;
-                            if (merged.wasm_import_name == .empty) merged.wasm_import_name = block_wasm_name_id;
-                            try sym_table.setFfiContract(added_idx, merged, existing_contract.param_contracts);
-                        }
-                    }
-                }
-            },
-            .subscript_decl => {
-                const sub_sym = try interner.intern("subscript");
-                const sub_span = token_buffer.getTokenSpan(file_id, ast_node.main_token);
-                flags.is_prototype_only = (ast_node.rhs.tag == .none);
-                extra_flags.is_subscript = true;
-
-                const effective_owner_def = if (!def_id.isNone()) def_id else enclosing_owner_def;
-                const extracted_params = try extractFnParamSpecsFromItemCst(
-                    sym_table.allocator,
-                    interner,
-                    file_id,
-                    effective_owner_def,
-                    item_cst,
-                    source,
-                    token_buffer,
-                    cst_arena,
-                );
-                defer sym_table.allocator.free(extracted_params.specs);
-                extra_flags.is_variadic = extracted_params.is_variadic;
-
-                const defined_sym_idx = try sym_table.defineSymbol(.{
-                    .name = sub_sym,
-                    .name_text = interner.get(sub_sym),
-                    .kind = .fn_sym,
-                    .namespace = .value_ns,
-                    .visibility = visibility,
-                    .flags = flags,
-                    .extra_flags = extra_flags,
-                    .scope_id = enclosing_scope,
-                    .def_id = def_id,
-                    .owner_def_id = enclosing_owner_def,
-                    .ast_node = item_node_idx,
-                    .cst_node = item_cst,
-                    .decl_span = sub_span,
-                    .contract_flags = header_meta.contract_flags,
-                    .max_stack_bytes = header_meta.max_stack_bytes,
-                    .cap_emits_mask = header_meta.cap_emits_mask,
-                    .cap_clears_mask = header_meta.cap_clears_mask,
-                    .link_section_name = interned_link_sec,
-                    .link_name_text = interned_link_name,
-                    .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
-                    .has_cfg_attr = header_meta.has_cfg_attr,
-                }, diagnostic_sink);
-
-                if (extracted_params.specs.len > 0) {
-                    try sym_table.setFnParamSpecs(defined_sym_idx, extracted_params.specs);
-                }
-                const gen_specs = try extractGenericParamSpecsFromItemCst(
-                    sym_table.allocator,
-                    interner,
-                    item_cst,
-                    source,
-                    token_buffer,
-                    cst_arena,
-                );
-                defer sym_table.allocator.free(gen_specs);
-                if (gen_specs.len > 0) {
-                    try sym_table.setGenericParamSpecs(defined_sym_idx, gen_specs);
-                }
-            },
-            .test_decl, .bench_decl => {
-                const desc_slice = extractTestOrBenchDescriptionSlice(
-                    source,
-                    token_buffer,
-                    cst_arena,
-                    item_cst,
-                    ast_node.main_token,
-                );
-                if (desc_slice.len == 0) continue;
-                const desc_sym = try interner.intern(desc_slice);
-                const desc_span = token_buffer.getTokenSpan(file_id, ast_node.main_token);
-                flags.is_used = true;
-                extra_flags.is_test = (ast_node.tag == .test_decl);
-                extra_flags.is_bench = (ast_node.tag == .bench_decl);
-
-                const effective_owner_def = if (!def_id.isNone()) def_id else enclosing_owner_def;
-                const extracted_params = try extractFnParamSpecsFromItemCst(
-                    sym_table.allocator,
-                    interner,
-                    file_id,
-                    effective_owner_def,
-                    item_cst,
-                    source,
-                    token_buffer,
-                    cst_arena,
-                );
-                defer sym_table.allocator.free(extracted_params.specs);
-
-                const defined_sym_idx = try sym_table.defineSymbol(.{
-                    .name = desc_sym,
-                    .name_text = interner.get(desc_sym),
-                    .kind = .fn_sym,
-                    .namespace = .value_ns,
-                    .visibility = visibility,
-                    .flags = flags,
-                    .extra_flags = extra_flags,
-                    .scope_id = enclosing_scope,
-                    .def_id = def_id,
-                    .owner_def_id = enclosing_owner_def,
-                    .ast_node = item_node_idx,
-                    .cst_node = item_cst,
-                    .decl_span = desc_span,
-                    .contract_flags = header_meta.contract_flags,
-                    .max_stack_bytes = header_meta.max_stack_bytes,
-                    .has_cfg_attr = header_meta.has_cfg_attr,
-                }, diagnostic_sink);
-
-                if (extracted_params.specs.len > 0) {
-                    try sym_table.setFnParamSpecs(defined_sym_idx, extracted_params.specs);
-                }
-            },
-            .impl_decl => {
-                // Collect methods inside `impl [Trait for] TargetType { … }` into `TargetType`'s member scope:
-                const impl_target = try resolveImplTargetScope(
-                    sym_table,
-                    interner,
-                    file_id,
-                    enclosing_scope,
-                    def_id,
-                    item_cst,
-                    ast_node,
-                    source,
-                    token_buffer,
-                    cst_arena,
-                    ast_arena,
-                );
-                const member_items = computeRhsExtraSliceWithEnds(ast_arena, item_node_idx, extra_ends);
-                const pre_sym_len = sym_table.symbols.items.len;
-                try collectItemSliceInScope(
-                    sym_table,
-                    interner,
-                    file_id,
-                    impl_target.target_scope,
-                    false,
-                    def_id,
-                    member_items,
-                    source,
-                    token_buffer,
-                    cst_arena,
-                    ast_arena,
-                    extra_ends,
-                    diagnostic_sink,
-                );
-                if (header_meta.has_cfg_attr or !impl_target.trait_sym_idx.isNone()) {
-                    var sym_i = pre_sym_len;
-                    while (sym_i < sym_table.symbols.items.len) : (sym_i += 1) {
-                        const added_sym = &sym_table.symbols.items[sym_i];
-                        if (added_sym.scope_id == impl_target.target_scope) {
-                            if (header_meta.has_cfg_attr) {
-                                added_sym.has_cfg_attr = true;
-                                added_sym.enclosing_cfg_cst = item_cst;
-                            }
-                            if (!impl_target.trait_sym_idx.isNone() and added_sym.kind == .fn_sym) {
-                                try sym_table.impl_method_trait.put(
-                                    sym_table.allocator,
-                                    @intCast(sym_i),
-                                    impl_target.trait_sym_idx,
-                                );
-                            }
-                        }
-                    }
-                }
-            },
-            else => {},
-        }
-    }
 }
 
 /// Returns the exact `rhs` `extra_data` slice of `node_idx` matching `computeAstNodeExtraEnds` without overrunning.
@@ -8808,7 +8816,7 @@ test "test_phase8_cfg_11_target_sync_extern_blocks_kw_async_and_c_casing" {
     );
 }
 
-test "test_r3_not_send_not_sync_flags_and_cx_ffi_target_refresh" {
+test "test_symbol_resolver_not_send_not_sync_flags_and_cx_ffi_target_refresh" {
     const parser_mod = @import("parser.zig");
     const allocator = std.testing.allocator;
 

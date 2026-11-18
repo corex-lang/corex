@@ -330,7 +330,7 @@ pub const QueryStage = enum(u8) {
     typecheck_body = 8,
     /// Stage 9: Per-definition SSA MIR SAST memory and exclusivity verification (`DefId -> SastVerificationArtifact`).
     verify_sast_mir = 9,
-    /// Stage 10: Isolated per-definition `AST -> HIR` desugaring (`DefId -> HirStore`, `[CRITICAL-11]`).
+    /// Stage 10: Isolated per-definition `AST -> HIR` desugaring (`DefId -> HirStore`).
     lower_def_hir = 10,
     /// Stage 11: Per-definition Block-Argument SSA `HIR -> MIR` construction (`DefId -> DefMirArtifact`).
     build_def_mir = 11,
@@ -391,7 +391,7 @@ pub const QueryKey = extern struct {
         };
     }
 
-    /// Constructs a synthetic `.source_text` `QueryKey` for a Stage-0 compiler config slot (`[CRITICAL-17]`).
+    /// Constructs a synthetic `.source_text` `QueryKey` for a Stage-0 compiler config slot.
     pub inline fn forConfig(config_entity: u32) QueryKey {
         return .{
             .stage = .source_text,
@@ -401,7 +401,7 @@ pub const QueryKey = extern struct {
         };
     }
 
-    /// Constructs a synthetic `.source_text` `QueryKey` tracking an `@embed_bytes` relative path (`[CRITICAL-02]`).
+    /// Constructs a synthetic `.source_text` `QueryKey` tracking an `@embed_bytes` or `@c_import` file path.
     pub inline fn forEmbedFile(path_symbol: SymbolId) QueryKey {
         return .{
             .stage = .source_text,
@@ -945,6 +945,14 @@ const ExternBlockItemContext = struct {
     header_fingerprint: Fingerprint128,
 };
 
+/// Owned transitive `#include` path and `BLAKE3` content digest stored inside `CImportCache`.
+pub const CImportIncludeDep = struct {
+    /// Owned path string (VFS key or resolved filesystem path) allocated from `CompilerDb.allocator`.
+    owned_path: []u8,
+    /// 256-bit `BLAKE3` content digest observed when the `@c_import` header was translated.
+    content_blake3: [32]u8,
+};
+
 /// Borrowed read-only view of a cached `@c_import` header translation entry (`Durability.medium`).
 pub const CImportCacheView = struct {
     /// 128-bit content-addressed key (`Wyhash` over header bytes, `target_spec.archOsTag()`, and `defines`).
@@ -955,6 +963,8 @@ pub const CImportCacheView = struct {
     virtual_file_id: FileId,
     /// Assigned Salsa durability tier (`.medium`).
     durability: Durability = .medium,
+    /// Borrowed transitive `#include` `(owned_path, content_blake3)` pairs recorded during translation.
+    included_files: []const CImportIncludeDep = &.{},
 };
 
 /// Intrusive doubly-linked LRU slot inside `CImportCache`.
@@ -963,6 +973,8 @@ const CImportCacheNode = struct {
     key: Fingerprint128 = Fingerprint128.ZERO,
     /// Owned canonical `.cx` source buffer allocated from `CompilerDb.allocator`.
     owned_cx_text: []u8 = &.{},
+    /// Owned transitive `#include` `(owned_path, content_blake3)` pairs recorded during translation.
+    included_files: []CImportIncludeDep = &.{},
     /// Virtual `FileId` associated with this translated header.
     virtual_file_id: FileId = .none,
     /// Assigned Salsa durability tier (`.medium`).
@@ -1005,7 +1017,7 @@ pub const CImportCache = struct {
     tail_lru: u32 = NONE_C_IMPORT_LRU,
     /// Active cached entry count (`<= MAX_C_IMPORT_CACHE_ENTRIES`).
     entry_count: usize = 0,
-    /// Total byte length of all active `owned_cx_text` buffers (`<= MAX_C_IMPORT_CACHE_BYTES`).
+    /// Total byte footprint of all active `owned_cx_text` and `included_files` buffers (`<= MAX_C_IMPORT_CACHE_BYTES`).
     total_bytes: usize = 0,
     /// Total number of cache hits observed via `get`.
     hits: u64 = 0,
@@ -1019,11 +1031,54 @@ pub const CImportCache = struct {
         return .{};
     }
 
+    /// Computes the owned byte footprint of `deps` for `MAX_C_IMPORT_CACHE_BYTES` accounting.
+    fn includeDepsByteSize(deps: []const CImportIncludeDep) usize {
+        var bytes: usize = 0;
+        for (deps) |dep| {
+            bytes +|= dep.owned_path.len + @sizeOf([32]u8);
+        }
+        return bytes;
+    }
+
+    /// Releases owned transitive `#include` path buffers and slice storage in `deps`.
+    fn freeIncludeDeps(allocator: std.mem.Allocator, deps: []CImportIncludeDep) void {
+        for (deps) |dep| {
+            if (dep.owned_path.len > 0) allocator.free(dep.owned_path);
+        }
+        if (deps.len > 0) allocator.free(deps);
+    }
+
+    /// Clones `recorded` transitive `#include` descriptors into an owned `[]CImportIncludeDep` slice.
+    fn cloneIncludeDeps(
+        allocator: std.mem.Allocator,
+        recorded: []const c_frontend.RecordedIncludeFile,
+    ) ![]CImportIncludeDep {
+        if (recorded.len == 0) return &.{};
+        const out = try allocator.alloc(CImportIncludeDep, recorded.len);
+        var init_count: usize = 0;
+        errdefer {
+            var idx: usize = 0;
+            while (idx < init_count) : (idx += 1) {
+                if (out[idx].owned_path.len > 0) allocator.free(out[idx].owned_path);
+            }
+            allocator.free(out);
+        }
+        for (recorded, 0..) |item, i| {
+            out[i] = .{
+                .owned_path = if (item.path.len > 0) try allocator.dupe(u8, item.path) else &.{},
+                .content_blake3 = item.content_blake3,
+            };
+            init_count += 1;
+        }
+        return out;
+    }
+
     /// Releases all owned `.cx` translation buffers and internal tables back to `allocator`.
     pub fn deinit(self: *CImportCache, allocator: std.mem.Allocator) void {
         for (self.nodes.items) |*slot| {
-            if (slot.is_occupied and slot.owned_cx_text.len > 0) {
-                allocator.free(slot.owned_cx_text);
+            if (slot.is_occupied) {
+                if (slot.owned_cx_text.len > 0) allocator.free(slot.owned_cx_text);
+                freeIncludeDeps(allocator, slot.included_files);
             }
         }
         self.nodes.deinit(allocator);
@@ -1035,8 +1090,9 @@ pub const CImportCache = struct {
     /// Clears all cached `@c_import` entries while retaining table capacities for workspace reuse.
     pub fn clear(self: *CImportCache, allocator: std.mem.Allocator) void {
         for (self.nodes.items) |*slot| {
-            if (slot.is_occupied and slot.owned_cx_text.len > 0) {
-                allocator.free(slot.owned_cx_text);
+            if (slot.is_occupied) {
+                if (slot.owned_cx_text.len > 0) allocator.free(slot.owned_cx_text);
+                freeIncludeDeps(allocator, slot.included_files);
             }
             slot.* = .{};
         }
@@ -1108,10 +1164,10 @@ pub const CImportCache = struct {
         self.detachSlot(victim_idx);
         const victim = self.nodes.items[victim_idx];
         _ = self.index_by_key.remove(victim.key);
-        if (victim.owned_cx_text.len > 0) {
-            self.total_bytes -|= victim.owned_cx_text.len;
-            allocator.free(victim.owned_cx_text);
-        }
+        const victim_bytes = victim.owned_cx_text.len +| includeDepsByteSize(victim.included_files);
+        self.total_bytes -|= victim_bytes;
+        if (victim.owned_cx_text.len > 0) allocator.free(victim.owned_cx_text);
+        freeIncludeDeps(allocator, victim.included_files);
         self.nodes.items[victim_idx] = .{};
         try self.free_slots.append(allocator, victim_idx);
         self.entry_count -|= 1;
@@ -1136,6 +1192,7 @@ pub const CImportCache = struct {
             .translated_cx_text = slot.owned_cx_text,
             .virtual_file_id = slot.virtual_file_id,
             .durability = slot.durability,
+            .included_files = slot.included_files,
         };
     }
 
@@ -1148,6 +1205,7 @@ pub const CImportCache = struct {
             .translated_cx_text = slot.owned_cx_text,
             .virtual_file_id = slot.virtual_file_id,
             .durability = slot.durability,
+            .included_files = slot.included_files,
         };
     }
 
@@ -1159,7 +1217,7 @@ pub const CImportCache = struct {
         translated_cx_text: []const u8,
         virtual_file_id: FileId,
     ) !?CImportCacheView {
-        return self.putWithEvicted(allocator, key, translated_cx_text, virtual_file_id, null);
+        return self.putWithIncludesAndEvicted(allocator, key, translated_cx_text, &.{}, virtual_file_id, null);
     }
 
     /// Inserts or updates `(key, translated_cx_text, virtual_file_id)`, recording any LRU-evicted virtual `FileId`s.
@@ -1171,14 +1229,39 @@ pub const CImportCache = struct {
         virtual_file_id: FileId,
         evicted_fids: ?*std.ArrayListUnmanaged(FileId),
     ) !?CImportCacheView {
-        if (translated_cx_text.len > MAX_C_IMPORT_CACHE_BYTES) return null;
+        return self.putWithIncludesAndEvicted(
+            allocator,
+            key,
+            translated_cx_text,
+            &.{},
+            virtual_file_id,
+            evicted_fids,
+        );
+    }
+
+    /// Inserts or updates `(key, translated_cx_text, included_files, virtual_file_id)` under `128`-entry / `16 MiB` caps.
+    pub fn putWithIncludesAndEvicted(
+        self: *CImportCache,
+        allocator: std.mem.Allocator,
+        key: Fingerprint128,
+        translated_cx_text: []const u8,
+        included_files: []const c_frontend.RecordedIncludeFile,
+        virtual_file_id: FileId,
+        evicted_fids: ?*std.ArrayListUnmanaged(FileId),
+    ) !?CImportCacheView {
+        var new_entry_bytes: usize = translated_cx_text.len;
+        for (included_files) |inc_item| {
+            new_entry_bytes +|= inc_item.path.len + @sizeOf([32]u8);
+        }
+        if (new_entry_bytes > MAX_C_IMPORT_CACHE_BYTES) return null;
 
         if (self.index_by_key.get(key)) |existing_idx| {
-            const prev_len = self.nodes.items[existing_idx].owned_cx_text.len;
-            const prev_fid = self.nodes.items[existing_idx].virtual_file_id;
+            const prev_slot = self.nodes.items[existing_idx];
+            const prev_bytes = prev_slot.owned_cx_text.len +| includeDepsByteSize(prev_slot.included_files);
+            const prev_fid = prev_slot.virtual_file_id;
             self.detachSlot(existing_idx);
             while (self.entry_count > 1 and
-                (self.total_bytes -| prev_len) + translated_cx_text.len > MAX_C_IMPORT_CACHE_BYTES)
+                (self.total_bytes -| prev_bytes) + new_entry_bytes > MAX_C_IMPORT_CACHE_BYTES)
             {
                 const evicted_fid = (try self.evictLeastRecentlyUsed(allocator)) orelse break;
                 if (evicted_fids) |out_list| {
@@ -1186,16 +1269,20 @@ pub const CImportCache = struct {
                 }
             }
             const duped_text = try allocator.dupe(u8, translated_cx_text);
-            if (prev_len > 0) {
-                allocator.free(self.nodes.items[existing_idx].owned_cx_text);
-            }
+            errdefer if (duped_text.len > 0) allocator.free(duped_text);
+            const duped_includes = try cloneIncludeDeps(allocator, included_files);
+            errdefer freeIncludeDeps(allocator, duped_includes);
+
+            if (prev_slot.owned_cx_text.len > 0) allocator.free(prev_slot.owned_cx_text);
+            freeIncludeDeps(allocator, prev_slot.included_files);
             if (evicted_fids) |out_list| {
                 if (!prev_fid.isNone() and prev_fid != virtual_file_id) {
                     try out_list.append(allocator, prev_fid);
                 }
             }
-            self.total_bytes = (self.total_bytes -| prev_len) + duped_text.len;
+            self.total_bytes = (self.total_bytes -| prev_bytes) + new_entry_bytes;
             self.nodes.items[existing_idx].owned_cx_text = duped_text;
+            self.nodes.items[existing_idx].included_files = duped_includes;
             self.nodes.items[existing_idx].virtual_file_id = virtual_file_id;
             self.nodes.items[existing_idx].durability = .medium;
             self.attachAtHead(existing_idx);
@@ -1204,11 +1291,12 @@ pub const CImportCache = struct {
                 .translated_cx_text = duped_text,
                 .virtual_file_id = virtual_file_id,
                 .durability = .medium,
+                .included_files = duped_includes,
             };
         }
 
         while (self.entry_count >= MAX_C_IMPORT_CACHE_ENTRIES or
-            self.total_bytes + translated_cx_text.len > MAX_C_IMPORT_CACHE_BYTES)
+            self.total_bytes + new_entry_bytes > MAX_C_IMPORT_CACHE_BYTES)
         {
             const evicted_fid = (try self.evictLeastRecentlyUsed(allocator)) orelse break;
             if (evicted_fids) |out_list| {
@@ -1218,6 +1306,8 @@ pub const CImportCache = struct {
 
         const duped_text = try allocator.dupe(u8, translated_cx_text);
         errdefer if (duped_text.len > 0) allocator.free(duped_text);
+        const duped_includes = try cloneIncludeDeps(allocator, included_files);
+        errdefer freeIncludeDeps(allocator, duped_includes);
 
         const slot_idx: u32 = if (self.free_slots.items.len > 0)
             self.free_slots.pop().?
@@ -1230,6 +1320,7 @@ pub const CImportCache = struct {
         self.nodes.items[slot_idx] = .{
             .key = key,
             .owned_cx_text = duped_text,
+            .included_files = duped_includes,
             .virtual_file_id = virtual_file_id,
             .durability = .medium,
             .is_occupied = true,
@@ -1237,12 +1328,13 @@ pub const CImportCache = struct {
         try self.index_by_key.put(allocator, key, slot_idx);
         self.attachAtHead(slot_idx);
         self.entry_count += 1;
-        self.total_bytes += duped_text.len;
+        self.total_bytes += new_entry_bytes;
         return .{
             .key = key,
             .translated_cx_text = duped_text,
             .virtual_file_id = virtual_file_id,
             .durability = .medium,
+            .included_files = duped_includes,
         };
     }
 };
@@ -1265,11 +1357,11 @@ pub const MAX_C_IMPORT_CACHE_BYTES: usize = 16 * 1024 * 1024;
 pub const VIRTUAL_C_IMPORT_FILE_ID_BASE: u32 = 0x000F_0000;
 /// Sentinel LRU node index indicating the end of an intrusive `CImportCache` list (`0xFFFF_FFFF`).
 const NONE_C_IMPORT_LRU: u32 = std.math.maxInt(u32);
-/// Reserved synthetic `.source_text` entity index tracking `CompilerDb.target_layout` (`[CRITICAL-17]`).
+/// Reserved synthetic `.source_text` entity index tracking `CompilerDb.target_layout`.
 pub const CONFIG_KEY_TARGET_LAYOUT: u32 = 0xFFFF_FFF0;
-/// Reserved synthetic `.source_text` entity index tracking `CompilerDb.comptime_step_limit` (`[CRITICAL-17]`).
+/// Reserved synthetic `.source_text` entity index tracking `CompilerDb.comptime_step_limit`.
 pub const CONFIG_KEY_COMPTIME_LIMIT: u32 = 0xFFFF_FFF1;
-/// Reserved synthetic `.source_text` entity index tracking `CompilerDb` `@embed_bytes` sandbox (`[CRITICAL-17]`).
+/// Reserved synthetic `.source_text` entity index tracking `CompilerDb` `@embed_bytes` sandbox.
 pub const CONFIG_KEY_EMBED_SANDBOX: u32 = 0xFFFF_FFF2;
 /// Reserved synthetic `.source_text` entity index tracking `--sast-strict` (`CompilerDb.is_sast_strict`).
 pub const CONFIG_KEY_SAST_STRICT: u32 = 0xFFFF_FFF3;
@@ -1277,7 +1369,7 @@ pub const CONFIG_KEY_SAST_STRICT: u32 = 0xFFFF_FFF3;
 pub const CONFIG_KEY_INTERNAL_CORE: u32 = 0xFFFF_FFF4;
 /// Reserved synthetic `.source_text` entity index tracking test/bench inclusion (`CompilerDb.is_including_tests`).
 pub const CONFIG_KEY_INCLUDE_TESTS: u32 = 0xFFFF_FFF5;
-/// Flag bit on `.source_text` `QueryKey.flags` identifying a tracked `@embed_bytes` file dependency (`[CRITICAL-02]`).
+/// Flag bit on `.source_text` `QueryKey.flags` identifying a tracked `@embed_bytes` or `@c_import` file dependency.
 pub const EMBED_FILE_KEY_FLAG: u8 = 0x01;
 /// Flag bit on `.verify_sast_mir` `QueryKey.flags` projecting only the 34 caller-observable `FnRegionSummary` bytes.
 pub const SAST_SUMMARY_PROJ_FLAG: u8 = 1 << 1;
@@ -3625,9 +3717,9 @@ pub const CompilerDb = struct {
     embed_io: ?std.Io = null,
     /// Optional in-memory virtual file map (`relative_path -> bytes`) for `@embed_bytes`.
     virtual_files: ?*const std.StringHashMapUnmanaged([]const u8) = null,
-    /// Monotonic counter bumped on every `setEmbedSandbox` / `setEmbedIo` mutation (`[CRITICAL-17]`).
+    /// Monotonic counter bumped on every `setEmbedSandbox` / `setEmbedIo` mutation.
     embed_sandbox_epoch: u64 = 0,
-    /// Last-changed revisions for synthetic config keys `0xFFFF_FFF0..0xFFFF_FFF5` (`[CRITICAL-17]`).
+    /// Last-changed revisions for synthetic config keys `0xFFFF_FFF0..0xFFFF_FFF5`.
     config_changed_at: [6]Revision = .{ .initial, .initial, .initial, .initial, .initial, .initial },
     /// Deduplicated `.rodata` constant pool shared across `MirVm` evaluations.
     rodata_pool: mir_vm.RodataPool,
@@ -3637,7 +3729,7 @@ pub const CompilerDb = struct {
     file_side_tables: std.AutoHashMapUnmanaged(u32, BodySemanticSideTables) = .empty,
     /// Per-file signature AST synchronization watermarks keyed by `FileId.asInt()` (`SE-07`).
     file_sig_sync_states: std.AutoHashMapUnmanaged(u32, FileSigSyncState) = .empty,
-    /// Per-definition windowed semantic side tables keyed by `DefId.asInt()` (`[CRITICAL-11]`).
+    /// Per-definition windowed semantic side tables keyed by `DefId.asInt()`.
     def_side_tables: std.AutoHashMapUnmanaged(u32, BodySemanticSideTables) = .empty,
     /// Stage 10 per-definition lowered `HirStore`s keyed by `DefId.asInt()`.
     lowered_def_hirs: std.AutoHashMapUnmanaged(u32, hir.HirStore) = .empty,
@@ -3881,7 +3973,7 @@ pub const CompilerDb = struct {
 
     // -------------- Stage 0 Input & Config Mutations --------------
 
-    /// Computes the 128-bit fingerprint of a synthetic Stage-0 compiler config key (`[CRITICAL-17]`).
+    /// Computes the 128-bit fingerprint of a synthetic Stage-0 compiler config key.
     fn computeConfigFingerprint(self: *const CompilerDb, config_entity: u32) Fingerprint128 {
         var hasher = StructuralHasher.init();
         hasher.updateU32(config_entity);
@@ -3940,13 +4032,13 @@ pub const CompilerDb = struct {
         self.pure_call_memo_cache.clear();
     }
 
-    /// Reads `target_layout` while recording a tracked dependency on `CONFIG_KEY_TARGET_LAYOUT` (`[CRITICAL-17]`).
+    /// Reads `target_layout` while recording a tracked dependency on `CONFIG_KEY_TARGET_LAYOUT`.
     pub fn readTargetLayout(self: *CompilerDb) QueryError!TargetLayout {
         _ = try self.fetchQuery(QueryKey.forConfig(CONFIG_KEY_TARGET_LAYOUT));
         return self.target_layout;
     }
 
-    /// Reads `comptime_step_limit` while recording a tracked dependency on `CONFIG_KEY_COMPTIME_LIMIT` (`[CRITICAL-17]`).
+    /// Reads `comptime_step_limit` while recording a tracked dependency on `CONFIG_KEY_COMPTIME_LIMIT`.
     pub fn readComptimeStepLimit(self: *CompilerDb) QueryError!u64 {
         _ = try self.fetchQuery(QueryKey.forConfig(CONFIG_KEY_COMPTIME_LIMIT));
         return self.comptime_step_limit;
@@ -3977,7 +4069,7 @@ pub const CompilerDb = struct {
         return cfg_key;
     }
 
-    /// Records a tracked content-hashed dependency for an `@embed_bytes(rel_path)` read (`[CRITICAL-02]`).
+    /// Records a tracked content-hashed dependency for an `@embed_bytes` or `@c_import` file read.
     pub fn recordEmbeddedFileRead(
         self: *CompilerDb,
         rel_path: []const u8,
@@ -4010,15 +4102,15 @@ pub const CompilerDb = struct {
         return embed_key;
     }
 
-    /// Re-probes the current VFS or disk content fingerprint of a tracked `@embed_bytes` path (`[CRITICAL-02]`).
+    /// Re-probes the current VFS or disk content fingerprint of a tracked `@embed_bytes` or `@c_import` path.
     fn probeEmbeddedFileFingerprint(self: *CompilerDb, path_sym: SymbolId) Fingerprint128 {
         const rel_path = self.interner.get(path_sym);
-        if (mir_vm.isValidSandboxedEmbedPath(rel_path)) {
-            if (self.virtual_files) |vfs_map| {
-                if (vfs_map.get(rel_path)) |vfs_bytes| {
-                    return Fingerprint128.hashBytes(vfs_bytes);
-                }
+        if (self.virtual_files) |vfs_map| {
+            if (vfs_map.get(rel_path)) |vfs_bytes| {
+                return Fingerprint128.hashBytes(vfs_bytes);
             }
+        }
+        if (mir_vm.isValidSandboxedEmbedPath(rel_path)) {
             if (self.workspace_root) |ws_root| {
                 if (self.embed_io) |io_handle| {
                     if (std.Io.Dir.cwd().realPathFileAlloc(io_handle, ws_root, self.allocator)) |canon_ws| {
@@ -4066,11 +4158,62 @@ pub const CompilerDb = struct {
                     } else |_| {}
                 }
             }
+        } else if (self.embed_io) |io_handle| {
+            if (std.Io.Dir.cwd().readFileAlloc(
+                io_handle,
+                rel_path,
+                self.allocator,
+                .limited(16 * 1024 * 1024),
+            )) |disk_bytes| {
+                defer self.allocator.free(disk_bytes);
+                return Fingerprint128.hashBytes(disk_bytes);
+            } else |_| {}
+        }
+        if (c_frontend.BUNDLED_SYSTEM_HEADERS.get(rel_path)) |bundled_src| {
+            return Fingerprint128.hashBytes(bundled_src);
         }
         var missing_hasher = StructuralHasher.init();
         missing_hasher.updateU8(0xEE);
         missing_hasher.updateBytes(rel_path);
         return missing_hasher.final();
+    }
+
+    /// Loads live bytes for a recorded `@c_import` `#include` path from `virtual_files`, `embed_io`, or `workspace_root`.
+    fn loadTrackedCImportIncludeBytes(
+        self: *CompilerDb,
+        inc_path: []const u8,
+        out_owned_bytes: *?[]u8,
+    ) ?[]const u8 {
+        if (self.virtual_files) |vfs_map| {
+            if (vfs_map.get(inc_path)) |vfs_bytes| return vfs_bytes;
+        }
+        if (self.embed_io) |io_handle| {
+            if (std.Io.Dir.cwd().readFileAlloc(
+                io_handle,
+                inc_path,
+                self.allocator,
+                .limited(16 * 1024 * 1024),
+            )) |direct_bytes| {
+                out_owned_bytes.* = direct_bytes;
+                return direct_bytes;
+            } else |_| {}
+
+            if (self.workspace_root) |ws_root| {
+                if (std.fs.path.join(self.allocator, &.{ ws_root, inc_path })) |joined_ws| {
+                    defer self.allocator.free(joined_ws);
+                    if (std.Io.Dir.cwd().readFileAlloc(
+                        io_handle,
+                        joined_ws,
+                        self.allocator,
+                        .limited(16 * 1024 * 1024),
+                    )) |ws_bytes| {
+                        out_owned_bytes.* = ws_bytes;
+                        return ws_bytes;
+                    } else |_| {}
+                } else |_| {}
+            }
+        }
+        return null;
     }
 
     /// Updates `--comptime-limit` (`comptime_step_limit`) and bumps `current_revision` when changed.
@@ -4126,13 +4269,61 @@ pub const CompilerDb = struct {
         );
     }
 
-    /// Looks up a cached `@c_import` translation for `(header_source_bytes, self.target_spec, defines)`.
+    /// Looks up a cached `@c_import` translation, verifying and recording all transitive `#include` digests.
     pub fn lookupCImportCache(
         self: *CompilerDb,
         header_source_bytes: []const u8,
         defines: []const []const u8,
     ) ?CImportCacheView {
         const cache_key = self.computeCImportKey(header_source_bytes, defines);
+        const peeked = self.c_import_cache.peek(cache_key) orelse {
+            self.c_import_cache.misses += 1;
+            return null;
+        };
+        if (peeked.included_files.len == 0) {
+            return self.c_import_cache.get(cache_key);
+        }
+
+        const VerifiedIncludeRead = struct {
+            path: []const u8,
+            bytes: []const u8,
+            owned_buf: ?[]u8,
+        };
+        var verified_reads: std.ArrayListUnmanaged(VerifiedIncludeRead) = .empty;
+        defer {
+            for (verified_reads.items) |read_item| {
+                if (read_item.owned_buf) |owned_slice| self.allocator.free(owned_slice);
+            }
+            verified_reads.deinit(self.allocator);
+        }
+
+        for (peeked.included_files) |inc_dep| {
+            var owned_inc_buf: ?[]u8 = null;
+            const live_bytes = self.loadTrackedCImportIncludeBytes(inc_dep.owned_path, &owned_inc_buf) orelse {
+                self.c_import_cache.misses += 1;
+                return null;
+            };
+            var live_blake3: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(live_bytes, &live_blake3, .{});
+            if (!std.mem.eql(u8, &live_blake3, &inc_dep.content_blake3)) {
+                if (owned_inc_buf) |buf| self.allocator.free(buf);
+                self.c_import_cache.misses += 1;
+                return null;
+            }
+            verified_reads.append(self.allocator, .{
+                .path = inc_dep.owned_path,
+                .bytes = live_bytes,
+                .owned_buf = owned_inc_buf,
+            }) catch {
+                if (owned_inc_buf) |buf| self.allocator.free(buf);
+                self.c_import_cache.misses += 1;
+                return null;
+            };
+        }
+
+        for (verified_reads.items) |read_item| {
+            _ = self.recordEmbeddedFileRead(read_item.path, read_item.bytes) catch {};
+        }
         return self.c_import_cache.get(cache_key);
     }
 
@@ -4360,6 +4551,24 @@ pub const CompilerDb = struct {
         translated_cx_text: []const u8,
         explicit_file_id: ?FileId,
     ) !FileId {
+        return self.storeCImportTranslationWithIncludes(
+            header_source_bytes,
+            defines,
+            translated_cx_text,
+            &.{},
+            explicit_file_id,
+        );
+    }
+
+    /// Registers a translated `@c_import` `.cx` module and its transitive `included_files` in `c_import_cache`.
+    pub fn storeCImportTranslationWithIncludes(
+        self: *CompilerDb,
+        header_source_bytes: []const u8,
+        defines: []const []const u8,
+        translated_cx_text: []const u8,
+        included_files: []const c_frontend.RecordedIncludeFile,
+        explicit_file_id: ?FileId,
+    ) !FileId {
         const cache_key = self.computeCImportKey(header_source_bytes, defines);
         const virtual_fid: FileId = if (explicit_file_id) |given_fid|
             given_fid
@@ -4375,10 +4584,11 @@ pub const CompilerDb = struct {
         var evicted_fids: std.ArrayListUnmanaged(FileId) = .empty;
         defer evicted_fids.deinit(self.allocator);
         _ = try self.setInput(virtual_fid, translated_cx_text, .medium);
-        _ = try self.c_import_cache.putWithEvicted(
+        _ = try self.c_import_cache.putWithIncludesAndEvicted(
             self.allocator,
             cache_key,
             translated_cx_text,
+            included_files,
             virtual_fid,
             &evicted_fids,
         );
@@ -4564,20 +4774,25 @@ pub const CompilerDb = struct {
         const db: *CompilerDb = @fieldParentPtr("symbol_table", sym_table);
         if (header_path.len == 0) return .none;
 
-        // [1] Resolve `header_path` bytes from `virtual_files`, caller dir, `workspace_root`, `-I` dirs, or bundled headers:
+        // [1] Resolve `header_path` bytes and resolved path from VFS, caller dir, `workspace_root`, `-I`, or bundled:
         var owned_disk_bytes: ?[]u8 = null;
         defer if (owned_disk_bytes) |buf| db.allocator.free(buf);
-        const header_bytes = (try db.resolveCImportHeaderBytes(caller_file_id, header_path, &owned_disk_bytes)) orelse {
-            return .none;
-        };
+        var owned_resolved_path: ?[]u8 = null;
+        defer if (owned_resolved_path) |path_buf| db.allocator.free(path_buf);
+        const resolved_hdr = (try db.resolveCImportHeaderSource(
+            caller_file_id,
+            header_path,
+            &owned_disk_bytes,
+            &owned_resolved_path,
+        )) orelse return .none;
 
         // Record tracked sandbox and file-read dependencies so `-D`/`-I` or header edits invalidate signatures:
         _ = db.recordEmbedSandboxDependency() catch {};
-        _ = db.recordEmbeddedFileRead(header_path, header_bytes) catch {};
+        _ = db.recordEmbeddedFileRead(resolved_hdr.resolved_path, resolved_hdr.bytes) catch {};
 
-        // [2] Probe `CImportCache` (`128` entries / `16 MiB` bounded LRU keyed by header + target + `-D`/`-I`):
+        // [2] Probe `CImportCache` (`128` entries / `16 MiB` bounded LRU; replays transitive `#include` reads on hit):
         var virtual_fid: FileId = .none;
-        if (db.lookupCImportCache(header_bytes, db.c_import_defines.items)) |cached_view| {
+        if (db.lookupCImportCache(resolved_hdr.bytes, db.c_import_defines.items)) |cached_view| {
             virtual_fid = cached_view.virtual_file_id;
         } else {
             var macro_defs: std.ArrayListUnmanaged(c_frontend.MacroDefine) = .empty;
@@ -4630,24 +4845,46 @@ pub const CompilerDb = struct {
                 .virtual_headers = vfs_headers.items,
                 .include_loader = if (db.embed_io) |io_h| .{ .host_fs = io_h } else .none,
             };
-            const translated_cx = c_translate.translateHeaderSource(
+            var unit = c_frontend.parseCHeader(
                 db.allocator,
-                header_bytes,
-                header_path,
+                resolved_hdr.bytes,
+                resolved_hdr.resolved_path,
                 caller_file_id,
                 frontend_opts,
-                .{},
                 active_sink,
             ) catch |err| switch (err) {
                 error.TranslationFailed => return .none,
                 else => return err,
             };
+            defer unit.deinit();
+
+            const translated_cx = c_translate.translateUnit(
+                db.allocator,
+                &unit,
+                .{},
+            ) catch |err| switch (err) {
+                error.InvalidTranslatedSyntax => {
+                    try active_sink.emit(.{
+                        .code = .e0009_c_header_translation_failed,
+                        .severity = .err,
+                        .primary_span = .{ .file_id = caller_file_id, .start_byte = 0, .end_byte = 0 },
+                        .message = "translated C header failed CoreX syntax verification",
+                    });
+                    return .none;
+                },
+                else => return err,
+            };
             defer db.allocator.free(translated_cx);
 
-            virtual_fid = try db.storeCImportTranslation(
-                header_bytes,
+            for (unit.included_files.items) |inc_file| {
+                _ = db.recordEmbeddedFileRead(inc_file.path, inc_file.content) catch {};
+            }
+
+            virtual_fid = try db.storeCImportTranslationWithIncludes(
+                resolved_hdr.bytes,
                 db.c_import_defines.items,
                 translated_cx,
+                unit.included_files.items,
                 null,
             );
         }
@@ -4682,20 +4919,25 @@ pub const CompilerDb = struct {
         return mod_sym_idx;
     }
 
-    /// Resolves C header bytes from `virtual_files`, caller directory, `workspace_root`, `-I` dirs, or bundled headers.
-    fn resolveCImportHeaderBytes(
+    /// Resolves C header bytes and canonical lookup path from `virtual_files`, caller dir, `workspace_root`, `-I`, or bundled.
+    fn resolveCImportHeaderSource(
         self: *CompilerDb,
         caller_file_id: FileId,
         header_path: []const u8,
         out_owned_bytes: *?[]u8,
-    ) !?[]const u8 {
+        out_owned_path: *?[]u8,
+    ) !?struct { bytes: []const u8, resolved_path: []const u8 } {
         if (self.virtual_files) |vfs_map| {
-            if (vfs_map.get(header_path)) |vfs_bytes| return vfs_bytes;
+            if (vfs_map.getEntry(header_path)) |direct_kv| {
+                return .{ .bytes = direct_kv.value_ptr.*, .resolved_path = direct_kv.key_ptr.* };
+            }
             if (self.file_paths.get(caller_file_id.asInt())) |caller_path| {
                 if (std.fs.path.dirname(caller_path)) |caller_dir| {
                     const joined_rel = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ caller_dir, header_path });
                     defer self.allocator.free(joined_rel);
-                    if (vfs_map.get(joined_rel)) |rel_bytes| return rel_bytes;
+                    if (vfs_map.getEntry(joined_rel)) |rel_kv| {
+                        return .{ .bytes = rel_kv.value_ptr.*, .resolved_path = rel_kv.key_ptr.* };
+                    }
                 }
             }
         }
@@ -4736,14 +4978,16 @@ pub const CompilerDb = struct {
                     self.allocator,
                     .limited(4 * 1024 * 1024),
                 )) |disk_bytes| {
+                    const duped_path = try self.allocator.dupe(u8, cand_path);
                     out_owned_bytes.* = disk_bytes;
-                    return disk_bytes;
+                    out_owned_path.* = duped_path;
+                    return .{ .bytes = disk_bytes, .resolved_path = duped_path };
                 } else |_| {}
             }
         }
 
         if (c_frontend.BUNDLED_SYSTEM_HEADERS.get(header_path)) |bundled_src| {
-            return bundled_src;
+            return .{ .bytes = bundled_src, .resolved_path = header_path };
         }
         return null;
     }
@@ -4926,7 +5170,7 @@ pub const CompilerDb = struct {
         return self.sast_summaries.get(def_id.asInt());
     }
 
-    /// Stage 10: Lowers a single `def_id` into an owned `HirStore` (`[CRITICAL-11]` per-`DefId` firewall).
+    /// Stage 10: Lowers a single `def_id` into an owned `HirStore` (per-`DefId` firewall).
     pub fn lowerDefHir(self: *CompilerDb, def_id: DefId) QueryError!*const hir.HirStore {
         _ = try self.fetchQuery(QueryKey.forDef(.lower_def_hir, def_id));
         return self.lowered_def_hirs.getPtr(def_id.asInt()) orelse error.InvalidDefId;
@@ -4943,7 +5187,7 @@ pub const CompilerDb = struct {
         return (try self.buildDefMirArtifact(def_id)).primaryBody();
     }
 
-    /// Returns drop-elaborated `MirBody` records for `def_id` for `MirVm` `comptime` execution (`[CRITICAL-04]`).
+    /// Returns drop-elaborated `MirBody` records for `def_id` for `MirVm` `comptime` execution.
     pub fn getComptimeElaboratedMirBodies(
         self: *CompilerDb,
         def_id: DefId,
@@ -5257,7 +5501,7 @@ pub const CompilerDb = struct {
             &working_bodies,
         );
 
-        // Materialize reachable `@embed_bytes` constants per body (`[CRITICAL-07]`):
+        // Materialize reachable `@embed_bytes` constants per body:
         var blob_store = mir.MirBlobStore.init(self.allocator);
         defer blob_store.deinit();
         var local_embed_sink = DiagnosticSink.init(self.allocator);
@@ -5288,7 +5532,7 @@ pub const CompilerDb = struct {
         }
         if (!is_embed_ok or active_embed_sink.hasErrors()) return error.FrontendErrors;
 
-        // Compute Pentagon `ProvenValueRange` slices (`[MAJOR-08]`):
+        // Compute Pentagon `ProvenValueRange` slices:
         const body_count = working_bodies.items.len;
         const proven_views = try self.allocator.alloc([]const codegen_abi.ProvenValueRange, body_count);
         defer self.allocator.free(proven_views);
@@ -5514,7 +5758,7 @@ pub const CompilerDb = struct {
             return memo_snapshot.changed_at.isAfter(after_revision);
         }
 
-        // [2.5] Conservative Red Path if direct dependency count exceeded `MAX_DEPS_PER_MEMO` (`[MAJOR-18]`):
+        // [2.5] Conservative Red Path if direct dependency count exceeded `MAX_DEPS_PER_MEMO`:
         if (memo_snapshot.has_overflowed_deps) {
             const updated_memo = try self.executeAndBackdate(key);
             return updated_memo.changed_at.isAfter(after_revision);
@@ -7014,6 +7258,29 @@ pub const CompilerDb = struct {
             public_cxi_hasher.updateU32(public_count);
         }
 
+        if (self.active_stack.items.len > 0) {
+            const cur_frame = self.active_stack.items[self.active_stack.items.len - 1];
+            var has_embed_or_c_import = false;
+            for (self.scratch_dep_edges.items[cur_frame.start_dep_index..]) |dep_key| {
+                if (dep_key.stage == .source_text and (dep_key.flags & EMBED_FILE_KEY_FLAG) != 0) {
+                    has_embed_or_c_import = true;
+                } else if (dep_key.stage == .resolve_signatures and
+                    dep_key.entity_index >= VIRTUAL_C_IMPORT_FILE_ID_BASE and
+                    dep_key.entity_index < CONFIG_KEY_TARGET_LAYOUT)
+                {
+                    has_embed_or_c_import = true;
+                    if (self.resolved_signatures.get(dep_key.entity_index)) |c_imp_sigs| {
+                        hasher.updateU32(dep_key.entity_index);
+                        hasher.updateFingerprint(c_imp_sigs.public_interface_fingerprint);
+                        hasher.updateU32(c_imp_sigs.error_count);
+                    }
+                }
+            }
+            if (has_embed_or_c_import) {
+                hasher.updateU32(sig_err_count);
+            }
+        }
+
         const final_item_count: u32 = @intCast((try self.extractItemTree(file_id)).entries.len);
         const resolved_fp = hasher.final();
         try self.resolved_signatures.put(self.allocator, file_id.asInt(), .{
@@ -7083,14 +7350,14 @@ pub const CompilerDb = struct {
             }
         }
 
-        var did_detect_unflattened_syms = false;
+        var has_unflattened_syms = false;
         var check_sym: u32 = sym_start;
         while (check_sym < sym_end) : (check_sym += 1) {
             const sym = self.symbol_table.getSymbol(SymbolIndex.fromInt(check_sym)).*;
             if (sym.ast_node.isNone() or sym.def_id.isNone()) continue;
             if (ast_to_def.get(sym.ast_node.asInt())) |expected_def| {
                 if (sym.def_id != expected_def) {
-                    did_detect_unflattened_syms = true;
+                    has_unflattened_syms = true;
                     break;
                 }
             }
@@ -7137,7 +7404,7 @@ pub const CompilerDb = struct {
                     sym_idx,
                 );
             }
-            if (did_detect_unflattened_syms and !sym_mut.owner_def_id.isNone()) {
+            if (has_unflattened_syms and !sym_mut.owner_def_id.isNone()) {
                 if (unflattened_owner_remap.get(sym_mut.owner_def_id.asInt())) |mapped_owner| {
                     sym_mut.owner_def_id = mapped_owner;
                 }
@@ -7731,7 +7998,7 @@ pub const CompilerDb = struct {
         return typed_fp;
     }
 
-    /// Constructs a fail-closed conservative `FnRegionSummary` for an in-flight mutual-recursion cycle (`[CRITICAL-03]`).
+    /// Constructs a fail-closed conservative `FnRegionSummary` for an in-flight mutual-recursion cycle.
     fn makeConservativeCycleSummary(
         db: *const CompilerDb,
         target_def: DefId,
@@ -7742,8 +8009,8 @@ pub const CompilerDb = struct {
             .param_flow_matrix = std.math.maxInt(u64),
             .global_escape_mask = std.math.maxInt(u32),
             .max_subtree_bytes = mir_sast.FnRegionSummary.STACK_UNBOUNDED,
-            .direct_effects_bits = 0x0FFF,
-            .inferred_effects_bits = 0x0FFF,
+            .direct_effects_bits = 0x3FFF,
+            .inferred_effects_bits = 0x3FFF,
         };
         var cs_mask = mir_sast.FnContractScratchMask{
             .is_scc_recursive = true,
@@ -8139,7 +8406,7 @@ pub const CompilerDb = struct {
                 var has_live_sast_res = true;
                 defer if (has_live_sast_res) sast_res.deinit();
 
-                // If `resolveDbCalleeSummary` discovered a cross-`DefId` mutual-recursion cycle (`[CRITICAL-03]`),
+                // If `resolveDbCalleeSummary` discovered a cross-`DefId` mutual-recursion cycle,
                 // expand `active_bodies` with all peer `DefId`s and converge the full Tarjan SCC precisely:
                 var cycle_round: usize = 0;
                 var prev_peer_count: usize = 0;
@@ -8295,7 +8562,7 @@ pub const CompilerDb = struct {
         return sast_fp;
     }
 
-    /// Stage 10 implementation: lowers `def_id` into an isolated `HirStore` (`[CRITICAL-11]`).
+    /// Stage 10 implementation: lowers `def_id` into an isolated `HirStore`.
     fn computeLowerDefHir(self: *CompilerDb, def_id: DefId) QueryError!Fingerprint128 {
         if (def_id.isNone()) return error.InvalidDefId;
         _ = try self.typecheckBody(def_id);
@@ -8507,7 +8774,7 @@ pub const CompilerDb = struct {
             try unelaborated_clones.append(self.allocator, dup_raw);
         }
 
-        // `Fix-17` Gate D/F + `[CRITICAL-04]`: Elaborate `drop_in_place` / `drop_if_live` & reject `E0325` before `MirVm`!
+        // Elaborate `drop_in_place` / `drop_if_live` and reject `E0325` before `MirVm` execution:
         var cloned_bodies: std.ArrayListUnmanaged(mir.MirBody) = .empty;
         defer {
             for (cloned_bodies.items) |*cloned_item| cloned_item.deinit();
@@ -9486,7 +9753,7 @@ test "test_phase5_config_invalidation_target_layout_wasm32_step_limit_and_embed_
     var db = try CompilerDb.init(std.testing.allocator);
     defer db.deinit();
 
-    // [1] `[CRITICAL-17]`: `setTargetLayout(WASM32)` invalidates cached `@size_of[*u8]()` (`8 -> 4`):
+    // [1] `setTargetLayout(WASM32)` invalidates cached `@size_of[*u8]()` (`8 -> 4`):
     const layout_file = FileId.fromInt(40);
     const layout_src =
         \\pub const PTR_SZ: usize = @size_of[*u8]();
@@ -9504,7 +9771,7 @@ test "test_phase5_config_invalidation_target_layout_wasm32_step_limit_and_embed_
     try std.testing.expect(!eval_32.has_errors);
     try std.testing.expectEqual(@as(i128, 4), eval_32.value.int_val);
 
-    // [2] `[CRITICAL-02]` & `[CRITICAL-17]`: `setEmbedSandbox` invalidates cached `@embed_bytes` queries:
+    // [2] `setEmbedSandbox` invalidates cached `@embed_bytes` queries:
     var vfs_v1: std.StringHashMapUnmanaged([]const u8) = .empty;
     defer vfs_v1.deinit(std.testing.allocator);
     try vfs_v1.put(std.testing.allocator, "assets/ver.txt", "v1");
@@ -9531,7 +9798,7 @@ test "test_phase5_config_invalidation_target_layout_wasm32_step_limit_and_embed_
     try std.testing.expect(!embed_r2.has_errors);
     try std.testing.expectEqual(@as(i128, 11), embed_r2.value.int_val);
 
-    // [3] `[CRITICAL-17]`: Raising `setComptimeStepLimit` invalidates cached `E0501` and succeeds:
+    // [3] Raising `setComptimeStepLimit` invalidates cached `E0501` and succeeds:
     const step_file = FileId.fromInt(42);
     const step_src =
         \\pub fn count_to(goal: i32) -> i32 {
@@ -9561,7 +9828,7 @@ test "test_phase5_pure_call_memo_replays_deps_overflow_deps_red_path_cancel_and_
     var db = try CompilerDb.init(std.testing.allocator);
     defer db.deinit();
 
-    // [1] `[CRITICAL-01]`: `PureCallMemoCache` hit replays transitive `CompilerDb` `QueryKey` dependencies:
+    // [1] `PureCallMemoCache` hit replays transitive `CompilerDb` `QueryKey` dependencies:
     const memo_file = FileId.fromInt(43);
     const memo_src_v1 =
         \\pub fn read_factor() -> i32 { return 3; }
@@ -9598,7 +9865,7 @@ test "test_phase5_pure_call_memo_replays_deps_overflow_deps_red_path_cancel_and_
     const two_r2 = try db.evalComptimeDef(def_scaled_two);
     try std.testing.expectEqual(@as(i128, 70), two_r2.value.int_val);
 
-    // [2] `[MAJOR-18]`: `MemoHeader.has_overflowed_deps` forces conservative Red-Path verification past `MAX_DEPS_PER_MEMO`:
+    // [2] `MemoHeader.has_overflowed_deps` forces conservative Red-Path verification past `MAX_DEPS_PER_MEMO`:
     const ovf_file = FileId.fromInt(44);
     const ovf_src_v1 =
         \\pub fn id_int(val: i32) -> i32 { return val; }
@@ -9641,7 +9908,7 @@ test "test_phase5_pure_call_memo_replays_deps_overflow_deps_red_path_cancel_and_
     const sum_r2 = try db.evalComptimeDef(def_sum_two);
     try std.testing.expectEqual(@as(i128, 102), sum_r2.value.int_val);
 
-    // [3] `[MAJOR-05]` & `[MAJOR-06]`: `requestCancellation` propagates `error.Cancelled`, and loop UAF traps `E0506`:
+    // [3] `requestCancellation` propagates `error.Cancelled`, and loop UAF traps `E0506`:
     const uaf_file = FileId.fromInt(45);
     const uaf_src =
         \\pub fn loop_uaf() -> i64 {
@@ -10202,13 +10469,13 @@ test "test_phase8_target_abi_cutoff_flattened_extern_item_tree_and_c_import_lru_
     try std.testing.expect(local_cache.peek(chunk_keys[4]) != null);
 }
 
-// -------- R-3 Target FFI Refresh & CImport LRU Cleanup --------
+// ---------- Target FFI Refresh & CImport LRU Cleanup ----------
 
-test "r3 target spec cx.ffi refresh and c_import include dirs and eviction cleanup" {
+test "test_c_import_target_spec_ffi_refresh_include_dirs_and_lru_eviction_cleanup" {
     var db = try CompilerDb.init(std.testing.allocator);
     defer db.deinit();
 
-    // [1] `[MAJOR-02]`: `setTargetSpec` refreshes `cx.ffi.{c_char, c_long, c_ulong}` across targets:
+    // [1] `setTargetSpec` refreshes `cx.ffi.{c_char, c_long, c_ulong}` across targets:
     const ffi_file = FileId.fromInt(90);
     const ffi_src =
         \\use cx.ffi.{c_char, c_long, c_ulong};
@@ -10235,7 +10502,7 @@ test "r3 target spec cx.ffi refresh and c_import include dirs and eviction clean
     try std.testing.expectEqual(TypeId.i64_ty, db.type_pool.getFnSignatureView(aarch_sig.type_id).?.ret_ty);
     try std.testing.expectEqual(TypeId.u8_ty, db.type_pool.getFnSignatureView(aarch_char_sig.type_id).?.ret_ty);
 
-    // [2] `[MAJOR-03]`: `c_import_include_dirs` differentiates `CImportCache` keys:
+    // [2] `c_import_include_dirs` differentiates `CImportCache` keys:
     const inc_dir_a = [_][]const u8{"include/v1"};
     const inc_dir_b = [_][]const u8{"include/v2"};
     try db.setCImportConfig(&.{}, &inc_dir_a);
@@ -10244,7 +10511,7 @@ test "r3 target spec cx.ffi refresh and c_import include dirs and eviction clean
     const key_inc_b = db.computeCImportKey("#include \"cfg.h\"\n", &.{});
     try std.testing.expect(!Fingerprint128.eql(key_inc_a, key_inc_b));
 
-    // [3] `[MAJOR-03]`: Mid-query `@c_import` does NOT bump `current_revision` or clobber durability tiers:
+    // [3] Mid-query `@c_import` does NOT bump `current_revision` or clobber durability tiers:
     var vfs_map: std.StringHashMapUnmanaged([]const u8) = .empty;
     defer vfs_map.deinit(std.testing.allocator);
     try vfs_map.put(std.testing.allocator, "mid_q.h", "int mid_fn(int x);\n");
@@ -10253,7 +10520,7 @@ test "r3 target spec cx.ffi refresh and c_import include dirs and eviction clean
     const caller_file = FileId.fromInt(91);
     _ = try db.setInput(
         caller_file,
-        "const c_mod = @c_import(\"mid_q.h\");\npub fn call_mid(v: i32) -> i32 { return unsafe { c_mod.mid_fn(v) }; }\n",
+        "const c_mod = @c_import(\"mid_q.h\");\npub fn call_mid(val: i32) -> i32 { return unsafe { c_mod.mid_fn(val) }; }\n",
         .low,
     );
     const rev_before_query = db.current_revision;
@@ -10263,7 +10530,7 @@ test "r3 target spec cx.ffi refresh and c_import include dirs and eviction clean
     try std.testing.expectEqual(rev_before_query, db.current_revision);
     try std.testing.expectEqual(med_changed_before, db.last_changed_by_durability[@backingInt(Durability.medium)]);
 
-    // [4] `[MAJOR-03]`: LRU eviction purges virtual `FileId` artifacts and memos from `CompilerDb`:
+    // [4] LRU eviction purges virtual `FileId` artifacts and memos from `CompilerDb`:
     const evicted_cand_fid = try db.storeCImportTranslation(
         "int evict_me(void);",
         &.{},
@@ -10289,9 +10556,9 @@ test "r3 target spec cx.ffi refresh and c_import include dirs and eviction clean
     try std.testing.expect(!db.memos.contains(QueryKey.forFile(.resolve_signatures, evicted_cand_fid).asU64()));
 }
 
-// --------- R-4A ItemTree Rehash Safety in OptimizeMir ---------
+// ----------- ItemTree Rehash Safety in OptimizeMir ------------
 
-test "test_r4a_optimize_mir_module_rehashes_item_trees_across_16_modules_safely" {
+test "test_optimize_mir_module_rehashes_item_trees_across_16_modules_safely" {
     var db = try CompilerDb.init(std.testing.allocator);
     defer db.deinit();
 
@@ -10338,4 +10605,70 @@ test "test_r4a_optimize_mir_module_rehashes_item_trees_across_16_modules_safely"
     const opt_res = try db.optimizeMirModule(app_fid, true);
     try std.testing.expect(db.item_trees.count() >= 17);
     try std.testing.expectEqual(@as(usize, 1), opt_res.bodies.items.len);
+}
+
+// -------- Transitive CImport Invalidation & Cycle Mask --------
+
+test "test_c_import_transitive_include_mutation_invalidates_cache_and_signatures" {
+    var db = try CompilerDb.init(std.testing.allocator);
+    defer db.deinit();
+
+    // [1] Mutating a transitive `#include "sub.h"` / `"leaf.h"` invalidates `CImportCache`, `evalComptimeDef`, and `typecheckBody`:
+    const root_h_src = "#include \"sub.h\"\nint root_only(void);\n";
+    const sub_h_v1 = "#include \"leaf.h\"\nint sub_step(int x);\n";
+    const leaf_h_v1 = "#define LEAF_MAGIC 11\n";
+
+    var vfs_headers: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer vfs_headers.deinit(std.testing.allocator);
+    try vfs_headers.put(std.testing.allocator, "root.h", root_h_src);
+    try vfs_headers.put(std.testing.allocator, "sub.h", sub_h_v1);
+    try vfs_headers.put(std.testing.allocator, "leaf.h", leaf_h_v1);
+    db.setEmbedSandbox(null, &vfs_headers);
+
+    const caller_a_fid = FileId.fromInt(240);
+    const caller_b_fid = FileId.fromInt(241);
+    const caller_src =
+        \\const c_hdr = @c_import("root.h");
+        \\pub const COMPUTED_MAGIC: i64 = c_hdr.LEAF_MAGIC + 1;
+        \\pub fn invoke_sub(arg: i32) -> i32 {
+        \\    return unsafe { c_hdr.sub_step(arg) };
+        \\}
+    ;
+    _ = try db.setInput(caller_a_fid, caller_src, .low);
+    _ = try db.setInput(caller_b_fid, caller_src, .low);
+
+    const tree_a = try db.extractItemTree(caller_a_fid);
+    const tree_b = try db.extractItemTree(caller_b_fid);
+    const def_magic_a = tree_a.entries[1].def_id;
+    const def_invoke_a = tree_a.entries[2].def_id;
+    const def_magic_b = tree_b.entries[1].def_id;
+    const def_invoke_b = tree_b.entries[2].def_id;
+
+    // Cold translation on `caller_a`, followed by `CImportCache` hit on `caller_b` (replaying transitive deps):
+    try std.testing.expectEqual(@as(i128, 12), (try db.evalComptimeDef(def_magic_a)).value.int_val);
+    try std.testing.expectEqual(@as(u32, 0), (try db.typecheckBody(def_invoke_a)).error_count);
+
+    const hits_before_b = db.c_import_cache.hits;
+    try std.testing.expectEqual(@as(i128, 12), (try db.evalComptimeDef(def_magic_b)).value.int_val);
+    try std.testing.expectEqual(@as(u32, 0), (try db.typecheckBody(def_invoke_b)).error_count);
+    try std.testing.expect(db.c_import_cache.hits > hits_before_b);
+
+    // Mutate ONLY `"leaf.h"` and `"sub.h"` (`"root.h"` is byte-for-byte unchanged!) and advance revision via an unrelated file:
+    try vfs_headers.put(std.testing.allocator, "leaf.h", "#define LEAF_MAGIC 99\n");
+    try vfs_headers.put(std.testing.allocator, "sub.h", "#include \"leaf.h\"\nint sub_step(int x, int extra);\n");
+    try std.testing.expect(db.lookupCImportCache(root_h_src, &.{}) == null);
+
+    const unrelated_fid = FileId.fromInt(242);
+    _ = try db.setInput(unrelated_fid, "pub const UNRELATED: i32 = 1;\n", .low);
+
+    // Both `caller_a` (cache miss on rev 1) and `caller_b` (cache hit on rev 1) MUST invalidate and observe v2:
+    try std.testing.expectEqual(@as(i128, 100), (try db.evalComptimeDef(def_magic_a)).value.int_val);
+    try std.testing.expect((try db.typecheckBody(def_invoke_a)).error_count >= 1);
+    try std.testing.expectEqual(@as(i128, 100), (try db.evalComptimeDef(def_magic_b)).value.int_val);
+    try std.testing.expect((try db.typecheckBody(def_invoke_b)).error_count >= 1);
+
+    // [2] Verify `makeConservativeCycleSummary` preserves `INFERRED_THREAD_LOCAL_BIT` (`0x1000`) and `INFERRED_ASYNC_NON_SEND_BIT` (`0x2000`):
+    const cycle_sum = CompilerDb.makeConservativeCycleSummary(&db, .NONE, .none);
+    try std.testing.expectEqual(@as(u16, 0x3FFF), cycle_sum.direct_effects_bits);
+    try std.testing.expectEqual(@as(u16, 0x3FFF), cycle_sum.inferred_effects_bits);
 }

@@ -615,7 +615,7 @@ pub const MovePathNode = extern struct {
     }
 };
 
-/// Result of resolving a `MirPlace` against `MovePathTrie` (`[CRITICAL-02]`).
+/// Result of resolving a `MirPlace` against `MovePathTrie`.
 pub const PlacePathLookup = struct {
     /// Deepest resolved `MovePathId` in the trie.
     id: MovePathId,
@@ -887,7 +887,7 @@ pub const DenseBitSet = union(enum) {
 
 // -------------- Sign-Biased Interval & Pentagon ---------------
 
-/// 16-byte order-preserving interval (`DR-06` §2.3 & `[CRITICAL-03]`, `@sizeOf == 16`).
+/// 16-byte order-preserving interval (`DR-06` §2.3, `@sizeOf == 16`).
 ///
 /// Signed domains (`i8`..`i64`, `isize`) flip bit 63 (`val_u64 ^ SIGN_BIAS_U64`) so `i64.min -> 0` and
 /// `i64.max -> u64.max`. Unsigned domains (`u8`..`u64`, `usize`, `bool`, `char`) store raw `u64` directly.
@@ -1018,7 +1018,7 @@ pub const PentagonSubRow = extern struct {
     }
 };
 
-/// 24-byte proven SSA scalar value range & alignment fact exported for LLVM `!range` / `@llvm.assume` (`[MAJOR-08]`).
+/// 24-byte proven SSA scalar value range & alignment fact exported for LLVM `!range` / `@llvm.assume`.
 pub const ProvenValueRange = extern struct {
     /// Two's-complement bit-cast inclusive lower bound (`Intv.decodeSigned` for signed, raw `u64` for unsigned).
     min_bits: u64,
@@ -1207,12 +1207,238 @@ pub const MirSastPipelineBundle = struct {
     }
 };
 
+/// Zero-allocation 128-slot (`64` 2-way sets) exact-key `(TypeId, depth) -> u8` stack memo for `TypeId` DAG walkers.
+const TypeDepthByteMemo = struct {
+    /// Validity bitset for the 128 slots (`16` bytes zeroed at init).
+    has_bits: [2]u64 = @splat(0),
+    /// Exact `TypeId.toU32()` keys for populated slots.
+    type_raws: [128]u32 = undefined,
+    /// Exact recursion depths for populated slots.
+    depths: [128]u16 = undefined,
+    /// Cached `u8` payload (`0`/`1` boolean or 3-bit handle mask) for populated slots.
+    vals: [128]u8 = undefined,
+
+    /// Returns `true` if slot `slot_idx` holds a valid entry.
+    inline fn hasSlot(self: *const TypeDepthByteMemo, slot_idx: u7) bool {
+        const word_idx: usize = slot_idx >> 6;
+        const bit_pos: u6 = @truncate(slot_idx);
+        return (self.has_bits[word_idx] & (@as(u64, 1) << bit_pos)) != 0;
+    }
+
+    /// Marks slot `slot_idx` valid.
+    inline fn setSlot(self: *TypeDepthByteMemo, slot_idx: u7) void {
+        const word_idx: usize = slot_idx >> 6;
+        const bit_pos: u6 = @truncate(slot_idx);
+        self.has_bits[word_idx] |= (@as(u64, 1) << bit_pos);
+    }
+
+    /// Computes the 2-way set base index (`0, 2, …, 126`) for `(type_raw, depth_u16)`.
+    inline fn computeSetBase(type_raw: u32, depth_u16: u16) u7 {
+        var mix: u32 = (type_raw *% 0x9E37_79B1) ^ (@as(u32, depth_u16) *% 0x85EB_CA6B);
+        mix ^= mix >> 16;
+        mix *%= 0x7FEB_352D;
+        mix ^= mix >> 15;
+        return @as(u7, @truncate(mix)) & 0x7E;
+    }
+
+    /// Looks up a cached `u8` value for `(type_raw, depth)` (`null` on miss).
+    inline fn lookup(self: *const TypeDepthByteMemo, type_raw: u32, depth: u32) ?u8 {
+        const depth_u16: u16 = @intCast(depth);
+        const base_slot = computeSetBase(type_raw, depth_u16);
+        if (self.hasSlot(base_slot) and
+            self.type_raws[base_slot] == type_raw and
+            self.depths[base_slot] == depth_u16)
+        {
+            return self.vals[base_slot];
+        }
+        const second_slot = base_slot | 1;
+        if (self.hasSlot(second_slot) and
+            self.type_raws[second_slot] == type_raw and
+            self.depths[second_slot] == depth_u16)
+        {
+            return self.vals[second_slot];
+        }
+        return null;
+    }
+
+    /// Stores `payload` under `(type_raw, depth)` using `depth & 1` parity selection.
+    inline fn store(self: *TypeDepthByteMemo, type_raw: u32, depth: u32, payload: u8) void {
+        const depth_u16: u16 = @intCast(depth);
+        const base_slot = computeSetBase(type_raw, depth_u16);
+        const second_slot = base_slot | 1;
+        const parity_way: u7 = @intCast(depth & 1);
+        const parity_slot = base_slot | parity_way;
+        const alt_slot = base_slot | (parity_way ^ 1);
+        const slot_idx: u7 = if (self.hasSlot(base_slot) and
+            self.type_raws[base_slot] == type_raw and
+            self.depths[base_slot] == depth_u16)
+            base_slot
+        else if (self.hasSlot(second_slot) and
+            self.type_raws[second_slot] == type_raw and
+            self.depths[second_slot] == depth_u16)
+            second_slot
+        else if (!self.hasSlot(parity_slot))
+            parity_slot
+        else if (!self.hasSlot(alt_slot))
+            alt_slot
+        else
+            parity_slot;
+        self.type_raws[slot_idx] = type_raw;
+        self.depths[slot_idx] = depth_u16;
+        self.vals[slot_idx] = payload;
+        self.setSlot(slot_idx);
+    }
+};
+
+/// Resolved `(sym_idx, contract)` pair for an FFI call site carrying a sparse `FfiFnContract`.
+const ResolvedFfiCallContract = struct {
+    /// Canonical target function `SymbolIndex`.
+    sym_idx: SymbolIndex,
+    /// Sparse `FfiFnContract` registered on `sym_table.ffi_contracts`.
+    contract: symbol_resolver.FfiFnContract,
+};
+
+/// Per-slot FFI ownership and nullability state tracked path-sensitively in Pass 2 (`DR-10` §2.3).
+const FfiPtrSlotState = struct {
+    /// `true` if this slot holds an unconsumed `@owned_by_caller` FFI allocation on at least one path.
+    is_owned: bool = false,
+    /// `true` if this slot may hold a null pointer from `@may_be_null` on at least one path.
+    is_maybe_null: bool = false,
+    /// `true` if this slot was already passed to an `@consumes` FFI parameter on at least one path.
+    is_consumed_freed: bool = false,
+    /// Monotonic `1`-based allocation-origin identifier (`0` when absent or merged across distinct origins).
+    origin_alloc_id: u16 = 0,
+    /// Bitset of potential allocation origins (`1 << (ord & 63)`) for sound may-alias `@consumes` invalidation.
+    origin_alloc_mask: u64 = 0,
+    /// Required `@free_with(fn_sym)` deallocator `SymbolIndex` (`.none` if any `@consumes` callee is valid).
+    expected_dealloc: SymbolIndex = .none,
+    /// Source token where the `@owned_by_caller` or `@may_be_null` pointer originated.
+    origin_token: TokenIndex = .none,
+
+    /// Joins `first` and `second` across CFG merge edges (`may`-analysis for leaks, nullability, and double-free).
+    fn join(first: FfiPtrSlotState, second: FfiPtrSlotState) FfiPtrSlotState {
+        const merged_alloc_id: u16 = if (first.origin_alloc_id == second.origin_alloc_id)
+            first.origin_alloc_id
+        else if (first.origin_alloc_id == 0 and first.origin_alloc_mask == 0 and
+            !first.is_owned and !first.is_maybe_null and !first.is_consumed_freed)
+            second.origin_alloc_id
+        else if (second.origin_alloc_id == 0 and second.origin_alloc_mask == 0 and
+            !second.is_owned and !second.is_maybe_null and !second.is_consumed_freed)
+            first.origin_alloc_id
+        else
+            0;
+        return .{
+            .is_owned = first.is_owned or second.is_owned,
+            .is_maybe_null = first.is_maybe_null or second.is_maybe_null,
+            .is_consumed_freed = first.is_consumed_freed or second.is_consumed_freed,
+            .origin_alloc_id = merged_alloc_id,
+            .origin_alloc_mask = first.origin_alloc_mask | second.origin_alloc_mask,
+            .expected_dealloc = if (!first.expected_dealloc.isNone())
+                first.expected_dealloc
+            else
+                second.expected_dealloc,
+            .origin_token = if (!first.origin_token.isNone()) first.origin_token else second.origin_token,
+        };
+    }
+
+    /// Structural equality check for RPO fixpoint convergence.
+    fn isEqual(first: FfiPtrSlotState, second: FfiPtrSlotState) bool {
+        return first.is_owned == second.is_owned and
+            first.is_maybe_null == second.is_maybe_null and
+            first.is_consumed_freed == second.is_consumed_freed and
+            first.origin_alloc_id == second.origin_alloc_id and
+            first.origin_alloc_mask == second.origin_alloc_mask and
+            first.expected_dealloc == second.expected_dealloc;
+    }
+};
+
+/// Resolved FFI null-check refinement on an incoming `cond_br` or `switch_int` edge (`DR-10` §2.3).
+const FfiNullBranchRefinement = struct {
+    /// Target index in `TypestateState.ffi_slots`.
+    slot_idx: usize,
+    /// `true` on the `ptr != 0` branch; `false` on the `ptr == 0` branch (discharging `@owned_by_caller` leaks).
+    is_nonnull_edge: bool,
+};
+
+/// Backing capacity classification for a pointer passed to an `@slice_len` / `@byte_len` FFI parameter.
+const FfiBackingBuffer = union(enum) {
+    /// Fixed byte capacity (`[T; N]` array, string/byte literal, or null `0` when `@may_be_null`).
+    static_bytes: i128,
+    /// Dynamic slice (`&[T]`, `&mut [T]`, or `str`) whose runtime capacity is tied to a slice length SSA/local.
+    dynamic_slice: struct {
+        /// Base `LocalId` index when loaded from a slice local (`NONE_U32` if pure SSA).
+        slice_base_local: u32,
+        /// Canonical slice SSA `MirValueId` (`NONE_U32` if none).
+        slice_ssa_val: u32,
+        /// Direct length SSA `MirValueId` when constructed via `subslice_make` (`lo == 0`) (`NONE_U32` otherwise).
+        direct_len_val: u32,
+        /// Byte size of one slice element (`>= 1`).
+        slice_elem_bytes: i128,
+    },
+    /// Arbitrary raw pointer whose backing capacity is statically unknown.
+    unknown_raw_ptr,
+};
+
+/// Pending relational Pentagon check for a dynamic-slice `@slice_len` / `@byte_len` FFI call argument.
+const PendingFfiSliceLenCheck = struct {
+    /// Basic block index of the `.call` terminator.
+    bb_idx: u32,
+    /// Origin token of the `.call` site.
+    origin_token: TokenIndex,
+    /// `true` if the call site lies inside an `unsafe` block or `unsafe fn` body.
+    is_unsafe_call: bool,
+    /// Length SSA `MirValueId` passed at `len_param_ordinal`.
+    len_val: u32,
+    /// Byte multiplier per unit of `len_val` (`sizeof(T)` for `@slice_len`, `1` for `@byte_len`).
+    unit_bytes: i128,
+    /// Slice base `LocalId` index (`NONE_U32` if pure SSA).
+    slice_base_local: u32,
+    /// Slice SSA `MirValueId` (`NONE_U32` if none).
+    slice_ssa_val: u32,
+    /// Direct subslice length SSA `MirValueId` (`NONE_U32` if none).
+    direct_len_val: u32,
+    /// Byte size of one element in the backing slice (`>= 1`).
+    slice_elem_bytes: i128,
+};
+
+/// Resolved target of an `.await` (`coro_suspend`) expression for Tarjan SCC and `16 KiB` inline frame sizing.
+const AwaitedCalleeTarget = struct {
+    /// Direct `DefId` when statically known.
+    def_id: DefId = .NONE,
+    /// Direct `SymbolIndex` when statically known.
+    sym_idx: SymbolIndex = .none,
+    /// Fallback `Future[T]` `producer_id` from `InternPool` (`0` when erased).
+    raw_producer_id: u32 = 0,
+    /// `true` when awaiting an opaque indirect function pointer or dynamic `Future`.
+    is_indirect_opaque: bool = false,
+};
+
+/// Colored coroutine frame storage slot tracking suspension-point occupancy (`DR-08` §4).
+const ColoredSlot = struct {
+    /// Bitset of `.coro_suspend` ordinals where this colored slot is occupied.
+    mask: DenseBitSet,
+    /// Storage size of this colored slot in bytes.
+    byte_size: u64,
+    /// Required byte alignment of this colored slot.
+    align_bytes: u64,
+};
+
+/// Cross-`.await` local candidate queued for non-overlapping coroutine frame coloring (`DR-08` §4).
+const CandidateLocal = struct {
+    /// Bitset of `.coro_suspend` ordinals across which this local is live.
+    mask: DenseBitSet,
+    /// Storage size of this local in bytes.
+    byte_size: u64,
+    /// Required byte alignment of this local.
+    align_bytes: u64,
+};
+
 // --------------------------------------- CONSTS ----------------------------------------
 
 /// Hard per-function `MovePath` trie node cap (`4,096 * 20B = 80 KiB`, `DR-06` §2.1).
 pub const MAX_MOVE_PATHS: u32 = 4096;
 
-/// Order-preserving sign-flip bias mapping `i64` monotonically onto `u64` (`[CRITICAL-03]`).
+/// Order-preserving sign-flip bias mapping `i64` monotonically onto `u64`.
 pub const SIGN_BIAS_U64: u64 = 0x8000_0000_0000_0000;
 
 /// Maximum backward-sliced SSA variables tracked in the Pentagon relational sub-domain (`256`).
@@ -1223,6 +1449,9 @@ pub const MAX_PENTAGON_BLOCKS: usize = 128;
 
 /// Maximum tracked NLL `LoanId` entries per function (`<= 64` inline `u64`, `> 64` in `BumpArena`; `4095` = overflow).
 const MAX_TRACKED_LOANS: usize = 4096;
+
+/// Maximum distinct `.async_spawn` sites tracked individually by forward must-awaited-join dataflow per body.
+const MAX_TRACKED_NURSERY_SPAWNS: usize = 64;
 
 /// Symbolic region depth `0`: `'static` constants, string literals, and global functions.
 pub const DEPTH_STATIC: u16 = 0;
@@ -1392,6 +1621,123 @@ const EXTERN_PROTO_EFFECT_MAP = std.StaticStringMap(EffectCapabilityMask).initCo
 // -------------------------------------- INTERNALS --------------------------------------
 
 // ---------------- Capability & Span Utilities -----------------
+
+/// Resolves an `InternPool` `Future[T]` `producer_id` (`>= 0x5000_0000` synthetic `DefId` vs. `SymbolIndex`).
+fn resolveProducerSlot(
+    raw_prod_id: u32,
+    key_to_slot: *const std.AutoHashMapUnmanaged(u32, u32),
+    sym_to_slot: *const std.AutoHashMapUnmanaged(u32, u32),
+) ?u32 {
+    if (raw_prod_id == 0) return null;
+    if (raw_prod_id >= 0x5000_0000) return key_to_slot.get(raw_prod_id);
+    return sym_to_slot.get(raw_prod_id);
+}
+
+/// Returns `true` if `sym` is a built-in or `core/*` (`PackageId.std_core`) nominal symbol named `expected_name`.
+inline fn isStdCoreOrBuiltinNominal(
+    sym_table: *const SymbolTable,
+    sym: SymbolRecord,
+    expected_name: []const u8,
+) bool {
+    return type_system.isStdCoreOrBuiltinSymbol(sym_table, sym) and
+        std.mem.eql(u8, sym.name_text, expected_name);
+}
+
+/// Returns `true` if `inst` is a `.fn_addr` referencing a `@thread_local` static variable.
+fn isThreadLocalAddrInst(sym_table: *const SymbolTable, inst: MirInst) bool {
+    if (inst.op != .fn_addr or inst.operands.rhs == mir.NONE_U32) return false;
+    const canon_sym = unwrapCanonicalSymbolIndex(sym_table, SymbolIndex.fromInt(inst.operands.rhs));
+    if (canon_sym.isNone() or canon_sym.asInt() >= sym_table.symbols.items.len) return false;
+    const sym_rec = sym_table.getSymbol(canon_sym).*;
+    if (sym_rec.extra_flags.is_thread_local) return true;
+    return if (sym_table.getFfiContract(canon_sym)) |fc| fc.is_thread_local else false;
+}
+
+/// Returns `true` if `inst` is an `own` `.closure_make` capturing at least one `@linear` value.
+fn isClosureMakeCapturingLinear(
+    body: *const MirBody,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    inst: MirInst,
+) bool {
+    if (inst.op != .aggregate_make or inst.flags.is_local_closure) return false;
+    const agg_k: AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+    if (agg_k != .closure_make) return false;
+    if (type_system.hasLinearObligation(pool, sym_table, inst.type_id)) return true;
+    if (inst.operands.rhs >= body.extra_args.items.len) return false;
+    const cap_len = body.extra_args.items[inst.operands.rhs];
+    const cap_start = @min(body.extra_args.items.len, @as(usize, inst.operands.rhs) + 1);
+    const cap_end = @min(body.extra_args.items.len, cap_start + @as(usize, cap_len));
+    for (body.extra_args.items[cap_start..cap_end]) |cap_val| {
+        if (cap_val < body.insts.len) {
+            const cap_ty = body.getInst(MirValueId.fromInt(cap_val)).type_id;
+            if (type_system.hasLinearObligation(pool, sym_table, cap_ty)) return true;
+        }
+    }
+    return false;
+}
+
+/// Returns `true` if `inst` (`MirIntrinsicKind.async_future_make`) captures any `@linear` value or `own` closure.
+fn isAsyncFutureMakeCapturingLinear(
+    body: *const MirBody,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    inst: MirInst,
+) bool {
+    if (inst.op != .intrinsic_op or
+        @as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)) != .async_future_make or
+        inst.operands.rhs < 3)
+    {
+        return false;
+    }
+    if (inst.operands.lhs + 2 < body.extra_args.items.len) {
+        const callee_val = peelCopyValId(body, body.extra_args.items[inst.operands.lhs + 2]);
+        if (callee_val < body.insts.len and
+            isClosureMakeCapturingLinear(body, pool, sym_table, body.getInst(MirValueId.fromInt(callee_val))))
+        {
+            return true;
+        }
+    }
+    const arg_start = @min(body.extra_args.items.len, @as(usize, inst.operands.lhs) + 3);
+    const arg_end = @min(body.extra_args.items.len, @as(usize, inst.operands.lhs) + @as(usize, inst.operands.rhs));
+    for (body.extra_args.items[arg_start..arg_end]) |arg_val| {
+        if (arg_val < body.insts.len) {
+            const arg_ty = body.getInst(MirValueId.fromInt(arg_val)).type_id;
+            if (type_system.hasLinearObligation(pool, sym_table, arg_ty)) return true;
+        }
+    }
+    return false;
+}
+
+/// Returns `true` if `raw_ty` is a `Future[T]` whose `producer_id` takes a by-value `@linear` parameter.
+fn doesFutureTypeHaveLinearInputParam(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    raw_ty: TypeId,
+) bool {
+    const fut_ty = pool.unwrapUnderlyingType(raw_ty);
+    if (fut_ty.isError() or !pool.isFutureType(fut_ty)) return false;
+    const prod_id = pool.getFutureProducerId(fut_ty);
+    if (prod_id == 0) return false;
+    var prod_sym_idx: SymbolIndex = .none;
+    if (prod_id < sym_table.symbols.items.len and
+        sym_table.getSymbol(SymbolIndex.fromInt(prod_id)).kind == .fn_sym)
+    {
+        prod_sym_idx = SymbolIndex.fromInt(prod_id);
+    } else if (sym_table.def_to_symbol.get(prod_id)) |mapped_sym| {
+        prod_sym_idx = mapped_sym;
+    }
+    if (prod_sym_idx.isNone() or prod_sym_idx.asInt() >= sym_table.symbols.items.len) return false;
+    const fn_ty = pool.unwrapUnderlyingType(sym_table.getSymbol(prod_sym_idx).type_id);
+    if (fn_ty.isError()) return false;
+    const sig_view = pool.getFnSignatureView(fn_ty) orelse return false;
+    for (0..sig_view.paramCount()) |param_i| {
+        const param_mode = sig_view.getParamMode(param_i);
+        if (param_mode == .inout_mode or param_mode == .set_mode) continue;
+        if (type_system.hasLinearObligation(pool, sym_table, sig_view.getParamType(param_i))) return true;
+    }
+    return false;
+}
 
 /// Translates `symbol_resolver.CapabilityBits` into canonical 12-bit `EffectCapabilityMask`.
 fn capabilityBitsToEffectMask(cap_bits: u16) EffectCapabilityMask {
@@ -1650,89 +1996,6 @@ fn lookupDirectDropMethodSymbol(
     }
     return .none;
 }
-
-/// Zero-allocation 128-slot (`64` 2-way sets) exact-key `(TypeId, depth) -> u8` stack memo for `TypeId` DAG walkers.
-const TypeDepthByteMemo = struct {
-    /// Validity bitset for the 128 slots (`16` bytes zeroed at init).
-    has_bits: [2]u64 = @splat(0),
-    /// Exact `TypeId.toU32()` keys for populated slots.
-    type_raws: [128]u32 = undefined,
-    /// Exact recursion depths for populated slots.
-    depths: [128]u16 = undefined,
-    /// Cached `u8` payload (`0`/`1` boolean or 3-bit handle mask) for populated slots.
-    vals: [128]u8 = undefined,
-
-    /// Returns `true` if slot `slot_idx` holds a valid entry.
-    inline fn hasSlot(self: *const TypeDepthByteMemo, slot_idx: u7) bool {
-        const word_idx: usize = slot_idx >> 6;
-        const bit_pos: u6 = @truncate(slot_idx);
-        return (self.has_bits[word_idx] & (@as(u64, 1) << bit_pos)) != 0;
-    }
-
-    /// Marks slot `slot_idx` valid.
-    inline fn setSlot(self: *TypeDepthByteMemo, slot_idx: u7) void {
-        const word_idx: usize = slot_idx >> 6;
-        const bit_pos: u6 = @truncate(slot_idx);
-        self.has_bits[word_idx] |= (@as(u64, 1) << bit_pos);
-    }
-
-    /// Computes the 2-way set base index (`0, 2, …, 126`) for `(type_raw, depth_u16)`.
-    inline fn computeSetBase(type_raw: u32, depth_u16: u16) u7 {
-        var mix: u32 = (type_raw *% 0x9E37_79B1) ^ (@as(u32, depth_u16) *% 0x85EB_CA6B);
-        mix ^= mix >> 16;
-        mix *%= 0x7FEB_352D;
-        mix ^= mix >> 15;
-        return @as(u7, @truncate(mix)) & 0x7E;
-    }
-
-    /// Looks up a cached `u8` value for `(type_raw, depth)` (`null` on miss).
-    inline fn lookup(self: *const TypeDepthByteMemo, type_raw: u32, depth: u32) ?u8 {
-        const depth_u16: u16 = @intCast(depth);
-        const base_slot = computeSetBase(type_raw, depth_u16);
-        if (self.hasSlot(base_slot) and
-            self.type_raws[base_slot] == type_raw and
-            self.depths[base_slot] == depth_u16)
-        {
-            return self.vals[base_slot];
-        }
-        const second_slot = base_slot | 1;
-        if (self.hasSlot(second_slot) and
-            self.type_raws[second_slot] == type_raw and
-            self.depths[second_slot] == depth_u16)
-        {
-            return self.vals[second_slot];
-        }
-        return null;
-    }
-
-    /// Stores `payload` under `(type_raw, depth)` using `depth & 1` parity selection.
-    inline fn store(self: *TypeDepthByteMemo, type_raw: u32, depth: u32, payload: u8) void {
-        const depth_u16: u16 = @intCast(depth);
-        const base_slot = computeSetBase(type_raw, depth_u16);
-        const second_slot = base_slot | 1;
-        const parity_way: u7 = @intCast(depth & 1);
-        const parity_slot = base_slot | parity_way;
-        const alt_slot = base_slot | (parity_way ^ 1);
-        const slot_idx: u7 = if (self.hasSlot(base_slot) and
-            self.type_raws[base_slot] == type_raw and
-            self.depths[base_slot] == depth_u16)
-            base_slot
-        else if (self.hasSlot(second_slot) and
-            self.type_raws[second_slot] == type_raw and
-            self.depths[second_slot] == depth_u16)
-            second_slot
-        else if (!self.hasSlot(parity_slot))
-            parity_slot
-        else if (!self.hasSlot(alt_slot))
-            alt_slot
-        else
-            parity_slot;
-        self.type_raws[slot_idx] = type_raw;
-        self.depths[slot_idx] = depth_u16;
-        self.vals[slot_idx] = payload;
-        self.setSlot(slot_idx);
-    }
-};
 
 /// Recursively collects custom `Drop.drop` symbols and built-in heap-container free flags for `type_id`.
 fn collectDropGlueTargets(
@@ -2160,8 +2423,8 @@ fn computeBottomUpTarjanSccs(
                 if (target_opt == null and !awt.sym_idx.isNone()) {
                     target_opt = sym_to_slot.get(awt.sym_idx.asInt());
                 }
-                if (target_opt == null and awt.raw_producer_id != 0) {
-                    target_opt = key_to_slot.get(awt.raw_producer_id) orelse sym_to_slot.get(awt.raw_producer_id);
+                if (awt.raw_producer_id != 0 and target_opt == null) {
+                    target_opt = resolveProducerSlot(awt.raw_producer_id, key_to_slot, sym_to_slot);
                 }
                 if (target_opt) |callee_slot| {
                     try addUniqueEdge(arena_alloc, adj_lists, adj_seen, has_self_edge, caller_slot, callee_slot);
@@ -2192,8 +2455,8 @@ fn computeBottomUpTarjanSccs(
                 if (target_opt == null and !awt.sym_idx.isNone()) {
                     target_opt = sym_to_slot.get(awt.sym_idx.asInt());
                 }
-                if (target_opt == null and awt.raw_producer_id != 0) {
-                    target_opt = key_to_slot.get(awt.raw_producer_id) orelse sym_to_slot.get(awt.raw_producer_id);
+                if (awt.raw_producer_id != 0 and target_opt == null) {
+                    target_opt = resolveProducerSlot(awt.raw_producer_id, key_to_slot, sym_to_slot);
                 }
                 if (target_opt) |callee_slot| {
                     try addUniqueEdge(arena_alloc, adj_lists, adj_seen, has_self_edge, caller_slot, callee_slot);
@@ -2680,7 +2943,7 @@ fn buildMovePathTrie(
                 &active_soa_field,
             );
 
-            // Dynamic `.index` collapses into parent with `is_partial = true` (`[CRITICAL-02]`):
+            // Dynamic `.index` collapses into parent with `is_partial = true`:
             if (proj.kind == .index) {
                 is_partial = true;
                 continue;
@@ -2818,6 +3081,82 @@ fn buildMovePathTrie(
 
         place_map[pl_i] = .{ .id = cur_id, .is_partial = is_partial };
         place_leaf_types[pl_i] = cur_ty;
+    }
+
+    // Propagate `is_linear` onto `MovePathNode`s storing `@linear`-capturing `async_future_make` values:
+    var linear_fut_vals = try DenseBitSet.initEmpty(arena_alloc, body.insts.len);
+    var has_any_linear_fut = false;
+    for (0..body.insts.len) |inst_i| {
+        const inst = body.getInst(MirValueId.fromInt(@intCast(inst_i)));
+        if (isAsyncFutureMakeCapturingLinear(body, pool, sym_table, inst) or
+            isClosureMakeCapturingLinear(body, pool, sym_table, inst))
+        {
+            linear_fut_vals.set(inst_i);
+            has_any_linear_fut = true;
+        }
+    }
+    if (has_any_linear_fut) {
+        var has_lin_prop = true;
+        var lin_iter: usize = 0;
+        while (has_lin_prop and lin_iter < 8) : (lin_iter += 1) {
+            has_lin_prop = false;
+            for (0..body.insts.len) |inst_i| {
+                const inst = body.getInst(MirValueId.fromInt(@intCast(inst_i)));
+                switch (inst.op) {
+                    .copy_val, .unary_op => {
+                        if (inst.operands.lhs < body.insts.len and
+                            linear_fut_vals.isSet(inst.operands.lhs) and
+                            !linear_fut_vals.isSet(inst_i))
+                        {
+                            linear_fut_vals.set(inst_i);
+                            has_lin_prop = true;
+                        }
+                    },
+                    .place_store => {
+                        if (inst.operands.lhs < place_map.len and
+                            inst.operands.rhs < body.insts.len and
+                            linear_fut_vals.isSet(inst.operands.rhs))
+                        {
+                            var walk_m = place_map[inst.operands.lhs].id;
+                            while (!walk_m.isNone()) {
+                                const m_u32 = walk_m.asInt();
+                                if (m_u32 >= node_list.items.len) break;
+                                var cur_fl = node_list.items[m_u32].flags();
+                                if (!cur_fl.is_linear) {
+                                    cur_fl.is_linear = true;
+                                    node_list.items[m_u32].flags_raw = @bitCast(cur_fl);
+                                    has_lin_prop = true;
+                                }
+                                walk_m = node_list.items[m_u32].parent;
+                            }
+                        }
+                    },
+                    .place_load => {
+                        if (inst.operands.lhs < place_map.len and !linear_fut_vals.isSet(inst_i)) {
+                            const m_u32 = place_map[inst.operands.lhs].id.asInt();
+                            if (m_u32 < node_list.items.len and node_list.items[m_u32].flags().is_linear) {
+                                linear_fut_vals.set(inst_i);
+                                has_lin_prop = true;
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+            for (body.extra_edges.items) |edge| {
+                if (edge.target_bb.asInt() >= body.blocks.items.len) continue;
+                const dst_params = body.getBlockParams(edge.target_bb);
+                const pair_len = @min(dst_params.len, @as(usize, edge.args_len));
+                for (0..pair_len) |p_i| {
+                    const arg_v = body.extra_args.items[edge.args_start + p_i];
+                    const dst_v = dst_params[p_i].asInt();
+                    if (arg_v < body.insts.len and linear_fut_vals.isSet(arg_v) and !linear_fut_vals.isSet(dst_v)) {
+                        linear_fut_vals.set(dst_v);
+                        has_lin_prop = true;
+                    }
+                }
+            }
+        }
     }
 
     const total_paths = node_list.items.len;
@@ -3146,9 +3485,6 @@ const BodyProvenanceHorizon = struct {
     /// `true` on entry to `bb` when an overflow `.async_spawn` may still be unjoined (`len == block_count`).
     overflow_spawn_active_in: []const bool = &.{},
 };
-
-/// Maximum distinct `.async_spawn` sites tracked individually by forward must-awaited-join dataflow per body.
-const MAX_TRACKED_NURSERY_SPAWNS: usize = 64;
 
 /// Resolves an SSA `TaskHandle` value to its unique originating `.async_spawn` ordinal (`null` if ambiguous).
 fn resolveUniqueSpawnOrd(
@@ -3888,14 +4224,27 @@ fn computeBodyProvenanceAndNllHorizon(
 
                                 const is_user_raw_addr = inst.op == .place_addr and inst.operands.rhs >= 2;
                                 if (is_user_raw_addr) {
-                                    // `ADR-22F`: `&raw` / `&raw mut` produce `DEPTH_STATIC` (`0`) raw pointers without MVS loans:
-                                    next_p.max_depth = DEPTH_STATIC;
-                                    if (!is_borrowing_pointee) {
+                                    // `ADR-22F`: `&raw` / `&raw mut` skip MVS `LoanId` minting while preserving stack/param provenance:
+                                    if (is_borrowing_pointee) {
+                                        const base_prov = local_prov[place_rec.base];
+                                        next_p.max_depth = @max(next_p.max_depth, base_prov.max_depth);
+                                        next_p.min_target_depth = @min(next_p.min_target_depth, base_prov.min_target_depth);
+                                        next_p.param_mask |= base_prov.param_mask;
+                                        if (!base_prov.origin_local.isNone()) {
+                                            next_p.origin_local = base_prov.origin_local;
+                                        }
+                                        next_p.raw_ptr_state = base_prov.raw_ptr_state;
+                                        next_p.raw_ptr_local = base_prov.raw_ptr_local;
+                                    } else {
+                                        const base_depth = local_decl_depth[place_rec.base];
+                                        next_p.max_depth = @max(next_p.max_depth, base_depth);
+                                        next_p.min_target_depth = @min(next_p.min_target_depth, base_depth);
+                                        next_p.param_mask |= local_prov[place_rec.base].param_mask;
+                                        if (base_depth >= DEPTH_FN_FRAME) {
+                                            next_p.origin_local = base_lid;
+                                        }
                                         next_p.raw_ptr_state = .valid_live;
                                         next_p.raw_ptr_local = base_lid;
-                                    } else {
-                                        next_p.raw_ptr_state = local_prov[place_rec.base].raw_ptr_state;
-                                        next_p.raw_ptr_local = local_prov[place_rec.base].raw_ptr_local;
                                     }
                                 } else if (is_borrowing_pointee) {
                                     next_p = try ValueProvenance.merge(
@@ -3914,6 +4263,14 @@ fn computeBodyProvenanceAndNllHorizon(
                                     }
                                     if (local_prov[place_rec.base].param_mask != 0) {
                                         next_p.param_mask |= local_prov[place_rec.base].param_mask;
+                                    }
+                                    if ((inst.op != .place_addr or inst.operands.rhs == 0) and
+                                        !local_prov[place_rec.base].loan_mask.isEmpty())
+                                    {
+                                        next_p.loan_mask = try next_p.loan_mask.unionAlloc(
+                                            local_prov[place_rec.base].loan_mask,
+                                            arena_alloc,
+                                        );
                                     }
                                     if (base_depth >= DEPTH_FN_FRAME) {
                                         next_p.origin_local = base_lid;
@@ -4483,7 +4840,7 @@ fn computeBodyProvenanceAndNllHorizon(
                 const bb_id = MirBlockId.fromInt(bb_idx);
                 if (bb_idx != 0) {
                     @memset(work_spawn, 0);
-                    var merged_overflow = false;
+                    var has_merged_overflow = false;
                     for (body.getPredEdges(bb_id)) |pred_eid| {
                         const edge = body.extra_edges.items[pred_eid.asInt()];
                         const src_idx = edge.src_bb.asInt();
@@ -4506,7 +4863,7 @@ fn computeBodyProvenanceAndNllHorizon(
                             }
                             if (edge_cnt > work_spawn[sp_i]) work_spawn[sp_i] = edge_cnt;
                         }
-                        if (overflow_spawn_active_out[src_idx]) merged_overflow = true;
+                        if (overflow_spawn_active_out[src_idx]) has_merged_overflow = true;
                     }
                     for (0..spawn_count) |sp_i| {
                         if (work_spawn[sp_i] > spawn_active_in[bb_idx * spawn_count + sp_i]) {
@@ -4514,7 +4871,7 @@ fn computeBodyProvenanceAndNllHorizon(
                             has_spawn_changed = true;
                         }
                     }
-                    if (merged_overflow and !overflow_spawn_active_in[bb_idx]) {
+                    if (has_merged_overflow and !overflow_spawn_active_in[bb_idx]) {
                         overflow_spawn_active_in[bb_idx] = true;
                         has_spawn_changed = true;
                     }
@@ -4940,7 +5297,7 @@ fn hasProvenanceCarrierBounded(
             const sym_idx = SymbolIndex.fromInt(node.rhs);
             if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) break :blk false;
             const sym = sym_table.getSymbol(sym_idx).*;
-            if (std.mem.eql(u8, sym.name_text, "TaskHandle")) break :blk true;
+            if (isStdCoreOrBuiltinNominal(sym_table, sym, "TaskHandle")) break :blk true;
             if (sym.target_scope.isNone()) break :blk false;
             const child_subst = type_system.NominalTypeSubst.fromNominal(pool, sym_table, unwrapped, sym, subst);
             const active_subst = if (child_subst.len > 0) &child_subst else subst;
@@ -5618,7 +5975,7 @@ fn lookupLocalNameText(
     return "";
 }
 
-/// Converges monotone flow/scratch bitmasks across a recursive Tarjan SCC prior to Pass 2 (`[CRITICAL-01]`).
+/// Converges monotone flow/scratch bitmasks across a recursive Tarjan SCC prior to Pass 2.
 fn convergeRecursiveSccSummaries(
     scratch_arena: *BumpArena,
     bodies: []const MirBody,
@@ -5948,14 +6305,6 @@ fn resolveCanonicalCallSymbol(sym_table: *const SymbolTable, call_site: mir.MirC
     return .none;
 }
 
-/// Resolved `(sym_idx, contract)` pair for an FFI call site carrying a sparse `FfiFnContract`.
-const ResolvedFfiCallContract = struct {
-    /// Canonical target function `SymbolIndex`.
-    sym_idx: SymbolIndex,
-    /// Sparse `FfiFnContract` registered on `sym_table.ffi_contracts`.
-    contract: symbol_resolver.FfiFnContract,
-};
-
 /// Looks up the sparse `FfiFnContract` for `call_site` if it targets an annotated FFI/extern symbol.
 fn lookupCallFfiContract(
     sym_table: *const SymbolTable,
@@ -6009,60 +6358,6 @@ fn accumulateFfiContractGlobalEscape(
         }
     }
 }
-
-/// Per-slot FFI ownership and nullability state tracked path-sensitively in Pass 2 (`DR-10` §2.3).
-const FfiPtrSlotState = struct {
-    /// `true` if this slot holds an unconsumed `@owned_by_caller` FFI allocation on at least one path.
-    is_owned: bool = false,
-    /// `true` if this slot may hold a null pointer from `@may_be_null` on at least one path.
-    is_maybe_null: bool = false,
-    /// `true` if this slot was already passed to an `@consumes` FFI parameter on at least one path.
-    is_consumed_freed: bool = false,
-    /// Monotonic `1`-based allocation-origin identifier (`0` when absent or merged across distinct origins).
-    origin_alloc_id: u16 = 0,
-    /// Bitset of potential allocation origins (`1 << (ord & 63)`) for sound may-alias `@consumes` invalidation.
-    origin_alloc_mask: u64 = 0,
-    /// Required `@free_with(fn_sym)` deallocator `SymbolIndex` (`.none` if any `@consumes` callee is valid).
-    expected_dealloc: SymbolIndex = .none,
-    /// Source token where the `@owned_by_caller` or `@may_be_null` pointer originated.
-    origin_token: TokenIndex = .none,
-
-    /// Joins `first` and `second` across CFG merge edges (`may`-analysis for leaks, nullability, and double-free).
-    fn join(first: FfiPtrSlotState, second: FfiPtrSlotState) FfiPtrSlotState {
-        const merged_alloc_id: u16 = if (first.origin_alloc_id == second.origin_alloc_id)
-            first.origin_alloc_id
-        else if (first.origin_alloc_id == 0 and first.origin_alloc_mask == 0 and
-            !first.is_owned and !first.is_maybe_null and !first.is_consumed_freed)
-            second.origin_alloc_id
-        else if (second.origin_alloc_id == 0 and second.origin_alloc_mask == 0 and
-            !second.is_owned and !second.is_maybe_null and !second.is_consumed_freed)
-            first.origin_alloc_id
-        else
-            0;
-        return .{
-            .is_owned = first.is_owned or second.is_owned,
-            .is_maybe_null = first.is_maybe_null or second.is_maybe_null,
-            .is_consumed_freed = first.is_consumed_freed or second.is_consumed_freed,
-            .origin_alloc_id = merged_alloc_id,
-            .origin_alloc_mask = first.origin_alloc_mask | second.origin_alloc_mask,
-            .expected_dealloc = if (!first.expected_dealloc.isNone())
-                first.expected_dealloc
-            else
-                second.expected_dealloc,
-            .origin_token = if (!first.origin_token.isNone()) first.origin_token else second.origin_token,
-        };
-    }
-
-    /// Structural equality check for RPO fixpoint convergence.
-    fn eql(first: FfiPtrSlotState, second: FfiPtrSlotState) bool {
-        return first.is_owned == second.is_owned and
-            first.is_maybe_null == second.is_maybe_null and
-            first.is_consumed_freed == second.is_consumed_freed and
-            first.origin_alloc_id == second.origin_alloc_id and
-            first.origin_alloc_mask == second.origin_alloc_mask and
-            first.expected_dealloc == second.expected_dealloc;
-    }
-};
 
 /// Six-bitset monotone dataflow state + raw/FFI-pointer abstract maps for Pass 2 (`DR-06` §2.1 & `DR-10` §2.3).
 const TypestateState = struct {
@@ -6164,7 +6459,7 @@ const TypestateState = struct {
         }
         for (self.ffi_slots, other.ffi_slots) |*dst_ffi, src_ffi| {
             const joined_ffi = FfiPtrSlotState.join(dst_ffi.*, src_ffi);
-            if (!FfiPtrSlotState.eql(joined_ffi, dst_ffi.*)) {
+            if (!FfiPtrSlotState.isEqual(joined_ffi, dst_ffi.*)) {
                 dst_ffi.* = joined_ffi;
                 has_changed = true;
             }
@@ -6217,7 +6512,7 @@ fn hasImmediatePairedStore(body: *const MirBody, inst_slice: []const MirValueId,
     return false;
 }
 
-/// Applies strong or weak initialization of `lookup` onto `state` (`[CRITICAL-02]`).
+/// Applies strong or weak initialization of `lookup` onto `state`.
 fn applyPathWriteToState(trie: *const MovePathTrie, lookup: PlacePathLookup, state: *TypestateState) void {
     if (lookup.id.isNone()) return;
     const m_idx = lookup.id.asInt();
@@ -6252,7 +6547,7 @@ fn applyPathWriteToState(trie: *const MovePathTrie, lookup: PlacePathLookup, sta
     }
 }
 
-/// Applies strong or weak move/free transition of `lookup` onto `state` (`[CRITICAL-02]`).
+/// Applies strong or weak move/free transition of `lookup` onto `state`.
 fn applyPathMoveOrFreeToState(
     trie: *const MovePathTrie,
     lookup: PlacePathLookup,
@@ -6504,14 +6799,6 @@ fn refineFfiNullGuardAcrossAliases(edge_state: *TypestateState, ffi_guard: FfiNu
         }
     }
 }
-
-/// Resolved FFI null-check refinement on an incoming `cond_br` or `switch_int` edge (`DR-10` §2.3).
-const FfiNullBranchRefinement = struct {
-    /// Target index in `TypestateState.ffi_slots`.
-    slot_idx: usize,
-    /// `true` on the `ptr != 0` branch; `false` on the `ptr == 0` branch (discharging `@owned_by_caller` leaks).
-    is_nonnull_edge: bool,
-};
 
 /// Checks whether `val_raw` peels to a compile-time `0` / null constant in `body`.
 fn isZeroScalarOrPtrConstVal(body: *const MirBody, val_raw: u32) bool {
@@ -6787,7 +7074,7 @@ fn isTrustedExternStaticTempSlot(
     if (temp_base >= body.locals.items.len or !body.locals.items[temp_base].flags().is_synthetic_temp) {
         return false;
     }
-    var found_trusted = false;
+    var has_found_trusted = false;
     for (body.blocks.items, 0..) |_, b_i| {
         for (body.getBlockInsts(MirBlockId.fromInt(@intCast(b_i)))) |inst_vid| {
             const inst = body.getInst(inst_vid);
@@ -6803,13 +7090,13 @@ fn isTrustedExternStaticTempSlot(
             if (sym_rec.kind != .extern_static_sym or sym_rec.flags.is_mut) return false;
             const fc = sym_table.getFfiContract(ext_sym) orelse return false;
             if (!fc.is_trusted or fc.is_unsafe_extern) return false;
-            found_trusted = true;
+            has_found_trusted = true;
         }
     }
-    return found_trusted;
+    return has_found_trusted;
 }
 
-/// Returns `true` when `raw_ty` unwraps (through `&` / `&mut` / aliases) to nominal `CStr`.
+/// Returns `true` when `raw_ty` unwraps to `core.ffi.CStr` or a `@trusted @repr(C)` `CStr` wrapper.
 fn isCStrNominalType(
     pool: *const InternPool,
     sym_table: *const SymbolTable,
@@ -6826,10 +7113,43 @@ fn isCStrNominalType(
         if (node.tag == .struct_ty) {
             const sym_idx = SymbolIndex.fromInt(node.rhs);
             if (!sym_idx.isNone() and sym_idx.asInt() < sym_table.symbols.items.len) {
-                return std.mem.eql(u8, sym_table.getSymbol(sym_idx).name_text, "CStr");
+                const sym = sym_table.getSymbol(sym_idx).*;
+                if (!std.mem.eql(u8, sym.name_text, "CStr")) return false;
+                return type_system.isStdCoreOrBuiltinSymbol(sym_table, sym) or
+                    (sym.extra_flags.is_trusted_ffi and sym.contract_flags.is_repr_c);
             }
         }
         break;
+    }
+    return false;
+}
+
+/// Returns `true` if basic block `start_bb` can reach `target_bb` along CFG edges in `body`.
+fn canBlockReachTarget(body: *const MirBody, start_bb: MirBlockId, target_bb: MirBlockId) bool {
+    if (start_bb == target_bb) return true;
+    const block_count = body.blocks.items.len;
+    if (start_bb.asInt() >= block_count or target_bb.asInt() >= block_count) return false;
+    var visited_words: [8]u64 = @splat(0);
+    if (block_count > 512) return true;
+    var stack: [64]u32 = undefined;
+    var stack_len: usize = 1;
+    stack[0] = start_bb.asInt();
+    visited_words[start_bb.asInt() >> 6] |= (@as(u64, 1) << @as(u6, @truncate(start_bb.asInt())));
+    while (stack_len > 0) {
+        stack_len -= 1;
+        const cur_u32 = stack[stack_len];
+        for (body.getOutgoingEdges(MirBlockId.fromInt(cur_u32))) |edge| {
+            const dst = edge.target_bb.asInt();
+            if (dst == target_bb.asInt()) return true;
+            if (dst >= block_count) continue;
+            const mask = @as(u64, 1) << @as(u6, @truncate(dst));
+            if ((visited_words[dst >> 6] & mask) == 0) {
+                visited_words[dst >> 6] |= mask;
+                if (stack_len >= stack.len) return true;
+                stack[stack_len] = dst;
+                stack_len += 1;
+            }
+        }
     }
     return false;
 }
@@ -6849,6 +7169,7 @@ fn isFixedByteArrayLocalZeroTerminated(
 
     for (dom.rpo_blocks) |b_u32| {
         const cand_bb = MirBlockId.fromInt(b_u32);
+        if (!canBlockReachTarget(body, cand_bb, use_bb)) continue;
         const is_dom = dom.isDominatorOf(cand_bb, use_bb);
         for (body.getBlockInsts(cand_bb)) |inst_vid| {
             const inst = body.getInst(inst_vid);
@@ -6923,10 +7244,43 @@ fn isFixedByteArrayLocalZeroTerminated(
                 } else {
                     has_dominating_nul = false;
                 }
+            } else if ((inst.op == .ghost_access_inout or inst.op == .ghost_access_set) and
+                inst.operands.lhs < body.places.items.len)
+            {
+                const pl_id = PlaceId.fromInt(inst.operands.lhs);
+                const pl_rec = body.places.items[inst.operands.lhs];
+                if (pl_rec.base == arr_local) {
+                    const projs = body.getPlaceProjections(pl_id);
+                    var is_safe_prefix_index = false;
+                    if (projs.len == 1 and projs[0].kind == .index and projs[0].payload < body.insts.len) {
+                        const idx_inst = body.getInst(MirValueId.fromInt(peelCopyValId(body, projs[0].payload)));
+                        if (idx_inst.op == .const_scalar and idx_inst.operands.lhs < body.consts.items.len and
+                            body.consts.items[idx_inst.operands.lhs] == .int_val)
+                        {
+                            const c_idx = body.consts.items[idx_inst.operands.lhs].int_val;
+                            is_safe_prefix_index = c_idx >= 0 and c_idx < last_idx;
+                        }
+                    }
+                    if (!is_safe_prefix_index) has_dominating_nul = false;
+                }
             } else if (inst.op == .place_addr and inst.operands.lhs < body.places.items.len) {
                 const pl_rec = body.places.items[inst.operands.lhs];
                 if (pl_rec.base == arr_local and (inst.operands.rhs == 1 or inst.operands.rhs == 3)) {
                     return false;
+                }
+            }
+        }
+        const cand_term = body.blocks.items[b_u32].terminator;
+        if (cand_term.kind == .call and cand_term.cond_or_val < body.calls.items.len) {
+            const csite = body.calls.items[cand_term.cond_or_val];
+            for (0..csite.args_len) |arg_i| {
+                const mode = body.call_arg_modes.items[csite.modes_start + arg_i];
+                const word = body.extra_args.items[csite.args_start + arg_i];
+                if ((mode == .inout_mode or mode == .set_mode) and word < body.places.items.len and
+                    body.places.items[word].base == arr_local)
+                {
+                    if (cand_bb == use_bb) return false;
+                    has_dominating_nul = false;
                 }
             }
         }
@@ -7108,7 +7462,7 @@ fn isProvenNullTerminatedValue(
                     if (src_term.kind == .call and src_term.cond_or_val < body.calls.items.len) {
                         const prod_call = body.calls.items[src_term.cond_or_val];
                         if (lookupCallFfiContract(sym_table, prod_call)) |fc| {
-                            if (fc.contract.ret_null_terminated) return true;
+                            if (fc.contract.is_ret_null_terminated) return true;
                         }
                         const prod_sym = resolveCanonicalCallSymbol(sym_table, prod_call);
                         if (!prod_sym.isNone() and prod_sym.asInt() < sym_table.symbols.items.len) {
@@ -7634,12 +7988,12 @@ fn applyCallStateTransitionSilent(
                 const alloc_id: u16 = @intCast(1 + @min(call_idx, 0x7FFE));
                 const alloc_mask: u64 = @as(u64, 1) << @intCast(call_idx & 63);
                 state.ffi_slots[ret_slot] = .{
-                    .is_owned = ffi_call.contract.ret_owned_by_caller,
-                    .is_maybe_null = ffi_call.contract.ret_may_be_null,
+                    .is_owned = ffi_call.contract.is_ret_owned_by_caller,
+                    .is_maybe_null = ffi_call.contract.is_ret_may_be_null,
                     .is_consumed_freed = false,
                     .origin_alloc_id = alloc_id,
                     .origin_alloc_mask = alloc_mask,
-                    .expected_dealloc = if (ffi_call.contract.ret_owned_by_caller)
+                    .expected_dealloc = if (ffi_call.contract.is_ret_owned_by_caller)
                         unwrapCanonicalSymbolIndex(sym_table, ffi_call.contract.ret_free_with_sym)
                     else
                         .none,
@@ -8051,17 +8405,420 @@ fn findExclusivityConflict(
     return null;
 }
 
-/// Returns `true` when `bb_idx` is the cancellation unwind target (`edge 1`) of a `.coro_suspend` terminator.
+/// Returns `true` when cleanup pad `bb_idx` is reachable from the cancel edge (`edge 1`) of `.coro_suspend`.
 fn isCoroCancelCleanupBlock(body: *const MirBody, bb_idx: u32) bool {
-    if (bb_idx >= body.blocks.items.len) return false;
-    const preds = body.getPredEdges(MirBlockId.fromInt(bb_idx));
-    if (preds.len != 1) return false;
-    const pred_edge = body.extra_edges.items[preds[0].asInt()];
-    if (pred_edge.src_bb.asInt() >= body.blocks.items.len) return false;
-    const src_term = body.blocks.items[pred_edge.src_bb.asInt()].terminator;
-    return src_term.kind == .coro_suspend and
-        src_term.edge_len >= 2 and
-        preds[0].asInt() == src_term.edge_start + 1;
+    if (bb_idx >= body.blocks.items.len or !body.blocks.items[bb_idx].isCleanupPad()) return false;
+    var stack: [32]u32 = undefined;
+    var visited: [32]u32 = undefined;
+    var stack_len: usize = 1;
+    var visited_len: usize = 1;
+    stack[0] = bb_idx;
+    visited[0] = bb_idx;
+
+    var steps: usize = 0;
+    while (stack_len > 0 and steps < 32) : (steps += 1) {
+        stack_len -= 1;
+        const cur_bb = stack[stack_len];
+        for (body.getPredEdges(MirBlockId.fromInt(cur_bb))) |pred_eid| {
+            if (pred_eid.asInt() >= body.extra_edges.items.len) continue;
+            const pred_edge = body.extra_edges.items[pred_eid.asInt()];
+            const src_bb = pred_edge.src_bb.asInt();
+            if (src_bb >= body.blocks.items.len) continue;
+            const src_term = body.blocks.items[src_bb].terminator;
+            if (src_term.kind == .coro_suspend and
+                src_term.edge_len >= 2 and
+                pred_eid.asInt() == src_term.edge_start + 1)
+            {
+                return true;
+            }
+            if (body.blocks.items[src_bb].isCleanupPad() and
+                (src_term.kind == .br or src_term.kind == .call) and
+                src_term.edge_len == 1 and
+                visited_len < visited.len and stack_len < stack.len)
+            {
+                var has_seen = false;
+                for (visited[0..visited_len]) |seen_bb| {
+                    if (seen_bb == src_bb) {
+                        has_seen = true;
+                        break;
+                    }
+                }
+                if (!has_seen) {
+                    visited[visited_len] = src_bb;
+                    visited_len += 1;
+                    stack[stack_len] = src_bb;
+                    stack_len += 1;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/// Returns `true` when `start_bb` (a cleanup pad or `?`/`.Err` branch entering one) reaches `async_task_group_exit`.
+fn doesCleanupChainReachNurseryExit(body: *const MirBody, start_bb: u32) bool {
+    if (start_bb >= body.blocks.items.len) return false;
+    var cur_bb = start_bb;
+    if (!body.blocks.items[cur_bb].isCleanupPad()) {
+        const start_term = body.blocks.items[cur_bb].terminator;
+        if (start_term.kind != .br or start_term.edge_len != 1 or
+            start_term.edge_start >= body.extra_edges.items.len)
+        {
+            return false;
+        }
+        cur_bb = body.extra_edges.items[start_term.edge_start].target_bb.asInt();
+    }
+    var hops: usize = 0;
+    while (cur_bb < body.blocks.items.len and hops <= 32) : (hops += 1) {
+        const blk = body.blocks.items[cur_bb];
+        if (!blk.isCleanupPad()) return false;
+        for (body.getBlockInsts(MirBlockId.fromInt(cur_bb))) |inst_vid| {
+            const inst = body.getInst(inst_vid);
+            if (inst.op == .intrinsic_op and
+                @as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)) == .async_task_group_exit)
+            {
+                return true;
+            }
+        }
+        const term = blk.terminator;
+        if ((term.kind != .br and term.kind != .call) or term.edge_len != 1 or
+            term.edge_start >= body.extra_edges.items.len)
+        {
+            return false;
+        }
+        cur_bb = body.extra_edges.items[term.edge_start].target_bb.asInt();
+    }
+    return false;
+}
+
+/// Returns `true` when every `@linear` leaf inside `raw_ty` is built-in or `core.async` `TaskHandle[T]`.
+fn isEveryLinearLeafTaskHandleType(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    raw_ty: TypeId,
+    subst: *const type_system.NominalTypeSubst,
+    depth: u32,
+) bool {
+    if (depth >= 16) return false;
+    const resolved_ty = subst.resolve(raw_ty);
+    if (resolved_ty.isError()) return false;
+    if (!type_system.hasLinearObligationWithSubst(pool, sym_table, resolved_ty, subst)) return false;
+    const unwrapped = pool.unwrapUnderlyingType(resolved_ty);
+    if (pool.isTaskHandleType(unwrapped)) return true;
+    const node = pool.getNode(unwrapped);
+    return switch (node.tag) {
+        .array_ty, .soa_array_ty, .optional_ty => isEveryLinearLeafTaskHandleType(
+            pool,
+            sym_table,
+            TypeId.fromInt(node.lhs),
+            subst,
+            depth + 1,
+        ),
+        .result_ty => blk: {
+            const ok_ty = TypeId.fromInt(node.lhs);
+            const err_ty = TypeId.fromInt(node.rhs);
+            const has_ok_lin = type_system.hasLinearObligationWithSubst(pool, sym_table, ok_ty, subst);
+            const has_err_lin = type_system.hasLinearObligationWithSubst(pool, sym_table, err_ty, subst);
+            if (!has_ok_lin and !has_err_lin) break :blk false;
+            if (has_ok_lin and !isEveryLinearLeafTaskHandleType(pool, sym_table, ok_ty, subst, depth + 1)) {
+                break :blk false;
+            }
+            if (has_err_lin and !isEveryLinearLeafTaskHandleType(pool, sym_table, err_ty, subst, depth + 1)) {
+                break :blk false;
+            }
+            break :blk true;
+        },
+        .tuple_ty => blk: {
+            var has_any_lin = false;
+            for (pool.getTupleElements(unwrapped)) |elem_raw| {
+                const elem_ty = TypeId.fromInt(elem_raw);
+                if (!type_system.hasLinearObligationWithSubst(pool, sym_table, elem_ty, subst)) continue;
+                has_any_lin = true;
+                if (!isEveryLinearLeafTaskHandleType(pool, sym_table, elem_ty, subst, depth + 1)) {
+                    break :blk false;
+                }
+            }
+            break :blk has_any_lin;
+        },
+        .struct_ty => blk: {
+            const sym_idx = SymbolIndex.fromInt(node.rhs);
+            if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) break :blk false;
+            const sym = sym_table.getSymbol(sym_idx).*;
+            if (isStdCoreOrBuiltinNominal(sym_table, sym, "TaskHandle")) break :blk true;
+            if (sym.contract_flags.is_linear or type_system.LINEAR_BUILTIN_TYPE_MAP.has(sym.name_text)) {
+                break :blk false;
+            }
+            if (sym.target_scope.isNone()) break :blk false;
+            const child_subst = type_system.NominalTypeSubst.fromNominal(pool, sym_table, unwrapped, sym, subst);
+            const active_subst = if (child_subst.len > 0) &child_subst else subst;
+            var has_any_lin = false;
+            for (sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
+                const mem_sym = sym_table.getSymbol(mem_idx).*;
+                if (mem_sym.kind != .field_sym) continue;
+                if (!type_system.hasLinearObligationWithSubst(pool, sym_table, mem_sym.type_id, active_subst)) continue;
+                has_any_lin = true;
+                if (!isEveryLinearLeafTaskHandleType(pool, sym_table, mem_sym.type_id, active_subst, depth + 1)) {
+                    break :blk false;
+                }
+            }
+            break :blk has_any_lin;
+        },
+        else => false,
+    };
+}
+
+/// Returns `true` when every live unconsumed `@linear` leaf in `m_idx`'s subtree is a nursery `TaskHandle[T]`.
+fn areAllLiveLinearLeavesTaskHandles(
+    trie: *const MovePathTrie,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    state: *const TypestateState,
+    m_idx: usize,
+) bool {
+    if (m_idx >= trie.nodes.len) return true;
+    const node = trie.nodes[m_idx];
+    if (!node.flags().is_linear or !state.maybe_init.isSet(m_idx)) return true;
+
+    var has_linear_field_child = false;
+    var walk_ch = node.first_child;
+    while (!walk_ch.isNone()) {
+        const ch_idx = walk_ch.asInt();
+        const ch_node = trie.nodes[ch_idx];
+        if (ch_node.proj_kind_raw == @backingInt(mir.ProjKind.field) and ch_node.flags().is_linear) {
+            has_linear_field_child = true;
+            if (hasLiveLinearObligation(trie, state, ch_idx) and
+                !areAllLiveLinearLeavesTaskHandles(trie, pool, sym_table, state, ch_idx))
+            {
+                return false;
+            }
+        }
+        walk_ch = ch_node.next_sibling;
+    }
+    if (has_linear_field_child) return true;
+    if (m_idx >= trie.node_types.len) return false;
+    return isEveryLinearLeafTaskHandleType(
+        pool,
+        sym_table,
+        trie.node_types[m_idx],
+        &type_system.NominalTypeSubst.EMPTY,
+        0,
+    );
+}
+
+/// Returns `true` if SSA instruction `target_val` is never consumed by any downstream instruction or terminator.
+fn isUnusedSsaValue(body: *const MirBody, target_val: u32) bool {
+    for (body.blocks.items) |blk| {
+        for (0..blk.inst_len) |inst_k| {
+            const vid = body.block_insts.items[blk.inst_start + inst_k].asInt();
+            if (vid == target_val) continue;
+            const inst = body.getInst(MirValueId.fromInt(vid));
+            switch (inst.op) {
+                .copy_val, .unary_op, .aggregate_extract, .bitfield_extract, .ghost_access_end => {
+                    if (inst.operands.lhs == target_val) return false;
+                },
+                .bin_op => {
+                    if (inst.operands.lhs == target_val or inst.operands.rhs == target_val) return false;
+                },
+                .place_store => {
+                    if (inst.operands.rhs == target_val) return false;
+                },
+                .aggregate_make => {
+                    const akind: AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+                    switch (akind) {
+                        .array_repeat => if (inst.operands.lhs == target_val) return false,
+                        .closure_make => {
+                            if (inst.operands.rhs < body.extra_args.items.len) {
+                                const cap_len = body.extra_args.items[inst.operands.rhs];
+                                const cap_end = @min(
+                                    body.extra_args.items.len,
+                                    @as(usize, inst.operands.rhs) + 1 + @as(usize, cap_len),
+                                );
+                                for (body.extra_args.items[inst.operands.rhs + 1 .. cap_end]) |word_v| {
+                                    if (word_v == target_val) return false;
+                                }
+                            }
+                        },
+                        .tagged_variant => {
+                            const extra_len = inst.operands.rhs & 0xFFFF;
+                            const end_idx = @min(
+                                body.extra_args.items.len,
+                                @as(usize, inst.operands.lhs) + @as(usize, extra_len),
+                            );
+                            for (body.extra_args.items[inst.operands.lhs..end_idx]) |word_v| {
+                                if (word_v == target_val) return false;
+                            }
+                        },
+                        .tuple_agg, .struct_agg, .array_elems, .str_concat, .fmt_args_make => {
+                            const end_idx = @min(
+                                body.extra_args.items.len,
+                                @as(usize, inst.operands.lhs) + @as(usize, inst.operands.rhs),
+                            );
+                            for (body.extra_args.items[inst.operands.lhs..end_idx]) |word_v| {
+                                if (word_v == target_val) return false;
+                            }
+                        },
+                    }
+                },
+                .aggregate_insert => {
+                    if (inst.operands.lhs == target_val) return false;
+                    if (inst.operands.rhs + 1 < body.extra_args.items.len and
+                        body.extra_args.items[inst.operands.rhs + 1] == target_val)
+                    {
+                        return false;
+                    }
+                },
+                .intrinsic_op => {
+                    const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+                    if (ikind.hasPlaceInLhs()) {
+                        if (ikind.hasSsaFlagInRhs() and inst.operands.rhs == target_val) return false;
+                    } else if (ikind.hasExtraArgs()) {
+                        const end_idx = @min(
+                            body.extra_args.items.len,
+                            @as(usize, inst.operands.lhs) + @as(usize, inst.operands.rhs),
+                        );
+                        for (body.extra_args.items[inst.operands.lhs..end_idx]) |word_v| {
+                            if (word_v == target_val) return false;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+        const term = blk.terminator;
+        switch (term.kind) {
+            .ret, .cond_br, .switch_int, .coro_suspend => {
+                if (term.cond_or_val == target_val) return false;
+            },
+            .call => {
+                if (term.cond_or_val < body.calls.items.len) {
+                    const cs = body.calls.items[term.cond_or_val];
+                    if (cs.callee_val.asInt() == target_val) return false;
+                    for (0..cs.args_len) |arg_i| {
+                        const mode = body.call_arg_modes.items[cs.modes_start + arg_i];
+                        if (mode == .let_mode or mode == .sink_mode) {
+                            if (body.extra_args.items[cs.args_start + arg_i] == target_val) return false;
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+        for (0..term.edge_len) |edge_k| {
+            const edge = body.extra_edges.items[term.edge_start + edge_k];
+            for (0..edge.args_len) |ea_i| {
+                if (body.extra_args.items[edge.args_start + ea_i] == target_val) return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// Returns `true` if `root_fut_val` passed to `async_spawn` holds an unpolled `@linear` input capture or argument.
+fn doesSpawnedFutureHoldPrePollLinearCapture(
+    body: *const MirBody,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    root_fut_val: u32,
+) bool {
+    if (root_fut_val >= body.insts.len) return false;
+    var stack: [32]u32 = undefined;
+    var visited: [32]u32 = undefined;
+    var stack_len: usize = 1;
+    var visited_len: usize = 1;
+    stack[0] = root_fut_val;
+    visited[0] = root_fut_val;
+
+    var steps: usize = 0;
+    while (stack_len > 0 and steps < 32) : (steps += 1) {
+        stack_len -= 1;
+        const cur_val = stack[stack_len];
+        if (cur_val >= body.insts.len) continue;
+        const cur_inst = body.getInst(MirValueId.fromInt(cur_val));
+        if (doesFutureTypeHaveLinearInputParam(pool, sym_table, cur_inst.type_id)) return true;
+        if (isAsyncFutureMakeCapturingLinear(body, pool, sym_table, cur_inst)) return true;
+        if (isClosureMakeCapturingLinear(body, pool, sym_table, cur_inst)) return true;
+
+        switch (cur_inst.op) {
+            .copy_val, .unary_op => {
+                const next_v = cur_inst.operands.lhs;
+                if (next_v < body.insts.len and visited_len < visited.len and stack_len < stack.len) {
+                    var has_seen = false;
+                    for (visited[0..visited_len]) |seen_v| {
+                        if (seen_v == next_v) {
+                            has_seen = true;
+                            break;
+                        }
+                    }
+                    if (!has_seen) {
+                        visited[visited_len] = next_v;
+                        visited_len += 1;
+                        stack[stack_len] = next_v;
+                        stack_len += 1;
+                    }
+                }
+            },
+            .place_load => {
+                if (cur_inst.operands.lhs < body.places.items.len) {
+                    const target_base = body.places.items[cur_inst.operands.lhs].base;
+                    for (0..body.insts.len) |scan_i| {
+                        const scan_inst = body.getInst(MirValueId.fromInt(@intCast(scan_i)));
+                        if (scan_inst.op == .place_store and
+                            scan_inst.operands.lhs < body.places.items.len and
+                            body.places.items[scan_inst.operands.lhs].base == target_base)
+                        {
+                            const next_v = scan_inst.operands.rhs;
+                            if (next_v < body.insts.len and visited_len < visited.len and stack_len < stack.len) {
+                                var has_seen = false;
+                                for (visited[0..visited_len]) |seen_v| {
+                                    if (seen_v == next_v) {
+                                        has_seen = true;
+                                        break;
+                                    }
+                                }
+                                if (!has_seen) {
+                                    visited[visited_len] = next_v;
+                                    visited_len += 1;
+                                    stack[stack_len] = next_v;
+                                    stack_len += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            .block_param => {
+                const owner_bb = MirBlockId.fromInt(cur_inst.operands.lhs);
+                const param_ord = cur_inst.operands.rhs;
+                if (owner_bb.asInt() < body.blocks.items.len) {
+                    for (body.getPredEdges(owner_bb)) |pred_eid| {
+                        const edge = body.extra_edges.items[pred_eid.asInt()];
+                        if (edge.src_bb.asInt() >= body.blocks.items.len) continue;
+                        const src_term = body.blocks.items[edge.src_bb.asInt()].terminator;
+                        if (src_term.kind != .call and src_term.kind != .coro_suspend and param_ord < edge.args_len) {
+                            const next_v = body.extra_args.items[edge.args_start + param_ord];
+                            if (next_v < body.insts.len and visited_len < visited.len and stack_len < stack.len) {
+                                var has_seen = false;
+                                for (visited[0..visited_len]) |seen_v| {
+                                    if (seen_v == next_v) {
+                                        has_seen = true;
+                                        break;
+                                    }
+                                }
+                                if (!has_seen) {
+                                    visited[visited_len] = next_v;
+                                    visited_len += 1;
+                                    stack[stack_len] = next_v;
+                                    stack_len += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    return false;
 }
 
 /// Queues `drop_in_place` / `drop_if_live` insertions for `m_idx` (and reverse-order fields on partial struct states).
@@ -8222,7 +8979,7 @@ fn runPass2TypestateNllAndDrops(
         const c_idx = b_term.cond_or_val;
         const c_site = body.calls.items[c_idx];
         const ffi_call = lookupCallFfiContract(sym_table, c_site) orelse continue;
-        if (!ffi_call.contract.ret_owned_by_caller and !ffi_call.contract.ret_may_be_null) continue;
+        if (!ffi_call.contract.is_ret_owned_by_caller and !ffi_call.contract.is_ret_may_be_null) continue;
         if (b_term.edge_start >= body.extra_edges.items.len) continue;
         const normal_bb = body.extra_edges.items[b_term.edge_start].target_bb;
         const normal_params = body.getBlockParams(normal_bb);
@@ -8605,7 +9362,10 @@ fn runPass2TypestateNllAndDrops(
                         }
 
                         // [b] `@linear` Completeness Law (`E0304`):
+                        const is_reaped_nursery_handle = doesCleanupChainReachNurseryExit(body, bb_idx) and
+                            areAllLiveLinearLeavesTaskHandles(trie, pool, sym_table, &work_state, lid);
                         if (lid < trie.direct_local_limit and
+                            !is_reaped_nursery_handle and
                             hasLiveLinearObligation(trie, &work_state, lid) and
                             !has_reported_path_diag[lid])
                         {
@@ -9233,12 +9993,15 @@ fn runPass2TypestateNllAndDrops(
                                     (unwrapped_rhs == .fmt_args_ty or
                                         pool.getNode(unwrapped_rhs).tag == .closure_ty or
                                         pool.getNode(unwrapped_rhs).tag == .fn_ty);
+                                const is_raw_ptr_rhs = !unwrapped_rhs.isError() and
+                                    pool.getNode(unwrapped_rhs).tag == .raw_ptr_ty;
                                 const has_synth_same_depth_escape = body.local_scope_depths.items.len != local_count and
                                     rhs_prov.max_depth == horizon.local_decl_depth[pl_rec.base] and
                                     rhs_prov.max_depth >= DEPTH_LOCAL_REGION_BASE and
                                     !rhs_prov.origin_local.isNone() and
                                     pl_rec.base < rhs_prov.origin_local.asInt();
                                 const is_unloaned_local_escape = !has_leading_deref and pl_rec.base != 0 and
+                                    !is_raw_ptr_rhs and
                                     (rhs_prov.loan_mask.isEmpty() or is_closure_or_fmt_store) and
                                     (rhs_prov.max_depth > horizon.local_decl_depth[pl_rec.base] or
                                         has_synth_same_depth_escape);
@@ -9385,6 +10148,41 @@ fn runPass2TypestateNllAndDrops(
                         if (base < work_state.local_raw_ptr.len) {
                             work_state.local_raw_ptr[base] = .freed_or_dangling;
                         }
+                    } else if (ikind == .async_future_make) {
+                        if (isAsyncFutureMakeCapturingLinear(body, pool, sym_table, inst) and
+                            isUnusedSsaValue(body, val_idx))
+                        {
+                            outcome.emitted_error_count += 1;
+                            try emitSastDiag(
+                                eff_config.diagnostic_sink,
+                                .e0304_resource_or_memory_leak,
+                                .err,
+                                inst_span,
+                                "`Future` capturing `@linear` resource is dropped without `.await`",
+                                "unawaited `Future` leaks captured `@linear` resource here",
+                                null,
+                                null,
+                                "`.await` the `Future` directly so its `@linear` capture is consumed",
+                            );
+                        }
+                    } else if (ikind == .async_spawn) {
+                        if (inst.operands.rhs >= 3 and inst.operands.lhs + 2 < body.extra_args.items.len) {
+                            const task_fut_val = body.extra_args.items[inst.operands.lhs + 2];
+                            if (doesSpawnedFutureHoldPrePollLinearCapture(body, pool, sym_table, task_fut_val)) {
+                                outcome.emitted_error_count += 1;
+                                try emitSastDiag(
+                                    eff_config.diagnostic_sink,
+                                    .e0304_resource_or_memory_leak,
+                                    .err,
+                                    inst_span,
+                                    "cannot pass `@linear`-capturing `Future` into cancellable `TaskGroup.spawn`",
+                                    "pre-poll nursery cancellation would drop unpolled `@linear` capture here",
+                                    null,
+                                    null,
+                                    "`.await` the `@linear`-consuming `Future` directly instead of spawning onto `TaskGroup`",
+                                );
+                            }
+                        }
                     } else if (ikind == .atomic_store or
                         ikind == .atomic_rmw_add or
                         ikind == .atomic_rmw_sub or
@@ -9441,7 +10239,11 @@ fn runPass2TypestateNllAndDrops(
             }
             if (hasProvenanceCarrier(pool, sym_table, body.ret_ty)) {
                 summary.ret_provenance_mask |= @as(u64, ret_prov.param_mask);
-                if (ret_prov.max_depth >= DEPTH_FN_FRAME and !has_reported_path_diag[0]) {
+                const unwrapped_ret = pool.unwrapUnderlyingType(body.ret_ty);
+                const is_raw_ptr_ret = !unwrapped_ret.isError() and
+                    pool.getNode(unwrapped_ret).tag == .raw_ptr_ty;
+                const is_direct_user_raw_ret = is_raw_ptr_ret and ret_prov.raw_ptr_state == .valid_live;
+                if (!is_direct_user_raw_ret and ret_prov.max_depth >= DEPTH_FN_FRAME and !has_reported_path_diag[0]) {
                     has_reported_path_diag[0] = true;
                     outcome.emitted_error_count += 1;
                     const sec_origin: ?LabeledSpan = if (!ret_prov.origin_local.isNone() and
@@ -10077,12 +10879,12 @@ fn runPass2TypestateNllAndDrops(
                         const alloc_id: u16 = @intCast(1 + @min(term.cond_or_val, 0x7FFE));
                         const alloc_mask: u64 = @as(u64, 1) << @intCast(term.cond_or_val & 63);
                         work_state.ffi_slots[ret_slot] = .{
-                            .is_owned = ffi_call.contract.ret_owned_by_caller,
-                            .is_maybe_null = ffi_call.contract.ret_may_be_null,
+                            .is_owned = ffi_call.contract.is_ret_owned_by_caller,
+                            .is_maybe_null = ffi_call.contract.is_ret_may_be_null,
                             .is_consumed_freed = false,
                             .origin_alloc_id = alloc_id,
                             .origin_alloc_mask = alloc_mask,
-                            .expected_dealloc = if (ffi_call.contract.ret_owned_by_caller)
+                            .expected_dealloc = if (ffi_call.contract.is_ret_owned_by_caller)
                                 unwrapCanonicalSymbolIndex(sym_table, ffi_call.contract.ret_free_with_sym)
                             else
                                 .none,
@@ -12734,47 +13536,6 @@ fn closePentagonRowsOneHop(in_rows: []const PentagonSubRow, out_rows: []Pentagon
     }
 }
 
-/// Backing capacity classification for a pointer passed to an `@slice_len` / `@byte_len` FFI parameter.
-const FfiBackingBuffer = union(enum) {
-    /// Fixed byte capacity (`[T; N]` array, string/byte literal, or null `0` when `@may_be_null`).
-    static_bytes: i128,
-    /// Dynamic slice (`&[T]`, `&mut [T]`, or `str`) whose runtime capacity is tied to a slice length SSA/local.
-    dynamic_slice: struct {
-        /// Base `LocalId` index when loaded from a slice local (`NONE_U32` if pure SSA).
-        slice_base_local: u32,
-        /// Canonical slice SSA `MirValueId` (`NONE_U32` if none).
-        slice_ssa_val: u32,
-        /// Direct length SSA `MirValueId` when constructed via `subslice_make` (`lo == 0`) (`NONE_U32` otherwise).
-        direct_len_val: u32,
-        /// Byte size of one slice element (`>= 1`).
-        slice_elem_bytes: i128,
-    },
-    /// Arbitrary raw pointer whose backing capacity is statically unknown.
-    unknown_raw_ptr,
-};
-
-/// Pending relational Pentagon check for a dynamic-slice `@slice_len` / `@byte_len` FFI call argument.
-const PendingFfiSliceLenCheck = struct {
-    /// Basic block index of the `.call` terminator.
-    bb_idx: u32,
-    /// Origin token of the `.call` site.
-    origin_token: TokenIndex,
-    /// `true` if the call site lies inside an `unsafe` block or `unsafe fn` body.
-    is_unsafe_call: bool,
-    /// Length SSA `MirValueId` passed at `len_param_ordinal`.
-    len_val: u32,
-    /// Byte multiplier per unit of `len_val` (`sizeof(T)` for `@slice_len`, `1` for `@byte_len`).
-    unit_bytes: i128,
-    /// Slice base `LocalId` index (`NONE_U32` if pure SSA).
-    slice_base_local: u32,
-    /// Slice SSA `MirValueId` (`NONE_U32` if none).
-    slice_ssa_val: u32,
-    /// Direct subslice length SSA `MirValueId` (`NONE_U32` if none).
-    direct_len_val: u32,
-    /// Byte size of one element in the backing slice (`>= 1`).
-    slice_elem_bytes: i128,
-};
-
 /// Computes the element byte size (`>= 1`) of a pointer/reference type's pointee for `@slice_len`.
 fn computeFfiPointeeByteSize(
     body: *const MirBody,
@@ -14594,7 +15355,7 @@ fn runPass4IntervalsAndPentagonBce(
                                     slice_len_store_counts,
                                 );
                                 if (bk == .urem_checked and rhs_pid < sub_var_count) {
-                                    // Soundness guard (`[CRITICAL-01]`): `a % d < d` ONLY when `0 ∉ Intv(d)`:
+                                    // Soundness guard; `a % d < d` holds only when `0 ∉ Intv(d)`:
                                     if (val_domains[rhs_raw]) |r_dom| {
                                         if (!r_iv.isBottom() and decodeIntvToI128(r_iv, r_dom).lo >= 1) {
                                             cur_rows[dst_pid].insert(@intCast(rhs_pid));
@@ -15296,18 +16057,6 @@ fn computeOwnStackFrameBytes(
     return @intCast(@min(total_bytes, FnRegionSummary.STACK_UNBOUNDED - 1));
 }
 
-/// Resolved target of an `.await` (`coro_suspend`) expression for Tarjan SCC and `16 KiB` inline frame sizing.
-const AwaitedCalleeTarget = struct {
-    /// Direct `DefId` when statically known.
-    def_id: DefId = .NONE,
-    /// Direct `SymbolIndex` when statically known.
-    sym_idx: SymbolIndex = .none,
-    /// Fallback `Future[T]` `producer_id` from `InternPool` (`0` when erased).
-    raw_producer_id: u32 = 0,
-    /// `true` when awaiting an opaque indirect function pointer or dynamic `Future`.
-    is_indirect_opaque: bool = false,
-};
-
 /// Traces `root_fut_val` backward through SSA copies, locals, sync helpers, `async_join`, and `async_future_make` (`DR-08`).
 fn collectAwaitedCalleeTargets(
     alloc: std.mem.Allocator,
@@ -15703,17 +16452,6 @@ fn computeAsyncOwnFrameBytes(
             }
         }
     }
-
-    const ColoredSlot = struct {
-        mask: DenseBitSet,
-        byte_size: u64,
-        align_bytes: u64,
-    };
-    const CandidateLocal = struct {
-        mask: DenseBitSet,
-        byte_size: u64,
-        align_bytes: u64,
-    };
 
     var candidates: std.ArrayListUnmanaged(CandidateLocal) = .empty;
 
@@ -16529,6 +17267,12 @@ fn verifyCrossThreadSpawnsInBody(
             }
         }
 
+        var visited_slots = try DenseBitSet.initEmpty(allocator, bodies.len);
+        defer switch (visited_slots) {
+            .inline_words => {},
+            .arena_words => |words| allocator.free(words),
+        };
+
         var has_tls_violation = false;
         var has_opaque_violation = false;
         spawn_targets.clearRetainingCapacity();
@@ -16545,7 +17289,9 @@ fn verifyCrossThreadSpawnsInBody(
             &spawn_targets,
         );
 
-        for (spawn_targets.items) |swt| {
+        var target_idx: usize = 0;
+        while (target_idx < spawn_targets.items.len) : (target_idx += 1) {
+            const swt = spawn_targets.items[target_idx];
             if (swt.is_indirect_opaque) {
                 has_opaque_violation = true;
                 continue;
@@ -16556,10 +17302,13 @@ fn verifyCrossThreadSpawnsInBody(
                 target_slot_opt = sym_to_slot.get(swt.sym_idx.asInt());
             }
             if (target_slot_opt == null and swt.raw_producer_id != 0) {
-                target_slot_opt = key_to_slot.get(swt.raw_producer_id) orelse sym_to_slot.get(swt.raw_producer_id);
+                target_slot_opt = resolveProducerSlot(swt.raw_producer_id, key_to_slot, sym_to_slot);
             }
 
             if (target_slot_opt) |t_slot| {
+                if (visited_slots.isSet(t_slot)) continue;
+                visited_slots.set(t_slot);
+
                 const t_sum = summaries[t_slot];
                 if ((t_sum.inferred_effects_bits & FnRegionSummary.INFERRED_THREAD_LOCAL_BIT) != 0) {
                     has_tls_violation = true;
@@ -16567,8 +17316,8 @@ fn verifyCrossThreadSpawnsInBody(
                 if ((t_sum.inferred_effects_bits & FnRegionSummary.INFERRED_ASYNC_NON_SEND_BIT) != 0 and non_send_reason == null) {
                     non_send_reason = "spawned `Future` holds `!Send` / `!Sync` state across worker threads";
                 }
+                const t_body = &bodies[t_slot];
                 if (non_send_reason == null) {
-                    const t_body = &bodies[t_slot];
                     const t_param_end = @min(@as(usize, 1 + t_body.param_count), t_body.locals.items.len);
                     for (0..t_param_end) |loc_i| {
                         const loc_ty = t_body.locals.items[loc_i].type_id;
@@ -16578,14 +17327,39 @@ fn verifyCrossThreadSpawnsInBody(
                         }
                     }
                 }
+                for (t_body.blocks.items) |sub_bb| {
+                    if (sub_bb.terminator.kind != .coro_suspend) continue;
+                    try collectAwaitedCalleeTargets(
+                        allocator,
+                        t_body,
+                        bodies,
+                        key_to_slot,
+                        sym_to_slot,
+                        pool,
+                        sym_table,
+                        sub_bb.terminator.cond_or_val,
+                        0,
+                        &spawn_targets,
+                    );
+                }
             } else {
+                var ext_sym_idx = swt.sym_idx;
+                if (ext_sym_idx.isNone() and !swt.def_id.isNone()) {
+                    ext_sym_idx = sym_table.def_to_symbol.get(swt.def_id.asInt()) orelse .none;
+                }
+                if (ext_sym_idx.isNone() and swt.raw_producer_id != 0 and swt.raw_producer_id < sym_table.symbols.items.len) {
+                    ext_sym_idx = SymbolIndex.fromInt(swt.raw_producer_id);
+                }
+                const canon_ext = unwrapCanonicalSymbolIndex(sym_table, ext_sym_idx);
                 const ext_def = if (!swt.def_id.isNone())
                     swt.def_id
+                else if (!canon_ext.isNone() and canon_ext.asInt() < sym_table.symbols.items.len)
+                    sym_table.getSymbol(canon_ext).def_id
                 else if (swt.raw_producer_id != 0)
                     DefId.fromInt(swt.raw_producer_id)
                 else
                     DefId.NONE;
-                if (try lookupCalleeSummary(ext_def, swt.sym_idx, summaries, key_to_slot, sym_to_slot, config)) |ext_sum| {
+                if (try lookupCalleeSummary(ext_def, canon_ext, summaries, key_to_slot, sym_to_slot, config)) |ext_sum| {
                     if ((ext_sum.inferred_effects_bits & FnRegionSummary.INFERRED_THREAD_LOCAL_BIT) != 0) {
                         has_tls_violation = true;
                     }
@@ -16593,14 +17367,6 @@ fn verifyCrossThreadSpawnsInBody(
                         non_send_reason = "spawned `Future` holds `!Send` / `!Sync` state across worker threads";
                     }
                 }
-                var ext_sym_idx = swt.sym_idx;
-                if (ext_sym_idx.isNone() and !ext_def.isNone()) {
-                    ext_sym_idx = sym_table.def_to_symbol.get(ext_def.asInt()) orelse .none;
-                }
-                if (ext_sym_idx.isNone() and swt.raw_producer_id != 0 and swt.raw_producer_id < sym_table.symbols.items.len) {
-                    ext_sym_idx = SymbolIndex.fromInt(swt.raw_producer_id);
-                }
-                const canon_ext = unwrapCanonicalSymbolIndex(sym_table, ext_sym_idx);
                 if (!canon_ext.isNone() and canon_ext.asInt() < sym_table.symbols.items.len) {
                     const ext_sym = sym_table.getSymbol(canon_ext).*;
                     if (non_send_reason == null) {
@@ -16659,6 +17425,664 @@ fn verifyCrossThreadSpawnsInBody(
                 null,
                 null,
                 "pass a concrete `Send` `Future` / closure or spawn locally via `group.spawn_local(…)`",
+            );
+        }
+    }
+}
+
+/// Returns `true` if `temp_base` is a synthetic temp initialized exclusively from `.fn_addr` of a `@thread_local` static.
+fn isDirectTlsStaticTempSlot(
+    body: *const MirBody,
+    sym_table: *const SymbolTable,
+    temp_base: u32,
+) bool {
+    if (temp_base >= body.locals.items.len or !body.locals.items[temp_base].flags().is_synthetic_temp) {
+        return false;
+    }
+    var has_found_tls_addr = false;
+    for (body.blocks.items, 0..) |_, b_i| {
+        for (body.getBlockInsts(MirBlockId.fromInt(@intCast(b_i)))) |inst_vid| {
+            const inst = body.getInst(inst_vid);
+            if (inst.op != .place_store or inst.operands.lhs >= body.places.items.len) continue;
+            const pl_rec = body.places.items[inst.operands.lhs];
+            if (pl_rec.base != temp_base) continue;
+            if (pl_rec.proj_len != 0 or inst.operands.rhs >= body.insts.len) return false;
+            const rhs_inst = body.getInst(MirValueId.fromInt(peelCopyValId(body, inst.operands.rhs)));
+            if (!isThreadLocalAddrInst(sym_table, rhs_inst)) return false;
+            has_found_tls_addr = true;
+        }
+    }
+    return has_found_tls_addr;
+}
+
+/// Returns `true` if `place_id` contains at least one `ProjKind.deref` step.
+fn hasAnyDerefProjection(body: *const MirBody, place_id: PlaceId) bool {
+    for (body.getPlaceProjections(place_id)) |proj| {
+        if (proj.kind == .deref) return true;
+    }
+    return false;
+}
+
+/// Sets `bits[val_raw]` when `val_raw < val_count`.
+inline fn markSsaValueReadInBitSet(bits: *DenseBitSet, val_raw: u32, val_count: usize) void {
+    if (val_raw < val_count) bits.set(val_raw);
+}
+
+/// Rejects holding a borrow (`&T` / `&mut T`) or raw pointer derived from a `@thread_local` static across `.await` (`E0309`).
+fn verifyNoThreadLocalBorrowsAcrossAwait(
+    allocator: std.mem.Allocator,
+    body: *const MirBody,
+    summaries: []const FnRegionSummary,
+    key_to_slot: *const std.AutoHashMapUnmanaged(u32, u32),
+    sym_to_slot: *const std.AutoHashMapUnmanaged(u32, u32),
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    config: SastConfig,
+    decl_span: Span,
+) !void {
+    var has_suspend = false;
+    for (body.blocks.items) |bb| {
+        if (bb.terminator.kind == .coro_suspend and bb.terminator.edge_len >= 2) {
+            has_suspend = true;
+            break;
+        }
+    }
+    if (!has_suspend) return;
+
+    var has_tls_source = false;
+    for (0..body.insts.len) |inst_i| {
+        if (isThreadLocalAddrInst(sym_table, body.getInst(MirValueId.fromInt(@intCast(inst_i))))) {
+            has_tls_source = true;
+            break;
+        }
+    }
+    if (!has_tls_source) {
+        for (body.calls.items) |cs| {
+            if (try lookupCalleeSummary(cs.direct_def_id, cs.direct_symbol, summaries, key_to_slot, sym_to_slot, config)) |c_sum| {
+                if ((c_sum.inferred_effects_bits & FnRegionSummary.INFERRED_THREAD_LOCAL_BIT) != 0) {
+                    has_tls_source = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (!has_tls_source) return;
+
+    var local_arena = std.heap.ArenaAllocator.init(allocator);
+    defer local_arena.deinit();
+    const arena_alloc = local_arena.allocator();
+
+    const local_count = body.locals.items.len;
+    const val_count = body.insts.len;
+    const block_count = body.blocks.items.len;
+
+    var is_direct_tls_temp = try DenseBitSet.initEmpty(arena_alloc, local_count);
+    for (0..local_count) |loc_i| {
+        if (isDirectTlsStaticTempSlot(body, sym_table, @intCast(loc_i))) {
+            is_direct_tls_temp.set(loc_i);
+        }
+    }
+
+    var is_val_tls = try DenseBitSet.initEmpty(arena_alloc, val_count);
+    var is_local_tls = try DenseBitSet.initEmpty(arena_alloc, local_count);
+    var val_tls_tok = try arena_alloc.alloc(TokenIndex, val_count);
+    @memset(val_tls_tok, TokenIndex.none);
+    var local_tls_tok = try arena_alloc.alloc(TokenIndex, local_count);
+    @memset(local_tls_tok, TokenIndex.none);
+
+    // [1] Propagate `@thread_local` address/reference provenance across SSA values, locals, and calls:
+    var has_taint_changed = true;
+    var taint_iters: usize = 0;
+    while (has_taint_changed and taint_iters < 16) : (taint_iters += 1) {
+        has_taint_changed = false;
+        for (0..val_count) |val_i| {
+            if (is_val_tls.isSet(val_i)) continue;
+            const inst = body.getInst(MirValueId.fromInt(@intCast(val_i)));
+            const inst_tok = if (val_i < body.origin_tokens.items.len) body.origin_tokens.items[val_i] else TokenIndex.none;
+            var src_tok: ?TokenIndex = null;
+
+            switch (inst.op) {
+                .fn_addr => {
+                    if (isThreadLocalAddrInst(sym_table, inst)) src_tok = inst_tok;
+                },
+                .copy_val, .unary_op, .aggregate_extract => {
+                    if (inst.operands.lhs < val_count and is_val_tls.isSet(inst.operands.lhs) and
+                        hasProvenanceCarrier(pool, sym_table, inst.type_id))
+                    {
+                        src_tok = if (!val_tls_tok[inst.operands.lhs].isNone()) val_tls_tok[inst.operands.lhs] else inst_tok;
+                    }
+                },
+                .bin_op => {
+                    if (hasProvenanceCarrier(pool, sym_table, inst.type_id)) {
+                        if (inst.operands.lhs < val_count and is_val_tls.isSet(inst.operands.lhs)) {
+                            src_tok = if (!val_tls_tok[inst.operands.lhs].isNone()) val_tls_tok[inst.operands.lhs] else inst_tok;
+                        } else if (inst.operands.rhs < val_count and is_val_tls.isSet(inst.operands.rhs)) {
+                            src_tok = if (!val_tls_tok[inst.operands.rhs].isNone()) val_tls_tok[inst.operands.rhs] else inst_tok;
+                        }
+                    }
+                },
+                .place_addr, .soa_column_slice => {
+                    if (inst.operands.lhs < body.places.items.len) {
+                        const base_loc = body.places.items[inst.operands.lhs].base;
+                        if (base_loc < local_count and is_local_tls.isSet(base_loc)) {
+                            src_tok = if (!inst_tok.isNone()) inst_tok else local_tls_tok[base_loc];
+                        }
+                    }
+                },
+                .place_load => {
+                    if (inst.operands.lhs < body.places.items.len and
+                        hasProvenanceCarrier(pool, sym_table, inst.type_id))
+                    {
+                        const base_loc = body.places.items[inst.operands.lhs].base;
+                        if (base_loc < local_count and is_local_tls.isSet(base_loc) and
+                            !(is_direct_tls_temp.isSet(base_loc) and
+                                hasAnyDerefProjection(body, PlaceId.fromInt(inst.operands.lhs))))
+                        {
+                            src_tok = if (!local_tls_tok[base_loc].isNone()) local_tls_tok[base_loc] else inst_tok;
+                        }
+                    }
+                },
+                .aggregate_insert => {
+                    if (hasProvenanceCarrier(pool, sym_table, inst.type_id)) {
+                        if (inst.operands.lhs < val_count and is_val_tls.isSet(inst.operands.lhs)) {
+                            src_tok = val_tls_tok[inst.operands.lhs];
+                        } else if (inst.operands.rhs < val_count and is_val_tls.isSet(inst.operands.rhs)) {
+                            src_tok = val_tls_tok[inst.operands.rhs];
+                        }
+                    }
+                },
+                .aggregate_make => {
+                    const agg_k: AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+                    if (agg_k == .closure_make) {
+                        if (inst.operands.rhs < body.extra_args.items.len) {
+                            const cap_len = body.extra_args.items[inst.operands.rhs];
+                            const cap_start = @min(body.extra_args.items.len, @as(usize, inst.operands.rhs) + 1);
+                            const cap_end = @min(body.extra_args.items.len, cap_start + @as(usize, cap_len));
+                            for (body.extra_args.items[cap_start..cap_end]) |cap_v| {
+                                if (cap_v < val_count and is_val_tls.isSet(cap_v) and
+                                    hasProvenanceCarrier(pool, sym_table, body.getInst(MirValueId.fromInt(cap_v)).type_id))
+                                {
+                                    src_tok = if (!val_tls_tok[cap_v].isNone()) val_tls_tok[cap_v] else inst_tok;
+                                    break;
+                                }
+                            }
+                        }
+                    } else if (hasProvenanceCarrier(pool, sym_table, inst.type_id)) {
+                        const elem_start = @min(body.extra_args.items.len, @as(usize, inst.operands.lhs));
+                        const elem_end = @min(body.extra_args.items.len, elem_start + @as(usize, inst.operands.rhs));
+                        for (body.extra_args.items[elem_start..elem_end]) |elem_v| {
+                            if (elem_v < val_count and is_val_tls.isSet(elem_v) and
+                                hasProvenanceCarrier(pool, sym_table, body.getInst(MirValueId.fromInt(elem_v)).type_id))
+                            {
+                                src_tok = if (!val_tls_tok[elem_v].isNone()) val_tls_tok[elem_v] else inst_tok;
+                                break;
+                            }
+                        }
+                    }
+                },
+                .intrinsic_op => {
+                    const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+                    if (ikind == .async_future_make) {
+                        if (inst.operands.rhs >= 3 and inst.operands.lhs + 2 < body.extra_args.items.len) {
+                            const callee_v = body.extra_args.items[inst.operands.lhs + 2];
+                            if (callee_v < val_count and is_val_tls.isSet(callee_v)) {
+                                src_tok = if (!val_tls_tok[callee_v].isNone()) val_tls_tok[callee_v] else inst_tok;
+                            } else {
+                                const arg_lo = @min(body.extra_args.items.len, @as(usize, inst.operands.lhs) + 3);
+                                const arg_hi = @min(
+                                    body.extra_args.items.len,
+                                    @as(usize, inst.operands.lhs) + @as(usize, inst.operands.rhs),
+                                );
+                                for (body.extra_args.items[arg_lo..arg_hi]) |arg_v| {
+                                    if (arg_v < val_count and is_val_tls.isSet(arg_v) and
+                                        hasProvenanceCarrier(pool, sym_table, body.getInst(MirValueId.fromInt(arg_v)).type_id))
+                                    {
+                                        src_tok = if (!val_tls_tok[arg_v].isNone()) val_tls_tok[arg_v] else inst_tok;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    } else if (ikind.hasPlaceInLhs()) {
+                        if (inst.operands.lhs < body.places.items.len and
+                            hasProvenanceCarrier(pool, sym_table, inst.type_id))
+                        {
+                            const base_loc = body.places.items[inst.operands.lhs].base;
+                            if (base_loc < local_count and is_local_tls.isSet(base_loc)) {
+                                src_tok = if (!local_tls_tok[base_loc].isNone()) local_tls_tok[base_loc] else inst_tok;
+                            }
+                        }
+                    } else if (ikind != .async_spawn and ikind != .async_join and
+                        ikind.hasExtraArgs() and hasProvenanceCarrier(pool, sym_table, inst.type_id))
+                    {
+                        const arg_lo = @min(body.extra_args.items.len, @as(usize, inst.operands.lhs));
+                        const arg_hi = @min(body.extra_args.items.len, arg_lo + @as(usize, inst.operands.rhs));
+                        for (body.extra_args.items[arg_lo..arg_hi]) |arg_v| {
+                            if (arg_v < val_count and is_val_tls.isSet(arg_v) and
+                                hasProvenanceCarrier(pool, sym_table, body.getInst(MirValueId.fromInt(arg_v)).type_id))
+                            {
+                                src_tok = if (!val_tls_tok[arg_v].isNone()) val_tls_tok[arg_v] else inst_tok;
+                                break;
+                            }
+                        }
+                    }
+                },
+                .block_param => {
+                    if (hasProvenanceCarrier(pool, sym_table, inst.type_id) and inst.operands.lhs < block_count) {
+                        const owner_bb = MirBlockId.fromInt(inst.operands.lhs);
+                        const param_ord = inst.operands.rhs;
+                        for (body.getPredEdges(owner_bb)) |pred_eid| {
+                            const edge = body.extra_edges.items[pred_eid.asInt()];
+                            if (edge.src_bb.asInt() >= block_count) continue;
+                            const src_term = body.blocks.items[edge.src_bb.asInt()].terminator;
+                            if (src_term.kind != .call and src_term.kind != .coro_suspend and param_ord < edge.args_len) {
+                                const passed_v = body.extra_args.items[edge.args_start + param_ord];
+                                if (passed_v < val_count and is_val_tls.isSet(passed_v)) {
+                                    src_tok = if (!val_tls_tok[passed_v].isNone()) val_tls_tok[passed_v] else inst_tok;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+
+            if (src_tok) |found_tok| {
+                is_val_tls.set(val_i);
+                val_tls_tok[val_i] = found_tok;
+                has_taint_changed = true;
+            }
+        }
+
+        for (0..val_count) |val_i| {
+            const inst = body.getInst(MirValueId.fromInt(@intCast(val_i)));
+            if (inst.op != .place_store or inst.operands.lhs >= body.places.items.len or inst.operands.rhs >= val_count) {
+                continue;
+            }
+            if (!is_val_tls.isSet(inst.operands.rhs)) continue;
+            if (hasAnyDerefProjection(body, PlaceId.fromInt(inst.operands.lhs))) continue;
+            const base_loc = body.places.items[inst.operands.lhs].base;
+            if (base_loc < local_count and !is_local_tls.isSet(base_loc) and
+                hasProvenanceCarrier(pool, sym_table, body.locals.items[base_loc].type_id))
+            {
+                is_local_tls.set(base_loc);
+                local_tls_tok[base_loc] = val_tls_tok[inst.operands.rhs];
+                has_taint_changed = true;
+            }
+        }
+
+        for (body.blocks.items) |bb| {
+            if (bb.terminator.kind != .call or bb.terminator.cond_or_val >= body.calls.items.len or bb.terminator.edge_len == 0) {
+                continue;
+            }
+            const cs = body.calls.items[bb.terminator.cond_or_val];
+            var arg_tls_mask: u64 = 0;
+            var first_arg_tok: TokenIndex = cs.origin_token;
+            const arg_lim = @min(@as(usize, cs.args_len), 64);
+            for (0..arg_lim) |arg_i| {
+                const mode = body.call_arg_modes.items[cs.modes_start + arg_i];
+                const word = body.extra_args.items[cs.args_start + arg_i];
+                if (mode == .let_mode or mode == .sink_mode) {
+                    if (word < val_count and is_val_tls.isSet(word) and
+                        hasProvenanceCarrier(pool, sym_table, body.getInst(MirValueId.fromInt(word)).type_id))
+                    {
+                        arg_tls_mask |= (@as(u64, 1) << @intCast(arg_i));
+                        if (!val_tls_tok[word].isNone()) first_arg_tok = val_tls_tok[word];
+                    }
+                } else if (word < body.places.items.len) {
+                    const base_loc = body.places.items[word].base;
+                    if (base_loc < local_count and is_local_tls.isSet(base_loc) and
+                        hasProvenanceCarrier(pool, sym_table, body.locals.items[base_loc].type_id))
+                    {
+                        arg_tls_mask |= (@as(u64, 1) << @intCast(arg_i));
+                        if (!local_tls_tok[base_loc].isNone()) first_arg_tok = local_tls_tok[base_loc];
+                    }
+                }
+            }
+
+            const callee_sum_opt = try lookupCalleeSummary(
+                cs.direct_def_id,
+                cs.direct_symbol,
+                summaries,
+                key_to_slot,
+                sym_to_slot,
+                config,
+            );
+            const normal_bb = body.extra_edges.items[bb.terminator.edge_start].target_bb;
+            const normal_params = body.getBlockParams(normal_bb);
+            if (normal_params.len >= 1) {
+                const ret_raw = normal_params[0].asInt();
+                if (ret_raw < val_count and !is_val_tls.isSet(ret_raw) and
+                    hasProvenanceCarrier(pool, sym_table, cs.ret_ty))
+                {
+                    const is_ret_tainted = if (callee_sum_opt) |c_sum|
+                        ((c_sum.ret_provenance_mask & arg_tls_mask) != 0 or
+                            ((c_sum.inferred_effects_bits & FnRegionSummary.INFERRED_THREAD_LOCAL_BIT) != 0 and
+                                c_sum.ret_provenance_mask == 0))
+                    else
+                        (arg_tls_mask != 0);
+                    if (is_ret_tainted) {
+                        is_val_tls.set(ret_raw);
+                        val_tls_tok[ret_raw] = first_arg_tok;
+                        has_taint_changed = true;
+                    }
+                }
+            }
+
+            if (callee_sum_opt) |c_sum| {
+                const flow_lim = @min(@as(usize, cs.args_len), 8);
+                for (0..flow_lim) |dst_i| {
+                    const dst_mode = body.call_arg_modes.items[cs.modes_start + dst_i];
+                    if (dst_mode != .inout_mode and dst_mode != .set_mode) continue;
+                    const dst_word = body.extra_args.items[cs.args_start + dst_i];
+                    if (dst_word >= body.places.items.len) continue;
+                    if (hasAnyDerefProjection(body, PlaceId.fromInt(dst_word))) continue;
+                    const dst_base = body.places.items[dst_word].base;
+                    if (dst_base >= local_count or is_local_tls.isSet(dst_base) or
+                        !hasProvenanceCarrier(pool, sym_table, body.locals.items[dst_base].type_id))
+                    {
+                        continue;
+                    }
+                    var should_taint_dst = (dst_mode == .set_mode) and
+                        ((c_sum.inferred_effects_bits & FnRegionSummary.INFERRED_THREAD_LOCAL_BIT) != 0);
+                    if (!should_taint_dst and c_sum.param_flow_matrix != 0) {
+                        for (0..flow_lim) |src_i| {
+                            if (src_i != dst_i and ((arg_tls_mask >> @intCast(src_i)) & 1) != 0 and
+                                ((c_sum.param_flow_matrix >> @intCast(src_i * 8 + dst_i)) & 1) != 0)
+                            {
+                                should_taint_dst = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (should_taint_dst) {
+                        is_local_tls.set(dst_base);
+                        local_tls_tok[dst_base] = first_arg_tok;
+                        has_taint_changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    var has_any_taint = false;
+    for (0..val_count) |val_i| {
+        if (is_val_tls.isSet(val_i)) {
+            has_any_taint = true;
+            break;
+        }
+    }
+    if (!has_any_taint) return;
+
+    // [2] Compute local def-reachability, local backward liveness, and SSA backward liveness:
+    var def_out = try arena_alloc.alloc(DenseBitSet, block_count);
+    var live_in = try arena_alloc.alloc(DenseBitSet, block_count);
+    var ssa_live_in = try arena_alloc.alloc(DenseBitSet, block_count);
+    for (0..block_count) |b_i| {
+        def_out[b_i] = try DenseBitSet.initEmpty(arena_alloc, local_count);
+        live_in[b_i] = try DenseBitSet.initEmpty(arena_alloc, local_count);
+        ssa_live_in[b_i] = try DenseBitSet.initEmpty(arena_alloc, val_count);
+    }
+    var local_scratch = try DenseBitSet.initEmpty(arena_alloc, local_count);
+    var ssa_scratch = try DenseBitSet.initEmpty(arena_alloc, val_count);
+
+    const param_end = @min(@as(usize, 1 + body.param_count), local_count);
+    var has_def_changed = true;
+    var def_iters: usize = 0;
+    while (has_def_changed and def_iters < block_count * 4 + 16) : (def_iters += 1) {
+        has_def_changed = false;
+        for (0..block_count) |bb_i| {
+            local_scratch.clearAll();
+            if (bb_i == 0) {
+                for (1..param_end) |param_loc| local_scratch.set(param_loc);
+            }
+            for (body.getPredEdges(MirBlockId.fromInt(@intCast(bb_i)))) |pred_eid| {
+                const src_b = body.extra_edges.items[pred_eid.asInt()].src_bb.asInt();
+                if (src_b < block_count) local_scratch.unionInPlace(def_out[src_b]);
+            }
+            for (body.getBlockInsts(MirBlockId.fromInt(@intCast(bb_i)))) |iv| {
+                const inst = body.getInst(iv);
+                if (inst.op == .place_store and inst.operands.lhs < body.places.items.len) {
+                    const base_loc = body.places.items[inst.operands.lhs].base;
+                    if (base_loc < local_count) local_scratch.set(base_loc);
+                } else if (inst.op == .ghost_storage_deinit and inst.operands.lhs < local_count) {
+                    local_scratch.unset(inst.operands.lhs);
+                }
+            }
+            const term = body.blocks.items[bb_i].terminator;
+            if (term.kind == .call and term.cond_or_val < body.calls.items.len) {
+                const cs = body.calls.items[term.cond_or_val];
+                for (0..cs.args_len) |arg_i| {
+                    const mode = body.call_arg_modes.items[cs.modes_start + arg_i];
+                    if (mode == .inout_mode or mode == .set_mode) {
+                        const word = body.extra_args.items[cs.args_start + arg_i];
+                        if (word < body.places.items.len) {
+                            const base_loc = body.places.items[word].base;
+                            if (base_loc < local_count) local_scratch.set(base_loc);
+                        }
+                    }
+                }
+            }
+            if (!local_scratch.eql(def_out[bb_i])) {
+                def_out[bb_i].copyFrom(local_scratch);
+                has_def_changed = true;
+            }
+        }
+    }
+
+    var has_live_changed = true;
+    var live_iters: usize = 0;
+    while (has_live_changed and live_iters < block_count * 4 + 16) : (live_iters += 1) {
+        has_live_changed = false;
+        var rev_b = block_count;
+        while (rev_b > 0) {
+            rev_b -= 1;
+            local_scratch.clearAll();
+            ssa_scratch.clearAll();
+            const blk = body.blocks.items[rev_b];
+
+            for (body.getOutgoingEdges(MirBlockId.fromInt(@intCast(rev_b)))) |edge| {
+                const dst_b = edge.target_bb.asInt();
+                if (dst_b < block_count) {
+                    local_scratch.unionInPlace(live_in[dst_b]);
+                    ssa_scratch.unionInPlace(ssa_live_in[dst_b]);
+                }
+                if (blk.terminator.kind != .call and blk.terminator.kind != .coro_suspend) {
+                    for (0..edge.args_len) |arg_k| {
+                        markSsaValueReadInBitSet(&ssa_scratch, body.extra_args.items[edge.args_start + arg_k], val_count);
+                    }
+                }
+            }
+
+            for (body.getBlockParams(MirBlockId.fromInt(@intCast(rev_b)))) |bp_vid| {
+                if (bp_vid.asInt() < val_count) ssa_scratch.unset(bp_vid.asInt());
+            }
+
+            switch (blk.terminator.kind) {
+                .ret, .cond_br, .switch_int, .coro_suspend => {
+                    markSsaValueReadInBitSet(&ssa_scratch, blk.terminator.cond_or_val, val_count);
+                },
+                .call => {
+                    if (blk.terminator.cond_or_val < body.calls.items.len) {
+                        const cs = body.calls.items[blk.terminator.cond_or_val];
+                        markSsaValueReadInBitSet(&ssa_scratch, cs.callee_val.asInt(), val_count);
+                        for (0..cs.args_len) |arg_i| {
+                            const mode = body.call_arg_modes.items[cs.modes_start + arg_i];
+                            const word = body.extra_args.items[cs.args_start + arg_i];
+                            if (mode == .let_mode or mode == .sink_mode) {
+                                markSsaValueReadInBitSet(&ssa_scratch, word, val_count);
+                            } else if (word < body.places.items.len) {
+                                const pl_rec = body.places.items[word];
+                                if (pl_rec.base < local_count and (mode == .inout_mode or pl_rec.proj_len > 0)) {
+                                    local_scratch.set(pl_rec.base);
+                                }
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+
+            const insts_slice = body.getBlockInsts(MirBlockId.fromInt(@intCast(rev_b)));
+            var rev_i = insts_slice.len;
+            while (rev_i > 0) {
+                rev_i -= 1;
+                const iv = insts_slice[rev_i];
+                if (iv.asInt() < val_count) ssa_scratch.unset(iv.asInt());
+                const inst = body.getInst(iv);
+                switch (inst.op) {
+                    .ghost_storage_deinit => {
+                        if (inst.operands.lhs < local_count) local_scratch.unset(inst.operands.lhs);
+                    },
+                    .place_store => {
+                        markSsaValueReadInBitSet(&ssa_scratch, inst.operands.rhs, val_count);
+                        if (inst.operands.lhs < body.places.items.len) {
+                            const pl_rec = body.places.items[inst.operands.lhs];
+                            if (pl_rec.base < local_count) {
+                                if (pl_rec.proj_len == 0) {
+                                    local_scratch.unset(pl_rec.base);
+                                } else {
+                                    local_scratch.set(pl_rec.base);
+                                }
+                            }
+                        }
+                    },
+                    .place_load, .place_addr, .place_discriminant, .soa_column_slice => {
+                        if (inst.operands.lhs < body.places.items.len) {
+                            const base_loc = body.places.items[inst.operands.lhs].base;
+                            if (base_loc < local_count and !is_direct_tls_temp.isSet(base_loc)) {
+                                local_scratch.set(base_loc);
+                            } else if (base_loc < local_count and inst.op == .place_addr) {
+                                local_scratch.set(base_loc);
+                            }
+                        }
+                        if (inst.op == .soa_column_slice) {
+                            markSsaValueReadInBitSet(&ssa_scratch, inst.operands.rhs, val_count);
+                        }
+                    },
+                    .copy_val, .unary_op, .aggregate_extract => {
+                        markSsaValueReadInBitSet(&ssa_scratch, inst.operands.lhs, val_count);
+                    },
+                    .bin_op, .aggregate_insert => {
+                        markSsaValueReadInBitSet(&ssa_scratch, inst.operands.lhs, val_count);
+                        markSsaValueReadInBitSet(&ssa_scratch, inst.operands.rhs, val_count);
+                    },
+                    .aggregate_make => {
+                        const agg_k: AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+                        if (agg_k == .closure_make) {
+                            if (inst.operands.rhs < body.extra_args.items.len) {
+                                const cap_len = body.extra_args.items[inst.operands.rhs];
+                                const cap_start = @min(body.extra_args.items.len, @as(usize, inst.operands.rhs) + 1);
+                                const cap_end = @min(body.extra_args.items.len, cap_start + @as(usize, cap_len));
+                                for (body.extra_args.items[cap_start..cap_end]) |cap_v| {
+                                    markSsaValueReadInBitSet(&ssa_scratch, cap_v, val_count);
+                                }
+                            }
+                        } else {
+                            const elem_start = @min(body.extra_args.items.len, @as(usize, inst.operands.lhs));
+                            const elem_end = @min(body.extra_args.items.len, elem_start + @as(usize, inst.operands.rhs));
+                            for (body.extra_args.items[elem_start..elem_end]) |elem_v| {
+                                markSsaValueReadInBitSet(&ssa_scratch, elem_v, val_count);
+                            }
+                        }
+                    },
+                    .intrinsic_op => {
+                        const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+                        if (ikind.hasPlaceInLhs()) {
+                            if ((ikind == .drop_in_place or ikind == .drop_if_live) and
+                                inst.operands.lhs < body.places.items.len)
+                            {
+                                const base_loc = body.places.items[inst.operands.lhs].base;
+                                if (base_loc < local_count) local_scratch.set(base_loc);
+                            }
+                            if (ikind.hasSsaFlagInRhs()) {
+                                markSsaValueReadInBitSet(&ssa_scratch, inst.operands.rhs, val_count);
+                            }
+                        } else if (ikind.hasExtraArgs()) {
+                            const arg_lo = @min(body.extra_args.items.len, @as(usize, inst.operands.lhs));
+                            const arg_hi = @min(body.extra_args.items.len, arg_lo + @as(usize, inst.operands.rhs));
+                            for (body.extra_args.items[arg_lo..arg_hi]) |arg_v| {
+                                markSsaValueReadInBitSet(&ssa_scratch, arg_v, val_count);
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+
+            if (!local_scratch.eql(live_in[rev_b])) {
+                live_in[rev_b].copyFrom(local_scratch);
+                has_live_changed = true;
+            }
+            if (!ssa_scratch.eql(ssa_live_in[rev_b])) {
+                ssa_live_in[rev_b].copyFrom(ssa_scratch);
+                has_live_changed = true;
+            }
+        }
+    }
+
+    // [3] Emit `E0309` when any `@thread_local`-derived reference/pointer is live across `.coro_suspend`:
+    for (body.blocks.items, 0..) |bb, s_bb| {
+        if (bb.terminator.kind != .coro_suspend or bb.terminator.edge_len < 2) continue;
+        const resume_bb = body.extra_edges.items[bb.terminator.edge_start].target_bb.asInt();
+        const cancel_bb = body.extra_edges.items[bb.terminator.edge_start + 1].target_bb.asInt();
+        const susp_tok = if (bb.terminator.cond_or_val < body.origin_tokens.items.len)
+            body.origin_tokens.items[bb.terminator.cond_or_val]
+        else
+            TokenIndex.none;
+        const susp_span = resolveTokenSpan(body.file_id, susp_tok, config, decl_span);
+        if (hasExistingDiagAtSpan(config.diagnostic_sink, .e0309_concurrent_exclusivity_or_escape, susp_span)) {
+            continue;
+        }
+
+        var origin_tok_opt: ?TokenIndex = null;
+        if (bb.terminator.cond_or_val < val_count and is_val_tls.isSet(bb.terminator.cond_or_val)) {
+            origin_tok_opt = val_tls_tok[bb.terminator.cond_or_val];
+        }
+        if (origin_tok_opt == null) {
+            for (1..local_count) |loc_i| {
+                if (!is_local_tls.isSet(loc_i) or !def_out[s_bb].isSet(loc_i)) continue;
+                if (!hasProvenanceCarrier(pool, sym_table, body.locals.items[loc_i].type_id)) continue;
+                if ((resume_bb < block_count and live_in[resume_bb].isSet(loc_i)) or
+                    (cancel_bb < block_count and live_in[cancel_bb].isSet(loc_i)))
+                {
+                    origin_tok_opt = local_tls_tok[loc_i];
+                    break;
+                }
+            }
+        }
+        if (origin_tok_opt == null) {
+            for (0..val_count) |val_i| {
+                if (!is_val_tls.isSet(val_i)) continue;
+                if (!hasProvenanceCarrier(pool, sym_table, body.getInst(MirValueId.fromInt(@intCast(val_i))).type_id)) {
+                    continue;
+                }
+                if ((resume_bb < block_count and ssa_live_in[resume_bb].isSet(val_i)) or
+                    (cancel_bb < block_count and ssa_live_in[cancel_bb].isSet(val_i)))
+                {
+                    origin_tok_opt = val_tls_tok[val_i];
+                    break;
+                }
+            }
+        }
+
+        if (origin_tok_opt) |orig_tok| {
+            const sec_span_opt: ?LabeledSpan = if (!orig_tok.isNone()) .{
+                .span = resolveTokenSpan(body.file_id, orig_tok, config, decl_span),
+                .label = "`@thread_local` reference or pointer created here",
+                .style = .secondary,
+            } else null;
+            try emitSastDiag(
+                config.diagnostic_sink,
+                .e0309_concurrent_exclusivity_or_escape,
+                .err,
+                susp_span,
+                "cannot hold reference or pointer to `@thread_local` static across `.await` suspension point",
+                "`.await` may resume on a different worker thread while `@thread_local` borrow/pointer is live",
+                sec_span_opt,
+                null,
+                "copy the needed value out of the `@thread_local` static before `.await`",
             );
         }
     }
@@ -16915,7 +18339,7 @@ fn runPass3SummaryContractsAndSandbox(
                         .sys_write => direct_eff.fs = true,
                         .sys_exit => direct_eff.process = true,
                         .panic, .trap => direct_eff.may_panic = true,
-                        .fmt_value => direct_eff.alloc = true,
+                        .fmt_value, .async_spawn => direct_eff.alloc = true,
                         .async_block_on => direct_eff.blocking_sync = true,
                         .async_future_make => {
                             if (inst.operands.rhs >= 3 and inst.operands.lhs + 2 < body.extra_args.items.len) {
@@ -17196,7 +18620,7 @@ fn runPass3SummaryContractsAndSandbox(
                     resolved_slot = sym_to_slot.get(awt.sym_idx.asInt());
                 }
                 if (resolved_slot == null and awt.raw_producer_id != 0) {
-                    resolved_slot = key_to_slot.get(awt.raw_producer_id) orelse sym_to_slot.get(awt.raw_producer_id);
+                    resolved_slot = resolveProducerSlot(awt.raw_producer_id, key_to_slot, sym_to_slot);
                 }
                 if (resolved_slot) |c_slot| {
                     try per_body_edges[slot_usize].append(allocator, WitnessCallEdge.init(
@@ -17205,16 +18629,28 @@ fn runPass3SummaryContractsAndSandbox(
                         .{ .edge_kind = .await_suspend },
                     ));
                 } else {
+                    var ext_sym_idx = awt.sym_idx;
+                    if (ext_sym_idx.isNone() and !awt.def_id.isNone()) {
+                        ext_sym_idx = sym_table.def_to_symbol.get(awt.def_id.asInt()) orelse .none;
+                    }
+                    if (ext_sym_idx.isNone() and awt.raw_producer_id != 0 and
+                        awt.raw_producer_id < sym_table.symbols.items.len)
+                    {
+                        ext_sym_idx = SymbolIndex.fromInt(awt.raw_producer_id);
+                    }
+                    const canon_ext = unwrapCanonicalSymbolIndex(sym_table, ext_sym_idx);
                     const ext_def = if (!awt.def_id.isNone())
                         awt.def_id
-                    else if (awt.raw_producer_id != 0)
+                    else if (!canon_ext.isNone() and canon_ext.asInt() < sym_table.symbols.items.len)
+                        sym_table.getSymbol(canon_ext).def_id
+                    else if (awt.raw_producer_id >= 0x5000_0000)
                         DefId.fromInt(awt.raw_producer_id)
                     else
                         DefId.NONE;
                     var ext_eff = EffectCapabilityMask.EMPTY;
                     if (try lookupCalleeSummary(
                         ext_def,
-                        awt.sym_idx,
+                        canon_ext,
                         summaries,
                         key_to_slot,
                         sym_to_slot,
@@ -17225,14 +18661,16 @@ fn runPass3SummaryContractsAndSandbox(
                             (FnRegionSummary.INFERRED_THREAD_LOCAL_BIT | FnRegionSummary.INFERRED_ASYNC_NON_SEND_BIT));
                     }
                     direct_eff = direct_eff.unionWith(ext_eff);
-                    try per_body_edges[slot_usize].append(allocator, WitnessCallEdge.init(
-                        ext_def.asInt(),
-                        susp_tok,
-                        .{
-                            .edge_kind = .await_suspend,
-                            .edge_effects_bits = ext_eff.asBits(),
-                        },
-                    ));
+                    if (!ext_def.isNone()) {
+                        try per_body_edges[slot_usize].append(allocator, WitnessCallEdge.init(
+                            ext_def.asInt(),
+                            susp_tok,
+                            .{
+                                .edge_kind = .await_suspend,
+                                .edge_effects_bits = ext_eff.asBits(),
+                            },
+                        ));
+                    }
                 }
             }
         }
@@ -17942,6 +19380,17 @@ fn runPass3SummaryContractsAndSandbox(
             allocator,
             body,
             bodies,
+            store.summaries,
+            key_to_slot,
+            sym_to_slot,
+            pool,
+            sym_table,
+            config,
+            decl_span,
+        );
+        try verifyNoThreadLocalBorrowsAcrossAwait(
+            allocator,
+            body,
             store.summaries,
             key_to_slot,
             sym_to_slot,
@@ -19631,7 +21080,7 @@ fn recordOneProvenRange(
 }
 
 /// Computes non-trivial `ProvenValueRange` facts (`24B` each) for `body`, decoding `SIGN_BIAS_U64` on signed
-/// integers (`i8..i64`, `isize`) and omitting full-domain `(max +% 1) == min` mod $2^W$ intervals (`[MAJOR-08]`).
+/// integers (`i8..i64`, `isize`) and omitting full-domain `(max +% 1) == min` mod $2^W$ intervals.
 pub fn computeBodyProvenRanges(
     allocator: std.mem.Allocator,
     body: *const MirBody,
@@ -20516,14 +21965,10 @@ test "test_phase76_stage4_sast_out_optional_none_unbranched_fallible_drop_and_mu
 test "test_phase8_mir_sast_ffi_effects_cstr_e0308_dealloc_e0310_nullable_e0311_slice_len_e0312_and_out_param" {
     const allocator = std.testing.allocator;
 
-    // [1] Valid end-to-end FFI contracts:
-    //     - `@trusted` `extern` calls & `@trusted extern static` set `EffectCapabilityMask.ffi` without `unsafe_op`,
-    //     - C variadic default argument promotions widen `bool`/`i8`/backed-`enum`/`bit_field` -> `i32` & `f32` -> `f64`,
-    //     - `@owned_by_caller` + `@free_with` + `@may_be_null` null-branch leak discharge (`if ptr == 0 { return; }`),
-    //     - `@null_terminated` accepts `"lit".as_ptr()`, `CStr.as_ptr()`, and `[u8; 4]` ending in `0`,
-    //     - `@slice_len` / `@byte_len` accepts `buf.len()`, guarded `if count <= buf.len()`, and bounded arrays,
-    //     - `@out_param` initializes `var out_val: i32;` via `&raw mut out_val` without `E0303`:
+    // [1] Valid `@trusted` FFI contracts (`EffectCapabilityMask.ffi` without `unsafe_op`, variadic promotions,
+    //     `@owned_by_caller`/`@free_with`/`@may_be_null`, `@null_terminated`, `@slice_len`/`@byte_len`, `@out_param`):
     const valid_ffi_sast_src =
+        \\@trusted
         \\@repr(C)
         \\pub struct CStr {
         \\    ptr: *u8,
@@ -20605,10 +22050,10 @@ test "test_phase8_mir_sast_ffi_effects_cstr_e0308_dealloc_e0310_nullable_e0311_s
     try std.testing.expect(!pipeline_sum.inferredEffects().unsafe_op);
 
     // Confirm variadic MIR call operands were widened to `i32` and `f64`:
-    var verified_variadic_promotions = false;
+    var has_verified_variadic_promotions = false;
     for (pipeline_body.calls.items) |cs| {
         if (cs.is_c_variadic and cs.args_len == 6) {
-            verified_variadic_promotions = true;
+            has_verified_variadic_promotions = true;
             for (1..5) |var_idx| {
                 const arg_vid = MirValueId.fromInt(pipeline_body.extra_args.items[cs.args_start + var_idx]);
                 try std.testing.expectEqual(TypeId.i32_ty, pipeline_body.getInst(arg_vid).type_id);
@@ -20617,7 +22062,7 @@ test "test_phase8_mir_sast_ffi_effects_cstr_e0308_dealloc_e0310_nullable_e0311_s
             try std.testing.expectEqual(TypeId.f64_ty, pipeline_body.getInst(flt_vid).type_id);
         }
     }
-    try std.testing.expect(verified_variadic_promotions);
+    try std.testing.expect(has_verified_variadic_promotions);
 
     // [2] `E0308` (`@null_terminated`): reject `str.as_ptr()` and `"hello"[0..3].as_ptr()` outside `unsafe`:
     {
@@ -20647,18 +22092,18 @@ test "test_phase8_mir_sast_ffi_effects_cstr_e0308_dealloc_e0310_nullable_e0311_s
             \\    @free_with(good_free)
             \\    @may_be_null
             \\    pub fn custom_alloc(n: usize) -> *mut u8;
-            \\    pub fn good_free(@consumes @may_be_null p: *mut u8);
-            \\    pub fn wrong_free(@consumes @may_be_null p: *mut u8);
-            \\    pub fn require_non_null(@non_null p: *mut u8);
+            \\    pub fn good_free(@consumes @may_be_null ptr_a: *mut u8);
+            \\    pub fn wrong_free(@consumes @may_be_null ptr_a: *mut u8);
+            \\    pub fn require_non_null(@non_null ptr_a: *mut u8);
             \\}
             \\pub fn mismatch_and_null_violation() {
-            \\    let p1 = custom_alloc(16);
-            \\    require_non_null(p1);
-            \\    wrong_free(p1);
+            \\    let ptr_first = custom_alloc(16);
+            \\    require_non_null(ptr_first);
+            \\    wrong_free(ptr_first);
             \\}
             \\pub fn leak_on_non_null_path() {
-            \\    let p2 = custom_alloc(32);
-            \\    if p2 == (0 as *mut u8) {
+            \\    let ptr_second = custom_alloc(32);
+            \\    if ptr_second == (0 as *mut u8) {
             \\        return;
             \\    }
             \\}
@@ -20727,21 +22172,21 @@ test "test_phase8_mir_sast_ffi_effects_cstr_e0308_dealloc_e0310_nullable_e0311_s
     }
 }
 
-// ------ R-3 Concurrency, FFI Alias & Opaque Future SAST -------
+// -------- Concurrency, FFI Alias & Opaque Future SAST ---------
 
-test "r3 concurrency nursery dataflow cross-thread send ffi aliasing and opaque futures" {
+test "test_mir_sast_nursery_exclusivity_cross_thread_send_ffi_aliasing_and_opaque_futures" {
     const allocator = std.testing.allocator;
 
-    // [1] `[CRITICAL-01]` & `[CRITICAL-02]`: Non-`own` `async` block `&mut` race, conditional/unawaited join (`E0309`), & valid sequential join:
+    // [1] Non-`own` `async` block `&mut` race, conditional/unawaited join (`E0309`), & valid sequential join:
     {
         const dual_async_mut_src =
             \\pub async fn dual_mut_async_blocks() -> i32 {
             \\    var count: i32 = 0;
-            \\    let _ = cx.async.task_group(|g| {
-            \\        let h1 = g.spawn(async { count += 1; });
-            \\        let h2 = g.spawn(async { count += 2; });
-            \\        let _ = h1.join().await;
-            \\        let _ = h2.join().await;
+            \\    let _ = cx.async.task_group(|grp| {
+            \\        let handle_1 = grp.spawn(async { count += 1; });
+            \\        let handle_2 = grp.spawn(async { count += 2; });
+            \\        let _ = handle_1.join().await;
+            \\        let _ = handle_2.join().await;
             \\        0
             \\    }).await;
             \\    return count;
@@ -20758,10 +22203,10 @@ test "r3 concurrency nursery dataflow cross-thread send ffi aliasing and opaque 
         const cond_join_src =
             \\pub async fn conditional_join_race(is_joining: bool) -> i32 {
             \\    var count: i32 = 0;
-            \\    let _ = cx.async.task_group(|g| {
-            \\        let h = g.spawn(async { count += 1; });
+            \\    let _ = cx.async.task_group(|grp| {
+            \\        let handle = grp.spawn(async { count += 1; });
             \\        if is_joining {
-            \\            let _ = h.join().await;
+            \\            let _ = handle.join().await;
             \\        }
             \\        count += 10;
             \\        0
@@ -20780,9 +22225,9 @@ test "r3 concurrency nursery dataflow cross-thread send ffi aliasing and opaque 
         const unawaited_join_src =
             \\pub async fn unawaited_join_race() -> i32 {
             \\    var count: i32 = 0;
-            \\    let _ = cx.async.task_group(|g| {
-            \\        let h = g.spawn(async { count += 1; });
-            \\        let join_fut = h.join();
+            \\    let _ = cx.async.task_group(|grp| {
+            \\        let handle = grp.spawn(async { count += 1; });
+            \\        let join_fut = handle.join();
             \\        count += 10;
             \\        let _ = join_fut.await;
             \\        0
@@ -20801,12 +22246,12 @@ test "r3 concurrency nursery dataflow cross-thread send ffi aliasing and opaque 
         const seq_join_ok_src =
             \\pub async fn sequential_awaited_join_ok() -> i32 {
             \\    var count: i32 = 0;
-            \\    let _ = cx.async.task_group(|g| {
-            \\        let h1 = g.spawn(async { count += 1; });
-            \\        let _ = h1.join().await;
+            \\    let _ = cx.async.task_group(|grp| {
+            \\        let handle_1 = grp.spawn(async { count += 1; });
+            \\        let _ = handle_1.join().await;
             \\        count += 10;
-            \\        let h2 = g.spawn(async { count += 2; });
-            \\        let _ = h2.join().await;
+            \\        let handle_2 = grp.spawn(async { count += 2; });
+            \\        let _ = handle_2.join().await;
             \\        0
             \\    }).await;
             \\    return count;
@@ -20817,7 +22262,7 @@ test "r3 concurrency nursery dataflow cross-thread send ffi aliasing and opaque 
         try std.testing.expect(!seq_ok_b.diagnostics.hasErrors());
     }
 
-    // [2] `[CRITICAL-05]` & `[CRITICAL-06]`: Pre-bound `!Send`/`!Sync` `Future`, `own` closure, `@thread_local`, & opaque `Future` (`E0309`):
+    // [2] Pre-bound `!Send`/`!Sync` `Future`, `own` closure, `@thread_local`, & opaque `Future` (`E0309`):
     {
         const prebound_non_send_src =
             \\@not_send
@@ -20829,9 +22274,9 @@ test "r3 concurrency nursery dataflow cross-thread send ffi aliasing and opaque 
             \\}
             \\pub async fn smuggle_prebound_future() -> i32 {
             \\    let fut = use_local_token(own LocalToken { val: 7 });
-            \\    return cx.async.task_group(|g| {
-            \\        let h = g.spawn(own fut);
-            \\        h.join().await
+            \\    return cx.async.task_group(|grp| {
+            \\        let handle = grp.spawn(own fut);
+            \\        handle.join().await
             \\    }).await;
             \\}
         ;
@@ -20856,9 +22301,9 @@ test "r3 concurrency nursery dataflow cross-thread send ffi aliasing and opaque 
             \\}
             \\pub async fn spawn_transitive_tls() -> i32 {
             \\    let fut = tls_worker();
-            \\    return cx.async.task_group(|g| {
-            \\        let h = g.spawn(own fut);
-            \\        h.join().await
+            \\    return cx.async.task_group(|grp| {
+            \\        let handle = grp.spawn(own fut);
+            \\        handle.join().await
             \\    }).await;
             \\}
         ;
@@ -20872,9 +22317,9 @@ test "r3 concurrency nursery dataflow cross-thread send ffi aliasing and opaque 
 
         const opaque_spawn_src =
             \\pub async fn spawn_opaque_future(fut: own Future[i32]) -> i32 {
-            \\    return cx.async.task_group(|g| {
-            \\        let h = g.spawn(own fut);
-            \\        h.join().await
+            \\    return cx.async.task_group(|grp| {
+            \\        let handle = grp.spawn(own fut);
+            \\        handle.join().await
             \\    }).await;
             \\}
         ;
@@ -20887,7 +22332,7 @@ test "r3 concurrency nursery dataflow cross-thread send ffi aliasing and opaque 
         try std.testing.expect(has_opq_e0309);
     }
 
-    // [3] `[CRITICAL-08]` & `[MINOR-03]`: FFI alias UAF (`E0301`) / double-free (`E0313`), field `@may_be_null` (`E0311`), & `b"abc"` (`E0308`):
+    // [3] FFI alias UAF (`E0301`) / double-free (`E0313`), field `@may_be_null` (`E0311`), & `b"abc"` (`E0308`):
     {
         const ffi_alias_and_field_src =
             \\@trusted
@@ -20905,16 +22350,16 @@ test "r3 concurrency nursery dataflow cross-thread send ffi aliasing and opaque 
             \\    pub ptr: *mut i32,
             \\}
             \\pub fn alias_uaf_violation() {
-            \\    let p = alloc_i32();
-            \\    let q = p;
-            \\    good_free_i32(q);
-            \\    unsafe { p.* = 42; }
+            \\    let ptr_a = alloc_i32();
+            \\    let ptr_b = ptr_a;
+            \\    good_free_i32(ptr_b);
+            \\    unsafe { ptr_a.* = 42; }
             \\}
             \\pub fn alias_double_free_violation() {
-            \\    let p = alloc_i32();
-            \\    let q = p;
-            \\    good_free_i32(q);
-            \\    good_free_i32(p);
+            \\    let ptr_a = alloc_i32();
+            \\    let ptr_b = ptr_a;
+            \\    good_free_i32(ptr_b);
+            \\    good_free_i32(ptr_a);
             \\}
             \\pub fn field_maybe_null_violation() {
             \\    let wrap = PtrWrap { ptr: maybe_null_i32() };
@@ -20955,7 +22400,7 @@ test "r3 concurrency nursery dataflow cross-thread send ffi aliasing and opaque 
         try std.testing.expect(!nul_ok_b.diagnostics.hasErrors());
     }
 
-    // [4] `[CRITICAL-10]`: Thin sync `Future` wrapper resolves cleanly, while opaque `Future` enforces `E0317`/`E0320`/`E0321`/`E0322`/`E0324`:
+    // [4] Thin sync `Future` wrapper resolves cleanly, while opaque `Future` enforces `E0317`/`E0320`/`E0321`/`E0322`/`E0324`:
     {
         const sync_wrapper_ok_src =
             \\async fn leaf_step() -> i32 {
@@ -21012,5 +22457,408 @@ test "r3 concurrency nursery dataflow cross-thread send ffi aliasing and opaque 
         try std.testing.expect(has_e0321);
         try std.testing.expect(has_e0322);
         try std.testing.expect(has_e0324);
+    }
+}
+
+test "test_phase8_hardening_nursery_task_handle_raw_provenance_linear_future_spoofing_clobber_and_tls_await" {
+    const allocator = std.testing.allocator;
+
+    // [1] `TaskHandle[T]` nursery cleanup across `.await` & `?` unwind (`0` errors) vs unjoined / user `@linear` (`E0304`):
+    {
+        const nursery_join_ok_src =
+            \\async fn compute_part(seed: i32) -> i32!i32 {
+            \\    return .Ok(seed + 1);
+            \\}
+            \\pub async fn parallel_fanout_and_try_join() -> i32!i32 {
+            \\    let sum_pair = cx.async.task_group(|grp| {
+            \\        let left = grp.spawn(own async { 10 });
+            \\        let right = grp.spawn(own async { 20 });
+            \\        left.join().await + right.join().await
+            \\    }).await;
+            \\    let try_sum = cx.async.task_group(|grp| -> i32!i32 {
+            \\        let pri_handle = grp.spawn(own compute_part(1));
+            \\        let sec_handle = grp.spawn(own compute_part(2));
+            \\        let first_val = pri_handle.join().await?;
+            \\        let second_val = sec_handle.join().await?;
+            \\        .Ok(first_val + second_val)
+            \\    }).await?;
+            \\    return .Ok(sum_pair + try_sum);
+            \\}
+        ;
+        var ok_nursery = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(101),
+            nursery_join_ok_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer ok_nursery.deinit();
+        try std.testing.expect(!ok_nursery.diagnostics.hasErrors());
+
+        const unjoined_handle_src =
+            \\pub async fn drop_task_handle_on_normal_exit() -> i32 {
+            \\    return cx.async.task_group(|grp| {
+            \\        let _unjoined = grp.spawn(own async { 1 });
+            \\        0
+            \\    }).await;
+            \\}
+        ;
+        var bad_unjoined = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(102),
+            unjoined_handle_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer bad_unjoined.deinit();
+        var has_unjoined_e0304 = false;
+        for (bad_unjoined.diagnostics.diagnostics.items) |diag_item| {
+            if (diag_item.code == .e0304_resource_or_memory_leak) has_unjoined_e0304 = true;
+        }
+        try std.testing.expect(has_unjoined_e0304);
+
+        const linear_permit_cancel_src =
+            \\@linear
+            \\pub struct LinearPermit {
+            \\    pub id: i32,
+            \\}
+            \\pub fn release_permit(permit: own LinearPermit) -> i32 {
+            \\    let LinearPermit { id: out_id } = permit;
+            \\    return out_id;
+            \\}
+            \\pub async fn hold_user_linear_across_nursery_await() -> i32 {
+            \\    return cx.async.task_group(|grp| {
+            \\        let permit = LinearPermit { id: 9 };
+            \\        let child = grp.spawn(async { 1 });
+            \\        let val = child.join().await;
+            \\        release_permit(own permit) + val
+            \\    }).await;
+            \\}
+        ;
+        var bad_permit = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(103),
+            linear_permit_cancel_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer bad_permit.deinit();
+        var has_permit_e0304 = false;
+        for (bad_permit.diagnostics.diagnostics.items) |diag_item| {
+            if (diag_item.code == .e0304_resource_or_memory_leak) has_permit_e0304 = true;
+        }
+        try std.testing.expect(has_permit_e0304);
+    }
+
+    // [2] `C3`: `&raw` provenance preserves stack depth & `param_mask` (`E0306` escape & `E0305` mutation while live):
+    {
+        const raw_prov_escape_and_mut_src =
+            \\@trusted
+            \\@repr(C)
+            \\pub struct CStr {
+            \\    pub ptr: *u8,
+            \\}
+            \\impl CStr {
+            \\    pub fn from_bytes_with_nul(bytes: &[u8]) -> CStr {
+            \\        return CStr { ptr: &raw bytes[0] };
+            \\    }
+            \\    pub fn as_ptr(&self) -> *u8 {
+            \\        return self.ptr;
+            \\    }
+            \\}
+            \\@trusted
+            \\extern "C" {
+            \\    pub fn stash_cstr_ptr(@escapes text: *u8);
+            \\}
+            \\pub fn return_dangling_cstr() -> CStr {
+            \\    let local_bytes: [u8; 4] = [65, 66, 67, 0];
+            \\    return CStr.from_bytes_with_nul(&local_bytes);
+            \\}
+            \\pub fn mutate_backing_while_cstr_live() -> *u8 {
+            \\    var buf: [u8; 4] = [65, 66, 67, 0];
+            \\    let cstr = CStr.from_bytes_with_nul(&buf);
+            \\    buf[0] = 90;
+            \\    return cstr.as_ptr();
+            \\}
+            \\pub fn escape_cstr_into_ffi_global() {
+            \\    let local_bytes: [u8; 4] = [65, 66, 67, 0];
+            \\    let cstr = CStr.from_bytes_with_nul(&local_bytes);
+            \\    stash_cstr_ptr(cstr.as_ptr());
+            \\}
+        ;
+        var raw_prov_b = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(104),
+            raw_prov_escape_and_mut_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer raw_prov_b.deinit();
+        var count_e0306: usize = 0;
+        var has_e0305 = false;
+        for (raw_prov_b.diagnostics.diagnostics.items) |diag_item| {
+            if (diag_item.code == .e0306_region_escape_violation) count_e0306 += 1;
+            if (diag_item.code == .e0305_exclusivity_violation) has_e0305 = true;
+        }
+        try std.testing.expect(count_e0306 >= 2);
+        try std.testing.expect(has_e0305);
+    }
+
+    // [3] `C4`: Unpolled `Future` & pre-poll `TaskGroup.spawn` with `@linear` capture emit `E0304`; direct `.await` is clean:
+    {
+        const linear_future_drop_src =
+            \\@linear
+            \\pub struct LinearTicket {
+            \\    pub code: i32,
+            \\}
+            \\pub fn redeem_ticket(ticket: own LinearTicket) -> i32 {
+            \\    let LinearTicket { code: val } = ticket;
+            \\    return val;
+            \\}
+            \\async fn consume_async(ticket: own LinearTicket) -> i32 {
+            \\    return redeem_ticket(own ticket);
+            \\}
+            \\pub fn drop_unawaited_linear_future() {
+            \\    let _fut = consume_async(own LinearTicket { code: 1 });
+            \\}
+        ;
+        var drop_fut_b = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(105),
+            linear_future_drop_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer drop_fut_b.deinit();
+        var has_drop_fut_e0304 = false;
+        for (drop_fut_b.diagnostics.diagnostics.items) |diag_item| {
+            if (diag_item.code == .e0304_resource_or_memory_leak) has_drop_fut_e0304 = true;
+        }
+        try std.testing.expect(has_drop_fut_e0304);
+
+        const linear_future_spawn_src =
+            \\@linear
+            \\pub struct LinearTicket {
+            \\    pub code: i32,
+            \\}
+            \\pub fn redeem_ticket(ticket: own LinearTicket) -> i32 {
+            \\    let LinearTicket { code: val } = ticket;
+            \\    return val;
+            \\}
+            \\async fn consume_async(ticket: own LinearTicket) -> i32 {
+            \\    return redeem_ticket(own ticket);
+            \\}
+            \\pub async fn spawn_pre_poll_linear_future() -> i32 {
+            \\    return cx.async.task_group(|grp| {
+            \\        let handle = grp.spawn(own consume_async(own LinearTicket { code: 2 }));
+            \\        handle.join().await
+            \\    }).await;
+            \\}
+        ;
+        var spawn_fut_b = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(106),
+            linear_future_spawn_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer spawn_fut_b.deinit();
+        var has_spawn_fut_e0304 = false;
+        for (spawn_fut_b.diagnostics.diagnostics.items) |diag_item| {
+            if (diag_item.code == .e0304_resource_or_memory_leak) has_spawn_fut_e0304 = true;
+        }
+        try std.testing.expect(has_spawn_fut_e0304);
+
+        const linear_future_await_ok_src =
+            \\@linear
+            \\pub struct LinearTicket {
+            \\    pub code: i32,
+            \\}
+            \\pub fn redeem_ticket(ticket: own LinearTicket) -> i32 {
+            \\    let LinearTicket { code: val } = ticket;
+            \\    return val;
+            \\}
+            \\async fn consume_async(ticket: own LinearTicket) -> i32 {
+            \\    return redeem_ticket(own ticket);
+            \\}
+            \\pub async fn await_linear_future_directly() -> i32 {
+            \\    return consume_async(own LinearTicket { code: 3 }).await;
+            \\}
+        ;
+        var await_ok_b = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(107),
+            linear_future_await_ok_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer await_ok_b.deinit();
+        try std.testing.expect(!await_ok_b.diagnostics.hasErrors());
+    }
+
+    // [4] `C5` & `C6`: Reject spoofed `CStr`/`AtomicSpoof` (`E0308`/`E0309`) & `&mut` NUL-clobbered `[u8; 4]` (`E0308`):
+    {
+        const cstr_spoof_and_clobber_src =
+            \\pub struct CStr {
+            \\    pub ptr: *u8,
+            \\}
+            \\impl CStr {
+            \\    pub fn as_ptr(&self) -> *u8 {
+            \\        return self.ptr;
+            \\    }
+            \\}
+            \\@trusted
+            \\extern "C" {
+            \\    pub fn c_puts_checked(@null_terminated msg: *u8) -> i32;
+            \\}
+            \\pub fn overwrite_nul(buf: &mut [u8; 4]) {
+            \\    buf.*[3] = 88;
+            \\}
+            \\pub fn spoofed_cstr_call(fake: &CStr) -> i32 {
+            \\    return c_puts_checked(fake.as_ptr());
+            \\}
+            \\pub fn clobbered_array_call() -> i32 {
+            \\    var buf: [u8; 4] = [65, 66, 67, 0];
+            \\    overwrite_nul(&mut buf);
+            \\    return c_puts_checked(buf.as_ptr());
+            \\}
+        ;
+        var cstr_spoof_b = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(108),
+            cstr_spoof_and_clobber_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer cstr_spoof_b.deinit();
+        var count_spoof_e0308: usize = 0;
+        for (cstr_spoof_b.diagnostics.diagnostics.items) |diag_item| {
+            if (diag_item.code == .e0308_unterminated_cstr_ffi) count_spoof_e0308 += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2), count_spoof_e0308);
+
+        const atomic_spoof_src =
+            \\pub struct AtomicSpoof {
+            \\    pub raw: *mut i32,
+            \\}
+            \\async fn take_spoof(val: AtomicSpoof) -> i32 {
+            \\    let _ = val.raw;
+            \\    return 0;
+            \\}
+            \\pub async fn spawn_spoofed_atomic(spoof: AtomicSpoof) -> i32 {
+            \\    return cx.async.task_group(|grp| {
+            \\        let handle = grp.spawn(own take_spoof(spoof));
+            \\        handle.join().await
+            \\    }).await;
+            \\}
+        ;
+        var atomic_spoof_b = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(112),
+            atomic_spoof_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer atomic_spoof_b.deinit();
+        var has_spoof_e0309 = false;
+        for (atomic_spoof_b.diagnostics.diagnostics.items) |diag_item| {
+            if (diag_item.code == .e0309_concurrent_exclusivity_or_escape) has_spoof_e0309 = true;
+        }
+        try std.testing.expect(has_spoof_e0309);
+    }
+
+    // [5] `H4` (`@no_alloc` on `TaskGroup.spawn` -> `E0320`) & `H5` (`@thread_local` borrow/ptr across `.await` -> `E0309`):
+    {
+        const h4_no_alloc_spawn_src =
+            \\@no_alloc
+            \\pub async fn forbidden_spawn_in_no_alloc() -> i32 {
+            \\    return cx.async.task_group(|grp| {
+            \\        let handle = grp.spawn(own async { 1 });
+            \\        handle.join().await
+            \\    }).await;
+            \\}
+        ;
+        var h4_b = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(109),
+            h4_no_alloc_spawn_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer h4_b.deinit();
+        var has_h4_e0320 = false;
+        for (h4_b.diagnostics.diagnostics.items) |diag_item| {
+            if (diag_item.code == .e0320_no_alloc_contract_violation) has_h4_e0320 = true;
+        }
+        try std.testing.expect(has_h4_e0320);
+
+        const h5_tls_across_await_src =
+            \\@thread_local
+            \\extern "C" {
+            \\    pub static mut TLS_COUNTER: i32;
+            \\}
+            \\async fn async_step() -> i32 {
+            \\    return 1;
+            \\}
+            \\pub async fn hold_tls_ref_across_await() -> i32 {
+            \\    let tls_ref: &i32 = unsafe { &TLS_COUNTER };
+            \\    let delta = async_step().await;
+            \\    return tls_ref.* + delta;
+            \\}
+            \\pub async fn hold_tls_raw_ptr_across_await() -> i32 {
+            \\    let tls_ptr: *mut i32 = unsafe { &raw mut TLS_COUNTER };
+            \\    let delta = async_step().await;
+            \\    return unsafe { tls_ptr.* } + delta;
+            \\}
+            \\async fn leaf_tls_async() -> i32 {
+            \\    return unsafe { TLS_COUNTER };
+            \\}
+            \\async fn outer_tls_async() -> i32 {
+            \\    return leaf_tls_async().await;
+            \\}
+            \\pub async fn spawn_nested_async_tls() -> i32 {
+            \\    return cx.async.task_group(|grp| {
+            \\        let handle = grp.spawn(own outer_tls_async());
+            \\        handle.join().await
+            \\    }).await;
+            \\}
+        ;
+        var h5_b = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(110),
+            h5_tls_across_await_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer h5_b.deinit();
+        var count_h5_e0309: usize = 0;
+        for (h5_b.diagnostics.diagnostics.items) |diag_item| {
+            if (diag_item.code == .e0309_concurrent_exclusivity_or_escape) count_h5_e0309 += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 3), count_h5_e0309);
+
+        const h5_tls_copy_before_await_ok_src =
+            \\@thread_local
+            \\extern "C" {
+            \\    pub static mut TLS_COUNTER: i32;
+            \\}
+            \\async fn async_step() -> i32 {
+            \\    return 1;
+            \\}
+            \\pub async fn copy_tls_scalar_before_await() -> i32 {
+            \\    let snapshot: i32 = unsafe { TLS_COUNTER };
+            \\    let delta = async_step().await;
+            \\    return snapshot + delta;
+            \\}
+        ;
+        var h5_ok_b = try lowerAndVerifySourceMirSast(
+            allocator,
+            FileId.fromInt(111),
+            h5_tls_copy_before_await_ok_src,
+            TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer h5_ok_b.deinit();
+        try std.testing.expect(!h5_ok_b.diagnostics.hasErrors());
     }
 }

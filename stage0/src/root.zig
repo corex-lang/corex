@@ -355,7 +355,7 @@ pub const TypeFlags = type_system.TypeFlags;
 pub const OwnershipTier = type_system.OwnershipTier;
 /// Classifies any `TypeId` into `.copy_tier`, `.auto_drop_tier`, or `.linear_tier`.
 pub const classifyOwnershipTier = type_system.classifyOwnershipTier;
-/// 1-byte bit-packed effect contract mask carried on `fn(…)` and closure types (`[CRITICAL-07]`).
+/// 1-byte bit-packed effect contract mask carried on `fn(…)` and closure types.
 pub const FnPtrContractMask = type_system.FnPtrContractMask;
 /// Canonical field ordinals on CoreX's implicit/explicit `Context` value (`Seam #2`, `D-04`, `D-06B`).
 pub const ContextFieldKind = type_system.ContextFieldKind;
@@ -401,7 +401,7 @@ pub const AttrArgValue = type_system.AttrArgValue;
 pub const AttrFieldInit = type_system.AttrFieldInit;
 /// Validated user-defined `@attribute_schema` instance attached to a declaration, field, or variant.
 pub const AttrInstance = type_system.AttrInstance;
-/// Per-body AST-window-scoped semantic side tables extracted from `TypeChecker` (`[CRITICAL-11]`).
+/// Per-body AST-window-scoped semantic side tables extracted from `TypeChecker`.
 pub const BodySemanticSideTables = type_system.BodySemanticSideTables;
 /// Canonical compiler-intrinsic selector for `@snake_case` expressions (`DR-05` Section 3.3).
 pub const IntrinsicKind = type_system.IntrinsicKind;
@@ -417,11 +417,11 @@ pub const HirTag = hir.HirTag;
 pub const ValueCategory = hir.ValueCategory;
 /// 1-byte bit-packed `HirNode` metadata flags.
 pub const HirFlags = hir.HirFlags;
-/// 18-byte zero-padding Structure-of-Arrays `HirNode` (`20` bytes AoS, `[MAJOR-05]`).
+/// 18-byte zero-padding Structure-of-Arrays `HirNode` (`20` bytes AoS).
 pub const HirNode = hir.HirNode;
 /// Packed 32-bit LSB-first `bit_field` slice specification (`DR-13` §2.2).
 pub const BitSpec = hir.BitSpec;
-/// Classification of `hir_return` for `defer` vs. `errdefer` cleanup routing (`[CRITICAL-08]`).
+/// Classification of `hir_return` for `defer` vs. `errdefer` cleanup routing.
 pub const ReturnErrorKind = hir.ReturnErrorKind;
 /// Canonical `HIR` unary operator enum.
 pub const HirUnaryOp = hir.HirUnaryOp;
@@ -457,7 +457,7 @@ pub const renderHir = hir.renderHir;
 pub const LocalId = mir.LocalId;
 /// Strongly typed 32-bit index into `MirBody.places`.
 pub const PlaceId = mir.PlaceId;
-/// Strongly typed 32-bit index into `MirBody.extra_edges` (`[CRITICAL-06]`).
+/// Strongly typed 32-bit index into `MirBody.extra_edges`.
 pub const EdgeId = mir.EdgeId;
 /// 1-byte bit-packed flags on `LocalDecl`.
 pub const LocalFlags = mir.LocalFlags;
@@ -471,9 +471,9 @@ pub const ProjKind = mir.ProjKind;
 pub const MirProjection = mir.MirProjection;
 /// Canonical `MIR` instruction opcode (`0..24`).
 pub const MirOp = mir.MirOp;
-/// Explicit signed, unsigned, and IEEE-754 binary opcodes in `MIR` (`[CRITICAL-09]`).
+/// Explicit signed, unsigned, and IEEE-754 binary opcodes in `MIR`.
 pub const BinOpKind = mir.BinOpKind;
-/// Explicit unary arithmetic, logical, and conversion opcodes in `MIR` (`[CRITICAL-09]`).
+/// Explicit unary arithmetic, logical, and conversion opcodes in `MIR`.
 pub const UnaryOpKind = mir.UnaryOpKind;
 /// Sub-kind encoded in `MirInst.aux_u16` on `MirOp.aggregate_make`.
 pub const AggregateKind = mir.AggregateKind;
@@ -485,11 +485,11 @@ pub const InstFlags = mir.InstFlags;
 pub const MirInst = mir.MirInst;
 /// Control-flow terminator kind ending every `MirBasicBlock`.
 pub const TerminatorKind = mir.TerminatorKind;
-/// 12-byte control-flow terminator embedded in `MirBasicBlock` (`[CRITICAL-01]`).
+/// 12-byte control-flow terminator embedded in `MirBasicBlock`.
 pub const MirTerminator = mir.MirTerminator;
-/// 32-byte basic block record in `MirBody.blocks` (`[CRITICAL-01]`, `[MINOR-02]`).
+/// 32-byte basic block record in `MirBody.blocks`.
 pub const MirBasicBlock = mir.MirBasicBlock;
-/// 16-byte first-class outgoing CFG edge record in `MirBody.extra_edges` (`[CRITICAL-06]`).
+/// 16-byte first-class outgoing CFG edge record in `MirBody.extra_edges`.
 pub const MirOutgoingEdge = mir.MirOutgoingEdge;
 /// Call-site metadata record in `MirBody.calls`.
 pub const MirCallSite = mir.MirCallSite;
@@ -503,7 +503,7 @@ pub const LoopContractMeta = mir.LoopContractMeta;
 pub const MirLoopContractEntry = mir.MirLoopContractEntry;
 /// 16-byte `$O(1)$` embedded binary blob descriptor stored in `MirConst.raw_blob` (`DR-20` `D-03`).
 pub const RawBlobConst = mir.RawBlobConst;
-/// Deduplicated binary blob store populated by `materializeModuleEmbedBytes` (`[CRITICAL-07]`).
+/// Deduplicated binary blob store populated by `materializeModuleEmbedBytes`.
 pub const MirBlobStore = mir.MirBlobStore;
 /// Pre-codegen `@embed_bytes` materializer converting constant paths into `MirConst.raw_blob`.
 pub const materializeModuleEmbedBytes = mir.materializeModuleEmbedBytes;
@@ -513,7 +513,7 @@ pub const VacatedProjectionWindow = mir.VacatedProjectionWindow;
 pub const MirBody = mir.MirBody;
 /// Returns `true` when `raw_ty` unwraps to a nominal `@zero_pad` `struct`, `union`, or `enum`.
 pub const isZeroPadNominalType = mir.isZeroPadNominalType;
-/// Braun et al. single-pass forward Block-Argument SSA builder (`DR-13` §3.5, `[MAJOR-01]`).
+/// Braun et al. single-pass forward Block-Argument SSA builder (`DR-13` §3.5).
 pub const MirSsaBuilder = mir.MirSsaBuilder;
 /// Cooper-Harvey-Kennedy dominator tree rooted at `^bb0`.
 pub const DominatorTree = mir.DominatorTree;
@@ -595,21 +595,21 @@ pub const analyzeAndElaborateMirModule = mir_sast.analyzeAndElaborateMirModule;
 pub const analyzeSingleMirBody = mir_sast.analyzeSingleMirBody;
 /// Standalone end-to-end `Source -> HIR -> MIR -> SAST` pipeline helper.
 pub const lowerAndVerifySourceMirSast = mir_sast.lowerAndVerifySourceMirSast;
-/// 24-byte Pentagon-proven SSA scalar range & alignment fact (`[MAJOR-08]`).
+/// 24-byte Pentagon-proven SSA scalar range & alignment fact.
 pub const ProvenValueRange = mir_sast.ProvenValueRange;
-/// Extracts sign-bias-decoded `ProvenValueRange` facts for LLVM `!range` / `@llvm.assume` (`[MAJOR-08]`).
+/// Extracts sign-bias-decoded `ProvenValueRange` facts for LLVM `!range` / `@llvm.assume`.
 pub const computeBodyProvenRanges = mir_sast.computeBodyProvenRanges;
 
 // ------------ `MirVm` & `MIR` Optimizer Re-Exports ------------
-/// Disjoint 2-bit allocation domain tag inside `ComptimeAllocId` (`[CRITICAL-02]`).
+/// Disjoint 2-bit allocation domain tag inside `ComptimeAllocId`.
 pub const AllocDomain = mir_vm.AllocDomain;
-/// 4-byte `MirVm` / `.rodata` / `StringInterner` / `fn_addr` handle (`[CRITICAL-02]`).
+/// 4-byte `MirVm` / `.rodata` / `StringInterner` / `fn_addr` handle.
 pub const ComptimeAllocId = mir_vm.ComptimeAllocId;
 /// 8-byte symbolic pointer (`alloc_id` + `byte_offset`).
 pub const SymbolicPtr = mir_vm.SymbolicPtr;
-/// 8-byte `MirVm` virtual register slot (`DR-05` §3.1, `[CRITICAL-04]`).
+/// 8-byte `MirVm` virtual register slot (`DR-05` §3.1).
 pub const RegSlot = mir_vm.RegSlot;
-/// 8-byte pointer provenance entry (`[CRITICAL-10]`).
+/// 8-byte pointer provenance entry.
 pub const ProvenanceEntry = mir_vm.ProvenanceEntry;
 /// 3-way `MirVm` value representation (`inline_scalar`, `inline_ptr`, `by_value_snapshot`).
 pub const VmValueRepr = mir_vm.VmValueRepr;
@@ -633,9 +633,9 @@ pub const makeComptimeEvalHook = mir_vm.makeComptimeEvalHook;
 pub const AbiPassClass = mir_opt.AbiPassClass;
 /// Niche bit-pattern representation tag in `LayoutShapeKey`.
 pub const NicheKind = mir_opt.NicheKind;
-/// Exact 16-byte physical layout shape descriptor (`DR-13` §5.3, `[CRITICAL-09]`).
+/// Exact 16-byte physical layout shape descriptor (`DR-13` §5.3).
 pub const LayoutShapeKey = mir_opt.LayoutShapeKey;
-/// Operational semantics tag guarding sound `LayoutShapeKey` deduplication (`[CRITICAL-09]`).
+/// Operational semantics tag guarding sound `LayoutShapeKey` deduplication.
 pub const OpSemanticsTag = mir_opt.OpSemanticsTag;
 /// Function inline directive (`default_mode`, `inline_hint`, `inline_always`, `inline_never`).
 pub const InlineDirective = mir_opt.InlineDirective;
@@ -659,7 +659,7 @@ pub const TargetAbi = codegen_abi.TargetAbi;
 pub const LinkMode = codegen_abi.LinkMode;
 /// Target SIMD alignment tier (`none`, `sse2_neon_simd128`, `avx2`, `avx512`).
 pub const SimdLevel = codegen_abi.SimdLevel;
-/// 4-byte binary-exact target specification covering all 7 canonical targets.
+/// 4-byte binary-exact target specification covering all 11 canonical targets.
 pub const TargetSpec = codegen_abi.TargetSpec;
 /// 24-byte binary-exact niche descriptor.
 pub const NicheSpec = codegen_abi.NicheSpec;
@@ -685,7 +685,7 @@ pub const OptLevel = codegen_abi.OptLevel;
 pub const CBackendConfig = codegen_abi.CBackendConfig;
 /// Tier B (`LLVM 20–23`) backend configuration.
 pub const LlvmBackendConfig = codegen_abi.LlvmBackendConfig;
-/// Output artifact form (`.source_text`, `.object_file`, `.executable`).
+/// Output artifact form (`.source_text`, `.object_file`, `.executable`, `.static_library`, `.shared_library`).
 pub const OutputArtifactKind = codegen_abi.OutputArtifactKind;
 /// Owned artifact bundle produced by `CodegenBackend.emitModule`.
 pub const CodegenArtifact = codegen_abi.CodegenArtifact;

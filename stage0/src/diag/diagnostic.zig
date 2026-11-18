@@ -473,6 +473,9 @@ const IndexedFix = struct {
     original_index: usize,
 };
 
+/// Key-value tuple entry pairing a 5-character diagnostic code string with its `DiagnosticCode` tag.
+const CodeKvPair = struct { []const u8, DiagnosticCode };
+
 // --------------------------------------- CONSTS ----------------------------------------
 
 /// Default upper bound on emitted error diagnostics before halting emission (`AGENTS.md` Section 2).
@@ -785,14 +788,14 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .code = .e0308_unterminated_cstr_ffi,
         .code_str = "E0308",
         .default_severity = .err,
-        .title = "unterminated string or slice passed to @null_terminated C FFI",
+        .title = "unterminated string or slice passed to `@null_terminated` C FFI",
         .explanation = "Passing a non-NUL-terminated `str` or slice to a `@null_terminated` C FFI parameter requires `CStr` conversion.",
     },
     .{
         .code = .e0309_concurrent_exclusivity_or_escape,
         .code_str = "E0309",
         .default_severity = .err,
-        .title = "concurrent exclusivity, @thread_local capture, or escape violation",
+        .title = "concurrent exclusivity, `@thread_local` capture, or escape violation",
         .explanation = "Concurrent `&mut` aliasing, `!Send`/`@thread_local` capture, or region escape crossed a `TaskGroup`/`async` boundary.",
     },
     .{
@@ -806,14 +809,14 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .code = .e0311_unchecked_nullable_ffi_ptr,
         .code_str = "E0311",
         .default_severity = .err,
-        .title = "unchecked nullable FFI pointer dereference or @non_null pass",
+        .title = "unchecked nullable FFI pointer dereference or `@non_null` pass",
         .explanation = "An `@may_be_null` FFI pointer was dereferenced or passed to a `@non_null` consumer without a dominating null check.",
     },
     .{
         .code = .e0312_unproven_ffi_slice_len,
         .code_str = "E0312",
         .default_severity = .err,
-        .title = "unproven buffer capacity at @slice_len / @byte_len FFI boundary",
+        .title = "unproven buffer capacity at `@slice_len` / `@byte_len` FFI boundary",
         .explanation = "Raw pointer and length passed to `@slice_len` or `@byte_len` FFI lack statically proven slice capacity.",
     },
     .{
@@ -1170,7 +1173,7 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .code = .e0438_await_outside_async_context,
         .code_str = "E0438",
         .default_severity = .err,
-        .title = "postfix '.await' outside async context",
+        .title = "postfix `.await` outside async context",
         .explanation = "Postfix `.await` may only be used inside an `async fn`, `async` closure, or `async` block.",
     },
     .{
@@ -1318,7 +1321,6 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
 /// Static $O(1)$ compile-time map resolving canonical 5-character code strings to `DiagnosticCode`.
 pub const DIAGNOSTIC_CODE_STR_MAP = blk: {
     @setEvalBranchQuota(20_000);
-    const CodeKvPair = struct { []const u8, DiagnosticCode };
     var pairs: [DIAGNOSTIC_CATALOG.len]CodeKvPair = undefined;
     for (DIAGNOSTIC_CATALOG, 0..) |descriptor, i| {
         pairs[i] = .{ descriptor.code_str, descriptor.code };

@@ -218,11 +218,6 @@ pub const CTokenKind = enum(u8) {
 /// 64-bit $O(1)$ membership bitmask over `CTokenKind` (`0..54`).
 const CTokenMask64 = u64;
 
-comptime {
-    std.debug.assert(std.enums.values(CTokenKind).len <= 64);
-    std.debug.assert(@backingInt(CTokenKind.eof) < 64);
-}
-
 /// `#pragma pack` stack operation attached to `.pragma_pack` tokens.
 pub const PragmaPackOp = enum(u8) {
     /// Reset packing to target default (`#pragma pack()`).
@@ -305,6 +300,16 @@ pub const RecordedMacroConst = struct {
     span: Span,
     /// `true` when defined inside a bundled system header (`<stdint.h>`, `<limits.h>`, etc.).
     is_from_system_header: bool,
+};
+
+/// Non-bundled transitive `#include` file resolved from VFS or `host_fs` (`BLAKE3` content-keyed).
+pub const RecordedIncludeFile = struct {
+    /// Arena-owned path of the resolved `#include` header.
+    path: []const u8,
+    /// Arena-owned UTF-8 source bytes of the resolved `#include` header.
+    content: []const u8,
+    /// Cryptographic 256-bit `BLAKE3` digest of `content`.
+    content_blake3: [32]u8,
 };
 
 // -------------------- C Types & Contracts ---------------------
@@ -723,6 +728,8 @@ pub const CTranslationUnit = struct {
     decls: std.ArrayListUnmanaged(CDecl) = .empty,
     /// Simple scalar and string `#define` constants preserved from preprocessing.
     macro_consts: std.ArrayListUnmanaged(RecordedMacroConst) = .empty,
+    /// Non-bundled transitive `#include` files resolved during preprocessing (`BLAKE3` content-keyed).
+    included_files: std.ArrayListUnmanaged(RecordedIncludeFile) = .empty,
     /// `true` if any `E0009` error was emitted during preprocessing or parsing.
     has_errors: bool = false,
 
@@ -744,6 +751,7 @@ pub const CTranslationUnit = struct {
         self.enum_variants.deinit(self.allocator);
         self.decls.deinit(self.allocator);
         self.macro_consts.deinit(self.allocator);
+        self.included_files.deinit(self.allocator);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -790,8 +798,7 @@ pub const CTranslationUnit = struct {
             .primitive => |prim| prim.byteSize(self.target),
             .pointer => self.target.ptrBytes(),
             .enum_ref => |ed_id| blk: {
-                const ed = self.getDecl(ed_id).kind.enum_decl;
-                if (ed.underlying_prim) |up| break :blk up.byteSize(self.target);
+                if (self.getDecl(ed_id).kind.enum_decl.underlying_prim) |up| break :blk up.byteSize(self.target);
                 break :blk 4;
             },
             .array => |arr| if (arr.len) |n| n *| self.computeTypeByteSize(arr.elem, depth + 1) else 0,
@@ -809,8 +816,7 @@ pub const CTranslationUnit = struct {
             .primitive => |prim| prim.alignBytes(self.target),
             .pointer => self.target.ptrBytes(),
             .enum_ref => |ed_id| blk: {
-                const ed = self.getDecl(ed_id).kind.enum_decl;
-                if (ed.underlying_prim) |up| break :blk up.alignBytes(self.target);
+                if (self.getDecl(ed_id).kind.enum_decl.underlying_prim) |up| break :blk up.alignBytes(self.target);
                 break :blk 4;
             },
             .array => |arr| self.computeTypeNaturalAlign(arr.elem, depth + 1),
@@ -936,8 +942,7 @@ pub const CTranslationUnit = struct {
                     if (is_aapcs64_linux) {
                         max_align = @max(max_align, pragma_only_al);
                     }
-                    const zero_align_bits: u64 = @as(u64, pragma_only_al) * 8;
-                    bit_cursor = std.mem.alignForward(u64, bit_cursor, @max(zero_align_bits, 8));
+                    bit_cursor = std.mem.alignForward(u64, bit_cursor, @max(@as(u64, pragma_only_al) * 8, 8));
                     continue;
                 }
                 if (field.name.len > 0 or is_aapcs64_linux) {
@@ -945,9 +950,7 @@ pub const CTranslationUnit = struct {
                 }
                 if (!is_fld_packed) {
                     const align_bits: u64 = @as(u64, eff_al) * 8;
-                    const unit_bits: u64 = unit_sz * 8;
-                    const base_bit = (bit_cursor / align_bits) * align_bits;
-                    if (bit_cursor - base_bit + bw > unit_bits) {
+                    if (bit_cursor - (bit_cursor / align_bits) * align_bits + bw > unit_sz * 8) {
                         bit_cursor = std.mem.alignForward(u64, bit_cursor, align_bits);
                     }
                 }
@@ -1136,6 +1139,4204 @@ const ParsedDeclarator = struct {
     contract: CFfiContract = .{},
 };
 
+/// Preprocessor `#` directive classification for $O(1)$ `CPP_DIRECTIVE_MAP` dispatch.
+const CppDirectiveKind = enum(u8) {
+    /// `#define` macro definition directive.
+    define_dir,
+    /// `#elif` conditional branch directive.
+    elif_dir,
+    /// C23 `#elifdef` conditional branch directive.
+    elifdef_dir,
+    /// C23 `#elifndef` conditional branch directive.
+    elifndef_dir,
+    /// `#else` fallback branch directive.
+    else_dir,
+    /// `#endif` conditional block terminator.
+    endif_dir,
+    /// `#error` fatal diagnostic directive.
+    error_dir,
+    /// `#if` constant-expression conditional directive.
+    if_dir,
+    /// `#ifdef` macro-existence conditional directive.
+    ifdef_dir,
+    /// `#ifndef` negated macro-existence conditional directive.
+    ifndef_dir,
+    /// `#include` header inclusion directive.
+    include_dir,
+    /// `#line` source-location directive.
+    line_dir,
+    /// `#pragma` compiler directive.
+    pragma_dir,
+    /// `#undef` macro removal directive.
+    undef_dir,
+    /// C23 `#warning` directive.
+    warning_dir,
+};
+
+/// Preprocessor `#if` query operator kind for $O(1)$ `CPP_IF_BUILTIN_MAP` dispatch.
+const CppIfBuiltinKind = enum(u8) {
+    /// `defined` / `defined(MACRO)` operator.
+    defined_op,
+    /// `__has_attribute(attr)` query.
+    has_attribute,
+    /// `__has_builtin(name)` query.
+    has_builtin,
+    /// C23 `__has_c_attribute(attr)` query.
+    has_c_attribute,
+    /// `__has_include(<hdr>)` / `__has_include("hdr")` query.
+    has_include,
+};
+
+/// Encoding prefix on a C character constant (`u'…'`, `U'…'`, `L'…'`, `u8'…'`).
+const CCharPrefixKind = enum(u8) {
+    /// Wide `wchar_t` character literal (`L'…'`).
+    char_wide,
+    /// UTF-32 `char32_t` character literal (`U'…'`).
+    char_u32,
+    /// UTF-16 `char16_t` character literal (`u'…'`).
+    char_u16,
+    /// C23 UTF-8 `char8_t` character literal (`u8'…'`).
+    char_u8,
+};
+
+/// C declaration-specifier keyword classification for $O(1)$ `C_DECL_SPEC_KEYWORD_MAP` dispatch.
+const CDeclSpecKeywordKind = enum(u8) {
+    /// `typedef` storage-class specifier.
+    kw_typedef,
+    /// `extern` storage-class specifier.
+    kw_extern,
+    /// `static` storage-class specifier.
+    kw_static,
+    /// `inline` / `__inline` / `__inline__` / `__forceinline` function specifier.
+    kw_inline,
+    /// `_Noreturn` function specifier.
+    kw_noreturn,
+    /// `auto` / `register` / `_Thread_local` / `__extension__` / calling-convention modifier.
+    kw_ignored_storage,
+    /// `const` / `__const` / `__const__` qualifier.
+    kw_const,
+    /// `volatile` / `__volatile` / `__volatile__` qualifier.
+    kw_volatile,
+    /// `restrict` / `__restrict` / `__restrict__` qualifier.
+    kw_restrict,
+    /// `_Atomic` specifier or qualifier.
+    kw_atomic,
+    /// `void` primitive specifier.
+    kw_void,
+    /// `_Bool` / `bool` primitive specifier.
+    kw_bool,
+    /// `char` primitive specifier.
+    kw_char,
+    /// `short` primitive specifier.
+    kw_short,
+    /// `int` primitive specifier.
+    kw_int,
+    /// `long` primitive specifier.
+    kw_long,
+    /// `__int128` primitive specifier.
+    kw_int128,
+    /// `float` primitive specifier.
+    kw_float,
+    /// `double` primitive specifier.
+    kw_double,
+    /// `signed` / `__signed` / `__signed__` signedness specifier.
+    kw_signed,
+    /// `unsigned` signedness specifier.
+    kw_unsigned,
+    /// `struct` record specifier.
+    kw_struct,
+    /// `union` record specifier.
+    kw_union,
+    /// `enum` specifier.
+    kw_enum,
+};
+
+/// Pointer and C99 array-declarator qualifier classification for $O(1)$ `C_PTR_OR_ARRAY_QUAL_MAP` lookup.
+const CPtrArrayQualKind = enum(u8) {
+    /// `const` / `__const` / `__const__` qualifier.
+    qual_const,
+    /// `volatile` / `__volatile` / `__volatile__` qualifier.
+    qual_volatile,
+    /// `restrict` / `__restrict` / `__restrict__` qualifier.
+    qual_restrict,
+    /// `static` C99 array-parameter minimum-bound qualifier.
+    qual_static_array,
+    /// `_Nonnull` / `__nonnull` pointer nullability qualifier.
+    qual_nonnull,
+    /// `_Nullable` / `__nullable` pointer nullability qualifier.
+    qual_nullable,
+    /// `_Atomic` / `_Null_unspecified` / `__ptr32` / `__ptr64` / `__unaligned` ignored pointer qualifier.
+    qual_ignored_ptr,
+};
+
+/// Attribute or SAL contract token kind for $O(1)$ `C_LEADING_ATTR_TOKEN_MAP` dispatch.
+const CLeadingAttrTokenKind = enum(u8) {
+    /// `__attribute__` / `__attribute` GNU attribute introducer.
+    gnu_attribute,
+    /// `_Alignas` / `alignas` alignment specifier.
+    alignas_spec,
+    /// `__declspec` MSVC declaration modifier.
+    msvc_declspec,
+    /// `_In_z_` non-null NUL-terminated input string contract.
+    sal_in_z,
+    /// `_In_opt_z_` nullable NUL-terminated input string contract.
+    sal_in_opt_z,
+    /// `_Out_` non-null output parameter contract.
+    sal_out,
+    /// `_Out_opt_` nullable output parameter contract.
+    sal_out_opt,
+    /// `_In_` / `_Inout_` / `_Ret_notnull_` / `_Nonnull` / `__nonnull` non-null contract.
+    sal_non_null,
+    /// `_In_opt_` / `_Inout_opt_` / `_Ret_maybenull_` / `_Nullable` / `__nullable` nullable contract.
+    sal_may_be_null,
+    /// `_In_reads_(n)` slice-length input contract.
+    sal_in_reads,
+    /// `_Out_writes_(n)` slice-length output contract.
+    sal_out_writes,
+    /// `_Null_unspecified` ignored nullability token.
+    null_unspecified,
+};
+
+/// MSVC `__declspec(…)` modifier kind for $O(1)$ `C_MSVC_DECLSPEC_MAP` dispatch.
+const CMsvcDeclspecKind = enum(u8) {
+    /// `__declspec(align(N))` alignment override.
+    ds_align,
+    /// `__declspec(dllexport)` PE export visibility.
+    ds_dllexport,
+    /// `__declspec(dllimport)` PE import visibility.
+    ds_dllimport,
+    /// `__declspec(noreturn)` non-returning function contract.
+    ds_noreturn,
+};
+
+/// Canonical GNU `__attribute__` and C23 `[[…]]` attribute kind after stripping `__` wrappers.
+const CGnuOrC23AttrKind = enum(u8) {
+    /// `aligned` / `aligned(N)` alignment override.
+    attr_aligned,
+    /// `counted_by(field_or_param)` slice-length contract.
+    attr_counted_by,
+    /// `gcc_struct` SysV bitfield layout override.
+    attr_gcc_struct,
+    /// `malloc` / `malloc(free_fn)` caller-owned allocation contract.
+    attr_malloc,
+    /// `ms_struct` MSVC bitfield layout override.
+    attr_ms_struct,
+    /// `nonnull` / `nonnull(1, 2)` parameter non-null contract.
+    attr_nonnull,
+    /// `noreturn` non-returning function contract.
+    attr_noreturn,
+    /// `packed` byte-packed layout modifier.
+    attr_packed,
+};
+
+/// Virtual or VFS header entry pairing original caller path with UTF-8 content.
+const MappedHeaderSource = struct {
+    /// Original un-normalized VFS/virtual header path key.
+    raw_path: []const u8,
+    /// UTF-8 header source contents.
+    content: []const u8,
+};
+
+/// Resolved `#include` payload returned by `CPreprocessor.resolveIncludeContent`.
+const ResolvedIncludeSource = struct {
+    /// Normalized include key used for `#pragma once` and relative directory resolution.
+    canonical_key: []const u8,
+    /// Exact VFS or filesystem path recorded in `CTranslationUnit.included_files`.
+    recorded_path: []const u8,
+    /// Arena-owned or bundled UTF-8 header source contents.
+    content: []const u8,
+    /// `true` when treated as a system header during declaration filtering.
+    is_system: bool,
+    /// `true` when resolved from immutable `BUNDLED_SYSTEM_HEADERS` (`false` for VFS / `host_fs`).
+    is_bundled: bool,
+};
+
+// -------------------- Preprocessor Engine ---------------------
+
+/// Stateful C11/C23 preprocessor with Blue-Paint macro recursion prevention and `#pragma once`.
+const CPreprocessor = struct {
+    /// Owning translation unit receiving expanded tokens and macro constants.
+    unit: *CTranslationUnit,
+    /// Diagnostic sink for `E0009` errors.
+    sink: *DiagnosticSink,
+    /// Frontend configuration and resource caps.
+    options: CFrontendOptions,
+    /// Active `#define` symbol table.
+    macros: std.StringHashMapUnmanaged(MacroEntry) = .empty,
+    /// Ordered names of user object-like `#define` macros candidate for `pub const` promotion.
+    user_object_macro_order: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// Canonical header paths marked with `#pragma once`.
+    pragma_once_headers: std.StringHashMapUnmanaged(void) = .empty,
+    /// Deduplication set of normalized non-bundled `#include` keys recorded in `unit.included_files`.
+    recorded_include_set: std.StringHashMapUnmanaged(void) = .empty,
+    /// Refcounted active macro names currently undergoing rescanning ($O(1)$ Blue-Paint guard).
+    active_macro_counts: std.StringHashMapUnmanaged(u32) = .empty,
+    /// `true` once `virtual_header_map` and `vfs_header_map` have been populated on first `#include`.
+    has_built_include_maps: bool = false,
+    /// Lazily built $O(1)$ normalized-path -> `MappedHeaderSource` map over `options.virtual_headers`.
+    virtual_header_map: std.StringHashMapUnmanaged(MappedHeaderSource) = .empty,
+    /// Lazily built $O(1)$ normalized-path -> `MappedHeaderSource` map over `options.include_loader.vfs`.
+    vfs_header_map: std.StringHashMapUnmanaged(MappedHeaderSource) = .empty,
+    /// Cumulative macro replacement steps executed across the unit.
+    expansion_steps: u32 = 0,
+    /// Current macro expansion / substitution call-stack depth (capped at `options.max_parse_depth`).
+    macro_recursion_depth: u32 = 0,
+    /// Cumulative expanded token count across all `substituteAndPasteMacroBody` and `expandTokenSequence` calls.
+    expanded_token_budget: usize = 0,
+    /// `true` once any preprocessor resource cap (`max_tokens`, `max_macro_steps`, `max_parse_depth`) has tripped.
+    has_hit_resource_cap: bool = false,
+    /// `true` while speculatively expanding candidate object-like `#define`s for `pub const` promotion.
+    is_probing_macro_const: bool = false,
+
+    /// Releases temporary hash maps and stacks owned by `self`.
+    fn deinit(self: *CPreprocessor) void {
+        self.macros.deinit(self.unit.allocator);
+        self.user_object_macro_order.deinit(self.unit.allocator);
+        self.pragma_once_headers.deinit(self.unit.allocator);
+        self.recorded_include_set.deinit(self.unit.allocator);
+        self.active_macro_counts.deinit(self.unit.allocator);
+        self.virtual_header_map.deinit(self.unit.allocator);
+        self.vfs_header_map.deinit(self.unit.allocator);
+    }
+
+    /// Defines a single predefined scalar/identifier macro into `self.macros`.
+    fn defineBuiltinText(self: *CPreprocessor, name: []const u8, val_text: []const u8) !void {
+        const name_owned = try self.unit.arena.dupe(u8, name);
+        var body_list: std.ArrayListUnmanaged(CToken) = .empty;
+        defer body_list.deinit(self.unit.allocator);
+        if (val_text.len > 0) {
+            try tokenizeCSBuffer(
+                self.unit,
+                self.sink,
+                val_text,
+                .none,
+                true,
+                self.options.max_tokens,
+                &body_list,
+            );
+        }
+        try self.macros.put(self.unit.allocator, name_owned, .{
+            .name = name_owned,
+            .body = try self.unit.arena.dupe(CToken, body_list.items),
+            .is_from_system_header = true,
+        });
+    }
+
+    /// Populates target-calibrated C11/C23 predefined macros and user `-D` defines.
+    fn populatePredefinedMacros(self: *CPreprocessor) CFrontendError!void {
+        const target = self.options.target;
+        try self.defineBuiltinText("__STDC__", "1");
+        try self.defineBuiltinText("__STDC_VERSION__", "201710L");
+        try self.defineBuiltinText("__STDC_HOSTED__", if (target.isFreestanding()) "0" else "1");
+        try self.defineBuiltinText("__ORDER_LITTLE_ENDIAN__", "1234");
+        try self.defineBuiltinText("__ORDER_BIG_ENDIAN__", "4321");
+        try self.defineBuiltinText("__BYTE_ORDER__", "__ORDER_LITTLE_ENDIAN__");
+        try self.defineBuiltinText("__SIZEOF_SHORT__", "2");
+        try self.defineBuiltinText("__SIZEOF_INT__", "4");
+        try self.defineBuiltinText("__SIZEOF_LONG_LONG__", "8");
+
+        const ptr_str = if (target.ptrBytes() == 4) "4" else "8";
+        const long_str = if (target.cLongByteSize() == 4) "4" else "8";
+        try self.defineBuiltinText("__SIZEOF_POINTER__", ptr_str);
+        try self.defineBuiltinText("__SIZEOF_SIZE_T__", ptr_str);
+        try self.defineBuiltinText("__SIZEOF_LONG__", long_str);
+
+        if (target.cLongByteSize() == 8) {
+            try self.defineBuiltinText("__LP64__", "1");
+            try self.defineBuiltinText("_LP64", "1");
+        }
+        if (!target.isCCharSigned()) {
+            try self.defineBuiltinText("__CHAR_UNSIGNED__", "1");
+        }
+
+        switch (target.arch) {
+            .x86_64 => {
+                try self.defineBuiltinText("__x86_64__", "1");
+                try self.defineBuiltinText("__x86_64", "1");
+                try self.defineBuiltinText("__amd64__", "1");
+                if (target.os == .windows) {
+                    try self.defineBuiltinText("_M_X64", "100");
+                    try self.defineBuiltinText("_M_AMD64", "100");
+                }
+            },
+            .aarch64 => {
+                try self.defineBuiltinText("__aarch64__", "1");
+                if (target.os == .windows) {
+                    try self.defineBuiltinText("_M_ARM64", "1");
+                }
+            },
+            .wasm32 => {
+                try self.defineBuiltinText("__wasm32__", "1");
+                try self.defineBuiltinText("__wasm__", "1");
+            },
+        }
+
+        switch (target.os) {
+            .linux => {
+                try self.defineBuiltinText("__linux__", "1");
+                try self.defineBuiltinText("__linux", "1");
+                try self.defineBuiltinText("__unix__", "1");
+            },
+            .macos => {
+                try self.defineBuiltinText("__APPLE__", "1");
+                try self.defineBuiltinText("__MACH__", "1");
+            },
+            .windows => {
+                try self.defineBuiltinText("_WIN32", "1");
+                try self.defineBuiltinText("_WIN64", "1");
+                if (target.abi == .msvc) {
+                    try self.defineBuiltinText("_MSC_VER", "1930");
+                } else {
+                    try self.defineBuiltinText("__MINGW32__", "1");
+                    try self.defineBuiltinText("__MINGW64__", "1");
+                    try self.defineBuiltinText("__GNUC__", "14");
+                }
+            },
+            .wasi => {
+                try self.defineBuiltinText("__wasi__", "1");
+            },
+            .freestanding => {},
+        }
+
+        // Apply user `-DNAME` / `-DNAME=VAL` defines:
+        for (self.options.defines) |user_def| {
+            if (user_def.name.len == 0) continue;
+            const val_str = user_def.value orelse "1";
+            const name_owned = try self.unit.arena.dupe(u8, user_def.name);
+            var def_toks: std.ArrayListUnmanaged(CToken) = .empty;
+            defer def_toks.deinit(self.unit.allocator);
+            if (val_str.len > 0) {
+                try tokenizeCSBuffer(
+                    self.unit,
+                    self.sink,
+                    val_str,
+                    .none,
+                    false,
+                    self.options.max_tokens,
+                    &def_toks,
+                );
+            }
+            try self.macros.put(self.unit.allocator, name_owned, .{
+                .name = name_owned,
+                .body = try self.unit.arena.dupe(CToken, def_toks.items),
+                .is_from_system_header = false,
+            });
+            try self.user_object_macro_order.append(self.unit.allocator, name_owned);
+        }
+    }
+
+    /// Marks `macro_name` as active in the $O(1)$ Blue-Paint recursion table.
+    fn pushActiveMacro(self: *CPreprocessor, macro_name: []const u8) !void {
+        const gop = try self.active_macro_counts.getOrPut(self.unit.allocator, macro_name);
+        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
+    }
+
+    /// Decrements `macro_name` in the $O(1)$ Blue-Paint recursion table, removing it at `0`.
+    fn popActiveMacro(self: *CPreprocessor, macro_name: []const u8) void {
+        if (self.active_macro_counts.getPtr(macro_name)) |count_ptr| {
+            if (count_ptr.* <= 1) {
+                _ = self.active_macro_counts.remove(macro_name);
+            } else {
+                count_ptr.* -= 1;
+            }
+        }
+    }
+
+    /// Returns `true` in $O(1)$ if `macro_name` is currently on the active Blue-Paint expansion set.
+    inline fn isMacroBluePainted(self: *const CPreprocessor, macro_name: []const u8) bool {
+        return self.active_macro_counts.contains(macro_name);
+    }
+
+    /// Lazily populates $O(1)$ lookup maps for `options.virtual_headers` and `VfsSourceMap` entries.
+    fn ensureIncludeMapsBuilt(self: *CPreprocessor) !void {
+        if (self.has_built_include_maps) return;
+        self.has_built_include_maps = true;
+        for (self.options.virtual_headers) |vh| {
+            const gop = try self.virtual_header_map.getOrPut(
+                self.unit.allocator,
+                try normalizeIncludePath(&self.unit.arena, vh.path),
+            );
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{
+                    .raw_path = try self.unit.arena.dupe(u8, vh.path),
+                    .content = vh.content,
+                };
+            }
+        }
+        if (self.options.include_loader == .vfs) {
+            const vfs_map = self.options.include_loader.vfs;
+            for (vfs_map.entries.items) |entry| {
+                const raw_vpath = vfs_map.interner.get(entry.virtual_path);
+                const gop = try self.vfs_header_map.getOrPut(
+                    self.unit.allocator,
+                    try normalizeIncludePath(&self.unit.arena, raw_vpath),
+                );
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = .{
+                        .raw_path = try self.unit.arena.dupe(u8, raw_vpath),
+                        .content = entry.content,
+                    };
+                }
+            }
+        }
+    }
+
+    /// Appends `resolved` into `unit.included_files` once when `!resolved.is_bundled`.
+    fn recordResolvedIncludeIfNeeded(self: *CPreprocessor, resolved: ResolvedIncludeSource) !void {
+        if (resolved.is_bundled) return;
+        const gop = try self.recorded_include_set.getOrPut(self.unit.allocator, resolved.canonical_key);
+        if (gop.found_existing) return;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(resolved.content, &digest, .{});
+        try self.unit.included_files.append(self.unit.allocator, .{
+            .path = resolved.recorded_path,
+            .content = resolved.content,
+            .content_blake3 = digest,
+        });
+    }
+
+    /// Resolves `#include` content without mutating state.
+    fn resolveIncludeContent(
+        self: *CPreprocessor,
+        include_name: []const u8,
+        is_angled: bool,
+        includer_path: []const u8,
+    ) !?ResolvedIncludeSource {
+        try self.ensureIncludeMapsBuilt();
+        const norm_req = try normalizeIncludePath(&self.unit.arena, include_name);
+
+        // [1] For `"…"` includes, search relative to the current includer's directory first:
+        if (!is_angled) {
+            const parent_dir = if (std.mem.lastIndexOfScalar(u8, includer_path, '/')) |slash_idx|
+                includer_path[0..slash_idx]
+            else
+                "";
+            const rel_candidate = if (parent_dir.len > 0) blk: {
+                const joined = try std.fmt.allocPrint(
+                    self.unit.arena.asAllocator(),
+                    "{s}/{s}",
+                    .{ parent_dir, norm_req },
+                );
+                break :blk try normalizeIncludePath(&self.unit.arena, joined);
+            } else norm_req;
+
+            if (try self.tryLoadSingleCandidate(rel_candidate)) |found| {
+                return .{
+                    .canonical_key = rel_candidate,
+                    .recorded_path = found.raw_path,
+                    .content = found.content,
+                    .is_system = false,
+                    .is_bundled = false,
+                };
+            }
+        }
+
+        // [2] Search explicit `virtual_headers` directly by normalized name in $O(1)$:
+        if (self.virtual_header_map.getEntry(norm_req)) |vh_entry| {
+            return .{
+                .canonical_key = vh_entry.key_ptr.*,
+                .recorded_path = vh_entry.value_ptr.raw_path,
+                .content = try self.unit.arena.dupe(u8, vh_entry.value_ptr.content),
+                .is_system = false,
+                .is_bundled = false,
+            };
+        }
+
+        // [3] Search `-Idir` `include_dirs`:
+        for (self.options.include_dirs) |inc_dir| {
+            const joined = try std.fmt.allocPrint(
+                self.unit.arena.asAllocator(),
+                "{s}/{s}",
+                .{ inc_dir, norm_req },
+            );
+            const norm_joined = try normalizeIncludePath(&self.unit.arena, joined);
+            if (try self.tryLoadSingleCandidate(norm_joined)) |found| {
+                return .{
+                    .canonical_key = norm_joined,
+                    .recorded_path = found.raw_path,
+                    .content = found.content,
+                    .is_system = is_angled,
+                    .is_bundled = false,
+                };
+            }
+        }
+
+        // [4] Check bundled virtual standard C headers (`<stdint.h>`, `<stddef.h>`, etc.):
+        if (BUNDLED_SYSTEM_HEADERS.get(norm_req)) |bundled_src| {
+            const sys_key = try std.fmt.allocPrint(
+                self.unit.arena.asAllocator(),
+                "<builtin:{s}>",
+                .{norm_req},
+            );
+            return .{
+                .canonical_key = sys_key,
+                .recorded_path = sys_key,
+                .content = bundled_src,
+                .is_system = true,
+                .is_bundled = true,
+            };
+        }
+
+        return null;
+    }
+
+    /// Probes `virtual_headers`, `VfsSourceMap`, or `std.Io` host disk for `candidate_path` in $O(1)$.
+    fn tryLoadSingleCandidate(self: *CPreprocessor, candidate_path: []const u8) !?MappedHeaderSource {
+        try self.ensureIncludeMapsBuilt();
+        if (self.virtual_header_map.get(candidate_path)) |vh_source| {
+            return .{
+                .raw_path = vh_source.raw_path,
+                .content = try self.unit.arena.dupe(u8, vh_source.content),
+            };
+        }
+        switch (self.options.include_loader) {
+            .none => return null,
+            .vfs => {
+                if (self.vfs_header_map.get(candidate_path)) |vfs_source| {
+                    return .{
+                        .raw_path = vfs_source.raw_path,
+                        .content = try self.unit.arena.dupe(u8, vfs_source.content),
+                    };
+                }
+                return null;
+            },
+            .host_fs => |io| {
+                const raw_bytes = std.Io.Dir.cwd().readFileAlloc(
+                    io,
+                    candidate_path,
+                    self.unit.allocator,
+                    .limited(16 * 1024 * 1024),
+                ) catch return null;
+                defer self.unit.allocator.free(raw_bytes);
+                return .{
+                    .raw_path = try self.unit.arena.dupe(u8, candidate_path),
+                    .content = try self.unit.arena.dupe(u8, raw_bytes),
+                };
+            },
+        }
+    }
+
+    /// Preprocesses `source` at `include_depth`, appending surviving tokens to `out_tokens`.
+    fn preprocessBuffer(
+        self: *CPreprocessor,
+        source: []const u8,
+        current_path: []const u8,
+        file_id: FileId,
+        is_system_header: bool,
+        include_depth: u32,
+        out_tokens: *std.ArrayListUnmanaged(CToken),
+    ) CFrontendError!void {
+        if (include_depth > self.options.max_include_depth) {
+            try emitCTranslationError(
+                self.unit,
+                self.sink,
+                Span.init(file_id, 0, 0),
+                "`#include` nesting depth exceeded `MAX_INCLUDE_DEPTH` cap",
+            );
+            return error.TranslationFailed;
+        }
+
+        const spliced = try splicePhysicalLines(&self.unit.arena, source);
+        var raw_tokens: std.ArrayListUnmanaged(CToken) = .empty;
+        defer raw_tokens.deinit(self.unit.allocator);
+        try tokenizeCSBuffer(
+            self.unit,
+            self.sink,
+            spliced,
+            file_id,
+            is_system_header,
+            self.options.max_tokens,
+            &raw_tokens,
+        );
+
+        var cond_stack: std.ArrayListUnmanaged(CondFrame) = .empty;
+        defer cond_stack.deinit(self.unit.allocator);
+
+        var idx: usize = 0;
+        const items = raw_tokens.items;
+        while (idx < items.len) {
+            const tok = items[idx];
+            const is_active = cond_stack.items.len == 0 or
+                cond_stack.items[cond_stack.items.len - 1].is_branch_active;
+
+            if (tok.is_at_line_start and tok.kind == .hash) {
+                const hash_span = tok.span;
+                idx += 1;
+                // Collect tokens up to end-of-line:
+                const dir_start = idx;
+                while (idx < items.len and !items[idx].is_at_line_start) : (idx += 1) {}
+                const dir_tokens = items[dir_start..idx];
+                if (dir_tokens.len == 0) continue; // Null `#` directive.
+
+                const dir_kind = CPP_DIRECTIVE_MAP.get(dir_tokens[0].lexeme) orelse continue;
+                const args = dir_tokens[1..];
+
+                switch (dir_kind) {
+                    .ifdef_dir, .ifndef_dir => {
+                        if (!is_active) {
+                            try cond_stack.append(self.unit.allocator, .{
+                                .is_parent_active = false,
+                                .is_branch_active = false,
+                                .has_taken_branch = true,
+                                .open_span = hash_span,
+                            });
+                        } else {
+                            if (args.len == 0 or args[0].kind != .ident) {
+                                try emitCTranslationError(
+                                    self.unit,
+                                    self.sink,
+                                    hash_span,
+                                    "expected macro identifier after `#ifdef` / `#ifndef`",
+                                );
+                                return error.TranslationFailed;
+                            }
+                            const is_defined = self.macros.contains(args[0].lexeme);
+                            const is_taken = if (dir_kind == .ifndef_dir) !is_defined else is_defined;
+                            try cond_stack.append(self.unit.allocator, .{
+                                .is_parent_active = true,
+                                .is_branch_active = is_taken,
+                                .has_taken_branch = is_taken,
+                                .open_span = hash_span,
+                            });
+                        }
+                        continue;
+                    },
+                    .if_dir => {
+                        if (!is_active) {
+                            try cond_stack.append(self.unit.allocator, .{
+                                .is_parent_active = false,
+                                .is_branch_active = false,
+                                .has_taken_branch = true,
+                                .open_span = hash_span,
+                            });
+                        } else {
+                            const is_cond_true = try self.evaluateIfCondition(args, current_path, hash_span);
+                            try cond_stack.append(self.unit.allocator, .{
+                                .is_parent_active = true,
+                                .is_branch_active = is_cond_true,
+                                .has_taken_branch = is_cond_true,
+                                .open_span = hash_span,
+                            });
+                        }
+                        continue;
+                    },
+                    .elif_dir, .elifdef_dir, .elifndef_dir => {
+                        if (cond_stack.items.len == 0 or
+                            cond_stack.items[cond_stack.items.len - 1].has_seen_else)
+                        {
+                            try emitCTranslationError(
+                                self.unit,
+                                self.sink,
+                                hash_span,
+                                "unmatched or out-of-order `#elif` / `#elifdef` / `#elifndef` directive",
+                            );
+                            return error.TranslationFailed;
+                        }
+                        const top = &cond_stack.items[cond_stack.items.len - 1];
+                        if (!top.is_parent_active or top.has_taken_branch) {
+                            top.is_branch_active = false;
+                        } else {
+                            const is_elif_taken: bool = if (dir_kind == .elif_dir)
+                                try self.evaluateIfCondition(args, current_path, hash_span)
+                            else blk: {
+                                if (args.len == 0 or args[0].kind != .ident) {
+                                    try emitCTranslationError(
+                                        self.unit,
+                                        self.sink,
+                                        hash_span,
+                                        "expected macro identifier after `#elifdef` / `#elifndef`",
+                                    );
+                                    return error.TranslationFailed;
+                                }
+                                const has_macro = self.macros.contains(args[0].lexeme);
+                                break :blk if (dir_kind == .elifndef_dir) !has_macro else has_macro;
+                            };
+                            top.is_branch_active = is_elif_taken;
+                            if (is_elif_taken) top.has_taken_branch = true;
+                        }
+                        continue;
+                    },
+                    .else_dir => {
+                        if (cond_stack.items.len == 0 or
+                            cond_stack.items[cond_stack.items.len - 1].has_seen_else)
+                        {
+                            try emitCTranslationError(
+                                self.unit,
+                                self.sink,
+                                hash_span,
+                                "unmatched or duplicate `#else` directive",
+                            );
+                            return error.TranslationFailed;
+                        }
+                        const top = &cond_stack.items[cond_stack.items.len - 1];
+                        top.has_seen_else = true;
+                        top.is_branch_active = top.is_parent_active and !top.has_taken_branch;
+                        if (top.is_branch_active) top.has_taken_branch = true;
+                        continue;
+                    },
+                    .endif_dir => {
+                        if (cond_stack.items.len == 0) {
+                            try emitCTranslationError(
+                                self.unit,
+                                self.sink,
+                                hash_span,
+                                "unmatched `#endif` directive in C header",
+                            );
+                            return error.TranslationFailed;
+                        }
+                        _ = cond_stack.pop();
+                        continue;
+                    },
+                    else => {},
+                }
+
+                // Skip all non-conditional directives inside inactive `#if` branches:
+                if (!is_active) continue;
+
+                switch (dir_kind) {
+                    .define_dir => try self.handleDefineDirective(args, hash_span, is_system_header),
+                    .undef_dir => {
+                        if (args.len > 0 and args[0].kind == .ident) {
+                            _ = self.macros.remove(args[0].lexeme);
+                        }
+                    },
+                    .error_dir => {
+                        var err_msg_buf: std.ArrayListUnmanaged(u8) = .empty;
+                        defer err_msg_buf.deinit(self.unit.allocator);
+                        try err_msg_buf.appendSlice(self.unit.allocator, "`#error` in C header: ");
+                        for (args, 0..) |arg_tok, arg_i| {
+                            if (arg_i > 0 and arg_tok.has_leading_space) {
+                                try err_msg_buf.append(self.unit.allocator, ' ');
+                            }
+                            try err_msg_buf.appendSlice(self.unit.allocator, arg_tok.lexeme);
+                        }
+                        try emitCTranslationError(self.unit, self.sink, hash_span, err_msg_buf.items);
+                        return error.TranslationFailed;
+                    },
+                    .include_dir => try self.handleIncludeDirective(
+                        spliced,
+                        args,
+                        current_path,
+                        hash_span,
+                        include_depth,
+                        out_tokens,
+                    ),
+                    .pragma_dir => try self.handlePragmaDirective(args, current_path, hash_span, out_tokens),
+                    .line_dir, .warning_dir => {},
+                    else => unreachable,
+                }
+                continue;
+            }
+
+            if (!is_active) {
+                idx += 1;
+                continue;
+            }
+
+            // Collect active non-directive tokens up to next directive line and expand macros:
+            const seg_start = idx;
+            while (idx < items.len and !(items[idx].is_at_line_start and items[idx].kind == .hash)) : (idx += 1) {}
+            try self.expandTokenSequence(items[seg_start..idx], out_tokens);
+        }
+
+        if (cond_stack.items.len > 0) {
+            try emitCTranslationError(
+                self.unit,
+                self.sink,
+                cond_stack.items[cond_stack.items.len - 1].open_span,
+                "unterminated `#if` / `#ifdef` conditional block in C header",
+            );
+            return error.TranslationFailed;
+        }
+    }
+
+    /// Parses `#define NAME(…) body` and registers it in `self.macros`.
+    fn handleDefineDirective(
+        self: *CPreprocessor,
+        args: []const CToken,
+        span: Span,
+        is_system_header: bool,
+    ) CFrontendError!void {
+        if (args.len == 0 or args[0].kind != .ident) {
+            try emitCTranslationError(self.unit, self.sink, span, "expected macro name after `#define`");
+            return error.TranslationFailed;
+        }
+        const macro_name = args[0].lexeme;
+        var body_start: usize = 1;
+        var is_fn_like = false;
+        var is_variadic = false;
+        var param_names: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer param_names.deinit(self.unit.allocator);
+
+        // Function-like iff `(` has NO leading space after `macro_name` (C11 §6.10.3):
+        if (args.len >= 2 and args[1].kind == .lparen and !args[1].has_leading_space) {
+            is_fn_like = true;
+            var p_idx: usize = 2;
+            while (p_idx < args.len and args[p_idx].kind != .rparen) {
+                if (args[p_idx].kind == .ellipses) {
+                    is_variadic = true;
+                    p_idx += 1;
+                    break;
+                }
+                if (args[p_idx].kind == .ident) {
+                    // GNU `args...` named variadic parameter syntax:
+                    if (p_idx + 1 < args.len and args[p_idx + 1].kind == .ellipses) {
+                        is_variadic = true;
+                        try param_names.append(self.unit.allocator, "__VA_ARGS__");
+                        p_idx += 2;
+                        break;
+                    }
+                    try param_names.append(self.unit.allocator, args[p_idx].lexeme);
+                    p_idx += 1;
+                } else {
+                    try emitCTranslationError(
+                        self.unit,
+                        self.sink,
+                        args[p_idx].span,
+                        "invalid parameter token in `#define` macro signature",
+                    );
+                    return error.TranslationFailed;
+                }
+                if (p_idx < args.len and args[p_idx].kind == .comma) {
+                    p_idx += 1;
+                } else {
+                    break;
+                }
+            }
+            if (p_idx >= args.len or args[p_idx].kind != .rparen) {
+                try emitCTranslationError(self.unit, self.sink, span, "unclosed `(` in `#define` macro");
+                return error.TranslationFailed;
+            }
+            body_start = p_idx + 1;
+        }
+
+        const owned_params = try self.unit.arena.dupe([]const u8, param_names.items);
+        const owned_body = try self.unit.arena.dupe(CToken, args[body_start..]);
+        try self.macros.put(self.unit.allocator, macro_name, .{
+            .name = macro_name,
+            .is_function_like = is_fn_like,
+            .is_variadic = is_variadic,
+            .params = owned_params,
+            .body = owned_body,
+            .span = span,
+            .is_from_system_header = is_system_header,
+        });
+        if (!is_fn_like and !is_system_header) {
+            try self.user_object_macro_order.append(self.unit.allocator, macro_name);
+        }
+    }
+
+    /// Extracts `<header.h>` or `"header.h"` and preprocesses the included file unless guarded by `#pragma once`.
+    fn handleIncludeDirective(
+        self: *CPreprocessor,
+        raw_spliced_src: []const u8,
+        args: []const CToken,
+        current_path: []const u8,
+        span: Span,
+        include_depth: u32,
+        out_tokens: *std.ArrayListUnmanaged(CToken),
+    ) CFrontendError!void {
+        if (args.len == 0) {
+            try emitCTranslationError(self.unit, self.sink, span, "missing header path after `#include`");
+            return error.TranslationFailed;
+        }
+
+        var include_path: []const u8 = "";
+        var is_angled = false;
+
+        if (args[0].kind == .string_lit) {
+            include_path = try decodeCStringLiteral(&self.unit.arena, args[0].lexeme);
+            is_angled = false;
+        } else if (args[0].kind == .lt) {
+            // Reconstruct exact raw slice between `<` and `>` on the `#include` line:
+            var close_idx: ?usize = null;
+            for (args, 0..) |tok, i| {
+                if (i > 0 and tok.kind == .gt) {
+                    close_idx = i;
+                    break;
+                }
+            }
+            if (close_idx) |gt_i| {
+                const start_b = args[0].span.end_byte;
+                const end_b = args[gt_i].span.start_byte;
+                if (start_b <= end_b and end_b <= raw_spliced_src.len) {
+                    include_path = std.mem.trim(u8, raw_spliced_src[start_b..end_b], " \t");
+                }
+                is_angled = true;
+            } else {
+                try emitCTranslationError(self.unit, self.sink, span, "unclosed `<` in `#include <…>`");
+                return error.TranslationFailed;
+            }
+        } else {
+            // Computed `#include MACRO_HEADER`:
+            var expanded_inc: std.ArrayListUnmanaged(CToken) = .empty;
+            defer expanded_inc.deinit(self.unit.allocator);
+            try self.expandTokenSequence(args, &expanded_inc);
+            if (expanded_inc.items.len == 1 and expanded_inc.items[0].kind == .string_lit) {
+                include_path = try decodeCStringLiteral(&self.unit.arena, expanded_inc.items[0].lexeme);
+                is_angled = false;
+            } else if (expanded_inc.items.len >= 3 and
+                expanded_inc.items[0].kind == .lt and
+                expanded_inc.items[expanded_inc.items.len - 1].kind == .gt)
+            {
+                var joined: std.ArrayListUnmanaged(u8) = .empty;
+                defer joined.deinit(self.unit.allocator);
+                for (expanded_inc.items[1 .. expanded_inc.items.len - 1]) |piece| {
+                    try joined.appendSlice(self.unit.allocator, piece.lexeme);
+                }
+                include_path = try self.unit.arena.dupe(u8, joined.items);
+                is_angled = true;
+            } else {
+                try emitCTranslationError(self.unit, self.sink, span, "invalid computed `#include` target");
+                return error.TranslationFailed;
+            }
+        }
+
+        const resolved = (try self.resolveIncludeContent(include_path, is_angled, current_path)) orelse {
+            const err_msg = try std.fmt.allocPrint(
+                self.unit.arena.asAllocator(),
+                "cannot find included C header `{s}`",
+                .{include_path},
+            );
+            try emitCTranslationError(self.unit, self.sink, span, err_msg);
+            return error.TranslationFailed;
+        };
+
+        try self.recordResolvedIncludeIfNeeded(resolved);
+        if (self.pragma_once_headers.contains(resolved.canonical_key)) return;
+
+        try self.preprocessBuffer(
+            resolved.content,
+            resolved.canonical_key,
+            .none,
+            resolved.is_system,
+            include_depth + 1,
+            out_tokens,
+        );
+    }
+
+    /// Handles `#pragma once` and `#pragma pack(…)` directives.
+    fn handlePragmaDirective(
+        self: *CPreprocessor,
+        args: []const CToken,
+        current_path: []const u8,
+        span: Span,
+        out_tokens: *std.ArrayListUnmanaged(CToken),
+    ) CFrontendError!void {
+        if (args.len == 0 or args[0].kind != .ident) return;
+        if (std.mem.eql(u8, args[0].lexeme, "once")) {
+            try self.pragma_once_headers.put(
+                self.unit.allocator,
+                try self.unit.arena.dupe(u8, current_path),
+                {},
+            );
+            return;
+        }
+        if (!std.mem.eql(u8, args[0].lexeme, "pack")) return;
+        if (args.len < 2 or args[1].kind != .lparen) return;
+
+        // Parse `#pragma pack()`, `pack(N)`, `pack(push)`, `pack(push, N)`, `pack(pop)`:
+        var pack_op: PragmaPackOp = .reset_pack;
+        var pack_align: u8 = 0;
+        if (args.len >= 3 and args[2].kind == .rparen) {
+            pack_op = .reset_pack;
+        } else if (args.len >= 3 and args[2].kind == .number) {
+            if (parseCIntegerLiteral(args[2].lexeme)) |iv| {
+                if (iv.bits >= 1 and iv.bits <= 16 and std.math.isPowerOfTwo(iv.bits)) {
+                    pack_op = .set_pack;
+                    pack_align = @intCast(iv.bits);
+                }
+            }
+        } else if (args.len >= 3 and args[2].kind == .ident) {
+            if (std.mem.eql(u8, args[2].lexeme, "pop")) {
+                pack_op = .pop_pack;
+            } else if (std.mem.eql(u8, args[2].lexeme, "push")) {
+                pack_op = .push_only;
+                for (args[3..]) |sub_tok| {
+                    if (sub_tok.kind == .number) {
+                        if (parseCIntegerLiteral(sub_tok.lexeme)) |iv| {
+                            if (iv.bits >= 1 and iv.bits <= 16 and std.math.isPowerOfTwo(iv.bits)) {
+                                pack_op = .push_pack;
+                                pack_align = @intCast(iv.bits);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        try out_tokens.append(self.unit.allocator, .{
+            .kind = .pragma_pack,
+            .lexeme = "",
+            .span = span,
+            .pack_op = pack_op,
+            .pack_align = pack_align,
+        });
+    }
+
+    /// Evaluates `#if` / `#elif` integer constant expressions (`defined`, `__has_include`, `__has_attribute`).
+    fn evaluateIfCondition(
+        self: *CPreprocessor,
+        raw_expr_tokens: []const CToken,
+        current_path: []const u8,
+        span: Span,
+    ) CFrontendError!bool {
+        // [1] Resolve `defined`, `__has_include`, `__has_builtin`, and `__has_attribute` before general expansion:
+        var pre_expanded: std.ArrayListUnmanaged(CToken) = .empty;
+        defer pre_expanded.deinit(self.unit.allocator);
+
+        var i: usize = 0;
+        while (i < raw_expr_tokens.len) {
+            const tok = raw_expr_tokens[i];
+            if (tok.kind == .ident) {
+                if (CPP_IF_BUILTIN_MAP.get(tok.lexeme)) |builtin_op| {
+                    switch (builtin_op) {
+                        .defined_op => {
+                            var target_name: []const u8 = "";
+                            if (i + 1 < raw_expr_tokens.len and raw_expr_tokens[i + 1].kind == .ident) {
+                                target_name = raw_expr_tokens[i + 1].lexeme;
+                                i += 2;
+                            } else if (i + 3 < raw_expr_tokens.len and
+                                raw_expr_tokens[i + 1].kind == .lparen and
+                                raw_expr_tokens[i + 2].kind == .ident and
+                                raw_expr_tokens[i + 3].kind == .rparen)
+                            {
+                                target_name = raw_expr_tokens[i + 2].lexeme;
+                                i += 4;
+                            } else {
+                                try emitCTranslationError(
+                                    self.unit,
+                                    self.sink,
+                                    tok.span,
+                                    "malformed `defined` in `#if`",
+                                );
+                                return error.TranslationFailed;
+                            }
+                            try pre_expanded.append(self.unit.allocator, .{
+                                .kind = .number,
+                                .lexeme = if (self.macros.contains(target_name)) "1" else "0",
+                                .span = tok.span,
+                            });
+                            continue;
+                        },
+                        .has_include => {
+                            var has_inc = false;
+                            if (i + 1 < raw_expr_tokens.len and raw_expr_tokens[i + 1].kind == .lparen) {
+                                var close_p = i + 2;
+                                while (close_p < raw_expr_tokens.len and raw_expr_tokens[close_p].kind != .rparen) : (close_p += 1) {}
+                                const inner = raw_expr_tokens[i + 2 .. close_p];
+                                if (inner.len == 1 and inner[0].kind == .string_lit) {
+                                    if (try self.resolveIncludeContent(
+                                        try decodeCStringLiteral(&self.unit.arena, inner[0].lexeme),
+                                        false,
+                                        current_path,
+                                    )) |resolved_inc| {
+                                        try self.recordResolvedIncludeIfNeeded(resolved_inc);
+                                        has_inc = true;
+                                    }
+                                } else if (inner.len >= 3 and
+                                    inner[0].kind == .lt and
+                                    inner[inner.len - 1].kind == .gt)
+                                {
+                                    var path_buf: std.ArrayListUnmanaged(u8) = .empty;
+                                    defer path_buf.deinit(self.unit.allocator);
+                                    for (inner[1 .. inner.len - 1]) |pt| {
+                                        try path_buf.appendSlice(self.unit.allocator, pt.lexeme);
+                                    }
+                                    if (try self.resolveIncludeContent(
+                                        path_buf.items,
+                                        true,
+                                        current_path,
+                                    )) |resolved_inc| {
+                                        try self.recordResolvedIncludeIfNeeded(resolved_inc);
+                                        has_inc = true;
+                                    }
+                                }
+                                i = @min(close_p + 1, raw_expr_tokens.len);
+                            } else {
+                                i += 1;
+                            }
+                            try pre_expanded.append(self.unit.allocator, .{
+                                .kind = .number,
+                                .lexeme = if (has_inc) "1" else "0",
+                                .span = tok.span,
+                            });
+                            continue;
+                        },
+                        .has_attribute, .has_c_attribute, .has_builtin => {
+                            var is_supported = false;
+                            if (i + 1 < raw_expr_tokens.len and raw_expr_tokens[i + 1].kind == .lparen) {
+                                var close_p = i + 2;
+                                while (close_p < raw_expr_tokens.len and raw_expr_tokens[close_p].kind != .rparen) : (close_p += 1) {}
+                                const inner = raw_expr_tokens[i + 2 .. close_p];
+                                if (builtin_op != .has_builtin and inner.len > 0) {
+                                    is_supported = SUPPORTED_C_ATTR_SET.has(inner[inner.len - 1].lexeme);
+                                }
+                                i = @min(close_p + 1, raw_expr_tokens.len);
+                            } else {
+                                i += 1;
+                            }
+                            try pre_expanded.append(self.unit.allocator, .{
+                                .kind = .number,
+                                .lexeme = if (is_supported) "1" else "0",
+                                .span = tok.span,
+                            });
+                            continue;
+                        },
+                    }
+                }
+            }
+            try pre_expanded.append(self.unit.allocator, tok);
+            i += 1;
+        }
+
+        // [2] Expand macros across `pre_expanded` (re-handling any `defined` produced by macros):
+        var expanded: std.ArrayListUnmanaged(CToken) = .empty;
+        defer expanded.deinit(self.unit.allocator);
+        try self.expandTokenSequence(pre_expanded.items, &expanded);
+
+        // [3] C11 §6.10.1p4; replace `true` -> `1` and all remaining undefined identifiers -> `0`:
+        var final_toks: std.ArrayListUnmanaged(CToken) = .empty;
+        defer final_toks.deinit(self.unit.allocator);
+        var f_idx: usize = 0;
+        while (f_idx < expanded.items.len) : (f_idx += 1) {
+            const ft = expanded.items[f_idx];
+            if (ft.kind == .ident) {
+                if (std.mem.eql(u8, ft.lexeme, "defined")) {
+                    if (f_idx + 1 < expanded.items.len and expanded.items[f_idx + 1].kind == .ident) {
+                        try final_toks.append(self.unit.allocator, .{
+                            .kind = .number,
+                            .lexeme = if (self.macros.contains(expanded.items[f_idx + 1].lexeme)) "1" else "0",
+                            .span = ft.span,
+                        });
+                        f_idx += 1;
+                        continue;
+                    } else if (f_idx + 3 < expanded.items.len and
+                        expanded.items[f_idx + 1].kind == .lparen and
+                        expanded.items[f_idx + 2].kind == .ident and
+                        expanded.items[f_idx + 3].kind == .rparen)
+                    {
+                        try final_toks.append(self.unit.allocator, .{
+                            .kind = .number,
+                            .lexeme = if (self.macros.contains(expanded.items[f_idx + 2].lexeme)) "1" else "0",
+                            .span = ft.span,
+                        });
+                        f_idx += 3;
+                        continue;
+                    }
+                }
+                try final_toks.append(self.unit.allocator, .{
+                    .kind = .number,
+                    .lexeme = if (std.mem.eql(u8, ft.lexeme, "true")) "1" else "0",
+                    .span = ft.span,
+                });
+            } else {
+                try final_toks.append(self.unit.allocator, ft);
+            }
+        }
+
+        if (final_toks.items.len == 0) {
+            try emitCTranslationError(self.unit, self.sink, span, "empty expression in `#if` / `#elif`");
+            return error.TranslationFailed;
+        }
+
+        var eval = ConstExprEvaluator{
+            .unit = self.unit,
+            .sink = self.sink,
+            .tokens = final_toks.items,
+            .max_depth = self.options.max_parse_depth,
+            .is_comma_allowed = true,
+        };
+        return (try eval.parseCompleteExpr(0)).isTruthy();
+    }
+
+    /// Emits `E0009` unless inside an isolated speculative `#define` constant probe, returning `TranslationFailed`.
+    fn emitMacroError(self: *CPreprocessor, span: Span, message: []const u8) CFrontendError {
+        if (!self.is_probing_macro_const) {
+            try emitCTranslationError(self.unit, self.sink, span, message);
+        }
+        return error.TranslationFailed;
+    }
+
+    /// Appends a single expanded `tok` into `list`, charging `expanded_token_budget` against `max_tokens`.
+    fn appendExpandedToken(
+        self: *CPreprocessor,
+        list: *std.ArrayListUnmanaged(CToken),
+        tok: CToken,
+        err_span: Span,
+    ) CFrontendError!void {
+        self.expanded_token_budget += 1;
+        if (self.expanded_token_budget > self.options.max_tokens) {
+            self.has_hit_resource_cap = true;
+            return self.emitMacroError(
+                err_span,
+                "C macro expansion exceeded `MAX_C_TOKENS_PER_UNIT` token budget",
+            );
+        }
+        try list.append(self.unit.allocator, tok);
+    }
+
+    /// Appends `slice` into `list`, charging `expanded_token_budget` before allocating to block token bombs.
+    fn appendExpandedTokenSlice(
+        self: *CPreprocessor,
+        list: *std.ArrayListUnmanaged(CToken),
+        slice: []const CToken,
+        err_span: Span,
+    ) CFrontendError!void {
+        if (slice.len == 0) return;
+        self.expanded_token_budget +|= slice.len;
+        if (self.expanded_token_budget > self.options.max_tokens) {
+            self.has_hit_resource_cap = true;
+            return self.emitMacroError(
+                err_span,
+                "C macro expansion exceeded `MAX_C_TOKENS_PER_UNIT` token budget",
+            );
+        }
+        try list.appendSlice(self.unit.allocator, slice);
+    }
+
+    /// Expands macros across `input_tokens` into `out_tokens`, enforcing Blue-Paint and depth/step/token caps.
+    fn expandTokenSequence(
+        self: *CPreprocessor,
+        input_tokens: []const CToken,
+        out_tokens: *std.ArrayListUnmanaged(CToken),
+    ) CFrontendError!void {
+        if (self.macro_recursion_depth >= self.options.max_parse_depth) {
+            self.has_hit_resource_cap = true;
+            const err_span = if (input_tokens.len > 0) input_tokens[0].span else Span.ZERO;
+            return self.emitMacroError(
+                err_span,
+                "C macro recursion depth exceeded `MAX_C_PARSE_DEPTH` cap",
+            );
+        }
+        self.macro_recursion_depth += 1;
+        defer self.macro_recursion_depth -= 1;
+
+        if (input_tokens.len > 16 and self.expanded_token_budget < self.options.max_tokens) {
+            try out_tokens.ensureTotalCapacityPrecise(
+                self.unit.allocator,
+                out_tokens.items.len + @min(input_tokens.len, self.options.max_tokens - self.expanded_token_budget),
+            );
+        }
+
+        var i: usize = 0;
+        while (i < input_tokens.len) {
+            const tok = input_tokens[i];
+            if (out_tokens.items.len >= self.options.max_tokens) {
+                self.has_hit_resource_cap = true;
+                return self.emitMacroError(
+                    tok.span,
+                    "C macro expansion exceeded `MAX_C_TOKENS_PER_UNIT` cap",
+                );
+            }
+
+            if (tok.kind == .ident and !self.isMacroBluePainted(tok.lexeme)) {
+                if (self.macros.get(tok.lexeme)) |macro| {
+                    if (!macro.is_function_like) {
+                        self.expansion_steps += 1;
+                        if (self.expansion_steps > self.options.max_macro_steps) {
+                            self.has_hit_resource_cap = true;
+                            return self.emitMacroError(
+                                tok.span,
+                                "C macro expansion exceeded `MAX_MACRO_EXPANSION_STEPS` cap",
+                            );
+                        }
+                        try self.pushActiveMacro(macro.name);
+                        defer self.popActiveMacro(macro.name);
+
+                        var pasted: std.ArrayListUnmanaged(CToken) = .empty;
+                        defer pasted.deinit(self.unit.allocator);
+                        try self.substituteAndPasteMacroBody(macro, &.{}, &.{}, tok, &pasted);
+                        try self.expandTokenSequence(pasted.items, out_tokens);
+                        i += 1;
+                        continue;
+                    } else if (i + 1 < input_tokens.len and input_tokens[i + 1].kind == .lparen) {
+                        // Collect balanced `( arg0, arg1, … )` arguments:
+                        var raw_args: std.ArrayListUnmanaged([]const CToken) = .empty;
+                        defer raw_args.deinit(self.unit.allocator);
+
+                        var arg_cursor = i + 2;
+                        var paren_depth: u32 = 1;
+                        var cur_arg_start = arg_cursor;
+                        while (arg_cursor < input_tokens.len and paren_depth > 0) {
+                            const ak = input_tokens[arg_cursor].kind;
+                            if (ak == .lparen) {
+                                paren_depth += 1;
+                            } else if (ak == .rparen) {
+                                paren_depth -= 1;
+                                if (paren_depth == 0) {
+                                    if (arg_cursor > cur_arg_start or raw_args.items.len > 0) {
+                                        try raw_args.append(
+                                            self.unit.allocator,
+                                            input_tokens[cur_arg_start..arg_cursor],
+                                        );
+                                    }
+                                    break;
+                                }
+                            } else if (ak == .comma and paren_depth == 1) {
+                                try raw_args.append(
+                                    self.unit.allocator,
+                                    input_tokens[cur_arg_start..arg_cursor],
+                                );
+                                cur_arg_start = arg_cursor + 1;
+                            }
+                            arg_cursor += 1;
+                        }
+                        if (paren_depth != 0) {
+                            return self.emitMacroError(
+                                tok.span,
+                                "unterminated argument list in function-like macro invocation",
+                            );
+                        }
+
+                        // Handle 0-argument vs 1-empty-argument macro calls:
+                        if (raw_args.items.len == 0 and macro.params.len == 1) {
+                            try raw_args.append(self.unit.allocator, &.{});
+                        }
+
+                        var fixed_args: []const []const CToken = raw_args.items;
+                        var va_tokens: std.ArrayListUnmanaged(CToken) = .empty;
+                        defer va_tokens.deinit(self.unit.allocator);
+
+                        if (macro.is_variadic) {
+                            if (raw_args.items.len < macro.params.len) {
+                                return self.emitMacroError(
+                                    tok.span,
+                                    "too few arguments to variadic C macro",
+                                );
+                            }
+                            fixed_args = raw_args.items[0..macro.params.len];
+                            for (raw_args.items[macro.params.len..], 0..) |va_slice, va_i| {
+                                if (va_i > 0) {
+                                    try self.appendExpandedToken(&va_tokens, .{
+                                        .kind = .comma,
+                                        .lexeme = ",",
+                                        .span = tok.span,
+                                    }, tok.span);
+                                }
+                                try self.appendExpandedTokenSlice(&va_tokens, va_slice, tok.span);
+                            }
+                        } else if (raw_args.items.len != macro.params.len) {
+                            return self.emitMacroError(
+                                tok.span,
+                                "argument count mismatch in C function-like macro call",
+                            );
+                        }
+
+                        self.expansion_steps += 1;
+                        if (self.expansion_steps > self.options.max_macro_steps) {
+                            self.has_hit_resource_cap = true;
+                            return self.emitMacroError(
+                                tok.span,
+                                "C macro expansion exceeded `MAX_MACRO_EXPANSION_STEPS` cap",
+                            );
+                        }
+
+                        var pasted: std.ArrayListUnmanaged(CToken) = .empty;
+                        defer pasted.deinit(self.unit.allocator);
+                        try self.substituteAndPasteMacroBody(
+                            macro,
+                            fixed_args,
+                            va_tokens.items,
+                            tok,
+                            &pasted,
+                        );
+
+                        try self.pushActiveMacro(macro.name);
+                        defer self.popActiveMacro(macro.name);
+                        try self.expandTokenSequence(pasted.items, out_tokens);
+                        i = arg_cursor + 1;
+                        continue;
+                    }
+                }
+            }
+
+            try self.appendExpandedToken(out_tokens, tok, tok.span);
+            i += 1;
+        }
+    }
+
+    /// Performs parameter substitution, `#` stringification, C23 `__VA_OPT__`, and `##` token pasting.
+    fn substituteAndPasteMacroBody(
+        self: *CPreprocessor,
+        macro: MacroEntry,
+        fixed_args: []const []const CToken,
+        va_tokens: []const CToken,
+        call_tok: CToken,
+        out_tokens: *std.ArrayListUnmanaged(CToken),
+    ) CFrontendError!void {
+        if (self.macro_recursion_depth >= self.options.max_parse_depth) {
+            self.has_hit_resource_cap = true;
+            return self.emitMacroError(
+                call_tok.span,
+                "C macro recursion depth exceeded `MAX_C_PARSE_DEPTH` cap",
+            );
+        }
+        self.macro_recursion_depth += 1;
+        defer self.macro_recursion_depth -= 1;
+
+        // Pre-expand each argument once for non-`#` / non-`##` parameter occurrences:
+        var expanded_fixed: std.ArrayListUnmanaged(std.ArrayListUnmanaged(CToken)) = .empty;
+        defer {
+            for (expanded_fixed.items) |*arg_list| arg_list.deinit(self.unit.allocator);
+            expanded_fixed.deinit(self.unit.allocator);
+        }
+        for (fixed_args) |raw_arg| {
+            var arg_list: std.ArrayListUnmanaged(CToken) = .empty;
+            errdefer arg_list.deinit(self.unit.allocator);
+            try self.expandTokenSequence(raw_arg, &arg_list);
+            try expanded_fixed.append(self.unit.allocator, arg_list);
+        }
+        var expanded_va_list: std.ArrayListUnmanaged(CToken) = .empty;
+        defer expanded_va_list.deinit(self.unit.allocator);
+        if (va_tokens.len > 0) {
+            try self.expandTokenSequence(va_tokens, &expanded_va_list);
+        }
+
+        const body = macro.body;
+        if (body.len > 0 and self.expanded_token_budget < self.options.max_tokens) {
+            var est_tokens: usize = 0;
+            for (body) |btok| {
+                if (btok.kind == .ident) {
+                    if (macro.is_variadic and std.mem.eql(u8, btok.lexeme, "__VA_ARGS__")) {
+                        est_tokens +|= expanded_va_list.items.len;
+                        continue;
+                    }
+                    if (findMacroParamIndex(macro.params, btok.lexeme)) |p_i| {
+                        est_tokens +|= expanded_fixed.items[p_i].items.len;
+                        continue;
+                    }
+                }
+                est_tokens +|= 1;
+            }
+            if (est_tokens > 16 and est_tokens <= self.options.max_tokens - self.expanded_token_budget) {
+                try out_tokens.ensureTotalCapacityPrecise(
+                    self.unit.allocator,
+                    out_tokens.items.len + est_tokens,
+                );
+            }
+        }
+        var idx: usize = 0;
+        while (idx < body.len) {
+            const btok = body[idx];
+
+            // [1] C23 `__VA_OPT__(…)`:
+            if (btok.kind == .ident and std.mem.eql(u8, btok.lexeme, "__VA_OPT__") and
+                idx + 1 < body.len and body[idx + 1].kind == .lparen)
+            {
+                var close_idx = idx + 2;
+                var depth: u32 = 1;
+                while (close_idx < body.len and depth > 0) {
+                    if (body[close_idx].kind == .lparen) depth += 1 else if (body[close_idx].kind == .rparen) {
+                        depth -= 1;
+                        if (depth == 0) break;
+                    }
+                    close_idx += 1;
+                }
+                if (expanded_va_list.items.len > 0) {
+                    const sub_macro = MacroEntry{
+                        .name = macro.name,
+                        .is_function_like = macro.is_function_like,
+                        .is_variadic = macro.is_variadic,
+                        .params = macro.params,
+                        .body = body[idx + 2 .. close_idx],
+                        .span = macro.span,
+                        .is_from_system_header = macro.is_from_system_header,
+                    };
+                    try self.substituteAndPasteMacroBody(
+                        sub_macro,
+                        fixed_args,
+                        va_tokens,
+                        call_tok,
+                        out_tokens,
+                    );
+                }
+                idx = @min(close_idx + 1, body.len);
+                continue;
+            }
+
+            // [2] `#param` / `#__VA_ARGS__` stringification:
+            if (btok.kind == .hash and idx + 1 < body.len and body[idx + 1].kind == .ident) {
+                const target_ident = body[idx + 1].lexeme;
+                var raw_target: ?[]const CToken = null;
+                if (macro.is_variadic and std.mem.eql(u8, target_ident, "__VA_ARGS__")) {
+                    raw_target = va_tokens;
+                } else if (findMacroParamIndex(macro.params, target_ident)) |p_i| {
+                    raw_target = fixed_args[p_i];
+                }
+                if (raw_target) |to_str| {
+                    try self.appendExpandedToken(
+                        out_tokens,
+                        try self.stringifyTokenSlice(to_str, call_tok.span),
+                        call_tok.span,
+                    );
+                    idx += 2;
+                    continue;
+                }
+            }
+
+            // [3] `lhs ## rhs` token pasting (including GNU `, ## __VA_ARGS__` elision):
+            if (idx + 1 < body.len and body[idx + 1].kind == .hash_hash) {
+                if (btok.kind == .comma and idx + 2 < body.len and
+                    body[idx + 2].kind == .ident and
+                    std.mem.eql(u8, body[idx + 2].lexeme, "__VA_ARGS__") and
+                    va_tokens.len == 0)
+                {
+                    idx += 3;
+                    continue;
+                }
+
+                var paste_accum: std.ArrayListUnmanaged(CToken) = .empty;
+                defer paste_accum.deinit(self.unit.allocator);
+                try self.appendRawParamOrSingle(btok, macro, fixed_args, va_tokens, call_tok.span, &paste_accum);
+
+                while (idx + 2 < body.len and body[idx + 1].kind == .hash_hash) {
+                    const rhs_btok = body[idx + 2];
+                    var rhs_raw: std.ArrayListUnmanaged(CToken) = .empty;
+                    defer rhs_raw.deinit(self.unit.allocator);
+                    try self.appendRawParamOrSingle(rhs_btok, macro, fixed_args, va_tokens, call_tok.span, &rhs_raw);
+
+                    if (paste_accum.items.len == 0) {
+                        try self.appendExpandedTokenSlice(&paste_accum, rhs_raw.items, call_tok.span);
+                    } else if (rhs_raw.items.len > 0) {
+                        const left_last = paste_accum.items[paste_accum.items.len - 1];
+                        const right_first = rhs_raw.items[0];
+                        const joined_lex = try std.fmt.allocPrint(
+                            self.unit.arena.asAllocator(),
+                            "{s}{s}",
+                            .{ left_last.lexeme, right_first.lexeme },
+                        );
+                        var relexed: std.ArrayListUnmanaged(CToken) = .empty;
+                        defer relexed.deinit(self.unit.allocator);
+                        try tokenizeCSBuffer(
+                            self.unit,
+                            self.sink,
+                            joined_lex,
+                            call_tok.span.file_id,
+                            macro.is_from_system_header,
+                            self.options.max_tokens,
+                            &relexed,
+                        );
+                        _ = paste_accum.pop();
+                        for (relexed.items) |*rt| rt.span = call_tok.span;
+                        try self.appendExpandedTokenSlice(&paste_accum, relexed.items, call_tok.span);
+                        if (rhs_raw.items.len > 1) {
+                            try self.appendExpandedTokenSlice(&paste_accum, rhs_raw.items[1..], call_tok.span);
+                        }
+                    }
+                    idx += 2;
+                }
+                try self.appendExpandedTokenSlice(out_tokens, paste_accum.items, call_tok.span);
+                idx += 1;
+                continue;
+            }
+
+            // [4] Standard expanded parameter / `__VA_ARGS__` substitution:
+            if (btok.kind == .ident) {
+                if (macro.is_variadic and std.mem.eql(u8, btok.lexeme, "__VA_ARGS__")) {
+                    try self.appendExpandedTokenSlice(out_tokens, expanded_va_list.items, call_tok.span);
+                    idx += 1;
+                    continue;
+                }
+                if (findMacroParamIndex(macro.params, btok.lexeme)) |p_i| {
+                    try self.appendExpandedTokenSlice(out_tokens, expanded_fixed.items[p_i].items, call_tok.span);
+                    idx += 1;
+                    continue;
+                }
+            }
+
+            var cloned = btok;
+            if (idx == 0) cloned.has_leading_space = call_tok.has_leading_space;
+            cloned.is_from_system_header = macro.is_from_system_header or call_tok.is_from_system_header;
+            try self.appendExpandedToken(out_tokens, cloned, call_tok.span);
+            idx += 1;
+        }
+    }
+
+    /// Appends unexpanded parameter tokens for `##` operands (supporting empty placemarkers).
+    fn appendRawParamOrSingle(
+        self: *CPreprocessor,
+        btok: CToken,
+        macro: MacroEntry,
+        fixed_args: []const []const CToken,
+        va_tokens: []const CToken,
+        err_span: Span,
+        out_list: *std.ArrayListUnmanaged(CToken),
+    ) CFrontendError!void {
+        if (btok.kind == .ident) {
+            if (macro.is_variadic and std.mem.eql(u8, btok.lexeme, "__VA_ARGS__")) {
+                try self.appendExpandedTokenSlice(out_list, va_tokens, err_span);
+                return;
+            }
+            if (findMacroParamIndex(macro.params, btok.lexeme)) |p_i| {
+                try self.appendExpandedTokenSlice(out_list, fixed_args[p_i], err_span);
+                return;
+            }
+        }
+        try self.appendExpandedToken(out_list, btok, err_span);
+    }
+
+    /// Converts `tokens` into a C11 stringified literal token (`#arg`).
+    fn stringifyTokenSlice(self: *CPreprocessor, tokens: []const CToken, span: Span) !CToken {
+        var str_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer str_buf.deinit(self.unit.allocator);
+        try str_buf.append(self.unit.allocator, '"');
+        for (tokens, 0..) |tok, i| {
+            if (i > 0 and tok.has_leading_space) {
+                try str_buf.append(self.unit.allocator, ' ');
+            }
+            if (tok.kind == .string_lit or tok.kind == .char_lit) {
+                for (tok.lexeme) |ch| {
+                    if (ch == '"' or ch == '\\') {
+                        try str_buf.append(self.unit.allocator, '\\');
+                    }
+                    try str_buf.append(self.unit.allocator, ch);
+                }
+            } else {
+                try str_buf.appendSlice(self.unit.allocator, tok.lexeme);
+            }
+        }
+        try str_buf.append(self.unit.allocator, '"');
+        return .{
+            .kind = .string_lit,
+            .lexeme = try self.unit.arena.dupe(u8, str_buf.items),
+            .span = span,
+        };
+    }
+
+    /// Classifies surviving user object-like `#define`s into `unit.macro_consts` with isolated per-macro budgets.
+    fn collectSurvivingMacroConsts(self: *CPreprocessor) CFrontendError!void {
+        var seen_names: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen_names.deinit(self.unit.allocator);
+
+        var probe_sink = DiagnosticSink.init(self.unit.allocator);
+        defer probe_sink.deinit();
+
+        const saved_steps = self.expansion_steps;
+        const saved_budget = self.expanded_token_budget;
+        const saved_cap = self.has_hit_resource_cap;
+        const saved_options = self.options;
+        const saved_sink = self.sink;
+        const saved_has_errors = self.unit.has_errors;
+        self.is_probing_macro_const = true;
+        self.sink = &probe_sink;
+        defer {
+            self.expansion_steps = saved_steps;
+            self.expanded_token_budget = saved_budget;
+            self.has_hit_resource_cap = saved_cap;
+            self.options = saved_options;
+            self.sink = saved_sink;
+            self.unit.has_errors = saved_has_errors;
+            self.is_probing_macro_const = false;
+        }
+
+        var idx = self.user_object_macro_order.items.len;
+        while (idx > 0) {
+            idx -= 1;
+            const name = self.user_object_macro_order.items[idx];
+            if (seen_names.contains(name)) continue;
+            try seen_names.put(self.unit.allocator, name, {});
+            const macro = self.macros.get(name) orelse continue;
+            if (macro.is_function_like or
+                macro.body.len == 0 or
+                macro.body.len > MAX_MACRO_CONST_PROBE_TOKENS or
+                macro.is_from_system_header)
+            {
+                continue;
+            }
+
+            // Isolated per-macro `<= 256` step/token budget so optional promotion never trips `E0009`:
+            self.expansion_steps = 0;
+            self.expanded_token_budget = 0;
+            self.has_hit_resource_cap = false;
+            self.options.max_macro_steps = MAX_MACRO_CONST_PROBE_STEPS;
+            self.options.max_tokens = @intCast(MAX_MACRO_CONST_PROBE_TOKENS);
+            self.options.max_parse_depth = @min(saved_options.max_parse_depth, 32);
+
+            var expanded: std.ArrayListUnmanaged(CToken) = .empty;
+            defer expanded.deinit(self.unit.allocator);
+            {
+                try self.pushActiveMacro(name);
+                defer self.popActiveMacro(name);
+                self.expandTokenSequence(macro.body, &expanded) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    continue;
+                };
+            }
+            if (expanded.items.len == 0) continue;
+
+            if (try self.tryClassifyExpandedMacroConst(expanded.items)) |const_val| {
+                try self.unit.macro_consts.append(self.unit.allocator, .{
+                    .name = macro.name,
+                    .value = const_val,
+                    .span = macro.span,
+                    .is_from_system_header = false,
+                });
+            }
+        }
+        std.mem.reverse(RecordedMacroConst, self.unit.macro_consts.items);
+    }
+
+    /// Attempts to evaluate `tokens` as an unambiguous string, float, or integer constant.
+    fn tryClassifyExpandedMacroConst(
+        self: *CPreprocessor,
+        tokens: []const CToken,
+    ) !?MacroConstValue {
+        // Strip outer balanced parentheses `( … )`:
+        var slice = tokens;
+        while (slice.len >= 2 and slice[0].kind == .lparen and slice[slice.len - 1].kind == .rparen) {
+            var depth: u32 = 0;
+            var is_wrapping = true;
+            for (slice[0 .. slice.len - 1], 0..) |tok, i| {
+                if (tok.kind == .lparen) depth += 1 else if (tok.kind == .rparen) {
+                    if (depth == 0) {
+                        is_wrapping = false;
+                        break;
+                    }
+                    depth -= 1;
+                }
+                if (depth == 0 and i > 0) {
+                    is_wrapping = false;
+                    break;
+                }
+            }
+            if (!is_wrapping or depth != 1) break;
+            slice = slice[1 .. slice.len - 1];
+        }
+        if (slice.len == 0) return null;
+
+        // [1] Adjacent string literal concatenation (`"foo" "bar"`):
+        var is_all_strings = true;
+        for (slice) |tok| {
+            if (tok.kind != .string_lit) {
+                is_all_strings = false;
+                break;
+            }
+        }
+        if (is_all_strings) {
+            var str_acc: std.ArrayListUnmanaged(u8) = .empty;
+            defer str_acc.deinit(self.unit.allocator);
+            for (slice) |tok| {
+                try str_acc.appendSlice(
+                    self.unit.allocator,
+                    try decodeCStringLiteral(&self.unit.arena, tok.lexeme),
+                );
+            }
+            return .{ .string_val = try self.unit.arena.dupe(u8, str_acc.items) };
+        }
+
+        // [2] Optional unary `+` / `-` float literal:
+        if (slice.len == 1 and slice[0].kind == .number) {
+            if (parseCFloatLiteral(slice[0].lexeme)) |fval| {
+                return .{ .float_val = fval };
+            }
+        } else if (slice.len == 2 and
+            (slice[0].kind == .minus or slice[0].kind == .plus) and
+            slice[1].kind == .number)
+        {
+            if (parseCFloatLiteral(slice[1].lexeme)) |fval| {
+                return .{ .float_val = if (slice[0].kind == .minus) -fval else fval };
+            }
+        }
+
+        // [3] Pure integer constant expression (no unresolved identifiers or floats):
+        for (slice) |tok| {
+            switch (tok.kind) {
+                .number => if (parseCIntegerLiteral(tok.lexeme) == null) return null,
+                .char_lit => if (parseCCharLiteral(tok.lexeme, self.unit.target) == null) return null,
+                .lparen,
+                .rparen,
+                .plus,
+                .minus,
+                .tilde,
+                .bang,
+                .star,
+                .slash,
+                .percent,
+                .shl,
+                .shr,
+                .lt,
+                .le,
+                .gt,
+                .ge,
+                .eq_eq,
+                .bang_eq,
+                .amp,
+                .caret,
+                .pipe,
+                .amp_amp,
+                .pipe_pipe,
+                .question,
+                .colon,
+                => {},
+                else => return null,
+            }
+        }
+
+        var dummy_sink = DiagnosticSink.init(self.unit.allocator);
+        defer dummy_sink.deinit();
+        var eval = ConstExprEvaluator{
+            .unit = self.unit,
+            .sink = &dummy_sink,
+            .tokens = slice,
+            .max_depth = self.options.max_parse_depth,
+            .is_silent = true,
+        };
+        const eval_val = eval.parseCompleteTernary(0) catch return null;
+        if (eval_val.is_unsigned) {
+            return .{ .unsigned_int = eval_val.bits };
+        }
+        return .{ .signed_int = eval_val.asSigned() };
+    }
+};
+
+// --------------- Constant Expression Evaluator ----------------
+
+/// Depth-bounded C11/C23 integer constant expression evaluator (`#if`, `_Static_assert`, enums, arrays).
+const ConstExprEvaluator = struct {
+    /// Owning translation unit.
+    unit: *CTranslationUnit,
+    /// Diagnostic sink for `E0009` errors when `!is_silent`.
+    sink: *DiagnosticSink,
+    /// Slice of C tokens to evaluate.
+    tokens: []const CToken,
+    /// Current token cursor.
+    pos: usize = 0,
+    /// Optional known enum/const identifier lookup table (`null` in `#if` where idents were zeroed).
+    known_consts: ?*const std.StringHashMapUnmanaged(i128) = null,
+    /// Optional parser context for `sizeof(Type)` evaluation.
+    parser_ctx: ?*CDeclParser = null,
+    /// Recursion depth cap (`MAX_C_PARSE_DEPTH`).
+    max_depth: u32 = MAX_C_PARSE_DEPTH,
+    /// When `true`, suppresses diagnostic emission during speculative macro constant probing.
+    is_silent: bool = false,
+    /// When `true` (`#if` / `#elif`), enables the lowest-precedence C comma `,` operator.
+    is_comma_allowed: bool = false,
+
+    /// Emits `E0009` (unless `is_silent`) and aborts constant evaluation.
+    fn fail(self: *ConstExprEvaluator, msg: []const u8) CFrontendError {
+        if (!self.is_silent) {
+            const span = if (self.pos < self.tokens.len)
+                self.tokens[self.pos].span
+            else if (self.tokens.len > 0)
+                self.tokens[self.tokens.len - 1].span
+            else
+                Span.ZERO;
+            try emitCTranslationError(self.unit, self.sink, span, msg);
+        }
+        return error.TranslationFailed;
+    }
+
+    /// Evaluates a complete `#if` / `#elif` expression and rejects any trailing unparsed tokens.
+    fn parseCompleteExpr(self: *ConstExprEvaluator, depth: u32) CFrontendError!CIntVal {
+        const val = try self.parseExpr(depth, true);
+        if (self.pos != self.tokens.len) {
+            return self.fail("unexpected trailing token in `#if` / `#elif` constant expression");
+        }
+        return val;
+    }
+
+    /// Evaluates a complete ternary constant expression and rejects any trailing unparsed tokens.
+    fn parseCompleteTernary(self: *ConstExprEvaluator, depth: u32) CFrontendError!CIntVal {
+        const val = try self.parseTernary(depth, true);
+        if (self.pos != self.tokens.len) {
+            return self.fail("unexpected trailing token in C integer constant expression");
+        }
+        return val;
+    }
+
+    /// Evaluates a top-level or parenthesized constant expression (including `,` when `is_comma_allowed`).
+    fn parseExpr(self: *ConstExprEvaluator, depth: u32, is_eval: bool) CFrontendError!CIntVal {
+        if (depth >= self.max_depth) return self.fail("C constant expression exceeded `MAX_C_PARSE_DEPTH`");
+        var val = try self.parseTernary(depth + 1, is_eval);
+        if (self.is_comma_allowed) {
+            while (self.pos < self.tokens.len and self.tokens[self.pos].kind == .comma) {
+                self.pos += 1;
+                val = try self.parseTernary(depth + 1, is_eval);
+            }
+        }
+        return val;
+    }
+
+    /// Evaluates `cond ? then_expr : else_expr` with short-circuit branch suppression (`is_eval`).
+    fn parseTernary(self: *ConstExprEvaluator, depth: u32, is_eval: bool) CFrontendError!CIntVal {
+        if (depth >= self.max_depth) return self.fail("C constant expression exceeded `MAX_C_PARSE_DEPTH`");
+        const cond = try self.parseBinary(depth + 1, 1, is_eval);
+        if (self.pos < self.tokens.len and self.tokens[self.pos].kind == .question) {
+            self.pos += 1;
+            const is_then_taken = cond.isTruthy();
+            const then_val = try self.parseExpr(depth + 1, is_eval and is_then_taken);
+            if (self.pos >= self.tokens.len or self.tokens[self.pos].kind != .colon) {
+                return self.fail("expected `:` in C ternary constant expression");
+            }
+            self.pos += 1;
+            const else_val = try self.parseTernary(depth + 1, is_eval and !is_then_taken);
+            const is_unsigned = then_val.is_unsigned or else_val.is_unsigned;
+            return .{
+                .bits = if (is_then_taken) then_val.bits else else_val.bits,
+                .is_unsigned = is_unsigned,
+            };
+        }
+        return cond;
+    }
+
+    /// Precedence-climbing binary constant expression evaluator (`min_prec = 1..10`).
+    fn parseBinary(
+        self: *ConstExprEvaluator,
+        depth: u32,
+        min_prec: u8,
+        is_eval: bool,
+    ) CFrontendError!CIntVal {
+        if (depth >= self.max_depth) return self.fail("C constant expression exceeded `MAX_C_PARSE_DEPTH`");
+        var lhs = try self.parseUnary(depth + 1, is_eval);
+        while (self.pos < self.tokens.len) {
+            const op = self.tokens[self.pos].kind;
+            const prec = getBinaryPrecedence(op) orelse break;
+            if (prec < min_prec) break;
+            self.pos += 1;
+
+            const is_rhs_eval = switch (op) {
+                .pipe_pipe => is_eval and !lhs.isTruthy(),
+                .amp_amp => is_eval and lhs.isTruthy(),
+                else => is_eval,
+            };
+            const rhs = try self.parseBinary(depth + 1, prec + 1, is_rhs_eval);
+            const is_common_unsigned = lhs.is_unsigned or rhs.is_unsigned;
+
+            lhs = switch (op) {
+                .pipe_pipe => .{ .bits = @intFromBool(lhs.isTruthy() or rhs.isTruthy()), .is_unsigned = false },
+                .amp_amp => .{ .bits = @intFromBool(lhs.isTruthy() and rhs.isTruthy()), .is_unsigned = false },
+                .pipe => .{ .bits = lhs.bits | rhs.bits, .is_unsigned = is_common_unsigned },
+                .caret => .{ .bits = lhs.bits ^ rhs.bits, .is_unsigned = is_common_unsigned },
+                .amp => .{ .bits = lhs.bits & rhs.bits, .is_unsigned = is_common_unsigned },
+                .eq_eq => .{ .bits = @intFromBool(lhs.bits == rhs.bits), .is_unsigned = false },
+                .bang_eq => .{ .bits = @intFromBool(lhs.bits != rhs.bits), .is_unsigned = false },
+                .lt => .{
+                    .bits = @intFromBool(if (is_common_unsigned) lhs.bits < rhs.bits else lhs.asSigned() < rhs.asSigned()),
+                    .is_unsigned = false,
+                },
+                .le => .{
+                    .bits = @intFromBool(if (is_common_unsigned) lhs.bits <= rhs.bits else lhs.asSigned() <= rhs.asSigned()),
+                    .is_unsigned = false,
+                },
+                .gt => .{
+                    .bits = @intFromBool(if (is_common_unsigned) lhs.bits > rhs.bits else lhs.asSigned() > rhs.asSigned()),
+                    .is_unsigned = false,
+                },
+                .ge => .{
+                    .bits = @intFromBool(if (is_common_unsigned) lhs.bits >= rhs.bits else lhs.asSigned() >= rhs.asSigned()),
+                    .is_unsigned = false,
+                },
+                .shl => blk: {
+                    const sh: u6 = @intCast(@min(rhs.bits, 63));
+                    break :blk .{ .bits = if (rhs.bits >= 64) 0 else lhs.bits << sh, .is_unsigned = lhs.is_unsigned };
+                },
+                .shr => blk: {
+                    const sh: u6 = @intCast(@min(rhs.bits, 63));
+                    const shifted: u64 = if (lhs.is_unsigned)
+                        (if (rhs.bits >= 64) 0 else lhs.bits >> sh)
+                    else
+                        @bitCast(lhs.asSigned() >> sh);
+                    break :blk .{ .bits = shifted, .is_unsigned = lhs.is_unsigned };
+                },
+                .plus => .{ .bits = lhs.bits +% rhs.bits, .is_unsigned = is_common_unsigned },
+                .minus => .{ .bits = lhs.bits -% rhs.bits, .is_unsigned = is_common_unsigned },
+                .star => .{ .bits = lhs.bits *% rhs.bits, .is_unsigned = is_common_unsigned },
+                .slash => blk: {
+                    if (!is_eval) break :blk .{ .bits = 0, .is_unsigned = is_common_unsigned };
+                    if (rhs.bits == 0) return self.fail("division by zero in C constant expression");
+                    if (is_common_unsigned) break :blk .{ .bits = lhs.bits / rhs.bits, .is_unsigned = true };
+                    if (lhs.asSigned() == std.math.minInt(i64) and rhs.asSigned() == -1) {
+                        break :blk .{ .bits = lhs.bits, .is_unsigned = false };
+                    }
+                    break :blk .{ .bits = @bitCast(@divTrunc(lhs.asSigned(), rhs.asSigned())), .is_unsigned = false };
+                },
+                .percent => blk: {
+                    if (!is_eval) break :blk .{ .bits = 0, .is_unsigned = is_common_unsigned };
+                    if (rhs.bits == 0) return self.fail("remainder by zero in C constant expression");
+                    if (is_common_unsigned) break :blk .{ .bits = lhs.bits % rhs.bits, .is_unsigned = true };
+                    if (lhs.asSigned() == std.math.minInt(i64) and rhs.asSigned() == -1) {
+                        break :blk .{ .bits = 0, .is_unsigned = false };
+                    }
+                    break :blk .{ .bits = @bitCast(@rem(lhs.asSigned(), rhs.asSigned())), .is_unsigned = false };
+                },
+                else => unreachable,
+            };
+        }
+        return lhs;
+    }
+
+    /// Parses `(TypeName)` at `self.pos` using `pctx`, advancing `self.pos` past `)` on match.
+    fn tryParseParenthesizedType(
+        self: *ConstExprEvaluator,
+        pctx: *CDeclParser,
+        depth: u32,
+        is_diagnostic_enabled: bool,
+    ) CFrontendError!?CTypeId {
+        if (self.pos >= self.tokens.len or self.tokens[self.pos].kind != .lparen) return null;
+        const saved_p_pos = pctx.pos;
+        const saved_p_toks = pctx.tokens;
+        defer {
+            pctx.tokens = saved_p_toks;
+            pctx.pos = saved_p_pos;
+        }
+        pctx.tokens = self.tokens;
+        pctx.pos = self.pos + 1;
+        const parsed_ty = pctx.parseTypeName(depth) catch |err| {
+            if (err == error.OutOfMemory or is_diagnostic_enabled) return err;
+            return null;
+        };
+        if (pctx.pos >= self.tokens.len or self.tokens[pctx.pos].kind != .rparen) {
+            if (is_diagnostic_enabled) return self.fail("expected `)` after `sizeof(type)`");
+            return null;
+        }
+        self.pos = pctx.pos + 1;
+        return parsed_ty;
+    }
+
+    /// Evaluates unary `+`, `-`, `~`, `!`, `sizeof`, casts `(Type)expr`, and primary atoms.
+    fn parseUnary(self: *ConstExprEvaluator, depth: u32, is_eval: bool) CFrontendError!CIntVal {
+        if (depth >= self.max_depth) return self.fail("C constant expression exceeded `MAX_C_PARSE_DEPTH`");
+        if (self.pos >= self.tokens.len) return self.fail("unexpected end of C constant expression");
+
+        const tok = self.tokens[self.pos];
+        switch (tok.kind) {
+            .plus => {
+                self.pos += 1;
+                return self.parseUnary(depth + 1, is_eval);
+            },
+            .minus => {
+                self.pos += 1;
+                const inner = try self.parseUnary(depth + 1, is_eval);
+                return .{ .bits = 0 -% inner.bits, .is_unsigned = inner.is_unsigned };
+            },
+            .tilde => {
+                self.pos += 1;
+                const inner = try self.parseUnary(depth + 1, is_eval);
+                return .{ .bits = ~inner.bits, .is_unsigned = inner.is_unsigned };
+            },
+            .bang => {
+                self.pos += 1;
+                const inner = try self.parseUnary(depth + 1, is_eval);
+                return .{ .bits = @intFromBool(!inner.isTruthy()), .is_unsigned = false };
+            },
+            .lparen => {
+                // Support C integer type casts `(uint32_t)-1` inside constant expressions:
+                if (self.parser_ctx) |pctx| {
+                    if (self.pos + 1 < self.tokens.len and pctx.isTypeStartToken(self.tokens[self.pos + 1])) {
+                        if (try self.tryParseParenthesizedType(pctx, depth + 1, false)) |cast_ty| {
+                            return self.applyIntegerCast(cast_ty, try self.parseUnary(depth + 1, is_eval));
+                        }
+                    }
+                }
+                self.pos += 1;
+                const inner = try self.parseExpr(depth + 1, is_eval);
+                if (self.pos >= self.tokens.len or self.tokens[self.pos].kind != .rparen) {
+                    return self.fail("unclosed `(` in C constant expression");
+                }
+                self.pos += 1;
+                return inner;
+            },
+            .number => {
+                self.pos += 1;
+                return parseCIntegerLiteral(tok.lexeme) orelse
+                    self.fail("invalid integer literal in C constant expression");
+            },
+            .char_lit => {
+                self.pos += 1;
+                return parseCCharLiteral(tok.lexeme, self.unit.target) orelse
+                    self.fail("invalid character literal in C constant expression");
+            },
+            .ident => {
+                if (std.mem.eql(u8, tok.lexeme, "sizeof") and self.parser_ctx != null) {
+                    const pctx = self.parser_ctx.?;
+                    self.pos += 1;
+                    if (try self.tryParseParenthesizedType(pctx, depth + 1, true)) |sizeof_ty| {
+                        return .{
+                            .bits = pctx.estimateTypeSizeBytes(sizeof_ty, depth + 1),
+                            .is_unsigned = true,
+                        };
+                    }
+                }
+                if (std.mem.eql(u8, tok.lexeme, "true")) {
+                    self.pos += 1;
+                    return .{ .bits = 1, .is_unsigned = false };
+                } else if (std.mem.eql(u8, tok.lexeme, "false")) {
+                    self.pos += 1;
+                    return .{ .bits = 0, .is_unsigned = false };
+                } else if (self.known_consts) |const_map| {
+                    if (const_map.get(tok.lexeme)) |cval| {
+                        self.pos += 1;
+                        if (cval < 0) {
+                            return .{
+                                .bits = @bitCast(@as(i64, @intCast(cval))),
+                                .is_unsigned = false,
+                            };
+                        }
+                        return .{
+                            .bits = @intCast(cval),
+                            .is_unsigned = cval > @as(i128, std.math.maxInt(i64)),
+                        };
+                    }
+                }
+                return self.fail("unresolved identifier in C constant expression");
+            },
+            else => return self.fail("unexpected token in C constant expression"),
+        }
+    }
+
+    /// Truncates or sign-extends `operand` when cast to a C integer primitive `target_ty`.
+    fn applyIntegerCast(self: *const ConstExprEvaluator, target_ty: CTypeId, operand: CIntVal) CIntVal {
+        const node = self.unit.getType(self.unit.unwrapTypedefs(target_ty));
+        if (node != .primitive) return operand;
+        const prim = node.primitive;
+        if (prim == .c_bool) return .{ .bits = @intFromBool(operand.bits != 0), .is_unsigned = true };
+        if (!prim.isInteger()) return operand;
+        const is_signed = prim.isSignedInteger(self.unit.target);
+        return switch (prim.byteSize(self.unit.target)) {
+            1 => if (is_signed)
+                .{ .bits = @bitCast(@as(i64, @as(i8, @truncate(operand.asSigned())))), .is_unsigned = false }
+            else
+                .{ .bits = @as(u8, @truncate(operand.bits)), .is_unsigned = true },
+            2 => if (is_signed)
+                .{ .bits = @bitCast(@as(i64, @as(i16, @truncate(operand.asSigned())))), .is_unsigned = false }
+            else
+                .{ .bits = @as(u16, @truncate(operand.bits)), .is_unsigned = true },
+            4 => if (is_signed)
+                .{ .bits = @bitCast(@as(i64, @as(i32, @truncate(operand.asSigned())))), .is_unsigned = false }
+            else
+                .{ .bits = @as(u32, @truncate(operand.bits)), .is_unsigned = true },
+            else => .{ .bits = operand.bits, .is_unsigned = !is_signed },
+        };
+    }
+};
+
+// --------------------- Declaration Parser ---------------------
+
+/// C11/C23 recursive-descent declaration and type-specifier parser (`DR-10` §2.1, `DR-20` Seam #6).
+const CDeclParser = struct {
+    /// Target translation unit.
+    unit: *CTranslationUnit,
+    /// Diagnostic sink for `E0009` errors.
+    sink: *DiagnosticSink,
+    /// Frontend options (`body_hook`, `max_parse_depth`).
+    options: CFrontendOptions,
+    /// Preprocessed token stream.
+    tokens: []const CToken,
+    /// Current token index.
+    pos: usize = 0,
+    /// Lexical `typedef` name -> `CTypeId` map for declarator disambiguation.
+    typedef_names: std.StringHashMapUnmanaged(CTypeId) = .empty,
+    /// Tag table for `struct Name` -> `CDeclId`.
+    struct_tags: std.StringHashMapUnmanaged(CDeclId) = .empty,
+    /// Tag table for `union Name` -> `CDeclId`.
+    union_tags: std.StringHashMapUnmanaged(CDeclId) = .empty,
+    /// Tag table for `enum Name` -> `CDeclId`.
+    enum_tags: std.StringHashMapUnmanaged(CDeclId) = .empty,
+    /// Known enumerator and `static const` integer values for subsequent constant expressions.
+    known_int_consts: std.StringHashMapUnmanaged(i128) = .empty,
+    /// Active `#pragma pack(N)` alignment (`0` = default natural alignment).
+    active_pack_align: u8 = 0,
+    /// Stack of pushed `#pragma pack(push, …)` states.
+    pack_stack: std.ArrayListUnmanaged(u8) = .empty,
+
+    /// Releases parser lookup tables.
+    fn deinit(self: *CDeclParser) void {
+        self.typedef_names.deinit(self.unit.allocator);
+        self.struct_tags.deinit(self.unit.allocator);
+        self.union_tags.deinit(self.unit.allocator);
+        self.enum_tags.deinit(self.unit.allocator);
+        self.known_int_consts.deinit(self.unit.allocator);
+        self.pack_stack.deinit(self.unit.allocator);
+    }
+
+    /// Consumes any pending `.pragma_pack` tokens and updates `active_pack_align`.
+    fn flushPragmaPack(self: *CDeclParser) !void {
+        while (self.pos < self.tokens.len and self.tokens[self.pos].kind == .pragma_pack) {
+            const pk = self.tokens[self.pos];
+            self.pos += 1;
+            switch (pk.pack_op) {
+                .reset_pack => self.active_pack_align = 0,
+                .set_pack => self.active_pack_align = pk.pack_align,
+                .push_only => try self.pack_stack.append(self.unit.allocator, self.active_pack_align),
+                .push_pack => {
+                    try self.pack_stack.append(self.unit.allocator, self.active_pack_align);
+                    self.active_pack_align = pk.pack_align;
+                },
+                .pop_pack => {
+                    if (self.pack_stack.pop()) |restored| {
+                        self.active_pack_align = restored;
+                    } else {
+                        self.active_pack_align = 0;
+                    }
+                },
+            }
+        }
+    }
+
+    /// Peeks the current non-pragma token kind (`.eof` at end of stream).
+    fn peekKind(self: *CDeclParser) !CTokenKind {
+        try self.flushPragmaPack();
+        return if (self.pos < self.tokens.len) self.tokens[self.pos].kind else .eof;
+    }
+
+    /// Peeks the current non-pragma `CToken`.
+    fn peekToken(self: *CDeclParser) !CToken {
+        try self.flushPragmaPack();
+        if (self.pos < self.tokens.len) return self.tokens[self.pos];
+        return .{
+            .kind = .eof,
+            .lexeme = "",
+            .span = if (self.tokens.len > 0) self.tokens[self.tokens.len - 1].span else Span.ZERO,
+        };
+    }
+
+    /// Emits `E0009` at the current token and returns `error.TranslationFailed`.
+    fn failHere(self: *CDeclParser, msg: []const u8) CFrontendError {
+        const span = if (self.pos < self.tokens.len)
+            self.tokens[self.pos].span
+        else if (self.tokens.len > 0)
+            self.tokens[self.tokens.len - 1].span
+        else
+            Span.ZERO;
+        try emitCTranslationError(self.unit, self.sink, span, msg);
+        return error.TranslationFailed;
+    }
+
+    /// Returns `true` if `tok` can begin a C declaration-specifier or type-name.
+    fn isTypeStartToken(self: *const CDeclParser, tok: CToken) bool {
+        if (tok.kind == .lbracket and self.pos + 1 < self.tokens.len and
+            self.tokens[self.pos + 1].kind == .lbracket)
+        {
+            return true;
+        }
+        if (tok.kind != .ident) return false;
+        if (C_SPECIFIER_KEYWORD_SET.has(tok.lexeme)) return true;
+        if (isSalOrNullabilityIdent(tok.lexeme)) return true;
+        return self.typedef_names.contains(tok.lexeme);
+    }
+
+    /// Parses the entire translation unit declaration stream.
+    fn parseTranslationUnit(self: *CDeclParser) CFrontendError!void {
+        while ((try self.peekKind()) != .eof) {
+            try self.parseExternalDeclaration(0);
+        }
+    }
+
+    /// Parses a top-level C declaration, `_Static_assert`, or `extern "C" { … }` linkage block.
+    fn parseExternalDeclaration(self: *CDeclParser, depth: u32) CFrontendError!void {
+        if (depth >= self.options.max_parse_depth) {
+            return self.failHere("C declaration nesting exceeded `MAX_C_PARSE_DEPTH`");
+        }
+        const cur_tok = try self.peekToken();
+        if (cur_tok.kind == .semi) {
+            self.pos += 1;
+            return;
+        }
+
+        // Support `extern "C" { … }` blocks in mixed C/C++ headers:
+        if (cur_tok.kind == .ident and std.mem.eql(u8, cur_tok.lexeme, "extern") and
+            self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .string_lit)
+        {
+            self.pos += 2;
+            if ((try self.peekKind()) == .lbrace) {
+                self.pos += 1;
+                while ((try self.peekKind()) != .rbrace and (try self.peekKind()) != .eof) {
+                    try self.parseExternalDeclaration(depth + 1);
+                }
+                if ((try self.peekKind()) != .rbrace) {
+                    return self.failHere("unclosed `extern \"C\" {` block in C header");
+                }
+                self.pos += 1;
+                return;
+            }
+            try self.parseExternalDeclaration(depth + 1);
+            return;
+        }
+
+        // C11 `_Static_assert(expr, "msg");` / C23 `static_assert(expr);`:
+        if (cur_tok.kind == .ident and C_STATIC_ASSERT_SET.has(cur_tok.lexeme)) {
+            try self.parseStaticAssert(depth + 1);
+            return;
+        }
+
+        const specs = try self.parseDeclSpecs(depth + 1);
+
+        // Standalone tag declaration (`struct Foo;`, `struct Foo { … };`, `enum Bar { … };`):
+        if ((try self.peekKind()) == .semi) {
+            self.pos += 1;
+            return;
+        }
+
+        var decl_index: usize = 0;
+        while (true) : (decl_index += 1) {
+            const decl = try self.parseDeclarator(specs, depth + 1, false);
+            var post_contract = decl.contract;
+            var is_post_noreturn = specs.is_noreturn;
+            var post_nonnull_mask = specs.nonnull_param_mask;
+            var post_align = specs.explicit_align;
+            var is_post_packed = specs.is_packed;
+            var post_dll = specs.dll_storage;
+            try self.consumeLeadingOrTrailingAttributes(
+                depth + 1,
+                &post_contract,
+                &is_post_noreturn,
+                &post_nonnull_mask,
+                &post_align,
+                &is_post_packed,
+                &post_dll,
+            );
+            // Skip optional GNU `asm("symbol")` linker redirect if present:
+            if ((try self.peekKind()) == .ident and C_ASM_KEYWORD_SET.has(self.tokens[self.pos].lexeme)) {
+                self.pos += 1;
+                try self.skipBalancedParens();
+                try self.consumeLeadingOrTrailingAttributes(
+                    depth + 1,
+                    &post_contract,
+                    &is_post_noreturn,
+                    &post_nonnull_mask,
+                    &post_align,
+                    &is_post_packed,
+                    &post_dll,
+                );
+            }
+
+            if (specs.is_typedef) {
+                if (decl.name.len == 0) return self.failHere("missing identifier in C `typedef` declaration");
+                if (!cur_tok.is_from_system_header and self.hasUnsupportedFnLongDouble(decl.type_id, 0)) {
+                    try emitCTranslationError(
+                        self.unit,
+                        self.sink,
+                        decl.span,
+                        "non-8-byte `long double` by-value ABI is unsupported in C function types on this target",
+                    );
+                    return error.TranslationFailed;
+                }
+                const decl_id = CDeclId.fromInt(@intCast(self.unit.decls.items.len));
+                try self.unit.decls.append(self.unit.allocator, .{
+                    .kind = .{ .typedef_decl = .{ .name = decl.name, .target_type = decl.type_id } },
+                    .span = decl.span,
+                    .is_from_system_header = cur_tok.is_from_system_header,
+                });
+                const td_ref_ty = try self.unit.appendType(.{ .typedef_ref = decl_id });
+                try self.typedef_names.put(self.unit.allocator, decl.name, td_ref_ty);
+            } else {
+                const unwrapped = self.unit.getType(decl.type_id);
+                if (unwrapped == .function) {
+                    const fn_info = unwrapped.function;
+                    self.applyNonnullParamMask(fn_info.param_start, fn_info.param_len, post_nonnull_mask);
+
+                    const has_body = decl_index == 0 and (try self.peekKind()) == .lbrace;
+                    var body_first: CTokenId = .none;
+                    var body_end: CTokenId = .none;
+                    if (has_body) {
+                        body_first = CTokenId.fromInt(@intCast(self.pos));
+                        try self.skipBalancedBraces();
+                        body_end = CTokenId.fromInt(@intCast(self.pos));
+                    }
+
+                    if (!cur_tok.is_from_system_header and !specs.is_static and !has_body and
+                        self.hasUnsupportedByValueLongDoubleSig(
+                            fn_info.return_type,
+                            fn_info.param_start,
+                            fn_info.param_len,
+                        ))
+                    {
+                        try emitCTranslationError(
+                            self.unit,
+                            self.sink,
+                            decl.span,
+                            "non-8-byte `long double` by-value ABI is unsupported in C function prototypes on this target",
+                        );
+                        return error.TranslationFailed;
+                    }
+
+                    const fn_decl_id = CDeclId.fromInt(@intCast(self.unit.decls.items.len));
+                    try self.unit.decls.append(self.unit.allocator, .{
+                        .kind = .{
+                            .fn_decl = .{
+                                .name = decl.name,
+                                .return_type = fn_info.return_type,
+                                .param_start = fn_info.param_start,
+                                .param_len = fn_info.param_len,
+                                .is_variadic = fn_info.is_variadic,
+                                .is_static = specs.is_static,
+                                .is_inline = specs.is_inline,
+                                .is_noreturn = is_post_noreturn or fn_info.is_noreturn,
+                                .has_body = has_body,
+                                .body_first_token = body_first,
+                                .body_end_token = body_end,
+                                .ret_contract = post_contract,
+                                .dll_storage = post_dll,
+                            },
+                        },
+                        .span = decl.span,
+                        .is_from_system_header = cur_tok.is_from_system_header,
+                    });
+
+                    // `DR-20` Seam #6 (`CFunctionBodyHook`, <= 20 LOC):
+                    if (has_body) {
+                        if (self.options.body_hook) |hook_fn| {
+                            try hook_fn(self.unit, fn_decl_id, body_first, body_end, self.sink);
+                        }
+                        if ((try self.peekKind()) == .semi) self.pos += 1;
+                        return;
+                    }
+                } else {
+                    var init_const_val: ?MacroConstValue = null;
+                    if ((try self.peekKind()) == .eq) {
+                        self.pos += 1;
+                        init_const_val = try self.parseInitializerOrConstVal(depth + 1);
+                        if (decl.is_top_const and decl.name.len > 0) {
+                            if (init_const_val) |cv| {
+                                switch (cv) {
+                                    .signed_int => |sv| try self.known_int_consts.put(
+                                        self.unit.allocator,
+                                        decl.name,
+                                        sv,
+                                    ),
+                                    .unsigned_int => |uv| try self.known_int_consts.put(
+                                        self.unit.allocator,
+                                        decl.name,
+                                        uv,
+                                    ),
+                                    else => {},
+                                }
+                            }
+                        }
+                    }
+                    try self.unit.decls.append(self.unit.allocator, .{
+                        .kind = .{
+                            .var_decl = .{
+                                .name = decl.name,
+                                .type_id = decl.type_id,
+                                .is_extern = specs.is_extern or (!specs.is_static and init_const_val == null),
+                                .is_static = specs.is_static,
+                                .is_const = decl.is_top_const,
+                                .const_val = init_const_val,
+                                .dll_storage = post_dll,
+                            },
+                        },
+                        .span = decl.span,
+                        .is_from_system_header = cur_tok.is_from_system_header,
+                    });
+                }
+            }
+
+            if ((try self.peekKind()) == .comma) {
+                self.pos += 1;
+                continue;
+            }
+            break;
+        }
+
+        if ((try self.peekKind()) != .semi) {
+            return self.failHere("expected `;` at end of C declaration");
+        }
+        self.pos += 1;
+    }
+
+    /// Evaluates `_Static_assert(expr [, "msg"]);` / C23 `static_assert(expr);` at translation time.
+    fn parseStaticAssert(self: *CDeclParser, depth: u32) CFrontendError!void {
+        const kw_tok = try self.peekToken();
+        self.pos += 1;
+        if ((try self.peekKind()) != .lparen) {
+            return self.failHere("expected `(` after `_Static_assert`");
+        }
+        self.pos += 1;
+        const cond_val = try self.parseConstantIntExprUntilCommaOrRparen(depth + 1);
+        var msg_text: []const u8 = "C `_Static_assert` condition evaluated to 0";
+        if ((try self.peekKind()) == .comma) {
+            self.pos += 1;
+            if ((try self.peekKind()) == .string_lit) {
+                msg_text = try std.fmt.allocPrint(
+                    self.unit.arena.asAllocator(),
+                    "C `_Static_assert` failed: {s}",
+                    .{try decodeCStringLiteral(&self.unit.arena, self.tokens[self.pos].lexeme)},
+                );
+                self.pos += 1;
+            }
+        }
+        if ((try self.peekKind()) != .rparen) {
+            return self.failHere("expected `)` to close `_Static_assert`");
+        }
+        self.pos += 1;
+        if ((try self.peekKind()) == .semi) self.pos += 1;
+
+        if (cond_val == 0) {
+            try emitCTranslationError(self.unit, self.sink, kw_tok.span, msg_text);
+            return error.TranslationFailed;
+        }
+    }
+
+    /// Parses `(TypeName)` after `_Atomic` and verifies the closing `)`.
+    fn parseParenTypeArg(self: *CDeclParser, depth: u32) CFrontendError!CTypeId {
+        self.pos += 1;
+        const arg_ty = try self.parseTypeName(depth);
+        if ((try self.peekKind()) != .rparen) return self.failHere("expected `)` after `_Atomic(T)`");
+        self.pos += 1;
+        return arg_ty;
+    }
+
+    /// Parses C11/C23 declaration specifiers, qualifiers, SAL annotations, and struct/union/enum tags.
+    fn parseDeclSpecs(self: *CDeclParser, depth: u32) CFrontendError!ParsedDeclSpecs {
+        if (depth >= self.options.max_parse_depth) {
+            return self.failHere("C specifier nesting exceeded `MAX_C_PARSE_DEPTH`");
+        }
+        var out = ParsedDeclSpecs{ .type_id = .none };
+        var has_void = false;
+        var has_bool = false;
+        var has_char = false;
+        var has_short = false;
+        var has_int = false;
+        var long_count: u8 = 0;
+        var has_int128 = false;
+        var has_float = false;
+        var has_double = false;
+        var has_signed = false;
+        var has_unsigned = false;
+        var is_atomic_qual = false;
+        var explicit_type_id: CTypeId = .none;
+
+        while (true) {
+            try self.consumeLeadingOrTrailingAttributes(
+                depth + 1,
+                &out.contract,
+                &out.is_noreturn,
+                &out.nonnull_param_mask,
+                &out.explicit_align,
+                &out.is_packed,
+                &out.dll_storage,
+            );
+            const tok = try self.peekToken();
+            if (tok.kind != .ident) break;
+            const lex = tok.lexeme;
+
+            if (C_DECL_SPEC_KEYWORD_MAP.get(lex)) |kw_kind| {
+                switch (kw_kind) {
+                    .kw_typedef => {
+                        out.is_typedef = true;
+                        self.pos += 1;
+                    },
+                    .kw_extern => {
+                        out.is_extern = true;
+                        self.pos += 1;
+                    },
+                    .kw_static => {
+                        out.is_static = true;
+                        self.pos += 1;
+                    },
+                    .kw_inline => {
+                        out.is_inline = true;
+                        self.pos += 1;
+                    },
+                    .kw_noreturn => {
+                        out.is_noreturn = true;
+                        self.pos += 1;
+                    },
+                    .kw_ignored_storage, .kw_restrict => self.pos += 1,
+                    .kw_const => {
+                        out.is_const = true;
+                        self.pos += 1;
+                    },
+                    .kw_volatile => {
+                        out.is_volatile = true;
+                        self.pos += 1;
+                    },
+                    .kw_atomic => {
+                        self.pos += 1;
+                        if ((try self.peekKind()) == .lparen and explicit_type_id.isNone()) {
+                            explicit_type_id = try self.unit.appendType(.{
+                                .atomic_val = try self.parseParenTypeArg(depth + 1),
+                            });
+                        } else {
+                            is_atomic_qual = true;
+                        }
+                    },
+                    .kw_void => {
+                        has_void = true;
+                        self.pos += 1;
+                    },
+                    .kw_bool => {
+                        has_bool = true;
+                        self.pos += 1;
+                    },
+                    .kw_char => {
+                        has_char = true;
+                        self.pos += 1;
+                    },
+                    .kw_short => {
+                        has_short = true;
+                        self.pos += 1;
+                    },
+                    .kw_int => {
+                        has_int = true;
+                        self.pos += 1;
+                    },
+                    .kw_long => {
+                        long_count += 1;
+                        self.pos += 1;
+                    },
+                    .kw_int128 => {
+                        has_int128 = true;
+                        self.pos += 1;
+                    },
+                    .kw_float => {
+                        has_float = true;
+                        self.pos += 1;
+                    },
+                    .kw_double => {
+                        has_double = true;
+                        self.pos += 1;
+                    },
+                    .kw_signed => {
+                        has_signed = true;
+                        self.pos += 1;
+                    },
+                    .kw_unsigned => {
+                        has_unsigned = true;
+                        self.pos += 1;
+                    },
+                    .kw_struct, .kw_union => {
+                        self.pos += 1;
+                        explicit_type_id = try self.parseStructOrUnionSpecifier(
+                            kw_kind == .kw_union,
+                            depth + 1,
+                        );
+                    },
+                    .kw_enum => {
+                        self.pos += 1;
+                        explicit_type_id = try self.parseEnumSpecifier(depth + 1);
+                    },
+                }
+            } else {
+                const has_any_prim = !explicit_type_id.isNone() or has_void or has_bool or has_char or
+                    has_short or has_int or long_count > 0 or has_int128 or has_float or has_double or
+                    has_signed or has_unsigned;
+                if (has_any_prim) break;
+
+                if (BUILTIN_EXACT_TYPE_MAP.get(lex)) |exact_prim| {
+                    self.pos += 1;
+                    explicit_type_id = try self.unit.appendType(.{ .primitive = exact_prim });
+                } else if (self.typedef_names.get(lex)) |td_ty| {
+                    self.pos += 1;
+                    explicit_type_id = td_ty;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if (explicit_type_id.isNone()) {
+            const prim: CPrimitiveKind = if (has_void)
+                .c_void
+            else if (has_bool)
+                .c_bool
+            else if (has_float)
+                .c_float
+            else if (has_double)
+                (if (long_count > 0) .c_longdouble else .c_double)
+            else if (has_int128)
+                (if (has_unsigned) .c_uint128 else .c_int128)
+            else if (has_char)
+                (if (has_unsigned) .c_uchar else if (has_signed) .c_schar else .c_char)
+            else if (has_short)
+                (if (has_unsigned) .c_ushort else .c_short)
+            else if (long_count >= 2)
+                (if (has_unsigned) .c_ulonglong else .c_longlong)
+            else if (long_count == 1)
+                (if (has_unsigned) .c_ulong else .c_long)
+            else if (has_unsigned)
+                .c_uint
+            else if (has_int or has_signed)
+                .c_int
+            else
+                return self.failHere("expected C type specifier in declaration");
+
+            explicit_type_id = try self.unit.appendType(.{ .primitive = prim });
+        }
+
+        if (is_atomic_qual) {
+            explicit_type_id = try self.unit.appendType(.{ .atomic_val = explicit_type_id });
+        }
+        out.type_id = explicit_type_id;
+        return out;
+    }
+
+    /// Enforces C11/C23 §6.7.2.1p4 bitfield base-type and storage-unit bit-width invariants (`E0009`).
+    fn validateBitfieldWidthAndBaseType(
+        self: *CDeclParser,
+        field_type_id: CTypeId,
+        field_name: []const u8,
+        width_val: i128,
+        err_span: Span,
+    ) CFrontendError!u16 {
+        if (!self.isValidBitfieldBaseType(field_type_id)) {
+            try emitCTranslationError(
+                self.unit,
+                self.sink,
+                err_span,
+                "C bitfield must have an integer, `_Bool`, or `enum` base type",
+            );
+            return error.TranslationFailed;
+        }
+        const canon_node = self.unit.getType(self.unit.unwrapTypedefs(field_type_id));
+        const is_bool_base = switch (canon_node) {
+            .primitive => |prim| prim == .c_bool,
+            .enum_ref => |en_id| self.unit.getDecl(en_id).kind.enum_decl.underlying_prim == .c_bool,
+            else => false,
+        };
+        const unit_bytes = self.unit.computeTypeByteSize(field_type_id, 0);
+        const max_unit_bits: i128 = if (is_bool_base) 1 else @as(i128, unit_bytes) * 8;
+        if (width_val < 0 or
+            width_val > max_unit_bits or
+            width_val > 64 or
+            (field_name.len > 0 and width_val == 0))
+        {
+            try emitCTranslationError(
+                self.unit,
+                self.sink,
+                err_span,
+                "C bitfield width exceeds base storage-unit bit width or valid range",
+            );
+            return error.TranslationFailed;
+        }
+        return @intCast(width_val);
+    }
+
+    /// Parses `struct [Attrs] [Tag] [{ Fields… }]` or `union [Attrs] [Tag] [{ Fields… }]`.
+    fn parseStructOrUnionSpecifier(self: *CDeclParser, is_union: bool, depth: u32) CFrontendError!CTypeId {
+        const start_tok = try self.peekToken();
+        var layout = CRecordLayoutAttrs{ .pragma_pack = self.active_pack_align };
+        try self.consumeRecordAttributes(depth + 1, &layout);
+
+        var tag_name: []const u8 = "";
+        if ((try self.peekKind()) == .ident and !isAttributeKeyword(self.tokens[self.pos].lexeme)) {
+            tag_name = self.tokens[self.pos].lexeme;
+            self.pos += 1;
+        }
+        try self.consumeRecordAttributes(depth + 1, &layout);
+
+        const tag_map = if (is_union) &self.union_tags else &self.struct_tags;
+        const has_body = (try self.peekKind()) == .lbrace;
+
+        var decl_id: CDeclId = .none;
+        if (tag_name.len > 0) {
+            if (tag_map.get(tag_name)) |existing_id| {
+                decl_id = existing_id;
+            }
+        }
+        if (decl_id.isNone()) {
+            decl_id = CDeclId.fromInt(@intCast(self.unit.decls.items.len));
+            try self.unit.decls.append(self.unit.allocator, .{
+                .kind = .{
+                    .record_decl = .{
+                        .is_union = is_union,
+                        .name = tag_name,
+                        .is_complete = false,
+                        .field_start = 0,
+                        .field_len = 0,
+                        .layout_attrs = layout,
+                    },
+                },
+                .span = start_tok.span,
+                .is_from_system_header = start_tok.is_from_system_header,
+            });
+            if (tag_name.len > 0) {
+                try tag_map.put(self.unit.allocator, tag_name, decl_id);
+            }
+        }
+
+        if (has_body) {
+            self.pos += 1;
+            var local_fields: std.ArrayListUnmanaged(CStructField) = .empty;
+            defer local_fields.deinit(self.unit.allocator);
+
+            while ((try self.peekKind()) != .rbrace and (try self.peekKind()) != .eof) {
+                const f_tok = try self.peekToken();
+                if (f_tok.kind == .semi) {
+                    self.pos += 1;
+                    continue;
+                }
+                if (f_tok.kind == .ident and C_STATIC_ASSERT_SET.has(f_tok.lexeme)) {
+                    try self.parseStaticAssert(depth + 1);
+                    continue;
+                }
+
+                const f_specs = try self.parseDeclSpecs(depth + 1);
+
+                // Anonymous nested `struct { … };` or `union { … };` member without declarator:
+                if ((try self.peekKind()) == .semi) {
+                    self.pos += 1;
+                    if (self.unit.getType(f_specs.type_id) == .record_ref) {
+                        if (self.hasIncompleteRecordOrVoidByValue(f_specs.type_id, 0)) {
+                            try emitCTranslationError(
+                                self.unit,
+                                self.sink,
+                                f_tok.span,
+                                "C struct or union field has incomplete or self-referential value type",
+                            );
+                            return error.TranslationFailed;
+                        }
+                        try local_fields.append(self.unit.allocator, .{
+                            .name = "",
+                            .type_id = f_specs.type_id,
+                            .explicit_align = f_specs.explicit_align,
+                            .is_packed_field = f_specs.is_packed,
+                            .is_anonymous_record = true,
+                            .span = f_tok.span,
+                        });
+                    }
+                    continue;
+                }
+
+                while (true) {
+                    if ((try self.peekKind()) == .colon) {
+                        // Unnamed bitfield (`unsigned : 0;` or `unsigned : 4;`):
+                        self.pos += 1;
+                        const width_val = try self.parseConstantIntExprUntilCommaOrSemi(depth + 1);
+                        const validated_width = try self.validateBitfieldWidthAndBaseType(
+                            f_specs.type_id,
+                            "",
+                            width_val,
+                            f_tok.span,
+                        );
+                        try local_fields.append(self.unit.allocator, .{
+                            .name = "",
+                            .type_id = f_specs.type_id,
+                            .bit_width = validated_width,
+                            .explicit_align = f_specs.explicit_align,
+                            .is_packed_field = f_specs.is_packed,
+                            .span = f_tok.span,
+                        });
+                    } else {
+                        const f_decl = try self.parseDeclarator(f_specs, depth + 1, false);
+                        var raw_bit_width: ?i128 = null;
+                        if ((try self.peekKind()) == .colon) {
+                            self.pos += 1;
+                            raw_bit_width = try self.parseConstantIntExprUntilCommaOrSemi(depth + 1);
+                        }
+                        var f_contract = f_decl.contract;
+                        var is_ignored_noreturn = false;
+                        var ignored_nonnull_mask: u32 = 0;
+                        var f_align = f_specs.explicit_align;
+                        var is_field_packed = f_specs.is_packed;
+                        var ignored_dll_storage: CDllStorage = .none;
+                        try self.consumeLeadingOrTrailingAttributes(
+                            depth + 1,
+                            &f_contract,
+                            &is_ignored_noreturn,
+                            &ignored_nonnull_mask,
+                            &f_align,
+                            &is_field_packed,
+                            &ignored_dll_storage,
+                        );
+                        const bit_width: ?u16 = if (raw_bit_width) |width_val|
+                            try self.validateBitfieldWidthAndBaseType(
+                                f_decl.type_id,
+                                f_decl.name,
+                                width_val,
+                                f_decl.span,
+                            )
+                        else blk: {
+                            if (self.hasIncompleteRecordOrVoidByValue(f_decl.type_id, 0)) {
+                                try emitCTranslationError(
+                                    self.unit,
+                                    self.sink,
+                                    f_decl.span,
+                                    "C struct or union field has incomplete or self-referential value type",
+                                );
+                                return error.TranslationFailed;
+                            }
+                            break :blk null;
+                        };
+                        try local_fields.append(self.unit.allocator, .{
+                            .name = f_decl.name,
+                            .type_id = f_decl.type_id,
+                            .bit_width = bit_width,
+                            .explicit_align = f_align,
+                            .is_packed_field = is_field_packed,
+                            .contract = f_contract,
+                            .span = f_decl.span,
+                        });
+                    }
+                    if ((try self.peekKind()) == .comma) {
+                        self.pos += 1;
+                        continue;
+                    }
+                    break;
+                }
+
+                if ((try self.peekKind()) != .semi) {
+                    return self.failHere("expected `;` after C struct/union member");
+                }
+                self.pos += 1;
+            }
+
+            if ((try self.peekKind()) != .rbrace) {
+                return self.failHere("unclosed `{` in C struct/union definition");
+            }
+            self.pos += 1;
+            try self.consumeRecordAttributes(depth + 1, &layout);
+
+            const field_start: u32 = @intCast(self.unit.fields.items.len);
+            try self.unit.fields.appendSlice(self.unit.allocator, local_fields.items);
+            const rec_ptr = &self.unit.decls.items[decl_id.asInt()].kind.record_decl;
+            rec_ptr.is_complete = true;
+            rec_ptr.field_start = field_start;
+            rec_ptr.field_len = @intCast(local_fields.items.len);
+            rec_ptr.layout_attrs.is_packed = rec_ptr.layout_attrs.is_packed or layout.is_packed;
+            rec_ptr.layout_attrs.is_ms_struct = rec_ptr.layout_attrs.is_ms_struct or layout.is_ms_struct;
+            rec_ptr.layout_attrs.is_gcc_struct = rec_ptr.layout_attrs.is_gcc_struct or layout.is_gcc_struct;
+            if (layout.pragma_pack != 0) rec_ptr.layout_attrs.pragma_pack = layout.pragma_pack;
+            rec_ptr.layout_attrs.explicit_align = @max(
+                rec_ptr.layout_attrs.explicit_align,
+                layout.explicit_align,
+            );
+        }
+
+        return self.unit.appendType(.{ .record_ref = decl_id });
+    }
+
+    /// Parses `enum [Attrs] [Tag] [: UnderlyingInt] [{ Variants… }]`.
+    fn parseEnumSpecifier(self: *CDeclParser, depth: u32) CFrontendError!CTypeId {
+        const start_tok = try self.peekToken();
+        var dummy_layout = CRecordLayoutAttrs{};
+        try self.consumeRecordAttributes(depth + 1, &dummy_layout);
+
+        var tag_name: []const u8 = "";
+        if ((try self.peekKind()) == .ident and !isAttributeKeyword(self.tokens[self.pos].lexeme)) {
+            tag_name = self.tokens[self.pos].lexeme;
+            self.pos += 1;
+        }
+        try self.consumeRecordAttributes(depth + 1, &dummy_layout);
+
+        var underlying_prim: ?CPrimitiveKind = null;
+        if ((try self.peekKind()) == .colon) {
+            self.pos += 1;
+            const under_node = self.unit.getType(
+                self.unit.unwrapTypedefs((try self.parseDeclSpecs(depth + 1)).type_id),
+            );
+            if (under_node == .primitive and under_node.primitive.isInteger()) {
+                underlying_prim = under_node.primitive;
+            }
+        }
+
+        var decl_id: CDeclId = .none;
+        if (tag_name.len > 0) {
+            if (self.enum_tags.get(tag_name)) |existing_id| {
+                decl_id = existing_id;
+            }
+        }
+        if (decl_id.isNone()) {
+            decl_id = CDeclId.fromInt(@intCast(self.unit.decls.items.len));
+            try self.unit.decls.append(self.unit.allocator, .{
+                .kind = .{
+                    .enum_decl = .{
+                        .name = tag_name,
+                        .underlying_prim = underlying_prim,
+                        .is_complete = false,
+                        .variant_start = 0,
+                        .variant_len = 0,
+                    },
+                },
+                .span = start_tok.span,
+                .is_from_system_header = start_tok.is_from_system_header,
+            });
+            if (tag_name.len > 0) {
+                try self.enum_tags.put(self.unit.allocator, tag_name, decl_id);
+            }
+        }
+
+        if ((try self.peekKind()) == .lbrace) {
+            self.pos += 1;
+            var local_variants: std.ArrayListUnmanaged(CEnumVariant) = .empty;
+            defer local_variants.deinit(self.unit.allocator);
+            var next_val: i128 = 0;
+
+            while ((try self.peekKind()) != .rbrace and (try self.peekKind()) != .eof) {
+                const v_tok = try self.peekToken();
+                if (v_tok.kind != .ident) {
+                    return self.failHere("expected enumerator identifier inside C `enum`");
+                }
+                const v_name = v_tok.lexeme;
+                self.pos += 1;
+                try self.consumeRecordAttributes(depth + 1, &dummy_layout);
+
+                var has_explicit = false;
+                if ((try self.peekKind()) == .eq) {
+                    self.pos += 1;
+                    next_val = try self.parseConstantIntExprUntilCommaOrRbrace(depth + 1);
+                    has_explicit = true;
+                }
+                try self.known_int_consts.put(self.unit.allocator, v_name, next_val);
+                try local_variants.append(self.unit.allocator, .{
+                    .name = v_name,
+                    .value = next_val,
+                    .has_explicit_value = has_explicit,
+                    .span = v_tok.span,
+                });
+                next_val += 1;
+
+                if ((try self.peekKind()) == .comma) {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+            if ((try self.peekKind()) != .rbrace) {
+                return self.failHere("unclosed `{` in C `enum` definition");
+            }
+            self.pos += 1;
+            try self.consumeRecordAttributes(depth + 1, &dummy_layout);
+
+            const var_start: u32 = @intCast(self.unit.enum_variants.items.len);
+            try self.unit.enum_variants.appendSlice(self.unit.allocator, local_variants.items);
+            const enum_ptr = &self.unit.decls.items[decl_id.asInt()].kind.enum_decl;
+            enum_ptr.is_complete = true;
+            if (underlying_prim != null) enum_ptr.underlying_prim = underlying_prim;
+            enum_ptr.variant_start = var_start;
+            enum_ptr.variant_len = @intCast(local_variants.items.len);
+        }
+
+        return self.unit.appendType(.{ .enum_ref = decl_id });
+    }
+
+    /// Parses an abstract C type name (`sizeof(T)`, `_Atomic(T)`).
+    fn parseTypeName(self: *CDeclParser, depth: u32) CFrontendError!CTypeId {
+        return (try self.parseDeclarator(try self.parseDeclSpecs(depth + 1), depth + 1, true)).type_id;
+    }
+
+    /// Parses a direct or grouped inside-out C declarator (`*`, `(…)`, `[N]`, `(params…)`).
+    fn parseDeclarator(
+        self: *CDeclParser,
+        specs: ParsedDeclSpecs,
+        depth: u32,
+        is_abstract_only: bool,
+    ) CFrontendError!ParsedDeclarator {
+        if (depth >= self.options.max_parse_depth) {
+            return self.failHere("C declarator nesting exceeded `MAX_C_PARSE_DEPTH`");
+        }
+        var outer_mods: std.ArrayListUnmanaged(DeclaratorModifier) = .empty;
+        defer outer_mods.deinit(self.unit.allocator);
+        var inner_mods: std.ArrayListUnmanaged(DeclaratorModifier) = .empty;
+        defer inner_mods.deinit(self.unit.allocator);
+
+        var contract = specs.contract;
+        const start_tok = try self.peekToken();
+        var decl_name: []const u8 = "";
+        var decl_span: Span = start_tok.span;
+
+        // [1] Parse leading `*` pointer indirections:
+        try self.parsePointerPrefixChain(depth + 1, &outer_mods, &contract);
+
+        // [2] Check for grouped inner declarator `(*cb)` vs direct identifier:
+        if (!is_abstract_only and (try self.peekKind()) == .lparen and self.isGroupedDeclaratorAhead()) {
+            self.pos += 1;
+            const inner_res = try self.parseGroupedInnerDeclarator(depth + 1, &inner_mods, &contract);
+            decl_name = inner_res.name;
+            decl_span = inner_res.span;
+            if ((try self.peekKind()) != .rparen) {
+                return self.failHere("expected `)` to close grouped C declarator");
+            }
+            self.pos += 1;
+        } else if (is_abstract_only and (try self.peekKind()) == .lparen and self.isGroupedDeclaratorAhead()) {
+            self.pos += 1;
+            _ = try self.parseGroupedInnerDeclarator(depth + 1, &inner_mods, &contract);
+            if ((try self.peekKind()) != .rparen) {
+                return self.failHere("expected `)` to close abstract grouped C declarator");
+            }
+            self.pos += 1;
+        } else if (!is_abstract_only and (try self.peekKind()) == .ident and
+            !isSalOrNullabilityIdent(self.tokens[self.pos].lexeme) and
+            !isAttributeKeyword(self.tokens[self.pos].lexeme))
+        {
+            decl_name = self.tokens[self.pos].lexeme;
+            decl_span = self.tokens[self.pos].span;
+            self.pos += 1;
+        }
+
+        // [3] Parse postfix `[len]` array and `(params…)` function suffixes on the outer level:
+        var outer_postfixes: std.ArrayListUnmanaged(DeclaratorModifier) = .empty;
+        defer outer_postfixes.deinit(self.unit.allocator);
+        try self.parseDeclaratorPostfixes(depth + 1, &outer_postfixes);
+
+        // [4] Assemble type from outermost base specifiers inward:
+        var current_ty = specs.type_id;
+        var is_pointee_const = specs.is_const;
+        var is_pointee_volatile = specs.is_volatile;
+
+        // Apply outer pointer chain (`const T *` makes first pointer point to `const T`):
+        for (outer_mods.items) |pmod| {
+            current_ty = try self.unit.appendType(.{
+                .pointer = .{
+                    .pointee = current_ty,
+                    .is_const = is_pointee_const,
+                    .is_volatile = is_pointee_volatile,
+                    .is_restrict = pmod.pointer.is_ptr_restrict,
+                    .nullability = pmod.pointer.nullability,
+                },
+            });
+            is_pointee_const = pmod.pointer.is_ptr_const;
+            is_pointee_volatile = pmod.pointer.is_ptr_volatile;
+        }
+
+        // Apply outer postfixes from right to left so `int a[2][3]` is `[ [int; 3]; 2 ]`:
+        var op_idx = outer_postfixes.items.len;
+        while (op_idx > 0) {
+            op_idx -= 1;
+            switch (outer_postfixes.items[op_idx]) {
+                .array => |arr_len| {
+                    current_ty = try self.unit.appendType(.{
+                        .array = .{ .elem = current_ty, .len = arr_len },
+                    });
+                },
+                .function => |fn_mod| {
+                    current_ty = try self.unit.appendType(.{
+                        .function = .{
+                            .return_type = current_ty,
+                            .param_start = fn_mod.param_start,
+                            .param_len = fn_mod.param_len,
+                            .is_variadic = fn_mod.is_variadic,
+                            .is_noreturn = specs.is_noreturn,
+                        },
+                    });
+                },
+                .pointer => unreachable,
+            }
+            is_pointee_const = false;
+            is_pointee_volatile = false;
+        }
+
+        // Apply grouped inner modifiers (`(*cb)(args)` wraps pointer around `fn(args) -> R`):
+        for (inner_mods.items) |imod| {
+            switch (imod) {
+                .pointer => |pinfo| {
+                    current_ty = try self.unit.appendType(.{
+                        .pointer = .{
+                            .pointee = current_ty,
+                            .is_const = is_pointee_const,
+                            .is_volatile = is_pointee_volatile,
+                            .is_restrict = pinfo.is_ptr_restrict,
+                            .nullability = pinfo.nullability,
+                        },
+                    });
+                    is_pointee_const = pinfo.is_ptr_const;
+                    is_pointee_volatile = pinfo.is_ptr_volatile;
+                },
+                .array => |arr_len| {
+                    current_ty = try self.unit.appendType(.{
+                        .array = .{ .elem = current_ty, .len = arr_len },
+                    });
+                    is_pointee_const = false;
+                },
+                .function => |fn_mod| {
+                    current_ty = try self.unit.appendType(.{
+                        .function = .{
+                            .return_type = current_ty,
+                            .param_start = fn_mod.param_start,
+                            .param_len = fn_mod.param_len,
+                            .is_variadic = fn_mod.is_variadic,
+                        },
+                    });
+                    is_pointee_const = false;
+                },
+            }
+        }
+
+        // Propagate outermost pointer nullability onto `contract` if set via `_Nullable` / `_Nonnull`:
+        const top_node = self.unit.getType(current_ty);
+        if (top_node == .pointer and top_node.pointer.nullability != .unspecified and
+            contract.nullability == .unspecified)
+        {
+            contract.nullability = top_node.pointer.nullability;
+        }
+
+        return .{
+            .name = decl_name,
+            .span = decl_span,
+            .type_id = current_ty,
+            .is_top_const = is_pointee_const,
+            .contract = contract,
+        };
+    }
+
+    /// Parses a parenthesized inner declarator (`*cb` or `*(*factory)(int)`).
+    fn parseGroupedInnerDeclarator(
+        self: *CDeclParser,
+        depth: u32,
+        out_mods: *std.ArrayListUnmanaged(DeclaratorModifier),
+        contract: *CFfiContract,
+    ) CFrontendError!struct { name: []const u8, span: Span } {
+        if (depth >= self.options.max_parse_depth) {
+            return self.failHere("C grouped declarator exceeded `MAX_C_PARSE_DEPTH`");
+        }
+        var lead_ptrs: std.ArrayListUnmanaged(DeclaratorModifier) = .empty;
+        defer lead_ptrs.deinit(self.unit.allocator);
+        try self.parsePointerPrefixChain(depth + 1, &lead_ptrs, contract);
+
+        var name: []const u8 = "";
+        var span: Span = (try self.peekToken()).span;
+        var deeper_mods: std.ArrayListUnmanaged(DeclaratorModifier) = .empty;
+        defer deeper_mods.deinit(self.unit.allocator);
+
+        if ((try self.peekKind()) == .lparen and self.isGroupedDeclaratorAhead()) {
+            self.pos += 1;
+            const sub = try self.parseGroupedInnerDeclarator(depth + 1, &deeper_mods, contract);
+            name = sub.name;
+            span = sub.span;
+            if ((try self.peekKind()) != .rparen) {
+                return self.failHere("expected `)` in nested C declarator");
+            }
+            self.pos += 1;
+        } else if ((try self.peekKind()) == .ident and
+            !isSalOrNullabilityIdent(self.tokens[self.pos].lexeme) and
+            !isAttributeKeyword(self.tokens[self.pos].lexeme))
+        {
+            name = self.tokens[self.pos].lexeme;
+            span = self.tokens[self.pos].span;
+            self.pos += 1;
+        }
+
+        var local_postfixes: std.ArrayListUnmanaged(DeclaratorModifier) = .empty;
+        defer local_postfixes.deinit(self.unit.allocator);
+        try self.parseDeclaratorPostfixes(depth + 1, &local_postfixes);
+
+        try out_mods.appendSlice(self.unit.allocator, lead_ptrs.items);
+        var p_idx = local_postfixes.items.len;
+        while (p_idx > 0) {
+            p_idx -= 1;
+            try out_mods.append(self.unit.allocator, local_postfixes.items[p_idx]);
+        }
+        try out_mods.appendSlice(self.unit.allocator, deeper_mods.items);
+        return .{ .name = name, .span = span };
+    }
+
+    /// Returns `true` when `(` at `self.pos` opens a grouped declarator rather than a parameter list.
+    fn isGroupedDeclaratorAhead(self: *const CDeclParser) bool {
+        if (self.pos + 1 >= self.tokens.len) return false;
+        const next_tok = self.tokens[self.pos + 1];
+        if (next_tok.kind == .rparen or next_tok.kind == .ellipses) return false;
+        if (next_tok.kind == .star or next_tok.kind == .lparen or next_tok.kind == .lbracket) return true;
+        if (next_tok.kind == .ident) {
+            if (isCallingConvIdent(next_tok.lexeme) or isAttributeKeyword(next_tok.lexeme)) return true;
+            return !self.isTypeStartToken(next_tok);
+        }
+        return false;
+    }
+
+    /// Parses zero or more `*` pointer prefixes and trailing pointer qualifiers (`const`, `_Nonnull`, etc.).
+    fn parsePointerPrefixChain(
+        self: *CDeclParser,
+        depth: u32,
+        out_mods: *std.ArrayListUnmanaged(DeclaratorModifier),
+        contract: *CFfiContract,
+    ) CFrontendError!void {
+        while (true) {
+            var is_ignored_noreturn = false;
+            var ignored_nonnull_mask: u32 = 0;
+            var ignored_align: u32 = 0;
+            var is_ignored_packed = false;
+            var ignored_dll_storage: CDllStorage = .none;
+            try self.consumeLeadingOrTrailingAttributes(
+                depth + 1,
+                contract,
+                &is_ignored_noreturn,
+                &ignored_nonnull_mask,
+                &ignored_align,
+                &is_ignored_packed,
+                &ignored_dll_storage,
+            );
+            if ((try self.peekKind()) == .ident and isCallingConvIdent(self.tokens[self.pos].lexeme)) {
+                self.pos += 1;
+                continue;
+            }
+            if ((try self.peekKind()) != .star) break;
+            self.pos += 1;
+
+            var is_p_const = false;
+            var is_p_vol = false;
+            var is_p_rest = false;
+            var ptr_null: CNullability = .unspecified;
+
+            while ((try self.peekKind()) == .ident or (try self.peekKind()) == .lbracket) {
+                if ((try self.peekKind()) == .lbracket) {
+                    if (self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lbracket) {
+                        var ptr_contract = CFfiContract{};
+                        try self.consumeLeadingOrTrailingAttributes(
+                            depth + 1,
+                            &ptr_contract,
+                            &is_ignored_noreturn,
+                            &ignored_nonnull_mask,
+                            &ignored_align,
+                            &is_ignored_packed,
+                            &ignored_dll_storage,
+                        );
+                        if (ptr_contract.slice_len_param.len > 0) {
+                            contract.slice_len_param = ptr_contract.slice_len_param;
+                        }
+                        continue;
+                    }
+                    break;
+                }
+                const qlex = self.tokens[self.pos].lexeme;
+                if (C_PTR_OR_ARRAY_QUAL_MAP.get(qlex)) |qual_kind| {
+                    switch (qual_kind) {
+                        .qual_const => {
+                            is_p_const = true;
+                            self.pos += 1;
+                        },
+                        .qual_volatile => {
+                            is_p_vol = true;
+                            self.pos += 1;
+                        },
+                        .qual_restrict => {
+                            is_p_rest = true;
+                            self.pos += 1;
+                        },
+                        .qual_nonnull => {
+                            ptr_null = .non_null;
+                            self.pos += 1;
+                        },
+                        .qual_nullable => {
+                            ptr_null = .may_be_null;
+                            self.pos += 1;
+                        },
+                        .qual_ignored_ptr => self.pos += 1,
+                        .qual_static_array => break,
+                    }
+                } else if (isCallingConvIdent(qlex)) {
+                    self.pos += 1;
+                } else if (isAttributeKeyword(qlex)) {
+                    var ptr_contract = CFfiContract{};
+                    try self.consumeLeadingOrTrailingAttributes(
+                        depth + 1,
+                        &ptr_contract,
+                        &is_ignored_noreturn,
+                        &ignored_nonnull_mask,
+                        &ignored_align,
+                        &is_ignored_packed,
+                        &ignored_dll_storage,
+                    );
+                    if (ptr_contract.slice_len_param.len > 0) {
+                        contract.slice_len_param = ptr_contract.slice_len_param;
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            try out_mods.append(self.unit.allocator, .{
+                .pointer = .{
+                    .is_ptr_const = is_p_const,
+                    .is_ptr_volatile = is_p_vol,
+                    .is_ptr_restrict = is_p_rest,
+                    .nullability = ptr_null,
+                },
+            });
+        }
+    }
+
+    /// Parses a `(param0, param1, …)` parameter list and verifies the closing `)`.
+    fn parseClosedParameterTypeList(self: *CDeclParser, depth: u32) CFrontendError!FnSuffixMod {
+        self.pos += 1;
+        const parsed_sig = try self.parseParameterTypeList(depth);
+        if ((try self.peekKind()) != .rparen) {
+            return self.failHere("expected `)` to close C function parameter list");
+        }
+        self.pos += 1;
+        return parsed_sig;
+    }
+
+    /// Parses postfix `[len]` array and `(params…)` function suffixes.
+    fn parseDeclaratorPostfixes(
+        self: *CDeclParser,
+        depth: u32,
+        out_postfixes: *std.ArrayListUnmanaged(DeclaratorModifier),
+    ) CFrontendError!void {
+        while (true) {
+            const pk = try self.peekKind();
+            if (pk == .lbracket) {
+                // Stop if C23 `[[…]]` attribute follows declarator:
+                if (self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lbracket) break;
+                self.pos += 1;
+                // Skip optional C99 `[static const 16]` array parameter qualifiers:
+                while ((try self.peekKind()) == .ident and
+                    C_PTR_OR_ARRAY_QUAL_MAP.has(self.tokens[self.pos].lexeme))
+                {
+                    self.pos += 1;
+                }
+                var arr_len: ?u64 = null;
+                if ((try self.peekKind()) == .star and
+                    self.pos + 1 < self.tokens.len and
+                    self.tokens[self.pos + 1].kind == .rbracket)
+                {
+                    self.pos += 1;
+                } else if ((try self.peekKind()) != .rbracket) {
+                    const len_val = try self.parseConstantIntExprUntilRbracket(depth + 1);
+                    if (len_val < 0) return self.failHere("negative C array bound");
+                    arr_len = @intCast(len_val);
+                }
+                if ((try self.peekKind()) != .rbracket) {
+                    return self.failHere("expected `]` in C array declarator");
+                }
+                self.pos += 1;
+                try out_postfixes.append(self.unit.allocator, .{ .array = arr_len });
+            } else if (pk == .lparen) {
+                try out_postfixes.append(
+                    self.unit.allocator,
+                    .{ .function = try self.parseClosedParameterTypeList(depth + 1) },
+                );
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Parses a C function `(param0, param1, …)` list, applying `(void)` empty-param and array/fn decay.
+    fn parseParameterTypeList(self: *CDeclParser, depth: u32) CFrontendError!FnSuffixMod {
+        if ((try self.peekKind()) == .rparen) {
+            return .{ .param_start = 0, .param_len = 0, .is_variadic = false };
+        }
+        var local_params: std.ArrayListUnmanaged(CFnParam) = .empty;
+        defer local_params.deinit(self.unit.allocator);
+        var is_variadic = false;
+
+        while ((try self.peekKind()) != .rparen and (try self.peekKind()) != .eof) {
+            if ((try self.peekKind()) == .ellipses) {
+                is_variadic = true;
+                self.pos += 1;
+                break;
+            }
+
+            const p_specs = try self.parseDeclSpecs(depth + 1);
+            const p_decl = try self.parseDeclarator(p_specs, depth + 1, false);
+            var p_contract = p_decl.contract;
+            var is_ignored_noreturn = false;
+            var ignored_nonnull_mask: u32 = 0;
+            var ignored_align: u32 = 0;
+            var is_ignored_packed = false;
+            var ignored_dll_storage: CDllStorage = .none;
+            try self.consumeLeadingOrTrailingAttributes(
+                depth + 1,
+                &p_contract,
+                &is_ignored_noreturn,
+                &ignored_nonnull_mask,
+                &ignored_align,
+                &is_ignored_packed,
+                &ignored_dll_storage,
+            );
+
+            // C11 `(void)` single unnamed `void` parameter means 0 parameters:
+            if (local_params.items.len == 0 and p_decl.name.len == 0 and (try self.peekKind()) == .rparen) {
+                const p_node = self.unit.getType(p_decl.type_id);
+                if (p_node == .primitive and p_node.primitive == .c_void) {
+                    return .{ .param_start = 0, .param_len = 0, .is_variadic = false };
+                }
+            }
+
+            // C11 §6.7.6.3p7–8 parameter decay; `T[N]` -> `*T` / `*mut T` and `fn(…)` -> `*fn(…)`:
+            var decayed_ty = p_decl.type_id;
+            const raw_p_node = self.unit.getType(decayed_ty);
+            if (raw_p_node == .array) {
+                decayed_ty = try self.unit.appendType(.{
+                    .pointer = .{
+                        .pointee = raw_p_node.array.elem,
+                        .is_const = p_specs.is_const and !self.isPointerChain(raw_p_node.array.elem),
+                        .nullability = p_contract.nullability,
+                    },
+                });
+            } else if (raw_p_node == .function) {
+                decayed_ty = try self.unit.appendType(.{
+                    .pointer = .{
+                        .pointee = decayed_ty,
+                        .is_const = true,
+                        .nullability = p_contract.nullability,
+                    },
+                });
+            }
+
+            try local_params.append(self.unit.allocator, .{
+                .name = p_decl.name,
+                .type_id = decayed_ty,
+                .contract = p_contract,
+                .span = p_decl.span,
+            });
+
+            if ((try self.peekKind()) == .comma) {
+                self.pos += 1;
+                continue;
+            }
+            break;
+        }
+
+        const param_start: u32 = @intCast(self.unit.params.items.len);
+        try self.unit.params.appendSlice(self.unit.allocator, local_params.items);
+        return .{
+            .param_start = param_start,
+            .param_len = @intCast(local_params.items.len),
+            .is_variadic = is_variadic,
+        };
+    }
+
+    /// Returns `true` if `type_id` is already a `.pointer` node.
+    fn isPointerChain(self: *const CDeclParser, type_id: CTypeId) bool {
+        return self.unit.getType(type_id) == .pointer;
+    }
+
+    /// Applies `__attribute__((nonnull(…)))` bits onto `params[param_start .. param_start + param_len]`.
+    fn applyNonnullParamMask(self: *CDeclParser, param_start: u32, param_len: u32, mask: u32) void {
+        if (mask == 0 or param_len == 0) return;
+        var i: u32 = 0;
+        while (i < param_len) : (i += 1) {
+            if (mask == std.math.maxInt(u32) or (i < 31 and ((mask >> @intCast(i)) & 1) != 0)) {
+                const p_ptr = &self.unit.params.items[param_start + i];
+                if (p_ptr.contract.nullability == .unspecified) {
+                    p_ptr.contract.nullability = .non_null;
+                }
+            }
+        }
+    }
+
+    /// Parses `struct`/`union`/`enum` layout attributes (`packed`, `aligned(N)`, `ms_struct`, `gcc_struct`).
+    fn consumeRecordAttributes(
+        self: *CDeclParser,
+        depth: u32,
+        layout: *CRecordLayoutAttrs,
+    ) CFrontendError!void {
+        var dummy_contract = CFfiContract{};
+        var is_ignored_noreturn = false;
+        var ignored_nonnull_mask: u32 = 0;
+        var ignored_dll_storage: CDllStorage = .none;
+        while (true) {
+            const before = self.pos;
+            const pk = try self.peekKind();
+            if (pk == .lbracket and self.pos + 1 < self.tokens.len and
+                self.tokens[self.pos + 1].kind == .lbracket)
+            {
+                try self.parseC23AttributeGroup(
+                    depth + 1,
+                    &dummy_contract,
+                    &is_ignored_noreturn,
+                    &layout.explicit_align,
+                    &layout.is_packed,
+                    &layout.is_ms_struct,
+                    &layout.is_gcc_struct,
+                );
+            } else if (pk == .ident) {
+                const attr_kw = C_LEADING_ATTR_TOKEN_MAP.get(self.tokens[self.pos].lexeme) orelse break;
+                switch (attr_kw) {
+                    .gnu_attribute => {
+                        self.pos += 1;
+                        if ((try self.peekKind()) == .lparen) {
+                            try self.parseGnuAttributeGroup(
+                                depth + 1,
+                                &dummy_contract,
+                                &is_ignored_noreturn,
+                                &ignored_nonnull_mask,
+                                &layout.explicit_align,
+                                &layout.is_packed,
+                                &layout.is_ms_struct,
+                                &layout.is_gcc_struct,
+                            );
+                        }
+                    },
+                    .alignas_spec, .msvc_declspec => {
+                        try self.consumeLeadingOrTrailingAttributes(
+                            depth + 1,
+                            &dummy_contract,
+                            &is_ignored_noreturn,
+                            &ignored_nonnull_mask,
+                            &layout.explicit_align,
+                            &layout.is_packed,
+                            &ignored_dll_storage,
+                        );
+                    },
+                    else => break,
+                }
+            } else {
+                break;
+            }
+            if (self.pos == before) break;
+        }
+    }
+
+    /// Consumes Clang/GNU `__attribute__`, C23 `[[…]]`, `_Alignas`, `__declspec`, and Microsoft SAL tokens.
+    fn consumeLeadingOrTrailingAttributes(
+        self: *CDeclParser,
+        depth: u32,
+        contract: *CFfiContract,
+        is_noreturn: *bool,
+        nonnull_mask: *u32,
+        explicit_align: *u32,
+        is_packed: *bool,
+        dll_storage: *CDllStorage,
+    ) CFrontendError!void {
+        var is_ignored_ms = false;
+        var is_ignored_gcc = false;
+        while (true) {
+            const pk = try self.peekKind();
+            if (pk == .lbracket and self.pos + 1 < self.tokens.len and
+                self.tokens[self.pos + 1].kind == .lbracket)
+            {
+                try self.parseC23AttributeGroup(
+                    depth + 1,
+                    contract,
+                    is_noreturn,
+                    explicit_align,
+                    is_packed,
+                    &is_ignored_ms,
+                    &is_ignored_gcc,
+                );
+                continue;
+            }
+            if (pk != .ident) break;
+            const attr_tok = C_LEADING_ATTR_TOKEN_MAP.get(self.tokens[self.pos].lexeme) orelse break;
+            switch (attr_tok) {
+                .gnu_attribute => {
+                    self.pos += 1;
+                    if ((try self.peekKind()) == .lparen) {
+                        try self.parseGnuAttributeGroup(
+                            depth + 1,
+                            contract,
+                            is_noreturn,
+                            nonnull_mask,
+                            explicit_align,
+                            is_packed,
+                            &is_ignored_ms,
+                            &is_ignored_gcc,
+                        );
+                    }
+                },
+                .alignas_spec => {
+                    self.pos += 1;
+                    if ((try self.peekKind()) == .lparen) {
+                        self.pos += 1;
+                        if (self.pos < self.tokens.len and self.isTypeStartToken(self.tokens[self.pos])) {
+                            explicit_align.* = @max(
+                                explicit_align.*,
+                                self.estimateTypeAlignBytes(try self.parseTypeName(depth + 1), depth + 1),
+                            );
+                        } else {
+                            const al_val = try self.parseConstantIntExprUntilCommaOrRparen(depth + 1);
+                            if (al_val > 0 and std.math.isPowerOfTwo(@as(u64, @intCast(al_val)))) {
+                                explicit_align.* = @max(explicit_align.*, @as(u32, @intCast(al_val)));
+                            }
+                        }
+                        if ((try self.peekKind()) == .rparen) self.pos += 1;
+                    }
+                },
+                .msvc_declspec => {
+                    self.pos += 1;
+                    if ((try self.peekKind()) == .lparen) {
+                        self.pos += 1;
+                        while ((try self.peekKind()) != .rparen and (try self.peekKind()) != .eof) {
+                            if (self.tokens[self.pos].kind == .ident) {
+                                const ds_name = self.tokens[self.pos].lexeme;
+                                self.pos += 1;
+                                if (C_MSVC_DECLSPEC_MAP.get(ds_name)) |ds_kind| {
+                                    switch (ds_kind) {
+                                        .ds_dllexport => dll_storage.* = .dllexport,
+                                        .ds_dllimport => dll_storage.* = .dllimport,
+                                        .ds_noreturn => is_noreturn.* = true,
+                                        .ds_align => {
+                                            if ((try self.peekKind()) == .lparen) {
+                                                self.pos += 1;
+                                                const al_v = try self.parseConstantIntExprUntilCommaOrRparen(depth + 1);
+                                                if (al_v > 0 and std.math.isPowerOfTwo(@as(u64, @intCast(al_v)))) {
+                                                    explicit_align.* = @max(
+                                                        explicit_align.*,
+                                                        @as(u32, @intCast(al_v)),
+                                                    );
+                                                }
+                                                if ((try self.peekKind()) == .rparen) self.pos += 1;
+                                            }
+                                        },
+                                    }
+                                } else if ((try self.peekKind()) == .lparen) {
+                                    try self.skipBalancedParens();
+                                }
+                            } else {
+                                self.pos += 1;
+                            }
+                        }
+                        if ((try self.peekKind()) == .rparen) self.pos += 1;
+                    }
+                },
+                .sal_in_z => {
+                    contract.is_null_terminated = true;
+                    contract.nullability = .non_null;
+                    self.pos += 1;
+                },
+                .sal_in_opt_z => {
+                    contract.is_null_terminated = true;
+                    contract.nullability = .may_be_null;
+                    self.pos += 1;
+                },
+                .sal_out => {
+                    contract.is_out_param = true;
+                    contract.nullability = .non_null;
+                    self.pos += 1;
+                },
+                .sal_out_opt => {
+                    contract.is_out_param = true;
+                    contract.nullability = .may_be_null;
+                    self.pos += 1;
+                },
+                .sal_non_null => {
+                    contract.nullability = .non_null;
+                    self.pos += 1;
+                },
+                .sal_may_be_null => {
+                    contract.nullability = .may_be_null;
+                    self.pos += 1;
+                },
+                .sal_in_reads, .sal_out_writes => {
+                    if (attr_tok == .sal_out_writes) contract.is_out_param = true;
+                    contract.nullability = .non_null;
+                    self.pos += 1;
+                    if ((try self.peekKind()) == .lparen) {
+                        self.pos += 1;
+                        if ((try self.peekKind()) == .ident or (try self.peekKind()) == .number) {
+                            contract.slice_len_param = self.tokens[self.pos].lexeme;
+                            self.pos += 1;
+                        }
+                        while ((try self.peekKind()) != .rparen and (try self.peekKind()) != .eof) : (self.pos += 1) {}
+                        if ((try self.peekKind()) == .rparen) self.pos += 1;
+                    }
+                },
+                .null_unspecified => self.pos += 1,
+            }
+        }
+    }
+
+    /// Parses `__attribute__((attr1, attr2(arg)))` groups.
+    fn parseGnuAttributeGroup(
+        self: *CDeclParser,
+        depth: u32,
+        contract: *CFfiContract,
+        is_noreturn: *bool,
+        nonnull_mask: *u32,
+        explicit_align: *u32,
+        is_packed: *bool,
+        is_ms_struct: *bool,
+        is_gcc_struct: *bool,
+    ) CFrontendError!void {
+        if ((try self.peekKind()) != .lparen) return;
+        self.pos += 1;
+        const has_double_paren = (try self.peekKind()) == .lparen;
+        if (has_double_paren) self.pos += 1;
+
+        while ((try self.peekKind()) != .rparen and (try self.peekKind()) != .eof) {
+            if ((try self.peekKind()) == .comma) {
+                self.pos += 1;
+                continue;
+            }
+            if ((try self.peekKind()) != .ident) {
+                if ((try self.peekKind()) == .lparen) {
+                    try self.skipBalancedParens();
+                } else {
+                    self.pos += 1;
+                }
+                continue;
+            }
+            const attr_name = stripDoubleUnderscores(self.tokens[self.pos].lexeme);
+            self.pos += 1;
+
+            if (C_GNU_OR_C23_ATTR_MAP.get(attr_name)) |attr_kind| {
+                switch (attr_kind) {
+                    .attr_packed => is_packed.* = true,
+                    .attr_ms_struct => is_ms_struct.* = true,
+                    .attr_gcc_struct => is_gcc_struct.* = true,
+                    .attr_noreturn => is_noreturn.* = true,
+                    .attr_aligned => {
+                        if ((try self.peekKind()) == .lparen) {
+                            self.pos += 1;
+                            if ((try self.peekKind()) != .rparen) {
+                                const al_val = try self.parseConstantIntExprUntilCommaOrRparen(depth + 1);
+                                if (al_val > 0 and std.math.isPowerOfTwo(@as(u64, @intCast(al_val)))) {
+                                    explicit_align.* = @max(explicit_align.*, @as(u32, @intCast(al_val)));
+                                }
+                            } else {
+                                explicit_align.* = @max(explicit_align.*, 16);
+                            }
+                            if ((try self.peekKind()) == .rparen) self.pos += 1;
+                        } else {
+                            explicit_align.* = @max(explicit_align.*, 16);
+                        }
+                    },
+                    .attr_counted_by => {
+                        if ((try self.peekKind()) == .lparen) {
+                            self.pos += 1;
+                            if ((try self.peekKind()) == .ident or (try self.peekKind()) == .number) {
+                                contract.slice_len_param = self.tokens[self.pos].lexeme;
+                                self.pos += 1;
+                            }
+                            while ((try self.peekKind()) != .rparen and (try self.peekKind()) != .eof) : (self.pos += 1) {}
+                            if ((try self.peekKind()) == .rparen) self.pos += 1;
+                        }
+                    },
+                    .attr_malloc => {
+                        contract.is_owned_by_caller = true;
+                        if ((try self.peekKind()) == .lparen) {
+                            self.pos += 1;
+                            if ((try self.peekKind()) == .ident) {
+                                contract.free_with_fn = self.tokens[self.pos].lexeme;
+                                self.pos += 1;
+                            }
+                            while ((try self.peekKind()) != .rparen and (try self.peekKind()) != .eof) : (self.pos += 1) {}
+                            if ((try self.peekKind()) == .rparen) self.pos += 1;
+                        }
+                    },
+                    .attr_nonnull => {
+                        if ((try self.peekKind()) == .lparen) {
+                            self.pos += 1;
+                            var has_any_idx = false;
+                            while ((try self.peekKind()) != .rparen and (try self.peekKind()) != .eof) {
+                                if ((try self.peekKind()) == .number) {
+                                    if (parseCIntegerLiteral(self.tokens[self.pos].lexeme)) |iv| {
+                                        if (iv.bits >= 1 and iv.bits <= 31) {
+                                            nonnull_mask.* |= @as(u32, 1) << @intCast(iv.bits - 1);
+                                            has_any_idx = true;
+                                        }
+                                    }
+                                }
+                                self.pos += 1;
+                            }
+                            if (!has_any_idx) nonnull_mask.* = std.math.maxInt(u32);
+                            if ((try self.peekKind()) == .rparen) self.pos += 1;
+                        } else {
+                            nonnull_mask.* = std.math.maxInt(u32);
+                        }
+                    },
+                }
+            } else if ((try self.peekKind()) == .lparen) {
+                try self.skipBalancedParens();
+            }
+        }
+
+        if ((try self.peekKind()) == .rparen) self.pos += 1;
+        if (has_double_paren and (try self.peekKind()) == .rparen) self.pos += 1;
+    }
+
+    /// Parses C23 `[[gnu::packed]]`, `[[noreturn]]`, `[[clang::counted_by(len)]]` attribute groups.
+    fn parseC23AttributeGroup(
+        self: *CDeclParser,
+        depth: u32,
+        contract: *CFfiContract,
+        is_noreturn: *bool,
+        explicit_align: *u32,
+        is_packed: *bool,
+        is_ms_struct: *bool,
+        is_gcc_struct: *bool,
+    ) CFrontendError!void {
+        _ = depth;
+        self.pos += 2; // Consume `[[`.
+        while (self.pos < self.tokens.len) {
+            if (self.tokens[self.pos].kind == .rbracket and
+                self.pos + 1 < self.tokens.len and
+                self.tokens[self.pos + 1].kind == .rbracket)
+            {
+                self.pos += 2;
+                break;
+            }
+            if (self.tokens[self.pos].kind == .ident) {
+                var attr_ident = self.tokens[self.pos].lexeme;
+                self.pos += 1;
+                if (self.pos + 1 < self.tokens.len and self.tokens[self.pos].kind == .colon_colon and
+                    self.tokens[self.pos + 1].kind == .ident)
+                {
+                    attr_ident = self.tokens[self.pos + 1].lexeme;
+                    self.pos += 2;
+                }
+                if (C_GNU_OR_C23_ATTR_MAP.get(stripDoubleUnderscores(attr_ident))) |attr_kind| {
+                    switch (attr_kind) {
+                        .attr_packed => is_packed.* = true,
+                        .attr_ms_struct => is_ms_struct.* = true,
+                        .attr_gcc_struct => is_gcc_struct.* = true,
+                        .attr_noreturn => is_noreturn.* = true,
+                        .attr_aligned => {
+                            if (self.pos < self.tokens.len and self.tokens[self.pos].kind == .lparen) {
+                                self.pos += 1;
+                                if (self.pos < self.tokens.len and self.tokens[self.pos].kind == .number) {
+                                    if (parseCIntegerLiteral(self.tokens[self.pos].lexeme)) |iv| {
+                                        if (iv.bits > 0 and std.math.isPowerOfTwo(iv.bits)) {
+                                            explicit_align.* = @max(
+                                                explicit_align.*,
+                                                @as(u32, @intCast(iv.bits)),
+                                            );
+                                        }
+                                    }
+                                    self.pos += 1;
+                                }
+                                if (self.pos < self.tokens.len and self.tokens[self.pos].kind == .rparen) {
+                                    self.pos += 1;
+                                }
+                            }
+                        },
+                        .attr_counted_by => {
+                            if (self.pos < self.tokens.len and self.tokens[self.pos].kind == .lparen) {
+                                self.pos += 1;
+                                if (self.pos < self.tokens.len and
+                                    (self.tokens[self.pos].kind == .ident or
+                                        self.tokens[self.pos].kind == .number))
+                                {
+                                    contract.slice_len_param = self.tokens[self.pos].lexeme;
+                                    self.pos += 1;
+                                }
+                                if (self.pos < self.tokens.len and self.tokens[self.pos].kind == .rparen) {
+                                    self.pos += 1;
+                                }
+                            }
+                        },
+                        .attr_malloc, .attr_nonnull => {
+                            if (self.pos < self.tokens.len and self.tokens[self.pos].kind == .lparen) {
+                                try self.skipBalancedParens();
+                            }
+                        },
+                    }
+                } else if (self.pos < self.tokens.len and self.tokens[self.pos].kind == .lparen) {
+                    try self.skipBalancedParens();
+                }
+            } else {
+                self.pos += 1;
+            }
+        }
+    }
+
+    /// Skips a balanced `( … )` group starting at `self.pos`.
+    fn skipBalancedParens(self: *CDeclParser) CFrontendError!void {
+        if ((try self.peekKind()) != .lparen) return;
+        self.pos += 1;
+        var depth: u32 = 1;
+        while (self.pos < self.tokens.len and depth > 0) : (self.pos += 1) {
+            const tok_kind = self.tokens[self.pos].kind;
+            if (tok_kind == .lparen) {
+                depth += 1;
+                if (depth >= self.options.max_parse_depth) {
+                    return self.failHere("C parenthesis nesting exceeded `MAX_C_PARSE_DEPTH`");
+                }
+            } else if (tok_kind == .rparen) {
+                depth -= 1;
+            }
+        }
+        if (depth != 0) return self.failHere("unclosed `(` in C attribute or expression");
+    }
+
+    /// Skips a balanced `{ … }` function body starting at `self.pos` (`DR-20` Seam #6).
+    fn skipBalancedBraces(self: *CDeclParser) CFrontendError!void {
+        if ((try self.peekKind()) != .lbrace) return;
+        self.pos += 1;
+        var depth: u32 = 1;
+        while (self.pos < self.tokens.len and depth > 0) : (self.pos += 1) {
+            const tok_kind = self.tokens[self.pos].kind;
+            if (tok_kind == .lbrace) {
+                depth += 1;
+                if (depth >= self.options.max_parse_depth) {
+                    return self.failHere("C brace nesting exceeded `MAX_C_PARSE_DEPTH`");
+                }
+            } else if (tok_kind == .rbrace) {
+                depth -= 1;
+            }
+        }
+        if (depth != 0) return self.failHere("unclosed `{` in C inline function body");
+    }
+
+    /// Parses a `static const` scalar/string initializer or skips complex aggregate initializers.
+    fn parseInitializerOrConstVal(self: *CDeclParser, depth: u32) CFrontendError!?MacroConstValue {
+        if (depth >= self.options.max_parse_depth) {
+            return self.failHere("C initializer nesting exceeded `MAX_C_PARSE_DEPTH`");
+        }
+        if ((try self.peekKind()) == .lbrace) {
+            try self.skipBalancedBraces();
+            return null;
+        }
+        const start_idx = self.pos;
+        var p_depth: u32 = 0;
+        while (self.pos < self.tokens.len) {
+            const tok_kind = self.tokens[self.pos].kind;
+            if (p_depth == 0 and (tok_kind == .comma or tok_kind == .semi)) break;
+            if (tok_kind == .lparen or tok_kind == .lbracket or tok_kind == .lbrace) {
+                p_depth += 1;
+                if (depth + p_depth >= self.options.max_parse_depth) {
+                    return self.failHere("C initializer delimiter nesting exceeded `MAX_C_PARSE_DEPTH`");
+                }
+            } else if (tok_kind == .rparen or tok_kind == .rbracket or tok_kind == .rbrace) {
+                if (p_depth == 0) break;
+                p_depth -= 1;
+            }
+            self.pos += 1;
+        }
+        const expr_slice = self.tokens[start_idx..self.pos];
+        if (expr_slice.len == 0) return null;
+        if (expr_slice.len == 1 and expr_slice[0].kind == .string_lit) {
+            return .{ .string_val = try decodeCStringLiteral(&self.unit.arena, expr_slice[0].lexeme) };
+        } else if (expr_slice.len == 1 and expr_slice[0].kind == .number) {
+            if (parseCFloatLiteral(expr_slice[0].lexeme)) |fv| return .{ .float_val = fv };
+        } else if (expr_slice.len == 2 and
+            (expr_slice[0].kind == .minus or expr_slice[0].kind == .plus) and
+            expr_slice[1].kind == .number)
+        {
+            if (parseCFloatLiteral(expr_slice[1].lexeme)) |fv| {
+                return .{ .float_val = if (expr_slice[0].kind == .minus) -fv else fv };
+            }
+        }
+        var dummy_sink = DiagnosticSink.init(self.unit.allocator);
+        defer dummy_sink.deinit();
+        var eval = ConstExprEvaluator{
+            .unit = self.unit,
+            .sink = &dummy_sink,
+            .tokens = expr_slice,
+            .known_consts = &self.known_int_consts,
+            .parser_ctx = self,
+            .max_depth = self.options.max_parse_depth,
+            .is_silent = true,
+        };
+        const eval_val = eval.parseCompleteTernary(depth + 1) catch return null;
+        return if (eval_val.is_unsigned)
+            .{ .unsigned_int = eval_val.bits }
+        else
+            .{ .signed_int = eval_val.asSigned() };
+    }
+
+    /// Evaluates an integer constant expression stopping at top-level `,` or `)`.
+    fn parseConstantIntExprUntilCommaOrRparen(self: *CDeclParser, depth: u32) CFrontendError!i128 {
+        return self.parseConstantIntExprUntilSet(depth, comptime cTokenMask(&.{ .comma, .rparen }));
+    }
+
+    /// Evaluates an integer constant expression stopping at top-level `,` or `;`.
+    fn parseConstantIntExprUntilCommaOrSemi(self: *CDeclParser, depth: u32) CFrontendError!i128 {
+        return self.parseConstantIntExprUntilSet(depth, comptime cTokenMask(&.{ .comma, .semi }));
+    }
+
+    /// Evaluates an integer constant expression stopping at top-level `,` or `}`.
+    fn parseConstantIntExprUntilCommaOrRbrace(self: *CDeclParser, depth: u32) CFrontendError!i128 {
+        return self.parseConstantIntExprUntilSet(depth, comptime cTokenMask(&.{ .comma, .rbrace }));
+    }
+
+    /// Evaluates an integer constant expression stopping at top-level `]`.
+    fn parseConstantIntExprUntilRbracket(self: *CDeclParser, depth: u32) CFrontendError!i128 {
+        return self.parseConstantIntExprUntilSet(depth, comptime cTokenMask(&.{.rbracket}));
+    }
+
+    /// Slices tokens up to any top-level delimiter in `stop_mask` and evaluates to `i128`.
+    fn parseConstantIntExprUntilSet(
+        self: *CDeclParser,
+        depth: u32,
+        stop_mask: CTokenMask64,
+    ) CFrontendError!i128 {
+        try self.flushPragmaPack();
+        const start_idx = self.pos;
+        var nested: u32 = 0;
+        while (self.pos < self.tokens.len) {
+            const tok_kind = self.tokens[self.pos].kind;
+            if (nested == 0 and isCTokenInMask(tok_kind, stop_mask)) break;
+            if (tok_kind == .lparen or tok_kind == .lbracket or tok_kind == .lbrace) {
+                nested += 1;
+            } else if (tok_kind == .rparen or tok_kind == .rbracket or tok_kind == .rbrace) {
+                if (nested == 0) break;
+                nested -= 1;
+            }
+            self.pos += 1;
+        }
+        const slice = self.tokens[start_idx..self.pos];
+        if (slice.len == 0) return self.failHere("expected integer constant expression in C declaration");
+        var eval = ConstExprEvaluator{
+            .unit = self.unit,
+            .sink = self.sink,
+            .tokens = slice,
+            .known_consts = &self.known_int_consts,
+            .parser_ctx = self,
+            .max_depth = self.options.max_parse_depth,
+        };
+        return (try eval.parseCompleteTernary(depth + 1)).asI128();
+    }
+
+    /// Returns `true` if `type_id` embeds an incomplete or self-referential `struct`/`union` or `void` by value.
+    fn hasIncompleteRecordOrVoidByValue(
+        self: *const CDeclParser,
+        type_id: CTypeId,
+        depth: u32,
+    ) bool {
+        if (depth > MAX_C_PARSE_DEPTH or type_id.isNone()) return true;
+        return switch (self.unit.getType(self.unit.unwrapTypedefs(type_id))) {
+            .pointer, .function, .enum_ref => false,
+            .primitive => |prim| prim == .c_void,
+            .record_ref => |rec_id| !self.unit.getDecl(rec_id).kind.record_decl.is_complete,
+            .array => |arr| self.hasIncompleteRecordOrVoidByValue(arr.elem, depth + 1),
+            .atomic_val => |inner| self.hasIncompleteRecordOrVoidByValue(inner, depth + 1),
+            .typedef_ref => true,
+        };
+    }
+
+    /// Returns `true` when `type_id` unwraps to an integer, `_Bool`, or complete/fixed `enum` valid for a C bitfield.
+    fn isValidBitfieldBaseType(self: *const CDeclParser, type_id: CTypeId) bool {
+        return switch (self.unit.getType(self.unit.unwrapTypedefs(type_id))) {
+            .primitive => |prim| prim.isInteger(),
+            .enum_ref => |en_id| blk: {
+                const en_decl = self.unit.getDecl(en_id).kind.enum_decl;
+                break :blk en_decl.is_complete or en_decl.underlying_prim != null;
+            },
+            else => false,
+        };
+    }
+
+    /// Returns `true` if `type_id` embeds a function signature passing/returning non-8-byte `long double` by value.
+    fn hasUnsupportedFnLongDouble(self: *const CDeclParser, type_id: CTypeId, depth: u32) bool {
+        if (CPrimitiveKind.c_longdouble.byteSize(self.unit.target) == 8) return false;
+        if (depth > MAX_C_PARSE_DEPTH or type_id.isNone()) return false;
+        return switch (self.unit.getType(self.unit.unwrapTypedefs(type_id))) {
+            .function => |fn_ty| self.hasUnsupportedByValueLongDoubleSig(
+                fn_ty.return_type,
+                fn_ty.param_start,
+                fn_ty.param_len,
+            ),
+            .pointer => |ptr| self.hasUnsupportedFnLongDouble(ptr.pointee, depth + 1),
+            .array => |arr| self.hasUnsupportedFnLongDouble(arr.elem, depth + 1),
+            .atomic_val => |inner| self.hasUnsupportedFnLongDouble(inner, depth + 1),
+            else => false,
+        };
+    }
+
+    /// Returns `true` if a C function signature passes or returns a non-8-byte `long double` (`f80`/`fp128`) by value.
+    fn hasUnsupportedByValueLongDoubleSig(
+        self: *const CDeclParser,
+        return_type: CTypeId,
+        param_start: u32,
+        param_len: u32,
+    ) bool {
+        if (CPrimitiveKind.c_longdouble.byteSize(self.unit.target) == 8) return false;
+        if (self.unit.hasByValueLongDouble(return_type, 0) or
+            self.hasUnsupportedFnLongDouble(return_type, 0))
+        {
+            return true;
+        }
+        for (self.unit.getParams(param_start, param_len)) |param| {
+            if (self.unit.hasByValueLongDouble(param.type_id, 0) or
+                self.hasUnsupportedFnLongDouble(param.type_id, 0))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Computes target `sizeof(T)` for `sizeof(…)` inside C `_Static_assert` / array bounds (`depth`-capped).
+    fn estimateTypeSizeBytes(self: *const CDeclParser, type_id: CTypeId, depth: u32) u64 {
+        return self.unit.computeTypeByteSize(type_id, depth);
+    }
+
+    /// Computes target `alignof(T)` for `_Alignas(Type)` (`depth`-capped).
+    fn estimateTypeAlignBytes(self: *const CDeclParser, type_id: CTypeId, depth: u32) u32 {
+        return self.unit.computeTypeNaturalAlign(type_id, depth);
+    }
+
+    /// Computes canonical target C ABI `(size_bytes, align_bytes)` for `rec_id` (`depth`-capped).
+    fn estimateStructOrUnionLayout(self: *const CDeclParser, rec_id: CDeclId, depth: u32) CRecordByteLayout {
+        return self.unit.computeRecordByteLayout(rec_id, depth);
+    }
+};
+
 // --------------------------------------- CONSTS ----------------------------------------
 
 /// Hard upper bound on preprocessed C tokens per translation unit (`AGENTS.md` §2).
@@ -1146,6 +5347,10 @@ pub const MAX_MACRO_EXPANSION_STEPS: u32 = 65_536;
 pub const MAX_INCLUDE_DEPTH: u32 = 64;
 /// Hard upper bound on recursive C declarator, struct, and expression parse depth (`AGENTS.md` §2).
 pub const MAX_C_PARSE_DEPTH: u32 = 256;
+/// Isolated per-macro expansion step cap during speculative `#define` constant promotion.
+const MAX_MACRO_CONST_PROBE_STEPS: u32 = 256;
+/// Isolated per-macro expanded token cap during speculative `#define` constant promotion.
+const MAX_MACRO_CONST_PROBE_TOKENS: usize = 256;
 
 // ------------------- Bundled System Headers -------------------
 
@@ -1354,6 +5559,175 @@ pub const BUNDLED_SYSTEM_HEADERS = std.StaticStringMap([]const u8).initComptime(
     .{ "sys/types.h", VIRTUAL_SYS_TYPES_H },
 });
 
+// ----------------- Keyword & Attribute Tables -----------------
+
+/// $O(1)$ map of C11/C23 `#` preprocessor directive names.
+const CPP_DIRECTIVE_MAP = std.StaticStringMap(CppDirectiveKind).initComptime(.{
+    .{ "define", .define_dir },
+    .{ "elif", .elif_dir },
+    .{ "elifdef", .elifdef_dir },
+    .{ "elifndef", .elifndef_dir },
+    .{ "else", .else_dir },
+    .{ "endif", .endif_dir },
+    .{ "error", .error_dir },
+    .{ "if", .if_dir },
+    .{ "ifdef", .ifdef_dir },
+    .{ "ifndef", .ifndef_dir },
+    .{ "include", .include_dir },
+    .{ "line", .line_dir },
+    .{ "pragma", .pragma_dir },
+    .{ "undef", .undef_dir },
+    .{ "warning", .warning_dir },
+});
+
+/// $O(1)$ map of C11/C23 `#if` / `#elif` query operators.
+const CPP_IF_BUILTIN_MAP = std.StaticStringMap(CppIfBuiltinKind).initComptime(.{
+    .{ "__has_attribute", .has_attribute },
+    .{ "__has_builtin", .has_builtin },
+    .{ "__has_c_attribute", .has_c_attribute },
+    .{ "__has_include", .has_include },
+    .{ "defined", .defined_op },
+});
+
+/// $O(1)$ map of encoding prefixes on C character constants (`L'…'`, `U'…'`, `u'…'`, `u8'…'`).
+const C_CHAR_PREFIX_MAP = std.StaticStringMap(CCharPrefixKind).initComptime(.{
+    .{ "L", .char_wide },
+    .{ "U", .char_u32 },
+    .{ "u", .char_u16 },
+    .{ "u8", .char_u8 },
+});
+
+/// $O(1)$ map of C11/C23 declaration-specifier, storage-class, qualifier, and primitive keywords.
+const C_DECL_SPEC_KEYWORD_MAP = std.StaticStringMap(CDeclSpecKeywordKind).initComptime(.{
+    .{ "_Atomic", .kw_atomic },
+    .{ "_Bool", .kw_bool },
+    .{ "_Noreturn", .kw_noreturn },
+    .{ "_Thread_local", .kw_ignored_storage },
+    .{ "__cdecl", .kw_ignored_storage },
+    .{ "__const", .kw_const },
+    .{ "__const__", .kw_const },
+    .{ "__extension__", .kw_ignored_storage },
+    .{ "__fastcall", .kw_ignored_storage },
+    .{ "__forceinline", .kw_inline },
+    .{ "__inline", .kw_inline },
+    .{ "__inline__", .kw_inline },
+    .{ "__int128", .kw_int128 },
+    .{ "__restrict", .kw_restrict },
+    .{ "__restrict__", .kw_restrict },
+    .{ "__signed", .kw_signed },
+    .{ "__signed__", .kw_signed },
+    .{ "__stdcall", .kw_ignored_storage },
+    .{ "__thread", .kw_ignored_storage },
+    .{ "__vectorcall", .kw_ignored_storage },
+    .{ "__volatile", .kw_volatile },
+    .{ "__volatile__", .kw_volatile },
+    .{ "auto", .kw_ignored_storage },
+    .{ "bool", .kw_bool },
+    .{ "char", .kw_char },
+    .{ "const", .kw_const },
+    .{ "double", .kw_double },
+    .{ "enum", .kw_enum },
+    .{ "extern", .kw_extern },
+    .{ "float", .kw_float },
+    .{ "inline", .kw_inline },
+    .{ "int", .kw_int },
+    .{ "long", .kw_long },
+    .{ "register", .kw_ignored_storage },
+    .{ "restrict", .kw_restrict },
+    .{ "short", .kw_short },
+    .{ "signed", .kw_signed },
+    .{ "static", .kw_static },
+    .{ "struct", .kw_struct },
+    .{ "thread_local", .kw_ignored_storage },
+    .{ "typedef", .kw_typedef },
+    .{ "union", .kw_union },
+    .{ "unsigned", .kw_unsigned },
+    .{ "void", .kw_void },
+    .{ "volatile", .kw_volatile },
+});
+
+/// $O(1)$ map of pointer and C99 array-declarator qualifiers.
+const C_PTR_OR_ARRAY_QUAL_MAP = std.StaticStringMap(CPtrArrayQualKind).initComptime(.{
+    .{ "_Atomic", .qual_ignored_ptr },
+    .{ "_Nonnull", .qual_nonnull },
+    .{ "_Null_unspecified", .qual_ignored_ptr },
+    .{ "_Nullable", .qual_nullable },
+    .{ "__const", .qual_const },
+    .{ "__const__", .qual_const },
+    .{ "__nonnull", .qual_nonnull },
+    .{ "__nullable", .qual_nullable },
+    .{ "__ptr32", .qual_ignored_ptr },
+    .{ "__ptr64", .qual_ignored_ptr },
+    .{ "__restrict", .qual_restrict },
+    .{ "__restrict__", .qual_restrict },
+    .{ "__unaligned", .qual_ignored_ptr },
+    .{ "__volatile", .qual_volatile },
+    .{ "__volatile__", .qual_volatile },
+    .{ "const", .qual_const },
+    .{ "restrict", .qual_restrict },
+    .{ "static", .qual_static_array },
+    .{ "volatile", .qual_volatile },
+});
+
+/// $O(1)$ map of leading/trailing C attribute keywords and Microsoft SAL contract tokens.
+const C_LEADING_ATTR_TOKEN_MAP = std.StaticStringMap(CLeadingAttrTokenKind).initComptime(.{
+    .{ "_Alignas", .alignas_spec },
+    .{ "_In_", .sal_non_null },
+    .{ "_In_opt_", .sal_may_be_null },
+    .{ "_In_opt_z_", .sal_in_opt_z },
+    .{ "_In_reads_", .sal_in_reads },
+    .{ "_In_z_", .sal_in_z },
+    .{ "_Inout_", .sal_non_null },
+    .{ "_Inout_opt_", .sal_may_be_null },
+    .{ "_Nonnull", .sal_non_null },
+    .{ "_Null_unspecified", .null_unspecified },
+    .{ "_Nullable", .sal_may_be_null },
+    .{ "_Out_", .sal_out },
+    .{ "_Out_opt_", .sal_out_opt },
+    .{ "_Out_writes_", .sal_out_writes },
+    .{ "_Ret_maybenull_", .sal_may_be_null },
+    .{ "_Ret_notnull_", .sal_non_null },
+    .{ "__attribute", .gnu_attribute },
+    .{ "__attribute__", .gnu_attribute },
+    .{ "__declspec", .msvc_declspec },
+    .{ "__nonnull", .sal_non_null },
+    .{ "__nullable", .sal_may_be_null },
+    .{ "alignas", .alignas_spec },
+});
+
+/// $O(1)$ map of MSVC `__declspec(…)` modifier identifiers.
+const C_MSVC_DECLSPEC_MAP = std.StaticStringMap(CMsvcDeclspecKind).initComptime(.{
+    .{ "align", .ds_align },
+    .{ "dllexport", .ds_dllexport },
+    .{ "dllimport", .ds_dllimport },
+    .{ "noreturn", .ds_noreturn },
+});
+
+/// $O(1)$ map of canonical GNU `__attribute__` and C23 `[[…]]` attribute names.
+const C_GNU_OR_C23_ATTR_MAP = std.StaticStringMap(CGnuOrC23AttrKind).initComptime(.{
+    .{ "aligned", .attr_aligned },
+    .{ "counted_by", .attr_counted_by },
+    .{ "gcc_struct", .attr_gcc_struct },
+    .{ "malloc", .attr_malloc },
+    .{ "ms_struct", .attr_ms_struct },
+    .{ "nonnull", .attr_nonnull },
+    .{ "noreturn", .attr_noreturn },
+    .{ "packed", .attr_packed },
+});
+
+/// $O(1)$ set of C11/C23 static-assertion keywords.
+const C_STATIC_ASSERT_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "_Static_assert", {} },
+    .{ "static_assert", {} },
+});
+
+/// $O(1)$ set of GNU inline/symbol-redirect `asm` keywords.
+const C_ASM_KEYWORD_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "__asm", {} },
+    .{ "__asm__", {} },
+    .{ "asm", {} },
+});
+
 /// $O(1)$ map of built-in exact-width `<stdint.h>` / `<stddef.h>` / `<stdarg.h>` type names.
 const BUILTIN_EXACT_TYPE_MAP = std.StaticStringMap(CPrimitiveKind).initComptime(.{
     .{ "__builtin_va_list", .va_list },
@@ -1492,6 +5866,8 @@ const SAL_OR_NULLABILITY_IDENT_SET = std.StaticStringMap(void).initComptime(.{
     .{ "_Out_writes_", {} },
     .{ "_Ret_maybenull_", {} },
     .{ "_Ret_notnull_", {} },
+    .{ "__nonnull", {} },
+    .{ "__nullable", {} },
 });
 
 /// $O(1)$ set of C attribute introducer keywords (`__attribute__`, `_Alignas`, `__declspec`).
@@ -1524,6 +5900,9 @@ fn emitCTranslationError(
 ) !void {
     unit.has_errors = true;
     const owned_msg = try sink.arena.asAllocator().dupe(u8, message);
+    const help_notes = [1][]const u8{
+        "help: fix the C11/C23 header error or narrow the header surface imported into CoreX",
+    };
     if (!span.file_id.isNone()) {
         const labels = [1]LabeledSpan{.{
             .span = span,
@@ -1536,6 +5915,7 @@ fn emitCTranslationError(
             .primary_span = span,
             .message = owned_msg,
             .labels = &labels,
+            .notes = &help_notes,
         });
     } else {
         try sink.emit(.{
@@ -1543,6 +5923,7 @@ fn emitCTranslationError(
             .severity = .err,
             .primary_span = span,
             .message = owned_msg,
+            .notes = &help_notes,
         });
     }
 }
@@ -1953,8 +6334,7 @@ fn decodeCEscapeChar(raw: []const u8, cursor: *usize) u8 {
             var val: u8 = 0;
             var digits: usize = 0;
             while (cursor.* < raw.len and digits < 2) {
-                const nibble = std.fmt.charToDigit(raw[cursor.*], 16) catch break;
-                val = (val << 4) | nibble;
+                val = (val << 4) | (std.fmt.charToDigit(raw[cursor.*], 16) catch break);
                 cursor.* += 1;
                 digits += 1;
             }
@@ -1992,8 +6372,7 @@ fn decodeCEscapeCodepoint(raw: []const u8, cursor: *usize) ?u32 {
             var val: u32 = 0;
             var digits: usize = 0;
             while (cursor.* < raw.len) {
-                const nibble = std.fmt.charToDigit(raw[cursor.*], 16) catch break;
-                val = (val << 4) | @as(u32, nibble);
+                val = (val << 4) | @as(u32, std.fmt.charToDigit(raw[cursor.*], 16) catch break);
                 cursor.* += 1;
                 digits += 1;
             }
@@ -2006,8 +6385,7 @@ fn decodeCEscapeCodepoint(raw: []const u8, cursor: *usize) ?u32 {
             var val: u32 = 0;
             var digit_i: usize = 0;
             while (digit_i < needed_digits) : (digit_i += 1) {
-                const nibble = std.fmt.charToDigit(raw[cursor.*], 16) catch return null;
-                val = (val << 4) | @as(u32, nibble);
+                val = (val << 4) | @as(u32, std.fmt.charToDigit(raw[cursor.*], 16) catch return null);
                 cursor.* += 1;
             }
             if (val > 0x10FFFF) break :blk null;
@@ -2057,41 +6435,41 @@ fn parseCCharLiteral(lexeme: []const u8, target: TargetSpec) ?CIntVal {
     const inner = lexeme[first_quote + 1 .. lexeme.len - 1];
     if (inner.len == 0) return null;
 
-    // [1] Wide and UTF-16/UTF-32 character constants (`u'…'`, `U'…'`, `L'…'`):
-    if (std.mem.eql(u8, prefix, "u") or std.mem.eql(u8, prefix, "U") or std.mem.eql(u8, prefix, "L")) {
-        const codepoint: u32 = if (inner[0] == '\\') blk: {
-            var cursor: usize = 1;
-            const esc_cp = decodeCEscapeCodepoint(inner, &cursor) orelse return null;
-            if (cursor != inner.len) return null;
-            break :blk esc_cp;
-        } else blk: {
-            const seq_len = std.unicode.utf8ByteSequenceLength(inner[0]) catch return null;
-            if (seq_len != inner.len) return null;
-            const decoded_cp = std.unicode.utf8Decode(inner[0..seq_len]) catch return null;
-            break :blk @intCast(decoded_cp);
-        };
-        if (std.mem.eql(u8, prefix, "u") and codepoint > 0xFFFF) return null;
-        return .{
-            .bits = codepoint,
-            .is_unsigned = std.mem.eql(u8, prefix, "U"),
-        };
-    }
-
-    // [2] C23 UTF-8 `u8'…'` character constant (`char8_t` = `unsigned char`):
-    if (std.mem.eql(u8, prefix, "u8")) {
-        if (inner[0] == '\\') {
-            var cursor: usize = 1;
-            const esc_cp = decodeCEscapeCodepoint(inner, &cursor) orelse return null;
-            if (cursor != inner.len or esc_cp > 0xFF) return null;
-            return .{ .bits = esc_cp, .is_unsigned = true };
+    // [1] Prefixed character constants (`u'…'`, `U'…'`, `L'…'`, `u8'…'`) via $O(1)$ map:
+    if (prefix.len > 0) {
+        const prefix_kind = C_CHAR_PREFIX_MAP.get(prefix) orelse return null;
+        switch (prefix_kind) {
+            .char_u16, .char_u32, .char_wide => {
+                const codepoint: u32 = if (inner[0] == '\\') blk: {
+                    var cursor: usize = 1;
+                    const esc_cp = decodeCEscapeCodepoint(inner, &cursor) orelse return null;
+                    if (cursor != inner.len) return null;
+                    break :blk esc_cp;
+                } else blk: {
+                    const seq_len = std.unicode.utf8ByteSequenceLength(inner[0]) catch return null;
+                    if (seq_len != inner.len) return null;
+                    break :blk @intCast(std.unicode.utf8Decode(inner[0..seq_len]) catch return null);
+                };
+                if (prefix_kind == .char_u16 and codepoint > 0xFFFF) return null;
+                return .{
+                    .bits = codepoint,
+                    .is_unsigned = prefix_kind == .char_u32,
+                };
+            },
+            .char_u8 => {
+                if (inner[0] == '\\') {
+                    var cursor: usize = 1;
+                    const esc_cp = decodeCEscapeCodepoint(inner, &cursor) orelse return null;
+                    if (cursor != inner.len or esc_cp > 0xFF) return null;
+                    return .{ .bits = esc_cp, .is_unsigned = true };
+                }
+                if (inner.len != 1 or inner[0] >= 0x80) return null;
+                return .{ .bits = inner[0], .is_unsigned = true };
+            },
         }
-        if (inner.len != 1 or inner[0] >= 0x80) return null;
-        return .{ .bits = inner[0], .is_unsigned = true };
     }
 
-    if (prefix.len != 0) return null;
-
-    // [3] Unprefixed `'…'` C character constant (sign-extended from `char` when `target.isCCharSigned()`):
+    // [2] Unprefixed `'…'` C character constant (sign-extended from `char` when `target.isCCharSigned()`):
     var cursor: usize = 0;
     const first_cp: u32 = if (inner[0] == '\\') blk: {
         cursor = 1;
@@ -2105,8 +6483,7 @@ fn parseCCharLiteral(lexeme: []const u8, target: TargetSpec) ?CIntVal {
         if (first_cp > 0xFF) return null;
         const byte_val: u8 = @intCast(first_cp);
         if (target.isCCharSigned()) {
-            const signed_char: i8 = @bitCast(byte_val);
-            return .{ .bits = @bitCast(@as(i64, signed_char)), .is_unsigned = false };
+            return .{ .bits = @bitCast(@as(i64, @as(i8, @bitCast(byte_val)))), .is_unsigned = false };
         }
         return .{ .bits = byte_val, .is_unsigned = false };
     }
@@ -2121,16 +6498,14 @@ fn parseCCharLiteral(lexeme: []const u8, target: TargetSpec) ?CIntVal {
             cursor += 1;
             break :blk decodeCEscapeCodepoint(inner, &cursor) orelse return null;
         } else blk: {
-            const raw_b = inner[cursor];
-            cursor += 1;
-            break :blk raw_b;
+            defer cursor += 1;
+            break :blk inner[cursor];
         };
         if (next_cp > 0xFF) return null;
         multi_acc = (multi_acc << 8) | next_cp;
         byte_count += 1;
     }
-    const multi_i32: i32 = @bitCast(multi_acc);
-    return .{ .bits = @bitCast(@as(i64, multi_i32)), .is_unsigned = false };
+    return .{ .bits = @bitCast(@as(i64, @as(i32, @bitCast(multi_acc)))), .is_unsigned = false };
 }
 
 /// Parses a C11/C23 integer literal (`0x…`, `0b…`, `0…`, decimal, `'` separators, `U`/`L`/`ULL`/`Z` suffixes).
@@ -2182,8 +6557,7 @@ fn parseCIntegerLiteral(lexeme: []const u8) ?CIntVal {
         return null;
     }
 
-    const digits = clean[start_idx..end_idx];
-    const parsed_u64 = std.fmt.parseInt(u64, digits, radix) catch return null;
+    const parsed_u64 = std.fmt.parseInt(u64, clean[start_idx..end_idx], radix) catch return null;
     const is_unsigned = has_u_suffix or (radix != 10 and parsed_u64 > @as(u64, std.math.maxInt(i64))) or
         parsed_u64 > @as(u64, std.math.maxInt(i64));
     return .{ .bits = parsed_u64, .is_unsigned = is_unsigned };
@@ -2230,1534 +6604,7 @@ fn normalizeIncludePath(arena: *BumpArena, raw_path: []const u8) ![]const u8 {
     return buf[0..out_len];
 }
 
-// -------------------- Preprocessor Engine ---------------------
-
-/// Stateful C11/C23 preprocessor with Blue-Paint macro recursion prevention and `#pragma once`.
-const CPreprocessor = struct {
-    /// Owning translation unit receiving expanded tokens and macro constants.
-    unit: *CTranslationUnit,
-    /// Diagnostic sink for `E0009` errors.
-    sink: *DiagnosticSink,
-    /// Frontend configuration and resource caps.
-    options: CFrontendOptions,
-    /// Active `#define` symbol table.
-    macros: std.StringHashMapUnmanaged(MacroEntry) = .empty,
-    /// Ordered names of user object-like `#define` macros candidate for `pub const` promotion.
-    user_object_macro_order: std.ArrayListUnmanaged([]const u8) = .empty,
-    /// Canonical header paths marked with `#pragma once`.
-    pragma_once_headers: std.StringHashMapUnmanaged(void) = .empty,
-    /// Refcounted active macro names currently undergoing rescanning ($O(1)$ Blue-Paint guard).
-    active_macro_counts: std.StringHashMapUnmanaged(u32) = .empty,
-    /// `true` once `virtual_header_map` and `vfs_header_map` have been populated on first `#include`.
-    has_built_include_maps: bool = false,
-    /// Lazily built $O(1)$ normalized-path -> content map over `options.virtual_headers`.
-    virtual_header_map: std.StringHashMapUnmanaged([]const u8) = .empty,
-    /// Lazily built $O(1)$ virtual-path -> content map over `options.include_loader.vfs`.
-    vfs_header_map: std.StringHashMapUnmanaged([]const u8) = .empty,
-    /// Cumulative macro replacement steps executed across the unit.
-    expansion_steps: u32 = 0,
-    /// Current macro expansion / substitution call-stack depth (capped at `options.max_parse_depth`).
-    macro_recursion_depth: u32 = 0,
-    /// Cumulative expanded token count across all `substituteAndPasteMacroBody` and `expandTokenSequence` calls.
-    expanded_token_budget: usize = 0,
-    /// `true` once any preprocessor resource cap (`max_tokens`, `max_macro_steps`, `max_parse_depth`) has tripped.
-    has_hit_resource_cap: bool = false,
-    /// `true` while speculatively expanding candidate object-like `#define`s for `pub const` promotion.
-    is_probing_macro_const: bool = false,
-
-    /// Releases temporary hash maps and stacks owned by `self`.
-    fn deinit(self: *CPreprocessor) void {
-        self.macros.deinit(self.unit.allocator);
-        self.user_object_macro_order.deinit(self.unit.allocator);
-        self.pragma_once_headers.deinit(self.unit.allocator);
-        self.active_macro_counts.deinit(self.unit.allocator);
-        self.virtual_header_map.deinit(self.unit.allocator);
-        self.vfs_header_map.deinit(self.unit.allocator);
-    }
-
-    /// Defines a single predefined scalar/identifier macro into `self.macros`.
-    fn defineBuiltinText(self: *CPreprocessor, name: []const u8, val_text: []const u8) !void {
-        const name_owned = try self.unit.arena.dupe(u8, name);
-        var body_list: std.ArrayListUnmanaged(CToken) = .empty;
-        defer body_list.deinit(self.unit.allocator);
-        if (val_text.len > 0) {
-            try tokenizeCSBuffer(
-                self.unit,
-                self.sink,
-                val_text,
-                .none,
-                true,
-                self.options.max_tokens,
-                &body_list,
-            );
-        }
-        const body_slice = try self.unit.arena.dupe(CToken, body_list.items);
-        try self.macros.put(self.unit.allocator, name_owned, .{
-            .name = name_owned,
-            .body = body_slice,
-            .is_from_system_header = true,
-        });
-    }
-
-    /// Populates target-calibrated C11/C23 predefined macros and user `-D` defines.
-    fn populatePredefinedMacros(self: *CPreprocessor) CFrontendError!void {
-        const target = self.options.target;
-        try self.defineBuiltinText("__STDC__", "1");
-        try self.defineBuiltinText("__STDC_VERSION__", "201710L");
-        try self.defineBuiltinText("__STDC_HOSTED__", if (target.isFreestanding()) "0" else "1");
-        try self.defineBuiltinText("__ORDER_LITTLE_ENDIAN__", "1234");
-        try self.defineBuiltinText("__ORDER_BIG_ENDIAN__", "4321");
-        try self.defineBuiltinText("__BYTE_ORDER__", "__ORDER_LITTLE_ENDIAN__");
-        try self.defineBuiltinText("__SIZEOF_SHORT__", "2");
-        try self.defineBuiltinText("__SIZEOF_INT__", "4");
-        try self.defineBuiltinText("__SIZEOF_LONG_LONG__", "8");
-
-        const ptr_str = if (target.ptrBytes() == 4) "4" else "8";
-        const long_str = if (target.cLongByteSize() == 4) "4" else "8";
-        try self.defineBuiltinText("__SIZEOF_POINTER__", ptr_str);
-        try self.defineBuiltinText("__SIZEOF_SIZE_T__", ptr_str);
-        try self.defineBuiltinText("__SIZEOF_LONG__", long_str);
-
-        if (target.cLongByteSize() == 8) {
-            try self.defineBuiltinText("__LP64__", "1");
-            try self.defineBuiltinText("_LP64", "1");
-        }
-        if (!target.isCCharSigned()) {
-            try self.defineBuiltinText("__CHAR_UNSIGNED__", "1");
-        }
-
-        switch (target.arch) {
-            .x86_64 => {
-                try self.defineBuiltinText("__x86_64__", "1");
-                try self.defineBuiltinText("__x86_64", "1");
-                try self.defineBuiltinText("__amd64__", "1");
-                if (target.os == .windows) {
-                    try self.defineBuiltinText("_M_X64", "100");
-                    try self.defineBuiltinText("_M_AMD64", "100");
-                }
-            },
-            .aarch64 => {
-                try self.defineBuiltinText("__aarch64__", "1");
-                if (target.os == .windows) {
-                    try self.defineBuiltinText("_M_ARM64", "1");
-                }
-            },
-            .wasm32 => {
-                try self.defineBuiltinText("__wasm32__", "1");
-                try self.defineBuiltinText("__wasm__", "1");
-            },
-        }
-
-        switch (target.os) {
-            .linux => {
-                try self.defineBuiltinText("__linux__", "1");
-                try self.defineBuiltinText("__linux", "1");
-                try self.defineBuiltinText("__unix__", "1");
-            },
-            .macos => {
-                try self.defineBuiltinText("__APPLE__", "1");
-                try self.defineBuiltinText("__MACH__", "1");
-            },
-            .windows => {
-                try self.defineBuiltinText("_WIN32", "1");
-                try self.defineBuiltinText("_WIN64", "1");
-                if (target.abi == .msvc) {
-                    try self.defineBuiltinText("_MSC_VER", "1930");
-                } else {
-                    try self.defineBuiltinText("__MINGW32__", "1");
-                    try self.defineBuiltinText("__MINGW64__", "1");
-                    try self.defineBuiltinText("__GNUC__", "14");
-                }
-            },
-            .wasi => {
-                try self.defineBuiltinText("__wasi__", "1");
-            },
-            .freestanding => {},
-        }
-
-        // Apply user `-DNAME` / `-DNAME=VAL` defines:
-        for (self.options.defines) |user_def| {
-            if (user_def.name.len == 0) continue;
-            const val_str = user_def.value orelse "1";
-            const name_owned = try self.unit.arena.dupe(u8, user_def.name);
-            var def_toks: std.ArrayListUnmanaged(CToken) = .empty;
-            defer def_toks.deinit(self.unit.allocator);
-            if (val_str.len > 0) {
-                try tokenizeCSBuffer(
-                    self.unit,
-                    self.sink,
-                    val_str,
-                    .none,
-                    false,
-                    self.options.max_tokens,
-                    &def_toks,
-                );
-            }
-            try self.macros.put(self.unit.allocator, name_owned, .{
-                .name = name_owned,
-                .body = try self.unit.arena.dupe(CToken, def_toks.items),
-                .is_from_system_header = false,
-            });
-            try self.user_object_macro_order.append(self.unit.allocator, name_owned);
-        }
-    }
-
-    /// Marks `macro_name` as active in the $O(1)$ Blue-Paint recursion table.
-    fn pushActiveMacro(self: *CPreprocessor, macro_name: []const u8) !void {
-        const gop = try self.active_macro_counts.getOrPut(self.unit.allocator, macro_name);
-        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
-    }
-
-    /// Decrements `macro_name` in the $O(1)$ Blue-Paint recursion table, removing it at `0`.
-    fn popActiveMacro(self: *CPreprocessor, macro_name: []const u8) void {
-        if (self.active_macro_counts.getPtr(macro_name)) |count_ptr| {
-            if (count_ptr.* <= 1) {
-                _ = self.active_macro_counts.remove(macro_name);
-            } else {
-                count_ptr.* -= 1;
-            }
-        }
-    }
-
-    /// Returns `true` in $O(1)$ if `macro_name` is currently on the active Blue-Paint expansion set.
-    inline fn isMacroBluePainted(self: *const CPreprocessor, macro_name: []const u8) bool {
-        return self.active_macro_counts.contains(macro_name);
-    }
-
-    /// Lazily populates $O(1)$ lookup maps for `options.virtual_headers` and `VfsSourceMap` entries.
-    fn ensureIncludeMapsBuilt(self: *CPreprocessor) !void {
-        if (self.has_built_include_maps) return;
-        self.has_built_include_maps = true;
-        for (self.options.virtual_headers) |vh| {
-            const norm_vh = try normalizeIncludePath(&self.unit.arena, vh.path);
-            const gop = try self.virtual_header_map.getOrPut(self.unit.allocator, norm_vh);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = vh.content;
-            }
-        }
-        if (self.options.include_loader == .vfs) {
-            const vfs_map = self.options.include_loader.vfs;
-            for (vfs_map.entries.items) |entry| {
-                const vpath = vfs_map.interner.get(entry.virtual_path);
-                const gop = try self.vfs_header_map.getOrPut(self.unit.allocator, vpath);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = entry.content;
-                }
-            }
-        }
-    }
-
-    /// Resolves `#include` content without mutating state (`is_probe_only == true` for `__has_include`).
-    fn resolveIncludeContent(
-        self: *CPreprocessor,
-        include_name: []const u8,
-        is_angled: bool,
-        includer_path: []const u8,
-    ) !?struct { canonical_key: []const u8, content: []const u8, is_system: bool } {
-        try self.ensureIncludeMapsBuilt();
-        const norm_req = try normalizeIncludePath(&self.unit.arena, include_name);
-
-        // [1] For `"…"` includes, search relative to the current includer's directory first:
-        if (!is_angled) {
-            const parent_dir = if (std.mem.lastIndexOfScalar(u8, includer_path, '/')) |slash_idx|
-                includer_path[0..slash_idx]
-            else
-                "";
-            const rel_candidate = if (parent_dir.len > 0) blk: {
-                const joined = try std.fmt.allocPrint(
-                    self.unit.arena.asAllocator(),
-                    "{s}/{s}",
-                    .{ parent_dir, norm_req },
-                );
-                break :blk try normalizeIncludePath(&self.unit.arena, joined);
-            } else norm_req;
-
-            if (try self.tryLoadSingleCandidate(rel_candidate)) |found| {
-                return .{ .canonical_key = rel_candidate, .content = found, .is_system = false };
-            }
-        }
-
-        // [2] Search explicit `virtual_headers` directly by normalized name in $O(1)$:
-        if (self.virtual_header_map.getEntry(norm_req)) |vh_entry| {
-            return .{
-                .canonical_key = vh_entry.key_ptr.*,
-                .content = try self.unit.arena.dupe(u8, vh_entry.value_ptr.*),
-                .is_system = false,
-            };
-        }
-
-        // [3] Search `-Idir` `include_dirs`:
-        for (self.options.include_dirs) |inc_dir| {
-            const joined = try std.fmt.allocPrint(
-                self.unit.arena.asAllocator(),
-                "{s}/{s}",
-                .{ inc_dir, norm_req },
-            );
-            const norm_joined = try normalizeIncludePath(&self.unit.arena, joined);
-            if (try self.tryLoadSingleCandidate(norm_joined)) |found| {
-                return .{ .canonical_key = norm_joined, .content = found, .is_system = is_angled };
-            }
-        }
-
-        // [4] Check bundled virtual standard C headers (`<stdint.h>`, `<stddef.h>`, etc.):
-        if (BUNDLED_SYSTEM_HEADERS.get(norm_req)) |bundled_src| {
-            const sys_key = try std.fmt.allocPrint(
-                self.unit.arena.asAllocator(),
-                "<builtin:{s}>",
-                .{norm_req},
-            );
-            return .{ .canonical_key = sys_key, .content = bundled_src, .is_system = true };
-        }
-
-        return null;
-    }
-
-    /// Probes `virtual_headers`, `VfsSourceMap`, or `std.Io` host disk for `candidate_path` in $O(1)$.
-    fn tryLoadSingleCandidate(self: *CPreprocessor, candidate_path: []const u8) !?[]const u8 {
-        try self.ensureIncludeMapsBuilt();
-        if (self.virtual_header_map.get(candidate_path)) |vh_content| {
-            return try self.unit.arena.dupe(u8, vh_content);
-        }
-        switch (self.options.include_loader) {
-            .none => return null,
-            .vfs => {
-                if (self.vfs_header_map.get(candidate_path)) |vfs_content| {
-                    return try self.unit.arena.dupe(u8, vfs_content);
-                }
-                return null;
-            },
-            .host_fs => |io| {
-                const raw_bytes = std.Io.Dir.cwd().readFileAlloc(
-                    io,
-                    candidate_path,
-                    self.unit.allocator,
-                    .limited(16 * 1024 * 1024),
-                ) catch return null;
-                defer self.unit.allocator.free(raw_bytes);
-                return try self.unit.arena.dupe(u8, raw_bytes);
-            },
-        }
-    }
-
-    /// Preprocesses `source` at `include_depth`, appending surviving tokens to `out_tokens`.
-    fn preprocessBuffer(
-        self: *CPreprocessor,
-        source: []const u8,
-        current_path: []const u8,
-        file_id: FileId,
-        is_system_header: bool,
-        include_depth: u32,
-        out_tokens: *std.ArrayListUnmanaged(CToken),
-    ) CFrontendError!void {
-        if (include_depth > self.options.max_include_depth) {
-            try emitCTranslationError(
-                self.unit,
-                self.sink,
-                Span.init(file_id, 0, 0),
-                "`#include` nesting depth exceeded `MAX_INCLUDE_DEPTH` cap",
-            );
-            return error.TranslationFailed;
-        }
-
-        const spliced = try splicePhysicalLines(&self.unit.arena, source);
-        var raw_tokens: std.ArrayListUnmanaged(CToken) = .empty;
-        defer raw_tokens.deinit(self.unit.allocator);
-        try tokenizeCSBuffer(
-            self.unit,
-            self.sink,
-            spliced,
-            file_id,
-            is_system_header,
-            self.options.max_tokens,
-            &raw_tokens,
-        );
-
-        var cond_stack: std.ArrayListUnmanaged(CondFrame) = .empty;
-        defer cond_stack.deinit(self.unit.allocator);
-
-        var idx: usize = 0;
-        const items = raw_tokens.items;
-        while (idx < items.len) {
-            const tok = items[idx];
-            const is_active = cond_stack.items.len == 0 or
-                cond_stack.items[cond_stack.items.len - 1].is_branch_active;
-
-            if (tok.is_at_line_start and tok.kind == .hash) {
-                const hash_span = tok.span;
-                idx += 1;
-                // Collect tokens up to end-of-line:
-                const dir_start = idx;
-                while (idx < items.len and !items[idx].is_at_line_start) : (idx += 1) {}
-                const dir_tokens = items[dir_start..idx];
-                if (dir_tokens.len == 0) continue; // Null `#` directive.
-
-                const dir_name = dir_tokens[0].lexeme;
-                const args = dir_tokens[1..];
-
-                if (std.mem.eql(u8, dir_name, "ifdef") or std.mem.eql(u8, dir_name, "ifndef")) {
-                    const is_ifndef = std.mem.eql(u8, dir_name, "ifndef");
-                    if (!is_active) {
-                        try cond_stack.append(self.unit.allocator, .{
-                            .is_parent_active = false,
-                            .is_branch_active = false,
-                            .has_taken_branch = true,
-                            .open_span = hash_span,
-                        });
-                    } else {
-                        if (args.len == 0 or args[0].kind != .ident) {
-                            try emitCTranslationError(
-                                self.unit,
-                                self.sink,
-                                hash_span,
-                                "expected macro identifier after `#ifdef` / `#ifndef`",
-                            );
-                            return error.TranslationFailed;
-                        }
-                        const is_defined = self.macros.contains(args[0].lexeme);
-                        const is_taken = if (is_ifndef) !is_defined else is_defined;
-                        try cond_stack.append(self.unit.allocator, .{
-                            .is_parent_active = true,
-                            .is_branch_active = is_taken,
-                            .has_taken_branch = is_taken,
-                            .open_span = hash_span,
-                        });
-                    }
-                    continue;
-                } else if (std.mem.eql(u8, dir_name, "if")) {
-                    if (!is_active) {
-                        try cond_stack.append(self.unit.allocator, .{
-                            .is_parent_active = false,
-                            .is_branch_active = false,
-                            .has_taken_branch = true,
-                            .open_span = hash_span,
-                        });
-                    } else {
-                        const is_cond_true = try self.evaluateIfCondition(args, current_path, hash_span);
-                        try cond_stack.append(self.unit.allocator, .{
-                            .is_parent_active = true,
-                            .is_branch_active = is_cond_true,
-                            .has_taken_branch = is_cond_true,
-                            .open_span = hash_span,
-                        });
-                    }
-                    continue;
-                } else if (std.mem.eql(u8, dir_name, "elif") or
-                    std.mem.eql(u8, dir_name, "elifdef") or
-                    std.mem.eql(u8, dir_name, "elifndef"))
-                {
-                    if (cond_stack.items.len == 0 or
-                        cond_stack.items[cond_stack.items.len - 1].has_seen_else)
-                    {
-                        try emitCTranslationError(
-                            self.unit,
-                            self.sink,
-                            hash_span,
-                            "unmatched or out-of-order `#elif` / `#elifdef` / `#elifndef` directive",
-                        );
-                        return error.TranslationFailed;
-                    }
-                    const top = &cond_stack.items[cond_stack.items.len - 1];
-                    if (!top.is_parent_active or top.has_taken_branch) {
-                        top.is_branch_active = false;
-                    } else {
-                        const is_elif_taken: bool = if (std.mem.eql(u8, dir_name, "elif"))
-                            try self.evaluateIfCondition(args, current_path, hash_span)
-                        else blk: {
-                            if (args.len == 0 or args[0].kind != .ident) {
-                                try emitCTranslationError(
-                                    self.unit,
-                                    self.sink,
-                                    hash_span,
-                                    "expected macro identifier after `#elifdef` / `#elifndef`",
-                                );
-                                return error.TranslationFailed;
-                            }
-                            const is_def = self.macros.contains(args[0].lexeme);
-                            break :blk if (std.mem.eql(u8, dir_name, "elifndef")) !is_def else is_def;
-                        };
-                        top.is_branch_active = is_elif_taken;
-                        if (is_elif_taken) top.has_taken_branch = true;
-                    }
-                    continue;
-                } else if (std.mem.eql(u8, dir_name, "else")) {
-                    if (cond_stack.items.len == 0 or
-                        cond_stack.items[cond_stack.items.len - 1].has_seen_else)
-                    {
-                        try emitCTranslationError(
-                            self.unit,
-                            self.sink,
-                            hash_span,
-                            "unmatched or duplicate `#else` directive",
-                        );
-                        return error.TranslationFailed;
-                    }
-                    const top = &cond_stack.items[cond_stack.items.len - 1];
-                    top.has_seen_else = true;
-                    top.is_branch_active = top.is_parent_active and !top.has_taken_branch;
-                    if (top.is_branch_active) top.has_taken_branch = true;
-                    continue;
-                } else if (std.mem.eql(u8, dir_name, "endif")) {
-                    if (cond_stack.items.len == 0) {
-                        try emitCTranslationError(
-                            self.unit,
-                            self.sink,
-                            hash_span,
-                            "unmatched `#endif` directive in C header",
-                        );
-                        return error.TranslationFailed;
-                    }
-                    _ = cond_stack.pop();
-                    continue;
-                }
-
-                // Skip all non-conditional directives inside inactive `#if` branches:
-                if (!is_active) continue;
-
-                if (std.mem.eql(u8, dir_name, "define")) {
-                    try self.handleDefineDirective(args, hash_span, is_system_header);
-                } else if (std.mem.eql(u8, dir_name, "undef")) {
-                    if (args.len > 0 and args[0].kind == .ident) {
-                        _ = self.macros.remove(args[0].lexeme);
-                    }
-                } else if (std.mem.eql(u8, dir_name, "error")) {
-                    var err_msg_buf: std.ArrayListUnmanaged(u8) = .empty;
-                    defer err_msg_buf.deinit(self.unit.allocator);
-                    try err_msg_buf.appendSlice(self.unit.allocator, "`#error` in C header: ");
-                    for (args, 0..) |arg_tok, arg_i| {
-                        if (arg_i > 0 and arg_tok.has_leading_space) {
-                            try err_msg_buf.append(self.unit.allocator, ' ');
-                        }
-                        try err_msg_buf.appendSlice(self.unit.allocator, arg_tok.lexeme);
-                    }
-                    try emitCTranslationError(self.unit, self.sink, hash_span, err_msg_buf.items);
-                    return error.TranslationFailed;
-                } else if (std.mem.eql(u8, dir_name, "include")) {
-                    try self.handleIncludeDirective(
-                        source,
-                        args,
-                        current_path,
-                        hash_span,
-                        include_depth,
-                        out_tokens,
-                    );
-                } else if (std.mem.eql(u8, dir_name, "pragma")) {
-                    try self.handlePragmaDirective(args, current_path, hash_span, out_tokens);
-                }
-                continue;
-            }
-
-            if (!is_active) {
-                idx += 1;
-                continue;
-            }
-
-            // Collect active non-directive tokens up to next directive line and expand macros:
-            const seg_start = idx;
-            while (idx < items.len and !(items[idx].is_at_line_start and items[idx].kind == .hash)) : (idx += 1) {}
-            try self.expandTokenSequence(items[seg_start..idx], out_tokens);
-        }
-
-        if (cond_stack.items.len > 0) {
-            const unclosed = cond_stack.items[cond_stack.items.len - 1];
-            try emitCTranslationError(
-                self.unit,
-                self.sink,
-                unclosed.open_span,
-                "unterminated `#if` / `#ifdef` conditional block in C header",
-            );
-            return error.TranslationFailed;
-        }
-    }
-
-    /// Parses `#define NAME(…) body` and registers it in `self.macros`.
-    fn handleDefineDirective(
-        self: *CPreprocessor,
-        args: []const CToken,
-        span: Span,
-        is_system_header: bool,
-    ) CFrontendError!void {
-        if (args.len == 0 or args[0].kind != .ident) {
-            try emitCTranslationError(self.unit, self.sink, span, "expected macro name after `#define`");
-            return error.TranslationFailed;
-        }
-        const macro_name = args[0].lexeme;
-        var body_start: usize = 1;
-        var is_fn_like = false;
-        var is_variadic = false;
-        var param_names: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer param_names.deinit(self.unit.allocator);
-
-        // Function-like iff `(` has NO leading space after `macro_name` (C11 §6.10.3):
-        if (args.len >= 2 and args[1].kind == .lparen and !args[1].has_leading_space) {
-            is_fn_like = true;
-            var p_idx: usize = 2;
-            while (p_idx < args.len and args[p_idx].kind != .rparen) {
-                if (args[p_idx].kind == .ellipses) {
-                    is_variadic = true;
-                    p_idx += 1;
-                    break;
-                }
-                if (args[p_idx].kind == .ident) {
-                    const pname = args[p_idx].lexeme;
-                    p_idx += 1;
-                    // GNU `args...` named variadic parameter syntax:
-                    if (p_idx < args.len and args[p_idx].kind == .ellipses) {
-                        is_variadic = true;
-                        try param_names.append(self.unit.allocator, "__VA_ARGS__");
-                        p_idx += 1;
-                        break;
-                    }
-                    try param_names.append(self.unit.allocator, pname);
-                } else {
-                    try emitCTranslationError(
-                        self.unit,
-                        self.sink,
-                        args[p_idx].span,
-                        "invalid parameter token in `#define` macro signature",
-                    );
-                    return error.TranslationFailed;
-                }
-                if (p_idx < args.len and args[p_idx].kind == .comma) {
-                    p_idx += 1;
-                } else {
-                    break;
-                }
-            }
-            if (p_idx >= args.len or args[p_idx].kind != .rparen) {
-                try emitCTranslationError(self.unit, self.sink, span, "unclosed `(` in `#define` macro");
-                return error.TranslationFailed;
-            }
-            body_start = p_idx + 1;
-        }
-
-        const owned_params = try self.unit.arena.dupe([]const u8, param_names.items);
-        const owned_body = try self.unit.arena.dupe(CToken, args[body_start..]);
-        try self.macros.put(self.unit.allocator, macro_name, .{
-            .name = macro_name,
-            .is_function_like = is_fn_like,
-            .is_variadic = is_variadic,
-            .params = owned_params,
-            .body = owned_body,
-            .span = span,
-            .is_from_system_header = is_system_header,
-        });
-        if (!is_fn_like and !is_system_header) {
-            try self.user_object_macro_order.append(self.unit.allocator, macro_name);
-        }
-    }
-
-    /// Extracts `<header.h>` or `"header.h"` and preprocesses the included file unless guarded by `#pragma once`.
-    fn handleIncludeDirective(
-        self: *CPreprocessor,
-        raw_spliced_src: []const u8,
-        args: []const CToken,
-        current_path: []const u8,
-        span: Span,
-        include_depth: u32,
-        out_tokens: *std.ArrayListUnmanaged(CToken),
-    ) CFrontendError!void {
-        if (args.len == 0) {
-            try emitCTranslationError(self.unit, self.sink, span, "missing header path after `#include`");
-            return error.TranslationFailed;
-        }
-
-        var include_path: []const u8 = "";
-        var is_angled = false;
-
-        if (args[0].kind == .string_lit) {
-            include_path = try decodeCStringLiteral(&self.unit.arena, args[0].lexeme);
-            is_angled = false;
-        } else if (args[0].kind == .lt) {
-            // Reconstruct exact raw slice between `<` and `>` on the `#include` line:
-            var close_idx: ?usize = null;
-            for (args, 0..) |tok, i| {
-                if (i > 0 and tok.kind == .gt) {
-                    close_idx = i;
-                    break;
-                }
-            }
-            if (close_idx) |gt_i| {
-                const start_b = args[0].span.end_byte;
-                const end_b = args[gt_i].span.start_byte;
-                if (start_b <= end_b and end_b <= raw_spliced_src.len) {
-                    include_path = std.mem.trim(u8, raw_spliced_src[start_b..end_b], " \t");
-                }
-                is_angled = true;
-            } else {
-                try emitCTranslationError(self.unit, self.sink, span, "unclosed `<` in `#include <…>`");
-                return error.TranslationFailed;
-            }
-        } else {
-            // Computed `#include MACRO_HEADER`:
-            var expanded_inc: std.ArrayListUnmanaged(CToken) = .empty;
-            defer expanded_inc.deinit(self.unit.allocator);
-            try self.expandTokenSequence(args, &expanded_inc);
-            if (expanded_inc.items.len == 1 and expanded_inc.items[0].kind == .string_lit) {
-                include_path = try decodeCStringLiteral(&self.unit.arena, expanded_inc.items[0].lexeme);
-                is_angled = false;
-            } else if (expanded_inc.items.len >= 3 and
-                expanded_inc.items[0].kind == .lt and
-                expanded_inc.items[expanded_inc.items.len - 1].kind == .gt)
-            {
-                var joined: std.ArrayListUnmanaged(u8) = .empty;
-                defer joined.deinit(self.unit.allocator);
-                for (expanded_inc.items[1 .. expanded_inc.items.len - 1]) |piece| {
-                    try joined.appendSlice(self.unit.allocator, piece.lexeme);
-                }
-                include_path = try self.unit.arena.dupe(u8, joined.items);
-                is_angled = true;
-            } else {
-                try emitCTranslationError(self.unit, self.sink, span, "invalid computed `#include` target");
-                return error.TranslationFailed;
-            }
-        }
-
-        const resolved = (try self.resolveIncludeContent(include_path, is_angled, current_path)) orelse {
-            const err_msg = try std.fmt.allocPrint(
-                self.unit.arena.asAllocator(),
-                "cannot find included C header `{s}`",
-                .{include_path},
-            );
-            try emitCTranslationError(self.unit, self.sink, span, err_msg);
-            return error.TranslationFailed;
-        };
-
-        if (self.pragma_once_headers.contains(resolved.canonical_key)) return;
-
-        try self.preprocessBuffer(
-            resolved.content,
-            resolved.canonical_key,
-            .none,
-            resolved.is_system,
-            include_depth + 1,
-            out_tokens,
-        );
-    }
-
-    /// Handles `#pragma once` and `#pragma pack(…)` directives.
-    fn handlePragmaDirective(
-        self: *CPreprocessor,
-        args: []const CToken,
-        current_path: []const u8,
-        span: Span,
-        out_tokens: *std.ArrayListUnmanaged(CToken),
-    ) CFrontendError!void {
-        if (args.len == 0 or args[0].kind != .ident) return;
-        if (std.mem.eql(u8, args[0].lexeme, "once")) {
-            const key_owned = try self.unit.arena.dupe(u8, current_path);
-            try self.pragma_once_headers.put(self.unit.allocator, key_owned, {});
-            return;
-        }
-        if (!std.mem.eql(u8, args[0].lexeme, "pack")) return;
-        if (args.len < 2 or args[1].kind != .lparen) return;
-
-        // Parse `#pragma pack()`, `pack(N)`, `pack(push)`, `pack(push, N)`, `pack(pop)`:
-        var pack_op: PragmaPackOp = .reset_pack;
-        var pack_align: u8 = 0;
-        if (args.len >= 3 and args[2].kind == .rparen) {
-            pack_op = .reset_pack;
-        } else if (args.len >= 3 and args[2].kind == .number) {
-            if (parseCIntegerLiteral(args[2].lexeme)) |iv| {
-                if (iv.bits >= 1 and iv.bits <= 16 and std.math.isPowerOfTwo(iv.bits)) {
-                    pack_op = .set_pack;
-                    pack_align = @intCast(iv.bits);
-                }
-            }
-        } else if (args.len >= 3 and args[2].kind == .ident) {
-            if (std.mem.eql(u8, args[2].lexeme, "pop")) {
-                pack_op = .pop_pack;
-            } else if (std.mem.eql(u8, args[2].lexeme, "push")) {
-                pack_op = .push_only;
-                for (args[3..]) |sub_tok| {
-                    if (sub_tok.kind == .number) {
-                        if (parseCIntegerLiteral(sub_tok.lexeme)) |iv| {
-                            if (iv.bits >= 1 and iv.bits <= 16 and std.math.isPowerOfTwo(iv.bits)) {
-                                pack_op = .push_pack;
-                                pack_align = @intCast(iv.bits);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        try out_tokens.append(self.unit.allocator, .{
-            .kind = .pragma_pack,
-            .lexeme = "",
-            .span = span,
-            .pack_op = pack_op,
-            .pack_align = pack_align,
-        });
-    }
-
-    /// Evaluates `#if` / `#elif` integer constant expressions (`defined`, `__has_include`, `__has_attribute`).
-    fn evaluateIfCondition(
-        self: *CPreprocessor,
-        raw_expr_tokens: []const CToken,
-        current_path: []const u8,
-        span: Span,
-    ) CFrontendError!bool {
-        // [1] Resolve `defined`, `__has_include`, `__has_builtin`, and `__has_attribute` before general expansion:
-        var pre_expanded: std.ArrayListUnmanaged(CToken) = .empty;
-        defer pre_expanded.deinit(self.unit.allocator);
-
-        var i: usize = 0;
-        while (i < raw_expr_tokens.len) {
-            const tok = raw_expr_tokens[i];
-            if (tok.kind == .ident and std.mem.eql(u8, tok.lexeme, "defined")) {
-                var target_name: []const u8 = "";
-                if (i + 1 < raw_expr_tokens.len and raw_expr_tokens[i + 1].kind == .ident) {
-                    target_name = raw_expr_tokens[i + 1].lexeme;
-                    i += 2;
-                } else if (i + 3 < raw_expr_tokens.len and
-                    raw_expr_tokens[i + 1].kind == .lparen and
-                    raw_expr_tokens[i + 2].kind == .ident and
-                    raw_expr_tokens[i + 3].kind == .rparen)
-                {
-                    target_name = raw_expr_tokens[i + 2].lexeme;
-                    i += 4;
-                } else {
-                    try emitCTranslationError(self.unit, self.sink, tok.span, "malformed `defined` in `#if`");
-                    return error.TranslationFailed;
-                }
-                const is_def = self.macros.contains(target_name);
-                try pre_expanded.append(self.unit.allocator, .{
-                    .kind = .number,
-                    .lexeme = if (is_def) "1" else "0",
-                    .span = tok.span,
-                });
-                continue;
-            } else if (tok.kind == .ident and std.mem.eql(u8, tok.lexeme, "__has_include")) {
-                var has_inc = false;
-                if (i + 1 < raw_expr_tokens.len and raw_expr_tokens[i + 1].kind == .lparen) {
-                    var close_p = i + 2;
-                    while (close_p < raw_expr_tokens.len and raw_expr_tokens[close_p].kind != .rparen) : (close_p += 1) {}
-                    const inner = raw_expr_tokens[i + 2 .. close_p];
-                    if (inner.len == 1 and inner[0].kind == .string_lit) {
-                        const dec = try decodeCStringLiteral(&self.unit.arena, inner[0].lexeme);
-                        has_inc = (try self.resolveIncludeContent(dec, false, current_path)) != null;
-                    } else if (inner.len >= 3 and inner[0].kind == .lt and inner[inner.len - 1].kind == .gt) {
-                        var path_buf: std.ArrayListUnmanaged(u8) = .empty;
-                        defer path_buf.deinit(self.unit.allocator);
-                        for (inner[1 .. inner.len - 1]) |pt| {
-                            try path_buf.appendSlice(self.unit.allocator, pt.lexeme);
-                        }
-                        has_inc = (try self.resolveIncludeContent(path_buf.items, true, current_path)) != null;
-                    }
-                    i = @min(close_p + 1, raw_expr_tokens.len);
-                } else {
-                    i += 1;
-                }
-                try pre_expanded.append(self.unit.allocator, .{
-                    .kind = .number,
-                    .lexeme = if (has_inc) "1" else "0",
-                    .span = tok.span,
-                });
-                continue;
-            } else if (tok.kind == .ident and
-                (std.mem.eql(u8, tok.lexeme, "__has_attribute") or
-                    std.mem.eql(u8, tok.lexeme, "__has_c_attribute") or
-                    std.mem.eql(u8, tok.lexeme, "__has_builtin")))
-            {
-                const is_builtin_q = std.mem.eql(u8, tok.lexeme, "__has_builtin");
-                var is_supported = false;
-                if (i + 1 < raw_expr_tokens.len and raw_expr_tokens[i + 1].kind == .lparen) {
-                    var close_p = i + 2;
-                    while (close_p < raw_expr_tokens.len and raw_expr_tokens[close_p].kind != .rparen) : (close_p += 1) {}
-                    const inner = raw_expr_tokens[i + 2 .. close_p];
-                    if (!is_builtin_q and inner.len > 0) {
-                        const last_ident = inner[inner.len - 1].lexeme;
-                        is_supported = SUPPORTED_C_ATTR_SET.has(last_ident);
-                    }
-                    i = @min(close_p + 1, raw_expr_tokens.len);
-                } else {
-                    i += 1;
-                }
-                try pre_expanded.append(self.unit.allocator, .{
-                    .kind = .number,
-                    .lexeme = if (is_supported) "1" else "0",
-                    .span = tok.span,
-                });
-                continue;
-            }
-            try pre_expanded.append(self.unit.allocator, tok);
-            i += 1;
-        }
-
-        // [2] Expand macros across `pre_expanded` (re-handling any `defined` produced by macros):
-        var expanded: std.ArrayListUnmanaged(CToken) = .empty;
-        defer expanded.deinit(self.unit.allocator);
-        try self.expandTokenSequence(pre_expanded.items, &expanded);
-
-        // [3] C11 §6.10.1p4; replace `true` -> `1` and all remaining undefined identifiers -> `0`:
-        var final_toks: std.ArrayListUnmanaged(CToken) = .empty;
-        defer final_toks.deinit(self.unit.allocator);
-        var f_idx: usize = 0;
-        while (f_idx < expanded.items.len) : (f_idx += 1) {
-            const ft = expanded.items[f_idx];
-            if (ft.kind == .ident) {
-                if (std.mem.eql(u8, ft.lexeme, "defined")) {
-                    if (f_idx + 1 < expanded.items.len and expanded.items[f_idx + 1].kind == .ident) {
-                        const is_d = self.macros.contains(expanded.items[f_idx + 1].lexeme);
-                        try final_toks.append(self.unit.allocator, .{
-                            .kind = .number,
-                            .lexeme = if (is_d) "1" else "0",
-                            .span = ft.span,
-                        });
-                        f_idx += 1;
-                        continue;
-                    } else if (f_idx + 3 < expanded.items.len and
-                        expanded.items[f_idx + 1].kind == .lparen and
-                        expanded.items[f_idx + 2].kind == .ident and
-                        expanded.items[f_idx + 3].kind == .rparen)
-                    {
-                        const is_d = self.macros.contains(expanded.items[f_idx + 2].lexeme);
-                        try final_toks.append(self.unit.allocator, .{
-                            .kind = .number,
-                            .lexeme = if (is_d) "1" else "0",
-                            .span = ft.span,
-                        });
-                        f_idx += 3;
-                        continue;
-                    }
-                }
-                const is_true_kw = std.mem.eql(u8, ft.lexeme, "true");
-                try final_toks.append(self.unit.allocator, .{
-                    .kind = .number,
-                    .lexeme = if (is_true_kw) "1" else "0",
-                    .span = ft.span,
-                });
-            } else {
-                try final_toks.append(self.unit.allocator, ft);
-            }
-        }
-
-        if (final_toks.items.len == 0) {
-            try emitCTranslationError(self.unit, self.sink, span, "empty expression in `#if` / `#elif`");
-            return error.TranslationFailed;
-        }
-
-        var eval = ConstExprEvaluator{
-            .unit = self.unit,
-            .sink = self.sink,
-            .tokens = final_toks.items,
-            .max_depth = self.options.max_parse_depth,
-            .is_comma_allowed = true,
-        };
-        const res = try eval.parseExpr(0, true);
-        if (eval.pos != eval.tokens.len) {
-            return eval.fail("unexpected trailing token in `#if` / `#elif` constant expression");
-        }
-        return res.isTruthy();
-    }
-
-    /// Emits `E0009` unless inside a non-cap speculative `#define` constant probe, returning `TranslationFailed`.
-    fn emitMacroError(self: *CPreprocessor, span: Span, message: []const u8) CFrontendError {
-        if (!self.is_probing_macro_const or self.has_hit_resource_cap) {
-            try emitCTranslationError(self.unit, self.sink, span, message);
-        }
-        return error.TranslationFailed;
-    }
-
-    /// Appends a single expanded `tok` into `list`, charging `expanded_token_budget` against `max_tokens`.
-    fn appendExpandedToken(
-        self: *CPreprocessor,
-        list: *std.ArrayListUnmanaged(CToken),
-        tok: CToken,
-        err_span: Span,
-    ) CFrontendError!void {
-        self.expanded_token_budget += 1;
-        if (self.expanded_token_budget > self.options.max_tokens) {
-            self.has_hit_resource_cap = true;
-            return self.emitMacroError(
-                err_span,
-                "C macro expansion exceeded `MAX_C_TOKENS_PER_UNIT` token budget",
-            );
-        }
-        try list.append(self.unit.allocator, tok);
-    }
-
-    /// Appends `slice` into `list`, charging `expanded_token_budget` before allocating to block token bombs.
-    fn appendExpandedTokenSlice(
-        self: *CPreprocessor,
-        list: *std.ArrayListUnmanaged(CToken),
-        slice: []const CToken,
-        err_span: Span,
-    ) CFrontendError!void {
-        if (slice.len == 0) return;
-        self.expanded_token_budget +|= slice.len;
-        if (self.expanded_token_budget > self.options.max_tokens) {
-            self.has_hit_resource_cap = true;
-            return self.emitMacroError(
-                err_span,
-                "C macro expansion exceeded `MAX_C_TOKENS_PER_UNIT` token budget",
-            );
-        }
-        try list.appendSlice(self.unit.allocator, slice);
-    }
-
-    /// Expands macros across `input_tokens` into `out_tokens`, enforcing Blue-Paint and depth/step/token caps.
-    fn expandTokenSequence(
-        self: *CPreprocessor,
-        input_tokens: []const CToken,
-        out_tokens: *std.ArrayListUnmanaged(CToken),
-    ) CFrontendError!void {
-        if (self.macro_recursion_depth >= self.options.max_parse_depth) {
-            self.has_hit_resource_cap = true;
-            const err_span = if (input_tokens.len > 0) input_tokens[0].span else Span.ZERO;
-            return self.emitMacroError(
-                err_span,
-                "C macro recursion depth exceeded `MAX_C_PARSE_DEPTH` cap",
-            );
-        }
-        self.macro_recursion_depth += 1;
-        defer self.macro_recursion_depth -= 1;
-
-        if (input_tokens.len > 16 and self.expanded_token_budget < self.options.max_tokens) {
-            const rem_budget = self.options.max_tokens - self.expanded_token_budget;
-            try out_tokens.ensureTotalCapacityPrecise(
-                self.unit.allocator,
-                out_tokens.items.len + @min(input_tokens.len, rem_budget),
-            );
-        }
-
-        var i: usize = 0;
-        while (i < input_tokens.len) {
-            const tok = input_tokens[i];
-            if (out_tokens.items.len >= self.options.max_tokens) {
-                self.has_hit_resource_cap = true;
-                return self.emitMacroError(
-                    tok.span,
-                    "C macro expansion exceeded `MAX_C_TOKENS_PER_UNIT` cap",
-                );
-            }
-
-            if (tok.kind == .ident and !self.isMacroBluePainted(tok.lexeme)) {
-                if (self.macros.get(tok.lexeme)) |macro| {
-                    if (!macro.is_function_like) {
-                        self.expansion_steps += 1;
-                        if (self.expansion_steps > self.options.max_macro_steps) {
-                            self.has_hit_resource_cap = true;
-                            return self.emitMacroError(
-                                tok.span,
-                                "C macro expansion exceeded `MAX_MACRO_EXPANSION_STEPS` cap",
-                            );
-                        }
-                        try self.pushActiveMacro(macro.name);
-                        defer self.popActiveMacro(macro.name);
-
-                        var pasted: std.ArrayListUnmanaged(CToken) = .empty;
-                        defer pasted.deinit(self.unit.allocator);
-                        try self.substituteAndPasteMacroBody(macro, &.{}, &.{}, tok, &pasted);
-                        try self.expandTokenSequence(pasted.items, out_tokens);
-                        i += 1;
-                        continue;
-                    } else if (i + 1 < input_tokens.len and input_tokens[i + 1].kind == .lparen) {
-                        // Collect balanced `( arg0, arg1, … )` arguments:
-                        var raw_args: std.ArrayListUnmanaged([]const CToken) = .empty;
-                        defer raw_args.deinit(self.unit.allocator);
-
-                        var arg_cursor = i + 2;
-                        var paren_depth: u32 = 1;
-                        var cur_arg_start = arg_cursor;
-                        while (arg_cursor < input_tokens.len and paren_depth > 0) {
-                            const ak = input_tokens[arg_cursor].kind;
-                            if (ak == .lparen) {
-                                paren_depth += 1;
-                            } else if (ak == .rparen) {
-                                paren_depth -= 1;
-                                if (paren_depth == 0) {
-                                    if (arg_cursor > cur_arg_start or raw_args.items.len > 0) {
-                                        try raw_args.append(
-                                            self.unit.allocator,
-                                            input_tokens[cur_arg_start..arg_cursor],
-                                        );
-                                    }
-                                    break;
-                                }
-                            } else if (ak == .comma and paren_depth == 1) {
-                                try raw_args.append(
-                                    self.unit.allocator,
-                                    input_tokens[cur_arg_start..arg_cursor],
-                                );
-                                cur_arg_start = arg_cursor + 1;
-                            }
-                            arg_cursor += 1;
-                        }
-                        if (paren_depth != 0) {
-                            return self.emitMacroError(
-                                tok.span,
-                                "unterminated argument list in function-like macro invocation",
-                            );
-                        }
-
-                        // Handle 0-argument vs 1-empty-argument macro calls:
-                        if (raw_args.items.len == 0 and macro.params.len == 1) {
-                            try raw_args.append(self.unit.allocator, &.{});
-                        }
-
-                        var fixed_args: []const []const CToken = raw_args.items;
-                        var va_tokens: std.ArrayListUnmanaged(CToken) = .empty;
-                        defer va_tokens.deinit(self.unit.allocator);
-
-                        if (macro.is_variadic) {
-                            if (raw_args.items.len < macro.params.len) {
-                                return self.emitMacroError(
-                                    tok.span,
-                                    "too few arguments to variadic C macro",
-                                );
-                            }
-                            fixed_args = raw_args.items[0..macro.params.len];
-                            const extra_slices = raw_args.items[macro.params.len..];
-                            for (extra_slices, 0..) |va_slice, va_i| {
-                                if (va_i > 0) {
-                                    try self.appendExpandedToken(&va_tokens, .{
-                                        .kind = .comma,
-                                        .lexeme = ",",
-                                        .span = tok.span,
-                                    }, tok.span);
-                                }
-                                try self.appendExpandedTokenSlice(&va_tokens, va_slice, tok.span);
-                            }
-                        } else if (raw_args.items.len != macro.params.len) {
-                            return self.emitMacroError(
-                                tok.span,
-                                "argument count mismatch in C function-like macro call",
-                            );
-                        }
-
-                        self.expansion_steps += 1;
-                        if (self.expansion_steps > self.options.max_macro_steps) {
-                            self.has_hit_resource_cap = true;
-                            return self.emitMacroError(
-                                tok.span,
-                                "C macro expansion exceeded `MAX_MACRO_EXPANSION_STEPS` cap",
-                            );
-                        }
-
-                        var pasted: std.ArrayListUnmanaged(CToken) = .empty;
-                        defer pasted.deinit(self.unit.allocator);
-                        try self.substituteAndPasteMacroBody(
-                            macro,
-                            fixed_args,
-                            va_tokens.items,
-                            tok,
-                            &pasted,
-                        );
-
-                        try self.pushActiveMacro(macro.name);
-                        defer self.popActiveMacro(macro.name);
-                        try self.expandTokenSequence(pasted.items, out_tokens);
-                        i = arg_cursor + 1;
-                        continue;
-                    }
-                }
-            }
-
-            try self.appendExpandedToken(out_tokens, tok, tok.span);
-            i += 1;
-        }
-    }
-
-    /// Performs parameter substitution, `#` stringification, C23 `__VA_OPT__`, and `##` token pasting.
-    fn substituteAndPasteMacroBody(
-        self: *CPreprocessor,
-        macro: MacroEntry,
-        fixed_args: []const []const CToken,
-        va_tokens: []const CToken,
-        call_tok: CToken,
-        out_tokens: *std.ArrayListUnmanaged(CToken),
-    ) CFrontendError!void {
-        if (self.macro_recursion_depth >= self.options.max_parse_depth) {
-            self.has_hit_resource_cap = true;
-            return self.emitMacroError(
-                call_tok.span,
-                "C macro recursion depth exceeded `MAX_C_PARSE_DEPTH` cap",
-            );
-        }
-        self.macro_recursion_depth += 1;
-        defer self.macro_recursion_depth -= 1;
-
-        // Pre-expand each argument once for non-`#` / non-`##` parameter occurrences:
-        var expanded_fixed: std.ArrayListUnmanaged(std.ArrayListUnmanaged(CToken)) = .empty;
-        defer {
-            for (expanded_fixed.items) |*arg_list| arg_list.deinit(self.unit.allocator);
-            expanded_fixed.deinit(self.unit.allocator);
-        }
-        for (fixed_args) |raw_arg| {
-            var arg_list: std.ArrayListUnmanaged(CToken) = .empty;
-            errdefer arg_list.deinit(self.unit.allocator);
-            try self.expandTokenSequence(raw_arg, &arg_list);
-            try expanded_fixed.append(self.unit.allocator, arg_list);
-        }
-        var expanded_va_list: std.ArrayListUnmanaged(CToken) = .empty;
-        defer expanded_va_list.deinit(self.unit.allocator);
-        if (va_tokens.len > 0) {
-            try self.expandTokenSequence(va_tokens, &expanded_va_list);
-        }
-
-        const body = macro.body;
-        if (body.len > 0 and self.expanded_token_budget < self.options.max_tokens) {
-            var est_tokens: usize = 0;
-            for (body) |btok| {
-                if (btok.kind == .ident) {
-                    if (macro.is_variadic and std.mem.eql(u8, btok.lexeme, "__VA_ARGS__")) {
-                        est_tokens +|= expanded_va_list.items.len;
-                        continue;
-                    }
-                    if (findMacroParamIndex(macro.params, btok.lexeme)) |p_i| {
-                        est_tokens +|= expanded_fixed.items[p_i].items.len;
-                        continue;
-                    }
-                }
-                est_tokens +|= 1;
-            }
-            const rem_budget = self.options.max_tokens - self.expanded_token_budget;
-            if (est_tokens > 16 and est_tokens <= rem_budget) {
-                try out_tokens.ensureTotalCapacityPrecise(
-                    self.unit.allocator,
-                    out_tokens.items.len + est_tokens,
-                );
-            }
-        }
-        var idx: usize = 0;
-        while (idx < body.len) {
-            const btok = body[idx];
-
-            // [1] C23 `__VA_OPT__(…)`:
-            if (btok.kind == .ident and std.mem.eql(u8, btok.lexeme, "__VA_OPT__") and
-                idx + 1 < body.len and body[idx + 1].kind == .lparen)
-            {
-                var close_idx = idx + 2;
-                var depth: u32 = 1;
-                while (close_idx < body.len and depth > 0) {
-                    if (body[close_idx].kind == .lparen) depth += 1 else if (body[close_idx].kind == .rparen) {
-                        depth -= 1;
-                        if (depth == 0) break;
-                    }
-                    close_idx += 1;
-                }
-                if (expanded_va_list.items.len > 0) {
-                    const sub_macro = MacroEntry{
-                        .name = macro.name,
-                        .is_function_like = macro.is_function_like,
-                        .is_variadic = macro.is_variadic,
-                        .params = macro.params,
-                        .body = body[idx + 2 .. close_idx],
-                        .span = macro.span,
-                        .is_from_system_header = macro.is_from_system_header,
-                    };
-                    try self.substituteAndPasteMacroBody(
-                        sub_macro,
-                        fixed_args,
-                        va_tokens,
-                        call_tok,
-                        out_tokens,
-                    );
-                }
-                idx = @min(close_idx + 1, body.len);
-                continue;
-            }
-
-            // [2] `#param` / `#__VA_ARGS__` stringification:
-            if (btok.kind == .hash and idx + 1 < body.len and body[idx + 1].kind == .ident) {
-                const target_ident = body[idx + 1].lexeme;
-                var raw_target: ?[]const CToken = null;
-                if (macro.is_variadic and std.mem.eql(u8, target_ident, "__VA_ARGS__")) {
-                    raw_target = va_tokens;
-                } else if (findMacroParamIndex(macro.params, target_ident)) |p_i| {
-                    raw_target = fixed_args[p_i];
-                }
-                if (raw_target) |to_str| {
-                    const str_tok = try self.stringifyTokenSlice(to_str, call_tok.span);
-                    try self.appendExpandedToken(out_tokens, str_tok, call_tok.span);
-                    idx += 2;
-                    continue;
-                }
-            }
-
-            // [3] `lhs ## rhs` token pasting (including GNU `, ## __VA_ARGS__` elision):
-            const is_lhs_of_paste = idx + 1 < body.len and body[idx + 1].kind == .hash_hash;
-            if (is_lhs_of_paste) {
-                if (btok.kind == .comma and idx + 2 < body.len and
-                    body[idx + 2].kind == .ident and
-                    std.mem.eql(u8, body[idx + 2].lexeme, "__VA_ARGS__") and
-                    va_tokens.len == 0)
-                {
-                    idx += 3;
-                    continue;
-                }
-
-                var paste_accum: std.ArrayListUnmanaged(CToken) = .empty;
-                defer paste_accum.deinit(self.unit.allocator);
-                try self.appendRawParamOrSingle(btok, macro, fixed_args, va_tokens, call_tok.span, &paste_accum);
-
-                while (idx + 2 < body.len and body[idx + 1].kind == .hash_hash) {
-                    const rhs_btok = body[idx + 2];
-                    var rhs_raw: std.ArrayListUnmanaged(CToken) = .empty;
-                    defer rhs_raw.deinit(self.unit.allocator);
-                    try self.appendRawParamOrSingle(rhs_btok, macro, fixed_args, va_tokens, call_tok.span, &rhs_raw);
-
-                    if (paste_accum.items.len == 0) {
-                        try self.appendExpandedTokenSlice(&paste_accum, rhs_raw.items, call_tok.span);
-                    } else if (rhs_raw.items.len > 0) {
-                        const left_last = paste_accum.items[paste_accum.items.len - 1];
-                        const right_first = rhs_raw.items[0];
-                        const joined_lex = try std.fmt.allocPrint(
-                            self.unit.arena.asAllocator(),
-                            "{s}{s}",
-                            .{ left_last.lexeme, right_first.lexeme },
-                        );
-                        var relexed: std.ArrayListUnmanaged(CToken) = .empty;
-                        defer relexed.deinit(self.unit.allocator);
-                        try tokenizeCSBuffer(
-                            self.unit,
-                            self.sink,
-                            joined_lex,
-                            call_tok.span.file_id,
-                            macro.is_from_system_header,
-                            self.options.max_tokens,
-                            &relexed,
-                        );
-                        _ = paste_accum.pop();
-                        for (relexed.items) |*rt| rt.span = call_tok.span;
-                        try self.appendExpandedTokenSlice(&paste_accum, relexed.items, call_tok.span);
-                        if (rhs_raw.items.len > 1) {
-                            try self.appendExpandedTokenSlice(&paste_accum, rhs_raw.items[1..], call_tok.span);
-                        }
-                    }
-                    idx += 2;
-                }
-                try self.appendExpandedTokenSlice(out_tokens, paste_accum.items, call_tok.span);
-                idx += 1;
-                continue;
-            }
-
-            // [4] Standard expanded parameter / `__VA_ARGS__` substitution:
-            if (btok.kind == .ident) {
-                if (macro.is_variadic and std.mem.eql(u8, btok.lexeme, "__VA_ARGS__")) {
-                    try self.appendExpandedTokenSlice(out_tokens, expanded_va_list.items, call_tok.span);
-                    idx += 1;
-                    continue;
-                }
-                if (findMacroParamIndex(macro.params, btok.lexeme)) |p_i| {
-                    try self.appendExpandedTokenSlice(out_tokens, expanded_fixed.items[p_i].items, call_tok.span);
-                    idx += 1;
-                    continue;
-                }
-            }
-
-            var cloned = btok;
-            if (idx == 0) cloned.has_leading_space = call_tok.has_leading_space;
-            cloned.is_from_system_header = macro.is_from_system_header or call_tok.is_from_system_header;
-            try self.appendExpandedToken(out_tokens, cloned, call_tok.span);
-            idx += 1;
-        }
-    }
-
-    /// Appends unexpanded parameter tokens for `##` operands (supporting empty placemarkers).
-    fn appendRawParamOrSingle(
-        self: *CPreprocessor,
-        btok: CToken,
-        macro: MacroEntry,
-        fixed_args: []const []const CToken,
-        va_tokens: []const CToken,
-        err_span: Span,
-        out_list: *std.ArrayListUnmanaged(CToken),
-    ) CFrontendError!void {
-        if (btok.kind == .ident) {
-            if (macro.is_variadic and std.mem.eql(u8, btok.lexeme, "__VA_ARGS__")) {
-                try self.appendExpandedTokenSlice(out_list, va_tokens, err_span);
-                return;
-            }
-            if (findMacroParamIndex(macro.params, btok.lexeme)) |p_i| {
-                try self.appendExpandedTokenSlice(out_list, fixed_args[p_i], err_span);
-                return;
-            }
-        }
-        try self.appendExpandedToken(out_list, btok, err_span);
-    }
-
-    /// Converts `tokens` into a C11 stringified literal token (`#arg`).
-    fn stringifyTokenSlice(self: *CPreprocessor, tokens: []const CToken, span: Span) !CToken {
-        var str_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer str_buf.deinit(self.unit.allocator);
-        try str_buf.append(self.unit.allocator, '"');
-        for (tokens, 0..) |tok, i| {
-            if (i > 0 and tok.has_leading_space) {
-                try str_buf.append(self.unit.allocator, ' ');
-            }
-            if (tok.kind == .string_lit or tok.kind == .char_lit) {
-                for (tok.lexeme) |ch| {
-                    if (ch == '"' or ch == '\\') {
-                        try str_buf.append(self.unit.allocator, '\\');
-                    }
-                    try str_buf.append(self.unit.allocator, ch);
-                }
-            } else {
-                try str_buf.appendSlice(self.unit.allocator, tok.lexeme);
-            }
-        }
-        try str_buf.append(self.unit.allocator, '"');
-        return .{
-            .kind = .string_lit,
-            .lexeme = try self.unit.arena.dupe(u8, str_buf.items),
-            .span = span,
-        };
-    }
-
-    /// Classifies surviving user object-like `#define`s into `unit.macro_consts`.
-    fn collectSurvivingMacroConsts(self: *CPreprocessor) CFrontendError!void {
-        var seen_names: std.StringHashMapUnmanaged(void) = .empty;
-        defer seen_names.deinit(self.unit.allocator);
-        self.is_probing_macro_const = true;
-        defer self.is_probing_macro_const = false;
-
-        var idx = self.user_object_macro_order.items.len;
-        while (idx > 0) {
-            idx -= 1;
-            const name = self.user_object_macro_order.items[idx];
-            if (seen_names.contains(name)) continue;
-            try seen_names.put(self.unit.allocator, name, {});
-            const macro = self.macros.get(name) orelse continue;
-            if (macro.is_function_like or macro.body.len == 0 or macro.is_from_system_header) continue;
-
-            var expanded: std.ArrayListUnmanaged(CToken) = .empty;
-            defer expanded.deinit(self.unit.allocator);
-            {
-                try self.pushActiveMacro(name);
-                defer self.popActiveMacro(name);
-                self.expandTokenSequence(macro.body, &expanded) catch |err| {
-                    if (err == error.OutOfMemory) return error.OutOfMemory;
-                    if (self.has_hit_resource_cap) return error.TranslationFailed;
-                    continue;
-                };
-            }
-            if (expanded.items.len == 0) continue;
-
-            if (try self.tryClassifyExpandedMacroConst(expanded.items)) |const_val| {
-                try self.unit.macro_consts.append(self.unit.allocator, .{
-                    .name = macro.name,
-                    .value = const_val,
-                    .span = macro.span,
-                    .is_from_system_header = false,
-                });
-            }
-        }
-        std.mem.reverse(RecordedMacroConst, self.unit.macro_consts.items);
-    }
-
-    /// Attempts to evaluate `tokens` as an unambiguous string, float, or integer constant.
-    fn tryClassifyExpandedMacroConst(
-        self: *CPreprocessor,
-        tokens: []const CToken,
-    ) !?MacroConstValue {
-        // Strip outer balanced parentheses `( … )`:
-        var slice = tokens;
-        while (slice.len >= 2 and slice[0].kind == .lparen and slice[slice.len - 1].kind == .rparen) {
-            var depth: u32 = 0;
-            var is_wrapping = true;
-            for (slice[0 .. slice.len - 1], 0..) |tok, i| {
-                if (tok.kind == .lparen) depth += 1 else if (tok.kind == .rparen) {
-                    if (depth == 0) {
-                        is_wrapping = false;
-                        break;
-                    }
-                    depth -= 1;
-                }
-                if (depth == 0 and i > 0) {
-                    is_wrapping = false;
-                    break;
-                }
-            }
-            if (!is_wrapping or depth != 1) break;
-            slice = slice[1 .. slice.len - 1];
-        }
-        if (slice.len == 0) return null;
-
-        // [1] Adjacent string literal concatenation (`"foo" "bar"`):
-        var is_all_strings = true;
-        for (slice) |tok| {
-            if (tok.kind != .string_lit) {
-                is_all_strings = false;
-                break;
-            }
-        }
-        if (is_all_strings) {
-            var str_acc: std.ArrayListUnmanaged(u8) = .empty;
-            defer str_acc.deinit(self.unit.allocator);
-            for (slice) |tok| {
-                const decoded = try decodeCStringLiteral(&self.unit.arena, tok.lexeme);
-                try str_acc.appendSlice(self.unit.allocator, decoded);
-            }
-            return .{ .string_val = try self.unit.arena.dupe(u8, str_acc.items) };
-        }
-
-        // [2] Optional unary `+` / `-` float literal:
-        if (slice.len == 1 and slice[0].kind == .number) {
-            if (parseCFloatLiteral(slice[0].lexeme)) |fval| {
-                return .{ .float_val = fval };
-            }
-        } else if (slice.len == 2 and
-            (slice[0].kind == .minus or slice[0].kind == .plus) and
-            slice[1].kind == .number)
-        {
-            if (parseCFloatLiteral(slice[1].lexeme)) |fval| {
-                return .{ .float_val = if (slice[0].kind == .minus) -fval else fval };
-            }
-        }
-
-        // [3] Pure integer constant expression (no unresolved identifiers or floats):
-        for (slice) |tok| {
-            switch (tok.kind) {
-                .number => if (parseCIntegerLiteral(tok.lexeme) == null) return null,
-                .char_lit => if (parseCCharLiteral(tok.lexeme, self.unit.target) == null) return null,
-                .lparen,
-                .rparen,
-                .plus,
-                .minus,
-                .tilde,
-                .bang,
-                .star,
-                .slash,
-                .percent,
-                .shl,
-                .shr,
-                .lt,
-                .le,
-                .gt,
-                .ge,
-                .eq_eq,
-                .bang_eq,
-                .amp,
-                .caret,
-                .pipe,
-                .amp_amp,
-                .pipe_pipe,
-                .question,
-                .colon,
-                => {},
-                else => return null,
-            }
-        }
-
-        var dummy_sink = DiagnosticSink.init(self.unit.allocator);
-        defer dummy_sink.deinit();
-        var eval = ConstExprEvaluator{
-            .unit = self.unit,
-            .sink = &dummy_sink,
-            .tokens = slice,
-            .max_depth = self.options.max_parse_depth,
-            .is_silent = true,
-        };
-        const res = eval.parseTernary(0, true) catch return null;
-        if (eval.pos != slice.len) return null;
-        if (res.is_unsigned or res.bits > @as(u64, std.math.maxInt(i64))) {
-            return .{ .unsigned_int = res.bits };
-        }
-        return .{ .signed_int = res.asSigned() };
-    }
-};
+// --------------- Preprocessor & Parser Helpers ----------------
 
 /// Finds `target` inside `params`, returning its 0-based index or `null`.
 fn findMacroParamIndex(params: []const []const u8, target: []const u8) ?usize {
@@ -3766,302 +6613,6 @@ fn findMacroParamIndex(params: []const []const u8, target: []const u8) ?usize {
     }
     return null;
 }
-
-/// Depth-bounded C11/C23 integer constant expression evaluator (`#if`, `_Static_assert`, enums, arrays).
-const ConstExprEvaluator = struct {
-    /// Owning translation unit.
-    unit: *CTranslationUnit,
-    /// Diagnostic sink for `E0009` errors when `!is_silent`.
-    sink: *DiagnosticSink,
-    /// Slice of C tokens to evaluate.
-    tokens: []const CToken,
-    /// Current token cursor.
-    pos: usize = 0,
-    /// Optional known enum/const identifier lookup table (`null` in `#if` where idents were zeroed).
-    known_consts: ?*const std.StringHashMapUnmanaged(i128) = null,
-    /// Optional parser context for `sizeof(Type)` evaluation.
-    parser_ctx: ?*CDeclParser = null,
-    /// Recursion depth cap (`MAX_C_PARSE_DEPTH`).
-    max_depth: u32 = MAX_C_PARSE_DEPTH,
-    /// When `true`, suppresses diagnostic emission during speculative macro constant probing.
-    is_silent: bool = false,
-    /// When `true` (`#if` / `#elif`), enables the lowest-precedence C comma `,` operator.
-    is_comma_allowed: bool = false,
-
-    /// Emits `E0009` (unless `is_silent`) and aborts constant evaluation.
-    fn fail(self: *ConstExprEvaluator, msg: []const u8) CFrontendError {
-        if (!self.is_silent) {
-            const span = if (self.pos < self.tokens.len)
-                self.tokens[self.pos].span
-            else if (self.tokens.len > 0)
-                self.tokens[self.tokens.len - 1].span
-            else
-                Span.ZERO;
-            try emitCTranslationError(self.unit, self.sink, span, msg);
-        }
-        return error.TranslationFailed;
-    }
-
-    /// Evaluates a top-level or parenthesized constant expression (including `,` when `is_comma_allowed`).
-    fn parseExpr(self: *ConstExprEvaluator, depth: u32, is_eval: bool) CFrontendError!CIntVal {
-        if (depth >= self.max_depth) return self.fail("C constant expression exceeded `MAX_C_PARSE_DEPTH`");
-        var val = try self.parseTernary(depth + 1, is_eval);
-        if (self.is_comma_allowed) {
-            while (self.pos < self.tokens.len and self.tokens[self.pos].kind == .comma) {
-                self.pos += 1;
-                val = try self.parseTernary(depth + 1, is_eval);
-            }
-        }
-        return val;
-    }
-
-    /// Evaluates `cond ? then_expr : else_expr` with short-circuit branch suppression (`is_eval`).
-    fn parseTernary(self: *ConstExprEvaluator, depth: u32, is_eval: bool) CFrontendError!CIntVal {
-        if (depth >= self.max_depth) return self.fail("C constant expression exceeded `MAX_C_PARSE_DEPTH`");
-        const cond = try self.parseBinary(depth + 1, 1, is_eval);
-        if (self.pos < self.tokens.len and self.tokens[self.pos].kind == .question) {
-            self.pos += 1;
-            const is_then_taken = cond.isTruthy();
-            const then_val = try self.parseExpr(depth + 1, is_eval and is_then_taken);
-            if (self.pos >= self.tokens.len or self.tokens[self.pos].kind != .colon) {
-                return self.fail("expected `:` in C ternary constant expression");
-            }
-            self.pos += 1;
-            const else_val = try self.parseTernary(depth + 1, is_eval and !is_then_taken);
-            const is_unsigned = then_val.is_unsigned or else_val.is_unsigned;
-            return .{
-                .bits = if (is_then_taken) then_val.bits else else_val.bits,
-                .is_unsigned = is_unsigned,
-            };
-        }
-        return cond;
-    }
-
-    /// Precedence-climbing binary constant expression evaluator (`min_prec = 1..10`).
-    fn parseBinary(
-        self: *ConstExprEvaluator,
-        depth: u32,
-        min_prec: u8,
-        is_eval: bool,
-    ) CFrontendError!CIntVal {
-        if (depth >= self.max_depth) return self.fail("C constant expression exceeded `MAX_C_PARSE_DEPTH`");
-        var lhs = try self.parseUnary(depth + 1, is_eval);
-        while (self.pos < self.tokens.len) {
-            const op = self.tokens[self.pos].kind;
-            const prec = getBinaryPrecedence(op) orelse break;
-            if (prec < min_prec) break;
-            self.pos += 1;
-
-            const is_rhs_eval = switch (op) {
-                .pipe_pipe => is_eval and !lhs.isTruthy(),
-                .amp_amp => is_eval and lhs.isTruthy(),
-                else => is_eval,
-            };
-            const rhs = try self.parseBinary(depth + 1, prec + 1, is_rhs_eval);
-            const is_common_unsigned = lhs.is_unsigned or rhs.is_unsigned;
-
-            lhs = switch (op) {
-                .pipe_pipe => .{ .bits = @intFromBool(lhs.isTruthy() or rhs.isTruthy()), .is_unsigned = false },
-                .amp_amp => .{ .bits = @intFromBool(lhs.isTruthy() and rhs.isTruthy()), .is_unsigned = false },
-                .pipe => .{ .bits = lhs.bits | rhs.bits, .is_unsigned = is_common_unsigned },
-                .caret => .{ .bits = lhs.bits ^ rhs.bits, .is_unsigned = is_common_unsigned },
-                .amp => .{ .bits = lhs.bits & rhs.bits, .is_unsigned = is_common_unsigned },
-                .eq_eq => .{ .bits = @intFromBool(lhs.bits == rhs.bits), .is_unsigned = false },
-                .bang_eq => .{ .bits = @intFromBool(lhs.bits != rhs.bits), .is_unsigned = false },
-                .lt => .{
-                    .bits = @intFromBool(if (is_common_unsigned) lhs.bits < rhs.bits else lhs.asSigned() < rhs.asSigned()),
-                    .is_unsigned = false,
-                },
-                .le => .{
-                    .bits = @intFromBool(if (is_common_unsigned) lhs.bits <= rhs.bits else lhs.asSigned() <= rhs.asSigned()),
-                    .is_unsigned = false,
-                },
-                .gt => .{
-                    .bits = @intFromBool(if (is_common_unsigned) lhs.bits > rhs.bits else lhs.asSigned() > rhs.asSigned()),
-                    .is_unsigned = false,
-                },
-                .ge => .{
-                    .bits = @intFromBool(if (is_common_unsigned) lhs.bits >= rhs.bits else lhs.asSigned() >= rhs.asSigned()),
-                    .is_unsigned = false,
-                },
-                .shl => blk: {
-                    const sh: u6 = @intCast(@min(rhs.bits, 63));
-                    break :blk .{ .bits = if (rhs.bits >= 64) 0 else lhs.bits << sh, .is_unsigned = lhs.is_unsigned };
-                },
-                .shr => blk: {
-                    const sh: u6 = @intCast(@min(rhs.bits, 63));
-                    const shifted: u64 = if (lhs.is_unsigned)
-                        (if (rhs.bits >= 64) 0 else lhs.bits >> sh)
-                    else
-                        @bitCast(lhs.asSigned() >> sh);
-                    break :blk .{ .bits = shifted, .is_unsigned = lhs.is_unsigned };
-                },
-                .plus => .{ .bits = lhs.bits +% rhs.bits, .is_unsigned = is_common_unsigned },
-                .minus => .{ .bits = lhs.bits -% rhs.bits, .is_unsigned = is_common_unsigned },
-                .star => .{ .bits = lhs.bits *% rhs.bits, .is_unsigned = is_common_unsigned },
-                .slash => blk: {
-                    if (!is_eval) break :blk .{ .bits = 0, .is_unsigned = is_common_unsigned };
-                    if (rhs.bits == 0) return self.fail("division by zero in C constant expression");
-                    if (is_common_unsigned) break :blk .{ .bits = lhs.bits / rhs.bits, .is_unsigned = true };
-                    if (lhs.asSigned() == std.math.minInt(i64) and rhs.asSigned() == -1) {
-                        break :blk .{ .bits = lhs.bits, .is_unsigned = false };
-                    }
-                    break :blk .{ .bits = @bitCast(@divTrunc(lhs.asSigned(), rhs.asSigned())), .is_unsigned = false };
-                },
-                .percent => blk: {
-                    if (!is_eval) break :blk .{ .bits = 0, .is_unsigned = is_common_unsigned };
-                    if (rhs.bits == 0) return self.fail("remainder by zero in C constant expression");
-                    if (is_common_unsigned) break :blk .{ .bits = lhs.bits % rhs.bits, .is_unsigned = true };
-                    if (lhs.asSigned() == std.math.minInt(i64) and rhs.asSigned() == -1) {
-                        break :blk .{ .bits = 0, .is_unsigned = false };
-                    }
-                    break :blk .{ .bits = @bitCast(@rem(lhs.asSigned(), rhs.asSigned())), .is_unsigned = false };
-                },
-                else => unreachable,
-            };
-        }
-        return lhs;
-    }
-
-    /// Evaluates unary `+`, `-`, `~`, `!`, `sizeof`, casts `(Type)expr`, and primary atoms.
-    fn parseUnary(self: *ConstExprEvaluator, depth: u32, is_eval: bool) CFrontendError!CIntVal {
-        if (depth >= self.max_depth) return self.fail("C constant expression exceeded `MAX_C_PARSE_DEPTH`");
-        if (self.pos >= self.tokens.len) return self.fail("unexpected end of C constant expression");
-
-        const tok = self.tokens[self.pos];
-        switch (tok.kind) {
-            .plus => {
-                self.pos += 1;
-                return self.parseUnary(depth + 1, is_eval);
-            },
-            .minus => {
-                self.pos += 1;
-                const inner = try self.parseUnary(depth + 1, is_eval);
-                return .{ .bits = 0 -% inner.bits, .is_unsigned = inner.is_unsigned };
-            },
-            .tilde => {
-                self.pos += 1;
-                const inner = try self.parseUnary(depth + 1, is_eval);
-                return .{ .bits = ~inner.bits, .is_unsigned = inner.is_unsigned };
-            },
-            .bang => {
-                self.pos += 1;
-                const inner = try self.parseUnary(depth + 1, is_eval);
-                return .{ .bits = @intFromBool(!inner.isTruthy()), .is_unsigned = false };
-            },
-            .lparen => {
-                // Support C integer type casts `(uint32_t)-1` inside constant expressions:
-                if (self.parser_ctx) |pctx| {
-                    if (self.pos + 1 < self.tokens.len and pctx.isTypeStartToken(self.tokens[self.pos + 1])) {
-                        const saved_p_pos = pctx.pos;
-                        const saved_p_toks = pctx.tokens;
-                        pctx.tokens = self.tokens;
-                        pctx.pos = self.pos + 1;
-                        const cast_ty = pctx.parseTypeName(depth + 1) catch null;
-                        if (cast_ty != null and pctx.pos < self.tokens.len and
-                            self.tokens[pctx.pos].kind == .rparen)
-                        {
-                            self.pos = pctx.pos + 1;
-                            pctx.tokens = saved_p_toks;
-                            pctx.pos = saved_p_pos;
-                            const cast_operand = try self.parseUnary(depth + 1, is_eval);
-                            return self.applyIntegerCast(cast_ty.?, cast_operand);
-                        }
-                        pctx.tokens = saved_p_toks;
-                        pctx.pos = saved_p_pos;
-                    }
-                }
-                self.pos += 1;
-                const inner = try self.parseExpr(depth + 1, is_eval);
-                if (self.pos >= self.tokens.len or self.tokens[self.pos].kind != .rparen) {
-                    return self.fail("unclosed `(` in C constant expression");
-                }
-                self.pos += 1;
-                return inner;
-            },
-            .number => {
-                self.pos += 1;
-                return parseCIntegerLiteral(tok.lexeme) orelse
-                    self.fail("invalid integer literal in C constant expression");
-            },
-            .char_lit => {
-                self.pos += 1;
-                return parseCCharLiteral(tok.lexeme, self.unit.target) orelse
-                    self.fail("invalid character literal in C constant expression");
-            },
-            .ident => {
-                if (std.mem.eql(u8, tok.lexeme, "sizeof") and self.parser_ctx != null) {
-                    const pctx = self.parser_ctx.?;
-                    self.pos += 1;
-                    if (self.pos < self.tokens.len and self.tokens[self.pos].kind == .lparen) {
-                        const saved_p_pos = pctx.pos;
-                        const saved_p_toks = pctx.tokens;
-                        pctx.tokens = self.tokens;
-                        pctx.pos = self.pos + 1;
-                        const sz_ty = try pctx.parseTypeName(depth + 1);
-                        if (pctx.pos >= self.tokens.len or self.tokens[pctx.pos].kind != .rparen) {
-                            pctx.tokens = saved_p_toks;
-                            pctx.pos = saved_p_pos;
-                            return self.fail("expected `)` after `sizeof(type)`");
-                        }
-                        self.pos = pctx.pos + 1;
-                        pctx.tokens = saved_p_toks;
-                        pctx.pos = saved_p_pos;
-                        return .{ .bits = pctx.estimateTypeSizeBytes(sz_ty, depth + 1), .is_unsigned = true };
-                    }
-                }
-                if (std.mem.eql(u8, tok.lexeme, "true")) {
-                    self.pos += 1;
-                    return .{ .bits = 1, .is_unsigned = false };
-                } else if (std.mem.eql(u8, tok.lexeme, "false")) {
-                    self.pos += 1;
-                    return .{ .bits = 0, .is_unsigned = false };
-                } else if (self.known_consts) |const_map| {
-                    if (const_map.get(tok.lexeme)) |cval| {
-                        self.pos += 1;
-                        if (cval < 0) {
-                            const s64: i64 = @intCast(cval);
-                            return .{ .bits = @bitCast(s64), .is_unsigned = false };
-                        }
-                        return .{
-                            .bits = @intCast(cval),
-                            .is_unsigned = cval > @as(i128, std.math.maxInt(i64)),
-                        };
-                    }
-                }
-                return self.fail("unresolved identifier in C constant expression");
-            },
-            else => return self.fail("unexpected token in C constant expression"),
-        }
-    }
-
-    /// Truncates or sign-extends `operand` when cast to a C integer primitive `target_ty`.
-    fn applyIntegerCast(self: *const ConstExprEvaluator, target_ty: CTypeId, operand: CIntVal) CIntVal {
-        const canon_id = self.unit.unwrapTypedefs(target_ty);
-        const node = self.unit.getType(canon_id);
-        if (node != .primitive) return operand;
-        const prim = node.primitive;
-        if (prim == .c_bool) return .{ .bits = @intFromBool(operand.bits != 0), .is_unsigned = true };
-        if (!prim.isInteger()) return operand;
-        const byte_sz = prim.byteSize(self.unit.target);
-        const is_signed = prim.isSignedInteger(self.unit.target);
-        return switch (byte_sz) {
-            1 => if (is_signed)
-                .{ .bits = @bitCast(@as(i64, @as(i8, @truncate(operand.asSigned())))), .is_unsigned = false }
-            else
-                .{ .bits = @as(u8, @truncate(operand.bits)), .is_unsigned = true },
-            2 => if (is_signed)
-                .{ .bits = @bitCast(@as(i64, @as(i16, @truncate(operand.asSigned())))), .is_unsigned = false }
-            else
-                .{ .bits = @as(u16, @truncate(operand.bits)), .is_unsigned = true },
-            4 => if (is_signed)
-                .{ .bits = @bitCast(@as(i64, @as(i32, @truncate(operand.asSigned())))), .is_unsigned = false }
-            else
-                .{ .bits = @as(u32, @truncate(operand.bits)), .is_unsigned = true },
-            else => .{ .bits = operand.bits, .is_unsigned = !is_signed },
-        };
-    }
-};
 
 /// Returns climbing precedence (`1..10`) for binary C operators in constant expressions.
 fn getBinaryPrecedence(kind: CTokenKind) ?u8 {
@@ -4079,1988 +6630,6 @@ fn getBinaryPrecedence(kind: CTokenKind) ?u8 {
         else => null,
     };
 }
-
-// --------------------- Declaration Parser ---------------------
-
-/// C11/C23 recursive-descent declaration and type-specifier parser (`DR-10` §2.1, `DR-20` Seam #6).
-const CDeclParser = struct {
-    /// Target translation unit.
-    unit: *CTranslationUnit,
-    /// Diagnostic sink for `E0009` errors.
-    sink: *DiagnosticSink,
-    /// Frontend options (`body_hook`, `max_parse_depth`).
-    options: CFrontendOptions,
-    /// Preprocessed token stream.
-    tokens: []const CToken,
-    /// Current token index.
-    pos: usize = 0,
-    /// Lexical `typedef` name -> `CTypeId` map for declarator disambiguation.
-    typedef_names: std.StringHashMapUnmanaged(CTypeId) = .empty,
-    /// Tag table for `struct Name` -> `CDeclId`.
-    struct_tags: std.StringHashMapUnmanaged(CDeclId) = .empty,
-    /// Tag table for `union Name` -> `CDeclId`.
-    union_tags: std.StringHashMapUnmanaged(CDeclId) = .empty,
-    /// Tag table for `enum Name` -> `CDeclId`.
-    enum_tags: std.StringHashMapUnmanaged(CDeclId) = .empty,
-    /// Known enumerator and `static const` integer values for subsequent constant expressions.
-    known_int_consts: std.StringHashMapUnmanaged(i128) = .empty,
-    /// Active `#pragma pack(N)` alignment (`0` = default natural alignment).
-    active_pack_align: u8 = 0,
-    /// Stack of pushed `#pragma pack(push, …)` states.
-    pack_stack: std.ArrayListUnmanaged(u8) = .empty,
-
-    /// Releases parser lookup tables.
-    fn deinit(self: *CDeclParser) void {
-        self.typedef_names.deinit(self.unit.allocator);
-        self.struct_tags.deinit(self.unit.allocator);
-        self.union_tags.deinit(self.unit.allocator);
-        self.enum_tags.deinit(self.unit.allocator);
-        self.known_int_consts.deinit(self.unit.allocator);
-        self.pack_stack.deinit(self.unit.allocator);
-    }
-
-    /// Consumes any pending `.pragma_pack` tokens and updates `active_pack_align`.
-    fn flushPragmaPack(self: *CDeclParser) !void {
-        while (self.pos < self.tokens.len and self.tokens[self.pos].kind == .pragma_pack) {
-            const pk = self.tokens[self.pos];
-            self.pos += 1;
-            switch (pk.pack_op) {
-                .reset_pack => self.active_pack_align = 0,
-                .set_pack => self.active_pack_align = pk.pack_align,
-                .push_only => try self.pack_stack.append(self.unit.allocator, self.active_pack_align),
-                .push_pack => {
-                    try self.pack_stack.append(self.unit.allocator, self.active_pack_align);
-                    self.active_pack_align = pk.pack_align;
-                },
-                .pop_pack => {
-                    if (self.pack_stack.pop()) |restored| {
-                        self.active_pack_align = restored;
-                    } else {
-                        self.active_pack_align = 0;
-                    }
-                },
-            }
-        }
-    }
-
-    /// Peeks the current non-pragma token kind (`.eof` at end of stream).
-    fn peekKind(self: *CDeclParser) !CTokenKind {
-        try self.flushPragmaPack();
-        return if (self.pos < self.tokens.len) self.tokens[self.pos].kind else .eof;
-    }
-
-    /// Peeks the current non-pragma `CToken`.
-    fn peekToken(self: *CDeclParser) !CToken {
-        try self.flushPragmaPack();
-        if (self.pos < self.tokens.len) return self.tokens[self.pos];
-        return .{
-            .kind = .eof,
-            .lexeme = "",
-            .span = if (self.tokens.len > 0) self.tokens[self.tokens.len - 1].span else Span.ZERO,
-        };
-    }
-
-    /// Emits `E0009` at the current token and returns `error.TranslationFailed`.
-    fn failHere(self: *CDeclParser, msg: []const u8) CFrontendError {
-        const span = if (self.pos < self.tokens.len)
-            self.tokens[self.pos].span
-        else if (self.tokens.len > 0)
-            self.tokens[self.tokens.len - 1].span
-        else
-            Span.ZERO;
-        try emitCTranslationError(self.unit, self.sink, span, msg);
-        return error.TranslationFailed;
-    }
-
-    /// Returns `true` if `tok` can begin a C declaration-specifier or type-name.
-    fn isTypeStartToken(self: *const CDeclParser, tok: CToken) bool {
-        if (tok.kind == .lbracket and self.pos + 1 < self.tokens.len and
-            self.tokens[self.pos + 1].kind == .lbracket)
-        {
-            return true;
-        }
-        if (tok.kind != .ident) return false;
-        if (C_SPECIFIER_KEYWORD_SET.has(tok.lexeme)) return true;
-        if (isSalOrNullabilityIdent(tok.lexeme)) return true;
-        return self.typedef_names.contains(tok.lexeme);
-    }
-
-    /// Parses the entire translation unit declaration stream.
-    fn parseTranslationUnit(self: *CDeclParser) CFrontendError!void {
-        while ((try self.peekKind()) != .eof) {
-            try self.parseExternalDeclaration(0);
-        }
-    }
-
-    /// Parses a top-level C declaration, `_Static_assert`, or `extern "C" { … }` linkage block.
-    fn parseExternalDeclaration(self: *CDeclParser, depth: u32) CFrontendError!void {
-        if (depth >= self.options.max_parse_depth) {
-            return self.failHere("C declaration nesting exceeded `MAX_C_PARSE_DEPTH`");
-        }
-        const cur_tok = try self.peekToken();
-        if (cur_tok.kind == .semi) {
-            self.pos += 1;
-            return;
-        }
-
-        // Support `extern "C" { … }` blocks in mixed C/C++ headers:
-        if (cur_tok.kind == .ident and std.mem.eql(u8, cur_tok.lexeme, "extern") and
-            self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .string_lit)
-        {
-            self.pos += 2;
-            if ((try self.peekKind()) == .lbrace) {
-                self.pos += 1;
-                while ((try self.peekKind()) != .rbrace and (try self.peekKind()) != .eof) {
-                    try self.parseExternalDeclaration(depth + 1);
-                }
-                if ((try self.peekKind()) != .rbrace) {
-                    return self.failHere("unclosed `extern \"C\" {` block in C header");
-                }
-                self.pos += 1;
-                return;
-            }
-            try self.parseExternalDeclaration(depth + 1);
-            return;
-        }
-
-        // C11 `_Static_assert(expr, "msg");` / C23 `static_assert(expr);`:
-        if (cur_tok.kind == .ident and
-            (std.mem.eql(u8, cur_tok.lexeme, "_Static_assert") or
-                std.mem.eql(u8, cur_tok.lexeme, "static_assert")))
-        {
-            try self.parseStaticAssert(depth + 1);
-            return;
-        }
-
-        const specs = try self.parseDeclSpecs(depth + 1);
-
-        // Standalone tag declaration (`struct Foo;`, `struct Foo { … };`, `enum Bar { … };`):
-        if ((try self.peekKind()) == .semi) {
-            self.pos += 1;
-            return;
-        }
-
-        var decl_index: usize = 0;
-        while (true) : (decl_index += 1) {
-            const decl = try self.parseDeclarator(specs, depth + 1, false);
-            var post_contract = decl.contract;
-            var post_noreturn = specs.is_noreturn;
-            var post_nonnull_mask = specs.nonnull_param_mask;
-            var post_align = specs.explicit_align;
-            var post_packed = specs.is_packed;
-            var post_dll = specs.dll_storage;
-            try self.consumeLeadingOrTrailingAttributes(
-                depth + 1,
-                &post_contract,
-                &post_noreturn,
-                &post_nonnull_mask,
-                &post_align,
-                &post_packed,
-                &post_dll,
-            );
-            // Skip optional GNU `asm("symbol")` linker redirect if present:
-            if ((try self.peekKind()) == .ident and
-                (std.mem.eql(u8, self.tokens[self.pos].lexeme, "asm") or
-                    std.mem.eql(u8, self.tokens[self.pos].lexeme, "__asm") or
-                    std.mem.eql(u8, self.tokens[self.pos].lexeme, "__asm__")))
-            {
-                self.pos += 1;
-                try self.skipBalancedParens();
-                try self.consumeLeadingOrTrailingAttributes(
-                    depth + 1,
-                    &post_contract,
-                    &post_noreturn,
-                    &post_nonnull_mask,
-                    &post_align,
-                    &post_packed,
-                    &post_dll,
-                );
-            }
-
-            if (specs.is_typedef) {
-                if (decl.name.len == 0) return self.failHere("missing identifier in C `typedef` declaration");
-                if (!cur_tok.is_from_system_header and self.hasUnsupportedFnLongDouble(decl.type_id, 0)) {
-                    try emitCTranslationError(
-                        self.unit,
-                        self.sink,
-                        decl.span,
-                        "non-8-byte `long double` by-value ABI is unsupported in C function types on this target",
-                    );
-                    return error.TranslationFailed;
-                }
-                const decl_id = CDeclId.fromInt(@intCast(self.unit.decls.items.len));
-                try self.unit.decls.append(self.unit.allocator, .{
-                    .kind = .{ .typedef_decl = .{ .name = decl.name, .target_type = decl.type_id } },
-                    .span = decl.span,
-                    .is_from_system_header = cur_tok.is_from_system_header,
-                });
-                const td_ref_ty = try self.unit.appendType(.{ .typedef_ref = decl_id });
-                try self.typedef_names.put(self.unit.allocator, decl.name, td_ref_ty);
-            } else {
-                const unwrapped = self.unit.getType(decl.type_id);
-                if (unwrapped == .function) {
-                    const fn_info = unwrapped.function;
-                    self.applyNonnullParamMask(fn_info.param_start, fn_info.param_len, post_nonnull_mask);
-
-                    const has_body = decl_index == 0 and (try self.peekKind()) == .lbrace;
-                    var body_first: CTokenId = .none;
-                    var body_end: CTokenId = .none;
-                    if (has_body) {
-                        body_first = CTokenId.fromInt(@intCast(self.pos));
-                        try self.skipBalancedBraces();
-                        body_end = CTokenId.fromInt(@intCast(self.pos));
-                    }
-
-                    if (!cur_tok.is_from_system_header and !specs.is_static and !has_body and
-                        self.hasUnsupportedByValueLongDoubleSig(
-                            fn_info.return_type,
-                            fn_info.param_start,
-                            fn_info.param_len,
-                        ))
-                    {
-                        try emitCTranslationError(
-                            self.unit,
-                            self.sink,
-                            decl.span,
-                            "non-8-byte `long double` by-value ABI is unsupported in C function prototypes on this target",
-                        );
-                        return error.TranslationFailed;
-                    }
-
-                    const fn_decl_id = CDeclId.fromInt(@intCast(self.unit.decls.items.len));
-                    try self.unit.decls.append(self.unit.allocator, .{
-                        .kind = .{
-                            .fn_decl = .{
-                                .name = decl.name,
-                                .return_type = fn_info.return_type,
-                                .param_start = fn_info.param_start,
-                                .param_len = fn_info.param_len,
-                                .is_variadic = fn_info.is_variadic,
-                                .is_static = specs.is_static,
-                                .is_inline = specs.is_inline,
-                                .is_noreturn = post_noreturn or fn_info.is_noreturn,
-                                .has_body = has_body,
-                                .body_first_token = body_first,
-                                .body_end_token = body_end,
-                                .ret_contract = post_contract,
-                                .dll_storage = post_dll,
-                            },
-                        },
-                        .span = decl.span,
-                        .is_from_system_header = cur_tok.is_from_system_header,
-                    });
-
-                    // `DR-20` Seam #6 (`CFunctionBodyHook`, <= 20 LOC):
-                    if (has_body) {
-                        if (self.options.body_hook) |hook_fn| {
-                            try hook_fn(self.unit, fn_decl_id, body_first, body_end, self.sink);
-                        }
-                        if ((try self.peekKind()) == .semi) self.pos += 1;
-                        return;
-                    }
-                } else {
-                    var init_const_val: ?MacroConstValue = null;
-                    if ((try self.peekKind()) == .eq) {
-                        self.pos += 1;
-                        init_const_val = try self.parseInitializerOrConstVal(depth + 1);
-                        if (decl.is_top_const and decl.name.len > 0) {
-                            if (init_const_val) |cv| {
-                                switch (cv) {
-                                    .signed_int => |sv| try self.known_int_consts.put(
-                                        self.unit.allocator,
-                                        decl.name,
-                                        sv,
-                                    ),
-                                    .unsigned_int => |uv| try self.known_int_consts.put(
-                                        self.unit.allocator,
-                                        decl.name,
-                                        uv,
-                                    ),
-                                    else => {},
-                                }
-                            }
-                        }
-                    }
-                    try self.unit.decls.append(self.unit.allocator, .{
-                        .kind = .{
-                            .var_decl = .{
-                                .name = decl.name,
-                                .type_id = decl.type_id,
-                                .is_extern = specs.is_extern or (!specs.is_static and init_const_val == null),
-                                .is_static = specs.is_static,
-                                .is_const = decl.is_top_const,
-                                .const_val = init_const_val,
-                                .dll_storage = post_dll,
-                            },
-                        },
-                        .span = decl.span,
-                        .is_from_system_header = cur_tok.is_from_system_header,
-                    });
-                }
-            }
-
-            if ((try self.peekKind()) == .comma) {
-                self.pos += 1;
-                continue;
-            }
-            break;
-        }
-
-        if ((try self.peekKind()) != .semi) {
-            return self.failHere("expected `;` at end of C declaration");
-        }
-        self.pos += 1;
-    }
-
-    /// Evaluates `_Static_assert(expr [, "msg"]);` / C23 `static_assert(expr);` at translation time.
-    fn parseStaticAssert(self: *CDeclParser, depth: u32) CFrontendError!void {
-        const kw_tok = try self.peekToken();
-        self.pos += 1;
-        if ((try self.peekKind()) != .lparen) {
-            return self.failHere("expected `(` after `_Static_assert`");
-        }
-        self.pos += 1;
-        const cond_val = try self.parseConstantIntExprUntilCommaOrRparen(depth + 1);
-        var msg_text: []const u8 = "C `_Static_assert` condition evaluated to 0";
-        if ((try self.peekKind()) == .comma) {
-            self.pos += 1;
-            if ((try self.peekKind()) == .string_lit) {
-                const decoded = try decodeCStringLiteral(&self.unit.arena, self.tokens[self.pos].lexeme);
-                msg_text = try std.fmt.allocPrint(
-                    self.unit.arena.asAllocator(),
-                    "C `_Static_assert` failed: {s}",
-                    .{decoded},
-                );
-                self.pos += 1;
-            }
-        }
-        if ((try self.peekKind()) != .rparen) {
-            return self.failHere("expected `)` to close `_Static_assert`");
-        }
-        self.pos += 1;
-        if ((try self.peekKind()) == .semi) self.pos += 1;
-
-        if (cond_val == 0) {
-            try emitCTranslationError(self.unit, self.sink, kw_tok.span, msg_text);
-            return error.TranslationFailed;
-        }
-    }
-
-    /// Parses C11/C23 declaration specifiers, qualifiers, SAL annotations, and struct/union/enum tags.
-    fn parseDeclSpecs(self: *CDeclParser, depth: u32) CFrontendError!ParsedDeclSpecs {
-        if (depth >= self.options.max_parse_depth) {
-            return self.failHere("C specifier nesting exceeded `MAX_C_PARSE_DEPTH`");
-        }
-        var out = ParsedDeclSpecs{ .type_id = .none };
-        var has_void = false;
-        var has_bool = false;
-        var has_char = false;
-        var has_short = false;
-        var has_int = false;
-        var long_count: u8 = 0;
-        var has_int128 = false;
-        var has_float = false;
-        var has_double = false;
-        var has_signed = false;
-        var has_unsigned = false;
-        var is_atomic_qual = false;
-        var explicit_type_id: CTypeId = .none;
-
-        while (true) {
-            try self.consumeLeadingOrTrailingAttributes(
-                depth + 1,
-                &out.contract,
-                &out.is_noreturn,
-                &out.nonnull_param_mask,
-                &out.explicit_align,
-                &out.is_packed,
-                &out.dll_storage,
-            );
-            const tok = try self.peekToken();
-            if (tok.kind != .ident) break;
-            const lex = tok.lexeme;
-
-            if (std.mem.eql(u8, lex, "typedef")) {
-                out.is_typedef = true;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "extern")) {
-                out.is_extern = true;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "static")) {
-                out.is_static = true;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "inline") or
-                std.mem.eql(u8, lex, "__inline") or
-                std.mem.eql(u8, lex, "__inline__") or
-                std.mem.eql(u8, lex, "__forceinline"))
-            {
-                out.is_inline = true;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "_Noreturn")) {
-                out.is_noreturn = true;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "auto") or
-                std.mem.eql(u8, lex, "register") or
-                std.mem.eql(u8, lex, "_Thread_local") or
-                std.mem.eql(u8, lex, "thread_local") or
-                std.mem.eql(u8, lex, "__thread") or
-                std.mem.eql(u8, lex, "__extension__") or
-                isCallingConvIdent(lex))
-            {
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "const") or
-                std.mem.eql(u8, lex, "__const") or
-                std.mem.eql(u8, lex, "__const__"))
-            {
-                out.is_const = true;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "volatile") or
-                std.mem.eql(u8, lex, "__volatile") or
-                std.mem.eql(u8, lex, "__volatile__") or
-                std.mem.eql(u8, lex, "restrict") or
-                std.mem.eql(u8, lex, "__restrict") or
-                std.mem.eql(u8, lex, "__restrict__"))
-            {
-                if (std.mem.startsWith(u8, lex, "volatile") or std.mem.startsWith(u8, lex, "__volatile")) {
-                    out.is_volatile = true;
-                }
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "_Atomic")) {
-                self.pos += 1;
-                if ((try self.peekKind()) == .lparen and explicit_type_id.isNone()) {
-                    self.pos += 1;
-                    const inner_ty = try self.parseTypeName(depth + 1);
-                    if ((try self.peekKind()) != .rparen) return self.failHere("expected `)` after `_Atomic(T)`");
-                    self.pos += 1;
-                    explicit_type_id = try self.unit.appendType(.{ .atomic_val = inner_ty });
-                } else {
-                    is_atomic_qual = true;
-                }
-            } else if (std.mem.eql(u8, lex, "void")) {
-                has_void = true;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "_Bool") or std.mem.eql(u8, lex, "bool")) {
-                has_bool = true;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "char")) {
-                has_char = true;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "short")) {
-                has_short = true;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "int")) {
-                has_int = true;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "long")) {
-                long_count += 1;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "__int128")) {
-                has_int128 = true;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "float")) {
-                has_float = true;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "double")) {
-                has_double = true;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "signed") or
-                std.mem.eql(u8, lex, "__signed") or
-                std.mem.eql(u8, lex, "__signed__"))
-            {
-                has_signed = true;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "unsigned")) {
-                has_unsigned = true;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "struct") or std.mem.eql(u8, lex, "union")) {
-                const is_union = std.mem.eql(u8, lex, "union");
-                self.pos += 1;
-                explicit_type_id = try self.parseStructOrUnionSpecifier(is_union, depth + 1);
-            } else if (std.mem.eql(u8, lex, "enum")) {
-                self.pos += 1;
-                explicit_type_id = try self.parseEnumSpecifier(depth + 1);
-            } else {
-                const has_any_prim = !explicit_type_id.isNone() or has_void or has_bool or has_char or
-                    has_short or has_int or long_count > 0 or has_int128 or has_float or has_double or
-                    has_signed or has_unsigned;
-                if (has_any_prim) break;
-
-                if (BUILTIN_EXACT_TYPE_MAP.get(lex)) |exact_prim| {
-                    self.pos += 1;
-                    explicit_type_id = try self.unit.appendType(.{ .primitive = exact_prim });
-                } else if (self.typedef_names.get(lex)) |td_ty| {
-                    self.pos += 1;
-                    explicit_type_id = td_ty;
-                } else {
-                    break;
-                }
-            }
-        }
-
-        if (explicit_type_id.isNone()) {
-            const prim: CPrimitiveKind = if (has_void)
-                .c_void
-            else if (has_bool)
-                .c_bool
-            else if (has_float)
-                .c_float
-            else if (has_double)
-                (if (long_count > 0) .c_longdouble else .c_double)
-            else if (has_int128)
-                (if (has_unsigned) .c_uint128 else .c_int128)
-            else if (has_char)
-                (if (has_unsigned) .c_uchar else if (has_signed) .c_schar else .c_char)
-            else if (has_short)
-                (if (has_unsigned) .c_ushort else .c_short)
-            else if (long_count >= 2)
-                (if (has_unsigned) .c_ulonglong else .c_longlong)
-            else if (long_count == 1)
-                (if (has_unsigned) .c_ulong else .c_long)
-            else if (has_unsigned)
-                .c_uint
-            else if (has_int or has_signed)
-                .c_int
-            else
-                return self.failHere("expected C type specifier in declaration");
-
-            explicit_type_id = try self.unit.appendType(.{ .primitive = prim });
-        }
-
-        if (is_atomic_qual) {
-            explicit_type_id = try self.unit.appendType(.{ .atomic_val = explicit_type_id });
-        }
-        out.type_id = explicit_type_id;
-        return out;
-    }
-
-    /// Parses `struct [Attrs] [Tag] [{ Fields… }]` or `union [Attrs] [Tag] [{ Fields… }]`.
-    fn parseStructOrUnionSpecifier(self: *CDeclParser, is_union: bool, depth: u32) CFrontendError!CTypeId {
-        const start_tok = try self.peekToken();
-        var layout = CRecordLayoutAttrs{ .pragma_pack = self.active_pack_align };
-        try self.consumeRecordAttributes(depth + 1, &layout);
-
-        var tag_name: []const u8 = "";
-        if ((try self.peekKind()) == .ident and !isAttributeKeyword(self.tokens[self.pos].lexeme)) {
-            tag_name = self.tokens[self.pos].lexeme;
-            self.pos += 1;
-        }
-        try self.consumeRecordAttributes(depth + 1, &layout);
-
-        const tag_map = if (is_union) &self.union_tags else &self.struct_tags;
-        const has_body = (try self.peekKind()) == .lbrace;
-
-        var decl_id: CDeclId = .none;
-        if (tag_name.len > 0) {
-            if (tag_map.get(tag_name)) |existing_id| {
-                decl_id = existing_id;
-            }
-        }
-        if (decl_id.isNone()) {
-            decl_id = CDeclId.fromInt(@intCast(self.unit.decls.items.len));
-            try self.unit.decls.append(self.unit.allocator, .{
-                .kind = .{
-                    .record_decl = .{
-                        .is_union = is_union,
-                        .name = tag_name,
-                        .is_complete = false,
-                        .field_start = 0,
-                        .field_len = 0,
-                        .layout_attrs = layout,
-                    },
-                },
-                .span = start_tok.span,
-                .is_from_system_header = start_tok.is_from_system_header,
-            });
-            if (tag_name.len > 0) {
-                try tag_map.put(self.unit.allocator, tag_name, decl_id);
-            }
-        }
-
-        if (has_body) {
-            self.pos += 1;
-            var local_fields: std.ArrayListUnmanaged(CStructField) = .empty;
-            defer local_fields.deinit(self.unit.allocator);
-
-            while ((try self.peekKind()) != .rbrace and (try self.peekKind()) != .eof) {
-                const f_tok = try self.peekToken();
-                if (f_tok.kind == .semi) {
-                    self.pos += 1;
-                    continue;
-                }
-                if (f_tok.kind == .ident and
-                    (std.mem.eql(u8, f_tok.lexeme, "_Static_assert") or
-                        std.mem.eql(u8, f_tok.lexeme, "static_assert")))
-                {
-                    try self.parseStaticAssert(depth + 1);
-                    continue;
-                }
-
-                const f_specs = try self.parseDeclSpecs(depth + 1);
-
-                // Anonymous nested `struct { … };` or `union { … };` member without declarator:
-                if ((try self.peekKind()) == .semi) {
-                    self.pos += 1;
-                    const inner_ty = self.unit.getType(f_specs.type_id);
-                    if (inner_ty == .record_ref) {
-                        if (self.hasIncompleteRecordOrVoidByValue(f_specs.type_id, 0)) {
-                            try emitCTranslationError(
-                                self.unit,
-                                self.sink,
-                                f_tok.span,
-                                "C struct or union field has incomplete or self-referential value type",
-                            );
-                            return error.TranslationFailed;
-                        }
-                        try local_fields.append(self.unit.allocator, .{
-                            .name = "",
-                            .type_id = f_specs.type_id,
-                            .explicit_align = f_specs.explicit_align,
-                            .is_packed_field = f_specs.is_packed,
-                            .is_anonymous_record = true,
-                            .span = f_tok.span,
-                        });
-                    }
-                    continue;
-                }
-
-                while (true) {
-                    if ((try self.peekKind()) == .colon) {
-                        // Unnamed bitfield (`unsigned : 0;` or `unsigned : 4;`):
-                        self.pos += 1;
-                        const width_val = try self.parseConstantIntExprUntilCommaOrSemi(depth + 1);
-                        if (width_val < 0 or width_val > 64) {
-                            return self.failHere("C bitfield width out of valid `[0..64]` range");
-                        }
-                        if (!self.isValidBitfieldBaseType(f_specs.type_id)) {
-                            try emitCTranslationError(
-                                self.unit,
-                                self.sink,
-                                f_tok.span,
-                                "C bitfield must have an integer, `_Bool`, or `enum` base type",
-                            );
-                            return error.TranslationFailed;
-                        }
-                        try local_fields.append(self.unit.allocator, .{
-                            .name = "",
-                            .type_id = f_specs.type_id,
-                            .bit_width = @intCast(width_val),
-                            .explicit_align = f_specs.explicit_align,
-                            .is_packed_field = f_specs.is_packed,
-                            .span = f_tok.span,
-                        });
-                    } else {
-                        const f_decl = try self.parseDeclarator(f_specs, depth + 1, false);
-                        var bit_width: ?u16 = null;
-                        if ((try self.peekKind()) == .colon) {
-                            self.pos += 1;
-                            const width_val = try self.parseConstantIntExprUntilCommaOrSemi(depth + 1);
-                            if (width_val < 0 or width_val > 64) {
-                                return self.failHere("C bitfield width out of valid `[0..64]` range");
-                            }
-                            bit_width = @intCast(width_val);
-                        }
-                        var f_contract = f_decl.contract;
-                        var dummy_nr = false;
-                        var dummy_nn: u32 = 0;
-                        var f_align = f_specs.explicit_align;
-                        var f_packed = f_specs.is_packed;
-                        var dummy_dll: CDllStorage = .none;
-                        try self.consumeLeadingOrTrailingAttributes(
-                            depth + 1,
-                            &f_contract,
-                            &dummy_nr,
-                            &dummy_nn,
-                            &f_align,
-                            &f_packed,
-                            &dummy_dll,
-                        );
-                        if (bit_width != null) {
-                            if (!self.isValidBitfieldBaseType(f_decl.type_id)) {
-                                try emitCTranslationError(
-                                    self.unit,
-                                    self.sink,
-                                    f_decl.span,
-                                    "C bitfield must have an integer, `_Bool`, or `enum` base type",
-                                );
-                                return error.TranslationFailed;
-                            }
-                        } else if (self.hasIncompleteRecordOrVoidByValue(f_decl.type_id, 0)) {
-                            try emitCTranslationError(
-                                self.unit,
-                                self.sink,
-                                f_decl.span,
-                                "C struct or union field has incomplete or self-referential value type",
-                            );
-                            return error.TranslationFailed;
-                        }
-                        try local_fields.append(self.unit.allocator, .{
-                            .name = f_decl.name,
-                            .type_id = f_decl.type_id,
-                            .bit_width = bit_width,
-                            .explicit_align = f_align,
-                            .is_packed_field = f_packed,
-                            .contract = f_contract,
-                            .span = f_decl.span,
-                        });
-                    }
-                    if ((try self.peekKind()) == .comma) {
-                        self.pos += 1;
-                        continue;
-                    }
-                    break;
-                }
-
-                if ((try self.peekKind()) != .semi) {
-                    return self.failHere("expected `;` after C struct/union member");
-                }
-                self.pos += 1;
-            }
-
-            if ((try self.peekKind()) != .rbrace) {
-                return self.failHere("unclosed `{` in C struct/union definition");
-            }
-            self.pos += 1;
-            try self.consumeRecordAttributes(depth + 1, &layout);
-
-            const field_start: u32 = @intCast(self.unit.fields.items.len);
-            try self.unit.fields.appendSlice(self.unit.allocator, local_fields.items);
-            const rec_ptr = &self.unit.decls.items[decl_id.asInt()].kind.record_decl;
-            rec_ptr.is_complete = true;
-            rec_ptr.field_start = field_start;
-            rec_ptr.field_len = @intCast(local_fields.items.len);
-            rec_ptr.layout_attrs.is_packed = rec_ptr.layout_attrs.is_packed or layout.is_packed;
-            rec_ptr.layout_attrs.is_ms_struct = rec_ptr.layout_attrs.is_ms_struct or layout.is_ms_struct;
-            rec_ptr.layout_attrs.is_gcc_struct = rec_ptr.layout_attrs.is_gcc_struct or layout.is_gcc_struct;
-            if (layout.pragma_pack != 0) rec_ptr.layout_attrs.pragma_pack = layout.pragma_pack;
-            rec_ptr.layout_attrs.explicit_align = @max(
-                rec_ptr.layout_attrs.explicit_align,
-                layout.explicit_align,
-            );
-        }
-
-        return self.unit.appendType(.{ .record_ref = decl_id });
-    }
-
-    /// Parses `enum [Attrs] [Tag] [: UnderlyingInt] [{ Variants… }]`.
-    fn parseEnumSpecifier(self: *CDeclParser, depth: u32) CFrontendError!CTypeId {
-        const start_tok = try self.peekToken();
-        var dummy_layout = CRecordLayoutAttrs{};
-        try self.consumeRecordAttributes(depth + 1, &dummy_layout);
-
-        var tag_name: []const u8 = "";
-        if ((try self.peekKind()) == .ident and !isAttributeKeyword(self.tokens[self.pos].lexeme)) {
-            tag_name = self.tokens[self.pos].lexeme;
-            self.pos += 1;
-        }
-        try self.consumeRecordAttributes(depth + 1, &dummy_layout);
-
-        var underlying_prim: ?CPrimitiveKind = null;
-        if ((try self.peekKind()) == .colon) {
-            self.pos += 1;
-            const under_specs = try self.parseDeclSpecs(depth + 1);
-            const canon_under = self.unit.unwrapTypedefs(under_specs.type_id);
-            const under_node = self.unit.getType(canon_under);
-            if (under_node == .primitive and under_node.primitive.isInteger()) {
-                underlying_prim = under_node.primitive;
-            }
-        }
-
-        var decl_id: CDeclId = .none;
-        if (tag_name.len > 0) {
-            if (self.enum_tags.get(tag_name)) |existing_id| {
-                decl_id = existing_id;
-            }
-        }
-        if (decl_id.isNone()) {
-            decl_id = CDeclId.fromInt(@intCast(self.unit.decls.items.len));
-            try self.unit.decls.append(self.unit.allocator, .{
-                .kind = .{
-                    .enum_decl = .{
-                        .name = tag_name,
-                        .underlying_prim = underlying_prim,
-                        .is_complete = false,
-                        .variant_start = 0,
-                        .variant_len = 0,
-                    },
-                },
-                .span = start_tok.span,
-                .is_from_system_header = start_tok.is_from_system_header,
-            });
-            if (tag_name.len > 0) {
-                try self.enum_tags.put(self.unit.allocator, tag_name, decl_id);
-            }
-        }
-
-        if ((try self.peekKind()) == .lbrace) {
-            self.pos += 1;
-            var local_variants: std.ArrayListUnmanaged(CEnumVariant) = .empty;
-            defer local_variants.deinit(self.unit.allocator);
-            var next_val: i128 = 0;
-
-            while ((try self.peekKind()) != .rbrace and (try self.peekKind()) != .eof) {
-                const v_tok = try self.peekToken();
-                if (v_tok.kind != .ident) {
-                    return self.failHere("expected enumerator identifier inside C `enum`");
-                }
-                const v_name = v_tok.lexeme;
-                self.pos += 1;
-                try self.consumeRecordAttributes(depth + 1, &dummy_layout);
-
-                var has_explicit = false;
-                if ((try self.peekKind()) == .eq) {
-                    self.pos += 1;
-                    next_val = try self.parseConstantIntExprUntilCommaOrRbrace(depth + 1);
-                    has_explicit = true;
-                }
-                try self.known_int_consts.put(self.unit.allocator, v_name, next_val);
-                try local_variants.append(self.unit.allocator, .{
-                    .name = v_name,
-                    .value = next_val,
-                    .has_explicit_value = has_explicit,
-                    .span = v_tok.span,
-                });
-                next_val += 1;
-
-                if ((try self.peekKind()) == .comma) {
-                    self.pos += 1;
-                } else {
-                    break;
-                }
-            }
-            if ((try self.peekKind()) != .rbrace) {
-                return self.failHere("unclosed `{` in C `enum` definition");
-            }
-            self.pos += 1;
-            try self.consumeRecordAttributes(depth + 1, &dummy_layout);
-
-            const var_start: u32 = @intCast(self.unit.enum_variants.items.len);
-            try self.unit.enum_variants.appendSlice(self.unit.allocator, local_variants.items);
-            const enum_ptr = &self.unit.decls.items[decl_id.asInt()].kind.enum_decl;
-            enum_ptr.is_complete = true;
-            if (underlying_prim != null) enum_ptr.underlying_prim = underlying_prim;
-            enum_ptr.variant_start = var_start;
-            enum_ptr.variant_len = @intCast(local_variants.items.len);
-        }
-
-        return self.unit.appendType(.{ .enum_ref = decl_id });
-    }
-
-    /// Parses an abstract C type name (`sizeof(T)`, `_Atomic(T)`).
-    fn parseTypeName(self: *CDeclParser, depth: u32) CFrontendError!CTypeId {
-        return (try self.parseDeclarator(try self.parseDeclSpecs(depth + 1), depth + 1, true)).type_id;
-    }
-
-    /// Parses a direct or grouped inside-out C declarator (`*`, `(…)`, `[N]`, `(params…)`).
-    fn parseDeclarator(
-        self: *CDeclParser,
-        specs: ParsedDeclSpecs,
-        depth: u32,
-        is_abstract_only: bool,
-    ) CFrontendError!ParsedDeclarator {
-        if (depth >= self.options.max_parse_depth) {
-            return self.failHere("C declarator nesting exceeded `MAX_C_PARSE_DEPTH`");
-        }
-        var outer_mods: std.ArrayListUnmanaged(DeclaratorModifier) = .empty;
-        defer outer_mods.deinit(self.unit.allocator);
-        var inner_mods: std.ArrayListUnmanaged(DeclaratorModifier) = .empty;
-        defer inner_mods.deinit(self.unit.allocator);
-
-        var contract = specs.contract;
-        const start_tok = try self.peekToken();
-        var decl_name: []const u8 = "";
-        var decl_span: Span = start_tok.span;
-
-        // [1] Parse leading `*` pointer indirections:
-        try self.parsePointerPrefixChain(depth + 1, &outer_mods, &contract);
-
-        // [2] Check for grouped inner declarator `(*cb)` vs direct identifier:
-        if (!is_abstract_only and (try self.peekKind()) == .lparen and self.isGroupedDeclaratorAhead()) {
-            self.pos += 1;
-            const inner_res = try self.parseGroupedInnerDeclarator(depth + 1, &inner_mods, &contract);
-            decl_name = inner_res.name;
-            decl_span = inner_res.span;
-            if ((try self.peekKind()) != .rparen) {
-                return self.failHere("expected `)` to close grouped C declarator");
-            }
-            self.pos += 1;
-        } else if (is_abstract_only and (try self.peekKind()) == .lparen and self.isGroupedDeclaratorAhead()) {
-            self.pos += 1;
-            _ = try self.parseGroupedInnerDeclarator(depth + 1, &inner_mods, &contract);
-            if ((try self.peekKind()) != .rparen) {
-                return self.failHere("expected `)` to close abstract grouped C declarator");
-            }
-            self.pos += 1;
-        } else if (!is_abstract_only and (try self.peekKind()) == .ident and
-            !isSalOrNullabilityIdent(self.tokens[self.pos].lexeme) and
-            !isAttributeKeyword(self.tokens[self.pos].lexeme))
-        {
-            decl_name = self.tokens[self.pos].lexeme;
-            decl_span = self.tokens[self.pos].span;
-            self.pos += 1;
-        }
-
-        // [3] Parse postfix `[len]` array and `(params…)` function suffixes on the outer level:
-        var outer_postfixes: std.ArrayListUnmanaged(DeclaratorModifier) = .empty;
-        defer outer_postfixes.deinit(self.unit.allocator);
-        try self.parseDeclaratorPostfixes(depth + 1, &outer_postfixes);
-
-        // [4] Assemble type from outermost base specifiers inward:
-        var current_ty = specs.type_id;
-        var is_pointee_const = specs.is_const;
-        var is_pointee_volatile = specs.is_volatile;
-
-        // Apply outer pointer chain (`const T *` makes first pointer point to `const T`):
-        for (outer_mods.items) |pmod| {
-            current_ty = try self.unit.appendType(.{
-                .pointer = .{
-                    .pointee = current_ty,
-                    .is_const = is_pointee_const,
-                    .is_volatile = is_pointee_volatile,
-                    .is_restrict = pmod.pointer.is_ptr_restrict,
-                    .nullability = pmod.pointer.nullability,
-                },
-            });
-            is_pointee_const = pmod.pointer.is_ptr_const;
-            is_pointee_volatile = pmod.pointer.is_ptr_volatile;
-        }
-
-        // Apply outer postfixes from right to left so `int a[2][3]` is `[ [int; 3]; 2 ]`:
-        var op_idx = outer_postfixes.items.len;
-        while (op_idx > 0) {
-            op_idx -= 1;
-            switch (outer_postfixes.items[op_idx]) {
-                .array => |arr_len| {
-                    current_ty = try self.unit.appendType(.{
-                        .array = .{ .elem = current_ty, .len = arr_len },
-                    });
-                },
-                .function => |fn_mod| {
-                    current_ty = try self.unit.appendType(.{
-                        .function = .{
-                            .return_type = current_ty,
-                            .param_start = fn_mod.param_start,
-                            .param_len = fn_mod.param_len,
-                            .is_variadic = fn_mod.is_variadic,
-                            .is_noreturn = specs.is_noreturn,
-                        },
-                    });
-                },
-                .pointer => unreachable,
-            }
-            is_pointee_const = false;
-            is_pointee_volatile = false;
-        }
-
-        // Apply grouped inner modifiers (`(*cb)(args)` wraps pointer around `fn(args) -> R`):
-        for (inner_mods.items) |imod| {
-            switch (imod) {
-                .pointer => |pinfo| {
-                    current_ty = try self.unit.appendType(.{
-                        .pointer = .{
-                            .pointee = current_ty,
-                            .is_const = is_pointee_const,
-                            .is_volatile = is_pointee_volatile,
-                            .is_restrict = pinfo.is_ptr_restrict,
-                            .nullability = pinfo.nullability,
-                        },
-                    });
-                    is_pointee_const = pinfo.is_ptr_const;
-                    is_pointee_volatile = pinfo.is_ptr_volatile;
-                },
-                .array => |arr_len| {
-                    current_ty = try self.unit.appendType(.{
-                        .array = .{ .elem = current_ty, .len = arr_len },
-                    });
-                    is_pointee_const = false;
-                },
-                .function => |fn_mod| {
-                    current_ty = try self.unit.appendType(.{
-                        .function = .{
-                            .return_type = current_ty,
-                            .param_start = fn_mod.param_start,
-                            .param_len = fn_mod.param_len,
-                            .is_variadic = fn_mod.is_variadic,
-                        },
-                    });
-                    is_pointee_const = false;
-                },
-            }
-        }
-
-        // Propagate outermost pointer nullability onto `contract` if set via `_Nullable` / `_Nonnull`:
-        const top_node = self.unit.getType(current_ty);
-        if (top_node == .pointer and top_node.pointer.nullability != .unspecified and
-            contract.nullability == .unspecified)
-        {
-            contract.nullability = top_node.pointer.nullability;
-        }
-
-        return .{
-            .name = decl_name,
-            .span = decl_span,
-            .type_id = current_ty,
-            .is_top_const = is_pointee_const,
-            .contract = contract,
-        };
-    }
-
-    /// Parses a parenthesized inner declarator (`*cb` or `*(*factory)(int)`).
-    fn parseGroupedInnerDeclarator(
-        self: *CDeclParser,
-        depth: u32,
-        out_mods: *std.ArrayListUnmanaged(DeclaratorModifier),
-        contract: *CFfiContract,
-    ) CFrontendError!struct { name: []const u8, span: Span } {
-        if (depth >= self.options.max_parse_depth) {
-            return self.failHere("C grouped declarator exceeded `MAX_C_PARSE_DEPTH`");
-        }
-        var lead_ptrs: std.ArrayListUnmanaged(DeclaratorModifier) = .empty;
-        defer lead_ptrs.deinit(self.unit.allocator);
-        try self.parsePointerPrefixChain(depth + 1, &lead_ptrs, contract);
-
-        var name: []const u8 = "";
-        var span: Span = (try self.peekToken()).span;
-        var deeper_mods: std.ArrayListUnmanaged(DeclaratorModifier) = .empty;
-        defer deeper_mods.deinit(self.unit.allocator);
-
-        if ((try self.peekKind()) == .lparen and self.isGroupedDeclaratorAhead()) {
-            self.pos += 1;
-            const sub = try self.parseGroupedInnerDeclarator(depth + 1, &deeper_mods, contract);
-            name = sub.name;
-            span = sub.span;
-            if ((try self.peekKind()) != .rparen) {
-                return self.failHere("expected `)` in nested C declarator");
-            }
-            self.pos += 1;
-        } else if ((try self.peekKind()) == .ident and
-            !isSalOrNullabilityIdent(self.tokens[self.pos].lexeme) and
-            !isAttributeKeyword(self.tokens[self.pos].lexeme))
-        {
-            name = self.tokens[self.pos].lexeme;
-            span = self.tokens[self.pos].span;
-            self.pos += 1;
-        }
-
-        var local_postfixes: std.ArrayListUnmanaged(DeclaratorModifier) = .empty;
-        defer local_postfixes.deinit(self.unit.allocator);
-        try self.parseDeclaratorPostfixes(depth + 1, &local_postfixes);
-
-        try out_mods.appendSlice(self.unit.allocator, lead_ptrs.items);
-        var p_idx = local_postfixes.items.len;
-        while (p_idx > 0) {
-            p_idx -= 1;
-            try out_mods.append(self.unit.allocator, local_postfixes.items[p_idx]);
-        }
-        try out_mods.appendSlice(self.unit.allocator, deeper_mods.items);
-        return .{ .name = name, .span = span };
-    }
-
-    /// Returns `true` when `(` at `self.pos` opens a grouped declarator rather than a parameter list.
-    fn isGroupedDeclaratorAhead(self: *const CDeclParser) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const next_tok = self.tokens[self.pos + 1];
-        if (next_tok.kind == .rparen or next_tok.kind == .ellipses) return false;
-        if (next_tok.kind == .star or next_tok.kind == .lparen or next_tok.kind == .lbracket) return true;
-        if (next_tok.kind == .ident) {
-            if (isCallingConvIdent(next_tok.lexeme) or isAttributeKeyword(next_tok.lexeme)) return true;
-            return !self.isTypeStartToken(next_tok);
-        }
-        return false;
-    }
-
-    /// Parses zero or more `*` pointer prefixes and trailing pointer qualifiers (`const`, `_Nonnull`, etc.).
-    fn parsePointerPrefixChain(
-        self: *CDeclParser,
-        depth: u32,
-        out_mods: *std.ArrayListUnmanaged(DeclaratorModifier),
-        contract: *CFfiContract,
-    ) CFrontendError!void {
-        while (true) {
-            var dummy_nr = false;
-            var dummy_nn: u32 = 0;
-            var dummy_al: u32 = 0;
-            var dummy_pk = false;
-            var dummy_dll: CDllStorage = .none;
-            try self.consumeLeadingOrTrailingAttributes(
-                depth + 1,
-                contract,
-                &dummy_nr,
-                &dummy_nn,
-                &dummy_al,
-                &dummy_pk,
-                &dummy_dll,
-            );
-            if ((try self.peekKind()) == .ident and isCallingConvIdent(self.tokens[self.pos].lexeme)) {
-                self.pos += 1;
-                continue;
-            }
-            if ((try self.peekKind()) != .star) break;
-            self.pos += 1;
-
-            var is_p_const = false;
-            var is_p_vol = false;
-            var is_p_rest = false;
-            var ptr_null: CNullability = .unspecified;
-
-            while ((try self.peekKind()) == .ident or (try self.peekKind()) == .lbracket) {
-                if ((try self.peekKind()) == .lbracket) {
-                    if (self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lbracket) {
-                        var ptr_contract = CFfiContract{};
-                        try self.consumeLeadingOrTrailingAttributes(
-                            depth + 1,
-                            &ptr_contract,
-                            &dummy_nr,
-                            &dummy_nn,
-                            &dummy_al,
-                            &dummy_pk,
-                            &dummy_dll,
-                        );
-                        if (ptr_contract.slice_len_param.len > 0) {
-                            contract.slice_len_param = ptr_contract.slice_len_param;
-                        }
-                        continue;
-                    }
-                    break;
-                }
-                const qlex = self.tokens[self.pos].lexeme;
-                if (std.mem.eql(u8, qlex, "const") or std.mem.eql(u8, qlex, "__const") or
-                    std.mem.eql(u8, qlex, "__const__"))
-                {
-                    is_p_const = true;
-                    self.pos += 1;
-                } else if (std.mem.eql(u8, qlex, "volatile") or std.mem.eql(u8, qlex, "__volatile") or
-                    std.mem.eql(u8, qlex, "__volatile__"))
-                {
-                    is_p_vol = true;
-                    self.pos += 1;
-                } else if (std.mem.eql(u8, qlex, "restrict") or std.mem.eql(u8, qlex, "__restrict") or
-                    std.mem.eql(u8, qlex, "__restrict__"))
-                {
-                    is_p_rest = true;
-                    self.pos += 1;
-                } else if (std.mem.eql(u8, qlex, "_Nonnull")) {
-                    ptr_null = .non_null;
-                    self.pos += 1;
-                } else if (std.mem.eql(u8, qlex, "_Nullable")) {
-                    ptr_null = .may_be_null;
-                    self.pos += 1;
-                } else if (std.mem.eql(u8, qlex, "_Null_unspecified") or isCallingConvIdent(qlex)) {
-                    self.pos += 1;
-                } else if (isAttributeKeyword(qlex)) {
-                    var ptr_contract = CFfiContract{};
-                    try self.consumeLeadingOrTrailingAttributes(
-                        depth + 1,
-                        &ptr_contract,
-                        &dummy_nr,
-                        &dummy_nn,
-                        &dummy_al,
-                        &dummy_pk,
-                        &dummy_dll,
-                    );
-                    if (ptr_contract.slice_len_param.len > 0) {
-                        contract.slice_len_param = ptr_contract.slice_len_param;
-                    }
-                } else {
-                    break;
-                }
-            }
-
-            try out_mods.append(self.unit.allocator, .{
-                .pointer = .{
-                    .is_ptr_const = is_p_const,
-                    .is_ptr_volatile = is_p_vol,
-                    .is_ptr_restrict = is_p_rest,
-                    .nullability = ptr_null,
-                },
-            });
-        }
-    }
-
-    /// Parses postfix `[len]` array and `(params…)` function suffixes.
-    fn parseDeclaratorPostfixes(
-        self: *CDeclParser,
-        depth: u32,
-        out_postfixes: *std.ArrayListUnmanaged(DeclaratorModifier),
-    ) CFrontendError!void {
-        while (true) {
-            const pk = try self.peekKind();
-            if (pk == .lbracket) {
-                // Stop if C23 `[[…]]` attribute follows declarator:
-                if (self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lbracket) break;
-                self.pos += 1;
-                // Skip optional C99 `[static const 16]` array parameter qualifiers:
-                while ((try self.peekKind()) == .ident) {
-                    const qual_lex = self.tokens[self.pos].lexeme;
-                    if (std.mem.eql(u8, qual_lex, "static") or std.mem.eql(u8, qual_lex, "const") or
-                        std.mem.eql(u8, qual_lex, "restrict") or std.mem.eql(u8, qual_lex, "__restrict") or
-                        std.mem.eql(u8, qual_lex, "volatile"))
-                    {
-                        self.pos += 1;
-                    } else {
-                        break;
-                    }
-                }
-                var arr_len: ?u64 = null;
-                if ((try self.peekKind()) == .star and
-                    self.pos + 1 < self.tokens.len and
-                    self.tokens[self.pos + 1].kind == .rbracket)
-                {
-                    self.pos += 1;
-                } else if ((try self.peekKind()) != .rbracket) {
-                    const len_val = try self.parseConstantIntExprUntilRbracket(depth + 1);
-                    if (len_val < 0) return self.failHere("negative C array bound");
-                    arr_len = @intCast(len_val);
-                }
-                if ((try self.peekKind()) != .rbracket) {
-                    return self.failHere("expected `]` in C array declarator");
-                }
-                self.pos += 1;
-                try out_postfixes.append(self.unit.allocator, .{ .array = arr_len });
-            } else if (pk == .lparen) {
-                self.pos += 1;
-                const fn_params = try self.parseParameterTypeList(depth + 1);
-                if ((try self.peekKind()) != .rparen) {
-                    return self.failHere("expected `)` to close C function parameter list");
-                }
-                self.pos += 1;
-                try out_postfixes.append(self.unit.allocator, .{ .function = fn_params });
-            } else {
-                break;
-            }
-        }
-    }
-
-    /// Parses a C function `(param0, param1, …)` list, applying `(void)` empty-param and array/fn decay.
-    fn parseParameterTypeList(self: *CDeclParser, depth: u32) CFrontendError!FnSuffixMod {
-        if ((try self.peekKind()) == .rparen) {
-            return .{ .param_start = 0, .param_len = 0, .is_variadic = false };
-        }
-        var local_params: std.ArrayListUnmanaged(CFnParam) = .empty;
-        defer local_params.deinit(self.unit.allocator);
-        var is_variadic = false;
-
-        while ((try self.peekKind()) != .rparen and (try self.peekKind()) != .eof) {
-            if ((try self.peekKind()) == .ellipses) {
-                is_variadic = true;
-                self.pos += 1;
-                break;
-            }
-
-            const p_specs = try self.parseDeclSpecs(depth + 1);
-            const p_decl = try self.parseDeclarator(p_specs, depth + 1, false);
-            var p_contract = p_decl.contract;
-            var dummy_nr = false;
-            var dummy_nn: u32 = 0;
-            var dummy_al: u32 = 0;
-            var dummy_pk = false;
-            var dummy_dll: CDllStorage = .none;
-            try self.consumeLeadingOrTrailingAttributes(
-                depth + 1,
-                &p_contract,
-                &dummy_nr,
-                &dummy_nn,
-                &dummy_al,
-                &dummy_pk,
-                &dummy_dll,
-            );
-
-            // C11 `(void)` single unnamed `void` parameter means 0 parameters:
-            if (local_params.items.len == 0 and p_decl.name.len == 0 and (try self.peekKind()) == .rparen) {
-                const p_node = self.unit.getType(p_decl.type_id);
-                if (p_node == .primitive and p_node.primitive == .c_void) {
-                    return .{ .param_start = 0, .param_len = 0, .is_variadic = false };
-                }
-            }
-
-            // C11 §6.7.6.3p7–8 parameter decay; `T[N]` -> `*T` / `*mut T` and `fn(…)` -> `*fn(…)`:
-            var decayed_ty = p_decl.type_id;
-            const raw_p_node = self.unit.getType(decayed_ty);
-            if (raw_p_node == .array) {
-                decayed_ty = try self.unit.appendType(.{
-                    .pointer = .{
-                        .pointee = raw_p_node.array.elem,
-                        .is_const = p_specs.is_const and !self.isPointerChain(raw_p_node.array.elem),
-                        .nullability = p_contract.nullability,
-                    },
-                });
-            } else if (raw_p_node == .function) {
-                decayed_ty = try self.unit.appendType(.{
-                    .pointer = .{
-                        .pointee = decayed_ty,
-                        .is_const = true,
-                        .nullability = p_contract.nullability,
-                    },
-                });
-            }
-
-            try local_params.append(self.unit.allocator, .{
-                .name = p_decl.name,
-                .type_id = decayed_ty,
-                .contract = p_contract,
-                .span = p_decl.span,
-            });
-
-            if ((try self.peekKind()) == .comma) {
-                self.pos += 1;
-                continue;
-            }
-            break;
-        }
-
-        const param_start: u32 = @intCast(self.unit.params.items.len);
-        try self.unit.params.appendSlice(self.unit.allocator, local_params.items);
-        return .{
-            .param_start = param_start,
-            .param_len = @intCast(local_params.items.len),
-            .is_variadic = is_variadic,
-        };
-    }
-
-    /// Returns `true` if `type_id` is already a `.pointer` node.
-    fn isPointerChain(self: *const CDeclParser, type_id: CTypeId) bool {
-        return self.unit.getType(type_id) == .pointer;
-    }
-
-    /// Applies `__attribute__((nonnull(…)))` bits onto `params[param_start .. param_start + param_len]`.
-    fn applyNonnullParamMask(self: *CDeclParser, param_start: u32, param_len: u32, mask: u32) void {
-        if (mask == 0 or param_len == 0) return;
-        var i: u32 = 0;
-        while (i < param_len) : (i += 1) {
-            const has_bit = mask == std.math.maxInt(u32) or (i < 31 and ((mask >> @intCast(i)) & 1) != 0);
-            if (has_bit) {
-                const p_ptr = &self.unit.params.items[param_start + i];
-                if (p_ptr.contract.nullability == .unspecified) {
-                    p_ptr.contract.nullability = .non_null;
-                }
-            }
-        }
-    }
-
-    /// Parses `struct`/`union`/`enum` layout attributes (`packed`, `aligned(N)`, `ms_struct`, `gcc_struct`).
-    fn consumeRecordAttributes(
-        self: *CDeclParser,
-        depth: u32,
-        layout: *CRecordLayoutAttrs,
-    ) CFrontendError!void {
-        var dummy_contract = CFfiContract{};
-        var dummy_nr = false;
-        var dummy_nn: u32 = 0;
-        var dummy_dll: CDllStorage = .none;
-        while (true) {
-            const before = self.pos;
-            const pk = try self.peekKind();
-            if (pk == .ident and
-                (std.mem.eql(u8, self.tokens[self.pos].lexeme, "__attribute__") or
-                    std.mem.eql(u8, self.tokens[self.pos].lexeme, "__attribute")))
-            {
-                self.pos += 1;
-                if ((try self.peekKind()) == .lparen) {
-                    try self.parseGnuAttributeGroup(
-                        depth + 1,
-                        &dummy_contract,
-                        &dummy_nr,
-                        &dummy_nn,
-                        &layout.explicit_align,
-                        &layout.is_packed,
-                        &layout.is_ms_struct,
-                        &layout.is_gcc_struct,
-                    );
-                }
-            } else if (pk == .lbracket and self.pos + 1 < self.tokens.len and
-                self.tokens[self.pos + 1].kind == .lbracket)
-            {
-                try self.parseC23AttributeGroup(
-                    depth + 1,
-                    &dummy_contract,
-                    &dummy_nr,
-                    &layout.explicit_align,
-                    &layout.is_packed,
-                    &layout.is_ms_struct,
-                    &layout.is_gcc_struct,
-                );
-            } else if (pk == .ident and
-                (std.mem.eql(u8, self.tokens[self.pos].lexeme, "_Alignas") or
-                    std.mem.eql(u8, self.tokens[self.pos].lexeme, "alignas") or
-                    std.mem.eql(u8, self.tokens[self.pos].lexeme, "__declspec")))
-            {
-                try self.consumeLeadingOrTrailingAttributes(
-                    depth + 1,
-                    &dummy_contract,
-                    &dummy_nr,
-                    &dummy_nn,
-                    &layout.explicit_align,
-                    &layout.is_packed,
-                    &dummy_dll,
-                );
-            } else {
-                break;
-            }
-            if (self.pos == before) break;
-        }
-    }
-
-    /// Consumes Clang/GNU `__attribute__`, C23 `[[…]]`, `_Alignas`, `__declspec`, and Microsoft SAL tokens.
-    fn consumeLeadingOrTrailingAttributes(
-        self: *CDeclParser,
-        depth: u32,
-        contract: *CFfiContract,
-        is_noreturn: *bool,
-        nonnull_mask: *u32,
-        explicit_align: *u32,
-        is_packed: *bool,
-        dll_storage: *CDllStorage,
-    ) CFrontendError!void {
-        var dummy_ms = false;
-        var dummy_gcc = false;
-        while (true) {
-            const pk = try self.peekKind();
-            if (pk == .lbracket and self.pos + 1 < self.tokens.len and
-                self.tokens[self.pos + 1].kind == .lbracket)
-            {
-                try self.parseC23AttributeGroup(
-                    depth + 1,
-                    contract,
-                    is_noreturn,
-                    explicit_align,
-                    is_packed,
-                    &dummy_ms,
-                    &dummy_gcc,
-                );
-                continue;
-            }
-            if (pk != .ident) break;
-            const lex = self.tokens[self.pos].lexeme;
-
-            if (std.mem.eql(u8, lex, "__attribute__") or std.mem.eql(u8, lex, "__attribute")) {
-                self.pos += 1;
-                if ((try self.peekKind()) == .lparen) {
-                    try self.parseGnuAttributeGroup(
-                        depth + 1,
-                        contract,
-                        is_noreturn,
-                        nonnull_mask,
-                        explicit_align,
-                        is_packed,
-                        &dummy_ms,
-                        &dummy_gcc,
-                    );
-                }
-            } else if (std.mem.eql(u8, lex, "_Alignas") or std.mem.eql(u8, lex, "alignas")) {
-                self.pos += 1;
-                if ((try self.peekKind()) == .lparen) {
-                    self.pos += 1;
-                    if (self.pos < self.tokens.len and self.isTypeStartToken(self.tokens[self.pos])) {
-                        const al_ty = try self.parseTypeName(depth + 1);
-                        explicit_align.* = @max(explicit_align.*, self.estimateTypeAlignBytes(al_ty, depth + 1));
-                    } else {
-                        const al_val = try self.parseConstantIntExprUntilCommaOrRparen(depth + 1);
-                        if (al_val > 0 and std.math.isPowerOfTwo(@as(u64, @intCast(al_val)))) {
-                            explicit_align.* = @max(explicit_align.*, @as(u32, @intCast(al_val)));
-                        }
-                    }
-                    if ((try self.peekKind()) == .rparen) self.pos += 1;
-                }
-            } else if (std.mem.eql(u8, lex, "__declspec")) {
-                self.pos += 1;
-                if ((try self.peekKind()) == .lparen) {
-                    self.pos += 1;
-                    while ((try self.peekKind()) != .rparen and (try self.peekKind()) != .eof) {
-                        if (self.tokens[self.pos].kind == .ident) {
-                            const ds_name = self.tokens[self.pos].lexeme;
-                            self.pos += 1;
-                            if (std.mem.eql(u8, ds_name, "dllexport")) {
-                                dll_storage.* = .dllexport;
-                            } else if (std.mem.eql(u8, ds_name, "dllimport")) {
-                                dll_storage.* = .dllimport;
-                            } else if (std.mem.eql(u8, ds_name, "noreturn")) {
-                                is_noreturn.* = true;
-                            } else if (std.mem.eql(u8, ds_name, "align") and (try self.peekKind()) == .lparen) {
-                                self.pos += 1;
-                                const al_v = try self.parseConstantIntExprUntilCommaOrRparen(depth + 1);
-                                if (al_v > 0 and std.math.isPowerOfTwo(@as(u64, @intCast(al_v)))) {
-                                    explicit_align.* = @max(explicit_align.*, @as(u32, @intCast(al_v)));
-                                }
-                                if ((try self.peekKind()) == .rparen) self.pos += 1;
-                            } else if ((try self.peekKind()) == .lparen) {
-                                try self.skipBalancedParens();
-                            }
-                        } else {
-                            self.pos += 1;
-                        }
-                    }
-                    if ((try self.peekKind()) == .rparen) self.pos += 1;
-                }
-            } else if (std.mem.eql(u8, lex, "_In_z_")) {
-                // Microsoft SAL and Clang nullability annotations:
-                contract.is_null_terminated = true;
-                contract.nullability = .non_null;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "_In_opt_z_")) {
-                contract.is_null_terminated = true;
-                contract.nullability = .may_be_null;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "_Out_")) {
-                contract.is_out_param = true;
-                contract.nullability = .non_null;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "_Out_opt_")) {
-                contract.is_out_param = true;
-                contract.nullability = .may_be_null;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "_In_") or std.mem.eql(u8, lex, "_Inout_") or
-                std.mem.eql(u8, lex, "_Ret_notnull_"))
-            {
-                contract.nullability = .non_null;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "_In_opt_") or std.mem.eql(u8, lex, "_Inout_opt_") or
-                std.mem.eql(u8, lex, "_Ret_maybenull_"))
-            {
-                contract.nullability = .may_be_null;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "_In_reads_") or std.mem.eql(u8, lex, "_Out_writes_")) {
-                if (std.mem.eql(u8, lex, "_Out_writes_")) contract.is_out_param = true;
-                contract.nullability = .non_null;
-                self.pos += 1;
-                if ((try self.peekKind()) == .lparen) {
-                    self.pos += 1;
-                    if ((try self.peekKind()) == .ident or (try self.peekKind()) == .number) {
-                        contract.slice_len_param = self.tokens[self.pos].lexeme;
-                        self.pos += 1;
-                    }
-                    while ((try self.peekKind()) != .rparen and (try self.peekKind()) != .eof) : (self.pos += 1) {}
-                    if ((try self.peekKind()) == .rparen) self.pos += 1;
-                }
-            } else if (std.mem.eql(u8, lex, "_Nonnull")) {
-                contract.nullability = .non_null;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "_Nullable")) {
-                contract.nullability = .may_be_null;
-                self.pos += 1;
-            } else if (std.mem.eql(u8, lex, "_Null_unspecified")) {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
-    }
-
-    /// Parses `__attribute__((attr1, attr2(arg)))` groups.
-    fn parseGnuAttributeGroup(
-        self: *CDeclParser,
-        depth: u32,
-        contract: *CFfiContract,
-        is_noreturn: *bool,
-        nonnull_mask: *u32,
-        explicit_align: *u32,
-        is_packed: *bool,
-        is_ms_struct: *bool,
-        is_gcc_struct: *bool,
-    ) CFrontendError!void {
-        if ((try self.peekKind()) != .lparen) return;
-        self.pos += 1;
-        const has_double_paren = (try self.peekKind()) == .lparen;
-        if (has_double_paren) self.pos += 1;
-
-        while ((try self.peekKind()) != .rparen and (try self.peekKind()) != .eof) {
-            if ((try self.peekKind()) == .comma) {
-                self.pos += 1;
-                continue;
-            }
-            if ((try self.peekKind()) != .ident) {
-                if ((try self.peekKind()) == .lparen) {
-                    try self.skipBalancedParens();
-                } else {
-                    self.pos += 1;
-                }
-                continue;
-            }
-            const attr_name = stripDoubleUnderscores(self.tokens[self.pos].lexeme);
-            self.pos += 1;
-
-            if (std.mem.eql(u8, attr_name, "packed")) {
-                is_packed.* = true;
-            } else if (std.mem.eql(u8, attr_name, "ms_struct")) {
-                is_ms_struct.* = true;
-            } else if (std.mem.eql(u8, attr_name, "gcc_struct")) {
-                is_gcc_struct.* = true;
-            } else if (std.mem.eql(u8, attr_name, "noreturn")) {
-                is_noreturn.* = true;
-            } else if (std.mem.eql(u8, attr_name, "aligned")) {
-                if ((try self.peekKind()) == .lparen) {
-                    self.pos += 1;
-                    if ((try self.peekKind()) != .rparen) {
-                        const al_val = try self.parseConstantIntExprUntilCommaOrRparen(depth + 1);
-                        if (al_val > 0 and std.math.isPowerOfTwo(@as(u64, @intCast(al_val)))) {
-                            explicit_align.* = @max(explicit_align.*, @as(u32, @intCast(al_val)));
-                        }
-                    } else {
-                        explicit_align.* = @max(explicit_align.*, 16);
-                    }
-                    if ((try self.peekKind()) == .rparen) self.pos += 1;
-                } else {
-                    explicit_align.* = @max(explicit_align.*, 16);
-                }
-            } else if (std.mem.eql(u8, attr_name, "counted_by")) {
-                if ((try self.peekKind()) == .lparen) {
-                    self.pos += 1;
-                    if ((try self.peekKind()) == .ident or (try self.peekKind()) == .number) {
-                        contract.slice_len_param = self.tokens[self.pos].lexeme;
-                        self.pos += 1;
-                    }
-                    while ((try self.peekKind()) != .rparen and (try self.peekKind()) != .eof) : (self.pos += 1) {}
-                    if ((try self.peekKind()) == .rparen) self.pos += 1;
-                }
-            } else if (std.mem.eql(u8, attr_name, "malloc")) {
-                contract.is_owned_by_caller = true;
-                if ((try self.peekKind()) == .lparen) {
-                    self.pos += 1;
-                    if ((try self.peekKind()) == .ident) {
-                        contract.free_with_fn = self.tokens[self.pos].lexeme;
-                        self.pos += 1;
-                    }
-                    while ((try self.peekKind()) != .rparen and (try self.peekKind()) != .eof) : (self.pos += 1) {}
-                    if ((try self.peekKind()) == .rparen) self.pos += 1;
-                }
-            } else if (std.mem.eql(u8, attr_name, "nonnull")) {
-                if ((try self.peekKind()) == .lparen) {
-                    self.pos += 1;
-                    var has_any_idx = false;
-                    while ((try self.peekKind()) != .rparen and (try self.peekKind()) != .eof) {
-                        if ((try self.peekKind()) == .number) {
-                            if (parseCIntegerLiteral(self.tokens[self.pos].lexeme)) |iv| {
-                                if (iv.bits >= 1 and iv.bits <= 31) {
-                                    nonnull_mask.* |= @as(u32, 1) << @intCast(iv.bits - 1);
-                                    has_any_idx = true;
-                                }
-                            }
-                        }
-                        self.pos += 1;
-                    }
-                    if (!has_any_idx) nonnull_mask.* = std.math.maxInt(u32);
-                    if ((try self.peekKind()) == .rparen) self.pos += 1;
-                } else {
-                    nonnull_mask.* = std.math.maxInt(u32);
-                }
-            } else if ((try self.peekKind()) == .lparen) {
-                try self.skipBalancedParens();
-            }
-        }
-
-        if ((try self.peekKind()) == .rparen) self.pos += 1;
-        if (has_double_paren and (try self.peekKind()) == .rparen) self.pos += 1;
-    }
-
-    /// Parses C23 `[[gnu::packed]]`, `[[noreturn]]`, `[[clang::counted_by(len)]]` attribute groups.
-    fn parseC23AttributeGroup(
-        self: *CDeclParser,
-        depth: u32,
-        contract: *CFfiContract,
-        is_noreturn: *bool,
-        explicit_align: *u32,
-        is_packed: *bool,
-        is_ms_struct: *bool,
-        is_gcc_struct: *bool,
-    ) CFrontendError!void {
-        _ = depth;
-        self.pos += 2; // Consume `[[`.
-        while (self.pos < self.tokens.len) {
-            if (self.tokens[self.pos].kind == .rbracket and
-                self.pos + 1 < self.tokens.len and
-                self.tokens[self.pos + 1].kind == .rbracket)
-            {
-                self.pos += 2;
-                break;
-            }
-            if (self.tokens[self.pos].kind == .ident) {
-                var attr_ident = self.tokens[self.pos].lexeme;
-                self.pos += 1;
-                if (self.pos + 1 < self.tokens.len and self.tokens[self.pos].kind == .colon_colon and
-                    self.tokens[self.pos + 1].kind == .ident)
-                {
-                    attr_ident = self.tokens[self.pos + 1].lexeme;
-                    self.pos += 2;
-                }
-                const clean = stripDoubleUnderscores(attr_ident);
-                if (std.mem.eql(u8, clean, "packed")) {
-                    is_packed.* = true;
-                } else if (std.mem.eql(u8, clean, "ms_struct")) {
-                    is_ms_struct.* = true;
-                } else if (std.mem.eql(u8, clean, "gcc_struct")) {
-                    is_gcc_struct.* = true;
-                } else if (std.mem.eql(u8, clean, "noreturn")) {
-                    is_noreturn.* = true;
-                } else if (std.mem.eql(u8, clean, "aligned") and
-                    self.pos < self.tokens.len and
-                    self.tokens[self.pos].kind == .lparen)
-                {
-                    self.pos += 1;
-                    if (self.pos < self.tokens.len and self.tokens[self.pos].kind == .number) {
-                        if (parseCIntegerLiteral(self.tokens[self.pos].lexeme)) |iv| {
-                            if (iv.bits > 0 and std.math.isPowerOfTwo(iv.bits)) {
-                                explicit_align.* = @max(explicit_align.*, @as(u32, @intCast(iv.bits)));
-                            }
-                        }
-                        self.pos += 1;
-                    }
-                    if (self.pos < self.tokens.len and self.tokens[self.pos].kind == .rparen) self.pos += 1;
-                } else if (std.mem.eql(u8, clean, "counted_by") and
-                    self.pos < self.tokens.len and
-                    self.tokens[self.pos].kind == .lparen)
-                {
-                    self.pos += 1;
-                    if (self.pos < self.tokens.len and
-                        (self.tokens[self.pos].kind == .ident or self.tokens[self.pos].kind == .number))
-                    {
-                        contract.slice_len_param = self.tokens[self.pos].lexeme;
-                        self.pos += 1;
-                    }
-                    if (self.pos < self.tokens.len and self.tokens[self.pos].kind == .rparen) self.pos += 1;
-                } else if (self.pos < self.tokens.len and self.tokens[self.pos].kind == .lparen) {
-                    try self.skipBalancedParens();
-                }
-            } else {
-                self.pos += 1;
-            }
-        }
-    }
-
-    /// Skips a balanced `( … )` group starting at `self.pos`.
-    fn skipBalancedParens(self: *CDeclParser) CFrontendError!void {
-        if ((try self.peekKind()) != .lparen) return;
-        self.pos += 1;
-        var depth: u32 = 1;
-        while (self.pos < self.tokens.len and depth > 0) : (self.pos += 1) {
-            const tok_kind = self.tokens[self.pos].kind;
-            if (tok_kind == .lparen) {
-                depth += 1;
-                if (depth >= self.options.max_parse_depth) {
-                    return self.failHere("C parenthesis nesting exceeded `MAX_C_PARSE_DEPTH`");
-                }
-            } else if (tok_kind == .rparen) {
-                depth -= 1;
-            }
-        }
-        if (depth != 0) return self.failHere("unclosed `(` in C attribute or expression");
-    }
-
-    /// Skips a balanced `{ … }` function body starting at `self.pos` (`DR-20` Seam #6).
-    fn skipBalancedBraces(self: *CDeclParser) CFrontendError!void {
-        if ((try self.peekKind()) != .lbrace) return;
-        self.pos += 1;
-        var depth: u32 = 1;
-        while (self.pos < self.tokens.len and depth > 0) : (self.pos += 1) {
-            const tok_kind = self.tokens[self.pos].kind;
-            if (tok_kind == .lbrace) {
-                depth += 1;
-                if (depth >= self.options.max_parse_depth) {
-                    return self.failHere("C brace nesting exceeded `MAX_C_PARSE_DEPTH`");
-                }
-            } else if (tok_kind == .rbrace) {
-                depth -= 1;
-            }
-        }
-        if (depth != 0) return self.failHere("unclosed `{` in C inline function body");
-    }
-
-    /// Parses a `static const` scalar/string initializer or skips complex aggregate initializers.
-    fn parseInitializerOrConstVal(self: *CDeclParser, depth: u32) CFrontendError!?MacroConstValue {
-        if (depth >= self.options.max_parse_depth) {
-            return self.failHere("C initializer nesting exceeded `MAX_C_PARSE_DEPTH`");
-        }
-        if ((try self.peekKind()) == .lbrace) {
-            try self.skipBalancedBraces();
-            return null;
-        }
-        const start_idx = self.pos;
-        var p_depth: u32 = 0;
-        while (self.pos < self.tokens.len) {
-            const tok_kind = self.tokens[self.pos].kind;
-            if (p_depth == 0 and (tok_kind == .comma or tok_kind == .semi)) break;
-            if (tok_kind == .lparen or tok_kind == .lbracket or tok_kind == .lbrace) {
-                p_depth += 1;
-                if (depth + p_depth >= self.options.max_parse_depth) {
-                    return self.failHere("C initializer delimiter nesting exceeded `MAX_C_PARSE_DEPTH`");
-                }
-            } else if (tok_kind == .rparen or tok_kind == .rbracket or tok_kind == .rbrace) {
-                if (p_depth == 0) break;
-                p_depth -= 1;
-            }
-            self.pos += 1;
-        }
-        const expr_slice = self.tokens[start_idx..self.pos];
-        if (expr_slice.len == 0) return null;
-        if (expr_slice.len == 1 and expr_slice[0].kind == .string_lit) {
-            return .{ .string_val = try decodeCStringLiteral(&self.unit.arena, expr_slice[0].lexeme) };
-        } else if (expr_slice.len == 1 and expr_slice[0].kind == .number) {
-            if (parseCFloatLiteral(expr_slice[0].lexeme)) |fv| return .{ .float_val = fv };
-        } else if (expr_slice.len == 2 and
-            (expr_slice[0].kind == .minus or expr_slice[0].kind == .plus) and
-            expr_slice[1].kind == .number)
-        {
-            if (parseCFloatLiteral(expr_slice[1].lexeme)) |fv| {
-                return .{ .float_val = if (expr_slice[0].kind == .minus) -fv else fv };
-            }
-        }
-        var dummy_sink = DiagnosticSink.init(self.unit.allocator);
-        defer dummy_sink.deinit();
-        var eval = ConstExprEvaluator{
-            .unit = self.unit,
-            .sink = &dummy_sink,
-            .tokens = expr_slice,
-            .known_consts = &self.known_int_consts,
-            .parser_ctx = self,
-            .max_depth = self.options.max_parse_depth,
-            .is_silent = true,
-        };
-        const res = eval.parseTernary(depth + 1, true) catch return null;
-        if (eval.pos != expr_slice.len) return null;
-        return if (res.is_unsigned or res.bits > @as(u64, std.math.maxInt(i64)))
-            .{ .unsigned_int = res.bits }
-        else
-            .{ .signed_int = res.asSigned() };
-    }
-
-    /// Evaluates an integer constant expression stopping at top-level `,` or `)`.
-    fn parseConstantIntExprUntilCommaOrRparen(self: *CDeclParser, depth: u32) CFrontendError!i128 {
-        return self.parseConstantIntExprUntilSet(depth, comptime cTokenMask(&.{ .comma, .rparen }));
-    }
-
-    /// Evaluates an integer constant expression stopping at top-level `,` or `;`.
-    fn parseConstantIntExprUntilCommaOrSemi(self: *CDeclParser, depth: u32) CFrontendError!i128 {
-        return self.parseConstantIntExprUntilSet(depth, comptime cTokenMask(&.{ .comma, .semi }));
-    }
-
-    /// Evaluates an integer constant expression stopping at top-level `,` or `}`.
-    fn parseConstantIntExprUntilCommaOrRbrace(self: *CDeclParser, depth: u32) CFrontendError!i128 {
-        return self.parseConstantIntExprUntilSet(depth, comptime cTokenMask(&.{ .comma, .rbrace }));
-    }
-
-    /// Evaluates an integer constant expression stopping at top-level `]`.
-    fn parseConstantIntExprUntilRbracket(self: *CDeclParser, depth: u32) CFrontendError!i128 {
-        return self.parseConstantIntExprUntilSet(depth, comptime cTokenMask(&.{.rbracket}));
-    }
-
-    /// Slices tokens up to any top-level delimiter in `stop_mask` and evaluates to `i128`.
-    fn parseConstantIntExprUntilSet(
-        self: *CDeclParser,
-        depth: u32,
-        stop_mask: CTokenMask64,
-    ) CFrontendError!i128 {
-        try self.flushPragmaPack();
-        const start_idx = self.pos;
-        var nested: u32 = 0;
-        while (self.pos < self.tokens.len) {
-            const tok_kind = self.tokens[self.pos].kind;
-            if (nested == 0 and isCTokenInMask(tok_kind, stop_mask)) break;
-            if (tok_kind == .lparen or tok_kind == .lbracket or tok_kind == .lbrace) {
-                nested += 1;
-            } else if (tok_kind == .rparen or tok_kind == .rbracket or tok_kind == .rbrace) {
-                if (nested == 0) break;
-                nested -= 1;
-            }
-            self.pos += 1;
-        }
-        const slice = self.tokens[start_idx..self.pos];
-        if (slice.len == 0) return self.failHere("expected integer constant expression in C declaration");
-        var eval = ConstExprEvaluator{
-            .unit = self.unit,
-            .sink = self.sink,
-            .tokens = slice,
-            .known_consts = &self.known_int_consts,
-            .parser_ctx = self,
-            .max_depth = self.options.max_parse_depth,
-        };
-        const res = try eval.parseTernary(depth + 1, true);
-        if (eval.pos != eval.tokens.len) {
-            return eval.fail("unexpected trailing token in C integer constant expression");
-        }
-        return res.asI128();
-    }
-
-    /// Returns `true` if `type_id` embeds an incomplete or self-referential `struct`/`union` or `void` by value.
-    fn hasIncompleteRecordOrVoidByValue(
-        self: *const CDeclParser,
-        type_id: CTypeId,
-        depth: u32,
-    ) bool {
-        if (depth > MAX_C_PARSE_DEPTH or type_id.isNone()) return true;
-        const canon_id = self.unit.unwrapTypedefs(type_id);
-        return switch (self.unit.getType(canon_id)) {
-            .pointer, .function, .enum_ref => false,
-            .primitive => |prim| prim == .c_void,
-            .record_ref => |rec_id| !self.unit.getDecl(rec_id).kind.record_decl.is_complete,
-            .array => |arr| self.hasIncompleteRecordOrVoidByValue(arr.elem, depth + 1),
-            .atomic_val => |inner| self.hasIncompleteRecordOrVoidByValue(inner, depth + 1),
-            .typedef_ref => true,
-        };
-    }
-
-    /// Returns `true` when `type_id` unwraps to an integer, `_Bool`, or `enum` valid for a C bitfield.
-    fn isValidBitfieldBaseType(self: *const CDeclParser, type_id: CTypeId) bool {
-        const canon_id = self.unit.unwrapTypedefs(type_id);
-        return switch (self.unit.getType(canon_id)) {
-            .primitive => |prim| prim.isInteger(),
-            .enum_ref => true,
-            else => false,
-        };
-    }
-
-    /// Returns `true` if `type_id` embeds a function signature passing/returning non-8-byte `long double` by value.
-    fn hasUnsupportedFnLongDouble(self: *const CDeclParser, type_id: CTypeId, depth: u32) bool {
-        if (CPrimitiveKind.c_longdouble.byteSize(self.unit.target) == 8) return false;
-        if (depth > MAX_C_PARSE_DEPTH or type_id.isNone()) return false;
-        const canon_id = self.unit.unwrapTypedefs(type_id);
-        return switch (self.unit.getType(canon_id)) {
-            .function => |fn_ty| self.hasUnsupportedByValueLongDoubleSig(
-                fn_ty.return_type,
-                fn_ty.param_start,
-                fn_ty.param_len,
-            ),
-            .pointer => |ptr| self.hasUnsupportedFnLongDouble(ptr.pointee, depth + 1),
-            .array => |arr| self.hasUnsupportedFnLongDouble(arr.elem, depth + 1),
-            .atomic_val => |inner| self.hasUnsupportedFnLongDouble(inner, depth + 1),
-            else => false,
-        };
-    }
-
-    /// Returns `true` if a C function signature passes or returns a non-8-byte `long double` (`f80`/`fp128`) by value.
-    fn hasUnsupportedByValueLongDoubleSig(
-        self: *const CDeclParser,
-        return_type: CTypeId,
-        param_start: u32,
-        param_len: u32,
-    ) bool {
-        if (CPrimitiveKind.c_longdouble.byteSize(self.unit.target) == 8) return false;
-        if (self.unit.hasByValueLongDouble(return_type, 0) or
-            self.hasUnsupportedFnLongDouble(return_type, 0))
-        {
-            return true;
-        }
-        for (self.unit.getParams(param_start, param_len)) |param| {
-            if (self.unit.hasByValueLongDouble(param.type_id, 0) or
-                self.hasUnsupportedFnLongDouble(param.type_id, 0))
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /// Computes target `sizeof(T)` for `sizeof(…)` inside C `_Static_assert` / array bounds (`depth`-capped).
-    fn estimateTypeSizeBytes(self: *const CDeclParser, type_id: CTypeId, depth: u32) u64 {
-        return self.unit.computeTypeByteSize(type_id, depth);
-    }
-
-    /// Computes target `alignof(T)` for `_Alignas(Type)` (`depth`-capped).
-    fn estimateTypeAlignBytes(self: *const CDeclParser, type_id: CTypeId, depth: u32) u32 {
-        return self.unit.computeTypeNaturalAlign(type_id, depth);
-    }
-
-    /// Computes canonical target C ABI `(size_bytes, align_bytes)` for `rec_id` (`depth`-capped).
-    fn estimateStructOrUnionLayout(self: *const CDeclParser, rec_id: CDeclId, depth: u32) CRecordByteLayout {
-        return self.unit.computeRecordByteLayout(rec_id, depth);
-    }
-};
 
 /// Strips matching leading and trailing `__` from GNU attribute identifiers (`__packed__` -> `packed`).
 fn stripDoubleUnderscores(raw_ident: []const u8) []const u8 {
@@ -6086,26 +6655,6 @@ inline fn isAttributeKeyword(lexeme: []const u8) bool {
 /// Returns `true` in $O(1)$ if `lexeme` is a Windows/x86 C calling-convention modifier.
 inline fn isCallingConvIdent(lexeme: []const u8) bool {
     return C_CALLING_CONV_IDENT_SET.has(lexeme);
-}
-
-/// Test counter incremented by `testBodyHookCallback` to verify `DR-20` Seam #6 invocation.
-var test_body_hook_invocations: u32 = 0;
-
-/// Strongly typed `CFunctionBodyHook` test callback recording inline C function body spans.
-fn testBodyHookCallback(
-    unit: *const CTranslationUnit,
-    decl_id: CDeclId,
-    body_first_token: CTokenId,
-    body_end_token: CTokenId,
-    sink: *DiagnosticSink,
-) CFrontendError!void {
-    _ = sink;
-    const decl = unit.getDecl(decl_id);
-    if (decl.kind == .fn_decl and !body_first_token.isNone() and !body_end_token.isNone()) {
-        if (body_first_token.asInt() < body_end_token.asInt()) {
-            test_body_hook_invocations += 1;
-        }
-    }
 }
 
 // ------------------------------------- PUBLIC API --------------------------------------
@@ -6139,8 +6688,14 @@ pub fn parseCHeader(
     defer pp.deinit();
 
     try pp.populatePredefinedMacros();
-    const norm_root_path = try normalizeIncludePath(&unit.arena, header_path);
-    try pp.preprocessBuffer(source, norm_root_path, file_id, false, 0, &unit.tokens);
+    try pp.preprocessBuffer(
+        source,
+        try normalizeIncludePath(&unit.arena, header_path),
+        file_id,
+        false,
+        0,
+        &unit.tokens,
+    );
     try pp.collectSurvivingMacroConsts();
 
     try unit.tokens.append(allocator, .{
@@ -6164,7 +6719,31 @@ pub fn parseCHeader(
 
 // ---------------------------------------- MAIN -----------------------------------------
 
-test "c_frontend: C11/C23 preprocessor #if, #elifdef, ## paste, # stringify, __VA_OPT__, and Blue-Paint" {
+comptime {
+    std.debug.assert(std.enums.values(CTokenKind).len <= 64);
+    std.debug.assert(@backingInt(CTokenKind.eof) < 64);
+}
+
+/// Test counter incremented by `testBodyHookCallback` to verify `DR-20` Seam #6 invocation.
+var test_body_hook_invocations: u32 = 0;
+
+/// Strongly typed `CFunctionBodyHook` test callback recording inline C function body spans.
+fn testBodyHookCallback(
+    unit: *const CTranslationUnit,
+    decl_id: CDeclId,
+    body_first_token: CTokenId,
+    body_end_token: CTokenId,
+    sink: *DiagnosticSink,
+) CFrontendError!void {
+    _ = sink;
+    if (unit.getDecl(decl_id).kind == .fn_decl and !body_first_token.isNone() and !body_end_token.isNone()) {
+        if (body_first_token.asInt() < body_end_token.asInt()) {
+            test_body_hook_invocations += 1;
+        }
+    }
+}
+
+test "test_c_frontend_preprocessor_conditionals_paste_stringify_va_opt_and_blue_paint" {
     const allocator = std.testing.allocator;
     var sink = DiagnosticSink.init(allocator);
     defer sink.deinit();
@@ -6251,7 +6830,7 @@ test "c_frontend: C11/C23 preprocessor #if, #elifdef, ## paste, # stringify, __V
     try std.testing.expect(has_log_fmt);
 }
 
-test "c_frontend: structs, unions, C23 enums, function pointers, SAL contracts, and Seam #6 body hook" {
+test "test_c_frontend_structs_unions_c23_enums_fn_ptrs_sal_contracts_and_body_hook" {
     const allocator = std.testing.allocator;
     var sink = DiagnosticSink.init(allocator);
     defer sink.deinit();
@@ -6338,22 +6917,17 @@ test "c_frontend: structs, unions, C23 enums, function pointers, SAL contracts, 
     try std.testing.expect(has_verified_inline);
 }
 
-test "c_frontend: resource caps, #error, and failing _Static_assert emit E0009 cleanly" {
+test "test_c_frontend_resource_caps_error_directive_and_static_assert_emit_e0009" {
     const allocator = std.testing.allocator;
 
     // [1] `#error` directive emits `E0009`:
     {
         var sink = DiagnosticSink.init(allocator);
         defer sink.deinit();
-        const res = parseCHeader(
-            allocator,
-            "#error unsupported target configuration\n",
-            "bad.h",
-            .none,
-            .{},
-            &sink,
+        try std.testing.expectError(
+            error.TranslationFailed,
+            parseCHeader(allocator, "#error unsupported target configuration\n", "bad.h", .none, .{}, &sink),
         );
-        try std.testing.expectError(error.TranslationFailed, res);
         try std.testing.expectEqual(@as(u32, 1), sink.error_count);
         try std.testing.expectEqual(
             DiagnosticCode.e0009_c_header_translation_failed,
@@ -6384,15 +6958,10 @@ test "c_frontend: resource caps, #error, and failing _Static_assert emit E0009 c
     {
         var sink = DiagnosticSink.init(allocator);
         defer sink.deinit();
-        const res = parseCHeader(
-            allocator,
-            "int a; int b; int c; int d; int e;\n",
-            "cap.h",
-            .none,
-            .{ .max_tokens = 4 },
-            &sink,
+        try std.testing.expectError(
+            error.TranslationFailed,
+            parseCHeader(allocator, "int a; int b; int c; int d; int e;\n", "cap.h", .none, .{ .max_tokens = 4 }, &sink),
         );
-        try std.testing.expectError(error.TranslationFailed, res);
         try std.testing.expectEqual(
             DiagnosticCode.e0009_c_header_translation_failed,
             sink.diagnostics.items[0].code,
@@ -6450,16 +7019,10 @@ test "c_frontend: resource caps, #error, and failing _Static_assert emit E0009 c
     {
         var sink = DiagnosticSink.init(allocator);
         defer sink.deinit();
-        const deep_src = "int x = ((((((((((1))))))))));\n";
-        const res = parseCHeader(
-            allocator,
-            deep_src,
-            "depth_cap.h",
-            .none,
-            .{ .max_parse_depth = 4 },
-            &sink,
+        try std.testing.expectError(
+            error.TranslationFailed,
+            parseCHeader(allocator, "int x = ((((((((((1))))))))));\n", "depth_cap.h", .none, .{ .max_parse_depth = 4 }, &sink),
         );
-        try std.testing.expectError(error.TranslationFailed, res);
         try std.testing.expectEqual(
             DiagnosticCode.e0009_c_header_translation_failed,
             sink.diagnostics.items[0].code,
@@ -6467,7 +7030,7 @@ test "c_frontend: resource caps, #error, and failing _Static_assert emit E0009 c
     }
 }
 
-test "c_frontend: target-calibrated predefined macros across AArch64, Windows MSVC, and Wasm32 WASI" {
+test "test_c_frontend_target_predefined_macros_across_aarch64_msvc_and_wasm32" {
     const allocator = std.testing.allocator;
     const probe_src =
         \\#include <limits.h>
@@ -6556,7 +7119,7 @@ test "c_frontend: target-calibrated predefined macros across AArch64, Windows MS
     }
 }
 
-test "c_frontend: [CRITICAL-06] billion-laughs X10^8 macro bomb and deep macro chain emit E0009 in bounded memory" {
+test "test_c_frontend_macro_bomb_and_deep_chain_emit_e0009_in_bounded_memory" {
     const allocator = std.testing.allocator;
 
     // [1] Exponential `X10^8(1)` (`10^8` tokens) aborts via `expanded_token_budget` inside `< 10 MiB`:
@@ -6572,15 +7135,10 @@ test "c_frontend: [CRITICAL-06] billion-laughs X10^8 macro bomb and deep macro c
             \\#define X10(a) a a a a a a a a a a
             \\int explode = X10(X10(X10(X10(X10(X10(X10(X10(1))))))));
         ;
-        const res = parseCHeader(
-            fixed_alloc.allocator(),
-            bomb_src,
-            "bomb.h",
-            .none,
-            .{},
-            &sink,
+        try std.testing.expectError(
+            error.TranslationFailed,
+            parseCHeader(fixed_alloc.allocator(), bomb_src, "bomb.h", .none, .{}, &sink),
         );
-        try std.testing.expectError(error.TranslationFailed, res);
         try std.testing.expect(fixed_alloc.end_index < 10 * 1024 * 1024);
         try std.testing.expect(sink.error_count >= 1);
         try std.testing.expectEqual(
@@ -6603,8 +7161,10 @@ test "c_frontend: [CRITICAL-06] billion-laughs X10^8 macro bomb and deep macro c
 
         var sink = DiagnosticSink.init(allocator);
         defer sink.deinit();
-        const res = parseCHeader(allocator, chain_src.items, "deep_chain.h", .none, .{}, &sink);
-        try std.testing.expectError(error.TranslationFailed, res);
+        try std.testing.expectError(
+            error.TranslationFailed,
+            parseCHeader(allocator, chain_src.items, "deep_chain.h", .none, .{}, &sink),
+        );
         try std.testing.expect(sink.error_count >= 1);
         try std.testing.expectEqual(
             DiagnosticCode.e0009_c_header_translation_failed,
@@ -6613,22 +7173,17 @@ test "c_frontend: [CRITICAL-06] billion-laughs X10^8 macro bomb and deep macro c
     }
 }
 
-test "c_frontend: [CRITICAL-07] self-referential and incomplete struct/union value fields emit E0009" {
+test "test_c_frontend_self_referential_and_incomplete_record_value_fields_emit_e0009" {
     const allocator = std.testing.allocator;
 
     // [1] Direct self-referential `struct Loop { struct Loop a; };` emits `E0009` without crashing:
     {
         var sink = DiagnosticSink.init(allocator);
         defer sink.deinit();
-        const res = parseCHeader(
-            allocator,
-            "struct Loop { struct Loop a; };\n",
-            "loop.h",
-            .none,
-            .{},
-            &sink,
+        try std.testing.expectError(
+            error.TranslationFailed,
+            parseCHeader(allocator, "struct Loop { struct Loop a; };\n", "loop.h", .none, .{}, &sink),
         );
-        try std.testing.expectError(error.TranslationFailed, res);
         try std.testing.expectEqual(
             DiagnosticCode.e0009_c_header_translation_failed,
             sink.diagnostics.items[0].code,
@@ -6639,15 +7194,17 @@ test "c_frontend: [CRITICAL-07] self-referential and incomplete struct/union val
     {
         var sink = DiagnosticSink.init(allocator);
         defer sink.deinit();
-        const res = parseCHeader(
-            allocator,
-            "struct Fwd; struct Bad { struct Fwd field_val; };\n",
-            "incomplete_field.h",
-            .none,
-            .{},
-            &sink,
+        try std.testing.expectError(
+            error.TranslationFailed,
+            parseCHeader(
+                allocator,
+                "struct Fwd; struct Bad { struct Fwd field_val; };\n",
+                "incomplete_field.h",
+                .none,
+                .{},
+                &sink,
+            ),
         );
-        try std.testing.expectError(error.TranslationFailed, res);
         try std.testing.expectEqual(
             DiagnosticCode.e0009_c_header_translation_failed,
             sink.diagnostics.items[0].code,
@@ -6671,7 +7228,7 @@ test "c_frontend: [CRITICAL-07] self-referential and incomplete struct/union val
     }
 }
 
-test "c_frontend: [MAJOR-02/03] MSVC WinHdr bitfield sizeof, packed SysV :0 sizeof, and AAPCS64 :0 promotion" {
+test "test_c_frontend_msvc_bitfield_sizeof_packed_sysv_zero_width_and_aapcs64_promotion" {
     const allocator = std.testing.allocator;
 
     const win_hdr_src =
@@ -6744,7 +7301,7 @@ test "c_frontend: [MAJOR-02/03] MSVC WinHdr bitfield sizeof, packed SysV :0 size
     }
 }
 
-test "c_frontend: [MAJOR-04/06] char sign-extension, UTF char literals, #if comma op, trailing garbage, and f80/fp128" {
+test "test_c_frontend_char_sign_extension_utf_literals_comma_op_trailing_tokens_and_long_double" {
     const allocator = std.testing.allocator;
 
     const pp_expr_src =
@@ -6810,8 +7367,10 @@ test "c_frontend: [MAJOR-04/06] char sign-extension, UTF char literals, #if comm
     }) |bad_expr_src| {
         var sink = DiagnosticSink.init(allocator);
         defer sink.deinit();
-        const res = parseCHeader(allocator, bad_expr_src, "trailing_garbage.h", .none, .{}, &sink);
-        try std.testing.expectError(error.TranslationFailed, res);
+        try std.testing.expectError(
+            error.TranslationFailed,
+            parseCHeader(allocator, bad_expr_src, "trailing_garbage.h", .none, .{}, &sink),
+        );
         try std.testing.expectEqual(
             DiagnosticCode.e0009_c_header_translation_failed,
             sink.diagnostics.items[0].code,
@@ -6849,4 +7408,139 @@ test "c_frontend: [MAJOR-04/06] char sign-extension, UTF char literals, #if comm
         defer msvc_unit.deinit();
         try std.testing.expectEqual(@as(u32, 0), msvc_sink.error_count);
     }
+}
+
+test "test_c_frontend_oversized_or_invalid_bitfield_widths_emit_e0009" {
+    const allocator = std.testing.allocator;
+
+    // [1] Oversized, negative, named `: 0`, and non-integer bitfields violate C11/C23 §6.7.2.1p4 (`E0009`):
+    for ([_][]const u8{
+        "struct BadChar { unsigned char a : 16; };\n",
+        "struct BadShort { unsigned short s : 24; };\n",
+        "struct BadInt { int x : 40; };\n",
+        "struct BadBool { _Bool flag : 2; };\n",
+        "struct BadNamedZero { unsigned int named_zero : 0; };\n",
+        "struct BadNeg { int neg : -1; };\n",
+        "struct BadFloat { float f : 4; };\n",
+    }) |bad_bf_src| {
+        for ([_]TargetSpec{ TargetSpec.X86_64_LINUX_GNU, TargetSpec.X86_64_WINDOWS_MSVC }) |target_spec| {
+            var sink = DiagnosticSink.init(allocator);
+            defer sink.deinit();
+            try std.testing.expectError(
+                error.TranslationFailed,
+                parseCHeader(allocator, bad_bf_src, "bad_bitfield.h", .none, .{ .target = target_spec }, &sink),
+            );
+            try std.testing.expect(sink.error_count >= 1);
+            try std.testing.expectEqual(
+                DiagnosticCode.e0009_c_header_translation_failed,
+                sink.diagnostics.items[0].code,
+            );
+        }
+    }
+
+    // [2] Exact storage-unit boundary widths (`_Bool : 1`, `uchar : 8`, `uint : 32`, `ull : 64`, unnamed `: 0`) pass:
+    {
+        var sink = DiagnosticSink.init(allocator);
+        defer sink.deinit();
+        const valid_bf_src =
+            \\enum SmallTag : unsigned char { TAG_ZERO = 0, TAG_ONE = 1 };
+            \\struct ValidBounds {
+            \\    _Bool flag : 1;
+            \\    unsigned char byte_bits : 8;
+            \\    unsigned char : 0;
+            \\    enum SmallTag tag_bits : 8;
+            \\    unsigned int word_bits : 32;
+            \\    unsigned long long qword_bits : 64;
+            \\};
+        ;
+        var unit = try parseCHeader(
+            allocator,
+            valid_bf_src,
+            "valid_bitfield.h",
+            .none,
+            .{ .target = TargetSpec.X86_64_WINDOWS_MSVC },
+            &sink,
+        );
+        defer unit.deinit();
+        try std.testing.expectEqual(@as(u32, 0), sink.error_count);
+    }
+}
+
+test "test_c_frontend_speculative_macro_const_probing_isolated_budget_and_included_files" {
+    const allocator = std.testing.allocator;
+
+    // [1] 300+ `#define` constants + unreferenced >256-token macro under tight `max_macro_steps` never trip `E0009`:
+    var heavy_src: std.ArrayListUnmanaged(u8) = .empty;
+    defer heavy_src.deinit(allocator);
+    try heavy_src.appendSlice(
+        allocator,
+        "#include <stdint.h>\n" ++
+            "#include \"inc_outer.h\"\n" ++
+            "#define EXP16(tok) tok + tok + tok + tok + tok + tok + tok + tok + " ++
+            "tok + tok + tok + tok + tok + tok + tok + tok\n" ++
+            "#define HEAVY_UNREFERENCED EXP16(EXP16(1))\n",
+    );
+    var idx: u32 = 0;
+    while (idx < 320) : (idx += 1) {
+        const def_line = try std.fmt.allocPrint(
+            allocator,
+            "#define BASE_{d} {d}\n#define PROMOTED_{d} (BASE_{d} + 1)\n",
+            .{ idx, idx, idx, idx },
+        );
+        defer allocator.free(def_line);
+        try heavy_src.appendSlice(allocator, def_line);
+    }
+    try heavy_src.appendSlice(allocator, "typedef uint32_t HeaderHandle;\n");
+
+    const sub_inner_src = "#define INNER_VAL 42\n";
+    const sub_outer_src = "#include \"inc_inner.h\"\n#define OUTER_VAL (INNER_VAL + 8)\n";
+    const vheaders = [_]VirtualHeaderEntry{
+        .{ .path = "inc_outer.h", .content = sub_outer_src },
+        .{ .path = "inc_inner.h", .content = sub_inner_src },
+    };
+
+    var sink = DiagnosticSink.init(allocator);
+    defer sink.deinit();
+    var unit = try parseCHeader(
+        allocator,
+        heavy_src.items,
+        "macro_heavy.h",
+        .none,
+        .{
+            .target = TargetSpec.X86_64_LINUX_GNU,
+            .virtual_headers = &vheaders,
+            .max_macro_steps = 8,
+        },
+        &sink,
+    );
+    defer unit.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), sink.error_count);
+    try std.testing.expect(!unit.has_errors);
+
+    var promoted_count: u32 = 0;
+    var has_heavy_unreferenced = false;
+    var has_outer_val = false;
+    for (unit.macro_consts.items) |mc| {
+        if (std.mem.startsWith(u8, mc.name, "PROMOTED_")) promoted_count += 1;
+        if (std.mem.eql(u8, mc.name, "HEAVY_UNREFERENCED")) has_heavy_unreferenced = true;
+        if (std.mem.eql(u8, mc.name, "OUTER_VAL")) {
+            has_outer_val = mc.value.signed_int == 50;
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 320), promoted_count);
+    try std.testing.expect(!has_heavy_unreferenced);
+    try std.testing.expect(has_outer_val);
+
+    // [2] Verify non-bundled transitive `#include`s are recorded with exact BLAKE3 digests (skipping `<stdint.h>`):
+    try std.testing.expectEqual(@as(usize, 2), unit.included_files.items.len);
+    var expected_outer_hash: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(sub_outer_src, &expected_outer_hash, .{});
+    var expected_inner_hash: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(sub_inner_src, &expected_inner_hash, .{});
+
+    try std.testing.expectEqualStrings("inc_outer.h", unit.included_files.items[0].path);
+    try std.testing.expectEqualSlices(u8, &expected_outer_hash, &unit.included_files.items[0].content_blake3);
+    try std.testing.expectEqualStrings("inc_inner.h", unit.included_files.items[1].path);
+    try std.testing.expectEqualSlices(u8, &expected_inner_hash, &unit.included_files.items[1].content_blake3);
 }

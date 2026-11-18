@@ -196,7 +196,7 @@ pub const HirFlags = packed struct(u8) {
     _reserved: u1 = 0,
 };
 
-/// Zero-padding 18-byte Structure-of-Arrays `HIR` node (`20` bytes AoS, `[MAJOR-05]`).
+/// Zero-padding 18-byte Structure-of-Arrays `HIR` node (`20` bytes AoS).
 pub const HirNode = struct {
     /// Node discriminant (`1` byte).
     tag: HirTag,
@@ -249,7 +249,7 @@ pub const BitSpec = packed struct(u32) {
     }
 };
 
-/// Classification of `hir_return` for `defer` vs. `errdefer` cleanup routing (`[CRITICAL-08]`).
+/// Classification of `hir_return` for `defer` vs. `errdefer` cleanup routing.
 pub const ReturnErrorKind = enum(u8) {
     /// Infallible return or statically known `.Ok(v)` / `.Some(v)` return (`defer` only).
     normal = 0,
@@ -467,7 +467,7 @@ pub const HirFnMeta = struct {
     is_comptime: bool = false,
     /// `true` if synthesized for `@derive(Eq, Hash, Debug, Clone)`.
     is_derived: bool = false,
-    /// `true` if this closure carries an explicit `@local` attribute or Tier-1 borrow capture (`CRIT-05`, `SE-19`).
+    /// `true` if this closure carries an explicit `@local` attribute or Tier-1 borrow capture (`SE-19`).
     is_local_closure: bool = false,
     /// `true` if this closure captures outer bindings by ownership transfer (`own |…|`, Tier-2 `SE-19`).
     is_move_closure: bool = false,
@@ -941,6 +941,14 @@ pub const HirStore = struct {
     }
 };
 
+/// Enclosing closure capture frame tracking per-level `(outer_local_id, inner_local_id)` pairs.
+const ClosureCaptureFrame = struct {
+    /// Function boundary local floor (`return_local_id`) of this closure/async frame.
+    ceil: u32,
+    /// Dedicated `(outer_local_id, inner_local_id)` pair buffer for this frame.
+    captures: std.ArrayListUnmanaged(u32) = .empty,
+};
+
 // --------------------------------------- CONSTS ----------------------------------------
 
 /// Hard upper bound on `HirNode` count per `HirStore` (`4,194,304` nodes -> `E0508`).
@@ -969,6 +977,13 @@ const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 
 /// FNV-1a 64-bit prime multiplier used by synthesized `@derive(Hash)` implementations.
 const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// $O(1)$ static lookup map of structured `core.async` / `cx.async` entry function names.
+const CORE_ASYNC_ENTRY_MAP = std.StaticStringMap(void).initComptime(.{
+    .{ "block_on", {} },
+    .{ "task_group", {} },
+    .{ "yield_now", {} },
+});
 
 comptime {
     std.debug.assert(@sizeOf(HirFlags) == 1);
@@ -999,7 +1014,7 @@ const ShadowComptimeRestore = struct {
     prev_val: ?ComptimeValue,
 };
 
-/// Unrolled loop control-flow state for `break` / `continue` inside `comptime for` (`CRIT-10`).
+/// Unrolled loop control-flow state for `break` / `continue` inside `comptime for`.
 const ComptimeLoopState = enum(u8) {
     /// Normal sequential statement execution.
     normal,
@@ -1035,7 +1050,7 @@ const ActiveLoopEntry = struct {
     loop_id: u32,
     /// Optional `:label` symbol (`SymbolId.empty` when unlabeled).
     label_id: SymbolId = .empty,
-    /// `true` when this frame corresponds to an unrolled `comptime for` loop (`CRIT-10`).
+    /// `true` when this frame corresponds to an unrolled `comptime for` loop.
     is_comptime_for: bool = false,
     /// Synthetic `Option[T]` local (`__loop_res`) for value-breaking `for`/`while`, or `NONE_U32` otherwise.
     result_opt_local: u32 = NONE_U32,
@@ -1065,14 +1080,6 @@ const ActiveLabeledMatch = struct {
     scrutinee_local: u32,
     /// Expected scrutinee `TypeId` for `continue :fsm next_state`.
     scrutinee_ty: TypeId,
-};
-
-/// Enclosing closure capture frame tracking per-level `(outer_local_id, inner_local_id)` pairs.
-const ClosureCaptureFrame = struct {
-    /// Function boundary local floor (`return_local_id`) of this closure/async frame.
-    ceil: u32,
-    /// Dedicated `(outer_local_id, inner_local_id)` pair buffer for this frame.
-    captures: std.ArrayListUnmanaged(u32) = .empty,
 };
 
 /// Stateful `AST -> HIR` desugaring, `@derive` synthesis, and `comptime` unrolling engine.
@@ -1153,17 +1160,17 @@ const HirLowerer = struct {
     const_eval_depth: usize = 0,
     /// Arena owning dynamic slices inside `VirtualZipBinding` descriptors.
     zip_arena: std.heap.ArenaAllocator,
-    /// Floor index in `local_shadow_log` marking bindings introduced by the currently lowering pattern (`CRIT-09`).
+    /// Floor index in `local_shadow_log` marking bindings introduced by the currently lowering pattern.
     current_pat_shadow_floor: usize = 0,
-    /// `true` when unrolling the body of a `comptime for` loop (`CRIT-10`).
+    /// `true` when unrolling the body of a `comptime for` loop.
     is_in_comptime_for: bool = false,
-    /// Nesting depth of runtime conditional branches inside an active `comptime for` body (`CRIT-10`).
+    /// Nesting depth of runtime conditional branches inside an active `comptime for` body.
     comptime_runtime_cond_depth: u32 = 0,
-    /// Pending `break` / `continue` control-flow state for the active `comptime for` iteration (`CRIT-10`).
+    /// Pending `break` / `continue` control-flow state for the active `comptime for` iteration.
     comptime_loop_state: ComptimeLoopState = .normal,
-    /// Override outer token stamped onto sub-parsed `{expr}` string interpolation HIR nodes (`MAJ-08`).
+    /// Override outer token stamped onto sub-parsed `{expr}` string interpolation HIR nodes.
     interp_override_token: TokenIndex = .none,
-    /// Override outer span used while lowering sub-parsed `{expr}` string interpolation HIR nodes (`MAJ-08`).
+    /// Override outer span used while lowering sub-parsed `{expr}` string interpolation HIR nodes.
     interp_override_span: ?Span = null,
     /// Override caller source buffer paired with `interp_override_span` for cross-file `@caller_location()` (`SE-17`).
     interp_override_source: ?[]const u8 = null,
@@ -3386,7 +3393,7 @@ const HirLowerer = struct {
         try out_stmts.append(self.allocator, assign_hir.asInt());
     }
 
-    /// Computes a `u64` hash contribution for `val_hir` (`val_ty`) in `@derive(Hash)` (`MAJ-07`).
+    /// Computes a `u64` hash contribution for `val_hir` (`val_ty`) in `@derive(Hash)`.
     fn emitDerivedValueHash(
         self: *HirLowerer,
         val_hir: HirIndex,
@@ -3720,7 +3727,7 @@ const HirLowerer = struct {
         }, .none);
     }
 
-    /// Clones a single member `place_hir` (`member_ty`) for `@derive(Clone)` (`MAJ-07`).
+    /// Clones a single member `place_hir` (`member_ty`) for `@derive(Clone)`.
     fn emitDerivedMemberClone(
         self: *HirLowerer,
         place_hir: HirIndex,
@@ -4029,7 +4036,7 @@ const HirLowerer = struct {
         }, .none);
     }
 
-    /// Emits a synthetic `hir_call` to `callee_sym_idx`, adjusting and projecting `args` per formal signature (`CRIT-13`).
+    /// Emits a synthetic `hir_call` to `callee_sym_idx`, adjusting and projecting `args` per formal signature.
     fn emitDirectSymbolCall(
         self: *HirLowerer,
         callee_sym_idx: SymbolIndex,
@@ -4217,7 +4224,7 @@ const HirLowerer = struct {
         }, block_id);
     }
 
-    /// Classifies `val_hir` for `defer` vs. `errdefer` cleanup routing (`[CRITICAL-08]`).
+    /// Classifies `val_hir` for `defer` vs. `errdefer` cleanup routing.
     fn classifyReturnExpr(self: *const HirLowerer, val_hir: HirIndex, fn_ret_ty: TypeId) ReturnErrorKind {
         if (val_hir.isNone()) return .normal;
         const ret_ty_node = self.pool.getNode(self.pool.unwrapUnderlyingType(fn_ret_ty));
@@ -6119,7 +6126,7 @@ const HirLowerer = struct {
             }, stmt_id);
         }
 
-        // [2] Compound assignment (`+=`, `-=`, etc.): evaluate `rhs` BEFORE `&mut lhs` (`DR-02` §2.2 & `MAJ-02`):
+        // [2] Compound assignment (`+=`, `-=`, etc.): evaluate `rhs` BEFORE `&mut lhs` (`DR-02` §2.2):
         const bin_op: HirBinaryOp = switch (op_kind) {
             .plus_eq => .add,
             .minus_eq => .sub,
@@ -7838,7 +7845,7 @@ const HirLowerer = struct {
         }, expr_id);
     }
 
-    /// Lowers a `{expr}` segment inside an interpolated string literal (`MAJ-08`).
+    /// Lowers a `{expr}` segment inside an interpolated string literal.
     fn lowerInterpolatedSegment(self: *HirLowerer, segment_src: []const u8, tok: TokenIndex) !HirIndex {
         if (segment_src.len == 0) {
             const empty_id = try self.interner.intern("");
@@ -8273,7 +8280,7 @@ const HirLowerer = struct {
             return self.emitErrorHole(tok, expr_id, target_ty);
         }
 
-        // Collect canonical `@cfg`-enabled struct / `bit_field` member declarations dynamically (`CRIT-11`, `SE-18`):
+        // Collect canonical `@cfg`-enabled struct / `bit_field` member declarations dynamically (`SE-18`):
         var canonical_tys: std.ArrayListUnmanaged(TypeId) = .empty;
         defer canonical_tys.deinit(self.allocator);
         var canonical_names: std.ArrayListUnmanaged(SymbolId) = .empty;
@@ -9410,7 +9417,7 @@ const HirLowerer = struct {
         return self.sym_table.lookupInScopeDirect(owner_scope, member_id, NamespaceMask.ALL);
     }
 
-    /// Desugars `lhs |> f(a_1, …, a_k)`, `lhs |> mod.f(a_1, …, a_k)`, and `lhs |> recv.m(a_1, …, a_k)` (`DR-13` §2.2 Rule 1 & `MAJ-06`).
+    /// Desugars `lhs |> f(a_1, …, a_k)`, `lhs |> mod.f(a_1, …, a_k)`, and `lhs |> recv.m(a_1, …, a_k)` (`DR-13` §2.2 Rule 1).
     fn lowerPipeExpr(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) !HirIndex {
         const ast_node = self.ast_arena.getNode(expr_id);
         const tok = ast_node.main_token;
@@ -10066,7 +10073,7 @@ const HirLowerer = struct {
             }, expr_id);
         }
 
-        // [2] Resolved operator trait call (`side_tables` or nominal `Eq.eq` for `==` / `!=`, `CRIT-13`):
+        // [2] Resolved operator trait call (`side_tables` or nominal `Eq.eq` for `==` / `!=`):
         const op_sym_idx = self.nodeSymbol(expr_id);
         if (!op_sym_idx.isNone() and self.sym_table.getSymbol(op_sym_idx).kind == .fn_sym) {
             const lhs_hir = try self.lowerExpr(lhs_id, .err_ty);
@@ -10894,7 +10901,7 @@ const HirLowerer = struct {
         return .{ .base_hir = reusable_base, .len_slot = len_slot };
     }
 
-    /// Emits `hir_soa_field_ptr` shared by both `items[i].field` and `items.field[i]` (`DR-13` §2.2 Rule 6 & `MAJ-03`).
+    /// Emits `hir_soa_field_ptr` shared by both `items[i].field` and `items.field[i]` (`DR-13` §2.2 Rule 6).
     fn emitSoaElementFieldPtr(
         self: *HirLowerer,
         soa_base_ast: NodeIndex,
@@ -12805,7 +12812,7 @@ const HirLowerer = struct {
             return self.emitConstVal(folded_intr, res_ty, intr_tok, call_id, true);
         }
 
-        // [6] Emit `hir_intrinsic_call` for polymorphic or `MirVm`-evaluated intrinsics (`CRIT-11`):
+        // [6] Emit `hir_intrinsic_call` for polymorphic or `MirVm`-evaluated intrinsics:
         var payload_words: std.ArrayListUnmanaged(u32) = .empty;
         defer payload_words.deinit(self.allocator);
         try payload_words.append(self.allocator, @intCast(type_arg_nodes.len));
@@ -14157,6 +14164,34 @@ const HirLowerer = struct {
         const cap_slice = self.closure_frame_stack.items[self.closure_frame_stack.items.len - 1].captures.items;
         const cap_extra_start = if (cap_slice.len > 0) try self.store.appendExtraSlice(cap_slice) else 0;
 
+        var final_clos_sig_ty = clos_sig_ty;
+        if (has_own_mod) {
+            var has_lin_cap = false;
+            var cap_i: usize = 0;
+            while (cap_i + 1 < cap_slice.len) : (cap_i += 2) {
+                const outer_lid = cap_slice[cap_i];
+                if (outer_lid < self.store.locals.items.len and
+                    type_system.hasLinearObligation(self.pool, self.sym_table, self.store.locals.items[outer_lid].type_id))
+                {
+                    has_lin_cap = true;
+                    break;
+                }
+            }
+            if (has_lin_cap) {
+                final_clos_sig_ty = try self.pool.internClosureSignatureExt(
+                    &.{},
+                    &.{},
+                    ret_ty,
+                    .{},
+                    .linear_tier,
+                    true,
+                    true,
+                    true,
+                );
+            }
+        }
+
+        self.store.functions.items[fn_meta_idx].fn_ty = final_clos_sig_ty;
         self.store.functions.items[fn_meta_idx].body_hir = body_hir;
         self.store.functions.items[fn_meta_idx].total_local_len =
             @intCast(self.store.locals.items.len - return_local_id);
@@ -14166,7 +14201,7 @@ const HirLowerer = struct {
         const clos_hir = try self.emitNode(.{
             .tag = .hir_closure,
             .flags = .{ .category = .rvalue, .is_synthetic = true },
-            .type_id = clos_sig_ty,
+            .type_id = final_clos_sig_ty,
             .origin_token = tok,
             .data = .{ .lhs = fn_meta_idx, .rhs = body_hir.asInt() },
         }, block_id);
@@ -14259,17 +14294,13 @@ const HirLowerer = struct {
                     self.tokens,
                     TokenIndex.fromInt(callee_node.rhs.payload),
                 );
-            }
-            if (callee_node.tag == .ident_expr and !callee_node.main_token.isNone()) {
+            } else if (callee_node.tag == .ident_expr and !callee_node.main_token.isNone()) {
                 break :blk_name symbol_resolver.extractTokenSlice(self.source, self.tokens, callee_node.main_token);
             }
             return null;
         };
 
-        if (!std.mem.eql(u8, entry_name, "yield_now") and
-            !std.mem.eql(u8, entry_name, "block_on") and
-            !std.mem.eql(u8, entry_name, "task_group"))
-        {
+        if (!CORE_ASYNC_ENTRY_MAP.has(entry_name)) {
             return null;
         }
 
@@ -14289,8 +14320,7 @@ const HirLowerer = struct {
 
         if (std.mem.eql(u8, entry_name, "yield_now")) {
             return try self.emitInternalIntrinsic(.async_yield, &.{}, out_ty, tok, expr_id);
-        }
-        if (std.mem.eql(u8, entry_name, "block_on")) {
+        } else if (std.mem.eql(u8, entry_name, "block_on")) {
             if (val_args.len == 0) return try self.emitErrorHole(tok, expr_id, out_ty);
             const fut_ast = self.unwrapCallArgAst(val_args[0]);
             const fut_hir = try self.lowerExpr(fut_ast, .err_ty);
@@ -14301,14 +14331,15 @@ const HirLowerer = struct {
                 tok,
                 expr_id,
             );
+        } else {
+            if (val_args.len == 0) return try self.emitErrorHole(tok, expr_id, out_ty);
+            return try self.lowerStructuredTaskGroupCall(
+                expr_id,
+                self.unwrapCallArgAst(val_args[0]),
+                out_ty,
+                tok,
+            );
         }
-        if (val_args.len == 0) return try self.emitErrorHole(tok, expr_id, out_ty);
-        return try self.lowerStructuredTaskGroupCall(
-            expr_id,
-            self.unwrapCallArgAst(val_args[0]),
-            out_ty,
-            tok,
-        );
     }
 
     /// Lowers `task_group(cb)` into an `is_async = true` nursery `HirFnMeta` guarded by `async_task_group_enter`/`exit`.
@@ -14575,8 +14606,10 @@ const HirLowerer = struct {
         if (self.pool.isTaskGroupType(ty)) return true;
         if (self.pool.getTag(ty) == .struct_ty) {
             const sym_idx = SymbolIndex.fromInt(self.pool.getNode(ty).rhs);
-            if (!sym_idx.isNone()) {
-                return std.mem.eql(u8, self.sym_table.getSymbol(sym_idx).name_text, "TaskGroup");
+            if (!sym_idx.isNone() and sym_idx.asInt() < self.sym_table.symbols.items.len) {
+                const sym = self.sym_table.getSymbol(sym_idx).*;
+                return type_system.isStdCoreOrBuiltinSymbol(self.sym_table, sym) and
+                    std.mem.eql(u8, sym.name_text, "TaskGroup");
             }
         }
         return false;
@@ -14588,8 +14621,10 @@ const HirLowerer = struct {
         if (self.pool.isTaskHandleType(ty)) return true;
         if (self.pool.getTag(ty) == .struct_ty) {
             const sym_idx = SymbolIndex.fromInt(self.pool.getNode(ty).rhs);
-            if (!sym_idx.isNone()) {
-                return std.mem.eql(u8, self.sym_table.getSymbol(sym_idx).name_text, "TaskHandle");
+            if (!sym_idx.isNone() and sym_idx.asInt() < self.sym_table.symbols.items.len) {
+                const sym = self.sym_table.getSymbol(sym_idx).*;
+                return type_system.isStdCoreOrBuiltinSymbol(self.sym_table, sym) and
+                    std.mem.eql(u8, sym.name_text, "TaskHandle");
             }
         }
         return false;
@@ -15038,7 +15073,7 @@ const HirLowerer = struct {
 
     // ---------- CST, Member, Pattern & Comptime Helpers -----------
 
-    /// Returns `true` if any direct shallow token leaf of `cst_id` matches `target_kind` (`MAJ-05`).
+    /// Returns `true` if any direct shallow token leaf of `cst_id` matches `target_kind`.
     fn hasKeywordInCst(self: *const HirLowerer, cst_id: CstNodeIndex, target_kind: TokenKind) bool {
         if (cst_id.isNone() or cst_id.asInt() >= self.cst_arena.countNodes()) return false;
         const start_idx: usize = cst_id.asInt();
@@ -15247,7 +15282,7 @@ const HirLowerer = struct {
         return .none;
     }
 
-    /// Scans `.match_arm` CST subtrees of `match_expr_id` to recover optional `if guard_expr` AST nodes (`CRIT-11`).
+    /// Scans `.match_arm` CST subtrees of `match_expr_id` to recover optional `if guard_expr` AST nodes.
     fn extractMatchArmGuards(
         self: *const HirLowerer,
         match_expr_id: NodeIndex,
@@ -15625,7 +15660,7 @@ const HirLowerer = struct {
         };
     }
 
-    /// Lowers a top-level pattern, scoping `or_pat` slot-reuse to bindings within this pattern (`CRIT-09`).
+    /// Lowers a top-level pattern, scoping `or_pat` slot-reuse to bindings within this pattern.
     fn lowerTopPattern(
         self: *HirLowerer,
         pat_id: NodeIndex,
@@ -15686,7 +15721,7 @@ const HirLowerer = struct {
                 }
                 const existing_local = blk: {
                     if (self.interner.lookup(lexeme)) |existing_id| {
-                        // Reuse binding slot ONLY across `P1 | P2` alternatives in the SAME top-level pattern (`CRIT-09`):
+                        // Reuse binding slot ONLY across `P1 | P2` alternatives in the SAME top-level pattern:
                         const floor = @min(self.current_pat_shadow_floor, self.local_shadow_log.items.len);
                         for (self.local_shadow_log.items[floor..]) |shadow_item| {
                             if (shadow_item.name_id == existing_id.asInt()) {
@@ -15709,7 +15744,7 @@ const HirLowerer = struct {
                 });
             },
             .lit_pat => {
-                // Range pattern `low..=high` or `low..high` (`CRIT-07`):
+                // Range pattern `low..=high` or `low..high`:
                 if (pat_node.lhs.tag == .node and pat_node.rhs.tag == .token) {
                     const low_val = self.evalLitPatScalar(NodeIndex.fromInt(pat_node.lhs.payload));
                     const high_raw = self.evalTokenPatScalar(TokenIndex.fromInt(pat_node.rhs.payload), pat_id);
@@ -16395,7 +16430,7 @@ const HirLowerer = struct {
         return 0;
     }
 
-    /// Extracts field name tokens from `.field_pat` CST children inside a `.struct_pat` (`CRIT-11`).
+    /// Extracts field name tokens from `.field_pat` CST children inside a `.struct_pat`.
     fn extractStructPatFieldTokens(
         self: *const HirLowerer,
         pat_id: NodeIndex,
@@ -19180,7 +19215,7 @@ test "test_hir_comptime_unrolling_hylo_eval_order_and_resource_caps" {
 test "test_redteam_3a_hir_conjunctive_is_shadow_isolation_comptime_for_and_operator_eq" {
     const allocator = std.testing.allocator;
 
-    // [1] `CRIT-08`, `CRIT-09`, `CRIT-10`, `CRIT-13`, `MAJ-06`, `MAJ-07`, `MAJ-08`, `MAJ-09`:
+    // [1] Conjunctive `is`, shadow isolation, `comptime for`, `@derive`, and operator `Eq` lowering:
     const valid_src =
         \\@derive(Eq)
         \\pub struct Key {
@@ -19246,7 +19281,7 @@ test "test_redteam_3a_hir_conjunctive_is_shadow_isolation_comptime_for_and_opera
     defer ok_bundle.deinit();
     try std.testing.expect(!ok_bundle.diagnostics.hasErrors());
 
-    // Verify `else_hits = else_hits + 1` was lowered only ONCE (`CRIT-08`) and `comptime for` left zero user `hir_loop`s:
+    // Verify `else_hits = else_hits + 1` was lowered only ONCE and `comptime for` left zero user `hir_loop`s:
     var user_loop_count: usize = 0;
     var user_assign_count: usize = 0;
     for (0..ok_bundle.hir_store.nodes.len) |node_i| {
@@ -19259,7 +19294,7 @@ test "test_redteam_3a_hir_conjunctive_is_shadow_isolation_comptime_for_and_opera
     // 1 `else_hits` assign + 3 unrolled `unrolled_sum` assigns (`step = 0, 2, 3`; `5..5` is empty!) = 4 assigns:
     try std.testing.expectEqual(@as(usize, 4), user_assign_count);
 
-    // [2] `CRIT-10`: runtime-guarded `break` targeting an outer `comptime for` emits `E0503`:
+    // [2] Runtime-guarded `break` targeting an outer `comptime for` emits `E0503`:
     const bad_ct_break_src =
         \\pub fn bad_runtime_break(runtime_cond: bool) -> i32 {
         \\    var acc: i32 = 0;
@@ -19284,7 +19319,7 @@ test "test_redteam_3a_hir_conjunctive_is_shadow_isolation_comptime_for_and_opera
     }
     try std.testing.expect(has_e0503);
 
-    // [3] `MAJ-02`, `MAJ-03`, `MAJ-04`: compound assign `rhs`-before-`&mut lhs`, post-arg index order, and `for` mutability:
+    // [3] Compound assign `rhs`-before-`&mut lhs`, post-arg index order, and `for` mutability:
     const eval_order_src =
         \\pub fn bump_and_get(counter: &mut usize) -> usize {
         \\    counter.* = counter.* + 1;
@@ -19309,7 +19344,7 @@ test "test_redteam_3a_hir_conjunctive_is_shadow_isolation_comptime_for_and_opera
     defer order_bundle.deinit();
     try std.testing.expect(!order_bundle.diagnostics.hasErrors());
 
-    // [4] `CRIT-11`: `> 64` struct fields lowered into HIR without silent truncation:
+    // [4] `> 64` struct fields lowered into HIR without silent truncation:
     var big_struct_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer big_struct_buf.deinit(allocator);
     var field_line_buf: [64]u8 = undefined;
@@ -19626,10 +19661,10 @@ test "test_phase76_stage4_hir_subscript_single_def_raw_multiline_caller_loc_and_
     }
 }
 
-test "test_r3_async_block_borrow_loans_nested_mutation_scan_and_pipe_variadic_promotion" {
+test "test_hir_async_block_borrow_loans_nested_mutation_scan_and_pipe_variadic_promotion" {
     const allocator = std.testing.allocator;
 
-    // [1] `[CRITICAL-01]` & `[CRITICAL-03]`: non-`own` `async { … }` + `hir_cond_if` + `#soa` + nested `task_group` mint `&mut` loans:
+    // [1] Non-`own` `async { … }` + `hir_cond_if` + `#soa` + nested `task_group` mint `&mut` loans:
     const async_loan_src =
         \\use cx.async.task_group;
         \\pub struct Particle {
@@ -19647,12 +19682,12 @@ test "test_r3_async_block_borrow_loans_nested_mutation_scan_and_pipe_variadic_pr
         \\        count
         \\    };
         \\    let a_out = fut_a.await;
-        \\    let nested_fut = task_group(|g| {
-        \\        let h = g.spawn(|| {
+        \\    let nested_fut = task_group(|grp| {
+        \\        let handle = grp.spawn(|| {
         \\            count += 1;
         \\            count
         \\        });
-        \\        h.join().await
+        \\        handle.join().await
         \\    });
         \\    let n_out = nested_fut.await;
         \\    let moved_fut = own async { count };
@@ -19698,7 +19733,7 @@ test "test_r3_async_block_borrow_loans_nested_mutation_scan_and_pipe_variadic_pr
     // `fut_a` mints `&mut count` + `&mut parts` (2), and `nested_fut` mints `&mut count` (1) -> >= 3 `&mut` loans:
     try std.testing.expect(mut_loan_intrinsic_count >= 3);
 
-    // [2] `[MINOR-02]`: Indirect C variadic function-pointer call through `|>` promotes `bool`/`i8` -> `i32` & `f32` -> `f64`:
+    // [2] Indirect C variadic function-pointer call through `|>` promotes `bool`/`i8` -> `i32` & `f32` -> `f64`:
     const pipe_var_src =
         \\pub fn invoke_pipe_variadic(
         \\    fp: extern "C" fn(*u8, ...) -> i32,

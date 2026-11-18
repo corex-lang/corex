@@ -14,7 +14,7 @@
 //!   guard `rhs == 0` and `MIN / -1` prior to evaluation, shifts bounds-check/mask counts,
 //!   float-to-int casts trap on `NaN`/`Inf`/out-of-range values, and `@bit_cast` uses `memcpy`.
 //! - Cycle-safe parallel block-argument moves stage outgoing values into scoped `_phi_<k>` locals
-//!   inside every branch/switch arm (`[CRITICAL-05]`).
+//!   inside every branch/switch arm.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -1219,7 +1219,7 @@ const C99_FREESTANDING_PREAMBLE: []const u8 =
 const C99_FREESTANDING_TAIL: []const u8 =
     \\static inline cx_str_t _cx_rt_buf_finish_str(_cx_rt_buf_t *out_b) {
     \\    (void)out_b;
-    \\    cx_str_t res_s = { (uint8_t *)((uintptr_t)1u), 0u };
+    \\    cx_str_t res_s = { (uint8_t *)_cx_empty_rodata, 0u };
     \\    return res_s;
     \\}
     \\#if defined(__GNUC__) || defined(__clang__)
@@ -1655,11 +1655,12 @@ const C99_FMT_HELPERS: []const u8 =
     \\    cx_str_t res_s;
     \\    if (out_b->len == 0u) {
     \\        free(out_b->data);
-    \\        res_s.ptr = (uint8_t *)((uintptr_t)1u);
+    \\        res_s.ptr = (uint8_t *)_cx_empty_rodata;
     \\        res_s.len = 0u;
     \\    } else {
+    \\        _cx_rt_buf_push_byte(out_b, 0u);
     \\        res_s.ptr = out_b->data;
-    \\        res_s.len = (uintptr_t)out_b->len;
+    \\        res_s.len = (uintptr_t)(out_b->len - 1u);
     \\    }
     \\    return res_s;
     \\}
@@ -2418,16 +2419,32 @@ fn isBodyCAbiBoundary(emitter: *const CModuleEmitter, body: *const MirBody) bool
     return false;
 }
 
-/// Returns `true` if `lay` contains any scalar floating-point field (`float`/`double`) requiring SSE/HFA classification.
-fn hasFloatFieldForCAbi(emitter: *const CModuleEmitter, lay: ResolvedTypeLayout) bool {
-    var phys_i: u32 = 0;
-    while (phys_i < lay.aux_len) : (phys_i += 1) {
-        const decl_ord = emitter.resolver.phys_to_decl.items[lay.aux_start + phys_i];
-        const fld = emitter.resolver.fields_by_decl.items[lay.aux_start + decl_ord];
-        const fld_ty = emitter.input.pool.unwrapUnderlyingType(fld.field_ty);
-        if (fld_ty == .f32_ty or fld_ty == .f64_ty) return true;
+/// Returns `true` if `raw_ty` (within `depth <= 16`) contains any floating-point leaf (`float`/`double`) for C ABI classification.
+fn hasFloatFieldForCAbi(emitter: *CModuleEmitter, raw_ty: TypeId, depth: u32) !bool {
+    if (depth > 16) return false;
+    const unwrapped = emitter.input.pool.unwrapUnderlyingType(raw_ty);
+    if (unwrapped == .f32_ty or unwrapped == .f64_ty) return true;
+    if (unwrapped.isPrimitiveOrSentinel()) return false;
+    const node = emitter.input.pool.getNode(unwrapped);
+    switch (node.tag) {
+        .array_ty => {
+            if ((node.rhs & type_system.SYMBOLIC_ARRAY_LEN_FLAG) != 0 or node.rhs == 0) return false;
+            return hasFloatFieldForCAbi(emitter, TypeId.fromInt(node.lhs), depth + 1);
+        },
+        .struct_ty, .tuple_ty, .union_ty => {
+            const sub_lay = try emitter.resolver.resolveTypeBounded(unwrapped, depth + 1);
+            const sub_start = sub_lay.aux_start;
+            const sub_len = sub_lay.aux_len;
+            var fld_i: u32 = 0;
+            while (fld_i < sub_len) : (fld_i += 1) {
+                const fld = emitter.resolver.fields_by_decl.items[sub_start + fld_i];
+                if (fld.size_bytes == 0) continue;
+                if (try hasFloatFieldForCAbi(emitter, fld.field_ty, depth + 1)) return true;
+            }
+            return false;
+        },
+        else => return false,
     }
-    return false;
 }
 
 /// Formats the header-comment target identifier (`"x86_64-linux"` on default GNU Linux for golden parity).
@@ -2898,6 +2915,9 @@ fn emitTypeDeclarations(emitter: *CModuleEmitter) !void {
                     lay.alignBytes(),
                     ty_u32,
                 });
+                const is_natural_c_float = rflags.is_repr_c and !rflags.is_packed and
+                    (try hasFloatFieldForCAbi(emitter, ty, 0));
+                var max_emitted_bytes: u64 = 0;
                 const sym_idx = SymbolIndex.fromInt(node.rhs);
                 if (!sym_idx.isNone() and sym_idx.asInt() < emitter.input.sym_table.symbols.items.len) {
                     const un_sym = emitter.input.sym_table.getSymbol(sym_idx).*;
@@ -2913,6 +2933,8 @@ fn emitTypeDeclarations(emitter: *CModuleEmitter) !void {
                             if (mem_sym.kind != .field_sym) continue;
                             const fld_ty = emitter.input.pool.unwrapUnderlyingType(subst.resolve(mem_sym.type_id));
                             if (!(try isZeroSizedType(emitter, fld_ty))) {
+                                const fld_lay = try emitter.resolver.resolveType(fld_ty);
+                                if (fld_lay.size_bytes > max_emitted_bytes) max_emitted_bytes = fld_lay.size_bytes;
                                 const fld_c = try formatCType(emitter, fld_ty);
                                 defer emitter.allocator.free(fld_c);
                                 try emitter.print("    {s} _f{d};\n", .{ fld_c, fld_ord });
@@ -2921,7 +2943,13 @@ fn emitTypeDeclarations(emitter: *CModuleEmitter) !void {
                         }
                     }
                 }
-                try emitter.print("    uint8_t _raw[{d}u];\n}};\n", .{@max(lay.size_bytes, 1)});
+                if (max_emitted_bytes == 0 or
+                    !(is_natural_c_float and
+                        std.mem.alignForward(u64, max_emitted_bytes, lay.alignBytes()) == lay.size_bytes))
+                {
+                    try emitter.print("    uint8_t _raw[{d}u];\n", .{@max(lay.size_bytes, 1)});
+                }
+                try emitter.writeAll("};\n");
             },
             .struct_ty, .tuple_ty => {
                 if (rflags.is_packed) {
@@ -2935,7 +2963,7 @@ fn emitTypeDeclarations(emitter: *CModuleEmitter) !void {
                 const fld_start = lay.aux_start;
                 const fld_len = lay.aux_len;
                 const is_natural_c_float = rflags.is_repr_c and !rflags.is_packed and
-                    hasFloatFieldForCAbi(emitter, lay);
+                    (try hasFloatFieldForCAbi(emitter, ty, 0));
                 var cur_byte: u64 = 0;
                 var pad_idx: u32 = 0;
                 var phys_i: u32 = 0;
@@ -3069,13 +3097,13 @@ fn emitRodataAndDevSeam(emitter: *CModuleEmitter, dev_seam_out: *?[]u8) !void {
     for (emitter.string_const_ids.items) |sym_raw| {
         const str_bytes = emitter.input.interner.get(SymbolId.fromInt(sym_raw));
         if (str_bytes.len == 0) continue;
-        try emitter.print("static const uint8_t _cx_str_bytes_{d}[{d}u] = {{", .{ sym_raw, str_bytes.len });
+        try emitter.print("static const uint8_t _cx_str_bytes_{d}[{d}u] = {{", .{ sym_raw, str_bytes.len + 1 });
         for (str_bytes, 0..) |byte_val, idx| {
             if (idx > 0) try emitter.writeAll(",");
             if (idx % RAW_BLOB_BYTES_PER_LINE == 0) try emitter.writeAll("\n   ");
             try emitter.print(" 0x{x:0>2}u", .{byte_val});
         }
-        try emitter.writeAll("\n};\n");
+        try emitter.writeAll(", 0x00u\n};\n");
     }
 
     for (emitter.type_name_ids.items) |ty_u32| {
@@ -3086,13 +3114,13 @@ fn emitRodataAndDevSeam(emitter: *CModuleEmitter, dev_seam_out: *?[]u8) !void {
             &name_buf,
         );
         if (rendered.len == 0) continue;
-        try emitter.print("static const uint8_t _cx_tyname_{d}[{d}u] = {{", .{ ty_u32, rendered.len });
+        try emitter.print("static const uint8_t _cx_tyname_{d}[{d}u] = {{", .{ ty_u32, rendered.len + 1 });
         for (rendered, 0..) |byte_val, idx| {
             if (idx > 0) try emitter.writeAll(",");
             if (idx % RAW_BLOB_BYTES_PER_LINE == 0) try emitter.writeAll("\n   ");
             try emitter.print(" 0x{x:0>2}u", .{byte_val});
         }
-        try emitter.writeAll("\n};\n");
+        try emitter.writeAll(", 0x00u\n};\n");
     }
 
     if (emitter.input.blob_store) |bstore| {
@@ -3187,7 +3215,7 @@ fn emitRodataAndDevSeam(emitter: *CModuleEmitter, dev_seam_out: *?[]u8) !void {
         );
     }
 
-    if (emitter.has_async_ops and !emitter.cfg.target.isFreestanding()) {
+    if (emitter.has_async_ops) {
         try emitAsyncRuntimeHelpersC(emitter);
     }
 
@@ -3253,6 +3281,49 @@ fn emitAsyncRuntimeHelpersC(emitter: *CModuleEmitter) !void {
         \\static size_t _cx_coro_frame_size(uint32_t _b_idx);
         \\static size_t _cx_coro_frame_align(uint32_t _b_idx);
         \\static uint32_t _cx_coro_poll_dispatch(uint32_t _b_idx, uint8_t *_frame, void *_out_ptr, uint32_t _action, uint8_t *_parked_out);
+        \\
+    );
+    if (emitter.cfg.target.isFreestanding()) {
+        try emitter.writeAll(
+            \\static uint8_t __attribute__((aligned(16))) _cx_wasm_async_heap[65536u];
+            \\static size_t _cx_wasm_async_heap_off = 0u;
+            \\static void *_cx_async_zalloc(size_t _byte_n) {
+            \\    if (_byte_n == 0u) _byte_n = 16u;
+            \\    size_t _aligned_off = (_cx_wasm_async_heap_off + 15u) & ~(size_t)15u;
+            \\    if (_aligned_off > 65536u || _byte_n > 65536u - _aligned_off) __builtin_trap();
+            \\    uint8_t *_out_p = &_cx_wasm_async_heap[_aligned_off];
+            \\    memset(_out_p, 0, _byte_n);
+            \\    _cx_wasm_async_heap_off = _aligned_off + _byte_n;
+            \\    return (void *)_out_p;
+            \\}
+            \\static void *_cx_async_grow_buf(void *_old_p, size_t _old_bytes, size_t _new_bytes) {
+            \\    void *_new_p = _cx_async_zalloc(_new_bytes);
+            \\    if (_old_p != NULL && _old_bytes > 0u) {
+            \\        memcpy(_new_p, _old_p, _old_bytes < _new_bytes ? _old_bytes : _new_bytes);
+            \\    }
+            \\    return _new_p;
+            \\}
+            \\static inline void _cx_async_free(void *_ptr) { (void)_ptr; }
+            \\
+        );
+    } else {
+        try emitter.writeAll(
+            \\static void *_cx_async_zalloc(size_t _byte_n) {
+            \\    void *_out_p = calloc(1u, _byte_n == 0u ? 1u : _byte_n);
+            \\    if (_out_p == NULL) _cx_rt_trap(0u);
+            \\    return _out_p;
+            \\}
+            \\static void *_cx_async_grow_buf(void *_old_p, size_t _old_bytes, size_t _new_bytes) {
+            \\    (void)_old_bytes;
+            \\    void *_new_p = realloc(_old_p, _new_bytes == 0u ? 1u : _new_bytes);
+            \\    if (_new_p == NULL) _cx_rt_trap(0u);
+            \\    return _new_p;
+            \\}
+            \\static inline void _cx_async_free(void *_ptr) { free(_ptr); }
+            \\
+        );
+    }
+    try emitter.writeAll(
         \\static CX_THREAD_LOCAL uintptr_t *_cx_exec_q = NULL;
         \\static CX_THREAD_LOCAL size_t _cx_exec_q_len = 0u;
         \\static CX_THREAD_LOCAL size_t _cx_exec_q_cap = 0u;
@@ -3262,8 +3333,7 @@ fn emitAsyncRuntimeHelpersC(emitter: *CModuleEmitter) !void {
         \\    if (_cx_exec_q_len >= _cx_exec_q_cap) {
         \\        size_t _nc = _cx_exec_q_cap == 0u ? 64u : (_cx_exec_q_cap * 2u);
         \\        if (_nc <= _cx_exec_q_cap || _nc > (((size_t)-1) / sizeof(uintptr_t))) _cx_rt_trap(0u);
-        \\        uintptr_t *_nq = (uintptr_t *)realloc(_cx_exec_q, _nc * sizeof(uintptr_t));
-        \\        if (_nq == NULL) _cx_rt_trap(0u);
+        \\        uintptr_t *_nq = (uintptr_t *)_cx_async_grow_buf(_cx_exec_q, _cx_exec_q_cap * sizeof(uintptr_t), _nc * sizeof(uintptr_t));
         \\        _cx_exec_q = _nq;
         \\        _cx_exec_q_cap = _nc;
         \\    }
@@ -3288,8 +3358,7 @@ fn emitAsyncRuntimeHelpersC(emitter: *CModuleEmitter) !void {
         \\    if (_sz < 16u) _sz = 16u;
         \\    if (_al < 16u) _al = 16u;
         \\    if (_sz > (((size_t)-1) - _al)) _cx_rt_trap(0u);
-        \\    uint8_t *_raw = (uint8_t *)calloc(1u, _sz + _al);
-        \\    if (_raw == NULL) _cx_rt_trap(0u);
+        \\    uint8_t *_raw = (uint8_t *)_cx_async_zalloc(_sz + _al);
         \\    uintptr_t _raw_a = (uintptr_t)_raw;
         \\    uintptr_t _al_a = (_raw_a + ((uintptr_t)_al - 1u)) & ~((uintptr_t)_al - 1u);
         \\    uint16_t _delta = (uint16_t)(_al_a - _raw_a);
@@ -3302,7 +3371,7 @@ fn emitAsyncRuntimeHelpersC(emitter: *CModuleEmitter) !void {
         \\    if (_fr == NULL) return;
         \\    uint16_t _delta = 0u;
         \\    memcpy(&_delta, _fr + 12u, 2u);
-        \\    free(_fr - (size_t)_delta);
+        \\    _cx_async_free(_fr - (size_t)_delta);
         \\}
         \\static void _cx_async_cancel_node(_cx_task_node_t *_tn);
         \\static void _cx_async_fut_cancel(void *_raw_fut) {
@@ -3429,22 +3498,19 @@ fn emitAsyncRuntimeHelpersC(emitter: *CModuleEmitter) !void {
         \\    }
         \\}
         \\static void *_cx_async_group_enter(void) {
-        \\    _cx_task_group_t *_g = (_cx_task_group_t *)calloc(1u, sizeof(_cx_task_group_t));
-        \\    if (_g == NULL) _cx_rt_trap(0u);
+        \\    _cx_task_group_t *_g = (_cx_task_group_t *)_cx_async_zalloc(sizeof(_cx_task_group_t));
         \\    return (void *)_g;
         \\}
         \\static void *_cx_async_spawn(void *_grp_ptr, void *_raw_fut, size_t _out_sz, _cx_err_chk_fn_t _echk) {
         \\    _cx_task_group_t *_g = (_cx_task_group_t *)_grp_ptr;
-        \\    _cx_task_node_t *_tn = (_cx_task_node_t *)calloc(1u, sizeof(_cx_task_node_t));
-        \\    if (_tn == NULL) _cx_rt_trap(0u);
+        \\    _cx_task_node_t *_tn = (_cx_task_node_t *)_cx_async_zalloc(sizeof(_cx_task_node_t));
         \\    _tn->group = _g;
         \\    memcpy(&_tn->fut, _raw_fut, sizeof(_cx_fut_raw_t));
         \\    ((_cx_fut_raw_t *)_raw_fut)->_kind = 0u;
         \\    ((_cx_fut_raw_t *)_raw_fut)->_handle = NULL;
         \\    _tn->res_sz = _out_sz;
         \\    if (_out_sz > 0u) {
-        \\        _tn->res_buf = (uint8_t *)calloc(1u, _out_sz);
-        \\        if (_tn->res_buf == NULL) _cx_rt_trap(0u);
+        \\        _tn->res_buf = (uint8_t *)_cx_async_zalloc(_out_sz);
         \\    }
         \\    _tn->err_chk = _echk;
         \\    memcpy(_tn->ctx_buf, _cx_tls_ctx, _CX_CTX_BYTES);
@@ -3452,8 +3518,8 @@ fn emitAsyncRuntimeHelpersC(emitter: *CModuleEmitter) !void {
         \\        if (_g->len >= _g->cap) {
         \\            size_t _nc = _g->cap == 0u ? 8u : (_g->cap * 2u);
         \\            if (_nc <= _g->cap || _nc > (((size_t)-1) / sizeof(_cx_task_node_t *))) _cx_rt_trap(0u);
-        \\            _cx_task_node_t **_nt = (_cx_task_node_t **)realloc(_g->tasks, _nc * sizeof(_cx_task_node_t *));
-        \\            if (_nt == NULL) _cx_rt_trap(0u);
+        \\            _cx_task_node_t **_nt = (_cx_task_node_t **)_cx_async_grow_buf(
+        \\                _g->tasks, _g->cap * sizeof(_cx_task_node_t *), _nc * sizeof(_cx_task_node_t *));
         \\            _g->tasks = _nt;
         \\            _g->cap = _nc;
         \\        }
@@ -3525,13 +3591,13 @@ fn emitAsyncRuntimeHelpersC(emitter: *CModuleEmitter) !void {
         \\            _cx_task_node_t *_tn = _g->tasks[_fi];
         \\            if (_tn != NULL) {
         \\                _cx_async_fut_cancel(&_tn->fut);
-        \\                if (_tn->res_buf != NULL) free(_tn->res_buf);
-        \\                free(_tn);
+        \\                if (_tn->res_buf != NULL) _cx_async_free(_tn->res_buf);
+        \\                _cx_async_free(_tn);
         \\            }
         \\            _fi += 1u;
         \\        }
-        \\        if (_g->tasks != NULL) free(_g->tasks);
-        \\        free(_g);
+        \\        if (_g->tasks != NULL) _cx_async_free(_g->tasks);
+        \\        _cx_async_free(_g);
         \\    }
         \\}
         \\static void _cx_async_block_on(void *_raw_fut, void *_out_ptr) {
@@ -3574,7 +3640,7 @@ fn emitAsyncRuntimeHelpersC(emitter: *CModuleEmitter) !void {
         \\                _cx_active_poll_item = _spoll;
         \\                _cx_exec_q_len = _q_base;
         \\                if (_q_base == 0u && _cx_exec_q != NULL) {
-        \\                    free(_cx_exec_q);
+        \\                    _cx_async_free(_cx_exec_q);
         \\                    _cx_exec_q = NULL;
         \\                    _cx_exec_q_cap = 0u;
         \\                }
@@ -3995,7 +4061,7 @@ fn emitCallablePrototypesAndDrops(emitter: *CModuleEmitter) !void {
         try emitFmtHelperDefinition(emitter, fmt_ty);
     }
 
-    if (emitter.has_async_ops and !emitter.cfg.target.isFreestanding()) {
+    if (emitter.has_async_ops) {
         try emitAsyncDispatchTablesC(emitter);
     }
     try emitter.writeAll("\n");
@@ -4386,7 +4452,7 @@ fn emitDropHelperDefinition(emitter: *CModuleEmitter, drop_ty: TypeId) !void {
             }
         },
         .future_ty => {
-            if (emitter.has_async_ops and !emitter.cfg.target.isFreestanding()) {
+            if (emitter.has_async_ops) {
                 try emitter.writeAll("    _cx_async_fut_cancel((void *)_self_ptr);\n");
             }
         },
@@ -5638,7 +5704,7 @@ fn emitScalarEnumOrdinalReadC(
     }
 }
 
-/// Returns `true` when `inst` is a 0-hole `.fmt_args_make` whose pieces are all `.str_val` constants (`[P0-C]`).
+/// Returns `true` when `inst` is a 0-hole `.fmt_args_make` whose pieces are all `.str_val` constants.
 fn isStaticConstFmtArgsMake(body: *const MirBody, inst: mir.MirInst) bool {
     const words = body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs];
     if (words.len < 1) return false;
@@ -5853,8 +5919,7 @@ fn emitMirBody(emitter: *CModuleEmitter, body_idx: u32, body: *const MirBody) !v
         }
         if (emitter.entry_main_body_idx == body_idx and
             body.param_count == 0 and
-            emitter.has_async_ops and
-            !emitter.cfg.target.isFreestanding())
+            emitter.has_async_ops)
         {
             const ret_lay = try emitter.resolver.resolveType(body.ret_ty);
             if (is_void_ret) {
@@ -5883,7 +5948,7 @@ fn emitMirBody(emitter: *CModuleEmitter, body_idx: u32, body: *const MirBody) !v
                 .{ret_c},
             );
         }
-        if (emitter.has_async_ops and !emitter.cfg.target.isFreestanding()) {
+        if (emitter.has_async_ops) {
             try emitAsyncCoroPollBodyC(emitter, body_idx, body);
         }
         return;
@@ -6457,7 +6522,7 @@ fn emitMirInstC(
                     } else {
                         if (bytes.len == 0) {
                             try emitter.print(
-                                "    _v_{d}.ptr = (uint8_t *)((uintptr_t)1u); _v_{d}.len = 0u;\n",
+                                "    _v_{d}.ptr = (uint8_t *)_cx_empty_rodata; _v_{d}.len = 0u;\n",
                                 .{ dst_raw, dst_raw },
                             );
                         } else {
@@ -6565,6 +6630,7 @@ fn emitMirInstC(
             const agg_ty = emitter.input.pool.unwrapUnderlyingType(
                 body.getInst(MirValueId.fromInt(inst.operands.lhs)).type_id,
             );
+            const agg_tag = emitter.input.pool.getNode(agg_ty).tag;
             if (agg_ty == .source_loc_ty) {
                 const fld_name = switch (inst.operands.rhs) {
                     0 => "file",
@@ -6573,7 +6639,15 @@ fn emitMirInstC(
                     else => "col",
                 };
                 try emitter.print("    _v_{d} = _v_{d}->{s};\n", .{ dst_raw, inst.operands.lhs, fld_name });
-            } else if (emitter.input.pool.getNode(agg_ty).tag == .array_ty) {
+            } else if (agg_ty == .str_ty or agg_tag == .slice_ty or agg_tag == .soa_slice_ty) {
+                const dst_c = try formatCType(emitter, inst.type_id);
+                defer emitter.allocator.free(dst_c);
+                const slice_fld = if (inst.operands.rhs == 0) "ptr" else "len";
+                try emitter.print(
+                    "    _v_{d} = ({s})(_v_{d}.{s});\n",
+                    .{ dst_raw, dst_c, inst.operands.lhs, slice_fld },
+                );
+            } else if (agg_tag == .array_ty) {
                 try emitter.print(
                     "    _v_{d} = _v_{d}._elems[{d}u];\n",
                     .{ dst_raw, inst.operands.lhs, inst.operands.rhs },
@@ -6593,7 +6667,17 @@ fn emitMirInstC(
             const elem_ty = body.getInst(MirValueId.fromInt(new_val)).type_id;
             if (!(try isZeroSizedType(emitter, elem_ty))) {
                 const agg_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
-                if (emitter.input.pool.getNode(agg_ty).tag == .array_ty) {
+                const agg_tag = emitter.input.pool.getNode(agg_ty).tag;
+                if (agg_ty == .str_ty or agg_tag == .slice_ty or agg_tag == .soa_slice_ty) {
+                    if (ord == 0) {
+                        try emitter.print(
+                            "    memcpy(&(_v_{d}.ptr), &_v_{d}, sizeof(_v_{d}.ptr));\n",
+                            .{ dst_raw, new_val, dst_raw },
+                        );
+                    } else {
+                        try emitter.print("    _v_{d}.len = _v_{d};\n", .{ dst_raw, new_val });
+                    }
+                } else if (agg_tag == .array_ty) {
                     try emitter.print("    _v_{d}._elems[{d}u] = _v_{d};\n", .{ dst_raw, ord, new_val });
                 } else {
                     try emitter.print("    _v_{d}._f{d} = _v_{d};\n", .{ dst_raw, ord, new_val });
@@ -8157,7 +8241,7 @@ fn emitAggregateMakeC(
     }
 }
 
-/// Classification of C11/GNU `__atomic_*` memory-order clamping rules (`[P0-A]`).
+/// Classification of C11/GNU `__atomic_*` memory-order clamping rules.
 const AtomicOrderSlotKind = enum {
     /// `@atomic_fence` and `@atomic_rmw_*`: all 5 C11 memory models valid (`Consume -> Acquire`).
     fence_or_rmw,
@@ -8224,7 +8308,7 @@ fn emitSingleOrderAtomicStmtC(
     try emitter.writeAll("    default: _cx_rt_trap(3u);\n    }\n");
 }
 
-/// Resolves a warning-free `(succ_macro, fail_macro)` pair for `__atomic_compare_exchange_n` (`[P0-A]`).
+/// Resolves a warning-free `(succ_macro, fail_macro)` pair for `__atomic_compare_exchange_n`.
 fn resolveCmpxchgOrderMacrosC(
     succ_code: u64,
     fail_code: u64,
@@ -9102,18 +9186,18 @@ fn emitIntrinsicOpC(
         },
         .ghost_ctx_region_push, .ghost_ctx_region_pop => {},
         .async_future_make => {
-            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops or args.len < 3) return;
+            if (!emitter.has_async_ops or args.len < 3) return;
             try emitAsyncFutureMakeC(emitter, body, dst_raw, inst.type_id, args);
         },
         .async_task_group_enter => {
-            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops) return;
+            if (!emitter.has_async_ops) return;
             try emitter.print(
                 "    {{ void *_gp = _cx_async_group_enter(); memcpy(&_v_{d}, &_gp, sizeof(void *)); }}\n",
                 .{dst_raw},
             );
         },
         .async_spawn => {
-            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops or args.len < 3) return;
+            if (!emitter.has_async_ops or args.len < 3) return;
             const fut_ty = emitter.input.pool.unwrapUnderlyingType(
                 body.getInst(MirValueId.fromInt(args[2])).type_id,
             );
@@ -9134,7 +9218,7 @@ fn emitIntrinsicOpC(
             );
         },
         .async_join => {
-            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops or args.len < 1) return;
+            if (!emitter.has_async_ops or args.len < 1) return;
             const fut_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
             const out_ty = emitter.input.pool.getFutureOutputType(fut_ty) orelse .unit_ty;
             const out_lay = try emitter.resolver.resolveType(out_ty);
@@ -9146,7 +9230,7 @@ fn emitIntrinsicOpC(
             );
         },
         .async_cancel => {
-            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops or args.len < 1) return;
+            if (!emitter.has_async_ops or args.len < 1) return;
             const ret_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
             if (args.len >= 2 or ret_ty == .bool_ty) {
                 try emitter.print(
@@ -9169,18 +9253,18 @@ fn emitIntrinsicOpC(
             }
         },
         .async_task_group_exit => {
-            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops or args.len < 1) return;
+            if (!emitter.has_async_ops or args.len < 1) return;
             try emitAsyncTaskGroupExitC(emitter, body, args[0]);
         },
         .async_yield => {
-            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops) return;
+            if (!emitter.has_async_ops) return;
             try emitter.print(
                 "    memset(&_v_{d}, 0, sizeof(_v_{d})); _v_{d}._kind = 2u; _v_{d}._aux = 0u;\n",
                 .{ dst_raw, dst_raw, dst_raw, dst_raw },
             );
         },
         .async_block_on => {
-            if (emitter.cfg.target.isFreestanding() or !emitter.has_async_ops or args.len < 1) return;
+            if (!emitter.has_async_ops or args.len < 1) return;
             if (try isZeroSizedType(emitter, inst.type_id)) {
                 try emitter.print("    _cx_async_block_on(&_v_{d}, NULL);\n", .{args[0]});
             } else {
@@ -9190,7 +9274,7 @@ fn emitIntrinsicOpC(
     }
 }
 
-/// Returns `true` when `cand_i` matches an indirect `async_future_make` signature (`[CRITICAL-02]`).
+/// Returns `true` when `cand_i` matches an indirect `async_future_make` signature.
 fn isCompatibleIndirectAsyncCandidateC(
     emitter: *const CModuleEmitter,
     caller_body: *const MirBody,
@@ -9474,7 +9558,7 @@ fn emitAsyncTaskGroupExitC(emitter: *CModuleEmitter, body: *const MirBody, group
     );
 }
 
-/// Emits cycle-safe scoped parallel block-argument moves (`_phi_<k>`) followed by `goto _bb_<target>` (`[CRITICAL-05]`).
+/// Emits cycle-safe scoped parallel block-argument moves (`_phi_<k>`) followed by `goto _bb_<target>`.
 fn emitEdgeParallelMovesAndGotoC(
     emitter: *CModuleEmitter,
     body: *const MirBody,
@@ -10223,7 +10307,7 @@ pub fn emitModule(
             break;
         }
     }
-    if (has_any_async and !cfg.target.isFreestanding()) {
+    if (has_any_async) {
         const cloned_bodies = allocator.alloc(MirBody, input.bodies.len) catch return error.OutOfMemory;
         var cloned_count: usize = 0;
         errdefer {
@@ -10309,7 +10393,7 @@ pub fn emitModule(
 
 // ---------------------------------------- MAIN -----------------------------------------
 
-test "codegen_c. Phase 7.6 SourceLoc, FmtSpec/FmtArgs, raw addr, atomics, variadics, opaque, and byte literals" {
+test "test_codegen_c_source_loc_fmt_atomics_variadics_and_bytes" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const host_spec = TargetSpec.host();
@@ -10365,7 +10449,7 @@ test "codegen_c. Phase 7.6 SourceLoc, FmtSpec/FmtArgs, raw addr, atomics, variad
     try std.testing.expect(std.mem.indexOf(u8, var_art.emitted_text, "c_var_log") != null);
 
     // [2] End-to-end executable verification: `SourceLoc` (both `.field` & `aggregate_extract`), `fmt_value`,
-    // static 0-hole `FmtArgs` (`[P0-C]`), `Atomic*` interior mutability (`MemoryOrder` `0..5`), `b"…"`, & `~vec`:
+    // static 0-hole `FmtArgs`, `Atomic*` interior mutability (`MemoryOrder` `0..5`), `b"…"`, & `~vec`:
     const exec_src =
         \\pub enum MemoryOrder: u8 {
         \\    Relaxed = 0,
@@ -10474,7 +10558,7 @@ test "codegen_c. Phase 7.6 SourceLoc, FmtSpec/FmtArgs, raw addr, atomics, variad
     try std.testing.expectEqualStrings("0000002a|    hi|num=42|ffffffff|k=2a,Low", run_res.stdout);
 }
 
-test "Phase 7.6 Stage-4 C99 regressions: 0-byte own closure niche, 6-arg cmpxchg, float fmt parity" {
+test "test_codegen_c_zero_env_own_closure_cmpxchg_and_float_fmt" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const host_spec = TargetSpec.host();
@@ -10585,7 +10669,7 @@ test "Phase 7.6 Stage-4 C99 regressions: 0-byte own closure niche, 6-arg cmpxchg
     );
 }
 
-test "Phase 8 Tier A C99: freestanding < 10 KB Wasm, @wasm_import/@wasm_export, and SDK-less aarch64-msvc .obj" {
+test "test_codegen_c_freestanding_wasm_and_sdkless_aarch64_msvc_obj" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 

@@ -56,14 +56,22 @@ pub struct TaskHeader {
 /// Dispatch vtable routed through `context.reactor` (`slot 8`, `DR-08` §5.3, `DR-18` §2.1).
 @repr(C)
 pub struct ReactorVTable {
-    /// Submission hook for non-blocking I/O or timer operations.
-    pub submit_fn: usize,
-    /// Single-turn readiness polling hook driving runnable tasks.
-    pub poll_fn: usize,
-    /// Cross-thread or local task wakeup hook.
-    pub wake_fn: usize,
-    /// Monotonic timer registration hook.
-    pub timer_fn: usize,
+    /// Monotonic nanosecond clock query hook.
+    pub monotonic_ns: usize,
+    /// Wall-clock Unix epoch nanosecond query hook.
+    pub wall_epoch_ns: usize,
+    /// Cryptographic or deterministic simulation PRNG byte-fill hook.
+    pub fill_rng: usize,
+    /// Non-blocking I/O or timer submission hook.
+    pub submit_io: usize,
+    /// In-flight asynchronous I/O cancellation hook.
+    pub cancel_io: usize,
+    /// Single-turn readiness polling or thread-parking hook.
+    pub poll_or_park: usize,
+    /// Cooperative task reschedule hook.
+    pub yield_task: usize,
+    /// Deterministic simulation fault-injection (`BUGGIFY`) gate hook.
+    pub buggify_gate: usize,
 }
 
 /// `Copy` reactor dispatch capability stored in `context.reactor` (`slot 8`, `SE-08`).
@@ -75,6 +83,7 @@ pub struct Reactor {
 
 /// `Copy` reactor state capability stored in `context.reactor_ctx` (`slot 9`, `SE-08`).
 @repr(C)
+@not_send
 pub struct ReactorCtx {
     /// Opaque mutable pointer to the active reactor or deterministic simulation state.
     pub state: *mut opaque,
@@ -199,9 +208,9 @@ impl CancelSource {
     /// Signals cooperative cancellation to all holders of tokens derived from `self`.
     @std_cap_boundary(clears: [unsafe_op])
     @inline @no_alloc @no_panic
-    pub fn cancel(&mut self) {
+    pub fn cancel(&self) {
         unsafe {
-            @atomic_store((&raw mut self.flag) as *mut u64, 1_u64, 3_u8);
+            @atomic_store((&raw self.flag) as *mut u64, 1_u64, 3_u8);
         }
     }
 

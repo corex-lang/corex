@@ -74,7 +74,7 @@ LLD_HAS_DRIVER(wasm)
 
 namespace {
 
-// -------------------------------------- INTERNALS --------------------------------------
+// --------------------------------------- CONSTS ----------------------------------------
 
 /// Process-wide one-time initialization guard for LLVM target registries.
 std::once_flag g_llvm_targets_once;
@@ -83,6 +83,8 @@ std::once_flag g_llvm_targets_once;
 /// Process-wide mutex serializing in-process `lld` invocations across worker threads.
 std::mutex g_lld_mutex;
 #endif
+
+// -------------------------------------- INTERNALS --------------------------------------
 
 /// Lazily initializes all registered LLVM target descriptions on first bridge invocation (`AGENTS.md` Section 2).
 void ensureLlvmTargetsInitialized() {
@@ -273,12 +275,11 @@ extern "C" CxLlvmStatus cx_llvm_compile_ir_to_object(
 
     llvm::LLVMContext llvm_ctx;
     llvm::SMDiagnostic parse_diag;
-    const llvm::StringRef ir_ref(request->ir_text_ptr, request->ir_text_len);
-    const llvm::StringRef mod_name_ref(
-        request->module_name != nullptr ? request->module_name : "corex_mod"
+    std::unique_ptr<llvm::MemoryBuffer> mem_buf = llvm::MemoryBuffer::getMemBuffer(
+        llvm::StringRef(request->ir_text_ptr, request->ir_text_len),
+        llvm::StringRef(request->module_name != nullptr ? request->module_name : "corex_mod"),
+        false
     );
-    std::unique_ptr<llvm::MemoryBuffer> mem_buf =
-        llvm::MemoryBuffer::getMemBuffer(ir_ref, mod_name_ref, false);
     std::unique_ptr<llvm::Module> llvm_mod =
         llvm::parseAssembly(mem_buf->getMemBufferRef(), parse_diag, llvm_ctx);
     if (!llvm_mod) {
@@ -545,12 +546,16 @@ extern "C" CxLlvmResult cx_llvm_write_coff_import_library(
         return CX_LLVM_ERR_INVALID_ARG;
     }
 
-    const llvm::StringRef def_text(def_contents_ptr != nullptr ? def_contents_ptr : "", def_contents_len);
-    const llvm::MemoryBufferRef def_buf(def_text, "module.def");
     const auto machine = static_cast<llvm::COFF::MachineTypes>(coff_machine);
-
     llvm::Expected<llvm::object::COFFModuleDefinition> def_or_err =
-        llvm::object::parseCOFFModuleDefinition(def_buf, machine, /*MingwDef=*/true);
+        llvm::object::parseCOFFModuleDefinition(
+            llvm::MemoryBufferRef(
+                llvm::StringRef(def_contents_ptr != nullptr ? def_contents_ptr : "", def_contents_len),
+                "module.def"
+            ),
+            machine,
+            /*MingwDef=*/true
+        );
     if (!def_or_err) {
         writeBoundedError(err_buf, err_cap, llvm::toString(def_or_err.takeError()));
         return CX_LLVM_ERR_COFF_IMPLIB;

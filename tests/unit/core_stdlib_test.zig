@@ -956,7 +956,7 @@ test "test_core_ffi_cstr_and_async_nursery_four_tier_differential_oracle" {
     }
     try std.testing.expect(report.is_all_matching);
     try std.testing.expect(!report.outcomes[0].has_trapped);
-    // 5 + 2 + 10 + 25 = 42
+    // Expected return scalar (`5 + 2 + 10 + 25 = 42`):
     try std.testing.expectEqual(@as(i64, 42), report.outcomes[0].return_scalar_i64);
     try std.testing.expectEqualSlices(
         i64,

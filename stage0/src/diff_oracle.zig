@@ -909,7 +909,7 @@ test "test_diff_oracle_monochrome_table_rendering_on_simulated_divergence" {
     try std.testing.expect(std.mem.indexOf(u8, rendered.rendered_table, "✗") != null);
 }
 
-test "Phase 8 Wave 3C-2 4-tier async coroutines, FIFO TaskGroup, FramePinned borrows, and cancellation parity" {
+test "test_diff_oracle_phase8_async_coroutines_fifo_task_group_and_cancellation_parity" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -954,9 +954,8 @@ test "Phase 8 Wave 3C-2 4-tier async coroutines, FIFO TaskGroup, FramePinned bor
         }
     }.run;
 
-    // [1] Lazy `Future`, multi-suspend `cx.async.yield_now().await`, nested `.await`, `FramePinned` `&mut`,
-    //     FIFO `task_group` `1 -> 2 -> 3 -> 4` interleaving, `handle.cancel().await` (unpolled + suspended LIFO `defer`),
-    //     and `group.cancel_all()` / `group.is_cancelled()` via `cx.async.block_on`:
+    // [1] Lazy `Future`, multi-suspend `yield_now().await`, `FramePinned` `&mut`, FIFO `task_group`,
+    //     `handle.cancel().await` LIFO `defer` cleanup, and `group.cancel_all()` via `cx.async.block_on`:
     const sync_async_src =
         \\pub async fn lazy_step(tag: i64, val: i32) -> i32 {
         \\    @drop_trace(tag);

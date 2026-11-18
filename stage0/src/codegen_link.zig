@@ -154,7 +154,7 @@ pub const CoffMachine = enum(u16) {
 pub const ModuleDefExport = struct {
     /// Public imported symbol identifier owned by `ParsedModuleDef` (`SymName`).
     sym_name: []u8,
-    /// Optional internal/target DLL export name when `SymName = InternalName` is present.
+    /// Optional target DLL export alias when `SymName == DllExportName` is present (`IMPORT_NAME_EXPORTAS`).
     ext_name: ?[]u8 = null,
     /// Optional `@ordinal` value (`1..65535`).
     ordinal: ?u16 = null,
@@ -324,11 +324,10 @@ const DIRECT_LIB_EXT_MAP = std.StaticStringMap(void).initComptime(.{
     .{ ".tbd", {} },
     .{ ".wasm", {} },
 });
-
-// -------------------------------------- INTERNALS --------------------------------------
-
 /// Monotonic scratch sequence counter isolating concurrent `linkCrossTarget` staging directories.
 var next_link_scratch_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(1);
+
+// -------------------------------------- INTERNALS --------------------------------------
 
 // --------------- Object Symbol Table Extraction ---------------
 
@@ -530,8 +529,7 @@ fn extractCoffDefinedSymbols(
         const size_of_data: usize = std.mem.readInt(u32, obj_bytes[12..16], .little);
         const type_info = std.mem.readInt(u16, obj_bytes[18..20], .little);
         if (20 + size_of_data > obj_bytes.len) return;
-        const payload = obj_bytes[20 .. 20 + size_of_data];
-        const sym_name = std.mem.sliceTo(payload, 0);
+        const sym_name = std.mem.sliceTo(obj_bytes[20 .. 20 + size_of_data], 0);
         if (sym_name.len == 0) return;
         const imp_sym = try std.fmt.allocPrint(allocator, "__imp_{s}", .{sym_name});
         errdefer allocator.free(imp_sym);
@@ -562,8 +560,7 @@ fn extractCoffDefinedSymbols(
         const sym_val = std.mem.readInt(u32, raw[8..12], .little);
         const sec_num = std.mem.readInt(i16, raw[12..14], .little);
         const storage_class = raw[16];
-        const aux_count: usize = raw[17];
-        sym_i += 1 + aux_count;
+        sym_i += 1 + @as(usize, raw[17]);
 
         if (storage_class != COFF_SYM_CLASS_EXTERNAL and storage_class != COFF_SYM_CLASS_WEAK_EXTERNAL) continue;
         if (sec_num == 0 and sym_val == 0) continue; // Undefined external reference.
@@ -590,18 +587,16 @@ fn extractWasmDefinedSymbols(
     while (cursor < obj_bytes.len) {
         const sec_id = obj_bytes[cursor];
         cursor += 1;
-        const sec_len_u64 = readUleb128(obj_bytes, &cursor) orelse return;
-        const sec_len: usize = @intCast(sec_len_u64);
+        const sec_len: usize = @intCast(readUleb128(obj_bytes, &cursor) orelse return);
         if (cursor + sec_len > obj_bytes.len) return;
         const sec_end = cursor + sec_len;
 
         if (sec_id == 0) {
             var sub_cur = cursor;
-            const name_len_u64 = readUleb128(obj_bytes, &sub_cur) orelse {
+            const name_len: usize = @intCast(readUleb128(obj_bytes, &sub_cur) orelse {
                 cursor = sec_end;
                 continue;
-            };
-            const name_len: usize = @intCast(name_len_u64);
+            });
             if (sub_cur + name_len <= sec_end and std.mem.eql(u8, obj_bytes[sub_cur .. sub_cur + name_len], "linking")) {
                 sub_cur += name_len;
                 _ = readUleb128(obj_bytes, &sub_cur) orelse {
@@ -609,40 +604,32 @@ fn extractWasmDefinedSymbols(
                     continue;
                 };
                 while (sub_cur < sec_end) {
-                    const sub_type = obj_bytes[sub_cur];
-                    sub_cur += 1;
-                    const sub_len_u64 = readUleb128(obj_bytes, &sub_cur) orelse break;
-                    const sub_len: usize = @intCast(sub_len_u64);
-                    if (sub_cur + sub_len > sec_end) break;
-                    const sub_end = sub_cur + sub_len;
+                    var sym_cur = sub_cur + 1;
+                    const sub_len: usize = @intCast(readUleb128(obj_bytes, &sym_cur) orelse break);
+                    if (sym_cur + sub_len > sec_end) break;
+                    const sub_end = sym_cur + sub_len;
 
-                    if (sub_type == 8) { // `WASM_SYMBOL_TABLE`.
-                        var sym_cur = sub_cur;
-                        const sym_count_u64 = readUleb128(obj_bytes, &sym_cur) orelse break;
-                        var sym_idx: u64 = 0;
-                        while (sym_idx < sym_count_u64 and sym_cur < sub_end) : (sym_idx += 1) {
+                    if (obj_bytes[sub_cur] == 8) { // `WASM_SYMBOL_TABLE`.
+                        var rem_syms = readUleb128(obj_bytes, &sym_cur) orelse break;
+                        while (rem_syms > 0 and sym_cur < sub_end) : (rem_syms -= 1) {
                             const sym_kind = obj_bytes[sym_cur];
                             sym_cur += 1;
                             const sym_flags = readUleb128(obj_bytes, &sym_cur) orelse break;
                             const is_undefined = (sym_flags & 0x10) != 0;
-                            const is_local = (sym_flags & 0x02) != 0;
-                            const has_explicit_name = (sym_flags & 0x40) != 0;
 
                             var parsed_name: []const u8 = "";
                             switch (sym_kind) {
                                 0, 2, 4, 5 => { // Function, Global, Event, Table.
                                     _ = readUleb128(obj_bytes, &sym_cur) orelse break;
-                                    if (!is_undefined or has_explicit_name) {
-                                        const nl = readUleb128(obj_bytes, &sym_cur) orelse break;
-                                        const nl_usz: usize = @intCast(nl);
+                                    if (!is_undefined or (sym_flags & 0x40) != 0) {
+                                        const nl_usz: usize = @intCast(readUleb128(obj_bytes, &sym_cur) orelse break);
                                         if (sym_cur + nl_usz > sub_end) break;
                                         parsed_name = obj_bytes[sym_cur .. sym_cur + nl_usz];
                                         sym_cur += nl_usz;
                                     }
                                 },
                                 1 => { // Data symbol.
-                                    const nl = readUleb128(obj_bytes, &sym_cur) orelse break;
-                                    const nl_usz: usize = @intCast(nl);
+                                    const nl_usz: usize = @intCast(readUleb128(obj_bytes, &sym_cur) orelse break);
                                     if (sym_cur + nl_usz > sub_end) break;
                                     parsed_name = obj_bytes[sym_cur .. sym_cur + nl_usz];
                                     sym_cur += nl_usz;
@@ -657,7 +644,7 @@ fn extractWasmDefinedSymbols(
                                 },
                                 else => break,
                             }
-                            if (!is_undefined and !is_local and sym_kind != 3 and parsed_name.len > 0) {
+                            if (!is_undefined and (sym_flags & 0x02) == 0 and sym_kind != 3 and parsed_name.len > 0) {
                                 try appendOwnedSymbol(allocator, out_syms, parsed_name);
                             }
                         }
@@ -667,23 +654,21 @@ fn extractWasmDefinedSymbols(
             }
         } else if (sec_id == 7) { // Fallback: standard Wasm `Export` section.
             var exp_cur = cursor;
-            const exp_count = readUleb128(obj_bytes, &exp_cur) orelse {
+            var rem_exports = readUleb128(obj_bytes, &exp_cur) orelse {
                 cursor = sec_end;
                 continue;
             };
-            var exp_i: u64 = 0;
-            while (exp_i < exp_count and exp_cur < sec_end) : (exp_i += 1) {
-                const nl = readUleb128(obj_bytes, &exp_cur) orelse break;
-                const nl_usz: usize = @intCast(nl);
+            while (rem_exports > 0 and exp_cur < sec_end) : (rem_exports -= 1) {
+                const nl_usz: usize = @intCast(readUleb128(obj_bytes, &exp_cur) orelse break);
                 if (exp_cur + nl_usz + 1 > sec_end) break;
                 const exp_name = obj_bytes[exp_cur .. exp_cur + nl_usz];
                 exp_cur += nl_usz;
-                const exp_kind = obj_bytes[exp_cur];
-                exp_cur += 1;
-                if (!skipLeb128(obj_bytes, &exp_cur)) break;
-                if (exp_kind == 0 and !std.mem.eql(u8, exp_name, "memory")) {
+                var next_cur = exp_cur + 1;
+                if (!skipLeb128(obj_bytes, &next_cur)) break;
+                if (obj_bytes[exp_cur] == 0 and !std.mem.eql(u8, exp_name, "memory")) {
                     try appendOwnedSymbol(allocator, out_syms, exp_name);
                 }
+                exp_cur = next_cur;
             }
         }
         cursor = sec_end;
@@ -709,8 +694,7 @@ fn extractDefinedSymbolsFromObject(
         try extractWasmDefinedSymbols(allocator, obj_bytes, &syms);
     } else if (obj_bytes.len >= 20) {
         const first_u16 = std.mem.readInt(u16, obj_bytes[0..2], .little);
-        const second_u16 = std.mem.readInt(u16, obj_bytes[2..4], .little);
-        if ((first_u16 == 0x0000 and second_u16 == 0xFFFF) or
+        if ((first_u16 == 0x0000 and std.mem.readInt(u16, obj_bytes[2..4], .little) == 0xFFFF) or
             first_u16 == 0x8664 or first_u16 == 0xAA64 or first_u16 == 0x014C)
         {
             try extractCoffDefinedSymbols(allocator, obj_bytes, &syms);
@@ -770,9 +754,9 @@ fn serializeGnuOrCoffArchive(
             @memcpy(member_name_fields[i][0..base.len], base);
             member_name_fields[i][base.len] = '/';
         } else {
-            const off_in_long = longnames_buf.items.len;
             var off_str_buf: [15]u8 = undefined;
-            const off_str = std.fmt.bufPrint(&off_str_buf, "/{d}", .{off_in_long}) catch return error.ArchiveWriteFailed;
+            const off_str = std.fmt.bufPrint(&off_str_buf, "/{d}", .{longnames_buf.items.len}) catch
+                return error.ArchiveWriteFailed;
             @memcpy(member_name_fields[i][0..off_str.len], off_str);
             longnames_buf.appendSlice(allocator, base) catch return error.OutOfMemory;
             if (is_coff) {
@@ -1121,9 +1105,8 @@ fn buildCoffImportDescriptorObject(
     const idata2_ptr: u32 = 20 + 2 * 40; // `100`.
     const reloc_ptr: u32 = idata2_ptr + 20; // `120`.
     const idata6_ptr: u32 = reloc_ptr + 3 * 10; // `150`.
-    const symtab_ptr: u32 = idata6_ptr + dll_raw_len;
 
-    try appendCoffFileHeader(allocator, &buf, machine, 2, symtab_ptr, 7);
+    try appendCoffFileHeader(allocator, &buf, machine, 2, idata6_ptr + dll_raw_len, 7);
     try appendCoffSectionHeader(allocator, &buf, ".idata$2", 20, idata2_ptr, reloc_ptr, 3, COFF_SCN_IDATA_4B_RW);
     try appendCoffSectionHeader(allocator, &buf, ".idata$6", dll_raw_len, idata6_ptr, 0, 0, COFF_SCN_IDATA_2B_RW);
 
@@ -1254,8 +1237,8 @@ fn buildCoffShortImportMember(
     return buf.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
-/// Scans the next whitespace-delimited or `"…"` quoted token from `line[*pos_ptr..]`.
-fn nextDefToken(line: []const u8, pos_ptr: *usize) ?[]const u8 {
+/// Extracts the next whitespace-delimited, `"…"` quoted, `=`, or `==` token from `line[*pos_ptr..]`.
+fn extractNextDefToken(line: []const u8, pos_ptr: *usize) ?[]const u8 {
     var idx = pos_ptr.*;
     while (idx < line.len and (line[idx] == ' ' or line[idx] == '\t')) : (idx += 1) {}
     if (idx >= line.len) {
@@ -1263,16 +1246,16 @@ fn nextDefToken(line: []const u8, pos_ptr: *usize) ?[]const u8 {
         return null;
     }
     if (line[idx] == '=') {
-        pos_ptr.* = idx + 1;
-        return line[idx .. idx + 1];
+        const eq_len: usize = if (idx + 1 < line.len and line[idx + 1] == '=') 2 else 1;
+        pos_ptr.* = idx + eq_len;
+        return line[idx .. idx + eq_len];
     }
     if (line[idx] == '"') {
         const start = idx + 1;
         idx += 1;
         while (idx < line.len and line[idx] != '"') : (idx += 1) {}
-        const tok = line[start..idx];
         pos_ptr.* = if (idx < line.len) idx + 1 else idx;
-        return tok;
+        return line[start..idx];
     }
     const start = idx;
     while (idx < line.len and line[idx] != ' ' and line[idx] != '\t' and line[idx] != '=') : (idx += 1) {}
@@ -1290,7 +1273,13 @@ inline fn toLowerBounded(lower_buf: *[32]u8, raw_tok: []const u8) ?[]const u8 {
 /// Returns `true` when `lib_arg` denotes a direct filesystem path or archive/object filename rather than `-l<stem>`.
 fn isDirectLibraryPathArg(lib_arg: []const u8) bool {
     if (std.mem.indexOfAny(u8, lib_arg, "/\\") != null) return true;
-    return DIRECT_LIB_EXT_MAP.has(std.fs.path.extension(lib_arg));
+    const raw_ext = std.fs.path.extension(lib_arg);
+    if (DIRECT_LIB_EXT_MAP.has(raw_ext)) return true;
+    var ext_lower_buf: [32]u8 = undefined;
+    if (toLowerBounded(&ext_lower_buf, raw_ext)) |lower_ext| {
+        return DIRECT_LIB_EXT_MAP.has(lower_ext);
+    }
+    return false;
 }
 
 /// Duplicates `raw_text` into a NUL-terminated `[:0]u8` slice owned by `allocator`.
@@ -1300,6 +1289,34 @@ fn dupeSentineledZ(allocator: std.mem.Allocator, raw_text: []const u8) ![:0]u8 {
     return z_buf;
 }
 
+/// Appends a NUL-terminated copy of `raw_arg` into `owned_z`.
+fn appendSentineledZ(
+    allocator: std.mem.Allocator,
+    owned_z: *std.ArrayListUnmanaged([:0]u8),
+    raw_arg: []const u8,
+) !void {
+    const z_buf = try dupeSentineledZ(allocator, raw_arg);
+    errdefer allocator.free(z_buf);
+    try owned_z.append(allocator, z_buf);
+}
+
+/// Appends `prefix ++ middle ++ suffix` as a NUL-terminated slice into `owned_z`.
+fn appendJoinedSentineledZ(
+    allocator: std.mem.Allocator,
+    owned_z: *std.ArrayListUnmanaged([:0]u8),
+    prefix: []const u8,
+    middle: []const u8,
+    suffix: []const u8,
+) !void {
+    const total_len = prefix.len + middle.len + suffix.len;
+    const z_buf = try allocator.allocSentinel(u8, total_len, 0);
+    @memcpy(z_buf[0..prefix.len], prefix);
+    @memcpy(z_buf[prefix.len .. prefix.len + middle.len], middle);
+    @memcpy(z_buf[prefix.len + middle.len .. total_len], suffix);
+    errdefer allocator.free(z_buf);
+    try owned_z.append(allocator, z_buf);
+}
+
 /// Appends embedded `wasm-ld` arguments into `owned_z`, honoring `entry_symbol`, `has_dwarf_tables`, and `extra_libs`.
 fn populateEmbeddedWasmLldArgs(
     allocator: std.mem.Allocator,
@@ -1307,51 +1324,82 @@ fn populateEmbeddedWasmLldArgs(
     staged_output_path: []const u8,
     options: CrossLinkOptions,
 ) !void {
-    const pushZ = struct {
-        /// Appends a NUL-terminated argument into `list`.
-        fn add(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged([:0]u8), val: []const u8) !void {
-            try list.append(alloc, try dupeSentineledZ(alloc, val));
-        }
-    }.add;
-
     if (options.entry_symbol) |entry_sym| {
         if (entry_sym.len > 0) {
-            const entry_flag = try std.fmt.allocPrint(allocator, "--entry={s}", .{entry_sym});
-            defer allocator.free(entry_flag);
-            try pushZ(allocator, owned_z, entry_flag);
+            try appendJoinedSentineledZ(allocator, owned_z, "--entry=", entry_sym, "");
         } else {
-            try pushZ(allocator, owned_z, "--no-entry");
+            try appendSentineledZ(allocator, owned_z, "--no-entry");
         }
     } else {
-        try pushZ(allocator, owned_z, "--no-entry");
+        try appendSentineledZ(allocator, owned_z, "--no-entry");
     }
-    try pushZ(allocator, owned_z, "--export-dynamic");
-    try pushZ(allocator, owned_z, "--gc-sections");
-    if (options.is_release_mode and !options.has_dwarf_tables) {
-        try pushZ(allocator, owned_z, "--strip-all");
+    try appendSentineledZ(allocator, owned_z, "--gc-sections");
+    if (options.is_release_mode) {
+        try appendSentineledZ(allocator, owned_z, "--icf=safe");
+        if (!options.has_dwarf_tables) {
+            try appendSentineledZ(allocator, owned_z, "--strip-all");
+        }
     }
-    try pushZ(allocator, owned_z, "-z");
-    try pushZ(allocator, owned_z, "stack-size=8192");
-    try pushZ(allocator, owned_z, "--initial-memory=65536");
+    try appendSentineledZ(allocator, owned_z, "-z");
+    try appendSentineledZ(allocator, owned_z, "stack-size=8192");
     for (options.lib_dirs) |dir_p| {
         if (dir_p.len == 0) continue;
-        const l_flag = try std.fmt.allocPrint(allocator, "-L{s}", .{dir_p});
-        defer allocator.free(l_flag);
-        try pushZ(allocator, owned_z, l_flag);
+        try appendJoinedSentineledZ(allocator, owned_z, "-L", dir_p, "");
     }
-    for (options.object_paths) |obj_p| try pushZ(allocator, owned_z, obj_p);
+    for (options.object_paths) |obj_p| try appendSentineledZ(allocator, owned_z, obj_p);
     for (options.extra_libs) |lib_item| {
         if (lib_item.len == 0 or std.mem.endsWith(u8, lib_item, ".def")) continue;
         if (isDirectLibraryPathArg(lib_item)) {
-            try pushZ(allocator, owned_z, lib_item);
+            try appendSentineledZ(allocator, owned_z, lib_item);
         } else {
-            const lib_flag = try std.fmt.allocPrint(allocator, "-l{s}", .{lib_item});
-            defer allocator.free(lib_flag);
-            try pushZ(allocator, owned_z, lib_flag);
+            try appendJoinedSentineledZ(allocator, owned_z, "-l", lib_item, "");
         }
     }
-    try pushZ(allocator, owned_z, "-o");
-    try pushZ(allocator, owned_z, staged_output_path);
+    try appendSentineledZ(allocator, owned_z, "-o");
+    try appendSentineledZ(allocator, owned_z, staged_output_path);
+}
+
+/// Appends embedded `lld-link` PE/COFF arguments into `owned_z`, mapping bare library stems to `-defaultlib:<stem>.lib`.
+fn populateEmbeddedCoffLldArgs(
+    allocator: std.mem.Allocator,
+    owned_z: *std.ArrayListUnmanaged([:0]u8),
+    staged_output_path: []const u8,
+    generated_implibs: []const []const u8,
+    options: CrossLinkOptions,
+) !void {
+    try appendSentineledZ(
+        allocator,
+        owned_z,
+        if (options.target.arch == .aarch64) "/MACHINE:ARM64" else "/MACHINE:X64",
+    );
+    try appendSentineledZ(
+        allocator,
+        owned_z,
+        if (options.artifact_kind == .shared_library) "/DLL" else "/SUBSYSTEM:CONSOLE",
+    );
+    try appendSentineledZ(allocator, owned_z, "/OPT:REF");
+    try appendSentineledZ(allocator, owned_z, "/OPT:ICF");
+    try appendSentineledZ(allocator, owned_z, "/BREPRO");
+    if (options.entry_symbol) |entry_sym| {
+        if (entry_sym.len > 0) {
+            try appendJoinedSentineledZ(allocator, owned_z, "/ENTRY:", entry_sym, "");
+        }
+    }
+    for (options.lib_dirs) |dir_p| {
+        if (dir_p.len == 0) continue;
+        try appendJoinedSentineledZ(allocator, owned_z, "/LIBPATH:", dir_p, "");
+    }
+    for (options.object_paths) |obj_p| try appendSentineledZ(allocator, owned_z, obj_p);
+    for (generated_implibs) |imp_p| try appendSentineledZ(allocator, owned_z, imp_p);
+    for (options.extra_libs) |lib_item| {
+        if (lib_item.len == 0 or std.mem.endsWith(u8, lib_item, ".def")) continue;
+        if (isDirectLibraryPathArg(lib_item)) {
+            try appendSentineledZ(allocator, owned_z, lib_item);
+        } else {
+            try appendJoinedSentineledZ(allocator, owned_z, "-defaultlib:", lib_item, ".lib");
+        }
+    }
+    try appendJoinedSentineledZ(allocator, owned_z, "/OUT:", staged_output_path, "");
 }
 
 /// Appends a duplicated string argument to `argv`.
@@ -1360,17 +1408,23 @@ fn appendOwnedArg(
     argv: *std.ArrayListUnmanaged([]u8),
     raw_arg: []const u8,
 ) !void {
-    try argv.append(allocator, try allocator.dupe(u8, raw_arg));
+    const owned_copy = try allocator.dupe(u8, raw_arg);
+    errdefer allocator.free(owned_copy);
+    try argv.append(allocator, owned_copy);
 }
 
-/// Appends a formatted string argument to `argv`.
-fn appendFmtArg(
+/// Appends `prefix ++ suffix` as a newly allocated string argument to `argv`.
+fn appendPrefixedArg(
     allocator: std.mem.Allocator,
     argv: *std.ArrayListUnmanaged([]u8),
-    comptime fmt_str: []const u8,
-    args: anytype,
+    prefix: []const u8,
+    suffix: []const u8,
 ) !void {
-    try argv.append(allocator, try std.fmt.allocPrint(allocator, fmt_str, args));
+    const combined = try allocator.alloc(u8, prefix.len + suffix.len);
+    @memcpy(combined[0..prefix.len], prefix);
+    @memcpy(combined[prefix.len..], suffix);
+    errdefer allocator.free(combined);
+    try argv.append(allocator, combined);
 }
 
 /// Invokes embedded `lld` (`cx_llvm_link_with_lld`) directly for `wasm32-unknown-freestanding` or `-nostdlib` links.
@@ -1398,42 +1452,13 @@ fn tryLinkWithEmbeddedLld(
         for (owned_z.items) |z_s| allocator.free(z_s);
         owned_z.deinit(allocator);
     }
-    const pushZ = struct {
-        /// Appends a NUL-terminated argument into `list`.
-        fn add(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged([:0]u8), val: []const u8) !void {
-            try list.append(alloc, try dupeSentineledZ(alloc, val));
-        }
-    }.add;
 
     switch (flavor) {
         .wasm => {
             try populateEmbeddedWasmLldArgs(allocator, &owned_z, staged_output_path, options);
         },
         .coff => {
-            try pushZ(allocator, &owned_z, if (options.target.arch == .aarch64) "/MACHINE:ARM64" else "/MACHINE:X64");
-            try pushZ(allocator, &owned_z, if (options.artifact_kind == .shared_library) "/DLL" else "/SUBSYSTEM:CONSOLE");
-            try pushZ(allocator, &owned_z, "/OPT:REF");
-            try pushZ(allocator, &owned_z, "/OPT:ICF");
-            try pushZ(allocator, &owned_z, "/BREPRO");
-            if (options.entry_symbol) |entry_sym| {
-                const e_flag = try std.fmt.allocPrint(allocator, "/ENTRY:{s}", .{entry_sym});
-                defer allocator.free(e_flag);
-                try pushZ(allocator, &owned_z, e_flag);
-            }
-            for (options.lib_dirs) |dir_p| {
-                const lp_flag = try std.fmt.allocPrint(allocator, "/LIBPATH:{s}", .{dir_p});
-                defer allocator.free(lp_flag);
-                try pushZ(allocator, &owned_z, lp_flag);
-            }
-            for (options.object_paths) |obj_p| try pushZ(allocator, &owned_z, obj_p);
-            for (generated_implibs) |imp_p| try pushZ(allocator, &owned_z, imp_p);
-            for (options.extra_libs) |lib_item| {
-                if (lib_item.len == 0 or std.mem.endsWith(u8, lib_item, ".def")) continue;
-                try pushZ(allocator, &owned_z, lib_item);
-            }
-            const out_flag = try std.fmt.allocPrint(allocator, "/OUT:{s}", .{staged_output_path});
-            defer allocator.free(out_flag);
-            try pushZ(allocator, &owned_z, out_flag);
+            try populateEmbeddedCoffLldArgs(allocator, &owned_z, staged_output_path, generated_implibs, options);
         },
         .macho, .elf => return false,
     }
@@ -1452,8 +1477,12 @@ fn tryLinkWithEmbeddedLld(
     );
     if (status != c_llvm_link_bridge.CX_LLVM_OK) {
         if (options.diagnostic_sink) |sink| {
-            const err_len = std.mem.indexOfScalar(u8, &err_buf, 0) orelse err_buf.len;
-            codegen_abi.emitLinkerFailureDiagnostic(sink, Span.ZERO, @intCast(@max(status, 1)), err_buf[0..err_len]) catch {};
+            codegen_abi.emitLinkerFailureDiagnostic(
+                sink,
+                Span.ZERO,
+                @intCast(@max(status, 1)),
+                std.mem.sliceTo(&err_buf, 0),
+            ) catch {};
         }
         return error.LinkerFailed;
     }
@@ -1527,9 +1556,11 @@ pub fn writeDeterministicArchive(
 
     // [1] Delegate to `cx_llvm_write_archive` when `-Dllvm-prefix` static C++20 bridge is active:
     if (build_options.has_llvm_cpp_bridge) {
-        const seq_id = next_link_scratch_seq.fetchAdd(1, .monotonic);
-        const staged_path = std.fmt.allocPrint(allocator, "{s}.ar_stage.{d}", .{ output_path, seq_id }) catch
-            return error.OutOfMemory;
+        const staged_path = std.fmt.allocPrint(
+            allocator,
+            "{s}.ar_stage.{d}",
+            .{ output_path, next_link_scratch_seq.fetchAdd(1, .monotonic) },
+        ) catch return error.OutOfMemory;
         defer allocator.free(staged_path);
         defer std.Io.Dir.cwd().deleteFile(io, staged_path) catch {};
 
@@ -1640,16 +1671,15 @@ pub fn parseModuleDef(
         if (trimmed.len == 0) continue;
 
         var pos: usize = 0;
-        const first_tok = nextDefToken(trimmed, &pos) orelse continue;
+        const first_tok = extractNextDefToken(trimmed, &pos) orelse continue;
 
         var lower_buf: [32]u8 = undefined;
         if (std.ascii.eqlIgnoreCase(first_tok, "LIBRARY") or std.ascii.eqlIgnoreCase(first_tok, "NAME")) {
             is_in_exports = false;
-            if (nextDefToken(trimmed, &pos)) |raw_lib_tok| {
+            if (extractNextDefToken(trimmed, &pos)) |raw_lib_tok| {
                 if (raw_lib_tok.len == 0) return error.InvalidModuleDef;
                 if (dll_name_owned) |prev| allocator.free(prev);
-                const has_ext = std.mem.indexOfScalar(u8, raw_lib_tok, '.') != null;
-                dll_name_owned = if (has_ext)
+                dll_name_owned = if (std.mem.indexOfScalar(u8, raw_lib_tok, '.') != null)
                     allocator.dupe(u8, raw_lib_tok) catch return error.OutOfMemory
                 else
                     std.fmt.allocPrint(allocator, "{s}.dll", .{raw_lib_tok}) catch return error.OutOfMemory;
@@ -1667,8 +1697,10 @@ pub fn parseModuleDef(
 
         if (!is_in_exports) continue;
 
-        const sym_tok = nextDefToken(trimmed, &pos) orelse continue;
-        if (sym_tok.len == 0 or std.mem.eql(u8, sym_tok, "=")) return error.InvalidModuleDef;
+        const sym_tok = extractNextDefToken(trimmed, &pos) orelse continue;
+        if (sym_tok.len == 0 or std.mem.eql(u8, sym_tok, "=") or std.mem.eql(u8, sym_tok, "==")) {
+            return error.InvalidModuleDef;
+        }
 
         var exp_entry: ModuleDefExport = .{
             .sym_name = allocator.dupe(u8, sym_tok) catch return error.OutOfMemory,
@@ -1678,17 +1710,30 @@ pub fn parseModuleDef(
             if (exp_entry.ext_name) |ext_s| allocator.free(ext_s);
         }
 
-        while (nextDefToken(trimmed, &pos)) |tok| {
-            if (std.mem.eql(u8, tok, "=")) {
-                const target_tok = nextDefToken(trimmed, &pos) orelse return error.InvalidModuleDef;
-                if (target_tok.len == 0) return error.InvalidModuleDef;
+        while (extractNextDefToken(trimmed, &pos)) |attr_tok| {
+            if (std.mem.eql(u8, attr_tok, "=")) {
+                const internal_tok = extractNextDefToken(trimmed, &pos) orelse return error.InvalidModuleDef;
+                if (internal_tok.len == 0 or
+                    std.mem.eql(u8, internal_tok, "=") or
+                    std.mem.eql(u8, internal_tok, "=="))
+                {
+                    return error.InvalidModuleDef;
+                }
+            } else if (std.mem.eql(u8, attr_tok, "==")) {
+                const export_as_tok = extractNextDefToken(trimmed, &pos) orelse return error.InvalidModuleDef;
+                if (export_as_tok.len == 0 or
+                    std.mem.eql(u8, export_as_tok, "=") or
+                    std.mem.eql(u8, export_as_tok, "=="))
+                {
+                    return error.InvalidModuleDef;
+                }
                 if (exp_entry.ext_name) |prev_ext| allocator.free(prev_ext);
-                exp_entry.ext_name = allocator.dupe(u8, target_tok) catch return error.OutOfMemory;
-            } else if (tok[0] == '@' and tok.len > 1) {
-                const parsed_ord = std.fmt.parseUnsigned(u16, tok[1..], 10) catch return error.InvalidModuleDef;
+                exp_entry.ext_name = allocator.dupe(u8, export_as_tok) catch return error.OutOfMemory;
+            } else if (attr_tok[0] == '@' and attr_tok.len > 1) {
+                const parsed_ord = std.fmt.parseUnsigned(u16, attr_tok[1..], 10) catch return error.InvalidModuleDef;
                 if (parsed_ord == 0) return error.InvalidModuleDef;
                 exp_entry.ordinal = parsed_ord;
-            } else if (if (toLowerBounded(&lower_buf, tok)) |lower_kw| DEF_EXPORT_ATTR_MAP.get(lower_kw) else null) |attr_kw| {
+            } else if (if (toLowerBounded(&lower_buf, attr_tok)) |lower_kw| DEF_EXPORT_ATTR_MAP.get(lower_kw) else null) |attr_kw| {
                 switch (attr_kw) {
                     .noname => exp_entry.is_noname = true,
                     .data => exp_entry.is_data = true,
@@ -1828,9 +1873,11 @@ pub fn writeCoffShortImportLibrary(
     machine: CoffMachine,
 ) LinkError!void {
     if (build_options.has_llvm_cpp_bridge) {
-        const seq_id = next_link_scratch_seq.fetchAdd(1, .monotonic);
-        const staged_path = std.fmt.allocPrint(allocator, "{s}.imp_stage.{d}", .{ output_lib_path, seq_id }) catch
-            return error.OutOfMemory;
+        const staged_path = std.fmt.allocPrint(
+            allocator,
+            "{s}.imp_stage.{d}",
+            .{ output_lib_path, next_link_scratch_seq.fetchAdd(1, .monotonic) },
+        ) catch return error.OutOfMemory;
         defer allocator.free(staged_path);
         defer std.Io.Dir.cwd().deleteFile(io, staged_path) catch {};
 
@@ -1892,21 +1939,18 @@ pub fn buildZigCcLinkArgs(
         if (if (options.entry_symbol) |entry_sym| entry_sym.len == 0 else true) {
             try appendOwnedArg(allocator, &argv, "-Wl,--no-entry");
         }
-        try appendOwnedArg(allocator, &argv, "-Wl,--export-dynamic");
         try appendOwnedArg(allocator, &argv, "-Wl,--gc-sections");
-        if (options.is_release_mode and !options.has_dwarf_tables) {
-            try appendOwnedArg(allocator, &argv, "-Wl,--strip-all");
-        }
-        try appendOwnedArg(allocator, &argv, "-Wl,-z,stack-size=8192");
-        try appendOwnedArg(allocator, &argv, "-Wl,--initial-memory=65536");
         if (options.is_release_mode) {
+            if (!options.has_dwarf_tables) {
+                try appendOwnedArg(allocator, &argv, "-Wl,--strip-all");
+            }
             try appendOwnedArg(allocator, &argv, "-Oz");
         }
+        try appendOwnedArg(allocator, &argv, "-Wl,-z,stack-size=8192");
     } else if (options.target.os == .wasi) {
         if (options.is_nostdlib) try appendOwnedArg(allocator, &argv, "-nostdlib");
         if (options.artifact_kind == .shared_library) {
             try appendOwnedArg(allocator, &argv, "-Wl,--no-entry");
-            try appendOwnedArg(allocator, &argv, "-Wl,--export-dynamic");
         }
         try appendOwnedArg(allocator, &argv, "-Wl,--gc-sections");
         if (options.is_release_mode) {
@@ -1945,14 +1989,14 @@ pub fn buildZigCcLinkArgs(
 
     if (options.entry_symbol) |entry_sym| {
         if (entry_sym.len > 0) {
-            try appendFmtArg(allocator, &argv, "-Wl,-e,{s}", .{entry_sym});
+            try appendPrefixedArg(allocator, &argv, "-Wl,-e,", entry_sym);
         }
     }
 
     // [2] Library search paths, input objects, synthesized `.lib` imports, and `-l<lib>` flags:
     for (options.lib_dirs) |dir_path| {
         if (dir_path.len > 0) {
-            try appendFmtArg(allocator, &argv, "-L{s}", .{dir_path});
+            try appendPrefixedArg(allocator, &argv, "-L", dir_path);
         }
     }
     for (options.object_paths) |obj_path| {
@@ -1966,7 +2010,7 @@ pub fn buildZigCcLinkArgs(
         if (isDirectLibraryPathArg(lib_item)) {
             try appendOwnedArg(allocator, &argv, lib_item);
         } else {
-            try appendFmtArg(allocator, &argv, "-l{s}", .{lib_item});
+            try appendPrefixedArg(allocator, &argv, "-l", lib_item);
         }
     }
 
@@ -1991,11 +2035,15 @@ pub fn linkCrossTarget(
         );
     }
 
-    const seq_id = next_link_scratch_seq.fetchAdd(1, .monotonic);
-    const proc_salt = @intFromPtr(&next_link_scratch_seq) ^ (@intFromPtr(&seq_id) >> 4) ^
-        @as(usize, @truncate(std.hash.Wyhash.hash(0, options.output_path)));
-    const scratch_dir = std.fmt.allocPrint(allocator, ".zig-cache/cx_link_{x}_{d}", .{ proc_salt, seq_id }) catch
-        return error.OutOfMemory;
+    const scratch_dir = std.fmt.allocPrint(
+        allocator,
+        ".zig-cache/cx_link_{x}_{d}",
+        .{
+            @intFromPtr(&next_link_scratch_seq) ^
+                @as(usize, @truncate(std.hash.Wyhash.hash(0, options.output_path))),
+            next_link_scratch_seq.fetchAdd(1, .monotonic),
+        },
+    ) catch return error.OutOfMemory;
     defer allocator.free(scratch_dir);
     defer std.Io.Dir.cwd().deleteTree(io, scratch_dir) catch {};
     std.Io.Dir.cwd().createDirPath(io, scratch_dir) catch return error.ArchiveWriteFailed;
@@ -2118,7 +2166,7 @@ comptime {
     std.debug.assert(@sizeOf(CoffShortImportHeader) == 20 and @alignOf(CoffShortImportHeader) == 4);
 }
 
-test "codegen_link. deterministic archive writer across K_GNU, K_BSD, and K_COFF" {
+test "test_codegen_link_deterministic_archives_gnu_bsd_and_coff" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -2179,7 +2227,7 @@ test "codegen_link. deterministic archive writer across K_GNU, K_BSD, and K_COFF
     }
 }
 
-test "codegen_link. COFF .def parser & Short-Import .lib cross-link across x86_64-msvc, x86_64-gnu, and aarch64-msvc" {
+test "test_codegen_link_coff_def_aliases_and_short_import_cross_link" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -2189,7 +2237,8 @@ test "codegen_link. COFF .def parser & Short-Import .lib cross-link across x86_6
         \\EXPORTS
         \\    ExitProcess
         \\    GetCurrentProcessId @12
-        \\    CxTickAlias = GetTickCount64
+        \\    CxTickAlias = InternalTickImpl
+        \\    CxExportRename == GetTickCount64
         \\    ExportedGlobalCounter DATA
         \\    HiddenInternalHelper PRIVATE
     ;
@@ -2197,11 +2246,14 @@ test "codegen_link. COFF .def parser & Short-Import .lib cross-link across x86_6
     var parsed = try parseModuleDef(allocator, def_text, "fallback");
     defer parsed.deinit(allocator);
     try std.testing.expectEqualStrings("kernel32.dll", parsed.dll_name);
-    try std.testing.expectEqual(@as(usize, 5), parsed.exports.len);
+    try std.testing.expectEqual(@as(usize, 6), parsed.exports.len);
     try std.testing.expectEqual(@as(u16, 12), parsed.exports[1].ordinal.?);
-    try std.testing.expectEqualStrings("GetTickCount64", parsed.exports[2].ext_name.?);
-    try std.testing.expect(parsed.exports[3].is_data);
-    try std.testing.expect(parsed.exports[4].is_private);
+    try std.testing.expectEqualStrings("CxTickAlias", parsed.exports[2].sym_name);
+    try std.testing.expect(parsed.exports[2].ext_name == null);
+    try std.testing.expectEqualStrings("CxExportRename", parsed.exports[3].sym_name);
+    try std.testing.expectEqualStrings("GetTickCount64", parsed.exports[3].ext_name.?);
+    try std.testing.expect(parsed.exports[4].is_data);
+    try std.testing.expect(parsed.exports[5].is_private);
 
     const test_dir = ".zig-cache/test_codegen_link_coff";
     defer std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
@@ -2274,7 +2326,7 @@ test "codegen_link. COFF .def parser & Short-Import .lib cross-link across x86_6
     }
 }
 
-test "codegen_link. 11-target argument matrix & < 10 KB wasm32-unknown-freestanding release link" {
+test "test_codegen_link_target_arg_matrix_and_freestanding_wasm_size" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -2368,7 +2420,50 @@ test "codegen_link. 11-target argument matrix & < 10 KB wasm32-unknown-freestand
     try std.testing.expectEqualSlices(u8, "\x00asm\x01\x00\x00\x00", wasm_bytes[0..8]);
 }
 
-test "codegen_link R-1. sim_seam ReapOutcome orphan preservation, ABA protection, and barrier error/EOF guards" {
+/// Deterministic mock reactor world exercising EOF, error, and terminal CQE reaping.
+const MockWorld = struct {
+    /// Fault-injection mode (`0 = EOF`, `1 = (size_t)-1`, `2 = emit CQE`).
+    mode: u8 = 0,
+    /// Synthetic terminal CQE delivered in mode `2`.
+    cqe_to_emit: sim_seam.ReactorCqe = .{},
+    /// Captured orphan file descriptor from `onOrphan`.
+    reaped_fd: i32 = -1,
+    /// Captured orphan DMA buffer pool ID from `onOrphan`.
+    reaped_pool: u32 = 0,
+    /// Captured orphan cleanup action from `onOrphan`.
+    reaped_action: sim_seam.ReaperAction = .none,
+    /// Invocation count of `pollOrPark`.
+    poll_calls: u32 = 0,
+
+    /// Deterministic mock `poll_or_park` hook testing EOF, error, and terminal CQE delivery.
+    fn pollOrPark(
+        raw_ctx: *sim_seam.ReactorCtx,
+        cqes_out: [*]sim_seam.ReactorCqe,
+        cap: usize,
+        _: bool,
+    ) callconv(.c) usize {
+        const world: *@This() = @ptrCast(@alignCast(raw_ctx));
+        world.poll_calls += 1;
+        if (world.mode == 0) {
+            return 0;
+        } else if (world.mode == 1) {
+            return std.math.maxInt(usize);
+        }
+        std.debug.assert(cap >= 1);
+        cqes_out[0] = world.cqe_to_emit;
+        return 1;
+    }
+
+    /// Captures orphaned resource metadata reported during `drainQuarantinedBarrier`.
+    fn onOrphan(raw_ctx: *sim_seam.ReactorCtx, outcome: sim_seam.ReapOutcome) callconv(.c) void {
+        const world: *@This() = @ptrCast(@alignCast(raw_ctx));
+        world.reaped_fd = outcome.orphan_fd;
+        world.reaped_pool = outcome.orphan_buf.owned_pool_id;
+        world.reaped_action = outcome.orphan_action;
+    }
+};
+
+test "test_codegen_link_sim_seam_reaper_aba_and_orphan_barrier" {
     var slots: [4]sim_seam.InFlightOpSlot = @splat(.{});
     var reaper = sim_seam.CompletionReaper.init(&slots);
 
@@ -2413,48 +2508,6 @@ test "codegen_link R-1. sim_seam ReapOutcome orphan preservation, ABA protection
     try std.testing.expectEqual(@as(u32, 1), reaper.quarantined_count);
 
     // [3] Verify `drainQuarantinedBarrier` breaks immediately on `0` (EOF) and `maxInt(usize)` (`(size_t)-1` error):
-    const MockWorld = struct {
-        /// Fault-injection mode (`0 = EOF`, `1 = (size_t)-1`, `2 = emit CQE`).
-        mode: u8 = 0,
-        /// Synthetic terminal CQE delivered in mode `2`.
-        cqe_to_emit: sim_seam.ReactorCqe = .{},
-        /// Captured orphan file descriptor from `onOrphan`.
-        reaped_fd: i32 = -1,
-        /// Captured orphan DMA buffer pool ID from `onOrphan`.
-        reaped_pool: u32 = 0,
-        /// Captured orphan cleanup action from `onOrphan`.
-        reaped_action: sim_seam.ReaperAction = .none,
-        /// Invocation count of `pollOrPark`.
-        poll_calls: u32 = 0,
-
-        /// Deterministic mock `poll_or_park` hook testing EOF, error, and terminal CQE delivery.
-        fn pollOrPark(
-            raw_ctx: *sim_seam.ReactorCtx,
-            cqes_out: [*]sim_seam.ReactorCqe,
-            cap: usize,
-            _: bool,
-        ) callconv(.c) usize {
-            const world: *@This() = @ptrCast(@alignCast(raw_ctx));
-            world.poll_calls += 1;
-            if (world.mode == 0) {
-                return 0;
-            } else if (world.mode == 1) {
-                return std.math.maxInt(usize);
-            }
-            std.debug.assert(cap >= 1);
-            cqes_out[0] = world.cqe_to_emit;
-            return 1;
-        }
-
-        /// Captures orphaned resource metadata reported during `drainQuarantinedBarrier`.
-        fn onOrphan(raw_ctx: *sim_seam.ReactorCtx, outcome: sim_seam.ReapOutcome) callconv(.c) void {
-            const world: *@This() = @ptrCast(@alignCast(raw_ctx));
-            world.reaped_fd = outcome.orphan_fd;
-            world.reaped_pool = outcome.orphan_buf.owned_pool_id;
-            world.reaped_action = outcome.orphan_action;
-        }
-    };
-
     var world: MockWorld = .{
         .mode = 0,
         .cqe_to_emit = .{ .user_data = key0_gen1.asU64(), .result = -125 },
@@ -2479,7 +2532,7 @@ test "codegen_link R-1. sim_seam ReapOutcome orphan preservation, ABA protection
     try std.testing.expectEqual(sim_seam.ReaperAction.release_buf_and_close_fd, world.reaped_action);
 }
 
-test "codegen_link R-1. serializeDarwinBsdArchive 3 odd-sized Mach-O members 8-byte aligned & uncorrupted" {
+test "test_codegen_link_darwin_bsd_archive_eight_byte_alignment" {
     const allocator = std.testing.allocator;
 
     // Construct 3 synthetic Mach-O member payloads with odd/unaligned lengths (`37`, `51`, `29` bytes):
@@ -2542,19 +2595,20 @@ test "codegen_link R-1. serializeDarwinBsdArchive 3 odd-sized Mach-O members 8-b
     try std.testing.expectEqual(ar_bytes.len, cursor);
 }
 
-test "codegen_link R-1. inline EXPORTS, NONAME alias Short-Import, overflow guards, and embedded wasm-ld flags" {
+test "test_codegen_link_inline_exports_noname_and_embedded_lld_flags" {
     const allocator = std.testing.allocator;
 
-    // [1] `[MINOR-02]` & `[MAJOR-05]`; inline `EXPORTS EXP @1`, `EXPORTS "QuotedSym" @2`, and `Alias = Target @12 NONAME`:
+    // [1] Inline `EXPORTS EXP @1`, `EXPORTS "QuotedSym" @2`, `=` internal alias, and `==` DLL export rename:
     const def_src =
         \\LIBRARY "custom.dll"
         \\EXPORTS EXP @1
         \\EXPORTS "QuotedSym" @2
-        \\    InternalAlias = TargetFn @12 NONAME
+        \\    InternalAlias = LocalImpl == TargetFn @12 NONAME
+        \\    RenamedImport == RealDllExport
     ;
     var parsed = try parseModuleDef(allocator, def_src, "fallback");
     defer parsed.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 3), parsed.exports.len);
+    try std.testing.expectEqual(@as(usize, 4), parsed.exports.len);
     try std.testing.expectEqualStrings("EXP", parsed.exports[0].sym_name);
     try std.testing.expectEqual(@as(u16, 1), parsed.exports[0].ordinal.?);
     try std.testing.expectEqualStrings("QuotedSym", parsed.exports[1].sym_name);
@@ -2562,6 +2616,8 @@ test "codegen_link R-1. inline EXPORTS, NONAME alias Short-Import, overflow guar
     try std.testing.expectEqualStrings("InternalAlias", parsed.exports[2].sym_name);
     try std.testing.expectEqualStrings("TargetFn", parsed.exports[2].ext_name.?);
     try std.testing.expect(parsed.exports[2].is_noname);
+    try std.testing.expectEqualStrings("RenamedImport", parsed.exports[3].sym_name);
+    try std.testing.expectEqualStrings("RealDllExport", parsed.exports[3].ext_name.?);
 
     const noname_member = try buildCoffShortImportMember(allocator, "custom.dll", parsed.exports[2], .amd64);
     defer allocator.free(noname_member);
@@ -2571,7 +2627,12 @@ test "codegen_link R-1. inline EXPORTS, NONAME alias Short-Import, overflow guar
     const type_info = std.mem.readInt(u16, noname_member[18..20], .little);
     try std.testing.expectEqual(COFF_IMPORT_NAME_ORDINAL, (type_info >> 2) & 0x07);
 
-    // [2] `[MINOR-01]` & `[MINOR-03]`; embedded `wasm-ld` flags honor `entry_symbol`, `has_dwarf_tables`, and `extra_libs`:
+    const exportas_member = try buildCoffShortImportMember(allocator, "custom.dll", parsed.exports[3], .amd64);
+    defer allocator.free(exportas_member);
+    const exportas_type_info = std.mem.readInt(u16, exportas_member[18..20], .little);
+    try std.testing.expectEqual(COFF_IMPORT_NAME_EXPORTAS, (exportas_type_info >> 2) & 0x07);
+
+    // [2] Embedded `wasm-ld` and `lld-link` flags honor `entry_symbol`, `--icf=safe`, and `-defaultlib:<stem>.lib`:
     var wasm_args: std.ArrayListUnmanaged([:0]u8) = .empty;
     defer {
         for (wasm_args.items) |z_arg| allocator.free(z_arg);
@@ -2588,6 +2649,9 @@ test "codegen_link R-1. inline EXPORTS, NONAME alias Short-Import, overflow guar
     });
     var has_entry = false;
     var has_strip = false;
+    var has_icf_safe = false;
+    var has_initial_mem = false;
+    var has_export_dyn = false;
     var has_lib_m = false;
     var has_vendor_a = false;
     for (wasm_args.items) |z_arg| {
@@ -2595,11 +2659,41 @@ test "codegen_link R-1. inline EXPORTS, NONAME alias Short-Import, overflow guar
             has_entry = true;
         } else if (std.mem.eql(u8, z_arg, "--strip-all")) {
             has_strip = true;
+        } else if (std.mem.eql(u8, z_arg, "--icf=safe")) {
+            has_icf_safe = true;
+        } else if (std.mem.startsWith(u8, z_arg, "--initial-memory")) {
+            has_initial_mem = true;
+        } else if (std.mem.eql(u8, z_arg, "--export-dynamic")) {
+            has_export_dyn = true;
         } else if (std.mem.eql(u8, z_arg, "-lm")) {
             has_lib_m = true;
         } else if (std.mem.eql(u8, z_arg, "vendor.a")) {
             has_vendor_a = true;
         }
     }
-    try std.testing.expect(has_entry and !has_strip and has_lib_m and has_vendor_a);
+    try std.testing.expect(
+        has_entry and !has_strip and has_icf_safe and !has_initial_mem and !has_export_dyn and has_lib_m and has_vendor_a,
+    );
+
+    var coff_args: std.ArrayListUnmanaged([:0]u8) = .empty;
+    defer {
+        for (coff_args.items) |z_arg| allocator.free(z_arg);
+        coff_args.deinit(allocator);
+    }
+    try populateEmbeddedCoffLldArgs(allocator, &coff_args, "app.exe", &.{"synth.lib"}, .{
+        .target = TargetSpec.X86_64_WINDOWS_MSVC,
+        .object_paths = &.{"main.obj"},
+        .output_path = "app.exe",
+        .extra_libs = &.{ "kernel32", "vendor.lib" },
+    });
+    var has_defaultlib_k32 = false;
+    var has_vendor_lib = false;
+    for (coff_args.items) |z_arg| {
+        if (std.mem.eql(u8, z_arg, "-defaultlib:kernel32.lib")) {
+            has_defaultlib_k32 = true;
+        } else if (std.mem.eql(u8, z_arg, "vendor.lib")) {
+            has_vendor_lib = true;
+        }
+    }
+    try std.testing.expect(has_defaultlib_k32 and has_vendor_lib);
 }

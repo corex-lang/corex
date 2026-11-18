@@ -50,6 +50,47 @@ const TargetHeaderSpec = struct {
     format: ExpectedBinaryFormat,
 };
 
+/// Mock `SimWorld` barrier state verifying `CompletionReaper.drainQuarantinedBarrier` callbacks.
+const SimBarrierState = struct {
+    /// Pending CQE delivered on poll.
+    pending_cqe: sim_seam.ReactorCqe,
+    /// Number of `cancel_io` notifications observed.
+    cancel_calls: u32 = 0,
+    /// Captured orphaned descriptor from `onOrphanReaped`.
+    orphan_fd: i32 = -1,
+    /// Captured orphaned pool ID from `onOrphanReaped`.
+    orphan_pool_id: u32 = 0,
+    /// Captured orphaned cleanup action from `onOrphanReaped`.
+    orphan_action: sim_seam.ReaperAction = .none,
+
+    /// Records `cancel_io` invocations from `CompletionReaper.requestCancel`.
+    fn onCancelIo(raw_ctx: *sim_seam.ReactorCtx, _: u32, _: u16) callconv(.c) void {
+        const state_ptr: *@This() = @ptrCast(@alignCast(raw_ctx));
+        state_ptr.cancel_calls += 1;
+    }
+
+    /// Emits the terminal cancelled CQE into `cqes_out[0]`.
+    fn onPollOrPark(
+        raw_ctx: *sim_seam.ReactorCtx,
+        cqes_out: [*]sim_seam.ReactorCqe,
+        cap: usize,
+        _: bool,
+    ) callconv(.c) usize {
+        const state_ptr: *@This() = @ptrCast(@alignCast(raw_ctx));
+        std.debug.assert(cap >= 1);
+        cqes_out[0] = state_ptr.pending_cqe;
+        return 1;
+    }
+
+    /// Captures `ReapOutcome` orphan delivery during `drainQuarantinedBarrier`.
+    fn onOrphanReaped(raw_ctx: *sim_seam.ReactorCtx, outcome: sim_seam.ReapOutcome) callconv(.c) void {
+        const state_ptr: *@This() = @ptrCast(@alignCast(raw_ctx));
+        state_ptr.orphan_fd = outcome.orphan_fd;
+        state_ptr.orphan_pool_id = outcome.orphan_buf.owned_pool_id;
+        state_ptr.orphan_action = outcome.orphan_action;
+    }
+};
+
 // --------------------------------------- CONSTS ----------------------------------------
 
 /// Hard `< 10 KB` (`10,240` bytes) size ceiling for `--release` `wasm32-unknown-freestanding` modules.
@@ -112,10 +153,15 @@ fn verifyObjectMagicHeader(obj_bytes: []const u8, expected_format: ExpectedBinar
     }
 }
 
-/// Checks whether `sink` contains at least one diagnostic matching `expected_code`.
+/// Checks whether `sink` contains a well-formed diagnostic matching `expected_code` with a valid span and labels/notes.
 fn hasSinkDiagnostic(sink: *const DiagnosticSink, expected_code: DiagnosticCode) bool {
     for (sink.diagnostics.items) |diag_item| {
-        if (diag_item.code == expected_code) return true;
+        if (diag_item.code == expected_code) {
+            std.debug.assert(diag_item.message.len > 0);
+            std.debug.assert(diag_item.primary_span.end_byte >= diag_item.primary_span.start_byte);
+            std.debug.assert(diag_item.labels.len > 0 or diag_item.notes.len > 0 or diag_item.suggestions.len > 0);
+            return true;
+        }
     }
     return false;
 }
@@ -132,16 +178,14 @@ fn hasCompiledDiagnosticCode(
     const file_id = FileId.fromInt(0);
     _ = try db.setInput(file_id, source, .low);
 
-    const parsed = try db.parseCst(file_id);
-    if (hasSinkDiagnostic(&parsed.diagnostics, expected_code)) return true;
+    if (hasSinkDiagnostic(&(try db.parseCst(file_id)).diagnostics, expected_code)) return true;
 
     _ = try db.resolveSignatures(file_id);
     if (db.getSignatureDiagnostics(file_id)) |sig_sink| {
         if (hasSinkDiagnostic(sig_sink, expected_code)) return true;
     }
 
-    const items = (try db.extractItemTree(file_id)).entries;
-    for (items) |entry| {
+    for ((try db.extractItemTree(file_id)).entries) |entry| {
         _ = try db.typecheckBody(entry.def_id);
         if (db.getBodyDiagnostics(entry.def_id)) |body_sink| {
             if (hasSinkDiagnostic(body_sink, expected_code)) return true;
@@ -589,12 +633,12 @@ test "test_phase8_translate_c_c_import_bitfields_and_live_native_c_ffi_roundtrip
         "    let start_pair = CPointPair { x_coord: 5, y_coord: 4 };\n" ++
         "    let out_pair: CPointPair = unsafe { c_transform_pair(start_pair, 3) };\n" ++
         "    let small_delta: i8 = -2;\n" ++
-        "    let flag_ok: bool = true;\n" ++
+        "    let is_flag_ok: bool = true;\n" ++
         "    let half_ratio: f32 = 3.5_f32;\n" ++
         "    let nul_tag: [u8; 7] = [b'c', b'x', b'-', b'f', b'f', b'i', 0_u8];\n" ++
         "    let tag_cstr = CStr { ptr: &raw nul_tag[0] };\n" ++
         "    let var_sum: i32 = unsafe {\n" ++
-        "        c_variadic_digest(5, small_delta, flag_ok, half_ratio, WireMode.Active, tag_cstr.ptr)\n" ++
+        "        c_variadic_digest(5, small_delta, is_flag_ok, half_ratio, WireMode.Active, tag_cstr.ptr)\n" ++
         "    };\n" ++
         "    let reply_ptr: *u8 = unsafe { c_echo_greeting(&raw nul_tag[0]) };\n" ++
         "    let reply_cstr = CStr { ptr: reply_ptr };\n" ++
@@ -867,9 +911,9 @@ test "test_phase8_four_tier_async_await_frame_pinned_task_group_cancel_and_conte
     try std.testing.expectEqual(@as(i64, 42), report_ctx.outcomes[0].return_scalar_i64);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 302, 301 }, report_ctx.outcomes[0].drop_trace);
 
-    // [3] Stage 4 R-4B 4-tier regression; `@align(64)` `&blk` and `FmtArgs` across `yield_now().await`, generic
+    // [3] 4-tier regression; `@align(64)` `&blk` and `FmtArgs` across `yield_now().await`, generic
     //     `async fn` `@size_of[T]()`, and indirect `async fn` pointers sharing the same `i32` return type:
-    const r4b_regression_src =
+    const aligned_async_src =
         "@align(64)\n" ++
         "pub struct AlignedBlock64 {\n" ++
         "    pub lanes: [u64; 8],\n" ++
@@ -911,7 +955,7 @@ test "test_phase8_four_tier_async_await_frame_pinned_task_group_cancel_and_conte
         "pub fn invoke_indirect_sync(fp: async fn(i32) -> i32, arg_val: i32) -> i32 {\n" ++
         "    return cx.async.block_on(own fp(arg_val));\n" ++
         "}\n\n" ++
-        "pub async fn run_r4b_suite() -> i32 {\n" ++
+        "pub async fn run_aligned_async_suite() -> i32 {\n" ++
         "    let aligned_sum: i32 = probe_aligned_across_yield(4_u64).await;\n" ++
         "    let fmt_len: i32 = format_across_yield(0x2a_u32, \"ok\").await;\n" ++
         "    let gen_a: i32 = generic_async_size(7_u16).await;\n" ++
@@ -921,17 +965,17 @@ test "test_phase8_four_tier_async_await_frame_pinned_task_group_cancel_and_conte
         "    return aligned_sum + fmt_len + gen_a + gen_b + gen_c;\n" ++
         "}\n\n" ++
         "pub fn main() -> i32 {\n" ++
-        "    let suite_val: i32 = cx.async.block_on(own run_r4b_suite());\n" ++
+        "    let suite_val: i32 = cx.async.block_on(own run_aligned_async_suite());\n" ++
         "    let indirect_val: i32 = invoke_indirect_sync(target_indirect_add, 8);\n" ++
         "    return suite_val + indirect_val;\n" ++
         "}\n";
 
-    var report_r4b = try runVerifiedFourTierOracle(allocator, io, r4b_regression_src);
-    defer report_r4b.deinit(allocator);
-    try std.testing.expect(report_r4b.is_all_matching);
+    var report_aligned = try runVerifiedFourTierOracle(allocator, io, aligned_async_src);
+    defer report_aligned.deinit(allocator);
+    try std.testing.expect(report_aligned.is_all_matching);
     // Verify expected sum `8 + 9 + 2 + 2 + 8 + 13 == 42`:
-    try std.testing.expectEqual(@as(i64, 42), report_r4b.outcomes[0].return_scalar_i64);
-    try std.testing.expectEqualStrings("v=002a:ok", report_r4b.outcomes[0].stdout_bytes);
+    try std.testing.expectEqual(@as(i64, 42), report_aligned.outcomes[0].return_scalar_i64);
+    try std.testing.expectEqualStrings("v=002a:ok", report_aligned.outcomes[0].stdout_bytes);
 }
 
 // --------------- Pillar 4: Phase 8 Compile-Fail ---------------
@@ -948,8 +992,7 @@ test "test_phase8_compile_fail_all_eight_diagnostics_and_positive_discharge_proo
     for (c_error_headers) |bad_c_src| {
         var c_sink = DiagnosticSink.init(allocator);
         defer c_sink.deinit();
-        const maybe_unit = c_frontend.parseCHeader(allocator, bad_c_src, "bad.h", .none, .{}, &c_sink);
-        if (maybe_unit) |ok_unit| {
+        if (c_frontend.parseCHeader(allocator, bad_c_src, "bad.h", .none, .{}, &c_sink)) |ok_unit| {
             var owned_unit = ok_unit;
             owned_unit.deinit();
         } else |_| {}
@@ -1286,10 +1329,11 @@ test "test_phase8_sim_seam_reaper_quarantine_barrier_and_mir_async_liveness_slot
     try std.testing.expect(reaper.reapCompletion(.{ .user_data = forged_key.asU64(), .result = 32 }) == null);
 
     // Normal completion + release increments slot generation from `0` to `1`:
-    const normal_outcome = reaper.reapCompletion(.{ .user_data = key_gen0.asU64(), .result = 32 }).?;
-    try std.testing.expectEqual(sim_seam.SlotState.completed, normal_outcome.state);
-    const recovered_buf = reaper.releaseCompletedSlot(key_gen0).?;
-    try std.testing.expectEqual(@as(u32, 11), recovered_buf.owned_pool_id);
+    try std.testing.expectEqual(
+        sim_seam.SlotState.completed,
+        reaper.reapCompletion(.{ .user_data = key_gen0.asU64(), .result = 32 }).?.state,
+    );
+    try std.testing.expectEqual(@as(u32, 11), reaper.releaseCompletedSlot(key_gen0).?.owned_pool_id);
     try std.testing.expect(reaper.releaseCompletedSlot(key_gen0) == null);
 
     // Re-submit recycled slot (`generation == 1`), quarantine via `requestCancel`, and drain via barrier:
@@ -1303,46 +1347,6 @@ test "test_phase8_sim_seam_reaper_quarantine_barrier_and_mir_async_liveness_slot
         .release_buf_and_close_fd,
     );
     try std.testing.expect(!reaper.requestCancel(key_gen0, null, null));
-
-    const SimBarrierState = struct {
-        /// Pending CQE delivered on poll.
-        pending_cqe: sim_seam.ReactorCqe,
-        /// Number of `cancel_io` notifications observed.
-        cancel_calls: u32 = 0,
-        /// Captured orphaned descriptor from `onOrphan`.
-        orphan_fd: i32 = -1,
-        /// Captured orphaned pool ID from `onOrphan`.
-        orphan_pool_id: u32 = 0,
-        /// Captured orphaned cleanup action from `onOrphan`.
-        orphan_action: sim_seam.ReaperAction = .none,
-
-        /// Records `cancel_io` invocations from `CompletionReaper.requestCancel`.
-        fn onCancelIo(raw_ctx: *sim_seam.ReactorCtx, _: u32, _: u16) callconv(.c) void {
-            const state_ptr: *@This() = @ptrCast(@alignCast(raw_ctx));
-            state_ptr.cancel_calls += 1;
-        }
-
-        /// Emits the terminal cancelled CQE into `cqes_out[0]`.
-        fn onPollOrPark(
-            raw_ctx: *sim_seam.ReactorCtx,
-            cqes_out: [*]sim_seam.ReactorCqe,
-            cap: usize,
-            _: bool,
-        ) callconv(.c) usize {
-            const state_ptr: *@This() = @ptrCast(@alignCast(raw_ctx));
-            std.debug.assert(cap >= 1);
-            cqes_out[0] = state_ptr.pending_cqe;
-            return 1;
-        }
-
-        /// Captures `ReapOutcome` orphan delivery during `drainQuarantinedBarrier`.
-        fn onOrphanReaped(raw_ctx: *sim_seam.ReactorCtx, outcome: sim_seam.ReapOutcome) callconv(.c) void {
-            const state_ptr: *@This() = @ptrCast(@alignCast(raw_ctx));
-            state_ptr.orphan_fd = outcome.orphan_fd;
-            state_ptr.orphan_pool_id = outcome.orphan_buf.owned_pool_id;
-            state_ptr.orphan_action = outcome.orphan_action;
-        }
-    };
 
     var barrier_state = SimBarrierState{
         .pending_cqe = .{ .user_data = key_gen1.asU64(), .result = -125 },
@@ -1419,4 +1423,244 @@ test "test_phase8_sim_seam_reaper_quarantine_barrier_and_mir_async_liveness_slot
         try std.testing.expect(!body_plan.has_exceeded_inline_cap);
     }
     try std.testing.expect(has_checked_seq_plan);
+}
+
+// ---------- Pillar 6: Phase 8 Hardening Regressions -----------
+
+test "test_phase8_soundness_abi_c1_through_h6_and_nursery_handle_regressions" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const scratch_dir = ".zig-cache/phase8_unit_pillar6";
+    defer std.Io.Dir.cwd().deleteTree(io, scratch_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, scratch_dir);
+
+    // [1] Live C99 + CoreX Tier A / Tier B verification for `C1` (`"".as_ptr()` + `"hello".as_ptr()` NUL-termination)
+    //     and `C2` (`NestedFloatPair` `@repr(C)` struct containing nested `FloatBox` float struct):
+    const host_spec = TargetSpec.host();
+    const zig_exe = try codegen_abi.resolveZigExecutable(io, allocator, null);
+    defer allocator.free(zig_exe);
+
+    const c_helper_src =
+        "#include <stddef.h>\n" ++
+        "typedef struct { float val; } FloatBox;\n" ++
+        "typedef struct { FloatBox first; double second; } NestedFloatPair;\n" ++
+        "size_t cx_test_c_strlen(const char *str_ptr) {\n" ++
+        "    size_t count = 0;\n" ++
+        "    while (str_ptr[count] != '\\0') { count += 1; }\n" ++
+        "    return count;\n" ++
+        "}\n" ++
+        "int cx_test_nested_float_abi(NestedFloatPair pair_in) {\n" ++
+        "    double sum = (double)pair_in.first.val + pair_in.second;\n" ++
+        "    return (int)(sum * 10.0 + 0.5);\n" ++
+        "}\n";
+    const c_src_path = scratch_dir ++ "/c_abi_reg.c";
+    const c_obj_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/c_abi_reg{s}",
+        .{ scratch_dir, host_spec.defaultObjExtension() },
+    );
+    defer allocator.free(c_obj_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = c_src_path, .data = c_helper_src });
+
+    const cc_run = try std.process.run(allocator, io, .{
+        .argv = &.{
+            zig_exe,
+            "cc",
+            "-c",
+            "-std=c99",
+            "-O2",
+            "-target",
+            host_spec.asZigTargetTriple(),
+            c_src_path,
+            "-o",
+            c_obj_path,
+        },
+    });
+    defer allocator.free(cc_run.stdout);
+    defer allocator.free(cc_run.stderr);
+    try std.testing.expect(cc_run.term.success());
+
+    const cx_ffi_reg_src =
+        "@repr(C)\n" ++
+        "pub struct FloatBox { pub val: f32 }\n" ++
+        "@repr(C)\n" ++
+        "pub struct NestedFloatPair { pub first: FloatBox, pub second: f64 }\n" ++
+        "@trusted\n" ++
+        "extern \"C\" {\n" ++
+        "    fn cx_test_c_strlen(@null_terminated str_ptr: *u8) -> usize;\n" ++
+        "    fn cx_test_nested_float_abi(pair_in: NestedFloatPair) -> i32;\n" ++
+        "}\n" ++
+        "pub fn main() -> i32 {\n" ++
+        "    let empty_len: i32 = cx_test_c_strlen(\"\".as_ptr()) as i32;\n" ++
+        "    let hello_len: i32 = cx_test_c_strlen(\"hello\".as_ptr()) as i32;\n" ++
+        "    let pair_score: i32 = cx_test_nested_float_abi(NestedFloatPair {\n" ++
+        "        first: FloatBox { val: 1.5_f32 },\n" ++
+        "        second: 2.2_f64,\n" ++
+        "    });\n" ++
+        "    return empty_len * 100 + hello_len + pair_score;\n" ++
+        "}\n";
+
+    var ffi_db = try CompilerDb.init(allocator);
+    defer ffi_db.deinit();
+    ffi_db.setTargetSpec(host_spec);
+    const ffi_fid = FileId.fromInt(0);
+    _ = try ffi_db.setInput(ffi_fid, cx_ffi_reg_src, .low);
+
+    const reg_backends = [_]CodegenBackend{
+        .{ .tier_a_c99 = .{ .target = host_spec, .is_release_mode = true, .has_line_directives = false } },
+        .{ .tier_b_llvm = .{ .target = host_spec, .is_release_mode = true } },
+    };
+    for (reg_backends, 0..) |backend_cfg, tier_idx| {
+        const exe_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/reg_tier_{d}{s}",
+            .{ scratch_dir, tier_idx, host_spec.executableExtension() },
+        );
+        defer allocator.free(exe_path);
+
+        var sink = DiagnosticSink.init(allocator);
+        defer sink.deinit();
+        var art = try ffi_db.compileModuleArtifact(ffi_fid, backend_cfg, .{
+            .artifact_kind = .executable,
+            .extra_libs = &.{c_obj_path},
+            .output_path = exe_path,
+            .io = io,
+            .diagnostic_sink = &sink,
+        });
+        defer art.deinit(allocator);
+        try std.testing.expect(!sink.hasErrors());
+
+        const run_res = try std.process.run(allocator, io, .{ .argv = &.{exe_path} });
+        defer allocator.free(run_res.stdout);
+        defer allocator.free(run_res.stderr);
+        switch (run_res.term) {
+            .exited => |exit_code| try std.testing.expectEqual(@as(u8, 42), exit_code),
+            else => return error.UnexpectedProcessTermination,
+        }
+    }
+
+    // [2] Structured `TaskHandle` across `.await` (`left.join().await + right.join().await` and `?` sibling cancel):
+    const nursery_handles_src =
+        "pub async fn step_result(val: i32, is_failing: bool) -> i32!i32 {\n" ++
+        "    if not is_failing {\n" ++
+        "        defer { @drop_trace(901); }\n" ++
+        "        cx.async.yield_now().await;\n" ++
+        "        return .Ok(val);\n" ++
+        "    }\n" ++
+        "    return .Err(val);\n" ++
+        "}\n\n" ++
+        "pub async fn try_pair_join() -> i32!i32 {\n" ++
+        "    return cx.async.task_group(|grp| -> i32!i32 {\n" ++
+        "        let h_fail = grp.spawn_local(own step_result(12, true));\n" ++
+        "        let h_slow = grp.spawn_local(own step_result(99, false));\n" ++
+        "        .Ok(h_fail.join().await? + h_slow.join().await?)\n" ++
+        "    }).await;\n" ++
+        "}\n\n" ++
+        "pub async fn sum_pair_join() -> i32 {\n" ++
+        "    return cx.async.task_group(|grp| {\n" ++
+        "        let left_h = grp.spawn_local(own async {\n" ++
+        "            cx.async.yield_now().await;\n" ++
+        "            10\n" ++
+        "        });\n" ++
+        "        let right_h = grp.spawn_local(own async { 20 });\n" ++
+        "        left_h.join().await + right_h.join().await\n" ++
+        "    }).await;\n" ++
+        "}\n\n" ++
+        "pub fn main() -> i32 {\n" ++
+        "    let ok_sum: i32 = cx.async.block_on(own sum_pair_join());\n" ++
+        "    let err_part: i32 = cx.async.block_on(own try_pair_join()) catch |err_code| err_code;\n" ++
+        "    return ok_sum + err_part;\n" ++
+        "}\n";
+    var nursery_report = try runVerifiedFourTierOracle(allocator, io, nursery_handles_src);
+    defer nursery_report.deinit(allocator);
+    try std.testing.expect(nursery_report.is_all_matching);
+    try std.testing.expectEqual(@as(i64, 42), nursery_report.outcomes[0].return_scalar_i64);
+
+    // [3] Freestanding `wasm32-unknown-freestanding` + `async` (`H2`) compiles cleanly in both Tier A and Tier B:
+    const wasm_async_src =
+        "pub async fn wasm_step(seed: u32) -> u32 {\n" ++
+        "    cx.async.yield_now().await;\n" ++
+        "    return seed +% 7_u32;\n" ++
+        "}\n" ++
+        "@wasm_export(\"cx_wasm_async_run\")\n" ++
+        "pub fn cx_wasm_async_run(seed: u32) -> u32 {\n" ++
+        "    return cx.async.block_on(own wasm_step(seed));\n" ++
+        "}\n";
+    var wasm_async_db = try CompilerDb.init(allocator);
+    defer wasm_async_db.deinit();
+    wasm_async_db.setTargetSpec(TargetSpec.WASM32_UNKNOWN_FREESTANDING);
+    const wasm_async_fid = FileId.fromInt(0);
+    _ = try wasm_async_db.setInput(wasm_async_fid, wasm_async_src, .low);
+
+    var wasm_async_sink = DiagnosticSink.init(allocator);
+    defer wasm_async_sink.deinit();
+    const wasm_async_ll_out = scratch_dir ++ "/wasm_async_tier_b.wasm";
+    var wasm_async_art = try wasm_async_db.compileModuleArtifact(
+        wasm_async_fid,
+        .{ .tier_b_llvm = .{ .target = TargetSpec.WASM32_UNKNOWN_FREESTANDING, .is_release_mode = true } },
+        .{
+            .artifact_kind = .executable,
+            .output_path = wasm_async_ll_out,
+            .io = io,
+            .diagnostic_sink = &wasm_async_sink,
+        },
+    );
+    defer wasm_async_art.deinit(allocator);
+    try std.testing.expect(!wasm_async_sink.hasErrors());
+    const wasm_async_bytes = try readAllFileBytes(allocator, io, wasm_async_ll_out);
+    defer allocator.free(wasm_async_bytes);
+    try verifyObjectMagicHeader(wasm_async_bytes, .wasm32);
+
+    // [4] Positive `E0311` dereference after `!= 0` check + Negative `C6` (`&mut` clobber -> `E0308`),
+    //     `C7` (oversized C bitfield -> `E0009`), and `H6` (`.def` `=` vs `==` symbol directory):
+    const positive_e0311_deref_src =
+        "@trusted\nextern \"C\" {\n    @may_be_null\n    pub fn c_try_slot() -> *mut i32;\n}\n" ++
+        "pub fn safe_checked_deref() -> i32 {\n" ++
+        "    let maybe_ptr = c_try_slot();\n" ++
+        "    if maybe_ptr != (0 as *mut i32) {\n" ++
+        "        return unsafe { maybe_ptr.* };\n" ++
+        "    }\n" ++
+        "    return 0;\n" ++
+        "}\n";
+    try expectZeroCompileDiagnostics(allocator, positive_e0311_deref_src);
+
+    const clobbered_nul_src =
+        "@trusted\nextern \"C\" fn c_puts(@null_terminated msg: *u8) -> i32;\n" ++
+        "fn overwrite_nul(buf: &mut [u8; 4]) { buf[3] = 65; }\n" ++
+        "pub fn bad_clobbered_cstr() -> i32 {\n" ++
+        "    var buf: [u8; 4] = [65, 66, 67, 0];\n" ++
+        "    overwrite_nul(&mut buf);\n" ++
+        "    return c_puts(buf.as_ptr());\n" ++
+        "}\n";
+    try std.testing.expect(
+        try hasCompiledDiagnosticCode(allocator, clobbered_nul_src, DiagnosticCode.e0308_unterminated_cstr_ffi),
+    );
+
+    var bf_sink = DiagnosticSink.init(allocator);
+    defer bf_sink.deinit();
+    if (c_frontend.parseCHeader(
+        allocator,
+        "struct BadBf { unsigned char too_wide : 16; };\n",
+        "bad_bf.h",
+        .none,
+        .{},
+        &bf_sink,
+    )) |ok_bf| {
+        var owned_bf = ok_bf;
+        owned_bf.deinit();
+    } else |_| {}
+    try std.testing.expect(hasSinkDiagnostic(&bf_sink, DiagnosticCode.e0009_c_header_translation_failed));
+
+    var def_parsed = try codegen_link.parseModuleDef(
+        allocator,
+        "LIBRARY \"demo.dll\"\nEXPORTS\n    PublicSym = InternalImpl\n    ImportAlias == ActualDllSym\n",
+        "demo.dll",
+    );
+    defer def_parsed.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), def_parsed.exports.len);
+    try std.testing.expectEqualStrings("PublicSym", def_parsed.exports[0].sym_name);
+    try std.testing.expect(def_parsed.exports[0].ext_name == null);
+    try std.testing.expectEqualStrings("ImportAlias", def_parsed.exports[1].sym_name);
+    try std.testing.expectEqualStrings("ActualDllSym", def_parsed.exports[1].ext_name.?);
 }

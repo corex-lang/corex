@@ -37,7 +37,7 @@ const ParamMode = type_system.ParamMode;
 const TargetLayout = type_system.TargetLayout;
 const NominalTypeSubst = type_system.NominalTypeSubst;
 
-/// Re-exported 24-byte Pentagon-proven SSA scalar range and alignment fact (`[MAJOR-08]`).
+/// Re-exported 24-byte Pentagon-proven SSA scalar range and alignment fact.
 pub const ProvenValueRange = mir_sast.ProvenValueRange;
 
 // ---------------------------------------- TYPES ----------------------------------------
@@ -84,7 +84,7 @@ pub const TargetAbi = enum(u8) {
     none = 5,
 };
 
-/// Target SIMD vector-width tier governing `#soa` column alignment (`DR-09` §1.1, `[CRITICAL-03]`).
+/// Target SIMD vector-width tier governing `#soa` column alignment (`DR-09` §1.1).
 pub const SimdLevel = enum(u8) {
     /// Scalar fallback (`8`-byte alignment floor).
     none = 0,
@@ -210,10 +210,9 @@ pub const TargetSpec = extern struct {
         };
     }
 
-    /// Represents `self` as the frontend `type_system.TargetLayout` (`D-10A`, `[CRITICAL-03]`).
+    /// Represents `self` as the frontend `type_system.TargetLayout` (`D-10A`).
     pub inline fn asTargetLayout(self: TargetSpec) TargetLayout {
         const is_wasm = self.arch == .wasm32;
-        const cache_log2: u8 = if (self.arch == .aarch64 and self.os == .macos) 7 else 6;
         const simd_log2: u8 = switch (self.simd_level) {
             .none => 3,
             .sse2_neon_simd128 => 4,
@@ -223,7 +222,7 @@ pub const TargetSpec = extern struct {
         return .{
             .ptr_byte_size = if (is_wasm) 4 else 8,
             .ptr_align_log2 = if (is_wasm) 2 else 3,
-            .cache_line_align_log2 = cache_log2,
+            .cache_line_align_log2 = if (self.arch == .aarch64 and self.os == .macos) 7 else 6,
             .simd_align_log2 = simd_log2,
         };
     }
@@ -251,6 +250,11 @@ pub const TargetSpec = extern struct {
     /// Returns `true` when targeting `wasm32-unknown-freestanding` (`os == .freestanding`).
     pub inline fn isFreestanding(self: TargetSpec) bool {
         return self.os == .freestanding;
+    }
+
+    /// Returns `true` when targeting freestanding WebAssembly (`arch == .wasm32` and `os == .freestanding`).
+    pub inline fn isFreestandingWasm(self: TargetSpec) bool {
+        return self.arch == .wasm32 and self.os == .freestanding;
     }
 
     /// Returns `true` when C `char` is signed (`false` on `aarch64-linux-*` `AAPCS64`, `true` on all other targets).
@@ -446,9 +450,8 @@ pub const TargetSpec = extern struct {
         sink: *DiagnosticSink,
     ) !?TargetSpec {
         if (parseTargetTriple(raw_triple)) |valid_spec| return valid_spec;
-        const arena_alloc = sink.arena.asAllocator();
         const msg = try std.fmt.allocPrint(
-            arena_alloc,
+            sink.arena.asAllocator(),
             "unsupported or malformed target triple `{s}`",
             .{raw_triple},
         );
@@ -469,7 +472,7 @@ pub const TargetSpec = extern struct {
 
 // ----------------- Layout & Niche Descriptors -----------------
 
-/// Niche encoding classification inside `NicheSpec` (`DR-07`, `DR-09` §1.1, `[CRITICAL-04]`).
+/// Niche encoding classification inside `NicheSpec` (`DR-07`, `DR-09` §1.1).
 pub const NicheEncoding = enum(u8) {
     /// Type exposes no spare invalid bit-patterns (`0`).
     none = 0,
@@ -495,7 +498,7 @@ pub const NicheSpec = extern struct {
     invalid_count: u64 = 0,
 };
 
-/// Canonical sum-type in-memory discriminant layout (`[CRITICAL-04]`).
+/// Canonical sum-type in-memory discriminant layout (`DR-07`, `DR-09` §1.1).
 pub const SumReprKind = enum(u8) {
     /// Product, scalar, pointer, or array type (not a sum type).
     not_sum = 0,
@@ -613,11 +616,11 @@ pub const ResolvedTypeLayout = extern struct {
 
 // ------------------ ABI Classification Types ------------------
 
-/// Lowered machine calling convention (`DR-09` §1.1, `DR-20` `Fix-07`, `[CRITICAL-06]`).
+/// Lowered machine calling convention (`DR-09` §1.1, `DR-20` `Fix-07`).
 pub const CallingConvKind = enum(u8) {
     /// Native CoreX `swiftcc` convention (`x86_64` / `aarch64`).
     cx_native = 0,
-    /// Native CoreX fallible `swiftcc` + `swifterror` convention (`Fix-07`, `[CRITICAL-06]`).
+    /// Native CoreX fallible `swiftcc` + `swifterror` convention (`Fix-07`).
     cx_result_cc = 1,
     /// Platform C ABI (`SysV AMD64`, `Win64`, `AAPCS64`, `Apple ARM64`).
     c_system = 2,
@@ -643,7 +646,7 @@ pub const AbiPassMode = enum(u8) {
     indirect_byval = 6,
     /// Returned via hidden 1st `ptr noalias nonnull sret(T)` parameter.
     sret_ptr = 7,
-    /// Hidden `ptr swifterror` slot in `cx_result_cc` (`R12` / `X21`, `[CRITICAL-06]`).
+    /// Hidden `ptr swifterror` slot in `cx_result_cc` (`R12` / `X21`).
     swifterror_ptr = 8,
 };
 
@@ -702,7 +705,7 @@ pub const AbiParamRecipe = extern struct {
     }
 };
 
-/// Error-channel encoding in `cx_result_cc` (`Fix-07`, `[CRITICAL-06]`).
+/// Error-channel encoding in `cx_result_cc` (`Fix-07`).
 pub const SwifterrorKind = enum(u8) {
     /// Function does not use `swifterror`.
     none = 0,
@@ -754,7 +757,7 @@ pub const AbiFnRecipe = struct {
     context_recipe: AbiParamRecipe = .{},
     /// `swifterror` encoding flavor (`.none` unless `calling_conv == .cx_result_cc`).
     swifterror_kind: SwifterrorKind = .none,
-    /// Recipe for bare `ptr swifterror %_cx_err_slot` when `swifterror_kind != .none` (`[CRITICAL-06]`).
+    /// Recipe for bare `ptr swifterror %_cx_err_slot` when `swifterror_kind != .none`.
     swifterror_recipe: AbiParamRecipe = .{},
     /// Unwrapped `T` payload `TypeId` when `calling_conv == .cx_result_cc`.
     ok_ty: TypeId = .unit_ty,
@@ -842,9 +845,13 @@ pub const LinkMode = enum(u8) {
     /// Parses `"auto"`, `"static"`, or `"dynamic"` into a `LinkMode`.
     pub fn fromStr(raw_mode: []const u8) ?LinkMode {
         const trimmed = std.mem.trim(u8, raw_mode, " \t\r\n");
-        if (std.mem.eql(u8, trimmed, "auto")) return .auto;
-        if (std.mem.eql(u8, trimmed, "static")) return .static;
-        if (std.mem.eql(u8, trimmed, "dynamic")) return .dynamic;
+        if (std.mem.eql(u8, trimmed, "auto")) {
+            return .auto;
+        } else if (std.mem.eql(u8, trimmed, "static")) {
+            return .static;
+        } else if (std.mem.eql(u8, trimmed, "dynamic")) {
+            return .dynamic;
+        }
         return null;
     }
 
@@ -908,9 +915,9 @@ pub const CodegenModuleInput = struct {
     file_tokens: ?*const std.AutoHashMapUnmanaged(u32, *const syntax_arenas.TokenBuffer) = null,
     /// Optional promoted `.rodata` constant pool (`MirVm`).
     rodata_pool: ?*const mir_vm.RodataPool = null,
-    /// Optional pre-materialized `@embed_bytes` blob store (`[CRITICAL-07]`).
+    /// Optional pre-materialized `@embed_bytes` blob store.
     blob_store: ?*const mir.MirBlobStore = null,
-    /// Optional per-body Pentagon `ProvenValueRange` slices (`[MAJOR-08]`).
+    /// Optional per-body Pentagon `ProvenValueRange` slices.
     proven_ranges: ?[]const []const ProvenValueRange = null,
     /// Optional interprocedural `FnSummaryStore` for `nocapture` / effect queries.
     summary_store: ?*const mir_sast.FnSummaryStore = null,
@@ -939,7 +946,7 @@ pub const CodegenModuleInput = struct {
 /// Canonical alias for `CodegenModuleInput` carrying backend emission and cross-link options.
 pub const BackendEmitOptions = CodegenModuleInput;
 
-/// Exhaustive tagged-union backend dispatcher with zero `*anyopaque` or `void*` (`AGENTS.md` §1, `[CRITICAL-09]`).
+/// Exhaustive tagged-union backend dispatcher with zero `*anyopaque` or `void*` (`AGENTS.md` §1).
 pub const CodegenBackend = union(enum) {
     /// Tier A deterministic ISO C99 backend (`-ofmt=c`).
     tier_a_c99: CBackendConfig,
@@ -1069,10 +1076,10 @@ const TARGET_TRIPLE_MAP = std.StaticStringMap(TargetSpec).initComptime(.{
     .{ "x86_64-windows-msvc", TargetSpec.X86_64_WINDOWS_MSVC },
 });
 
-// -------------------------------------- INTERNALS --------------------------------------
-
 /// Monotonic process-wide sequence counter qualifying `atomicWriteOutputFile` temporary filenames.
 var atomic_write_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(1);
+
+// -------------------------------------- INTERNALS --------------------------------------
 
 /// Converts `type_system.LeafNicheInfo` into binary-exact `NicheSpec`.
 fn leafNicheToSpec(leaf: type_system.LeafNicheInfo) NicheSpec {
@@ -1424,11 +1431,14 @@ fn unwrapWasmCSingleScalar(resolver: *TypeLayoutResolver, raw_ty: TypeId, depth:
             while (fld_i < len) : (fld_i += 1) {
                 const fld = resolver.fields_by_decl.items[start + fld_i];
                 if (fld.size_bytes == 0) continue;
-                if (single_ty != null) return null;
+                if (single_ty != null or fld.byte_offset != 0) return null;
                 single_ty = fld.field_ty;
             }
             if (single_ty) |only_ty| {
-                return unwrapWasmCSingleScalar(resolver, only_ty, depth + 1);
+                const leaf_ty = (try unwrapWasmCSingleScalar(resolver, only_ty, depth + 1)) orelse return null;
+                const leaf_layout = try resolver.resolveTypeBounded(leaf_ty, depth + 1);
+                if (layout.size_bytes != leaf_layout.size_bytes) return null;
+                return leaf_ty;
             }
             return null;
         },
@@ -1446,7 +1456,7 @@ fn computeProcessNonceTag() u32 {
 
 // ------------------------------------- PUBLIC API --------------------------------------
 
-/// Frontend-unified layout, field-order, `#soa` column, and niche resolver (`DR-09` §1.1, `[CRITICAL-01]`–`[CRITICAL-04]`).
+/// Frontend-unified layout, field-order, `#soa` column, and niche resolver (`DR-09` §1.1).
 pub const TypeLayoutResolver = struct {
     /// Backing allocator owning cached layout, field, padding, and niche tables.
     allocator: std.mem.Allocator,
@@ -1712,7 +1722,7 @@ pub const TypeLayoutResolver = struct {
         return &.{};
     }
 
-    /// Resolves `#soa [S; C]` column offset and alignment for `field_ordinal` (`[CRITICAL-03]`).
+    /// Resolves `#soa [S; C]` column offset and alignment for `field_ordinal` (`DR-09` §1.1).
     pub fn getSoaColumnOffset(
         self: *const TypeLayoutResolver,
         elem_struct_ty: TypeId,
@@ -2038,7 +2048,7 @@ pub const TypeLayoutResolver = struct {
 
 /// Canonical machine calling-convention classifier (`cx_native`, `cx_result_cc`, `c_system`, `wasm_mvp`).
 pub const AbiClassifier = struct {
-    /// Classifies `sig` for `resolver.target_spec` using only signature types/modes (`DR-09` §1.1, `[CRITICAL-06]`).
+    /// Classifies `sig` for `resolver.target_spec` using only signature types/modes (`DR-09` §1.1).
     pub fn classifyFn(
         allocator: std.mem.Allocator,
         resolver: *TypeLayoutResolver,
@@ -2066,7 +2076,7 @@ pub const AbiClassifier = struct {
         return classifyCxNativeFn(resolver, effective_sig, param_recipes);
     }
 
-    /// Classifies native `x86_64` / `aarch64` CoreX functions (`cx_native` & `cx_result_cc` `Fix-07` / `[CRITICAL-06]`).
+    /// Classifies native `x86_64` / `aarch64` CoreX functions (`cx_native` & `cx_result_cc` `Fix-07`).
     fn classifyCxNativeFn(
         resolver: *TypeLayoutResolver,
         sig: FnSignatureView,
@@ -2098,7 +2108,7 @@ pub const AbiClassifier = struct {
             };
         }
 
-        // [2] Check `[CRITICAL-06]` `cx_result_cc` (`swiftcc` + `swifterror`) eligibility:
+        // [2] Check `cx_result_cc` (`swiftcc` + `swifterror`) eligibility:
         const unwrapped_ret = resolver.pool.unwrapUnderlyingType(sig.ret_ty);
         if (!unwrapped_ret.isPrimitiveOrSentinel() and resolver.pool.getNode(unwrapped_ret).tag == .result_ty) {
             const ret_node = resolver.pool.getNode(unwrapped_ret);
@@ -2242,7 +2252,7 @@ pub const AbiClassifier = struct {
         return recipe;
     }
 
-    /// Classifies `PackedOk(T)` or `<= 32B` `swiftcc` return values (`[CRITICAL-06]`: `<= 4` registers).
+    /// Classifies `PackedOk(T)` or `<= 32B` `swiftcc` return values (`<= 4` registers).
     fn classifyPackedSwiftReturn(
         pool: *const InternPool,
         ret_ty: TypeId,
@@ -2545,7 +2555,7 @@ pub const AbiClassifier = struct {
         recipe.ret_recipe = recipe.sret_recipe;
     }
 
-    /// Classifies `wasm32-wasi` functions under the WebAssembly MVP ABI (`swifterror` disabled per `[CRITICAL-06]`).
+    /// Classifies `wasm32` functions under the WebAssembly Basic C / MVP ABI (`swifterror` disabled per `DR-09` §1.1).
     fn classifyWasmMvpFn(
         resolver: *TypeLayoutResolver,
         sig: FnSignatureView,
@@ -2747,7 +2757,7 @@ pub fn emitLinkerFailureDiagnostic(
     });
 }
 
-/// Writes `content` to `dest_path` using `Prune-02` `SIGKILL`-safe `UnlinkAndReplace` + Windows lock retry (`[MAJOR-10]`).
+/// Writes `content` to `dest_path` using `Prune-02` `SIGKILL`-safe `UnlinkAndReplace` + Windows lock retry.
 pub fn atomicWriteOutputFile(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -2891,7 +2901,7 @@ comptime {
     }
 }
 
-test "Phase 7.6 built-in TypeId layouts, 3-tier closures, and variadic ABI recipes" {
+test "test_codegen_abi_builtin_layouts_closures_and_variadics" {
     _ = codegen_link;
     const allocator = std.testing.allocator;
     var interner = try StringInterner.init(allocator);
@@ -3006,7 +3016,7 @@ test "Phase 7.6 built-in TypeId layouts, 3-tier closures, and variadic ABI recip
     try std.testing.expectEqual(AbiPassMode.direct_pair, arm_c_rec.ret_recipe.pass_mode);
 }
 
-test "Phase 8 11-target cross-compilation matrix, C ABI scalar queries, and LinkMode parsing" {
+test "test_codegen_abi_target_matrix_c_scalars_and_link_mode" {
     for (ALL_CANONICAL_TARGETS) |spec| {
         const parsed = TargetSpec.parseTargetTriple(spec.asTripleStr()).?;
         try std.testing.expectEqual(spec, parsed);
@@ -3050,7 +3060,7 @@ test "Phase 8 11-target cross-compilation matrix, C ABI scalar queries, and Link
     try std.testing.expect(LinkMode.fromStr("invalid") == null);
 }
 
-test "Phase 8 R-1 wasm32 & aarch64-windows datalayouts and WinARM64 variadic GPR-only ABI" {
+test "test_codegen_abi_wasm32_overaligned_and_win_arm64_variadic" {
     const expected_wasm_dl = "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-f128:64-n32:64-S128-ni:1:10:20";
     const expected_win_arm64_dl = "e-m:w-p270:32:32-p271:32:32-p272:64:64-p:64:64-i32:32-i64:64-i128:128-n32:64-S128-Fn32";
     try std.testing.expectEqualStrings(expected_wasm_dl, TargetSpec.WASM32_UNKNOWN_WASI.asLlvmDataLayout());
@@ -3064,6 +3074,38 @@ test "Phase 8 R-1 wasm32 & aarch64-windows datalayouts and WinARM64 variadic GPR
     defer pool.deinit();
     var sym_table = try SymbolTable.init(allocator, &interner);
     defer sym_table.deinit();
+
+    // Verify `@repr(C) @align(8) struct { val: i32 }` (`size == 8 != 4`) uses `.indirect_by_ref` on `wasm32`:
+    var check_res = try type_system.typecheckSource(
+        allocator,
+        mem_foundation.FileId.fromInt(90),
+        "@repr(C)\n@align(8)\npub struct OverAlignedI32 { pub val: i32 }\n",
+    );
+    defer check_res.deinit();
+    const mod_scope = check_res.symbol_table.file_module_scopes.get(90).?;
+    const struct_sym = check_res.symbol_table.lookupInScopeDirect(
+        mod_scope,
+        try check_res.interner.intern("OverAlignedI32"),
+        symbol_resolver.NamespaceMask.TYPE_ONLY,
+    );
+    const overaligned_ty = check_res.symbol_table.getSymbol(struct_sym).type_id;
+    var wasm_res = TypeLayoutResolver.init(
+        allocator,
+        &check_res.type_pool,
+        &check_res.symbol_table,
+        TargetSpec.WASM32_UNKNOWN_WASI,
+    );
+    defer wasm_res.deinit();
+    const overaligned_lay = try wasm_res.resolveType(overaligned_ty);
+    try std.testing.expectEqual(@as(u64, 8), overaligned_lay.size_bytes);
+    var wasm_overaligned_rec = try AbiClassifier.classifyFn(allocator, &wasm_res, .{
+        .params = &.{.{ .type_id = overaligned_ty }},
+        .ret_ty = overaligned_ty,
+        .is_extern_c = true,
+    });
+    defer wasm_overaligned_rec.deinit(allocator);
+    try std.testing.expectEqual(AbiPassMode.indirect_by_ref, wasm_overaligned_rec.param_recipes[0].pass_mode);
+    try std.testing.expect(wasm_overaligned_rec.has_sret);
 
     const raw_u8_ptr = try pool.internRawPtr(.u8_ty, false);
     const hfa_f32x2 = try pool.internArray(.f32_ty, 2, false);
@@ -3132,7 +3174,7 @@ test "Phase 8 R-1 wasm32 & aarch64-windows datalayouts and WinARM64 variadic GPR
     try std.testing.expectEqual(AbiPassMode.direct_hfa, linux_var_rec.param_recipes[2].pass_mode);
 }
 
-test "Phase 8 Wave 3C-2 Future[T] layout and 10-slot Context ABI across 64-bit and wasm32" {
+test "test_codegen_abi_future_and_context_layouts" {
     const allocator = std.testing.allocator;
     var interner = try StringInterner.init(allocator);
     defer interner.deinit();

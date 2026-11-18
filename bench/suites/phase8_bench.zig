@@ -118,17 +118,14 @@ const FFI_CALLER_C_SOURCE =
     "    uint64_t final_digest = run_ffi_loop(2000000ULL, seed);\n" ++
     "    return (int)((final_digest ^ (final_digest >> 32)) & 127ULL);\n" ++
     "}\n";
-
-// -------------------------------------- INTERNALS --------------------------------------
-
 /// Lazily initialized ~360-line C11/C23 header buffer for Case 1.
 var shared_c_header_corpus: ?PreparedCHeaderCorpus = null;
-
 /// Lazily initialized `64`-coroutine `MIR` bundle for Case 2.
 var shared_async_mir_state: ?PreparedAsyncMirState = null;
-
 /// Pre-compiled native FFI benchmark binaries for Cases 3–4.
 var shared_ffi_binaries: ?PreparedFfiBinaries = null;
+
+// -------------------------------------- INTERNALS --------------------------------------
 
 /// Synthesizes a realistic ~360-line C11/C23 systems header (`SYNTHETIC_C_GROUP_COUNT` groups).
 fn buildSyntheticCHeaderCorpus(allocator: std.mem.Allocator) ![]u8 {

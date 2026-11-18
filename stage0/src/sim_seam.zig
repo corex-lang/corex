@@ -227,8 +227,8 @@ fn noopBuggifyGate(_: *ReactorCtx, _: u64, _: u32) callconv(.c) bool {
 }
 /// Resets `reaper.slots[slot_index]` to `.free` (`generation +%= 1`) and links it onto `free_head`.
 fn recycleSlotToFree(reaper: *CompletionReaper, slot_index: u32, generation: u16) void {
-    const next_gen: GenStateReaper = .{ .generation = generation +% 1, .state = .free, .reaper_action = .none };
-    reaper.slots[slot_index] = .{ .gen_state_reaper = next_gen.asU32(), .platform_overlapped = .{ reaper.free_head, 0, 0, 0 } };
+    reaper.slots[slot_index] = .{ .gen_state_reaper = (GenStateReaper{ .generation = generation +% 1 }).asU32() };
+    reaper.slots[slot_index].platform_overlapped[0] = reaper.free_head;
     reaper.free_head = slot_index;
 }
 

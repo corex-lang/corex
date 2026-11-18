@@ -326,6 +326,8 @@ test "test_drift_guard_zig_files_column_150_and_section_dividers" {
         try walkZigDirectoryFormatting(std.testing.allocator, std.testing.io, dir_name);
     }
     try checkZigFileFormattingAndDividers(std.testing.allocator, std.testing.io, "build.zig");
+    try checkZigFileFormattingAndDividers(std.testing.allocator, std.testing.io, "stage0/src/corex_llvm.h");
+    try checkZigFileFormattingAndDividers(std.testing.allocator, std.testing.io, "stage0/src/corex_llvm.cpp");
 }
 
 test "test_drift_guard_phase1_token_kind_contiguity_and_keyword_table" {
@@ -1235,6 +1237,50 @@ test "test_drift_guard_phase8_cross_compile_ffi_async_seams_and_diagnostics" {
         }
     }
 
+    try std.testing.expectEqual(@as(usize, 5), router.TRANSLATE_C_FLAGS.len);
+    var tc_help_buf: [2048]u8 = undefined;
+    var tc_help_writer = std.Io.Writer.fixed(&tc_help_buf);
+    try router.renderSubcommandHelp(&tc_help_writer, StyleConfig.MONOCHROME, .translate_c);
+    const tc_help_text = tc_help_writer.buffered();
+    for (router.TRANSLATE_C_FLAGS, 0..) |tc_flag, i| {
+        try std.testing.expectEqual(i, @as(usize, @backingInt(tc_flag.id)));
+        try std.testing.expect(std.mem.indexOf(u8, tc_help_text, tc_flag.long_flag) != null);
+        try std.testing.expect(std.mem.indexOf(u8, tc_help_text, tc_flag.summary) != null);
+        if (tc_flag.short_flag) |short_s| {
+            try std.testing.expect(std.mem.indexOf(u8, tc_help_text, short_s) != null);
+        }
+        if (i > 0) {
+            try std.testing.expectEqual(
+                std.math.Order.lt,
+                std.mem.order(u8, router.TRANSLATE_C_FLAGS[i - 1].long_flag, tc_flag.long_flag),
+            );
+        }
+    }
+
+    const required_phase8_attrs = [_][]const u8{
+        "borrowed",
+        "byte_len",
+        "consumes",
+        "escapes",
+        "free_with",
+        "link_lib",
+        "may_be_null",
+        "non_null",
+        "not_send",
+        "not_sync",
+        "null_terminated",
+        "out_param",
+        "owned_by_caller",
+        "slice_len",
+        "thread_local",
+        "trusted",
+        "wasm_export",
+        "wasm_import",
+    };
+    for (required_phase8_attrs) |attr_name| {
+        try std.testing.expect(corex.type_system.BUILTIN_ATTRIBUTE_MAP.has(attr_name));
+    }
+
     // [2] Verify 11 canonical `TargetSpec` entries (`@sizeOf == 4`) with 11 distinct `archOsTag()` values:
     try std.testing.expectEqual(@as(usize, 4), @sizeOf(corex.TargetSpec));
     try std.testing.expectEqual(@as(usize, 11), corex.TargetSpec.ALL_CANONICAL_TARGETS.len);
@@ -1269,6 +1315,27 @@ test "test_drift_guard_phase8_cross_compile_ffi_async_seams_and_diagnostics" {
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(corex.ReactorCqe));
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(corex.SuspendPointMeta));
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(corex.CoroFrameLayout));
+    try std.testing.expectEqual(@as(usize, 8 * @sizeOf(usize)), @sizeOf(corex.sim_seam.ReactorVTable));
+
+    const core_async_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "core/async.cx",
+        std.testing.allocator,
+        .limited(1024 * 1024),
+    );
+    defer std.testing.allocator.free(core_async_bytes);
+    for ([_][]const u8{
+        "pub monotonic_ns: usize,",
+        "pub wall_epoch_ns: usize,",
+        "pub fill_rng: usize,",
+        "pub submit_io: usize,",
+        "pub cancel_io: usize,",
+        "pub poll_or_park: usize,",
+        "pub yield_task: usize,",
+        "pub buggify_gate: usize,",
+    }) |vtable_field_decl| {
+        try std.testing.expect(std.mem.indexOf(u8, core_async_bytes, vtable_field_decl) != null);
+    }
 
     // [4] Verify all 8 Phase 8 `DiagnosticCode` tags (`E0009`, `E0308`–`E0312`, `E0317`, `E0438`)
     //     in `DIAGNOSTIC_CATALOG`, `stage0/src/`, and `tests/unit/`:

@@ -1,7 +1,7 @@
 //! CoreX Stage-0 LLVM 20–23 & LLD C99 Bridge Header (`corex_llvm.h`)
 //!
 //! Exposes a strictly typed, zero-`void*` ISO C99 FFI boundary (`AGENTS.md` Section 1,
-//! `DR-09` Section 1.2, `DR-10` Section 1.4, `[CRITICAL-09]`) between `stage0/src/codegen_llvm.zig`,
+//! `DR-09` Section 1.2, `DR-10` Section 1.4) between `stage0/src/codegen_llvm.zig`,
 //! `stage0/src/codegen_link.zig`, and the optional `-Dllvm-prefix` C++20 static LLVM/LLD bridge
 //! (`stage0/src/corex_llvm.cpp`).
 //!
