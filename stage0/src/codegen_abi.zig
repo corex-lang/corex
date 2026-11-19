@@ -2764,6 +2764,17 @@ pub fn atomicWriteOutputFile(
     dest_path: []const u8,
     content: []const u8,
 ) !void {
+    return atomicWriteOutputFileWithPermissions(io, allocator, dest_path, content, .default_file);
+}
+
+/// Writes `content` to `dest_path` with explicit `permissions` via `SIGKILL`-safe `UnlinkAndReplace`.
+pub fn atomicWriteOutputFileWithPermissions(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    dest_path: []const u8,
+    content: []const u8,
+    permissions: std.Io.File.Permissions,
+) !void {
     if (std.fs.path.dirname(dest_path)) |parent_dir| {
         if (parent_dir.len > 0) {
             std.Io.Dir.cwd().createDirPath(io, parent_dir) catch {};
@@ -2786,6 +2797,7 @@ pub fn atomicWriteOutputFile(
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = tmp_path,
         .data = content,
+        .flags = .{ .permissions = permissions },
     });
     is_tmp_live = true;
 
@@ -2817,7 +2829,7 @@ pub fn atomicWriteOutputFile(
 /// Canonical Phase 8 alias for `atomicWriteOutputFile` (`Prune-02` `UnlinkAndReplace`).
 pub const writeArtifactAtomic = atomicWriteOutputFile;
 
-/// Reads `staged_src_path` and atomically publishes it onto `final_dest_path` (`Prune-02`).
+/// Reads `staged_src_path` and atomically publishes it onto `final_dest_path`, preserving file permissions.
 pub fn publishStagedFileAtomic(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -2830,13 +2842,14 @@ pub fn publishStagedFileAtomic(
     });
     defer opened_file.close(io);
 
-    const file_size: usize = @intCast((try opened_file.stat(io)).size);
+    const src_stat = try opened_file.stat(io);
+    const file_size: usize = @intCast(src_stat.size);
     const staged_bytes = try allocator.alloc(u8, file_size);
     defer allocator.free(staged_bytes);
     if ((try opened_file.readPositionalAll(io, staged_bytes, 0)) != file_size) {
         return error.UnexpectedEndOfFile;
     }
-    try atomicWriteOutputFile(io, allocator, final_dest_path, staged_bytes);
+    try atomicWriteOutputFileWithPermissions(io, allocator, final_dest_path, staged_bytes, src_stat.permissions);
 }
 
 /// Lazily locates the `zig` compiler driver executable via `COREX_ZIG_EXE` or `PATH` (`AGENTS.md` §2).

@@ -30,12 +30,14 @@ const lexer = @import("lexer.zig");
 const symbol_resolver = @import("symbol_resolver.zig");
 const type_system = @import("type_system.zig");
 const query_db = @import("query_db.zig");
+const vfs_sourcemap = @import("vfs_sourcemap.zig");
 const hir = @import("hir.zig");
 const mir = @import("mir.zig");
 const mir_async = @import("mir_async.zig");
 const sim_seam = @import("sim_seam.zig");
 
 const FileId = mem_foundation.FileId;
+const PackageId = vfs_sourcemap.PackageId;
 const Span = mem_foundation.Span;
 const SymbolId = mem_foundation.SymbolId;
 const StringInterner = mem_foundation.StringInterner;
@@ -627,7 +629,16 @@ pub const VmExecOptions = struct {
     stderr_capture: ?*std.ArrayListUnmanaged(u8) = null,
     /// Enables differential-oracle runtime execution of `@sys_write` and `@sys_exit` (`D-07A`).
     is_oracle_runtime_mode: bool = false,
+    /// Optional `SymbolTable` override mapping lexical `origin_file_id -> PackageId` (`P1-5`).
+    sym_table: ?*const SymbolTable = null,
+    /// Optional per-`PackageId` `@embed_bytes` sandbox jail policy table (`DR-17` §5).
+    package_jails: ?*const std.AutoHashMapUnmanaged(PackageId, mir.EmbedPackageJail) = null,
+    /// Optional `VfsSourceMap` resolving `.cxtree_only` assets without touching host disk.
+    vfs_source_map: ?*const vfs_sourcemap.VfsSourceMap = null,
 };
+
+/// Re-exported canonical per-package `@embed_bytes` jail union (`DR-17` §5).
+pub const EmbedPackageJail = mir.EmbedPackageJail;
 
 /// Error set returned by `MirVm` when compile-time evaluation traps or runs out of host memory.
 pub const VmEvalError = error{
@@ -7099,7 +7110,17 @@ pub const MirVm = struct {
                 }
                 const path_bytes = try self.readStrSlotBytes(self.call_stack.items[frame_idx].regs[args[0]]);
                 defer self.allocator.free(path_bytes);
-                return self.evalEmbedBytesSlot(path_bytes, inst.type_id);
+                const origin_fid: FileId = if (args.len >= 2) blk_fid: {
+                    const raw_bits = self.readIntBitsFromSlot(
+                        self.call_stack.items[frame_idx].regs[args[1]],
+                        .u32_ty,
+                    ) catch break :blk_fid body.file_id;
+                    break :blk_fid if (raw_bits <= std.math.maxInt(u32))
+                        FileId.fromInt(@intCast(raw_bits))
+                    else
+                        body.file_id;
+                } else body.file_id;
+                return self.evalEmbedBytesSlotWithOrigin(path_bytes, inst.type_id, origin_fid);
             },
             .derive_debug_fmt => {
                 var builder: std.ArrayListUnmanaged(u8) = .empty;
@@ -10558,11 +10579,25 @@ pub const MirVm = struct {
 
     // ---------- Reflection Intrinsics & Rodata Promotion ----------
 
-    /// Loads sandboxed `@embed_bytes(rel_path)` from `virtual_files` or `workspace_root` (`E0326` on escape).
+    /// Loads sandboxed `@embed_bytes(rel_path)` using the active frame's `file_id` (or `.none` if standalone).
     pub fn evalEmbedBytesSlot(
         self: *MirVm,
         rel_path: []const u8,
         res_ty: TypeId,
+    ) VmEvalError!RegSlot {
+        const active_fid: FileId = if (self.call_stack.items.len > 0)
+            self.call_stack.items[self.call_stack.items.len - 1].body.file_id
+        else
+            .none;
+        return self.evalEmbedBytesSlotWithOrigin(rel_path, res_ty, active_fid);
+    }
+
+    /// Loads sandboxed `@embed_bytes(rel_path)` jailed strictly to lexical `origin_file_id` (`P1-5`, `E0326` on escape).
+    pub fn evalEmbedBytesSlotWithOrigin(
+        self: *MirVm,
+        rel_path: []const u8,
+        res_ty: TypeId,
+        origin_file_id: FileId,
     ) VmEvalError!RegSlot {
         if (self.options.compiler_db) |db| {
             const sb_key = db.recordEmbedSandboxDependency() catch |err| return self.mapDbQueryError(err);
@@ -10579,144 +10614,153 @@ pub const MirVm = struct {
             );
         }
 
+        const max_read_bytes: u64 = @min(
+            @min(self.options.mem_limit, mir.MAX_EMBED_BYTES),
+            std.math.maxInt(u32),
+        );
         var loaded_bytes: ?[]const u8 = null;
         var owned_disk_buf: ?[]u8 = null;
         defer if (owned_disk_buf) |buf| self.allocator.free(buf);
 
-        if (self.options.virtual_files) |vfs_map| {
-            if (vfs_map.get(rel_path)) |vfs_bytes| {
-                loaded_bytes = vfs_bytes;
-            }
-        }
-        if (loaded_bytes == null) {
-            if (self.options.workspace_root) |ws_root| {
-                if (self.options.io) |io_handle| {
-                    const canon_ws = std.Io.Dir.cwd().realPathFileAlloc(
-                        io_handle,
-                        ws_root,
+        const eff_sym_table: ?*const SymbolTable = self.options.sym_table orelse self.sym_table;
+        const active_jail = mir.resolveActiveEmbedJail(
+            origin_file_id,
+            eff_sym_table,
+            self.options.package_jails,
+            self.options.workspace_root,
+        );
+        switch (active_jail) {
+            .cxtree_only => |cx_jail| {
+                if (self.options.vfs_source_map) |vfs_map| {
+                    const cx_bytes_opt = mir.lookupSandboxedCxTreeEmbedAsset(
                         self.allocator,
-                    ) catch {
+                        vfs_map,
+                        origin_file_id,
+                        cx_jail.virtual_root_prefix,
+                        rel_path,
+                    ) catch |cx_err| {
+                        if (cx_err == error.OutOfMemory) return error.OutOfMemory;
+                        const err_code: DiagnosticCode = if (cx_err == error.CacheIntegrityMismatch)
+                            .e0015_cache_integrity_mismatch
+                        else
+                            .e0004_source_file_io_error;
                         return self.failWithTrap(
                             error.ForbiddenOperation,
-                            .e0503_forbidden_comptime_operation,
-                            "`@embed_bytes` workspace root could not be canonicalized",
-                            "invalid workspace sandbox root",
+                            err_code,
+                            "`@embed_bytes` external package asset failed content-addressable cache verification",
+                            "corrupt or unreadable `.cxtree` asset",
                             null,
                         );
                     };
-                    defer self.allocator.free(canon_ws);
-
-                    const full_path = std.fs.path.join(self.allocator, &.{ canon_ws, rel_path }) catch
-                        return error.OutOfMemory;
-                    defer self.allocator.free(full_path);
-
-                    // Reject leaf symlinks, junctions/reparse points, directories, and special files (`Fix-17` Gate D):
-                    const opened_file = std.Io.Dir.cwd().openFile(io_handle, full_path, .{
-                        .mode = .read_only,
-                        .allow_directory = false,
-                        .follow_symlinks = false,
-                    }) catch |open_err| switch (open_err) {
-                        error.SymLinkLoop, error.IsDir, error.NotDir => {
+                    if (cx_bytes_opt) |cx_bytes| {
+                        if (cx_bytes.len > max_read_bytes) {
                             return self.failWithTrap(
                                 error.ForbiddenOperation,
                                 .e0326_embed_path_escape,
-                                "`@embed_bytes` target cannot be a symlink, reparse point, or directory",
-                                "`@embed_bytes` symlink or non-regular target blocked here",
+                                "`@embed_bytes` target file exceeds `MAX_EMBED_BYTES` package sandbox cap",
+                                "oversized `@embed_bytes` file",
                                 null,
                             );
+                        }
+                        loaded_bytes = cx_bytes;
+                    }
+                }
+                if (loaded_bytes == null) {
+                    return self.failWithTrap(
+                        error.ForbiddenOperation,
+                        .e0004_source_file_io_error,
+                        "`@embed_bytes` target file does not exist inside external package archive",
+                        "missing package `@embed_bytes` asset",
+                        null,
+                    );
+                }
+            },
+            .host_dir_jailed => |jail_root| {
+                if (self.options.io) |io_handle| {
+                    switch (mir.readSandboxedHostEmbedFile(
+                        self.allocator,
+                        io_handle,
+                        jail_root,
+                        rel_path,
+                        max_read_bytes,
+                    ) catch return error.OutOfMemory) {
+                        .ok => |file_bytes| {
+                            owned_disk_buf = file_bytes;
+                            loaded_bytes = file_bytes;
                         },
-                        else => {
+                        .sandbox_escape => |esc| {
                             return self.failWithTrap(
                                 error.ForbiddenOperation,
-                                .e0503_forbidden_comptime_operation,
-                                "`@embed_bytes` target file could not be opened inside workspace sandbox",
-                                "unreadable `@embed_bytes` file",
+                                .e0326_embed_path_escape,
+                                esc.message,
+                                esc.label,
                                 null,
                             );
                         },
-                    };
-                    defer opened_file.close(io_handle);
-
-                    const file_stat = opened_file.stat(io_handle) catch {
-                        return self.failWithTrap(
-                            error.ForbiddenOperation,
-                            .e0503_forbidden_comptime_operation,
-                            "`@embed_bytes` target file metadata could not be queried",
-                            "unreadable `@embed_bytes` file",
-                            null,
-                        );
-                    };
-                    if (file_stat.kind != .file) {
-                        return self.failWithTrap(
-                            error.ForbiddenOperation,
-                            .e0326_embed_path_escape,
-                            "`@embed_bytes` target must be a regular file inside the package sandbox",
-                            "non-regular `@embed_bytes` target blocked here",
-                            null,
-                        );
+                        .io_error => |io_err| {
+                            return self.failWithTrap(
+                                error.ForbiddenOperation,
+                                .e0004_source_file_io_error,
+                                io_err.message,
+                                io_err.label,
+                                null,
+                            );
+                        },
                     }
-
-                    const canon_target = std.Io.Dir.cwd().realPathFileAlloc(
-                        io_handle,
-                        full_path,
-                        self.allocator,
-                    ) catch {
-                        return self.failWithTrap(
-                            error.ForbiddenOperation,
-                            .e0326_embed_path_escape,
-                            "`@embed_bytes` target path could not be canonicalized inside package sandbox",
-                            "`@embed_bytes` sandbox violation here",
-                            null,
-                        );
-                    };
-                    defer self.allocator.free(canon_target);
-
-                    if (!isDirectCanonicalSubpath(canon_ws, canon_target, rel_path)) {
-                        return self.failWithTrap(
-                            error.ForbiddenOperation,
-                            .e0326_embed_path_escape,
-                            "`@embed_bytes` target resolved outside package sandbox or traversed a symlink/junction",
-                            "sandbox escape blocked here",
-                            null,
-                        );
-                    }
-
-                    const max_read_bytes: u64 = @min(self.options.mem_limit, std.math.maxInt(u32));
-                    if (file_stat.size > max_read_bytes) {
-                        return self.failWithTrap(
-                            error.ResourceLimitExceeded,
-                            .e0508_comptime_resource_limit_exceeded,
-                            "`@embed_bytes` target file exceeds compile-time memory budget",
-                            "oversized `@embed_bytes` file",
-                            null,
-                        );
-                    }
-                    const expected_size: usize = @intCast(file_stat.size);
-                    const file_bytes = self.allocator.alloc(u8, expected_size) catch
-                        return error.OutOfMemory;
-                    errdefer self.allocator.free(file_bytes);
-                    const actual_read = opened_file.readPositionalAll(io_handle, file_bytes, 0) catch {
-                        return self.failWithTrap(
-                            error.ForbiddenOperation,
-                            .e0503_forbidden_comptime_operation,
-                            "`@embed_bytes` target file could not be read from verified descriptor",
-                            "unreadable `@embed_bytes` file",
-                            null,
-                        );
-                    };
-                    if (actual_read != expected_size) {
-                        return self.failWithTrap(
-                            error.ForbiddenOperation,
-                            .e0503_forbidden_comptime_operation,
-                            "`@embed_bytes` target file changed size concurrently during read",
-                            "truncated `@embed_bytes` file",
-                            null,
-                        );
-                    }
-                    owned_disk_buf = file_bytes;
-                    loaded_bytes = file_bytes;
                 }
-            }
+            },
+            .unrestricted_legacy => {
+                if (self.options.virtual_files) |vfs_map| {
+                    if (vfs_map.get(rel_path)) |vfs_bytes| {
+                        if (vfs_bytes.len > max_read_bytes) {
+                            return self.failWithTrap(
+                                error.ForbiddenOperation,
+                                .e0326_embed_path_escape,
+                                "`@embed_bytes` target file exceeds `MAX_EMBED_BYTES` package sandbox cap",
+                                "oversized `@embed_bytes` file",
+                                null,
+                            );
+                        }
+                        loaded_bytes = vfs_bytes;
+                    }
+                }
+                if (loaded_bytes == null) {
+                    if (self.options.workspace_root) |ws_root| {
+                        if (self.options.io) |io_handle| {
+                            switch (mir.readSandboxedHostEmbedFile(
+                                self.allocator,
+                                io_handle,
+                                ws_root,
+                                rel_path,
+                                max_read_bytes,
+                            ) catch return error.OutOfMemory) {
+                                .ok => |file_bytes| {
+                                    owned_disk_buf = file_bytes;
+                                    loaded_bytes = file_bytes;
+                                },
+                                .sandbox_escape => |esc| {
+                                    return self.failWithTrap(
+                                        error.ForbiddenOperation,
+                                        .e0326_embed_path_escape,
+                                        esc.message,
+                                        esc.label,
+                                        null,
+                                    );
+                                },
+                                .io_error => |io_err| {
+                                    return self.failWithTrap(
+                                        error.ForbiddenOperation,
+                                        .e0503_forbidden_comptime_operation,
+                                        io_err.message,
+                                        io_err.label,
+                                        null,
+                                    );
+                                },
+                            }
+                        }
+                    }
+                }
+            },
         }
 
         const raw_bytes = loaded_bytes orelse {

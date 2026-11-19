@@ -113,6 +113,8 @@ pub const EffectCapabilityMask = packed struct(u16) {
     pub const LOCKFILE_CAP_BITS: u16 = 0x033F;
     /// Foreign function interface and `unsafe` capability bits (`ffi | unsafe_op` = `0x0030`).
     pub const FFI_UNSAFE_BITS: u16 = 0x0030;
+    /// High-risk dead third-party capability bits (`net | process | ffi | unsafe_op` = `0x003A`, `W0330`).
+    pub const HIGH_RISK_DEAD_CAP_BITS: u16 = (1 << 1) | (1 << 3) | FFI_UNSAFE_BITS;
     /// Blocking I/O and synchronization bits (`fs | net | process | blocking_sync`).
     pub const BLOCKING_BITS: u16 = (1 << 0) | (1 << 1) | (1 << 3) | (1 << 10);
     /// Dynamic heap allocation bit (`1 << 6`).
@@ -1070,22 +1072,29 @@ pub const ProvenValueRange = extern struct {
 
 // ----------------- Package Capability Sandbox -----------------
 
-/// Three-tier package capability roll-up (`DR-17` §3.1 & `Fix-17` Gate E).
+/// Four-tier package capability roll-up (`DR-17` §3.1 & `Fix-17` Gate E).
 pub const PackageCapSummary = struct {
     /// Union of capabilities across all compiled items in the package/module (`ambient_caps`).
     ambient_caps: EffectCapabilityMask = .{},
-    /// Capabilities reachable from `main`, `pub` exports, `@export`, `@link_name`, or `@link_section`.
+    /// Capabilities reachable from `main`, `pub` exports, `@export`, `@wasm_export`, `@link_name`, or `@link_section`.
     reachable_caps: EffectCapabilityMask = .{},
     /// Capabilities reachable exclusively from `pub` surface items (`surface_caps`).
     surface_caps: EffectCapabilityMask = .{},
+    /// Capabilities of all `@export`, `@wasm_export`, `@link_name`, `@link_section`, and module `asm` items (`TrueAmbientCaps`).
+    link_ambient_caps: EffectCapabilityMask = .{},
 };
+
+/// Canonical per-file SAST capability summary alias (`DR-17` §3.1).
+pub const FileSastSummary = PackageCapSummary;
 
 /// Scope of `E0324` package capability policy enforcement (`DR-17` §4.1).
 pub const CapEnforcementScope = enum(u8) {
-    /// Enforce `allowed_caps` against `pub` surface exports (`surface_caps`, default library policy).
+    /// Enforce `allow_caps` against `pub` surface + `link_ambient_caps` + inactive `@cfg` (`surface`, default).
     surface = 0,
-    /// Enforce `allowed_caps` against all reachable export/entry roots (`reachable_caps`).
+    /// Enforce `allow_caps` against all reachable export/entry roots (`reachable_caps`).
     all = 1,
+    /// Explicit call-graph reachable mode (`RootCallGraphReachableIn(D) | TrueAmbientCaps(D)`).
+    reachable = 2,
 };
 
 /// Package capability policy declared in `corex.toml` / `corex.lock` (`DR-17` §3.1).
@@ -1094,12 +1103,94 @@ pub const PackageCapPolicy = struct {
     package_name: []const u8 = "root",
     /// Primary manifest/file span reported on policy violations.
     policy_span: Span = .{ .file_id = .none, .start_byte = 0, .end_byte = 0 },
-    /// Allowed `LOCKFILE_CAP_BITS` granted to this package (`0xFFFF` = unrestricted root binary).
+    /// Allowed `LOCKFILE_CAP_BITS` granted to this package (`0x0FFF` = unrestricted root binary).
     allowed_caps: EffectCapabilityMask = EffectCapabilityMask.fromBits(0x0FFF),
-    /// `true` when checking an external third-party dependency (gates `W0330` dead `ffi | unsafe_op`).
+    /// Optional explicit `[dependencies]` `allow_caps` ceiling (`null` falls back to `allowed_caps`).
+    allow_caps: ?EffectCapabilityMask = null,
+    /// Optional Trust-on-First-Lock `max_caps` ceiling recorded in `corex.lock` (`DR-17` §3.2).
+    locked_caps: ?EffectCapabilityMask = null,
+    /// Workspace-wide `forbid_global_caps` mask from root `[workspace.security]` (`DR-17` §4.1).
+    forbid_global_caps: EffectCapabilityMask = .{},
+    /// `true` when checking an external third-party dependency (gates `W0330` dead capabilities).
     is_third_party_dependency: bool = false,
-    /// Selects whether `E0324` inspects `surface_caps` (`.surface`) or `reachable_caps` (`.all`).
+    /// `true` when dead high-risk capabilities (`net | process | ffi | unsafe_op`) should emit `W0330`.
+    is_warning_ambient_dead_caps: bool = true,
+    /// Selects `.surface` vs `.all` / `.reachable` enforcement scope.
     enforcement_scope: CapEnforcementScope = .surface,
+
+    /// Computes the effective permitted capability bitmask (`(allow_caps orelse allowed_caps) & ~forbid_global_caps & locked_caps`).
+    pub inline fn effectiveAllowedCaps(self: PackageCapPolicy) EffectCapabilityMask {
+        var mask_bits = (self.allow_caps orelse self.allowed_caps).asBits();
+        mask_bits &= ~self.forbid_global_caps.asBits();
+        if (self.locked_caps) |locked| {
+            mask_bits &= locked.asBits();
+        }
+        return EffectCapabilityMask.fromBits(mask_bits);
+    }
+};
+
+/// Directed dependency capability policy edge `caller_pkg -> callee_pkg` in the resolved package graph.
+pub const WorkspacePackageEdge = struct {
+    /// Importing `PackageId`.
+    caller_pkg: symbol_resolver.PackageId,
+    /// Imported dependency `PackageId`.
+    callee_pkg: symbol_resolver.PackageId,
+    /// Dependency alias or display name on the import edge.
+    edge_label: []const u8 = "",
+    /// Manifest span of the `[dependencies]` entry on `caller_pkg`.
+    edge_span: Span = .{ .file_id = .none, .start_byte = 0, .end_byte = 0 },
+    /// Maximum capabilities `caller_pkg` grants to `callee_pkg` and its transitive dependency subtree.
+    allow_caps: EffectCapabilityMask = EffectCapabilityMask.fromBits(0x0FFF),
+};
+
+/// Optional cross-package call-site witness edge (`caller_pkg -> callee_pkg`) for `E0324` BFS traces.
+pub const CrossPackageCallWitness = struct {
+    /// Calling `PackageId`.
+    caller_pkg: symbol_resolver.PackageId,
+    /// Callee `PackageId`.
+    callee_pkg: symbol_resolver.PackageId,
+    /// Formatted caller function label (e.g., `"app.main"`).
+    caller_label: []const u8 = "",
+    /// Formatted callee function label (e.g., `"http.fetch"`).
+    callee_label: []const u8 = "",
+    /// Source span of the cross-package call site in `caller_pkg`.
+    call_span: Span = .{ .file_id = .none, .start_byte = 0, .end_byte = 0 },
+};
+
+/// Per-package capability summary and policy input passed to `verifyWorkspaceCapabilitySandbox`.
+pub const WorkspacePackageCapInput = struct {
+    /// Resolved `PackageId`.
+    pkg_id: symbol_resolver.PackageId,
+    /// Canonical package display label (e.g., `"corex-http@1.2.0"`).
+    package_name: []const u8,
+    /// Aggregated MIR SAST summary across all active files of `pkg_id`.
+    caps: PackageCapSummary = .{},
+    /// Dormant capabilities scanned across all `@cfg`-disabled CST subtrees of `pkg_id` (`P1-7`).
+    inactive_caps: EffectCapabilityMask = .{},
+    /// Dormant capabilities inside `pub` `@cfg`-disabled CST items of `pkg_id`.
+    pub_inactive_caps: EffectCapabilityMask = .{},
+    /// Source span of the first capability-bearing token inside an inactive `@cfg` branch.
+    first_inactive_cap_span: Span = .{ .file_id = .none, .start_byte = 0, .end_byte = 0 },
+    /// Capabilities reachable exclusively along call edges from `PackageId.root` (`null` uses `caps.reachable_caps`).
+    root_callgraph_reachable_caps: ?EffectCapabilityMask = null,
+    /// Source span of the first leaf item directly exercising a capability in `pkg_id`.
+    first_cap_leaf_span: Span = .{ .file_id = .none, .start_byte = 0, .end_byte = 0 },
+    /// Qualified symbol name of the first leaf item directly exercising a capability in `pkg_id`.
+    first_cap_leaf_name: []const u8 = "",
+    /// Sandbox policy governing `pkg_id`.
+    policy: PackageCapPolicy = .{},
+};
+
+/// Finalized whole-workspace capability report for a single `PackageId` (`DR-17` §3.1).
+pub const WorkspacePackageCapReport = struct {
+    /// Resolved `PackageId`.
+    pkg_id: symbol_resolver.PackageId,
+    /// Effective direct capabilities of `pkg_id` under its active `CapEnforcementScope`.
+    effective_caps: EffectCapabilityMask = .{},
+    /// Non-laundering transitive union `EffectiveCaps(D) | ⋃_{Q ∈ Deps*(D)} EffectiveCaps(Q)`.
+    subtree_caps: EffectCapabilityMask = .{},
+    /// Dead high-risk capabilities (`net | process | ffi | unsafe_op`) present outside reachable code.
+    dead_high_risk_caps: EffectCapabilityMask = .{},
 };
 
 // ---------------- SAST Configuration & Results ----------------
@@ -1139,6 +1230,8 @@ pub const SastConfig = struct {
     package_policy: ?PackageCapPolicy = null,
     /// Optional prefix count of primary `MirBody` slots emitting diagnostics/telemetry (used for SCC peers).
     primary_body_count: ?usize = null,
+    /// Optional owning `FileId` used to roll up non-body `@export`/module-`asm` ambient capabilities when `bodies.len == 0`.
+    file_id: FileId = .none,
 };
 
 /// Complete result of running Phase 6 SAST and drop/BCE elaboration across one or more `MirBody` items.
@@ -18088,6 +18181,103 @@ fn verifyNoThreadLocalBorrowsAcrossAwait(
     }
 }
 
+/// Returns `true` when `sym_idx` carries a `@wasm_export("…")` FFI contract in `sym_table`.
+fn hasSymbolWasmExport(sym_table: *const SymbolTable, sym_idx: SymbolIndex) bool {
+    if (sym_idx.isNone()) return false;
+    if (sym_table.getFfiContract(sym_idx)) |fc| {
+        return fc.wasm_export_name != .empty;
+    }
+    return false;
+}
+
+/// Returns `true` when `sym_idx` carries a `@wasm_import("…", "…")` FFI contract in `sym_table`.
+fn hasSymbolWasmImport(sym_table: *const SymbolTable, sym_idx: SymbolIndex) bool {
+    if (sym_idx.isNone()) return false;
+    if (sym_table.getFfiContract(sym_idx)) |fc| {
+        return fc.wasm_import_module != .empty or fc.wasm_import_name != .empty;
+    }
+    return false;
+}
+
+/// Returns `true` when `sym` is a defined linker/Wasm export (`@export`, `@wasm_export`, `@link_name`, `@link_section`).
+fn isSymbolDefinedLinkAmbientRoot(
+    sym_table: *const SymbolTable,
+    sym_idx: SymbolIndex,
+    sym: SymbolRecord,
+) bool {
+    if (sym.flags.is_prototype_only) return false;
+    return sym.contract_flags.is_export or
+        hasSymbolWasmExport(sym_table, sym_idx) or
+        sym.contract_flags.has_link_name or
+        sym.contract_flags.has_link_section;
+}
+
+/// Collects non-body symbol (`@export`/`@wasm_export`/`@link_section`/`extern`) and top-level `asm` ambient capabilities.
+fn collectSymbolAndCstAmbientCaps(
+    sym_table: *const SymbolTable,
+    file_id: FileId,
+    config: SastConfig,
+    out_caps: *PackageCapSummary,
+) void {
+    if (!file_id.isNone()) {
+        for (sym_table.symbols.items, 0..) |sym, raw_i| {
+            if (sym.flags.is_builtin or sym.flags.is_imported) continue;
+            if (sym.decl_span.file_id != file_id) continue;
+            const sym_idx = SymbolIndex.fromInt(@intCast(raw_i));
+            if (isSymbolDefinedLinkAmbientRoot(sym_table, sym_idx, sym)) {
+                const link_taint = EffectCapabilityMask{ .ffi = true, .unsafe_op = true };
+                out_caps.link_ambient_caps = out_caps.link_ambient_caps.unionWith(link_taint);
+                out_caps.reachable_caps = out_caps.reachable_caps.unionWith(link_taint);
+                out_caps.ambient_caps = out_caps.ambient_caps.unionWith(link_taint);
+                if (sym.visibility == .public) {
+                    out_caps.surface_caps = out_caps.surface_caps.unionWith(link_taint);
+                }
+            } else if (sym.flags.is_extern or hasSymbolWasmImport(sym_table, sym_idx)) {
+                out_caps.ambient_caps = out_caps.ambient_caps.unionWith(.{ .ffi = true });
+            }
+        }
+    }
+
+    const cst_arena = config.cst_arena orelse return;
+    const tok_buf = config.token_buffer orelse return;
+    const src = config.source_text orelse return;
+    if (cst_arena.countNodes() == 0) return;
+
+    // Detect top-level module `asm(…)` items in active CST (`TrueAmbientCaps`, `P2-4`):
+    var cur_idx: usize = 1;
+    const total_cst = cst_arena.countNodes();
+    while (cur_idx < total_cst) {
+        const node = cst_arena.getNode(mem_foundation.CstNodeIndex.fromInt(@intCast(cur_idx)));
+        const subtree_end = @min(cur_idx + @max(@as(usize, node.subtree_size), 1), total_cst);
+        if (node.kind == .fn_item or node.kind == .struct_item or node.kind == .enum_item or
+            node.kind == .union_item or node.kind == .impl_item or node.kind == .trait_item or
+            node.kind == .mod_item or node.kind == .test_item or node.kind == .bench_item or
+            node.kind == .use_item or node.kind == .const_item or node.kind == .extern_block_item or
+            node.kind == .extern_static_item or node.kind == .subscript_item)
+        {
+            cur_idx = subtree_end;
+            continue;
+        }
+        if (node.subtree_size <= 1 and !node.token.isNone() and node.token.asInt() < tok_buf.countTokens()) {
+            const tk = tok_buf.getToken(node.token).kind;
+            if (tk == .ident) {
+                const lex = symbol_resolver.extractTokenSlice(src, tok_buf, node.token);
+                if (std.mem.eql(u8, lex, "asm")) {
+                    const next_id = TokenIndex.fromInt(node.token.asInt() + 1);
+                    if (next_id.asInt() < tok_buf.countTokens() and tok_buf.getToken(next_id).kind == .lparen) {
+                        const asm_taint = EffectCapabilityMask{ .ffi = true, .unsafe_op = true };
+                        out_caps.link_ambient_caps = out_caps.link_ambient_caps.unionWith(asm_taint);
+                        out_caps.reachable_caps = out_caps.reachable_caps.unionWith(asm_taint);
+                        out_caps.ambient_caps = out_caps.ambient_caps.unionWith(asm_taint);
+                        break;
+                    }
+                }
+            }
+        }
+        cur_idx += 1;
+    }
+}
+
 /// Runs Pass 3 across all `bodies` in bottom-up Tarjan SCC order, populating `FnSummaryStore` & `PackageCapSummary`.
 fn runPass3SummaryContractsAndSandbox(
     allocator: std.mem.Allocator,
@@ -18116,32 +18306,32 @@ fn runPass3SummaryContractsAndSandbox(
         var direct_eff = EffectCapabilityMask.EMPTY;
         var contracts = summaries[slot_idx].contractsScratch();
 
+        const eff_body_sym = if (!body.symbol_index.isNone()) body.symbol_index else body.sast_owner_symbol;
+        const eff_body_def = if (!body.def_id.isNone()) body.def_id else body.sast_owner_def_id;
+        var resolved_sym_idx: SymbolIndex = eff_body_sym;
         var sym_opt: ?SymbolRecord = null;
-        if (!body.symbol_index.isNone() and body.symbol_index.asInt() < sym_table.symbols.items.len) {
-            sym_opt = sym_table.getSymbol(body.symbol_index).*;
-        } else if (!body.def_id.isNone()) {
-            if (sym_table.def_to_symbol.get(body.def_id.asInt())) |mapped_sym| {
+        if (!eff_body_sym.isNone() and eff_body_sym.asInt() < sym_table.symbols.items.len) {
+            sym_opt = sym_table.getSymbol(eff_body_sym).*;
+        } else if (!eff_body_def.isNone()) {
+            if (sym_table.def_to_symbol.get(eff_body_def.asInt())) |mapped_sym| {
+                resolved_sym_idx = mapped_sym;
                 sym_opt = sym_table.getSymbol(mapped_sym).*;
             }
         }
 
         if (sym_opt) |sym| {
+            const is_link_ambient = isSymbolDefinedLinkAmbientRoot(sym_table, resolved_sym_idx, sym);
+            const has_wasm_imp = hasSymbolWasmImport(sym_table, resolved_sym_idx);
             contracts.has_no_alloc = sym.contract_flags.is_no_alloc;
             contracts.has_no_panic = sym.contract_flags.is_no_panic;
             contracts.has_no_block = sym.contract_flags.is_no_block;
             contracts.has_pure_contract = sym.flags.is_comptime or sym.kind == .const_sym;
             contracts.has_max_stack_attr = sym.contract_flags.has_max_stack;
             contracts.is_std_cap_boundary = sym.contract_flags.is_std_cap_boundary;
-            contracts.is_ambient_export_root = (sym.visibility == .public) or
+            contracts.is_ambient_export_root = isSymbolExternallyCallableSurface(sym_table, resolved_sym_idx, sym) or
                 std.mem.eql(u8, sym.name_text, "main") or
-                sym.contract_flags.is_export or
-                sym.contract_flags.has_link_name or
-                sym.contract_flags.has_link_section;
-            if (sym.flags.is_extern or
-                sym.contract_flags.is_export or
-                sym.contract_flags.has_link_name or
-                sym.contract_flags.has_link_section)
-            {
+                is_link_ambient;
+            if (sym.flags.is_extern or has_wasm_imp or is_link_ambient) {
                 direct_eff.ffi = true;
                 direct_eff.unsafe_op = true;
             }
@@ -18906,6 +19096,94 @@ fn runPass3SummaryContractsAndSandbox(
         }
     }
 
+    // [2b] Merge sibling SAST slots (`is_sast_default_probe` & dual `let`/`inout` `subscript` arms) sharing a
+    // `SymbolIndex` or `DefId` so callers and `.cxi` observe 100% of default-arg & subscript capabilities (`P1-5`, `P1-6`):
+    {
+        const merge_cp = scratch_arena.checkpoint();
+        defer scratch_arena.restore(merge_cp);
+        const merge_alloc = scratch_arena.asAllocator();
+        const SiblingAccum = struct {
+            direct_bits: u16,
+            inferred_bits: u16,
+            max_subtree: u32,
+            has_primary_body: bool,
+        };
+        var sym_merge = std.AutoHashMapUnmanaged(u32, SiblingAccum){};
+        var def_merge = std.AutoHashMapUnmanaged(u32, SiblingAccum){};
+        const primary_ceil = config.primary_body_count orelse fn_count;
+        for (bodies[0..primary_ceil], 0..) |*body, s_i| {
+            const slot_sum = summaries[s_i];
+            var eff_sym = if (!body.symbol_index.isNone()) body.symbol_index else body.sast_owner_symbol;
+            const eff_def = if (!body.def_id.isNone()) body.def_id else body.sast_owner_def_id;
+            if (eff_sym.isNone() and !eff_def.isNone()) {
+                if (sym_table.def_to_symbol.get(eff_def.asInt())) |mapped_s| eff_sym = mapped_s;
+            }
+            if (!eff_sym.isNone()) {
+                const gop = try sym_merge.getOrPut(merge_alloc, eff_sym.asInt());
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = .{
+                        .direct_bits = slot_sum.direct_effects_bits,
+                        .inferred_bits = slot_sum.inferred_effects_bits,
+                        .max_subtree = slot_sum.max_subtree_bytes,
+                        .has_primary_body = !body.is_sast_default_probe,
+                    };
+                } else {
+                    gop.value_ptr.direct_bits |= slot_sum.direct_effects_bits;
+                    gop.value_ptr.inferred_bits |= slot_sum.inferred_effects_bits;
+                    if (slot_sum.max_subtree_bytes == FnRegionSummary.STACK_UNBOUNDED or
+                        gop.value_ptr.max_subtree == FnRegionSummary.STACK_UNBOUNDED)
+                    {
+                        gop.value_ptr.max_subtree = FnRegionSummary.STACK_UNBOUNDED;
+                    } else {
+                        gop.value_ptr.max_subtree = @max(gop.value_ptr.max_subtree, slot_sum.max_subtree_bytes);
+                    }
+                    if (!body.is_sast_default_probe) gop.value_ptr.has_primary_body = true;
+                }
+            } else if (!eff_def.isNone()) {
+                const gop = try def_merge.getOrPut(merge_alloc, eff_def.asInt());
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = .{
+                        .direct_bits = slot_sum.direct_effects_bits,
+                        .inferred_bits = slot_sum.inferred_effects_bits,
+                        .max_subtree = slot_sum.max_subtree_bytes,
+                        .has_primary_body = !body.is_sast_default_probe,
+                    };
+                } else {
+                    gop.value_ptr.direct_bits |= slot_sum.direct_effects_bits;
+                    gop.value_ptr.inferred_bits |= slot_sum.inferred_effects_bits;
+                    if (slot_sum.max_subtree_bytes == FnRegionSummary.STACK_UNBOUNDED or
+                        gop.value_ptr.max_subtree == FnRegionSummary.STACK_UNBOUNDED)
+                    {
+                        gop.value_ptr.max_subtree = FnRegionSummary.STACK_UNBOUNDED;
+                    } else {
+                        gop.value_ptr.max_subtree = @max(gop.value_ptr.max_subtree, slot_sum.max_subtree_bytes);
+                    }
+                    if (!body.is_sast_default_probe) gop.value_ptr.has_primary_body = true;
+                }
+            }
+        }
+        for (bodies[0..primary_ceil], 0..) |*body, s_i| {
+            var eff_sym = if (!body.symbol_index.isNone()) body.symbol_index else body.sast_owner_symbol;
+            const eff_def = if (!body.def_id.isNone()) body.def_id else body.sast_owner_def_id;
+            if (eff_sym.isNone() and !eff_def.isNone()) {
+                if (sym_table.def_to_symbol.get(eff_def.asInt())) |mapped_s| eff_sym = mapped_s;
+            }
+            if (!eff_sym.isNone()) {
+                if (sym_merge.get(eff_sym.asInt())) |acc| {
+                    summaries[s_i].direct_effects_bits = acc.direct_bits;
+                    summaries[s_i].inferred_effects_bits = acc.inferred_bits;
+                    summaries[s_i].max_subtree_bytes = acc.max_subtree;
+                }
+            } else if (!eff_def.isNone()) {
+                if (def_merge.get(eff_def.asInt())) |acc| {
+                    summaries[s_i].direct_effects_bits = acc.direct_bits;
+                    summaries[s_i].inferred_effects_bits = acc.inferred_bits;
+                    summaries[s_i].max_subtree_bytes = acc.max_subtree;
+                }
+            }
+        }
+    }
+
     // [3] Sort per-caller `WitnessCallEdge` slices deterministically & pack CSR `FnSummaryStore`:
     var store: FnSummaryStore = blk_store: {
         const out_summaries = try allocator.dupe(FnRegionSummary, summaries);
@@ -18922,8 +19200,8 @@ fn runPass3SummaryContractsAndSandbox(
 
         var total_edges: usize = 0;
         for (bodies, 0..) |*body, s_i| {
-            out_defs[s_i] = body.def_id;
-            out_syms[s_i] = body.symbol_index;
+            out_defs[s_i] = if (!body.def_id.isNone()) body.def_id else body.sast_owner_def_id;
+            out_syms[s_i] = if (!body.symbol_index.isNone()) body.symbol_index else body.sast_owner_symbol;
             out_files[s_i] = body.file_id;
             out_names[s_i] = body.name;
             std.mem.sort(WitnessCallEdge, per_body_edges[s_i].items, {}, struct {
@@ -18975,8 +19253,17 @@ fn runPass3SummaryContractsAndSandbox(
     };
     errdefer store.deinit();
 
-    // [4] Roll up `PackageCapSummary` (`ambient_caps`, `reachable_caps`, `surface_caps`) & emit contract diags:
+    // [4] Roll up `PackageCapSummary` (`ambient_caps`, `reachable_caps`, `surface_caps`, `link_ambient_caps`) & emit contract diags:
     var pkg_caps = PackageCapSummary{};
+    const fallback_fid: FileId = if (!config.file_id.isNone())
+        config.file_id
+    else if (bodies.len > 0)
+        bodies[0].file_id
+    else
+        .none;
+    collectSymbolAndCstAmbientCaps(sym_table, fallback_fid, config, &pkg_caps);
+    var emitted_contract_syms = std.AutoHashMapUnmanaged(u32, void){};
+    defer emitted_contract_syms.deinit(allocator);
     for (bodies, 0..) |*body, s_usize| {
         const slot_idx: u32 = @intCast(s_usize);
         var sum = store.summaries[s_usize];
@@ -18996,17 +19283,37 @@ fn runPass3SummaryContractsAndSandbox(
             pkg_caps.reachable_caps = pkg_caps.reachable_caps.unionWith(inferred);
         }
 
+        const eff_body_sym = if (!body.symbol_index.isNone()) body.symbol_index else body.sast_owner_symbol;
+        const eff_body_def = if (!body.def_id.isNone()) body.def_id else body.sast_owner_def_id;
+        var resolved_sym_idx: SymbolIndex = eff_body_sym;
         var sym_opt: ?SymbolRecord = null;
-        if (!body.symbol_index.isNone() and body.symbol_index.asInt() < sym_table.symbols.items.len) {
-            sym_opt = sym_table.getSymbol(body.symbol_index).*;
-        } else if (!body.def_id.isNone()) {
-            if (sym_table.def_to_symbol.get(body.def_id.asInt())) |ms| {
+        if (!eff_body_sym.isNone() and eff_body_sym.asInt() < sym_table.symbols.items.len) {
+            sym_opt = sym_table.getSymbol(eff_body_sym).*;
+        } else if (!eff_body_def.isNone()) {
+            if (sym_table.def_to_symbol.get(eff_body_def.asInt())) |ms| {
+                resolved_sym_idx = ms;
                 sym_opt = sym_table.getSymbol(ms).*;
             }
         }
         if (sym_opt) |srec| {
-            if (srec.visibility == .public) {
+            if (isSymbolExternallyCallableSurface(sym_table, resolved_sym_idx, srec)) {
                 pkg_caps.surface_caps = pkg_caps.surface_caps.unionWith(inferred);
+            }
+            if (isSymbolDefinedLinkAmbientRoot(sym_table, resolved_sym_idx, srec)) {
+                pkg_caps.link_ambient_caps = pkg_caps.link_ambient_caps.unionWith(inferred);
+            }
+        }
+
+        // Deduplicate contract diagnostics across sibling `subscript` / `is_sast_default_probe` slots:
+        if (!resolved_sym_idx.isNone()) {
+            const seen_gop = try emitted_contract_syms.getOrPut(allocator, resolved_sym_idx.asInt());
+            if (seen_gop.found_existing) {
+                if (pass2_outcomes[s_usize].emitted_error_count == 0 and
+                    pass4_outcomes[s_usize].emitted_error_count == 0)
+                {
+                    try verifyElaboratedMirBody(allocator, body, pool, sym_table);
+                }
+                continue;
             }
         }
 
@@ -19869,7 +20176,169 @@ fn appendConstInitializerMirBodiesForSast(
     }
 }
 
+/// Formats the shortest BFS dependency/call-chain witness from `start_idx` to a package exercising `forbidden_bits`.
+fn buildShortestWorkspaceCapWitness(
+    allocator: std.mem.Allocator,
+    packages: []const WorkspacePackageCapInput,
+    edges: []const WorkspacePackageEdge,
+    call_witnesses: []const CrossPackageCallWitness,
+    pkg_index_map: *const std.AutoHashMapUnmanaged(u16, usize),
+    effective_caps: []const EffectCapabilityMask,
+    start_idx: usize,
+    forbidden_bits: u16,
+    out_leaf_span: *?LabeledSpan,
+) !?[]u8 {
+    const pkg_count = packages.len;
+    if (start_idx >= pkg_count) return null;
+
+    var visited = try allocator.alloc(bool, pkg_count);
+    defer allocator.free(visited);
+    @memset(visited, false);
+    var parent_idx = try allocator.alloc(usize, pkg_count);
+    defer allocator.free(parent_idx);
+    @memset(parent_idx, std.math.maxInt(usize));
+    var queue = try allocator.alloc(usize, pkg_count);
+    defer allocator.free(queue);
+
+    var q_head: usize = 0;
+    var q_tail: usize = 0;
+    visited[start_idx] = true;
+    queue[q_tail] = start_idx;
+    q_tail += 1;
+
+    var found_leaf: ?usize = null;
+    while (q_head < q_tail) : (q_head += 1) {
+        const cur_idx = queue[q_head];
+        if ((effective_caps[cur_idx].asBits() & forbidden_bits) != 0) {
+            found_leaf = cur_idx;
+            break;
+        }
+        const cur_pkg = packages[cur_idx].pkg_id;
+        for (edges) |dep_edge| {
+            if (dep_edge.caller_pkg != cur_pkg) continue;
+            const next_idx = pkg_index_map.get(dep_edge.callee_pkg.asInt()) orelse continue;
+            if (!visited[next_idx]) {
+                visited[next_idx] = true;
+                parent_idx[next_idx] = cur_idx;
+                queue[q_tail] = next_idx;
+                q_tail += 1;
+            }
+        }
+    }
+
+    const leaf_idx = found_leaf orelse return null;
+    const leaf_pkg = packages[leaf_idx];
+    if (!leaf_pkg.first_cap_leaf_span.file_id.isNone()) {
+        out_leaf_span.* = .{
+            .span = leaf_pkg.first_cap_leaf_span,
+            .label = "capability originates in this package item",
+            .style = .secondary,
+        };
+    } else if (!leaf_pkg.first_inactive_cap_span.file_id.isNone()) {
+        out_leaf_span.* = .{
+            .span = leaf_pkg.first_inactive_cap_span,
+            .label = "dormant capability inside inactive `@cfg` branch here",
+            .style = .secondary,
+        };
+    }
+
+    var chain_indices: [64]usize = undefined;
+    var chain_len: usize = 0;
+    var trace_cur: usize = leaf_idx;
+    while (trace_cur < pkg_count and chain_len < chain_indices.len) {
+        chain_indices[chain_len] = trace_cur;
+        chain_len += 1;
+        if (trace_cur == start_idx) break;
+        trace_cur = parent_idx[trace_cur];
+    }
+
+    var note_buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer note_buf.deinit(allocator);
+    try note_buf.appendSlice(allocator, "shortest capability witness chain: ");
+    var rev_i: usize = chain_len;
+    while (rev_i > 0) {
+        rev_i -= 1;
+        const step_idx = chain_indices[rev_i];
+        if (rev_i + 1 < chain_len) {
+            try note_buf.appendSlice(allocator, " -> ");
+        }
+        try note_buf.append(allocator, '`');
+        try note_buf.appendSlice(allocator, packages[step_idx].package_name);
+        if (rev_i > 0) {
+            const next_step_pkg = packages[chain_indices[rev_i - 1]].pkg_id;
+            for (call_witnesses) |cw| {
+                if (cw.caller_pkg == packages[step_idx].pkg_id and cw.callee_pkg == next_step_pkg and
+                    cw.caller_label.len > 0)
+                {
+                    try note_buf.append(allocator, '.');
+                    try note_buf.appendSlice(allocator, cw.caller_label);
+                    break;
+                }
+            }
+        } else if (leaf_pkg.first_cap_leaf_name.len > 0) {
+            try note_buf.append(allocator, '.');
+            try note_buf.appendSlice(allocator, leaf_pkg.first_cap_leaf_name);
+        }
+        try note_buf.append(allocator, '`');
+    }
+    return try note_buf.toOwnedSlice(allocator);
+}
+
 // ------------------------------------- PUBLIC API --------------------------------------
+
+/// Returns `true` when `sym` is externally callable across package boundaries (`pub` item, or `Drop` /
+/// public/built-in trait `impl` method on a `.public` nominal owner type).
+pub fn isSymbolExternallyCallableSurface(
+    sym_table: *const SymbolTable,
+    sym_idx: SymbolIndex,
+    sym: SymbolRecord,
+) bool {
+    if (sym.visibility == .public) return true;
+    if (sym.kind != .fn_sym) return false;
+
+    const is_drop_method = std.mem.eql(u8, sym.name_text, "drop");
+    const is_pub_or_builtin_trait = if (!sym_idx.isNone()) blk: {
+        if (sym_table.impl_method_trait.get(sym_idx.asInt())) |trait_sym_idx| {
+            if (!trait_sym_idx.isNone() and trait_sym_idx.asInt() < sym_table.symbols.items.len) {
+                const trait_sym = sym_table.getSymbol(trait_sym_idx);
+                break :blk trait_sym.visibility == .public or trait_sym.flags.is_builtin;
+            }
+        }
+        break :blk false;
+    } else false;
+    if (!is_drop_method and !is_pub_or_builtin_trait) return false;
+
+    if (!sym.scope_id.isNone() and sym.scope_id.asInt() < sym_table.scope_arena.scopes.len) {
+        const scope_rec = sym_table.scope_arena.scopes.get(sym.scope_id.asInt());
+        if (scope_rec.kind == .nominal_type_scope) {
+            if (!scope_rec.owner_def_id.isNone()) {
+                if (sym_table.def_to_symbol.get(scope_rec.owner_def_id.asInt())) |owner_sym_idx| {
+                    if (!owner_sym_idx.isNone() and owner_sym_idx.asInt() < sym_table.symbols.items.len) {
+                        const owner_sym = sym_table.getSymbol(owner_sym_idx);
+                        if (owner_sym.namespace == .type_ns) return owner_sym.visibility == .public;
+                    }
+                }
+            }
+            if (!scope_rec.parent.isNone() and scope_rec.parent.asInt() < sym_table.scope_arena.scopes.len) {
+                for (sym_table.getScopeMembers(scope_rec.parent)) |cand_idx| {
+                    const cand_sym = sym_table.getSymbol(cand_idx);
+                    if (cand_sym.namespace == .type_ns and cand_sym.target_scope == sym.scope_id) {
+                        return cand_sym.visibility == .public;
+                    }
+                }
+            }
+        }
+    }
+    if (!sym.owner_def_id.isNone()) {
+        if (sym_table.def_to_symbol.get(sym.owner_def_id.asInt())) |owner_sym_idx| {
+            if (!owner_sym_idx.isNone() and owner_sym_idx.asInt() < sym_table.symbols.items.len) {
+                const owner_sym = sym_table.getSymbol(owner_sym_idx);
+                if (owner_sym.namespace == .type_ns) return owner_sym.visibility == .public;
+            }
+        }
+    }
+    return false;
+}
 
 /// Verifies `PackageCapSummary` against `PackageCapPolicy` (`Fix-17` Gate E: `E0324` & `W0330`).
 pub fn verifyPackageCapPolicy(
@@ -19879,10 +20348,11 @@ pub fn verifyPackageCapPolicy(
     diagnostic_sink: ?*DiagnosticSink,
 ) !void {
     const active_caps = switch (policy.enforcement_scope) {
-        .surface => pkg_caps.surface_caps,
-        .all => pkg_caps.reachable_caps,
+        .surface => pkg_caps.surface_caps.unionWith(pkg_caps.link_ambient_caps),
+        .all, .reachable => pkg_caps.reachable_caps.unionWith(pkg_caps.link_ambient_caps),
     };
-    const unauthorized_bits = (active_caps.asBits() & ~policy.allowed_caps.asBits()) &
+    const permitted_bits = policy.effectiveAllowedCaps().asBits();
+    const unauthorized_bits = (active_caps.asBits() & ~permitted_bits) &
         (EffectCapabilityMask.LOCKFILE_CAP_BITS | EffectCapabilityMask.INDIRECT_OPAQUE_BIT);
     if (unauthorized_bits != 0) {
         const cap_names = try formatEffectBitsList(allocator, unauthorized_bits);
@@ -19906,11 +20376,12 @@ pub fn verifyPackageCapPolicy(
         );
     }
 
-    if (policy.is_third_party_dependency) {
-        const dead_ffi_unsafe = (pkg_caps.ambient_caps.asBits() & ~pkg_caps.reachable_caps.asBits()) &
-            EffectCapabilityMask.FFI_UNSAFE_BITS & ~policy.allowed_caps.asBits();
-        if (dead_ffi_unsafe != 0) {
-            const cap_names = try formatEffectBitsList(allocator, dead_ffi_unsafe);
+    if (policy.is_third_party_dependency and policy.is_warning_ambient_dead_caps) {
+        const live_reachable = pkg_caps.reachable_caps.unionWith(pkg_caps.link_ambient_caps);
+        const dead_high_risk = (pkg_caps.ambient_caps.asBits() & ~live_reachable.asBits()) &
+            EffectCapabilityMask.HIGH_RISK_DEAD_CAP_BITS & ~permitted_bits;
+        if (dead_high_risk != 0) {
+            const cap_names = try formatEffectBitsList(allocator, dead_high_risk);
             defer allocator.free(cap_names);
             const msg = try std.fmt.allocPrint(
                 allocator,
@@ -19933,6 +20404,209 @@ pub fn verifyPackageCapPolicy(
     }
 }
 
+/// Verifies whole-workspace non-laundering capability monotonicity (`E0324` with shortest BFS witness) and
+/// dead third-party high-risk capability warnings (`W0330`) across all resolved packages (`DR-17` §3.1).
+pub fn verifyWorkspaceCapabilitySandbox(
+    allocator: std.mem.Allocator,
+    packages: []const WorkspacePackageCapInput,
+    edges: []const WorkspacePackageEdge,
+    call_witnesses: []const CrossPackageCallWitness,
+    diagnostic_sink: ?*DiagnosticSink,
+) ![]WorkspacePackageCapReport {
+    const pkg_count = packages.len;
+    const reports = try allocator.alloc(WorkspacePackageCapReport, pkg_count);
+    errdefer if (reports.len > 0) allocator.free(reports);
+    if (pkg_count == 0) return reports;
+
+    var pkg_index_map = std.AutoHashMapUnmanaged(u16, usize){};
+    defer pkg_index_map.deinit(allocator);
+    try pkg_index_map.ensureTotalCapacity(allocator, @intCast(pkg_count));
+
+    var effective_caps = try allocator.alloc(EffectCapabilityMask, pkg_count);
+    defer allocator.free(effective_caps);
+    var subtree_caps = try allocator.alloc(EffectCapabilityMask, pkg_count);
+    defer allocator.free(subtree_caps);
+
+    // [1] Compute per-package `EffectiveCaps(D)` under `.surface` vs `.reachable`/`.all`:
+    for (packages, 0..) |pkg_in, idx| {
+        try pkg_index_map.put(allocator, pkg_in.pkg_id.asInt(), idx);
+        const true_ambient = pkg_in.caps.link_ambient_caps;
+        const eff = switch (pkg_in.policy.enforcement_scope) {
+            .surface => pkg_in.caps.surface_caps
+                .unionWith(true_ambient)
+                .unionWith(pkg_in.inactive_caps)
+                .unionWith(pkg_in.pub_inactive_caps),
+            .all, .reachable => (pkg_in.root_callgraph_reachable_caps orelse pkg_in.caps.reachable_caps)
+                .unionWith(true_ambient),
+        };
+        effective_caps[idx] = eff;
+        subtree_caps[idx] = eff;
+    }
+
+    // [2] Propagate non-laundering transitive `SubtreeCaps(D) = EffectiveCaps(D) | ⋃_{Q ∈ Deps*(D)} EffectiveCaps(Q)`:
+    var pass_iter: usize = 0;
+    while (pass_iter < pkg_count) : (pass_iter += 1) {
+        var has_any_change = false;
+        for (edges) |dep_edge| {
+            const caller_idx = pkg_index_map.get(dep_edge.caller_pkg.asInt()) orelse continue;
+            const callee_idx = pkg_index_map.get(dep_edge.callee_pkg.asInt()) orelse continue;
+            const merged = subtree_caps[caller_idx].unionWith(subtree_caps[callee_idx]);
+            if (merged.asBits() != subtree_caps[caller_idx].asBits()) {
+                subtree_caps[caller_idx] = merged;
+                has_any_change = true;
+            }
+        }
+        if (!has_any_change) break;
+    }
+
+    const checked_cap_mask: u16 = EffectCapabilityMask.LOCKFILE_CAP_BITS | EffectCapabilityMask.INDIRECT_OPAQUE_BIT;
+
+    // [3] Verify per-package `policy` (`locked_caps`, `forbid_global_caps`, `allow_caps`) & `W0330`:
+    for (packages, 0..) |pkg_in, idx| {
+        const all_ambient = pkg_in.caps.ambient_caps.unionWith(pkg_in.inactive_caps);
+        const live_reachable = (pkg_in.root_callgraph_reachable_caps orelse pkg_in.caps.reachable_caps)
+            .unionWith(pkg_in.caps.link_ambient_caps);
+        const permitted_bits = pkg_in.policy.effectiveAllowedCaps().asBits();
+        const dead_bits = (all_ambient.asBits() & ~live_reachable.asBits()) &
+            EffectCapabilityMask.HIGH_RISK_DEAD_CAP_BITS & ~permitted_bits;
+
+        reports[idx] = .{
+            .pkg_id = pkg_in.pkg_id,
+            .effective_caps = effective_caps[idx],
+            .subtree_caps = subtree_caps[idx],
+            .dead_high_risk_caps = EffectCapabilityMask.fromBits(dead_bits),
+        };
+
+        const unauthorized_self = (subtree_caps[idx].asBits() & ~permitted_bits) & checked_cap_mask;
+        if (unauthorized_self != 0) {
+            const cap_names = try formatEffectBitsList(allocator, unauthorized_self);
+            defer allocator.free(cap_names);
+            var leaf_label: ?LabeledSpan = null;
+            const witness_note = try buildShortestWorkspaceCapWitness(
+                allocator,
+                packages,
+                edges,
+                call_witnesses,
+                &pkg_index_map,
+                effective_caps,
+                idx,
+                unauthorized_self,
+                &leaf_label,
+            );
+            defer if (witness_note) |wn_buf| allocator.free(wn_buf);
+            const base_help = "grant the capability in `[dependencies]` / update `corex.lock` or remove the offending dependency path";
+            const full_note = if (witness_note) |wn_str|
+                try std.fmt.allocPrint(allocator, "{s}\nhelp: {s}", .{ wn_str, base_help })
+            else
+                try allocator.dupe(u8, base_help);
+            defer allocator.free(full_note);
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "package `{s}` exercises unauthorized capability `{s}` exceeding `corex.toml` / `corex.lock` policy",
+                .{ pkg_in.package_name, cap_names },
+            );
+            defer allocator.free(msg);
+            try emitSastDiag(
+                diagnostic_sink,
+                .e0324_package_capability_violation,
+                .err,
+                pkg_in.policy.policy_span,
+                msg,
+                "capability exceeds package sandbox or lockfile `max_caps` ceiling",
+                leaf_label,
+                null,
+                full_note,
+            );
+        }
+
+        if (pkg_in.policy.is_third_party_dependency and pkg_in.policy.is_warning_ambient_dead_caps and dead_bits != 0) {
+            const cap_names = try formatEffectBitsList(allocator, dead_bits);
+            defer allocator.free(cap_names);
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "dependency `{s}` contains unreachable ambient `{s}` code outside exported call graph",
+                .{ pkg_in.package_name, cap_names },
+            );
+            defer allocator.free(msg);
+            try emitSastDiag(
+                diagnostic_sink,
+                .w0330_ambient_dead_capability_in_dep,
+                .warning,
+                pkg_in.policy.policy_span,
+                msg,
+                "dead high-risk capability present in dependency source",
+                null,
+                null,
+                "audit unreachable `net`/`process`/`extern`/`unsafe` items in this third-party dependency",
+            );
+        }
+    }
+
+    // [4] Verify incoming edge `allow_caps(P -> D)` non-laundering subtree monotonicity:
+    for (edges) |dep_edge| {
+        const caller_idx = pkg_index_map.get(dep_edge.caller_pkg.asInt()) orelse continue;
+        const callee_idx = pkg_index_map.get(dep_edge.callee_pkg.asInt()) orelse continue;
+        const edge_permitted = dep_edge.allow_caps.asBits() & ~packages[caller_idx].policy.forbid_global_caps.asBits();
+        const edge_unauthorized = (subtree_caps[callee_idx].asBits() & ~edge_permitted) & checked_cap_mask;
+        if (edge_unauthorized == 0) continue;
+
+        // Avoid duplicate emission if `callee_idx` already reported identical `unauthorized_self` on the same span:
+        const callee_self_permitted = packages[callee_idx].policy.effectiveAllowedCaps().asBits();
+        const callee_self_unauth = (subtree_caps[callee_idx].asBits() & ~callee_self_permitted) & checked_cap_mask;
+        if ((edge_unauthorized & ~callee_self_unauth) == 0 and
+            dep_edge.edge_span.file_id == packages[callee_idx].policy.policy_span.file_id and
+            dep_edge.edge_span.start_byte == packages[callee_idx].policy.policy_span.start_byte)
+        {
+            continue;
+        }
+
+        const cap_names = try formatEffectBitsList(allocator, edge_unauthorized);
+        defer allocator.free(cap_names);
+        var leaf_label: ?LabeledSpan = null;
+        const witness_note = try buildShortestWorkspaceCapWitness(
+            allocator,
+            packages,
+            edges,
+            call_witnesses,
+            &pkg_index_map,
+            effective_caps,
+            caller_idx,
+            edge_unauthorized,
+            &leaf_label,
+        );
+        defer if (witness_note) |wn_buf| allocator.free(wn_buf);
+        const edge_help = "add the capability to `allow_caps` on this dependency edge or replace the transitive dependency";
+        const edge_full_note = if (witness_note) |wn_str|
+            try std.fmt.allocPrint(allocator, "{s}\nhelp: {s}", .{ wn_str, edge_help })
+        else
+            try allocator.dupe(u8, edge_help);
+        defer allocator.free(edge_full_note);
+        const callee_display = if (dep_edge.edge_label.len > 0)
+            dep_edge.edge_label
+        else
+            packages[callee_idx].package_name;
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "dependency `{s}` (imported by `{s}`) transitively reaches capability `{s}` not granted by `allow_caps`",
+            .{ callee_display, packages[caller_idx].package_name, cap_names },
+        );
+        defer allocator.free(msg);
+        try emitSastDiag(
+            diagnostic_sink,
+            .e0324_package_capability_violation,
+            .err,
+            dep_edge.edge_span,
+            msg,
+            "transitive dependency capability exceeds `allow_caps` on this import edge",
+            leaf_label,
+            null,
+            edge_full_note,
+        );
+    }
+
+    return reports;
+}
+
 /// Runs the complete Phase 6 SAST & Elaboration pipeline (`Pass 1`, `Pass 2`, `Pass 4`, `Pass 3`) in-place on `bodies`.
 pub fn analyzeAndElaborateMirModule(
     allocator: std.mem.Allocator,
@@ -19953,13 +20627,14 @@ pub fn analyzeAndElaborateMirModule(
             },
         };
         errdefer res.deinit();
+        collectSymbolAndCstAmbientCaps(sym_table, config.file_id, config, &res.package_caps);
         if (config.package_policy) |policy| {
             try verifyPackageCapPolicy(allocator, res.package_caps, policy, config.diagnostic_sink);
         }
         return res;
     }
 
-    // [1] Build $O(1)$ `(node_key -> slot)` and `(SymbolIndex -> slot)` maps:
+    // [1] Build $O(1)$ `(node_key -> slot)` and `(SymbolIndex -> slot)` maps (keeping primary bodies over SAST probes):
     var key_to_slot = std.AutoHashMapUnmanaged(u32, u32){};
     defer key_to_slot.deinit(allocator);
     var sym_to_slot = std.AutoHashMapUnmanaged(u32, u32){};
@@ -19967,12 +20642,23 @@ pub fn analyzeAndElaborateMirModule(
 
     for (bodies, 0..) |*body, s_i| {
         const slot_u32: u32 = @intCast(s_i);
-        try key_to_slot.put(allocator, nodeKeyForBody(body, slot_u32), slot_u32);
-        if (!body.symbol_index.isNone()) {
-            try sym_to_slot.put(allocator, body.symbol_index.asInt(), slot_u32);
-        } else if (!body.def_id.isNone()) {
-            if (sym_table.def_to_symbol.get(body.def_id.asInt())) |mapped_sym| {
-                try sym_to_slot.put(allocator, mapped_sym.asInt(), slot_u32);
+        const primary_key = nodeKeyForBody(body, slot_u32);
+        if (body.is_sast_default_probe or key_to_slot.contains(primary_key)) {
+            try key_to_slot.put(allocator, ANON_BODY_KEY_FLAG | slot_u32, slot_u32);
+        } else {
+            try key_to_slot.put(allocator, primary_key, slot_u32);
+        }
+        if (!body.is_sast_default_probe) {
+            if (!body.symbol_index.isNone()) {
+                if (!sym_to_slot.contains(body.symbol_index.asInt())) {
+                    try sym_to_slot.put(allocator, body.symbol_index.asInt(), slot_u32);
+                }
+            } else if (!body.def_id.isNone()) {
+                if (sym_table.def_to_symbol.get(body.def_id.asInt())) |mapped_sym| {
+                    if (!sym_to_slot.contains(mapped_sym.asInt())) {
+                        try sym_to_slot.put(allocator, mapped_sym.asInt(), slot_u32);
+                    }
+                }
             }
         }
     }
@@ -20059,11 +20745,11 @@ pub fn analyzeAndElaborateMirModule(
             const cp = scratch_arena.checkpoint();
             defer scratch_arena.restore(cp);
             const arena_alloc = scratch_arena.asAllocator();
+            const body = &bodies[slot_u32];
             const is_primary_slot = slot_u32 < primary_limit;
             var body_cfg = config;
-            if (!is_primary_slot) body_cfg.diagnostic_sink = null;
+            if (!is_primary_slot or body.is_sast_default_probe) body_cfg.diagnostic_sink = null;
 
-            const body = &bodies[slot_u32];
             const trie = try buildMovePathTrie(arena_alloc, body, pool, sym_table);
             const horizon = try computeBodyProvenanceAndNllHorizon(
                 arena_alloc,
@@ -20095,7 +20781,7 @@ pub fn analyzeAndElaborateMirModule(
                 &per_body_edges[slot_u32],
                 body_cfg,
             );
-            if (is_primary_slot) {
+            if (is_primary_slot and !body.is_sast_default_probe and !body.is_sast_subscript_probe) {
                 total_emitted_drops += pass2_outcomes[slot_u32].emitted_drops;
             }
 
@@ -20120,7 +20806,7 @@ pub fn analyzeAndElaborateMirModule(
                 has_no_panic_attr,
                 body_cfg,
             );
-            if (is_primary_slot) {
+            if (is_primary_slot and !body.is_sast_default_probe and !body.is_sast_subscript_probe) {
                 total_elim_bce += pass4_outcomes[slot_u32].eliminated_bounds_checks;
                 total_elim_narrow += pass4_outcomes[slot_u32].eliminated_narrow_checks;
                 max_pentagon_bytes = @max(max_pentagon_bytes, pass4_outcomes[slot_u32].peak_pentagon_bytes);
@@ -22861,4 +23547,51 @@ test "test_phase8_hardening_nursery_task_handle_raw_provenance_linear_future_spo
         defer h5_ok_b.deinit();
         try std.testing.expect(!h5_ok_b.diagnostics.hasErrors());
     }
+}
+
+test "test_phase9_surface_drop_impl_and_link_ambient_policy_enforcement" {
+    const allocator = std.testing.allocator;
+    const drop_surface_src =
+        \\extern "C" {
+        \\    fn sneaky_ffi();
+        \\}
+        \\pub struct PublicGuard {
+        \\    pub val: i32,
+        \\}
+        \\impl Drop for PublicGuard {
+        \\    fn drop(&mut self) {
+        \\        unsafe { sneaky_ffi(); }
+        \\    }
+        \\}
+    ;
+    var drop_res = try lowerAndVerifySourceMirSast(
+        allocator,
+        FileId.fromInt(112),
+        drop_surface_src,
+        TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer drop_res.deinit();
+    try std.testing.expect(!drop_res.diagnostics.hasErrors());
+    try std.testing.expect(drop_res.sast_result.package_caps.surface_caps.ffi);
+    try std.testing.expect(drop_res.sast_result.package_caps.surface_caps.unsafe_op);
+    try std.testing.expect(drop_res.sast_result.package_caps.reachable_caps.ffi);
+    try std.testing.expect(drop_res.sast_result.package_caps.reachable_caps.unsafe_op);
+
+    var policy_sink = DiagnosticSink.init(allocator);
+    defer policy_sink.deinit();
+    const link_only_caps = PackageCapSummary{
+        .link_ambient_caps = .{ .ffi = true, .unsafe_op = true },
+    };
+    try verifyPackageCapPolicy(
+        allocator,
+        link_only_caps,
+        .{
+            .package_name = "sneaky-dep",
+            .allowed_caps = EffectCapabilityMask.EMPTY,
+            .enforcement_scope = .surface,
+        },
+        &policy_sink,
+    );
+    try std.testing.expect(policy_sink.hasErrors());
 }

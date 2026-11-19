@@ -164,7 +164,7 @@ Posting *"I built a new programming language"* in isolation invites bikeshedding
         -   *How CoreX eliminates bounds checks and use-after-free in O(V) without Rust lifetime parameters* (`r/ProgrammingLanguages`, Lobste.rs).
         -   *Show HN: `<ToolName>` – A sub-millisecond `<utility>` written in CoreX*.
 3.  **Seed Early Ecosystem Repositories:**
-    -   Publish 4–6 clean, focused wrapper packages under `corex-lang` or personal repos (`raylib-cx`, `sdl3-cx`, `sqlite-cx`, `zstd-cx`) consumable via Phase 9 direct Git URL imports (`corex.toml`), demonstrating effortless C library wrapping for early contributors.
+    -   Publish 4–6 clean, focused wrapper packages under `corex-lang` or personal repos (`raylib-cx`, `sdl3-cx`, `sqlite-cx`, `zstd-cx`) consumable via direct Git URL imports (`corex.toml` and `use "github.com/…@v1.0.0" as …;`, `[Live]` in Stage 0), demonstrating effortless C library wrapping for early contributors.
     -   Promote the 4 **GitHub Template** starter repos (`corex-starter`, `corex-cli-starter`, `corex-aoc-starter`, `corex-c-interop-starter`) in the Quickstart guide so every tutorial reader clicks **Use this template** instead of **Fork**.
 
 ---

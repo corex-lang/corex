@@ -1680,14 +1680,14 @@ test "test_phase6_fix17_gates_a_to_f_sandbox_policies_and_fix06b_vacated_w0329" 
     try std.testing.expect(dev_art.has_errors);
     try std.testing.expect(hasDiagnosticCode(db.getComptimeDiagnostics(dev_def).?, .e0326_embed_path_escape));
 
-    // [3] `Fix-17` Gate E (`[MINOR-19]`): `PackageCapPolicy` `.surface` vs `.all` (`E0324`) & dead `ffi` (`W0330`):
+    // [3] `Fix-17` Gate E (`[MINOR-19]` & `DR-17` §3.1): `PackageCapPolicy` `.surface` vs `.all` (`E0324`),
+    //     `TrueAmbientCaps` (`@export`) enforced under `.surface`, & dead `ffi` (`W0330`):
     const pkg_scope_src =
         \\extern "C" fn raw_net_send() -> i32;
         \\pub fn pure_surface_api(val: i32) -> i32 {
         \\    return val +% 10;
         \\}
-        \\@export
-        \\fn internal_export_root() -> i32 {
+        \\fn main() -> i32 {
         \\    return unsafe { raw_net_send() };
         \\}
         \\fn dead_ambient_helper() -> i32 {
@@ -1708,6 +1708,21 @@ test "test_phase6_fix17_gates_a_to_f_sandbox_policies_and_fix06b_vacated_w0329" 
         .{ .package_policy = surface_policy },
     );
     defer surface_bundle.deinit();
+
+    const export_ambient_src =
+        \\extern "C" fn raw_net_send() -> i32;
+        \\@export
+        \\fn internal_export_root() -> i32 {
+        \\    return unsafe { raw_net_send() };
+        \\}
+    ;
+    try expectSastDiagnostic(
+        allocator,
+        326,
+        export_ambient_src,
+        .{ .package_policy = surface_policy },
+        .e0324_package_capability_violation,
+    );
 
     var all_policy = surface_policy;
     all_policy.enforcement_scope = CapEnforcementScope.all;

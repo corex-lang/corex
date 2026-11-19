@@ -182,10 +182,49 @@ const ParsedAttrSlice = struct {
     attr_len: u32 = 0,
 };
 
+/// Borrowed structural view over an inline package `use "<spec>" as <alias>;` item (`DR-11` §2.1).
+pub const InlineUseDeclView = struct {
+    /// AST `.use_decl` node index (`NodeIndex.none` when extracted directly from CST).
+    ast_node: NodeIndex = .none,
+    /// Enclosing `.use_item` CST node index.
+    item_cst: CstNodeIndex = .none,
+    /// `.string_lit` token carrying the quoted package specifier.
+    spec_token: TokenIndex,
+    /// Unquoted dependency specifier slice (`<pkg>@<req>`, `https://…`, `git+…`, `./…`).
+    unquoted_spec: []const u8,
+    /// Identifier token carrying the `<snake_alias>` package binding (`TokenIndex.none` on missing alias).
+    alias_token: TokenIndex,
+    /// Borrowed `<snake_alias>` identifier slice (`""` when `alias_token` is missing).
+    alias_slice: []const u8,
+    /// Byte span of `spec_token`.
+    spec_span: Span,
+    /// Byte span of `alias_token` (or `spec_span` when `alias_token` is missing).
+    alias_span: Span,
+    /// Byte span covering the full `.use_item` declaration.
+    decl_span: Span,
+    /// `true` when the `.use_item` carries a `pub` visibility modifier.
+    is_pub: bool = false,
+};
+
 // --------------------------------------- CONSTS ----------------------------------------
 
 /// Hard upper bound on non-mutating `LL(k)` token lookahead steps (`DR-21` Section 1.5).
 pub const MAX_TYPE_LOOKAHEAD: usize = 64;
+
+/// Maximum byte length of an unquoted inline `use "<spec>" as <alias>;` package specifier.
+pub const MAX_INLINE_USE_SPEC_BYTES: usize = 512;
+
+/// Reserved identifiers forbidden as inline package import aliases (`E0013`, `DR-11` §2.1).
+pub const RESERVED_INLINE_USE_ALIAS_MAP = std.StaticStringMap(void).initComptime(.{
+    .{ "Self", {} },
+    .{ "_", {} },
+    .{ "core", {} },
+    .{ "cx", {} },
+    .{ "pkg", {} },
+    .{ "self", {} },
+    .{ "std", {} },
+    .{ "super", {} },
+});
 
 /// Canonical C ABI primitive type alias identifiers exempted from `W0201` `PascalCase` checks (`DR-10` §2.1).
 pub const CANONICAL_C_TYPE_ALIASES = std.StaticStringMap(void).initComptime(.{
@@ -562,6 +601,120 @@ inline fn isLiteralToken(kind: TokenKind) bool {
 /// Returns `true` if `byte_val` can continue an ASCII identifier (`[A-Za-z0-9_]`).
 inline fn isAsciiIdentContinue(byte_val: u8) bool {
     return std.ascii.isAlphanumeric(byte_val) or byte_val == '_';
+}
+
+/// Extracts the inner unquoted slice of a plain single-line `.string_lit` lexeme (`null` on multiline or interpolated).
+fn extractSingleLineUnquotedSpec(lexeme: []const u8) ?[]const u8 {
+    if (lexeme.len < 2) return null;
+    if (std.mem.startsWith(u8, lexeme, "\"\"\"")) return null;
+    if (lexeme[0] == 'r') {
+        var hash_count: usize = 0;
+        var idx: usize = 1;
+        while (idx < lexeme.len and lexeme[idx] == '#') : (idx += 1) {
+            hash_count += 1;
+        }
+        if (idx >= lexeme.len or lexeme[idx] != '"') return null;
+        if (std.mem.startsWith(u8, lexeme[idx..], "\"\"\"")) return null;
+        const suffix_len = 1 + hash_count;
+        if (lexeme.len < idx + 1 + suffix_len) return null;
+        const close_pos = lexeme.len - suffix_len;
+        if (lexeme[close_pos] != '"') return null;
+        const inner_raw = lexeme[idx + 1 .. close_pos];
+        if (std.mem.indexOfAny(u8, inner_raw, "\r\n") != null) return null;
+        return inner_raw;
+    }
+    if (lexeme[0] != '"' or lexeme[lexeme.len - 1] != '"') return null;
+    const inner_slice = lexeme[1 .. lexeme.len - 1];
+    var i: usize = 0;
+    while (i < inner_slice.len) : (i += 1) {
+        const byte_val = inner_slice[i];
+        if (byte_val == '\n' or byte_val == '\r' or byte_val == 0) return null;
+        if (byte_val == '\\') {
+            if (i + 1 >= inner_slice.len) return null;
+            i += 1;
+            continue;
+        }
+        if (byte_val == '{' or byte_val == '}') return null;
+    }
+    return inner_slice;
+}
+
+/// Validates syntactic well-formedness of an unquoted inline `use "<spec>"` package specifier (`DR-11` §1.2).
+pub fn isValidInlineUseSpec(raw_spec: []const u8) bool {
+    if (raw_spec.len == 0 or raw_spec.len > MAX_INLINE_USE_SPEC_BYTES) return false;
+    if (raw_spec[0] == ' ' or raw_spec[raw_spec.len - 1] == ' ') return false;
+    for (raw_spec) |byte_val| {
+        if (byte_val < 0x20 or byte_val == 0x7F or byte_val == '\\') return false;
+    }
+
+    // [1] Local relative directory paths (`./…` or `../…`):
+    if (std.mem.startsWith(u8, raw_spec, "./") or std.mem.startsWith(u8, raw_spec, "../")) {
+        if (std.mem.indexOfScalar(u8, raw_spec, ' ') != null) return false;
+        const rel_tail = if (std.mem.startsWith(u8, raw_spec, "./")) raw_spec[2..] else raw_spec[3..];
+        return rel_tail.len > 0;
+    }
+
+    // [2] Shorthand GitHub / GitLab repository specifiers (`github.com/<org>/<repo>[@<rev>]`):
+    if (std.mem.startsWith(u8, raw_spec, "github.com/") or std.mem.startsWith(u8, raw_spec, "gitlab.com/")) {
+        if (std.mem.indexOfScalar(u8, raw_spec, ' ') != null) return false;
+        const after_host = raw_spec["github.com/".len..];
+        const repo_path = if (std.mem.lastIndexOfAny(u8, after_host, "@#")) |sep_pos| blk: {
+            if (sep_pos == 0 or sep_pos + 1 >= after_host.len) return false;
+            break :blk after_host[0..sep_pos];
+        } else after_host;
+        const slash_pos = std.mem.indexOfScalar(u8, repo_path, '/') orelse return false;
+        if (slash_pos == 0 or slash_pos + 1 >= repo_path.len) return false;
+        return repo_path[repo_path.len - 1] != '/' and std.mem.indexOf(u8, repo_path, "//") == null;
+    }
+
+    // [3] Explicit Git / HTTPS URLs (`https://…`, `git+https://…`, `git+ssh://…`, `git+file://…`):
+    const url_schemes = [_][]const u8{
+        "https://",
+        "git+https://",
+        "git+ssh://",
+        "git+file://",
+    };
+    for (url_schemes) |scheme| {
+        if (std.mem.startsWith(u8, raw_spec, scheme)) {
+            if (std.mem.indexOfScalar(u8, raw_spec, ' ') != null) return false;
+            const after_scheme = raw_spec[scheme.len..];
+            if (after_scheme.len == 0) return false;
+            if (std.mem.lastIndexOfAny(u8, raw_spec, "@#")) |sep_idx| {
+                const is_ssh_at = std.mem.startsWith(u8, raw_spec, "git+ssh://git@") and sep_idx < 16;
+                if (!is_ssh_at and sep_idx >= scheme.len) {
+                    if (sep_idx == scheme.len or sep_idx + 1 >= raw_spec.len) return false;
+                }
+            }
+            return true;
+        }
+    }
+
+    // [4] Registry specifier (`[registry:]<kebab>@<non_empty_ver>`):
+    const stripped = if (std.mem.startsWith(u8, raw_spec, "registry:")) raw_spec[9..] else raw_spec;
+    const at_pos = std.mem.indexOfScalar(u8, stripped, '@') orelse return false;
+    const pkg_part = stripped[0..at_pos];
+    const ver_part = std.mem.trim(u8, stripped[at_pos + 1 ..], " ");
+    if (ver_part.len == 0) return false;
+    if (pkg_part.len == 0 or pkg_part.len > 64) return false;
+    if (RESERVED_INLINE_USE_ALIAS_MAP.has(pkg_part) or lexer.KEYWORD_OR_PRIM_MAP.has(pkg_part)) return false;
+    if (!std.ascii.isLower(pkg_part[0]) or pkg_part[pkg_part.len - 1] == '-') return false;
+
+    var snake_buf: [64]u8 = undefined;
+    var has_prev_dash = false;
+    for (pkg_part, 0..) |pkg_ch, i| {
+        if (pkg_ch == '-') {
+            if (has_prev_dash) return false;
+            has_prev_dash = true;
+            snake_buf[i] = '_';
+        } else if (std.ascii.isLower(pkg_ch) or std.ascii.isDigit(pkg_ch)) {
+            has_prev_dash = false;
+            snake_buf[i] = pkg_ch;
+        } else {
+            return false;
+        }
+    }
+    const snake_view = snake_buf[0..pkg_part.len];
+    return !RESERVED_INLINE_USE_ALIAS_MAP.has(snake_view) and !lexer.KEYWORD_OR_PRIM_MAP.has(snake_view);
 }
 
 /// Returns `true` if `kind` is an unambiguous place/value starter after contextual `&out` or `&raw`.
@@ -2348,8 +2501,17 @@ pub const Parser = struct {
         }, item_cst);
     }
 
-    /// Parses `UseTree = ModuleSegment { "." ModuleSegment } [ "." ( "*" | "{" … "}" ) | "as" IDENT ]`.
+    /// Parses `UseTree = ( StringLit "as" IDENT ) | ( ModuleSegment { "." ModuleSegment } [ "." ( "*" | "{" … "}" ) | "as" IDENT ] )`.
     fn parseUseTree(self: *Parser, has_error: *bool) anyerror!void {
+        return self.parseUseTreeWithContext(has_error, true);
+    }
+
+    /// Parses a root or nested `.use_tree` CST subtree (`is_top_level` gates inline `"<spec>" as <alias>`).
+    fn parseUseTreeWithContext(
+        self: *Parser,
+        has_error: *bool,
+        is_top_level: bool,
+    ) anyerror!void {
         const tree_cst = try self.startCstNode(.use_tree);
         self.pushState(.item_finish, tree_cst) catch |err| switch (err) {
             error.ParseDepthExceeded => {
@@ -2361,6 +2523,114 @@ pub const Parser = struct {
         };
         defer self.popStates(1);
 
+        if (self.peekKind() == .string_lit or self.peekKind() == .byte_string_lit) {
+            const is_byte_str = self.peekKind() == .byte_string_lit;
+            const spec_tok = try self.consumeLeaf(.token_leaf, .{});
+            const spec_span = self.getTokenSpan(spec_tok);
+            const spec_lexeme = self.getTokenLexeme(spec_tok);
+            const opt_unquoted = if (is_byte_str) null else extractSingleLineUnquotedSpec(spec_lexeme);
+
+            if (!is_top_level) {
+                has_error.* = true;
+                try self.emitDiagnosticWithFix(
+                    .e0013_invalid_manifest_or_pkg_name,
+                    spec_span,
+                    "inline package import cannot be nested inside a `{ … }` group",
+                    "write a standalone `use \"<spec>\" as <snake_alias>;` item",
+                    null,
+                    null,
+                    null,
+                );
+            } else if (opt_unquoted == null) {
+                has_error.* = true;
+                try self.emitDiagnosticWithFix(
+                    .e0013_invalid_manifest_or_pkg_name,
+                    spec_span,
+                    "inline package import specifier must be a plain single-line string literal",
+                    "expected single-line `\"<pkg>@<version>\"` or URL string literal",
+                    null,
+                    null,
+                    null,
+                );
+            } else if (!isValidInlineUseSpec(opt_unquoted.?)) {
+                has_error.* = true;
+                try self.emitDiagnosticWithFix(
+                    .e0013_invalid_manifest_or_pkg_name,
+                    spec_span,
+                    "malformed inline package import specifier",
+                    "expected `<pkg>@<semver_req>`, `https://…`, `git+https://…`, or `./…`",
+                    null,
+                    null,
+                    null,
+                );
+            }
+
+            if (self.peekKind() == .dot or self.peekKind() == .lbrace or self.peekKind() == .star) {
+                has_error.* = true;
+                try self.emitDiagnosticWithFix(
+                    .e0013_invalid_manifest_or_pkg_name,
+                    self.getTokenSpan(self.peekTokenIndexNth(0)),
+                    "inline package import cannot chain `.item` or `.{…}`; bind the package root with `as <snake_alias>` first",
+                    "replace chained path with `as <snake_alias>`",
+                    null,
+                    null,
+                    null,
+                );
+                while (self.peekKind() != .semi and
+                    self.peekKind() != .rbrace and
+                    self.peekKind() != .eof)
+                {
+                    _ = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                }
+                self.cst.finishNode(tree_cst, .{ .has_error = true });
+                return;
+            }
+
+            _ = try self.expectToken(
+                .kw_as,
+                has_error,
+                "inline package import requires an explicit `as <snake_alias>` binding",
+                "expected `as <snake_alias>` after package specifier",
+            );
+
+            const next_kind = self.peekKind();
+            if (next_kind == .underscore or next_kind == .kw_self_val or next_kind == .kw_self_type) {
+                const bad_alias_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                has_error.* = true;
+                try self.emitDiagnosticWithFix(
+                    .e0013_invalid_manifest_or_pkg_name,
+                    self.getTokenSpan(bad_alias_tok),
+                    "inline package alias must be a non-reserved `snake_case` identifier",
+                    "reserved keyword or `_` cannot be used as a package alias",
+                    null,
+                    null,
+                    null,
+                );
+            } else {
+                const alias_tok = try self.expectIdentifierWithCasing(
+                    .ident,
+                    .snake_case,
+                    has_error,
+                    "expected `snake_case` package alias identifier after `as`",
+                );
+                const alias_lexeme = self.getTokenLexeme(alias_tok);
+                if (RESERVED_INLINE_USE_ALIAS_MAP.has(alias_lexeme)) {
+                    has_error.* = true;
+                    try self.emitDiagnosticWithFix(
+                        .e0013_invalid_manifest_or_pkg_name,
+                        self.getTokenSpan(alias_tok),
+                        "inline package alias must not shadow reserved root namespace identifiers",
+                        "choose a non-reserved `snake_case` package alias",
+                        null,
+                        null,
+                        null,
+                    );
+                }
+            }
+            self.cst.finishNode(tree_cst, .{ .has_error = has_error.* });
+            return;
+        }
+
         if (self.peekKind() == .lbrace) {
             const open_brace = try self.consumeLeaf(.token_leaf, .{});
             while (self.peekKind() != .rbrace and
@@ -2368,7 +2638,7 @@ pub const Parser = struct {
                 self.peekKind() != .eof)
             {
                 const loop_start = self.cursor;
-                try self.parseUseTree(has_error);
+                try self.parseUseTreeWithContext(has_error, false);
                 if (self.peekKind() == .comma) {
                     _ = try self.consumeLeaf(.token_leaf, .{});
                 } else {
@@ -2414,7 +2684,7 @@ pub const Parser = struct {
                     self.peekKind() != .eof)
                 {
                     const loop_start = self.cursor;
-                    try self.parseUseTree(has_error);
+                    try self.parseUseTreeWithContext(has_error, false);
                     if (self.peekKind() == .comma) {
                         _ = try self.consumeLeaf(.token_leaf, .{});
                     } else {
@@ -10420,6 +10690,155 @@ pub fn reparseIncremental(
     };
 }
 
+/// Extracts an `InlineUseDeclView` from a `.use_item` CST subtree when its `.use_tree` begins with `.string_lit`.
+pub fn extractInlineUseDeclView(
+    source: []const u8,
+    file_id: FileId,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    item_cst: CstNodeIndex,
+    ast_node: NodeIndex,
+) ?InlineUseDeclView {
+    if (item_cst.isNone() or item_cst.asInt() >= cst_arena.countNodes()) return null;
+    const item_rec = cst_arena.getNode(item_cst);
+    if (item_rec.kind != .use_item) return null;
+
+    const item_start: usize = item_cst.asInt();
+    const item_end: usize = @min(item_start + @max(@as(usize, item_rec.subtree_size), 1), cst_arena.countNodes());
+    var is_pub = false;
+    var tree_cst: CstNodeIndex = .none;
+    var first_tok: TokenIndex = .none;
+    var last_tok: TokenIndex = .none;
+
+    var cursor: usize = item_start + 1;
+    while (cursor < item_end) {
+        const child_idx = CstNodeIndex.fromInt(@intCast(cursor));
+        const child = cst_arena.getNode(child_idx);
+        if (!child.token.isNone() and child.token.asInt() < token_buffer.countTokens()) {
+            const tok_rec = token_buffer.getToken(child.token);
+            if (!tok_rec.flags.is_synthesized) {
+                if (first_tok.isNone()) first_tok = child.token;
+                last_tok = child.token;
+            }
+        }
+        if (child.kind == .attribute) {
+            cursor += @max(@as(usize, child.subtree_size), 1);
+            continue;
+        }
+        if (child.kind == .visibility_modifier) {
+            is_pub = true;
+            cursor += @max(@as(usize, child.subtree_size), 1);
+            continue;
+        }
+        if (child.subtree_size <= 1 and !child.flags.is_bracketed and !child.token.isNone() and
+            child.token.asInt() < token_buffer.countTokens())
+        {
+            if (token_buffer.getToken(child.token).kind == .kw_pub) is_pub = true;
+        }
+        if (child.kind == .use_tree and tree_cst.isNone()) {
+            tree_cst = child_idx;
+        }
+        cursor += @max(@as(usize, child.subtree_size), 1);
+    }
+
+    if (tree_cst.isNone()) return null;
+    const tree_rec = cst_arena.getNode(tree_cst);
+    const tree_start: usize = tree_cst.asInt();
+    const tree_end: usize = @min(tree_start + @max(@as(usize, tree_rec.subtree_size), 1), cst_arena.countNodes());
+
+    var spec_tok: TokenIndex = .none;
+    var alias_tok: TokenIndex = .none;
+    var has_seen_as = false;
+    var tree_cur: usize = tree_start + 1;
+    while (tree_cur < tree_end) : (tree_cur += 1) {
+        const leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(tree_cur)));
+        if (leaf.kind == .use_tree and leaf.subtree_size > 1) return null;
+        if (leaf.subtree_size <= 1 and !leaf.flags.is_bracketed and !leaf.token.isNone() and
+            leaf.token.asInt() < token_buffer.countTokens())
+        {
+            const tok_rec = token_buffer.getToken(leaf.token);
+            if (tok_rec.flags.is_synthesized) continue;
+            if (spec_tok.isNone()) {
+                if (tok_rec.kind != .string_lit and tok_rec.kind != .byte_string_lit) return null;
+                spec_tok = leaf.token;
+                continue;
+            }
+            if (tok_rec.kind == .kw_as) {
+                has_seen_as = true;
+                continue;
+            }
+            if (has_seen_as and alias_tok.isNone()) {
+                alias_tok = leaf.token;
+                last_tok = leaf.token;
+            }
+        }
+    }
+    if (spec_tok.isNone()) return null;
+
+    const spec_rec = token_buffer.getToken(spec_tok);
+    const spec_start: usize = spec_rec.byte_offset;
+    const spec_end: usize = @min(spec_start + @as(usize, spec_rec.byte_len), source.len);
+    const spec_lexeme = if (spec_start < spec_end) source[spec_start..spec_end] else "";
+    const unquoted_spec = if (spec_rec.kind == .string_lit)
+        (extractSingleLineUnquotedSpec(spec_lexeme) orelse "")
+    else
+        "";
+    const spec_span = Span.init(file_id, @intCast(spec_start), @intCast(spec_end));
+
+    var alias_slice: []const u8 = "";
+    var alias_span = spec_span;
+    if (!alias_tok.isNone() and alias_tok.asInt() < token_buffer.countTokens()) {
+        const alias_rec = token_buffer.getToken(alias_tok);
+        const alias_start: usize = alias_rec.byte_offset;
+        const alias_end: usize = @min(alias_start + @as(usize, alias_rec.byte_len), source.len);
+        if (alias_start < alias_end) alias_slice = source[alias_start..alias_end];
+        alias_span = Span.init(file_id, @intCast(alias_start), @intCast(alias_end));
+    }
+
+    const decl_start: u32 = if (!first_tok.isNone()) token_buffer.getToken(first_tok).byte_offset else spec_span.start_byte;
+    const decl_end: u32 = if (!last_tok.isNone()) blk: {
+        const end_rec = token_buffer.getToken(last_tok);
+        break :blk end_rec.byte_offset + end_rec.byte_len;
+    } else alias_span.end_byte;
+
+    return .{
+        .ast_node = ast_node,
+        .item_cst = item_cst,
+        .spec_token = spec_tok,
+        .unquoted_spec = unquoted_spec,
+        .alias_token = alias_tok,
+        .alias_slice = alias_slice,
+        .spec_span = spec_span,
+        .alias_span = alias_span,
+        .decl_span = Span.init(file_id, decl_start, decl_end),
+        .is_pub = is_pub,
+    };
+}
+
+/// Scans `cst_arena` in source order and collects all inline string `use "<spec>" as <alias>;` views.
+pub fn extractInlineStringUseSpecs(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    file_id: FileId,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+) ![]InlineUseDeclView {
+    var results: std.ArrayListUnmanaged(InlineUseDeclView) = .empty;
+    errdefer results.deinit(allocator);
+
+    const total_nodes = cst_arena.countNodes();
+    var cursor: usize = 0;
+    while (cursor < total_nodes) : (cursor += 1) {
+        const node_idx = CstNodeIndex.fromInt(@intCast(cursor));
+        if (cst_arena.getNode(node_idx).kind == .use_item) {
+            if (extractInlineUseDeclView(source, file_id, token_buffer, cst_arena, node_idx, .none)) |view| {
+                try results.append(allocator, view);
+            }
+        }
+    }
+    return results.toOwnedSlice(allocator);
+}
+
 // ------------------------- Unit Tests -------------------------
 
 /// Verifies pre-order CST subtree partitioning, monotonic token coverage, and lossless round-tripping.
@@ -12168,4 +12587,58 @@ test "test_parser_allow_non_canonical_case_and_c_scalar_aliases_suppress_w0201" 
     try std.testing.expectEqual(@as(u32, 0), core_ffi_sink.error_count);
     try std.testing.expectEqual(@as(u32, 0), core_ffi_sink.warning_count);
     try verifyCstAndAstInvariants(allocator, lf_core_ffi.items, &inc_tokens, &inc_cst, &inc_ast);
+}
+
+test "test_parser_inline_string_use_decl_and_diagnostics" {
+    const allocator = std.testing.allocator;
+    var interner = try StringInterner.init(allocator);
+    defer interner.deinit();
+
+    const valid_src =
+        "use \"corex-http@^2.1.0\" as http;\n" ++
+        "pub use \"https://github.com/org/repo.git#v1.2.0\" as repo_client;\n" ++
+        "use \"./vendor/local-codec\" as local_codec;\n";
+
+    var tokens = TokenBuffer.init(allocator);
+    defer tokens.deinit();
+    var cst = LosslessCstArena.init(allocator);
+    defer cst.deinit();
+    var ast = AstArena.init(allocator);
+    defer ast.deinit();
+    var sink = DiagnosticSink.init(allocator);
+    defer sink.deinit();
+
+    _ = try parseSource(valid_src, FileId.fromInt(90), &tokens, &cst, &ast, &sink, &interner);
+    try std.testing.expectEqual(@as(u32, 0), sink.error_count);
+    try std.testing.expectEqual(@as(u32, 0), sink.warning_count);
+    try verifyCstAndAstInvariants(allocator, valid_src, &tokens, &cst, &ast);
+
+    const specs = try extractInlineStringUseSpecs(allocator, valid_src, FileId.fromInt(90), &tokens, &cst);
+    defer allocator.free(specs);
+    try std.testing.expectEqual(@as(usize, 3), specs.len);
+    try std.testing.expectEqualStrings("corex-http@^2.1.0", specs[0].unquoted_spec);
+    try std.testing.expectEqualStrings("http", specs[0].alias_slice);
+    try std.testing.expect(!specs[0].is_pub);
+    try std.testing.expect(specs[1].is_pub);
+    try std.testing.expectEqualStrings("repo_client", specs[1].alias_slice);
+
+    const bad_src =
+        "use \"corex-http@\" as http;\n" ++
+        "use \"corex-http@^2.0\" as pkg;\n" ++
+        "use \"corex-http@^2.0\" as Http;\n";
+    var bad_sink = DiagnosticSink.init(allocator);
+    defer bad_sink.deinit();
+    _ = try parseSource(bad_src, FileId.fromInt(91), &tokens, &cst, &ast, &bad_sink, &interner);
+    try std.testing.expectEqual(@as(u32, 2), bad_sink.error_count);
+    try std.testing.expectEqual(@as(u32, 1), bad_sink.warning_count);
+
+    try std.testing.expect(isValidInlineUseSpec("github.com/corex-labs/http-router@v1.2.0"));
+    try std.testing.expect(isValidInlineUseSpec("gitlab.com/corex-labs/http-router"));
+    try std.testing.expect(isValidInlineUseSpec("registry:serde-json@1.4.2"));
+    try std.testing.expect(isValidInlineUseSpec("../shared/local-codec"));
+    try std.testing.expect(!isValidInlineUseSpec("serde_json@1.4.2"));
+    try std.testing.expect(!isValidInlineUseSpec("serde-json"));
+    try std.testing.expect(!isValidInlineUseSpec("registry:serde-json"));
+    try std.testing.expect(!isValidInlineUseSpec("serde--json@1.0.0"));
+    try std.testing.expect(!isValidInlineUseSpec("Serde@1.0.0"));
 }

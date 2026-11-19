@@ -1,7 +1,8 @@
 //! CoreX Stage 0 Bootstrap Compiler Root Module
 //!
 //! Aggregates and re-exports the foundational memory arenas, virtual file system, lossless CST/AST
-//! syntax tables, diagnostic catalog and snippet renderer, CLI command router, and benchmark harness.
+//! syntax tables, incremental query engine, MIR/SAST verifiers, C99/LLVM codegen backends, package
+//! manifest/cache/resolver subsystems, diagnostic snippet renderer, CLI router, and bench harness.
 //!
 //! Serves as the single canonical library root (`corex`) imported by the CLI entrypoint (`main.zig`),
 //! automated verification suites (`tests/`), and performance benchmark suites (`bench/`).
@@ -61,6 +62,16 @@ pub const codegen_c = @import("codegen_c.zig");
 pub const codegen_llvm = @import("codegen_llvm.zig");
 /// Four-tier differential backend execution oracle (`MirVm` `--dev`/`--release` vs Tier A C99 vs Tier B LLVM, `DR-20` `D-07A`).
 pub const diff_oracle = @import("diff_oracle.zig");
+/// Phase-9 `< 35` LOC PubGrub decision-level-0 conflict DAG & `TomlSpanAnchor` seam (`DR-16` §2.3, `DR-20` Seam `#7`).
+pub const pkg_conflict_seam = @import("pkg_conflict_seam.zig");
+/// Phase-9 `< 35` LOC binary `.cxi` public-interface & capability digest seam (`DR-17` §4.3, `DR-20` `D-08`).
+pub const pkg_cxi_seam = @import("pkg_cxi_seam.zig");
+/// `corex.toml` manifest, `.cx` script frontmatter, SemVer 2.0.0, and `corex.lock` v1 parser/patcher (`DR-11` §1).
+pub const pkg_manifest = @import("pkg_manifest.zig");
+/// Content-addressable `COREX_HOME` `.cxtree`/blob cache, Bao `.obao` streaming, Ed25519 + RFC 6962 proofs, and `vendor/` (`DR-11` §2).
+pub const pkg_cache = @import("pkg_cache.zig");
+/// Hybrid `Bounded-MVS` + `100,000`-step `PubGrub CDCL` package/feature resolver and auto-sync engine (`DR-11` §3, `DR-16`).
+pub const pkg_resolver = @import("pkg_resolver.zig");
 /// Monochrome Unicode glyph registry, `ColorMode`, and ANSI SGR styling helpers.
 pub const style = @import("cli/style.zig");
 /// Rounded Unicode card, aligned table, and 1/8th-block progress bar renderers.
@@ -736,6 +747,64 @@ pub const ReactorVTable = sim_seam.ReactorVTable;
 /// Two-phase DMA quarantine and zombie-CQE slot manager (`DR-08` §4.3, `Fix-08B`).
 pub const CompletionReaper = sim_seam.CompletionReaper;
 
+// --------- Phase 9 Package, Cache & Resolver Exports ----------
+/// Contiguous 1-byte discriminant classifying PubGrub incompatibility nodes (`0..5`, `DR-16` §2.3).
+pub const IncompatKind = pkg_conflict_seam.IncompatKind;
+/// Exact 16-byte (`128`-bit, `0` padding) version/feature interval term in an incompatibility.
+pub const IncompatTerm = pkg_conflict_seam.IncompatTerm;
+/// Exact 24-byte (`192`-bit, `0` padding) node in a decision-level-0 PubGrub derivation DAG.
+pub const IncompatNode = pkg_conflict_seam.IncompatNode;
+/// Exact 24-byte (`192`-bit, `0` padding) lossless `corex.toml` or `.cx` frontmatter span anchor.
+pub const TomlSpanAnchor = pkg_conflict_seam.TomlSpanAnchor;
+/// Arena-cloned decision-level-0 conflict proof DAG exported by `pkg_resolver`.
+pub const ConflictDagExport = pkg_conflict_seam.ConflictDagExport;
+/// Clones a level-0 PubGrub conflict derivation DAG into `BumpArena` slabs.
+pub const exportLevelZeroConflictDag = pkg_conflict_seam.exportLevelZeroConflictDag;
+/// Exact 64-byte (`align(8)`, `0` padding) binary `.cxi` summary header (`DR-20` `D-08`).
+pub const CxiHeader = pkg_cxi_seam.CxiHeader;
+/// Exact 64-byte (`align(8)`, `0` padding) exported `pub fn` / `pub trait` method `.cxi` record.
+pub const CxiFnRecord = pkg_cxi_seam.CxiFnRecord;
+/// Exact 40-byte (`align(8)`, `0` padding) exported `pub` nominal / `distinct` type `.cxi` record.
+pub const CxiTypeRecord = pkg_cxi_seam.CxiTypeRecord;
+/// Computes the domain-separated `"corex.cxi.v1.2026-04"` `BLAKE3` `.cxi` interface digest.
+pub const computeCxiBlake3 = pkg_cxi_seam.computeCxiBlake3;
+/// Serializes sorted `CxiFnRecord` and `CxiTypeRecord` slices into an 8-byte-aligned `.cxi` summary.
+pub const serializeCxiSummary = pkg_cxi_seam.serializeCxiSummary;
+/// 12-byte SemVer 2.0.0 `(major, minor, patch)` numeric core.
+pub const SemVerCore = pkg_manifest.SemVerCore;
+/// 20-byte SemVer 2.0.0 version record including prerelease and build metadata handles.
+pub const SemVer = pkg_manifest.SemVer;
+/// Normalized SemVer requirement conjunction.
+pub const VersionReq = pkg_manifest.VersionReq;
+/// Validated `corex.toml` or `.cx` script frontmatter manifest.
+pub const Manifest = pkg_manifest.Manifest;
+/// Workspace manifest bundle covering `[workspace]` members, `[patch]`, and `[security]`.
+pub const WorkspaceManifestBundle = pkg_manifest.WorkspaceManifestBundle;
+/// Inline `use "<spec>" as <alias>;` source dependency specification (`DR-11` §1.2).
+pub const InlineUseSpec = pkg_manifest.InlineUseSpec;
+/// Deterministic `corex.lock` v1 package pin record.
+pub const LockPackage = pkg_manifest.LockPackage;
+/// Deterministic `corex.lock` v1 lockfile document.
+pub const Lockfile = pkg_manifest.Lockfile;
+/// Dual-bounded (`max_entries` + `max_bytes`) intrusive LRU metadata cache (`AGENTS.md` §2).
+pub const BoundedMetadataLru = pkg_cache.BoundedMetadataLru;
+/// Content-addressable `COREX_HOME/cache/blake3` global package cache (`DR-11` §2).
+pub const PkgCache = pkg_cache.PkgCache;
+/// Resolves `COREX_HOME` (`$COREX_HOME` -> OS cache/home directory fallback).
+pub const resolveCorexHome = pkg_cache.resolveCorexHome;
+/// Exact 12-byte compatibility-series coexistence key (`DR-11` §3.1).
+pub const SeriesKey = pkg_resolver.SeriesKey;
+/// Fast 512-bit inline feature bitset (`64B`) for `< 5 ms` MVS feature unification.
+pub const FeatureBitset512 = pkg_resolver.FeatureBitset512;
+/// Topologically resolved package instance in `ResolvedPackageGraph`.
+pub const ResolvedPackageNode = pkg_resolver.ResolvedPackageNode;
+/// Complete deterministic dependency & feature resolution output.
+pub const ResolvedPackageGraph = pkg_resolver.ResolvedPackageGraph;
+/// Configuration options governing `resolveProjectGraph`.
+pub const ResolveOptions = pkg_resolver.ResolveOptions;
+/// Resolves workspace/script manifests, auto-sync, features, `corex.lock`, and `.cxtree` packages.
+pub const resolveProjectGraph = pkg_resolver.resolveProjectGraph;
+
 // ---------------- Diagnostics & CLI Re-Exports ----------------
 /// Canonical alphabetical 9-entry CLI subcommand descriptor table.
 pub const CLI_SUBCOMMANDS = router.CLI_SUBCOMMANDS;
@@ -791,6 +860,11 @@ test "test_root_module_references_all_phase0_submodules" {
     _ = codegen_c;
     _ = codegen_llvm;
     _ = diff_oracle;
+    _ = pkg_conflict_seam;
+    _ = pkg_cxi_seam;
+    _ = pkg_manifest;
+    _ = pkg_cache;
+    _ = pkg_resolver;
     _ = style;
     _ = box_draw;
     _ = router;

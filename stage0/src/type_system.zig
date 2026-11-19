@@ -2161,6 +2161,30 @@ comptime {
     std.debug.assert(soa_bytes_per_type_node == 14);
 }
 
+/// Returns `true` if `rel_path` is a safe sandboxed relative header path without traversal or root escape.
+fn isValidSandboxedCImportRelPath(rel_path: []const u8) bool {
+    if (rel_path.len == 0) return false;
+    if (rel_path[0] == '/' or rel_path[0] == '\\') return false;
+    for (rel_path) |byte_val| {
+        if (byte_val == 0 or byte_val == '\\' or byte_val == ':') return false;
+    }
+    var seg_iter = std.mem.splitScalar(u8, rel_path, '/');
+    while (seg_iter.next()) |seg| {
+        if (seg.len == 0 or std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Returns `true` if `tag` is a nominal declaration constructor eligible for cross-major `E0012` matching.
+inline fn isCrossMajorNominalTag(tag: TypeTag) bool {
+    return switch (tag) {
+        .struct_ty, .enum_ty, .union_ty, .bit_field_ty, .trait_ty, .distinct_ty => true,
+        else => false,
+    };
+}
+
 /// Returns `true` if `tag` is a syntactic type AST node tag.
 fn isTypeAstTag(tag: AstTag) bool {
     return switch (tag) {
@@ -8432,6 +8456,7 @@ pub const TypeChecker = struct {
         errdefer if (extra_end_table.len > 0) allocator.free(extra_end_table);
 
         const mod_scope = sym_table.file_module_scopes.get(file_id.asInt()) orelse sym_table.prelude_scope;
+        const file_pkg_id = sym_table.getFilePackageId(file_id);
 
         return .{
             .allocator = allocator,
@@ -8444,6 +8469,8 @@ pub const TypeChecker = struct {
             .cst_arena = cst_arena,
             .ast_arena = ast_arena,
             .diagnostic_sink = diagnostic_sink,
+            .cfg_env = sym_table.effectiveCfgEnvForFile(file_id),
+            .is_including_tests = sym_table.is_including_tests and (file_pkg_id == .root),
             .cst_to_ast = cst_map,
             .node_types = ty_table,
             .node_symbols = sym_node_table,
@@ -9049,8 +9076,11 @@ pub const TypeChecker = struct {
         cst_node: CstNodeIndex,
         is_emitting_diags: bool,
     ) anyerror!bool {
+        var pkg_cfg = self.cfg_env;
+        pkg_cfg.owner_pkg_id = self.sym_table.getFilePackageId(self.file_id);
+        pkg_cfg.sym_table_features = self.sym_table;
         return symbol_resolver.evaluateCstNodeCfgWithEnv(
-            &self.cfg_env,
+            &pkg_cfg,
             self.file_id,
             self.source,
             self.token_buffer,
@@ -9062,8 +9092,11 @@ pub const TypeChecker = struct {
 
     /// Evaluates all leading `@cfg(…)` attributes on `cst_node`, returning `false` if any evaluates to `false`.
     fn evaluateCstNodeCfgAttributes(self: *TypeChecker, cst_node: CstNodeIndex) anyerror!bool {
+        var pkg_cfg = self.cfg_env;
+        pkg_cfg.owner_pkg_id = self.sym_table.getFilePackageId(self.file_id);
+        pkg_cfg.sym_table_features = self.sym_table;
         return symbol_resolver.evaluateCstNodeCfgWithEnv(
-            &self.cfg_env,
+            &pkg_cfg,
             self.file_id,
             self.source,
             self.token_buffer,
@@ -14955,7 +14988,9 @@ pub const TypeChecker = struct {
             }
         } else {
             const root_lex = symbol_resolver.extractTokenSlice(self.source, self.token_buffer, seg_tokens.items[0]);
-            if (std.mem.eql(u8, root_lex, "cx") or std.mem.eql(u8, root_lex, "core")) {
+            if (std.mem.eql(u8, root_lex, "cx") or
+                (std.mem.eql(u8, root_lex, "core") and self.sym_table.isCoreAllowedForFile(self.file_id)))
+            {
                 if (symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.get(target_lexeme)) |builtin_ty| {
                     if (builtin_ty.toU32() >= TypeId.source_loc_ty.toU32() and
                         builtin_ty.toU32() <= TypeId.task_handle_base_ty.toU32())
@@ -15780,16 +15815,23 @@ pub const TypeChecker = struct {
         var seg_idx: usize = 0;
         while (seg_idx + 1 < seg_count) : (seg_idx += 1) {
             const seg_lex = symbol_resolver.extractTokenSlice(self.source, self.token_buffer, seg_tokens[seg_idx]);
+            if (seg_idx == 0 and std.mem.eql(u8, seg_lex, "pkg")) {
+                cur_scope = self.sym_table.resolveCallerPackageRootScope(self.file_id, cur_scope);
+                continue;
+            }
+            if (seg_idx == 0 and std.mem.eql(u8, seg_lex, "core") and
+                !self.sym_table.isCoreAllowedForFile(self.file_id))
+            {
+                return null;
+            }
             const seg_sym_id = self.interner.lookup(seg_lex) orelse return null;
             const found_seg = if (seg_idx == 0)
                 switch (self.sym_table.lookupLexical(cur_scope, seg_sym_id, NamespaceMask.TYPE_OR_VALUE)) {
                     .found => |idx| idx,
                     else => blk_root: {
-                        if (!std.mem.eql(u8, seg_lex, "core") or self.sym_table.is_internal_core) {
-                            if (self.sym_table.named_module_scopes.get(seg_sym_id.asInt())) |ext_scope| {
-                                cur_scope = ext_scope;
-                                continue;
-                            }
+                        if (self.sym_table.lookupExternalPackageScope(self.file_id, seg_sym_id)) |ext_scope| {
+                            cur_scope = ext_scope;
+                            continue;
                         }
                         break :blk_root SymbolIndex.none;
                     },
@@ -24733,6 +24775,11 @@ pub const TypeChecker = struct {
                 );
                 if (lexeme.len == 0) return .value_expr;
                 const span = self.token_buffer.getTokenSpan(self.file_id, recv_node.main_token);
+                if (std.mem.eql(u8, lexeme, "pkg")) {
+                    return .{
+                        .module_ns = self.sym_table.resolveCallerPackageRootScope(self.file_id, self.current_scope),
+                    };
+                }
                 const sym_id = try self.interner.intern(lexeme);
 
                 // [1] Local / lexical value or `@c_import` const bindings take precedence; `.module_sym` yields `.module_ns`:
@@ -24742,6 +24789,12 @@ pub const TypeChecker = struct {
                         if (val_sym.kind == .module_sym) {
                             self.sym_table.markSymbolUsed(val_idx);
                             self.recordNodeSymbol(recv_id, val_idx);
+                            if (!val_sym.target_scope.isNone()) {
+                                return .{ .module_ns = val_sym.target_scope };
+                            }
+                            if (self.sym_table.lookupExternalPackageScope(self.file_id, sym_id)) |ext_scope| {
+                                return .{ .module_ns = ext_scope };
+                            }
                             return .{ .module_ns = val_sym.target_scope };
                         }
                         if (!val_sym.target_scope.isNone() and
@@ -24769,7 +24822,7 @@ pub const TypeChecker = struct {
                     .not_found => {},
                 }
 
-                // [2] Root namespaces (`cx`, `core` with `E0218` gate, `pkg`, or registered root modules):
+                // [2] Root namespaces (`cx`, `core` with `E0218` gate, or declared dependency / root modules):
                 if (std.mem.eql(u8, lexeme, "cx") or
                     std.mem.eql(u8, lexeme, "core"))
                 {
@@ -24792,15 +24845,12 @@ pub const TypeChecker = struct {
                         }
                         return .{ .module_ns = root_scope };
                     }
-                    if (std.mem.eql(u8, lexeme, "core") and !self.sym_table.is_internal_core) {
+                    if (std.mem.eql(u8, lexeme, "core") and !self.sym_table.isCoreAllowedForFile(self.file_id)) {
                         return .poisoned;
                     }
                 }
-                if (self.sym_table.named_module_scopes.get(sym_id.asInt())) |ext_scope| {
+                if (self.sym_table.lookupExternalPackageScope(self.file_id, sym_id)) |ext_scope| {
                     return .{ .module_ns = ext_scope };
-                }
-                if (std.mem.eql(u8, lexeme, "pkg")) {
-                    return .{ .module_ns = self.current_scope };
                 }
 
                 // [3] Built-in primitive types (`u32`, `i64`, `f64`, `usize`, `bool`, `str`, `char`):
@@ -26656,6 +26706,18 @@ pub const TypeChecker = struct {
                 defer if (cooked_path) |bytes| self.allocator.free(bytes);
                 const header_path = cooked_path orelse
                     (if (raw_lit.len >= 2) raw_lit[1 .. raw_lit.len - 1] else "");
+
+                if (self.sym_table.getFilePackageId(self.file_id).asInt() >= 2 and
+                    !isValidSandboxedCImportRelPath(header_path))
+                {
+                    try self.emitDiagnosticSimple(
+                        .e0326_embed_path_escape,
+                        self.getAstNodeSpan(header_arg_id),
+                        "external package `@c_import` header path cannot be absolute or escape its `.cxtree` root",
+                        "header path escapes package sandbox root",
+                    );
+                    return .err_ty;
+                }
 
                 const pre_diag_len = if (self.diagnostic_sink) |sink| sink.diagnostics.items.len else 0;
                 var mod_sym_idx: SymbolIndex = self.sym_table.c_import_modules.get(header_path) orelse .none;
@@ -31425,7 +31487,419 @@ pub const TypeChecker = struct {
 
     // ------------------- Diagnostic Formatters --------------------
 
-    /// Emits `E0401` (`type_mismatch`) with formatted expected and actual type names.
+    /// Matched nominal symbol pair from two distinct `PackageId` versions of the same canonical package (`E0012`).
+    const CrossMajorNominalMatch = struct {
+        /// Expected nominal `SymbolIndex`.
+        exp_sym_idx: SymbolIndex,
+        /// Actual nominal `SymbolIndex`.
+        act_sym_idx: SymbolIndex,
+        /// Owning `PackageId` of `exp_sym_idx`.
+        exp_pkg: symbol_resolver.PackageId,
+        /// Owning `PackageId` of `act_sym_idx`.
+        act_pkg: symbol_resolver.PackageId,
+        /// Shared canonical package name `SymbolId`.
+        canon_name_sym: SymbolId,
+    };
+
+    /// Resolves the canonical package name `SymbolId` for `pkg_id` in $O(1)$ (`SymbolId.empty` when unregistered).
+    fn lookupPackageCanonicalNameSym(
+        self: *const TypeChecker,
+        pkg_id: symbol_resolver.PackageId,
+    ) SymbolId {
+        if (self.sym_table.package_canonical_names.get(pkg_id)) |canon_sym| {
+            return canon_sym;
+        }
+        if (self.sym_table.package_metas.get(pkg_id)) |meta| {
+            return meta.canonical_name_sym;
+        }
+        return .empty;
+    }
+
+    /// Resolves the borrowed SemVer text for `pkg_id` (`"?"` when unregistered).
+    fn lookupPackageVersionSlice(
+        self: *const TypeChecker,
+        pkg_id: symbol_resolver.PackageId,
+    ) []const u8 {
+        if (self.sym_table.package_metas.get(pkg_id)) |meta| {
+            if (meta.version_text.len > 0) return meta.version_text;
+        }
+        if (self.sym_table.package_version_labels.get(pkg_id)) |ver_id| {
+            const ver_str = self.interner.get(ver_id);
+            if (ver_str.len > 0) return ver_str;
+        }
+        return "?";
+    }
+
+    /// Extracts the reverse intra-package `[sym, mod_k, …, mod_0]` `SymbolId` path up to `pkg_id`'s root scope.
+    fn extractIntraPackageSymbolChain(
+        self: *const TypeChecker,
+        sym_idx: SymbolIndex,
+        pkg_id: symbol_resolver.PackageId,
+        out_chain: *[16]SymbolId,
+    ) usize {
+        if (sym_idx.isNone()) return 0;
+        const sym = self.sym_table.getSymbol(sym_idx).*;
+        out_chain[0] = sym.name;
+        var count: usize = 1;
+
+        const pkg_root = self.sym_table.lookupPackageRootScope(pkg_id) orelse
+            (self.sym_table.file_module_scopes.get(sym.decl_span.file_id.asInt()) orelse .none);
+        var cur_mod = if (!sym.scope_id.isNone())
+            self.sym_table.scope_arena.getScope(sym.scope_id).enclosing_module
+        else
+            .none;
+
+        var steps: usize = 0;
+        while (!cur_mod.isNone() and cur_mod != pkg_root and
+            cur_mod != self.sym_table.prelude_scope and
+            count < out_chain.len and steps < 16) : (steps += 1)
+        {
+            const parent_mod = self.sym_table.scope_arena.findImmediateParentModule(cur_mod);
+            if (parent_mod.isNone()) break;
+            var mod_name: SymbolId = .empty;
+            for (self.sym_table.getScopeMembers(parent_mod)) |mem_idx| {
+                const mem_sym = self.sym_table.getSymbol(mem_idx).*;
+                if (mem_sym.kind == .module_sym and !mem_sym.flags.is_imported and mem_sym.target_scope == cur_mod) {
+                    mod_name = mem_sym.name;
+                    break;
+                }
+            }
+            if (mod_name == .empty) break;
+            out_chain[count] = mod_name;
+            count += 1;
+            cur_mod = parent_mod;
+        }
+        return count;
+    }
+
+    /// Formats a reversed `chain[0..chain_len]` (`[leaf, …, root_submod]`) into `out_buf` as `root_submod.….leaf`.
+    fn formatIntraPackageSymbolChain(
+        self: *const TypeChecker,
+        chain: []const SymbolId,
+        out_buf: *[128]u8,
+    ) []const u8 {
+        var pos: usize = 0;
+        var rev_idx: usize = chain.len;
+        while (rev_idx > 0) {
+            rev_idx -= 1;
+            if (pos > 0 and pos < out_buf.len) {
+                out_buf[pos] = '.';
+                pos += 1;
+            }
+            const seg_str = self.interner.get(chain[rev_idx]);
+            const copy_len = @min(seg_str.len, out_buf.len - pos);
+            @memcpy(out_buf[pos .. pos + copy_len], seg_str[0..copy_len]);
+            pos += copy_len;
+        }
+        return out_buf[0..pos];
+    }
+
+    /// Checks in $O(1)$ before scope-walking whether `(exp_sym_idx, act_sym_idx)` are coexisting-version twins.
+    fn matchCrossMajorNominalSymbols(
+        self: *const TypeChecker,
+        exp_sym_idx: SymbolIndex,
+        act_sym_idx: SymbolIndex,
+    ) ?CrossMajorNominalMatch {
+        if (exp_sym_idx.isNone() or act_sym_idx.isNone() or exp_sym_idx == act_sym_idx) return null;
+        const exp_sym = self.sym_table.getSymbol(exp_sym_idx).*;
+        const act_sym = self.sym_table.getSymbol(act_sym_idx).*;
+        if (exp_sym.name != act_sym.name) return null;
+
+        const exp_pkg = self.sym_table.getFilePackageId(exp_sym.decl_span.file_id);
+        const act_pkg = self.sym_table.getFilePackageId(act_sym.decl_span.file_id);
+        if (exp_pkg == act_pkg) return null;
+
+        const exp_canon = self.lookupPackageCanonicalNameSym(exp_pkg);
+        if (exp_canon == .empty) return null;
+        const act_canon = self.lookupPackageCanonicalNameSym(act_pkg);
+        if (exp_canon != act_canon) return null;
+
+        var exp_chain: [16]SymbolId = undefined;
+        var act_chain: [16]SymbolId = undefined;
+        const exp_len = self.extractIntraPackageSymbolChain(exp_sym_idx, exp_pkg, &exp_chain);
+        const act_len = self.extractIntraPackageSymbolChain(act_sym_idx, act_pkg, &act_chain);
+        if (exp_len == 0 or exp_len != act_len) return null;
+        for (exp_chain[0..exp_len], act_chain[0..act_len]) |exp_seg, act_seg| {
+            if (exp_seg != act_seg) return null;
+        }
+        return .{
+            .exp_sym_idx = exp_sym_idx,
+            .act_sym_idx = act_sym_idx,
+            .exp_pkg = exp_pkg,
+            .act_pkg = act_pkg,
+            .canon_name_sym = exp_canon,
+        };
+    }
+
+    /// Recursively walks matching structural constructors up to depth `16` to find a cross-major nominal pair.
+    fn findCrossMajorNominalPairBounded(
+        self: *const TypeChecker,
+        raw_exp_ty: TypeId,
+        raw_act_ty: TypeId,
+        depth: u32,
+    ) ?CrossMajorNominalMatch {
+        if (depth >= 16 or raw_exp_ty == raw_act_ty or raw_exp_ty.isError() or raw_act_ty.isError()) {
+            return null;
+        }
+        var exp_ty = raw_exp_ty;
+        var act_ty = raw_act_ty;
+        while (self.pool.getTag(exp_ty) == .refined_ty or self.pool.getTag(exp_ty) == .tilde_approx) {
+            exp_ty = TypeId.fromInt(self.pool.getNode(exp_ty).lhs);
+        }
+        while (self.pool.getTag(act_ty) == .refined_ty or self.pool.getTag(act_ty) == .tilde_approx) {
+            act_ty = TypeId.fromInt(self.pool.getNode(act_ty).lhs);
+        }
+        if (exp_ty == act_ty or exp_ty.isError() or act_ty.isError()) return null;
+
+        const exp_node = self.pool.getNode(exp_ty);
+        const act_node = self.pool.getNode(act_ty);
+
+        if (isCrossMajorNominalTag(exp_node.tag) and exp_node.tag == act_node.tag) {
+            const exp_sym_idx = self.sym_table.type_to_symbol.get(exp_ty.toU32()) orelse
+                SymbolIndex.fromInt(exp_node.rhs);
+            const act_sym_idx = self.sym_table.type_to_symbol.get(act_ty.toU32()) orelse
+                SymbolIndex.fromInt(act_node.rhs);
+            if (self.matchCrossMajorNominalSymbols(exp_sym_idx, act_sym_idx)) |matched| {
+                return matched;
+            }
+            const exp_args = self.pool.getGenericTypeArgs(exp_ty);
+            const act_args = self.pool.getGenericTypeArgs(act_ty);
+            if (exp_args.len > 0 and exp_args.len == act_args.len) {
+                for (exp_args, act_args) |exp_arg_raw, act_arg_raw| {
+                    if (self.findCrossMajorNominalPairBounded(
+                        TypeId.fromInt(exp_arg_raw),
+                        TypeId.fromInt(act_arg_raw),
+                        depth + 1,
+                    )) |arg_match| {
+                        return arg_match;
+                    }
+                }
+            }
+            return null;
+        }
+
+        const is_both_ref = (exp_node.tag == .ref_ty or exp_node.tag == .mut_ref_ty) and
+            (act_node.tag == .ref_ty or act_node.tag == .mut_ref_ty);
+        const is_both_slice = (exp_node.tag == .slice_ty or exp_node.tag == .soa_slice_ty) and
+            (act_node.tag == .slice_ty or act_node.tag == .soa_slice_ty);
+        const is_both_array = (exp_node.tag == .array_ty or exp_node.tag == .soa_array_ty) and
+            (act_node.tag == .array_ty or act_node.tag == .soa_array_ty);
+        if (is_both_ref or is_both_slice or is_both_array) {
+            return self.findCrossMajorNominalPairBounded(
+                TypeId.fromInt(exp_node.lhs),
+                TypeId.fromInt(act_node.lhs),
+                depth + 1,
+            );
+        }
+
+        if (exp_node.tag != act_node.tag) return null;
+        return switch (exp_node.tag) {
+            .primitive => if (exp_node.rhs == act_node.rhs and
+                (exp_node.rhs == TypeId.task_group_base_ty.toU32() or
+                    exp_node.rhs == TypeId.task_handle_base_ty.toU32()))
+                self.findCrossMajorNominalPairBounded(
+                    TypeId.fromInt(exp_node.lhs),
+                    TypeId.fromInt(act_node.lhs),
+                    depth + 1,
+                )
+            else
+                null,
+            .optional_ty, .raw_ptr_ty, .dyn_trait_ty, .future_ty => self.findCrossMajorNominalPairBounded(
+                TypeId.fromInt(exp_node.lhs),
+                TypeId.fromInt(act_node.lhs),
+                depth + 1,
+            ),
+            .result_ty => self.findCrossMajorNominalPairBounded(
+                TypeId.fromInt(exp_node.lhs),
+                TypeId.fromInt(act_node.lhs),
+                depth + 1,
+            ) orelse self.findCrossMajorNominalPairBounded(
+                TypeId.fromInt(exp_node.rhs),
+                TypeId.fromInt(act_node.rhs),
+                depth + 1,
+            ),
+            .tuple_ty => blk_tup: {
+                if (exp_node.rhs != act_node.rhs or exp_node.rhs == 0) break :blk_tup null;
+                const arity: usize = exp_node.rhs;
+                const exp_elems = self.pool.extra.items[exp_node.lhs .. exp_node.lhs + arity];
+                const act_elems = self.pool.extra.items[act_node.lhs .. act_node.lhs + arity];
+                for (exp_elems, act_elems) |exp_el, act_el| {
+                    if (self.findCrossMajorNominalPairBounded(
+                        TypeId.fromInt(exp_el),
+                        TypeId.fromInt(act_el),
+                        depth + 1,
+                    )) |el_match| {
+                        break :blk_tup el_match;
+                    }
+                }
+                break :blk_tup null;
+            },
+            .fn_ty, .closure_ty => blk_fn: {
+                const exp_sig = self.pool.getFnSignatureView(exp_ty) orelse break :blk_fn null;
+                const act_sig = self.pool.getFnSignatureView(act_ty) orelse break :blk_fn null;
+                if (exp_sig.paramCount() != act_sig.paramCount()) break :blk_fn null;
+                var param_idx: usize = 0;
+                while (param_idx < exp_sig.paramCount()) : (param_idx += 1) {
+                    if (self.findCrossMajorNominalPairBounded(
+                        exp_sig.getParamType(param_idx),
+                        act_sig.getParamType(param_idx),
+                        depth + 1,
+                    )) |p_match| {
+                        break :blk_fn p_match;
+                    }
+                }
+                break :blk_fn self.findCrossMajorNominalPairBounded(exp_sig.ret_ty, act_sig.ret_ty, depth + 1);
+            },
+            else => null,
+        };
+    }
+
+    /// Emits `E0012` (`e0012_cross_major_cxi_type_mismatch`) for a matched cross-version nominal or trait pair.
+    fn emitCrossMajorMismatchDiagnostic(
+        self: *TypeChecker,
+        span: Span,
+        matched: CrossMajorNominalMatch,
+        is_trait_bound: bool,
+    ) !void {
+        const sink = self.diagnostic_sink orelse return;
+        const arena_alloc = sink.arena.asAllocator();
+
+        const pkg_name = self.interner.get(matched.canon_name_sym);
+        const exp_ver = self.lookupPackageVersionSlice(matched.exp_pkg);
+        const act_ver = self.lookupPackageVersionSlice(matched.act_pkg);
+
+        var exp_chain: [16]SymbolId = undefined;
+        const chain_len = self.extractIntraPackageSymbolChain(matched.exp_sym_idx, matched.exp_pkg, &exp_chain);
+        var path_buf: [128]u8 = undefined;
+        const qual_path = self.formatIntraPackageSymbolChain(exp_chain[0..chain_len], &path_buf);
+
+        const message = if (is_trait_bound)
+            try std.fmt.allocPrint(
+                arena_alloc,
+                "unsatisfied trait bound across coexisting versions of `{s}`: implements `{s}` from `{s}@{s}`, but `{s}@{s}` is required",
+                .{ pkg_name, qual_path, pkg_name, act_ver, pkg_name, exp_ver },
+            )
+        else
+            try std.fmt.allocPrint(
+                arena_alloc,
+                "mismatched nominal types across coexisting versions of `{s}`: expected `{s}` from `{s}@{s}`, found `{s}` from `{s}@{s}`",
+                .{ pkg_name, qual_path, pkg_name, exp_ver, qual_path, pkg_name, act_ver },
+            );
+
+        const primary_lbl = try std.fmt.allocPrint(
+            arena_alloc,
+            "uses `{s}` from `{s}@{s}` (expected `{s}@{s}`)",
+            .{ qual_path, pkg_name, act_ver, pkg_name, exp_ver },
+        );
+
+        var labels_buf: [3]diagnostic.LabeledSpan = undefined;
+        labels_buf[0] = .{
+            .span = span,
+            .label = primary_lbl,
+            .style = .primary,
+        };
+        var label_count: usize = 1;
+
+        const exp_decl = self.sym_table.getSymbol(matched.exp_sym_idx).decl_span;
+        if (!exp_decl.file_id.isNone()) {
+            labels_buf[label_count] = .{
+                .span = exp_decl,
+                .label = try std.fmt.allocPrint(arena_alloc, "`{s}` in `{s}@{s}` defined here", .{ qual_path, pkg_name, exp_ver }),
+                .style = .secondary,
+            };
+            label_count += 1;
+        }
+        const act_decl = self.sym_table.getSymbol(matched.act_sym_idx).decl_span;
+        if (!act_decl.file_id.isNone()) {
+            labels_buf[label_count] = .{
+                .span = act_decl,
+                .label = try std.fmt.allocPrint(arena_alloc, "`{s}` in `{s}@{s}` defined here", .{ qual_path, pkg_name, act_ver }),
+                .style = .secondary,
+            };
+            label_count += 1;
+        }
+
+        const help_note = try std.fmt.allocPrint(
+            arena_alloc,
+            "help: `{s}@{s}` and `{s}@{s}` have distinct `.cxi` nominal identities; " ++
+                "unify dependency versions in `corex.toml` or write an explicit adapter",
+            .{ pkg_name, exp_ver, pkg_name, act_ver },
+        );
+        const notes_slice = try arena_alloc.alloc([]const u8, 1);
+        notes_slice[0] = help_note;
+
+        _ = try sink.emit(.{
+            .code = .e0012_cross_major_cxi_type_mismatch,
+            .severity = .err,
+            .primary_span = span,
+            .message = message,
+            .labels = try arena_alloc.dupe(diagnostic.LabeledSpan, labels_buf[0..label_count]),
+            .notes = notes_slice,
+        });
+    }
+
+    /// Emits `E0012` and returns `true` when `(expected_ty, actual_ty)` fails solely due to coexisting package versions.
+    fn tryEmitCrossMajorNominalMismatch(
+        self: *TypeChecker,
+        span: Span,
+        expected_ty: TypeId,
+        actual_ty: TypeId,
+    ) !bool {
+        if (self.sym_table.package_canonical_names.count() == 0 and
+            self.sym_table.package_metas.count() == 0)
+        {
+            return false;
+        }
+        if (self.findCrossMajorNominalPairBounded(expected_ty, actual_ty, 0)) |matched| {
+            try self.emitCrossMajorMismatchDiagnostic(span, matched, false);
+            return true;
+        }
+        return false;
+    }
+
+    /// Emits `E0012` and returns `true` when `candidate_ty` implements a trait from a different version of `group_ty`'s package.
+    fn tryEmitCrossMajorTraitBoundMismatch(
+        self: *TypeChecker,
+        span: Span,
+        candidate_ty: TypeId,
+        group_ty: TypeId,
+    ) !bool {
+        if (self.sym_table.package_canonical_names.count() == 0 and
+            self.sym_table.package_metas.count() == 0)
+        {
+            return false;
+        }
+        if (self.pool.getTag(group_ty) != .trait_ty) return false;
+        const exp_trait_sym = self.sym_table.type_to_symbol.get(group_ty.toU32()) orelse
+            SymbolIndex.fromInt(self.pool.getNode(group_ty).rhs);
+        if (exp_trait_sym.isNone()) return false;
+
+        var peeled_cand = candidate_ty;
+        while (self.pool.getTag(peeled_cand) == .ref_ty or
+            self.pool.getTag(peeled_cand) == .mut_ref_ty or
+            self.pool.getTag(peeled_cand) == .refined_ty or
+            self.pool.getTag(peeled_cand) == .tilde_approx)
+        {
+            peeled_cand = TypeId.fromInt(self.pool.getNode(peeled_cand).lhs);
+        }
+
+        var key_iter = self.sym_table.trait_impl_pairs.keyIterator();
+        while (key_iter.next()) |pair_key_ptr| {
+            const pair_key = pair_key_ptr.*;
+            const impl_target_raw: u32 = @truncate(pair_key >> 32);
+            if (impl_target_raw != candidate_ty.toU32() and impl_target_raw != peeled_cand.toU32()) {
+                continue;
+            }
+            const impl_trait_sym = SymbolIndex.fromInt(@truncate(pair_key));
+            if (self.matchCrossMajorNominalSymbols(exp_trait_sym, impl_trait_sym)) |matched| {
+                try self.emitCrossMajorMismatchDiagnostic(span, matched, true);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Emits `E0401` (`type_mismatch`, or `E0012` across coexisting package versions) with formatted type names.
     fn emitTypeMismatch(
         self: *TypeChecker,
         span: Span,
@@ -31433,6 +31907,7 @@ pub const TypeChecker = struct {
         actual_ty: TypeId,
     ) !void {
         if (self.diagnostic_sink == null) return;
+        if (try self.tryEmitCrossMajorNominalMismatch(span, expected_ty, actual_ty)) return;
         var exp_buf: [96]u8 = undefined;
         var act_buf: [96]u8 = undefined;
         const exp_str = self.pool.formatType(expected_ty, self.sym_table, &exp_buf);
@@ -31455,7 +31930,7 @@ pub const TypeChecker = struct {
         try self.emitDiagnosticSimple(.e0401_type_mismatch, span, msg, lbl);
     }
 
-    /// Emits `E0402` (`unsatisfied_trait_bound`) when a type fails a Constrained Type Group check.
+    /// Emits `E0402` (`unsatisfied_trait_bound`, or `E0012` across coexisting package versions) on failed group/trait checks.
     fn emitGroupConstraintError(
         self: *TypeChecker,
         span: Span,
@@ -31464,6 +31939,9 @@ pub const TypeChecker = struct {
         is_distinct_without_tilde: bool,
     ) !void {
         if (self.diagnostic_sink == null) return;
+        if (!is_distinct_without_tilde) {
+            if (try self.tryEmitCrossMajorTraitBoundMismatch(span, candidate_ty, group_ty)) return;
+        }
         var cand_buf: [96]u8 = undefined;
         var grp_buf: [96]u8 = undefined;
         const cand_str = self.pool.formatType(candidate_ty, self.sym_table, &cand_buf);

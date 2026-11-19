@@ -1587,6 +1587,9 @@ fn maybeRegisterResultErrCheckTypeLlvm(emitter: *LlvmModuleEmitter, raw_ty: Type
 
 /// Indexes all `MirBody` functions, composite types, string/blob constants, externs, closures, and drops.
 fn indexModuleEntities(emitter: *LlvmModuleEmitter) !void {
+    var seen_llvm_exports: std.StringHashMapUnmanaged(SymbolIndex) = .empty;
+    defer seen_llvm_exports.deinit(emitter.allocator);
+
     for (emitter.input.bodies, 0..) |*body_ptr, body_i| {
         const b_idx: u32 = @intCast(body_i);
         if (!body_ptr.def_id.isNone()) {
@@ -1599,6 +1602,7 @@ fn indexModuleEntities(emitter: *LlvmModuleEmitter) !void {
         const raw_name = emitter.input.interner.get(body_ptr.name);
         var is_export_sym = false;
         var has_wasm_export = false;
+        var wasm_export_slice: []const u8 = "";
         var link_name_override: ?[]const u8 = null;
         if (!body_ptr.symbol_index.isNone() and
             body_ptr.symbol_index.asInt() < emitter.input.sym_table.symbols.items.len)
@@ -1607,29 +1611,61 @@ fn indexModuleEntities(emitter: *LlvmModuleEmitter) !void {
             try recordCollectedLinkLibLlvm(emitter, ffi_meta.link_lib_name);
             is_export_sym = ffi_meta.is_export;
             has_wasm_export = ffi_meta.wasm_export_name.len > 0;
+            wasm_export_slice = ffi_meta.wasm_export_name;
             if (ffi_meta.link_name.len > 0) {
                 link_name_override = ffi_meta.link_name;
             }
         }
         const is_exported_main = std.mem.eql(u8, raw_name, "main") and (is_export_sym or has_wasm_export);
-        if (std.mem.eql(u8, raw_name, "main") and !is_exported_main) {
+        if (codegen_c.isRootEntryMainCandidate(body_ptr, emitter.input.sym_table, raw_name, is_exported_main)) {
             emitter.entry_main_body_idx = b_idx;
         }
 
-        const llvm_name = if (link_name_override) |lnk_str|
-            (if (std.mem.eql(u8, lnk_str, "main") and !is_exported_main)
-                try emitter.allocator.dupe(u8, "_cx_user_main")
-            else
-                try emitter.allocator.dupe(u8, lnk_str))
-        else if ((is_export_sym or has_wasm_export) and
+        var is_unmangled_linker_sym = false;
+        const llvm_name = if (link_name_override) |lnk_str| blk_lnk: {
+            is_unmangled_linker_sym = true;
+            if (std.mem.eql(u8, lnk_str, "main") and !is_exported_main) {
+                break :blk_lnk try emitter.allocator.dupe(u8, "_cx_user_main");
+            }
+            break :blk_lnk try emitter.allocator.dupe(u8, lnk_str);
+        } else if ((is_export_sym or has_wasm_export) and
             (!std.mem.eql(u8, raw_name, "main") or emitter.cfg.target.isWasm()))
-            try emitter.allocator.dupe(u8, raw_name)
-        else blk: {
+        blk_exp: {
+            is_unmangled_linker_sym = true;
+            break :blk_exp try emitter.allocator.dupe(u8, raw_name);
+        } else blk: {
             const clean_suffix = try sanitizeLlvmIdentAlloc(emitter.allocator, raw_name);
             defer emitter.allocator.free(clean_suffix);
-            break :blk try std.fmt.allocPrint(emitter.allocator, "_cx_fn_{d}_{s}", .{ b_idx, clean_suffix });
+            break :blk try codegen_c.formatInternalBodySymbolAlloc(
+                emitter.allocator,
+                emitter.input.sym_table,
+                emitter.input.interner,
+                body_ptr,
+                b_idx,
+                clean_suffix,
+            );
         };
         try emitter.body_llvm_names.append(emitter.allocator, llvm_name);
+        if (is_unmangled_linker_sym) {
+            try codegen_c.checkAndRecordExportedLinkerSymbol(
+                emitter.allocator,
+                &seen_llvm_exports,
+                emitter.input.sym_table,
+                emitter.input.diagnostic_sink,
+                llvm_name,
+                body_ptr,
+            );
+        }
+        if (has_wasm_export and !std.mem.eql(u8, wasm_export_slice, llvm_name)) {
+            try codegen_c.checkAndRecordExportedLinkerSymbol(
+                emitter.allocator,
+                &seen_llvm_exports,
+                emitter.input.sym_table,
+                emitter.input.diagnostic_sink,
+                wasm_export_slice,
+                body_ptr,
+            );
+        }
         try emitter.body_recipes.append(emitter.allocator, try classifyBodyAbi(emitter, body_ptr));
     }
 

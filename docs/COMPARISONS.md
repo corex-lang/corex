@@ -17,7 +17,7 @@ It serves two roles:
 
 ## 2. Cross-Language Capability Matrix
 
-Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `stage0/` + `core/` (`Phases 0–8`); **`[v0.0.1]`** = scheduled in `Phases 9–12` prior to initial release; **`[0.x]`** = scheduled in `Phase 13.0–13.4` prior to `v1.0.0`.
+Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `stage0/` + `core/` (`Phases 0–9`); **`[v0.0.1]`** = scheduled in `Phases 10–12` prior to initial release; **`[0.x]`** = scheduled in `Phase 13.0–13.4` prior to `v1.0.0`.
 
 | Dimension | CoreX | Rust | Zig | C23 / C++23 | Go | Python |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -26,7 +26,7 @@ Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `st
 | **Compile-Time Bounds-Check Elimination** | **Built-in Pentagon + `Intv` proof engine (`E0307` on static OOB)** `[Live]` | Relies on LLVM optimizer; runtime panic otherwise | Runtime check in Safe modes; UB in Fast | Unchecked (silent OOB UB) | Partial; runtime panic otherwise | Runtime `IndexError` |
 | **Must-Consume Linear Types (`@linear`)** | **Native** (`E0304` across all normal/error/`defer` paths) `[Live]` | Workarounds only (`#[must_use]` allows `let _ = x; drop`) | No | No | No | No |
 | **Static `@no_alloc` / `@no_panic` / `@max_stack(N)` Proofs** | **Built-in call-graph verifier + counterexample trace** `[Live]` | External hacks (`no_std` / symbol linker tricks) | Partial / manual | No | No | No |
-| **Supply-Chain Capability Sandboxing** | **Lockfile-enforced (`fs`, `net`, `env`, `ffi`, `alloc` per pkg)** `[v0.0.1]` | None (`build.rs` / proc-macros run arbitrary code) | Build runner sandboxing partial | None | None | None (`setup.py` / arbitrary imports) |
+| **Supply-Chain Capability Sandboxing** | **Lockfile-enforced (`fs`, `net`, `process`, `env`, `ffi`, `unsafe_op` per pkg)** `[Live]` | None (`build.rs` / proc-macros run arbitrary code) | Build runner sandboxing partial | None | None | None (`setup.py` / arbitrary imports) |
 | **Error Handling ABI** | **`T!E` zero-branch register return (`swiftcc` + `swifterror`)** `[Live]` | Stack/register `Result<T, E>` enum | Error union `E!T` | Exceptions (slow unwind) or `errno` | Multi-return `(T, error)` + `if err != nil` | Exceptions |
 | **Zero-Alloc Formatted Panics & Strings** | **8-byte `FmtSpec` + stack `FmtArgs` + `{x=}` (`0` heap allocs)** `[Live]` | `format_args!` (verbose macros, separate `{:?}`/`{}`) | `std.fmt` comptime format strings | `printf` (unsafe) / `std::format` (heavy) | `fmt.Sprintf` (heap/reflection) | `f"{x=}"` (heap-allocated) |
 | **C Header Interop (`@c_import`)** | **Built-in zero-`libclang` C11/C23 translator + FFI SAST contracts** `[Live]` | External `bindgen` + `libclang` + `unsafe` everywhere | Built-in `@cImport` (bundles heavy `libclang`) | Native | `cgo` (high call overhead) | `ctypes` / `cffi` (runtime overhead) |
@@ -57,11 +57,11 @@ Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `st
 -   CoreX runs a linear-time `Intv` interval pass paired with a Demand-Sliced Sparse ABCD **Pentagon** relational solver (`< 1.5 MB` scratch cap) directly on `MIR`.
 -   Provably out-of-bounds accesses fail **at compile time** (`E0307`) rather than crashing in production, while provably in-bounds loops and backward slice indexing (`buf[$ - 1]`, `buf[1..$ - 1]`) have their runtime bounds checks **statically eliminated** and export LLVM `!range` metadata for auto-vectorization.
 
-### 3.3 Call-Graph Capability Inference, Hard Real-Time Contracts & Supply-Chain Sandboxing (`[Live]` / `[v0.0.1]`)
+### 3.3 Call-Graph Capability Inference, Hard Real-Time Contracts & Supply-Chain Sandboxing (`[Live]`)
 
--   Every function automatically receives a compiler-inferred 16-bit `EffectCapabilityMask` (`fs`, `net`, `env`, `process`, `ffi`, `unsafe`, `alloc`, `may_panic`) and stack-frame summary (`own_frame_bytes`, `max_subtree_bytes`).
+-   Every function automatically receives a compiler-inferred 16-bit `EffectCapabilityMask` (`fs`, `net`, `env`, `process`, `ffi`, `unsafe_op`, `alloc`, `may_panic`) and stack-frame summary (`own_frame_bytes`, `max_subtree_bytes`).
 -   Annotating an audio callback, interrupt handler, kernel path, or parser hot loop with `@no_alloc`, `@no_panic`, `@no_block`, or `@max_stack(4096)` statically proves the entire transitive call graph obeys that contract – emitting the **shortest violating call-chain witness** (`E0316`, `E0320`–`E0322`) when violated.
--   In `Phase 9` (`[v0.0.1]`), `corex.lock` records each dependency's inferred capability mask: a math or JSON dependency that tries to open a network socket or invoke FFI in a patch update is rejected **at compile time** before a single test even runs.
+-   `corex.toml` (`allow_caps`, `default_dep_policy = "zero_trust"`) and `corex.lock` (`max_caps`, `cxi_blake3`) enforce compile-time supply-chain sandboxing across every dependency, `impl Drop` destructor, inactive `@cfg` branch, and `.cxtree`-jailed `@embed_bytes` / `@c_import` asset (`E0324`, `E0326`, `E0327`, `W0330`) – rejecting capability escalation or transitive capability laundering **at compile time** before a single test runs.
 
 ### 3.4 Zero-Branch `T!E` Error Handling & `@derive(From)` (`[Live]`)
 
@@ -109,9 +109,9 @@ CoreX systematically adopts the highest-leverage ergonomic wins from Python, Swi
     -   **True `@linear` types** that statically guarantee explicit consumption on every path (`[Live]`).
     -   **`Pin`-free stackless `async`/`await` (`<= 16 KiB` inline frame budget `E0317`) and `@linear` `cx.async.task_group` nurseries (`E0309`)** without `'static` or `Arc<Mutex<T>>` ceremony (`[Live]`).
     -   **Named arguments, default parameters, `/` and `*` parameter zones**, and **generic type defaults** (`[Live]`).
-    -   **Built-in `@no_alloc` / `@no_panic` / `@max_stack(N)`** verification and **lockfile capability sandboxing** (`[Live]` / `[v0.0.1]`).
+    -   **Built-in `@no_alloc` / `@no_panic` / `@max_stack(N)`** verification and **lockfile capability sandboxing** (`[Live]`).
     -   **Zero-`libclang` C header import** (`[Live]`), **hermetic `MirVm` `comptime`** instead of heavy proc-macro crates (`[Live]`), and a **`< 1 MB` self-hosted toolchain** (`[v0.0.1]`).
--   **Honest Scope Note:** Rust has a massive mature crates.io ecosystem today; CoreX bridges day-one library breadth via zero-ceremony C11/C23 FFI (`[Live]`) and direct Git URL package imports (`Phase 9`).
+-   **Honest Scope Note:** Rust has a massive mature crates.io ecosystem today; CoreX bridges day-one library breadth via zero-ceremony C11/C23 FFI and direct Git URL / single-file `.cx` script package imports (`[Live]`).
 
 ### 4.2 CoreX vs. C & C++
 
@@ -366,5 +366,38 @@ pub async fn parallel_digest(label: CStr, payload: &[u8]) -> i32 {
         });
         left.join().await + right.join().await
     }).await;
+}
+```
+
+### Showcase 8: Zero-Friction Package Management & Supply-Chain Capability Sandboxing (`[Live]`)
+
+```toml
+# corex.toml – Bounded-MVS (`< 5 ms` cold resolve) + compile-time capability sandboxing:
+[package]
+name = "metrics-agent"
+version = "0.1.0"
+corex = "1.0"
+
+[security]
+default_dep_policy = "zero_trust"
+
+[dependencies]
+# Pure parser granted `0` OS/FFI capabilities (network/fs/ffi/unsafe_op rejected with `E0324`!):
+json-wire = { version = "1.4.0", allow_caps = [] }
+# Linux-only ring transport gated by CoreX's single-form `@cfg` predicate syntax:
+uring-net = { version = "0.3.0", target = "target.os == .Linux", allow_caps = ["net", "ffi", "unsafe_op"] }
+```
+
+```cx
+#!/usr/bin/env corex
+---
+[dependencies]
+json-wire = { version = "1.4.0", allow_caps = [] }
+---
+// Single-file `.cx` script (`corex run script.cx`) locks out-of-tree under `<COREX_HOME>/target/scripts/<blake3>/`:
+use json_wire.parse_counter;
+
+pub fn main() -> i32 {
+    return parse_counter("{\"ok\":1}");
 }
 ```

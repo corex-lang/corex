@@ -2459,6 +2459,9 @@ fn formatC99BannerTargetName(target: TargetSpec) []const u8 {
 fn indexModuleEntities(emitter: *CModuleEmitter) !void {
     try discoverTypeRecursive(emitter, .str_ty, 0);
 
+    var seen_c_exports: std.StringHashMapUnmanaged(SymbolIndex) = .empty;
+    defer seen_c_exports.deinit(emitter.allocator);
+
     for (emitter.input.bodies, 0..) |*body_ptr, body_i| {
         const b_idx: u32 = @intCast(body_i);
         if (!body_ptr.def_id.isNone()) {
@@ -2471,6 +2474,7 @@ fn indexModuleEntities(emitter: *CModuleEmitter) !void {
         const raw_name = emitter.input.interner.get(body_ptr.name);
         var is_export_sym = false;
         var has_wasm_export = false;
+        var wasm_export_slice: []const u8 = "";
         var link_name_override: ?[]const u8 = null;
         if (!body_ptr.symbol_index.isNone() and
             body_ptr.symbol_index.asInt() < emitter.input.sym_table.symbols.items.len)
@@ -2479,29 +2483,62 @@ fn indexModuleEntities(emitter: *CModuleEmitter) !void {
             try recordCollectedLinkLib(emitter, ffi_meta.link_lib_name);
             is_export_sym = ffi_meta.is_export;
             has_wasm_export = ffi_meta.wasm_export_name.len > 0;
+            wasm_export_slice = ffi_meta.wasm_export_name;
             if (ffi_meta.link_name.len > 0) {
                 link_name_override = ffi_meta.link_name;
             }
         }
 
         const is_exported_main = std.mem.eql(u8, raw_name, "main") and (is_export_sym or has_wasm_export);
-        if (std.mem.eql(u8, raw_name, "main") and !is_exported_main) {
+        if (isRootEntryMainCandidate(body_ptr, emitter.input.sym_table, raw_name, is_exported_main)) {
             emitter.entry_main_body_idx = b_idx;
         }
 
-        const c_name = if (link_name_override) |lnk_str|
-            (if (std.mem.eql(u8, lnk_str, "main") and !is_exported_main)
-                try emitter.allocator.dupe(u8, "_cx_user_main")
-            else
-                try emitter.allocator.dupe(u8, lnk_str))
-        else if ((is_export_sym or has_wasm_export) and (!std.mem.eql(u8, raw_name, "main") or emitter.cfg.target.isWasm()))
-            try sanitizeIdentifierAlloc(emitter.allocator, raw_name)
-        else blk: {
+        var is_unmangled_linker_sym = false;
+        const c_name = if (link_name_override) |lnk_str| blk_lnk: {
+            is_unmangled_linker_sym = true;
+            if (std.mem.eql(u8, lnk_str, "main") and !is_exported_main) {
+                break :blk_lnk try emitter.allocator.dupe(u8, "_cx_user_main");
+            }
+            break :blk_lnk try emitter.allocator.dupe(u8, lnk_str);
+        } else if ((is_export_sym or has_wasm_export) and
+            (!std.mem.eql(u8, raw_name, "main") or emitter.cfg.target.isWasm()))
+        blk_exp: {
+            is_unmangled_linker_sym = true;
+            break :blk_exp try sanitizeIdentifierAlloc(emitter.allocator, raw_name);
+        } else blk: {
             const clean_suffix = try sanitizeIdentifierAlloc(emitter.allocator, raw_name);
             defer emitter.allocator.free(clean_suffix);
-            break :blk try std.fmt.allocPrint(emitter.allocator, "_cx_fn_{d}_{s}", .{ b_idx, clean_suffix });
+            break :blk try formatInternalBodySymbolAlloc(
+                emitter.allocator,
+                emitter.input.sym_table,
+                emitter.input.interner,
+                body_ptr,
+                b_idx,
+                clean_suffix,
+            );
         };
         try emitter.body_c_names.append(emitter.allocator, c_name);
+        if (is_unmangled_linker_sym) {
+            try checkAndRecordExportedLinkerSymbol(
+                emitter.allocator,
+                &seen_c_exports,
+                emitter.input.sym_table,
+                emitter.input.diagnostic_sink,
+                c_name,
+                body_ptr,
+            );
+        }
+        if (has_wasm_export and !std.mem.eql(u8, wasm_export_slice, c_name)) {
+            try checkAndRecordExportedLinkerSymbol(
+                emitter.allocator,
+                &seen_c_exports,
+                emitter.input.sym_table,
+                emitter.input.diagnostic_sink,
+                wasm_export_slice,
+                body_ptr,
+            );
+        }
     }
 
     for (emitter.input.bodies, 0..) |*body_ptr, body_i| {
@@ -10263,6 +10300,167 @@ pub fn runZigCcCommand(
 
 // ------------------------------------- PUBLIC API --------------------------------------
 
+/// Returns `true` iff `body_ptr` is the top-level binary entrypoint `fn main` in `PackageId.root` (`P2-5`).
+pub fn isRootEntryMainCandidate(
+    body_ptr: *const MirBody,
+    sym_table: *const SymbolTable,
+    raw_name: []const u8,
+    is_exported_main: bool,
+) bool {
+    if (!std.mem.eql(u8, raw_name, "main") or is_exported_main) return false;
+    if (!body_ptr.file_id.isNone()) {
+        if (sym_table.getFilePackageId(body_ptr.file_id) != .root) return false;
+        if (sym_table.package_metas.get(.root)) |root_meta| {
+            if (!root_meta.root_file_id.isNone() and body_ptr.file_id != root_meta.root_file_id) {
+                return false;
+            }
+        } else if (sym_table.lookupPackageRootScope(.root)) |root_pkg_scope| {
+            if (!root_pkg_scope.isNone()) {
+                const root_scope_fid = sym_table.scope_arena.getScope(root_pkg_scope).file_id;
+                if (!root_scope_fid.isNone() and body_ptr.file_id != root_scope_fid) {
+                    return false;
+                }
+            }
+        }
+    }
+    var resolved_sym_idx: SymbolIndex = body_ptr.symbol_index;
+    if (resolved_sym_idx.isNone() and !body_ptr.def_id.isNone()) {
+        if (sym_table.def_to_symbol.get(body_ptr.def_id.asInt())) |mapped_sym| {
+            resolved_sym_idx = mapped_sym;
+        }
+    }
+    if (!resolved_sym_idx.isNone() and resolved_sym_idx.asInt() < sym_table.symbols.items.len) {
+        const sym_rec = sym_table.getSymbol(resolved_sym_idx).*;
+        if (!sym_rec.owner_def_id.isNone()) return false;
+        if (!body_ptr.file_id.isNone()) {
+            if (sym_table.file_module_scopes.get(body_ptr.file_id.asInt())) |mod_scope| {
+                if (!sym_rec.scope_id.isNone() and sym_rec.scope_id != mod_scope) return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// Formats a deterministic C99 / LLVM internal symbol identifier for `body_ptr` (`P2-5`).
+/// Preserves exact `_cx_fn_{body_idx}_{clean_suffix}` in single-package standalone mode for golden parity,
+/// and emits `_cx_p{pkg_id}_{pkg_ver_hash8}_f{file_id}_{body_idx}_{clean_suffix}` in multi-package mode.
+pub fn formatInternalBodySymbolAlloc(
+    allocator: std.mem.Allocator,
+    sym_table: *const SymbolTable,
+    interner: *const StringInterner,
+    body_ptr: *const MirBody,
+    body_idx: u32,
+    clean_suffix: []const u8,
+) ![]u8 {
+    const pkg_id = if (!body_ptr.file_id.isNone())
+        sym_table.getFilePackageId(body_ptr.file_id)
+    else
+        vfs_sourcemap.PackageId.root;
+    const is_multi_pkg_mode = (pkg_id != .root) or
+        sym_table.is_flat_named_module_scopes_suppressed or
+        (sym_table.package_metas.count() > 0) or
+        (sym_table.package_canonical_names.count() > 0);
+    if (!is_multi_pkg_mode) {
+        return std.fmt.allocPrint(allocator, "_cx_fn_{d}_{s}", .{ body_idx, clean_suffix });
+    }
+
+    var hasher = std.hash.Wyhash.init(0);
+    if (sym_table.package_metas.get(pkg_id)) |pkg_meta| {
+        if (pkg_meta.canonical_name_sym != .empty) {
+            hasher.update(interner.get(pkg_meta.canonical_name_sym));
+        }
+        hasher.update("@");
+        hasher.update(pkg_meta.version_text);
+    } else if (sym_table.package_canonical_names.get(pkg_id)) |canon_sym| {
+        hasher.update(interner.get(canon_sym));
+        hasher.update("@");
+        if (sym_table.package_version_labels.get(pkg_id)) |ver_id| {
+            hasher.update(interner.get(ver_id));
+        }
+    } else {
+        const raw_pkg_bytes: [2]u8 = @bitCast(pkg_id.asInt());
+        hasher.update(&raw_pkg_bytes);
+    }
+    const pkg_ver_hash8: u32 = @truncate(hasher.final());
+    const fid_raw: u32 = if (!body_ptr.file_id.isNone()) body_ptr.file_id.asInt() else 0;
+    return std.fmt.allocPrint(
+        allocator,
+        "_cx_p{d}_{x:0>8}_f{d}_{d}_{s}",
+        .{ pkg_id.asInt(), pkg_ver_hash8, fid_raw, body_idx, clean_suffix },
+    );
+}
+
+/// Verifies that unmangled external export `export_name` (`@export` / `@link_name` / `@wasm_export`)
+/// does not collide with another distinct `SymbolIndex` across packages (`E0011`).
+pub fn checkAndRecordExportedLinkerSymbol(
+    allocator: std.mem.Allocator,
+    seen_exports: *std.StringHashMapUnmanaged(SymbolIndex),
+    sym_table: *const SymbolTable,
+    diagnostic_sink: ?*diagnostic.DiagnosticSink,
+    export_name: []const u8,
+    body_ptr: *const MirBody,
+) !void {
+    if (export_name.len == 0) return;
+    const cur_sym_idx = body_ptr.symbol_index;
+    if (!cur_sym_idx.isNone() and cur_sym_idx.asInt() < sym_table.symbols.items.len and
+        sym_table.getSymbol(cur_sym_idx).flags.is_prototype_only)
+    {
+        return;
+    }
+    const gop = try seen_exports.getOrPut(allocator, export_name);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = cur_sym_idx;
+        return;
+    }
+    if (!cur_sym_idx.isNone() and gop.value_ptr.* == cur_sym_idx) return;
+
+    if (diagnostic_sink) |sink| {
+        const primary_span = if (!cur_sym_idx.isNone() and cur_sym_idx.asInt() < sym_table.symbols.items.len)
+            sym_table.getSymbol(cur_sym_idx).decl_span
+        else
+            Span.init(body_ptr.file_id, 0, 0);
+        const prev_sym_idx = gop.value_ptr.*;
+        const display_name = if (std.mem.eql(u8, export_name, "_cx_user_main")) "main" else export_name;
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "duplicate exported native linker symbol `{s}` across compiled modules/packages",
+            .{display_name},
+        );
+        defer allocator.free(msg);
+
+        var labels_buf: [2]diagnostic.LabeledSpan = undefined;
+        var label_len: usize = 0;
+        labels_buf[label_len] = .{
+            .span = primary_span,
+            .label = "conflicting exported symbol defined here",
+            .style = .primary,
+        };
+        label_len += 1;
+        if (!prev_sym_idx.isNone() and prev_sym_idx.asInt() < sym_table.symbols.items.len) {
+            const prev_span = sym_table.getSymbol(prev_sym_idx).decl_span;
+            if (!prev_span.file_id.isNone()) {
+                labels_buf[label_len] = .{
+                    .span = prev_span,
+                    .label = "first exported definition here",
+                    .style = .secondary,
+                };
+                label_len += 1;
+            }
+        }
+        try sink.emit(.{
+            .code = .e0011_native_links_collision,
+            .severity = .err,
+            .primary_span = primary_span,
+            .message = msg,
+            .labels = labels_buf[0..label_len],
+            .notes = &[_][]const u8{
+                "help: rename one of the `@export` / `@link_name` / `@wasm_export` symbols to avoid linker collision",
+            },
+        });
+    }
+    return error.BackendFailure;
+}
+
 /// Emits deterministic ISO C99 source for `input` and optionally compiles/links via `zig cc`.
 pub fn emitModule(
     allocator: std.mem.Allocator,
@@ -10788,4 +10986,45 @@ test "test_codegen_c_freestanding_wasm_and_sdkless_aarch64_msvc_obj" {
     const lib_file = try std.Io.Dir.cwd().openFile(io, arm64_lib_path, .{ .mode = .read_only });
     defer lib_file.close(io);
     try std.testing.expect((try lib_file.stat(io)).size > 8);
+}
+
+test "test_phase9_duplicate_link_name_main_emits_e0011" {
+    const allocator = std.testing.allocator;
+    const dup_main_src =
+        \\@link_name("main")
+        \\pub fn entry_one() -> i32 = 0;
+        \\@link_name("main")
+        \\pub fn entry_two() -> i32 = 1;
+    ;
+    var dup_bundle = try mir.lowerSourceToMir(
+        allocator,
+        FileId.fromInt(99),
+        dup_main_src,
+        TargetSpec.X86_64_LINUX_GNU.asTargetLayout(),
+        .{},
+    );
+    defer dup_bundle.deinit();
+    var dup_sink = diagnostic.DiagnosticSink.init(allocator);
+    defer dup_sink.deinit();
+    try std.testing.expectError(
+        error.BackendFailure,
+        emitModule(
+            allocator,
+            .{ .target = TargetSpec.X86_64_LINUX_GNU, .is_release_mode = false },
+            .{
+                .bodies = dup_bundle.mir_bundle.bodies.items,
+                .pool = &dup_bundle.hir_bundle.pool,
+                .sym_table = &dup_bundle.hir_bundle.sym_table,
+                .interner = &dup_bundle.hir_bundle.interner,
+                .module_name = "dup_user_main",
+                .artifact_kind = .source_text,
+                .diagnostic_sink = &dup_sink,
+            },
+        ),
+    );
+    var has_e0011 = false;
+    for (dup_sink.asSlice()) |diag_item| {
+        if (diag_item.code == .e0011_native_links_collision) has_e0011 = true;
+    }
+    try std.testing.expect(has_e0011);
 }

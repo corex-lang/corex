@@ -25,6 +25,7 @@ const mir_vm = @import("mir_vm.zig");
 const mir_opt = @import("mir_opt.zig");
 const codegen_abi = @import("codegen_abi.zig");
 const codegen_dev_seam = @import("codegen_dev_seam.zig");
+const pkg_cxi_seam = @import("pkg_cxi_seam.zig");
 pub const c_frontend = @import("c_frontend.zig");
 pub const c_translate = @import("c_translate.zig");
 
@@ -640,6 +641,8 @@ pub const ItemTree = struct {
     combined_fingerprint: Fingerprint128 = Fingerprint128.ZERO,
     /// `LoweredAstArtifact.ast_fingerprint` from which this `ItemTree` was extracted.
     source_ast_fingerprint: Fingerprint128 = Fingerprint128.ZERO,
+    /// 128-bit fingerprint of the owning package's `@cfg` feature configuration (`DR-11` §3.2).
+    pkg_cfg_fingerprint: Fingerprint128 = Fingerprint128.ZERO,
 
     /// Releases the owned `entries` slice back to `allocator`.
     pub fn deinit(self: *ItemTree, allocator: std.mem.Allocator) void {
@@ -854,6 +857,67 @@ pub const ComptimeEvalArtifact = struct {
     has_errors: bool = false,
     /// 128-bit fingerprint computed strictly from `(type_id, canonical_value)` for Early Cutoff backdating.
     value_fingerprint: Fingerprint128,
+};
+
+/// Re-exported canonical per-`PackageId` `@embed_bytes` / `@c_import` sandbox jail union (`DR-17` §5).
+pub const PackageEmbedJail = mir.EmbedPackageJail;
+
+/// Owned per-`PackageId` `@cfg` feature configuration stored in `CompilerDb` (`DR-11` §3.2).
+pub const PackageCfgConfig = struct {
+    /// Sorted active feature names (`cfg.feature.<name>`).
+    enabled_features: [][]u8 = &.{},
+    /// Optional sorted declared `[features]` names from `corex.toml` (`E0435` guard).
+    declared_features: ?[][]u8 = null,
+    /// Precomputed 128-bit canonical digest over `(enabled_features, declared_features)`.
+    cfg_fingerprint: Fingerprint128 = Fingerprint128.ZERO,
+
+    /// Releases all owned feature slices back to `allocator`.
+    pub fn deinit(self: *PackageCfgConfig, allocator: std.mem.Allocator) void {
+        for (self.enabled_features) |feat_slice| allocator.free(feat_slice);
+        if (self.enabled_features.len > 0) allocator.free(self.enabled_features);
+        if (self.declared_features) |decl_list| {
+            for (decl_list) |decl_slice| allocator.free(decl_slice);
+            if (decl_list.len > 0) allocator.free(decl_list);
+        }
+        self.* = undefined;
+    }
+};
+
+/// Serialized `.cxi` binary summary, `BLAKE3` digest, and four-tier capability roll-up for a `PackageId`.
+pub const PackageCxiArtifact = struct {
+    /// 8-byte-aligned serialized `.cxi` binary buffer (`CxiHeader` + `CxiFnRecord[]` + `CxiTypeRecord[]`).
+    bytes: []align(8) u8,
+    /// Keyed 256-bit `BLAKE3` `.cxi` digest (`"corex.cxi.v1.2026-04"`).
+    cxi_blake3: [32]u8,
+    /// Aggregated active SAST capability roll-up across all compiled files of the package.
+    caps: mir_sast.PackageCapSummary = .{},
+    /// Dormant capabilities scanned across all `@cfg`-disabled CST subtrees of the package.
+    inactive_scan: symbol_resolver.InactiveCfgCapScan = .{},
+    /// Source span of the first leaf item directly exercising a capability in the package.
+    first_cap_leaf_span: Span = .{ .file_id = .none, .start_byte = 0, .end_byte = 0 },
+    /// Owned qualified symbol name of the first capability-bearing leaf item (`&.{}` when none).
+    first_cap_leaf_name: []u8 = &.{},
+
+    /// Releases the aligned `.cxi` byte buffer and `first_cap_leaf_name` back to `allocator`.
+    pub fn deinit(self: *PackageCxiArtifact, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+        if (self.first_cap_leaf_name.len > 0) allocator.free(self.first_cap_leaf_name);
+        self.* = undefined;
+    }
+};
+
+/// Cached intra-package Pass-1 module-item collection state preventing duplicate `SymbolIndex` creation.
+const FilePass1State = struct {
+    /// Collected module `ScopeId` for `file_id`.
+    mod_scope: ScopeId = .none,
+    /// Inclusive starting `SymbolIndex.asInt()` of Pass-1 collected items.
+    sym_start: u32 = 0,
+    /// Exclusive ending `SymbolIndex.asInt()` of Pass-1 collected items.
+    sym_end: u32 = 0,
+    /// Revision on which Pass-1 ran.
+    created_revision: Revision = .initial,
+    /// `true` once Pass-2 `resolveFileUseImports` has already consumed `mod_scope`.
+    has_consumed_pass2: bool = false,
 };
 
 /// Errors returned by `CompilerDb.compileModuleArtifact`.
@@ -2786,6 +2850,7 @@ fn extractItemTreeFromAst(
     source: []const u8,
     parsed: *const ParsedCstArtifact,
     is_including_tests: bool,
+    pkg_cfg_fp: Fingerprint128,
 ) !ItemTree {
     var entries_list: std.ArrayList(ItemTreeEntry) = .empty;
     errdefer entries_list.deinit(allocator);
@@ -2817,6 +2882,9 @@ fn extractItemTreeFromAst(
     var sig_tree_hasher = StructuralHasher.init();
     sig_tree_hasher.updateU32(file_id.asInt());
     sig_tree_hasher.updateU32(@intCast(entries_list.items.len));
+    if (!Fingerprint128.eql(pkg_cfg_fp, Fingerprint128.ZERO)) {
+        sig_tree_hasher.updateFingerprint(pkg_cfg_fp);
+    }
     for (entries_list.items) |entry| {
         sig_tree_hasher.updateU32(entry.def_id.asInt());
         sig_tree_hasher.updateU8(@backingInt(entry.kind));
@@ -2839,6 +2907,7 @@ fn extractItemTreeFromAst(
         .tree_fingerprint = tree_fp,
         .combined_fingerprint = combined_hasher.final(),
         .source_ast_fingerprint = parsed.ast_fingerprint,
+        .pkg_cfg_fingerprint = pkg_cfg_fp,
     };
 }
 
@@ -3641,6 +3710,103 @@ fn discoverDevRecordTypeBounded(
     }
 }
 
+/// Unions two `FnRegionSummary` records across sibling bodies of an `impl` or default-arg item.
+fn unionFnRegionSummaries(
+    lhs: mir_sast.FnRegionSummary,
+    rhs: mir_sast.FnRegionSummary,
+    is_preserving_fn_sig_flow: bool,
+) mir_sast.FnRegionSummary {
+    const merged_subtree: u32 = if (lhs.max_subtree_bytes == mir_sast.FnRegionSummary.STACK_UNBOUNDED or
+        rhs.max_subtree_bytes == mir_sast.FnRegionSummary.STACK_UNBOUNDED)
+        mir_sast.FnRegionSummary.STACK_UNBOUNDED
+    else
+        @max(lhs.max_subtree_bytes, rhs.max_subtree_bytes);
+    if (is_preserving_fn_sig_flow) {
+        var res = lhs;
+        res.max_subtree_bytes = merged_subtree;
+        res.inferred_effects_bits = lhs.inferred_effects_bits | rhs.inferred_effects_bits;
+        res.direct_effects_bits = lhs.direct_effects_bits | rhs.direct_effects_bits;
+        return res;
+    }
+    return .{
+        .ret_provenance_mask = lhs.ret_provenance_mask | rhs.ret_provenance_mask,
+        .param_flow_matrix = lhs.param_flow_matrix | rhs.param_flow_matrix,
+        .global_escape_mask = lhs.global_escape_mask | rhs.global_escape_mask,
+        .consumed_param_mask = lhs.consumed_param_mask | rhs.consumed_param_mask,
+        .own_frame_bytes = @max(lhs.own_frame_bytes, rhs.own_frame_bytes),
+        .max_subtree_bytes = merged_subtree,
+        .inferred_effects_bits = lhs.inferred_effects_bits | rhs.inferred_effects_bits,
+        .direct_effects_bits = lhs.direct_effects_bits | rhs.direct_effects_bits,
+        .contracts_scratch_bits = lhs.contracts_scratch_bits | rhs.contracts_scratch_bits,
+        .forwarded_cb_mask = lhs.forwarded_cb_mask | rhs.forwarded_cb_mask,
+    };
+}
+
+/// Scans `cst_arena` for an `@cfg`-active top-level (or inline `mod`) `asm(…)` item, returning its `Span`.
+fn scanFileActiveTopLevelAsm(
+    cfg_env: *const symbol_resolver.CfgEnv,
+    file_id: FileId,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+) ?Span {
+    const total_cst = cst_arena.countNodes();
+    const total_tokens = token_buffer.countTokens();
+    if (total_cst == 0 or total_tokens == 0) return null;
+
+    var cur_idx: usize = 1;
+    while (cur_idx < total_cst) {
+        const cst_idx = CstNodeIndex.fromInt(@intCast(cur_idx));
+        const node = cst_arena.getNode(cst_idx);
+        const subtree_end = @min(cur_idx + @max(@as(usize, node.subtree_size), 1), total_cst);
+        if (node.subtree_size > 1 and node.kind != .attribute and node.kind != .file_end) {
+            const is_active = symbol_resolver.evaluateCstNodeCfgWithEnv(
+                cfg_env,
+                file_id,
+                source,
+                token_buffer,
+                cst_arena,
+                cst_idx,
+                null,
+            ) catch true;
+            if (!is_active) {
+                cur_idx = subtree_end;
+                continue;
+            }
+        }
+        if (node.kind == .fn_item or node.kind == .struct_item or node.kind == .enum_item or
+            node.kind == .union_item or node.kind == .impl_item or node.kind == .trait_item or
+            node.kind == .test_item or node.kind == .bench_item or node.kind == .use_item or
+            node.kind == .const_item or node.kind == .extern_block_item or node.kind == .extern_static_item or
+            node.kind == .subscript_item or node.kind == .attribute)
+        {
+            cur_idx = subtree_end;
+            continue;
+        }
+        if (node.subtree_size <= 1 and !node.flags.is_bracketed and !node.flags.is_missing_or_injected and
+            !node.token.isNone() and node.token.asInt() < total_tokens)
+        {
+            const tok_rec = token_buffer.getToken(node.token);
+            if (!tok_rec.flags.is_synthesized and tok_rec.kind == .ident and
+                std.mem.eql(u8, symbol_resolver.extractTokenSlice(source, token_buffer, node.token), "asm"))
+            {
+                var next_tok_raw = node.token.asInt() + 1;
+                while (next_tok_raw < total_tokens and token_buffer.getToken(TokenIndex.fromInt(next_tok_raw)).flags.is_synthesized) {
+                    next_tok_raw += 1;
+                }
+                if (next_tok_raw < total_tokens) {
+                    const next_kind = token_buffer.getToken(TokenIndex.fromInt(next_tok_raw)).kind;
+                    if (next_kind == .lparen or next_kind == .lbrace or next_kind == .string_lit) {
+                        return token_buffer.getTokenSpan(file_id, node.token);
+                    }
+                }
+            }
+        }
+        cur_idx += 1;
+    }
+    return null;
+}
+
 // ------------------------------------- PUBLIC API --------------------------------------
 
 /// Demand-driven incremental query database (`DR-12` Section 3) with Early Cutoff and Durability.
@@ -3769,6 +3935,26 @@ pub const CompilerDb = struct {
     file_paths: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
     /// Cached `.module_sym` `SymbolIndex` handles keyed by virtual `@c_import` `FileId.asInt()`.
     c_import_mod_syms: std.AutoHashMapUnmanaged(u32, SymbolIndex) = .empty,
+    /// `true` when a resolved Phase 9 package graph is mounted (disables `Durability.high` stdlib privilege on `.root`).
+    is_package_graph_mounted: bool = false,
+    /// Per-`PackageId` `@cfg` feature configuration (`PackageId -> PackageCfgConfig`).
+    package_cfg_configs: std.AutoHashMapUnmanaged(PackageId, PackageCfgConfig) = .empty,
+    /// Directed dependency edges `(caller_pkg, alias_sym) -> target_pkg_root_file_id` (`P1-1`).
+    package_dep_files: std.AutoHashMapUnmanaged(symbol_resolver.PkgDepKey, FileId) = .empty,
+    /// Canonical root `FileId` (`src/root.cx` or `src/main.cx`) per `PackageId`.
+    package_root_files: std.AutoHashMapUnmanaged(PackageId, FileId) = .empty,
+    /// Per-`PackageId` `@embed_bytes` and `@c_import` sandbox jail (`PackageId -> EmbedPackageJail`).
+    package_embed_jails: std.AutoHashMapUnmanaged(PackageId, mir.EmbedPackageJail) = .empty,
+    /// Owned jail directory/prefix string buffers referenced by `package_embed_jails`.
+    owned_jail_strings: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Per-`PackageId` capability sandbox policy (`PackageId -> PackageCapPolicy`).
+    package_cap_policies: std.AutoHashMapUnmanaged(PackageId, mir_sast.PackageCapPolicy) = .empty,
+    /// Owned display name strings referenced by `package_cap_policies`.
+    owned_policy_names: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Intra-package Pass-1 module collection states keyed by `FileId.asInt()`.
+    file_pass1_states: std.AutoHashMapUnmanaged(u32, FilePass1State) = .empty,
+    /// Optional `VfsSourceMap` pointer resolving `.cxtree_only` assets without touching host disk.
+    vfs_source_map: ?*const vfs_sourcemap.VfsSourceMap = null,
     /// Optional hook for injecting synthetic dependency cycles in unit tests.
     custom_stage_hook: ?CustomStageHook = null,
     /// Execution, Green Path, Durability fast-path, and Early Cutoff counters.
@@ -3915,6 +4101,18 @@ pub const CompilerDb = struct {
         while (fp_iter.next()) |owned_path| self.allocator.free(owned_path.*);
         self.file_paths.deinit(self.allocator);
         self.c_import_mod_syms.deinit(self.allocator);
+        var pkg_cfg_iter = self.package_cfg_configs.valueIterator();
+        while (pkg_cfg_iter.next()) |cfg_ptr| cfg_ptr.deinit(self.allocator);
+        self.package_cfg_configs.deinit(self.allocator);
+        self.package_dep_files.deinit(self.allocator);
+        self.package_root_files.deinit(self.allocator);
+        self.package_embed_jails.deinit(self.allocator);
+        for (self.owned_jail_strings.items) |jail_str| self.allocator.free(jail_str);
+        self.owned_jail_strings.deinit(self.allocator);
+        self.package_cap_policies.deinit(self.allocator);
+        for (self.owned_policy_names.items) |pol_str| self.allocator.free(pol_str);
+        self.owned_policy_names.deinit(self.allocator);
+        self.file_pass1_states.deinit(self.allocator);
         self.pure_call_memo_cache.deinit();
         self.rodata_pool.deinit();
         self.symbol_table.deinit();
@@ -4069,13 +4267,43 @@ pub const CompilerDb = struct {
         return cfg_key;
     }
 
+    /// Resolves the `PackageId` of the innermost file/def query currently executing on `active_stack`.
+    fn resolveActiveQueryPackageId(self: *const CompilerDb) PackageId {
+        var idx = self.active_stack.items.len;
+        while (idx > 0) {
+            idx -= 1;
+            if (queryKeyTargetFileId(self.active_stack.items[idx].key)) |target_fid| {
+                return self.symbol_table.getFilePackageId(target_fid);
+            }
+        }
+        return .root;
+    }
+
     /// Records a tracked content-hashed dependency for an `@embed_bytes` or `@c_import` file read.
     pub fn recordEmbeddedFileRead(
         self: *CompilerDb,
         rel_path: []const u8,
         content_bytes: []const u8,
     ) QueryError!QueryKey {
-        const path_sym = self.interner.intern(rel_path) catch return error.OutOfMemory;
+        return self.recordPackageEmbeddedFileRead(self.resolveActiveQueryPackageId(), rel_path, content_bytes);
+    }
+
+    /// Records a tracked content-hashed file read dependency qualified by `pkg_id` when `is_package_graph_mounted`.
+    fn recordPackageEmbeddedFileRead(
+        self: *CompilerDb,
+        pkg_id: PackageId,
+        rel_path: []const u8,
+        content_bytes: []const u8,
+    ) QueryError!QueryKey {
+        var owned_qual_key: ?[]u8 = null;
+        defer if (owned_qual_key) |buf| self.allocator.free(buf);
+        const key_slice: []const u8 = if (self.is_package_graph_mounted and !std.mem.startsWith(u8, rel_path, "pkg#")) blk: {
+            const qual = std.fmt.allocPrint(self.allocator, "pkg#{d}:{s}", .{ pkg_id.asInt(), rel_path }) catch
+                return error.OutOfMemory;
+            owned_qual_key = qual;
+            break :blk qual;
+        } else rel_path;
+        const path_sym = self.interner.intern(key_slice) catch return error.OutOfMemory;
         const embed_key = QueryKey.forEmbedFile(path_sym);
         const content_fp = Fingerprint128.hashBytes(content_bytes);
 
@@ -4102,12 +4330,106 @@ pub const CompilerDb = struct {
         return embed_key;
     }
 
-    /// Re-probes the current VFS or disk content fingerprint of a tracked `@embed_bytes` or `@c_import` path.
+    /// Re-probes the current VFS, `.cxtree`, or jailed disk content fingerprint of a tracked `@embed_bytes` / `@c_import` path.
     fn probeEmbeddedFileFingerprint(self: *CompilerDb, path_sym: SymbolId) Fingerprint128 {
-        const rel_path = self.interner.get(path_sym);
+        const raw_key = self.interner.get(path_sym);
+        var scoped_pkg: ?PackageId = null;
+        var rel_path: []const u8 = raw_key;
+        if (std.mem.startsWith(u8, raw_key, "pkg#")) {
+            if (std.mem.indexOfScalarPos(u8, raw_key, 4, ':')) |colon_pos| {
+                if (std.fmt.parseInt(u16, raw_key[4..colon_pos], 10) catch null) |parsed_pkg_num| {
+                    scoped_pkg = PackageId.fromInt(parsed_pkg_num);
+                    rel_path = raw_key[colon_pos + 1 ..];
+                }
+            }
+        }
+        if (self.vfs_source_map) |vfs_src_map| {
+            if (std.mem.startsWith(u8, rel_path, "/cx/")) {
+                if (vfs_src_map.lookupCxTreeAsset(rel_path) catch null) |cx_bytes| {
+                    return Fingerprint128.hashBytes(cx_bytes);
+                }
+            }
+        }
         if (self.virtual_files) |vfs_map| {
             if (vfs_map.get(rel_path)) |vfs_bytes| {
                 return Fingerprint128.hashBytes(vfs_bytes);
+            }
+        }
+        if (scoped_pkg) |target_pkg| {
+            if (self.package_embed_jails.get(target_pkg)) |target_jail| {
+                switch (target_jail) {
+                    .cxtree_only => |cx_jail| {
+                        if (self.vfs_source_map) |vfs_src_map| {
+                            const root_fid = self.package_root_files.get(cx_jail.pkg_id) orelse .none;
+                            if (mir.lookupSandboxedCxTreeEmbedAsset(
+                                self.allocator,
+                                vfs_src_map,
+                                root_fid,
+                                cx_jail.virtual_root_prefix,
+                                rel_path,
+                            ) catch null) |cx_bytes| {
+                                return Fingerprint128.hashBytes(cx_bytes);
+                            }
+                        }
+                    },
+                    .host_dir_jailed => |jail_dir| {
+                        if (self.embed_io) |io_handle| {
+                            switch (mir.readSandboxedHostEmbedFile(
+                                self.allocator,
+                                io_handle,
+                                jail_dir,
+                                rel_path,
+                                @min(mir_vm.DEFAULT_MEM_LIMIT, std.math.maxInt(u32)),
+                            ) catch return Fingerprint128.ZERO) {
+                                .ok => |file_bytes| {
+                                    defer self.allocator.free(file_bytes);
+                                    return Fingerprint128.hashBytes(file_bytes);
+                                },
+                                else => {},
+                            }
+                        }
+                    },
+                    .unrestricted_legacy => {},
+                }
+            }
+            if (target_pkg != .root) return Fingerprint128.ZERO;
+        } else if (self.package_embed_jails.count() > 0) {
+            var jail_iter = self.package_embed_jails.valueIterator();
+            while (jail_iter.next()) |jail_ptr| {
+                switch (jail_ptr.*) {
+                    .cxtree_only => |cx_jail| {
+                        if (self.vfs_source_map) |vfs_src_map| {
+                            const root_fid = self.package_root_files.get(cx_jail.pkg_id) orelse .none;
+                            if (mir.lookupSandboxedCxTreeEmbedAsset(
+                                self.allocator,
+                                vfs_src_map,
+                                root_fid,
+                                cx_jail.virtual_root_prefix,
+                                rel_path,
+                            ) catch null) |cx_bytes| {
+                                return Fingerprint128.hashBytes(cx_bytes);
+                            }
+                        }
+                    },
+                    .host_dir_jailed => |jail_dir| {
+                        if (self.embed_io) |io_handle| {
+                            switch (mir.readSandboxedHostEmbedFile(
+                                self.allocator,
+                                io_handle,
+                                jail_dir,
+                                rel_path,
+                                @min(mir_vm.DEFAULT_MEM_LIMIT, std.math.maxInt(u32)),
+                            ) catch continue) {
+                                .ok => |file_bytes| {
+                                    defer self.allocator.free(file_bytes);
+                                    return Fingerprint128.hashBytes(file_bytes);
+                                },
+                                else => {},
+                            }
+                        }
+                    },
+                    .unrestricted_legacy => {},
+                }
             }
         }
         if (mir_vm.isValidSandboxedEmbedPath(rel_path)) {
@@ -4605,6 +4927,35 @@ pub const CompilerDb = struct {
         return self.target_spec;
     }
 
+    /// Propagates `pkg_id` across `root_fid` and any already-bound `external_mod_files` descendants.
+    fn propagateSubtreePackageId(self: *CompilerDb, root_fid: FileId, pkg_id: PackageId) !void {
+        if (root_fid.isNone()) return;
+        var queue: std.ArrayListUnmanaged(FileId) = .empty;
+        defer queue.deinit(self.allocator);
+        var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer visited.deinit(self.allocator);
+
+        try queue.append(self.allocator, root_fid);
+        try visited.put(self.allocator, root_fid.asInt(), {});
+
+        var head: usize = 0;
+        while (head < queue.items.len) : (head += 1) {
+            const cur_fid = queue.items[head];
+            try self.symbol_table.setFilePackageId(cur_fid, pkg_id);
+            var ext_iter = self.external_mod_files.iterator();
+            while (ext_iter.next()) |ext_kv| {
+                const parent_raw: u32 = @truncate(ext_kv.key_ptr.* >> 32);
+                if (parent_raw == cur_fid.asInt()) {
+                    const child_fid = ext_kv.value_ptr.*;
+                    const gop = try visited.getOrPut(self.allocator, child_fid.asInt());
+                    if (!gop.found_existing) {
+                        try queue.append(self.allocator, child_fid);
+                    }
+                }
+            }
+        }
+    }
+
     /// Binds an external `mod <mod_name>;` declaration in `parent_file_id` to `child_file_id`.
     pub fn bindExternalModule(
         self: *CompilerDb,
@@ -4612,16 +4963,15 @@ pub const CompilerDb = struct {
         mod_name: []const u8,
         child_file_id: FileId,
     ) !void {
-        const parent_pkg = self.symbol_table.getFilePackageId(parent_file_id);
-        if (parent_pkg != .root and self.symbol_table.getFilePackageId(child_file_id) == .root) {
-            try self.symbol_table.setFilePackageId(child_file_id, parent_pkg);
-        }
         const mod_sym = try self.interner.intern(mod_name);
         const key: u64 = (@as(u64, parent_file_id.asInt()) << 32) | @as(u64, mod_sym.asInt());
-        if (self.external_mod_files.get(key)) |existing_fid| {
-            if (existing_fid == child_file_id) return;
-        }
+        const existing_opt = self.external_mod_files.get(key);
         try self.external_mod_files.put(self.allocator, key, child_file_id);
+        const parent_pkg = self.symbol_table.getFilePackageId(parent_file_id);
+        if (parent_pkg != .root) {
+            try self.propagateSubtreePackageId(child_file_id, parent_pkg);
+        }
+        if (existing_opt == child_file_id) return;
         self.bumpConfigInput(CONFIG_KEY_TARGET_LAYOUT);
     }
 
@@ -4639,7 +4989,7 @@ pub const CompilerDb = struct {
         }
         if (std.mem.eql(u8, mod_name, "core")) {
             if (self.symbol_table.getFilePackageId(root_file_id) == .root) {
-                try self.symbol_table.setFilePackageId(root_file_id, .std_core);
+                try self.propagateSubtreePackageId(root_file_id, .std_core);
             }
             const cx_sym = try self.interner.intern("cx");
             if (!self.root_module_files.contains(cx_sym.asInt())) {
@@ -4652,16 +5002,286 @@ pub const CompilerDb = struct {
         }
     }
 
-    /// Assigns `pkg_id` to `file_id` for `pub(pkg)` visibility enforcement (`ADR-22E`).
+    /// Assigns `pkg_id` to `file_id` (and its bound `mod` children) for `pub(pkg)` & privilege isolation.
     pub fn setFilePackageId(self: *CompilerDb, file_id: FileId, pkg_id: PackageId) !void {
         if (self.symbol_table.getFilePackageId(file_id) == pkg_id) return;
-        try self.symbol_table.setFilePackageId(file_id, pkg_id);
+        try self.propagateSubtreePackageId(file_id, pkg_id);
         self.bumpConfigInput(CONFIG_KEY_TARGET_LAYOUT);
     }
 
     /// Returns the `PackageId` currently assigned to `file_id` (`.root` by default).
     pub inline fn getFilePackageId(self: *const CompilerDb, file_id: FileId) PackageId {
         return self.symbol_table.getFilePackageId(file_id);
+    }
+
+    /// Attaches a `VfsSourceMap` for zero-FS `.cxtree_only` `@embed_bytes` and `@c_import` asset resolution.
+    pub fn setVfsSourceMap(self: *CompilerDb, vfs_map: ?*const vfs_sourcemap.VfsSourceMap) void {
+        if (self.vfs_source_map == vfs_map) return;
+        self.vfs_source_map = vfs_map;
+        self.embed_sandbox_epoch +%= 1;
+        self.bumpConfigInput(CONFIG_KEY_EMBED_SANDBOX);
+    }
+
+    /// Toggles multi-package graph mounting (`P1-3` stdlib privilege firewall & flat module scope isolation).
+    pub fn setPackageGraphMounted(self: *CompilerDb, is_mounted: bool) void {
+        if (self.is_package_graph_mounted == is_mounted and
+            self.symbol_table.is_flat_named_module_scopes_suppressed == is_mounted)
+        {
+            return;
+        }
+        self.is_package_graph_mounted = is_mounted;
+        self.symbol_table.is_flat_named_module_scopes_suppressed = is_mounted;
+        self.stdlib_privilege_epoch +%= 1;
+        self.bumpConfigInput(CONFIG_KEY_INTERNAL_CORE);
+        self.bumpConfigInput(CONFIG_KEY_TARGET_LAYOUT);
+    }
+
+    /// Configures active and declared `[features]` for `pkg_id`, updating `SymbolTable` and `cfg_fingerprint`.
+    pub fn setPackageCfgFeatures(
+        self: *CompilerDb,
+        pkg_id: PackageId,
+        enabled_features: []const []const u8,
+        declared_features: ?[]const []const u8,
+    ) !void {
+        var sorted_enabled: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (sorted_enabled.items) |owned_item| self.allocator.free(owned_item);
+            sorted_enabled.deinit(self.allocator);
+        }
+        for (enabled_features) |feat_str| {
+            if (feat_str.len == 0) continue;
+            var is_dup = false;
+            for (sorted_enabled.items) |existing| {
+                if (std.mem.eql(u8, existing, feat_str)) {
+                    is_dup = true;
+                    break;
+                }
+            }
+            if (!is_dup) try sorted_enabled.append(self.allocator, try self.allocator.dupe(u8, feat_str));
+        }
+        std.mem.sort([]u8, sorted_enabled.items, {}, struct {
+            fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
+                return std.mem.order(u8, lhs, rhs) == .lt;
+            }
+        }.lessThan);
+
+        var opt_declared: ?[][]u8 = null;
+        errdefer if (opt_declared) |decl_slice| {
+            for (decl_slice) |owned_decl| self.allocator.free(owned_decl);
+            if (decl_slice.len > 0) self.allocator.free(decl_slice);
+        };
+        if (declared_features) |decl_in| {
+            var sorted_decl: std.ArrayListUnmanaged([]u8) = .empty;
+            errdefer {
+                for (sorted_decl.items) |owned_item| self.allocator.free(owned_item);
+                sorted_decl.deinit(self.allocator);
+            }
+            for (decl_in) |decl_str| {
+                if (decl_str.len == 0) continue;
+                var is_dup = false;
+                for (sorted_decl.items) |existing| {
+                    if (std.mem.eql(u8, existing, decl_str)) {
+                        is_dup = true;
+                        break;
+                    }
+                }
+                if (!is_dup) try sorted_decl.append(self.allocator, try self.allocator.dupe(u8, decl_str));
+            }
+            std.mem.sort([]u8, sorted_decl.items, {}, struct {
+                fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
+                    return std.mem.order(u8, lhs, rhs) == .lt;
+                }
+            }.lessThan);
+            opt_declared = try sorted_decl.toOwnedSlice(self.allocator);
+        }
+
+        const owned_enabled = try sorted_enabled.toOwnedSlice(self.allocator);
+        errdefer {
+            for (owned_enabled) |owned_item| self.allocator.free(owned_item);
+            if (owned_enabled.len > 0) self.allocator.free(owned_enabled);
+        }
+
+        var cfg_hasher = StructuralHasher.init();
+        cfg_hasher.updateU16(pkg_id.asInt());
+        cfg_hasher.updateU32(@intCast(owned_enabled.len));
+        for (owned_enabled) |feat_item| cfg_hasher.updateBytes(feat_item);
+        if (opt_declared) |decl_list| {
+            cfg_hasher.updateU8(1);
+            cfg_hasher.updateU32(@intCast(decl_list.len));
+            for (decl_list) |decl_item| cfg_hasher.updateBytes(decl_item);
+        } else {
+            cfg_hasher.updateU8(0);
+        }
+        const computed_fp = cfg_hasher.final();
+
+        var prev_fp = Fingerprint128.ZERO;
+        if (self.package_cfg_configs.fetchRemove(pkg_id)) |prev_kv| {
+            var old_cfg = prev_kv.value;
+            prev_fp = old_cfg.cfg_fingerprint;
+            old_cfg.deinit(self.allocator);
+        }
+        try self.package_cfg_configs.put(self.allocator, pkg_id, .{
+            .enabled_features = owned_enabled,
+            .declared_features = opt_declared,
+            .cfg_fingerprint = computed_fp,
+        });
+
+        // Synchronize `SymbolTable` per-`PackageId` feature sets (`O(1)` `@cfg(cfg.feature.<name>)`):
+        self.symbol_table.interner_ref = &self.interner;
+        var stale_en: std.ArrayListUnmanaged(symbol_resolver.PkgFeatureKey) = .empty;
+        defer stale_en.deinit(self.allocator);
+        var en_it = self.symbol_table.package_enabled_features.keyIterator();
+        while (en_it.next()) |fk_ptr| {
+            if (fk_ptr.pkg_id == pkg_id) try stale_en.append(self.allocator, fk_ptr.*);
+        }
+        for (stale_en.items) |fk_item| _ = self.symbol_table.package_enabled_features.remove(fk_item);
+
+        var stale_decl: std.ArrayListUnmanaged(symbol_resolver.PkgFeatureKey) = .empty;
+        defer stale_decl.deinit(self.allocator);
+        var decl_it = self.symbol_table.package_declared_features.keyIterator();
+        while (decl_it.next()) |fk_ptr| {
+            if (fk_ptr.pkg_id == pkg_id) try stale_decl.append(self.allocator, fk_ptr.*);
+        }
+        for (stale_decl.items) |fk_item| _ = self.symbol_table.package_declared_features.remove(fk_item);
+        _ = self.symbol_table.has_package_feature_manifest.remove(pkg_id);
+
+        if (opt_declared) |decl_list| {
+            try self.symbol_table.registerPackageFeatureManifest(pkg_id);
+            for (decl_list) |decl_name| {
+                const feat_sym = try self.interner.intern(decl_name);
+                try self.symbol_table.declarePackageFeature(pkg_id, feat_sym);
+            }
+        }
+        for (owned_enabled) |en_name| {
+            const feat_sym = try self.interner.intern(en_name);
+            try self.symbol_table.enablePackageFeature(pkg_id, feat_sym);
+        }
+
+        if (!Fingerprint128.eql(prev_fp, computed_fp)) {
+            self.bumpConfigInput(CONFIG_KEY_TARGET_LAYOUT);
+        }
+    }
+
+    /// Registers `root_file_id` as the canonical root module of `pkg_id` (`use pkg.…` anchor).
+    pub fn registerPackageRootFile(self: *CompilerDb, pkg_id: PackageId, root_file_id: FileId) !void {
+        try self.propagateSubtreePackageId(root_file_id, pkg_id);
+        const prev_opt = self.package_root_files.get(pkg_id);
+        try self.package_root_files.put(self.allocator, pkg_id, root_file_id);
+        if (prev_opt != root_file_id) {
+            self.bumpConfigInput(CONFIG_KEY_TARGET_LAYOUT);
+        }
+    }
+
+    /// Binds a per-package dependency edge `(caller_pkg_id, alias_sym) -> target_root_file_id` (`P1-1`).
+    pub fn bindPackageDepFile(
+        self: *CompilerDb,
+        caller_pkg_id: PackageId,
+        alias_sym: SymbolId,
+        target_root_file_id: FileId,
+    ) !void {
+        try self.symbol_table.markPackageDepsConfigured(caller_pkg_id);
+        const dep_key = symbol_resolver.PkgDepKey{
+            .caller_pkg = caller_pkg_id,
+            .alias_sym = alias_sym,
+        };
+        const prev_opt = self.package_dep_files.get(dep_key);
+        try self.package_dep_files.put(self.allocator, dep_key, target_root_file_id);
+        if (prev_opt != target_root_file_id) {
+            self.bumpConfigInput(CONFIG_KEY_TARGET_LAYOUT);
+        }
+    }
+
+    /// Configures the `@embed_bytes` and `@c_import` filesystem/archive jail for `pkg_id` (`DR-17` §5).
+    pub fn setPackageEmbedJail(self: *CompilerDb, pkg_id: PackageId, jail: mir.EmbedPackageJail) !void {
+        const stored_jail: mir.EmbedPackageJail = switch (jail) {
+            .unrestricted_legacy => .unrestricted_legacy,
+            .host_dir_jailed => |raw_dir| blk: {
+                const duped = try self.allocator.dupe(u8, raw_dir);
+                errdefer self.allocator.free(duped);
+                try self.owned_jail_strings.append(self.allocator, duped);
+                break :blk .{ .host_dir_jailed = duped };
+            },
+            .cxtree_only => |cx_spec| blk: {
+                const duped = try self.allocator.dupe(u8, cx_spec.virtual_root_prefix);
+                errdefer self.allocator.free(duped);
+                try self.owned_jail_strings.append(self.allocator, duped);
+                break :blk .{ .cxtree_only = .{
+                    .pkg_id = cx_spec.pkg_id,
+                    .virtual_root_prefix = duped,
+                } };
+            },
+        };
+        try self.package_embed_jails.put(self.allocator, pkg_id, stored_jail);
+        self.embed_sandbox_epoch +%= 1;
+        self.bumpConfigInput(CONFIG_KEY_EMBED_SANDBOX);
+    }
+
+    /// Configures the `DR-17` capability sandbox policy for `pkg_id`.
+    pub fn setPackageCapPolicy(self: *CompilerDb, pkg_id: PackageId, policy: mir_sast.PackageCapPolicy) !void {
+        const duped_name = try self.allocator.dupe(u8, policy.package_name);
+        errdefer self.allocator.free(duped_name);
+        try self.owned_policy_names.append(self.allocator, duped_name);
+        var cloned_policy = policy;
+        cloned_policy.package_name = duped_name;
+        try self.package_cap_policies.put(self.allocator, pkg_id, cloned_policy);
+    }
+
+    /// Returns `true` iff `file_id` holds first-party `std_core` privileges (`P1-3` firewall).
+    pub fn isStdlibFile(self: *const CompilerDb, file_id: FileId) bool {
+        const pkg_id = self.symbol_table.getFilePackageId(file_id);
+        if (pkg_id == .std_core) return true;
+        if (pkg_id != .root) return false;
+        if (self.is_package_graph_mounted or self.symbol_table.configured_pkg_deps.count() > 0) return false;
+        return if (self.source_inputs.get(file_id.asInt())) |inp| inp.durability == .high else false;
+    }
+
+    /// Returns `true` iff `file_id` is permitted to import `core.*` intrinsics directly (`P1-3` firewall).
+    pub fn isCoreAllowedForFile(self: *CompilerDb, file_id: FileId) bool {
+        const is_global_core = self.readInternalCore();
+        const pkg_id = self.symbol_table.getFilePackageId(file_id);
+        if (pkg_id == .std_core) return true;
+        if (pkg_id != .root) return false;
+        return is_global_core or self.isStdlibFile(file_id);
+    }
+
+    /// Returns `true` iff `test`/`bench` items should be retained for `file_id` (`false` for external deps, `P1-2`).
+    pub fn effectiveIncludeTestsForFile(self: *CompilerDb, file_id: FileId) QueryError!bool {
+        const global_include = try self.readIncludeTests();
+        if (!global_include) return false;
+        const pkg_id = self.symbol_table.getFilePackageId(file_id);
+        if (pkg_id == .root) return true;
+        if (pkg_id == .std_core and !self.is_package_graph_mounted) return true;
+        return false;
+    }
+
+    /// Returns the precomputed 128-bit `@cfg` feature fingerprint for `file_id`'s `PackageId`.
+    pub fn getPackageCfgFingerprint(self: *const CompilerDb, file_id: FileId) Fingerprint128 {
+        const pkg_id = self.symbol_table.getFilePackageId(file_id);
+        if (self.package_cfg_configs.get(pkg_id)) |cfg_rec| return cfg_rec.cfg_fingerprint;
+        return Fingerprint128.ZERO;
+    }
+
+    /// Constructs the package-scoped `CfgEnv` for `file_id` (`P1-2` & `E0435` feature allowlist).
+    pub fn effectiveCfgEnvForFile(
+        self: *const CompilerDb,
+        file_id: FileId,
+        is_file_including_tests: bool,
+    ) type_system.CfgEnv {
+        const pkg_id = self.symbol_table.getFilePackageId(file_id);
+        const allow_tests = (pkg_id == .root) or (pkg_id == .std_core and !self.is_package_graph_mounted);
+        var cfg_env = type_system.CfgEnv.fromTargetSpec(
+            self.target_spec,
+            allow_tests and is_file_including_tests,
+        );
+        cfg_env.owner_pkg_id = pkg_id;
+        cfg_env.sym_table_features = &self.symbol_table;
+        if (self.package_cfg_configs.get(pkg_id)) |cfg_rec| {
+            cfg_env.enabled_features = cfg_rec.enabled_features;
+            if (cfg_rec.declared_features) |decl_feats| {
+                cfg_env.declared_features = decl_feats;
+            }
+        }
+        return cfg_env;
     }
 
     /// Updates `--sast-strict` (`is_sast_strict`) and bumps `current_revision` when changed.
@@ -4763,6 +5383,259 @@ pub const CompilerDb = struct {
         self.bumpConfigInput(CONFIG_KEY_EMBED_SANDBOX);
     }
 
+    /// Computes normalized directory depth for `rel_path`, returning `null` if `..` escapes `< 0`.
+    fn computeNormalizedRelDirDepth(rel_path: []const u8) ?usize {
+        const last_sep = std.mem.lastIndexOfAny(u8, rel_path, "/\\") orelse return 0;
+        const dir_slice = rel_path[0..last_sep];
+        var depth: usize = 0;
+        var start: usize = 0;
+        var idx: usize = 0;
+        while (idx <= dir_slice.len) : (idx += 1) {
+            if (idx == dir_slice.len or dir_slice[idx] == '/' or dir_slice[idx] == '\\') {
+                const seg = dir_slice[start..idx];
+                start = idx + 1;
+                if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
+                if (std.mem.eql(u8, seg, "..")) {
+                    if (depth == 0) return null;
+                    depth -= 1;
+                } else {
+                    depth += 1;
+                }
+            }
+        }
+        return depth;
+    }
+
+    /// Advances `cursor` past horizontal whitespace, C `/* … */` block comments, and `\\\r?\n` continuations.
+    fn skipCIncludeHorizAndComments(src: []const u8, cursor: *usize) void {
+        while (cursor.* < src.len) {
+            const byte_val = src[cursor.*];
+            if (byte_val == ' ' or byte_val == '\t' or byte_val == '\r') {
+                cursor.* += 1;
+            } else if (byte_val == '\\' and cursor.* + 1 < src.len and src[cursor.* + 1] == '\n') {
+                cursor.* += 2;
+            } else if (byte_val == '\\' and cursor.* + 2 < src.len and
+                src[cursor.* + 1] == '\r' and src[cursor.* + 2] == '\n')
+            {
+                cursor.* += 3;
+            } else if (byte_val == '/' and cursor.* + 1 < src.len and src[cursor.* + 1] == '*') {
+                cursor.* += 2;
+                while (cursor.* < src.len) : (cursor.* += 1) {
+                    if (src[cursor.*] == '*' and cursor.* + 1 < src.len and src[cursor.* + 1] == '/') {
+                        cursor.* += 2;
+                        break;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Returns `true` if any `#include` directive in `header_src` attempts an absolute or `..` sandbox escape.
+    fn hasEscapingCIncludeDirective(header_src: []const u8, current_rel_depth: usize) bool {
+        var cursor: usize = 0;
+        var is_at_line_start = true;
+        while (cursor < header_src.len) {
+            if (is_at_line_start) {
+                skipCIncludeHorizAndComments(header_src, &cursor);
+                if (cursor >= header_src.len) break;
+                if (header_src[cursor] == '\n') {
+                    cursor += 1;
+                    continue;
+                }
+                if (header_src[cursor] == '#') {
+                    cursor += 1;
+                    skipCIncludeHorizAndComments(header_src, &cursor);
+                    var kw_buf: [16]u8 = undefined;
+                    var kw_len: usize = 0;
+                    while (cursor < header_src.len) {
+                        if (header_src[cursor] == '\\' and cursor + 1 < header_src.len and header_src[cursor + 1] == '\n') {
+                            cursor += 2;
+                            continue;
+                        }
+                        if (header_src[cursor] == '\\' and cursor + 2 < header_src.len and
+                            header_src[cursor + 1] == '\r' and header_src[cursor + 2] == '\n')
+                        {
+                            cursor += 3;
+                            continue;
+                        }
+                        const ch_val = header_src[cursor];
+                        if (!std.ascii.isAlphanumeric(ch_val) and ch_val != '_') break;
+                        if (kw_len < kw_buf.len) {
+                            kw_buf[kw_len] = ch_val;
+                            kw_len += 1;
+                        }
+                        cursor += 1;
+                    }
+                    const kw_slice = kw_buf[0..kw_len];
+                    if (std.mem.eql(u8, kw_slice, "include_next")) return true;
+                    if (std.mem.eql(u8, kw_slice, "include")) {
+                        skipCIncludeHorizAndComments(header_src, &cursor);
+                        if (cursor < header_src.len and (header_src[cursor] == '"' or header_src[cursor] == '<')) {
+                            const open_delim = header_src[cursor];
+                            const close_delim: u8 = if (open_delim == '"') '"' else '>';
+                            cursor += 1;
+                            var spec_buf: [512]u8 = undefined;
+                            var spec_len: usize = 0;
+                            var has_closed = false;
+                            while (cursor < header_src.len) {
+                                if (header_src[cursor] == '\\' and cursor + 1 < header_src.len and header_src[cursor + 1] == '\n') {
+                                    cursor += 2;
+                                    continue;
+                                }
+                                if (header_src[cursor] == '\\' and cursor + 2 < header_src.len and
+                                    header_src[cursor + 1] == '\r' and header_src[cursor + 2] == '\n')
+                                {
+                                    cursor += 3;
+                                    continue;
+                                }
+                                if (header_src[cursor] == '\n') break;
+                                if (header_src[cursor] == close_delim) {
+                                    cursor += 1;
+                                    has_closed = true;
+                                    break;
+                                }
+                                if (spec_len >= spec_buf.len) return true;
+                                spec_buf[spec_len] = header_src[cursor];
+                                spec_len += 1;
+                                cursor += 1;
+                            }
+                            if (has_closed and spec_len > 0) {
+                                const inc_spec = spec_buf[0..spec_len];
+                                if (inc_spec[0] == '/' or inc_spec[0] == '\\' or
+                                    std.mem.indexOfScalar(u8, inc_spec, ':') != null or
+                                    std.mem.indexOfScalar(u8, inc_spec, '\\') != null)
+                                {
+                                    return true;
+                                }
+                                var depth: isize = if (open_delim == '"') @intCast(current_rel_depth) else 0;
+                                var seg_it = std.mem.splitScalar(u8, inc_spec, '/');
+                                while (seg_it.next()) |seg| {
+                                    if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
+                                    if (std.mem.eql(u8, seg, "..")) {
+                                        depth -= 1;
+                                        if (depth < 0) return true;
+                                    } else {
+                                        depth += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    is_at_line_start = false;
+                    continue;
+                }
+                is_at_line_start = false;
+            }
+
+            const cur_ch = header_src[cursor];
+            if (cur_ch == '\n') {
+                cursor += 1;
+                is_at_line_start = true;
+            } else if (cur_ch == '\\' and cursor + 1 < header_src.len and header_src[cursor + 1] == '\n') {
+                cursor += 2;
+            } else if (cur_ch == '\\' and cursor + 2 < header_src.len and
+                header_src[cursor + 1] == '\r' and header_src[cursor + 2] == '\n')
+            {
+                cursor += 3;
+            } else if (cur_ch == '/' and cursor + 1 < header_src.len and header_src[cursor + 1] == '*') {
+                cursor += 2;
+                while (cursor < header_src.len) : (cursor += 1) {
+                    if (header_src[cursor] == '*' and cursor + 1 < header_src.len and header_src[cursor + 1] == '/') {
+                        cursor += 2;
+                        break;
+                    }
+                }
+            } else if (cur_ch == '/' and cursor + 1 < header_src.len and header_src[cursor + 1] == '/') {
+                cursor += 2;
+                while (cursor < header_src.len) {
+                    if (header_src[cursor] == '\\' and cursor + 1 < header_src.len and header_src[cursor + 1] == '\n') {
+                        cursor += 2;
+                        continue;
+                    }
+                    if (header_src[cursor] == '\\' and cursor + 2 < header_src.len and
+                        header_src[cursor + 1] == '\r' and header_src[cursor + 2] == '\n')
+                    {
+                        cursor += 3;
+                        continue;
+                    }
+                    if (header_src[cursor] == '\n') break;
+                    cursor += 1;
+                }
+            } else if (cur_ch == '"' or cur_ch == '\'') {
+                const quote_ch = cur_ch;
+                cursor += 1;
+                while (cursor < header_src.len and header_src[cursor] != '\n') {
+                    if (header_src[cursor] == '\\' and cursor + 1 < header_src.len) {
+                        cursor += 2;
+                        continue;
+                    }
+                    if (header_src[cursor] == quote_ch) {
+                        cursor += 1;
+                        break;
+                    }
+                    cursor += 1;
+                }
+            } else {
+                cursor += 1;
+            }
+        }
+        return false;
+    }
+
+    /// Verifies that `inc_path` resolves strictly inside `jail_dir` (or `extra_inc_dirs` for `.root`) with zero symlinks.
+    fn isJailedHostIncludeVerified(
+        allocator: std.mem.Allocator,
+        io_opt: ?std.Io,
+        jail_dir: []const u8,
+        extra_inc_dirs: []const []const u8,
+        virtual_files: ?*const std.StringHashMapUnmanaged([]const u8),
+        inc_path: []const u8,
+    ) !bool {
+        if (virtual_files) |vfs_map| {
+            if (vfs_map.contains(inc_path)) return true;
+        }
+        const io_handle = io_opt orelse return false;
+        const norm_inc = try allocator.alloc(u8, inc_path.len);
+        defer allocator.free(norm_inc);
+        for (inc_path, 0..) |ch_val, i| {
+            norm_inc[i] = if (ch_val == '\\') '/' else ch_val;
+        }
+
+        var root_idx: usize = 0;
+        while (root_idx < 1 + extra_inc_dirs.len) : (root_idx += 1) {
+            const cand_root = if (root_idx == 0) jail_dir else extra_inc_dirs[root_idx - 1];
+            const norm_root_buf = try allocator.alloc(u8, cand_root.len);
+            defer allocator.free(norm_root_buf);
+            for (cand_root, 0..) |ch_val, i| {
+                norm_root_buf[i] = if (ch_val == '\\') '/' else ch_val;
+            }
+            const norm_root = std.mem.trimEnd(u8, norm_root_buf, "/");
+            if (norm_inc.len > norm_root.len + 1 and
+                std.mem.startsWith(u8, norm_inc, norm_root) and
+                norm_inc[norm_root.len] == '/')
+            {
+                const rel_sub = norm_inc[norm_root.len + 1 ..];
+                if (!mir_vm.isValidSandboxedEmbedPath(rel_sub)) continue;
+                switch (try mir.readSandboxedHostEmbedFile(
+                    allocator,
+                    io_handle,
+                    cand_root,
+                    rel_sub,
+                    4 * 1024 * 1024,
+                )) {
+                    .ok => |verified_bytes| {
+                        allocator.free(verified_bytes);
+                        return true;
+                    },
+                    else => return false,
+                }
+            }
+        }
+        return false;
+    }
+
     /// Strongly typed `SymbolTable.c_import_loader` callback bridging `@c_import` through `CompilerDb` (`DR-10`, `@fieldParentPtr`).
     fn loadCImportFromDb(
         sym_table: *SymbolTable,
@@ -4774,30 +5647,49 @@ pub const CompilerDb = struct {
         const db: *CompilerDb = @fieldParentPtr("symbol_table", sym_table);
         if (header_path.len == 0) return .none;
 
-        // [1] Resolve `header_path` bytes and resolved path from VFS, caller dir, `workspace_root`, `-I`, or bundled:
+        var local_sink = DiagnosticSink.init(db.allocator);
+        defer local_sink.deinit();
+        const active_sink = diagnostic_sink orelse &local_sink;
+
+        const caller_pkg = sym_table.getFilePackageId(caller_file_id);
+        const active_jail = mir.resolveActiveEmbedJail(
+            caller_file_id,
+            sym_table,
+            if (db.package_embed_jails.count() > 0) &db.package_embed_jails else null,
+            if (db.is_package_graph_mounted and caller_pkg != .root) null else db.workspace_root,
+        );
+
+        // [1] Resolve `header_path` bytes under `active_jail` (`.cxtree_only`, `.host_dir_jailed`, or legacy):
         var owned_disk_bytes: ?[]u8 = null;
         defer if (owned_disk_bytes) |buf| db.allocator.free(buf);
         var owned_resolved_path: ?[]u8 = null;
         defer if (owned_resolved_path) |path_buf| db.allocator.free(path_buf);
         const resolved_hdr = (try db.resolveCImportHeaderSource(
             caller_file_id,
+            caller_pkg,
+            active_jail,
             header_path,
+            active_sink,
             &owned_disk_bytes,
             &owned_resolved_path,
         )) orelse return .none;
 
         // Record tracked sandbox and file-read dependencies so `-D`/`-I` or header edits invalidate signatures:
         _ = db.recordEmbedSandboxDependency() catch {};
-        _ = db.recordEmbeddedFileRead(resolved_hdr.resolved_path, resolved_hdr.bytes) catch {};
+        _ = db.recordPackageEmbeddedFileRead(caller_pkg, resolved_hdr.resolved_path, resolved_hdr.bytes) catch {};
 
-        // [2] Probe `CImportCache` (`128` entries / `16 MiB` bounded LRU; replays transitive `#include` reads on hit):
+        // [2] Probe `CImportCache` (`128` entries / `16 MiB` bounded LRU; isolated per `PackageId`):
+        const active_defines: []const []const u8 = if (caller_pkg == .root) db.c_import_defines.items else &.{};
         var virtual_fid: FileId = .none;
-        if (db.lookupCImportCache(resolved_hdr.bytes, db.c_import_defines.items)) |cached_view| {
-            virtual_fid = cached_view.virtual_file_id;
-        } else {
+        if (db.lookupCImportCache(resolved_hdr.bytes, active_defines)) |cached_view| {
+            if (sym_table.getFilePackageId(cached_view.virtual_file_id) == caller_pkg) {
+                virtual_fid = cached_view.virtual_file_id;
+            }
+        }
+        if (virtual_fid.isNone()) {
             var macro_defs: std.ArrayListUnmanaged(c_frontend.MacroDefine) = .empty;
             defer macro_defs.deinit(db.allocator);
-            for (db.c_import_defines.items) |def_text| {
+            for (active_defines) |def_text| {
                 if (std.mem.indexOfScalar(u8, def_text, '=')) |eq_pos| {
                     try macro_defs.append(db.allocator, .{
                         .name = def_text[0..eq_pos],
@@ -4810,40 +5702,163 @@ pub const CompilerDb = struct {
 
             var vfs_headers: std.ArrayListUnmanaged(c_frontend.VirtualHeaderEntry) = .empty;
             defer vfs_headers.deinit(db.allocator);
-            if (db.virtual_files) |vfs_map| {
-                var vfs_it = vfs_map.iterator();
-                while (vfs_it.next()) |kv| {
-                    try vfs_headers.append(db.allocator, .{
-                        .path = kv.key_ptr.*,
-                        .content = kv.value_ptr.*,
-                    });
-                }
-            }
-
             var search_dirs: std.ArrayListUnmanaged([]const u8) = .empty;
             defer search_dirs.deinit(db.allocator);
-            if (db.file_paths.get(caller_file_id.asInt())) |caller_path| {
-                if (std.fs.path.dirname(caller_path)) |caller_dir| {
-                    try search_dirs.append(db.allocator, caller_dir);
-                }
-            }
-            if (db.workspace_root) |ws_root| {
-                try search_dirs.append(db.allocator, ws_root);
-            }
-            for (db.c_import_include_dirs.items) |inc_dir| {
-                try search_dirs.append(db.allocator, inc_dir);
-            }
+            var owned_inferred_prefix: ?[]u8 = null;
+            defer if (owned_inferred_prefix) |pref| db.allocator.free(pref);
 
-            var local_sink = DiagnosticSink.init(db.allocator);
-            defer local_sink.deinit();
-            const active_sink = diagnostic_sink orelse &local_sink;
+            const inc_loader: c_frontend.CIncludeLoader = switch (active_jail) {
+                .cxtree_only => |cx_jail| blk_cx: {
+                    var pkg_prefix = cx_jail.virtual_root_prefix;
+                    if (pkg_prefix.len == 0) {
+                        if (db.vfs_source_map) |vmap| {
+                            const caller_vpath = vmap.getFilePath(caller_file_id);
+                            if (std.mem.startsWith(u8, caller_vpath, "/cx/")) {
+                                if (std.mem.indexOfScalarPos(u8, caller_vpath, 4, '/')) |slash_pos| {
+                                    owned_inferred_prefix = try db.allocator.dupe(u8, caller_vpath[0..slash_pos]);
+                                    pkg_prefix = owned_inferred_prefix.?;
+                                }
+                            }
+                        }
+                    }
+                    if (pkg_prefix.len > 0) {
+                        try search_dirs.append(db.allocator, pkg_prefix);
+                    }
+                    // Check `resolved_hdr.bytes` for `#include` traversal escaping `pkg_prefix`:
+                    var hdr_rel_depth: usize = 0;
+                    if (pkg_prefix.len > 0 and std.mem.startsWith(u8, resolved_hdr.resolved_path, pkg_prefix)) {
+                        var tail = resolved_hdr.resolved_path[pkg_prefix.len..];
+                        if (tail.len > 0 and tail[0] == '/') tail = tail[1..];
+                        hdr_rel_depth = computeNormalizedRelDirDepth(tail) orelse {
+                            try active_sink.emit(.{
+                                .code = .e0326_embed_path_escape,
+                                .severity = .err,
+                                .primary_span = .{ .file_id = caller_file_id, .start_byte = 0, .end_byte = 0 },
+                                .message = "`@c_import` header path escapes `.cxtree` package root",
+                            });
+                            return .none;
+                        };
+                    }
+                    if (hasEscapingCIncludeDirective(resolved_hdr.bytes, hdr_rel_depth)) {
+                        try active_sink.emit(.{
+                            .code = .e0326_embed_path_escape,
+                            .severity = .err,
+                            .primary_span = .{ .file_id = caller_file_id, .start_byte = 0, .end_byte = 0 },
+                            .message = "`@c_import` header contains `#include` directive escaping `.cxtree` package root",
+                        });
+                        return .none;
+                    }
+                    if (db.vfs_source_map) |vmap| {
+                        for (vmap.entries.items) |entry| {
+                            if (entry.package_id != caller_pkg) continue;
+                            const entry_vpath = vmap.interner.get(entry.virtual_path);
+                            if (!std.mem.endsWith(u8, entry_vpath, ".h") and
+                                !std.mem.endsWith(u8, entry_vpath, ".inc") and
+                                !std.mem.endsWith(u8, entry_vpath, ".def"))
+                            {
+                                continue;
+                            }
+                            const faulted = vmap.faultCxTreeFile(entry.file_id) catch |fault_err| {
+                                if (fault_err == error.CacheIntegrityMismatch) {
+                                    try active_sink.emit(.{
+                                        .code = .e0015_cache_integrity_mismatch,
+                                        .severity = .err,
+                                        .primary_span = .{ .file_id = caller_file_id, .start_byte = 0, .end_byte = 0 },
+                                        .message = "cached `.cxtree` C header blob failed BLAKE3 integrity verification",
+                                    });
+                                }
+                                return .none;
+                            };
+                            var entry_rel_depth: usize = 0;
+                            if (pkg_prefix.len > 0 and std.mem.startsWith(u8, entry_vpath, pkg_prefix)) {
+                                var entry_tail = entry_vpath[pkg_prefix.len..];
+                                if (entry_tail.len > 0 and entry_tail[0] == '/') entry_tail = entry_tail[1..];
+                                entry_rel_depth = computeNormalizedRelDirDepth(entry_tail) orelse 0;
+                            }
+                            if (hasEscapingCIncludeDirective(faulted, entry_rel_depth)) {
+                                try active_sink.emit(.{
+                                    .code = .e0326_embed_path_escape,
+                                    .severity = .err,
+                                    .primary_span = .{ .file_id = caller_file_id, .start_byte = 0, .end_byte = 0 },
+                                    .message = "nested `.cxtree` C header contains `#include` directive escaping package root",
+                                });
+                                return .none;
+                            }
+                            try vfs_headers.append(db.allocator, .{
+                                .path = entry_vpath,
+                                .content = faulted,
+                            });
+                        }
+                    }
+                    break :blk_cx .none;
+                },
+                .host_dir_jailed => |jail_dir| blk_host: {
+                    if (db.virtual_files) |vfs_map| {
+                        var vfs_it = vfs_map.iterator();
+                        while (vfs_it.next()) |kv| {
+                            try vfs_headers.append(db.allocator, .{
+                                .path = kv.key_ptr.*,
+                                .content = kv.value_ptr.*,
+                            });
+                        }
+                    }
+                    const hdr_rel_depth = computeNormalizedRelDirDepth(header_path) orelse {
+                        try active_sink.emit(.{
+                            .code = .e0326_embed_path_escape,
+                            .severity = .err,
+                            .primary_span = .{ .file_id = caller_file_id, .start_byte = 0, .end_byte = 0 },
+                            .message = "`@c_import` header path escapes package directory",
+                        });
+                        return .none;
+                    };
+                    if (hasEscapingCIncludeDirective(resolved_hdr.bytes, hdr_rel_depth)) {
+                        try active_sink.emit(.{
+                            .code = .e0326_embed_path_escape,
+                            .severity = .err,
+                            .primary_span = .{ .file_id = caller_file_id, .start_byte = 0, .end_byte = 0 },
+                            .message = "`@c_import` header contains `#include` directive escaping package directory",
+                        });
+                        return .none;
+                    }
+                    try search_dirs.append(db.allocator, jail_dir);
+                    if (caller_pkg == .root) {
+                        for (db.c_import_include_dirs.items) |inc_dir| {
+                            try search_dirs.append(db.allocator, inc_dir);
+                        }
+                    }
+                    break :blk_host if (db.embed_io) |io_h| .{ .host_fs = io_h } else .none;
+                },
+                .unrestricted_legacy => blk_leg: {
+                    if (db.virtual_files) |vfs_map| {
+                        var vfs_it = vfs_map.iterator();
+                        while (vfs_it.next()) |kv| {
+                            try vfs_headers.append(db.allocator, .{
+                                .path = kv.key_ptr.*,
+                                .content = kv.value_ptr.*,
+                            });
+                        }
+                    }
+                    if (db.file_paths.get(caller_file_id.asInt())) |caller_path| {
+                        if (std.fs.path.dirname(caller_path)) |caller_dir| {
+                            try search_dirs.append(db.allocator, caller_dir);
+                        }
+                    }
+                    if (db.workspace_root) |ws_root| {
+                        try search_dirs.append(db.allocator, ws_root);
+                    }
+                    for (db.c_import_include_dirs.items) |inc_dir| {
+                        try search_dirs.append(db.allocator, inc_dir);
+                    }
+                    break :blk_leg if (db.embed_io) |io_h| .{ .host_fs = io_h } else .none;
+                },
+            };
 
             const frontend_opts = c_frontend.CFrontendOptions{
                 .target = db.target_spec,
                 .defines = macro_defs.items,
                 .include_dirs = search_dirs.items,
                 .virtual_headers = vfs_headers.items,
-                .include_loader = if (db.embed_io) |io_h| .{ .host_fs = io_h } else .none,
+                .include_loader = inc_loader,
             };
             var unit = c_frontend.parseCHeader(
                 db.allocator,
@@ -4857,6 +5872,29 @@ pub const CompilerDb = struct {
                 else => return err,
             };
             defer unit.deinit();
+
+            if (active_jail == .host_dir_jailed) {
+                const jail_dir = active_jail.host_dir_jailed;
+                const extra_inc = if (caller_pkg == .root) db.c_import_include_dirs.items else &.{};
+                for (unit.included_files.items) |inc_file| {
+                    if (!(try isJailedHostIncludeVerified(
+                        db.allocator,
+                        db.embed_io,
+                        jail_dir,
+                        extra_inc,
+                        db.virtual_files,
+                        inc_file.path,
+                    ))) {
+                        try active_sink.emit(.{
+                            .code = .e0326_embed_path_escape,
+                            .severity = .err,
+                            .primary_span = .{ .file_id = caller_file_id, .start_byte = 0, .end_byte = 0 },
+                            .message = "`@c_import` nested `#include` traverses a symlink or escapes package directory sandbox",
+                        });
+                        return .none;
+                    }
+                }
+            }
 
             const translated_cx = c_translate.translateUnit(
                 db.allocator,
@@ -4877,16 +5915,19 @@ pub const CompilerDb = struct {
             defer db.allocator.free(translated_cx);
 
             for (unit.included_files.items) |inc_file| {
-                _ = db.recordEmbeddedFileRead(inc_file.path, inc_file.content) catch {};
+                _ = db.recordPackageEmbeddedFileRead(caller_pkg, inc_file.path, inc_file.content) catch {};
             }
 
             virtual_fid = try db.storeCImportTranslationWithIncludes(
                 resolved_hdr.bytes,
-                db.c_import_defines.items,
+                active_defines,
                 translated_cx,
                 unit.included_files.items,
                 null,
             );
+            if (caller_pkg != .root) {
+                try sym_table.setFilePackageId(virtual_fid, caller_pkg);
+            }
         }
 
         // [3] Resolve signatures of the virtual `.cx` module inside `CompilerDb`:
@@ -4919,14 +5960,160 @@ pub const CompilerDb = struct {
         return mod_sym_idx;
     }
 
-    /// Resolves C header bytes and canonical lookup path from `virtual_files`, caller dir, `workspace_root`, `-I`, or bundled.
+    /// Resolves C header bytes and canonical lookup path under `active_jail` (`.cxtree_only`, `.host_dir_jailed`, or legacy).
     fn resolveCImportHeaderSource(
         self: *CompilerDb,
         caller_file_id: FileId,
+        caller_pkg: PackageId,
+        active_jail: mir.EmbedPackageJail,
         header_path: []const u8,
+        active_sink: *DiagnosticSink,
         out_owned_bytes: *?[]u8,
         out_owned_path: *?[]u8,
     ) !?struct { bytes: []const u8, resolved_path: []const u8 } {
+        switch (active_jail) {
+            .cxtree_only => |cx_jail| {
+                if (!mir_vm.isValidSandboxedEmbedPath(header_path)) {
+                    try active_sink.emit(.{
+                        .code = .e0326_embed_path_escape,
+                        .severity = .err,
+                        .primary_span = .{ .file_id = caller_file_id, .start_byte = 0, .end_byte = 0 },
+                        .message = "`@c_import` header path escapes external `.cxtree` package sandbox",
+                    });
+                    return null;
+                }
+                if (self.vfs_source_map) |vmap| {
+                    var prefix_slice = cx_jail.virtual_root_prefix;
+                    var owned_pref: ?[]u8 = null;
+                    defer if (owned_pref) |pref| self.allocator.free(pref);
+                    if (prefix_slice.len == 0) {
+                        const caller_vpath = vmap.getFilePath(caller_file_id);
+                        if (std.mem.startsWith(u8, caller_vpath, "/cx/")) {
+                            if (std.mem.indexOfScalarPos(u8, caller_vpath, 4, '/')) |slash_pos| {
+                                owned_pref = try self.allocator.dupe(u8, caller_vpath[0..slash_pos]);
+                                prefix_slice = owned_pref.?;
+                            }
+                        }
+                    }
+                    // Try caller-relative inside `.cxtree` first, then package-root-relative:
+                    const caller_vpath = vmap.getFilePath(caller_file_id);
+                    if (caller_vpath.len > 0 and (prefix_slice.len == 0 or std.mem.startsWith(u8, caller_vpath, prefix_slice))) {
+                        if (std.fs.path.dirname(caller_vpath)) |caller_dir| {
+                            const rel_vpath = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ caller_dir, header_path });
+                            errdefer self.allocator.free(rel_vpath);
+                            const cx_res = vmap.lookupCxTreeAsset(rel_vpath) catch |cx_err| {
+                                self.allocator.free(rel_vpath);
+                                if (cx_err == error.CacheIntegrityMismatch) {
+                                    try active_sink.emit(.{
+                                        .code = .e0015_cache_integrity_mismatch,
+                                        .severity = .err,
+                                        .primary_span = .{ .file_id = caller_file_id, .start_byte = 0, .end_byte = 0 },
+                                        .message = "cached `.cxtree` C header blob failed BLAKE3 integrity verification",
+                                    });
+                                }
+                                return null;
+                            };
+                            if (cx_res) |cx_bytes| {
+                                out_owned_path.* = rel_vpath;
+                                return .{ .bytes = cx_bytes, .resolved_path = rel_vpath };
+                            }
+                            self.allocator.free(rel_vpath);
+                        }
+                    }
+                    if (prefix_slice.len > 0) {
+                        const root_vpath = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ prefix_slice, header_path });
+                        errdefer self.allocator.free(root_vpath);
+                        const cx_res = vmap.lookupCxTreeAsset(root_vpath) catch |cx_err| {
+                            self.allocator.free(root_vpath);
+                            if (cx_err == error.CacheIntegrityMismatch) {
+                                try active_sink.emit(.{
+                                    .code = .e0015_cache_integrity_mismatch,
+                                    .severity = .err,
+                                    .primary_span = .{ .file_id = caller_file_id, .start_byte = 0, .end_byte = 0 },
+                                    .message = "cached `.cxtree` C header blob failed BLAKE3 integrity verification",
+                                });
+                            }
+                            return null;
+                        };
+                        if (cx_res) |cx_bytes| {
+                            out_owned_path.* = root_vpath;
+                            return .{ .bytes = cx_bytes, .resolved_path = root_vpath };
+                        }
+                        self.allocator.free(root_vpath);
+                    }
+                }
+                if (c_frontend.BUNDLED_SYSTEM_HEADERS.get(header_path)) |bundled_src| {
+                    return .{ .bytes = bundled_src, .resolved_path = header_path };
+                }
+                return null;
+            },
+            .host_dir_jailed => |jail_dir| {
+                if (self.virtual_files) |vfs_map| {
+                    if (vfs_map.getEntry(header_path)) |direct_kv| {
+                        return .{ .bytes = direct_kv.value_ptr.*, .resolved_path = direct_kv.key_ptr.* };
+                    }
+                }
+                if (!mir_vm.isValidSandboxedEmbedPath(header_path)) {
+                    try active_sink.emit(.{
+                        .code = .e0326_embed_path_escape,
+                        .severity = .err,
+                        .primary_span = .{ .file_id = caller_file_id, .start_byte = 0, .end_byte = 0 },
+                        .message = "`@c_import` header path escapes package directory sandbox",
+                    });
+                    return null;
+                }
+                if (self.embed_io) |io_handle| {
+                    switch (mir.readSandboxedHostEmbedFile(
+                        self.allocator,
+                        io_handle,
+                        jail_dir,
+                        header_path,
+                        4 * 1024 * 1024,
+                    ) catch return error.OutOfMemory) {
+                        .ok => |disk_bytes| {
+                            const joined = try std.fs.path.join(self.allocator, &.{ jail_dir, header_path });
+                            out_owned_bytes.* = disk_bytes;
+                            out_owned_path.* = joined;
+                            return .{ .bytes = disk_bytes, .resolved_path = joined };
+                        },
+                        .sandbox_escape => |esc| {
+                            try active_sink.emit(.{
+                                .code = .e0326_embed_path_escape,
+                                .severity = .err,
+                                .primary_span = .{ .file_id = caller_file_id, .start_byte = 0, .end_byte = 0 },
+                                .message = esc.message,
+                            });
+                            return null;
+                        },
+                        .io_error => {},
+                    }
+                    if (caller_pkg == .root) {
+                        for (self.c_import_include_dirs.items) |inc_dir| {
+                            const cand_path = try std.fs.path.join(self.allocator, &.{ inc_dir, header_path });
+                            errdefer self.allocator.free(cand_path);
+                            if (std.Io.Dir.cwd().readFileAlloc(
+                                io_handle,
+                                cand_path,
+                                self.allocator,
+                                .limited(4 * 1024 * 1024),
+                            )) |disk_bytes| {
+                                out_owned_bytes.* = disk_bytes;
+                                out_owned_path.* = cand_path;
+                                return .{ .bytes = disk_bytes, .resolved_path = cand_path };
+                            } else |_| {
+                                self.allocator.free(cand_path);
+                            }
+                        }
+                    }
+                }
+                if (c_frontend.BUNDLED_SYSTEM_HEADERS.get(header_path)) |bundled_src| {
+                    return .{ .bytes = bundled_src, .resolved_path = header_path };
+                }
+                return null;
+            },
+            .unrestricted_legacy => {},
+        }
+
         if (self.virtual_files) |vfs_map| {
             if (vfs_map.getEntry(header_path)) |direct_kv| {
                 return .{ .bytes = direct_kv.value_ptr.*, .resolved_path = direct_kv.key_ptr.* };
@@ -5330,6 +6517,25 @@ pub const CompilerDb = struct {
             }
         }
 
+        if (self.package_root_files.count() > 0) {
+            var pkg_ids: std.ArrayListUnmanaged(u16) = .empty;
+            defer pkg_ids.deinit(self.allocator);
+            var pkg_iter = self.package_root_files.keyIterator();
+            while (pkg_iter.next()) |pkg_key_ptr| {
+                try pkg_ids.append(self.allocator, pkg_key_ptr.asInt());
+            }
+            std.mem.sort(u16, pkg_ids.items, {}, std.sort.asc(u16));
+            for (pkg_ids.items) |raw_pkg_id| {
+                const pkg_handle = PackageId.fromInt(raw_pkg_id);
+                if (pkg_handle == .root) continue;
+                if (self.package_root_files.get(pkg_handle)) |pkg_fid| {
+                    if (pkg_fid != root_file_id) {
+                        try self.appendModuleSubtreePostOrder(pkg_fid, &seen_files, out_files, 0);
+                    }
+                }
+            }
+        }
+
         for (extra_file_ids) |extra_fid| {
             if (extra_fid != root_file_id) {
                 try self.appendModuleSubtreePostOrder(extra_fid, &seen_files, out_files, 0);
@@ -5525,6 +6731,10 @@ pub const CompilerDb = struct {
                     .workspace_root = self.workspace_root,
                     .io = active_io,
                     .virtual_files = self.virtual_files,
+                    .compiler_db = self,
+                    .sym_table = &self.symbol_table,
+                    .package_jails = if (self.package_embed_jails.count() > 0) &self.package_embed_jails else null,
+                    .vfs_source_map = options.vfs_source_map orelse self.vfs_source_map,
                 },
                 active_embed_sink,
             ) catch return error.OutOfMemory;
@@ -5565,7 +6775,7 @@ pub const CompilerDb = struct {
             .sym_table = &self.symbol_table,
             .interner = &self.interner,
             .module_name = options.module_name,
-            .vfs_source_map = options.vfs_source_map,
+            .vfs_source_map = options.vfs_source_map orelse self.vfs_source_map,
             .file_tokens = &file_tokens,
             .rodata_pool = &self.rodata_pool,
             .blob_store = &blob_store,
@@ -6084,16 +7294,18 @@ pub const CompilerDb = struct {
         return artifact.ast_fingerprint;
     }
 
-    /// Ensures `self.item_trees` holds an `ItemTree` matching `lowered.ast_fingerprint` and `is_including_tests` for `file_id`.
+    /// Ensures `self.item_trees` holds an `ItemTree` matching `lowered.ast_fingerprint`, `is_including_tests`, and `pkg_cfg_fp`.
     fn ensureFreshItemTree(
         self: *CompilerDb,
         file_id: FileId,
         lowered: LoweredAstArtifact,
     ) QueryError!*const ItemTree {
-        const is_including_tests = try self.readIncludeTests();
+        const is_including_tests = try self.effectiveIncludeTestsForFile(file_id);
+        const pkg_cfg_fp = self.getPackageCfgFingerprint(file_id);
         if (self.item_trees.getPtr(file_id.asInt())) |existing_tree| {
             if (Fingerprint128.eql(existing_tree.source_ast_fingerprint, lowered.ast_fingerprint) and
-                existing_tree.is_including_tests == is_including_tests)
+                existing_tree.is_including_tests == is_including_tests and
+                Fingerprint128.eql(existing_tree.pkg_cfg_fingerprint, pkg_cfg_fp))
             {
                 return existing_tree;
             }
@@ -6108,6 +7320,7 @@ pub const CompilerDb = struct {
             input_ptr.owned_text,
             parsed_ptr,
             is_including_tests,
+            pkg_cfg_fp,
         );
         // Keep module-symbol `ast_node`/`cst_node` synchronized when `resolveSignatures` hits Early Cutoff:
         for (new_tree.entries) |entry| {
@@ -6273,6 +7486,9 @@ pub const CompilerDb = struct {
             .virtual_files = self.virtual_files,
             .file_tokens = file_tokens,
             .compiler_db = self,
+            .sym_table = &self.symbol_table,
+            .package_jails = if (self.package_embed_jails.count() > 0) &self.package_embed_jails else null,
+            .vfs_source_map = self.vfs_source_map,
         };
     }
 
@@ -6447,6 +7663,7 @@ pub const CompilerDb = struct {
     /// Returns `true` if the `TypePath` (`path_tokens`) referenced in an `impl` header resolves to an externally `.public` type/trait.
     fn isImplTypePathExternallyPublic(
         self: *const CompilerDb,
+        enclosing_file_id: FileId,
         enclosing_scope: ScopeId,
         source: []const u8,
         token_buffer: *const TokenBuffer,
@@ -6474,6 +7691,11 @@ pub const CompilerDb = struct {
         for (path_tokens[0 .. path_tokens.len - 1], 0..) |mod_tok, seg_idx| {
             const seg_name = getTokenLexeme(source, token_buffer, mod_tok);
             const seg_sym_id = self.interner.lookup(seg_name) orelse return false;
+            if (seg_idx == 0 and std.mem.eql(u8, seg_name, "pkg")) {
+                const caller_pkg = self.symbol_table.getFilePackageId(enclosing_file_id);
+                active_scope = self.symbol_table.lookupPackageRootScope(caller_pkg) orelse enclosing_scope;
+                continue;
+            }
             const found_mod_idx: SymbolIndex = if (seg_idx == 0) switch (self.symbol_table.lookupLexical(
                 active_scope,
                 seg_sym_id,
@@ -6481,8 +7703,8 @@ pub const CompilerDb = struct {
             )) {
                 .found => |idx| idx,
                 else => {
-                    if (self.symbol_table.named_module_scopes.get(seg_sym_id.asInt())) |named_scope| {
-                        active_scope = named_scope;
+                    if (self.symbol_table.lookupExternalPackageScope(enclosing_file_id, seg_sym_id)) |pkg_scope| {
+                        active_scope = pkg_scope;
                         continue;
                     }
                     return false;
@@ -6627,6 +7849,7 @@ pub const CompilerDb = struct {
             }
         }
         const is_target_pub = is_target_generic_param or self.isImplTypePathExternallyPublic(
+            checker.file_id,
             enclosing_scope,
             source,
             &parsed.token_buffer,
@@ -6637,6 +7860,7 @@ pub const CompilerDb = struct {
         const member_ids = symbol_resolver.extractImplMemberItems(&parsed.ast_arena, impl_ast_id);
         if (has_seen_for) {
             const is_trait_pub = self.isImplTypePathExternallyPublic(
+                checker.file_id,
                 enclosing_scope,
                 source,
                 &parsed.token_buffer,
@@ -6919,18 +8143,228 @@ pub const CompilerDb = struct {
         public_hasher.updateU32(pub_child_count);
     }
 
+    /// Runs Pass-1 `collectFileModuleItems` at most once per `(target_fid, current_revision)` before Pass-2 consumes it.
+    fn ensureFilePass1Collected(
+        self: *CompilerDb,
+        target_fid: FileId,
+        pkg_id: PackageId,
+    ) QueryError!FilePass1State {
+        if (self.file_pass1_states.get(target_fid.asInt())) |existing_p1| {
+            if (existing_p1.created_revision == self.current_revision and !existing_p1.has_consumed_pass2) {
+                return existing_p1;
+            }
+        }
+        if (!self.in_flight_keys.contains(QueryKey.forFile(.item_tree, target_fid).asU64())) {
+            _ = try self.extractItemTree(target_fid);
+        }
+        if (!self.parsed_artifacts.contains(target_fid.asInt()) and
+            !self.in_flight_keys.contains(QueryKey.forFile(.parse_cst, target_fid).asU64()))
+        {
+            _ = try self.parseCst(target_fid);
+        }
+        const target_include_tests = try self.effectiveIncludeTestsForFile(target_fid);
+        const target_core_allowed = self.isCoreAllowedForFile(target_fid);
+        const target_cfg = self.effectiveCfgEnvForFile(target_fid, target_include_tests);
+
+        const input_ptr = self.source_inputs.getPtr(target_fid.asInt()) orelse {
+            return .{ .created_revision = self.current_revision };
+        };
+        const parsed_ptr = self.parsed_artifacts.getPtr(target_fid.asInt()) orelse {
+            return .{ .created_revision = self.current_revision };
+        };
+
+        const was_core_allowed = self.symbol_table.is_internal_core;
+        const had_included_tests = self.symbol_table.is_including_tests;
+        const prev_cfg_env = self.symbol_table.cfg_env;
+        self.symbol_table.is_internal_core = target_core_allowed;
+        self.symbol_table.is_including_tests = target_include_tests;
+        self.symbol_table.cfg_env = target_cfg;
+        defer {
+            self.symbol_table.is_internal_core = was_core_allowed;
+            self.symbol_table.is_including_tests = had_included_tests;
+            self.symbol_table.cfg_env = prev_cfg_env;
+        }
+
+        const sig_sink = try resetOrCreateDefDiagSink(
+            &self.sig_diagnostics,
+            self.allocator,
+            target_fid.asInt(),
+        );
+        _ = self.symbol_table.file_module_scopes.remove(target_fid.asInt());
+
+        const sym_start: u32 = self.symbol_table.countSymbols();
+        const mod_scope = symbol_resolver.collectFileModuleItems(
+            &self.symbol_table,
+            &self.interner,
+            target_fid,
+            input_ptr.owned_text,
+            &parsed_ptr.token_buffer,
+            &parsed_ptr.cst_arena,
+            &parsed_ptr.ast_arena,
+            sig_sink,
+        ) catch return error.OutOfMemory;
+        const sym_end: u32 = self.symbol_table.countSymbols();
+
+        const sync_entries = (try self.extractItemTree(target_fid)).entries;
+        try self.syncFlattenedExternDefIds(
+            target_fid,
+            target_include_tests,
+            parsed_ptr,
+            sync_entries,
+            sym_start,
+            sym_end,
+        );
+
+        // Migrate cached per-symbol SAST summaries (`sast_sym_summaries`) from detached revisions to `[sym_start .. sym_end)`:
+        if (self.sast_sym_summaries.count() > 0 and sym_end > sym_start) {
+            const SymSummaryMigration = struct {
+                old_idx: u32,
+                new_idx: u32,
+                summary: mir_sast.FnRegionSummary,
+            };
+            var migrations: std.ArrayListUnmanaged(SymSummaryMigration) = .empty;
+            defer migrations.deinit(self.allocator);
+            var sum_it = self.sast_sym_summaries.iterator();
+            while (sum_it.next()) |sum_kv| {
+                const old_raw = sum_kv.key_ptr.*;
+                if (old_raw >= sym_start or old_raw >= self.symbol_table.countSymbols()) continue;
+                const old_sym = self.symbol_table.getSymbol(SymbolIndex.fromInt(old_raw)).*;
+                if (old_sym.decl_span.file_id != target_fid) continue;
+                var cand_raw: u32 = sym_start;
+                while (cand_raw < sym_end) : (cand_raw += 1) {
+                    const cand_sym = self.symbol_table.getSymbol(SymbolIndex.fromInt(cand_raw)).*;
+                    if (cand_sym.kind == old_sym.kind and
+                        cand_sym.name == old_sym.name and
+                        cand_sym.def_id == old_sym.def_id and
+                        cand_sym.owner_def_id == old_sym.owner_def_id)
+                    {
+                        try migrations.append(self.allocator, .{
+                            .old_idx = old_raw,
+                            .new_idx = cand_raw,
+                            .summary = sum_kv.value_ptr.*,
+                        });
+                        break;
+                    }
+                }
+            }
+            for (migrations.items) |mig| {
+                _ = self.sast_sym_summaries.remove(mig.old_idx);
+                try self.sast_sym_summaries.put(self.allocator, mig.new_idx, mig.summary);
+            }
+        }
+
+        if (!mod_scope.isNone()) {
+            if (self.package_root_files.get(pkg_id) == target_fid) {
+                try self.symbol_table.setPackageRootScope(pkg_id, mod_scope);
+            }
+        }
+
+        const state = FilePass1State{
+            .mod_scope = mod_scope,
+            .sym_start = sym_start,
+            .sym_end = sym_end,
+            .created_revision = self.current_revision,
+            .has_consumed_pass2 = false,
+        };
+        try self.file_pass1_states.put(self.allocator, target_fid.asInt(), state);
+        return state;
+    }
+
+    /// Pre-collects Pass-1 module scopes across `pkg_id`'s entire `mod` subtree before any Pass-2 `use pkg.…` resolves (`P1-1`).
+    fn ensurePackageSubtreePass1(
+        self: *CompilerDb,
+        pkg_id: PackageId,
+        hasher: *StructuralHasher,
+        caller_fid: FileId,
+    ) QueryError!void {
+        const pkg_root_fid = self.package_root_files.get(pkg_id) orelse return;
+        const ModLink = struct {
+            parent_fid: FileId,
+            mod_sym: SymbolId,
+            child_fid: FileId,
+        };
+        var subtree_files: std.ArrayListUnmanaged(FileId) = .empty;
+        defer subtree_files.deinit(self.allocator);
+        var mod_links: std.ArrayListUnmanaged(ModLink) = .empty;
+        defer mod_links.deinit(self.allocator);
+        var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer visited.deinit(self.allocator);
+
+        try subtree_files.append(self.allocator, pkg_root_fid);
+        try visited.put(self.allocator, pkg_root_fid.asInt(), {});
+
+        var head: usize = 0;
+        while (head < subtree_files.items.len) : (head += 1) {
+            const cur_fid = subtree_files.items[head];
+            var local_links: std.ArrayListUnmanaged(ModLink) = .empty;
+            defer local_links.deinit(self.allocator);
+
+            var ext_it = self.external_mod_files.iterator();
+            while (ext_it.next()) |ext_kv| {
+                const parent_raw: u32 = @truncate(ext_kv.key_ptr.* >> 32);
+                if (parent_raw == cur_fid.asInt()) {
+                    const mod_sym_raw: u32 = @truncate(ext_kv.key_ptr.*);
+                    try local_links.append(self.allocator, .{
+                        .parent_fid = cur_fid,
+                        .mod_sym = SymbolId.fromInt(mod_sym_raw),
+                        .child_fid = ext_kv.value_ptr.*,
+                    });
+                }
+            }
+            std.mem.sort(ModLink, local_links.items, {}, struct {
+                fn lessThan(_: void, lhs: ModLink, rhs: ModLink) bool {
+                    return lhs.mod_sym.asInt() < rhs.mod_sym.asInt();
+                }
+            }.lessThan);
+
+            for (local_links.items) |link| {
+                try mod_links.append(self.allocator, link);
+                const gop = try visited.getOrPut(self.allocator, link.child_fid.asInt());
+                if (!gop.found_existing) {
+                    try subtree_files.append(self.allocator, link.child_fid);
+                }
+            }
+        }
+
+        for (subtree_files.items) |member_fid| {
+            if (member_fid != caller_fid and
+                !self.in_flight_keys.contains(QueryKey.forFile(.item_tree, member_fid).asU64()))
+            {
+                const member_tree = try self.extractItemTree(member_fid);
+                hasher.updateFingerprint(member_tree.tree_fingerprint);
+            }
+            _ = try self.ensureFilePass1Collected(member_fid, pkg_id);
+        }
+
+        for (mod_links.items) |link| {
+            if (self.symbol_table.file_module_scopes.get(link.child_fid.asInt())) |child_scope| {
+                if (!child_scope.isNone()) {
+                    try self.symbol_table.bindExternalModuleScope(
+                        link.parent_fid,
+                        link.mod_sym,
+                        child_scope,
+                    );
+                    if (self.symbol_table.file_module_scopes.get(link.parent_fid.asInt())) |parent_scope| {
+                        if (!parent_scope.isNone()) {
+                            self.symbol_table.scope_arena.setParentModule(child_scope, parent_scope);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Stage 6 implementation: resolves module signatures for `file_id` (shielded by `tree_fingerprint`).
     fn computeResolveSignatures(self: *CompilerDb, file_id: FileId) QueryError!Fingerprint128 {
         const init_tree = try self.extractItemTree(file_id);
         const item_tree_fp = init_tree.tree_fingerprint;
         const is_including_tests = init_tree.is_including_tests;
         const active_layout = try self.readTargetLayout();
-        const is_internal_core = self.readInternalCore();
-        const is_stdlib_durability = if (self.source_inputs.get(file_id.asInt())) |inp|
-            inp.durability == .high
-        else
-            false;
-        const is_core_allowed = is_internal_core or is_stdlib_durability;
+        const caller_pkg = self.symbol_table.getFilePackageId(file_id);
+        const is_stdlib = self.isStdlibFile(file_id);
+        const is_core_allowed = self.isCoreAllowedForFile(file_id);
+        const pkg_cfg_fp = self.getPackageCfgFingerprint(file_id);
+        const eff_cfg = self.effectiveCfgEnvForFile(file_id, is_including_tests);
         try self.unwindIfCancelled();
 
         var hasher = StructuralHasher.init();
@@ -6942,6 +8376,10 @@ pub const CompilerDb = struct {
         hasher.updateU8(@backingInt(self.target_spec.simd_level));
         hasher.updateU8(@intFromBool(is_including_tests));
         hasher.updateU8(@intFromBool(is_core_allowed));
+        hasher.updateU8(@intFromBool(is_stdlib));
+        if (!Fingerprint128.eql(pkg_cfg_fp, Fingerprint128.ZERO)) {
+            hasher.updateFingerprint(pkg_cfg_fp);
+        }
         hasher.updateFingerprint(item_tree_fp);
 
         var public_cxi_hasher = StructuralHasher.init();
@@ -6951,6 +8389,9 @@ pub const CompilerDb = struct {
         public_cxi_hasher.updateU8(@backingInt(self.target_spec.os));
         public_cxi_hasher.updateU8(@backingInt(self.target_spec.abi));
         public_cxi_hasher.updateU8(@backingInt(self.target_spec.simd_level));
+        if (!Fingerprint128.eql(pkg_cfg_fp, Fingerprint128.ZERO)) {
+            public_cxi_hasher.updateFingerprint(pkg_cfg_fp);
+        }
 
         var sig_entry_idx: usize = 0;
         while (sig_entry_idx < (try self.extractItemTree(file_id)).entries.len) : (sig_entry_idx += 1) {
@@ -6994,9 +8435,79 @@ pub const CompilerDb = struct {
                         root_sym_raw,
                         root_sigs.module_scope,
                     );
+                    if (self.symbol_table.getFilePackageId(root_fid) == .std_core) {
+                        try self.symbol_table.setPackageRootScope(.std_core, root_sigs.module_scope);
+                    }
                 }
             }
         }
+
+        // Resolve per-package dependency bindings `(caller_pkg, alias_sym) -> dep_root_fid` (`P1-1` `.cxi` cutoff):
+        if (self.package_dep_files.count() > 0) {
+            var dep_aliases: std.ArrayListUnmanaged(SymbolId) = .empty;
+            defer dep_aliases.deinit(self.allocator);
+            var dep_key_it = self.package_dep_files.keyIterator();
+            while (dep_key_it.next()) |dep_key_ptr| {
+                if (dep_key_ptr.caller_pkg == caller_pkg) {
+                    try dep_aliases.append(self.allocator, dep_key_ptr.alias_sym);
+                }
+            }
+            std.mem.sort(SymbolId, dep_aliases.items, {}, struct {
+                fn lessThan(_: void, lhs: SymbolId, rhs: SymbolId) bool {
+                    return lhs.asInt() < rhs.asInt();
+                }
+            }.lessThan);
+            for (dep_aliases.items) |alias_sym| {
+                const dep_root_fid = self.package_dep_files.get(.{
+                    .caller_pkg = caller_pkg,
+                    .alias_sym = alias_sym,
+                }) orelse continue;
+                if (dep_root_fid != file_id and
+                    !self.in_flight_keys.contains(QueryKey.forFile(.resolve_signatures, dep_root_fid).asU64()))
+                {
+                    const dep_sigs = try self.resolveSignatures(dep_root_fid);
+                    hasher.updateU32(alias_sym.asInt());
+                    hasher.updateFingerprint(dep_sigs.public_interface_fingerprint);
+                    if (!dep_sigs.module_scope.isNone()) {
+                        try self.symbol_table.bindPackageDepScope(
+                            caller_pkg,
+                            alias_sym,
+                            dep_sigs.module_scope,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Pre-collect intra-package Pass-1 scopes across `caller_pkg` so `use pkg.…` works from any submodule (`P1-1`):
+        if (self.package_root_files.contains(caller_pkg)) {
+            try self.ensurePackageSubtreePass1(caller_pkg, &hasher, file_id);
+        }
+
+        // Collect Pass-1 items for `file_id` BEFORE recursing into `mod` children (`super.` & `pkg.` visibility):
+        var pass1_state = FilePass1State{ .created_revision = self.current_revision };
+        if (self.source_inputs.contains(file_id.asInt()) and self.parsed_artifacts.contains(file_id.asInt())) {
+            pass1_state = try self.ensureFilePass1Collected(file_id, caller_pkg);
+            if (self.file_pass1_states.getPtr(file_id.asInt())) |p1_mut| {
+                p1_mut.has_consumed_pass2 = true;
+            }
+            if (!pass1_state.mod_scope.isNone()) {
+                if (caller_pkg == .std_core and self.symbol_table.lookupPackageRootScope(.std_core) == null) {
+                    var has_parent_mod = false;
+                    var p_it = self.external_mod_files.valueIterator();
+                    while (p_it.next()) |val_fid| {
+                        if (val_fid.* == file_id) {
+                            has_parent_mod = true;
+                            break;
+                        }
+                    }
+                    if (!has_parent_mod) {
+                        try self.symbol_table.setPackageRootScope(.std_core, pass1_state.mod_scope);
+                    }
+                }
+            }
+        }
+
         var stale_ext_keys: std.ArrayListUnmanaged(u64) = .empty;
         defer stale_ext_keys.deinit(self.allocator);
         var ext_iter = self.symbol_table.external_module_scopes.keyIterator();
@@ -7025,10 +8536,22 @@ pub const CompilerDb = struct {
                                 entry.name_symbol,
                                 child_sigs.module_scope,
                             );
-                            try self.symbol_table.named_module_scopes.put(
-                                self.allocator,
-                                entry.name_symbol.asInt(),
-                                child_sigs.module_scope,
+                            if (!self.is_package_graph_mounted and
+                                !self.symbol_table.configured_pkg_deps.contains(caller_pkg))
+                            {
+                                try self.symbol_table.named_module_scopes.put(
+                                    self.allocator,
+                                    entry.name_symbol.asInt(),
+                                    child_sigs.module_scope,
+                                );
+                            }
+                        }
+                    } else if (self.symbol_table.file_module_scopes.get(child_fid.asInt())) |in_flight_child_scope| {
+                        if (!in_flight_child_scope.isNone()) {
+                            try self.symbol_table.bindExternalModuleScope(
+                                file_id,
+                                entry.name_symbol,
+                                in_flight_child_scope,
                             );
                         }
                     }
@@ -7036,8 +8559,8 @@ pub const CompilerDb = struct {
             }
         }
 
-        // Run Phase 4 symbol collection, `use` resolution, and signature type resolution for `file_id`:
-        var mod_scope: ScopeId = .none;
+        // Run Phase 4 `use` resolution and signature type resolution for `file_id`:
+        var mod_scope: ScopeId = pass1_state.mod_scope;
         var sig_err_count: u32 = 0;
         var public_count: u32 = 0;
         if (self.source_inputs.getPtr(file_id.asInt())) |input_ptr| {
@@ -7047,47 +8570,23 @@ pub const CompilerDb = struct {
                 const prev_cfg_env = self.symbol_table.cfg_env;
                 self.symbol_table.is_internal_core = is_core_allowed;
                 self.symbol_table.is_including_tests = is_including_tests;
-                self.symbol_table.cfg_env = type_system.CfgEnv.fromTargetSpec(self.target_spec, is_including_tests);
+                self.symbol_table.cfg_env = eff_cfg;
                 defer {
                     self.symbol_table.is_internal_core = was_core_allowed;
                     self.symbol_table.is_including_tests = had_included_tests;
                     self.symbol_table.cfg_env = prev_cfg_env;
                 }
 
-                const sig_sink = try resetOrCreateDefDiagSink(
-                    &self.sig_diagnostics,
-                    self.allocator,
-                    file_id.asInt(),
-                );
-
-                // Detach previous module scope for `file_id` so re-runs allocate a clean scope:
-                _ = self.symbol_table.file_module_scopes.remove(file_id.asInt());
-
-                const sym_start: u32 = self.symbol_table.countSymbols();
-                mod_scope = symbol_resolver.collectFileModuleItems(
-                    &self.symbol_table,
-                    &self.interner,
-                    file_id,
-                    input_ptr.owned_text,
-                    &parsed_ptr.token_buffer,
-                    &parsed_ptr.cst_arena,
-                    &parsed_ptr.ast_arena,
-                    sig_sink,
-                ) catch return error.OutOfMemory;
-                const sym_end: u32 = self.symbol_table.countSymbols();
-
+                const sig_sink = self.sig_diagnostics.getPtr(file_id.asInt()) orelse
+                    try resetOrCreateDefDiagSink(&self.sig_diagnostics, self.allocator, file_id.asInt());
+                const sym_start = pass1_state.sym_start;
+                const sym_end = pass1_state.sym_end;
                 const sync_entries = (try self.extractItemTree(file_id)).entries;
-                // Synchronize `DefId` bindings with flattened `extern` `ItemTree` entries when present:
-                try self.syncFlattenedExternDefIds(
-                    file_id,
-                    is_including_tests,
-                    parsed_ptr,
-                    sync_entries,
-                    sym_start,
-                    sym_end,
-                );
 
                 if (!mod_scope.isNone()) {
+                    if (self.package_root_files.get(caller_pkg) == file_id) {
+                        try self.symbol_table.setPackageRootScope(caller_pkg, mod_scope);
+                    }
                     // Link `parent_module` for both external child modules and any already-resolved parent file:
                     for (sync_entries) |entry| {
                         if (entry.kind == .mod_decl) {
@@ -7102,6 +8601,12 @@ pub const CompilerDb = struct {
                     while (parent_ext_iter.next()) |ext_kv| {
                         if (ext_kv.value_ptr.* == file_id) {
                             const parent_raw_fid: u32 = @truncate(ext_kv.key_ptr.* >> 32);
+                            const mod_sym_raw: u32 = @truncate(ext_kv.key_ptr.*);
+                            try self.symbol_table.bindExternalModuleScope(
+                                FileId.fromInt(parent_raw_fid),
+                                SymbolId.fromInt(mod_sym_raw),
+                                mod_scope,
+                            );
                             if (self.symbol_table.file_module_scopes.get(parent_raw_fid)) |parent_mod_scope| {
                                 self.symbol_table.scope_arena.setParentModule(mod_scope, parent_mod_scope);
                             }
@@ -7141,9 +8646,9 @@ pub const CompilerDb = struct {
                 defer checker.deinit();
                 checker.db = self;
                 checker.target_layout = active_layout;
-                checker.cfg_env = type_system.CfgEnv.fromTargetSpec(self.target_spec, is_including_tests);
+                checker.cfg_env = eff_cfg;
                 checker.is_including_tests = is_including_tests;
-                checker.is_stdlib_file = (input_ptr.durability == .high);
+                checker.is_stdlib_file = is_stdlib;
                 checker.is_internal_core = is_core_allowed;
 
                 checker.resolveModuleSignatures() catch return error.OutOfMemory;
@@ -7418,7 +8923,7 @@ pub const CompilerDb = struct {
         const parsed_ptr = self.parsed_artifacts.getPtr(file_id.asInt()) orelse return;
         if (Fingerprint128.eql(sync_ptr.ast_fingerprint, parsed_ptr.ast_fingerprint)) return;
         const input_ptr = self.source_inputs.getPtr(file_id.asInt()) orelse return;
-        const is_including_tests = try self.readIncludeTests();
+        const is_including_tests = try self.effectiveIncludeTestsForFile(file_id);
 
         const fn_handles = try symbol_resolver.collectFileFnDeclHandlesWithOptions(
             self.allocator,
@@ -7457,10 +8962,17 @@ pub const CompilerDb = struct {
 
         if (default_fn_syms.items.len > 0) {
             const active_layout = try self.readTargetLayout();
-            const is_core_allowed = self.readInternalCore() or (input_ptr.durability == .high);
+            const is_stdlib = self.isStdlibFile(file_id);
+            const is_core_allowed = self.isCoreAllowedForFile(file_id);
+            const eff_cfg = self.effectiveCfgEnvForFile(file_id, is_including_tests);
             const was_core_allowed = self.symbol_table.is_internal_core;
+            const prev_cfg = self.symbol_table.cfg_env;
             self.symbol_table.is_internal_core = is_core_allowed;
-            defer self.symbol_table.is_internal_core = was_core_allowed;
+            self.symbol_table.cfg_env = eff_cfg;
+            defer {
+                self.symbol_table.is_internal_core = was_core_allowed;
+                self.symbol_table.cfg_env = prev_cfg;
+            }
 
             var scratch_sink = DiagnosticSink.init(self.allocator);
             defer scratch_sink.deinit();
@@ -7480,9 +8992,9 @@ pub const CompilerDb = struct {
             defer checker.deinit();
             checker.db = self;
             checker.target_layout = active_layout;
-            checker.cfg_env = type_system.CfgEnv.fromTargetSpec(self.target_spec, is_including_tests);
+            checker.cfg_env = eff_cfg;
             checker.is_including_tests = is_including_tests;
-            checker.is_stdlib_file = (input_ptr.durability == .high);
+            checker.is_stdlib_file = is_stdlib;
             checker.is_internal_core = is_core_allowed;
 
             for (default_fn_syms.items) |fn_sym_idx| {
@@ -7590,13 +9102,11 @@ pub const CompilerDb = struct {
         const def_sig = try self.getDefSignature(def_id);
         const body_window = try self.getBodyAstProj(def_id);
         const active_layout = try self.readTargetLayout();
-        const is_including_tests = try self.readIncludeTests();
-        const is_internal_core = self.readInternalCore();
-        const is_stdlib_durability = if (self.source_inputs.get(file_id.asInt())) |inp|
-            inp.durability == .high
-        else
-            false;
-        const is_core_allowed = is_internal_core or is_stdlib_durability;
+        const is_including_tests = try self.effectiveIncludeTestsForFile(file_id);
+        const is_stdlib = self.isStdlibFile(file_id);
+        const is_core_allowed = self.isCoreAllowedForFile(file_id);
+        const pkg_cfg_fp = self.getPackageCfgFingerprint(file_id);
+        const eff_cfg = self.effectiveCfgEnvForFile(file_id, is_including_tests);
         try self.unwindIfCancelled();
 
         var body_err_count: u32 = 0;
@@ -7605,8 +9115,13 @@ pub const CompilerDb = struct {
         if (self.source_inputs.getPtr(file_id.asInt())) |input_ptr| {
             if (self.parsed_artifacts.getPtr(file_id.asInt())) |parsed_ptr| {
                 const was_core_allowed = self.symbol_table.is_internal_core;
+                const prev_cfg = self.symbol_table.cfg_env;
                 self.symbol_table.is_internal_core = is_core_allowed;
-                defer self.symbol_table.is_internal_core = was_core_allowed;
+                self.symbol_table.cfg_env = eff_cfg;
+                defer {
+                    self.symbol_table.is_internal_core = was_core_allowed;
+                    self.symbol_table.cfg_env = prev_cfg;
+                }
 
                 const body_sink = try resetOrCreateDefDiagSink(
                     &self.body_diagnostics,
@@ -7629,9 +9144,9 @@ pub const CompilerDb = struct {
                 defer checker.deinit();
                 checker.db = self;
                 checker.target_layout = active_layout;
-                checker.cfg_env = type_system.CfgEnv.fromTargetSpec(self.target_spec, is_including_tests);
+                checker.cfg_env = eff_cfg;
                 checker.is_including_tests = is_including_tests;
-                checker.is_stdlib_file = (input_ptr.durability == .high);
+                checker.is_stdlib_file = is_stdlib;
                 checker.is_internal_core = is_core_allowed;
 
                 if (def_sig.kind == .extern_static or def_sig.kind == .ffi_extern_block) {
@@ -7794,6 +9309,10 @@ pub const CompilerDb = struct {
         hasher.updateU8(@backingInt(self.target_spec.abi));
         hasher.updateU8(@backingInt(self.target_spec.simd_level));
         hasher.updateU8(@intFromBool(is_core_allowed));
+        hasher.updateU8(@intFromBool(is_stdlib));
+        if (!Fingerprint128.eql(pkg_cfg_fp, Fingerprint128.ZERO)) {
+            hasher.updateFingerprint(pkg_cfg_fp);
+        }
         hasher.updateFingerprint(def_sig.signature_fingerprint);
         hasher.updateFingerprint(body_window.body_fingerprint);
         hasher.updateU32(body_err_count);
@@ -8170,6 +9689,16 @@ pub const CompilerDb = struct {
         var hir_scratch_sink = DiagnosticSink.init(self.allocator);
         defer hir_scratch_sink.deinit();
         const eval_hook = mir_vm.makeComptimeEvalHook(self, target_def.asInt());
+        const target_inc_tests = try self.effectiveIncludeTestsForFile(target_file);
+        const target_eff_cfg = self.effectiveCfgEnvForFile(target_file, target_inc_tests);
+        const prev_sast_cfg = self.symbol_table.cfg_env;
+        const prev_sast_inc = self.symbol_table.is_including_tests;
+        self.symbol_table.cfg_env = target_eff_cfg;
+        self.symbol_table.is_including_tests = target_inc_tests;
+        defer {
+            self.symbol_table.cfg_env = prev_sast_cfg;
+            self.symbol_table.is_including_tests = prev_sast_inc;
+        }
 
         var store = hir.lowerDefToHir(
             self.allocator,
@@ -8494,6 +10023,11 @@ pub const CompilerDb = struct {
                 emitted_drops = sast_res.emitted_drops;
 
                 var has_matched_primary = false;
+                const is_single_fn_def = if (self.symbol_table.def_to_symbol.get(def_id.asInt())) |def_sym_idx|
+                    (!def_sym_idx.isNone() and def_sym_idx.asInt() < self.symbol_table.countSymbols() and
+                        self.symbol_table.getSymbol(def_sym_idx).kind == .fn_sym)
+                else
+                    false;
                 const summary_limit = @min(primary_len, sast_res.summary_store.summaries.len);
                 for (sast_res.summary_store.summaries[0..summary_limit], 0..) |slot_sum, slot_i| {
                     const slot_def = sast_res.summary_store.def_ids[slot_i];
@@ -8504,21 +10038,39 @@ pub const CompilerDb = struct {
                             slot_sym.asInt(),
                             slot_sum,
                         );
+                        if (self.file_sig_sync_states.get(file_id.asInt())) |sync_st| {
+                            if (slot_sym.asInt() < sync_st.sym_start and
+                                slot_sym.asInt() < self.symbol_table.countSymbols())
+                            {
+                                const stale_sym = self.symbol_table.getSymbol(slot_sym).*;
+                                const clamped_end = @min(sync_st.sym_end, self.symbol_table.countSymbols());
+                                var cur_raw: u32 = sync_st.sym_start;
+                                while (cur_raw < clamped_end) : (cur_raw += 1) {
+                                    const cur_sym = self.symbol_table.getSymbol(SymbolIndex.fromInt(cur_raw)).*;
+                                    if (cur_sym.kind == stale_sym.kind and
+                                        cur_sym.name == stale_sym.name and
+                                        cur_sym.owner_def_id == def_id)
+                                    {
+                                        try self.sast_sym_summaries.put(self.allocator, cur_raw, slot_sum);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
-                    if (!slot_def.isNone()) {
+                    if (!slot_def.isNone() and slot_def != def_id) {
                         try self.sast_summaries.put(
                             self.allocator,
                             slot_def.asInt(),
                             slot_sum,
                         );
-                        if (slot_def == def_id) {
-                            final_summary = slot_sum;
-                            has_matched_primary = true;
-                        }
                     }
-                }
-                if (!has_matched_primary and summary_limit > 0) {
-                    final_summary = sast_res.summary_store.summaries[0];
+                    if (!has_matched_primary) {
+                        final_summary = slot_sum;
+                        has_matched_primary = true;
+                    } else {
+                        final_summary = unionFnRegionSummaries(final_summary, slot_sum, is_single_fn_def);
+                    }
                 }
             }
         }
@@ -8597,6 +10149,18 @@ pub const CompilerDb = struct {
 
         try self.syncDefWindowAndSideTables(def_id, parsed_ptr, body_window.item_ast_node);
 
+        const hir_inc_tests = try self.effectiveIncludeTestsForFile(file_id);
+        const hir_eff_cfg = self.effectiveCfgEnvForFile(file_id, hir_inc_tests);
+        const hir_pkg_cfg_fp = self.getPackageCfgFingerprint(file_id);
+        const prev_hir_cfg = self.symbol_table.cfg_env;
+        const prev_hir_inc = self.symbol_table.is_including_tests;
+        self.symbol_table.cfg_env = hir_eff_cfg;
+        self.symbol_table.is_including_tests = hir_inc_tests;
+        defer {
+            self.symbol_table.cfg_env = prev_hir_cfg;
+            self.symbol_table.is_including_tests = prev_hir_inc;
+        }
+
         const eval_hook = mir_vm.makeComptimeEvalHook(self, def_id.asInt());
         var store = hir.lowerDefToHir(
             self.allocator,
@@ -8622,12 +10186,18 @@ pub const CompilerDb = struct {
         };
         errdefer store.deinit();
 
-        const hir_fp = computeHirStoreFingerprint(
+        var hir_fp = computeHirStoreFingerprint(
             &store,
             &self.type_pool,
             &self.symbol_table,
             &self.interner,
         );
+        if (!Fingerprint128.eql(hir_pkg_cfg_fp, Fingerprint128.ZERO)) {
+            var hir_cfg_hasher = StructuralHasher.init();
+            hir_cfg_hasher.updateFingerprint(hir_fp);
+            hir_cfg_hasher.updateFingerprint(hir_pkg_cfg_fp);
+            hir_fp = hir_cfg_hasher.final();
+        }
         if (try self.lowered_def_hirs.fetchPut(self.allocator, def_id.asInt(), store)) |prev_kv| {
             var old_store = prev_kv.value;
             old_store.deinit();
@@ -9098,6 +10668,634 @@ pub const CompilerDb = struct {
             old_res.deinit();
         }
         return opt_fp;
+    }
+
+    // ------- Phase 9 `.cxi` Digest & Workspace Cap Sandbox --------
+
+    /// Computes the binary `.cxi` summary, `cxi_blake3` digest, and four-tier capability roll-up for `pkg_id`.
+    pub fn computePackageCxiSummary(
+        self: *CompilerDb,
+        out_allocator: std.mem.Allocator,
+        pkg_id: PackageId,
+        pkg_files: []const FileId,
+    ) QueryError!PackageCxiArtifact {
+        const active_layout = try self.readTargetLayout();
+        var caps = mir_sast.PackageCapSummary{};
+        var inactive_agg = symbol_resolver.InactiveCfgCapScan{};
+        var first_leaf_span = Span{ .file_id = .none, .start_byte = 0, .end_byte = 0 };
+        var first_leaf_name: []u8 = &.{};
+        errdefer if (first_leaf_name.len > 0) out_allocator.free(first_leaf_name);
+
+        var fn_records: std.ArrayListUnmanaged(pkg_cxi_seam.CxiFnRecord) = .empty;
+        defer fn_records.deinit(self.allocator);
+        var type_records: std.ArrayListUnmanaged(pkg_cxi_seam.CxiTypeRecord) = .empty;
+        defer type_records.deinit(self.allocator);
+
+        var file_set: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer file_set.deinit(self.allocator);
+        for (pkg_files) |pkg_fid| {
+            try file_set.put(self.allocator, pkg_fid.asInt(), {});
+        }
+
+        for (pkg_files) |pkg_fid| {
+            _ = try self.parseCst(pkg_fid);
+            _ = try self.resolveSignatures(pkg_fid);
+            const item_tree = try self.extractItemTree(pkg_fid);
+            const is_inc_tests = try self.effectiveIncludeTestsForFile(pkg_fid);
+            const eff_cfg = self.effectiveCfgEnvForFile(pkg_fid, is_inc_tests);
+
+            if (self.source_inputs.getPtr(pkg_fid.asInt())) |inp_ptr| {
+                if (self.parsed_artifacts.getPtr(pkg_fid.asInt())) |parsed_ptr| {
+                    const file_inactive = symbol_resolver.scanFileInactiveCfgCapabilities(
+                        &eff_cfg,
+                        pkg_fid,
+                        inp_ptr.owned_text,
+                        &parsed_ptr.token_buffer,
+                        &parsed_ptr.cst_arena,
+                    );
+                    inactive_agg.all_inactive_caps_bits |= file_inactive.all_inactive_caps_bits;
+                    inactive_agg.pub_inactive_caps_bits |= file_inactive.pub_inactive_caps_bits;
+                    inactive_agg.link_ambient_inactive_caps_bits |= file_inactive.link_ambient_inactive_caps_bits;
+                    if (inactive_agg.first_inactive_cap_span.file_id.isNone() and
+                        !file_inactive.first_inactive_cap_span.file_id.isNone())
+                    {
+                        inactive_agg.first_inactive_cap_span = file_inactive.first_inactive_cap_span;
+                    }
+                    if (scanFileActiveTopLevelAsm(
+                        &eff_cfg,
+                        pkg_fid,
+                        inp_ptr.owned_text,
+                        &parsed_ptr.token_buffer,
+                        &parsed_ptr.cst_arena,
+                    )) |asm_span| {
+                        const asm_bits: u16 = (mir_sast.EffectCapabilityMask{ .ffi = true, .unsafe_op = true }).asBits();
+                        caps.ambient_caps = mir_sast.EffectCapabilityMask.fromBits(caps.ambient_caps.asBits() | asm_bits);
+                        caps.link_ambient_caps = mir_sast.EffectCapabilityMask.fromBits(
+                            caps.link_ambient_caps.asBits() | asm_bits,
+                        );
+                        caps.reachable_caps = mir_sast.EffectCapabilityMask.fromBits(
+                            caps.reachable_caps.asBits() | asm_bits,
+                        );
+                        if (first_leaf_span.file_id.isNone()) {
+                            first_leaf_span = asm_span;
+                            if (first_leaf_name.len == 0) {
+                                first_leaf_name = try out_allocator.dupe(u8, "asm");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Aggregate active item SAST summaries and module-level `extern`/`asm` capabilities:
+            var idx: usize = 0;
+            while (idx < (try self.extractItemTree(pkg_fid)).entries.len) : (idx += 1) {
+                const entry = (try self.extractItemTree(pkg_fid)).entries[idx];
+                _ = try self.typecheckBody(entry.def_id);
+                const sast_res = try self.verifySastMir(entry.def_id);
+                var item_bits: u16 = (sast_res.summary.inferred_effects_bits |
+                    sast_res.summary.direct_effects_bits) & mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
+                var direct_bits: u16 = sast_res.summary.direct_effects_bits &
+                    mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
+                var is_link_ambient = false;
+
+                const ffi_bit: u16 = (mir_sast.EffectCapabilityMask{ .ffi = true }).asBits();
+                const ffi_unsafe_bits: u16 = (mir_sast.EffectCapabilityMask{ .ffi = true, .unsafe_op = true }).asBits();
+                if (entry.kind == .extern_static or entry.kind == .ffi_extern_block) {
+                    item_bits |= ffi_bit;
+                    direct_bits |= ffi_bit;
+                }
+                if (self.symbol_table.def_to_symbol.get(entry.def_id.asInt())) |sym_idx| {
+                    if (!sym_idx.isNone() and sym_idx.asInt() < self.symbol_table.countSymbols()) {
+                        const sym_rec = self.symbol_table.getSymbol(sym_idx).*;
+                        if (sym_rec.flags.is_extern) {
+                            item_bits |= ffi_bit;
+                            direct_bits |= ffi_bit;
+                        }
+                        if (sym_rec.contract_flags.is_export or
+                            sym_rec.contract_flags.has_link_section or
+                            sym_rec.contract_flags.has_link_name or
+                            sym_rec.contract_flags.is_ifunc)
+                        {
+                            is_link_ambient = true;
+                        }
+                        if (self.symbol_table.ffi_contracts.get(sym_idx)) |ffi_con| {
+                            if (ffi_con.wasm_export_name != .empty or ffi_con.link_lib_name != .empty) {
+                                item_bits |= ffi_bit;
+                                if (ffi_con.wasm_export_name != .empty) is_link_ambient = true;
+                            }
+                        }
+                    }
+                }
+                if (is_link_ambient) {
+                    item_bits |= ffi_unsafe_bits;
+                    direct_bits |= ffi_unsafe_bits;
+                }
+
+                caps.ambient_caps = mir_sast.EffectCapabilityMask.fromBits(caps.ambient_caps.asBits() | item_bits);
+                if (is_link_ambient) {
+                    caps.link_ambient_caps = mir_sast.EffectCapabilityMask.fromBits(
+                        caps.link_ambient_caps.asBits() | item_bits,
+                    );
+                }
+                const is_root_main = pkg_id == .root and std.mem.eql(u8, entry.name_text, "main");
+                if (entry.isPublicOutsidePkg() or is_root_main or is_link_ambient) {
+                    caps.reachable_caps = mir_sast.EffectCapabilityMask.fromBits(
+                        caps.reachable_caps.asBits() | item_bits,
+                    );
+                }
+                if (entry.isPublicOutsidePkg()) {
+                    caps.surface_caps = mir_sast.EffectCapabilityMask.fromBits(
+                        caps.surface_caps.asBits() | item_bits,
+                    );
+                }
+                if (direct_bits != 0 and first_leaf_span.file_id.isNone()) {
+                    if (self.symbol_table.def_to_symbol.get(entry.def_id.asInt())) |sym_idx| {
+                        if (!sym_idx.isNone() and sym_idx.asInt() < self.symbol_table.countSymbols()) {
+                            first_leaf_span = self.symbol_table.getSymbol(sym_idx).decl_span;
+                        }
+                    }
+                    if (first_leaf_span.file_id.isNone()) {
+                        first_leaf_span = Span.init(pkg_fid, 0, 0);
+                    }
+                    if (entry.name_text.len > 0 and first_leaf_name.len == 0) {
+                        first_leaf_name = try out_allocator.dupe(u8, entry.name_text);
+                    }
+                }
+            }
+            _ = item_tree;
+        }
+
+        // Scan symbols owned by `pkg_files` for `@c_import` `.ffi`, impl methods, and exported `.cxi` records:
+        var sym_i: u32 = 0;
+        while (sym_i < self.symbol_table.countSymbols()) : (sym_i += 1) {
+            const sym_idx = SymbolIndex.fromInt(sym_i);
+            const sym = self.symbol_table.getSymbol(sym_idx).*;
+            if (sym.flags.is_builtin or sym.flags.is_imported) continue;
+
+            if (sym.kind == .module_sym and
+                self.symbol_table.getFilePackageId(sym.decl_span.file_id) == pkg_id and
+                std.mem.startsWith(u8, sym.name_text, "__c_import_"))
+            {
+                const ffi_bit: u16 = (mir_sast.EffectCapabilityMask{ .ffi = true }).asBits();
+                caps.ambient_caps = mir_sast.EffectCapabilityMask.fromBits(caps.ambient_caps.asBits() | ffi_bit);
+                caps.reachable_caps = mir_sast.EffectCapabilityMask.fromBits(caps.reachable_caps.asBits() | ffi_bit);
+                caps.surface_caps = mir_sast.EffectCapabilityMask.fromBits(caps.surface_caps.asBits() | ffi_bit);
+                continue;
+            }
+
+            if (!file_set.contains(sym.decl_span.file_id.asInt())) continue;
+            if (self.file_sig_sync_states.get(sym.decl_span.file_id.asInt())) |sync_st| {
+                if (sym_i < sync_st.sym_start or sym_i >= sync_st.sym_end) continue;
+            }
+
+            const is_ext_surface = mir_sast.isSymbolExternallyCallableSurface(&self.symbol_table, sym_idx, sym);
+            const has_wasm_export = if (self.symbol_table.ffi_contracts.get(sym_idx)) |ffi_con|
+                ffi_con.wasm_export_name != .empty
+            else
+                false;
+            const is_exported_sym = sym.contract_flags.is_export or
+                sym.contract_flags.has_link_section or
+                sym.contract_flags.has_link_name or
+                sym.contract_flags.is_ifunc or
+                has_wasm_export;
+
+            // Fold `impl` method & default-arg summaries (`sast_sym_summaries`) into `caps`:
+            if (self.sast_sym_summaries.get(sym_i)) |method_sum| {
+                const ffi_unsafe_bits: u16 = (mir_sast.EffectCapabilityMask{ .ffi = true, .unsafe_op = true }).asBits();
+                const raw_m_bits: u16 = (method_sum.inferred_effects_bits | method_sum.direct_effects_bits) &
+                    mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
+                const m_bits: u16 = if (is_exported_sym) (raw_m_bits | ffi_unsafe_bits) else raw_m_bits;
+                caps.ambient_caps = mir_sast.EffectCapabilityMask.fromBits(caps.ambient_caps.asBits() | m_bits);
+                if (is_exported_sym) {
+                    caps.link_ambient_caps = mir_sast.EffectCapabilityMask.fromBits(
+                        caps.link_ambient_caps.asBits() | m_bits,
+                    );
+                }
+                if (is_ext_surface or is_exported_sym) {
+                    caps.reachable_caps = mir_sast.EffectCapabilityMask.fromBits(
+                        caps.reachable_caps.asBits() | m_bits,
+                    );
+                }
+                if (is_ext_surface) {
+                    caps.surface_caps = mir_sast.EffectCapabilityMask.fromBits(
+                        caps.surface_caps.asBits() | m_bits,
+                    );
+                }
+                if (((method_sum.direct_effects_bits & mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS) != 0 or is_exported_sym) and
+                    first_leaf_span.file_id.isNone())
+                {
+                    first_leaf_span = sym.decl_span;
+                    if (sym.name_text.len > 0 and first_leaf_name.len == 0) {
+                        first_leaf_name = try out_allocator.dupe(u8, sym.name_text);
+                    }
+                }
+            }
+
+            if (!is_ext_surface) continue;
+            const vpath = if (self.vfs_source_map) |vmap| vmap.getFilePath(sym.decl_span.file_id) else "";
+            var path_hasher = std.hash.Wyhash.init(0);
+            path_hasher.update(vpath);
+            if (!sym.scope_id.isNone() and sym.scope_id.asInt() < self.symbol_table.scope_arena.scopes.len) {
+                const sym_scope_rec = self.symbol_table.scope_arena.scopes.get(sym.scope_id.asInt());
+                if (sym_scope_rec.kind == .nominal_type_scope and !sym_scope_rec.owner_def_id.isNone()) {
+                    if (self.symbol_table.def_to_symbol.get(sym_scope_rec.owner_def_id.asInt())) |owner_sym_idx| {
+                        if (!owner_sym_idx.isNone() and owner_sym_idx.asInt() < self.symbol_table.countSymbols()) {
+                            path_hasher.update("::");
+                            path_hasher.update(self.symbol_table.getSymbol(owner_sym_idx).name_text);
+                        }
+                    }
+                }
+            }
+            if (self.symbol_table.impl_method_trait.get(sym_i)) |trait_sym_idx| {
+                if (!trait_sym_idx.isNone() and trait_sym_idx.asInt() < self.symbol_table.countSymbols()) {
+                    path_hasher.update("::");
+                    path_hasher.update(self.symbol_table.getSymbol(trait_sym_idx).name_text);
+                }
+            }
+            path_hasher.update("::");
+            path_hasher.update(sym.name_text);
+            const path_hash64 = path_hasher.final();
+
+            if (sym.kind == .fn_sym) {
+                var sig_hasher = StructuralHasher.init();
+                hashTypeCanonical(&sig_hasher, &self.type_pool, &self.symbol_table, sym.type_id);
+                for (self.symbol_table.getFnParamSpecs(sym_idx)) |pspec| {
+                    if (!pspec.is_positional_only) {
+                        hashSymbolTextCanonical(&sig_hasher, &self.interner, pspec.name);
+                    }
+                    sig_hasher.updateU8(@intFromBool(pspec.has_default));
+                }
+                const sig_fp = sig_hasher.final();
+                const fn_sum = if (self.sast_sym_summaries.get(sym_i)) |msum|
+                    msum
+                else if (!sym.def_id.isNone())
+                    (self.sast_summaries.get(sym.def_id.asInt()) orelse mir_sast.FnRegionSummary{})
+                else
+                    mir_sast.FnRegionSummary{};
+                var obs_buf: [34]u8 = undefined;
+                fn_sum.writeObservableBytes(&obs_buf);
+                var sum_words: [5]u64 = @splat(0);
+                @memcpy(std.mem.sliceAsBytes(&sum_words)[0..34], &obs_buf);
+
+                try fn_records.append(self.allocator, .{
+                    .symbol_path_hash = path_hash64,
+                    .sig_type_hash = sig_fp.low,
+                    .shape_hash64 = sig_fp.high,
+                    .summary_bits = sum_words,
+                });
+            } else if (sym.kind == .struct_sym or sym.kind == .enum_sym or sym.kind == .union_sym or
+                sym.kind == .bit_field_sym or sym.kind == .trait_sym or sym.kind == .type_alias_sym or
+                sym.kind == .distinct_type_sym or sym.kind == .refined_type_sym)
+            {
+                const field_h64 = computeNominalFieldHash64(
+                    &self.type_pool,
+                    &self.symbol_table,
+                    sym.type_id,
+                    active_layout,
+                ).asInt();
+                const layout_rec = buildCxTypeLayoutRecord(
+                    &self.type_pool,
+                    &self.symbol_table,
+                    sym.type_id,
+                    active_layout,
+                );
+                const byte_align_u32: u32 = if (layout_rec.align_log2 < 32)
+                    @as(u32, 1) << @intCast(layout_rec.align_log2)
+                else
+                    1;
+                try type_records.append(self.allocator, .{
+                    .symbol_path_hash = path_hash64,
+                    .shape_hash64 = layout_rec.layout_shape_hash64,
+                    .field_hash64 = field_h64,
+                    .layout_meta = .{
+                        layout_rec.byte_size,
+                        byte_align_u32,
+                        @as(u32, layout_rec.fields_len),
+                        @as(u32, layout_rec.kind_flags),
+                    },
+                });
+            }
+        }
+
+        std.mem.sort(pkg_cxi_seam.CxiFnRecord, fn_records.items, {}, struct {
+            /// Sorts `CxiFnRecord` entries in ascending `(symbol_path_hash, sig_type_hash)` order.
+            fn lessThan(_: void, lhs: pkg_cxi_seam.CxiFnRecord, rhs: pkg_cxi_seam.CxiFnRecord) bool {
+                if (lhs.symbol_path_hash != rhs.symbol_path_hash) return lhs.symbol_path_hash < rhs.symbol_path_hash;
+                return lhs.sig_type_hash < rhs.sig_type_hash;
+            }
+        }.lessThan);
+        std.mem.sort(pkg_cxi_seam.CxiTypeRecord, type_records.items, {}, struct {
+            /// Sorts `CxiTypeRecord` entries in ascending `(symbol_path_hash, field_hash64)` order.
+            fn lessThan(_: void, lhs: pkg_cxi_seam.CxiTypeRecord, rhs: pkg_cxi_seam.CxiTypeRecord) bool {
+                if (lhs.symbol_path_hash != rhs.symbol_path_hash) return lhs.symbol_path_hash < rhs.symbol_path_hash;
+                return lhs.field_hash64 < rhs.field_hash64;
+            }
+        }.lessThan);
+
+        const surf_bits: u16 = (caps.surface_caps.asBits() | caps.link_ambient_caps.asBits() |
+            inactive_agg.pub_inactive_caps_bits | inactive_agg.link_ambient_inactive_caps_bits) &
+            mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
+        const amb_bits: u16 = (caps.ambient_caps.asBits() | caps.link_ambient_caps.asBits() |
+            inactive_agg.all_inactive_caps_bits) & mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
+
+        const cxi_bytes = pkg_cxi_seam.serializeCxiSummary(
+            out_allocator,
+            surf_bits,
+            amb_bits,
+            fn_records.items,
+            type_records.items,
+        ) catch return error.OutOfMemory;
+        const hdr = std.mem.bytesAsValue(pkg_cxi_seam.CxiHeader, cxi_bytes[0..64]).*;
+        return .{
+            .bytes = cxi_bytes,
+            .cxi_blake3 = hdr.cxi_digest,
+            .caps = caps,
+            .inactive_scan = inactive_agg,
+            .first_cap_leaf_span = first_leaf_span,
+            .first_cap_leaf_name = first_leaf_name,
+        };
+    }
+
+    /// Appends `Drop.drop` (and nested field `Drop`) call-graph edges for `type_sym` onto `call_adj` and `call_witnesses`.
+    fn appendNominalTypeDropEdgesBounded(
+        self: *CompilerDb,
+        witness_arena: *mem_foundation.BumpArena,
+        caller_pkg: PackageId,
+        caller_fid: FileId,
+        caller_def: DefId,
+        caller_name: []const u8,
+        type_sym: symbol_resolver.SymbolRecord,
+        drop_sym_id: SymbolId,
+        call_adj: *std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(DefId)),
+        call_witnesses: *std.ArrayListUnmanaged(mir_sast.CrossPackageCallWitness),
+        depth: u8,
+    ) !void {
+        if (depth >= 8 or type_sym.target_scope.isNone()) return;
+
+        const drop_idx = self.symbol_table.lookupInScopeDirect(
+            type_sym.target_scope,
+            drop_sym_id,
+            symbol_resolver.NamespaceMask.VALUE_ONLY,
+        );
+        if (!drop_idx.isNone() and drop_idx.asInt() < self.symbol_table.countSymbols()) {
+            const drop_sym = self.symbol_table.getSymbol(drop_idx).*;
+            const drop_def = if (!drop_sym.def_id.isNone()) drop_sym.def_id else drop_sym.owner_def_id;
+            if (!drop_def.isNone() and drop_def != caller_def) {
+                const adj_gop = try call_adj.getOrPut(self.allocator, caller_def.asInt());
+                if (!adj_gop.found_existing) adj_gop.value_ptr.* = .empty;
+                try adj_gop.value_ptr.append(self.allocator, drop_def);
+
+                const drop_pkg = self.symbol_table.getFilePackageId(drop_sym.decl_span.file_id);
+                if (drop_pkg != caller_pkg and drop_pkg != .std_core and !drop_sym.decl_span.file_id.isNone()) {
+                    var caller_span = Span.init(caller_fid, 0, 0);
+                    if (self.symbol_table.def_to_symbol.get(caller_def.asInt())) |caller_sym_idx| {
+                        if (!caller_sym_idx.isNone()) {
+                            caller_span = self.symbol_table.getSymbol(caller_sym_idx).decl_span;
+                        }
+                    }
+                    const caller_pkg_name = if (self.symbol_table.package_metas.get(caller_pkg)) |meta|
+                        meta.canonical_name
+                    else
+                        "root";
+                    const drop_pkg_name = if (self.symbol_table.package_metas.get(drop_pkg)) |meta|
+                        meta.canonical_name
+                    else
+                        "dep";
+                    const caller_lbl = try std.fmt.allocPrint(
+                        witness_arena.asAllocator(),
+                        "{s}.{s}",
+                        .{ caller_pkg_name, caller_name },
+                    );
+                    const callee_lbl = try std.fmt.allocPrint(
+                        witness_arena.asAllocator(),
+                        "{s}.{s}.drop",
+                        .{ drop_pkg_name, type_sym.name_text },
+                    );
+                    try call_witnesses.append(self.allocator, .{
+                        .caller_pkg = caller_pkg,
+                        .callee_pkg = drop_pkg,
+                        .caller_label = caller_lbl,
+                        .callee_label = callee_lbl,
+                        .call_span = caller_span,
+                    });
+                }
+            }
+        }
+
+        for (self.symbol_table.getScopeMembers(type_sym.target_scope)) |mem_idx| {
+            const mem_sym = self.symbol_table.getSymbol(mem_idx).*;
+            if (mem_sym.kind != .field_sym and mem_sym.kind != .enum_variant_sym) continue;
+            if (mem_sym.type_id.isError()) continue;
+            if (self.symbol_table.type_to_symbol.get(mem_sym.type_id.toU32())) |field_ty_sym_idx| {
+                if (!field_ty_sym_idx.isNone() and field_ty_sym_idx.asInt() < self.symbol_table.countSymbols()) {
+                    try self.appendNominalTypeDropEdgesBounded(
+                        witness_arena,
+                        caller_pkg,
+                        caller_fid,
+                        caller_def,
+                        caller_name,
+                        self.symbol_table.getSymbol(field_ty_sym_idx).*,
+                        drop_sym_id,
+                        call_adj,
+                        call_witnesses,
+                        depth + 1,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Verifies `DR-17` §3.1 whole-workspace capability monotonicity (`E0324`), shortest cross-pkg witnesses, and `W0330`.
+    pub fn verifyWorkspaceCapabilitySandbox(
+        self: *CompilerDb,
+        out_allocator: std.mem.Allocator,
+        pkg_order: []const PackageId,
+        pkg_files_map: *const std.AutoHashMapUnmanaged(PackageId, []const FileId),
+        edges: []const mir_sast.WorkspacePackageEdge,
+        diagnostic_sink: ?*DiagnosticSink,
+    ) QueryError![]mir_sast.WorkspacePackageCapReport {
+        var cxi_artifacts: std.ArrayListUnmanaged(PackageCxiArtifact) = .empty;
+        defer {
+            for (cxi_artifacts.items) |*art| art.deinit(self.allocator);
+            cxi_artifacts.deinit(self.allocator);
+        }
+
+        // Collect cross-package call-site witnesses and root call-graph reachability from `def_side_tables`:
+        const drop_sym_id = self.interner.intern("drop") catch return error.OutOfMemory;
+        var witness_arena = mem_foundation.BumpArena.init(self.allocator);
+        defer witness_arena.deinit();
+        var call_witnesses: std.ArrayListUnmanaged(mir_sast.CrossPackageCallWitness) = .empty;
+        defer call_witnesses.deinit(self.allocator);
+        var call_adj: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(DefId)) = .empty;
+        defer {
+            var adj_it = call_adj.valueIterator();
+            while (adj_it.next()) |list_ptr| list_ptr.deinit(self.allocator);
+            call_adj.deinit(self.allocator);
+        }
+        var root_queue: std.ArrayListUnmanaged(DefId) = .empty;
+        defer root_queue.deinit(self.allocator);
+        var visited_defs: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer visited_defs.deinit(self.allocator);
+        var seen_drop_tys: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer seen_drop_tys.deinit(self.allocator);
+
+        for (pkg_order) |pkg_id| {
+            const pkg_files = pkg_files_map.get(pkg_id) orelse &.{};
+            const art = try self.computePackageCxiSummary(self.allocator, pkg_id, pkg_files);
+            try cxi_artifacts.append(self.allocator, art);
+
+            for (pkg_files) |fid| {
+                const entries = (try self.extractItemTree(fid)).entries;
+                for (entries) |entry| {
+                    if (pkg_id == .root) {
+                        const gop = try visited_defs.getOrPut(self.allocator, entry.def_id.asInt());
+                        if (!gop.found_existing) try root_queue.append(self.allocator, entry.def_id);
+                    }
+                    if (self.def_side_tables.getPtr(entry.def_id.asInt())) |st_ptr| {
+                        seen_drop_tys.clearRetainingCapacity();
+                        for (st_ptr.node_symbols) |raw_sym_idx| {
+                            if (raw_sym_idx.isNone() or raw_sym_idx.asInt() >= self.symbol_table.countSymbols()) continue;
+                            var target_sym = self.symbol_table.getSymbol(raw_sym_idx).*;
+                            var hops: u8 = 0;
+                            while (target_sym.kind == .use_alias_sym and !target_sym.target_symbol.isNone() and
+                                target_sym.target_symbol.asInt() < self.symbol_table.countSymbols() and hops < 16) : (hops += 1)
+                            {
+                                target_sym = self.symbol_table.getSymbol(target_sym.target_symbol).*;
+                            }
+                            const callee_def = if (!target_sym.def_id.isNone()) target_sym.def_id else target_sym.owner_def_id;
+                            if (!callee_def.isNone() and callee_def != entry.def_id) {
+                                const adj_gop = try call_adj.getOrPut(self.allocator, entry.def_id.asInt());
+                                if (!adj_gop.found_existing) adj_gop.value_ptr.* = .empty;
+                                try adj_gop.value_ptr.append(self.allocator, callee_def);
+                            }
+                            if (target_sym.namespace == .type_ns and !target_sym.target_scope.isNone()) {
+                                try self.appendNominalTypeDropEdgesBounded(
+                                    &witness_arena,
+                                    pkg_id,
+                                    fid,
+                                    entry.def_id,
+                                    entry.name_text,
+                                    target_sym,
+                                    drop_sym_id,
+                                    &call_adj,
+                                    &call_witnesses,
+                                    0,
+                                );
+                            }
+                            const callee_pkg = self.symbol_table.getFilePackageId(target_sym.decl_span.file_id);
+                            if (callee_pkg != pkg_id and callee_pkg != .std_core and !target_sym.decl_span.file_id.isNone()) {
+                                var caller_span = Span.init(fid, 0, 0);
+                                if (self.symbol_table.def_to_symbol.get(entry.def_id.asInt())) |caller_sym_idx| {
+                                    if (!caller_sym_idx.isNone()) {
+                                        caller_span = self.symbol_table.getSymbol(caller_sym_idx).decl_span;
+                                    }
+                                }
+                                const caller_pkg_name = if (self.symbol_table.package_metas.get(pkg_id)) |meta|
+                                    meta.canonical_name
+                                else
+                                    "root";
+                                const callee_pkg_name = if (self.symbol_table.package_metas.get(callee_pkg)) |meta|
+                                    meta.canonical_name
+                                else
+                                    "dep";
+                                const caller_lbl = try std.fmt.allocPrint(
+                                    witness_arena.asAllocator(),
+                                    "{s}.{s}",
+                                    .{ caller_pkg_name, entry.name_text },
+                                );
+                                const callee_lbl = try std.fmt.allocPrint(
+                                    witness_arena.asAllocator(),
+                                    "{s}.{s}",
+                                    .{ callee_pkg_name, target_sym.name_text },
+                                );
+                                try call_witnesses.append(self.allocator, .{
+                                    .caller_pkg = pkg_id,
+                                    .callee_pkg = callee_pkg,
+                                    .caller_label = caller_lbl,
+                                    .callee_label = callee_lbl,
+                                    .call_span = caller_span,
+                                });
+                            }
+                        }
+                        for (st_ptr.node_types) |node_ty| {
+                            if (node_ty.isError()) continue;
+                            const ty_gop = try seen_drop_tys.getOrPut(self.allocator, node_ty.toU32());
+                            if (ty_gop.found_existing) continue;
+                            if (self.symbol_table.type_to_symbol.get(node_ty.toU32())) |ty_sym_idx| {
+                                if (!ty_sym_idx.isNone() and ty_sym_idx.asInt() < self.symbol_table.countSymbols()) {
+                                    try self.appendNominalTypeDropEdgesBounded(
+                                        &witness_arena,
+                                        pkg_id,
+                                        fid,
+                                        entry.def_id,
+                                        entry.name_text,
+                                        self.symbol_table.getSymbol(ty_sym_idx).*,
+                                        drop_sym_id,
+                                        &call_adj,
+                                        &call_witnesses,
+                                        0,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // BFS from `PackageId.root` definitions for `.reachable` enforcement scope:
+        var reachable_by_pkg: std.AutoHashMapUnmanaged(PackageId, u16) = .empty;
+        defer reachable_by_pkg.deinit(self.allocator);
+        var bfs_head: usize = 0;
+        while (bfs_head < root_queue.items.len) : (bfs_head += 1) {
+            const cur_def = root_queue.items[bfs_head];
+            const def_pkg = self.symbol_table.getFilePackageId(cur_def.fileId());
+            if (self.sast_summaries.get(cur_def.asInt())) |sum_rec| {
+                const prev_bits = reachable_by_pkg.get(def_pkg) orelse 0;
+                const add_bits = (sum_rec.inferred_effects_bits | sum_rec.direct_effects_bits) &
+                    mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
+                try reachable_by_pkg.put(self.allocator, def_pkg, prev_bits | add_bits);
+            }
+            if (call_adj.getPtr(cur_def.asInt())) |callees| {
+                for (callees.items) |next_def| {
+                    const gop = try visited_defs.getOrPut(self.allocator, next_def.asInt());
+                    if (!gop.found_existing) try root_queue.append(self.allocator, next_def);
+                }
+            }
+        }
+
+        var cap_inputs: std.ArrayListUnmanaged(mir_sast.WorkspacePackageCapInput) = .empty;
+        defer cap_inputs.deinit(self.allocator);
+        try cap_inputs.ensureTotalCapacity(self.allocator, pkg_order.len);
+
+        for (pkg_order, 0..) |pkg_id, idx| {
+            const art = cxi_artifacts.items[idx];
+            const policy = self.package_cap_policies.get(pkg_id) orelse mir_sast.PackageCapPolicy{
+                .package_name = if (self.symbol_table.package_metas.get(pkg_id)) |meta| meta.canonical_name else "root",
+                .is_third_party_dependency = pkg_id.asInt() >= 2,
+            };
+            const reach_mask = mir_sast.EffectCapabilityMask.fromBits(reachable_by_pkg.get(pkg_id) orelse 0);
+            cap_inputs.appendAssumeCapacity(.{
+                .pkg_id = pkg_id,
+                .package_name = policy.package_name,
+                .caps = art.caps,
+                .inactive_caps = mir_sast.EffectCapabilityMask.fromBits(art.inactive_scan.all_inactive_caps_bits),
+                .pub_inactive_caps = mir_sast.EffectCapabilityMask.fromBits(art.inactive_scan.pub_inactive_caps_bits),
+                .first_inactive_cap_span = art.inactive_scan.first_inactive_cap_span,
+                .root_callgraph_reachable_caps = reach_mask,
+                .first_cap_leaf_span = art.first_cap_leaf_span,
+                .first_cap_leaf_name = art.first_cap_leaf_name,
+                .policy = policy,
+            });
+        }
+
+        return mir_sast.verifyWorkspaceCapabilitySandbox(
+            out_allocator,
+            cap_inputs.items,
+            edges,
+            call_witnesses.items,
+            diagnostic_sink,
+        ) catch return error.OutOfMemory;
     }
 };
 
@@ -10671,4 +12869,82 @@ test "test_c_import_transitive_include_mutation_invalidates_cache_and_signatures
     const cycle_sum = CompilerDb.makeConservativeCycleSummary(&db, .NONE, .none);
     try std.testing.expectEqual(@as(u16, 0x3FFF), cycle_sum.direct_effects_bits);
     try std.testing.expectEqual(@as(u16, 0x3FFF), cycle_sum.inferred_effects_bits);
+}
+
+test "test_phase9_c_include_escape_incremental_cxi_and_drop_surface_caps" {
+    const allocator = std.testing.allocator;
+
+    // [1] Comment-masked & depth-aware `#include` sandbox verification (`CRITICAL-05`):
+    try std.testing.expect(CompilerDb.hasEscapingCIncludeDirective("/* lead */ # /* mid */ include \"../outside.h\"\n", 0));
+    try std.testing.expect(!CompilerDb.hasEscapingCIncludeDirective("/* ok */ #include \"../sibling.h\"\n", 1));
+    try std.testing.expect(CompilerDb.hasEscapingCIncludeDirective("#include \"../../outside.h\"\n", 1));
+    try std.testing.expectEqual(@as(?usize, 2), CompilerDb.computeNormalizedRelDirDepth("include/sub/api.h"));
+    try std.testing.expectEqual(@as(?usize, null), CompilerDb.computeNormalizedRelDirDepth("../escape.h"));
+
+    // [2] Incremental `setInput` `.cxi` determinism (`VERIFIER-04`) + `impl Drop` & top-level `asm` (`CRITICAL-02`, `HIGH-01`):
+    const src_v1 =
+        \\extern "C" {
+        \\    fn sneaky_ffi();
+        \\}
+        \\pub struct Guard {
+        \\    pub id: i32,
+        \\}
+        \\impl Drop for Guard {
+        \\    fn drop(&mut self) {
+        \\        unsafe { sneaky_ffi(); }
+        \\    }
+        \\}
+        \\pub fn compute(val: i32) -> i32 = val + 1;
+    ;
+    const src_v2 =
+        \\extern "C" {
+        \\    fn sneaky_ffi();
+        \\}
+        \\pub struct Guard {
+        \\    pub id: i32,
+        \\}
+        \\impl Drop for Guard {
+        \\    fn drop(&mut self) {
+        \\        unsafe { sneaky_ffi(); }
+        \\    }
+        \\}
+        \\pub fn compute(val: i32) -> i32 = val + 99;
+    ;
+
+    var db_inc = try CompilerDb.init(allocator);
+    defer db_inc.deinit();
+    const fid = FileId.fromInt(310);
+    const pkg_two = PackageId.fromInt(2);
+    try db_inc.setFilePackageId(fid, pkg_two);
+    _ = try db_inc.setInput(fid, src_v1, .medium);
+    var cxi_v1 = try db_inc.computePackageCxiSummary(allocator, pkg_two, &.{fid});
+    defer cxi_v1.deinit(allocator);
+    try std.testing.expect(cxi_v1.caps.surface_caps.unsafe_op);
+
+    _ = try db_inc.setInput(fid, src_v2, .medium);
+    var cxi_v2_inc = try db_inc.computePackageCxiSummary(allocator, pkg_two, &.{fid});
+    defer cxi_v2_inc.deinit(allocator);
+
+    var db_fresh = try CompilerDb.init(allocator);
+    defer db_fresh.deinit();
+    try db_fresh.setFilePackageId(fid, pkg_two);
+    _ = try db_fresh.setInput(fid, src_v2, .medium);
+    var cxi_v2_fresh = try db_fresh.computePackageCxiSummary(allocator, pkg_two, &.{fid});
+    defer cxi_v2_fresh.deinit(allocator);
+
+    try std.testing.expectEqualSlices(u8, &cxi_v2_fresh.cxi_blake3, &cxi_v2_inc.cxi_blake3);
+
+    const src_v3 = src_v2 ++ "\npub fn extra_item() -> i32 = 7;\n";
+    _ = try db_inc.setInput(fid, src_v3, .medium);
+    var cxi_v3_inc = try db_inc.computePackageCxiSummary(allocator, pkg_two, &.{fid});
+    defer cxi_v3_inc.deinit(allocator);
+
+    var db_fresh_v3 = try CompilerDb.init(allocator);
+    defer db_fresh_v3.deinit();
+    try db_fresh_v3.setFilePackageId(fid, pkg_two);
+    _ = try db_fresh_v3.setInput(fid, src_v3, .medium);
+    var cxi_v3_fresh = try db_fresh_v3.computePackageCxiSummary(allocator, pkg_two, &.{fid});
+    defer cxi_v3_fresh.deinit(allocator);
+
+    try std.testing.expectEqualSlices(u8, &cxi_v3_fresh.cxi_blake3, &cxi_v3_inc.cxi_blake3);
 }

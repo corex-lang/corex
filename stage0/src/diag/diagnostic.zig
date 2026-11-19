@@ -162,239 +162,255 @@ pub const DiagnosticCode = enum(u16) {
     e0008_linker_invocation_failed = 7,
     /// C11/C23 header preprocessing, parsing, or `@c_import` / `translate-c` translation failure (`E0009`).
     e0009_c_header_translation_failed = 8,
+    /// Unsatisfiable SemVer, feature, or `[resolution].exclude` package dependency graph (`E0010`).
+    e0010_unsatisfiable_dependency_graph = 9,
+    /// Two or more resolved packages declare the same native C `links` library key (`E0011`).
+    e0011_native_links_collision = 10,
+    /// Nominal `.cxi` type mismatch across coexisting major versions of the same package (`E0012`).
+    e0012_cross_major_cxi_type_mismatch = 11,
+    /// Malformed `corex.toml` manifest, script frontmatter, or non-canonical package/alias name (`E0013`).
+    e0013_invalid_manifest_or_pkg_name = 12,
+    /// Missing, drifted, or corrupt `corex.lock` under `--locked` or `--frozen` (`E0014`).
+    e0014_lockfile_drift_or_corrupt = 13,
+    /// Content-addressable cache BLAKE3, Bao, Ed25519, or RFC 6962 transparency-log mismatch (`E0015`).
+    e0015_cache_integrity_mismatch = 14,
+    /// Package fetch failure or missing cached artifact under `--offline` / `COREX_HERMETIC=1` (`E0016`).
+    e0016_offline_or_fetch_failed = 15,
 
     // E01xx; Lexical Scanning, UTF-8 & Literal Rules:
     /// Invalid UTF-8 byte sequence in source file (`E0101`).
-    e0101_invalid_utf8_sequence = 9,
+    e0101_invalid_utf8_sequence = 16,
     /// Unterminated string or character literal (`E0102`).
-    e0102_unterminated_string_literal = 10,
+    e0102_unterminated_string_literal = 17,
     /// Malformed numeric literal or invalid digit separator (`E0103`).
-    e0103_invalid_numeric_literal = 11,
+    e0103_invalid_numeric_literal = 18,
     /// File token count exceeds `MAX_TOKENS_PER_FILE` (`E0104`).
-    e0104_token_limit_exceeded = 12,
+    e0104_token_limit_exceeded = 19,
     /// Retired `::` path separator (`E0112`).
-    e0112_retired_path_separator = 13,
+    e0112_retired_path_separator = 20,
     /// Retired `&&` logical AND operator (`E0113`).
-    e0113_retired_logical_and = 14,
+    e0113_retired_logical_and = 21,
     /// Invalid `\{` or `\}` brace escape in interpolated string (`E0114`).
-    e0114_invalid_brace_escape = 15,
+    e0114_invalid_brace_escape = 22,
     /// Multiline `"""` delimiter not immediately followed by newline (`E0115`).
-    e0115_multiline_string_opening = 16,
+    e0115_multiline_string_opening = 23,
     /// Multiline `"""` content line under-indented or mixes leading tabs and spaces (`E0116`).
-    e0116_multiline_string_indent = 17,
+    e0116_multiline_string_indent = 24,
     /// Non-ASCII byte (`> 0x7F`) in `b'…'` or `b"…"` byte literal (`E0117`).
-    e0117_non_ascii_byte_literal = 18,
+    e0117_non_ascii_byte_literal = 25,
 
     // E02xx; Syntax Parsing, Recovery & Casing:
     /// Unexpected token in grammar production (`E0201`).
-    e0201_unexpected_token = 19,
+    e0201_unexpected_token = 26,
     /// Unclosed block, group, or generic delimiter (`E0202`).
-    e0202_unclosed_delimiter = 20,
+    e0202_unclosed_delimiter = 27,
     /// Parser recursion depth exceeded `MAX_PARSE_DEPTH` (`E0203`).
-    e0203_parse_depth_exceeded = 21,
+    e0203_parse_depth_exceeded = 28,
     /// Invalid pattern binding inside a negated, disjunctive, or non-condition `is` test (`E0214`).
-    e0214_invalid_condition_binding = 22,
+    e0214_invalid_condition_binding = 29,
     /// Condition `:=` binding outside a parenthesized positive `if`/`while` header (`E0215`).
-    e0215_invalid_walrus_position = 23,
+    e0215_invalid_walrus_position = 30,
     /// Retired `if let` or `while let` conditional destructuring syntax (`E0216`).
-    e0216_retired_if_while_let = 24,
+    e0216_retired_if_while_let = 31,
     /// Direct `core` kernel import or path outside `--internal-core` (`E0218`).
-    e0218_direct_core_import_forbidden = 25,
+    e0218_direct_core_import_forbidden = 32,
     /// Retired infix `||` logical OR operator (`E0219`).
-    e0219_retired_logical_or = 26,
+    e0219_retired_logical_or = 33,
     /// Retired prefix `!` negation operator (`E0220`).
-    e0220_retired_bang_prefix = 27,
+    e0220_retired_bang_prefix = 34,
     /// Retired local mutability or parameter mode spelling (`E0221`).
-    e0221_retired_mutability_or_param_mode = 28,
+    e0221_retired_mutability_or_param_mode = 35,
     /// Non-associative chained `A!B!C` result type (`E0222`).
-    e0222_chained_result_type = 29,
+    e0222_chained_result_type = 36,
     /// Retired `=` key-value separator inside `@attribute(…)` (`E0223`).
-    e0223_retired_attribute_eq = 30,
+    e0223_retired_attribute_eq = 37,
     /// Retired `;` member separator in `struct`, `union`, `enum`, or `bit_field` (`E0224`).
-    e0224_retired_semicolon_member_sep = 31,
+    e0224_retired_semicolon_member_sep = 38,
     /// Retired `@noalloc` attribute spelling (`E0225`).
-    e0225_retired_noalloc_attribute = 32,
+    e0225_retired_noalloc_attribute = 39,
     /// Retired `*const T` raw pointer syntax (`E0226`).
-    e0226_retired_const_raw_ptr = 33,
+    e0226_retired_const_raw_ptr = 40,
     /// Retired prefix `*ptr` dereference syntax (`E0227`).
-    e0227_retired_prefix_deref = 34,
+    e0227_retired_prefix_deref = 41,
     /// Invalid `/` positional-only or `*` keyword-only parameter zone separator (`E0228`).
-    e0228_invalid_param_zone_separator = 35,
+    e0228_invalid_param_zone_separator = 42,
 
     // E03xx; MIR SAST Memory, Ownership, Capabilities & Exclusivity:
     /// Use of deallocated or freed value (`E0301`).
-    e0301_use_after_free = 36,
+    e0301_use_after_free = 43,
     /// Use of moved value after ownership transfer (`E0302`).
-    e0302_use_after_move = 37,
+    e0302_use_after_move = 44,
     /// Read of possibly uninitialized memory or binding (`E0303`).
-    e0303_uninitialized_memory_read = 38,
+    e0303_uninitialized_memory_read = 45,
     /// Unconsumed `@linear` resource or memory leak (`E0304`).
-    e0304_resource_or_memory_leak = 39,
+    e0304_resource_or_memory_leak = 46,
     /// Mutable aliasing or MVS loan exclusivity violation (`E0305`).
-    e0305_exclusivity_violation = 40,
+    e0305_exclusivity_violation = 47,
     /// Value escapes lexical arena or stack region (`E0306`).
-    e0306_region_escape_violation = 41,
+    e0306_region_escape_violation = 48,
     /// Compile-time proven out-of-bounds buffer access (`E0307`).
-    e0307_static_buffer_overflow = 42,
+    e0307_static_buffer_overflow = 49,
     /// Non-NUL-terminated `str` or slice passed to `@null_terminated` C FFI parameter (`E0308`).
-    e0308_unterminated_cstr_ffi = 43,
+    e0308_unterminated_cstr_ffi = 50,
     /// Concurrent mutable aliasing, `@thread_local` capture, or borrow escape across `TaskGroup`/`async` (`E0309`).
-    e0309_concurrent_exclusivity_or_escape = 44,
+    e0309_concurrent_exclusivity_or_escape = 51,
     /// `@owned_by_caller @free_with(fn)` FFI pointer released with mismatched deallocator (`E0310`).
-    e0310_mismatched_ffi_deallocator = 45,
+    e0310_mismatched_ffi_deallocator = 52,
     /// Unchecked dereference or `@non_null` use of `@may_be_null` FFI pointer (`E0311`).
-    e0311_unchecked_nullable_ffi_ptr = 46,
+    e0311_unchecked_nullable_ffi_ptr = 53,
     /// Raw pointer and length passed to `@slice_len` / `@byte_len` FFI without proven capacity (`E0312`).
-    e0312_unproven_ffi_slice_len = 47,
+    e0312_unproven_ffi_slice_len = 54,
     /// Double free or duplicate `@linear` resource consumption (`E0313`).
-    e0313_double_free_or_close = 48,
+    e0313_double_free_or_close = 55,
     /// `FromBytes` / `IntoBytes` wire layout contract violation (`E0315`).
-    e0315_wire_layout_contract_violation = 49,
+    e0315_wire_layout_contract_violation = 56,
     /// Worst-case call stack exceeds `@max_stack` budget (`E0316`).
-    e0316_max_stack_budget_exceeded = 50,
+    e0316_max_stack_budget_exceeded = 57,
     /// Inline `async` state-machine frame subtree exceeds `16 KiB` cap or recurses unboxed (`E0317`).
-    e0317_async_inline_frame_exceeded = 51,
+    e0317_async_inline_frame_exceeded = 58,
     /// `@no_alloc` contract violated by heap allocation (`E0320`).
-    e0320_no_alloc_contract_violation = 52,
+    e0320_no_alloc_contract_violation = 59,
     /// `@no_panic` contract violated by residual trap path (`E0321`).
-    e0321_no_panic_contract_violation = 53,
+    e0321_no_panic_contract_violation = 60,
     /// `@no_block` contract violated by blocking operation (`E0322`).
-    e0322_no_block_contract_violation = 54,
+    e0322_no_block_contract_violation = 61,
     /// Trait `impl` method escalates signature contract (`E0323`).
-    e0323_trait_impl_effect_escalation = 55,
+    e0323_trait_impl_effect_escalation = 62,
     /// Package exceeds authorized capability policy (`E0324`).
-    e0324_package_capability_violation = 56,
+    e0324_package_capability_violation = 63,
     /// Forbidden capability in hermetic `comptime` context (`E0325`).
-    e0325_comptime_sandbox_violation = 57,
+    e0325_comptime_sandbox_violation = 64,
     /// `@embed_bytes` path escapes package sandbox root (`E0326`).
-    e0326_embed_path_escape = 58,
+    e0326_embed_path_escape = 65,
     /// Forbidden linker section or sandbox bypass attribute (`E0327`).
-    e0327_forbidden_sandbox_bypass_attribute = 59,
+    e0327_forbidden_sandbox_bypass_attribute = 66,
     /// Scratch arena rewind aliases caller output arena (`E0328`).
-    e0328_scratch_arena_ping_pong_conflict = 60,
+    e0328_scratch_arena_ping_pong_conflict = 67,
 
     // E04xx; Type System, Inference, Traits, Bounds & Error Semantics:
     /// Ambiguous overload call in explicit overload group (`E0400`).
-    e0400_ambiguous_overload = 61,
+    e0400_ambiguous_overload = 68,
     /// Mismatched types between expected and found expressions (`E0401`).
-    e0401_type_mismatch = 62,
+    e0401_type_mismatch = 69,
     /// Type does not satisfy constrained trait or type group bound (`E0402`).
-    e0402_unsatisfied_trait_bound = 63,
+    e0402_unsatisfied_trait_bound = 70,
     /// Unresolved identifier or symbol in scope (`E0403`).
-    e0403_unresolved_symbol = 64,
+    e0403_unresolved_symbol = 71,
     /// Conflicting concrete types for a Bind-Once Constrained Type Group (`E0404`).
-    e0404_bind_once_group_conflict = 65,
+    e0404_bind_once_group_conflict = 72,
     /// Distinct nominal type mixed with underlying representation without `as` or `~T` (`E0405`).
-    e0405_distinct_type_mixing = 66,
+    e0405_distinct_type_mixing = 73,
     /// Compile-time value or width violates range refinement or bit-field bounds (`E0406`).
-    e0406_range_refinement_violation = 67,
+    e0406_range_refinement_violation = 74,
     /// Contextual `.Variant` syntax cannot be resolved against expected type (`E0407`).
-    e0407_invalid_contextual_variant = 68,
+    e0407_invalid_contextual_variant = 75,
     /// Duplicate symbol definition in the same namespace and lexical scope (`E0408`).
-    e0408_duplicate_definition = 69,
+    e0408_duplicate_definition = 76,
     /// Access to a private item, field, or method outside its defining module (`E0409`).
-    e0409_private_symbol_access = 70,
+    e0409_private_symbol_access = 77,
     /// Postfix `?` operator used outside a fallible `T!E` or `T?` function (`E0410`).
-    e0410_try_outside_fallible_fn = 71,
+    e0410_try_outside_fallible_fn = 78,
     /// Propagated error type cannot be converted via `FromError` or `@from` (`E0411`).
-    e0411_missing_from_error_conversion = 72,
+    e0411_missing_from_error_conversion = 79,
     /// `let … else` guard block does not unconditionally diverge (`never`) (`E0412`).
-    e0412_let_else_not_diverging = 73,
+    e0412_let_else_not_diverging = 80,
     /// Unhandled `T!E` or `@must_use` value in expression statement (`E0413`).
-    e0413_unhandled_must_use_or_result = 74,
+    e0413_unhandled_must_use_or_result = 81,
     /// Forbidden bare `let _ = fallible()` discard of a `T!E` without `catch` (`E0414`).
-    e0414_bare_wildcard_result_discard = 75,
+    e0414_bare_wildcard_result_discard = 82,
     /// Non-exhaustive pattern arms in `match` expression (`E0415`).
-    e0415_non_exhaustive_match = 76,
+    e0415_non_exhaustive_match = 83,
     /// `$` length sentinel used outside indexable `[…]` brackets (`E0416`).
-    e0416_invalid_dollar_length_expr = 77,
+    e0416_invalid_dollar_length_expr = 84,
     /// Irrefutable bare identifier pattern in an `is` test (`E0418`).
-    e0418_irrefutable_is_binding = 78,
+    e0418_irrefutable_is_binding = 85,
     /// Invalid named or default call arguments at a call site (`E0419`).
-    e0419_invalid_call_arguments = 79,
+    e0419_invalid_call_arguments = 86,
     /// Missing active `own` marker at call site on named non-`Copy` binding (`E0420`).
-    e0420_missing_call_site_own = 80,
+    e0420_missing_call_site_own = 87,
     /// Bare by-value parameter `x: T` where `T` is non-`Copy` (`E0421`).
-    e0421_non_copy_value_parameter = 81,
+    e0421_non_copy_value_parameter = 88,
     /// `&out T` parameter contract violation at call site or function exit (`E0422`).
-    e0422_out_param_contract_violation = 82,
+    e0422_out_param_contract_violation = 89,
     /// `bit_field` width mismatch or invalid backed-enum, `bit_field`, or `bool` `as` cast (`E0423`).
-    e0423_invalid_bitfield_or_enum_cast = 83,
+    e0423_invalid_bitfield_or_enum_cast = 90,
     /// Retired `.len` or `.ptr` field access on slice, array, or `str` (`E0424`).
-    e0424_retired_slice_field_access = 84,
+    e0424_retired_slice_field_access = 91,
     /// Invalid `opaque` value usage or direct `*opaque` dereference (`E0425`).
-    e0425_invalid_opaque_type_usage = 85,
+    e0425_invalid_opaque_type_usage = 92,
     /// Non-defaulted generic parameter follows a defaulted generic parameter (`E0426`).
-    e0426_non_trailing_generic_default = 86,
+    e0426_non_trailing_generic_default = 93,
     /// Invalid `@derive(From)` enum layout or Type Group on error side of `T!Group` (`E0427`).
-    e0427_invalid_error_composition = 87,
+    e0427_invalid_error_composition = 94,
     /// Named argument passed to a `/` positional-only parameter (`E0428`).
-    e0428_named_arg_for_positional_only = 88,
+    e0428_named_arg_for_positional_only = 95,
     /// Positional argument passed to a `*` keyword-only parameter (`E0429`).
-    e0429_positional_arg_for_keyword_only = 89,
+    e0429_positional_arg_for_keyword_only = 96,
     /// Non-defaulted parameter follows a defaulted parameter before `*` (`E0430`).
-    e0430_non_default_after_default_param = 90,
+    e0430_non_default_after_default_param = 97,
     /// Invalid `FormatSpec` syntax or incompatible specifier for interpolated type or `@secret` (`E0431`).
-    e0431_invalid_format_specifier = 91,
+    e0431_invalid_format_specifier = 98,
     /// Missing non-defaulted struct field initializer without `..` or `..base` (`E0432`).
-    e0432_missing_struct_field_initializer = 92,
+    e0432_missing_struct_field_initializer = 99,
     /// Inaccessible private, `pub(super)`, or `pub(pkg)` symbol or struct field (`E0433`).
-    e0433_inaccessible_field_or_visibility = 93,
+    e0433_inaccessible_field_or_visibility = 100,
     /// Invalid non-place or immutable target in parallel destructuring assignment (`E0434`).
-    e0434_invalid_parallel_assign_target = 94,
+    e0434_invalid_parallel_assign_target = 101,
     /// Invalid, non-boolean, or undeclared feature predicate in `@cfg(…)` (`E0435`).
-    e0435_invalid_cfg_predicate = 95,
+    e0435_invalid_cfg_predicate = 102,
     /// `@builder_item` invoked outside an active `@builder` trailing block scope (`E0436`).
-    e0436_builder_item_outside_scope = 96,
+    e0436_builder_item_outside_scope = 103,
     /// Invalid labeled `match` `continue :label` target or state payload (`E0437`).
-    e0437_invalid_labeled_match_continue = 97,
+    e0437_invalid_labeled_match_continue = 104,
     /// Postfix `.await` used outside an `async fn`, `async` closure, or `async` block (`E0438`).
-    e0438_await_outside_async_context = 98,
+    e0438_await_outside_async_context = 105,
 
     // E05xx; Comptime Virtual Machine & MIR Lowering:
     /// Compile-time execution exceeded step fuel budget (`E0501`).
-    e0501_comptime_step_limit_exceeded = 99,
+    e0501_comptime_step_limit_exceeded = 106,
     /// Compile-time integer arithmetic overflow (`E0502`).
-    e0502_integer_constant_overflow = 100,
+    e0502_integer_constant_overflow = 107,
     /// Forbidden non-deterministic, FFI, I/O, or raw pointer-to-integer operation in `comptime` (`E0503`).
-    e0503_forbidden_comptime_operation = 101,
+    e0503_forbidden_comptime_operation = 108,
     /// Out-of-bounds array, slice, or virtual allocation access in `comptime` (`E0504`).
-    e0504_comptime_out_of_bounds = 102,
+    e0504_comptime_out_of_bounds = 109,
     /// Read from uninitialized virtual memory bytes in `comptime` (`E0505`).
-    e0505_comptime_uninitialized_read = 103,
+    e0505_comptime_uninitialized_read = 110,
     /// Null, misaligned, or dangling virtual pointer dereference in `comptime` (`E0506`).
-    e0506_comptime_invalid_pointer = 104,
+    e0506_comptime_invalid_pointer = 111,
     /// Division by zero, remainder by zero, or invalid shift count in `comptime` (`E0507`).
-    e0507_comptime_arithmetic_trap = 105,
+    e0507_comptime_arithmetic_trap = 112,
     /// Virtual heap, call depth, loop unroll, or `@embed_bytes` cap exceeded in `comptime` (`E0508`).
-    e0508_comptime_resource_limit_exceeded = 106,
+    e0508_comptime_resource_limit_exceeded = 113,
     /// Cyclic dependency across `const` or `comptime` evaluations (`E0509`).
-    e0509_comptime_evaluation_cycle = 107,
+    e0509_comptime_evaluation_cycle = 114,
     /// Failed `@compile_assert` or reached `@compile_error` intrinsic (`E0510`).
-    e0510_compile_assertion_failed = 108,
+    e0510_compile_assertion_failed = 115,
 
     // W00xx to W05xx; Subsystem Compiler Warnings:
     /// Deprecated CLI invocation or option (`W0001`).
-    w0001_deprecated_cli_option = 109,
+    w0001_deprecated_cli_option = 116,
     /// Redundant character escape sequence in literal (`W0101`).
-    w0101_redundant_escape_sequence = 110,
+    w0101_redundant_escape_sequence = 117,
     /// Identifier does not follow canonical CoreX casing (`W0201`).
-    w0201_non_canonical_identifier_case = 111,
+    w0201_non_canonical_identifier_case = 118,
     /// Unused region capability or linear binding (`W0308`).
-    w0308_unused_region_allocation = 112,
+    w0308_unused_region_allocation = 119,
     /// Slice or array bounds not statically proven under `--sast-strict` (`W0314`).
-    w0314_unproven_bounds_access = 113,
+    w0314_unproven_bounds_access = 120,
     /// Panic inside vacated non-`Copy` projection inserts abort guard (`W0329`).
-    w0329_vacated_projection_panic_abort = 114,
+    w0329_vacated_projection_panic_abort = 121,
     /// Unreachable high-risk capability exported by dependency (`W0330`).
-    w0330_ambient_dead_capability_in_dep = 115,
+    w0330_ambient_dead_capability_in_dep = 122,
     /// Unreachable pattern arm in `match` expression (`W0401`).
-    w0401_unreachable_pattern_arm = 116,
+    w0401_unreachable_pattern_arm = 123,
     /// Unused local variable binding or function parameter (`W0402`).
-    w0402_unused_binding = 117,
+    w0402_unused_binding = 124,
     /// Function exceeds MIR inlining cost threshold (`W0501`).
-    w0501_inlining_budget_exceeded = 118,
+    w0501_inlining_budget_exceeded = 125,
 
+    /// Ergonomic alias for undeclared `@cfg(cfg.feature.<name>)` predicates (`E0435`).
+    pub const e0435_unknown_cfg_feature: DiagnosticCode = .e0435_invalid_cfg_predicate;
     /// Ergonomic alias for `.e0502_integer_constant_overflow`.
     pub const e0502_integer_overflow: DiagnosticCode = .e0502_integer_constant_overflow;
 
@@ -545,6 +561,55 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .default_severity = .err,
         .title = "C header translation failure",
         .explanation = "C11/C23 header preprocessing, declaration parsing, or `@c_import` / `translate-c` ingestion failed.",
+    },
+    .{
+        .code = .e0010_unsatisfiable_dependency_graph,
+        .code_str = "E0010",
+        .default_severity = .err,
+        .title = "unsatisfiable package dependency graph",
+        .explanation = "No package version assignment satisfies all SemVer bounds, feature requirements, and `[resolution].exclude` rules.",
+    },
+    .{
+        .code = .e0011_native_links_collision,
+        .code_str = "E0011",
+        .default_severity = .err,
+        .title = "native C 'links' library collision",
+        .explanation = "At most one resolved package in a workspace build graph may claim a given native C `links` library key.",
+    },
+    .{
+        .code = .e0012_cross_major_cxi_type_mismatch,
+        .code_str = "E0012",
+        .default_severity = .err,
+        .title = "cross-major nominal package type mismatch",
+        .explanation = "Nominal `.cxi` types exported by coexisting major versions of the same package are distinct and cannot be mixed.",
+    },
+    .{
+        .code = .e0013_invalid_manifest_or_pkg_name,
+        .code_str = "E0013",
+        .default_severity = .err,
+        .title = "invalid 'corex.toml' manifest or package name",
+        .explanation = "Manifests and script frontmatter must follow the single-form `corex.toml` schema and `kebab-case` naming rules.",
+    },
+    .{
+        .code = .e0014_lockfile_drift_or_corrupt,
+        .code_str = "E0014",
+        .default_severity = .err,
+        .title = "missing, drifted, or corrupt 'corex.lock'",
+        .explanation = "`corex.lock` is malformed or out of sync with `corex.toml` while `--locked`, `--frozen`, or `COREX_HERMETIC=1` is active.",
+    },
+    .{
+        .code = .e0015_cache_integrity_mismatch,
+        .code_str = "E0015",
+        .default_severity = .err,
+        .title = "package cache cryptographic integrity mismatch",
+        .explanation = "A package archive, `.cxtree`, blob, Ed25519 signature, or RFC 6962 transparency-log proof failed verification.",
+    },
+    .{
+        .code = .e0016_offline_or_fetch_failed,
+        .code_str = "E0016",
+        .default_severity = .err,
+        .title = "package fetch failed or unavailable offline",
+        .explanation = "A required package artifact or sparse index entry could not be fetched or was missing from cache under `--offline`.",
     },
     .{
         .code = .e0101_invalid_utf8_sequence,
@@ -1329,7 +1394,7 @@ pub const DIAGNOSTIC_CODE_STR_MAP = blk: {
 };
 
 comptime {
-    std.debug.assert(DIAGNOSTIC_CATALOG.len == 119);
+    std.debug.assert(DIAGNOSTIC_CATALOG.len == 126);
     std.debug.assert(DIAGNOSTIC_CODE_STR_MAP.keys().len == DIAGNOSTIC_CATALOG.len);
     std.debug.assert(@typeInfo(DiagnosticCode).@"enum".field_names.len == DIAGNOSTIC_CATALOG.len);
     for (DIAGNOSTIC_CATALOG, 0..) |entry, i| {
@@ -1711,10 +1776,18 @@ test "test_diagnostic_sink_error_cap_and_patcher" {
     try std.testing.expectEqual(@as(u32, 1), outcome.applied_count);
     try std.testing.expectEqualStrings("call(&socket);", outcome.patched_source);
 
-    try std.testing.expectEqual(@as(usize, 119), DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 126), DIAGNOSTIC_CATALOG.len);
     try std.testing.expectEqual(
         DiagnosticCode.e0009_c_header_translation_failed,
         DiagnosticCode.fromCodeStr("E0009").?,
+    );
+    try std.testing.expectEqual(
+        DiagnosticCode.e0010_unsatisfiable_dependency_graph,
+        DiagnosticCode.fromCodeStr("E0010").?,
+    );
+    try std.testing.expectEqual(
+        DiagnosticCode.e0016_offline_or_fetch_failed,
+        DiagnosticCode.fromCodeStr("E0016").?,
     );
     try std.testing.expectEqual(
         DiagnosticCode.e0112_retired_path_separator,

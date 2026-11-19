@@ -2645,6 +2645,11 @@ const CstFormatter = struct {
                         try self.registerFixRename(tok_id, .snake_case);
                     }
                 },
+                .use_tree => {
+                    if (self.findInlineUseAliasIdentToken(node_id)) |tok_id| {
+                        try self.registerFixRename(tok_id, .snake_case);
+                    }
+                },
                 else => {},
             }
         }
@@ -2764,6 +2769,31 @@ const CstFormatter = struct {
             if (child.subtree_size == 1 and !self.shouldSkipLeaf(child)) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
                 if (tok_kind == .colon or tok_kind == .eq) break;
+            }
+            child_cursor += @max(@as(usize, 1), child.subtree_size);
+        }
+        return null;
+    }
+
+    /// Finds the `<snake_alias>` identifier token inside an inline `use "<spec>" as <alias>;` `.use_tree`.
+    fn findInlineUseAliasIdentToken(self: *const CstFormatter, tree_idx: CstNodeIndex) ?TokenIndex {
+        const tree = self.cst_arena.getNode(tree_idx);
+        const end_idx: usize = tree_idx.asInt() + tree.subtree_size;
+        var has_leading_string = false;
+        var has_seen_as = false;
+        var child_cursor: usize = tree_idx.asInt() + 1;
+        while (child_cursor < end_idx) {
+            const child = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(child_cursor)));
+            if (child.subtree_size == 1 and !self.shouldSkipLeaf(child)) {
+                const tok_kind = self.token_buffer.getToken(child.token).kind;
+                if (!has_leading_string) {
+                    if (tok_kind != .string_lit) return null;
+                    has_leading_string = true;
+                } else if (tok_kind == .kw_as) {
+                    has_seen_as = true;
+                } else if (has_seen_as and isRenamableIdentifierKind(tok_kind)) {
+                    return child.token;
+                }
             }
             child_cursor += @max(@as(usize, 1), child.subtree_size);
         }
@@ -7732,6 +7762,199 @@ const CstFormatter = struct {
     }
 };
 
+// ---------------- Script Frontmatter Splicing -----------------
+
+/// Byte-range metadata for an optional top-of-file `#!` + `--- … ---` script TOML frontmatter block.
+const ScriptFrontmatterPrefix = struct {
+    /// Byte offset immediately following the closing `---` fence line (including its line ending).
+    fence_end: usize,
+    /// `true` when at least one blank line separates the closing `---` fence from a non-empty `.cx` body.
+    has_blank_separator: bool,
+};
+
+/// Returns `true` when `line_no_nl` is a TOML frontmatter `---` delimiter followed only by `' '` or `'\t'`.
+fn isFrontmatterFenceLine(line_no_nl: []const u8) bool {
+    if (line_no_nl.len < 3 or !std.mem.startsWith(u8, line_no_nl, "---")) return false;
+    for (line_no_nl[3..]) |byte_val| {
+        if (byte_val != ' ' and byte_val != '\t') return false;
+    }
+    return true;
+}
+
+/// Returns `true` when `rest_slice` begins with an empty/whitespace-only line terminated by `\n`.
+fn hasLeadingBlankLineInSlice(rest_slice: []const u8) bool {
+    var idx: usize = 0;
+    while (idx < rest_slice.len) : (idx += 1) {
+        const byte_val = rest_slice[idx];
+        if (byte_val == '\n') return true;
+        if (byte_val == '\r') {
+            return idx + 1 < rest_slice.len and rest_slice[idx + 1] == '\n';
+        }
+        if (byte_val != ' ' and byte_val != '\t') return false;
+    }
+    return false;
+}
+
+/// Scans `source` for a top-of-file `[BOM][#!…\n]---\n…\n---[\n]` script TOML frontmatter prefix.
+fn extractScriptFrontmatterPrefix(source: []const u8) ?ScriptFrontmatterPrefix {
+    var cursor: usize = if (std.mem.startsWith(u8, source, "\xEF\xBB\xBF")) 3 else 0;
+    if (cursor < source.len and std.mem.startsWith(u8, source[cursor..], "#!")) {
+        const shebang_nl = std.mem.indexOfScalar(u8, source[cursor..], '\n') orelse return null;
+        cursor += shebang_nl + 1;
+    }
+    if (cursor >= source.len) return null;
+    const open_nl = std.mem.indexOfScalar(u8, source[cursor..], '\n') orelse return null;
+    const open_raw = source[cursor .. cursor + open_nl];
+    const open_line = if (open_raw.len > 0 and open_raw[open_raw.len - 1] == '\r')
+        open_raw[0 .. open_raw.len - 1]
+    else
+        open_raw;
+    if (!isFrontmatterFenceLine(open_line)) return null;
+    cursor += open_nl + 1;
+
+    while (cursor < source.len) {
+        if (std.mem.indexOfScalar(u8, source[cursor..], '\n')) |line_nl| {
+            const line_raw = source[cursor .. cursor + line_nl];
+            const line_clean = if (line_raw.len > 0 and line_raw[line_raw.len - 1] == '\r')
+                line_raw[0 .. line_raw.len - 1]
+            else
+                line_raw;
+            const next_cursor = cursor + line_nl + 1;
+            if (isFrontmatterFenceLine(line_clean)) {
+                return .{
+                    .fence_end = next_cursor,
+                    .has_blank_separator = hasLeadingBlankLineInSlice(source[next_cursor..]),
+                };
+            }
+            cursor = next_cursor;
+        } else {
+            const tail_raw = source[cursor..];
+            const tail_clean = if (tail_raw.len > 0 and tail_raw[tail_raw.len - 1] == '\r')
+                tail_raw[0 .. tail_raw.len - 1]
+            else
+                tail_raw;
+            if (isFrontmatterFenceLine(tail_clean)) {
+                return .{
+                    .fence_end = source.len,
+                    .has_blank_separator = false,
+                };
+            }
+            break;
+        }
+    }
+    return null;
+}
+
+/// Allocates a copy of `source` with non-newline bytes in `[0 .. fence_end)` blanked to `' '` (`0x20`).
+fn allocateMaskedFrontmatterSource(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    fence_end: usize,
+) ![]u8 {
+    const masked = try allocator.dupe(u8, source);
+    var i: usize = 0;
+    while (i < fence_end) : (i += 1) {
+        if (masked[i] != '\n' and masked[i] != '\r') {
+            masked[i] = ' ';
+        }
+    }
+    return masked;
+}
+
+/// Splices the script frontmatter `prefix` (normalizing `\r\n` to `\n`) onto the formatted `.cx` `body_text`.
+fn spliceFrontmatterAndBody(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    prefix: ScriptFrontmatterPrefix,
+    body_text: []const u8,
+) ![]u8 {
+    const raw_header = source[0..prefix.fence_end];
+    var cr_skip_count: usize = 0;
+    for (raw_header, 0..) |byte_val, i| {
+        if (byte_val == '\r' and (i + 1 == raw_header.len or raw_header[i + 1] == '\n')) {
+            cr_skip_count += 1;
+        }
+    }
+    const norm_header_len = raw_header.len - cr_skip_count;
+    const has_header_nl = raw_header.len > 0 and raw_header[raw_header.len - 1] == '\n';
+    const extra_header_nl: usize = if (!has_header_nl) 1 else 0;
+    const extra_sep_nl: usize = if (body_text.len > 0 and prefix.has_blank_separator) 1 else 0;
+
+    const total_len = norm_header_len + extra_header_nl + extra_sep_nl + body_text.len;
+    const out_buf = try allocator.alloc(u8, total_len);
+    var write_off: usize = 0;
+    if (cr_skip_count == 0) {
+        @memcpy(out_buf[0..raw_header.len], raw_header);
+        write_off = raw_header.len;
+    } else {
+        for (raw_header, 0..) |byte_val, i| {
+            if (byte_val == '\r' and (i + 1 == raw_header.len or raw_header[i + 1] == '\n')) continue;
+            out_buf[write_off] = byte_val;
+            write_off += 1;
+        }
+    }
+    if (extra_header_nl == 1) {
+        out_buf[write_off] = '\n';
+        write_off += 1;
+    }
+    if (extra_sep_nl == 1) {
+        out_buf[write_off] = '\n';
+        write_off += 1;
+    }
+    if (body_text.len > 0) {
+        @memcpy(out_buf[write_off .. write_off + body_text.len], body_text);
+    }
+    return out_buf;
+}
+
+/// Formats an already-masked `masked_source` with its corresponding `token_buffer` and `cst_arena`, then splices `prefix`.
+fn formatMaskedTokensAndCstWithPrefix(
+    allocator: std.mem.Allocator,
+    original_source: []const u8,
+    masked_source: []const u8,
+    prefix: ScriptFrontmatterPrefix,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    options: FormatOptions,
+) !FormatResult {
+    const is_fix_mode = options.is_fix_mode;
+    if (hasBlockingSyntaxErrors(token_buffer, cst_arena, is_fix_mode)) {
+        return .{
+            .formatted_text = try allocator.dupe(u8, original_source),
+            .is_changed = false,
+            .has_syntax_errors = true,
+        };
+    }
+
+    var doc_arena = DocArena.init(allocator);
+    defer doc_arena.deinit();
+
+    var cst_formatter = try CstFormatter.init(
+        allocator,
+        masked_source,
+        token_buffer,
+        cst_arena,
+        &doc_arena,
+        is_fix_mode,
+    );
+    defer cst_formatter.deinit();
+
+    try cst_formatter.formatRoot();
+
+    var renderer = DocRenderer.init(allocator, options.max_line_width);
+    defer renderer.deinit();
+
+    const formatted_body = try renderer.render(&doc_arena);
+    defer allocator.free(formatted_body);
+
+    const spliced = try spliceFrontmatterAndBody(allocator, original_source, prefix, formatted_body);
+    return .{
+        .formatted_text = spliced,
+        .is_changed = !std.mem.eql(u8, original_source, spliced),
+        .has_syntax_errors = false,
+    };
+}
+
 // ------------------------------------- PUBLIC API --------------------------------------
 
 /// Converts `ident` to `PascalCase` (`DR-03` Section 3.3 & `DR-14` Section 1.5).
@@ -7749,6 +7972,25 @@ pub fn formatTokensAndCst(
     cst_arena: *const LosslessCstArena,
     options: FormatOptions,
 ) !FormatResult {
+    if (extractScriptFrontmatterPrefix(source)) |prefix| {
+        const has_unmasked_frontmatter_tokens = token_buffer.countTokens() > 0 and
+            token_buffer.getToken(TokenIndex.fromInt(0)).byte_offset < prefix.fence_end;
+        if (has_unmasked_frontmatter_tokens) {
+            return formatSourceWithOptions(allocator, source, FileId.fromInt(0), options);
+        }
+        const masked_source = try allocateMaskedFrontmatterSource(allocator, source, prefix.fence_end);
+        defer allocator.free(masked_source);
+        return formatMaskedTokensAndCstWithPrefix(
+            allocator,
+            source,
+            masked_source,
+            prefix,
+            token_buffer,
+            cst_arena,
+            options,
+        );
+    }
+
     const is_fix_mode = options.is_fix_mode;
     const has_errors = hasBlockingSyntaxErrors(token_buffer, cst_arena, is_fix_mode);
     if (has_errors) {
@@ -7800,6 +8042,29 @@ pub fn formatSourceWithOptions(
     defer cst_arena.deinit();
     var ast_arena = AstArena.init(allocator);
     defer ast_arena.deinit();
+
+    if (extractScriptFrontmatterPrefix(source)) |prefix| {
+        const masked_source = try allocateMaskedFrontmatterSource(allocator, source, prefix.fence_end);
+        defer allocator.free(masked_source);
+        _ = try parser.parseSource(
+            masked_source,
+            file_id,
+            &token_buffer,
+            &cst_arena,
+            &ast_arena,
+            null,
+            null,
+        );
+        return formatMaskedTokensAndCstWithPrefix(
+            allocator,
+            source,
+            masked_source,
+            prefix,
+            &token_buffer,
+            &cst_arena,
+            options,
+        );
+    }
 
     _ = try parser.parseSource(
         source,
@@ -8475,4 +8740,62 @@ test "test_format_r1_wrapped_variadic_extern_fn_and_slice_rest_pattern_no_traili
     try std.testing.expect(!pass2.has_syntax_errors);
     try std.testing.expect(!pass2.is_changed);
     try std.testing.expectEqualStrings(pass1.formatted_text, pass2.formatted_text);
+}
+
+test "test_format_script_toml_frontmatter_and_inline_string_use_idempotency" {
+    const raw_script =
+        "#!/usr/bin/env corex\n" ++
+        "---\n" ++
+        "[dependencies]\n" ++
+        "corex-http = \"2.1.0\" # preserve verbatim TOML comment\n" ++
+        "---\n\n" ++
+        "use   \"https://github.com/org/repo.git#v1.0.0\"   as   repo_client ;\n\n" ++
+        "pub fn main() -> i32 { return 0; }\n";
+
+    var pass1 = try formatSource(std.testing.allocator, raw_script, FileId.fromInt(0));
+    defer pass1.deinit(std.testing.allocator);
+    try std.testing.expect(!pass1.has_syntax_errors);
+    try std.testing.expect(pass1.is_changed);
+
+    const expected =
+        "#!/usr/bin/env corex\n" ++
+        "---\n" ++
+        "[dependencies]\n" ++
+        "corex-http = \"2.1.0\" # preserve verbatim TOML comment\n" ++
+        "---\n\n" ++
+        "use \"https://github.com/org/repo.git#v1.0.0\" as repo_client;\n\n" ++
+        "pub fn main() -> i32 {\n" ++
+        "    return 0;\n" ++
+        "}\n";
+    try std.testing.expectEqualStrings(expected, pass1.formatted_text);
+
+    var pass2 = try formatSource(std.testing.allocator, pass1.formatted_text, FileId.fromInt(0));
+    defer pass2.deinit(std.testing.allocator);
+    try std.testing.expect(!pass2.has_syntax_errors);
+    try std.testing.expect(!pass2.is_changed);
+    try std.testing.expectEqualStrings(expected, pass2.formatted_text);
+
+    const fix_src = "use \"corex-http@^2.1.0\" as HttpClient\n";
+    var fix_res = try formatSourceWithOptions(
+        std.testing.allocator,
+        fix_src,
+        FileId.fromInt(1),
+        .{ .is_fix_mode = true },
+    );
+    defer fix_res.deinit(std.testing.allocator);
+    try std.testing.expect(!fix_res.has_syntax_errors);
+    try std.testing.expectEqualStrings("use \"corex-http@^2.1.0\" as http_client;\n", fix_res.formatted_text);
+
+    const crlf_script =
+        "#!/usr/bin/env corex\r\n" ++
+        "---\r\n" ++
+        "[dependencies]\r\n" ++
+        "corex-http = \"2.1.0\"\r\n" ++
+        "---\r\n\r\n" ++
+        "pub fn main() -> i32 { return 0; }\r\n";
+    var crlf_res = try formatSource(std.testing.allocator, crlf_script, FileId.fromInt(2));
+    defer crlf_res.deinit(std.testing.allocator);
+    try std.testing.expect(!crlf_res.has_syntax_errors);
+    try std.testing.expect(crlf_res.is_changed);
+    try std.testing.expect(std.mem.indexOfScalar(u8, crlf_res.formatted_text, '\r') == null);
 }

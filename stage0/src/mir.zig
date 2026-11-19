@@ -36,9 +36,11 @@ const parser = @import("parser.zig");
 const symbol_resolver = @import("symbol_resolver.zig");
 const type_system = @import("type_system.zig");
 const query_db = @import("query_db.zig");
+const vfs_sourcemap = @import("vfs_sourcemap.zig");
 const hir = @import("hir.zig");
 
 const FileId = mem_foundation.FileId;
+const PackageId = vfs_sourcemap.PackageId;
 const Span = mem_foundation.Span;
 const SymbolId = mem_foundation.SymbolId;
 const StringInterner = mem_foundation.StringInterner;
@@ -1025,14 +1027,18 @@ pub const MirBlobStore = struct {
     pub fn internBlob(self: *MirBlobStore, rel_path: []const u8, bytes: []const u8) !u32 {
         if (rel_path.len > 0) {
             if (self.path_to_blob_id.get(rel_path)) |existing_id| {
-                return existing_id;
+                if (existing_id < self.blobs.items.len and
+                    std.mem.eql(u8, self.blobs.items[existing_id], bytes))
+                {
+                    return existing_id;
+                }
             }
         }
         const blob_id: u32 = @intCast(self.blobs.items.len);
         const duped_bytes = try self.allocator.dupe(u8, bytes);
         errdefer self.allocator.free(duped_bytes);
         try self.blobs.append(self.allocator, duped_bytes);
-        if (rel_path.len > 0) {
+        if (rel_path.len > 0 and !self.path_to_blob_id.contains(rel_path)) {
             const duped_path = try self.allocator.dupe(u8, rel_path);
             errdefer self.allocator.free(duped_path);
             try self.owned_paths.append(self.allocator, duped_path);
@@ -1048,6 +1054,43 @@ pub const MirBlobStore = struct {
     }
 };
 
+/// Per-package sandbox policy governing `@embed_bytes` resolution (`DR-17` §5, `Fix-17` Gate D).
+pub const EmbedPackageJail = union(enum) {
+    /// Legacy single-file mode resolving through `virtual_files` or `workspace_root`.
+    unrestricted_legacy,
+    /// Host directory jail (`PackageId.root` or local `path` dependency) rejecting symlinks (`E0326`).
+    host_dir_jailed: []const u8,
+    /// Pure virtual `.cxtree` lookup (`PackageId >= 2` external packages); never touches host disk.
+    cxtree_only: struct {
+        /// Owning external `PackageId`.
+        pkg_id: PackageId,
+        /// Optional virtual root prefix (e.g., `"/cx/http@1.2.0"`, or `""` to infer from `origin_file_id`).
+        virtual_root_prefix: []const u8 = "",
+    },
+};
+
+/// Result of reading a host-directory-jailed `@embed_bytes` file via segment-by-segment `O_NOFOLLOW`.
+pub const HostEmbedReadResult = union(enum) {
+    /// Verified regular file contents allocated in caller `allocator`.
+    ok: []u8,
+    /// Path escaped sandbox, traversed a symlink/reparse point, targeted a non-regular file, or exceeded `max_bytes` (`E0326`).
+    sandbox_escape: struct {
+        /// Primary diagnostic message.
+        message: []const u8,
+        /// Primary span underline label.
+        label: []const u8,
+    },
+    /// Regular missing-file or read error (`E0004` in jailed package mode / `E0503` in legacy mode).
+    io_error: struct {
+        /// `true` when the target file or intermediate directory does not exist.
+        is_not_found: bool,
+        /// Primary diagnostic message.
+        message: []const u8,
+        /// Primary span underline label.
+        label: []const u8,
+    },
+};
+
 /// Sandbox configuration passed to `materializeBodyEmbedBytes` and `materializeModuleEmbedBytes` (`[CRITICAL-07]`).
 pub const EmbedMaterializeOptions = struct {
     /// Optional workspace root directory path for disk-backed `@embed_bytes`.
@@ -1060,6 +1103,12 @@ pub const EmbedMaterializeOptions = struct {
     compiler_db: ?*query_db.CompilerDb = null,
     /// Maximum single `@embed_bytes` file size (`64 MiB` default per `DR-20` `D-03`).
     max_blob_bytes: u64 = MAX_EMBED_BLOB_BYTES,
+    /// Optional `SymbolTable` mapping lexical `origin_file_id -> PackageId` (`P1-5`).
+    sym_table: ?*const SymbolTable = null,
+    /// Optional per-`PackageId` `@embed_bytes` sandbox jail policy table (`DR-17` §5).
+    package_jails: ?*const std.AutoHashMapUnmanaged(PackageId, EmbedPackageJail) = null,
+    /// Optional `VfsSourceMap` resolving `.cxtree_only` assets without touching host disk.
+    vfs_source_map: ?*const vfs_sourcemap.VfsSourceMap = null,
 };
 
 // -------------------- Canonical `MirBody` ---------------------
@@ -1124,6 +1173,14 @@ pub const MirBody = struct {
     has_overflowed_limits: bool = false,
     /// `true` once Phase 6 `ElaborateDrops` has materialized destructors on this body.
     is_sast_elaborated: bool = false,
+    /// `true` when lowered solely to verify default parameter/field expressions during Phase 6 `mir_sast` (`P1-5`).
+    is_sast_default_probe: bool = false,
+    /// `true` when lowered from a standalone `subscript` arm solely for Phase 6 `mir_sast` verification (`P1-6`).
+    is_sast_subscript_probe: bool = false,
+    /// Owning `DefId` attributed for SAST summary roll-up on synthetic `is_sast_*_probe` bodies.
+    sast_owner_def_id: DefId = .NONE,
+    /// Owning `SymbolIndex` attributed for SAST summary roll-up on synthetic `is_sast_*_probe` bodies.
+    sast_owner_symbol: SymbolIndex = .none,
 
     /// Local slot declarations (`_0` is always the return slot).
     locals: std.ArrayListUnmanaged(LocalDecl) = .empty,
@@ -1495,6 +1552,8 @@ const BLOCK_CLEANUP_PAD_BIT: u16 = 1 << 15;
 
 /// Default maximum `@embed_bytes` file size (`64 MiB`, `DR-20` `D-03`).
 pub const MAX_EMBED_BLOB_BYTES: u64 = 64 * 1024 * 1024;
+/// Canonical alias for `MAX_EMBED_BLOB_BYTES` (`DR-17` §5).
+pub const MAX_EMBED_BYTES: u64 = MAX_EMBED_BLOB_BYTES;
 
 comptime {
     // Enforce exact Phase 5 & Phase 7 MIR cache-density byte-size invariants (`[CRITICAL-01]`, `[MINOR-02]`):
@@ -2553,6 +2612,10 @@ const MirLowerer = struct {
     decision_node_count: u32 = 0,
     /// `true` when lowering for Phase 6 `mir_sast` so mutable `&T`, `*T`, and `str` bindings keep place stores.
     is_for_sast: bool = false,
+    /// `true` when lowering a standalone `subscript` arm in `is_for_sast` mode (`P1-6`).
+    is_sast_subscript_body: bool = false,
+    /// `true` when the active standalone `subscript` arm in `is_for_sast` mode is `inout` (`P1-6`).
+    is_sast_subscript_inout: bool = false,
 
     /// Releases all temporary lowering buffers owned by `self`.
     fn deinit(self: *MirLowerer) void {
@@ -5831,6 +5894,21 @@ const MirLowerer = struct {
                 return self.emitUnitVal(tok);
             },
             .hir_yield => {
+                if (self.is_sast_subscript_body) {
+                    const saved_mut = self.is_mut_place_context;
+                    self.is_mut_place_context = self.is_sast_subscript_inout;
+                    const yielded_place = blk_yield_place: {
+                        defer self.is_mut_place_context = saved_mut;
+                        break :blk_yield_place try self.lowerPlace(HirIndex.fromInt(node.data.lhs));
+                    };
+                    const ghost_op: MirOp = if (self.is_sast_subscript_inout)
+                        .ghost_access_inout
+                    else
+                        .ghost_access_let;
+                    const open_tok = try self.emitGhostOpen(ghost_op, yielded_place, .scoped_projection, tok);
+                    try self.emitGhostEnd(open_tok, tok);
+                    return self.emitUnitVal(tok);
+                }
                 const yielded_place = try self.lowerPlace(HirIndex.fromInt(node.data.lhs));
                 const yielded_val = try self.loadPlaceValue(yielded_place, node.type_id, tok, false);
                 try self.emitBorrowEndsAboveDepth(0, tok);
@@ -6318,6 +6396,16 @@ const MirLowerer = struct {
                 return self.emitUnitVal(tok);
             },
             .embed_bytes => {
+                const origin_fid = self.hir_store.embed_origin_files.get(intr_hir.asInt()) orelse
+                    self.hir_store.file_id;
+                const fid_const_idx = try self.body.appendConst(.{ .int_val = @as(i128, origin_fid.asInt()) });
+                const fid_val = try self.ssa.emitInst(self.cur_bb, .{
+                    .op = .const_scalar,
+                    .flags = .{ .is_synthetic = true },
+                    .type_id = .u32_ty,
+                    .operands = .{ .lhs = fid_const_idx, .rhs = 0 },
+                }, tok);
+                try lowered_vals.append(self.allocator, fid_val.asInt());
                 const args_start: u32 = @intCast(self.body.extra_args.items.len);
                 try self.body.extra_args.appendSlice(self.body.allocator, lowered_vals.items);
                 return self.ssa.emitInst(self.cur_bb, .{
@@ -10515,14 +10603,23 @@ const MirLowerer = struct {
 
     /// Lowers a single `HirFnMeta` into `self.body` and finalizes SSA via `self.ssa.finish()`.
     fn lowerFunction(self: *MirLowerer, fn_meta: HirFnMeta) !void {
-        self.body.def_id = fn_meta.def_id;
-        self.body.symbol_index = fn_meta.symbol_index;
-        self.body.name = fn_meta.name;
-        self.body.ret_ty = fn_meta.ret_ty;
+        const is_sast_sub = self.is_for_sast and fn_meta.is_subscript;
+        const is_sast_probe = is_sast_sub or fn_meta.is_sast_default_probe;
+        const eff_ret_ty: TypeId = if (is_sast_sub) .unit_ty else fn_meta.ret_ty;
+        self.is_sast_subscript_body = is_sast_sub;
+        self.is_sast_subscript_inout = is_sast_sub and fn_meta.is_subscript_inout_arm;
+        self.body.def_id = if (is_sast_probe) .NONE else fn_meta.def_id;
+        self.body.symbol_index = if (is_sast_probe) .none else fn_meta.symbol_index;
+        self.body.name = if (is_sast_probe) .empty else fn_meta.name;
+        self.body.sast_owner_def_id = fn_meta.def_id;
+        self.body.sast_owner_symbol = fn_meta.symbol_index;
+        self.body.ret_ty = eff_ret_ty;
         self.body.param_count = fn_meta.capture_len + fn_meta.param_len;
         self.body.target_layout = self.hir_store.target_layout;
         self.body.is_async = fn_meta.is_async;
         self.body.is_contextless = fn_meta.is_contextless and !fn_meta.is_async;
+        self.body.is_sast_default_probe = fn_meta.is_sast_default_probe;
+        self.body.is_sast_subscript_probe = is_sast_sub;
         if (fn_meta.is_subscript) {
             for (self.hir_store.functions.items, 0..) |cand_meta, cand_idx| {
                 if (cand_meta.body_hir == fn_meta.body_hir and
@@ -10547,7 +10644,7 @@ const MirLowerer = struct {
         try self.local_var_types.ensureTotalCapacity(self.allocator, self.root_local_len);
 
         if (fn_meta.capture_len > 0) {
-            try self.appendHirSlotAsMirLocal(self.base_hir_local, true, false, fn_meta.ret_ty, true);
+            try self.appendHirSlotAsMirLocal(self.base_hir_local, true, false, eff_ret_ty, true);
             for (0..fn_meta.capture_len) |cap_i| {
                 const inner_hir_slot = self.hir_store.extra_data.items[fn_meta.capture_extra_start + cap_i * 2 + 1];
                 try self.appendHirSlotAsMirLocal(inner_hir_slot, false, true, .unit_ty, true);
@@ -10566,7 +10663,7 @@ const MirLowerer = struct {
                 const hir_slot = self.base_hir_local + @as(u32, @intCast(offset));
                 const is_ret = offset == 0;
                 const is_arg = offset >= 1 and offset <= fn_meta.param_len;
-                const fb_ty = if (is_ret) fn_meta.ret_ty else TypeId.unit_ty;
+                const fb_ty = if (is_ret) eff_ret_ty else TypeId.unit_ty;
                 try self.appendHirSlotAsMirLocal(hir_slot, is_ret, is_arg, fb_ty, false);
             }
         }
@@ -10609,12 +10706,12 @@ const MirLowerer = struct {
         if (!fn_meta.body_hir.isNone()) {
             const tail_val = try self.lowerRValue(fn_meta.body_hir);
             if (!self.cur_bb.isNone() and !self.ssa.isBlockTerminated(self.cur_bb)) {
-                if (fn_meta.ret_ty == .never_ty) {
+                if (eff_ret_ty == .never_ty) {
                     self.ssa.setTerminator(self.cur_bb, .{ .kind = .unreachable_term });
                 } else {
                     try self.popAndCloseBorrowsTo(0, .none);
                     try self.emitInlineNormalCleanupsAbove(0, .none);
-                    const final_ret = if (fn_meta.ret_ty == .unit_ty)
+                    const final_ret = if (eff_ret_ty == .unit_ty)
                         try self.emitUnitVal(.none)
                     else
                         tail_val;
@@ -10622,7 +10719,7 @@ const MirLowerer = struct {
                 }
             }
         } else {
-            const unit_ret = try self.ssa.emitDefaultScalarInBlock(entry_bb, fn_meta.ret_ty);
+            const unit_ret = try self.ssa.emitDefaultScalarInBlock(entry_bb, eff_ret_ty);
             try self.emitFinalReturnTerminator(unit_ret, .none);
         }
 
@@ -12299,8 +12396,8 @@ pub fn lowerHirToMirWithSubscripts(
     errdefer bundle.deinit();
 
     for (hir_store.functions.items) |fn_meta| {
-        // Skip `extern` prototypes (`body_hir == .none`) and `subscript` templates (spliced at call sites):
-        if (fn_meta.body_hir.isNone() or fn_meta.is_subscript) continue;
+        // Skip `extern` prototypes (`body_hir == .none`), `subscript` templates, and SAST default probes:
+        if (fn_meta.body_hir.isNone() or fn_meta.is_subscript or fn_meta.is_sast_default_probe) continue;
         var lowered_body = try lowerHirFnToMirWithSubscripts(
             allocator,
             hir_store,
@@ -12398,7 +12495,7 @@ pub fn lowerHirToMirForSastWithSubscripts(
     errdefer bundle.deinit();
 
     for (hir_store.functions.items) |fn_meta| {
-        if (fn_meta.body_hir.isNone() or fn_meta.is_subscript) continue;
+        if (fn_meta.body_hir.isNone() or fn_meta.is_splice_helper_only) continue;
         var lowered_body = try lowerHirFnToMirForSastWithSubscripts(
             allocator,
             hir_store,
@@ -12941,6 +13038,230 @@ fn emitEmbedDiagnostic(
     });
 }
 
+/// Resolves the active `EmbedPackageJail` for lexical `origin_file_id` (`P1-5`, fail-closed to `.cxtree_only` for `PackageId >= 2`).
+pub fn resolveActiveEmbedJail(
+    origin_file_id: FileId,
+    sym_table: ?*const SymbolTable,
+    package_jails: ?*const std.AutoHashMapUnmanaged(PackageId, EmbedPackageJail),
+    workspace_root: ?[]const u8,
+) EmbedPackageJail {
+    const owner_pkg_id: PackageId = if (sym_table != null and !origin_file_id.isNone())
+        sym_table.?.getFilePackageId(origin_file_id)
+    else
+        .root;
+    if (package_jails) |jails| {
+        if (jails.get(owner_pkg_id)) |configured_jail| return configured_jail;
+    }
+    if (owner_pkg_id.asInt() >= 2) {
+        return .{ .cxtree_only = .{ .pkg_id = owner_pkg_id } };
+    }
+    if (package_jails != null) {
+        if (workspace_root) |ws_root| {
+            return .{ .host_dir_jailed = ws_root };
+        }
+    }
+    return .unrestricted_legacy;
+}
+
+/// Reads `<root_path>/<rel_path>` via segment-by-segment `openDir(.follow_symlinks = false)` and
+/// `openFile(.follow_symlinks = false, .resolve_beneath = true, .allow_directory = false)` with zero TOCTOU.
+pub fn readSandboxedHostEmbedFile(
+    allocator: std.mem.Allocator,
+    io_handle: std.Io,
+    root_path: []const u8,
+    rel_path: []const u8,
+    max_bytes: u64,
+) std.mem.Allocator.Error!HostEmbedReadResult {
+    const canon_root = std.Io.Dir.cwd().realPathFileAlloc(io_handle, root_path, allocator) catch {
+        return .{ .io_error = .{
+            .is_not_found = false,
+            .message = "`@embed_bytes` workspace root could not be canonicalized",
+            .label = "invalid workspace sandbox root",
+        } };
+    };
+    defer allocator.free(canon_root);
+
+    var cur_dir = std.Io.Dir.cwd().openDir(io_handle, canon_root, .{
+        .follow_symlinks = false,
+    }) catch |dir_err| switch (dir_err) {
+        error.SymLinkLoop, error.NotDir => {
+            return .{ .sandbox_escape = .{
+                .message = "`@embed_bytes` package root cannot be a symlink or non-directory",
+                .label = "`@embed_bytes` sandbox violation here",
+            } };
+        },
+        else => {
+            return .{ .io_error = .{
+                .is_not_found = false,
+                .message = "`@embed_bytes` package root directory could not be opened",
+                .label = "unreadable package sandbox root",
+            } };
+        },
+    };
+    defer cur_dir.close(io_handle);
+
+    // Walk intermediate path components one segment at a time with `.follow_symlinks = false`:
+    var seg_start: usize = 0;
+    var scan_i: usize = 0;
+    var leaf_segment: []const u8 = rel_path;
+    while (scan_i <= rel_path.len) : (scan_i += 1) {
+        const is_end = scan_i == rel_path.len;
+        const is_sep = is_end or rel_path[scan_i] == '/' or rel_path[scan_i] == '\\';
+        if (!is_sep) continue;
+        const seg = rel_path[seg_start..scan_i];
+        if (is_end) {
+            leaf_segment = seg;
+            break;
+        }
+        const next_dir = cur_dir.openDir(io_handle, seg, .{
+            .follow_symlinks = false,
+        }) catch |step_err| switch (step_err) {
+            error.SymLinkLoop, error.NotDir, error.AccessDenied => {
+                return .{ .sandbox_escape = .{
+                    .message = "`@embed_bytes` intermediate path segment cannot traverse a symlink or non-directory",
+                    .label = "`@embed_bytes` symlink or sandbox escape blocked here",
+                } };
+            },
+            error.FileNotFound => {
+                return .{ .io_error = .{
+                    .is_not_found = true,
+                    .message = "`@embed_bytes` target directory does not exist inside package sandbox",
+                    .label = "missing `@embed_bytes` directory",
+                } };
+            },
+            else => {
+                return .{ .io_error = .{
+                    .is_not_found = false,
+                    .message = "`@embed_bytes` intermediate directory could not be opened inside package sandbox",
+                    .label = "unreadable `@embed_bytes` directory",
+                } };
+            },
+        };
+        cur_dir.close(io_handle);
+        cur_dir = next_dir;
+        seg_start = scan_i + 1;
+    }
+
+    const opened_file = cur_dir.openFile(io_handle, leaf_segment, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    }) catch |open_err| switch (open_err) {
+        error.SymLinkLoop, error.IsDir, error.NotDir, error.AccessDenied => {
+            return .{ .sandbox_escape = .{
+                .message = "`@embed_bytes` target cannot be a symlink, reparse point, or directory",
+                .label = "`@embed_bytes` symlink or non-regular target blocked here",
+            } };
+        },
+        error.FileNotFound => {
+            return .{ .io_error = .{
+                .is_not_found = true,
+                .message = "`@embed_bytes` target file could not be opened inside workspace sandbox",
+                .label = "unreadable `@embed_bytes` file",
+            } };
+        },
+        else => {
+            return .{ .io_error = .{
+                .is_not_found = false,
+                .message = "`@embed_bytes` target file could not be opened inside workspace sandbox",
+                .label = "unreadable `@embed_bytes` file",
+            } };
+        },
+    };
+    defer opened_file.close(io_handle);
+
+    const file_stat = opened_file.stat(io_handle) catch {
+        return .{ .io_error = .{
+            .is_not_found = false,
+            .message = "`@embed_bytes` target file metadata could not be queried",
+            .label = "unreadable `@embed_bytes` file",
+        } };
+    };
+    if (file_stat.kind != .file) {
+        return .{ .sandbox_escape = .{
+            .message = "`@embed_bytes` target must be a regular file inside the package sandbox",
+            .label = "non-regular `@embed_bytes` target blocked here",
+        } };
+    }
+    if (file_stat.size > max_bytes) {
+        return .{ .sandbox_escape = .{
+            .message = "`@embed_bytes` target file exceeds `MAX_EMBED_BYTES` package sandbox cap",
+            .label = "oversized `@embed_bytes` file",
+        } };
+    }
+
+    const full_path = try std.fs.path.join(allocator, &.{ canon_root, rel_path });
+    defer allocator.free(full_path);
+    const canon_target = std.Io.Dir.cwd().realPathFileAlloc(io_handle, full_path, allocator) catch {
+        return .{ .sandbox_escape = .{
+            .message = "`@embed_bytes` target path could not be canonicalized inside package sandbox",
+            .label = "`@embed_bytes` sandbox violation here",
+        } };
+    };
+    defer allocator.free(canon_target);
+
+    if (!isDirectCanonicalSubpath(canon_root, canon_target, rel_path)) {
+        return .{ .sandbox_escape = .{
+            .message = "`@embed_bytes` target resolved outside package sandbox or traversed a symlink/junction",
+            .label = "sandbox escape blocked here",
+        } };
+    }
+
+    const expected_size: usize = @intCast(file_stat.size);
+    const file_bytes = try allocator.alloc(u8, expected_size);
+    errdefer allocator.free(file_bytes);
+    const actual_read = opened_file.readPositionalAll(io_handle, file_bytes, 0) catch {
+        allocator.free(file_bytes);
+        return .{ .io_error = .{
+            .is_not_found = false,
+            .message = "`@embed_bytes` target file could not be read from verified descriptor",
+            .label = "unreadable `@embed_bytes` file",
+        } };
+    };
+    if (actual_read != expected_size) {
+        allocator.free(file_bytes);
+        return .{ .io_error = .{
+            .is_not_found = false,
+            .message = "`@embed_bytes` target file changed size concurrently during read",
+            .label = "truncated `@embed_bytes` file",
+        } };
+    }
+    return .{ .ok = file_bytes };
+}
+
+/// Resolves a `.cxtree_only` asset strictly through `vfs_map` without touching host filesystem syscalls.
+pub fn lookupSandboxedCxTreeEmbedAsset(
+    allocator: std.mem.Allocator,
+    vfs_map: *const vfs_sourcemap.VfsSourceMap,
+    origin_file_id: FileId,
+    explicit_prefix: []const u8,
+    rel_path: []const u8,
+) !?[]const u8 {
+    var derived_prefix: []const u8 = std.mem.trimEnd(u8, explicit_prefix, "/\\");
+    if (derived_prefix.len == 0 and !origin_file_id.isNone()) {
+        const origin_vpath = vfs_map.getFilePath(origin_file_id);
+        if (std.mem.startsWith(u8, origin_vpath, "/cx/")) {
+            if (std.mem.indexOfScalarPos(u8, origin_vpath, 4, '/')) |slash_pos| {
+                derived_prefix = origin_vpath[0..slash_pos];
+            }
+        }
+    }
+    if (derived_prefix.len == 0) return null;
+
+    var joined_vpath = try allocator.alloc(u8, derived_prefix.len + 1 + rel_path.len);
+    defer allocator.free(joined_vpath);
+    @memcpy(joined_vpath[0..derived_prefix.len], derived_prefix);
+    joined_vpath[derived_prefix.len] = '/';
+    for (rel_path, 0..) |ch_byte, i| {
+        joined_vpath[derived_prefix.len + 1 + i] = if (ch_byte == '\\') '/' else ch_byte;
+    }
+    if (try vfs_map.lookupCxTreeAsset(joined_vpath)) |asset_slice| {
+        return asset_slice;
+    }
+    return null;
+}
+
 /// Resolves reachable constant-path `@embed_bytes` calls in `body` into `blob_store` and rewrites them in-place
 /// to `MirOp.const_scalar` (`MirConst.raw_blob`), keeping `MirLowerer` pure/I/O-free (`[CRITICAL-07]`).
 pub fn materializeBodyEmbedBytes(
@@ -13000,6 +13321,33 @@ pub fn materializeBodyEmbedBytes(
             const path_const = body.consts.items[path_inst.operands.lhs];
             if (path_const != .str_val) continue;
 
+            // Resolve lexical `origin_file_id` strictly from `args[1]` (`P1-5`), NEVER `body.file_id` when present:
+            const origin_file_id: FileId = if (inst.operands.rhs >= 2) blk_origin: {
+                var fid_val = body.extra_args.items[inst.operands.lhs + 1];
+                var fid_hops: u32 = 32;
+                while (fid_hops > 0 and fid_val < body.insts.len) : (fid_hops -= 1) {
+                    const def_fid = body.insts.get(fid_val);
+                    if (def_fid.op == .copy_val) {
+                        fid_val = def_fid.operands.lhs;
+                    } else {
+                        break;
+                    }
+                }
+                if (fid_val < body.insts.len) {
+                    const fid_inst = body.insts.get(fid_val);
+                    if (fid_inst.op == .const_scalar and fid_inst.operands.lhs < body.consts.items.len) {
+                        const fid_const = body.consts.items[fid_inst.operands.lhs];
+                        if (fid_const == .int_val and
+                            fid_const.int_val >= 0 and
+                            fid_const.int_val <= std.math.maxInt(u32))
+                        {
+                            break :blk_origin FileId.fromInt(@intCast(fid_const.int_val));
+                        }
+                    }
+                }
+                break :blk_origin body.file_id;
+            } else body.file_id;
+
             const rel_path = interner.get(path_const.str_val);
             const tok = if (inst_val.asInt() < body.origin_tokens.items.len)
                 body.origin_tokens.items[inst_val.asInt()]
@@ -13024,191 +13372,175 @@ pub fn materializeBodyEmbedBytes(
             var owned_disk_buf: ?[]u8 = null;
             defer if (owned_disk_buf) |buf| allocator.free(buf);
 
-            if (options.virtual_files) |vfs_map| {
-                if (vfs_map.get(rel_path)) |vfs_bytes| {
-                    if (vfs_bytes.len > options.max_blob_bytes) {
+            const active_jail = resolveActiveEmbedJail(
+                origin_file_id,
+                options.sym_table,
+                options.package_jails,
+                options.workspace_root,
+            );
+            switch (active_jail) {
+                .cxtree_only => |cx_jail| {
+                    if (options.vfs_source_map) |vfs_map| {
+                        const cx_bytes_opt = lookupSandboxedCxTreeEmbedAsset(
+                            allocator,
+                            vfs_map,
+                            origin_file_id,
+                            cx_jail.virtual_root_prefix,
+                            rel_path,
+                        ) catch |cx_err| {
+                            const err_code: DiagnosticCode = if (cx_err == error.CacheIntegrityMismatch)
+                                .e0015_cache_integrity_mismatch
+                            else
+                                .e0004_source_file_io_error;
+                            try emitEmbedDiagnostic(
+                                diagnostic_sink,
+                                body.file_id,
+                                tokens,
+                                tok,
+                                err_code,
+                                "`@embed_bytes` external package asset failed content-addressable cache verification",
+                                "corrupt or unreadable `.cxtree` asset",
+                            );
+                            is_all_ok = false;
+                            continue;
+                        };
+                        if (cx_bytes_opt) |cx_bytes| {
+                            if (cx_bytes.len > options.max_blob_bytes) {
+                                try emitEmbedDiagnostic(
+                                    diagnostic_sink,
+                                    body.file_id,
+                                    tokens,
+                                    tok,
+                                    .e0326_embed_path_escape,
+                                    "`@embed_bytes` target file exceeds `MAX_EMBED_BYTES` package sandbox cap",
+                                    "oversized `@embed_bytes` file",
+                                );
+                                is_all_ok = false;
+                                continue;
+                            }
+                            loaded_bytes = cx_bytes;
+                        }
+                    }
+                    if (loaded_bytes == null) {
                         try emitEmbedDiagnostic(
                             diagnostic_sink,
                             body.file_id,
                             tokens,
                             tok,
-                            .e0508_comptime_resource_limit_exceeded,
-                            "`@embed_bytes` target file exceeds compile-time memory budget",
-                            "oversized `@embed_bytes` file",
+                            .e0004_source_file_io_error,
+                            "`@embed_bytes` target file does not exist inside external package archive",
+                            "missing package `@embed_bytes` asset",
                         );
                         is_all_ok = false;
                         continue;
                     }
-                    loaded_bytes = vfs_bytes;
-                }
-            }
-
-            if (loaded_bytes == null) {
-                if (options.workspace_root) |ws_root| {
+                },
+                .host_dir_jailed => |jail_root| {
                     if (options.io) |io_handle| {
-                        const canon_ws = std.Io.Dir.cwd().realPathFileAlloc(
-                            io_handle,
-                            ws_root,
+                        switch (try readSandboxedHostEmbedFile(
                             allocator,
-                        ) catch {
-                            try emitEmbedDiagnostic(
-                                diagnostic_sink,
-                                body.file_id,
-                                tokens,
-                                tok,
-                                .e0503_forbidden_comptime_operation,
-                                "`@embed_bytes` workspace root could not be canonicalized",
-                                "invalid workspace sandbox root",
-                            );
-                            is_all_ok = false;
-                            continue;
-                        };
-                        defer allocator.free(canon_ws);
-
-                        const full_path = try std.fs.path.join(allocator, &.{ canon_ws, rel_path });
-                        defer allocator.free(full_path);
-
-                        const opened_file = std.Io.Dir.cwd().openFile(io_handle, full_path, .{
-                            .mode = .read_only,
-                            .allow_directory = false,
-                            .follow_symlinks = false,
-                        }) catch |open_err| {
-                            switch (open_err) {
-                                error.SymLinkLoop, error.IsDir, error.NotDir => {
-                                    try emitEmbedDiagnostic(
-                                        diagnostic_sink,
-                                        body.file_id,
-                                        tokens,
-                                        tok,
-                                        .e0326_embed_path_escape,
-                                        "`@embed_bytes` target cannot be a symlink, reparse point, or directory",
-                                        "`@embed_bytes` symlink or non-regular target blocked here",
-                                    );
-                                },
-                                else => {
-                                    try emitEmbedDiagnostic(
-                                        diagnostic_sink,
-                                        body.file_id,
-                                        tokens,
-                                        tok,
-                                        .e0503_forbidden_comptime_operation,
-                                        "`@embed_bytes` target file could not be opened inside workspace sandbox",
-                                        "unreadable `@embed_bytes` file",
-                                    );
-                                },
-                            }
-                            is_all_ok = false;
-                            continue;
-                        };
-                        defer opened_file.close(io_handle);
-
-                        const file_stat = opened_file.stat(io_handle) catch {
-                            try emitEmbedDiagnostic(
-                                diagnostic_sink,
-                                body.file_id,
-                                tokens,
-                                tok,
-                                .e0503_forbidden_comptime_operation,
-                                "`@embed_bytes` target file metadata could not be queried",
-                                "unreadable `@embed_bytes` file",
-                            );
-                            is_all_ok = false;
-                            continue;
-                        };
-                        if (file_stat.kind != .file) {
-                            try emitEmbedDiagnostic(
-                                diagnostic_sink,
-                                body.file_id,
-                                tokens,
-                                tok,
-                                .e0326_embed_path_escape,
-                                "`@embed_bytes` target must be a regular file inside the package sandbox",
-                                "non-regular `@embed_bytes` target blocked here",
-                            );
-                            is_all_ok = false;
-                            continue;
-                        }
-                        const canon_target = std.Io.Dir.cwd().realPathFileAlloc(
                             io_handle,
-                            full_path,
-                            allocator,
-                        ) catch {
-                            try emitEmbedDiagnostic(
-                                diagnostic_sink,
-                                body.file_id,
-                                tokens,
-                                tok,
-                                .e0326_embed_path_escape,
-                                "`@embed_bytes` target path could not be canonicalized inside package sandbox",
-                                "`@embed_bytes` sandbox violation here",
-                            );
-                            is_all_ok = false;
-                            continue;
-                        };
-                        defer allocator.free(canon_target);
-
-                        if (!isDirectCanonicalSubpath(canon_ws, canon_target, rel_path)) {
-                            try emitEmbedDiagnostic(
-                                diagnostic_sink,
-                                body.file_id,
-                                tokens,
-                                tok,
-                                .e0326_embed_path_escape,
-                                "`@embed_bytes` target resolved outside package sandbox or traversed a symlink/junction",
-                                "sandbox escape blocked here",
-                            );
-                            is_all_ok = false;
-                            continue;
+                            jail_root,
+                            rel_path,
+                            options.max_blob_bytes,
+                        )) {
+                            .ok => |file_bytes| {
+                                owned_disk_buf = file_bytes;
+                                loaded_bytes = file_bytes;
+                            },
+                            .sandbox_escape => |esc| {
+                                try emitEmbedDiagnostic(
+                                    diagnostic_sink,
+                                    body.file_id,
+                                    tokens,
+                                    tok,
+                                    .e0326_embed_path_escape,
+                                    esc.message,
+                                    esc.label,
+                                );
+                                is_all_ok = false;
+                                continue;
+                            },
+                            .io_error => |io_err| {
+                                try emitEmbedDiagnostic(
+                                    diagnostic_sink,
+                                    body.file_id,
+                                    tokens,
+                                    tok,
+                                    .e0004_source_file_io_error,
+                                    io_err.message,
+                                    io_err.label,
+                                );
+                                is_all_ok = false;
+                                continue;
+                            },
                         }
-                        if (file_stat.size > options.max_blob_bytes) {
-                            try emitEmbedDiagnostic(
-                                diagnostic_sink,
-                                body.file_id,
-                                tokens,
-                                tok,
-                                .e0508_comptime_resource_limit_exceeded,
-                                "`@embed_bytes` target file exceeds compile-time memory budget",
-                                "oversized `@embed_bytes` file",
-                            );
-                            is_all_ok = false;
-                            continue;
-                        }
-
-                        const expected_size: usize = @intCast(file_stat.size);
-                        const file_bytes = try allocator.alloc(u8, expected_size);
-                        errdefer allocator.free(file_bytes);
-                        const actual_read = opened_file.readPositionalAll(io_handle, file_bytes, 0) catch {
-                            allocator.free(file_bytes);
-                            try emitEmbedDiagnostic(
-                                diagnostic_sink,
-                                body.file_id,
-                                tokens,
-                                tok,
-                                .e0503_forbidden_comptime_operation,
-                                "`@embed_bytes` target file could not be read from verified descriptor",
-                                "unreadable `@embed_bytes` file",
-                            );
-                            is_all_ok = false;
-                            continue;
-                        };
-                        if (actual_read != expected_size) {
-                            allocator.free(file_bytes);
-                            try emitEmbedDiagnostic(
-                                diagnostic_sink,
-                                body.file_id,
-                                tokens,
-                                tok,
-                                .e0503_forbidden_comptime_operation,
-                                "`@embed_bytes` target file changed size concurrently during read",
-                                "truncated `@embed_bytes` file",
-                            );
-                            is_all_ok = false;
-                            continue;
-                        }
-                        owned_disk_buf = file_bytes;
-                        loaded_bytes = file_bytes;
                     }
-                }
+                },
+                .unrestricted_legacy => {
+                    if (options.virtual_files) |vfs_map| {
+                        if (vfs_map.get(rel_path)) |vfs_bytes| {
+                            if (vfs_bytes.len > options.max_blob_bytes) {
+                                try emitEmbedDiagnostic(
+                                    diagnostic_sink,
+                                    body.file_id,
+                                    tokens,
+                                    tok,
+                                    .e0326_embed_path_escape,
+                                    "`@embed_bytes` target file exceeds `MAX_EMBED_BYTES` package sandbox cap",
+                                    "oversized `@embed_bytes` file",
+                                );
+                                is_all_ok = false;
+                                continue;
+                            }
+                            loaded_bytes = vfs_bytes;
+                        }
+                    }
+                    if (loaded_bytes == null) {
+                        if (options.workspace_root) |ws_root| {
+                            if (options.io) |io_handle| {
+                                switch (try readSandboxedHostEmbedFile(
+                                    allocator,
+                                    io_handle,
+                                    ws_root,
+                                    rel_path,
+                                    options.max_blob_bytes,
+                                )) {
+                                    .ok => |file_bytes| {
+                                        owned_disk_buf = file_bytes;
+                                        loaded_bytes = file_bytes;
+                                    },
+                                    .sandbox_escape => |esc| {
+                                        try emitEmbedDiagnostic(
+                                            diagnostic_sink,
+                                            body.file_id,
+                                            tokens,
+                                            tok,
+                                            .e0326_embed_path_escape,
+                                            esc.message,
+                                            esc.label,
+                                        );
+                                        is_all_ok = false;
+                                        continue;
+                                    },
+                                    .io_error => |io_err| {
+                                        try emitEmbedDiagnostic(
+                                            diagnostic_sink,
+                                            body.file_id,
+                                            tokens,
+                                            tok,
+                                            .e0503_forbidden_comptime_operation,
+                                            io_err.message,
+                                            io_err.label,
+                                        );
+                                        is_all_ok = false;
+                                        continue;
+                                    },
+                                }
+                            }
+                        }
+                    }
+                },
             }
 
             const raw_bytes = loaded_bytes orelse {

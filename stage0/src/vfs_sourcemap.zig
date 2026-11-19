@@ -51,18 +51,18 @@ pub const PackageId = enum(u16) {
     }
 };
 
-/// 32-byte binary header of a content-addressable `.cxtree` package manifest (`DR-11` §2.4).
+/// 32-byte binary header of a content-addressable `.cxtree` package manifest (`DR-11` §2.4, `align(8)`).
 pub const CxTreeHeader = extern struct {
-    /// Four-byte file magic signature (`"CXTR"`).
-    magic: [4]u8 = CXTREE_MAGIC,
+    /// Four-byte file magic signature (`"CXTR"`), aligned to 8 bytes for zero-copy `.cxtree` slicing.
+    magic: [4]u8 align(8) = CXTREE_MAGIC,
     /// Format version number (`1`).
     version: u32 = CXTREE_VERSION,
     /// Number of `CxTreeEntry` records immediately following this header.
-    entry_count: u32,
+    entry_count: u32 = 0,
     /// Total byte length of the trailing UTF-8 relative-path string table.
-    string_table_bytes: u32,
+    string_table_bytes: u32 = 0,
     /// Byte offset of the package name inside the string table.
-    pkg_name_str_off: u32,
+    pkg_name_str_off: u32 = 0,
     /// Zero-initialized reserved padding to align `CxTreeHeader` to 32 bytes.
     reserved: [12]u8 = @splat(0),
 };
@@ -79,6 +79,59 @@ pub const CxTreeEntry = extern struct {
     file_size: u64,
     /// 256-bit BLAKE3 content digest of the file.
     file_blake3: [32]u8,
+};
+
+/// Validation and integrity errors returned when mounting or faulting `.cxtree` manifests (`E0015`).
+pub const CxTreeError = error{
+    /// Buffer is shorter than `32` bytes (`@sizeOf(CxTreeHeader)`).
+    TruncatedCxTree,
+    /// Header magic bytes do not match `"CXTR"`.
+    InvalidCxTreeMagic,
+    /// Header `version` does not equal `1`.
+    UnsupportedCxTreeVersion,
+    /// Total buffer byte length does not equal `32 + entry_count * 48 + string_table_bytes`.
+    CxTreeSizeMismatch,
+    /// Relative path is empty, invalid UTF-8, or contains `..`, `.`, `\`, leading `/`, `:`, or control bytes.
+    InvalidCxTreePath,
+    /// Entries are not sorted in strict ascending bytewise UTF-8 relative-path order.
+    UnsortedCxTreePaths,
+    /// Two entries collide under exact or ASCII case-insensitive relative-path comparison.
+    DuplicateOrCaseCollidingCxTreePath,
+    /// Entry `file_mode` is outside `{ 0x01, 0x02 }` or `file_size` exceeds `MAX_SOURCE_FILE_BYTES`.
+    InvalidCxTreeFileMode,
+    /// Cached blob is missing, truncated, or fails `BLAKE3` verification against `CxTreeEntry.file_blake3`.
+    CacheIntegrityMismatch,
+};
+
+/// Validated zero-copy view over an immutable `.cxtree` binary manifest buffer.
+pub const CxTreeView = struct {
+    /// Decoded 32-byte `.cxtree` header.
+    header: CxTreeHeader,
+    /// Sorted array of 48-byte `CxTreeEntry` records (`len == header.entry_count`).
+    entries: []align(1) const CxTreeEntry,
+    /// Trailing UTF-8 string table storing normalized POSIX relative paths.
+    string_table: []const u8,
+
+    /// Returns the normalized POSIX relative path slice for `entry`.
+    pub inline fn asEntryPath(self: CxTreeView, entry: CxTreeEntry) []const u8 {
+        const start: usize = entry.rel_path_off;
+        return self.string_table[start .. start + entry.rel_path_len];
+    }
+
+    /// Extracts the NUL-terminated or prefix-bounded package name from `string_table`.
+    pub fn extractPackageName(self: CxTreeView) []const u8 {
+        const start: usize = @min(@as(usize, self.header.pkg_name_str_off), self.string_table.len);
+        const limit: usize = if (self.entries.len > 0)
+            @min(@as(usize, self.entries[0].rel_path_off), self.string_table.len)
+        else
+            self.string_table.len;
+        if (start >= limit) return "";
+        const candidate = self.string_table[start..limit];
+        if (std.mem.indexOfScalar(u8, candidate, 0)) |nul_pos| {
+            return candidate[0..nul_pos];
+        }
+        return candidate;
+    }
 };
 
 // ------------------- Line & Column Indexing -------------------
@@ -145,6 +198,36 @@ pub const VfsFileEntry = struct {
     mapped_file: ?std.Io.File = null,
     /// Lazily constructed `LineIndex` for byte-to-line/column resolution.
     line_index: ?LineIndex = null,
+    /// `true` once `content` holds verified file bytes (`false` for newly mounted lazy `.cxtree` entries).
+    is_blob_loaded: bool = true,
+    /// `true` if lazy blob faulting failed `BLAKE3` content verification (`E0015`).
+    has_blob_integrity_error: bool = false,
+    /// Uncompressed byte length expected when faulting an unloaded `.cxtree` blob.
+    unloaded_blob_size: u32 = 0,
+    /// Interned host `blobs/` directory path used strictly for internal lazy faulting (never exposed).
+    blobs_dir_id: StringId = .empty,
+};
+
+/// Heap-allocated demand pager backing lazy `.cxtree` blob reads across `*const VfsSourceMap` queries.
+const LazyCxTreePager = struct {
+    /// Active `std.Io` handle used to open/mmap immutable blobs on first access.
+    io: std.Io,
+    /// Backing allocator for temporary path formatting.
+    backing_allocator: std.mem.Allocator,
+    /// Shared interner resolving internal `blobs_dir_id` paths.
+    interner: *const StringInterner,
+    /// Dedicated 64 KiB slab arena owning `< 16 KiB` and page-aligned `.cxtree` blob buffers with `:0` sentinels.
+    blob_arena: BumpArena,
+    /// First `FileId` that failed `BLAKE3` verification during a `getFileEntry`/`getFileSource` fault.
+    first_integrity_error_file: FileId = .none,
+    /// Total count of blob integrity failures observed by this pager.
+    integrity_error_count: u32 = 0,
+
+    /// Releases `blob_arena` slabs owned by this pager.
+    fn deinit(self: *LazyCxTreePager) void {
+        self.blob_arena.deinit();
+        self.* = undefined;
+    }
 };
 
 // --------------------------------------- CONSTS ----------------------------------------
@@ -188,15 +271,270 @@ inline fn computeBlake3Hash(source_bytes: []const u8) [32]u8 {
     return digest;
 }
 
+/// Returns `true` iff `rel_path` is a canonical, traversal-free POSIX relative `.cxtree` path.
+fn isValidCxTreeRelativePathImpl(rel_path: []const u8) bool {
+    if (rel_path.len == 0 or rel_path.len > 4096) return false;
+    if (rel_path[0] == '/' or rel_path[rel_path.len - 1] == '/') return false;
+    if (!std.unicode.utf8ValidateSlice(rel_path)) return false;
+
+    for (rel_path) |ch_byte| {
+        if (ch_byte < 0x20 or ch_byte == 0x7F or ch_byte == '\\' or ch_byte == ':') return false;
+    }
+
+    var seg_iter = std.mem.splitScalar(u8, rel_path, '/');
+    while (seg_iter.next()) |seg| {
+        if (seg.len == 0) return false;
+        if (std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return false;
+    }
+    return true;
+}
+
+/// Marks `target_entry` as corrupted in `target_pager` and returns `error.CacheIntegrityMismatch`.
+fn markLazyIntegrityFailure(
+    target_pager: *LazyCxTreePager,
+    target_entry: *VfsFileEntry,
+) error{CacheIntegrityMismatch} {
+    target_entry.has_blob_integrity_error = true;
+    if (target_pager.first_integrity_error_file.isNone()) {
+        target_pager.first_integrity_error_file = target_entry.file_id;
+    }
+    target_pager.integrity_error_count += 1;
+    return error.CacheIntegrityMismatch;
+}
+
+/// Opens `<blobs_dir>/<2-hex>/<62-hex>` (falling back to `<2-hex>/<2-hex>/<64-hex>`) in read-only mode.
+fn openCachedBlobFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    blobs_dir: []const u8,
+    digest: [32]u8,
+) !std.Io.File {
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const trimmed_root = std.mem.trimEnd(u8, blobs_dir, "/\\");
+    const primary_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}/{s}",
+        .{ trimmed_root, hex[0..2], hex[2..64] },
+    );
+    defer allocator.free(primary_path);
+
+    if (std.Io.Dir.cwd().openFile(io, primary_path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+    })) |opened_primary| {
+        return opened_primary;
+    } else |open_err| {
+        if (open_err != error.FileNotFound) return open_err;
+    }
+
+    const two_level_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}/{s}/{s}",
+        .{ trimmed_root, hex[0..2], hex[2..4], hex[0..64] },
+    );
+    defer allocator.free(two_level_path);
+    return std.Io.Dir.cwd().openFile(io, two_level_path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+    });
+}
+
+/// Faults an unloaded `.cxtree` `entry` from `blobs/`, verifying `BLAKE3(bytes) == entry.content_hash`.
+fn faultLazyEntryIfNeeded(pager: *LazyCxTreePager, entry: *VfsFileEntry) !void {
+    if (entry.has_blob_integrity_error) return error.CacheIntegrityMismatch;
+    if (entry.is_blob_loaded) return;
+
+    const blobs_dir = pager.interner.get(entry.blobs_dir_id);
+    if (blobs_dir.len == 0) return markLazyIntegrityFailure(pager, entry);
+
+    const opened_file = openCachedBlobFile(
+        pager.io,
+        pager.backing_allocator,
+        blobs_dir,
+        entry.content_hash,
+    ) catch {
+        return markLazyIntegrityFailure(pager, entry);
+    };
+    errdefer opened_file.close(pager.io);
+
+    const file_stat = opened_file.stat(pager.io) catch {
+        return markLazyIntegrityFailure(pager, entry);
+    };
+    if (file_stat.kind == .directory or file_stat.size != entry.unloaded_blob_size) {
+        return markLazyIntegrityFailure(pager, entry);
+    }
+    const file_size: usize = entry.unloaded_blob_size;
+
+    // [1] Use read-only OS `mmap` for `>= 16 KiB` blobs not ending on a 4096-byte page boundary:
+    if (file_size >= SMALL_FILE_THRESHOLD and (file_size % OS_PAGE_SIZE) != 0) {
+        if (opened_file.createMemoryMap(pager.io, .{
+            .len = file_size,
+            .protection = .{ .read = true, .write = false },
+            .populate = true,
+            .offset = 0,
+        })) |memory_map| {
+            const raw_mapped_ptr: [*]const u8 = @ptrCast(memory_map.memory.ptr);
+            if (memory_map.section != null and raw_mapped_ptr[file_size] == 0) {
+                const mapped_content: [:0]const u8 = raw_mapped_ptr[0..file_size :0];
+                if (!std.crypto.timing_safe.eql([32]u8, computeBlake3Hash(mapped_content), entry.content_hash)) {
+                    var bad_map = memory_map;
+                    bad_map.destroy(pager.io);
+                    return markLazyIntegrityFailure(pager, entry);
+                }
+                entry.content = mapped_content;
+                entry.memory_map = memory_map;
+                entry.mapped_file = opened_file;
+                entry.is_blob_loaded = true;
+                return;
+            }
+            var cleanup_map = memory_map;
+            cleanup_map.destroy(pager.io);
+        } else |_| {}
+    }
+
+    // [2] Read `< 16 KiB`, page-multiple, or fallback blobs into `blob_arena` with explicit `:0` NUL sentinel:
+    const arena_buf = try pager.blob_arena.allocSlice(u8, file_size + 1);
+    const bytes_read = opened_file.readPositionalAll(pager.io, arena_buf[0..file_size], 0) catch {
+        return markLazyIntegrityFailure(pager, entry);
+    };
+    if (bytes_read != file_size) {
+        return markLazyIntegrityFailure(pager, entry);
+    }
+    arena_buf[file_size] = 0;
+    opened_file.close(pager.io);
+
+    const arena_content: [:0]const u8 = arena_buf[0..file_size :0];
+    if (!std.crypto.timing_safe.eql([32]u8, computeBlake3Hash(arena_content), entry.content_hash)) {
+        return markLazyIntegrityFailure(pager, entry);
+    }
+    entry.content = arena_content;
+    entry.is_blob_loaded = true;
+}
+
 comptime {
     std.debug.assert(@sizeOf(PackageId) == 2);
     std.debug.assert(@sizeOf(CxTreeHeader) == 32);
     std.debug.assert(@sizeOf(CxTreeEntry) == 48);
-    std.debug.assert(@alignOf(CxTreeHeader) == 4);
+    std.debug.assert(@alignOf(CxTreeHeader) == 8);
     std.debug.assert(@alignOf(CxTreeEntry) == 8);
 }
 
 // ------------------------------------- PUBLIC API --------------------------------------
+
+// ----------------- CxTree Validation & Lookup -----------------
+
+/// Returns `true` iff `rel_path` is a canonical, traversal-free POSIX relative `.cxtree` path.
+pub fn isValidCxTreeRelativePath(rel_path: []const u8) bool {
+    return isValidCxTreeRelativePathImpl(rel_path);
+}
+
+/// Validates a binary `.cxtree` buffer (`CxTreeHeader`, sorted `CxTreeEntry` table, and case-collision set).
+pub fn validateCxTreeBytes(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) (CxTreeError || std.mem.Allocator.Error)!CxTreeView {
+    if (bytes.len < @sizeOf(CxTreeHeader)) return error.TruncatedCxTree;
+    var header: CxTreeHeader = undefined;
+    @memcpy(std.mem.asBytes(&header), bytes[0..@sizeOf(CxTreeHeader)]);
+
+    if (!std.mem.eql(u8, &header.magic, &CXTREE_MAGIC)) return error.InvalidCxTreeMagic;
+    if (header.version != CXTREE_VERSION) return error.UnsupportedCxTreeVersion;
+
+    const entries_byte_len = std.math.mul(usize, header.entry_count, @sizeOf(CxTreeEntry)) catch {
+        return error.CxTreeSizeMismatch;
+    };
+    const body_byte_len = std.math.add(usize, entries_byte_len, header.string_table_bytes) catch {
+        return error.CxTreeSizeMismatch;
+    };
+    const expected_total = std.math.add(usize, @sizeOf(CxTreeHeader), body_byte_len) catch {
+        return error.CxTreeSizeMismatch;
+    };
+    if (bytes.len != expected_total or header.pkg_name_str_off > header.string_table_bytes) {
+        return error.CxTreeSizeMismatch;
+    }
+
+    const entries = std.mem.bytesAsSlice(
+        CxTreeEntry,
+        bytes[@sizeOf(CxTreeHeader) .. @sizeOf(CxTreeHeader) + entries_byte_len],
+    );
+    const string_table = bytes[@sizeOf(CxTreeHeader) + entries_byte_len ..];
+
+    // [1] Verify path validity, strict ascending bytewise order, and check for any ASCII uppercase byte:
+    var has_ascii_upper = false;
+    var prev_path: ?[]const u8 = null;
+    for (entries) |entry| {
+        if (entry.file_mode != 0x01 and entry.file_mode != 0x02) return error.InvalidCxTreeFileMode;
+        if (entry.file_size > MAX_SOURCE_FILE_BYTES or entry.file_size > std.math.maxInt(u32)) {
+            return error.InvalidCxTreeFileMode;
+        }
+        const path_end = std.math.add(usize, entry.rel_path_off, entry.rel_path_len) catch {
+            return error.InvalidCxTreePath;
+        };
+        if (path_end > string_table.len) return error.InvalidCxTreePath;
+        const rel_path = string_table[entry.rel_path_off..path_end];
+        if (!isValidCxTreeRelativePath(rel_path)) return error.InvalidCxTreePath;
+
+        if (prev_path) |prior_path| {
+            switch (std.mem.order(u8, prior_path, rel_path)) {
+                .lt => {},
+                .eq => return error.DuplicateOrCaseCollidingCxTreePath,
+                .gt => return error.UnsortedCxTreePaths,
+            }
+        }
+        prev_path = rel_path;
+
+        if (!has_ascii_upper) {
+            for (rel_path) |path_byte| {
+                if (path_byte >= 'A' and path_byte <= 'Z') {
+                    has_ascii_upper = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // [2] Only allocate lowercase collision table when `entries.len > 1` and `'A'..'Z'` is present:
+    if (entries.len > 1 and has_ascii_upper) {
+        var lower_arena = BumpArena.init(allocator);
+        defer lower_arena.deinit();
+        var seen_lower_paths: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen_lower_paths.deinit(allocator);
+        try seen_lower_paths.ensureTotalCapacity(allocator, @intCast(entries.len));
+
+        for (entries) |entry| {
+            const rel_path = string_table[entry.rel_path_off .. entry.rel_path_off + entry.rel_path_len];
+            const lower_copy = try lower_arena.allocSlice(u8, rel_path.len);
+            for (rel_path, 0..) |path_byte, i| {
+                lower_copy[i] = std.ascii.toLower(path_byte);
+            }
+            const gop = seen_lower_paths.getOrPutAssumeCapacity(lower_copy);
+            if (gop.found_existing) return error.DuplicateOrCaseCollidingCxTreePath;
+        }
+    }
+
+    return .{
+        .header = header,
+        .entries = entries,
+        .string_table = string_table,
+    };
+}
+
+/// Performs a zero-allocation $O(\log K)$ binary search for `rel_path` in `view`.
+pub fn lookupCxTreeEntry(view: CxTreeView, rel_path: []const u8) ?CxTreeEntry {
+    var low: usize = 0;
+    var high: usize = view.entries.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const candidate: CxTreeEntry = view.entries[mid];
+        const cand_path = view.asEntryPath(candidate);
+        switch (std.mem.order(u8, cand_path, rel_path)) {
+            .lt => low = mid + 1,
+            .gt => high = mid,
+            .eq => return candidate,
+        }
+    }
+    return null;
+}
 
 // ----------------- Line Index Implementation ------------------
 
@@ -385,6 +723,8 @@ pub const VfsSourceMap = struct {
     entries: std.ArrayList(VfsFileEntry) = .empty,
     /// $O(1)$ lookup map from interned normalized/resolved path `StringId` to `FileId`.
     path_to_file_id: std.AutoHashMapUnmanaged(StringId, FileId) = .empty,
+    /// Optional heap-allocated demand pager for lazily mounted `.cxtree` package blobs.
+    lazy_pager: ?*LazyCxTreePager = null,
 
     /// Initializes an empty `VfsSourceMap` bound to `backing_allocator` and `interner`.
     pub fn init(backing_allocator: std.mem.Allocator, interner: *StringInterner) VfsSourceMap {
@@ -408,6 +748,11 @@ pub const VfsSourceMap = struct {
                 opened_file.close(io);
             }
         }
+        if (self.lazy_pager) |pager| {
+            pager.deinit();
+            self.backing_allocator.destroy(pager);
+            self.lazy_pager = null;
+        }
         self.entries.deinit(self.backing_allocator);
         self.path_to_file_id.deinit(self.backing_allocator);
         self.small_file_arena.deinit();
@@ -421,7 +766,11 @@ pub const VfsSourceMap = struct {
             return normalized_id;
         }
 
-        const real_os_path = std.Io.Dir.cwd().realPathFileAlloc(io, raw_path, self.backing_allocator) catch {
+        const real_os_path = std.Io.Dir.cwd().realPathFileAlloc(
+            io,
+            self.interner.get(normalized_id),
+            self.backing_allocator,
+        ) catch {
             return normalized_id;
         };
         defer self.backing_allocator.free(real_os_path);
@@ -441,7 +790,7 @@ pub const VfsSourceMap = struct {
             return existing_id;
         }
 
-        const resolved_id = try self.resolvePath(io, raw_path);
+        const resolved_id = try self.resolvePath(io, self.interner.get(virtual_id));
         if (self.path_to_file_id.get(resolved_id)) |existing_id| {
             try self.path_to_file_id.put(self.backing_allocator, virtual_id, existing_id);
             return existing_id;
@@ -449,8 +798,8 @@ pub const VfsSourceMap = struct {
 
         if (self.entries.items.len >= MAX_LOADED_FILES) return error.TooManyLoadedFiles;
 
-        // [2] Open and stat file on disk, enforcing `MAX_SOURCE_FILE_BYTES`:
-        const opened_file = try std.Io.Dir.cwd().openFile(io, raw_path, .{
+        // [2] Open and stat file on disk using the normalized `/` path, enforcing `MAX_SOURCE_FILE_BYTES`:
+        const opened_file = try std.Io.Dir.cwd().openFile(io, self.interner.get(virtual_id), .{
             .mode = .read_only,
             .allow_directory = false,
         });
@@ -543,11 +892,21 @@ pub const VfsSourceMap = struct {
                 existing_line_idx.deinit(self.backing_allocator);
                 entry.line_index = null;
             }
+            if (entry.memory_map) |*existing_map| {
+                if (self.lazy_pager) |pager| existing_map.destroy(pager.io);
+                entry.memory_map = null;
+            }
+            if (entry.mapped_file) |existing_file| {
+                if (self.lazy_pager) |pager| existing_file.close(pager.io);
+                entry.mapped_file = null;
+            }
             entry.package_id = package_id;
             entry.content = owned_content;
             entry.content_hash = digest;
             entry.revision += 1;
             entry.backing_kind = .in_memory_overlay;
+            entry.is_blob_loaded = true;
+            entry.has_blob_integrity_error = false;
             return existing_id;
         }
 
@@ -567,21 +926,145 @@ pub const VfsSourceMap = struct {
         return new_file_id;
     }
 
-    /// Returns a read-only pointer to the `VfsFileEntry` for `file_id`, or `null` if invalid.
+    /// Lazily mounts all files in `cxtree_bytes` under `/cx/<pkg_name>@<pkg_version>/<rel_path>` without host path leakage.
+    pub fn mountCxTreePackage(
+        self: *VfsSourceMap,
+        io: std.Io,
+        package_id: PackageId,
+        pkg_name: []const u8,
+        pkg_version: []const u8,
+        cxtree_bytes: []const u8,
+        blobs_root_dir: []const u8,
+    ) ![]FileId {
+        const tree_view = try validateCxTreeBytes(self.backing_allocator, cxtree_bytes);
+
+        // [1] Lazily initialize or refresh the demand-paging context for `.cxtree` blobs:
+        if (self.lazy_pager) |existing_pager| {
+            existing_pager.io = io;
+        } else {
+            const created = try self.backing_allocator.create(LazyCxTreePager);
+            created.* = .{
+                .io = io,
+                .backing_allocator = self.backing_allocator,
+                .interner = self.interner,
+                .blob_arena = BumpArena.init(self.backing_allocator),
+            };
+            self.lazy_pager = created;
+        }
+
+        const blobs_dir_id = try internNormalizedPath(self.backing_allocator, self.interner, blobs_root_dir);
+        const mounted_ids = try self.backing_allocator.alloc(FileId, tree_view.entries.len);
+        errdefer self.backing_allocator.free(mounted_ids);
+
+        try self.entries.ensureUnusedCapacity(self.backing_allocator, tree_view.entries.len);
+        try self.path_to_file_id.ensureUnusedCapacity(self.backing_allocator, @intCast(tree_view.entries.len));
+
+        var path_buf: std.ArrayList(u8) = .empty;
+        defer path_buf.deinit(self.backing_allocator);
+
+        // [2] Pre-allocate deterministic unloaded `FileId` handles with `resolved_os_path = virtual_id`:
+        for (tree_view.entries, 0..) |tree_entry, i| {
+            const rel_path = tree_view.asEntryPath(tree_entry);
+            path_buf.clearRetainingCapacity();
+            try path_buf.ensureUnusedCapacity(
+                self.backing_allocator,
+                5 + pkg_name.len + pkg_version.len + rel_path.len,
+            );
+            path_buf.appendSliceAssumeCapacity("/cx/");
+            path_buf.appendSliceAssumeCapacity(pkg_name);
+            path_buf.appendAssumeCapacity('@');
+            path_buf.appendSliceAssumeCapacity(pkg_version);
+            path_buf.appendAssumeCapacity('/');
+            path_buf.appendSliceAssumeCapacity(rel_path);
+
+            const virtual_id = try self.interner.intern(path_buf.items);
+            if (self.path_to_file_id.get(virtual_id)) |existing_id| {
+                mounted_ids[i] = existing_id;
+                continue;
+            }
+            if (self.entries.items.len >= MAX_LOADED_FILES) return error.TooManyLoadedFiles;
+
+            const new_file_id = FileId.fromInt(@intCast(self.entries.items.len));
+            self.entries.appendAssumeCapacity(.{
+                .file_id = new_file_id,
+                .package_id = package_id,
+                .virtual_path = virtual_id,
+                .resolved_os_path = virtual_id,
+                .content = "",
+                .content_hash = tree_entry.file_blake3,
+                .revision = 1,
+                .backing_kind = .cxtree_archive,
+                .is_blob_loaded = false,
+                .unloaded_blob_size = @intCast(tree_entry.file_size),
+                .blobs_dir_id = blobs_dir_id,
+            });
+            self.path_to_file_id.putAssumeCapacity(virtual_id, new_file_id);
+            mounted_ids[i] = new_file_id;
+        }
+        return mounted_ids;
+    }
+
+    /// Explicitly faults `file_id` from `blobs/`, returning `error.CacheIntegrityMismatch` (`E0015`) on tampering.
+    pub fn faultCxTreeFile(self: *const VfsSourceMap, file_id: FileId) ![:0]const u8 {
+        if (file_id.isNone() or file_id.asInt() >= self.entries.items.len) return error.InvalidFileId;
+        const entry = &self.entries.items[file_id.asInt()];
+        if (!entry.is_blob_loaded) {
+            const pager = self.lazy_pager orelse return error.CacheIntegrityMismatch;
+            try faultLazyEntryIfNeeded(pager, entry);
+        } else if (entry.has_blob_integrity_error) {
+            return error.CacheIntegrityMismatch;
+        }
+        return entry.content;
+    }
+
+    /// Resolves a `.cxtree` or overlay asset by virtual path without touching the host workspace filesystem.
+    pub fn lookupCxTreeAsset(self: *const VfsSourceMap, virtual_path: []const u8) !?[:0]const u8 {
+        var stack_buf: [512]u8 = undefined;
+        const normalized_slice = if (std.mem.indexOfScalar(u8, virtual_path, '\\') == null)
+            virtual_path
+        else blk: {
+            if (virtual_path.len > stack_buf.len) return null;
+            for (virtual_path, 0..) |ch_byte, i| {
+                stack_buf[i] = if (ch_byte == '\\') '/' else ch_byte;
+            }
+            break :blk stack_buf[0..virtual_path.len];
+        };
+        const lookup_id = self.interner.lookup(normalized_slice) orelse return null;
+        const file_id = self.path_to_file_id.get(lookup_id) orelse return null;
+        const entry = &self.entries.items[file_id.asInt()];
+        if (entry.backing_kind != .cxtree_archive and entry.backing_kind != .in_memory_overlay) {
+            return null;
+        }
+        return try self.faultCxTreeFile(file_id);
+    }
+
+    /// Returns the first `FileId` that failed lazy `BLAKE3` blob verification, or `null` if all reads were clean.
+    pub fn hasIntegrityErrorFile(self: *const VfsSourceMap) ?FileId {
+        if (self.lazy_pager) |pager| {
+            if (!pager.first_integrity_error_file.isNone()) return pager.first_integrity_error_file;
+        }
+        return null;
+    }
+
+    /// Returns a read-only pointer to the `VfsFileEntry` for `file_id`, faulting lazy `.cxtree` blobs on first access.
     pub fn getFileEntry(self: *const VfsSourceMap, file_id: FileId) ?*const VfsFileEntry {
         if (file_id.isNone() or file_id.asInt() >= self.entries.items.len) return null;
-        return &self.entries.items[file_id.asInt()];
+        const entry = &self.entries.items[file_id.asInt()];
+        if (!entry.is_blob_loaded) {
+            const pager = self.lazy_pager orelse return null;
+            faultLazyEntryIfNeeded(pager, entry) catch return null;
+        }
+        if (entry.has_blob_integrity_error) return null;
+        return entry;
     }
 
     /// Returns the normalized virtual path string for `file_id`, or `""` if `file_id` is invalid.
     pub fn getFilePath(self: *const VfsSourceMap, file_id: FileId) []const u8 {
-        if (self.getFileEntry(file_id)) |entry| {
-            return self.interner.get(entry.virtual_path);
-        }
-        return "";
+        if (file_id.isNone() or file_id.asInt() >= self.entries.items.len) return "";
+        return self.interner.get(self.entries.items[file_id.asInt()].virtual_path);
     }
 
-    /// Returns the NUL-terminated UTF-8 source buffer for `file_id`, or `null` if invalid.
+    /// Returns the NUL-terminated UTF-8 source buffer for `file_id`, or `null` if invalid or corrupt.
     pub fn getFileSource(self: *const VfsSourceMap, file_id: FileId) ?[:0]const u8 {
         if (self.getFileEntry(file_id)) |entry| {
             return entry.content;
@@ -589,10 +1072,16 @@ pub const VfsSourceMap = struct {
         return null;
     }
 
-    /// Returns the cached `LineIndex` for `file_id`, building it lazily on first request.
+    /// Returns the cached `LineIndex` for `file_id`, faulting any unloaded `.cxtree` blob and building lazily.
     pub fn getLineIndex(self: *VfsSourceMap, file_id: FileId) !*const LineIndex {
         if (file_id.isNone() or file_id.asInt() >= self.entries.items.len) return error.InvalidFileId;
         const entry = &self.entries.items[file_id.asInt()];
+        if (!entry.is_blob_loaded) {
+            const pager = self.lazy_pager orelse return error.CacheIntegrityMismatch;
+            try faultLazyEntryIfNeeded(pager, entry);
+        } else if (entry.has_blob_integrity_error) {
+            return error.CacheIntegrityMismatch;
+        }
         if (entry.line_index == null) {
             entry.line_index = try LineIndex.build(self.backing_allocator, entry.content);
         }

@@ -477,6 +477,10 @@ pub const HirFnMeta = struct {
     capture_extra_start: u32 = 0,
     /// Number of captured bindings for closures (`0` for non-capturing functions).
     capture_len: u32 = 0,
+    /// `true` when lowered solely by `populateReferencedSameFileSubscripts` for `MirLowerer` arm splicing.
+    is_splice_helper_only: bool = false,
+    /// `true` when synthesized solely to capture default parameter/field capabilities during MIR SAST (`P1-5`).
+    is_sast_default_probe: bool = false,
 };
 
 /// Compile-time constant value interned in `HirStore.const_pool` (`hir_const_val`) and returned by `ComptimeEvalHook`.
@@ -774,6 +778,8 @@ pub const HirStore = struct {
     parallel_assign_blocks: std.AutoHashMapUnmanaged(u32, ParallelAssignSpan) = .empty,
     /// Labeled `fsm: match` metadata keyed by `hir_match` `HirIndex` (`SE-23`).
     labeled_matches: std.AutoHashMapUnmanaged(u32, LabeledMatchMeta) = .empty,
+    /// Lexical declaration `FileId` recorded per `@embed_bytes` `hir_intrinsic_call` `HirIndex` (`P1-5`).
+    embed_origin_files: std.AutoHashMapUnmanaged(u32, FileId) = .empty,
     /// Root `hir_module` or single-item `HirIndex` (`.none` when empty).
     root_hir: HirIndex = .none,
     /// `true` if `MAX_HIR_NODES` or `MAX_HIR_LOWER_DEPTH` was exceeded (`E0508`).
@@ -818,6 +824,7 @@ pub const HirStore = struct {
         self.call_type_args.deinit(self.allocator);
         self.parallel_assign_blocks.deinit(self.allocator);
         self.labeled_matches.deinit(self.allocator);
+        self.embed_origin_files.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -1200,6 +1207,10 @@ const HirLowerer = struct {
     next_fsm_id: u32 = 0,
     /// Pre-evaluated LHS index/pointer HIR nodes keyed by `NodeIndex.asInt()` during Phase-0 parallel assignment (`SE-15`).
     parallel_pre_eval: std.AutoHashMapUnmanaged(u32, HirIndex) = .empty,
+    /// Active lexical declaration `FileId` for `@embed_bytes` jail attribution and `pkg.` / dep-alias resolution (`P1-5`).
+    active_lexical_file_id: FileId,
+    /// `true` while `populateReferencedSameFileSubscripts` lowers cross-item helper templates.
+    is_lowering_splice_helper: bool = false,
 
     /// Initializes a `HirLowerer` with precomputed $O(1)$ AST/CST auxiliary index maps.
     fn init(
@@ -1219,12 +1230,37 @@ const HirLowerer = struct {
         const extra_ends = try syntax_arenas.computeAstNodeExtraEnds(allocator, ast_arena);
         errdefer if (extra_ends.len > 0) allocator.free(extra_ends);
         const cst_map = try syntax_arenas.computeCstToAstMap(allocator, cst_arena.countNodes(), ast_arena);
-        const derived_cfg: CfgEnv = if (store.target_layout.ptr_byte_size == 4)
-            .{ .os = .wasi, .arch = .wasm32, .abi = .wasi, .ptr_width = 32 }
-        else if (store.target_layout.cache_line_align_log2 == 7)
-            .{ .os = .macos, .arch = .aarch64, .abi = .apple, .ptr_width = 64 }
+        const base_cfg = sym_table.effectiveCfgEnvForFile(store.file_id);
+        const derived_cfg: CfgEnv = if (store.target_layout.ptr_byte_size == 4 and base_cfg.ptr_width != 32)
+            .{
+                .os = .wasi,
+                .arch = .wasm32,
+                .abi = .wasi,
+                .ptr_width = 32,
+                .is_debug = base_cfg.is_debug,
+                .is_test_mode = base_cfg.is_test_mode,
+                .is_sim_mode = base_cfg.is_sim_mode,
+                .is_fuzz_mode = base_cfg.is_fuzz_mode,
+                .enabled_features = base_cfg.enabled_features,
+                .enabled_cpu_features = base_cfg.enabled_cpu_features,
+                .owner_pkg_id = base_cfg.owner_pkg_id,
+            }
+        else if (store.target_layout.cache_line_align_log2 == 7 and base_cfg.arch != .aarch64)
+            .{
+                .os = .macos,
+                .arch = .aarch64,
+                .abi = .apple,
+                .ptr_width = 64,
+                .is_debug = base_cfg.is_debug,
+                .is_test_mode = base_cfg.is_test_mode,
+                .is_sim_mode = base_cfg.is_sim_mode,
+                .is_fuzz_mode = base_cfg.is_fuzz_mode,
+                .enabled_features = base_cfg.enabled_features,
+                .enabled_cpu_features = base_cfg.enabled_cpu_features,
+                .owner_pkg_id = base_cfg.owner_pkg_id,
+            }
         else
-            .{};
+            base_cfg;
         return .{
             .allocator = allocator,
             .store = store,
@@ -1242,6 +1278,7 @@ const HirLowerer = struct {
             .cst_to_ast = cst_map,
             .zip_arena = std.heap.ArenaAllocator.init(allocator),
             .cfg_env = derived_cfg,
+            .active_lexical_file_id = store.file_id,
         };
     }
 
@@ -1776,12 +1813,15 @@ const HirLowerer = struct {
                     ExtraIndex.fromInt(root_node.lhs.payload),
                     root_node.rhs.payload,
                 );
+                const is_file_including_tests = self.sym_table.is_including_tests and
+                    (self.sym_table.getFilePackageId(self.store.file_id) == .root);
                 var ordinal: u12 = 0;
                 for (item_slice) |raw_idx| {
                     const item_id = NodeIndex.fromInt(raw_idx);
                     if (item_id.asInt() >= self.ast_arena.countNodes()) continue;
                     const item_tag = self.ast_arena.getNode(item_id).tag;
                     if (item_tag == .item_hole) continue;
+                    if (!is_file_including_tests and (item_tag == .test_decl or item_tag == .bench_decl)) continue;
                     if (item_tag == .extern_block_decl) {
                         for (self.ast_arena.getExternBlockItems(item_id)) |ext_raw_idx| {
                             const ext_id = NodeIndex.fromInt(ext_raw_idx);
@@ -1873,13 +1913,15 @@ const HirLowerer = struct {
             ExtraIndex.fromInt(root_node.lhs.payload),
             root_node.rhs.payload,
         );
+        const is_file_including_tests = self.sym_table.is_including_tests and
+            (self.sym_table.getFilePackageId(self.store.file_id) == .root);
         var ordinal: u12 = 0;
         for (item_slice) |raw_idx| {
             const item_id = NodeIndex.fromInt(raw_idx);
             if (item_id.asInt() >= self.ast_arena.countNodes()) continue;
             const item_tag = self.ast_arena.getNode(item_id).tag;
             if (item_tag == .item_hole) continue;
-            if (!self.sym_table.is_including_tests and (item_tag == .test_decl or item_tag == .bench_decl)) continue;
+            if (!is_file_including_tests and (item_tag == .test_decl or item_tag == .bench_decl)) continue;
             if (item_tag == .extern_block_decl) {
                 for (self.ast_arena.getExternBlockItems(item_id)) |ext_raw_idx| {
                     const ext_id = NodeIndex.fromInt(ext_raw_idx);
@@ -1928,13 +1970,20 @@ const HirLowerer = struct {
             const matched_ast = self.resolveSameFileSubscriptAst(sub_sym_idx);
             const saved_tables = self.side_tables;
             const saved_scope = self.current_scope;
+            const saved_splice_flag = self.is_lowering_splice_helper;
             self.side_tables = null;
             self.current_scope = sub_sym.scope_id;
+            self.is_lowering_splice_helper = true;
             defer {
                 self.side_tables = saved_tables;
                 self.current_scope = saved_scope;
+                self.is_lowering_splice_helper = saved_splice_flag;
             }
+            const fn_floor = self.store.functions.items.len;
             _ = try self.lowerSymbolItemWithAstOverride(sub_sym_idx, matched_ast);
+            for (self.store.functions.items[fn_floor..]) |*meta_item| {
+                meta_item.is_splice_helper_only = true;
+            }
         }
     }
 
@@ -1956,12 +2005,15 @@ const HirLowerer = struct {
                     ExtraIndex.fromInt(root_node.lhs.payload),
                     root_node.rhs.payload,
                 );
+                const is_file_including_tests = self.sym_table.is_including_tests and
+                    (self.sym_table.getFilePackageId(self.store.file_id) == .root);
                 var ordinal: u12 = 0;
                 for (item_slice) |raw_idx| {
                     const item_id = NodeIndex.fromInt(raw_idx);
                     if (item_id.asInt() >= self.ast_arena.countNodes()) continue;
                     const item_tag = self.ast_arena.getNode(item_id).tag;
                     if (item_tag == .item_hole) continue;
+                    if (!is_file_including_tests and (item_tag == .test_decl or item_tag == .bench_decl)) continue;
                     if (item_tag == .extern_block_decl) {
                         for (self.ast_arena.getExternBlockItems(item_id)) |ext_raw_idx| {
                             const ext_id = NodeIndex.fromInt(ext_raw_idx);
@@ -2103,6 +2155,11 @@ const HirLowerer = struct {
                     self.ast_arena.getNode(eff_ast).main_token
                 else
                     TokenIndex.fromInt(0);
+                if (sym.kind == .struct_sym and !self.is_lowering_splice_helper and
+                    !sym.flags.is_imported and !sym.flags.is_builtin)
+                {
+                    try self.synthesizeStructFieldDefaultSastProbe(sym_idx, tok);
+                }
                 return self.emitNode(.{
                     .tag = .hir_struct_decl,
                     .flags = .{ .category = .rvalue },
@@ -2372,13 +2429,17 @@ const HirLowerer = struct {
         self.store.functions.items[fn_meta_idx].body_hir = body_hir;
         self.store.functions.items[fn_meta_idx].total_local_len = total_locals;
 
-        return self.emitNode(.{
+        const decl_hir = try self.emitNode(.{
             .tag = .hir_fn_decl,
             .flags = .{ .category = .rvalue },
             .type_id = fn_sym.type_id,
             .origin_token = fn_ast.main_token,
             .data = .{ .lhs = fn_meta_idx, .rhs = body_hir.asInt() },
         }, eff_ast);
+        if (!self.is_lowering_splice_helper and !fn_sym.flags.is_imported and !fn_sym.flags.is_builtin) {
+            try self.synthesizeFnParamDefaultSastProbe(fn_sym_idx, sig_view, fn_ast.main_token);
+        }
+        return decl_hir;
     }
 
     /// Returns `true` if `cst_id` carries a direct leading `@<target_attr>` attribute.
@@ -2624,7 +2685,317 @@ const HirLowerer = struct {
             }, eff_ast);
             if (first_decl_hir.isNone()) first_decl_hir = decl_hir;
         }
+        if (!self.is_lowering_splice_helper and !fn_sym.flags.is_imported and !fn_sym.flags.is_builtin) {
+            try self.synthesizeFnParamDefaultSastProbe(fn_sym_idx, sig_view, fn_ast.main_token);
+        }
         return first_decl_hir;
+    }
+
+    /// Synthesizes an `is_sast_default_probe` `HirFnMeta` lowering declared struct field defaults in `struct_sym_idx` (`P1-5`).
+    fn synthesizeStructFieldDefaultSastProbe(
+        self: *HirLowerer,
+        struct_sym_idx: SymbolIndex,
+        origin_tok: TokenIndex,
+    ) anyerror!void {
+        const struct_sym = self.sym_table.getSymbol(struct_sym_idx).*;
+        if (struct_sym.target_scope.isNone()) return;
+
+        var has_any_default = false;
+        for (self.sym_table.getScopeMembers(struct_sym.target_scope)) |mem_idx| {
+            const field_sym = self.sym_table.getSymbol(mem_idx).*;
+            if (field_sym.kind != .field_sym) continue;
+            if (!field_sym.decl_span.file_id.isNone() and field_sym.decl_span.file_id != self.store.file_id) continue;
+            const def_ast = extractStructFieldDefaultAst(
+                field_sym,
+                self.ast_arena,
+                self.cst_arena,
+                self.tokens,
+                self.cst_to_ast,
+            );
+            if (!def_ast.isNone()) {
+                has_any_default = true;
+                break;
+            }
+        }
+        if (!has_any_default) return;
+
+        const saved_scope = self.current_scope;
+        const saved_ret_ty = self.current_fn_ret_ty;
+        const saved_loop_id = self.current_loop_id;
+        const saved_closure_ceil = self.closure_outer_local_ceil;
+        const saved_owner_def = self.active_owner_def_id;
+        const saved_closure_ord = self.closure_ordinal_in_owner;
+        const saved_fn_name = self.active_fn_name;
+        const saved_caller_loc = self.active_caller_loc_local;
+        const saved_in_sub_inout = self.is_in_subscript_inout_arm;
+        const saved_in_unsafe = self.is_in_unsafe;
+        const saved_in_nursery = self.is_in_nursery_body;
+        const saved_lex_file = self.active_lexical_file_id;
+        const saved_closure_frames = self.closure_frame_stack;
+        self.closure_frame_stack = .empty;
+        const builder_floor = self.builder_scope_stack.items.len;
+        const fsm_floor = self.labeled_match_stack.items.len;
+        const local_checkpoint = self.local_shadow_log.items.len;
+        const ct_checkpoint = self.comptime_shadow_log.items.len;
+        defer {
+            for (self.closure_frame_stack.items) |*frame| frame.captures.deinit(self.allocator);
+            self.closure_frame_stack.deinit(self.allocator);
+            self.closure_frame_stack = saved_closure_frames;
+            self.popComptimeBindingsTo(ct_checkpoint);
+            self.popLexicalLocalsTo(local_checkpoint);
+            self.builder_scope_stack.items.len = builder_floor;
+            self.labeled_match_stack.items.len = fsm_floor;
+            self.current_scope = saved_scope;
+            self.current_fn_ret_ty = saved_ret_ty;
+            self.current_loop_id = saved_loop_id;
+            self.closure_outer_local_ceil = saved_closure_ceil;
+            self.active_owner_def_id = saved_owner_def;
+            self.closure_ordinal_in_owner = saved_closure_ord;
+            self.active_fn_name = saved_fn_name;
+            self.active_caller_loc_local = saved_caller_loc;
+            self.is_in_subscript_inout_arm = saved_in_sub_inout;
+            self.is_in_unsafe = saved_in_unsafe;
+            self.is_in_nursery_body = saved_in_nursery;
+            self.active_lexical_file_id = saved_lex_file;
+        }
+
+        self.current_scope = struct_sym.target_scope;
+        self.current_fn_ret_ty = .unit_ty;
+        self.current_loop_id = null;
+        self.loop_stack.clearRetainingCapacity();
+        self.closure_loop_stack_floor = 0;
+        self.dollar_len_stack.clearRetainingCapacity();
+        self.is_in_cond_scope = false;
+        self.closure_outer_local_ceil = 0;
+        self.active_fn_name = struct_sym.name;
+        self.active_caller_loc_local = null;
+        self.is_in_subscript_inout_arm = false;
+        self.is_in_unsafe = false;
+        self.is_in_nursery_body = false;
+        if (!struct_sym.def_id.isNone()) {
+            self.active_owner_def_id = struct_sym.def_id;
+        }
+
+        const return_local_id = try self.store.appendLocal(.{
+            .name = .empty,
+            .type_id = .unit_ty,
+            .decl_span = struct_sym.decl_span,
+            .mode = .set_mode,
+            .is_mut = true,
+            .is_param = false,
+            .is_temp = true,
+        });
+        const param_local_start: u32 = @intCast(self.store.locals.items.len);
+        const probe_meta_idx: u32 = @intCast(self.store.functions.items.len);
+        try self.store.functions.append(self.allocator, .{
+            .def_id = struct_sym.def_id,
+            .symbol_index = struct_sym_idx,
+            .name = struct_sym.name,
+            .fn_ty = .unit_ty,
+            .ret_ty = .unit_ty,
+            .return_local_id = return_local_id,
+            .param_local_start = param_local_start,
+            .param_len = 0,
+            .is_sast_default_probe = true,
+        });
+
+        var probe_stmts: std.ArrayListUnmanaged(u32) = .empty;
+        defer probe_stmts.deinit(self.allocator);
+        for (self.sym_table.getScopeMembers(struct_sym.target_scope)) |mem_idx| {
+            const field_sym = self.sym_table.getSymbol(mem_idx).*;
+            if (field_sym.kind != .field_sym) continue;
+            if (!field_sym.decl_span.file_id.isNone() and field_sym.decl_span.file_id != self.store.file_id) continue;
+            const def_ast = extractStructFieldDefaultAst(
+                field_sym,
+                self.ast_arena,
+                self.cst_arena,
+                self.tokens,
+                self.cst_to_ast,
+            );
+            if (def_ast.isNone()) continue;
+            self.active_lexical_file_id = if (!field_sym.decl_span.file_id.isNone())
+                field_sym.decl_span.file_id
+            else
+                self.store.file_id;
+            const expr_hir = try self.lowerExpr(def_ast, self.concreteType(field_sym.type_id));
+            if (!expr_hir.isNone()) {
+                try probe_stmts.append(self.allocator, expr_hir.asInt());
+            }
+        }
+        const probe_body_hir = try self.emitSyntheticBlock(probe_stmts.items, .none, .unit_ty, origin_tok);
+        const total_locals: u32 = @intCast(self.store.locals.items.len - return_local_id);
+        self.store.functions.items[probe_meta_idx].body_hir = probe_body_hir;
+        self.store.functions.items[probe_meta_idx].total_local_len = total_locals;
+    }
+
+    /// Synthesizes an `is_sast_default_probe` `HirFnMeta` lowering declared parameter defaults on `fn_sym_idx` (`P1-5`).
+    fn synthesizeFnParamDefaultSastProbe(
+        self: *HirLowerer,
+        fn_sym_idx: SymbolIndex,
+        sig_view: type_system.FnSignatureView,
+        origin_tok: TokenIndex,
+    ) anyerror!void {
+        const specs = self.sym_table.fn_param_specs.get(fn_sym_idx.asInt()) orelse return;
+        var has_any_default = false;
+        for (specs) |spec| {
+            if (spec.has_default and !spec.is_caller_location_default and !spec.default_ast_node.isNone() and
+                (spec.decl_file_id.isNone() or spec.decl_file_id == self.store.file_id))
+            {
+                has_any_default = true;
+                break;
+            }
+        }
+        if (!has_any_default) return;
+
+        const fn_sym = self.sym_table.getSymbol(fn_sym_idx).*;
+        const saved_scope = self.current_scope;
+        const saved_ret_ty = self.current_fn_ret_ty;
+        const saved_loop_id = self.current_loop_id;
+        const saved_closure_ceil = self.closure_outer_local_ceil;
+        const saved_owner_def = self.active_owner_def_id;
+        const saved_closure_ord = self.closure_ordinal_in_owner;
+        const saved_fn_name = self.active_fn_name;
+        const saved_caller_loc = self.active_caller_loc_local;
+        const saved_in_sub_inout = self.is_in_subscript_inout_arm;
+        const saved_in_unsafe = self.is_in_unsafe;
+        const saved_in_nursery = self.is_in_nursery_body;
+        const saved_lex_file = self.active_lexical_file_id;
+        const saved_sym_to_local = self.symbol_to_local;
+        self.symbol_to_local = .empty;
+        const saved_closure_frames = self.closure_frame_stack;
+        self.closure_frame_stack = .empty;
+        const builder_floor = self.builder_scope_stack.items.len;
+        const fsm_floor = self.labeled_match_stack.items.len;
+        const local_checkpoint = self.local_shadow_log.items.len;
+        const ct_checkpoint = self.comptime_shadow_log.items.len;
+        defer {
+            self.symbol_to_local.deinit(self.allocator);
+            self.symbol_to_local = saved_sym_to_local;
+            for (self.closure_frame_stack.items) |*frame| frame.captures.deinit(self.allocator);
+            self.closure_frame_stack.deinit(self.allocator);
+            self.closure_frame_stack = saved_closure_frames;
+            self.popComptimeBindingsTo(ct_checkpoint);
+            self.popLexicalLocalsTo(local_checkpoint);
+            self.builder_scope_stack.items.len = builder_floor;
+            self.labeled_match_stack.items.len = fsm_floor;
+            self.current_scope = saved_scope;
+            self.current_fn_ret_ty = saved_ret_ty;
+            self.current_loop_id = saved_loop_id;
+            self.closure_outer_local_ceil = saved_closure_ceil;
+            self.active_owner_def_id = saved_owner_def;
+            self.closure_ordinal_in_owner = saved_closure_ord;
+            self.active_fn_name = saved_fn_name;
+            self.active_caller_loc_local = saved_caller_loc;
+            self.is_in_subscript_inout_arm = saved_in_sub_inout;
+            self.is_in_unsafe = saved_in_unsafe;
+            self.is_in_nursery_body = saved_in_nursery;
+            self.active_lexical_file_id = saved_lex_file;
+        }
+
+        self.current_scope = if (!fn_sym.target_scope.isNone()) fn_sym.target_scope else fn_sym.scope_id;
+        self.current_fn_ret_ty = .unit_ty;
+        self.current_loop_id = null;
+        self.loop_stack.clearRetainingCapacity();
+        self.closure_loop_stack_floor = 0;
+        self.dollar_len_stack.clearRetainingCapacity();
+        self.is_in_cond_scope = false;
+        self.closure_outer_local_ceil = 0;
+        self.active_fn_name = fn_sym.name;
+        self.active_caller_loc_local = null;
+        self.is_in_subscript_inout_arm = false;
+        self.is_in_unsafe = false;
+        self.is_in_nursery_body = false;
+        if (!fn_sym.def_id.isNone()) {
+            self.active_owner_def_id = fn_sym.def_id;
+        }
+
+        const return_local_id = try self.store.appendLocal(.{
+            .name = .empty,
+            .type_id = .unit_ty,
+            .decl_span = fn_sym.decl_span,
+            .mode = .set_mode,
+            .is_mut = true,
+            .is_param = false,
+            .is_temp = true,
+        });
+        const param_local_start: u32 = @intCast(self.store.locals.items.len);
+
+        const param_syms = try self.allocator.alloc(SymbolIndex, sig_view.paramCount());
+        defer if (param_syms.len > 0) self.allocator.free(param_syms);
+        @memset(param_syms, .none);
+        if (!fn_sym.target_scope.isNone()) {
+            for (self.sym_table.getScopeMembers(fn_sym.target_scope)) |mem_idx| {
+                const mem_sym = self.sym_table.getSymbol(mem_idx).*;
+                if (mem_sym.kind == .param_sym and mem_sym.member_ordinal < param_syms.len) {
+                    param_syms[mem_sym.member_ordinal] = mem_idx;
+                }
+            }
+        }
+
+        var param_idx: usize = 0;
+        while (param_idx < sig_view.paramCount()) : (param_idx += 1) {
+            const param_ty = self.concreteType(sig_view.getParamType(param_idx));
+            const param_mode = sig_view.getParamMode(param_idx);
+            const param_sym_idx = if (param_idx < param_syms.len) param_syms[param_idx] else SymbolIndex.none;
+            const param_name = if (!param_sym_idx.isNone())
+                self.sym_table.getSymbol(param_sym_idx).name
+            else
+                SymbolId.empty;
+            const param_span = if (!param_sym_idx.isNone())
+                self.sym_table.getSymbol(param_sym_idx).decl_span
+            else
+                fn_sym.decl_span;
+            const is_param_mut = (!param_sym_idx.isNone() and self.sym_table.getSymbol(param_sym_idx).flags.is_mut) or
+                param_mode == .inout_mode or param_mode == .set_mode;
+            const slot_id = try self.store.appendLocal(.{
+                .name = param_name,
+                .type_id = param_ty,
+                .decl_span = param_span,
+                .mode = param_mode,
+                .is_mut = is_param_mut,
+                .is_param = true,
+                .is_temp = false,
+                .is_comptime = !param_sym_idx.isNone() and self.sym_table.getSymbol(param_sym_idx).flags.is_comptime,
+                .symbol_index = param_sym_idx,
+            });
+            if (!param_sym_idx.isNone()) {
+                try self.symbol_to_local.put(self.allocator, param_sym_idx.asInt(), slot_id);
+            }
+            try self.pushLexicalLocal(param_name, slot_id);
+        }
+
+        const probe_meta_idx: u32 = @intCast(self.store.functions.items.len);
+        try self.store.functions.append(self.allocator, .{
+            .def_id = fn_sym.def_id,
+            .symbol_index = fn_sym_idx,
+            .name = fn_sym.name,
+            .fn_ty = fn_sym.type_id,
+            .ret_ty = .unit_ty,
+            .return_local_id = return_local_id,
+            .param_local_start = param_local_start,
+            .param_len = @intCast(sig_view.paramCount()),
+            .is_sast_default_probe = true,
+        });
+
+        var probe_stmts: std.ArrayListUnmanaged(u32) = .empty;
+        defer probe_stmts.deinit(self.allocator);
+        for (specs, 0..) |spec, spec_idx| {
+            if (!spec.has_default or spec.is_caller_location_default or spec.default_ast_node.isNone()) continue;
+            if (!spec.decl_file_id.isNone() and spec.decl_file_id != self.store.file_id) continue;
+            self.active_lexical_file_id = if (!spec.decl_file_id.isNone()) spec.decl_file_id else self.store.file_id;
+            const expected_ty = if (spec_idx < sig_view.paramCount())
+                self.concreteType(sig_view.getParamType(spec_idx))
+            else
+                .err_ty;
+            const expr_hir = try self.lowerExpr(spec.default_ast_node, expected_ty);
+            if (!expr_hir.isNone()) {
+                try probe_stmts.append(self.allocator, expr_hir.asInt());
+            }
+        }
+        const probe_body_hir = try self.emitSyntheticBlock(probe_stmts.items, .none, .unit_ty, origin_tok);
+        const total_locals: u32 = @intCast(self.store.locals.items.len - return_local_id);
+        self.store.functions.items[probe_meta_idx].body_hir = probe_body_hir;
+        self.store.functions.items[probe_meta_idx].total_local_len = total_locals;
     }
 
     /// Checks whether `fn_sym_idx` carries a `@contextless` attribute in CST.
@@ -2827,6 +3198,12 @@ const HirLowerer = struct {
             eff_segs = eff_segs[1..];
         }
         if (eff_segs.len == 2 and std.mem.eql(u8, eff_segs[0], "feature")) {
+            if (self.sym_table.has_package_feature_manifest.contains(self.cfg_env.owner_pkg_id)) {
+                return self.sym_table.isPackageFeatureEnabled(self.cfg_env.owner_pkg_id, eff_segs[1]);
+            }
+            if (self.sym_table.isPackageFeatureEnabled(self.cfg_env.owner_pkg_id, eff_segs[1])) {
+                return true;
+            }
             for (self.cfg_env.enabled_features) |feat| {
                 if (std.mem.eql(u8, feat, eff_segs[1])) return true;
             }
@@ -2843,6 +3220,14 @@ const HirLowerer = struct {
                 const raw_lit = symbol_resolver.extractTokenSlice(self.source, self.tokens, cfg_tokens[pos.* + 1]);
                 pos.* += 3;
                 const item_name = if (raw_lit.len >= 2) raw_lit[1 .. raw_lit.len - 1] else "";
+                if (std.mem.eql(u8, key, "feature")) {
+                    if (self.sym_table.has_package_feature_manifest.contains(self.cfg_env.owner_pkg_id)) {
+                        return self.sym_table.isPackageFeatureEnabled(self.cfg_env.owner_pkg_id, item_name);
+                    }
+                    if (self.sym_table.isPackageFeatureEnabled(self.cfg_env.owner_pkg_id, item_name)) {
+                        return true;
+                    }
+                }
                 const slice = if (std.mem.eql(u8, key, "feature"))
                     self.cfg_env.enabled_features
                 else
@@ -8683,11 +9068,14 @@ const HirLowerer = struct {
 
         const saved_scope = self.current_scope;
         const saved_mut_ctx = self.is_mut_lvalue_ctx;
+        const saved_lex_file = self.active_lexical_file_id;
         self.current_scope = field_scope;
         self.is_mut_lvalue_ctx = false;
+        self.active_lexical_file_id = if (!decl_file.isNone()) decl_file else self.store.file_id;
         defer {
             self.current_scope = saved_scope;
             self.is_mut_lvalue_ctx = saved_mut_ctx;
+            self.active_lexical_file_id = saved_lex_file;
         }
 
         if (decl_file.isNone() or decl_file == self.store.file_id) {
@@ -9125,62 +9513,99 @@ const HirLowerer = struct {
         return cur;
     }
 
-    /// Classifies whether `recv_id` denotes a static module or type namespace rather than a runtime value.
-    fn resolveStaticDotTargetAst(self: *const HirLowerer, recv_id: NodeIndex) StaticDotKind {
-        if (recv_id.isNone() or recv_id.asInt() >= self.ast_arena.countNodes()) return .none;
+    /// Resolved static module or nominal type namespace target for Unified `.` path expressions (`P2-3`).
+    const StaticNamespaceTarget = struct {
+        /// Whether the target denotes a module/package namespace or nominal type namespace.
+        kind: StaticDotKind,
+        /// Member `ScopeId` of the target module/package/type (`.none` for built-in `Option`/`Result`/primitives).
+        scope_id: ScopeId,
+    };
+
+    /// Classifies `sym_idx` (after unwrapping `use` aliases) into a `StaticNamespaceTarget` if it is a module or type.
+    fn classifyStaticNamespaceSymbol(self: *const HirLowerer, sym_idx: SymbolIndex) ?StaticNamespaceTarget {
+        if (sym_idx.isNone()) return null;
+        const resolved_idx = self.unwrapAliasSymbolIdx(sym_idx);
+        const sym = self.sym_table.getSymbol(resolved_idx).*;
+        if (!sym.target_scope.isNone() and
+            (sym.kind == .module_sym or sym.kind == .const_sym or
+                sym.kind == .local_let_sym or sym.kind == .local_var_sym))
+        {
+            return .{ .kind = .module_ns, .scope_id = sym.target_scope };
+        }
+        if (self.symbol_to_local.contains(resolved_idx.asInt())) return null;
+        return switch (sym.kind) {
+            .module_sym => .{ .kind = .module_ns, .scope_id = sym.target_scope },
+            .struct_sym,
+            .enum_sym,
+            .union_sym,
+            .bit_field_sym,
+            .trait_sym,
+            .type_alias_sym,
+            .distinct_type_sym,
+            .refined_type_sym,
+            .type_param_sym,
+            => .{ .kind = .type_ns, .scope_id = sym.target_scope },
+            else => null,
+        };
+    }
+
+    /// Resolves `recv_id` up to `depth < 16` into a `StaticNamespaceTarget` supporting `pkg.`, `dep_alias.`, and chained paths.
+    fn resolveStaticNamespaceAst(self: *const HirLowerer, recv_id: NodeIndex, depth: u8) ?StaticNamespaceTarget {
+        if (depth >= 16 or recv_id.isNone() or recv_id.asInt() >= self.ast_arena.countNodes()) return null;
         const recv_node = self.ast_arena.getNode(recv_id);
         if (recv_node.tag == .index_expr and recv_node.lhs.tag == .node) {
-            return self.resolveStaticDotTargetAst(NodeIndex.fromInt(recv_node.lhs.payload));
+            return self.resolveStaticNamespaceAst(NodeIndex.fromInt(recv_node.lhs.payload), depth + 1);
         }
-        var sym_idx = self.nodeSymbol(recv_id);
-        if (sym_idx.isNone() and recv_node.tag == .ident_expr and !recv_node.main_token.isNone()) {
-            const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, recv_node.main_token);
-            if (self.interner.lookup(lexeme)) |name_id| {
-                switch (self.sym_table.lookupLexical(self.current_scope, name_id, NamespaceMask.ALL)) {
-                    .found => |found_idx| sym_idx = found_idx,
-                    else => {},
-                }
-            }
+
+        const recorded_sym = self.nodeSymbol(recv_id);
+        if (!recorded_sym.isNone()) {
+            if (self.classifyStaticNamespaceSymbol(recorded_sym)) |target| return target;
         }
-        if (!sym_idx.isNone()) {
-            const resolved_idx = self.unwrapAliasSymbolIdx(sym_idx);
-            const sym = self.sym_table.getSymbol(resolved_idx).*;
-            if (!sym.target_scope.isNone() and
-                (sym.kind == .module_sym or sym.kind == .const_sym or
-                    sym.kind == .local_let_sym or sym.kind == .local_var_sym))
-            {
-                return .module_ns;
-            }
-        }
+
         if (recv_node.tag == .ident_expr and !recv_node.main_token.isNone()) {
             const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, recv_node.main_token);
+            // [1] `pkg` always resolves to the caller package's root module scope (`src/root.cx`) BEFORE `lookupLexical`:
+            if (std.mem.eql(u8, lexeme, "pkg")) {
+                const pkg_scope = self.sym_table.resolveCallerPackageRootScope(
+                    self.active_lexical_file_id,
+                    self.current_scope,
+                );
+                if (!pkg_scope.isNone()) {
+                    return .{ .kind = .module_ns, .scope_id = pkg_scope };
+                }
+            }
             if (self.interner.lookup(lexeme)) |name_id| {
                 if (self.active_name_to_local.contains(name_id.asInt()) or
                     self.active_comptime_vals.contains(name_id.asInt()) or
                     self.active_zip_bindings.contains(name_id.asInt()))
                 {
-                    return .none;
+                    return null;
+                }
+                if (std.mem.eql(u8, lexeme, "core") and
+                    !self.sym_table.isCoreAllowedForFile(self.active_lexical_file_id))
+                {
+                    return null;
+                }
+                switch (self.sym_table.lookupLexical(self.current_scope, name_id, NamespaceMask.ALL)) {
+                    .found => |found_idx| {
+                        if (self.classifyStaticNamespaceSymbol(found_idx)) |target| return target;
+                    },
+                    else => {},
+                }
+                if (self.sym_table.lookupExternalPackageScope(self.active_lexical_file_id, name_id)) |dep_scope| {
+                    if (!dep_scope.isNone()) {
+                        return .{ .kind = .module_ns, .scope_id = dep_scope };
+                    }
                 }
             }
+            if (std.mem.eql(u8, lexeme, "Option") or std.mem.eql(u8, lexeme, "Result") or
+                self.resolveBuiltinPrimitiveLexeme(lexeme) != null)
+            {
+                return .{ .kind = .type_ns, .scope_id = .none };
+            }
+            return null;
         }
-        if (!sym_idx.isNone()) {
-            const resolved_idx = self.unwrapAliasSymbolIdx(sym_idx);
-            if (self.symbol_to_local.contains(resolved_idx.asInt())) return .none;
-            return switch (self.sym_table.getSymbol(resolved_idx).kind) {
-                .module_sym => .module_ns,
-                .struct_sym,
-                .enum_sym,
-                .union_sym,
-                .bit_field_sym,
-                .trait_sym,
-                .type_alias_sym,
-                .distinct_type_sym,
-                .refined_type_sym,
-                .type_param_sym,
-                => .type_ns,
-                else => .none,
-            };
-        }
+
         if (recv_node.tag == .field_access and recv_node.lhs.tag == .node and recv_node.rhs.tag == .token) {
             const base_id = NodeIndex.fromInt(recv_node.lhs.payload);
             const field_lex = symbol_resolver.extractTokenSlice(
@@ -9188,36 +9613,30 @@ const HirLowerer = struct {
                 self.tokens,
                 TokenIndex.fromInt(recv_node.rhs.payload),
             );
-            if (std.mem.eql(u8, field_lex, "async") or std.mem.eql(u8, field_lex, "ffi")) {
-                var base_sym = self.nodeSymbol(base_id);
-                if (base_sym.isNone() and self.ast_arena.getNode(base_id).tag == .ident_expr) {
-                    const base_tok = self.ast_arena.getNode(base_id).main_token;
-                    if (!base_tok.isNone()) {
-                        const base_lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, base_tok);
-                        if (self.interner.lookup(base_lex)) |base_name_id| {
-                            switch (self.sym_table.lookupLexical(self.current_scope, base_name_id, NamespaceMask.ALL)) {
-                                .found => |found_idx| base_sym = found_idx,
-                                else => {},
-                            }
-                        }
+            if (self.resolveStaticNamespaceAst(base_id, depth + 1)) |base_ns| {
+                if (!base_ns.scope_id.isNone()) {
+                    if (self.interner.lookup(field_lex)) |member_id| {
+                        const member_sym = self.sym_table.lookupInScopeDirect(
+                            base_ns.scope_id,
+                            member_id,
+                            NamespaceMask.ALL,
+                        );
+                        if (self.classifyStaticNamespaceSymbol(member_sym)) |target| return target;
                     }
-                }
-                if (!base_sym.isNone()) {
-                    const unwrapped_base = self.unwrapAliasSymbolIdx(base_sym);
-                    if (self.sym_table.getSymbol(unwrapped_base).target_scope == self.sym_table.cx_root_scope) {
-                        return .module_ns;
+                    if (base_ns.scope_id == self.sym_table.cx_root_scope and
+                        (std.mem.eql(u8, field_lex, "async") or std.mem.eql(u8, field_lex, "ffi")))
+                    {
+                        return .{ .kind = .module_ns, .scope_id = .none };
                     }
                 }
             }
         }
-        if (recv_node.tag == .ident_expr and !recv_node.main_token.isNone()) {
-            const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, recv_node.main_token);
-            if (std.mem.eql(u8, lexeme, "Option") or std.mem.eql(u8, lexeme, "Result") or
-                self.resolveBuiltinPrimitiveLexeme(lexeme) != null)
-            {
-                return .type_ns;
-            }
-        }
+        return null;
+    }
+
+    /// Classifies whether `recv_id` denotes a static module or type namespace rather than a runtime value.
+    fn resolveStaticDotTargetAst(self: *const HirLowerer, recv_id: NodeIndex) StaticDotKind {
+        if (self.resolveStaticNamespaceAst(recv_id, 0)) |target| return target.kind;
         return .none;
     }
 
@@ -9392,29 +9811,12 @@ const HirLowerer = struct {
         member_name: []const u8,
     ) SymbolIndex {
         const member_id = self.interner.lookup(member_name) orelse return .none;
-        const target_base_id = if (!recv_id.isNone() and recv_id.asInt() < self.ast_arena.countNodes() and
-            self.ast_arena.getNode(recv_id).tag == .index_expr and
-            self.ast_arena.getNode(recv_id).lhs.tag == .node)
-            NodeIndex.fromInt(self.ast_arena.getNode(recv_id).lhs.payload)
-        else
-            recv_id;
-        var recv_sym = self.nodeSymbol(target_base_id);
-        if (recv_sym.isNone() and !target_base_id.isNone() and target_base_id.asInt() < self.ast_arena.countNodes()) {
-            const base_node = self.ast_arena.getNode(target_base_id);
-            if (base_node.tag == .ident_expr and !base_node.main_token.isNone()) {
-                const lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, base_node.main_token);
-                if (self.interner.lookup(lex)) |base_name_id| {
-                    switch (self.sym_table.lookupLexical(self.current_scope, base_name_id, NamespaceMask.ALL)) {
-                        .found => |found_idx| recv_sym = found_idx,
-                        else => {},
-                    }
-                }
+        if (self.resolveStaticNamespaceAst(recv_id, 0)) |target_ns| {
+            if (!target_ns.scope_id.isNone()) {
+                return self.sym_table.lookupInScopeDirect(target_ns.scope_id, member_id, NamespaceMask.ALL);
             }
         }
-        if (recv_sym.isNone()) return .none;
-        const owner_scope = self.sym_table.getSymbol(recv_sym).target_scope;
-        if (owner_scope.isNone()) return .none;
-        return self.sym_table.lookupInScopeDirect(owner_scope, member_id, NamespaceMask.ALL);
+        return .none;
     }
 
     /// Desugars `lhs |> f(a_1, …, a_k)`, `lhs |> mod.f(a_1, …, a_k)`, and `lhs |> recv.m(a_1, …, a_k)` (`DR-13` §2.2 Rule 1).
@@ -11419,11 +11821,13 @@ const HirLowerer = struct {
         const saved_zips = self.active_zip_bindings;
         const saved_scope = self.current_scope;
         const saved_mut_ctx = self.is_mut_lvalue_ctx;
+        const saved_lex_file = self.active_lexical_file_id;
         self.active_name_to_local = .empty;
         self.active_comptime_vals = .empty;
         self.active_zip_bindings = .empty;
         self.current_scope = callee_scope;
         self.is_mut_lvalue_ctx = false;
+        self.active_lexical_file_id = if (!spec.decl_file_id.isNone()) spec.decl_file_id else self.store.file_id;
         defer {
             self.active_name_to_local.deinit(self.allocator);
             self.active_comptime_vals.deinit(self.allocator);
@@ -11433,6 +11837,7 @@ const HirLowerer = struct {
             self.active_zip_bindings = saved_zips;
             self.current_scope = saved_scope;
             self.is_mut_lvalue_ctx = saved_mut_ctx;
+            self.active_lexical_file_id = saved_lex_file;
         }
 
         // Bind earlier evaluated parameter slots (`0 .. full_param_idx`) so `hi: i32 = lo + 10` resolves `lo`:
@@ -12863,13 +13268,17 @@ const HirLowerer = struct {
             },
             else => .unit_ty,
         };
-        return self.emitNode(.{
+        const intr_hir = try self.emitNode(.{
             .tag = .hir_intrinsic_call,
             .flags = .{ .category = if (res_ty == .never_ty) .diverging else .rvalue },
             .type_id = self.concreteType(res_ty),
             .origin_token = intr_tok,
             .data = .{ .lhs = @backingInt(intr_kind), .rhs = extra_idx },
         }, call_id);
+        if (intr_kind == .embed_bytes and !intr_hir.isNone()) {
+            try self.store.embed_origin_files.put(self.allocator, intr_hir.asInt(), self.active_lexical_file_id);
+        }
+        return intr_hir;
     }
 
     /// Lowers `receiver.method(…)` and Unified `.` static calls `mod.fn(…)` / `Type.assoc_fn(…)` (`DR-02` §2.2 & `SE-07`).
