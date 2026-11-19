@@ -4214,7 +4214,9 @@ pub const Parser = struct {
                     paren_depth -= 1;
                 } else if (isIdentifierKind(cur_kind)) {
                     const arg_lex = self.getTokenLexeme(TokenIndex.fromInt(@intCast(cur_idx)));
-                    if (std.mem.eql(u8, arg_lex, "non_canonical_case")) {
+                    if (std.mem.eql(u8, arg_lex, "non_canonical_case") or
+                        std.mem.eql(u8, arg_lex, "W0201"))
+                    {
                         has_non_canonical = true;
                     }
                 }
@@ -4370,7 +4372,8 @@ pub const Parser = struct {
                             if (!std.mem.eql(u8, lex, "allow")) break;
                             is_allow_attr = true;
                         } else if (is_allow_attr and isIdentifierKind(tok_rec.kind) and
-                            std.mem.eql(u8, lex, "non_canonical_case"))
+                            (std.mem.eql(u8, lex, "non_canonical_case") or
+                                std.mem.eql(u8, lex, "W0201")))
                         {
                             return true;
                         }
@@ -4618,7 +4621,7 @@ pub const Parser = struct {
                 }
             }
 
-            // Check for `SelfParam` (`&self`, `&mut self`, `[var] [own] self`, `self: Type`, or retired `mut`/`ref`/`&inout self`):
+            // Check for `SelfParam` (`&self`, `&mut self`, `[var] [own] self`, `self: Type`, or retired `mut`/`ref`/`inout`/`sink`/`&inout self`):
             const is_amp_self = self.peekKind() == .amp;
             const is_own_self = self.peekKind() == .kw_own and self.peekKindNth(1) == .kw_self_val;
             const is_mut_self = self.peekKind() == .kw_mut and self.peekKindNth(1) == .kw_self_val;
@@ -4626,8 +4629,14 @@ pub const Parser = struct {
                 std.mem.eql(u8, self.peekLexemeNth(0), "ref") and
                 (self.peekKindNth(1) == .kw_self_val or
                     (self.peekKindNth(1) == .kw_mut and self.peekKindNth(2) == .kw_self_val));
+            const is_inout_or_sink_self = self.peekKind() == .ident and
+                (std.mem.eql(u8, self.peekLexemeNth(0), "inout") or
+                    std.mem.eql(u8, self.peekLexemeNth(0), "sink")) and
+                self.peekKindNth(1) == .kw_self_val;
 
-            if (is_amp_self or is_own_self or is_mut_self or is_ref_self or self.peekKind() == .kw_self_val) {
+            if (is_amp_self or is_own_self or is_mut_self or is_ref_self or
+                is_inout_or_sink_self or self.peekKind() == .kw_self_val)
+            {
                 if (is_amp_self) {
                     const amp_tok = try self.consumeLeaf(.token_leaf, .{});
                     if (self.peekKind() == .kw_mut) {
@@ -4673,6 +4682,11 @@ pub const Parser = struct {
                         "&mut self",
                         "replace `mut self` with `&mut self`",
                     );
+                    if (self.peekKind() == .colon) {
+                        _ = try self.consumeLeaf(.token_leaf, .{});
+                        try self.consumeRetiredPostColonParamMode(&has_param_err);
+                        _ = try self.parseType();
+                    }
                     self.cst.finishNode(param_cst, .{ .has_error = true });
                     has_error.* = true;
                     if (self.peekKind() == .comma) {
@@ -4704,6 +4718,46 @@ pub const Parser = struct {
                         if (is_ref_mut) "&mut self" else "&self",
                         if (is_ref_mut) "replace `ref mut self` with `&mut self`" else "replace `ref self` with `&self`",
                     );
+                    if (self.peekKind() == .colon) {
+                        _ = try self.consumeLeaf(.token_leaf, .{});
+                        try self.consumeRetiredPostColonParamMode(&has_param_err);
+                        _ = try self.parseType();
+                    }
+                    self.cst.finishNode(param_cst, .{ .has_error = true });
+                    has_error.* = true;
+                    if (self.peekKind() == .comma) {
+                        _ = try self.consumeLeaf(.token_leaf, .{});
+                    } else if (self.peekKind() != .rparen) {
+                        break;
+                    }
+                    continue;
+                } else if (is_inout_or_sink_self) {
+                    has_param_err = true;
+                    const is_inout_kw = std.mem.eql(u8, self.peekLexemeNth(0), "inout");
+                    const mode_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                    const self_tok = try self.consumeLeaf(.token_leaf, .{});
+                    const fix_span = Span.init(
+                        self.file_id,
+                        self.getTokenSpan(mode_tok).start_byte,
+                        self.getTokenSpan(self_tok).end_byte,
+                    );
+                    try self.emitDiagnosticWithFix(
+                        .e0221_retired_mutability_or_param_mode,
+                        fix_span,
+                        if (is_inout_kw)
+                            "`inout self` receiver syntax has been retired; use `&mut self` instead"
+                        else
+                            "`sink self` receiver syntax has been retired; use `own self` instead",
+                        if (is_inout_kw) "retired `inout` receiver; use `&mut`" else "retired `sink` receiver; use `own`",
+                        fix_span,
+                        if (is_inout_kw) "&mut self" else "own self",
+                        if (is_inout_kw) "replace `inout self` with `&mut self`" else "replace `sink self` with `own self`",
+                    );
+                    if (self.peekKind() == .colon) {
+                        _ = try self.consumeLeaf(.token_leaf, .{});
+                        try self.consumeRetiredPostColonParamMode(&has_param_err);
+                        _ = try self.parseType();
+                    }
                     self.cst.finishNode(param_cst, .{ .has_error = true });
                     has_error.* = true;
                     if (self.peekKind() == .comma) {
@@ -4726,9 +4780,10 @@ pub const Parser = struct {
                     _ = try self.parseType();
                 }
             } else {
-                // Handle retired leading parameter modifiers (`mut x: T`, `own x: T`, `ref [mut] x: T`) -> `E0221`:
+                // Handle retired leading parameter modifiers (`mut`/`own`/`ref`/`inout`/`set`/`out`/`sink x: T`) -> `E0221`:
                 var opt_retired_own_tok: ?TokenIndex = null;
                 var opt_retired_ref_tok: ?TokenIndex = null;
+                var retired_mode_lex: []const u8 = "";
                 var is_retired_ref_mut = false;
 
                 if (self.peekKind() == .kw_mut) {
@@ -4751,15 +4806,28 @@ pub const Parser = struct {
                         has_leading_var = true;
                         _ = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
                     }
-                } else if (self.peekKind() == .ident and
-                    std.mem.eql(u8, self.peekLexemeNth(0), "ref") and
-                    (self.peekKindNth(1) == .kw_mut or
-                        isIdentifierKind(self.peekKindNth(1)) or
-                        self.peekKindNth(1) == .underscore))
-                {
+                } else if (self.peekKind() == .ident and blk_ret_mode: {
+                    const first_lex = self.peekLexemeNth(0);
+                    if (std.mem.eql(u8, first_lex, "ref")) {
+                        break :blk_ret_mode self.peekKindNth(1) == .kw_mut or
+                            isIdentifierKind(self.peekKindNth(1)) or
+                            self.peekKindNth(1) == .underscore;
+                    }
+                    if (std.mem.eql(u8, first_lex, "inout") or
+                        std.mem.eql(u8, first_lex, "set") or
+                        std.mem.eql(u8, first_lex, "out") or
+                        std.mem.eql(u8, first_lex, "sink"))
+                    {
+                        break :blk_ret_mode (isIdentifierKind(self.peekKindNth(1)) or
+                            self.peekKindNth(1) == .underscore) and
+                            self.peekKindNth(2) == .colon;
+                    }
+                    break :blk_ret_mode false;
+                }) {
                     has_param_err = true;
+                    retired_mode_lex = self.peekLexemeNth(0);
                     opt_retired_ref_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
-                    if (self.peekKind() == .kw_mut) {
+                    if (std.mem.eql(u8, retired_mode_lex, "ref") and self.peekKind() == .kw_mut) {
                         is_retired_ref_mut = true;
                         _ = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
                     }
@@ -4835,21 +4903,29 @@ pub const Parser = struct {
                                     " \t\r\n",
                                 );
                                 if (name_lex.len > 0 and ty_lex.len > 0) {
-                                    opt_rep = if (is_retired_ref_mut)
-                                        try std.fmt.allocPrint(sink.arena.asAllocator(), "{s}: &mut {s}", .{ name_lex, ty_lex })
+                                    const sink_alloc = sink.arena.asAllocator();
+                                    opt_rep = if (is_retired_ref_mut or std.mem.eql(u8, retired_mode_lex, "inout"))
+                                        try std.fmt.allocPrint(sink_alloc, "{s}: &mut {s}", .{ name_lex, ty_lex })
+                                    else if (std.mem.eql(u8, retired_mode_lex, "set") or std.mem.eql(u8, retired_mode_lex, "out"))
+                                        try std.fmt.allocPrint(sink_alloc, "{s}: &out {s}", .{ name_lex, ty_lex })
+                                    else if (std.mem.eql(u8, retired_mode_lex, "sink"))
+                                        (if (has_leading_var)
+                                            try std.fmt.allocPrint(sink_alloc, "var {s}: own {s}", .{ name_lex, ty_lex })
+                                        else
+                                            try std.fmt.allocPrint(sink_alloc, "{s}: own {s}", .{ name_lex, ty_lex }))
                                     else
-                                        try std.fmt.allocPrint(sink.arena.asAllocator(), "{s}: &{s}", .{ name_lex, ty_lex });
+                                        try std.fmt.allocPrint(sink_alloc, "{s}: &{s}", .{ name_lex, ty_lex });
                                 }
                             }
                         }
                         try self.emitDiagnosticWithFix(
                             .e0221_retired_mutability_or_param_mode,
                             full_span,
-                            "`ref` parameter binding modifier has been retired; write `x: &T` or `x: &mut T` instead",
-                            "retired `ref` parameter modifier",
+                            "leading parameter mode modifier has been retired; place `&`, `&mut`, `&out`, or `own` on the parameter type",
+                            "retired leading parameter mode modifier",
                             full_span,
                             opt_rep,
-                            "rewrite parameter with `&` reference type",
+                            "move parameter mode onto the parameter type",
                         );
                     }
 
@@ -9237,6 +9313,7 @@ pub const Parser = struct {
             const saved_lhs_place = self.is_in_lhs_place;
             self.is_in_stmt_lhs = saved_stmt_lhs and (op_kind == .star);
             self.is_in_lhs_place = saved_lhs_place and (op_kind == .star);
+            const operand_cst_start = self.cst.countNodes();
             const operand = blk_pref: {
                 defer {
                     self.is_in_stmt_lhs = saved_stmt_lhs;
@@ -9248,16 +9325,14 @@ pub const Parser = struct {
             if (op_kind == .bang) {
                 has_pref_err = true;
                 const bang_span = self.getTokenSpan(op_tok);
-                const has_following_space = bang_span.end_byte < self.source.len and
-                    (self.source[bang_span.end_byte] == ' ' or self.source[bang_span.end_byte] == '\t');
                 try self.emitDiagnosticWithFix(
                     .e0220_retired_bang_prefix,
                     bang_span,
                     "prefix `!` has been retired (`ADR-22A`); write `not expr` for boolean negation or `~expr` for bitwise NOT",
                     "retired `!` prefix operator",
-                    bang_span,
-                    if (has_following_space) "not" else "not ",
-                    "replace `!` with `not` (or `~` for integer bitwise NOT)",
+                    null,
+                    null,
+                    null,
                 );
             } else if (op_kind == .star) {
                 has_pref_err = true;
@@ -9273,7 +9348,14 @@ pub const Parser = struct {
                     if (op_end >= op_start and op_end <= self.source.len) {
                         full_span = Span.init(self.file_id, star_span.start_byte, op_end);
                         const op_slice = self.source[op_start..op_end];
-                        const is_postfix_tight = switch (self.ast.getNode(operand).tag) {
+                        const is_paren_wrapped = blk_paren: {
+                            if (operand_cst_start >= self.cst.countNodes()) break :blk_paren false;
+                            const op_cst = self.cst.getNode(CstNodeIndex.fromInt(@intCast(operand_cst_start)));
+                            break :blk_paren op_cst.kind == .tuple_or_paren_expr and
+                                operand_cst_start + @as(usize, op_cst.subtree_size) == self.cst.countNodes();
+                        };
+                        const operand_node = self.ast.getNode(operand);
+                        const is_postfix_tight = is_paren_wrapped or switch (operand_node.tag) {
                             .ident_expr,
                             .self_val,
                             .field_access,
@@ -9281,11 +9363,11 @@ pub const Parser = struct {
                             .call_expr,
                             .generic_call,
                             .index_expr,
-                            .deref_expr,
                             .try_expr,
                             .await_expr,
-                            .tuple_lit,
                             => true,
+                            .deref_expr => !operand_node.main_token.isNone() and
+                                self.token_buffer.getToken(operand_node.main_token).kind != .star,
                             else => false,
                         };
                         opt_fix_text = if (is_postfix_tight)
@@ -10428,26 +10510,11 @@ pub fn reparseIncremental(
         edit.new_end_byte <= new_source.len and
         hasCleanTokensAndCst(token_buffer, cst_arena))
     {
-        var has_potential_lexer_warn_in_reused = false;
-        if (diagnostic_sink != null) {
-            for (token_buffer.tokens.items(.kind)) |tok_kind| {
-                if (tok_kind == .string_lit or
-                    tok_kind == .char_lit or
-                    tok_kind == .byte_lit or
-                    tok_kind == .byte_string_lit)
-                {
-                    has_potential_lexer_warn_in_reused = true;
-                    break;
-                }
-            }
-        }
         const old_eof_tok = TokenIndex.fromInt(@intCast(token_buffer.countTokens() - 1));
         const old_eof_offset = token_buffer.getToken(old_eof_tok).byte_offset;
         const byte_delta: i64 = @as(i64, edit.new_end_byte) - @as(i64, edit.old_end_byte);
 
-        if (!has_potential_lexer_warn_in_reused and
-            @as(i64, old_eof_offset) + byte_delta == @as(i64, @intCast(new_source.len)))
-        {
+        if (@as(i64, old_eof_offset) + byte_delta == @as(i64, @intCast(new_source.len))) {
             const windows = try extractTopLevelItemWindows(
                 cst_arena.allocator,
                 token_buffer,
@@ -10468,7 +10535,52 @@ pub fn reparseIncremental(
                 windows[suffix_start - 1].start_byte > edit.old_end_byte) : (suffix_start -= 1)
             {}
 
-            if (prefix_count > 0 or suffix_start < total_items) {
+            var has_potential_lexer_warn_in_reused = false;
+            if (diagnostic_sink != null and (prefix_count > 0 or suffix_start < total_items)) {
+                const prefix_tok_limit: usize = if (prefix_count < total_items)
+                    windows[prefix_count].first_token
+                else
+                    old_eof_tok.asInt();
+                const suffix_tok_begin: usize = if (suffix_start < total_items)
+                    windows[suffix_start].first_token
+                else
+                    old_eof_tok.asInt();
+                const tok_kinds = token_buffer.tokens.items(.kind);
+                const tok_offsets = token_buffer.tokens.items(.byte_offset);
+                const tok_lens = token_buffer.tokens.items(.byte_len);
+                var tok_idx: usize = 0;
+                while (tok_idx < old_eof_tok.asInt()) : (tok_idx += 1) {
+                    if (tok_idx >= prefix_tok_limit and tok_idx < suffix_tok_begin) {
+                        tok_idx = suffix_tok_begin - 1;
+                        continue;
+                    }
+                    const tok_kind = tok_kinds[tok_idx];
+                    if (tok_kind == .string_lit or tok_kind == .char_lit or
+                        tok_kind == .byte_lit or tok_kind == .byte_string_lit)
+                    {
+                        const new_off_i64: i64 = if (tok_idx < prefix_tok_limit)
+                            @as(i64, tok_offsets[tok_idx])
+                        else
+                            @as(i64, tok_offsets[tok_idx]) + byte_delta;
+                        if (new_off_i64 >= 0) {
+                            const new_off: usize = @intCast(new_off_i64);
+                            const new_end = @min(new_off + tok_lens[tok_idx], new_source.len);
+                            const lit_slice = new_source[new_off..new_end];
+                            if (std.mem.indexOfScalar(u8, lit_slice, '\\') != null and
+                                (std.mem.indexOf(u8, lit_slice, "\\'") != null or
+                                    std.mem.indexOf(u8, lit_slice, "\\\"") != null or
+                                    std.mem.indexOf(u8, lit_slice, "\\{") != null or
+                                    std.mem.indexOf(u8, lit_slice, "\\}") != null))
+                            {
+                                has_potential_lexer_warn_in_reused = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!has_potential_lexer_warn_in_reused and (prefix_count > 0 or suffix_start < total_items)) {
                 const reparse_start_byte: u32 = if (prefix_count < total_items)
                     windows[prefix_count].start_byte
                 else

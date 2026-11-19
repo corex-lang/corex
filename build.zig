@@ -4,7 +4,7 @@
 //! `build/stage0/` and the standard `zig-out/bin/` prefix per `.agents/skills/build/SKILL.md`.
 //!
 //! Provides `zig build`, `zig build run`, `zig build test` (executing both internal module tests and
-//! `tests/test_runner.zig`), and `zig build bench` (executing `phase0_bench` through `phase9_bench`).
+//! `tests/test_runner.zig`), and `zig build bench` (executing `phase0_bench` through `phase10_bench`).
 
 const std = @import("std");
 
@@ -476,9 +476,24 @@ pub fn build(builder: *std.Build) void {
     const run_bench9 = builder.addRunArtifact(bench9_exe);
     run_bench9.step.dependOn(&run_bench8.step);
 
+    const bench10_exe_mod = builder.createModule(.{
+        .root_source_file = builder.path("bench/suites/phase10_bench.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .imports = &.{
+            .{ .name = "corex", .module = bench_corex_mod },
+        },
+    });
+    const bench10_exe = builder.addExecutable(.{
+        .name = "phase10_bench",
+        .root_module = bench10_exe_mod,
+    });
+    const run_bench10 = builder.addRunArtifact(bench10_exe);
+    run_bench10.step.dependOn(&run_bench9.step);
+
     const bench_step = builder.step(
         "bench",
-        "Run Phase 0 through Phase 9 statistical performance benchmarks",
+        "Run Phase 0 through Phase 10 statistical performance benchmarks",
     );
     bench_step.dependOn(&run_bench0.step);
     bench_step.dependOn(&run_bench1.step);
@@ -490,6 +505,7 @@ pub fn build(builder: *std.Build) void {
     bench_step.dependOn(&run_bench7.step);
     bench_step.dependOn(&run_bench8.step);
     bench_step.dependOn(&run_bench9.step);
+    bench_step.dependOn(&run_bench10.step);
 
     builder.step("bench-phase1", "Run Phase 1 lexer performance benchmarks").dependOn(
         &builder.addRunArtifact(bench1_exe).step,
@@ -517,5 +533,8 @@ pub fn build(builder: *std.Build) void {
     );
     builder.step("bench-phase9", "Run Phase 9 Bounded-MVS, warm VFS mount & CAS crypto benchmarks").dependOn(
         &builder.addRunArtifact(bench9_exe).step,
+    );
+    builder.step("bench-phase10", "Run Phase 10 100K-LOC incremental LSP & upgrade benchmarks").dependOn(
+        &builder.addRunArtifact(bench10_exe).step,
     );
 }

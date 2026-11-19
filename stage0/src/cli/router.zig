@@ -1,10 +1,10 @@
 //! CLI Command Router, Dynamic Metadata Registry & Typo Suggestion Engine
 //!
 //! Defines the canonical `CLI_SUBCOMMANDS` (`SUBCOMMANDS`), `GLOBAL_FLAGS`, `COMPILE_FLAGS`,
-//! `TRANSLATE_C_FLAGS`, `FMT_FLAGS`, and `UPGRADE_FLAGS` metadata tables.
+//! `CHECK_FLAGS`, `TRANSLATE_C_FLAGS`, `FMT_FLAGS`, `UPGRADE_FLAGS`, and `LSP_FLAGS` tables.
 //!
 //! Parses command-line arguments in a single pass, dispatches compilation, C11/C23 header translation,
-//! formatting, and verification workflows, emits `E0001`–`E0006` diagnostics with stack-allocated
+//! formatting, LSP, upgrade, and check workflows, emits `E0001`–`E0006` diagnostics with stack-allocated
 //! Levenshtein typo suggestions (`help: did you mean \`…\`?`), and renders monochrome help menus.
 
 const std = @import("std");
@@ -17,6 +17,10 @@ const diag = @import("../diag/diagnostic.zig");
 const renderer = @import("../diag/renderer.zig");
 const bench_harness = @import("../bench/harness.zig");
 const fmt_engine = @import("../fmt_engine.zig");
+const check_audit = @import("../check_audit.zig");
+const upgrade_engine = @import("../upgrade_engine.zig");
+const upgrade_rules = @import("../upgrade_rules.zig");
+const lsp_server = @import("../lsp_server.zig");
 const query_db = @import("../query_db.zig");
 const codegen_abi = @import("../codegen_abi.zig");
 const diff_oracle = @import("../diff_oracle.zig");
@@ -135,10 +139,44 @@ pub const FmtFlagDescriptor = struct {
     summary: []const u8,
 };
 
+/// Subcommand-specific CLI option identifiers for `corex check` (`CHECK_FLAGS`).
+pub const CheckFlagId = enum(u8) {
+    /// `--caps` – render supply-chain package capability audit table (`0`).
+    caps = 0,
+    /// `--deny-warnings` – treat all compiler and lint warnings as fatal errors (`1`).
+    deny_warnings = 1,
+    /// `--explain-caps[=<pkg[,cap]>]` – render shortest call-chain capability witnesses (`2`).
+    explain_caps = 2,
+    /// `--fix` – apply machine-applicable compiler and lint autofixes (`3`).
+    fix = 3,
+};
+
+/// Static metadata entry in `CHECK_FLAGS` describing `corex check` flags.
+pub const CheckFlagDescriptor = struct {
+    /// Strongly typed `corex check` flag enum tag.
+    id: CheckFlagId,
+    /// Canonical long flag token (e.g., `"--caps"`).
+    long_flag: []const u8,
+    /// Optional value placeholder suffix (e.g., `"[=<pkg[,cap]>]"`).
+    value_suffix: ?[]const u8 = null,
+    /// Concise one-line summary displayed in `corex check --help`.
+    summary: []const u8,
+};
+
 /// Subcommand-specific CLI option identifiers for `corex upgrade` (`UPGRADE_FLAGS`).
 pub const UpgradeFlagId = enum(u8) {
-    /// `--internal-core` – permit direct `core.*` kernel imports without `E0218` (`0`).
-    internal_core = 0,
+    /// `--accept-caps[=<cap,…>]` – authorize package capability escalations (`0`).
+    accept_caps = 0,
+    /// `--check` – verify conformance without writing files to disk (`1`).
+    check = 1,
+    /// `--explain=<rule>` – display rule rationale and before/after `.cx` examples (`2`).
+    explain = 2,
+    /// `--internal-core` – permit direct `core.*` kernel imports without `E0218` (`3`).
+    internal_core = 3,
+    /// `--list` – list all 15 canonical Zero-Legacy upgrade rules (`4`).
+    list = 4,
+    /// `--rule=<id,…>` – run only the specified comma-separated upgrade rule IDs (`5`).
+    rule = 5,
 };
 
 /// Static metadata entry in `UPGRADE_FLAGS` describing `corex upgrade` flags.
@@ -147,7 +185,27 @@ pub const UpgradeFlagDescriptor = struct {
     id: UpgradeFlagId,
     /// Canonical long flag token (e.g., `"--internal-core"`).
     long_flag: []const u8,
+    /// Optional value placeholder suffix (e.g., `"=<rule>"`).
+    value_suffix: ?[]const u8 = null,
     /// Concise one-line summary.
+    summary: []const u8,
+};
+
+/// Subcommand-specific CLI option identifiers for `corex lsp` (`LSP_FLAGS`).
+pub const LspFlagId = enum(u8) {
+    /// `--internal-core` – permit direct `core.*` kernel imports without `E0218` (`0`).
+    internal_core = 0,
+    /// `--stdio` – communicate over JSON-RPC 2.0 standard input/output (`1`).
+    stdio = 1,
+};
+
+/// Static metadata entry in `LSP_FLAGS` describing `corex lsp` flags.
+pub const LspFlagDescriptor = struct {
+    /// Strongly typed `corex lsp` flag enum tag.
+    id: LspFlagId,
+    /// Canonical long flag token (e.g., `"--stdio"`).
+    long_flag: []const u8,
+    /// Concise one-line summary displayed in `corex lsp --help`.
     summary: []const u8,
 };
 
@@ -327,6 +385,28 @@ pub const ExecuteSubcommandAction = struct {
     has_no_default_features: bool = false,
     /// Whether `--verify-checksums` was passed.
     is_verifying_checksums: bool = false,
+    /// Whether `corex check --caps` was requested.
+    is_check_caps: bool = false,
+    /// Whether `corex check --deny-warnings` was requested.
+    is_deny_warnings: bool = false,
+    /// Whether `corex check --explain-caps` was requested.
+    is_explain_caps: bool = false,
+    /// Optional `[pkg]` selector extracted from `--explain-caps=<pkg[,cap]>`.
+    explain_caps_pkg: ?[]const u8 = null,
+    /// Optional `[cap]` filter extracted from `--explain-caps=<pkg[,cap]>`.
+    explain_caps_cap: ?[]const u8 = null,
+    /// Whether `corex upgrade --list` was requested.
+    is_upgrade_list: bool = false,
+    /// Optional rule ID passed to `corex upgrade --explain=<rule>`.
+    upgrade_explain_rule: ?[]const u8 = null,
+    /// Optional comma-separated rule IDs passed to `corex upgrade --rule=<id,…>`.
+    upgrade_rule_csv: ?[]const u8 = null,
+    /// Whether `corex upgrade --accept-caps[=<cap,…>]` was requested.
+    has_accept_caps: bool = false,
+    /// Optional comma-separated capability names passed to `--accept-caps=<cap,…>`.
+    accept_caps_csv: ?[]const u8 = null,
+    /// Whether `corex lsp --stdio` was requested (`true` by default).
+    is_lsp_stdio: bool = true,
 };
 
 /// Resolved CLI action produced by `parseArgs`.
@@ -361,9 +441,9 @@ pub const ParsedCommand = struct {
     color_mode: ColorMode = .auto,
     /// Resolved command action to execute.
     action: CommandAction = .{ .show_help = null },
-    /// Whether `--check` was passed on `corex fmt`.
+    /// Whether `--check` was passed on `corex fmt` or `corex upgrade`.
     is_check_only: bool = false,
-    /// Whether `--fix` was passed on `corex fmt`.
+    /// Whether `--fix` was passed on `corex fmt` or `corex check`.
     is_fix_mode: bool = false,
     /// Maximum `MirVm` compile-time execution step budget (`--comptime-limit`).
     comptime_step_limit: u64 = DEFAULT_COMPTIME_STEP_LIMIT,
@@ -381,7 +461,7 @@ pub const ParsedCommand = struct {
     is_emit_obj: bool = false,
     /// Whether `--fuzz` was passed on a compile subcommand.
     is_fuzz_enabled: bool = false,
-    /// Whether `--internal-core` was passed on a compile/check/translate-c/fmt/upgrade subcommand.
+    /// Whether `--internal-core` was passed on a compile/check/translate-c/fmt/upgrade/lsp subcommand.
     is_internal_core: bool = false,
     /// Selected codegen backend family (`llvm` by default).
     output_format: OutputFormat = .llvm,
@@ -413,6 +493,28 @@ pub const ParsedCommand = struct {
     has_no_default_features: bool = false,
     /// Whether `--verify-checksums` was passed.
     is_verifying_checksums: bool = false,
+    /// Whether `corex check --caps` was requested.
+    is_check_caps: bool = false,
+    /// Whether `corex check --deny-warnings` was requested.
+    is_deny_warnings: bool = false,
+    /// Whether `corex check --explain-caps` was requested.
+    is_explain_caps: bool = false,
+    /// Optional `[pkg]` selector extracted from `--explain-caps=<pkg[,cap]>`.
+    explain_caps_pkg: ?[]const u8 = null,
+    /// Optional `[cap]` filter extracted from `--explain-caps=<pkg[,cap]>`.
+    explain_caps_cap: ?[]const u8 = null,
+    /// Whether `corex upgrade --list` was requested.
+    is_upgrade_list: bool = false,
+    /// Optional rule ID passed to `corex upgrade --explain=<rule>`.
+    upgrade_explain_rule: ?[]const u8 = null,
+    /// Optional comma-separated rule IDs passed to `corex upgrade --rule=<id,…>`.
+    upgrade_rule_csv: ?[]const u8 = null,
+    /// Whether `corex upgrade --accept-caps[=<cap,…>]` was requested.
+    has_accept_caps: bool = false,
+    /// Optional comma-separated capability names passed to `--accept-caps=<cap,…>`.
+    accept_caps_csv: ?[]const u8 = null,
+    /// Whether `corex lsp --stdio` was requested (`true` by default).
+    is_lsp_stdio: bool = true,
     /// Arguments passed after `--` (forwarded to the child executable on `corex run`).
     run_args: []const []const u8 = &.{},
 };
@@ -540,14 +642,117 @@ pub const FMT_FLAGS = [_]FmtFlagDescriptor{
     },
 };
 
-/// Canonical `corex upgrade` option table (`DR-21` `ADR-21B`).
+/// Canonical alphabetical `corex check` option table (`DR-14` & `DR-17`).
+pub const CHECK_FLAGS = [_]CheckFlagDescriptor{
+    .{
+        .id = .caps,
+        .long_flag = "--caps",
+        .summary = "Render supply-chain package capability audit table (DR-17)",
+    },
+    .{
+        .id = .deny_warnings,
+        .long_flag = "--deny-warnings",
+        .summary = "Treat all compiler and lint warnings as fatal errors",
+    },
+    .{
+        .id = .explain_caps,
+        .long_flag = "--explain-caps",
+        .value_suffix = "[=<pkg[,cap]>]",
+        .summary = "Render shortest call-chain witnesses for package capabilities",
+    },
+    .{
+        .id = .fix,
+        .long_flag = "--fix",
+        .summary = "Apply machine-applicable compiler and lint autofixes",
+    },
+};
+
+/// Canonical alphabetical `corex upgrade` option table (`DR-14`, `DR-17`, `DR-21`, & `DR-22`).
 pub const UPGRADE_FLAGS = [_]UpgradeFlagDescriptor{
+    .{
+        .id = .accept_caps,
+        .long_flag = "--accept-caps",
+        .value_suffix = "[=<cap,…>]",
+        .summary = "Authorize package capability escalations in `corex.toml` and `corex.lock`",
+    },
+    .{
+        .id = .check,
+        .long_flag = "--check",
+        .summary = "Verify that files and manifests need no upgrades without writing",
+    },
+    .{
+        .id = .explain,
+        .long_flag = "--explain",
+        .value_suffix = "=<rule>",
+        .summary = "Display detailed documentation and examples for an upgrade rule",
+    },
     .{
         .id = .internal_core,
         .long_flag = "--internal-core",
         .summary = "Permit direct `core.*` kernel imports without `E0218`",
     },
+    .{
+        .id = .list,
+        .long_flag = "--list",
+        .summary = "List all 15 canonical Zero-Legacy upgrade rules",
+    },
+    .{
+        .id = .rule,
+        .long_flag = "--rule",
+        .value_suffix = "=<id,…>",
+        .summary = "Run only the specified comma-separated upgrade rule IDs",
+    },
 };
+
+/// Canonical alphabetical `corex lsp` option table (`DR-12`).
+pub const LSP_FLAGS = [_]LspFlagDescriptor{
+    .{
+        .id = .internal_core,
+        .long_flag = "--internal-core",
+        .summary = "Permit direct `core.*` kernel imports without `E0218`",
+    },
+    .{
+        .id = .stdio,
+        .long_flag = "--stdio",
+        .summary = "Communicate over JSON-RPC 2.0 standard input/output (default)",
+    },
+};
+
+/// $O(1)$ compile-time lookup table mapping `corex fmt` long flags to `FmtFlagId`.
+const FMT_FLAG_MAP = std.StaticStringMap(FmtFlagId).initComptime(blk: {
+    var entries: [FMT_FLAGS.len]struct { []const u8, FmtFlagId } = undefined;
+    for (FMT_FLAGS, 0..) |descriptor, i| {
+        entries[i] = .{ descriptor.long_flag, descriptor.id };
+    }
+    break :blk entries;
+});
+
+/// $O(1)$ compile-time lookup table mapping `corex check` long flags to `CheckFlagId`.
+const CHECK_FLAG_MAP = std.StaticStringMap(CheckFlagId).initComptime(blk: {
+    var entries: [CHECK_FLAGS.len]struct { []const u8, CheckFlagId } = undefined;
+    for (CHECK_FLAGS, 0..) |descriptor, i| {
+        entries[i] = .{ descriptor.long_flag, descriptor.id };
+    }
+    break :blk entries;
+});
+
+/// $O(1)$ compile-time lookup table mapping `corex upgrade` long flags to `UpgradeFlagId`.
+const UPGRADE_FLAG_MAP = std.StaticStringMap(UpgradeFlagId).initComptime(blk: {
+    var entries: [UPGRADE_FLAGS.len]struct { []const u8, UpgradeFlagId } = undefined;
+    for (UPGRADE_FLAGS, 0..) |descriptor, i| {
+        entries[i] = .{ descriptor.long_flag, descriptor.id };
+    }
+    break :blk entries;
+});
+
+/// $O(1)$ compile-time lookup table mapping `corex lsp` long flags to `LspFlagId`.
+const LSP_FLAG_MAP = std.StaticStringMap(LspFlagId).initComptime(blk: {
+    var entries: [LSP_FLAGS.len]struct { []const u8, LspFlagId } = undefined;
+    for (LSP_FLAGS, 0..) |descriptor, i| {
+        entries[i] = .{ descriptor.long_flag, descriptor.id };
+    }
+    break :blk entries;
+});
 
 /// Canonical alphabetical `corex translate-c` option table (`DR-10` Section 2 & `PLAN.md` Phase 8).
 pub const TRANSLATE_C_FLAGS = [_]TranslateCFlagDescriptor{
@@ -765,25 +970,41 @@ const HUB_MODULE_BASENAME_SET = std.StaticStringMap(void).initComptime(.{
     .{ "mod.cx", {} },
     .{ "root.cx", {} },
 });
+/// $O(1)$ lookup table of build/cache/VCS child directories skipped during recursive `.cx` walks.
+const SKIPPED_WALK_DIR_SET = std.StaticStringMap(void).initComptime(.{
+    .{ ".corex", {} },
+    .{ ".corex-cache", {} },
+    .{ ".git", {} },
+    .{ ".zig-cache", {} },
+    .{ "build", {} },
+    .{ "node_modules", {} },
+    .{ "target", {} },
+    .{ "vendor", {} },
+    .{ "zig-out", {} },
+});
 /// Monotonic atomic counter preventing scratch-path collisions across concurrent `corex run` calls.
 var next_run_scratch_seq = std.atomic.Value(u32).init(1);
 
 // -------------------------------------- INTERNALS --------------------------------------
 
-/// Resolves `arg_text` dynamically against `FMT_FLAGS` without hardcoded string drift.
+/// Resolves `arg_text` in $O(1)$ against `FMT_FLAGS` via `FMT_FLAG_MAP` without hardcoded string drift.
 fn matchFmtFlag(arg_text: []const u8) ?FmtFlagId {
-    inline for (FMT_FLAGS) |fmt_desc| {
-        if (std.mem.eql(u8, arg_text, fmt_desc.long_flag)) return fmt_desc.id;
-    }
-    return null;
+    return FMT_FLAG_MAP.get(arg_text);
 }
 
-/// Resolves `arg_text` dynamically against `UPGRADE_FLAGS` without hardcoded string drift.
+/// Resolves `arg_text` in $O(1)$ against `CHECK_FLAGS` via `CHECK_FLAG_MAP` without hardcoded string drift.
+fn matchCheckFlag(arg_text: []const u8) ?CheckFlagId {
+    return CHECK_FLAG_MAP.get(arg_text);
+}
+
+/// Resolves `arg_text` in $O(1)$ against `UPGRADE_FLAGS` via `UPGRADE_FLAG_MAP` without hardcoded string drift.
 fn matchUpgradeFlag(arg_text: []const u8) ?UpgradeFlagId {
-    inline for (UPGRADE_FLAGS) |upg_desc| {
-        if (std.mem.eql(u8, arg_text, upg_desc.long_flag)) return upg_desc.id;
-    }
-    return null;
+    return UPGRADE_FLAG_MAP.get(arg_text);
+}
+
+/// Resolves `arg_text` in $O(1)$ against `LSP_FLAGS` via `LSP_FLAG_MAP` without hardcoded string drift.
+fn matchLspFlag(arg_text: []const u8) ?LspFlagId {
+    return LSP_FLAG_MAP.get(arg_text);
 }
 
 /// Extracts a strictly positive ASCII decimal step count (`> 0`), rejecting empty, signed, or zero values.
@@ -1018,6 +1239,21 @@ fn isLessThanUtf8Path(_: void, lhs_path: []u8, rhs_path: []u8) bool {
     return std.mem.order(u8, lhs_path, rhs_path) == .lt;
 }
 
+/// Returns `true` if any parent directory segment of `rel_path` matches `SKIPPED_WALK_DIR_SET`.
+fn hasSkippedRelativeWalkSegment(rel_path: []const u8) bool {
+    var seg_start: usize = 0;
+    var cursor: usize = 0;
+    while (cursor < rel_path.len) : (cursor += 1) {
+        if (rel_path[cursor] == '/' or rel_path[cursor] == '\\') {
+            if (cursor > seg_start and SKIPPED_WALK_DIR_SET.has(rel_path[seg_start..cursor])) {
+                return true;
+            }
+            seg_start = cursor + 1;
+        }
+    }
+    return false;
+}
+
 /// Appends `.cx` file paths inside `dir_path` (sorted lexicographically) into `out_paths`, or returns `false` if not a dir.
 fn collectDirectoryCxPaths(
     allocator: std.mem.Allocator,
@@ -1034,7 +1270,11 @@ fn collectDirectoryCxPaths(
 
     while (try walker.next(io)) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".cx")) continue;
-        const joined_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.path });
+        if (hasSkippedRelativeWalkSegment(entry.path)) continue;
+        const joined_path = if (std.mem.eql(u8, dir_path, "."))
+            try allocator.dupe(u8, entry.path)
+        else
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.path });
         errdefer allocator.free(joined_path);
         for (joined_path) |*ch_ptr| {
             if (ch_ptr.* == '\\') ch_ptr.* = '/';
@@ -1075,6 +1315,7 @@ fn discoverExternalSubmodulesRecursive(
         has_core_mention_out.* = true;
     }
     _ = try db.setInput(parent_fid, parent_src, durability);
+    try db.setFilePath(parent_fid, parent_path);
     if (pkg_id != .root) {
         try db.setFilePackageId(parent_fid, pkg_id);
     }
@@ -1201,14 +1442,23 @@ fn fileDeclaresMainEntrypoint(db: *query_db.CompilerDb, file_id: mem.FileId) !bo
     return false;
 }
 
-/// Verifies all reachable module files from `root_files` and renders any front-end/SAST/comptime diagnostics.
-fn verifyAndRenderModuleDiagnostics(
+/// Counts warning-severity diagnostics inside `sink`.
+fn countWarningsInSink(sink: *const DiagnosticSink) u32 {
+    var count: u32 = 0;
+    for (sink.diagnostics.items) |diag_item| {
+        if (diag_item.severity == .warning) count +|= 1;
+    }
+    return count;
+}
+
+/// Verifies all reachable module files from `root_files`, renders diagnostics, and returns `(has_errors, warning_count)`.
+fn verifyAndRenderModuleDiagnosticsWithWarnings(
     allocator: std.mem.Allocator,
     db: *query_db.CompilerDb,
     root_files: []const mem.FileId,
     diag_renderer: DiagnosticRenderer,
     stderr_writer: *std.Io.Writer,
-) !bool {
+) !struct { has_errors: bool, warning_count: u32 } {
     var reachable_files: std.ArrayListUnmanaged(mem.FileId) = .empty;
     defer reachable_files.deinit(allocator);
     if (root_files.len > 0) {
@@ -1216,17 +1466,20 @@ fn verifyAndRenderModuleDiagnostics(
     }
 
     var has_errors = false;
+    var warning_count: u32 = 0;
     for (reachable_files.items) |mod_fid| {
         const parsed_art = try db.parseCst(mod_fid);
         if (parsed_art.diagnostics.diagnostics.items.len > 0) {
             try diag_renderer.renderAll(stderr_writer, &parsed_art.diagnostics);
             if (parsed_art.diagnostics.hasErrors()) has_errors = true;
+            warning_count +|= countWarningsInSink(&parsed_art.diagnostics);
         }
 
         const sig_err_count = (try db.resolveSignatures(mod_fid)).error_count;
         if (db.getSignatureDiagnostics(mod_fid)) |sig_sink| {
             if (sig_sink.diagnostics.items.len > 0) {
                 try diag_renderer.renderAll(stderr_writer, sig_sink);
+                warning_count +|= countWarningsInSink(sig_sink);
             }
             if (sig_sink.hasErrors()) has_errors = true;
         }
@@ -1239,6 +1492,7 @@ fn verifyAndRenderModuleDiagnostics(
             if (db.getBodyDiagnostics(entry.def_id)) |body_sink| {
                 if (body_sink.diagnostics.items.len > 0) {
                     try diag_renderer.renderAll(stderr_writer, body_sink);
+                    warning_count +|= countWarningsInSink(body_sink);
                 }
                 if (body_sink.hasErrors()) has_errors = true;
             }
@@ -1248,6 +1502,7 @@ fn verifyAndRenderModuleDiagnostics(
             if (db.getSastDiagnostics(entry.def_id)) |sast_sink| {
                 if (sast_sink.diagnostics.items.len > 0) {
                     try diag_renderer.renderAll(stderr_writer, sast_sink);
+                    warning_count +|= countWarningsInSink(sast_sink);
                 }
                 if (sast_sink.hasErrors()) has_errors = true;
             }
@@ -1265,6 +1520,7 @@ fn verifyAndRenderModuleDiagnostics(
                 if (db.getComptimeDiagnostics(entry.def_id)) |ct_sink| {
                     if (ct_sink.diagnostics.items.len > 0) {
                         try diag_renderer.renderAll(stderr_writer, ct_sink);
+                        warning_count +|= countWarningsInSink(ct_sink);
                     }
                     if (ct_sink.hasErrors()) has_errors = true;
                 }
@@ -1274,7 +1530,24 @@ fn verifyAndRenderModuleDiagnostics(
             }
         }
     }
-    return has_errors;
+    return .{ .has_errors = has_errors, .warning_count = warning_count };
+}
+
+/// Verifies all reachable module files from `root_files` and renders any front-end/SAST/comptime diagnostics.
+fn verifyAndRenderModuleDiagnostics(
+    allocator: std.mem.Allocator,
+    db: *query_db.CompilerDb,
+    root_files: []const mem.FileId,
+    diag_renderer: DiagnosticRenderer,
+    stderr_writer: *std.Io.Writer,
+) !bool {
+    return (try verifyAndRenderModuleDiagnosticsWithWarnings(
+        allocator,
+        db,
+        root_files,
+        diag_renderer,
+        stderr_writer,
+    )).has_errors;
 }
 
 /// Builds a `CodegenBackend` matching `(output_format, target_spec, is_release_mode, is_fuzz_enabled)`.
@@ -2652,13 +2925,26 @@ fn executePackageOrScriptWorkflow(
             }
         }
     }
-    if (try verifyAndRenderModuleDiagnostics(
+    const check_fix_report: ?check_audit.CheckFixReport = if (exec_info.subcommand == .check and exec_info.is_fix_mode)
+        try check_audit.applyCheckFixesOnDb(allocator, &db, .{
+            .io = io,
+            .vfs = source_map,
+            .write_to_disk = true,
+            .candidate_files = root_verify_slices.items,
+        })
+    else
+        null;
+
+    const mod_diag = try verifyAndRenderModuleDiagnosticsWithWarnings(
         allocator,
         &db,
         all_verify_slices.items,
         diag_renderer,
         stderr_writer,
-    )) {
+    );
+    if (mod_diag.has_errors and
+        !(exec_info.subcommand == .check and (exec_info.is_check_caps or exec_info.is_explain_caps)))
+    {
         return 1;
     }
     if (source_map.hasIntegrityErrorFile() != null) {
@@ -2688,9 +2974,47 @@ fn executePackageOrScriptWorkflow(
     );
     defer allocator.free(cap_reports);
 
+    const total_warnings = mod_diag.warning_count +| countWarningsInSink(sink);
     if (sink.diagnostics.items.len > 0) {
         try diag_renderer.renderAll(stderr_writer, sink);
-        if (sink.hasErrors()) return 1;
+    }
+
+    var has_caps_audit_escalation = false;
+    if (exec_info.subcommand == .check and exec_info.is_check_caps) {
+        const audit_rep = try check_audit.renderCapabilityAuditTable(allocator, &db, stdout_writer, .{
+            .style_config = stdout_style,
+            .resolved_graph = &resolved,
+            .pkg_files_map = &pkg_files_slices,
+            .cap_edges = cap_edges.items,
+            .cap_reports = cap_reports,
+            .lockfile = if (existing_lock_val) |*lck| lck else null,
+            .has_contract_errors = mod_diag.has_errors,
+        });
+        if (audit_rep.has_escalation) has_caps_audit_escalation = true;
+    }
+    if (exec_info.subcommand == .check and exec_info.is_explain_caps) {
+        var explain_sink = DiagnosticSink.init(allocator);
+        defer explain_sink.deinit();
+        const exp_rep = try check_audit.renderExplainCapsReport(allocator, &db, stdout_writer, &explain_sink, .{
+            .style_config = stdout_style,
+            .vfs = source_map,
+            .resolved_graph = &resolved,
+            .pkg_files_map = &pkg_files_slices,
+            .target_pkg_arg = exec_info.explain_caps_pkg,
+            .target_cap_arg = exec_info.explain_caps_cap,
+        });
+        if (explain_sink.diagnostics.items.len > 0) {
+            try diag_renderer.renderAll(stderr_writer, &explain_sink);
+        }
+        if (exp_rep.has_cli_error or explain_sink.hasErrors()) return 1;
+    }
+
+    if (mod_diag.has_errors or sink.hasErrors() or has_caps_audit_escalation) {
+        return 1;
+    }
+    if (exec_info.subcommand == .check and exec_info.is_deny_warnings and total_warnings > 0) {
+        try check_audit.renderDenyWarningsSummary(stderr_style, stderr_writer, total_warnings);
+        return 1;
     }
 
     // [6] Compute `.cxi` digests, verify `--locked` `.cxi` parity (`E0015`), publish `.cxi`, and write `corex.lock`:
@@ -2767,6 +3091,15 @@ fn executePackageOrScriptWorkflow(
 
     switch (exec_info.subcommand) {
         .check => {
+            if (check_fix_report) |fix_rep| {
+                if (!exec_info.is_check_caps and !exec_info.is_explain_caps) {
+                    try check_audit.renderCheckFixSummary(stdout_style, stdout_writer, fix_rep);
+                }
+                return 0;
+            }
+            if (exec_info.is_check_caps or exec_info.is_explain_caps) {
+                return 0;
+            }
             try stdout_style.writeStatusHeader(
                 stdout_writer,
                 .success,
@@ -3408,7 +3741,8 @@ fn tryExecutePackageOrScriptMode(
         };
         defer allocator.free(raw_script);
 
-        const raw_fid = try source_map.setOverlay(script_path, raw_script, .root);
+        const raw_fid = source_map.resolveOrCreatePath(io, script_path, .root) catch
+            try source_map.setEditorOverlay(io, script_path, raw_script, .root, false);
         _ = try source_map.getLineIndex(raw_fid);
 
         var fm_arena = mem.BumpArena.init(allocator);
@@ -3488,14 +3822,14 @@ fn tryExecutePackageOrScriptMode(
                 if (extracted_fm.prefix_end_byte > 0) {
                     // Shebang-only standalone `.cx` script; keep `#!` blanked in `source_map` and run fast Mode C:
                     _ = try source_map.getLineIndex(
-                        try source_map.setOverlay(script_path, extracted_fm.blanked_cx_source, .root),
+                        try source_map.setEditorOverlay(io, script_path, extracted_fm.blanked_cx_source, .root, false),
                     );
                 }
                 return null;
             }
         }
 
-        const script_fid = try source_map.setOverlay(script_path, cx_body_src, .root);
+        const script_fid = try source_map.setEditorOverlay(io, script_path, cx_body_src, .root, false);
         _ = try source_map.getLineIndex(script_fid);
 
         var manifest_arena = mem.BumpArena.init(allocator);
@@ -3590,6 +3924,659 @@ fn tryExecutePackageOrScriptMode(
     }
 
     return null;
+}
+
+/// Parses `--explain-caps=<spec>` (`<cap>`, `<pkg>`, or `<pkg>,<cap>`), returning `false` on empty/malformed `<spec>`.
+fn extractExplainCapsInlineSpec(
+    raw_spec: []const u8,
+    pkg_out: *?[]const u8,
+    cap_out: *?[]const u8,
+) bool {
+    const trimmed = std.mem.trim(u8, raw_spec, " \t");
+    if (trimmed.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, trimmed, ',')) |comma_idx| {
+        const left = std.mem.trim(u8, trimmed[0..comma_idx], " \t");
+        const right = std.mem.trim(u8, trimmed[comma_idx + 1 ..], " \t");
+        if (left.len == 0 or right.len == 0 or std.mem.indexOfScalar(u8, right, ',') != null) {
+            return false;
+        }
+        pkg_out.* = left;
+        cap_out.* = right;
+        return true;
+    }
+    if (pkg_manifest.MANIFEST_CAPABILITY_MAP.has(trimmed) or std.mem.eql(u8, trimmed, "unsafe")) {
+        pkg_out.* = null;
+        cap_out.* = trimmed;
+    } else {
+        pkg_out.* = trimmed;
+        cap_out.* = null;
+    }
+    return true;
+}
+
+/// Returns `true` when `token` looks like an `--explain-caps` `[pkg]` or `[cap]` selector rather than a filesystem path.
+fn isExplainCapsSelectorToken(io: std.Io, token: []const u8) bool {
+    if (token.len == 0 or std.mem.eql(u8, token, ".") or std.mem.eql(u8, token, "..")) return false;
+    if (std.mem.endsWith(u8, token, ".cx") or std.mem.endsWith(u8, token, ".toml")) return false;
+    if (std.mem.indexOfAny(u8, token, "/\\") != null) return false;
+    if (std.Io.Dir.cwd().openDir(io, token, .{})) |opened_d| {
+        var dir_mut = opened_d;
+        dir_mut.close(io);
+        return false;
+    } else |_| {}
+    if (std.Io.Dir.cwd().openFile(io, token, .{ .mode = .read_only })) |opened_f| {
+        opened_f.close(io);
+        return false;
+    } else |_| {}
+    return true;
+}
+
+/// Collects observed exported `surface_caps` for non-root packages in a `corex.toml` workspace for `--accept-caps`.
+fn collectWorkspaceObservedPackageCaps(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ_map: ?*const std.process.Environ.Map,
+    toml_path: []const u8,
+    target_spec: codegen_abi.TargetSpec,
+    out_observed: *std.ArrayListUnmanaged(upgrade_engine.PackageObservedCaps),
+    owned_pkg_names: *std.ArrayListUnmanaged([]u8),
+) !void {
+    var local_interner = try mem.StringInterner.init(allocator);
+    defer local_interner.deinit();
+    var local_vfs = vfs.VfsSourceMap.init(allocator, &local_interner);
+    defer local_vfs.deinit(io);
+    var local_sink = DiagnosticSink.init(allocator);
+    defer local_sink.deinit();
+
+    var env_cfg = try resolveToolchainEnvConfig(allocator, environ_map);
+    defer env_cfg.deinit(allocator);
+    const cfg_env = symbol_resolver.CfgEnv.fromTargetSpec(target_spec, false);
+
+    const toml_fid = (try loadSourceFileIntoVfs(io, &local_vfs, toml_path, &local_sink)) orelse return;
+    var bundle = pkg_manifest.loadWorkspaceManifestBundle(
+        io,
+        allocator,
+        &local_interner,
+        toml_path,
+        toml_fid,
+        &cfg_env,
+        &local_sink,
+    ) catch return;
+    defer bundle.deinit();
+    if (local_sink.hasErrors() or bundle.root_manifest.dependencies.len == 0) return;
+
+    var resolved_opt = pkg_resolver.resolveProjectGraph(
+        allocator,
+        &local_interner,
+        &local_vfs,
+        &bundle,
+        null,
+        .{
+            .io = io,
+            .target_spec = target_spec,
+            .corex_home_dir = env_cfg.corex_home_dir,
+            .environ_map = environ_map,
+        },
+        &local_sink,
+    ) catch return;
+    if (resolved_opt == null or local_sink.hasErrors()) {
+        if (resolved_opt) |*rg| rg.deinit(allocator);
+        return;
+    }
+    var resolved = resolved_opt.?;
+    defer resolved.deinit(allocator);
+
+    var cache = pkg_cache.PkgCache.init(
+        allocator,
+        env_cfg.corex_home_dir,
+        pkg_cache.DEFAULT_MAX_LRU_ENTRIES,
+        pkg_cache.DEFAULT_MAX_LRU_BYTES,
+    ) catch return;
+    defer cache.deinit();
+    const blobs_dir = try std.fmt.allocPrint(allocator, "{s}/blobs", .{cache.cas_root});
+    defer allocator.free(blobs_dir);
+
+    var db = try query_db.CompilerDb.init(allocator);
+    defer db.deinit();
+    db.setPackageGraphMounted(true);
+    db.setVfsSourceMap(&local_vfs);
+    db.setEmbedIo(io);
+    db.setTargetSpec(target_spec);
+
+    var visited_fids: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer visited_fids.deinit(allocator);
+    var has_core_mention = false;
+    var pkg_root_fids: std.AutoHashMapUnmanaged(vfs.PackageId, mem.FileId) = .empty;
+    defer pkg_root_fids.deinit(allocator);
+    var pkg_files_owned: std.AutoHashMapUnmanaged(vfs.PackageId, std.ArrayListUnmanaged(mem.FileId)) = .empty;
+    defer {
+        var pf_it = pkg_files_owned.valueIterator();
+        while (pf_it.next()) |list_ptr| list_ptr.deinit(allocator);
+        pkg_files_owned.deinit(allocator);
+    }
+
+    for (resolved.packages) |pkg_node| {
+        if (pkg_node.pkg_id == .root or pkg_node.pkg_id == .std_core) continue;
+        const files_gop = try pkg_files_owned.getOrPut(allocator, pkg_node.pkg_id);
+        if (!files_gop.found_existing) files_gop.value_ptr.* = .empty;
+
+        const ver_str = try pkg_node.version.formatAlloc(allocator, &local_interner);
+        defer allocator.free(ver_str);
+
+        if (pkg_node.source_kind != .workspace_member and pkg_node.source_kind != .local_path) {
+            const cxtree_hash = pkg_node.cxtree_blake3 orelse continue;
+            const cxtree_bytes = cache.readVerifiedCxTreeAlloc(
+                io,
+                cxtree_hash,
+                &local_sink,
+                pkg_node.manifest_span,
+            ) catch continue;
+            defer allocator.free(cxtree_bytes);
+
+            const mounted_ids = local_vfs.mountCxTreePackage(
+                io,
+                pkg_node.pkg_id,
+                pkg_node.canonical_name,
+                ver_str,
+                cxtree_bytes,
+                blobs_dir,
+            ) catch continue;
+            allocator.free(mounted_ids);
+
+            const entry_rel = pkg_node.lib_root_rel_path orelse pkg_node.bin_root_rel_path orelse "src/root.cx";
+            const entry_vpath = try std.fmt.allocPrint(
+                allocator,
+                "/cx/{s}@{s}/{s}",
+                .{ pkg_node.canonical_name, ver_str, entry_rel },
+            );
+            defer allocator.free(entry_vpath);
+            const vpath_id = local_vfs.interner.lookup(entry_vpath) orelse continue;
+            const root_fid = local_vfs.path_to_file_id.get(vpath_id) orelse continue;
+            _ = try discoverVirtualCxTreeSubmodulesRecursive(
+                allocator,
+                &local_vfs,
+                &db,
+                root_fid,
+                entry_vpath,
+                pkg_node.pkg_id,
+                &visited_fids,
+                files_gop.value_ptr,
+                &has_core_mention,
+                &local_sink,
+                0,
+            );
+            try pkg_root_fids.put(allocator, pkg_node.pkg_id, root_fid);
+        } else {
+            const pkg_dir = pkg_node.package_root_path;
+            if (pkg_dir.len == 0) continue;
+            const entry_rel = pkg_node.lib_root_rel_path orelse pkg_node.bin_root_rel_path orelse "src/root.cx";
+            const entry_path = try std.fs.path.join(allocator, &.{ pkg_dir, entry_rel });
+            defer allocator.free(entry_path);
+            const root_fid = local_vfs.resolveOrCreatePath(io, entry_path, pkg_node.pkg_id) catch continue;
+            try discoverExternalSubmodulesRecursive(
+                allocator,
+                io,
+                &local_vfs,
+                &db,
+                root_fid,
+                entry_path,
+                .medium,
+                pkg_node.pkg_id,
+                &visited_fids,
+                files_gop.value_ptr,
+                &has_core_mention,
+                0,
+            );
+            try pkg_root_fids.put(allocator, pkg_node.pkg_id, root_fid);
+        }
+        try db.symbol_table.markPackageDepsConfigured(pkg_node.pkg_id);
+    }
+
+    for (resolved.packages) |pkg_node| {
+        for (pkg_node.dependencies) |dep_bind| {
+            const target_fid = pkg_root_fids.get(dep_bind.target_pkg_id) orelse continue;
+            try db.bindPackageDepFile(pkg_node.pkg_id, try db.interner.intern(dep_bind.alias_text), target_fid);
+        }
+    }
+    if (has_core_mention) {
+        try registerWorkspaceCoreModuleIfNeeded(allocator, io, &local_vfs, &db, &visited_fids);
+    }
+
+    for (resolved.packages) |pkg_node| {
+        if (pkg_node.pkg_id == .root or pkg_node.pkg_id == .std_core) continue;
+        const p_files = if (pkg_files_owned.get(pkg_node.pkg_id)) |lst| lst.items else &.{};
+        if (p_files.len == 0) continue;
+        var cxi_art = db.computePackageCxiSummary(allocator, pkg_node.pkg_id, p_files) catch continue;
+        defer cxi_art.deinit(allocator);
+
+        const duped_name = try allocator.dupe(u8, pkg_node.canonical_name);
+        errdefer allocator.free(duped_name);
+        try owned_pkg_names.append(allocator, duped_name);
+        try out_observed.append(allocator, .{
+            .package_kebab = duped_name,
+            .actual_surface_caps = cxi_art.caps.surface_caps,
+        });
+    }
+}
+
+/// Dispatches `corex upgrade` (`--list`, `--explain`, `--rule`, `--check`, `--accept-caps`, and zero-arg discovery).
+fn executeUpgradeSubcommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ_map: ?*const std.process.Environ.Map,
+    source_map: *vfs.VfsSourceMap,
+    interner: *mem.StringInterner,
+    sink: *DiagnosticSink,
+    exec_info: ExecuteSubcommandAction,
+    stdout_style: StyleConfig,
+    stderr_style: StyleConfig,
+    stdout_writer: *std.Io.Writer,
+    stderr_writer: *std.Io.Writer,
+) !u8 {
+    const diag_renderer = DiagnosticRenderer.init(source_map, interner, stderr_style);
+
+    // [1] Informational `--list` and `--explain=<rule>` modes:
+    if (exec_info.is_upgrade_list) {
+        try upgrade_engine.renderUpgradeRuleList(allocator, stdout_writer, stdout_style);
+        return 0;
+    }
+    if (exec_info.upgrade_explain_rule) |rule_str| {
+        const rule_id = upgrade_rules.lookupUpgradeRule(rule_str) orelse {
+            try sink.emit(.{
+                .code = .e0001_unknown_cli_flag,
+                .severity = .err,
+                .message = try std.fmt.allocPrint(
+                    sink.arena.asAllocator(),
+                    "unknown upgrade rule `{s}` for `--explain`",
+                    .{rule_str},
+                ),
+                .notes = &.{"help: run `corex upgrade --list` to see all 15 canonical Zero-Legacy upgrade rules"},
+            });
+            try diag_renderer.renderAll(stderr_writer, sink);
+            return 1;
+        };
+        try upgrade_engine.renderUpgradeRuleExplanation(allocator, stdout_writer, stdout_style, rule_id);
+        return 0;
+    }
+
+    // [2] Validate `--rule=<id,…>` and `--accept-caps[=<cap,…>]`:
+    var rule_mask: u16 = upgrade_engine.ALL_UPGRADE_RULES_MASK;
+    var has_explicit_rule_filter = false;
+    if (exec_info.upgrade_rule_csv) |csv_str| {
+        rule_mask = upgrade_engine.parseRuleFilterMask(csv_str) orelse {
+            try sink.emit(.{
+                .code = .e0001_unknown_cli_flag,
+                .severity = .err,
+                .message = try std.fmt.allocPrint(
+                    sink.arena.asAllocator(),
+                    "invalid or unknown upgrade rule ID in `--rule={s}`",
+                    .{csv_str},
+                ),
+                .notes = &.{"help: run `corex upgrade --list` to see valid rule IDs (e.g., `--rule=UR-21-00,UR-22-04`)"},
+            });
+            try diag_renderer.renderAll(stderr_writer, sink);
+            return 1;
+        };
+        has_explicit_rule_filter = true;
+    }
+
+    var accept_caps_bits: u16 = 0;
+    if (exec_info.has_accept_caps) {
+        accept_caps_bits = upgrade_engine.parseAcceptCapsFilter(exec_info.accept_caps_csv) orelse {
+            try sink.emit(.{
+                .code = .e0001_unknown_cli_flag,
+                .severity = .err,
+                .message = try std.fmt.allocPrint(
+                    sink.arena.asAllocator(),
+                    "invalid capability name in `--accept-caps={s}`",
+                    .{exec_info.accept_caps_csv orelse ""},
+                ),
+                .notes = &.{
+                    "help: valid capabilities are `fs`, `net`, `env`, `process`, `ffi`, `unsafe_op`, `clock`, `entropy`",
+                },
+            });
+            try diag_renderer.renderAll(stderr_writer, sink);
+            return 1;
+        };
+    }
+
+    // [3] Discover `.cx` and `corex.toml` targets (defaulting to nearest workspace or `.` on zero args):
+    var cx_paths: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (cx_paths.items) |owned_p| allocator.free(owned_p);
+        cx_paths.deinit(allocator);
+    }
+    var owned_manifest_path: ?[]u8 = null;
+    defer if (owned_manifest_path) |mp_buf| allocator.free(mp_buf);
+
+    if (exec_info.positional_args.len == 0) {
+        if (try discoverNearestManifestUpward(allocator, io)) |anc_toml| {
+            owned_manifest_path = anc_toml;
+            const ws_dir = std.fs.path.dirname(anc_toml) orelse ".";
+            _ = try collectDirectoryCxPaths(allocator, io, ws_dir, &cx_paths);
+        } else {
+            _ = try collectDirectoryCxPaths(allocator, io, ".", &cx_paths);
+            if (cx_paths.items.len == 0) {
+                try emitMissingCliArgDiagnostic(
+                    sink,
+                    "no `corex.toml` manifest or `.cx` source files found in current directory",
+                    "help: pass a `.cx` file, `corex.toml` manifest, or directory to `corex upgrade`",
+                );
+                try diag_renderer.renderAll(stderr_writer, sink);
+                return 1;
+            }
+        }
+    } else {
+        for (exec_info.positional_args) |raw_arg| {
+            if (std.mem.endsWith(u8, raw_arg, ".toml")) {
+                if (std.Io.Dir.cwd().openFile(io, raw_arg, .{ .mode = .read_only })) |opened_f| {
+                    opened_f.close(io);
+                    if (owned_manifest_path) |prev_mp| allocator.free(prev_mp);
+                    owned_manifest_path = try allocator.dupe(u8, raw_arg);
+                } else |_| {
+                    _ = try loadSourceFileIntoVfs(io, source_map, raw_arg, sink);
+                }
+            } else if (try collectDirectoryCxPaths(allocator, io, raw_arg, &cx_paths)) {
+                if (owned_manifest_path == null) {
+                    const cand_toml = try std.fs.path.join(allocator, &.{ raw_arg, "corex.toml" });
+                    if (std.Io.Dir.cwd().openFile(io, cand_toml, .{ .mode = .read_only })) |opened_t| {
+                        opened_t.close(io);
+                        owned_manifest_path = cand_toml;
+                    } else |_| {
+                        allocator.free(cand_toml);
+                    }
+                }
+            } else if (std.mem.endsWith(u8, raw_arg, ".cx")) {
+                if (std.Io.Dir.cwd().openFile(io, raw_arg, .{ .mode = .read_only })) |opened_cx| {
+                    opened_cx.close(io);
+                    const duped_cx = try allocator.dupe(u8, raw_arg);
+                    errdefer allocator.free(duped_cx);
+                    try cx_paths.append(allocator, duped_cx);
+                } else |_| {
+                    _ = try loadSourceFileIntoVfs(io, source_map, raw_arg, sink);
+                }
+            } else {
+                try sink.emit(.{
+                    .code = .e0001_unknown_cli_flag,
+                    .severity = .err,
+                    .message = try std.fmt.allocPrint(
+                        sink.arena.asAllocator(),
+                        "unsupported input `{s}` for `corex upgrade`; expected `.cx`, `corex.toml`, or directory",
+                        .{raw_arg},
+                    ),
+                });
+            }
+        }
+        if (sink.hasErrors()) {
+            try diag_renderer.renderAll(stderr_writer, sink);
+            return 1;
+        }
+    }
+
+    const upg_options: upgrade_engine.UpgradeOptions = .{
+        .rule_mask = rule_mask,
+        .has_explicit_rule_filter = has_explicit_rule_filter,
+        .is_check_only = exec_info.is_check_only,
+        .is_internal_core = exec_info.is_internal_core,
+        .has_accept_caps = exec_info.has_accept_caps,
+        .accept_caps_filter_bits = accept_caps_bits,
+        .target_spec = exec_info.target_spec,
+        .comptime_step_limit = exec_info.comptime_step_limit,
+    };
+
+    var cx_const_slices = try allocator.alloc([]const u8, cx_paths.items.len);
+    defer allocator.free(cx_const_slices);
+    for (cx_paths.items, 0..) |item_p, i| cx_const_slices[i] = item_p;
+
+    // [4] Evaluate `--accept-caps` against `corex.toml` + `corex.lock` when a manifest is present:
+    if (exec_info.has_accept_caps) {
+        if (owned_manifest_path) |toml_path| {
+            const active_target = exec_info.target_spec orelse codegen_abi.TargetSpec.host();
+            var observed_caps: std.ArrayListUnmanaged(upgrade_engine.PackageObservedCaps) = .empty;
+            defer observed_caps.deinit(allocator);
+            var owned_pkg_names: std.ArrayListUnmanaged([]u8) = .empty;
+            defer {
+                for (owned_pkg_names.items) |nm| allocator.free(nm);
+                owned_pkg_names.deinit(allocator);
+            }
+            try collectWorkspaceObservedPackageCaps(
+                allocator,
+                io,
+                environ_map,
+                toml_path,
+                active_target,
+                &observed_caps,
+                &owned_pkg_names,
+            );
+
+            if (observed_caps.items.len > 0) {
+                const raw_toml = std.Io.Dir.cwd().readFileAlloc(
+                    io,
+                    toml_path,
+                    allocator,
+                    .limited(pkg_manifest.MAX_TOML_BYTES),
+                ) catch |read_err| switch (read_err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.StreamTooLong => {
+                        try sink.emit(.{
+                            .code = .e0005_source_file_size_exceeded,
+                            .severity = .err,
+                            .message = try std.fmt.allocPrint(
+                                sink.arena.asAllocator(),
+                                "manifest file `{s}` exceeds the maximum size limit",
+                                .{toml_path},
+                            ),
+                        });
+                        try diag_renderer.renderAll(stderr_writer, sink);
+                        return 1;
+                    },
+                    else => {
+                        try sink.emit(.{
+                            .code = .e0004_source_file_io_error,
+                            .severity = .err,
+                            .message = try std.fmt.allocPrint(
+                                sink.arena.asAllocator(),
+                                "failed to read manifest file `{s}`",
+                                .{toml_path},
+                            ),
+                        });
+                        try diag_renderer.renderAll(stderr_writer, sink);
+                        return 1;
+                    },
+                };
+                defer allocator.free(raw_toml);
+                const cfg_env = pkg_manifest.CfgEnv.fromTargetSpec(active_target, true);
+                var pre_upg_toml = try upgrade_engine.upgradeManifestToml(
+                    allocator,
+                    raw_toml,
+                    mem.FileId.fromInt(1),
+                    &cfg_env,
+                    upg_options,
+                );
+                defer pre_upg_toml.deinit(allocator);
+
+                const ws_dir = std.fs.path.dirname(toml_path) orelse ".";
+                const lock_path = try std.fs.path.join(allocator, &.{ ws_dir, "corex.lock" });
+                defer allocator.free(lock_path);
+                const lock_bytes_opt: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(
+                    io,
+                    lock_path,
+                    allocator,
+                    .limited(pkg_manifest.MAX_TOML_BYTES),
+                ) catch |lock_err| switch (lock_err) {
+                    error.FileNotFound => null,
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.StreamTooLong => {
+                        try sink.emit(.{
+                            .code = .e0005_source_file_size_exceeded,
+                            .severity = .err,
+                            .message = try std.fmt.allocPrint(
+                                sink.arena.asAllocator(),
+                                "lockfile `{s}` exceeds the maximum size limit",
+                                .{lock_path},
+                            ),
+                        });
+                        try diag_renderer.renderAll(stderr_writer, sink);
+                        return 1;
+                    },
+                    else => {
+                        try sink.emit(.{
+                            .code = .e0004_source_file_io_error,
+                            .severity = .err,
+                            .message = try std.fmt.allocPrint(
+                                sink.arena.asAllocator(),
+                                "failed to read lockfile `{s}`",
+                                .{lock_path},
+                            ),
+                        });
+                        try diag_renderer.renderAll(stderr_writer, sink);
+                        return 1;
+                    },
+                };
+                defer if (lock_bytes_opt) |lb| allocator.free(lb);
+
+                var accept_outcome = try upgrade_engine.evaluateAndApplyAcceptCaps(
+                    allocator,
+                    mem.FileId.fromInt(1),
+                    pre_upg_toml.upgraded_toml,
+                    mem.FileId.fromInt(2),
+                    lock_bytes_opt,
+                    observed_caps.items,
+                    &cfg_env,
+                    accept_caps_bits,
+                );
+                defer accept_outcome.deinit(allocator);
+
+                if (accept_outcome.has_denied_cap_violation or accept_outcome.unaccepted_escalation_bits != 0) {
+                    return try upgrade_engine.renderCapabilityEscalationError(
+                        allocator,
+                        stderr_writer,
+                        stderr_style,
+                        &accept_outcome,
+                    );
+                }
+
+                const upg_code = upgrade_engine.executeUpgradePaths(
+                    allocator,
+                    io,
+                    cx_const_slices,
+                    toml_path,
+                    upg_options,
+                    stdout_style,
+                    stderr_style,
+                    stdout_writer,
+                    stderr_writer,
+                ) catch |upg_err| switch (upg_err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.WriteFailed => return error.WriteFailed,
+                    error.StreamTooLong, error.FileTooLarge => {
+                        try sink.emit(.{
+                            .code = .e0005_source_file_size_exceeded,
+                            .severity = .err,
+                            .message = "input file exceeds the maximum size limit during `corex upgrade`",
+                        });
+                        try diag_renderer.renderAll(stderr_writer, sink);
+                        return 1;
+                    },
+                    else => {
+                        try sink.emit(.{
+                            .code = .e0004_source_file_io_error,
+                            .severity = .err,
+                            .message = "failed to read or write workspace files during `corex upgrade`",
+                        });
+                        try diag_renderer.renderAll(stderr_writer, sink);
+                        return 1;
+                    },
+                };
+                if (upg_code != 0) return upg_code;
+
+                if (!exec_info.is_check_only) {
+                    if (accept_outcome.is_toml_changed) {
+                        codegen_abi.writeArtifactAtomic(
+                            io,
+                            allocator,
+                            toml_path,
+                            accept_outcome.updated_toml,
+                        ) catch |write_err| switch (write_err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            else => {
+                                try sink.emit(.{
+                                    .code = .e0004_source_file_io_error,
+                                    .severity = .err,
+                                    .message = try std.fmt.allocPrint(
+                                        sink.arena.asAllocator(),
+                                        "failed to write manifest file `{s}`",
+                                        .{toml_path},
+                                    ),
+                                });
+                                try diag_renderer.renderAll(stderr_writer, sink);
+                                return 1;
+                            },
+                        };
+                    }
+                    if (accept_outcome.is_lock_changed) {
+                        if (accept_outcome.updated_lock) |new_lock| {
+                            codegen_abi.writeArtifactAtomic(
+                                io,
+                                allocator,
+                                lock_path,
+                                new_lock,
+                            ) catch |write_err| switch (write_err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                else => {
+                                    try sink.emit(.{
+                                        .code = .e0004_source_file_io_error,
+                                        .severity = .err,
+                                        .message = try std.fmt.allocPrint(
+                                            sink.arena.asAllocator(),
+                                            "failed to write lockfile `{s}`",
+                                            .{lock_path},
+                                        ),
+                                    });
+                                    try diag_renderer.renderAll(stderr_writer, sink);
+                                    return 1;
+                                },
+                            };
+                        }
+                    }
+                }
+                return 0;
+            }
+        }
+    }
+
+    return upgrade_engine.executeUpgradePaths(
+        allocator,
+        io,
+        cx_const_slices,
+        owned_manifest_path,
+        upg_options,
+        stdout_style,
+        stderr_style,
+        stdout_writer,
+        stderr_writer,
+    ) catch |upg_err| switch (upg_err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.WriteFailed => return error.WriteFailed,
+        error.StreamTooLong, error.FileTooLarge => {
+            try sink.emit(.{
+                .code = .e0005_source_file_size_exceeded,
+                .severity = .err,
+                .message = "input file exceeds the maximum size limit during `corex upgrade`",
+            });
+            try diag_renderer.renderAll(stderr_writer, sink);
+            return 1;
+        },
+        else => {
+            try sink.emit(.{
+                .code = .e0004_source_file_io_error,
+                .severity = .err,
+                .message = "failed to read or write workspace files during `corex upgrade`",
+            });
+            try diag_renderer.renderAll(stderr_writer, sink);
+            return 1;
+        },
+    };
 }
 
 // ------------------------------------- PUBLIC API --------------------------------------
@@ -3710,6 +4697,14 @@ pub fn suggestFlagForSubcommand(unknown_flag: []const u8, subcommand: ?Subcomman
                 best_match = upg_desc.long_flag;
             }
         }
+    } else if (subcommand == .lsp) {
+        for (LSP_FLAGS) |lsp_desc| {
+            const lsp_dist = computeLevenshteinDistance(flag_name, lsp_desc.long_flag);
+            if (lsp_dist < best_distance) {
+                best_distance = lsp_dist;
+                best_match = lsp_desc.long_flag;
+            }
+        }
     } else if (subcommand == .translate_c) {
         for (TRANSLATE_C_FLAGS) |tc_desc| {
             const tc_dist = computeLevenshteinDistance(flag_name, tc_desc.long_flag);
@@ -3728,6 +4723,15 @@ pub fn suggestFlagForSubcommand(unknown_flag: []const u8, subcommand: ?Subcomman
             }
         }
     } else if (subcommand) |sub_id| {
+        if (sub_id == .check) {
+            for (CHECK_FLAGS) |chk_desc| {
+                const chk_dist = computeLevenshteinDistance(flag_name, chk_desc.long_flag);
+                if (chk_dist < best_distance) {
+                    best_distance = chk_dist;
+                    best_match = chk_desc.long_flag;
+                }
+            }
+        }
         if (isCompileSubcommand(sub_id)) {
             for (COMPILE_FLAGS) |comp_desc| {
                 const comp_dist = computeLevenshteinDistance(flag_name, comp_desc.long_flag);
@@ -3783,6 +4787,17 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
     var is_frozen = false;
     var has_no_default_features = false;
     var is_verifying_checksums = false;
+    var is_check_caps = false;
+    var is_deny_warnings = false;
+    var is_explain_caps = false;
+    var explain_caps_pkg: ?[]const u8 = null;
+    var explain_caps_cap: ?[]const u8 = null;
+    var is_upgrade_list = false;
+    var upgrade_explain_rule: ?[]const u8 = null;
+    var upgrade_rule_csv: ?[]const u8 = null;
+    var has_accept_caps = false;
+    var accept_caps_csv: ?[]const u8 = null;
+    var is_lsp_stdio = true;
     var selected_subcommand: ?SubcommandId = null;
     var positional_list: std.ArrayListUnmanaged([]const u8) = .empty;
     var is_after_double_dash = false;
@@ -3828,10 +4843,99 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                     break :blk_fmt true;
                 }
                 break :blk_fmt false;
-            }) {} else if (selected_subcommand == .upgrade and blk_upg: {
+            }) {} else if (selected_subcommand == .lsp and blk_lsp: {
+                if (matchLspFlag(arg_text)) |lsp_flag| {
+                    switch (lsp_flag) {
+                        .internal_core => is_internal_core = true,
+                        .stdio => is_lsp_stdio = true,
+                    }
+                    break :blk_lsp true;
+                }
+                break :blk_lsp false;
+            }) {} else if (selected_subcommand == .check and std.mem.startsWith(u8, arg_text, "--explain-caps=")) {
+                is_explain_caps = true;
+                const raw_spec = arg_text["--explain-caps=".len..];
+                if (raw_spec.len == 0) {
+                    try emitMissingCliArgDiagnostic(
+                        sink,
+                        "missing package or capability filter for `--explain-caps`",
+                        "help: pass `--explain-caps`, `--explain-caps=net`, or `--explain-caps=pkg,net`",
+                    );
+                } else {
+                    var parsed_pkg: ?[]const u8 = null;
+                    var parsed_cap: ?[]const u8 = null;
+                    if (extractExplainCapsInlineSpec(raw_spec, &parsed_pkg, &parsed_cap)) {
+                        if (parsed_pkg) |pkg_s| explain_caps_pkg = try arena_alloc.dupe(u8, pkg_s);
+                        if (parsed_cap) |cap_s| explain_caps_cap = try arena_alloc.dupe(u8, cap_s);
+                    } else {
+                        try sink.emit(.{
+                            .code = .e0001_unknown_cli_flag,
+                            .severity = .err,
+                            .message = try std.fmt.allocPrint(
+                                arena_alloc,
+                                "malformed selector `{s}` for `--explain-caps`; expected `<pkg>`, `<cap>`, or `<pkg>,<cap>`",
+                                .{raw_spec},
+                            ),
+                        });
+                    }
+                }
+            } else if (selected_subcommand == .check and blk_chk: {
+                if (matchCheckFlag(arg_text)) |chk_flag| {
+                    switch (chk_flag) {
+                        .caps => is_check_caps = true,
+                        .deny_warnings => is_deny_warnings = true,
+                        .explain_caps => is_explain_caps = true,
+                        .fix => is_fix_mode = true,
+                    }
+                    break :blk_chk true;
+                }
+                break :blk_chk false;
+            }) {} else if (selected_subcommand == .upgrade and std.mem.startsWith(u8, arg_text, "--accept-caps=")) {
+                has_accept_caps = true;
+                const raw_caps = arg_text["--accept-caps=".len..];
+                if (raw_caps.len == 0) {
+                    try emitMissingCliArgDiagnostic(
+                        sink,
+                        "missing capability list for `--accept-caps`",
+                        "help: pass `--accept-caps` or `--accept-caps=net,unsafe_op`",
+                    );
+                } else {
+                    accept_caps_csv = try arena_alloc.dupe(u8, raw_caps);
+                }
+            } else if (selected_subcommand == .upgrade and try tryExtractStringFlagValue(
+                raw_args,
+                &arg_idx,
+                "--explain",
+                "",
+                "missing upgrade rule ID for `--explain`",
+                "help: pass `--explain=UR-21-00` (run `corex upgrade --list` to list all rules)",
+                sink,
+                &extracted_str,
+            )) {
+                if (extracted_str) |rule_str| {
+                    upgrade_explain_rule = rule_str;
+                }
+            } else if (selected_subcommand == .upgrade and try tryExtractStringFlagValue(
+                raw_args,
+                &arg_idx,
+                "--rule",
+                "",
+                "missing upgrade rule ID(s) for `--rule`",
+                "help: pass `--rule=UR-21-00` or `--rule=UR-21-00,UR-22-04`",
+                sink,
+                &extracted_str,
+            )) {
+                if (extracted_str) |csv_str| {
+                    upgrade_rule_csv = csv_str;
+                }
+            } else if (selected_subcommand == .upgrade and blk_upg: {
                 if (matchUpgradeFlag(arg_text)) |upg_flag| {
                     switch (upg_flag) {
+                        .accept_caps => has_accept_caps = true,
+                        .check => is_check_only = true,
                         .internal_core => is_internal_core = true,
+                        .list => is_upgrade_list = true,
+                        .explain, .rule => break :blk_upg false,
                     }
                     break :blk_upg true;
                 }
@@ -4163,6 +5267,17 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
             .is_frozen = is_frozen,
             .has_no_default_features = has_no_default_features,
             .is_verifying_checksums = is_verifying_checksums,
+            .is_check_caps = is_check_caps,
+            .is_deny_warnings = is_deny_warnings,
+            .is_explain_caps = is_explain_caps,
+            .explain_caps_pkg = explain_caps_pkg,
+            .explain_caps_cap = explain_caps_cap,
+            .is_upgrade_list = is_upgrade_list,
+            .upgrade_explain_rule = upgrade_explain_rule,
+            .upgrade_rule_csv = upgrade_rule_csv,
+            .has_accept_caps = has_accept_caps,
+            .accept_caps_csv = accept_caps_csv,
+            .is_lsp_stdio = is_lsp_stdio,
             .run_args = forwarded_run_args,
             .action = .{
                 .execute_subcommand = .{
@@ -4196,6 +5311,17 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                     .is_frozen = is_frozen,
                     .has_no_default_features = has_no_default_features,
                     .is_verifying_checksums = is_verifying_checksums,
+                    .is_check_caps = is_check_caps,
+                    .is_deny_warnings = is_deny_warnings,
+                    .is_explain_caps = is_explain_caps,
+                    .explain_caps_pkg = explain_caps_pkg,
+                    .explain_caps_cap = explain_caps_cap,
+                    .is_upgrade_list = is_upgrade_list,
+                    .upgrade_explain_rule = upgrade_explain_rule,
+                    .upgrade_rule_csv = upgrade_rule_csv,
+                    .has_accept_caps = has_accept_caps,
+                    .accept_caps_csv = accept_caps_csv,
+                    .is_lsp_stdio = is_lsp_stdio,
                 },
             },
         };
@@ -4273,6 +5399,23 @@ pub fn renderSubcommandHelp(
     );
     try writer.writeByte('\n');
 
+    if (subcommand == .check) {
+        try style_config.writeStyled(writer, .bold, "Check Options:");
+        try writer.writeByte('\n');
+        for (CHECK_FLAGS) |chk_desc| {
+            try renderOptionLine(
+                writer,
+                style_config,
+                null,
+                chk_desc.long_flag,
+                chk_desc.value_suffix,
+                34,
+                chk_desc.summary,
+            );
+        }
+        try writer.writeByte('\n');
+    }
+
     if (isCompileSubcommand(subcommand)) {
         try style_config.writeStyled(writer, .bold, "Compile Options:");
         try writer.writeByte('\n');
@@ -4327,9 +5470,24 @@ pub fn renderSubcommandHelp(
                 style_config,
                 null,
                 upg_desc.long_flag,
+                upg_desc.value_suffix,
+                30,
+                upg_desc.summary,
+            );
+        }
+        try writer.writeByte('\n');
+    } else if (subcommand == .lsp) {
+        try style_config.writeStyled(writer, .bold, "LSP Options:");
+        try writer.writeByte('\n');
+        for (LSP_FLAGS) |lsp_desc| {
+            try renderOptionLine(
+                writer,
+                style_config,
+                null,
+                lsp_desc.long_flag,
                 null,
                 22,
-                upg_desc.summary,
+                lsp_desc.summary,
             );
         }
         try writer.writeByte('\n');
@@ -4422,17 +5580,96 @@ pub fn runCli(
                     stderr_writer,
                 );
             }
+            if (exec_info.subcommand == .lsp) {
+                if (exec_info.positional_args.len > 0) {
+                    try sink.emit(.{
+                        .code = .e0001_unknown_cli_flag,
+                        .severity = .err,
+                        .message = try std.fmt.allocPrint(
+                            sink.arena.asAllocator(),
+                            "unexpected positional argument `{s}` for `corex lsp`",
+                            .{exec_info.positional_args[0]},
+                        ),
+                        .notes = &.{"help: run `corex lsp` or `corex lsp --stdio` without positional arguments"},
+                    });
+                    try DiagnosticRenderer.init(&source_map, &interner, stderr_style).renderAll(stderr_writer, &sink);
+                    return 1;
+                }
+                return lsp_server.runServerStdio(allocator, io, environ_map, .{
+                    .is_internal_core = exec_info.is_internal_core,
+                });
+            }
+            if (exec_info.subcommand == .upgrade) {
+                return executeUpgradeSubcommand(
+                    allocator,
+                    io,
+                    environ_map,
+                    &source_map,
+                    &interner,
+                    &sink,
+                    exec_info,
+                    stdout_style,
+                    stderr_style,
+                    stdout_writer,
+                    stderr_writer,
+                );
+            }
             if (exec_info.subcommand == .fmt) {
                 var expanded_fmt_paths: std.ArrayListUnmanaged([]u8) = .empty;
                 defer {
                     for (expanded_fmt_paths.items) |owned_p| allocator.free(owned_p);
                     expanded_fmt_paths.deinit(allocator);
                 }
-                for (exec_info.positional_args) |raw_arg| {
-                    if (!(try collectDirectoryCxPaths(allocator, io, raw_arg, &expanded_fmt_paths))) {
-                        const duped_arg = try allocator.dupe(u8, raw_arg);
-                        errdefer allocator.free(duped_arg);
-                        try expanded_fmt_paths.append(allocator, duped_arg);
+                if (exec_info.positional_args.len == 0) {
+                    if (try discoverNearestManifestUpward(allocator, io)) |anc_toml| {
+                        defer allocator.free(anc_toml);
+                        _ = try collectDirectoryCxPaths(
+                            allocator,
+                            io,
+                            std.fs.path.dirname(anc_toml) orelse ".",
+                            &expanded_fmt_paths,
+                        );
+                    } else {
+                        _ = try collectDirectoryCxPaths(allocator, io, ".", &expanded_fmt_paths);
+                    }
+                    if (expanded_fmt_paths.items.len == 0) {
+                        try emitMissingCliArgDiagnostic(
+                            &sink,
+                            "no `.cx` source files found in current directory to format",
+                            "help: pass a `.cx` source file or directory to `corex fmt`",
+                        );
+                        try DiagnosticRenderer.init(&source_map, &interner, stderr_style).renderAll(
+                            stderr_writer,
+                            &sink,
+                        );
+                        return 1;
+                    }
+                } else {
+                    for (exec_info.positional_args) |raw_arg| {
+                        if (!(try collectDirectoryCxPaths(allocator, io, raw_arg, &expanded_fmt_paths))) {
+                            if (!std.mem.endsWith(u8, raw_arg, ".cx")) {
+                                try sink.emit(.{
+                                    .code = .e0001_unknown_cli_flag,
+                                    .severity = .err,
+                                    .message = try std.fmt.allocPrint(
+                                        sink.arena.asAllocator(),
+                                        "unsupported input `{s}` for `corex fmt`; expected `.cx` file or directory",
+                                        .{raw_arg},
+                                    ),
+                                });
+                                continue;
+                            }
+                            const duped_arg = try allocator.dupe(u8, raw_arg);
+                            errdefer allocator.free(duped_arg);
+                            try expanded_fmt_paths.append(allocator, duped_arg);
+                        }
+                    }
+                    if (sink.hasErrors()) {
+                        try DiagnosticRenderer.init(&source_map, &interner, stderr_style).renderAll(
+                            stderr_writer,
+                            &sink,
+                        );
+                        return 1;
                     }
                 }
 
@@ -4499,20 +5736,25 @@ pub fn runCli(
                             );
                             try stderr_writer.writeByte('\n');
                         } else {
-                            std.Io.Dir.cwd().writeFile(io, .{
-                                .sub_path = file_arg,
-                                .data = fmt_res.formatted_text,
-                            }) catch {
-                                try sink.emit(.{
-                                    .code = .e0004_source_file_io_error,
-                                    .severity = .err,
-                                    .message = try std.fmt.allocPrint(
-                                        sink.arena.asAllocator(),
-                                        "failed to write formatted source file `{s}`",
-                                        .{file_arg},
-                                    ),
-                                });
-                                continue;
+                            codegen_abi.writeArtifactAtomic(
+                                io,
+                                allocator,
+                                file_arg,
+                                fmt_res.formatted_text,
+                            ) catch |write_err| switch (write_err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                else => {
+                                    try sink.emit(.{
+                                        .code = .e0004_source_file_io_error,
+                                        .severity = .err,
+                                        .message = try std.fmt.allocPrint(
+                                            sink.arena.asAllocator(),
+                                            "failed to write formatted source file `{s}`",
+                                            .{file_arg},
+                                        ),
+                                    });
+                                    continue;
+                                },
                             };
                         }
                     }
@@ -4538,10 +5780,33 @@ pub fn runCli(
                 return 0;
             }
 
-            const input_positional = if (exec_info.subcommand == .run)
+            var effective_exec_info = exec_info;
+            var input_positional = if (exec_info.subcommand == .run)
                 exec_info.positional_args[0..exec_info.pre_dash_arg_count]
             else
                 exec_info.positional_args;
+
+            // Extract optional space-separated `[pkg] [cap]` selectors after bare `--explain-caps`:
+            if (effective_exec_info.subcommand == .check and
+                effective_exec_info.is_explain_caps and
+                effective_exec_info.explain_caps_pkg == null and
+                effective_exec_info.explain_caps_cap == null and
+                input_positional.len > 0 and
+                isExplainCapsSelectorToken(io, input_positional[0]))
+            {
+                const sel0 = input_positional[0];
+                if (input_positional.len > 1 and isExplainCapsSelectorToken(io, input_positional[1])) {
+                    effective_exec_info.explain_caps_pkg = sel0;
+                    effective_exec_info.explain_caps_cap = input_positional[1];
+                    input_positional = input_positional[2..];
+                } else if (pkg_manifest.MANIFEST_CAPABILITY_MAP.has(sel0) or std.mem.eql(u8, sel0, "unsafe")) {
+                    effective_exec_info.explain_caps_cap = sel0;
+                    input_positional = input_positional[1..];
+                } else {
+                    effective_exec_info.explain_caps_pkg = sel0;
+                    input_positional = input_positional[1..];
+                }
+            }
 
             if (try tryExecutePackageOrScriptMode(
                 allocator,
@@ -4550,7 +5815,7 @@ pub fn runCli(
                 &source_map,
                 &interner,
                 &sink,
-                exec_info,
+                effective_exec_info,
                 input_positional,
                 stdout_style,
                 stderr_style,
@@ -4565,14 +5830,28 @@ pub fn runCli(
                 for (expanded_paths.items) |owned_p| allocator.free(owned_p);
                 expanded_paths.deinit(allocator);
             }
-            for (input_positional) |raw_arg| {
-                const allow_dir = exec_info.subcommand == .check or
-                    exec_info.subcommand == .@"test" or
-                    exec_info.subcommand == .upgrade;
-                if (!allow_dir or !(try collectDirectoryCxPaths(allocator, io, raw_arg, &expanded_paths))) {
-                    const duped_arg = try allocator.dupe(u8, raw_arg);
-                    errdefer allocator.free(duped_arg);
-                    try expanded_paths.append(allocator, duped_arg);
+            if (input_positional.len == 0) {
+                if (effective_exec_info.subcommand == .check or effective_exec_info.subcommand == .@"test") {
+                    _ = try collectDirectoryCxPaths(allocator, io, ".", &expanded_paths);
+                }
+                if (expanded_paths.items.len == 0) {
+                    try emitMissingCliArgDiagnostic(
+                        &sink,
+                        "no `corex.toml` manifest or `.cx` source files found in current directory",
+                        "help: pass a `.cx` source file, `corex.toml` manifest, or directory",
+                    );
+                    try DiagnosticRenderer.init(&source_map, &interner, stderr_style).renderAll(stderr_writer, &sink);
+                    return 1;
+                }
+            } else {
+                for (input_positional) |raw_arg| {
+                    const allow_dir = effective_exec_info.subcommand == .check or
+                        effective_exec_info.subcommand == .@"test";
+                    if (!allow_dir or !(try collectDirectoryCxPaths(allocator, io, raw_arg, &expanded_paths))) {
+                        const duped_arg = try allocator.dupe(u8, raw_arg);
+                        errdefer allocator.free(duped_arg);
+                        try expanded_paths.append(allocator, duped_arg);
+                    }
                 }
             }
 
@@ -4583,34 +5862,52 @@ pub fn runCli(
             var embed_sandbox_root: []const u8 = ".";
 
             for (expanded_paths.items) |file_arg| {
-                const file_id = (try loadSourceFileIntoVfs(io, &source_map, file_arg, &sink)) orelse continue;
-                if (std.mem.endsWith(u8, file_arg, ".cx")) {
-                    if (cx_file_ids.items.len == 0) {
-                        embed_sandbox_root = std.fs.path.dirname(file_arg) orelse ".";
-                    }
-                    try cx_file_ids.append(allocator, file_id);
-                    try cx_file_paths.append(allocator, file_arg);
+                if (!std.mem.endsWith(u8, file_arg, ".cx")) {
+                    try sink.emit(.{
+                        .code = .e0001_unknown_cli_flag,
+                        .severity = .err,
+                        .message = try std.fmt.allocPrint(
+                            sink.arena.asAllocator(),
+                            "unsupported input `{s}`; expected a `.cx` source file, `corex.toml` manifest, or directory",
+                            .{file_arg},
+                        ),
+                    });
+                    continue;
                 }
+                const file_id = (try loadSourceFileIntoVfs(io, &source_map, file_arg, &sink)) orelse continue;
+                if (cx_file_ids.items.len == 0) {
+                    embed_sandbox_root = std.fs.path.dirname(file_arg) orelse ".";
+                }
+                try cx_file_ids.append(allocator, file_id);
+                try cx_file_paths.append(allocator, file_arg);
             }
             if (sink.hasErrors()) {
                 try DiagnosticRenderer.init(&source_map, &interner, stderr_style).renderAll(stderr_writer, &sink);
                 return 1;
             }
+            if (cx_file_ids.items.len == 0) {
+                try emitMissingCliArgDiagnostic(
+                    &sink,
+                    "no `.cx` source files found in specified target",
+                    "help: pass a `.cx` source file or a directory containing `.cx` modules",
+                );
+                try DiagnosticRenderer.init(&source_map, &interner, stderr_style).renderAll(stderr_writer, &sink);
+                return 1;
+            }
 
-            if ((isCompileSubcommand(exec_info.subcommand) or exec_info.subcommand == .upgrade) and
-                cx_file_ids.items.len > 0)
-            {
+            if (isCompileSubcommand(effective_exec_info.subcommand) and cx_file_ids.items.len > 0) {
                 var db = try query_db.CompilerDb.init(allocator);
                 defer db.deinit();
-                db.setSastStrict(exec_info.is_sast_strict);
-                if (exec_info.is_internal_core) {
+                db.setVfsSourceMap(&source_map);
+                db.setSastStrict(effective_exec_info.is_sast_strict);
+                if (effective_exec_info.is_internal_core) {
                     try db.setInternalCore(true);
                 }
-                db.setIncludeTests(exec_info.subcommand == .@"test");
-                db.setComptimeStepLimit(exec_info.comptime_step_limit);
+                db.setIncludeTests(effective_exec_info.subcommand == .@"test");
+                db.setComptimeStepLimit(effective_exec_info.comptime_step_limit);
                 db.setEmbedSandbox(embed_sandbox_root, null);
                 db.setEmbedIo(io);
-                if (exec_info.target_spec) |explicit_target| {
+                if (effective_exec_info.target_spec) |explicit_target| {
                     db.setTargetSpec(explicit_target);
                 }
 
@@ -4644,19 +5941,100 @@ pub fn runCli(
                     );
                 }
 
+                const check_fix_report: ?check_audit.CheckFixReport =
+                    if (effective_exec_info.subcommand == .check and effective_exec_info.is_fix_mode)
+                        try check_audit.applyCheckFixesOnDb(allocator, &db, .{
+                            .io = io,
+                            .vfs = &source_map,
+                            .write_to_disk = true,
+                            .candidate_files = cx_file_ids.items,
+                        })
+                    else
+                        null;
+
                 const diag_renderer = DiagnosticRenderer.init(&source_map, &interner, stderr_style);
-                if (try verifyAndRenderModuleDiagnostics(
+                const mod_diag = try verifyAndRenderModuleDiagnosticsWithWarnings(
                     allocator,
                     &db,
                     cx_file_ids.items,
                     diag_renderer,
                     stderr_writer,
-                )) {
+                );
+                if (mod_diag.has_errors and
+                    !(effective_exec_info.subcommand == .check and
+                        (effective_exec_info.is_check_caps or effective_exec_info.is_explain_caps)))
+                {
                     return 1;
                 }
 
-                switch (exec_info.subcommand) {
-                    .check => {},
+                switch (effective_exec_info.subcommand) {
+                    .check => {
+                        const standalone_stem = std.fs.path.stem(cx_file_paths.items[0]);
+                        var has_caps_escalation = false;
+                        if (effective_exec_info.is_check_caps) {
+                            const audit_rep = try check_audit.renderCapabilityAuditTable(
+                                allocator,
+                                &db,
+                                stdout_writer,
+                                .{
+                                    .style_config = stdout_style,
+                                    .standalone_files = cx_file_ids.items,
+                                    .standalone_label = standalone_stem,
+                                    .has_contract_errors = mod_diag.has_errors,
+                                },
+                            );
+                            if (audit_rep.has_escalation) has_caps_escalation = true;
+                        }
+                        if (effective_exec_info.is_explain_caps) {
+                            var explain_sink = DiagnosticSink.init(allocator);
+                            defer explain_sink.deinit();
+                            const exp_rep = try check_audit.renderExplainCapsReport(
+                                allocator,
+                                &db,
+                                stdout_writer,
+                                &explain_sink,
+                                .{
+                                    .style_config = stdout_style,
+                                    .vfs = &source_map,
+                                    .standalone_files = cx_file_ids.items,
+                                    .standalone_name = standalone_stem,
+                                    .target_pkg_arg = effective_exec_info.explain_caps_pkg,
+                                    .target_cap_arg = effective_exec_info.explain_caps_cap,
+                                },
+                            );
+                            if (explain_sink.diagnostics.items.len > 0) {
+                                try diag_renderer.renderAll(stderr_writer, &explain_sink);
+                            }
+                            if (exp_rep.has_cli_error or explain_sink.hasErrors()) return 1;
+                        }
+                        if (mod_diag.has_errors or has_caps_escalation) return 1;
+                        if (effective_exec_info.is_deny_warnings and mod_diag.warning_count > 0) {
+                            try check_audit.renderDenyWarningsSummary(
+                                stderr_style,
+                                stderr_writer,
+                                mod_diag.warning_count,
+                            );
+                            return 1;
+                        }
+                        if (check_fix_report) |fix_rep| {
+                            if (!effective_exec_info.is_check_caps and !effective_exec_info.is_explain_caps) {
+                                try check_audit.renderCheckFixSummary(stdout_style, stdout_writer, fix_rep);
+                            }
+                            return 0;
+                        }
+                        if (effective_exec_info.is_check_caps or effective_exec_info.is_explain_caps) {
+                            return 0;
+                        }
+                        try stdout_style.writeStatusHeader(
+                            stdout_writer,
+                            .success,
+                            Glyphs.SUCCESS,
+                            "check",
+                            standalone_stem,
+                        );
+                        try stdout_writer.writeByte('\n');
+                        return 0;
+                    },
                     .build => {
                         const active_target = exec_info.target_spec orelse codegen_abi.TargetSpec.host();
                         const has_main = try fileDeclaresMainEntrypoint(&db, cx_file_ids.items[0]);
@@ -4896,18 +6274,19 @@ pub fn runCli(
                             try stdout_writer.writeByte('\n');
                             return 0;
                         }
+                        try stdout_style.writeStatusHeader(
+                            stdout_writer,
+                            .success,
+                            Glyphs.SUCCESS,
+                            "test",
+                            std.fs.path.stem(cx_file_paths.items[0]),
+                        );
+                        try stdout_writer.writeByte('\n');
+                        return 0;
                     },
                     else => {},
                 }
             }
-            try stdout_style.writeStatusHeader(
-                stdout_writer,
-                .success,
-                Glyphs.SUCCESS,
-                exec_info.subcommand.asName(),
-                "Phase 0 bootstrap foundation verified",
-            );
-            try stdout_writer.writeByte('\n');
             return 0;
         },
     }
@@ -4932,10 +6311,30 @@ comptime {
     std.debug.assert(FMT_FLAGS.len == 3);
     for (FMT_FLAGS, 0..) |fmt_desc, i| {
         std.debug.assert(@backingInt(fmt_desc.id) == i);
+        if (i > 0) {
+            std.debug.assert(std.mem.order(u8, FMT_FLAGS[i - 1].long_flag, fmt_desc.long_flag) == .lt);
+        }
     }
-    std.debug.assert(UPGRADE_FLAGS.len == 1);
+    std.debug.assert(CHECK_FLAGS.len == 4);
+    for (CHECK_FLAGS, 0..) |chk_desc, i| {
+        std.debug.assert(@backingInt(chk_desc.id) == i);
+        if (i > 0) {
+            std.debug.assert(std.mem.order(u8, CHECK_FLAGS[i - 1].long_flag, chk_desc.long_flag) == .lt);
+        }
+    }
+    std.debug.assert(UPGRADE_FLAGS.len == 6);
     for (UPGRADE_FLAGS, 0..) |upg_desc, i| {
         std.debug.assert(@backingInt(upg_desc.id) == i);
+        if (i > 0) {
+            std.debug.assert(std.mem.order(u8, UPGRADE_FLAGS[i - 1].long_flag, upg_desc.long_flag) == .lt);
+        }
+    }
+    std.debug.assert(LSP_FLAGS.len == 2);
+    for (LSP_FLAGS, 0..) |lsp_desc, i| {
+        std.debug.assert(@backingInt(lsp_desc.id) == i);
+        if (i > 0) {
+            std.debug.assert(std.mem.order(u8, LSP_FLAGS[i - 1].long_flag, lsp_desc.long_flag) == .lt);
+        }
     }
     std.debug.assert(TRANSLATE_C_FLAGS.len == 5);
     for (TRANSLATE_C_FLAGS, 0..) |tc_desc, i| {
@@ -4955,6 +6354,9 @@ comptime {
 
 test "test_cli_router_subcommands_flags_and_typo_suggestions" {
     try std.testing.expectEqual(@as(usize, 9), CLI_SUBCOMMANDS.len);
+    try std.testing.expectEqual(@as(usize, 4), CHECK_FLAGS.len);
+    try std.testing.expectEqual(@as(usize, 6), UPGRADE_FLAGS.len);
+    try std.testing.expectEqual(@as(usize, 2), LSP_FLAGS.len);
     try std.testing.expectEqual(@as(usize, 5), TRANSLATE_C_FLAGS.len);
     try std.testing.expectEqual(@as(usize, 25), COMPILE_FLAGS.len);
     try std.testing.expectEqualStrings("build", suggestSubcommand("biuld").?);
@@ -4979,19 +6381,50 @@ test "test_cli_router_subcommands_flags_and_typo_suggestions" {
     try std.testing.expect(parsed_core.is_internal_core);
     try std.testing.expect(parsed_core.action.execute_subcommand.is_internal_core);
 
-    // `--check`, `--fix`, and `--internal-core` are valid on `fmt`/`upgrade`, driven by `FMT_FLAGS` & `UPGRADE_FLAGS`:
+    // Phase 10 `FMT_FLAGS`, `CHECK_FLAGS`, `UPGRADE_FLAGS`, and `LSP_FLAGS` typo hints & parsing:
     try std.testing.expectEqual(@as(usize, 3), FMT_FLAGS.len);
-    try std.testing.expectEqual(@as(usize, 1), UPGRADE_FLAGS.len);
     try std.testing.expectEqualStrings("--check", suggestFlagForSubcommand("--chck", .fmt).?);
     try std.testing.expectEqualStrings("--fix", suggestFlagForSubcommand("--fx", .fmt).?);
     try std.testing.expectEqualStrings("--internal-core", suggestFlagForSubcommand("--internal-cor", .fmt).?);
     try std.testing.expectEqualStrings("--internal-core", suggestFlagForSubcommand("--internal-cor", .upgrade).?);
+    try std.testing.expectEqualStrings("--accept-caps", suggestFlagForSubcommand("--accept-cap", .upgrade).?);
+    try std.testing.expectEqualStrings("--explain", suggestFlagForSubcommand("--explan", .upgrade).?);
+    try std.testing.expectEqualStrings("--deny-warnings", suggestFlagForSubcommand("--deny-warning", .check).?);
+    try std.testing.expectEqualStrings("--explain-caps", suggestFlagForSubcommand("--explain-cap", .check).?);
+    try std.testing.expectEqualStrings("--stdio", suggestFlagForSubcommand("--stdi", .lsp).?);
 
     const parsed_fmt = try parseArgs(&.{ "fmt", "--check", "--fix", "--internal-core" }, &sink);
     try std.testing.expect(!sink.hasErrors());
     try std.testing.expect(parsed_fmt.is_check_only);
     try std.testing.expect(parsed_fmt.is_fix_mode);
     try std.testing.expect(parsed_fmt.is_internal_core);
+
+    const parsed_chk10 = try parseArgs(
+        &.{ "check", "--caps", "--deny-warnings", "--fix", "--explain-caps=my-pkg,net" },
+        &sink,
+    );
+    try std.testing.expect(!sink.hasErrors());
+    try std.testing.expect(parsed_chk10.is_check_caps);
+    try std.testing.expect(parsed_chk10.is_deny_warnings);
+    try std.testing.expect(parsed_chk10.is_fix_mode);
+    try std.testing.expect(parsed_chk10.is_explain_caps);
+    try std.testing.expectEqualStrings("my-pkg", parsed_chk10.explain_caps_pkg.?);
+    try std.testing.expectEqualStrings("net", parsed_chk10.explain_caps_cap.?);
+
+    const parsed_upg10 = try parseArgs(
+        &.{ "upgrade", "--check", "--rule=UR-21-00", "--accept-caps=net,unsafe_op" },
+        &sink,
+    );
+    try std.testing.expect(!sink.hasErrors());
+    try std.testing.expect(parsed_upg10.is_check_only);
+    try std.testing.expectEqualStrings("UR-21-00", parsed_upg10.upgrade_rule_csv.?);
+    try std.testing.expect(parsed_upg10.has_accept_caps);
+    try std.testing.expectEqualStrings("net,unsafe_op", parsed_upg10.accept_caps_csv.?);
+
+    const parsed_lsp10 = try parseArgs(&.{ "lsp", "--stdio", "--internal-core" }, &sink);
+    try std.testing.expect(!sink.hasErrors());
+    try std.testing.expect(parsed_lsp10.is_lsp_stdio);
+    try std.testing.expect(parsed_lsp10.is_internal_core);
 
     const parsed_pkg = try parseArgs(&.{
         "build",
@@ -5180,4 +6613,122 @@ test "test_direct_script_invocation_and_dual_lib_bin_scope" {
         std.debug.print("Dual lib+bin stderr:\n{s}\n", .{err_writer.buffered()});
     }
     try std.testing.expectEqual(@as(u8, 0), exit_check);
+}
+
+test "test_cli_check_fix_preserves_script_prefixes_and_atomic_fmt" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const scratch_dir = ".zig-cache/router_script_check_fix_test";
+    std.Io.Dir.cwd().deleteTree(io, scratch_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, scratch_dir) catch {};
+
+    const home_dir = scratch_dir ++ "/home";
+    const scripts_dir = scratch_dir ++ "/scripts";
+    try std.Io.Dir.cwd().createDirPath(io, home_dir);
+    try std.Io.Dir.cwd().createDirPath(io, scripts_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("COREX_HOME", home_dir);
+
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+
+    // [1] Mode C shebang-only `.cx` script: `corex check --fix` preserves `#!` and rewrites `Option[u8]` -> `u8?`:
+    const mode_c_path = scripts_dir ++ "/mode_c_cli.cx";
+    const shebang_line = "#!/usr/bin/env corex\n";
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = mode_c_path,
+        .data = shebang_line ++
+            "pub fn main() -> i32 {\n" ++
+            "    let opt: Option[u8] = .None;\n" ++
+            "    let _ = opt;\n" ++
+            "    return 0;\n" ++
+            "}\n",
+    });
+    {
+        var out_writer = std.Io.Writer.fixed(&out_buf);
+        var err_writer = std.Io.Writer.fixed(&err_buf);
+        const exit_c = try runCli(
+            allocator,
+            io,
+            &env_map,
+            &.{ "--color=never", "check", "--fix", mode_c_path },
+            &out_writer,
+            &err_writer,
+        );
+        try std.testing.expectEqual(@as(u8, 0), exit_c);
+        const disk_c = try std.Io.Dir.cwd().readFileAlloc(io, mode_c_path, allocator, .limited(64 * 1024));
+        defer allocator.free(disk_c);
+        try std.testing.expect(std.mem.startsWith(u8, disk_c, shebang_line));
+        try std.testing.expect(std.mem.indexOf(u8, disk_c, "let opt: u8? = .None;") != null);
+    }
+
+    // [2] Mode B `#! + ---` script + `mod helper;`: `corex check --fix` persists both files while keeping `#! + ---`:
+    const mode_b_path = scripts_dir ++ "/mode_b_cli.cx";
+    const helper_path = scripts_dir ++ "/helper.cx";
+    const fm_header =
+        "#!/usr/bin/env corex\n" ++
+        "---\n" ++
+        "[package]\n" ++
+        "name = \"mode-b-cli\"\n" ++
+        "version = \"0.1.0\"\n" ++
+        "---\n";
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = helper_path,
+        .data = "pub fn pick_val(opt: Option[i32]) -> i32 {\n    return opt orelse 7;\n}\n",
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = mode_b_path,
+        .data = fm_header ++
+            "mod helper;\n\n" ++
+            "pub fn main() -> i32 {\n" ++
+            "    let top_opt: Option[i32] = .Some(3);\n" ++
+            "    return helper.pick_val(top_opt);\n" ++
+            "}\n",
+    });
+    {
+        var out_writer = std.Io.Writer.fixed(&out_buf);
+        var err_writer = std.Io.Writer.fixed(&err_buf);
+        const exit_b = try runCli(
+            allocator,
+            io,
+            &env_map,
+            &.{ "--color=never", "check", "--fix", mode_b_path },
+            &out_writer,
+            &err_writer,
+        );
+        try std.testing.expectEqual(@as(u8, 0), exit_b);
+        const disk_b = try std.Io.Dir.cwd().readFileAlloc(io, mode_b_path, allocator, .limited(64 * 1024));
+        defer allocator.free(disk_b);
+        try std.testing.expect(std.mem.startsWith(u8, disk_b, fm_header));
+        try std.testing.expect(std.mem.indexOf(u8, disk_b, "let top_opt: i32? = .Some(3);") != null);
+
+        const disk_helper = try std.Io.Dir.cwd().readFileAlloc(io, helper_path, allocator, .limited(64 * 1024));
+        defer allocator.free(disk_helper);
+        try std.testing.expect(std.mem.indexOf(u8, disk_helper, "opt: i32?") != null);
+    }
+
+    // [3] `corex fmt` writes atomically via `writeArtifactAtomic`:
+    const fmt_path = scripts_dir ++ "/unformatted.cx";
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = fmt_path,
+        .data = "pub fn   messy(  val:i32 )->i32{return val;}\n",
+    });
+    {
+        var out_writer = std.Io.Writer.fixed(&out_buf);
+        var err_writer = std.Io.Writer.fixed(&err_buf);
+        const exit_fmt = try runCli(
+            allocator,
+            io,
+            &env_map,
+            &.{ "--color=never", "fmt", fmt_path },
+            &out_writer,
+            &err_writer,
+        );
+        try std.testing.expectEqual(@as(u8, 0), exit_fmt);
+        const disk_fmt = try std.Io.Dir.cwd().readFileAlloc(io, fmt_path, allocator, .limited(64 * 1024));
+        defer allocator.free(disk_fmt);
+        try std.testing.expect(std.mem.indexOf(u8, disk_fmt, "pub fn messy(val: i32) -> i32") != null);
+    }
 }

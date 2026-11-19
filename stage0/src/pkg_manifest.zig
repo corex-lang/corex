@@ -3123,16 +3123,15 @@ const TomlParser = struct {
 
 /// Translates common Rust-style `cfg(target_os = "linux")` predicates into CoreX `@cfg` syntax for autofixes.
 fn suggestCorexTargetCfgFromRust(arena: *BumpArena, raw_pred: []const u8) !?[]const u8 {
-    const trimmed = std.mem.trim(u8, raw_pred, " \t");
-    if (std.mem.eql(u8, trimmed, "unix")) {
-        return try arena.dupe(u8, "target.os is (.Linux | .Macos)");
-    }
-    if (std.mem.eql(u8, trimmed, "windows")) {
-        return try arena.dupe(u8, "target.os == .Windows");
-    }
-    var inner = trimmed;
+    var inner = std.mem.trim(u8, raw_pred, " \t");
     if (std.mem.startsWith(u8, inner, "cfg(") and std.mem.endsWith(u8, inner, ")")) {
         inner = std.mem.trim(u8, inner[4 .. inner.len - 1], " \t");
+    }
+    if (std.mem.eql(u8, inner, "unix")) {
+        return try arena.dupe(u8, "target.os is (.Linux | .Macos)");
+    }
+    if (std.mem.eql(u8, inner, "windows")) {
+        return try arena.dupe(u8, "target.os == .Windows");
     }
     const eq_pos = std.mem.indexOfScalar(u8, inner, '=') orelse return null;
     if (eq_pos + 1 < inner.len and inner[eq_pos + 1] == '=') return null;

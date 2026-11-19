@@ -1,7 +1,7 @@
 //! Repository-Wide Drift Guards (`tests/drift/drift_guard_test.zig`)
 //!
 //! Enforces zero colored emojis across the entire repository, 100% parity between `router.zig`
-//! tables and `corex --help`, `DIAGNOSTIC_CATALOG` subsystem prefix integrity, Phase 1–9 IR/VM/
+//! tables and `corex --help`, `DIAGNOSTIC_CATALOG` subsystem prefix integrity, Phase 1–10 IR/VM/
 //! SAST/ABI/Async/Pkg struct layouts, `DR-08`/`DR-11`/`DR-16`–`DR-22` seams, enum contiguity, and
 //! diagnostic coverage, plus `< 150` column line length and 90-char dividers in `.zig`/`.cx` files.
 //!
@@ -474,11 +474,22 @@ test "test_drift_guard_phase3_query_db_fmt_engine_and_cli_flags" {
         try std.testing.expect(fmt_flag.summary.len > 0);
     }
 
-    try std.testing.expectEqual(@as(usize, 1), router.UPGRADE_FLAGS.len);
-    try std.testing.expectEqualStrings("--internal-core", router.UPGRADE_FLAGS[0].long_flag);
+    try std.testing.expectEqual(@as(usize, 6), router.UPGRADE_FLAGS.len);
+    try std.testing.expectEqualStrings("--accept-caps", router.UPGRADE_FLAGS[0].long_flag);
+    try std.testing.expectEqualStrings("--check", router.UPGRADE_FLAGS[1].long_flag);
+    try std.testing.expectEqualStrings("--explain", router.UPGRADE_FLAGS[2].long_flag);
+    try std.testing.expectEqualStrings("--internal-core", router.UPGRADE_FLAGS[3].long_flag);
+    try std.testing.expectEqualStrings("--list", router.UPGRADE_FLAGS[4].long_flag);
+    try std.testing.expectEqualStrings("--rule", router.UPGRADE_FLAGS[5].long_flag);
     for (router.UPGRADE_FLAGS, 0..) |upg_flag, i| {
         try std.testing.expectEqual(i, @as(usize, @backingInt(upg_flag.id)));
         try std.testing.expect(upg_flag.summary.len > 0);
+        if (i > 0) {
+            try std.testing.expectEqual(
+                std.math.Order.lt,
+                std.mem.order(u8, router.UPGRADE_FLAGS[i - 1].long_flag, upg_flag.long_flag),
+            );
+        }
     }
 }
 
@@ -1040,8 +1051,8 @@ test "test_drift_guard_phase7_5_dr21_surface_syntax_and_diagnostics" {
         try std.testing.expectEqual(@as(u8, @intCast(i)), resolved.?.slot_ordinal);
     }
 
-    // [4] Verify all 8 `DR-21` `DiagnosticCode` tags (`126` total catalog entries) and test coverage:
-    try std.testing.expectEqual(@as(usize, 126), diagnostic.DIAGNOSTIC_CATALOG.len);
+    // [4] Verify all 8 `DR-21` `DiagnosticCode` tags (`128` total catalog entries) and test coverage:
+    try std.testing.expectEqual(@as(usize, 128), diagnostic.DIAGNOSTIC_CATALOG.len);
     const dr21_specs = [_]struct {
         /// Canonical Phase 7.5 `DR-21` `DiagnosticCode` tag.
         code: DiagnosticCode,
@@ -1531,7 +1542,7 @@ test "test_drift_guard_phase9_pkg_seams_diagnostics_and_cli" {
 
     // [5] Verify all 7 new Phase 9 `DiagnosticCode` tags (`E0010`–`E0016`) + reused `DR-17` codes (`E0324`–`E0327`,
     //     `E0435`, `W0330`) in `DIAGNOSTIC_CATALOG`, `stage0/src/`, and `tests/unit/`:
-    try std.testing.expectEqual(@as(usize, 126), diagnostic.DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 128), diagnostic.DIAGNOSTIC_CATALOG.len);
     try std.testing.expectEqual(
         DiagnosticCode.e0435_invalid_cfg_predicate,
         DiagnosticCode.e0435_unknown_cfg_feature,
@@ -1600,4 +1611,171 @@ test "test_drift_guard_phase9_pkg_seams_diagnostics_and_cli" {
         }
         try std.testing.expect(has_test_reference[i]);
     }
+}
+
+test "test_drift_guard_phase10_tooling_lsp_check_and_upgrade" {
+    // [1] Verify `DIAGNOSTIC_CATALOG` (`128` contiguous entries) and `W0202` / `W0403` coverage:
+    try expectContiguousEnum(DiagnosticCode);
+    try std.testing.expectEqual(@as(usize, 128), diagnostic.DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 128), std.enums.values(DiagnosticCode).len);
+
+    const phase10_diag_specs = [_]struct {
+        /// Canonical Phase 10 `DiagnosticCode` tag exercised by `check` and `upgrade`.
+        code: DiagnosticCode,
+        /// Expected 5-character CLI diagnostic code string.
+        expected_str: []const u8,
+    }{
+        .{ .code = .w0202_non_idiomatic_construct, .expected_str = "W0202" },
+        .{ .code = .w0403_deprecated_symbol, .expected_str = "W0403" },
+    };
+    var diag_tag_names: [phase10_diag_specs.len][]const u8 = undefined;
+    var has_src_ref: [phase10_diag_specs.len]bool = @splat(false);
+    var has_test_ref: [phase10_diag_specs.len]bool = @splat(false);
+    for (phase10_diag_specs, 0..) |spec, i| {
+        const cat_entry = diagnostic.DIAGNOSTIC_CATALOG[@backingInt(spec.code)];
+        try std.testing.expectEqual(spec.code, cat_entry.code);
+        try std.testing.expectEqualStrings(spec.expected_str, spec.code.asCodeStr());
+        try std.testing.expectEqualStrings(spec.expected_str, cat_entry.code_str);
+        try std.testing.expectEqual(corex.Severity.warning, cat_entry.default_severity);
+        try std.testing.expect(cat_entry.title.len > 0);
+        try std.testing.expect(cat_entry.explanation.len > 0);
+        diag_tag_names[i] = @tagName(spec.code);
+    }
+    try markReferencedIdentifiersInDir(
+        std.testing.allocator,
+        std.testing.io,
+        "stage0/src",
+        &diag_tag_names,
+        &has_src_ref,
+    );
+    try markReferencedIdentifiersInDir(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/unit",
+        &diag_tag_names,
+        &has_test_ref,
+    );
+    for (0..phase10_diag_specs.len) |i| {
+        try std.testing.expect(has_src_ref[i]);
+        try std.testing.expect(has_test_ref[i]);
+    }
+
+    // [2] Verify frozen `SUBCOMMANDS` (`9`), `TokenKind` (`120`), and `COMPILE_FLAGS` (`25`):
+    try expectContiguousEnum(router.SubcommandId);
+    try std.testing.expectEqual(@as(usize, 9), router.SUBCOMMANDS.len);
+    try expectContiguousEnum(TokenKind);
+    try std.testing.expectEqual(@as(usize, 120), std.enums.values(TokenKind).len);
+    try expectContiguousEnum(router.CompileFlagId);
+    try std.testing.expectEqual(@as(usize, 25), router.COMPILE_FLAGS.len);
+
+    // [3] Verify `CHECK_FLAGS` (`4` sorted entries), `UPGRADE_FLAGS` (`6`), and `LSP_FLAGS` (`2`) + `--help` parity:
+    try expectContiguousEnum(router.CheckFlagId);
+    const expected_check_flags = [_][]const u8{
+        "--caps",
+        "--deny-warnings",
+        "--explain-caps",
+        "--fix",
+    };
+    try std.testing.expectEqual(@as(usize, 4), router.CHECK_FLAGS.len);
+    var sub_help_buf: [8192]u8 = undefined;
+    var check_help_writer = std.Io.Writer.fixed(&sub_help_buf);
+    try router.renderSubcommandHelp(&check_help_writer, StyleConfig.MONOCHROME, .check);
+    const check_help_text = check_help_writer.buffered();
+    for (router.CHECK_FLAGS, 0..) |chk_desc, i| {
+        try std.testing.expectEqual(i, @as(usize, @backingInt(chk_desc.id)));
+        try std.testing.expectEqualStrings(expected_check_flags[i], chk_desc.long_flag);
+        if (i > 0) {
+            try std.testing.expectEqual(
+                std.math.Order.lt,
+                std.mem.order(u8, router.CHECK_FLAGS[i - 1].long_flag, chk_desc.long_flag),
+            );
+        }
+        try std.testing.expect(std.mem.indexOf(u8, check_help_text, chk_desc.long_flag) != null);
+        try std.testing.expect(std.mem.indexOf(u8, check_help_text, chk_desc.summary) != null);
+    }
+
+    try expectContiguousEnum(router.UpgradeFlagId);
+    const expected_upgrade_flags = [_][]const u8{
+        "--accept-caps",
+        "--check",
+        "--explain",
+        "--internal-core",
+        "--list",
+        "--rule",
+    };
+    try std.testing.expectEqual(@as(usize, 6), router.UPGRADE_FLAGS.len);
+    var upgrade_help_writer = std.Io.Writer.fixed(&sub_help_buf);
+    try router.renderSubcommandHelp(&upgrade_help_writer, StyleConfig.MONOCHROME, .upgrade);
+    const upgrade_help_text = upgrade_help_writer.buffered();
+    for (router.UPGRADE_FLAGS, 0..) |upg_desc, i| {
+        try std.testing.expectEqual(i, @as(usize, @backingInt(upg_desc.id)));
+        try std.testing.expectEqualStrings(expected_upgrade_flags[i], upg_desc.long_flag);
+        if (i > 0) {
+            try std.testing.expectEqual(
+                std.math.Order.lt,
+                std.mem.order(u8, router.UPGRADE_FLAGS[i - 1].long_flag, upg_desc.long_flag),
+            );
+        }
+        try std.testing.expect(std.mem.indexOf(u8, upgrade_help_text, upg_desc.long_flag) != null);
+        try std.testing.expect(std.mem.indexOf(u8, upgrade_help_text, upg_desc.summary) != null);
+    }
+
+    try expectContiguousEnum(router.LspFlagId);
+    const expected_lsp_flags = [_][]const u8{
+        "--internal-core",
+        "--stdio",
+    };
+    try std.testing.expectEqual(@as(usize, 2), router.LSP_FLAGS.len);
+    var lsp_help_writer = std.Io.Writer.fixed(&sub_help_buf);
+    try router.renderSubcommandHelp(&lsp_help_writer, StyleConfig.MONOCHROME, .lsp);
+    const lsp_help_text = lsp_help_writer.buffered();
+    for (router.LSP_FLAGS, 0..) |lsp_desc, i| {
+        try std.testing.expectEqual(i, @as(usize, @backingInt(lsp_desc.id)));
+        try std.testing.expectEqualStrings(expected_lsp_flags[i], lsp_desc.long_flag);
+        if (i > 0) {
+            try std.testing.expectEqual(
+                std.math.Order.lt,
+                std.mem.order(u8, router.LSP_FLAGS[i - 1].long_flag, lsp_desc.long_flag),
+            );
+        }
+        try std.testing.expect(std.mem.indexOf(u8, lsp_help_text, lsp_desc.long_flag) != null);
+        try std.testing.expect(std.mem.indexOf(u8, lsp_help_text, lsp_desc.summary) != null);
+    }
+
+    // [4] Verify `UPGRADE_RULE_CATALOG` (`15` contiguous rules `UR-21-00`–`UR-21-07`, `UR-22-00`–`UR-22-06`):
+    try expectContiguousEnum(corex.UpgradeRuleId);
+    try std.testing.expectEqual(@as(usize, 15), corex.UPGRADE_RULE_COUNT);
+    try std.testing.expectEqual(@as(usize, 15), corex.UPGRADE_RULE_CATALOG.len);
+    const expected_rule_codes = [_][]const u8{
+        "UR-21-00",
+        "UR-21-01",
+        "UR-21-02",
+        "UR-21-03",
+        "UR-21-04",
+        "UR-21-05",
+        "UR-21-06",
+        "UR-21-07",
+        "UR-22-00",
+        "UR-22-01",
+        "UR-22-02",
+        "UR-22-03",
+        "UR-22-04",
+        "UR-22-05",
+        "UR-22-06",
+    };
+    for (corex.UPGRADE_RULE_CATALOG, 0..) |rule_desc, i| {
+        try std.testing.expectEqual(i, @as(usize, rule_desc.id.asInt()));
+        try std.testing.expectEqualStrings(expected_rule_codes[i], rule_desc.rule_code);
+        try std.testing.expectEqual(rule_desc.id, corex.lookupUpgradeRule(rule_desc.rule_code).?);
+        try std.testing.expect(rule_desc.summary.len > 0);
+    }
+
+    // [5] Verify bounded VFS overlay and LSP untrusted-input resource caps (`AGENTS.md` §2):
+    try std.testing.expectEqual(@as(usize, 256), corex.MAX_OPEN_OVERLAYS);
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), corex.MAX_OPEN_OVERLAY_BYTES);
+    try std.testing.expectEqual(@as(usize, 8 * 1024), corex.lsp_server.MAX_LSP_HEADER_BYTES);
+    try std.testing.expectEqual(@as(usize, 16 * 1024 * 1024), corex.lsp_server.MAX_LSP_CONTENT_LENGTH);
+    try std.testing.expectEqual(@as(usize, 64), corex.lsp_server.MAX_LSP_JSON_DEPTH);
+    try std.testing.expectEqual(@as(usize, 64), corex.lsp_server.MAX_SEMANTIC_TOKEN_CACHE_ENTRIES);
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), corex.lsp_server.MAX_SEMANTIC_TOKEN_CACHE_BYTES);
 }

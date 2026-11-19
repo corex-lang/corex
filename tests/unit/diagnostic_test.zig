@@ -33,7 +33,9 @@ test "test_diagnostic_severity_and_catalog_code_resolution" {
     try std.testing.expectEqualStrings("note", Severity.info.asLabel());
     try std.testing.expectEqualStrings("help", Severity.help.asLabel());
 
-    try std.testing.expectEqual(@as(usize, 126), diag.DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 128), diag.DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(DiagnosticCode.w0202_non_idiomatic_construct, DiagnosticCode.fromCodeStr("W0202").?);
+    try std.testing.expectEqual(DiagnosticCode.w0403_deprecated_symbol, DiagnosticCode.fromCodeStr("W0403").?);
     try std.testing.expectEqual(DiagnosticCode.e0009_c_header_translation_failed, DiagnosticCode.fromCodeStr("E0009").?);
     try std.testing.expectEqual(DiagnosticCode.e0010_unsatisfiable_dependency_graph, DiagnosticCode.fromCodeStr("E0010").?);
     try std.testing.expectEqual(DiagnosticCode.e0016_offline_or_fetch_failed, DiagnosticCode.fromCodeStr("E0016").?);

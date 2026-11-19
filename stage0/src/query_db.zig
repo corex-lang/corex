@@ -26,6 +26,7 @@ const mir_opt = @import("mir_opt.zig");
 const codegen_abi = @import("codegen_abi.zig");
 const codegen_dev_seam = @import("codegen_dev_seam.zig");
 const pkg_cxi_seam = @import("pkg_cxi_seam.zig");
+const check_audit = @import("check_audit.zig");
 pub const c_frontend = @import("c_frontend.zig");
 pub const c_translate = @import("c_translate.zig");
 
@@ -47,6 +48,7 @@ const LosslessCstArena = syntax_arenas.LosslessCstArena;
 const AstArena = syntax_arenas.AstArena;
 const DiagnosticSink = diagnostic.DiagnosticSink;
 const LabeledSpan = diagnostic.LabeledSpan;
+const SuggestedFix = diagnostic.SuggestedFix;
 const ScopeId = symbol_resolver.ScopeId;
 const SymbolIndex = symbol_resolver.SymbolIndex;
 const SymbolTable = symbol_resolver.SymbolTable;
@@ -507,6 +509,8 @@ pub const ParsedCstArtifact = struct {
     root_node: NodeIndex = .root,
     /// `true` if lexical or syntax errors were encountered during parsing.
     has_parse_errors: bool = false,
+    /// 128-bit `Wyhash` content fingerprint of the source buffer from which this artifact was parsed.
+    source_fingerprint: Fingerprint128 = Fingerprint128.ZERO,
 
     /// Initializes an empty `ParsedCstArtifact` bound to `allocator`.
     pub fn init(allocator: std.mem.Allocator) ParsedCstArtifact {
@@ -516,6 +520,11 @@ pub const ParsedCstArtifact = struct {
             .ast_arena = AstArena.init(allocator),
             .diagnostics = DiagnosticSink.init(allocator),
         };
+    }
+
+    /// Clears `diagnostics` while retaining token, CST, and AST buffers for `reparseIncremental`.
+    pub fn clearDiagnosticsOnly(self: *ParsedCstArtifact) void {
+        self.diagnostics.resetRetainingCapacity();
     }
 
     /// Clears syntax tables while retaining allocated capacity for fast incremental re-parsing.
@@ -528,12 +537,9 @@ pub const ParsedCstArtifact = struct {
         self.ast_arena.nodes.shrinkRetainingCapacity(0);
         self.ast_arena.extra_data.clearRetainingCapacity();
         self.ast_arena.ast_to_cst.clearRetainingCapacity();
-        self.diagnostics.diagnostics.clearRetainingCapacity();
-        self.diagnostics.arena.resetRetainingCapacity();
-        self.diagnostics.error_count = 0;
-        self.diagnostics.warning_count = 0;
-        self.diagnostics.has_reached_limit = false;
+        self.clearDiagnosticsOnly();
         self.has_parse_errors = false;
+        self.source_fingerprint = Fingerprint128.ZERO;
     }
 
     /// Releases all owned syntax arenas and diagnostic buffers.
@@ -699,6 +705,8 @@ pub const ResolvedSignaturesArtifact = struct {
     public_item_count: u32,
     /// Total number of name-resolution or signature errors emitted in `file_id`.
     error_count: u32 = 0,
+    /// Total number of name-resolution or signature warnings (e.g., `W0403`) emitted in `file_id`.
+    warning_count: u32 = 0,
     /// 128-bit fingerprint of the intra-package resolved module signature map.
     signatures_fingerprint: Fingerprint128,
     /// `.cxi` cross-package export firewall digest covering ONLY `Visibility.public` items (`ADR-22E`).
@@ -912,6 +920,34 @@ pub const PackageCxiArtifact = struct {
     }
 };
 
+/// Directed intra-package `mod <name>;` parent-to-child file edge maintained for $O(V + E)$ subtree traversal.
+pub const ModLink = struct {
+    /// Parent module `FileId` containing `mod <name>;`.
+    parent_fid: FileId,
+    /// Interned child module identifier (`SymbolId`).
+    mod_sym: SymbolId,
+    /// Resolved child module `FileId`.
+    child_fid: FileId,
+};
+
+/// Coalesced byte-range edit queued by `setInputWithEdit` for Stage 1 `reparseIncremental`.
+pub const PendingFileEdit = struct {
+    /// `SourceInput.content_fingerprint` prior to `range` (`S_0`).
+    base_fingerprint: Fingerprint128,
+    /// `SourceInput.content_fingerprint` after applying `range` (`S_1`).
+    target_fingerprint: Fingerprint128,
+    /// Coalesced byte-offset replacement span from `base_fingerprint` to `target_fingerprint`.
+    range: parser.EditRange,
+};
+
+/// Inclusive/exclusive `[sym_start .. sym_end)` `SymbolIndex` bounds for a file's live Pass-1 symbols.
+pub const SymbolIndexBounds = struct {
+    /// Inclusive starting `SymbolIndex.asInt()` of the file's Pass-1 symbols.
+    sym_start: u32,
+    /// Exclusive ending `SymbolIndex.asInt()` of the file's Pass-1 symbols.
+    sym_end: u32,
+};
+
 /// Cached intra-package Pass-1 module-item collection state preventing duplicate `SymbolIndex` creation.
 const FilePass1State = struct {
     /// Collected module `ScopeId` for `file_id`.
@@ -924,6 +960,8 @@ const FilePass1State = struct {
     created_revision: Revision = .initial,
     /// `true` once Pass-2 `resolveFileUseImports` has already consumed `mod_scope`.
     has_consumed_pass2: bool = false,
+    /// `ItemTree.tree_fingerprint` from which `mod_scope` was collected.
+    tree_fingerprint: Fingerprint128 = Fingerprint128.ZERO,
 };
 
 /// Errors returned by `CompilerDb.compileModuleArtifact`.
@@ -980,6 +1018,8 @@ pub const QueryTelemetry = struct {
     durability_fast_path_hits: u64 = 0,
     /// Number of times `executeAndBackdate` recomputed an identical fingerprint and backdated `changed_at`.
     early_cutoff_hits: u64 = 0,
+    /// Number of times `computeParseCst` spliced unchanged prefix/suffix items via `reparseIncremental`.
+    incremental_reparse_fast_splices: u64 = 0,
 
     /// Returns the total execution count recorded for `stage`.
     pub inline fn countExecutions(self: *const QueryTelemetry, stage: QueryStage) u64 {
@@ -2934,6 +2974,158 @@ fn hashSymbolTextCanonical(
     hasher.updateBytes(interner.get(sym_id));
 }
 
+/// Appends `is_deprecated` and `@deprecated` / `@fix_inline` metadata of `sym_idx` to `hasher`.
+fn hashSymbolDeprecationMeta(
+    hasher: *StructuralHasher,
+    sym_table: *const SymbolTable,
+    interner: *const StringInterner,
+    sym_idx: SymbolIndex,
+) void {
+    if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) {
+        hasher.updateU8(0);
+        return;
+    }
+    const sym = sym_table.getSymbol(sym_idx).*;
+    hasher.updateU8(@intFromBool(sym.extra_flags.is_deprecated));
+    if (sym_table.getDeprecatedMeta(sym_idx)) |meta| {
+        hasher.updateU8(1);
+        hasher.updateU8(@intFromBool(meta.is_deprecated));
+        hashSymbolTextCanonical(hasher, interner, meta.since_sym);
+        hashSymbolTextCanonical(hasher, interner, meta.reason_sym);
+        hashSymbolTextCanonical(hasher, interner, meta.upgrade_sym);
+    } else {
+        hasher.updateU8(0);
+    }
+}
+
+/// Scans the declaration header of `cst_node` for the identifier token matching `wanted_name`.
+fn findHeaderIdentSpanInCst(
+    source: []const u8,
+    file_id: FileId,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    cst_node: CstNodeIndex,
+    wanted_name: []const u8,
+    is_local_or_use: bool,
+) ?Span {
+    if (cst_node.isNone() or cst_node.asInt() >= cst_arena.countNodes()) return null;
+    const start_idx: usize = cst_node.asInt();
+    const root_rec = cst_arena.getNode(cst_node);
+    const end_idx = @min(start_idx + @max(@as(usize, root_rec.subtree_size), 1), cst_arena.countNodes());
+    const tok_count = token_buffer.countTokens();
+
+    var last_use_match: ?Span = null;
+    var cursor: usize = start_idx;
+    while (cursor < end_idx) {
+        const sub = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cursor)));
+        if (cursor > start_idx and (sub.kind == .attribute or sub.kind == .visibility_modifier) and sub.subtree_size > 1) {
+            cursor += @max(@as(usize, sub.subtree_size), 1);
+            continue;
+        }
+        const is_leaf = sub.subtree_size <= 1 and !sub.flags.is_bracketed;
+        if (is_leaf and !sub.flags.is_missing_or_injected and !sub.token.isNone() and sub.token.asInt() < tok_count) {
+            const tok_rec = token_buffer.getToken(sub.token);
+            if (!tok_rec.flags.is_synthesized) {
+                if (!is_local_or_use and
+                    (tok_rec.kind == .lbrace or tok_rec.kind == .semi or tok_rec.kind == .eq or
+                        tok_rec.kind == .colon or tok_rec.kind == .lparen or tok_rec.kind == .lbracket))
+                {
+                    break;
+                }
+                if (is_local_or_use and root_rec.kind != .use_item and root_rec.kind != .use_tree and
+                    (tok_rec.kind == .colon or tok_rec.kind == .eq or tok_rec.kind == .colon_eq or tok_rec.kind == .semi))
+                {
+                    break;
+                }
+                if (isIdentifierTokenKind(tok_rec.kind) or tok_rec.kind == .kw_self_val or tok_rec.kind == .kw_async) {
+                    const lex = symbol_resolver.extractTokenSlice(source, token_buffer, sub.token);
+                    if (std.mem.eql(u8, lex, wanted_name)) {
+                        const found_span = token_buffer.getTokenSpan(file_id, sub.token);
+                        if (root_rec.kind == .use_item or root_rec.kind == .use_tree) {
+                            last_use_match = found_span;
+                        } else {
+                            return found_span;
+                        }
+                    }
+                }
+            }
+        }
+        cursor += 1;
+    }
+    return last_use_match;
+}
+
+/// Scans `owner_cst` for the nested member/parameter/binder CST node matching `(sym_kind, wanted_name)`.
+fn findMemberIdentSpanInOwnerCst(
+    source: []const u8,
+    file_id: FileId,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    owner_cst: CstNodeIndex,
+    sym_kind: symbol_resolver.SymbolKind,
+    wanted_name: []const u8,
+    orig_start_byte: u32,
+) ?Span {
+    if (owner_cst.isNone() or owner_cst.asInt() >= cst_arena.countNodes()) return null;
+    const start_idx: usize = owner_cst.asInt();
+    const root_rec = cst_arena.getNode(owner_cst);
+    const end_idx = @min(start_idx + @max(@as(usize, root_rec.subtree_size), 1), cst_arena.countNodes());
+
+    var best_span: ?Span = null;
+    var best_dist: u32 = std.math.maxInt(u32);
+    var cursor: usize = start_idx;
+    while (cursor < end_idx) : (cursor += 1) {
+        const sub_id = CstNodeIndex.fromInt(@intCast(cursor));
+        const sub = cst_arena.getNode(sub_id);
+        const is_match_kind = switch (sym_kind) {
+            .field_sym => sub.kind == .struct_field or sub.kind == .bit_field_member,
+            .enum_variant_sym => sub.kind == .enum_variant,
+            .param_sym => sub.kind == .fn_param or sub.kind == .variadic_param or sub.kind == .closure_param,
+            .type_param_sym, .const_param_sym => sub.kind == .type_param,
+            .fn_sym => sub.kind == .fn_item or sub.kind == .trait_member or sub.kind == .impl_member,
+            .const_sym => sub.kind == .const_item or sub.kind == .trait_member or sub.kind == .impl_member,
+            .type_alias_sym,
+            .distinct_type_sym,
+            .refined_type_sym,
+            .type_group_sym,
+            => sub.kind == .type_alias_item or sub.kind == .trait_member or sub.kind == .impl_member,
+            .struct_sym => sub.kind == .struct_item,
+            .enum_sym => sub.kind == .enum_item,
+            .union_sym => sub.kind == .union_item,
+            .bit_field_sym => sub.kind == .bit_field_item,
+            .trait_sym => sub.kind == .trait_item,
+            .module_sym => sub.kind == .mod_item,
+            .extern_static_sym => sub.kind == .extern_static_item,
+            .use_alias_sym => sub.kind == .use_item or sub.kind == .use_tree,
+            .local_let_sym, .local_var_sym => sub.kind == .ident_pat or
+                sub.kind == .local_decl_stmt or sub.kind == .walrus_cond_expr,
+            else => false,
+        };
+        if (!is_match_kind) continue;
+        const is_local_or_use = sym_kind == .use_alias_sym or
+            sym_kind == .local_let_sym or sym_kind == .local_var_sym;
+        if (findHeaderIdentSpanInCst(
+            source,
+            file_id,
+            token_buffer,
+            cst_arena,
+            sub_id,
+            wanted_name,
+            is_local_or_use,
+        )) |cand_span| {
+            const dist = if (cand_span.start_byte >= orig_start_byte)
+                cand_span.start_byte - orig_start_byte
+            else
+                orig_start_byte - cand_span.start_byte;
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_span = cand_span;
+            }
+        }
+    }
+    return best_span;
+}
+
 /// Appends a pool-order-independent canonical representation of `ty` to `hasher`.
 fn hashTypeCanonical(
     hasher: *StructuralHasher,
@@ -3817,6 +4009,23 @@ fn scanFileActiveTopLevelAsm(
 
 // ------------------------------------- PUBLIC API --------------------------------------
 
+/// Coalesces two sequential `EditRange`s (`S_0 -> S_1` then `S_1 -> S_2`) into one overflow-free `S_0 -> S_2` `EditRange`.
+pub fn coalesceEditRanges(first: parser.EditRange, second: parser.EditRange) ?parser.EditRange {
+    if (first.start_byte > first.old_end_byte or first.start_byte > first.new_end_byte) return null;
+    if (second.start_byte > second.old_end_byte or second.start_byte > second.new_end_byte) return null;
+    const merged_start: u32 = @min(first.start_byte, second.start_byte);
+    const s1_end: u64 = @max(@as(u64, first.new_end_byte), @as(u64, second.old_end_byte));
+    const old_end_u64: u64 = s1_end - @as(u64, first.new_end_byte) + @as(u64, first.old_end_byte);
+    const new_end_u64: u64 = s1_end - @as(u64, second.old_end_byte) + @as(u64, second.new_end_byte);
+    if (old_end_u64 > std.math.maxInt(u32) or new_end_u64 > std.math.maxInt(u32)) return null;
+    if (old_end_u64 < merged_start or new_end_u64 < merged_start) return null;
+    return .{
+        .start_byte = merged_start,
+        .old_end_byte = @intCast(old_end_u64),
+        .new_end_byte = @intCast(new_end_u64),
+    };
+}
+
 /// Demand-driven incremental query database (`DR-12` Section 3) with Early Cutoff and Durability.
 pub const CompilerDb = struct {
     /// Backing allocator for query memo tables, dependency edges, and stage artifacts.
@@ -3875,6 +4084,10 @@ pub const CompilerDb = struct {
     target_spec: codegen_abi.TargetSpec = codegen_abi.TargetSpec.host(),
     /// External `mod <name>;` file bindings keyed by `(parent_file_id << 32) | mod_name_sym`.
     external_mod_files: std.AutoHashMapUnmanaged(u64, FileId) = .empty,
+    /// Adjacency lists of sorted `ModLink` children keyed by `parent_file_id.asInt()` for $O(V + E)$ BFS.
+    parent_to_child_mods: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(ModLink)) = .empty,
+    /// Coalesced pending byte-range edits queued by `setInputWithEdit` keyed by `FileId.asInt()`.
+    pending_file_edits: std.AutoHashMapUnmanaged(u32, PendingFileEdit) = .empty,
     /// Root package/stdlib module bindings (`"core" -> core/root.cx`) keyed by `SymbolId.asInt()`.
     root_module_files: std.AutoHashMapUnmanaged(u32, FileId) = .empty,
     /// Active `--sast-strict` policy flag (`W0314` on unproven bounds checks outside `@no_panic`).
@@ -4133,6 +4346,12 @@ pub const CompilerDb = struct {
         self.sast_results.deinit(self.allocator);
         self.sast_summaries.deinit(self.allocator);
         self.sast_sym_summaries.deinit(self.allocator);
+        var child_mods_it = self.parent_to_child_mods.valueIterator();
+        while (child_mods_it.next()) |link_list_ptr| {
+            link_list_ptr.deinit(self.allocator);
+        }
+        self.parent_to_child_mods.deinit(self.allocator);
+        self.pending_file_edits.deinit(self.allocator);
         self.external_mod_files.deinit(self.allocator);
         self.root_module_files.deinit(self.allocator);
         self.memos.deinit(self.allocator);
@@ -4760,7 +4979,13 @@ pub const CompilerDb = struct {
                 self.allocator.free(removed_kv.value);
             }
             _ = self.c_import_mod_syms.remove(fid_raw);
+            if (self.parent_to_child_mods.fetchRemove(fid_raw)) |removed_kv| {
+                var links = removed_kv.value;
+                links.deinit(self.allocator);
+            }
         }
+        _ = self.pending_file_edits.remove(fid_raw);
+        _ = self.file_pass1_states.remove(fid_raw);
 
         if (self.parsed_artifacts.fetchRemove(fid_raw)) |removed_kv| {
             var artifact_val = removed_kv.value;
@@ -4995,13 +5220,10 @@ pub const CompilerDb = struct {
         while (head < queue.items.len) : (head += 1) {
             const cur_fid = queue.items[head];
             try self.symbol_table.setFilePackageId(cur_fid, pkg_id);
-            var ext_iter = self.external_mod_files.iterator();
-            while (ext_iter.next()) |ext_kv| {
-                const parent_raw: u32 = @truncate(ext_kv.key_ptr.* >> 32);
-                if (parent_raw == cur_fid.asInt()) {
-                    const child_fid = ext_kv.value_ptr.*;
-                    if (!(try visited.getOrPut(self.allocator, child_fid.asInt())).found_existing) {
-                        try queue.append(self.allocator, child_fid);
+            if (self.parent_to_child_mods.getPtr(cur_fid.asInt())) |child_links| {
+                for (child_links.items) |link| {
+                    if (!(try visited.getOrPut(self.allocator, link.child_fid.asInt())).found_existing) {
+                        try queue.append(self.allocator, link.child_fid);
                     }
                 }
             }
@@ -5019,6 +5241,31 @@ pub const CompilerDb = struct {
         const key: u64 = (@as(u64, parent_file_id.asInt()) << 32) | @as(u64, mod_sym.asInt());
         const existing_opt = self.external_mod_files.get(key);
         try self.external_mod_files.put(self.allocator, key, child_file_id);
+
+        const adj_gop = try self.parent_to_child_mods.getOrPut(self.allocator, parent_file_id.asInt());
+        if (!adj_gop.found_existing) {
+            adj_gop.value_ptr.* = .empty;
+        }
+        var is_updated = false;
+        var insert_pos: usize = adj_gop.value_ptr.items.len;
+        for (adj_gop.value_ptr.items, 0..) |*existing_link, idx| {
+            if (existing_link.mod_sym == mod_sym) {
+                existing_link.child_fid = child_file_id;
+                is_updated = true;
+                break;
+            }
+            if (insert_pos == adj_gop.value_ptr.items.len and existing_link.mod_sym.asInt() > mod_sym.asInt()) {
+                insert_pos = idx;
+            }
+        }
+        if (!is_updated) {
+            try adj_gop.value_ptr.insert(self.allocator, insert_pos, .{
+                .parent_fid = parent_file_id,
+                .mod_sym = mod_sym,
+                .child_fid = child_file_id,
+            });
+        }
+
         const parent_pkg = self.symbol_table.getFilePackageId(parent_file_id);
         if (parent_pkg != .root) {
             try self.propagateSubtreePackageId(child_file_id, parent_pkg);
@@ -6283,6 +6530,66 @@ pub const CompilerDb = struct {
         source_text: []const u8,
         durability: Durability,
     ) !Revision {
+        _ = self.pending_file_edits.remove(file_id.asInt());
+        return self.setInputCore(file_id, source_text, durability);
+    }
+
+    /// Updates `file_id` with `new_text` and queues or coalesces `edit` for Stage 1 `reparseIncremental`.
+    pub fn setInputWithEdit(
+        self: *CompilerDb,
+        file_id: FileId,
+        new_text: []const u8,
+        durability: Durability,
+        edit: parser.EditRange,
+    ) !Revision {
+        const new_fp = Fingerprint128.hashBytes(new_text);
+        if (self.source_inputs.getPtr(file_id.asInt())) |existing_input| {
+            const prev_fp = existing_input.content_fingerprint;
+            if (!Fingerprint128.eql(prev_fp, new_fp)) {
+                const is_valid_edit = edit.start_byte <= edit.old_end_byte and
+                    edit.start_byte <= edit.new_end_byte and
+                    @as(usize, edit.new_end_byte) <= new_text.len;
+                if (!is_valid_edit) {
+                    _ = self.pending_file_edits.remove(file_id.asInt());
+                } else if (self.pending_file_edits.get(file_id.asInt())) |prev_pending| {
+                    if (Fingerprint128.eql(prev_pending.target_fingerprint, prev_fp)) {
+                        if (coalesceEditRanges(prev_pending.range, edit)) |merged_range| {
+                            try self.pending_file_edits.put(self.allocator, file_id.asInt(), .{
+                                .base_fingerprint = prev_pending.base_fingerprint,
+                                .target_fingerprint = new_fp,
+                                .range = merged_range,
+                            });
+                        } else {
+                            _ = self.pending_file_edits.remove(file_id.asInt());
+                        }
+                    } else {
+                        try self.pending_file_edits.put(self.allocator, file_id.asInt(), .{
+                            .base_fingerprint = prev_fp,
+                            .target_fingerprint = new_fp,
+                            .range = edit,
+                        });
+                    }
+                } else {
+                    try self.pending_file_edits.put(self.allocator, file_id.asInt(), .{
+                        .base_fingerprint = prev_fp,
+                        .target_fingerprint = new_fp,
+                        .range = edit,
+                    });
+                }
+            }
+        } else {
+            _ = self.pending_file_edits.remove(file_id.asInt());
+        }
+        return self.setInputCore(file_id, new_text, durability);
+    }
+
+    /// Core implementation of `setInput` / `setInputWithEdit` updating `source_inputs` and `.source_text` memo.
+    fn setInputCore(
+        self: *CompilerDb,
+        file_id: FileId,
+        source_text: []const u8,
+        durability: Durability,
+    ) !Revision {
         const new_fp = Fingerprint128.hashBytes(source_text);
         const key = QueryKey.forFile(.source_text, file_id);
 
@@ -6435,6 +6742,319 @@ pub const CompilerDb = struct {
     pub fn typecheckBody(self: *CompilerDb, def_id: DefId) QueryError!TypedBodyArtifact {
         _ = try self.fetchQuery(QueryKey.forDef(.typecheck_body, def_id));
         return self.typed_bodies.get(def_id.asInt()) orelse error.InvalidDefId;
+    }
+
+    /// Type-checks `def_id` and rebases its `BodySemanticSideTables` window onto the live `AstArena`.
+    pub fn getDefSideTables(self: *CompilerDb, def_id: DefId) QueryError!?*const BodySemanticSideTables {
+        if (def_id.isNone()) return null;
+        _ = try self.typecheckBody(def_id);
+        const file_id = def_id.fileId();
+        const item_tree = try self.extractItemTree(file_id);
+        if (item_tree.getEntry(def_id)) |entry| {
+            if (self.parsed_artifacts.getPtr(file_id.asInt())) |parsed_ptr| {
+                try self.syncDefWindowAndSideTables(def_id, parsed_ptr, entry.ast_node);
+            }
+        }
+        return self.def_side_tables.getPtr(def_id.asInt());
+    }
+
+    /// Returns the cached file-level signature `BodySemanticSideTables` for `file_id` without triggering execution.
+    pub inline fn getFileSideTables(self: *const CompilerDb, file_id: FileId) ?*const BodySemanticSideTables {
+        return self.file_side_tables.getPtr(file_id.asInt());
+    }
+
+    /// Returns the `[sym_start .. sym_end)` `SymbolIndex` bounds of `file_id`'s live Pass-1 and Pass-2 symbols.
+    pub inline fn getFileLiveSymbolBounds(self: *const CompilerDb, file_id: FileId) ?SymbolIndexBounds {
+        if (self.file_sig_sync_states.get(file_id.asInt())) |sync_st| {
+            if (self.file_pass1_states.get(file_id.asInt())) |pass1| {
+                if (sync_st.sym_start >= pass1.sym_start) {
+                    return .{ .sym_start = sync_st.sym_start, .sym_end = sync_st.sym_end };
+                }
+            } else {
+                return .{ .sym_start = sync_st.sym_start, .sym_end = sync_st.sym_end };
+            }
+        }
+        if (self.file_pass1_states.get(file_id.asInt())) |pass1| {
+            if (pass1.sym_end >= pass1.sym_start and (pass1.sym_end > 0 or !pass1.mod_scope.isNone())) {
+                return .{ .sym_start = pass1.sym_start, .sym_end = pass1.sym_end };
+            }
+        }
+        return null;
+    }
+
+    /// Resolves the live declaration `Span` of `sym_idx`, surviving earlier byte-offset edits preserved by Early Cutoff.
+    pub fn resolveLiveSymbolDeclSpan(self: *CompilerDb, sym_idx: SymbolIndex) QueryError!Span {
+        if (sym_idx.isNone() or sym_idx.asInt() >= self.symbol_table.countSymbols()) return Span.ZERO;
+        const sym = self.symbol_table.getSymbol(sym_idx).*;
+        const decl_fid = sym.decl_span.file_id;
+        if (decl_fid.isNone() or !self.source_inputs.contains(decl_fid.asInt())) return sym.decl_span;
+
+        const src = try self.getSourceText(decl_fid);
+        const parsed = try self.parseCst(decl_fid);
+        const tok_count = parsed.token_buffer.countTokens();
+
+        // [1] $O(\log T)$ fast path when `sym.decl_span` still aligns with the live `TokenBuffer`:
+        var lo: usize = 0;
+        var hi: usize = tok_count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const mid_off = parsed.token_buffer.getToken(TokenIndex.fromInt(@intCast(mid))).byte_offset;
+            if (mid_off < sym.decl_span.start_byte) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        while (lo < tok_count) : (lo += 1) {
+            const cand_tok = TokenIndex.fromInt(@intCast(lo));
+            const cand_rec = parsed.token_buffer.getToken(cand_tok);
+            if (cand_rec.byte_offset != sym.decl_span.start_byte) break;
+            if (!cand_rec.flags.is_synthesized and
+                cand_rec.byte_offset + cand_rec.byte_len == sym.decl_span.end_byte)
+            {
+                if (sym.name_text.len == 0 or
+                    std.mem.eql(
+                        u8,
+                        symbol_resolver.extractTokenSlice(src, &parsed.token_buffer, cand_tok),
+                        sym.name_text,
+                    ))
+                {
+                    return sym.decl_span;
+                }
+            }
+        }
+
+        if (sym.name_text.len == 0) return sym.decl_span;
+        const tree = try self.extractItemTree(decl_fid);
+
+        // [2] Top-level `ItemTree` entry header lookup (`!sym.def_id.isNone()`):
+        if (!sym.def_id.isNone() and sym.def_id.fileId() == decl_fid) {
+            if (tree.getEntry(sym.def_id)) |entry| {
+                if (findHeaderIdentSpanInCst(
+                    src,
+                    decl_fid,
+                    &parsed.token_buffer,
+                    &parsed.cst_arena,
+                    entry.cst_node,
+                    sym.name_text,
+                    false,
+                )) |live_span| {
+                    return live_span;
+                }
+            }
+        }
+
+        // [3] Enclosing `owner_def_id` lookup (nominal fields/variants/methods, params, and body locals):
+        var owner_def: DefId = if (!sym.owner_def_id.isNone() and sym.owner_def_id.fileId() == decl_fid)
+            sym.owner_def_id
+        else
+            .NONE;
+        if (owner_def.isNone() and !sym.scope_id.isNone()) {
+            var cur_scope = sym.scope_id;
+            var depth: u32 = 0;
+            while (!cur_scope.isNone() and cur_scope.asInt() < self.symbol_table.scope_arena.scopes.len and
+                depth < 64) : (depth += 1)
+            {
+                const scope_rec = self.symbol_table.scope_arena.getScope(cur_scope);
+                if (!scope_rec.owner_def_id.isNone() and scope_rec.owner_def_id.fileId() == decl_fid) {
+                    owner_def = scope_rec.owner_def_id;
+                    break;
+                }
+                cur_scope = scope_rec.parent;
+            }
+        }
+
+        if (!owner_def.isNone()) {
+            if (sym.kind == .local_let_sym or sym.kind == .local_var_sym) {
+                if (try self.getDefSideTables(owner_def)) |st| {
+                    for (st.node_symbols, 0..) |recorded_sym, rel_idx| {
+                        if (recorded_sym != sym_idx) continue;
+                        const live_ast = NodeIndex.fromInt(st.ast_start + @as(u32, @intCast(rel_idx)));
+                        if (live_ast.asInt() >= parsed.ast_arena.countNodes()) continue;
+                        const live_cst = parsed.ast_arena.getCstOrigin(live_ast);
+                        if (!live_cst.isNone()) {
+                            if (findHeaderIdentSpanInCst(
+                                src,
+                                decl_fid,
+                                &parsed.token_buffer,
+                                &parsed.cst_arena,
+                                live_cst,
+                                sym.name_text,
+                                true,
+                            )) |binder_span| {
+                                return binder_span;
+                            }
+                        }
+                        const main_tok = parsed.ast_arena.getNode(live_ast).main_token;
+                        if (!main_tok.isNone() and main_tok.asInt() < tok_count and
+                            std.mem.eql(
+                                u8,
+                                symbol_resolver.extractTokenSlice(src, &parsed.token_buffer, main_tok),
+                                sym.name_text,
+                            ))
+                        {
+                            return parsed.token_buffer.getTokenSpan(decl_fid, main_tok);
+                        }
+                    }
+                }
+            }
+            if (tree.getEntry(owner_def)) |owner_entry| {
+                if (findMemberIdentSpanInOwnerCst(
+                    src,
+                    decl_fid,
+                    &parsed.token_buffer,
+                    &parsed.cst_arena,
+                    owner_entry.cst_node,
+                    sym.kind,
+                    sym.name_text,
+                    sym.decl_span.start_byte,
+                )) |member_span| {
+                    return member_span;
+                }
+            }
+        }
+
+        // [4] Module-level `use` alias or inline `mod` fallback across `ItemTree` entries:
+        var best_fallback: ?Span = null;
+        var best_dist: u32 = std.math.maxInt(u32);
+        for (tree.entries) |entry| {
+            const should_scan = (sym.kind == .use_alias_sym and (entry.kind == .use_decl or entry.kind == .mod_decl)) or
+                entry.kind == .mod_decl or entry.kind == .impl_decl;
+            if (!should_scan) continue;
+            if (findMemberIdentSpanInOwnerCst(
+                src,
+                decl_fid,
+                &parsed.token_buffer,
+                &parsed.cst_arena,
+                entry.cst_node,
+                sym.kind,
+                sym.name_text,
+                sym.decl_span.start_byte,
+            )) |cand_span| {
+                const dist = if (cand_span.start_byte >= sym.decl_span.start_byte)
+                    cand_span.start_byte - sym.decl_span.start_byte
+                else
+                    sym.decl_span.start_byte - cand_span.start_byte;
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best_fallback = cand_span;
+                }
+            }
+        }
+        return best_fallback orelse sym.decl_span;
+    }
+
+    /// Resolves the type-directed `not` vs `~` `SuggestedFix` for a retired `!expr` (`E0220`) at `bang_span`.
+    pub fn resolveBangFixSuggestion(
+        self: *CompilerDb,
+        file_id: FileId,
+        bang_span: Span,
+    ) QueryError!?SuggestedFix {
+        if (file_id.isNone() or bang_span.file_id != file_id) return null;
+        const src = try self.getSourceText(file_id);
+        _ = try self.parseCst(file_id);
+        _ = try self.resolveSignatures(file_id);
+        const tree = try self.extractItemTree(file_id);
+
+        var fix_kind_opt: ?type_system.BangFixKind = null;
+        if (self.file_side_tables.getPtr(file_id.asInt())) |file_st| {
+            fix_kind_opt = file_st.resolved_bang_fixes.get(bang_span.start_byte);
+        }
+
+        if (fix_kind_opt == null) {
+            for (tree.entries) |entry| {
+                const parsed_ref = self.parsed_artifacts.getPtr(file_id.asInt()) orelse break;
+                var is_inside_entry = true;
+                if (!entry.cst_node.isNone() and entry.cst_node.asInt() < parsed_ref.cst_arena.countNodes()) {
+                    const cst_start: usize = entry.cst_node.asInt();
+                    const cst_rec = parsed_ref.cst_arena.getNode(entry.cst_node);
+                    const cst_end = @min(
+                        cst_start + @max(@as(usize, cst_rec.subtree_size), 1),
+                        parsed_ref.cst_arena.countNodes(),
+                    );
+                    var first_byte: ?u32 = null;
+                    var last_byte: u32 = 0;
+                    var cur = cst_start;
+                    while (cur < cst_end) : (cur += 1) {
+                        const leaf = parsed_ref.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+                        if (!leaf.token.isNone() and leaf.token.asInt() < parsed_ref.token_buffer.countTokens()) {
+                            const tok_rec = parsed_ref.token_buffer.getToken(leaf.token);
+                            if (!tok_rec.flags.is_synthesized) {
+                                if (first_byte == null) first_byte = tok_rec.byte_offset;
+                                last_byte = tok_rec.byte_offset +| tok_rec.byte_len;
+                            }
+                        }
+                    }
+                    if (first_byte) |fb| {
+                        is_inside_entry = bang_span.start_byte >= fb and bang_span.start_byte <= last_byte;
+                    }
+                }
+                if (!is_inside_entry) continue;
+
+                if (try self.getDefSideTables(entry.def_id)) |def_st| {
+                    if (def_st.resolved_bang_fixes.get(bang_span.start_byte)) |direct_fix| {
+                        fix_kind_opt = direct_fix;
+                        break;
+                    }
+                    // Handle line-shifted body reuse via rebased `resolved_bang_nodes`:
+                    const live_parsed = self.parsed_artifacts.getPtr(file_id.asInt()) orelse break;
+                    var rel_it = def_st.resolved_bang_nodes.iterator();
+                    while (rel_it.next()) |rel_kv| {
+                        const live_ast = NodeIndex.fromInt(def_st.ast_start + rel_kv.key_ptr.*);
+                        if (live_ast.asInt() >= live_parsed.ast_arena.countNodes()) continue;
+                        const main_tok = live_parsed.ast_arena.getNode(live_ast).main_token;
+                        if (main_tok.isNone() or main_tok.asInt() >= live_parsed.token_buffer.countTokens()) continue;
+                        const tok_sp = live_parsed.token_buffer.getTokenSpan(file_id, main_tok);
+                        if (tok_sp.start_byte == bang_span.start_byte and tok_sp.end_byte == bang_span.end_byte) {
+                            fix_kind_opt = rel_kv.value_ptr.*;
+                            break;
+                        }
+                    }
+                    if (fix_kind_opt != null) break;
+                }
+            }
+        }
+
+        const fix_kind = fix_kind_opt orelse return null;
+        const parsed_mut = self.parsed_artifacts.getPtr(file_id.asInt()) orelse return null;
+        const has_ws_after = @as(usize, bang_span.end_byte) < src.len and
+            (src[bang_span.end_byte] == ' ' or src[bang_span.end_byte] == '\t');
+        const repl_text: []const u8 = switch (fix_kind) {
+            .logical_not => if (has_ws_after) "not" else "not ",
+            .bitwise_tilde => "~",
+        };
+        const repl_id = self.interner.intern(repl_text) catch return error.OutOfMemory;
+        const arena_alloc = parsed_mut.diagnostics.arena.asAllocator();
+        const edits = arena_alloc.alloc(diagnostic.TextEdit, 1) catch return error.OutOfMemory;
+        edits[0] = .{
+            .file_id = file_id,
+            .start_byte = bang_span.start_byte,
+            .end_byte = bang_span.end_byte,
+            .replacement_id = repl_id,
+        };
+        const fix = SuggestedFix{
+            .message = switch (fix_kind) {
+                .logical_not => "replace retired `!` with boolean `not`",
+                .bitwise_tilde => "replace retired `!` with bitwise `~`",
+            },
+            .applicability = .machine_applicable,
+            .priority = .syntax_canonicalization,
+            .edits = edits,
+        };
+
+        for (parsed_mut.diagnostics.diagnostics.items) |*diag_item| {
+            if (diag_item.code == .e0220_retired_bang_prefix and
+                diag_item.primary_span.start_byte == bang_span.start_byte and
+                diag_item.primary_span.end_byte == bang_span.end_byte and
+                diag_item.suggestions.len == 0)
+            {
+                const suggestions = arena_alloc.alloc(SuggestedFix, 1) catch return error.OutOfMemory;
+                suggestions[0] = fix;
+                diag_item.suggestions = suggestions;
+                break;
+            }
+        }
+        return fix;
     }
 
     /// Stage 9: Runs MIR SAST memory and exclusivity verification on `def_id`.
@@ -7340,11 +7960,15 @@ pub const CompilerDb = struct {
         const source = try self.getSourceText(file_id);
         try self.unwindIfCancelled();
 
+        const src_fp = if (self.source_inputs.get(file_id.asInt())) |inp|
+            inp.content_fingerprint
+        else
+            Fingerprint128.hashBytes(source);
+        const pending_opt = self.pending_file_edits.fetchRemove(file_id.asInt());
+
         const gop = try self.parsed_artifacts.getOrPut(self.allocator, file_id.asInt());
         if (!gop.found_existing) {
             gop.value_ptr.* = ParsedCstArtifact.init(self.allocator);
-        } else {
-            gop.value_ptr.resetForReparse();
         }
         errdefer if (!gop.found_existing) {
             gop.value_ptr.deinit();
@@ -7352,17 +7976,48 @@ pub const CompilerDb = struct {
         };
 
         const parsed_ptr = gop.value_ptr;
-        const root_node = parser.parseSource(
-            source,
-            file_id,
-            &parsed_ptr.token_buffer,
-            &parsed_ptr.cst_arena,
-            &parsed_ptr.ast_arena,
-            &parsed_ptr.diagnostics,
-            &self.interner,
-        ) catch return error.OutOfMemory;
+        const had_prev_errors = if (gop.found_existing) parsed_ptr.has_parse_errors else false;
+        const can_reparse_inc = gop.found_existing and
+            !had_prev_errors and
+            pending_opt != null and
+            Fingerprint128.eql(pending_opt.?.value.base_fingerprint, parsed_ptr.source_fingerprint) and
+            Fingerprint128.eql(pending_opt.?.value.target_fingerprint, src_fp);
+
+        var root_node: NodeIndex = .root;
+        if (can_reparse_inc) {
+            parsed_ptr.clearDiagnosticsOnly();
+            errdefer parsed_ptr.resetForReparse();
+            const inc_stats = parser.reparseIncremental(
+                source,
+                file_id,
+                pending_opt.?.value.range,
+                &parsed_ptr.token_buffer,
+                &parsed_ptr.cst_arena,
+                &parsed_ptr.ast_arena,
+                &parsed_ptr.diagnostics,
+                &self.interner,
+            ) catch return error.OutOfMemory;
+            if (inc_stats.is_fast_splice) {
+                self.telemetry.incremental_reparse_fast_splices += 1;
+            }
+            root_node = .root;
+        } else {
+            if (gop.found_existing) {
+                parsed_ptr.resetForReparse();
+            }
+            root_node = parser.parseSource(
+                source,
+                file_id,
+                &parsed_ptr.token_buffer,
+                &parsed_ptr.cst_arena,
+                &parsed_ptr.ast_arena,
+                &parsed_ptr.diagnostics,
+                &self.interner,
+            ) catch return error.OutOfMemory;
+        }
 
         parsed_ptr.root_node = root_node;
+        parsed_ptr.source_fingerprint = src_fp;
         parsed_ptr.has_parse_errors = parsed_ptr.cst_arena.has_parse_errors or
             parsed_ptr.diagnostics.hasErrors();
         parsed_ptr.cst_fingerprint = computeCstFingerprint(
@@ -7533,11 +8188,7 @@ pub const CompilerDb = struct {
         if (!gop.found_existing) {
             gop.value_ptr.* = DiagnosticSink.init(allocator);
         } else {
-            gop.value_ptr.diagnostics.clearRetainingCapacity();
-            gop.value_ptr.arena.resetRetainingCapacity();
-            gop.value_ptr.error_count = 0;
-            gop.value_ptr.warning_count = 0;
-            gop.value_ptr.has_reached_limit = false;
+            gop.value_ptr.resetRetainingCapacity();
         }
         return gop.value_ptr;
     }
@@ -7552,11 +8203,7 @@ pub const CompilerDb = struct {
         if (!gop.found_existing) {
             gop.value_ptr.* = DiagnosticSink.init(allocator);
         } else {
-            gop.value_ptr.diagnostics.clearRetainingCapacity();
-            gop.value_ptr.arena.resetRetainingCapacity();
-            gop.value_ptr.error_count = 0;
-            gop.value_ptr.warning_count = 0;
-            gop.value_ptr.has_reached_limit = false;
+            gop.value_ptr.resetRetainingCapacity();
         }
         return gop.value_ptr;
     }
@@ -7647,15 +8294,14 @@ pub const CompilerDb = struct {
         try work_stack.append(self.allocator, subtree_root_fid.asInt());
 
         while (work_stack.pop()) |parent_raw| {
-            var ext_iter = self.external_mod_files.iterator();
-            while (ext_iter.next()) |kv| {
-                const key_parent: u32 = @truncate(kv.key_ptr.* >> 32);
-                if (key_parent != parent_raw) continue;
-                const child_raw = kv.value_ptr.asInt();
-                if (child_raw == candidate_fid.asInt()) return true;
-                const gop = try visited_fids.getOrPut(self.allocator, child_raw);
-                if (!gop.found_existing) {
-                    try work_stack.append(self.allocator, child_raw);
+            if (self.parent_to_child_mods.getPtr(parent_raw)) |child_links| {
+                for (child_links.items) |link| {
+                    const child_raw = link.child_fid.asInt();
+                    if (child_raw == candidate_fid.asInt()) return true;
+                    const gop = try visited_fids.getOrPut(self.allocator, child_raw);
+                    if (!gop.found_existing) {
+                        try work_stack.append(self.allocator, child_raw);
+                    }
                 }
             }
         }
@@ -8304,6 +8950,8 @@ pub const CompilerDb = struct {
         _ = self.symbol_table.file_module_scopes.remove(target_fid.asInt());
 
         const sym_start: u32 = self.symbol_table.countSymbols();
+        // Preserve `< sym_start` entries in `deprecated_symbols` and `symbol_allow_masks`; backdated `def_signatures`
+        // resolve callees to `< sym_start` `SymbolIndex` handles before collecting fresh module items:
         const mod_scope = symbol_resolver.collectFileModuleItems(
             &self.symbol_table,
             &self.interner,
@@ -8316,12 +8964,12 @@ pub const CompilerDb = struct {
         ) catch return error.OutOfMemory;
         const sym_end: u32 = self.symbol_table.countSymbols();
 
-        const sync_entries = (try self.extractItemTree(target_fid)).entries;
+        const sync_tree = try self.extractItemTree(target_fid);
         try self.syncFlattenedExternDefIds(
             target_fid,
             is_target_including_tests,
             parsed_ptr,
-            sync_entries,
+            sync_tree.entries,
             sym_start,
             sym_end,
         );
@@ -8371,20 +9019,11 @@ pub const CompilerDb = struct {
             .sym_end = sym_end,
             .created_revision = self.current_revision,
             .has_consumed_pass2 = false,
+            .tree_fingerprint = sync_tree.tree_fingerprint,
         };
         try self.file_pass1_states.put(self.allocator, target_fid.asInt(), state);
         return state;
     }
-
-    /// Directed intra-package `mod <name>;` parent-to-child file edge collected during BFS traversal.
-    const ModLink = struct {
-        /// Parent module `FileId` containing `mod <name>;`.
-        parent_fid: FileId,
-        /// Interned child module identifier (`SymbolId`).
-        mod_sym: SymbolId,
-        /// Resolved child module `FileId`.
-        child_fid: FileId,
-    };
 
     /// Pre-collects Pass-1 module scopes across `pkg_id`'s entire `mod` subtree before any Pass-2 `use pkg.…` resolves.
     fn ensurePackageSubtreePass1(
@@ -8392,6 +9031,7 @@ pub const CompilerDb = struct {
         pkg_id: PackageId,
         hasher: *StructuralHasher,
         caller_fid: FileId,
+        is_skipping_caller_pass1: bool,
     ) QueryError!void {
         const pkg_root_fid = self.package_root_files.get(pkg_id) orelse return;
         var subtree_files: std.ArrayListUnmanaged(FileId) = .empty;
@@ -8407,41 +9047,36 @@ pub const CompilerDb = struct {
         var head: usize = 0;
         while (head < subtree_files.items.len) : (head += 1) {
             const cur_fid = subtree_files.items[head];
-            var local_links: std.ArrayListUnmanaged(ModLink) = .empty;
-            defer local_links.deinit(self.allocator);
-
-            var ext_it = self.external_mod_files.iterator();
-            while (ext_it.next()) |ext_kv| {
-                const parent_raw: u32 = @truncate(ext_kv.key_ptr.* >> 32);
-                if (parent_raw == cur_fid.asInt()) {
-                    const mod_sym_raw: u32 = @truncate(ext_kv.key_ptr.*);
-                    try local_links.append(self.allocator, .{
-                        .parent_fid = cur_fid,
-                        .mod_sym = SymbolId.fromInt(mod_sym_raw),
-                        .child_fid = ext_kv.value_ptr.*,
-                    });
-                }
-            }
-            std.mem.sort(ModLink, local_links.items, {}, struct {
-                /// Orders sibling `ModLink` edges deterministically by `mod_sym` ID.
-                fn lessThan(_: void, lhs: ModLink, rhs: ModLink) bool {
-                    return lhs.mod_sym.asInt() < rhs.mod_sym.asInt();
-                }
-            }.lessThan);
-
-            for (local_links.items) |link| {
-                try mod_links.append(self.allocator, link);
-                if (!(try visited.getOrPut(self.allocator, link.child_fid.asInt())).found_existing) {
-                    try subtree_files.append(self.allocator, link.child_fid);
+            if (self.parent_to_child_mods.getPtr(cur_fid.asInt())) |child_links| {
+                for (child_links.items) |link| {
+                    try mod_links.append(self.allocator, link);
+                    if (!(try visited.getOrPut(self.allocator, link.child_fid.asInt())).found_existing) {
+                        try subtree_files.append(self.allocator, link.child_fid);
+                    }
                 }
             }
         }
 
         for (subtree_files.items) |member_fid| {
+            if (member_fid == caller_fid and is_skipping_caller_pass1) {
+                continue;
+            }
             if (member_fid != caller_fid and
                 !self.in_flight_keys.contains(QueryKey.forFile(.item_tree, member_fid).asU64()))
             {
-                hasher.updateFingerprint((try self.extractItemTree(member_fid)).tree_fingerprint);
+                const member_tree = try self.extractItemTree(member_fid);
+                hasher.updateFingerprint(member_tree.tree_fingerprint);
+                if (self.file_pass1_states.get(member_fid.asInt())) |existing_p1| {
+                    if (!existing_p1.mod_scope.isNone() and
+                        Fingerprint128.eql(existing_p1.tree_fingerprint, member_tree.tree_fingerprint) and
+                        self.symbol_table.file_module_scopes.get(member_fid.asInt()) == existing_p1.mod_scope)
+                    {
+                        if (self.package_root_files.get(pkg_id) == member_fid) {
+                            try self.symbol_table.setPackageRootScope(pkg_id, existing_p1.mod_scope);
+                        }
+                        continue;
+                    }
+                }
             }
             _ = try self.ensureFilePass1Collected(member_fid, pkg_id);
         }
@@ -8462,6 +9097,31 @@ pub const CompilerDb = struct {
                 }
             }
         }
+    }
+
+    /// Returns `true` if `key`'s previous memo edges included an `@embed_bytes` or `@c_import` dependency.
+    fn hadEmbedOrCImportEdgeInPrevMemo(self: *const CompilerDb, key: QueryKey) bool {
+        const memo = self.memos.get(key.asU64()) orelse return false;
+        const edge_start: usize = memo.dep_edge_start;
+        const edge_end: usize = @min(edge_start + @as(usize, memo.dep_edge_len), self.dep_edges.items.len);
+        for (self.dep_edges.items[edge_start..edge_end]) |dep_key| {
+            if (dep_key.stage == .source_text and (dep_key.flags & EMBED_FILE_KEY_FLAG) != 0) return true;
+            if (dep_key.stage == .resolve_signatures and
+                dep_key.entity_index >= VIRTUAL_C_IMPORT_FILE_ID_BASE and
+                dep_key.entity_index < CONFIG_KEY_TARGET_LAYOUT)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Returns the starting `SymbolIndex.asInt()` of the active Pass-1 collection for `file_id` (`0` if unrecorded).
+    pub fn getFilePass1SymStart(self: *const CompilerDb, file_id: FileId) u32 {
+        if (self.file_pass1_states.get(file_id.asInt())) |p1_state| {
+            return p1_state.sym_start;
+        }
+        return 0;
     }
 
     /// Stage 6 implementation: resolves module signatures for `file_id` (shielded by `tree_fingerprint`).
@@ -8573,9 +9233,13 @@ pub const CompilerDb = struct {
                     .caller_pkg = caller_pkg,
                     .alias_sym = alias_sym,
                 }) orelse continue;
-                if (dep_root_fid != file_id and
-                    !self.in_flight_keys.contains(QueryKey.forFile(.resolve_signatures, dep_root_fid).asU64()))
-                {
+                const is_same_pkg_subtree = (dep_root_fid == file_id) or
+                    (self.symbol_table.getFilePackageId(dep_root_fid) == caller_pkg and
+                        (try self.isModuleSubtreeMember(dep_root_fid, file_id)));
+                if (is_same_pkg_subtree) {
+                    continue;
+                }
+                if (!self.in_flight_keys.contains(QueryKey.forFile(.resolve_signatures, dep_root_fid).asU64())) {
                     const dep_sigs = try self.resolveSignatures(dep_root_fid);
                     hasher.updateU32(alias_sym.asInt());
                     hasher.updateFingerprint(dep_sigs.public_interface_fingerprint);
@@ -8590,14 +9254,49 @@ pub const CompilerDb = struct {
             }
         }
 
+        var is_eligible_for_sig_reuse = false;
+        if (self.resolved_signatures.get(file_id.asInt())) |prev_sigs| {
+            if (prev_sigs.error_count == 0 and prev_sigs.warning_count == 0 and !prev_sigs.module_scope.isNone()) {
+                if (self.file_pass1_states.get(file_id.asInt())) |existing_p1| {
+                    if (existing_p1.mod_scope == prev_sigs.module_scope and
+                        Fingerprint128.eql(existing_p1.tree_fingerprint, item_tree_fp) and
+                        self.symbol_table.file_module_scopes.get(file_id.asInt()) == prev_sigs.module_scope and
+                        !self.hadEmbedOrCImportEdgeInPrevMemo(QueryKey.forFile(.resolve_signatures, file_id)))
+                    {
+                        is_eligible_for_sig_reuse = true;
+                    }
+                }
+            }
+        }
+
         // Pre-collect intra-package Pass-1 scopes across `caller_pkg` so `use pkg.…` works from any submodule:
         if (self.package_root_files.contains(caller_pkg)) {
-            try self.ensurePackageSubtreePass1(caller_pkg, &hasher, file_id);
+            try self.ensurePackageSubtreePass1(caller_pkg, &hasher, file_id, is_eligible_for_sig_reuse);
+            if (self.package_dep_files.count() > 0) {
+                var self_dep_it = self.package_dep_files.iterator();
+                while (self_dep_it.next()) |dep_kv| {
+                    if (dep_kv.key_ptr.caller_pkg != caller_pkg) continue;
+                    const dep_fid = dep_kv.value_ptr.*;
+                    if (self.symbol_table.getFilePackageId(dep_fid) != caller_pkg) continue;
+                    if (self.symbol_table.file_module_scopes.get(dep_fid.asInt())) |self_lib_scope| {
+                        if (!self_lib_scope.isNone()) {
+                            try self.symbol_table.bindPackageDepScope(
+                                caller_pkg,
+                                dep_kv.key_ptr.alias_sym,
+                                self_lib_scope,
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         // Collect Pass-1 items for `file_id` BEFORE recursing into `mod` children (`super.` & `pkg.` visibility):
         var pass1_state = FilePass1State{ .created_revision = self.current_revision };
-        if (self.source_inputs.contains(file_id.asInt()) and self.parsed_artifacts.contains(file_id.asInt())) {
+        if (!is_eligible_for_sig_reuse and
+            self.source_inputs.contains(file_id.asInt()) and
+            self.parsed_artifacts.contains(file_id.asInt()))
+        {
             pass1_state = try self.ensureFilePass1Collected(file_id, caller_pkg);
             if (self.file_pass1_states.getPtr(file_id.asInt())) |p1_mut| {
                 p1_mut.has_consumed_pass2 = true;
@@ -8670,9 +9369,31 @@ pub const CompilerDb = struct {
             }
         }
 
+        // Fast-path Early Cutoff reuse when `file_id`'s `tree_fingerprint` and all upstream signature inputs match:
+        if (is_eligible_for_sig_reuse) {
+            if (self.resolved_signatures.get(file_id.asInt())) |prev_sigs| {
+                var probe_hasher = hasher;
+                probe_hasher.updateU32(prev_sigs.warning_count);
+                if (Fingerprint128.eql(probe_hasher.final(), prev_sigs.signatures_fingerprint)) {
+                    try self.ensureFreshSignatureAstAndSideTables(file_id);
+                    return prev_sigs.signatures_fingerprint;
+                }
+            }
+            if (self.source_inputs.contains(file_id.asInt()) and self.parsed_artifacts.contains(file_id.asInt())) {
+                pass1_state = try self.ensureFilePass1Collected(file_id, caller_pkg);
+                if (self.file_pass1_states.getPtr(file_id.asInt())) |p1_mut| {
+                    p1_mut.has_consumed_pass2 = true;
+                }
+                if (!pass1_state.mod_scope.isNone() and self.package_root_files.get(caller_pkg) == file_id) {
+                    try self.symbol_table.setPackageRootScope(caller_pkg, pass1_state.mod_scope);
+                }
+            }
+        }
+
         // Run Phase 4 `use` resolution and signature type resolution for `file_id`:
         var mod_scope: ScopeId = pass1_state.mod_scope;
         var sig_err_count: u32 = 0;
+        var sig_warn_count: u32 = 0;
         var public_count: u32 = 0;
         if (self.source_inputs.getPtr(file_id.asInt())) |input_ptr| {
             if (self.parsed_artifacts.getPtr(file_id.asInt())) |parsed_ptr| {
@@ -8763,7 +9484,10 @@ pub const CompilerDb = struct {
                 checker.is_internal_core = is_core_allowed;
 
                 checker.resolveModuleSignatures() catch return error.OutOfMemory;
+                const post_sig_sym_end: u32 = self.symbol_table.countSymbols();
+                check_audit.lintFileSignaturesW0202(&checker, sig_sink) catch return error.OutOfMemory;
                 sig_err_count = sig_sink.error_count;
+                sig_warn_count = sig_sink.warning_count;
 
                 // Finalize `.cxi` `public_interface_fingerprint` across public items, inline `pub mod`, `pub const`, and `impl`s:
                 const post_input_ptr = self.source_inputs.getPtr(file_id.asInt()) orelse
@@ -8832,7 +9556,16 @@ pub const CompilerDb = struct {
                             !mem_sym.target_symbol.isNone() and
                             mem_sym.target_symbol.asInt() < self.symbol_table.countSymbols())
                         {
-                            const target_sym = self.symbol_table.getSymbol(mem_sym.target_symbol).*;
+                            var target_idx = mem_sym.target_symbol;
+                            var target_sym = self.symbol_table.getSymbol(target_idx).*;
+                            var hops: u8 = 0;
+                            while (target_sym.kind == .use_alias_sym and !target_sym.target_symbol.isNone() and
+                                target_sym.target_symbol.asInt() < self.symbol_table.countSymbols() and
+                                hops < 16) : (hops += 1)
+                            {
+                                target_idx = target_sym.target_symbol;
+                                target_sym = self.symbol_table.getSymbol(target_idx).*;
+                            }
                             public_cxi_hasher.updateU8(0xE1);
                             public_cxi_hasher.updateBytes(mem_sym.name_text);
                             hashTypeCanonical(
@@ -8840,6 +9573,18 @@ pub const CompilerDb = struct {
                                 &self.type_pool,
                                 &self.symbol_table,
                                 target_sym.type_id,
+                            );
+                            hashSymbolDeprecationMeta(
+                                &public_cxi_hasher,
+                                &self.symbol_table,
+                                &self.interner,
+                                mem_idx,
+                            );
+                            hashSymbolDeprecationMeta(
+                                &public_cxi_hasher,
+                                &self.symbol_table,
+                                &self.interner,
+                                target_idx,
                             );
                         }
                     }
@@ -8853,9 +9598,10 @@ pub const CompilerDb = struct {
                     var old_st = prev_kv.value;
                     old_st.deinit();
                 }
+                _ = sym_end;
                 try self.file_sig_sync_states.put(self.allocator, file_id.asInt(), .{
                     .sym_start = sym_start,
-                    .sym_end = sym_end,
+                    .sym_end = post_sig_sym_end,
                     .ast_fingerprint = post_parsed_ptr.ast_fingerprint,
                 });
             }
@@ -8898,6 +9644,7 @@ pub const CompilerDb = struct {
         }
 
         const final_item_count: u32 = @intCast((try self.extractItemTree(file_id)).entries.len);
+        hasher.updateU32(sig_warn_count);
         const resolved_fp = hasher.final();
         try self.resolved_signatures.put(self.allocator, file_id.asInt(), .{
             .file_id = file_id,
@@ -8905,6 +9652,7 @@ pub const CompilerDb = struct {
             .item_count = final_item_count,
             .public_item_count = public_count,
             .error_count = sig_err_count,
+            .warning_count = sig_warn_count,
             .signatures_fingerprint = resolved_fp,
             .public_interface_fingerprint = public_cxi_hasher.final(),
         });
@@ -9160,6 +9908,19 @@ pub const CompilerDb = struct {
         hasher.updateU8(@backingInt(entry.visibility));
         hasher.updateBytes(entry.name_text);
         hashTypeCanonical(&hasher, &self.type_pool, &self.symbol_table, resolved_ty);
+        hashSymbolDeprecationMeta(&hasher, &self.symbol_table, &self.interner, sym_idx);
+        if (!sym_idx.isNone() and sym_idx.asInt() < self.symbol_table.countSymbols()) {
+            const sym_rec = self.symbol_table.getSymbol(sym_idx).*;
+            if (sym_rec.namespace == .type_ns and !sym_rec.target_scope.isNone()) {
+                for (self.symbol_table.getScopeMembers(sym_rec.target_scope)) |mem_idx| {
+                    const mem_sym = self.symbol_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind == .field_sym or mem_sym.kind == .enum_variant_sym or mem_sym.kind == .fn_sym) {
+                        hasher.updateBytes(mem_sym.name_text);
+                        hashSymbolDeprecationMeta(&hasher, &self.symbol_table, &self.interner, mem_idx);
+                    }
+                }
+            }
+        }
         hasher.updateU32(@intCast(param_specs.len));
         for (param_specs) |pspec| {
             // Erase positional-only (`before /`) parameter names so caller signatures hit Early Cutoff (`SE-11`):
@@ -9354,6 +10115,13 @@ pub const CompilerDb = struct {
                         checker.checkDefBody(def_id) catch return error.OutOfMemory;
                     }
                 }
+                check_audit.lintDefBodyW0202(
+                    &checker,
+                    def_id,
+                    def_sig.symbol_index,
+                    body_window.item_ast_node,
+                    body_sink,
+                ) catch return error.OutOfMemory;
                 body_err_count = body_sink.error_count;
                 body_warn_count = body_sink.warning_count;
 
@@ -9454,6 +10222,8 @@ pub const CompilerDb = struct {
                     hasher.updateU16(sym.member_ordinal);
                     hasher.updateBytes(sym.name_text);
                     hashTypeCanonical(&hasher, &self.type_pool, &self.symbol_table, sym.type_id);
+                    hashSymbolDeprecationMeta(&hasher, &self.symbol_table, &self.interner, sym_idx);
+                    var resolved_idx = sym_idx;
                     var resolved_sym = sym;
                     var alias_hops: u8 = 0;
                     while (resolved_sym.kind == .use_alias_sym and
@@ -9461,7 +10231,11 @@ pub const CompilerDb = struct {
                         resolved_sym.target_symbol.asInt() < self.symbol_table.countSymbols() and
                         alias_hops < 16) : (alias_hops += 1)
                     {
-                        resolved_sym = self.symbol_table.getSymbol(resolved_sym.target_symbol).*;
+                        resolved_idx = resolved_sym.target_symbol;
+                        resolved_sym = self.symbol_table.getSymbol(resolved_idx).*;
+                    }
+                    if (resolved_idx != sym_idx) {
+                        hashSymbolDeprecationMeta(&hasher, &self.symbol_table, &self.interner, resolved_idx);
                     }
                     const ref_def = if (!resolved_sym.def_id.isNone())
                         resolved_sym.def_id

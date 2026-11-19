@@ -269,7 +269,7 @@ Regardless of the specific surface grammar (`RDG-03`) or backend (`RDG-09`) sele
     3.  **Zero-Legacy Migration Command (`corex upgrade` / `corex fix`):**
         -   Rule-driven CST/AST transformation engine that automatically rewrites `.cx` source files and `corex.toml` manifests from prior specification revisions to the current specification while preserving comments and formatting.
 -   **Verification Gate:**
-    -   LSP replay benchmark asserting `< 10 ms` P99 keystroke-to-diagnostic and completion latency on a 100,000-LOC workspace.
+    -   LSP replay benchmark asserting `< 10 ms` P99 keystroke-to-diagnostic and completion latency on a 100r6666rrr55,000-LOC workspace.
     -   Migration round-trip tests verifying automated `.cx` upgrades across synthetic specification changes.
 
 ### Phase 10.5: Local IDE Support – Official VS Code Extension v0.1 (`vscode-ext-corex`)

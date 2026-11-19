@@ -394,20 +394,24 @@ pub const DiagnosticCode = enum(u16) {
     w0101_redundant_escape_sequence = 117,
     /// Identifier does not follow canonical CoreX casing (`W0201`).
     w0201_non_canonical_identifier_case = 118,
+    /// Non-idiomatic syntax or redundant expression construct (`W0202`).
+    w0202_non_idiomatic_construct = 119,
     /// Unused region capability or linear binding (`W0308`).
-    w0308_unused_region_allocation = 119,
+    w0308_unused_region_allocation = 120,
     /// Slice or array bounds not statically proven under `--sast-strict` (`W0314`).
-    w0314_unproven_bounds_access = 120,
+    w0314_unproven_bounds_access = 121,
     /// Panic inside vacated non-`Copy` projection inserts abort guard (`W0329`).
-    w0329_vacated_projection_panic_abort = 121,
+    w0329_vacated_projection_panic_abort = 122,
     /// Unreachable high-risk capability exported by dependency (`W0330`).
-    w0330_ambient_dead_capability_in_dep = 122,
+    w0330_ambient_dead_capability_in_dep = 123,
     /// Unreachable pattern arm in `match` expression (`W0401`).
-    w0401_unreachable_pattern_arm = 123,
+    w0401_unreachable_pattern_arm = 124,
     /// Unused local variable binding or function parameter (`W0402`).
-    w0402_unused_binding = 124,
+    w0402_unused_binding = 125,
+    /// Reference to symbol marked `@deprecated` (`W0403`).
+    w0403_deprecated_symbol = 126,
     /// Function exceeds MIR inlining cost threshold (`W0501`).
-    w0501_inlining_budget_exceeded = 125,
+    w0501_inlining_budget_exceeded = 127,
 
     /// Ergonomic alias for undeclared `@cfg(cfg.feature.<name>)` predicates (`E0435`).
     pub const e0435_unknown_cfg_feature: DiagnosticCode = .e0435_invalid_cfg_predicate;
@@ -1333,6 +1337,13 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .explanation = "Types must use `PascalCase`, functions/variables `snake_case`, and constants `SCREAMING_SNAKE_CASE`.",
     },
     .{
+        .code = .w0202_non_idiomatic_construct,
+        .code_str = "W0202",
+        .default_severity = .warning,
+        .title = "non-idiomatic syntax or redundant expression construct",
+        .explanation = "An expression or type annotation uses redundant parentheses, boolean comparisons, or non-canonical surface spelling.",
+    },
+    .{
         .code = .w0308_unused_region_allocation,
         .code_str = "W0308",
         .default_severity = .warning,
@@ -1375,6 +1386,13 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .explanation = "A local variable or function parameter is never read; prefix with `_` if intentionally unused.",
     },
     .{
+        .code = .w0403_deprecated_symbol,
+        .code_str = "W0403",
+        .default_severity = .warning,
+        .title = "use of deprecated symbol",
+        .explanation = "A symbol marked `@deprecated` was referenced; migrate to its replacement API or run `corex upgrade`.",
+    },
+    .{
         .code = .w0501_inlining_budget_exceeded,
         .code_str = "W0501",
         .default_severity = .warning,
@@ -1394,7 +1412,7 @@ pub const DIAGNOSTIC_CODE_STR_MAP = blk: {
 };
 
 comptime {
-    std.debug.assert(DIAGNOSTIC_CATALOG.len == 126);
+    std.debug.assert(DIAGNOSTIC_CATALOG.len == 128);
     std.debug.assert(DIAGNOSTIC_CODE_STR_MAP.keys().len == DIAGNOSTIC_CATALOG.len);
     std.debug.assert(@typeInfo(DiagnosticCode).@"enum".field_names.len == DIAGNOSTIC_CATALOG.len);
     for (DIAGNOSTIC_CATALOG, 0..) |entry, i| {
@@ -1506,6 +1524,15 @@ pub const DiagnosticSink = struct {
     pub fn deinit(self: *DiagnosticSink) void {
         self.diagnostics.deinit(self.arena.asAllocator());
         self.arena.deinit();
+    }
+
+    /// Resets the sink's diagnostic list and bump arena while retaining slab capacity.
+    pub fn resetRetainingCapacity(self: *DiagnosticSink) void {
+        self.diagnostics = .empty;
+        self.arena.resetRetainingCapacity();
+        self.error_count = 0;
+        self.warning_count = 0;
+        self.has_reached_limit = false;
     }
 
     /// Clones `diagnostic` into the sink's arena and records it if below `max_errors`.
@@ -1776,7 +1803,15 @@ test "test_diagnostic_sink_error_cap_and_patcher" {
     try std.testing.expectEqual(@as(u32, 1), outcome.applied_count);
     try std.testing.expectEqualStrings("call(&socket);", outcome.patched_source);
 
-    try std.testing.expectEqual(@as(usize, 126), DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 128), DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(
+        DiagnosticCode.w0202_non_idiomatic_construct,
+        DiagnosticCode.fromCodeStr("W0202").?,
+    );
+    try std.testing.expectEqual(
+        DiagnosticCode.w0403_deprecated_symbol,
+        DiagnosticCode.fromCodeStr("W0403").?,
+    );
     try std.testing.expectEqual(
         DiagnosticCode.e0009_c_header_translation_failed,
         DiagnosticCode.fromCodeStr("E0009").?,

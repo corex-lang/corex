@@ -142,16 +142,94 @@ pub const ScopeFlags = packed struct(u8) {
     is_inside_fallible_fn: bool = false,
     /// `true` inside a `subscript` `let { … }` or `inout { … }` accessor arm (`SE-21`).
     is_inside_subscript: bool = false,
+    /// `true` inside a module, type, `impl`, or function itself annotated with `@deprecated`.
+    is_inside_deprecated: bool = false,
     /// Reserved zero bits (`0`).
-    reserved: u2 = 0,
+    reserved: u1 = 0,
+};
+
+/// 1-byte bit-packed lint suppression mask inherited down lexical scope chains via `@allow(…)`.
+pub const AllowLintMask = packed struct(u8) {
+    /// Suppresses `W0201` (`non_canonical_case`) identifier casing warnings.
+    allow_case_w0201: bool = false,
+    /// Suppresses `W0202` (`idiom` / `style` / `non_idiomatic`) construct warnings.
+    allow_idiom_w0202: bool = false,
+    /// Suppresses `W0401` (`unreachable_pattern`) redundant `match` arm warnings.
+    allow_unreachable_w0401: bool = false,
+    /// Suppresses `W0402` (`unused` / `unused_binding` / `unused_variables`) binding warnings.
+    allow_unused_w0402: bool = false,
+    /// Suppresses `W0403` (`deprecated`) deprecated symbol reference warnings.
+    allow_deprecated_w0403: bool = false,
+    /// Reserved zero padding (`0`).
+    reserved: u3 = 0,
+
+    comptime {
+        std.debug.assert(@sizeOf(AllowLintMask) == 1);
+    }
+
+    /// Combines two `AllowLintMask` values via bitwise OR.
+    pub inline fn merge(self: AllowLintMask, other: AllowLintMask) AllowLintMask {
+        return @bitCast(@as(u8, @bitCast(self)) | @as(u8, @bitCast(other)));
+    }
+
+    /// Returns `true` when no lint suppression bit is set.
+    pub inline fn isEmpty(self: AllowLintMask) bool {
+        return @as(u8, @bitCast(self)) == 0;
+    }
+
+    /// Returns `true` when at least one lint suppression bit is set.
+    pub inline fn hasAny(self: AllowLintMask) bool {
+        return !self.isEmpty();
+    }
+
+    /// Returns `true` when `self` suppresses `code`.
+    pub inline fn isCodeAllowed(self: AllowLintMask, code: DiagnosticCode) bool {
+        return switch (code) {
+            .w0201_non_canonical_identifier_case => self.allow_case_w0201,
+            .w0202_non_idiomatic_construct => self.allow_idiom_w0202,
+            .w0401_unreachable_pattern_arm => self.allow_unreachable_w0401,
+            .w0402_unused_binding => self.allow_unused_w0402,
+            .w0403_deprecated_symbol => self.allow_deprecated_w0403,
+            else => false,
+        };
+    }
+
+    /// Maps a recognized `@allow(…)` lint code or name to its `AllowLintMask` bit (`null` when unknown or blanket).
+    pub fn fromLintName(lint_name: []const u8) ?AllowLintMask {
+        return ALLOW_LINT_NAME_MAP.get(lint_name);
+    }
+};
+
+/// Lexical source byte range governed by a scoped `@allow(…)` attribute (`W0201`/`W0202` CST queries).
+pub const AllowedSpanEntry = struct {
+    /// Bounding source byte span of the annotated declaration, member, parameter, block, or statement.
+    span: Span,
+    /// Active `AllowLintMask` bits enabled across `span`.
+    mask: AllowLintMask,
+};
+
+/// Parsed `@deprecated` and `@fix_inline` metadata stored in `SymbolTable.deprecated_symbols` (`DR-14` §2.2).
+pub const DeprecatedMeta = struct {
+    /// Optional SemVer string from `since: "…"` (`.empty` when omitted).
+    since_sym: SymbolId = .empty,
+    /// Optional human-readable deprecation reason from `"…"` or `reason: "…"` (`.empty` when omitted).
+    reason_sym: SymbolId = .empty,
+    /// Optional replacement template from `upgrade: "…"` or `@fix_inline("…")` (`.empty` when omitted).
+    upgrade_sym: SymbolId = .empty,
+    /// Source byte span of the `@deprecated` or `@fix_inline` attribute node.
+    attr_span: Span = Span.ZERO,
+    /// `true` when `@deprecated` is present (`false` when only `@fix_inline` is present).
+    is_deprecated: bool = true,
 };
 
 /// Lexical or module scope record stored in `ScopeArena`.
 pub const ScopeRecord = struct {
     /// Category of this scope.
     kind: ScopeKind,
-    /// Inherited context flags (`unsafe`, `async`, `comptime`, loop, fallible, subscript).
+    /// Inherited context flags (`unsafe`, `async`, `comptime`, loop, fallible, subscript, deprecated).
     flags: ScopeFlags = .{},
+    /// Inherited scoped `@allow(…)` lint suppression mask.
+    allow_mask: AllowLintMask = .{},
     /// Enclosing parent `ScopeId` (`.none` for `.global_prelude`).
     parent: ScopeId = .none,
     /// Nearest enclosing `.module_scope` `ScopeId` for $O(1)$ visibility checks.
@@ -352,8 +430,10 @@ pub const DeclExtraFlags = packed struct(u16) {
     is_thread_local: bool = false,
     /// `true` if annotated with `@trusted` (`DR-10` §2.3 safe FFI contract).
     is_trusted_ffi: bool = false,
+    /// `true` if annotated with `@deprecated` (`DR-14` §2.2 API deprecation marker).
+    is_deprecated: bool = false,
     /// Reserved zero padding bits (`0`).
-    reserved: u4 = 0,
+    reserved: u3 = 0,
 
     comptime {
         std.debug.assert(@sizeOf(DeclExtraFlags) == 2);
@@ -910,6 +990,8 @@ pub const LookupResult = union(enum) {
 const HeaderAttrKind = enum(u8) {
     /// `@align(N)` explicit power-of-two byte alignment attribute.
     align_attr,
+    /// `@allow(…)` scoped lint suppression attribute.
+    allow_attr,
     /// `@attribute_schema` target-constrained schema struct attribute.
     attribute_schema,
     /// `@builder` declarative builder closure/parameter attribute (`SE-22`).
@@ -920,12 +1002,16 @@ const HeaderAttrKind = enum(u8) {
     cache_aligned,
     /// `@constructor` primary/secondary constructor attribute (`SE-22`).
     constructor,
+    /// `@deprecated` API deprecation and migration template attribute (`DR-14` §2.2).
+    deprecated,
     /// `@derive(Eq, Hash, Debug, Clone, From, Copy)` trait synthesis attribute.
     derive,
     /// `@export` symbol export attribute.
     export_attr,
     /// `@extern` foreign symbol linkage attribute.
     extern_attr,
+    /// `@fix_inline("…")` non-deprecated upgrade template attribute (`DR-14` §2.2).
+    fix_inline,
     /// `@from` `FromError` upcasting constructor attribute.
     from,
     /// `@ifunc` forbidden indirect function resolver attribute (`E0327`).
@@ -1321,14 +1407,17 @@ pub const C_PRIMITIVE_TYPE_ALIAS_MAP = std.StaticStringMap(void).initComptime(.{
 /// $O(1)$ static lookup map from declaration `@attr` identifiers to `HeaderAttrKind`.
 const HEADER_ATTR_MAP = std.StaticStringMap(HeaderAttrKind).initComptime(.{
     .{ "align", .align_attr },
+    .{ "allow", .allow_attr },
     .{ "attribute_schema", .attribute_schema },
     .{ "builder", .builder },
     .{ "builder_item", .builder_item },
     .{ "cache_aligned", .cache_aligned },
     .{ "constructor", .constructor },
+    .{ "deprecated", .deprecated },
     .{ "derive", .derive },
     .{ "export", .export_attr },
     .{ "extern", .extern_attr },
+    .{ "fix_inline", .fix_inline },
     .{ "from", .from },
     .{ "ifunc", .ifunc },
     .{ "linear", .linear },
@@ -1355,6 +1444,42 @@ const HEADER_ATTR_MAP = std.StaticStringMap(HeaderAttrKind).initComptime(.{
     .{ "wasm_export", .wasm_export },
     .{ "wasm_import", .wasm_import },
     .{ "zero_pad", .zero_pad },
+});
+
+/// Canonical scoped `@allow(…)` lint names for typo suggestions on `E0403`.
+pub const ALLOW_LINT_NAMES = [_][]const u8{
+    "W0201",
+    "W0202",
+    "W0401",
+    "W0402",
+    "W0403",
+    "deprecated",
+    "idiom",
+    "non_canonical_case",
+    "non_idiomatic",
+    "style",
+    "unreachable_pattern",
+    "unused",
+    "unused_binding",
+    "unused_variables",
+};
+
+/// $O(1)$ static lookup map from scoped `@allow(…)` lint identifiers to `AllowLintMask` bits.
+pub const ALLOW_LINT_NAME_MAP = std.StaticStringMap(AllowLintMask).initComptime(.{
+    .{ "W0201", AllowLintMask{ .allow_case_w0201 = true } },
+    .{ "W0202", AllowLintMask{ .allow_idiom_w0202 = true } },
+    .{ "W0401", AllowLintMask{ .allow_unreachable_w0401 = true } },
+    .{ "W0402", AllowLintMask{ .allow_unused_w0402 = true } },
+    .{ "W0403", AllowLintMask{ .allow_deprecated_w0403 = true } },
+    .{ "deprecated", AllowLintMask{ .allow_deprecated_w0403 = true } },
+    .{ "idiom", AllowLintMask{ .allow_idiom_w0202 = true } },
+    .{ "non_canonical_case", AllowLintMask{ .allow_case_w0201 = true } },
+    .{ "non_idiomatic", AllowLintMask{ .allow_idiom_w0202 = true } },
+    .{ "style", AllowLintMask{ .allow_idiom_w0202 = true } },
+    .{ "unreachable_pattern", AllowLintMask{ .allow_unreachable_w0401 = true } },
+    .{ "unused", AllowLintMask{ .allow_unused_w0402 = true } },
+    .{ "unused_binding", AllowLintMask{ .allow_unused_w0402 = true } },
+    .{ "unused_variables", AllowLintMask{ .allow_unused_w0402 = true } },
 });
 
 /// $O(1)$ static lookup map from built-in `@derive` trait identifiers to `DeriveMask` bits.
@@ -2085,7 +2210,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     break :blk fresh_scope;
                 };
 
-                _ = try sym_table.defineSymbol(.{
+                const defined_sym_idx = try sym_table.defineSymbol(.{
                     .name = name_sym,
                     .name_text = interner.get(name_sym),
                     .kind = .module_sym,
@@ -2095,15 +2220,18 @@ fn collectItemSliceInScopeWithOrdinal(
                     .extra_flags = extra_flags,
                     .scope_id = enclosing_scope,
                     .def_id = def_id,
+                    .owner_def_id = enclosing_owner_def,
                     .ast_node = item_node_idx,
                     .cst_node = item_cst,
                     .decl_span = name_span,
                     .target_scope = mod_scope,
                     .has_cfg_attr = header_meta.has_cfg_attr,
                 }, diagnostic_sink);
+                try sym_table.applyItemHeaderLintAndDeprecation(defined_sym_idx, mod_scope, &header_meta);
 
                 // Collect inline `mod foo { … }` sub-items:
                 if (ast_node.rhs.tag == .extra) {
+                    const effective_mod_owner = if (!def_id.isNone()) def_id else enclosing_owner_def;
                     const inner_items = computeRhsExtraSliceWithEnds(ast_arena, item_node_idx, extra_ends);
                     try collectItemSliceInScope(
                         sym_table,
@@ -2111,7 +2239,7 @@ fn collectItemSliceInScopeWithOrdinal(
                         file_id,
                         mod_scope,
                         false,
-                        .NONE,
+                        effective_mod_owner,
                         inner_items,
                         source,
                         token_buffer,
@@ -2142,11 +2270,12 @@ fn collectItemSliceInScopeWithOrdinal(
                 if (name_str.len == 0) continue;
                 const name_sym = try interner.intern(name_str);
                 const name_span = token_buffer.getTokenSpan(file_id, name_tok);
+                const effective_owner_def = if (!def_id.isNone()) def_id else enclosing_owner_def;
 
                 const member_scope = try sym_table.scope_arena.allocScope(
                     .nominal_type_scope,
                     enclosing_scope,
-                    def_id,
+                    effective_owner_def,
                     file_id,
                     .{},
                 );
@@ -2167,6 +2296,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     .extra_flags = extra_flags,
                     .scope_id = enclosing_scope,
                     .def_id = def_id,
+                    .owner_def_id = enclosing_owner_def,
                     .ast_node = item_node_idx,
                     .cst_node = item_cst,
                     .decl_span = name_span,
@@ -2183,6 +2313,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
                     .has_cfg_attr = header_meta.has_cfg_attr,
                 }, diagnostic_sink);
+                try sym_table.applyItemHeaderLintAndDeprecation(defined_sym_idx, member_scope, &header_meta);
 
                 const gen_specs = try extractGenericParamSpecsFromItemCst(
                     sym_table.allocator,
@@ -2202,6 +2333,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     interner,
                     file_id,
                     member_scope,
+                    effective_owner_def,
                     item_cst,
                     source,
                     token_buffer,
@@ -2215,6 +2347,7 @@ fn collectItemSliceInScopeWithOrdinal(
                 if (name_str.len == 0) continue;
                 const name_sym = try interner.intern(name_str);
                 const name_span = token_buffer.getTokenSpan(file_id, name_tok);
+                const effective_owner_def = if (!def_id.isNone()) def_id else enclosing_owner_def;
 
                 if (extra_flags.has_repr_int) {
                     if (diagnostic_sink) |sink| {
@@ -2232,7 +2365,7 @@ fn collectItemSliceInScopeWithOrdinal(
                 const variant_scope = try sym_table.scope_arena.allocScope(
                     .nominal_type_scope,
                     enclosing_scope,
-                    def_id,
+                    effective_owner_def,
                     file_id,
                     .{},
                 );
@@ -2246,6 +2379,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     .extra_flags = extra_flags,
                     .scope_id = enclosing_scope,
                     .def_id = def_id,
+                    .owner_def_id = enclosing_owner_def,
                     .ast_node = item_node_idx,
                     .cst_node = item_cst,
                     .decl_span = name_span,
@@ -2262,6 +2396,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
                     .has_cfg_attr = header_meta.has_cfg_attr,
                 }, diagnostic_sink);
+                try sym_table.applyItemHeaderLintAndDeprecation(defined_sym_idx, variant_scope, &header_meta);
 
                 const gen_specs = try extractGenericParamSpecsFromItemCst(
                     sym_table.allocator,
@@ -2281,6 +2416,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     interner,
                     file_id,
                     variant_scope,
+                    effective_owner_def,
                     visibility,
                     item_cst,
                     source,
@@ -2295,11 +2431,12 @@ fn collectItemSliceInScopeWithOrdinal(
                 if (name_str.len == 0) continue;
                 const name_sym = try interner.intern(name_str);
                 const name_span = token_buffer.getTokenSpan(file_id, name_tok);
+                const effective_owner_def = if (!def_id.isNone()) def_id else enclosing_owner_def;
 
                 const trait_scope = try sym_table.scope_arena.allocScope(
                     .trait_scope,
                     enclosing_scope,
-                    def_id,
+                    effective_owner_def,
                     file_id,
                     .{},
                 );
@@ -2313,6 +2450,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     .extra_flags = extra_flags,
                     .scope_id = enclosing_scope,
                     .def_id = def_id,
+                    .owner_def_id = enclosing_owner_def,
                     .ast_node = item_node_idx,
                     .cst_node = item_cst,
                     .decl_span = name_span,
@@ -2320,6 +2458,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     .contract_flags = header_meta.contract_flags,
                     .has_cfg_attr = header_meta.has_cfg_attr,
                 }, diagnostic_sink);
+                try sym_table.applyItemHeaderLintAndDeprecation(defined_sym_idx, trait_scope, &header_meta);
 
                 const gen_specs = try extractGenericParamSpecsFromItemCst(
                     sym_table.allocator,
@@ -2345,7 +2484,7 @@ fn collectItemSliceInScopeWithOrdinal(
                         file_id,
                         trait_scope,
                         false,
-                        .NONE,
+                        effective_owner_def,
                         member_slice,
                         source,
                         token_buffer,
@@ -2362,6 +2501,7 @@ fn collectItemSliceInScopeWithOrdinal(
                 if (name_str.len == 0) continue;
                 const name_sym = try interner.intern(name_str);
                 const name_span = token_buffer.getTokenSpan(file_id, name_tok);
+                const effective_owner_def = if (!def_id.isNone()) def_id else enclosing_owner_def;
 
                 const gen_specs = try extractGenericParamSpecsFromItemCst(
                     sym_table.allocator,
@@ -2381,7 +2521,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     bf_member_scope = try sym_table.scope_arena.allocScope(
                         .nominal_type_scope,
                         enclosing_scope,
-                        def_id,
+                        effective_owner_def,
                         file_id,
                         .{},
                     );
@@ -2408,7 +2548,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     bf_member_scope = try sym_table.scope_arena.allocScope(
                         .nominal_type_scope,
                         enclosing_scope,
-                        def_id,
+                        effective_owner_def,
                         file_id,
                         .{},
                     );
@@ -2424,6 +2564,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     .extra_flags = extra_flags,
                     .scope_id = enclosing_scope,
                     .def_id = def_id,
+                    .owner_def_id = enclosing_owner_def,
                     .ast_node = item_node_idx,
                     .cst_node = item_cst,
                     .decl_span = name_span,
@@ -2435,6 +2576,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
                     .has_cfg_attr = header_meta.has_cfg_attr,
                 }, diagnostic_sink);
+                try sym_table.applyItemHeaderLintAndDeprecation(defined_sym_idx, bf_member_scope, &header_meta);
 
                 if (gen_specs.len > 0) {
                     try sym_table.setGenericParamSpecs(defined_sym_idx, gen_specs);
@@ -2446,6 +2588,7 @@ fn collectItemSliceInScopeWithOrdinal(
                         interner,
                         file_id,
                         bf_member_scope,
+                        effective_owner_def,
                         item_cst,
                         source,
                         token_buffer,
@@ -2461,7 +2604,7 @@ fn collectItemSliceInScopeWithOrdinal(
                 const name_sym = try interner.intern(name_str);
                 const name_span = token_buffer.getTokenSpan(file_id, name_tok);
 
-                _ = try sym_table.defineSymbol(.{
+                const defined_sym_idx = try sym_table.defineSymbol(.{
                     .name = name_sym,
                     .name_text = interner.get(name_sym),
                     .kind = .const_sym,
@@ -2481,6 +2624,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
                     .has_cfg_attr = header_meta.has_cfg_attr,
                 }, diagnostic_sink);
+                try sym_table.applyItemHeaderLintAndDeprecation(defined_sym_idx, .none, &header_meta);
             },
             .fn_decl => {
                 const name_tok = findItemNameToken(token_buffer, cst_arena, item_cst, ast_node.main_token);
@@ -2528,6 +2672,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     .has_cfg_attr = header_meta.has_cfg_attr,
                 }, diagnostic_sink);
 
+                try sym_table.applyItemHeaderLintAndDeprecation(defined_sym_idx, .none, &header_meta);
                 if (extracted_params.specs.len > 0) {
                     try sym_table.setFnParamSpecs(defined_sym_idx, extracted_params.specs);
                 }
@@ -2598,6 +2743,8 @@ fn collectItemSliceInScopeWithOrdinal(
                     .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
                     .has_cfg_attr = header_meta.has_cfg_attr,
                 }, diagnostic_sink);
+
+                try sym_table.applyItemHeaderLintAndDeprecation(defined_sym_idx, .none, &header_meta);
 
                 var static_abi_buf: [256]u8 = undefined;
                 const static_abi_slice: []const u8 = if (!static_extra.abi_tok.isNone())
@@ -2688,6 +2835,15 @@ fn collectItemSliceInScopeWithOrdinal(
                             added_sym.enclosing_cfg_cst = item_cst;
                         }
                     }
+                    if (!header_meta.allow_mask.isEmpty()) {
+                        try sym_table.mergeSymbolAllowMask(added_idx, header_meta.allow_mask);
+                    }
+                    if (header_meta.has_deprecated_meta and sym_table.getDeprecatedMeta(added_idx) == null) {
+                        if (header_meta.deprecated_meta.is_deprecated) {
+                            added_sym.extra_flags.is_deprecated = true;
+                        }
+                        try sym_table.setDeprecatedMeta(added_idx, header_meta.deprecated_meta);
+                    }
                     if (added_sym.kind == .fn_sym or added_sym.kind == .extern_static_sym) {
                         added_sym.flags.is_extern = true;
                         const existing_contract = if (sym_table.getFfiContract(added_idx)) |ptr|
@@ -2765,6 +2921,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     .has_cfg_attr = header_meta.has_cfg_attr,
                 }, diagnostic_sink);
 
+                try sym_table.applyItemHeaderLintAndDeprecation(defined_sym_idx, .none, &header_meta);
                 if (extracted_params.specs.len > 0) {
                     try sym_table.setFnParamSpecs(defined_sym_idx, extracted_params.specs);
                 }
@@ -2828,18 +2985,20 @@ fn collectItemSliceInScopeWithOrdinal(
                     .has_cfg_attr = header_meta.has_cfg_attr,
                 }, diagnostic_sink);
 
+                try sym_table.applyItemHeaderLintAndDeprecation(defined_sym_idx, .none, &header_meta);
                 if (extracted_params.specs.len > 0) {
                     try sym_table.setFnParamSpecs(defined_sym_idx, extracted_params.specs);
                 }
             },
             .impl_decl => {
                 // Collect methods inside `impl [Trait for] TargetType { … }` in exact AST source order:
+                const effective_owner_def = if (!def_id.isNone()) def_id else enclosing_owner_def;
                 const impl_target = try resolveImplTargetScope(
                     sym_table,
                     interner,
                     file_id,
                     enclosing_scope,
-                    def_id,
+                    effective_owner_def,
                     item_cst,
                     ast_node,
                     source,
@@ -2855,7 +3014,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     file_id,
                     impl_target.target_scope,
                     false,
-                    def_id,
+                    effective_owner_def,
                     member_items,
                     source,
                     token_buffer,
@@ -2865,9 +3024,12 @@ fn collectItemSliceInScopeWithOrdinal(
                     diagnostic_sink,
                 );
                 const post_sym_len = sym_table.symbols.items.len;
-                if (header_meta.has_cfg_attr or !impl_target.trait_sym_idx.isNone()) {
+                if (header_meta.has_cfg_attr or !impl_target.trait_sym_idx.isNone() or
+                    !header_meta.allow_mask.isEmpty() or header_meta.has_deprecated_meta)
+                {
                     var sym_i = pre_sym_len;
                     while (sym_i < post_sym_len) : (sym_i += 1) {
+                        const added_idx = SymbolIndex.fromInt(@intCast(sym_i));
                         const added_sym = &sym_table.symbols.items[sym_i];
                         if (added_sym.scope_id == impl_target.target_scope) {
                             if (header_meta.has_cfg_attr) {
@@ -2881,6 +3043,15 @@ fn collectItemSliceInScopeWithOrdinal(
                                     impl_target.trait_sym_idx,
                                 );
                             }
+                            if (!header_meta.allow_mask.isEmpty()) {
+                                try sym_table.mergeSymbolAllowMask(added_idx, header_meta.allow_mask);
+                            }
+                            if (header_meta.has_deprecated_meta and sym_table.getDeprecatedMeta(added_idx) == null) {
+                                if (header_meta.deprecated_meta.is_deprecated) {
+                                    added_sym.extra_flags.is_deprecated = true;
+                                }
+                                try sym_table.setDeprecatedMeta(added_idx, header_meta.deprecated_meta);
+                            }
                         }
                     }
                 }
@@ -2890,7 +3061,7 @@ fn collectItemSliceInScopeWithOrdinal(
                 if (is_unresolved_scope or impl_target.trait_sym_idx.isNone()) {
                     try forward_impls.append(sym_table.allocator, .{
                         .old_scope = impl_target.target_scope,
-                        .def_id = def_id,
+                        .def_id = effective_owner_def,
                         .item_node_idx = item_node_idx,
                         .item_cst = item_cst,
                         .sym_start = pre_sym_len,
@@ -2990,6 +3161,7 @@ pub const ScopeArena = struct {
         extra_flags: ScopeFlags,
     ) !ScopeId {
         var merged_flags = extra_flags;
+        var merged_allow = AllowLintMask{};
         var enclosing_mod: ScopeId = .none;
         var parent_mod: ScopeId = .none;
         var inherited_pkg: PackageId = .root;
@@ -3009,6 +3181,9 @@ pub const ScopeArena = struct {
                 parent_rec.flags.is_inside_fallible_fn;
             merged_flags.is_inside_subscript = merged_flags.is_inside_subscript or
                 parent_rec.flags.is_inside_subscript;
+            merged_flags.is_inside_deprecated = merged_flags.is_inside_deprecated or
+                parent_rec.flags.is_inside_deprecated;
+            merged_allow = parent_rec.allow_mask;
             if (parent_rec.kind != .global_prelude) {
                 inherited_pkg = parent_rec.pkg_id;
             }
@@ -3029,6 +3204,7 @@ pub const ScopeArena = struct {
         try self.scopes.append(self.allocator, .{
             .kind = kind,
             .flags = merged_flags,
+            .allow_mask = merged_allow,
             .parent = parent,
             .enclosing_module = enclosing_mod,
             .parent_module = parent_mod,
@@ -3038,6 +3214,44 @@ pub const ScopeArena = struct {
             .depth = depth,
         });
         return new_id;
+    }
+
+    /// ORs `mask` into `scope_id`'s `allow_mask` when `scope_id` is valid.
+    pub fn addAllowMask(self: *ScopeArena, scope_id: ScopeId, mask: AllowLintMask) void {
+        if (mask.isEmpty() or scope_id.isNone() or scope_id.asInt() >= self.scopes.len) return;
+        const allow_col = self.scopes.items(.allow_mask);
+        allow_col[scope_id.asInt()] = allow_col[scope_id.asInt()].merge(mask);
+    }
+
+    /// Returns the inherited `AllowLintMask` active in `scope_id` (walking `parent` dynamically for late additions).
+    pub fn getAllowMask(self: *const ScopeArena, scope_id: ScopeId) AllowLintMask {
+        var combined = AllowLintMask{};
+        var cursor = scope_id;
+        var steps: usize = 0;
+        while (!cursor.isNone() and cursor.asInt() < self.scopes.len and steps <= MAX_SCOPE_DEPTH) : (steps += 1) {
+            const rec = self.scopes.get(cursor.asInt());
+            combined = combined.merge(rec.allow_mask);
+            cursor = rec.parent;
+        }
+        return combined;
+    }
+
+    /// Marks `scope_id` as residing inside a `@deprecated` item (`W0403` self-exemption).
+    pub fn setInsideDeprecated(self: *ScopeArena, scope_id: ScopeId) void {
+        if (scope_id.isNone() or scope_id.asInt() >= self.scopes.len) return;
+        self.scopes.items(.flags)[scope_id.asInt()].is_inside_deprecated = true;
+    }
+
+    /// Returns `true` if `scope_id` or any lexical ancestor scope is marked `is_inside_deprecated`.
+    pub fn isInsideDeprecated(self: *const ScopeArena, scope_id: ScopeId) bool {
+        var cursor = scope_id;
+        var steps: usize = 0;
+        while (!cursor.isNone() and cursor.asInt() < self.scopes.len and steps <= MAX_SCOPE_DEPTH) : (steps += 1) {
+            const rec = self.scopes.get(cursor.asInt());
+            if (rec.flags.is_inside_deprecated) return true;
+            cursor = rec.parent;
+        }
+        return false;
     }
 
     /// Retrieves the `ScopeRecord` for `scope_id` in $O(1)$ time.
@@ -3182,6 +3396,10 @@ pub const SymbolTable = struct {
     generic_param_specs: std.AutoHashMapUnmanaged(u32, []GenericParamSpec) = .empty,
     /// Sparse map of `extern` function/static FFI linkage and SAST contract metadata (`DR-10` §2.3).
     ffi_contracts: std.AutoHashMapUnmanaged(SymbolIndex, FfiFnContract) = .empty,
+    /// Sparse map of `@deprecated` and `@fix_inline` metadata keyed by `SymbolIndex` (`DR-14` §2.2).
+    deprecated_symbols: std.AutoHashMapUnmanaged(SymbolIndex, DeprecatedMeta) = .empty,
+    /// Sparse map of per-declaration `@allow(…)` masks keyed by `SymbolIndex`.
+    symbol_allow_masks: std.AutoHashMapUnmanaged(SymbolIndex, AllowLintMask) = .empty,
     /// Pre-registered or cached `(PackageId, StringId)` -> synthetic `@c_import` module `SymbolIndex` handles.
     c_import_modules: std.AutoHashMapUnmanaged(u64, SymbolIndex) = .empty,
     /// Optional on-demand loader invoked when `@c_import("header.h")` misses `c_import_modules`.
@@ -3249,6 +3467,8 @@ pub const SymbolTable = struct {
             }
         }
         self.ffi_contracts.deinit(self.allocator);
+        self.deprecated_symbols.deinit(self.allocator);
+        self.symbol_allow_masks.deinit(self.allocator);
         self.c_import_modules.deinit(self.allocator);
 
         self.symbols.deinit(self.allocator);
@@ -3308,6 +3528,8 @@ pub const SymbolTable = struct {
             }
         }
         self.ffi_contracts.clearRetainingCapacity();
+        self.deprecated_symbols.clearRetainingCapacity();
+        self.symbol_allow_masks.clearRetainingCapacity();
         self.c_import_modules.clearRetainingCapacity();
         self.c_import_loader = null;
 
@@ -3665,6 +3887,73 @@ pub const SymbolTable = struct {
     pub fn getFfiContract(self: *const SymbolTable, sym_idx: SymbolIndex) ?*const FfiFnContract {
         if (sym_idx.isNone()) return null;
         return self.ffi_contracts.getPtr(sym_idx);
+    }
+
+    /// Registers `@deprecated` / `@fix_inline` metadata for `sym_idx`.
+    pub fn setDeprecatedMeta(self: *SymbolTable, sym_idx: SymbolIndex, meta: DeprecatedMeta) !void {
+        if (sym_idx.isNone()) return;
+        try self.deprecated_symbols.put(self.allocator, sym_idx, meta);
+    }
+
+    /// Looks up `@deprecated` / `@fix_inline` metadata for `sym_idx` (`null` when absent).
+    pub fn getDeprecatedMeta(self: *const SymbolTable, sym_idx: SymbolIndex) ?DeprecatedMeta {
+        if (sym_idx.isNone()) return null;
+        return self.deprecated_symbols.get(sym_idx);
+    }
+
+    /// Replaces the `@allow(…)` mask recorded on `sym_idx`.
+    pub fn setSymbolAllowMask(self: *SymbolTable, sym_idx: SymbolIndex, mask: AllowLintMask) !void {
+        if (sym_idx.isNone() or mask.isEmpty()) return;
+        try self.symbol_allow_masks.put(self.allocator, sym_idx, mask);
+    }
+
+    /// ORs `mask` into the `@allow(…)` mask recorded on `sym_idx`.
+    pub fn mergeSymbolAllowMask(self: *SymbolTable, sym_idx: SymbolIndex, mask: AllowLintMask) !void {
+        if (sym_idx.isNone() or mask.isEmpty()) return;
+        const existing = self.symbol_allow_masks.get(sym_idx) orelse AllowLintMask{};
+        try self.symbol_allow_masks.put(self.allocator, sym_idx, existing.merge(mask));
+    }
+
+    /// Returns the `@allow(…)` mask directly attached to `sym_idx`.
+    pub fn getSymbolAllowMask(self: *const SymbolTable, sym_idx: SymbolIndex) AllowLintMask {
+        if (sym_idx.isNone()) return .{};
+        return self.symbol_allow_masks.get(sym_idx) orelse .{};
+    }
+
+    /// Returns the inherited `@allow(…)` mask active in `scope_id`.
+    pub inline fn getScopeAllowMask(self: *const SymbolTable, scope_id: ScopeId) AllowLintMask {
+        return self.scope_arena.getAllowMask(scope_id);
+    }
+
+    /// Unwraps `.use_alias_sym` hops up to bounded depth (`16`) to reach the underlying symbol.
+    pub fn unwrapAliasSymbolIdx(self: *const SymbolTable, sym_idx: SymbolIndex) SymbolIndex {
+        var cur = sym_idx;
+        var hops: u8 = 0;
+        while (!cur.isNone() and cur.asInt() < self.symbols.items.len and hops < 16) : (hops += 1) {
+            const sym = self.getSymbol(cur).*;
+            if (sym.kind != .use_alias_sym or sym.target_symbol.isNone()) break;
+            cur = sym.target_symbol;
+        }
+        return cur;
+    }
+
+    /// Applies extracted item-header `@allow(…)` and `@deprecated`/`@fix_inline` metadata to `sym_idx` and `owned_scope`.
+    pub fn applyItemHeaderLintAndDeprecation(
+        self: *SymbolTable,
+        sym_idx: SymbolIndex,
+        owned_scope: ScopeId,
+        header_meta: *const ItemHeaderMetadata,
+    ) !void {
+        if (!header_meta.allow_mask.isEmpty()) {
+            try self.mergeSymbolAllowMask(sym_idx, header_meta.allow_mask);
+            self.scope_arena.addAllowMask(owned_scope, header_meta.allow_mask);
+        }
+        if (header_meta.has_deprecated_meta) {
+            try self.setDeprecatedMeta(sym_idx, header_meta.deprecated_meta);
+            if (header_meta.deprecated_meta.is_deprecated) {
+                self.scope_arena.setInsideDeprecated(owned_scope);
+            }
+        }
     }
 
     /// Packs `(pkg_id, header_id)` into a collision-free 64-bit `c_import_modules` lookup key.
@@ -4422,6 +4711,39 @@ pub const SymbolTable = struct {
         return &.{};
     }
 
+    /// Prunes prior body-local bindings from `fn_scope` and resets parameter `is_used` flags before body re-checking.
+    pub fn resetFnScopeForBodyRecheck(
+        self: *SymbolTable,
+        fn_scope: ScopeId,
+        param_specs: []const FnParamSpec,
+    ) void {
+        if (fn_scope.isNone()) return;
+        const list_ptr = self.scope_members.getPtr(fn_scope.asInt()) orelse return;
+        var write_idx: usize = 0;
+        for (list_ptr.items) |mem_idx| {
+            const mem_sym = self.getSymbol(mem_idx).*;
+            const is_sig_param = switch (mem_sym.kind) {
+                .param_sym, .type_param_sym, .const_param_sym => true,
+                else => false,
+            };
+            if (is_sig_param) {
+                if (mem_sym.kind == .param_sym) {
+                    self.getSymbolMut(mem_idx).flags.is_used =
+                        mem_sym.member_ordinal < param_specs.len and
+                        param_specs[mem_sym.member_ordinal].is_used_by_default;
+                }
+                list_ptr.items[write_idx] = mem_idx;
+                write_idx += 1;
+            } else {
+                const scoped_key = packScopedSymbolKey(fn_scope, mem_sym.name, mem_sym.namespace);
+                if (self.scoped_map.get(scoped_key) == mem_idx) {
+                    _ = self.scoped_map.remove(scoped_key);
+                }
+            }
+        }
+        list_ptr.items.len = write_idx;
+    }
+
     /// Returns the total number of symbols in `self.symbols`.
     pub inline fn countSymbols(self: *const SymbolTable) u32 {
         return @intCast(self.symbols.items.len);
@@ -4780,12 +5102,14 @@ pub const SymbolTable = struct {
         interner: *StringInterner,
         diagnostic_sink: *DiagnosticSink,
     ) !void {
+        if (self.getScopeAllowMask(scope_id).allow_unused_w0402) return;
         for (self.getScopeMembers(scope_id)) |sym_idx| {
             const sym = self.getSymbol(sym_idx);
             if (sym.kind != .local_let_sym and sym.kind != .local_var_sym and sym.kind != .param_sym) {
                 continue;
             }
             if (sym.flags.is_used or sym.flags.is_builtin) continue;
+            if (self.getSymbolAllowMask(sym_idx).allow_unused_w0402) continue;
             if (sym.name_text.len == 0 or
                 std.mem.startsWith(u8, sym.name_text, "_") or
                 std.mem.eql(u8, sym.name_text, "self"))
@@ -5276,6 +5600,12 @@ pub const ItemHeaderMetadata = struct {
     wasm_export_buf: [256]u8 = undefined,
     /// Valid byte length inside `wasm_export_buf`.
     wasm_export_len: u16 = 0,
+    /// Scoped `@allow(…)` lint suppression mask extracted from this item header.
+    allow_mask: AllowLintMask = .{},
+    /// Parsed `@deprecated` / `@fix_inline` metadata extracted from this item header.
+    deprecated_meta: DeprecatedMeta = .{},
+    /// `true` when `@deprecated` or `@fix_inline` appeared on this item header.
+    has_deprecated_meta: bool = false,
 
     /// Returns the decoded `@link_section` byte slice.
     pub inline fn asLinkSectionSlice(self: *const ItemHeaderMetadata) []const u8 {
@@ -6242,6 +6572,53 @@ fn extractItemHeaderMetadataWithInterner(
                                     attr_end,
                                     &meta,
                                 ),
+                                .allow_attr => {
+                                    const parsed_allow = try extractAndValidateAllowAttrRange(
+                                        source,
+                                        file_id,
+                                        token_buffer,
+                                        cst_arena,
+                                        at_tok,
+                                        leaf.token,
+                                        attr_cur + 1,
+                                        attr_end,
+                                        diagnostic_sink,
+                                    );
+                                    meta.allow_mask = meta.allow_mask.merge(parsed_allow);
+                                },
+                                .deprecated => {
+                                    meta.extra_flags.is_deprecated = true;
+                                    try parseDeprecatedOrFixInlineAttrRange(
+                                        source,
+                                        file_id,
+                                        token_buffer,
+                                        cst_arena,
+                                        interner,
+                                        false,
+                                        at_tok,
+                                        leaf.token,
+                                        attr_cur + 1,
+                                        attr_end,
+                                        &meta.deprecated_meta,
+                                        &meta.has_deprecated_meta,
+                                    );
+                                },
+                                .fix_inline => {
+                                    try parseDeprecatedOrFixInlineAttrRange(
+                                        source,
+                                        file_id,
+                                        token_buffer,
+                                        cst_arena,
+                                        interner,
+                                        true,
+                                        at_tok,
+                                        leaf.token,
+                                        attr_cur + 1,
+                                        attr_end,
+                                        &meta.deprecated_meta,
+                                        &meta.has_deprecated_meta,
+                                    );
+                                },
                                 .link_name => extractLinkNameAttr(
                                     source,
                                     token_buffer,
@@ -7887,6 +8264,571 @@ fn hasDiagnosticAtSpan(sink: *const DiagnosticSink, code: DiagnosticCode, span: 
     return false;
 }
 
+/// Computes the bounding source `Span` of `cst_node` across all non-injected leaf tokens in its subtree.
+pub fn computeCstSubtreeSpan(
+    file_id: FileId,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    cst_node: CstNodeIndex,
+) ?Span {
+    if (cst_node.isNone() or cst_node.asInt() >= cst_arena.countNodes()) return null;
+    const start_idx: usize = cst_node.asInt();
+    const root_rec = cst_arena.getNode(cst_node);
+    const end_idx: usize = @min(
+        start_idx + @max(@as(usize, root_rec.subtree_size), 1),
+        cst_arena.countNodes(),
+    );
+    const tok_count = token_buffer.countTokens();
+    var min_byte: u32 = std.math.maxInt(u32);
+    var max_byte: u32 = 0;
+    var has_tok = false;
+    var cur = start_idx;
+    while (cur < end_idx) : (cur += 1) {
+        const sub = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+        if (sub.subtree_size <= 1 and !sub.flags.is_missing_or_injected and
+            !sub.token.isNone() and sub.token.asInt() < tok_count)
+        {
+            const tok_rec = token_buffer.getToken(sub.token);
+            if (tok_rec.flags.is_synthesized or tok_rec.kind == .eof) continue;
+            const tok_span = token_buffer.getTokenSpan(file_id, sub.token);
+            min_byte = @min(min_byte, tok_span.start_byte);
+            max_byte = @max(max_byte, tok_span.end_byte);
+            has_tok = true;
+        }
+    }
+    if (!has_tok or min_byte > max_byte) return null;
+    return Span.init(file_id, min_byte, max_byte);
+}
+
+/// Emits deduplicated `E0403` for a malformed, blanket, or unknown `@allow(…)` attribute argument.
+fn emitInvalidAllowAttrDiagnostic(
+    sink: ?*DiagnosticSink,
+    span: Span,
+    message: []const u8,
+    primary_label: []const u8,
+    bad_lint_name: ?[]const u8,
+) !void {
+    const active_sink = sink orelse return;
+    if (span.file_id.isNone()) return;
+    if (hasDiagnosticAtSpan(active_sink, .e0403_unresolved_symbol, span)) return;
+
+    const arena_alloc = active_sink.arena.asAllocator();
+    const msg_owned = try arena_alloc.dupe(u8, message);
+    const label_owned = try arena_alloc.dupe(u8, primary_label);
+    const labels = [1]LabeledSpan{
+        .{ .span = span, .label = label_owned, .style = .primary },
+    };
+
+    var best_suggestion: ?[]const u8 = null;
+    if (bad_lint_name) |bad_name| {
+        if (bad_name.len >= 2 and !std.mem.eql(u8, bad_name, "all") and !std.mem.eql(u8, bad_name, "warnings")) {
+            var best_dist: u16 = 4;
+            for (ALLOW_LINT_NAMES) |cand| {
+                const dist = computeEditDistance(bad_name, cand);
+                if (dist > 0 and dist < best_dist) {
+                    best_dist = dist;
+                    best_suggestion = cand;
+                }
+            }
+        }
+    }
+
+    if (best_suggestion) |suggested| {
+        const note_str = try std.fmt.allocPrint(arena_alloc, "help: did you mean `{s}`?", .{suggested});
+        const notes = [1][]const u8{note_str};
+        _ = try active_sink.emit(.{
+            .code = .e0403_unresolved_symbol,
+            .severity = .err,
+            .primary_span = span,
+            .message = msg_owned,
+            .labels = &labels,
+            .notes = &notes,
+        });
+    } else {
+        _ = try active_sink.emit(.{
+            .code = .e0403_unresolved_symbol,
+            .severity = .err,
+            .primary_span = span,
+            .message = msg_owned,
+            .labels = &labels,
+        });
+    }
+}
+
+/// Extracts and validates scoped `@allow(…)` lint names inside `[arg_start .. attr_end)`, rejecting blanket suppressors (`E0403`).
+pub fn extractAndValidateAllowAttrRange(
+    source: []const u8,
+    file_id: FileId,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    at_token: TokenIndex,
+    name_token: TokenIndex,
+    arg_start: usize,
+    attr_end: usize,
+    diagnostic_sink: ?*DiagnosticSink,
+) !AllowLintMask {
+    const name_span = if (!name_token.isNone() and name_token.asInt() < token_buffer.countTokens())
+        token_buffer.getTokenSpan(file_id, name_token)
+    else
+        Span.ZERO;
+    const attr_head_span: Span = if (!at_token.isNone() and at_token.asInt() < token_buffer.countTokens() and
+        !name_span.file_id.isNone())
+    blk: {
+        const at_span = token_buffer.getTokenSpan(file_id, at_token);
+        if (at_span.file_id == name_span.file_id and at_span.start_byte <= name_span.end_byte) {
+            break :blk Span.init(file_id, at_span.start_byte, name_span.end_byte);
+        }
+        break :blk name_span;
+    } else name_span;
+
+    const first_tok = peekNextAttrLeafToken(token_buffer, cst_arena, arg_start, attr_end);
+    if (first_tok.isNone() or token_buffer.getToken(first_tok).kind != .lparen) {
+        try emitInvalidAllowAttrDiagnostic(
+            diagnostic_sink,
+            attr_head_span,
+            "bare `@allow` without explicit lint names is forbidden (`AGENTS.md` §1); write `@allow(W0402)` or similar",
+            "expected `(lint_name)` argument list after `@allow`",
+            null,
+        );
+        return .{};
+    }
+
+    var mask = AllowLintMask{};
+    var seen_arg_count: u32 = 0;
+    var paren_depth: u32 = 0;
+    var arg_cur = arg_start;
+    while (arg_cur < attr_end) : (arg_cur += 1) {
+        const arg_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cur)));
+        if (arg_leaf.subtree_size > 1 or arg_leaf.flags.is_missing_or_injected or
+            arg_leaf.token.isNone() or arg_leaf.token.asInt() >= token_buffer.countTokens())
+        {
+            continue;
+        }
+        const tok_kind = token_buffer.getToken(arg_leaf.token).kind;
+        if (tok_kind == .lparen) {
+            paren_depth += 1;
+            continue;
+        }
+        if (tok_kind == .rparen) {
+            if (paren_depth <= 1) break;
+            paren_depth -= 1;
+            continue;
+        }
+        if (tok_kind == .comma) continue;
+
+        seen_arg_count += 1;
+        const tok_span = token_buffer.getTokenSpan(file_id, arg_leaf.token);
+        const raw_lex = extractTokenSlice(source, token_buffer, arg_leaf.token);
+        if (tok_kind == .star or std.mem.eql(u8, raw_lex, "all") or std.mem.eql(u8, raw_lex, "warnings")) {
+            var msg_buf: [200]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &msg_buf,
+                "blanket `@allow({s})` suppressor is forbidden (`AGENTS.md` §1); specify an explicit lint code or name",
+                .{raw_lex},
+            ) catch "blanket `@allow` suppressor is forbidden (`AGENTS.md` §1)";
+            try emitInvalidAllowAttrDiagnostic(
+                diagnostic_sink,
+                tok_span,
+                msg,
+                "blanket lint suppression is forbidden",
+                null,
+            );
+            continue;
+        }
+        if (!isIdentifierToken(tok_kind)) {
+            try emitInvalidAllowAttrDiagnostic(
+                diagnostic_sink,
+                tok_span,
+                "`@allow(…)` argument must be a recognized lint identifier (e.g., `W0402`, `unused`, `deprecated`)",
+                "expected lint identifier here",
+                null,
+            );
+            continue;
+        }
+        if (AllowLintMask.fromLintName(raw_lex)) |lint_bit| {
+            mask = mask.merge(lint_bit);
+        } else {
+            var msg_buf: [200]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &msg_buf,
+                "unknown `@allow` lint `{s}`; expected `W0201`–`W0202` or `W0401`–`W0403`",
+                .{raw_lex},
+            ) catch "unknown lint identifier in `@allow(…)`";
+            try emitInvalidAllowAttrDiagnostic(
+                diagnostic_sink,
+                tok_span,
+                msg,
+                "unknown lint identifier",
+                raw_lex,
+            );
+        }
+    }
+
+    if (seen_arg_count == 0) {
+        try emitInvalidAllowAttrDiagnostic(
+            diagnostic_sink,
+            attr_head_span,
+            "empty `@allow()` is forbidden (`AGENTS.md` §1); specify at least one explicit lint code or name",
+            "empty `@allow()` attribute",
+            null,
+        );
+    }
+    return mask;
+}
+
+/// Decodes and interns an attribute string literal token `str_tok` into `interner` (`SymbolId.empty` when `interner == null`).
+fn internDecodedAttrStringToken(
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    str_tok: TokenIndex,
+    interner_opt: ?*StringInterner,
+) !SymbolId {
+    const str_interner = interner_opt orelse return .empty;
+    const raw_str = extractTokenSlice(source, token_buffer, str_tok);
+    if (raw_str.len == 0) return .empty;
+    var stack_buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
+    if (lexer.cookStringLiteral(fba.allocator(), raw_str)) |cooked_stack| {
+        return str_interner.intern(cooked_stack);
+    } else |_| {}
+    const backing = str_interner.backing_allocator;
+    if (lexer.cookStringLiteral(backing, raw_str)) |cooked_heap| {
+        defer backing.free(cooked_heap);
+        return str_interner.intern(cooked_heap);
+    } else |_| {
+        var unesc_buf: [256]u8 = undefined;
+        return str_interner.intern(unquoteAttrStringLexeme(raw_str, &unesc_buf));
+    }
+}
+
+/// Parses `@deprecated` and `@fix_inline` arguments inside `[arg_start .. attr_end)` into `meta_io` (`DR-14` §2.2).
+pub fn parseDeprecatedOrFixInlineAttrRange(
+    source: []const u8,
+    file_id: FileId,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    interner_opt: ?*StringInterner,
+    is_fix_inline: bool,
+    at_token: TokenIndex,
+    name_token: TokenIndex,
+    arg_start: usize,
+    attr_end: usize,
+    meta_io: *DeprecatedMeta,
+    has_meta_io: *bool,
+) !void {
+    var end_tok = name_token;
+    var scan_cur = arg_start;
+    while (scan_cur < attr_end) : (scan_cur += 1) {
+        const sub = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(scan_cur)));
+        if (sub.subtree_size <= 1 and !sub.flags.is_missing_or_injected and
+            !sub.token.isNone() and sub.token.asInt() < token_buffer.countTokens())
+        {
+            const rec = token_buffer.getToken(sub.token);
+            if (!rec.flags.is_synthesized) end_tok = sub.token;
+        }
+    }
+    const attr_span: Span = if (!file_id.isNone() and !name_token.isNone() and
+        name_token.asInt() < token_buffer.countTokens())
+    blk: {
+        const start_tok = if (!at_token.isNone() and at_token.asInt() < token_buffer.countTokens())
+            at_token
+        else
+            name_token;
+        const start_sp = token_buffer.getTokenSpan(file_id, start_tok);
+        const end_sp = token_buffer.getTokenSpan(file_id, end_tok);
+        break :blk Span.init(file_id, start_sp.start_byte, @max(start_sp.end_byte, end_sp.end_byte));
+    } else Span.ZERO;
+
+    if (!has_meta_io.*) {
+        meta_io.* = .{
+            .attr_span = attr_span,
+            .is_deprecated = !is_fix_inline,
+        };
+        has_meta_io.* = true;
+    } else {
+        if (!is_fix_inline) {
+            meta_io.is_deprecated = true;
+            meta_io.attr_span = attr_span;
+        } else if (meta_io.attr_span.file_id.isNone()) {
+            meta_io.attr_span = attr_span;
+        }
+    }
+
+    const first_tok = peekNextAttrLeafToken(token_buffer, cst_arena, arg_start, attr_end);
+    if (first_tok.isNone() or token_buffer.getToken(first_tok).kind != .lparen) return;
+
+    var pending_key: []const u8 = "";
+    var has_key_sep = false;
+    var positional_index: u32 = 0;
+    var paren_depth: u32 = 0;
+    var cur = arg_start;
+    while (cur < attr_end) : (cur += 1) {
+        const leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+        if (leaf.subtree_size > 1 or leaf.flags.is_missing_or_injected or
+            leaf.token.isNone() or leaf.token.asInt() >= token_buffer.countTokens())
+        {
+            continue;
+        }
+        const tok_kind = token_buffer.getToken(leaf.token).kind;
+        if (tok_kind == .lparen) {
+            paren_depth += 1;
+            continue;
+        }
+        if (tok_kind == .rparen) {
+            if (paren_depth <= 1) break;
+            paren_depth -= 1;
+            continue;
+        }
+        if (paren_depth != 1) continue;
+        if (tok_kind == .comma) {
+            pending_key = "";
+            has_key_sep = false;
+            continue;
+        }
+        if ((tok_kind == .colon or tok_kind == .eq) and pending_key.len > 0) {
+            has_key_sep = true;
+            continue;
+        }
+        if (!has_key_sep and isIdentifierToken(tok_kind)) {
+            const next_tok = peekNextAttrLeafToken(token_buffer, cst_arena, cur + 1, attr_end);
+            const next_kind: TokenKind = if (!next_tok.isNone()) token_buffer.getToken(next_tok).kind else .eof;
+            if (next_kind == .colon or next_kind == .eq) {
+                pending_key = extractTokenSlice(source, token_buffer, leaf.token);
+                continue;
+            }
+        }
+        if (tok_kind == .string_lit) {
+            const interned_val = try internDecodedAttrStringToken(source, token_buffer, leaf.token, interner_opt);
+            if (has_key_sep) {
+                if (is_fix_inline) {
+                    if (std.mem.eql(u8, pending_key, "template") or std.mem.eql(u8, pending_key, "upgrade")) {
+                        meta_io.upgrade_sym = interned_val;
+                    }
+                } else if (std.mem.eql(u8, pending_key, "since")) {
+                    meta_io.since_sym = interned_val;
+                } else if (std.mem.eql(u8, pending_key, "reason")) {
+                    meta_io.reason_sym = interned_val;
+                } else if (std.mem.eql(u8, pending_key, "upgrade")) {
+                    meta_io.upgrade_sym = interned_val;
+                }
+            } else if (positional_index == 0) {
+                if (is_fix_inline) {
+                    meta_io.upgrade_sym = interned_val;
+                } else {
+                    meta_io.reason_sym = interned_val;
+                }
+                positional_index += 1;
+            }
+            pending_key = "";
+            has_key_sep = false;
+        }
+    }
+}
+
+/// Scans `cst_arena` in $O(N)$ to collect all lexical `AllowedSpanEntry` ranges carrying valid `@allow(…)` attributes.
+pub fn collectAllowedSpansFromCst(
+    allocator: std.mem.Allocator,
+    file_id: FileId,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+) ![]AllowedSpanEntry {
+    var entries: std.ArrayListUnmanaged(AllowedSpanEntry) = .empty;
+    errdefer entries.deinit(allocator);
+
+    const total_nodes = cst_arena.countNodes();
+    const total_tokens = token_buffer.countTokens();
+    var node_cur: usize = 0;
+    while (node_cur < total_nodes) : (node_cur += 1) {
+        const owner_cst = CstNodeIndex.fromInt(@intCast(node_cur));
+        const owner_rec = cst_arena.getNode(owner_cst);
+        if (owner_rec.subtree_size <= 1 or owner_rec.kind == .attribute or owner_rec.kind == .file_end) continue;
+
+        const owner_end = @min(node_cur + @as(usize, owner_rec.subtree_size), total_nodes);
+        var owner_mask = AllowLintMask{};
+        var child_cur = node_cur + 1;
+        while (child_cur < owner_end) {
+            const child_rec = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(child_cur)));
+            if (child_rec.kind == .visibility_modifier) {
+                child_cur += @max(@as(usize, child_rec.subtree_size), 1);
+                continue;
+            }
+            if (child_rec.kind != .attribute) break;
+
+            const attr_end = @min(child_cur + @max(@as(usize, child_rec.subtree_size), 1), owner_end);
+            var at_tok: TokenIndex = .none;
+            var attr_cur = child_cur + 1;
+            while (attr_cur < attr_end) : (attr_cur += 1) {
+                const leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(attr_cur)));
+                if (leaf.subtree_size <= 1 and !leaf.token.isNone() and leaf.token.asInt() < total_tokens) {
+                    const lk = token_buffer.getToken(leaf.token).kind;
+                    if (lk == .at and at_tok.isNone()) {
+                        at_tok = leaf.token;
+                        continue;
+                    }
+                    if (isIdentifierToken(lk)) {
+                        if (std.mem.eql(u8, extractTokenSlice(source, token_buffer, leaf.token), "allow")) {
+                            const parsed = try extractAndValidateAllowAttrRange(
+                                source,
+                                file_id,
+                                token_buffer,
+                                cst_arena,
+                                at_tok,
+                                leaf.token,
+                                attr_cur + 1,
+                                attr_end,
+                                null,
+                            );
+                            owner_mask = owner_mask.merge(parsed);
+                        }
+                        break;
+                    }
+                }
+            }
+            child_cur = attr_end;
+        }
+
+        if (!owner_mask.isEmpty()) {
+            if (computeCstSubtreeSpan(file_id, token_buffer, cst_arena, owner_cst)) |owner_span| {
+                try entries.append(allocator, .{ .span = owner_span, .mask = owner_mask });
+            }
+        }
+    }
+    return entries.toOwnedSlice(allocator);
+}
+
+/// Returns the combined `AllowLintMask` covering `target_span` across `entries`.
+pub fn getAllowedMaskAtSpan(entries: []const AllowedSpanEntry, target_span: Span) AllowLintMask {
+    var combined = AllowLintMask{};
+    if (target_span.file_id.isNone()) return combined;
+    for (entries) |entry| {
+        if (entry.span.file_id == target_span.file_id and
+            entry.span.start_byte <= target_span.start_byte and
+            target_span.end_byte <= entry.span.end_byte)
+        {
+            combined = combined.merge(entry.mask);
+        }
+    }
+    return combined;
+}
+
+/// Human-readable noun describing `kind` in `W0403` diagnostics.
+pub fn describeDeprecatedSymbolKind(kind: SymbolKind) []const u8 {
+    return switch (kind) {
+        .module_sym => "module",
+        .fn_sym, .overload_group_sym => "function",
+        .struct_sym => "struct",
+        .enum_sym => "enum",
+        .union_sym => "union",
+        .bit_field_sym => "bit_field",
+        .trait_sym => "trait",
+        .type_alias_sym, .distinct_type_sym, .refined_type_sym, .type_group_sym => "type",
+        .const_sym => "constant",
+        .extern_static_sym => "static",
+        .field_sym => "field",
+        .enum_variant_sym => "variant",
+        else => "symbol",
+    };
+}
+
+/// Formats and emits a `W0403` (`w0403_deprecated_symbol`) warning into `sink` with optional `suggested_fix`.
+pub fn emitDeprecatedSymbolWarning(
+    sink: *DiagnosticSink,
+    interner: *const StringInterner,
+    sym: *const SymbolRecord,
+    meta: DeprecatedMeta,
+    ref_span: Span,
+    suggested_fix: ?SuggestedFix,
+) !void {
+    if (!meta.is_deprecated or ref_span.file_id.isNone()) return;
+    const arena_alloc = sink.arena.asAllocator();
+    const kind_noun = describeDeprecatedSymbolKind(sym.kind);
+    const since_str = if (meta.since_sym != .empty) interner.get(meta.since_sym) else "";
+    const reason_str = if (meta.reason_sym != .empty) interner.get(meta.reason_sym) else "";
+    const upgrade_str = if (meta.upgrade_sym != .empty) interner.get(meta.upgrade_sym) else "";
+
+    const message = if (since_str.len > 0 and reason_str.len > 0)
+        try std.fmt.allocPrint(
+            arena_alloc,
+            "use of deprecated {s} `{s}` (since {s}): {s}",
+            .{ kind_noun, sym.name_text, since_str, reason_str },
+        )
+    else if (reason_str.len > 0)
+        try std.fmt.allocPrint(
+            arena_alloc,
+            "use of deprecated {s} `{s}`: {s}",
+            .{ kind_noun, sym.name_text, reason_str },
+        )
+    else if (since_str.len > 0)
+        try std.fmt.allocPrint(
+            arena_alloc,
+            "use of deprecated {s} `{s}` (since {s})",
+            .{ kind_noun, sym.name_text, since_str },
+        )
+    else
+        try std.fmt.allocPrint(
+            arena_alloc,
+            "use of deprecated {s} `{s}`",
+            .{ kind_noun, sym.name_text },
+        );
+
+    const primary_label = try std.fmt.allocPrint(
+        arena_alloc,
+        "deprecated `{s}` referenced here",
+        .{sym.name_text},
+    );
+
+    const has_same_file_decl = !sym.decl_span.file_id.isNone() and
+        sym.decl_span.file_id == ref_span.file_id and
+        (sym.decl_span.start_byte != ref_span.start_byte or sym.decl_span.end_byte != ref_span.end_byte);
+    const labels_slice: []const LabeledSpan = if (has_same_file_decl) blk_lbl: {
+        const two = try arena_alloc.alloc(LabeledSpan, 2);
+        two[0] = .{ .span = ref_span, .label = primary_label, .style = .primary };
+        two[1] = .{ .span = sym.decl_span, .label = "declared `@deprecated` here", .style = .secondary };
+        break :blk_lbl two;
+    } else blk_lbl: {
+        const one = try arena_alloc.alloc(LabeledSpan, 1);
+        one[0] = .{ .span = ref_span, .label = primary_label, .style = .primary };
+        break :blk_lbl one;
+    };
+
+    var notes_slice: []const []const u8 = &.{};
+    if (suggested_fix == null and upgrade_str.len > 0) {
+        const note_text = try std.fmt.allocPrint(
+            arena_alloc,
+            "help: migrate using template `{s}`",
+            .{upgrade_str},
+        );
+        const notes_arr = try arena_alloc.alloc([]const u8, 1);
+        notes_arr[0] = note_text;
+        notes_slice = notes_arr;
+    }
+
+    var fixes_slice: []const SuggestedFix = &.{};
+    if (suggested_fix) |fix_val| {
+        const duped_edits = try arena_alloc.dupe(TextEdit, fix_val.edits);
+        const duped_msg = try arena_alloc.dupe(u8, fix_val.message);
+        const fix_arr = try arena_alloc.alloc(SuggestedFix, 1);
+        fix_arr[0] = .{
+            .message = duped_msg,
+            .applicability = fix_val.applicability,
+            .priority = fix_val.priority,
+            .edits = duped_edits,
+        };
+        fixes_slice = fix_arr;
+    }
+
+    _ = try sink.emit(.{
+        .code = .w0403_deprecated_symbol,
+        .severity = .warning,
+        .primary_span = ref_span,
+        .message = message,
+        .labels = labels_slice,
+        .notes = notes_slice,
+        .suggestions = fixes_slice,
+    });
+}
+
 /// Recursively checks `.use_tree` root segments in an external package (`PackageId >= 2`) for `core` (`E0218`).
 fn checkExternalUseTreeCoreImports(
     interner: *StringInterner,
@@ -8372,6 +9314,7 @@ fn collectStructOrBitFieldMembers(
     interner: *StringInterner,
     file_id: FileId,
     member_scope: ScopeId,
+    owner_def_id: DefId,
     item_cst: CstNodeIndex,
     source: []const u8,
     token_buffer: *const TokenBuffer,
@@ -8398,23 +9341,77 @@ fn collectStructOrBitFieldMembers(
             var bit_width: u16 = 0;
             var has_seen_pipe = false;
             var has_field_cfg = false;
+            var field_allow_mask = AllowLintMask{};
+            var field_dep_meta = DeprecatedMeta{};
+            var has_field_dep = false;
 
             var inner_cur = cursor + 1;
             while (inner_cur < field_end) : (inner_cur += 1) {
                 const sub = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(inner_cur)));
                 if (sub.kind == .attribute) {
                     const attr_end = @min(inner_cur + @max(@as(usize, sub.subtree_size), 1), field_end);
+                    var at_tok: TokenIndex = .none;
                     var attr_cur = inner_cur + 1;
                     while (attr_cur < attr_end) : (attr_cur += 1) {
                         const leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(attr_cur)));
                         if (leaf.subtree_size <= 1 and !leaf.token.isNone() and
-                            leaf.token.asInt() < token_buffer.countTokens() and
-                            isIdentifierToken(token_buffer.getToken(leaf.token).kind))
+                            leaf.token.asInt() < token_buffer.countTokens())
                         {
-                            if (std.mem.eql(u8, extractTokenSlice(source, token_buffer, leaf.token), "cfg")) {
-                                has_field_cfg = true;
+                            const lk = token_buffer.getToken(leaf.token).kind;
+                            if (lk == .at and at_tok.isNone()) {
+                                at_tok = leaf.token;
+                                continue;
                             }
-                            break;
+                            if (isIdentifierToken(lk)) {
+                                const attr_lex = extractTokenSlice(source, token_buffer, leaf.token);
+                                if (std.mem.eql(u8, attr_lex, "cfg")) {
+                                    has_field_cfg = true;
+                                } else if (std.mem.eql(u8, attr_lex, "allow")) {
+                                    const parsed_allow = try extractAndValidateAllowAttrRange(
+                                        source,
+                                        file_id,
+                                        token_buffer,
+                                        cst_arena,
+                                        at_tok,
+                                        leaf.token,
+                                        attr_cur + 1,
+                                        attr_end,
+                                        diagnostic_sink,
+                                    );
+                                    field_allow_mask = field_allow_mask.merge(parsed_allow);
+                                } else if (std.mem.eql(u8, attr_lex, "deprecated")) {
+                                    try parseDeprecatedOrFixInlineAttrRange(
+                                        source,
+                                        file_id,
+                                        token_buffer,
+                                        cst_arena,
+                                        interner,
+                                        false,
+                                        at_tok,
+                                        leaf.token,
+                                        attr_cur + 1,
+                                        attr_end,
+                                        &field_dep_meta,
+                                        &has_field_dep,
+                                    );
+                                } else if (std.mem.eql(u8, attr_lex, "fix_inline")) {
+                                    try parseDeprecatedOrFixInlineAttrRange(
+                                        source,
+                                        file_id,
+                                        token_buffer,
+                                        cst_arena,
+                                        interner,
+                                        true,
+                                        at_tok,
+                                        leaf.token,
+                                        attr_cur + 1,
+                                        attr_end,
+                                        &field_dep_meta,
+                                        &has_field_dep,
+                                    );
+                                }
+                                break;
+                            }
                         }
                     }
                     if (sub.subtree_size > 1) {
@@ -8465,20 +9462,29 @@ fn collectStructOrBitFieldMembers(
                 const field_name = extractTokenSlice(source, token_buffer, field_tok);
                 if (field_name.len > 0) {
                     const field_sym = try interner.intern(field_name);
-                    _ = try sym_table.defineSymbol(.{
+                    const is_field_dep = has_field_dep and field_dep_meta.is_deprecated;
+                    const field_sym_idx = try sym_table.defineSymbol(.{
                         .name = field_sym,
                         .name_text = interner.get(field_sym),
                         .kind = .field_sym,
                         .namespace = .value_ns,
                         .visibility = field_vis,
                         .flags = .{ .is_pub = (field_vis == .public) },
+                        .extra_flags = .{ .is_deprecated = is_field_dep },
                         .scope_id = member_scope,
+                        .owner_def_id = owner_def_id,
                         .cst_node = cst_id,
                         .decl_span = token_buffer.getTokenSpan(file_id, field_tok),
                         .member_ordinal = ordinal,
                         .bit_width = bit_width,
                         .has_cfg_attr = has_field_cfg,
                     }, diagnostic_sink);
+                    if (!field_allow_mask.isEmpty()) {
+                        try sym_table.mergeSymbolAllowMask(field_sym_idx, field_allow_mask);
+                    }
+                    if (has_field_dep) {
+                        try sym_table.setDeprecatedMeta(field_sym_idx, field_dep_meta);
+                    }
                     ordinal +|= 1;
                 }
             }
@@ -8495,6 +9501,7 @@ fn collectEnumVariants(
     interner: *StringInterner,
     file_id: FileId,
     variant_scope: ScopeId,
+    owner_def_id: DefId,
     enum_visibility: Visibility,
     item_cst: CstNodeIndex,
     source: []const u8,
@@ -8520,12 +9527,16 @@ fn collectEnumVariants(
             var var_tok: TokenIndex = .none;
             var is_var_from_error = false;
             var has_var_cfg = false;
+            var var_allow_mask = AllowLintMask{};
+            var var_dep_meta = DeprecatedMeta{};
+            var has_var_dep = false;
 
             var inner_cur = cursor + 1;
             while (inner_cur < var_end) : (inner_cur += 1) {
                 const sub = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(inner_cur)));
                 if (sub.kind == .attribute) {
                     const attr_end = @min(inner_cur + @max(@as(usize, sub.subtree_size), 1), var_end);
+                    var at_tok: TokenIndex = .none;
                     var attr_cur = inner_cur + 1;
                     while (attr_cur < attr_end) : (attr_cur += 1) {
                         const leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(attr_cur)));
@@ -8533,12 +9544,59 @@ fn collectEnumVariants(
                             leaf.token.asInt() < token_buffer.countTokens())
                         {
                             const attr_tok_kind = token_buffer.getToken(leaf.token).kind;
+                            if (attr_tok_kind == .at and at_tok.isNone()) {
+                                at_tok = leaf.token;
+                                continue;
+                            }
                             if (isIdentifierToken(attr_tok_kind)) {
                                 const attr_lex = extractTokenSlice(source, token_buffer, leaf.token);
                                 if (std.mem.eql(u8, attr_lex, "from")) {
                                     is_var_from_error = true;
                                 } else if (std.mem.eql(u8, attr_lex, "cfg")) {
                                     has_var_cfg = true;
+                                } else if (std.mem.eql(u8, attr_lex, "allow")) {
+                                    const parsed_allow = try extractAndValidateAllowAttrRange(
+                                        source,
+                                        file_id,
+                                        token_buffer,
+                                        cst_arena,
+                                        at_tok,
+                                        leaf.token,
+                                        attr_cur + 1,
+                                        attr_end,
+                                        diagnostic_sink,
+                                    );
+                                    var_allow_mask = var_allow_mask.merge(parsed_allow);
+                                } else if (std.mem.eql(u8, attr_lex, "deprecated")) {
+                                    try parseDeprecatedOrFixInlineAttrRange(
+                                        source,
+                                        file_id,
+                                        token_buffer,
+                                        cst_arena,
+                                        interner,
+                                        false,
+                                        at_tok,
+                                        leaf.token,
+                                        attr_cur + 1,
+                                        attr_end,
+                                        &var_dep_meta,
+                                        &has_var_dep,
+                                    );
+                                } else if (std.mem.eql(u8, attr_lex, "fix_inline")) {
+                                    try parseDeprecatedOrFixInlineAttrRange(
+                                        source,
+                                        file_id,
+                                        token_buffer,
+                                        cst_arena,
+                                        interner,
+                                        true,
+                                        at_tok,
+                                        leaf.token,
+                                        attr_cur + 1,
+                                        attr_end,
+                                        &var_dep_meta,
+                                        &has_var_dep,
+                                    );
                                 }
                                 break;
                             }
@@ -8564,7 +9622,8 @@ fn collectEnumVariants(
                 const var_name = extractTokenSlice(source, token_buffer, var_tok);
                 if (var_name.len > 0) {
                     const var_sym = try interner.intern(var_name);
-                    _ = try sym_table.defineSymbol(.{
+                    const is_var_dep = has_var_dep and var_dep_meta.is_deprecated;
+                    const var_sym_idx = try sym_table.defineSymbol(.{
                         .name = var_sym,
                         .name_text = interner.get(var_sym),
                         .kind = .enum_variant_sym,
@@ -8574,12 +9633,20 @@ fn collectEnumVariants(
                             .is_pub = (enum_visibility == .public),
                             .is_from_error = is_var_from_error,
                         },
+                        .extra_flags = .{ .is_deprecated = is_var_dep },
                         .scope_id = variant_scope,
+                        .owner_def_id = owner_def_id,
                         .cst_node = cst_id,
                         .decl_span = token_buffer.getTokenSpan(file_id, var_tok),
                         .member_ordinal = ordinal,
                         .has_cfg_attr = has_var_cfg,
                     }, diagnostic_sink);
+                    if (!var_allow_mask.isEmpty()) {
+                        try sym_table.mergeSymbolAllowMask(var_sym_idx, var_allow_mask);
+                    }
+                    if (has_var_dep) {
+                        try sym_table.setDeprecatedMeta(var_sym_idx, var_dep_meta);
+                    }
                     ordinal +|= 1;
                 }
             }
@@ -8644,6 +9711,40 @@ pub fn evaluateCstNodeCfgWithEnv(
     return is_all_enabled;
 }
 
+/// Emits `W0403` into `sink` when `raw_sym_idx` unwraps to a `@deprecated` symbol and `is_suppressed` is `false`.
+fn emitUseOrPathDeprecatedIfNeeded(
+    sym_table: *const SymbolTable,
+    interner: *const StringInterner,
+    caller_scope: ScopeId,
+    is_suppressed: bool,
+    raw_sym_idx: SymbolIndex,
+    ref_span: Span,
+    diagnostic_sink: ?*DiagnosticSink,
+) !void {
+    if (is_suppressed or raw_sym_idx.isNone() or ref_span.file_id.isNone()) return;
+    const sink = diagnostic_sink orelse return;
+    if (sym_table.scope_arena.isInsideDeprecated(caller_scope)) return;
+    if (sym_table.getScopeAllowMask(caller_scope).allow_deprecated_w0403) return;
+
+    const target_idx = if (sym_table.getDeprecatedMeta(raw_sym_idx) != null)
+        raw_sym_idx
+    else
+        sym_table.unwrapAliasSymbolIdx(raw_sym_idx);
+    const meta = sym_table.getDeprecatedMeta(target_idx) orelse return;
+    if (!meta.is_deprecated) return;
+
+    for (sink.asSlice()) |existing| {
+        if (existing.code == .w0403_deprecated_symbol and
+            existing.primary_span.file_id == ref_span.file_id and
+            existing.primary_span.start_byte == ref_span.start_byte and
+            existing.primary_span.end_byte == ref_span.end_byte)
+        {
+            return;
+        }
+    }
+    try emitDeprecatedSymbolWarning(sink, interner, sym_table.getSymbol(target_idx), meta, ref_span, null);
+}
+
 /// Resolves all queued `PendingUseImport` entries in `sym_table` for `file_id`.
 pub fn resolveFileUseImports(
     sym_table: *SymbolTable,
@@ -8661,13 +9762,17 @@ pub fn resolveFileUseImports(
         if (pending.file_id != file_id) continue;
         if (pending.cst_node.isNone() or pending.cst_node.asInt() >= cst_arena.countNodes()) continue;
 
-        const has_use_cfg = extractItemHeaderMetadata(
+        const use_header_meta = try extractItemHeaderMetadataWithInterner(
             source,
+            pending.file_id,
             token_buffer,
             cst_arena,
             pending.cst_node,
             .none,
-        ).has_cfg_attr;
+            interner,
+            diagnostic_sink,
+        );
+        const has_use_cfg = use_header_meta.has_cfg_attr;
         if (has_use_cfg) {
             const is_use_enabled = try evaluateCstNodeCfgWithEnv(
                 &effective_cfg,
@@ -8681,6 +9786,8 @@ pub fn resolveFileUseImports(
             if (!is_use_enabled) continue;
         }
 
+        const is_dep_suppressed = use_header_meta.extra_flags.is_deprecated or
+            use_header_meta.allow_mask.allow_deprecated_w0403;
         const root_idx: usize = pending.cst_node.asInt();
         const root_rec = cst_arena.getNode(pending.cst_node);
         const end_idx: usize = @min(
@@ -8704,6 +9811,8 @@ pub fn resolveFileUseImports(
                     pending.visibility,
                     pending.cst_node,
                     has_use_cfg,
+                    is_dep_suppressed,
+                    &use_header_meta,
                     node_id,
                     source,
                     token_buffer,
@@ -8728,6 +9837,8 @@ fn resolveUseTreeCst(
     visibility: Visibility,
     use_item_cst: CstNodeIndex,
     has_use_cfg: bool,
+    is_dep_suppressed: bool,
+    use_header_meta: *const ItemHeaderMetadata,
     tree_cst: CstNodeIndex,
     source: []const u8,
     token_buffer: *const TokenBuffer,
@@ -8827,7 +9938,7 @@ fn resolveUseTreeCst(
             const prefix_scope = if (cached_prefix_scope) |cached_scope|
                 cached_scope
             else blk: {
-                const resolved_scope = try resolveModulePathSegments(
+                const resolved_scope = try resolveModulePathSegmentsWithOpts(
                     sym_table,
                     interner,
                     file_id,
@@ -8837,6 +9948,7 @@ fn resolveUseTreeCst(
                     source,
                     token_buffer,
                     diagnostic_sink,
+                    is_dep_suppressed,
                 );
                 cached_prefix_scope = resolved_scope;
                 break :blk resolved_scope;
@@ -8854,6 +9966,8 @@ fn resolveUseTreeCst(
                     visibility,
                     use_item_cst,
                     has_use_cfg,
+                    is_dep_suppressed,
+                    use_header_meta,
                     sub_id,
                     source,
                     token_buffer,
@@ -8893,7 +10007,7 @@ fn resolveUseTreeCst(
 
     // [1] Glob import (`use prefix.*;`):
     if (is_glob) {
-        const target_scope = try resolveModulePathSegments(
+        const target_scope = try resolveModulePathSegmentsWithOpts(
             sym_table,
             interner,
             file_id,
@@ -8903,6 +10017,7 @@ fn resolveUseTreeCst(
             source,
             token_buffer,
             diagnostic_sink,
+            is_dep_suppressed,
         );
         if (target_scope.isNone()) return;
 
@@ -9094,7 +10209,7 @@ fn resolveUseTreeCst(
 
     // [4] Single path import (`use prefix.Item [as Alias];`):
     const prefix_scope = if (seg_count > 1)
-        try resolveModulePathSegments(
+        try resolveModulePathSegmentsWithOpts(
             sym_table,
             interner,
             file_id,
@@ -9104,6 +10219,7 @@ fn resolveUseTreeCst(
             source,
             token_buffer,
             diagnostic_sink,
+            is_dep_suppressed,
         )
     else
         current_lookup_scope;
@@ -9120,6 +10236,15 @@ fn resolveUseTreeCst(
     switch (lookup_res) {
         .found => |resolved_idx| {
             sym_table.markSymbolUsed(resolved_idx);
+            try emitUseOrPathDeprecatedIfNeeded(
+                sym_table,
+                interner,
+                dest_module_scope,
+                is_dep_suppressed,
+                resolved_idx,
+                final_span,
+                diagnostic_sink,
+            );
             const target_rec = sym_table.getSymbol(resolved_idx).*;
             const bind_tok = if (!alias_tok.isNone()) alias_tok else final_tok;
             const bind_lexeme = extractTokenSlice(source, token_buffer, bind_tok);
@@ -9151,7 +10276,7 @@ fn resolveUseTreeCst(
                 }
                 effective_alias_vis = max_allowed_vis;
             }
-            _ = try sym_table.defineSymbol(.{
+            const alias_sym_idx = try sym_table.defineSymbol(.{
                 .name = bind_sym_id,
                 .name_text = interner.get(bind_sym_id),
                 .kind = .use_alias_sym,
@@ -9162,6 +10287,9 @@ fn resolveUseTreeCst(
                     .is_used = true,
                     .is_imported = true,
                 },
+                .extra_flags = .{
+                    .is_deprecated = use_header_meta.extra_flags.is_deprecated,
+                },
                 .scope_id = dest_module_scope,
                 .def_id = def_id,
                 .cst_node = use_item_cst,
@@ -9171,6 +10299,9 @@ fn resolveUseTreeCst(
                 .target_scope = target_rec.target_scope,
                 .has_cfg_attr = has_use_cfg,
             }, diagnostic_sink);
+            if (use_header_meta.has_deprecated_meta) {
+                try sym_table.setDeprecatedMeta(alias_sym_idx, use_header_meta.deprecated_meta);
+            }
         },
         .private_error => |priv_idx| {
             if (diagnostic_sink) |sink| {
@@ -9242,6 +10373,33 @@ pub fn resolveModulePathSegments(
     token_buffer: *const TokenBuffer,
     diagnostic_sink: ?*DiagnosticSink,
 ) !ScopeId {
+    return resolveModulePathSegmentsWithOpts(
+        sym_table,
+        interner,
+        file_id,
+        caller_scope,
+        initial_scope,
+        segments,
+        source,
+        token_buffer,
+        diagnostic_sink,
+        false,
+    );
+}
+
+/// Resolves `module.submodule` path tokens with explicit `W0403` deprecation suppression control.
+pub fn resolveModulePathSegmentsWithOpts(
+    sym_table: *SymbolTable,
+    interner: *StringInterner,
+    file_id: FileId,
+    caller_scope: ScopeId,
+    initial_scope: ScopeId,
+    segments: []const TokenIndex,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    diagnostic_sink: ?*DiagnosticSink,
+    is_dep_suppressed: bool,
+) !ScopeId {
     var cur_scope = initial_scope;
     for (segments, 0..) |seg_tok, i| {
         const seg_lexeme = extractTokenSlice(source, token_buffer, seg_tok);
@@ -9282,6 +10440,15 @@ pub fn resolveModulePathSegments(
         switch (lookup_res) {
             .found => |sym_idx| {
                 sym_table.markSymbolUsed(sym_idx);
+                try emitUseOrPathDeprecatedIfNeeded(
+                    sym_table,
+                    interner,
+                    caller_scope,
+                    is_dep_suppressed,
+                    sym_idx,
+                    seg_span,
+                    diagnostic_sink,
+                );
                 const sym = sym_table.getSymbol(sym_idx);
                 if (!sym.target_scope.isNone()) {
                     cur_scope = sym.target_scope;

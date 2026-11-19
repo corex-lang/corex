@@ -1,9 +1,10 @@
 //! CoreX Stage 0 Master Verification Suite Runner (`tests/test_runner.zig`)
 //!
 //! Aggregates and executes all Phase 0, Phase 1, Phase 2, Phase 3, Phase 4, Phase 5, Phase 6,
-//! Phase 7, Phase 7.5 (`DR-21`), Phase 7.6 (`DR-22`), Phase 8 (`DR-08`, `DR-10`, `DR-18`), and
-//! Phase 9 (`DR-11`, `DR-16`, `DR-17`) isolated unit tests (`tests/unit/`), golden snapshot tests
-//! (`tests/snapshots/`), deterministic PRNG fuzzers (`tests/fuzz/`), and drift guards (`tests/drift/`).
+//! Phase 7, Phase 7.5 (`DR-21`), Phase 7.6 (`DR-22`), Phase 8 (`DR-08`, `DR-10`, `DR-18`),
+//! Phase 9 (`DR-11`, `DR-16`, `DR-17`), and Phase 10 (`DR-12`, `DR-14`, `DR-17`) isolated unit tests
+//! (`tests/unit/`), golden snapshot tests (`tests/snapshots/`), deterministic PRNG fuzzers
+//! (`tests/fuzz/`), and drift guards (`tests/drift/`).
 //!
 //! Invoked automatically by `zig build test` alongside internal `stage0/src/` module tests.
 
@@ -55,6 +56,10 @@ pub const diff_oracle_test = @import("unit/diff_oracle_test.zig");
 pub const phase8_test = @import("unit/phase8_test.zig");
 /// Comprehensive Phase 9 package manager, global CAS cache, MVS/PubGrub, `.cxi`, & supply-chain sandbox suite.
 pub const phase9_pkg_test = @import("unit/phase9_pkg_test.zig");
+/// Comprehensive Phase 10 built-in LSP 3.17 server (`corex lsp`) end-to-end verification suite.
+pub const phase10_lsp_test = @import("unit/phase10_lsp_test.zig");
+/// Comprehensive Phase 10 `corex check` (`--fix`, `--deny-warnings`, `--caps`, `--explain-caps`) & `corex upgrade` suite.
+pub const phase10_check_upgrade_test = @import("unit/phase10_check_upgrade_test.zig");
 /// Unit tests for `diag/diagnostic.zig` and `diag/renderer.zig` (`DiagnosticSink`, `TransactionalPatcher`).
 pub const diagnostic_test = @import("unit/diagnostic_test.zig");
 /// Unit tests for `cli/style.zig`, `cli/box_draw.zig`, and `cli/router.zig`.
@@ -83,10 +88,12 @@ pub const phase7_diff_backends_fuzz = @import("fuzz/phase7_diff_backends_fuzz.zi
 pub const phase8_ffi_async_fuzz = @import("fuzz/phase8_ffi_async_fuzz.zig");
 /// Phase 9 deterministic PRNG fuzzing suite (MVS/PubGrub vs brute-force oracle, lossless TOML, & CAS/sandbox tampering).
 pub const phase9_pkg_fuzz = @import("fuzz/phase9_pkg_fuzz.zig");
+/// Phase 10 deterministic PRNG fuzzing suite (untrusted JSON-RPC framing, incremental VFS/CST edits, & `upgradeSource` convergence).
+pub const phase10_lsp_upgrade_fuzz = @import("fuzz/phase10_lsp_upgrade_fuzz.zig");
 /// Repository-wide drift guards (zero colored emojis, CLI parity, diagnostic catalog, `< 150` col format).
 pub const drift_guard_test = @import("drift/drift_guard_test.zig");
 
-test "test_runner_references_all_phase0_to_phase9_verification_suites" {
+test "test_runner_references_all_phase0_to_phase10_verification_suites" {
     std.testing.refAllDecls(@This());
     _ = mem_foundation_test;
     _ = vfs_sourcemap_test;
@@ -110,6 +117,8 @@ test "test_runner_references_all_phase0_to_phase9_verification_suites" {
     _ = diff_oracle_test;
     _ = phase8_test;
     _ = phase9_pkg_test;
+    _ = phase10_lsp_test;
+    _ = phase10_check_upgrade_test;
     _ = diagnostic_test;
     _ = cli_router_test;
     _ = bench_harness_test;
@@ -124,5 +133,6 @@ test "test_runner_references_all_phase0_to_phase9_verification_suites" {
     _ = phase7_diff_backends_fuzz;
     _ = phase8_ffi_async_fuzz;
     _ = phase9_pkg_fuzz;
+    _ = phase10_lsp_upgrade_fuzz;
     _ = drift_guard_test;
 }

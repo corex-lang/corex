@@ -19,11 +19,13 @@
 
 const std = @import("std");
 const mem_foundation = @import("mem_foundation.zig");
+const vfs_sourcemap = @import("vfs_sourcemap.zig");
 const syntax_arenas = @import("syntax_arenas.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 
 const FileId = mem_foundation.FileId;
+const LineIndex = vfs_sourcemap.LineIndex;
 const TokenKind = syntax_arenas.TokenKind;
 const TokenIndex = mem_foundation.TokenIndex;
 const TokenBuffer = syntax_arenas.TokenBuffer;
@@ -394,6 +396,16 @@ pub const DocArena = struct {
         const end: usize = start + inst.flat_width;
         return self.string_bytes.items[start..end];
     }
+
+    /// Emits a zero-width `.nop` range-anchor marker (`RANGE_ANCHOR_START` or `RANGE_ANCHOR_END`).
+    pub fn emitRangeAnchor(self: *DocArena, anchor_kind: u8) !void {
+        try self.instructions.append(self.allocator, .{
+            .op = .nop,
+            .mode_or_delta = anchor_kind,
+            .flat_width = 0,
+            .payload = 0,
+        });
+    }
 };
 
 /// Single-pass $O(N)$ linear renderer executing a `DocArena` into formatted UTF-8 source text.
@@ -420,6 +432,10 @@ pub const DocRenderer = struct {
     consecutive_newlines: u8 = 0,
     /// Whether the renderer is positioned at the start of a fresh line awaiting deferred indent.
     is_at_line_start: bool = true,
+    /// Recorded byte offset in `out` when `RANGE_ANCHOR_START` fired (`null` if unset).
+    range_start_byte: ?usize = null,
+    /// Recorded byte offset in `out` when `RANGE_ANCHOR_END` fired (`null` if unset).
+    range_end_byte: ?usize = null,
 
     /// Initializes a `DocRenderer` bound to `allocator` and `max_line_width`.
     pub fn init(allocator: std.mem.Allocator, max_line_width: u16) DocRenderer {
@@ -591,15 +607,13 @@ pub const DocRenderer = struct {
         self.consecutive_newlines = 0;
     }
 
-    /// Flushes all queued `line_suffix` comments and emits a line break (or blank line).
-    pub fn flushNewline(self: *DocRenderer, is_blank_line: bool) !void {
-        // Strip any trailing horizontal spaces before flushing `line_suffix` or `\n`:
+    /// Strips trailing horizontal spaces and flushes `line_suffix_queue` inline without emitting `\n`.
+    fn flushQueuedLineSuffixesInline(self: *DocRenderer) !void {
         while (self.out.items.len > 0 and self.out.items[self.out.items.len - 1] == ' ') {
             _ = self.out.pop();
             self.current_col -|= 1;
         }
 
-        // [1] Flush queued `line_suffix` comments before emitting `\n`:
         if (self.line_suffix_queue.items.len > 0) {
             if (self.is_at_line_start) {
                 try self.out.appendNTimes(self.allocator, ' ', self.pending_indent_spaces);
@@ -621,6 +635,12 @@ pub const DocRenderer = struct {
             }
             self.line_suffix_queue.clearRetainingCapacity();
         }
+    }
+
+    /// Flushes all queued `line_suffix` comments and emits a line break (or blank line).
+    pub fn flushNewline(self: *DocRenderer, is_blank_line: bool) !void {
+        // [1] Flush queued `line_suffix` comments before emitting `\n`:
+        try self.flushQueuedLineSuffixesInline();
 
         // [2] Avoid emitting leading newlines at the very start of the file:
         if (self.out.items.len == 0) {
@@ -659,10 +679,24 @@ pub const DocRenderer = struct {
         self.current_line_indent = 0;
         self.consecutive_newlines = 0;
         self.is_at_line_start = true;
+        self.range_start_byte = null;
+        self.range_end_byte = null;
 
         for (arena.instructions.items) |inst| {
             switch (inst.op) {
-                .nop => {},
+                .nop => {
+                    if (inst.mode_or_delta == RANGE_ANCHOR_START) {
+                        self.range_start_byte = self.out.items.len;
+                    } else if (inst.mode_or_delta == RANGE_ANCHOR_END) {
+                        try self.flushQueuedLineSuffixesInline();
+                        var end_pos = self.out.items.len;
+                        const min_pos = self.range_start_byte orelse 0;
+                        while (end_pos > min_pos and self.out.items[end_pos - 1] == '\n') {
+                            end_pos -= 1;
+                        }
+                        self.range_end_byte = end_pos;
+                    }
+                },
                 .text => {
                     try self.writeTextSlice(arena.getTextSlice(inst));
                 },
@@ -798,7 +832,49 @@ pub const FormatResult = struct {
     }
 };
 
+/// Single surgical byte replacement returned by `formatByteRange` (`null` when unchanged or syntax-errored).
+pub const RangeTextEdit = struct {
+    /// Inclusive starting byte offset in `source`.
+    start_byte: u32,
+    /// Exclusive ending byte offset in `source`.
+    end_byte: u32,
+    /// Newly allocated replacement UTF-8 text owned by caller.
+    replacement: []u8,
+
+    /// Releases `replacement` with `allocator`.
+    pub fn deinit(self: *RangeTextEdit, allocator: std.mem.Allocator) void {
+        allocator.free(self.replacement);
+        self.* = undefined;
+    }
+};
+
 // --------------- Trivia & CST Formatter Context ---------------
+
+/// Selected contiguous CST sibling range `[first_sib .. last_sib]` targeted by `formatByteRange`.
+const SiblingRangeTarget = struct {
+    /// First sibling CST node included in the formatted range.
+    first_sib: CstNodeIndex,
+    /// Last sibling CST node included in the formatted range.
+    last_sib: CstNodeIndex,
+    /// Exclusive ending byte offset of `last_sib`'s line in `source` (before `\r`/`\n`).
+    orig_end_byte: u32,
+};
+
+/// Extracted sibling list and delimiter tokens for an enclosing CST container node.
+const ContainerView = struct {
+    /// Opening `{` token of the container (`.none` for root `.file_end`).
+    open_brace_tok: TokenIndex = .none,
+    /// Closing `}` token of the container (`.none` for root `.file_end`).
+    close_brace_tok: TokenIndex = .none,
+    /// Ordered formatting siblings directly owned by this container.
+    siblings: std.ArrayList(CstNodeIndex) = .empty,
+
+    /// Releases `siblings` back to `allocator`.
+    fn deinit(self: *ContainerView, allocator: std.mem.Allocator) void {
+        self.siblings.deinit(allocator);
+        self.* = undefined;
+    }
+};
 
 /// Paired `.context_binding` CST subtree and its optional trailing `,` token.
 const WithBindingEntry = struct {
@@ -968,6 +1044,10 @@ pub const MAX_TEXT_CHUNK_LEN: u16 = 0xFFFE;
 pub const COLUMNAR_GRID_MIN_ELEMENTS: usize = 9;
 /// Maximum number of columns per row when rendering a `GroupMode.columnar_grid` literal array.
 pub const COLUMNAR_GRID_MAX_COLS: usize = 8;
+/// `DocInst.mode_or_delta` `.nop` payload marking the start of a range-formatting slice (`1`).
+const RANGE_ANCHOR_START: u8 = 1;
+/// `DocInst.mode_or_delta` `.nop` payload marking the end of a range-formatting slice (`2`).
+const RANGE_ANCHOR_END: u8 = 2;
 
 // -------------------------------------- INTERNALS --------------------------------------
 
@@ -1585,6 +1665,35 @@ fn buildTokenTriviaMeta(
 
 // ----------------- CST Node & Token Utilities -----------------
 
+/// Returns `true` if `token_buffer` contains any lexer-errored, invalid, or synthesized recovery token.
+fn hasAnyErrorOrSynthesizedTokens(token_buffer: *const TokenBuffer) bool {
+    const token_count = token_buffer.countTokens();
+    var tok_i: usize = 0;
+    while (tok_i < token_count) : (tok_i += 1) {
+        const rec = token_buffer.getToken(TokenIndex.fromInt(@intCast(tok_i)));
+        if (rec.flags.has_lexer_error or rec.flags.is_synthesized or rec.kind == .invalid_token) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Resolves `byte_offset` to its 0-based line index in `line_index` in $O(\log L)$ time.
+fn resolveLineIndex0(line_index: *const LineIndex, byte_offset: u32) u32 {
+    const clamped = @min(byte_offset, line_index.source_len);
+    var low: usize = 0;
+    var high: usize = line_index.line_starts.len;
+    while (low + 1 < high) {
+        const mid = low + (high - low) / 2;
+        if (line_index.line_starts[mid] <= clamped) {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    return @intCast(low);
+}
+
 /// Checks whether `cst_arena` or `token_buffer` contains unrecoverable syntax errors.
 fn hasBlockingSyntaxErrors(
     token_buffer: *const TokenBuffer,
@@ -1783,6 +1892,8 @@ const CstFormatter = struct {
     in_type_context: u32 = 0,
     /// Nesting depth inside `.index_expr` `[…]` brackets for compact `$-K` formatting (`DR-21` §3.3).
     index_bracket_depth: u32 = 0,
+    /// Optional sibling slice target when executing surgical `formatByteRange` rendering.
+    range_target: ?SiblingRangeTarget = null,
     /// Whether `--fix` mode (casing normalization and missing `;` synthesis) is enabled.
     is_fix_mode: bool,
 
@@ -1940,6 +2051,7 @@ const CstFormatter = struct {
         const rec = self.token_buffer.getToken(tok_id);
         if (rec.flags.is_synthesized) return "";
         const start: usize = rec.byte_offset;
+        if (start >= self.source.len) return "";
         const end: usize = @min(self.source.len, start + rec.byte_len);
         return self.source[start..end];
     }
@@ -2057,6 +2169,246 @@ const CstFormatter = struct {
         return true;
     }
 
+    /// Emits `RANGE_ANCHOR_START` right before `sib_id` when `sib_id` matches `range_target.first_sib`.
+    inline fn emitStartAnchorIfTarget(self: *CstFormatter, sib_id: CstNodeIndex) !void {
+        if (self.range_target) |target| {
+            if (sib_id == target.first_sib) {
+                try self.doc_arena.emitRangeAnchor(RANGE_ANCHOR_START);
+            }
+        }
+    }
+
+    /// Emits `RANGE_ANCHOR_END` after `sib_id` (flushing same-line stripped `.semi` comments) when matched.
+    fn emitEndAnchorIfTarget(
+        self: *CstFormatter,
+        sib_id: CstNodeIndex,
+        next_limit_tok: TokenIndex,
+    ) !void {
+        const target = self.range_target orelse return;
+        if (sib_id != target.last_sib) return;
+
+        const last_tok = self.findLastTokenInSubtree(sib_id);
+        if (!last_tok.isNone()) {
+            const limit_idx: u32 = if (next_limit_tok.isNone())
+                @intCast(self.token_meta.len)
+            else
+                @min(next_limit_tok.asInt(), @as(u32, @intCast(self.token_meta.len)));
+            var tok_i: u32 = last_tok.asInt() + 1;
+            while (tok_i < limit_idx) : (tok_i += 1) {
+                const cand_id = TokenIndex.fromInt(tok_i);
+                const rec = self.token_buffer.getToken(cand_id);
+                if (rec.flags.is_synthesized or rec.kind == .eof) continue;
+                if (rec.byte_offset >= target.orig_end_byte) break;
+                if (rec.kind == .semi) {
+                    if (self.hasUnconsumedLeadingComments(cand_id)) {
+                        try self.emitLeadingTrivia(cand_id, false);
+                    }
+                    self.token_meta[tok_i].is_token_emitted = true;
+                    try self.emitTrailingTrivia(cand_id);
+                }
+            }
+        }
+        try self.doc_arena.emitRangeAnchor(RANGE_ANCHOR_END);
+    }
+
+    /// Populates `out_view` if `node_idx` is a sibling-formatting container, returning `false` otherwise.
+    fn extractContainerView(
+        self: *const CstFormatter,
+        node_idx: CstNodeIndex,
+        out_view: *ContainerView,
+    ) std.mem.Allocator.Error!bool {
+        const node = self.cst_arena.getNode(node_idx);
+        if (node.subtree_size <= 1 and node.kind != .file_end) return false;
+
+        switch (node.kind) {
+            .file_end => {
+                var raw_children: std.ArrayList(CstNodeIndex) = .empty;
+                defer raw_children.deinit(self.allocator);
+                try self.collectDirectChildren(node_idx, &raw_children);
+                for (raw_children.items) |child_id| {
+                    const child = self.cst_arena.getNode(child_id);
+                    if (child.kind == .empty_stmt) continue;
+                    if (child.subtree_size == 1 and !child.token.isNone()) {
+                        const rec = self.token_buffer.getToken(child.token);
+                        if (rec.kind == .semi or rec.kind == .eof or
+                            (rec.kind == .invalid_token and rec.flags.is_synthesized))
+                        {
+                            continue;
+                        }
+                    }
+                    try out_view.siblings.append(self.allocator, child_id);
+                }
+                return true;
+            },
+            .mod_item, .trait_item, .impl_item, .extern_block_item => {
+                var raw_children: std.ArrayList(CstNodeIndex) = .empty;
+                defer raw_children.deinit(self.allocator);
+                try self.collectDirectChildren(node_idx, &raw_children);
+
+                var lbrace_pos: ?usize = null;
+                var rbrace_pos: ?usize = null;
+                for (raw_children.items, 0..) |child_id, idx| {
+                    const child = self.cst_arena.getNode(child_id);
+                    if (child.subtree_size == 1 and !child.token.isNone()) {
+                        const tok_kind = self.token_buffer.getToken(child.token).kind;
+                        if (tok_kind == .lbrace and lbrace_pos == null) lbrace_pos = idx;
+                        if (tok_kind == .rbrace) rbrace_pos = idx;
+                    }
+                }
+                if (lbrace_pos == null or rbrace_pos == null or rbrace_pos.? <= lbrace_pos.?) {
+                    return false;
+                }
+                out_view.open_brace_tok = self.cst_arena.getNode(raw_children.items[lbrace_pos.?]).token;
+                out_view.close_brace_tok = self.cst_arena.getNode(raw_children.items[rbrace_pos.?]).token;
+                for (raw_children.items[lbrace_pos.? + 1 .. rbrace_pos.?]) |child_id| {
+                    const child = self.cst_arena.getNode(child_id);
+                    if (child.kind == .empty_stmt) continue;
+                    if (child.subtree_size == 1 and !child.token.isNone()) {
+                        const rec = self.token_buffer.getToken(child.token);
+                        if (rec.kind == .semi or rec.kind == .eof or
+                            (rec.kind == .invalid_token and rec.flags.is_synthesized))
+                        {
+                            continue;
+                        }
+                    }
+                    try out_view.siblings.append(self.allocator, child_id);
+                }
+                return true;
+            },
+            .struct_item, .union_item, .enum_item, .bit_field_item, .type_alias_item => {
+                var raw_children: std.ArrayList(CstNodeIndex) = .empty;
+                defer raw_children.deinit(self.allocator);
+                try self.collectDirectChildren(node_idx, &raw_children);
+
+                var lbrace_pos: ?usize = null;
+                var rbrace_pos: ?usize = null;
+                for (raw_children.items, 0..) |child_id, idx| {
+                    const child = self.cst_arena.getNode(child_id);
+                    if (child.subtree_size == 1 and !child.token.isNone()) {
+                        const tok_kind = self.token_buffer.getToken(child.token).kind;
+                        if (tok_kind == .lbrace and lbrace_pos == null) lbrace_pos = idx;
+                        if (tok_kind == .rbrace) rbrace_pos = idx;
+                    }
+                }
+                if (lbrace_pos == null or rbrace_pos == null or rbrace_pos.? <= lbrace_pos.?) {
+                    return false;
+                }
+                out_view.open_brace_tok = self.cst_arena.getNode(raw_children.items[lbrace_pos.?]).token;
+                out_view.close_brace_tok = self.cst_arena.getNode(raw_children.items[rbrace_pos.?]).token;
+                for (raw_children.items[lbrace_pos.? + 1 .. rbrace_pos.?]) |child_id| {
+                    const child = self.cst_arena.getNode(child_id);
+                    if (child.kind == .struct_field or
+                        child.kind == .enum_variant or
+                        child.kind == .bit_field_member)
+                    {
+                        try out_view.siblings.append(self.allocator, child_id);
+                    }
+                }
+                return true;
+            },
+            .block => {
+                var raw_children: std.ArrayList(CstNodeIndex) = .empty;
+                defer raw_children.deinit(self.allocator);
+                try self.collectDirectChildren(node_idx, &raw_children);
+
+                var inner_block_pos: ?usize = null;
+                var wrapper_kw_pos: ?usize = null;
+                for (raw_children.items, 0..) |child_id, idx| {
+                    const child = self.cst_arena.getNode(child_id);
+                    if (child.kind == .block and inner_block_pos == null) {
+                        inner_block_pos = idx;
+                    } else if (child.subtree_size == 1 and !child.token.isNone() and inner_block_pos == null) {
+                        const tok_kind = self.token_buffer.getToken(child.token).kind;
+                        if (tok_kind == .kw_comptime or tok_kind == .kw_unsafe or tok_kind == .kw_async) {
+                            wrapper_kw_pos = idx;
+                        }
+                    }
+                }
+                if (wrapper_kw_pos != null and inner_block_pos != null and wrapper_kw_pos.? < inner_block_pos.?) {
+                    return false;
+                }
+
+                var lbrace_pos: ?usize = null;
+                var rbrace_pos: ?usize = null;
+                for (raw_children.items, 0..) |child_id, idx| {
+                    const child = self.cst_arena.getNode(child_id);
+                    if (child.subtree_size == 1 and !child.token.isNone()) {
+                        const tok_kind = self.token_buffer.getToken(child.token).kind;
+                        if (tok_kind == .lbrace and lbrace_pos == null) lbrace_pos = idx;
+                        if (tok_kind == .rbrace) rbrace_pos = idx;
+                    }
+                }
+                if (lbrace_pos == null or rbrace_pos == null or rbrace_pos.? <= lbrace_pos.?) {
+                    return false;
+                }
+                out_view.open_brace_tok = self.cst_arena.getNode(raw_children.items[lbrace_pos.?]).token;
+                out_view.close_brace_tok = self.cst_arena.getNode(raw_children.items[rbrace_pos.?]).token;
+                for (raw_children.items[lbrace_pos.? + 1 .. rbrace_pos.?]) |child_id| {
+                    const child = self.cst_arena.getNode(child_id);
+                    if (child.kind == .empty_stmt) continue;
+                    if (child.subtree_size == 1 and !child.token.isNone()) {
+                        const rec = self.token_buffer.getToken(child.token);
+                        if (rec.kind == .semi or (rec.kind == .invalid_token and rec.flags.is_synthesized)) {
+                            continue;
+                        }
+                    }
+                    try out_view.siblings.append(self.allocator, child_id);
+                }
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    /// Collects enclosing sibling containers from `.file_end` down to the tightest container around `[sel_start .. sel_end]`.
+    fn collectEnclosingContainers(
+        self: *const CstFormatter,
+        node_idx: CstNodeIndex,
+        sel_start: u32,
+        sel_end: u32,
+        out_containers: *std.ArrayList(CstNodeIndex),
+    ) std.mem.Allocator.Error!void {
+        const node = self.cst_arena.getNode(node_idx);
+        if (node.kind == .file_end) {
+            try out_containers.append(self.allocator, node_idx);
+        } else {
+            var probe_view: ContainerView = .{};
+            defer probe_view.deinit(self.allocator);
+            if (try self.extractContainerView(node_idx, &probe_view)) {
+                if (!probe_view.open_brace_tok.isNone() and !probe_view.close_brace_tok.isNone()) {
+                    const open_rec = self.token_buffer.getToken(probe_view.open_brace_tok);
+                    const close_rec = self.token_buffer.getToken(probe_view.close_brace_tok);
+                    const interior_start = open_rec.byte_offset + open_rec.byte_len;
+                    const interior_end = close_rec.byte_offset;
+                    if (sel_start >= interior_start and sel_end <= interior_end) {
+                        try out_containers.append(self.allocator, node_idx);
+                    }
+                }
+            }
+        }
+
+        const end_idx: usize = node_idx.asInt() + node.subtree_size;
+        var child_cursor: usize = node_idx.asInt() + 1;
+        while (child_cursor < end_idx) {
+            const child_id = CstNodeIndex.fromInt(@intCast(child_cursor));
+            const child = self.cst_arena.getNode(child_id);
+            if (child.subtree_size > 1) {
+                const first_tok = self.findFirstTokenInSubtree(child_id);
+                const last_tok = self.findLastTokenInSubtree(child_id);
+                if (!first_tok.isNone() and !last_tok.isNone()) {
+                    const first_rec = self.token_buffer.getToken(first_tok);
+                    const last_rec = self.token_buffer.getToken(last_tok);
+                    if (first_rec.byte_offset <= sel_end and
+                        last_rec.byte_offset + last_rec.byte_len >= sel_start)
+                    {
+                        try self.collectEnclosingContainers(child_id, sel_start, sel_end, out_containers);
+                    }
+                }
+            }
+            child_cursor += @max(@as(usize, 1), child.subtree_size);
+        }
+    }
+
     /// Emits all unconsumed leading comments of `tok_id` into `self.doc_arena`.
     fn emitLeadingTrivia(
         self: *CstFormatter,
@@ -2085,6 +2437,7 @@ const CstFormatter = struct {
             if (!isCommentOrShebangTrivia(piece.kind)) continue;
 
             const start: usize = piece.byte_offset;
+            if (start >= self.source.len) continue;
             const end: usize = @min(self.source.len, start + piece.byte_len);
             const raw_slice = self.source[start..end];
             const trimmed = std.mem.trimEnd(u8, raw_slice, " \t\r\n");
@@ -2141,6 +2494,7 @@ const CstFormatter = struct {
         for (all_trivia[meta.trailing_start..meta.trailing_end]) |piece| {
             if (!isCommentOrShebangTrivia(piece.kind)) continue;
             const start: usize = piece.byte_offset;
+            if (start >= self.source.len) continue;
             const end: usize = @min(self.source.len, start + piece.byte_len);
             try self.doc_arena.emitLineSuffix(self.source[start..end]);
         }
@@ -2150,6 +2504,7 @@ const CstFormatter = struct {
             const piece = all_trivia[idx];
             if (!isCommentOrShebangTrivia(piece.kind)) continue;
             const start: usize = piece.byte_offset;
+            if (start >= self.source.len) continue;
             const end: usize = @min(self.source.len, start + piece.byte_len);
             try self.doc_arena.emitLineSuffix(self.source[start..end]);
         }
@@ -2501,11 +2856,11 @@ const CstFormatter = struct {
                     }
                     if (!has_advanced) break;
                 }
-                const slice_start: usize = @min(node_lead_byte, supp.off_start);
                 const slice_end: usize = @min(
                     self.source.len,
                     @max(@as(usize, max_on_end), @as(usize, self.getNodeTrailingEndByte(siblings[last_idx]))),
                 );
+                const slice_start: usize = @min(slice_end, @min(node_lead_byte, supp.off_start));
                 self.markByteRangeConsumed(@intCast(slice_start), @intCast(slice_end));
                 try self.doc_arena.emitVerbatimText(self.source[slice_start..slice_end]);
                 index.* = last_idx + 1;
@@ -2892,7 +3247,16 @@ const CstFormatter = struct {
         const eof_tok_idx: u32 = @intCast(self.token_meta.len);
         if (self.hasUnconsumedCommentsInTokenRange(0, eof_tok_idx, false, true)) {
             if (self.doc_arena.instructions.items.len > 0) {
-                const last_op = self.doc_arena.instructions.items[self.doc_arena.instructions.items.len - 1].op;
+                var last_idx = self.doc_arena.instructions.items.len;
+                var last_op: DocOp = .nop;
+                while (last_idx > 0) {
+                    last_idx -= 1;
+                    const cand_op = self.doc_arena.instructions.items[last_idx].op;
+                    if (cand_op != .nop) {
+                        last_op = cand_op;
+                        break;
+                    }
+                }
                 if (last_op != .hard_line and last_op != .blank_line and last_op != .line_suffix) {
                     if (eof_tok_idx > 0 and self.token_meta[eof_tok_idx - 1].has_leading_blank_line) {
                         try self.doc_arena.emitBlankLine();
@@ -2967,7 +3331,13 @@ const CstFormatter = struct {
                 continue;
             }
 
+            try self.emitStartAnchorIfTarget(child_id);
             try self.formatNode(child_id);
+            const next_item_tok: TokenIndex = if (i + 1 < items.len)
+                self.findFirstTokenInSubtree(items[i + 1])
+            else
+                .none;
+            try self.emitEndAnchorIfTarget(child_id, next_item_tok);
             prev_item_idx = child_id;
             i += 1;
         }
@@ -3712,7 +4082,10 @@ const CstFormatter = struct {
         defer members.deinit(self.allocator);
         for (children.items[lb_idx + 1 .. rb_idx]) |child_id| {
             const child = self.cst_arena.getNode(child_id);
-            if (child.kind == .struct_field or child.kind == .enum_variant) {
+            if (child.kind == .struct_field or
+                child.kind == .enum_variant or
+                child.kind == .bit_field_member)
+            {
                 try members.append(self.allocator, child_id);
             }
         }
@@ -3737,12 +4110,18 @@ const CstFormatter = struct {
                     continue;
                 }
                 const mem_id = members.items[mem_i];
+                try self.emitStartAnchorIfTarget(mem_id);
                 const mem_node = self.cst_arena.getNode(mem_id);
-                if (mem_node.kind == .struct_field) {
+                if (mem_node.kind == .struct_field or mem_node.kind == .bit_field_member) {
                     try self.formatStructField(mem_id);
                 } else {
                     try self.formatEnumVariant(mem_id);
                 }
+                const next_mem_tok: TokenIndex = if (mem_i + 1 < members.items.len)
+                    self.findFirstTokenInSubtree(members.items[mem_i + 1])
+                else
+                    close_brace_tok;
+                try self.emitEndAnchorIfTarget(mem_id, next_mem_tok);
                 mem_i += 1;
             }
 
@@ -4978,7 +5357,13 @@ const CstFormatter = struct {
                 continue;
             }
 
+            try self.emitStartAnchorIfTarget(stmt_id);
             try self.formatNode(stmt_id);
+            const next_stmt_tok: TokenIndex = if (stmt_i + 1 < real_stmts.items.len)
+                self.findFirstTokenInSubtree(real_stmts.items[stmt_i + 1])
+            else
+                close_brace_tok;
+            try self.emitEndAnchorIfTarget(stmt_id, next_stmt_tok);
             const last_t = self.findLastTokenInSubtree(stmt_id);
             if (!last_t.isNone()) prev_end_tok = last_t.asInt() + 1;
             stmt_i += 1;
@@ -7669,8 +8054,10 @@ const CstFormatter = struct {
             .const_item => try self.formatConstItem(node_idx),
             .type_alias_item => try self.formatTypeAliasItem(node_idx),
             .mod_item => try self.formatModItem(node_idx),
-            .struct_item, .union_item, .enum_item => try self.formatStructOrUnionOrEnum(node_idx),
-            .struct_field => try self.formatStructField(node_idx),
+            .struct_item, .union_item, .enum_item, .bit_field_item => {
+                try self.formatStructOrUnionOrEnum(node_idx);
+            },
+            .struct_field, .bit_field_member => try self.formatStructField(node_idx),
             .enum_variant => try self.formatEnumVariant(node_idx),
             .trait_item, .impl_item => try self.formatTraitOrImpl(node_idx),
             .extern_block_item => try self.formatExternBlockItem(node_idx),
@@ -8082,6 +8469,249 @@ pub fn formatSource(
     file_id: FileId,
 ) !FormatResult {
     return formatSourceWithOptions(allocator, source, file_id, .{});
+}
+
+/// Formats the tightest CST sibling slice covering `[req_start_byte .. req_end_byte]` into a surgical edit.
+pub fn formatByteRange(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    line_index: *const LineIndex,
+    req_start_byte: u32,
+    req_end_byte: u32,
+    options: FormatOptions,
+) !?RangeTextEdit {
+    if (source.len == 0 or source.len > std.math.maxInt(u32)) return null;
+    const source_len_u32: u32 = @intCast(source.len);
+    if (line_index.countLines() == 0 or line_index.source_len != source_len_u32) return null;
+    if (cst_arena.countNodes() == 0 or cst_arena.has_parse_errors) return null;
+    if (!options.is_fix_mode and hasAnyErrorOrSynthesizedTokens(token_buffer)) return null;
+    if (hasBlockingSyntaxErrors(token_buffer, cst_arena, options.is_fix_mode)) return null;
+
+    const clamped_start: u32 = @min(req_start_byte, source_len_u32);
+    const clamped_end: u32 = @max(clamped_start, @min(req_end_byte, source_len_u32));
+
+    // [1] Guard `---` script frontmatter overlap before inspecting CST nodes:
+    var owned_masked_source: ?[]u8 = null;
+    defer if (owned_masked_source) |masked| allocator.free(masked);
+    const active_source: []const u8 = if (extractScriptFrontmatterPrefix(source)) |prefix| blk: {
+        if (clamped_start <= prefix.fence_end) return null;
+        if (token_buffer.countTokens() > 0 and
+            token_buffer.getToken(TokenIndex.fromInt(0)).byte_offset < prefix.fence_end)
+        {
+            return null;
+        }
+        const masked = try allocateMaskedFrontmatterSource(allocator, source, prefix.fence_end);
+        owned_masked_source = masked;
+        break :blk masked;
+    } else source;
+
+    // Trim trailing `\r?\n` on whole-line selections ending at column 0 of the next line:
+    var sel_end: u32 = clamped_end;
+    if (sel_end > clamped_start and source[sel_end - 1] == '\n') {
+        sel_end -= 1;
+        if (sel_end > clamped_start and source[sel_end - 1] == '\r') {
+            sel_end -= 1;
+        }
+    }
+
+    var doc_arena = DocArena.init(allocator);
+    defer doc_arena.deinit();
+
+    var cst_formatter = try CstFormatter.init(
+        allocator,
+        active_source,
+        token_buffer,
+        cst_arena,
+        &doc_arena,
+        options.is_fix_mode,
+    );
+    defer cst_formatter.deinit();
+
+    // [2] Locate tightest enclosing container and snap to `[first_sib .. last_sib]`:
+    var containers: std.ArrayList(CstNodeIndex) = .empty;
+    defer containers.deinit(allocator);
+    try cst_formatter.collectEnclosingContainers(
+        CstNodeIndex.fromInt(0),
+        clamped_start,
+        sel_end,
+        &containers,
+    );
+
+    for (containers.items) |anc_id| {
+        if (cst_formatter.hasFmtOffAttribute(anc_id)) return null;
+    }
+
+    var chosen_target: ?SiblingRangeTarget = null;
+    var orig_start_byte: u32 = 0;
+    var orig_end_byte: u32 = 0;
+
+    var depth_idx: usize = containers.items.len;
+    while (depth_idx > 0) {
+        depth_idx -= 1;
+        var view: ContainerView = .{};
+        defer view.deinit(allocator);
+        if (!(try cst_formatter.extractContainerView(containers.items[depth_idx], &view))) continue;
+        if (view.siblings.items.len == 0) continue;
+
+        const sib_count = view.siblings.items.len;
+        const sib_start_lines = try allocator.alloc(u32, sib_count);
+        defer allocator.free(sib_start_lines);
+        const sib_end_lines = try allocator.alloc(u32, sib_count);
+        defer allocator.free(sib_end_lines);
+
+        var first_match: ?usize = null;
+        var last_match: usize = 0;
+
+        for (view.siblings.items, 0..) |sib_id, sib_i| {
+            const lead_byte = cst_formatter.getNodeLeadingStartByte(sib_id);
+            const trail_byte = cst_formatter.getNodeTrailingEndByte(sib_id);
+            const start_line = resolveLineIndex0(line_index, lead_byte);
+            const end_probe = if (trail_byte > lead_byte) trail_byte - 1 else lead_byte;
+            const end_line = resolveLineIndex0(line_index, end_probe);
+            sib_start_lines[sib_i] = start_line;
+            sib_end_lines[sib_i] = end_line;
+
+            const line_start_b = line_index.line_starts[start_line];
+            const line_end_b = line_index.getLineBounds(source, end_line).end;
+            const is_overlapping = if (clamped_start < sel_end)
+                (clamped_start < line_end_b and sel_end > line_start_b)
+            else
+                (clamped_start >= line_start_b and clamped_start <= line_end_b);
+            if (is_overlapping) {
+                if (first_match == null) first_match = sib_i;
+                last_match = sib_i;
+            }
+        }
+
+        var first_idx: usize = first_match orelse return null;
+        var last_idx: usize = last_match;
+        var start_line_0: u32 = sib_start_lines[first_idx];
+        var end_line_0: u32 = sib_end_lines[last_idx];
+
+        // Expand slice to include any adjacent sibling sharing `start_line_0` or `end_line_0`:
+        while (true) {
+            var has_expanded = false;
+            while (first_idx > 0 and sib_end_lines[first_idx - 1] >= start_line_0) {
+                first_idx -= 1;
+                start_line_0 = @min(start_line_0, sib_start_lines[first_idx]);
+                end_line_0 = @max(end_line_0, sib_end_lines[first_idx]);
+                has_expanded = true;
+            }
+            while (last_idx + 1 < sib_count and sib_start_lines[last_idx + 1] <= end_line_0) {
+                last_idx += 1;
+                start_line_0 = @min(start_line_0, sib_start_lines[last_idx]);
+                end_line_0 = @max(end_line_0, sib_end_lines[last_idx]);
+                has_expanded = true;
+            }
+            if (!has_expanded) break;
+        }
+
+        // Walk up to parent container if `{` or `}` shares a physical line with `[first_idx .. last_idx]`:
+        if (!view.open_brace_tok.isNone() and !view.close_brace_tok.isNone()) {
+            const open_line_0 = resolveLineIndex0(
+                line_index,
+                token_buffer.getToken(view.open_brace_tok).byte_offset,
+            );
+            const close_line_0 = resolveLineIndex0(
+                line_index,
+                token_buffer.getToken(view.close_brace_tok).byte_offset,
+            );
+            if (start_line_0 <= open_line_0 or end_line_0 >= close_line_0) {
+                continue;
+            }
+            if (cst_formatter.hasUnconsumedLeadingComments(view.close_brace_tok)) {
+                const close_meta = cst_formatter.token_meta[view.close_brace_tok.asInt()];
+                var tr_i: u32 = close_meta.leading_start;
+                var has_close_comment_collision = false;
+                while (tr_i < close_meta.leading_end) : (tr_i += 1) {
+                    const piece = cst_formatter.trivia_slice[tr_i];
+                    if (isCommentOrShebangTrivia(piece.kind)) {
+                        if (end_line_0 >= resolveLineIndex0(line_index, piece.byte_offset)) {
+                            has_close_comment_collision = true;
+                        }
+                        break;
+                    }
+                }
+                if (has_close_comment_collision) continue;
+            }
+        }
+
+        for (view.siblings.items[first_idx .. last_idx + 1]) |sel_sib| {
+            if (cst_formatter.hasFmtOffAttribute(sel_sib)) return null;
+        }
+
+        orig_start_byte = line_index.line_starts[start_line_0];
+        orig_end_byte = line_index.getLineBounds(source, end_line_0).end;
+        chosen_target = .{
+            .first_sib = view.siblings.items[first_idx],
+            .last_sib = view.siblings.items[last_idx],
+            .orig_end_byte = orig_end_byte,
+        };
+        break;
+    }
+
+    cst_formatter.range_target = chosen_target orelse return null;
+    if (orig_start_byte > orig_end_byte or orig_end_byte > source_len_u32) return null;
+
+    // [3] Bail out if `[orig_start_byte .. orig_end_byte]` overlaps any `// corex fmt: off` span:
+    for (cst_formatter.suppressed_ranges.items) |supp| {
+        const has_supp_overlap = if (orig_start_byte < orig_end_byte)
+            (orig_start_byte < supp.on_end and orig_end_byte > supp.off_start)
+        else
+            (orig_start_byte >= supp.off_start and orig_start_byte <= supp.on_end);
+        if (has_supp_overlap) return null;
+    }
+
+    // [4] Format via `DocArena` / `DocRenderer` and slice `[fmt_start_byte .. fmt_end_byte]`:
+    try cst_formatter.formatRoot();
+
+    var renderer = DocRenderer.init(allocator, options.max_line_width);
+    defer renderer.deinit();
+
+    const formatted = try renderer.render(&doc_arena);
+    defer allocator.free(formatted);
+
+    const fmt_start = renderer.range_start_byte orelse return null;
+    const fmt_end = renderer.range_end_byte orelse return null;
+    if (fmt_start > fmt_end or fmt_end > formatted.len) return null;
+
+    // [5] Trim common prefix and suffix bytes while preserving UTF-8 scalar boundaries:
+    var edit_orig_start: usize = orig_start_byte;
+    var edit_orig_end: usize = orig_end_byte;
+    var orig_slice: []const u8 = source[edit_orig_start..edit_orig_end];
+    var fmt_slice: []const u8 = formatted[fmt_start..fmt_end];
+
+    var prefix_len: usize = 0;
+    const max_prefix = @min(orig_slice.len, fmt_slice.len);
+    while (prefix_len < max_prefix and orig_slice[prefix_len] == fmt_slice[prefix_len]) : (prefix_len += 1) {}
+    while (prefix_len > 0 and prefix_len < orig_slice.len and (orig_slice[prefix_len] & 0xC0) == 0x80) {
+        prefix_len -= 1;
+    }
+    edit_orig_start += prefix_len;
+    orig_slice = orig_slice[prefix_len..];
+    fmt_slice = fmt_slice[prefix_len..];
+
+    var suffix_len: usize = 0;
+    const max_suffix = @min(orig_slice.len, fmt_slice.len);
+    while (suffix_len < max_suffix and
+        orig_slice[orig_slice.len - 1 - suffix_len] == fmt_slice[fmt_slice.len - 1 - suffix_len]) : (suffix_len += 1)
+    {}
+    while (suffix_len > 0 and (orig_slice[orig_slice.len - suffix_len] & 0xC0) == 0x80) {
+        suffix_len -= 1;
+    }
+    edit_orig_end -= suffix_len;
+    orig_slice = orig_slice[0 .. orig_slice.len - suffix_len];
+    fmt_slice = fmt_slice[0 .. fmt_slice.len - suffix_len];
+
+    if (orig_slice.len == 0 and fmt_slice.len == 0) return null;
+
+    return .{
+        .start_byte = @intCast(edit_orig_start),
+        .end_byte = @intCast(edit_orig_end),
+        .replacement = try allocator.dupe(u8, fmt_slice),
+    };
 }
 
 // ---------------------------------------- MAIN -----------------------------------------
@@ -8795,4 +9425,114 @@ test "test_format_script_toml_frontmatter_and_inline_string_use_idempotency" {
     try std.testing.expect(!crlf_res.has_syntax_errors);
     try std.testing.expect(crlf_res.is_changed);
     try std.testing.expect(std.mem.indexOfScalar(u8, crlf_res.formatted_text, '\r') == null);
+}
+
+test "test_format_byte_range_nested_statement_trailing_comment_and_idempotency" {
+    const unformatted_prefix = "const   EARLY_UNTOUCHED :  i32  =   99 ;\n\n";
+    const fn_header = "fn compute_target(input_val: i32) -> i32 {\n";
+    const messy_stmt = "        let   shifted_val  =   input_val +  42 ; // inline comment\n";
+    const fn_footer = "    return shifted_val;\n}\n\n";
+    const unformatted_suffix = "fn   later_untouched( ) -> i32 { return   0 ; }\n";
+    const initial_src = unformatted_prefix ++ fn_header ++ messy_stmt ++ fn_footer ++ unformatted_suffix;
+
+    const req_start: u32 = @intCast(unformatted_prefix.len + fn_header.len + 8);
+    const req_end: u32 = @intCast(unformatted_prefix.len + fn_header.len + messy_stmt.len - 1);
+
+    // [1] First pass formats ONLY `messy_stmt` (`4` spaces, never `8`), preserving `// inline comment`:
+    var tok_buf_1 = TokenBuffer.init(std.testing.allocator);
+    defer tok_buf_1.deinit();
+    var cst_1 = LosslessCstArena.init(std.testing.allocator);
+    defer cst_1.deinit();
+    var ast_1 = AstArena.init(std.testing.allocator);
+    defer ast_1.deinit();
+    _ = try parser.parseSource(
+        initial_src,
+        FileId.fromInt(0),
+        &tok_buf_1,
+        &cst_1,
+        &ast_1,
+        null,
+        null,
+    );
+    var line_idx_1 = try LineIndex.build(std.testing.allocator, initial_src);
+    defer line_idx_1.deinit(std.testing.allocator);
+
+    var edit_1 = (try formatByteRange(
+        std.testing.allocator,
+        initial_src,
+        &tok_buf_1,
+        &cst_1,
+        &line_idx_1,
+        req_start,
+        req_end,
+        .{},
+    )).?;
+    defer edit_1.deinit(std.testing.allocator);
+
+    var patched: std.ArrayList(u8) = .empty;
+    defer patched.deinit(std.testing.allocator);
+    try patched.appendSlice(std.testing.allocator, initial_src[0..edit_1.start_byte]);
+    try patched.appendSlice(std.testing.allocator, edit_1.replacement);
+    try patched.appendSlice(std.testing.allocator, initial_src[edit_1.end_byte..]);
+
+    const expected_after_range_fmt =
+        unformatted_prefix ++
+        fn_header ++
+        "    let shifted_val = input_val + 42; // inline comment\n" ++
+        fn_footer ++
+        unformatted_suffix;
+    try std.testing.expectEqualStrings(expected_after_range_fmt, patched.items);
+
+    // [2] Second idempotency pass on the formatted statement must return `null`:
+    var tok_buf_2 = TokenBuffer.init(std.testing.allocator);
+    defer tok_buf_2.deinit();
+    var cst_2 = LosslessCstArena.init(std.testing.allocator);
+    defer cst_2.deinit();
+    var ast_2 = AstArena.init(std.testing.allocator);
+    defer ast_2.deinit();
+    _ = try parser.parseSource(
+        patched.items,
+        FileId.fromInt(0),
+        &tok_buf_2,
+        &cst_2,
+        &ast_2,
+        null,
+        null,
+    );
+    var line_idx_2 = try LineIndex.build(std.testing.allocator, patched.items);
+    defer line_idx_2.deinit(std.testing.allocator);
+
+    const new_stmt_start: u32 = @intCast(unformatted_prefix.len + fn_header.len);
+    const new_stmt_end: u32 = new_stmt_start + @as(u32, @intCast("    let shifted_val = input_val + 42; // inline comment".len));
+    const edit_2 = try formatByteRange(
+        std.testing.allocator,
+        patched.items,
+        &tok_buf_2,
+        &cst_2,
+        &line_idx_2,
+        new_stmt_start,
+        new_stmt_end,
+        .{},
+    );
+    try std.testing.expect(edit_2 == null);
+
+    // [3] Verify `// corex fmt: off` overlap safely returns `null`:
+    const suppressed_src =
+        "fn keep_raw() {\n" ++
+        "    // corex fmt: off\n" ++
+        "    let   raw_val  =   1 +   2 ;\n" ++
+        "    // corex fmt: on\n" ++
+        "}\n";
+    var sup_toks = TokenBuffer.init(std.testing.allocator);
+    defer sup_toks.deinit();
+    var sup_cst = LosslessCstArena.init(std.testing.allocator);
+    defer sup_cst.deinit();
+    var sup_ast = AstArena.init(std.testing.allocator);
+    defer sup_ast.deinit();
+    _ = try parser.parseSource(suppressed_src, FileId.fromInt(1), &sup_toks, &sup_cst, &sup_ast, null, null);
+    var sup_lines = try LineIndex.build(std.testing.allocator, suppressed_src);
+    defer sup_lines.deinit(std.testing.allocator);
+    try std.testing.expect(
+        (try formatByteRange(std.testing.allocator, suppressed_src, &sup_toks, &sup_cst, &sup_lines, 42, 60, .{})) == null,
+    );
 }

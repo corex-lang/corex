@@ -7392,7 +7392,15 @@ const HirLowerer = struct {
             .binary_expr => try self.lowerBinaryOrCatchExpr(expr_id, target_ty),
             .field_access => try self.lowerFieldAccess(expr_id, target_ty),
             .index_expr => try self.lowerIndexExpr(expr_id, target_ty),
-            .call_expr, .generic_call, .incomplete_call => try self.lowerCallExpr(expr_id, target_ty),
+            .call_expr, .generic_call => try self.lowerCallExpr(expr_id, target_ty),
+            .incomplete_call => if (ast_node.lhs.tag == .token)
+                try self.lowerContextualVariant(expr_id, target_ty)
+            else if (ast_node.lhs.tag == .node and !ast_node.main_token.isNone() and
+                ast_node.main_token.asInt() < self.tokens.countTokens() and
+                self.tokens.getToken(ast_node.main_token).kind == .dot)
+                try self.lowerMethodCallExpr(expr_id, target_ty)
+            else
+                try self.lowerCallExpr(expr_id, target_ty),
             .method_call => try self.lowerMethodCallExpr(expr_id, target_ty),
             .block => try self.lowerBlockExpr(expr_id, target_ty, false),
             .if_expr => try self.lowerIfExpr(expr_id, target_ty, false),
@@ -8454,12 +8462,25 @@ const HirLowerer = struct {
     /// Lowers `.None`, `.Some(x)`, `.Ok(x)`, `.Err(e)`, and `.Variant(args)` into `hir_construct`.
     fn lowerContextualVariant(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) !HirIndex {
         const expr_node = self.ast_arena.getNode(expr_id);
+        const is_incomplete_var = expr_node.tag == .incomplete_call;
         const var_tok = if (expr_node.lhs.tag == .token)
             TokenIndex.fromInt(expr_node.lhs.payload)
         else
             expr_node.main_token;
         const var_name = symbol_resolver.extractTokenSlice(self.source, self.tokens, var_tok);
-        const arg_nodes = self.getAstExtraSlice(expr_id, true);
+        var arg_nodes = self.getAstExtraSlice(expr_id, true);
+        if (is_incomplete_var) {
+            while (arg_nodes.len > 0) {
+                const tail_id = NodeIndex.fromInt(arg_nodes[arg_nodes.len - 1]);
+                if (!tail_id.isNone() and tail_id.asInt() < self.ast_arena.countNodes() and
+                    self.ast_arena.getNode(tail_id).tag == .expr_hole)
+                {
+                    arg_nodes = arg_nodes[0 .. arg_nodes.len - 1];
+                } else {
+                    break;
+                }
+            }
+        }
         const ty_node = self.pool.getNode(target_ty);
 
         switch (ty_node.tag) {
@@ -8477,6 +8498,8 @@ const HirLowerer = struct {
                 const payload_ty = TypeId.fromInt(ty_node.lhs);
                 const payload_hir = if (arg_nodes.len >= 1)
                     try self.lowerExpr(self.unwrapCallArgAst(NodeIndex.fromInt(arg_nodes[0])), payload_ty)
+                else if (is_incomplete_var and payload_ty != .unit_ty)
+                    try self.emitErrorHole(expr_node.main_token, .none, payload_ty)
                 else
                     try self.emitUnitConst(expr_node.main_token, .none);
                 const extra_idx = try self.store.appendLenPrefixedExtra(&[1]u32{payload_hir.asInt()});
@@ -8496,6 +8519,8 @@ const HirLowerer = struct {
                 const payload_ty = TypeId.fromInt(if (is_ok) ty_node.lhs else ty_node.rhs);
                 const payload_hir = if (arg_nodes.len >= 1)
                     try self.lowerExpr(self.unwrapCallArgAst(NodeIndex.fromInt(arg_nodes[0])), payload_ty)
+                else if (is_incomplete_var and payload_ty != .unit_ty)
+                    try self.emitErrorHole(expr_node.main_token, .none, payload_ty)
                 else
                     try self.emitUnitConst(expr_node.main_token, .none);
                 const extra_idx = try self.store.appendLenPrefixedExtra(&[1]u32{payload_hir.asInt()});
@@ -8538,13 +8563,7 @@ const HirLowerer = struct {
                 var_payload_ty = try enum_subst.applyMut(self.allocator, self.pool, var_payload_ty);
                 var lowered_args: std.ArrayListUnmanaged(u32) = .empty;
                 defer lowered_args.deinit(self.allocator);
-                if (arg_nodes.len == 1) {
-                    const first_arg = self.unwrapCallArgAst(NodeIndex.fromInt(arg_nodes[0]));
-                    try lowered_args.append(
-                        self.allocator,
-                        (try self.lowerExpr(first_arg, var_payload_ty)).asInt(),
-                    );
-                } else if (arg_nodes.len > 1) {
+                if (self.pool.getTag(var_payload_ty) == .tuple_ty and (arg_nodes.len > 1 or is_incomplete_var)) {
                     const tup_elems = self.pool.getTupleElements(var_payload_ty);
                     for (arg_nodes, 0..) |raw_arg, i| {
                         const sub_ty = if (i < tup_elems.len) TypeId.fromInt(tup_elems[i]) else .err_ty;
@@ -8554,6 +8573,26 @@ const HirLowerer = struct {
                             (try self.lowerExpr(unwrapped_arg, sub_ty)).asInt(),
                         );
                     }
+                    if (is_incomplete_var and arg_nodes.len < tup_elems.len) {
+                        for (tup_elems[arg_nodes.len..]) |raw_missing_ty| {
+                            const missing_ty = self.concreteType(TypeId.fromInt(raw_missing_ty));
+                            try lowered_args.append(
+                                self.allocator,
+                                (try self.emitErrorHole(expr_node.main_token, .none, missing_ty)).asInt(),
+                            );
+                        }
+                    }
+                } else if (arg_nodes.len == 1) {
+                    const first_arg = self.unwrapCallArgAst(NodeIndex.fromInt(arg_nodes[0]));
+                    try lowered_args.append(
+                        self.allocator,
+                        (try self.lowerExpr(first_arg, var_payload_ty)).asInt(),
+                    );
+                } else if (is_incomplete_var and arg_nodes.len == 0 and var_payload_ty != .unit_ty) {
+                    try lowered_args.append(
+                        self.allocator,
+                        (try self.emitErrorHole(expr_node.main_token, .none, self.concreteType(var_payload_ty))).asInt(),
+                    );
                 }
                 const extra_idx = try self.store.appendLenPrefixedExtra(lowered_args.items);
                 return self.emitNode(.{
@@ -9282,7 +9321,10 @@ const HirLowerer = struct {
                 .data = .{ .lhs = @backingInt(HirUnaryOp.bit_not), .rhs = inner_hir.asInt() },
             }, expr_id),
             .bang => {
-                const un_op: HirUnaryOp = if (inner_node.type_id == .bool_ty) .logical_not else .bit_not;
+                const base_inner_ty = self.pool.unwrapRefinementBase(
+                    self.pool.unwrapUnderlyingType(inner_node.type_id),
+                );
+                const un_op: HirUnaryOp = if (base_inner_ty == .bool_ty) .logical_not else .bit_not;
                 return self.emitNode(.{
                     .tag = .hir_unary_op,
                     .flags = .{ .category = .rvalue },
@@ -9831,7 +9873,12 @@ const HirLowerer = struct {
         const rhs_node = self.ast_arena.getNode(rhs_id);
 
         // [1] `.method_call` pipeline (`lhs |> recv.method(…)` OR static `lhs |> mod.func(…)` under Unified `.`):
-        if (rhs_node.tag == .method_call and rhs_node.lhs.tag == .node) {
+        const is_pipe_method_rhs = rhs_node.tag == .method_call or
+            (rhs_node.tag == .incomplete_call and rhs_node.lhs.tag == .node and
+                !rhs_node.main_token.isNone() and
+                rhs_node.main_token.asInt() < self.tokens.countTokens() and
+                self.tokens.getToken(rhs_node.main_token).kind == .dot);
+        if (is_pipe_method_rhs and rhs_node.lhs.tag == .node) {
             const recv_id = NodeIndex.fromInt(rhs_node.lhs.payload);
             const raw_items = self.getAstExtraSlice(rhs_id, true);
             if (raw_items.len == 0) return self.emitErrorHole(tok, expr_id, target_ty);
@@ -9851,6 +9898,18 @@ const HirLowerer = struct {
                     try type_arg_nodes.append(self.allocator, item_id);
                 } else {
                     try pipe_val_args.append(self.allocator, item_id);
+                }
+            }
+            if (rhs_node.tag == .incomplete_call) {
+                while (pipe_val_args.items.len > 1) {
+                    const tail_id = pipe_val_args.items[pipe_val_args.items.len - 1];
+                    if (!tail_id.isNone() and tail_id.asInt() < self.ast_arena.countNodes() and
+                        self.ast_arena.getNode(tail_id).tag == .expr_hole)
+                    {
+                        _ = pipe_val_args.pop();
+                    } else {
+                        break;
+                    }
                 }
             }
 
@@ -9980,6 +10039,18 @@ const HirLowerer = struct {
                 try pipe_val_args.append(self.allocator, item_id);
             }
         }
+        if (rhs_node.tag == .incomplete_call) {
+            while (pipe_val_args.items.len > 1) {
+                const tail_id = pipe_val_args.items[pipe_val_args.items.len - 1];
+                if (!tail_id.isNone() and tail_id.asInt() < self.ast_arena.countNodes() and
+                    self.ast_arena.getNode(tail_id).tag == .expr_hole)
+                {
+                    _ = pipe_val_args.pop();
+                } else {
+                    break;
+                }
+            }
+        }
         if (self.ast_arena.getNode(callee_ast_id).tag == .generic_call and
             self.ast_arena.getNode(callee_ast_id).lhs.tag == .node)
         {
@@ -10073,6 +10144,19 @@ const HirLowerer = struct {
                 }
             }
             try wrapped_args.append(self.allocator, (try self.wrapArgProjection(adj_arg, param_mode, tok)).asInt());
+        }
+        if (rhs_node.tag == .incomplete_call and !is_direct_sym) {
+            if (sig_view) |sv| {
+                while (wrapped_args.items.len < sv.paramCount()) {
+                    const pad_idx = wrapped_args.items.len;
+                    const pad_ty = self.concreteType(sv.getParamType(pad_idx));
+                    const pad_hir = try self.emitErrorHole(tok, .none, pad_ty);
+                    try wrapped_args.append(
+                        self.allocator,
+                        (try self.wrapArgProjection(pad_hir, sv.getParamMode(pad_idx), tok)).asInt(),
+                    );
+                }
+            }
         }
 
         const ret_ty = if (!target_ty.isError())
@@ -11103,6 +11187,27 @@ const HirLowerer = struct {
                 const raw_items = self.getAstExtraSlice(node_id, true);
                 if (raw_items.len > 1) {
                     for (raw_items[1..]) |raw_arg| {
+                        if (self.hasDollarAstDepth(NodeIndex.fromInt(raw_arg), depth + 1)) return true;
+                    }
+                }
+                return false;
+            },
+            .incomplete_call => {
+                if (node.lhs.tag == .node and
+                    self.hasDollarAstDepth(NodeIndex.fromInt(node.lhs.payload), depth + 1))
+                {
+                    return true;
+                }
+                if (node.rhs.tag == .node) {
+                    return self.hasDollarAstDepth(NodeIndex.fromInt(node.rhs.payload), depth + 1);
+                }
+                if (node.rhs.tag == .extra) {
+                    const raw_items = self.getAstExtraSlice(node_id, true);
+                    const is_dot_call = node.lhs.tag == .node and !node.main_token.isNone() and
+                        node.main_token.asInt() < self.tokens.countTokens() and
+                        self.tokens.getToken(node.main_token).kind == .dot;
+                    const start_off: usize = if (is_dot_call and raw_items.len >= 1) 1 else 0;
+                    for (raw_items[start_off..]) |raw_arg| {
                         if (self.hasDollarAstDepth(NodeIndex.fromInt(raw_arg), depth + 1)) return true;
                     }
                 }
@@ -12270,6 +12375,11 @@ const HirLowerer = struct {
     ) !void {
         const sig_view = self.pool.getFnSignatureView(callee_sig_ty);
         const param_offset: usize = if (has_self_receiver) 1 else 0;
+        const call_ast = self.ast_arena.getNode(call_ast_id);
+        const is_incomplete_call = call_ast.tag == .incomplete_call or
+            (call_ast.tag == .pipe_expr and call_ast.rhs.tag == .node and
+                self.ast_arena.getNode(NodeIndex.fromInt(call_ast.rhs.payload)).tag == .incomplete_call);
+        const specs_for_def = self.sym_table.fn_param_specs.get(callee_sym.asInt());
 
         const builder_block_state_opt = if (self.side_tables) |st|
             st.getBuilderBlockStateType(call_ast_id)
@@ -12368,14 +12478,25 @@ const HirLowerer = struct {
                         (if (full_idx < sv.paramCount()) sv.getParamType(full_idx) else .err_ty)
                     else
                         .err_ty;
-                    const def_hir = try self.lowerCalleeDefaultExpr(
-                        callee_sym,
-                        full_idx,
-                        param_offset,
-                        slot_locals,
-                        p_ty,
-                        tok,
-                    );
+                    const has_param_default = if (specs_for_def) |specs|
+                        full_idx < specs.len and (specs[full_idx].has_default or specs[full_idx].is_caller_location_default)
+                    else
+                        false;
+                    const def_hir = if (is_incomplete_call and !has_param_default)
+                        try self.emitErrorHole(
+                            tok,
+                            .none,
+                            self.concreteType(if (!p_ty.isError()) p_ty else .unit_ty),
+                        )
+                    else
+                        try self.lowerCalleeDefaultExpr(
+                            callee_sym,
+                            full_idx,
+                            param_offset,
+                            slot_locals,
+                            p_ty,
+                            tok,
+                        );
                     const tmp_slot = try self.allocTempLocal(self.store.getNode(def_hir).type_id, tok, false);
                     try out_seq_stmts.append(
                         self.allocator,
@@ -12488,14 +12609,25 @@ const HirLowerer = struct {
                 (if (full_idx < sv.paramCount()) sv.getParamType(full_idx) else .err_ty)
             else
                 .err_ty;
-            const def_hir = try self.lowerCalleeDefaultExpr(
-                callee_sym,
-                full_idx,
-                param_offset,
-                slot_locals,
-                p_ty,
-                tok,
-            );
+            const has_param_default = if (specs_opt) |specs|
+                full_idx < specs.len and (specs[full_idx].has_default or specs[full_idx].is_caller_location_default)
+            else
+                false;
+            const def_hir = if (is_incomplete_call and !has_param_default)
+                try self.emitErrorHole(
+                    tok,
+                    .none,
+                    self.concreteType(if (!p_ty.isError()) p_ty else .unit_ty),
+                )
+            else
+                try self.lowerCalleeDefaultExpr(
+                    callee_sym,
+                    full_idx,
+                    param_offset,
+                    slot_locals,
+                    p_ty,
+                    tok,
+                );
             const tmp_slot = try self.allocTempLocal(self.store.getNode(def_hir).type_id, tok, false);
             try out_seq_stmts.append(
                 self.allocator,
@@ -12523,12 +12655,15 @@ const HirLowerer = struct {
         const unwrapped_ty = self.pool.unwrapUnderlyingType(concrete_target);
         const ty_node = self.pool.getNode(unwrapped_ty);
 
+        const is_inc_ctor = self.ast_arena.getNode(expr_id).tag == .incomplete_call;
         switch (ty_node.tag) {
             .optional_ty => {
                 if (!std.mem.eql(u8, member_name, "Some")) return null;
                 const payload_ty = TypeId.fromInt(ty_node.lhs);
                 const payload_hir = if (val_args.len >= 1)
                     try self.lowerExpr(self.unwrapCallArgAst(val_args[0]), payload_ty)
+                else if (is_inc_ctor and payload_ty != .unit_ty)
+                    try self.emitErrorHole(tok, .none, payload_ty)
                 else
                     try self.emitUnitConst(tok, .none);
                 const extra_idx = try self.store.appendLenPrefixedExtra(&[1]u32{payload_hir.asInt()});
@@ -12560,6 +12695,8 @@ const HirLowerer = struct {
                 const payload_ty = TypeId.fromInt(if (is_ok) ty_node.lhs else ty_node.rhs);
                 const payload_hir = if (val_args.len >= 1)
                     try self.lowerExpr(self.unwrapCallArgAst(val_args[0]), payload_ty)
+                else if (is_inc_ctor and payload_ty != .unit_ty)
+                    try self.emitErrorHole(tok, .none, payload_ty)
                 else
                     try self.emitUnitConst(tok, .none);
                 const extra_idx = try self.store.appendLenPrefixedExtra(&[1]u32{payload_hir.asInt()});
@@ -12599,9 +12736,32 @@ const HirLowerer = struct {
                 const subst_var_ty = try enum_subst.applyMut(self.allocator, self.pool, v_sym.type_id);
                 var arg_hirs: std.ArrayListUnmanaged(u32) = .empty;
                 defer arg_hirs.deinit(self.allocator);
-                if (val_args.len == 1) {
+                if (self.pool.getTag(subst_var_ty) == .tuple_ty and
+                    (val_args.len > 1 or is_inc_ctor))
+                {
+                    const tup_elems = self.pool.getTupleElements(subst_var_ty);
+                    for (val_args, 0..) |arg_id, i| {
+                        const sub_ty = if (i < tup_elems.len) TypeId.fromInt(tup_elems[i]) else .err_ty;
+                        const unwrapped_arg = self.unwrapCallArgAst(arg_id);
+                        try arg_hirs.append(self.allocator, (try self.lowerExpr(unwrapped_arg, sub_ty)).asInt());
+                    }
+                    if (is_inc_ctor and val_args.len < tup_elems.len) {
+                        for (tup_elems[val_args.len..]) |raw_missing_ty| {
+                            const missing_ty = self.concreteType(TypeId.fromInt(raw_missing_ty));
+                            try arg_hirs.append(
+                                self.allocator,
+                                (try self.emitErrorHole(tok, .none, missing_ty)).asInt(),
+                            );
+                        }
+                    }
+                } else if (val_args.len == 1) {
                     const a0 = self.unwrapCallArgAst(val_args[0]);
                     try arg_hirs.append(self.allocator, (try self.lowerExpr(a0, subst_var_ty)).asInt());
+                } else if (is_inc_ctor and val_args.len == 0 and subst_var_ty != .unit_ty) {
+                    try arg_hirs.append(
+                        self.allocator,
+                        (try self.emitErrorHole(tok, .none, self.concreteType(subst_var_ty))).asInt(),
+                    );
                 } else {
                     const tup_elems = self.pool.getTupleElements(subst_var_ty);
                     for (val_args, 0..) |arg_id, i| {
@@ -12786,6 +12946,18 @@ const HirLowerer = struct {
                 }
             }
         }
+        if (ast_node.tag == .incomplete_call) {
+            while (val_arg_nodes.items.len > 0) {
+                const tail_id = val_arg_nodes.items[val_arg_nodes.items.len - 1];
+                if (!tail_id.isNone() and tail_id.asInt() < self.ast_arena.countNodes() and
+                    self.ast_arena.getNode(tail_id).tag == .expr_hole)
+                {
+                    _ = val_arg_nodes.pop();
+                } else {
+                    break;
+                }
+            }
+        }
         const val_args = val_arg_nodes.items;
 
         // [1] Compiler `@intrinsic` invocation:
@@ -12871,9 +13043,32 @@ const HirLowerer = struct {
                 const subst_var_ty = try enum_subst.applyMut(self.allocator, self.pool, sym.type_id);
                 var arg_hirs: std.ArrayListUnmanaged(u32) = .empty;
                 defer arg_hirs.deinit(self.allocator);
-                if (val_args.len == 1) {
+                if (self.pool.getTag(subst_var_ty) == .tuple_ty and
+                    (val_args.len > 1 or ast_node.tag == .incomplete_call))
+                {
+                    const tup_elems = self.pool.getTupleElements(subst_var_ty);
+                    for (val_args, 0..) |arg_id, i| {
+                        const sub_ty = if (i < tup_elems.len) TypeId.fromInt(tup_elems[i]) else .err_ty;
+                        const unwrapped_arg = self.unwrapCallArgAst(arg_id);
+                        try arg_hirs.append(self.allocator, (try self.lowerExpr(unwrapped_arg, sub_ty)).asInt());
+                    }
+                    if (ast_node.tag == .incomplete_call and val_args.len < tup_elems.len) {
+                        for (tup_elems[val_args.len..]) |raw_missing_ty| {
+                            const missing_ty = self.concreteType(TypeId.fromInt(raw_missing_ty));
+                            try arg_hirs.append(
+                                self.allocator,
+                                (try self.emitErrorHole(tok, .none, missing_ty)).asInt(),
+                            );
+                        }
+                    }
+                } else if (val_args.len == 1) {
                     const a0 = self.unwrapCallArgAst(val_args[0]);
                     try arg_hirs.append(self.allocator, (try self.lowerExpr(a0, subst_var_ty)).asInt());
+                } else if (ast_node.tag == .incomplete_call and val_args.len == 0 and subst_var_ty != .unit_ty) {
+                    try arg_hirs.append(
+                        self.allocator,
+                        (try self.emitErrorHole(tok, .none, self.concreteType(subst_var_ty))).asInt(),
+                    );
                 } else {
                     const tup_elems = self.pool.getTupleElements(subst_var_ty);
                     for (val_args, 0..) |arg_id, i| {
@@ -13009,6 +13204,17 @@ const HirLowerer = struct {
                     arg_hir = try self.emitVarRef(tmp_slot, tok, .none);
                 }
                 try wrapped_args.append(self.allocator, (try self.wrapArgProjection(arg_hir, p_mode, tok)).asInt());
+            }
+            if (ast_node.tag == .incomplete_call and sig_view != null) {
+                while (wrapped_args.items.len < fixed_arity) {
+                    const pad_idx = wrapped_args.items.len;
+                    const pad_ty = self.concreteType(sig_view.?.getParamType(pad_idx));
+                    const pad_hir = try self.emitErrorHole(tok, .none, pad_ty);
+                    try wrapped_args.append(
+                        self.allocator,
+                        (try self.wrapArgProjection(pad_hir, sig_view.?.getParamMode(pad_idx), tok)).asInt(),
+                    );
+                }
             }
         }
 
@@ -13308,6 +13514,18 @@ const HirLowerer = struct {
             }
             try val_arg_nodes.append(self.allocator, item_id);
         }
+        if (ast_node.tag == .incomplete_call) {
+            while (val_arg_nodes.items.len > 0) {
+                const tail_id = val_arg_nodes.items[val_arg_nodes.items.len - 1];
+                if (!tail_id.isNone() and tail_id.asInt() < self.ast_arena.countNodes() and
+                    self.ast_arena.getNode(tail_id).tag == .expr_hole)
+                {
+                    _ = val_arg_nodes.pop();
+                } else {
+                    break;
+                }
+            }
+        }
         const val_args = val_arg_nodes.items;
 
         // Built-in `.len()`, `.is_empty()`, `.as_ptr()`, and `.as_mut_ptr()` methods on slices, arrays, `#soa`, `str`, and `SE-09` bounds:
@@ -13487,9 +13705,32 @@ const HirLowerer = struct {
             const subst_var_ty = try enum_subst.applyMut(self.allocator, self.pool, v_sym.type_id);
             var arg_hirs: std.ArrayListUnmanaged(u32) = .empty;
             defer arg_hirs.deinit(self.allocator);
-            if (val_args.len == 1) {
+            if (self.pool.getTag(subst_var_ty) == .tuple_ty and
+                (val_args.len > 1 or ast_node.tag == .incomplete_call))
+            {
+                const tup_elems = self.pool.getTupleElements(subst_var_ty);
+                for (val_args, 0..) |arg_id, i| {
+                    const sub_ty = if (i < tup_elems.len) TypeId.fromInt(tup_elems[i]) else .err_ty;
+                    const unwrapped_arg = self.unwrapCallArgAst(arg_id);
+                    try arg_hirs.append(self.allocator, (try self.lowerExpr(unwrapped_arg, sub_ty)).asInt());
+                }
+                if (ast_node.tag == .incomplete_call and val_args.len < tup_elems.len) {
+                    for (tup_elems[val_args.len..]) |raw_missing_ty| {
+                        const missing_ty = self.concreteType(TypeId.fromInt(raw_missing_ty));
+                        try arg_hirs.append(
+                            self.allocator,
+                            (try self.emitErrorHole(tok, .none, missing_ty)).asInt(),
+                        );
+                    }
+                }
+            } else if (val_args.len == 1) {
                 const a0 = self.unwrapCallArgAst(val_args[0]);
                 try arg_hirs.append(self.allocator, (try self.lowerExpr(a0, subst_var_ty)).asInt());
+            } else if (ast_node.tag == .incomplete_call and val_args.len == 0 and subst_var_ty != .unit_ty) {
+                try arg_hirs.append(
+                    self.allocator,
+                    (try self.emitErrorHole(tok, .none, self.concreteType(subst_var_ty))).asInt(),
+                );
             } else {
                 const tup_elems = self.pool.getTupleElements(subst_var_ty);
                 for (val_args, 0..) |arg_id, i| {

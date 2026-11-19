@@ -198,10 +198,33 @@ test "test_run_cli_lifecycle_version_check_and_missing_file_error" {
     try std.testing.expectEqual(@as(u8, 0), ver_exit);
     try std.testing.expectEqualStrings("corex 0.1.0-dev (stage0 zig 0.17.0)\n", out_writer.buffered());
 
-    // [2] `corex --color=never check build.zig`:
+    // [2] `corex --color=never check <valid.cx>` verifies real `.cx` source; `build.zig` is rejected with `E0001`:
+    const valid_cx_path = ".zig-cache/test_cli_router_lifecycle_check.cx";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = valid_cx_path,
+        .data = "pub fn add_pair(lhs: i32, rhs: i32) -> i32 {\n    return lhs + rhs;\n}\n",
+    });
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, valid_cx_path) catch {};
+
     out_writer = std.Io.Writer.fixed(&out_buf);
     err_writer = std.Io.Writer.fixed(&err_buf);
     const check_exit = try router.runCli(
+        std.testing.allocator,
+        std.testing.io,
+        null,
+        &.{ "--color=never", "check", valid_cx_path },
+        &out_writer,
+        &err_writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), check_exit);
+    try std.testing.expectEqualStrings(
+        "✓ check: test_cli_router_lifecycle_check\n",
+        out_writer.buffered(),
+    );
+
+    out_writer = std.Io.Writer.fixed(&out_buf);
+    err_writer = std.Io.Writer.fixed(&err_buf);
+    const non_cx_exit = try router.runCli(
         std.testing.allocator,
         std.testing.io,
         null,
@@ -209,8 +232,8 @@ test "test_run_cli_lifecycle_version_check_and_missing_file_error" {
         &out_writer,
         &err_writer,
     );
-    try std.testing.expectEqual(@as(u8, 0), check_exit);
-    try std.testing.expectEqualStrings("✓ check: Phase 0 bootstrap foundation verified\n", out_writer.buffered());
+    try std.testing.expectEqual(@as(u8, 1), non_cx_exit);
+    try std.testing.expect(std.mem.indexOf(u8, err_writer.buffered(), "error[E0001]") != null);
 
     // [3] `corex --color=never check missing_file_xyz.cx` -> returns exit code `1` with `E0004`:
     out_writer = std.Io.Writer.fixed(&out_buf);

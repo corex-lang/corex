@@ -17,7 +17,7 @@ It serves two roles:
 
 ## 2. Cross-Language Capability Matrix
 
-Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `stage0/` + `core/` (`Phases 0–9`); **`[v0.0.1]`** = scheduled in `Phases 10–12` prior to initial release; **`[0.x]`** = scheduled in `Phase 13.0–13.4` prior to `v1.0.0`.
+Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `stage0/` + `core/` (`Phases 0–10`); **`[v0.0.1]`** = scheduled in `Phases 10.5–12` prior to initial release; **`[0.x]`** = scheduled in `Phase 13.0–13.4` prior to `v1.0.0`.
 
 | Dimension | CoreX | Rust | Zig | C23 / C++23 | Go | Python |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -35,8 +35,8 @@ Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `st
 | **Compile-Time Execution (`comptime`)** | **Hermetic `MirVm` with spatial/temporal provenance & step caps** `[Live]` | Restricted `const fn` + slow proc-macros | Unrestricted `comptime` (no fuel/sandbox cap by default) | `constexpr` / template metaprogramming | None (`go generate`) | Import-time execution |
 | **Built-In Deterministic `--sim` & `--fuzz`** | **First-class `test` / `bench` + `--sim --seed` + `--fuzz`** `[Live]`/`[v0.0.1]` | External crates (`cargo-fuzz`, `loom`, `turmoil`) | `std.testing.fuzz` (no virtual-time sim) | External (`libFuzzer`, custom harnesses) | `go test -fuzz` (no deterministic sim) | `hypothesis` / `atheris` |
 | **Installed Toolchain Footprint** | **`< 1 MB` self-hosted binary + tree-shaken `cx.*` stdlib** `[v0.0.1]` | `~800 MB–1.5 GB` (`rustup` + `rustc` + `cargo` + std rlibs) | `~45–50 MB` compressed (`libclang`/C++ headers) | `~500 MB–2 GB` (Clang/GCC/MSVC SDKs) | `~70–150 MB` | `~50–120 MB` |
-| **Dev Rebuild & Stateful Hot-Reload** | **Incremental `CompilerDb` `[Live]` + `< 5 ms` `--watch` `[0.x]`** | Slow (`cargo check` / link bottlenecks) | Fast incremental builds under active work | Slow header reparsing / linking | Fast (`go build`) | Instant startup, slow runtime |
-| **Legacy Syntax Baggage** | **Zero** (`corex fmt` + `corex upgrade` CST rewriter) `[Live]`/`[v0.0.1]` | Editions accumulate (`2015`–`2024`, async/pin tech debt) | Pre-1.0 churn (manual upgrades) | 40+ years of legacy footguns | Minimal (`gofmt` / `go fix`) | Python 2→3 scars, typing legacy |
+| **Dev Rebuild & Stateful Hot-Reload** | **Incremental `CompilerDb` + `< 10 ms` `corex lsp` `[Live]` + `< 5 ms` `--watch` `[0.x]`** | Slow (`cargo check` / `rust-analyzer` RAM bloat) | Fast incremental builds under active work | Slow header reparsing / `clangd` index lag | Fast (`go build` / `gopls`) | Instant startup, slow runtime |
+| **Legacy Syntax Baggage** | **Zero** (`corex fmt` + `corex upgrade` 3-tier CST/type rewriter) `[Live]` | Editions accumulate (`2015`–`2024`, async/pin tech debt) | Pre-1.0 churn (manual upgrades) | 40+ years of legacy footguns | Minimal (`gofmt` / `go fix`) | Python 2→3 scars, typing legacy |
 
 ---
 
@@ -96,6 +96,12 @@ CoreX systematically adopts the highest-leverage ergonomic wins from Python, Swi
 
 -   **Zero-Heap-Per-Await State Machines (`E0317`):** `async fn` and `async` blocks lower into liveness-colored stackless frames with `FramePinned` interior-borrow stability (no `Pin<&mut Self>` boilerplate) and a static `<= 16 KiB` inline frame cap (`E0317`).
 -   **Lexical `@linear` `cx.async.task_group` Nurseries (`E0309`):** Spawned `TaskHandle[T]` values are `@linear` obligations (`E0304` if forgotten on normal exit, automatically cancelled and reaped on `?` error or parent cancellation), while SAST proves concurrent borrow exclusivity, `Send`/`Sync`/`@thread_local` safety, and zero parent-scope escapes (`E0309`).
+
+### 3.9 Built-In `< 10 ms` Language Server, Capability Auditor & Zero-Legacy Migration Suite (`[Live]`)
+
+-   **Sub-Millisecond `corex lsp` Over `CompilerDb` (`DR-12`, `DR-17`):** Built directly into the single `corex` binary with zero external daemons, delivering `< 10 ms` P99 keystroke-to-diagnostic, completion, semantic-token delta, hygienic cross-file rename, and `DR-17` hover cards showing inferred capabilities (`[fs, net, unsafe_op]` or `none (pure)`), `@no_alloc`/`@no_panic` verification status, and exact `@max_stack(N)` frame byte budgets on 100,000-LOC workspaces.
+-   **Zero-False-Positive Linter & Supply-Chain Capability Auditor (`corex check`):** Unifies `W0202` idiom lints, `@deprecated(upgrade: "…")` (`W0403`) call-site rewrite templates, transactional `corex check --fix`, `--deny-warnings`, `corex check --caps` package capability matrices, and `corex check --explain-caps` shortest BFS call-chain witnesses.
+-   **3-Tier Zero-Legacy `corex upgrade` Engine (`DR-14`, `UR-21-00`–`UR-22-06`):** Automatically rewrites legacy syntax, `TypeId`-resolved idioms, `@deprecated` / `@fix_inline` library calls, and `corex.toml` / `corex.lock` manifests (`--accept-caps` without ever overriding `deny_caps`) while preserving 100% of comments and rolling back atomically if syntax errors increase.
 
 ---
 
@@ -400,5 +406,26 @@ use json_wire.parse_counter;
 
 pub fn main() -> i32 {
     return parse_counter(r#"{"ok":1}"#);
+}
+```
+
+### Showcase 9: `@deprecated` Auto-Migration Templates & `corex check --caps` Auditing (`[Live]`)
+
+```cx
+// Library authors attach hazard-checked rewrite templates directly to `@deprecated`:
+@deprecated(since: "0.2.0", reason: "use connect_timeout", upgrade: "connect_timeout($0, timeout_ms: 5000)")
+pub fn connect_host(endpoint: str) -> i32 {
+    return connect_timeout(endpoint, timeout_ms: 5000);
+}
+
+pub fn connect_timeout(endpoint: str, *, timeout_ms: u32 = 5000) -> i32 {
+    let _ = endpoint;
+    return timeout_ms as i32;
+}
+
+// Running `corex check --fix` or `corex upgrade` rewrites `connect_host(addr)` ->
+// `connect_timeout(addr, timeout_ms: 5000)` automatically when `$0` is pure and comment-free!
+pub fn bootstrap_client(addr: str) -> i32 {
+    return connect_timeout(addr, timeout_ms: 5000);
 }
 ```

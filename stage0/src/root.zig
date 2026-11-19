@@ -28,6 +28,12 @@ pub const query_db = @import("query_db.zig");
 pub const fmt_engine = @import("fmt_engine.zig");
 /// Zero-legacy `corex upgrade` three-tier rule catalog (`DR-14`, `DR-21`, & `DR-22`).
 pub const upgrade_rules = @import("upgrade_rules.zig");
+/// Zero-legacy 3-tier CST/AST/semantic source and manifest migration engine (`corex upgrade`, `DR-14`).
+pub const upgrade_engine = @import("upgrade_engine.zig");
+/// Unified `W0202` idiom linter, `corex check --fix`, and `DR-17` `--caps` / `--explain-caps` auditor.
+pub const check_audit = @import("check_audit.zig");
+/// Built-in zero-dependency LSP 3.17 JSON-RPC 2.0 server (`corex lsp`, `DR-12` & `DR-17`).
+pub const lsp_server = @import("lsp_server.zig");
 /// Module & lexical scope name resolution, `SymbolTable`, `ScopeArena`, and Levenshtein typo engine.
 pub const symbol_resolver = @import("symbol_resolver.zig");
 /// Canonical 14-byte SoA `TypeNode` `InternPool` (`TypeArena`), Constrained Type Groups, and bidirectional type checker.
@@ -136,6 +142,12 @@ pub const StringInterner = mem_foundation.StringInterner;
 // ------------------ VFS & Syntax Re-Exports -------------------
 /// 16-bit package identifier.
 pub const PackageId = vfs_sourcemap.PackageId;
+/// Negotiated LSP 3.17 character offset encoding (`utf16` vs `utf8`).
+pub const PositionEncoding = vfs_sourcemap.PositionEncoding;
+/// Maximum number of active in-memory VFS overlays (`256`).
+pub const MAX_OPEN_OVERLAYS = vfs_sourcemap.MAX_OPEN_OVERLAYS;
+/// Maximum aggregate byte footprint across active VFS overlays (`64 MiB`).
+pub const MAX_OPEN_OVERLAY_BYTES = vfs_sourcemap.MAX_OPEN_OVERLAY_BYTES;
 /// Resolved 1-based line, UTF-8 column, and 0-based UTF-16 column record.
 pub const LineCol = vfs_sourcemap.LineCol;
 /// $O(\log L)$ line start index and non-ASCII line bitset.
@@ -292,12 +304,16 @@ pub const DocRenderer = fmt_engine.DocRenderer;
 pub const FormatOptions = fmt_engine.FormatOptions;
 /// Result returned by `formatSource`, `formatSourceWithOptions`, and `formatTokensAndCst`.
 pub const FormatResult = fmt_engine.FormatResult;
+/// Surgical byte replacement returned by `formatByteRange`.
+pub const RangeTextEdit = fmt_engine.RangeTextEdit;
 /// Formats a pre-tokenized `TokenBuffer` and `LosslessCstArena` using `FormatOptions`.
 pub const formatTokensAndCst = fmt_engine.formatTokensAndCst;
 /// Tokenizes, parses, and formats `source` using `FormatOptions`.
 pub const formatSourceWithOptions = fmt_engine.formatSourceWithOptions;
 /// Tokenizes, parses, and formats `source` using default `FormatOptions`.
 pub const formatSource = fmt_engine.formatSource;
+/// Formats the tightest CST sibling slice covering `[req_start_byte .. req_end_byte]`.
+pub const formatByteRange = fmt_engine.formatByteRange;
 
 // ------------------ Upgrade Rules Re-Exports ------------------
 /// Three-tier execution stage in `corex upgrade` (`DR-14` §2.2).
@@ -843,6 +859,9 @@ test "test_root_module_references_all_phase0_submodules" {
     _ = query_db;
     _ = fmt_engine;
     _ = upgrade_rules;
+    _ = upgrade_engine;
+    _ = check_audit;
+    _ = lsp_server;
     _ = symbol_resolver;
     _ = type_system;
     _ = hir;
