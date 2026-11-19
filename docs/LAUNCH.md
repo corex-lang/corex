@@ -87,13 +87,18 @@ Most developers discovering a new systems language on Hacker News, Reddit, or Lo
 
 ---
 
-## 5. Stage `L3` – Zero-Friction Cross-Platform Distribution & CI
+## 5. Stage `L3` – Zero-Friction Cross-Platform Distribution, Anti-Backdoor CI & Provenance
 
-1.  **Automated Release Matrix (`corex-lang/corex`):**
-    -   GitHub Actions workflow producing stripped, deterministic `< 1 MB` `.tar.zst` / `.zip` bundles with SHA-256 checksums and Sigstore/cosign attestations for:
+Author `.github/workflows/{ci,release}.yml` here (right before the Stage `L4` orphan squash so the public GitHub Actions tab contains zero pre-squash Stage-0 commits) and build every public release strictly inside ephemeral GitHub Actions runners triggered by signed `v*` tags – never on a local developer machine:
+
+1.  **Automated Release Matrix & Anti-Backdoor Bootstrap Gates (`.github/workflows/release.yml`):**
+    -   Produces stripped, deterministic `< 1 MB` `.tar.zst` / `.zip` bundles for:
         -   `x86_64-linux-musl` & `aarch64-linux-musl` (zero-dependency static binaries),
         -   `x86_64-apple-darwin` & `aarch64-apple-darwin` (signed/notarized or ad-hoc signed),
         -   `x86_64-windows-msvc` & `aarch64-windows-msvc`.
+    -   **Gate A – Zero-Download Cold Bootstrap (`bootstrap.c`):** Never downloads an external `corex` binary from the network; cold-bootstraps strictly from the tagged Git commit (`bootstrap.c` + `stage1/corex1.wasm.zst` → `corex1` → `corex2` → `corex3` → `corex4` with `SOURCE_DATE_EPOCH=0`) and aborts unless `SHA-256(corex3) == SHA-256(corex4)`.
+    -   **Gate B – Dual-Compiler Diverse Double-Compiling (`gcc` vs. `clang`):** Runs two isolated bootstrap jobs using independent system C compilers (Job A via `gcc`, Job B via `clang`) to cross-compile the deterministic release artifacts, asserting **bit-for-bit `SHA-256` identity** across both lineages before any asset can be published (defeating single-compiler *Trusting Trust* backdoors and hidden build nondeterminism).
+    -   **Gate C – SLSA Provenance & Least-Privilege Publishing:** Runs all build/verification jobs with read-only `contents: read` permissions, handing verified artifacts to a minimal isolated publish job (`contents: write`, `attestations: write`, `id-token: write`) that generates `SHA256SUMS.txt` and cryptographic GitHub/Sigstore build-provenance attestations (`actions/attest-build-provenance`).
 2.  **One-Line Installers & Package Managers:**
     -   POSIX shell installer (`curl -fsSL https://corex-lang.org/install.sh | sh`) and Windows PowerShell installer (`irm https://corex-lang.org/install.ps1 | iex`).
     -   Package manager manifests updated automatically on release tag:

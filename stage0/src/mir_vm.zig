@@ -33,6 +33,7 @@ const query_db = @import("query_db.zig");
 const vfs_sourcemap = @import("vfs_sourcemap.zig");
 const hir = @import("hir.zig");
 const mir = @import("mir.zig");
+const mir_sast = @import("mir_sast.zig");
 const mir_async = @import("mir_async.zig");
 const sim_seam = @import("sim_seam.zig");
 
@@ -629,7 +630,7 @@ pub const VmExecOptions = struct {
     stderr_capture: ?*std.ArrayListUnmanaged(u8) = null,
     /// Enables differential-oracle runtime execution of `@sys_write` and `@sys_exit` (`D-07A`).
     is_oracle_runtime_mode: bool = false,
-    /// Optional `SymbolTable` override mapping lexical `origin_file_id -> PackageId` (`P1-5`).
+    /// Optional `SymbolTable` override mapping lexical `origin_file_id -> PackageId`.
     sym_table: ?*const SymbolTable = null,
     /// Optional per-`PackageId` `@embed_bytes` sandbox jail policy table (`DR-17` §5).
     package_jails: ?*const std.AutoHashMapUnmanaged(PackageId, mir.EmbedPackageJail) = null,
@@ -10592,7 +10593,7 @@ pub const MirVm = struct {
         return self.evalEmbedBytesSlotWithOrigin(rel_path, res_ty, active_fid);
     }
 
-    /// Loads sandboxed `@embed_bytes(rel_path)` jailed strictly to lexical `origin_file_id` (`P1-5`, `E0326` on escape).
+    /// Loads sandboxed `@embed_bytes(rel_path)` jailed strictly to lexical `origin_file_id` (`E0326` on escape).
     pub fn evalEmbedBytesSlotWithOrigin(
         self: *MirVm,
         rel_path: []const u8,
@@ -11967,6 +11968,73 @@ pub fn evalHirSubtreeWithMirVm(
         diagnostic_sink,
     ) catch return null;
     defer wrapper_body.deinit();
+
+    // Enforce static Gate F (`E0325`) capability check across the `comptime` call graph prior to `MirVm` execution:
+    if (!options.is_oracle_runtime_mode) {
+        var sast_bodies: std.ArrayListUnmanaged(MirBody) = .empty;
+        defer {
+            for (sast_bodies.items) |*sb| sb.deinit();
+            sast_bodies.deinit(allocator);
+        }
+        var wrapper_clone = try wrapper_body.clone(allocator);
+        errdefer wrapper_clone.deinit();
+        try sast_bodies.append(allocator, wrapper_clone);
+        for (helper_bodies.items) |*hb| {
+            var hb_clone = try hb.clone(allocator);
+            errdefer hb_clone.deinit();
+            try sast_bodies.append(allocator, hb_clone);
+        }
+
+        var gate_sink = DiagnosticSink.init(allocator);
+        defer gate_sink.deinit();
+        const tok_buf_opt: ?*const TokenBuffer = if (options.file_tokens) |ft_map|
+            ft_map.get(source_store.file_id.asInt())
+        else
+            null;
+        const has_ct_io = if (options.compiler_db) |db|
+            db.hasComptimeIoCapForFile(source_store.file_id)
+        else
+            false;
+        const ext_resolver: ?mir_sast.ExternalSummaryResolver = if (options.compiler_db) |db|
+            .{
+                .compiler_db = db,
+                .resolve_fn = query_db.CompilerDb.resolveDbCalleeSummary,
+            }
+        else
+            null;
+
+        if (mir_sast.analyzeAndElaborateMirModule(
+            allocator,
+            sast_bodies.items,
+            pool,
+            sym_table,
+            interner,
+            .{
+                .diagnostic_sink = &gate_sink,
+                .is_comptime_context = true,
+                .has_comptime_io_cap = has_ct_io,
+                .primary_body_count = 1,
+                .token_buffer = tok_buf_opt,
+                .external_resolver = ext_resolver,
+            },
+        )) |gate_res_val| {
+            var gate_res = gate_res_val;
+            defer gate_res.deinit();
+            var has_e0325 = false;
+            for (gate_sink.diagnostics.items) |diag_item| {
+                if (diag_item.code != .e0325_comptime_sandbox_violation) continue;
+                has_e0325 = true;
+                if (diagnostic_sink) |dst_sink| {
+                    try dst_sink.emit(diag_item);
+                }
+            }
+            if (has_e0325) return null;
+        } else |sast_err| switch (sast_err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Cancelled => return error.Cancelled,
+            else => {},
+        }
+    }
 
     var vm = try MirVm.init(
         allocator,

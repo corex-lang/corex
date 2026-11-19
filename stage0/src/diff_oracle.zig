@@ -152,20 +152,22 @@ var next_oracle_scratch_seq = std.atomic.Value(u32).init(1);
 
 // --------------------- MirVm Tier Runner ----------------------
 
-/// Locates the zero-argument `main` entrypoint `MirBody` inside `bodies`, preferring `root_file_id`.
+/// Locates the zero-argument `main` entrypoint `MirBody` inside `bodies`, preferring `root_file_id` in `PackageId.root`.
 fn findMainEntrypointBody(
     bodies: []const mir.MirBody,
-    interner: *const mem_foundation.StringInterner,
+    db: *const CompilerDb,
     root_file_id: FileId,
 ) ?*const mir.MirBody {
     var fallback_main: ?*const mir.MirBody = null;
     for (bodies) |*cand_body| {
         if (cand_body.param_count != 0) continue;
-        if (!std.mem.eql(u8, interner.get(cand_body.name), "main")) continue;
+        if (!std.mem.eql(u8, db.interner.get(cand_body.name), "main")) continue;
         if (cand_body.def_id.fileId() == root_file_id) {
             return cand_body;
         }
-        if (fallback_main == null) {
+        if (fallback_main == null and !cand_body.def_id.isNone() and
+            db.getFilePackageId(cand_body.def_id.fileId()) == .root)
+        {
             fallback_main = cand_body;
         }
     }
@@ -200,7 +202,7 @@ fn executeVmTierOnDb(
         else => return error.FrontendErrors,
     };
 
-    const main_body = findMainEntrypointBody(owned_bodies.items, &db.interner, root_file_id) orelse
+    const main_body = findMainEntrypointBody(owned_bodies.items, db, root_file_id) orelse
         return error.MissingMainEntrypoint;
 
     var file_tokens: std.AutoHashMapUnmanaged(u32, *const TokenBuffer) = .empty;

@@ -36,6 +36,8 @@ const PreparedPhase9BenchState = struct {
     scratch_dir: []u8,
     /// Hermetic `COREX_HOME` directory holding pre-populated sparse index & shared `.cxtree` for Case 1.
     corex_home_dir: []u8,
+    /// Persistent `PkgCache` keeping `BoundedMetadataLru` (`4,096` entries / `64 MiB`) warm across Case 1 runs.
+    shared_cache: pkg_cache.PkgCache,
     /// Pre-initialized `StringInterner` owning root manifest symbols for Case 1.
     cold_interner: StringInterner,
     /// Arena backing `cold_bundle.root_manifest` slices for Case 1.
@@ -67,6 +69,7 @@ const PreparedPhase9BenchState = struct {
         self.cold_bundle.deinit();
         self.cold_manifest_arena.deinit();
         self.cold_interner.deinit();
+        self.shared_cache.deinit();
         allocator.free(self.corex_home_dir);
         std.Io.Dir.cwd().deleteTree(self.io, self.scratch_dir) catch {};
         allocator.free(self.scratch_dir);
@@ -115,8 +118,8 @@ fn preparePhase9BenchState(allocator: std.mem.Allocator, io: std.Io) !PreparedPh
     defer allocator.free(ws_dir);
     try std.Io.Dir.cwd().createDirPath(io, ws_dir);
 
-    var cache = try pkg_cache.PkgCache.init(allocator, corex_home, 1024, 16 * 1024 * 1024);
-    defer cache.deinit();
+    var cache = try pkg_cache.PkgCache.init(allocator, corex_home, 4096, 64 * 1024 * 1024);
+    errdefer cache.deinit();
 
     // [1] Publish shared `.cxtree` (`src/root.cx`) in `corex_home` and write 500 sparse-index NDJSON files:
     const stub_src = "pub fn exported_fn() -> i32 = 42;\n";
@@ -199,11 +202,10 @@ fn preparePhase9BenchState(allocator: std.mem.Allocator, io: std.Io) !PreparedPh
         }
 
         var rel_buf: [160]u8 = undefined;
-        const sparse_rel = pkg_resolver.formatSparseIndexRelPath(pkg_name, &rel_buf).?;
         const idx_path = try std.fmt.allocPrint(
             allocator,
             "{s}/index/default/index/{s}",
-            .{ cache.cas_root, sparse_rel },
+            .{ cache.cas_root, pkg_resolver.formatSparseIndexRelPath(pkg_name, &rel_buf).? },
         );
         defer allocator.free(idx_path);
         if (std.fs.path.dirname(idx_path)) |parent_d| {
@@ -214,9 +216,6 @@ fn preparePhase9BenchState(allocator: std.mem.Allocator, io: std.Io) !PreparedPh
 
     const cold_toml_path = try std.fmt.allocPrint(allocator, "{s}/corex.toml", .{ws_dir});
     defer allocator.free(cold_toml_path);
-    const cold_toml_text =
-        "[package]\nname = \"bench-cold-root\"\nversion = \"0.1.0\"\n" ++
-        "[dependencies]\ndep-000 = { version = \"1.1.0\", features = [\"tls\", \"json\"] }\n";
 
     var cold_interner = try StringInterner.init(allocator);
     errdefer cold_interner.deinit();
@@ -228,12 +227,13 @@ fn preparePhase9BenchState(allocator: std.mem.Allocator, io: std.Io) !PreparedPh
         &cold_manifest_arena,
         &cold_interner,
         FileId.fromInt(0),
-        cold_toml_text,
+        "[package]\nname = \"bench-cold-root\"\nversion = \"0.1.0\"\n" ++
+            "[dependencies]\ndep-000 = { version = \"1.1.0\", features = [\"tls\", \"json\"] }\n",
         &host_cfg,
         null,
     );
     parsed_cold.doc.deinit(allocator);
-    var cold_bundle = try pkg_manifest.bundleFromSingleManifest(
+    var cold_bundle = try pkg_manifest.buildBundleFromSingleManifest(
         allocator,
         ws_dir,
         cold_toml_path,
@@ -324,6 +324,7 @@ fn preparePhase9BenchState(allocator: std.mem.Allocator, io: std.Io) !PreparedPh
         .io = io,
         .scratch_dir = scratch_dir,
         .corex_home_dir = corex_home,
+        .shared_cache = cache,
         .cold_interner = cold_interner,
         .cold_manifest_arena = cold_manifest_arena,
         .cold_bundle = cold_bundle,
@@ -355,6 +356,7 @@ fn benchColdMvsResolve500Deps(allocator: std.mem.Allocator) !usize {
         .{
             .io = state.io,
             .corex_home_dir = state.corex_home_dir,
+            .shared_cache = &state.shared_cache,
         },
         &sink,
     )) orelse return error.ColdResolveFailed;
@@ -395,12 +397,11 @@ fn benchWarmLockParseAndVfsMount50Pkgs(allocator: std.mem.Allocator) !usize {
     var mounted_file_total: usize = 0;
     for (0..WARM_MOUNT_PKG_COUNT) |pkg_idx| {
         var ver_buf: [16]u8 = undefined;
-        const ver_str = try std.fmt.bufPrint(&ver_buf, "1.{d}.0", .{pkg_idx});
         const mounted_ids = try vfs.mountCxTreePackage(
             state.io,
             PackageId.fromInt(@intCast(2 + pkg_idx)),
             &state.warm_pkg_names[pkg_idx],
-            ver_str,
+            try std.fmt.bufPrint(&ver_buf, "1.{d}.0", .{pkg_idx}),
             state.warm_cxtrees[pkg_idx],
             state.corex_home_dir,
         );
@@ -419,9 +420,8 @@ fn benchCxTreeCxiBlake3AndBaoVerify(allocator: std.mem.Allocator) !usize {
     var path_storage: [CXTREE_BENCH_ENTRY_COUNT][24]u8 = undefined;
     var tree_inputs: [CXTREE_BENCH_ENTRY_COUNT]pkg_cache.CxTreeInputEntry = undefined;
     for (0..CXTREE_BENCH_ENTRY_COUNT) |idx| {
-        const rel_slice = try std.fmt.bufPrint(&path_storage[idx], "src/mod_{d:0>2}.cx", .{idx});
         tree_inputs[idx] = .{
-            .rel_path = rel_slice,
+            .rel_path = try std.fmt.bufPrint(&path_storage[idx], "src/mod_{d:0>2}.cx", .{idx}),
             .file_mode = 0x01,
             .file_size = 512 + idx * 16,
             .file_blake3 = state.bao_root_blake3,

@@ -14,8 +14,10 @@ const std = @import("std");
 const mem_foundation = @import("mem_foundation.zig");
 const syntax_arenas = @import("syntax_arenas.zig");
 const lexer = @import("lexer.zig");
+const parser = @import("parser.zig");
 const symbol_resolver = @import("symbol_resolver.zig");
 const mir_sast = @import("mir_sast.zig");
+const mir_vm = @import("mir_vm.zig");
 const diagnostic = @import("diag/diagnostic.zig");
 const pkg_conflict_seam = @import("pkg_conflict_seam.zig");
 
@@ -25,8 +27,11 @@ const Span = mem_foundation.Span;
 const BumpArena = mem_foundation.BumpArena;
 const StringInterner = mem_foundation.StringInterner;
 const TokenIndex = mem_foundation.TokenIndex;
+const CstNodeIndex = mem_foundation.CstNodeIndex;
 const TokenKind = syntax_arenas.TokenKind;
 const TokenBuffer = syntax_arenas.TokenBuffer;
+const LosslessCstArena = syntax_arenas.LosslessCstArena;
+const AstArena = syntax_arenas.AstArena;
 const DiagnosticCode = diagnostic.DiagnosticCode;
 const DiagnosticSink = diagnostic.DiagnosticSink;
 const SuggestedFix = diagnostic.SuggestedFix;
@@ -90,8 +95,8 @@ pub const SemVer = extern struct {
         return .{ .major = self.major, .minor = self.minor, .patch = self.patch };
     }
 
-    /// Computes the `DR-11` §3.1 Bounded-MVS compatibility series `(tier, number)` for `self`.
-    pub inline fn seriesSlot(self: SemVer) struct { tier: SeriesTier, number: u32 } {
+    /// Classifies `self` into its `DR-11` §3.1 Bounded-MVS compatibility series `(tier, number)`.
+    pub inline fn classifySeriesSlot(self: SemVer) struct { tier: SeriesTier, number: u32 } {
         if (self.major >= 1) return .{ .tier = .major_ge_1, .number = self.major };
         if (self.minor >= 1) return .{ .tier = .minor_0_x, .number = self.minor };
         return .{ .tier = .patch_0_0_z, .number = self.patch };
@@ -199,7 +204,7 @@ pub const VersionReq = struct {
     }
 
     /// Evaluates whether `candidate` satisfies all comparators in `self` (including pre-release rules).
-    pub fn matches(self: *const VersionReq, candidate: SemVer, interner: *const StringInterner) bool {
+    pub fn isMatchedBy(self: *const VersionReq, candidate: SemVer, interner: *const StringInterner) bool {
         return isVersionReqMatchingImpl(self, candidate, interner);
     }
 };
@@ -498,7 +503,7 @@ pub const DependencySpec = struct {
     kind: DepKind = .normal,
     /// Backing registry, Git, path, or workspace-inherited source.
     source: DepSourceSpec,
-    /// `true` unless `default-features = false` (or `default_features = false`) was specified.
+    /// `true` unless `default-features = false` was specified.
     has_default_features: bool = true,
     /// `true` when `optional = true` was specified.
     is_optional: bool = false,
@@ -552,7 +557,7 @@ pub const DefaultDepPolicy = enum(u8) {
     trust_on_first_lock = 0,
     /// Require explicit `allow_caps` for any non-pure capability (`1`).
     zero_trust = 1,
-    /// Permit all `LOCKFILE_CAP_BITS` unless blocked by `forbid_global_caps` / `deny_caps` (`2`).
+    /// Permit all `LOCKFILE_CAP_BITS` unless blocked by `deny_caps` (`2`).
     allow_all = 2,
 };
 
@@ -582,8 +587,6 @@ pub const SecurityPolicy = struct {
     default_allow_caps: ?EffectCapabilityMask = null,
     /// Workspace-wide forbidden capability bits across third-party dependencies.
     deny_caps: EffectCapabilityMask = .EMPTY,
-    /// Alias mask kept identical to `deny_caps` (`forbid_global_caps` key in `[security]`).
-    forbid_global_caps: EffectCapabilityMask = .EMPTY,
     /// Whether `E0324` inspects `surface` exports or `reachable` call graphs.
     enforcement_scope: EnforcementScope = .surface,
     /// Whether `W0330` warns on unexported dead `ffi` / `unsafe_op` capabilities (`warn_ambient_dead_caps`).
@@ -676,7 +679,7 @@ pub const WorkspacePackageMeta = struct {
 pub const WorkspaceConfig = struct {
     /// Member directory patterns (`members = ["crates/*", "tools/cli"]`).
     members: []const StringId = &.{},
-    /// Default build target member patterns (`default-members` / `default_members`).
+    /// Default build target member patterns (`default-members`).
     default_members: []const StringId = &.{},
     /// Excluded directory paths (`exclude = ["vendor"]`).
     exclude: []const StringId = &.{},
@@ -720,6 +723,14 @@ pub const Manifest = struct {
     anchors: []const TomlSpanAnchor = &.{},
     /// Whitespace- and comment-invariant 256-bit `BLAKE3` digest of this manifest.
     root_manifest_blake3: [32]u8 = @splat(0),
+};
+
+/// Candidate workspace member directory discovered directly or via `/*` glob expansion.
+const MemberDirCandidate = struct {
+    /// Normalized workspace-relative directory path.
+    rel_dir: []const u8,
+    /// `true` when listed explicitly in `[workspace].members` rather than expanded from `/*`.
+    is_explicit: bool,
 };
 
 /// Resolved member package inside a `WorkspaceManifestBundle`.
@@ -798,7 +809,7 @@ pub const ScriptFrontmatterExtract = struct {
     prefix_end_byte: u32,
 };
 
-/// Single resolved `[[package]]` record in canonical `corex.lock` v1 (`reconciled_overrides.md` §1.3).
+/// Single resolved `[[package]]` record in canonical `corex.lock` v1 (`DR-11` §1.3, `DR-17` §4.2).
 pub const LockPackage = struct {
     /// Strict `kebab-case` package name.
     name: StringId,
@@ -828,7 +839,7 @@ pub const LockPackage = struct {
     dependencies: []const StringId = &.{},
 };
 
-/// Validated `corex.lock` v1 document (`reconciled_overrides.md` §1.3).
+/// Validated `corex.lock` v1 document (`DR-11` §1.3, `DR-17` §4.2).
 pub const Lockfile = struct {
     /// Schema version (`1`).
     version: u32 = LOCKFILE_VERSION,
@@ -882,7 +893,6 @@ pub const MANIFEST_CAPABILITY_MAP = std.StaticStringMap(u16).initComptime(.{
     .{ "may_panic", EffectCapabilityMask.MAY_PANIC_BIT },
     .{ "net", 1 << 1 },
     .{ "process", 1 << 3 },
-    .{ "random", 1 << 9 },
     .{ "unsafe_op", 1 << 5 },
 });
 
@@ -895,7 +905,6 @@ const LOCKFILE_CAPABILITY_MAP = std.StaticStringMap(u16).initComptime(.{
     .{ "fs", 1 << 0 },
     .{ "net", 1 << 1 },
     .{ "process", 1 << 3 },
-    .{ "random", 1 << 9 },
     .{ "unsafe_op", 1 << 5 },
 });
 
@@ -1120,7 +1129,7 @@ fn pushComparator(req: *VersionReq, op: ComparatorOp, ver: SemVer, interner: *co
 }
 
 /// Computes the natural `SeriesKey` exclusive ceiling `< ceiling` for `floor_ver` (`1.x -> 2.0.0`, `0.2.x -> 0.3.0`).
-fn naturalSeriesCeiling(floor_ver: SemVer) ?SemVer {
+fn computeNaturalSeriesCeiling(floor_ver: SemVer) ?SemVer {
     if (floor_ver.major >= 1) {
         const next_maj = std.math.add(u32, floor_ver.major, 1) catch return null;
         return .{ .major = next_maj, .minor = 0, .patch = 0 };
@@ -1271,7 +1280,7 @@ fn parseVersionReqImpl(interner: *StringInterner, raw_req: []const u8) !?Version
                 break :blk .{ .major = 0, .minor = 1, .patch = 0 };
             } else .{ .major = 1, .minor = 0, .patch = 0 };
 
-            if (naturalSeriesCeiling(floor_v)) |nat_ceil| {
+            if (computeNaturalSeriesCeiling(floor_v)) |nat_ceil| {
                 if (SemVer.compare(ceil_v, nat_ceil, interner) == .lt) {
                     req.has_intra_series_upper_bound = true;
                 }
@@ -2126,6 +2135,8 @@ const TomlDomEntry = struct {
     val_span: Span,
     /// Decoded value.
     val: TomlDomValue,
+    /// Geometric backing buffer for `[[array_table]]` elements ($O(N)$ amortized growth).
+    array_table_buf: std.ArrayListUnmanaged(TomlDomElem) = .empty,
     /// Index into `doc.cst.anchors`.
     anchor_id: u32 = std.math.maxInt(u32),
     /// `true` when defined via `[subtable]` header rather than inline/dotted key.
@@ -2136,6 +2147,8 @@ const TomlDomEntry = struct {
 const TomlDomTable = struct {
     /// Ordered list of entries in this table.
     entries: std.ArrayListUnmanaged(TomlDomEntry) = .empty,
+    /// $O(1)$ lookup index mapping entry keys to `entries.items` indices.
+    key_index: std.StringHashMapUnmanaged(u32) = .empty,
     /// `true` if sealed as an inline `{ … }` table or scalar-assigned dotted parent.
     is_inline_sealed: bool = false,
     /// `true` if already opened via an explicit `[table]` header.
@@ -2145,17 +2158,22 @@ const TomlDomTable = struct {
     /// Header span for diagnostics.
     header_span: Span = .{ .file_id = .none, .start_byte = 0, .end_byte = 0 },
 
-    /// Looks up `key` inside `self.entries`.
+    /// Appends `entry` onto `self.entries` and indexes `entry.key` in $O(1)$ amortized time.
+    fn appendEntry(self: *TomlDomTable, allocator: std.mem.Allocator, entry: TomlDomEntry) !void {
+        const idx: u32 = @intCast(self.entries.items.len);
+        try self.entries.append(allocator, entry);
+        try self.key_index.put(allocator, entry.key, idx);
+    }
+
+    /// Looks up `key` inside `self.entries` in $O(1)$ time via `self.key_index`.
     fn findEntry(self: *const TomlDomTable, key: []const u8) ?*TomlDomEntry {
-        for (self.entries.items) |*entry| {
-            if (std.mem.eql(u8, entry.key, key)) return entry;
-        }
-        return null;
+        const idx = self.key_index.get(key) orelse return null;
+        return &self.entries.items[idx];
     }
 };
 
 /// Returns the safe relative byte offset of token `tok_idx` inside `doc.toml_slice`.
-inline fn tokenByteOffset(doc: *const TomlDocumentView, tok_idx: u32) u32 {
+inline fn getTokenByteOffset(doc: *const TomlDocumentView, tok_idx: u32) u32 {
     if (tok_idx >= doc.tokens.tokens.len) {
         return @intCast(@min(doc.toml_slice.len, std.math.maxInt(u32)));
     }
@@ -2226,7 +2244,7 @@ fn decodeTomlStringOrKey(
 
     if (is_key and (kind == .multiline_basic_string or kind == .multiline_literal_string)) {
         doc.has_syntax_errors = true;
-        const off = tokenByteOffset(doc, tok_idx);
+        const off = getTokenByteOffset(doc, tok_idx);
         try emitTomlDiag(
             sink,
             diag_code,
@@ -2455,7 +2473,7 @@ const TomlParser = struct {
     }
 
     /// Returns the `TomlTokenFlags` at `tok_idx` safely when `tok_idx < tokens.len`.
-    inline fn tokenFlagsAt(self: *const TomlParser, tok_idx: u32) TomlTokenFlags {
+    inline fn getTokenFlagsAt(self: *const TomlParser, tok_idx: u32) TomlTokenFlags {
         if (tok_idx >= self.doc.tokens.tokens.len) return .{};
         return self.doc.tokens.tokens.items(.flags)[tok_idx];
     }
@@ -2544,9 +2562,9 @@ const TomlParser = struct {
         is_trailing_comma: bool,
     ) !u32 {
         const kinds = self.doc.tokens.tokens.items(.kind);
-        const key_rel = tokenByteOffset(self.doc, key_first_tok);
-        const val_first_rel = tokenByteOffset(self.doc, val_first_tok);
-        const val_last_rel = tokenByteOffset(self.doc, val_last_tok);
+        const key_rel = getTokenByteOffset(self.doc, key_first_tok);
+        const val_first_rel = getTokenByteOffset(self.doc, val_first_tok);
+        const val_last_rel = getTokenByteOffset(self.doc, val_last_tok);
         const key_lo = self.doc.base_byte_offset +| key_rel;
         const val_lo = self.doc.base_byte_offset +| val_first_rel;
         const last_slice = getTomlTokenSlice(self.doc, val_last_tok);
@@ -2595,7 +2613,7 @@ const TomlParser = struct {
             self.doc.has_syntax_errors = true;
             return .{ .val = .{ .str_val = "" }, .first_tok = start_tok, .last_tok = start_tok, .has_cve = false };
         }
-        const tok_flags = self.tokenFlagsAt(start_tok);
+        const tok_flags = self.getTokenFlagsAt(start_tok);
 
         // [1] Array `[ elem, … ]`:
         if (kind == .lbracket) {
@@ -2677,7 +2695,7 @@ const TomlParser = struct {
                 const eq_tok = self.pos;
                 const eq_col = computeUtf8Column(
                     self.doc.toml_slice,
-                    tokenByteOffset(self.doc, eq_tok),
+                    getTokenByteOffset(self.doc, eq_tok),
                 );
                 self.pos += 1;
 
@@ -2744,7 +2762,7 @@ const TomlParser = struct {
             .bool_lit => .{ .bool_val = std.mem.eql(u8, raw, "true") },
             .int_lit => decodeTomlInteger(raw) orelse blk: {
                 self.doc.has_syntax_errors = true;
-                const off = tokenByteOffset(self.doc, start_tok);
+                const off = getTokenByteOffset(self.doc, start_tok);
                 try emitTomlDiag(
                     self.sink,
                     self.diag_code,
@@ -2765,8 +2783,7 @@ const TomlParser = struct {
                         clean_len += 1;
                     }
                 }
-                const fval = std.fmt.parseFloat(f64, clean_buf[0..clean_len]) catch 0.0;
-                break :blk .{ .float_val = fval };
+                break :blk .{ .float_val = std.fmt.parseFloat(f64, clean_buf[0..clean_len]) catch 0.0 };
             },
             .datetime_lit => .{ .datetime_val = raw },
             else => blk: {
@@ -2815,7 +2832,7 @@ const TomlParser = struct {
             } else {
                 const sub_tbl = try self.dom_arena.create(TomlDomTable);
                 sub_tbl.* = .{ .header_span = key_spans[seg_idx] };
-                try cur_tbl.entries.append(self.dom_arena.asAllocator(), .{
+                try cur_tbl.appendEntry(self.dom_arena.asAllocator(), .{
                     .key = seg,
                     .key_span = key_spans[seg_idx],
                     .val_span = key_spans[seg_idx],
@@ -2832,7 +2849,7 @@ const TomlParser = struct {
             try self.emitSpanErr(leaf_span, "duplicate TOML key in table");
             return;
         }
-        try cur_tbl.entries.append(self.dom_arena.asAllocator(), .{
+        try cur_tbl.appendEntry(self.dom_arena.asAllocator(), .{
             .key = leaf_key,
             .key_span = leaf_span,
             .val_span = val_span,
@@ -2881,7 +2898,7 @@ const TomlParser = struct {
             } else {
                 const sub_tbl = try self.dom_arena.create(TomlDomTable);
                 sub_tbl.* = .{ .is_super_table = true, .header_span = key_spans[i] };
-                try cur_tbl.entries.append(self.dom_arena.asAllocator(), .{
+                try cur_tbl.appendEntry(self.dom_arena.asAllocator(), .{
                     .key = seg,
                     .key_span = key_spans[i],
                     .val_span = hdr_span,
@@ -2903,19 +2920,23 @@ const TomlParser = struct {
                     try self.emitSpanErr(leaf_span, "`[[array_table]]` conflicts with existing key or table");
                     return elem_tbl;
                 }
-                const old_elems = existing.val.array_val;
-                const grown = try self.dom_arena.allocSlice(TomlDomElem, old_elems.len + 1);
-                @memcpy(grown[0..old_elems.len], old_elems);
-                grown[old_elems.len] = .{ .val = .{ .table_val = elem_tbl }, .span = hdr_span };
-                existing.val = .{ .array_val = grown };
+                try existing.array_table_buf.append(
+                    self.dom_arena.asAllocator(),
+                    .{ .val = .{ .table_val = elem_tbl }, .span = hdr_span },
+                );
+                existing.val = .{ .array_val = existing.array_table_buf.items };
             } else {
-                const single = try self.dom_arena.allocSlice(TomlDomElem, 1);
-                single[0] = .{ .val = .{ .table_val = elem_tbl }, .span = hdr_span };
-                try cur_tbl.entries.append(self.dom_arena.asAllocator(), .{
+                var arr_buf: std.ArrayListUnmanaged(TomlDomElem) = .empty;
+                try arr_buf.append(
+                    self.dom_arena.asAllocator(),
+                    .{ .val = .{ .table_val = elem_tbl }, .span = hdr_span },
+                );
+                try cur_tbl.appendEntry(self.dom_arena.asAllocator(), .{
                     .key = leaf,
                     .key_span = leaf_span,
                     .val_span = hdr_span,
-                    .val = .{ .array_val = single },
+                    .val = .{ .array_val = arr_buf.items },
+                    .array_table_buf = arr_buf,
                     .is_explicit_header = true,
                 });
             }
@@ -2940,7 +2961,7 @@ const TomlParser = struct {
 
         const new_tbl = try self.dom_arena.create(TomlDomTable);
         new_tbl.* = .{ .is_explicitly_defined = true, .header_span = hdr_span };
-        try cur_tbl.entries.append(self.dom_arena.asAllocator(), .{
+        try cur_tbl.appendEntry(self.dom_arena.asAllocator(), .{
             .key = leaf,
             .key_span = leaf_span,
             .val_span = hdr_span,
@@ -3012,7 +3033,7 @@ const TomlParser = struct {
                     if (is_in_direct_deps_section) {
                         self.doc.deps_section_insert_byte = computeRowEndByte(
                             self.doc,
-                            tokenByteOffset(self.doc, end_tok),
+                            getTokenByteOffset(self.doc, end_tok),
                         );
                     }
                 }
@@ -3033,7 +3054,7 @@ const TomlParser = struct {
                 const eq_tok = self.pos;
                 const eq_col = computeUtf8Column(
                     self.doc.toml_slice,
-                    tokenByteOffset(self.doc, eq_tok),
+                    getTokenByteOffset(self.doc, eq_tok),
                 );
                 self.pos += 1;
 
@@ -3045,7 +3066,7 @@ const TomlParser = struct {
                         "unexpected trailing token after TOML value on the same line",
                     );
                 }
-                const has_lead_cve = self.tokenFlagsAt(start_tok).has_cve_comment;
+                const has_lead_cve = self.getTokenFlagsAt(start_tok).has_cve_comment;
                 const form_code: u8 = if (rhs.val == .table_val)
                     1
                 else if (key_res.len > 1)
@@ -3078,7 +3099,7 @@ const TomlParser = struct {
                 if (is_in_direct_deps_section) {
                     self.doc.deps_section_insert_byte = computeRowEndByte(
                         self.doc,
-                        tokenByteOffset(self.doc, rhs.last_tok),
+                        getTokenByteOffset(self.doc, rhs.last_tok),
                     );
                     if (self.doc.deps_section_eq_col == 0) {
                         self.doc.deps_section_eq_col = eq_col;
@@ -3152,209 +3173,24 @@ fn suggestCorexTargetCfgFromRust(arena: *BumpArena, raw_pred: []const u8) !?[]co
     return null;
 }
 
-/// Evaluates a tokenized CoreX `@cfg` predicate against `cfg_env`, returning `null` on invalid syntax.
-const ManifestCfgEval = struct {
-    /// Source expression slice.
-    src: []const u8,
-    /// Lexed `TokenBuffer`.
-    tok_buf: *const TokenBuffer,
-    /// Target environment.
-    env: *const CfgEnv,
-    /// Current token index (`0 .. count - 1`, excluding `.eof`).
-    idx: u32 = 0,
-    /// Recursion depth (`<= 32`).
-    depth: u8 = 0,
+/// Validates and normalizes a manifest-relative `.cx` source path (`E0013` on `..`, `\`, `:`, or absolute paths).
+fn normalizeAndValidateManifestRelPath(raw_path: []const u8) ?[]const u8 {
+    if (raw_path.len == 0 or std.mem.indexOfAny(u8, raw_path, "\\*?") != null) return null;
+    const stripped = if (std.mem.startsWith(u8, raw_path, "./")) raw_path[2..] else raw_path;
+    if (!mir_vm.isValidSandboxedEmbedPath(stripped)) return null;
+    return stripped;
+}
 
-    /// Returns current `TokenKind` (`.eof` when `self.idx >= countTokens()`).
-    inline fn peek(self: *const ManifestCfgEval) TokenKind {
-        if (self.idx >= self.tok_buf.countTokens()) return .eof;
-        return self.tok_buf.getToken(TokenIndex.fromInt(self.idx)).kind;
+/// Validates a `[workspace]` relative directory or `/*` glob pattern (`E0013` on `..`, `\`, `:`, or absolute paths).
+fn isValidWorkspaceRelPattern(raw_pat: []const u8, is_glob_allowed: bool) bool {
+    if (raw_pat.len == 0 or std.mem.indexOfScalar(u8, raw_pat, '\\') != null) return false;
+    if (std.mem.eql(u8, raw_pat, ".")) return true;
+    if (is_glob_allowed and std.mem.endsWith(u8, raw_pat, "/*")) {
+        const prefix = raw_pat[0 .. raw_pat.len - 2];
+        return std.mem.indexOfAny(u8, prefix, "*?") == null and mir_vm.isValidSandboxedEmbedPath(prefix);
     }
-
-    /// Returns slice of token `tok_i`.
-    inline fn lexeme(self: *const ManifestCfgEval, tok_i: u32) []const u8 {
-        if (tok_i >= self.tok_buf.countTokens()) return "";
-        const tok = self.tok_buf.getToken(TokenIndex.fromInt(tok_i));
-        return self.src[tok.byte_offset .. tok.byte_offset + tok.byte_len];
-    }
-
-    /// Evaluates `OrExpr = AndExpr { "or" AndExpr }`.
-    fn evalOr(self: *ManifestCfgEval) ?bool {
-        if (self.depth > 32) return null;
-        var lhs = self.evalAnd() orelse return null;
-        while (self.peek() == .kw_or) {
-            self.idx += 1;
-            const rhs = self.evalAnd() orelse return null;
-            lhs = lhs or rhs;
-        }
-        return lhs;
-    }
-
-    /// Evaluates `AndExpr = UnaryExpr { "and" UnaryExpr }`.
-    fn evalAnd(self: *ManifestCfgEval) ?bool {
-        var lhs = self.evalUnary() orelse return null;
-        while (self.peek() == .kw_and) {
-            self.idx += 1;
-            const rhs = self.evalUnary() orelse return null;
-            lhs = lhs and rhs;
-        }
-        return lhs;
-    }
-
-    /// Evaluates `UnaryExpr = "not" UnaryExpr | AtomExpr`.
-    fn evalUnary(self: *ManifestCfgEval) ?bool {
-        if (self.peek() == .kw_not) {
-            self.idx += 1;
-            self.depth += 1;
-            defer self.depth -= 1;
-            return !(self.evalUnary() orelse return null);
-        }
-        return self.evalAtom();
-    }
-
-    /// Evaluates parenthesized expressions, `target.<field> == / != / is`, and `cfg.<flag>`.
-    fn evalAtom(self: *ManifestCfgEval) ?bool {
-        const kind = self.peek();
-        if (kind == .lparen) {
-            self.idx += 1;
-            self.depth += 1;
-            const inner = self.evalOr();
-            self.depth -= 1;
-            if (inner == null or self.peek() != .rparen) return null;
-            self.idx += 1;
-            return inner;
-        }
-        if (kind == .kw_true or kind == .kw_false) {
-            self.idx += 1;
-            return kind == .kw_true;
-        }
-        if (kind != .ident) return null;
-        const head = self.lexeme(self.idx);
-        self.idx += 1;
-
-        if (std.mem.eql(u8, head, "debug")) return self.env.is_debug;
-        if (std.mem.eql(u8, head, "test")) return self.env.is_test_mode;
-
-        if (std.mem.eql(u8, head, "cfg")) {
-            if (self.peek() != .dot) return null;
-            self.idx += 1;
-            if (self.peek() != .ident) return null;
-            const sub = self.lexeme(self.idx);
-            self.idx += 1;
-            if (std.mem.eql(u8, sub, "debug")) return self.env.is_debug;
-            if (std.mem.eql(u8, sub, "test_mode") or std.mem.eql(u8, sub, "test")) return self.env.is_test_mode;
-            if (std.mem.eql(u8, sub, "sim_mode")) return self.env.is_sim_mode;
-            if (std.mem.eql(u8, sub, "fuzz_mode")) return self.env.is_fuzz_mode;
-            if (std.mem.eql(u8, sub, "feature")) {
-                if (self.peek() != .dot) return null;
-                self.idx += 1;
-                if (self.peek() != .ident) return null;
-                const feat_name = self.lexeme(self.idx);
-                self.idx += 1;
-                for (self.env.enabled_features) |enabled| {
-                    if (std.mem.eql(u8, enabled, feat_name)) return true;
-                }
-                return false;
-            }
-            return null;
-        }
-
-        if (!std.mem.eql(u8, head, "target") or self.peek() != .dot) return null;
-        self.idx += 1;
-        if (self.peek() != .ident) return null;
-        const prop = self.lexeme(self.idx);
-        self.idx += 1;
-
-        if (std.mem.eql(u8, prop, "ptr_width")) {
-            const op_tok = self.peek();
-            if (op_tok != .eqeq and op_tok != .bang_eq) return null;
-            self.idx += 1;
-            if (self.peek() != .int_lit) return null;
-            const width_val = std.fmt.parseInt(u16, self.lexeme(self.idx), 10) catch return null;
-            if (width_val != 32 and width_val != 64) return null;
-            self.idx += 1;
-            return if (op_tok == .eqeq) (self.env.ptr_width == width_val) else (self.env.ptr_width != width_val);
-        }
-
-        const rel_tok = self.peek();
-        if (rel_tok == .eqeq or rel_tok == .bang_eq) {
-            self.idx += 1;
-            const matched = self.matchTargetVariant(prop) orelse return null;
-            return if (rel_tok == .eqeq) matched else !matched;
-        }
-        if (rel_tok == .kw_is) {
-            self.idx += 1;
-            const has_paren = self.peek() == .lparen;
-            if (has_paren) self.idx += 1;
-            var any_match = self.matchTargetVariant(prop) orelse return null;
-            while (self.peek() == .pipe) {
-                self.idx += 1;
-                const branch_ok = self.matchTargetVariant(prop) orelse return null;
-                any_match = any_match or branch_ok;
-            }
-            if (has_paren) {
-                if (self.peek() != .rparen) return null;
-                self.idx += 1;
-            }
-            return any_match;
-        }
-        return null;
-    }
-
-    /// Matches `.Variant` or `"variant"` against `target.<prop>`.
-    fn matchTargetVariant(self: *ManifestCfgEval, prop: []const u8) ?bool {
-        var variant_name: []const u8 = "";
-        if (self.peek() == .dot) {
-            self.idx += 1;
-            if (self.peek() != .type_ident and self.peek() != .const_ident and self.peek() != .ident) {
-                return null;
-            }
-            variant_name = self.lexeme(self.idx);
-            self.idx += 1;
-        } else if (self.peek() == .string_lit) {
-            const raw_s = self.lexeme(self.idx);
-            if (raw_s.len < 2) return null;
-            variant_name = raw_s[1 .. raw_s.len - 1];
-            self.idx += 1;
-        } else {
-            return null;
-        }
-
-        if (std.mem.eql(u8, prop, "os")) {
-            if (std.ascii.eqlIgnoreCase(variant_name, "linux")) return self.env.os == .linux;
-            if (std.ascii.eqlIgnoreCase(variant_name, "macos")) return self.env.os == .macos;
-            if (std.ascii.eqlIgnoreCase(variant_name, "windows")) return self.env.os == .windows;
-            if (std.ascii.eqlIgnoreCase(variant_name, "wasi")) return self.env.os == .wasi;
-            if (std.ascii.eqlIgnoreCase(variant_name, "freestanding") or
-                std.ascii.eqlIgnoreCase(variant_name, "none"))
-            {
-                return self.env.os == .freestanding;
-            }
-            return null;
-        }
-        if (std.mem.eql(u8, prop, "arch")) {
-            if (std.ascii.eqlIgnoreCase(variant_name, "x86_64")) return self.env.arch == .x86_64;
-            if (std.ascii.eqlIgnoreCase(variant_name, "aarch64")) return self.env.arch == .aarch64;
-            if (std.ascii.eqlIgnoreCase(variant_name, "wasm32")) return self.env.arch == .wasm32;
-            return null;
-        }
-        if (std.mem.eql(u8, prop, "abi")) {
-            if (std.ascii.eqlIgnoreCase(variant_name, "gnu")) return self.env.abi == .gnu;
-            if (std.ascii.eqlIgnoreCase(variant_name, "msvc")) return self.env.abi == .msvc;
-            if (std.ascii.eqlIgnoreCase(variant_name, "musl")) return self.env.abi == .musl;
-            if (std.ascii.eqlIgnoreCase(variant_name, "apple")) return self.env.abi == .apple;
-            if (std.ascii.eqlIgnoreCase(variant_name, "wasi")) return self.env.abi == .wasi;
-            if (std.ascii.eqlIgnoreCase(variant_name, "none")) return self.env.abi == .none;
-            return null;
-        }
-        if (std.mem.eql(u8, prop, "endian")) {
-            if (std.ascii.eqlIgnoreCase(variant_name, "little")) return self.env.endian == .little;
-            if (std.ascii.eqlIgnoreCase(variant_name, "big")) return self.env.endian == .big;
-            return null;
-        }
-        return null;
-    }
-};
+    return std.mem.indexOfAny(u8, raw_pat, "*?") == null and mir_vm.isValidSandboxedEmbedPath(raw_pat);
+}
 
 /// Parses a TOML string array of canonical capabilities (`"unsafe_op"`, rejecting `"unsafe"` / unknown).
 fn parseCapabilityElemArray(
@@ -3671,9 +3507,8 @@ fn sortAndDedupStringIds(
 /// Parses `"b3:<64-lowercase-or-hex>"` into a 32-byte digest (`null` on invalid prefix/hex).
 fn parsePrefixedBlake3Hex(raw_str: []const u8) ?[32]u8 {
     if (!std.mem.startsWith(u8, raw_str, "b3:") or raw_str.len != 67) return null;
-    const hex_part = raw_str[3..];
     var out: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, hex_part) catch return null;
+    _ = std.fmt.hexToBytes(&out, raw_str[3..]) catch return null;
     return out;
 }
 
@@ -3702,8 +3537,7 @@ fn parseShorthandGitOrReq(
         var rev_kind: GitRevKind = .default_head;
         var rev_val: StringId = .empty;
 
-        const sep_idx_opt = std.mem.lastIndexOfAny(u8, raw_spec, "@#");
-        if (sep_idx_opt) |sep_idx| {
+        if (std.mem.lastIndexOfAny(u8, raw_spec, "@#")) |sep_idx| {
             const scheme_end = if (std.mem.indexOf(u8, raw_spec, "://")) |sc_i| sc_i + 3 else 0;
             const is_ssh_at = std.mem.startsWith(u8, raw_spec, "git+ssh://git@") and sep_idx < 16;
             if (!is_ssh_at and sep_idx > scheme_end) {
@@ -3892,7 +3726,7 @@ fn parseDependencySection(
                     continue;
                 }
                 is_ws_inherit = true;
-            } else if (std.mem.eql(u8, sub_k, "default-features") or std.mem.eql(u8, sub_k, "default_features")) {
+            } else if (std.mem.eql(u8, sub_k, "default-features")) {
                 if (sub_kv.val != .bool_val) {
                     has_entry_err = true;
                     try emitManifestFieldErr(sink, sub_kv.val_span, "`default-features` must be a boolean");
@@ -4090,11 +3924,9 @@ fn parseSecuritySection(
                 continue;
             }
             const pol_s = kv.val.str_val;
-            if (std.mem.eql(u8, pol_s, "trust_on_first_lock") or std.mem.eql(u8, pol_s, "tofu")) {
+            if (std.mem.eql(u8, pol_s, "trust_on_first_lock")) {
                 policy.default_dep_policy = .trust_on_first_lock;
-            } else if (std.mem.eql(u8, pol_s, "zero_trust") or std.mem.eql(u8, pol_s, "deny_all") or
-                std.mem.eql(u8, pol_s, "pure_only") or std.mem.eql(u8, pol_s, "strict"))
-            {
+            } else if (std.mem.eql(u8, pol_s, "zero_trust")) {
                 policy.default_dep_policy = .zero_trust;
                 if (policy.default_allow_caps == null) policy.default_allow_caps = .EMPTY;
             } else if (std.mem.eql(u8, pol_s, "allow_all")) {
@@ -4109,7 +3941,7 @@ fn parseSecuritySection(
                     "invalid `default_dep_policy`; expected `\"trust_on_first_lock\"`, `\"zero_trust\"`, or `\"allow_all\"`",
                 );
             }
-        } else if (std.mem.eql(u8, kv.key, "deny_caps") or std.mem.eql(u8, kv.key, "forbid_global_caps")) {
+        } else if (std.mem.eql(u8, kv.key, "deny_caps")) {
             if (kv.val != .array_val) {
                 try emitManifestFieldErr(sink, kv.val_span, "capability denylist must be an array of capability strings");
                 continue;
@@ -4124,7 +3956,6 @@ fn parseSecuritySection(
                 sink,
             )) |parsed_deny| {
                 policy.deny_caps = policy.deny_caps.unionWith(parsed_deny);
-                policy.forbid_global_caps = policy.deny_caps;
             }
         } else if (std.mem.eql(u8, kv.key, "enforcement_scope")) {
             if (kv.val != .str_val) {
@@ -4475,34 +4306,39 @@ fn resolveWorkspaceInheritedDeps(
     if (!has_any_ws_inherit) return deps;
 
     const resolved_deps = try arena.dupe(DependencySpec, deps);
+    var ws_by_alias: std.AutoHashMapUnmanaged(StringId, usize) = .empty;
+    defer ws_by_alias.deinit(allocator);
+    var ws_by_pkg: std.AutoHashMapUnmanaged(StringId, usize) = .empty;
+    defer ws_by_pkg.deinit(allocator);
+    for (ws_deps, 0..) |ws_dep, ws_i| {
+        if (ws_dep.source == .workspace_inherit) continue;
+        const alias_gop = try ws_by_alias.getOrPut(allocator, ws_dep.alias_kebab);
+        if (!alias_gop.found_existing) alias_gop.value_ptr.* = ws_i;
+        const pkg_gop = try ws_by_pkg.getOrPut(allocator, ws_dep.package_kebab);
+        if (!pkg_gop.found_existing) pkg_gop.value_ptr.* = ws_i;
+    }
+
     for (resolved_deps) |*dep_item| {
         if (dep_item.source != .workspace_inherit) continue;
-        var has_matched = false;
-        for (ws_deps) |ws_dep| {
-            if (ws_dep.source == .workspace_inherit) continue;
-            if (ws_dep.alias_kebab == dep_item.alias_kebab or
-                ws_dep.package_kebab == dep_item.package_kebab)
-            {
-                dep_item.source = ws_dep.source;
-                dep_item.package_kebab = ws_dep.package_kebab;
-                dep_item.has_default_features = dep_item.has_default_features and ws_dep.has_default_features;
-                if (dep_item.allow_caps == null) dep_item.allow_caps = ws_dep.allow_caps;
-                dep_item.deny_caps = dep_item.deny_caps.unionWith(ws_dep.deny_caps);
-                dep_item.has_comptime_io_cap = dep_item.has_comptime_io_cap or ws_dep.has_comptime_io_cap;
-                if (dep_item.features.len == 0) {
-                    dep_item.features = ws_dep.features;
-                } else if (ws_dep.features.len > 0) {
-                    var merged: std.ArrayList(StringId) = .empty;
-                    defer merged.deinit(allocator);
-                    try merged.appendSlice(allocator, ws_dep.features);
-                    try merged.appendSlice(allocator, dep_item.features);
-                    dep_item.features = try sortAndDedupStringIds(arena, interner, merged.items);
-                }
-                has_matched = true;
-                break;
+        const match_idx_opt = ws_by_alias.get(dep_item.alias_kebab) orelse ws_by_pkg.get(dep_item.package_kebab);
+        if (match_idx_opt) |ws_idx| {
+            const ws_dep = ws_deps[ws_idx];
+            dep_item.source = ws_dep.source;
+            dep_item.package_kebab = ws_dep.package_kebab;
+            dep_item.has_default_features = dep_item.has_default_features and ws_dep.has_default_features;
+            if (dep_item.allow_caps == null) dep_item.allow_caps = ws_dep.allow_caps;
+            dep_item.deny_caps = dep_item.deny_caps.unionWith(ws_dep.deny_caps);
+            dep_item.has_comptime_io_cap = dep_item.has_comptime_io_cap or ws_dep.has_comptime_io_cap;
+            if (dep_item.features.len == 0) {
+                dep_item.features = ws_dep.features;
+            } else if (ws_dep.features.len > 0) {
+                var merged: std.ArrayList(StringId) = .empty;
+                defer merged.deinit(allocator);
+                try merged.appendSlice(allocator, ws_dep.features);
+                try merged.appendSlice(allocator, dep_item.features);
+                dep_item.features = try sortAndDedupStringIds(arena, interner, merged.items);
             }
-        }
-        if (!has_matched) {
+        } else {
             try emitManifestFieldErr(
                 sink,
                 dep_item.decl_span,
@@ -4805,11 +4641,19 @@ fn lowerDomToManifest(
                         try emitManifestFieldErr(sink, pkv.val_span, "`package.publish` must be a boolean or registry array");
                     }
                 } else if (std.mem.eql(u8, pkv.key, "root_module")) {
-                    if (pkv.val != .str_val or pkv.val.str_val.len == 0) {
-                        try emitManifestFieldErr(sink, pkv.val_span, "`package.root_module` must be a non-empty relative path");
+                    if (pkv.val != .str_val) {
+                        try emitManifestFieldErr(sink, pkv.val_span, "`package.root_module` must be a relative path string");
                         continue;
                     }
-                    root_mod_id = try interner.intern(pkv.val.str_val);
+                    const norm_root = normalizeAndValidateManifestRelPath(pkv.val.str_val) orelse {
+                        try emitManifestFieldErr(
+                            sink,
+                            pkv.val_span,
+                            "`package.root_module` must be a jailed forward-slash relative path without `..` or `\\`",
+                        );
+                        continue;
+                    };
+                    root_mod_id = try interner.intern(norm_root);
                 } else if (std.mem.eql(u8, pkv.key, "links")) {
                     if (pkv.val != .str_val or pkv.val.str_val.len == 0) {
                         try emitManifestFieldErr(sink, pkv.val_span, "`package.links` must be a non-empty C library identifier");
@@ -4875,8 +4719,18 @@ fn lowerDomToManifest(
                     } else {
                         lib_name = try interner.intern(lkv.val.str_val);
                     }
-                } else if (std.mem.eql(u8, lkv.key, "path") and lkv.val == .str_val and lkv.val.str_val.len > 0) {
-                    lib_path = try interner.intern(lkv.val.str_val);
+                } else if (std.mem.eql(u8, lkv.key, "path")) {
+                    if (lkv.val != .str_val) {
+                        try emitManifestFieldErr(sink, lkv.val_span, "`lib.path` must be a relative path string");
+                    } else if (normalizeAndValidateManifestRelPath(lkv.val.str_val)) |norm_lib| {
+                        lib_path = try interner.intern(norm_lib);
+                    } else {
+                        try emitManifestFieldErr(
+                            sink,
+                            lkv.val_span,
+                            "`lib.path` must be a jailed forward-slash relative path without `..` or `\\`",
+                        );
+                    }
                 } else {
                     try emitManifestFieldErr(sink, lkv.key_span, "unknown key in `[lib]` table");
                 }
@@ -4901,6 +4755,7 @@ fn lowerDomToManifest(
                 }
                 var bin_name: ?StringId = null;
                 var bin_path: ?StringId = null;
+                var has_bad_bin_path = false;
                 for (belem.val.table_val.entries.items) |bkv| {
                     if (std.mem.eql(u8, bkv.key, "name") and bkv.val == .str_val) {
                         if (try validatePackageNameKebab(
@@ -4913,15 +4768,29 @@ fn lowerDomToManifest(
                         )) {
                             bin_name = try interner.intern(bkv.val.str_val);
                         }
-                    } else if (std.mem.eql(u8, bkv.key, "path") and bkv.val == .str_val and bkv.val.str_val.len > 0) {
-                        bin_path = try interner.intern(bkv.val.str_val);
+                    } else if (std.mem.eql(u8, bkv.key, "path")) {
+                        if (bkv.val != .str_val) {
+                            has_bad_bin_path = true;
+                            try emitManifestFieldErr(sink, bkv.val_span, "`bin.path` must be a relative path string");
+                        } else if (normalizeAndValidateManifestRelPath(bkv.val.str_val)) |norm_bin| {
+                            bin_path = try interner.intern(norm_bin);
+                        } else {
+                            has_bad_bin_path = true;
+                            try emitManifestFieldErr(
+                                sink,
+                                bkv.val_span,
+                                "`bin.path` must be a jailed forward-slash relative path without `..` or `\\`",
+                            );
+                        }
                     } else {
                         try emitManifestFieldErr(sink, bkv.key_span, "unknown key in `[[bin]]` target");
                     }
                 }
                 if (bin_name) |bn| {
-                    const resolved_path = bin_path orelse try interner.intern("src/main.cx");
-                    try bins_list.append(arena.asAllocator(), .{ .name_kebab = bn, .path = resolved_path });
+                    if (!has_bad_bin_path) {
+                        const resolved_path = bin_path orelse try interner.intern("src/main.cx");
+                        try bins_list.append(arena.asAllocator(), .{ .name_kebab = bn, .path = resolved_path });
+                    }
                 } else {
                     try emitManifestFieldErr(sink, belem.span, "`[[bin]]` target requires `name`");
                 }
@@ -5017,13 +4886,11 @@ fn lowerDomToManifest(
 
             for (top_kv.val.table_val.entries.items) |wkv| {
                 if (std.mem.eql(u8, wkv.key, "members") and wkv.val == .array_val) {
-                    ws_cfg.members = try extractStringArraySorted(arena, interner, wkv.val.array_val, sink);
-                } else if ((std.mem.eql(u8, wkv.key, "default-members") or
-                    std.mem.eql(u8, wkv.key, "default_members")) and wkv.val == .array_val)
-                {
-                    ws_cfg.default_members = try extractStringArraySorted(arena, interner, wkv.val.array_val, sink);
+                    ws_cfg.members = try extractWorkspaceRelArraySorted(arena, interner, wkv.val.array_val, true, sink);
+                } else if (std.mem.eql(u8, wkv.key, "default-members") and wkv.val == .array_val) {
+                    ws_cfg.default_members = try extractWorkspaceRelArraySorted(arena, interner, wkv.val.array_val, false, sink);
                 } else if (std.mem.eql(u8, wkv.key, "exclude") and wkv.val == .array_val) {
-                    ws_cfg.exclude = try extractStringArraySorted(arena, interner, wkv.val.array_val, sink);
+                    ws_cfg.exclude = try extractWorkspaceRelArraySorted(arena, interner, wkv.val.array_val, false, sink);
                 } else if (std.mem.eql(u8, wkv.key, "dependencies") and wkv.val == .table_val) {
                     try parseDependencySection(arena, interner, doc, wkv.val.table_val, .normal, cfg_env, &ws_deps, sink);
                 } else if (std.mem.eql(u8, wkv.key, "security") and wkv.val == .table_val) {
@@ -5127,6 +4994,14 @@ fn lowerDomToManifest(
         }
     }.lessThan);
 
+    if (manifest.lib_target) |*lib_tgt| {
+        if (lib_tgt.name_snake == .empty) {
+            if (manifest.package) |pkg_meta| {
+                lib_tgt.name_snake = pkg_meta.module_snake;
+            }
+        }
+    }
+
     manifest.bin_targets = bins_list.items;
     manifest.features = feats_list.items;
     manifest.dependencies = if (manifest.workspace) |ws_self|
@@ -5140,27 +5015,121 @@ fn lowerDomToManifest(
         )
     else
         deps_list.items;
+    if (root_tbl.findEntry("features")) |feat_entry| {
+        if (feat_entry.val == .table_val) {
+            try validateManifestFeatureActivations(
+                arena.backing_allocator,
+                interner,
+                feat_entry.val.table_val,
+                manifest.features,
+                manifest.dependencies,
+                sink,
+            );
+        }
+    }
     manifest.excludes = excludes_list.items;
     manifest.patches = patches_list.items;
     manifest.root_manifest_blake3 = computeNormalizedManifestBlake3(&manifest, interner);
     return manifest;
 }
 
-/// Extracts and sorts a TOML array of non-empty strings into `StringId`s.
-fn extractStringArraySorted(
+/// Validates `[features]` activation targets (`dep:<opt>`, `<dep>/<feat>`, `<local_feat>`) in $O(1)$ per entry.
+fn validateManifestFeatureActivations(
+    allocator: std.mem.Allocator,
+    interner: *StringInterner,
+    feat_tbl: *const TomlDomTable,
+    features: []const FeatureDecl,
+    dependencies: []const DependencySpec,
+    sink: ?*DiagnosticSink,
+) !void {
+    if (features.len == 0) return;
+
+    var declared_set: std.AutoHashMapUnmanaged(StringId, void) = .empty;
+    defer declared_set.deinit(allocator);
+    for (features) |feat_decl| {
+        try declared_set.put(allocator, feat_decl.name, {});
+    }
+
+    var all_dep_set: std.AutoHashMapUnmanaged(StringId, void) = .empty;
+    defer all_dep_set.deinit(allocator);
+    var opt_dep_set: std.AutoHashMapUnmanaged(StringId, void) = .empty;
+    defer opt_dep_set.deinit(allocator);
+    for (dependencies) |dep| {
+        try all_dep_set.put(allocator, dep.alias_kebab, {});
+        if (dep.is_optional) {
+            try opt_dep_set.put(allocator, dep.alias_kebab, {});
+        }
+    }
+
+    for (feat_tbl.entries.items) |fkv| {
+        if (fkv.key.len == 0 or fkv.val != .array_val) continue;
+        for (fkv.val.array_val) |aelem| {
+            if (aelem.val != .str_val or aelem.val.str_val.len == 0) continue;
+            const act_str = aelem.val.str_val;
+            if (std.mem.startsWith(u8, act_str, "dep:")) {
+                const opt_name = act_str[4..];
+                const opt_id = try interner.intern(opt_name);
+                if (opt_name.len == 0 or !opt_dep_set.contains(opt_id)) {
+                    try emitManifestFieldErr(
+                        sink,
+                        aelem.span,
+                        "`dep:<name>` in `[features]` must reference an `optional = true` dependency",
+                    );
+                }
+            } else if (std.mem.indexOfScalar(u8, act_str, '/')) |slash_pos| {
+                const raw_dep = act_str[0..slash_pos];
+                const dep_alias = if (std.mem.endsWith(u8, raw_dep, "?"))
+                    raw_dep[0 .. raw_dep.len - 1]
+                else
+                    raw_dep;
+                const sub_feat = act_str[slash_pos + 1 ..];
+                const dep_id = try interner.intern(dep_alias);
+                if (dep_alias.len == 0 or sub_feat.len == 0 or !all_dep_set.contains(dep_id)) {
+                    try emitManifestFieldErr(
+                        sink,
+                        aelem.span,
+                        "`<dep>/<feature>` in `[features]` references an undeclared dependency alias",
+                    );
+                }
+            } else {
+                const local_id = try interner.intern(act_str);
+                if (!declared_set.contains(local_id) and !opt_dep_set.contains(local_id)) {
+                    try emitManifestFieldErr(
+                        sink,
+                        aelem.span,
+                        "`[features]` activation references an undeclared local feature or non-optional dependency",
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Extracts, validates, and sorts `[workspace]` relative directory or `/*` glob patterns into `StringId`s.
+fn extractWorkspaceRelArraySorted(
     arena: *BumpArena,
     interner: *StringInterner,
     elems: []const TomlDomElem,
+    is_glob_allowed: bool,
     sink: ?*DiagnosticSink,
 ) ![]const StringId {
     var ids: std.ArrayList(StringId) = .empty;
     defer ids.deinit(arena.backing_allocator);
     for (elems) |el| {
         if (el.val != .str_val or el.val.str_val.len == 0) {
-            try emitManifestFieldErr(sink, el.span, "expected non-empty string element");
+            try emitManifestFieldErr(sink, el.span, "expected non-empty relative path string in `[workspace]` array");
             continue;
         }
-        try ids.append(arena.backing_allocator, try interner.intern(el.val.str_val));
+        const stripped = if (std.mem.startsWith(u8, el.val.str_val, "./")) el.val.str_val[2..] else el.val.str_val;
+        if (!isValidWorkspaceRelPattern(stripped, is_glob_allowed)) {
+            try emitManifestFieldErr(
+                sink,
+                el.span,
+                "`[workspace]` path must be a jailed forward-slash relative directory without `..`, `:`, or `\\`",
+            );
+            continue;
+        }
+        try ids.append(arena.backing_allocator, try interner.intern(stripped));
     }
     return sortAndDedupStringIds(arena, interner, ids.items);
 }
@@ -5354,16 +5323,22 @@ pub fn validateAndEvalManifestTargetCfg(
         return null;
     }
 
-    // [2] Tokenize `trimmed` with CoreX's non-backtracking lexer and evaluate against `cfg_env`:
+    // [2] Pre-tokenize `trimmed` to bound token count and reject invalid/escape tokens before `@cfg(…)` parsing:
+    const alloc = arena.backing_allocator;
     const nul_src = try arena.dupeZ(trimmed);
-    var tok_buf = TokenBuffer.init(arena.backing_allocator);
-    defer tok_buf.deinit();
-    try lexer.tokenize(nul_src, FileId.fromInt(0), &tok_buf, null, null);
+    var pre_tok_buf = TokenBuffer.init(alloc);
+    defer pre_tok_buf.deinit();
+    try lexer.tokenize(nul_src, FileId.fromInt(0), &pre_tok_buf, null, null);
 
-    const tok_count = tok_buf.countTokens();
+    const pre_count = pre_tok_buf.countTokens();
+    if (pre_count > 120) {
+        try emitManifestFieldErr(sink, span, "`target` `@cfg` predicate exceeds maximum token complexity (`120` tokens)");
+        return null;
+    }
+    var paren_balance: i32 = 0;
     var check_i: u32 = 0;
-    while (check_i < tok_count) : (check_i += 1) {
-        const tk = tok_buf.getToken(TokenIndex.fromInt(check_i)).kind;
+    while (check_i < pre_count) : (check_i += 1) {
+        const tk = pre_tok_buf.getToken(TokenIndex.fromInt(check_i)).kind;
         if (tk == .invalid_token or tk == .pipepipe or tk == .bang or tk == .amp) {
             try emitManifestFieldErr(
                 sink,
@@ -5372,19 +5347,90 @@ pub fn validateAndEvalManifestTargetCfg(
             );
             return null;
         }
+        if (tk == .semi or tk == .lbrace or tk == .rbrace or tk == .at) {
+            try emitManifestFieldErr(sink, span, "malformed CoreX `@cfg` expression in dependency `target` field");
+            return null;
+        }
+        if (tk == .lparen) {
+            paren_balance += 1;
+        } else if (tk == .rparen) {
+            paren_balance -= 1;
+            if (paren_balance < 0) {
+                try emitManifestFieldErr(sink, span, "unbalanced `)` in dependency `target` `@cfg` predicate");
+                return null;
+            }
+        }
     }
-
-    var evaluator = ManifestCfgEval{ .src = nul_src, .tok_buf = &tok_buf, .env = cfg_env };
-    const eval_res = evaluator.evalOr();
-    if (eval_res == null or evaluator.peek() != .eof) {
-        try emitManifestFieldErr(
-            sink,
-            span,
-            "malformed CoreX `@cfg` expression in dependency `target` field",
-        );
+    if (paren_balance != 0) {
+        try emitManifestFieldErr(sink, span, "unclosed `(` in dependency `target` `@cfg` predicate");
         return null;
     }
-    return eval_res.?;
+
+    // [3] Delegate to CoreX's canonical parser + `symbol_resolver.evaluateCstNodeCfgWithEnv` with $O(1)$ feature sets:
+    const probe_src = try std.fmt.allocPrintSentinel(arena.asAllocator(), "@cfg({s}) fn cx_cfg_probe() {{}}", .{trimmed}, 0);
+    var probe_toks = TokenBuffer.init(alloc);
+    defer probe_toks.deinit();
+    var probe_cst = LosslessCstArena.init(alloc);
+    defer probe_cst.deinit();
+    var probe_ast = AstArena.init(alloc);
+    defer probe_ast.deinit();
+    var probe_sink = DiagnosticSink.init(alloc);
+    defer probe_sink.deinit();
+
+    _ = try parser.parseSource(
+        probe_src,
+        FileId.fromInt(0),
+        &probe_toks,
+        &probe_cst,
+        &probe_ast,
+        &probe_sink,
+        interner,
+    );
+    if (probe_cst.has_parse_errors or probe_sink.error_count > 0 or probe_cst.countNodes() < 2) {
+        try emitManifestFieldErr(sink, span, "malformed CoreX `@cfg` expression in dependency `target` field");
+        return null;
+    }
+
+    var eff_env = cfg_env.*;
+    var local_sym_table: ?symbol_resolver.SymbolTable = null;
+    defer if (local_sym_table) |*st| st.deinit();
+
+    if (eff_env.sym_table_features == null and (eff_env.enabled_features.len > 0 or eff_env.declared_features != null)) {
+        var st = try symbol_resolver.SymbolTable.init(alloc, interner);
+        errdefer st.deinit();
+        if (eff_env.declared_features) |decl_feats| {
+            try st.has_package_feature_manifest.put(st.allocator, eff_env.owner_pkg_id, {});
+            for (decl_feats) |feat_str| {
+                try st.declarePackageFeature(eff_env.owner_pkg_id, try interner.intern(feat_str));
+            }
+        }
+        for (eff_env.enabled_features) |en_str| {
+            try st.enablePackageFeature(eff_env.owner_pkg_id, try interner.intern(en_str));
+        }
+        local_sym_table = st;
+        eff_env.enabled_features = &.{};
+        eff_env.declared_features = null;
+        eff_env.sym_table_features = &local_sym_table.?;
+    }
+
+    const eval_ok = try symbol_resolver.evaluateCstNodeCfgWithEnv(
+        &eff_env,
+        FileId.fromInt(0),
+        probe_src,
+        &probe_toks,
+        &probe_cst,
+        CstNodeIndex.fromInt(1),
+        &probe_sink,
+    );
+    if (probe_sink.error_count > 0) {
+        const detail = if (probe_sink.diagnostics.items.len > 0)
+            try arena.dupe(u8, probe_sink.diagnostics.items[0].message)
+        else
+            "malformed CoreX `@cfg` expression in dependency `target` field";
+        try emitManifestFieldErr(sink, span, detail);
+        return null;
+    }
+    return eval_ok;
 }
 
 // ------------- Script Frontmatter & Inline `use` --------------
@@ -5556,10 +5602,40 @@ pub fn parseInlineUseSpec(
             try emitManifestFieldErr(sink, spec_span, "inline package import specifier cannot contain control bytes");
             return null;
         }
+        switch (ch_b) {
+            '"', '\'', '\\', '{', '}', '[', ']', '#' => {
+                try emitManifestFieldErr(
+                    sink,
+                    spec_span,
+                    "inline package import specifier contains forbidden TOML metacharacter (`\"`, `'`, `\\`, `{`, `}`, `[`, `]`, or `#`)",
+                );
+                return null;
+            },
+            else => {},
+        }
     }
 
     // [1] Local relative directory path (`./…` or `../…`):
     if (std.mem.startsWith(u8, raw_spec, "./") or std.mem.startsWith(u8, raw_spec, "../")) {
+        if (std.mem.indexOfScalar(u8, raw_spec, ':') != null) {
+            try emitManifestFieldErr(sink, spec_span, "local inline `use` path cannot contain `:` or drive letters");
+            return null;
+        }
+        var has_named_seg = false;
+        var seg_iter = std.mem.splitScalar(u8, std.mem.trimEnd(u8, raw_spec, "/"), '/');
+        while (seg_iter.next()) |seg| {
+            if (seg.len == 0) {
+                try emitManifestFieldErr(sink, spec_span, "local inline `use` path cannot contain empty `/` segments");
+                return null;
+            }
+            if (!std.mem.eql(u8, seg, ".") and !std.mem.eql(u8, seg, "..")) {
+                has_named_seg = true;
+            }
+        }
+        if (!has_named_seg) {
+            try emitManifestFieldErr(sink, spec_span, "local inline `use` path must name a target package directory");
+            return null;
+        }
         return .{
             .alias_snake = alias_snake_id,
             .alias_kebab = alias_kebab_id,
@@ -5832,12 +5908,10 @@ pub fn computeNormalizedManifestBlake3(
         hashLenPrefixedBytes(&hasher, interner.get(bin_tgt.path));
     }
 
-    const feat_cnt = std.mem.toBytes(std.mem.nativeToLittle(u32, @intCast(manifest.features.len)));
-    hasher.update(&feat_cnt);
+    hasher.update(&std.mem.toBytes(std.mem.nativeToLittle(u32, @intCast(manifest.features.len))));
     for (manifest.features) |feat| {
         hashLenPrefixedBytes(&hasher, interner.get(feat.name));
-        const act_cnt = std.mem.toBytes(std.mem.nativeToLittle(u32, @intCast(feat.activations.len)));
-        hasher.update(&act_cnt);
+        hasher.update(&std.mem.toBytes(std.mem.nativeToLittle(u32, @intCast(feat.activations.len))));
         for (feat.activations) |act_id| hashLenPrefixedBytes(&hasher, interner.get(act_id));
     }
 
@@ -5897,7 +5971,7 @@ pub fn computeNormalizedManifestBlake3(
 }
 
 /// Wraps a single parsed `Manifest` into a `WorkspaceManifestBundle` for `pkg_resolver`.
-pub fn bundleFromSingleManifest(
+pub fn buildBundleFromSingleManifest(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
     manifest_path: []const u8,
@@ -6004,12 +6078,20 @@ pub fn loadWorkspaceManifestBundle(
     }
 
     if (parsed_root.manifest.workspace) |ws_cfg| {
-        const MemberDirCandidate = struct {
-            rel_dir: []const u8,
-            is_explicit: bool,
-        };
         var rel_dirs: std.ArrayList(MemberDirCandidate) = .empty;
         defer rel_dirs.deinit(allocator);
+
+        var exclude_set: std.StringHashMapUnmanaged(void) = .empty;
+        defer exclude_set.deinit(allocator);
+        for (ws_cfg.exclude) |ex_id| {
+            try exclude_set.put(allocator, interner.get(ex_id), {});
+        }
+
+        var default_member_set: std.StringHashMapUnmanaged(void) = .empty;
+        defer default_member_set.deinit(allocator);
+        for (ws_cfg.default_members) |def_id| {
+            try default_member_set.put(allocator, interner.get(def_id), {});
+        }
 
         for (ws_cfg.members) |pat_id| {
             const pat = interner.get(pat_id);
@@ -6049,16 +6131,7 @@ pub fn loadWorkspaceManifestBundle(
                 if (std.mem.eql(u8, prior_rel, rel_d)) continue;
             }
             prev_rel_dir = rel_d;
-            if (std.mem.eql(u8, rel_d, ".")) continue;
-
-            var is_excluded = false;
-            for (ws_cfg.exclude) |ex_id| {
-                if (std.mem.eql(u8, interner.get(ex_id), rel_d)) {
-                    is_excluded = true;
-                    break;
-                }
-            }
-            if (is_excluded) continue;
+            if (std.mem.eql(u8, rel_d, ".") or exclude_set.contains(rel_d)) continue;
 
             const mem_dir = try std.fmt.allocPrint(arena.asAllocator(), "{s}/{s}", .{ owned_root_dir, rel_d });
             const mem_toml = try std.fmt.allocPrint(arena.asAllocator(), "{s}/corex.toml", .{mem_dir});
@@ -6118,13 +6191,7 @@ pub fn loadWorkspaceManifestBundle(
             );
             parsed_mem.manifest.root_manifest_blake3 = computeNormalizedManifestBlake3(&parsed_mem.manifest, interner);
 
-            var is_default = ws_cfg.default_members.len == 0;
-            for (ws_cfg.default_members) |def_id| {
-                if (std.mem.eql(u8, interner.get(def_id), rel_d)) {
-                    is_default = true;
-                    break;
-                }
-            }
+            const is_default = ws_cfg.default_members.len == 0 or default_member_set.contains(rel_d);
             try member_list.append(arena.asAllocator(), .{
                 .rel_dir = rel_d,
                 .abs_dir = mem_dir,
@@ -6160,6 +6227,45 @@ pub fn loadWorkspaceManifestBundle(
     };
 }
 
+/// Appends a complete TOML v1.0 basic string literal (`"…"`, including surrounding quotes) onto `list`,
+/// escaping `\\`, `\"`, `\b`, `\t`, `\n`, `\f`, `\r`, and control bytes `< 0x20` or `0x7F` as `\u00XX`.
+pub fn appendEscapedTomlBasicString(
+    list: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+) !void {
+    try list.ensureUnusedCapacity(allocator, raw.len + 2);
+    try list.append(allocator, '"');
+    for (raw) |ch_b| {
+        switch (ch_b) {
+            '\\' => try list.appendSlice(allocator, "\\\\"),
+            '"' => try list.appendSlice(allocator, "\\\""),
+            0x08 => try list.appendSlice(allocator, "\\b"),
+            '\t' => try list.appendSlice(allocator, "\\t"),
+            '\n' => try list.appendSlice(allocator, "\\n"),
+            0x0C => try list.appendSlice(allocator, "\\f"),
+            '\r' => try list.appendSlice(allocator, "\\r"),
+            else => {
+                if (ch_b < 0x20 or ch_b == 0x7F) {
+                    const hex_digits = "0123456789abcdef";
+                    const esc_seq = [6]u8{
+                        '\\',
+                        'u',
+                        '0',
+                        '0',
+                        hex_digits[(ch_b >> 4) & 0x0F],
+                        hex_digits[ch_b & 0x0F],
+                    };
+                    try list.appendSlice(allocator, &esc_seq);
+                } else {
+                    try list.append(allocator, ch_b);
+                }
+            },
+        }
+    }
+    try list.append(allocator, '"');
+}
+
 /// Builds a quote-preserving `TextEdit` replacing `[anchor.val_lo .. anchor.val_hi)` with `new_unquoted_val`.
 pub fn buildScalarReplaceEdit(
     doc: *const TomlDocumentView,
@@ -6167,19 +6273,23 @@ pub fn buildScalarReplaceEdit(
     anchor: TomlSpanAnchor,
     new_unquoted_val: []const u8,
 ) !TextEdit {
-    const is_single = ((anchor.flags & 0x02) != 0) or
-        (anchor.val_lo < doc.full_file_bytes.len and doc.full_file_bytes[anchor.val_lo] == '\'');
-    const quote_char: u8 = if (is_single) '\'' else '"';
-    var buf: [512]u8 = undefined;
-    const formatted = if (new_unquoted_val.len + 2 <= buf.len)
-        try std.fmt.bufPrint(&buf, "{c}{s}{c}", .{ quote_char, new_unquoted_val, quote_char })
-    else
-        new_unquoted_val;
+    const is_single_safe = (((anchor.flags & 0x02) != 0) or
+        (anchor.val_lo < doc.full_file_bytes.len and doc.full_file_bytes[anchor.val_lo] == '\'')) and
+        std.mem.indexOfAny(u8, new_unquoted_val, "'\r\n") == null;
+    var out_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer out_buf.deinit(interner.backing_allocator);
+    if (is_single_safe) {
+        try out_buf.append(interner.backing_allocator, '\'');
+        try out_buf.appendSlice(interner.backing_allocator, new_unquoted_val);
+        try out_buf.append(interner.backing_allocator, '\'');
+    } else {
+        try appendEscapedTomlBasicString(&out_buf, interner.backing_allocator, new_unquoted_val);
+    }
     return .{
         .file_id = anchor.file_id,
         .start_byte = anchor.val_lo,
         .end_byte = anchor.val_hi,
-        .replacement_id = try interner.intern(formatted),
+        .replacement_id = try interner.intern(out_buf.items),
     };
 }
 
@@ -6198,25 +6308,22 @@ pub fn buildInsertAliasLineEdit(
     const target_col: usize = @max(@as(usize, anchor.eq_col), alias_kebab.len + 1);
     const pad_spaces: usize = target_col - alias_kebab.len;
 
-    var line_buf: [512]u8 = undefined;
-    var pos: usize = 0;
-    @memcpy(line_buf[pos .. pos + alias_kebab.len], alias_kebab);
-    pos += alias_kebab.len;
-    const clamped_pad = @min(pad_spaces, 64);
-    @memset(line_buf[pos .. pos + clamped_pad], ' ');
-    pos += clamped_pad;
-    const rhs = try std.fmt.bufPrint(
-        line_buf[pos..],
-        "= {{ package = \"{s}\", version = \"{s}\" }}{s}",
-        .{ pkg_kebab, ver_str, nl },
-    );
-    pos += rhs.len;
+    var line_list: std.ArrayListUnmanaged(u8) = .empty;
+    defer line_list.deinit(interner.backing_allocator);
+    try line_list.appendSlice(interner.backing_allocator, alias_kebab);
+    try line_list.appendNTimes(interner.backing_allocator, ' ', @min(pad_spaces, 64));
+    try line_list.appendSlice(interner.backing_allocator, "= { package = ");
+    try appendEscapedTomlBasicString(&line_list, interner.backing_allocator, pkg_kebab);
+    try line_list.appendSlice(interner.backing_allocator, ", version = ");
+    try appendEscapedTomlBasicString(&line_list, interner.backing_allocator, ver_str);
+    try line_list.appendSlice(interner.backing_allocator, " }");
+    try line_list.appendSlice(interner.backing_allocator, nl);
 
     return .{
         .file_id = anchor.file_id,
         .start_byte = anchor.row_end,
         .end_byte = anchor.row_end,
-        .replacement_id = try interner.intern(line_buf[0..pos]),
+        .replacement_id = try interner.intern(line_list.items),
     };
 }
 
@@ -6328,7 +6435,7 @@ pub fn compareLockPackages(
     return std.mem.order(u8, interner.get(lhs.source), interner.get(rhs.source));
 }
 
-/// Serializes `lockfile` into deterministic canonical `corex.lock` v1 text (`reconciled_overrides.md` §1.3).
+/// Serializes `lockfile` into deterministic canonical `corex.lock` v1 text (`DR-11` §1.3).
 pub fn serializeLockfile(
     allocator: std.mem.Allocator,
     lockfile: *const Lockfile,
@@ -6371,9 +6478,7 @@ pub fn serializeLockfile(
                 if ((bits & cap_entry.bit) != 0) {
                     if (!is_first) try buf.appendSlice(alloc, ", ");
                     is_first = false;
-                    try buf.append(alloc, '"');
-                    try buf.appendSlice(alloc, cap_entry.name);
-                    try buf.append(alloc, '"');
+                    try appendEscapedTomlBasicString(buf, alloc, cap_entry.name);
                 }
             }
             try buf.appendSlice(alloc, "]\n");
@@ -6401,22 +6506,25 @@ pub fn serializeLockfile(
             try buf.appendSlice(alloc, " = [");
             for (copy, 0..) |sid, i| {
                 if (i > 0) try buf.appendSlice(alloc, ", ");
-                try buf.append(alloc, '"');
-                try buf.appendSlice(alloc, int_ptr.get(sid));
-                try buf.append(alloc, '"');
+                try appendEscapedTomlBasicString(buf, alloc, int_ptr.get(sid));
             }
             try buf.appendSlice(alloc, "]\n");
         }
     }.run;
 
+    var ver_scratch: std.ArrayListUnmanaged(u8) = .empty;
+    defer ver_scratch.deinit(allocator);
+
     for (sorted_pkgs) |pkg| {
-        try out.appendSlice(allocator, "\n[[package]]\nname = \"");
-        try out.appendSlice(allocator, interner.get(pkg.name));
-        try out.appendSlice(allocator, "\"\nversion = \"");
-        try pkg.version.appendFormatted(&out, allocator, interner);
-        try out.appendSlice(allocator, "\"\nsource = \"");
-        try out.appendSlice(allocator, interner.get(pkg.source));
-        try out.appendSlice(allocator, "\"\n");
+        try out.appendSlice(allocator, "\n[[package]]\nname = ");
+        try appendEscapedTomlBasicString(&out, allocator, interner.get(pkg.name));
+        try out.appendSlice(allocator, "\nversion = ");
+        ver_scratch.clearRetainingCapacity();
+        try pkg.version.appendFormatted(&ver_scratch, allocator, interner);
+        try appendEscapedTomlBasicString(&out, allocator, ver_scratch.items);
+        try out.appendSlice(allocator, "\nsource = ");
+        try appendEscapedTomlBasicString(&out, allocator, interner.get(pkg.source));
+        try out.append(allocator, '\n');
 
         if (pkg.checksum) |cksum| {
             const ck_hex = std.fmt.bytesToHex(cksum, .lower);
@@ -6439,8 +6547,7 @@ pub fn serializeLockfile(
 
         if (pkg.tlog_index) |tlog_idx| {
             var idx_buf: [32]u8 = undefined;
-            const idx_s = try std.fmt.bufPrint(&idx_buf, "tlog_index = {d}\n", .{tlog_idx});
-            try out.appendSlice(allocator, idx_s);
+            try out.appendSlice(allocator, try std.fmt.bufPrint(&idx_buf, "tlog_index = {d}\n", .{tlog_idx}));
         }
 
         try appendCapArray(&out, allocator, "max_caps", pkg.max_caps);
@@ -6454,9 +6561,9 @@ pub fn serializeLockfile(
         try out.appendSlice(allocator, "\"\n");
 
         if (pkg.links != .empty) {
-            try out.appendSlice(allocator, "links = \"");
-            try out.appendSlice(allocator, interner.get(pkg.links));
-            try out.appendSlice(allocator, "\"\n");
+            try out.appendSlice(allocator, "links = ");
+            try appendEscapedTomlBasicString(&out, allocator, interner.get(pkg.links));
+            try out.append(allocator, '\n');
         }
 
         try appendStrIdArray(&out, allocator, interner, "features", pkg.features);

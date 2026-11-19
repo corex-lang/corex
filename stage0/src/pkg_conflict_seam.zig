@@ -15,8 +15,8 @@ const mem = @import("mem_foundation.zig");
 pub const BumpArena = mem.BumpArena;
 /// Re-exported 32-bit `VfsSourceMap` file handle.
 pub const FileId = mem.FileId;
-/// Contiguous 1-byte discriminant classifying PubGrub incompatibility nodes (`0..5`).
-pub const IncompatKind = enum(u8) { root_pin = 0, dep_edge = 1, feature_dep = 2, exclude_ban = 3, no_versions = 4, derived_conflict = 5 };
+/// Contiguous 1-byte discriminant classifying PubGrub incompatibility nodes.
+pub const IncompatKind = enum(u8) { root_pin, dep_edge, feature_dep, exclude_ban, no_versions, derived_conflict, links_uniq, cxi_pub_mismatch };
 /// Exact 16-byte (`128`-bit, `0` padding) version/feature interval term in an incompatibility.
 pub const IncompatTerm = extern struct { series_id: u32 = 0, ver_min: u32 = 0, ver_max: u32 = 0, flags_and_feat: u32 = 0 };
 

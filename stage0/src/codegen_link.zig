@@ -1380,6 +1380,7 @@ fn populateEmbeddedCoffLldArgs(
     try appendSentineledZ(allocator, owned_z, "/OPT:REF");
     try appendSentineledZ(allocator, owned_z, "/OPT:ICF");
     try appendSentineledZ(allocator, owned_z, "/BREPRO");
+    try appendSentineledZ(allocator, owned_z, "/DEBUG:NONE");
     if (options.entry_symbol) |entry_sym| {
         if (entry_sym.len > 0) {
             try appendJoinedSentineledZ(allocator, owned_z, "/ENTRY:", entry_sym, "");
@@ -1985,6 +1986,7 @@ pub fn buildZigCcLinkArgs(
             }
         }
         try appendOwnedArg(allocator, &argv, "-Wl,--gc-sections");
+        try appendOwnedArg(allocator, &argv, "-Wl,--strip-debug");
     }
 
     if (options.entry_symbol) |entry_sym| {
@@ -2136,9 +2138,13 @@ pub fn linkCrossTarget(
         defer allocator.free(const_argv);
         for (owned_argv.items, 0..) |arg_s, i| const_argv[i] = arg_s;
 
+        var det_env = codegen_abi.prepareDeterministicDriverEnv(allocator, options.environ_map) catch
+            return error.OutOfMemory;
+        defer det_env.deinit();
+
         const run_res = std.process.run(allocator, io, .{
             .argv = const_argv,
-            .environ_map = options.environ_map,
+            .environ_map = det_env.asConstPtr(),
         }) catch return error.LinkerFailed;
         defer allocator.free(run_res.stdout);
         defer allocator.free(run_res.stderr);
@@ -2361,6 +2367,12 @@ test "test_codegen_link_target_arg_matrix_and_freestanding_wasm_size" {
                 if (std.mem.eql(u8, arg_s, "-Wl,-dead_strip")) has_dead_strip = true;
             }
             try std.testing.expect(has_dead_strip);
+        } else if (spec.isWindows()) {
+            var has_strip_debug = false;
+            for (args.items) |arg_s| {
+                if (std.mem.eql(u8, arg_s, "-Wl,--strip-debug")) has_strip_debug = true;
+            }
+            try std.testing.expect(has_strip_debug);
         }
     }
 

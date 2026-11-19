@@ -341,7 +341,7 @@ pub const CommandAction = union(enum) {
     invalid: void,
 };
 
-/// Resolved `COREX_HOME` and `COREX_HERMETIC` environment variables (`reconciled_overrides.md` §1.5).
+/// Resolved `COREX_HOME` and `COREX_HERMETIC` environment variables (`DR-11` §3.5).
 pub const ToolchainEnvConfig = struct {
     /// Owned `COREX_HOME` cache root directory path.
     corex_home_dir: []u8,
@@ -1083,8 +1083,7 @@ fn discoverExternalSubmodulesRecursive(
     defer ext_mod_names.deinit(allocator);
     {
         const parsed_art = try db.parseCst(parent_fid);
-        const item_entries = (try db.extractItemTree(parent_fid)).entries;
-        for (item_entries) |entry| {
+        for ((try db.extractItemTree(parent_fid)).entries) |entry| {
             if (entry.kind != .mod_decl or entry.name_text.len == 0) continue;
             if (!entry.ast_node.isNone() and
                 parsed_art.ast_arena.getNode(entry.ast_node).rhs.tag == .extra)
@@ -1430,16 +1429,15 @@ fn executeTranslateCSubcommand(
     // [3] Assemble `-I` search directories plus `<header.h>`'s parent directory for `#include "…"`:
     var effective_include_dirs: std.ArrayListUnmanaged([]const u8) = .empty;
     defer effective_include_dirs.deinit(allocator);
-    try effective_include_dirs.appendSlice(allocator, include_dirs);
-    const header_dir = std.fs.path.dirname(header_path) orelse ".";
-    var has_header_dir = false;
-    for (effective_include_dirs.items) |existing_dir| {
-        if (std.mem.eql(u8, existing_dir, header_dir)) {
-            has_header_dir = true;
-            break;
+    var seen_include_dirs: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen_include_dirs.deinit(allocator);
+    for (include_dirs) |inc_dir| {
+        if (!(try seen_include_dirs.getOrPut(allocator, inc_dir)).found_existing) {
+            try effective_include_dirs.append(allocator, inc_dir);
         }
     }
-    if (!has_header_dir) {
+    const header_dir = std.fs.path.dirname(header_path) orelse ".";
+    if (!seen_include_dirs.contains(header_dir)) {
         try effective_include_dirs.append(allocator, header_dir);
     }
 
@@ -1511,6 +1509,12 @@ fn extractCliFeatureTokens(
     raw_spec: []const u8,
     out_features: *std.ArrayListUnmanaged([]const u8),
 ) !void {
+    var seen_features: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen_features.deinit(arena_alloc);
+    for (out_features.items) |existing_feat| {
+        try seen_features.put(arena_alloc, existing_feat, {});
+    }
+
     var cursor: usize = 0;
     while (cursor < raw_spec.len and out_features.items.len < MAX_CLI_FEATURES) {
         while (cursor < raw_spec.len and
@@ -1522,15 +1526,10 @@ fn extractCliFeatureTokens(
         {}
         if (cursor > start) {
             const token_slice = raw_spec[start..cursor];
-            var is_dup = false;
-            for (out_features.items) |existing| {
-                if (std.mem.eql(u8, existing, token_slice)) {
-                    is_dup = true;
-                    break;
-                }
-            }
-            if (!is_dup) {
-                try out_features.append(arena_alloc, try arena_alloc.dupe(u8, token_slice));
+            if (!seen_features.contains(token_slice)) {
+                const duped_feat = try arena_alloc.dupe(u8, token_slice);
+                try seen_features.put(arena_alloc, duped_feat, {});
+                try out_features.append(arena_alloc, duped_feat);
             }
         }
     }
@@ -1594,16 +1593,14 @@ fn isCxFileOwnedByManifest(
         norm_cx[i] = if (ch_val == '\\') '/' else ch_val;
     }
 
-    const toml_dir = std.fs.path.dirname(toml_path) orelse ".";
-    if (std.Io.Dir.cwd().realPathFileAlloc(io, toml_dir, allocator)) |raw_canon_toml_dir| {
+    if (std.Io.Dir.cwd().realPathFileAlloc(io, std.fs.path.dirname(toml_path) orelse ".", allocator)) |raw_canon_toml_dir| {
         defer allocator.free(raw_canon_toml_dir);
         const norm_toml_dir = try allocator.alloc(u8, raw_canon_toml_dir.len);
         defer allocator.free(norm_toml_dir);
         for (raw_canon_toml_dir, 0..) |ch_val, i| {
             norm_toml_dir[i] = if (ch_val == '\\') '/' else ch_val;
         }
-        const trimmed_dir = std.mem.trimEnd(u8, norm_toml_dir, "/");
-        const src_prefix = try std.fmt.allocPrint(allocator, "{s}/src/", .{trimmed_dir});
+        const src_prefix = try std.fmt.allocPrint(allocator, "{s}/src/", .{std.mem.trimEnd(u8, norm_toml_dir, "/")});
         defer allocator.free(src_prefix);
         if (std.mem.startsWith(u8, norm_cx, src_prefix)) return true;
     } else |_| {}
@@ -1631,8 +1628,7 @@ fn isCxFileOwnedByManifest(
             for (raw_mem_dir, 0..) |ch_val, i| {
                 norm_mem_dir[i] = if (ch_val == '\\') '/' else ch_val;
             }
-            const trimmed_mem = std.mem.trimEnd(u8, norm_mem_dir, "/");
-            const mem_src_prefix = try std.fmt.allocPrint(allocator, "{s}/src/", .{trimmed_mem});
+            const mem_src_prefix = try std.fmt.allocPrint(allocator, "{s}/src/", .{std.mem.trimEnd(u8, norm_mem_dir, "/")});
             defer allocator.free(mem_src_prefix);
             if (std.mem.startsWith(u8, norm_cx, mem_src_prefix)) return true;
         } else |_| {}
@@ -1738,8 +1734,7 @@ fn discoverVirtualCxTreeSubmodulesRecursive(
     defer ext_mod_names.deinit(allocator);
     {
         const parsed_art = try db.parseCst(parent_fid);
-        const item_entries = (try db.extractItemTree(parent_fid)).entries;
-        for (item_entries) |entry| {
+        for ((try db.extractItemTree(parent_fid)).entries) |entry| {
             if (entry.kind != .mod_decl or entry.name_text.len == 0) continue;
             if (!entry.ast_node.isNone() and
                 parsed_art.ast_arena.getNode(entry.ast_node).rhs.tag == .extra)
@@ -1853,6 +1848,11 @@ fn scanRootCxSourceImports(
     }
 
     // Collect first identifier segment of bare `use <ident>…;` declarations for zero-friction auto-sync:
+    var seen_bare_roots: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen_bare_roots.deinit(allocator);
+    for (bare_roots_out.items) |existing_root| {
+        try seen_bare_roots.put(allocator, existing_root, {});
+    }
     var cursor: usize = 0;
     const node_cnt = cst_arena.countNodes();
     while (cursor < node_cnt) : (cursor += 1) {
@@ -1878,17 +1878,10 @@ fn scanRootCxSourceImports(
                     const tok_rec = tok_buf.getToken(leaf.token);
                     if (tok_rec.kind == .ident) {
                         const seg_slice = source[tok_rec.byte_offset .. tok_rec.byte_offset + tok_rec.byte_len];
-                        if (!pkg_manifest.RESERVED_PKG_NAME_MAP.has(seg_slice)) {
-                            var is_dup = false;
-                            for (bare_roots_out.items) |existing_root| {
-                                if (std.mem.eql(u8, existing_root, seg_slice)) {
-                                    is_dup = true;
-                                    break;
-                                }
-                            }
-                            if (!is_dup) {
-                                try bare_roots_out.append(allocator, try allocator.dupe(u8, seg_slice));
-                            }
+                        if (!pkg_manifest.RESERVED_PKG_NAME_MAP.has(seg_slice) and !seen_bare_roots.contains(seg_slice)) {
+                            const duped_root = try allocator.dupe(u8, seg_slice);
+                            try seen_bare_roots.put(allocator, duped_root, {});
+                            try bare_roots_out.append(allocator, duped_root);
                         }
                         break;
                     }
@@ -1899,6 +1892,14 @@ fn scanRootCxSourceImports(
         cursor = sub_end - 1;
     }
 }
+
+/// Mounted executable `[[bin]]` target entry for `.root` multi-binary workspaces.
+const RootBinEntry = struct {
+    /// Executable binary target name (`[[bin]].name` or `pkg_node.canonical_name`).
+    bin_name: []const u8,
+    /// Mounted `FileId` of the binary entry `.cx` file.
+    bin_fid: mem.FileId,
+};
 
 /// Resolves, mounts, verifies, locks, and compiles/runs/tests a Mode-A (`corex.toml`) or Mode-B (`.cx` script) project.
 fn executePackageOrScriptWorkflow(
@@ -1923,9 +1924,9 @@ fn executePackageOrScriptWorkflow(
 ) !u8 {
     const diag_renderer = DiagnosticRenderer.init(source_map, interner, stderr_style);
     const active_target = exec_info.target_spec orelse codegen_abi.TargetSpec.host();
-    const eff_frozen = exec_info.is_frozen or env_cfg.is_hermetic;
-    const eff_locked = exec_info.is_locked or eff_frozen;
-    const eff_offline = exec_info.is_offline or eff_frozen;
+    const is_effective_frozen = exec_info.is_frozen or env_cfg.is_hermetic;
+    const is_effective_locked = exec_info.is_locked or is_effective_frozen;
+    const is_effective_offline = exec_info.is_offline or is_effective_frozen;
 
     // [1] Parse existing `corex.lock` if present on disk:
     var lock_arena = mem.BumpArena.init(allocator);
@@ -1946,7 +1947,7 @@ fn executePackageOrScriptWorkflow(
             interner,
             lock_fid,
             lock_bytes,
-            if (eff_locked) manifest_bundle.root_manifest_blake3 else null,
+            if (is_effective_locked) manifest_bundle.root_manifest_blake3 else null,
             sink,
         );
         if (sink.hasErrors()) {
@@ -1968,9 +1969,9 @@ fn executePackageOrScriptWorkflow(
             .cli_features = exec_info.features,
             .has_no_default_features = exec_info.has_no_default_features,
             .is_including_tests = exec_info.subcommand == .@"test",
-            .is_locked = eff_locked,
-            .is_offline = eff_offline,
-            .is_frozen = eff_frozen,
+            .is_locked = is_effective_locked,
+            .is_offline = is_effective_offline,
+            .is_frozen = is_effective_frozen,
             .is_verifying_checksums = exec_info.is_verifying_checksums,
             .corex_home_dir = env_cfg.corex_home_dir,
             .environ_map = environ_map,
@@ -2060,6 +2061,11 @@ fn executePackageOrScriptWorkflow(
     var pkg_order: std.ArrayListUnmanaged(vfs.PackageId) = .empty;
     defer pkg_order.deinit(allocator);
 
+    var root_bin_entries: std.ArrayListUnmanaged(RootBinEntry) = .empty;
+    defer root_bin_entries.deinit(allocator);
+    var root_lib_fid_opt: ?mem.FileId = null;
+    var root_lib_custom_snake: ?[]const u8 = null;
+
     var primary_root_fid: mem.FileId = .none;
     var primary_stem: []const u8 = "app";
 
@@ -2086,7 +2092,7 @@ fn executePackageOrScriptWorkflow(
             ) catch |cx_err| {
                 if (cx_err != error.CacheIntegrityMismatch) {
                     try sink.emit(.{
-                        .code = if (eff_offline) .e0016_offline_or_fetch_failed else .e0015_cache_integrity_mismatch,
+                        .code = if (is_effective_offline) .e0016_offline_or_fetch_failed else .e0015_cache_integrity_mismatch,
                         .severity = .err,
                         .primary_span = pkg_node.manifest_span,
                         .message = "missing or unreadable `.cxtree` package manifest in `COREX_HOME`",
@@ -2293,68 +2299,55 @@ fn executePackageOrScriptWorkflow(
             );
             try db.setFilePath(node_root_fid, s_path);
             try db.setPackageEmbedJail(.root, .{ .host_dir_jailed = pkg_node.package_root_path });
-        } else {
-            const want_bin = (pkg_node.pkg_id == .root) and
-                (exec_info.subcommand == .run or (exec_info.subcommand == .build and pkg_node.bin_root_rel_path != null));
-            const chosen_rel = if (want_bin)
-                (pkg_node.bin_root_rel_path orelse pkg_node.lib_root_rel_path orelse "src/main.cx")
-            else
-                (pkg_node.lib_root_rel_path orelse pkg_node.bin_root_rel_path orelse "src/root.cx");
-            const full_entry_path = try std.fs.path.join(allocator, &.{ pkg_node.package_root_path, chosen_rel });
-            defer allocator.free(full_entry_path);
-
-            node_root_fid = source_map.resolveOrCreatePath(io, full_entry_path, pkg_node.pkg_id) catch {
-                try sink.emit(.{
-                    .code = .e0004_source_file_io_error,
-                    .severity = .err,
-                    .primary_span = pkg_node.manifest_span,
-                    .message = try std.fmt.allocPrint(
-                        sink.arena.asAllocator(),
-                        "failed to open package entry module `{s}`",
-                        .{full_entry_path},
-                    ),
-                });
-                try diag_renderer.renderAll(stderr_writer, sink);
-                return 1;
-            };
-            _ = try source_map.getLineIndex(node_root_fid);
             if (pkg_node.pkg_id == .root) {
-                primary_stem = pkg_node.canonical_name;
+                primary_root_fid = node_root_fid;
             }
+        } else {
+            var root_pkg_manifest: *const pkg_manifest.Manifest = &manifest_bundle.root_manifest;
+            if (pkg_node.pkg_id == .root and root_pkg_manifest.package == null) {
+                for (manifest_bundle.members) |*ws_mem| {
+                    if (ws_mem.manifest.package) |mem_pkg| {
+                        if (std.mem.eql(u8, interner.get(mem_pkg.name_kebab), pkg_node.canonical_name)) {
+                            root_pkg_manifest = &ws_mem.manifest;
+                            break;
+                        }
+                    }
+                }
+            }
+            const has_root_bins = pkg_node.pkg_id == .root and
+                (pkg_node.bin_root_rel_path != null or root_pkg_manifest.bin_targets.len > 0);
+            const is_bin_preferred = (pkg_node.pkg_id == .root) and
+                (exec_info.subcommand == .run or (exec_info.subcommand == .build and has_root_bins));
             const dur: query_db.Durability = if (pkg_node.pkg_id == .root) .low else .medium;
-            try discoverExternalSubmodulesRecursive(
-                allocator,
-                io,
-                source_map,
-                &db,
-                node_root_fid,
-                full_entry_path,
-                dur,
-                pkg_node.pkg_id,
-                &visited_fids,
-                files_gop.value_ptr,
-                &has_core_mention,
-                0,
-            );
-            try db.setFilePath(node_root_fid, full_entry_path);
 
-            // If `.root` also has BOTH `lib.cx`/`root.cx` AND `main.cx` (e.g., `corex test` / `corex check`), include both:
-            if (pkg_node.pkg_id == .root and pkg_node.lib_root_rel_path != null and pkg_node.bin_root_rel_path != null) {
-                const other_rel = if (std.mem.eql(u8, chosen_rel, pkg_node.lib_root_rel_path.?))
-                    pkg_node.bin_root_rel_path.?
-                else
-                    pkg_node.lib_root_rel_path.?;
-                const other_path = try std.fs.path.join(allocator, &.{ pkg_node.package_root_path, other_rel });
-                defer allocator.free(other_path);
-                if (source_map.resolveOrCreatePath(io, other_path, .root)) |other_fid| {
-                    _ = source_map.getLineIndex(other_fid) catch {};
+            if (pkg_node.pkg_id == .root and
+                ((pkg_node.lib_root_rel_path != null and has_root_bins) or root_pkg_manifest.bin_targets.len > 1))
+            {
+                if (pkg_node.lib_root_rel_path) |lib_rel| {
+                    const lib_full_path = try std.fs.path.join(allocator, &.{ pkg_node.package_root_path, lib_rel });
+                    defer allocator.free(lib_full_path);
+                    const lib_fid = source_map.resolveOrCreatePath(io, lib_full_path, .root) catch {
+                        try sink.emit(.{
+                            .code = .e0004_source_file_io_error,
+                            .severity = .err,
+                            .primary_span = pkg_node.manifest_span,
+                            .message = try std.fmt.allocPrint(
+                                sink.arena.asAllocator(),
+                                "failed to open package entry module `{s}`",
+                                .{lib_full_path},
+                            ),
+                        });
+                        try diag_renderer.renderAll(stderr_writer, sink);
+                        return 1;
+                    };
+                    _ = try source_map.getLineIndex(lib_fid);
                     try discoverExternalSubmodulesRecursive(
                         allocator,
                         io,
                         source_map,
                         &db,
-                        other_fid,
-                        other_path,
+                        lib_fid,
+                        lib_full_path,
                         .low,
                         .root,
                         &visited_fids,
@@ -2362,28 +2355,222 @@ fn executePackageOrScriptWorkflow(
                         &has_core_mention,
                         0,
                     );
-                } else |_| {}
+                    try db.setFilePath(lib_fid, lib_full_path);
+                    root_lib_fid_opt = lib_fid;
+                    if (root_pkg_manifest.lib_target) |lib_tgt| {
+                        if (lib_tgt.name_snake != .empty and interner.get(lib_tgt.name_snake).len > 0) {
+                            root_lib_custom_snake = interner.get(lib_tgt.name_snake);
+                        }
+                    }
+                }
+
+                if (root_pkg_manifest.bin_targets.len > 0) {
+                    for (root_pkg_manifest.bin_targets) |bin_tgt| {
+                        const bin_rel = if (bin_tgt.path != .empty and interner.get(bin_tgt.path).len > 0)
+                            interner.get(bin_tgt.path)
+                        else
+                            (pkg_node.bin_root_rel_path orelse "src/main.cx");
+                        const bin_name = if (bin_tgt.name_kebab != .empty and interner.get(bin_tgt.name_kebab).len > 0)
+                            interner.get(bin_tgt.name_kebab)
+                        else
+                            pkg_node.canonical_name;
+                        const bin_full_path = try std.fs.path.join(allocator, &.{ pkg_node.package_root_path, bin_rel });
+                        defer allocator.free(bin_full_path);
+                        const bin_fid = source_map.resolveOrCreatePath(io, bin_full_path, .root) catch {
+                            try sink.emit(.{
+                                .code = .e0004_source_file_io_error,
+                                .severity = .err,
+                                .primary_span = pkg_node.manifest_span,
+                                .message = try std.fmt.allocPrint(
+                                    sink.arena.asAllocator(),
+                                    "failed to open package entry module `{s}`",
+                                    .{bin_full_path},
+                                ),
+                            });
+                            try diag_renderer.renderAll(stderr_writer, sink);
+                            return 1;
+                        };
+                        _ = try source_map.getLineIndex(bin_fid);
+                        try discoverExternalSubmodulesRecursive(
+                            allocator,
+                            io,
+                            source_map,
+                            &db,
+                            bin_fid,
+                            bin_full_path,
+                            .low,
+                            .root,
+                            &visited_fids,
+                            files_gop.value_ptr,
+                            &has_core_mention,
+                            0,
+                        );
+                        try db.setFilePath(bin_fid, bin_full_path);
+                        try root_bin_entries.append(allocator, .{ .bin_name = bin_name, .bin_fid = bin_fid });
+                    }
+                } else if (pkg_node.bin_root_rel_path) |bin_rel| {
+                    const bin_full_path = try std.fs.path.join(allocator, &.{ pkg_node.package_root_path, bin_rel });
+                    defer allocator.free(bin_full_path);
+                    if (source_map.resolveOrCreatePath(io, bin_full_path, .root)) |bin_fid| {
+                        _ = source_map.getLineIndex(bin_fid) catch {};
+                        try discoverExternalSubmodulesRecursive(
+                            allocator,
+                            io,
+                            source_map,
+                            &db,
+                            bin_fid,
+                            bin_full_path,
+                            .low,
+                            .root,
+                            &visited_fids,
+                            files_gop.value_ptr,
+                            &has_core_mention,
+                            0,
+                        );
+                        try db.setFilePath(bin_fid, bin_full_path);
+                        try root_bin_entries.append(allocator, .{
+                            .bin_name = pkg_node.canonical_name,
+                            .bin_fid = bin_fid,
+                        });
+                    } else |_| {
+                        if (root_lib_fid_opt == null) {
+                            try sink.emit(.{
+                                .code = .e0004_source_file_io_error,
+                                .severity = .err,
+                                .primary_span = pkg_node.manifest_span,
+                                .message = try std.fmt.allocPrint(
+                                    sink.arena.asAllocator(),
+                                    "failed to open package entry module `{s}`",
+                                    .{bin_full_path},
+                                ),
+                            });
+                            try diag_renderer.renderAll(stderr_writer, sink);
+                            return 1;
+                        }
+                    }
+                }
+
+                node_root_fid = root_lib_fid_opt orelse root_bin_entries.items[0].bin_fid;
+                if (is_bin_preferred and root_bin_entries.items.len > 0) {
+                    primary_root_fid = root_bin_entries.items[0].bin_fid;
+                    primary_stem = root_bin_entries.items[0].bin_name;
+                } else {
+                    primary_root_fid = node_root_fid;
+                    primary_stem = pkg_node.canonical_name;
+                }
+            } else {
+                const chosen_rel = if (is_bin_preferred)
+                    (pkg_node.bin_root_rel_path orelse pkg_node.lib_root_rel_path orelse "src/main.cx")
+                else
+                    (pkg_node.lib_root_rel_path orelse pkg_node.bin_root_rel_path orelse "src/root.cx");
+                const full_entry_path = try std.fs.path.join(allocator, &.{ pkg_node.package_root_path, chosen_rel });
+                defer allocator.free(full_entry_path);
+
+                node_root_fid = source_map.resolveOrCreatePath(io, full_entry_path, pkg_node.pkg_id) catch {
+                    try sink.emit(.{
+                        .code = .e0004_source_file_io_error,
+                        .severity = .err,
+                        .primary_span = pkg_node.manifest_span,
+                        .message = try std.fmt.allocPrint(
+                            sink.arena.asAllocator(),
+                            "failed to open package entry module `{s}`",
+                            .{full_entry_path},
+                        ),
+                    });
+                    try diag_renderer.renderAll(stderr_writer, sink);
+                    return 1;
+                };
+                _ = try source_map.getLineIndex(node_root_fid);
+                if (pkg_node.pkg_id == .root) {
+                    primary_root_fid = node_root_fid;
+                    primary_stem = if (is_bin_preferred and root_pkg_manifest.bin_targets.len > 0 and
+                        root_pkg_manifest.bin_targets[0].name_kebab != .empty and
+                        interner.get(root_pkg_manifest.bin_targets[0].name_kebab).len > 0)
+                        interner.get(root_pkg_manifest.bin_targets[0].name_kebab)
+                    else
+                        pkg_node.canonical_name;
+                }
+                try discoverExternalSubmodulesRecursive(
+                    allocator,
+                    io,
+                    source_map,
+                    &db,
+                    node_root_fid,
+                    full_entry_path,
+                    dur,
+                    pkg_node.pkg_id,
+                    &visited_fids,
+                    files_gop.value_ptr,
+                    &has_core_mention,
+                    0,
+                );
+                try db.setFilePath(node_root_fid, full_entry_path);
             }
             try db.setPackageEmbedJail(pkg_node.pkg_id, .{ .host_dir_jailed = pkg_node.package_root_path });
         }
 
-        if (pkg_node.pkg_id == .root) {
-            primary_root_fid = node_root_fid;
-        }
         try pkg_root_fids.put(allocator, pkg_node.pkg_id, node_root_fid);
         try db.registerPackageRootFile(pkg_node.pkg_id, node_root_fid);
+        if (pkg_node.pkg_id == .root) {
+            if (root_lib_fid_opt) |lib_fid| {
+                if (pkg_node.default_snake_name.len > 0) {
+                    try db.bindPackageDepFile(.root, try db.interner.intern(pkg_node.default_snake_name), lib_fid);
+                }
+                if (root_lib_custom_snake) |custom_snake| {
+                    if (!std.mem.eql(u8, custom_snake, pkg_node.default_snake_name)) {
+                        try db.bindPackageDepFile(.root, try db.interner.intern(custom_snake), lib_fid);
+                    }
+                }
+            }
+        }
         try db.setPackageCfgFeatures(
             pkg_node.pkg_id,
             pkg_node.enabled_features,
             if (pkg_node.has_feature_manifest) pkg_node.declared_features else null,
         );
-        try db.setPackageCapPolicy(pkg_node.pkg_id, pkg_node.cap_policy);
+        var pkg_policy = pkg_node.cap_policy;
+        if (pkg_node.pkg_id != .root) {
+            for (manifest_bundle.root_manifest.dependencies) |dep_spec| {
+                if (dep_spec.has_comptime_io_cap and
+                    std.mem.eql(u8, interner.get(dep_spec.package_kebab), pkg_node.canonical_name))
+                {
+                    pkg_policy.has_comptime_io_cap = true;
+                    break;
+                }
+            }
+            if (!pkg_policy.has_comptime_io_cap) {
+                for (manifest_bundle.members) |ws_mem| {
+                    for (ws_mem.manifest.dependencies) |dep_spec| {
+                        if (dep_spec.has_comptime_io_cap and
+                            std.mem.eql(u8, interner.get(dep_spec.package_kebab), pkg_node.canonical_name))
+                        {
+                            pkg_policy.has_comptime_io_cap = true;
+                            break;
+                        }
+                    }
+                    if (pkg_policy.has_comptime_io_cap) break;
+                }
+            }
+            if (!pkg_policy.has_comptime_io_cap) {
+                if (manifest_bundle.root_manifest.workspace) |ws_cfg| {
+                    for (ws_cfg.dependencies) |dep_spec| {
+                        if (dep_spec.has_comptime_io_cap and
+                            std.mem.eql(u8, interner.get(dep_spec.package_kebab), pkg_node.canonical_name))
+                        {
+                            pkg_policy.has_comptime_io_cap = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        try db.setPackageCapPolicy(pkg_node.pkg_id, pkg_policy);
         try db.symbol_table.setPackageIdentityMeta(
             &db.interner,
             pkg_node.pkg_id,
             pkg_node.canonical_name,
             ver_str,
-            pkg_node.default_snake_name,
+            root_lib_custom_snake orelse pkg_node.default_snake_name,
             node_root_fid,
         );
         try db.symbol_table.markPackageDepsConfigured(pkg_node.pkg_id);
@@ -2395,14 +2582,13 @@ fn executePackageOrScriptWorkflow(
     for (resolved.packages) |pkg_node| {
         for (pkg_node.dependencies) |dep_bind| {
             const target_fid = pkg_root_fids.get(dep_bind.target_pkg_id) orelse continue;
-            const db_alias_sym = try db.interner.intern(dep_bind.alias_text);
-            try db.bindPackageDepFile(pkg_node.pkg_id, db_alias_sym, target_fid);
+            try db.bindPackageDepFile(pkg_node.pkg_id, try db.interner.intern(dep_bind.alias_text), target_fid);
 
             // Compute edge `allow_caps` ceiling for `verifyWorkspaceCapabilitySandbox`:
             var target_eff_allow = mir_sast.EffectCapabilityMask.fromBits(0x0FFF);
             for (resolved.packages) |cand_target| {
                 if (cand_target.pkg_id == dep_bind.target_pkg_id) {
-                    target_eff_allow = cand_target.cap_policy.effectiveAllowedCaps();
+                    target_eff_allow = cand_target.cap_policy.asEffectiveAllowedCaps();
                     break;
                 }
             }
@@ -2518,7 +2704,7 @@ fn executePackageOrScriptWorkflow(
         var cxi_art = try db.computePackageCxiSummary(allocator, pkg_node.pkg_id, p_files);
         defer cxi_art.deinit(allocator);
 
-        if (eff_locked and pkg_node.pkg_id != .root and
+        if (is_effective_locked and pkg_node.pkg_id != .root and
             pkg_node.source_kind != .workspace_member and pkg_node.source_kind != .local_path)
         {
             if (pkg_node.locked_cxi_blake3) |expected_cxi| {
@@ -2546,7 +2732,7 @@ fn executePackageOrScriptWorkflow(
         try cap_summaries.put(allocator, pkg_node.pkg_id, cxi_art.caps);
     }
 
-    if (!eff_locked) {
+    if (!is_effective_locked) {
         var out_lock_arena = mem.BumpArena.init(allocator);
         defer out_lock_arena.deinit();
         const built_lock = try pkg_resolver.buildLockfileFromResolvedGraph(
@@ -2566,18 +2752,17 @@ fn executePackageOrScriptWorkflow(
     // [7] Merge `ordered_native_link_libs` (`links = "…"`) + CLI `-l` `extra_libs` and execute subcommand:
     var merged_libs: std.ArrayListUnmanaged([]const u8) = .empty;
     defer merged_libs.deinit(allocator);
+    var seen_libs: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen_libs.deinit(allocator);
     for (resolved.ordered_native_link_libs) |nat_lib| {
-        try merged_libs.append(allocator, nat_lib);
+        if (!(try seen_libs.getOrPut(allocator, nat_lib)).found_existing) {
+            try merged_libs.append(allocator, nat_lib);
+        }
     }
     for (exec_info.extra_libs) |cli_lib| {
-        var is_dup = false;
-        for (merged_libs.items) |ex_lib| {
-            if (std.mem.eql(u8, ex_lib, cli_lib)) {
-                is_dup = true;
-                break;
-            }
+        if (!(try seen_libs.getOrPut(allocator, cli_lib)).found_existing) {
+            try merged_libs.append(allocator, cli_lib);
         }
-        if (!is_dup) try merged_libs.append(allocator, cli_lib);
     }
 
     switch (exec_info.subcommand) {
@@ -2593,6 +2778,82 @@ fn executePackageOrScriptWorkflow(
             return 0;
         },
         .build => {
+            const backend = buildConfiguredBackend(
+                exec_info.output_format,
+                active_target,
+                exec_info.is_release_mode,
+                exec_info.is_fuzz_enabled,
+            );
+
+            if (root_bin_entries.items.len > 1 and exec_info.output_path == null and
+                !exec_info.is_emit_c and !exec_info.is_emit_llvm and !exec_info.is_emit_obj)
+            {
+                const bin_ext = active_target.executableExtension();
+                for (root_bin_entries.items) |bin_entry| {
+                    var bin_extra_files: std.ArrayListUnmanaged(mem.FileId) = .empty;
+                    defer bin_extra_files.deinit(allocator);
+                    for (all_verify_slices.items) |cand_fid| {
+                        if (cand_fid == bin_entry.bin_fid) continue;
+                        var is_sibling_bin = false;
+                        for (root_bin_entries.items) |other_bin| {
+                            if (other_bin.bin_fid != bin_entry.bin_fid and cand_fid == other_bin.bin_fid) {
+                                is_sibling_bin = true;
+                                break;
+                            }
+                        }
+                        if (!is_sibling_bin) try bin_extra_files.append(allocator, cand_fid);
+                    }
+
+                    const bin_out_path = try std.fmt.allocPrint(
+                        allocator,
+                        "{s}/build/{s}{s}",
+                        .{ manifest_bundle.workspace_root_dir, bin_entry.bin_name, bin_ext },
+                    );
+                    defer allocator.free(bin_out_path);
+
+                    var multi_art = db.compileModuleArtifact(bin_entry.bin_fid, backend, .{
+                        .module_name = bin_entry.bin_name,
+                        .extra_file_ids = bin_extra_files.items,
+                        .vfs_source_map = source_map,
+                        .is_dev_got_enabled = false,
+                        .artifact_kind = .executable,
+                        .link_mode = exec_info.link_mode,
+                        .extra_libs = merged_libs.items,
+                        .lib_dirs = exec_info.lib_dirs,
+                        .output_path = bin_out_path,
+                        .io = io,
+                        .environ_map = environ_map,
+                        .diagnostic_sink = sink,
+                    }) catch |comp_err| switch (comp_err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => {
+                            try renderCompileFailureDiagnostics(
+                                allocator,
+                                &db,
+                                bin_entry.bin_fid,
+                                all_verify_slices.items,
+                                exec_info.is_release_mode,
+                                sink,
+                                diag_renderer,
+                                stderr_writer,
+                            );
+                            return 1;
+                        },
+                    };
+                    defer multi_art.deinit(allocator);
+
+                    try stdout_style.writeStatusHeader(
+                        stdout_writer,
+                        .success,
+                        Glyphs.SUCCESS,
+                        "build",
+                        bin_out_path,
+                    );
+                    try stdout_writer.writeByte('\n');
+                }
+                return 0;
+            }
+
             const has_main = try fileDeclaresMainEntrypoint(&db, primary_root_fid);
             const artifact_kind: codegen_abi.OutputArtifactKind =
                 if (exec_info.is_emit_c or exec_info.is_emit_llvm)
@@ -2619,15 +2880,23 @@ fn executePackageOrScriptWorkflow(
             defer allocator.free(default_out);
             const final_out_path = exec_info.output_path orelse default_out;
 
-            const backend = buildConfiguredBackend(
-                exec_info.output_format,
-                active_target,
-                exec_info.is_release_mode,
-                exec_info.is_fuzz_enabled,
-            );
+            var filtered_extra_files: std.ArrayListUnmanaged(mem.FileId) = .empty;
+            defer filtered_extra_files.deinit(allocator);
+            for (all_verify_slices.items) |cand_fid| {
+                if (cand_fid == primary_root_fid) continue;
+                var is_sibling_bin = false;
+                for (root_bin_entries.items) |other_bin| {
+                    if (other_bin.bin_fid != primary_root_fid and cand_fid == other_bin.bin_fid) {
+                        is_sibling_bin = true;
+                        break;
+                    }
+                }
+                if (!is_sibling_bin) try filtered_extra_files.append(allocator, cand_fid);
+            }
+
             var build_art = db.compileModuleArtifact(primary_root_fid, backend, .{
                 .module_name = primary_stem,
-                .extra_file_ids = if (all_verify_slices.items.len > 1) all_verify_slices.items[1..] else &.{},
+                .extra_file_ids = filtered_extra_files.items,
                 .vfs_source_map = source_map,
                 .is_dev_got_enabled = false,
                 .artifact_kind = artifact_kind,
@@ -2680,8 +2949,11 @@ fn executePackageOrScriptWorkflow(
                 return 1;
             }
 
-            const run_seq = next_run_scratch_seq.fetchAdd(1, .monotonic);
-            const scratch_dir = try std.fmt.allocPrint(allocator, ".zig-cache/cx_run_{d}", .{run_seq});
+            const scratch_dir = try std.fmt.allocPrint(
+                allocator,
+                ".zig-cache/cx_run_{d}",
+                .{next_run_scratch_seq.fetchAdd(1, .monotonic)},
+            );
             defer allocator.free(scratch_dir);
             defer std.Io.Dir.cwd().deleteTree(io, scratch_dir) catch {};
 
@@ -2705,9 +2977,22 @@ fn executePackageOrScriptWorkflow(
                 exec_info.is_release_mode,
                 exec_info.is_fuzz_enabled,
             );
+            var run_extra_files: std.ArrayListUnmanaged(mem.FileId) = .empty;
+            defer run_extra_files.deinit(allocator);
+            for (all_verify_slices.items) |cand_fid| {
+                if (cand_fid == primary_root_fid) continue;
+                var is_sibling_bin = false;
+                for (root_bin_entries.items) |other_bin| {
+                    if (other_bin.bin_fid != primary_root_fid and cand_fid == other_bin.bin_fid) {
+                        is_sibling_bin = true;
+                        break;
+                    }
+                }
+                if (!is_sibling_bin) try run_extra_files.append(allocator, cand_fid);
+            }
             var run_art = db.compileModuleArtifact(primary_root_fid, backend, .{
                 .module_name = primary_stem,
-                .extra_file_ids = if (all_verify_slices.items.len > 1) all_verify_slices.items[1..] else &.{},
+                .extra_file_ids = run_extra_files.items,
                 .vfs_source_map = source_map,
                 .is_dev_got_enabled = false,
                 .artifact_kind = run_artifact_kind,
@@ -3047,6 +3332,7 @@ fn tryExecutePackageOrScriptMode(
 
     const has_explicit_pkg_flags = exec_info.is_locked or
         exec_info.is_frozen or
+        exec_info.is_offline or
         exec_info.manifest_path != null or
         exec_info.features.len > 0 or
         exec_info.has_no_default_features or
@@ -3073,7 +3359,9 @@ fn tryExecutePackageOrScriptMode(
         );
     }
 
-    if (candidate_script_path == null and input_positional.len > 1 and (exec_info.is_locked or exec_info.is_frozen)) {
+    if (candidate_script_path == null and input_positional.len > 1 and
+        (exec_info.is_locked or exec_info.is_frozen or env_cfg.is_hermetic))
+    {
         if (try discoverNearestManifestUpward(allocator, io)) |anc_toml| {
             defer allocator.free(anc_toml);
             return try executeManifestTomlMode(
@@ -3162,8 +3450,11 @@ fn tryExecutePackageOrScriptMode(
         }
 
         if (!extracted_fm.has_frontmatter and scanned_inlines.items.len == 0 and exec_info.manifest_path == null) {
-            const script_parent_dir = std.fs.path.dirname(script_path) orelse ".";
-            if (try discoverNearestManifestFromDirUpward(allocator, io, script_parent_dir)) |anc_toml| {
+            if (try discoverNearestManifestFromDirUpward(
+                allocator,
+                io,
+                std.fs.path.dirname(script_path) orelse ".",
+            )) |anc_toml| {
                 defer allocator.free(anc_toml);
                 if (has_explicit_pkg_flags or try isCxFileOwnedByManifest(
                     allocator,
@@ -3196,8 +3487,9 @@ fn tryExecutePackageOrScriptMode(
             if (!has_explicit_pkg_flags) {
                 if (extracted_fm.prefix_end_byte > 0) {
                     // Shebang-only standalone `.cx` script; keep `#!` blanked in `source_map` and run fast Mode C:
-                    const blanked_fid = try source_map.setOverlay(script_path, extracted_fm.blanked_cx_source, .root);
-                    _ = try source_map.getLineIndex(blanked_fid);
+                    _ = try source_map.getLineIndex(
+                        try source_map.setOverlay(script_path, extracted_fm.blanked_cx_source, .root),
+                    );
                 }
                 return null;
             }
@@ -3258,7 +3550,7 @@ fn tryExecutePackageOrScriptMode(
         }
 
         const script_dir = std.fs.path.dirname(script_path) orelse ".";
-        var bundle = try pkg_manifest.bundleFromSingleManifest(
+        var bundle = try pkg_manifest.buildBundleFromSingleManifest(
             allocator,
             script_dir,
             script_path,
@@ -3302,7 +3594,7 @@ fn tryExecutePackageOrScriptMode(
 
 // ------------------------------------- PUBLIC API --------------------------------------
 
-/// Resolves `COREX_HOME` and `COREX_HERMETIC=1` from `environ_map` (`reconciled_overrides.md` §1.5).
+/// Resolves `COREX_HOME` and `COREX_HERMETIC=1` from `environ_map` (`DR-11` §3.5).
 pub fn resolveToolchainEnvConfig(
     allocator: std.mem.Allocator,
     environ_map: ?*const std.process.Environ.Map,
@@ -3494,7 +3786,16 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
     var selected_subcommand: ?SubcommandId = null;
     var positional_list: std.ArrayListUnmanaged([]const u8) = .empty;
     var is_after_double_dash = false;
+    var is_direct_script_invocation = false;
     var pre_dash_count: ?usize = null;
+    const has_direct_script_target = blk_script: {
+        for (raw_args) |cand_arg| {
+            if (std.mem.eql(u8, cand_arg, "--")) break;
+            if (std.mem.startsWith(u8, cand_arg, "-")) continue;
+            break :blk_script SubcommandId.fromName(cand_arg) == null and std.mem.endsWith(u8, cand_arg, ".cx");
+        }
+        break :blk_script false;
+    };
 
     var arg_idx: usize = 0;
     while (arg_idx < raw_args.len) : (arg_idx += 1) {
@@ -3506,7 +3807,8 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
         }
 
         if (!is_after_double_dash and std.mem.startsWith(u8, arg_text, "-")) {
-            const is_compile_sub = selected_subcommand != null and isCompileSubcommand(selected_subcommand.?);
+            const is_compile_sub = (selected_subcommand != null and isCompileSubcommand(selected_subcommand.?)) or
+                (selected_subcommand == null and has_direct_script_target);
             const is_compile_or_translate = is_compile_sub or selected_subcommand == .translate_c;
             const is_ofmt_spelling = std.mem.eql(u8, arg_text, "-ofmt") or
                 std.mem.startsWith(u8, arg_text, "-ofmt=");
@@ -3805,6 +4107,10 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
         if (selected_subcommand == null) {
             if (SubcommandId.fromName(arg_text)) |sub_id| {
                 selected_subcommand = sub_id;
+            } else if (std.mem.endsWith(u8, arg_text, ".cx")) {
+                selected_subcommand = .run;
+                is_direct_script_invocation = true;
+                try positional_list.append(arena_alloc, arg_text);
             } else {
                 try emitUnknownSubcommandDiagnostic(sink, arg_text);
             }
@@ -3823,7 +4129,11 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
         return .{ .color_mode = color_mode, .action = .show_version };
     }
     if (selected_subcommand) |sub_id| {
-        const split_pos = pre_dash_count orelse positional_list.items.len;
+        const split_pos = pre_dash_count orelse
+            if (is_direct_script_invocation and positional_list.items.len > 1)
+                @as(usize, 1)
+            else
+                positional_list.items.len;
         const forwarded_run_args = positional_list.items[split_pos..];
         return .{
             .color_mode = color_mode,
@@ -4438,11 +4748,10 @@ pub fn runCli(
                             return 1;
                         }
 
-                        const run_seq = next_run_scratch_seq.fetchAdd(1, .monotonic);
                         const scratch_dir = try std.fmt.allocPrint(
                             allocator,
                             ".zig-cache/cx_run_{d}",
-                            .{run_seq},
+                            .{next_run_scratch_seq.fetchAdd(1, .monotonic)},
                         );
                         defer allocator.free(scratch_dir);
                         defer std.Io.Dir.cwd().deleteTree(io, scratch_dir) catch {};
@@ -4797,4 +5106,78 @@ test "test_cli_router_package_mode_mount_cxtree_lockfile_and_frozen_check" {
         std.debug.print("Frozen stderr:\n{s}\n", .{err_writer.buffered()});
     }
     try std.testing.expectEqual(@as(u8, 0), exit_frozen);
+}
+
+test "test_direct_script_invocation_and_dual_lib_bin_scope" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // [1] Direct `corex script.cx arg1` and `corex --offline script.cx` route to `.run` with 9 canonical subcommands:
+    try std.testing.expectEqual(@as(usize, 9), SUBCOMMANDS.len);
+    {
+        var sink = DiagnosticSink.init(allocator);
+        defer sink.deinit();
+        const parsed = try parseArgs(&.{ "hello.cx", "user_arg" }, &sink);
+        try std.testing.expect(!sink.hasErrors());
+        try std.testing.expect(parsed.action == .execute_subcommand);
+        try std.testing.expectEqual(SubcommandId.run, parsed.action.execute_subcommand.subcommand);
+        try std.testing.expectEqual(@as(usize, 1), parsed.action.execute_subcommand.pre_dash_arg_count);
+        try std.testing.expectEqual(@as(usize, 1), parsed.run_args.len);
+        try std.testing.expectEqualStrings("user_arg", parsed.run_args[0]);
+    }
+    {
+        var sink = DiagnosticSink.init(allocator);
+        defer sink.deinit();
+        const parsed_off = try parseArgs(&.{ "--offline", "hello.cx" }, &sink);
+        try std.testing.expect(!sink.hasErrors());
+        try std.testing.expect(parsed_off.is_offline);
+        try std.testing.expectEqual(SubcommandId.run, parsed_off.action.execute_subcommand.subcommand);
+    }
+
+    // [2] Dual `[lib]` + `[[bin]]` package registers `lib` as `.root` scope (`use pkg.…` & `use <pkg_name>.…`):
+    const tmp_root = ".zig-cache/router_dual_lib_bin_test";
+    std.Io.Dir.cwd().deleteTree(io, tmp_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, tmp_root) catch {};
+    const src_dir = tmp_root ++ "/src";
+    const home_dir = tmp_root ++ "/home";
+    try std.Io.Dir.cwd().createDirPath(io, src_dir);
+    try std.Io.Dir.cwd().createDirPath(io, home_dir);
+
+    const manifest_path = tmp_root ++ "/corex.toml";
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = manifest_path,
+        .data = "[package]\nname = \"dual-demo\"\nversion = \"0.1.0\"\n" ++
+            "[lib]\npath = \"src/root.cx\"\n" ++
+            "[[bin]]\nname = \"dual-cli\"\npath = \"src/main.cx\"\n",
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = src_dir ++ "/root.cx",
+        .data = "pub fn answer() -> i32 { return 42; }\n",
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = src_dir ++ "/main.cx",
+        .data = "use pkg.answer;\nuse dual_demo.answer as named_answer;\n" ++
+            "pub fn main() -> i32 { return answer() - named_answer(); }\n",
+    });
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("COREX_HOME", home_dir);
+
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var out_writer = std.Io.Writer.fixed(&out_buf);
+    var err_writer = std.Io.Writer.fixed(&err_buf);
+    const exit_check = try runCli(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--manifest-path=" ++ manifest_path },
+        &out_writer,
+        &err_writer,
+    );
+    if (exit_check != 0) {
+        std.debug.print("Dual lib+bin stderr:\n{s}\n", .{err_writer.buffered()});
+    }
+    try std.testing.expectEqual(@as(u8, 0), exit_check);
 }

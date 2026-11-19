@@ -650,8 +650,7 @@ pub fn isValidInlineUseSpec(raw_spec: []const u8) bool {
     // [1] Local relative directory paths (`./…` or `../…`):
     if (std.mem.startsWith(u8, raw_spec, "./") or std.mem.startsWith(u8, raw_spec, "../")) {
         if (std.mem.indexOfScalar(u8, raw_spec, ' ') != null) return false;
-        const rel_tail = if (std.mem.startsWith(u8, raw_spec, "./")) raw_spec[2..] else raw_spec[3..];
-        return rel_tail.len > 0;
+        return (if (std.mem.startsWith(u8, raw_spec, "./")) raw_spec[2..] else raw_spec[3..]).len > 0;
     }
 
     // [2] Shorthand GitHub / GitLab repository specifiers (`github.com/<org>/<repo>[@<rev>]`):
@@ -676,12 +675,9 @@ pub fn isValidInlineUseSpec(raw_spec: []const u8) bool {
     };
     for (url_schemes) |scheme| {
         if (std.mem.startsWith(u8, raw_spec, scheme)) {
-            if (std.mem.indexOfScalar(u8, raw_spec, ' ') != null) return false;
-            const after_scheme = raw_spec[scheme.len..];
-            if (after_scheme.len == 0) return false;
+            if (std.mem.indexOfScalar(u8, raw_spec, ' ') != null or raw_spec[scheme.len..].len == 0) return false;
             if (std.mem.lastIndexOfAny(u8, raw_spec, "@#")) |sep_idx| {
-                const is_ssh_at = std.mem.startsWith(u8, raw_spec, "git+ssh://git@") and sep_idx < 16;
-                if (!is_ssh_at and sep_idx >= scheme.len) {
+                if (!(std.mem.startsWith(u8, raw_spec, "git+ssh://git@") and sep_idx < 16) and sep_idx >= scheme.len) {
                     if (sep_idx == scheme.len or sep_idx + 1 >= raw_spec.len) return false;
                 }
             }
@@ -693,8 +689,7 @@ pub fn isValidInlineUseSpec(raw_spec: []const u8) bool {
     const stripped = if (std.mem.startsWith(u8, raw_spec, "registry:")) raw_spec[9..] else raw_spec;
     const at_pos = std.mem.indexOfScalar(u8, stripped, '@') orelse return false;
     const pkg_part = stripped[0..at_pos];
-    const ver_part = std.mem.trim(u8, stripped[at_pos + 1 ..], " ");
-    if (ver_part.len == 0) return false;
+    if (std.mem.trim(u8, stripped[at_pos + 1 ..], " ").len == 0) return false;
     if (pkg_part.len == 0 or pkg_part.len > 64) return false;
     if (RESERVED_INLINE_USE_ALIAS_MAP.has(pkg_part) or lexer.KEYWORD_OR_PRIM_MAP.has(pkg_part)) return false;
     if (!std.ascii.isLower(pkg_part[0]) or pkg_part[pkg_part.len - 1] == '-') return false;
@@ -2527,8 +2522,7 @@ pub const Parser = struct {
             const is_byte_str = self.peekKind() == .byte_string_lit;
             const spec_tok = try self.consumeLeaf(.token_leaf, .{});
             const spec_span = self.getTokenSpan(spec_tok);
-            const spec_lexeme = self.getTokenLexeme(spec_tok);
-            const opt_unquoted = if (is_byte_str) null else extractSingleLineUnquotedSpec(spec_lexeme);
+            const opt_unquoted = if (is_byte_str) null else extractSingleLineUnquotedSpec(self.getTokenLexeme(spec_tok));
 
             if (!is_top_level) {
                 has_error.* = true;
@@ -2613,8 +2607,7 @@ pub const Parser = struct {
                     has_error,
                     "expected `snake_case` package alias identifier after `as`",
                 );
-                const alias_lexeme = self.getTokenLexeme(alias_tok);
-                if (RESERVED_INLINE_USE_ALIAS_MAP.has(alias_lexeme)) {
+                if (RESERVED_INLINE_USE_ALIAS_MAP.has(self.getTokenLexeme(alias_tok))) {
                     has_error.* = true;
                     try self.emitDiagnosticWithFix(
                         .e0013_invalid_manifest_or_pkg_name,
@@ -12146,7 +12139,7 @@ test "test_parser_extern_blocks_extern_static_and_c_casing_exemption" {
     const top_items = ast_arena.getExtraSlice(ExtraIndex.fromInt(root_node.lhs.payload), root_node.rhs.payload);
     try std.testing.expectEqual(@as(usize, 4), top_items.len);
 
-    // [1] First item: `@cfg(...) pub extern "C" { ... }` with 6 members:
+    // [1] First item: `@cfg(…) pub extern "C" { … }` with 6 members:
     const block1_id = NodeIndex.fromInt(top_items[0]);
     try std.testing.expectEqual(AstTag.extern_block_decl, ast_arena.getNode(block1_id).tag);
     try std.testing.expectEqual(CstNodeKind.extern_block_item, cst_arena.getNode(ast_arena.getCstOrigin(block1_id)).kind);
@@ -12168,7 +12161,7 @@ test "test_parser_extern_blocks_extern_static_and_c_casing_exemption" {
     try std.testing.expect(static_mut_info.flags.has_extern);
     try std.testing.expectEqual(ExternVisibility.public, static_mut_info.flags.visibility);
 
-    // [2] Second item: bare `extern { fn free(...); }` with omitted ABI token (`TokenIndex.none`):
+    // [2] Second item: bare `extern { fn free(…); }` with omitted ABI token (`TokenIndex.none`):
     const block2_id = NodeIndex.fromInt(top_items[1]);
     const header2 = ast_arena.getExternBlockHeader(block2_id);
     try std.testing.expect(header2.abi_tok.isNone());
@@ -12182,7 +12175,7 @@ test "test_parser_extern_blocks_extern_static_and_c_casing_exemption" {
     try std.testing.expect(standalone_info.flags.is_mut);
     try std.testing.expectEqual(@as(u32, 1), standalone_info.attr_len);
 
-    // [4] Error recovery inside `extern "C" { ... }` produces `item_hole` and parses subsequent members:
+    // [4] Error recovery inside `extern "C" { … }` produces `item_hole` and parses subsequent members:
     const bad_extern_src =
         \\extern "C" {
         \\    let invalid_local = 1;

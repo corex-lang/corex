@@ -13,6 +13,7 @@ const builtin = @import("builtin");
 const mem_foundation = @import("mem_foundation.zig");
 const vfs_sourcemap = @import("vfs_sourcemap.zig");
 const diagnostic = @import("diag/diagnostic.zig");
+const pkg_manifest = @import("pkg_manifest.zig");
 
 const Span = mem_foundation.Span;
 const BumpArena = mem_foundation.BumpArena;
@@ -135,8 +136,8 @@ pub const LruCacheKey = extern struct {
 const LruSlot = struct {
     /// Key occupying this slot when `is_occupied == true`.
     key: LruCacheKey,
-    /// Owned payload byte buffer (`allocator.free` on eviction or `deinit`).
-    payload: []u8,
+    /// Owned 8-byte-aligned payload byte buffer (`allocator.free` on eviction or `deinit`).
+    payload: []align(8) u8 = @as([*]align(8) u8, @ptrFromInt(8))[0..0],
     /// Previous (more-recently-used) slot index, or `LRU_SENTINEL` at `mru_head`.
     prev_slot: u32 = LRU_SENTINEL,
     /// Next (less-recently-used) slot index, or `LRU_SENTINEL` at `lru_tail`.
@@ -196,8 +197,8 @@ pub const BoundedMetadataLru = struct {
         self.* = undefined;
     }
 
-    /// Looks up `key` in $O(1)$, promoting it to `mru_head` on hit and returning its payload slice.
-    pub fn get(self: *BoundedMetadataLru, key: LruCacheKey) ?[]const u8 {
+    /// Looks up `key` in $O(1)$, promoting it to `mru_head` on hit and returning its 8-byte-aligned payload slice.
+    pub fn get(self: *BoundedMetadataLru, key: LruCacheKey) ?[]align(8) const u8 {
         const slot_idx = self.key_to_slot.get(key) orelse {
             self.miss_count += 1;
             return null;
@@ -207,7 +208,7 @@ pub const BoundedMetadataLru = struct {
         return self.entries.items[slot_idx].payload;
     }
 
-    /// Inserts or replaces `key` with a copy of `payload`, evicting LRU tail entries until within bounds.
+    /// Inserts or replaces `key` with an 8-byte-aligned copy of `payload`, evicting LRU tail entries until within bounds.
     pub fn put(self: *BoundedMetadataLru, key: LruCacheKey, payload: []const u8) !void {
         if (self.key_to_slot.get(key)) |existing_slot| {
             self.evictSlot(existing_slot, false);
@@ -222,14 +223,15 @@ pub const BoundedMetadataLru = struct {
             self.evictSlot(self.lru_tail, true);
         }
 
-        const cloned_payload = try self.allocator.dupe(u8, payload);
+        const cloned_payload = try self.allocator.alignedAlloc(u8, .@"8", payload.len);
         errdefer self.allocator.free(cloned_payload);
+        @memcpy(cloned_payload, payload);
 
         const slot_idx: u32 = if (self.free_slots.items.len > 0)
             self.free_slots.pop().?
         else blk: {
             const next_idx: u32 = @intCast(self.entries.items.len);
-            try self.entries.append(self.allocator, .{ .key = key, .payload = &[_]u8{} });
+            try self.entries.append(self.allocator, .{ .key = key });
             break :blk next_idx;
         };
 
@@ -293,7 +295,7 @@ pub const BoundedMetadataLru = struct {
         self.live_bytes -= slot.payload.len;
         self.live_entries -= 1;
         self.allocator.free(slot.payload);
-        slot.* = .{ .key = slot.key, .payload = &[_]u8{}, .is_occupied = false };
+        slot.* = .{ .key = slot.key, .is_occupied = false };
         self.free_slots.append(self.allocator, slot_idx) catch {};
         if (is_capacity_eviction) {
             self.eviction_count += 1;
@@ -317,6 +319,10 @@ pub const PkgCache = struct {
     metadata_lru: BoundedMetadataLru,
     /// `true` once `{blobs,trees,cxi,staging,index,tlog,locks}` directories have been verified on disk.
     has_ensured_dirs: bool = false,
+    /// `true` once `staging_nonce` has been seeded from the host OS CSPRNG on first write.
+    has_seeded_nonce: bool = false,
+    /// 128-bit per-process/per-cache CSPRNG nonce preventing multi-process staging filename collisions.
+    staging_nonce: [16]u8 = @splat(0),
     /// Monotonic per-instance staging file counter preventing intra-process filename collisions.
     staging_seq: u64 = 0,
 
@@ -401,8 +407,7 @@ pub const PkgCache = struct {
         sink: ?*DiagnosticSink,
         span: Span,
     ) !void {
-        const actual = computeUnkeyedBlake3(data);
-        if (!std.crypto.timing_safe.eql([32]u8, actual, expected_blake3)) {
+        if (!std.crypto.timing_safe.eql([32]u8, computeUnkeyedBlake3(data), expected_blake3)) {
             try emitIntegrityDiagnostic(sink, span, "downloaded or staged blob failed BLAKE3 digest verification");
             return error.CacheIntegrityMismatch;
         }
@@ -435,8 +440,7 @@ pub const PkgCache = struct {
             try emitIntegrityDiagnostic(sink, span, "corrupt or unsorted `.cxtree` package manifest header/entries");
             return error.CacheIntegrityMismatch;
         };
-        const actual_tree = computeCxTreeViewDigest(view);
-        if (!std.crypto.timing_safe.eql([32]u8, actual_tree, expected_tree_blake3)) {
+        if (!std.crypto.timing_safe.eql([32]u8, computeCxTreeViewDigest(view), expected_tree_blake3)) {
             try emitIntegrityDiagnostic(sink, span, "`.cxtree` Merkle root does not match expected `tree_hash`");
             return error.CacheIntegrityMismatch;
         }
@@ -471,6 +475,26 @@ pub const PkgCache = struct {
             span,
         );
         try self.metadata_lru.put(.{ .digest = cxi_blake3, .domain = .cxi_summary }, cxi_bytes);
+    }
+
+    /// Returns a borrowed 8-byte-aligned `.cxtree` slice from `metadata_lru` on hit (zero-alloc), or loads & caches from disk.
+    pub fn asVerifiedCxTreeSlice(
+        self: *PkgCache,
+        io: std.Io,
+        expected_tree_blake3: [32]u8,
+        sink: ?*DiagnosticSink,
+        span: Span,
+    ) !struct { bytes: []align(8) const u8, owned_fallback: ?[]align(8) u8 } {
+        const cache_key = LruCacheKey{ .digest = expected_tree_blake3, .domain = .cxtree };
+        if (self.metadata_lru.get(cache_key)) |cached_slice| {
+            return .{ .bytes = cached_slice, .owned_fallback = null };
+        }
+        const loaded = try self.readVerifiedCxTreeAlloc(io, expected_tree_blake3, sink, span);
+        if (self.metadata_lru.get(cache_key)) |cached_after| {
+            self.allocator.free(loaded);
+            return .{ .bytes = cached_after, .owned_fallback = null };
+        }
+        return .{ .bytes = loaded, .owned_fallback = loaded };
     }
 
     /// Reads and verifies `.cxtree` bytes from `metadata_lru` or `trees/<2-hex>/<62-hex>.cxtree` (`E0015` on tampering).
@@ -670,7 +694,15 @@ pub const PkgCache = struct {
         return error.CacheIntegrityMismatch;
     }
 
-    /// Internal atomic staging writer hardening permissions to read-only before `std.Io.Dir.rename`.
+    /// Lazily seeds `self.staging_nonce` from OS CSPRNG on first staging write.
+    fn ensureStagingNonce(self: *PkgCache, io: std.Io) void {
+        if (!self.has_seeded_nonce) {
+            fillStagingNonce(io, &self.staging_nonce);
+            self.has_seeded_nonce = true;
+        }
+    }
+
+    /// Internal atomic staging writer hardening permissions to read-only across POSIX and Windows NT.
     fn publishImmutableArtifact(
         self: *PkgCache,
         io: std.Io,
@@ -682,6 +714,7 @@ pub const PkgCache = struct {
         span: Span,
     ) !void {
         try self.ensureLayoutDirs(io);
+        self.ensureStagingNonce(io);
         const hex = std.fmt.bytesToHex(digest, .lower);
         const shard_dir = try std.fmt.allocPrint(self.allocator, "{s}/{s}/{s}", .{ self.cas_root, bucket, hex[0..2] });
         defer self.allocator.free(shard_dir);
@@ -698,39 +731,59 @@ pub const PkgCache = struct {
             return;
         }
 
-        self.staging_seq +%= 1;
-        const salt_hash = std.hash.Wyhash.hash(self.staging_seq, &digest);
-        const staging_path = try std.fmt.allocPrint(
+        const stage_prefix = try std.fmt.allocPrint(self.allocator, "{s}/staging/stage-{s}", .{ self.cas_root, hex[0..16] });
+        defer self.allocator.free(stage_prefix);
+
+        const staged = try openExclusiveStagedFile(
+            io,
             self.allocator,
-            "{s}/staging/stage-{x}-{d}.tmp",
-            .{ self.cas_root, salt_hash, self.staging_seq },
+            stage_prefix,
+            self.staging_nonce,
+            &self.staging_seq,
         );
-        defer self.allocator.free(staging_path);
+        defer self.allocator.free(staged.path);
 
-        var is_staged_live = false;
-        errdefer if (is_staged_live) {
-            std.Io.Dir.cwd().deleteFile(io, staging_path) catch {};
-        };
-
-        const staged_file = try std.Io.Dir.cwd().createFile(io, staging_path, .{ .truncate = true });
-        is_staged_live = true;
-        {
-            errdefer staged_file.close(io);
-            try staged_file.writeStreamingAll(io, payload);
-            try staged_file.sync(io);
-            const stat_info = try staged_file.stat(io);
-            staged_file.setPermissions(io, stat_info.permissions.setReadOnly(true)) catch {};
+        var is_file_open = true;
+        var is_staged_live = true;
+        errdefer {
+            if (is_file_open) staged.file.close(io);
+            if (is_staged_live) {
+                clearWindowsReadOnlyIfPresent(io, staged.path);
+                std.Io.Dir.cwd().deleteFile(io, staged.path) catch {};
+            }
         }
-        staged_file.close(io);
 
-        if (std.Io.Dir.rename(std.Io.Dir.cwd(), staging_path, std.Io.Dir.cwd(), final_path, io)) |_| {
+        try staged.file.writeStreamingAll(io, payload);
+        try staged.file.sync(io);
+
+        if (builtin.os.tag != .windows) {
+            if (staged.file.stat(io)) |stat_info| {
+                staged.file.setPermissions(io, withReadOnlyPermission(stat_info.permissions, true)) catch {};
+            } else |_| {}
+            staged.file.close(io);
+            is_file_open = false;
+        }
+
+        if (std.Io.Dir.rename(std.Io.Dir.cwd(), staged.path, std.Io.Dir.cwd(), final_path, io)) |_| {
             is_staged_live = false;
+            if (builtin.os.tag == .windows) {
+                if (staged.file.stat(io)) |stat_info| {
+                    staged.file.setPermissions(io, withReadOnlyPermission(stat_info.permissions, true)) catch {};
+                } else |_| {}
+                staged.file.close(io);
+                is_file_open = false;
+            }
             return;
         } else |rename_err| {
+            if (is_file_open) {
+                staged.file.close(io);
+                is_file_open = false;
+            }
             // Handle concurrent idempotent content-addressed commit (always verifying exact size + BLAKE3 bytes):
             if (rename_err == error.AccessDenied or rename_err == error.PathAlreadyExists) {
                 if (try self.verifyExistingImmutableArtifact(io, final_path, payload, sink, span)) {
-                    std.Io.Dir.cwd().deleteFile(io, staging_path) catch {};
+                    clearWindowsReadOnlyIfPresent(io, staged.path);
+                    std.Io.Dir.cwd().deleteFile(io, staged.path) catch {};
                     is_staged_live = false;
                     return;
                 }
@@ -843,13 +896,107 @@ fn computeUnkeyedBlake3(bytes: []const u8) [32]u8 {
 
 /// Returns `true` if `rel_path` has a recognized source/manifest text filename or extension.
 fn hasTextSourceExtension(rel_path: []const u8) bool {
-    const slash_pos = std.mem.lastIndexOfAny(u8, rel_path, "/\\");
-    const base_name = if (slash_pos) |idx| rel_path[idx + 1 ..] else rel_path;
+    const base_name = if (std.mem.lastIndexOfAny(u8, rel_path, "/\\")) |idx| rel_path[idx + 1 ..] else rel_path;
     if (std.mem.eql(u8, base_name, "corex.toml") or TEXT_BASENAME_MAP.has(base_name)) return true;
     if (std.mem.lastIndexOfScalar(u8, base_name, '.')) |dot_idx| {
         return TEXT_EXTENSION_MAP.has(base_name[dot_idx..]);
     }
     return false;
+}
+
+/// Fills `out_nonce` from OS CSPRNG (`io.randomSecure`, falling back to `io.random` only if unavailable).
+fn fillStagingNonce(io: std.Io, out_nonce: *[16]u8) void {
+    io.randomSecure(out_nonce) catch io.random(out_nonce);
+}
+
+/// Creates a unique exclusive temporary staging file `<prefix>.<128-bit-nonce>-<seq>.tmp` (`O_EXCL` / `CREATE_NEW`).
+fn openExclusiveStagedFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    prefix_path: []const u8,
+    nonce: [16]u8,
+    seq_counter: *u64,
+) !struct { file: std.Io.File, path: []u8 } {
+    const nonce_hex = std.fmt.bytesToHex(nonce, .lower);
+    var attempt: u32 = 0;
+    while (attempt < 64) : (attempt += 1) {
+        seq_counter.* +%= 1;
+        const candidate_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}.{s}-{x}.tmp",
+            .{ prefix_path, &nonce_hex, seq_counter.* },
+        );
+        if (std.Io.Dir.cwd().createFile(io, candidate_path, .{
+            .exclusive = true,
+            .truncate = false,
+        })) |created_file| {
+            return .{ .file = created_file, .path = candidate_path };
+        } else |open_err| {
+            allocator.free(candidate_path);
+            if (open_err == error.PathAlreadyExists) continue;
+            return open_err;
+        }
+    }
+    return error.PathAlreadyExists;
+}
+
+/// Clears Windows NT `READONLY` attribute on `path` if present so replacement or deletion succeeds cleanly.
+fn clearWindowsReadOnlyIfPresent(io: std.Io, path: []const u8) void {
+    if (builtin.os.tag != .windows) return;
+    const stat_info = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return;
+    if (!stat_info.permissions.toAttributes().READONLY) return;
+
+    const windows = std.os.windows;
+    const cwd_dir = std.Io.Dir.cwd();
+    const sub_path_w = std.Io.Threaded.sliceToPrefixedFileW(cwd_dir.handle, path, .{}) catch return;
+    const is_abs = std.Io.Dir.path.isAbsoluteWindowsWtf16(sub_path_w.span());
+    const attr: windows.OBJECT.ATTRIBUTES = .{
+        .RootDirectory = if (is_abs) null else cwd_dir.handle,
+        .ObjectName = @constCast(&sub_path_w.string()),
+    };
+    var io_status_block: windows.IO_STATUS_BLOCK = undefined;
+    var attr_handle: windows.HANDLE = undefined;
+    if (windows.ntdll.NtCreateFile(
+        &attr_handle,
+        .{
+            .SPECIFIC = .{ .FILE = .{ .READ_ATTRIBUTES = true, .WRITE_ATTRIBUTES = true } },
+            .STANDARD = .{ .SYNCHRONIZE = true },
+        },
+        &attr,
+        &io_status_block,
+        null,
+        .{},
+        .VALID_FLAGS,
+        .OPEN,
+        .{ .IO = .SYNCHRONOUS_NONALERT, .NON_DIRECTORY_FILE = true },
+        null,
+        0,
+    ) == .SUCCESS) {
+        const attr_file = std.Io.File{ .handle = attr_handle, .flags = .{ .nonblocking = false } };
+        defer attr_file.close(io);
+        attr_file.setPermissions(io, withReadOnlyPermission(stat_info.permissions, false)) catch {};
+    }
+}
+
+/// Returns `true` if `dst_path` already exists on disk with exact size and `BLAKE3` digest matching `expected_bytes`.
+fn verifyExistingDestinationBytes(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    dst_path: []const u8,
+    expected_bytes: []const u8,
+) bool {
+    const existing_file = std.Io.Dir.cwd().openFile(io, dst_path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+    }) catch return false;
+    defer existing_file.close(io);
+    const existing_stat = existing_file.stat(io) catch return false;
+    if (existing_stat.kind == .directory or existing_stat.size != expected_bytes.len) return false;
+    const existing_buf = allocator.alloc(u8, expected_bytes.len) catch return false;
+    defer allocator.free(existing_buf);
+    const read_len = existing_file.readPositionalAll(io, existing_buf, 0) catch return false;
+    return read_len == expected_bytes.len and
+        std.crypto.timing_safe.eql([32]u8, computeUnkeyedBlake3(existing_buf), computeUnkeyedBlake3(expected_bytes));
 }
 
 /// Computes `tree_blake3` directly from a validated `CxTreeView`.
@@ -874,7 +1021,7 @@ fn computeCxTreeViewDigest(view: vfs_sourcemap.CxTreeView) [32]u8 {
 // --------- Standalone 7-Round BLAKE3 Bao Compression ----------
 
 /// Quarter-round mixing step `G` of the 7-round `BLAKE3` compression function.
-inline fn blake3MixG(
+inline fn mixBlake3G(
     state: *[16]u32,
     idx_a: usize,
     idx_b: usize,
@@ -894,7 +1041,7 @@ inline fn blake3MixG(
 }
 
 /// Compresses one 64-byte `BLAKE3` block across all 7 rounds and returns the 32-byte chaining value.
-fn blake3CompressBlock(
+fn compressBlake3Block(
     chaining_val: [8]u32,
     block_bytes: *const [64]u8,
     block_len: u8,
@@ -915,14 +1062,14 @@ fn blake3CompressBlock(
 
     for (0..7) |round_idx| {
         const sched = &BLAKE3_MSG_SCHEDULE[round_idx];
-        blake3MixG(&state, 0, 4, 8, 12, msg_words[sched[0]], msg_words[sched[1]]);
-        blake3MixG(&state, 1, 5, 9, 13, msg_words[sched[2]], msg_words[sched[3]]);
-        blake3MixG(&state, 2, 6, 10, 14, msg_words[sched[4]], msg_words[sched[5]]);
-        blake3MixG(&state, 3, 7, 11, 15, msg_words[sched[6]], msg_words[sched[7]]);
-        blake3MixG(&state, 0, 5, 10, 15, msg_words[sched[8]], msg_words[sched[9]]);
-        blake3MixG(&state, 1, 6, 11, 12, msg_words[sched[10]], msg_words[sched[11]]);
-        blake3MixG(&state, 2, 7, 8, 13, msg_words[sched[12]], msg_words[sched[13]]);
-        blake3MixG(&state, 3, 4, 9, 14, msg_words[sched[14]], msg_words[sched[15]]);
+        mixBlake3G(&state, 0, 4, 8, 12, msg_words[sched[0]], msg_words[sched[1]]);
+        mixBlake3G(&state, 1, 5, 9, 13, msg_words[sched[2]], msg_words[sched[3]]);
+        mixBlake3G(&state, 2, 6, 10, 14, msg_words[sched[4]], msg_words[sched[5]]);
+        mixBlake3G(&state, 3, 7, 11, 15, msg_words[sched[6]], msg_words[sched[7]]);
+        mixBlake3G(&state, 0, 5, 10, 15, msg_words[sched[8]], msg_words[sched[9]]);
+        mixBlake3G(&state, 1, 6, 11, 12, msg_words[sched[10]], msg_words[sched[11]]);
+        mixBlake3G(&state, 2, 7, 8, 13, msg_words[sched[12]], msg_words[sched[13]]);
+        mixBlake3G(&state, 3, 4, 9, 14, msg_words[sched[14]], msg_words[sched[15]]);
     }
 
     var next_cv: [8]u32 = undefined;
@@ -948,7 +1095,7 @@ fn computeBlake3ChunkCv(chunk_bytes: []const u8, chunk_index: u64, is_root: bool
     if (chunk_bytes.len == 0) {
         const zero_block: [64]u8 = @splat(0);
         const root_bit: u8 = if (is_root) BLAKE3_FLAG_ROOT else 0;
-        return cvWordsToBytes(blake3CompressBlock(
+        return cvWordsToBytes(compressBlake3Block(
             cv_words,
             &zero_block,
             0,
@@ -971,7 +1118,7 @@ fn computeBlake3ChunkCv(chunk_bytes: []const u8, chunk_index: u64, is_root: bool
             flags |= BLAKE3_FLAG_CHUNK_END;
             if (is_root) flags |= BLAKE3_FLAG_ROOT;
         }
-        cv_words = blake3CompressBlock(cv_words, &padded_block, @intCast(rem), chunk_index, flags);
+        cv_words = compressBlake3Block(cv_words, &padded_block, @intCast(rem), chunk_index, flags);
     }
     return cvWordsToBytes(cv_words);
 }
@@ -982,11 +1129,11 @@ fn computeBlake3ParentCv(left_cv: [32]u8, right_cv: [32]u8, is_root: bool) [32]u
     @memcpy(parent_block[0..32], &left_cv);
     @memcpy(parent_block[32..64], &right_cv);
     const flags: u8 = BLAKE3_FLAG_PARENT | (if (is_root) BLAKE3_FLAG_ROOT else 0);
-    return cvWordsToBytes(blake3CompressBlock(BLAKE3_IV, &parent_block, 64, 0, flags));
+    return cvWordsToBytes(compressBlake3Block(BLAKE3_IV, &parent_block, 64, 0, flags));
 }
 
 /// Returns the left-complete binary subtree chunk count (`2^k` strictly `< chunk_count`) for `chunk_count >= 2`.
-inline fn leftSubtreeChunks(chunk_count: u64) u64 {
+inline fn countLeftSubtreeChunks(chunk_count: u64) u64 {
     std.debug.assert(chunk_count >= 2);
     const shift_amt: u6 = @intCast(63 - @clz(chunk_count - 1));
     return @as(u64, 1) << shift_amt;
@@ -1008,7 +1155,7 @@ fn encodeBaoSubtreeRecursive(
         return computeBlake3ChunkCv(slice, base_chunk, is_root);
     }
 
-    const left_chunks = leftSubtreeChunks(chunk_count);
+    const left_chunks = countLeftSubtreeChunks(chunk_count);
     const slot_offset = write_cursor.*;
     write_cursor.* += 64;
 
@@ -1049,8 +1196,7 @@ fn verifyBaoSubtreeRecursive(
         if (data_cursor.* + expected_chunk_len > slice_data.len) return false;
         const chunk_slice = slice_data[data_cursor.* .. data_cursor.* + expected_chunk_len];
         data_cursor.* += expected_chunk_len;
-        const actual_cv = computeBlake3ChunkCv(chunk_slice, base_chunk, is_root);
-        return std.crypto.timing_safe.eql([32]u8, actual_cv, expected_cv);
+        return std.crypto.timing_safe.eql([32]u8, computeBlake3ChunkCv(chunk_slice, base_chunk, is_root), expected_cv);
     }
 
     if (obao_cursor.* + 64 > obao_nodes.len) return false;
@@ -1058,10 +1204,11 @@ fn verifyBaoSubtreeRecursive(
     const right_cv = obao_nodes[obao_cursor.* + 32 ..][0..32].*;
     obao_cursor.* += 64;
 
-    const parent_cv = computeBlake3ParentCv(left_cv, right_cv, is_root);
-    if (!std.crypto.timing_safe.eql([32]u8, parent_cv, expected_cv)) return false;
+    if (!std.crypto.timing_safe.eql([32]u8, computeBlake3ParentCv(left_cv, right_cv, is_root), expected_cv)) {
+        return false;
+    }
 
-    const left_chunks = leftSubtreeChunks(chunk_count);
+    const left_chunks = countLeftSubtreeChunks(chunk_count);
     const right_chunks = chunk_count - left_chunks;
     const mid_chunk = base_chunk + left_chunks;
 
@@ -1137,12 +1284,14 @@ fn resolveShardedCasSourcePathAlloc(
     );
 }
 
-/// Attempts a Linux `FICLONE` copy-on-write reflink from `src_file` onto a newly staged file in `dst_path`.
+/// Attempts a Linux `FICLONE` copy-on-write reflink from `src_path` onto a newly staged file in `dst_path`.
 fn tryCloneFileViaReflink(
     io: std.Io,
     allocator: std.mem.Allocator,
     src_path: []const u8,
     dst_path: []const u8,
+    nonce: [16]u8,
+    seq_counter: *u64,
 ) bool {
     if (builtin.os.tag != .linux) return false;
 
@@ -1152,30 +1301,33 @@ fn tryCloneFileViaReflink(
     }) catch return false;
     defer src_file.close(io);
 
-    const tmp_path = std.fmt.allocPrint(allocator, "{s}.reflink.tmp", .{dst_path}) catch return false;
-    defer allocator.free(tmp_path);
+    const stage_prefix = std.fmt.allocPrint(allocator, "{s}.reflink", .{dst_path}) catch return false;
+    defer allocator.free(stage_prefix);
 
-    const dst_file = std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true }) catch return false;
+    const staged = openExclusiveStagedFile(io, allocator, stage_prefix, nonce, seq_counter) catch return false;
+    defer allocator.free(staged.path);
+
     const ficlone_req = std.os.linux.IOCTL.IOW(0x94, 9, c_int);
     const src_fd_usize: usize = @intCast(@as(u32, @bitCast(src_file.handle)));
-    const ioctl_rc = std.os.linux.ioctl(dst_file.handle, ficlone_req, src_fd_usize);
+    const ioctl_rc = std.os.linux.ioctl(staged.file.handle, ficlone_req, src_fd_usize);
     if (std.os.linux.errno(ioctl_rc) != .SUCCESS) {
-        dst_file.close(io);
-        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        staged.file.close(io);
+        std.Io.Dir.cwd().deleteFile(io, staged.path) catch {};
         return false;
     }
 
-    dst_file.sync(io) catch {};
-    if (dst_file.stat(io)) |st| {
-        dst_file.setPermissions(io, st.permissions.setReadOnly(true)) catch {};
+    staged.file.sync(io) catch {};
+    if (staged.file.stat(io)) |st| {
+        staged.file.setPermissions(io, withReadOnlyPermission(st.permissions, true)) catch {};
     } else |_| {}
-    dst_file.close(io);
+    staged.file.close(io);
 
+    clearWindowsReadOnlyIfPresent(io, dst_path);
     std.Io.Dir.cwd().deleteFile(io, dst_path) catch {};
-    if (std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), dst_path, io)) |_| {
+    if (std.Io.Dir.rename(std.Io.Dir.cwd(), staged.path, std.Io.Dir.cwd(), dst_path, io)) |_| {
         return true;
     } else |_| {
-        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        std.Io.Dir.cwd().deleteFile(io, staged.path) catch {};
         return false;
     }
 }
@@ -1186,17 +1338,20 @@ fn materializeImmutableFileTiered(
     allocator: std.mem.Allocator,
     src_path: []const u8,
     dst_path: []const u8,
+    nonce: [16]u8,
+    seq_counter: *u64,
 ) !VendorLinkTier {
     if (std.fs.path.dirname(dst_path)) |parent_dir| {
         if (parent_dir.len > 0) try std.Io.Dir.cwd().createDirPath(io, parent_dir);
     }
 
-    // [1] Tier 1: Copy-on-Write filesystem reflink (`FICLONE` on Linux when supported by underlying FS):
-    if (tryCloneFileViaReflink(io, allocator, src_path, dst_path)) {
+    // [1] Tier 1 – Copy-on-Write filesystem reflink (`FICLONE` on Linux when supported by underlying FS):
+    if (tryCloneFileViaReflink(io, allocator, src_path, dst_path, nonce, seq_counter)) {
         return .cow_reflink;
     }
 
-    // [2] Tier 2: Read-only directory hardlink (`follow_symlinks = false`):
+    // [2] Tier 2 – Read-only directory hardlink (`follow_symlinks = false`):
+    clearWindowsReadOnlyIfPresent(io, dst_path);
     std.Io.Dir.cwd().deleteFile(io, dst_path) catch {};
     if (std.Io.Dir.hardLink(
         std.Io.Dir.cwd(),
@@ -1209,7 +1364,7 @@ fn materializeImmutableFileTiered(
         return .hardlink;
     } else |_| {}
 
-    // [3] Tier 3: Cross-device (`EXDEV`) atomic read-only copy:
+    // [3] Tier 3 – Cross-device (`EXDEV`) atomic read-only copy:
     const src_file = try std.Io.Dir.cwd().openFile(io, src_path, .{
         .mode = .read_only,
         .allow_directory = false,
@@ -1223,30 +1378,88 @@ fn materializeImmutableFileTiered(
         return error.UnexpectedEndOfFile;
     }
 
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.copy.tmp", .{dst_path});
-    defer allocator.free(tmp_path);
-    errdefer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    const stage_prefix = try std.fmt.allocPrint(allocator, "{s}.copy", .{dst_path});
+    defer allocator.free(stage_prefix);
 
-    const tmp_file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
-    {
-        errdefer tmp_file.close(io);
-        try tmp_file.writeStreamingAll(io, copy_buf);
-        try tmp_file.sync(io);
-        const tmp_stat = try tmp_file.stat(io);
-        tmp_file.setPermissions(io, tmp_stat.permissions.setReadOnly(true)) catch {};
+    const staged = try openExclusiveStagedFile(io, allocator, stage_prefix, nonce, seq_counter);
+    defer allocator.free(staged.path);
+
+    var is_file_open = true;
+    var is_staged_live = true;
+    errdefer {
+        if (is_file_open) staged.file.close(io);
+        if (is_staged_live) {
+            clearWindowsReadOnlyIfPresent(io, staged.path);
+            std.Io.Dir.cwd().deleteFile(io, staged.path) catch {};
+        }
     }
-    tmp_file.close(io);
 
+    try staged.file.writeStreamingAll(io, copy_buf);
+    try staged.file.sync(io);
+
+    if (builtin.os.tag != .windows) {
+        if (staged.file.stat(io)) |tmp_stat| {
+            staged.file.setPermissions(io, withReadOnlyPermission(tmp_stat.permissions, true)) catch {};
+        } else |_| {}
+        staged.file.close(io);
+        is_file_open = false;
+    }
+
+    clearWindowsReadOnlyIfPresent(io, dst_path);
     std.Io.Dir.cwd().deleteFile(io, dst_path) catch {};
-    try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), dst_path, io);
-    return .atomic_copy;
+    if (std.Io.Dir.rename(std.Io.Dir.cwd(), staged.path, std.Io.Dir.cwd(), dst_path, io)) |_| {
+        is_staged_live = false;
+        if (builtin.os.tag == .windows) {
+            if (staged.file.stat(io)) |tmp_stat| {
+                staged.file.setPermissions(io, withReadOnlyPermission(tmp_stat.permissions, true)) catch {};
+            } else |_| {}
+            staged.file.close(io);
+            is_file_open = false;
+        }
+        return .atomic_copy;
+    } else |rename_err| {
+        if (is_file_open) {
+            staged.file.close(io);
+            is_file_open = false;
+        }
+        if ((rename_err == error.PathAlreadyExists or rename_err == error.AccessDenied) and
+            verifyExistingDestinationBytes(io, allocator, dst_path, copy_buf))
+        {
+            clearWindowsReadOnlyIfPresent(io, staged.path);
+            std.Io.Dir.cwd().deleteFile(io, staged.path) catch {};
+            is_staged_live = false;
+            return .atomic_copy;
+        }
+        return rename_err;
+    }
 }
 
 // ------------------------------------- PUBLIC API --------------------------------------
 
 // ------------ Environment & Normalization Helpers -------------
 
-/// Resolves `COREX_HOME` (`$COREX_HOME` -> OS cache/home directory fallback, `reconciled_overrides.md` §1.5).
+/// Returns `permissions` with read-only attributes toggled safely across Windows NT and POSIX (`DR-11` §2.2).
+pub fn withReadOnlyPermission(
+    permissions: std.Io.File.Permissions,
+    is_read_only: bool,
+) std.Io.File.Permissions {
+    if (builtin.os.tag == .windows) {
+        var attributes = permissions.toAttributes();
+        if (is_read_only) {
+            attributes.NORMAL = false;
+            attributes.READONLY = true;
+        } else {
+            attributes.READONLY = false;
+            if (@as(std.os.windows.ULONG, @bitCast(attributes)) == 0) {
+                attributes.NORMAL = true;
+            }
+        }
+        return @fromBackingInt(@intCast(@as(std.os.windows.DWORD, @bitCast(attributes))));
+    }
+    return permissions.setReadOnly(is_read_only);
+}
+
+/// Resolves `COREX_HOME` (`$COREX_HOME` -> OS cache/home directory fallback, `DR-11` §2).
 pub fn resolveCorexHome(
     allocator: std.mem.Allocator,
     environ_map: ?*const std.process.Environ.Map,
@@ -1463,7 +1676,8 @@ pub fn encodeBaoOutboard(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
     return out;
 }
 
-/// Verifies a slice `slice_data` at `[slice_offset .. slice_offset + slice_len)` against `obao_bytes` and `expected_root`.
+/// Verifies `[slice_offset .. slice_offset + slice_len)` against `obao_bytes` and `expected_root` (`slice_data` holds the
+/// enclosing `1,024`-byte `BLAKE3` chunk window `[floor(slice_offset / 1024) * 1024 .. min(ceil(end / 1024) * 1024, total_len))`).
 pub fn verifyBaoSlice(
     expected_root: [32]u8,
     obao_bytes: []const u8,
@@ -1504,11 +1718,25 @@ pub fn verifyBaoSlice(
         return error.CacheIntegrityMismatch;
     }
 
-    const slice_start_chunk: u64 = slice_offset / BLAKE3_CHUNK_LEN;
+    const slice_start_chunk: u64 = if (total_len == 0)
+        0
+    else
+        @min(slice_offset / BLAKE3_CHUNK_LEN, chunk_count - 1);
     const slice_end_chunk: u64 = if (total_len == 0 or slice_len == 0)
         slice_start_chunk + 1
     else
         (slice_end_byte + BLAKE3_CHUNK_LEN - 1) / BLAKE3_CHUNK_LEN;
+
+    const window_start_byte: u64 = slice_start_chunk * BLAKE3_CHUNK_LEN;
+    const window_end_byte: u64 = @min(slice_end_chunk * BLAKE3_CHUNK_LEN, total_len);
+    if (slice_data.len != window_end_byte - window_start_byte) {
+        try emitIntegrityDiagnostic(
+            sink,
+            span,
+            "Bao slice buffer length must match the enclosing 1,024-byte BLAKE3 chunk window",
+        );
+        return error.CacheIntegrityMismatch;
+    }
 
     var obao_cursor: usize = 0;
     var data_cursor: usize = 0;
@@ -1556,8 +1784,7 @@ pub fn verifyEd25519Signature(
         try emitIntegrityDiagnostic(sink, span, "non-canonical or invalid Ed25519 publisher public key");
         return error.CacheIntegrityMismatch;
     };
-    const sig = std.crypto.sign.Ed25519.Signature.fromBytes(sig_bytes);
-    sig.verify(message, public_key) catch {
+    std.crypto.sign.Ed25519.Signature.fromBytes(sig_bytes).verify(message, public_key) catch {
         try emitIntegrityDiagnostic(sink, span, "Ed25519 package signature verification failed");
         return error.CacheIntegrityMismatch;
     };
@@ -1735,6 +1962,7 @@ pub fn materializeVendorDir(
     span: Span,
 ) !VendorMaterializeStats {
     var stats = VendorMaterializeStats{};
+    cache.ensureStagingNonce(io);
     const trimmed_vendor = std.mem.trimEnd(u8, vendor_dir, "/\\");
     const vendor_blobs = try std.fmt.allocPrint(cache.allocator, "{s}/blake3/blobs", .{trimmed_vendor});
     defer cache.allocator.free(vendor_blobs);
@@ -1776,8 +2004,14 @@ pub fn materializeVendorDir(
         );
         defer cache.allocator.free(dst_tree_path);
 
-        const tree_tier = try materializeImmutableFileTiered(io, cache.allocator, src_tree_primary, dst_tree_path);
-        switch (tree_tier) {
+        switch (try materializeImmutableFileTiered(
+            io,
+            cache.allocator,
+            src_tree_primary,
+            dst_tree_path,
+            cache.staging_nonce,
+            &cache.staging_seq,
+        )) {
             .cow_reflink => stats.reflink_count += 1,
             .hardlink => stats.hardlink_count += 1,
             .atomic_copy => stats.copy_count += 1,
@@ -1827,32 +2061,73 @@ pub fn materializeVendorDir(
             );
             defer cache.allocator.free(dst_blob);
 
-            const blob_tier = try materializeImmutableFileTiered(io, cache.allocator, src_blob, dst_blob);
-            switch (blob_tier) {
+            switch (try materializeImmutableFileTiered(
+                io,
+                cache.allocator,
+                src_blob,
+                dst_blob,
+                cache.staging_nonce,
+                &cache.staging_seq,
+            )) {
                 .cow_reflink => stats.reflink_count += 1,
                 .hardlink => stats.hardlink_count += 1,
                 .atomic_copy => stats.copy_count += 1,
             }
         }
 
-        const mod_entry = try std.fmt.allocPrint(
-            cache.allocator,
-            "\n[[package]]\nname = \"{s}\"\nversion = \"{s}\"\nsource = \"{s}\"\ntree_hash = \"b3:{s}\"\n",
-            .{ pkg_rec.name, pkg_rec.version, pkg_rec.source, &tree_hex },
-        );
-        defer cache.allocator.free(mod_entry);
-        try modules_builder.appendSlice(cache.allocator, mod_entry);
+        try modules_builder.appendSlice(cache.allocator, "\n[[package]]\nname = ");
+        try pkg_manifest.appendEscapedTomlBasicString(&modules_builder, cache.allocator, pkg_rec.name);
+        try modules_builder.appendSlice(cache.allocator, "\nversion = ");
+        try pkg_manifest.appendEscapedTomlBasicString(&modules_builder, cache.allocator, pkg_rec.version);
+        try modules_builder.appendSlice(cache.allocator, "\nsource = ");
+        try pkg_manifest.appendEscapedTomlBasicString(&modules_builder, cache.allocator, pkg_rec.source);
+        try modules_builder.appendSlice(cache.allocator, "\ntree_hash = \"b3:");
+        try modules_builder.appendSlice(cache.allocator, &tree_hex);
+        try modules_builder.appendSlice(cache.allocator, "\"\n");
     }
 
-    // [3] Atomically write `<vendor_dir>/modules.toml`:
-    const modules_tmp = try std.fmt.allocPrint(cache.allocator, "{s}/modules.toml.tmp", .{trimmed_vendor});
-    defer cache.allocator.free(modules_tmp);
+    // [3] Atomically write `<vendor_dir>/modules.toml` via CSPRNG-salted exclusive staging:
     const modules_dst = try std.fmt.allocPrint(cache.allocator, "{s}/modules.toml", .{trimmed_vendor});
     defer cache.allocator.free(modules_dst);
 
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = modules_tmp, .data = modules_builder.items });
+    const staged_mods = try openExclusiveStagedFile(
+        io,
+        cache.allocator,
+        modules_dst,
+        cache.staging_nonce,
+        &cache.staging_seq,
+    );
+    defer cache.allocator.free(staged_mods.path);
+
+    var is_mods_open = true;
+    var is_mods_live = true;
+    errdefer {
+        if (is_mods_open) staged_mods.file.close(io);
+        if (is_mods_live) {
+            clearWindowsReadOnlyIfPresent(io, staged_mods.path);
+            std.Io.Dir.cwd().deleteFile(io, staged_mods.path) catch {};
+        }
+    }
+
+    try staged_mods.file.writeStreamingAll(io, modules_builder.items);
+    try staged_mods.file.sync(io);
+    staged_mods.file.close(io);
+    is_mods_open = false;
+
+    clearWindowsReadOnlyIfPresent(io, modules_dst);
     std.Io.Dir.cwd().deleteFile(io, modules_dst) catch {};
-    try std.Io.Dir.rename(std.Io.Dir.cwd(), modules_tmp, std.Io.Dir.cwd(), modules_dst, io);
+    if (std.Io.Dir.rename(std.Io.Dir.cwd(), staged_mods.path, std.Io.Dir.cwd(), modules_dst, io)) |_| {
+        is_mods_live = false;
+    } else |rename_err| {
+        if ((rename_err == error.PathAlreadyExists or rename_err == error.AccessDenied) and
+            verifyExistingDestinationBytes(io, cache.allocator, modules_dst, modules_builder.items))
+        {
+            std.Io.Dir.cwd().deleteFile(io, staged_mods.path) catch {};
+            is_mods_live = false;
+        } else {
+            return rename_err;
+        }
+    }
     return stats;
 }
 

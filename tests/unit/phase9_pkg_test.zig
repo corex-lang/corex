@@ -55,6 +55,14 @@ const CliRunCapture = struct {
     }
 };
 
+/// Contiguous byte range of a single syntactic token or trivia piece inside `doc.toml_slice`.
+const SpanPiece = struct {
+    /// Starting byte offset relative to `doc.toml_slice`.
+    offset: u32,
+    /// Byte length of this token or trivia piece.
+    length: u32,
+};
+
 // --------------------------------------- CONSTS ----------------------------------------
 
 /// Monotonic atomic counter ensuring unique scratch directories across parallel test threads.
@@ -106,8 +114,20 @@ fn buildHermeticEnvMap(
     errdefer env_map.deinit();
     try env_map.put("COREX_HOME", corex_home);
     try env_map.put("HOME", corex_home);
-    try env_map.put("ZIG_GLOBAL_CACHE_DIR", ".zig-cache/zig_global_cache");
-    try env_map.put("PATH", "/usr/local/bin:/usr/bin:/bin");
+    try env_map.put("USERPROFILE", corex_home);
+    try env_map.put("LOCALAPPDATA", corex_home);
+    try env_map.put("APPDATA", corex_home);
+    try env_map.put("TMPDIR", corex_home);
+    try env_map.put("TEMP", corex_home);
+    try env_map.put("TMP", corex_home);
+    try env_map.put("ZIG_GLOBAL_CACHE_DIR", corex_home);
+    if (builtin.os.tag == .windows) {
+        try env_map.put("SystemRoot", "C:\\Windows");
+        try env_map.put("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+        try env_map.put("PATH", "C:\\Windows\\System32;C:\\Windows");
+    } else {
+        try env_map.put("PATH", "/usr/local/bin:/usr/bin:/bin");
+    }
     if (registry_dir_opt) |reg_dir| {
         try env_map.put("COREX_REGISTRY_DIR", reg_dir);
     }
@@ -160,13 +180,6 @@ fn reconstructTomlFromTokensAlloc(
     allocator: std.mem.Allocator,
     doc: *const pkg_manifest.TomlDocumentView,
 ) ![]u8 {
-    const SpanPiece = struct {
-        /// Starting byte offset relative to `doc.toml_slice`.
-        offset: u32,
-        /// Byte length of this token or trivia piece.
-        length: u32,
-    };
-
     var pieces: std.ArrayListUnmanaged(SpanPiece) = .empty;
     defer pieces.deinit(allocator);
 
@@ -214,7 +227,7 @@ fn reconstructTomlFromTokensAlloc(
     return out_builder.toOwnedSlice(allocator);
 }
 
-// ---------------------------------------- MAIN -----------------------------------------
+// ------------------------------------- PUBLIC API --------------------------------------
 
 // ----- Pillar 1: Lossless TOML CST & Manifest Validation ------
 
@@ -1257,7 +1270,7 @@ test "test_phase9_mvs_pubgrub_conflicts_links_registry_git_and_hermetic_cli" {
     try std.Io.Dir.cwd().createDirPath(io, corex_home);
     try std.Io.Dir.cwd().createDirPath(io, reg_dir);
 
-    // [1] Diamond MVS + `P2-1` monotone feature re-enqueue (`v_next == v_cur`) + weak `foo?/feat` + `SeriesKey` coexistence:
+    // [1] Diamond MVS + monotone feature re-enqueue (`v_next == v_cur`) + weak `foo?/feat` + `SeriesKey` coexistence:
     {
         // Populate mock registry packages:
         // - `leaf-opt@1.0.0` with feature `extra = []`
@@ -1809,7 +1822,7 @@ test "test_phase9_mvs_pubgrub_conflicts_links_registry_git_and_hermetic_cli" {
         defer allocator.free(cached_blob_path);
         if (std.Io.Dir.cwd().openFile(io, cached_blob_path, .{ .mode = .read_only })) |ro_file| {
             const st = try ro_file.stat(io);
-            ro_file.setPermissions(io, st.permissions.setReadOnly(false)) catch {};
+            ro_file.setPermissions(io, pkg_cache.withReadOnlyPermission(st.permissions, false)) catch {};
             ro_file.close(io);
         } else |_| {}
         std.Io.Dir.cwd().deleteFile(io, cached_blob_path) catch {};
@@ -1844,8 +1857,7 @@ test "test_phase9_multipkg_db_cross_major_e0012_cxi_sandbox_and_entrypoint" {
     try std.Io.Dir.cwd().createDirPath(io, reg_dir);
 
     // [1] Submodule `use pkg.RootType;`, undeclared transitive dep rejection, `Durability.high` external stdlib
-    //     firewall (`E0218` on `use core.mem;`, `E0327` on `@trusted`/`@std_cap_boundary` even inside inactive `@cfg`!),
-    //     and `@cfg(cfg.feature.undeclared)` emitting `E0435`:
+    //     firewall (`E0218` on `use core.mem;`, `E0327` on `@trusted`/`@std_cap_boundary`), and `@cfg` `E0435`:
     {
         var db = try CompilerDb.init(allocator);
         defer db.deinit();
@@ -2035,9 +2047,8 @@ test "test_phase9_multipkg_db_cross_major_e0012_cxi_sandbox_and_entrypoint" {
         try std.testing.expect(!std.mem.eql(u8, &cxi_1.cxi_blake3, &cxi_4.cxi_blake3));
     }
 
-    // [4] Supply-chain sandboxing: transitive capability laundering (`E0324` with witness!), default-arg & `pub subscript`
-    //     & inactive `@cfg(target.os == .Windows)` capability detection, dead high-risk `W0330`, comptime `E0325`,
-    //     and `.cxtree` / symlink `@embed_bytes` & `@c_import` escape rejection (`E0326`):
+    // [4] Supply-chain sandboxing; transitive capability laundering (`E0324` witness), default-arg & `pub subscript`
+    //     & inactive `@cfg` capability detection, dead `W0330`, comptime `E0325`, and `@embed_bytes`/`@c_import` `E0326`:
     {
         var db = try CompilerDb.init(allocator);
         defer db.deinit();
@@ -2304,8 +2315,9 @@ test "test_phase9_multipkg_db_cross_major_e0012_cxi_sandbox_and_entrypoint" {
         var env_map = try buildHermeticEnvMap(allocator, corex_home, reg_dir, false);
         defer env_map.deinit();
 
+        const exe_ext = if (builtin.os.tag == .windows) ".exe" else "";
         for ([_][]const u8{ "c", "llvm" }) |backend_name| {
-            const out_exe = try std.fmt.allocPrint(allocator, "{s}/entry_{s}_exe", .{ temp_dir, backend_name });
+            const out_exe = try std.fmt.allocPrint(allocator, "{s}/entry_{s}_exe{s}", .{ temp_dir, backend_name, exe_ext });
             defer allocator.free(out_exe);
             const ofmt_arg = try std.fmt.allocPrint(allocator, "--ofmt={s}", .{backend_name});
             defer allocator.free(ofmt_arg);
@@ -2340,12 +2352,12 @@ test "test_phase9_multipkg_db_cross_major_e0012_cxi_sandbox_and_entrypoint" {
     }
 }
 
-// ------ Pillar 6: Red-Team & Verifier Remediation Suite -------
+// ----- Pillar 6: Sandbox Escalation & CAS Tamper Defense ------
 
-test "test_phase9_redteam_and_verifier_remediation_regressions" {
+test "test_phase9_sandbox_escalation_cas_tamper_and_edge_cases" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const temp_dir = try createIsolatedTempDir(allocator, io, "remediation");
+    const temp_dir = try createIsolatedTempDir(allocator, io, "sandbox_tamper");
     defer allocator.free(temp_dir);
     defer std.Io.Dir.cwd().deleteTree(io, temp_dir) catch {};
 
@@ -2359,8 +2371,8 @@ test "test_phase9_redteam_and_verifier_remediation_regressions" {
     var env_map = try buildHermeticEnvMap(allocator, corex_home, reg_dir, false);
     defer env_map.deinit();
 
-    // [1] `[CRITICAL-01]` & `[HIGH-03]`: External dependency with `@std_cap_boundary` (`E0327`), `use core.mem;` (`E0218`),
-    //     or inactive `@cfg(target.os == .Windows) pub fn f() { core.mem.zero(); }` fails `corex check` and writes NO `corex.lock`:
+    // [1] External dependency with `@std_cap_boundary` (`E0327`), `use core.mem;` (`E0218`), or inactive
+    //     `@cfg(target.os == .Windows) pub fn f() { core.mem.zero(); }` fails `corex check` without writing `corex.lock`:
     {
         const bad_dep_specs = [_]struct {
             pkg_name: []const u8,
@@ -2403,11 +2415,11 @@ test "test_phase9_redteam_and_verifier_remediation_regressions" {
             const p_idx = try writeFixtureFile(allocator, io, reg_dir, spec.sparse_rel, idx_line);
             defer allocator.free(p_idx);
 
-            const case_ws = try std.fmt.allocPrint(allocator, "{s}/crit01_ws_{d}", .{ temp_dir, case_i });
+            const case_ws = try std.fmt.allocPrint(allocator, "{s}/hygiene_ws_{d}", .{ temp_dir, case_i });
             defer allocator.free(case_ws);
             const ws_toml_txt = try std.fmt.allocPrint(
                 allocator,
-                "[package]\nname = \"crit01-app\"\nversion = \"0.1.0\"\n[dependencies]\n{s} = \"1.0.0\"\n",
+                "[package]\nname = \"hygiene-app\"\nversion = \"0.1.0\"\n[dependencies]\n{s} = \"1.0.0\"\n",
                 .{spec.pkg_name},
             );
             defer allocator.free(ws_toml_txt);
@@ -2443,7 +2455,7 @@ test "test_phase9_redteam_and_verifier_remediation_regressions" {
         }
     }
 
-    // [2] `[CRITICAL-02]`: `impl Drop for Guard` and `impl PublicTrait for Guard` (with `allow_caps = []`,
+    // [2] `impl Drop for Guard` and `impl PublicTrait for Guard` (with `allow_caps = []`,
     //     `enforcement_scope = "surface"`) propagate capabilities into `surface_caps` and emit `E0324`:
     {
         const drop_trait_cases = [_][]const u8{
@@ -2507,9 +2519,8 @@ test "test_phase9_redteam_and_verifier_remediation_regressions" {
         }
     }
 
-    // [3] `[CRITICAL-03]` & `[HIGH-06]`: `allow_caps = ["comptime_io"]` sets `has_comptime_io_cap == true` with
-    //     `mask == 0` (granting zero runtime OS capabilities), while `corex.lock` rejects `max_caps = ["comptime_io"]`
-    //     and `checksum = ""` with `E0014`:
+    // [3] `allow_caps = ["comptime_io"]` sets `has_comptime_io_cap == true` with `mask == 0` (zero runtime OS
+    //     capabilities), while `corex.lock` rejects `max_caps = ["comptime_io"]` and `checksum = ""` with `E0014`:
     {
         var interner = try StringInterner.init(allocator);
         defer interner.deinit();
@@ -2570,9 +2581,8 @@ test "test_phase9_redteam_and_verifier_remediation_regressions" {
         }
     }
 
-    // [4] `[CRITICAL-04]`: Under `[security] default_dep_policy = "zero_trust"`, an untrusted dependency's own
-    //     `corex.toml` declaring `leaf-sneak = { version = "1.0.0", allow_caps = ["ffi", "unsafe_op", "net"] }`
-    //     does NOT grant capabilities to `leaf-sneak` (`E0324`):
+    // [4] Under `[security] default_dep_policy = "zero_trust"`, an untrusted dependency's own `corex.toml`
+    //     declaring `leaf-sneak = { version = "1.0.0", allow_caps = ["ffi", "unsafe_op", "net"] }` fails with `E0324`:
     {
         const leaf_toml = try writeFixtureFile(
             allocator,
@@ -2641,7 +2651,7 @@ test "test_phase9_redteam_and_verifier_remediation_regressions" {
         try std.testing.expect(std.mem.indexOf(u8, zt_check.stderr, "E0324") != null);
     }
 
-    // [5] `[CRITICAL-05]`: Nested C `#include` inside `.host_dir_jailed` & `.cxtree_only` (`/* comment */ #include "../../escape.h"`
+    // [5] Nested C `#include` inside `.host_dir_jailed` & `.cxtree_only` (`/* comment */ #include "../../escape.h"`
     //     or symlinked nested `#include`) is rejected with `E0326`:
     {
         const outside_esc_hdr = try writeFixtureFile(allocator, io, temp_dir, "escape_outside.h", "int pwn(void);\n");
@@ -2738,10 +2748,10 @@ test "test_phase9_redteam_and_verifier_remediation_regressions" {
         );
     }
 
-    // [6] `[CRITICAL-06]`: Tampering 1 byte of an existing same-size read-only `.cxtree` or `.cxi` in CAS
+    // [6] Tampering 1 byte of an existing same-size read-only `.cxtree` or `.cxi` in CAS
     //     causes `publishCxTree` / `publishCxiSummary` to reject with `E0015`:
     {
-        const cas_home = try std.fmt.allocPrint(allocator, "{s}/crit06_home", .{temp_dir});
+        const cas_home = try std.fmt.allocPrint(allocator, "{s}/cas_tamper_home", .{temp_dir});
         defer allocator.free(cas_home);
         var cache = try pkg_cache.PkgCache.init(allocator, cas_home, 32, 1024 * 1024);
         defer cache.deinit();
@@ -2766,17 +2776,17 @@ test "test_phase9_redteam_and_verifier_remediation_regressions" {
             fn run(alloc: std.mem.Allocator, io_h: std.Io, path: []const u8) !void {
                 if (std.Io.Dir.cwd().openFile(io_h, path, .{ .mode = .read_only })) |ro_f| {
                     const st = try ro_f.stat(io_h);
-                    ro_f.setPermissions(io_h, st.permissions.setReadOnly(false)) catch {};
+                    ro_f.setPermissions(io_h, pkg_cache.withReadOnlyPermission(st.permissions, false)) catch {};
                     ro_f.close(io_h);
                 } else |_| {}
                 const orig = try std.Io.Dir.cwd().readFileAlloc(io_h, path, alloc, .limited(64 * 1024));
                 defer alloc.free(orig);
                 orig[orig.len - 1] ^= 0x01;
                 std.Io.Dir.cwd().deleteFile(io_h, path) catch {};
-                const rw_f = try std.Io.Dir.cwd().createFile(io_h, path, .{ .truncate = true });
+                const rw_f = try std.Io.Dir.cwd().createFile(io_h, path, .{ .truncate = true, .read = true });
                 try rw_f.writeStreamingAll(io_h, orig);
                 const st_after = try rw_f.stat(io_h);
-                rw_f.setPermissions(io_h, st_after.permissions.setReadOnly(true)) catch {};
+                rw_f.setPermissions(io_h, pkg_cache.withReadOnlyPermission(st_after.permissions, true)) catch {};
                 rw_f.close(io_h);
             }
         }.run;
@@ -2816,9 +2826,8 @@ test "test_phase9_redteam_and_verifier_remediation_regressions" {
         try std.testing.expect(hasSinkDiagnosticCode(&cxi_sink, .e0015_cache_integrity_mismatch));
     }
 
-    // [7] `[CRITICAL-07]` & `[HIGH-04]` & `[HIGH-05]`: `[security.package.*]` drift (`E0014`), `corex.lock`
-    //     `features`/`source` tampering under `--frozen` (`E0014`), and `>= 64 KiB` `.obao` 1-byte tamper
-    //     under `--verify-checksums` (`E0015`):
+    // [7] `[security.package.*]` drift (`E0014`), `corex.lock` `features`/`source` tampering under `--frozen` (`E0014`),
+    //     and `>= 64 KiB` `.obao` 1-byte tamper under `--verify-checksums` (`E0015`):
     {
         // Build a `>= 64 KiB` valid `.cx` source file (`68 KiB` via padded doc comment) so CAS emits a `.obao` file:
         var big_cx_buf = try std.ArrayList(u8).initCapacity(allocator, 70 * 1024);
@@ -2854,7 +2863,7 @@ test "test_phase9_redteam_and_verifier_remediation_regressions" {
         );
         defer allocator.free(big_idx_path);
 
-        const sec_ws = try std.fmt.allocPrint(allocator, "{s}/crit07_ws", .{temp_dir});
+        const sec_ws = try std.fmt.allocPrint(allocator, "{s}/sec_drift_ws", .{temp_dir});
         defer allocator.free(sec_ws);
         const orig_sec_toml =
             "[package]\nname = \"sec-app\"\nversion = \"0.1.0\"\n" ++
@@ -2894,7 +2903,7 @@ test "test_phase9_redteam_and_verifier_remediation_regressions" {
         const clean_lock_bytes = try std.Io.Dir.cwd().readFileAlloc(io, sec_lock_path, allocator, .limited(64 * 1024));
         defer allocator.free(clean_lock_bytes);
 
-        // `[CRITICAL-07]`: Editing `[security.package.big-dep]` in `corex.toml` under `--frozen` -> `E0014`:
+        // Editing `[security.package.big-dep]` in `corex.toml` under `--frozen` emits `E0014`:
         const edited_sec_toml =
             "[package]\nname = \"sec-app\"\nversion = \"0.1.0\"\n" ++
             "[security.package.big-dep]\nallow_caps = []\n" ++
@@ -2911,7 +2920,7 @@ test "test_phase9_redteam_and_verifier_remediation_regressions" {
         try std.testing.expect(std.mem.indexOf(u8, sec_drift.stderr, "E0014") != null);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sec_toml_path, .data = orig_sec_toml });
 
-        // `[HIGH-04]`: Tampering `features` or `source` inside `corex.lock` under `--frozen` -> `E0014`:
+        // Tampering `features` or `source` inside `corex.lock` under `--frozen` emits `E0014`:
         const tampered_feats_lock = try std.mem.replaceOwned(
             u8,
             allocator,
@@ -2952,7 +2961,7 @@ test "test_phase9_redteam_and_verifier_remediation_regressions" {
         try std.testing.expect(std.mem.indexOf(u8, src_drift.stderr, "E0014") != null);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sec_lock_path, .data = clean_lock_bytes });
 
-        // `[HIGH-05]`: Tampering 1 byte in `blobs/<2>/<62>.obao` under `--verify-checksums` -> `E0015`:
+        // Tampering 1 byte in `blobs/<2>/<62>.obao` under `--verify-checksums` emits `E0015`:
         const big_hex = std.fmt.bytesToHex(big_blob_b3, .lower);
         const obao_disk_path = try std.fmt.allocPrint(
             allocator,
@@ -2962,7 +2971,7 @@ test "test_phase9_redteam_and_verifier_remediation_regressions" {
         defer allocator.free(obao_disk_path);
         if (std.Io.Dir.cwd().openFile(io, obao_disk_path, .{ .mode = .read_only })) |ro_ob| {
             const st = try ro_ob.stat(io);
-            ro_ob.setPermissions(io, st.permissions.setReadOnly(false)) catch {};
+            ro_ob.setPermissions(io, pkg_cache.withReadOnlyPermission(st.permissions, false)) catch {};
             ro_ob.close(io);
         } else |_| {}
         const orig_obao = try std.Io.Dir.cwd().readFileAlloc(io, obao_disk_path, allocator, .limited(64 * 1024));
@@ -2983,12 +2992,8 @@ test "test_phase9_redteam_and_verifier_remediation_regressions" {
         try std.testing.expect(std.mem.indexOf(u8, obao_check.stderr, "E0015") != null);
     }
 
-    // [8] `[CRITICAL-08]`, `[MEDIUM-05]`, `[VERIFIER-02]`, `[VERIFIER-04]`, & `[HIGH-07..09]`:
-    //     - Direct `pkg_resolver.evaluateManifestTargetCfg`
-    //     - `corex fmt` on `use "github.com/org/pkg@v1.2.0" as pkg_alias;` & `use "registry:serde-json@1.4.2" as serde_json;`
-    //     - Truncated/unclosed/oversized inputs to `parseTomlDocument` / `parseManifest` / `parseScriptFrontmatterManifest`
-    //     - Incremental `db.setInput` private-body edit preserving `cxi_blake3` (`pub_fn_count == 1`)
-    //     - Tier-1 `Bounded-MVS` weak `foo?/feat`, `default`-feature activation on version upgrade, & Tier-2 `-F pkg/feat`:
+    // [8] Direct `evaluateManifestTargetCfg`, inline `use` `corex fmt`, malformed TOML resilience, incremental `.cxi`
+    //     early-cutoff stability, weak `foo?/feat`, `default`-feature upgrade activation, and Tier-2 `-F pkg/feat`:
     {
         // Direct `pkg_resolver.evaluateManifestTargetCfg`:
         const eval_ok_linux = try pkg_resolver.evaluateManifestTargetCfg(
@@ -3133,8 +3138,8 @@ test "test_phase9_redteam_and_verifier_remediation_regressions" {
             try std.testing.expectEqualSlices(u8, &inc_cxi_1.cxi_blake3, &inc_cxi_2.cxi_blake3);
         }
 
-        // Solver `[HIGH-07..09]`: Tier-1 weak `foo?/feat` (inactive optional dep stays unpulled),
-        // `default` feature activation after `1.0.0 -> 1.1.0` upgrade, and Tier-2 `-F sub-pkg/extra`:
+        // Tier-1 weak `foo?/feat` (inactive optional dep stays unpulled), `default` feature activation
+        // after `1.0.0 -> 1.1.0` upgrade, and Tier-2 `-F sub-pkg/extra`:
         {
             const s_opt = try writeFixtureFile(allocator, io, reg_dir, "packages/weak-opt-1.0.0/src/root.cx", "pub fn w() -> i32 = 1;\n");
             defer allocator.free(s_opt);
@@ -3182,7 +3187,7 @@ test "test_phase9_redteam_and_verifier_remediation_regressions" {
             );
             defer allocator.free(idx_ur);
 
-            const mvs_ws = try std.fmt.allocPrint(allocator, "{s}/high07_ws", .{temp_dir});
+            const mvs_ws = try std.fmt.allocPrint(allocator, "{s}/mvs_edge_ws", .{temp_dir});
             defer allocator.free(mvs_ws);
             const mvs_toml_txt =
                 "[package]\nname = \"mvs-edge-app\"\nversion = \"0.1.0\"\n" ++
@@ -3237,7 +3242,7 @@ test "test_phase9_redteam_and_verifier_remediation_regressions" {
             try std.testing.expect(has_upg_fast);
 
             // Tier-2 PubGrub CDCL (forced via `[resolution].exclude` on `1.0.0`) with CLI `-F upg-def/fast`:
-            const cdcl_ws = try std.fmt.allocPrint(allocator, "{s}/high09_ws", .{temp_dir});
+            const cdcl_ws = try std.fmt.allocPrint(allocator, "{s}/cdcl_feat_ws", .{temp_dir});
             defer allocator.free(cdcl_ws);
             const cdcl_toml_txt =
                 "[package]\nname = \"cdcl-feat-app\"\nversion = \"0.1.0\"\n" ++
@@ -3285,6 +3290,297 @@ test "test_phase9_redteam_and_verifier_remediation_regressions" {
                 }
             }
             try std.testing.expect(has_cdcl_fast);
+        }
+    }
+}
+
+// ------ Pillar 7: Manifest Escaping & Resolver Hardening ------
+
+test "test_phase9_toml_injection_linear_arena_workspace_and_git_lock_parity" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const temp_dir = try createIsolatedTempDir(allocator, io, "manifest_resolver_hardening");
+    defer allocator.free(temp_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, temp_dir) catch {};
+
+    const corex_home = try std.fmt.allocPrint(allocator, "{s}/corex_home", .{temp_dir});
+    defer allocator.free(corex_home);
+    const reg_dir = try std.fmt.allocPrint(allocator, "{s}/mock_reg", .{temp_dir});
+    defer allocator.free(reg_dir);
+    try std.Io.Dir.cwd().createDirPath(io, corex_home);
+    try std.Io.Dir.cwd().createDirPath(io, reg_dir);
+
+    const host_cfg = corex.symbol_resolver.CfgEnv.fromTargetSpec(TargetSpec.host(), false);
+
+    // [1] Inline `use` rejects TOML metacharacter injection (`E0013`) and `appendEscapedTomlBasicString` escapes quotes/slashes:
+    {
+        var interner = try StringInterner.init(allocator);
+        defer interner.deinit();
+        var spec_arena = BumpArena.init(allocator);
+        defer spec_arena.deinit();
+        var spec_sink = DiagnosticSink.init(allocator);
+        defer spec_sink.deinit();
+
+        const injected_spec = try pkg_manifest.parseInlineUseSpec(
+            &spec_arena,
+            &interner,
+            "./dep\", allow_caps = [\"net\"] } #",
+            "safe_dep",
+            Span.init(FileId.fromInt(95), 0, 32),
+            Span.init(FileId.fromInt(95), 36, 44),
+            &spec_sink,
+        );
+        try std.testing.expect(injected_spec == null);
+        try std.testing.expect(hasSinkDiagnosticCode(&spec_sink, .e0013_invalid_manifest_or_pkg_name));
+
+        var escaped_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer escaped_buf.deinit(allocator);
+        try pkg_manifest.appendEscapedTomlBasicString(&escaped_buf, allocator, "C:\\dir\\\"q\"\n\x07");
+        try std.testing.expectEqualStrings("\"C:\\\\dir\\\\\\\"q\\\"\\n\\u0007\"", escaped_buf.items);
+    }
+
+    // [2] Parsing `4,000` `[[item]]` array-of-tables stays strictly linear (`< 12 MiB` peak inside `FixedBufferAllocator`):
+    {
+        var array_toml: std.ArrayList(u8) = .empty;
+        defer array_toml.deinit(allocator);
+        for (0..4000) |i| {
+            var row_buf: [32]u8 = undefined;
+            try array_toml.appendSlice(
+                allocator,
+                try std.fmt.bufPrint(&row_buf, "[[item]]\nord = {d}\n", .{i}),
+            );
+        }
+
+        const fba_backing = try allocator.alloc(u8, 12 * 1024 * 1024);
+        defer allocator.free(fba_backing);
+        var fba = std.heap.FixedBufferAllocator.init(fba_backing);
+        var lin_sink = DiagnosticSink.init(allocator);
+        defer lin_sink.deinit();
+
+        var parsed_doc = try pkg_manifest.parseTomlDocument(
+            fba.allocator(),
+            FileId.fromInt(96),
+            array_toml.items,
+            array_toml.items,
+            0,
+            0,
+            false,
+            .e0013_invalid_manifest_or_pkg_name,
+            &lin_sink,
+        );
+        defer parsed_doc.deinit(fba.allocator());
+        try std.testing.expect(!parsed_doc.has_syntax_errors);
+        try std.testing.expect(!lin_sink.hasErrors());
+    }
+
+    // [3] `[lib]` preceding `[package]` backfills `lib_target.name_snake` identically to `[package]` preceding `[lib]`:
+    {
+        var interner = try StringInterner.init(allocator);
+        defer interner.deinit();
+        var lib_arena = BumpArena.init(allocator);
+        defer lib_arena.deinit();
+        var lib_sink = DiagnosticSink.init(allocator);
+        defer lib_sink.deinit();
+
+        const lib_first_toml = "[lib]\npath = \"src/custom_root.cx\"\n[package]\nname = \"order-check\"\nversion = \"0.1.0\"\n";
+        var parsed_lib_first = try pkg_manifest.parseManifest(
+            allocator,
+            &lib_arena,
+            &interner,
+            FileId.fromInt(97),
+            lib_first_toml,
+            &host_cfg,
+            &lib_sink,
+        );
+        defer parsed_lib_first.doc.deinit(allocator);
+        try std.testing.expect(!lib_sink.hasErrors());
+        try std.testing.expectEqualStrings(
+            "order_check",
+            interner.get(parsed_lib_first.manifest.lib_target.?.name_snake),
+        );
+    }
+
+    // [4] Sparse-index `"path": "../../escape"` fails with `E0015`, undeclared features fail (`E0010`/`E0013`),
+    //     cross-major `>=1.0.0, <3.0.0` falls back to `2.0.0` when `1.0.0` is excluded, virtual `[workspace]`
+    //     resolves all default members, and `materializeVendorDir` is idempotent on Windows read-only outputs:
+    {
+        var interner = try StringInterner.init(allocator);
+        defer interner.deinit();
+
+        // Sparse-index traversal escape (`E0015`):
+        const trav_idx = try writeFixtureFile(
+            allocator,
+            io,
+            reg_dir,
+            "index/tr/av/trav-pkg",
+            "{\"name\":\"trav-pkg\",\"vers\":\"1.0.0\",\"path\":\"../../escape\",\"deps\":[]}\n",
+        );
+        defer allocator.free(trav_idx);
+        const trav_ws = try std.fmt.allocPrint(allocator, "{s}/trav_ws", .{temp_dir});
+        defer allocator.free(trav_ws);
+        const trav_toml = try writeFixtureFile(
+            allocator,
+            io,
+            trav_ws,
+            "corex.toml",
+            "[package]\nname = \"trav-app\"\nversion = \"0.1.0\"\n[dependencies]\ntrav-pkg = \"1.0.0\"\n",
+        );
+        defer allocator.free(trav_toml);
+        {
+            var vfs = vfs_sourcemap.VfsSourceMap.init(allocator, &interner);
+            defer vfs.deinit(io);
+            var trav_sink = DiagnosticSink.init(allocator);
+            defer trav_sink.deinit();
+            const trav_fid = try vfs.resolveOrCreatePath(io, trav_toml, .root);
+            var trav_bundle = try pkg_manifest.loadWorkspaceManifestBundle(
+                io,
+                allocator,
+                &interner,
+                trav_toml,
+                trav_fid,
+                &host_cfg,
+                &trav_sink,
+            );
+            defer trav_bundle.deinit();
+            const trav_res = try pkg_resolver.resolveProjectGraph(
+                allocator,
+                &interner,
+                &vfs,
+                &trav_bundle,
+                null,
+                .{ .io = io, .corex_home_dir = corex_home, .local_registry_dir = reg_dir },
+                &trav_sink,
+            );
+            try std.testing.expect(trav_res == null);
+            try std.testing.expect(hasSinkDiagnosticCode(&trav_sink, .e0015_cache_integrity_mismatch));
+        }
+
+        // Cross-major `>=1.0.0, <3.0.0` resolving to `2.0.0` when `1.0.0` is excluded, plus undeclared CLI feature guard:
+        const cm_v1 = try writeFixtureFile(allocator, io, reg_dir, "packages/cm-pkg-1.0.0/src/root.cx", "pub fn v() -> i32 = 1;\n");
+        defer allocator.free(cm_v1);
+        const cm_v2 = try writeFixtureFile(allocator, io, reg_dir, "packages/cm-pkg-2.0.0/src/root.cx", "pub fn v() -> i32 = 2;\n");
+        defer allocator.free(cm_v2);
+        const cm_idx = try writeFixtureFile(
+            allocator,
+            io,
+            reg_dir,
+            "index/cm/-p/cm-pkg",
+            "{\"name\":\"cm-pkg\",\"vers\":\"1.0.0\",\"deps\":[],\"features\":{\"known\":[]}}\n" ++
+                "{\"name\":\"cm-pkg\",\"vers\":\"2.0.0\",\"deps\":[],\"features\":{\"known\":[]}}\n",
+        );
+        defer allocator.free(cm_idx);
+
+        // Virtual `[workspace]` with two default members (`crates/mem-a` and `crates/mem-b`) sharing `cm-pkg`:
+        const virt_ws = try std.fmt.allocPrint(allocator, "{s}/virt_ws", .{temp_dir});
+        defer allocator.free(virt_ws);
+        const virt_root_toml = try writeFixtureFile(
+            allocator,
+            io,
+            virt_ws,
+            "corex.toml",
+            "[workspace]\nmembers = [\"crates/mem-a\", \"crates/mem-b\"]\n" ++
+                "[workspace.resolution]\nexclude = [\"cm-pkg@=1.0.0\"]\n",
+        );
+        defer allocator.free(virt_root_toml);
+        const mem_a_toml = try writeFixtureFile(
+            allocator,
+            io,
+            virt_ws,
+            "crates/mem-a/corex.toml",
+            "[package]\nname = \"mem-a\"\nversion = \"0.1.0\"\n[dependencies]\ncm-pkg = \">=1.0.0, <3.0.0\"\n",
+        );
+        defer allocator.free(mem_a_toml);
+        const mem_a_src = try writeFixtureFile(allocator, io, virt_ws, "crates/mem-a/src/root.cx", "pub fn a() -> i32 = 10;\n");
+        defer allocator.free(mem_a_src);
+        const mem_b_toml = try writeFixtureFile(
+            allocator,
+            io,
+            virt_ws,
+            "crates/mem-b/corex.toml",
+            "[package]\nname = \"mem-b\"\nversion = \"0.1.0\"\n[dependencies]\ncm-pkg = \">=1.0.0, <3.0.0\"\n",
+        );
+        defer allocator.free(mem_b_toml);
+        const mem_b_src = try writeFixtureFile(allocator, io, virt_ws, "crates/mem-b/src/root.cx", "pub fn b() -> i32 = 20;\n");
+        defer allocator.free(mem_b_src);
+
+        {
+            var vfs = vfs_sourcemap.VfsSourceMap.init(allocator, &interner);
+            defer vfs.deinit(io);
+            var ws_sink = DiagnosticSink.init(allocator);
+            defer ws_sink.deinit();
+            const virt_fid = try vfs.resolveOrCreatePath(io, virt_root_toml, .root);
+            var virt_bundle = try pkg_manifest.loadWorkspaceManifestBundle(
+                io,
+                allocator,
+                &interner,
+                virt_root_toml,
+                virt_fid,
+                &host_cfg,
+                &ws_sink,
+            );
+            defer virt_bundle.deinit();
+
+            var virt_graph = (try pkg_resolver.resolveProjectGraph(
+                allocator,
+                &interner,
+                &vfs,
+                &virt_bundle,
+                null,
+                .{ .io = io, .corex_home_dir = corex_home, .local_registry_dir = reg_dir },
+                &ws_sink,
+            )).?;
+            defer virt_graph.deinit(allocator);
+            try std.testing.expect(!ws_sink.hasErrors());
+
+            var has_mem_a = false;
+            var has_mem_b = false;
+            var cm_major: u32 = 0;
+            var cm_tree_hash: [32]u8 = undefined;
+            for (virt_graph.packages) |pkg_n| {
+                if (std.mem.eql(u8, pkg_n.canonical_name, "mem-a")) has_mem_a = true;
+                if (std.mem.eql(u8, pkg_n.canonical_name, "mem-b")) has_mem_b = true;
+                if (std.mem.eql(u8, pkg_n.canonical_name, "cm-pkg")) {
+                    cm_major = pkg_n.version.major;
+                    cm_tree_hash = pkg_n.cxtree_blake3.?;
+                }
+            }
+            try std.testing.expect(has_mem_a and has_mem_b);
+            try std.testing.expectEqual(@as(u32, 2), cm_major);
+
+            // Idempotent `materializeVendorDir` twice in a row over read-only Windows destination files:
+            var cache_inst = try pkg_cache.PkgCache.init(allocator, corex_home, 256, 16 * 1024 * 1024);
+            defer cache_inst.deinit();
+            const vendor_dir = try std.fmt.allocPrint(allocator, "{s}/vendor_idem", .{temp_dir});
+            defer allocator.free(vendor_dir);
+            const vendor_pkgs = [_]pkg_cache.VendorPackageRecord{.{
+                .name = "cm-pkg",
+                .version = "2.0.0",
+                .source = pkg_resolver.DEFAULT_REGISTRY_URI,
+                .tree_blake3 = cm_tree_hash,
+            }};
+            _ = try pkg_cache.materializeVendorDir(&cache_inst, io, vendor_dir, &vendor_pkgs, &ws_sink, Span.ZERO);
+            _ = try pkg_cache.materializeVendorDir(&cache_inst, io, vendor_dir, &vendor_pkgs, &ws_sink, Span.ZERO);
+            try std.testing.expect(!ws_sink.hasErrors());
+
+            // Requesting undeclared feature `-F cm-pkg/typo_feat` fails deterministically:
+            var bad_feat_sink = DiagnosticSink.init(allocator);
+            defer bad_feat_sink.deinit();
+            const bad_feat_res = try pkg_resolver.resolveProjectGraph(
+                allocator,
+                &interner,
+                &vfs,
+                &virt_bundle,
+                null,
+                .{
+                    .io = io,
+                    .corex_home_dir = corex_home,
+                    .local_registry_dir = reg_dir,
+                    .cli_features = &.{"cm-pkg/typo_feat"},
+                },
+                &bad_feat_sink,
+            );
+            try std.testing.expect(bad_feat_res == null);
+            try std.testing.expect(bad_feat_sink.hasErrors());
         }
     }
 }

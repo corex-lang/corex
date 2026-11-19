@@ -394,10 +394,9 @@ fn faultLazyEntryIfNeeded(pager: *LazyCxTreePager, entry: *VfsFileEntry) !void {
 
     // [2] Read `< 16 KiB`, page-multiple, or fallback blobs into `blob_arena` with explicit `:0` NUL sentinel:
     const arena_buf = try pager.blob_arena.allocSlice(u8, file_size + 1);
-    const bytes_read = opened_file.readPositionalAll(pager.io, arena_buf[0..file_size], 0) catch {
+    if ((opened_file.readPositionalAll(pager.io, arena_buf[0..file_size], 0) catch {
         return markLazyIntegrityFailure(pager, entry);
-    };
-    if (bytes_read != file_size) {
+    }) != file_size) {
         return markLazyIntegrityFailure(pager, entry);
     }
     arena_buf[file_size] = 0;
@@ -507,8 +506,9 @@ pub fn validateCxTreeBytes(
             for (rel_path, 0..) |path_byte, i| {
                 lower_copy[i] = std.ascii.toLower(path_byte);
             }
-            const gop = seen_lower_paths.getOrPutAssumeCapacity(lower_copy);
-            if (gop.found_existing) return error.DuplicateOrCaseCollidingCxTreePath;
+            if (seen_lower_paths.getOrPutAssumeCapacity(lower_copy).found_existing) {
+                return error.DuplicateOrCaseCollidingCxTreePath;
+            }
         }
     }
 
@@ -526,8 +526,7 @@ pub fn lookupCxTreeEntry(view: CxTreeView, rel_path: []const u8) ?CxTreeEntry {
     while (low < high) {
         const mid = low + (high - low) / 2;
         const candidate: CxTreeEntry = view.entries[mid];
-        const cand_path = view.asEntryPath(candidate);
-        switch (std.mem.order(u8, cand_path, rel_path)) {
+        switch (std.mem.order(u8, view.asEntryPath(candidate), rel_path)) {
             .lt => low = mid + 1,
             .gt => high = mid,
             .eq => return candidate,

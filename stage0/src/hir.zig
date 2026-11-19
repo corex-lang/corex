@@ -479,7 +479,7 @@ pub const HirFnMeta = struct {
     capture_len: u32 = 0,
     /// `true` when lowered solely by `populateReferencedSameFileSubscripts` for `MirLowerer` arm splicing.
     is_splice_helper_only: bool = false,
-    /// `true` when synthesized solely to capture default parameter/field capabilities during MIR SAST (`P1-5`).
+    /// `true` when synthesized solely to capture default parameter/field capabilities during MIR SAST.
     is_sast_default_probe: bool = false,
 };
 
@@ -778,7 +778,7 @@ pub const HirStore = struct {
     parallel_assign_blocks: std.AutoHashMapUnmanaged(u32, ParallelAssignSpan) = .empty,
     /// Labeled `fsm: match` metadata keyed by `hir_match` `HirIndex` (`SE-23`).
     labeled_matches: std.AutoHashMapUnmanaged(u32, LabeledMatchMeta) = .empty,
-    /// Lexical declaration `FileId` recorded per `@embed_bytes` `hir_intrinsic_call` `HirIndex` (`P1-5`).
+    /// Lexical declaration `FileId` recorded per `@embed_bytes` `hir_intrinsic_call` `HirIndex`.
     embed_origin_files: std.AutoHashMapUnmanaged(u32, FileId) = .empty,
     /// Root `hir_module` or single-item `HirIndex` (`.none` when empty).
     root_hir: HirIndex = .none,
@@ -1207,7 +1207,7 @@ const HirLowerer = struct {
     next_fsm_id: u32 = 0,
     /// Pre-evaluated LHS index/pointer HIR nodes keyed by `NodeIndex.asInt()` during Phase-0 parallel assignment (`SE-15`).
     parallel_pre_eval: std.AutoHashMapUnmanaged(u32, HirIndex) = .empty,
-    /// Active lexical declaration `FileId` for `@embed_bytes` jail attribution and `pkg.` / dep-alias resolution (`P1-5`).
+    /// Active lexical declaration `FileId` for `@embed_bytes` jail attribution and `pkg.` / dep-alias resolution.
     active_lexical_file_id: FileId,
     /// `true` while `populateReferencedSameFileSubscripts` lowers cross-item helper templates.
     is_lowering_splice_helper: bool = false,
@@ -1230,7 +1230,7 @@ const HirLowerer = struct {
         const extra_ends = try syntax_arenas.computeAstNodeExtraEnds(allocator, ast_arena);
         errdefer if (extra_ends.len > 0) allocator.free(extra_ends);
         const cst_map = try syntax_arenas.computeCstToAstMap(allocator, cst_arena.countNodes(), ast_arena);
-        const base_cfg = sym_table.effectiveCfgEnvForFile(store.file_id);
+        const base_cfg = sym_table.resolveCfgEnvForFile(store.file_id);
         const derived_cfg: CfgEnv = if (store.target_layout.ptr_byte_size == 4 and base_cfg.ptr_width != 32)
             .{
                 .os = .wasi,
@@ -2691,7 +2691,7 @@ const HirLowerer = struct {
         return first_decl_hir;
     }
 
-    /// Synthesizes an `is_sast_default_probe` `HirFnMeta` lowering declared struct field defaults in `struct_sym_idx` (`P1-5`).
+    /// Synthesizes an `is_sast_default_probe` `HirFnMeta` lowering declared struct field defaults in `struct_sym_idx`.
     fn synthesizeStructFieldDefaultSastProbe(
         self: *HirLowerer,
         struct_sym_idx: SymbolIndex,
@@ -2828,7 +2828,7 @@ const HirLowerer = struct {
         self.store.functions.items[probe_meta_idx].total_local_len = total_locals;
     }
 
-    /// Synthesizes an `is_sast_default_probe` `HirFnMeta` lowering declared parameter defaults on `fn_sym_idx` (`P1-5`).
+    /// Synthesizes an `is_sast_default_probe` `HirFnMeta` lowering declared parameter defaults on `fn_sym_idx`.
     fn synthesizeFnParamDefaultSastProbe(
         self: *HirLowerer,
         fn_sym_idx: SymbolIndex,
@@ -9513,7 +9513,7 @@ const HirLowerer = struct {
         return cur;
     }
 
-    /// Resolved static module or nominal type namespace target for Unified `.` path expressions (`P2-3`).
+    /// Resolved static module or nominal type namespace target for Unified `.` path expressions.
     const StaticNamespaceTarget = struct {
         /// Whether the target denotes a module/package namespace or nominal type namespace.
         kind: StaticDotKind,

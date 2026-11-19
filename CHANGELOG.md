@@ -43,4 +43,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
--   Normalized `\` path separators to `/` prior to `realPathFileAlloc` and `openFile` in `VfsSourceMap.resolvePath` and `VfsSourceMap.resolveOrCreatePath` on POSIX hosts, and preserved staged executable file permissions across atomic `UnlinkAndReplace` artifact publishing (`publishStagedFileAtomic`).
+-   Normalized `\` path separators to `/` prior to `realPathFileAlloc` and `openFile` in `VfsSourceMap.resolvePath` and `VfsSourceMap.resolveOrCreatePath` on POSIX hosts, preserved staged executable file permissions across atomic `UnlinkAndReplace` artifact publishing (`publishStagedFileAtomic`), enforced deterministic Windows PE/COFF binary linking (`SOURCE_DATE_EPOCH=0` and scratch PDB debug-directory stripping across `codegen_abi.zig`, `codegen_link.zig`, and `codegen_c.zig`), enforced Windows `FILE.ATTRIBUTE` `READONLY` / `NORMAL` CAS immutability (`withReadOnlyPermission`) across `pkg_cache.zig`, and routed direct `corex <script.cx>` CLI invocations to single-file script execution (`DR-11` §1.2).

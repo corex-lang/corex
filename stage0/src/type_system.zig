@@ -8469,7 +8469,7 @@ pub const TypeChecker = struct {
             .cst_arena = cst_arena,
             .ast_arena = ast_arena,
             .diagnostic_sink = diagnostic_sink,
-            .cfg_env = sym_table.effectiveCfgEnvForFile(file_id),
+            .cfg_env = sym_table.resolveCfgEnvForFile(file_id),
             .is_including_tests = sym_table.is_including_tests and (file_pkg_id == .root),
             .cst_to_ast = cst_map,
             .node_types = ty_table,
@@ -9794,6 +9794,45 @@ pub const TypeChecker = struct {
         }
     }
 
+    /// Returns `true` if `diagnostic_sink` already contains `code` within the token byte range of `root_cst`.
+    fn hasDiagnosticInCstSubtree(
+        self: *const TypeChecker,
+        code: DiagnosticCode,
+        root_cst: CstNodeIndex,
+    ) bool {
+        const sink = self.diagnostic_sink orelse return false;
+        if (root_cst.isNone() or root_cst.asInt() >= self.cst_arena.countNodes()) return false;
+        const start_idx: usize = root_cst.asInt();
+        const end_idx: usize = @min(
+            start_idx + @max(@as(usize, self.cst_arena.getNode(root_cst).subtree_size), 1),
+            self.cst_arena.countNodes(),
+        );
+        var min_byte: u32 = std.math.maxInt(u32);
+        var max_byte: u32 = 0;
+        var cur = start_idx;
+        while (cur < end_idx) : (cur += 1) {
+            const leaf = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+            if (leaf.subtree_size <= 1 and !leaf.token.isNone() and
+                leaf.token.asInt() < self.token_buffer.countTokens())
+            {
+                const tok_span = self.token_buffer.getTokenSpan(self.file_id, leaf.token);
+                min_byte = @min(min_byte, tok_span.start_byte);
+                max_byte = @max(max_byte, tok_span.end_byte);
+            }
+        }
+        if (min_byte > max_byte) return false;
+        for (sink.asSlice()) |diag_item| {
+            if (diag_item.code == code and
+                diag_item.primary_span.file_id == self.file_id and
+                diag_item.primary_span.start_byte <= max_byte and
+                min_byte <= diag_item.primary_span.end_byte)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Verifies that `impl` methods preserve all trait contracts (`E0323`, `Fix-17`) and checks `@std_cap_boundary` (`E0327`).
     fn verifyImplMethodContractNonEscalation(
         self: *TypeChecker,
@@ -9829,7 +9868,8 @@ pub const TypeChecker = struct {
             );
             const method_span = self.getAstNodeSpan(member_ast_id);
             if (is_checking_cap_boundary and mem_meta.contract_flags.is_std_cap_boundary and
-                !(self.is_stdlib_file or self.is_internal_core))
+                !(self.is_stdlib_file or self.is_internal_core) and
+                !self.hasDiagnosticInCstSubtree(.e0327_forbidden_sandbox_bypass_attribute, member_cst))
             {
                 try self.emitDiagnosticSimple(
                     .e0327_forbidden_sandbox_bypass_attribute,
@@ -10044,7 +10084,10 @@ pub const TypeChecker = struct {
             const sym = self.sym_table.getSymbol(sym_idx).*;
             if (sym.flags.is_builtin or sym.flags.is_imported) continue;
 
-            if (sym.contract_flags.is_std_cap_boundary and !(self.is_stdlib_file or self.is_internal_core)) {
+            if (sym.contract_flags.is_std_cap_boundary and
+                !(self.is_stdlib_file or self.is_internal_core) and
+                !self.hasDiagnosticInCstSubtree(.e0327_forbidden_sandbox_bypass_attribute, sym.cst_node))
+            {
                 try self.emitDiagnosticSimple(
                     .e0327_forbidden_sandbox_bypass_attribute,
                     sym.decl_span,
@@ -10093,7 +10136,8 @@ pub const TypeChecker = struct {
                             const child_sym = self.sym_table.getSymbol(child_idx).*;
                             if (child_sym.flags.is_builtin or child_sym.flags.is_imported) continue;
                             if (child_sym.contract_flags.is_std_cap_boundary and
-                                !(self.is_stdlib_file or self.is_internal_core))
+                                !(self.is_stdlib_file or self.is_internal_core) and
+                                !self.hasDiagnosticInCstSubtree(.e0327_forbidden_sandbox_bypass_attribute, child_sym.cst_node))
                             {
                                 try self.emitDiagnosticSimple(
                                     .e0327_forbidden_sandbox_bypass_attribute,
@@ -26720,7 +26764,12 @@ pub const TypeChecker = struct {
                 }
 
                 const pre_diag_len = if (self.diagnostic_sink) |sink| sink.diagnostics.items.len else 0;
-                var mod_sym_idx: SymbolIndex = self.sym_table.c_import_modules.get(header_path) orelse .none;
+                const caller_pkg = self.sym_table.getFilePackageId(self.file_id);
+                var mod_sym_idx: SymbolIndex = self.sym_table.lookupCImportModule(
+                    self.interner,
+                    caller_pkg,
+                    header_path,
+                ) orelse .none;
                 if (self.sym_table.c_import_loader) |loader_fn| {
                     const loaded_sym = try loader_fn(
                         self.sym_table,
@@ -26734,16 +26783,19 @@ pub const TypeChecker = struct {
                     }
                 }
                 if (mod_sym_idx.isNone()) {
-                    var has_emitted_e0009 = false;
+                    var has_emitted_c_import_diag = false;
                     if (self.diagnostic_sink) |sink| {
                         for (sink.diagnostics.items[pre_diag_len..]) |diag_item| {
-                            if (diag_item.code == .e0009_c_header_translation_failed) {
-                                has_emitted_e0009 = true;
+                            if (diag_item.code == .e0009_c_header_translation_failed or
+                                diag_item.code == .e0326_embed_path_escape or
+                                diag_item.code == .e0015_cache_integrity_mismatch)
+                            {
+                                has_emitted_c_import_diag = true;
                                 break;
                             }
                         }
                     }
-                    if (!has_emitted_e0009) {
+                    if (!has_emitted_c_import_diag) {
                         var msg_buf: [224]u8 = undefined;
                         const msg = std.fmt.bufPrint(
                             &msg_buf,
@@ -31611,15 +31663,15 @@ pub const TypeChecker = struct {
 
         const exp_canon = self.lookupPackageCanonicalNameSym(exp_pkg);
         if (exp_canon == .empty) return null;
-        const act_canon = self.lookupPackageCanonicalNameSym(act_pkg);
-        if (exp_canon != act_canon) return null;
+        if (exp_canon != self.lookupPackageCanonicalNameSym(act_pkg)) return null;
 
         var exp_chain: [16]SymbolId = undefined;
         var act_chain: [16]SymbolId = undefined;
         const exp_len = self.extractIntraPackageSymbolChain(exp_sym_idx, exp_pkg, &exp_chain);
-        const act_len = self.extractIntraPackageSymbolChain(act_sym_idx, act_pkg, &act_chain);
-        if (exp_len == 0 or exp_len != act_len) return null;
-        for (exp_chain[0..exp_len], act_chain[0..act_len]) |exp_seg, act_seg| {
+        if (exp_len == 0 or exp_len != self.extractIntraPackageSymbolChain(act_sym_idx, act_pkg, &act_chain)) {
+            return null;
+        }
+        for (exp_chain[0..exp_len], act_chain[0..exp_len]) |exp_seg, act_seg| {
             if (exp_seg != act_seg) return null;
         }
         return .{
@@ -31721,9 +31773,10 @@ pub const TypeChecker = struct {
             .tuple_ty => blk_tup: {
                 if (exp_node.rhs != act_node.rhs or exp_node.rhs == 0) break :blk_tup null;
                 const arity: usize = exp_node.rhs;
-                const exp_elems = self.pool.extra.items[exp_node.lhs .. exp_node.lhs + arity];
-                const act_elems = self.pool.extra.items[act_node.lhs .. act_node.lhs + arity];
-                for (exp_elems, act_elems) |exp_el, act_el| {
+                for (
+                    self.pool.extra.items[exp_node.lhs .. exp_node.lhs + arity],
+                    self.pool.extra.items[act_node.lhs .. act_node.lhs + arity],
+                ) |exp_el, act_el| {
                     if (self.findCrossMajorNominalPairBounded(
                         TypeId.fromInt(exp_el),
                         TypeId.fromInt(act_el),
@@ -31890,8 +31943,10 @@ pub const TypeChecker = struct {
             if (impl_target_raw != candidate_ty.toU32() and impl_target_raw != peeled_cand.toU32()) {
                 continue;
             }
-            const impl_trait_sym = SymbolIndex.fromInt(@truncate(pair_key));
-            if (self.matchCrossMajorNominalSymbols(exp_trait_sym, impl_trait_sym)) |matched| {
+            if (self.matchCrossMajorNominalSymbols(
+                exp_trait_sym,
+                SymbolIndex.fromInt(@truncate(pair_key)),
+            )) |matched| {
                 try self.emitCrossMajorMismatchDiagnostic(span, matched, true);
                 return true;
             }

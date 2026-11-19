@@ -2490,7 +2490,13 @@ fn indexModuleEntities(emitter: *CModuleEmitter) !void {
         }
 
         const is_exported_main = std.mem.eql(u8, raw_name, "main") and (is_export_sym or has_wasm_export);
-        if (isRootEntryMainCandidate(body_ptr, emitter.input.sym_table, raw_name, is_exported_main)) {
+        if (isRootEntryMainCandidateWithEntry(
+            body_ptr,
+            emitter.input.sym_table,
+            raw_name,
+            is_exported_main,
+            emitter.input.entry_file_id,
+        )) {
             emitter.entry_main_body_idx = b_idx;
         }
 
@@ -10274,9 +10280,13 @@ pub fn runZigCcCommand(
     diagnostic_sink: ?*diagnostic.DiagnosticSink,
     argv: []const []const u8,
 ) CCodegenError!void {
+    var det_env = codegen_abi.prepareDeterministicDriverEnv(allocator, environ_map) catch
+        return error.OutOfMemory;
+    defer det_env.deinit();
+
     const run_res = std.process.run(allocator, io, .{
         .argv = argv,
-        .environ_map = environ_map,
+        .environ_map = det_env.asConstPtr(),
     }) catch return error.CompilerDriverFailed;
     defer allocator.free(run_res.stdout);
     defer allocator.free(run_res.stderr);
@@ -10300,17 +10310,37 @@ pub fn runZigCcCommand(
 
 // ------------------------------------- PUBLIC API --------------------------------------
 
-/// Returns `true` iff `body_ptr` is the top-level binary entrypoint `fn main` in `PackageId.root` (`P2-5`).
+/// Returns `true` iff `body_ptr` is the top-level binary entrypoint `fn main` in `PackageId.root`.
 pub fn isRootEntryMainCandidate(
     body_ptr: *const MirBody,
     sym_table: *const SymbolTable,
     raw_name: []const u8,
     is_exported_main: bool,
 ) bool {
+    return isRootEntryMainCandidateWithEntry(
+        body_ptr,
+        sym_table,
+        raw_name,
+        is_exported_main,
+        sym_table.active_entry_file_id,
+    );
+}
+
+/// Returns `true` iff `body_ptr` is the binary entrypoint `fn main` matching `entry_file_id` (or `.root` root file).
+pub fn isRootEntryMainCandidateWithEntry(
+    body_ptr: *const MirBody,
+    sym_table: *const SymbolTable,
+    raw_name: []const u8,
+    is_exported_main: bool,
+    entry_file_id: FileId,
+) bool {
     if (!std.mem.eql(u8, raw_name, "main") or is_exported_main) return false;
+    const effective_entry = if (!entry_file_id.isNone()) entry_file_id else sym_table.active_entry_file_id;
     if (!body_ptr.file_id.isNone()) {
         if (sym_table.getFilePackageId(body_ptr.file_id) != .root) return false;
-        if (sym_table.package_metas.get(.root)) |root_meta| {
+        if (!effective_entry.isNone()) {
+            if (body_ptr.file_id != effective_entry) return false;
+        } else if (sym_table.package_metas.get(.root)) |root_meta| {
             if (!root_meta.root_file_id.isNone() and body_ptr.file_id != root_meta.root_file_id) {
                 return false;
             }
@@ -10341,7 +10371,7 @@ pub fn isRootEntryMainCandidate(
     return true;
 }
 
-/// Formats a deterministic C99 / LLVM internal symbol identifier for `body_ptr` (`P2-5`).
+/// Formats a deterministic C99 / LLVM internal symbol identifier for `body_ptr`.
 /// Preserves exact `_cx_fn_{body_idx}_{clean_suffix}` in single-package standalone mode for golden parity,
 /// and emits `_cx_p{pkg_id}_{pkg_ver_hash8}_f{file_id}_{body_idx}_{clean_suffix}` in multi-package mode.
 pub fn formatInternalBodySymbolAlloc(

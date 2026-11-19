@@ -10,22 +10,22 @@
 //!   `ghost_storage_move`, `ghost_storage_deinit`) instructions (`DR-02` Deliverable 3) so
 //!   Phase 6 SAST ownership/exclusivity verification operates without CFG reconstruction.
 //! - Implements Braun et al.'s single-pass forward `MirSsaBuilder` (`DR-13` §3.4) over an
-//!   edge-indexed CFG (`[CRITICAL-06]`), supporting both fresh `HIR -> MIR` lowering and
-//!   pre-seeded `MirBody` promotion for Wave 2C's `R2` SROA pass (`[MAJOR-01]`).
-//! - Splices non-recursive `subscript … yield` projections (`[CRITICAL-07]`), lowers pattern
+//!   edge-indexed CFG, supporting both fresh `HIR -> MIR` lowering and pre-seeded `MirBody`
+//!   promotion for Wave 2C's `R2` SROA pass.
+//! - Splices non-recursive `subscript … yield` projections, lowers pattern
 //!   matrices via Maranget + Jacobs decision trees (`DR-13` §4.1), synthesizes shared cold LIFO
-//!   `defer` / `errdefer` cleanup pads with mid-expression borrow closing (`[CRITICAL-08]`),
+//!   `defer` / `errdefer` cleanup pads with mid-expression borrow closing,
 //!   and enforces formal `MirVerifier` invariants `V1`–`V6` (`DR-13` §4.4).
 //!
 //! Key Design Choices:
 //! - Outgoing CFG edges are first-class `EdgeId` records (`MirOutgoingEdge`) referenced by both
 //!   source `MirTerminator`s and target `pred_edges`, guaranteeing distinct per-edge block
 //!   argument lists even when `cond_br` or `switch_int` targets the same block twice.
-//! - Call continuations strictly obey the Split-Edge Invariant (`[CRITICAL-05]`): every `call`
+//! - Call continuations strictly obey the Split-Edge Invariant: every `call`
 //!   terminator's `normal_bb` has `pred_len == 1`, `paramLen() == 1` (`%ret_val`), and
 //!   `normal_edge.args_len == 0`.
 //! - SSA `MirValueId`s index `MirBody.insts` directly (`0 .. insts.len - 1`); `.none`
-//!   (`maxInt(u32)`) is the sole sentinel for absent SSA values (`[MINOR-01]`).
+//!   (`maxInt(u32)`) is the sole sentinel for absent SSA values.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -132,7 +132,7 @@ pub const PlaceId = enum(u32) {
     }
 };
 
-/// Strongly typed 32-bit index into `MirBody.extra_edges` (`[CRITICAL-06]`).
+/// Strongly typed 32-bit index into `MirBody.extra_edges`.
 pub const EdgeId = enum(u32) {
     /// Sentinel representing no CFG edge (`maxInt(u32)`).
     none = std.math.maxInt(u32),
@@ -354,7 +354,7 @@ pub const GhostBorrowKind = enum(u8) {
     match_guard = 2,
 };
 
-/// Explicit signed, unsigned, and IEEE-754 binary opcodes in `MIR` (`[CRITICAL-09]`).
+/// Explicit signed, unsigned, and IEEE-754 binary opcodes in `MIR`.
 pub const BinOpKind = enum(u8) {
     // Checked integer arithmetic (`0..12`, traps / `E0507` on overflow or div-by-zero):
     /// Checked signed integer addition (`+`).
@@ -463,7 +463,7 @@ pub const BinOpKind = enum(u8) {
     fge = 46,
 };
 
-/// Explicit unary arithmetic, logical, and conversion opcodes in `MIR` (`[CRITICAL-09]`).
+/// Explicit unary arithmetic, logical, and conversion opcodes in `MIR`.
 pub const UnaryOpKind = enum(u8) {
     /// Checked signed integer negation (`-x`, traps on `MIN`).
     sneg_checked = 0,
@@ -800,7 +800,7 @@ pub const MirTrapReason = enum(u8) {
     assertion_failed = 3,
 };
 
-/// 12-byte control-flow terminator embedded at the end of `MirBasicBlock` (`[CRITICAL-01]`).
+/// 12-byte control-flow terminator embedded at the end of `MirBasicBlock`.
 pub const MirTerminator = extern struct {
     /// Terminator discriminant (`1B`).
     kind: TerminatorKind = .unreachable_term,
@@ -814,7 +814,7 @@ pub const MirTerminator = extern struct {
     edge_start: u32 = 0,
 };
 
-/// 32-byte basic block record in `MirBody.blocks` (`[CRITICAL-01]`, `[MINOR-02]`).
+/// 32-byte basic block record in `MirBody.blocks`.
 ///
 /// Packs `param_len: u14` (bits `0..13`), `is_sealed: bool` (bit `14`), and `is_cleanup_pad: bool`
 /// (bit `15`) into `meta_bits: u16` so the entire `extern struct` is exactly 32 bytes with zero
@@ -874,7 +874,7 @@ pub const MirBasicBlock = extern struct {
     }
 };
 
-/// 16-byte first-class outgoing CFG edge record in `MirBody.extra_edges` (`[CRITICAL-06]`).
+/// 16-byte first-class outgoing CFG edge record in `MirBody.extra_edges`.
 pub const MirOutgoingEdge = extern struct {
     /// Originating basic block (`4B`).
     src_bb: MirBlockId,
@@ -943,7 +943,7 @@ pub const MirLoopContractEntry = extern struct {
     meta: LoopContractMeta = .{},
 };
 
-/// 16-byte `$O(1)$` embedded binary blob descriptor stored in `MirConst.raw_blob` (`DR-20` `D-03`, `[CRITICAL-07]`).
+/// 16-byte `$O(1)$` embedded binary blob descriptor stored in `MirConst.raw_blob` (`DR-20` `D-03`).
 pub const RawBlobConst = extern struct {
     /// Zero-based index into `MirBlobStore.blobs`.
     blob_id: u32,
@@ -993,7 +993,7 @@ pub const MirConst = union(enum) {
     source_loc: SourceLocConst,
 };
 
-/// Deduplicated binary blob store populated by `materializeModuleEmbedBytes` prior to codegen (`[CRITICAL-07]`).
+/// Deduplicated binary blob store populated by `materializeModuleEmbedBytes` prior to codegen.
 pub const MirBlobStore = struct {
     /// Backing allocator owning all allocated byte slices and hash tables.
     allocator: std.mem.Allocator,
@@ -1091,7 +1091,7 @@ pub const HostEmbedReadResult = union(enum) {
     },
 };
 
-/// Sandbox configuration passed to `materializeBodyEmbedBytes` and `materializeModuleEmbedBytes` (`[CRITICAL-07]`).
+/// Sandbox configuration passed to `materializeBodyEmbedBytes` and `materializeModuleEmbedBytes`.
 pub const EmbedMaterializeOptions = struct {
     /// Optional workspace root directory path for disk-backed `@embed_bytes`.
     workspace_root: ?[]const u8 = null,
@@ -1103,7 +1103,7 @@ pub const EmbedMaterializeOptions = struct {
     compiler_db: ?*query_db.CompilerDb = null,
     /// Maximum single `@embed_bytes` file size (`64 MiB` default per `DR-20` `D-03`).
     max_blob_bytes: u64 = MAX_EMBED_BLOB_BYTES,
-    /// Optional `SymbolTable` mapping lexical `origin_file_id -> PackageId` (`P1-5`).
+    /// Optional `SymbolTable` mapping lexical `origin_file_id -> PackageId`.
     sym_table: ?*const SymbolTable = null,
     /// Optional per-`PackageId` `@embed_bytes` sandbox jail policy table (`DR-17` §5).
     package_jails: ?*const std.AutoHashMapUnmanaged(PackageId, EmbedPackageJail) = null,
@@ -1160,7 +1160,7 @@ pub const MirBody = struct {
     /// Target pointer width/alignment configuration.
     target_layout: TargetLayout = TargetLayout.NATIVE_64,
 
-    /// Explicit ghost lifecycle flags (`[CRITICAL-01]`, `DR-02` Deliverable 3):
+    /// Explicit ghost lifecycle flags (`DR-02` Deliverable 3):
     /// `true` while `ghost_access_*` / `ghost_storage_*` instructions are present in `insts`.
     has_ghost_instructions: bool = true,
     /// `true` after Phase 6 SAST strips all ghost instructions (`V4` post-strip mode).
@@ -1173,9 +1173,9 @@ pub const MirBody = struct {
     has_overflowed_limits: bool = false,
     /// `true` once Phase 6 `ElaborateDrops` has materialized destructors on this body.
     is_sast_elaborated: bool = false,
-    /// `true` when lowered solely to verify default parameter/field expressions during Phase 6 `mir_sast` (`P1-5`).
+    /// `true` when lowered solely to verify default parameter/field expressions during Phase 6 `mir_sast`.
     is_sast_default_probe: bool = false,
-    /// `true` when lowered from a standalone `subscript` arm solely for Phase 6 `mir_sast` verification (`P1-6`).
+    /// `true` when lowered from a standalone `subscript` arm solely for Phase 6 `mir_sast` verification.
     is_sast_subscript_probe: bool = false,
     /// Owning `DefId` attributed for SAST summary roll-up on synthetic `is_sast_*_probe` bodies.
     sast_owner_def_id: DefId = .NONE,
@@ -1360,7 +1360,7 @@ pub const MirBody = struct {
     }
 
     /// Visits every mutable SSA `MirValueId` use across all instructions, terminators, outgoing
-    /// edge arguments, call sites, AND dynamic `MirProjection.index` operands (`[CRITICAL-06]`).
+    /// edge arguments, call sites, AND dynamic `MirProjection.index` operands.
     ///
     /// Used by `MirSsaBuilder.finish()` and Wave 2C optimization passes (`R1` SCCP / `R3` GVN)
     /// so trivial block-parameter / copy rewrites never leave stale `MirValueId`s in projections!
@@ -1556,7 +1556,7 @@ pub const MAX_EMBED_BLOB_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_EMBED_BYTES: u64 = MAX_EMBED_BLOB_BYTES;
 
 comptime {
-    // Enforce exact Phase 5 & Phase 7 MIR cache-density byte-size invariants (`[CRITICAL-01]`, `[MINOR-02]`):
+    // Enforce exact Phase 5 & Phase 7 MIR cache-density byte-size invariants:
     std.debug.assert(@sizeOf(LocalFlags) == 1);
     std.debug.assert(@sizeOf(LocalDecl) == 16);
     std.debug.assert(@sizeOf(MirPlace) == 8);
@@ -1610,7 +1610,7 @@ const SsaBlockScratch = struct {
 /// Single-pass forward Block-Argument SSA builder (Braun et al., CC 2013, `DR-13` §3.4).
 ///
 /// Supports both fresh `HIR -> MIR` lowering (`init`) and in-place SSA variable promotion over an
-/// existing `MirBody` (`initFromExistingBody` for Wave 2C's `R2` SROA pass, `[MAJOR-01]`).
+/// existing `MirBody` (`initFromExistingBody` for Wave 2C's `R2` SROA pass).
 pub const MirSsaBuilder = struct {
     /// Backing scratch allocator.
     allocator: std.mem.Allocator,
@@ -1654,7 +1654,7 @@ pub const MirSsaBuilder = struct {
     }
 
     /// Initializes a `MirSsaBuilder` pre-seeded with `body`'s existing blocks, block parameters,
-    /// instructions, predecessor edges, and per-edge block arguments (`[MAJOR-01]` for `R2` SROA).
+    /// instructions, predecessor edges, and per-edge block arguments (`R2` SROA).
     pub fn initFromExistingBody(
         allocator: std.mem.Allocator,
         body: *MirBody,
@@ -2010,7 +2010,7 @@ pub const MirSsaBuilder = struct {
         }
 
         if (same.isNone()) {
-            // Unreachable or self-referential dead loop: materialize typed zero fallback (`[CRITICAL-06]`):
+            // Unreachable or self-referential dead loop: materialize typed zero fallback:
             const param_ty = self.body.getInst(param_val).type_id;
             same = try self.emitDefaultScalarInBlock(.fromInt(0), param_ty);
         }
@@ -2343,7 +2343,7 @@ const CleanupEntry = struct {
     scope_depth: u32,
     /// Enclosing `hir_loop` nesting depth at registration time.
     loop_depth: u32,
-    /// Prefix count of `MirLowerer.storage_locals` active when this cleanup entry was registered (`CRIT-06`).
+    /// Prefix count of `MirLowerer.storage_locals` active when this cleanup entry was registered.
     storage_floor: usize = 0,
     /// Lazily constructed shared cold error cleanup pad (`is_cleanup_pad = true`).
     cached_err_pad: MirBlockId = .none,
@@ -2365,7 +2365,7 @@ const SubscriptPlaceBinding = struct {
     place_id: PlaceId,
 };
 
-/// Deferred post-`yield` `subscript` cleanup triggered when `trigger_tok` closes (`MAJ-01`, `Fix-06B`).
+/// Deferred post-`yield` `subscript` cleanup triggered when `trigger_tok` closes (`Fix-06B`).
 const DeferredSubscriptCleanup = struct {
     /// Ghost access token (`yield_ghost_tok`) whose close executes `post_yield_stmts`.
     trigger_tok: MirValueId,
@@ -2414,7 +2414,7 @@ const LoopTargets = struct {
     outer_scope_depth: u32,
     /// `loop_depth` of this loop (`cleanup_stack` filter boundary).
     loop_depth: u32,
-    /// `active_expr_borrows` length outside the loop (`[CRITICAL-08]`).
+    /// `active_expr_borrows` length outside the loop.
     outer_borrow_depth: usize,
 };
 
@@ -2588,7 +2588,7 @@ const MirLowerer = struct {
     /// True while lowering a mutable target place (`&mut p`, `p = v`, `inout p`, `set p`).
     is_mut_place_context: bool = false,
 
-    /// Active mid-expression Ghost access tokens (`[CRITICAL-08]`, closed LIFO on early exit).
+    /// Active mid-expression Ghost access tokens (closed LIFO on early exit).
     active_expr_borrows: std.ArrayListUnmanaged(MirValueId) = .empty,
     /// Unified LIFO `defer` / `errdefer` stack (`DR-13` §4.2).
     cleanup_stack: std.ArrayListUnmanaged(CleanupEntry) = .empty,
@@ -2602,7 +2602,7 @@ const MirLowerer = struct {
     active_fsm_arm_storage: ?*std.ArrayListUnmanaged(LocalId) = null,
     /// Most recent LHS `PlaceId` written by `hir_assign` / `hir_bitfield_rmw` for `SE-15` group tracking.
     last_assigned_place: PlaceId = .none,
-    /// Deferred `subscript` post-`yield` cleanups awaiting `yield_ghost_tok` close (`MAJ-01`).
+    /// Deferred `subscript` post-`yield` cleanups awaiting `yield_ghost_tok` close.
     deferred_subscript_cleanups: std.ArrayListUnmanaged(DeferredSubscriptCleanup) = .empty,
     /// Active `(store, fn_meta_idx)` recursion guard frames preventing cyclic `subscript` splicing.
     subscript_splice_stack: [16]SubscriptSpliceFrame = @splat(.{}),
@@ -2612,9 +2612,9 @@ const MirLowerer = struct {
     decision_node_count: u32 = 0,
     /// `true` when lowering for Phase 6 `mir_sast` so mutable `&T`, `*T`, and `str` bindings keep place stores.
     is_for_sast: bool = false,
-    /// `true` when lowering a standalone `subscript` arm in `is_for_sast` mode (`P1-6`).
+    /// `true` when lowering a standalone `subscript` arm in `is_for_sast` mode.
     is_sast_subscript_body: bool = false,
-    /// `true` when the active standalone `subscript` arm in `is_for_sast` mode is `inout` (`P1-6`).
+    /// `true` when the active standalone `subscript` arm in `is_for_sast` mode is `inout`.
     is_sast_subscript_inout: bool = false,
 
     /// Releases all temporary lowering buffers owned by `self`.
@@ -2702,7 +2702,7 @@ const MirLowerer = struct {
         };
     }
 
-    /// Returns `true` if values of `ty` can retain borrowed references or stack-pinned regions (`CRIT-02`).
+    /// Returns `true` if values of `ty` can retain borrowed references or stack-pinned regions.
     fn hasTypeRegions(self: *const MirLowerer, ty: TypeId) bool {
         return self.hasTypeRegionsDepth(ty, 0);
     }
@@ -3261,7 +3261,7 @@ const MirLowerer = struct {
     }
 
     /// Closes active mid-expression borrows in `[target_borrow_depth .. active_expr_borrows.len)`
-    /// in strict reverse (LIFO) order without mutating `active_expr_borrows` (`[CRITICAL-08]`).
+    /// in strict reverse (LIFO) order without mutating `active_expr_borrows`.
     fn emitBorrowEndsAboveDepth(
         self: *MirLowerer,
         target_borrow_depth: usize,
@@ -3285,7 +3285,7 @@ const MirLowerer = struct {
         }
     }
 
-    /// Executes any deferred `subscript` `post_yield_stmts` bound to `closed_tok` (`MAJ-01`, `Fix-06B`).
+    /// Executes any deferred `subscript` `post_yield_stmts` bound to `closed_tok` (`Fix-06B`).
     fn runDeferredSubscriptCleanupForToken(
         self: *MirLowerer,
         closed_tok: MirValueId,
@@ -3699,7 +3699,7 @@ const MirLowerer = struct {
         }, tok);
     }
 
-    /// Emits `MirIntrinsicKind.bounds_check` immediately prior to dynamic `.index` projection (`[MAJOR-02]`).
+    /// Emits `MirIntrinsicKind.bounds_check` immediately prior to dynamic `.index` projection.
     fn emitIndexBoundsCheck(
         self: *MirLowerer,
         peeled_place: PlaceId,
@@ -3778,7 +3778,7 @@ const MirLowerer = struct {
         });
     }
 
-    /// Lowers `hir_return` routing through `normal`, `explicit_err`, or `dynamic_fallible` cleanups (`[CRITICAL-08]`).
+    /// Lowers `hir_return` routing through `normal`, `explicit_err`, or `dynamic_fallible` cleanups.
     fn lowerReturnNode(self: *MirLowerer, ret_hir_id: HirIndex) anyerror!void {
         const node = self.hir_store.getNode(ret_hir_id);
         const tok = node.origin_token;
@@ -3791,7 +3791,7 @@ const MirLowerer = struct {
             try self.emitUnitVal(tok);
         if (self.cur_bb.isNone() or self.ssa.isBlockTerminated(self.cur_bb)) return;
 
-        // [1] Close all mid-expression active Ghost borrows in strict LIFO order (`[CRITICAL-08]`):
+        // [1] Close all mid-expression active Ghost borrows in strict LIFO order:
         try self.emitBorrowEndsAboveDepth(0, tok);
 
         var has_any_errdefer = false;
@@ -3969,7 +3969,7 @@ const MirLowerer = struct {
         return arm_len == 1 or self.hir_store.getNode(arms[1].body_hir).type_id == .never_ty;
     }
 
-    /// Returns `true` when borrows opened during `stmt_node` must survive until block exit (`CRIT-02`, `CRIT-03`).
+    /// Returns `true` when borrows opened during `stmt_node` must survive until block exit.
     fn isKeepingStmtBorrows(self: *const MirLowerer, stmt_node: hir.HirNode) bool {
         if (stmt_node.tag == .hir_local_decl) {
             const lid = self.mapHirLocal(stmt_node.data.lhs);
@@ -4374,7 +4374,7 @@ const MirLowerer = struct {
         return fallback;
     }
 
-    /// Splices a non-recursive `subscript … yield` call inline (`[CRITICAL-07]`, `MAJ-01`).
+    /// Splices a non-recursive `subscript … yield` call inline.
     fn spliceSubscriptCall(
         self: *MirLowerer,
         call_hir: HirIndex,
@@ -4687,7 +4687,7 @@ const MirLowerer = struct {
         return result;
     }
 
-    /// Closes a `SplicedSubscriptAccess` after caller read/write completes (`[CRITICAL-07]`, `MAJ-01`, `Fix-06B`).
+    /// Closes a `SplicedSubscriptAccess` after caller read/write completes (`Fix-06B`).
     fn closeSplicedSubscriptAccess(
         self: *MirLowerer,
         spliced: *SplicedSubscriptAccess,
@@ -5905,8 +5905,10 @@ const MirLowerer = struct {
                         .ghost_access_inout
                     else
                         .ghost_access_let;
-                    const open_tok = try self.emitGhostOpen(ghost_op, yielded_place, .scoped_projection, tok);
-                    try self.emitGhostEnd(open_tok, tok);
+                    try self.emitGhostEnd(
+                        try self.emitGhostOpen(ghost_op, yielded_place, .scoped_projection, tok),
+                        tok,
+                    );
                     return self.emitUnitVal(tok);
                 }
                 const yielded_place = try self.lowerPlace(HirIndex.fromInt(node.data.lhs));
@@ -5977,7 +5979,7 @@ const MirLowerer = struct {
         return ready_val;
     }
 
-    /// Pending call-scoped Ghost borrow opened right before `.call` (`CRIT-02` + `mir_opt` stack top).
+    /// Pending call-scoped Ghost borrow opened right before `.call`.
     const PendingCallBorrow = struct {
         /// Ghost access opcode (`.ghost_access_let`, `.ghost_access_inout`, or `.ghost_access_set`).
         op: MirOp,
@@ -5985,7 +5987,7 @@ const MirLowerer = struct {
         place_id: PlaceId,
     };
 
-    /// Lowers `hir_call` obeying Hylo post-argument callee order & Call Continuation Split-Edge (`[CRITICAL-05]`, `CRIT-02`).
+    /// Lowers `hir_call` obeying Hylo post-argument callee order & Call Continuation Split-Edge.
     fn lowerCallNode(self: *MirLowerer, call_hir: HirIndex) anyerror!MirValueId {
         const call_node = self.hir_store.getNode(call_hir);
         const tok = call_node.origin_token;
@@ -6140,7 +6142,7 @@ const MirLowerer = struct {
             .origin_token = tok,
         });
 
-        // [4] Enforce Call Continuation Split-Edge Invariant (`[CRITICAL-05]`):
+        // [4] Enforce Call Continuation Split-Edge Invariant:
         //     `normal_bb` has `pred_len == 1`, `paramLen() == 1` (`%ret_val`), `normal_edge.args_len == 0`:
         const normal_bb = try self.ssa.createBlock(false, false);
         const ret_val = try self.ssa.addExplicitBlockParam(normal_bb, call_node.type_id, tok, true);
@@ -6794,7 +6796,7 @@ const MirLowerer = struct {
         }
     }
 
-    /// Returns `true` if `closure_hir` is `@local` or captures regional borrows (`V6`, `CRIT-05`).
+    /// Returns `true` if `closure_hir` is `@local` or captures regional borrows (`V6`).
     fn isClosureMarkedLocal(self: *const MirLowerer, closure_hir: HirIndex) bool {
         const node = self.hir_store.getNode(closure_hir);
         if (node.tag != .hir_closure or node.data.lhs >= self.hir_store.functions.items.len) return false;
@@ -6904,7 +6906,7 @@ const MirLowerer = struct {
                     try pa_targets.append(self.allocator, self.last_assigned_place);
                 }
             }
-            // Statement-scoped temporaries close at `;`; region-carrying `let` bindings live to block exit (`CRIT-02`):
+            // Statement-scoped temporaries close at `;`; region-carrying `let` bindings live to block exit:
             if (!self.isKeepingStmtBorrows(stmt_node) and
                 !self.cur_bb.isNone() and !self.ssa.isBlockTerminated(self.cur_bb))
             {
@@ -8296,7 +8298,7 @@ const MirLowerer = struct {
         };
     }
 
-    /// Maps `(HirBinaryOp, operand_ty)` to an explicit signed/unsigned/float `BinOpKind` (`[CRITICAL-09]`).
+    /// Maps `(HirBinaryOp, operand_ty)` to an explicit signed/unsigned/float `BinOpKind`.
     fn selectMirBinOp(
         self: *const MirLowerer,
         hir_op: hir.HirBinaryOp,
@@ -8465,7 +8467,7 @@ const MirLowerer = struct {
         high: i128,
     };
 
-    /// Compares two pattern range bounds under `u128` (when `is_u128`) or signed `i128` order (`CRIT-07`).
+    /// Compares two pattern range bounds under `u128` (when `is_u128`) or signed `i128` order.
     fn isIntBoundLess(is_u128: bool, lhs_bound: i128, rhs_bound: i128) bool {
         if (is_u128) {
             return @as(u128, @bitCast(lhs_bound)) < @as(u128, @bitCast(rhs_bound));
@@ -8473,7 +8475,7 @@ const MirLowerer = struct {
         return lhs_bound < rhs_bound;
     }
 
-    /// Compares `lhs_bound <= rhs_bound` under `u128` (when `is_u128`) or signed `i128` order (`CRIT-07`).
+    /// Compares `lhs_bound <= rhs_bound` under `u128` (when `is_u128`) or signed `i128` order.
     fn isIntBoundLessOrEq(is_u128: bool, lhs_bound: i128, rhs_bound: i128) bool {
         return lhs_bound == rhs_bound or isIntBoundLess(is_u128, lhs_bound, rhs_bound);
     }
@@ -9002,7 +9004,7 @@ const MirLowerer = struct {
                 return;
             }
 
-            // Guarded arm (`DR-13` §4.1.6 & `CRIT-03`): push `.match_guard` shared borrows onto
+            // Guarded arm (`DR-13` §4.1.6): push `.match_guard` shared borrows onto
             // `active_expr_borrows` and bind with `is_in_guard = true` so `inout` opens only on hit:
             const guard_borrow_base = self.active_expr_borrows.items.len;
             for (matched_row.bindings) |binding| {
@@ -9379,7 +9381,7 @@ const MirLowerer = struct {
         return best_col;
     }
 
-    /// Materializes deferred `PatBinding`s into SSA variables or address-taken local slots (`CRIT-03`).
+    /// Materializes deferred `PatBinding`s into SSA variables or address-taken local slots.
     fn emitPatternBindings(
         self: *MirLowerer,
         bindings: []const PatBinding,
@@ -10001,7 +10003,7 @@ const MirLowerer = struct {
             );
         }
 
-        // Disjoint Elementary Interval Decomposition (`DR-13` §4.1.5 & `CRIT-07`) for wide/overlapping ranges:
+        // Disjoint Elementary Interval Decomposition (`DR-13` §4.1.5) for wide/overlapping ranges:
         var endpoints: std.ArrayListUnmanaged(i128) = .empty;
         for (rows) |row| {
             const pat_idx = row.pats[pivot_col];
@@ -10663,8 +10665,13 @@ const MirLowerer = struct {
                 const hir_slot = self.base_hir_local + @as(u32, @intCast(offset));
                 const is_ret = offset == 0;
                 const is_arg = offset >= 1 and offset <= fn_meta.param_len;
-                const fb_ty = if (is_ret) eff_ret_ty else TypeId.unit_ty;
-                try self.appendHirSlotAsMirLocal(hir_slot, is_ret, is_arg, fb_ty, false);
+                try self.appendHirSlotAsMirLocal(
+                    hir_slot,
+                    is_ret,
+                    is_arg,
+                    if (is_ret) eff_ret_ty else TypeId.unit_ty,
+                    false,
+                );
             }
         }
         self.ssa.var_types = self.local_var_types.items;
@@ -10719,8 +10726,10 @@ const MirLowerer = struct {
                 }
             }
         } else {
-            const unit_ret = try self.ssa.emitDefaultScalarInBlock(entry_bb, eff_ret_ty);
-            try self.emitFinalReturnTerminator(unit_ret, .none);
+            try self.emitFinalReturnTerminator(
+                try self.ssa.emitDefaultScalarInBlock(entry_bb, eff_ret_ty),
+                .none,
+            );
         }
 
         // [5] Seal, prune unreachable blocks, collapse trivial phis, and pack `MirBody`:
@@ -11022,7 +11031,7 @@ pub fn verifyMirBody(
             const dst_bb = body.blocks.items[edge.target_bb.asInt()];
             if (term.kind == .call) {
                 if (term.cond_or_val >= body.calls.items.len) return error.V2InvalidTerminatorOrEdge;
-                // Call Continuation Split-Edge Invariant (`[CRITICAL-05]`):
+                // Call Continuation Split-Edge Invariant:
                 if (dst_bb.pred_len != 1 or dst_bb.paramLen() != 1 or edge.args_len != 0) {
                     return error.V2CallContinuationSplitViolation;
                 }
@@ -11675,7 +11684,7 @@ fn verifyV5DefiniteInit(
     if (local_count == 0) return;
     const block_count = body.blocks.items.len;
 
-    // Collect distinct sub-places (`proj_len > 0`) moved via `ghost_storage_move` (`CRIT-04`):
+    // Collect distinct sub-places (`proj_len > 0`) moved via `ghost_storage_move`:
     var moved_subplaces: std.ArrayListUnmanaged(PlaceId) = .empty;
     defer moved_subplaces.deinit(allocator);
     for (dom.rpo_blocks) |bb_idx| {
@@ -12032,7 +12041,7 @@ fn verifyV6ContextAndClosureEscape(
         }
     }
 
-    // [2] `@local` closure taint propagation & non-escape check (`E0306`, `CRIT-05`):
+    // [2] `@local` closure taint propagation & non-escape check (`E0306`):
     var has_any_local_closure = false;
     for (body.locals.items) |loc| {
         if (loc.flags().is_local_closure) {
@@ -13038,7 +13047,7 @@ fn emitEmbedDiagnostic(
     });
 }
 
-/// Resolves the active `EmbedPackageJail` for lexical `origin_file_id` (`P1-5`, fail-closed to `.cxtree_only` for `PackageId >= 2`).
+/// Resolves the active `EmbedPackageJail` for lexical `origin_file_id` (fail-closed to `.cxtree_only` for `PackageId >= 2`).
 pub fn resolveActiveEmbedJail(
     origin_file_id: FileId,
     sym_table: ?*const SymbolTable,
@@ -13106,8 +13115,7 @@ pub fn readSandboxedHostEmbedFile(
     var leaf_segment: []const u8 = rel_path;
     while (scan_i <= rel_path.len) : (scan_i += 1) {
         const is_end = scan_i == rel_path.len;
-        const is_sep = is_end or rel_path[scan_i] == '/' or rel_path[scan_i] == '\\';
-        if (!is_sep) continue;
+        if (!is_end and rel_path[scan_i] != '/' and rel_path[scan_i] != '\\') continue;
         const seg = rel_path[seg_start..scan_i];
         if (is_end) {
             leaf_segment = seg;
@@ -13263,7 +13271,7 @@ pub fn lookupSandboxedCxTreeEmbedAsset(
 }
 
 /// Resolves reachable constant-path `@embed_bytes` calls in `body` into `blob_store` and rewrites them in-place
-/// to `MirOp.const_scalar` (`MirConst.raw_blob`), keeping `MirLowerer` pure/I/O-free (`[CRITICAL-07]`).
+/// to `MirOp.const_scalar` (`MirConst.raw_blob`), keeping `MirLowerer` pure/I/O-free.
 pub fn materializeBodyEmbedBytes(
     body: *MirBody,
     interner: *const StringInterner,
@@ -13321,7 +13329,7 @@ pub fn materializeBodyEmbedBytes(
             const path_const = body.consts.items[path_inst.operands.lhs];
             if (path_const != .str_val) continue;
 
-            // Resolve lexical `origin_file_id` strictly from `args[1]` (`P1-5`), NEVER `body.file_id` when present:
+            // Resolve lexical `origin_file_id` strictly from `args[1]`, NEVER `body.file_id` when present:
             const origin_file_id: FileId = if (inst.operands.rhs >= 2) blk_origin: {
                 var fid_val = body.extra_args.items[inst.operands.lhs + 1];
                 var fid_hops: u32 = 32;
@@ -13582,7 +13590,7 @@ pub fn materializeBodyEmbedBytes(
     return is_all_ok;
 }
 
-/// Materializes reachable `@embed_bytes` constants across all `bodies` in a module prior to codegen (`[CRITICAL-07]`).
+/// Materializes reachable `@embed_bytes` constants across all `bodies` in a module prior to codegen.
 pub fn materializeModuleEmbedBytes(
     bodies: []MirBody,
     interner: *const StringInterner,
@@ -13616,7 +13624,7 @@ test "test_mir_layout_invariants_and_value_zero_validity" {
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(MirBasicBlock));
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(MirOutgoingEdge));
 
-    // `[MINOR-01]`: `MirValueId.fromInt(0)` is a valid SSA instruction ID, never `.none`:
+    // `MirValueId.fromInt(0)` is a valid SSA instruction ID, never `.none`:
     const first_ssa = MirValueId.fromInt(0);
     try std.testing.expect(!first_ssa.isNone());
     try std.testing.expect(MirValueId.none.isNone());
@@ -13812,7 +13820,7 @@ test "test_mir_braun_ssa_duplicate_target_cond_br_and_proj_index_rewrite_and_res
 
     try verifyMirBody(alloc, &body, &pool, &sym_table, null);
 
-    // `[MAJOR-01]`: Test `initFromExistingBody` pre-seeding existing `MirBody` without losing edge args:
+    // Test `initFromExistingBody` pre-seeding existing `MirBody` without losing edge args:
     const sroa_types = [1]TypeId{.i32_ty};
     var reseeded = try MirSsaBuilder.initFromExistingBody(alloc, &body, &sroa_types, null);
     defer reseeded.deinit();
@@ -14247,7 +14255,7 @@ test "test_mir_derive_bodies_attribute_schema_and_inclusive_u8_range_end_to_end"
 test "test_redteam_3a_mir_mut_ref_linearity_two_phase_borrows_and_match_ref_guards" {
     const alloc = std.testing.allocator;
 
-    // [1] `CRIT-01`: linear `&mut i32` double-move caught by `V5`, and `&r1.*` + `r1.* = 20` caught by `V4`:
+    // [1] Linear `&mut i32` double-move caught by `V5`, and `&r1.*` + `r1.* = 20` caught by `V4`:
     const double_move_mut_ref_src =
         \\pub fn use_two(first_ref: &mut i32, second_ref: &mut i32) -> i32 {
         \\    return first_ref.* + second_ref.*;
@@ -14275,7 +14283,7 @@ test "test_redteam_3a_mir_mut_ref_linearity_two_phase_borrows_and_match_ref_guar
         lowerSourceToMir(alloc, FileId.fromInt(31), reborrow_conflict_src, TargetLayout.NATIVE_64, .{}),
     );
 
-    // [2] `CRIT-02`: `buf.push(buf.len())` and `let count = buf.len(); buf.push(count);` pass `V4` cleanly:
+    // [2] `buf.push(buf.len())` and `let count = buf.len(); buf.push(count);` pass `V4` cleanly:
     const vec_push_len_src =
         \\pub struct MiniBuf {
         \\    pub count: usize,
@@ -14299,7 +14307,7 @@ test "test_redteam_3a_mir_mut_ref_linearity_two_phase_borrows_and_match_ref_guar
     defer vec_bundle.deinit();
     try std.testing.expect(!vec_bundle.hir_bundle.diagnostics.hasErrors());
 
-    // [3] `CRIT-03`: `ref` / `ref mut` match arms, `or_pat` `(1, ref x) | (ref x, 1)`, `let … else` `ref`, and `?` in guard:
+    // [3] `ref` / `ref mut` match arms, `or_pat` `(1, ref x) | (ref x, 1)`, `let … else` `ref`, and `?` in guard:
     const match_ref_ok_src =
         \\pub fn check_guard(val: i32) -> bool!i32 {
         \\    if val < 0 { return .Err(val); }
@@ -14346,7 +14354,7 @@ test "test_redteam_3a_mir_mut_ref_linearity_two_phase_borrows_and_match_ref_guar
 test "test_redteam_3a_mir_definite_init_partial_moves_local_closure_escape_and_cleanup_pads" {
     const alloc = std.testing.allocator;
 
-    // [1] `CRIT-04`: uninitialized `var` across conditional branch caught by `V5`:
+    // [1] Uninitialized `var` across conditional branch caught by `V5`:
     const uninit_var_src =
         \\pub fn maybe_uninit(cond: bool) -> i32 {
         \\    var num: i32;
@@ -14361,7 +14369,7 @@ test "test_redteam_3a_mir_definite_init_partial_moves_local_closure_escape_and_c
         lowerSourceToMir(alloc, FileId.fromInt(35), uninit_var_src, TargetLayout.NATIVE_64, .{}),
     );
 
-    // [2] `CRIT-04`: partial double-move of non-`Copy` field caught by `V5`, while sibling move + re-init passes:
+    // [2] Partial double-move of non-`Copy` field caught by `V5`, while sibling move + re-init passes:
     const partial_double_move_src =
         \\pub struct Resource {
         \\    pub lock_ref: &mut i32,
@@ -14402,7 +14410,7 @@ test "test_redteam_3a_mir_definite_init_partial_moves_local_closure_escape_and_c
     defer reinit_bundle.deinit();
     try std.testing.expect(!reinit_bundle.hir_bundle.diagnostics.hasErrors());
 
-    // [3] `CRIT-04`: moving out of `&mut` parameter without re-initializing before return caught by `V5`:
+    // [3] Moving out of `&mut` parameter without re-initializing before return caught by `V5`:
     const inout_steal_src =
         \\pub struct Resource {
         \\    pub lock_ref: &mut i32,
@@ -14417,7 +14425,7 @@ test "test_redteam_3a_mir_definite_init_partial_moves_local_closure_escape_and_c
         lowerSourceToMir(alloc, FileId.fromInt(38), inout_steal_src, TargetLayout.NATIVE_64, .{}),
     );
 
-    // [4] `CRIT-05`: captureless closure passes `own` cleanly, while Tier-1 borrow closure, field-stored `@local`, and `&mut` escape fail `V6`:
+    // [4] Captureless closure passes `own` cleanly, while Tier-1 borrow closure, field-stored `@local`, and `&mut` escape fail `V6`:
     const pure_closure_ok_src =
         \\pub fn consume_sink[F](cb: own F) -> i32 {
         \\    let _ = cb;
@@ -14476,7 +14484,7 @@ test "test_redteam_3a_mir_definite_init_partial_moves_local_closure_escape_and_c
         lowerSourceToMir(alloc, FileId.fromInt(42), inout_local_escape_src, TargetLayout.NATIVE_64, .{}),
     );
 
-    // [5] `CRIT-06`, `CRIT-07`, `MAJ-01`, `MAJ-09`, `MIN-01`: per-scope `errdefer` storage deinits, `i128`/`u128` ranges,
+    // [5] Per-scope `errdefer` storage deinits, `i128`/`u128` ranges,
     // `subscript` post-yield ordering, and `distinct Result` `?` + `errdefer`:
     const combined_mir_src =
         \\pub struct GuardedRes {
@@ -14547,7 +14555,7 @@ test "test_redteam_3a_mir_definite_init_partial_moves_local_closure_escape_and_c
     defer comb_bundle.deinit();
     try std.testing.expect(!comb_bundle.hir_bundle.diagnostics.hasErrors());
 
-    // Verify `MIN-01`: every live `MirValueId` referenced by any reachable terminator or edge belongs to a basic block:
+    // Verify every live `MirValueId` referenced by any reachable terminator or edge belongs to a basic block:
     for (comb_bundle.mir_bundle.bodies.items) |*mir_body| {
         const is_block_owned = try alloc.alloc(bool, mir_body.insts.len);
         defer alloc.free(is_block_owned);

@@ -909,6 +909,8 @@ pub const CodegenModuleInput = struct {
     interner: *const StringInterner,
     /// Logical module identifier used for debug info and `.ll` header metadata.
     module_name: []const u8 = "corex_mod",
+    /// Explicit binary entrypoint `FileId` restricting `fn main` wrapper selection when non-`.none`.
+    entry_file_id: mem_foundation.FileId = .none,
     /// Optional `VfsSourceMap` resolving `FileId` paths and line numbers for `#line` / DWARF v5 tables.
     vfs_source_map: ?*const vfs_sourcemap.VfsSourceMap = null,
     /// Optional map `FileId.asInt() -> *const TokenBuffer` resolving `TokenIndex` byte spans.
@@ -1004,6 +1006,26 @@ pub const ZigDriverLocator = struct {
         const found = try resolveZigExecutable(io, allocator, environ_map);
         self.cached_path = found;
         return found;
+    }
+};
+
+/// Borrowed or owned `Environ.Map` guaranteeing `SOURCE_DATE_EPOCH` is populated for deterministic linking.
+pub const DeterministicDriverEnv = struct {
+    /// Owned map allocated when `SOURCE_DATE_EPOCH` had to be injected (`null` when borrowed or inherited).
+    owned_map: ?std.process.Environ.Map = null,
+    /// Borrowed caller map when `SOURCE_DATE_EPOCH` was already present.
+    borrowed_map: ?*const std.process.Environ.Map = null,
+
+    /// Returns the active `*const std.process.Environ.Map` view for `std.process.run`.
+    pub fn asConstPtr(self: *const DeterministicDriverEnv) ?*const std.process.Environ.Map {
+        if (self.owned_map) |*map_ref| return map_ref;
+        return self.borrowed_map;
+    }
+
+    /// Releases `owned_map` if one was allocated.
+    pub fn deinit(self: *DeterministicDriverEnv) void {
+        if (self.owned_map) |*map_ref| map_ref.deinit();
+        self.* = .{};
     }
 };
 
@@ -2764,11 +2786,11 @@ pub fn atomicWriteOutputFile(
     dest_path: []const u8,
     content: []const u8,
 ) !void {
-    return atomicWriteOutputFileWithPermissions(io, allocator, dest_path, content, .default_file);
+    return writeOutputFileAtomicWithPermissions(io, allocator, dest_path, content, .default_file);
 }
 
 /// Writes `content` to `dest_path` with explicit `permissions` via `SIGKILL`-safe `UnlinkAndReplace`.
-pub fn atomicWriteOutputFileWithPermissions(
+pub fn writeOutputFileAtomicWithPermissions(
     io: std.Io,
     allocator: std.mem.Allocator,
     dest_path: []const u8,
@@ -2849,7 +2871,7 @@ pub fn publishStagedFileAtomic(
     if ((try opened_file.readPositionalAll(io, staged_bytes, 0)) != file_size) {
         return error.UnexpectedEndOfFile;
     }
-    try atomicWriteOutputFileWithPermissions(io, allocator, final_dest_path, staged_bytes, src_stat.permissions);
+    try writeOutputFileAtomicWithPermissions(io, allocator, final_dest_path, staged_bytes, src_stat.permissions);
 }
 
 /// Lazily locates the `zig` compiler driver executable via `COREX_ZIG_EXE` or `PATH` (`AGENTS.md` §2).
@@ -2882,6 +2904,34 @@ pub fn resolveZigExecutable(
         }
     }
     return allocator.dupe(u8, exe_name);
+}
+
+/// Prepares a deterministic subprocess environment with `SOURCE_DATE_EPOCH=0` unless already set by the caller.
+pub fn prepareDeterministicDriverEnv(
+    allocator: std.mem.Allocator,
+    environ_map: ?*const std.process.Environ.Map,
+) !DeterministicDriverEnv {
+    if (environ_map) |caller_map| {
+        if (caller_map.contains("SOURCE_DATE_EPOCH")) {
+            return .{ .borrowed_map = caller_map };
+        }
+        var cloned_map = try caller_map.clone(allocator);
+        errdefer cloned_map.deinit();
+        try cloned_map.put("SOURCE_DATE_EPOCH", "0");
+        return .{ .owned_map = cloned_map };
+    }
+    if (builtin.os.tag == .windows) {
+        var win_map = (std.process.Environ{ .block = .global }).createMap(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{},
+        };
+        errdefer win_map.deinit();
+        if (!win_map.contains("SOURCE_DATE_EPOCH")) {
+            try win_map.put("SOURCE_DATE_EPOCH", "0");
+        }
+        return .{ .owned_map = win_map };
+    }
+    return .{};
 }
 
 // ---------------------------------------- MAIN -----------------------------------------

@@ -657,6 +657,10 @@ pub const CfgEnv = struct {
     enabled_features: []const []const u8 = &.{},
     /// Optional declared package feature allowlist from `corex.toml`; undeclared names emit `E0435` when set.
     declared_features: ?[]const []const u8 = null,
+    /// Optional pre-built $O(1)$ enabled feature set overriding slice-based lookup.
+    enabled_feature_set: ?*const std.StringHashMapUnmanaged(void) = null,
+    /// Optional pre-built $O(1)$ declared feature set overriding slice-based lookup.
+    declared_feature_set: ?*const std.StringHashMapUnmanaged(void) = null,
     /// Additional enabled CPU feature strings queried by `target.cpu_has("…")`.
     enabled_cpu_features: []const []const u8 = &.{},
     /// Owning `PackageId` when bound to a multi-package `SymbolTable` (`PackageId.root` by default).
@@ -1066,6 +1070,8 @@ pub const InactiveCfgCapScan = struct {
     pub_inactive_caps_bits: u16 = 0,
     /// Raw 12-bit capability mask (`CapabilityBits`) found on `@cfg`-disabled exported/linked items.
     link_ambient_inactive_caps_bits: u16 = 0,
+    /// `true` when at least one `pub` declaration or member inside this file is `@cfg`-disabled.
+    has_pub_inactive_cfg_items: bool = false,
     /// Span of the first capability-bearing token inside an inactive `@cfg` branch.
     first_inactive_cap_span: Span = .{ .file_id = .none, .start_byte = 0, .end_byte = 0 },
 };
@@ -1781,7 +1787,7 @@ fn pruneScopeMapWithCfgEnvQuiet(
     depth: u32,
 ) !void {
     if (scope_id.isNone() or depth >= MAX_SCOPE_DEPTH) return;
-    const effective_cfg = sym_table.effectiveCfgEnvForFile(file_id);
+    const effective_cfg = sym_table.resolveCfgEnvForFile(file_id);
     const members_copy = try sym_table.allocator.dupe(
         SymbolIndex,
         sym_table.getScopeMembers(scope_id),
@@ -1945,6 +1951,22 @@ fn recordHeaderFfiContractIfPresent(
     }, &.{});
 }
 
+/// Deferred forward `impl` block awaiting nominal target or trait scope rebinding after Pass-1 item collection.
+const ForwardImplRebind = struct {
+    /// Temporary `.impl_scope` created before the target nominal type was seen.
+    old_scope: ScopeId,
+    /// Assigned `DefId` of the `.impl_decl`.
+    def_id: DefId,
+    /// AST node index of the `.impl_decl`.
+    item_node_idx: NodeIndex,
+    /// CST node index of the `.impl_item`.
+    item_cst: CstNodeIndex,
+    /// Inclusive symbol table start index of this `impl`'s members.
+    sym_start: usize,
+    /// Exclusive symbol table end index of this `impl`'s members.
+    sym_end: usize,
+};
+
 /// Collects AST items into `enclosing_scope`, advancing `top_ordinal_ptr` across flattened top-level `extern` blocks.
 fn collectItemSliceInScopeWithOrdinal(
     sym_table: *SymbolTable,
@@ -1961,23 +1983,9 @@ fn collectItemSliceInScopeWithOrdinal(
     extra_ends: []const u32,
     diagnostic_sink: ?*DiagnosticSink,
 ) anyerror!void {
-    const ForwardImplRebind = struct {
-        /// Temporary `.impl_scope` created before the target nominal type was seen.
-        old_scope: ScopeId,
-        /// Assigned `DefId` of the `.impl_decl`.
-        def_id: DefId,
-        /// AST node index of the `.impl_decl`.
-        item_node_idx: NodeIndex,
-        /// CST node index of the `.impl_item`.
-        item_cst: CstNodeIndex,
-        /// Inclusive symbol table start index of this `impl`'s members.
-        sym_start: usize,
-        /// Exclusive symbol table end index of this `impl`'s members.
-        sym_end: usize,
-    };
-
     const file_pkg_id = sym_table.getFilePackageId(file_id);
     const is_external_pkg = file_pkg_id.asInt() >= 2;
+    const is_stdlib_privileged = sym_table.isCoreAllowedForFile(file_id);
     const is_file_including_tests = sym_table.is_including_tests and (file_pkg_id == .root);
     var forward_impls: std.ArrayListUnmanaged(ForwardImplRebind) = .empty;
     defer forward_impls.deinit(sym_table.allocator);
@@ -2010,10 +2018,12 @@ fn collectItemSliceInScopeWithOrdinal(
             interner,
             diagnostic_sink,
         );
-        if (is_external_pkg) {
+        if (!is_stdlib_privileged) {
             header_meta.contract_flags.is_std_cap_boundary = false;
             header_meta.cap_emits_mask = 0;
             header_meta.cap_clears_mask = 0;
+        }
+        if (is_external_pkg) {
             header_meta.is_trusted = false;
             header_meta.extra_flags.is_trusted_ffi = false;
             header_meta.contract_flags.has_link_section = false;
@@ -3172,8 +3182,8 @@ pub const SymbolTable = struct {
     generic_param_specs: std.AutoHashMapUnmanaged(u32, []GenericParamSpec) = .empty,
     /// Sparse map of `extern` function/static FFI linkage and SAST contract metadata (`DR-10` §2.3).
     ffi_contracts: std.AutoHashMapUnmanaged(SymbolIndex, FfiFnContract) = .empty,
-    /// Pre-registered or cached `@c_import("header.h")` synthetic module `SymbolIndex` handles.
-    c_import_modules: std.StringHashMapUnmanaged(SymbolIndex) = .empty,
+    /// Pre-registered or cached `(PackageId, StringId)` -> synthetic `@c_import` module `SymbolIndex` handles.
+    c_import_modules: std.AutoHashMapUnmanaged(u64, SymbolIndex) = .empty,
     /// Optional on-demand loader invoked when `@c_import("header.h")` misses `c_import_modules`.
     c_import_loader: ?CImportModuleLoader = null,
     /// Deferred `use` imports queued during Pass 1 for Pass 2 cross-module resolution.
@@ -3186,6 +3196,8 @@ pub const SymbolTable = struct {
     cx_root_scope: ScopeId = .none,
     /// Lazily resolved or synthesized `cx.sync.atomic` / `cx.atomic` module `ScopeId`.
     cx_atomic_scope: ScopeId = .none,
+    /// Active binary entrypoint `FileId` during codegen `main` wrapper emission (`.none` when unset).
+    active_entry_file_id: FileId = .none,
     /// `true` when compiling internal `core/` sources (`--internal-core` or `Durability.high`), suppressing `E0218`.
     is_internal_core: bool = false,
     /// `true` when `test "…"` and `bench "…"` items are active (`SE-16`); `false` skips them in $O(1)$.
@@ -3327,6 +3339,7 @@ pub const SymbolTable = struct {
         self.cx_meta_scope = .none;
         self.cx_root_scope = .none;
         self.cx_atomic_scope = .none;
+        self.active_entry_file_id = .none;
         self.is_internal_core = false;
         self.is_including_tests = true;
         self.cfg_env = .{};
@@ -3377,8 +3390,7 @@ pub const SymbolTable = struct {
         caller_file_id: FileId,
         fallback_scope: ScopeId,
     ) ScopeId {
-        const caller_pkg = self.getFilePackageId(caller_file_id);
-        if (self.lookupPackageRootScope(caller_pkg)) |pkg_root| {
+        if (self.lookupPackageRootScope(self.getFilePackageId(caller_file_id))) |pkg_root| {
             return pkg_root;
         }
         if (!caller_file_id.isNone()) {
@@ -3538,7 +3550,7 @@ pub const SymbolTable = struct {
     }
 
     /// Returns a `CfgEnv` scoped to `file_id`'s `PackageId` (pruning `test` mode on `PackageId >= 2`).
-    pub fn effectiveCfgEnvForFile(self: *const SymbolTable, file_id: FileId) CfgEnv {
+    pub fn resolveCfgEnvForFile(self: *const SymbolTable, file_id: FileId) CfgEnv {
         var file_cfg = self.cfg_env;
         const pkg_id = self.getFilePackageId(file_id);
         file_cfg.owner_pkg_id = pkg_id;
@@ -3655,15 +3667,46 @@ pub const SymbolTable = struct {
         return self.ffi_contracts.getPtr(sym_idx);
     }
 
-    /// Registers a translated `@c_import("header.h")` synthetic module `mod_sym_idx` under `header_path`.
+    /// Packs `(pkg_id, header_id)` into a collision-free 64-bit `c_import_modules` lookup key.
+    pub inline fn packCImportModuleKey(pkg_id: PackageId, header_id: mem_foundation.StringId) u64 {
+        return (@as(u64, pkg_id.asInt()) << 32) | @as(u64, header_id.asInt());
+    }
+
+    /// Registers a translated `@c_import("header.h")` synthetic module `mod_sym_idx` scoped to `pkg_id`.
+    pub fn registerPackageCImportModule(
+        self: *SymbolTable,
+        interner: *StringInterner,
+        pkg_id: PackageId,
+        header_path: []const u8,
+        mod_sym_idx: SymbolIndex,
+    ) !void {
+        const header_id = try interner.intern(header_path);
+        try self.c_import_modules.put(
+            self.allocator,
+            packCImportModuleKey(pkg_id, header_id),
+            mod_sym_idx,
+        );
+    }
+
+    /// Looks up a cached `@c_import("header.h")` synthetic module scoped to `pkg_id` in $O(1)$.
+    pub fn lookupCImportModule(
+        self: *const SymbolTable,
+        interner: *const StringInterner,
+        pkg_id: PackageId,
+        header_path: []const u8,
+    ) ?SymbolIndex {
+        const header_id = interner.lookup(header_path) orelse return null;
+        return self.c_import_modules.get(packCImportModuleKey(pkg_id, header_id));
+    }
+
+    /// Registers a translated `@c_import("header.h")` synthetic module `mod_sym_idx` under `.root`.
     pub fn registerCImportModule(
         self: *SymbolTable,
         interner: *StringInterner,
         header_path: []const u8,
         mod_sym_idx: SymbolIndex,
     ) !void {
-        const interned_id = try interner.intern(header_path);
-        try self.c_import_modules.put(self.allocator, interner.get(interned_id), mod_sym_idx);
+        return self.registerPackageCImportModule(interner, .root, header_path, mod_sym_idx);
     }
 
     /// Binds an external `mod <name>;` declaration in `parent_file_id` to `target_scope`.
@@ -6777,11 +6820,8 @@ fn evaluateCfgFeatureFlag(
     diagnostic_sink: ?*DiagnosticSink,
 ) !bool {
     var is_enabled = false;
-    for (cfg_env.enabled_features) |enabled_feat| {
-        if (std.mem.eql(u8, enabled_feat, feat_name)) {
-            is_enabled = true;
-            break;
-        }
+    if (cfg_env.enabled_feature_set) |en_set| {
+        is_enabled = en_set.contains(feat_name);
     }
     if (!is_enabled) {
         if (cfg_env.sym_table_features) |st_features| {
@@ -6793,14 +6833,9 @@ fn evaluateCfgFeatureFlag(
 
     var has_manifest = false;
     var is_declared = false;
-    if (cfg_env.declared_features) |declared_list| {
+    if (cfg_env.declared_feature_set) |decl_set| {
         has_manifest = true;
-        for (declared_list) |decl_feat| {
-            if (std.mem.eql(u8, decl_feat, feat_name)) {
-                is_declared = true;
-                break;
-            }
-        }
+        is_declared = decl_set.contains(feat_name);
     } else if (cfg_env.sym_table_features) |st_features| {
         if (st_features.has_package_feature_manifest.contains(cfg_env.owner_pkg_id)) {
             has_manifest = true;
@@ -6906,10 +6941,32 @@ fn evaluateSingleCfgAttrRangeWithEnv(
         return true;
     }
 
+    var stack_buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
+    var local_enabled_set: std.StringHashMapUnmanaged(void) = .empty;
+    var local_declared_set: std.StringHashMapUnmanaged(void) = .empty;
+    var indexed_env = cfg_env.*;
+    if (indexed_env.enabled_feature_set == null and indexed_env.enabled_features.len > 0) {
+        const fba_alloc = fba.allocator();
+        for (indexed_env.enabled_features) |en_feat| {
+            local_enabled_set.put(fba_alloc, en_feat, {}) catch break;
+        }
+        indexed_env.enabled_feature_set = &local_enabled_set;
+    }
+    if (indexed_env.declared_feature_set == null) {
+        if (indexed_env.declared_features) |decl_feats| {
+            const fba_alloc = fba.allocator();
+            for (decl_feats) |decl_feat| {
+                local_declared_set.put(fba_alloc, decl_feat, {}) catch break;
+            }
+            indexed_env.declared_feature_set = &local_declared_set;
+        }
+    }
+
     var pos: usize = 0;
     var has_cfg_err = false;
     const result = try parseCfgOrExprWithEnv(
-        cfg_env,
+        &indexed_env,
         file_id,
         source,
         token_buffer,
@@ -7634,7 +7691,7 @@ pub fn suppressCPrimitiveTypeCasingWarnings(
     sink.diagnostics.items.len = write_idx;
 }
 
-/// Enforces `DR-17` pre-`@cfg` external-package hygiene (`E0327`, `E0218`, `E0013`) across all CST nodes.
+/// Enforces `DR-17` pre-`@cfg` sandbox and package hygiene (`E0327`, `E0218`, `E0013`) across all CST nodes.
 pub fn enforceExternalPackageCstHygiene(
     sym_table: *const SymbolTable,
     interner: *StringInterner,
@@ -7644,9 +7701,11 @@ pub fn enforceExternalPackageCstHygiene(
     cst_arena: *const LosslessCstArena,
     diagnostic_sink: ?*DiagnosticSink,
 ) !void {
-    if (sym_table.getFilePackageId(file_id).asInt() < 2) return;
+    const is_external_pkg = sym_table.getFilePackageId(file_id).asInt() >= 2;
+    const is_stdlib_privileged = sym_table.isCoreAllowedForFile(file_id);
+    if (is_stdlib_privileged and !is_external_pkg) return;
     const sink = diagnostic_sink orelse return;
-    const file_cfg = sym_table.effectiveCfgEnvForFile(file_id);
+    const file_cfg = sym_table.resolveCfgEnvForFile(file_id);
     const total_nodes = cst_arena.countNodes();
     const total_tokens = token_buffer.countTokens();
 
@@ -7669,7 +7728,7 @@ pub fn enforceExternalPackageCstHygiene(
                 if (tok_kind == .at) continue;
                 if (isIdentifierToken(tok_kind)) {
                     const attr_name = extractTokenSlice(source, token_buffer, leaf.token);
-                    if (FORBIDDEN_EXTERNAL_PKG_ATTR_MAP.has(attr_name)) {
+                    if (is_external_pkg and FORBIDDEN_EXTERNAL_PKG_ATTR_MAP.has(attr_name)) {
                         const attr_span = token_buffer.getTokenSpan(file_id, leaf.token);
                         if (!hasDiagnosticAtSpan(sink, .e0327_forbidden_sandbox_bypass_attribute, attr_span)) {
                             const arena_alloc = sink.arena.asAllocator();
@@ -7691,12 +7750,30 @@ pub fn enforceExternalPackageCstHygiene(
                                 .labels = &labels,
                             });
                         }
+                    } else if (!is_stdlib_privileged and std.mem.eql(u8, attr_name, "std_cap_boundary")) {
+                        const attr_span = token_buffer.getTokenSpan(file_id, leaf.token);
+                        if (!hasDiagnosticAtSpan(sink, .e0327_forbidden_sandbox_bypass_attribute, attr_span)) {
+                            const labels = [1]LabeledSpan{.{
+                                .span = attr_span,
+                                .label = "forbidden capability-boundary attribute in user code",
+                                .style = .primary,
+                            }};
+                            _ = try sink.emit(.{
+                                .code = .e0327_forbidden_sandbox_bypass_attribute,
+                                .severity = .err,
+                                .primary_span = attr_span,
+                                .message = "`@std_cap_boundary` is restricted to privileged `cx` / `core` library modules",
+                                .labels = &labels,
+                            });
+                        }
                     }
                 }
                 break;
             }
             continue;
         }
+
+        if (!is_external_pkg) continue;
 
         if (node.kind == .use_item) {
             if (parser.extractInlineUseDeclView(source, file_id, token_buffer, cst_arena, node_idx, .none)) |inline_view| {
@@ -7822,8 +7899,10 @@ fn checkExternalUseTreeCoreImports(
     sink: *DiagnosticSink,
 ) !void {
     const start_idx: usize = tree_cst.asInt();
-    const tree_rec = cst_arena.getNode(tree_cst);
-    const end_idx = @min(start_idx + @max(@as(usize, tree_rec.subtree_size), 1), cst_arena.countNodes());
+    const end_idx = @min(
+        start_idx + @max(@as(usize, cst_arena.getNode(tree_cst).subtree_size), 1),
+        cst_arena.countNodes(),
+    );
     var has_consumed_segment = false;
 
     var cur = start_idx + 1;
@@ -7847,11 +7926,9 @@ fn checkExternalUseTreeCoreImports(
         if (sub.subtree_size <= 1 and !sub.flags.is_bracketed and !sub.flags.is_missing_or_injected and
             !sub.token.isNone() and sub.token.asInt() < token_buffer.countTokens())
         {
-            const tok_kind = token_buffer.getToken(sub.token).kind;
-            if (isIdentifierToken(tok_kind)) {
+            if (isIdentifierToken(token_buffer.getToken(sub.token).kind)) {
                 if (is_at_root_segment and !has_consumed_segment) {
-                    const lex = extractTokenSlice(source, token_buffer, sub.token);
-                    if (std.mem.eql(u8, lex, "core")) {
+                    if (std.mem.eql(u8, extractTokenSlice(source, token_buffer, sub.token), "core")) {
                         const core_span = token_buffer.getTokenSpan(file_id, sub.token);
                         if (!hasDiagnosticAtSpan(sink, .e0218_direct_core_import_forbidden, core_span)) {
                             try emitDirectCoreImportDiagnostic(sink, interner, core_span);
@@ -8577,7 +8654,7 @@ pub fn resolveFileUseImports(
     cst_arena: *const LosslessCstArena,
     diagnostic_sink: ?*DiagnosticSink,
 ) !void {
-    const effective_cfg = sym_table.effectiveCfgEnvForFile(file_id);
+    const effective_cfg = sym_table.resolveCfgEnvForFile(file_id);
     var i: usize = 0;
     while (i < sym_table.pending_imports.items.len) : (i += 1) {
         const pending = sym_table.pending_imports.items[i];
@@ -9301,8 +9378,7 @@ pub fn extractActiveInlineUseImports(
         const node = cst_arena.getNode(node_idx);
 
         if (node.kind == .mod_item) {
-            const mod_meta = extractItemHeaderMetadata(source, token_buffer, cst_arena, node_idx, .none);
-            if (mod_meta.has_cfg_attr) {
+            if (extractItemHeaderMetadata(source, token_buffer, cst_arena, node_idx, .none).has_cfg_attr) {
                 const is_mod_active = try evaluateCstNodeCfgWithEnv(
                     cfg_env,
                     file_id,
@@ -9372,12 +9448,14 @@ pub fn extractActiveInlineUseImports(
 
 /// Stack-allocated imported `cx.<domain>` alias binding used during `scanFileInactiveCfgCapabilities`.
 const ImportedCapBinding = struct {
-    /// Borrowed identifier lexeme bound by `use cx.<domain>…`.
+    /// Borrowed identifier lexeme bound by `use cx.<domain>…` (`"*"` for wildcard `.star` imports).
     alias_name: []const u8,
     /// `CapabilityBits` mask (`0` when `is_cx_root_alias` is `true`).
     cap_bits: u16 = 0,
     /// `true` when this binding aliases the root `cx` namespace itself (`use cx as std_cx;`).
     is_cx_root_alias: bool = false,
+    /// `true` when produced by a wildcard import (`use cx.<domain>.*;` / `use core.<domain>.*;`).
+    is_wildcard: bool = false,
 };
 
 /// Collects `use cx…` capability alias bindings recursively from `.use_tree` into `bindings[0..binding_count]`.
@@ -9393,12 +9471,15 @@ fn collectUseTreeCapBindings(
     binding_count: *usize,
 ) void {
     const start_idx: usize = tree_cst.asInt();
-    const tree_rec = cst_arena.getNode(tree_cst);
-    const end_idx = @min(start_idx + @max(@as(usize, tree_rec.subtree_size), 1), cst_arena.countNodes());
+    const end_idx = @min(
+        start_idx + @max(@as(usize, cst_arena.getNode(tree_cst).subtree_size), 1),
+        cst_arena.countNodes(),
+    );
 
     var seg_slices: [16][]const u8 = undefined;
     var seg_count: usize = 0;
     var has_seen_as = false;
+    var has_star = false;
     var alias_slice: []const u8 = "";
     var has_nested = false;
 
@@ -9441,6 +9522,8 @@ fn collectUseTreeCapBindings(
             const tok_kind = token_buffer.getToken(sub.token).kind;
             if (tok_kind == .kw_as) {
                 has_seen_as = true;
+            } else if (!has_seen_as and tok_kind == .star) {
+                has_star = true;
             } else if (has_seen_as and isIdentifierToken(tok_kind)) {
                 alias_slice = extractTokenSlice(source, token_buffer, sub.token);
             } else if (!has_seen_as and
@@ -9455,7 +9538,7 @@ fn collectUseTreeCapBindings(
         cur += 1;
     }
 
-    if (has_nested or seg_count == 0 or binding_count.* >= bindings.len) return;
+    if (has_nested or (seg_count == 0 and !has_star) or binding_count.* >= bindings.len) return;
 
     var is_cur_cx = is_prefix_cx_root;
     var cur_cap = prefix_cap_bits;
@@ -9469,6 +9552,25 @@ fn collectUseTreeCapBindings(
             cur_cap = CX_DOMAIN_CAP_MAP.get(seg_str) orelse 0;
             is_cur_cx = false;
         }
+    }
+
+    if (has_star) {
+        const star_caps: u16 = if (cur_cap != 0)
+            cur_cap
+        else if (is_cur_cx)
+            CapabilityBits.LOCKFILE_CAP_BITS
+        else
+            0;
+        if (star_caps != 0) {
+            bindings[binding_count.*] = .{
+                .alias_name = "*",
+                .cap_bits = star_caps,
+                .is_cx_root_alias = false,
+                .is_wildcard = true,
+            };
+            binding_count.* += 1;
+        }
+        return;
     }
 
     const last_seg = seg_slices[seg_count - 1];
@@ -9572,8 +9674,7 @@ pub fn scanFileInactiveCfgCapabilities(
     var binding_count: usize = 0;
     var pre_cur: usize = 0;
     while (pre_cur < total_nodes) : (pre_cur += 1) {
-        const pre_idx = CstNodeIndex.fromInt(@intCast(pre_cur));
-        const pre_node = cst_arena.getNode(pre_idx);
+        const pre_node = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(pre_cur)));
         if (pre_node.kind == .use_item) {
             const item_end = @min(pre_cur + @max(@as(usize, pre_node.subtree_size), 1), total_nodes);
             var sub_cur = pre_cur + 1;
@@ -9666,6 +9767,32 @@ pub fn scanFileInactiveCfgCapabilities(
                     nested_body_end = 0;
                 }
                 const sub_node = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(scan_cur)));
+                if (sub_node.kind == .use_item) {
+                    const use_end = @min(scan_cur + @max(@as(usize, sub_node.subtree_size), 1), subtree_end);
+                    var use_cur = scan_cur + 1;
+                    while (use_cur < use_end) : (use_cur += 1) {
+                        const tree_idx = CstNodeIndex.fromInt(@intCast(use_cur));
+                        if (cst_arena.getNode(tree_idx).kind == .use_tree) {
+                            var local_bindings: [256]ImportedCapBinding = undefined;
+                            var local_count: usize = 0;
+                            collectUseTreeCapBindings(
+                                source,
+                                token_buffer,
+                                cst_arena,
+                                tree_idx,
+                                false,
+                                0,
+                                "",
+                                &local_bindings,
+                                &local_count,
+                            );
+                            for (local_bindings[0..local_count]) |lb| {
+                                subtree_caps |= lb.cap_bits;
+                            }
+                            break;
+                        }
+                    }
+                }
                 if (nested_body_end == 0) {
                     switch (sub_node.kind) {
                         .fn_item,
@@ -9764,7 +9891,9 @@ pub fn scanFileInactiveCfgCapabilities(
                         continue;
                     } else {
                         for (bindings[0..binding_count]) |binding| {
-                            if (std.mem.eql(u8, binding.alias_name, lexeme)) {
+                            if (binding.is_wildcard) {
+                                token_caps |= binding.cap_bits;
+                            } else if (std.mem.eql(u8, binding.alias_name, lexeme)) {
                                 if (binding.is_cx_root_alias) {
                                     is_prev_cx_root = true;
                                 } else {
@@ -9793,6 +9922,7 @@ pub fn scanFileInactiveCfgCapabilities(
 
             result.all_inactive_caps_bits |= subtree_caps;
             if (is_in_pub_context) {
+                result.has_pub_inactive_cfg_items = true;
                 result.pub_inactive_caps_bits |= subtree_caps;
             }
             if (has_link_export) {
@@ -10364,7 +10494,7 @@ test "test_multi_package_scope_isolation_hygiene_and_inactive_cfg_caps" {
     try std.testing.expect(has_e0218);
     try std.testing.expect(has_e0327);
 
-    const file_cfg = sym_table.effectiveCfgEnvForFile(ext_fid);
+    const file_cfg = sym_table.resolveCfgEnvForFile(ext_fid);
     const inactive_scan = scanFileInactiveCfgCapabilities(&file_cfg, ext_fid, ext_src, &tokens, &cst);
     try std.testing.expect((inactive_scan.pub_inactive_caps_bits & CapabilityBits.NET) != 0);
     try std.testing.expect((inactive_scan.pub_inactive_caps_bits & CapabilityBits.FFI) != 0);
@@ -10398,7 +10528,7 @@ test "test_multi_package_scope_isolation_hygiene_and_inactive_cfg_caps" {
     }
     try std.testing.expect(has_inactive_core_e0218);
 
-    const file_cfg_b = sym_table.effectiveCfgEnvForFile(ext_fid_b);
+    const file_cfg_b = sym_table.resolveCfgEnvForFile(ext_fid_b);
     const scan_b = scanFileInactiveCfgCapabilities(&file_cfg_b, ext_fid_b, ext_src_b, &tokens_b, &cst_b);
     try std.testing.expect((scan_b.pub_inactive_caps_bits & CapabilityBits.NET) != 0);
     try std.testing.expect((scan_b.link_ambient_inactive_caps_bits & CapabilityBits.FFI) != 0);

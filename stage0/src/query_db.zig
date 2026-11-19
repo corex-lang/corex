@@ -868,11 +868,17 @@ pub const PackageCfgConfig = struct {
     enabled_features: [][]u8 = &.{},
     /// Optional sorted declared `[features]` names from `corex.toml` (`E0435` guard).
     declared_features: ?[][]u8 = null,
+    /// Pre-built $O(1)$ lookup set over `enabled_features`.
+    enabled_set: std.StringHashMapUnmanaged(void) = .empty,
+    /// Pre-built $O(1)$ lookup set over `declared_features` when `declared_features != null`.
+    declared_set: std.StringHashMapUnmanaged(void) = .empty,
     /// Precomputed 128-bit canonical digest over `(enabled_features, declared_features)`.
     cfg_fingerprint: Fingerprint128 = Fingerprint128.ZERO,
 
-    /// Releases all owned feature slices back to `allocator`.
+    /// Releases all owned feature slices and hash sets back to `allocator`.
     pub fn deinit(self: *PackageCfgConfig, allocator: std.mem.Allocator) void {
+        self.enabled_set.deinit(allocator);
+        self.declared_set.deinit(allocator);
         for (self.enabled_features) |feat_slice| allocator.free(feat_slice);
         if (self.enabled_features.len > 0) allocator.free(self.enabled_features);
         if (self.declared_features) |decl_list| {
@@ -1421,6 +1427,8 @@ pub const MAX_C_IMPORT_CACHE_BYTES: usize = 16 * 1024 * 1024;
 pub const VIRTUAL_C_IMPORT_FILE_ID_BASE: u32 = 0x000F_0000;
 /// Sentinel LRU node index indicating the end of an intrusive `CImportCache` list (`0xFFFF_FFFF`).
 const NONE_C_IMPORT_LRU: u32 = std.math.maxInt(u32);
+/// Distinguishing bit in `CxiTypeRecord.layout_meta[3]` identifying an exported `pub const` record (`DR-17`).
+const CXI_CONST_RECORD_FLAG: u32 = 0x8000_0000;
 /// Reserved synthetic `.source_text` entity index tracking `CompilerDb.target_layout`.
 pub const CONFIG_KEY_TARGET_LAYOUT: u32 = 0xFFFF_FFF0;
 /// Reserved synthetic `.source_text` entity index tracking `CompilerDb.comptime_step_limit`.
@@ -3939,7 +3947,7 @@ pub const CompilerDb = struct {
     is_package_graph_mounted: bool = false,
     /// Per-`PackageId` `@cfg` feature configuration (`PackageId -> PackageCfgConfig`).
     package_cfg_configs: std.AutoHashMapUnmanaged(PackageId, PackageCfgConfig) = .empty,
-    /// Directed dependency edges `(caller_pkg, alias_sym) -> target_pkg_root_file_id` (`P1-1`).
+    /// Directed dependency edges `(caller_pkg, alias_sym) -> target_pkg_root_file_id`.
     package_dep_files: std.AutoHashMapUnmanaged(symbol_resolver.PkgDepKey, FileId) = .empty,
     /// Canonical root `FileId` (`src/root.cx` or `src/main.cx`) per `PackageId`.
     package_root_files: std.AutoHashMapUnmanaged(PackageId, FileId) = .empty,
@@ -4591,13 +4599,38 @@ pub const CompilerDb = struct {
         );
     }
 
+    /// Computes a package-isolated `@c_import` cache key so distinct packages never alias virtual `FileId`s.
+    pub fn computeCImportKeyForPackage(
+        self: *const CompilerDb,
+        caller_pkg: PackageId,
+        header_source_bytes: []const u8,
+        defines: []const []const u8,
+    ) Fingerprint128 {
+        const base_key = self.computeCImportKey(header_source_bytes, defines);
+        if (caller_pkg == .root) return base_key;
+        var pkg_hasher = StructuralHasher.init();
+        pkg_hasher.updateFingerprint(base_key);
+        pkg_hasher.updateU16(caller_pkg.asInt());
+        return pkg_hasher.final();
+    }
+
     /// Looks up a cached `@c_import` translation, verifying and recording all transitive `#include` digests.
     pub fn lookupCImportCache(
         self: *CompilerDb,
         header_source_bytes: []const u8,
         defines: []const []const u8,
     ) ?CImportCacheView {
-        const cache_key = self.computeCImportKey(header_source_bytes, defines);
+        return self.lookupCImportCacheForPackage(.root, header_source_bytes, defines);
+    }
+
+    /// Package-isolated `@c_import` cache lookup verifying all transitive `#include` digests.
+    pub fn lookupCImportCacheForPackage(
+        self: *CompilerDb,
+        caller_pkg: PackageId,
+        header_source_bytes: []const u8,
+        defines: []const []const u8,
+    ) ?CImportCacheView {
+        const cache_key = self.computeCImportKeyForPackage(caller_pkg, header_source_bytes, defines);
         const peeked = self.c_import_cache.peek(cache_key) orelse {
             self.c_import_cache.misses += 1;
             return null;
@@ -4891,7 +4924,27 @@ pub const CompilerDb = struct {
         included_files: []const c_frontend.RecordedIncludeFile,
         explicit_file_id: ?FileId,
     ) !FileId {
-        const cache_key = self.computeCImportKey(header_source_bytes, defines);
+        return self.storeCImportTranslationForPackage(
+            .root,
+            header_source_bytes,
+            defines,
+            translated_cx_text,
+            included_files,
+            explicit_file_id,
+        );
+    }
+
+    /// Registers a package-isolated translated `@c_import` `.cx` module and its `included_files` in `c_import_cache`.
+    pub fn storeCImportTranslationForPackage(
+        self: *CompilerDb,
+        caller_pkg: PackageId,
+        header_source_bytes: []const u8,
+        defines: []const []const u8,
+        translated_cx_text: []const u8,
+        included_files: []const c_frontend.RecordedIncludeFile,
+        explicit_file_id: ?FileId,
+    ) !FileId {
+        const cache_key = self.computeCImportKeyForPackage(caller_pkg, header_source_bytes, defines);
         const virtual_fid: FileId = if (explicit_file_id) |given_fid|
             given_fid
         else if (self.c_import_cache.peek(cache_key)) |existing_view|
@@ -4947,8 +5000,7 @@ pub const CompilerDb = struct {
                 const parent_raw: u32 = @truncate(ext_kv.key_ptr.* >> 32);
                 if (parent_raw == cur_fid.asInt()) {
                     const child_fid = ext_kv.value_ptr.*;
-                    const gop = try visited.getOrPut(self.allocator, child_fid.asInt());
-                    if (!gop.found_existing) {
+                    if (!(try visited.getOrPut(self.allocator, child_fid.asInt())).found_existing) {
                         try queue.append(self.allocator, child_fid);
                     }
                 }
@@ -5022,7 +5074,7 @@ pub const CompilerDb = struct {
         self.bumpConfigInput(CONFIG_KEY_EMBED_SANDBOX);
     }
 
-    /// Toggles multi-package graph mounting (`P1-3` stdlib privilege firewall & flat module scope isolation).
+    /// Toggles multi-package graph mounting (stdlib privilege firewall & flat module scope isolation).
     pub fn setPackageGraphMounted(self: *CompilerDb, is_mounted: bool) void {
         if (self.is_package_graph_mounted == is_mounted and
             self.symbol_table.is_flat_named_module_scopes_suppressed == is_mounted)
@@ -5050,20 +5102,26 @@ pub const CompilerDb = struct {
         }
         for (enabled_features) |feat_str| {
             if (feat_str.len == 0) continue;
-            var is_dup = false;
-            for (sorted_enabled.items) |existing| {
-                if (std.mem.eql(u8, existing, feat_str)) {
-                    is_dup = true;
-                    break;
-                }
-            }
-            if (!is_dup) try sorted_enabled.append(self.allocator, try self.allocator.dupe(u8, feat_str));
+            try sorted_enabled.append(self.allocator, try self.allocator.dupe(u8, feat_str));
         }
         std.mem.sort([]u8, sorted_enabled.items, {}, struct {
+            /// Orders enabled feature strings lexicographically for $O(N)$ adjacent deduplication.
             fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
                 return std.mem.order(u8, lhs, rhs) == .lt;
             }
         }.lessThan);
+        {
+            var write_idx: usize = 0;
+            for (sorted_enabled.items) |feat_item| {
+                if (write_idx > 0 and std.mem.eql(u8, sorted_enabled.items[write_idx - 1], feat_item)) {
+                    self.allocator.free(feat_item);
+                    continue;
+                }
+                sorted_enabled.items[write_idx] = feat_item;
+                write_idx += 1;
+            }
+            sorted_enabled.items.len = write_idx;
+        }
 
         var opt_declared: ?[][]u8 = null;
         errdefer if (opt_declared) |decl_slice| {
@@ -5078,20 +5136,26 @@ pub const CompilerDb = struct {
             }
             for (decl_in) |decl_str| {
                 if (decl_str.len == 0) continue;
-                var is_dup = false;
-                for (sorted_decl.items) |existing| {
-                    if (std.mem.eql(u8, existing, decl_str)) {
-                        is_dup = true;
-                        break;
-                    }
-                }
-                if (!is_dup) try sorted_decl.append(self.allocator, try self.allocator.dupe(u8, decl_str));
+                try sorted_decl.append(self.allocator, try self.allocator.dupe(u8, decl_str));
             }
             std.mem.sort([]u8, sorted_decl.items, {}, struct {
+                /// Orders declared feature strings lexicographically for $O(N)$ adjacent deduplication.
                 fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
                     return std.mem.order(u8, lhs, rhs) == .lt;
                 }
             }.lessThan);
+            {
+                var write_idx: usize = 0;
+                for (sorted_decl.items) |decl_item| {
+                    if (write_idx > 0 and std.mem.eql(u8, sorted_decl.items[write_idx - 1], decl_item)) {
+                        self.allocator.free(decl_item);
+                        continue;
+                    }
+                    sorted_decl.items[write_idx] = decl_item;
+                    write_idx += 1;
+                }
+                sorted_decl.items.len = write_idx;
+            }
             opt_declared = try sorted_decl.toOwnedSlice(self.allocator);
         }
 
@@ -5099,6 +5163,19 @@ pub const CompilerDb = struct {
         errdefer {
             for (owned_enabled) |owned_item| self.allocator.free(owned_item);
             if (owned_enabled.len > 0) self.allocator.free(owned_enabled);
+        }
+
+        var enabled_set: std.StringHashMapUnmanaged(void) = .empty;
+        errdefer enabled_set.deinit(self.allocator);
+        for (owned_enabled) |en_item| {
+            try enabled_set.put(self.allocator, en_item, {});
+        }
+        var declared_set: std.StringHashMapUnmanaged(void) = .empty;
+        errdefer declared_set.deinit(self.allocator);
+        if (opt_declared) |decl_list| {
+            for (decl_list) |decl_item| {
+                try declared_set.put(self.allocator, decl_item, {});
+            }
         }
 
         var cfg_hasher = StructuralHasher.init();
@@ -5123,6 +5200,8 @@ pub const CompilerDb = struct {
         try self.package_cfg_configs.put(self.allocator, pkg_id, .{
             .enabled_features = owned_enabled,
             .declared_features = opt_declared,
+            .enabled_set = enabled_set,
+            .declared_set = declared_set,
             .cfg_fingerprint = computed_fp,
         });
 
@@ -5148,13 +5227,11 @@ pub const CompilerDb = struct {
         if (opt_declared) |decl_list| {
             try self.symbol_table.registerPackageFeatureManifest(pkg_id);
             for (decl_list) |decl_name| {
-                const feat_sym = try self.interner.intern(decl_name);
-                try self.symbol_table.declarePackageFeature(pkg_id, feat_sym);
+                try self.symbol_table.declarePackageFeature(pkg_id, try self.interner.intern(decl_name));
             }
         }
         for (owned_enabled) |en_name| {
-            const feat_sym = try self.interner.intern(en_name);
-            try self.symbol_table.enablePackageFeature(pkg_id, feat_sym);
+            try self.symbol_table.enablePackageFeature(pkg_id, try self.interner.intern(en_name));
         }
 
         if (!Fingerprint128.eql(prev_fp, computed_fp)) {
@@ -5172,7 +5249,7 @@ pub const CompilerDb = struct {
         }
     }
 
-    /// Binds a per-package dependency edge `(caller_pkg_id, alias_sym) -> target_root_file_id` (`P1-1`).
+    /// Binds a per-package dependency edge `(caller_pkg_id, alias_sym) -> target_root_file_id`.
     pub fn bindPackageDepFile(
         self: *CompilerDb,
         caller_pkg_id: PackageId,
@@ -5226,7 +5303,13 @@ pub const CompilerDb = struct {
         try self.package_cap_policies.put(self.allocator, pkg_id, cloned_policy);
     }
 
-    /// Returns `true` iff `file_id` holds first-party `std_core` privileges (`P1-3` firewall).
+    /// Returns `true` if `file_id`'s package policy grants `allow_caps = ["comptime_io"]`.
+    pub fn hasComptimeIoCapForFile(self: *const CompilerDb, file_id: FileId) bool {
+        const pkg_id = self.symbol_table.getFilePackageId(file_id);
+        return if (self.package_cap_policies.get(pkg_id)) |pol| pol.has_comptime_io_cap else false;
+    }
+
+    /// Returns `true` iff `file_id` holds first-party `std_core` privileges.
     pub fn isStdlibFile(self: *const CompilerDb, file_id: FileId) bool {
         const pkg_id = self.symbol_table.getFilePackageId(file_id);
         if (pkg_id == .std_core) return true;
@@ -5235,7 +5318,7 @@ pub const CompilerDb = struct {
         return if (self.source_inputs.get(file_id.asInt())) |inp| inp.durability == .high else false;
     }
 
-    /// Returns `true` iff `file_id` is permitted to import `core.*` intrinsics directly (`P1-3` firewall).
+    /// Returns `true` iff `file_id` is permitted to import `core.*` intrinsics directly.
     pub fn isCoreAllowedForFile(self: *CompilerDb, file_id: FileId) bool {
         const is_global_core = self.readInternalCore();
         const pkg_id = self.symbol_table.getFilePackageId(file_id);
@@ -5244,10 +5327,9 @@ pub const CompilerDb = struct {
         return is_global_core or self.isStdlibFile(file_id);
     }
 
-    /// Returns `true` iff `test`/`bench` items should be retained for `file_id` (`false` for external deps, `P1-2`).
-    pub fn effectiveIncludeTestsForFile(self: *CompilerDb, file_id: FileId) QueryError!bool {
-        const global_include = try self.readIncludeTests();
-        if (!global_include) return false;
+    /// Returns `true` iff `test`/`bench` items should be retained for `file_id` (`false` for external deps).
+    pub fn isIncludingTestsForFile(self: *CompilerDb, file_id: FileId) QueryError!bool {
+        if (!(try self.readIncludeTests())) return false;
         const pkg_id = self.symbol_table.getFilePackageId(file_id);
         if (pkg_id == .root) return true;
         if (pkg_id == .std_core and !self.is_package_graph_mounted) return true;
@@ -5256,29 +5338,32 @@ pub const CompilerDb = struct {
 
     /// Returns the precomputed 128-bit `@cfg` feature fingerprint for `file_id`'s `PackageId`.
     pub fn getPackageCfgFingerprint(self: *const CompilerDb, file_id: FileId) Fingerprint128 {
-        const pkg_id = self.symbol_table.getFilePackageId(file_id);
-        if (self.package_cfg_configs.get(pkg_id)) |cfg_rec| return cfg_rec.cfg_fingerprint;
+        if (self.package_cfg_configs.get(self.symbol_table.getFilePackageId(file_id))) |cfg_rec| {
+            return cfg_rec.cfg_fingerprint;
+        }
         return Fingerprint128.ZERO;
     }
 
-    /// Constructs the package-scoped `CfgEnv` for `file_id` (`P1-2` & `E0435` feature allowlist).
-    pub fn effectiveCfgEnvForFile(
+    /// Constructs the package-scoped `CfgEnv` for `file_id` (`E0435` feature allowlist).
+    pub fn resolveCfgEnvForFile(
         self: *const CompilerDb,
         file_id: FileId,
         is_file_including_tests: bool,
     ) type_system.CfgEnv {
         const pkg_id = self.symbol_table.getFilePackageId(file_id);
-        const allow_tests = (pkg_id == .root) or (pkg_id == .std_core and !self.is_package_graph_mounted);
+        const is_tests_allowed = (pkg_id == .root) or (pkg_id == .std_core and !self.is_package_graph_mounted);
         var cfg_env = type_system.CfgEnv.fromTargetSpec(
             self.target_spec,
-            allow_tests and is_file_including_tests,
+            is_tests_allowed and is_file_including_tests,
         );
         cfg_env.owner_pkg_id = pkg_id;
         cfg_env.sym_table_features = &self.symbol_table;
-        if (self.package_cfg_configs.get(pkg_id)) |cfg_rec| {
+        if (self.package_cfg_configs.getPtr(pkg_id)) |cfg_rec| {
             cfg_env.enabled_features = cfg_rec.enabled_features;
+            cfg_env.enabled_feature_set = &cfg_rec.enabled_set;
             if (cfg_rec.declared_features) |decl_feats| {
                 cfg_env.declared_features = decl_feats;
+                cfg_env.declared_feature_set = &cfg_rec.declared_set;
             }
         }
         return cfg_env;
@@ -5681,7 +5766,7 @@ pub const CompilerDb = struct {
         // [2] Probe `CImportCache` (`128` entries / `16 MiB` bounded LRU; isolated per `PackageId`):
         const active_defines: []const []const u8 = if (caller_pkg == .root) db.c_import_defines.items else &.{};
         var virtual_fid: FileId = .none;
-        if (db.lookupCImportCache(resolved_hdr.bytes, active_defines)) |cached_view| {
+        if (db.lookupCImportCacheForPackage(caller_pkg, resolved_hdr.bytes, active_defines)) |cached_view| {
             if (sym_table.getFilePackageId(cached_view.virtual_file_id) == caller_pkg) {
                 virtual_fid = cached_view.virtual_file_id;
             }
@@ -5706,6 +5791,7 @@ pub const CompilerDb = struct {
             defer search_dirs.deinit(db.allocator);
             var owned_inferred_prefix: ?[]u8 = null;
             defer if (owned_inferred_prefix) |pref| db.allocator.free(pref);
+            var strict_virtual_root: ?[]const u8 = null;
 
             const inc_loader: c_frontend.CIncludeLoader = switch (active_jail) {
                 .cxtree_only => |cx_jail| blk_cx: {
@@ -5722,6 +5808,7 @@ pub const CompilerDb = struct {
                         }
                     }
                     if (pkg_prefix.len > 0) {
+                        strict_virtual_root = pkg_prefix;
                         try search_dirs.append(db.allocator, pkg_prefix);
                     }
                     // Check `resolved_hdr.bytes` for `#include` traversal escaping `pkg_prefix`:
@@ -5826,7 +5913,13 @@ pub const CompilerDb = struct {
                             try search_dirs.append(db.allocator, inc_dir);
                         }
                     }
-                    break :blk_host if (db.embed_io) |io_h| .{ .host_fs = io_h } else .none;
+                    break :blk_host if (db.embed_io) |io_h| .{
+                        .jailed_host_fs = .{
+                            .io = io_h,
+                            .jail_dir = jail_dir,
+                            .extra_allowed_dirs = if (caller_pkg == .root) db.c_import_include_dirs.items else &.{},
+                        },
+                    } else .none;
                 },
                 .unrestricted_legacy => blk_leg: {
                     if (db.virtual_files) |vfs_map| {
@@ -5859,6 +5952,9 @@ pub const CompilerDb = struct {
                 .include_dirs = search_dirs.items,
                 .virtual_headers = vfs_headers.items,
                 .include_loader = inc_loader,
+                .is_strict_sandbox = active_jail != .unrestricted_legacy,
+                .strict_virtual_root = strict_virtual_root,
+                .sandbox_caller_file_id = caller_file_id,
             };
             var unit = c_frontend.parseCHeader(
                 db.allocator,
@@ -5918,7 +6014,8 @@ pub const CompilerDb = struct {
                 _ = db.recordPackageEmbeddedFileRead(caller_pkg, inc_file.path, inc_file.content) catch {};
             }
 
-            virtual_fid = try db.storeCImportTranslationWithIncludes(
+            virtual_fid = try db.storeCImportTranslationForPackage(
+                caller_pkg,
                 resolved_hdr.bytes,
                 active_defines,
                 translated_cx,
@@ -6527,7 +6624,6 @@ pub const CompilerDb = struct {
             std.mem.sort(u16, pkg_ids.items, {}, std.sort.asc(u16));
             for (pkg_ids.items) |raw_pkg_id| {
                 const pkg_handle = PackageId.fromInt(raw_pkg_id);
-                if (pkg_handle == .root) continue;
                 if (self.package_root_files.get(pkg_handle)) |pkg_fid| {
                     if (pkg_fid != root_file_id) {
                         try self.appendModuleSubtreePostOrder(pkg_fid, &seen_files, out_files, 0);
@@ -6769,12 +6865,17 @@ pub const CompilerDb = struct {
         defer file_tokens.deinit(self.allocator);
         try self.populateFileTokensMap(&file_tokens);
 
+        const prev_entry_fid = self.symbol_table.active_entry_file_id;
+        self.symbol_table.active_entry_file_id = root_file_id;
+        defer self.symbol_table.active_entry_file_id = prev_entry_fid;
+
         return backend.emitModule(self.allocator, .{
             .bodies = working_bodies.items,
             .pool = &self.type_pool,
             .sym_table = &self.symbol_table,
             .interner = &self.interner,
             .module_name = options.module_name,
+            .entry_file_id = root_file_id,
             .vfs_source_map = options.vfs_source_map orelse self.vfs_source_map,
             .file_tokens = &file_tokens,
             .rodata_pool = &self.rodata_pool,
@@ -7300,7 +7401,7 @@ pub const CompilerDb = struct {
         file_id: FileId,
         lowered: LoweredAstArtifact,
     ) QueryError!*const ItemTree {
-        const is_including_tests = try self.effectiveIncludeTestsForFile(file_id);
+        const is_including_tests = try self.isIncludingTestsForFile(file_id);
         const pkg_cfg_fp = self.getPackageCfgFingerprint(file_id);
         if (self.item_trees.getPtr(file_id.asInt())) |existing_tree| {
             if (Fingerprint128.eql(existing_tree.source_ast_fingerprint, lowered.ast_fingerprint) and
@@ -8143,6 +8244,16 @@ pub const CompilerDb = struct {
         public_hasher.updateU32(pub_child_count);
     }
 
+    /// Pending migration of a cached `FnRegionSummary` from a detached `SymbolIndex` to its re-collected slot.
+    const SymSummaryMigration = struct {
+        /// Previous detached `SymbolIndex.asInt()` key.
+        old_idx: u32,
+        /// Freshly collected `SymbolIndex.asInt()` key in `[sym_start .. sym_end)`.
+        new_idx: u32,
+        /// Preserved 40-byte SAST region/effect summary.
+        summary: mir_sast.FnRegionSummary,
+    };
+
     /// Runs Pass-1 `collectFileModuleItems` at most once per `(target_fid, current_revision)` before Pass-2 consumes it.
     fn ensureFilePass1Collected(
         self: *CompilerDb,
@@ -8162,9 +8273,9 @@ pub const CompilerDb = struct {
         {
             _ = try self.parseCst(target_fid);
         }
-        const target_include_tests = try self.effectiveIncludeTestsForFile(target_fid);
-        const target_core_allowed = self.isCoreAllowedForFile(target_fid);
-        const target_cfg = self.effectiveCfgEnvForFile(target_fid, target_include_tests);
+        const is_target_including_tests = try self.isIncludingTestsForFile(target_fid);
+        const is_target_core_allowed = self.isCoreAllowedForFile(target_fid);
+        const target_cfg = self.resolveCfgEnvForFile(target_fid, is_target_including_tests);
 
         const input_ptr = self.source_inputs.getPtr(target_fid.asInt()) orelse {
             return .{ .created_revision = self.current_revision };
@@ -8176,8 +8287,8 @@ pub const CompilerDb = struct {
         const was_core_allowed = self.symbol_table.is_internal_core;
         const had_included_tests = self.symbol_table.is_including_tests;
         const prev_cfg_env = self.symbol_table.cfg_env;
-        self.symbol_table.is_internal_core = target_core_allowed;
-        self.symbol_table.is_including_tests = target_include_tests;
+        self.symbol_table.is_internal_core = is_target_core_allowed;
+        self.symbol_table.is_including_tests = is_target_including_tests;
         self.symbol_table.cfg_env = target_cfg;
         defer {
             self.symbol_table.is_internal_core = was_core_allowed;
@@ -8208,7 +8319,7 @@ pub const CompilerDb = struct {
         const sync_entries = (try self.extractItemTree(target_fid)).entries;
         try self.syncFlattenedExternDefIds(
             target_fid,
-            target_include_tests,
+            is_target_including_tests,
             parsed_ptr,
             sync_entries,
             sym_start,
@@ -8217,11 +8328,6 @@ pub const CompilerDb = struct {
 
         // Migrate cached per-symbol SAST summaries (`sast_sym_summaries`) from detached revisions to `[sym_start .. sym_end)`:
         if (self.sast_sym_summaries.count() > 0 and sym_end > sym_start) {
-            const SymSummaryMigration = struct {
-                old_idx: u32,
-                new_idx: u32,
-                summary: mir_sast.FnRegionSummary,
-            };
             var migrations: std.ArrayListUnmanaged(SymSummaryMigration) = .empty;
             defer migrations.deinit(self.allocator);
             var sum_it = self.sast_sym_summaries.iterator();
@@ -8270,7 +8376,17 @@ pub const CompilerDb = struct {
         return state;
     }
 
-    /// Pre-collects Pass-1 module scopes across `pkg_id`'s entire `mod` subtree before any Pass-2 `use pkg.…` resolves (`P1-1`).
+    /// Directed intra-package `mod <name>;` parent-to-child file edge collected during BFS traversal.
+    const ModLink = struct {
+        /// Parent module `FileId` containing `mod <name>;`.
+        parent_fid: FileId,
+        /// Interned child module identifier (`SymbolId`).
+        mod_sym: SymbolId,
+        /// Resolved child module `FileId`.
+        child_fid: FileId,
+    };
+
+    /// Pre-collects Pass-1 module scopes across `pkg_id`'s entire `mod` subtree before any Pass-2 `use pkg.…` resolves.
     fn ensurePackageSubtreePass1(
         self: *CompilerDb,
         pkg_id: PackageId,
@@ -8278,11 +8394,6 @@ pub const CompilerDb = struct {
         caller_fid: FileId,
     ) QueryError!void {
         const pkg_root_fid = self.package_root_files.get(pkg_id) orelse return;
-        const ModLink = struct {
-            parent_fid: FileId,
-            mod_sym: SymbolId,
-            child_fid: FileId,
-        };
         var subtree_files: std.ArrayListUnmanaged(FileId) = .empty;
         defer subtree_files.deinit(self.allocator);
         var mod_links: std.ArrayListUnmanaged(ModLink) = .empty;
@@ -8312,6 +8423,7 @@ pub const CompilerDb = struct {
                 }
             }
             std.mem.sort(ModLink, local_links.items, {}, struct {
+                /// Orders sibling `ModLink` edges deterministically by `mod_sym` ID.
                 fn lessThan(_: void, lhs: ModLink, rhs: ModLink) bool {
                     return lhs.mod_sym.asInt() < rhs.mod_sym.asInt();
                 }
@@ -8319,8 +8431,7 @@ pub const CompilerDb = struct {
 
             for (local_links.items) |link| {
                 try mod_links.append(self.allocator, link);
-                const gop = try visited.getOrPut(self.allocator, link.child_fid.asInt());
-                if (!gop.found_existing) {
+                if (!(try visited.getOrPut(self.allocator, link.child_fid.asInt())).found_existing) {
                     try subtree_files.append(self.allocator, link.child_fid);
                 }
             }
@@ -8330,8 +8441,7 @@ pub const CompilerDb = struct {
             if (member_fid != caller_fid and
                 !self.in_flight_keys.contains(QueryKey.forFile(.item_tree, member_fid).asU64()))
             {
-                const member_tree = try self.extractItemTree(member_fid);
-                hasher.updateFingerprint(member_tree.tree_fingerprint);
+                hasher.updateFingerprint((try self.extractItemTree(member_fid)).tree_fingerprint);
             }
             _ = try self.ensureFilePass1Collected(member_fid, pkg_id);
         }
@@ -8364,7 +8474,7 @@ pub const CompilerDb = struct {
         const is_stdlib = self.isStdlibFile(file_id);
         const is_core_allowed = self.isCoreAllowedForFile(file_id);
         const pkg_cfg_fp = self.getPackageCfgFingerprint(file_id);
-        const eff_cfg = self.effectiveCfgEnvForFile(file_id, is_including_tests);
+        const eff_cfg = self.resolveCfgEnvForFile(file_id, is_including_tests);
         try self.unwindIfCancelled();
 
         var hasher = StructuralHasher.init();
@@ -8442,7 +8552,7 @@ pub const CompilerDb = struct {
             }
         }
 
-        // Resolve per-package dependency bindings `(caller_pkg, alias_sym) -> dep_root_fid` (`P1-1` `.cxi` cutoff):
+        // Resolve per-package dependency bindings `(caller_pkg, alias_sym) -> dep_root_fid` (`.cxi` cutoff):
         if (self.package_dep_files.count() > 0) {
             var dep_aliases: std.ArrayListUnmanaged(SymbolId) = .empty;
             defer dep_aliases.deinit(self.allocator);
@@ -8453,6 +8563,7 @@ pub const CompilerDb = struct {
                 }
             }
             std.mem.sort(SymbolId, dep_aliases.items, {}, struct {
+                /// Orders dependency alias `SymbolId` handles deterministically for signature hashing.
                 fn lessThan(_: void, lhs: SymbolId, rhs: SymbolId) bool {
                     return lhs.asInt() < rhs.asInt();
                 }
@@ -8479,7 +8590,7 @@ pub const CompilerDb = struct {
             }
         }
 
-        // Pre-collect intra-package Pass-1 scopes across `caller_pkg` so `use pkg.…` works from any submodule (`P1-1`):
+        // Pre-collect intra-package Pass-1 scopes across `caller_pkg` so `use pkg.…` works from any submodule:
         if (self.package_root_files.contains(caller_pkg)) {
             try self.ensurePackageSubtreePass1(caller_pkg, &hasher, file_id);
         }
@@ -8923,7 +9034,7 @@ pub const CompilerDb = struct {
         const parsed_ptr = self.parsed_artifacts.getPtr(file_id.asInt()) orelse return;
         if (Fingerprint128.eql(sync_ptr.ast_fingerprint, parsed_ptr.ast_fingerprint)) return;
         const input_ptr = self.source_inputs.getPtr(file_id.asInt()) orelse return;
-        const is_including_tests = try self.effectiveIncludeTestsForFile(file_id);
+        const is_including_tests = try self.isIncludingTestsForFile(file_id);
 
         const fn_handles = try symbol_resolver.collectFileFnDeclHandlesWithOptions(
             self.allocator,
@@ -8964,7 +9075,7 @@ pub const CompilerDb = struct {
             const active_layout = try self.readTargetLayout();
             const is_stdlib = self.isStdlibFile(file_id);
             const is_core_allowed = self.isCoreAllowedForFile(file_id);
-            const eff_cfg = self.effectiveCfgEnvForFile(file_id, is_including_tests);
+            const eff_cfg = self.resolveCfgEnvForFile(file_id, is_including_tests);
             const was_core_allowed = self.symbol_table.is_internal_core;
             const prev_cfg = self.symbol_table.cfg_env;
             self.symbol_table.is_internal_core = is_core_allowed;
@@ -9102,11 +9213,11 @@ pub const CompilerDb = struct {
         const def_sig = try self.getDefSignature(def_id);
         const body_window = try self.getBodyAstProj(def_id);
         const active_layout = try self.readTargetLayout();
-        const is_including_tests = try self.effectiveIncludeTestsForFile(file_id);
+        const is_including_tests = try self.isIncludingTestsForFile(file_id);
         const is_stdlib = self.isStdlibFile(file_id);
         const is_core_allowed = self.isCoreAllowedForFile(file_id);
         const pkg_cfg_fp = self.getPackageCfgFingerprint(file_id);
-        const eff_cfg = self.effectiveCfgEnvForFile(file_id, is_including_tests);
+        const eff_cfg = self.resolveCfgEnvForFile(file_id, is_including_tests);
         try self.unwindIfCancelled();
 
         var body_err_count: u32 = 0;
@@ -9600,7 +9711,8 @@ pub const CompilerDb = struct {
     }
 
     /// Resolves cross-`DefId` `FnRegionSummary` dependencies via `getSastSummaryProj` (34-byte Early Cutoff).
-    fn resolveDbCalleeSummary(
+    /// Resolves a finalized 40-byte `FnRegionSummary` for `(callee_def, callee_sym)` across `CompilerDb`.
+    pub fn resolveDbCalleeSummary(
         compiler_db_opt: ?*CompilerDb,
         summary_map_opt: ?*const std.AutoHashMapUnmanaged(u32, mir_sast.FnRegionSummary),
         callee_def: DefId,
@@ -9666,6 +9778,7 @@ pub const CompilerDb = struct {
         active_layout: TargetLayout,
         out_bodies: *std.ArrayListUnmanaged(mir.MirBody),
         out_is_comptime: *bool,
+        sast_sink: ?*DiagnosticSink,
     ) QueryError!void {
         const target_file = target_def.fileId();
         const parsed_ptr = self.parsed_artifacts.getPtr(target_file.asInt()) orelse return;
@@ -9689,12 +9802,12 @@ pub const CompilerDb = struct {
         var hir_scratch_sink = DiagnosticSink.init(self.allocator);
         defer hir_scratch_sink.deinit();
         const eval_hook = mir_vm.makeComptimeEvalHook(self, target_def.asInt());
-        const target_inc_tests = try self.effectiveIncludeTestsForFile(target_file);
-        const target_eff_cfg = self.effectiveCfgEnvForFile(target_file, target_inc_tests);
+        const is_target_including_tests = try self.isIncludingTestsForFile(target_file);
+        const target_eff_cfg = self.resolveCfgEnvForFile(target_file, is_target_including_tests);
         const prev_sast_cfg = self.symbol_table.cfg_env;
         const prev_sast_inc = self.symbol_table.is_including_tests;
         self.symbol_table.cfg_env = target_eff_cfg;
-        self.symbol_table.is_including_tests = target_inc_tests;
+        self.symbol_table.is_including_tests = is_target_including_tests;
         defer {
             self.symbol_table.cfg_env = prev_sast_cfg;
             self.symbol_table.is_including_tests = prev_sast_inc;
@@ -9723,7 +9836,16 @@ pub const CompilerDb = struct {
             else => return error.OutOfMemory,
         };
         defer store.deinit();
-        if (hir_scratch_sink.error_count != 0) return;
+        if (hir_scratch_sink.error_count != 0) {
+            if (sast_sink) |dst_sink| {
+                for (hir_scratch_sink.diagnostics.items) |diag_item| {
+                    if (diag_item.code == .e0325_comptime_sandbox_violation) {
+                        dst_sink.emit(diag_item) catch return error.OutOfMemory;
+                    }
+                }
+            }
+            return;
+        }
 
         var mir_scratch_sink = DiagnosticSink.init(self.allocator);
         defer mir_scratch_sink.deinit();
@@ -9889,6 +10011,10 @@ pub const CompilerDb = struct {
             var local_tok_buf = self.parsed_artifacts.getPtr(file_id.asInt()).?.token_buffer;
             var local_cst_arena = self.parsed_artifacts.getPtr(file_id.asInt()).?.cst_arena;
             const src_text = self.source_inputs.getPtr(file_id.asInt()).?.owned_text;
+            const has_ct_io = self.hasComptimeIoCapForFile(file_id);
+            const was_sast_core = self.symbol_table.is_internal_core;
+            self.symbol_table.is_internal_core = self.isCoreAllowedForFile(file_id);
+            defer self.symbol_table.is_internal_core = was_sast_core;
 
             var active_bodies: std.ArrayListUnmanaged(mir.MirBody) = .empty;
             defer {
@@ -9901,6 +10027,7 @@ pub const CompilerDb = struct {
                 active_layout,
                 &active_bodies,
                 &is_comptime_item,
+                &local_sast_sink,
             );
 
             const primary_len = active_bodies.items.len;
@@ -9915,6 +10042,7 @@ pub const CompilerDb = struct {
                         .diagnostic_sink = &local_sast_sink,
                         .is_sast_strict = is_strict,
                         .is_comptime_context = is_comptime_item,
+                        .has_comptime_io_cap = has_ct_io,
                         .primary_body_count = primary_len,
                         .source_text = src_text,
                         .token_buffer = &local_tok_buf,
@@ -9966,6 +10094,7 @@ pub const CompilerDb = struct {
                         active_layout,
                         &active_bodies,
                         &is_dummy_ct,
+                        &local_sast_sink,
                     );
                     const rerun_primary_len = active_bodies.items.len;
                     for (peers_snapshot) |peer_def| {
@@ -9981,6 +10110,7 @@ pub const CompilerDb = struct {
                                 active_layout,
                                 &active_bodies,
                                 &is_peer_ct,
+                                null,
                             );
                         }
                     }
@@ -9998,6 +10128,7 @@ pub const CompilerDb = struct {
                             .diagnostic_sink = &local_sast_sink,
                             .is_sast_strict = is_strict,
                             .is_comptime_context = is_comptime_item,
+                            .has_comptime_io_cap = has_ct_io,
                             .primary_body_count = rerun_primary_len,
                             .source_text = refreshed_src,
                             .token_buffer = &local_tok_buf,
@@ -10149,13 +10280,13 @@ pub const CompilerDb = struct {
 
         try self.syncDefWindowAndSideTables(def_id, parsed_ptr, body_window.item_ast_node);
 
-        const hir_inc_tests = try self.effectiveIncludeTestsForFile(file_id);
-        const hir_eff_cfg = self.effectiveCfgEnvForFile(file_id, hir_inc_tests);
+        const is_hir_including_tests = try self.isIncludingTestsForFile(file_id);
+        const hir_eff_cfg = self.resolveCfgEnvForFile(file_id, is_hir_including_tests);
         const hir_pkg_cfg_fp = self.getPackageCfgFingerprint(file_id);
         const prev_hir_cfg = self.symbol_table.cfg_env;
         const prev_hir_inc = self.symbol_table.is_including_tests;
         self.symbol_table.cfg_env = hir_eff_cfg;
-        self.symbol_table.is_including_tests = hir_inc_tests;
+        self.symbol_table.is_including_tests = is_hir_including_tests;
         defer {
             self.symbol_table.cfg_env = prev_hir_cfg;
             self.symbol_table.is_including_tests = prev_hir_inc;
@@ -10374,6 +10505,7 @@ pub const CompilerDb = struct {
                 .{
                     .diagnostic_sink = &gate_sink,
                     .is_comptime_context = true,
+                    .has_comptime_io_cap = self.hasComptimeIoCapForFile(file_id),
                     .source_text = src_opt,
                     .token_buffer = if (parsed_opt) |pp| &pp.token_buffer else null,
                     .cst_arena = if (parsed_opt) |pp| &pp.cst_arena else null,
@@ -10672,6 +10804,359 @@ pub const CompilerDb = struct {
 
     // ------- Phase 9 `.cxi` Digest & Workspace Cap Sandbox --------
 
+    /// Appends a canonical `CxiFnRecord` for `(sym_idx, sym)` under `path_hash64`.
+    fn appendCxiFnRecordForSymbol(
+        self: *CompilerDb,
+        fn_records: *std.ArrayListUnmanaged(pkg_cxi_seam.CxiFnRecord),
+        path_hash64: u64,
+        sym_idx: SymbolIndex,
+        sym: symbol_resolver.SymbolRecord,
+    ) !void {
+        var sig_hasher = StructuralHasher.init();
+        hashTypeCanonical(&sig_hasher, &self.type_pool, &self.symbol_table, sym.type_id);
+        for (self.symbol_table.getFnParamSpecs(sym_idx)) |pspec| {
+            if (!pspec.is_positional_only) {
+                hashSymbolTextCanonical(&sig_hasher, &self.interner, pspec.name);
+            }
+            sig_hasher.updateU8(@intFromBool(pspec.has_default));
+        }
+        const sig_fp = sig_hasher.final();
+        var fn_sum = if (self.sast_sym_summaries.get(sym_idx.asInt())) |msum|
+            msum
+        else if (!sym.def_id.isNone())
+            (self.sast_summaries.get(sym.def_id.asInt()) orelse mir_sast.FnRegionSummary{})
+        else
+            mir_sast.FnRegionSummary{};
+        if ((sym.def_id.isNone() or !self.sast_summaries.contains(sym.def_id.asInt())) and
+            !self.sast_sym_summaries.contains(sym_idx.asInt()))
+        {
+            const proto_bits = mir_sast.inferSymbolBoundaryOrPrototypeEffects(&self.symbol_table, sym_idx).asBits();
+            fn_sum.direct_effects_bits |= proto_bits;
+            fn_sum.inferred_effects_bits |= proto_bits;
+        }
+        var obs_buf: [34]u8 = undefined;
+        fn_sum.writeObservableBytes(&obs_buf);
+        var sum_words: [5]u64 = @splat(0);
+        @memcpy(std.mem.sliceAsBytes(&sum_words)[0..34], &obs_buf);
+
+        try fn_records.append(self.allocator, .{
+            .symbol_path_hash = path_hash64,
+            .sig_type_hash = sig_fp.low,
+            .shape_hash64 = sig_fp.high,
+            .summary_bits = sum_words,
+        });
+    }
+
+    /// Appends a canonical `CxiTypeRecord` for a nominal or alias type `sym` under `path_hash64`.
+    fn appendCxiTypeRecordForSymbol(
+        self: *CompilerDb,
+        type_records: *std.ArrayListUnmanaged(pkg_cxi_seam.CxiTypeRecord),
+        path_hash64: u64,
+        sym: symbol_resolver.SymbolRecord,
+        active_layout: TargetLayout,
+    ) !void {
+        const field_h64 = computeNominalFieldHash64(
+            &self.type_pool,
+            &self.symbol_table,
+            sym.type_id,
+            active_layout,
+        ).asInt();
+        const layout_rec = buildCxTypeLayoutRecord(
+            &self.type_pool,
+            &self.symbol_table,
+            sym.type_id,
+            active_layout,
+        );
+        const byte_align_u32: u32 = if (layout_rec.align_log2 < 32)
+            @as(u32, 1) << @intCast(layout_rec.align_log2)
+        else
+            1;
+        try type_records.append(self.allocator, .{
+            .symbol_path_hash = path_hash64,
+            .shape_hash64 = layout_rec.layout_shape_hash64,
+            .field_hash64 = field_h64,
+            .layout_meta = .{
+                layout_rec.byte_size,
+                byte_align_u32,
+                @as(u32, layout_rec.fields_len),
+                @as(u32, layout_rec.kind_flags),
+            },
+        });
+    }
+
+    /// Appends a canonical `CxiTypeRecord` tagged with `CXI_CONST_RECORD_FLAG` for an exported `pub const`.
+    fn appendCxiConstRecordForSymbol(
+        self: *CompilerDb,
+        type_records: *std.ArrayListUnmanaged(pkg_cxi_seam.CxiTypeRecord),
+        path_hash64: u64,
+        sym: symbol_resolver.SymbolRecord,
+    ) QueryError!void {
+        var ty_hasher = StructuralHasher.init();
+        hashTypeCanonical(&ty_hasher, &self.type_pool, &self.symbol_table, sym.type_id);
+        const type_fp = ty_hasher.final();
+
+        var val_fp: Fingerprint128 = .{ .low = 0, .high = 0 };
+        var has_eval_fp = false;
+        if (!sym.def_id.isNone() and self.source_inputs.contains(sym.def_id.fileId().asInt())) {
+            if (self.evalComptimeDef(sym.def_id)) |eval_art| {
+                if (!eval_art.has_errors) {
+                    val_fp = eval_art.value_fingerprint;
+                    has_eval_fp = true;
+                }
+            } else |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Cancelled => return error.Cancelled,
+                else => {},
+            }
+        }
+        if (!has_eval_fp) {
+            var fallback_hasher = StructuralHasher.init();
+            fallback_hasher.updateU64(type_fp.low);
+            fallback_hasher.updateU64(type_fp.high);
+            if (!sym.decl_span.file_id.isNone()) {
+                if (self.source_inputs.getPtr(sym.decl_span.file_id.asInt())) |inp_ptr| {
+                    if (self.parsed_artifacts.getPtr(sym.decl_span.file_id.asInt())) |parsed_ptr| {
+                        if (!sym.cst_node.isNone() and sym.cst_node.asInt() < parsed_ptr.cst_arena.countNodes()) {
+                            const start_cst: usize = sym.cst_node.asInt();
+                            const root_cst = parsed_ptr.cst_arena.getNode(sym.cst_node);
+                            const end_cst = @min(
+                                start_cst + @max(@as(usize, root_cst.subtree_size), 1),
+                                parsed_ptr.cst_arena.countNodes(),
+                            );
+                            const total_toks = parsed_ptr.token_buffer.countTokens();
+                            var cst_cur = start_cst;
+                            while (cst_cur < end_cst) : (cst_cur += 1) {
+                                const leaf = parsed_ptr.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cst_cur)));
+                                if (leaf.subtree_size <= 1 and !leaf.flags.is_bracketed and
+                                    !leaf.flags.is_missing_or_injected and !leaf.token.isNone() and
+                                    leaf.token.asInt() < total_toks)
+                                {
+                                    fallback_hasher.updateBytes(symbol_resolver.extractTokenSlice(
+                                        inp_ptr.owned_text,
+                                        &parsed_ptr.token_buffer,
+                                        leaf.token,
+                                    ));
+                                }
+                            }
+                        } else {
+                            const s_start = @min(@as(usize, sym.decl_span.start_byte), inp_ptr.owned_text.len);
+                            const s_end = @min(@as(usize, sym.decl_span.end_byte), inp_ptr.owned_text.len);
+                            if (s_end > s_start) fallback_hasher.updateBytes(inp_ptr.owned_text[s_start..s_end]);
+                        }
+                    }
+                }
+            }
+            val_fp = fallback_hasher.final();
+        }
+
+        try type_records.append(self.allocator, .{
+            .symbol_path_hash = path_hash64,
+            .shape_hash64 = type_fp.low,
+            .field_hash64 = val_fp.low,
+            .layout_meta = .{
+                @truncate(type_fp.high),
+                @truncate(type_fp.high >> 32),
+                @truncate(val_fp.high),
+                CXI_CONST_RECORD_FLAG,
+            },
+        });
+    }
+
+    /// Computes `LOCKFILE_CAP_BITS` contributed by re-exporting `(sym_idx, sym)` (`depth < 8`).
+    fn computeSymbolReexportCapBits(
+        self: *CompilerDb,
+        sym_idx: SymbolIndex,
+        sym: symbol_resolver.SymbolRecord,
+        depth: u8,
+    ) QueryError!u16 {
+        if (depth >= 8) return 0;
+        const ffi_bit: u16 = (mir_sast.EffectCapabilityMask{ .ffi = true }).asBits();
+        var bits: u16 = 0;
+
+        if (sym.kind == .module_sym) {
+            if (std.mem.startsWith(u8, sym.name_text, "__c_import_") or
+                sym.decl_span.file_id.asInt() >= VIRTUAL_C_IMPORT_FILE_ID_BASE)
+            {
+                bits |= ffi_bit;
+            }
+            if (!sym.target_scope.isNone()) {
+                for (self.symbol_table.getScopeMembers(sym.target_scope)) |sub_idx| {
+                    var res_idx = sub_idx;
+                    var res_sym = self.symbol_table.getSymbol(res_idx).*;
+                    if (res_sym.visibility != .public) continue;
+                    var hops: u8 = 0;
+                    while (res_sym.kind == .use_alias_sym and !res_sym.target_symbol.isNone() and
+                        res_sym.target_symbol.asInt() < self.symbol_table.countSymbols() and hops < 16) : (hops += 1)
+                    {
+                        res_idx = res_sym.target_symbol;
+                        res_sym = self.symbol_table.getSymbol(res_idx).*;
+                    }
+                    if (res_sym.kind == .use_alias_sym) continue;
+                    bits |= try self.computeSymbolReexportCapBits(res_idx, res_sym, depth + 1);
+                }
+            }
+            return bits & mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
+        }
+
+        if (sym.kind == .overload_group_sym and !sym.target_symbol.isNone() and
+            sym.target_symbol.asInt() < self.symbol_table.overload_sets.items.len)
+        {
+            const ov_members = self.symbol_table.overload_sets.items[sym.target_symbol.asInt()].members.items;
+            for (ov_members) |ov_idx| {
+                if (ov_idx.isNone() or ov_idx.asInt() >= self.symbol_table.countSymbols()) continue;
+                bits |= try self.computeSymbolReexportCapBits(ov_idx, self.symbol_table.getSymbol(ov_idx).*, depth + 1);
+            }
+            return bits & mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
+        }
+
+        if (sym.namespace == .type_ns and !sym.target_scope.isNone()) {
+            for (self.symbol_table.getScopeMembers(sym.target_scope)) |mem_idx| {
+                const mem_sym = self.symbol_table.getSymbol(mem_idx).*;
+                if (mem_sym.kind == .fn_sym) {
+                    const is_drop = std.mem.eql(u8, mem_sym.name_text, "drop");
+                    const is_pub_trait = if (self.symbol_table.impl_method_trait.get(mem_idx.asInt())) |tr_idx|
+                        (!tr_idx.isNone() and tr_idx.asInt() < self.symbol_table.countSymbols() and
+                            (self.symbol_table.getSymbol(tr_idx).visibility == .public or
+                                self.symbol_table.getSymbol(tr_idx).flags.is_builtin))
+                    else
+                        false;
+                    if (mem_sym.visibility == .public or is_drop or is_pub_trait) {
+                        bits |= try self.computeSymbolReexportCapBits(mem_idx, mem_sym, depth + 1);
+                    }
+                } else if ((mem_sym.kind == .field_sym or mem_sym.kind == .enum_variant_sym) and
+                    !mem_sym.type_id.isError())
+                {
+                    if (self.symbol_table.type_to_symbol.get(mem_sym.type_id.toU32())) |fty_idx| {
+                        if (!fty_idx.isNone() and fty_idx.asInt() < self.symbol_table.countSymbols()) {
+                            bits |= try self.computeSymbolReexportCapBits(
+                                fty_idx,
+                                self.symbol_table.getSymbol(fty_idx).*,
+                                depth + 1,
+                            );
+                        }
+                    }
+                }
+            }
+            return bits & mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
+        }
+
+        if (self.sast_sym_summaries.get(sym_idx.asInt())) |msum| {
+            bits |= msum.inferred_effects_bits | msum.direct_effects_bits;
+        } else if (!sym.def_id.isNone()) {
+            if (!self.sast_summaries.contains(sym.def_id.asInt()) and
+                self.source_inputs.contains(sym.def_id.fileId().asInt()))
+            {
+                _ = self.typecheckBody(sym.def_id) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Cancelled => return error.Cancelled,
+                    else => null,
+                };
+                _ = self.verifySastMir(sym.def_id) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Cancelled => return error.Cancelled,
+                    else => null,
+                };
+            }
+            if (self.sast_summaries.get(sym.def_id.asInt())) |sum_rec| {
+                bits |= sum_rec.inferred_effects_bits | sum_rec.direct_effects_bits;
+            } else {
+                bits |= mir_sast.inferSymbolBoundaryOrPrototypeEffects(&self.symbol_table, sym_idx).asBits();
+            }
+        } else {
+            bits |= mir_sast.inferSymbolBoundaryOrPrototypeEffects(&self.symbol_table, sym_idx).asBits();
+        }
+
+        if (sym.contract_flags.is_std_cap_boundary) {
+            bits = mir_sast.applySymbolBoundaryMask(bits, sym);
+        } else {
+            if (sym.flags.is_extern or sym.kind == .extern_static_sym or
+                sym.decl_span.file_id.asInt() >= VIRTUAL_C_IMPORT_FILE_ID_BASE)
+            {
+                bits |= ffi_bit;
+            }
+            if (self.symbol_table.ffi_contracts.get(sym_idx)) |ffi_con| {
+                if (ffi_con.wasm_export_name != .empty or ffi_con.link_lib_name != .empty) {
+                    bits |= ffi_bit;
+                }
+            }
+        }
+        return bits & mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
+    }
+
+    /// Emits `.cxi` function, type, or `const` records for a re-exported `(sym_idx, sym)` (`depth < 8`).
+    fn appendReexportedCxiRecordsBounded(
+        self: *CompilerDb,
+        fn_records: *std.ArrayListUnmanaged(pkg_cxi_seam.CxiFnRecord),
+        type_records: *std.ArrayListUnmanaged(pkg_cxi_seam.CxiTypeRecord),
+        path_hash64: u64,
+        sym_idx: SymbolIndex,
+        sym: symbol_resolver.SymbolRecord,
+        active_layout: TargetLayout,
+        depth: u8,
+    ) QueryError!void {
+        if (depth >= 8) return;
+        if (sym.kind == .fn_sym) {
+            try self.appendCxiFnRecordForSymbol(fn_records, path_hash64, sym_idx, sym);
+        } else if (sym.kind == .overload_group_sym and !sym.target_symbol.isNone() and
+            sym.target_symbol.asInt() < self.symbol_table.overload_sets.items.len)
+        {
+            const ov_members = self.symbol_table.overload_sets.items[sym.target_symbol.asInt()].members.items;
+            for (ov_members) |ov_idx| {
+                if (ov_idx.isNone() or ov_idx.asInt() >= self.symbol_table.countSymbols()) continue;
+                try self.appendCxiFnRecordForSymbol(
+                    fn_records,
+                    path_hash64,
+                    ov_idx,
+                    self.symbol_table.getSymbol(ov_idx).*,
+                );
+            }
+        } else if (sym.kind == .const_sym) {
+            try self.appendCxiConstRecordForSymbol(type_records, path_hash64, sym);
+        } else if (sym.kind == .struct_sym or sym.kind == .enum_sym or sym.kind == .union_sym or
+            sym.kind == .bit_field_sym or sym.kind == .trait_sym or sym.kind == .type_alias_sym or
+            sym.kind == .distinct_type_sym or sym.kind == .refined_type_sym)
+        {
+            try self.appendCxiTypeRecordForSymbol(type_records, path_hash64, sym, active_layout);
+        } else if (sym.kind == .module_sym and !sym.target_scope.isNone()) {
+            for (self.symbol_table.getScopeMembers(sym.target_scope)) |sub_idx| {
+                var res_idx = sub_idx;
+                var res_sym = self.symbol_table.getSymbol(res_idx).*;
+                if (res_sym.visibility != .public) continue;
+                var sub_hasher = std.hash.Wyhash.init(path_hash64);
+                sub_hasher.update("::");
+                sub_hasher.update(res_sym.name_text);
+                const sub_hash64 = sub_hasher.final();
+                var hops: u8 = 0;
+                while (res_sym.kind == .use_alias_sym and !res_sym.target_symbol.isNone() and
+                    res_sym.target_symbol.asInt() < self.symbol_table.countSymbols() and hops < 16) : (hops += 1)
+                {
+                    res_idx = res_sym.target_symbol;
+                    res_sym = self.symbol_table.getSymbol(res_idx).*;
+                }
+                if (res_sym.kind == .use_alias_sym) continue;
+                try self.appendReexportedCxiRecordsBounded(
+                    fn_records,
+                    type_records,
+                    sub_hash64,
+                    res_idx,
+                    res_sym,
+                    active_layout,
+                    depth + 1,
+                );
+            }
+        }
+    }
+
+    /// Worklist node for scanning live module scopes of `pkg_files` for `.public` `use_alias_sym` re-exports.
+    const ScopeQueueEntry = struct {
+        /// Module `ScopeId` to inspect for `.public` `use_alias_sym` re-exports.
+        scope_id: ScopeId,
+        /// Owning `FileId` in `pkg_files`.
+        owner_file_id: FileId,
+        /// Base `Wyhash` seed including `vpath` and any enclosing inline `mod` names.
+        prefix_hash64: u64,
+    };
+
     /// Computes the binary `.cxi` summary, `cxi_blake3` digest, and four-tier capability roll-up for `pkg_id`.
     pub fn computePackageCxiSummary(
         self: *CompilerDb,
@@ -10700,9 +11185,7 @@ pub const CompilerDb = struct {
         for (pkg_files) |pkg_fid| {
             _ = try self.parseCst(pkg_fid);
             _ = try self.resolveSignatures(pkg_fid);
-            const item_tree = try self.extractItemTree(pkg_fid);
-            const is_inc_tests = try self.effectiveIncludeTestsForFile(pkg_fid);
-            const eff_cfg = self.effectiveCfgEnvForFile(pkg_fid, is_inc_tests);
+            const eff_cfg = self.resolveCfgEnvForFile(pkg_fid, try self.isIncludingTestsForFile(pkg_fid));
 
             if (self.source_inputs.getPtr(pkg_fid.asInt())) |inp_ptr| {
                 if (self.parsed_artifacts.getPtr(pkg_fid.asInt())) |parsed_ptr| {
@@ -10716,6 +11199,9 @@ pub const CompilerDb = struct {
                     inactive_agg.all_inactive_caps_bits |= file_inactive.all_inactive_caps_bits;
                     inactive_agg.pub_inactive_caps_bits |= file_inactive.pub_inactive_caps_bits;
                     inactive_agg.link_ambient_inactive_caps_bits |= file_inactive.link_ambient_inactive_caps_bits;
+                    if (file_inactive.has_pub_inactive_cfg_items) {
+                        inactive_agg.has_pub_inactive_cfg_items = true;
+                    }
                     if (inactive_agg.first_inactive_cap_span.file_id.isNone() and
                         !file_inactive.first_inactive_cap_span.file_id.isNone())
                     {
@@ -10767,9 +11253,22 @@ pub const CompilerDb = struct {
                 if (self.symbol_table.def_to_symbol.get(entry.def_id.asInt())) |sym_idx| {
                     if (!sym_idx.isNone() and sym_idx.asInt() < self.symbol_table.countSymbols()) {
                         const sym_rec = self.symbol_table.getSymbol(sym_idx).*;
-                        if (sym_rec.flags.is_extern) {
-                            item_bits |= ffi_bit;
-                            direct_bits |= ffi_bit;
+                        if (sym_rec.contract_flags.is_std_cap_boundary) {
+                            item_bits = mir_sast.applySymbolBoundaryMask(item_bits, sym_rec) &
+                                mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
+                            direct_bits = mir_sast.applySymbolBoundaryMask(direct_bits, sym_rec) &
+                                mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
+                        } else {
+                            if (sym_rec.flags.is_extern) {
+                                item_bits |= ffi_bit;
+                                direct_bits |= ffi_bit;
+                            }
+                            if (self.symbol_table.ffi_contracts.get(sym_idx)) |ffi_con| {
+                                if (ffi_con.wasm_export_name != .empty or ffi_con.link_lib_name != .empty) {
+                                    item_bits |= ffi_bit;
+                                    if (ffi_con.wasm_export_name != .empty) is_link_ambient = true;
+                                }
+                            }
                         }
                         if (sym_rec.contract_flags.is_export or
                             sym_rec.contract_flags.has_link_section or
@@ -10777,12 +11276,6 @@ pub const CompilerDb = struct {
                             sym_rec.contract_flags.is_ifunc)
                         {
                             is_link_ambient = true;
-                        }
-                        if (self.symbol_table.ffi_contracts.get(sym_idx)) |ffi_con| {
-                            if (ffi_con.wasm_export_name != .empty or ffi_con.link_lib_name != .empty) {
-                                item_bits |= ffi_bit;
-                                if (ffi_con.wasm_export_name != .empty) is_link_ambient = true;
-                            }
                         }
                     }
                 }
@@ -10797,8 +11290,10 @@ pub const CompilerDb = struct {
                         caps.link_ambient_caps.asBits() | item_bits,
                     );
                 }
-                const is_root_main = pkg_id == .root and std.mem.eql(u8, entry.name_text, "main");
-                if (entry.isPublicOutsidePkg() or is_root_main or is_link_ambient) {
+                if (entry.isPublicOutsidePkg() or
+                    (pkg_id == .root and std.mem.eql(u8, entry.name_text, "main")) or
+                    is_link_ambient)
+                {
                     caps.reachable_caps = mir_sast.EffectCapabilityMask.fromBits(
                         caps.reachable_caps.asBits() | item_bits,
                     );
@@ -10822,7 +11317,6 @@ pub const CompilerDb = struct {
                     }
                 }
             }
-            _ = item_tree;
         }
 
         // Scan symbols owned by `pkg_files` for `@c_import` `.ffi`, impl methods, and exported `.cxi` records:
@@ -10917,63 +11411,164 @@ pub const CompilerDb = struct {
             const path_hash64 = path_hasher.final();
 
             if (sym.kind == .fn_sym) {
-                var sig_hasher = StructuralHasher.init();
-                hashTypeCanonical(&sig_hasher, &self.type_pool, &self.symbol_table, sym.type_id);
-                for (self.symbol_table.getFnParamSpecs(sym_idx)) |pspec| {
-                    if (!pspec.is_positional_only) {
-                        hashSymbolTextCanonical(&sig_hasher, &self.interner, pspec.name);
-                    }
-                    sig_hasher.updateU8(@intFromBool(pspec.has_default));
-                }
-                const sig_fp = sig_hasher.final();
-                const fn_sum = if (self.sast_sym_summaries.get(sym_i)) |msum|
-                    msum
-                else if (!sym.def_id.isNone())
-                    (self.sast_summaries.get(sym.def_id.asInt()) orelse mir_sast.FnRegionSummary{})
-                else
-                    mir_sast.FnRegionSummary{};
-                var obs_buf: [34]u8 = undefined;
-                fn_sum.writeObservableBytes(&obs_buf);
-                var sum_words: [5]u64 = @splat(0);
-                @memcpy(std.mem.sliceAsBytes(&sum_words)[0..34], &obs_buf);
-
-                try fn_records.append(self.allocator, .{
-                    .symbol_path_hash = path_hash64,
-                    .sig_type_hash = sig_fp.low,
-                    .shape_hash64 = sig_fp.high,
-                    .summary_bits = sum_words,
-                });
+                try self.appendCxiFnRecordForSymbol(&fn_records, path_hash64, sym_idx, sym);
+            } else if (sym.kind == .const_sym) {
+                try self.appendCxiConstRecordForSymbol(&type_records, path_hash64, sym);
             } else if (sym.kind == .struct_sym or sym.kind == .enum_sym or sym.kind == .union_sym or
                 sym.kind == .bit_field_sym or sym.kind == .trait_sym or sym.kind == .type_alias_sym or
                 sym.kind == .distinct_type_sym or sym.kind == .refined_type_sym)
             {
-                const field_h64 = computeNominalFieldHash64(
-                    &self.type_pool,
-                    &self.symbol_table,
-                    sym.type_id,
+                try self.appendCxiTypeRecordForSymbol(&type_records, path_hash64, sym, active_layout);
+            }
+        }
+
+        // Fold `.public` `pub use` re-exports across live module scopes of `pkg_files` into `caps` and `.cxi` records:
+        var scope_queue: std.ArrayListUnmanaged(ScopeQueueEntry) = .empty;
+        defer scope_queue.deinit(self.allocator);
+        var visited_scopes: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer visited_scopes.deinit(self.allocator);
+
+        for (pkg_files) |pkg_fid| {
+            const mod_scope = self.symbol_table.file_module_scopes.get(pkg_fid.asInt()) orelse continue;
+            if (mod_scope.isNone()) continue;
+            if ((try visited_scopes.getOrPut(self.allocator, mod_scope.asInt())).found_existing) continue;
+            const vpath = if (self.vfs_source_map) |vmap| vmap.getFilePath(pkg_fid) else "";
+            var root_hasher = std.hash.Wyhash.init(0);
+            root_hasher.update(vpath);
+            try scope_queue.append(self.allocator, .{
+                .scope_id = mod_scope,
+                .owner_file_id = pkg_fid,
+                .prefix_hash64 = root_hasher.final(),
+            });
+        }
+
+        var scope_head: usize = 0;
+        while (scope_head < scope_queue.items.len) : (scope_head += 1) {
+            const cur_scope_item = scope_queue.items[scope_head];
+            var member_idx: usize = 0;
+            while (member_idx < self.symbol_table.getScopeMembers(cur_scope_item.scope_id).len) : (member_idx += 1) {
+                const mem_sym_idx = self.symbol_table.getScopeMembers(cur_scope_item.scope_id)[member_idx];
+                if (mem_sym_idx.isNone() or mem_sym_idx.asInt() >= self.symbol_table.countSymbols()) continue;
+                const mem_sym = self.symbol_table.getSymbol(mem_sym_idx).*;
+
+                if (mem_sym.kind == .module_sym and !mem_sym.flags.is_imported and !mem_sym.target_scope.isNone() and
+                    file_set.contains(mem_sym.decl_span.file_id.asInt()))
+                {
+                    if (!(try visited_scopes.getOrPut(self.allocator, mem_sym.target_scope.asInt())).found_existing) {
+                        var sub_mod_hasher = std.hash.Wyhash.init(cur_scope_item.prefix_hash64);
+                        sub_mod_hasher.update("::");
+                        sub_mod_hasher.update(mem_sym.name_text);
+                        try scope_queue.append(self.allocator, .{
+                            .scope_id = mem_sym.target_scope,
+                            .owner_file_id = mem_sym.decl_span.file_id,
+                            .prefix_hash64 = sub_mod_hasher.final(),
+                        });
+                    }
+                    continue;
+                }
+
+                if (mem_sym.kind != .use_alias_sym) continue;
+                var is_pub_reexport = mem_sym.visibility == .public;
+                if (!is_pub_reexport and mem_sym.decl_span.file_id == cur_scope_item.owner_file_id and
+                    !mem_sym.cst_node.isNone())
+                {
+                    if (self.parsed_artifacts.getPtr(cur_scope_item.owner_file_id.asInt())) |u_parsed| {
+                        if (mem_sym.cst_node.asInt() < u_parsed.cst_arena.countNodes()) {
+                            const u_start: usize = mem_sym.cst_node.asInt();
+                            const u_root = u_parsed.cst_arena.getNode(mem_sym.cst_node);
+                            const u_end = @min(
+                                u_start + @max(@as(usize, u_root.subtree_size), 1),
+                                u_parsed.cst_arena.countNodes(),
+                            );
+                            const u_tok_cnt = u_parsed.token_buffer.countTokens();
+                            var has_bare_pub = false;
+                            var has_vis_paren = false;
+                            var has_kw_use = false;
+                            var is_span_in_use_cst = false;
+                            var u_cur = u_start;
+                            while (u_cur < u_end) : (u_cur += 1) {
+                                const u_leaf = u_parsed.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(u_cur)));
+                                if (u_leaf.subtree_size <= 1 and !u_leaf.flags.is_missing_or_injected and
+                                    !u_leaf.token.isNone() and u_leaf.token.asInt() < u_tok_cnt)
+                                {
+                                    const u_tok = u_parsed.token_buffer.getToken(u_leaf.token);
+                                    if (!has_kw_use) {
+                                        if (u_tok.kind == .kw_pub) has_bare_pub = true;
+                                        if (has_bare_pub and u_tok.kind == .lparen) has_vis_paren = true;
+                                        if (u_tok.kind == .kw_use) has_kw_use = true;
+                                    }
+                                    if (u_tok.byte_offset == mem_sym.decl_span.start_byte and
+                                        u_tok.byte_offset + u_tok.byte_len == mem_sym.decl_span.end_byte)
+                                    {
+                                        is_span_in_use_cst = true;
+                                    }
+                                }
+                            }
+                            if (has_bare_pub and !has_vis_paren and has_kw_use and is_span_in_use_cst) {
+                                is_pub_reexport = true;
+                            }
+                        }
+                    }
+                }
+                if (!is_pub_reexport) continue;
+                var target_idx = mem_sym.target_symbol;
+                if (target_idx.isNone() or target_idx.asInt() >= self.symbol_table.countSymbols()) continue;
+                var target_sym = self.symbol_table.getSymbol(target_idx).*;
+                var hops: u8 = 0;
+                while (target_sym.kind == .use_alias_sym and !target_sym.target_symbol.isNone() and
+                    target_sym.target_symbol.asInt() < self.symbol_table.countSymbols() and hops < 16) : (hops += 1)
+                {
+                    target_idx = target_sym.target_symbol;
+                    target_sym = self.symbol_table.getSymbol(target_idx).*;
+                }
+                if (target_sym.kind == .use_alias_sym) continue;
+
+                const reexport_bits = try self.computeSymbolReexportCapBits(target_idx, target_sym, 0);
+                if (reexport_bits != 0) {
+                    caps.ambient_caps = mir_sast.EffectCapabilityMask.fromBits(
+                        caps.ambient_caps.asBits() | reexport_bits,
+                    );
+                    caps.reachable_caps = mir_sast.EffectCapabilityMask.fromBits(
+                        caps.reachable_caps.asBits() | reexport_bits,
+                    );
+                    caps.surface_caps = mir_sast.EffectCapabilityMask.fromBits(
+                        caps.surface_caps.asBits() | reexport_bits,
+                    );
+                    if (first_leaf_span.file_id.isNone()) {
+                        first_leaf_span = if (!mem_sym.decl_span.file_id.isNone() and
+                            file_set.contains(mem_sym.decl_span.file_id.asInt()))
+                            mem_sym.decl_span
+                        else if (!target_sym.decl_span.file_id.isNone() and
+                            file_set.contains(target_sym.decl_span.file_id.asInt()))
+                            target_sym.decl_span
+                        else
+                            Span.init(cur_scope_item.owner_file_id, 0, 0);
+                        if (mem_sym.name_text.len > 0 and first_leaf_name.len == 0) {
+                            first_leaf_name = try out_allocator.dupe(u8, mem_sym.name_text);
+                        }
+                    }
+                }
+
+                var alias_hasher = std.hash.Wyhash.init(cur_scope_item.prefix_hash64);
+                alias_hasher.update("::");
+                alias_hasher.update(mem_sym.name_text);
+                try self.appendReexportedCxiRecordsBounded(
+                    &fn_records,
+                    &type_records,
+                    alias_hasher.final(),
+                    target_idx,
+                    target_sym,
                     active_layout,
-                ).asInt();
-                const layout_rec = buildCxTypeLayoutRecord(
-                    &self.type_pool,
-                    &self.symbol_table,
-                    sym.type_id,
-                    active_layout,
+                    0,
                 );
-                const byte_align_u32: u32 = if (layout_rec.align_log2 < 32)
-                    @as(u32, 1) << @intCast(layout_rec.align_log2)
-                else
-                    1;
-                try type_records.append(self.allocator, .{
-                    .symbol_path_hash = path_hash64,
-                    .shape_hash64 = layout_rec.layout_shape_hash64,
-                    .field_hash64 = field_h64,
-                    .layout_meta = .{
-                        layout_rec.byte_size,
-                        byte_align_u32,
-                        @as(u32, layout_rec.fields_len),
-                        @as(u32, layout_rec.kind_flags),
-                    },
-                });
+            }
+        }
+
+        if (inactive_agg.has_pub_inactive_cfg_items) {
+            const intra_pkg_ambient = caps.ambient_caps.asBits() & mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
+            inactive_agg.pub_inactive_caps_bits |= intra_pkg_ambient;
+            if (intra_pkg_ambient != 0 and inactive_agg.first_inactive_cap_span.file_id.isNone()) {
+                inactive_agg.first_inactive_cap_span = first_leaf_span;
             }
         }
 
@@ -10997,6 +11592,11 @@ pub const CompilerDb = struct {
             mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
         const amb_bits: u16 = (caps.ambient_caps.asBits() | caps.link_ambient_caps.asBits() |
             inactive_agg.all_inactive_caps_bits) & mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
+        caps.surface_caps = mir_sast.EffectCapabilityMask.fromBits(surf_bits);
+        caps.link_ambient_caps = mir_sast.EffectCapabilityMask.fromBits(
+            (caps.link_ambient_caps.asBits() | inactive_agg.link_ambient_inactive_caps_bits) &
+                mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS,
+        );
 
         const cxi_bytes = pkg_cxi_seam.serializeCxiSummary(
             out_allocator,
@@ -11138,6 +11738,12 @@ pub const CompilerDb = struct {
         defer visited_defs.deinit(self.allocator);
         var seen_drop_tys: std.AutoHashMapUnmanaged(u32, void) = .empty;
         defer seen_drop_tys.deinit(self.allocator);
+        var def_extra_cap_bits: std.AutoHashMapUnmanaged(u32, u16) = .empty;
+        defer def_extra_cap_bits.deinit(self.allocator);
+        var def_cross_c_import_pkgs: std.AutoHashMapUnmanaged(u32, PackageId) = .empty;
+        defer def_cross_c_import_pkgs.deinit(self.allocator);
+        const ffi_bit: u16 = (mir_sast.EffectCapabilityMask{ .ffi = true }).asBits();
+        const ffi_unsafe_bits: u16 = (mir_sast.EffectCapabilityMask{ .ffi = true, .unsafe_op = true }).asBits();
 
         for (pkg_order) |pkg_id| {
             const pkg_files = pkg_files_map.get(pkg_id) orelse &.{};
@@ -11145,8 +11751,43 @@ pub const CompilerDb = struct {
             try cxi_artifacts.append(self.allocator, art);
 
             for (pkg_files) |fid| {
-                const entries = (try self.extractItemTree(fid)).entries;
-                for (entries) |entry| {
+                for ((try self.extractItemTree(fid)).entries) |entry| {
+                    var own_extra_bits: u16 = 0;
+                    if (entry.kind == .extern_static or entry.kind == .ffi_extern_block) {
+                        own_extra_bits |= ffi_bit;
+                    }
+                    if (self.symbol_table.def_to_symbol.get(entry.def_id.asInt())) |sym_idx| {
+                        if (!sym_idx.isNone() and sym_idx.asInt() < self.symbol_table.countSymbols()) {
+                            const sym_rec = self.symbol_table.getSymbol(sym_idx).*;
+                            if (sym_rec.contract_flags.is_std_cap_boundary) {
+                                own_extra_bits |= mir_sast.inferSymbolBoundaryOrPrototypeEffects(
+                                    &self.symbol_table,
+                                    sym_idx,
+                                ).asBits() & mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
+                            } else {
+                                if (sym_rec.flags.is_extern) {
+                                    own_extra_bits |= mir_sast.inferSymbolBoundaryOrPrototypeEffects(
+                                        &self.symbol_table,
+                                        sym_idx,
+                                    ).asBits() & mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
+                                }
+                                if (self.symbol_table.ffi_contracts.get(sym_idx)) |ffi_con| {
+                                    if (ffi_con.wasm_export_name != .empty or ffi_con.link_lib_name != .empty) {
+                                        own_extra_bits |= ffi_bit;
+                                        if (ffi_con.wasm_export_name != .empty) own_extra_bits |= ffi_unsafe_bits;
+                                    }
+                                }
+                            }
+                            if (sym_rec.contract_flags.is_export or
+                                sym_rec.contract_flags.has_link_section or
+                                sym_rec.contract_flags.has_link_name or
+                                sym_rec.contract_flags.is_ifunc)
+                            {
+                                own_extra_bits |= ffi_unsafe_bits;
+                            }
+                        }
+                    }
+
                     if (pkg_id == .root) {
                         const gop = try visited_defs.getOrPut(self.allocator, entry.def_id.asInt());
                         if (!gop.found_existing) try root_queue.append(self.allocator, entry.def_id);
@@ -11155,12 +11796,36 @@ pub const CompilerDb = struct {
                         seen_drop_tys.clearRetainingCapacity();
                         for (st_ptr.node_symbols) |raw_sym_idx| {
                             if (raw_sym_idx.isNone() or raw_sym_idx.asInt() >= self.symbol_table.countSymbols()) continue;
-                            var target_sym = self.symbol_table.getSymbol(raw_sym_idx).*;
+                            var target_idx = raw_sym_idx;
+                            var target_sym = self.symbol_table.getSymbol(target_idx).*;
                             var hops: u8 = 0;
                             while (target_sym.kind == .use_alias_sym and !target_sym.target_symbol.isNone() and
                                 target_sym.target_symbol.asInt() < self.symbol_table.countSymbols() and hops < 16) : (hops += 1)
                             {
-                                target_sym = self.symbol_table.getSymbol(target_sym.target_symbol).*;
+                                target_idx = target_sym.target_symbol;
+                                target_sym = self.symbol_table.getSymbol(target_idx).*;
+                            }
+                            const callee_pkg = self.symbol_table.getFilePackageId(target_sym.decl_span.file_id);
+                            if (target_sym.decl_span.file_id.asInt() >= VIRTUAL_C_IMPORT_FILE_ID_BASE or
+                                (target_sym.kind == .module_sym and std.mem.startsWith(u8, target_sym.name_text, "__c_import_")))
+                            {
+                                if (callee_pkg == pkg_id) {
+                                    own_extra_bits |= ffi_bit;
+                                } else if (!target_sym.decl_span.file_id.isNone()) {
+                                    try def_cross_c_import_pkgs.put(self.allocator, entry.def_id.asInt(), callee_pkg);
+                                }
+                            } else if (!target_sym.contract_flags.is_std_cap_boundary and callee_pkg == pkg_id) {
+                                if (target_sym.flags.is_extern or target_sym.kind == .extern_static_sym) {
+                                    own_extra_bits |= mir_sast.inferSymbolBoundaryOrPrototypeEffects(
+                                        &self.symbol_table,
+                                        target_idx,
+                                    ).asBits() & mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
+                                }
+                                if (self.symbol_table.ffi_contracts.get(target_idx)) |ffi_con| {
+                                    if (ffi_con.wasm_export_name != .empty or ffi_con.link_lib_name != .empty) {
+                                        own_extra_bits |= ffi_bit;
+                                    }
+                                }
                             }
                             const callee_def = if (!target_sym.def_id.isNone()) target_sym.def_id else target_sym.owner_def_id;
                             if (!callee_def.isNone() and callee_def != entry.def_id) {
@@ -11182,7 +11847,6 @@ pub const CompilerDb = struct {
                                     0,
                                 );
                             }
-                            const callee_pkg = self.symbol_table.getFilePackageId(target_sym.decl_span.file_id);
                             if (callee_pkg != pkg_id and callee_pkg != .std_core and !target_sym.decl_span.file_id.isNone()) {
                                 var caller_span = Span.init(fid, 0, 0);
                                 if (self.symbol_table.def_to_symbol.get(entry.def_id.asInt())) |caller_sym_idx| {
@@ -11219,8 +11883,7 @@ pub const CompilerDb = struct {
                         }
                         for (st_ptr.node_types) |node_ty| {
                             if (node_ty.isError()) continue;
-                            const ty_gop = try seen_drop_tys.getOrPut(self.allocator, node_ty.toU32());
-                            if (ty_gop.found_existing) continue;
+                            if ((try seen_drop_tys.getOrPut(self.allocator, node_ty.toU32())).found_existing) continue;
                             if (self.symbol_table.type_to_symbol.get(node_ty.toU32())) |ty_sym_idx| {
                                 if (!ty_sym_idx.isNone() and ty_sym_idx.asInt() < self.symbol_table.countSymbols()) {
                                     try self.appendNominalTypeDropEdgesBounded(
@@ -11239,6 +11902,10 @@ pub const CompilerDb = struct {
                             }
                         }
                     }
+                    if (own_extra_bits != 0) {
+                        const prev_extra = def_extra_cap_bits.get(entry.def_id.asInt()) orelse 0;
+                        try def_extra_cap_bits.put(self.allocator, entry.def_id.asInt(), prev_extra | own_extra_bits);
+                    }
                 }
             }
         }
@@ -11250,11 +11917,21 @@ pub const CompilerDb = struct {
         while (bfs_head < root_queue.items.len) : (bfs_head += 1) {
             const cur_def = root_queue.items[bfs_head];
             const def_pkg = self.symbol_table.getFilePackageId(cur_def.fileId());
+            var add_bits: u16 = def_extra_cap_bits.get(cur_def.asInt()) orelse 0;
+            if (cur_def.fileId().asInt() >= VIRTUAL_C_IMPORT_FILE_ID_BASE) {
+                add_bits |= ffi_bit;
+            }
             if (self.sast_summaries.get(cur_def.asInt())) |sum_rec| {
-                const prev_bits = reachable_by_pkg.get(def_pkg) orelse 0;
-                const add_bits = (sum_rec.inferred_effects_bits | sum_rec.direct_effects_bits) &
+                add_bits |= (sum_rec.inferred_effects_bits | sum_rec.direct_effects_bits) &
                     mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
+            }
+            if (add_bits != 0) {
+                const prev_bits = reachable_by_pkg.get(def_pkg) orelse 0;
                 try reachable_by_pkg.put(self.allocator, def_pkg, prev_bits | add_bits);
+            }
+            if (def_cross_c_import_pkgs.get(cur_def.asInt())) |c_imp_pkg| {
+                const prev_c_bits = reachable_by_pkg.get(c_imp_pkg) orelse 0;
+                try reachable_by_pkg.put(self.allocator, c_imp_pkg, prev_c_bits | ffi_bit);
             }
             if (call_adj.getPtr(cur_def.asInt())) |callees| {
                 for (callees.items) |next_def| {
@@ -11281,6 +11958,9 @@ pub const CompilerDb = struct {
                 .caps = art.caps,
                 .inactive_caps = mir_sast.EffectCapabilityMask.fromBits(art.inactive_scan.all_inactive_caps_bits),
                 .pub_inactive_caps = mir_sast.EffectCapabilityMask.fromBits(art.inactive_scan.pub_inactive_caps_bits),
+                .link_ambient_inactive_caps = mir_sast.EffectCapabilityMask.fromBits(
+                    art.inactive_scan.link_ambient_inactive_caps_bits,
+                ),
                 .first_inactive_cap_span = art.inactive_scan.first_inactive_cap_span,
                 .root_callgraph_reachable_caps = reach_mask,
                 .first_cap_leaf_span = art.first_cap_leaf_span,
@@ -12874,14 +13554,14 @@ test "test_c_import_transitive_include_mutation_invalidates_cache_and_signatures
 test "test_phase9_c_include_escape_incremental_cxi_and_drop_surface_caps" {
     const allocator = std.testing.allocator;
 
-    // [1] Comment-masked & depth-aware `#include` sandbox verification (`CRITICAL-05`):
+    // [1] Comment-masked & depth-aware `#include` sandbox verification:
     try std.testing.expect(CompilerDb.hasEscapingCIncludeDirective("/* lead */ # /* mid */ include \"../outside.h\"\n", 0));
     try std.testing.expect(!CompilerDb.hasEscapingCIncludeDirective("/* ok */ #include \"../sibling.h\"\n", 1));
     try std.testing.expect(CompilerDb.hasEscapingCIncludeDirective("#include \"../../outside.h\"\n", 1));
     try std.testing.expectEqual(@as(?usize, 2), CompilerDb.computeNormalizedRelDirDepth("include/sub/api.h"));
     try std.testing.expectEqual(@as(?usize, null), CompilerDb.computeNormalizedRelDirDepth("../escape.h"));
 
-    // [2] Incremental `setInput` `.cxi` determinism (`VERIFIER-04`) + `impl Drop` & top-level `asm` (`CRITICAL-02`, `HIGH-01`):
+    // [2] Incremental `setInput` `.cxi` determinism + `impl Drop` & top-level `asm` capability roll-up:
     const src_v1 =
         \\extern "C" {
         \\    fn sneaky_ffi();
@@ -12947,4 +13627,255 @@ test "test_phase9_c_include_escape_incremental_cxi_and_drop_surface_caps" {
     defer cxi_v3_fresh.deinit(allocator);
 
     try std.testing.expectEqualSlices(u8, &cxi_v3_fresh.cxi_blake3, &cxi_v3_inc.cxi_blake3);
+}
+
+test "test_phase9_pub_use_reexport_caps_const_cxi_boundary_inactive_cfg_and_comptime_gate" {
+    const allocator = std.testing.allocator;
+
+    // [1] `pub use` re-export folds `pub(pkg)` target capabilities into `surface_caps` & `.cxi`, and `pub const` alters `cxi_blake3`:
+    {
+        var db = try CompilerDb.init(allocator);
+        defer db.deinit();
+        db.setPackageGraphMounted(true);
+
+        const pkg_dep = PackageId.fromInt(2);
+        const fid_root = FileId.fromInt(400);
+        const fid_secret = FileId.fromInt(401);
+
+        const secret_src =
+            \\extern "C" fn raw_c_steal() -> i32;
+            \\pub(pkg) fn steal() -> i32 {
+            \\    return unsafe { raw_c_steal() };
+            \\}
+            \\pub(pkg) const SECRET_LIMIT: i32 = 42;
+        ;
+        const root_safe_src =
+            \\mod secret;
+            \\pub const PUBLIC_VERSION: i32 = 1;
+            \\pub fn clean_api(val: i32) -> i32 = val + 1;
+        ;
+        const root_reexport_src =
+            \\mod secret;
+            \\pub use secret.steal as parse;
+            \\pub use secret.SECRET_LIMIT as LIMIT;
+            \\pub const PUBLIC_VERSION: i32 = 1;
+            \\pub fn clean_api(val: i32) -> i32 = val + 1;
+        ;
+        const root_const_changed_src =
+            \\mod secret;
+            \\pub const PUBLIC_VERSION: i32 = 2;
+            \\pub fn clean_api(val: i32) -> i32 = val + 1;
+        ;
+
+        try db.setFilePackageId(fid_root, pkg_dep);
+        try db.setFilePackageId(fid_secret, pkg_dep);
+        _ = try db.setInput(fid_secret, secret_src, .high);
+        _ = try db.setInput(fid_root, root_safe_src, .high);
+        try db.registerPackageRootFile(pkg_dep, fid_root);
+        try db.bindExternalModule(fid_root, "secret", fid_secret);
+
+        var cxi_safe = try db.computePackageCxiSummary(allocator, pkg_dep, &.{ fid_root, fid_secret });
+        defer cxi_safe.deinit(allocator);
+        try std.testing.expect(!cxi_safe.caps.surface_caps.ffi);
+
+        _ = try db.setInput(fid_root, root_const_changed_src, .high);
+        var cxi_const_changed = try db.computePackageCxiSummary(allocator, pkg_dep, &.{ fid_root, fid_secret });
+        defer cxi_const_changed.deinit(allocator);
+        try std.testing.expect(!std.mem.eql(u8, &cxi_safe.cxi_blake3, &cxi_const_changed.cxi_blake3));
+
+        _ = try db.setInput(fid_root, root_reexport_src, .high);
+        var cxi_reexport = try db.computePackageCxiSummary(allocator, pkg_dep, &.{ fid_root, fid_secret });
+        defer cxi_reexport.deinit(allocator);
+        try std.testing.expect(cxi_reexport.caps.surface_caps.ffi);
+        try std.testing.expect(cxi_reexport.caps.surface_caps.unsafe_op);
+        try std.testing.expect(!std.mem.eql(u8, &cxi_safe.cxi_blake3, &cxi_reexport.cxi_blake3));
+
+        const non_os_bits: u16 = 0x0FFF & ~mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
+        try db.setPackageCapPolicy(pkg_dep, .{
+            .package_name = "reexport-pkg@1.0.0",
+            .policy_span = Span.init(fid_root, 0, 10),
+            .allowed_caps = mir_sast.EffectCapabilityMask.fromBits(non_os_bits),
+            .is_third_party_dependency = true,
+            .enforcement_scope = .surface,
+        });
+        var files_map: std.AutoHashMapUnmanaged(PackageId, []const FileId) = .empty;
+        defer files_map.deinit(allocator);
+        try files_map.put(allocator, pkg_dep, &.{ fid_root, fid_secret });
+        var cap_sink = DiagnosticSink.init(allocator);
+        defer cap_sink.deinit();
+        const cap_reports = try db.verifyWorkspaceCapabilitySandbox(allocator, &.{pkg_dep}, &files_map, &.{}, &cap_sink);
+        defer allocator.free(cap_reports);
+        var has_e0324 = false;
+        for (cap_sink.diagnostics.items) |diag_item| {
+            if (diag_item.code == .e0324_package_capability_violation) has_e0324 = true;
+        }
+        try std.testing.expect(has_e0324);
+    }
+
+    // [2] `@std_cap_boundary` on `.root` (including inactive `@cfg`) emits `E0327` and clears `is_std_cap_boundary`:
+    {
+        var db = try CompilerDb.init(allocator);
+        defer db.deinit();
+        db.setTargetSpec(codegen_abi.TargetSpec.X86_64_LINUX_GNU);
+        db.setPackageGraphMounted(true);
+
+        const fid_root = FileId.fromInt(410);
+        const spoof_src =
+            \\@cfg(target.os == .Windows)
+            \\@std_cap_boundary(clears = [ffi])
+            \\pub fn inactive_spoof() -> i32 = 0;
+            \\@std_cap_boundary(clears = [ffi, unsafe_op])
+            \\pub fn active_spoof() -> i32 = 1;
+        ;
+        try db.setFilePackageId(fid_root, .root);
+        _ = try db.setInput(fid_root, spoof_src, .low);
+        try db.registerPackageRootFile(.root, fid_root);
+        _ = try db.resolveSignatures(fid_root);
+        const sig_sink_ptr = db.getSignatureDiagnostics(fid_root).?;
+        var e0327_count: usize = 0;
+        for (sig_sink_ptr.diagnostics.items) |diag_item| {
+            if (diag_item.code == .e0327_forbidden_sandbox_bypass_attribute) e0327_count += 1;
+        }
+        try std.testing.expect(e0327_count >= 2);
+        const tree = try db.extractItemTree(fid_root);
+        for (tree.entries) |ent| {
+            if (db.symbol_table.def_to_symbol.get(ent.def_id.asInt())) |sym_idx| {
+                const sym_rec = db.symbol_table.getSymbol(sym_idx).*;
+                try std.testing.expect(!sym_rec.contract_flags.is_std_cap_boundary);
+                try std.testing.expectEqual(@as(u16, 0), sym_rec.cap_clears_mask);
+                try std.testing.expectEqual(@as(u16, 0), sym_rec.cap_emits_mask);
+            }
+        }
+    }
+
+    // [3] Cross-OS inactive `@cfg` wildcard `use cx.net.*;` + intra-package helper union + pre-execution `E0325`:
+    {
+        var db = try CompilerDb.init(allocator);
+        defer db.deinit();
+        db.setTargetSpec(codegen_abi.TargetSpec.X86_64_LINUX_GNU);
+        db.setPackageGraphMounted(true);
+
+        const pkg_cfg = PackageId.fromInt(3);
+        const fid_cfg_root = FileId.fromInt(420);
+        const fid_cfg_helper = FileId.fromInt(421);
+        const helper_src =
+            \\extern "C" fn win_sys_call() -> i32;
+            \\pub(pkg) fn pkg_helper() -> i32 {
+            \\    return unsafe { win_sys_call() };
+            \\}
+        ;
+        const cfg_root_src =
+            \\mod helper;
+            \\@cfg(target.os == .Windows)
+            \\pub fn run_win() -> i32 {
+            \\    use cx.net.*;
+            \\    let sock = connect();
+            \\    return helper.pkg_helper() + sock;
+            \\}
+            \\pub fn noop() -> i32 = 0;
+        ;
+        try db.setFilePackageId(fid_cfg_root, pkg_cfg);
+        try db.setFilePackageId(fid_cfg_helper, pkg_cfg);
+        _ = try db.setInput(fid_cfg_helper, helper_src, .high);
+        _ = try db.setInput(fid_cfg_root, cfg_root_src, .high);
+        try db.registerPackageRootFile(pkg_cfg, fid_cfg_root);
+        try db.bindExternalModule(fid_cfg_root, "helper", fid_cfg_helper);
+
+        var cxi_cfg = try db.computePackageCxiSummary(allocator, pkg_cfg, &.{ fid_cfg_root, fid_cfg_helper });
+        defer cxi_cfg.deinit(allocator);
+        try std.testing.expect(cxi_cfg.inactive_scan.has_pub_inactive_cfg_items);
+        try std.testing.expect(cxi_cfg.caps.surface_caps.net);
+        try std.testing.expect(cxi_cfg.caps.surface_caps.ffi);
+
+        const fid_ct = FileId.fromInt(425);
+        const ct_dead_net_src =
+            \\fn dead_net_branch(flag: bool) -> i32 {
+            \\    if flag {
+            \\        return unsafe { fs_open() };
+            \\    }
+            \\    return 9;
+            \\}
+            \\extern "C" fn fs_open() -> i32;
+            \\pub fn trigger_ct() -> i32 {
+            \\    return comptime { dead_net_branch(false) };
+            \\}
+        ;
+        try db.setFilePackageId(fid_ct, .root);
+        _ = try db.setInput(fid_ct, ct_dead_net_src, .low);
+        const ct_tree = try db.extractItemTree(fid_ct);
+        var has_e0325 = false;
+        for (ct_tree.entries) |ent| {
+            if (std.mem.eql(u8, ent.name_text, "trigger_ct")) {
+                _ = try db.verifySastMir(ent.def_id);
+                if (db.getSastDiagnostics(ent.def_id)) |sast_sink_ptr| {
+                    for (sast_sink_ptr.diagnostics.items) |diag_item| {
+                        if (diag_item.code == .e0325_comptime_sandbox_violation) has_e0325 = true;
+                    }
+                }
+            }
+        }
+        try std.testing.expect(has_e0325);
+    }
+
+    // [4] Cross-package `@c_import("config.h")` isolation + pre-open macro `#include` jail check (`E0326`):
+    {
+        const io = std.testing.io;
+        const jail_base = ".zig-cache/c_import_jail_test";
+        std.Io.Dir.cwd().deleteTree(io, jail_base) catch {};
+        defer std.Io.Dir.cwd().deleteTree(io, jail_base) catch {};
+        const dir_a = jail_base ++ "/pkg_a";
+        const dir_b = jail_base ++ "/pkg_b";
+        try std.Io.Dir.cwd().createDirPath(io, dir_a);
+        try std.Io.Dir.cwd().createDirPath(io, dir_b);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir_a ++ "/config.h", .data = "#define CFG_VAL 11\n" });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir_b ++ "/config.h", .data = "#define CFG_VAL 22\n" });
+        try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = dir_a ++ "/escape.h",
+            .data = "#define SECRET \"../pkg_b/config.h\"\n#include SECRET\n",
+        });
+
+        var db = try CompilerDb.init(allocator);
+        defer db.deinit();
+        db.setPackageGraphMounted(true);
+        db.setEmbedIo(io);
+        db.setEmbedSandbox(jail_base, null);
+
+        const pkg_a = PackageId.fromInt(2);
+        const pkg_b = PackageId.fromInt(3);
+        const fid_a = FileId.fromInt(430);
+        const fid_b = FileId.fromInt(431);
+        const fid_esc = FileId.fromInt(432);
+        try db.setFilePackageId(fid_a, pkg_a);
+        try db.setFilePackageId(fid_b, pkg_b);
+        try db.setFilePackageId(fid_esc, pkg_a);
+        try db.setFilePath(fid_a, dir_a ++ "/lib.cx");
+        try db.setFilePath(fid_b, dir_b ++ "/lib.cx");
+        try db.setFilePath(fid_esc, dir_a ++ "/esc.cx");
+        try db.setPackageEmbedJail(pkg_a, .{ .host_dir_jailed = dir_a });
+        try db.setPackageEmbedJail(pkg_b, .{ .host_dir_jailed = dir_b });
+
+        _ = try db.setInput(fid_a, "const c_mod = @c_import(\"config.h\");\npub const VAL_A: i32 = c_mod.CFG_VAL;\n", .high);
+        _ = try db.setInput(fid_b, "const c_mod = @c_import(\"config.h\");\npub const VAL_B: i32 = c_mod.CFG_VAL;\n", .high);
+        _ = try db.setInput(fid_esc, "const esc_mod = @c_import(\"escape.h\");\npub fn probe() -> i32 = 0;\n", .high);
+
+        const tree_a = try db.extractItemTree(fid_a);
+        const tree_b = try db.extractItemTree(fid_b);
+        try std.testing.expectEqual(@as(i128, 11), (try db.evalComptimeDef(tree_a.entries[1].def_id)).value.int_val);
+        try std.testing.expectEqual(@as(i128, 22), (try db.evalComptimeDef(tree_b.entries[1].def_id)).value.int_val);
+
+        const tree_esc = try db.extractItemTree(fid_esc);
+        _ = try db.typecheckBody(tree_esc.entries[0].def_id);
+        var has_e0326 = false;
+        if (db.getSignatureDiagnostics(fid_esc)) |sig_sink| {
+            for (sig_sink.diagnostics.items) |diag_item| {
+                if (diag_item.code == .e0326_embed_path_escape) has_e0326 = true;
+            }
+        }
+        if (db.getBodyDiagnostics(tree_esc.entries[0].def_id)) |body_sink| {
+            for (body_sink.diagnostics.items) |diag_item| {
+                if (diag_item.code == .e0326_embed_path_escape) has_e0326 = true;
+            }
+        }
+        try std.testing.expect(has_e0326);
+    }
 }

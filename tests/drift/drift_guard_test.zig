@@ -625,6 +625,9 @@ test "test_drift_guard_phase5_hir_mir_vm_opt_layouts_cli_flags_and_diagnostics" 
         const sub_help_out = sub_help_writer.buffered();
         for (router.COMPILE_FLAGS) |comp_flag| {
             try std.testing.expect(std.mem.indexOf(u8, sub_help_out, comp_flag.long_flag) != null);
+            if (comp_flag.short_flag) |short_s| {
+                try std.testing.expect(std.mem.indexOf(u8, sub_help_out, short_s) != null);
+            }
             try std.testing.expect(std.mem.indexOf(u8, sub_help_out, comp_flag.summary) != null);
         }
 
@@ -1455,6 +1458,36 @@ test "test_drift_guard_phase9_pkg_seams_diagnostics_and_cli" {
         std.math.Order.lt,
         std.mem.order(u8, "--offline", "--ofmt"),
     );
+    var pkg_cli_sink = corex.DiagnosticSink.init(std.testing.allocator);
+    defer pkg_cli_sink.deinit();
+    const parsed_pkg_cli = try router.parseArgs(
+        &.{
+            "check",
+            "-F",
+            "tls,simd",
+            "--no-default-features",
+            "--frozen",
+            "--locked",
+            "--offline",
+            "--verify-checksums",
+            "--manifest-path=ws/corex.toml",
+        },
+        &pkg_cli_sink,
+    );
+    try std.testing.expect(!pkg_cli_sink.hasErrors());
+    try std.testing.expect(parsed_pkg_cli.has_no_default_features);
+    try std.testing.expect(parsed_pkg_cli.is_frozen);
+    try std.testing.expect(parsed_pkg_cli.is_locked);
+    try std.testing.expect(parsed_pkg_cli.is_offline);
+    try std.testing.expect(parsed_pkg_cli.is_verifying_checksums);
+    try std.testing.expectEqualStrings("ws/corex.toml", parsed_pkg_cli.manifest_path.?);
+    try std.testing.expectEqual(@as(usize, 2), parsed_pkg_cli.features.len);
+
+    var script_cli_sink = corex.DiagnosticSink.init(std.testing.allocator);
+    defer script_cli_sink.deinit();
+    const parsed_script_cli = try router.parseArgs(&.{"tool.cx"}, &script_cli_sink);
+    try std.testing.expect(!script_cli_sink.hasErrors());
+    try std.testing.expectEqual(router.SubcommandId.run, parsed_script_cli.action.execute_subcommand.subcommand);
 
     // [2] Verify `pkg_conflict_seam.zig` (`<= 35` non-comment/non-blank LOC) and exact binary seam layouts:
     const conflict_seam_loc = try countNonCommentNonBlankLines(
@@ -1496,9 +1529,8 @@ test "test_drift_guard_phase9_pkg_seams_diagnostics_and_cli" {
     try std.testing.expectEqual(@as(usize, 12), @sizeOf(corex.SeriesKey));
     try std.testing.expectEqual(@as(usize, 4), @alignOf(corex.SeriesKey));
 
-    // [5] Verify all 7 new Phase 9 `DiagnosticCode` tags (`E0010`–`E0016`) + reused `DR-17` codes
-    //     (`E0324`, `E0325`, `E0326`, `E0327`, `E0435`, `W0330`) in `DIAGNOSTIC_CATALOG`, `stage0/src/`,
-    //     and `tests/unit/`:
+    // [5] Verify all 7 new Phase 9 `DiagnosticCode` tags (`E0010`–`E0016`) + reused `DR-17` codes (`E0324`–`E0327`,
+    //     `E0435`, `W0330`) in `DIAGNOSTIC_CATALOG`, `stage0/src/`, and `tests/unit/`:
     try std.testing.expectEqual(@as(usize, 126), diagnostic.DIAGNOSTIC_CATALOG.len);
     try std.testing.expectEqual(
         DiagnosticCode.e0435_invalid_cfg_predicate,

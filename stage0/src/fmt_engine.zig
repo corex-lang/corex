@@ -2777,8 +2777,7 @@ const CstFormatter = struct {
 
     /// Finds the `<snake_alias>` identifier token inside an inline `use "<spec>" as <alias>;` `.use_tree`.
     fn findInlineUseAliasIdentToken(self: *const CstFormatter, tree_idx: CstNodeIndex) ?TokenIndex {
-        const tree = self.cst_arena.getNode(tree_idx);
-        const end_idx: usize = tree_idx.asInt() + tree.subtree_size;
+        const end_idx: usize = tree_idx.asInt() + self.cst_arena.getNode(tree_idx).subtree_size;
         var has_leading_string = false;
         var has_seen_as = false;
         var child_cursor: usize = tree_idx.asInt() + 1;
@@ -7876,12 +7875,10 @@ fn spliceFrontmatterAndBody(
         }
     }
     const norm_header_len = raw_header.len - cr_skip_count;
-    const has_header_nl = raw_header.len > 0 and raw_header[raw_header.len - 1] == '\n';
-    const extra_header_nl: usize = if (!has_header_nl) 1 else 0;
+    const extra_header_nl: usize = if (raw_header.len == 0 or raw_header[raw_header.len - 1] != '\n') 1 else 0;
     const extra_sep_nl: usize = if (body_text.len > 0 and prefix.has_blank_separator) 1 else 0;
 
-    const total_len = norm_header_len + extra_header_nl + extra_sep_nl + body_text.len;
-    const out_buf = try allocator.alloc(u8, total_len);
+    const out_buf = try allocator.alloc(u8, norm_header_len + extra_header_nl + extra_sep_nl + body_text.len);
     var write_off: usize = 0;
     if (cr_skip_count == 0) {
         @memcpy(out_buf[0..raw_header.len], raw_header);

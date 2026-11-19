@@ -376,7 +376,8 @@ pub async fn parallel_digest(label: CStr, payload: &[u8]) -> i32 {
 [package]
 name = "metrics-agent"
 version = "0.1.0"
-corex = "1.0"
+edition = "2026"
+corex = "^0.1.0"
 
 [security]
 default_dep_policy = "zero_trust"
@@ -394,10 +395,10 @@ uring-net = { version = "0.3.0", target = "target.os == .Linux", allow_caps = ["
 [dependencies]
 json-wire = { version = "1.4.0", allow_caps = [] }
 ---
-// Single-file `.cx` script (`corex run script.cx`) locks out-of-tree under `<COREX_HOME>/target/scripts/<blake3>/`:
+// Single-file `.cx` script (`corex script.cx`) locks out-of-tree under `<COREX_HOME>/target/scripts/<blake3>/`:
 use json_wire.parse_counter;
 
 pub fn main() -> i32 {
-    return parse_counter("{\"ok\":1}");
+    return parse_counter(r#"{"ok":1}"#);
 }
 ```

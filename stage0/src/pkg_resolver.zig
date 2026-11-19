@@ -16,6 +16,7 @@ const mem_foundation = @import("mem_foundation.zig");
 const vfs_sourcemap = @import("vfs_sourcemap.zig");
 const symbol_resolver = @import("symbol_resolver.zig");
 const mir_sast = @import("mir_sast.zig");
+const mir_vm = @import("mir_vm.zig");
 const codegen_abi = @import("codegen_abi.zig");
 const diagnostic = @import("diag/diagnostic.zig");
 const style = @import("cli/style.zig");
@@ -117,7 +118,7 @@ pub const SeriesKey = extern struct {
 
     /// Constructs a registry `SeriesKey` for `(pkg_name_sym, ver)` using `DR-11` §3.1 slot rules.
     pub inline fn forRegistrySemVer(pkg_name_sym: SymbolId, ver: SemVer) SeriesKey {
-        const slot = ver.seriesSlot();
+        const slot = ver.classifySeriesSlot();
         return .{
             .pkg_name_sym = pkg_name_sym,
             .tier = slot.tier,
@@ -156,7 +157,7 @@ pub const FeatureBitset512 = struct {
         return is_new;
     }
 
-    /// Unions `other` into `self` and returns `true` if `(other \ self) != ∅` (`P2-1`).
+    /// Unions `other` into `self` and returns `true` if `(other \ self) != ∅`.
     pub inline fn unionReturningChanged(self: *FeatureBitset512, other: FeatureBitset512) bool {
         var has_changed = false;
         var i: usize = 0;
@@ -308,6 +309,8 @@ pub const ResolveOptions = struct {
     local_registry_dir: ?[]const u8 = null,
     /// Canonical `COREX_HOME` directory path owning `cache/blake3`.
     corex_home_dir: []const u8,
+    /// Optional caller-owned `PkgCache` preserving `BoundedMetadataLru` across repeated resolutions.
+    shared_cache: ?*pkg_cache.PkgCache = null,
     /// Active inline `use "<spec>" as <alias>;` imports extracted from root `.cx` files.
     inline_imports: []const symbol_resolver.InlineUseImport = &.{},
     /// Unresolved bare `use <snake_pkg>…;` root identifiers eligible for unlocked auto-sync.
@@ -338,10 +341,20 @@ const CandidateVersionMeta = struct {
     is_yanked: bool = false,
     /// `true` if `[features]` or optional dependencies are declared.
     has_feature_manifest: bool = false,
+    /// `false` only when synthesized from a `corex.lock` entry lacking an embedded `corex.toml`.
+    has_authoritative_features: bool = true,
     /// Sorted `[features]` declarations.
     features: []const FeatureDecl = &.{},
     /// Outgoing dependency edges from this candidate version.
     dependencies: []const DependencySpec = &.{},
+    /// Zero-allocation inline bitset (`0..511`) of declared `[features]` and optional dependency aliases.
+    declared_bits: FeatureBitset512 = .{},
+    /// Zero-allocation inline bitset (`0..511`) of `optional = true` dependency `alias_kebab` names.
+    opt_dep_bits: FeatureBitset512 = .{},
+    /// Overflow map (`bit >= 512`) of declared `[features]` keys and optional dependency `alias_kebab` names.
+    overflow_declared_set: std.AutoHashMapUnmanaged(StringId, void) = .empty,
+    /// Overflow map (`bit >= 512`) of `optional = true` dependency `alias_kebab` names.
+    overflow_opt_dep_set: std.AutoHashMapUnmanaged(StringId, void) = .empty,
     /// Expected `.cxtree` digest when known from index or `corex.lock`.
     expected_tree_blake3: ?[32]u8 = null,
     /// Expected archive `BLAKE3` digest when known from index or `corex.lock`.
@@ -358,8 +371,6 @@ const CandidateVersionMeta = struct {
     tlog_root: ?[32]u8 = null,
     /// Optional RFC 6962 transparency-log sibling proof hashes.
     tlog_proof: []const [32]u8 = &.{},
-    /// Optional RFC 6962 custom leaf payload (`null` uses canonical `"corex-publish-v1\n…"` leaf).
-    tlog_leaf_override: ?[]const u8 = null,
     /// Optional companion `.obao` path in local registry store for Bao verification.
     obao_file_path: ?[]const u8 = null,
     /// Optional raw archive/cxtree file path in local registry store.
@@ -478,6 +489,92 @@ const CdclTrailEntry = struct {
     },
 };
 
+/// Zero-allocation non-backtracking byte cursor for unescaped sparse-index NDJSON lines (`AGENTS.md` §2).
+const FastNdjsonCursor = struct {
+    /// Borrowed single-line UTF-8 JSON buffer containing no `\` escape bytes.
+    src: []const u8,
+    /// Current byte offset within `src`.
+    pos: usize = 0,
+
+    /// Advances `pos` past ASCII horizontal whitespace (`' '`, `'\t'`, `'\r'`).
+    inline fn skipWs(self: *FastNdjsonCursor) void {
+        while (self.pos < self.src.len) {
+            const byte_val = self.src[self.pos];
+            if (byte_val == ' ' or byte_val == '\t' or byte_val == '\r') {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Peeks the next non-whitespace byte without consuming it (`null` at EOF).
+    inline fn peekByte(self: *FastNdjsonCursor) ?u8 {
+        self.skipWs();
+        return if (self.pos < self.src.len) self.src[self.pos] else null;
+    }
+
+    /// Consumes and returns the next non-whitespace byte (`error.FallbackToDom` at EOF).
+    inline fn readNextByte(self: *FastNdjsonCursor) !u8 {
+        self.skipWs();
+        if (self.pos >= self.src.len) return error.FallbackToDom;
+        const byte_val = self.src[self.pos];
+        self.pos += 1;
+        return byte_val;
+    }
+
+    /// Consumes `expected` after skipping whitespace (`error.FallbackToDom` on mismatch).
+    inline fn expectByte(self: *FastNdjsonCursor, expected: u8) !void {
+        if ((try self.readNextByte()) != expected) return error.FallbackToDom;
+    }
+
+    /// Scans an unescaped `"…"` JSON string via SIMD `indexOfScalarPos` (`error.FallbackToDom` on control bytes).
+    inline fn readUnescapedStr(self: *FastNdjsonCursor) ![]const u8 {
+        try self.expectByte('"');
+        const start_idx = self.pos;
+        const end_idx = std.mem.indexOfScalarPos(u8, self.src, start_idx, '"') orelse return error.FallbackToDom;
+        const str_slice = self.src[start_idx..end_idx];
+        for (str_slice) |ch_byte| {
+            if (ch_byte < 0x20) return error.FallbackToDom;
+        }
+        self.pos = end_idx + 1;
+        return str_slice;
+    }
+
+    /// Consumes a JSON `true` or `false` boolean literal (`error.FallbackToDom` otherwise).
+    inline fn readBool(self: *FastNdjsonCursor) !bool {
+        self.skipWs();
+        const rem = self.src[self.pos..];
+        if (std.mem.startsWith(u8, rem, "true")) {
+            self.pos += 4;
+            return true;
+        }
+        if (std.mem.startsWith(u8, rem, "false")) {
+            self.pos += 5;
+            return false;
+        }
+        return error.FallbackToDom;
+    }
+};
+
+/// Dense per-`series_id` graph finalization metadata avoiding hash-table churn across resolved nodes (`AGENTS.md` §2).
+const SidGraphMeta = struct {
+    /// Assigned `PackageId` (`0 = .root`, `>= 2` = external packages; `.none` if unreachable).
+    pkg_id: PackageId = .none,
+    /// `true` when at least one non-`.dev` dependency edge targets this series.
+    has_normal_edge: bool = false,
+    /// `true` when at least one workspace-owned `allow_caps` override targets this series.
+    has_allow_caps: bool = false,
+    /// Union of workspace-owned `allow_caps` masks targeting this series.
+    allow_union: EffectCapabilityMask = .EMPTY,
+    /// Union of workspace-owned `deny_caps` masks targeting this series.
+    deny_union: EffectCapabilityMask = .EMPTY,
+    /// First non-empty dependency declaration span targeting this series (`has_first_span` tracks presence).
+    first_span: Span = Span.ZERO,
+    /// `true` once `first_span` has been recorded.
+    has_first_span: bool = false,
+};
+
 // --------------------------------------- CONSTS ----------------------------------------
 
 /// Maximum CDCL conflict-resolution iterations before deterministic abort (`DR-11` §3.3).
@@ -539,7 +636,7 @@ inline fn setStateBit(words: []u64, state_idx: usize) void {
 }
 
 /// Counts total set bits across `words`.
-fn popcountStateWords(words: []const u64) usize {
+fn countSetStateBits(words: []const u64) usize {
     var total: usize = 0;
     for (words) |word_val| {
         total += @popCount(word_val);
@@ -548,7 +645,7 @@ fn popcountStateWords(words: []const u64) usize {
 }
 
 /// Returns the lowest set state index in `words`, or `null` if all zero.
-fn firstSetStateBit(words: []const u64) ?usize {
+fn findFirstSetStateBit(words: []const u64) ?usize {
     for (words, 0..) |word_val, word_i| {
         if (word_val != 0) {
             return (word_i << 6) + @ctz(word_val);
@@ -599,7 +696,7 @@ inline fn extractTermFeatureId(term: IncompatTerm) StringId {
 fn isStateMatchingVersionTerm(term: IncompatTerm, cand_len: usize, state_idx: usize) bool {
     const is_pos = isPositiveTerm(term);
     if (state_idx >= cand_len) {
-        // `STATE_ABSENT`: never in `S ∈ Range`, always in `S ∉ Range`:
+        // `STATE_ABSENT` is never in `S ∈ Range`, and always in `S ∉ Range`:
         return !is_pos;
     }
     const is_min_inc = (term.flags_and_feat & 0x02) != 0;
@@ -670,6 +767,7 @@ fn isHexGitOid40(raw_str: []const u8) bool {
 
 /// Detects entry `.cx` relative paths (`src/root.cx`, `src/lib.cx`, `root.cx`, `src/main.cx`, `main.cx`) from `manifest` & `entries`.
 fn detectEntryRelPathsFromList(
+    allocator: std.mem.Allocator,
     arena: *BumpArena,
     interner: *const StringInterner,
     manifest_opt: ?*const Manifest,
@@ -692,32 +790,30 @@ fn detectEntryRelPathsFromList(
         }
     }
 
-    const hasPath = struct {
-        /// Returns `true` if `needle` appears in `haystack`.
-        fn check(haystack: []const []const u8, needle: []const u8) bool {
-            for (haystack) |item| {
-                if (std.mem.eql(u8, item, needle)) return true;
+    if (lib_rel == null or bin_rel == null) {
+        var path_set: std.StringHashMapUnmanaged(void) = .empty;
+        defer path_set.deinit(allocator);
+        try path_set.ensureTotalCapacity(allocator, @intCast(rel_paths.len));
+        for (rel_paths) |item| {
+            path_set.putAssumeCapacity(item, {});
+        }
+        if (lib_rel == null) {
+            if (path_set.contains("src/root.cx")) {
+                lib_rel = "src/root.cx";
+            } else if (path_set.contains("src/lib.cx")) {
+                lib_rel = "src/lib.cx";
+            } else if (path_set.contains("root.cx")) {
+                lib_rel = "root.cx";
+            } else if (path_set.contains("lib.cx")) {
+                lib_rel = "lib.cx";
             }
-            return false;
         }
-    }.check;
-
-    if (lib_rel == null) {
-        if (hasPath(rel_paths, "src/root.cx")) {
-            lib_rel = "src/root.cx";
-        } else if (hasPath(rel_paths, "src/lib.cx")) {
-            lib_rel = "src/lib.cx";
-        } else if (hasPath(rel_paths, "root.cx")) {
-            lib_rel = "root.cx";
-        } else if (hasPath(rel_paths, "lib.cx")) {
-            lib_rel = "lib.cx";
-        }
-    }
-    if (bin_rel == null) {
-        if (hasPath(rel_paths, "src/main.cx")) {
-            bin_rel = "src/main.cx";
-        } else if (hasPath(rel_paths, "main.cx")) {
-            bin_rel = "main.cx";
+        if (bin_rel == null) {
+            if (path_set.contains("src/main.cx")) {
+                bin_rel = "src/main.cx";
+            } else if (path_set.contains("main.cx")) {
+                bin_rel = "main.cx";
+            }
         }
     }
     return .{ .lib_rel = lib_rel, .bin_rel = bin_rel };
@@ -743,7 +839,23 @@ fn ingestHostDirectoryAsCxTree(
     lib_rel: ?[]const u8,
     bin_rel: ?[]const u8,
 } {
-    var opened_dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    var opened_dir = std.Io.Dir.cwd().openDir(io, dir_path, .{
+        .iterate = true,
+        .follow_symlinks = !is_publish_to_cache,
+    }) catch |open_err| {
+        if (is_publish_to_cache and open_err == error.SymLinkLoop) {
+            if (sink) |diag_sink| {
+                try diag_sink.emit(.{
+                    .code = .e0015_cache_integrity_mismatch,
+                    .severity = .err,
+                    .primary_span = span,
+                    .message = "registry package directory cannot be a symbolic link",
+                });
+            }
+            return error.CacheIntegrityMismatch;
+        }
+        return open_err;
+    };
     defer opened_dir.close(io);
 
     var walker = try opened_dir.walk(allocator);
@@ -758,6 +870,17 @@ fn ingestHostDirectoryAsCxTree(
     defer blob_arena.deinit();
 
     while (try walker.next(io)) |entry| {
+        if (is_publish_to_cache and entry.kind == .sym_link) {
+            if (sink) |diag_sink| {
+                try diag_sink.emit(.{
+                    .code = .e0015_cache_integrity_mismatch,
+                    .severity = .err,
+                    .primary_span = span,
+                    .message = "symbolic links are forbidden inside external registry package directories",
+                });
+            }
+            return error.CacheIntegrityMismatch;
+        }
         if (entry.kind != .file) continue;
         const norm_rel = try arena.dupe(u8, entry.path);
         for (norm_rel) |*byte_ptr| {
@@ -806,7 +929,7 @@ fn ingestHostDirectoryAsCxTree(
         }
     }
 
-    const detected = try detectEntryRelPathsFromList(arena, interner, manifest_opt, rel_names.items);
+    const detected = try detectEntryRelPathsFromList(allocator, arena, interner, manifest_opt, rel_names.items);
     return .{
         .tree_blake3 = built.tree_blake3,
         .cxtree_bytes = built.bytes,
@@ -837,6 +960,8 @@ fn ingestTarArchiveIntoCache(
     allocator: std.mem.Allocator,
     io: std.Io,
     arena: *BumpArena,
+    interner: *StringInterner,
+    cfg_env: *const symbol_resolver.CfgEnv,
     pkg_name: []const u8,
     tar_bytes: []const u8,
     cache: *pkg_cache.PkgCache,
@@ -967,32 +1092,99 @@ fn ingestTarArchiveIntoCache(
     defer allocator.free(built.bytes);
     try cache.publishCxTree(io, built.bytes, built.tree_blake3, sink, span);
 
-    var lib_rel: ?[]const u8 = null;
-    var bin_rel: ?[]const u8 = null;
-    for (rel_names.items) |rel_p| {
-        if (std.mem.eql(u8, rel_p, "src/root.cx")) lib_rel = rel_p;
-        if (lib_rel == null and std.mem.eql(u8, rel_p, "src/lib.cx")) lib_rel = rel_p;
-        if (lib_rel == null and std.mem.eql(u8, rel_p, "root.cx")) lib_rel = rel_p;
-        if (std.mem.eql(u8, rel_p, "src/main.cx")) bin_rel = rel_p;
-        if (bin_rel == null and std.mem.eql(u8, rel_p, "main.cx")) bin_rel = rel_p;
+    var parsed_manifest_opt: ?pkg_manifest.ParsedManifestResult = null;
+    defer if (parsed_manifest_opt) |*pm| pm.doc.deinit(allocator);
+    if (manifest_copy) |toml_bytes| {
+        parsed_manifest_opt = try pkg_manifest.parseManifest(
+            allocator,
+            arena,
+            interner,
+            .none,
+            toml_bytes,
+            cfg_env,
+            null,
+        );
     }
+    const detected = try detectEntryRelPathsFromList(
+        allocator,
+        arena,
+        interner,
+        if (parsed_manifest_opt) |*pm| &pm.manifest else null,
+        rel_names.items,
+    );
     return .{
         .tree_blake3 = built.tree_blake3,
         .manifest_bytes = manifest_copy,
-        .lib_rel = lib_rel,
-        .bin_rel = bin_rel,
+        .lib_rel = detected.lib_rel,
+        .bin_rel = detected.bin_rel,
     };
 }
 
 // ----------- Sparse Registry Index & Git Providers ------------
 
+/// Validates that `rel_path` is a jailed forward-slash relative path inside `reg_root_dir` with zero symlinks.
+fn validateAndJailSparseIndexPath(
+    io: std.Io,
+    arena: *BumpArena,
+    reg_root_dir: []const u8,
+    rel_path: []const u8,
+    is_dir_target: bool,
+) !?[]const u8 {
+    if (std.mem.indexOfScalar(u8, rel_path, '\\') != null or !mir_vm.isValidSandboxedEmbedPath(rel_path)) {
+        return null;
+    }
+
+    // Walk existing path segments beneath `reg_root_dir` with `.follow_symlinks = false` to block symlink escapes:
+    if (std.Io.Dir.cwd().openDir(io, reg_root_dir, .{ .follow_symlinks = false })) |opened_root| {
+        var cur_dir = opened_root;
+        defer cur_dir.close(io);
+
+        var seg_start: usize = 0;
+        var scan_i: usize = 0;
+        while (scan_i <= rel_path.len) : (scan_i += 1) {
+            const is_end = scan_i == rel_path.len;
+            if (!is_end and rel_path[scan_i] != '/') continue;
+            const seg = rel_path[seg_start..scan_i];
+            if (is_end and !is_dir_target) {
+                if (cur_dir.openFile(io, seg, .{
+                    .mode = .read_only,
+                    .allow_directory = false,
+                    .follow_symlinks = false,
+                    .resolve_beneath = true,
+                })) |leaf_file| {
+                    leaf_file.close(io);
+                } else |file_err| switch (file_err) {
+                    error.FileNotFound => {},
+                    else => return null,
+                }
+                break;
+            }
+            const next_dir = cur_dir.openDir(io, seg, .{ .follow_symlinks = false }) catch |dir_err| switch (dir_err) {
+                error.FileNotFound => break,
+                else => return null,
+            };
+            cur_dir.close(io);
+            cur_dir = next_dir;
+            seg_start = scan_i + 1;
+        }
+    } else |root_err| switch (root_err) {
+        error.FileNotFound => {},
+        else => return null,
+    }
+
+    return try std.fmt.allocPrint(arena.asAllocator(), "{s}/{s}", .{ reg_root_dir, rel_path });
+}
+
 /// Parses a single JSON object from a sparse-index NDJSON line into `CandidateVersionMeta`.
 fn parseSparseIndexJsonObject(
     allocator: std.mem.Allocator,
+    io: std.Io,
     arena: *BumpArena,
     interner: *StringInterner,
     reg_root_dir: ?[]const u8,
     obj: std.json.ObjectMap,
+    has_security_error: *bool,
+    sink: ?*DiagnosticSink,
 ) !?CandidateVersionMeta {
     const vers_val = obj.get("vers") orelse obj.get("version") orelse return null;
     if (vers_val != .string) return null;
@@ -1138,10 +1330,6 @@ fn parseSparseIndexJsonObject(
         (if (tr_v == .string) parseFlexibleBlake3Hex(tr_v.string) else null)
     else
         null;
-    const tlog_leaf_ov: ?[]const u8 = if (obj.get("tlog_leaf")) |tl_v|
-        (if (tl_v == .string) try arena.dupe(u8, tl_v.string) else null)
-    else
-        null;
 
     var proof_hashes: std.ArrayListUnmanaged([32]u8) = .empty;
     defer proof_hashes.deinit(allocator);
@@ -1162,40 +1350,85 @@ fn parseSparseIndexJsonObject(
     var archive_path: ?[]const u8 = null;
     if (reg_root_dir) |reg_dir| {
         if (obj.get("path") orelse obj.get("src_dir")) |dir_v| {
-            if (dir_v == .string and dir_v.string.len > 0) {
-                host_pkg_dir = if (std.fs.path.isAbsolute(dir_v.string))
-                    try arena.dupe(u8, dir_v.string)
-                else
-                    try std.fmt.allocPrint(arena.asAllocator(), "{s}/{s}", .{ reg_dir, dir_v.string });
+            if (dir_v != .string or dir_v.string.len == 0) {
+                has_security_error.* = true;
+                if (sink) |diag_sink| {
+                    try diag_sink.emit(.{
+                        .code = .e0015_cache_integrity_mismatch,
+                        .severity = .err,
+                        .message = "sparse-index `path` field must be a non-empty jailed relative directory string",
+                    });
+                }
+                return null;
             }
-        } else if (pkg_name_str.len > 0) {
-            const ver_text = vers_val.string;
-            var host_dir_buf: [512]u8 = undefined;
-            if (std.fmt.bufPrint(&host_dir_buf, "{s}/packages/{s}-{s}", .{ reg_dir, pkg_name_str, ver_text })) |dir_s| {
-                host_pkg_dir = try arena.dupe(u8, dir_s);
-            } else |_| {
-                host_pkg_dir = try std.fmt.allocPrint(
-                    arena.asAllocator(),
-                    "{s}/packages/{s}-{s}",
-                    .{ reg_dir, pkg_name_str, ver_text },
-                );
-            }
+            host_pkg_dir = (try validateAndJailSparseIndexPath(io, arena, reg_dir, dir_v.string, true)) orelse {
+                has_security_error.* = true;
+                if (sink) |diag_sink| {
+                    try diag_sink.emit(.{
+                        .code = .e0015_cache_integrity_mismatch,
+                        .severity = .err,
+                        .message = "sparse-index `path` escapes registry root or traverses a symbolic link",
+                    });
+                }
+                return null;
+            };
+        } else if (pkg_manifest.isValidPackageNameKebab(pkg_name_str) and
+            std.mem.indexOfAny(u8, vers_val.string, "/\\:") == null and
+            mir_vm.isValidSandboxedEmbedPath(vers_val.string))
+        {
+            host_pkg_dir = try std.fmt.allocPrint(
+                arena.asAllocator(),
+                "{s}/packages/{s}-{s}",
+                .{ reg_dir, pkg_name_str, vers_val.string },
+            );
         }
         if (obj.get("obao") orelse obj.get("obao_path")) |ob_v| {
-            if (ob_v == .string and ob_v.string.len > 0) {
-                obao_path = if (std.fs.path.isAbsolute(ob_v.string))
-                    try arena.dupe(u8, ob_v.string)
-                else
-                    try std.fmt.allocPrint(arena.asAllocator(), "{s}/{s}", .{ reg_dir, ob_v.string });
+            if (ob_v != .string or ob_v.string.len == 0) {
+                has_security_error.* = true;
+                if (sink) |diag_sink| {
+                    try diag_sink.emit(.{
+                        .code = .e0015_cache_integrity_mismatch,
+                        .severity = .err,
+                        .message = "sparse-index `obao` field must be a non-empty jailed relative file path",
+                    });
+                }
+                return null;
             }
+            obao_path = (try validateAndJailSparseIndexPath(io, arena, reg_dir, ob_v.string, false)) orelse {
+                has_security_error.* = true;
+                if (sink) |diag_sink| {
+                    try diag_sink.emit(.{
+                        .code = .e0015_cache_integrity_mismatch,
+                        .severity = .err,
+                        .message = "sparse-index `obao` path escapes registry root or traverses a symbolic link",
+                    });
+                }
+                return null;
+            };
         }
         if (obj.get("archive") orelse obj.get("cxtree_path")) |ar_v| {
-            if (ar_v == .string and ar_v.string.len > 0) {
-                archive_path = if (std.fs.path.isAbsolute(ar_v.string))
-                    try arena.dupe(u8, ar_v.string)
-                else
-                    try std.fmt.allocPrint(arena.asAllocator(), "{s}/{s}", .{ reg_dir, ar_v.string });
+            if (ar_v != .string or ar_v.string.len == 0) {
+                has_security_error.* = true;
+                if (sink) |diag_sink| {
+                    try diag_sink.emit(.{
+                        .code = .e0015_cache_integrity_mismatch,
+                        .severity = .err,
+                        .message = "sparse-index `archive` field must be a non-empty jailed relative file path",
+                    });
+                }
+                return null;
             }
+            archive_path = (try validateAndJailSparseIndexPath(io, arena, reg_dir, ar_v.string, false)) orelse {
+                has_security_error.* = true;
+                if (sink) |diag_sink| {
+                    try diag_sink.emit(.{
+                        .code = .e0015_cache_integrity_mismatch,
+                        .severity = .err,
+                        .message = "sparse-index `archive` path escapes registry root or traverses a symbolic link",
+                    });
+                }
+                return null;
+            };
         }
     }
 
@@ -1223,23 +1456,353 @@ fn parseSparseIndexJsonObject(
         .tlog_tree_size = tlog_size,
         .tlog_root = tlog_root,
         .tlog_proof = try arena.dupe([32]u8, proof_hashes.items),
-        .tlog_leaf_override = tlog_leaf_ov,
         .obao_file_path = obao_path,
         .archive_file_path = archive_path,
     };
 }
 
-/// Probes sparse-index metadata files for `pkg_name` inside `base_index_dir` (NDJSON or directory scan of `<pkg>-<ver>/corex.toml`).
+/// Non-backtracking SIMD-accelerated NDJSON object scanner (`AGENTS.md` §2) avoiding `ObjectMap`, `Array`,
+/// and `BitStack` allocations on unescaped sparse-index lines (`returns error.FallbackToDom` on `\` or extended keys).
+fn parseSparseIndexScannerObject(
+    allocator: std.mem.Allocator,
+    index_alloc: std.mem.Allocator,
+    interner: *StringInterner,
+    default_registry_uri_id: StringId,
+    reg_root_dir: ?[]const u8,
+    trimmed_line: []const u8,
+) !?CandidateVersionMeta {
+    if (std.mem.indexOfScalar(u8, trimmed_line, '\\') != null) return error.FallbackToDom;
+
+    var cur = FastNdjsonCursor{ .src = trimmed_line };
+    try cur.expectByte('{');
+
+    var pkg_name_str: []const u8 = "";
+    var vers_raw_str: ?[]const u8 = null;
+    var is_yanked = false;
+    var links_id: StringId = .empty;
+    var corex_req_id: StringId = .empty;
+    var custom_src_uri_opt: ?[]const u8 = null;
+    var expected_cksum: ?[32]u8 = null;
+    var expected_tree: ?[32]u8 = null;
+    var has_feat_manifest = false;
+
+    var deps_stack: [16]DependencySpec = undefined;
+    var deps_count: usize = 0;
+    var deps_overflow: std.ArrayListUnmanaged(DependencySpec) = .empty;
+    defer deps_overflow.deinit(allocator);
+
+    var feats_stack: [16]FeatureDecl = undefined;
+    var feats_count: usize = 0;
+    var feats_overflow: std.ArrayListUnmanaged(FeatureDecl) = .empty;
+    defer feats_overflow.deinit(allocator);
+
+    if ((cur.peekByte() orelse return error.FallbackToDom) == '}') {
+        cur.pos += 1;
+    } else {
+        while (true) {
+            const top_key = try cur.readUnescapedStr();
+            try cur.expectByte(':');
+
+            if (std.mem.eql(u8, top_key, "name")) {
+                pkg_name_str = try cur.readUnescapedStr();
+            } else if (std.mem.eql(u8, top_key, "vers") or std.mem.eql(u8, top_key, "version")) {
+                const v_str = try cur.readUnescapedStr();
+                if (vers_raw_str == null or std.mem.eql(u8, top_key, "vers")) {
+                    vers_raw_str = v_str;
+                }
+            } else if (std.mem.eql(u8, top_key, "tree_hash") or std.mem.eql(u8, top_key, "tree_blake3")) {
+                expected_tree = parseFlexibleBlake3Hex(try cur.readUnescapedStr());
+            } else if (std.mem.eql(u8, top_key, "cksum") or std.mem.eql(u8, top_key, "checksum")) {
+                expected_cksum = parseFlexibleBlake3Hex(try cur.readUnescapedStr());
+            } else if (std.mem.eql(u8, top_key, "yanked")) {
+                is_yanked = try cur.readBool();
+            } else if (std.mem.eql(u8, top_key, "links")) {
+                const l_str = try cur.readUnescapedStr();
+                links_id = if (l_str.len > 0) try interner.intern(l_str) else .empty;
+            } else if (std.mem.eql(u8, top_key, "corex")) {
+                const c_str = try cur.readUnescapedStr();
+                corex_req_id = if (c_str.len > 0) try interner.intern(c_str) else .empty;
+            } else if (std.mem.eql(u8, top_key, "source")) {
+                const s_str = try cur.readUnescapedStr();
+                if (s_str.len > 0 and !std.mem.eql(u8, s_str, DEFAULT_REGISTRY_URI)) {
+                    custom_src_uri_opt = s_str;
+                }
+            } else if (std.mem.eql(u8, top_key, "deps")) {
+                try cur.expectByte('[');
+                if ((cur.peekByte() orelse return error.FallbackToDom) == ']') {
+                    cur.pos += 1;
+                } else {
+                    while (true) {
+                        try cur.expectByte('{');
+                        var alias_kebab: ?[]const u8 = null;
+                        var pkg_kebab_opt: ?[]const u8 = null;
+                        var req_str: []const u8 = "*";
+                        var kind_val: DepKind = .normal;
+                        var is_opt = false;
+                        var has_def = true;
+                        var target_id: StringId = .empty;
+                        var dep_feat_stack: [16]StringId = undefined;
+                        var dep_feat_len: usize = 0;
+                        var dep_feat_overflow: std.ArrayListUnmanaged(StringId) = .empty;
+                        defer dep_feat_overflow.deinit(allocator);
+
+                        if ((cur.peekByte() orelse return error.FallbackToDom) == '}') {
+                            cur.pos += 1;
+                        } else {
+                            while (true) {
+                                const dep_key = try cur.readUnescapedStr();
+                                try cur.expectByte(':');
+                                if (std.mem.eql(u8, dep_key, "name")) {
+                                    alias_kebab = try cur.readUnescapedStr();
+                                } else if (std.mem.eql(u8, dep_key, "package")) {
+                                    const p_str = try cur.readUnescapedStr();
+                                    if (p_str.len > 0) pkg_kebab_opt = p_str;
+                                } else if (std.mem.eql(u8, dep_key, "req")) {
+                                    req_str = try cur.readUnescapedStr();
+                                } else if (std.mem.eql(u8, dep_key, "kind")) {
+                                    const k_str = try cur.readUnescapedStr();
+                                    if (std.mem.eql(u8, k_str, "dev")) {
+                                        kind_val = .dev;
+                                    } else if (std.mem.eql(u8, k_str, "build")) {
+                                        kind_val = .build;
+                                    }
+                                } else if (std.mem.eql(u8, dep_key, "optional")) {
+                                    is_opt = try cur.readBool();
+                                } else if (std.mem.eql(u8, dep_key, "default_features") or
+                                    std.mem.eql(u8, dep_key, "default-features"))
+                                {
+                                    has_def = try cur.readBool();
+                                } else if (std.mem.eql(u8, dep_key, "target")) {
+                                    const t_str = try cur.readUnescapedStr();
+                                    if (t_str.len > 0) target_id = try interner.intern(t_str);
+                                } else if (std.mem.eql(u8, dep_key, "features")) {
+                                    try cur.expectByte('[');
+                                    if ((cur.peekByte() orelse return error.FallbackToDom) == ']') {
+                                        cur.pos += 1;
+                                    } else {
+                                        while (true) {
+                                            const f_str = try cur.readUnescapedStr();
+                                            if (f_str.len > 0) {
+                                                const f_id = try interner.intern(f_str);
+                                                if (dep_feat_overflow.items.len == 0 and dep_feat_len < dep_feat_stack.len) {
+                                                    dep_feat_stack[dep_feat_len] = f_id;
+                                                    dep_feat_len += 1;
+                                                } else {
+                                                    if (dep_feat_overflow.items.len == 0 and dep_feat_len > 0) {
+                                                        try dep_feat_overflow.appendSlice(allocator, dep_feat_stack[0..dep_feat_len]);
+                                                    }
+                                                    try dep_feat_overflow.append(allocator, f_id);
+                                                }
+                                            }
+                                            switch (try cur.readNextByte()) {
+                                                ',' => if ((cur.peekByte() orelse return error.FallbackToDom) == ']') return error.FallbackToDom,
+                                                ']' => break,
+                                                else => return error.FallbackToDom,
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    return error.FallbackToDom;
+                                }
+
+                                switch (try cur.readNextByte()) {
+                                    ',' => if ((cur.peekByte() orelse return error.FallbackToDom) == '}') return error.FallbackToDom,
+                                    '}' => break,
+                                    else => return error.FallbackToDom,
+                                }
+                            }
+                        }
+
+                        if (alias_kebab) |valid_alias| {
+                            if (pkg_manifest.isValidPackageNameKebab(valid_alias)) {
+                                if (try VersionReq.parse(interner, req_str)) |ver_req| {
+                                    var snake_buf: [pkg_manifest.MAX_PKG_NAME_BYTES]u8 = undefined;
+                                    for (valid_alias, 0..) |ch_byte, i| {
+                                        snake_buf[i] = if (ch_byte == '-') '_' else ch_byte;
+                                    }
+                                    const feat_slice: []const StringId = if (dep_feat_overflow.items.len > 0)
+                                        try index_alloc.dupe(StringId, dep_feat_overflow.items)
+                                    else if (dep_feat_len > 0)
+                                        try index_alloc.dupe(StringId, dep_feat_stack[0..dep_feat_len])
+                                    else
+                                        &.{};
+
+                                    if (is_opt) has_feat_manifest = true;
+                                    const alias_kebab_id = try interner.intern(valid_alias);
+                                    const pkg_kebab_id = if (pkg_kebab_opt) |pk_str|
+                                        (if (std.mem.eql(u8, pk_str, valid_alias)) alias_kebab_id else try interner.intern(pk_str))
+                                    else
+                                        alias_kebab_id;
+                                    const dep_spec = DependencySpec{
+                                        .alias_kebab = alias_kebab_id,
+                                        .module_snake = try interner.intern(snake_buf[0..valid_alias.len]),
+                                        .package_kebab = pkg_kebab_id,
+                                        .kind = kind_val,
+                                        .source = .{ .registry = ver_req },
+                                        .has_default_features = has_def,
+                                        .is_optional = is_opt,
+                                        .features = feat_slice,
+                                        .target_cfg = target_id,
+                                    };
+                                    if (deps_overflow.items.len == 0 and deps_count < deps_stack.len) {
+                                        deps_stack[deps_count] = dep_spec;
+                                        deps_count += 1;
+                                    } else {
+                                        if (deps_overflow.items.len == 0 and deps_count > 0) {
+                                            try deps_overflow.appendSlice(allocator, deps_stack[0..deps_count]);
+                                        }
+                                        try deps_overflow.append(allocator, dep_spec);
+                                    }
+                                }
+                            }
+                        }
+
+                        switch (try cur.readNextByte()) {
+                            ',' => if ((cur.peekByte() orelse return error.FallbackToDom) == ']') return error.FallbackToDom,
+                            ']' => break,
+                            else => return error.FallbackToDom,
+                        }
+                    }
+                }
+            } else if (std.mem.eql(u8, top_key, "features")) {
+                try cur.expectByte('{');
+                has_feat_manifest = true;
+                if ((cur.peekByte() orelse return error.FallbackToDom) == '}') {
+                    cur.pos += 1;
+                } else {
+                    while (true) {
+                        const feat_key = try cur.readUnescapedStr();
+                        try cur.expectByte(':');
+                        try cur.expectByte('[');
+                        var act_stack: [16]StringId = undefined;
+                        var act_len: usize = 0;
+                        var act_overflow: std.ArrayListUnmanaged(StringId) = .empty;
+                        defer act_overflow.deinit(allocator);
+                        if ((cur.peekByte() orelse return error.FallbackToDom) == ']') {
+                            cur.pos += 1;
+                        } else {
+                            while (true) {
+                                const act_str = try cur.readUnescapedStr();
+                                if (act_str.len > 0) {
+                                    const act_id = try interner.intern(act_str);
+                                    if (act_overflow.items.len == 0 and act_len < act_stack.len) {
+                                        act_stack[act_len] = act_id;
+                                        act_len += 1;
+                                    } else {
+                                        if (act_overflow.items.len == 0 and act_len > 0) {
+                                            try act_overflow.appendSlice(allocator, act_stack[0..act_len]);
+                                        }
+                                        try act_overflow.append(allocator, act_id);
+                                    }
+                                }
+                                switch (try cur.readNextByte()) {
+                                    ',' => if ((cur.peekByte() orelse return error.FallbackToDom) == ']') return error.FallbackToDom,
+                                    ']' => break,
+                                    else => return error.FallbackToDom,
+                                }
+                            }
+                        }
+                        const act_slice: []const StringId = if (act_overflow.items.len > 0)
+                            try index_alloc.dupe(StringId, act_overflow.items)
+                        else if (act_len > 0)
+                            try index_alloc.dupe(StringId, act_stack[0..act_len])
+                        else
+                            &.{};
+                        const f_decl = FeatureDecl{
+                            .name = try interner.intern(feat_key),
+                            .activations = act_slice,
+                        };
+                        if (feats_overflow.items.len == 0 and feats_count < feats_stack.len) {
+                            feats_stack[feats_count] = f_decl;
+                            feats_count += 1;
+                        } else {
+                            if (feats_overflow.items.len == 0 and feats_count > 0) {
+                                try feats_overflow.appendSlice(allocator, feats_stack[0..feats_count]);
+                            }
+                            try feats_overflow.append(allocator, f_decl);
+                        }
+
+                        switch (try cur.readNextByte()) {
+                            ',' => if ((cur.peekByte() orelse return error.FallbackToDom) == '}') return error.FallbackToDom,
+                            '}' => break,
+                            else => return error.FallbackToDom,
+                        }
+                    }
+                }
+            } else {
+                return error.FallbackToDom;
+            }
+
+            switch (try cur.readNextByte()) {
+                ',' => if ((cur.peekByte() orelse return error.FallbackToDom) == '}') return error.FallbackToDom,
+                '}' => break,
+                else => return error.FallbackToDom,
+            }
+        }
+    }
+
+    cur.skipWs();
+    if (cur.pos != cur.src.len) return error.FallbackToDom;
+    const vers_str = vers_raw_str orelse return null;
+    const parsed_ver = (try SemVer.parse(interner, vers_str)) orelse return null;
+
+    var host_pkg_dir: ?[]const u8 = null;
+    if (reg_root_dir) |reg_dir| {
+        if (pkg_manifest.isValidPackageNameKebab(pkg_name_str) and
+            std.mem.indexOfAny(u8, vers_str, "/\\:") == null and
+            mir_vm.isValidSandboxedEmbedPath(vers_str))
+        {
+            host_pkg_dir = try std.fmt.allocPrint(
+                index_alloc,
+                "{s}/packages/{s}-{s}",
+                .{ reg_dir, pkg_name_str, vers_str },
+            );
+        }
+    }
+
+    const final_deps: []const DependencySpec = if (deps_overflow.items.len > 0)
+        try index_alloc.dupe(DependencySpec, deps_overflow.items)
+    else if (deps_count > 0)
+        try index_alloc.dupe(DependencySpec, deps_stack[0..deps_count])
+    else
+        &.{};
+    const final_feats: []const FeatureDecl = if (feats_overflow.items.len > 0)
+        try index_alloc.dupe(FeatureDecl, feats_overflow.items)
+    else if (feats_count > 0)
+        try index_alloc.dupe(FeatureDecl, feats_stack[0..feats_count])
+    else
+        &.{};
+
+    return .{
+        .version = parsed_ver,
+        .source_kind = .sparse_registry,
+        .source_uri = if (custom_src_uri_opt) |c_uri| try interner.intern(c_uri) else default_registry_uri_id,
+        .host_dir_path = host_pkg_dir,
+        .corex_req = corex_req_id,
+        .links = links_id,
+        .is_yanked = is_yanked,
+        .has_feature_manifest = has_feat_manifest,
+        .features = final_feats,
+        .dependencies = final_deps,
+        .expected_tree_blake3 = expected_tree,
+        .expected_checksum = expected_cksum,
+    };
+}
+
+/// Probes sparse-index metadata files for `pkg_name` inside `base_dir` (NDJSON or directory scan of `<pkg>-<ver>/corex.toml`).
 fn loadSparseIndexVersionsFromDir(
     allocator: std.mem.Allocator,
     io: std.Io,
     arena: *BumpArena,
+    index_alloc: std.mem.Allocator,
     scratch_json_arena: *BumpArena,
     interner: *StringInterner,
     cfg_env: *const symbol_resolver.CfgEnv,
+    cache_opt: ?*pkg_cache.PkgCache,
     base_dir: []const u8,
     pkg_name: []const u8,
     out_versions: *std.ArrayListUnmanaged(CandidateVersionMeta),
+    out_has_security_err: *bool,
     sink: ?*DiagnosticSink,
 ) !bool {
     var rel_buf: [160]u8 = undefined;
@@ -1279,14 +1842,33 @@ fn loadSparseIndexVersionsFromDir(
             },
         };
 
-        const raw_bytes = std.Io.Dir.cwd().readFileAlloc(
-            io,
-            cand_file,
-            allocator,
-            .limited(MAX_INDEX_FILE_BYTES + 1),
-        ) catch continue;
-        defer allocator.free(raw_bytes);
+        var lru_key_opt: ?pkg_cache.LruCacheKey = null;
+        var owned_raw_bytes: ?[]u8 = null;
+        defer if (owned_raw_bytes) |ob| allocator.free(ob);
+
+        const raw_bytes: []const u8 = blk_raw: {
+            if (cache_opt) |c_inst| {
+                var key_b3: [32]u8 = @splat(0);
+                std.mem.writeInt(u64, key_b3[0..8], std.hash.Wyhash.hash(0, cand_file), .little);
+                std.mem.writeInt(u64, key_b3[8..16], std.hash.Wyhash.hash(0x9E37_79B9_7F4A_7C15, cand_file), .little);
+                std.mem.writeInt(u64, key_b3[16..24], @intCast(cand_file.len), .little);
+                const lru_key = pkg_cache.LruCacheKey{ .digest = key_b3, .domain = .sparse_index };
+                lru_key_opt = lru_key;
+                if (c_inst.metadata_lru.get(lru_key)) |cached_slice| {
+                    break :blk_raw cached_slice;
+                }
+            }
+            const disk_bytes = std.Io.Dir.cwd().readFileAlloc(
+                io,
+                cand_file,
+                allocator,
+                .limited(MAX_INDEX_FILE_BYTES + 1),
+            ) catch continue;
+            owned_raw_bytes = disk_bytes;
+            break :blk_raw disk_bytes;
+        };
         if (raw_bytes.len > MAX_INDEX_FILE_BYTES) {
+            out_has_security_err.* = true;
             if (sink) |diag_sink| {
                 try diag_sink.emit(.{
                     .code = .e0013_invalid_manifest_or_pkg_name,
@@ -1296,14 +1878,40 @@ fn loadSparseIndexVersionsFromDir(
             }
             return false;
         }
+        if (owned_raw_bytes != null) {
+            if (cache_opt) |c_inst| {
+                if (lru_key_opt) |lru_key| {
+                    try c_inst.metadata_lru.put(lru_key, raw_bytes);
+                }
+            }
+        }
 
-        defer scratch_json_arena.resetRetainingCapacity();
+        defer if (scratch_json_arena.total_allocated > 0) scratch_json_arena.resetRetainingCapacity();
+        const default_reg_uri_id = try interner.intern(DEFAULT_REGISTRY_URI);
 
         var line_iter = std.mem.splitScalar(u8, raw_bytes, '\n');
         var has_parsed_any = false;
         while (line_iter.next()) |raw_line| {
             const trimmed = std.mem.trim(u8, raw_line, " \t\r");
             if (trimmed.len == 0 or trimmed[0] == '#') continue;
+            if (trimmed[0] == '{') {
+                if (parseSparseIndexScannerObject(
+                    allocator,
+                    index_alloc,
+                    interner,
+                    default_reg_uri_id,
+                    if (cache_opt != null) null else base_dir,
+                    trimmed,
+                )) |cand_opt| {
+                    if (cand_opt) |cand| {
+                        try out_versions.append(allocator, cand);
+                        has_parsed_any = true;
+                    }
+                    continue;
+                } else |scan_err| {
+                    if (scan_err != error.FallbackToDom) return scan_err;
+                }
+            }
             const parsed_val = std.json.parseFromSliceLeaky(
                 std.json.Value,
                 scratch_json_arena.asAllocator(),
@@ -1311,17 +1919,37 @@ fn loadSparseIndexVersionsFromDir(
                 .{},
             ) catch continue;
             if (parsed_val == .object) {
-                if (try parseSparseIndexJsonObject(allocator, arena, interner, base_dir, parsed_val.object)) |cand| {
+                if (try parseSparseIndexJsonObject(
+                    allocator,
+                    io,
+                    arena,
+                    interner,
+                    base_dir,
+                    parsed_val.object,
+                    out_has_security_err,
+                    sink,
+                )) |cand| {
                     try out_versions.append(allocator, cand);
                     has_parsed_any = true;
                 }
+                if (out_has_security_err.*) return false;
             } else if (parsed_val == .array) {
                 for (parsed_val.array.items) |elem| {
                     if (elem == .object) {
-                        if (try parseSparseIndexJsonObject(allocator, arena, interner, base_dir, elem.object)) |cand| {
+                        if (try parseSparseIndexJsonObject(
+                            allocator,
+                            io,
+                            arena,
+                            interner,
+                            base_dir,
+                            elem.object,
+                            out_has_security_err,
+                            sink,
+                        )) |cand| {
                             try out_versions.append(allocator, cand);
                             has_parsed_any = true;
                         }
+                        if (out_has_security_err.*) return false;
                     }
                 }
             }
@@ -1329,7 +1957,7 @@ fn loadSparseIndexVersionsFromDir(
         if (has_parsed_any) return true;
     }
 
-    // Fallback: scan `<base_dir>/packages/<pkg_name>-<ver>/corex.toml` or `<base_dir>/<pkg_name>-<ver>/corex.toml`:
+    // Fall back to scanning `<base_dir>/packages/<pkg_name>-<ver>/corex.toml` or `<base_dir>/<pkg_name>-<ver>/corex.toml`:
     const scan_roots = [_][]u8{
         try std.fmt.allocPrint(allocator, "{s}/packages", .{base_dir}),
         try allocator.dupe(u8, base_dir),
@@ -1557,14 +2185,123 @@ fn formatCanonicalGitSourceUriAlloc(
     };
 }
 
+/// Formats canonical `"path+file://<posix_rel_path>"` normalizing any `\` separators to `/`.
+fn formatNormalizedPathUriAlloc(arena: *BumpArena, raw_rel: []const u8) ![]const u8 {
+    const prefix = "path+file://";
+    const out = try arena.allocSlice(u8, prefix.len + raw_rel.len);
+    @memcpy(out[0..prefix.len], prefix);
+    for (raw_rel, 0..) |ch_b, i| {
+        out[prefix.len + i] = if (ch_b == '\\') '/' else ch_b;
+    }
+    return out;
+}
+
+/// Joins `base_dir` and `rel_path` lexically with `/` separators, collapsing `.` and `..` segments deterministically.
+fn normalizeLexicalJoinedPathAlloc(
+    allocator: std.mem.Allocator,
+    base_dir: []const u8,
+    rel_path: []const u8,
+) ![]u8 {
+    const raw_joined = if (rel_path.len == 0)
+        try allocator.dupe(u8, base_dir)
+    else if (std.fs.path.isAbsolute(rel_path))
+        try allocator.dupe(u8, rel_path)
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, rel_path });
+    defer allocator.free(raw_joined);
+
+    for (raw_joined) |*ch_b| {
+        if (ch_b.* == '\\') ch_b.* = '/';
+    }
+
+    var prefix: []const u8 = "";
+    var rest = raw_joined;
+    if (rest.len >= 2 and std.ascii.isAlphabetic(rest[0]) and rest[1] == ':') {
+        if (rest.len >= 3 and rest[2] == '/') {
+            prefix = rest[0..3];
+            rest = rest[3..];
+        } else {
+            prefix = rest[0..2];
+            rest = rest[2..];
+        }
+    } else if (std.mem.startsWith(u8, rest, "/")) {
+        prefix = "/";
+        rest = rest[1..];
+    }
+
+    var segs: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer segs.deinit(allocator);
+    var it = std.mem.tokenizeScalar(u8, rest, '/');
+    while (it.next()) |seg| {
+        if (std.mem.eql(u8, seg, ".")) continue;
+        if (std.mem.eql(u8, seg, "..")) {
+            if (segs.items.len > 0 and !std.mem.eql(u8, segs.items[segs.items.len - 1], "..")) {
+                _ = segs.pop();
+                continue;
+            }
+            if (std.mem.endsWith(u8, prefix, "/")) continue;
+        }
+        try segs.append(allocator, seg);
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, prefix);
+    for (segs.items, 0..) |seg, i| {
+        if (i > 0) try out.append(allocator, '/');
+        try out.appendSlice(allocator, seg);
+    }
+    if (out.items.len == 0) try out.append(allocator, '.');
+    return out.toOwnedSlice(allocator);
+}
+
+/// Parses a locked `"git+<exact_url>[?tag=…|?branch=…|?rev=…]#<40-hex-oid>"` URI structurally (`null` if malformed).
+fn extractLockedGitSourceUri(lp_src: []const u8) ?struct {
+    url: []const u8,
+    rev_kind: GitRevKind,
+    rev_value: []const u8,
+    oid_hex: []const u8,
+} {
+    if (!std.mem.startsWith(u8, lp_src, "git+")) return null;
+    const after_scheme = lp_src[4..];
+    const hash_idx = std.mem.lastIndexOfScalar(u8, after_scheme, '#') orelse return null;
+    const oid_hex = after_scheme[hash_idx + 1 ..];
+    if (!isHexGitOid40(oid_hex)) return null;
+
+    const before_hash = after_scheme[0..hash_idx];
+    if (before_hash.len == 0) return null;
+
+    if (std.mem.indexOfScalar(u8, before_hash, '?')) |q_idx| {
+        const url = before_hash[0..q_idx];
+        const query = before_hash[q_idx + 1 ..];
+        if (url.len == 0 or std.mem.indexOfScalar(u8, query, '&') != null) return null;
+        if (std.mem.startsWith(u8, query, "tag=") and query.len > 4) {
+            return .{ .url = url, .rev_kind = .tag, .rev_value = query[4..], .oid_hex = oid_hex };
+        }
+        if (std.mem.startsWith(u8, query, "branch=") and query.len > 7) {
+            return .{ .url = url, .rev_kind = .branch, .rev_value = query[7..], .oid_hex = oid_hex };
+        }
+        if (std.mem.startsWith(u8, query, "rev=") and query.len > 4) {
+            return .{ .url = url, .rev_kind = .rev, .rev_value = query[4..], .oid_hex = oid_hex };
+        }
+        return null;
+    }
+
+    return .{
+        .url = before_hash,
+        .rev_kind = .default_head,
+        .rev_value = "",
+        .oid_hex = oid_hex,
+    };
+}
+
 // ---------- Target `@cfg` & Security Policy Helpers -----------
 
 /// Computes the effective `mir_sast.PackageCapPolicy` for an external or workspace dependency node.
 fn buildNodeCapPolicy(
     arena: *BumpArena,
-    interner: *const StringInterner,
     root_security: SecurityPolicy,
-    pkg_kebab_id: StringId,
+    pkg_override_opt: ?pkg_manifest.PackageSecurityOverride,
     pkg_display: []const u8,
     is_third_party: bool,
     is_dev_only: bool,
@@ -1604,20 +2341,14 @@ fn buildNodeCapPolicy(
         extra_deny = extra_deny.unionWith(root_security.dev_deny_caps);
     }
 
-    for (root_security.package_overrides) |pkg_ov| {
-        if (pkg_ov.package_kebab == pkg_kebab_id or
-            std.mem.eql(u8, interner.get(pkg_ov.package_kebab), interner.get(pkg_kebab_id)))
-        {
-            if (pkg_ov.allow_caps) |ov_allow| {
-                explicit_allow = if (explicit_allow) |prev| prev.unionWith(ov_allow) else ov_allow;
-            }
-            extra_deny = extra_deny.unionWith(pkg_ov.deny_caps);
+    if (pkg_override_opt) |pkg_ov| {
+        if (pkg_ov.allow_caps) |ov_allow| {
+            explicit_allow = if (explicit_allow) |prev| prev.unionWith(ov_allow) else ov_allow;
         }
+        extra_deny = extra_deny.unionWith(pkg_ov.deny_caps);
     }
 
-    const global_forbid = root_security.forbid_global_caps
-        .unionWith(root_security.deny_caps)
-        .unionWith(extra_deny);
+    const global_forbid = root_security.deny_caps.unionWith(extra_deny);
 
     // Always permit local/pure computation effects (`alloc`, `may_panic`, `blocking_sync`, `indirect_opaque`)
     // unless restricted by function-level `@no_*`; `[security]` gates OS/supply-chain `LOCKFILE_CAP_BITS`:
@@ -1681,24 +2412,101 @@ const SolverContext = struct {
     patch_map: std.AutoHashMapUnmanaged(SymbolId, PatchSpec) = .empty,
     /// Workspace members keyed by `package_kebab` `SymbolId`.
     workspace_pkg_map: std.AutoHashMapUnmanaged(SymbolId, u32) = .empty,
+    /// Additional active workspace member `series_id`s (`>= 1`) resolved alongside `sid == 0`.
+    active_workspace_member_sids: std.ArrayListUnmanaged(u32) = .empty,
+    /// $O(1)$ membership set of `active_workspace_member_sids`.
+    active_workspace_member_set: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Cross-major `SeriesKey`s ruled out during bounded cross-series retry.
+    excluded_series_slots: std.AutoHashMapUnmanaged(SeriesKey, void) = .empty,
+    /// First lower `SeriesKey` that had a valid higher-series fallback during the current pass.
+    next_cross_series_alt: ?SeriesKey = null,
+    /// Zero-memset slab arena owning `SeriesEntry` `candidates`, `feature_ids`, and `feature_to_bit` tables.
+    series_arena: std.heap.ArenaAllocator,
+    /// Zero-memset slab arena owning parsed sparse-index `CandidateVersionMeta` slices across cross-series retries.
+    index_arena: std.heap.ArenaAllocator,
+    /// Reusable scratch buffer for candidate loading in `ensureRegistryCandidatesLoaded`.
+    scratch_raw_versions: std.ArrayListUnmanaged(CandidateVersionMeta) = .empty,
     /// Reusable bump arena for NDJSON sparse-index parsing, reset per index file.
     scratch_json_arena: BumpArena,
-    /// Set of `SymbolId`s where a fetch or integrity error (`E0014`/`E0015`/`E0016`) was already emitted.
+    /// `true` once a fetch or integrity error (`E0014`/`E0015`/`E0016`) was already emitted.
     has_aborted_error: bool = false,
 
     /// Releases solver-temporary containers (keeping `graph_arena` intact).
     fn deinit(self: *SolverContext) void {
-        for (self.series_list.items) |*entry| {
-            entry.candidates.deinit(self.allocator);
-            entry.feature_ids.deinit(self.allocator);
-            entry.feature_to_bit.deinit(self.allocator);
-        }
+        self.series_arena.deinit();
+        self.index_arena.deinit();
+        self.scratch_raw_versions.deinit(self.allocator);
         self.series_list.deinit(self.allocator);
         self.series_map.deinit(self.allocator);
         self.registry_index_cache.deinit(self.allocator);
         self.patch_map.deinit(self.allocator);
         self.workspace_pkg_map.deinit(self.allocator);
+        self.active_workspace_member_sids.deinit(self.allocator);
+        self.active_workspace_member_set.deinit(self.allocator);
+        self.excluded_series_slots.deinit(self.allocator);
         self.scratch_json_arena.deinit();
+    }
+
+    /// Resets per-attempt `series_list`, `series_map`, and active workspace roots before a cross-series retry.
+    fn resetForCrossSeriesRetry(self: *SolverContext) void {
+        _ = self.series_arena.reset(.retain_capacity);
+        self.series_list.clearRetainingCapacity();
+        self.series_map.clearRetainingCapacity();
+        self.active_workspace_member_sids.clearRetainingCapacity();
+        self.active_workspace_member_set.clearRetainingCapacity();
+        self.next_cross_series_alt = null;
+    }
+
+    /// Records `feat_id` as declared (and optionally `is_opt_dep`) on `(entry, cand)` using `FeatureBitset512`.
+    fn registerCandidateFeatureBit(
+        entry: *SeriesEntry,
+        cand: *CandidateVersionMeta,
+        allocator: std.mem.Allocator,
+        arena_alloc: std.mem.Allocator,
+        feat_id: StringId,
+        is_opt_dep: bool,
+    ) !void {
+        const bit_idx = try entry.internFeatureBit(allocator, feat_id);
+        if (bit_idx < MAX_FEATURES_PER_PKG) {
+            _ = cand.declared_bits.setReturningChanged(@intCast(bit_idx));
+            if (is_opt_dep) {
+                _ = cand.opt_dep_bits.setReturningChanged(@intCast(bit_idx));
+            }
+        } else {
+            try cand.overflow_declared_set.put(arena_alloc, feat_id, {});
+            if (is_opt_dep) {
+                try cand.overflow_opt_dep_set.put(arena_alloc, feat_id, {});
+            }
+        }
+    }
+
+    /// Returns `true` in $O(1)$ if `cand` explicitly lists `feat_id` (used for implicit `"default"` seeding).
+    fn hasExplicitlyDeclaredFeature(entry: *const SeriesEntry, cand: CandidateVersionMeta, feat_id: StringId) bool {
+        const bit_idx = entry.feature_to_bit.get(feat_id) orelse return false;
+        if (bit_idx < MAX_FEATURES_PER_PKG) {
+            return cand.declared_bits.isSet(@intCast(bit_idx));
+        }
+        return cand.overflow_declared_set.contains(feat_id);
+    }
+
+    /// Returns `true` in $O(1)$ if `cand` declares `feat_id` in `[features]` or as an `optional = true` dependency alias.
+    fn isFeatureDeclaredOnCandidate(entry: *const SeriesEntry, cand: CandidateVersionMeta, feat_id: StringId) bool {
+        if (!cand.has_authoritative_features) return true;
+        return hasExplicitlyDeclaredFeature(entry, cand, feat_id);
+    }
+
+    /// Returns `true` in $O(1)$ if `cand` declares `alias_id` as an `optional = true` dependency.
+    fn isOptDepOnCandidate(entry: *const SeriesEntry, cand: CandidateVersionMeta, alias_id: StringId) bool {
+        const bit_idx = entry.feature_to_bit.get(alias_id) orelse return false;
+        if (bit_idx < MAX_FEATURES_PER_PKG) {
+            return cand.opt_dep_bits.isSet(@intCast(bit_idx));
+        }
+        return cand.overflow_opt_dep_set.contains(alias_id);
+    }
+
+    /// Returns `true` in $O(1)$ if `sid` is an active workspace root (`0` or in `active_workspace_member_set`).
+    fn isActiveWorkspaceRootSeries(self: *const SolverContext, sid: u32) bool {
+        return sid == 0 or (self.active_workspace_member_sids.items.len > 0 and self.active_workspace_member_set.contains(sid));
     }
 
     /// Ensures all registry versions of `pkg_kebab_sym` are loaded and cached in `registry_index_cache`.
@@ -1710,8 +2518,9 @@ const SolverContext = struct {
         if (self.registry_index_cache.get(pkg_kebab_sym)) |cached| return cached;
 
         const pkg_name = self.interner.get(pkg_kebab_sym);
-        var raw_versions: std.ArrayListUnmanaged(CandidateVersionMeta) = .empty;
-        defer raw_versions.deinit(self.allocator);
+        self.scratch_raw_versions.clearRetainingCapacity();
+        const raw_versions = &self.scratch_raw_versions;
+        var has_sec_err = false;
 
         // [1] First probe `<corex_home>/cache/blake3/index/default` (always valid even in `--offline` mode):
         var cached_idx_buf: [512]u8 = undefined;
@@ -1726,18 +2535,26 @@ const SolverContext = struct {
             heap_cached_idx = allocated_idx;
             break :blk_cidx allocated_idx;
         };
+        const idx_alloc = self.index_arena.allocator();
         const has_cached_idx = try loadSparseIndexVersionsFromDir(
             self.allocator,
             self.options.io,
             self.graph_arena,
+            idx_alloc,
             &self.scratch_json_arena,
             self.interner,
             &self.base_cfg_env,
+            self.cache,
             cached_index_dir,
             pkg_name,
-            &raw_versions,
+            raw_versions,
+            &has_sec_err,
             self.sink,
         );
+        if (has_sec_err) {
+            self.has_aborted_error = true;
+            return &.{};
+        }
         var has_found = has_cached_idx;
 
         // [2] Also synthesize candidates from `existing_lock` when cached `.cxtree` exists in `PkgCache`:
@@ -1878,6 +2695,7 @@ const SolverContext = struct {
                     .source_uri = try self.interner.intern(DEFAULT_REGISTRY_URI),
                     .links = lock_pkg.links,
                     .has_feature_manifest = has_fm,
+                    .has_authoritative_features = has_embedded_toml,
                     .features = parsed_feats,
                     .dependencies = parsed_deps,
                     .expected_tree_blake3 = lock_pkg.tree_hash,
@@ -1897,14 +2715,21 @@ const SolverContext = struct {
                         self.allocator,
                         self.options.io,
                         self.graph_arena,
+                        idx_alloc,
                         &self.scratch_json_arena,
                         self.interner,
                         &self.base_cfg_env,
+                        null,
                         reg_dir,
                         pkg_name,
-                        &raw_versions,
+                        raw_versions,
+                        &has_sec_err,
                         self.sink,
                     );
+                    if (has_sec_err) {
+                        self.has_aborted_error = true;
+                        return &.{};
+                    }
                 } else if (!self.options.is_locked and !has_cached_idx) {
                     var extra_versions: std.ArrayListUnmanaged(CandidateVersionMeta) = .empty;
                     defer extra_versions.deinit(self.allocator);
@@ -1912,31 +2737,42 @@ const SolverContext = struct {
                         self.allocator,
                         self.options.io,
                         self.graph_arena,
+                        idx_alloc,
                         &self.scratch_json_arena,
                         self.interner,
                         &self.base_cfg_env,
+                        null,
                         reg_dir,
                         pkg_name,
                         &extra_versions,
+                        &has_sec_err,
                         self.sink,
                     )) {
+                        var version_idx_map: std.AutoHashMapUnmanaged(SemVer, usize) = .empty;
+                        defer version_idx_map.deinit(self.allocator);
+                        for (raw_versions.items, 0..) |existing_cand, ex_idx| {
+                            try version_idx_map.put(self.allocator, existing_cand.version, ex_idx);
+                        }
                         for (extra_versions.items) |extra_cand| {
-                            var is_already_present = false;
-                            for (raw_versions.items) |*existing_cand| {
-                                if (SemVer.eql(existing_cand.version, extra_cand.version, self.interner)) {
-                                    if (!existing_cand.has_feature_manifest and extra_cand.has_feature_manifest) {
-                                        existing_cand.has_feature_manifest = true;
-                                        existing_cand.features = extra_cand.features;
-                                        existing_cand.dependencies = extra_cand.dependencies;
-                                    }
-                                    is_already_present = true;
-                                    break;
+                            if (version_idx_map.get(extra_cand.version)) |ex_idx| {
+                                var existing_cand = &raw_versions.items[ex_idx];
+                                if (!existing_cand.has_authoritative_features or
+                                    (!existing_cand.has_feature_manifest and extra_cand.has_feature_manifest))
+                                {
+                                    existing_cand.has_feature_manifest = extra_cand.has_feature_manifest;
+                                    existing_cand.has_authoritative_features = true;
+                                    existing_cand.features = extra_cand.features;
+                                    existing_cand.dependencies = extra_cand.dependencies;
                                 }
-                            }
-                            if (!is_already_present) {
+                            } else {
+                                try version_idx_map.put(self.allocator, extra_cand.version, raw_versions.items.len);
                                 try raw_versions.append(self.allocator, extra_cand);
                             }
                         }
+                    }
+                    if (has_sec_err) {
+                        self.has_aborted_error = true;
+                        return &.{};
                     }
                 }
             }
@@ -1965,7 +2801,7 @@ const SolverContext = struct {
             }.lessThan);
         }
 
-        const owned_slice = try self.graph_arena.dupe(CandidateVersionMeta, raw_versions.items);
+        const owned_slice = try idx_alloc.dupe(CandidateVersionMeta, raw_versions.items);
         try self.registry_index_cache.put(self.allocator, pkg_kebab_sym, owned_slice);
         return owned_slice;
     }
@@ -1980,6 +2816,7 @@ const SolverContext = struct {
     ) !u32 {
         if (self.series_map.get(key)) |existing_id| return existing_id;
 
+        const series_alloc = self.series_arena.allocator();
         const new_id: u32 = @intCast(self.series_list.items.len);
         var entry = SeriesEntry{
             .series_id = new_id,
@@ -1995,12 +2832,25 @@ const SolverContext = struct {
                     for (ws_mem.manifest.dependencies) |d_item| {
                         if (d_item.is_optional) has_fm = true;
                     }
-                    const ws_uri = try std.fmt.allocPrint(self.graph_arena.asAllocator(), "path+file://{s}", .{ws_mem.rel_dir});
-                    try entry.candidates.append(self.allocator, .{
+                    const ws_uri = try formatNormalizedPathUriAlloc(self.graph_arena, ws_mem.rel_dir);
+                    const lib_override: ?[]const u8 = if (ws_mem.manifest.lib_target) |lt|
+                        (if (self.interner.get(lt.path).len > 0) try self.graph_arena.dupe(u8, self.interner.get(lt.path)) else null)
+                    else if (self.interner.get(pkg_meta.root_module).len > 0)
+                        try self.graph_arena.dupe(u8, self.interner.get(pkg_meta.root_module))
+                    else
+                        null;
+                    const bin_override: ?[]const u8 = if (ws_mem.manifest.bin_targets.len > 0 and
+                        self.interner.get(ws_mem.manifest.bin_targets[0].path).len > 0)
+                        try self.graph_arena.dupe(u8, self.interner.get(ws_mem.manifest.bin_targets[0].path))
+                    else
+                        null;
+                    try entry.candidates.append(series_alloc, .{
                         .version = pkg_meta.version,
                         .source_kind = .workspace_member,
                         .source_uri = try self.interner.intern(ws_uri),
                         .host_dir_path = ws_mem.abs_dir,
+                        .lib_root_rel_path = lib_override,
+                        .bin_root_rel_path = bin_override,
                         .corex_req = pkg_meta.corex_req,
                         .links = pkg_meta.links,
                         .has_feature_manifest = has_fm,
@@ -2059,12 +2909,25 @@ const SolverContext = struct {
                     for (parsed_p.manifest.dependencies) |d_item| {
                         if (d_item.is_optional) has_fm = true;
                     }
-                    const path_uri = try std.fmt.allocPrint(self.graph_arena.asAllocator(), "path+file://{s}", .{rel_str});
-                    try entry.candidates.append(self.allocator, .{
+                    const path_uri = try formatNormalizedPathUriAlloc(self.graph_arena, rel_str);
+                    const lib_override: ?[]const u8 = if (parsed_p.manifest.lib_target) |lt|
+                        (if (self.interner.get(lt.path).len > 0) try self.graph_arena.dupe(u8, self.interner.get(lt.path)) else null)
+                    else if (self.interner.get(pkg_meta.root_module).len > 0)
+                        try self.graph_arena.dupe(u8, self.interner.get(pkg_meta.root_module))
+                    else
+                        null;
+                    const bin_override: ?[]const u8 = if (parsed_p.manifest.bin_targets.len > 0 and
+                        self.interner.get(parsed_p.manifest.bin_targets[0].path).len > 0)
+                        try self.graph_arena.dupe(u8, self.interner.get(parsed_p.manifest.bin_targets[0].path))
+                    else
+                        null;
+                    try entry.candidates.append(series_alloc, .{
                         .version = pkg_meta.version,
                         .source_kind = .local_path,
                         .source_uri = try self.interner.intern(path_uri),
                         .host_dir_path = resolved_dir,
+                        .lib_root_rel_path = lib_override,
+                        .bin_root_rel_path = bin_override,
                         .corex_req = pkg_meta.corex_req,
                         .links = pkg_meta.links,
                         .has_feature_manifest = has_fm,
@@ -2080,19 +2943,29 @@ const SolverContext = struct {
                 const rev_str = self.interner.get(git_spec.rev_value);
                 const pkg_name = self.interner.get(key.pkg_name_sym);
 
-                // Check `existing_lock` first for a pinned `"git+…#<40-hex-oid>"` already cached in `PkgCache`:
+                // Check `existing_lock` first for an exact structured `"git+<url>[?selector]#<40-hex-oid>"` match:
                 var is_loaded_from_lock = false;
                 if (self.existing_lock) |lock_doc| {
                     const clean_url = if (std.mem.startsWith(u8, raw_url, "git+")) raw_url[4..] else raw_url;
                     for (lock_doc.packages) |lp| {
-                        const lp_src = self.interner.get(lp.source);
-                        if (!std.mem.startsWith(u8, lp_src, "git+")) continue;
-                        if (std.mem.indexOf(u8, lp_src, clean_url) == null) continue;
+                        if (lp.name != key.pkg_name_sym and
+                            !std.mem.eql(u8, self.interner.get(lp.name), pkg_name))
+                        {
+                            continue;
+                        }
+                        const parsed_git = extractLockedGitSourceUri(self.interner.get(lp.source)) orelse continue;
+                        if (!std.mem.eql(u8, parsed_git.url, clean_url) or
+                            parsed_git.rev_kind != git_spec.rev_kind or
+                            !std.mem.eql(u8, parsed_git.rev_value, rev_str))
+                        {
+                            continue;
+                        }
                         if (self.cache.readVerifiedCxTreeAlloc(self.options.io, lp.tree_hash, self.sink, req_span)) |tree_buf| {
                             defer self.allocator.free(tree_buf);
                             var parsed_deps: []const DependencySpec = &.{};
                             var parsed_feats: []const FeatureDecl = &.{};
                             var has_fm = false;
+                            var has_embedded_toml = false;
                             if (vfs_sourcemap.validateCxTreeBytes(self.allocator, tree_buf)) |view| {
                                 for (view.entries) |te| {
                                     const rp = view.asEntryPath(te);
@@ -2112,17 +2985,22 @@ const SolverContext = struct {
                                             parsed_deps = pm.manifest.dependencies;
                                             parsed_feats = pm.manifest.features;
                                             has_fm = parsed_feats.len > 0;
+                                            for (parsed_deps) |d_item| {
+                                                if (d_item.is_optional) has_fm = true;
+                                            }
+                                            has_embedded_toml = true;
                                         } else |_| {}
                                         break;
                                     }
                                 }
                             } else |_| {}
-                            try entry.candidates.append(self.allocator, .{
+                            try entry.candidates.append(series_alloc, .{
                                 .version = lp.version,
                                 .source_kind = .git_pinned,
                                 .source_uri = lp.source,
                                 .links = lp.links,
                                 .has_feature_manifest = has_fm,
+                                .has_authoritative_features = has_embedded_toml,
                                 .features = parsed_feats,
                                 .dependencies = parsed_deps,
                                 .expected_tree_blake3 = lp.tree_hash,
@@ -2213,6 +3091,8 @@ const SolverContext = struct {
                                             self.allocator,
                                             self.options.io,
                                             self.graph_arena,
+                                            self.interner,
+                                            &self.base_cfg_env,
                                             pkg_name,
                                             arch_res.stdout,
                                             self.cache,
@@ -2310,7 +3190,7 @@ const SolverContext = struct {
                                         rev_str,
                                         &oid_hex,
                                     );
-                                    try entry.candidates.append(self.allocator, .{
+                                    try entry.candidates.append(series_alloc, .{
                                         .version = parsed_ver,
                                         .source_kind = .git_pinned,
                                         .source_uri = try self.interner.intern(canon_uri),
@@ -2364,25 +3244,39 @@ const SolverContext = struct {
                 }
             },
             else => {
-                // `SOURCE_TAG_REGISTRY`: filter `all_cands` matching `key` (`tier`, `series_or_source_id`):
+                // Filter `all_cands` for `SOURCE_TAG_REGISTRY` matching `key` (`tier`, `series_or_source_id`):
                 const all_cands = try self.ensureRegistryCandidatesLoaded(key.pkg_name_sym, req_span);
                 for (all_cands) |cand| {
-                    const slot = cand.version.seriesSlot();
+                    const slot = cand.version.classifySeriesSlot();
                     if (slot.tier == key.tier and slot.number == key.series_or_source_id) {
-                        try entry.candidates.append(self.allocator, cand);
+                        try entry.candidates.append(series_alloc, cand);
                     }
                 }
             },
         }
 
         // Pre-populate declared feature bits (`0..511`) across all candidates of `entry`:
-        for (entry.candidates.items) |cand| {
+        for (entry.candidates.items) |*cand| {
             for (cand.features) |f_decl| {
-                _ = try entry.internFeatureBit(self.allocator, f_decl.name);
+                try registerCandidateFeatureBit(
+                    &entry,
+                    cand,
+                    series_alloc,
+                    self.graph_arena.asAllocator(),
+                    f_decl.name,
+                    false,
+                );
             }
             for (cand.dependencies) |d_spec| {
                 if (d_spec.is_optional) {
-                    _ = try entry.internFeatureBit(self.allocator, d_spec.alias_kebab);
+                    try registerCandidateFeatureBit(
+                        &entry,
+                        cand,
+                        series_alloc,
+                        self.graph_arena.asAllocator(),
+                        d_spec.alias_kebab,
+                        true,
+                    );
                 }
             }
         }
@@ -2406,15 +3300,17 @@ const SolverContext = struct {
         var eff_declaring_dir = declaring_dir;
 
         // [1] Apply root `[patch.<scope>]` overrides on registry / matching-URL dependencies (`DR-11` §1.3):
-        if (self.patch_map.get(dep.package_kebab)) |patch_rule| {
-            const is_overridable = switch (eff_source) {
-                .registry => true,
-                .git => |gs| std.mem.eql(u8, self.interner.get(patch_rule.scope), self.interner.get(gs.url)),
-                else => false,
-            };
-            if (is_overridable) {
-                eff_source = patch_rule.replacement;
-                eff_declaring_dir = self.bundle.workspace_root_dir;
+        if (self.patch_map.count() > 0) {
+            if (self.patch_map.get(dep.package_kebab)) |patch_rule| {
+                const is_overridable = switch (eff_source) {
+                    .registry => true,
+                    .git => |gs| std.mem.eql(u8, self.interner.get(patch_rule.scope), self.interner.get(gs.url)),
+                    else => false,
+                };
+                if (is_overridable) {
+                    eff_source = patch_rule.replacement;
+                    eff_declaring_dir = self.bundle.workspace_root_dir;
+                }
             }
         }
 
@@ -2422,15 +3318,14 @@ const SolverContext = struct {
         switch (eff_source) {
             .path => |ps| {
                 const rel_str = self.interner.get(ps.rel_path);
-                const norm_joined = if (std.fs.path.isAbsolute(rel_str))
-                    try self.allocator.dupe(u8, rel_str)
-                else
-                    try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ eff_declaring_dir, rel_str });
+                const norm_joined = try normalizeLexicalJoinedPathAlloc(self.allocator, eff_declaring_dir, rel_str);
                 defer self.allocator.free(norm_joined);
 
                 if (self.workspace_pkg_map.get(dep.package_kebab)) |ws_idx| {
                     const ws_mem = self.bundle.members[ws_idx];
-                    if (std.mem.eql(u8, ws_mem.abs_dir, norm_joined) or std.mem.eql(u8, ws_mem.rel_dir, rel_str)) {
+                    const norm_ws = try normalizeLexicalJoinedPathAlloc(self.allocator, ws_mem.abs_dir, "");
+                    defer self.allocator.free(norm_ws);
+                    if (std.mem.eql(u8, norm_ws, norm_joined) or std.mem.eql(u8, ws_mem.rel_dir, rel_str)) {
                         const ws_key = SeriesKey{
                             .pkg_name_sym = dep.package_kebab,
                             .tier = .major_ge_1,
@@ -2470,24 +3365,100 @@ const SolverContext = struct {
             },
             .registry => |ver_req| {
                 // Determine target `SeriesKey` (`vN`, `v0.M`, or `v0.0.Z`);
-                // for wildcard `*` (`len == 1 and op == .wildcard_any`), pick the highest non-yanked series in index:
-                var chosen_slot = ver_req.min_floor.seriesSlot();
+                // fast $O(1)$ path when `ver_req` is bounded strictly below the next compatibility series:
+                var chosen_slot = ver_req.min_floor.classifySeriesSlot();
+                const next_series_core: SemVerCore = switch (chosen_slot.tier) {
+                    .major_ge_1 => .{ .major = chosen_slot.number +| 1, .minor = 0, .patch = 0 },
+                    .minor_0_x => .{ .major = 0, .minor = chosen_slot.number +| 1, .patch = 0 },
+                    .patch_0_0_z => .{ .major = 0, .minor = 0, .patch = chosen_slot.number +| 1 },
+                };
+                var is_strictly_single_series = ver_req.len >= 1 and ver_req.comparators[0].op != .wildcard_any;
+                if (is_strictly_single_series) {
+                    var has_series_ceiling = false;
+                    for (ver_req.comparators[0..ver_req.len]) |cmp| {
+                        if (cmp.op == .exact) {
+                            const ex_slot = cmp.ver.classifySeriesSlot();
+                            if (ex_slot.tier == chosen_slot.tier and ex_slot.number == chosen_slot.number) {
+                                has_series_ceiling = true;
+                                break;
+                            }
+                        } else if (cmp.op == .less) {
+                            if (SemVerCore.compare(next_series_core, cmp.ver.asCore()) != .lt) {
+                                has_series_ceiling = true;
+                                break;
+                            }
+                        } else if (cmp.op == .less_eq) {
+                            if (SemVerCore.compare(next_series_core, cmp.ver.asCore()) == .gt) {
+                                has_series_ceiling = true;
+                                break;
+                            }
+                        }
+                    }
+                    is_strictly_single_series = has_series_ceiling;
+                }
+
+                const floor_key = SeriesKey{
+                    .pkg_name_sym = dep.package_kebab,
+                    .tier = chosen_slot.tier,
+                    .source_tag = SOURCE_TAG_REGISTRY,
+                    .series_or_source_id = chosen_slot.number,
+                };
+                if (is_strictly_single_series and !self.excluded_series_slots.contains(floor_key)) {
+                    if (self.series_map.get(floor_key)) |existing_sid| {
+                        return .{ .series_id = existing_sid, .effective_source = eff_source };
+                    }
+                    const sid = try self.getOrCreateSeries(floor_key, eff_source, eff_declaring_dir, dep.decl_span);
+                    return .{ .series_id = sid, .effective_source = eff_source };
+                }
+
                 if (ver_req.len == 1 and ver_req.comparators[0].op == .wildcard_any) {
                     const all_cands = try self.ensureRegistryCandidatesLoaded(dep.package_kebab, dep.decl_span);
                     var rev_idx = all_cands.len;
                     while (rev_idx > 0) {
                         rev_idx -= 1;
-                        if (!all_cands[rev_idx].is_yanked) {
-                            chosen_slot = all_cands[rev_idx].version.seriesSlot();
+                        const cand = all_cands[rev_idx];
+                        const cand_key = SeriesKey.forRegistrySemVer(dep.package_kebab, cand.version);
+                        if (!cand.is_yanked and
+                            !self.isExcludedByManifestRule(dep.package_kebab, cand.version) and
+                            self.isCompilerVersionCompatible(cand) and
+                            !self.excluded_series_slots.contains(cand_key))
+                        {
+                            chosen_slot = cand.version.classifySeriesSlot();
                             break;
                         }
                     }
                 } else {
-                    // Check if index has a matching candidate (e.g., `>1.9.0` might land in `2.0.0`):
+                    // Select the lowest non-excluded, non-yanked series matching `ver_req` (recording any cross-major fallback):
                     const all_cands = try self.ensureRegistryCandidatesLoaded(dep.package_kebab, dep.decl_span);
+                    var has_picked_slot = false;
                     for (all_cands) |cand| {
-                        if (!cand.is_yanked and ver_req.matches(cand.version, self.interner)) {
-                            chosen_slot = cand.version.seriesSlot();
+                        if (cand.is_yanked or
+                            self.isExcludedByManifestRule(dep.package_kebab, cand.version) or
+                            !self.isCompilerVersionCompatible(cand) or
+                            !ver_req.isMatchedBy(cand.version, self.interner))
+                        {
+                            continue;
+                        }
+                        const cand_slot = cand.version.classifySeriesSlot();
+                        const cand_key = SeriesKey{
+                            .pkg_name_sym = dep.package_kebab,
+                            .tier = cand_slot.tier,
+                            .source_tag = SOURCE_TAG_REGISTRY,
+                            .series_or_source_id = cand_slot.number,
+                        };
+                        if (self.excluded_series_slots.contains(cand_key)) continue;
+                        if (!has_picked_slot) {
+                            chosen_slot = cand_slot;
+                            has_picked_slot = true;
+                        } else if (cand_slot.tier != chosen_slot.tier or cand_slot.number != chosen_slot.number) {
+                            if (self.next_cross_series_alt == null) {
+                                self.next_cross_series_alt = .{
+                                    .pkg_name_sym = dep.package_kebab,
+                                    .tier = chosen_slot.tier,
+                                    .source_tag = SOURCE_TAG_REGISTRY,
+                                    .series_or_source_id = chosen_slot.number,
+                                };
+                            }
                             break;
                         }
                     }
@@ -2517,7 +3488,7 @@ const SolverContext = struct {
 
     /// Evaluates whether `dep` is active on `caller_series` (`kind` filter + `target_cfg` `@cfg` filter).
     fn isDepEdgeTargetEnabled(self: *SolverContext, caller_series: u32, dep: DependencySpec) !bool {
-        if (dep.kind == .dev and (caller_series != 0 or !self.options.is_including_tests)) {
+        if (dep.kind == .dev and (!self.isActiveWorkspaceRootSeries(caller_series) or !self.options.is_including_tests)) {
             return false;
         }
         if (dep.target_cfg != .empty) {
@@ -2546,19 +3517,19 @@ const SolverContext = struct {
         if (cand.corex_req == .empty) return true;
         const req_str = self.interner.get(cand.corex_req);
         const parsed_req = (VersionReq.parse(self.interner, req_str) catch return true) orelse return true;
-        return parsed_req.matches(self.options.compiler_version, self.interner);
+        return parsed_req.isMatchedBy(self.options.compiler_version, self.interner);
     }
 
     /// Checks whether `(pkg_kebab, ver)` is banned by any root `[resolution].exclude` rule.
     fn isExcludedByManifestRule(self: *const SolverContext, pkg_kebab: SymbolId, ver: SemVer) bool {
         for (self.bundle.root_manifest.excludes) |rule| {
-            if (rule.package_kebab == pkg_kebab and rule.req.matches(ver, self.interner)) {
+            if (rule.package_kebab == pkg_kebab and rule.req.isMatchedBy(ver, self.interner)) {
                 return true;
             }
         }
         if (self.bundle.root_manifest.workspace) |ws_cfg| {
             for (ws_cfg.excludes) |rule| {
-                if (rule.package_kebab == pkg_kebab and rule.req.matches(ver, self.interner)) {
+                if (rule.package_kebab == pkg_kebab and rule.req.isMatchedBy(ver, self.interner)) {
                     return true;
                 }
             }
@@ -2566,14 +3537,14 @@ const SolverContext = struct {
         return false;
     }
 
-    /// Activates `feat_id` on `series_id` inside `mvs_states` and returns `true` if newly added (`P2-1`).
+    /// Activates `feat_id` on `series_id` inside `mvs_states` and returns `true` if newly added.
     fn activateMvsFeature(
         self: *SolverContext,
         mvs_states: *std.ArrayListUnmanaged(MvsNodeState),
         series_id: u32,
         feat_id: StringId,
     ) !bool {
-        const bit_idx = try self.series_list.items[series_id].internFeatureBit(self.allocator, feat_id);
+        const bit_idx = try self.series_list.items[series_id].internFeatureBit(self.series_arena.allocator(), feat_id);
         var state = &mvs_states.items[series_id];
         if (bit_idx < MAX_FEATURES_PER_PKG) {
             return state.enabled_bits.setReturningChanged(bit_idx);
@@ -2597,28 +3568,51 @@ const SolverContext = struct {
         return mvs_states[series_id].overflow_features.contains(feat_id);
     }
 
-    /// Executes Tier-1 `< 5 ms` $O(V + E)$ `Bounded-MVS` + monotone `FeatureBitset512` unification (`DR-11` §3.2, `P2-1`).
+    /// Executes Tier-1 `< 5 ms` $O(V + E)$ `Bounded-MVS` + monotone `FeatureBitset512` unification (`DR-11` §3.2).
     /// Returns `true` if the MVS candidate satisfies all upper bounds, `[resolution].exclude` bans, and non-yanked checks.
     fn runTier1BoundedMvs(
         self: *SolverContext,
         mvs_states: *std.ArrayListUnmanaged(MvsNodeState),
         out_steps: *u32,
     ) !bool {
-        try mvs_states.append(self.allocator, .{ .is_active = true, .selected_idx = 0, .is_in_worklist = true });
+        while (mvs_states.items.len < self.series_list.items.len) {
+            try mvs_states.append(self.allocator, .{});
+        }
+        mvs_states.items[0].is_active = true;
+        mvs_states.items[0].selected_idx = 0;
+        mvs_states.items[0].is_in_worklist = true;
+
         var worklist: std.ArrayListUnmanaged(u32) = .empty;
         defer worklist.deinit(self.allocator);
         try worklist.append(self.allocator, 0);
 
+        for (self.active_workspace_member_sids.items) |ws_sid| {
+            mvs_states.items[ws_sid].is_active = true;
+            mvs_states.items[ws_sid].selected_idx = 0;
+            mvs_states.items[ws_sid].is_in_worklist = true;
+            try worklist.append(self.allocator, ws_sid);
+        }
+
         const default_feat_id = try self.interner.intern("default");
 
-        // Seed root features (`default` unless `--no-default-features`, plus `-F` / `--features`):
+        // Seed root and active workspace member `default` features (unless `--no-default-features`), plus `-F`:
         if (!self.options.has_no_default_features) {
             mvs_states.items[0].has_default_feature_requested = true;
-            const root_cand = self.series_list.items[0].candidates.items[0];
-            for (root_cand.features) |f_decl| {
-                if (f_decl.name == default_feat_id) {
-                    _ = try self.activateMvsFeature(mvs_states, 0, default_feat_id);
-                    break;
+            if (SolverContext.hasExplicitlyDeclaredFeature(
+                &self.series_list.items[0],
+                self.series_list.items[0].candidates.items[0],
+                default_feat_id,
+            )) {
+                _ = try self.activateMvsFeature(mvs_states, 0, default_feat_id);
+            }
+            for (self.active_workspace_member_sids.items) |ws_sid| {
+                mvs_states.items[ws_sid].has_default_feature_requested = true;
+                if (SolverContext.hasExplicitlyDeclaredFeature(
+                    &self.series_list.items[ws_sid],
+                    self.series_list.items[ws_sid].candidates.items[0],
+                    default_feat_id,
+                )) {
+                    _ = try self.activateMvsFeature(mvs_states, ws_sid, default_feat_id);
                 }
             }
         }
@@ -2644,6 +3638,11 @@ const SolverContext = struct {
                     _ = try self.activateMvsFeature(mvs_states, 0, f_id);
                 } else {
                     try pending_cli_pkg_feats.append(self.allocator, .{ .pkg_kebab = pkg_id, .feat_id = f_id });
+                    for (self.active_workspace_member_sids.items) |ws_sid| {
+                        if (self.series_list.items[ws_sid].key.pkg_name_sym == pkg_id) {
+                            _ = try self.activateMvsFeature(mvs_states, ws_sid, f_id);
+                        }
+                    }
                     for (root_cand_init.dependencies) |root_dep| {
                         if (root_dep.alias_kebab == pkg_id) {
                             if (root_dep.is_optional) {
@@ -2682,12 +3681,12 @@ const SolverContext = struct {
                 if (cur_v_idx >= cands_len) return false;
 
                 if (mvs_states.items[cur_sid].has_default_feature_requested) {
-                    const cur_cand_def = self.series_list.items[cur_sid].candidates.items[cur_v_idx];
-                    for (cur_cand_def.features) |tf| {
-                        if (tf.name == default_feat_id) {
-                            _ = try self.activateMvsFeature(mvs_states, cur_sid, default_feat_id);
-                            break;
-                        }
+                    if (SolverContext.hasExplicitlyDeclaredFeature(
+                        &self.series_list.items[cur_sid],
+                        self.series_list.items[cur_sid].candidates.items[cur_v_idx],
+                        default_feat_id,
+                    )) {
+                        _ = try self.activateMvsFeature(mvs_states, cur_sid, default_feat_id);
                     }
                 }
 
@@ -2727,14 +3726,11 @@ const SolverContext = struct {
                                 const clean_lhs = if (is_weak) raw_lhs[0 .. raw_lhs.len - 1] else raw_lhs;
                                 const dep_alias_id = try self.interner.intern(clean_lhs);
 
-                                var is_opt_dep = false;
-                                for (cand_snap.dependencies) |d_check| {
-                                    if (d_check.alias_kebab == dep_alias_id and d_check.is_optional) {
-                                        is_opt_dep = true;
-                                        break;
-                                    }
-                                }
-                                if (!is_weak and is_opt_dep) {
+                                if (!is_weak and SolverContext.isOptDepOnCandidate(
+                                    &self.series_list.items[cur_sid],
+                                    cand_snap,
+                                    dep_alias_id,
+                                )) {
                                     const gop = try mvs_states.items[cur_sid].active_opt_deps.getOrPut(
                                         self.allocator,
                                         dep_alias_id,
@@ -2782,7 +3778,7 @@ const SolverContext = struct {
                     const target_cands = self.series_list.items[target_sid].candidates.items;
                     if (target_cands.len == 0) return false;
 
-                    // Determine minimal candidate index matching `dep` (preferring existing lockfile pin when valid!):
+                    // Determine minimal candidate index matching `dep` (preferring existing lockfile pin when valid):
                     var req_floor_idx: ?u32 = null;
                     switch (resolved_target.effective_source) {
                         .registry => |ver_req| {
@@ -2799,13 +3795,13 @@ const SolverContext = struct {
                                 const pkg_sym = self.series_list.items[target_sid].key.pkg_name_sym;
                                 for (lock_doc.packages) |lp| {
                                     if (lp.name != pkg_sym) continue;
-                                    const lp_slot = lp.version.seriesSlot();
+                                    const lp_slot = lp.version.classifySeriesSlot();
                                     if (lp_slot.tier != self.series_list.items[target_sid].key.tier or
                                         lp_slot.number != self.series_list.items[target_sid].key.series_or_source_id)
                                     {
                                         continue;
                                     }
-                                    if (ver_req.matches(lp.version, self.interner)) {
+                                    if (ver_req.isMatchedBy(lp.version, self.interner)) {
                                         for (target_cands, 0..) |tc, tc_i| {
                                             if (SemVer.eql(tc.version, lp.version, self.interner) and
                                                 lp.source == tc.source_uri)
@@ -2820,7 +3816,7 @@ const SolverContext = struct {
 
                             if (req_floor_idx == null) {
                                 for (target_cands, 0..) |tc, tc_i| {
-                                    if (!tc.is_yanked and ver_req.matches(tc.version, self.interner)) {
+                                    if (!tc.is_yanked and ver_req.isMatchedBy(tc.version, self.interner)) {
                                         req_floor_idx = @intCast(tc_i);
                                         break;
                                     }
@@ -2832,7 +3828,7 @@ const SolverContext = struct {
                         },
                         .path => |ps| {
                             if (ps.version_req) |ver_req| {
-                                if (!ver_req.matches(target_cands[0].version, self.interner)) return false;
+                                if (!ver_req.isMatchedBy(target_cands[0].version, self.interner)) return false;
                             }
                             req_floor_idx = 0;
                         },
@@ -2856,13 +3852,13 @@ const SolverContext = struct {
                     var has_added_features = false;
                     // [a] Activate `"default"` whenever `has_default_feature_requested` holds on `next_idx`:
                     if (mvs_states.items[target_sid].has_default_feature_requested) {
-                        const target_cand = self.series_list.items[target_sid].candidates.items[next_idx];
-                        for (target_cand.features) |tf| {
-                            if (tf.name == default_feat_id) {
-                                if (try self.activateMvsFeature(mvs_states, target_sid, default_feat_id)) {
-                                    has_added_features = true;
-                                }
-                                break;
+                        if (SolverContext.hasExplicitlyDeclaredFeature(
+                            &self.series_list.items[target_sid],
+                            self.series_list.items[target_sid].candidates.items[next_idx],
+                            default_feat_id,
+                        )) {
+                            if (try self.activateMvsFeature(mvs_states, target_sid, default_feat_id)) {
+                                has_added_features = true;
                             }
                         }
                     }
@@ -2893,7 +3889,7 @@ const SolverContext = struct {
                         }
                     }
 
-                    // CRITICAL (`P2-1`): Re-enqueue `target_sid` whenever `has_version_raised` OR `has_added_features` (`v_next == v_cur`):
+                    // Re-enqueue `target_sid` whenever `has_version_raised` or `has_added_features` (`v_next == v_cur`):
                     if ((has_version_raised or has_added_features) and !mvs_states.items[target_sid].is_in_worklist) {
                         mvs_states.items[target_sid].is_in_worklist = true;
                         try worklist.append(self.allocator, target_sid);
@@ -2935,13 +3931,13 @@ const SolverContext = struct {
             if (!has_weak_progress) break;
         }
 
-        // Validate all active upper bounds, `[resolution].exclude` bans, yanked flags, and compiler `corex` bounds:
+        // Validate all active upper bounds, `[resolution].exclude` bans, yanked flags, compiler bounds, & declared features:
         for (active_constraints.items) |constraint| {
             if (!mvs_states.items[constraint.caller_series].is_active) continue;
             if (mvs_states.items[constraint.caller_series].selected_idx != constraint.caller_ver_idx) continue;
             const callee_v_idx = mvs_states.items[constraint.callee_series].selected_idx;
             const callee_cand = self.series_list.items[constraint.callee_series].candidates.items[callee_v_idx];
-            if (!constraint.req.matches(callee_cand.version, self.interner)) {
+            if (!constraint.req.isMatchedBy(callee_cand.version, self.interner)) {
                 return false;
             }
         }
@@ -2950,7 +3946,14 @@ const SolverContext = struct {
             if (!st.is_active) continue;
             const s_entry = &self.series_list.items[sid];
             const cand = s_entry.candidates.items[st.selected_idx];
-            if (sid > 0) {
+            for (s_entry.feature_ids.items, 0..) |f_id, bit_i| {
+                const is_on = if (bit_i < MAX_FEATURES_PER_PKG)
+                    st.enabled_bits.isSet(@intCast(bit_i))
+                else
+                    st.overflow_features.contains(f_id);
+                if (is_on and !isFeatureDeclaredOnCandidate(s_entry, cand, f_id)) return false;
+            }
+            if (!self.isActiveWorkspaceRootSeries(@intCast(sid))) {
                 if (self.isExcludedByManifestRule(s_entry.key.pkg_name_sym, cand.version)) return false;
                 if (!self.isCompilerVersionCompatible(cand)) return false;
                 if (cand.is_yanked) {
@@ -2975,12 +3978,13 @@ const SolverContext = struct {
     }
 
     /// Executes Tier-2 Bounded `PubGrub CDCL` (`<= 100,000` steps) with feature-aware clause learning and
-    /// exports a level-0 `ConflictDagExport` (`E0010`) on unsatisfiability (`DR-11` §3.3, `DR-16` §2.3, `P2-1`).
+    /// exports a level-0 `ConflictDagExport` (`E0010`) on unsatisfiability (`DR-11` §3.3, `DR-16` §2.3).
     fn runTier2PubGrubCdcl(
         self: *SolverContext,
         mvs_states: *std.ArrayListUnmanaged(MvsNodeState),
         out_steps: *u32,
         out_conflict_dag: *?ConflictDagExport,
+        is_emitting_diag: bool,
     ) !bool {
         var cdcl_arena = BumpArena.init(self.allocator);
         defer cdcl_arena.deinit();
@@ -2992,6 +3996,8 @@ const SolverContext = struct {
         defer terms.deinit(self.allocator);
         var explain_metas: std.ArrayListUnmanaged(IncompatExplainMeta) = .empty;
         defer explain_metas.deinit(self.allocator);
+        var emitted_undecl_bans: std.AutoHashMapUnmanaged(SeriesFeatKey, void) = .empty;
+        defer emitted_undecl_bans.deinit(self.allocator);
 
         var trail: std.ArrayListUnmanaged(CdclTrailEntry) = .empty;
         defer trail.deinit(self.allocator);
@@ -3011,6 +4017,73 @@ const SolverContext = struct {
         }) = .empty;
         defer feat_assigns.deinit(self.allocator);
 
+        const emitUndeclaredFeatureBans = struct {
+            /// Emits `{ target_sid@[lo..hi], target_sid + feat_id }` for candidate versions not declaring `feat_id`.
+            fn run(
+                ctx: *SolverContext,
+                target_sid: u32,
+                feat_id: StringId,
+                anchor_id: u32,
+                span: Span,
+                emitted_bans: *std.AutoHashMapUnmanaged(SeriesFeatKey, void),
+                incompat_nodes: *std.ArrayListUnmanaged(IncompatNode),
+                incompat_terms: *std.ArrayListUnmanaged(IncompatTerm),
+                metas: *std.ArrayListUnmanaged(IncompatExplainMeta),
+            ) !void {
+                if ((try emitted_bans.getOrPut(ctx.allocator, .{
+                    .series_id = target_sid,
+                    .feat_id = feat_id,
+                })).found_existing) return;
+
+                const s_entry = &ctx.series_list.items[target_sid];
+                const cands = s_entry.candidates.items;
+                var run_start: ?u32 = null;
+                var run_end: u32 = 0;
+                for (cands, 0..) |tc, tc_i| {
+                    if (!isFeatureDeclaredOnCandidate(s_entry, tc, feat_id)) {
+                        if (run_start == null) run_start = @intCast(tc_i);
+                        run_end = @intCast(tc_i);
+                    } else if (run_start) |rs| {
+                        const lbl = try std.fmt.allocPrint(
+                            ctx.graph_arena.asAllocator(),
+                            "package `{s}` candidate does not declare feature `{s}`",
+                            .{ ctx.interner.get(s_entry.key.pkg_name_sym), ctx.interner.get(feat_id) },
+                        );
+                        const t_start: u32 = @intCast(incompat_terms.items.len);
+                        try incompat_terms.append(ctx.allocator, makeVersionTerm(target_sid, rs, run_end, true));
+                        try incompat_terms.append(ctx.allocator, makeFeatureTerm(target_sid, feat_id, true));
+                        try incompat_nodes.append(ctx.allocator, .{
+                            .term_start = t_start,
+                            .term_len = 2,
+                            .kind = .feature_dep,
+                            .toml_anchor_id = anchor_id,
+                            .decision_level = 0,
+                        });
+                        try metas.append(ctx.allocator, .{ .unmatched_req_label = lbl, .span = span });
+                        run_start = null;
+                    }
+                }
+                if (run_start) |rs| {
+                    const lbl = try std.fmt.allocPrint(
+                        ctx.graph_arena.asAllocator(),
+                        "package `{s}` candidate does not declare feature `{s}`",
+                        .{ ctx.interner.get(s_entry.key.pkg_name_sym), ctx.interner.get(feat_id) },
+                    );
+                    const t_start: u32 = @intCast(incompat_terms.items.len);
+                    try incompat_terms.append(ctx.allocator, makeVersionTerm(target_sid, rs, run_end, true));
+                    try incompat_terms.append(ctx.allocator, makeFeatureTerm(target_sid, feat_id, true));
+                    try incompat_nodes.append(ctx.allocator, .{
+                        .term_start = t_start,
+                        .term_len = 2,
+                        .kind = .feature_dep,
+                        .toml_anchor_id = anchor_id,
+                        .decision_level = 0,
+                    });
+                    try metas.append(ctx.allocator, .{ .unmatched_req_label = lbl, .span = span });
+                }
+            }
+        }.run;
+
         const ensureSeriesCdclSlots = struct {
             /// Initializes `series_domains` (`{0..N-1, STATE_ABSENT}`) and level-0 `.exclude_ban` nodes for new series.
             fn run(
@@ -3020,6 +4093,7 @@ const SolverContext = struct {
                 steps_map: *std.ArrayListUnmanaged(usize),
                 exp_map: *std.ArrayListUnmanaged([]bool),
                 bans_map: *std.ArrayListUnmanaged(bool),
+                emitted_bans: *std.AutoHashMapUnmanaged(SeriesFeatKey, void),
                 incompat_nodes: *std.ArrayListUnmanaged(IncompatNode),
                 incompat_terms: *std.ArrayListUnmanaged(IncompatTerm),
                 metas: *std.ArrayListUnmanaged(IncompatExplainMeta),
@@ -3032,8 +4106,8 @@ const SolverContext = struct {
                     const words = try a_alloc.alloc(u64, w_cnt);
                     @memset(words, 0);
                     for (0..state_cnt) |st_i| {
-                        // Root (`sid == 0`) cannot be `STATE_ABSENT`:
-                        if (sid == 0 and st_i == cand_len) continue;
+                        // Active workspace roots cannot be `STATE_ABSENT`:
+                        if (ctx.isActiveWorkspaceRootSeries(@intCast(sid)) and st_i == cand_len) continue;
                         setStateBit(words, st_i);
                     }
                     try doms.append(ctx.allocator, words);
@@ -3044,7 +4118,7 @@ const SolverContext = struct {
                     try bans_map.append(ctx.allocator, false);
                 }
 
-                // Seed level-0 `[resolution].exclude`, compiler-version, and yanked bans for newly discovered series:
+                // Seed level-0 `[resolution].exclude`, compiler-version, yanked, and CLI `-F` bans for new series:
                 for (0..ctx.series_list.items.len) |sid_usize| {
                     if (bans_map.items[sid_usize]) continue;
                     bans_map.items[sid_usize] = true;
@@ -3055,20 +4129,36 @@ const SolverContext = struct {
                     const cands = s_entry.candidates.items;
                     if (cands.len == 0) continue;
 
-                    const all_exclude_slices = [_][]const ExcludeRule{
-                        ctx.bundle.root_manifest.excludes,
-                        if (ctx.bundle.root_manifest.workspace) |ws| ws.excludes else &.{},
-                    };
-                    for (all_exclude_slices) |rule_slice| {
-                        for (rule_slice) |rule| {
-                            if (rule.package_kebab != s_entry.key.pkg_name_sym) continue;
-                            var run_start: ?u32 = null;
-                            var run_end: u32 = 0;
-                            for (cands, 0..) |cand, c_i| {
-                                if (rule.req.matches(cand.version, ctx.interner)) {
-                                    if (run_start == null) run_start = @intCast(c_i);
-                                    run_end = @intCast(c_i);
-                                } else if (run_start) |rs| {
+                    if (!ctx.isActiveWorkspaceRootSeries(sid)) {
+                        const all_exclude_slices = [_][]const ExcludeRule{
+                            ctx.bundle.root_manifest.excludes,
+                            if (ctx.bundle.root_manifest.workspace) |ws| ws.excludes else &.{},
+                        };
+                        for (all_exclude_slices) |rule_slice| {
+                            for (rule_slice) |rule| {
+                                if (rule.package_kebab != s_entry.key.pkg_name_sym) continue;
+                                var run_start: ?u32 = null;
+                                var run_end: u32 = 0;
+                                for (cands, 0..) |cand, c_i| {
+                                    if (rule.req.isMatchedBy(cand.version, ctx.interner)) {
+                                        if (run_start == null) run_start = @intCast(c_i);
+                                        run_end = @intCast(c_i);
+                                    } else if (run_start) |rs| {
+                                        const t_start: u32 = @intCast(incompat_terms.items.len);
+                                        try incompat_terms.append(ctx.allocator, makeVersionTerm(sid, rs, run_end, true));
+                                        try incompat_nodes.append(ctx.allocator, .{
+                                            .term_start = t_start,
+                                            .term_len = 1,
+                                            .kind = .exclude_ban,
+                                            .flags = if (rule.has_cve_advisory) 0x01 else 0,
+                                            .toml_anchor_id = rule.anchor_id,
+                                            .decision_level = 0,
+                                        });
+                                        try metas.append(ctx.allocator, .{ .span = rule.span });
+                                        run_start = null;
+                                    }
+                                }
+                                if (run_start) |rs| {
                                     const t_start: u32 = @intCast(incompat_terms.items.len);
                                     try incompat_terms.append(ctx.allocator, makeVersionTerm(sid, rs, run_end, true));
                                     try incompat_nodes.append(ctx.allocator, .{
@@ -3080,59 +4170,45 @@ const SolverContext = struct {
                                         .decision_level = 0,
                                     });
                                     try metas.append(ctx.allocator, .{ .span = rule.span });
-                                    run_start = null;
                                 }
                             }
-                            if (run_start) |rs| {
+                        }
+
+                        // Yanked or incompatible `[package].corex` versions:
+                        for (cands, 0..) |cand, c_i| {
+                            const idx_u32: u32 = @intCast(c_i);
+                            const is_bad_corex = !ctx.isCompilerVersionCompatible(cand);
+                            var is_banned_yank = cand.is_yanked;
+                            if (is_banned_yank and ctx.existing_lock != null) {
+                                for (ctx.existing_lock.?.packages) |lp| {
+                                    if (lp.name == s_entry.key.pkg_name_sym and
+                                        SemVer.eql(lp.version, cand.version, ctx.interner) and
+                                        lp.source == cand.source_uri)
+                                    {
+                                        is_banned_yank = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (is_bad_corex or is_banned_yank) {
                                 const t_start: u32 = @intCast(incompat_terms.items.len);
-                                try incompat_terms.append(ctx.allocator, makeVersionTerm(sid, rs, run_end, true));
+                                try incompat_terms.append(ctx.allocator, makeVersionTerm(sid, idx_u32, idx_u32, true));
+                                const label = if (is_bad_corex)
+                                    try std.fmt.allocPrint(
+                                        ctx.graph_arena.asAllocator(),
+                                        "requires compiler `corex {s}`",
+                                        .{ctx.interner.get(cand.corex_req)},
+                                    )
+                                else
+                                    try ctx.graph_arena.dupe(u8, "version is yanked in registry");
                                 try incompat_nodes.append(ctx.allocator, .{
                                     .term_start = t_start,
                                     .term_len = 1,
-                                    .kind = .exclude_ban,
-                                    .flags = if (rule.has_cve_advisory) 0x01 else 0,
-                                    .toml_anchor_id = rule.anchor_id,
+                                    .kind = .no_versions,
                                     .decision_level = 0,
                                 });
-                                try metas.append(ctx.allocator, .{ .span = rule.span });
+                                try metas.append(ctx.allocator, .{ .unmatched_req_label = label });
                             }
-                        }
-                    }
-
-                    // Yanked or incompatible `[package].corex` versions:
-                    for (cands, 0..) |cand, c_i| {
-                        const idx_u32: u32 = @intCast(c_i);
-                        const is_bad_corex = !ctx.isCompilerVersionCompatible(cand);
-                        var is_banned_yank = cand.is_yanked;
-                        if (is_banned_yank and ctx.existing_lock != null) {
-                            for (ctx.existing_lock.?.packages) |lp| {
-                                if (lp.name == s_entry.key.pkg_name_sym and
-                                    SemVer.eql(lp.version, cand.version, ctx.interner) and
-                                    lp.source == cand.source_uri)
-                                {
-                                    is_banned_yank = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if (is_bad_corex or is_banned_yank) {
-                            const t_start: u32 = @intCast(incompat_terms.items.len);
-                            try incompat_terms.append(ctx.allocator, makeVersionTerm(sid, idx_u32, idx_u32, true));
-                            const label = if (is_bad_corex)
-                                try std.fmt.allocPrint(
-                                    ctx.graph_arena.asAllocator(),
-                                    "requires compiler `corex {s}`",
-                                    .{ctx.interner.get(cand.corex_req)},
-                                )
-                            else
-                                try ctx.graph_arena.dupe(u8, "version is yanked in registry");
-                            try incompat_nodes.append(ctx.allocator, .{
-                                .term_start = t_start,
-                                .term_len = 1,
-                                .kind = .no_versions,
-                                .decision_level = 0,
-                            });
-                            try metas.append(ctx.allocator, .{ .unmatched_req_label = label });
                         }
                     }
 
@@ -3165,7 +4241,7 @@ const SolverContext = struct {
                             }
                             if (is_matching_cli_pkg) {
                                 const cli_feat_id = try ctx.interner.intern(feat_part);
-                                _ = try s_entry.internFeatureBit(ctx.allocator, cli_feat_id);
+                                _ = try s_entry.internFeatureBit(ctx.series_arena.allocator(), cli_feat_id);
                                 const t_start: u32 = @intCast(incompat_terms.items.len);
                                 try incompat_terms.append(ctx.allocator, makeVersionTerm(sid, 0, INF_VER_INDEX, true));
                                 try incompat_terms.append(ctx.allocator, makeFeatureTerm(sid, cli_feat_id, false));
@@ -3176,6 +4252,17 @@ const SolverContext = struct {
                                     .decision_level = 0,
                                 });
                                 try metas.append(ctx.allocator, .{});
+                                try emitUndeclaredFeatureBans(
+                                    ctx,
+                                    sid,
+                                    cli_feat_id,
+                                    std.math.maxInt(u32),
+                                    Span.ZERO,
+                                    emitted_bans,
+                                    incompat_nodes,
+                                    incompat_terms,
+                                    metas,
+                                );
                             }
                         }
                     }
@@ -3190,12 +4277,13 @@ const SolverContext = struct {
             &series_assign_step,
             &series_expanded_ver,
             &series_seeded_bans,
+            &emitted_undecl_bans,
             &nodes,
             &terms,
             &explain_metas,
         );
 
-        // Seed level-0 `.root_pin` `{ ¬root@[0..0] }`:
+        // Seed level-0 `.root_pin` `{ ¬root@[0..0] }` for `0` and all active workspace members:
         {
             const t_start: u32 = @intCast(terms.items.len);
             try terms.append(self.allocator, makeVersionTerm(0, 0, 0, false));
@@ -3207,15 +4295,47 @@ const SolverContext = struct {
             });
             try explain_metas.append(self.allocator, .{});
         }
+        for (self.active_workspace_member_sids.items) |ws_sid| {
+            const t_start: u32 = @intCast(terms.items.len);
+            try terms.append(self.allocator, makeVersionTerm(ws_sid, 0, 0, false));
+            try nodes.append(self.allocator, .{
+                .term_start = t_start,
+                .term_len = 1,
+                .kind = .root_pin,
+                .decision_level = 0,
+            });
+            try explain_metas.append(self.allocator, .{});
+        }
 
-        // Seed root features at `decision_level = 0`:
+        // Seed root and active workspace member features at `decision_level = 0`:
         const default_feat_id = try self.interner.intern("default");
         const root_cand = self.series_list.items[0].candidates.items[0];
         if (!self.options.has_no_default_features) {
-            for (root_cand.features) |f_decl| {
-                if (f_decl.name == default_feat_id) {
-                    const key = SeriesFeatKey{ .series_id = 0, .feat_id = default_feat_id };
-                    try feat_assigns.put(self.allocator, key, .{
+            if (SolverContext.hasExplicitlyDeclaredFeature(
+                &self.series_list.items[0],
+                root_cand,
+                default_feat_id,
+            )) {
+                const key = SeriesFeatKey{ .series_id = 0, .feat_id = default_feat_id };
+                try feat_assigns.put(self.allocator, key, .{
+                    .is_enabled = true,
+                    .step_idx = trail.items.len,
+                    .decision_level = 0,
+                });
+                try trail.append(self.allocator, .{
+                    .decision_level = 0,
+                    .cause_incompat = null,
+                    .mutation = .{ .feature_val = .{ .key = key, .is_enabled = true } },
+                });
+            }
+            for (self.active_workspace_member_sids.items) |ws_sid| {
+                if (SolverContext.hasExplicitlyDeclaredFeature(
+                    &self.series_list.items[ws_sid],
+                    self.series_list.items[ws_sid].candidates.items[0],
+                    default_feat_id,
+                )) {
+                    const ws_key = SeriesFeatKey{ .series_id = ws_sid, .feat_id = default_feat_id };
+                    try feat_assigns.put(self.allocator, ws_key, .{
                         .is_enabled = true,
                         .step_idx = trail.items.len,
                         .decision_level = 0,
@@ -3223,9 +4343,8 @@ const SolverContext = struct {
                     try trail.append(self.allocator, .{
                         .decision_level = 0,
                         .cause_incompat = null,
-                        .mutation = .{ .feature_val = .{ .key = key, .is_enabled = true } },
+                        .mutation = .{ .feature_val = .{ .key = ws_key, .is_enabled = true } },
                     });
-                    break;
                 }
             }
         }
@@ -3245,6 +4364,18 @@ const SolverContext = struct {
                 const pkg_id = try self.interner.intern(kebab_buf[0..pkg_part.len]);
                 if (pkg_id == self.series_list.items[0].key.pkg_name_sym) {
                     const root_f_id = try self.interner.intern(feat_part);
+                    _ = try self.series_list.items[0].internFeatureBit(self.series_arena.allocator(), root_f_id);
+                    try emitUndeclaredFeatureBans(
+                        self,
+                        0,
+                        root_f_id,
+                        std.math.maxInt(u32),
+                        Span.init(self.bundle.root_manifest.file_id, 0, 0),
+                        &emitted_undecl_bans,
+                        &nodes,
+                        &terms,
+                        &explain_metas,
+                    );
                     const root_key = SeriesFeatKey{ .series_id = 0, .feat_id = root_f_id };
                     if (!feat_assigns.contains(root_key)) {
                         try feat_assigns.put(self.allocator, root_key, .{
@@ -3287,6 +4418,18 @@ const SolverContext = struct {
                 continue;
             }
             const f_id = try self.interner.intern(trimmed);
+            _ = try self.series_list.items[0].internFeatureBit(self.series_arena.allocator(), f_id);
+            try emitUndeclaredFeatureBans(
+                self,
+                0,
+                f_id,
+                std.math.maxInt(u32),
+                Span.init(self.bundle.root_manifest.file_id, 0, 0),
+                &emitted_undecl_bans,
+                &nodes,
+                &terms,
+                &explain_metas,
+            );
             const key = SeriesFeatKey{ .series_id = 0, .feat_id = f_id };
             if (!feat_assigns.contains(key)) {
                 try feat_assigns.put(self.allocator, key, .{
@@ -3314,6 +4457,7 @@ const SolverContext = struct {
                 steps_map: *std.ArrayListUnmanaged(usize),
                 exp_map: *std.ArrayListUnmanaged([]bool),
                 bans_map: *std.ArrayListUnmanaged(bool),
+                emitted_bans: *std.AutoHashMapUnmanaged(SeriesFeatKey, void),
                 incompat_nodes: *std.ArrayListUnmanaged(IncompatNode),
                 incompat_terms: *std.ArrayListUnmanaged(IncompatTerm),
                 metas: *std.ArrayListUnmanaged(IncompatExplainMeta),
@@ -3321,7 +4465,7 @@ const SolverContext = struct {
                 if (exp_map.items[sid][v_idx]) return;
                 exp_map.items[sid][v_idx] = true;
 
-                // [1] Intra-package `[features]` implications: `S@v ∧ S+F ⟹ S+G`:
+                // [1] Intra-package `[features]` implications (`S@v ∧ S+F ⟹ S+G`):
                 const cand_init = ctx.series_list.items[sid].candidates.items[v_idx];
                 const features_copy = cand_init.features;
                 const deps_copy = cand_init.dependencies;
@@ -3343,6 +4487,7 @@ const SolverContext = struct {
                         steps_map,
                         exp_map,
                         bans_map,
+                        emitted_bans,
                         incompat_nodes,
                         incompat_terms,
                         metas,
@@ -3378,7 +4523,7 @@ const SolverContext = struct {
                     switch (resolved.effective_source) {
                         .registry => |ver_req| {
                             for (target_cands, 0..) |tc, tc_i| {
-                                if (ver_req.matches(tc.version, ctx.interner)) {
+                                if (ver_req.isMatchedBy(tc.version, ctx.interner)) {
                                     try match_indices.append(ctx.allocator, @intCast(tc_i));
                                 }
                             }
@@ -3386,7 +4531,7 @@ const SolverContext = struct {
                         .path => |ps| {
                             if (target_cands.len > 0) {
                                 const is_ok = if (ps.version_req) |vr|
-                                    vr.matches(target_cands[0].version, ctx.interner)
+                                    vr.isMatchedBy(target_cands[0].version, ctx.interner)
                                 else
                                     true;
                                 if (is_ok) try match_indices.append(ctx.allocator, 0);
@@ -3425,7 +4570,7 @@ const SolverContext = struct {
 
                     const lo_m = match_indices.items[0];
                     const hi_m = match_indices.items[match_indices.items.len - 1];
-                    // Emit `.dep_edge`: `{ S@[v..v] (, S+gate), ¬target@[lo_m..hi_m] }`:
+                    // Emit `.dep_edge` `{ S@[v..v] (, S+gate), ¬target@[lo_m..hi_m] }`:
                     {
                         const t_start: u32 = @intCast(incompat_terms.items.len);
                         try incompat_terms.append(ctx.allocator, makeVersionTerm(sid, v_idx, v_idx, true));
@@ -3466,23 +4611,43 @@ const SolverContext = struct {
                         }
                     }
 
-                    // Propagate `default` (if any candidate in `target_sid` declares `default`) & explicit `dep.features`:
+                    // Propagate `default` per candidate run declaring `default` (matching Tier-1 MVS) & `dep.features`:
                     if (dep.has_default_features) {
-                        var has_target_def = false;
-                        for (ctx.series_list.items[target_sid].candidates.items) |tc| {
-                            for (tc.features) |tf| {
-                                if (tf.name == def_feat) {
-                                    has_target_def = true;
-                                    break;
+                        var def_run_start: ?u32 = null;
+                        var def_run_end: u32 = 0;
+                        for (target_cands, 0..) |tc, tc_i| {
+                            if (SolverContext.hasExplicitlyDeclaredFeature(
+                                &ctx.series_list.items[target_sid],
+                                tc,
+                                def_feat,
+                            )) {
+                                if (def_run_start == null) def_run_start = @intCast(tc_i);
+                                def_run_end = @intCast(tc_i);
+                            } else if (def_run_start) |drs| {
+                                const f_start: u32 = @intCast(incompat_terms.items.len);
+                                try incompat_terms.append(ctx.allocator, makeVersionTerm(sid, v_idx, v_idx, true));
+                                if (dep_gate_feat) |gf| {
+                                    try incompat_terms.append(ctx.allocator, makeFeatureTerm(sid, gf, true));
                                 }
+                                try incompat_terms.append(ctx.allocator, makeVersionTerm(target_sid, drs, def_run_end, true));
+                                try incompat_terms.append(ctx.allocator, makeFeatureTerm(target_sid, def_feat, false));
+                                try incompat_nodes.append(ctx.allocator, .{
+                                    .term_start = f_start,
+                                    .term_len = @intCast(incompat_terms.items.len - f_start),
+                                    .kind = .feature_dep,
+                                    .toml_anchor_id = dep.anchor_id,
+                                });
+                                try metas.append(ctx.allocator, .{ .span = dep.decl_span });
+                                def_run_start = null;
                             }
                         }
-                        if (has_target_def) {
+                        if (def_run_start) |drs| {
                             const f_start: u32 = @intCast(incompat_terms.items.len);
                             try incompat_terms.append(ctx.allocator, makeVersionTerm(sid, v_idx, v_idx, true));
                             if (dep_gate_feat) |gf| {
                                 try incompat_terms.append(ctx.allocator, makeFeatureTerm(sid, gf, true));
                             }
+                            try incompat_terms.append(ctx.allocator, makeVersionTerm(target_sid, drs, def_run_end, true));
                             try incompat_terms.append(ctx.allocator, makeFeatureTerm(target_sid, def_feat, false));
                             try incompat_nodes.append(ctx.allocator, .{
                                 .term_start = f_start,
@@ -3494,6 +4659,7 @@ const SolverContext = struct {
                         }
                     }
                     for (dep.features) |df_id| {
+                        _ = try ctx.series_list.items[target_sid].internFeatureBit(ctx.series_arena.allocator(), df_id);
                         const f_start: u32 = @intCast(incompat_terms.items.len);
                         try incompat_terms.append(ctx.allocator, makeVersionTerm(sid, v_idx, v_idx, true));
                         if (dep_gate_feat) |gf| {
@@ -3507,6 +4673,17 @@ const SolverContext = struct {
                             .toml_anchor_id = dep.anchor_id,
                         });
                         try metas.append(ctx.allocator, .{ .span = dep.decl_span });
+                        try emitUndeclaredFeatureBans(
+                            ctx,
+                            target_sid,
+                            df_id,
+                            dep.anchor_id,
+                            dep.decl_span,
+                            emitted_bans,
+                            incompat_nodes,
+                            incompat_terms,
+                            metas,
+                        );
                     }
                 }
 
@@ -3534,13 +4711,11 @@ const SolverContext = struct {
                             const dep_alias_id = try ctx.interner.intern(clean_lhs);
                             const target_sid = dep_alias_to_sid.get(dep_alias_id) orelse continue;
 
-                            var is_opt_dep = false;
-                            for (deps_copy) |d_check| {
-                                if (d_check.alias_kebab == dep_alias_id and d_check.is_optional) {
-                                    is_opt_dep = true;
-                                    break;
-                                }
-                            }
+                            const is_opt_dep = SolverContext.isOptDepOnCandidate(
+                                &ctx.series_list.items[sid],
+                                cand_init,
+                                dep_alias_id,
+                            );
                             if (!is_weak and is_opt_dep) {
                                 const dep_prefix = try std.fmt.allocPrint(
                                     ctx.allocator,
@@ -3561,11 +4736,13 @@ const SolverContext = struct {
                                 try metas.append(ctx.allocator, .{});
                             }
 
+                            if (target_sid == sid and rhs_feat == f_decl.name) continue;
+                            _ = try ctx.series_list.items[target_sid].internFeatureBit(ctx.series_arena.allocator(), rhs_feat);
                             const f_start: u32 = @intCast(incompat_terms.items.len);
                             try incompat_terms.append(ctx.allocator, makeVersionTerm(sid, v_idx, v_idx, true));
                             try incompat_terms.append(ctx.allocator, makeFeatureTerm(sid, f_decl.name, true));
                             if (is_weak and is_opt_dep) {
-                                // Weak `foo?/bar`: only fires when `target_sid` is active (`target_sid ∈ [0..INF]`):
+                                // Weak `foo?/bar` only fires when `target_sid` is active (`target_sid ∈ [0..INF]`):
                                 try incompat_terms.append(ctx.allocator, makeVersionTerm(target_sid, 0, INF_VER_INDEX, true));
                             }
                             try incompat_terms.append(ctx.allocator, makeFeatureTerm(target_sid, rhs_feat, false));
@@ -3575,7 +4752,19 @@ const SolverContext = struct {
                                 .kind = .feature_dep,
                             });
                             try metas.append(ctx.allocator, .{});
+                            try emitUndeclaredFeatureBans(
+                                ctx,
+                                target_sid,
+                                rhs_feat,
+                                std.math.maxInt(u32),
+                                cand_init.manifest_span,
+                                emitted_bans,
+                                incompat_nodes,
+                                incompat_terms,
+                                metas,
+                            );
                         } else {
+                            if (act_id == f_decl.name) continue;
                             const t_start: u32 = @intCast(incompat_terms.items.len);
                             try incompat_terms.append(ctx.allocator, makeVersionTerm(sid, v_idx, v_idx, true));
                             try incompat_terms.append(ctx.allocator, makeFeatureTerm(sid, f_decl.name, true));
@@ -3592,7 +4781,7 @@ const SolverContext = struct {
             }
         }.run;
 
-        // Expand root (`sid = 0`, `v_idx = 0`) incompatibilities upfront:
+        // Expand root (`sid = 0`) and active workspace member incompatibilities upfront:
         try expandCandidateIncompatibilities(
             self,
             arena_alloc,
@@ -3603,11 +4792,31 @@ const SolverContext = struct {
             &series_assign_step,
             &series_expanded_ver,
             &series_seeded_bans,
+            &emitted_undecl_bans,
             &nodes,
             &terms,
             &explain_metas,
         );
         if (self.has_aborted_error) return false;
+
+        for (self.active_workspace_member_sids.items) |ws_sid| {
+            try expandCandidateIncompatibilities(
+                self,
+                arena_alloc,
+                ws_sid,
+                0,
+                default_feat_id,
+                &series_domains,
+                &series_assign_step,
+                &series_expanded_ver,
+                &series_seeded_bans,
+                &emitted_undecl_bans,
+                &nodes,
+                &terms,
+                &explain_metas,
+            );
+            if (self.has_aborted_error) return false;
+        }
 
         var current_dl: u32 = 0;
 
@@ -3644,7 +4853,7 @@ const SolverContext = struct {
                                 break;
                             }
                         } else {
-                            // NOTE: unassigned feature is inconclusive (`true` or `false` still open):
+                            // Unassigned feature remains inconclusive (`true` or `false` still open):
                             inconclusive_count += 1;
                             unit_term_pos = t_pos;
                             if (inconclusive_count > 1) break;
@@ -3675,7 +4884,7 @@ const SolverContext = struct {
                             unit_term_pos = t_pos;
                             if (inconclusive_count > 1) break;
                         } else {
-                            // Satisfied (`Dom(sid) ⊆ States(term)`): find decision level of latest narrowing on `sid`:
+                            // Satisfied (`Dom(sid) ⊆ States(term)`); track decision level of latest narrowing on `sid`:
                             const step_i = series_assign_step.items[sid];
                             if (step_i > 0 and step_i <= trail.items.len) {
                                 max_sat_dl = @max(max_sat_dl, trail.items[step_i - 1].decision_level);
@@ -3732,8 +4941,8 @@ const SolverContext = struct {
                     series_assign_step.items[sid] = trail.items.len;
 
                     // If `sid` narrowed to a single concrete candidate `v_only` (`< cand_len`), expand its edges:
-                    if (popcountStateWords(dom_words) == 1) {
-                        if (firstSetStateBit(dom_words)) |only_st| {
+                    if (countSetStateBits(dom_words) == 1) {
+                        if (findFirstSetStateBit(dom_words)) |only_st| {
                             if (only_st < cand_len) {
                                 try expandCandidateIncompatibilities(
                                     self,
@@ -3745,6 +4954,7 @@ const SolverContext = struct {
                                     &series_assign_step,
                                     &series_expanded_ver,
                                     &series_seeded_bans,
+                                    &emitted_undecl_bans,
                                     &nodes,
                                     &terms,
                                     &explain_metas,
@@ -3762,28 +4972,30 @@ const SolverContext = struct {
                 if (current_dl == 0) {
                     // Root-level (`decision_level == 0`) unsatisfiability -> export `ConflictDagExport` & emit `E0010`:
                     nodes.items[init_conf_id].decision_level = 0;
-                    const exported = try pkg_conflict_seam.exportLevelZeroConflictDag(
-                        self.graph_arena,
-                        init_conf_id,
-                        nodes.items,
-                        terms.items,
-                        self.bundle.root_manifest.anchors,
-                    );
-                    out_conflict_dag.* = exported;
-                    try emitUnsatisfiableGraphDiagnosticWithMeta(
-                        self.allocator,
-                        self.interner,
-                        &exported,
-                        &self.series_list,
-                        explain_metas.items,
-                        init_conf_id,
-                        Span.init(self.bundle.root_manifest.file_id, 0, 0),
-                        self.sink,
-                    );
+                    if (is_emitting_diag) {
+                        const exported = try pkg_conflict_seam.exportLevelZeroConflictDag(
+                            self.graph_arena,
+                            init_conf_id,
+                            nodes.items,
+                            terms.items,
+                            self.bundle.root_manifest.anchors,
+                        );
+                        out_conflict_dag.* = exported;
+                        try emitUnsatisfiableGraphDiagnosticWithMeta(
+                            self.allocator,
+                            self.interner,
+                            &exported,
+                            &self.series_list,
+                            explain_metas.items,
+                            init_conf_id,
+                            Span.init(self.bundle.root_manifest.file_id, 0, 0),
+                            self.sink,
+                        );
+                    }
                     return false;
                 }
 
-                // CDCL conflict resolution: walk trail backwards to resolve `cur_conf_id` until 1st-UIP / backjump:
+                // CDCL conflict resolution walks `trail` backwards to resolve `cur_conf_id` until 1st-UIP / backjump:
                 var cur_conf_id = init_conf_id;
                 while (out_steps.* < MAX_SOLVER_STEPS) {
                     out_steps.* += 1;
@@ -3801,7 +5013,8 @@ const SolverContext = struct {
                             .feature_val => |fv| {
                                 for (conf_terms) |ct| {
                                     if (isFeatureTerm(ct) and ct.series_id == fv.key.series_id and
-                                        extractTermFeatureId(ct) == fv.key.feat_id)
+                                        extractTermFeatureId(ct) == fv.key.feat_id and
+                                        isPositiveTerm(ct) == fv.is_enabled)
                                     {
                                         has_trail_effect = true;
                                         break;
@@ -3865,8 +5078,8 @@ const SolverContext = struct {
 
                     const pivot_entry = trail.items[pivot_idx];
                     if (pivot_entry.cause_incompat == null) {
-                        // Reached the speculative decision at `pivot_entry.decision_level` (1st-UIP)!
-                        // Compute backjump level = highest `decision_level < pivot_entry.decision_level` among other terms:
+                        // Reached the speculative decision at `pivot_entry.decision_level` (1st-UIP);
+                        // compute backjump level as highest `decision_level < pivot_entry.decision_level` among other terms:
                         var backjump_dl: u32 = 0;
                         for (trail.items[0..pivot_idx]) |earlier| {
                             if (earlier.decision_level >= pivot_entry.decision_level) continue;
@@ -3875,7 +5088,8 @@ const SolverContext = struct {
                                 .feature_val => |fv| {
                                     for (conf_terms) |ct| {
                                         if (isFeatureTerm(ct) and ct.series_id == fv.key.series_id and
-                                            extractTermFeatureId(ct) == fv.key.feat_id)
+                                            extractTermFeatureId(ct) == fv.key.feat_id and
+                                            isPositiveTerm(ct) == fv.is_enabled)
                                         {
                                             has_earlier_effect = true;
                                             break;
@@ -4025,24 +5239,31 @@ const SolverContext = struct {
                         },
                     }
 
-                    // Merge/intersect duplicate version terms on the same non-pivot `series_id` to keep clauses compact:
+                    // Merge/intersect duplicate terms in $O(1)$ and drop tautological resolvents (`+F` & `-F` or empty intersection):
                     var deduped_terms: std.ArrayListUnmanaged(IncompatTerm) = .empty;
                     defer deduped_terms.deinit(self.allocator);
                     var handled_sids: std.AutoHashMapUnmanaged(u32, void) = .empty;
                     defer handled_sids.deinit(self.allocator);
+                    var seen_feat_polarity: std.AutoHashMapUnmanaged(SeriesFeatKey, bool) = .empty;
+                    defer seen_feat_polarity.deinit(self.allocator);
+                    var is_tautological = false;
 
                     for (new_terms.items) |nt| {
                         if (isFeatureTerm(nt)) {
-                            var is_dup_ft = false;
-                            for (deduped_terms.items) |existing_ft| {
-                                if (isFeatureTerm(existing_ft) and existing_ft.series_id == nt.series_id and
-                                    existing_ft.flags_and_feat == nt.flags_and_feat)
-                                {
-                                    is_dup_ft = true;
+                            const f_key = SeriesFeatKey{
+                                .series_id = nt.series_id,
+                                .feat_id = extractTermFeatureId(nt),
+                            };
+                            const is_pos = isPositiveTerm(nt);
+                            if (seen_feat_polarity.get(f_key)) |existing_pol| {
+                                if (existing_pol != is_pos) {
+                                    is_tautological = true;
                                     break;
                                 }
+                                continue;
                             }
-                            if (!is_dup_ft) try deduped_terms.append(self.allocator, nt);
+                            try seen_feat_polarity.put(self.allocator, f_key, is_pos);
+                            try deduped_terms.append(self.allocator, nt);
                             continue;
                         }
                         if ((try handled_sids.getOrPut(self.allocator, nt.series_id)).found_existing) continue;
@@ -4098,9 +5319,14 @@ const SolverContext = struct {
                                         gap_s = null;
                                     }
                                 }
+                            } else {
+                                is_tautological = true;
+                                break;
                             }
                         }
                     }
+
+                    if (is_tautological) continue;
 
                     const res_start: u32 = @intCast(terms.items.len);
                     try terms.appendSlice(self.allocator, deduped_terms.items);
@@ -4121,21 +5347,21 @@ const SolverContext = struct {
 
             if (has_propagated) continue;
 
-            // [2] Decision step: find the first active `SeriesKey` (`STATE_ABSENT ∉ Dom(S)`) with `|Dom(S)| > 1`:
+            // [2] Decision step picks the first active `SeriesKey` (`STATE_ABSENT ∉ Dom(S)`) with `|Dom(S)| > 1`:
             var chosen_sid_opt: ?u32 = null;
             var chosen_ver_idx: u32 = 0;
             for (0..self.series_list.items.len) |sid_usize| {
                 const cand_len = self.series_list.items[sid_usize].candidates.items.len;
                 const dom_words = series_domains.items[sid_usize];
                 if (isStateBitSet(dom_words, cand_len)) continue; // `STATE_ABSENT` still allowed -> inactive.
-                const rem_cnt = popcountStateWords(dom_words);
+                const rem_cnt = countSetStateBits(dom_words);
                 if (rem_cnt > 1) {
                     chosen_sid_opt = @intCast(sid_usize);
-                    // Minimal valid version (`MVS` ordering: pick lowest allowed index `>= 0`!):
-                    chosen_ver_idx = @intCast(firstSetStateBit(dom_words).?);
+                    // Minimal valid version (`MVS` ordering picks lowest allowed index `>= 0`):
+                    chosen_ver_idx = @intCast(findFirstSetStateBit(dom_words).?);
                     break;
                 } else if (rem_cnt == 1) {
-                    const only_v: u32 = @intCast(firstSetStateBit(dom_words).?);
+                    const only_v: u32 = @intCast(findFirstSetStateBit(dom_words).?);
                     if (only_v < cand_len and !series_expanded_ver.items[sid_usize][only_v]) {
                         try expandCandidateIncompatibilities(
                             self,
@@ -4147,6 +5373,7 @@ const SolverContext = struct {
                             &series_assign_step,
                             &series_expanded_ver,
                             &series_seeded_bans,
+                            &emitted_undecl_bans,
                             &nodes,
                             &terms,
                             &explain_metas,
@@ -4183,6 +5410,7 @@ const SolverContext = struct {
                     &series_assign_step,
                     &series_expanded_ver,
                     &series_seeded_bans,
+                    &emitted_undecl_bans,
                     &nodes,
                     &terms,
                     &explain_metas,
@@ -4236,7 +5464,7 @@ const SolverContext = struct {
                 var node_st = MvsNodeState{};
                 if (!isStateBitSet(dom_words, cand_len)) {
                     node_st.is_active = true;
-                    node_st.selected_idx = @intCast(firstSetStateBit(dom_words) orelse 0);
+                    node_st.selected_idx = @intCast(findFirstSetStateBit(dom_words) orelse 0);
                 }
                 try mvs_states.append(self.allocator, node_st);
             }
@@ -4253,10 +5481,8 @@ const SolverContext = struct {
                 } else {
                     _ = try self.activateMvsFeature(mvs_states, sid, kv.key_ptr.feat_id);
                     const cand = self.series_list.items[sid].candidates.items[mvs_states.items[sid].selected_idx];
-                    for (cand.dependencies) |d_check| {
-                        if (d_check.is_optional and d_check.alias_kebab == kv.key_ptr.feat_id) {
-                            try mvs_states.items[sid].active_opt_deps.put(self.allocator, d_check.alias_kebab, {});
-                        }
+                    if (SolverContext.isOptDepOnCandidate(&self.series_list.items[sid], cand, kv.key_ptr.feat_id)) {
+                        try mvs_states.items[sid].active_opt_deps.put(self.allocator, kv.key_ptr.feat_id, {});
                     }
                 }
             }
@@ -4264,13 +5490,15 @@ const SolverContext = struct {
         }
 
         // Solver step budget (`MAX_SOLVER_STEPS = 100,000`) exhausted:
-        try self.sink.emit(.{
-            .code = .e0010_unsatisfiable_dependency_graph,
-            .severity = .err,
-            .primary_span = Span.init(self.bundle.root_manifest.file_id, 0, 0),
-            .message = "dependency solver exceeded 100,000 CDCL conflict-resolution steps",
-            .notes = &.{"help: tighten version bounds or remove conflicting optional feature cycles in `corex.toml`"},
-        });
+        if (is_emitting_diag) {
+            try self.sink.emit(.{
+                .code = .e0010_unsatisfiable_dependency_graph,
+                .severity = .err,
+                .primary_span = Span.init(self.bundle.root_manifest.file_id, 0, 0),
+                .message = "dependency solver exceeded 100,000 CDCL conflict-resolution steps",
+                .notes = &.{"help: tighten version bounds or remove conflicting optional feature cycles in `corex.toml`"},
+            });
+        }
         return false;
     }
 };
@@ -4318,13 +5546,15 @@ fn appendFormattedIncompatTerm(
             return;
         }
     }
-    const raw_line = try std.fmt.allocPrint(allocator, "series#{d}[{d}..{d}]", .{
-        term.series_id,
-        term.ver_min,
-        term.ver_max,
-    });
-    defer allocator.free(raw_line);
-    try buf.appendSlice(allocator, raw_line);
+    var num_buf: [64]u8 = undefined;
+    try buf.appendSlice(
+        allocator,
+        try std.fmt.bufPrint(&num_buf, "series#{d}[{d}..{d}]", .{
+            term.series_id,
+            term.ver_min,
+            term.ver_max,
+        }),
+    );
 }
 
 /// Recursively renders monochrome Unicode box-drawing proof steps (`├─`, `│`, `╰─`) for `dag.nodes[node_idx]`.
@@ -4357,6 +5587,8 @@ fn renderConflictDagBranchRecursive(
                 try buf.appendSlice(allocator, "[resolution].exclude ban: ");
             }
         },
+        .links_uniq => try buf.appendSlice(allocator, "native links uniqueness conflict: "),
+        .cxi_pub_mismatch => try buf.appendSlice(allocator, "public .cxi interface mismatch: "),
         .no_versions => try buf.appendSlice(allocator, "unsatisfied candidate constraint: "),
         .derived_conflict => try buf.appendSlice(allocator, Glyphs.FAILURE ++ " derived conflict: "),
     }
@@ -4465,6 +5697,8 @@ fn emitUnsatisfiableGraphDiagnosticWithMeta(
                     else
                         "version excluded by `[resolution].exclude` here",
                     .feature_dep => "conflicting feature requirement declared here",
+                    .links_uniq => "conflicting native `links` claim declared here",
+                    .cxi_pub_mismatch => "incompatible public `.cxi` interface referenced here",
                     else => "conflicting dependency requirement declared here",
                 };
                 try labels.append(allocator, .{
@@ -4689,26 +5923,30 @@ pub fn resolveProjectGraph(
         if (env_m.get("COREX_HERMETIC")) |herm_val| std.mem.eql(u8, herm_val, "1") else false
     else
         false;
-    const effective_is_locked = options.is_locked or options.is_frozen or is_env_hermetic;
-    const effective_is_offline = options.is_offline or options.is_frozen or is_env_hermetic;
+    const is_effective_locked = options.is_locked or options.is_frozen or is_env_hermetic;
+    const is_effective_offline = options.is_offline or options.is_frozen or is_env_hermetic;
     var merged_opts = options;
-    merged_opts.is_locked = effective_is_locked;
-    merged_opts.is_offline = effective_is_offline;
+    merged_opts.is_locked = is_effective_locked;
+    merged_opts.is_offline = is_effective_offline;
 
     const reg_dir_opt: ?[]const u8 = options.local_registry_dir orelse
         if (options.environ_map) |env_m| env_m.get("COREX_REGISTRY_DIR") else null;
 
-    var cache = try pkg_cache.PkgCache.init(
-        allocator,
-        options.corex_home_dir,
-        RESOLVER_CACHE_MAX_ENTRIES,
-        RESOLVER_CACHE_MAX_BYTES,
-    );
-    defer cache.deinit();
+    var owned_cache_opt: ?pkg_cache.PkgCache = if (options.shared_cache == null)
+        try pkg_cache.PkgCache.init(
+            allocator,
+            options.corex_home_dir,
+            RESOLVER_CACHE_MAX_ENTRIES,
+            RESOLVER_CACHE_MAX_BYTES,
+        )
+    else
+        null;
+    defer if (owned_cache_opt) |*owned_c| owned_c.deinit();
+    const cache = options.shared_cache orelse &owned_cache_opt.?;
 
     // [1] Validate `--locked` / `--frozen` lockfile presence and manifest `BLAKE3` parity (`E0014`):
     const fallback_span = Span.init(manifest_bundle.root_manifest.file_id, 0, 0);
-    if (effective_is_locked) {
+    if (is_effective_locked) {
         if (existing_lockfile) |lock_doc| {
             if (!std.crypto.timing_safe.eql([32]u8, lock_doc.root_manifest_blake3, manifest_bundle.root_manifest_blake3)) {
                 try sink.emit(.{
@@ -4740,7 +5978,16 @@ pub fn resolveProjectGraph(
     var pending_manifest_rhs_edits: std.ArrayListUnmanaged(struct { alias_kebab: []const u8, rhs_toml: []const u8 }) = .empty;
     defer pending_manifest_rhs_edits.deinit(allocator);
 
-    const primary_idx = manifest_bundle.primary_member_index orelse 0;
+    const primary_idx: u32 = if (manifest_bundle.primary_member_index) |p_idx|
+        p_idx
+    else blk_prim: {
+        for (manifest_bundle.members, 0..) |ws_mem, m_idx| {
+            if (ws_mem.is_default_member and ws_mem.manifest.package != null) {
+                break :blk_prim @intCast(m_idx);
+            }
+        }
+        break :blk_prim 0;
+    };
     const base_root_manifest = if (primary_idx < manifest_bundle.members.len)
         manifest_bundle.members[primary_idx].manifest
     else
@@ -4769,7 +6016,7 @@ pub fn resolveProjectGraph(
         if (is_already_in_manifest) continue;
 
         if (!manifest_bundle.is_script) {
-            if (effective_is_locked) {
+            if (is_effective_locked) {
                 try sink.emit(.{
                     .code = .e0014_lockfile_drift_or_corrupt,
                     .severity = .err,
@@ -4780,8 +6027,9 @@ pub fn resolveProjectGraph(
             }
             const alias_k_str = interner.get(parsed_inline.alias_kebab);
             const pkg_k_str = interner.get(parsed_inline.package_kebab);
-            const rhs_str: []const u8 = switch (parsed_inline.source) {
-                .registry => |vr| blk_r: {
+            var rhs_buf: std.ArrayListUnmanaged(u8) = .empty;
+            switch (parsed_inline.source) {
+                .registry => |vr| {
                     const stripped = if (std.mem.startsWith(u8, inline_imp.spec_text, "registry:"))
                         inline_imp.spec_text[9..]
                     else
@@ -4789,44 +6037,50 @@ pub fn resolveProjectGraph(
                     const req_part = if (std.mem.indexOfScalar(u8, stripped, '@')) |at_i| stripped[at_i + 1 ..] else "*";
                     _ = vr;
                     if (std.mem.eql(u8, alias_k_str, pkg_k_str)) {
-                        break :blk_r try std.fmt.allocPrint(graph_arena.asAllocator(), "\"{s}\"", .{req_part});
+                        try pkg_manifest.appendEscapedTomlBasicString(&rhs_buf, graph_arena.asAllocator(), req_part);
+                    } else {
+                        try rhs_buf.appendSlice(graph_arena.asAllocator(), "{ package = ");
+                        try pkg_manifest.appendEscapedTomlBasicString(&rhs_buf, graph_arena.asAllocator(), pkg_k_str);
+                        try rhs_buf.appendSlice(graph_arena.asAllocator(), ", version = ");
+                        try pkg_manifest.appendEscapedTomlBasicString(&rhs_buf, graph_arena.asAllocator(), req_part);
+                        try rhs_buf.appendSlice(graph_arena.asAllocator(), " }");
                     }
-                    break :blk_r try std.fmt.allocPrint(
-                        graph_arena.asAllocator(),
-                        "{{ package = \"{s}\", version = \"{s}\" }}",
-                        .{ pkg_k_str, req_part },
-                    );
                 },
-                .path => |ps| try std.fmt.allocPrint(
-                    graph_arena.asAllocator(),
-                    "{{ path = \"{s}\" }}",
-                    .{interner.get(ps.rel_path)},
-                ),
-                .git => |gs| blk_g: {
+                .path => |ps| {
+                    const raw_rel = interner.get(ps.rel_path);
+                    const norm_rel = try graph_arena.allocSlice(u8, raw_rel.len);
+                    for (raw_rel, 0..) |ch_b, i| {
+                        norm_rel[i] = if (ch_b == '\\') '/' else ch_b;
+                    }
+                    try rhs_buf.appendSlice(graph_arena.asAllocator(), "{ path = ");
+                    try pkg_manifest.appendEscapedTomlBasicString(&rhs_buf, graph_arena.asAllocator(), norm_rel);
+                    try rhs_buf.appendSlice(graph_arena.asAllocator(), " }");
+                },
+                .git => |gs| {
                     const u_str = interner.get(gs.url);
                     const rv_str = interner.get(gs.rev_value);
-                    break :blk_g switch (gs.rev_kind) {
-                        .default_head => try std.fmt.allocPrint(graph_arena.asAllocator(), "{{ git = \"{s}\" }}", .{u_str}),
-                        .tag => try std.fmt.allocPrint(
-                            graph_arena.asAllocator(),
-                            "{{ git = \"{s}\", tag = \"{s}\" }}",
-                            .{ u_str, rv_str },
-                        ),
-                        .branch => try std.fmt.allocPrint(
-                            graph_arena.asAllocator(),
-                            "{{ git = \"{s}\", branch = \"{s}\" }}",
-                            .{ u_str, rv_str },
-                        ),
-                        .rev => try std.fmt.allocPrint(
-                            graph_arena.asAllocator(),
-                            "{{ git = \"{s}\", rev = \"{s}\" }}",
-                            .{ u_str, rv_str },
-                        ),
-                    };
+                    try rhs_buf.appendSlice(graph_arena.asAllocator(), "{ git = ");
+                    try pkg_manifest.appendEscapedTomlBasicString(&rhs_buf, graph_arena.asAllocator(), u_str);
+                    switch (gs.rev_kind) {
+                        .default_head => {},
+                        .tag => {
+                            try rhs_buf.appendSlice(graph_arena.asAllocator(), ", tag = ");
+                            try pkg_manifest.appendEscapedTomlBasicString(&rhs_buf, graph_arena.asAllocator(), rv_str);
+                        },
+                        .branch => {
+                            try rhs_buf.appendSlice(graph_arena.asAllocator(), ", branch = ");
+                            try pkg_manifest.appendEscapedTomlBasicString(&rhs_buf, graph_arena.asAllocator(), rv_str);
+                        },
+                        .rev => {
+                            try rhs_buf.appendSlice(graph_arena.asAllocator(), ", rev = ");
+                            try pkg_manifest.appendEscapedTomlBasicString(&rhs_buf, graph_arena.asAllocator(), rv_str);
+                        },
+                    }
+                    try rhs_buf.appendSlice(graph_arena.asAllocator(), " }");
                 },
-                .workspace_inherit => "{ workspace = true }",
-            };
-            try pending_manifest_rhs_edits.append(allocator, .{ .alias_kebab = alias_k_str, .rhs_toml = rhs_str });
+                .workspace_inherit => try rhs_buf.appendSlice(graph_arena.asAllocator(), "{ workspace = true }"),
+            }
+            try pending_manifest_rhs_edits.append(allocator, .{ .alias_kebab = alias_k_str, .rhs_toml = rhs_buf.items });
         }
 
         try extra_root_deps.append(allocator, .{
@@ -4870,37 +6124,46 @@ pub fn resolveProjectGraph(
 
             var probe_cands: std.ArrayListUnmanaged(CandidateVersionMeta) = .empty;
             defer probe_cands.deinit(allocator);
+            var probe_sec_err = false;
             var has_in_idx = try loadSparseIndexVersionsFromDir(
                 allocator,
                 options.io,
                 &graph_arena,
+                graph_arena.asAllocator(),
                 &probe_json_arena,
                 interner,
                 &base_cfg_env,
+                cache,
                 cached_idx_dir,
                 kebab_name,
                 &probe_cands,
-                null,
+                &probe_sec_err,
+                sink,
             );
-            if (!has_in_idx and !effective_is_offline) {
+            if (probe_sec_err) return null;
+            if (!has_in_idx and !is_effective_offline) {
                 if (reg_dir_opt) |reg_d| {
                     has_in_idx = try loadSparseIndexVersionsFromDir(
                         allocator,
                         options.io,
                         &graph_arena,
+                        graph_arena.asAllocator(),
                         &probe_json_arena,
                         interner,
                         &base_cfg_env,
+                        null,
                         reg_d,
                         kebab_name,
                         &probe_cands,
-                        null,
+                        &probe_sec_err,
+                        sink,
                     );
+                    if (probe_sec_err) return null;
                 }
             }
             if (!has_in_idx or probe_cands.items.len == 0) continue;
 
-            if (effective_is_locked) {
+            if (is_effective_locked) {
                 try sink.emit(.{
                     .code = .e0014_lockfile_drift_or_corrupt,
                     .severity = .err,
@@ -4945,10 +6208,11 @@ pub fn resolveProjectGraph(
             if (picked_ver) |sel_ver| {
                 const ver_str = try sel_ver.formatAlloc(graph_arena.asAllocator(), interner);
                 const ver_req = (try VersionReq.parse(interner, ver_str)) orelse continue;
-                const quoted_rhs = try std.fmt.allocPrint(graph_arena.asAllocator(), "\"{s}\"", .{ver_str});
+                var quoted_rhs: std.ArrayListUnmanaged(u8) = .empty;
+                try pkg_manifest.appendEscapedTomlBasicString(&quoted_rhs, graph_arena.asAllocator(), ver_str);
                 try pending_manifest_rhs_edits.append(allocator, .{
                     .alias_kebab = try graph_arena.dupe(u8, kebab_name),
-                    .rhs_toml = quoted_rhs,
+                    .rhs_toml = quoted_rhs.items,
                 });
                 try extra_root_deps.append(allocator, .{
                     .alias_kebab = kebab_id,
@@ -5023,13 +6287,15 @@ pub fn resolveProjectGraph(
         .graph_arena = &graph_arena,
         .interner = interner,
         .vfs = vfs,
-        .cache = &cache,
+        .cache = cache,
         .bundle = manifest_bundle,
         .existing_lock = existing_lockfile,
         .options = merged_opts,
         .base_cfg_env = base_cfg_env,
         .effective_registry_dir = reg_dir_opt,
         .sink = sink,
+        .series_arena = std.heap.ArenaAllocator.init(allocator),
+        .index_arena = std.heap.ArenaAllocator.init(allocator),
         .scratch_json_arena = BumpArena.init(allocator),
     };
     defer ctx.deinit();
@@ -5068,36 +6334,121 @@ pub fn resolveProjectGraph(
     @memcpy(combined_root_deps[0..base_root_manifest.dependencies.len], base_root_manifest.dependencies);
     @memcpy(combined_root_deps[base_root_manifest.dependencies.len..], extra_root_deps.items);
 
-    const root_key = SeriesKey{
-        .pkg_name_sym = root_pkg_meta.name_kebab,
-        .tier = .major_ge_1,
-        .source_tag = SOURCE_TAG_WORKSPACE,
-        .series_or_source_id = primary_idx,
-    };
-    var root_series = SeriesEntry{ .series_id = 0, .key = root_key };
-    var root_has_fm = base_root_manifest.features.len > 0;
-    for (combined_root_deps) |d_item| {
-        if (d_item.is_optional) root_has_fm = true;
-    }
-    try root_series.candidates.append(allocator, .{
-        .version = root_pkg_meta.version,
-        .source_kind = .workspace_member,
-        .source_uri = try interner.intern("root"),
-        .host_dir_path = root_dir,
-        .corex_req = root_pkg_meta.corex_req,
-        .links = root_pkg_meta.links,
-        .has_feature_manifest = root_has_fm,
-        .features = base_root_manifest.features,
-        .dependencies = combined_root_deps,
-        .manifest_span = fallback_span,
-    });
-    for (base_root_manifest.features) |f_decl| {
-        _ = try root_series.internFeatureBit(allocator, f_decl.name);
-    }
-    try ctx.series_list.append(allocator, root_series);
-    try ctx.series_map.put(allocator, root_key, 0);
+    const seedWorkspaceRoots = struct {
+        /// Seeds `sid == 0` (`prim_idx`) and all additional active workspace members into `c_ptr`.
+        fn run(
+            c_ptr: *SolverContext,
+            prim_idx: u32,
+            root_meta: PackageMeta,
+            r_dir: []const u8,
+            r_manifest: *const Manifest,
+            r_deps: []const DependencySpec,
+            fb_span: Span,
+        ) !void {
+            const r_key = SeriesKey{
+                .pkg_name_sym = root_meta.name_kebab,
+                .tier = .major_ge_1,
+                .source_tag = SOURCE_TAG_WORKSPACE,
+                .series_or_source_id = prim_idx,
+            };
+            var r_series = SeriesEntry{ .series_id = 0, .key = r_key };
+            var r_has_fm = r_manifest.features.len > 0;
+            for (r_deps) |d_item| {
+                if (d_item.is_optional) r_has_fm = true;
+            }
+            const r_uri = if (c_ptr.bundle.primary_member_index == null and prim_idx < c_ptr.bundle.members.len)
+                try formatNormalizedPathUriAlloc(c_ptr.graph_arena, c_ptr.bundle.members[prim_idx].rel_dir)
+            else
+                "root";
+            const r_lib_override: ?[]const u8 = if (r_manifest.lib_target) |lt|
+                (if (c_ptr.interner.get(lt.path).len > 0) try c_ptr.graph_arena.dupe(u8, c_ptr.interner.get(lt.path)) else null)
+            else if (c_ptr.interner.get(root_meta.root_module).len > 0)
+                try c_ptr.graph_arena.dupe(u8, c_ptr.interner.get(root_meta.root_module))
+            else
+                null;
+            const r_bin_override: ?[]const u8 = if (r_manifest.bin_targets.len > 0 and
+                c_ptr.interner.get(r_manifest.bin_targets[0].path).len > 0)
+                try c_ptr.graph_arena.dupe(u8, c_ptr.interner.get(r_manifest.bin_targets[0].path))
+            else
+                null;
 
-    // [4] Execute Tier-1 `Bounded-MVS`, escalating to Tier-2 `PubGrub CDCL` ONLY on upper-bound / exclude conflict:
+            var r_cand = CandidateVersionMeta{
+                .version = root_meta.version,
+                .source_kind = .workspace_member,
+                .source_uri = try c_ptr.interner.intern(r_uri),
+                .host_dir_path = r_dir,
+                .lib_root_rel_path = r_lib_override,
+                .bin_root_rel_path = r_bin_override,
+                .corex_req = root_meta.corex_req,
+                .links = root_meta.links,
+                .has_feature_manifest = r_has_fm,
+                .features = r_manifest.features,
+                .dependencies = r_deps,
+                .manifest_span = fb_span,
+            };
+            const r_series_alloc = c_ptr.series_arena.allocator();
+            for (r_manifest.features) |f_decl| {
+                try SolverContext.registerCandidateFeatureBit(
+                    &r_series,
+                    &r_cand,
+                    r_series_alloc,
+                    c_ptr.graph_arena.asAllocator(),
+                    f_decl.name,
+                    false,
+                );
+            }
+            for (r_deps) |d_spec| {
+                if (d_spec.is_optional) {
+                    try SolverContext.registerCandidateFeatureBit(
+                        &r_series,
+                        &r_cand,
+                        r_series_alloc,
+                        c_ptr.graph_arena.asAllocator(),
+                        d_spec.alias_kebab,
+                        true,
+                    );
+                }
+            }
+            try r_series.candidates.append(r_series_alloc, r_cand);
+            try c_ptr.series_list.append(c_ptr.allocator, r_series);
+            try c_ptr.series_map.put(c_ptr.allocator, r_key, 0);
+
+            for (c_ptr.bundle.members, 0..) |ws_mem, m_idx| {
+                const m_u32: u32 = @intCast(m_idx);
+                if (m_u32 == prim_idx or !ws_mem.is_default_member) continue;
+                const pm = ws_mem.manifest.package orelse continue;
+                const ws_key = SeriesKey{
+                    .pkg_name_sym = pm.name_kebab,
+                    .tier = .major_ge_1,
+                    .source_tag = SOURCE_TAG_WORKSPACE,
+                    .series_or_source_id = m_u32,
+                };
+                const ws_sid = try c_ptr.getOrCreateSeries(
+                    ws_key,
+                    .{ .workspace_inherit = .{} },
+                    ws_mem.abs_dir,
+                    Span.init(ws_mem.manifest.file_id, 0, 0),
+                );
+                if (ws_sid != 0 and !c_ptr.active_workspace_member_set.contains(ws_sid)) {
+                    try c_ptr.active_workspace_member_sids.append(c_ptr.allocator, ws_sid);
+                    try c_ptr.active_workspace_member_set.put(c_ptr.allocator, ws_sid, {});
+                }
+            }
+        }
+    }.run;
+
+    try seedWorkspaceRoots(
+        &ctx,
+        primary_idx,
+        root_pkg_meta,
+        root_dir,
+        &base_root_manifest,
+        combined_root_deps,
+        fallback_span,
+    );
+    if (ctx.has_aborted_error) return null;
+
+    // [4] Execute Tier-1 `Bounded-MVS`, escalating to Tier-2 `PubGrub CDCL` (with cross-series retry if needed):
     var mvs_states: std.ArrayListUnmanaged(MvsNodeState) = .empty;
     defer {
         for (mvs_states.items) |*st| {
@@ -5108,22 +6459,77 @@ pub fn resolveProjectGraph(
         mvs_states.deinit(allocator);
     }
 
+    const clearMvsStates = struct {
+        /// Releases inner containers of `states` and clears the list.
+        fn run(alloc: std.mem.Allocator, states: *std.ArrayListUnmanaged(MvsNodeState)) void {
+            for (states.items) |*st| {
+                st.overflow_features.deinit(alloc);
+                st.active_opt_deps.deinit(alloc);
+                st.pending_weak.deinit(alloc);
+            }
+            states.clearRetainingCapacity();
+        }
+    }.run;
+
     var solver_steps: u32 = 0;
     var has_used_mvs = true;
     var conflict_dag: ?ConflictDagExport = null;
 
-    const is_mvs_ok = try ctx.runTier1BoundedMvs(&mvs_states, &solver_steps);
+    var is_solved = try ctx.runTier1BoundedMvs(&mvs_states, &solver_steps);
     if (ctx.has_aborted_error) return null;
 
-    if (!is_mvs_ok) {
+    if (!is_solved) {
         has_used_mvs = false;
-        const is_cdcl_ok = try ctx.runTier2PubGrubCdcl(&mvs_states, &solver_steps, &conflict_dag);
-        if (!is_cdcl_ok or ctx.has_aborted_error) return null;
+        is_solved = try ctx.runTier2PubGrubCdcl(&mvs_states, &solver_steps, &conflict_dag, false);
+        if (ctx.has_aborted_error) return null;
+
+        var retry_count: u32 = 0;
+        while (!is_solved and ctx.next_cross_series_alt != null and retry_count < 8 and solver_steps < MAX_SOLVER_STEPS) : (retry_count += 1) {
+            try ctx.excluded_series_slots.put(allocator, ctx.next_cross_series_alt.?, {});
+            ctx.resetForCrossSeriesRetry();
+            clearMvsStates(allocator, &mvs_states);
+            try seedWorkspaceRoots(
+                &ctx,
+                primary_idx,
+                root_pkg_meta,
+                root_dir,
+                &base_root_manifest,
+                combined_root_deps,
+                fallback_span,
+            );
+            if (ctx.has_aborted_error) return null;
+
+            is_solved = try ctx.runTier1BoundedMvs(&mvs_states, &solver_steps);
+            if (ctx.has_aborted_error) return null;
+            if (!is_solved) {
+                is_solved = try ctx.runTier2PubGrubCdcl(&mvs_states, &solver_steps, &conflict_dag, false);
+                if (ctx.has_aborted_error) return null;
+            }
+        }
+
+        if (!is_solved) {
+            ctx.excluded_series_slots.clearRetainingCapacity();
+            ctx.resetForCrossSeriesRetry();
+            clearMvsStates(allocator, &mvs_states);
+            try seedWorkspaceRoots(
+                &ctx,
+                primary_idx,
+                root_pkg_meta,
+                root_dir,
+                &base_root_manifest,
+                combined_root_deps,
+                fallback_span,
+            );
+            if (ctx.has_aborted_error) return null;
+            _ = try ctx.runTier2PubGrubCdcl(&mvs_states, &solver_steps, &conflict_dag, true);
+            return null;
+        }
     }
 
     // [5] Topological post-order sort (`deps` precede `dependents`) & `PackageId` assignment (`0` = root, `>= 2` = deps):
     var topo_sids: std.ArrayListUnmanaged(u32) = .empty;
     defer topo_sids.deinit(allocator);
+    try topo_sids.ensureTotalCapacity(allocator, mvs_states.items.len);
     const visit_state = try allocator.alloc(u8, mvs_states.items.len);
     defer allocator.free(visit_state);
     @memset(visit_state, 0);
@@ -5155,6 +6561,9 @@ pub fn resolveProjectGraph(
     }.visit;
 
     try topoDfs(&ctx, mvs_states.items, visit_state, &topo_sids, 0);
+    for (ctx.active_workspace_member_sids.items) |ws_sid| {
+        try topoDfs(&ctx, mvs_states.items, visit_state, &topo_sids, ws_sid);
+    }
     if (topo_sids.items.len > MAX_RESOLVED_PACKAGES) {
         try sink.emit(.{
             .code = .e0010_unsatisfiable_dependency_graph,
@@ -5166,7 +6575,7 @@ pub fn resolveProjectGraph(
     }
 
     // [6] Enforce `--locked` / `--frozen` / `COREX_HERMETIC=1` `(name, version, source)`, count, & feature parity (`E0014`):
-    if (effective_is_locked) {
+    if (is_effective_locked) {
         const lock_doc = existing_lockfile.?;
         if (topo_sids.items.len != lock_doc.packages.len) {
             try sink.emit(.{
@@ -5252,14 +6661,14 @@ pub fn resolveProjectGraph(
         }
     }
 
-    var sid_to_pkg_id: std.AutoHashMapUnmanaged(u32, PackageId) = .empty;
-    defer sid_to_pkg_id.deinit(allocator);
+    const sid_meta_slice = try ctx.series_arena.allocator().alloc(SidGraphMeta, ctx.series_list.items.len);
+    @memset(sid_meta_slice, .{});
     var next_ext_pkg_raw: u16 = 2; // Reserve `0 = .root`, `1 = .std_core`.
     for (topo_sids.items) |sid| {
         if (sid == 0) {
-            try sid_to_pkg_id.put(allocator, 0, .root);
+            sid_meta_slice[0].pkg_id = .root;
         } else {
-            try sid_to_pkg_id.put(allocator, sid, PackageId.fromInt(next_ext_pkg_raw));
+            sid_meta_slice[sid].pkg_id = PackageId.fromInt(next_ext_pkg_raw);
             next_ext_pkg_raw += 1;
         }
     }
@@ -5306,16 +6715,7 @@ pub fn resolveProjectGraph(
         try ordered_links_list.append(allocator, try graph_arena.dupe(u8, interner.get(cand.links)));
     }
 
-    // Collect incoming workspace-owned `allow_caps` / `deny_caps` & dev-only status per `sid` (`[CRITICAL-04]`):
-    var sid_allow_union: std.AutoHashMapUnmanaged(u32, EffectCapabilityMask) = .empty;
-    defer sid_allow_union.deinit(allocator);
-    var sid_deny_union: std.AutoHashMapUnmanaged(u32, EffectCapabilityMask) = .empty;
-    defer sid_deny_union.deinit(allocator);
-    var sid_has_normal_edge: std.AutoHashMapUnmanaged(u32, void) = .empty;
-    defer sid_has_normal_edge.deinit(allocator);
-    var sid_first_span: std.AutoHashMapUnmanaged(u32, Span) = .empty;
-    defer sid_first_span.deinit(allocator);
-
+    // Collect incoming workspace-owned `allow_caps` / `deny_caps` & dev-only status per `sid`:
     for (topo_sids.items) |caller_sid| {
         const v_idx = mvs_states.items[caller_sid].selected_idx;
         const caller_cand = ctx.series_list.items[caller_sid].candidates.items[v_idx];
@@ -5325,32 +6725,54 @@ pub fn resolveProjectGraph(
             if (dep.is_optional and !mvs_states.items[caller_sid].active_opt_deps.contains(dep.alias_kebab)) continue;
             const res_t = try ctx.resolveDepTargetSeries(caller_sid, v_idx, dep);
             const t_sid = res_t.series_id;
+            var target_meta = &sid_meta_slice[t_sid];
             if (dep.kind != .dev) {
-                try sid_has_normal_edge.put(allocator, t_sid, {});
+                target_meta.has_normal_edge = true;
             }
-            if (!sid_first_span.contains(t_sid) and !dep.decl_span.file_id.isNone()) {
-                try sid_first_span.put(allocator, t_sid, dep.decl_span);
+            if (!target_meta.has_first_span and !dep.decl_span.file_id.isNone()) {
+                target_meta.first_span = dep.decl_span;
+                target_meta.has_first_span = true;
             }
             if (is_caller_workspace) {
                 if (dep.allow_caps) |ac| {
-                    const prev = sid_allow_union.get(t_sid) orelse EffectCapabilityMask.EMPTY;
-                    try sid_allow_union.put(allocator, t_sid, prev.unionWith(ac));
+                    target_meta.has_allow_caps = true;
+                    target_meta.allow_union = target_meta.allow_union.unionWith(ac);
                 }
                 if (!dep.deny_caps.isEmpty()) {
-                    const prev_d = sid_deny_union.get(t_sid) orelse EffectCapabilityMask.EMPTY;
-                    try sid_deny_union.put(allocator, t_sid, prev_d.unionWith(dep.deny_caps));
+                    target_meta.deny_union = target_meta.deny_union.unionWith(dep.deny_caps);
                 }
             }
         }
     }
 
+    var pkg_override_map: std.AutoHashMapUnmanaged(StringId, pkg_manifest.PackageSecurityOverride) = .empty;
+    defer pkg_override_map.deinit(allocator);
+    for (manifest_bundle.root_manifest.security.package_overrides) |ov| {
+        try pkg_override_map.put(allocator, ov.package_kebab, ov);
+    }
+
     // [8] Materialize/verify `.cxtree`, Ed25519 signatures, RFC 6962 proofs, Bao `.obao`, & `--verify-checksums`:
+    var verified_tree_meta_map: std.AutoHashMapUnmanaged([32]u8, struct {
+        lib_rel: ?[]const u8,
+        bin_rel: ?[]const u8,
+    }) = .empty;
+    defer verified_tree_meta_map.deinit(allocator);
+    var entry_rel_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer entry_rel_paths.deinit(allocator);
+    var enabled_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer enabled_list.deinit(allocator);
+    var declared_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer declared_list.deinit(allocator);
+    var bindings_list: std.ArrayListUnmanaged(ResolvedDepBinding) = .empty;
+    defer bindings_list.deinit(allocator);
+
     const out_nodes = try graph_arena.allocSlice(ResolvedPackageNode, topo_sids.items.len);
     for (topo_sids.items, 0..) |sid, out_idx| {
         const s_entry = &ctx.series_list.items[sid];
         const st = &mvs_states.items[sid];
         const cand = s_entry.candidates.items[st.selected_idx];
-        const pkg_id = sid_to_pkg_id.get(sid).?;
+        const sid_meta = sid_meta_slice[sid];
+        const pkg_id = sid_meta.pkg_id;
         const canon_name = interner.get(s_entry.key.pkg_name_sym);
 
         var stack_ver_buf: [64]u8 = undefined;
@@ -5390,7 +6812,7 @@ pub fn resolveProjectGraph(
             }
         }
 
-        const diag_span = sid_first_span.get(sid) orelse fallback_span;
+        const diag_span = if (sid_meta.has_first_span) sid_meta.first_span else fallback_span;
         var final_tree_hash: ?[32]u8 = cand.expected_tree_blake3 orelse
             if (matched_lock) |ml| ml.tree_hash else null;
         var final_cksum: ?[32]u8 = cand.expected_checksum orelse
@@ -5409,6 +6831,15 @@ pub fn resolveProjectGraph(
             const host_dir = cand.host_dir_path orelse manifest_bundle.workspace_root_dir;
             root_path = try graph_arena.dupe(u8, host_dir);
             if (!manifest_bundle.is_script or sid != 0) {
+                const known_ws_manifest: ?*const Manifest = if (sid == 0)
+                    &base_root_manifest
+                else if (cand.source_kind == .workspace_member)
+                    (if (ctx.workspace_pkg_map.get(s_entry.key.pkg_name_sym)) |ws_idx|
+                        &manifest_bundle.members[ws_idx].manifest
+                    else
+                        null)
+                else
+                    null;
                 if (ingestHostDirectoryAsCxTree(
                     allocator,
                     options.io,
@@ -5416,7 +6847,7 @@ pub fn resolveProjectGraph(
                     interner,
                     canon_name,
                     host_dir,
-                    if (sid == 0) &base_root_manifest else null,
+                    known_ws_manifest,
                     null,
                     false,
                     sink,
@@ -5429,143 +6860,175 @@ pub fn resolveProjectGraph(
                 } else |_| {}
             }
         } else {
-            // External `.sparse_registry` / `.git_pinned` / `.cxtree_cas` -> MUST resolve & verify in `PkgCache`:
-            root_path = try std.fmt.allocPrint(graph_arena.asAllocator(), "/cx/{s}@{s}", .{ canon_name, ver_str });
+            // External `.sparse_registry` / `.git_pinned` / `.cxtree_cas` MUST resolve & verify in `PkgCache`:
+            var vroot_buf: [192]u8 = undefined;
+            root_path = if (std.fmt.bufPrint(&vroot_buf, "/cx/{s}@{s}", .{ canon_name, ver_str })) |vr_slice|
+                try graph_arena.dupe(u8, vr_slice)
+            else |_|
+                try std.fmt.allocPrint(graph_arena.asAllocator(), "/cx/{s}@{s}", .{ canon_name, ver_str });
 
             var has_verified_in_cache = false;
             if (final_tree_hash) |expected_th| {
-                if (cache.readVerifiedCxTreeAlloc(options.io, expected_th, sink, diag_span)) |cxtree_buf| {
-                    defer allocator.free(cxtree_buf);
-                    const view = vfs_sourcemap.validateCxTreeBytes(allocator, cxtree_buf) catch {
-                        try sink.emit(.{
-                            .code = .e0015_cache_integrity_mismatch,
-                            .severity = .err,
-                            .primary_span = diag_span,
-                            .message = "cached `.cxtree` failed binary header/entry validation",
-                        });
-                        return null;
-                    };
+                if (!options.is_verifying_checksums and !is_effective_offline) {
+                    if (verified_tree_meta_map.get(expected_th)) |cached_meta| {
+                        if (lib_rel == null) lib_rel = cached_meta.lib_rel;
+                        if (bin_rel == null) bin_rel = cached_meta.bin_rel;
+                        has_verified_in_cache = true;
+                    }
+                }
+                if (!has_verified_in_cache) {
+                    if (cache.asVerifiedCxTreeSlice(options.io, expected_th, sink, diag_span)) |borrowed_tree| {
+                        defer if (borrowed_tree.owned_fallback) |fb| allocator.free(fb);
+                        const view = vfs_sourcemap.validateCxTreeBytes(allocator, borrowed_tree.bytes) catch {
+                            try sink.emit(.{
+                                .code = .e0015_cache_integrity_mismatch,
+                                .severity = .err,
+                                .primary_span = diag_span,
+                                .message = "cached `.cxtree` failed binary header/entry validation",
+                            });
+                            return null;
+                        };
 
-                    var has_src_root = false;
-                    var has_src_lib = false;
-                    var has_root = false;
-                    var has_src_main = false;
-                    var has_main = false;
+                        entry_rel_paths.clearRetainingCapacity();
+                        var cached_toml_blob: ?[]u8 = null;
+                        defer if (cached_toml_blob) |tb| allocator.free(tb);
 
-                    for (view.entries) |t_entry| {
-                        const rp = view.asEntryPath(t_entry);
-                        if (std.mem.eql(u8, rp, "src/root.cx")) {
-                            has_src_root = true;
-                        } else if (std.mem.eql(u8, rp, "src/lib.cx")) {
-                            has_src_lib = true;
-                        } else if (std.mem.eql(u8, rp, "root.cx")) {
-                            has_root = true;
-                        } else if (std.mem.eql(u8, rp, "src/main.cx")) {
-                            has_src_main = true;
-                        } else if (std.mem.eql(u8, rp, "main.cx")) {
-                            has_main = true;
-                        }
+                        for (view.entries) |t_entry| {
+                            const rp = view.asEntryPath(t_entry);
+                            try entry_rel_paths.append(allocator, rp);
+                            if (lib_rel == null and bin_rel == null and std.mem.eql(u8, rp, "corex.toml")) {
+                                cached_toml_blob = cache.readVerifiedBlobAlloc(
+                                    options.io,
+                                    t_entry.file_blake3,
+                                    sink,
+                                    diag_span,
+                                ) catch |tb_err| switch (tb_err) {
+                                    error.CacheIntegrityMismatch => return null,
+                                    else => null,
+                                };
+                            }
 
-                        if (options.is_verifying_checksums or effective_is_offline) {
-                            const verified_b = cache.readVerifiedBlobAlloc(
-                                options.io,
-                                t_entry.file_blake3,
-                                sink,
-                                diag_span,
-                            ) catch |b_err| switch (b_err) {
-                                error.CacheIntegrityMismatch => return null,
-                                else => {
+                            if (options.is_verifying_checksums or is_effective_offline) {
+                                const verified_b = cache.readVerifiedBlobAlloc(
+                                    options.io,
+                                    t_entry.file_blake3,
+                                    sink,
+                                    diag_span,
+                                ) catch |b_err| switch (b_err) {
+                                    error.CacheIntegrityMismatch => return null,
+                                    else => {
+                                        try sink.emit(.{
+                                            .code = if (is_effective_offline)
+                                                .e0016_offline_or_fetch_failed
+                                            else
+                                                .e0015_cache_integrity_mismatch,
+                                            .severity = .err,
+                                            .primary_span = diag_span,
+                                            .message = try std.fmt.allocPrint(
+                                                sink.arena.asAllocator(),
+                                                "missing cached blob for `{s}` in `{s} v{s}`",
+                                                .{ rp, canon_name, ver_str },
+                                            ),
+                                        });
+                                        return null;
+                                    },
+                                };
+                                defer allocator.free(verified_b);
+
+                                if (verified_b.len != t_entry.file_size) {
                                     try sink.emit(.{
-                                        .code = if (effective_is_offline)
-                                            .e0016_offline_or_fetch_failed
-                                        else
-                                            .e0015_cache_integrity_mismatch,
+                                        .code = .e0015_cache_integrity_mismatch,
                                         .severity = .err,
                                         .primary_span = diag_span,
                                         .message = try std.fmt.allocPrint(
                                             sink.arena.asAllocator(),
-                                            "missing cached blob for `{s}` in `{s} v{s}`",
+                                            "cached blob byte length for `{s}` in `{s} v{s}` does not match `.cxtree` `file_size`",
                                             .{ rp, canon_name, ver_str },
                                         ),
                                     });
                                     return null;
-                                },
-                            };
-                            defer allocator.free(verified_b);
+                                }
 
-                            if (verified_b.len != t_entry.file_size) {
-                                try sink.emit(.{
-                                    .code = .e0015_cache_integrity_mismatch,
-                                    .severity = .err,
-                                    .primary_span = diag_span,
-                                    .message = try std.fmt.allocPrint(
-                                        sink.arena.asAllocator(),
-                                        "cached blob byte length for `{s}` in `{s} v{s}` does not match `.cxtree` `file_size`",
-                                        .{ rp, canon_name, ver_str },
-                                    ),
-                                });
-                                return null;
-                            }
-
-                            if (options.is_verifying_checksums) {
-                                const obao_opt = cache.readOptionalBaoOutboardAlloc(
-                                    options.io,
-                                    t_entry.file_blake3,
-                                ) catch {
-                                    try sink.emit(.{
-                                        .code = .e0015_cache_integrity_mismatch,
-                                        .severity = .err,
-                                        .primary_span = diag_span,
-                                        .message = "corrupt companion `.obao` Bao outboard file in `COREX_HOME`",
-                                    });
-                                    return null;
-                                };
-                                if (obao_opt) |obao_bytes| {
-                                    defer allocator.free(obao_bytes);
-                                    pkg_cache.verifyBaoOutboard(
+                                if (options.is_verifying_checksums) {
+                                    const obao_opt = cache.readOptionalBaoOutboardAlloc(
+                                        options.io,
                                         t_entry.file_blake3,
-                                        obao_bytes,
-                                        verified_b,
-                                        sink,
-                                        diag_span,
-                                    ) catch return null;
-                                } else if (verified_b.len >= pkg_cache.BAO_OUTBOARD_MIN_BYTES) {
-                                    try sink.emit(.{
-                                        .code = .e0015_cache_integrity_mismatch,
-                                        .severity = .err,
-                                        .primary_span = diag_span,
-                                        .message = "missing companion `.obao` Bao outboard file for `>= 64 KiB` cached blob",
-                                    });
-                                    return null;
+                                    ) catch {
+                                        try sink.emit(.{
+                                            .code = .e0015_cache_integrity_mismatch,
+                                            .severity = .err,
+                                            .primary_span = diag_span,
+                                            .message = "corrupt companion `.obao` Bao outboard file in `COREX_HOME`",
+                                        });
+                                        return null;
+                                    };
+                                    if (obao_opt) |obao_bytes| {
+                                        defer allocator.free(obao_bytes);
+                                        pkg_cache.verifyBaoOutboard(
+                                            t_entry.file_blake3,
+                                            obao_bytes,
+                                            verified_b,
+                                            sink,
+                                            diag_span,
+                                        ) catch return null;
+                                    } else if (verified_b.len >= pkg_cache.BAO_OUTBOARD_MIN_BYTES) {
+                                        try sink.emit(.{
+                                            .code = .e0015_cache_integrity_mismatch,
+                                            .severity = .err,
+                                            .primary_span = diag_span,
+                                            .message = "missing companion `.obao` Bao outboard file for `>= 64 KiB` cached blob",
+                                        });
+                                        return null;
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    if (lib_rel == null) {
-                        if (has_src_root) {
-                            lib_rel = "src/root.cx";
-                        } else if (has_src_lib) {
-                            lib_rel = "src/lib.cx";
-                        } else if (has_root) {
-                            lib_rel = "root.cx";
+                        var detected_lib: ?[]const u8 = null;
+                        var detected_bin: ?[]const u8 = null;
+                        if (lib_rel == null or bin_rel == null) {
+                            var parsed_cached_opt: ?pkg_manifest.ParsedManifestResult = null;
+                            defer if (parsed_cached_opt) |*pco| pco.doc.deinit(allocator);
+                            if (cached_toml_blob) |tb| {
+                                parsed_cached_opt = try pkg_manifest.parseManifest(
+                                    allocator,
+                                    &graph_arena,
+                                    interner,
+                                    .none,
+                                    tb,
+                                    &base_cfg_env,
+                                    null,
+                                );
+                            }
+                            const detected = try detectEntryRelPathsFromList(
+                                allocator,
+                                &graph_arena,
+                                interner,
+                                if (parsed_cached_opt) |*pco| &pco.manifest else null,
+                                entry_rel_paths.items,
+                            );
+                            detected_lib = detected.lib_rel;
+                            detected_bin = detected.bin_rel;
+                            if (lib_rel == null) lib_rel = detected_lib;
+                            if (bin_rel == null) bin_rel = detected_bin;
                         }
-                    }
-                    if (bin_rel == null) {
-                        if (has_src_main) {
-                            bin_rel = "src/main.cx";
-                        } else if (has_main) {
-                            bin_rel = "main.cx";
+                        if (!options.is_verifying_checksums and !is_effective_offline and
+                            cand.lib_root_rel_path == null and cand.bin_root_rel_path == null)
+                        {
+                            try verified_tree_meta_map.put(allocator, expected_th, .{
+                                .lib_rel = detected_lib,
+                                .bin_rel = detected_bin,
+                            });
                         }
+                        has_verified_in_cache = true;
+                    } else |c_err| {
+                        if (c_err == error.CacheIntegrityMismatch) return null;
                     }
-                    has_verified_in_cache = true;
-                } else |c_err| {
-                    if (c_err == error.CacheIntegrityMismatch) return null;
                 }
             }
 
             if (!has_verified_in_cache) {
-                if (effective_is_offline) {
+                if (is_effective_offline) {
                     try sink.emit(.{
                         .code = .e0016_offline_or_fetch_failed,
                         .severity = .err,
@@ -5644,9 +7107,11 @@ pub fn resolveProjectGraph(
                         allocator,
                         options.io,
                         &graph_arena,
+                        interner,
+                        &base_cfg_env,
                         canon_name,
                         arch_bytes,
-                        &cache,
+                        cache,
                         sink,
                         diag_span,
                     ) catch |tar_err| switch (tar_err) {
@@ -5682,7 +7147,7 @@ pub fn resolveProjectGraph(
                         canon_name,
                         src_dir,
                         null,
-                        &cache,
+                        cache,
                         true,
                         sink,
                         diag_span,
@@ -5804,13 +7269,12 @@ pub fn resolveProjectGraph(
                 };
                 const leaf_idx = final_tlog_idx orelse 0;
                 const tree_hex = std.fmt.bytesToHex(final_tree_hash.?, .lower);
-                const default_leaf = try std.fmt.allocPrint(
+                const leaf_payload = try std.fmt.allocPrint(
                     allocator,
                     "corex-publish-v1\n{s}\n{s}\n{s}",
                     .{ canon_name, ver_str, &tree_hex },
                 );
-                defer allocator.free(default_leaf);
-                const leaf_payload = cand.tlog_leaf_override orelse default_leaf;
+                defer allocator.free(leaf_payload);
                 pkg_cache.verifyMerkleInclusionProof(
                     leaf_idx,
                     t_size,
@@ -5823,60 +7287,60 @@ pub fn resolveProjectGraph(
             }
         }
 
-        // Collect sorted `enabled_features` and `declared_features` slices:
-        var enabled_list: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer enabled_list.deinit(allocator);
+        // Collect sorted `enabled_features` and `declared_features` slices reusing scratch lists:
+        enabled_list.clearRetainingCapacity();
+        declared_list.clearRetainingCapacity();
         for (s_entry.feature_ids.items, 0..) |f_id, bit_i| {
             const is_on = if (bit_i < MAX_FEATURES_PER_PKG)
                 st.enabled_bits.isSet(@intCast(bit_i))
             else
                 st.overflow_features.contains(f_id);
+            const is_decl = SolverContext.isFeatureDeclaredOnCandidate(s_entry, cand, f_id);
             if (is_on) {
+                if (cand.has_authoritative_features and !is_decl) {
+                    try sink.emit(.{
+                        .code = .e0013_invalid_manifest_or_pkg_name,
+                        .severity = .err,
+                        .primary_span = diag_span,
+                        .message = try std.fmt.allocPrint(
+                            sink.arena.asAllocator(),
+                            "package `{s} v{s}` does not declare enabled feature `{s}`",
+                            .{ canon_name, ver_str, interner.get(f_id) },
+                        ),
+                    });
+                    return null;
+                }
                 try enabled_list.append(allocator, try graph_arena.dupe(u8, interner.get(f_id)));
             }
-        }
-        std.mem.sort([]const u8, enabled_list.items, {}, struct {
-            /// Sorts enabled feature strings in ASCII ascending order.
-            fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
-                return std.mem.order(u8, lhs, rhs) == .lt;
+            if (cand.has_authoritative_features and is_decl) {
+                try declared_list.append(allocator, try graph_arena.dupe(u8, interner.get(f_id)));
             }
-        }.lessThan);
-
-        var declared_list: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer declared_list.deinit(allocator);
-        for (cand.features) |f_decl| {
-            try declared_list.append(allocator, try graph_arena.dupe(u8, interner.get(f_decl.name)));
         }
-        for (cand.dependencies) |d_spec| {
-            if (d_spec.is_optional) {
-                const alias_s = interner.get(d_spec.alias_kebab);
-                var is_already_decl = false;
-                for (declared_list.items) |ex_f| {
-                    if (std.mem.eql(u8, ex_f, alias_s)) {
-                        is_already_decl = true;
-                        break;
-                    }
+        if (enabled_list.items.len > 1) {
+            std.mem.sort([]const u8, enabled_list.items, {}, struct {
+                /// Sorts enabled feature strings in ASCII ascending order.
+                fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+                    return std.mem.order(u8, lhs, rhs) == .lt;
                 }
-                if (!is_already_decl) {
-                    try declared_list.append(allocator, try graph_arena.dupe(u8, alias_s));
-                }
-            }
+            }.lessThan);
         }
-        std.mem.sort([]const u8, declared_list.items, {}, struct {
-            /// Sorts declared feature strings in ASCII ascending order.
-            fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
-                return std.mem.order(u8, lhs, rhs) == .lt;
-            }
-        }.lessThan);
+        if (declared_list.items.len > 1) {
+            std.mem.sort([]const u8, declared_list.items, {}, struct {
+                /// Sorts declared feature strings in ASCII ascending order.
+                fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+                    return std.mem.order(u8, lhs, rhs) == .lt;
+                }
+            }.lessThan);
+        }
 
         // Collect direct `ResolvedDepBinding`s for `sid`:
-        var bindings_list: std.ArrayListUnmanaged(ResolvedDepBinding) = .empty;
-        defer bindings_list.deinit(allocator);
+        bindings_list.clearRetainingCapacity();
         for (cand.dependencies) |dep| {
             if (!(try ctx.isDepEdgeTargetEnabled(sid, dep))) continue;
             if (dep.is_optional and !st.active_opt_deps.contains(dep.alias_kebab)) continue;
             const res_t = try ctx.resolveDepTargetSeries(sid, st.selected_idx, dep);
-            const target_pkg_id = sid_to_pkg_id.get(res_t.series_id) orelse continue;
+            const target_pkg_id = sid_meta_slice[res_t.series_id].pkg_id;
+            if (target_pkg_id == .none) continue;
             try bindings_list.append(allocator, .{
                 .alias_sym = dep.module_snake,
                 .alias_text = try graph_arena.dupe(u8, interner.get(dep.module_snake)),
@@ -5888,19 +7352,25 @@ pub fn resolveProjectGraph(
             });
         }
 
-        const is_third_party = (sid != 0) and (cand.source_kind != .workspace_member);
-        const is_dev_only = (sid != 0) and !sid_has_normal_edge.contains(sid);
-        const display_label = try std.fmt.allocPrint(graph_arena.asAllocator(), "{s}@{s}", .{ canon_name, ver_str });
+        const is_third_party = !ctx.isActiveWorkspaceRootSeries(sid) and (cand.source_kind != .workspace_member);
+        const is_dev_only = !ctx.isActiveWorkspaceRootSeries(sid) and !sid_meta.has_normal_edge;
+        var label_buf: [192]u8 = undefined;
+        var heap_label: ?[]u8 = null;
+        defer if (heap_label) |hl| allocator.free(hl);
+        const display_label = std.fmt.bufPrint(&label_buf, "{s}@{s}", .{ canon_name, ver_str }) catch blk_lbl: {
+            const hl = try std.fmt.allocPrint(allocator, "{s}@{s}", .{ canon_name, ver_str });
+            heap_label = hl;
+            break :blk_lbl hl;
+        };
         const node_policy = try buildNodeCapPolicy(
             &graph_arena,
-            interner,
             manifest_bundle.root_manifest.security,
-            s_entry.key.pkg_name_sym,
+            pkg_override_map.get(s_entry.key.pkg_name_sym),
             display_label,
             is_third_party,
             is_dev_only,
-            if (sid_allow_union.get(sid)) |au| au else null,
-            sid_deny_union.get(sid) orelse .EMPTY,
+            if (sid_meta.has_allow_caps) sid_meta.allow_union else null,
+            sid_meta.deny_union,
             if (matched_lock) |ml| ml.max_caps else null,
             diag_span,
         );
@@ -5987,7 +7457,7 @@ test "test_pkg_resolver_sparse_index_paths_series_coexistence_and_mvs_weak_featu
     const key_0_0_2 = SeriesKey.forRegistrySemVer(pkg_sym, .{ .major = 0, .minor = 0, .patch = 2 });
     try std.testing.expect(!std.meta.eql(key_0_0_1, key_0_0_2));
 
-    // Verify `FeatureBitset512` `P2-1` change detection:
+    // Verify `FeatureBitset512` change detection:
     var bs_a = FeatureBitset512{};
     try std.testing.expect(bs_a.setReturningChanged(0));
     try std.testing.expect(!bs_a.setReturningChanged(0));
@@ -6107,7 +7577,7 @@ test "test_pkg_resolver_mvs_feature_reenqueue_weak_deps_pubgrub_exclude_and_e001
     var resolved = resolved_opt.?;
     defer resolved.deinit(allocator);
 
-    // `=1.0.0` was excluded, so Tier-2 PubGrub selected `1.1.0` AND `2.0.0` side-by-side (`4` nodes total: mid, v1.1, v2.0, root):
+    // `=1.0.0` was excluded, so Tier-2 PubGrub selected `1.1.0` and `2.0.0` side-by-side (`4` nodes total):
     try std.testing.expect(!resolved.has_used_mvs_fast_path);
     try std.testing.expectEqual(@as(usize, 4), resolved.packages.len);
     var has_seen_v1_1 = false;

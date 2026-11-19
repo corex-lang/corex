@@ -8,10 +8,12 @@
 //! and `MAX_C_PARSE_DEPTH`), emitting `E0009` (`e0009_c_header_translation_failed`) on any cap or C error.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mem_foundation = @import("mem_foundation.zig");
 const vfs_sourcemap = @import("vfs_sourcemap.zig");
 const codegen_abi = @import("codegen_abi.zig");
 const diagnostic = @import("diag/diagnostic.zig");
+const mir = @import("mir.zig");
 
 const FileId = mem_foundation.FileId;
 const Span = mem_foundation.Span;
@@ -268,6 +270,16 @@ pub const VirtualHeaderEntry = struct {
     content: []const u8,
 };
 
+/// Host directory sandbox configuration enforcing pre-open `O_NOFOLLOW` / `resolve_beneath` on `#include`s (`E0326`).
+pub const JailedHostIncludeConfig = struct {
+    /// Host `std.Io` handle used strictly after lexical sandbox verification.
+    io: std.Io,
+    /// Canonical or workspace-relative package root jail directory.
+    jail_dir: []const u8,
+    /// Optional root-package `-Idir` search roots permitted in addition to `jail_dir`.
+    extra_allowed_dirs: []const []const u8 = &.{},
+};
+
 /// Strongly typed `#include` file resolution backend (zero untyped pointers).
 pub const CIncludeLoader = union(enum) {
     /// Resolve strictly against `virtual_headers` and `BUNDLED_SYSTEM_HEADERS`.
@@ -276,6 +288,8 @@ pub const CIncludeLoader = union(enum) {
     vfs: *vfs_sourcemap.VfsSourceMap,
     /// Resolve against the host filesystem via `std.Io` across `include_dirs`.
     host_fs: std.Io,
+    /// Resolve against the host filesystem jailed strictly inside `jail_dir` (`follow_symlinks = false`, `E0326`).
+    jailed_host_fs: JailedHostIncludeConfig,
 };
 
 /// Classified scalar or string value of an object-like `#define` constant.
@@ -686,6 +700,12 @@ pub const CFrontendOptions = struct {
     virtual_headers: []const VirtualHeaderEntry = &.{},
     /// Optional VFS or host filesystem loader for `#include` resolution.
     include_loader: CIncludeLoader = .none,
+    /// When `true`, rejects absolute, drive-prefixed, or sandbox-escaping `#include` targets with `E0326` prior to lookup.
+    is_strict_sandbox: bool = false,
+    /// Optional virtual root prefix (e.g., `"/cx/pkg@1.0.0"`) enforced on relative `#include`s in `.cxtree` mode.
+    strict_virtual_root: ?[]const u8 = null,
+    /// Primary caller `FileId` used on `E0326` diagnostics when an inner `#include` has `file_id == .none`.
+    sandbox_caller_file_id: FileId = .none,
     /// Optional Phase 13.3 C function-body transpilation hook (`null` in Phase 8 per `DR-20` Seam #6).
     body_hook: ?CFunctionBodyHook = null,
     /// Bounded token cap per translation unit (`AGENTS.md` §2).
@@ -1595,32 +1615,182 @@ const CPreprocessor = struct {
         });
     }
 
+    /// Computes the directory nesting depth of `includer_path` relative to the active package sandbox root.
+    fn computeIncluderRelDirDepth(self: *const CPreprocessor, includer_path: []const u8) usize {
+        if (includer_path.len == 0 or std.mem.startsWith(u8, includer_path, "<builtin:")) return 0;
+        var rel_includer = includer_path;
+        if (self.options.strict_virtual_root) |vroot| {
+            if (stripMatchingRootPrefix(vroot, includer_path)) |stripped| {
+                rel_includer = stripped;
+            }
+        } else if (self.options.include_loader == .jailed_host_fs) {
+            const jail_cfg = self.options.include_loader.jailed_host_fs;
+            if (stripMatchingRootPrefix(jail_cfg.jail_dir, includer_path)) |stripped| {
+                rel_includer = stripped;
+            } else {
+                for (jail_cfg.extra_allowed_dirs) |extra_dir| {
+                    if (stripMatchingRootPrefix(extra_dir, includer_path)) |stripped_extra| {
+                        rel_includer = stripped_extra;
+                        break;
+                    }
+                }
+            }
+        }
+        var last_sep: ?usize = null;
+        for (rel_includer, 0..) |ch_byte, i| {
+            if (ch_byte == '/' or ch_byte == '\\') last_sep = i;
+        }
+        const dir_slice = if (last_sep) |sep_pos| rel_includer[0..sep_pos] else return 0;
+        var depth: usize = 0;
+        var seg_start: usize = 0;
+        var idx: usize = 0;
+        while (idx <= dir_slice.len) : (idx += 1) {
+            if (idx == dir_slice.len or dir_slice[idx] == '/' or dir_slice[idx] == '\\') {
+                const seg = dir_slice[seg_start..idx];
+                if (seg.len > 0 and !std.mem.eql(u8, seg, ".")) {
+                    if (std.mem.eql(u8, seg, "..")) {
+                        if (depth == 0) return 0;
+                        depth -= 1;
+                    } else {
+                        depth += 1;
+                    }
+                }
+                seg_start = idx + 1;
+            }
+        }
+        return depth;
+    }
+
+    /// Validates `include_name` against the active package sandbox BEFORE any filesystem syscall (`E0326`).
+    fn checkStrictSandboxIncludeTarget(
+        self: *CPreprocessor,
+        include_name: []const u8,
+        is_angled: bool,
+        includer_path: []const u8,
+        span: Span,
+    ) CFrontendError!void {
+        if (!self.options.is_strict_sandbox and self.options.include_loader != .jailed_host_fs) return;
+
+        if (include_name.len == 0 or
+            include_name[0] == '/' or
+            include_name[0] == '\\' or
+            std.fs.path.isAbsolute(include_name))
+        {
+            try emitCSandboxEscapeError(
+                self.unit,
+                self.sink,
+                span,
+                self.options.sandbox_caller_file_id,
+                "`@c_import` `#include` path must be relative to the package sandbox",
+            );
+            return error.TranslationFailed;
+        }
+        for (include_name) |byte_val| {
+            if (byte_val == 0 or byte_val == ':') {
+                try emitCSandboxEscapeError(
+                    self.unit,
+                    self.sink,
+                    span,
+                    self.options.sandbox_caller_file_id,
+                    "`@c_import` `#include` path contains forbidden drive or NUL characters",
+                );
+                return error.TranslationFailed;
+            }
+        }
+
+        var avail_up_depth: usize = if (is_angled) 0 else self.computeIncluderRelDirDepth(includer_path);
+        var has_seen_normal_seg = false;
+        const tail_buf = try self.unit.arena.allocSlice(u8, include_name.len);
+        var tail_len: usize = 0;
+
+        var seg_start: usize = 0;
+        var idx: usize = 0;
+        while (idx <= include_name.len) : (idx += 1) {
+            if (idx == include_name.len or include_name[idx] == '/' or include_name[idx] == '\\') {
+                const seg = include_name[seg_start..idx];
+                if (seg.len == 0) {
+                    try emitCSandboxEscapeError(
+                        self.unit,
+                        self.sink,
+                        span,
+                        self.options.sandbox_caller_file_id,
+                        "`@c_import` `#include` path contains empty path segments",
+                    );
+                    return error.TranslationFailed;
+                }
+                if (std.mem.eql(u8, seg, ".")) {
+                    if (has_seen_normal_seg) {
+                        try emitCSandboxEscapeError(
+                            self.unit,
+                            self.sink,
+                            span,
+                            self.options.sandbox_caller_file_id,
+                            "`@c_import` `#include` path contains non-leading `.` traversal segment",
+                        );
+                        return error.TranslationFailed;
+                    }
+                } else if (std.mem.eql(u8, seg, "..")) {
+                    if (has_seen_normal_seg or avail_up_depth == 0) {
+                        try emitCSandboxEscapeError(
+                            self.unit,
+                            self.sink,
+                            span,
+                            self.options.sandbox_caller_file_id,
+                            "`@c_import` `#include` directive escapes package directory sandbox",
+                        );
+                        return error.TranslationFailed;
+                    }
+                    avail_up_depth -= 1;
+                } else {
+                    has_seen_normal_seg = true;
+                    if (tail_len > 0) {
+                        tail_buf[tail_len] = '/';
+                        tail_len += 1;
+                    }
+                    @memcpy(tail_buf[tail_len .. tail_len + seg.len], seg);
+                    tail_len += seg.len;
+                }
+                seg_start = idx + 1;
+            }
+        }
+
+        if (!has_seen_normal_seg or !mir.isValidSandboxedEmbedPath(tail_buf[0..tail_len])) {
+            try emitCSandboxEscapeError(
+                self.unit,
+                self.sink,
+                span,
+                self.options.sandbox_caller_file_id,
+                "`@c_import` `#include` target violates package path hygiene",
+            );
+            return error.TranslationFailed;
+        }
+    }
+
     /// Resolves `#include` content without mutating state.
     fn resolveIncludeContent(
         self: *CPreprocessor,
         include_name: []const u8,
         is_angled: bool,
         includer_path: []const u8,
-    ) !?ResolvedIncludeSource {
+        span: Span,
+    ) CFrontendError!?ResolvedIncludeSource {
+        try self.checkStrictSandboxIncludeTarget(include_name, is_angled, includer_path, span);
         try self.ensureIncludeMapsBuilt();
         const norm_req = try normalizeIncludePath(&self.unit.arena, include_name);
 
         // [1] For `"…"` includes, search relative to the current includer's directory first:
         if (!is_angled) {
-            const parent_dir = if (std.mem.lastIndexOfScalar(u8, includer_path, '/')) |slash_idx|
-                includer_path[0..slash_idx]
+            const norm_includer = try normalizeIncludePath(&self.unit.arena, includer_path);
+            const parent_dir = if (std.mem.lastIndexOfScalar(u8, norm_includer, '/')) |slash_idx|
+                norm_includer[0..slash_idx]
             else
                 "";
-            const rel_candidate = if (parent_dir.len > 0) blk: {
-                const joined = try std.fmt.allocPrint(
-                    self.unit.arena.asAllocator(),
-                    "{s}/{s}",
-                    .{ parent_dir, norm_req },
-                );
-                break :blk try normalizeIncludePath(&self.unit.arena, joined);
-            } else norm_req;
+            const rel_candidate = if (parent_dir.len > 0)
+                try joinCollapsedIncludeCandidate(&self.unit.arena, parent_dir, norm_req)
+            else
+                norm_req;
 
-            if (try self.tryLoadSingleCandidate(rel_candidate)) |found| {
+            if (try self.tryLoadSingleCandidate(rel_candidate, span)) |found| {
                 return .{
                     .canonical_key = rel_candidate,
                     .recorded_path = found.raw_path,
@@ -1644,13 +1814,9 @@ const CPreprocessor = struct {
 
         // [3] Search `-Idir` `include_dirs`:
         for (self.options.include_dirs) |inc_dir| {
-            const joined = try std.fmt.allocPrint(
-                self.unit.arena.asAllocator(),
-                "{s}/{s}",
-                .{ inc_dir, norm_req },
-            );
-            const norm_joined = try normalizeIncludePath(&self.unit.arena, joined);
-            if (try self.tryLoadSingleCandidate(norm_joined)) |found| {
+            const norm_inc_dir = try normalizeIncludePath(&self.unit.arena, inc_dir);
+            const norm_joined = try joinCollapsedIncludeCandidate(&self.unit.arena, norm_inc_dir, norm_req);
+            if (try self.tryLoadSingleCandidate(norm_joined, span)) |found| {
                 return .{
                     .canonical_key = norm_joined,
                     .recorded_path = found.raw_path,
@@ -1681,7 +1847,11 @@ const CPreprocessor = struct {
     }
 
     /// Probes `virtual_headers`, `VfsSourceMap`, or `std.Io` host disk for `candidate_path` in $O(1)$.
-    fn tryLoadSingleCandidate(self: *CPreprocessor, candidate_path: []const u8) !?MappedHeaderSource {
+    fn tryLoadSingleCandidate(
+        self: *CPreprocessor,
+        candidate_path: []const u8,
+        span: Span,
+    ) CFrontendError!?MappedHeaderSource {
         try self.ensureIncludeMapsBuilt();
         if (self.virtual_header_map.get(candidate_path)) |vh_source| {
             return .{
@@ -1712,6 +1882,78 @@ const CPreprocessor = struct {
                     .raw_path = try self.unit.arena.dupe(u8, candidate_path),
                     .content = try self.unit.arena.dupe(u8, raw_bytes),
                 };
+            },
+            .jailed_host_fs => |jail_cfg| {
+                var matched_root: ?[]const u8 = null;
+                var rel_sub: []const u8 = "";
+                if (stripMatchingRootPrefix(jail_cfg.jail_dir, candidate_path)) |sub| {
+                    matched_root = jail_cfg.jail_dir;
+                    rel_sub = sub;
+                } else {
+                    for (jail_cfg.extra_allowed_dirs) |extra_dir| {
+                        if (stripMatchingRootPrefix(extra_dir, candidate_path)) |sub_extra| {
+                            matched_root = extra_dir;
+                            rel_sub = sub_extra;
+                            break;
+                        }
+                    }
+                }
+                if (matched_root == null and mir.isValidSandboxedEmbedPath(candidate_path)) {
+                    matched_root = jail_cfg.jail_dir;
+                    rel_sub = candidate_path;
+                }
+                const verified_root = matched_root orelse {
+                    try emitCSandboxEscapeError(
+                        self.unit,
+                        self.sink,
+                        span,
+                        self.options.sandbox_caller_file_id,
+                        "`@c_import` `#include` candidate resolved outside package directory sandbox",
+                    );
+                    return error.TranslationFailed;
+                };
+                if (!mir.isValidSandboxedEmbedPath(rel_sub)) {
+                    try emitCSandboxEscapeError(
+                        self.unit,
+                        self.sink,
+                        span,
+                        self.options.sandbox_caller_file_id,
+                        "`@c_import` `#include` relative path violates package directory sandbox",
+                    );
+                    return error.TranslationFailed;
+                }
+                switch (try mir.readSandboxedHostEmbedFile(
+                    self.unit.allocator,
+                    jail_cfg.io,
+                    verified_root,
+                    rel_sub,
+                    16 * 1024 * 1024,
+                )) {
+                    .ok => |raw_bytes| {
+                        defer self.unit.allocator.free(raw_bytes);
+                        const trimmed_root = std.mem.trimEnd(u8, verified_root, "/\\");
+                        const recorded_full = try std.fmt.allocPrint(
+                            self.unit.arena.asAllocator(),
+                            "{s}/{s}",
+                            .{ trimmed_root, rel_sub },
+                        );
+                        return .{
+                            .raw_path = recorded_full,
+                            .content = try self.unit.arena.dupe(u8, raw_bytes),
+                        };
+                    },
+                    .sandbox_escape => |esc| {
+                        try emitCSandboxEscapeError(
+                            self.unit,
+                            self.sink,
+                            span,
+                            self.options.sandbox_caller_file_id,
+                            esc.message,
+                        );
+                        return error.TranslationFailed;
+                    },
+                    .io_error => return null,
+                }
             },
         }
     }
@@ -2092,7 +2334,7 @@ const CPreprocessor = struct {
             }
         }
 
-        const resolved = (try self.resolveIncludeContent(include_path, is_angled, current_path)) orelse {
+        const resolved = (try self.resolveIncludeContent(include_path, is_angled, current_path, span)) orelse {
             const err_msg = try std.fmt.allocPrint(
                 self.unit.arena.asAllocator(),
                 "cannot find included C header `{s}`",
@@ -2230,6 +2472,7 @@ const CPreprocessor = struct {
                                         try decodeCStringLiteral(&self.unit.arena, inner[0].lexeme),
                                         false,
                                         current_path,
+                                        tok.span,
                                     )) |resolved_inc| {
                                         try self.recordResolvedIncludeIfNeeded(resolved_inc);
                                         has_inc = true;
@@ -2247,6 +2490,7 @@ const CPreprocessor = struct {
                                         path_buf.items,
                                         true,
                                         current_path,
+                                        tok.span,
                                     )) |resolved_inc| {
                                         try self.recordResolvedIncludeIfNeeded(resolved_inc);
                                         has_inc = true;
@@ -5891,6 +6135,43 @@ const C_CALLING_CONV_IDENT_SET = std.StaticStringMap(void).initComptime(.{
 
 // --------------------- Tokenizer Helpers ----------------------
 
+/// Emits `E0326` (`e0326_embed_path_escape`) into `sink` and marks `unit.has_errors = true`.
+fn emitCSandboxEscapeError(
+    unit: *CTranslationUnit,
+    sink: *DiagnosticSink,
+    span: Span,
+    fallback_file_id: FileId,
+    message: []const u8,
+) !void {
+    unit.has_errors = true;
+    const owned_msg = try sink.arena.asAllocator().dupe(u8, message);
+    const effective_span = if (!span.file_id.isNone())
+        span
+    else
+        Span.init(fallback_file_id, 0, 0);
+    if (!effective_span.file_id.isNone()) {
+        const labels = [1]LabeledSpan{.{
+            .span = effective_span,
+            .label = "`#include` path escapes package sandbox here",
+            .style = .primary,
+        }};
+        try sink.emit(.{
+            .code = .e0326_embed_path_escape,
+            .severity = .err,
+            .primary_span = effective_span,
+            .message = owned_msg,
+            .labels = &labels,
+        });
+    } else {
+        try sink.emit(.{
+            .code = .e0326_embed_path_escape,
+            .severity = .err,
+            .primary_span = effective_span,
+            .message = owned_msg,
+        });
+    }
+}
+
 /// Emits `E0009` (`e0009_c_header_translation_failed`) into `sink` and marks `unit.has_errors = true`.
 fn emitCTranslationError(
     unit: *CTranslationUnit,
@@ -6583,6 +6864,49 @@ fn parseCFloatLiteral(lexeme: []const u8) ?f64 {
     }
     if (slice.len == 0) return null;
     return std.fmt.parseFloat(f64, slice) catch null;
+}
+
+/// Strips `root_dir` from `full_path` on a `/` or `\` boundary (case-insensitive on Windows), or returns `null`.
+fn stripMatchingRootPrefix(root_dir: []const u8, full_path: []const u8) ?[]const u8 {
+    const trimmed_root = std.mem.trimEnd(u8, root_dir, "/\\");
+    if (trimmed_root.len == 0 or full_path.len <= trimmed_root.len) return null;
+    for (0..trimmed_root.len) |i| {
+        const root_ch = trimmed_root[i];
+        const path_ch = full_path[i];
+        const is_root_sep = root_ch == '/' or root_ch == '\\';
+        const is_path_sep = path_ch == '/' or path_ch == '\\';
+        if (is_root_sep and is_path_sep) continue;
+        if (builtin.os.tag == .windows) {
+            if (std.ascii.toLower(root_ch) != std.ascii.toLower(path_ch)) return null;
+        } else {
+            if (root_ch != path_ch) return null;
+        }
+    }
+    const boundary = full_path[trimmed_root.len];
+    if (boundary != '/' and boundary != '\\') return null;
+    return full_path[trimmed_root.len + 1 ..];
+}
+
+/// Joins normalized `parent_dir` and `norm_req`, collapsing leading `../` segments of `norm_req` into `arena`.
+fn joinCollapsedIncludeCandidate(
+    arena: *BumpArena,
+    parent_dir: []const u8,
+    norm_req: []const u8,
+) ![]const u8 {
+    var base_dir = std.mem.trimEnd(u8, parent_dir, "/");
+    var req_tail = norm_req;
+    while (std.mem.startsWith(u8, req_tail, "../")) {
+        if (base_dir.len == 0) break;
+        req_tail = req_tail[3..];
+        if (std.mem.lastIndexOfScalar(u8, base_dir, '/')) |slash_pos| {
+            base_dir = base_dir[0..slash_pos];
+        } else {
+            base_dir = "";
+        }
+    }
+    if (base_dir.len == 0) return req_tail;
+    const joined = try std.fmt.allocPrint(arena.asAllocator(), "{s}/{s}", .{ base_dir, req_tail });
+    return normalizeIncludePath(arena, joined);
 }
 
 /// Normalizes backslashes (`\`) to forward slashes (`/`) and collapses `./` segments into `arena`.

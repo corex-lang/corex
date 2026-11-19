@@ -1115,11 +1115,13 @@ pub const PackageCapPolicy = struct {
     is_third_party_dependency: bool = false,
     /// `true` when dead high-risk capabilities (`net | process | ffi | unsafe_op`) should emit `W0330`.
     is_warning_ambient_dead_caps: bool = true,
+    /// `true` when `allow_caps = ["comptime_io"]` grants sandboxed compile-time `fs` reads during `comptime` evaluation.
+    has_comptime_io_cap: bool = false,
     /// Selects `.surface` vs `.all` / `.reachable` enforcement scope.
     enforcement_scope: CapEnforcementScope = .surface,
 
     /// Computes the effective permitted capability bitmask (`(allow_caps orelse allowed_caps) & ~forbid_global_caps & locked_caps`).
-    pub inline fn effectiveAllowedCaps(self: PackageCapPolicy) EffectCapabilityMask {
+    pub inline fn asEffectiveAllowedCaps(self: PackageCapPolicy) EffectCapabilityMask {
         var mask_bits = (self.allow_caps orelse self.allowed_caps).asBits();
         mask_bits &= ~self.forbid_global_caps.asBits();
         if (self.locked_caps) |locked| {
@@ -1165,10 +1167,12 @@ pub const WorkspacePackageCapInput = struct {
     package_name: []const u8,
     /// Aggregated MIR SAST summary across all active files of `pkg_id`.
     caps: PackageCapSummary = .{},
-    /// Dormant capabilities scanned across all `@cfg`-disabled CST subtrees of `pkg_id` (`P1-7`).
+    /// Dormant capabilities scanned across all `@cfg`-disabled CST subtrees of `pkg_id`.
     inactive_caps: EffectCapabilityMask = .{},
     /// Dormant capabilities inside `pub` `@cfg`-disabled CST items of `pkg_id`.
     pub_inactive_caps: EffectCapabilityMask = .{},
+    /// Dormant capabilities on `@cfg`-disabled `@export` / `@link_section` / top-level `asm` items of `pkg_id`.
+    link_ambient_inactive_caps: EffectCapabilityMask = .{},
     /// Source span of the first capability-bearing token inside an inactive `@cfg` branch.
     first_inactive_cap_span: Span = .{ .file_id = .none, .start_byte = 0, .end_byte = 0 },
     /// Capabilities reachable exclusively along call edges from `PackageId.root` (`null` uses `caps.reachable_caps`).
@@ -1218,6 +1222,8 @@ pub const SastConfig = struct {
     is_sast_strict: bool = false,
     /// `true` when analyzing a `comptime` item (`const` / `comptime fn`, enforces Gate F `E0325`).
     is_comptime_context: bool = false,
+    /// `true` when `allow_caps = ["comptime_io"]` permits compile-time `fs` reads under Gate F (`E0325`).
+    has_comptime_io_cap: bool = false,
     /// Optional source buffer for fine-grained `@std_cap_boundary` & token-span extraction.
     source_text: ?[]const u8 = null,
     /// Optional `TokenBuffer` mapping `TokenIndex` to exact byte `Span`s.
@@ -1851,6 +1857,7 @@ fn extractBoundaryMasksForSymbol(
     active_file_id: FileId,
     config: SastConfig,
 ) struct { emits: u16, clears: u16 } {
+    if (!sym.contract_flags.is_std_cap_boundary) return .{ .emits = 0, .clears = 0 };
     if (sym.cap_emits_mask != 0 or sym.cap_clears_mask != 0) {
         return .{
             .emits = capabilityBitsToEffectMask(sym.cap_emits_mask).asBits(),
@@ -18243,7 +18250,7 @@ fn collectSymbolAndCstAmbientCaps(
     const src = config.source_text orelse return;
     if (cst_arena.countNodes() == 0) return;
 
-    // Detect top-level module `asm(…)` items in active CST (`TrueAmbientCaps`, `P2-4`):
+    // Detect top-level module `asm(…)` items in active CST (`TrueAmbientCaps`):
     var cur_idx: usize = 1;
     const total_cst = cst_arena.countNodes();
     while (cur_idx < total_cst) {
@@ -18259,24 +18266,34 @@ fn collectSymbolAndCstAmbientCaps(
             continue;
         }
         if (node.subtree_size <= 1 and !node.token.isNone() and node.token.asInt() < tok_buf.countTokens()) {
-            const tk = tok_buf.getToken(node.token).kind;
-            if (tk == .ident) {
-                const lex = symbol_resolver.extractTokenSlice(src, tok_buf, node.token);
-                if (std.mem.eql(u8, lex, "asm")) {
-                    const next_id = TokenIndex.fromInt(node.token.asInt() + 1);
-                    if (next_id.asInt() < tok_buf.countTokens() and tok_buf.getToken(next_id).kind == .lparen) {
-                        const asm_taint = EffectCapabilityMask{ .ffi = true, .unsafe_op = true };
-                        out_caps.link_ambient_caps = out_caps.link_ambient_caps.unionWith(asm_taint);
-                        out_caps.reachable_caps = out_caps.reachable_caps.unionWith(asm_taint);
-                        out_caps.ambient_caps = out_caps.ambient_caps.unionWith(asm_taint);
-                        break;
-                    }
+            if (tok_buf.getToken(node.token).kind == .ident and
+                std.mem.eql(u8, symbol_resolver.extractTokenSlice(src, tok_buf, node.token), "asm"))
+            {
+                const next_id = TokenIndex.fromInt(node.token.asInt() + 1);
+                if (next_id.asInt() < tok_buf.countTokens() and tok_buf.getToken(next_id).kind == .lparen) {
+                    const asm_taint = EffectCapabilityMask{ .ffi = true, .unsafe_op = true };
+                    out_caps.link_ambient_caps = out_caps.link_ambient_caps.unionWith(asm_taint);
+                    out_caps.reachable_caps = out_caps.reachable_caps.unionWith(asm_taint);
+                    out_caps.ambient_caps = out_caps.ambient_caps.unionWith(asm_taint);
+                    break;
                 }
             }
         }
         cur_idx += 1;
     }
 }
+
+/// Merged effect and stack-budget accumulator across sibling `MirBody` probes sharing a symbol or `DefId`.
+const SiblingAccum = struct {
+    /// Unioned direct 12-bit capability mask across sibling slots.
+    direct_bits: u16,
+    /// Unioned transitive inferred 12-bit capability mask across sibling slots.
+    inferred_bits: u16,
+    /// Maximum worst-case stack byte bound across sibling slots (`STACK_UNBOUNDED` on recursion/indirect).
+    max_subtree: u32,
+    /// `true` when at least one merged slot is a primary body rather than a synthetic default-arg probe.
+    has_primary_body: bool,
+};
 
 /// Runs Pass 3 across all `bodies` in bottom-up Tarjan SCC order, populating `FnSummaryStore` & `PackageCapSummary`.
 fn runPass3SummaryContractsAndSandbox(
@@ -19097,17 +19114,11 @@ fn runPass3SummaryContractsAndSandbox(
     }
 
     // [2b] Merge sibling SAST slots (`is_sast_default_probe` & dual `let`/`inout` `subscript` arms) sharing a
-    // `SymbolIndex` or `DefId` so callers and `.cxi` observe 100% of default-arg & subscript capabilities (`P1-5`, `P1-6`):
+    // `SymbolIndex` or `DefId` so callers and `.cxi` observe 100% of default-arg & subscript capabilities:
     {
         const merge_cp = scratch_arena.checkpoint();
         defer scratch_arena.restore(merge_cp);
         const merge_alloc = scratch_arena.asAllocator();
-        const SiblingAccum = struct {
-            direct_bits: u16,
-            inferred_bits: u16,
-            max_subtree: u32,
-            has_primary_body: bool,
-        };
         var sym_merge = std.AutoHashMapUnmanaged(u32, SiblingAccum){};
         var def_merge = std.AutoHashMapUnmanaged(u32, SiblingAccum){};
         const primary_ceil = config.primary_body_count orelse fn_count;
@@ -19306,8 +19317,7 @@ fn runPass3SummaryContractsAndSandbox(
 
         // Deduplicate contract diagnostics across sibling `subscript` / `is_sast_default_probe` slots:
         if (!resolved_sym_idx.isNone()) {
-            const seen_gop = try emitted_contract_syms.getOrPut(allocator, resolved_sym_idx.asInt());
-            if (seen_gop.found_existing) {
+            if ((try emitted_contract_syms.getOrPut(allocator, resolved_sym_idx.asInt())).found_existing) {
                 if (pass2_outcomes[s_usize].emitted_error_count == 0 and
                     pass4_outcomes[s_usize].emitted_error_count == 0)
                 {
@@ -19709,7 +19719,13 @@ fn runPass3SummaryContractsAndSandbox(
 
         // `Fix-17` Gate F: Hermetic `comptime` capability check (`E0325`):
         if (cs_mask.has_pure_contract) {
-            const forbidden_ct = inferred.asBits() &
+            const is_comptime_fs_allowed = config.has_comptime_io_cap or
+                (if (config.package_policy) |pol| pol.has_comptime_io_cap else false);
+            const allowed_ct_bits: u16 = if (is_comptime_fs_allowed)
+                symbol_resolver.CapabilityBits.FS
+            else
+                0;
+            const forbidden_ct = (inferred.asBits() & ~allowed_ct_bits) &
                 (EffectCapabilityMask.LOCKFILE_CAP_BITS | EffectCapabilityMask.INDIRECT_OPAQUE_BIT);
             if (forbidden_ct != 0) {
                 const steps = try store.reconstructShortestWitness(allocator, slot_idx, forbidden_ct);
@@ -19744,7 +19760,7 @@ fn runPass3SummaryContractsAndSandbox(
                     "non-hermetic capability reachable during compile-time evaluation",
                     null,
                     null,
-                    note_opt orelse "remove `fs`, `net`, `env`, `process`, `ffi`, `unsafe`, `clock`, and `entropy` from `comptime`",
+                    note_opt orelse "remove `fs`, `net`, `env`, `process`, `ffi`, `unsafe_op`, `clock`, and `entropy` from `comptime`",
                 );
             }
         }
@@ -20340,7 +20356,31 @@ pub fn isSymbolExternallyCallableSurface(
     return false;
 }
 
-/// Verifies `PackageCapSummary` against `PackageCapPolicy` (`Fix-17` Gate E: `E0324` & `W0330`).
+/// Infers `@std_cap_boundary` or prototype-only `EffectCapabilityMask` bits for `sym_idx`.
+pub fn inferSymbolBoundaryOrPrototypeEffects(
+    sym_table: *const SymbolTable,
+    sym_idx: SymbolIndex,
+) EffectCapabilityMask {
+    const canon_sym = unwrapCanonicalSymbolIndex(sym_table, sym_idx);
+    if (canon_sym.isNone() or canon_sym.asInt() >= sym_table.symbols.items.len) {
+        return EffectCapabilityMask.EMPTY;
+    }
+    const sym = sym_table.getSymbol(canon_sym).*;
+    if (sym.contract_flags.is_std_cap_boundary) {
+        return capabilityBitsToEffectMask(sym.cap_emits_mask);
+    }
+    return inferExternalPrototypeEffectsForSym(sym_table, canon_sym);
+}
+
+/// Applies `sym`'s `@std_cap_boundary` `clears`/`emits` masks to `raw_bits` when privileged.
+pub fn applySymbolBoundaryMask(raw_bits: u16, sym: SymbolRecord) u16 {
+    if (!sym.contract_flags.is_std_cap_boundary) return raw_bits;
+    const emits = capabilityBitsToEffectMask(sym.cap_emits_mask).asBits();
+    const clears = capabilityBitsToEffectMask(sym.cap_clears_mask).asBits();
+    return (raw_bits & ~clears) | emits;
+}
+
+/// Verifies `PackageCapSummary` against `PackageCapPolicy` (`DR-17` Gate E: `E0324` & `W0330`).
 pub fn verifyPackageCapPolicy(
     allocator: std.mem.Allocator,
     pkg_caps: PackageCapSummary,
@@ -20351,7 +20391,7 @@ pub fn verifyPackageCapPolicy(
         .surface => pkg_caps.surface_caps.unionWith(pkg_caps.link_ambient_caps),
         .all, .reachable => pkg_caps.reachable_caps.unionWith(pkg_caps.link_ambient_caps),
     };
-    const permitted_bits = policy.effectiveAllowedCaps().asBits();
+    const permitted_bits = policy.asEffectiveAllowedCaps().asBits();
     const unauthorized_bits = (active_caps.asBits() & ~permitted_bits) &
         (EffectCapabilityMask.LOCKFILE_CAP_BITS | EffectCapabilityMask.INDIRECT_OPAQUE_BIT);
     if (unauthorized_bits != 0) {
@@ -20377,8 +20417,8 @@ pub fn verifyPackageCapPolicy(
     }
 
     if (policy.is_third_party_dependency and policy.is_warning_ambient_dead_caps) {
-        const live_reachable = pkg_caps.reachable_caps.unionWith(pkg_caps.link_ambient_caps);
-        const dead_high_risk = (pkg_caps.ambient_caps.asBits() & ~live_reachable.asBits()) &
+        const dead_high_risk = (pkg_caps.ambient_caps.asBits() &
+            ~pkg_caps.reachable_caps.unionWith(pkg_caps.link_ambient_caps).asBits()) &
             EffectCapabilityMask.HIGH_RISK_DEAD_CAP_BITS & ~permitted_bits;
         if (dead_high_risk != 0) {
             const cap_names = try formatEffectBitsList(allocator, dead_high_risk);
@@ -20430,7 +20470,7 @@ pub fn verifyWorkspaceCapabilitySandbox(
     // [1] Compute per-package `EffectiveCaps(D)` under `.surface` vs `.reachable`/`.all`:
     for (packages, 0..) |pkg_in, idx| {
         try pkg_index_map.put(allocator, pkg_in.pkg_id.asInt(), idx);
-        const true_ambient = pkg_in.caps.link_ambient_caps;
+        const true_ambient = pkg_in.caps.link_ambient_caps.unionWith(pkg_in.link_ambient_inactive_caps);
         const eff = switch (pkg_in.policy.enforcement_scope) {
             .surface => pkg_in.caps.surface_caps
                 .unionWith(true_ambient)
@@ -20464,9 +20504,10 @@ pub fn verifyWorkspaceCapabilitySandbox(
     // [3] Verify per-package `policy` (`locked_caps`, `forbid_global_caps`, `allow_caps`) & `W0330`:
     for (packages, 0..) |pkg_in, idx| {
         const all_ambient = pkg_in.caps.ambient_caps.unionWith(pkg_in.inactive_caps);
+        const true_ambient = pkg_in.caps.link_ambient_caps.unionWith(pkg_in.link_ambient_inactive_caps);
         const live_reachable = (pkg_in.root_callgraph_reachable_caps orelse pkg_in.caps.reachable_caps)
-            .unionWith(pkg_in.caps.link_ambient_caps);
-        const permitted_bits = pkg_in.policy.effectiveAllowedCaps().asBits();
+            .unionWith(true_ambient);
+        const permitted_bits = pkg_in.policy.asEffectiveAllowedCaps().asBits();
         const dead_bits = (all_ambient.asBits() & ~live_reachable.asBits()) &
             EffectCapabilityMask.HIGH_RISK_DEAD_CAP_BITS & ~permitted_bits;
 
@@ -20551,8 +20592,8 @@ pub fn verifyWorkspaceCapabilitySandbox(
         if (edge_unauthorized == 0) continue;
 
         // Avoid duplicate emission if `callee_idx` already reported identical `unauthorized_self` on the same span:
-        const callee_self_permitted = packages[callee_idx].policy.effectiveAllowedCaps().asBits();
-        const callee_self_unauth = (subtree_caps[callee_idx].asBits() & ~callee_self_permitted) & checked_cap_mask;
+        const callee_self_unauth = (subtree_caps[callee_idx].asBits() &
+            ~packages[callee_idx].policy.asEffectiveAllowedCaps().asBits()) & checked_cap_mask;
         if ((edge_unauthorized & ~callee_self_unauth) == 0 and
             dep_edge.edge_span.file_id == packages[callee_idx].policy.policy_span.file_id and
             dep_edge.edge_span.start_byte == packages[callee_idx].policy.policy_span.start_byte)

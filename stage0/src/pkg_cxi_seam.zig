@@ -24,7 +24,7 @@ pub const CxiHeader = extern struct {
     reserved_u16: [3]u16 = .{ 0, 0, 0 },
     /// Count of sorted `CxiFnRecord` entries immediately following this header.
     pub_fn_count: u32 = 0,
-    /// Count of sorted `CxiTypeRecord` entries following the function table.
+    /// Count of sorted `CxiTypeRecord` entries (nominal/alias types and `pub const` digests) following the function table.
     pub_type_count: u32 = 0,
     /// Total payload byte length following this 64-byte header (`pub_fn_count * 64 + pub_type_count * 40`).
     body_byte_len: u64 = 0,
@@ -34,7 +34,7 @@ pub const CxiHeader = extern struct {
 
 /// Exact 64-byte (`512`-bit, `align(8)`, `0` padding) record per exported `pub fn` or `pub trait` method.
 pub const CxiFnRecord = extern struct { symbol_path_hash: u64 = 0, sig_type_hash: u64 = 0, shape_hash64: u64 = 0, summary_bits: [5]u64 = @splat(0) };
-/// Exact 40-byte (`320`-bit, `align(8)`, `0` padding) record per exported `pub` nominal or `distinct` type.
+/// Exact 40-byte (`320`-bit, `align(8)`, `0` padding) record per exported `pub` nominal/alias type or `pub const` (`0x8000_0000` tag).
 pub const CxiTypeRecord = extern struct { symbol_path_hash: u64 = 0, shape_hash64: u64 = 0, field_hash64: u64 = 0, layout_meta: [4]u32 = @splat(0) };
 
 // ------------------------------------- PUBLIC API --------------------------------------

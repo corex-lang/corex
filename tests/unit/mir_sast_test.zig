@@ -1,19 +1,17 @@
-//! Unit & Red-Team Regression Tests for Phase 6 `MIR` SAST Engine (`stage0/src/mir_sast.zig`)
+//! Unit & Regression Tests for Phase 6 `MIR` SAST Engine (`stage0/src/mir_sast.zig`)
 //!
 //! Covers all Phase 6 invariants (`PLAN.md` §2.6, `DR-06`, `DR-17`, `DR-20`):
 //! - Binary layouts (`40B` `FnRegionSummary`, `34B` Early Cutoff digest, `DenseBitSet`, `Intv`,
 //!   `PentagonSubRow`, `MovePathNode`, `WitnessCallEdge`), three-tier ownership (`Copy`,
 //!   `AutoDrop`, `@linear`), trivial arena drop elision, `@secret`, `Context`, & `D-01` (`E0315`).
 //! - Pass 1 & Pass 2 typestate (`E0301`–`E0305`, `E0313`, `W0308`, `E0328`), `> 64` simultaneous
-//!   NLL loans (`[CRITICAL-08]`), `&mut`/`inout` temporary move-out (`[CRITICAL-07]`), conditional
-//!   `set` `_drop_flag` (`[MAJOR-11]`), `MirVm` `@drop_trace` LIFO execution, & `comptime` drops
-//!   (`[CRITICAL-04]`).
-//! - Pass 3 `FnRegionSummary`, `E0306` escape (`[CRITICAL-05]`, `[CRITICAL-06]`), `@max_stack`
-//!   (`E0316`, `[MINOR-18]`), contracts (`E0320`–`E0323`, `[CRITICAL-02]`, `[MAJOR-09]`,
-//!   `[MAJOR-15]`), `Fix-17` Gates A–F (`E0324`–`E0327`, `W0330`, `[MINOR-19]`), `Fix-06B`
-//!   vacated `subscript` (`W0329`, `[MAJOR-10]`), and `CompilerDb` Stage 9 SCCs (`[CRITICAL-03]`).
+//!   NLL loans, `&mut`/`inout` temporary move-out, conditional `set` `_drop_flag`, `MirVm`
+//!   `@drop_trace` LIFO execution, & `comptime` drops.
+//! - Pass 3 `FnRegionSummary`, `E0306` escape, `@max_stack` (`E0316`), contracts (`E0320`–`E0323`),
+//!   `Fix-17` Gates A–F (`E0324`–`E0327`, `W0330`), `Fix-06B` vacated `subscript` (`W0329`), and
+//!   `CompilerDb` Stage 9 SCCs.
 //! - Pass 4 sign-biased `Intv` (`NATIVE_64` & `WASM32`), Demand-Sliced Pentagon BCE (`E0307`,
-//!   `W0314`, `Fix-06A`), `[CRITICAL-01]` mutable slice & zero-modulo guards, & `D-11` (`E0406`).
+//!   `W0314`, `Fix-06A`), mutable slice & zero-modulo guards, & `D-11` (`E0406`).
 
 const std = @import("std");
 const corex = @import("corex");
@@ -905,7 +903,7 @@ test "test_phase6_nll_exclusivity_e0305_over_64_loans_mut_move_out_and_set_drop_
     ;
     try expectSastDiagnostic(allocator, 221, nll_conflict_src, .{}, .e0305_exclusivity_violation);
 
-    // [2] `[CRITICAL-08]` `> 64` (`70`) simultaneous tracked loans (`DenseBitSet.arena_words`):
+    // [2] `> 64` (`70`) simultaneous tracked loans (`DenseBitSet.arena_words`):
     const seventy_conflict_src = try buildOver64SimultaneousLoansSource(allocator, true);
     defer allocator.free(seventy_conflict_src);
     try expectSastDiagnostic(allocator, 222, seventy_conflict_src, .{}, .e0305_exclusivity_violation);
@@ -915,7 +913,7 @@ test "test_phase6_nll_exclusivity_e0305_over_64_loans_mut_move_out_and_set_drop_
     var seventy_ok_bundle = try verifyCleanSast(allocator, 223, seventy_clean_src, .{});
     defer seventy_ok_bundle.deinit();
 
-    // [3] `[CRITICAL-07]` `&mut Wrapper` temporary non-`Copy` field move-out:
+    // [3] `&mut Wrapper` temporary non-`Copy` field move-out:
     const mut_move_missing_reinit_src =
         \\pub struct Vec[T] {
         \\    pub len: usize,
@@ -969,7 +967,7 @@ test "test_phase6_nll_exclusivity_e0305_over_64_loans_mut_move_out_and_set_drop_
     var mut_ok_bundle = try verifyCleanSast(allocator, 225, mut_move_reinit_ok_src, .{});
     defer mut_ok_bundle.deinit();
 
-    // [4] `[MAJOR-11]` Conditional `&out` parameter initialization updates `_drop_flag` cleanly in `MirVm`:
+    // [4] Conditional `&out` parameter initialization updates `_drop_flag` cleanly in `MirVm`:
     const cond_set_drop_src =
         \\pub struct TrackedBox {
         \\    pub tag: i64,
@@ -1025,7 +1023,7 @@ test "test_phase6_nll_exclusivity_e0305_over_64_loans_mut_move_out_and_set_drop_
 test "test_phase6_w0308_per_arena_tracking_and_d04_scratch_ping_pong_e0328" {
     const allocator = std.testing.allocator;
 
-    // [1] `[MINOR-20]` Per-arena `LocalId` tracking for `W0308` across multiple distinct `BumpArena`s:
+    // [1] Per-arena `LocalId` tracking for `W0308` across multiple distinct `BumpArena`s:
     const multi_arena_clean_src =
         \\pub struct BumpArena {
         \\    pub cursor: usize,
@@ -1236,7 +1234,7 @@ test "test_phase6_elaborate_drops_mir_vm_lifo_trace_and_comptime_drop_eval" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1020, 20, 30, 10 }, vm.asDropTraceSlice());
     try std.testing.expectEqual(@as(u32, 0), vm.countUnfreedHeapAllocations());
 
-    // [2] `[CRITICAL-04]` `CompilerDb.evalComptimeDef` runs Stage 9 drop-elaborated `MIR`:
+    // [2] `CompilerDb.evalComptimeDef` runs Stage 9 drop-elaborated `MIR`:
     var db = try CompilerDb.init(allocator);
     defer db.deinit();
     const ct_file = FileId.fromInt(241);
@@ -1283,7 +1281,7 @@ test "test_phase6_region_escape_e0306_return_param_flow_wrapper_and_closures" {
     ;
     try expectSastDiagnostic(allocator, 301, ret_escape_src, .{}, .e0306_region_escape_violation);
 
-    // [2] `[CRITICAL-05]` `param_flow_matrix` exact `src_ord * 8 + dst_ord` bit direction (`bit 8`, NOT `1`):
+    // [2] `param_flow_matrix` exact `src_ord * 8 + dst_ord` bit direction (`bit 8`, NOT `1`):
     const param_flow_ok_src =
         \\pub fn assign_ref_slot(dst_slot: &mut &i64, src_ref: &i64) {
         \\    dst_slot.* = src_ref;
@@ -1333,7 +1331,7 @@ test "test_phase6_region_escape_e0306_return_param_flow_wrapper_and_closures" {
     ;
     try expectSastDiagnostic(allocator, 303, param_flow_escape_src, .{}, .e0306_region_escape_violation);
 
-    // [3] `[CRITICAL-06]` Nominal wrapper struct carrying borrowed view cannot escape stack frame:
+    // [3] Nominal wrapper struct carrying borrowed view cannot escape stack frame:
     const wrapper_escape_src =
         \\pub struct PacketView {
         \\    pub bytes: &[u8],
@@ -1428,7 +1426,7 @@ test "test_phase6_max_stack_e0316_malformed_attr_and_contracts_e0320_to_e0323" {
         countDiagnosticCode(&stk_bad_bundle.diagnostics, .e0316_max_stack_budget_exceeded),
     );
 
-    // `[MINOR-18]` Malformed `@max_stack(-8)` and `@max_stack()` emit `.e0406_range_refinement_violation`:
+    // Malformed `@max_stack(-8)` and `@max_stack()` emit `.e0406_range_refinement_violation`:
     const malformed_max_stack_src =
         \\@max_stack(-8)
         \\pub fn neg_budget() -> i32 { return 0; }
@@ -1512,7 +1510,7 @@ test "test_phase6_max_stack_e0316_malformed_attr_and_contracts_e0320_to_e0323" {
     try std.testing.expectEqual(@as(usize, 2), witness_steps.len);
     try std.testing.expectEqual(WitnessEdgeKind.direct_call, witness_steps[0].edge.meta().edge_kind);
 
-    // [3] `[MAJOR-09]` & `[CRITICAL-02]` Higher-order callback forwarding & mutable local `var` callable:
+    // [3] Higher-order callback forwarding & mutable local `var` callable:
     const ho_pure_ok_src =
         \\pub fn apply_step(val: i32, cb: fn(i32) -> i32) -> i32 {
         \\    return cb(val);
@@ -1569,7 +1567,7 @@ test "test_phase6_max_stack_e0316_malformed_attr_and_contracts_e0320_to_e0323" {
         countDiagnosticCode(&ho_bad_bundle.diagnostics, .e0320_no_alloc_contract_violation),
     );
 
-    // [4] `[MAJOR-15]` Trait `impl` effect escalation (`E0323`) vs same-named inherent method (`0` errors):
+    // [4] Trait `impl` effect escalation (`E0323`) vs same-named inherent method (`0` errors):
     const inherent_same_name_ok_src =
         \\pub trait StrictCodec {
         \\    @no_panic
@@ -1680,7 +1678,7 @@ test "test_phase6_fix17_gates_a_to_f_sandbox_policies_and_fix06b_vacated_w0329" 
     try std.testing.expect(dev_art.has_errors);
     try std.testing.expect(hasDiagnosticCode(db.getComptimeDiagnostics(dev_def).?, .e0326_embed_path_escape));
 
-    // [3] `Fix-17` Gate E (`[MINOR-19]` & `DR-17` §3.1): `PackageCapPolicy` `.surface` vs `.all` (`E0324`),
+    // [3] `Fix-17` Gate E (`DR-17` §3.1); `PackageCapPolicy` `.surface` vs `.all` (`E0324`),
     //     `TrueAmbientCaps` (`@export`) enforced under `.surface`, & dead `ffi` (`W0330`):
     const pkg_scope_src =
         \\extern "C" fn raw_net_send() -> i32;
@@ -1772,7 +1770,7 @@ test "test_phase6_fix17_gates_a_to_f_sandbox_policies_and_fix06b_vacated_w0329" 
     ;
     try expectSastDiagnostic(allocator, 326, bad_comptime_src, .{}, .e0325_comptime_sandbox_violation);
 
-    // [5] `Fix-06B` (`[MAJOR-10]`): Multi-block `if`/`else` inside vacated non-`Copy` `inout` `subscript` window:
+    // [5] `Fix-06B` multi-block `if`/`else` inside vacated non-`Copy` `inout` `subscript` window:
     const vacated_subscript_src =
         \\pub struct Vec[T] {
         \\    pub len: usize,
@@ -1953,7 +1951,7 @@ test "test_phase6_compiler_db_stage9_early_cutoff_and_mutual_recursion_sccs" {
     const proj_memo_v3 = db.getMemoHeader(QueryKey.forSastSummaryProj(helper_def)).?;
     try std.testing.expectEqual(rev_three, proj_memo_v3.changed_at);
 
-    // [2] `[CRITICAL-03]` Cross-`DefId` mutual recursion: pure `@no_alloc @no_panic` passes; `@max_stack` fails:
+    // [2] Cross-`DefId` mutual recursion; pure `@no_alloc @no_panic` passes and `@max_stack` fails:
     const scc_ok_file = FileId.fromInt(341);
     const scc_pure_src =
         \\@no_alloc
@@ -2160,7 +2158,7 @@ test "test_phase6_pentagon_bce_for_range_rem_u_static_oob_e0307_and_strict_w0314
 test "test_phase6_critical01_mutable_slice_reassignment_zero_mod_and_d11_narrow_e0406" {
     const allocator = std.testing.allocator;
 
-    // [1] `[CRITICAL-01]` Reassigning mutable `var cur_slice` after `if idx < cur_slice.len()` MUST NOT elide BCE:
+    // [1] Reassigning mutable `var cur_slice` after `if idx < cur_slice.len()` MUST NOT elide BCE:
     const mut_slice_reassign_src =
         \\@no_panic
         \\pub fn bad_reassigned_slice_bce(long_s: &[i64], short_s: &[i64], idx: usize) -> i64 {
@@ -2196,7 +2194,7 @@ test "test_phase6_critical01_mutable_slice_reassignment_zero_mod_and_d11_narrow_
         hasDiagnosticCode(&mut_slice_bundle.diagnostics, .w0314_unproven_bounds_access),
     );
 
-    // [2] `[CRITICAL-01]` `raw % divisor` when `0` is in `Intv(divisor)` MUST NOT elide panic/bounds checks:
+    // [2] `raw % divisor` when `0` is in `Intv(divisor)` MUST NOT elide panic/bounds checks:
     const unguarded_mod_src =
         \\@no_panic
         \\pub fn bad_zero_possible_modulo(slice: &[i64], raw: usize) -> i64 {
