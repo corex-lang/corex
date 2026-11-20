@@ -17,7 +17,7 @@ It serves two roles:
 
 ## 2. Cross-Language Capability Matrix
 
-Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `stage0/` + `core/` (`Phases 0–10`); **`[v0.0.1]`** = scheduled in `Phases 10.5–12` prior to initial release; **`[0.x]`** = scheduled in `Phase 13.0–13.4` prior to `v1.0.0`.
+Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `stage0/` + `core/` + `vscode-ext-corex` (`Phases 0–10.5`); **`[v0.0.1]`** = scheduled in `Phases 11–12` prior to initial release; **`[0.x]`** = scheduled in `Phase 13.0–13.4` prior to `v1.0.0`.
 
 | Dimension | CoreX | Rust | Zig | C23 / C++23 | Go | Python |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -102,6 +102,7 @@ CoreX systematically adopts the highest-leverage ergonomic wins from Python, Swi
 -   **Sub-Millisecond `corex lsp` Over `CompilerDb` (`DR-12`, `DR-17`):** Built directly into the single `corex` binary with zero external daemons, delivering `< 10 ms` P99 keystroke-to-diagnostic, completion, semantic-token delta, hygienic cross-file rename, and `DR-17` hover cards showing inferred capabilities (`[fs, net, unsafe_op]` or `none (pure)`), `@no_alloc`/`@no_panic` verification status, and exact `@max_stack(N)` frame byte budgets on 100,000-LOC workspaces.
 -   **Zero-False-Positive Linter & Supply-Chain Capability Auditor (`corex check`):** Unifies `W0202` idiom lints, `@deprecated(upgrade: "…")` (`W0403`) call-site rewrite templates, transactional `corex check --fix`, `--deny-warnings`, `corex check --caps` package capability matrices, and `corex check --explain-caps` shortest BFS call-chain witnesses.
 -   **3-Tier Zero-Legacy `corex upgrade` Engine (`DR-14`, `UR-21-00`–`UR-22-06`):** Automatically rewrites legacy syntax, `TypeId`-resolved idioms, `@deprecated` / `@fix_inline` library calls, and `corex.toml` / `corex.lock` manifests (`--accept-caps` without ever overriding `deny_caps`) while preserving 100% of comments and rolling back atomically if syntax errors increase.
+-   **Zero-Dependency `< 25 KB` Official VS Code & OpenVSX Extension (`vscode-ext-corex` `v1.0.0`):** Ships a non-backtracking CoreX v1.0 TextMate grammar (powering both offline editor highlighting and GitHub PrettyLights) paired with a zero-runtime-dependency `corex lsp` and `corex fmt` client featuring custom MVS/SAST semantic token modifiers (`mutable`, `consumedMove`, `unsafe`, `attribute`, `linearResource`) and Workspace Trust gating (`[Live]` locally; Marketplace release in Stage `L1`).
 
 ---
 
