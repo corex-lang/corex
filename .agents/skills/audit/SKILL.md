@@ -54,8 +54,8 @@ Select the mode matching the active milestone:
 
 -   Verify all rules in **`AGENTS.md` Section 6**:
     -   Canonical section order (`TYPES`, `CONSTS`, `INTERNALS`, `PUBLIC API`, `MAIN`) with exact 90-char / 65-char separators (verified in both UTF-8 bytes and Unicode codepoints).
-    -   Zero single-letter variable names (except `i`, `j`, `n`, `x`, `y`, `z`).
-    -   Strict `is_…`/`has_…`, `as_…`, `to_…`, `extract_…`, and `resolve_path` naming in `.cx` (and corresponding `camelCase` `is…`/`has…`, `as…`, `to…`, `extract…`, and `resolvePath` in Stage 0 Zig).
+    -   Zero cryptic single-letter variable names (except `i`, `j`, `k`, `n`, `x`, `y`, `z`, `w` per `AGENTS.md` §6).
+    -   Idiomatic CoreX naming (`as_…` / `to_…` / `into_…` 3-tier views & conversions, `parse_…` vs. `extract_…`, `is_…`/`has_…` predicate functions with concise boolean struct/attribute keys, noun property getters without `get_` noise, and `resolve_path` / `resolve_or_create_path`).
     -   Zero single-use temporary variables; condition-scoped bindings inlined; `else if` / `match` / `switch` mutual exclusion.
 
 ### D. CLI Aesthetics, Documentation & Comments
