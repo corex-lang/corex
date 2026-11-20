@@ -198,7 +198,7 @@ fn executeVmTierOnDb(
         &owned_bodies,
     ) catch |comp_err| switch (comp_err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.Cancelled => return error.Cancelled,
+        error.Canceled => return error.Canceled,
         else => return error.FrontendErrors,
     };
 
@@ -279,7 +279,7 @@ fn executeVmTierOnDb(
             }
         } else |conv_err| switch (conv_err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.Cancelled => return error.Cancelled,
+            error.Canceled => return error.Canceled,
             else => {
                 has_trapped = true;
                 exit_code = 101;
@@ -287,7 +287,7 @@ fn executeVmTierOnDb(
         }
     } else |eval_err| switch (eval_err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.Cancelled => return error.Cancelled,
+        error.Canceled => return error.Canceled,
         error.ProcessExited => {
             has_trapped = false;
             exit_code = vm_engine.exited_with_code orelse 0;
@@ -785,7 +785,7 @@ pub fn runFourTierDiffOracleOnDb(
             if (!has_front_errors and (entry.kind == .const_decl or entry.kind == .extern_block)) {
                 const ct_art = db.evalComptimeDef(entry.def_id) catch |ct_err| switch (ct_err) {
                     error.OutOfMemory => return error.OutOfMemory,
-                    error.Cancelled => return error.Cancelled,
+                    error.Canceled => return error.Canceled,
                     else => {
                         has_front_errors = true;
                         continue;
@@ -1023,7 +1023,7 @@ test "test_diff_oracle_phase8_async_coroutines_fifo_task_group_and_cancellation_
         \\        let _bg_join = bg.join();
         \\        cx.async.yield_now().await;
         \\        grp.cancel_all();
-        \\        if grp.is_cancelled() { 5 } else { 0 }
+        \\        if grp.is_canceled() { 5 } else { 0 }
         \\    }).await;
         \\
         \\    return lazy_val + pinned_val + after_pin + fifo_sum + cancel_score - 74;

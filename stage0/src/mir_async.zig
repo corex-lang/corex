@@ -49,7 +49,7 @@ pub const CoroStateTag = enum(u32) {
     /// Terminal state after `poll` produces `Ready(output)` (`0xFFFF_FFFE`).
     completed = 0xFFFF_FFFE,
     /// Terminal state after cancellation runs `cancel_bb` or drops unpolled arguments (`0xFFFF_FFFF`).
-    cancelled = 0xFFFF_FFFF,
+    canceled = 0xFFFF_FFFF,
     _,
 
     /// Encodes zero-based suspend-point ordinal `suspend_index` (`0 .. K - 1`) into state tag `1 .. K`.

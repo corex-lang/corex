@@ -28,7 +28,7 @@ pub struct Waker {
 /// Lightweight `Copy` cooperative cancellation capability propagated via `context.cancel_token` (`SE-08`).
 @repr(C)
 pub struct CancelToken {
-    /// Shared pointer to the atomic cancellation flag word (`0` = active, non-zero = cancelled).
+    /// Shared pointer to the atomic cancellation flag word (`0` = active, non-zero = canceled).
     flag_ptr: *u64,
 }
 
@@ -36,7 +36,7 @@ pub struct CancelToken {
 @repr(C)
 @align(8)
 pub struct CancelSource {
-    /// Backing 64-bit atomic cancellation flag (`0` = active, `1` = cancelled).
+    /// Backing 64-bit atomic cancellation flag (`0` = active, `1` = canceled).
     flag: u64,
 }
 
@@ -110,7 +110,7 @@ pub struct TaskGroup[E = never] {
     /// Deterministic nursery scope identifier in the active executor.
     pub group_id: u64,
     /// `true` once cooperative cancellation has been requested across sibling tasks.
-    pub is_cancelling: bool,
+    pub is_canceling: bool,
 }
 
 // --------------------------------------- CONSTS ----------------------------------------
@@ -182,7 +182,7 @@ impl CancelToken {
     /// Returns `true` if cooperative cancellation has been requested on the associated `CancelSource`.
     @std_cap_boundary(clears: [unsafe_op])
     @inline @no_alloc @no_panic
-    pub fn is_cancelled(&self) -> bool {
+    pub fn is_canceled(&self) -> bool {
         if self.flag_ptr == @default_init[*u64]() {
             return false;
         }
@@ -193,7 +193,7 @@ impl CancelToken {
 }
 
 impl CancelSource {
-    /// Constructs a fresh uncancelled `CancelSource`.
+    /// Constructs a fresh uncanceled `CancelSource`.
     @inline @no_alloc @no_panic
     pub fn new() -> CancelSource {
         return CancelSource { flag: 0_u64 };
@@ -217,7 +217,7 @@ impl CancelSource {
     /// Returns `true` if `cancel()` has been invoked on `self`.
     @std_cap_boundary(clears: [unsafe_op])
     @inline @no_alloc @no_panic
-    pub fn is_cancelled(&self) -> bool {
+    pub fn is_canceled(&self) -> bool {
         return unsafe {
             @atomic_load(&raw self.flag, 2_u8) != 0_u64
         };

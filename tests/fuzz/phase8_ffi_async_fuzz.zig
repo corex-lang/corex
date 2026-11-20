@@ -195,7 +195,7 @@ fn buildRandomAsyncCxProgram(allocator: std.mem.Allocator, rng: std.Random) ![]u
     const task_val_right = rng.intRangeAtMost(i32, 4, 22);
     const ctx_tok_handle = rng.intRangeAtMost(usize, 1, 31);
     const trace_base = rng.intRangeAtMost(i64, 100, 400);
-    const is_cancelling_extra = rng.boolean();
+    const is_canceling_extra = rng.boolean();
 
     return std.fmt.allocPrint(
         allocator,
@@ -251,7 +251,7 @@ fn buildRandomAsyncCxProgram(allocator: std.mem.Allocator, rng: std.Random) ![]u
             task_val_left,
             trace_base + 1,
             task_val_right,
-            if (is_cancelling_extra) "true" else "false",
+            if (is_canceling_extra) "true" else "false",
             trace_base + 50,
         },
     );

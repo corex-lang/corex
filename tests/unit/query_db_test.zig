@@ -7,7 +7,7 @@
 //! - Verifies `lower_ast` Early Cutoff on comment/whitespace edits and `ItemTree` signature firewalls
 //!   isolating sibling definitions shifted by 50+ lines.
 //! - Verifies 3-tier `Durability` fast-paths, green-path `min_durability` recomputation, cycle
-//!   detection (`error.DependencyCycle`), cooperative cancellation (`error.Cancelled`), and all 11
+//!   detection (`error.DependencyCycle`), cooperative cancellation (`error.Canceled`), and all 11
 //!   `ItemKind` variants in `extractItemTree`.
 //! - Verifies Phase 5 Stages `10..13` (`lowerDefHir`, `buildDefMir`, `evalComptimeDef`, and
 //!   `optimizeMirModule`), per-`DefId` HIR/MIR firewall preservation on sibling body edits, and
@@ -45,7 +45,7 @@ fn injectDefSignatureCycleHook(db: *CompilerDb, key: QueryKey) QueryError!void {
 fn cancelDuringTypecheckHook(db: *CompilerDb, key: QueryKey) QueryError!void {
     if (key.stage == .typecheck_body) {
         db.requestCancellation();
-        try db.unwindIfCancelled();
+        try db.unwindIfCanceled();
     }
 }
 
@@ -435,16 +435,16 @@ test "test_query_db_dependency_cycle_detection_and_cooperative_cancellation" {
 
     // [2] Inject mid-query cancellation via `cancelDuringTypecheckHook`:
     db.setCustomStageHook(cancelDuringTypecheckHook);
-    try std.testing.expectError(error.Cancelled, db.verifySastMir(def_alpha));
-    try std.testing.expect(db.isCancelled());
-    try std.testing.expectError(error.Cancelled, db.unwindIfCancelled());
+    try std.testing.expectError(error.Canceled, db.verifySastMir(def_alpha));
+    try std.testing.expect(db.isCanceled());
+    try std.testing.expectError(error.Canceled, db.unwindIfCanceled());
     try std.testing.expectEqual(@as(usize, 0), db.active_stack.items.len);
     db.setCustomStageHook(null);
 
     // [3] Clear cancellation and verify full query completion:
     db.clearCancellation();
-    try std.testing.expect(!db.isCancelled());
-    try db.unwindIfCancelled();
+    try std.testing.expect(!db.isCanceled());
+    try db.unwindIfCanceled();
     const sast_res = try db.verifySastMir(def_alpha);
     try std.testing.expect(sast_res.is_verified_sound);
 }

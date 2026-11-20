@@ -2901,7 +2901,7 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
             "@_cx_exec_q_len = {s} {s} 0, align {d}\n" ++
             "@_cx_exec_q_cap = {s} {s} 0, align {d}\n" ++
             "@_cx_active_poll_item = {s} {s} 1, align {d}\n" ++
-            "@_cx_coro_is_cancelling = {s} i8 0, align 1\n",
+            "@_cx_coro_is_canceling = {s} i8 0, align 1\n",
         .{
             ptr_int,   ptr_int,              ptr_int,
             ptr_int,   total_ctx_save_bytes, ptr_int,
@@ -3213,10 +3213,10 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
             "canc_coro:\n" ++
             "  %bp = getelementptr inbounds i8, ptr %h, {s} 4\n" ++
             "  %b_idx = load i32, ptr %bp, align 4\n" ++
-            "  %prev_c = load i8, ptr @_cx_coro_is_cancelling, align 1\n" ++
-            "  store i8 1, ptr @_cx_coro_is_cancelling, align 1\n" ++
+            "  %prev_c = load i8, ptr @_cx_coro_is_canceling, align 1\n" ++
+            "  store i8 1, ptr @_cx_coro_is_canceling, align 1\n" ++
             "  %_ign = call i32 @_cx_coro_poll_dispatch(i32 %b_idx, ptr %h, ptr null, i32 1, ptr null)\n" ++
-            "  store i8 %prev_c, ptr @_cx_coro_is_cancelling, align 1\n" ++
+            "  store i8 %prev_c, ptr @_cx_coro_is_canceling, align 1\n" ++
             "  call void @_cx_coro_free(ptr %h)\n" ++
             "  br label %done\n" ++
             "done:\n" ++
@@ -3719,7 +3719,7 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
             "chk_abort:\n" ++
             "  %gcp = getelementptr inbounds %_cx_task_group_t, ptr %grp, i32 0, i32 3\n" ++
             "  %gc = load i8, ptr %gcp, align 1\n" ++
-            "  %cc = load i8, ptr @_cx_coro_is_cancelling, align 1\n" ++
+            "  %cc = load i8, ptr @_cx_coro_is_canceling, align 1\n" ++
             "  %o1 = or i8 %is_err, %cc\n" ++
             "  %o2 = or i8 %o1, %gc\n" ++
             "  %ab = icmp ne i8 %o2, 0\n" ++
@@ -14693,7 +14693,7 @@ fn emitAsyncFutureMakeLlvm(
     try state.print("  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n", .{ dst_raw, val_ty, loaded, val_ty, loaded });
 }
 
-/// Emits LLVM IR nursery barrier (`async_task_group_exit`) cancelling on `Err`/cleanup or draining FIFO.
+/// Emits LLVM IR nursery barrier (`async_task_group_exit`) canceling on `Err`/cleanup or draining FIFO.
 fn emitAsyncTaskGroupExitLlvm(
     emitter: *LlvmModuleEmitter,
     state: *BodyEmitState,
@@ -16125,7 +16125,7 @@ fn emitMirTerminatorLlvm(
     }
 }
 
-/// Emits `.ret` inside `@_cx_coro_poll_<body_idx>`, writing ready output and marking state completed/cancelled.
+/// Emits `.ret` inside `@_cx_coro_poll_<body_idx>`, writing ready output and marking state completed/canceled.
 fn emitCoroPollRetTerminatorLlvm(
     emitter: *LlvmModuleEmitter,
     state: *BodyEmitState,

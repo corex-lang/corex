@@ -289,13 +289,13 @@ const InboundFrame = union(enum) {
     content_too_large: bool,
 };
 
-/// Fixed 256-slot ring buffer storing pre-drained `$/cancelRequest` IDs (`MAX_CANCELLED_REQUEST_IDS`).
-const CancelledRequestRing = struct {
+/// Fixed 256-slot ring buffer storing pre-drained `$/cancelRequest` IDs (`MAX_CANCELED_REQUEST_IDS`).
+const CanceledRequestRing = struct {
     /// Inline storage for string request IDs (`<= 120` raw bytes or 67-byte `"b3:<hex>"` BLAKE3 key).
     const Slot = struct {
         /// `true` when this ring slot holds an active unconsumed cancellation ID.
         is_active: bool = false,
-        /// `true` when cancelling a string ID; `false` when cancelling an integer ID.
+        /// `true` when canceling a string ID; `false` when canceling an integer ID.
         is_string: bool = false,
         /// `true` when `str_buf` stores `"b3:" ++ hex(blake3(id_str))` for `id_str.len > 120`.
         is_hashed_string: bool = false,
@@ -316,8 +316,8 @@ const CancelledRequestRing = struct {
     };
 
     /// Fixed-capacity circular slot array.
-    slots: [MAX_CANCELLED_REQUEST_IDS]Slot = @splat(.{}),
-    /// Next write cursor (`0 .. MAX_CANCELLED_REQUEST_IDS - 1`).
+    slots: [MAX_CANCELED_REQUEST_IDS]Slot = @splat(.{}),
+    /// Next write cursor (`0 .. MAX_CANCELED_REQUEST_IDS - 1`).
     write_cursor: usize = 0,
 
     /// Formats `id_str` into an inline key (`"b3:" ++ hex` via `Blake3` when `id_str.len > 120`).
@@ -333,8 +333,8 @@ const CancelledRequestRing = struct {
         return .{ .key = hash_key_buf[0..67], .is_hashed = true };
     }
 
-    /// Records string request ID `id_str` as cancelled without heap allocation.
-    pub fn recordStringId(self: *CancelledRequestRing, id_str: []const u8) void {
+    /// Records string request ID `id_str` as canceled without heap allocation.
+    pub fn recordStringId(self: *CanceledRequestRing, id_str: []const u8) void {
         var hash_key_buf: [67]u8 = undefined;
         const encoded = formatStringKey(id_str, &hash_key_buf);
         var slot = Slot{
@@ -345,11 +345,11 @@ const CancelledRequestRing = struct {
         };
         @memcpy(slot.str_buf[0..encoded.key.len], encoded.key);
         self.slots[self.write_cursor] = slot;
-        self.write_cursor = (self.write_cursor + 1) % MAX_CANCELLED_REQUEST_IDS;
+        self.write_cursor = (self.write_cursor + 1) % MAX_CANCELED_REQUEST_IDS;
     }
 
-    /// Consumes and returns `true` if string request ID `id_str` was previously cancelled.
-    pub fn takeCancelledString(self: *CancelledRequestRing, id_str: []const u8) bool {
+    /// Consumes and returns `true` if string request ID `id_str` was previously canceled.
+    pub fn takeCanceledString(self: *CanceledRequestRing, id_str: []const u8) bool {
         var hash_key_buf: [67]u8 = undefined;
         const encoded = formatStringKey(id_str, &hash_key_buf);
         for (&self.slots) |*slot| {
@@ -365,8 +365,8 @@ const CancelledRequestRing = struct {
         return false;
     }
 
-    /// Records `req_id` as cancelled in $O(1)$ time, overwriting the oldest slot when full.
-    pub fn insert(self: *CancelledRequestRing, req_id: JsonRpcId) void {
+    /// Records `req_id` as canceled in $O(1)$ time, overwriting the oldest slot when full.
+    pub fn insert(self: *CanceledRequestRing, req_id: JsonRpcId) void {
         switch (req_id) {
             .int_id => |int_val| {
                 self.slots[self.write_cursor] = .{
@@ -374,15 +374,15 @@ const CancelledRequestRing = struct {
                     .is_string = false,
                     .int_val = int_val,
                 };
-                self.write_cursor = (self.write_cursor + 1) % MAX_CANCELLED_REQUEST_IDS;
+                self.write_cursor = (self.write_cursor + 1) % MAX_CANCELED_REQUEST_IDS;
             },
             .string_id => |str_val| self.recordStringId(str_val),
             .missing, .null_id => {},
         }
     }
 
-    /// Checks whether `req_id` was cancelled and consumes the matching slot if present.
-    pub fn consumeIfCancelled(self: *CancelledRequestRing, req_id: JsonRpcId) bool {
+    /// Checks whether `req_id` was canceled and consumes the matching slot if present.
+    pub fn consumeIfCanceled(self: *CanceledRequestRing, req_id: JsonRpcId) bool {
         switch (req_id) {
             .int_id => |int_val| {
                 for (&self.slots) |*slot| {
@@ -392,7 +392,7 @@ const CancelledRequestRing = struct {
                     }
                 }
             },
-            .string_id => |str_val| return self.takeCancelledString(str_val),
+            .string_id => |str_val| return self.takeCanceledString(str_val),
             .missing, .null_id => {},
         }
         return false;
@@ -782,7 +782,7 @@ pub const LspSession = struct {
     /// Dual-bounded $O(1)$ LRU cache for semantic token delta snapshots.
     semantic_tokens_cache: SemanticTokensCache,
     /// 256-slot priority pre-drain ring buffer for `$/cancelRequest` IDs.
-    cancelled_ring: CancelledRequestRing = .{},
+    canceled_ring: CanceledRequestRing = .{},
     /// Current protocol lifecycle state.
     state: LifecycleState = .uninitialized,
     /// Negotiated column encoding (`utf-8` preferred when client supports it, else `utf-16`).
@@ -1002,7 +1002,7 @@ pub const MAX_INLAY_HINTS: usize = 1024;
 /// Maximum number of `CodeAction`s returned by `textDocument/codeAction` (`64`).
 pub const MAX_CODE_ACTIONS: usize = 64;
 /// Capacity of the `$/cancelRequest` ID ring buffer (`256`).
-pub const MAX_CANCELLED_REQUEST_IDS: usize = 256;
+pub const MAX_CANCELED_REQUEST_IDS: usize = 256;
 /// Maximum number of buffered inbound frames pre-drained per turn (`64`).
 pub const MAX_BATCHED_INBOUND_FRAMES: usize = 64;
 
@@ -1028,9 +1028,9 @@ const LSP_SERVER_NOT_INITIALIZED: i32 = -32002;
 /// LSP 3.17 semantic or hygiene failure (`-32803`).
 const LSP_REQUEST_FAILED: i32 = -32803;
 /// LSP 3.17 server-initiated cancellation (`-32802`).
-const LSP_SERVER_CANCELLED: i32 = -32802;
+const LSP_SERVER_CANCELED: i32 = -32802;
 /// LSP 3.17 client-initiated `$/cancelRequest` cancellation (`-32800`).
-const LSP_REQUEST_CANCELLED: i32 = -32800;
+const LSP_REQUEST_CANCELED: i32 = -32800;
 
 // ----------- Semantic Token Legend & Modifier Bits ------------
 
@@ -3152,7 +3152,7 @@ fn collectFileDiagnostics(
 
     // [1] Run all per-`DefId` signature/body/SAST/`comptime` queries first without retaining HashMap pointers:
     for (entries) |entry| {
-        try session.db.unwindIfCancelled();
+        try session.db.unwindIfCanceled();
         _ = try session.db.getDefSignature(entry.def_id);
         switch (entry.kind) {
             .mod_decl, .use_decl, .ffi_extern_block => {},
@@ -3162,7 +3162,7 @@ fn collectFileDiagnostics(
                 if (entry.kind == .const_decl or entry.kind == .extern_block) {
                     _ = session.db.evalComptimeDef(entry.def_id) catch |ct_err| switch (ct_err) {
                         error.OutOfMemory => return error.OutOfMemory,
-                        error.Cancelled => return error.Cancelled,
+                        error.Canceled => return error.Canceled,
                         else => {},
                     };
                 }
@@ -3542,7 +3542,7 @@ fn computeSemanticTokensData(
 
     // Map AST nodes and MVS move/mutation sites from per-`DefId` `BodySemanticSideTables`:
     for (entries) |entry| {
-        try session.db.unwindIfCancelled();
+        try session.db.unwindIfCanceled();
         switch (entry.kind) {
             .mod_decl, .use_decl, .ffi_extern_block => continue,
             else => {},
@@ -5687,7 +5687,7 @@ fn handleReferencesRequest(
 
         for (session.mounted_files.items) |cand_fid| {
             if (hits.items.len >= MAX_REFERENCES) break;
-            try session.db.unwindIfCancelled();
+            try session.db.unwindIfCanceled();
 
             const cand_src = getLiveDocumentSource(session, cand_fid) orelse continue;
             // Fast raw-byte pre-filter BEFORE resolving signatures or body side tables:
@@ -5981,7 +5981,7 @@ fn handleWorkspaceSymbolRequest(
     var candidates: std.ArrayListUnmanaged(WorkspaceSymbolCandidate) = .empty;
 
     for (session.mounted_files.items) |cand_fid| {
-        try session.db.unwindIfCancelled();
+        try session.db.unwindIfCanceled();
         const pkg_id = session.db.symbol_table.getFilePackageId(cand_fid);
         if (pkg_id == .std_core and !session.options.is_internal_core) continue;
 
@@ -8448,7 +8448,7 @@ fn handleRenameRequest(
     } else {
         const decl_fid = target_sym.decl_span.file_id;
         for (session.mounted_files.items) |cand_fid| {
-            try session.db.unwindIfCancelled();
+            try session.db.unwindIfCanceled();
             if (session.db.symbol_table.getFilePackageId(cand_fid) != .root) continue;
             if (cand_fid.asInt() >= query_db.VIRTUAL_C_IMPORT_FILE_ID_BASE) continue;
             if (session.db.source_inputs.get(cand_fid.asInt())) |in_rec| {
@@ -8641,8 +8641,8 @@ fn dispatchSingleJsonMessage(
     }
 
     // Check pre-drained `$/cancelRequest` ring buffer before running any query work:
-    if (!is_notification and session.cancelled_ring.consumeIfCancelled(rpc_id)) {
-        return sendJsonRpcError(session, out_writer, rpc_id, LSP_REQUEST_CANCELLED, "request cancelled by client");
+    if (!is_notification and session.canceled_ring.consumeIfCanceled(rpc_id)) {
+        return sendJsonRpcError(session, out_writer, rpc_id, LSP_REQUEST_CANCELED, "request canceled by client");
     }
 
     const method_tag = method_opt orelse {
@@ -8699,7 +8699,7 @@ fn dispatchSingleJsonMessage(
         },
         .cancel_request => {
             if (extractJsonRpcId(params) catch null) |cancel_id| {
-                session.cancelled_ring.insert(cancel_id);
+                session.canceled_ring.insert(cancel_id);
             }
         },
         .did_open => handleDidOpenNotification(session, arena_alloc, params, out_writer),
@@ -8743,14 +8743,14 @@ fn dispatchSingleJsonMessage(
     };
 
     dispatch_res catch |err| switch (err) {
-        error.Cancelled => {
+        error.Canceled => {
             session.db.clearCancellation();
             if (!is_notification) {
-                const cancel_code: i32 = if (session.cancelled_ring.consumeIfCancelled(rpc_id))
-                    LSP_REQUEST_CANCELLED
+                const cancel_code: i32 = if (session.canceled_ring.consumeIfCanceled(rpc_id))
+                    LSP_REQUEST_CANCELED
                 else
-                    LSP_SERVER_CANCELLED;
-                try sendJsonRpcError(session, out_writer, rpc_id, cancel_code, "request cancelled");
+                    LSP_SERVER_CANCELED;
+                try sendJsonRpcError(session, out_writer, rpc_id, cancel_code, "request canceled");
             }
         },
         error.OutOfMemory => return error.OutOfMemory,
@@ -8806,7 +8806,7 @@ fn drainAndDispatchInboundTurn(
         if (std.mem.eql(u8, batch[i].method_str, "$/cancelRequest")) {
             if (batch[i].json_root.getField("params")) |cancel_params| {
                 if (extractJsonRpcId(cancel_params) catch null) |cancel_id| {
-                    session.cancelled_ring.insert(cancel_id);
+                    session.canceled_ring.insert(cancel_id);
                 }
             }
             batch[i].is_consumed = true;
@@ -9376,15 +9376,15 @@ test "test_lsp_pipelined_cancel_request_and_semantic_tokens_lru_cache" {
 
         const frames = try extractTestOutboundPayloads(allocator, out_alloc.written());
         defer allocator.free(frames);
-        var has_seen_cancelled_7 = false;
+        var has_seen_canceled_7 = false;
         for (frames) |frame_json| {
             if (std.mem.indexOf(u8, frame_json, "\"id\":7") != null and
                 std.mem.indexOf(u8, frame_json, "-32800") != null)
             {
-                has_seen_cancelled_7 = true;
+                has_seen_canceled_7 = true;
             }
         }
-        try std.testing.expect(has_seen_cancelled_7);
+        try std.testing.expect(has_seen_canceled_7);
     }
 }
 

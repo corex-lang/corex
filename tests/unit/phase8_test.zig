@@ -69,7 +69,7 @@ const SimBarrierState = struct {
         state_ptr.cancel_calls += 1;
     }
 
-    /// Emits the terminal cancelled CQE into `cqes_out[0]`.
+    /// Emits the terminal canceled CQE into `cqes_out[0]`.
     fn onPollOrPark(
         raw_ctx: *sim_seam.ReactorCtx,
         cqes_out: [*]sim_seam.ReactorCqe,
@@ -834,7 +834,7 @@ test "test_phase8_four_tier_async_await_frame_pinned_task_group_cancel_and_conte
         "        let _join_bg = sibling_bg.join();\n" ++
         "        cx.async.yield_now().await;\n" ++
         "        grp.cancel_all();\n" ++
-        "        if grp.is_cancelled() { 3 } else { 0 }\n" ++
+        "        if grp.is_canceled() { 3 } else { 0 }\n" ++
         "    }).await;\n" ++
         "    return pinned_local + pinned_res + inline_block_val + fanout_sum + cancel_bonus - 24;\n" ++
         "}\n\n" ++

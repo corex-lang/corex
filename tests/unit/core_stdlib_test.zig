@@ -739,7 +739,7 @@ test "test_core_ffi_and_async_cross_target_layouts_and_object_emission" {
         "        .Some(valid_cstr) => valid_cstr.count_bytes(),\n" ++
         "        .None => 0,\n" ++
         "    };\n" ++
-        "    if poll_item.is_ready() and cancel_tok.is_cancelled() {\n" ++
+        "    if poll_item.is_ready() and cancel_tok.is_canceled() {\n" ++
         "        return cstr_len + hdr.poll_fn;\n" ++
         "    }\n" ++
         "    return 0;\n" ++
@@ -924,9 +924,9 @@ test "test_core_ffi_cstr_and_async_nursery_four_tier_differential_oracle" {
         "    noop_waker.wake();\n" ++
         "    var cancel_src = CancelSource.new();\n" ++
         "    let tok_view = cancel_src.as_token();\n" ++
-        "    assert_true(not cancel_src.is_cancelled() and not tok_view.is_cancelled(), \"init active\");\n" ++
+        "    assert_true(not cancel_src.is_canceled() and not tok_view.is_canceled(), \"init active\");\n" ++
         "    cancel_src.cancel();\n" ++
-        "    assert_true(cancel_src.is_cancelled() and tok_view.is_cancelled(), \"cancelled view\");\n" ++
+        "    assert_true(cancel_src.is_canceled() and tok_view.is_canceled(), \"canceled view\");\n" ++
         "    return block_on(own async_compute_pipeline(cstr_len + empty_ok));\n" ++
         "}\n";
 

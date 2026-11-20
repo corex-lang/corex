@@ -13686,7 +13686,7 @@ const HirLowerer = struct {
                 tok,
             )) |async_static_hir| return async_static_hir;
         } else {
-            // Structured `TaskGroup` (`spawn`, `spawn_local`, `cancel_all`, `is_cancelled`) and `TaskHandle` (`join`, `cancel`):
+            // Structured `TaskGroup` (`spawn`, `spawn_local`, `cancel_all`, `is_canceled`) and `TaskHandle` (`join`, `cancel`):
             if (try self.tryLowerTaskGroupOrHandleMethod(
                 expr_id,
                 recv_id,
@@ -15280,7 +15280,7 @@ const HirLowerer = struct {
         return false;
     }
 
-    /// Lowers `TaskGroup` (`spawn`, `spawn_local`, `cancel_all`, `is_cancelled`) and `TaskHandle` (`join`, `cancel`) calls.
+    /// Lowers `TaskGroup` (`spawn`, `spawn_local`, `cancel_all`, `is_canceled`) and `TaskHandle` (`join`, `cancel`) calls.
     fn tryLowerTaskGroupOrHandleMethod(
         self: *HirLowerer,
         expr_id: NodeIndex,
@@ -15358,7 +15358,7 @@ const HirLowerer = struct {
                     expr_id,
                 );
             }
-            if (std.mem.eql(u8, member_name, "is_cancelled")) {
+            if (std.mem.eql(u8, member_name, "is_canceled")) {
                 const raw_group_hir = try self.lowerPlaceWithMutCtx(recv_id, .err_ty, false);
                 const group_ref_hir = try self.reborrowOrAddrOfTaskGroup(raw_group_hir, false, tok);
                 const query_flag = try self.emitConstVal(.{ .int_val = 1 }, .u32_ty, tok, .none, true);

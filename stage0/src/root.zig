@@ -742,7 +742,7 @@ pub const runFourTierDiffOracleOnDb = diff_oracle.runFourTierDiffOracleOnDb;
 pub const runFourTierDiffOracle = diff_oracle.runFourTierDiffOracle;
 /// Hard `16 KiB` inline stackless coroutine frame budget (`DR-08` §2.3, `E0317`).
 pub const ASYNC_INLINE_FRAME_CAP_BYTES = mir_async.ASYNC_INLINE_FRAME_CAP_BYTES;
-/// Canonical stackless coroutine state discriminant (`unpolled`, `1..K`, `completed`, `cancelled`).
+/// Canonical stackless coroutine state discriminant (`unpolled`, `1..K`, `completed`, `canceled`).
 pub const CoroStateTag = mir_async.CoroStateTag;
 /// 24-byte `.coro_suspend` state-machine transition metadata (`DR-08` §2.2).
 pub const SuspendPointMeta = mir_async.SuspendPointMeta;

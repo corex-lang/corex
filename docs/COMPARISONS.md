@@ -95,7 +95,7 @@ CoreX systematically adopts the highest-leverage ergonomic wins from Python, Swi
 ### 3.8 `Pin`-Free `16 KiB` Stackless `async`/`await` & `@linear` `TaskGroup` Nurseries (`[Live]`)
 
 -   **Zero-Heap-Per-Await State Machines (`E0317`):** `async fn` and `async` blocks lower into liveness-colored stackless frames with `FramePinned` interior-borrow stability (no `Pin<&mut Self>` boilerplate) and a static `<= 16 KiB` inline frame cap (`E0317`).
--   **Lexical `@linear` `cx.async.task_group` Nurseries (`E0309`):** Spawned `TaskHandle[T]` values are `@linear` obligations (`E0304` if forgotten on normal exit, automatically cancelled and reaped on `?` error or parent cancellation), while SAST proves concurrent borrow exclusivity, `Send`/`Sync`/`@thread_local` safety, and zero parent-scope escapes (`E0309`).
+-   **Lexical `@linear` `cx.async.task_group` Nurseries (`E0309`):** Spawned `TaskHandle[T]` values are `@linear` obligations (`E0304` if forgotten on normal exit, automatically canceled and reaped on `?` error or parent cancellation), while SAST proves concurrent borrow exclusivity, `Send`/`Sync`/`@thread_local` safety, and zero parent-scope escapes (`E0309`).
 
 ### 3.9 Built-In `< 10 ms` Language Server, Capability Auditor & Zero-Legacy Migration Suite (`[Live]`)
 

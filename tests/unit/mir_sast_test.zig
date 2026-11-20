@@ -3107,13 +3107,13 @@ test "test_regression_context_handle_escape_e0306_and_allocator_slot_isolation" 
     // [3] Escaping `context.cancel_token` from `with context.cancel_token = &local_tok` emits `E0306`:
     const cancel_escape_src =
         \\pub struct LocalCancel {
-        \\    pub is_cancelled: bool,
+        \\    pub is_canceled: bool,
         \\}
         \\impl LocalCancel {
         \\    pub fn as_handle(&self) -> usize = 0;
         \\}
         \\pub fn escape_cancel_token() -> CancelToken {
-        \\    let local_tok = LocalCancel { is_cancelled: false };
+        \\    let local_tok = LocalCancel { is_canceled: false };
         \\    with context.cancel_token = &local_tok {
         \\        return context.cancel_token;
         \\    }

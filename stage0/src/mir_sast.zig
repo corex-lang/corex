@@ -9490,7 +9490,7 @@ fn runPass2TypestateNllAndDrops(
                                 .{
                                     .span = inst_span,
                                     .label = if (is_coro_cancel)
-                                        "task may be cancelled while suspended at `.await` before consuming resource"
+                                        "task may be canceled while suspended at `.await` before consuming resource"
                                     else if (is_err_pad)
                                         "resource remains unconsumed on error unwind here"
                                     else

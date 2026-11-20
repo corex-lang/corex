@@ -670,7 +670,7 @@ pub const VmEvalError = error{
     /// Target callee `MirBody` could not be resolved.
     UnresolvedCallee,
     /// Cooperative query cancellation (`DR-12` §3.3).
-    Cancelled,
+    Canceled,
     /// Host allocator ran out of memory.
     OutOfMemory,
 };
@@ -735,7 +735,7 @@ const VmFutureKind = enum(u64) {
     yield_once = 2,
     /// `TaskHandle[T].join()` future awaiting spawned task completion (`3`).
     join_task = 3,
-    /// `TaskHandle[T].cancel()` future cancelling a spawned task (`4`).
+    /// `TaskHandle[T].cancel()` future canceling a spawned task (`4`).
     cancel_task = 4,
 };
 
@@ -761,7 +761,7 @@ const VmContextSnapshot = struct {
 const VmCoroFrame = struct {
     /// Target `is_async` `MirBody`.
     body: *const MirBody,
-    /// Current `CoroStateTag` (`unpolled = 0`, `1..K`, `completed`, `cancelled`).
+    /// Current `CoroStateTag` (`unpolled = 0`, `1..K`, `completed`, `canceled`).
     state: mir_async.CoroStateTag = .unpolled,
     /// Persistent SSA register file across suspensions.
     regs: []RegSlot = &.{},
@@ -779,7 +779,7 @@ const VmCoroFrame = struct {
     active_ready_ty: TypeId = .unit_ty,
     /// Target `resume_bb` receiving `%ready_val` when `active_child_fut_ptr` completes.
     active_resume_bb: MirBlockId = .none,
-    /// Target `cancel_bb` cleanup pad executed if cancelled at this suspension point.
+    /// Target `cancel_bb` cleanup pad executed if canceled at this suspension point.
     active_cancel_bb: MirBlockId = .none,
     /// `true` once frame buffers and owned local allocations have been released.
     is_released: bool = false,
@@ -799,10 +799,10 @@ const VmTaskNode = struct {
     result_slot: RegSlot = .{ .scalar_u64 = 0 },
     /// Task-isolated 10-slot `Context` state saved/restored across polls.
     ctx_snapshot: VmContextSnapshot = .{},
-    /// `true` once the task has finished (`Ready` or `Cancelled`).
+    /// `true` once the task has finished (`Ready` or `Canceled`).
     is_completed: bool = false,
-    /// `true` if cancelled before or during execution.
-    is_cancelled: bool = false,
+    /// `true` if canceled before or during execution.
+    is_canceled: bool = false,
     /// `true` while parked on another task's `join_waiter_item`.
     is_parked_on_join: bool = false,
     /// Waiting executor item (`0` = root `block_on` task, `task_idx + 1` = spawned task, `maxInt(u32)` = none).
@@ -814,7 +814,7 @@ const VmTaskGroup = struct {
     /// Spawned `VmTaskNode` indices in registration order (`LIFO` reverse order on cancellation).
     task_ids: std.ArrayListUnmanaged(u32) = .empty,
     /// `true` once `cancel_all()`, sibling `Err`, or parent cancellation triggers group-wide cancellation.
-    is_cancelled: bool = false,
+    is_canceled: bool = false,
     /// `true` once `async_task_group_exit` has drained/reaped this group.
     is_exited: bool = false,
 };
@@ -1378,7 +1378,7 @@ pub const MirVm = struct {
     /// Currently polling executor item (`0` = root, `task_id + 1` = spawned task, `maxInt(u32)` = none).
     active_polling_item: u32 = std.math.maxInt(u32),
     /// `true` while executing a coroutine `cancel_bb` cleanup pad so `async_task_group_exit` cancels children.
-    is_active_coro_cancelling: bool = false,
+    is_active_coro_canceling: bool = false,
 
     /// Initializes a `MirVm` instance with reserved slot `0` (`.null_ptr`) in `allocations`.
     pub fn init(
@@ -3006,7 +3006,7 @@ pub const MirVm = struct {
     fn mapDbQueryError(self: *MirVm, err: query_db.QueryError) VmEvalError {
         return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
-            error.Cancelled => error.Cancelled,
+            error.Canceled => error.Canceled,
             error.DependencyCycle => self.failWithTrap(
                 error.EvaluationCycle,
                 .e0509_comptime_evaluation_cycle,
@@ -8609,7 +8609,7 @@ pub const MirVm = struct {
         };
     }
 
-    /// Evaluates `async_cancel` (`handle.cancel()`, `group.cancel_all()`, and `group.is_cancelled()`).
+    /// Evaluates `async_cancel` (`handle.cancel()`, `group.cancel_all()`, and `group.is_canceled()`).
     fn evalAsyncCancel(
         self: *MirVm,
         frame_idx: usize,
@@ -8619,12 +8619,12 @@ pub const MirVm = struct {
         if (args.len < 1) return .{ .scalar_u64 = 0 };
         const ret_ty = self.pool.unwrapUnderlyingType(ret_raw_ty);
 
-        // [1] `group.is_cancelled()` (`args.len >= 2`, returns `bool`):
+        // [1] `group.is_canceled()` (`args.len >= 2`, returns `bool`):
         if (args.len >= 2 or ret_ty == .bool_ty) {
             const group_ref_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
             const group_handle = try self.readPointerAt(group_ref_ptr, self.options.target_layout.ptr_align_log2);
             const group_id = group_handle.byte_offset -| 1;
-            const is_canc = group_id < self.task_groups.items.len and self.task_groups.items[group_id].is_cancelled;
+            const is_canc = group_id < self.task_groups.items.len and self.task_groups.items[group_id].is_canceled;
             return .{ .scalar_u64 = @intFromBool(is_canc) };
         }
 
@@ -8645,7 +8645,7 @@ pub const MirVm = struct {
     /// Cancels all uncompleted sibling tasks in `group_id` in reverse registration (`LIFO`) order.
     fn cancelAllTasksInGroup(self: *MirVm, group_id: u32) VmEvalError!void {
         if (group_id >= self.task_groups.items.len) return;
-        self.task_groups.items[group_id].is_cancelled = true;
+        self.task_groups.items[group_id].is_canceled = true;
         var rev_idx = self.task_groups.items[group_id].task_ids.items.len;
         while (rev_idx > 0) {
             rev_idx -= 1;
@@ -8658,8 +8658,8 @@ pub const MirVm = struct {
     /// Cancels a single `VmTaskNode` (`state == 0` drops captured args; `state in 1..K` runs `cancel_bb`).
     fn cancelSpawnedTask(self: *MirVm, task_id: u32) VmEvalError!void {
         if (task_id >= self.task_nodes.items.len) return;
-        if (self.task_nodes.items[task_id].is_completed or self.task_nodes.items[task_id].is_cancelled) return;
-        self.task_nodes.items[task_id].is_cancelled = true;
+        if (self.task_nodes.items[task_id].is_completed or self.task_nodes.items[task_id].is_canceled) return;
+        self.task_nodes.items[task_id].is_canceled = true;
         self.task_nodes.items[task_id].is_completed = true;
 
         const saved_ctx = self.captureContextSnapshot();
@@ -8709,11 +8709,11 @@ pub const MirVm = struct {
     fn cancelCoroFrame(self: *MirVm, coro_id: u32) VmEvalError!void {
         if (coro_id >= self.coro_frames.items.len) return;
         const cur_state = self.coro_frames.items[coro_id].state;
-        if (cur_state == .completed or cur_state == .cancelled or self.coro_frames.items[coro_id].is_released) return;
+        if (cur_state == .completed or cur_state == .canceled or self.coro_frames.items[coro_id].is_released) return;
 
         const body = self.coro_frames.items[coro_id].body;
         if (cur_state == .unpolled) {
-            self.coro_frames.items[coro_id].state = .cancelled;
+            self.coro_frames.items[coro_id].state = .canceled;
             var rev_param: usize = body.param_count;
             while (rev_param > 0) {
                 const param_decl = body.locals.items[rev_param];
@@ -8730,13 +8730,13 @@ pub const MirVm = struct {
         const child_ptr = self.coro_frames.items[coro_id].active_child_fut_ptr;
         const child_ty = self.coro_frames.items[coro_id].active_child_fut_ty;
         const cancel_bb = self.coro_frames.items[coro_id].active_cancel_bb;
-        self.coro_frames.items[coro_id].state = .cancelled;
+        self.coro_frames.items[coro_id].state = .canceled;
 
         try self.cancelFutureAtPtr(child_ptr, child_ty);
         if (!cancel_bb.isNone()) {
-            const prev_cancelling = self.is_active_coro_cancelling;
-            self.is_active_coro_cancelling = true;
-            defer self.is_active_coro_cancelling = prev_cancelling;
+            const prev_canceling = self.is_active_coro_canceling;
+            self.is_active_coro_canceling = true;
+            defer self.is_active_coro_canceling = prev_canceling;
             _ = try self.runCoroBlocksFrom(coro_id, cancel_bb, true);
         }
         self.releaseCoroFrame(coro_id);
@@ -8756,7 +8756,7 @@ pub const MirVm = struct {
 
         const body = self.call_stack.items[frame_idx].body;
         const cur_bb = self.call_stack.items[frame_idx].cur_bb;
-        var is_err_or_cancel = self.is_active_coro_cancelling or self.task_groups.items[group_id].is_cancelled;
+        var is_err_or_cancel = self.is_active_coro_canceling or self.task_groups.items[group_id].is_canceled;
         if (!is_err_or_cancel and cur_bb.asInt() < body.blocks.items.len) {
             const bb_rec = body.blocks.items[cur_bb.asInt()];
             if (bb_rec.isCleanupPad()) {
@@ -8796,7 +8796,7 @@ pub const MirVm = struct {
                     if (!self.task_nodes.items[task_id].is_parked_on_join) {
                         has_progressed = true;
                         try self.stepSpawnedTaskOnce(task_id);
-                        if (self.task_groups.items[group_id].is_cancelled) {
+                        if (self.task_groups.items[group_id].is_canceled) {
                             try self.cancelAllTasksInGroup(group_id);
                             self.task_groups.items[group_id].is_exited = true;
                             return;
@@ -9023,7 +9023,7 @@ pub const MirVm = struct {
                 var res_slot = self.task_nodes.items[task_id].result_slot;
                 const unwrapped_out = self.pool.unwrapUnderlyingType(out_ty);
                 if (!unwrapped_out.isError() and
-                    self.task_nodes.items[task_id].is_cancelled and
+                    self.task_nodes.items[task_id].is_canceled and
                     res_slot.scalar_u64 == 0 and
                     classifyValueRepr(self.pool, self.sym_table, unwrapped_out, self.options.target_layout) ==
                         .by_value_snapshot)
@@ -9067,7 +9067,7 @@ pub const MirVm = struct {
     ) VmEvalError!VmPollOutcome {
         if (coro_id >= self.coro_frames.items.len) return .{ .ready = .{ .scalar_u64 = 0 } };
         const cur_state = self.coro_frames.items[coro_id].state;
-        if (cur_state == .completed or cur_state == .cancelled) return .{ .ready = .{ .scalar_u64 = 0 } };
+        if (cur_state == .completed or cur_state == .canceled) return .{ .ready = .{ .scalar_u64 = 0 } };
 
         var entry_bb = MirBlockId.fromInt(0);
         if (cur_state.isSuspended()) {
@@ -9107,7 +9107,7 @@ pub const MirVm = struct {
         self: *MirVm,
         coro_id: u32,
         start_bb: MirBlockId,
-        is_cancelling: bool,
+        is_canceling: bool,
     ) VmEvalError!VmPollOutcome {
         const body = self.coro_frames.items[coro_id].body;
         if (body.blocks.items.len == 0) return .{ .ready = .{ .scalar_u64 = 0 } };
@@ -9202,7 +9202,7 @@ pub const MirVm = struct {
                     };
                 },
                 .ret => {
-                    if (is_cancelling) return .{ .ready = .{ .scalar_u64 = 0 } };
+                    if (is_canceling) return .{ .ready = .{ .scalar_u64 = 0 } };
                     if (term.cond_or_val != mir.NONE_U32) {
                         return .{ .ready = self.call_stack.items[frame_idx].regs[term.cond_or_val] };
                     }
@@ -12031,7 +12031,7 @@ pub fn evalHirSubtreeWithMirVm(
             if (has_e0325) return null;
         } else |sast_err| switch (sast_err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.Cancelled => return error.Cancelled,
+            error.Canceled => return error.Canceled,
             else => {},
         }
     }
@@ -12057,13 +12057,13 @@ pub fn evalHirSubtreeWithMirVm(
 
     const eval_res = vm.evalBody(&wrapper_body, &.{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.Cancelled => return error.Cancelled,
+        error.Canceled => return error.Canceled,
         error.EvaluationCycle => return error.EvaluationCycle,
         else => return null,
     };
     return vm.resultToComptimeValue(eval_res, out_const_store) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.Cancelled => return error.Cancelled,
+        error.Canceled => return error.Canceled,
         error.EvaluationCycle => return error.EvaluationCycle,
         else => return null,
     };

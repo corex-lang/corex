@@ -466,7 +466,7 @@ pub const ActiveQueryFrame = struct {
 /// Error set returned by demand-driven queries in `CompilerDb`.
 pub const QueryError = error{
     /// Cooperative cancellation was requested via `requestCancellation()`.
-    Cancelled,
+    Canceled,
     /// A cyclic query dependency was detected on the active execution stack.
     DependencyCycle,
     /// Queried `FileId` has not been registered via `setInput()`.
@@ -4041,7 +4041,7 @@ pub const CompilerDb = struct {
     /// Latest `Revision` that mutated any input at or above each `Durability` tier (`0..2`).
     last_changed_by_durability: [DURABILITY_COUNT]Revision = .{ .initial, .initial, .initial },
     /// Cooperative cancellation flag checked before query evaluation and verification steps.
-    is_cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    is_canceled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Monotonic cancellation counter bumped whenever `requestCancellation` is called.
     cancellation_epoch: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// Flat memo table mapping `QueryKey.asU64()` to its 40-byte `MemoHeader` value.
@@ -4369,25 +4369,25 @@ pub const CompilerDb = struct {
 
     // ------------ Cancellation & Hook Control Methods -------------
 
-    /// Signals cooperative cancellation so in-flight queries unwind with `error.Cancelled`.
+    /// Signals cooperative cancellation so in-flight queries unwind with `error.Canceled`.
     pub inline fn requestCancellation(self: *CompilerDb) void {
         _ = self.cancellation_epoch.fetchAdd(1, .seq_cst);
-        self.is_cancelled.store(true, .release);
+        self.is_canceled.store(true, .release);
     }
 
     /// Clears the cooperative cancellation flag so subsequent queries can execute.
     pub inline fn clearCancellation(self: *CompilerDb) void {
-        self.is_cancelled.store(false, .release);
+        self.is_canceled.store(false, .release);
     }
 
     /// Returns `true` if cooperative cancellation is currently active.
-    pub inline fn isCancelled(self: *const CompilerDb) bool {
-        return self.is_cancelled.load(.acquire);
+    pub inline fn isCanceled(self: *const CompilerDb) bool {
+        return self.is_canceled.load(.acquire);
     }
 
-    /// Returns `error.Cancelled` if cooperative cancellation has been requested (`DR-12` Section 3.3).
-    pub inline fn unwindIfCancelled(self: *const CompilerDb) QueryError!void {
-        if (self.isCancelled()) return error.Cancelled;
+    /// Returns `error.Canceled` if cooperative cancellation has been requested (`DR-12` Section 3.3).
+    pub inline fn unwindIfCanceled(self: *const CompilerDb) QueryError!void {
+        if (self.isCanceled()) return error.Canceled;
     }
 
     /// Installs or clears an optional `CustomStageHook` for deterministic cycle testing.
@@ -7144,7 +7144,7 @@ pub const CompilerDb = struct {
             break :blk scratch_sink.error_count == 0;
         } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.Cancelled => return error.Cancelled,
+            error.Canceled => return error.Canceled,
             else => false,
         };
 
@@ -7358,7 +7358,7 @@ pub const CompilerDb = struct {
             },
             active_opt_sink,
         ) catch |opt_err| switch (opt_err) {
-            error.Cancelled => return error.Cancelled,
+            error.Canceled => return error.Canceled,
             else => return error.OutOfMemory,
         };
         defer multi_opt.deinit();
@@ -7399,7 +7399,7 @@ pub const CompilerDb = struct {
                 if (!has_front_errors and (entry.kind == .const_decl or entry.kind == .extern_block)) {
                     const ct_art = self.evalComptimeDef(entry.def_id) catch |ct_err| switch (ct_err) {
                         error.OutOfMemory => return error.OutOfMemory,
-                        error.Cancelled => return error.Cancelled,
+                        error.Canceled => return error.Canceled,
                         else => {
                             has_front_errors = true;
                             continue;
@@ -7524,7 +7524,7 @@ pub const CompilerDb = struct {
     ) QueryError!?hir.ComptimeValue {
         const artifact = self.evalComptimeDef(def_id) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.Cancelled => return error.Cancelled,
+            error.Canceled => return error.Canceled,
             error.DependencyCycle => {
                 if (sink) |out_sink| {
                     try self.emitComptimeCycleIntoSink(out_sink, def_id);
@@ -7565,7 +7565,7 @@ pub const CompilerDb = struct {
             mutable_store,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.Cancelled => return error.Cancelled,
+            error.Canceled => return error.Canceled,
             error.EvaluationCycle => return error.DependencyCycle,
         };
     }
@@ -7579,7 +7579,7 @@ pub const CompilerDb = struct {
     ) mir_vm.VmEvalError!mir_vm.RegSlot {
         const artifact = self.evalComptimeDef(target_def) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.Cancelled => return error.Cancelled,
+            error.Canceled => return error.Canceled,
             error.DependencyCycle => {
                 return vm.failWithTrap(
                     error.EvaluationCycle,
@@ -7602,7 +7602,7 @@ pub const CompilerDb = struct {
 
     /// Fetches or computes `key`, recording dependency edges and propagating durability to the active caller.
     pub fn fetchQuery(self: *CompilerDb, key: QueryKey) QueryError!MemoHeader {
-        try self.unwindIfCancelled();
+        try self.unwindIfCanceled();
 
         // [1] Record `key` as a direct dependency of the enclosing active query frame:
         if (self.active_stack.items.len > 0) {
@@ -7639,7 +7639,7 @@ pub const CompilerDb = struct {
         key: QueryKey,
         after_revision: Revision,
     ) QueryError!bool {
-        try self.unwindIfCancelled();
+        try self.unwindIfCanceled();
 
         if (self.in_flight_keys.contains(key.asU64())) {
             return error.DependencyCycle;
@@ -7755,7 +7755,7 @@ pub const CompilerDb = struct {
 
     /// Executes `key`, commits its recorded dependency edges, and backdates `changed_at` on Early Cutoff.
     fn executeAndBackdate(self: *CompilerDb, key: QueryKey) QueryError!MemoHeader {
-        try self.unwindIfCancelled();
+        try self.unwindIfCanceled();
 
         if (key.stage == .source_text) {
             if ((key.flags & EMBED_FILE_KEY_FLAG) != 0) {
@@ -7960,7 +7960,7 @@ pub const CompilerDb = struct {
     /// Stage 1 implementation: tokenizes and parses `file_id` into `parsed_artifacts`.
     fn computeParseCst(self: *CompilerDb, file_id: FileId) QueryError!Fingerprint128 {
         const source = try self.getSourceText(file_id);
-        try self.unwindIfCancelled();
+        try self.unwindIfCanceled();
 
         const src_fp = if (self.source_inputs.get(file_id.asInt())) |inp|
             inp.content_fingerprint
@@ -8038,7 +8038,7 @@ pub const CompilerDb = struct {
     /// Stage 2 implementation: builds `LoweredAstArtifact` with trivia-stripped `ast_fingerprint`.
     fn computeLowerAst(self: *CompilerDb, file_id: FileId) QueryError!Fingerprint128 {
         const parsed = try self.parseCst(file_id);
-        try self.unwindIfCancelled();
+        try self.unwindIfCanceled();
 
         const artifact = LoweredAstArtifact{
             .file_id = file_id,
@@ -8105,7 +8105,7 @@ pub const CompilerDb = struct {
     /// Stage 3 implementation: extracts `ItemTree` for `file_id` (depending on `.lower_ast`).
     fn computeItemTree(self: *CompilerDb, file_id: FileId) QueryError!Fingerprint128 {
         const lowered = try self.lowerAst(file_id);
-        try self.unwindIfCancelled();
+        try self.unwindIfCanceled();
         const tree_ptr = try self.ensureFreshItemTree(file_id, lowered);
         return tree_ptr.combined_fingerprint;
     }
@@ -8123,7 +8123,7 @@ pub const CompilerDb = struct {
         if (def_id.isNone()) return error.InvalidDefId;
         const file_id = def_id.fileId();
         const lowered = try self.lowerAst(file_id);
-        try self.unwindIfCancelled();
+        try self.unwindIfCanceled();
 
         const item_tree = try self.ensureFreshItemTree(file_id, lowered);
         const entry = item_tree.getEntry(def_id) orelse return error.InvalidDefId;
@@ -9136,7 +9136,7 @@ pub const CompilerDb = struct {
         const is_core_allowed = self.isCoreAllowedForFile(file_id);
         const pkg_cfg_fp = self.getPackageCfgFingerprint(file_id);
         const eff_cfg = self.resolveCfgEnvForFile(file_id, is_including_tests);
-        try self.unwindIfCancelled();
+        try self.unwindIfCanceled();
 
         var hasher = StructuralHasher.init();
         hasher.updateU32(file_id.asInt());
@@ -9884,7 +9884,7 @@ pub const CompilerDb = struct {
         const file_id = def_id.fileId();
         const item_sig_fp = try self.getItemTreeSigProj(def_id);
         _ = try self.resolveSignatures(file_id);
-        try self.unwindIfCancelled();
+        try self.unwindIfCanceled();
 
         const item_tree = self.item_trees.getPtr(file_id.asInt()) orelse return error.MissingSourceInput;
         const entry = item_tree.getEntry(def_id) orelse return error.InvalidDefId;
@@ -9980,7 +9980,7 @@ pub const CompilerDb = struct {
         const is_core_allowed = self.isCoreAllowedForFile(file_id);
         const pkg_cfg_fp = self.getPackageCfgFingerprint(file_id);
         const eff_cfg = self.resolveCfgEnvForFile(file_id, is_including_tests);
-        try self.unwindIfCancelled();
+        try self.unwindIfCanceled();
 
         var body_err_count: u32 = 0;
         var body_warn_count: u32 = 0;
@@ -10528,7 +10528,7 @@ pub const CompilerDb = struct {
 
         const def_summary = db.getSastSummaryProj(target_def) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.Cancelled => return error.Cancelled,
+            error.Canceled => return error.Canceled,
             error.DependencyCycle => {
                 recordSastCycleOnActiveStack(db, target_def) catch return error.OutOfMemory;
                 return makeConservativeCycleSummary(db, target_def, callee_sym);
@@ -10603,7 +10603,7 @@ pub const CompilerDb = struct {
             active_layout,
             eval_hook,
         ) catch |err| switch (err) {
-            error.Cancelled => return error.Cancelled,
+            error.Canceled => return error.Canceled,
             error.DependencyCycle => return error.DependencyCycle,
             error.MissingSourceInput => return error.MissingSourceInput,
             error.InvalidDefId => return error.InvalidDefId,
@@ -10737,7 +10737,7 @@ pub const CompilerDb = struct {
 
         if ((key.flags & SAST_SUMMARY_PROJ_FLAG) != 0) {
             _ = try self.verifySastMir(def_id);
-            try self.unwindIfCancelled();
+            try self.unwindIfCanceled();
             const summary = self.sast_summaries.get(def_id.asInt()) orelse mir_sast.FnRegionSummary{};
             var obs_bytes: [34]u8 = undefined;
             summary.writeObservableBytes(&obs_bytes);
@@ -10757,7 +10757,7 @@ pub const CompilerDb = struct {
         const typed_body = try self.typecheckBody(def_id);
         const active_layout = try self.readTargetLayout();
         const is_strict = try self.readSastStrict();
-        try self.unwindIfCancelled();
+        try self.unwindIfCanceled();
 
         if (self.sast_cycle_peers.getPtr(def_id.asInt())) |peer_list| {
             peer_list.clearRetainingCapacity();
@@ -10828,7 +10828,7 @@ pub const CompilerDb = struct {
                         },
                     },
                 ) catch |err| switch (err) {
-                    error.Cancelled => return error.Cancelled,
+                    error.Canceled => return error.Canceled,
                     error.DependencyCycle => return error.DependencyCycle,
                     error.MissingSourceInput => return error.MissingSourceInput,
                     error.InvalidDefId => return error.InvalidDefId,
@@ -10875,7 +10875,7 @@ pub const CompilerDb = struct {
                     for (peers_snapshot) |peer_def| {
                         const peer_tb = self.typecheckBody(peer_def) catch |err| switch (err) {
                             error.OutOfMemory => return error.OutOfMemory,
-                            error.Cancelled => return error.Cancelled,
+                            error.Canceled => return error.Canceled,
                             else => continue,
                         };
                         if (peer_tb.error_count == 0) {
@@ -10914,7 +10914,7 @@ pub const CompilerDb = struct {
                             },
                         },
                     ) catch |err| switch (err) {
-                        error.Cancelled => return error.Cancelled,
+                        error.Canceled => return error.Canceled,
                         error.DependencyCycle => return error.DependencyCycle,
                         error.MissingSourceInput => return error.MissingSourceInput,
                         error.InvalidDefId => return error.InvalidDefId,
@@ -11026,7 +11026,7 @@ pub const CompilerDb = struct {
         _ = try self.typecheckBody(def_id);
         const body_window = try self.getBodyAstProj(def_id);
         const active_layout = try self.readTargetLayout();
-        try self.unwindIfCancelled();
+        try self.unwindIfCanceled();
 
         const file_id = def_id.fileId();
         const input_ptr = self.source_inputs.getPtr(file_id.asInt()) orelse return error.MissingSourceInput;
@@ -11083,7 +11083,7 @@ pub const CompilerDb = struct {
             active_layout,
             eval_hook,
         ) catch |err| switch (err) {
-            error.Cancelled => return error.Cancelled,
+            error.Canceled => return error.Canceled,
             error.DependencyCycle => return error.DependencyCycle,
             error.MissingSourceInput => return error.MissingSourceInput,
             error.InvalidDefId => return error.InvalidDefId,
@@ -11116,7 +11116,7 @@ pub const CompilerDb = struct {
         if (def_id.isNone()) return error.InvalidDefId;
         const def_sig = try self.getDefSignature(def_id);
         const hir_store = try self.lowerDefHir(def_id);
-        try self.unwindIfCancelled();
+        try self.unwindIfCanceled();
 
         const mir_sink = try resetOrCreateDefDiagSink(&self.mir_diagnostics, self.allocator, def_id.asInt());
         var bundle = mir.lowerHirToMir(
@@ -11206,7 +11206,7 @@ pub const CompilerDb = struct {
         if (def_id.isNone()) return error.InvalidDefId;
         _ = try self.getDefSignature(def_id);
         const mir_art = try self.buildDefMirArtifact(def_id);
-        try self.unwindIfCancelled();
+        try self.unwindIfCanceled();
 
         const ct_sink = try resetOrCreateDefDiagSink(
             &self.comptime_diagnostics,
@@ -11343,7 +11343,7 @@ pub const CompilerDb = struct {
                 }
             } else |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                error.Cancelled => return error.Cancelled,
+                error.Canceled => return error.Canceled,
                 else => {},
             }
         }
@@ -11378,7 +11378,7 @@ pub const CompilerDb = struct {
 
         const eval_res = vm.evalBody(exec_target, &.{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.Cancelled => return error.Cancelled,
+            error.Canceled => return error.Canceled,
             error.EvaluationCycle => return error.DependencyCycle,
             else => {
                 var err_hasher = StructuralHasher.init();
@@ -11400,7 +11400,7 @@ pub const CompilerDb = struct {
 
         const rodata_id = vm.promoteResultToRodata(eval_res) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.Cancelled => return error.Cancelled,
+            error.Canceled => return error.Canceled,
             else => {
                 var err_hasher = StructuralHasher.init();
                 err_hasher.updateU32(def_id.asInt());
@@ -11422,7 +11422,7 @@ pub const CompilerDb = struct {
         const out_hir_store = self.lowered_def_hirs.getPtr(def_id.asInt());
         const ct_val = vm.resultToComptimeValue(eval_res, out_hir_store) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.Cancelled => return error.Cancelled,
+            error.Canceled => return error.Canceled,
             else => hir.ComptimeValue.unit_val,
         };
 
@@ -11465,7 +11465,7 @@ pub const CompilerDb = struct {
     ) QueryError!Fingerprint128 {
         _ = try self.resolveSignatures(file_id);
         const active_layout = try self.readTargetLayout();
-        try self.unwindIfCancelled();
+        try self.unwindIfCanceled();
 
         const mode_key = QueryKey.forFileMode(.optimize_mir_module, file_id, is_release_mode);
         const opt_sink = try resetOrCreateModeDiagSink(
@@ -11490,7 +11490,7 @@ pub const CompilerDb = struct {
             if (entry.kind == .extern_block) {
                 _ = self.evalComptimeDef(entry.def_id) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
-                    error.Cancelled => return error.Cancelled,
+                    error.Canceled => return error.Canceled,
                     else => {},
                 };
             }
@@ -11545,7 +11545,7 @@ pub const CompilerDb = struct {
             },
             opt_sink,
         ) catch |err| switch (err) {
-            error.Cancelled => return error.Cancelled,
+            error.Canceled => return error.Canceled,
             else => return error.OutOfMemory,
         };
         errdefer opt_res.deinit();
@@ -11680,7 +11680,7 @@ pub const CompilerDb = struct {
                 }
             } else |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                error.Cancelled => return error.Cancelled,
+                error.Canceled => return error.Canceled,
                 else => {},
             }
         }
@@ -11823,12 +11823,12 @@ pub const CompilerDb = struct {
             {
                 _ = self.typecheckBody(sym.def_id) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
-                    error.Cancelled => return error.Cancelled,
+                    error.Canceled => return error.Canceled,
                     else => null,
                 };
                 _ = self.verifySastMir(sym.def_id) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
-                    error.Cancelled => return error.Cancelled,
+                    error.Canceled => return error.Canceled,
                     else => null,
                 };
             }
@@ -13141,12 +13141,12 @@ test "test_durability_fast_path_cycle_recovery_and_cancellation" {
     const recovered_sig = try db.getDefSignature(stdlib_def0);
     try std.testing.expectEqual(stdlib_def0, recovered_sig.def_id);
 
-    // Test cooperative cancellation (`requestCancellation` -> `error.Cancelled` -> `clearCancellation`):
+    // Test cooperative cancellation (`requestCancellation` -> `error.Canceled` -> `clearCancellation`):
     db.requestCancellation();
-    try std.testing.expect(db.isCancelled());
-    try std.testing.expectError(error.Cancelled, db.verifySastMir(stdlib_def0));
+    try std.testing.expect(db.isCanceled());
+    try std.testing.expectError(error.Canceled, db.verifySastMir(stdlib_def0));
     db.clearCancellation();
-    try std.testing.expect(!db.isCancelled());
+    try std.testing.expect(!db.isCanceled());
     const sast_after = try db.verifySastMir(stdlib_def0);
     try std.testing.expect(sast_after.is_verified_sound);
 }
@@ -13561,7 +13561,7 @@ test "test_phase5_pure_call_memo_replays_deps_overflow_deps_red_path_cancel_and_
     const sum_r2 = try db.evalComptimeDef(def_sum_two);
     try std.testing.expectEqual(@as(i128, 102), sum_r2.value.int_val);
 
-    // [3] `requestCancellation` propagates `error.Cancelled`, and loop UAF traps `E0506`:
+    // [3] `requestCancellation` propagates `error.Canceled`, and loop UAF traps `E0506`:
     const uaf_file = FileId.fromInt(45);
     const uaf_src =
         \\pub fn loop_uaf() -> i64 {
@@ -13586,7 +13586,7 @@ test "test_phase5_pure_call_memo_replays_deps_overflow_deps_red_path_cancel_and_
     const def_bad_uaf = uaf_tree.entries[1].def_id;
 
     db.requestCancellation();
-    try std.testing.expectError(error.Cancelled, db.evalComptimeDef(def_bad_uaf));
+    try std.testing.expectError(error.Canceled, db.evalComptimeDef(def_bad_uaf));
     db.clearCancellation();
 
     const uaf_eval = try db.evalComptimeDef(def_bad_uaf);

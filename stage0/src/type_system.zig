@@ -1573,8 +1573,8 @@ const TaskGroupMethodKind = enum(u8) {
     cancel,
     /// `group.cancel_all()` cooperative cancellation request.
     cancel_all,
-    /// `group.is_cancelled()` cancellation state query.
-    is_cancelled,
+    /// `group.is_canceled()` cancellation state query.
+    is_canceled,
     /// `group.spawn(fut)` work-stealing cross-thread child task spawn.
     spawn,
     /// `group.spawn_local(fut)` current-thread pinned child task spawn.
@@ -2225,7 +2225,7 @@ const PARAM_FFI_ATTR_MAP = std.StaticStringMap(ParamFfiAttrKind).initComptime(.{
 const TASK_GROUP_METHOD_MAP = std.StaticStringMap(TaskGroupMethodKind).initComptime(.{
     .{ "cancel", .cancel },
     .{ "cancel_all", .cancel_all },
-    .{ "is_cancelled", .is_cancelled },
+    .{ "is_canceled", .is_canceled },
     .{ "spawn", .spawn },
     .{ "spawn_local", .spawn_local },
 });
@@ -30984,7 +30984,7 @@ pub const TypeChecker = struct {
                     .cancel, .cancel_all => {
                         if (args.len == 0) return .unit_ty;
                     },
-                    .is_cancelled => {
+                    .is_canceled => {
                         if (args.len == 0) return .bool_ty;
                     },
                 }

@@ -12,7 +12,7 @@ const std = @import("std");
 pub const ReactorCtx = opaque {};
 /// Lifecycle state of an `InFlightOpSlot` in the completion proactor table (`DR-08` §5.3).
 pub const SlotState = enum(u8) { free = 0, in_flight = 1, completed = 2, cancel_requested = 3, quarantined = 4 };
-/// Resource cleanup action executed if a cancelled operation completes after task exit (`Fix-08B`).
+/// Resource cleanup action executed if a canceled operation completes after task exit (`Fix-08B`).
 pub const ReaperAction = enum(u8) { none = 0, release_buffer = 1, close_fd = 2, release_buf_and_close_fd = 3 };
 /// Packed 32-bit generation counter, `SlotState`, and `Fix-08B` `ReaperAction` header (`4B`).
 pub const GenStateReaper = packed struct(u32) {

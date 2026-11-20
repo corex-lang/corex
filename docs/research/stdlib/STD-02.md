@@ -119,7 +119,7 @@ pub enum IoErrorKind: u8 {
     StreamTooLong        = 19,
     ProcessBatchRejected = 20,
     Unsupported          = 21,
-    Cancelled            = 22,
+    Canceled            = 22,
     Other                = 255,
 }
 

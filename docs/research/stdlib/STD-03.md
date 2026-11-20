@@ -5,7 +5,7 @@ CoreX **Phase 11.2b (`STD-03`)** specifies the five bootstrap standard library m
 Three architectural decisions keep Phase 11.2b compact and verifiable while preserving a zero-churn upgrade path to Phase 13.1 (`STD-05`):
 
 1.  **Compact SIMD Cryptography & Iterative $O(1)$-Heap Bao Streaming (`cx.crypto`):** `cx.crypto` pairs `Simd[u32, 4]` and 8-way transposed `Simd[u32, 8]` `blake3` kernels over a **48-byte** `.rodata` table (`32 B` `IV` + `16 B` `MSG_PERM`) with an iterative pre-order `.obao` **Bao** 1 KiB chunk-tree verifier whose fixed 54-entry chaining-value stack and header state occupy **1,856 bytes** – 8.8x below Phase 8's `16 KiB` caller-inlined coroutine frame cap (`E0317` / `DR-20` `D-02`) with zero heap allocations. Supply-chain verification combines `Simd[u32, 4]`-scheduled `sha256` and `sha512`/`sha384`, constant-time strict FIPS 186-5 / RFC 8032 `ed25519.verify` (rejecting malleable $S \ge L$, non-canonical coordinates $y \ge p$, and 8-torsion small-order public keys), iterative $O(1)$-space RFC 6962 / RFC 9162 Merkle inclusion and consistency proof verifiers, `Wyhash` v4.3 64-bit and 128-bit (`Fingerprint128`) hashing, and `context.rng`-routed OS `Csprng`.
-2.  **Deterministic Bootstrap `Reactor`, Quarantine Reaper & 4-Byte OS-Futex Sync (`cx.async`, `cx.sync`):** `cx.async` combines a single-threaded local event loop (`block_on`, `spawn_local`) and a lazily initialized bounded worker pool (`spawn`, `1..8` threads) over cross-platform OS pollers (`epoll`/`poll`, `kqueue`, Windows `IOCP`/`WSAPoll`, WASI `poll_oneoff`) and a deterministic `--sim` virtual min-heap timer wheel behind `Context.reactor: *ReactorVTable` (`DR-20` Seam #5). Structured `TaskGroup[E]` nurseries enforce LIFO `cancel_cleanup_bb` `defer` execution (`E0304`), `@thread_local` / MVS borrow exclusivity (`E0309`), and a **64-byte `InFlightOpSlot` + `CompletionReaper` drain barrier (`Fix-08B`)** that quarantines cancelled DMA buffers and closes raced kernel socket/file descriptors before releasing nursery arenas. Blocking `cx.sync.{Mutex, RwLock, Condvar, Once, WaitGroup}` primitives pack fast-path state into 4-byte `AtomicU32` words backed by Linux `futex`, macOS `__ulock_wait` / `__ulock_wait2`, Windows `WaitOnAddress`, and Wasm `memory.atomic.wait32`, marked with `@std_cap_boundary` so `@no_block` scopes reject blocking calls at compile time (`E0322`).
+2.  **Deterministic Bootstrap `Reactor`, Quarantine Reaper & 4-Byte OS-Futex Sync (`cx.async`, `cx.sync`):** `cx.async` combines a single-threaded local event loop (`block_on`, `spawn_local`) and a lazily initialized bounded worker pool (`spawn`, `1..8` threads) over cross-platform OS pollers (`epoll`/`poll`, `kqueue`, Windows `IOCP`/`WSAPoll`, WASI `poll_oneoff`) and a deterministic `--sim` virtual min-heap timer wheel behind `Context.reactor: *ReactorVTable` (`DR-20` Seam #5). Structured `TaskGroup[E]` nurseries enforce LIFO `cancel_cleanup_bb` `defer` execution (`E0304`), `@thread_local` / MVS borrow exclusivity (`E0309`), and a **64-byte `InFlightOpSlot` + `CompletionReaper` drain barrier (`Fix-08B`)** that quarantines canceled DMA buffers and closes raced kernel socket/file descriptors before releasing nursery arenas. Blocking `cx.sync.{Mutex, RwLock, Condvar, Once, WaitGroup}` primitives pack fast-path state into 4-byte `AtomicU32` words backed by Linux `futex`, macOS `__ulock_wait` / `__ulock_wait2`, Windows `WaitOnAddress`, and Wasm `memory.atomic.wait32`, marked with `@std_cap_boundary` so `@no_block` scopes reject blocking calls at compile time (`E0322`).
 3.  **Zero-`libssl` Pure-`.cx` TLS 1.3 Client-Only & Unboxed `Span16` HTTP/1.1 (`cx.net`, `cx.http`):** Rather than coupling static `x86_64-linux-musl` builds to C `libssl` or working around deprecated macOS `SecureTransport` (which lacks TLS 1.3), `Network.framework` (which hides pollable socket descriptors), and Windows `Schannel` TLS 1.3 post-handshake `NewSessionTicket` key-corruption hazards (`SEC_I_RENEGOTIATE` / `SERVER-128041`), Phase 11.2b selects a pure-`.cx` TLS 1.3 client-only engine (`X25519` + `secp256r1`, `ChaCha20-Poly1305` + `AES-128-GCM`, DER X.509v3 verifier; modeled at ~1,850 LOC) paired with a native OS trust-store root loader (~175 modeled LOC across Linux/BSD PEM bundles, macOS `/etc/ssl/cert.pem` + `SystemRootCertificates.keychain`, and Windows `CertOpenSystemStoreW("ROOT")`). Over this transport, an unboxed 4-byte `Span16` HTTP/1.1 client streams `.cxpkg` downloads directly through `BaoVerifier` / `Blake3` into `~/.corex/cache/blake3/staging/` under strict anti-smuggling, Slowloris timeout, and cross-origin redirect bounds.
 
 ---
@@ -49,7 +49,7 @@ In `cx.crypto.csprng`, `fill_bytes` routes through `context.rng` (`Context.react
 
 Per `DR-20` `Prune-07`, full multi-core share-nothing `io_uring` buffer rings (`IORING_REGISTER_PBUF_RING`) are deferred to Phase 13.1. Phase 11.2b's bootstrap `Reactor` delivers exact `TaskGroup[E]`, `@linear TaskHandle[T]`, `64B` `InFlightOpSlot`, and `CompletionReaper` semantics across all supported targets.
 
-> **Visual – Quarantine Reaping and 4-Byte OS Futexes Guarantee Leak-Free Cancellation and Lock-Free Fast Paths:** Top: Each in-flight operation occupies an exact 64-byte cache-aligned **InFlightOpSlot**. On early error or timeout, **TaskGroup** runs child **cancel_cleanup_bb** LIFO defers and moves pending I/O slots into **CancellingQuarantine**; nursery arena memory is held until **CompletionReaper** closes raced file/socket descriptors and releases pinned buffers. Bottom: **cx.sync.Mutex** encodes contention in a single 4-byte **AtomicU32** word, executing zero syscalls when uncontended and trapping **@no_block** violations statically via **E0322**.
+> **Visual – Quarantine Reaping and 4-Byte OS Futexes Guarantee Leak-Free Cancellation and Lock-Free Fast Paths:** Top: Each in-flight operation occupies an exact 64-byte cache-aligned **InFlightOpSlot**. On early error or timeout, **TaskGroup** runs child **cancel_cleanup_bb** LIFO defers and moves pending I/O slots into **CancelingQuarantine**; nursery arena memory is held until **CompletionReaper** closes raced file/socket descriptors and releases pinned buffers. Bottom: **cx.sync.Mutex** encodes contention in a single 4-byte **AtomicU32** word, executing zero syscalls when uncontended and trapping **@no_block** violations statically via **E0322**.
 
 #### Bootstrap `Reactor` Pollers, Bounded Worker Pool, and `--sim` Virtual Event Wheel
 
@@ -65,11 +65,11 @@ Calling `cx.async.block_on(own fut)` drives a thread-local `Reactor` combining a
 
 #### `TaskGroup`, `64B` `InFlightOpSlot`, and `CompletionReaper` Drain Barrier (`Fix-08B`)
 
-Cancelling an in-flight kernel operation races with asynchronous completion: dropping a coroutine frame while Windows `IOCP` (or Phase 13.1 `io_uring`) holds an `OVERLAPPED` / DMA buffer corrupts freed memory, and cancelling an `accept` or `open` that already succeeded in the kernel leaks live descriptors. `cx.async` closes both hazards through a three-step quarantine protocol over 64-byte cache-aligned `InFlightOpSlot` entries indexed by `IoUserData` (`slot_index: u32`, `generation: u24`, `op_tag: u8`):
+Canceling an in-flight kernel operation races with asynchronous completion: dropping a coroutine frame while Windows `IOCP` (or Phase 13.1 `io_uring`) holds an `OVERLAPPED` / DMA buffer corrupts freed memory, and canceling an `accept` or `open` that already succeeded in the kernel leaks live descriptors. `cx.async` closes both hazards through a three-step quarantine protocol over 64-byte cache-aligned `InFlightOpSlot` entries indexed by `IoUserData` (`slot_index: u32`, `generation: u24`, `op_tag: u8`):
 
 1.  **Pinned Submission:** Submitting an I/O operation increments `group.pin_ref_count`, moves any `@linear` `IoBuf` (`sink`) into `slot.pinned_buf_ptr`, records `slot.reaper_action` (`NoResource`, `CloseSocket`, `CloseFd`, or `ReleaseIoBuf`), and sets `slot.state = .Active`.
 2.  **LIFO Cancellation Cascade:** When any child task in `TaskGroup[E]` returns `.Err(e)` – or when `with_timeout` elapses – the nursery sets `group.cancel_token`, walks active child tasks in reverse LIFO spawn order, invokes `@coro_poll(child_frame, .CancelDestroy, -ECANCELED)` to execute each suspended coroutine's `cancel_cleanup_bb` `defer`/`errdefer` chain (`E0304`), and cancels every active `InFlightOpSlot` belonging to the group.
-3.  **Quarantine Drain Barrier:** Readiness pollers (`epoll`/`kqueue`/`poll`) deregister the descriptor and reap the slot immediately. Completion pollers (`IOCP` `CancelIoEx` and `--sim` simulated DMA) transition `slot.state` to `.CancellingQuarantine` with `awaiting_task_id = 0xFFFF_FFFF`. **`TaskGroup` scope exit suspends on `group.waiting_on_drain` until `pin_ref_count == 0`**. When the terminal kernel completion arrives on a `.CancellingQuarantine` slot, `CompletionReaper` checks `result >= 0`: if a raced `accept`/`open` produced a live handle (`CloseSocket` / `CloseFd`), it closes that handle immediately, releases any pinned buffer, increments the 24-bit `generation` counter to reject stale ABA wakeups, and unblocks the `TaskGroup` barrier once `pin_ref_count` reaches zero.
+3.  **Quarantine Drain Barrier:** Readiness pollers (`epoll`/`kqueue`/`poll`) deregister the descriptor and reap the slot immediately. Completion pollers (`IOCP` `CancelIoEx` and `--sim` simulated DMA) transition `slot.state` to `.CancelingQuarantine` with `awaiting_task_id = 0xFFFF_FFFF`. **`TaskGroup` scope exit suspends on `group.waiting_on_drain` until `pin_ref_count == 0`**. When the terminal kernel completion arrives on a `.CancelingQuarantine` slot, `CompletionReaper` checks `result >= 0`: if a raced `accept`/`open` produced a live handle (`CloseSocket` / `CloseFd`), it closes that handle immediately, releases any pinned buffer, increments the 24-bit `generation` counter to reject stale ABA wakeups, and unblocks the `TaskGroup` barrier once `pin_ref_count` reaches zero.
 
 #### Intrusive Async Waiters and 4-Byte OS-Futex Blocking Sync (`cx.sync`)
 
@@ -493,7 +493,7 @@ pub bit_field IoUserData: u64 {
 pub enum SlotState: u8 {
     Free                 = 0,
     Active               = 1,
-    CancellingQuarantine = 2,
+    CancelingQuarantine = 2,
 }
 
 @derive(Copy, Equatable)
@@ -544,13 +544,13 @@ pub struct CancelToken {
 
 impl CancelToken {
     @inline @no_alloc @no_panic @no_block
-    pub fn is_cancelled(self) -> bool;
+    pub fn is_canceled(self) -> bool;
 }
 
 @derive(Copy, Equatable)
 pub enum TimeoutError: u8 {
     Elapsed   = 1,
-    Cancelled = 2,
+    Canceled = 2,
 }
 
 @linear
@@ -603,7 +603,7 @@ pub async fn with_timeout[T](dur: Duration, fut: own AsyncTask[T], /) -> T!Timeo
 @derive(Copy, Equatable)
 pub enum SendError[T] {
     Closed(T),
-    Cancelled(T),
+    Canceled(T),
 }
 
 @derive(Copy, Equatable)
@@ -2206,7 +2206,7 @@ pub const TASK_NONE: u32 = 0xFFFF_FFFF;
 pub const PollAction = enum(u8) { resume_ready = 0, cancel_destroy = 1 };
 pub const PollStatus = enum(u8) { pending = 0, ready_ok = 1, ready_err = 2 };
 
-pub const SlotState = enum(u8) { free = 0, active = 1, cancelling_quarantine = 2 };
+pub const SlotState = enum(u8) { free = 0, active = 1, canceling_quarantine = 2 };
 pub const ReaperAction = enum(u8) { no_resource = 0, close_socket = 1, close_fd = 2, release_iobuf = 3 };
 
 pub const IoUserData = packed struct(u64) {
@@ -2302,7 +2302,7 @@ pub const BootstrapReactor = struct {
                 if (self.cancelKernelOpFn(slot)) {
                     self.reapSlot(@intCast(i), -1);
                 } else {
-                    slot.state = .cancelling_quarantine;
+                    slot.state = .canceling_quarantine;
                 }
             }
         }
@@ -2322,7 +2322,7 @@ pub const BootstrapReactor = struct {
         const slot = &self.slots[udata.slot_index];
         if (slot.state == .free or slot.generation != udata.generation) return;
 
-        if (slot.state == .cancelling_quarantine) {
+        if (slot.state == .canceling_quarantine) {
             self.reapSlot(udata.slot_index, result);
             return;
         }
@@ -3041,7 +3041,7 @@ Every parser, handshake state machine, and network buffer in Phase 11.2b enforce
 | **HTTP/1.1 Framing & Smuggling** | `0` conflicting framing headers; `≤16` hex digits per chunk size; `≤4 KiB` chunk extensions/trailers | Rejects simultaneous `Transfer-Encoding` + `Content-Length`, duplicate differing `Content-Length`, bare `CR`/`LF` line endings, `obs-fold` continuations, and raw CTLs (`0x00..0x1F \ \t`, `0x7F`) in outgoing and incoming headers (blocks CRLF injection and CL.TE/TE.CL smuggling). |
 | **Slowloris & Stall Timeouts** | `connect = 5s`, `tls_handshake = 10s`, `header_read = 10s` (cumulative wall budget across entire header block), `idle_body_chunk = 15s` | Defeats Slowloris trickle attacks (sending 1 byte every 9 seconds to reset naive per-`read` timers) by wrapping `read_response_head` in a single cumulative `with_timeout(header_read_timeout, ...)`. |
 | **HTTP Redirects & Auth Stripping** | `MAX_REDIRECTS = 5`; cross-origin header sanitizer; HTTPS downgrade block | Caps `301`/`302`/`303`/`307`/`308` hops at `5` (`RedirectLimitExceeded`); rewrites `303` to `GET` with empty body; **strips `Authorization`, `Proxy-Authorization`, and `Cookie` whenever `(scheme, host, port)` changes**; and rejects `https://` to `http://` downgrades (`HttpsDowngradeBlocked`). |
-| **Keep-Alive Connection Pool** | `MAX_POOL_CONNS = 8`, `MAX_IDLE_MS = 30_000`, `0`-unread-body invariant | Recycles only connections whose response body reached clean `ContentLength(0)` or `ChunkPhase.Done` EOF; cancelled or erroring streams invoke `close_abort` immediately. |
+| **Keep-Alive Connection Pool** | `MAX_POOL_CONNS = 8`, `MAX_IDLE_MS = 30_000`, `0`-unread-body invariant | Recycles only connections whose response body reached clean `ContentLength(0)` or `ChunkPhase.Done` EOF; canceled or erroring streams invoke `close_abort` immediately. |
 | **IPv4 / DNS SSRF Guards** | Strict decimal IPv4 (no leading `'0'`); `≤16` DNS `A`/`AAAA` answers; `≤8` CNAME hops | Rejects octal/hex IPv4 (`0177.0.0.1` $\rightarrow$ `AddrParseError.LeadingZeroOctet`); verifies 16-bit CSPRNG DNS transaction ID and peer IP/port. |
 | **TLS 1.3 Record & X.509 Chain** | Ciphertext record `≤16,640 B`; Handshake msg `≤32 KiB`; Cert chain `≤8` certs; `≤32` `NewSessionTicket`s | Blocks record/certificate memory bombs (`RecordOverflow` / `HandshakeTooLarge` / `CertChainTooDeep`), empty-record / post-handshake `NewSessionTicket` DoS loops, and X25519 all-zero low-order shared secrets (`InvalidServerKeyShare`). |
 | **Bao & Package Cache Streaming** | `BaoVerifier` stack `= 1,856 B` (`54` CVs); `.cxpkg` `max_bytes = 256 MiB`; withheld length | Withholds header `claimed_len` until final chunk + stream EOF validate (`BaoLengthMismatch`); unlinks `~/.corex/cache/blake3/staging/*.tmp` on any hash mismatch prior to atomic rename. |

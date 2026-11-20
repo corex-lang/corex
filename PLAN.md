@@ -239,7 +239,7 @@ Regardless of the specific surface grammar (`RDG-03`) or backend (`RDG-09`) sele
         -   `x86_64-apple-darwin` and `aarch64-apple-darwin` (using `UnlinkAndReplace` + ad-hoc `LC_CODE_SIGNATURE`),
         -   `x86_64-windows-msvc` / `gnu` and `aarch64-windows-msvc`,
         -   `wasm32-unknown-wasi` and `wasm32-unknown-freestanding`.
-    2.  Implement **Stackless Coroutine Lowering** (`RDG-08`) with static `16 KiB` caller-inline `async` frame caps (`DR-20` `D-02`), `@linear` `CompletionReaper` socket/handle cleanup on cancelled completions (`DR-20` `Fix-08B`), and the `25-LOC` `Context.reactor: *ReactorVTable` (`monotonic_ns`, `wall_epoch_ns`, `fill_rng`, `submit_io`, …) seam (`DR-20` Seam Checklist #5).
+    2.  Implement **Stackless Coroutine Lowering** (`RDG-08`) with static `16 KiB` caller-inline `async` frame caps (`DR-20` `D-02`), `@linear` `CompletionReaper` socket/handle cleanup on canceled completions (`DR-20` `Fix-08B`), and the `25-LOC` `Context.reactor: *ReactorVTable` (`monotonic_ns`, `wall_epoch_ns`, `fill_rng`, `submit_io`, …) seam (`DR-20` Seam Checklist #5).
     3.  Implement zero-overhead **C11/C23 Declaration FFI** (`RDG-10`, `DR-20` `Prune-06`, `Reject-01`):
         -   Exact C ABI struct layout, calling conventions (`SysV64`, `Win64`, `AAPCS64`, `wasm32`), variadic C calls, FFI SAST pointer contracts (`@SliceLen`, `@null_terminated`, `@consumes`), and zero-`libclang` in-tree C11/C23 **declaration** ingestion (`typedef`, `enum`, `struct`/`union`, `extern fn`, literal `#define`s) lowering C bitfields into target-ABI byte arrays + `subscript` masks and reserving the `20-LOC` C body AST stub hook (`DR-20` Seam Checklist #6) for `Phase 13.3`.
 -   **Verification Gate:**

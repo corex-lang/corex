@@ -3311,14 +3311,14 @@ fn emitAsyncRuntimeHelpersC(emitter: *CModuleEmitter) !void {
         \\    uint8_t ctx_buf[_CX_CTX_BYTES];
         \\    uintptr_t join_waiter;
         \\    uint8_t is_completed;
-        \\    uint8_t is_cancelled;
+        \\    uint8_t is_canceled;
         \\    uint8_t is_parked_on_join;
         \\} _cx_task_node_t;
         \\typedef struct _cx_task_group_s {
         \\    _cx_task_node_t **tasks;
         \\    size_t len;
         \\    size_t cap;
-        \\    uint8_t is_cancelled;
+        \\    uint8_t is_canceled;
         \\    uint8_t is_exited;
         \\} _cx_task_group_t;
         \\static size_t _cx_coro_frame_size(uint32_t _b_idx);
@@ -3371,7 +3371,7 @@ fn emitAsyncRuntimeHelpersC(emitter: *CModuleEmitter) !void {
         \\static CX_THREAD_LOCAL size_t _cx_exec_q_len = 0u;
         \\static CX_THREAD_LOCAL size_t _cx_exec_q_cap = 0u;
         \\static CX_THREAD_LOCAL uintptr_t _cx_active_poll_item = 1u;
-        \\static CX_THREAD_LOCAL uint8_t _cx_coro_is_cancelling = 0u;
+        \\static CX_THREAD_LOCAL uint8_t _cx_coro_is_canceling = 0u;
         \\static void _cx_exec_push(uintptr_t _item) {
         \\    if (_cx_exec_q_len >= _cx_exec_q_cap) {
         \\        size_t _nc = _cx_exec_q_cap == 0u ? 64u : (_cx_exec_q_cap * 2u);
@@ -3427,10 +3427,10 @@ fn emitAsyncRuntimeHelpersC(emitter: *CModuleEmitter) !void {
         \\    if (_k == 1u && _h != NULL) {
         \\        uint32_t _b_idx = 0u;
         \\        memcpy(&_b_idx, ((uint8_t *)_h) + 4u, 4u);
-        \\        uint8_t _prev_c = _cx_coro_is_cancelling;
-        \\        _cx_coro_is_cancelling = 1u;
+        \\        uint8_t _prev_c = _cx_coro_is_canceling;
+        \\        _cx_coro_is_canceling = 1u;
         \\        (void)_cx_coro_poll_dispatch(_b_idx, (uint8_t *)_h, NULL, 1u, NULL);
-        \\        _cx_coro_is_cancelling = _prev_c;
+        \\        _cx_coro_is_canceling = _prev_c;
         \\        _cx_coro_free((uint8_t *)_h);
         \\    }
         \\}
@@ -3483,7 +3483,7 @@ fn emitAsyncRuntimeHelpersC(emitter: *CModuleEmitter) !void {
         \\}
         \\static void _cx_async_group_cancel_all(_cx_task_group_t *_grp) {
         \\    if (_grp == NULL) return;
-        \\    _grp->is_cancelled = 1u;
+        \\    _grp->is_canceled = 1u;
         \\    size_t _ri = _grp->len;
         \\    while (_ri > 0u) {
         \\        _ri -= 1u;
@@ -3493,8 +3493,8 @@ fn emitAsyncRuntimeHelpersC(emitter: *CModuleEmitter) !void {
         \\    }
         \\}
         \\static void _cx_async_cancel_node(_cx_task_node_t *_tn) {
-        \\    if (_tn == NULL || _tn->is_completed || _tn->is_cancelled) return;
-        \\    _tn->is_cancelled = 1u;
+        \\    if (_tn == NULL || _tn->is_completed || _tn->is_canceled) return;
+        \\    _tn->is_canceled = 1u;
         \\    _tn->is_completed = 1u;
         \\    uint8_t _sctx[_CX_CTX_BYTES];
         \\    uintptr_t _spoll = _cx_active_poll_item;
@@ -3575,7 +3575,7 @@ fn emitAsyncRuntimeHelpersC(emitter: *CModuleEmitter) !void {
         \\static void _cx_async_group_exit(void *_grp_ptr, uint8_t _is_err_or_cancel) {
         \\    _cx_task_group_t *_g = (_cx_task_group_t *)_grp_ptr;
         \\    if (_g == NULL || _g->is_exited) return;
-        \\    if (_is_err_or_cancel || _cx_coro_is_cancelling || _g->is_cancelled) {
+        \\    if (_is_err_or_cancel || _cx_coro_is_canceling || _g->is_canceled) {
         \\        _cx_async_group_cancel_all(_g);
         \\    } else {
         \\        for (;;) {
@@ -3589,7 +3589,7 @@ fn emitAsyncRuntimeHelpersC(emitter: *CModuleEmitter) !void {
         \\                    if (!_tn->is_parked_on_join) {
         \\                        _prog = 1u;
         \\                        _cx_exec_step_task(_tn);
-        \\                        if (_g->is_cancelled) {
+        \\                        if (_g->is_canceled) {
         \\                            _cx_async_group_cancel_all(_g);
         \\                            _pend = 0u;
         \\                            break;
@@ -6344,7 +6344,7 @@ fn emitAsyncCoroPollBodyC(emitter: *CModuleEmitter, body_idx: u32, body: *const 
         }
     }
 
-    // [3] Entry state switch (`0 = unpolled`, `1..K = suspended`, `completed/cancelled = done`):
+    // [3] Entry state switch (`0 = unpolled`, `1..K = suspended`, `completed/canceled = done`):
     try emitter.writeAll(
         "    uint32_t _coro_st = 0u;\n" ++
             "    memcpy(&_coro_st, _frame, 4u);\n" ++
@@ -9278,7 +9278,7 @@ fn emitIntrinsicOpC(
             if (args.len >= 2 or ret_ty == .bool_ty) {
                 try emitter.print(
                     "    {{ void *_gp = NULL; memcpy(&_gp, _v_{d}, sizeof(void *)); " ++
-                        "_v_{d} = (_gp != NULL && ((_cx_task_group_t *)_gp)->is_cancelled) ? 1u : 0u; }}\n",
+                        "_v_{d} = (_gp != NULL && ((_cx_task_group_t *)_gp)->is_canceled) ? 1u : 0u; }}\n",
                     .{ args[0], dst_raw },
                 );
             } else if (emitter.input.pool.isFutureType(ret_ty)) {
@@ -9546,7 +9546,7 @@ fn emitAsyncFutureMakeC(
     );
 }
 
-/// Emits C99 nursery barrier (`async_task_group_exit`) cancelling on `Err`/cleanup or draining FIFO.
+/// Emits C99 nursery barrier (`async_task_group_exit`) canceling on `Err`/cleanup or draining FIFO.
 fn emitAsyncTaskGroupExitC(emitter: *CModuleEmitter, body: *const MirBody, group_val_raw: u32) !void {
     var err_cond: []u8 = if (emitter.active_coro_body_idx != null)
         try emitter.allocator.dupe(u8, "(_action == 1u)")
