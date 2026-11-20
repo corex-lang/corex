@@ -30,9 +30,9 @@ To prevent manual documentation drift between `corex-lang/corex` and `corex-lang
 
 ---
 
-## 2. Stage `L0` – Pre-Release CLI Onboarding & Doc Extractor (Post-Phase 12, Pre-Tag)
+## 2. Stage `L0` – Pre-Release CLI Onboarding & Doc Extractor (Post-Phase 12.8, Pre-Tag)
 
-Immediately after `Phase 12` achieves 3-stage self-hosting SHA-256 fixed-point parity and before tagging `v0.0.1`, complete three high-leverage developer-experience polish items:
+Immediately after `Phase 12.8` completes the 5-slice holistic codebase simplification/de-duplication audit and 3-stage self-hosting SHA-256 fixed-point verification – and before tagging `v0.0.1` – complete three high-leverage developer-experience polish items:
 
 1.  **`corex init [name]` Project Scaffolder:**
     -   Generates a clean, ready-to-commit workspace in `< 5 ms`:
@@ -61,8 +61,12 @@ The core extension (`syntaxes/corex.tmLanguage.json`, `language-configuration.js
     -   Update default `corex` binary discovery to prioritize the installed `v0.0.1` toolchain (`PATH` and `~/.corex/bin/corex`) while keeping workspace `build/` overrides for compiler contributors.
 2.  **Local PrettyLights Verification (`@wooorm/starry-night`):**
     -   Render `core/**/*.cx`, `stdlib/cx/**/*.cx`, `compiler/**/*.cx`, and all [`docs/COMPARISONS.md`](COMPARISONS.md) showcase snippets through `@wooorm/starry-night` locally across GitHub Light, Dark, and High-Contrast palettes to verify crisp highlighting before publishing.
-3.  **Dual Marketplace Publishing:**
-    -   Add final release branding (official CoreX icon, marketplace `README.md` and `CHANGELOG.md` matching `xulbux/vscode-theme-isolux` and `xulbux/vscode-ext-color-tracr` quality standards) and publish `vscode-ext-corex` publicly to both the **Visual Studio Marketplace** (`code --install-extension`) and **OpenVSX** (serving Cursor, Antigravity, Windsurf, VSCodium, and Eclipse Theia users out of the box).
+3.  **Dual Marketplace Publishing (Post-`CoreX v0.0.1` Tag Only):**
+    -   *Strict Sequencing:* Keep `vscode-ext-corex` (`v1.0.0`) local-only during `Phase 10.5`–`12.8` development, and publish publicly **only after** `CoreX v0.0.1` itself is tagged and live in Stage `L4` so Marketplace installers immediately find an official released `corex` toolchain.
+    -   Publish `vscode-ext-corex` `v1.0.0` (with `assets/icon.png`, built-in `.cx` file-explorer icon, and `isolux` / `color-tracr`-grade `README.md` and `CHANGELOG.md`) to both the **Visual Studio Marketplace** (`code --install-extension corex-lang.corex`) and **OpenVSX** (serving Cursor, Antigravity, Windsurf, VSCodium, and Eclipse Theia users out of the box).
+4.  **Day-1 Icon Pack & Editor File-Icon Submissions (Zero Popularity Gate):**
+    -   Add the official CoreX logo (`#6352FF` / `#99A0FF` / monochrome glyph) to the **`svg.xul.is` SVG & Badge API icon pack** so all CoreX `README.md` headers, badges, and starter templates render native icons on day one.
+    -   Submit `.cx`, `corex.toml`, and `corex.lock` file-icon PRs to **Material Icon Theme** (`material-extensions/vscode-material-icon-theme`), **`vscode-icons`** (`vscode-icons/vscode-icons`), **Catppuccin Icons** (`catppuccin/vscode-icons`), **`nvim-web-devicons`**, and **`mini.icons`** (with explicit brand-owner authorization noted in the PR body).
 
 ---
 
@@ -188,6 +192,11 @@ GitHub Linguist requires a language extension to have **at least 200 unique publ
     -   Add representative `.cx` sample files under `samples/CoreX/` and unit tests verifying heuristic classification.
 4.  **Post-Merge Cleanup:**
     -   Once GitHub deploys the new Linguist release, remove the temporary `.gitattributes` `linguist-language=Rust` fallback from `corex init` and the starter templates so GitHub displays **CoreX** natively in repository language bars.
+5.  **Global Brand, Badge & Terminal Font Icon Rollout (Post-Traction Thresholds):**
+    -   Once `corex-lang/corex` crosses external star/domain popularity thresholds, submit the official CoreX monochrome SVG and primary brand indigo **`#6352FF`** (with explicit copyright/trademark owner permission in each PR) to:
+        -   **Simple Icons (`simple-icons/simple-icons`):** Unlocks native `?logo=corex` badges across **Shields.io** (`img.shields.io`) globally.
+        -   **Devicon (`devicons/devicon`)** & **Skill Icons (`tandpfun/skill-icons`):** Unlocks CoreX tech-stack icons across developer portfolios, documentation sites, and GitHub profile READMEs.
+        -   **Nerd Fonts (`ryanoasis/nerd-fonts`):** Unlocks native `.cx` terminal glyphs in `eza`, `lsd`, `yazi`, `neovim`, and `starship` prompts.
 
 ---
 

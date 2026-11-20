@@ -1,6 +1,6 @@
 # Upfront `Deep Research` Prompts (`DR-01`–`DR-22`)
 
-This catalog contains the 22 self-contained, copy-pasteable `Deep research` prompts and specifications that resolve the Research Decision Gates (`RDG-01`–`RDG-22`) in [PLAN.md](../../PLAN.md). When a `Deep research` report is completed, save its output to the corresponding `docs/research/DR-XX.md` path listed below.
+This catalog contains the 22 self-contained, copy-pasteable compiler `Deep research` prompts and specifications that resolve `RDG-01`–`RDG-22` in [PLAN.md](../../PLAN.md) (`docs/research/DR-XX.md`). For the companion module-level **Standard Library (`cx.*`)** `Deep research` prompts (`STD-01`–`STD-07` → `docs/research/stdlib/STD-XX.md`), see [docs/research/stdlib/PROMPTS.md](stdlib/PROMPTS.md).
 
 ---
 
