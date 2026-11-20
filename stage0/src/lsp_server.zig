@@ -761,6 +761,14 @@ const CodeActionUriGroup = struct {
     edits: std.ArrayListUnmanaged(diagnostic.TextEdit) = .empty,
 };
 
+/// Canonical signature and prose summary rendered on `textDocument/hover` for built-in `@` items.
+const HoverDocSpec = struct {
+    /// Signature header rendered inside a fenced ` ```corex ` code block.
+    signature: []const u8,
+    /// Concise human-readable explanation rendered below the signature separator.
+    summary: []const u8,
+};
+
 /// Stateful CoreX LSP 3.17 session owning `CompilerDb`, `VfsSourceMap`, and bounded caches.
 pub const LspSession = struct {
     /// Long-lived allocator for persistent session structures.
@@ -1208,6 +1216,693 @@ const NON_RENAMABLE_IDENT_SET = std.StaticStringMap(void).initComptime(.{
     .{ "pkg", {} },
     .{ "self", {} },
 });
+
+/// $O(1)$ set of built-in prelude `Option[T]` and `Result[T, E]` variant identifiers.
+const BUILTIN_VARIANT_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "Err", {} },
+    .{ "None", {} },
+    .{ "Ok", {} },
+    .{ "Some", {} },
+});
+
+/// $O(1)$ hover documentation catalog for all 57 canonical built-in `@attribute` annotations.
+const BUILTIN_ATTR_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
+    .{
+        "align",
+        HoverDocSpec{
+            .signature = "@align(bytes: usize)",
+            .summary = "Overrides the minimum byte alignment (power of two) of a `struct`, `union`, or static item.",
+        },
+    },
+    .{
+        "allow",
+        HoverDocSpec{
+            .signature = "@allow(code)",
+            .summary = "Scoped suppression for a specific compiler warning or lint diagnostic code (e.g., `@allow(W0402)`).",
+        },
+    },
+    .{
+        "attribute_schema",
+        HoverDocSpec{
+            .signature = "@attribute_schema(targets: […])",
+            .summary = "Declares a strongly typed compile-time attribute schema struct validated on annotated items.",
+        },
+    },
+    .{
+        "bench",
+        HoverDocSpec{
+            .signature = "@bench(…)",
+            .summary = "Configures statistical microbenchmark execution parameters on a `bench` item.",
+        },
+    },
+    .{
+        "borrowed",
+        HoverDocSpec{
+            .signature = "@borrowed",
+            .summary = "FFI parameter contract declaring that the callee borrows the pointer without retaining or freeing it.",
+        },
+    },
+    .{
+        "builder",
+        HoverDocSpec{
+            .signature = "@builder",
+            .summary = "Marks a function or type constructor as accepting trailing declarative child-item blocks.",
+        },
+    },
+    .{
+        "builder_item",
+        HoverDocSpec{
+            .signature = "@builder_item",
+            .summary = "Marks a function or constructor as an implicit child element inside an enclosing `@builder` block.",
+        },
+    },
+    .{
+        "byte_len",
+        HoverDocSpec{
+            .signature = "@byte_len(param_or_expr)",
+            .summary = "FFI spatial contract binding a raw buffer pointer's accessible byte length to a companion parameter (`E0307`, `E0312`).",
+        },
+    },
+    .{
+        "cache_aligned",
+        HoverDocSpec{
+            .signature = "@cache_aligned",
+            .summary = "Aligns a `struct` or static item to the target CPU cache-line boundary (`64` or `128` bytes) to prevent false sharing.",
+        },
+    },
+    .{
+        "cfg",
+        HoverDocSpec{
+            .signature = "@cfg(predicate)",
+            .summary = "Conditionally includes the annotated declaration when `predicate` evaluates to `true` at compile time.",
+        },
+    },
+    .{
+        "cold",
+        HoverDocSpec{
+            .signature = "@cold",
+            .summary = "Hints to the optimizer and branch predictor that this function is rarely executed (e.g., error or slow paths).",
+        },
+    },
+    .{
+        "constructor",
+        HoverDocSpec{
+            .signature = "@constructor",
+            .summary = "Permits a `PascalCase` factory function name that constructs a value or declarative `cx.ui` component.",
+        },
+    },
+    .{
+        "consumes",
+        HoverDocSpec{
+            .signature = "@consumes",
+            .summary = "FFI parameter contract declaring that ownership of an `@owned_by_caller` pointer transfers into the callee (`E0310`).",
+        },
+    },
+    .{
+        "deprecated",
+        HoverDocSpec{
+            .signature = "@deprecated(since: str, reason: str, upgrade: str = …)",
+            .summary = "Marks an item as deprecated, surfacing warnings and automated `corex upgrade` rewrite metadata.",
+        },
+    },
+    .{
+        "derive",
+        HoverDocSpec{
+            .signature = "@derive(Trait1, Trait2, …)",
+            .summary = "Synthesizes canonical compile-time trait implementations (`Copy`, `Clone`, `Eq`, `Ord`, `Hash`, `Debug`, `Default`).",
+        },
+    },
+    .{
+        "escapes",
+        HoverDocSpec{
+            .signature = "@escapes",
+            .summary = "FFI parameter contract declaring that the callee stores the pointer beyond the call's return (`E0306` provenance check).",
+        },
+    },
+    .{
+        "export",
+        HoverDocSpec{
+            .signature = "@export",
+            .summary = "Exports a function or static symbol in the compiled object/shared-library symbol table with external linkage.",
+        },
+    },
+    .{
+        "extern",
+        HoverDocSpec{
+            .signature = "@extern",
+            .summary = "Declares external FFI linkage on a declaration or ABI boundary item.",
+        },
+    },
+    .{
+        "fix_inline",
+        HoverDocSpec{
+            .signature = "@fix_inline",
+            .summary = "Provides an inline template used by `corex upgrade` / `corex fix` to migrate deprecated call sites automatically.",
+        },
+    },
+    .{
+        "free_with",
+        HoverDocSpec{
+            .signature = "@free_with(fn_name)",
+            .summary = "FFI return contract pairing an `@owned_by_caller` pointer with its mandatory deallocation function (`E0310`).",
+        },
+    },
+    .{
+        "from",
+        HoverDocSpec{
+            .signature = "@from",
+            .summary = "Synthesizes an automatic `FromError` error-conversion branch on an `enum` error variant for `?` propagation.",
+        },
+    },
+    .{
+        "ifunc",
+        HoverDocSpec{
+            .signature = "@ifunc(resolver_fn)",
+            .summary = "Binds a symbol to a runtime CPU-feature dispatch resolver on targets supporting indirect functions.",
+        },
+    },
+    .{
+        "inline",
+        HoverDocSpec{
+            .signature = "@inline",
+            .summary = "Instructs the MIR and backend optimizers to inline calls to this function across module boundaries.",
+        },
+    },
+    .{
+        "linear",
+        HoverDocSpec{
+            .signature = "@linear",
+            .summary = "Marks a resource type as must-consume (`Tier 3`): values cannot be implicitly dropped or leaked on any path (`E0304`).",
+        },
+    },
+    .{
+        "link_lib",
+        HoverDocSpec{
+            .signature = "@link_lib(\"name\")",
+            .summary = "Instructs the built-in linker driver to link against native system or static library `name`.",
+        },
+    },
+    .{
+        "link_name",
+        HoverDocSpec{
+            .signature = "@link_name(\"symbol\")",
+            .summary = "Overrides the exact mangled/unmangled linker symbol name emitted or imported for a function or static.",
+        },
+    },
+    .{
+        "link_section",
+        HoverDocSpec{
+            .signature = "@link_section(\".section\")",
+            .summary = "Places the compiled function or static data into the specified object-file section.",
+        },
+    },
+    .{
+        "local",
+        HoverDocSpec{
+            .signature = "@local",
+            .summary = "Restricts a parameter or closure to stack-scoped non-escaping execution without heap capture.",
+        },
+    },
+    .{
+        "max_stack",
+        HoverDocSpec{
+            .signature = "@max_stack(bytes: usize)",
+            .summary = "Compile-time call-graph stack budget contract rejecting transitive stack usage above `bytes` or recursion (`E0321`).",
+        },
+    },
+    .{
+        "may_be_null",
+        HoverDocSpec{
+            .signature = "@may_be_null",
+            .summary = "FFI pointer contract requiring an explicit null check before dereferencing (`E0311`).",
+        },
+    },
+    .{
+        "must_use",
+        HoverDocSpec{
+            .signature = "@must_use",
+            .summary = "Emits a diagnostic (`E0413`) whenever a call's return value (or returned type) is ignored without `_ = expr;`.",
+        },
+    },
+    .{
+        "must_vectorize",
+        HoverDocSpec{
+            .signature = "@must_vectorize",
+            .summary = "Asserts that the annotated loop vectorizes cleanly without scalarizing dependencies.",
+        },
+    },
+    .{
+        "no_alloc",
+        HoverDocSpec{
+            .signature = "@no_alloc",
+            .summary = "Compile-time effect contract verifying zero transitive heap allocations across the call graph (`E0320`).",
+        },
+    },
+    .{
+        "no_block",
+        HoverDocSpec{
+            .signature = "@no_block",
+            .summary = "Compile-time effect contract forbidding blocking syscalls or thread locks inside async/real-time paths (`E0322`).",
+        },
+    },
+    .{
+        "no_panic",
+        HoverDocSpec{
+            .signature = "@no_panic",
+            .summary = "Compile-time effect contract verifying that no panic, trap, or unchecked bounds/overflow failure is reachable (`E0320`).",
+        },
+    },
+    .{
+        "noinline",
+        HoverDocSpec{
+            .signature = "@noinline",
+            .summary = "Prevents the MIR and backend optimizers from inlining calls to this function.",
+        },
+    },
+    .{
+        "non_null",
+        HoverDocSpec{
+            .signature = "@non_null",
+            .summary = "FFI pointer contract asserting that the pointer is guaranteed non-null across the ABI boundary (`E0311`).",
+        },
+    },
+    .{
+        "not_send",
+        HoverDocSpec{
+            .signature = "@not_send",
+            .summary = "Opts a type out of cross-thread ownership transfer (`Send`), rejecting cross-worker `TaskGroup.spawn` captures (`E0309`).",
+        },
+    },
+    .{
+        "not_sync",
+        HoverDocSpec{
+            .signature = "@not_sync",
+            .summary = "Opts a type out of concurrent shared-reference access (`Sync`) across threads (`E0309`).",
+        },
+    },
+    .{
+        "null_terminated",
+        HoverDocSpec{
+            .signature = "@null_terminated",
+            .summary = "FFI pointer contract requiring a verified trailing NUL (`0`) byte on C string pointers (`E0308`).",
+        },
+    },
+    .{
+        "out_param",
+        HoverDocSpec{
+            .signature = "@out_param",
+            .summary = "FFI parameter contract marking a raw mutable pointer as write-only output initialized by the callee.",
+        },
+    },
+    .{
+        "overload",
+        HoverDocSpec{
+            .signature = "@overload",
+            .summary = "Enables explicit static arity/type-disjoint function overloading within an explicit overload set.",
+        },
+    },
+    .{
+        "owned_by_caller",
+        HoverDocSpec{
+            .signature = "@owned_by_caller",
+            .summary = "FFI return contract requiring the caller to release the returned pointer via its `@free_with` disposer (`E0310`).",
+        },
+    },
+    .{
+        "packed",
+        HoverDocSpec{
+            .signature = "@packed",
+            .summary = "Eliminates inter-field alignment padding on a `struct` (`1`-byte field alignment).",
+        },
+    },
+    .{
+        "repr",
+        HoverDocSpec{
+            .signature = "@repr(C | u8 | i32 | transparent | …)",
+            .summary = "Specifies the deterministic memory and ABI layout representation of a `struct`, `enum`, or `union`.",
+        },
+    },
+    .{
+        "secret",
+        HoverDocSpec{
+            .signature = "@secret",
+            .summary = "Marks cryptographic key/secret data for constant-time handling, zeroization on drop, and redacted debug output.",
+        },
+    },
+    .{
+        "simd",
+        HoverDocSpec{
+            .signature = "@simd",
+            .summary = "Marks a fixed-lane vector type as mapping directly to hardware SIMD registers.",
+        },
+    },
+    .{
+        "slice_len",
+        HoverDocSpec{
+            .signature = "@slice_len(param_or_expr)",
+            .summary = "FFI spatial contract binding a raw element pointer's valid count to a companion length parameter (`E0307`, `E0312`).",
+        },
+    },
+    .{
+        "soa",
+        HoverDocSpec{
+            .signature = "@soa",
+            .summary = "Enables Structure-of-Arrays (`#soa [T]`) multi-array column layout transformation for cache-dense SIMD iteration.",
+        },
+    },
+    .{
+        "std_cap_boundary",
+        HoverDocSpec{
+            .signature = "@std_cap_boundary(clears: […])",
+            .summary = "Internal `core`/`stdlib` capability boundary discharging audited low-level `unsafe_op` / `ffi` effects.",
+        },
+    },
+    .{
+        "test",
+        HoverDocSpec{
+            .signature = "@test(…)",
+            .summary = "Configures deterministic simulation (`--sim`), timeout, or property-testing options on a `test` item.",
+        },
+    },
+    .{
+        "thread_local",
+        HoverDocSpec{
+            .signature = "@thread_local",
+            .summary = "Places a static variable in thread-local storage (TLS) and forbids cross-thread pointer escape (`E0309`).",
+        },
+    },
+    .{
+        "trusted",
+        HoverDocSpec{
+            .signature = "@trusted",
+            .summary = "Audited FFI safety contract asserting that an external function upholds its declared pointer/spatial invariants.",
+        },
+    },
+    .{
+        "vectorize_width",
+        HoverDocSpec{
+            .signature = "@vectorize_width(lanes: usize)",
+            .summary = "Specifies the target SIMD lane width for loop auto-vectorization.",
+        },
+    },
+    .{
+        "wasm_export",
+        HoverDocSpec{
+            .signature = "@wasm_export(\"name\")",
+            .summary = "Exports a function in a WebAssembly module's export table under `name`.",
+        },
+    },
+    .{
+        "wasm_import",
+        HoverDocSpec{
+            .signature = "@wasm_import(module: \"env\", name: \"fn\")",
+            .summary = "Imports an `extern` function from a WebAssembly host module and symbol name.",
+        },
+    },
+    .{
+        "zero_pad",
+        HoverDocSpec{
+            .signature = "@zero_pad",
+            .summary = "Guarantees all padding bytes inside a `struct` or `union` are deterministically zero-initialized (`IntoBytes`-safe).",
+        },
+    },
+});
+
+/// $O(1)$ hover documentation catalog for all 36 canonical compiler `@intrinsic` operations.
+const INTRINSIC_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
+    .{
+        "align_of",
+        HoverDocSpec{
+            .signature = "@align_of[T]() -> usize",
+            .summary = "Returns the compile-time minimum byte alignment of type `T`.",
+        },
+    },
+    .{
+        "as_bytes",
+        HoverDocSpec{
+            .signature = "@as_bytes[T](val: &T) -> &[u8]",
+            .summary = "Reinterprets an immutable `IntoBytes`-safe value reference as a zero-copy read-only byte slice.",
+        },
+    },
+    .{
+        "atomic_cmpxchg",
+        HoverDocSpec{
+            .signature = "@atomic_cmpxchg[T](ptr: *mut T, expected: T, desired: T, ok_ord: u8, fail_ord: u8) -> (T, bool)",
+            .summary = "Atomically compares `ptr.*` with `expected`, stores `desired` if equal, and returns `(prev, swapped)`. Requires `unsafe`.",
+        },
+    },
+    .{
+        "atomic_fence",
+        HoverDocSpec{
+            .signature = "@atomic_fence(order: u8)",
+            .summary = "Emits a hardware/compiler memory ordering fence (`Acquire = 1`, `Release = 2`, `AcqRel = 3`, `SeqCst = 4`).",
+        },
+    },
+    .{
+        "atomic_load",
+        HoverDocSpec{
+            .signature = "@atomic_load[T](ptr: *T, order: u8) -> T",
+            .summary = "Atomically loads and returns the value at `ptr` using memory ordering `order`. Requires `unsafe`.",
+        },
+    },
+    .{
+        "atomic_rmw_add",
+        HoverDocSpec{
+            .signature = "@atomic_rmw_add[T](ptr: *mut T, delta: T, order: u8) -> T",
+            .summary = "Atomically adds `delta` to `ptr.*` (wrapping) and returns the previous value. Requires `unsafe`.",
+        },
+    },
+    .{
+        "atomic_rmw_sub",
+        HoverDocSpec{
+            .signature = "@atomic_rmw_sub[T](ptr: *mut T, delta: T, order: u8) -> T",
+            .summary = "Atomically subtracts `delta` from `ptr.*` (wrapping) and returns the previous value. Requires `unsafe`.",
+        },
+    },
+    .{
+        "atomic_rmw_xchg",
+        HoverDocSpec{
+            .signature = "@atomic_rmw_xchg[T](ptr: *mut T, new_val: T, order: u8) -> T",
+            .summary = "Atomically replaces `ptr.*` with `new_val` and returns the previous value. Requires `unsafe`.",
+        },
+    },
+    .{
+        "atomic_store",
+        HoverDocSpec{
+            .signature = "@atomic_store[T](ptr: *mut T, val: T, order: u8)",
+            .summary = "Atomically stores `val` into `ptr` using memory ordering `order`. Requires `unsafe`.",
+        },
+    },
+    .{
+        "bit_cast",
+        HoverDocSpec{
+            .signature = "@bit_cast[Dst, Src](val: Src) -> Dst",
+            .summary = "Reinterprets the bit pattern of `val` as `Dst`; statically verifies `@size_of[Src]() == @size_of[Dst]()` and bit validity.",
+        },
+    },
+    .{
+        "c_import",
+        HoverDocSpec{
+            .signature = "@c_import(\"header.h\", …)",
+            .summary = "Parses and translates C11/C23 declarations from `header.h` in-process without `libclang`, caching bindings in `CompilerDb`.",
+        },
+    },
+    .{
+        "caller_location",
+        HoverDocSpec{
+            .signature = "@caller_location() -> SourceLoc",
+            .summary = "Captures the caller's compile-time file, line, and column `SourceLoc` at the call site.",
+        },
+    },
+    .{
+        "compile_assert",
+        HoverDocSpec{
+            .signature = "@compile_assert(cond: bool, msg: str = …)",
+            .summary = "Evaluates `cond` at compile time and emits a compilation error if `false`.",
+        },
+    },
+    .{
+        "compile_error",
+        HoverDocSpec{
+            .signature = "@compile_error(msg: str) -> never",
+            .summary = "Unconditionally aborts compilation with diagnostic message `msg` when reached during semantic/comptime evaluation.",
+        },
+    },
+    .{
+        "default_init",
+        HoverDocSpec{
+            .signature = "@default_init[T]() -> T",
+            .summary = "Constructs the canonical zero/default representation of scalar, pointer, or default-initializable type `T`.",
+        },
+    },
+    .{
+        "drop_trace",
+        HoverDocSpec{
+            .signature = "@drop_trace(tag: i64)",
+            .summary = "Records deterministic drop-elaboration trace marker `tag` in `MirVm` and backend verification harnesses.",
+        },
+    },
+    .{
+        "embed_bytes",
+        HoverDocSpec{
+            .signature = "@embed_bytes(\"relative/path\") -> &[u8]",
+            .summary = "Embeds a workspace-sandboxed file directly into `.rodata` at compile time as an immutable byte slice.",
+        },
+    },
+    .{
+        "field",
+        HoverDocSpec{
+            .signature = "@field(target, comptime field_name: str)",
+            .summary = "Accesses or projects struct field `field_name` statically at compile time during reflection/serialization.",
+        },
+    },
+    .{
+        "field_attr_lookup",
+        HoverDocSpec{
+            .signature = "@field_attr_lookup[T, Attr](comptime field_name: str) -> Attr?",
+            .summary = "Queries compile-time `@attribute_schema` metadata `Attr` attached to field `field_name` of `T`.",
+        },
+    },
+    .{
+        "from_bytes",
+        HoverDocSpec{
+            .signature = "@from_bytes[T](bytes: &[u8]) -> T",
+            .summary = "Reads a `FromBytes`-verified value `T` from `bytes` with compile-time/checked size validation.",
+        },
+    },
+    .{
+        "has_field",
+        HoverDocSpec{
+            .signature = "@has_field[T](comptime field_name: str) -> bool",
+            .summary = "Returns `true` at compile time if nominal type `T` declares a field named `field_name`.",
+        },
+    },
+    .{
+        "implements",
+        HoverDocSpec{
+            .signature = "@implements[T, Trait]() -> bool",
+            .summary = "Returns `true` at compile time if type `T` satisfies trait or Constrained Type Group `Trait`.",
+        },
+    },
+    .{
+        "panic",
+        HoverDocSpec{
+            .signature = "@panic(msg: str) -> never",
+            .summary = "Triggers an immediate unrecoverable panic abort/unwind with message `msg`.",
+        },
+    },
+    .{
+        "poll_reload",
+        HoverDocSpec{
+            .signature = "@poll_reload() -> bool",
+            .summary = "Polls the development hot-reload coordinator for updated module artifacts.",
+        },
+    },
+    .{
+        "simd_add",
+        HoverDocSpec{
+            .signature = "@simd_add[T, const N: usize](lhs: Simd[T, N], rhs: Simd[T, N]) -> Simd[T, N]",
+            .summary = "Performs lane-wise hardware SIMD addition across `N` lanes of `T`.",
+        },
+    },
+    .{
+        "simd_mul",
+        HoverDocSpec{
+            .signature = "@simd_mul[T, const N: usize](lhs: Simd[T, N], rhs: Simd[T, N]) -> Simd[T, N]",
+            .summary = "Performs lane-wise hardware SIMD multiplication across `N` lanes of `T`.",
+        },
+    },
+    .{
+        "simd_reduce_add",
+        HoverDocSpec{
+            .signature = "@simd_reduce_add[T, const N: usize](vec: Simd[T, N]) -> T",
+            .summary = "Horizontally sums all `N` lanes of `vec` into a single scalar `T`.",
+        },
+    },
+    .{
+        "simd_splat",
+        HoverDocSpec{
+            .signature = "@simd_splat[T, const N: usize](scalar: T) -> Simd[T, N]",
+            .summary = "Broadcasts `scalar` across all `N` lanes of a `Simd[T, N]` vector.",
+        },
+    },
+    .{
+        "simd_sub",
+        HoverDocSpec{
+            .signature = "@simd_sub[T, const N: usize](lhs: Simd[T, N], rhs: Simd[T, N]) -> Simd[T, N]",
+            .summary = "Performs lane-wise hardware SIMD subtraction across `N` lanes of `T`.",
+        },
+    },
+    .{
+        "size_of",
+        HoverDocSpec{
+            .signature = "@size_of[T]() -> usize",
+            .summary = "Returns the compile-time stride size in bytes of type `T`.",
+        },
+    },
+    .{
+        "sys_exit",
+        HoverDocSpec{
+            .signature = "@sys_exit(code: i32) -> never",
+            .summary = "Terminates the current process immediately with status `code` via target OS/WASI syscall.",
+        },
+    },
+    .{
+        "sys_write",
+        HoverDocSpec{
+            .signature = "@sys_write(fd: i32, ptr: *u8, len: usize) -> isize",
+            .summary = "Writes `len` bytes from `ptr` to file descriptor `fd` via low-level target syscall.",
+        },
+    },
+    .{
+        "trap",
+        HoverDocSpec{
+            .signature = "@trap() -> never",
+            .summary = "Emits an immediate hardware illegal-instruction trap (`ud2` / `brk` / `unreachable`).",
+        },
+    },
+    .{
+        "type_info",
+        HoverDocSpec{
+            .signature = "@type_info[T]() -> TypeInfo",
+            .summary = "Returns the compile-time `cx.meta.TypeInfo` structural reflection mirror for `T`.",
+        },
+    },
+    .{
+        "type_name",
+        HoverDocSpec{
+            .signature = "@type_name[T]() -> str",
+            .summary = "Returns the canonical compile-time UTF-8 string name of type `T`.",
+        },
+    },
+    .{
+        "view_bytes",
+        HoverDocSpec{
+            .signature = "@view_bytes[T](ptr: *T, byte_len: usize) -> &[u8]",
+            .summary = "Constructs a bounded read-only byte slice view over `byte_len` bytes starting at `ptr`. Requires `unsafe`.",
+        },
+    },
+});
+
+comptime {
+    @setEvalBranchQuota(16_384);
+    if (BUILTIN_ATTR_HOVER_MAP.keys().len != type_system.BUILTIN_ATTRIBUTE_MAP.keys().len) {
+        @compileError("BUILTIN_ATTR_HOVER_MAP drifted from type_system.BUILTIN_ATTRIBUTE_MAP");
+    }
+    for (type_system.BUILTIN_ATTRIBUTE_MAP.keys()) |attr_key| {
+        if (!BUILTIN_ATTR_HOVER_MAP.has(attr_key)) {
+            @compileError("Missing LSP hover documentation for @" ++ attr_key);
+        }
+    }
+    if (INTRINSIC_HOVER_MAP.keys().len != type_system.INTRINSIC_NAME_MAP.keys().len) {
+        @compileError("INTRINSIC_HOVER_MAP drifted from type_system.INTRINSIC_NAME_MAP");
+    }
+    for (type_system.INTRINSIC_NAME_MAP.keys()) |intr_key| {
+        if (!INTRINSIC_HOVER_MAP.has(intr_key)) {
+            @compileError("Missing LSP hover documentation for @" ++ intr_key);
+        }
+    }
+}
 
 /// Sorted CoreX surface keywords offered during lexical scope completion.
 const COMPLETION_KEYWORDS = [_][]const u8{
@@ -2293,11 +2988,12 @@ fn mountCxTreeSubmodulesShallow(
     }
 }
 
-/// Lazily mounts `core/root.cx` at `Durability.high` (`PackageId.std_core`) if available on disk.
+/// Lazily mounts `core/root.cx` (`PackageId.std_core`) at `.medium` under `--internal-core`, else `.high`.
 fn mountWorkspaceCoreStdlibLazy(
     session: *LspSession,
     visited_fids: *std.AutoHashMapUnmanaged(u32, void),
 ) !void {
+    const core_durability: Durability = if (session.options.is_internal_core) .medium else .high;
     var ws_core_path_opt: ?[]u8 = null;
     defer if (ws_core_path_opt) |owned_p| session.allocator.free(owned_p);
 
@@ -2316,7 +3012,7 @@ fn mountWorkspaceCoreStdlibLazy(
                 session,
                 core_fid,
                 ws_core,
-                .high,
+                core_durability,
                 .std_core,
                 visited_fids,
                 0,
@@ -2334,7 +3030,7 @@ fn mountWorkspaceCoreStdlibLazy(
         session,
         core_fid,
         chosen_core_path,
-        .high,
+        core_durability,
         .std_core,
         visited_fids,
         0,
@@ -3515,6 +4211,77 @@ fn classifySymbolSemanticStyle(
     return .{ .tok_type = tok_type, .mod_bits = mods };
 }
 
+/// Resolves the identifier `TokenIndex` representing `ast_id` (unwrapping `.` on variants/members and `@` on intrinsics).
+fn resolveAstNodeFocalToken(
+    parsed_art: *const query_db.ParsedCstArtifact,
+    ast_id: NodeIndex,
+) TokenIndex {
+    const ast_node = parsed_art.ast_arena.getNode(ast_id);
+    const tok_count = parsed_art.token_buffer.countTokens();
+    switch (ast_node.tag) {
+        .field_access => {
+            if (ast_node.rhs.tag == .token and ast_node.rhs.payload < tok_count) {
+                return TokenIndex.fromInt(ast_node.rhs.payload);
+            }
+        },
+        .method_call => {
+            if (ast_node.rhs.tag == .extra and ast_node.rhs.payload < parsed_art.ast_arena.extra_data.items.len) {
+                const member_raw = parsed_art.ast_arena.extra_data.items[ast_node.rhs.payload];
+                if (member_raw < tok_count) return TokenIndex.fromInt(member_raw);
+            }
+        },
+        .contextual_variant => {
+            if (ast_node.lhs.tag == .token and ast_node.lhs.payload < tok_count) {
+                return TokenIndex.fromInt(ast_node.lhs.payload);
+            }
+        },
+        .incomplete_call => {
+            if (ast_node.lhs.tag == .token and ast_node.lhs.payload < tok_count and
+                !ast_node.main_token.isNone() and ast_node.main_token.asInt() < tok_count and
+                parsed_art.token_buffer.getToken(ast_node.main_token).kind == .dot)
+            {
+                return TokenIndex.fromInt(ast_node.lhs.payload);
+            }
+        },
+        .ident_expr => {
+            if (ast_node.lhs.tag == .token and ast_node.lhs.payload < tok_count and
+                !ast_node.main_token.isNone() and ast_node.main_token.asInt() < tok_count and
+                parsed_art.token_buffer.getToken(ast_node.main_token).kind == .at)
+            {
+                return TokenIndex.fromInt(ast_node.lhs.payload);
+            }
+        },
+        .variant_pat => {
+            const pat_cst = parsed_art.ast_arena.getCstOrigin(ast_id);
+            if (!pat_cst.isNone() and pat_cst.asInt() < parsed_art.cst_arena.countNodes()) {
+                const start_idx: usize = pat_cst.asInt();
+                const end_idx = @min(
+                    start_idx + @max(@as(usize, parsed_art.cst_arena.getNode(pat_cst).subtree_size), 1),
+                    parsed_art.cst_arena.countNodes(),
+                );
+                var last_ident_tok: TokenIndex = .none;
+                var cur = start_idx + 1;
+                while (cur < end_idx) : (cur += 1) {
+                    const sub = parsed_art.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+                    if (sub.subtree_size <= 1 and !sub.flags.is_bracketed and
+                        !sub.flags.is_missing_or_injected and !sub.token.isNone() and
+                        sub.token.asInt() < tok_count)
+                    {
+                        const leaf_kind = parsed_art.token_buffer.getToken(sub.token).kind;
+                        if (leaf_kind == .lparen or leaf_kind == .lbrace) break;
+                        if (symbol_resolver.isIdentifierToken(leaf_kind)) {
+                            last_ident_tok = sub.token;
+                        }
+                    }
+                }
+                if (!last_ident_tok.isNone()) return last_ident_tok;
+            }
+        },
+        else => {},
+    }
+    return ast_node.main_token;
+}
+
 /// Computes the 5-`u32`-per-token delta-encoded semantic token stream for `file_id` (optionally clipped to `range_opt`).
 fn computeSemanticTokensData(
     session: *LspSession,
@@ -3539,6 +4306,8 @@ fn computeSemanticTokensData(
     @memset(tok_extra_mods, 0);
     var tok_is_decl = try arena_alloc.alloc(bool, tok_count);
     @memset(tok_is_decl, false);
+    var tok_variant_tier = try arena_alloc.alloc(u8, tok_count);
+    @memset(tok_variant_tier, 0);
 
     // Map AST nodes and MVS move/mutation sites from per-`DefId` `BodySemanticSideTables`:
     for (entries) |entry| {
@@ -3555,22 +4324,27 @@ fn computeSemanticTokensData(
             const ast_id = NodeIndex.fromInt(ast_raw);
             const ast_node = parsed_art.ast_arena.getNode(ast_id);
             const resolved_sym = side_tables.getNodeSymbol(ast_id);
-            if (!resolved_sym.isNone() and !ast_node.main_token.isNone() and
-                ast_node.main_token.asInt() < tok_count)
-            {
-                if (ast_node.tag == .method_call and ast_node.rhs.tag == .extra) {
-                    const member_tok_raw = parsed_art.ast_arena.extra_data.items[ast_node.rhs.payload];
-                    if (member_tok_raw < tok_count) {
-                        tok_symbols[member_tok_raw] = resolved_sym;
-                    }
-                } else if (ast_node.tag == .field_access and ast_node.rhs.tag == .token) {
-                    if (ast_node.rhs.payload < tok_count) {
-                        tok_symbols[ast_node.rhs.payload] = resolved_sym;
-                    }
-                } else {
-                    tok_symbols[ast_node.main_token.asInt()] = resolved_sym;
+            const focal_tok = resolveAstNodeFocalToken(parsed_art, ast_id);
+            if (!focal_tok.isNone() and focal_tok.asInt() < tok_count) {
+                if (!resolved_sym.isNone()) {
+                    tok_symbols[focal_tok.asInt()] = resolved_sym;
                     if (ast_node.tag == .bind_pat or ast_node.tag == .local_var_decl) {
-                        tok_is_decl[ast_node.main_token.asInt()] = true;
+                        tok_is_decl[focal_tok.asInt()] = true;
+                    }
+                } else if (parsed_art.token_buffer.getToken(focal_tok).kind == .type_ident) {
+                    const focal_lex = symbol_resolver.extractTokenSlice(src, &parsed_art.token_buffer, focal_tok);
+                    const is_dot_variant = ast_node.tag == .contextual_variant or
+                        (ast_node.tag == .incomplete_call and ast_node.lhs.tag == .token and
+                            !ast_node.main_token.isNone() and ast_node.main_token.asInt() < tok_count and
+                            parsed_art.token_buffer.getToken(ast_node.main_token).kind == .dot) or
+                        (ast_node.tag == .variant_pat and !ast_node.main_token.isNone() and
+                            ast_node.main_token.asInt() < tok_count and
+                            parsed_art.token_buffer.getToken(ast_node.main_token).kind == .dot);
+                    if (is_dot_variant or
+                        ((ast_node.tag == .variant_pat or ast_node.tag == .field_access or ast_node.tag == .method_call) and
+                            BUILTIN_VARIANT_SET.has(focal_lex)))
+                    {
+                        tok_variant_tier[focal_tok.asInt()] = if (BUILTIN_VARIANT_SET.has(focal_lex)) 2 else 1;
                     }
                 }
             }
@@ -3729,9 +4503,37 @@ fn computeSemanticTokensData(
             continue;
         }
 
+        if (tok_variant_tier[tok_i] != 0) {
+            const var_mods: u32 = if (tok_variant_tier[tok_i] == 2) SEM_MOD_DEFAULT_LIB else 0;
+            try appendSplitSemanticSpan(
+                arena_alloc,
+                src,
+                line_idx,
+                session.position_encoding,
+                tok_start,
+                tok_end,
+                SEM_TOK_ENUM_MEMBER,
+                var_mods | tok_extra_mods[tok_i],
+                range_opt,
+                &raw_tokens,
+            );
+            continue;
+        }
+
+        const is_contextual_or_qual_variant = tok_rec.kind == .type_ident and tok_i > 0 and
+            parsed_art.token_buffer.getToken(TokenIndex.fromInt(@intCast(tok_i - 1))).kind == .dot and
+            (tok_i == 1 or
+                parsed_art.token_buffer.getToken(TokenIndex.fromInt(@intCast(tok_i - 2))).kind != .ident);
+
         const lexical_class: ?struct { tok_type: u32, mod_bits: u32 } = switch (tok_rec.kind) {
             .prim_type => .{ .tok_type = SEM_TOK_TYPE, .mod_bits = SEM_MOD_DEFAULT_LIB },
-            .type_ident => if (symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.has(lexeme))
+            .type_ident => if (is_contextual_or_qual_variant)
+                .{
+                    .tok_type = SEM_TOK_ENUM_MEMBER,
+                    .mod_bits = (if (BUILTIN_VARIANT_SET.has(lexeme)) SEM_MOD_DEFAULT_LIB else @as(u32, 0)) |
+                        tok_extra_mods[tok_i],
+                }
+            else if (symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.has(lexeme))
                 .{ .tok_type = SEM_TOK_TYPE, .mod_bits = SEM_MOD_DEFAULT_LIB }
             else
                 .{ .tok_type = SEM_TOK_TYPE, .mod_bits = tok_extra_mods[tok_i] },
@@ -3750,6 +4552,7 @@ fn computeSemanticTokensData(
             .kw_pub, .kw_comptime => .{ .tok_type = SEM_TOK_MODIFIER, .mod_bits = 0 },
             .kw_async, .kw_await => .{ .tok_type = SEM_TOK_KEYWORD, .mod_bits = SEM_MOD_ASYNC },
             .kw_unsafe, .kw_extern => .{ .tok_type = SEM_TOK_KEYWORD, .mod_bits = SEM_MOD_UNSAFE },
+            .kw_true, .kw_false => null,
             .int_lit, .float_lit => .{ .tok_type = SEM_TOK_NUMBER, .mod_bits = 0 },
             .string_lit, .char_lit, .byte_lit, .byte_string_lit => .{ .tok_type = SEM_TOK_STRING, .mod_bits = 0 },
             else => if (@backingInt(tok_rec.kind) <= @backingInt(TokenKind.kw_not))
@@ -3980,7 +4783,9 @@ fn findTokenAtCursorByte(token_buffer: *const TokenBuffer, cursor_byte: u32) Tok
             }
             best_tok = tok_id;
         } else if (cursor_byte == end_b and
-            (isUserIdentifierToken(rec.kind) or rec.kind == .kw_self_val or rec.kind == .kw_self_type))
+            (isUserIdentifierToken(rec.kind) or rec.kind == .kw_self_val or rec.kind == .kw_self_type or
+                (i > 0 and isIdentifierOrKeywordToken(rec.kind) and
+                    token_buffer.getToken(TokenIndex.fromInt(@intCast(i - 1))).kind == .at)))
         {
             return tok_id;
         }
@@ -4238,15 +5043,7 @@ fn resolveCursorTarget(
                     );
                     while (ast_raw < ast_limit) : (ast_raw += 1) {
                         const ast_id = NodeIndex.fromInt(ast_raw);
-                        const ast_node = parsed_art.ast_arena.getNode(ast_id);
-                        var is_token_match = (ast_node.main_token == tok_idx);
-                        if (!is_token_match and ast_node.tag == .field_access and ast_node.rhs.tag == .token) {
-                            is_token_match = (TokenIndex.fromInt(ast_node.rhs.payload) == tok_idx);
-                        } else if (!is_token_match and ast_node.tag == .method_call and ast_node.rhs.tag == .extra) {
-                            const member_raw = parsed_art.ast_arena.extra_data.items[ast_node.rhs.payload];
-                            is_token_match = (TokenIndex.fromInt(member_raw) == tok_idx);
-                        }
-                        if (!is_token_match) continue;
+                        if (resolveAstNodeFocalToken(parsed_art, ast_id) != tok_idx) continue;
 
                         const cand_sym = side_tables.getNodeSymbol(ast_id);
                         const cand_ty = side_tables.getNodeType(ast_id);
@@ -4756,6 +5553,43 @@ fn appendFnHoverContractBullets(
     }
 }
 
+/// Formats a hover response JSON-RPC frame for `(hover_span, markdown_text)` and flushes `out_writer`.
+fn writeMarkdownHoverFrame(
+    session: *LspSession,
+    fid: FileId,
+    hover_span: Span,
+    markdown_text: []const u8,
+    out_writer: *std.Io.Writer,
+    rpc_id: JsonRpcId,
+) !void {
+    const hover_range = spanToLspRange(session, fid, hover_span);
+    session.outbound_buf.clearRetainingCapacity();
+    const body_writer = &session.outbound_buf.writer;
+    try body_writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+    try writeJsonRpcId(body_writer, rpc_id);
+    try body_writer.writeAll(",\"result\":{\"contents\":{\"kind\":\"markdown\",\"value\":");
+    try writeJsonString(body_writer, markdown_text);
+    try body_writer.writeAll("},\"range\":");
+    try writeLspRangeJson(body_writer, hover_range);
+    try body_writer.writeAll("}}");
+    try flushOutboundJsonFrame(out_writer, session.outbound_buf.written());
+}
+
+/// Unwraps reference/pointer layers around `raw_ty` so `.optional_ty`, `.result_ty`, or `.enum_ty` can be inspected.
+fn unwrapHoverValueType(pool: *const InternPool, raw_ty: TypeId) TypeId {
+    var cur_ty = raw_ty;
+    var depth: u32 = 0;
+    while (!cur_ty.isError() and !cur_ty.isPrimitiveOrSentinel() and depth < 16) : (depth += 1) {
+        const node = pool.getNode(cur_ty);
+        if (node.tag == .ref_ty or node.tag == .mut_ref_ty) {
+            cur_ty = TypeId.fromInt(node.lhs);
+        } else {
+            break;
+        }
+    }
+    return cur_ty;
+}
+
 /// Handles `textDocument/hover`: renders ` ```corex ` signature + `DR-17` §4.4 bullets + `///`/`//!` docs.
 fn handleHoverRequest(
     session: *LspSession,
@@ -4765,7 +5599,7 @@ fn handleHoverRequest(
     rpc_id: JsonRpcId,
 ) !void {
     const raw_uri = (try extractValidatedRequestUri(session, params, out_writer, rpc_id)) orelse return;
-    const pos = extractJsonPosition(params.getField("position") orelse JsonValue{ .null_val = {} }) orelse {
+    var pos = extractJsonPosition(params.getField("position") orelse JsonValue{ .null_val = {} }) orelse {
         return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing position");
     };
 
@@ -4774,8 +5608,147 @@ fn handleHoverRequest(
         return writeNullResultFrame(session, out_writer, rpc_id);
     }
 
+    // [1] Built-in `@attribute` and `@intrinsic` hover lookup (on `@` or the immediately following name):
+    if (getLiveDocumentSource(session, fid)) |live_src| {
+        const parsed_cst = try session.db.parseCst(fid);
+        const cursor_byte = lspPositionToByteOffset(session, fid, pos);
+        const raw_tok = findTokenAtCursorByte(&parsed_cst.token_buffer, cursor_byte);
+        const tok_count = parsed_cst.token_buffer.countTokens();
+        if (!raw_tok.isNone() and raw_tok.asInt() < tok_count) {
+            const cur_rec = parsed_cst.token_buffer.getToken(raw_tok);
+            var at_tok: TokenIndex = .none;
+            var name_tok: TokenIndex = .none;
+            if (cur_rec.kind == .at and raw_tok.asInt() + 1 < tok_count) {
+                const next_id = TokenIndex.fromInt(raw_tok.asInt() + 1);
+                if (isIdentifierOrKeywordToken(parsed_cst.token_buffer.getToken(next_id).kind)) {
+                    at_tok = raw_tok;
+                    name_tok = next_id;
+                }
+            } else if (raw_tok.asInt() > 0 and isIdentifierOrKeywordToken(cur_rec.kind)) {
+                const prev_id = TokenIndex.fromInt(raw_tok.asInt() - 1);
+                if (parsed_cst.token_buffer.getToken(prev_id).kind == .at) {
+                    at_tok = prev_id;
+                    name_tok = raw_tok;
+                }
+            }
+
+            if (!at_tok.isNone() and !name_tok.isNone()) {
+                const at_rec = parsed_cst.token_buffer.getToken(at_tok);
+                const name_rec = parsed_cst.token_buffer.getToken(name_tok);
+                const name_lex = symbol_resolver.extractTokenSlice(live_src, &parsed_cst.token_buffer, name_tok);
+                if (INTRINSIC_HOVER_MAP.get(name_lex) orelse BUILTIN_ATTR_HOVER_MAP.get(name_lex)) |doc_spec| {
+                    const doc_md = try std.fmt.allocPrint(
+                        arena_alloc,
+                        "```corex\n{s}\n```\n\n---\n\n{s}",
+                        .{ doc_spec.signature, doc_spec.summary },
+                    );
+                    const full_at_span = Span.init(fid, at_rec.byte_offset, name_rec.byte_offset +| name_rec.byte_len);
+                    return writeMarkdownHoverFrame(session, fid, full_at_span, doc_md, out_writer, rpc_id);
+                }
+                if (cur_rec.kind == .at) {
+                    pos = byteOffsetToLspPosition(session, fid, name_rec.byte_offset);
+                }
+            }
+        }
+    }
+
     const target = try resolveCursorTarget(session, fid, pos);
-    if (target.token_index.isNone() or (target.symbol_index.isNone() and target.type_id.isError())) {
+    if (target.token_index.isNone()) {
+        return writeNullResultFrame(session, out_writer, rpc_id);
+    }
+
+    // [2] Built-in prelude `Option[T]` / `Result[T, E]` variant hover (`.Some`, `.None`, `.Ok`, `.Err`):
+    if (target.symbol_index.isNone()) {
+        if (getLiveDocumentSource(session, fid)) |live_src| {
+            if (session.db.parsed_artifacts.getPtr(fid.asInt())) |parsed_art| {
+                const tok_raw = target.token_index.asInt();
+                if (tok_raw > 0 and tok_raw < parsed_art.token_buffer.countTokens() and
+                    parsed_art.token_buffer.getToken(TokenIndex.fromInt(tok_raw - 1)).kind == .dot)
+                {
+                    const var_lex = symbol_resolver.extractTokenSlice(
+                        live_src,
+                        &parsed_art.token_buffer,
+                        target.token_index,
+                    );
+                    if (BUILTIN_VARIANT_SET.has(var_lex)) {
+                        var inner_buf_a: [256]u8 = undefined;
+                        var inner_buf_b: [256]u8 = undefined;
+                        const unwrapped_ty = unwrapHoverValueType(&session.db.type_pool, target.type_id);
+                        var sig_line: []const u8 = "";
+                        var summary_line: []const u8 = "";
+
+                        if (std.mem.eql(u8, var_lex, "Some") or std.mem.eql(u8, var_lex, "None")) {
+                            const inner_str: []const u8 = if (!unwrapped_ty.isError() and
+                                !unwrapped_ty.isPrimitiveOrSentinel() and
+                                session.db.type_pool.getNode(unwrapped_ty).tag == .optional_ty)
+                                session.db.type_pool.formatType(
+                                    TypeId.fromInt(session.db.type_pool.getNode(unwrapped_ty).lhs),
+                                    &session.db.symbol_table,
+                                    &inner_buf_a,
+                                )
+                            else
+                                "T";
+                            if (std.mem.eql(u8, var_lex, "Some")) {
+                                sig_line = try std.fmt.allocPrint(
+                                    arena_alloc,
+                                    "Option[{s}].Some({s})",
+                                    .{ inner_str, inner_str },
+                                );
+                                summary_line = "Present value variant of `Option[T]` (`T?`).";
+                            } else {
+                                sig_line = try std.fmt.allocPrint(arena_alloc, "Option[{s}].None", .{inner_str});
+                                summary_line = "Absent value variant of `Option[T]` (`T?`).";
+                            }
+                        } else {
+                            const has_res = !unwrapped_ty.isError() and
+                                !unwrapped_ty.isPrimitiveOrSentinel() and
+                                session.db.type_pool.getNode(unwrapped_ty).tag == .result_ty;
+                            const ok_str: []const u8 = if (has_res)
+                                session.db.type_pool.formatType(
+                                    TypeId.fromInt(session.db.type_pool.getNode(unwrapped_ty).lhs),
+                                    &session.db.symbol_table,
+                                    &inner_buf_a,
+                                )
+                            else
+                                "T";
+                            const err_str: []const u8 = if (has_res)
+                                session.db.type_pool.formatType(
+                                    TypeId.fromInt(session.db.type_pool.getNode(unwrapped_ty).rhs),
+                                    &session.db.symbol_table,
+                                    &inner_buf_b,
+                                )
+                            else
+                                "E";
+                            if (std.mem.eql(u8, var_lex, "Ok")) {
+                                sig_line = try std.fmt.allocPrint(
+                                    arena_alloc,
+                                    "Result[{s}, {s}].Ok({s})",
+                                    .{ ok_str, err_str, ok_str },
+                                );
+                                summary_line = "Success payload variant of `Result[T, E]` (`T!E`).";
+                            } else {
+                                sig_line = try std.fmt.allocPrint(
+                                    arena_alloc,
+                                    "Result[{s}, {s}].Err({s})",
+                                    .{ ok_str, err_str, err_str },
+                                );
+                                summary_line = "Error payload variant of `Result[T, E]` (`T!E`).";
+                            }
+                        }
+
+                        const builtin_md = try std.fmt.allocPrint(
+                            arena_alloc,
+                            "```corex\n{s}\n```\n\n---\n\n{s}",
+                            .{ sig_line, summary_line },
+                        );
+                        return writeMarkdownHoverFrame(session, fid, target.token_span, builtin_md, out_writer, rpc_id);
+                    }
+                }
+            }
+        }
+    }
+
+    if (target.symbol_index.isNone() and target.type_id.isError()) {
         return writeNullResultFrame(session, out_writer, rpc_id);
     }
 
@@ -4868,12 +5841,31 @@ fn handleHoverRequest(
                 try mw.print("{s}: {s}", .{ sym.name_text, ty_str });
             },
             .enum_variant_sym => {
-                const eff_ty = if (!target.type_id.isError()) target.type_id else sym.type_id;
-                if (eff_ty != .unit_ty and !eff_ty.isError()) {
-                    const ty_str = session.db.type_pool.formatType(eff_ty, &session.db.symbol_table, &type_buf);
-                    try mw.print("{s}({s})", .{ sym.name_text, ty_str });
+                var enum_buf: [256]u8 = undefined;
+                const unwrapped_enum = unwrapHoverValueType(&session.db.type_pool, target.type_id);
+                const enum_prefix: []const u8 = if (!unwrapped_enum.isError() and
+                    !unwrapped_enum.isPrimitiveOrSentinel() and
+                    session.db.type_pool.getNode(unwrapped_enum).tag == .enum_ty)
+                    session.db.type_pool.formatType(unwrapped_enum, &session.db.symbol_table, &enum_buf)
+                else if (!sym.owner_def_id.isNone()) blk_owner: {
+                    if (session.db.symbol_table.def_to_symbol.get(sym.owner_def_id.asInt())) |owner_idx| {
+                        break :blk_owner session.db.symbol_table.getSymbol(owner_idx).name_text;
+                    }
+                    break :blk_owner "";
+                } else "";
+
+                if (enum_prefix.len > 0) {
+                    try mw.print("{s}.{s}", .{ enum_prefix, sym.name_text });
                 } else {
                     try mw.print(".{s}", .{sym.name_text});
+                }
+                if (sym.type_id != .unit_ty and !sym.type_id.isError()) {
+                    const payload_str = session.db.type_pool.formatType(
+                        sym.type_id,
+                        &session.db.symbol_table,
+                        &type_buf,
+                    );
+                    try mw.print("({s})", .{payload_str});
                 }
             },
             .module_sym => {
@@ -4928,17 +5920,7 @@ fn handleHoverRequest(
         try mw.print("```corex\n{s}\n```", .{ty_str});
     }
 
-    const hover_range = spanToLspRange(session, fid, target.token_span);
-    session.outbound_buf.clearRetainingCapacity();
-    const body_writer = &session.outbound_buf.writer;
-    try body_writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
-    try writeJsonRpcId(body_writer, rpc_id);
-    try body_writer.writeAll(",\"result\":{\"contents\":{\"kind\":\"markdown\",\"value\":");
-    try writeJsonString(body_writer, md_alloc.written());
-    try body_writer.writeAll("},\"range\":");
-    try writeLspRangeJson(body_writer, hover_range);
-    try body_writer.writeAll("}}");
-    try flushOutboundJsonFrame(out_writer, session.outbound_buf.written());
+    return writeMarkdownHoverFrame(session, fid, target.token_span, md_alloc.written(), out_writer, rpc_id);
 }
 
 /// Writes `{"jsonrpc":"2.0","id":…,"result":null}` and flushes `out_writer`.
@@ -5381,12 +6363,7 @@ fn collectSymbolOccurrencesInFile(
                     (resolveLiveCanonicalSymbol(session, raw_node_sym) == canonical_sym);
 
                 if (is_matched) {
-                    var hit_tok = ast_node.main_token;
-                    if (ast_node.tag == .field_access and ast_node.rhs.tag == .token) {
-                        hit_tok = TokenIndex.fromInt(ast_node.rhs.payload);
-                    } else if (ast_node.tag == .method_call and ast_node.rhs.tag == .extra) {
-                        hit_tok = TokenIndex.fromInt(parsed_art.ast_arena.extra_data.items[ast_node.rhs.payload]);
-                    }
+                    const hit_tok = resolveAstNodeFocalToken(parsed_art, ast_id);
                     if (!hit_tok.isNone() and hit_tok.asInt() < parsed_art.token_buffer.countTokens()) {
                         const cand_sp = parsed_art.token_buffer.getTokenSpan(scan_fid, hit_tok);
                         if (!is_including_declaration and sym.decl_span.file_id == scan_fid) {
@@ -7387,7 +8364,7 @@ fn handleSignatureHelpRequest(
 
 // ------ Inlay Hints (<= 1024), Code Actions & Formatting ------
 
-/// Handles `textDocument/inlayHint`: `: <Type>` (with `textEdits`), `<param>:`, and contract hints (`<= 1024`).
+/// Handles `textDocument/inlayHint`: `: <Type>` (with `textEdits`) and `<param>:` hints (`<= 1024`).
 fn handleInlayHintRequest(
     session: *LspSession,
     arena_alloc: std.mem.Allocator,
@@ -7417,11 +8394,6 @@ fn handleInlayHintRequest(
         return writeNullResultFrame(session, out_writer, rpc_id);
     const extra_ends = try syntax_arenas.computeAstNodeExtraEnds(arena_alloc, &parsed_art.ast_arena);
 
-    const has_contract_annotations = std.mem.indexOf(u8, src, "@no_alloc") != null or
-        std.mem.indexOf(u8, src, "@no_panic") != null or
-        std.mem.indexOf(u8, src, "@no_block") != null or
-        std.mem.indexOf(u8, src, "@max_stack") != null;
-
     session.outbound_buf.clearRetainingCapacity();
     const body_writer = &session.outbound_buf.writer;
     try body_writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
@@ -7443,35 +8415,6 @@ fn handleInlayHintRequest(
         ) orelse continue;
         if (entry_span.end_byte < start_byte or entry_span.start_byte > end_byte) continue;
 
-        // [1] Module contract/effect inlay hint on unannotated functions inside contract-aware modules:
-        if (has_contract_annotations and entry.kind == .fn_decl and emitted_hints < MAX_INLAY_HINTS) {
-            if (session.db.symbol_table.def_to_symbol.get(entry.def_id.asInt())) |fn_sym_idx| {
-                const fn_sym = session.db.symbol_table.getSymbol(fn_sym_idx).*;
-                if (!fn_sym.contract_flags.is_no_alloc and !fn_sym.contract_flags.is_no_panic) {
-                    if (session.db.getSastSummaryProj(entry.def_id) catch null) |sum| {
-                        const sum_eff = sum.inferredEffects();
-                        const hint_pos = byteOffsetToLspPosition(session, fid, entry_span.start_byte);
-                        const eff_label: []const u8 = if (sum_eff.isEmpty())
-                            "/* • pure (@no_alloc, @no_panic) */ "
-                        else if (!sum_eff.alloc)
-                            "/* • @no_alloc-eligible */ "
-                        else
-                            "";
-                        if (eff_label.len > 0) {
-                            if (emitted_hints > 0) try body_writer.writeByte(',');
-                            try body_writer.print(
-                                "{{\"position\":{{\"line\":{d},\"character\":{d}}},\"label\":",
-                                .{ hint_pos.line, hint_pos.character },
-                            );
-                            try writeJsonString(body_writer, eff_label);
-                            try body_writer.writeAll(",\"paddingRight\":true}");
-                            emitted_hints += 1;
-                        }
-                    }
-                }
-            }
-        }
-
         const side_tables = (try session.db.getDefSideTables(entry.def_id)) orelse continue;
         parsed_art = session.db.parsed_artifacts.getPtr(fid.asInt()) orelse break;
         var ast_raw = side_tables.ast_start;
@@ -7481,7 +8424,7 @@ fn handleInlayHintRequest(
             const ast_id = NodeIndex.fromInt(ast_raw);
             const ast_node = parsed_art.ast_arena.getNode(ast_id);
 
-            // [2] Inferred `: <Type>` on unannotated `let` / `var` bindings (with `textEdits`!):
+            // [1] Inferred `: <Type>` on unannotated single-binding `let` / `var` declarations (with `textEdits`!):
             if (ast_node.tag == .local_var_decl) {
                 const cst_orig = parsed_art.ast_arena.getCstOrigin(ast_id);
                 if (!cst_orig.isNone()) {
@@ -7502,7 +8445,7 @@ fn handleInlayHintRequest(
                         }
                         const lk = parsed_art.token_buffer.getToken(leaf.token).kind;
                         if (lk == .eq) break;
-                        if (lk == .colon) {
+                        if (lk == .colon or lk == .lparen or lk == .lbrace or lk == .lbracket or lk == .dot) {
                             has_explicit_colon = true;
                             break;
                         }
@@ -7875,14 +8818,13 @@ const ValidatedRenameTarget = struct {
     enclosing_def_id: DefId,
 };
 
-/// Validates whether the cursor sits on a renamable `PackageId.root` symbol (`null` when forbidden).
+/// Validates whether the cursor sits on a renamable workspace symbol (`null` when read-only or built-in).
 fn validateRenamableSymbolAtCursor(
     session: *LspSession,
     file_id: FileId,
     pos: LspPosition,
 ) !?ValidatedRenameTarget {
-    if (file_id.isNone() or file_id.asInt() >= query_db.VIRTUAL_C_IMPORT_FILE_ID_BASE) return null;
-    if (session.db.symbol_table.getFilePackageId(file_id) != .root) return null;
+    if (isReadOnlyNonWorkspaceFile(session, file_id)) return null;
 
     const src = getLiveDocumentSource(session, file_id) orelse return null;
     const target = try resolveCursorTarget(session, file_id, pos);
@@ -7915,14 +8857,8 @@ fn validateRenamableSymbolAtCursor(
     if (NON_RENAMABLE_IDENT_SET.has(effective_sym.name_text)) return null;
 
     const decl_fid = effective_sym.decl_span.file_id;
-    if (decl_fid.isNone() or decl_fid.asInt() >= query_db.VIRTUAL_C_IMPORT_FILE_ID_BASE) return null;
-    if (session.db.symbol_table.getFilePackageId(decl_fid) != .root) return null;
-
-    if (session.db.source_inputs.get(decl_fid.asInt())) |src_in| {
-        if (src_in.durability == .high) return null;
-    } else {
-        return null;
-    }
+    if (!session.db.source_inputs.contains(decl_fid.asInt())) return null;
+    if (isReadOnlyNonWorkspaceFile(session, decl_fid)) return null;
 
     // Reject external `mod foo;` file declarations (only inline `mod foo { … }` is a pure text rename):
     if (effective_sym.kind == .module_sym) {
@@ -8162,7 +9098,7 @@ fn hasRenameCollisionOrShadowingHazard(
                             isScopeAncestorOrEqual(&session.db.symbol_table.scope_arena, target_sym.scope_id, other_sym.scope_id))
                         {
                             // Verify the conflicting reference or declaration sits inside `def_span`:
-                            const n_tok = parsed_art.ast_arena.getNode(ast_id).main_token;
+                            const n_tok = resolveAstNodeFocalToken(parsed_art, ast_id);
                             if (!n_tok.isNone() and n_tok.asInt() < parsed_art.token_buffer.countTokens()) {
                                 const n_off = parsed_art.token_buffer.getToken(n_tok).byte_offset;
                                 if (n_off >= def_span.start_byte and n_off <= def_span.end_byte) {
@@ -8392,8 +9328,14 @@ fn handleRenameRequest(
     };
 
     const fid = try resolveDocumentFileId(session, arena_alloc, raw_uri);
-    if (fid.isNone()) {
-        return sendJsonRpcError(session, out_writer, rpc_id, LSP_REQUEST_FAILED, "document is not mounted in PackageId.root");
+    if (fid.isNone() or isReadOnlyNonWorkspaceFile(session, fid)) {
+        return sendJsonRpcError(
+            session,
+            out_writer,
+            rpc_id,
+            LSP_REQUEST_FAILED,
+            "document is read-only or not mounted in workspace",
+        );
     }
 
     const validated = (try validateRenamableSymbolAtCursor(session, fid, pos)) orelse {
@@ -8449,11 +9391,7 @@ fn handleRenameRequest(
         const decl_fid = target_sym.decl_span.file_id;
         for (session.mounted_files.items) |cand_fid| {
             try session.db.unwindIfCanceled();
-            if (session.db.symbol_table.getFilePackageId(cand_fid) != .root) continue;
-            if (cand_fid.asInt() >= query_db.VIRTUAL_C_IMPORT_FILE_ID_BASE) continue;
-            if (session.db.source_inputs.get(cand_fid.asInt())) |in_rec| {
-                if (in_rec.durability == .high) continue;
-            }
+            if (isReadOnlyNonWorkspaceFile(session, cand_fid)) continue;
             const cand_src = getLiveDocumentSource(session, cand_fid) orelse continue;
             if (cand_fid != decl_fid and std.mem.indexOf(u8, cand_src, validated.old_name) == null) {
                 continue;
@@ -10316,4 +11254,163 @@ test "test_lsp_redteam_collect_file_diagnostics_hashmap_rehash_no_uaf" {
     try std.testing.expect(std.mem.indexOf(u8, frames[2], "unused_15") != null);
     // `frames[3]` (`codeAction`) emits the `E0220` retired-`!` -> `"not "` quickfix:
     try std.testing.expect(std.mem.indexOf(u8, frames[3], "\"newText\":\"not \"") != null);
+}
+
+test "test_lsp_hover_attrs_variants_semantic_tokens_inlay_and_internal_rename" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const sample_src =
+        "/// Async poll status.\n" ++
+        "pub enum Poll[T] {\n" ++
+        "    /// Completed with output value.\n" ++
+        "    Ready(T),\n" ++
+        "    /// Still pending wakeup.\n" ++
+        "    Pending,\n" ++
+        "}\n" ++
+        "@inline @no_alloc @no_panic\n" ++
+        "pub fn check_poll(state: &Poll[u32], opt: u32?, ptr: *mut u32) -> bool {\n" ++
+        "    let (prev_val, is_swapped) = unsafe { @atomic_cmpxchg(ptr, 0_u32, 1_u32, 4_u8, 4_u8) };\n" ++
+        "    _ = prev_val;\n" ++
+        "    _ = is_swapped;\n" ++
+        "    let has_opt = match opt {\n" ++
+        "        .Some(_) => true,\n" ++
+        "        .None => false,\n" ++
+        "    };\n" ++
+        "    if not has_opt { return false; }\n" ++
+        "    return match state {\n" ++
+        "        .Ready(_) => true,\n" ++
+        "        .Pending => false,\n" ++
+        "    };\n" ++
+        "}\n" ++
+        "pub fn unannotated_helper(val: u32) -> u32 {\n" ++
+        "    return val;\n" ++
+        "}\n";
+
+    var session = try LspSession.init(allocator, io, null, null, .{ .is_internal_core = true });
+    defer session.deinit();
+    session.bindInternalPointers();
+    session.state = .initialized;
+    session.position_encoding = .utf8;
+
+    const core_fid = try session.vfs.setEditorOverlay(io, "d:/corex/core/poll_demo.cx", sample_src, .std_core, true);
+    try session.open_doc_versions.put(allocator, core_fid.asInt(), 1);
+    _ = try session.db.setInput(core_fid, sample_src, .low);
+    try session.db.setFilePackageId(core_fid, .std_core);
+    try session.db.setFilePath(core_fid, "d:/corex/core/poll_demo.cx");
+    try session.recordMountedFile(core_fid);
+
+    var out_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer out_alloc.deinit();
+    var exit_opt: ?u8 = null;
+
+    const requests = [_][]const u8{
+        // [1] Hover on `@no_alloc` (line 7, col 10):
+        "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"textDocument/hover\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///d:/corex/core/poll_demo.cx\"},\"position\":{\"line\":7,\"character\":10}}}",
+        // [2] Hover on `@atomic_cmpxchg` (line 9, col 45):
+        "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"textDocument/hover\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///d:/corex/core/poll_demo.cx\"},\"position\":{\"line\":9,\"character\":45}}}",
+        // [3] Hover on `.Some` (line 13, col 10) & `.None` (line 14, col 10):
+        "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"textDocument/hover\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///d:/corex/core/poll_demo.cx\"},\"position\":{\"line\":13,\"character\":10}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"textDocument/hover\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///d:/corex/core/poll_demo.cx\"},\"position\":{\"line\":14,\"character\":10}}}",
+        // [4] Hover on `.Ready` (line 18, col 11):
+        "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"textDocument/hover\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///d:/corex/core/poll_demo.cx\"},\"position\":{\"line\":18,\"character\":11}}}",
+        // [5] Inlay hints across entire file (zero `/* • pure` contract hints & zero `: (u32, bool)` tuple hints):
+        "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"textDocument/inlayHint\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///d:/corex/core/poll_demo.cx\"}," ++
+            "\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":25,\"character\":0}}}}",
+        // [6] Semantic tokens across entire file:
+        "{\"jsonrpc\":\"2.0\",\"id\":16,\"method\":\"textDocument/semanticTokens/full\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///d:/corex/core/poll_demo.cx\"}}}",
+        // [7] `prepareRename` & `rename` on `.Ready` (line 18, col 11 -> `Completed`) inside `--internal-core` `.std_core`:
+        "{\"jsonrpc\":\"2.0\",\"id\":17,\"method\":\"textDocument/prepareRename\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///d:/corex/core/poll_demo.cx\"},\"position\":{\"line\":18,\"character\":11}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":18,\"method\":\"textDocument/rename\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///d:/corex/core/poll_demo.cx\"}," ++
+            "\"position\":{\"line\":18,\"character\":11},\"newName\":\"Completed\"}}",
+    };
+
+    for (requests) |req_json| {
+        session.turn_arena.resetRetainingCapacity();
+        const turn_alloc = session.turn_arena.asAllocator();
+        const parsed_msg = try parseJsonPayload(turn_alloc, req_json);
+        const msg_id = try extractJsonRpcId(parsed_msg);
+        const method_name = parsed_msg.getStringField("method").?;
+        try dispatchSingleJsonMessage(
+            &session,
+            turn_alloc,
+            parsed_msg,
+            msg_id,
+            method_name,
+            &out_alloc.writer,
+            &exit_opt,
+        );
+    }
+
+    const frames = try extractTestOutboundPayloads(allocator, out_alloc.written());
+    defer allocator.free(frames);
+    try std.testing.expectEqual(@as(usize, 9), frames.len);
+
+    // [1] `@no_alloc` & `@atomic_cmpxchg` hover cards:
+    try std.testing.expect(std.mem.indexOf(u8, frames[0], "@no_alloc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[0], "zero transitive heap allocations") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[1], "@atomic_cmpxchg") != null);
+
+    // [2] `.Some` & `.None` concrete `Option[u32]` hover cards:
+    try std.testing.expect(std.mem.indexOf(u8, frames[2], "Option[u32].Some(u32)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[3], "Option[u32].None") != null);
+
+    // [3] `.Ready` user enum variant hover card + `///` variant doc comment:
+    try std.testing.expect(std.mem.indexOf(u8, frames[4], "Poll[u32].Ready") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[4], "Completed with output value.") != null);
+
+    // [4] Inlay hints contain zero `/* • pure` contract clutter and zero `: (u32, bool)` tuple-destructuring bug:
+    try std.testing.expect(std.mem.indexOf(u8, frames[5], "pure (") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[5], "@no_alloc-eligible") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[5], ": (u32, bool)") == null);
+
+    // [5] Semantic tokens: verify `.` is never `enumMember` (`length: 1, type: 9`) and `true`/`false` are not `keyword`:
+    const sem_tokens = try computeSemanticTokensData(&session, session.turn_arena.asAllocator(), core_fid, null);
+    var saw_some_enum_member = false;
+    var saw_ready_enum_member = false;
+    var cur_line: u32 = 0;
+    var cur_col: u32 = 0;
+    var idx: usize = 0;
+    while (idx + 5 <= sem_tokens.len) : (idx += 5) {
+        const d_line = sem_tokens[idx];
+        const d_col = sem_tokens[idx + 1];
+        const tok_len = sem_tokens[idx + 2];
+        const tok_ty = sem_tokens[idx + 3];
+        if (d_line > 0) {
+            cur_line += d_line;
+            cur_col = d_col;
+        } else {
+            cur_col += d_col;
+        }
+        // Line 13 (`        .Some(_) => true,`): col 8 is `.`, col 9 is `Some` (len 4), col 20 is `true` (len 4):
+        if (cur_line == 13) {
+            try std.testing.expect(cur_col != 8);
+            if (cur_col == 9 and tok_len == 4 and tok_ty == SEM_TOK_ENUM_MEMBER) saw_some_enum_member = true;
+            try std.testing.expect(!(cur_col == 20 and tok_ty == SEM_TOK_KEYWORD));
+        }
+        // Line 18 (`        .Ready(_) => true,`): col 8 is `.`, col 9 is `Ready` (len 5), col 21 is `true` (len 4):
+        if (cur_line == 18) {
+            try std.testing.expect(cur_col != 8);
+            if (cur_col == 9 and tok_len == 5 and tok_ty == SEM_TOK_ENUM_MEMBER) saw_ready_enum_member = true;
+            try std.testing.expect(!(cur_col == 21 and tok_ty == SEM_TOK_KEYWORD));
+        }
+    }
+    try std.testing.expect(saw_some_enum_member);
+    try std.testing.expect(saw_ready_enum_member);
+
+    // [6] `prepareRename` & `rename` succeed in `--internal-core` `.std_core` and preserve `.` before `Ready`:
+    try std.testing.expect(std.mem.indexOf(u8, frames[7], "\"placeholder\":\"Ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[8], "\"newText\":\"Completed\"") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, frames[8], "\"start\":{\"line\":18,\"character\":9},\"end\":{\"line\":18,\"character\":14}") != null,
+    );
 }

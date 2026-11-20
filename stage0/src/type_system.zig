@@ -21366,6 +21366,7 @@ pub const TypeChecker = struct {
                 }
             },
             .variant_pat => {
+                _ = self.recordNodeType(pat_id, self.unwrapRefType(scrutinee_ty));
                 const sub_pats = self.getNodeExtraSlice(pat_id, false);
                 const child_scr_mut = self.isChildScrutineeMut(scrutinee_ty, is_scrutinee_mut);
                 const payload_ty = try self.resolveVariantPatPayloadType(pat_id, scrutinee_ty);
