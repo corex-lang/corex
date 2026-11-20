@@ -2230,6 +2230,25 @@ const TASK_GROUP_METHOD_MAP = std.StaticStringMap(TaskGroupMethodKind).initCompt
     .{ "spawn_local", .spawn_local },
 });
 
+/// $O(1)$ static lookup map of leading keyword/root identifiers exempt from `@deprecated` upgrade scope checks.
+const UPGRADE_TEMPLATE_EXEMPT_IDENT_MAP = std.StaticStringMap(void).initComptime(.{
+    .{ "Self", {} },
+    .{ "async", {} },
+    .{ "comptime", {} },
+    .{ "context", {} },
+    .{ "cx", {} },
+    .{ "false", {} },
+    .{ "if", {} },
+    .{ "loop", {} },
+    .{ "match", {} },
+    .{ "not", {} },
+    .{ "own", {} },
+    .{ "pkg", {} },
+    .{ "self", {} },
+    .{ "true", {} },
+    .{ "unsafe", {} },
+});
+
 /// Maximum recursion depth for cycle-safe ownership tier classification (`>= MAX_TYPE_DEPTH`).
 const MAX_OWNERSHIP_VISIT_DEPTH: usize = MAX_TYPE_DEPTH;
 
@@ -8538,10 +8557,14 @@ pub const TypeChecker = struct {
 
     /// Deduplication key for `W0403` deprecated-symbol references.
     const DeprecatedDiagKey = struct {
-        file_id: u32,
+        /// Source file containing the deprecated reference span.
+        file_id: FileId,
+        /// Inclusive starting byte offset of the primary reference span.
         start_byte: u32,
+        /// Exclusive ending byte offset of the primary reference span.
         end_byte: u32,
-        sym_raw: u32,
+        /// Canonical target `SymbolIndex` carrying the `@deprecated` metadata.
+        target_sym: SymbolIndex,
     };
 
     /// Initializes a `TypeChecker` for `file_id`, building the shared $O(N)$ lookup and side tables.
@@ -8673,7 +8696,7 @@ pub const TypeChecker = struct {
         {
             return true;
         }
-        return self.getEffectiveAllowMask(span).allow_deprecated_w0403;
+        return self.getEffectiveAllowMask(span).has_allow_deprecated_w0403;
     }
 
     /// Records `ty` for `node_id` in `self.node_types` and returns `ty`.
@@ -10879,8 +10902,7 @@ pub const TypeChecker = struct {
                 }
             }
             return;
-        }
-        if (std.mem.eql(u8, attr_name, "deprecated") or std.mem.eql(u8, attr_name, "fix_inline")) {
+        } else if (std.mem.eql(u8, attr_name, "deprecated") or std.mem.eql(u8, attr_name, "fix_inline")) {
             try self.validateDeprecatedOrFixInlineAttrCst(
                 target_sym_idx,
                 name_tok,
@@ -10889,8 +10911,9 @@ pub const TypeChecker = struct {
                 std.mem.eql(u8, attr_name, "deprecated"),
             );
             return;
+        } else if (BUILTIN_ATTRIBUTE_MAP.has(attr_name)) {
+            return;
         }
-        if (BUILTIN_ATTRIBUTE_MAP.has(attr_name)) return;
 
         const attr_span = self.token_buffer.getTokenSpan(self.file_id, name_tok);
         const schema_sym_idx = try self.lookupAttributeSchemaSymbol(attr_name);
@@ -11072,7 +11095,6 @@ pub const TypeChecker = struct {
         name_pos: usize,
         attr_end: usize,
     ) !symbol_resolver.AllowLintMask {
-        const attr_cst = CstNodeIndex.fromInt(@intCast(attr_start));
         var at_tok: TokenIndex = .none;
         var scan_idx: usize = attr_start + 1;
         while (scan_idx < name_pos) : (scan_idx += 1) {
@@ -11085,7 +11107,10 @@ pub const TypeChecker = struct {
                 break;
             }
         }
-        const active_sink = if (self.hasDiagnosticInCstSubtree(.e0403_unresolved_symbol, attr_cst))
+        const active_sink = if (self.hasDiagnosticInCstSubtree(
+            .e0403_unresolved_symbol,
+            CstNodeIndex.fromInt(@intCast(attr_start)),
+        ))
             null
         else
             self.diagnostic_sink;
@@ -11166,16 +11191,15 @@ pub const TypeChecker = struct {
                 }
                 cur = attr_end;
                 continue;
-            }
-            if (sub.kind == .visibility_modifier) {
+            } else if (sub.kind == .visibility_modifier) {
                 cur += @max(@as(usize, sub.subtree_size), 1);
                 continue;
-            }
-            if (sub.kind == .local_decl_stmt or sub.kind == .expr_stmt) {
+            } else if (sub.kind == .local_decl_stmt or sub.kind == .expr_stmt) {
                 cur += 1;
                 continue;
+            } else {
+                break;
             }
-            break;
         }
         return directives;
     }
@@ -11557,12 +11581,12 @@ pub const TypeChecker = struct {
             if (template_text[idx] != '$') {
                 idx += 1;
                 continue;
-            }
-            if (idx + 1 < template_text.len and template_text[idx + 1] == '$') {
+            } else if (idx + 1 < template_text.len and template_text[idx + 1] == '$') {
                 idx += 2;
                 continue;
+            } else if (idx + 1 >= template_text.len) {
+                break;
             }
-            if (idx + 1 >= template_text.len) break;
             const next_ch = template_text[idx + 1];
             if (next_ch >= '0' and next_ch <= '9') {
                 const digit_start = idx + 1;
@@ -11571,8 +11595,7 @@ pub const TypeChecker = struct {
                     template_text[digit_end] >= '0' and template_text[digit_end] <= '9') : (digit_end += 1)
                 {}
                 const pos_str = template_text[digit_start..digit_end];
-                const parsed_ord = std.fmt.parseInt(usize, pos_str, 10) catch std.math.maxInt(usize);
-                if (parsed_ord >= callable_arity) {
+                if ((std.fmt.parseInt(usize, pos_str, 10) catch std.math.maxInt(usize)) >= callable_arity) {
                     var msg_buf: [192]u8 = undefined;
                     const msg = std.fmt.bufPrint(
                         &msg_buf,
@@ -11588,8 +11611,7 @@ pub const TypeChecker = struct {
                 }
                 idx = digit_end;
                 continue;
-            }
-            if ((next_ch >= 'a' and next_ch <= 'z') or (next_ch >= 'A' and next_ch <= 'Z') or next_ch == '_') {
+            } else if ((next_ch >= 'a' and next_ch <= 'z') or (next_ch >= 'A' and next_ch <= 'Z') or next_ch == '_') {
                 const ident_start = idx + 1;
                 var ident_end = ident_start + 1;
                 while (ident_end < template_text.len) : (ident_end += 1) {
@@ -11642,8 +11664,9 @@ pub const TypeChecker = struct {
                 }
                 idx = ident_end;
                 continue;
+            } else {
+                idx += 1;
             }
-            idx += 1;
         }
     }
 
@@ -11691,7 +11714,6 @@ pub const TypeChecker = struct {
             .contextual_variant,
             .tuple_lit,
             .array_lit,
-            .struct_lit,
             .call_expr,
             .generic_call,
             .method_call,
@@ -11734,8 +11756,7 @@ pub const TypeChecker = struct {
                     if (lex[idx] == '\\') {
                         idx += 1;
                         continue;
-                    }
-                    if (lex[idx] == '{') {
+                    } else if (lex[idx] == '{') {
                         if (idx + 1 < lex.len and lex[idx + 1] == '{') {
                             idx += 1;
                             continue;
@@ -11771,11 +11792,11 @@ pub const TypeChecker = struct {
                         break :blk_un false;
                     }
                     break :blk_un self.isPureUpgradeArgAst(NodeIndex.fromInt(node.lhs.payload), depth + 1);
-                }
-                if (op_kind == .kw_not or op_kind == .tilde) {
+                } else if (op_kind == .kw_not or op_kind == .tilde) {
                     break :blk_un self.isPureUpgradeArgAst(NodeIndex.fromInt(node.lhs.payload), depth + 1);
+                } else {
+                    break :blk_un false;
                 }
-                break :blk_un false;
             },
             else => false,
         };
@@ -11789,9 +11810,9 @@ pub const TypeChecker = struct {
         while (right < tmpl.len and (tmpl[right] == ' ' or tmpl[right] == '\t')) : (right += 1) {}
 
         if (left == 0 and right == tmpl.len) return false;
-        const ok_left = left > 0 and (tmpl[left - 1] == '(' or tmpl[left - 1] == ',' or tmpl[left - 1] == '[');
-        const ok_right = right < tmpl.len and (tmpl[right] == ')' or tmpl[right] == ',' or tmpl[right] == ']');
-        return ok_left and ok_right;
+        const is_valid_left = left > 0 and (tmpl[left - 1] == '(' or tmpl[left - 1] == ',' or tmpl[left - 1] == '[');
+        const is_valid_right = right < tmpl.len and (tmpl[right] == ')' or tmpl[right] == ',' or tmpl[right] == ']');
+        return is_valid_left and is_valid_right;
     }
 
     /// Returns `true` if `expanded` contains top-level operators outside `(…)`, `[…]`, and `{…}`.
@@ -11799,22 +11820,22 @@ pub const TypeChecker = struct {
         const trimmed = std.mem.trim(u8, expanded, " \t\r\n");
         if (trimmed.len == 0) return false;
         var depth: u32 = 0;
-        var in_str = false;
-        var in_char = false;
+        var is_in_str = false;
+        var is_in_char = false;
         var idx: usize = 0;
         while (idx < trimmed.len) : (idx += 1) {
             const ch_val = trimmed[idx];
-            if (in_str) {
-                if (ch_val == '\\') idx += 1 else if (ch_val == '"') in_str = false;
+            if (is_in_str) {
+                if (ch_val == '\\') idx += 1 else if (ch_val == '"') is_in_str = false;
                 continue;
             }
-            if (in_char) {
-                if (ch_val == '\\') idx += 1 else if (ch_val == '\'') in_char = false;
+            if (is_in_char) {
+                if (ch_val == '\\') idx += 1 else if (ch_val == '\'') is_in_char = false;
                 continue;
             }
             switch (ch_val) {
-                '"' => in_str = true,
-                '\'' => in_char = true,
+                '"' => is_in_str = true,
+                '\'' => is_in_char = true,
                 '(', '[', '{' => depth += 1,
                 ')', ']', '}' => depth -|= 1,
                 '+', '-', '*', '/', '%', '&', '|', '^', '<', '>', '=', '!', '~', '?' => {
@@ -11838,8 +11859,7 @@ pub const TypeChecker = struct {
         while (cur > 0) {
             cur -= 1;
             const anc = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
-            const anc_end = cur + @max(@as(usize, anc.subtree_size), 1);
-            if (anc_end <= target_pos) continue;
+            if (cur + @max(@as(usize, anc.subtree_size), 1) <= target_pos) continue;
             return switch (anc.kind) {
                 .expr_stmt,
                 .local_decl_stmt,
@@ -11888,17 +11908,19 @@ pub const TypeChecker = struct {
             const piece_start = piece.byte_offset;
             const piece_end = piece.byte_offset +| @as(u32, piece.byte_len);
             if (piece_end <= replace_span.start_byte or piece_start >= replace_span.end_byte) continue;
-            const is_comment_kind = switch (piece.kind) {
-                .line_comment, .doc_comment, .module_doc_comment, .block_comment => true,
-                else => false,
-            };
-            if (is_comment_kind) {
-                const clamped_lo = @max(piece_start, replace_span.start_byte);
-                const clamped_hi = @min(piece_end, replace_span.end_byte);
-                if (!isCommentPreservedByUsedSlot(eval_slots, use_counts, clamped_lo, clamped_hi)) {
-                    return true;
-                }
-                continue;
+            switch (piece.kind) {
+                .line_comment, .doc_comment, .module_doc_comment, .block_comment => {
+                    if (!isCommentPreservedByUsedSlot(
+                        eval_slots,
+                        use_counts,
+                        @max(piece_start, replace_span.start_byte),
+                        @min(piece_end, replace_span.end_byte),
+                    )) {
+                        return true;
+                    }
+                    continue;
+                },
+                else => {},
             }
             if ((piece.flags & syntax_arenas.TRIVIA_FLAG_COALESCED) != 0) {
                 const scan_lo: usize = @min(@as(usize, piece_start), self.source.len);
@@ -11911,15 +11933,17 @@ pub const TypeChecker = struct {
                         while (cursor < scan_hi and self.source[cursor] != '\n') : (cursor += 1) {}
                         const cmt_hi: u32 = @intCast(cursor);
                         if (cmt_hi > replace_span.start_byte and cmt_lo < replace_span.end_byte) {
-                            const overlap_lo = @max(cmt_lo, replace_span.start_byte);
-                            const overlap_hi = @min(cmt_hi, replace_span.end_byte);
-                            if (!isCommentPreservedByUsedSlot(eval_slots, use_counts, overlap_lo, overlap_hi)) {
+                            if (!isCommentPreservedByUsedSlot(
+                                eval_slots,
+                                use_counts,
+                                @max(cmt_lo, replace_span.start_byte),
+                                @min(cmt_hi, replace_span.end_byte),
+                            )) {
                                 return true;
                             }
                         }
                         continue;
-                    }
-                    if (self.source[cursor] == '/' and self.source[cursor + 1] == '*') {
+                    } else if (self.source[cursor] == '/' and self.source[cursor + 1] == '*') {
                         const cmt_lo: u32 = @intCast(cursor);
                         cursor += 2;
                         var block_depth: usize = 1;
@@ -11937,15 +11961,19 @@ pub const TypeChecker = struct {
                         if (block_depth > 0) cursor = scan_hi;
                         const cmt_hi: u32 = @intCast(cursor);
                         if (cmt_hi > replace_span.start_byte and cmt_lo < replace_span.end_byte) {
-                            const overlap_lo = @max(cmt_lo, replace_span.start_byte);
-                            const overlap_hi = @min(cmt_hi, replace_span.end_byte);
-                            if (!isCommentPreservedByUsedSlot(eval_slots, use_counts, overlap_lo, overlap_hi)) {
+                            if (!isCommentPreservedByUsedSlot(
+                                eval_slots,
+                                use_counts,
+                                @max(cmt_lo, replace_span.start_byte),
+                                @min(cmt_hi, replace_span.end_byte),
+                            )) {
                                 return true;
                             }
                         }
                         continue;
+                    } else {
+                        cursor += 1;
                     }
-                    cursor += 1;
                 }
             }
         }
@@ -11988,13 +12016,11 @@ pub const TypeChecker = struct {
                 try out_buf.append(self.allocator, tmpl[idx]);
                 idx += 1;
                 continue;
-            }
-            if (idx + 1 < tmpl.len and tmpl[idx + 1] == '$') {
+            } else if (idx + 1 < tmpl.len and tmpl[idx + 1] == '$') {
                 try out_buf.append(self.allocator, '$');
                 idx += 2;
                 continue;
-            }
-            if (idx + 1 >= tmpl.len) {
+            } else if (idx + 1 >= tmpl.len) {
                 try out_buf.append(self.allocator, '$');
                 break;
             }
@@ -12056,10 +12082,10 @@ pub const TypeChecker = struct {
             use_counts[slot_i] += 1;
             try template_slot_seq.append(self.allocator, slot_i);
 
-            const needs_inner_parens = !slot.is_atomic and !isStandaloneTemplateArgSlot(tmpl, idx, ph_end);
-            if (needs_inner_parens) try out_buf.append(self.allocator, '(');
+            const is_needing_inner_parens = !slot.is_atomic and !isStandaloneTemplateArgSlot(tmpl, idx, ph_end);
+            if (is_needing_inner_parens) try out_buf.append(self.allocator, '(');
             try out_buf.appendSlice(self.allocator, slot.raw_text);
-            if (needs_inner_parens) try out_buf.append(self.allocator, ')');
+            if (is_needing_inner_parens) try out_buf.append(self.allocator, ')');
             idx = ph_end;
         }
 
@@ -12094,8 +12120,8 @@ pub const TypeChecker = struct {
         }
 
         // Check leading callee identifier scope visibility and `mod_a.old_fn(x)` -> `mod_a.new_fn(x)` qualification:
-        var needs_qual_prefix = false;
-        var needs_leading_dot = false;
+        var is_needing_qual_prefix = false;
+        var is_needing_leading_dot = false;
         const trimmed_tmpl = std.mem.trimStart(u8, tmpl, " \t");
         if (trimmed_tmpl.len > 0) {
             const first_ch = trimmed_tmpl[0];
@@ -12112,24 +12138,9 @@ pub const TypeChecker = struct {
                     if (!is_id) break;
                 }
                 const lead_ident = trimmed_tmpl[0..id_end];
-                const is_kw_or_builtin = std.mem.eql(u8, lead_ident, "not") or
-                    std.mem.eql(u8, lead_ident, "if") or
-                    std.mem.eql(u8, lead_ident, "match") or
-                    std.mem.eql(u8, lead_ident, "loop") or
-                    std.mem.eql(u8, lead_ident, "true") or
-                    std.mem.eql(u8, lead_ident, "false") or
-                    std.mem.eql(u8, lead_ident, "own") or
-                    std.mem.eql(u8, lead_ident, "comptime") or
-                    std.mem.eql(u8, lead_ident, "unsafe") or
-                    std.mem.eql(u8, lead_ident, "async") or
-                    std.mem.eql(u8, lead_ident, "context") or
-                    std.mem.eql(u8, lead_ident, "self") or
-                    std.mem.eql(u8, lead_ident, "Self") or
-                    std.mem.eql(u8, lead_ident, "cx") or
-                    std.mem.eql(u8, lead_ident, "pkg") or
-                    symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.has(lead_ident);
-
-                if (!is_kw_or_builtin) {
+                if (!UPGRADE_TEMPLATE_EXEMPT_IDENT_MAP.has(lead_ident) and
+                    !symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.has(lead_ident))
+                {
                     const lead_sym_id = try self.interner.intern(lead_ident);
                     const is_dot_after = id_end < trimmed_tmpl.len and trimmed_tmpl[id_end] == '.';
                     const lex_res = self.sym_table.lookupLexical(
@@ -12174,17 +12185,17 @@ pub const TypeChecker = struct {
                         if (@as(usize, replace_span.start_byte) < self.source.len and
                             self.source[replace_span.start_byte] == '.')
                         {
-                            needs_leading_dot = true;
+                            is_needing_leading_dot = true;
                         }
                     } else if (!is_dot_after and explicit_qual_prefix.len > 0 and qual_res == .found) {
                         const is_same_in_caller = lex_res == .found and
                             self.unwrapAliasSymbolIdx(lex_res.found) == self.unwrapAliasSymbolIdx(qual_res.found);
                         if (!is_same_in_caller) {
-                            needs_qual_prefix = true;
+                            is_needing_qual_prefix = true;
                         }
                     } else if (lex_res != .found and !has_ext_pkg) {
                         if (explicit_qual_prefix.len > 0 and qual_res == .found) {
-                            needs_qual_prefix = true;
+                            is_needing_qual_prefix = true;
                         } else {
                             is_safe = false;
                         }
@@ -12195,9 +12206,9 @@ pub const TypeChecker = struct {
 
         var final_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer final_buf.deinit(self.allocator);
-        if (needs_leading_dot) {
+        if (is_needing_leading_dot) {
             try final_buf.append(self.allocator, '.');
-        } else if (needs_qual_prefix) {
+        } else if (is_needing_qual_prefix) {
             try final_buf.appendSlice(self.allocator, explicit_qual_prefix);
             try final_buf.append(self.allocator, '.');
         }
@@ -12236,8 +12247,7 @@ pub const TypeChecker = struct {
             eval_slots,
         )) orelse return null;
 
-        const arena_alloc = sink.arena.asAllocator();
-        const edits = try arena_alloc.alloc(TextEdit, 1);
+        const edits = try sink.arena.asAllocator().alloc(TextEdit, 1);
         edits[0] = .{
             .file_id = replace_span.file_id,
             .start_byte = replace_span.start_byte,
@@ -12274,13 +12284,12 @@ pub const TypeChecker = struct {
         if (deprecated_idx == self.current_checking_sym) return;
         if (self.isDeprecatedWarningSuppressed(primary_span)) return;
 
-        const dedup_key = DeprecatedDiagKey{
-            .file_id = primary_span.file_id.asInt(),
+        if ((try self.emitted_deprecated_refs.getOrPut(self.allocator, .{
+            .file_id = primary_span.file_id,
             .start_byte = primary_span.start_byte,
             .end_byte = primary_span.end_byte,
-            .sym_raw = deprecated_idx.asInt(),
-        };
-        if ((try self.emitted_deprecated_refs.getOrPut(self.allocator, dedup_key)).found_existing) return;
+            .target_sym = deprecated_idx,
+        })).found_existing) return;
 
         const meta = self.sym_table.getDeprecatedMeta(deprecated_idx) orelse return;
         try symbol_resolver.emitDeprecatedSymbolWarning(
@@ -27091,8 +27100,7 @@ pub const TypeChecker = struct {
                 // [1] Local / lexical value or `@c_import` const bindings take precedence; `.module_sym` yields `.module_ns`:
                 switch (self.sym_table.lookupLexical(self.current_scope, sym_id, NamespaceMask.VALUE_OR_CONST)) {
                     .found => |val_idx| {
-                        const unwrapped_val_idx = self.unwrapAliasSymbolIdx(val_idx);
-                        const val_sym = self.sym_table.getSymbol(unwrapped_val_idx).*;
+                        const val_sym = self.sym_table.getSymbol(self.unwrapAliasSymbolIdx(val_idx)).*;
                         if (val_sym.kind == .module_sym) {
                             self.sym_table.markSymbolUsed(val_idx);
                             self.recordNodeSymbol(recv_id, val_idx);
@@ -33259,7 +33267,7 @@ pub const TypeChecker = struct {
                 (is_already_fully_covered or (!has_arm_added_coverage and is_unguarded)))
             {
                 const pat_span = self.getAstNodeSpan(pat_id);
-                if (!self.getEffectiveAllowMask(pat_span).allow_unreachable_w0401) {
+                if (!self.getEffectiveAllowMask(pat_span).has_allow_unreachable_w0401) {
                     try self.emitDiagnosticSimple(
                         .w0401_unreachable_pattern_arm,
                         pat_span,
@@ -37582,4 +37590,36 @@ test "test_phase8_linear_future_producer_tier_and_nominal_spoofing_guards" {
         classifyOwnershipTier(&check_res.type_pool, &check_res.symbol_table, fut_with_linear),
     );
     try std.testing.expect(hasLinearObligation(&check_res.type_pool, &check_res.symbol_table, fut_with_linear));
+}
+
+test "test_deprecated_upgrade_struct_lit_receiver_parenthesization" {
+    const src =
+        \\pub struct Config {
+        \\    pub ok: bool,
+        \\}
+        \\@deprecated(since: "0.2.0", reason: "inline", upgrade: "$0.ok")
+        \\pub fn old_read(cfg: Config) -> bool {
+        \\    return cfg.ok;
+        \\}
+        \\pub fn caller() -> bool {
+        \\    return old_read(Config { ok: true });
+        \\}
+    ;
+    var check_res = try typecheckSource(std.testing.allocator, FileId.fromInt(79), src);
+    defer check_res.deinit();
+    try std.testing.expect(!check_res.diagnostics.hasErrors());
+
+    var has_w0403_fix = false;
+    for (check_res.diagnostics.asSlice()) |diag_item| {
+        if (diag_item.code == .w0403_deprecated_symbol) {
+            try std.testing.expectEqual(@as(usize, 1), diag_item.suggestions.len);
+            try std.testing.expectEqual(@as(usize, 1), diag_item.suggestions[0].edits.len);
+            try std.testing.expectEqualStrings(
+                "(Config { ok: true }).ok",
+                check_res.interner.get(diag_item.suggestions[0].edits[0].replacement_id),
+            );
+            has_w0403_fix = true;
+        }
+    }
+    try std.testing.expect(has_w0403_fix);
 }

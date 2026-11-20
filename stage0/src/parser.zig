@@ -206,6 +206,22 @@ pub const InlineUseDeclView = struct {
     is_pub: bool = false,
 };
 
+/// Retired `DR-22` parameter or call-site mode identifier classified via $O(1)$ static lookup (`E0221`).
+const RetiredParamModeKind = enum(u8) {
+    /// Retired `inout` exclusive borrow convention (`&mut`).
+    inout,
+    /// Retired leading `out` out-parameter convention (`&out`).
+    out,
+    /// Retired `ref` / `ref mut` borrow convention (`&` / `&mut`).
+    ref,
+    /// Retired `set` out-parameter convention (`&out`).
+    set,
+    /// Retired `sink` ownership transfer convention (`own`).
+    sink,
+    /// Retired post-colon `yielded` convention (`&mut`).
+    yielded,
+};
+
 // --------------------------------------- CONSTS ----------------------------------------
 
 /// Hard upper bound on non-mutating `LL(k)` token lookahead steps (`DR-21` Section 1.5).
@@ -241,6 +257,16 @@ pub const CANONICAL_C_TYPE_ALIASES = std.StaticStringMap(void).initComptime(.{
     .{ "c_ulonglong", {} },
     .{ "c_ushort", {} },
     .{ "c_void", {} },
+});
+
+/// $O(1)$ static lookup map of retired `DR-22` parameter and call-site mode identifiers (`E0221`).
+const RETIRED_PARAM_MODE_MAP = std.StaticStringMap(RetiredParamModeKind).initComptime(.{
+    .{ "inout", .inout },
+    .{ "out", .out },
+    .{ "ref", .ref },
+    .{ "set", .set },
+    .{ "sink", .sink },
+    .{ "yielded", .yielded },
 });
 
 // -------------------- Synchronization Sets --------------------
@@ -4622,16 +4648,17 @@ pub const Parser = struct {
             }
 
             // Check for `SelfParam` (`&self`, `&mut self`, `[var] [own] self`, `self: Type`, or retired `mut`/`ref`/`inout`/`sink`/`&inout self`):
+            const peek0_retired_mode = if (self.peekKind() == .ident)
+                RETIRED_PARAM_MODE_MAP.get(self.peekLexemeNth(0))
+            else
+                null;
             const is_amp_self = self.peekKind() == .amp;
             const is_own_self = self.peekKind() == .kw_own and self.peekKindNth(1) == .kw_self_val;
             const is_mut_self = self.peekKind() == .kw_mut and self.peekKindNth(1) == .kw_self_val;
-            const is_ref_self = self.peekKind() == .ident and
-                std.mem.eql(u8, self.peekLexemeNth(0), "ref") and
+            const is_ref_self = peek0_retired_mode == .ref and
                 (self.peekKindNth(1) == .kw_self_val or
                     (self.peekKindNth(1) == .kw_mut and self.peekKindNth(2) == .kw_self_val));
-            const is_inout_or_sink_self = self.peekKind() == .ident and
-                (std.mem.eql(u8, self.peekLexemeNth(0), "inout") or
-                    std.mem.eql(u8, self.peekLexemeNth(0), "sink")) and
+            const is_inout_or_sink_self = (peek0_retired_mode == .inout or peek0_retired_mode == .sink) and
                 self.peekKindNth(1) == .kw_self_val;
 
             if (is_amp_self or is_own_self or is_mut_self or is_ref_self or
@@ -4733,7 +4760,7 @@ pub const Parser = struct {
                     continue;
                 } else if (is_inout_or_sink_self) {
                     has_param_err = true;
-                    const is_inout_kw = std.mem.eql(u8, self.peekLexemeNth(0), "inout");
+                    const is_inout_kw = peek0_retired_mode == .inout;
                     const mode_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
                     const self_tok = try self.consumeLeaf(.token_leaf, .{});
                     const fix_span = Span.init(
@@ -4783,7 +4810,7 @@ pub const Parser = struct {
                 // Handle retired leading parameter modifiers (`mut`/`own`/`ref`/`inout`/`set`/`out`/`sink x: T`) -> `E0221`:
                 var opt_retired_own_tok: ?TokenIndex = null;
                 var opt_retired_ref_tok: ?TokenIndex = null;
-                var retired_mode_lex: []const u8 = "";
+                var opt_retired_mode_kind: ?RetiredParamModeKind = null;
                 var is_retired_ref_mut = false;
 
                 if (self.peekKind() == .kw_mut) {
@@ -4806,30 +4833,24 @@ pub const Parser = struct {
                         has_leading_var = true;
                         _ = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
                     }
-                } else if (self.peekKind() == .ident and blk_ret_mode: {
-                    const first_lex = self.peekLexemeNth(0);
-                    if (std.mem.eql(u8, first_lex, "ref")) {
-                        break :blk_ret_mode self.peekKindNth(1) == .kw_mut or
+                } else if (peek0_retired_mode) |retired_kind| {
+                    const is_leading_retired_mode = switch (retired_kind) {
+                        .ref => self.peekKindNth(1) == .kw_mut or
                             isIdentifierKind(self.peekKindNth(1)) or
-                            self.peekKindNth(1) == .underscore;
-                    }
-                    if (std.mem.eql(u8, first_lex, "inout") or
-                        std.mem.eql(u8, first_lex, "set") or
-                        std.mem.eql(u8, first_lex, "out") or
-                        std.mem.eql(u8, first_lex, "sink"))
-                    {
-                        break :blk_ret_mode (isIdentifierKind(self.peekKindNth(1)) or
+                            self.peekKindNth(1) == .underscore,
+                        .inout, .out, .set, .sink => (isIdentifierKind(self.peekKindNth(1)) or
                             self.peekKindNth(1) == .underscore) and
-                            self.peekKindNth(2) == .colon;
-                    }
-                    break :blk_ret_mode false;
-                }) {
-                    has_param_err = true;
-                    retired_mode_lex = self.peekLexemeNth(0);
-                    opt_retired_ref_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
-                    if (std.mem.eql(u8, retired_mode_lex, "ref") and self.peekKind() == .kw_mut) {
-                        is_retired_ref_mut = true;
-                        _ = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                            self.peekKindNth(2) == .colon,
+                        .yielded => false,
+                    };
+                    if (is_leading_retired_mode) {
+                        has_param_err = true;
+                        opt_retired_mode_kind = retired_kind;
+                        opt_retired_ref_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                        if (retired_kind == .ref and self.peekKind() == .kw_mut) {
+                            is_retired_ref_mut = true;
+                            _ = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                        }
                     }
                 }
 
@@ -4904,17 +4925,42 @@ pub const Parser = struct {
                                 );
                                 if (name_lex.len > 0 and ty_lex.len > 0) {
                                     const sink_alloc = sink.arena.asAllocator();
-                                    opt_rep = if (is_retired_ref_mut or std.mem.eql(u8, retired_mode_lex, "inout"))
-                                        try std.fmt.allocPrint(sink_alloc, "{s}: &mut {s}", .{ name_lex, ty_lex })
-                                    else if (std.mem.eql(u8, retired_mode_lex, "set") or std.mem.eql(u8, retired_mode_lex, "out"))
-                                        try std.fmt.allocPrint(sink_alloc, "{s}: &out {s}", .{ name_lex, ty_lex })
-                                    else if (std.mem.eql(u8, retired_mode_lex, "sink"))
-                                        (if (has_leading_var)
-                                            try std.fmt.allocPrint(sink_alloc, "var {s}: own {s}", .{ name_lex, ty_lex })
+                                    opt_rep = switch (opt_retired_mode_kind orelse .ref) {
+                                        .inout, .yielded => try std.fmt.allocPrint(
+                                            sink_alloc,
+                                            "{s}: &mut {s}",
+                                            .{ name_lex, ty_lex },
+                                        ),
+                                        .out, .set => try std.fmt.allocPrint(
+                                            sink_alloc,
+                                            "{s}: &out {s}",
+                                            .{ name_lex, ty_lex },
+                                        ),
+                                        .sink => if (has_leading_var)
+                                            try std.fmt.allocPrint(
+                                                sink_alloc,
+                                                "var {s}: own {s}",
+                                                .{ name_lex, ty_lex },
+                                            )
                                         else
-                                            try std.fmt.allocPrint(sink_alloc, "{s}: own {s}", .{ name_lex, ty_lex }))
-                                    else
-                                        try std.fmt.allocPrint(sink_alloc, "{s}: &{s}", .{ name_lex, ty_lex });
+                                            try std.fmt.allocPrint(
+                                                sink_alloc,
+                                                "{s}: own {s}",
+                                                .{ name_lex, ty_lex },
+                                            ),
+                                        .ref => if (is_retired_ref_mut)
+                                            try std.fmt.allocPrint(
+                                                sink_alloc,
+                                                "{s}: &mut {s}",
+                                                .{ name_lex, ty_lex },
+                                            )
+                                        else
+                                            try std.fmt.allocPrint(
+                                                sink_alloc,
+                                                "{s}: &{s}",
+                                                .{ name_lex, ty_lex },
+                                            ),
+                                    };
                                 }
                             }
                         }
@@ -5010,21 +5056,28 @@ pub const Parser = struct {
         if (next_kind == .dot or next_kind == .comma or next_kind == .rparen or next_kind == .eq) return;
         if (!TYPE_STARTER_SET.contains(next_kind)) return;
 
-        const mode_lex = self.peekLexemeNth(0);
         var opt_replacement: ?[]const u8 = null;
         var opt_msg: ?[]const u8 = null;
-        if (std.mem.eql(u8, mode_lex, "inout")) {
-            opt_replacement = "&mut ";
-            opt_msg = "`inout` parameter mode has been retired; write `&mut T` instead";
-        } else if (std.mem.eql(u8, mode_lex, "sink")) {
-            opt_replacement = "own ";
-            opt_msg = "`sink` parameter mode has been retired; write `own T` instead";
-        } else if (std.mem.eql(u8, mode_lex, "set")) {
-            opt_replacement = "&out ";
-            opt_msg = "`set` parameter mode has been retired; write `&out T` instead";
-        } else if (std.mem.eql(u8, mode_lex, "yielded")) {
-            opt_replacement = "&mut ";
-            opt_msg = "`yielded` parameter mode has been retired; write `&mut T` instead";
+        if (RETIRED_PARAM_MODE_MAP.get(self.peekLexemeNth(0))) |retired_kind| {
+            switch (retired_kind) {
+                .inout => {
+                    opt_replacement = "&mut ";
+                    opt_msg = "`inout` parameter mode has been retired; write `&mut T` instead";
+                },
+                .sink => {
+                    opt_replacement = "own ";
+                    opt_msg = "`sink` parameter mode has been retired; write `own T` instead";
+                },
+                .set => {
+                    opt_replacement = "&out ";
+                    opt_msg = "`set` parameter mode has been retired; write `&out T` instead";
+                },
+                .yielded => {
+                    opt_replacement = "&mut ";
+                    opt_msg = "`yielded` parameter mode has been retired; write `&mut T` instead";
+                },
+                .out, .ref => {},
+            }
         }
 
         if (opt_replacement) |rep_text| {
@@ -9142,84 +9195,81 @@ pub const Parser = struct {
 
         // Retired standalone call-site / borrow prefix (`ref [mut] place`, `inout place`, `sink expr`, `set place`):
         if (cur_kind == .ident) {
-            const mode_lexeme = self.peekLexemeNth(0);
-            const next_kind = self.peekKindNth(1);
-            const is_retired_ref = std.mem.eql(u8, mode_lexeme, "ref") and
-                (next_kind == .kw_mut or next_kind == .ident or next_kind == .kw_self_val);
-            const is_retired_mode = (std.mem.eql(u8, mode_lexeme, "inout") or
-                std.mem.eql(u8, mode_lexeme, "sink") or
-                std.mem.eql(u8, mode_lexeme, "set")) and
-                (next_kind == .ident or next_kind == .kw_self_val);
-            if (is_retired_ref or is_retired_mode) {
-                const pref_cst = try self.startCstNode(.prefix_expr);
-                self.pushState(.expr_prefix_finish, pref_cst) catch |err| switch (err) {
-                    error.ParseDepthExceeded => {
-                        return self.recoverDepthOverflow(pref_cst, EXPR_SYNC_STOP_SET, .expr_hole);
-                    },
-                    else => return err,
-                };
-                defer self.popStates(1);
+            if (RETIRED_PARAM_MODE_MAP.get(self.peekLexemeNth(0))) |retired_kind| {
+                const next_kind = self.peekKindNth(1);
+                const is_retired_ref = retired_kind == .ref and
+                    (next_kind == .kw_mut or next_kind == .ident or next_kind == .kw_self_val);
+                const is_retired_mode = (retired_kind == .inout or retired_kind == .sink or retired_kind == .set) and
+                    (next_kind == .ident or next_kind == .kw_self_val);
+                if (is_retired_ref or is_retired_mode) {
+                    const pref_cst = try self.startCstNode(.prefix_expr);
+                    self.pushState(.expr_prefix_finish, pref_cst) catch |err| switch (err) {
+                        error.ParseDepthExceeded => {
+                            return self.recoverDepthOverflow(pref_cst, EXPR_SYNC_STOP_SET, .expr_hole);
+                        },
+                        else => return err,
+                    };
+                    defer self.popStates(1);
 
-                const first_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
-                var end_tok = first_tok;
-                var is_ref_mut = false;
-                if (is_retired_ref and self.peekKind() == .kw_mut) {
-                    is_ref_mut = true;
-                    end_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                    const first_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                    var end_tok = first_tok;
+                    var is_ref_mut = false;
+                    if (is_retired_ref and self.peekKind() == .kw_mut) {
+                        is_ref_mut = true;
+                        end_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                    }
+                    const first_span = self.getTokenSpan(first_tok);
+                    const end_span = self.getTokenSpan(end_tok);
+                    const next_tok = self.peekTokenIndexNth(0);
+                    const next_span = self.getTokenSpan(next_tok);
+                    const has_only_spaces = blk_spaces: {
+                        for (self.token_buffer.getLeadingTrivia(next_tok)) |piece| {
+                            if (piece.kind != .spaces) break :blk_spaces false;
+                        }
+                        break :blk_spaces !self.peekNth(0).flags.has_leading_newline;
+                    };
+                    const diag_span = Span.init(self.file_id, first_span.start_byte, end_span.end_byte);
+                    const fix_end = if (has_only_spaces and next_span.start_byte >= end_span.end_byte)
+                        next_span.start_byte
+                    else
+                        end_span.end_byte;
+                    const is_with_space = fix_end > end_span.end_byte;
+                    const replacement = switch (retired_kind) {
+                        .ref => if (is_ref_mut) (if (is_with_space) "&mut " else "&mut") else "&",
+                        .inout, .yielded => if (is_with_space) "&mut " else "&mut",
+                        .sink => if (is_with_space) "own " else "own",
+                        .out, .set => if (is_with_space) "&out " else "&out",
+                    };
+
+                    try self.emitDiagnosticWithFix(
+                        .e0221_retired_mutability_or_param_mode,
+                        diag_span,
+                        "retired call-site / borrow prefix (`ADR-22B`); use `&`, `&mut`, `&out`, or `own`",
+                        "retired call-site or borrow prefix",
+                        Span.init(self.file_id, first_span.start_byte, fix_end),
+                        replacement,
+                        "replace with canonical CoreX borrow/ownership prefix",
+                    );
+
+                    const saved_stmt_lhs = self.is_in_stmt_lhs;
+                    const saved_lhs_place = self.is_in_lhs_place;
+                    self.is_in_stmt_lhs = false;
+                    self.is_in_lhs_place = false;
+                    const operand = blk_ret_pref: {
+                        defer {
+                            self.is_in_stmt_lhs = saved_stmt_lhs;
+                            self.is_in_lhs_place = saved_lhs_place;
+                        }
+                        break :blk_ret_pref try self.parseExprBp(28, is_struct_lit_allowed);
+                    };
+                    self.cst.finishNode(pref_cst, .{ .has_error = true });
+                    self.has_last_expr_block_body = false;
+                    return self.ast.appendNodeWithCst(.{
+                        .tag = .unary_expr,
+                        .main_token = first_tok,
+                        .lhs = PackedOperand.initNode(operand),
+                    }, pref_cst);
                 }
-                const first_span = self.getTokenSpan(first_tok);
-                const end_span = self.getTokenSpan(end_tok);
-                const next_tok = self.peekTokenIndexNth(0);
-                const next_span = self.getTokenSpan(next_tok);
-                const has_only_spaces = blk_spaces: {
-                    for (self.token_buffer.getLeadingTrivia(next_tok)) |piece| {
-                        if (piece.kind != .spaces) break :blk_spaces false;
-                    }
-                    break :blk_spaces !self.peekNth(0).flags.has_leading_newline;
-                };
-                const diag_span = Span.init(self.file_id, first_span.start_byte, end_span.end_byte);
-                const fix_end = if (has_only_spaces and next_span.start_byte >= end_span.end_byte)
-                    next_span.start_byte
-                else
-                    end_span.end_byte;
-                const with_space = fix_end > end_span.end_byte;
-                const replacement = if (is_retired_ref)
-                    (if (is_ref_mut) (if (with_space) "&mut " else "&mut") else "&")
-                else if (std.mem.eql(u8, mode_lexeme, "inout"))
-                    (if (with_space) "&mut " else "&mut")
-                else if (std.mem.eql(u8, mode_lexeme, "sink"))
-                    (if (with_space) "own " else "own")
-                else
-                    (if (with_space) "&out " else "&out");
-
-                try self.emitDiagnosticWithFix(
-                    .e0221_retired_mutability_or_param_mode,
-                    diag_span,
-                    "retired call-site / borrow prefix (`ADR-22B`); use `&`, `&mut`, `&out`, or `own`",
-                    "retired call-site or borrow prefix",
-                    Span.init(self.file_id, first_span.start_byte, fix_end),
-                    replacement,
-                    "replace with canonical CoreX borrow/ownership prefix",
-                );
-
-                const saved_stmt_lhs = self.is_in_stmt_lhs;
-                const saved_lhs_place = self.is_in_lhs_place;
-                self.is_in_stmt_lhs = false;
-                self.is_in_lhs_place = false;
-                const operand = blk_ret_pref: {
-                    defer {
-                        self.is_in_stmt_lhs = saved_stmt_lhs;
-                        self.is_in_lhs_place = saved_lhs_place;
-                    }
-                    break :blk_ret_pref try self.parseExprBp(28, is_struct_lit_allowed);
-                };
-                self.cst.finishNode(pref_cst, .{ .has_error = true });
-                self.has_last_expr_block_body = false;
-                return self.ast.appendNodeWithCst(.{
-                    .tag = .unary_expr,
-                    .main_token = first_tok,
-                    .lhs = PackedOperand.initNode(operand),
-                }, pref_cst);
             }
         }
 
@@ -9256,31 +9306,30 @@ pub const Parser = struct {
                         if (self.peekKind() == .kw_mut) {
                             _ = try self.consumeLeaf(.token_leaf, .{});
                         }
-                    } else if ((std.mem.eql(u8, mod_lexeme, "inout") or
-                        std.mem.eql(u8, mod_lexeme, "sink") or
-                        std.mem.eql(u8, mod_lexeme, "set")) and
-                        isUnambiguousAddrOperandStart(after_mod, after_lparen))
-                    {
-                        has_pref_err = true;
-                        const mod_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
-                        const amp_span = self.getTokenSpan(op_tok);
-                        const mod_span = self.getTokenSpan(mod_tok);
-                        const diag_span = Span.init(self.file_id, amp_span.start_byte, mod_span.end_byte);
-                        const replacement = if (std.mem.eql(u8, mod_lexeme, "inout"))
-                            "&mut"
-                        else if (std.mem.eql(u8, mod_lexeme, "sink"))
-                            "own"
-                        else
-                            "&out";
-                        try self.emitDiagnosticWithFix(
-                            .e0221_retired_mutability_or_param_mode,
-                            diag_span,
-                            "retired `&inout` / `&sink` / `&set` spelling (`ADR-22B`); write `&mut`, `own`, or `&out`",
-                            "retired borrow/projection modifier",
-                            diag_span,
-                            replacement,
-                            "replace with canonical CoreX prefix",
-                        );
+                    } else if (RETIRED_PARAM_MODE_MAP.get(mod_lexeme)) |retired_amp_kind| {
+                        if ((retired_amp_kind == .inout or retired_amp_kind == .sink or retired_amp_kind == .set) and
+                            isUnambiguousAddrOperandStart(after_mod, after_lparen))
+                        {
+                            has_pref_err = true;
+                            const mod_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                            const amp_span = self.getTokenSpan(op_tok);
+                            const mod_span = self.getTokenSpan(mod_tok);
+                            const diag_span = Span.init(self.file_id, amp_span.start_byte, mod_span.end_byte);
+                            const replacement = switch (retired_amp_kind) {
+                                .inout, .yielded, .ref => "&mut",
+                                .sink => "own",
+                                .out, .set => "&out",
+                            };
+                            try self.emitDiagnosticWithFix(
+                                .e0221_retired_mutability_or_param_mode,
+                                diag_span,
+                                "retired `&inout` / `&sink` / `&set` spelling (`ADR-22B`); write `&mut`, `own`, or `&out`",
+                                "retired borrow/projection modifier",
+                                diag_span,
+                                replacement,
+                                "replace with canonical CoreX prefix",
+                            );
+                        }
                     }
                 } else if (self.peekKind() == .kw_let and
                     isUnambiguousAddrOperandStart(self.peekKindNth(1), self.peekKindNth(2)))
@@ -10564,8 +10613,7 @@ pub fn reparseIncremental(
                             @as(i64, tok_offsets[tok_idx]) + byte_delta;
                         if (new_off_i64 >= 0) {
                             const new_off: usize = @intCast(new_off_i64);
-                            const new_end = @min(new_off + tok_lens[tok_idx], new_source.len);
-                            const lit_slice = new_source[new_off..new_end];
+                            const lit_slice = new_source[new_off..@min(new_off + tok_lens[tok_idx], new_source.len)];
                             if (std.mem.indexOfScalar(u8, lit_slice, '\\') != null and
                                 (std.mem.indexOf(u8, lit_slice, "\\'") != null or
                                     std.mem.indexOf(u8, lit_slice, "\\\"") != null or
@@ -10698,8 +10746,7 @@ pub fn reparseIncremental(
                     }
 
                     if (!is_suffix_reused and win_parser.cursor < token_buffer.countTokens()) {
-                        const final_eof_tok = TokenIndex.fromInt(win_parser.cursor);
-                        _ = try window_cst.appendLeafNode(.token_leaf, final_eof_tok, .{});
+                        _ = try window_cst.appendLeafNode(.token_leaf, TokenIndex.fromInt(win_parser.cursor), .{});
                         win_parser.cursor += 1;
                     }
 

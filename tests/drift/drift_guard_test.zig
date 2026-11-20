@@ -121,13 +121,16 @@ fn checkZigFileFormattingAndDividers(
 
         const trimmed = std.mem.trimStart(u8, line, " ");
         if (std.mem.startsWith(u8, trimmed, "// ---") and std.mem.endsWith(u8, trimmed, "---")) {
-            if (trimmed.len != 90 and trimmed.len != 65) {
+            const cp_len = std.unicode.utf8CountCodepoints(trimmed) catch unreachable;
+            if ((trimmed.len != 90 or cp_len != 90) and (trimmed.len != 65 or cp_len != 65)) {
                 std.debug.print(
-                    "Drift Guard 4 divider width violation: `{s}:{d}` has {d} bytes (expected 90 or 65)\n",
-                    .{ zig_path, line_num, trimmed.len },
+                    "Drift Guard 4 divider width violation: `{s}:{d}` has {d}B/{d}cp (expected 90 or 65)\n",
+                    .{ zig_path, line_num, trimmed.len, cp_len },
                 );
             }
-            try std.testing.expect(trimmed.len == 90 or trimmed.len == 65);
+            try std.testing.expect(
+                (trimmed.len == 90 and cp_len == 90) or (trimmed.len == 65 and cp_len == 65),
+            );
             const after_prefix = trimmed[3..];
             var left_dashes: usize = 0;
             while (left_dashes < after_prefix.len and after_prefix[left_dashes] == '-') : (left_dashes += 1) {}
@@ -1776,6 +1779,9 @@ test "test_drift_guard_phase10_tooling_lsp_check_and_upgrade" {
     try std.testing.expectEqual(@as(usize, 8 * 1024), corex.lsp_server.MAX_LSP_HEADER_BYTES);
     try std.testing.expectEqual(@as(usize, 16 * 1024 * 1024), corex.lsp_server.MAX_LSP_CONTENT_LENGTH);
     try std.testing.expectEqual(@as(usize, 64), corex.lsp_server.MAX_LSP_JSON_DEPTH);
+    try std.testing.expectEqual(@as(usize, 4096), corex.lsp_server.MAX_LSP_URI_BYTES);
+    try std.testing.expectEqual(@as(usize, 512), corex.lsp_server.MAX_CLIENT_URI_MAP_ENTRIES);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), corex.lsp_server.MAX_CLIENT_URI_MAP_BYTES);
     try std.testing.expectEqual(@as(usize, 64), corex.lsp_server.MAX_SEMANTIC_TOKEN_CACHE_ENTRIES);
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), corex.lsp_server.MAX_SEMANTIC_TOKEN_CACHE_BYTES);
 }

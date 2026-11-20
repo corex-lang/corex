@@ -10149,8 +10149,7 @@ const HirLowerer = struct {
             if (sig_view) |sv| {
                 while (wrapped_args.items.len < sv.paramCount()) {
                     const pad_idx = wrapped_args.items.len;
-                    const pad_ty = self.concreteType(sv.getParamType(pad_idx));
-                    const pad_hir = try self.emitErrorHole(tok, .none, pad_ty);
+                    const pad_hir = try self.emitErrorHole(tok, .none, self.concreteType(sv.getParamType(pad_idx)));
                     try wrapped_args.append(
                         self.allocator,
                         (try self.wrapArgProjection(pad_hir, sv.getParamMode(pad_idx), tok)).asInt(),
@@ -11200,14 +11199,12 @@ const HirLowerer = struct {
                 }
                 if (node.rhs.tag == .node) {
                     return self.hasDollarAstDepth(NodeIndex.fromInt(node.rhs.payload), depth + 1);
-                }
-                if (node.rhs.tag == .extra) {
+                } else if (node.rhs.tag == .extra) {
                     const raw_items = self.getAstExtraSlice(node_id, true);
                     const is_dot_call = node.lhs.tag == .node and !node.main_token.isNone() and
                         node.main_token.asInt() < self.tokens.countTokens() and
                         self.tokens.getToken(node.main_token).kind == .dot;
-                    const start_off: usize = if (is_dot_call and raw_items.len >= 1) 1 else 0;
-                    for (raw_items[start_off..]) |raw_arg| {
+                    for (raw_items[if (is_dot_call and raw_items.len >= 1) 1 else 0..]) |raw_arg| {
                         if (self.hasDollarAstDepth(NodeIndex.fromInt(raw_arg), depth + 1)) return true;
                     }
                 }
@@ -13208,8 +13205,11 @@ const HirLowerer = struct {
             if (ast_node.tag == .incomplete_call and sig_view != null) {
                 while (wrapped_args.items.len < fixed_arity) {
                     const pad_idx = wrapped_args.items.len;
-                    const pad_ty = self.concreteType(sig_view.?.getParamType(pad_idx));
-                    const pad_hir = try self.emitErrorHole(tok, .none, pad_ty);
+                    const pad_hir = try self.emitErrorHole(
+                        tok,
+                        .none,
+                        self.concreteType(sig_view.?.getParamType(pad_idx)),
+                    );
                     try wrapped_args.append(
                         self.allocator,
                         (try self.wrapArgProjection(pad_hir, sig_view.?.getParamMode(pad_idx), tok)).asInt(),

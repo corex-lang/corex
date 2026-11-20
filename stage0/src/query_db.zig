@@ -2985,8 +2985,7 @@ fn hashSymbolDeprecationMeta(
         hasher.updateU8(0);
         return;
     }
-    const sym = sym_table.getSymbol(sym_idx).*;
-    hasher.updateU8(@intFromBool(sym.extra_flags.is_deprecated));
+    hasher.updateU8(@intFromBool(sym_table.getSymbol(sym_idx).extra_flags.is_deprecated));
     if (sym_table.getDeprecatedMeta(sym_idx)) |meta| {
         hasher.updateU8(1);
         hasher.updateU8(@intFromBool(meta.is_deprecated));
@@ -3038,8 +3037,11 @@ fn findHeaderIdentSpanInCst(
                     break;
                 }
                 if (isIdentifierTokenKind(tok_rec.kind) or tok_rec.kind == .kw_self_val or tok_rec.kind == .kw_async) {
-                    const lex = symbol_resolver.extractTokenSlice(source, token_buffer, sub.token);
-                    if (std.mem.eql(u8, lex, wanted_name)) {
+                    if (std.mem.eql(
+                        u8,
+                        symbol_resolver.extractTokenSlice(source, token_buffer, sub.token),
+                        wanted_name,
+                    )) {
                         const found_span = token_buffer.getTokenSpan(file_id, sub.token);
                         if (root_rec.kind == .use_item or root_rec.kind == .use_tree) {
                             last_use_match = found_span;
@@ -3068,8 +3070,10 @@ fn findMemberIdentSpanInOwnerCst(
 ) ?Span {
     if (owner_cst.isNone() or owner_cst.asInt() >= cst_arena.countNodes()) return null;
     const start_idx: usize = owner_cst.asInt();
-    const root_rec = cst_arena.getNode(owner_cst);
-    const end_idx = @min(start_idx + @max(@as(usize, root_rec.subtree_size), 1), cst_arena.countNodes());
+    const end_idx = @min(
+        start_idx + @max(@as(usize, cst_arena.getNode(owner_cst).subtree_size), 1),
+        cst_arena.countNodes(),
+    );
 
     var best_span: ?Span = null;
     var best_dist: u32 = std.math.maxInt(u32);
@@ -6749,8 +6753,7 @@ pub const CompilerDb = struct {
         if (def_id.isNone()) return null;
         _ = try self.typecheckBody(def_id);
         const file_id = def_id.fileId();
-        const item_tree = try self.extractItemTree(file_id);
-        if (item_tree.getEntry(def_id)) |entry| {
+        if ((try self.extractItemTree(file_id)).getEntry(def_id)) |entry| {
             if (self.parsed_artifacts.getPtr(file_id.asInt())) |parsed_ptr| {
                 try self.syncDefWindowAndSideTables(def_id, parsed_ptr, entry.ast_node);
             }
@@ -6798,8 +6801,7 @@ pub const CompilerDb = struct {
         var hi: usize = tok_count;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            const mid_off = parsed.token_buffer.getToken(TokenIndex.fromInt(@intCast(mid))).byte_offset;
-            if (mid_off < sym.decl_span.start_byte) {
+            if (parsed.token_buffer.getToken(TokenIndex.fromInt(@intCast(mid))).byte_offset < sym.decl_span.start_byte) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -6918,9 +6920,9 @@ pub const CompilerDb = struct {
         var best_fallback: ?Span = null;
         var best_dist: u32 = std.math.maxInt(u32);
         for (tree.entries) |entry| {
-            const should_scan = (sym.kind == .use_alias_sym and (entry.kind == .use_decl or entry.kind == .mod_decl)) or
+            const is_scan_needed = (sym.kind == .use_alias_sym and (entry.kind == .use_decl or entry.kind == .mod_decl)) or
                 entry.kind == .mod_decl or entry.kind == .impl_decl;
-            if (!should_scan) continue;
+            if (!is_scan_needed) continue;
             if (findMemberIdentSpanInOwnerCst(
                 src,
                 decl_fid,
@@ -7976,15 +7978,14 @@ pub const CompilerDb = struct {
         };
 
         const parsed_ptr = gop.value_ptr;
-        const had_prev_errors = if (gop.found_existing) parsed_ptr.has_parse_errors else false;
-        const can_reparse_inc = gop.found_existing and
-            !had_prev_errors and
+        const is_incremental_reparse_eligible = gop.found_existing and
+            !parsed_ptr.has_parse_errors and
             pending_opt != null and
             Fingerprint128.eql(pending_opt.?.value.base_fingerprint, parsed_ptr.source_fingerprint) and
             Fingerprint128.eql(pending_opt.?.value.target_fingerprint, src_fp);
 
         var root_node: NodeIndex = .root;
-        if (can_reparse_inc) {
+        if (is_incremental_reparse_eligible) {
             parsed_ptr.clearDiagnosticsOnly();
             errdefer parsed_ptr.resetForReparse();
             const inc_stats = parser.reparseIncremental(
@@ -8298,8 +8299,7 @@ pub const CompilerDb = struct {
                 for (child_links.items) |link| {
                     const child_raw = link.child_fid.asInt();
                     if (child_raw == candidate_fid.asInt()) return true;
-                    const gop = try visited_fids.getOrPut(self.allocator, child_raw);
-                    if (!gop.found_existing) {
+                    if (!(try visited_fids.getOrPut(self.allocator, child_raw)).found_existing) {
                         try work_stack.append(self.allocator, child_raw);
                     }
                 }
@@ -9060,8 +9060,7 @@ pub const CompilerDb = struct {
         for (subtree_files.items) |member_fid| {
             if (member_fid == caller_fid and is_skipping_caller_pass1) {
                 continue;
-            }
-            if (member_fid != caller_fid and
+            } else if (member_fid != caller_fid and
                 !self.in_flight_keys.contains(QueryKey.forFile(.item_tree, member_fid).asU64()))
             {
                 const member_tree = try self.extractItemTree(member_fid);
@@ -9100,11 +9099,13 @@ pub const CompilerDb = struct {
     }
 
     /// Returns `true` if `key`'s previous memo edges included an `@embed_bytes` or `@c_import` dependency.
-    fn hadEmbedOrCImportEdgeInPrevMemo(self: *const CompilerDb, key: QueryKey) bool {
+    fn hasEmbedOrCImportEdgeInPrevMemo(self: *const CompilerDb, key: QueryKey) bool {
         const memo = self.memos.get(key.asU64()) orelse return false;
         const edge_start: usize = memo.dep_edge_start;
-        const edge_end: usize = @min(edge_start + @as(usize, memo.dep_edge_len), self.dep_edges.items.len);
-        for (self.dep_edges.items[edge_start..edge_end]) |dep_key| {
+        for (self.dep_edges.items[edge_start..@min(
+            edge_start + @as(usize, memo.dep_edge_len),
+            self.dep_edges.items.len,
+        )]) |dep_key| {
             if (dep_key.stage == .source_text and (dep_key.flags & EMBED_FILE_KEY_FLAG) != 0) return true;
             if (dep_key.stage == .resolve_signatures and
                 dep_key.entity_index >= VIRTUAL_C_IMPORT_FILE_ID_BASE and
@@ -9261,7 +9262,7 @@ pub const CompilerDb = struct {
                     if (existing_p1.mod_scope == prev_sigs.module_scope and
                         Fingerprint128.eql(existing_p1.tree_fingerprint, item_tree_fp) and
                         self.symbol_table.file_module_scopes.get(file_id.asInt()) == prev_sigs.module_scope and
-                        !self.hadEmbedOrCImportEdgeInPrevMemo(QueryKey.forFile(.resolve_signatures, file_id)))
+                        !self.hasEmbedOrCImportEdgeInPrevMemo(QueryKey.forFile(.resolve_signatures, file_id)))
                     {
                         is_eligible_for_sig_reuse = true;
                     }

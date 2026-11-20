@@ -2377,10 +2377,9 @@ const CstFormatter = struct {
             if (try self.extractContainerView(node_idx, &probe_view)) {
                 if (!probe_view.open_brace_tok.isNone() and !probe_view.close_brace_tok.isNone()) {
                     const open_rec = self.token_buffer.getToken(probe_view.open_brace_tok);
-                    const close_rec = self.token_buffer.getToken(probe_view.close_brace_tok);
-                    const interior_start = open_rec.byte_offset + open_rec.byte_len;
-                    const interior_end = close_rec.byte_offset;
-                    if (sel_start >= interior_start and sel_end <= interior_end) {
+                    if (sel_start >= open_rec.byte_offset + open_rec.byte_len and
+                        sel_end <= self.token_buffer.getToken(probe_view.close_brace_tok).byte_offset)
+                    {
                         try out_containers.append(self.allocator, node_idx);
                     }
                 }
@@ -8568,8 +8567,10 @@ pub fn formatByteRange(
             const lead_byte = cst_formatter.getNodeLeadingStartByte(sib_id);
             const trail_byte = cst_formatter.getNodeTrailingEndByte(sib_id);
             const start_line = resolveLineIndex0(line_index, lead_byte);
-            const end_probe = if (trail_byte > lead_byte) trail_byte - 1 else lead_byte;
-            const end_line = resolveLineIndex0(line_index, end_probe);
+            const end_line = resolveLineIndex0(
+                line_index,
+                if (trail_byte > lead_byte) trail_byte - 1 else lead_byte,
+            );
             sib_start_lines[sib_i] = start_line;
             sib_end_lines[sib_i] = end_line;
 

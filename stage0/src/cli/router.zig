@@ -2929,7 +2929,7 @@ fn executePackageOrScriptWorkflow(
         try check_audit.applyCheckFixesOnDb(allocator, &db, .{
             .io = io,
             .vfs = source_map,
-            .write_to_disk = true,
+            .is_writing_to_disk = true,
             .candidate_files = root_verify_slices.items,
         })
     else
@@ -3990,10 +3990,10 @@ fn collectWorkspaceObservedPackageCaps(
 
     var env_cfg = try resolveToolchainEnvConfig(allocator, environ_map);
     defer env_cfg.deinit(allocator);
-    const cfg_env = symbol_resolver.CfgEnv.fromTargetSpec(target_spec, false);
+    const cfg_env = symbol_resolver.CfgEnv.fromTargetSpec(target_spec, true);
 
     const toml_fid = (try loadSourceFileIntoVfs(io, &local_vfs, toml_path, &local_sink)) orelse return;
-    var bundle = pkg_manifest.loadWorkspaceManifestBundle(
+    var bundle = upgrade_engine.loadUpgradedWorkspaceManifestBundle(
         io,
         allocator,
         &local_interner,
@@ -4003,7 +4003,7 @@ fn collectWorkspaceObservedPackageCaps(
         &local_sink,
     ) catch return;
     defer bundle.deinit();
-    if (local_sink.hasErrors() or bundle.root_manifest.dependencies.len == 0) return;
+    if (local_sink.hasErrors()) return;
 
     var resolved_opt = pkg_resolver.resolveProjectGraph(
         allocator,
@@ -4014,6 +4014,7 @@ fn collectWorkspaceObservedPackageCaps(
         .{
             .io = io,
             .target_spec = target_spec,
+            .is_including_tests = true,
             .corex_home_dir = env_cfg.corex_home_dir,
             .environ_map = environ_map,
         },
@@ -4025,6 +4026,7 @@ fn collectWorkspaceObservedPackageCaps(
     }
     var resolved = resolved_opt.?;
     defer resolved.deinit(allocator);
+    if (resolved.packages.len <= 1) return;
 
     var cache = pkg_cache.PkgCache.init(
         allocator,
@@ -4107,10 +4109,14 @@ fn collectWorkspaceObservedPackageCaps(
             );
             try pkg_root_fids.put(allocator, pkg_node.pkg_id, root_fid);
         } else {
-            const pkg_dir = pkg_node.package_root_path;
-            if (pkg_dir.len == 0) continue;
-            const entry_rel = pkg_node.lib_root_rel_path orelse pkg_node.bin_root_rel_path orelse "src/root.cx";
-            const entry_path = try std.fs.path.join(allocator, &.{ pkg_dir, entry_rel });
+            if (pkg_node.package_root_path.len == 0) continue;
+            const entry_path = try std.fs.path.join(
+                allocator,
+                &.{
+                    pkg_node.package_root_path,
+                    pkg_node.lib_root_rel_path orelse pkg_node.bin_root_rel_path orelse "src/root.cx",
+                },
+            );
             defer allocator.free(entry_path);
             const root_fid = local_vfs.resolveOrCreatePath(io, entry_path, pkg_node.pkg_id) catch continue;
             try discoverExternalSubmodulesRecursive(
@@ -4252,8 +4258,7 @@ fn executeUpgradeSubcommand(
     if (exec_info.positional_args.len == 0) {
         if (try discoverNearestManifestUpward(allocator, io)) |anc_toml| {
             owned_manifest_path = anc_toml;
-            const ws_dir = std.fs.path.dirname(anc_toml) orelse ".";
-            _ = try collectDirectoryCxPaths(allocator, io, ws_dir, &cx_paths);
+            _ = try collectDirectoryCxPaths(allocator, io, std.fs.path.dirname(anc_toml) orelse ".", &cx_paths);
         } else {
             _ = try collectDirectoryCxPaths(allocator, io, ".", &cx_paths);
             if (cx_paths.items.len == 0) {
@@ -4313,6 +4318,9 @@ fn executeUpgradeSubcommand(
         }
     }
 
+    var env_cfg = try resolveToolchainEnvConfig(allocator, environ_map);
+    defer env_cfg.deinit(allocator);
+
     const upg_options: upgrade_engine.UpgradeOptions = .{
         .rule_mask = rule_mask,
         .has_explicit_rule_filter = has_explicit_rule_filter,
@@ -4322,6 +4330,9 @@ fn executeUpgradeSubcommand(
         .accept_caps_filter_bits = accept_caps_bits,
         .target_spec = exec_info.target_spec,
         .comptime_step_limit = exec_info.comptime_step_limit,
+        .io = io,
+        .corex_home_dir = env_cfg.corex_home_dir,
+        .environ_map = environ_map,
     };
 
     var cx_const_slices = try allocator.alloc([]const u8, cx_paths.items.len);
@@ -4395,8 +4406,10 @@ fn executeUpgradeSubcommand(
                 );
                 defer pre_upg_toml.deinit(allocator);
 
-                const ws_dir = std.fs.path.dirname(toml_path) orelse ".";
-                const lock_path = try std.fs.path.join(allocator, &.{ ws_dir, "corex.lock" });
+                const lock_path = try std.fs.path.join(
+                    allocator,
+                    &.{ std.fs.path.dirname(toml_path) orelse ".", "corex.lock" },
+                );
                 defer allocator.free(lock_path);
                 const lock_bytes_opt: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(
                     io,
@@ -4456,12 +4469,25 @@ fn executeUpgradeSubcommand(
                     );
                 }
 
+                var extra_pending: std.ArrayListUnmanaged(upgrade_engine.PendingUpgradeItem) = .empty;
+                defer extra_pending.deinit(allocator);
+                if (exec_info.is_check_only) {
+                    if (pre_upg_toml.is_changed or accept_outcome.is_toml_changed) {
+                        try extra_pending.append(allocator, .{ .kind = .manifest_toml, .path = toml_path });
+                    }
+                    if (accept_outcome.is_lock_changed) {
+                        try extra_pending.append(allocator, .{ .kind = .lockfile, .path = lock_path });
+                    }
+                }
+                var path_upg_options = upg_options;
+                path_upg_options.extra_pending_items = extra_pending.items;
+
                 const upg_code = upgrade_engine.executeUpgradePaths(
                     allocator,
                     io,
                     cx_const_slices,
                     toml_path,
-                    upg_options,
+                    path_upg_options,
                     stdout_style,
                     stderr_style,
                     stdout_writer,
@@ -4488,7 +4514,7 @@ fn executeUpgradeSubcommand(
                         return 1;
                     },
                 };
-                if (upg_code != 0) return upg_code;
+                if (upg_code != 0 or exec_info.is_check_only) return upg_code;
 
                 if (!exec_info.is_check_only) {
                     if (accept_outcome.is_toml_changed) {
@@ -5845,9 +5871,9 @@ pub fn runCli(
                 }
             } else {
                 for (input_positional) |raw_arg| {
-                    const allow_dir = effective_exec_info.subcommand == .check or
+                    const is_dir_allowed = effective_exec_info.subcommand == .check or
                         effective_exec_info.subcommand == .@"test";
-                    if (!allow_dir or !(try collectDirectoryCxPaths(allocator, io, raw_arg, &expanded_paths))) {
+                    if (!is_dir_allowed or !(try collectDirectoryCxPaths(allocator, io, raw_arg, &expanded_paths))) {
                         const duped_arg = try allocator.dupe(u8, raw_arg);
                         errdefer allocator.free(duped_arg);
                         try expanded_paths.append(allocator, duped_arg);
@@ -5946,7 +5972,7 @@ pub fn runCli(
                         try check_audit.applyCheckFixesOnDb(allocator, &db, .{
                             .io = io,
                             .vfs = &source_map,
-                            .write_to_disk = true,
+                            .is_writing_to_disk = true,
                             .candidate_files = cx_file_ids.items,
                         })
                     else
@@ -6634,7 +6660,7 @@ test "test_cli_check_fix_preserves_script_prefixes_and_atomic_fmt" {
     var out_buf: [4096]u8 = undefined;
     var err_buf: [4096]u8 = undefined;
 
-    // [1] Mode C shebang-only `.cx` script: `corex check --fix` preserves `#!` and rewrites `Option[u8]` -> `u8?`:
+    // [1] Mode C shebang-only `.cx` script; `corex check --fix` preserves `#!` and rewrites `Option[u8]` -> `u8?`:
     const mode_c_path = scripts_dir ++ "/mode_c_cli.cx";
     const shebang_line = "#!/usr/bin/env corex\n";
     try std.Io.Dir.cwd().writeFile(io, .{
@@ -6664,7 +6690,7 @@ test "test_cli_check_fix_preserves_script_prefixes_and_atomic_fmt" {
         try std.testing.expect(std.mem.indexOf(u8, disk_c, "let opt: u8? = .None;") != null);
     }
 
-    // [2] Mode B `#! + ---` script + `mod helper;`: `corex check --fix` persists both files while keeping `#! + ---`:
+    // [2] Mode B `#! + ---` script with `mod helper`; `corex check --fix` persists both files while keeping `#! + ---`:
     const mode_b_path = scripts_dir ++ "/mode_b_cli.cx";
     const helper_path = scripts_dir ++ "/helper.cx";
     const fm_header =

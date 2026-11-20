@@ -216,13 +216,13 @@ const P99_SAMPLE_INDEX: usize = 98;
 
 /// Custom `std.Io.Reader.VTable` delivering one staged turn batch per `LspSession` cycle.
 const PIPE_READER_VTABLE = std.Io.Reader.VTable{
-    .stream = pipeReaderStream,
+    .stream = streamPipeReader,
 };
 
 /// Custom `std.Io.Writer.VTable` capturing outbound JSON-RPC frames and waking the benchmark caller.
 const PIPE_WRITER_VTABLE = std.Io.Writer.VTable{
-    .drain = pipeWriterDrain,
-    .flush = pipeWriterFlush,
+    .drain = drainPipeWriter,
+    .flush = flushPipeWriter,
 };
 
 /// Representative multi-item legacy `DR-21` + `DR-22` `.cx` module for Case 3 (`upgradeSource`).
@@ -307,7 +307,7 @@ var shared_bench_state: ?PreparedPhase10BenchState = null;
 // -------------------- LSP Turn Stream Pipe --------------------
 
 /// Streams staged client request bytes into `lsp_server.runServerStream`, blocking cleanly between turns.
-fn pipeReaderStream(
+fn streamPipeReader(
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
     limit: std.Io.Limit,
@@ -332,7 +332,7 @@ fn pipeReaderStream(
 }
 
 /// Appends buffered and vectored outbound JSON-RPC bytes into `pipe.captured_resp_buf`.
-fn pipeWriterDrain(
+fn drainPipeWriter(
     writer: *std.Io.Writer,
     data: []const []const u8,
     splat: usize,
@@ -361,7 +361,7 @@ fn pipeWriterDrain(
 }
 
 /// Parses newly flushed `Content-Length` frames in $O(1)$ per frame and wakes the client once complete.
-fn pipeWriterFlush(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+fn flushPipeWriter(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     const pipe: *LspTurnPipe = @fieldParentPtr("writer", writer);
     if (writer.end > 0) {
         pipe.captured_resp_buf.appendSlice(pipe.allocator, writer.buffer[0..writer.end]) catch {
@@ -492,7 +492,7 @@ fn writeSynthetic400LocModule(
     defer buf = alloc_writer.toArrayList();
     const writer = &alloc_writer.writer;
 
-    // Item 0 (`16` lines: `0..15`):
+    // Item 0 (`16` lines; `0..15`):
     try writer.print(
         "/// Module {d:0>3} state vector for incremental LSP scaling benchmark.\n" ++
             "pub struct SamplePair {{\n" ++
@@ -754,7 +754,6 @@ fn preparePhase10BenchState(allocator: std.mem.Allocator, io: std.Io) !PreparedP
     if (std.mem.indexOf(u8, warm_resp, "\"items\":[]") == null) {
         return error.WarmupDiagnosticsNotClean;
     }
-    const init_sem_id = extractSemanticResultId(warm_resp) orelse return error.MissingInitialSemanticResultId;
 
     return .{
         .io = io,
@@ -765,7 +764,7 @@ fn preparePhase10BenchState(allocator: std.mem.Allocator, io: std.Io) !PreparedP
         .worker_ctx = worker_ctx,
         .server_thread = server_thread,
         .mod125_uri = mod125_uri,
-        .latest_sem_result_id = init_sem_id,
+        .latest_sem_result_id = extractSemanticResultId(warm_resp) orelse return error.MissingInitialSemanticResultId,
     };
 }
 
@@ -914,7 +913,7 @@ fn benchUpgrade3TierSynergyModule(allocator: std.mem.Allocator) !usize {
     );
     defer upg_res.deinit(allocator);
 
-    if (!upg_res.is_changed or upg_res.was_rolled_back) {
+    if (!upg_res.is_changed or upg_res.is_rolled_back) {
         return error.UpgradeSynergyBenchmarkFailed;
     }
     std.mem.doNotOptimizeAway(upg_res.upgraded_source.ptr);
@@ -1003,21 +1002,20 @@ pub fn main(init: std.process.Init) !void {
 
     var p99_c1_buf: [32]u8 = undefined;
     var p99_c2_buf: [32]u8 = undefined;
-    const p99_c1_str = corex.bench_harness.formatDurationNs(&p99_c1_buf, case1_p99_ns);
-    const p99_c2_str = corex.bench_harness.formatDurationNs(&p99_c2_buf, case2_p99_ns);
-
     var footer_buf: [256]u8 = undefined;
-    const footer_msg = try std.fmt.bufPrint(
-        &footer_buf,
-        "100K-LOC LSP P99 verified (< 10 ms): didChange+diag P99 = {s}, completion+hover+def+delta P99 = {s}",
-        .{ p99_c1_str, p99_c2_str },
-    );
     try style_config.writeStatusHeader(
         &stdout_writer.interface,
         .success,
         corex.Glyphs.SUCCESS,
         "budgets",
-        footer_msg,
+        try std.fmt.bufPrint(
+            &footer_buf,
+            "100K-LOC LSP P99 verified (< 10 ms): didChange+diag P99 = {s}, completion+hover+def+delta P99 = {s}",
+            .{
+                corex.bench_harness.formatDurationNs(&p99_c1_buf, case1_p99_ns),
+                corex.bench_harness.formatDurationNs(&p99_c2_buf, case2_p99_ns),
+            },
+        ),
     );
     try stdout_writer.interface.writeByte('\n');
     try stdout_writer.interface.flush();

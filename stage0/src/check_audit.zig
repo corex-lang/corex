@@ -113,25 +113,25 @@ const CandidateFileSnapshot = struct {
     /// Normalized virtual or host path for VFS overlay updates and atomic disk writes.
     file_path: []u8,
     /// Whether `original_bytes` in `CompilerDb` had `disk_script_prefix` masked to spaces (`blanked_cx_source`).
-    was_prefix_masked_in_db: bool = false,
+    is_prefix_masked_in_db: bool = false,
     /// Whether the file was marked open in an editor inside `VfsSourceMap` before patching.
-    was_open_in_editor: bool = false,
-    /// Whether `file_path` had a real host-disk backing file when `write_to_disk` is active.
+    is_open_in_editor: bool = false,
+    /// Whether `file_path` had a real host-disk backing file when `is_writing_to_disk` is active.
     has_disk_backing: bool = false,
     /// Whether this file exhibited CST parse errors in the pre-fix baseline check.
-    had_baseline_syntax_errors: bool = false,
+    has_baseline_syntax_errors: bool = false,
     /// Whether at least one `.machine_applicable` fix or format normalization mutated this file.
     is_modified: bool = false,
 };
 
 /// Configuration options governing `applyCheckFixesOnDb` (`corex check --fix`).
 pub const CheckFixOptions = struct {
-    /// Optional Zig `std.Io` handle (required when `write_to_disk == true`).
+    /// Optional Zig `std.Io` handle (required when `is_writing_to_disk == true`).
     io: ?std.Io = null,
     /// Optional `VfsSourceMap` synchronized via `setEditorOverlay` across passes and rollback.
     vfs: ?*VfsSourceMap = null,
     /// When `true`, atomically persists converged modified files to disk via `writeArtifactAtomic`.
-    write_to_disk: bool = false,
+    is_writing_to_disk: bool = false,
     /// Optional explicit candidate `FileId` slice (`null` auto-discovers all editable `.root` files).
     candidate_files: ?[]const FileId = null,
 };
@@ -145,7 +145,7 @@ pub const CheckFixReport = struct {
     /// Number of check/patch passes executed (`1 .. MAX_CHECK_FIX_PASSES`).
     pass_count: u8 = 0,
     /// `true` if the Rollback Guard reverted all edits due to new syntax errors or increased error count.
-    was_rolled_back: bool = false,
+    is_rolled_back: bool = false,
 };
 
 /// Canonical capability bit metadata pairing an `EffectCapabilityMask` bit with its `DR-17` name.
@@ -328,14 +328,14 @@ fn isFrontmatterFenceLine(line_bytes: []const u8) bool {
 /// Scans a TOML slice (`[0 .. toml_slice.len)`) for unquoted `#` comments containing `@generated` or `DO NOT EDIT`.
 fn hasGeneratedMarkerInTomlComments(toml_slice: []const u8) bool {
     const scan_end = @min(toml_slice.len, GENERATED_HEADER_SCAN_BYTES);
-    var in_basic = false;
-    var in_literal = false;
-    var in_ml_basic = false;
-    var in_ml_literal = false;
+    var is_in_basic = false;
+    var is_in_literal = false;
+    var is_in_ml_basic = false;
+    var is_in_ml_literal = false;
     var cursor: usize = 0;
 
     while (cursor < scan_end) {
-        if (in_ml_basic) {
+        if (is_in_ml_basic) {
             if (toml_slice[cursor] == '\\' and cursor + 1 < scan_end) {
                 cursor += 2;
                 continue;
@@ -343,38 +343,35 @@ fn hasGeneratedMarkerInTomlComments(toml_slice: []const u8) bool {
             if (cursor + 2 < scan_end and toml_slice[cursor] == '"' and
                 toml_slice[cursor + 1] == '"' and toml_slice[cursor + 2] == '"')
             {
-                in_ml_basic = false;
+                is_in_ml_basic = false;
                 cursor += 3;
                 continue;
             }
             cursor += 1;
             continue;
-        }
-        if (in_ml_literal) {
+        } else if (is_in_ml_literal) {
             if (cursor + 2 < scan_end and toml_slice[cursor] == '\'' and
                 toml_slice[cursor + 1] == '\'' and toml_slice[cursor + 2] == '\'')
             {
-                in_ml_literal = false;
+                is_in_ml_literal = false;
                 cursor += 3;
                 continue;
             }
             cursor += 1;
             continue;
-        }
-        if (in_basic) {
+        } else if (is_in_basic) {
             if (toml_slice[cursor] == '\\' and cursor + 1 < scan_end) {
                 cursor += 2;
                 continue;
             }
             if (toml_slice[cursor] == '"' or toml_slice[cursor] == '\n') {
-                in_basic = false;
+                is_in_basic = false;
             }
             cursor += 1;
             continue;
-        }
-        if (in_literal) {
+        } else if (is_in_literal) {
             if (toml_slice[cursor] == '\'' or toml_slice[cursor] == '\n') {
-                in_literal = false;
+                is_in_literal = false;
             }
             cursor += 1;
             continue;
@@ -383,25 +380,23 @@ fn hasGeneratedMarkerInTomlComments(toml_slice: []const u8) bool {
         const ch_byte = toml_slice[cursor];
         if (ch_byte == '"') {
             if (cursor + 2 < scan_end and toml_slice[cursor + 1] == '"' and toml_slice[cursor + 2] == '"') {
-                in_ml_basic = true;
+                is_in_ml_basic = true;
                 cursor += 3;
             } else {
-                in_basic = true;
+                is_in_basic = true;
                 cursor += 1;
             }
             continue;
-        }
-        if (ch_byte == '\'') {
+        } else if (ch_byte == '\'') {
             if (cursor + 2 < scan_end and toml_slice[cursor + 1] == '\'' and toml_slice[cursor + 2] == '\'') {
-                in_ml_literal = true;
+                is_in_ml_literal = true;
                 cursor += 3;
             } else {
-                in_literal = true;
+                is_in_literal = true;
                 cursor += 1;
             }
             continue;
-        }
-        if (ch_byte == '#') {
+        } else if (ch_byte == '#') {
             const rest = toml_slice[cursor..scan_end];
             const nl_rel = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
             if (hasGeneratedMarkerSubstring(rest[0..nl_rel])) return true;
@@ -469,11 +464,11 @@ inline fn getRecordedNodeType(checker: *const TypeChecker, node_id: NodeIndex) T
     return .err_ty;
 }
 
-/// Returns `true` if `W0202` (`allow_idiom_w0202`) is suppressed at `span` via `@allow(…)`.
+/// Returns `true` if `W0202` (`has_allow_idiom_w0202`) is suppressed at `span` via `@allow(…)`.
 inline fn isW0202SuppressedAtSpan(checker: *const TypeChecker, span: Span) bool {
-    if (checker.active_allow_mask.allow_idiom_w0202) return true;
-    if (checker.sym_table.getScopeAllowMask(checker.current_scope).allow_idiom_w0202) return true;
-    return checker.getAllowedMaskAtSpan(span).allow_idiom_w0202;
+    if (checker.active_allow_mask.has_allow_idiom_w0202) return true;
+    if (checker.sym_table.getScopeAllowMask(checker.current_scope).has_allow_idiom_w0202) return true;
+    return checker.getAllowedMaskAtSpan(span).has_allow_idiom_w0202;
 }
 
 /// Returns `true` if `kind` is a line, doc, module-doc, or block comment trivia piece.
@@ -1039,10 +1034,10 @@ fn lintRedundantHeaderParensInCst(
         return;
     }
 
-    const needs_open_space = open_rec.byte_offset > 0 and
+    const is_needing_open_space = open_rec.byte_offset > 0 and
         isIdentifierByte(checker.source[open_rec.byte_offset - 1]);
     const close_end: usize = close_rec.byte_offset + @as(usize, close_rec.byte_len);
-    const needs_close_space = close_end < checker.source.len and
+    const is_needing_close_space = close_end < checker.source.len and
         (isIdentifierByte(checker.source[close_end]) or checker.source[close_end] == '{');
 
     const edits = [2]TextEdit{
@@ -1050,13 +1045,13 @@ fn lintRedundantHeaderParensInCst(
             .file_id = checker.file_id,
             .start_byte = open_rec.byte_offset,
             .end_byte = inner_span.start_byte,
-            .replacement_id = try checker.interner.intern(if (needs_open_space) " " else ""),
+            .replacement_id = try checker.interner.intern(if (is_needing_open_space) " " else ""),
         },
         .{
             .file_id = checker.file_id,
             .start_byte = inner_span.end_byte,
             .end_byte = close_rec.byte_offset + @as(u32, close_rec.byte_len),
-            .replacement_id = try checker.interner.intern(if (needs_close_space) " " else ""),
+            .replacement_id = try checker.interner.intern(if (is_needing_close_space) " " else ""),
         },
     };
     try emitIdiomWarning(
@@ -1096,10 +1091,47 @@ fn isNotOperandNeedingParens(checker: *const TypeChecker, operand_ast_id: NodeIn
     };
 }
 
+/// Returns `true` when unwrapping `expr_id` out of an identity boolean comparison (`== true` / `!= false`)
+/// requires `(…)` to prevent operator precedence inversion or `{` ambiguity under `parent_cst`.
+fn isIdentityBoolUnwrapNeedingParens(
+    checker: *const TypeChecker,
+    parent_cst: CstNodeIndex,
+    expr_id: NodeIndex,
+    expr_cst: CstNodeIndex,
+) bool {
+    if (expr_id.isNone() or expr_id.asInt() >= checker.ast_arena.countNodes()) return false;
+    const expr_tag = checker.ast_arena.getNode(expr_id).tag;
+    const has_walrus = hasWalrusInSubtree(checker.cst_arena, checker.token_buffer, expr_cst);
+    const has_brace_ambig = expr_tag == .block or expr_tag == .struct_lit or
+        hasStructLitOrBlockInSubtree(checker.cst_arena, checker.token_buffer, expr_cst);
+
+    if (!parent_cst.isNone() and parent_cst.asInt() < checker.cst_arena.countNodes()) {
+        const parent_kind = checker.cst_arena.getNode(parent_cst).kind;
+        switch (parent_kind) {
+            .tuple_or_paren_expr => return false,
+            .if_cond, .while_header, .match_expr, .expr_stmt => return has_brace_ambig or has_walrus,
+            .return_stmt,
+            .local_decl_stmt,
+            .const_item,
+            .assign_stmt,
+            .fn_expr_body,
+            .block,
+            .call_arg,
+            .array_expr,
+            .field_init,
+            => return has_walrus,
+            else => {},
+        }
+    }
+
+    return isNotOperandNeedingParens(checker, expr_id) or has_brace_ambig or has_walrus;
+}
+
 /// Idiom 2: Lints scalar `bool` equality/inequality with `true`/`false` (`x == true`, `x == false`, etc.).
 fn lintRedundantBoolEqualityAst(
     checker: *TypeChecker,
     bin_ast_id: NodeIndex,
+    parent_cst: CstNodeIndex,
     sink_opt: ?*DiagnosticSink,
 ) !void {
     if (bin_ast_id.isNone() or bin_ast_id.asInt() >= checker.ast_arena.countNodes()) return;
@@ -1176,11 +1208,14 @@ fn lintRedundantBoolEqualityAst(
         try repl_buf.append(checker.allocator, ' ');
     }
     if (is_lhs_bool_lit and is_rhs_bool_lit) {
-        const lhs_true = checker.token_buffer.getToken(lhs_node.main_token).kind == .kw_true;
-        const folded_val = if (op_tok.kind == .eqeq) (lhs_true == is_lit_true) else (lhs_true != is_lit_true);
-        try repl_buf.appendSlice(checker.allocator, if (folded_val) "true" else "false");
+        const is_lhs_true = checker.token_buffer.getToken(lhs_node.main_token).kind == .kw_true;
+        const is_folded_true = if (op_tok.kind == .eqeq) (is_lhs_true == is_lit_true) else (is_lhs_true != is_lit_true);
+        try repl_buf.appendSlice(checker.allocator, if (is_folded_true) "true" else "false");
     } else if (is_identity) {
+        const is_wrapping_identity = isIdentityBoolUnwrapNeedingParens(checker, parent_cst, expr_id, expr_cst);
+        if (is_wrapping_identity) try repl_buf.append(checker.allocator, '(');
         try repl_buf.appendSlice(checker.allocator, expr_slice);
+        if (is_wrapping_identity) try repl_buf.append(checker.allocator, ')');
     } else if (isNotOperandNeedingParens(checker, expr_id)) {
         try repl_buf.appendSlice(checker.allocator, "not (");
         try repl_buf.appendSlice(checker.allocator, expr_slice);
@@ -1193,19 +1228,18 @@ fn lintRedundantBoolEqualityAst(
         try repl_buf.append(checker.allocator, ' ');
     }
 
-    const edit = TextEdit{
-        .file_id = checker.file_id,
-        .start_byte = bin_span.start_byte,
-        .end_byte = bin_span.end_byte,
-        .replacement_id = try checker.interner.intern(repl_buf.items),
-    };
     try emitIdiomWarning(
         sink_opt,
         bin_span,
         "redundant comparison with boolean literal; use the boolean expression or `not` directly",
         "redundant boolean literal comparison",
         if (is_identity) "remove redundant boolean literal comparison" else "rewrite using prefix `not`",
-        &.{edit},
+        &.{.{
+            .file_id = checker.file_id,
+            .start_byte = bin_span.start_byte,
+            .end_byte = bin_span.end_byte,
+            .replacement_id = try checker.interner.intern(repl_buf.items),
+        }},
     );
 }
 
@@ -1338,8 +1372,7 @@ fn matchSyntacticStdlibGenericType(
             .close_bracket_tok = close_leaf.token,
             .inner_cst = type_args_buf[0],
         } };
-    }
-    if (is_result and type_arg_count == 2) {
+    } else if (is_result and type_arg_count == 2) {
         return .{ .result = .{
             .name_tok = name_leaf.token,
             .close_bracket_tok = close_leaf.token,
@@ -1391,8 +1424,8 @@ fn isUnshadowedBuiltinOptionOrResult(
     };
 }
 
-/// Computes the 4-tier `DR-22` surface precedence of `type_cst`.
-fn intrinsicCstTypePrec(checker: *const TypeChecker, type_cst: CstNodeIndex) !SurfaceTypePrec {
+/// Classifies the 4-tier `DR-22` surface precedence of `type_cst`.
+fn classifyIntrinsicCstTypePrec(checker: *const TypeChecker, type_cst: CstNodeIndex) !SurfaceTypePrec {
     const node = checker.cst_arena.getNode(type_cst);
     if (node.subtree_size <= 1) return .tier4_primary;
     return switch (node.kind) {
@@ -1473,7 +1506,7 @@ fn isInnerTypeNeedingOptionParens(checker: *const TypeChecker, inner_cst: CstNod
         => return true,
         else => {},
     }
-    const own_prec = try intrinsicCstTypePrec(checker, inner_cst);
+    const own_prec = try classifyIntrinsicCstTypePrec(checker, inner_cst);
     return @backingInt(own_prec) < @backingInt(SurfaceTypePrec.tier3_postfix) or
         hasCallableTypeTail(checker, inner_cst);
 }
@@ -1489,14 +1522,14 @@ fn isOuterOptionNeedingParens(
     return switch (parent.kind) {
         .ptr_type => true,
         .ref_type => has_leading_inner_lbracket,
-        .mode_type => (try intrinsicCstTypePrec(checker, parent_cst)) == .tier4_primary,
+        .mode_type => (try classifyIntrinsicCstTypePrec(checker, parent_cst)) == .tier4_primary,
         else => false,
     };
 }
 
 /// Returns `true` when `arg_cst` (`Ok` or `Err`) inside `Result[Ok, Err]` requires `(…)` around `<arg>`.
 fn isOperandNeedingResultParens(checker: *const TypeChecker, arg_cst: CstNodeIndex) !bool {
-    const own_prec = try intrinsicCstTypePrec(checker, arg_cst);
+    const own_prec = try classifyIntrinsicCstTypePrec(checker, arg_cst);
     return @backingInt(own_prec) < @backingInt(SurfaceTypePrec.tier2_prefix) or
         hasCallableTypeTail(checker, arg_cst);
 }
@@ -1511,7 +1544,7 @@ fn isOuterResultNeedingParens(
     const parent = checker.cst_arena.getNode(parent_cst);
     return switch (parent.kind) {
         .optional_type, .result_type, .ref_type, .ptr_type => true,
-        .mode_type => (try intrinsicCstTypePrec(checker, parent_cst)) != .tier0_open,
+        .mode_type => (try classifyIntrinsicCstTypePrec(checker, parent_cst)) != .tier0_open,
         .refined_type => blk: {
             var children: std.ArrayListUnmanaged(CstNodeIndex) = .empty;
             defer children.deinit(checker.allocator);
@@ -1571,32 +1604,31 @@ fn lintCanonicalGenericTypeCst(
             }
 
             const inner_slice = checker.source[inner_span.start_byte..inner_span.end_byte];
-            const wrap_inner = try isInnerTypeNeedingOptionParens(checker, opt_info.inner_cst);
-            const starts_with_bracket = !wrap_inner and inner_slice.len > 0 and inner_slice[0] == '[';
-            const wrap_outer = try isOuterOptionNeedingParens(checker, parent_cst, starts_with_bracket);
+            const is_wrapping_inner = try isInnerTypeNeedingOptionParens(checker, opt_info.inner_cst);
+            const has_leading_bracket = !is_wrapping_inner and inner_slice.len > 0 and inner_slice[0] == '[';
+            const is_wrapping_outer = try isOuterOptionNeedingParens(checker, parent_cst, has_leading_bracket);
 
             var repl_buf: std.ArrayListUnmanaged(u8) = .empty;
             defer repl_buf.deinit(checker.allocator);
-            if (wrap_outer) try repl_buf.append(checker.allocator, '(');
-            if (wrap_inner) try repl_buf.append(checker.allocator, '(');
+            if (is_wrapping_outer) try repl_buf.append(checker.allocator, '(');
+            if (is_wrapping_inner) try repl_buf.append(checker.allocator, '(');
             try repl_buf.appendSlice(checker.allocator, inner_slice);
-            if (wrap_inner) try repl_buf.append(checker.allocator, ')');
+            if (is_wrapping_inner) try repl_buf.append(checker.allocator, ')');
             try repl_buf.append(checker.allocator, '?');
-            if (wrap_outer) try repl_buf.append(checker.allocator, ')');
+            if (is_wrapping_outer) try repl_buf.append(checker.allocator, ')');
 
-            const edit = TextEdit{
-                .file_id = checker.file_id,
-                .start_byte = full_span.start_byte,
-                .end_byte = full_span.end_byte,
-                .replacement_id = try checker.interner.intern(repl_buf.items),
-            };
             try emitIdiomWarning(
                 sink_opt,
                 full_span,
                 "non-canonical generic `Option[T]` type spelling; prefer postfix `T?`",
                 "prefer postfix `?` optional syntax",
                 "rewrite `Option[T]` to `T?`",
-                &.{edit},
+                &.{.{
+                    .file_id = checker.file_id,
+                    .start_byte = full_span.start_byte,
+                    .end_byte = full_span.end_byte,
+                    .replacement_id = try checker.interner.intern(repl_buf.items),
+                }},
             );
         },
         .result => |res_info| {
@@ -1631,41 +1663,40 @@ fn lintCanonicalGenericTypeCst(
 
             const ok_slice = checker.source[ok_span.start_byte..ok_span.end_byte];
             const err_slice = checker.source[err_span.start_byte..err_span.end_byte];
-            const wrap_ok = try isOperandNeedingResultParens(checker, res_info.ok_cst);
-            const wrap_err = try isOperandNeedingResultParens(checker, res_info.err_cst);
+            const is_wrapping_ok = try isOperandNeedingResultParens(checker, res_info.ok_cst);
+            const is_wrapping_err = try isOperandNeedingResultParens(checker, res_info.err_cst);
             const is_inside_outer_canon = if (!grandparent_cst.isNone() and
                 checker.cst_arena.getNode(parent_cst).kind == .type_args)
                 ((try matchSyntacticStdlibGenericType(checker, grandparent_cst)) != null)
             else
                 false;
-            const wrap_outer = is_inside_outer_canon or
+            const is_wrapping_outer = is_inside_outer_canon or
                 (try isOuterResultNeedingParens(checker, cst_idx, parent_cst));
 
             var repl_buf: std.ArrayListUnmanaged(u8) = .empty;
             defer repl_buf.deinit(checker.allocator);
-            if (wrap_outer) try repl_buf.append(checker.allocator, '(');
-            if (wrap_ok) try repl_buf.append(checker.allocator, '(');
+            if (is_wrapping_outer) try repl_buf.append(checker.allocator, '(');
+            if (is_wrapping_ok) try repl_buf.append(checker.allocator, '(');
             try repl_buf.appendSlice(checker.allocator, ok_slice);
-            if (wrap_ok) try repl_buf.append(checker.allocator, ')');
+            if (is_wrapping_ok) try repl_buf.append(checker.allocator, ')');
             try repl_buf.append(checker.allocator, '!');
-            if (wrap_err) try repl_buf.append(checker.allocator, '(');
+            if (is_wrapping_err) try repl_buf.append(checker.allocator, '(');
             try repl_buf.appendSlice(checker.allocator, err_slice);
-            if (wrap_err) try repl_buf.append(checker.allocator, ')');
-            if (wrap_outer) try repl_buf.append(checker.allocator, ')');
+            if (is_wrapping_err) try repl_buf.append(checker.allocator, ')');
+            if (is_wrapping_outer) try repl_buf.append(checker.allocator, ')');
 
-            const edit = TextEdit{
-                .file_id = checker.file_id,
-                .start_byte = full_span.start_byte,
-                .end_byte = full_span.end_byte,
-                .replacement_id = try checker.interner.intern(repl_buf.items),
-            };
             try emitIdiomWarning(
                 sink_opt,
                 full_span,
                 "non-canonical generic `Result[T, E]` type spelling; prefer infix `T!E`",
                 "prefer payload-first `T!E` result syntax",
                 "rewrite `Result[T, E]` to `T!E`",
-                &.{edit},
+                &.{.{
+                    .file_id = checker.file_id,
+                    .start_byte = full_span.start_byte,
+                    .end_byte = full_span.end_byte,
+                    .replacement_id = try checker.interner.intern(repl_buf.items),
+                }},
             );
         },
     }
@@ -1754,19 +1785,18 @@ fn lintTrailingUnitReturnFnDecl(
         }
     }
 
-    const edit = TextEdit{
-        .file_id = checker.file_id,
-        .start_byte = del_start,
-        .end_byte = del_end,
-        .replacement_id = try checker.interner.intern(""),
-    };
     try emitIdiomWarning(
         sink_opt,
         ret_span,
         "redundant trailing `return;` at the end of a `unit`-returning function",
         "unnecessary trailing `return;`",
         "remove redundant trailing `return;`",
-        &.{edit},
+        &.{.{
+            .file_id = checker.file_id,
+            .start_byte = del_start,
+            .end_byte = del_end,
+            .replacement_id = try checker.interner.intern(""),
+        }},
     );
 }
 
@@ -2101,38 +2131,37 @@ fn lintTwoArmMatchToIfIs(
         return true;
     }
 
-    const wrap_scrut = clean_scrut_cst == scrut_cst and
+    const is_wrapping_scrut = clean_scrut_cst == scrut_cst and
         checker.cst_arena.getNode(clean_scrut_cst).kind != .tuple_or_paren_expr and
         isScrutineeNeedingParensForIs(checker, scrut_id, clean_scrut_cst) or
         (clean_scrut_cst != scrut_cst and isScrutineeNeedingParensForIs(checker, scrut_id, clean_scrut_cst));
-    const wrap_pat = hasBraceInPatternSubtree(checker.cst_arena, checker.token_buffer, pat_cst);
+    const is_wrapping_pat = hasBraceInPatternSubtree(checker.cst_arena, checker.token_buffer, pat_cst);
 
     var repl_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer repl_buf.deinit(checker.allocator);
     try repl_buf.appendSlice(checker.allocator, "if ");
-    if (wrap_scrut) try repl_buf.append(checker.allocator, '(');
+    if (is_wrapping_scrut) try repl_buf.append(checker.allocator, '(');
     try repl_buf.appendSlice(checker.allocator, checker.source[scrut_span.start_byte..scrut_span.end_byte]);
-    if (wrap_scrut) try repl_buf.append(checker.allocator, ')');
+    if (is_wrapping_scrut) try repl_buf.append(checker.allocator, ')');
     try repl_buf.appendSlice(checker.allocator, " is ");
-    if (wrap_pat) try repl_buf.append(checker.allocator, '(');
+    if (is_wrapping_pat) try repl_buf.append(checker.allocator, '(');
     try repl_buf.appendSlice(checker.allocator, checker.source[pat_span.start_byte..pat_span.end_byte]);
-    if (wrap_pat) try repl_buf.append(checker.allocator, ')');
+    if (is_wrapping_pat) try repl_buf.append(checker.allocator, ')');
     try repl_buf.append(checker.allocator, ' ');
     try repl_buf.appendSlice(checker.allocator, checker.source[body_span.start_byte..body_span.end_byte]);
 
-    const edit = TextEdit{
-        .file_id = checker.file_id,
-        .start_byte = match_span.start_byte,
-        .end_byte = match_span.end_byte,
-        .replacement_id = try checker.interner.intern(repl_buf.items),
-    };
     try emitIdiomWarning(
         sink_opt,
         match_span,
         "single-arm `match` with empty wildcard `_ => {}` can be written as `if … is …`",
         "reducible to `if … is …`",
         "rewrite `match` to `if … is …`",
-        &.{edit},
+        &.{.{
+            .file_id = checker.file_id,
+            .start_byte = match_span.start_byte,
+            .end_byte = match_span.end_byte,
+            .replacement_id = try checker.interner.intern(repl_buf.items),
+        }},
     );
     return true;
 }
@@ -2245,19 +2274,18 @@ fn lintBoolReturnIfElse(
         try repl_buf.append(checker.allocator, ';');
     }
 
-    const edit = TextEdit{
-        .file_id = checker.file_id,
-        .start_byte = if_span.start_byte,
-        .end_byte = if_span.end_byte,
-        .replacement_id = try checker.interner.intern(repl_buf.items),
-    };
     try emitIdiomWarning(
         sink_opt,
         if_span,
         "redundant `if … { return true; } else { return false; }`; return the boolean expression directly",
         "simplify boolean `return` branch",
         "simplify `if`/`else` boolean return",
-        &.{edit},
+        &.{.{
+            .file_id = checker.file_id,
+            .start_byte = if_span.start_byte,
+            .end_byte = if_span.end_byte,
+            .replacement_id = try checker.interner.intern(repl_buf.items),
+        }},
     );
     return true;
 }
@@ -2370,20 +2398,20 @@ fn walkAndLintCstSubtree(
         }
     }
 
-    // [2] Idiom 3: Canonical `Option[T]` / `Result[T, E]` surface type annotations:
+    // [2] Idiom 3; canonical `Option[T]` / `Result[T, E]` surface type annotations:
     if (node.kind == .named_type) {
         try lintCanonicalGenericTypeCst(checker, cst_idx, parent_cst, grandparent_cst, sink_opt);
     }
 
-    // [3] Idiom 2: Scalar `bool` literal equality/inequality (`x == true`, `x != false`, etc.):
+    // [3] Idiom 2; scalar `bool` literal equality/inequality (`x == true`, `x != false`, etc.):
     if (node.kind == .infix_expr and cst_idx.asInt() < checker.cst_to_ast.len) {
         const bin_ast = checker.cst_to_ast[cst_idx.asInt()];
         if (!bin_ast.isNone()) {
-            try lintRedundantBoolEqualityAst(checker, bin_ast, sink_opt);
+            try lintRedundantBoolEqualityAst(checker, bin_ast, parent_cst, sink_opt);
         }
     }
 
-    // [4] Idiom 1: Redundant outer `(` … `)` around `if`, `while`, and `match` headers:
+    // [4] Idiom 1; redundant outer `(` … `)` around `if`, `while`, and `match` headers:
     if ((node.kind == .if_cond or node.kind == .while_header) and
         !suppressed_headers.contains(parent_cst.asInt()))
     {
@@ -2402,14 +2430,14 @@ fn walkAndLintCstSubtree(
         var match_children: std.ArrayListUnmanaged(CstNodeIndex) = .empty;
         defer match_children.deinit(checker.allocator);
         try collectDirectCstChildren(checker.allocator, checker.cst_arena, cst_idx, &match_children);
-        var seen_match_kw = false;
+        var has_seen_match_kw = false;
         for (match_children.items) |m_child| {
             const m_node = checker.cst_arena.getNode(m_child);
             if (m_node.kind == .match_introducer) {
-                seen_match_kw = true;
+                has_seen_match_kw = true;
                 continue;
             }
-            if (!seen_match_kw) continue;
+            if (!has_seen_match_kw) continue;
             if (m_node.subtree_size == 1 and !m_node.token.isNone() and
                 checker.token_buffer.getToken(m_node.token).kind == .lbrace)
             {
@@ -2427,7 +2455,7 @@ fn walkAndLintCstSubtree(
     defer children.deinit(checker.allocator);
     try collectDirectCstChildren(checker.allocator, checker.cst_arena, cst_idx, &children);
 
-    const next_in_trait = is_inside_trait_item or (node.kind == .trait_item);
+    const is_next_in_trait = is_inside_trait_item or (node.kind == .trait_item);
     var has_passed_const_eq = false;
 
     for (children.items, 0..) |child_cst, child_pos| {
@@ -2470,7 +2498,7 @@ fn walkAndLintCstSubtree(
             cst_idx,
             parent_cst,
             is_signature_mode,
-            next_in_trait,
+            is_next_in_trait,
             suppressed_headers,
             sink_opt,
             depth + 1,
@@ -2636,13 +2664,13 @@ fn collectEditableRootCandidates(
         if (db.symbol_table.getFilePackageId(fid) != .root) continue;
         if (db.isStdlibFile(fid)) continue;
 
-        var was_open = false;
+        var is_open = false;
         var has_disk = false;
         var resolved_path: []const u8 = "";
         if (options.vfs) |vfs_ptr| {
             if (vfs_ptr.getFileEntry(fid)) |entry| {
                 if (entry.package_id != .root or entry.backing_kind == .cxtree_archive) continue;
-                was_open = entry.is_open_in_editor;
+                is_open = entry.is_open_in_editor;
                 has_disk = entry.has_disk_backing;
                 const os_path = vfs_ptr.interner.get(entry.resolved_os_path);
                 resolved_path = if (os_path.len > 0) os_path else vfs_ptr.getFilePath(fid);
@@ -2659,9 +2687,9 @@ fn collectEditableRootCandidates(
 
         var disk_prefix_copy: ?[]u8 = null;
         errdefer if (disk_prefix_copy) |pref_buf| allocator.free(pref_buf);
-        var was_prefix_masked = false;
+        var is_prefix_masked = false;
 
-        if (options.write_to_disk and resolved_path.len > 0) {
+        if (options.is_writing_to_disk and resolved_path.len > 0) {
             if (options.io) |io_handle| {
                 const raw_disk_opt: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(
                     io_handle,
@@ -2680,15 +2708,15 @@ fn collectEditableRootCandidates(
                     if (try pkg_manifest.extractScriptFrontmatter(&fm_arena, fid, raw_disk, null)) |extracted| {
                         const prefix_len: usize = extracted.prefix_end_byte;
                         if (prefix_len > 0 and src_text.len >= prefix_len) {
-                            const matches_raw = std.mem.eql(u8, src_text[0..prefix_len], raw_disk[0..prefix_len]);
-                            const matches_blanked = std.mem.eql(
+                            const is_matching_raw = std.mem.eql(u8, src_text[0..prefix_len], raw_disk[0..prefix_len]);
+                            const is_matching_blanked = std.mem.eql(
                                 u8,
                                 src_text[0..prefix_len],
                                 extracted.blanked_cx_source[0..prefix_len],
                             );
-                            if (matches_raw or matches_blanked) {
+                            if (is_matching_raw or is_matching_blanked) {
                                 disk_prefix_copy = try allocator.dupe(u8, raw_disk[0..prefix_len]);
-                                was_prefix_masked = !matches_raw;
+                                is_prefix_masked = !is_matching_raw;
                             }
                         }
                     }
@@ -2706,8 +2734,8 @@ fn collectEditableRootCandidates(
             .original_bytes = duped_src,
             .disk_script_prefix = disk_prefix_copy,
             .file_path = duped_path,
-            .was_prefix_masked_in_db = was_prefix_masked,
-            .was_open_in_editor = was_open,
+            .is_prefix_masked_in_db = is_prefix_masked,
+            .is_open_in_editor = is_open,
             .has_disk_backing = has_disk,
         });
     }
@@ -2732,8 +2760,8 @@ fn runFullCheckAcrossSnapshots(
         const parsed_art = try db.parseCst(snap.file_id);
         const has_syntax_err = parsed_art.cst_arena.has_parse_errors or parsed_art.diagnostics.hasErrors();
         if (is_recording_baseline_syntax) {
-            snap.had_baseline_syntax_errors = has_syntax_err;
-        } else if (has_syntax_err and !snap.had_baseline_syntax_errors) {
+            snap.has_baseline_syntax_errors = has_syntax_err;
+        } else if (has_syntax_err and !snap.has_baseline_syntax_errors) {
             has_new_syntax = true;
         }
         total_errors +|= parsed_art.diagnostics.error_count;
@@ -2811,7 +2839,7 @@ fn updateFileOverlayAndDb(
                 target_vpath,
                 new_bytes,
                 .root,
-                snap.was_open_in_editor,
+                snap.is_open_in_editor,
             );
             _ = vfs_ptr.getLineIndex(snap.file_id) catch {};
         }
@@ -2837,9 +2865,9 @@ fn rollbackSnapshotsInMemory(
 fn formatCapMaskCellAlloc(
     allocator: std.mem.Allocator,
     raw_bits: u16,
-    include_opaque: bool,
+    is_including_opaque: bool,
 ) ![]u8 {
-    const mask_filter: u16 = if (include_opaque)
+    const mask_filter: u16 = if (is_including_opaque)
         (EffectCapabilityMask.LOCKFILE_CAP_BITS | EffectCapabilityMask.INDIRECT_OPAQUE_BIT)
     else
         EffectCapabilityMask.LOCKFILE_CAP_BITS;
@@ -2859,7 +2887,7 @@ fn formatCapMaskCellAlloc(
             is_first = false;
         }
     }
-    if (include_opaque and (masked_bits & OPAQUE_ESCALATION_CAP.bit) != 0) {
+    if (is_including_opaque and (masked_bits & OPAQUE_ESCALATION_CAP.bit) != 0) {
         if (!is_first) try builder.appendSlice(allocator, ", ");
         try builder.appendSlice(allocator, OPAQUE_ESCALATION_CAP.name);
     }
@@ -3323,8 +3351,7 @@ fn reconstructShortestPackageWitness(
 
             if (step_item.edge.callee_def != mir.NONE_U32) {
                 const target_def = DefId.fromInt(step_item.edge.callee_def);
-                const target_sym_opt = db.symbol_table.def_to_symbol.get(target_def.asInt());
-                if (target_sym_opt) |t_sym_idx| {
+                if (db.symbol_table.def_to_symbol.get(target_def.asInt())) |t_sym_idx| {
                     if (!t_sym_idx.isNone() and t_sym_idx.asInt() < db.symbol_table.countSymbols()) {
                         const t_sym = db.symbol_table.getSymbol(t_sym_idx).*;
                         const callee_pkg = db.symbol_table.getFilePackageId(t_sym.decl_span.file_id);
@@ -3753,7 +3780,7 @@ pub fn applyCheckFixesOnDb(
             .applied_fix_count = 0,
             .modified_file_count = 0,
             .pass_count = passes_executed,
-            .was_rolled_back = false,
+            .is_rolled_back = false,
         };
     }
 
@@ -3767,15 +3794,15 @@ pub fn applyCheckFixesOnDb(
                 var fmt_res = try fmt_engine.formatSource(allocator, body_slice, snap.file_id);
                 defer fmt_res.deinit(allocator);
                 if (!fmt_res.has_syntax_errors) {
-                    const needs_hdr_nl = raw_prefix[raw_prefix.len - 1] != '\n';
-                    const needs_sep_nl = fmt_res.formatted_text.len > 0 and hasLeadingBlankLine(body_slice);
-                    const prefix_in_db = if (snap.was_prefix_masked_in_db)
+                    const is_needing_hdr_nl = raw_prefix[raw_prefix.len - 1] != '\n';
+                    const is_needing_sep_nl = fmt_res.formatted_text.len > 0 and hasLeadingBlankLine(body_slice);
+                    const prefix_in_db = if (snap.is_prefix_masked_in_db)
                         current_src[0..raw_prefix.len]
                     else
                         raw_prefix;
                     const total_len = prefix_in_db.len +
-                        @intFromBool(needs_hdr_nl) +
-                        @intFromBool(needs_sep_nl) +
+                        @intFromBool(is_needing_hdr_nl) +
+                        @intFromBool(is_needing_sep_nl) +
                         fmt_res.formatted_text.len;
                     const combined_db = try allocator.alloc(u8, total_len);
                     defer allocator.free(combined_db);
@@ -3783,11 +3810,11 @@ pub fn applyCheckFixesOnDb(
                     var cursor_off: usize = 0;
                     @memcpy(combined_db[0..prefix_in_db.len], prefix_in_db);
                     cursor_off += prefix_in_db.len;
-                    if (needs_hdr_nl) {
+                    if (is_needing_hdr_nl) {
                         combined_db[cursor_off] = '\n';
                         cursor_off += 1;
                     }
-                    if (needs_sep_nl) {
+                    if (is_needing_sep_nl) {
                         combined_db[cursor_off] = '\n';
                         cursor_off += 1;
                     }
@@ -3811,7 +3838,7 @@ pub fn applyCheckFixesOnDb(
         }
     }
 
-    // [4] Rollback Guard: revert to original snapshot if new syntax errors appeared or errors increased:
+    // [4] Rollback Guard; revert to original snapshot if new syntax errors appeared or errors increased:
     const post_check = try runFullCheckAcrossSnapshots(db, snapshots.items, false);
     if (post_check.has_new_syntax_errors or post_check.total_errors > baseline_check.total_errors) {
         try rollbackSnapshotsInMemory(db, options, snapshots.items);
@@ -3819,11 +3846,11 @@ pub fn applyCheckFixesOnDb(
             .applied_fix_count = 0,
             .modified_file_count = 0,
             .pass_count = passes_executed,
-            .was_rolled_back = true,
+            .is_rolled_back = true,
         };
     }
 
-    // [5] Atomically persist modified files to disk when `write_to_disk == true` and count modified files:
+    // [5] Atomically persist modified files to disk when `is_writing_to_disk == true` and count modified files:
     var modified_files: u32 = 0;
     var written_indices: std.ArrayListUnmanaged(usize) = .empty;
     defer written_indices.deinit(allocator);
@@ -3833,7 +3860,7 @@ pub fn applyCheckFixesOnDb(
         const final_src = try db.getSourceText(snap.file_id);
         if (std.mem.eql(u8, final_src, snap.original_bytes)) continue;
 
-        if (options.write_to_disk and snap.file_path.len > 0 and snap.has_disk_backing) {
+        if (options.is_writing_to_disk and snap.file_path.len > 0 and snap.has_disk_backing) {
             const io_handle = options.io orelse return error.MissingIoContext;
             const final_copy = try allocator.dupe(u8, final_src);
             defer allocator.free(final_copy);
@@ -3871,7 +3898,7 @@ pub fn applyCheckFixesOnDb(
             };
             try written_indices.append(allocator, idx);
             if (options.vfs) |vfs_ptr| {
-                if (!snap.was_open_in_editor and snap.has_disk_backing) {
+                if (!snap.is_open_in_editor and snap.has_disk_backing) {
                     _ = vfs_ptr.closeOverlay(io_handle, snap.file_id) catch {};
                     _ = vfs_ptr.getLineIndex(snap.file_id) catch {};
                 }
@@ -3881,7 +3908,7 @@ pub fn applyCheckFixesOnDb(
         modified_files += 1;
     }
 
-    if (options.write_to_disk and written_indices.items.len > 0) {
+    if (options.is_writing_to_disk and written_indices.items.len > 0) {
         _ = try runFullCheckAcrossSnapshots(db, snapshots.items, false);
     }
 
@@ -3889,7 +3916,7 @@ pub fn applyCheckFixesOnDb(
         .applied_fix_count = total_applied_fixes,
         .modified_file_count = modified_files,
         .pass_count = passes_executed,
-        .was_rolled_back = false,
+        .is_rolled_back = false,
     };
 }
 
@@ -3924,7 +3951,7 @@ pub fn renderDenyWarningsSummary(
     var msg_buf: [160]u8 = undefined;
     const summary_msg = std.fmt.bufPrint(
         &msg_buf,
-        "{d} warning(s) treated as errors due to '--deny-warnings'",
+        "{d} warning(s) treated as errors due to `--deny-warnings`",
         .{warning_count},
     ) catch unreachable;
     try style_config.writeStatusHeader(
@@ -4044,8 +4071,7 @@ pub fn renderCapabilityAuditTable(
                 }
             }
 
-            const permitted_self = pkg_node.cap_policy.asEffectiveAllowedCaps().asBits();
-            const self_unauth = (subtree_bits & ~permitted_self) & checked_mask;
+            const self_unauth = (subtree_bits & ~pkg_node.cap_policy.asEffectiveAllowedCaps().asBits()) & checked_mask;
             if (self_unauth != 0) {
                 if (pkg_node.pkg_id != .root and pkg_node.cap_policy.forbid_global_caps.isEmpty() and
                     pkg_node.cap_policy.allow_caps == null)
@@ -4102,7 +4128,7 @@ pub fn renderCapabilityAuditTable(
             });
         }
     } else {
-        // [2] Standalone Single/Multi-File Mode: synthesize a single `.root` audit row:
+        // [2] Standalone Single/Multi-File Mode; synthesize a single `.root` audit row:
         if (options.standalone_files.len > 0) {
             for (options.standalone_files) |fid| {
                 if (!fid.isNone() and !(try seen_files.getOrPut(allocator, fid.asInt())).found_existing) {
@@ -4367,7 +4393,7 @@ pub fn renderExplainCapsReport(
         var hop_nodes: std.ArrayListUnmanaged(WitnessHopNode) = .empty;
         defer freeWitnessNodes(allocator, &hop_nodes);
 
-        const found_active = try reconstructShortestPackageWitness(
+        const has_found_active = try reconstructShortestPackageWitness(
             allocator,
             db,
             target_pkg_id,
@@ -4379,7 +4405,7 @@ pub fn renderExplainCapsReport(
             &hop_nodes,
             0,
         );
-        const found_dormant = if (!found_active)
+        const has_found_dormant = if (!has_found_active)
             try findDormantCfgWitnessForBit(
                 allocator,
                 db,
@@ -4391,7 +4417,7 @@ pub fn renderExplainCapsReport(
         else
             false;
 
-        if (!found_active and !found_dormant) {
+        if (!has_found_active and !has_found_dormant) {
             if (requested_cap_mask != null) {
                 try options.style_config.writeStyled(writer, .success, Glyphs.SUCCESS);
                 try writer.print(
@@ -4549,10 +4575,10 @@ test "test_check_audit_w0202_all_six_idioms_and_transactional_fix" {
     // Run `applyCheckFixesOnDb` and verify canonical convergence + `@allow(W0202)` preservation:
     const fix_report = try applyCheckFixesOnDb(std.testing.allocator, &db, .{
         .vfs = &vfs,
-        .write_to_disk = false,
+        .is_writing_to_disk = false,
         .candidate_files = &.{ file_id, sup_only_fid },
     });
-    try std.testing.expect(!fix_report.was_rolled_back);
+    try std.testing.expect(!fix_report.is_rolled_back);
     try std.testing.expect(fix_report.applied_fix_count >= 6);
     try std.testing.expectEqual(@as(u32, 1), fix_report.modified_file_count);
 
@@ -4584,7 +4610,7 @@ test "test_check_audit_w0202_all_six_idioms_and_transactional_fix" {
     var deny_writer = std.Io.Writer.fixed(&deny_buf);
     try renderDenyWarningsSummary(StyleConfig.MONOCHROME, &deny_writer, 3);
     try std.testing.expectEqualStrings(
-        "✗ check failed: 3 warning(s) treated as errors due to '--deny-warnings'\n",
+        "✗ check failed: 3 warning(s) treated as errors due to `--deny-warnings`\n",
         deny_writer.buffered(),
     );
 }
@@ -4729,7 +4755,7 @@ test "test_script_frontmatter_check_fix_disk_preservation_and_coalesced_comments
         ));
     }
 
-    // [3] `applyCheckFixesOnDb(.write_to_disk = true)` preserves `#!` (Mode C) and `#! + ---` (Mode B) on disk:
+    // [3] `applyCheckFixesOnDb(.is_writing_to_disk = true)` preserves `#!` (Mode C) and `#! + ---` (Mode B) on disk:
     const scratch_dir = ".zig-cache/test_check_fix_scripts";
     std.Io.Dir.cwd().deleteTree(io, scratch_dir) catch {};
     defer std.Io.Dir.cwd().deleteTree(io, scratch_dir) catch {};
@@ -4792,10 +4818,10 @@ test "test_script_frontmatter_check_fix_disk_preservation_and_coalesced_comments
     const report = try applyCheckFixesOnDb(allocator, &db, .{
         .io = io,
         .vfs = &source_map,
-        .write_to_disk = true,
+        .is_writing_to_disk = true,
         .candidate_files = &.{ mode_c_fid, mode_b_fid },
     });
-    try std.testing.expect(!report.was_rolled_back);
+    try std.testing.expect(!report.is_rolled_back);
     try std.testing.expectEqual(@as(u32, 2), report.modified_file_count);
     try std.testing.expect(report.applied_fix_count >= 4);
 

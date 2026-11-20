@@ -291,12 +291,14 @@ const InboundFrame = union(enum) {
 
 /// Fixed 256-slot ring buffer storing pre-drained `$/cancelRequest` IDs (`MAX_CANCELLED_REQUEST_IDS`).
 const CancelledRequestRing = struct {
-    /// Inline storage for string request IDs (`<= 64` bytes; longer IDs hash-match or truncate safely).
+    /// Inline storage for string request IDs (`<= 120` raw bytes or 67-byte `"b3:<hex>"` BLAKE3 key).
     const Slot = struct {
         /// `true` when this ring slot holds an active unconsumed cancellation ID.
         is_active: bool = false,
         /// `true` when cancelling a string ID; `false` when cancelling an integer ID.
         is_string: bool = false,
+        /// `true` when `str_buf` stores `"b3:" ++ hex(blake3(id_str))` for `id_str.len > 120`.
+        is_hashed_string: bool = false,
         /// Integer ID payload when `!is_string`.
         int_val: i64 = 0,
         /// Byte length of `str_buf` when `is_string`.
@@ -305,10 +307,63 @@ const CancelledRequestRing = struct {
         str_buf: [120]u8 = @splat(0),
     };
 
+    /// Stack-encoded string cancellation key (raw slice `<= 120` bytes or `"b3:" ++ hex` digest).
+    const EncodedStringKey = struct {
+        /// Key bytes to store or compare inside `Slot.str_buf`.
+        key: []const u8,
+        /// `true` when `key` was hashed via `Blake3` because `id_str.len > 120`.
+        is_hashed: bool,
+    };
+
     /// Fixed-capacity circular slot array.
     slots: [MAX_CANCELLED_REQUEST_IDS]Slot = @splat(.{}),
     /// Next write cursor (`0 .. MAX_CANCELLED_REQUEST_IDS - 1`).
     write_cursor: usize = 0,
+
+    /// Formats `id_str` into an inline key (`"b3:" ++ hex` via `Blake3` when `id_str.len > 120`).
+    fn formatStringKey(id_str: []const u8, hash_key_buf: *[67]u8) EncodedStringKey {
+        if (id_str.len <= 120) {
+            return .{ .key = id_str, .is_hashed = false };
+        }
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(id_str, &digest, .{});
+        const hex_digest = std.fmt.bytesToHex(digest, .lower);
+        @memcpy(hash_key_buf[0..3], "b3:");
+        @memcpy(hash_key_buf[3..67], &hex_digest);
+        return .{ .key = hash_key_buf[0..67], .is_hashed = true };
+    }
+
+    /// Records string request ID `id_str` as cancelled without heap allocation.
+    pub fn recordStringId(self: *CancelledRequestRing, id_str: []const u8) void {
+        var hash_key_buf: [67]u8 = undefined;
+        const encoded = formatStringKey(id_str, &hash_key_buf);
+        var slot = Slot{
+            .is_active = true,
+            .is_string = true,
+            .is_hashed_string = encoded.is_hashed,
+            .str_len = @intCast(encoded.key.len),
+        };
+        @memcpy(slot.str_buf[0..encoded.key.len], encoded.key);
+        self.slots[self.write_cursor] = slot;
+        self.write_cursor = (self.write_cursor + 1) % MAX_CANCELLED_REQUEST_IDS;
+    }
+
+    /// Consumes and returns `true` if string request ID `id_str` was previously cancelled.
+    pub fn takeCancelledString(self: *CancelledRequestRing, id_str: []const u8) bool {
+        var hash_key_buf: [67]u8 = undefined;
+        const encoded = formatStringKey(id_str, &hash_key_buf);
+        for (&self.slots) |*slot| {
+            if (slot.is_active and slot.is_string and
+                slot.is_hashed_string == encoded.is_hashed and
+                slot.str_len == encoded.key.len and
+                std.mem.eql(u8, slot.str_buf[0..slot.str_len], encoded.key))
+            {
+                slot.is_active = false;
+                return true;
+            }
+        }
+        return false;
+    }
 
     /// Records `req_id` as cancelled in $O(1)$ time, overwriting the oldest slot when full.
     pub fn insert(self: *CancelledRequestRing, req_id: JsonRpcId) void {
@@ -321,17 +376,7 @@ const CancelledRequestRing = struct {
                 };
                 self.write_cursor = (self.write_cursor + 1) % MAX_CANCELLED_REQUEST_IDS;
             },
-            .string_id => |str_val| {
-                if (str_val.len > 120) return;
-                var slot = Slot{
-                    .is_active = true,
-                    .is_string = true,
-                    .str_len = @intCast(str_val.len),
-                };
-                @memcpy(slot.str_buf[0..str_val.len], str_val);
-                self.slots[self.write_cursor] = slot;
-                self.write_cursor = (self.write_cursor + 1) % MAX_CANCELLED_REQUEST_IDS;
-            },
+            .string_id => |str_val| self.recordStringId(str_val),
             .missing, .null_id => {},
         }
     }
@@ -347,17 +392,7 @@ const CancelledRequestRing = struct {
                     }
                 }
             },
-            .string_id => |str_val| {
-                for (&self.slots) |*slot| {
-                    if (slot.is_active and slot.is_string and
-                        slot.str_len == str_val.len and
-                        std.mem.eql(u8, slot.str_buf[0..slot.str_len], str_val))
-                    {
-                        slot.is_active = false;
-                        return true;
-                    }
-                }
-            },
+            .string_id => |str_val| return self.takeCancelledString(str_val),
             .missing, .null_id => {},
         }
         return false;
@@ -457,8 +492,8 @@ pub const SemanticTokensCache = struct {
         self.* = undefined;
     }
 
-    /// Generates the next 16-character lowercase hexadecimal `resultId`.
-    pub fn nextResultId(self: *SemanticTokensCache) [16]u8 {
+    /// Allocates and formats the next 16-character lowercase hexadecimal `resultId`.
+    pub fn allocNextResultId(self: *SemanticTokensCache) [16]u8 {
         const seq = self.next_result_seq;
         self.next_result_seq +%= 1;
         var out_id: [16]u8 = @splat('0');
@@ -509,8 +544,7 @@ pub const SemanticTokensCache = struct {
             (self.entry_count >= self.max_entries or self.total_bytes + entry_bytes > self.max_bytes))
         {
             const victim_slot = self.lru_tail;
-            const victim_fid = self.slots[victim_slot].file_id;
-            _ = self.file_to_slot.remove(victim_fid.asInt());
+            _ = self.file_to_slot.remove(self.slots[victim_slot].file_id.asInt());
             self.releaseOccupiedSlot(victim_slot);
         }
 
@@ -717,8 +751,18 @@ const DocumentSymbolItem = struct {
     children: []const DocumentSymbolItem = &.{},
 };
 
+/// Grouped `TextEdit` list for a single target URI inside a `CodeAction` `WorkspaceEdit.changes` map.
+const CodeActionUriGroup = struct {
+    /// Target document `FileId`.
+    file_id: FileId,
+    /// Resolved outbound document URI key.
+    uri: []const u8,
+    /// Ordered `TextEdit` items targeting `uri`.
+    edits: std.ArrayListUnmanaged(diagnostic.TextEdit) = .empty,
+};
+
 /// Stateful CoreX LSP 3.17 session owning `CompilerDb`, `VfsSourceMap`, and bounded caches.
-const LspSession = struct {
+pub const LspSession = struct {
     /// Long-lived allocator for persistent session structures.
     allocator: std.mem.Allocator,
     /// Zig `0.17.0` `std.Io` capability handle for VFS and workspace manifest reads.
@@ -744,7 +788,7 @@ const LspSession = struct {
     /// Negotiated column encoding (`utf-8` preferred when client supports it, else `utf-16`).
     position_encoding: PositionEncoding = .utf16,
     /// `true` when client advertised `capabilities.textDocument.diagnostic` pull support.
-    use_pull_diagnostics: bool = false,
+    is_pull_diagnostics_enabled: bool = false,
     /// Current `$/setTrace` mode.
     trace_mode: TraceMode = .off,
     /// Owned normalized workspace root directory path (`null` when single-file/untitled).
@@ -759,6 +803,8 @@ const LspSession = struct {
     open_doc_versions: std.AutoHashMapUnmanaged(u32, i64) = .empty,
     /// Exact client `didOpen` URI strings keyed by `FileId.asInt()` for lossless URI echoing.
     file_id_to_client_uri: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
+    /// Aggregate byte footprint of owned URI strings stored in `file_id_to_client_uri`.
+    client_uri_total_bytes: usize = 0,
     /// Optional diagnostic/trace writer (`stderr` or test log sink; never `stdout`).
     log_writer: ?*std.Io.Writer = null,
 
@@ -809,6 +855,7 @@ const LspSession = struct {
             self.allocator.free(uri_ptr.*);
         }
         self.file_id_to_client_uri.deinit(self.allocator);
+        self.client_uri_total_bytes = 0;
         self.open_doc_versions.deinit(self.allocator);
         self.mounted_file_set.deinit(self.allocator);
         self.mounted_files.deinit(self.allocator);
@@ -822,6 +869,12 @@ const LspSession = struct {
         self.* = undefined;
     }
 
+    /// Returns `true` when `file_id` is currently open in an editor tab (`didOpen` without `didClose`).
+    pub inline fn isFileOpen(self: *const LspSession, file_id: FileId) bool {
+        if (file_id.isNone()) return false;
+        return self.open_doc_versions.contains(file_id.asInt());
+    }
+
     /// Registers `file_id` in `mounted_files` in $O(1)$ if not yet tracked.
     pub fn recordMountedFile(self: *LspSession, file_id: FileId) !void {
         if (file_id.isNone()) return;
@@ -831,19 +884,72 @@ const LspSession = struct {
         }
     }
 
-    /// Records or updates the client's exact URI spelling for `file_id`.
-    pub fn recordClientUri(self: *LspSession, file_id: FileId, raw_uri: []const u8) !void {
+    /// Evicts one closed (`!isFileOpen`) entry from `file_id_to_client_uri`, returning `true` if one was freed.
+    fn evictOneClosedClientUri(self: *LspSession) bool {
+        var victim_key: ?u32 = null;
+        var key_iter = self.file_id_to_client_uri.keyIterator();
+        while (key_iter.next()) |key_ptr| {
+            if (!self.open_doc_versions.contains(key_ptr.*)) {
+                victim_key = key_ptr.*;
+                break;
+            }
+        }
+        if (victim_key) |fid_raw| {
+            if (self.file_id_to_client_uri.fetchRemove(fid_raw)) |removed_kv| {
+                self.client_uri_total_bytes -|= removed_kv.value.len;
+                self.allocator.free(removed_kv.value);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Removes and frees any cached client URI string for `file_id`, decrementing `client_uri_total_bytes`.
+    pub fn removeClientUri(self: *LspSession, file_id: FileId) void {
         if (file_id.isNone()) return;
+        if (self.file_id_to_client_uri.fetchRemove(file_id.asInt())) |removed_kv| {
+            self.client_uri_total_bytes -|= removed_kv.value.len;
+            self.allocator.free(removed_kv.value);
+        }
+    }
+
+    /// Records or updates the client's exact URI spelling for `file_id` within `MAX_CLIENT_URI_MAP_*` bounds.
+    pub fn recordClientUri(self: *LspSession, file_id: FileId, raw_uri: []const u8) !void {
+        if (file_id.isNone() or raw_uri.len == 0 or raw_uri.len > MAX_LSP_URI_BYTES) return;
         if (self.file_id_to_client_uri.getPtr(file_id.asInt())) |existing_ptr| {
             if (std.mem.eql(u8, existing_ptr.*, raw_uri)) return;
+            while ((self.client_uri_total_bytes -| existing_ptr.*.len) + raw_uri.len > MAX_CLIENT_URI_MAP_BYTES) {
+                if (!self.evictOneClosedClientUri()) {
+                    self.removeClientUri(file_id);
+                    return;
+                }
+            }
+            const refreshed_ptr = self.file_id_to_client_uri.getPtr(file_id.asInt()) orelse return;
             const duped_uri = try self.allocator.dupe(u8, raw_uri);
-            self.allocator.free(existing_ptr.*);
-            existing_ptr.* = duped_uri;
+            self.client_uri_total_bytes = (self.client_uri_total_bytes -| refreshed_ptr.*.len) + duped_uri.len;
+            self.allocator.free(refreshed_ptr.*);
+            refreshed_ptr.* = duped_uri;
             return;
+        }
+        while (self.file_id_to_client_uri.count() >= MAX_CLIENT_URI_MAP_ENTRIES or
+            self.client_uri_total_bytes + raw_uri.len > MAX_CLIENT_URI_MAP_BYTES)
+        {
+            if (!self.evictOneClosedClientUri()) return;
         }
         const duped_uri = try self.allocator.dupe(u8, raw_uri);
         errdefer self.allocator.free(duped_uri);
         try self.file_id_to_client_uri.put(self.allocator, file_id.asInt(), duped_uri);
+        self.client_uri_total_bytes += duped_uri.len;
+    }
+
+    /// Runs the framed JSON-RPC event loop on `self` until EOF or `exit` notification.
+    pub fn feedStream(self: *LspSession, reader: *std.Io.Reader, writer: *std.Io.Writer) !u8 {
+        var explicit_exit_code: ?u8 = null;
+        while (try drainAndDispatchInboundTurn(self, reader, writer, &explicit_exit_code)) {}
+        writer.flush() catch {};
+        if (self.log_writer) |lw| lw.flush() catch {};
+        if (explicit_exit_code) |code_val| return code_val;
+        return 0;
     }
 };
 
@@ -875,6 +981,12 @@ pub const MAX_LSP_HEADER_BYTES: usize = 8 * 1024;
 pub const MAX_LSP_CONTENT_LENGTH: usize = 16 * 1024 * 1024;
 /// Maximum JSON object/array nesting depth accepted by the non-backtracking parser (`64`).
 pub const MAX_LSP_JSON_DEPTH: usize = 64;
+/// Maximum byte length of a single document or workspace `file://` URI (`4 KiB`, `AGENTS.md` §2).
+pub const MAX_LSP_URI_BYTES: usize = 4096;
+/// Maximum number of client URI entries retained in `LspSession.file_id_to_client_uri` (`512`).
+pub const MAX_CLIENT_URI_MAP_ENTRIES: usize = 512;
+/// Maximum aggregate byte footprint retained in `LspSession.file_id_to_client_uri` (`1 MiB`).
+pub const MAX_CLIENT_URI_MAP_BYTES: usize = 1024 * 1024;
 /// Maximum number of file snapshots retained in `SemanticTokensCache` (`64`).
 pub const MAX_SEMANTIC_TOKEN_CACHE_ENTRIES: usize = 64;
 /// Maximum cumulative byte footprint retained in `SemanticTokensCache` (`8 MiB`).
@@ -1077,6 +1189,13 @@ const HUB_MODULE_BASENAME_SET = std.StaticStringMap(void).initComptime(.{
     .{ "main.cx", {} },
     .{ "mod.cx", {} },
     .{ "root.cx", {} },
+});
+
+/// $O(1)$ set of built-in root module namespace identifiers highlighted as `defaultLibrary` namespaces.
+const BUILTIN_ROOT_NAMESPACE_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "core", {} },
+    .{ "cx", {} },
+    .{ "pkg", {} },
 });
 
 /// $O(1)$ set of reserved root/receiver identifiers rejected by `prepareRename` and `rename`.
@@ -1321,13 +1440,14 @@ const JsonScanner = struct {
                     return try self.arena_alloc.dupe(u8, raw_slice);
                 }
                 return self.unescapeJsonString(raw_slice);
-            }
-            if (byte_val < 0x20) return error.InvalidJsonSyntax;
-            if (byte_val == '\\') {
+            } else if (byte_val < 0x20) {
+                return error.InvalidJsonSyntax;
+            } else if (byte_val == '\\') {
                 has_escapes = true;
                 self.cursor += 1;
-                if (self.cursor >= self.src.len) return error.InvalidJsonSyntax;
-                if (self.src[self.cursor] < 0x20) return error.InvalidJsonSyntax;
+                if (self.cursor >= self.src.len or self.src[self.cursor] < 0x20) {
+                    return error.InvalidJsonSyntax;
+                }
             }
             self.cursor += 1;
         }
@@ -1407,19 +1527,20 @@ const JsonScanner = struct {
 
         var items: std.ArrayListUnmanaged(JsonValue) = .empty;
         while (true) {
-            const elem = try self.parseValue(next_depth);
-            try items.append(self.arena_alloc, elem);
+            try items.append(self.arena_alloc, try self.parseValue(next_depth));
             self.skipWhitespace();
             if (self.cursor >= self.src.len) return error.InvalidJsonSyntax;
-            if (self.src[self.cursor] == ',') {
-                self.cursor += 1;
-                continue;
+            switch (self.src[self.cursor]) {
+                ',' => {
+                    self.cursor += 1;
+                    continue;
+                },
+                ']' => {
+                    self.cursor += 1;
+                    return .{ .array_val = items.items };
+                },
+                else => return error.InvalidJsonSyntax,
             }
-            if (self.src[self.cursor] == ']') {
-                self.cursor += 1;
-                return .{ .array_val = items.items };
-            }
-            return error.InvalidJsonSyntax;
         }
     }
 
@@ -1450,15 +1571,17 @@ const JsonScanner = struct {
 
             self.skipWhitespace();
             if (self.cursor >= self.src.len) return error.InvalidJsonSyntax;
-            if (self.src[self.cursor] == ',') {
-                self.cursor += 1;
-                continue;
+            switch (self.src[self.cursor]) {
+                ',' => {
+                    self.cursor += 1;
+                    continue;
+                },
+                '}' => {
+                    self.cursor += 1;
+                    return .{ .object_val = fields.items };
+                },
+                else => return error.InvalidJsonSyntax,
             }
-            if (self.src[self.cursor] == '}') {
-                self.cursor += 1;
-                return .{ .object_val = fields.items };
-            }
-            return error.InvalidJsonSyntax;
         }
     }
 };
@@ -1494,8 +1617,7 @@ fn writeJsonString(writer: *std.Io.Writer, text: []const u8) !void {
     var i: usize = 0;
     while (i < text.len) : (i += 1) {
         const byte_val = text[i];
-        const needs_escape = byte_val == '"' or byte_val == '\\' or byte_val < 0x20;
-        if (!needs_escape) continue;
+        if (byte_val != '"' and byte_val != '\\' and byte_val >= 0x20) continue;
         if (i > clean_start) {
             try writer.writeAll(text[clean_start..i]);
         }
@@ -1679,15 +1801,11 @@ fn tryExtractCompleteBufferedFrame(
     const avail = reader.buffered();
     if (avail.len < 4) return null;
 
-    const sep_pos_opt = std.mem.indexOf(u8, avail[0..@min(avail.len, MAX_LSP_HEADER_BYTES)], "\r\n\r\n");
-    if (sep_pos_opt == null) {
-        if (avail.len >= MAX_LSP_HEADER_BYTES) {
-            // Let `readSingleInboundFrame` handle oversized header draining on next turn:
-            return null;
-        }
-        return null;
-    }
-    const sep_pos = sep_pos_opt.?;
+    const sep_pos = std.mem.indexOf(
+        u8,
+        avail[0..@min(avail.len, MAX_LSP_HEADER_BYTES)],
+        "\r\n\r\n",
+    ) orelse return null;
     const body_start = sep_pos + 4;
     const content_len: usize = switch (extractHeaderContentLength(avail[0..sep_pos])) {
         .invalid => {
@@ -1723,55 +1841,27 @@ fn tryExtractCompleteBufferedFrame(
 
 // -------- Cross-Platform file:// URI Codec & Positions --------
 
-/// Decodes a `file://` URI into a normalized `/` path matching `VfsSourceMap` (`d:/…` on Windows, `/cx/…` on `.cxtree`).
-pub fn decodeFileUriToNormalizedPath(allocator: std.mem.Allocator, raw_uri: []const u8) ![]u8 {
-    var path_part: []const u8 = raw_uri;
-    if (std.ascii.startsWithIgnoreCase(raw_uri, "file://")) {
-        const after_scheme = raw_uri["file://".len..];
-        if (std.mem.startsWith(u8, after_scheme, "/")) {
-            path_part = after_scheme;
-        } else if (std.ascii.startsWithIgnoreCase(after_scheme, "localhost/")) {
-            path_part = after_scheme["localhost".len..];
-        } else if (std.mem.indexOfScalar(u8, after_scheme, '/')) |slash_idx| {
-            // Preserve UNC authority (`file://server/share/path` -> `//server/share/path`):
-            const host_part = after_scheme[0..slash_idx];
-            if (host_part.len == 2 and std.ascii.isAlphabetic(host_part[0]) and host_part[1] == ':') {
-                path_part = after_scheme;
-            } else {
-                var unc_buf: std.ArrayListUnmanaged(u8) = .empty;
-                errdefer unc_buf.deinit(allocator);
-                try unc_buf.appendSlice(allocator, "//");
-                try appendPercentDecodedNormalized(&unc_buf, allocator, after_scheme);
-                return unc_buf.toOwnedSlice(allocator);
+/// Percent-decodes `input` into `out_buf`, returning `null` if the decoded length exceeds `out_buf.len`.
+fn decodePercentSliceBounded(out_buf: []u8, input: []const u8) ?[]const u8 {
+    var out_len: usize = 0;
+    var i: usize = 0;
+    while (i < input.len) {
+        if (out_len >= out_buf.len) return null;
+        if (input[i] == '%' and i + 2 < input.len) {
+            if (extractHexNibble(input[i + 1])) |hi_nib| {
+                if (extractHexNibble(input[i + 2])) |lo_nib| {
+                    out_buf[out_len] = (hi_nib << 4) | lo_nib;
+                    out_len += 1;
+                    i += 3;
+                    continue;
+                }
             }
-        } else {
-            path_part = after_scheme;
         }
+        out_buf[out_len] = input[i];
+        out_len += 1;
+        i += 1;
     }
-
-    var decoded: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer decoded.deinit(allocator);
-    try appendPercentDecodedNormalized(&decoded, allocator, path_part);
-
-    var slice = decoded.items;
-    // Strip leading `/` before Windows drive letters (`/D:/foo` or `/d%3A/foo` -> `d:/foo`):
-    if (slice.len >= 3 and slice[0] == '/' and std.ascii.isAlphabetic(slice[1]) and slice[2] == ':') {
-        const lower_drive = std.ascii.toLower(slice[1]);
-        std.mem.copyForwards(u8, slice[0 .. slice.len - 1], slice[1..]);
-        slice[0] = lower_drive;
-        decoded.items.len -= 1;
-        slice = decoded.items;
-    } else if (slice.len >= 2 and std.ascii.isAlphabetic(slice[0]) and slice[1] == ':') {
-        slice[0] = std.ascii.toLower(slice[0]);
-    }
-
-    // Trim redundant trailing `/` except on filesystem roots (`"/"` or `"d:/"`):
-    while (slice.len > 1 and slice[slice.len - 1] == '/') {
-        if (slice.len == 3 and std.ascii.isAlphabetic(slice[0]) and slice[1] == ':') break;
-        decoded.items.len -= 1;
-        slice = decoded.items;
-    }
-    return decoded.toOwnedSlice(allocator);
+    return out_buf[0..out_len];
 }
 
 /// Percent-decodes `%XX` sequences in `input` and normalizes `\` separators to `/`.
@@ -1793,41 +1883,45 @@ fn appendPercentDecodedNormalized(
                 }
             }
         }
-        const norm_ch: u8 = if (input[i] == '\\') '/' else input[i];
-        out_list.appendAssumeCapacity(norm_ch);
+        out_list.appendAssumeCapacity(if (input[i] == '\\') '/' else input[i]);
         i += 1;
     }
 }
 
-/// Encodes a normalized VFS path (`d:/foo/bar.cx`, `/home/u/a.cx`, `/cx/pkg@1.0.0/src/lib.cx`) into a `file://` URI.
-pub fn encodePathToFileUri(allocator: std.mem.Allocator, raw_path: []const u8) ![]u8 {
-    var uri_buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer uri_buf.deinit(allocator);
-
-    if (std.mem.startsWith(u8, raw_path, "//")) {
-        try uri_buf.appendSlice(allocator, "file:");
-    } else if (raw_path.len >= 2 and std.ascii.isAlphabetic(raw_path[0]) and raw_path[1] == ':') {
-        try uri_buf.appendSlice(allocator, "file:///");
-    } else if (std.mem.startsWith(u8, raw_path, "/")) {
-        try uri_buf.appendSlice(allocator, "file://");
-    } else {
-        try uri_buf.appendSlice(allocator, "file:///");
+/// Extracts `params.textDocument.uri` and validates `1 <= uri.len <= MAX_LSP_URI_BYTES`, or emits `-32602`.
+fn extractValidatedRequestUri(
+    session: *LspSession,
+    params: JsonValue,
+    out_writer: *std.Io.Writer,
+    rpc_id: JsonRpcId,
+) !?[]const u8 {
+    const td_obj = params.getField("textDocument") orelse {
+        try sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing textDocument");
+        return null;
+    };
+    const raw_uri = td_obj.getStringField("uri") orelse {
+        try sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing uri");
+        return null;
+    };
+    if (raw_uri.len == 0 or raw_uri.len > MAX_LSP_URI_BYTES) {
+        try sendJsonRpcError(
+            session,
+            out_writer,
+            rpc_id,
+            JSONRPC_INVALID_PARAMS,
+            "URI is empty or exceeds MAX_LSP_URI_BYTES",
+        );
+        return null;
     }
+    return raw_uri;
+}
 
-    for (raw_path) |raw_ch| {
-        const ch_val: u8 = if (raw_ch == '\\') '/' else raw_ch;
-        const is_unreserved = std.ascii.isAlphanumeric(ch_val) or
-            ch_val == '/' or ch_val == '-' or ch_val == '_' or
-            ch_val == '.' or ch_val == '~' or ch_val == ':' or ch_val == '@';
-        if (is_unreserved) {
-            try uri_buf.append(allocator, ch_val);
-        } else {
-            var pct_tmp: [3]u8 = undefined;
-            _ = std.fmt.bufPrint(&pct_tmp, "%{X:0>2}", .{ch_val}) catch unreachable;
-            try uri_buf.appendSlice(allocator, &pct_tmp);
-        }
-    }
-    return uri_buf.toOwnedSlice(allocator);
+/// Extracts `params.textDocument.uri` for notifications, returning `null` if absent, empty, or `> MAX_LSP_URI_BYTES`.
+fn extractValidatedNotificationUri(params: JsonValue) ?[]const u8 {
+    const td_obj = params.getField("textDocument") orelse return null;
+    const raw_uri = td_obj.getStringField("uri") orelse return null;
+    if (raw_uri.len == 0 or raw_uri.len > MAX_LSP_URI_BYTES) return null;
+    return raw_uri;
 }
 
 /// Resolves the outbound URI string for `file_id`, echoing the client's `didOpen` URI when known.
@@ -1970,8 +2064,7 @@ fn resolveCorexHomeDir(
         if (env.get("COREX_HOME")) |explicit_home| {
             if (explicit_home.len > 0) return allocator.dupe(u8, explicit_home);
         }
-        const home_opt = env.get("HOME") orelse env.get("USERPROFILE");
-        if (home_opt) |user_home| {
+        if (env.get("HOME") orelse env.get("USERPROFILE")) |user_home| {
             if (user_home.len > 0) {
                 return std.fmt.allocPrint(allocator, "{s}/.corex", .{user_home});
             }
@@ -2331,7 +2424,7 @@ fn mountWorkspaceGraphLazy(session: *LspSession) !void {
                     .limited(pkg_manifest.MAX_TOML_BYTES),
                 )) |lock_bytes| {
                     defer session.allocator.free(lock_bytes);
-                    if (session.vfs.setOverlay(lock_path, lock_bytes, .root)) |lock_fid| {
+                    if (session.vfs.setEditorOverlay(session.io, lock_path, lock_bytes, .root, false)) |lock_fid| {
                         existing_lock = pkg_manifest.parseLockfile(
                             session.allocator,
                             &lock_arena,
@@ -2514,12 +2607,13 @@ fn mountWorkspaceGraphLazy(session: *LspSession) !void {
 
                     for (resolved.packages) |pkg_node| {
                         for (pkg_node.dependencies) |dep_bind| {
-                            const target_fid = pkg_root_fids.get(dep_bind.target_pkg_id) orelse continue;
-                            try session.db.bindPackageDepFile(
-                                pkg_node.pkg_id,
-                                try session.db.interner.intern(dep_bind.alias_text),
-                                target_fid,
-                            );
+                            if (pkg_root_fids.get(dep_bind.target_pkg_id)) |target_fid| {
+                                try session.db.bindPackageDepFile(
+                                    pkg_node.pkg_id,
+                                    try session.db.interner.intern(dep_bind.alias_text),
+                                    target_fid,
+                                );
+                            }
                         }
                     }
                 }
@@ -2548,7 +2642,7 @@ fn handleInitializeRequest(
     rpc_id: JsonRpcId,
 ) !void {
     session.position_encoding = .utf16;
-    session.use_pull_diagnostics = false;
+    session.is_pull_diagnostics_enabled = false;
 
     if (params.getField("capabilities")) |caps_obj| {
         if (caps_obj.getField("general")) |gen_obj| {
@@ -2566,7 +2660,7 @@ fn handleInitializeRequest(
         if (caps_obj.getField("textDocument")) |td_obj| {
             if (td_obj.getField("diagnostic")) |diag_cap| {
                 if (diag_cap != .null_val) {
-                    session.use_pull_diagnostics = true;
+                    session.is_pull_diagnostics_enabled = true;
                 }
             }
         }
@@ -2583,12 +2677,12 @@ fn handleInitializeRequest(
         raw_root_uri = params.getStringField("rootUri");
     }
     if (raw_root_uri) |uri_str| {
-        if (uri_str.len > 0) {
+        if (uri_str.len > 0 and uri_str.len <= MAX_LSP_URI_BYTES) {
             if (session.workspace_root_dir) |old_ws| session.allocator.free(old_ws);
             session.workspace_root_dir = try decodeFileUriToNormalizedPath(session.allocator, uri_str);
         }
     } else if (params.getStringField("rootPath")) |root_path_str| {
-        if (root_path_str.len > 0) {
+        if (root_path_str.len > 0 and root_path_str.len <= MAX_LSP_URI_BYTES) {
             if (session.workspace_root_dir) |old_ws| session.allocator.free(old_ws);
             session.workspace_root_dir = try decodeFileUriToNormalizedPath(session.allocator, root_path_str);
         }
@@ -2647,6 +2741,7 @@ fn resolveDocumentFileId(
     arena_alloc: std.mem.Allocator,
     raw_uri: []const u8,
 ) !FileId {
+    if (raw_uri.len == 0 or raw_uri.len > MAX_LSP_URI_BYTES) return .none;
     const norm_path = try decodeFileUriToNormalizedPath(arena_alloc, raw_uri);
     if (lookupMountedFileId(session, norm_path)) |existing_fid| {
         return existing_fid;
@@ -2667,30 +2762,35 @@ fn handleDidOpenNotification(
     params: JsonValue,
     out_writer: *std.Io.Writer,
 ) !void {
+    const raw_uri = extractValidatedNotificationUri(params) orelse return;
     const td_obj = params.getField("textDocument") orelse return;
-    const raw_uri = td_obj.getStringField("uri") orelse return;
     const doc_text = td_obj.getStringField("text") orelse "";
     const doc_version = td_obj.getIntField("version") orelse 0;
 
     const norm_path = try decodeFileUriToNormalizedPath(arena_alloc, raw_uri);
     var pkg_id: PackageId = .root;
-    if (lookupMountedFileId(session, norm_path)) |pre_fid| {
-        pkg_id = session.db.symbol_table.getFilePackageId(pre_fid);
+    var overlay_path: []const u8 = norm_path;
+    if (lookupMountedFileId(session, norm_path)) |existing_fid| {
+        pkg_id = session.db.symbol_table.getFilePackageId(existing_fid);
+        const existing_vpath = session.vfs.getFilePath(existing_fid);
+        if (existing_vpath.len > 0) overlay_path = existing_vpath;
     }
 
-    const fid = session.vfs.setEditorOverlay(session.io, norm_path, doc_text, pkg_id, true) catch return;
+    const fid = session.vfs.setEditorOverlay(session.io, overlay_path, doc_text, pkg_id, true) catch return;
     try session.recordMountedFile(fid);
     try session.recordClientUri(fid, raw_uri);
     try session.open_doc_versions.put(session.allocator, fid.asInt(), doc_version);
 
+    const effective_vpath = session.vfs.getFilePath(fid);
+    const canonical_vpath = if (effective_vpath.len > 0) effective_vpath else overlay_path;
     _ = try session.db.setInput(fid, doc_text, .low);
-    try session.db.setFilePath(fid, norm_path);
+    try session.db.setFilePath(fid, canonical_vpath);
 
     var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
     defer visited.deinit(session.allocator);
-    try mountExternalSubmodulesShallow(session, fid, norm_path, .low, pkg_id, &visited, 0);
+    try mountExternalSubmodulesShallow(session, fid, canonical_vpath, .low, pkg_id, &visited, 0);
 
-    if (!session.use_pull_diagnostics) {
+    if (!session.is_pull_diagnostics_enabled) {
         try publishDiagnosticsNotification(session, arena_alloc, fid, out_writer);
     }
 }
@@ -2703,10 +2803,11 @@ fn handleDidChangeNotificationBatch(
     out_writer: *std.Io.Writer,
 ) !void {
     if (change_params_batch.len == 0) return;
-    const first_td = change_params_batch[0].getField("textDocument") orelse return;
-    const raw_uri = first_td.getStringField("uri") orelse return;
+    const raw_uri = extractValidatedNotificationUri(change_params_batch[0]) orelse return;
     const norm_path = try decodeFileUriToNormalizedPath(arena_alloc, raw_uri);
     const fid = lookupMountedFileId(session, norm_path) orelse return;
+    const existing_vpath = session.vfs.getFilePath(fid);
+    const overlay_path = if (existing_vpath.len > 0) existing_vpath else norm_path;
     const pkg_id = session.db.symbol_table.getFilePackageId(fid);
 
     var latest_version: ?i64 = null;
@@ -2766,9 +2867,9 @@ fn handleDidChangeNotificationBatch(
                     .old_end_byte = @intCast(end_off),
                     .new_end_byte = @intCast(start_off + repl_text.len),
                 };
-                _ = session.vfs.setEditorOverlay(session.io, norm_path, spliced, pkg_id, true) catch return;
+                _ = session.vfs.setEditorOverlay(session.io, overlay_path, spliced, pkg_id, true) catch return;
                 _ = try session.db.setInputWithEdit(fid, spliced, .low, edit_range);
-                if (!session.use_pull_diagnostics) {
+                if (!session.is_pull_diagnostics_enabled) {
                     try publishDiagnosticsNotification(session, arena_alloc, fid, out_writer);
                 }
                 return;
@@ -2776,9 +2877,9 @@ fn handleDidChangeNotificationBatch(
         }
         // Single full-document sync (`range == null`):
         if (repl_text.len > vfs_sourcemap.MAX_OPEN_OVERLAY_BYTES) return;
-        _ = session.vfs.setEditorOverlay(session.io, norm_path, repl_text, pkg_id, true) catch return;
+        _ = session.vfs.setEditorOverlay(session.io, overlay_path, repl_text, pkg_id, true) catch return;
         _ = try session.db.setInput(fid, repl_text, .low);
-        if (!session.use_pull_diagnostics) {
+        if (!session.is_pull_diagnostics_enabled) {
             try publishDiagnosticsNotification(session, arena_alloc, fid, out_writer);
         }
         return;
@@ -2856,13 +2957,13 @@ fn handleDidChangeNotificationBatch(
         }
     }
 
-    _ = session.vfs.setEditorOverlay(session.io, norm_path, working_src, pkg_id, true) catch return;
+    _ = session.vfs.setEditorOverlay(session.io, overlay_path, working_src, pkg_id, true) catch return;
     if (!has_full_sync and folded_edit != null) {
         _ = try session.db.setInputWithEdit(fid, working_src, .low, folded_edit.?);
     } else {
         _ = try session.db.setInput(fid, working_src, .low);
     }
-    if (!session.use_pull_diagnostics) {
+    if (!session.is_pull_diagnostics_enabled) {
         try publishDiagnosticsNotification(session, arena_alloc, fid, out_writer);
     }
 }
@@ -2874,25 +2975,26 @@ fn handleDidSaveNotification(
     params: JsonValue,
     out_writer: *std.Io.Writer,
 ) !void {
-    const td_obj = params.getField("textDocument") orelse return;
-    const raw_uri = td_obj.getStringField("uri") orelse return;
+    const raw_uri = extractValidatedNotificationUri(params) orelse return;
     const norm_path = try decodeFileUriToNormalizedPath(arena_alloc, raw_uri);
     const fid = lookupMountedFileId(session, norm_path) orelse return;
+    const existing_vpath = session.vfs.getFilePath(fid);
+    const overlay_path = if (existing_vpath.len > 0) existing_vpath else norm_path;
     const pkg_id = session.db.symbol_table.getFilePackageId(fid);
 
     if (params.getStringField("text")) |saved_text| {
         const cur_src = getLiveDocumentSource(session, fid) orelse "";
         if (!std.mem.eql(u8, cur_src, saved_text) and saved_text.len <= vfs_sourcemap.MAX_OPEN_OVERLAY_BYTES) {
-            _ = session.vfs.setEditorOverlay(session.io, norm_path, saved_text, pkg_id, true) catch return;
+            _ = session.vfs.setEditorOverlay(session.io, overlay_path, saved_text, pkg_id, true) catch return;
             _ = try session.db.setInput(fid, saved_text, .low);
         }
     }
 
     var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
     defer visited.deinit(session.allocator);
-    try mountExternalSubmodulesShallow(session, fid, norm_path, .low, pkg_id, &visited, 0);
+    try mountExternalSubmodulesShallow(session, fid, overlay_path, .low, pkg_id, &visited, 0);
 
-    if (!session.use_pull_diagnostics) {
+    if (!session.is_pull_diagnostics_enabled) {
         try publishDiagnosticsNotification(session, arena_alloc, fid, out_writer);
     }
 }
@@ -2904,8 +3006,7 @@ fn handleDidCloseNotification(
     params: JsonValue,
     out_writer: *std.Io.Writer,
 ) !void {
-    const td_obj = params.getField("textDocument") orelse return;
-    const raw_uri = td_obj.getStringField("uri") orelse return;
+    const raw_uri = extractValidatedNotificationUri(params) orelse return;
     const norm_path = try decodeFileUriToNormalizedPath(arena_alloc, raw_uri);
     const fid = lookupMountedFileId(session, norm_path) orelse return;
     const pkg_id = session.db.symbol_table.getFilePackageId(fid);
@@ -2913,17 +3014,16 @@ fn handleDidCloseNotification(
     _ = session.open_doc_versions.remove(fid.asInt());
     session.semantic_tokens_cache.removeFile(fid);
 
-    const has_reverted = session.vfs.closeOverlay(session.io, fid) catch false;
-    if (has_reverted) {
+    if (session.vfs.closeOverlay(session.io, fid) catch false) {
         const disk_src = session.vfs.getFileSource(fid) orelse "";
         const demoted_dur: Durability = if (pkg_id == .root) .medium else .high;
         _ = try session.db.setInput(fid, disk_src, demoted_dur);
-        if (!session.use_pull_diagnostics) {
+        if (!session.is_pull_diagnostics_enabled) {
             try publishDiagnosticsNotification(session, arena_alloc, fid, out_writer);
         }
     } else {
         _ = try session.db.setInput(fid, "", .medium);
-        if (!session.use_pull_diagnostics) {
+        if (!session.is_pull_diagnostics_enabled) {
             session.outbound_buf.clearRetainingCapacity();
             const body_writer = &session.outbound_buf.writer;
             try body_writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":");
@@ -2933,9 +3033,7 @@ fn handleDidCloseNotification(
         }
     }
 
-    if (session.file_id_to_client_uri.fetchRemove(fid.asInt())) |removed_kv| {
-        session.allocator.free(removed_kv.value);
-    }
+    session.removeClientUri(fid);
 }
 
 /// Handles `workspace/didChangeWatchedFiles`: reloads `corex.toml`/`corex.lock` and unopened disk `.cx` files.
@@ -2947,21 +3045,23 @@ fn handleDidChangeWatchedFilesNotification(
     const changes_val = params.getField("changes") orelse return;
     if (changes_val != .array_val) return;
 
-    var needs_manifest_reload = false;
+    var has_manifest_change = false;
     for (changes_val.array_val) |ev_obj| {
         const raw_uri = ev_obj.getStringField("uri") orelse continue;
+        if (raw_uri.len == 0 or raw_uri.len > MAX_LSP_URI_BYTES) continue;
         const change_kind = ev_obj.getIntField("type") orelse 2;
         const norm_path = try decodeFileUriToNormalizedPath(arena_alloc, raw_uri);
         const base_name = std.fs.path.basename(norm_path);
 
         if (std.mem.eql(u8, base_name, "corex.toml") or std.mem.eql(u8, base_name, "corex.lock")) {
-            needs_manifest_reload = true;
+            has_manifest_change = true;
             continue;
         }
         if (!std.mem.endsWith(u8, norm_path, ".cx")) continue;
 
-        if (lookupMountedFileId(session, norm_path)) |existing_fid| {
-            if (session.open_doc_versions.contains(existing_fid.asInt())) continue;
+        const existing_fid_opt = lookupMountedFileId(session, norm_path);
+        if (existing_fid_opt) |existing_fid| {
+            if (session.isFileOpen(existing_fid)) continue;
             if (change_kind == 3) {
                 _ = try session.db.setInput(existing_fid, "", .medium);
                 continue;
@@ -2974,11 +3074,20 @@ fn handleDidChangeWatchedFilesNotification(
                 arena_alloc,
                 .limited(vfs_sourcemap.MAX_SOURCE_FILE_BYTES),
             )) |disk_bytes| {
-                const pkg_id: PackageId = if (lookupMountedFileId(session, norm_path)) |fid_prev|
-                    session.db.symbol_table.getFilePackageId(fid_prev)
-                else
-                    .root;
-                const fid = try session.vfs.setOverlay(norm_path, disk_bytes, pkg_id);
+                var pkg_id: PackageId = .root;
+                var overlay_path: []const u8 = norm_path;
+                if (existing_fid_opt) |existing_fid| {
+                    pkg_id = session.db.symbol_table.getFilePackageId(existing_fid);
+                    const existing_vpath = session.vfs.getFilePath(existing_fid);
+                    if (existing_vpath.len > 0) overlay_path = existing_vpath;
+                }
+                const fid = try session.vfs.setEditorOverlay(
+                    session.io,
+                    overlay_path,
+                    disk_bytes,
+                    pkg_id,
+                    false,
+                );
                 _ = session.vfs.getLineIndex(fid) catch {};
                 try session.recordMountedFile(fid);
                 const dur: Durability = if (pkg_id == .root) .medium else .high;
@@ -2987,7 +3096,7 @@ fn handleDidChangeWatchedFilesNotification(
         }
     }
 
-    if (needs_manifest_reload) {
+    if (has_manifest_change) {
         try mountWorkspaceGraphLazy(session);
     }
 }
@@ -3222,12 +3331,7 @@ fn handlePullDiagnosticRequest(
     out_writer: *std.Io.Writer,
     rpc_id: JsonRpcId,
 ) !void {
-    const td_obj = params.getField("textDocument") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing textDocument");
-    };
-    const raw_uri = td_obj.getStringField("uri") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing textDocument.uri");
-    };
+    const raw_uri = (try extractValidatedRequestUri(session, params, out_writer, rpc_id)) orelse return;
     const prev_result_id = params.getStringField("previousResultId");
 
     const fid = try resolveDocumentFileId(session, arena_alloc, raw_uri);
@@ -3635,8 +3739,7 @@ fn computeSemanticTokensData(
                 .tok_type = SEM_TOK_VARIABLE,
                 .mod_bits = SEM_MOD_READONLY | SEM_MOD_STATIC | tok_extra_mods[tok_i],
             },
-            .ident => if (std.mem.eql(u8, lexeme, "cx") or std.mem.eql(u8, lexeme, "core") or
-                std.mem.eql(u8, lexeme, "pkg"))
+            .ident => if (BUILTIN_ROOT_NAMESPACE_SET.has(lexeme))
                 .{ .tok_type = SEM_TOK_NAMESPACE, .mod_bits = SEM_MOD_DEFAULT_LIB }
             else
                 .{ .tok_type = SEM_TOK_VARIABLE, .mod_bits = tok_extra_mods[tok_i] },
@@ -3701,12 +3804,7 @@ fn handleSemanticTokensFullOrRange(
     out_writer: *std.Io.Writer,
     rpc_id: JsonRpcId,
 ) !void {
-    const td_obj = params.getField("textDocument") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing textDocument");
-    };
-    const raw_uri = td_obj.getStringField("uri") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing uri");
-    };
+    const raw_uri = (try extractValidatedRequestUri(session, params, out_writer, rpc_id)) orelse return;
     const range_opt: ?LspRange = if (is_range_request)
         extractJsonRange(params.getField("range") orelse JsonValue{ .null_val = {} })
     else
@@ -3725,7 +3823,7 @@ fn handleSemanticTokensFullOrRange(
     const encoded_data = try computeSemanticTokensData(session, arena_alloc, fid, range_opt);
     var res_id_opt: ?[16]u8 = null;
     if (!is_range_request) {
-        const res_id = session.semantic_tokens_cache.nextResultId();
+        const res_id = session.semantic_tokens_cache.allocNextResultId();
         try session.semantic_tokens_cache.putCloned(fid, res_id, encoded_data);
         res_id_opt = res_id;
     }
@@ -3757,12 +3855,7 @@ fn handleSemanticTokensDelta(
     out_writer: *std.Io.Writer,
     rpc_id: JsonRpcId,
 ) !void {
-    const td_obj = params.getField("textDocument") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing textDocument");
-    };
-    const raw_uri = td_obj.getStringField("uri") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing uri");
-    };
+    const raw_uri = (try extractValidatedRequestUri(session, params, out_writer, rpc_id)) orelse return;
     const prev_result_id = params.getStringField("previousResultId") orelse "";
 
     const fid = try resolveDocumentFileId(session, arena_alloc, raw_uri);
@@ -3781,7 +3874,7 @@ fn handleSemanticTokensDelta(
     else
         null;
 
-    const new_res_id = session.semantic_tokens_cache.nextResultId();
+    const new_res_id = session.semantic_tokens_cache.allocNextResultId();
     try session.semantic_tokens_cache.putCloned(fid, new_res_id, new_data);
 
     session.outbound_buf.clearRetainingCapacity();
@@ -4241,7 +4334,7 @@ fn resolveCursorTarget(
     return result;
 }
 
-// ---------- Hover (Signature + DR-17 §4.4 + Trivia) ----------
+// ----------- Hover (Signature + DR-17 4.4 + Trivia) -----------
 
 /// Extracts `///` or `//!` doc comment lines attached to `decl_span`, skipping previous-item same-line trivia.
 fn extractDeclarationDocComments(
@@ -4671,12 +4764,7 @@ fn handleHoverRequest(
     out_writer: *std.Io.Writer,
     rpc_id: JsonRpcId,
 ) !void {
-    const td_obj = params.getField("textDocument") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing textDocument");
-    };
-    const raw_uri = td_obj.getStringField("uri") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing uri");
-    };
+    const raw_uri = (try extractValidatedRequestUri(session, params, out_writer, rpc_id)) orelse return;
     const pos = extractJsonPosition(params.getField("position") orelse JsonValue{ .null_val = {} }) orelse {
         return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing position");
     };
@@ -4878,12 +4966,7 @@ fn handleDefinitionOrTypeDefinition(
     out_writer: *std.Io.Writer,
     rpc_id: JsonRpcId,
 ) !void {
-    const td_obj = params.getField("textDocument") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing textDocument");
-    };
-    const raw_uri = td_obj.getStringField("uri") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing uri");
-    };
+    const raw_uri = (try extractValidatedRequestUri(session, params, out_writer, rpc_id)) orelse return;
     const pos = extractJsonPosition(params.getField("position") orelse JsonValue{ .null_val = {} }) orelse {
         return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing position");
     };
@@ -5126,7 +5209,7 @@ fn collectSymbolOccurrencesInFile(
     scan_fid: FileId,
     canonical_sym: SymbolIndex,
     is_explicit_local_alias: bool,
-    include_declaration: bool,
+    is_including_declaration: bool,
     only_def_id: DefId,
     max_cap: usize,
     out_hits: *std.ArrayListUnmanaged(ReferenceHit),
@@ -5143,8 +5226,8 @@ fn collectSymbolOccurrencesInFile(
     var parsed_art = session.db.parsed_artifacts.getPtr(scan_fid.asInt()) orelse return;
     const mod_scope = session.db.symbol_table.file_module_scopes.get(scan_fid.asInt()) orelse ScopeId.none;
 
-    // [1] Include declaration site if `include_declaration` and declared in `scan_fid`:
-    if (include_declaration and sym.decl_span.file_id == scan_fid) {
+    // [1] Include declaration site if `is_including_declaration` and declared in `scan_fid`:
+    if (is_including_declaration and sym.decl_span.file_id == scan_fid) {
         const live_decl = session.db.resolveLiveSymbolDeclSpan(canonical_sym) catch sym.decl_span;
         parsed_art = session.db.parsed_artifacts.getPtr(scan_fid.asInt()) orelse return;
         if (live_decl.file_id == scan_fid) {
@@ -5292,12 +5375,12 @@ fn collectSymbolOccurrencesInFile(
             const ast_node = parsed_art.ast_arena.getNode(ast_id);
             const raw_node_sym = side_tables.getNodeSymbol(ast_id);
             if (!raw_node_sym.isNone()) {
-                const matched = if (is_explicit_local_alias)
+                const is_matched = if (is_explicit_local_alias)
                     (resolveLiveExplicitAliasSymbol(session, scan_fid, raw_node_sym) == canonical_sym)
                 else
                     (resolveLiveCanonicalSymbol(session, raw_node_sym) == canonical_sym);
 
-                if (matched) {
+                if (is_matched) {
                     var hit_tok = ast_node.main_token;
                     if (ast_node.tag == .field_access and ast_node.rhs.tag == .token) {
                         hit_tok = TokenIndex.fromInt(ast_node.rhs.payload);
@@ -5306,7 +5389,7 @@ fn collectSymbolOccurrencesInFile(
                     }
                     if (!hit_tok.isNone() and hit_tok.asInt() < parsed_art.token_buffer.countTokens()) {
                         const cand_sp = parsed_art.token_buffer.getTokenSpan(scan_fid, hit_tok);
-                        if (!include_declaration and sym.decl_span.file_id == scan_fid) {
+                        if (!is_including_declaration and sym.decl_span.file_id == scan_fid) {
                             const live_decl = session.db.resolveLiveSymbolDeclSpan(canonical_sym) catch sym.decl_span;
                             parsed_art = session.db.parsed_artifacts.getPtr(scan_fid.asInt()) orelse return;
                             if (cand_sp.start_byte == live_decl.start_byte and cand_sp.end_byte == live_decl.end_byte) {
@@ -5447,11 +5530,11 @@ fn scanSignatureTypeTokensInEntry(
         const name_id = session.db.interner.lookup(lex) orelse continue;
         switch (session.db.symbol_table.lookupLexical(mod_scope, name_id, NamespaceMask.TYPE_ONLY)) {
             .found => |found_sym| {
-                const matches = if (is_explicit_local_alias)
+                const is_matching = if (is_explicit_local_alias)
                     (resolveLiveExplicitAliasSymbol(session, file_id, found_sym) == canonical_sym)
                 else
                     (resolveLiveCanonicalSymbol(session, found_sym) == canonical_sym);
-                if (matches) {
+                if (is_matching) {
                     const tok_sp = parsed_art.token_buffer.getTokenSpan(file_id, leaf.token);
                     const target_sym_rec = session.db.symbol_table.getSymbol(canonical_sym).*;
                     if (target_sym_rec.decl_span.file_id == file_id) {
@@ -5501,12 +5584,7 @@ fn handleDocumentHighlightRequest(
     out_writer: *std.Io.Writer,
     rpc_id: JsonRpcId,
 ) !void {
-    const td_obj = params.getField("textDocument") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing textDocument");
-    };
-    const raw_uri = td_obj.getStringField("uri") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing uri");
-    };
+    const raw_uri = (try extractValidatedRequestUri(session, params, out_writer, rpc_id)) orelse return;
     const pos = extractJsonPosition(params.getField("position") orelse JsonValue{ .null_val = {} }) orelse {
         return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing position");
     };
@@ -5546,10 +5624,9 @@ fn handleDocumentHighlightRequest(
     for (hits.items, 0..) |hit, i| {
         if (i > 0) try body_writer.writeByte(',');
         const range = spanToLspRange(session, fid, hit.span);
-        const hl_kind: u8 = if (hit.is_write_access) 3 else 2;
         try body_writer.writeAll("{\"range\":");
         try writeLspRangeJson(body_writer, range);
-        try body_writer.print(",\"kind\":{d}}}", .{hl_kind});
+        try body_writer.print(",\"kind\":{d}}}", .{@as(u8, if (hit.is_write_access) 3 else 2)});
     }
     try body_writer.writeAll("]}");
     try flushOutboundJsonFrame(out_writer, session.outbound_buf.written());
@@ -5563,16 +5640,11 @@ fn handleReferencesRequest(
     out_writer: *std.Io.Writer,
     rpc_id: JsonRpcId,
 ) !void {
-    const td_obj = params.getField("textDocument") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing textDocument");
-    };
-    const raw_uri = td_obj.getStringField("uri") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing uri");
-    };
+    const raw_uri = (try extractValidatedRequestUri(session, params, out_writer, rpc_id)) orelse return;
     const pos = extractJsonPosition(params.getField("position") orelse JsonValue{ .null_val = {} }) orelse {
         return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing position");
     };
-    const include_decl = if (params.getField("context")) |ctx_obj|
+    const is_including_declaration = if (params.getField("context")) |ctx_obj|
         (ctx_obj.getBoolField("includeDeclaration") orelse true)
     else
         true;
@@ -5599,7 +5671,7 @@ fn handleReferencesRequest(
             fid,
             canonical_sym,
             false,
-            include_decl,
+            is_including_declaration,
             target.enclosing_def_id,
             MAX_REFERENCES,
             &hits,
@@ -5648,7 +5720,7 @@ fn handleReferencesRequest(
                 cand_fid,
                 canonical_sym,
                 false,
-                include_decl,
+                is_including_declaration,
                 .NONE,
                 MAX_REFERENCES,
                 &hits,
@@ -5732,12 +5804,7 @@ fn handleDocumentSymbolRequest(
     out_writer: *std.Io.Writer,
     rpc_id: JsonRpcId,
 ) !void {
-    const td_obj = params.getField("textDocument") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing textDocument");
-    };
-    const raw_uri = td_obj.getStringField("uri") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing uri");
-    };
+    const raw_uri = (try extractValidatedRequestUri(session, params, out_writer, rpc_id)) orelse return;
 
     const fid = try resolveDocumentFileId(session, arena_alloc, raw_uri);
     if (fid.isNone()) return writeNullResultFrame(session, out_writer, rpc_id);
@@ -6051,10 +6118,12 @@ fn isCompletionDotReceiverMutable(
     if (raw_recv_ty.isError()) return false;
     const unwrapped_raw = session.db.type_pool.unwrapUnderlyingType(raw_recv_ty);
     if (!unwrapped_raw.isPrimitiveOrSentinel()) {
-        const outer_tag = session.db.type_pool.getTag(unwrapped_raw);
-        if (outer_tag == .mut_ref_ty) return true;
-        if (outer_tag == .ref_ty) return false;
-        if (outer_tag == .raw_ptr_ty) return session.db.type_pool.getNode(unwrapped_raw).rhs != 0;
+        switch (session.db.type_pool.getTag(unwrapped_raw)) {
+            .mut_ref_ty => return true,
+            .ref_ty => return false,
+            .raw_ptr_ty => return session.db.type_pool.getNode(unwrapped_raw).rhs != 0,
+            else => {},
+        }
     }
 
     // Walk receiver AST place chain when available (`arr.`, `holder.arr.`, `slice_mut[i].`):
@@ -6079,9 +6148,11 @@ fn isCompletionDotReceiverMutable(
                         );
                         if (inner_ty.isPrimitiveOrSentinel()) return false;
                         const inner_node = session.db.type_pool.getNode(inner_ty);
-                        if (inner_node.tag == .mut_ref_ty) return true;
-                        if (inner_node.tag == .raw_ptr_ty) return inner_node.rhs != 0;
-                        return false;
+                        return switch (inner_node.tag) {
+                            .mut_ref_ty => true,
+                            .raw_ptr_ty => inner_node.rhs != 0,
+                            else => false,
+                        };
                     },
                     .field_access, .index_expr => {
                         if (cur_node.lhs.tag != .node) return false;
@@ -6089,9 +6160,12 @@ fn isCompletionDotReceiverMutable(
                         const base_ty = session.db.type_pool.unwrapUnderlyingType(side_tables.getNodeType(base_ast));
                         if (!base_ty.isPrimitiveOrSentinel()) {
                             const base_node = session.db.type_pool.getNode(base_ty);
-                            if (base_node.tag == .mut_ref_ty) return true;
-                            if (base_node.tag == .ref_ty) return false;
-                            if (base_node.tag == .raw_ptr_ty) return base_node.rhs != 0;
+                            switch (base_node.tag) {
+                                .mut_ref_ty => return true,
+                                .ref_ty => return false,
+                                .raw_ptr_ty => return base_node.rhs != 0,
+                                else => {},
+                            }
                         }
                         cur_ast = base_ast;
                     },
@@ -6619,12 +6693,7 @@ fn handleCompletionRequest(
     out_writer: *std.Io.Writer,
     rpc_id: JsonRpcId,
 ) !void {
-    const td_obj = params.getField("textDocument") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing textDocument");
-    };
-    const raw_uri = td_obj.getStringField("uri") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing uri");
-    };
+    const raw_uri = (try extractValidatedRequestUri(session, params, out_writer, rpc_id)) orelse return;
     const pos = extractJsonPosition(params.getField("position") orelse JsonValue{ .null_val = {} }) orelse {
         return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing position");
     };
@@ -6991,12 +7060,7 @@ fn handleSignatureHelpRequest(
     out_writer: *std.Io.Writer,
     rpc_id: JsonRpcId,
 ) !void {
-    const td_obj = params.getField("textDocument") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing textDocument");
-    };
-    const raw_uri = td_obj.getStringField("uri") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing uri");
-    };
+    const raw_uri = (try extractValidatedRequestUri(session, params, out_writer, rpc_id)) orelse return;
     const pos = extractJsonPosition(params.getField("position") orelse JsonValue{ .null_val = {} }) orelse {
         return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing position");
     };
@@ -7041,9 +7105,8 @@ fn handleSignatureHelpRequest(
     if (open_paren_tok.isNone()) return writeNullResultFrame(session, out_writer, rpc_id);
 
     const lparen_rec = parsed_art.token_buffer.getToken(open_paren_tok);
-    const args_start_byte = lparen_rec.byte_offset +| lparen_rec.byte_len;
 
-    // Count top-level commas and detect `label:` named arguments inside `[args_start_byte .. cursor_byte)`:
+    // Count top-level commas and detect `label:` named arguments before `cursor_byte`:
     var comma_count: usize = 0;
     var active_named_label: ?[]const u8 = null;
     var seen_named_labels: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -7052,7 +7115,7 @@ fn handleSignatureHelpRequest(
         var depth_brack: u32 = 0;
         var depth_brace: u32 = 0;
         var slot_first_ident: ?[]const u8 = null;
-        var slot_has_colon = false;
+        var has_slot_colon = false;
 
         var t_cur: usize = open_paren_tok.asInt() + 1;
         const tok_count = parsed_art.token_buffer.countTokens();
@@ -7075,19 +7138,19 @@ fn handleSignatureHelpRequest(
                 .rbrace => depth_brace -|= 1,
                 .comma => {
                     if (depth_paren == 0 and depth_brack == 0 and depth_brace == 0) {
-                        if (slot_has_colon and slot_first_ident != null) {
+                        if (has_slot_colon and slot_first_ident != null) {
                             try seen_named_labels.append(arena_alloc, slot_first_ident.?);
                         }
                         comma_count += 1;
                         slot_first_ident = null;
-                        slot_has_colon = false;
+                        has_slot_colon = false;
                     }
                 },
                 .colon => {
                     if (depth_paren == 0 and depth_brack == 0 and depth_brace == 0 and
-                        slot_first_ident != null and !slot_has_colon)
+                        slot_first_ident != null and !has_slot_colon)
                     {
-                        slot_has_colon = true;
+                        has_slot_colon = true;
                     }
                 },
                 else => {
@@ -7099,10 +7162,9 @@ fn handleSignatureHelpRequest(
                 },
             }
         }
-        if (slot_has_colon and slot_first_ident != null) {
+        if (has_slot_colon and slot_first_ident != null) {
             active_named_label = slot_first_ident;
         }
-        _ = args_start_byte;
     }
 
     // Resolve callee symbol + method-call flag from enclosing `DefId` AST side tables or token before `(`:
@@ -7162,17 +7224,17 @@ fn handleSignatureHelpRequest(
                 };
                 if (!is_call_tag) continue;
 
-                var matches_call = (ast_node.main_token == open_paren_tok);
-                if (!matches_call and !ident_before_paren.isNone()) {
+                var is_matching_call = (ast_node.main_token == open_paren_tok);
+                if (!is_matching_call and !ident_before_paren.isNone()) {
                     if (ast_node.tag == .method_call and ast_node.rhs.tag == .extra) {
                         const mem_raw = parsed_art.ast_arena.extra_data.items[ast_node.rhs.payload];
-                        matches_call = (TokenIndex.fromInt(mem_raw) == ident_before_paren);
+                        is_matching_call = (TokenIndex.fromInt(mem_raw) == ident_before_paren);
                     } else if (ast_node.lhs.tag == .node) {
                         const lhs_n = parsed_art.ast_arena.getNode(NodeIndex.fromInt(ast_node.lhs.payload));
-                        matches_call = (lhs_n.main_token == ident_before_paren);
+                        is_matching_call = (lhs_n.main_token == ident_before_paren);
                     }
                 }
-                if (!matches_call) continue;
+                if (!is_matching_call) continue;
 
                 if (ast_node.tag == .method_call) is_method_syntax = true;
                 const call_sym = side_tables.getNodeSymbol(ast_id);
@@ -7280,14 +7342,14 @@ fn handleSignatureHelpRequest(
             const pos_filled = comma_count -| seen_named_labels.items.len;
             for (visible_specs, 0..) |vspec, v_i| {
                 if (v_i < pos_filled) continue;
-                var already_used = false;
+                var is_already_used = false;
                 for (seen_named_labels.items) |used_lbl| {
                     if (std.mem.eql(u8, vspec.name_text, used_lbl)) {
-                        already_used = true;
+                        is_already_used = true;
                         break;
                     }
                 }
-                if (!already_used) {
+                if (!is_already_used) {
                     computed_param = v_i;
                     break;
                 }
@@ -7333,12 +7395,7 @@ fn handleInlayHintRequest(
     out_writer: *std.Io.Writer,
     rpc_id: JsonRpcId,
 ) !void {
-    const td_obj = params.getField("textDocument") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing textDocument");
-    };
-    const raw_uri = td_obj.getStringField("uri") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing uri");
-    };
+    const raw_uri = (try extractValidatedRequestUri(session, params, out_writer, rpc_id)) orelse return;
     const req_range = extractJsonRange(params.getField("range") orelse JsonValue{ .null_val = {} }) orelse {
         return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing range");
     };
@@ -7575,11 +7632,15 @@ fn handleInlayHintRequest(
     try flushOutboundJsonFrame(out_writer, session.outbound_buf.written());
 }
 
-/// Returns `true` when `file_id` belongs to `.std_core`, an external package, `@c_import`, or `Durability.high`.
+/// Returns `true` when `file_id` belongs to an external/read-only `.std_core`, `.cxtree`, `@c_import`, or `.high` file.
 fn isReadOnlyNonWorkspaceFile(session: *const LspSession, file_id: FileId) bool {
     if (file_id.isNone() or file_id.asInt() >= query_db.VIRTUAL_C_IMPORT_FILE_ID_BASE) return true;
-    if (session.db.symbol_table.getFilePackageId(file_id) != .root) return true;
-    if (session.db.isStdlibFile(file_id)) return true;
+    const vfs_path = session.vfs.getFilePath(file_id);
+    if (std.mem.startsWith(u8, vfs_path, "/cx/")) return true;
+    const pkg_id = session.db.symbol_table.getFilePackageId(file_id);
+    if (pkg_id == .std_core) return !session.options.is_internal_core;
+    if (pkg_id != .root) return true;
+    if (session.db.isStdlibFile(file_id)) return !session.options.is_internal_core;
     if (session.db.source_inputs.get(file_id.asInt())) |src_in| {
         if (src_in.durability == .high) return true;
     }
@@ -7604,12 +7665,7 @@ fn handleCodeActionRequest(
     out_writer: *std.Io.Writer,
     rpc_id: JsonRpcId,
 ) !void {
-    const td_obj = params.getField("textDocument") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing textDocument");
-    };
-    const raw_uri = td_obj.getStringField("uri") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing uri");
-    };
+    const raw_uri = (try extractValidatedRequestUri(session, params, out_writer, rpc_id)) orelse return;
     const req_range = extractJsonRange(params.getField("range") orelse JsonValue{ .null_val = {} }) orelse {
         return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing range");
     };
@@ -7621,7 +7677,6 @@ fn handleCodeActionRequest(
     const req_start = lspPositionToByteOffset(session, fid, req_range.start);
     const req_end = @max(req_start, lspPositionToByteOffset(session, fid, req_range.end));
     const collected = try collectFileDiagnostics(session, arena_alloc, fid);
-    const client_uri = try resolveOutboundUri(session, arena_alloc, fid);
 
     session.outbound_buf.clearRetainingCapacity();
     const body_writer = &session.outbound_buf.writer;
@@ -7633,8 +7688,7 @@ fn handleCodeActionRequest(
     for (collected) |entry| {
         if (action_count >= MAX_CODE_ACTIONS) break;
         const d_span = entry.diag.primary_span;
-        const overlaps_primary = (d_span.start_byte <= req_end and d_span.end_byte >= req_start);
-        if (!overlaps_primary) continue;
+        if (d_span.start_byte > req_end or d_span.end_byte < req_start) continue;
 
         var all_fixes: std.ArrayListUnmanaged(SuggestedFix) = .empty;
         for (entry.diag.suggestions) |fix_item| {
@@ -7646,15 +7700,43 @@ fn handleCodeActionRequest(
 
         for (all_fixes.items) |fix| {
             if (action_count >= MAX_CODE_ACTIONS) break;
-            var has_target_file_edit = false;
-            for (fix.edits) |cand_edit| {
-                const cand_fid = if (!cand_edit.file_id.isNone()) cand_edit.file_id else fid;
-                if (cand_fid == fid) {
-                    has_target_file_edit = true;
+            if (fix.edits.len == 0) continue;
+
+            var uri_groups: std.ArrayListUnmanaged(CodeActionUriGroup) = .empty;
+            var uri_to_group_idx: std.StringHashMapUnmanaged(usize) = .empty;
+            var is_fix_valid = true;
+
+            for (fix.edits) |edit_rec| {
+                const edit_fid = if (!edit_rec.file_id.isNone()) edit_rec.file_id else fid;
+                if (isReadOnlyNonWorkspaceFile(session, edit_fid)) {
+                    is_fix_valid = false;
                     break;
                 }
+                if (session.vfs.getFilePath(edit_fid).len == 0 and
+                    !session.file_id_to_client_uri.contains(edit_fid.asInt()))
+                {
+                    is_fix_valid = false;
+                    break;
+                }
+                const target_uri = resolveOutboundUri(session, arena_alloc, edit_fid) catch {
+                    is_fix_valid = false;
+                    break;
+                };
+                if (target_uri.len == 0) {
+                    is_fix_valid = false;
+                    break;
+                }
+                const gop = try uri_to_group_idx.getOrPut(arena_alloc, target_uri);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = uri_groups.items.len;
+                    try uri_groups.append(arena_alloc, .{
+                        .file_id = edit_fid,
+                        .uri = target_uri,
+                    });
+                }
+                try uri_groups.items[gop.value_ptr.*].edits.append(arena_alloc, edit_rec);
             }
-            if (!has_target_file_edit) continue;
+            if (!is_fix_valid or uri_groups.items.len == 0) continue;
 
             if (action_count > 0) try body_writer.writeByte(',');
             try body_writer.writeAll("{\"title\":");
@@ -7668,23 +7750,27 @@ fn handleCodeActionRequest(
             );
             try writeSingleLspDiagnosticJson(session, arena_alloc, fid, entry.diag, body_writer);
             try body_writer.writeAll("],\"edit\":{\"changes\":{");
-            try writeJsonString(body_writer, client_uri);
-            try body_writer.writeAll(":[");
-            var emitted_edits: usize = 0;
-            for (fix.edits) |edit_rec| {
-                const edit_fid = if (!edit_rec.file_id.isNone()) edit_rec.file_id else fid;
-                if (edit_fid != fid) continue;
-                const repl_str = session.db.interner.get(edit_rec.replacement_id);
-                const edit_range = spanToLspRange(session, fid, edit_rec.asSpan());
-                if (emitted_edits > 0) try body_writer.writeByte(',');
-                try body_writer.writeAll("{\"range\":");
-                try writeLspRangeJson(body_writer, edit_range);
-                try body_writer.writeAll(",\"newText\":");
-                try writeJsonString(body_writer, repl_str);
-                try body_writer.writeByte('}');
-                emitted_edits += 1;
+            for (uri_groups.items, 0..) |group, group_i| {
+                if (group_i > 0) try body_writer.writeByte(',');
+                try writeJsonString(body_writer, group.uri);
+                try body_writer.writeAll(":[");
+                for (group.edits.items, 0..) |edit_rec, edit_i| {
+                    const repl_str = session.db.interner.get(edit_rec.replacement_id);
+                    const edit_range = spanToLspRange(
+                        session,
+                        group.file_id,
+                        Span.init(group.file_id, edit_rec.start_byte, edit_rec.end_byte),
+                    );
+                    if (edit_i > 0) try body_writer.writeByte(',');
+                    try body_writer.writeAll("{\"range\":");
+                    try writeLspRangeJson(body_writer, edit_range);
+                    try body_writer.writeAll(",\"newText\":");
+                    try writeJsonString(body_writer, repl_str);
+                    try body_writer.writeByte('}');
+                }
+                try body_writer.writeByte(']');
             }
-            try body_writer.writeAll("]}}}");
+            try body_writer.writeAll("}}}");
             action_count += 1;
         }
     }
@@ -7702,12 +7788,7 @@ fn handleFormattingRequest(
     out_writer: *std.Io.Writer,
     rpc_id: JsonRpcId,
 ) !void {
-    const td_obj = params.getField("textDocument") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing textDocument");
-    };
-    const raw_uri = td_obj.getStringField("uri") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing uri");
-    };
+    const raw_uri = (try extractValidatedRequestUri(session, params, out_writer, rpc_id)) orelse return;
 
     const fid = try resolveDocumentFileId(session, arena_alloc, raw_uri);
     if (fid.isNone()) return writeNullResultFrame(session, out_writer, rpc_id);
@@ -7906,7 +7987,7 @@ fn isValidDr03RenameIdentifier(sym: SymbolRecord, new_name: []const u8) bool {
     if (!isUserIdentifierToken(classified.kind)) return false;
     if (symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.has(new_name)) return false;
 
-    const expects_pascal = switch (sym.kind) {
+    const is_expecting_pascal = switch (sym.kind) {
         .struct_sym,
         .enum_sym,
         .union_sym,
@@ -7922,16 +8003,15 @@ fn isValidDr03RenameIdentifier(sym: SymbolRecord, new_name: []const u8) bool {
         .use_alias_sym => sym.namespace == .type_ns,
         else => false,
     };
-    const expects_screaming = switch (sym.kind) {
+    const is_expecting_screaming = switch (sym.kind) {
         .const_sym, .const_param_sym => true,
         .use_alias_sym => sym.namespace == .const_ns,
         else => false,
     };
 
-    if (expects_pascal) {
+    if (is_expecting_pascal) {
         return classified.kind == .type_ident and classified.is_canonical;
-    }
-    if (expects_screaming) {
+    } else if (is_expecting_screaming) {
         return classified.kind == .const_ident and classified.is_canonical;
     }
     return classified.kind == .ident and classified.is_canonical;
@@ -8049,15 +8129,13 @@ fn hasRenameCollisionOrShadowingHazard(
     if (is_local and !validated.enclosing_def_id.isNone()) {
         const local_fid = validated.cursor_token_span.file_id;
         _ = try session.db.parseCst(local_fid);
-        const item_tree = try session.db.extractItemTree(local_fid);
-        if (item_tree.getEntry(validated.enclosing_def_id)) |enc_entry_ptr| {
-            const enc_entry = enc_entry_ptr.*;
+        if ((try session.db.extractItemTree(local_fid)).getEntry(validated.enclosing_def_id)) |enc_entry_ptr| {
             var parsed_art = session.db.parsed_artifacts.getPtr(local_fid.asInt()) orelse return false;
             if (computeCstSubtreeByteSpan(
                 local_fid,
                 &parsed_art.token_buffer,
                 &parsed_art.cst_arena,
-                enc_entry.cst_node,
+                enc_entry_ptr.cst_node,
             )) |def_span| {
                 if (try session.db.getDefSideTables(validated.enclosing_def_id)) |side_tables| {
                     parsed_art = session.db.parsed_artifacts.getPtr(local_fid.asInt()) orelse return false;
@@ -8094,17 +8172,17 @@ fn hasRenameCollisionOrShadowingHazard(
                         }
                     }
 
-                    // Also check unreferenced live parameters or inner locals named `new_name` in `enc_entry`:
+                    // Also check unreferenced live parameters or inner locals named `new_name` in `enc_entry_ptr`:
                     const scratch_alloc = session.turn_arena.asAllocator();
                     var live_param_syms: std.ArrayListUnmanaged(SymbolIndex) = .empty;
-                    try collectEntryLiveScopeParamSymbols(session, scratch_alloc, enc_entry, &live_param_syms);
+                    try collectEntryLiveScopeParamSymbols(session, scratch_alloc, enc_entry_ptr.*, &live_param_syms);
                     for (live_param_syms.items) |cand_idx| {
                         if (cand_idx == validated.target_sym_idx) continue;
                         const cand_sym = session.db.symbol_table.getSymbol(cand_idx).*;
                         if (cand_sym.namespace == target_sym.namespace and
                             std.mem.eql(u8, cand_sym.name_text, new_name))
                         {
-                            if (enc_entry.kind != .impl_decl or
+                            if (enc_entry_ptr.kind != .impl_decl or
                                 isScopeAncestorOrEqual(
                                     &session.db.symbol_table.scope_arena,
                                     target_sym.scope_id,
@@ -8263,12 +8341,7 @@ fn handlePrepareRenameRequest(
     out_writer: *std.Io.Writer,
     rpc_id: JsonRpcId,
 ) !void {
-    const td_obj = params.getField("textDocument") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing textDocument");
-    };
-    const raw_uri = td_obj.getStringField("uri") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing uri");
-    };
+    const raw_uri = (try extractValidatedRequestUri(session, params, out_writer, rpc_id)) orelse return;
     const pos = extractJsonPosition(params.getField("position") orelse JsonValue{ .null_val = {} }) orelse {
         return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing position");
     };
@@ -8310,12 +8383,7 @@ fn handleRenameRequest(
     out_writer: *std.Io.Writer,
     rpc_id: JsonRpcId,
 ) !void {
-    const td_obj = params.getField("textDocument") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing textDocument");
-    };
-    const raw_uri = td_obj.getStringField("uri") orelse {
-        return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing uri");
-    };
+    const raw_uri = (try extractValidatedRequestUri(session, params, out_writer, rpc_id)) orelse return;
     const pos = extractJsonPosition(params.getField("position") orelse JsonValue{ .null_val = {} }) orelse {
         return sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INVALID_PARAMS, "missing position");
     };
@@ -8417,7 +8485,7 @@ fn handleRenameRequest(
 
     // Build surgical `RenamePlanEdit`s, expanding `Point { x }` and `Point { var x }` shorthands:
     const is_renaming_field = (target_sym.kind == .field_sym);
-    const can_trigger_shorthand = is_renaming_field or
+    const is_shorthand_candidate = is_renaming_field or
         target_sym.kind == .local_let_sym or
         target_sym.kind == .local_var_sym or
         target_sym.kind == .param_sym or
@@ -8434,7 +8502,7 @@ fn handleRenameRequest(
             hit.span.start_byte == decl_live.start_byte and
             hit.span.end_byte == decl_live.end_byte);
 
-        if (can_trigger_shorthand and (!is_decl_span or
+        if (is_shorthand_candidate and (!is_decl_span or
             target_sym.kind == .local_let_sym or target_sym.kind == .local_var_sym))
         {
             if (try tryBuildShorthandExpansionEdit(
@@ -8725,8 +8793,7 @@ fn drainAndDispatchInboundTurn(
         batch_count < MAX_BATCHED_INBOUND_FRAMES and
         reader.bufferedLen() > 0)
     {
-        const next_opt = try tryExtractCompleteBufferedFrame(session.allocator, reader);
-        const next_frame = next_opt orelse break;
+        const next_frame = (try tryExtractCompleteBufferedFrame(session.allocator, reader)) orelse break;
         if (next_frame == .eof) break;
         batch[batch_count] = populateBatchSlot(arena_alloc, next_frame);
         batch_count += 1;
@@ -8799,8 +8866,9 @@ fn drainAndDispatchInboundTurn(
             );
             continue;
         }
-        const jsonrpc_ver = slot.json_root.getStringField("jsonrpc") orelse "";
-        if (!std.mem.eql(u8, jsonrpc_ver, "2.0") or slot.method_str.len == 0) {
+        if (!std.mem.eql(u8, slot.json_root.getStringField("jsonrpc") orelse "", "2.0") or
+            slot.method_str.len == 0)
+        {
             try sendJsonRpcError(
                 session,
                 out_writer,
@@ -8822,7 +8890,7 @@ fn drainAndDispatchInboundTurn(
             else
                 "";
 
-            if (first_uri.len > 0) {
+            if (first_uri.len > 0 and first_uri.len <= MAX_LSP_URI_BYTES) {
                 var coalesced_params: std.ArrayListUnmanaged(JsonValue) = .empty;
                 try coalesced_params.append(arena_alloc, first_params);
 
@@ -8906,7 +8974,138 @@ fn populateBatchSlot(arena_alloc: std.mem.Allocator, frame: InboundFrame) Parsed
     }
 }
 
+/// Wraps a raw JSON body in a `Content-Length: <N>\r\n\r\n<body>` frame inside `out_buf`.
+fn appendTestLspFrame(
+    allocator: std.mem.Allocator,
+    out_buf: *std.ArrayListUnmanaged(u8),
+    json_body: []const u8,
+) !void {
+    const frame_str = try std.fmt.allocPrint(
+        allocator,
+        "Content-Length: {d}\r\n\r\n{s}",
+        .{ json_body.len, json_body },
+    );
+    defer allocator.free(frame_str);
+    try out_buf.appendSlice(allocator, frame_str);
+}
+
+/// Extracts all outbound JSON-RPC frame bodies from a captured `Content-Length` wire stream.
+fn extractTestOutboundPayloads(
+    allocator: std.mem.Allocator,
+    wire_bytes: []const u8,
+) ![][]const u8 {
+    var bodies: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer bodies.deinit(allocator);
+    var cursor: usize = 0;
+    while (cursor < wire_bytes.len) {
+        const sep = std.mem.indexOfPos(u8, wire_bytes, cursor, "\r\n\r\n") orelse break;
+        const len_val = switch (extractHeaderContentLength(wire_bytes[cursor..sep])) {
+            .ok => |byte_len| byte_len,
+            .overflow, .invalid => break,
+        };
+        if (len_val > MAX_LSP_CONTENT_LENGTH) break;
+        const start_byte = sep + 4;
+        const end_byte = std.math.add(usize, start_byte, len_val) catch break;
+        if (end_byte > wire_bytes.len) break;
+        try bodies.append(allocator, wire_bytes[start_byte..end_byte]);
+        cursor = end_byte;
+    }
+    return bodies.toOwnedSlice(allocator);
+}
+
 // ------------------------------------- PUBLIC API --------------------------------------
+
+/// Decodes a `file://` URI into a normalized `/` path matching `VfsSourceMap` (`d:/…` on Windows, `/cx/…` on `.cxtree`).
+pub fn decodeFileUriToNormalizedPath(allocator: std.mem.Allocator, raw_uri: []const u8) ![]u8 {
+    var path_part: []const u8 = raw_uri;
+    if (std.ascii.startsWithIgnoreCase(raw_uri, "file://")) {
+        const after_scheme = raw_uri["file://".len..];
+        if (std.mem.startsWith(u8, after_scheme, "/")) {
+            path_part = after_scheme;
+        } else if (std.mem.indexOfScalar(u8, after_scheme, '/')) |slash_idx| {
+            const host_part = after_scheme[0..slash_idx];
+            var host_buf: [128]u8 = undefined;
+            const decoded_host_opt = decodePercentSliceBounded(&host_buf, host_part);
+            if (decoded_host_opt != null and std.ascii.eqlIgnoreCase(decoded_host_opt.?, "localhost")) {
+                path_part = after_scheme[slash_idx..];
+            } else if (decoded_host_opt != null and
+                decoded_host_opt.?.len == 2 and
+                std.ascii.isAlphabetic(decoded_host_opt.?[0]) and
+                decoded_host_opt.?[1] == ':')
+            {
+                path_part = after_scheme;
+            } else {
+                // Preserve UNC authority (`file://server/share/` -> `//server/share`):
+                var unc_buf: std.ArrayListUnmanaged(u8) = .empty;
+                errdefer unc_buf.deinit(allocator);
+                try unc_buf.appendSlice(allocator, "//");
+                try appendPercentDecodedNormalized(&unc_buf, allocator, after_scheme);
+                while (unc_buf.items.len > 2 and unc_buf.items[unc_buf.items.len - 1] == '/') {
+                    unc_buf.items.len -= 1;
+                }
+                return unc_buf.toOwnedSlice(allocator);
+            }
+        } else {
+            path_part = after_scheme;
+        }
+    }
+
+    var decoded: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer decoded.deinit(allocator);
+    try appendPercentDecodedNormalized(&decoded, allocator, path_part);
+
+    var slice = decoded.items;
+    // Strip leading `/` before Windows drive letters (`/D:/foo` or `/d%3A/foo` -> `d:/foo`):
+    if (slice.len >= 3 and slice[0] == '/' and std.ascii.isAlphabetic(slice[1]) and slice[2] == ':') {
+        const lower_drive = std.ascii.toLower(slice[1]);
+        std.mem.copyForwards(u8, slice[0 .. slice.len - 1], slice[1..]);
+        slice[0] = lower_drive;
+        decoded.items.len -= 1;
+        slice = decoded.items;
+    } else if (slice.len >= 2 and std.ascii.isAlphabetic(slice[0]) and slice[1] == ':') {
+        slice[0] = std.ascii.toLower(slice[0]);
+    }
+
+    // Trim redundant trailing `/` except on filesystem roots (`"/"`, `"d:/"`, or UNC `"//"`):
+    const min_keep_len: usize = if (std.mem.startsWith(u8, slice, "//")) 2 else 1;
+    while (slice.len > min_keep_len and slice[slice.len - 1] == '/') {
+        if (slice.len == 3 and std.ascii.isAlphabetic(slice[0]) and slice[1] == ':') break;
+        decoded.items.len -= 1;
+        slice = decoded.items;
+    }
+    return decoded.toOwnedSlice(allocator);
+}
+
+/// Encodes a normalized VFS path (`d:/foo/bar.cx`, `/home/u/a.cx`, `/cx/pkg@1.0.0/src/lib.cx`) into a `file://` URI.
+pub fn encodePathToFileUri(allocator: std.mem.Allocator, raw_path: []const u8) ![]u8 {
+    var uri_buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer uri_buf.deinit(allocator);
+
+    if (std.mem.startsWith(u8, raw_path, "//")) {
+        try uri_buf.appendSlice(allocator, "file:");
+    } else if (raw_path.len >= 2 and std.ascii.isAlphabetic(raw_path[0]) and raw_path[1] == ':') {
+        try uri_buf.appendSlice(allocator, "file:///");
+    } else if (std.mem.startsWith(u8, raw_path, "/")) {
+        try uri_buf.appendSlice(allocator, "file://");
+    } else {
+        try uri_buf.appendSlice(allocator, "file:///");
+    }
+
+    for (raw_path) |raw_ch| {
+        const ch_val: u8 = if (raw_ch == '\\') '/' else raw_ch;
+        const is_unreserved = std.ascii.isAlphanumeric(ch_val) or
+            ch_val == '/' or ch_val == '-' or ch_val == '_' or
+            ch_val == '.' or ch_val == '~' or ch_val == ':' or ch_val == '@';
+        if (is_unreserved) {
+            try uri_buf.append(allocator, ch_val);
+        } else {
+            var pct_tmp: [3]u8 = undefined;
+            _ = std.fmt.bufPrint(&pct_tmp, "%{X:0>2}", .{ch_val}) catch unreachable;
+            try uri_buf.appendSlice(allocator, &pct_tmp);
+        }
+    }
+    return uri_buf.toOwnedSlice(allocator);
+}
 
 /// Starts the built-in CoreX LSP 3.17 daemon over `stdin` / `stdout` using Zig `0.17.0` streaming I/O.
 pub fn runServerStdio(
@@ -8947,59 +9146,12 @@ pub fn runServerStream(
     var session = try LspSession.init(allocator, io, environ_map, log_writer, options);
     defer session.deinit();
     session.bindInternalPointers();
-
-    var explicit_exit_code: ?u8 = null;
-    while (try drainAndDispatchInboundTurn(&session, reader, writer, &explicit_exit_code)) {}
-
-    writer.flush() catch {};
-    if (log_writer) |lw| lw.flush() catch {};
-
-    if (explicit_exit_code) |code_val| return code_val;
-    return if (session.state == .shutting_down) 0 else 0;
+    return session.feedStream(reader, writer);
 }
 
 // ---------------------------------------- MAIN -----------------------------------------
 
-/// Wraps a raw JSON body in a `Content-Length: <N>\r\n\r\n<body>` frame inside `out_buf`.
-fn appendTestLspFrame(
-    allocator: std.mem.Allocator,
-    out_buf: *std.ArrayListUnmanaged(u8),
-    json_body: []const u8,
-) !void {
-    const frame_str = try std.fmt.allocPrint(
-        allocator,
-        "Content-Length: {d}\r\n\r\n{s}",
-        .{ json_body.len, json_body },
-    );
-    defer allocator.free(frame_str);
-    try out_buf.appendSlice(allocator, frame_str);
-}
-
-/// Extracts all outbound JSON-RPC frame bodies from a captured `Content-Length` wire stream.
-fn extractTestOutboundPayloads(
-    allocator: std.mem.Allocator,
-    wire_bytes: []const u8,
-) ![][]const u8 {
-    var bodies: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer bodies.deinit(allocator);
-    var cursor: usize = 0;
-    while (cursor < wire_bytes.len) {
-        const sep = std.mem.indexOfPos(u8, wire_bytes, cursor, "\r\n\r\n") orelse break;
-        const len_val = switch (extractHeaderContentLength(wire_bytes[cursor..sep])) {
-            .ok => |byte_len| byte_len,
-            .overflow, .invalid => break,
-        };
-        if (len_val > MAX_LSP_CONTENT_LENGTH) break;
-        const start_byte = sep + 4;
-        const end_byte = std.math.add(usize, start_byte, len_val) catch break;
-        if (end_byte > wire_bytes.len) break;
-        try bodies.append(allocator, wire_bytes[start_byte..end_byte]);
-        cursor = end_byte;
-    }
-    return bodies.toOwnedSlice(allocator);
-}
-
-test "lsp_framing_json_security_caps_surrogates_uri_codec_and_lifecycle" {
+test "test_lsp_framing_json_security_caps_surrogates_uri_codec_and_lifecycle" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -9087,7 +9239,7 @@ test "lsp_framing_json_security_caps_surrogates_uri_codec_and_lifecycle" {
     }
 }
 
-test "lsp_utf8_vs_utf16_did_change_and_multi_change_coalescing" {
+test "test_lsp_utf8_vs_utf16_did_change_and_multi_change_coalescing" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -9115,7 +9267,6 @@ test "lsp_utf8_vs_utf16_did_change_and_multi_change_coalescing" {
 
         // Replace `10` with `42` on line 1 (`"    let _label = \"𐍈\"; let val = "` = 35 UTF-8 cols vs 33 UTF-16 cols):
         const start_col: u32 = if (is_utf8_preferred) 35 else 33;
-        const end_col: u32 = start_col + 2;
         const change_json = try std.fmt.allocPrint(
             allocator,
             "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{{" ++
@@ -9124,7 +9275,7 @@ test "lsp_utf8_vs_utf16_did_change_and_multi_change_coalescing" {
                 "\"end\":{{\"line\":1,\"character\":{d}}}}},\"text\":\"42\"}}," ++
                 "{{\"range\":{{\"start\":{{\"line\":2,\"character\":11}}," ++
                 "\"end\":{{\"line\":2,\"character\":14}}}},\"text\":\"val\"}}]}}}}",
-            .{ start_col, end_col },
+            .{ start_col, start_col + 2 },
         );
         defer allocator.free(change_json);
         try appendTestLspFrame(allocator, &inbound, change_json);
@@ -9155,7 +9306,7 @@ test "lsp_utf8_vs_utf16_did_change_and_multi_change_coalescing" {
     }
 }
 
-test "lsp_pipelined_cancel_request_and_semantic_tokens_lru_cache" {
+test "test_lsp_pipelined_cancel_request_and_semantic_tokens_lru_cache" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -9164,9 +9315,9 @@ test "lsp_pipelined_cancel_request_and_semantic_tokens_lru_cache" {
         var cache = try SemanticTokensCache.initWithLimits(allocator, 2, 48);
         defer cache.deinit();
 
-        const id_one = cache.nextResultId();
-        const id_two = cache.nextResultId();
-        const id_three = cache.nextResultId();
+        const id_one = cache.allocNextResultId();
+        const id_two = cache.allocNextResultId();
+        const id_three = cache.allocNextResultId();
 
         try cache.putCloned(FileId.fromInt(1), id_one, &.{ 0, 0, 3, 1, 0 });
         try cache.putCloned(FileId.fromInt(2), id_two, &.{ 1, 0, 4, 2, 0 });
@@ -9182,8 +9333,8 @@ test "lsp_pipelined_cancel_request_and_semantic_tokens_lru_cache" {
         // Byte-budget eviction (`32` bytes holds one `20`-byte slice, evicting LRU on the second):
         var byte_cache = try SemanticTokensCache.initWithLimits(allocator, 8, 32);
         defer byte_cache.deinit();
-        const bid_one = byte_cache.nextResultId();
-        const bid_two = byte_cache.nextResultId();
+        const bid_one = byte_cache.allocNextResultId();
+        const bid_two = byte_cache.allocNextResultId();
         try byte_cache.putCloned(FileId.fromInt(10), bid_one, &.{ 0, 0, 3, 1, 0 });
         try byte_cache.putCloned(FileId.fromInt(11), bid_two, &.{ 1, 0, 4, 2, 0 });
         try std.testing.expect(byte_cache.getMatchingResult(FileId.fromInt(10), &bid_one) == null);
@@ -9225,19 +9376,19 @@ test "lsp_pipelined_cancel_request_and_semantic_tokens_lru_cache" {
 
         const frames = try extractTestOutboundPayloads(allocator, out_alloc.written());
         defer allocator.free(frames);
-        var saw_cancelled_7 = false;
+        var has_seen_cancelled_7 = false;
         for (frames) |frame_json| {
             if (std.mem.indexOf(u8, frame_json, "\"id\":7") != null and
                 std.mem.indexOf(u8, frame_json, "-32800") != null)
             {
-                saw_cancelled_7 = true;
+                has_seen_cancelled_7 = true;
             }
         }
-        try std.testing.expect(saw_cancelled_7);
+        try std.testing.expect(has_seen_cancelled_7);
     }
 }
 
-test "lsp_hover_dr17_bullets_doc_trivia_and_dot_completion" {
+test "test_lsp_hover_dr17_bullets_doc_trivia_and_dot_completion" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -9317,7 +9468,7 @@ test "lsp_hover_dr17_bullets_doc_trivia_and_dot_completion" {
     try std.testing.expect(std.mem.indexOf(u8, comp_resp, "\"label\":\"y_val\"") != null);
 }
 
-test "lsp_shorthand_init_and_se15_pattern_rename_plus_dr03_and_collision_hygiene" {
+test "test_lsp_shorthand_init_and_se15_pattern_rename_plus_dr03_and_collision_hygiene" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -9413,7 +9564,7 @@ test "lsp_shorthand_init_and_se15_pattern_rename_plus_dr03_and_collision_hygiene
     try std.testing.expect(std.mem.indexOf(u8, frames[5], "-32803") != null);
 }
 
-test "lsp_redteam_oversized_content_length_overflow_and_halt" {
+test "test_lsp_redteam_oversized_content_length_overflow_and_halt" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -9430,8 +9581,10 @@ test "lsp_redteam_oversized_content_length_overflow_and_halt" {
 
     // [2] `extractTestOutboundPayloads` must not overflow `usize` on `usize.max` `Content-Length`:
     {
-        const bad_wire = "Content-Length: 18446744073709551615\r\n\r\nx";
-        const empty_payloads = try extractTestOutboundPayloads(allocator, bad_wire);
+        const empty_payloads = try extractTestOutboundPayloads(
+            allocator,
+            "Content-Length: 18446744073709551615\r\n\r\nx",
+        );
         defer allocator.free(empty_payloads);
         try std.testing.expectEqual(@as(usize, 0), empty_payloads.len);
     }
@@ -9486,7 +9639,7 @@ test "lsp_redteam_oversized_content_length_overflow_and_halt" {
     }
 }
 
-test "lsp_redteam_257_overlay_lru_eviction_formatting_and_did_change" {
+test "test_lsp_redteam_257_overlay_lru_eviction_formatting_and_did_change" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -9594,7 +9747,7 @@ test "lsp_redteam_257_overlay_lru_eviction_formatting_and_did_change" {
     try std.testing.expect(std.mem.indexOf(u8, frames[3], "\"result\":[]") != null);
 }
 
-test "lsp_redteam_early_cutoff_shrunk_fn_stale_cst_references_rename_hover" {
+test "test_lsp_redteam_early_cutoff_shrunk_fn_stale_cst_references_rename_hover" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -9705,7 +9858,7 @@ test "lsp_redteam_early_cutoff_shrunk_fn_stale_cst_references_rename_hover" {
     try std.testing.expect(std.mem.indexOf(u8, frames[4], "\"newText\":\"renamed_inline\"") != null);
 }
 
-test "lsp_redteam_readonly_pkg_guards_and_non_empty_code_action_edits" {
+test "test_lsp_redteam_readonly_pkg_guards_and_non_empty_code_action_edits" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -9809,7 +9962,7 @@ test "lsp_redteam_readonly_pkg_guards_and_non_empty_code_action_edits" {
     }
 }
 
-test "lsp_redteam_dr22_slice_ptr_methods_and_soa_private_field_visibility" {
+test "test_lsp_redteam_dr22_slice_ptr_methods_and_soa_private_field_visibility" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -9940,7 +10093,7 @@ test "lsp_redteam_dr22_slice_ptr_methods_and_soa_private_field_visibility" {
     try std.testing.expect(std.mem.indexOf(u8, frames[6], "\"label\":\"as_mut_ptr\"") != null);
 }
 
-test "lsp_redteam_rename_deleted_local_and_shifted_fn_shadowing_hazard" {
+test "test_lsp_redteam_rename_deleted_local_and_shifted_fn_shadowing_hazard" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -10089,7 +10242,7 @@ test "lsp_redteam_rename_deleted_local_and_shifted_fn_shadowing_hazard" {
     try std.testing.expect(std.mem.indexOf(u8, frames[6], "-32803") != null);
 }
 
-test "lsp_redteam_collect_file_diagnostics_hashmap_rehash_no_uaf" {
+test "test_lsp_redteam_collect_file_diagnostics_hashmap_rehash_no_uaf" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 

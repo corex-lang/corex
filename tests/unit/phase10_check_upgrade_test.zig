@@ -45,16 +45,27 @@ var next_scratch_seq: std.atomic.Value(u32) = .init(1);
 
 /// Creates a fresh `.zig-cache/phase10_test_<label>_<seq>` scratch directory on disk.
 fn createScratchDir(allocator: std.mem.Allocator, io: std.Io, label: []const u8) ![]u8 {
-    const seq_num = next_scratch_seq.fetchAdd(1, .monotonic);
     const dir_path = try std.fmt.allocPrint(
         allocator,
         ".zig-cache/phase10_test_{s}_{d}",
-        .{ label, seq_num },
+        .{ label, next_scratch_seq.fetchAdd(1, .monotonic) },
     );
     errdefer allocator.free(dir_path);
     std.Io.Dir.cwd().deleteTree(io, dir_path) catch {};
     try std.Io.Dir.cwd().createDirPath(io, dir_path);
     return dir_path;
+}
+
+/// Writes `content` to `<base_dir>/<rel_path>` and frees the temporary joined path buffer immediately.
+fn writeScratchFileDiscard(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    base_dir: []const u8,
+    rel_path: []const u8,
+    content: []const u8,
+) !void {
+    const joined_path = try writeScratchFile(allocator, io, base_dir, rel_path, content);
+    allocator.free(joined_path);
 }
 
 /// Removes `dir_path` recursively and frees the heap-allocated path string.
@@ -224,7 +235,7 @@ test "test_cli_check_w0202_lints_scoped_allow_fix_and_deny_warnings" {
     try std.testing.expectEqual(@as(u8, 1), deny_res.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, deny_res.stderr, "✗ check failed:") != null);
     try std.testing.expect(
-        std.mem.indexOf(u8, deny_res.stderr, "warning(s) treated as errors due to '--deny-warnings'") != null,
+        std.mem.indexOf(u8, deny_res.stderr, "warning(s) treated as errors due to `--deny-warnings`") != null,
     );
 
     // [4] `corex check --fix` rewrites in-place preserving comments and `@allow(W0202)` items:
@@ -416,7 +427,7 @@ test "test_cli_check_deprecated_w0403_caps_table_and_explain_caps" {
     try std.testing.expectEqualStrings(st_exp_eq.stdout, st_exp_space.stdout);
 
     // [3] `corex.toml` Workspace mode `--caps` and `--explain-caps` (`=` and space-separated):
-    const dep_root_p = try writeScratchFile(
+    try writeScratchFileDiscard(
         allocator,
         io,
         reg_dir,
@@ -426,15 +437,13 @@ test "test_cli_check_deprecated_w0403_caps_table_and_explain_caps" {
             "    return unsafe { host_ping() };\n" ++
             "}\n",
     );
-    defer allocator.free(dep_root_p);
-    const idx_p = try writeScratchFile(
+    try writeScratchFileDiscard(
         allocator,
         io,
         reg_dir,
         "ff/i-/ffi-bridge",
         "{\"name\":\"ffi-bridge\",\"vers\":\"1.0.0\",\"deps\":[],\"features\":{\"default\":[]}}\n",
     );
-    defer allocator.free(idx_p);
 
     const ws_toml = try writeScratchFile(
         allocator,
@@ -445,7 +454,7 @@ test "test_cli_check_deprecated_w0403_caps_table_and_explain_caps" {
             "[dependencies]\nffi-bridge = \"^1.0.0\"\n",
     );
     defer allocator.free(ws_toml);
-    const ws_main = try writeScratchFile(
+    try writeScratchFileDiscard(
         allocator,
         io,
         scratch_dir,
@@ -456,7 +465,6 @@ test "test_cli_check_deprecated_w0403_caps_table_and_explain_caps" {
             "    return ping_bridge() +% local_pure(2);\n" ++
             "}\n",
     );
-    defer allocator.free(ws_main);
 
     const mp_flag = try std.fmt.allocPrint(allocator, "--manifest-path={s}", .{ws_toml});
     defer allocator.free(mp_flag);
@@ -567,8 +575,13 @@ test "test_cli_upgrade_list_explain_surgical_rule_check_and_accept_caps" {
     try std.testing.expect(std.mem.indexOf(u8, exp_bad.stderr, "E0001") != null);
 
     // [2] Surgical `corex upgrade --rule=UR-21-00` rewrites only `std::` -> `cx.`, leaving `Option` & `-> unit`:
-    const surgical_src = "use std::io;\npub fn keep_shape(opt_v: Option[i32]) -> unit {}\n";
-    const surgical_path = try writeScratchFile(allocator, io, scratch_dir, "surgical.cx", surgical_src);
+    const surgical_path = try writeScratchFile(
+        allocator,
+        io,
+        scratch_dir,
+        "surgical.cx",
+        "use std::io;\npub fn keep_shape(opt_v: Option[i32]) -> unit {}\n",
+    );
     defer allocator.free(surgical_path);
 
     var surgical_res = try runCliCaptured(
@@ -678,7 +691,7 @@ test "test_cli_upgrade_list_explain_surgical_rule_check_and_accept_caps" {
     );
 
     // [4] `--accept-caps` updates `corex.toml`/`corex.lock`, and NEVER overrides explicit `deny_caps`:
-    const cap_dep_root = try writeScratchFile(
+    try writeScratchFileDiscard(
         allocator,
         io,
         reg_dir,
@@ -688,15 +701,13 @@ test "test_cli_upgrade_list_explain_surgical_rule_check_and_accept_caps" {
             "    return unsafe { raw_cap_call() };\n" ++
             "}\n",
     );
-    defer allocator.free(cap_dep_root);
-    const cap_dep_idx = try writeScratchFile(
+    try writeScratchFileDiscard(
         allocator,
         io,
         reg_dir,
         "ca/p-/cap-lib",
         "{\"name\":\"cap-lib\",\"vers\":\"1.0.0\",\"deps\":[],\"features\":{\"default\":[]}}\n",
     );
-    defer allocator.free(cap_dep_idx);
 
     const caps_ws_dir = try std.fmt.allocPrint(allocator, "{s}/caps_ws", .{scratch_dir});
     defer allocator.free(caps_ws_dir);
@@ -709,31 +720,32 @@ test "test_cli_upgrade_list_explain_surgical_rule_check_and_accept_caps" {
             "[dependencies]\ncap-lib = { version = \"1.0.0\", allow_caps = [\"ffi\"] }\n",
     );
     defer allocator.free(caps_toml_path);
-    const caps_main_path = try writeScratchFile(
+    try writeScratchFileDiscard(
         allocator,
         io,
         caps_ws_dir,
         "src/main.cx",
         "use cap_lib.run_cap;\npub fn main() -> i32 { return run_cap(); }\n",
     );
-    defer allocator.free(caps_main_path);
 
     var lock_interner = try StringInterner.init(allocator);
     defer lock_interner.deinit();
-    const sem_100 = (try pkg_manifest.SemVer.parse(&lock_interner, "1.0.0")).?;
     const lock_pkgs = [_]pkg_manifest.LockPackage{.{
         .name = try lock_interner.intern("cap-lib"),
-        .version = sem_100,
+        .version = (try pkg_manifest.SemVer.parse(&lock_interner, "1.0.0")).?,
         .source = try lock_interner.intern("registry+https://index.corexlang.dev"),
         .tree_hash = @splat(0x33),
         .max_caps = .{ .ffi = true },
         .cxi_blake3 = @splat(0x44),
     }};
-    const init_lock = pkg_manifest.Lockfile{
-        .root_manifest_blake3 = @splat(0x11),
-        .packages = &lock_pkgs,
-    };
-    const init_lock_bytes = try pkg_manifest.serializeLockfile(allocator, &init_lock, &lock_interner);
+    const init_lock_bytes = try pkg_manifest.serializeLockfile(
+        allocator,
+        &(pkg_manifest.Lockfile{
+            .root_manifest_blake3 = @splat(0x11),
+            .packages = &lock_pkgs,
+        }),
+        &lock_interner,
+    );
     defer allocator.free(init_lock_bytes);
     const caps_lock_path = try writeScratchFile(allocator, io, caps_ws_dir, "corex.lock", init_lock_bytes);
     defer allocator.free(caps_lock_path);
@@ -769,7 +781,7 @@ test "test_cli_upgrade_list_explain_surgical_rule_check_and_accept_caps" {
     );
 
     // Explicit `deny_caps = ["unsafe_op"]` must NEVER be overridden even by bare `--accept-caps`:
-    const deny_toml_path = try writeScratchFile(
+    try writeScratchFileDiscard(
         allocator,
         io,
         caps_ws_dir,
@@ -778,7 +790,6 @@ test "test_cli_upgrade_list_explain_surgical_rule_check_and_accept_caps" {
             "[dependencies]\ncap-lib = { version = \"1.0.0\", allow_caps = [\"ffi\"] }\n\n" ++
             "[security]\ndeny_caps = [\"unsafe_op\"]\n",
     );
-    defer allocator.free(deny_toml_path);
 
     var denied_res = try runCliCaptured(
         allocator,
@@ -816,4 +827,385 @@ test "test_cli_upgrade_list_explain_surgical_rule_check_and_accept_caps" {
     try std.testing.expect(
         std.mem.indexOf(u8, lsp_pos_err.stderr, "unexpected positional argument `unexpected_file.cx`") != null,
     );
+}
+
+test "test_phase10_w0202_precedence_ur2204_array_multifile_upgrade_and_accept_caps_check" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const scratch_dir = try createScratchDir(allocator, io, "hardening_reg");
+    defer cleanupScratchDir(allocator, io, scratch_dir);
+
+    const home_dir = try std.fmt.allocPrint(allocator, "{s}/home", .{scratch_dir});
+    defer allocator.free(home_dir);
+    const reg_dir = try std.fmt.allocPrint(allocator, "{s}/reg", .{scratch_dir});
+    defer allocator.free(reg_dir);
+    try std.Io.Dir.cwd().createDirPath(io, home_dir);
+    try std.Io.Dir.cwd().createDirPath(io, reg_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("COREX_HOME", home_dir);
+    try env_map.put("COREX_REGISTRY_DIR", reg_dir);
+
+    // [1] `W0202` `corex check --fix` preserves `(a or b) and c`, `(a and b) |> tap`, `(a == b) == c`, and `if ({ … })`:
+    const w0202_prec_src =
+        "pub fn eval_guard(flag_a: bool, flag_b: bool, flag_c: bool) -> bool {\n" ++
+        "    return (flag_a or flag_b) == true and flag_c;\n" ++
+        "}\n\n" ++
+        "pub fn tap_bool(flag_v: bool) -> bool {\n" ++
+        "    return flag_v;\n" ++
+        "}\n\n" ++
+        "pub fn eval_pipe(flag_a: bool, flag_b: bool) -> bool {\n" ++
+        "    return ((flag_a and flag_b) == true) |> tap_bool();\n" ++
+        "}\n\n" ++
+        "pub fn eval_eq_chain(flag_a: bool, flag_b: bool, flag_c: bool) -> bool {\n" ++
+        "    return ((flag_a == flag_b) == true) == flag_c;\n" ++
+        "}\n\n" ++
+        "pub fn eval_block_if(seed: i32) -> i32 {\n" ++
+        "    if ({\n" ++
+        "        let is_ok = seed > 0;\n" ++
+        "        is_ok\n" ++
+        "    }) == true {\n" ++
+        "        return 1;\n" ++
+        "    }\n" ++
+        "    return 0;\n" ++
+        "}\n\n" ++
+        "pub const VERIFY_GUARD_TRUTH: bool = comptime {\n" ++
+        "    @compile_assert(not eval_guard(true, false, false));\n" ++
+        "    @compile_assert(eval_guard(true, false, true));\n" ++
+        "    true\n" ++
+        "};\n";
+    const w0202_prec_path = try writeScratchFile(allocator, io, scratch_dir, "w0202_prec.cx", w0202_prec_src);
+    defer allocator.free(w0202_prec_path);
+
+    {
+        var mem_db = try corex.CompilerDb.init(allocator);
+        defer mem_db.deinit();
+        const mem_fid = corex.FileId.fromInt(1);
+        _ = try mem_db.setInput(mem_fid, w0202_prec_src, .low);
+        const mem_fix_rep = try corex.check_audit.applyCheckFixesOnDb(allocator, &mem_db, .{
+            .is_writing_to_disk = false,
+            .candidate_files = &.{mem_fid},
+        });
+        try std.testing.expect(!mem_fix_rep.is_rolled_back);
+        try std.testing.expect(mem_fix_rep.applied_fix_count >= 4);
+    }
+
+    var prec_fix_res = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--fix", w0202_prec_path },
+    );
+    defer prec_fix_res.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), prec_fix_res.exit_code);
+
+    const prec_after = try readDiskFileAlloc(allocator, io, w0202_prec_path);
+    defer allocator.free(prec_after);
+    try std.testing.expect(std.mem.indexOf(u8, prec_after, "return (flag_a or flag_b) and flag_c;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prec_after, "flag_a or flag_b and flag_c") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prec_after, "(flag_a and flag_b) |> tap_bool()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prec_after, "(flag_a == flag_b) == flag_c") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prec_after, "== true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prec_after, "let is_ok = seed > 0;") != null);
+
+    var prec_verify_res = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--deny-warnings", w0202_prec_path },
+    );
+    defer prec_verify_res.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), prec_verify_res.exit_code);
+
+    // [2] `UR-22-04` preserves `[u8; 16]` array types while upgrading `;` fields, `*const u8`, & per-arg `.ptr`:
+    const ur2204_src =
+        "pub struct PacketHeader {\n" ++
+        "    pub raw_ptr: *const u8;\n" ++
+        "    pub header: [u8; 16];\n" ++
+        "    pub tag_id: u32;\n" ++
+        "}\n\n" ++
+        "pub fn inspect_ptrs(ro_ptr: *u8, rw_ptr: *mut u8) -> usize {\n" ++
+        "    let _ = ro_ptr;\n" ++
+        "    let _ = rw_ptr;\n" ++
+        "    return 16;\n" ++
+        "}\n\n" ++
+        "pub fn pass_array_ptrs() -> usize {\n" ++
+        "    var first_buf: [u8; 4] = [0, 0, 0, 0];\n" ++
+        "    var second_buf: [u8; 4] = [1, 1, 1, 1];\n" ++
+        "    return inspect_ptrs(first_buf.ptr, second_buf.ptr);\n" ++
+        "}\n";
+    const ur2204_path = try writeScratchFile(allocator, io, scratch_dir, "ur2204_array.cx", ur2204_src);
+    defer allocator.free(ur2204_path);
+
+    var ur2204_upg = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "upgrade", ur2204_path },
+    );
+    defer ur2204_upg.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), ur2204_upg.exit_code);
+
+    const ur2204_after = try readDiskFileAlloc(allocator, io, ur2204_path);
+    defer allocator.free(ur2204_after);
+    try std.testing.expect(std.mem.indexOf(u8, ur2204_after, "pub raw_ptr: *u8,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ur2204_after, "pub header: [u8; 16],") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ur2204_after, "[u8, 16]") == null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, ur2204_after, "inspect_ptrs(first_buf.as_ptr(), second_buf.as_mut_ptr())") != null,
+    );
+
+    var ur2204_check = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--deny-warnings", ur2204_path },
+    );
+    defer ur2204_check.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), ur2204_check.exit_code);
+
+    // [3] Multi-file workspace `corex upgrade` resolves `mod legacy;` `@deprecated` + syncs `corex.lock` hash:
+    const multi_ws_dir = try std.fmt.allocPrint(allocator, "{s}/multi_ws", .{scratch_dir});
+    defer allocator.free(multi_ws_dir);
+    const multi_toml_path = try writeScratchFile(
+        allocator,
+        io,
+        multi_ws_dir,
+        "corex.toml",
+        "[package]\nname = \"multi-upg\"\nversion = \"0.1.0\"\nedition = \"2026\"\n",
+    );
+    defer allocator.free(multi_toml_path);
+    try writeScratchFileDiscard(
+        allocator,
+        io,
+        multi_ws_dir,
+        "src/legacy.cx",
+        "pub fn modern(val: i32) -> i32 {\n" ++
+            "    return val +% 5;\n" ++
+            "}\n\n" ++
+            "@deprecated(since: \"0.2.0\", reason: \"use modern\", upgrade: \"modern($0)\")\n" ++
+            "pub fn old_api(val: i32) -> i32 {\n" ++
+            "    return modern(val);\n" ++
+            "}\n",
+    );
+    const multi_main_path = try writeScratchFile(
+        allocator,
+        io,
+        multi_ws_dir,
+        "src/main.cx",
+        "mod legacy;\n\n" ++
+            "pub fn main() -> i32 {\n" ++
+            "    return legacy.old_api(10);\n" ++
+            "}\n",
+    );
+    defer allocator.free(multi_main_path);
+
+    const multi_mp_flag = try std.fmt.allocPrint(allocator, "--manifest-path={s}", .{multi_toml_path});
+    defer allocator.free(multi_mp_flag);
+    var seed_lock_check = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", multi_mp_flag },
+    );
+    defer seed_lock_check.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), seed_lock_check.exit_code);
+
+    // Introduce legacy `name = "multi_upg"` and `edition = "2024"` so `corex.lock` hash must be synced on upgrade:
+    try writeScratchFileDiscard(
+        allocator,
+        io,
+        multi_ws_dir,
+        "corex.toml",
+        "[package]\nname = \"multi_upg\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+
+    var multi_upg_res = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "upgrade", multi_ws_dir },
+    );
+    defer multi_upg_res.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), multi_upg_res.exit_code);
+
+    const multi_main_after = try readDiskFileAlloc(allocator, io, multi_main_path);
+    defer allocator.free(multi_main_after);
+    try std.testing.expect(std.mem.indexOf(u8, multi_main_after, "old_api") == null);
+    try std.testing.expect(std.mem.indexOf(u8, multi_main_after, "modern(10)") != null);
+
+    var locked_after_upg = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--locked", "--deny-warnings", multi_mp_flag },
+    );
+    defer locked_after_upg.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), locked_after_upg.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, locked_after_upg.stderr, "E0014") == null);
+
+    // [4] `corex upgrade --check --accept-caps` exits `1` on capability drift (including legacy manifests):
+    try writeScratchFileDiscard(
+        allocator,
+        io,
+        reg_dir,
+        "packages/drift-lib-1.0.0/src/root.cx",
+        "extern \"C\" fn drift_ffi_call() -> i32;\n\n" ++
+            "pub fn invoke_drift() -> i32 {\n" ++
+            "    return unsafe { drift_ffi_call() };\n" ++
+            "}\n",
+    );
+    try writeScratchFileDiscard(
+        allocator,
+        io,
+        reg_dir,
+        "dr/if/drift-lib",
+        "{\"name\":\"drift-lib\",\"vers\":\"1.0.0\",\"deps\":[],\"features\":{\"default\":[]}}\n",
+    );
+
+    const drift_ws_dir = try std.fmt.allocPrint(allocator, "{s}/drift_ws", .{scratch_dir});
+    defer allocator.free(drift_ws_dir);
+    const legacy_drift_toml =
+        "[package]\nname = \"drift-app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n" ++
+        "[dev-dependencies]\ndrift-lib = { version = \"1.0.0\", allow_caps = [\"unsafe\"] }\n";
+    const drift_toml_path = try writeScratchFile(allocator, io, drift_ws_dir, "corex.toml", legacy_drift_toml);
+    defer allocator.free(drift_toml_path);
+    try writeScratchFileDiscard(
+        allocator,
+        io,
+        drift_ws_dir,
+        "src/main.cx",
+        "pub fn main() -> i32 {\n    return 0;\n}\n",
+    );
+
+    var drift_interner = try StringInterner.init(allocator);
+    defer drift_interner.deinit();
+    const drift_lock_pkgs = [_]pkg_manifest.LockPackage{.{
+        .name = try drift_interner.intern("drift-lib"),
+        .version = (try pkg_manifest.SemVer.parse(&drift_interner, "1.0.0")).?,
+        .source = try drift_interner.intern("registry+https://index.corexlang.dev"),
+        .tree_hash = @splat(0x55),
+        .max_caps = .{ .unsafe_op = true },
+        .cxi_blake3 = @splat(0x66),
+    }};
+    const drift_lock_bytes = try pkg_manifest.serializeLockfile(
+        allocator,
+        &(pkg_manifest.Lockfile{
+            .root_manifest_blake3 = @splat(0x22),
+            .packages = &drift_lock_pkgs,
+        }),
+        &drift_interner,
+    );
+    defer allocator.free(drift_lock_bytes);
+    try writeScratchFileDiscard(allocator, io, drift_ws_dir, "corex.lock", drift_lock_bytes);
+
+    var check_accept_res = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "upgrade", "--check", "--accept-caps", drift_ws_dir },
+    );
+    defer check_accept_res.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), check_accept_res.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, check_accept_res.stderr, "pending manifest migration") != null);
+    try std.testing.expect(std.mem.indexOf(u8, check_accept_res.stderr, "pending lockfile migration") != null);
+
+    // Ensure `--check --accept-caps` did not mutate `corex.toml` or `corex.lock` on disk:
+    const toml_unchanged = try readDiskFileAlloc(allocator, io, drift_toml_path);
+    defer allocator.free(toml_unchanged);
+    try std.testing.expectEqualStrings(legacy_drift_toml, toml_unchanged);
+
+    // Apply `corex upgrade --accept-caps` and verify subsequent `--check --accept-caps` exits `0`:
+    var apply_accept_res = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "upgrade", "--accept-caps", drift_ws_dir },
+    );
+    defer apply_accept_res.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), apply_accept_res.exit_code);
+
+    var clean_accept_check = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "upgrade", "--check", "--accept-caps", drift_ws_dir },
+    );
+    defer clean_accept_check.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), clean_accept_check.exit_code);
+
+    // Lockfile-only drift (`corex.toml` already canonical) still exits `1` under `--check --accept-caps`:
+    try writeScratchFileDiscard(allocator, io, drift_ws_dir, "corex.lock", drift_lock_bytes);
+    var lock_only_drift = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "upgrade", "--check", "--accept-caps", drift_ws_dir },
+    );
+    defer lock_only_drift.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), lock_only_drift.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, lock_only_drift.stderr, "pending lockfile migration") != null);
+
+    // [5] `UR-22-00` preserves `r"""\n\{raw\}\n"""` and `br"""\n\{bytes\}\n"""` inside `{ … }` while upgrading `::`:
+    const interp_src =
+        "pub mod tag_mod {\n" ++
+        "    pub fn pick(first_s: str, second_b: &[u8]) -> i32 {\n" ++
+        "        let _ = first_s;\n" ++
+        "        let _ = second_b;\n" ++
+        "        return 7;\n" ++
+        "    }\n" ++
+        "}\n\n" ++
+        "pub fn trigger_msg() -> never {\n" ++
+        "    @panic(\"\"\"\n" ++
+        "        val=\\{legacy\\}:{tag_mod::pick(\n" ++
+        "            r\"\"\"\n" ++
+        "            \\{raw\\}\n" ++
+        "            \"\"\",\n" ++
+        "            br\"\"\"\n" ++
+        "            \\{bytes\\}\n" ++
+        "            \"\"\",\n" ++
+        "        )}\n" ++
+        "        \"\"\");\n" ++
+        "}\n";
+    const interp_path = try writeScratchFile(allocator, io, scratch_dir, "interp_holes.cx", interp_src);
+    defer allocator.free(interp_path);
+
+    {
+        var mem_upg = try corex.upgrade_engine.upgradeSource(
+            allocator,
+            interp_src,
+            corex.FileId.fromInt(99),
+            .{},
+        );
+        defer mem_upg.deinit(allocator);
+        try std.testing.expect(mem_upg.is_changed);
+        try std.testing.expect(!mem_upg.is_rolled_back);
+    }
+
+    var interp_upg_res = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "upgrade", interp_path },
+    );
+    defer interp_upg_res.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), interp_upg_res.exit_code);
+
+    const interp_after = try readDiskFileAlloc(allocator, io, interp_path);
+    defer allocator.free(interp_after);
+    try std.testing.expect(std.mem.indexOf(u8, interp_after, "val={{legacy}}:{tag_mod.pick(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, interp_after, "tag_mod::pick") == null);
+    try std.testing.expect(std.mem.indexOf(u8, interp_after, "\\{raw\\}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, interp_after, "\\{bytes\\}") != null);
+
+    var interp_chk_res = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--deny-warnings", interp_path },
+    );
+    defer interp_chk_res.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), interp_chk_res.exit_code);
 }

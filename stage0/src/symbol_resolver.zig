@@ -151,15 +151,15 @@ pub const ScopeFlags = packed struct(u8) {
 /// 1-byte bit-packed lint suppression mask inherited down lexical scope chains via `@allow(…)`.
 pub const AllowLintMask = packed struct(u8) {
     /// Suppresses `W0201` (`non_canonical_case`) identifier casing warnings.
-    allow_case_w0201: bool = false,
+    has_allow_case_w0201: bool = false,
     /// Suppresses `W0202` (`idiom` / `style` / `non_idiomatic`) construct warnings.
-    allow_idiom_w0202: bool = false,
+    has_allow_idiom_w0202: bool = false,
     /// Suppresses `W0401` (`unreachable_pattern`) redundant `match` arm warnings.
-    allow_unreachable_w0401: bool = false,
+    has_allow_unreachable_w0401: bool = false,
     /// Suppresses `W0402` (`unused` / `unused_binding` / `unused_variables`) binding warnings.
-    allow_unused_w0402: bool = false,
+    has_allow_unused_w0402: bool = false,
     /// Suppresses `W0403` (`deprecated`) deprecated symbol reference warnings.
-    allow_deprecated_w0403: bool = false,
+    has_allow_deprecated_w0403: bool = false,
     /// Reserved zero padding (`0`).
     reserved: u3 = 0,
 
@@ -185,11 +185,11 @@ pub const AllowLintMask = packed struct(u8) {
     /// Returns `true` when `self` suppresses `code`.
     pub inline fn isCodeAllowed(self: AllowLintMask, code: DiagnosticCode) bool {
         return switch (code) {
-            .w0201_non_canonical_identifier_case => self.allow_case_w0201,
-            .w0202_non_idiomatic_construct => self.allow_idiom_w0202,
-            .w0401_unreachable_pattern_arm => self.allow_unreachable_w0401,
-            .w0402_unused_binding => self.allow_unused_w0402,
-            .w0403_deprecated_symbol => self.allow_deprecated_w0403,
+            .w0201_non_canonical_identifier_case => self.has_allow_case_w0201,
+            .w0202_non_idiomatic_construct => self.has_allow_idiom_w0202,
+            .w0401_unreachable_pattern_arm => self.has_allow_unreachable_w0401,
+            .w0402_unused_binding => self.has_allow_unused_w0402,
+            .w0403_deprecated_symbol => self.has_allow_deprecated_w0403,
             else => false,
         };
     }
@@ -1466,20 +1466,20 @@ pub const ALLOW_LINT_NAMES = [_][]const u8{
 
 /// $O(1)$ static lookup map from scoped `@allow(…)` lint identifiers to `AllowLintMask` bits.
 pub const ALLOW_LINT_NAME_MAP = std.StaticStringMap(AllowLintMask).initComptime(.{
-    .{ "W0201", AllowLintMask{ .allow_case_w0201 = true } },
-    .{ "W0202", AllowLintMask{ .allow_idiom_w0202 = true } },
-    .{ "W0401", AllowLintMask{ .allow_unreachable_w0401 = true } },
-    .{ "W0402", AllowLintMask{ .allow_unused_w0402 = true } },
-    .{ "W0403", AllowLintMask{ .allow_deprecated_w0403 = true } },
-    .{ "deprecated", AllowLintMask{ .allow_deprecated_w0403 = true } },
-    .{ "idiom", AllowLintMask{ .allow_idiom_w0202 = true } },
-    .{ "non_canonical_case", AllowLintMask{ .allow_case_w0201 = true } },
-    .{ "non_idiomatic", AllowLintMask{ .allow_idiom_w0202 = true } },
-    .{ "style", AllowLintMask{ .allow_idiom_w0202 = true } },
-    .{ "unreachable_pattern", AllowLintMask{ .allow_unreachable_w0401 = true } },
-    .{ "unused", AllowLintMask{ .allow_unused_w0402 = true } },
-    .{ "unused_binding", AllowLintMask{ .allow_unused_w0402 = true } },
-    .{ "unused_variables", AllowLintMask{ .allow_unused_w0402 = true } },
+    .{ "W0201", AllowLintMask{ .has_allow_case_w0201 = true } },
+    .{ "W0202", AllowLintMask{ .has_allow_idiom_w0202 = true } },
+    .{ "W0401", AllowLintMask{ .has_allow_unreachable_w0401 = true } },
+    .{ "W0402", AllowLintMask{ .has_allow_unused_w0402 = true } },
+    .{ "W0403", AllowLintMask{ .has_allow_deprecated_w0403 = true } },
+    .{ "deprecated", AllowLintMask{ .has_allow_deprecated_w0403 = true } },
+    .{ "idiom", AllowLintMask{ .has_allow_idiom_w0202 = true } },
+    .{ "non_canonical_case", AllowLintMask{ .has_allow_case_w0201 = true } },
+    .{ "non_idiomatic", AllowLintMask{ .has_allow_idiom_w0202 = true } },
+    .{ "style", AllowLintMask{ .has_allow_idiom_w0202 = true } },
+    .{ "unreachable_pattern", AllowLintMask{ .has_allow_unreachable_w0401 = true } },
+    .{ "unused", AllowLintMask{ .has_allow_unused_w0402 = true } },
+    .{ "unused_binding", AllowLintMask{ .has_allow_unused_w0402 = true } },
+    .{ "unused_variables", AllowLintMask{ .has_allow_unused_w0402 = true } },
 });
 
 /// $O(1)$ static lookup map from built-in `@derive` trait identifiers to `DeriveMask` bits.
@@ -3122,6 +3122,135 @@ fn collectItemSliceInScopeWithOrdinal(
             }
         }
     }
+}
+
+/// Returns `true` if `sink` already contains a diagnostic with `code` overlapping `span`.
+fn hasDiagnosticAtSpan(sink: *const DiagnosticSink, code: DiagnosticCode, span: Span) bool {
+    for (sink.asSlice()) |existing| {
+        if (existing.code == code and
+            existing.primary_span.file_id == span.file_id and
+            existing.primary_span.start_byte <= span.end_byte and
+            span.start_byte <= existing.primary_span.end_byte)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Emits deduplicated `E0403` for a malformed, blanket, or unknown `@allow(…)` attribute argument.
+fn emitInvalidAllowAttrDiagnostic(
+    sink: ?*DiagnosticSink,
+    span: Span,
+    message: []const u8,
+    primary_label: []const u8,
+    bad_lint_name: ?[]const u8,
+) !void {
+    const active_sink = sink orelse return;
+    if (span.file_id.isNone()) return;
+    if (hasDiagnosticAtSpan(active_sink, .e0403_unresolved_symbol, span)) return;
+
+    const arena_alloc = active_sink.arena.asAllocator();
+    const msg_owned = try arena_alloc.dupe(u8, message);
+    const label_owned = try arena_alloc.dupe(u8, primary_label);
+    const labels = [1]LabeledSpan{
+        .{ .span = span, .label = label_owned, .style = .primary },
+    };
+
+    var best_suggestion: ?[]const u8 = null;
+    if (bad_lint_name) |bad_name| {
+        if (bad_name.len >= 2 and !std.mem.eql(u8, bad_name, "all") and !std.mem.eql(u8, bad_name, "warnings")) {
+            var best_dist: u16 = 4;
+            for (ALLOW_LINT_NAMES) |cand| {
+                const dist = computeEditDistance(bad_name, cand);
+                if (dist > 0 and dist < best_dist) {
+                    best_dist = dist;
+                    best_suggestion = cand;
+                }
+            }
+        }
+    }
+
+    if (best_suggestion) |suggested| {
+        const notes = [1][]const u8{
+            try std.fmt.allocPrint(arena_alloc, "help: did you mean `{s}`?", .{suggested}),
+        };
+        _ = try active_sink.emit(.{
+            .code = .e0403_unresolved_symbol,
+            .severity = .err,
+            .primary_span = span,
+            .message = msg_owned,
+            .labels = &labels,
+            .notes = &notes,
+        });
+    } else {
+        _ = try active_sink.emit(.{
+            .code = .e0403_unresolved_symbol,
+            .severity = .err,
+            .primary_span = span,
+            .message = msg_owned,
+            .labels = &labels,
+        });
+    }
+}
+
+/// Decodes and interns an attribute string literal token `str_tok` into `interner` (`SymbolId.empty` when `interner == null`).
+fn internDecodedAttrStringToken(
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    str_tok: TokenIndex,
+    interner_opt: ?*StringInterner,
+) !SymbolId {
+    const str_interner = interner_opt orelse return .empty;
+    const raw_str = extractTokenSlice(source, token_buffer, str_tok);
+    if (raw_str.len == 0) return .empty;
+    var stack_buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
+    if (lexer.cookStringLiteral(fba.allocator(), raw_str)) |cooked_stack| {
+        return str_interner.intern(cooked_stack);
+    } else |_| {}
+    const backing = str_interner.backing_allocator;
+    if (lexer.cookStringLiteral(backing, raw_str)) |cooked_heap| {
+        defer backing.free(cooked_heap);
+        return str_interner.intern(cooked_heap);
+    } else |_| {
+        var unesc_buf: [256]u8 = undefined;
+        return str_interner.intern(unquoteAttrStringLexeme(raw_str, &unesc_buf));
+    }
+}
+
+/// Emits `W0403` into `sink` when `raw_sym_idx` unwraps to a `@deprecated` symbol and `is_suppressed` is `false`.
+fn emitUseOrPathDeprecatedIfNeeded(
+    sym_table: *const SymbolTable,
+    interner: *const StringInterner,
+    caller_scope: ScopeId,
+    is_suppressed: bool,
+    raw_sym_idx: SymbolIndex,
+    ref_span: Span,
+    diagnostic_sink: ?*DiagnosticSink,
+) !void {
+    if (is_suppressed or raw_sym_idx.isNone() or ref_span.file_id.isNone()) return;
+    const sink = diagnostic_sink orelse return;
+    if (sym_table.scope_arena.isInsideDeprecated(caller_scope)) return;
+    if (sym_table.getScopeAllowMask(caller_scope).has_allow_deprecated_w0403) return;
+
+    const target_idx = if (sym_table.getDeprecatedMeta(raw_sym_idx) != null)
+        raw_sym_idx
+    else
+        sym_table.unwrapAliasSymbolIdx(raw_sym_idx);
+    const meta = sym_table.getDeprecatedMeta(target_idx) orelse return;
+    if (!meta.is_deprecated) return;
+
+    for (sink.asSlice()) |existing| {
+        if (existing.code == .w0403_deprecated_symbol and
+            existing.primary_span.file_id == ref_span.file_id and
+            existing.primary_span.start_byte == ref_span.start_byte and
+            existing.primary_span.end_byte == ref_span.end_byte)
+        {
+            return;
+        }
+    }
+    try emitDeprecatedSymbolWarning(sink, interner, sym_table.getSymbol(target_idx), meta, ref_span, null);
 }
 
 // ------------------------------------- PUBLIC API --------------------------------------
@@ -5102,14 +5231,14 @@ pub const SymbolTable = struct {
         interner: *StringInterner,
         diagnostic_sink: *DiagnosticSink,
     ) !void {
-        if (self.getScopeAllowMask(scope_id).allow_unused_w0402) return;
+        if (self.getScopeAllowMask(scope_id).has_allow_unused_w0402) return;
         for (self.getScopeMembers(scope_id)) |sym_idx| {
             const sym = self.getSymbol(sym_idx);
             if (sym.kind != .local_let_sym and sym.kind != .local_var_sym and sym.kind != .param_sym) {
                 continue;
             }
             if (sym.flags.is_used or sym.flags.is_builtin) continue;
-            if (self.getSymbolAllowMask(sym_idx).allow_unused_w0402) continue;
+            if (self.getSymbolAllowMask(sym_idx).has_allow_unused_w0402) continue;
             if (sym.name_text.len == 0 or
                 std.mem.startsWith(u8, sym.name_text, "_") or
                 std.mem.eql(u8, sym.name_text, "self"))
@@ -8250,20 +8379,6 @@ pub fn enforceExternalPackageCstHygiene(
     }
 }
 
-/// Returns `true` if `sink` already contains a diagnostic with `code` overlapping `span`.
-fn hasDiagnosticAtSpan(sink: *const DiagnosticSink, code: DiagnosticCode, span: Span) bool {
-    for (sink.asSlice()) |existing| {
-        if (existing.code == code and
-            existing.primary_span.file_id == span.file_id and
-            existing.primary_span.start_byte <= span.end_byte and
-            span.start_byte <= existing.primary_span.end_byte)
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
 /// Computes the bounding source `Span` of `cst_node` across all non-injected leaf tokens in its subtree.
 pub fn computeCstSubtreeSpan(
     file_id: FileId,
@@ -8298,61 +8413,6 @@ pub fn computeCstSubtreeSpan(
     }
     if (!has_tok or min_byte > max_byte) return null;
     return Span.init(file_id, min_byte, max_byte);
-}
-
-/// Emits deduplicated `E0403` for a malformed, blanket, or unknown `@allow(…)` attribute argument.
-fn emitInvalidAllowAttrDiagnostic(
-    sink: ?*DiagnosticSink,
-    span: Span,
-    message: []const u8,
-    primary_label: []const u8,
-    bad_lint_name: ?[]const u8,
-) !void {
-    const active_sink = sink orelse return;
-    if (span.file_id.isNone()) return;
-    if (hasDiagnosticAtSpan(active_sink, .e0403_unresolved_symbol, span)) return;
-
-    const arena_alloc = active_sink.arena.asAllocator();
-    const msg_owned = try arena_alloc.dupe(u8, message);
-    const label_owned = try arena_alloc.dupe(u8, primary_label);
-    const labels = [1]LabeledSpan{
-        .{ .span = span, .label = label_owned, .style = .primary },
-    };
-
-    var best_suggestion: ?[]const u8 = null;
-    if (bad_lint_name) |bad_name| {
-        if (bad_name.len >= 2 and !std.mem.eql(u8, bad_name, "all") and !std.mem.eql(u8, bad_name, "warnings")) {
-            var best_dist: u16 = 4;
-            for (ALLOW_LINT_NAMES) |cand| {
-                const dist = computeEditDistance(bad_name, cand);
-                if (dist > 0 and dist < best_dist) {
-                    best_dist = dist;
-                    best_suggestion = cand;
-                }
-            }
-        }
-    }
-
-    if (best_suggestion) |suggested| {
-        const note_str = try std.fmt.allocPrint(arena_alloc, "help: did you mean `{s}`?", .{suggested});
-        const notes = [1][]const u8{note_str};
-        _ = try active_sink.emit(.{
-            .code = .e0403_unresolved_symbol,
-            .severity = .err,
-            .primary_span = span,
-            .message = msg_owned,
-            .labels = &labels,
-            .notes = &notes,
-        });
-    } else {
-        _ = try active_sink.emit(.{
-            .code = .e0403_unresolved_symbol,
-            .severity = .err,
-            .primary_span = span,
-            .message = msg_owned,
-            .labels = &labels,
-        });
-    }
 }
 
 /// Extracts and validates scoped `@allow(…)` lint names inside `[arg_start .. attr_end)`, rejecting blanket suppressors (`E0403`).
@@ -8408,13 +8468,13 @@ pub fn extractAndValidateAllowAttrRange(
         if (tok_kind == .lparen) {
             paren_depth += 1;
             continue;
-        }
-        if (tok_kind == .rparen) {
+        } else if (tok_kind == .rparen) {
             if (paren_depth <= 1) break;
             paren_depth -= 1;
             continue;
+        } else if (tok_kind == .comma) {
+            continue;
         }
-        if (tok_kind == .comma) continue;
 
         seen_arg_count += 1;
         const tok_span = token_buffer.getTokenSpan(file_id, arg_leaf.token);
@@ -8434,8 +8494,7 @@ pub fn extractAndValidateAllowAttrRange(
                 null,
             );
             continue;
-        }
-        if (!isIdentifierToken(tok_kind)) {
+        } else if (!isIdentifierToken(tok_kind)) {
             try emitInvalidAllowAttrDiagnostic(
                 diagnostic_sink,
                 tok_span,
@@ -8444,8 +8503,7 @@ pub fn extractAndValidateAllowAttrRange(
                 null,
             );
             continue;
-        }
-        if (AllowLintMask.fromLintName(raw_lex)) |lint_bit| {
+        } else if (AllowLintMask.fromLintName(raw_lex)) |lint_bit| {
             mask = mask.merge(lint_bit);
         } else {
             var msg_buf: [200]u8 = undefined;
@@ -8476,31 +8534,6 @@ pub fn extractAndValidateAllowAttrRange(
     return mask;
 }
 
-/// Decodes and interns an attribute string literal token `str_tok` into `interner` (`SymbolId.empty` when `interner == null`).
-fn internDecodedAttrStringToken(
-    source: []const u8,
-    token_buffer: *const TokenBuffer,
-    str_tok: TokenIndex,
-    interner_opt: ?*StringInterner,
-) !SymbolId {
-    const str_interner = interner_opt orelse return .empty;
-    const raw_str = extractTokenSlice(source, token_buffer, str_tok);
-    if (raw_str.len == 0) return .empty;
-    var stack_buf: [4096]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
-    if (lexer.cookStringLiteral(fba.allocator(), raw_str)) |cooked_stack| {
-        return str_interner.intern(cooked_stack);
-    } else |_| {}
-    const backing = str_interner.backing_allocator;
-    if (lexer.cookStringLiteral(backing, raw_str)) |cooked_heap| {
-        defer backing.free(cooked_heap);
-        return str_interner.intern(cooked_heap);
-    } else |_| {
-        var unesc_buf: [256]u8 = undefined;
-        return str_interner.intern(unquoteAttrStringLexeme(raw_str, &unesc_buf));
-    }
-}
-
 /// Parses `@deprecated` and `@fix_inline` arguments inside `[arg_start .. attr_end)` into `meta_io` (`DR-14` §2.2).
 pub fn parseDeprecatedOrFixInlineAttrRange(
     source: []const u8,
@@ -8523,8 +8556,7 @@ pub fn parseDeprecatedOrFixInlineAttrRange(
         if (sub.subtree_size <= 1 and !sub.flags.is_missing_or_injected and
             !sub.token.isNone() and sub.token.asInt() < token_buffer.countTokens())
         {
-            const rec = token_buffer.getToken(sub.token);
-            if (!rec.flags.is_synthesized) end_tok = sub.token;
+            if (!token_buffer.getToken(sub.token).flags.is_synthesized) end_tok = sub.token;
         }
     }
     const attr_span: Span = if (!file_id.isNone() and !name_token.isNone() and
@@ -8573,31 +8605,27 @@ pub fn parseDeprecatedOrFixInlineAttrRange(
         if (tok_kind == .lparen) {
             paren_depth += 1;
             continue;
-        }
-        if (tok_kind == .rparen) {
+        } else if (tok_kind == .rparen) {
             if (paren_depth <= 1) break;
             paren_depth -= 1;
             continue;
-        }
-        if (paren_depth != 1) continue;
-        if (tok_kind == .comma) {
+        } else if (paren_depth != 1) {
+            continue;
+        } else if (tok_kind == .comma) {
             pending_key = "";
             has_key_sep = false;
             continue;
-        }
-        if ((tok_kind == .colon or tok_kind == .eq) and pending_key.len > 0) {
+        } else if ((tok_kind == .colon or tok_kind == .eq) and pending_key.len > 0) {
             has_key_sep = true;
             continue;
-        }
-        if (!has_key_sep and isIdentifierToken(tok_kind)) {
+        } else if (!has_key_sep and isIdentifierToken(tok_kind)) {
             const next_tok = peekNextAttrLeafToken(token_buffer, cst_arena, cur + 1, attr_end);
             const next_kind: TokenKind = if (!next_tok.isNone()) token_buffer.getToken(next_tok).kind else .eof;
             if (next_kind == .colon or next_kind == .eq) {
                 pending_key = extractTokenSlice(source, token_buffer, leaf.token);
                 continue;
             }
-        }
-        if (tok_kind == .string_lit) {
+        } else if (tok_kind == .string_lit) {
             const interned_val = try internDecodedAttrStringToken(source, token_buffer, leaf.token, interner_opt);
             if (has_key_sep) {
                 if (is_fix_inline) {
@@ -8652,8 +8680,9 @@ pub fn collectAllowedSpansFromCst(
             if (child_rec.kind == .visibility_modifier) {
                 child_cur += @max(@as(usize, child_rec.subtree_size), 1);
                 continue;
+            } else if (child_rec.kind != .attribute) {
+                break;
             }
-            if (child_rec.kind != .attribute) break;
 
             const attr_end = @min(child_cur + @max(@as(usize, child_rec.subtree_size), 1), owner_end);
             var at_tok: TokenIndex = .none;
@@ -8661,12 +8690,11 @@ pub fn collectAllowedSpansFromCst(
             while (attr_cur < attr_end) : (attr_cur += 1) {
                 const leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(attr_cur)));
                 if (leaf.subtree_size <= 1 and !leaf.token.isNone() and leaf.token.asInt() < total_tokens) {
-                    const lk = token_buffer.getToken(leaf.token).kind;
-                    if (lk == .at and at_tok.isNone()) {
+                    const leaf_kind = token_buffer.getToken(leaf.token).kind;
+                    if (leaf_kind == .at and at_tok.isNone()) {
                         at_tok = leaf.token;
                         continue;
-                    }
-                    if (isIdentifierToken(lk)) {
+                    } else if (isIdentifierToken(leaf_kind)) {
                         if (std.mem.eql(u8, extractTokenSlice(source, token_buffer, leaf.token), "allow")) {
                             const parsed = try extractAndValidateAllowAttrRange(
                                 source,
@@ -9711,40 +9739,6 @@ pub fn evaluateCstNodeCfgWithEnv(
     return is_all_enabled;
 }
 
-/// Emits `W0403` into `sink` when `raw_sym_idx` unwraps to a `@deprecated` symbol and `is_suppressed` is `false`.
-fn emitUseOrPathDeprecatedIfNeeded(
-    sym_table: *const SymbolTable,
-    interner: *const StringInterner,
-    caller_scope: ScopeId,
-    is_suppressed: bool,
-    raw_sym_idx: SymbolIndex,
-    ref_span: Span,
-    diagnostic_sink: ?*DiagnosticSink,
-) !void {
-    if (is_suppressed or raw_sym_idx.isNone() or ref_span.file_id.isNone()) return;
-    const sink = diagnostic_sink orelse return;
-    if (sym_table.scope_arena.isInsideDeprecated(caller_scope)) return;
-    if (sym_table.getScopeAllowMask(caller_scope).allow_deprecated_w0403) return;
-
-    const target_idx = if (sym_table.getDeprecatedMeta(raw_sym_idx) != null)
-        raw_sym_idx
-    else
-        sym_table.unwrapAliasSymbolIdx(raw_sym_idx);
-    const meta = sym_table.getDeprecatedMeta(target_idx) orelse return;
-    if (!meta.is_deprecated) return;
-
-    for (sink.asSlice()) |existing| {
-        if (existing.code == .w0403_deprecated_symbol and
-            existing.primary_span.file_id == ref_span.file_id and
-            existing.primary_span.start_byte == ref_span.start_byte and
-            existing.primary_span.end_byte == ref_span.end_byte)
-        {
-            return;
-        }
-    }
-    try emitDeprecatedSymbolWarning(sink, interner, sym_table.getSymbol(target_idx), meta, ref_span, null);
-}
-
 /// Resolves all queued `PendingUseImport` entries in `sym_table` for `file_id`.
 pub fn resolveFileUseImports(
     sym_table: *SymbolTable,
@@ -9787,7 +9781,7 @@ pub fn resolveFileUseImports(
         }
 
         const is_dep_suppressed = use_header_meta.extra_flags.is_deprecated or
-            use_header_meta.allow_mask.allow_deprecated_w0403;
+            use_header_meta.allow_mask.has_allow_deprecated_w0403;
         const root_idx: usize = pending.cst_node.asInt();
         const root_rec = cst_arena.getNode(pending.cst_node);
         const end_idx: usize = @min(

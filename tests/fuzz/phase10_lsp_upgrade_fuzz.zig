@@ -273,7 +273,7 @@ test "test_fuzz_lsp_jsonrpc_framing_and_untrusted_payloads" {
     var prng = std.Random.Xoroshiro128.init(0xC0AE_1010_F022_0001);
     const random = prng.random();
 
-    // [1] Dedicated boundary streams: oversized `> 8 KiB` headers, `> 16 MiB` lengths, & truncated EOF frames:
+    // [1] Dedicated boundary streams; oversized `> 8 KiB` headers, `> 16 MiB` lengths, & truncated EOF frames:
     {
         var oversized_hdr: std.ArrayListUnmanaged(u8) = .empty;
         defer oversized_hdr.deinit(allocator);
@@ -355,9 +355,9 @@ test "test_fuzz_lsp_jsonrpc_framing_and_untrusted_payloads" {
                     ];
                     const mutated = try allocator.dupe(u8, base_tmpl);
                     defer allocator.free(mutated);
-                    const mut_count = random.intRangeAtMost(usize, 1, 4);
                     var m_i: usize = 0;
-                    while (m_i < mut_count and mutated.len > 0) : (m_i += 1) {
+                    const mut_limit = random.intRangeAtMost(usize, 1, 4);
+                    while (m_i < mut_limit and mutated.len > 0) : (m_i += 1) {
                         const pos = random.intRangeLessThan(usize, 0, mutated.len);
                         const bad_bytes = [_]u8{ 0x00, 0x07, 0x1F, 0x80, 0xC0, 0xFF, '{', '[', '"', '\\', ':' };
                         mutated[pos] = bad_bytes[random.intRangeLessThan(usize, 0, bad_bytes.len)];
@@ -595,7 +595,7 @@ test "test_fuzz_vfs_incremental_edits_match_fresh_parse" {
         // Verify `SemanticTokensCache.init` and `initWithLimits(4, 96)` bounded LRU eviction:
         var default_sem_cache = try lsp_server.SemanticTokensCache.init(allocator);
         defer default_sem_cache.deinit();
-        const default_rid = default_sem_cache.nextResultId();
+        const default_rid = default_sem_cache.allocNextResultId();
         try default_sem_cache.putCloned(FileId.fromInt(1), default_rid, &.{ 0, 0, 3, 1, 0 });
         try std.testing.expect(default_sem_cache.getMatchingResult(FileId.fromInt(1), &default_rid) != null);
 
@@ -611,13 +611,12 @@ test "test_fuzz_vfs_incremental_edits_match_fresh_parse" {
                 0 => tight_sem_cache.removeFile(target_fid),
                 1 => _ = tight_sem_cache.getMatchingResult(target_fid, &active_ids[file_slot]),
                 else => {
-                    const tok_quads = random.intRangeAtMost(usize, 0, 7);
-                    const sample_tokens = try allocator.alloc(u32, tok_quads * 5);
+                    const sample_tokens = try allocator.alloc(u32, random.intRangeAtMost(usize, 0, 7) * 5);
                     defer allocator.free(sample_tokens);
                     for (sample_tokens, 0..) |*slot_ptr, idx| {
                         slot_ptr.* = @intCast(idx + sem_op);
                     }
-                    const next_rid = tight_sem_cache.nextResultId();
+                    const next_rid = tight_sem_cache.allocNextResultId();
                     active_ids[file_slot] = next_rid;
                     try tight_sem_cache.putCloned(target_fid, next_rid, sample_tokens);
                 },
@@ -687,9 +686,9 @@ test "test_fuzz_upgrade_engine_convergence_idempotency_and_rollback_safety" {
             continue;
         }
 
-        // [2] Syntax error count must never increase (`!was_rolled_back` => `post_errors <= pre_errors`):
+        // [2] Syntax error count must never increase (`!is_rolled_back` => `post_errors <= pre_errors`):
         const post_errors = try countSyntaxErrorsForSource(allocator, file_id, first_res.upgraded_source);
-        if (first_res.was_rolled_back) {
+        if (first_res.is_rolled_back) {
             try std.testing.expect(!first_res.is_changed);
             try std.testing.expectEqualStrings(snippet_buf.items, first_res.upgraded_source);
         } else {

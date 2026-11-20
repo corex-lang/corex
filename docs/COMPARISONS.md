@@ -71,7 +71,7 @@ Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `st
 
 ### 3.5 Constrained Type Groups & Inline Union Bounds (`[Live]`)
 
--   Instead of C++ template duck-typing walls or verbose Rust trait bounds (`fn scale<T: Copy + Add<Output = T> + Mul<Output = T>>(a: T, b: T) -> T`), CoreX provides 12 built-in $O(1)$ bitmask **Constrained Type Groups** (`Number`, `Integer`, `Signed`, `Unsigned`, `Float`, `Primitive`, `ByteSlice`, `FromBytes`, `IntoBytes`, …), user-defined type groups (`type WireScalar = u8 | u16 | u32 | u64;`), and PEP 695-style **inline union bounds** (`pub fn parse_header[Data: str | &[u8]](input: Data)`).
+-   Instead of C++ template duck-typing walls or verbose Rust trait bounds (`fn scale<T: Copy + Add<Output = T> + Mul<Output = T>>(a: T, b: T) -> T`), CoreX provides 12 built-in $O(1)$ bitmask **Constrained Type Groups** (`Number`, `Integer`, `Signed`, `Unsigned`, `Float`, `Scalar`, `Bytes`, `FromBytes`, `IntoBytes`, …), user-defined type groups (`type WireScalar = u8 | u16 | u32 | u64;`), and PEP 695-style **inline union bounds** (`pub fn parse_header[Data: str | &[u8]](input: Data)`).
 -   `distinct` nominal types (`pub type UserId = distinct u64;`) isolate units and IDs at zero runtime cost (`E0405`), `@secret` enforces constant-time discipline (`Phase 13.1`), and `is` range refinements (`pub type Port = u16 is 1..=65535;`) catch out-of-range constants and unverified casts (`E0406`).
 
 ### 3.6 Python-Grade Ergonomics With Zero Runtime Cost (`[Live]`)

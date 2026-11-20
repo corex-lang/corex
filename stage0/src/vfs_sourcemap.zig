@@ -438,8 +438,9 @@ fn internNormalizedPath(
     raw_path: []const u8,
 ) !StringId {
     const has_drive_prefix = raw_path.len >= 2 and std.ascii.isAlphabetic(raw_path[0]) and raw_path[1] == ':';
-    const has_upper_drive = has_drive_prefix and std.ascii.isUpper(raw_path[0]);
-    if (!has_upper_drive and std.mem.indexOfScalar(u8, raw_path, '\\') == null) {
+    if (!(has_drive_prefix and std.ascii.isUpper(raw_path[0])) and
+        std.mem.indexOfScalar(u8, raw_path, '\\') == null)
+    {
         return interner.intern(raw_path);
     }
     const normalized_buf = try allocator.alloc(u8, raw_path.len);
@@ -1312,6 +1313,21 @@ pub const VfsSourceMap = struct {
             if (self.lazy_pager) |pager| pager.io else null;
 
         const virtual_id = try internNormalizedPath(self.backing_allocator, self.interner, virtual_path);
+        var resolved_id = virtual_id;
+        var existing_file_id = self.path_to_file_id.get(virtual_id);
+        if (existing_file_id == null) {
+            if (effective_io) |io| {
+                const normalized_slice = self.interner.get(virtual_id);
+                if (!std.mem.startsWith(u8, normalized_slice, "/cx/")) {
+                    resolved_id = try self.resolvePath(io, normalized_slice);
+                    if (self.path_to_file_id.get(resolved_id)) |canon_existing_id| {
+                        try self.path_to_file_id.put(self.backing_allocator, virtual_id, canon_existing_id);
+                        existing_file_id = canon_existing_id;
+                    }
+                }
+            }
+        }
+
         const new_owned_z = try self.backing_allocator.allocSentinel(u8, content_bytes.len, 0);
         @memcpy(new_owned_z, content_bytes);
         var is_new_owned_transferred = false;
@@ -1319,7 +1335,7 @@ pub const VfsSourceMap = struct {
         const digest = computeBlake3Hash(new_owned_z);
 
         // [1] Update an already-registered `FileId` (freeing prior `slot.owned_z` immediately on overwrite):
-        if (self.path_to_file_id.get(virtual_id)) |existing_id| {
+        if (existing_file_id) |existing_id| {
             if (self.overlay_cache.file_to_slot.get(existing_id)) |existing_slot_idx| {
                 const entry = &self.entries.items[existing_id.asInt()];
                 if (entry.line_index) |*existing_line_idx| {
@@ -1403,7 +1419,10 @@ pub const VfsSourceMap = struct {
         // [2] Register a new `FileId` backed by `OverlayCache`:
         if (self.entries.items.len >= MAX_LOADED_FILES) return error.TooManyLoadedFiles;
         try self.entries.ensureUnusedCapacity(self.backing_allocator, 1);
-        try self.path_to_file_id.ensureUnusedCapacity(self.backing_allocator, 1);
+        try self.path_to_file_id.ensureUnusedCapacity(
+            self.backing_allocator,
+            if (resolved_id != virtual_id) 2 else 1,
+        );
         if (self.overlay_cache.free_head == OVERLAY_SLOT_NONE) {
             try self.overlay_cache.slots.ensureUnusedCapacity(self.backing_allocator, 1);
         }
@@ -1414,7 +1433,7 @@ pub const VfsSourceMap = struct {
             .file_id = new_file_id,
             .package_id = package_id,
             .virtual_path = virtual_id,
-            .resolved_os_path = virtual_id,
+            .resolved_os_path = resolved_id,
             .content = new_owned_z,
             .content_hash = digest,
             .revision = 1,
@@ -1423,6 +1442,9 @@ pub const VfsSourceMap = struct {
             .has_disk_backing = false,
         });
         self.path_to_file_id.putAssumeCapacity(virtual_id, new_file_id);
+        if (resolved_id != virtual_id) {
+            self.path_to_file_id.putAssumeCapacity(resolved_id, new_file_id);
+        }
 
         const slot_idx = self.overlay_cache.acquireSlotAssumeCapacity();
         self.overlay_cache.slots.items[slot_idx].file_id = new_file_id;
@@ -1588,8 +1610,8 @@ pub const VfsSourceMap = struct {
         const has_drive_prefix = virtual_path.len >= 2 and
             std.ascii.isAlphabetic(virtual_path[0]) and
             virtual_path[1] == ':';
-        const has_upper_drive = has_drive_prefix and std.ascii.isUpper(virtual_path[0]);
-        const normalized_slice = if (!has_upper_drive and std.mem.indexOfScalar(u8, virtual_path, '\\') == null)
+        const normalized_slice = if (!(has_drive_prefix and std.ascii.isUpper(virtual_path[0])) and
+            std.mem.indexOfScalar(u8, virtual_path, '\\') == null)
             virtual_path
         else blk: {
             if (virtual_path.len > stack_buf.len) return null;
@@ -1776,10 +1798,24 @@ test "test_line_index_resolve_byte_offset_ascii_utf8_utf16_and_malformed" {
     var byte_i: u32 = 0;
     while (byte_i <= 8) : (byte_i += 1) {
         const resolved_col = bad_index.resolveLineCol(malformed, byte_i);
-        const char_utf8 = LineIndex.extractLspCharacter0(resolved_col, .utf8);
-        const char_utf16 = LineIndex.extractLspCharacter0(resolved_col, .utf16);
-        try std.testing.expectEqual(byte_i, bad_index.resolveByteOffset(malformed, 0, char_utf8, .utf8));
-        try std.testing.expectEqual(byte_i, bad_index.resolveByteOffset(malformed, 0, char_utf16, .utf16));
+        try std.testing.expectEqual(
+            byte_i,
+            bad_index.resolveByteOffset(
+                malformed,
+                0,
+                LineIndex.extractLspCharacter0(resolved_col, .utf8),
+                .utf8,
+            ),
+        );
+        try std.testing.expectEqual(
+            byte_i,
+            bad_index.resolveByteOffset(
+                malformed,
+                0,
+                LineIndex.extractLspCharacter0(resolved_col, .utf16),
+                .utf16,
+            ),
+        );
     }
 }
 
@@ -1793,8 +1829,7 @@ test "test_vfs_drive_canonicalization_and_dual_bounded_overlay_cache" {
 
     // [1] Windows drive-letter canonicalization (`"D:\\…"` vs `"d:/…"`):
     const win_id = try vfs.setOverlay("D:\\Repo\\src\\main.cx", "fn alpha() {}\n", .root);
-    const uri_id = try vfs.setOverlay("d:/Repo/src/main.cx", "fn beta() {}\n", .root);
-    try std.testing.expectEqual(win_id, uri_id);
+    try std.testing.expectEqual(win_id, try vfs.setOverlay("d:/Repo/src/main.cx", "fn beta() {}\n", .root));
     try std.testing.expectEqualStrings("d:/Repo/src/main.cx", vfs.getFilePath(win_id));
     try std.testing.expectEqualStrings(
         "fn beta() {}\n",

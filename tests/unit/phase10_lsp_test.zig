@@ -9,6 +9,7 @@
 //! under `std.testing.allocator` with zero memory leaks and zero host-state side effects.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const corex = @import("corex");
 
 const lsp_server = corex.lsp_server;
@@ -122,11 +123,57 @@ fn extractFrameContentLength(header_bytes: []const u8) ?usize {
         if (header_line.len >= prefix.len and
             std.ascii.eqlIgnoreCase(header_line[0..prefix.len], prefix))
         {
-            const trimmed_digits = std.mem.trim(u8, header_line[prefix.len..], " \t");
-            return std.fmt.parseUnsigned(usize, trimmed_digits, 10) catch null;
+            return std.fmt.parseUnsigned(
+                usize,
+                std.mem.trim(u8, header_line[prefix.len..], " \t"),
+                10,
+            ) catch null;
         }
     }
     return null;
+}
+
+/// Splits raw `Content-Length` wire bytes into an owned `LspTranscriptOutcome`.
+fn buildTranscriptOutcome(
+    allocator: std.mem.Allocator,
+    exit_status: u8,
+    written_wire: []const u8,
+) !LspTranscriptOutcome {
+    const raw_copy = try allocator.dupe(u8, written_wire);
+    errdefer allocator.free(raw_copy);
+
+    var frame_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer frame_list.deinit(allocator);
+
+    var cursor: usize = 0;
+    while (cursor < raw_copy.len) {
+        const sep_pos = std.mem.indexOfPos(u8, raw_copy, cursor, "\r\n\r\n") orelse break;
+        const body_len = extractFrameContentLength(raw_copy[cursor..sep_pos]) orelse break;
+        const body_start = sep_pos + 4;
+        if (body_start + body_len > raw_copy.len) break;
+        try frame_list.append(allocator, raw_copy[body_start .. body_start + body_len]);
+        cursor = body_start + body_len;
+    }
+
+    return .{
+        .exit_code = exit_status,
+        .raw_wire = raw_copy,
+        .frames = try frame_list.toOwnedSlice(allocator),
+    };
+}
+
+/// Feeds `inbound_bytes` into an existing `LspSession` and extracts all outbound JSON bodies.
+fn executeSessionTranscript(
+    allocator: std.mem.Allocator,
+    session: *lsp_server.LspSession,
+    inbound_bytes: []const u8,
+) !LspTranscriptOutcome {
+    var fixed_reader = std.Io.Reader.fixed(inbound_bytes);
+    var out_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer out_alloc.deinit();
+
+    const exit_status = try session.feedStream(&fixed_reader, &out_alloc.writer);
+    return buildTranscriptOutcome(allocator, exit_status, out_alloc.written());
 }
 
 /// Executes `lsp_server.runServerStream` over `inbound_bytes` and extracts all outbound JSON bodies.
@@ -150,28 +197,7 @@ fn executeLspTranscript(
         log_writer,
         options,
     );
-
-    const raw_copy = try allocator.dupe(u8, out_alloc.written());
-    errdefer allocator.free(raw_copy);
-
-    var frame_list: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer frame_list.deinit(allocator);
-
-    var cursor: usize = 0;
-    while (cursor < raw_copy.len) {
-        const sep_pos = std.mem.indexOfPos(u8, raw_copy, cursor, "\r\n\r\n") orelse break;
-        const body_len = extractFrameContentLength(raw_copy[cursor..sep_pos]) orelse break;
-        const body_start = sep_pos + 4;
-        if (body_start + body_len > raw_copy.len) break;
-        try frame_list.append(allocator, raw_copy[body_start .. body_start + body_len]);
-        cursor = body_start + body_len;
-    }
-
-    return .{
-        .exit_code = exit_status,
-        .raw_wire = raw_copy,
-        .frames = try frame_list.toOwnedSlice(allocator),
-    };
+    return buildTranscriptOutcome(allocator, exit_status, out_alloc.written());
 }
 
 /// Finds the first outbound JSON frame containing `id_fragment`, or `null` if absent.
@@ -207,8 +233,10 @@ fn extractJsonU32Array(
     errdefer values.deinit(allocator);
     var item_iter = std.mem.splitScalar(u8, body_slice, ',');
     while (item_iter.next()) |num_str| {
-        const clean_digits = std.mem.trim(u8, num_str, " \t\r\n");
-        try values.append(allocator, try std.fmt.parseUnsigned(u32, clean_digits, 10));
+        try values.append(
+            allocator,
+            try std.fmt.parseUnsigned(u32, std.mem.trim(u8, num_str, " \t\r\n"), 10),
+        );
     }
     return values.toOwnedSlice(allocator);
 }
@@ -286,8 +314,7 @@ fn resolvePathToFileUri(allocator: std.mem.Allocator, io: std.Io, disk_path: []c
     if (norm_buf.len >= 2 and std.ascii.isAlphabetic(norm_buf[0]) and norm_buf[1] == ':') {
         norm_buf[0] = std.ascii.toLower(norm_buf[0]);
         return std.fmt.allocPrint(allocator, "file:///{s}", .{norm_buf});
-    }
-    if (norm_buf.len > 0 and norm_buf[0] == '/') {
+    } else if (norm_buf.len > 0 and norm_buf[0] == '/') {
         return std.fmt.allocPrint(allocator, "file://{s}", .{norm_buf});
     }
     return std.fmt.allocPrint(allocator, "file:///{s}", .{norm_buf});
@@ -769,8 +796,11 @@ test "test_lsp_semantic_tokens_delta_hover_and_dr17_contracts" {
     try std.testing.expectEqual(@as(u8, 0), outcome.exit_code);
 
     // [1] Verify 5-int full stream, empty unchanged delta, and viewport range clipping:
-    const full_v1_json = findFrameByIdFragment(outcome.frames, "\"id\":2").?;
-    const full_v1_data = try extractJsonU32Array(allocator, full_v1_json, "\"data\":[");
+    const full_v1_data = try extractJsonU32Array(
+        allocator,
+        findFrameByIdFragment(outcome.frames, "\"id\":2").?,
+        "\"data\":[",
+    );
     defer allocator.free(full_v1_data);
     try std.testing.expect(full_v1_data.len >= 25);
     try std.testing.expectEqual(@as(usize, 0), full_v1_data.len % 5);
@@ -779,19 +809,27 @@ test "test_lsp_semantic_tokens_delta_hover_and_dr17_contracts" {
         std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":3").?, "\"edits\":[]") != null,
     );
 
-    const range_json = findFrameByIdFragment(outcome.frames, "\"id\":4").?;
-    const range_data = try extractJsonU32Array(allocator, range_json, "\"data\":[");
+    const range_data = try extractJsonU32Array(
+        allocator,
+        findFrameByIdFragment(outcome.frames, "\"id\":4").?,
+        "\"data\":[",
+    );
     defer allocator.free(range_data);
     try std.testing.expect(range_data.len > 0 and range_data.len < full_v1_data.len);
     try std.testing.expectEqual(@as(usize, 0), range_data.len % 5);
 
     // [2] Apply `semanticTokens/full/delta` edit to `full_v1_data` and assert exact equality with `full_v2_data`:
-    const edit_delta_json = findFrameByIdFragment(outcome.frames, "\"id\":5").?;
-    var sem_edit = try extractFirstSemanticDeltaEdit(allocator, edit_delta_json);
+    var sem_edit = try extractFirstSemanticDeltaEdit(
+        allocator,
+        findFrameByIdFragment(outcome.frames, "\"id\":5").?,
+    );
     defer sem_edit.deinit(allocator);
 
-    const full_v2_json = findFrameByIdFragment(outcome.frames, "\"id\":6").?;
-    const full_v2_data = try extractJsonU32Array(allocator, full_v2_json, "\"data\":[");
+    const full_v2_data = try extractJsonU32Array(
+        allocator,
+        findFrameByIdFragment(outcome.frames, "\"id\":6").?,
+        "\"data\":[",
+    );
     defer allocator.free(full_v2_data);
 
     var patched_tokens: std.ArrayListUnmanaged(u32) = .empty;
@@ -1348,4 +1386,416 @@ test "test_lsp_hygienic_rename_code_action_and_range_formatting" {
     const full_fmt_resp = findFrameByIdFragment(outcome.frames, "\"id\":11").?;
     try std.testing.expect(std.mem.indexOf(u8, full_fmt_resp, "pub fn keep_messy(a_in: i32, b_in: i32) -> i32") != null);
     try std.testing.expect(std.mem.indexOf(u8, full_fmt_resp, "pub fn format_target(c_in: i32, d_in: i32) -> i32") != null);
+}
+
+test "test_lsp_windows_case_uri_watched_eviction_multifile_fix_and_internal_core_fmt" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // [1a] Percent-encoded drive authority (`file://D%3A/…`) and UNC trailing `/` (`file://server/share/`):
+    {
+        const pct_drive = try lsp_server.decodeFileUriToNormalizedPath(allocator, "file://D%3A/src/main.cx");
+        defer allocator.free(pct_drive);
+        try std.testing.expectEqualStrings("d:/src/main.cx", pct_drive);
+
+        const unc_share = try lsp_server.decodeFileUriToNormalizedPath(allocator, "file://server/share/");
+        defer allocator.free(unc_share);
+        try std.testing.expectEqualStrings("//server/share", unc_share);
+    }
+
+    const ws_dir = try createTempWorkspaceDir(allocator, io, "hardening");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, ws_dir) catch {};
+        allocator.free(ws_dir);
+    }
+
+    try writeWorkspaceFile(
+        allocator,
+        io,
+        ws_dir,
+        "corex.toml",
+        "[package]\nname = \"hardening_pkg\"\nversion = \"0.1.0\"\n",
+    );
+    const initial_main_disk = "pub mod helper;\npub fn entry_val() -> i32 {\n    return helper.base_num();\n}\n";
+    const initial_helper_disk = "pub fn base_num() -> i32 {\n    return 10;\n}\n";
+    try writeWorkspaceFile(allocator, io, ws_dir, "SrcMixed/main.cx", initial_main_disk);
+    try writeWorkspaceFile(allocator, io, ws_dir, "SrcMixed/helper.cx", initial_helper_disk);
+    try writeWorkspaceFile(
+        allocator,
+        io,
+        ws_dir,
+        "core/root.cx",
+        "   pub fn   core_helper ( ) -> i32 { return 5; }\n",
+    );
+
+    const watched_total: usize = corex.MAX_OPEN_OVERLAYS + 8;
+    var watched_uris: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (watched_uris.items) |owned_uri| allocator.free(owned_uri);
+        watched_uris.deinit(allocator);
+    }
+    var i: usize = 0;
+    while (i < watched_total) : (i += 1) {
+        const rel_watched = try std.fmt.allocPrint(allocator, "watched/unopened_{d}.cx", .{i});
+        defer allocator.free(rel_watched);
+        try writeWorkspaceFile(
+            allocator,
+            io,
+            ws_dir,
+            rel_watched,
+            "pub fn watched_item() -> i32 {\n    return 1;\n}\n",
+        );
+        const full_watched = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ws_dir, rel_watched });
+        defer allocator.free(full_watched);
+        try watched_uris.append(allocator, try resolvePathToFileUri(allocator, io, full_watched));
+    }
+
+    const toml_path = try std.fmt.allocPrint(allocator, "{s}/corex.toml", .{ws_dir});
+    defer allocator.free(toml_path);
+    const toml_uri = try resolvePathToFileUri(allocator, io, toml_path);
+    defer allocator.free(toml_uri);
+
+    const main_disk_path = try std.fmt.allocPrint(allocator, "{s}/SrcMixed/main.cx", .{ws_dir});
+    defer allocator.free(main_disk_path);
+    const helper_disk_path = try std.fmt.allocPrint(allocator, "{s}/SrcMixed/helper.cx", .{ws_dir});
+    defer allocator.free(helper_disk_path);
+    const core_disk_path = try std.fmt.allocPrint(allocator, "{s}/core/root.cx", .{ws_dir});
+    defer allocator.free(core_disk_path);
+
+    const helper_uri = try resolvePathToFileUri(allocator, io, helper_disk_path);
+    defer allocator.free(helper_uri);
+    const core_uri = try resolvePathToFileUri(allocator, io, core_disk_path);
+    defer allocator.free(core_uri);
+
+    const real_main_os = try std.Io.Dir.cwd().realPathFileAlloc(io, main_disk_path, allocator);
+    defer allocator.free(real_main_os);
+
+    const alt_main_uri = if (builtin.os.tag == .windows and
+        real_main_os.len >= 3 and
+        std.ascii.isAlphabetic(real_main_os[0]) and
+        real_main_os[1] == ':')
+    blk: {
+        const lower_tail = try allocator.alloc(u8, real_main_os.len - 2);
+        defer allocator.free(lower_tail);
+        for (real_main_os[2..], 0..) |ch_byte, idx| {
+            lower_tail[idx] = if (ch_byte == '\\') '/' else std.ascii.toLower(ch_byte);
+        }
+        break :blk try std.fmt.allocPrint(
+            allocator,
+            "file://{c}%3A{s}",
+            .{ std.ascii.toUpper(real_main_os[0]), lower_tail },
+        );
+    } else blk: {
+        const real_ws_os = try std.Io.Dir.cwd().realPathFileAlloc(io, ws_dir, allocator);
+        defer allocator.free(real_ws_os);
+        break :blk try std.fmt.allocPrint(
+            allocator,
+            "file://localhost{s}/SrcMixed/../SrcMixed/main.cx",
+            .{real_ws_os},
+        );
+    };
+    defer allocator.free(alt_main_uri);
+
+    var session = try lsp_server.LspSession.init(allocator, io, null, null, .{ .is_internal_core = true });
+    defer session.deinit();
+    session.bindInternalPointers();
+
+    // Pre-mount `SrcMixed/main.cx` and `SrcMixed/helper.cx` with their canonical OS paths before `didOpen`:
+    const mounted_main_fid = try session.vfs.resolveOrCreatePath(io, main_disk_path, .root);
+    _ = try session.db.setInput(mounted_main_fid, initial_main_disk, .medium);
+    try session.db.setFilePath(mounted_main_fid, session.vfs.getFilePath(mounted_main_fid));
+    try session.recordMountedFile(mounted_main_fid);
+
+    const mounted_helper_fid = try session.vfs.resolveOrCreatePath(io, helper_disk_path, .root);
+    _ = try session.db.setInput(mounted_helper_fid, initial_helper_disk, .medium);
+    try session.db.setFilePath(mounted_helper_fid, session.vfs.getFilePath(mounted_helper_fid));
+    try session.recordMountedFile(mounted_helper_fid);
+
+    // Mount read-only `/cx/std/ro_core.cx` (`.std_core`) and `/cx/ext@1.0.0/src/lib.cx` (`PackageId >= 2`):
+    const ro_core_src = "   pub fn   ro_core_fn ( ) -> i32 { return 1; }\n";
+    const ro_core_fid = try session.vfs.setEditorOverlay(io, "/cx/std/ro_core.cx", ro_core_src, .std_core, false);
+    _ = try session.db.setInput(ro_core_fid, ro_core_src, .high);
+    try session.db.setFilePackageId(ro_core_fid, .std_core);
+    try session.db.setFilePath(ro_core_fid, "/cx/std/ro_core.cx");
+    try session.recordMountedFile(ro_core_fid);
+
+    const ext_pkg = corex.PackageId.fromInt(2);
+    const ext_dep_src = "pub fn ext_dep_fn() -> i32 {\n    return 2;\n}\n";
+    const ext_dep_fid = try session.vfs.setEditorOverlay(io, "/cx/ext@1.0.0/src/lib.cx", ext_dep_src, ext_pkg, false);
+    _ = try session.db.setInput(ext_dep_fid, ext_dep_src, .high);
+    try session.db.setFilePackageId(ext_dep_fid, ext_pkg);
+    try session.db.setFilePath(ext_dep_fid, "/cx/ext@1.0.0/src/lib.cx");
+    try session.recordMountedFile(ext_dep_fid);
+
+    // Phase A: `initialize` + case-mismatched `didOpen` + multi-turn ranged `didChange` + `> 256` watched files + fmt:
+    var phase_a_in: std.ArrayListUnmanaged(u8) = .empty;
+    defer phase_a_in.deinit(allocator);
+
+    {
+        var init_buf = std.Io.Writer.Allocating.init(allocator);
+        defer init_buf.deinit();
+        try init_buf.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"rootUri\":");
+        try writeEscapedJsonString(&init_buf.writer, toml_uri[0 .. toml_uri.len - "/corex.toml".len]);
+        try init_buf.writer.writeAll(
+            ",\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-8\"]}," ++
+                "\"textDocument\":{\"diagnostic\":{}}}}}",
+        );
+        try appendLspFrame(allocator, &phase_a_in, init_buf.written());
+    }
+    try appendLspFrame(allocator, &phase_a_in, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}");
+
+    try appendDidOpenFrame(
+        allocator,
+        &phase_a_in,
+        alt_main_uri,
+        1,
+        "pub mod helper;\npub fn entry_val() -> i32 {\n    let delta_v = 1;\n    return helper.base_num() + delta_v;\n}\n",
+    );
+    try appendDidOpenFrame(allocator, &phase_a_in, helper_uri, 1, initial_helper_disk);
+
+    // Ranged `didChange` #1 on `alt_main_uri` inserting a newline so `LineIndex` shifts line offsets:
+    {
+        var chg1_buf = std.Io.Writer.Allocating.init(allocator);
+        defer chg1_buf.deinit();
+        try chg1_buf.writer.writeAll(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":",
+        );
+        try writeEscapedJsonString(&chg1_buf.writer, alt_main_uri);
+        try chg1_buf.writer.writeAll(
+            ",\"version\":2},\"contentChanges\":[{\"range\":{\"start\":{\"line\":2,\"character\":18}," ++
+                "\"end\":{\"line\":2,\"character\":19}},\"text\":\"100;\\n    let extra_v = 22\"}]}}",
+        );
+        try appendLspFrame(allocator, &phase_a_in, chg1_buf.written());
+    }
+
+    // Separate `didChange` #1 and #2 with a pull diagnostic request (`id: 2`) to exercise fast-path `getLineIndex`:
+    {
+        var diag1_buf = std.Io.Writer.Allocating.init(allocator);
+        defer diag1_buf.deinit();
+        try diag1_buf.writer.writeAll(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/diagnostic\",\"params\":{\"textDocument\":{\"uri\":",
+        );
+        try writeEscapedJsonString(&diag1_buf.writer, alt_main_uri);
+        try diag1_buf.writer.writeAll("}}}");
+        try appendLspFrame(allocator, &phase_a_in, diag1_buf.written());
+    }
+
+    // Ranged `didChange` #2 on shifted line 4 (`character: 31..38` `"delta_v"` -> `"delta_v + extra_v"`):
+    {
+        var chg2_buf = std.Io.Writer.Allocating.init(allocator);
+        defer chg2_buf.deinit();
+        try chg2_buf.writer.writeAll(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":",
+        );
+        try writeEscapedJsonString(&chg2_buf.writer, alt_main_uri);
+        try chg2_buf.writer.writeAll(
+            ",\"version\":3},\"contentChanges\":[{\"range\":{\"start\":{\"line\":4,\"character\":31}," ++
+                "\"end\":{\"line\":4,\"character\":38}},\"text\":\"delta_v + extra_v\"}]}}",
+        );
+        try appendLspFrame(allocator, &phase_a_in, chg2_buf.written());
+    }
+
+    {
+        var diag2_buf = std.Io.Writer.Allocating.init(allocator);
+        defer diag2_buf.deinit();
+        try diag2_buf.writer.writeAll(
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/diagnostic\",\"params\":{\"textDocument\":{\"uri\":",
+        );
+        try writeEscapedJsonString(&diag2_buf.writer, alt_main_uri);
+        try diag2_buf.writer.writeAll("}}}");
+        try appendLspFrame(allocator, &phase_a_in, diag2_buf.written());
+    }
+
+    // [2] Send `> 256` (`264`) `workspace/didChangeWatchedFiles` events on unopened disk files:
+    {
+        var watched_buf = std.Io.Writer.Allocating.init(allocator);
+        defer watched_buf.deinit();
+        try watched_buf.writer.writeAll(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"workspace/didChangeWatchedFiles\",\"params\":{\"changes\":[",
+        );
+        for (watched_uris.items, 0..) |w_uri, w_idx| {
+            if (w_idx > 0) try watched_buf.writer.writeByte(',');
+            try watched_buf.writer.writeAll("{\"uri\":");
+            try writeEscapedJsonString(&watched_buf.writer, w_uri);
+            try watched_buf.writer.writeAll(",\"type\":2}");
+        }
+        try watched_buf.writer.writeAll("]}}");
+        try appendLspFrame(allocator, &phase_a_in, watched_buf.written());
+    }
+
+    // [4] `--internal-core` formatting on workspace `core/root.cx` (`id: 4`) vs read-only `/cx/std/ro_core.cx` (`id: 5`):
+    {
+        var fmt_core_buf = std.Io.Writer.Allocating.init(allocator);
+        defer fmt_core_buf.deinit();
+        try fmt_core_buf.writer.writeAll(
+            "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/formatting\",\"params\":{\"textDocument\":{\"uri\":",
+        );
+        try writeEscapedJsonString(&fmt_core_buf.writer, core_uri);
+        try fmt_core_buf.writer.writeAll("},\"options\":{\"tabSize\":4,\"insertSpaces\":true}}}");
+        try appendLspFrame(allocator, &phase_a_in, fmt_core_buf.written());
+    }
+    try appendLspFrame(
+        allocator,
+        &phase_a_in,
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/formatting\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///cx/std/ro_core.cx\"}," ++
+            "\"options\":{\"tabSize\":4,\"insertSpaces\":true}}}",
+    );
+
+    var out_a = try executeSessionTranscript(allocator, &session, phase_a_in.items);
+    defer out_a.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), out_a.exit_code);
+
+    // Verify [1]: `alt_main_uri` reused `mounted_main_fid` and spliced ranged edits with zero `LineIndex` drift:
+    const expected_unsaved_main =
+        "pub mod helper;\n" ++
+        "pub fn entry_val() -> i32 {\n" ++
+        "    let delta_v = 100;\n" ++
+        "    let extra_v = 22;\n" ++
+        "    return helper.base_num() + delta_v + extra_v;\n" ++
+        "}\n";
+    const alt_decoded = try lsp_server.decodeFileUriToNormalizedPath(allocator, alt_main_uri);
+    defer allocator.free(alt_decoded);
+    try std.testing.expectEqual(
+        mounted_main_fid,
+        try session.vfs.setEditorOverlay(io, alt_decoded, expected_unsaved_main, .root, true),
+    );
+    const alt_str_id = session.vfs.interner.lookup(alt_decoded).?;
+    try std.testing.expectEqual(mounted_main_fid, session.vfs.path_to_file_id.get(alt_str_id).?);
+    try std.testing.expectEqualStrings(expected_unsaved_main, session.vfs.getFileSource(mounted_main_fid).?);
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(out_a.frames, "\"id\":3").?, "\"items\":[]") != null,
+    );
+
+    // Verify [2]: `> 256` unopened watched-file updates did NOT evict open tabs from `OverlayCache`:
+    try std.testing.expect(session.isFileOpen(mounted_main_fid));
+    try std.testing.expect(session.vfs.overlay_cache.file_to_slot.contains(mounted_main_fid));
+    try std.testing.expect(session.vfs.overlay_cache.file_to_slot.contains(mounted_helper_fid));
+    try std.testing.expect(session.vfs.getFileEntry(mounted_main_fid).?.is_open_in_editor);
+    try std.testing.expectEqualStrings(expected_unsaved_main, session.vfs.getFileSource(mounted_main_fid).?);
+    try std.testing.expect(session.vfs.overlay_cache.entry_count <= corex.MAX_OPEN_OVERLAYS);
+
+    // Verify [4]: `--internal-core` formats `core/root.cx` while `/cx/std/ro_core.cx` returns `"result":[]`:
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            findFrameByIdFragment(out_a.frames, "\"id\":4").?,
+            "pub fn core_helper() -> i32",
+        ) != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(out_a.frames, "\"id\":5").?, "\"result\":[]") != null,
+    );
+
+    // [3] Attach a multi-file workspace `SuggestedFix` + a half-readonly `SuggestedFix` onto `mounted_main_fid`:
+    _ = try session.db.parseCst(mounted_main_fid);
+    if (session.db.parsed_artifacts.getPtr(mounted_main_fid.asInt())) |main_parsed| {
+        const sink_alloc = main_parsed.diagnostics.arena.asAllocator();
+        const main_repl = try session.db.interner.intern("pub mod helper;");
+        const helper_repl = try session.db.interner.intern("pub fn base_num() -> i32");
+
+        const multi_edits = try sink_alloc.alloc(corex.diagnostic.TextEdit, 2);
+        multi_edits[0] = .{
+            .file_id = mounted_main_fid,
+            .start_byte = 0,
+            .end_byte = 15,
+            .replacement_id = main_repl,
+        };
+        multi_edits[1] = .{
+            .file_id = mounted_helper_fid,
+            .start_byte = 0,
+            .end_byte = 24,
+            .replacement_id = helper_repl,
+        };
+
+        const blocked_edits = try sink_alloc.alloc(corex.diagnostic.TextEdit, 2);
+        blocked_edits[0] = multi_edits[0];
+        blocked_edits[1] = .{
+            .file_id = ext_dep_fid,
+            .start_byte = 0,
+            .end_byte = 6,
+            .replacement_id = main_repl,
+        };
+
+        const fixes = try sink_alloc.alloc(corex.diagnostic.SuggestedFix, 2);
+        fixes[0] = .{
+            .message = "Synchronize main and helper module header",
+            .applicability = .machine_applicable,
+            .priority = .type_migration,
+            .edits = multi_edits,
+        };
+        fixes[1] = .{
+            .message = "Blocked half-readonly fix",
+            .applicability = .machine_applicable,
+            .priority = .type_migration,
+            .edits = blocked_edits,
+        };
+
+        try main_parsed.diagnostics.emit(.{
+            .code = .w0202_non_idiomatic_construct,
+            .severity = .warning,
+            .primary_span = corex.Span.init(mounted_main_fid, 0, 15),
+            .message = "synthetic multi-file quickfix probe",
+            .suggestions = fixes,
+        });
+    }
+
+    // Phase B: `codeAction` (`id: 6`) + pipelined `> 120`-byte `$/cancelRequest` (`BLAKE3` slot) + `shutdown`/`exit`:
+    const long_req_id = "req_cancel_blake3_" ++ @as([142]u8, @splat('x'));
+    try std.testing.expectEqual(@as(usize, 160), long_req_id.len);
+
+    var phase_b_in: std.ArrayListUnmanaged(u8) = .empty;
+    defer phase_b_in.deinit(allocator);
+
+    {
+        var ca_buf = std.Io.Writer.Allocating.init(allocator);
+        defer ca_buf.deinit();
+        try ca_buf.writer.writeAll(
+            "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"textDocument/codeAction\",\"params\":{\"textDocument\":{\"uri\":",
+        );
+        try writeEscapedJsonString(&ca_buf.writer, alt_main_uri);
+        try ca_buf.writer.writeAll(
+            "},\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":15}}}}",
+        );
+        try appendLspFrame(allocator, &phase_b_in, ca_buf.written());
+    }
+
+    // [5] Pipelined `160`-byte string request ID + `$/cancelRequest`:
+    {
+        var hover_cancel_buf = std.Io.Writer.Allocating.init(allocator);
+        defer hover_cancel_buf.deinit();
+        try hover_cancel_buf.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+        try writeEscapedJsonString(&hover_cancel_buf.writer, long_req_id);
+        try hover_cancel_buf.writer.writeAll(",\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":");
+        try writeEscapedJsonString(&hover_cancel_buf.writer, alt_main_uri);
+        try hover_cancel_buf.writer.writeAll("},\"position\":{\"line\":1,\"character\":8}}}");
+        try appendLspFrame(allocator, &phase_b_in, hover_cancel_buf.written());
+    }
+    {
+        var cancel_notif_buf = std.Io.Writer.Allocating.init(allocator);
+        defer cancel_notif_buf.deinit();
+        try cancel_notif_buf.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"$/cancelRequest\",\"params\":{\"id\":");
+        try writeEscapedJsonString(&cancel_notif_buf.writer, long_req_id);
+        try cancel_notif_buf.writer.writeAll("}}");
+        try appendLspFrame(allocator, &phase_b_in, cancel_notif_buf.written());
+    }
+    try appendLspFrame(allocator, &phase_b_in, "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"shutdown\",\"params\":null}");
+    try appendLspFrame(allocator, &phase_b_in, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}");
+
+    var out_b = try executeSessionTranscript(allocator, &session, phase_b_in.items);
+    defer out_b.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), out_b.exit_code);
+
+    const ca_resp = findFrameByIdFragment(out_b.frames, "\"id\":6").?;
+    try std.testing.expect(
+        std.mem.indexOf(u8, ca_resp, "Synchronize main and helper module header") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, ca_resp, alt_main_uri) != null);
+    try std.testing.expect(std.mem.indexOf(u8, ca_resp, helper_uri) != null);
+    try std.testing.expect(std.mem.indexOf(u8, ca_resp, "\"newText\":\"pub fn base_num() -> i32\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ca_resp, "Blocked half-readonly fix") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ca_resp, "/cx/ext@1.0.0") == null);
+
+    const cancel_resp = findFrameByIdFragment(out_b.frames, long_req_id).?;
+    try std.testing.expect(std.mem.indexOf(u8, cancel_resp, "-32800") != null);
 }

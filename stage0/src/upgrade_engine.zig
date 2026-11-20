@@ -21,6 +21,8 @@ const query_db = @import("query_db.zig");
 const check_audit = @import("check_audit.zig");
 const fmt_engine = @import("fmt_engine.zig");
 const pkg_manifest = @import("pkg_manifest.zig");
+const pkg_resolver = @import("pkg_resolver.zig");
+const pkg_cache = @import("pkg_cache.zig");
 const codegen_abi = @import("codegen_abi.zig");
 const upgrade_rules = @import("upgrade_rules.zig");
 const diagnostic = @import("diag/diagnostic.zig");
@@ -100,6 +102,16 @@ pub const UpgradeOptions = struct {
     target_spec: ?codegen_abi.TargetSpec = null,
     /// Maximum `MirVm` compile-time step budget during Tier 3 semantic analysis.
     comptime_step_limit: u64 = 10_000_000,
+    /// Optional `std.Io` handle enabling on-demand `core` stdlib and sibling `mod` file loading.
+    io: ?std.Io = null,
+    /// Optional mutable `VfsSourceMap` used when binding newly discovered `mod` files on disk.
+    vfs: ?*vfs_sourcemap.VfsSourceMap = null,
+    /// Optional `COREX_HOME` directory path for offline cached dependency mounting.
+    corex_home_dir: ?[]const u8 = null,
+    /// Optional process environment map for local registry / hermetic resolution.
+    environ_map: ?*const std.process.Environ.Map = null,
+    /// Additional pending migration items (e.g., `--accept-caps` drift) merged during `--check`.
+    extra_pending_items: []const PendingUpgradeItem = &.{},
 };
 
 // ----------------- Upgrade Outcomes & Reports -----------------
@@ -117,7 +129,7 @@ pub const FileUpgradeResult = struct {
     /// Total number of `SuggestedFix` bundles transactionally applied across all passes.
     applied_edit_count: u32 = 0,
     /// `true` if the post-upgrade syntax-error-count soundness guard rolled back to baseline.
-    was_rolled_back: bool = false,
+    is_rolled_back: bool = false,
 
     /// Releases `upgraded_source` using `allocator`.
     pub fn deinit(self: *FileUpgradeResult, allocator: std.mem.Allocator) void {
@@ -239,6 +251,16 @@ const CanonicalCapEntry = struct {
     name: []const u8,
     /// Single-bit mask in `EffectCapabilityMask` (`LOCKFILE_CAP_BITS`).
     bit: u16,
+};
+
+/// Retired bare property kind on slices, arrays, and `str` migrated by `UR-22-06`.
+const RetiredSlicePropKind = enum(u8) {
+    /// Retired `.is_empty` property -> `.is_empty()`.
+    is_empty = 0,
+    /// Retired `.len` property -> `.len()`.
+    len = 1,
+    /// Retired `.ptr` property -> `.as_mut_ptr()` or `.as_ptr()`.
+    ptr = 2,
 };
 
 /// Arena-backed accumulator building `SuggestedFix` bundles for `TransactionalPatcher.apply`.
@@ -630,17 +652,17 @@ pub const UPGRADE_RULE_EXAMPLES: [upgrade_rules.UPGRADE_RULE_COUNT]UpgradeRuleEx
 
 /// $O(1)$ lookup set of integer primitive names valid as `enum Name: <IntPrim>` backing types (`UR-22-04`).
 const INT_PRIM_REPR_SET = std.StaticStringMap(void).initComptime(.{
-    .{ "i8", {} },
+    .{ "i128", {} },
     .{ "i16", {} },
     .{ "i32", {} },
     .{ "i64", {} },
-    .{ "i128", {} },
+    .{ "i8", {} },
     .{ "isize", {} },
-    .{ "u8", {} },
+    .{ "u128", {} },
     .{ "u16", {} },
     .{ "u32", {} },
     .{ "u64", {} },
-    .{ "u128", {} },
+    .{ "u8", {} },
     .{ "usize", {} },
 });
 
@@ -651,6 +673,133 @@ const UNQUALIFIED_STD_VARIANT_MAP = std.StaticStringMap([]const u8).initComptime
     .{ "Ok", ".Ok" },
     .{ "Some", ".Some" },
 });
+
+/// $O(1)$ set of standard `Option` path prefix segments accepted by `UR-21-03`.
+const OPTION_PREFIX_SEGMENT_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "Option", {} },
+    .{ "cx", {} },
+    .{ "option", {} },
+    .{ "std", {} },
+});
+
+/// $O(1)$ map from single-token retired `self` receiver modifiers to canonical replacements (`UR-22-02`).
+const RETIRED_SELF_MODE_MAP = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "inout", "&mut self" },
+    .{ "mut", "var self" },
+    .{ "ref", "&self" },
+    .{ "sink", "own self" },
+});
+
+/// $O(1)$ map from retired parameter, type, and call-site mode tokens to canonical prefixes (`UR-22-02`).
+const RETIRED_TYPE_MODE_MAP = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "inout", "&mut" },
+    .{ "out", "&out" },
+    .{ "ref", "&" },
+    .{ "set", "&out" },
+    .{ "sink", "own" },
+});
+
+/// $O(1)$ set of mutability introducers (`"mut"`, `"var"`) in parameter headers (`UR-22-02`).
+const PARAM_MUT_INTRO_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "mut", {} },
+    .{ "var", {} },
+});
+
+/// $O(1)$ set of ownership mode tokens (`"own"`, `"sink"`) in parameter headers (`UR-22-02`).
+const PARAM_OWN_MODE_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "own", {} },
+    .{ "sink", {} },
+});
+
+/// $O(1)$ set of existential/dynamic trait-bound keywords with open callable tails (`UR-22-03`).
+const CALLABLE_BOUND_HEAD_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "any", {} },
+    .{ "dyn", {} },
+});
+
+/// $O(1)$ set of unshadowed `Option` type constructor paths rewritten to `T?` (`UR-22-03`).
+const CANONICAL_OPTION_HEAD_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "Option", {} },
+    .{ "cx.option.Option", {} },
+    .{ "std.option.Option", {} },
+});
+
+/// $O(1)$ set of unshadowed `Result` type constructor paths rewritten to `Ok!Err` (`UR-22-03`).
+const CANONICAL_RESULT_HEAD_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "Result", {} },
+    .{ "cx.result.Result", {} },
+    .{ "std.result.Result", {} },
+});
+
+/// $O(1)$ map classifying `"never"` (`false`) vs. omissible `"unit"` (`true`) primitive return types (`UR-22-04`/`05`).
+const UNIT_OR_NEVER_PRIM_MAP = std.StaticStringMap(bool).initComptime(.{
+    .{ "never", false },
+    .{ "unit", true },
+});
+
+/// $O(1)$ set of C representation argument spellings inside `@repr(C, <IntPrim>)` (`UR-22-04`).
+const C_REPR_ARG_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "C", {} },
+    .{ "c", {} },
+});
+
+/// $O(1)$ set of standard library root namespace segments preceding `.ffi.c_void` (`UR-22-05`).
+const STDLIB_ROOT_SEG_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "core", {} },
+    .{ "cx", {} },
+    .{ "std", {} },
+});
+
+/// $O(1)$ set of qualified `with_arena` callee paths rewritten to `with context.allocator` (`UR-21-06`).
+const WITH_ARENA_CALLEE_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "core.mem.with_arena", {} },
+    .{ "cx.mem.with_arena", {} },
+    .{ "mem.with_arena", {} },
+});
+
+/// $O(1)$ set of standard `mem` module receiver paths for `.with_arena(…)` calls (`UR-21-06`).
+const MEM_MODULE_RECEIVER_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "core.mem", {} },
+    .{ "cx.mem", {} },
+    .{ "mem", {} },
+});
+
+/// $O(1)$ map from retired slice/array/`str` property names to `RetiredSlicePropKind` (`UR-22-06`).
+const SLICE_PROP_MEMBER_MAP = std.StaticStringMap(RetiredSlicePropKind).initComptime(.{
+    .{ "is_empty", .is_empty },
+    .{ "len", .len },
+    .{ "ptr", .ptr },
+});
+
+/// $O(1)$ set of TOML table headers owning `edition = "…"` keys (`corex.toml` canonicalization).
+const MANIFEST_EDITION_SECTION_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "package", {} },
+    .{ "workspace.package", {} },
+});
+
+/// $O(1)$ set of TOML dependency table headers scanned for inline `allow_caps` arrays (`--accept-caps`).
+const MANIFEST_DEP_SECTION_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "build-dependencies", {} },
+    .{ "dependencies", {} },
+    .{ "dev-dependencies", {} },
+    .{ "workspace.dependencies", {} },
+});
+
+/// $O(1)$ map from retired capability spellings to canonical `MANIFEST_CAPABILITY_MAP` names (`--accept-caps`).
+const RETIRED_CAP_ALIAS_MAP = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "unsafe", "unsafe_op" },
+});
+
+/// $O(1)$ set of hub module basenames whose child `mod <name>;` files resolve as direct siblings.
+const HUB_MODULE_BASENAME_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "lib.cx", {} },
+    .{ "main.cx", {} },
+    .{ "mod.cx", {} },
+    .{ "root.cx", {} },
+});
+
+/// Maximum directory / `mod` recursion depth when binding workspace module trees in `CompilerDb`.
+const MAX_UPGRADE_MOD_DISCOVERY_DEPTH: u32 = 64;
 
 /// $O(1)$ set of retired `corex.toml` `edition` strings migrated to `"2026"` (`pkg_manifest.DEFAULT_COREX_EDITION`).
 const RETIRED_EDITION_SET = std.StaticStringMap(void).initComptime(.{
@@ -697,17 +846,6 @@ fn verifyUpgradeEngineInvariantsComptime() void {
 
 comptime {
     verifyUpgradeEngineInvariantsComptime();
-}
-
-/// Extracts the raw source slice of `tok_idx` (`""` for `.none`, `.eof`, or synthesized zero-length tokens).
-inline fn tokenSlice(source: []const u8, tok_buf: *const TokenBuffer, tok_idx: TokenIndex) []const u8 {
-    if (tok_idx.isNone() or tok_idx.asInt() >= tok_buf.countTokens()) return "";
-    const rec = tok_buf.getToken(tok_idx);
-    if (rec.flags.is_synthesized or rec.byte_len == 0) return "";
-    const start_pos: usize = rec.byte_offset;
-    const end_pos: usize = start_pos + @as(usize, rec.byte_len);
-    if (end_pos > source.len) return "";
-    return source[start_pos..end_pos];
 }
 
 /// Returns `true` if `ch_byte` is ASCII horizontal or vertical whitespace.
@@ -855,7 +993,7 @@ fn hasLocalStdDeclaration(source: []const u8, tok_buf: *const TokenBuffer) bool 
     while (i < tok_count) : (i += 1) {
         const tok_idx = TokenIndex.fromInt(@intCast(i));
         const rec = tok_buf.getToken(tok_idx);
-        if (rec.kind != .ident or !std.mem.eql(u8, tokenSlice(source, tok_buf, tok_idx), "std")) continue;
+        if (rec.kind != .ident or !std.mem.eql(u8, symbol_resolver.extractTokenSlice(source, tok_buf, tok_idx), "std")) continue;
         if (i > 0) {
             const prev_kind = tok_buf.getToken(TokenIndex.fromInt(@intCast(i - 1))).kind;
             switch (prev_kind) {
@@ -874,7 +1012,7 @@ fn hasLocalNumericDeclaration(source: []const u8, tok_buf: *const TokenBuffer) b
     while (i < tok_count) : (i += 1) {
         const tok_idx = TokenIndex.fromInt(@intCast(i));
         const rec = tok_buf.getToken(tok_idx);
-        if (rec.kind != .type_ident or !std.mem.eql(u8, tokenSlice(source, tok_buf, tok_idx), "Numeric")) continue;
+        if (rec.kind != .type_ident or !std.mem.eql(u8, symbol_resolver.extractTokenSlice(source, tok_buf, tok_idx), "Numeric")) continue;
         if (i > 0) {
             const prev_kind = tok_buf.getToken(TokenIndex.fromInt(@intCast(i - 1))).kind;
             switch (prev_kind) {
@@ -897,13 +1035,46 @@ fn hasLocalNumericDeclaration(source: []const u8, tok_buf: *const TokenBuffer) b
     return false;
 }
 
-/// Advances past a nested `{ … }` interpolation expression inside a `.string_lit`, recursively scanning nested `"…"`.
-fn scanStringInterpolationExpr(
-    source: []const u8,
-    start_pos: usize,
-    limit_pos: usize,
-    collector: *FixCollector,
-) !usize {
+/// Skips a nested standard `"…"` or `"""…"""` literal inside an interpolation `{ … }` hole without emitting edits.
+fn skipStandardStringInHole(source: []const u8, start_pos: usize, limit_pos: usize, is_triple: bool) usize {
+    var pos = start_pos;
+    while (pos < limit_pos) {
+        if (is_triple) {
+            if (pos + 2 < limit_pos and source[pos] == '"' and source[pos + 1] == '"' and source[pos + 2] == '"') {
+                return pos + 3;
+            }
+        } else if (source[pos] == '"') {
+            return pos + 1;
+        }
+        if (source[pos] == '\\') {
+            if (pos + 2 < limit_pos and source[pos + 1] == 'u' and source[pos + 2] == '{') {
+                pos += 3;
+                while (pos < limit_pos and source[pos] != '}') : (pos += 1) {}
+                if (pos < limit_pos) pos += 1;
+            } else {
+                pos = @min(pos + 2, limit_pos);
+            }
+            continue;
+        }
+        if (source[pos] == '{') {
+            if (pos + 1 < limit_pos and source[pos + 1] == '{') {
+                pos += 2;
+                continue;
+            }
+            pos = scanHoleEndWithoutEdits(source, pos + 1, limit_pos);
+            continue;
+        }
+        if (source[pos] == '}' and pos + 1 < limit_pos and source[pos + 1] == '}') {
+            pos += 2;
+            continue;
+        }
+        pos += 1;
+    }
+    return pos;
+}
+
+/// Scans to the matching `}` of a `{ … }` interpolation hole, handling single and triple-quoted raw/byte/standard strings.
+fn scanHoleEndWithoutEdits(source: []const u8, start_pos: usize, limit_pos: usize) usize {
     var pos = start_pos;
     var brace_depth: u32 = 1;
     while (pos < limit_pos and brace_depth > 0) {
@@ -929,19 +1100,17 @@ fn scanStringInterpolationExpr(
             }
             continue;
         }
-        if (ch_byte == '\'') {
-            pos += 1;
+        if (ch_byte == '\'' or (ch_byte == 'b' and pos + 1 < limit_pos and source[pos + 1] == '\'' and
+            !(pos > start_pos and isIdentContinueByte(source[pos - 1]))))
+        {
+            pos += if (ch_byte == 'b') 2 else 1;
             while (pos < limit_pos and source[pos] != '\'') {
-                if (source[pos] == '\\' and pos + 1 < limit_pos) {
-                    pos += 2;
-                } else {
-                    pos += 1;
-                }
+                pos += if (source[pos] == '\\' and pos + 1 < limit_pos) 2 else 1;
             }
             if (pos < limit_pos) pos += 1;
             continue;
         }
-        // Skip raw (`r"…"`, `r#"…"#`) and byte (`b"…"`, `br"…"`) string literals inside `{ … }`:
+        // Skip raw (`r"…"`, `r#"…"#`, `r"""…"""`) and byte (`b"…"`, `b"""…"""`, `br"…"`, `br"""…"""`) literals:
         if ((ch_byte == 'r' or ch_byte == 'b') and pos + 1 < limit_pos) {
             const is_prev_ident = pos > start_pos and isIdentContinueByte(source[pos - 1]);
             if (!is_prev_ident) {
@@ -953,13 +1122,40 @@ fn scanStringInterpolationExpr(
                 }
                 if (probe < limit_pos and source[probe] == '"') {
                     const is_raw = ch_byte == 'r' or (pos + 1 < limit_pos and source[pos + 1] == 'r');
-                    pos = probe + 1;
+                    var quote_run: usize = 0;
+                    while (probe + quote_run < limit_pos and source[probe + quote_run] == '"') : (quote_run += 1) {}
+                    const has_immediate_close_hashes = hash_count > 0 and
+                        probe + quote_run + hash_count <= limit_pos and blk_h: {
+                        var h_i: usize = 0;
+                        while (h_i < hash_count) : (h_i += 1) {
+                            if (source[probe + quote_run + h_i] != '#') break :blk_h false;
+                        }
+                        break :blk_h true;
+                    };
+                    const is_triple_lit = probe + 2 < limit_pos and
+                        source[probe] == '"' and source[probe + 1] == '"' and source[probe + 2] == '"' and
+                        quote_run >= 3 and !has_immediate_close_hashes;
+                    pos = probe + (if (is_triple_lit) @as(usize, 3) else 1);
                     while (pos < limit_pos) {
                         if (!is_raw and source[pos] == '\\' and pos + 1 < limit_pos) {
                             pos += 2;
                             continue;
                         }
-                        if (source[pos] == '"') {
+                        if (is_triple_lit) {
+                            if (pos + 2 < limit_pos and
+                                source[pos] == '"' and source[pos + 1] == '"' and source[pos + 2] == '"')
+                            {
+                                var matched_hashes: usize = 0;
+                                while (matched_hashes < hash_count and
+                                    pos + 3 + matched_hashes < limit_pos and
+                                    source[pos + 3 + matched_hashes] == '#') : (matched_hashes += 1)
+                                {}
+                                if (matched_hashes == hash_count) {
+                                    pos += 3 + hash_count;
+                                    break;
+                                }
+                            }
+                        } else if (source[pos] == '"') {
                             var matched_hashes: usize = 0;
                             while (matched_hashes < hash_count and
                                 pos + 1 + matched_hashes < limit_pos and
@@ -978,8 +1174,7 @@ fn scanStringInterpolationExpr(
         }
         if (ch_byte == '"') {
             const is_triple = pos + 2 < limit_pos and source[pos + 1] == '"' and source[pos + 2] == '"';
-            pos += if (is_triple) 3 else 1;
-            pos = try scanStandardStringBodyForBraceEscapes(source, pos, limit_pos, is_triple, collector);
+            pos = skipStandardStringInHole(source, pos + (if (is_triple) @as(usize, 3) else 1), limit_pos, is_triple);
             continue;
         }
         if (ch_byte == '{') {
@@ -992,14 +1187,57 @@ fn scanStringInterpolationExpr(
     return pos;
 }
 
-/// Deterministic non-backtracking string escape scanner rewriting `\{` -> `{{` and `\}` -> `}}` (`UR-22-00`).
-fn scanStandardStringBodyForBraceEscapes(
+/// Advances past a `{ … }` interpolation hole inside a `.string_lit` and runs Tier 1 shims on its expression slice.
+fn scanStringInterpolationExpr(
+    allocator: std.mem.Allocator,
     source: []const u8,
     start_pos: usize,
     limit_pos: usize,
-    is_triple: bool,
+    base_offset: u32,
+    file_id: FileId,
+    options: UpgradeOptions,
+    has_local_std: bool,
+    has_local_numeric: bool,
+    depth: u8,
     collector: *FixCollector,
 ) anyerror!usize {
+    const after_close = scanHoleEndWithoutEdits(source, start_pos, limit_pos);
+    if (after_close > start_pos and after_close <= limit_pos and source[after_close - 1] == '}' and depth < 32) {
+        const raw_hole = source[start_pos .. after_close - 1];
+        const split = type_system.splitInterpolationHole(raw_hole);
+        if (split.expr_slice.len > 0) {
+            try collectTier1FixesOnSlice(
+                allocator,
+                split.expr_slice,
+                base_offset +| @as(u32, @intCast(start_pos)),
+                file_id,
+                options,
+                has_local_std,
+                has_local_numeric,
+                depth + 1,
+                collector,
+            );
+        }
+    }
+    return after_close;
+}
+
+/// Deterministic non-backtracking string scanner rewriting `\{`/`\}` (`UR-22-00`) and `{ expr }` Tier 1 holes.
+fn scanStandardStringBodyForBraceEscapes(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    start_pos: usize,
+    limit_pos: usize,
+    base_offset: u32,
+    is_triple: bool,
+    file_id: FileId,
+    options: UpgradeOptions,
+    has_local_std: bool,
+    has_local_numeric: bool,
+    depth: u8,
+    collector: *FixCollector,
+) anyerror!usize {
+    const is_ur22_00 = isRuleEnabled(options.rule_mask, .ur_22_00_lexical_token_canonicalization);
     var pos = start_pos;
     while (pos < limit_pos) {
         if (is_triple) {
@@ -1013,26 +1251,34 @@ fn scanStandardStringBodyForBraceEscapes(
         if (source[pos] == '\\') {
             if (pos + 1 < limit_pos) {
                 const escaped_byte = source[pos + 1];
-                if (escaped_byte == '{') {
+                if (is_ur22_00 and escaped_byte == '{') {
+                    const abs_pos = base_offset +| @as(u32, @intCast(pos));
                     try collector.appendSingleEdit(
                         .syntax_canonicalization,
-                        @intCast(pos),
-                        @intCast(pos + 2),
+                        abs_pos,
+                        abs_pos +| 2,
                         "{{",
                         "UR-22-00: replace retired `\\{` string brace escape with `{{`",
                     );
                     pos += 2;
                     continue;
                 }
-                if (escaped_byte == '}') {
+                if (is_ur22_00 and escaped_byte == '}') {
+                    const abs_pos = base_offset +| @as(u32, @intCast(pos));
                     try collector.appendSingleEdit(
                         .syntax_canonicalization,
-                        @intCast(pos),
-                        @intCast(pos + 2),
+                        abs_pos,
+                        abs_pos +| 2,
                         "}}",
                         "UR-22-00: replace retired `\\}` string brace escape with `}}`",
                     );
                     pos += 2;
+                    continue;
+                }
+                if (escaped_byte == 'u' and pos + 2 < limit_pos and source[pos + 2] == '{') {
+                    pos += 3;
+                    while (pos < limit_pos and source[pos] != '}') : (pos += 1) {}
+                    if (pos < limit_pos) pos += 1;
                     continue;
                 }
                 // `\\` advances by 2 bytes so `\\{` leaves `\\` intact and sees `{` as an interpolation hole:
@@ -1047,7 +1293,19 @@ fn scanStandardStringBodyForBraceEscapes(
                 pos += 2;
                 continue;
             }
-            pos = try scanStringInterpolationExpr(source, pos + 1, limit_pos, collector);
+            pos = try scanStringInterpolationExpr(
+                allocator,
+                source,
+                pos + 1,
+                limit_pos,
+                base_offset,
+                file_id,
+                options,
+                has_local_std,
+                has_local_numeric,
+                depth,
+                collector,
+            );
             continue;
         }
 
@@ -1061,14 +1319,18 @@ fn scanStandardStringBodyForBraceEscapes(
     return pos;
 }
 
-/// Collects Sub-stage A Tier 1 pre-CST lexical rewrites (`UR-21-00` and `UR-22-00`) into `collector`.
-fn collectSubstageATier1Fixes(
+/// Tokenizes `source` (rebased at `base_offset`) and emits Tier 1 `UR-21-00` and `UR-22-00` fixes into `collector`.
+fn collectTier1FixesOnSlice(
     allocator: std.mem.Allocator,
     source: []const u8,
+    base_offset: u32,
     file_id: FileId,
     options: UpgradeOptions,
+    has_local_std: bool,
+    has_local_numeric: bool,
+    depth: u8,
     collector: *FixCollector,
-) !void {
+) anyerror!void {
     const is_ur21_00 = isRuleEnabled(options.rule_mask, .ur_21_00_path_coloncolon_and_std_root);
     const is_ur22_00 = isRuleEnabled(options.rule_mask, .ur_22_00_lexical_token_canonicalization);
     if (!is_ur21_00 and !is_ur22_00) return;
@@ -1080,9 +1342,6 @@ fn collectSubstageATier1Fixes(
 
     var lex_inst = lexer.Lexer.init(source, file_id, &tok_buf, &lex_sink, collector.interner);
     _ = try lex_inst.tokenize();
-
-    const has_local_std = if (is_ur21_00) hasLocalStdDeclaration(source, &tok_buf) else false;
-    const has_local_numeric = if (is_ur22_00) hasLocalNumericDeclaration(source, &tok_buf) else false;
     const tok_count = tok_buf.countTokens();
 
     var i: usize = 0;
@@ -1090,11 +1349,13 @@ fn collectSubstageATier1Fixes(
         const tok_idx = TokenIndex.fromInt(@intCast(i));
         const rec = tok_buf.getToken(tok_idx);
         if (rec.flags.is_synthesized or rec.kind == .eof or rec.byte_len == 0) continue;
-        const lexeme = tokenSlice(source, &tok_buf, tok_idx);
-        const start_byte = rec.byte_offset;
-        const end_byte = rec.byte_offset +| rec.byte_len;
+        const lexeme = symbol_resolver.extractTokenSlice(source, &tok_buf, tok_idx);
+        const local_start = rec.byte_offset;
+        const local_end = rec.byte_offset +| rec.byte_len;
+        const start_byte = base_offset +| local_start;
+        const end_byte = base_offset +| local_end;
 
-        // [1] `UR-21-00`: `::` -> `.` and root `std` -> `cx`:
+        // [1] `UR-21-00`; `::` -> `.` and root `std` -> `cx`:
         if (is_ur21_00) {
             if (rec.kind == .dot and rec.byte_len == 2 and std.mem.eql(u8, lexeme, "::")) {
                 try collector.appendSingleEdit(
@@ -1149,15 +1410,15 @@ fn collectSubstageATier1Fixes(
             }
         }
 
-        // [2] `UR-22-00`: `&&` -> `and`, `@noalloc` -> `@no_alloc`, `Numeric` -> `Number`, `\{`/`\}` -> `{{`/`}}`:
+        // [2] `UR-22-00`; `&&` -> `and`, `@noalloc` -> `@no_alloc`, `Numeric` -> `Number`, `\{`/`\}` -> `{{`/`}}`:
         if (is_ur22_00) {
             if (rec.kind == .kw_and and rec.byte_len == 2 and std.mem.eql(u8, lexeme, "&&")) {
-                const is_needing_left_sp = start_byte > 0 and !isAsciiWhitespace(source[start_byte - 1]) and
-                    source[start_byte - 1] != '(' and source[start_byte - 1] != '[' and source[start_byte - 1] != '{';
-                const is_needing_right_sp = @as(usize, end_byte) < source.len and
-                    !isAsciiWhitespace(source[end_byte]) and
-                    source[end_byte] != ')' and source[end_byte] != ']' and source[end_byte] != '}' and
-                    source[end_byte] != ',' and source[end_byte] != ';';
+                const is_needing_left_sp = local_start > 0 and !isAsciiWhitespace(source[local_start - 1]) and
+                    source[local_start - 1] != '(' and source[local_start - 1] != '[' and source[local_start - 1] != '{';
+                const is_needing_right_sp = @as(usize, local_end) < source.len and
+                    !isAsciiWhitespace(source[local_end]) and
+                    source[local_end] != ')' and source[local_end] != ']' and source[local_end] != '}' and
+                    source[local_end] != ',' and source[local_end] != ';';
                 const and_repl: []const u8 = if (is_needing_left_sp and is_needing_right_sp)
                     " and "
                 else if (is_needing_left_sp)
@@ -1179,10 +1440,10 @@ fn collectSubstageATier1Fixes(
             if (rec.kind == .at and i + 1 < tok_count) {
                 const next_tok = TokenIndex.fromInt(@intCast(i + 1));
                 const next_rec = tok_buf.getToken(next_tok);
-                const next_end = next_rec.byte_offset +| next_rec.byte_len;
+                const next_end = base_offset +| (next_rec.byte_offset +| next_rec.byte_len);
                 if (next_rec.kind == .ident and
-                    std.mem.eql(u8, tokenSlice(source, &tok_buf, next_tok), "noalloc") and
-                    !hasCommentsInByteRange(source, &tok_buf, end_byte, next_rec.byte_offset))
+                    std.mem.eql(u8, symbol_resolver.extractTokenSlice(source, &tok_buf, next_tok), "noalloc") and
+                    !hasCommentsInByteRange(source, &tok_buf, local_end, next_rec.byte_offset))
                 {
                     try collector.appendSingleEdit(
                         .syntax_canonicalization,
@@ -1210,23 +1471,62 @@ fn collectSubstageATier1Fixes(
                     continue;
                 }
             }
+        }
 
-            if (rec.kind == .string_lit and lexeme.len >= 2) {
-                // Skip raw (`r"…"`, `r#"…"#`) and byte (`b"…"`, `br"…"`) literals:
-                if (lexeme[0] != 'r' and lexeme[0] != 'b') {
-                    const is_triple = lexeme.len >= 6 and std.mem.startsWith(u8, lexeme, "\"\"\"");
-                    const open_len: usize = if (is_triple) 3 else 1;
-                    _ = try scanStandardStringBodyForBraceEscapes(
-                        source,
-                        @as(usize, start_byte) + open_len,
-                        @as(usize, end_byte),
-                        is_triple,
-                        collector,
-                    );
-                }
-            }
+        if (rec.kind == .string_lit and lexeme.len >= 2 and lexeme[0] != 'r' and lexeme[0] != 'b') {
+            const is_triple = lexeme.len >= 6 and std.mem.startsWith(u8, lexeme, "\"\"\"");
+            const open_len: usize = if (is_triple) 3 else 1;
+            _ = try scanStandardStringBodyForBraceEscapes(
+                allocator,
+                source,
+                @as(usize, local_start) + open_len,
+                @as(usize, local_end),
+                base_offset,
+                is_triple,
+                file_id,
+                options,
+                has_local_std,
+                has_local_numeric,
+                depth,
+                collector,
+            );
         }
     }
+}
+
+/// Collects Sub-stage A Tier 1 pre-CST lexical rewrites (`UR-21-00` and `UR-22-00`) into `collector`.
+fn collectSubstageATier1Fixes(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    file_id: FileId,
+    options: UpgradeOptions,
+    collector: *FixCollector,
+) !void {
+    const is_ur21_00 = isRuleEnabled(options.rule_mask, .ur_21_00_path_coloncolon_and_std_root);
+    const is_ur22_00 = isRuleEnabled(options.rule_mask, .ur_22_00_lexical_token_canonicalization);
+    if (!is_ur21_00 and !is_ur22_00) return;
+
+    var tok_buf = TokenBuffer.init(allocator);
+    defer tok_buf.deinit();
+    var lex_sink = DiagnosticSink.init(allocator);
+    defer lex_sink.deinit();
+
+    var lex_inst = lexer.Lexer.init(source, file_id, &tok_buf, &lex_sink, collector.interner);
+    _ = try lex_inst.tokenize();
+
+    const has_local_std = if (is_ur21_00) hasLocalStdDeclaration(source, &tok_buf) else false;
+    const has_local_numeric = if (is_ur22_00) hasLocalNumericDeclaration(source, &tok_buf) else false;
+    try collectTier1FixesOnSlice(
+        allocator,
+        source,
+        0,
+        file_id,
+        options,
+        has_local_std,
+        has_local_numeric,
+        0,
+        collector,
+    );
 }
 
 // --------------- Tier 2 CST Structural Rewrites ---------------
@@ -1272,7 +1572,7 @@ fn hasLocalSymbolShadow(source: []const u8, tok_buf: *const TokenBuffer, target_
     var i: usize = 0;
     while (i < tok_count) : (i += 1) {
         const tok_idx = TokenIndex.fromInt(@intCast(i));
-        if (!std.mem.eql(u8, tokenSlice(source, tok_buf, tok_idx), target_name)) continue;
+        if (!std.mem.eql(u8, symbol_resolver.extractTokenSlice(source, tok_buf, tok_idx), target_name)) continue;
         if (i > 0) {
             const prev_kind = tok_buf.getToken(TokenIndex.fromInt(@intCast(i - 1))).kind;
             switch (prev_kind) {
@@ -1320,7 +1620,7 @@ fn formatUpgradedPatternText(
         if (rec.byte_offset > cursor_byte) {
             try builder.appendSlice(allocator, source[cursor_byte..rec.byte_offset]);
         }
-        const lex = tokenSlice(source, tok_buf, tok_idx);
+        const lex = symbol_resolver.extractTokenSlice(source, tok_buf, tok_idx);
         const prev_kind: ?TokenKind = if (tok_i > pat_first.asInt())
             tok_buf.getToken(TokenIndex.fromInt(tok_i - 1)).kind
         else
@@ -1655,40 +1955,36 @@ fn collectLetSomeElseToOrelseFixes(
         if (hdr_i < eq_tok.asInt() and tok_buf.getToken(TokenIndex.fromInt(hdr_i)).kind == .dot) {
             hdr_i += 1;
             if (hdr_i < eq_tok.asInt() and
-                std.mem.eql(u8, tokenSlice(source, tok_buf, TokenIndex.fromInt(hdr_i)), "Some"))
+                std.mem.eql(u8, symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(hdr_i)), "Some"))
             {
                 hdr_i += 1;
                 is_matched_some = true;
             }
         } else if (hdr_i < eq_tok.asInt()) {
             // Walk optional `cx.option.Option.` or `Option.` prefix ending in `Some`:
-            var path_ok = true;
-            var saw_some = false;
-            var saw_only_option_prefix = true;
+            var is_path_ok = true;
+            var has_seen_some = false;
+            var has_only_option_prefix = true;
             while (hdr_i < eq_tok.asInt()) {
                 const seg_tok = TokenIndex.fromInt(hdr_i);
-                const seg_lex = tokenSlice(source, tok_buf, seg_tok);
+                const seg_lex = symbol_resolver.extractTokenSlice(source, tok_buf, seg_tok);
                 if (hdr_i + 1 < eq_tok.asInt() and tok_buf.getToken(TokenIndex.fromInt(hdr_i + 1)).kind == .dot) {
-                    if (!std.mem.eql(u8, seg_lex, "Option") and
-                        !std.mem.eql(u8, seg_lex, "option") and
-                        !std.mem.eql(u8, seg_lex, "cx") and
-                        !std.mem.eql(u8, seg_lex, "std"))
-                    {
-                        saw_only_option_prefix = false;
+                    if (!OPTION_PREFIX_SEGMENT_SET.has(seg_lex)) {
+                        has_only_option_prefix = false;
                         break;
                     }
                     hdr_i += 2;
                 } else {
                     if (std.mem.eql(u8, seg_lex, "Some")) {
-                        saw_some = true;
+                        has_seen_some = true;
                         hdr_i += 1;
                     } else {
-                        path_ok = false;
+                        is_path_ok = false;
                     }
                     break;
                 }
             }
-            is_matched_some = path_ok and saw_some and saw_only_option_prefix;
+            is_matched_some = is_path_ok and has_seen_some and has_only_option_prefix;
         }
         if (!is_matched_some) continue;
 
@@ -1703,7 +1999,7 @@ fn collectLetSomeElseToOrelseFixes(
             }
         }
         if (hdr_i >= eq_tok.asInt() or tok_buf.getToken(TokenIndex.fromInt(hdr_i)).kind != .ident) continue;
-        const bind_ident = tokenSlice(source, tok_buf, TokenIndex.fromInt(hdr_i));
+        const bind_ident = symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(hdr_i));
         hdr_i += 1;
         if (hdr_i >= eq_tok.asInt() or tok_buf.getToken(TokenIndex.fromInt(hdr_i)).kind != .rparen) continue;
         hdr_i += 1;
@@ -1986,9 +2282,9 @@ fn collectParameterAndCallModeFixes(
                     const self_rec = tok_buf.getToken(TokenIndex.fromInt(self_tok_i));
                     const self_end_b = self_rec.byte_offset +| self_rec.byte_len;
                     if (!hasCommentsInByteRange(source, tok_buf, prefix_start_b, self_end_b)) {
-                        const first_lex = tokenSlice(source, tok_buf, TokenIndex.fromInt(cur_tok_i));
+                        const first_lex = symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(cur_tok_i));
                         const second_lex = if (cur_tok_i + 1 < self_tok_i)
-                            tokenSlice(source, tok_buf, TokenIndex.fromInt(cur_tok_i + 1))
+                            symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(cur_tok_i + 1))
                         else
                             "";
 
@@ -2007,39 +2303,21 @@ fn collectParameterAndCallModeFixes(
                                 "&mut self",
                                 "UR-22-02: rewrite `ref mut self` receiver to `&mut self`",
                             );
-                        } else if (std.mem.eql(u8, first_lex, "inout")) {
-                            try collector.appendSingleEdit(
-                                .syntax_canonicalization,
-                                prefix_start_b,
-                                self_end_b,
-                                "&mut self",
-                                "UR-22-02: rewrite `inout self` receiver to `&mut self`",
-                            );
-                        } else if (std.mem.eql(u8, first_lex, "ref")) {
-                            try collector.appendSingleEdit(
-                                .syntax_canonicalization,
-                                prefix_start_b,
-                                self_end_b,
-                                "&self",
-                                "UR-22-02: rewrite `ref self` receiver to `&self`",
-                            );
-                        } else if (std.mem.eql(u8, first_lex, "sink")) {
-                            try collector.appendSingleEdit(
-                                .syntax_canonicalization,
-                                prefix_start_b,
-                                self_end_b,
-                                "own self",
-                                "UR-22-02: rewrite `sink self` receiver to `own self`",
-                            );
-                        } else if (std.mem.eql(u8, first_lex, "mut") or
-                            (std.mem.eql(u8, first_lex, "var") and std.mem.eql(u8, second_lex, "mut")))
-                        {
+                        } else if (std.mem.eql(u8, first_lex, "var") and std.mem.eql(u8, second_lex, "mut")) {
                             try collector.appendSingleEdit(
                                 .syntax_canonicalization,
                                 prefix_start_b,
                                 self_end_b,
                                 "var self",
-                                "UR-22-02: rewrite `mut self` receiver to `var self`",
+                                "UR-22-02: rewrite `var mut self` receiver to `var self`",
+                            );
+                        } else if (RETIRED_SELF_MODE_MAP.get(first_lex)) |canon_self| {
+                            try collector.appendSingleEdit(
+                                .syntax_canonicalization,
+                                prefix_start_b,
+                                self_end_b,
+                                canon_self,
+                                "UR-22-02: canonicalize `self` receiver mode",
                             );
                         }
                     }
@@ -2070,9 +2348,9 @@ fn collectParameterAndCallModeFixes(
                 // Handle `$id: <ty_mode> $ty` when `colon_tok_i == cur_tok_i + 1`:
                 if (colon_tok_i == cur_tok_i + 1 and colon_tok_i + 1 <= param_sp.last_tok.asInt()) {
                     const ty_tok_i = colon_tok_i + 1;
-                    const ty_first_lex = tokenSlice(source, tok_buf, TokenIndex.fromInt(ty_tok_i));
+                    const ty_first_lex = symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(ty_tok_i));
                     const ty_second_lex = if (ty_tok_i + 1 <= param_sp.last_tok.asInt())
-                        tokenSlice(source, tok_buf, TokenIndex.fromInt(ty_tok_i + 1))
+                        symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(ty_tok_i + 1))
                     else
                         "";
                     const ty_first_rec = tok_buf.getToken(TokenIndex.fromInt(ty_tok_i));
@@ -2092,47 +2370,31 @@ fn collectParameterAndCallModeFixes(
                                 "UR-22-02: rewrite `: ref mut T` parameter type to `: &mut T`",
                             );
                         }
-                    } else if (std.mem.eql(u8, ty_first_lex, "inout") and ty_tok_i + 1 <= param_sp.last_tok.asInt()) {
-                        try handled_tokens.put(allocator, ty_tok_i, {});
-                        try collector.appendSingleEdit(
-                            .syntax_canonicalization,
-                            ty_first_rec.byte_offset,
-                            ty_first_rec.byte_offset +| ty_first_rec.byte_len,
-                            "&mut",
-                            "UR-22-02: rewrite `: inout T` parameter type to `: &mut T`",
-                        );
-                    } else if (std.mem.eql(u8, ty_first_lex, "ref") and ty_tok_i + 1 <= param_sp.last_tok.asInt()) {
-                        const after_ref = tok_buf.getToken(TokenIndex.fromInt(ty_tok_i + 1));
-                        if (!hasCommentsInByteRange(source, tok_buf, ty_first_rec.byte_offset, after_ref.byte_offset)) {
-                            try handled_tokens.put(allocator, ty_tok_i, {});
-                            try collector.appendSingleEdit(
-                                .syntax_canonicalization,
-                                ty_first_rec.byte_offset,
-                                after_ref.byte_offset,
-                                "&",
-                                "UR-22-02: rewrite `: ref T` parameter type to `: &T`",
-                            );
+                    } else if (ty_tok_i + 1 <= param_sp.last_tok.asInt()) {
+                        if (RETIRED_TYPE_MODE_MAP.get(ty_first_lex)) |canon_ty_mode| {
+                            if (std.mem.eql(u8, canon_ty_mode, "&")) {
+                                const after_ref = tok_buf.getToken(TokenIndex.fromInt(ty_tok_i + 1));
+                                if (!hasCommentsInByteRange(source, tok_buf, ty_first_rec.byte_offset, after_ref.byte_offset)) {
+                                    try handled_tokens.put(allocator, ty_tok_i, {});
+                                    try collector.appendSingleEdit(
+                                        .syntax_canonicalization,
+                                        ty_first_rec.byte_offset,
+                                        after_ref.byte_offset,
+                                        "&",
+                                        "UR-22-02: rewrite `: ref T` parameter type to `: &T`",
+                                    );
+                                }
+                            } else {
+                                try handled_tokens.put(allocator, ty_tok_i, {});
+                                try collector.appendSingleEdit(
+                                    .syntax_canonicalization,
+                                    ty_first_rec.byte_offset,
+                                    ty_first_rec.byte_offset +| ty_first_rec.byte_len,
+                                    canon_ty_mode,
+                                    "UR-22-02: canonicalize retired parameter type mode",
+                                );
+                            }
                         }
-                    } else if ((std.mem.eql(u8, ty_first_lex, "set") or std.mem.eql(u8, ty_first_lex, "out")) and
-                        ty_tok_i + 1 <= param_sp.last_tok.asInt())
-                    {
-                        try handled_tokens.put(allocator, ty_tok_i, {});
-                        try collector.appendSingleEdit(
-                            .syntax_canonicalization,
-                            ty_first_rec.byte_offset,
-                            ty_first_rec.byte_offset +| ty_first_rec.byte_len,
-                            "&out",
-                            "UR-22-02: rewrite `: set/out T` parameter type to `: &out T`",
-                        );
-                    } else if (std.mem.eql(u8, ty_first_lex, "sink") and ty_tok_i + 1 <= param_sp.last_tok.asInt()) {
-                        try handled_tokens.put(allocator, ty_tok_i, {});
-                        try collector.appendSingleEdit(
-                            .syntax_canonicalization,
-                            ty_first_rec.byte_offset,
-                            ty_first_rec.byte_offset +| ty_first_rec.byte_len,
-                            "own",
-                            "UR-22-02: rewrite `: sink T` parameter type to `: own T`",
-                        );
                     }
                 }
                 continue;
@@ -2148,9 +2410,9 @@ fn collectParameterAndCallModeFixes(
             if (hasCommentsInByteRange(source, tok_buf, mode_first_rec.byte_offset, name_rec.byte_offset)) {
                 continue;
             }
-            const mode_first_lex = tokenSlice(source, tok_buf, TokenIndex.fromInt(cur_tok_i));
+            const mode_first_lex = symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(cur_tok_i));
             const mode_second_lex = if (cur_tok_i + 1 < name_tok_i)
-                tokenSlice(source, tok_buf, TokenIndex.fromInt(cur_tok_i + 1))
+                symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(cur_tok_i + 1))
             else
                 "";
 
@@ -2167,28 +2429,28 @@ fn collectParameterAndCallModeFixes(
             if (std.mem.eql(u8, mode_first_lex, "ref") and std.mem.eql(u8, mode_second_lex, "mut")) {
                 new_param_prefix = "";
                 inserted_ty_mode = if (ty_start_rec.kind == .amp) null else "&mut ";
-            } else if (std.mem.eql(u8, mode_first_lex, "inout")) {
-                new_param_prefix = "";
-                inserted_ty_mode = if (ty_start_rec.kind == .amp) null else "&mut ";
-            } else if (std.mem.eql(u8, mode_first_lex, "ref")) {
-                new_param_prefix = "";
-                inserted_ty_mode = if (ty_start_rec.kind == .amp) null else "&";
-            } else if (std.mem.eql(u8, mode_first_lex, "set") or std.mem.eql(u8, mode_first_lex, "out")) {
-                new_param_prefix = "";
-                inserted_ty_mode = if (ty_start_rec.kind == .amp) null else "&out ";
-            } else if ((std.mem.eql(u8, mode_first_lex, "mut") or std.mem.eql(u8, mode_first_lex, "var")) and
-                (std.mem.eql(u8, mode_second_lex, "sink") or std.mem.eql(u8, mode_second_lex, "own")))
-            {
+            } else if (PARAM_MUT_INTRO_SET.has(mode_first_lex) and PARAM_OWN_MODE_SET.has(mode_second_lex)) {
                 new_param_prefix = "var ";
                 inserted_ty_mode = if (ty_start_rec.kind == .kw_own) null else "own ";
-            } else if (std.mem.eql(u8, mode_first_lex, "sink") or std.mem.eql(u8, mode_first_lex, "own")) {
+            } else if (PARAM_OWN_MODE_SET.has(mode_first_lex)) {
                 new_param_prefix = "";
                 inserted_ty_mode = if (ty_start_rec.kind == .kw_own) null else "own ";
+            } else if (RETIRED_TYPE_MODE_MAP.get(mode_first_lex)) |canon_lead| {
+                new_param_prefix = "";
+                if (ty_start_rec.kind != .amp) {
+                    inserted_ty_mode = if (std.mem.eql(u8, canon_lead, "&"))
+                        "&"
+                    else if (std.mem.eql(u8, canon_lead, "&mut"))
+                        "&mut "
+                    else
+                        "&out ";
+                }
             } else if (std.mem.eql(u8, mode_first_lex, "mut") or
                 (std.mem.eql(u8, mode_first_lex, "var") and std.mem.eql(u8, mode_second_lex, "mut")))
             {
                 new_param_prefix = "var ";
-                if (std.mem.eql(u8, tokenSlice(source, tok_buf, TokenIndex.fromInt(ty_start_tok_i)), "sink")) {
+                const ty_lead_lex = symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(ty_start_tok_i));
+                if (std.mem.eql(u8, ty_lead_lex, "sink")) {
                     try handled_tokens.put(allocator, ty_start_tok_i, {});
                     try collector.appendDualEdits(
                         .syntax_canonicalization,
@@ -2235,9 +2497,9 @@ fn collectParameterAndCallModeFixes(
             const first_i = ty_sp.first_tok.asInt();
             if (handled_tokens.contains(first_i)) continue;
             const first_rec = tok_buf.getToken(ty_sp.first_tok);
-            const first_lex = tokenSlice(source, tok_buf, ty_sp.first_tok);
+            const first_lex = symbol_resolver.extractTokenSlice(source, tok_buf, ty_sp.first_tok);
             const second_lex = if (first_i + 1 <= ty_sp.last_tok.asInt())
-                tokenSlice(source, tok_buf, TokenIndex.fromInt(first_i + 1))
+                symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(first_i + 1))
             else
                 "";
 
@@ -2257,45 +2519,31 @@ fn collectParameterAndCallModeFixes(
                         "UR-22-02: rewrite `ref mut T` type to `&mut T`",
                     );
                 }
-            } else if (std.mem.eql(u8, first_lex, "inout") and first_i + 1 <= ty_sp.last_tok.asInt()) {
-                try handled_tokens.put(allocator, first_i, {});
-                try collector.appendSingleEdit(
-                    .syntax_canonicalization,
-                    first_rec.byte_offset,
-                    first_rec.byte_offset +| first_rec.byte_len,
-                    "&mut",
-                    "UR-22-02: rewrite `inout T` type to `&mut T`",
-                );
-            } else if (std.mem.eql(u8, first_lex, "ref") and first_i + 1 <= ty_sp.last_tok.asInt()) {
-                const next_rec = tok_buf.getToken(TokenIndex.fromInt(first_i + 1));
-                if (!hasCommentsInByteRange(source, tok_buf, first_rec.byte_offset, next_rec.byte_offset)) {
-                    try handled_tokens.put(allocator, first_i, {});
-                    try collector.appendSingleEdit(
-                        .syntax_canonicalization,
-                        first_rec.byte_offset,
-                        next_rec.byte_offset,
-                        "&",
-                        "UR-22-02: rewrite `ref T` type to `&T`",
-                    );
+            } else if (first_i + 1 <= ty_sp.last_tok.asInt()) {
+                if (RETIRED_TYPE_MODE_MAP.get(first_lex)) |canon_mode| {
+                    if (std.mem.eql(u8, canon_mode, "&")) {
+                        const next_rec = tok_buf.getToken(TokenIndex.fromInt(first_i + 1));
+                        if (!hasCommentsInByteRange(source, tok_buf, first_rec.byte_offset, next_rec.byte_offset)) {
+                            try handled_tokens.put(allocator, first_i, {});
+                            try collector.appendSingleEdit(
+                                .syntax_canonicalization,
+                                first_rec.byte_offset,
+                                next_rec.byte_offset,
+                                "&",
+                                "UR-22-02: rewrite `ref T` type to `&T`",
+                            );
+                        }
+                    } else {
+                        try handled_tokens.put(allocator, first_i, {});
+                        try collector.appendSingleEdit(
+                            .syntax_canonicalization,
+                            first_rec.byte_offset,
+                            first_rec.byte_offset +| first_rec.byte_len,
+                            canon_mode,
+                            "UR-22-02: canonicalize retired type passing mode",
+                        );
+                    }
                 }
-            } else if (std.mem.eql(u8, first_lex, "set") and first_i + 1 <= ty_sp.last_tok.asInt()) {
-                try handled_tokens.put(allocator, first_i, {});
-                try collector.appendSingleEdit(
-                    .syntax_canonicalization,
-                    first_rec.byte_offset,
-                    first_rec.byte_offset +| first_rec.byte_len,
-                    "&out",
-                    "UR-22-02: rewrite `set T` type to `&out T`",
-                );
-            } else if (std.mem.eql(u8, first_lex, "sink") and first_i + 1 <= ty_sp.last_tok.asInt()) {
-                try handled_tokens.put(allocator, first_i, {});
-                try collector.appendSingleEdit(
-                    .syntax_canonicalization,
-                    first_rec.byte_offset,
-                    first_rec.byte_offset +| first_rec.byte_len,
-                    "own",
-                    "UR-22-02: rewrite `sink T` type to `own T`",
-                );
             }
             continue;
         }
@@ -2312,7 +2560,7 @@ fn collectParameterAndCallModeFixes(
                 if (rec.kind == .for_header and tok_buf.getToken(TokenIndex.fromInt(tok_i)).kind == .kw_in) break;
                 if (handled_tokens.contains(tok_i)) continue;
                 const t_rec = tok_buf.getToken(TokenIndex.fromInt(tok_i));
-                if (t_rec.kind != .ident or !std.mem.eql(u8, tokenSlice(source, tok_buf, TokenIndex.fromInt(tok_i)), "ref")) {
+                if (t_rec.kind != .ident or !std.mem.eql(u8, symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(tok_i)), "ref")) {
                     continue;
                 }
                 if (tok_i + 2 <= pat_sp.last_tok.asInt() and
@@ -2360,8 +2608,7 @@ fn collectParameterAndCallModeFixes(
             var close_paren_tok: TokenIndex = .none;
             var child_c = cst_i + 1;
             while (child_c < call_end_node) {
-                const c_id = CstNodeIndex.fromInt(@intCast(child_c));
-                const c_rec = cst_arena.getNode(c_id);
+                const c_rec = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(child_c)));
                 if (c_rec.kind == .call_args_start and !c_rec.token.isNone()) {
                     open_paren_tok = c_rec.token;
                 } else if (!open_paren_tok.isNone() and c_rec.subtree_size <= 1 and !c_rec.token.isNone() and
@@ -2393,9 +2640,9 @@ fn collectParameterAndCallModeFixes(
                         }
                         if (mode_i + 1 < scan_arg and !handled_tokens.contains(mode_i)) {
                             const m0_rec = tok_buf.getToken(TokenIndex.fromInt(mode_i));
-                            const m0_lex = tokenSlice(source, tok_buf, TokenIndex.fromInt(mode_i));
+                            const m0_lex = symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(mode_i));
                             const m1_rec = tok_buf.getToken(TokenIndex.fromInt(mode_i + 1));
-                            const m1_lex = tokenSlice(source, tok_buf, TokenIndex.fromInt(mode_i + 1));
+                            const m1_lex = symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(mode_i + 1));
 
                             if (m0_rec.kind == .ident and std.mem.eql(u8, m0_lex, "ref") and
                                 m1_rec.kind == .kw_mut and mode_i + 2 < scan_arg and
@@ -2413,54 +2660,30 @@ fn collectParameterAndCallModeFixes(
                                         "UR-22-02: rewrite call-site `ref mut` to `&mut`",
                                     );
                                 }
-                            } else if (m0_rec.kind == .ident and std.mem.eql(u8, m0_lex, "inout") and
-                                isCallArgExprStartToken(m1_rec.kind))
-                            {
-                                try handled_tokens.put(allocator, mode_i, {});
-                                try collector.appendSingleEdit(
-                                    .syntax_canonicalization,
-                                    m0_rec.byte_offset,
-                                    m0_rec.byte_offset +| m0_rec.byte_len,
-                                    "&mut",
-                                    "UR-22-02: rewrite call-site `inout` to `&mut`",
-                                );
-                            } else if (m0_rec.kind == .ident and std.mem.eql(u8, m0_lex, "ref") and
-                                isCallArgExprStartToken(m1_rec.kind))
-                            {
-                                if (!hasCommentsInByteRange(source, tok_buf, m0_rec.byte_offset, m1_rec.byte_offset)) {
-                                    try handled_tokens.put(allocator, mode_i, {});
-                                    try collector.appendSingleEdit(
-                                        .syntax_canonicalization,
-                                        m0_rec.byte_offset,
-                                        m1_rec.byte_offset,
-                                        "&",
-                                        "UR-22-02: rewrite call-site `ref` to `&`",
-                                    );
+                            } else if (m0_rec.kind == .ident and isCallArgExprStartToken(m1_rec.kind)) {
+                                if (RETIRED_TYPE_MODE_MAP.get(m0_lex)) |canon_call_mode| {
+                                    if (std.mem.eql(u8, canon_call_mode, "&")) {
+                                        if (!hasCommentsInByteRange(source, tok_buf, m0_rec.byte_offset, m1_rec.byte_offset)) {
+                                            try handled_tokens.put(allocator, mode_i, {});
+                                            try collector.appendSingleEdit(
+                                                .syntax_canonicalization,
+                                                m0_rec.byte_offset,
+                                                m1_rec.byte_offset,
+                                                "&",
+                                                "UR-22-02: rewrite call-site `ref` to `&`",
+                                            );
+                                        }
+                                    } else if (!std.mem.eql(u8, canon_call_mode, "&out") or !std.mem.eql(u8, m1_lex, "is")) {
+                                        try handled_tokens.put(allocator, mode_i, {});
+                                        try collector.appendSingleEdit(
+                                            .syntax_canonicalization,
+                                            m0_rec.byte_offset,
+                                            m0_rec.byte_offset +| m0_rec.byte_len,
+                                            canon_call_mode,
+                                            "UR-22-02: canonicalize retired call-site passing mode",
+                                        );
+                                    }
                                 }
-                            } else if (m0_rec.kind == .ident and
-                                (std.mem.eql(u8, m0_lex, "set") or std.mem.eql(u8, m0_lex, "out")) and
-                                isCallArgExprStartToken(m1_rec.kind) and
-                                !std.mem.eql(u8, m1_lex, "is"))
-                            {
-                                try handled_tokens.put(allocator, mode_i, {});
-                                try collector.appendSingleEdit(
-                                    .syntax_canonicalization,
-                                    m0_rec.byte_offset,
-                                    m0_rec.byte_offset +| m0_rec.byte_len,
-                                    "&out",
-                                    "UR-22-02: rewrite call-site `set`/`out` to `&out`",
-                                );
-                            } else if (m0_rec.kind == .ident and std.mem.eql(u8, m0_lex, "sink") and
-                                isCallArgExprStartToken(m1_rec.kind))
-                            {
-                                try handled_tokens.put(allocator, mode_i, {});
-                                try collector.appendSingleEdit(
-                                    .syntax_canonicalization,
-                                    m0_rec.byte_offset,
-                                    m0_rec.byte_offset +| m0_rec.byte_len,
-                                    "own",
-                                    "UR-22-02: rewrite call-site `sink` to `own`",
-                                );
                             }
                         }
                     }
@@ -2531,10 +2754,8 @@ fn hasCallableTypeTailCst(
     const sp = extractCstTokenSpan(cst_arena, tok_buf, type_cst) orelse return false;
     const rec = cst_arena.getNode(type_cst);
     if (rec.subtree_size <= 1) return false;
-    const first_lex = tokenSlice(source, tok_buf, sp.first_tok);
-    if (rec.kind == .fn_type or rec.kind == .closure_type or
-        std.mem.eql(u8, first_lex, "any") or std.mem.eql(u8, first_lex, "dyn"))
-    {
+    const first_lex = symbol_resolver.extractTokenSlice(source, tok_buf, sp.first_tok);
+    if (rec.kind == .fn_type or rec.kind == .closure_type or CALLABLE_BOUND_HEAD_SET.has(first_lex)) {
         return true;
     }
     return switch (rec.kind) {
@@ -2593,12 +2814,8 @@ fn renderUpgradedTypeCstRecursive(
         if (!type_args_cst.isNone()) {
             const args_sp = extractCstTokenSpan(cst_arena, tok_buf, type_args_cst).?;
             const head_raw = std.mem.trim(u8, source[sp.start_byte..args_sp.start_byte], " \t\r\n");
-            const is_opt_name = is_option_unshadowed and (std.mem.eql(u8, head_raw, "Option") or
-                std.mem.eql(u8, head_raw, "cx.option.Option") or
-                std.mem.eql(u8, head_raw, "std.option.Option"));
-            const is_res_name = is_result_unshadowed and (std.mem.eql(u8, head_raw, "Result") or
-                std.mem.eql(u8, head_raw, "cx.result.Result") or
-                std.mem.eql(u8, head_raw, "std.result.Result"));
+            const is_opt_name = is_option_unshadowed and CANONICAL_OPTION_HEAD_SET.has(head_raw);
+            const is_res_name = is_result_unshadowed and CANONICAL_RESULT_HEAD_SET.has(head_raw);
 
             if (is_opt_name or is_res_name) {
                 var arg_types: std.ArrayListUnmanaged(CstNodeIndex) = .empty;
@@ -2631,15 +2848,15 @@ fn renderUpgradedTypeCstRecursive(
                         is_result_unshadowed,
                     );
                     defer allocator.free(inner.text);
-                    const needs_parens = @backingInt(inner.prec) < @backingInt(TypeRewritePrec.tier3_postfix) or
+                    const is_needing_parens = @backingInt(inner.prec) < @backingInt(TypeRewritePrec.tier3_postfix) or
                         inner.has_callable_tail;
                     const out_str = try std.fmt.allocPrint(
                         allocator,
                         "{s}{s}{s}?",
                         .{
-                            if (needs_parens) "(" else "",
+                            if (is_needing_parens) "(" else "",
                             inner.text,
-                            if (needs_parens) ")" else "",
+                            if (is_needing_parens) ")" else "",
                         },
                     );
                     return .{
@@ -2673,20 +2890,20 @@ fn renderUpgradedTypeCstRecursive(
                     defer allocator.free(err_part.text);
 
                     // `T!E` is non-associative (`tier1_result`), and callable tails (`*fn() -> A`) capture `!E`:
-                    const ok_parens = @backingInt(ok_part.prec) <= @backingInt(TypeRewritePrec.tier1_result) or
+                    const is_ok_parenthesized = @backingInt(ok_part.prec) <= @backingInt(TypeRewritePrec.tier1_result) or
                         ok_part.has_callable_tail;
-                    const err_parens = @backingInt(err_part.prec) <= @backingInt(TypeRewritePrec.tier1_result) or
+                    const is_err_parenthesized = @backingInt(err_part.prec) <= @backingInt(TypeRewritePrec.tier1_result) or
                         err_part.has_callable_tail;
                     const out_str = try std.fmt.allocPrint(
                         allocator,
                         "{s}{s}{s}!{s}{s}{s}",
                         .{
-                            if (ok_parens) "(" else "",
+                            if (is_ok_parenthesized) "(" else "",
                             ok_part.text,
-                            if (ok_parens) ")" else "",
-                            if (err_parens) "(" else "",
+                            if (is_ok_parenthesized) ")" else "",
+                            if (is_err_parenthesized) "(" else "",
                             err_part.text,
-                            if (err_parens) ")" else "",
+                            if (is_err_parenthesized) ")" else "",
                         },
                     );
                     return .{
@@ -2717,17 +2934,16 @@ fn renderUpgradedTypeCstRecursive(
         else => .tier4_primary,
     };
     const is_direct_callable_or_dyn = rec.kind == .fn_type or rec.kind == .closure_type or
-        std.mem.eql(u8, tokenSlice(source, tok_buf, sp.first_tok), "any") or
-        std.mem.eql(u8, tokenSlice(source, tok_buf, sp.first_tok), "dyn");
-    const unchanged_callable_tail = is_direct_callable_or_dyn or
+        CALLABLE_BOUND_HEAD_SET.has(symbol_resolver.extractTokenSlice(source, tok_buf, sp.first_tok));
+    const has_unchanged_callable_tail = is_direct_callable_or_dyn or
         hasCallableTypeTailCst(source, cst_arena, tok_buf, type_cst);
 
     // [3] Recursively inspect direct child type CST nodes and splice any upgraded inner types:
     var out_buf: std.ArrayList(u8) = .empty;
     errdefer out_buf.deinit(allocator);
     var cursor_b: usize = sp.start_byte;
-    var any_child_changed = false;
-    var last_child_callable_tail = false;
+    var has_any_child_change = false;
+    var has_last_child_callable_tail = false;
 
     var child_idx: usize = type_cst.asInt() + 1;
     while (child_idx < cst_end) {
@@ -2747,7 +2963,7 @@ fn renderUpgradedTypeCstRecursive(
                 defer allocator.free(sub_res.text);
 
                 if (sub_res.has_change) {
-                    any_child_changed = true;
+                    has_any_child_change = true;
                     if (sub_sp.start_byte > cursor_b) {
                         try out_buf.appendSlice(allocator, source[cursor_b..sub_sp.start_byte]);
                     }
@@ -2772,10 +2988,10 @@ fn renderUpgradedTypeCstRecursive(
                     if (is_wrap_child) try out_buf.append(allocator, '(');
                     try out_buf.appendSlice(allocator, sub_res.text);
                     if (is_wrap_child) try out_buf.append(allocator, ')');
-                    last_child_callable_tail = !is_wrap_child and sub_res.has_callable_tail;
+                    has_last_child_callable_tail = !is_wrap_child and sub_res.has_callable_tail;
                     cursor_b = sub_sp.end_byte;
                 } else {
-                    last_child_callable_tail = sub_res.has_callable_tail;
+                    has_last_child_callable_tail = sub_res.has_callable_tail;
                 }
             }
             child_idx += @max(@as(usize, sub_rec.subtree_size), 1);
@@ -2784,12 +3000,12 @@ fn renderUpgradedTypeCstRecursive(
         }
     }
 
-    if (!any_child_changed) {
+    if (!has_any_child_change) {
         out_buf.deinit(allocator);
         return .{
             .text = try allocator.dupe(u8, source[sp.start_byte..sp.end_byte]),
             .prec = intrinsic_prec,
-            .has_callable_tail = unchanged_callable_tail,
+            .has_callable_tail = has_unchanged_callable_tail,
             .has_change = false,
         };
     }
@@ -2797,15 +3013,15 @@ fn renderUpgradedTypeCstRecursive(
     if (cursor_b < sp.end_byte) {
         try out_buf.appendSlice(allocator, source[cursor_b..sp.end_byte]);
     }
-    const final_callable_tail = is_direct_callable_or_dyn or switch (rec.kind) {
-        .ptr_type, .mode_type => last_child_callable_tail,
-        .ref_type => !is_slice_ref and last_child_callable_tail,
+    const has_final_callable_tail = is_direct_callable_or_dyn or switch (rec.kind) {
+        .ptr_type, .mode_type => has_last_child_callable_tail,
+        .ref_type => !is_slice_ref and has_last_child_callable_tail,
         else => false,
     };
     return .{
         .text = try out_buf.toOwnedSlice(allocator),
         .prec = intrinsic_prec,
-        .has_callable_tail = final_callable_tail,
+        .has_callable_tail = has_final_callable_tail,
         .has_change = true,
     };
 }
@@ -2884,7 +3100,9 @@ fn tryCollectOmitFnUnitReturnFix(
     if (ret_sp.last_tok.asInt() != ret_sp.first_tok.asInt() + 1) return;
     if (tok_buf.getToken(ret_sp.first_tok).kind != .arrow) return;
     const unit_tok = ret_sp.last_tok;
-    if (tok_buf.getToken(unit_tok).kind != .prim_type or !std.mem.eql(u8, tokenSlice(source, tok_buf, unit_tok), "unit")) {
+    const is_omissible_unit = tok_buf.getToken(unit_tok).kind == .prim_type and
+        (UNIT_OR_NEVER_PRIM_MAP.get(symbol_resolver.extractTokenSlice(source, tok_buf, unit_tok)) orelse false);
+    if (!is_omissible_unit) {
         return;
     }
 
@@ -2980,13 +3198,61 @@ fn collectAttrEnumBitfieldAndUnitFixes(
                     tok_buf.getToken(eq_tok).kind == .eq and
                     tok_buf.getToken(bf_kw_tok).kind == .kw_bit_field)
                 {
-                    // Find `{` opening the `bit_field` member block so backing type is preserved verbatim:
+                    // Find `{` opening the `bit_field` member block (skipping `where` / `[…]` / `(…)`):
                     var lbrace_tok_opt: ?u32 = null;
-                    var probe_b: u32 = scan_i + 4;
-                    while (probe_b <= alias_sp.last_tok.asInt()) : (probe_b += 1) {
-                        if (tok_buf.getToken(TokenIndex.fromInt(probe_b)).kind == .lbrace) {
-                            lbrace_tok_opt = probe_b;
-                            break;
+                    const maybe_close_tok_i: u32 = if (tok_buf.getToken(alias_sp.last_tok).kind == .semi and
+                        alias_sp.last_tok.asInt() > scan_i + 4)
+                        alias_sp.last_tok.asInt() - 1
+                    else
+                        alias_sp.last_tok.asInt();
+                    if (tok_buf.getToken(TokenIndex.fromInt(maybe_close_tok_i)).kind == .rbrace) {
+                        var rev_depth: u32 = 0;
+                        var rev_i: u32 = maybe_close_tok_i;
+                        while (rev_i >= scan_i + 4) : (rev_i -= 1) {
+                            const rk = tok_buf.getToken(TokenIndex.fromInt(rev_i)).kind;
+                            if (rk == .rbrace) {
+                                rev_depth += 1;
+                            } else if (rk == .lbrace) {
+                                rev_depth -|= 1;
+                                if (rev_depth == 0) {
+                                    lbrace_tok_opt = rev_i;
+                                    break;
+                                }
+                            }
+                            if (rev_i == 0) break;
+                        }
+                    } else {
+                        var probe_b: u32 = scan_i + 4;
+                        var hdr_brace: u32 = 0;
+                        var hdr_bracket: u32 = 0;
+                        var hdr_paren: u32 = 0;
+                        var is_in_where = false;
+                        while (probe_b <= alias_sp.last_tok.asInt()) : (probe_b += 1) {
+                            const pk = tok_buf.getToken(TokenIndex.fromInt(probe_b)).kind;
+                            if (pk == .kw_where and hdr_brace == 0 and hdr_bracket == 0 and hdr_paren == 0) {
+                                is_in_where = true;
+                                continue;
+                            }
+                            if (pk == .lbracket) {
+                                hdr_bracket += 1;
+                            } else if (pk == .rbracket) {
+                                hdr_bracket -|= 1;
+                            } else if (pk == .lparen) {
+                                hdr_paren += 1;
+                            } else if (pk == .rparen) {
+                                hdr_paren -|= 1;
+                            } else if (pk == .lbrace) {
+                                if (!is_in_where and hdr_brace == 0 and hdr_bracket == 0 and hdr_paren == 0) {
+                                    lbrace_tok_opt = probe_b;
+                                    break;
+                                }
+                                hdr_brace += 1;
+                            } else if (pk == .rbrace) {
+                                hdr_brace -|= 1;
+                                if (is_in_where and hdr_brace == 0 and hdr_bracket == 0 and hdr_paren == 0) {
+                                    is_in_where = false;
+                                }
+                            }
                         }
                     }
                     if (lbrace_tok_opt) |lbrace_i| {
@@ -2996,7 +3262,7 @@ fn collectAttrEnumBitfieldAndUnitFixes(
                             const back_end = back_last.byte_offset +| back_last.byte_len;
                             if (!hasCommentsInByteRange(source, tok_buf, type_kw_rec.byte_offset, back_first.byte_offset)) {
                                 const backing_str = std.mem.trim(u8, source[back_first.byte_offset..back_end], " \t\r\n");
-                                const name_str = tokenSlice(source, tok_buf, name_tok);
+                                const name_str = symbol_resolver.extractTokenSlice(source, tok_buf, name_tok);
                                 const hdr_repl = try std.fmt.allocPrint(
                                     allocator,
                                     "bit_field {s}: {s}",
@@ -3026,23 +3292,41 @@ fn collectAttrEnumBitfieldAndUnitFixes(
                                     );
                                 }
 
-                                // Also convert `;` -> `,` member separators inside `{ … }` of this `bit_field`:
+                                // Convert top-level `;` -> `,` member separators inside `{ … }` (preserving `[T; N]`):
                                 var brace_depth: u32 = 0;
+                                var bracket_depth: u32 = 0;
+                                var paren_depth: u32 = 0;
+                                var has_seen_body_open = false;
                                 var mem_i: u32 = lbrace_i;
                                 while (mem_i <= alias_sp.last_tok.asInt()) : (mem_i += 1) {
                                     const m_rec = tok_buf.getToken(TokenIndex.fromInt(mem_i));
-                                    if (m_rec.kind == .lbrace) {
-                                        brace_depth += 1;
-                                    } else if (m_rec.kind == .rbrace) {
-                                        brace_depth -|= 1;
-                                    } else if (brace_depth == 1 and m_rec.kind == .semi) {
-                                        try collector.appendSingleEdit(
-                                            .syntax_canonicalization,
-                                            m_rec.byte_offset,
-                                            m_rec.byte_offset +| m_rec.byte_len,
-                                            ",",
-                                            "UR-22-04: replace `;` bit_field member separator with `,`",
-                                        );
+                                    switch (m_rec.kind) {
+                                        .lbrace => {
+                                            brace_depth += 1;
+                                            has_seen_body_open = true;
+                                        },
+                                        .rbrace => {
+                                            brace_depth -|= 1;
+                                            if (has_seen_body_open and brace_depth == 0) break;
+                                        },
+                                        .lbracket => bracket_depth += 1,
+                                        .rbracket => bracket_depth -|= 1,
+                                        .lparen => paren_depth += 1,
+                                        .rparen => paren_depth -|= 1,
+                                        .semi => {
+                                            if (has_seen_body_open and brace_depth == 1 and
+                                                bracket_depth == 0 and paren_depth == 0)
+                                            {
+                                                try collector.appendSingleEdit(
+                                                    .syntax_canonicalization,
+                                                    m_rec.byte_offset,
+                                                    m_rec.byte_offset +| m_rec.byte_len,
+                                                    ",",
+                                                    "UR-22-04: replace `;` bit_field member separator with `,`",
+                                                );
+                                            }
+                                        },
+                                        else => {},
                                     }
                                 }
                             }
@@ -3054,13 +3338,15 @@ fn collectAttrEnumBitfieldAndUnitFixes(
         }
 
         // [3] `bit_field $N($U) { … }` -> `bit_field $N: $U { … }`:
-        if (rec.kind == .bit_field_item) {
+        if (rec.kind == .bit_field_item or rec.kind == .struct_item) {
             if (extractCstTokenSpan(cst_arena, tok_buf, cst_id)) |bf_sp| {
                 var scan_bf: u32 = bf_sp.first_tok.asInt();
-                while (scan_bf <= bf_sp.last_tok.asInt() and
-                    tok_buf.getToken(TokenIndex.fromInt(scan_bf)).kind != .kw_bit_field) : (scan_bf += 1)
-                {}
+                while (scan_bf <= bf_sp.last_tok.asInt()) : (scan_bf += 1) {
+                    const bf_tk = tok_buf.getToken(TokenIndex.fromInt(scan_bf)).kind;
+                    if (bf_tk == .kw_bit_field or bf_tk == .lbrace) break;
+                }
                 if (scan_bf + 4 <= bf_sp.last_tok.asInt() and
+                    tok_buf.getToken(TokenIndex.fromInt(scan_bf)).kind == .kw_bit_field and
                     tok_buf.getToken(TokenIndex.fromInt(scan_bf + 1)).kind == .type_ident and
                     tok_buf.getToken(TokenIndex.fromInt(scan_bf + 2)).kind == .lparen)
                 {
@@ -3143,7 +3429,7 @@ fn collectAttrEnumBitfieldAndUnitFixes(
                                         tok_buf.getToken(a_sp.first_tok).kind == .at and
                                         std.mem.eql(
                                             u8,
-                                            tokenSlice(source, tok_buf, TokenIndex.fromInt(a_sp.first_tok.asInt() + 1)),
+                                            symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(a_sp.first_tok.asInt() + 1)),
                                             "repr",
                                         ) and
                                         tok_buf.getToken(TokenIndex.fromInt(a_sp.first_tok.asInt() + 2)).kind == .lparen and
@@ -3155,7 +3441,7 @@ fn collectAttrEnumBitfieldAndUnitFixes(
                                         const ins_byte = ins_rec.byte_offset +| ins_rec.byte_len;
 
                                         if (arg_first == arg_last) {
-                                            const sole_arg = tokenSlice(source, tok_buf, TokenIndex.fromInt(arg_first));
+                                            const sole_arg = symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(arg_first));
                                             if (INT_PRIM_REPR_SET.has(sole_arg)) {
                                                 var attr_erase_end: usize = a_sp.end_byte;
                                                 while (attr_erase_end < source.len and
@@ -3189,10 +3475,10 @@ fn collectAttrEnumBitfieldAndUnitFixes(
                                         } else if (arg_first + 2 == arg_last and
                                             tok_buf.getToken(TokenIndex.fromInt(arg_first + 1)).kind == .comma)
                                         {
-                                            const a0 = tokenSlice(source, tok_buf, TokenIndex.fromInt(arg_first));
-                                            const a1 = tokenSlice(source, tok_buf, TokenIndex.fromInt(arg_last));
-                                            const is_a0_c = std.mem.eql(u8, a0, "C") or std.mem.eql(u8, a0, "c");
-                                            const is_a1_c = std.mem.eql(u8, a1, "C") or std.mem.eql(u8, a1, "c");
+                                            const a0 = symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(arg_first));
+                                            const a1 = symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(arg_last));
+                                            const is_a0_c = C_REPR_ARG_SET.has(a0);
+                                            const is_a1_c = C_REPR_ARG_SET.has(a1);
                                             const int_prim_opt: ?[]const u8 = if (is_a0_c and INT_PRIM_REPR_SET.has(a1))
                                                 a1
                                             else if (is_a1_c and INT_PRIM_REPR_SET.has(a0))
@@ -3234,25 +3520,100 @@ fn collectAttrEnumBitfieldAndUnitFixes(
             rec.kind == .enum_item or rec.kind == .bit_field_item)
         {
             if (extractCstTokenSpan(cst_arena, tok_buf, cst_id)) |nom_sp| {
+                // Skip header CST subtrees (`.attribute`, `.type_params`, backing `Type`, `.where_clause`) before `{`:
+                var start_scan_tok_i: u32 = nom_sp.first_tok.asInt();
+                var hdr_c = idx + 1;
+                while (hdr_c < sub_end) {
+                    const hdr_id = CstNodeIndex.fromInt(@intCast(hdr_c));
+                    const hdr_rec = cst_arena.getNode(hdr_id);
+                    if (hdr_rec.kind == .attribute or hdr_rec.kind == .visibility_modifier or
+                        hdr_rec.kind == .type_params or hdr_rec.kind == .where_clause or
+                        isTypeCstKind(hdr_rec.kind))
+                    {
+                        if (extractCstTokenSpan(cst_arena, tok_buf, hdr_id)) |hdr_sp| {
+                            start_scan_tok_i = @max(start_scan_tok_i, hdr_sp.last_tok.asInt() + 1);
+                        }
+                        hdr_c += @max(@as(usize, hdr_rec.subtree_size), 1);
+                        continue;
+                    }
+                    if (hdr_rec.subtree_size <= 1 and !hdr_rec.token.isNone() and
+                        tok_buf.getToken(hdr_rec.token).kind == .lbrace)
+                    {
+                        start_scan_tok_i = @max(start_scan_tok_i, hdr_rec.token.asInt());
+                        break;
+                    }
+                    if (hdr_rec.kind == .struct_field or hdr_rec.kind == .enum_variant) break;
+                    hdr_c += @max(@as(usize, hdr_rec.subtree_size), 1);
+                }
+
                 var brace_depth: u32 = 0;
-                var saw_body_open = false;
-                var m_tok_i: u32 = nom_sp.first_tok.asInt();
+                var bracket_depth: u32 = 0;
+                var paren_depth: u32 = 0;
+                var where_brace_depth: u32 = 0;
+                var is_in_where_clause = false;
+                var has_seen_body_open = false;
+                var m_tok_i: u32 = start_scan_tok_i;
                 while (m_tok_i <= nom_sp.last_tok.asInt()) : (m_tok_i += 1) {
                     const m_rec = tok_buf.getToken(TokenIndex.fromInt(m_tok_i));
-                    if (m_rec.kind == .lbrace) {
-                        brace_depth += 1;
-                        saw_body_open = true;
-                    } else if (m_rec.kind == .rbrace) {
-                        brace_depth -|= 1;
-                        if (saw_body_open and brace_depth == 0) break;
-                    } else if (saw_body_open and brace_depth == 1 and m_rec.kind == .semi) {
-                        try collector.appendSingleEdit(
-                            .syntax_canonicalization,
-                            m_rec.byte_offset,
-                            m_rec.byte_offset +| m_rec.byte_len,
-                            ",",
-                            "UR-22-04: replace retired `;` nominal member separator with `,`",
-                        );
+                    if (!has_seen_body_open and m_rec.kind == .kw_where and
+                        brace_depth == 0 and bracket_depth == 0 and paren_depth == 0)
+                    {
+                        is_in_where_clause = true;
+                        where_brace_depth = 0;
+                        continue;
+                    }
+                    switch (m_rec.kind) {
+                        .lbracket => bracket_depth += 1,
+                        .rbracket => bracket_depth -|= 1,
+                        .lparen => paren_depth += 1,
+                        .rparen => paren_depth -|= 1,
+                        .lbrace => {
+                            if (is_in_where_clause) {
+                                if (where_brace_depth == 0 and bracket_depth == 0 and paren_depth == 0) {
+                                    // Verify whether this `{` is the final body block ending at `nom_sp.last_tok`:
+                                    var look_depth: u32 = 1;
+                                    var look_i: u32 = m_tok_i + 1;
+                                    while (look_i <= nom_sp.last_tok.asInt() and look_depth > 0) : (look_i += 1) {
+                                        const lk = tok_buf.getToken(TokenIndex.fromInt(look_i)).kind;
+                                        if (lk == .lbrace) look_depth += 1 else if (lk == .rbrace) look_depth -|= 1;
+                                    }
+                                    if (look_depth == 0 and look_i > nom_sp.last_tok.asInt()) {
+                                        is_in_where_clause = false;
+                                        brace_depth = 1;
+                                        has_seen_body_open = true;
+                                        continue;
+                                    }
+                                }
+                                where_brace_depth += 1;
+                            } else {
+                                brace_depth += 1;
+                                if (bracket_depth == 0 and paren_depth == 0) {
+                                    has_seen_body_open = true;
+                                }
+                            }
+                        },
+                        .rbrace => {
+                            if (is_in_where_clause) {
+                                where_brace_depth -|= 1;
+                            } else {
+                                brace_depth -|= 1;
+                                if (has_seen_body_open and brace_depth == 0) break;
+                            }
+                        },
+                        .semi => {
+                            if (has_seen_body_open and brace_depth == 1 and
+                                bracket_depth == 0 and paren_depth == 0)
+                            {
+                                try collector.appendSingleEdit(
+                                    .syntax_canonicalization,
+                                    m_rec.byte_offset,
+                                    m_rec.byte_offset +| m_rec.byte_len,
+                                    ",",
+                                    "UR-22-04: replace retired `;` nominal member separator with `,`",
+                                );
+                            }
+                        },
+                        else => {},
                     }
                 }
             }
@@ -3283,7 +3644,7 @@ fn collectAttrEnumBitfieldAndUnitFixes(
 }
 
 /// Converts a function identifier (`"test_foo_bar"` or `"foo_bar"`) into a prose `test "foo bar"` title (`UR-22-05`).
-fn slugFnNameToProseTestTitle(allocator: std.mem.Allocator, raw_fn_name: []const u8) ![]u8 {
+fn toProseTestTitle(allocator: std.mem.Allocator, raw_fn_name: []const u8) ![]u8 {
     const stripped = if (raw_fn_name.len > 5 and std.mem.startsWith(u8, raw_fn_name, "test_"))
         raw_fn_name[5..]
     else
@@ -3328,7 +3689,7 @@ fn collectFfiPointersAndProseTestsFixes(
         if (t_rec.kind == .kw_extern and tok_i + 1 < tok_count) {
             const abi_tok = TokenIndex.fromInt(@intCast(tok_i + 1));
             const abi_rec = tok_buf.getToken(abi_tok);
-            if (abi_rec.kind == .string_lit and std.mem.eql(u8, tokenSlice(source, tok_buf, abi_tok), "\"c\"")) {
+            if (abi_rec.kind == .string_lit and std.mem.eql(u8, symbol_resolver.extractTokenSlice(source, tok_buf, abi_tok), "\"c\"")) {
                 try collector.appendSingleEdit(
                     .syntax_canonicalization,
                     abi_rec.byte_offset,
@@ -3384,7 +3745,7 @@ fn collectFfiPointersAndProseTestsFixes(
                 var u_t: u32 = u_sp.first_tok.asInt();
                 while (u_t <= u_sp.last_tok.asInt()) : (u_t += 1) {
                     const uk = tok_buf.getToken(TokenIndex.fromInt(u_t)).kind;
-                    const u_lex = tokenSlice(source, tok_buf, TokenIndex.fromInt(u_t));
+                    const u_lex = symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(u_t));
                     if (uk == .lbrace) {
                         has_brace_group = true;
                         lbrace_u = u_t;
@@ -3482,7 +3843,7 @@ fn collectFfiPointersAndProseTestsFixes(
         while (scan_cv < tok_count) : (scan_cv += 1) {
             const cv_idx = TokenIndex.fromInt(scan_cv);
             const cv_rec = tok_buf.getToken(cv_idx);
-            if (cv_rec.kind != .ident or !std.mem.eql(u8, tokenSlice(source, tok_buf, cv_idx), "c_void")) continue;
+            if (cv_rec.kind != .ident or !std.mem.eql(u8, symbol_resolver.extractTokenSlice(source, tok_buf, cv_idx), "c_void")) continue;
 
             var is_in_use = false;
             for (use_token_ranges.items) |ur| {
@@ -3496,15 +3857,12 @@ fn collectFfiPointersAndProseTestsFixes(
             // Walk backward across `[cx|core|std.]ffi.` path prefix if present:
             var start_tok_i: u32 = scan_cv;
             if (start_tok_i >= 2 and tok_buf.getToken(TokenIndex.fromInt(start_tok_i - 1)).kind == .dot) {
-                const prev_seg = tokenSlice(source, tok_buf, TokenIndex.fromInt(start_tok_i - 2));
+                const prev_seg = symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(start_tok_i - 2));
                 if (std.mem.eql(u8, prev_seg, "ffi")) {
                     start_tok_i -= 2;
                     if (start_tok_i >= 2 and tok_buf.getToken(TokenIndex.fromInt(start_tok_i - 1)).kind == .dot) {
-                        const root_seg = tokenSlice(source, tok_buf, TokenIndex.fromInt(start_tok_i - 2));
-                        if (std.mem.eql(u8, root_seg, "cx") or
-                            std.mem.eql(u8, root_seg, "core") or
-                            std.mem.eql(u8, root_seg, "std"))
-                        {
+                        const root_seg = symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(start_tok_i - 2));
+                        if (STDLIB_ROOT_SEG_SET.has(root_seg)) {
                             start_tok_i -= 2;
                         }
                     }
@@ -3562,7 +3920,7 @@ fn collectFfiPointersAndProseTestsFixes(
                         tok_buf.getToken(a_sp.first_tok).kind == .at and
                         std.mem.eql(
                             u8,
-                            tokenSlice(source, tok_buf, TokenIndex.fromInt(a_sp.first_tok.asInt() + 1)),
+                            symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(a_sp.first_tok.asInt() + 1)),
                             "test",
                         ))
                     {
@@ -3629,7 +3987,7 @@ fn collectFfiPointersAndProseTestsFixes(
         const sig_sp = extractCstTokenSpan(cst_arena, tok_buf, fn_sig_cst) orelse continue;
         const body_sp = extractCstTokenSpan(cst_arena, tok_buf, body_block_cst) orelse continue;
         const test_attr_sp = extractCstTokenSpan(cst_arena, tok_buf, test_attr_cst) orelse continue;
-        const fn_name = tokenSlice(source, tok_buf, sig_sp.first_tok);
+        const fn_name = symbol_resolver.extractTokenSlice(source, tok_buf, sig_sp.first_tok);
         if (fn_name.len == 0 or tok_buf.getToken(sig_sp.first_tok).kind != .ident) continue;
 
         // Locate start of `[pub…] [async] fn` modifiers after all attributes on `fn_item`:
@@ -3657,14 +4015,16 @@ fn collectFfiPointersAndProseTestsFixes(
             if (extractCstTokenSpan(cst_arena, tok_buf, ret_cst)) |r_sp| {
                 const is_unit_ret = r_sp.last_tok.asInt() == r_sp.first_tok.asInt() + 1 and
                     tok_buf.getToken(r_sp.last_tok).kind == .prim_type and
-                    std.mem.eql(u8, tokenSlice(source, tok_buf, r_sp.last_tok), "unit");
+                    (UNIT_OR_NEVER_PRIM_MAP.get(
+                        symbol_resolver.extractTokenSlice(source, tok_buf, r_sp.last_tok),
+                    ) orelse false);
                 if (!is_unit_ret) {
                     kept_ret_slice = std.mem.trim(u8, source[r_sp.start_byte..r_sp.end_byte], " \t\r\n");
                 }
             }
         }
 
-        const prose_title = try slugFnNameToProseTestTitle(allocator, fn_name);
+        const prose_title = try toProseTestTitle(allocator, fn_name);
         defer allocator.free(prose_title);
         var header_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer header_buf.deinit(allocator);
@@ -3886,7 +4246,7 @@ fn computeAstParentMap(allocator: std.mem.Allocator, ast_arena: *const AstArena)
 }
 
 /// Unwraps `.ref_ty` and `.mut_ref_ty` layers on `raw_ty` in `type_pool`.
-fn autoDerefType(type_pool: *const InternPool, raw_ty: TypeId) TypeId {
+fn unwrapAutoDerefType(type_pool: *const InternPool, raw_ty: TypeId) TypeId {
     var current = raw_ty;
     var depth: u8 = 0;
     while (!current.isNone() and !current.isError() and depth < 16) : (depth += 1) {
@@ -3971,6 +4331,25 @@ fn lookupFixInlineRewrite(
     return null;
 }
 
+/// Looks up the `CallArgMapping` of `call_node` across file-level and per-`DefId` `BodySemanticSideTables`.
+fn lookupCallArgMapping(
+    db: *CompilerDb,
+    file_id: FileId,
+    item_tree: *const ItemTree,
+    call_node: NodeIndex,
+) !?type_system.CallArgMapping {
+    if (call_node.isNone()) return null;
+    if (db.getFileSideTables(file_id)) |file_st| {
+        if (file_st.getCallArgMapping(call_node)) |mapping| return mapping;
+    }
+    for (item_tree.entries) |entry| {
+        if (try db.getDefSideTables(entry.def_id)) |def_st| {
+            if (def_st.getCallArgMapping(call_node)) |mapping| return mapping;
+        }
+    }
+    return null;
+}
+
 /// Follows `.use_alias_sym` indirections in `sym_table` to reach the underlying target `SymbolIndex`.
 fn chaseUseAliasSymbol(sym_table: *const symbol_resolver.SymbolTable, start_sym: SymbolIndex) SymbolIndex {
     var cur = start_sym;
@@ -4019,7 +4398,7 @@ fn hasIdenticalTokenLexemes(
         const tok_a = TokenIndex.fromInt(first_sp.first_tok.asInt() + offset);
         const tok_b = TokenIndex.fromInt(second_sp.first_tok.asInt() + offset);
         if (tok_buf.getToken(tok_a).kind != tok_buf.getToken(tok_b).kind) return false;
-        if (!std.mem.eql(u8, tokenSlice(source, tok_buf, tok_a), tokenSlice(source, tok_buf, tok_b))) {
+        if (!std.mem.eql(u8, symbol_resolver.extractTokenSlice(source, tok_buf, tok_a), symbol_resolver.extractTokenSlice(source, tok_buf, tok_b))) {
             return false;
         }
     }
@@ -4067,6 +4446,7 @@ fn isPtrAccessCoercedToMutRawPtr(
     ast_arena: *const AstArena,
     tok_buf: *const TokenBuffer,
     ast_parents: []const NodeIndex,
+    extra_ends: []const u32,
     expr_id: NodeIndex,
 ) !bool {
     if (expr_id.isNone() or expr_id.asInt() >= ast_parents.len) return false;
@@ -4077,8 +4457,7 @@ fn isPtrAccessCoercedToMutRawPtr(
     switch (parent_node.tag) {
         .local_var_decl => {
             // Inspect `let/var p: *mut T = buf.ptr;` explicit `: *mut` annotation in CST:
-            const decl_cst = ast_arena.getCstOrigin(parent_id);
-            if (extractCstTokenSpan(cst_arena, tok_buf, decl_cst)) |decl_sp| {
+            if (extractCstTokenSpan(cst_arena, tok_buf, ast_arena.getCstOrigin(parent_id))) |decl_sp| {
                 var scan_t: u32 = decl_sp.first_tok.asInt();
                 while (scan_t + 1 <= decl_sp.last_tok.asInt()) : (scan_t += 1) {
                     const tk = tok_buf.getToken(TokenIndex.fromInt(scan_t)).kind;
@@ -4092,15 +4471,18 @@ fn isPtrAccessCoercedToMutRawPtr(
         },
         .cast_expr => {
             if (extractAstByteSpan(cst_arena, ast_arena, tok_buf, parent_id)) |cast_sp| {
-                const cast_text = source[cast_sp.start_byte..cast_sp.end_byte];
-                return std.mem.indexOf(u8, cast_text, "*mut") != null;
+                return std.mem.indexOf(u8, source[cast_sp.start_byte..cast_sp.end_byte], "*mut") != null;
             }
             return false;
         },
         .assign_stmt => {
             if (parent_node.lhs.tag == .node) {
-                const lhs_node = NodeIndex.fromInt(parent_node.lhs.payload);
-                const lhs_ty = try lookupSemanticNodeType(db, file_id, item_tree, lhs_node);
+                const lhs_ty = try lookupSemanticNodeType(
+                    db,
+                    file_id,
+                    item_tree,
+                    NodeIndex.fromInt(parent_node.lhs.payload),
+                );
                 const lhs_type_node = db.type_pool.getNode(lhs_ty);
                 if (lhs_type_node.tag == .raw_ptr_ty and lhs_type_node.rhs != 0) return true;
             }
@@ -4133,14 +4515,82 @@ fn isPtrAccessCoercedToMutRawPtr(
             }
             return false;
         },
-        .call_expr, .generic_call, .method_call => {
-            const callee_sym = chaseUseAliasSymbol(
-                &db.symbol_table,
-                try lookupSemanticNodeSymbol(db, file_id, item_tree, parent_id),
-            );
+        .named_arg, .call_expr, .generic_call, .method_call => {
+            var call_id = parent_id;
+            var call_node = parent_node;
+            var arg_carrier_id = expr_id;
+            if (call_node.tag == .named_arg) {
+                if (call_id.asInt() >= ast_parents.len) return false;
+                arg_carrier_id = call_id;
+                call_id = ast_parents[call_id.asInt()];
+                if (call_id.isNone() or call_id.asInt() >= ast_arena.countNodes()) return false;
+                call_node = ast_arena.getNode(call_id);
+                if (call_node.tag != .call_expr and
+                    call_node.tag != .generic_call and
+                    call_node.tag != .method_call)
+                {
+                    return false;
+                }
+            }
+
+            const maybe_mapping = try lookupCallArgMapping(db, file_id, item_tree, call_id);
+            const raw_callee_sym = if (maybe_mapping) |mapping|
+                (if (!mapping.callee_sym.isNone())
+                    mapping.callee_sym
+                else
+                    try lookupSemanticNodeSymbol(db, file_id, item_tree, call_id))
+            else
+                try lookupSemanticNodeSymbol(db, file_id, item_tree, call_id);
+            const callee_sym = chaseUseAliasSymbol(&db.symbol_table, raw_callee_sym);
+
             if (!callee_sym.isNone() and callee_sym.asInt() < db.symbol_table.countSymbols()) {
                 const fn_ty = db.symbol_table.getSymbol(callee_sym).type_id;
                 if (db.type_pool.getFnSignatureView(fn_ty)) |sig_v| {
+                    if (maybe_mapping) |mapping| {
+                        const self_offset: usize = if (sig_v.paramCount() > mapping.total_params)
+                            sig_v.paramCount() - @as(usize, mapping.total_params)
+                        else
+                            0;
+                        for (mapping.provided_slots) |slot| {
+                            if (slot.arg_ast_node == expr_id) {
+                                const param_idx = self_offset + @as(usize, slot.param_index);
+                                if (param_idx < sig_v.paramCount()) {
+                                    const p_node = db.type_pool.getNode(sig_v.getParamType(param_idx));
+                                    return p_node.tag == .raw_ptr_ty and p_node.rhs != 0;
+                                }
+                                return false;
+                            }
+                        }
+                        return false;
+                    }
+
+                    if ((call_node.tag == .call_expr or call_node.tag == .method_call) and
+                        call_node.rhs.tag == .extra and call_id.asInt() < extra_ends.len)
+                    {
+                        const e_start: usize = call_node.rhs.payload;
+                        const e_end: usize = @min(@as(usize, extra_ends[call_id.asInt()]), ast_arena.extra_data.items.len);
+                        const args_base: usize = if (call_node.tag == .method_call) e_start + 1 else e_start;
+                        if (args_base <= e_end) {
+                            const arg_words = ast_arena.extra_data.items[args_base..e_end];
+                            const self_offset: usize = if (call_node.tag == .method_call and
+                                sig_v.paramCount() > arg_words.len)
+                                1
+                            else
+                                0;
+                            for (arg_words, 0..) |raw_arg_node, arg_i| {
+                                if (raw_arg_node == arg_carrier_id.asInt() or raw_arg_node == expr_id.asInt()) {
+                                    const param_idx = self_offset + arg_i;
+                                    if (param_idx < sig_v.paramCount()) {
+                                        const p_node = db.type_pool.getNode(sig_v.getParamType(param_idx));
+                                        return p_node.tag == .raw_ptr_ty and p_node.rhs != 0;
+                                    }
+                                    return false;
+                                }
+                            }
+                            return false;
+                        }
+                    }
+
                     var p_idx: usize = 0;
                     while (p_idx < sig_v.paramCount()) : (p_idx += 1) {
                         const p_node = db.type_pool.getNode(sig_v.getParamType(p_idx));
@@ -4272,7 +4722,7 @@ fn scanSinkForTier3(
             }
         }
 
-        // `UR-22-02` Tier-3 `~Copy` completion: `var $id: $ty` hitting `E0421` -> `var $id: own $ty`:
+        // `UR-22-02` Tier-3 `~Copy` completion; `var $id: $ty` hitting `E0421` -> `var $id: own $ty`:
         if (is_enable_ur22_02 and diag_item.code == .e0421_non_copy_value_parameter) {
             const p_start = diag_item.primary_span.start_byte;
             const cst_len = cst.countNodes();
@@ -4457,7 +4907,7 @@ fn collectSubstageCTier3FixesForFile(
             }
         }
 
-        // [1] `UR-21-04`: `Type.assoc_fn[Args](…)` -> `Type[Args].assoc_fn(…)`:
+        // [1] `UR-21-04`; `Type.assoc_fn[Args](…)` -> `Type[Args].assoc_fn(…)`:
         if (is_ur21_04 and node.tag == .method_call and node.lhs.tag == .node and node.rhs.tag == .extra) {
             const recv_node = NodeIndex.fromInt(node.lhs.payload);
             const recv_tag = ast_arena.getNode(recv_node).tag;
@@ -4528,13 +4978,13 @@ fn collectSubstageCTier3FixesForFile(
             }
         }
 
-        // [2] `UR-21-05`: `$opt.unwrap_or($def)` -> `$opt orelse $def`, `$opt.unwrap()` -> `$opt orelse unreachable`:
+        // [2] `UR-21-05`; `$opt.unwrap_or($def)` -> `$opt orelse $def`, `$opt.unwrap()` -> `$opt orelse unreachable`:
         if (is_ur21_05 and node.tag == .method_call and node.lhs.tag == .node and node.rhs.tag == .extra) {
             const extra_start: usize = node.rhs.payload;
             const extra_end: usize = @min(@as(usize, extra_ends[ast_idx]), ast_arena.extra_data.items.len);
             if (extra_start < extra_end) {
                 const member_tok = TokenIndex.fromInt(ast_arena.extra_data.items[extra_start]);
-                const member_lex = tokenSlice(source, tok_buf, member_tok);
+                const member_lex = symbol_resolver.extractTokenSlice(source, tok_buf, member_tok);
                 const call_arg_slice = ast_arena.extra_data.items[extra_start + 1 .. extra_end];
                 const is_unwrap = std.mem.eql(u8, member_lex, "unwrap") and call_arg_slice.len == 0;
                 const is_unwrap_or = std.mem.eql(u8, member_lex, "unwrap_or") and call_arg_slice.len == 1;
@@ -4542,7 +4992,7 @@ fn collectSubstageCTier3FixesForFile(
                 if (is_unwrap or is_unwrap_or) {
                     const recv_node = NodeIndex.fromInt(node.lhs.payload);
                     const raw_recv_ty = try lookupSemanticNodeType(db, file_id, item_tree, recv_node);
-                    const deref_ty = autoDerefType(&db.type_pool, raw_recv_ty);
+                    const deref_ty = unwrapAutoDerefType(&db.type_pool, raw_recv_ty);
                     if (!deref_ty.isError() and db.type_pool.getTag(deref_ty) == .optional_ty) {
                         if (extractAstByteSpan(cst_arena, ast_arena, tok_buf, node_id)) |full_sp| {
                             if (extractAstByteSpan(cst_arena, ast_arena, tok_buf, recv_node)) |recv_sp| {
@@ -4600,8 +5050,12 @@ fn collectSubstageCTier3FixesForFile(
                                         );
                                     }
                                 } else {
-                                    const def_node = NodeIndex.fromInt(call_arg_slice[0]);
-                                    if (extractAstByteSpan(cst_arena, ast_arena, tok_buf, def_node)) |def_sp| {
+                                    if (extractAstByteSpan(
+                                        cst_arena,
+                                        ast_arena,
+                                        tok_buf,
+                                        NodeIndex.fromInt(call_arg_slice[0]),
+                                    )) |def_sp| {
                                         if (!hasCommentsInByteRange(source, tok_buf, recv_sp.end_byte, def_sp.start_byte) and
                                             !hasCommentsInByteRange(source, tok_buf, def_sp.end_byte, full_sp.end_byte))
                                         {
@@ -4647,7 +5101,7 @@ fn collectSubstageCTier3FixesForFile(
             }
         }
 
-        // [3] `UR-21-06`: `cx.mem.with_arena($arena, || $blk)` -> `with context.allocator = $arena $blk`:
+        // [3] `UR-21-06`; `cx.mem.with_arena($arena, || $blk)` -> `with context.allocator = $arena $blk`:
         if (is_ur21_06 and (node.tag == .call_expr or node.tag == .method_call)) {
             const parent_id = ast_parents[ast_idx];
             const is_stmt_position = !parent_id.isNone() and ast_arena.getNode(parent_id).tag == .block;
@@ -4662,10 +5116,7 @@ fn collectSubstageCTier3FixesForFile(
                     if (e_start < e_end) arg_words = ast_arena.extra_data.items[e_start..e_end];
                     if (extractAstByteSpan(cst_arena, ast_arena, tok_buf, callee_node)) |cal_sp| {
                         const cal_str = std.mem.trim(u8, source[cal_sp.start_byte..cal_sp.end_byte], " \t\r\n");
-                        if (std.mem.eql(u8, cal_str, "cx.mem.with_arena") or
-                            std.mem.eql(u8, cal_str, "core.mem.with_arena") or
-                            std.mem.eql(u8, cal_str, "mem.with_arena"))
-                        {
+                        if (WITH_ARENA_CALLEE_SET.has(cal_str)) {
                             is_with_arena_callee = true;
                         } else if (std.mem.eql(u8, cal_str, "with_arena")) {
                             const cal_sym = chaseUseAliasSymbol(
@@ -4683,15 +5134,16 @@ fn collectSubstageCTier3FixesForFile(
                     const e_end: usize = @min(@as(usize, extra_ends[ast_idx]), ast_arena.extra_data.items.len);
                     if (e_start < e_end) {
                         const mem_tok = TokenIndex.fromInt(ast_arena.extra_data.items[e_start]);
-                        if (std.mem.eql(u8, tokenSlice(source, tok_buf, mem_tok), "with_arena")) {
+                        if (std.mem.eql(u8, symbol_resolver.extractTokenSlice(source, tok_buf, mem_tok), "with_arena")) {
                             arg_words = ast_arena.extra_data.items[e_start + 1 .. e_end];
-                            const recv_n = NodeIndex.fromInt(node.lhs.payload);
-                            if (extractAstByteSpan(cst_arena, ast_arena, tok_buf, recv_n)) |r_sp| {
+                            if (extractAstByteSpan(
+                                cst_arena,
+                                ast_arena,
+                                tok_buf,
+                                NodeIndex.fromInt(node.lhs.payload),
+                            )) |r_sp| {
                                 const r_str = std.mem.trim(u8, source[r_sp.start_byte..r_sp.end_byte], " \t\r\n");
-                                if (std.mem.eql(u8, r_str, "cx.mem") or
-                                    std.mem.eql(u8, r_str, "core.mem") or
-                                    std.mem.eql(u8, r_str, "mem"))
-                                {
+                                if (MEM_MODULE_RECEIVER_SET.has(r_str)) {
                                     is_with_arena_callee = true;
                                 }
                             }
@@ -4780,7 +5232,7 @@ fn collectSubstageCTier3FixesForFile(
             }
         }
 
-        // [4] `UR-21-07`: `$s[$lo .. $s.len() - $k]` -> `$s[$lo..$-$k]` (omitting literal `0` `$lo`):
+        // [4] `UR-21-07`; `$s[$lo .. $s.len() - $k]` -> `$s[$lo..$-$k]` (omitting literal `0` `$lo`):
         if (is_ur21_07 and node.tag == .index_expr and node.lhs.tag == .node and node.rhs.tag == .node) {
             const recv_s = NodeIndex.fromInt(node.lhs.payload);
             const idx_arg = NodeIndex.fromInt(node.rhs.payload);
@@ -4806,7 +5258,7 @@ fn collectSubstageCTier3FixesForFile(
                             );
                             if (m_start + 1 == m_end) {
                                 const m_tok = TokenIndex.fromInt(ast_arena.extra_data.items[m_start]);
-                                if (std.mem.eql(u8, tokenSlice(source, tok_buf, m_tok), "len")) {
+                                if (std.mem.eql(u8, symbol_resolver.extractTokenSlice(source, tok_buf, m_tok), "len")) {
                                     len_recv_opt = NodeIndex.fromInt(sub_lhs.lhs.payload);
                                 }
                             }
@@ -4814,13 +5266,13 @@ fn collectSubstageCTier3FixesForFile(
                             sub_lhs.rhs.tag == .token)
                         {
                             const f_tok = TokenIndex.fromInt(sub_lhs.rhs.payload);
-                            if (std.mem.eql(u8, tokenSlice(source, tok_buf, f_tok), "len")) {
+                            if (std.mem.eql(u8, symbol_resolver.extractTokenSlice(source, tok_buf, f_tok), "len")) {
                                 len_recv_opt = NodeIndex.fromInt(sub_lhs.lhs.payload);
                             }
                         }
 
                         if (len_recv_opt) |len_recv| {
-                            const s_ty = autoDerefType(
+                            const s_ty = unwrapAutoDerefType(
                                 &db.type_pool,
                                 try lookupSemanticNodeType(db, file_id, item_tree, recv_s),
                             );
@@ -4841,8 +5293,12 @@ fn collectSubstageCTier3FixesForFile(
                                                     var lo_str: []const u8 = "";
                                                     var lo_kept_sp: ?CstTokenSpan = null;
                                                     if (range_node.lhs.tag == .node) {
-                                                        const lo_id = NodeIndex.fromInt(range_node.lhs.payload);
-                                                        if (extractAstByteSpan(cst_arena, ast_arena, tok_buf, lo_id)) |lo_sp| {
+                                                        if (extractAstByteSpan(
+                                                            cst_arena,
+                                                            ast_arena,
+                                                            tok_buf,
+                                                            NodeIndex.fromInt(range_node.lhs.payload),
+                                                        )) |lo_sp| {
                                                             const raw_lo = std.mem.trim(
                                                                 u8,
                                                                 source[lo_sp.start_byte..lo_sp.end_byte],
@@ -4868,11 +5324,12 @@ fn collectSubstageCTier3FixesForFile(
                                                             source[k_sp.start_byte..k_sp.end_byte],
                                                             " \t\r\n",
                                                         );
-                                                        const k_parens = k_tag == .binary_expr or k_tag == .range_expr or
+                                                        const is_k_parenthesized = k_tag == .binary_expr or
+                                                            k_tag == .range_expr or
                                                             k_tag == .cast_expr or k_tag == .if_expr;
                                                         const rhs_dollar = if (k_tag == .int_lit)
                                                             try std.fmt.allocPrint(allocator, "$-{s}", .{k_raw})
-                                                        else if (k_parens)
+                                                        else if (is_k_parenthesized)
                                                             try std.fmt.allocPrint(allocator, "$ - ({s})", .{k_raw})
                                                         else
                                                             try std.fmt.allocPrint(allocator, "$ - {s}", .{k_raw});
@@ -4905,7 +5362,7 @@ fn collectSubstageCTier3FixesForFile(
             }
         }
 
-        // [5] `UR-22-06`: `!$e` -> `not $e` / `~$e`, prefix `*$p` -> `$p.*`, `.len`/`.ptr` -> `.len()`/`.as_ptr()`:
+        // [5] `UR-22-06`; `!$e` -> `not $e` / `~$e`, prefix `*$p` -> `$p.*`, `.len`/`.ptr` -> `.len()`/`.as_ptr()`:
         if (is_ur22_06) {
             // [5a] Retired `!$e`:
             if (node.tag == .unary_expr and !node.main_token.isNone()) {
@@ -4916,7 +5373,7 @@ fn collectSubstageCTier3FixesForFile(
                         try collector.appendClonedFix(&db.interner, bang_fix);
                     } else if (node.lhs.tag == .node) {
                         const op_node = NodeIndex.fromInt(node.lhs.payload);
-                        const op_ty = autoDerefType(
+                        const op_ty = unwrapAutoDerefType(
                             &db.type_pool,
                             try lookupSemanticNodeType(db, file_id, item_tree, op_node),
                         );
@@ -4975,53 +5432,61 @@ fn collectSubstageCTier3FixesForFile(
                 }
             }
 
-            // [5c] Slice/array/`str` `.len` -> `.len()` & `.ptr` -> `.as_mut_ptr()` / `.as_ptr()`:
+            // [5c] Slice/array/`str` `.len` -> `.len()`, `.is_empty` -> `.is_empty()`, & `.ptr` -> `.as_mut_ptr()` / `.as_ptr()`:
             if (node.tag == .field_access and node.lhs.tag == .node and node.rhs.tag == .token) {
                 const mem_tok = TokenIndex.fromInt(node.rhs.payload);
                 const mem_rec = tok_buf.getToken(mem_tok);
-                const mem_lex = tokenSlice(source, tok_buf, mem_tok);
-                const is_len = std.mem.eql(u8, mem_lex, "len");
-                const is_ptr = std.mem.eql(u8, mem_lex, "ptr");
+                const mem_lex = symbol_resolver.extractTokenSlice(source, tok_buf, mem_tok);
+                if (!mem_rec.flags.is_synthesized) {
+                    if (SLICE_PROP_MEMBER_MAP.get(mem_lex)) |prop_kind| {
+                        const recv_node = NodeIndex.fromInt(node.lhs.payload);
+                        const raw_recv_ty = try lookupSemanticNodeType(db, file_id, item_tree, recv_node);
+                        const deref_ty = unwrapAutoDerefType(&db.type_pool, raw_recv_ty);
+                        const deref_tag = db.type_pool.getTag(deref_ty);
+                        const is_verified_slice_or_e0424 = e0424_mut_map.contains(mem_rec.byte_offset) or
+                            deref_ty == .str_ty or deref_tag == .slice_ty or deref_tag == .array_ty or
+                            deref_tag == .soa_slice_ty or deref_tag == .soa_array_ty;
 
-                if ((is_len or is_ptr) and !mem_rec.flags.is_synthesized) {
-                    const recv_node = NodeIndex.fromInt(node.lhs.payload);
-                    const raw_recv_ty = try lookupSemanticNodeType(db, file_id, item_tree, recv_node);
-                    const deref_ty = autoDerefType(&db.type_pool, raw_recv_ty);
-                    const deref_tag = db.type_pool.getTag(deref_ty);
-                    const is_verified_slice_or_e0424 = e0424_mut_map.contains(mem_rec.byte_offset) or
-                        deref_ty == .str_ty or deref_tag == .slice_ty or deref_tag == .array_ty or
-                        deref_tag == .soa_slice_ty or deref_tag == .soa_array_ty;
-
-                    if (is_verified_slice_or_e0424) {
-                        if (is_len) {
-                            try collector.appendSingleEdit(
-                                .type_migration,
-                                mem_rec.byte_offset,
-                                mem_rec.byte_offset +| mem_rec.byte_len,
-                                "len()",
-                                "UR-22-06: replace retired `.len` property with `.len()`",
-                            );
-                        } else {
-                            const is_mut_place = (e0424_mut_map.get(mem_rec.byte_offset) orelse
-                                (db.type_pool.getTag(raw_recv_ty) == .mut_ref_ty)) and deref_ty != .str_ty;
-                            const use_mut_ptr = is_mut_place and try isPtrAccessCoercedToMutRawPtr(
-                                db,
-                                file_id,
-                                item_tree,
-                                source,
-                                cst_arena,
-                                ast_arena,
-                                tok_buf,
-                                ast_parents,
-                                node_id,
-                            );
-                            try collector.appendSingleEdit(
-                                .type_migration,
-                                mem_rec.byte_offset,
-                                mem_rec.byte_offset +| mem_rec.byte_len,
-                                if (use_mut_ptr) "as_mut_ptr()" else "as_ptr()",
-                                "UR-22-06: replace retired `.ptr` property with pointer method",
-                            );
+                        if (is_verified_slice_or_e0424) {
+                            switch (prop_kind) {
+                                .len => try collector.appendSingleEdit(
+                                    .type_migration,
+                                    mem_rec.byte_offset,
+                                    mem_rec.byte_offset +| mem_rec.byte_len,
+                                    "len()",
+                                    "UR-22-06: replace retired `.len` property with `.len()`",
+                                ),
+                                .is_empty => try collector.appendSingleEdit(
+                                    .type_migration,
+                                    mem_rec.byte_offset,
+                                    mem_rec.byte_offset +| mem_rec.byte_len,
+                                    "is_empty()",
+                                    "UR-22-06: replace retired `.is_empty` property with `.is_empty()`",
+                                ),
+                                .ptr => {
+                                    const is_mut_place = (e0424_mut_map.get(mem_rec.byte_offset) orelse
+                                        (db.type_pool.getTag(raw_recv_ty) == .mut_ref_ty)) and deref_ty != .str_ty;
+                                    const is_using_mut_ptr = is_mut_place and try isPtrAccessCoercedToMutRawPtr(
+                                        db,
+                                        file_id,
+                                        item_tree,
+                                        source,
+                                        cst_arena,
+                                        ast_arena,
+                                        tok_buf,
+                                        ast_parents,
+                                        extra_ends,
+                                        node_id,
+                                    );
+                                    try collector.appendSingleEdit(
+                                        .type_migration,
+                                        mem_rec.byte_offset,
+                                        mem_rec.byte_offset +| mem_rec.byte_len,
+                                        if (is_using_mut_ptr) "as_mut_ptr()" else "as_ptr()",
+                                        "UR-22-06: replace retired `.ptr` property with pointer method",
+                                    );
+                                },
+                            }
                         }
                     }
                 }
@@ -5108,7 +5573,7 @@ fn collectRetiredEditionTomlFixes(
         const key_clean = unquoteSimpleTomlString(key_raw) orelse key_raw;
 
         var is_edition_target = false;
-        if ((std.mem.eql(u8, active_section, "package") or std.mem.eql(u8, active_section, "workspace.package")) and
+        if (MANIFEST_EDITION_SECTION_SET.has(active_section) and
             std.mem.eql(u8, key_clean, "edition") and
             doc.tokens.tokens.get(cst_node.first_token + 1).kind == .eq)
         {
@@ -5128,14 +5593,14 @@ fn collectRetiredEditionTomlFixes(
         if (is_edition_target) {
             const abs_lo = doc.base_byte_offset +| last_tok.byte_offset;
             const abs_hi = abs_lo +| @as(u32, last_tok.byte_len);
-            const is_single = val_raw.len >= 2 and val_raw[0] == '\'';
-            const repl_str = if (is_single) "'2026'" else "\"2026\"";
             const edits = try arena.asAllocator().alloc(TextEdit, 1);
             edits[0] = .{
                 .file_id = doc.file_id,
                 .start_byte = abs_lo,
                 .end_byte = abs_hi,
-                .replacement_id = try interner.intern(repl_str),
+                .replacement_id = try interner.intern(
+                    if (val_raw.len >= 2 and val_raw[0] == '\'') "'2026'" else "\"2026\"",
+                ),
             };
             try fixes_out.append(arena.backing_allocator, .{
                 .message = "upgrade retired `edition` to `\"2026\"`",
@@ -5179,12 +5644,7 @@ fn collectManifestAllowCapsAppendFixes(
         const key_clean = unquoteSimpleTomlString(key_raw) orelse key_raw;
 
         // Track `<dep_name> = { … allow_caps = […] … }` inside `[dependencies]` / `[dev-dependencies]`:
-        if ((std.mem.eql(u8, active_section, "dependencies") or
-            std.mem.eql(u8, active_section, "dev-dependencies") or
-            std.mem.eql(u8, active_section, "build-dependencies") or
-            std.mem.eql(u8, active_section, "workspace.dependencies")) and
-            !cst_node.flags.is_inline_table_entry)
-        {
+        if (MANIFEST_DEP_SECTION_SET.has(active_section) and !cst_node.flags.is_inline_table_entry) {
             current_inline_dep = key_clean;
             inline_dep_end_idx = idx + @max(@as(usize, cst_node.subtree_size), 1);
             continue;
@@ -5238,12 +5698,12 @@ fn collectManifestAllowCapsAppendFixes(
             if (missing_bits != 0) {
                 var append_buf: std.ArrayListUnmanaged(u8) = .empty;
                 defer append_buf.deinit(allocator);
-                const needs_leading_comma = elem_count > 0 and !arr_node.flags.has_trailing_comma;
+                const is_needing_leading_comma = elem_count > 0 and !arr_node.flags.has_trailing_comma;
                 var is_first_added = true;
                 for (CANONICAL_LOCKFILE_CAP_TABLE) |cap_entry| {
                     if ((missing_bits & cap_entry.bit) != 0) {
                         if (is_first_added) {
-                            if (needs_leading_comma) {
+                            if (is_needing_leading_comma) {
                                 try append_buf.appendSlice(allocator, ", ");
                             } else if (elem_count > 0) {
                                 try append_buf.append(allocator, ' ');
@@ -5350,18 +5810,624 @@ fn appendFmtLine(
     try lines.append(alloc, formatted);
 }
 
+// --------- Multi-Module, Stdlib & Dependency Binding ----------
+
+/// Normalizes path separators to `/` and strips leading `./` prefixes for deterministic `FileId` matching.
+fn normalizeModLookupPathAlloc(allocator: std.mem.Allocator, raw_path: []const u8) ![]u8 {
+    var trimmed = raw_path;
+    while (trimmed.len >= 2 and trimmed[0] == '.' and (trimmed[1] == '/' or trimmed[1] == '\\')) {
+        trimmed = trimmed[2..];
+    }
+    const out = try allocator.alloc(u8, trimmed.len);
+    for (trimmed, 0..) |ch_byte, i| {
+        out[i] = if (ch_byte == '\\') '/' else ch_byte;
+    }
+    return out;
+}
+
+/// Formats a relative or directory-qualified candidate module path (`<mod>.cx` when `dir_path` is `"."` or `""`).
+fn formatSubmoduleCandidateAlloc(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    stem_opt: ?[]const u8,
+    mod_name: []const u8,
+    is_mod_cx: bool,
+) ![]u8 {
+    const has_dir = dir_path.len > 0 and !std.mem.eql(u8, dir_path, ".");
+    const suffix = if (is_mod_cx) "/mod.cx" else ".cx";
+    if (stem_opt) |stem_str| {
+        if (has_dir) {
+            return std.fmt.allocPrint(allocator, "{s}/{s}/{s}{s}", .{ dir_path, stem_str, mod_name, suffix });
+        }
+        return std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ stem_str, mod_name, suffix });
+    }
+    if (has_dir) {
+        return std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ dir_path, mod_name, suffix });
+    }
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ mod_name, suffix });
+}
+
+/// Recursively discovers and binds external `mod <name>;` `.cx` files on disk into `source_map` and `db`.
+fn discoverExternalSubmodulesInDb(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_map: *vfs_sourcemap.VfsSourceMap,
+    db: *CompilerDb,
+    parent_fid: FileId,
+    parent_path: []const u8,
+    durability: query_db.Durability,
+    pkg_id: vfs_sourcemap.PackageId,
+    visited_fids: *std.AutoHashMapUnmanaged(u32, void),
+    has_core_mention_out: *bool,
+    depth: u32,
+) !void {
+    if (depth >= MAX_UPGRADE_MOD_DISCOVERY_DEPTH or visited_fids.contains(parent_fid.asInt())) return;
+    try visited_fids.put(allocator, parent_fid.asInt(), {});
+
+    if (!db.source_inputs.contains(parent_fid.asInt())) {
+        _ = source_map.getLineIndex(parent_fid) catch {};
+        const disk_src = source_map.getFileSource(parent_fid) orelse "";
+        _ = try db.setInput(parent_fid, disk_src, durability);
+    }
+    const parent_src = try db.getSourceText(parent_fid);
+    if (!has_core_mention_out.* and
+        (std.mem.indexOf(u8, parent_src, "cx") != null or
+            std.mem.indexOf(u8, parent_src, "core") != null or
+            std.mem.indexOf(u8, parent_src, "std") != null))
+    {
+        has_core_mention_out.* = true;
+    }
+    try db.setFilePath(parent_fid, parent_path);
+    if (pkg_id != .root) {
+        try db.setFilePackageId(parent_fid, pkg_id);
+    }
+
+    var ext_mod_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer ext_mod_names.deinit(allocator);
+    {
+        const parsed_art = try db.parseCst(parent_fid);
+        for ((try db.extractItemTree(parent_fid)).entries) |entry| {
+            if (entry.kind != .mod_decl or entry.name_text.len == 0) continue;
+            if (!entry.ast_node.isNone() and
+                parsed_art.ast_arena.getNode(entry.ast_node).rhs.tag == .extra)
+            {
+                continue;
+            }
+            try ext_mod_names.append(allocator, entry.name_text);
+        }
+    }
+
+    const parent_dir = std.fs.path.dirname(parent_path) orelse ".";
+    const parent_base = std.fs.path.basename(parent_path);
+    const parent_stem = std.fs.path.stem(parent_path);
+    const is_hub_file = HUB_MODULE_BASENAME_SET.has(parent_base);
+
+    for (ext_mod_names.items) |mod_name| {
+        var cand_paths: [4]?[]u8 = @splat(null);
+        defer {
+            for (cand_paths) |maybe_path| {
+                if (maybe_path) |owned_path| allocator.free(owned_path);
+            }
+        }
+        var cand_len: usize = 0;
+        if (!is_hub_file) {
+            cand_paths[cand_len] = try formatSubmoduleCandidateAlloc(
+                allocator,
+                parent_dir,
+                parent_stem,
+                mod_name,
+                false,
+            );
+            cand_len += 1;
+            cand_paths[cand_len] = try formatSubmoduleCandidateAlloc(
+                allocator,
+                parent_dir,
+                parent_stem,
+                mod_name,
+                true,
+            );
+            cand_len += 1;
+        }
+        cand_paths[cand_len] = try formatSubmoduleCandidateAlloc(allocator, parent_dir, null, mod_name, false);
+        cand_len += 1;
+        cand_paths[cand_len] = try formatSubmoduleCandidateAlloc(allocator, parent_dir, null, mod_name, true);
+        cand_len += 1;
+
+        var idx: usize = 0;
+        while (idx < cand_len) : (idx += 1) {
+            const cand_str = cand_paths[idx].?;
+            if (source_map.resolveOrCreatePath(io, cand_str, pkg_id)) |child_fid| {
+                if (child_fid == parent_fid) continue;
+                try db.bindExternalModule(parent_fid, mod_name, child_fid);
+                try discoverExternalSubmodulesInDb(
+                    allocator,
+                    io,
+                    source_map,
+                    db,
+                    child_fid,
+                    cand_str,
+                    durability,
+                    pkg_id,
+                    visited_fids,
+                    has_core_mention_out,
+                    depth + 1,
+                );
+                break;
+            } else |_| {}
+        }
+    }
+}
+
+/// Recursively discovers and binds `mod <name>;` submodules inside a mounted virtual `/cx/<pkg>@<ver>/…` `.cxtree`.
+fn discoverVirtualCxTreeSubmodulesInDb(
+    allocator: std.mem.Allocator,
+    source_map: *vfs_sourcemap.VfsSourceMap,
+    db: *CompilerDb,
+    parent_fid: FileId,
+    parent_vpath: []const u8,
+    pkg_id: vfs_sourcemap.PackageId,
+    visited_fids: *std.AutoHashMapUnmanaged(u32, void),
+    has_core_mention_out: *bool,
+    depth: u32,
+) !void {
+    if (depth >= MAX_UPGRADE_MOD_DISCOVERY_DEPTH or visited_fids.contains(parent_fid.asInt())) return;
+    try visited_fids.put(allocator, parent_fid.asInt(), {});
+
+    const parent_src = source_map.faultCxTreeFile(parent_fid) catch return;
+    _ = source_map.getLineIndex(parent_fid) catch {};
+    if (!has_core_mention_out.* and
+        (std.mem.indexOf(u8, parent_src, "cx") != null or std.mem.indexOf(u8, parent_src, "core") != null))
+    {
+        has_core_mention_out.* = true;
+    }
+
+    _ = try db.setInput(parent_fid, parent_src, .high);
+    try db.setFilePackageId(parent_fid, pkg_id);
+    try db.setFilePath(parent_fid, parent_vpath);
+
+    var ext_mod_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer ext_mod_names.deinit(allocator);
+    {
+        const parsed_art = try db.parseCst(parent_fid);
+        for ((try db.extractItemTree(parent_fid)).entries) |entry| {
+            if (entry.kind != .mod_decl or entry.name_text.len == 0) continue;
+            if (!entry.ast_node.isNone() and
+                parsed_art.ast_arena.getNode(entry.ast_node).rhs.tag == .extra)
+            {
+                continue;
+            }
+            try ext_mod_names.append(allocator, entry.name_text);
+        }
+    }
+
+    const parent_dir = std.fs.path.dirname(parent_vpath) orelse "";
+    const parent_base = std.fs.path.basename(parent_vpath);
+    const parent_stem = std.fs.path.stem(parent_vpath);
+    const is_hub_file = HUB_MODULE_BASENAME_SET.has(parent_base);
+
+    for (ext_mod_names.items) |mod_name| {
+        var cand_paths: [4]?[]u8 = @splat(null);
+        defer {
+            for (cand_paths) |maybe_path| {
+                if (maybe_path) |owned_path| allocator.free(owned_path);
+            }
+        }
+        var cand_len: usize = 0;
+        if (!is_hub_file) {
+            cand_paths[cand_len] = try formatSubmoduleCandidateAlloc(
+                allocator,
+                parent_dir,
+                parent_stem,
+                mod_name,
+                false,
+            );
+            cand_len += 1;
+            cand_paths[cand_len] = try formatSubmoduleCandidateAlloc(
+                allocator,
+                parent_dir,
+                parent_stem,
+                mod_name,
+                true,
+            );
+            cand_len += 1;
+        }
+        cand_paths[cand_len] = try formatSubmoduleCandidateAlloc(allocator, parent_dir, null, mod_name, false);
+        cand_len += 1;
+        cand_paths[cand_len] = try formatSubmoduleCandidateAlloc(allocator, parent_dir, null, mod_name, true);
+        cand_len += 1;
+
+        var idx: usize = 0;
+        while (idx < cand_len) : (idx += 1) {
+            const cand_vpath = cand_paths[idx].?;
+            const vpath_id = source_map.interner.lookup(cand_vpath) orelse continue;
+            const child_fid = source_map.path_to_file_id.get(vpath_id) orelse continue;
+            try db.bindExternalModule(parent_fid, mod_name, child_fid);
+            try discoverVirtualCxTreeSubmodulesInDb(
+                allocator,
+                source_map,
+                db,
+                child_fid,
+                cand_vpath,
+                pkg_id,
+                visited_fids,
+                has_core_mention_out,
+                depth + 1,
+            );
+            break;
+        }
+    }
+}
+
+/// Registers `core/root.cx` (and its `core/` submodule tree) on `db` as `"core"` and `"cx"` when present on disk.
+fn registerCoreStdlibInDb(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_map: *vfs_sourcemap.VfsSourceMap,
+    db: *CompilerDb,
+    visited_fids: *std.AutoHashMapUnmanaged(u32, void),
+) !void {
+    const core_root_path = "core/root.cx";
+    const core_fid = source_map.resolveOrCreatePath(io, core_root_path, .std_core) catch return;
+    var has_dummy_core_mention = true;
+    try discoverExternalSubmodulesInDb(
+        allocator,
+        io,
+        source_map,
+        db,
+        core_fid,
+        core_root_path,
+        .high,
+        .std_core,
+        visited_fids,
+        &has_dummy_core_mention,
+        0,
+    );
+    try db.registerRootModule("core", core_fid);
+    try db.registerRootModule("cx", core_fid);
+}
+
+/// Re-binds external `mod <name>;` edges across all `.root` files in `db` after Tier 1/2 syntax healing.
+fn rebindWorkspaceSubmodulesInDb(
+    allocator: std.mem.Allocator,
+    db: *CompilerDb,
+    options: UpgradeOptions,
+) !void {
+    if (db.file_paths.count() == 0) return;
+
+    const RootPathEntry = struct {
+        fid: FileId,
+        norm_path: []u8,
+    };
+
+    var root_entries: std.ArrayListUnmanaged(RootPathEntry) = .empty;
+    defer {
+        for (root_entries.items) |entry| allocator.free(entry.norm_path);
+        root_entries.deinit(allocator);
+    }
+    var norm_to_fid: std.StringHashMapUnmanaged(FileId) = .empty;
+    defer norm_to_fid.deinit(allocator);
+
+    var has_core_mention = false;
+    var fp_it = db.file_paths.iterator();
+    while (fp_it.next()) |fp_kv| {
+        const fid = FileId.fromInt(fp_kv.key_ptr.*);
+        if (fid.isNone() or fid.asInt() >= query_db.VIRTUAL_C_IMPORT_FILE_ID_BASE) continue;
+        if (db.getFilePackageId(fid) != .root or db.isStdlibFile(fid)) continue;
+        if (!db.source_inputs.contains(fid.asInt())) continue;
+
+        const norm_p = try normalizeModLookupPathAlloc(allocator, fp_kv.value_ptr.*);
+        errdefer allocator.free(norm_p);
+        try root_entries.append(allocator, .{ .fid = fid, .norm_path = norm_p });
+        try norm_to_fid.put(allocator, norm_p, fid);
+
+        if (!has_core_mention) {
+            const src_text = try db.getSourceText(fid);
+            if (std.mem.indexOf(u8, src_text, "cx") != null or std.mem.indexOf(u8, src_text, "core") != null) {
+                has_core_mention = true;
+            }
+        }
+    }
+
+    if (has_core_mention) {
+        if (options.io) |io_val| {
+            if (options.vfs) |vfs_ptr| {
+                const cx_sym = try db.interner.intern("cx");
+                if (!db.root_module_files.contains(cx_sym.asInt())) {
+                    var core_visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                    defer core_visited.deinit(allocator);
+                    try registerCoreStdlibInDb(allocator, io_val, vfs_ptr, db, &core_visited);
+                }
+            }
+        }
+    }
+
+    var on_disk_visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer on_disk_visited.deinit(allocator);
+
+    for (root_entries.items) |root_item| {
+        const parent_fid = root_item.fid;
+        const parent_path = root_item.norm_path;
+
+        var ext_mod_names: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer ext_mod_names.deinit(allocator);
+        {
+            const parsed_art = try db.parseCst(parent_fid);
+            for ((try db.extractItemTree(parent_fid)).entries) |entry| {
+                if (entry.kind != .mod_decl or entry.name_text.len == 0) continue;
+                if (!entry.ast_node.isNone() and
+                    parsed_art.ast_arena.getNode(entry.ast_node).rhs.tag == .extra)
+                {
+                    continue;
+                }
+                try ext_mod_names.append(allocator, entry.name_text);
+            }
+        }
+        if (ext_mod_names.items.len == 0) continue;
+
+        const parent_dir = std.fs.path.dirname(parent_path) orelse ".";
+        const parent_base = std.fs.path.basename(parent_path);
+        const parent_stem = std.fs.path.stem(parent_path);
+        const is_hub_file = HUB_MODULE_BASENAME_SET.has(parent_base);
+
+        for (ext_mod_names.items) |mod_name| {
+            var cand_paths: [4]?[]u8 = @splat(null);
+            defer {
+                for (cand_paths) |maybe_path| {
+                    if (maybe_path) |owned_path| allocator.free(owned_path);
+                }
+            }
+            var cand_len: usize = 0;
+            if (!is_hub_file) {
+                cand_paths[cand_len] = try formatSubmoduleCandidateAlloc(
+                    allocator,
+                    parent_dir,
+                    parent_stem,
+                    mod_name,
+                    false,
+                );
+                cand_len += 1;
+                cand_paths[cand_len] = try formatSubmoduleCandidateAlloc(
+                    allocator,
+                    parent_dir,
+                    parent_stem,
+                    mod_name,
+                    true,
+                );
+                cand_len += 1;
+            }
+            cand_paths[cand_len] = try formatSubmoduleCandidateAlloc(allocator, parent_dir, null, mod_name, false);
+            cand_len += 1;
+            cand_paths[cand_len] = try formatSubmoduleCandidateAlloc(allocator, parent_dir, null, mod_name, true);
+            cand_len += 1;
+
+            var idx: usize = 0;
+            while (idx < cand_len) : (idx += 1) {
+                const cand_norm = cand_paths[idx].?;
+                if (norm_to_fid.get(cand_norm)) |known_child_fid| {
+                    if (known_child_fid != parent_fid) {
+                        try db.bindExternalModule(parent_fid, mod_name, known_child_fid);
+                        break;
+                    }
+                } else if (options.io != null and options.vfs != null) {
+                    const io_val = options.io.?;
+                    const vfs_ptr = options.vfs.?;
+                    if (vfs_ptr.resolveOrCreatePath(io_val, cand_norm, .root)) |disk_child_fid| {
+                        if (disk_child_fid != parent_fid) {
+                            try db.bindExternalModule(parent_fid, mod_name, disk_child_fid);
+                            var has_sub_core = false;
+                            try discoverExternalSubmodulesInDb(
+                                allocator,
+                                io_val,
+                                vfs_ptr,
+                                db,
+                                disk_child_fid,
+                                cand_norm,
+                                .low,
+                                .root,
+                                &on_disk_visited,
+                                &has_sub_core,
+                                1,
+                            );
+                            if (has_sub_core) {
+                                const cx_sym = try db.interner.intern("cx");
+                                if (!db.root_module_files.contains(cx_sym.asInt())) {
+                                    try registerCoreStdlibInDb(allocator, io_val, vfs_ptr, db, &on_disk_visited);
+                                }
+                            }
+                            break;
+                        }
+                    } else |_| {}
+                }
+            }
+        }
+    }
+}
+
+/// Best-effort mounts offline cached `.cxtree`, local `path`, and `workspace_member` dependencies from `toml_path`.
+fn mountOfflineManifestDepsInDb(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_map: *vfs_sourcemap.VfsSourceMap,
+    db: *CompilerDb,
+    toml_path: []const u8,
+    options: UpgradeOptions,
+    visited_fids: *std.AutoHashMapUnmanaged(u32, void),
+    has_core_mention_out: *bool,
+) !void {
+    const active_target = options.target_spec orelse codegen_abi.TargetSpec.host();
+    const cfg_env = symbol_resolver.CfgEnv.fromTargetSpec(active_target, true);
+
+    var local_sink = DiagnosticSink.init(allocator);
+    defer local_sink.deinit();
+
+    const toml_fid = source_map.resolveOrCreatePath(io, toml_path, .root) catch return;
+    var bundle = loadUpgradedWorkspaceManifestBundle(
+        io,
+        allocator,
+        source_map.interner,
+        toml_path,
+        toml_fid,
+        &cfg_env,
+        null,
+    ) catch return;
+    defer bundle.deinit();
+
+    const ws_dir = std.fs.path.dirname(toml_path) orelse ".";
+    const lock_path = try std.fs.path.join(allocator, &.{ ws_dir, "corex.lock" });
+    defer allocator.free(lock_path);
+
+    var lock_arena = BumpArena.init(allocator);
+    defer lock_arena.deinit();
+    var parsed_lock_opt: ?pkg_manifest.Lockfile = null;
+    if (std.Io.Dir.cwd().readFileAlloc(io, lock_path, allocator, .limited(pkg_manifest.MAX_TOML_BYTES))) |lock_bytes| {
+        defer allocator.free(lock_bytes);
+        const lock_fid = source_map.setOverlay(lock_path, lock_bytes, .root) catch FileId.fromInt(2);
+        parsed_lock_opt = pkg_manifest.parseLockfile(
+            allocator,
+            &lock_arena,
+            source_map.interner,
+            lock_fid,
+            lock_bytes,
+            null,
+            null,
+        ) catch null;
+    } else |_| {}
+
+    var resolved = (pkg_resolver.resolveProjectGraph(
+        allocator,
+        source_map.interner,
+        source_map,
+        &bundle,
+        if (parsed_lock_opt) |*parsed_lock| parsed_lock else null,
+        .{
+            .io = io,
+            .target_spec = active_target,
+            .is_including_tests = true,
+            .is_offline = true,
+            .corex_home_dir = options.corex_home_dir orelse "",
+            .environ_map = options.environ_map,
+        },
+        &local_sink,
+    ) catch return) orelse return;
+    defer resolved.deinit(allocator);
+
+    if (resolved.packages.len <= 1) return;
+
+    var cache_opt: ?pkg_cache.PkgCache = if (options.corex_home_dir) |home_dir|
+        pkg_cache.PkgCache.init(
+            allocator,
+            home_dir,
+            pkg_cache.DEFAULT_MAX_LRU_ENTRIES,
+            pkg_cache.DEFAULT_MAX_LRU_BYTES,
+        ) catch null
+    else
+        null;
+    defer if (cache_opt) |*cache_inst| cache_inst.deinit();
+
+    const blobs_dir_opt: ?[]u8 = if (cache_opt) |cache_inst|
+        try std.fmt.allocPrint(allocator, "{s}/blobs", .{cache_inst.cas_root})
+    else
+        null;
+    defer if (blobs_dir_opt) |blobs_buf| allocator.free(blobs_buf);
+
+    var pkg_root_fids: std.AutoHashMapUnmanaged(vfs_sourcemap.PackageId, FileId) = .empty;
+    defer pkg_root_fids.deinit(allocator);
+
+    for (resolved.packages) |pkg_node| {
+        if (pkg_node.pkg_id == .root or pkg_node.pkg_id == .std_core) continue;
+
+        const ver_str = try pkg_node.version.formatAlloc(allocator, source_map.interner);
+        defer allocator.free(ver_str);
+
+        if (pkg_node.source_kind != .workspace_member and pkg_node.source_kind != .local_path) {
+            const cache_ptr = if (cache_opt) |*c_ref| c_ref else continue;
+            const blobs_dir = blobs_dir_opt orelse continue;
+            const cxtree_hash = pkg_node.cxtree_blake3 orelse continue;
+            const cxtree_bytes = cache_ptr.readVerifiedCxTreeAlloc(
+                io,
+                cxtree_hash,
+                &local_sink,
+                pkg_node.manifest_span,
+            ) catch continue;
+            defer allocator.free(cxtree_bytes);
+
+            const mounted_ids = source_map.mountCxTreePackage(
+                io,
+                pkg_node.pkg_id,
+                pkg_node.canonical_name,
+                ver_str,
+                cxtree_bytes,
+                blobs_dir,
+            ) catch continue;
+            allocator.free(mounted_ids);
+
+            const entry_rel = pkg_node.lib_root_rel_path orelse pkg_node.bin_root_rel_path orelse "src/root.cx";
+            const entry_vpath = try std.fmt.allocPrint(
+                allocator,
+                "/cx/{s}@{s}/{s}",
+                .{ pkg_node.canonical_name, ver_str, entry_rel },
+            );
+            defer allocator.free(entry_vpath);
+            const vpath_id = source_map.interner.lookup(entry_vpath) orelse continue;
+            const dep_root_fid = source_map.path_to_file_id.get(vpath_id) orelse continue;
+            try discoverVirtualCxTreeSubmodulesInDb(
+                allocator,
+                source_map,
+                db,
+                dep_root_fid,
+                entry_vpath,
+                pkg_node.pkg_id,
+                visited_fids,
+                has_core_mention_out,
+                0,
+            );
+            try pkg_root_fids.put(allocator, pkg_node.pkg_id, dep_root_fid);
+        } else {
+            if (pkg_node.package_root_path.len == 0) continue;
+            const entry_rel = pkg_node.lib_root_rel_path orelse pkg_node.bin_root_rel_path orelse "src/root.cx";
+            const entry_path = try std.fs.path.join(allocator, &.{ pkg_node.package_root_path, entry_rel });
+            defer allocator.free(entry_path);
+            const dep_root_fid = source_map.resolveOrCreatePath(io, entry_path, pkg_node.pkg_id) catch continue;
+            try discoverExternalSubmodulesInDb(
+                allocator,
+                io,
+                source_map,
+                db,
+                dep_root_fid,
+                entry_path,
+                .medium,
+                pkg_node.pkg_id,
+                visited_fids,
+                has_core_mention_out,
+                0,
+            );
+            try pkg_root_fids.put(allocator, pkg_node.pkg_id, dep_root_fid);
+        }
+        try db.symbol_table.markPackageDepsConfigured(pkg_node.pkg_id);
+    }
+
+    if (pkg_root_fids.count() == 0) return;
+
+    for (resolved.packages) |pkg_node| {
+        for (pkg_node.dependencies) |dep_bind| {
+            const target_fid = pkg_root_fids.get(dep_bind.target_pkg_id) orelse continue;
+            try db.bindPackageDepFile(pkg_node.pkg_id, try db.interner.intern(dep_bind.alias_text), target_fid);
+        }
+    }
+}
+
 // ------------------------------------- PUBLIC API --------------------------------------
 
 // --------------- Rule Discovery & CLI Rendering ---------------
 
 /// Returns the single-bit mask (`1 << @intFromEnum(rule_id)`) for `rule_id`.
-pub inline fn ruleBit(rule_id: UpgradeRuleId) u16 {
+pub inline fn toRuleBit(rule_id: UpgradeRuleId) u16 {
     return @as(u16, 1) << @intCast(rule_id.asInt());
 }
 
 /// Returns `true` if `rule_id` is enabled in `rule_mask`.
 pub inline fn isRuleEnabled(rule_mask: u16, rule_id: UpgradeRuleId) bool {
-    return (rule_mask & ruleBit(rule_id)) != 0;
+    return (rule_mask & toRuleBit(rule_id)) != 0;
 }
 
 /// Parses a comma-separated `--rule=UR-21-00,UR-22-06` specification into a `rule_mask` (`null` on unknown rule).
@@ -5374,7 +6440,7 @@ pub fn parseRuleFilterMask(raw_csv: []const u8) ?u16 {
         const code = std.mem.trim(u8, part, " \t");
         if (code.len == 0) return null;
         const rule_id = upgrade_rules.lookupUpgradeRule(code) orelse return null;
-        mask |= ruleBit(rule_id);
+        mask |= toRuleBit(rule_id);
     }
     return mask;
 }
@@ -5389,7 +6455,7 @@ pub fn parseAcceptCapsFilter(raw_value: ?[]const u8) ?u16 {
     while (iter.next()) |part| {
         const cap_name = std.mem.trim(u8, part, " \t");
         if (cap_name.len == 0) return null;
-        const canonical_name = if (std.mem.eql(u8, cap_name, "unsafe")) "unsafe_op" else cap_name;
+        const canonical_name = RETIRED_CAP_ALIAS_MAP.get(cap_name) orelse cap_name;
         const cap_bit = pkg_manifest.MANIFEST_CAPABILITY_MAP.get(canonical_name) orelse return null;
         if ((cap_bit & EffectCapabilityMask.LOCKFILE_CAP_BITS) == 0) return null;
         bits |= cap_bit;
@@ -5608,7 +6674,7 @@ pub fn upgradeWorkspaceFilesInDb(
     // [2] Bounded multi-pass synergy loop (`0 .. MAX_SYNERGY_PASSES = 4`):
     var pass: u8 = 0;
     while (pass < MAX_SYNERGY_PASSES) : (pass += 1) {
-        var any_pass_edits = false;
+        var has_changed_in_pass = false;
 
         // Sub-stage A (Tier 1 Pre-CST Lexeme Shims – immediate in-memory heal):
         for (file_ids, 0..) |fid, i| {
@@ -5622,7 +6688,7 @@ pub fn upgradeWorkspaceFilesInDb(
             const applied_a = try applyCollectedFixesInMemory(allocator, &states[i].working_masked_cx, &collector);
             if (applied_a > 0) {
                 states[i].edits_applied += applied_a;
-                any_pass_edits = true;
+                has_changed_in_pass = true;
             }
         }
 
@@ -5638,15 +6704,16 @@ pub fn upgradeWorkspaceFilesInDb(
             const applied_b = try applyCollectedFixesInMemory(allocator, &states[i].working_masked_cx, &collector);
             if (applied_b > 0) {
                 states[i].edits_applied += applied_b;
-                any_pass_edits = true;
+                has_changed_in_pass = true;
             }
         }
 
-        // Sync healed buffers into `CompilerDb` before Sub-stage C semantic resolution:
+        // Sync healed buffers into `CompilerDb` and re-bind `mod <name>;` edges before Sub-stage C:
         for (file_ids, 0..) |fid, i| {
             if (states[i].is_generated) continue;
             _ = try db.setInput(fid, states[i].working_masked_cx, .low);
         }
+        try rebindWorkspaceSubmodulesInDb(allocator, db, options);
 
         // Sub-stage C (Tier 3 Type-Directed Semantic Modernizers across `CompilerDb`):
         for (file_ids, 0..) |fid, i| {
@@ -5660,18 +6727,18 @@ pub fn upgradeWorkspaceFilesInDb(
             const applied_c = try applyCollectedFixesInMemory(allocator, &states[i].working_masked_cx, &collector);
             if (applied_c > 0) {
                 states[i].edits_applied += applied_c;
-                any_pass_edits = true;
+                has_changed_in_pass = true;
             }
         }
 
         for (0..file_ids.len) |i| {
             if (!states[i].is_generated) states[i].passes_run = pass + 1;
         }
-        if (!any_pass_edits) break;
+        if (!has_changed_in_pass) break;
     }
 
     // [3] Re-attach canonicalized frontmatter, run `fmt_engine.formatSource` when appropriate, and enforce rollback guard:
-    const should_run_full_fmt = !options.has_explicit_rule_filter or options.rule_mask == ALL_UPGRADE_RULES_MASK;
+    const is_running_full_fmt = !options.has_explicit_rule_filter or options.rule_mask == ALL_UPGRADE_RULES_MASK;
     for (file_ids, 0..) |fid, i| {
         const st = &states[i];
         if (st.is_generated) {
@@ -5681,18 +6748,18 @@ pub fn upgradeWorkspaceFilesInDb(
                 .is_skipped_generated = true,
                 .passes_executed = 0,
                 .applied_edit_count = 0,
-                .was_rolled_back = false,
+                .is_rolled_back = false,
             };
             initialized_count += 1;
             continue;
         }
 
-        const fm_changed = if (st.canonical_fm_prefix) |canon_fm|
+        const has_fm_changed = if (st.canonical_fm_prefix) |canon_fm|
             !std.mem.eql(u8, canon_fm, st.original_full[0..st.fm_prefix_len])
         else
             false;
 
-        if (st.edits_applied == 0 and !fm_changed) {
+        if (st.edits_applied == 0 and !has_fm_changed) {
             _ = try db.setInput(fid, st.original_full, .low);
             results[i] = .{
                 .upgraded_source = try allocator.dupe(u8, st.original_full),
@@ -5700,7 +6767,7 @@ pub fn upgradeWorkspaceFilesInDb(
                 .is_skipped_generated = false,
                 .passes_executed = st.passes_run,
                 .applied_edit_count = 0,
-                .was_rolled_back = false,
+                .is_rolled_back = false,
             };
             initialized_count += 1;
             continue;
@@ -5720,7 +6787,7 @@ pub fn upgradeWorkspaceFilesInDb(
         errdefer allocator.free(candidate_full);
 
         // Run `fmt_engine.formatSource` on modified `.cx` buffers (skipped during partial `--rule` surgical runs):
-        if (st.edits_applied > 0 and should_run_full_fmt) {
+        if (st.edits_applied > 0 and is_running_full_fmt) {
             var fmt_res = try fmt_engine.formatSource(allocator, candidate_full, fid);
             if (!fmt_res.has_syntax_errors) {
                 allocator.free(candidate_full);
@@ -5730,7 +6797,7 @@ pub fn upgradeWorkspaceFilesInDb(
             }
         }
 
-        // Atomic soundness rollback guard: roll back if syntax error count increased vs baseline:
+        // Atomic soundness rollback guard; roll back if syntax error count increased vs baseline:
         const final_syntax_errors = try countSyntaxErrors(allocator, fid, candidate_full);
         if (final_syntax_errors > st.baseline_syntax_errors) {
             allocator.free(candidate_full);
@@ -5741,7 +6808,7 @@ pub fn upgradeWorkspaceFilesInDb(
                 .is_skipped_generated = false,
                 .passes_executed = st.passes_run,
                 .applied_edit_count = 0,
-                .was_rolled_back = true,
+                .is_rolled_back = true,
             };
             initialized_count += 1;
             continue;
@@ -5755,7 +6822,7 @@ pub fn upgradeWorkspaceFilesInDb(
             .is_skipped_generated = false,
             .passes_executed = st.passes_run,
             .applied_edit_count = st.edits_applied,
-            .was_rolled_back = false,
+            .is_rolled_back = false,
         };
         initialized_count += 1;
     }
@@ -5777,7 +6844,7 @@ pub fn upgradeSource(
             .is_skipped_generated = true,
             .passes_executed = 0,
             .applied_edit_count = 0,
-            .was_rolled_back = false,
+            .is_rolled_back = false,
         };
     }
 
@@ -5898,6 +6965,111 @@ pub fn upgradeManifestToml(
     };
 }
 
+/// Loads a `WorkspaceManifestBundle` after healing any legacy `edition` / `"unsafe"` tokens in `root_manifest_path` in memory.
+pub fn loadUpgradedWorkspaceManifestBundle(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    interner: *StringInterner,
+    root_manifest_path: []const u8,
+    root_file_id: FileId,
+    cfg_env: *const pkg_manifest.CfgEnv,
+    sink: ?*DiagnosticSink,
+) !pkg_manifest.WorkspaceManifestBundle {
+    const raw_toml = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        root_manifest_path,
+        allocator,
+        .limited(pkg_manifest.MAX_TOML_BYTES),
+    );
+    defer allocator.free(raw_toml);
+
+    var upg_toml = try upgradeManifestToml(allocator, raw_toml, root_file_id, cfg_env, .{});
+    defer upg_toml.deinit(allocator);
+
+    if (!upg_toml.is_changed) {
+        return pkg_manifest.loadWorkspaceManifestBundle(
+            io,
+            allocator,
+            interner,
+            root_manifest_path,
+            root_file_id,
+            cfg_env,
+            sink,
+        );
+    }
+
+    var single_arena = BumpArena.init(allocator);
+    var should_free_single_arena = true;
+    defer if (should_free_single_arena) single_arena.deinit();
+
+    var parsed_upg = try pkg_manifest.parseManifest(
+        allocator,
+        &single_arena,
+        interner,
+        root_file_id,
+        upg_toml.upgraded_toml,
+        cfg_env,
+        sink,
+    );
+    defer parsed_upg.doc.deinit(allocator);
+
+    if (parsed_upg.manifest.workspace == null) {
+        const root_dir_raw = std.fs.path.dirname(root_manifest_path) orelse ".";
+        const owned_root = try single_arena.dupe(u8, root_dir_raw);
+        const owned_path = try single_arena.dupe(u8, root_manifest_path);
+        const members = try single_arena.allocSlice(pkg_manifest.WorkspaceMember, 1);
+        members[0] = .{
+            .rel_dir = ".",
+            .abs_dir = owned_root,
+            .manifest_path = owned_path,
+            .manifest = parsed_upg.manifest,
+            .is_default_member = true,
+        };
+        should_free_single_arena = false;
+        return .{
+            .arena = single_arena,
+            .workspace_root_dir = owned_root,
+            .root_manifest_path = owned_path,
+            .root_manifest = parsed_upg.manifest,
+            .members = members,
+            .primary_member_index = 0,
+            .is_script = false,
+            .root_manifest_blake3 = parsed_upg.manifest.root_manifest_blake3,
+        };
+    }
+
+    var ws_bundle = try pkg_manifest.loadWorkspaceManifestBundle(
+        io,
+        allocator,
+        interner,
+        root_manifest_path,
+        root_file_id,
+        cfg_env,
+        null,
+    );
+    errdefer ws_bundle.deinit();
+
+    var ws_parsed = try pkg_manifest.parseManifest(
+        allocator,
+        &ws_bundle.arena,
+        interner,
+        root_file_id,
+        upg_toml.upgraded_toml,
+        cfg_env,
+        sink,
+    );
+    defer ws_parsed.doc.deinit(allocator);
+
+    ws_bundle.root_manifest = ws_parsed.manifest;
+    ws_bundle.root_manifest_blake3 = ws_parsed.manifest.root_manifest_blake3;
+    if (ws_bundle.members.len > 0 and std.mem.eql(u8, ws_bundle.members[0].rel_dir, ".")) {
+        const mut_members = try ws_bundle.arena.dupe(pkg_manifest.WorkspaceMember, ws_bundle.members);
+        mut_members[0].manifest = ws_parsed.manifest;
+        ws_bundle.members = mut_members;
+    }
+    return ws_bundle;
+}
+
 /// Evaluates `--accept-caps` against `corex.toml`, optional `corex.lock`, and `observed_caps` (`deny_caps` never overridden!).
 pub fn evaluateAndApplyAcceptCaps(
     allocator: std.mem.Allocator,
@@ -5948,7 +7120,7 @@ pub fn evaluateAndApplyAcceptCaps(
             def_allow.asBits()
         else
             null;
-        var uses_global_default_allow = explicit_allow_opt != null;
+        var is_using_global_default_allow = explicit_allow_opt != null;
 
         for (manifest.dependencies) |dep| {
             if (std.mem.eql(u8, interner.get(dep.package_kebab), obs.package_kebab) or
@@ -5957,7 +7129,7 @@ pub fn evaluateAndApplyAcceptCaps(
                 explicit_deny_bits |= dep.deny_caps.asBits();
                 if (dep.allow_caps) |dep_allow| {
                     explicit_allow_opt = dep_allow.asBits();
-                    uses_global_default_allow = false;
+                    is_using_global_default_allow = false;
                 }
             }
         }
@@ -5966,7 +7138,7 @@ pub fn evaluateAndApplyAcceptCaps(
                 explicit_deny_bits |= pkg_ov.deny_caps.asBits();
                 if (pkg_ov.allow_caps) |ov_allow| {
                     explicit_allow_opt = ov_allow.asBits();
-                    uses_global_default_allow = false;
+                    is_using_global_default_allow = false;
                 }
             }
         }
@@ -6007,7 +7179,7 @@ pub fn evaluateAndApplyAcceptCaps(
         // Record accepted capability bits for `allow_caps` TOML update and `LockPackage.max_caps`:
         if (explicit_allow_opt) |cur_allow| {
             if ((actual_bits & ~cur_allow) != 0) {
-                const map_key = if (uses_global_default_allow) "*" else obs.package_kebab;
+                const map_key = if (is_using_global_default_allow) "*" else obs.package_kebab;
                 const gop = try accepted_by_pkg.getOrPut(allocator, map_key);
                 gop.value_ptr.* = (if (gop.found_existing) gop.value_ptr.* else 0) | (actual_bits & ~cur_allow);
             }
@@ -6155,8 +7327,11 @@ pub fn executeUpgradePaths(
     defer interner.deinit();
     var source_map = vfs_sourcemap.VfsSourceMap.init(allocator, &interner);
     defer source_map.deinit(io);
+    source_map.setIo(io);
+
     var db = try CompilerDb.init(allocator);
     defer db.deinit();
+    db.setVfsSourceMap(&source_map);
     db.setEmbedIo(io);
     if (options.is_internal_core) {
         try db.setInternalCore(true);
@@ -6167,23 +7342,56 @@ pub fn executeUpgradePaths(
     var upgraded_cx_count: usize = 0;
     var upgraded_manifest_count: usize = 0;
 
-    // [1] Load and upgrade `.cx` workspace/file targets:
+    // [1] Load `.cx` workspace/file targets, bind `mod <name>;` submodules, stdlib `cx`, and offline dependencies:
     var loaded_fids: std.ArrayListUnmanaged(FileId) = .empty;
     defer loaded_fids.deinit(allocator);
     var loaded_paths: std.ArrayListUnmanaged([]const u8) = .empty;
     defer loaded_paths.deinit(allocator);
 
+    var has_core_mention = false;
     for (cx_paths) |cx_path| {
         const raw_bytes = try std.Io.Dir.cwd().readFileAlloc(io, cx_path, allocator, .limited(64 * 1024 * 1024));
         defer allocator.free(raw_bytes);
+        if (!has_core_mention and
+            (std.mem.indexOf(u8, raw_bytes, "cx") != null or
+                std.mem.indexOf(u8, raw_bytes, "core") != null or
+                std.mem.indexOf(u8, raw_bytes, "std") != null))
+        {
+            has_core_mention = true;
+        }
         const fid = try source_map.setOverlay(cx_path, raw_bytes, .root);
         _ = try db.setInput(fid, raw_bytes, .low);
+        try db.setFilePath(fid, cx_path);
         try loaded_fids.append(allocator, fid);
         try loaded_paths.append(allocator, cx_path);
     }
 
     if (loaded_fids.items.len > 0) {
-        const cx_results = try upgradeWorkspaceFilesInDb(allocator, &db, loaded_fids.items, options);
+        var visited_fids: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer visited_fids.deinit(allocator);
+
+        if (manifest_path_opt) |toml_path| {
+            try mountOfflineManifestDepsInDb(
+                allocator,
+                io,
+                &source_map,
+                &db,
+                toml_path,
+                options,
+                &visited_fids,
+                &has_core_mention,
+            );
+        }
+        if (has_core_mention) {
+            try registerCoreStdlibInDb(allocator, io, &source_map, &db, &visited_fids);
+        }
+
+        var ws_options = options;
+        ws_options.io = io;
+        ws_options.vfs = &source_map;
+        try rebindWorkspaceSubmodulesInDb(allocator, &db, ws_options);
+
+        const cx_results = try upgradeWorkspaceFilesInDb(allocator, &db, loaded_fids.items, ws_options);
         defer {
             for (cx_results) |*res| res.deinit(allocator);
             allocator.free(cx_results);
@@ -6200,7 +7408,7 @@ pub fn executeUpgradePaths(
         }
     }
 
-    // [2] Canonicalize `corex.toml` when present and `!has_explicit_rule_filter`:
+    // [2] Canonicalize `corex.toml` (and synchronize sibling `corex.lock` `root_manifest_blake3`) when present:
     if (manifest_path_opt) |toml_path| {
         if (!options.has_explicit_rule_filter) {
             const raw_toml = try std.Io.Dir.cwd().readFileAlloc(io, toml_path, allocator, .limited(16 * 1024 * 1024));
@@ -6219,12 +7427,68 @@ pub fn executeUpgradePaths(
                 } else {
                     try codegen_abi.writeArtifactAtomic(io, allocator, toml_path, manifest_res.upgraded_toml);
                     upgraded_manifest_count += 1;
+
+                    const ws_dir = std.fs.path.dirname(toml_path) orelse ".";
+                    const lock_path = try std.fs.path.join(allocator, &.{ ws_dir, "corex.lock" });
+                    defer allocator.free(lock_path);
+                    if (std.Io.Dir.cwd().readFileAlloc(
+                        io,
+                        lock_path,
+                        allocator,
+                        .limited(pkg_manifest.MAX_TOML_BYTES),
+                    )) |lock_bytes| {
+                        defer allocator.free(lock_bytes);
+                        var lock_arena = BumpArena.init(allocator);
+                        defer lock_arena.deinit();
+                        var lock_interner = try StringInterner.init(allocator);
+                        defer lock_interner.deinit();
+                        var lock_sink = DiagnosticSink.init(allocator);
+                        defer lock_sink.deinit();
+
+                        if (pkg_manifest.parseLockfile(
+                            allocator,
+                            &lock_arena,
+                            &lock_interner,
+                            FileId.fromInt(2),
+                            lock_bytes,
+                            null,
+                            &lock_sink,
+                        )) |parsed_lock_opt| {
+                            if (!lock_sink.hasErrors()) {
+                                if (parsed_lock_opt) |lock_val| {
+                                    var updated_lock = lock_val;
+                                    updated_lock.root_manifest_blake3 = manifest_res.root_manifest_blake3;
+                                    const new_lock_bytes = try pkg_manifest.serializeLockfile(
+                                        allocator,
+                                        &updated_lock,
+                                        &lock_interner,
+                                    );
+                                    defer allocator.free(new_lock_bytes);
+                                    if (!std.mem.eql(u8, lock_bytes, new_lock_bytes)) {
+                                        try codegen_abi.writeArtifactAtomic(io, allocator, lock_path, new_lock_bytes);
+                                    }
+                                }
+                            }
+                        } else |_| {}
+                    } else |_| {}
                 }
             }
         }
     }
 
     if (options.is_check_only) {
+        for (options.extra_pending_items) |extra_item| {
+            var is_duplicate = false;
+            for (pending_list.items) |existing_item| {
+                if (existing_item.kind == extra_item.kind and std.mem.eql(u8, existing_item.path, extra_item.path)) {
+                    is_duplicate = true;
+                    break;
+                }
+            }
+            if (!is_duplicate) {
+                try pending_list.append(allocator, extra_item);
+            }
+        }
         return renderUpgradeCheckReport(
             stdout_writer,
             stderr_writer,
@@ -6367,7 +7631,7 @@ test "test_tier1_and_tier2_synergy_ur21_and_ur22_rewrites" {
     defer res.deinit(std.testing.allocator);
 
     try std.testing.expect(res.is_changed);
-    try std.testing.expect(!res.was_rolled_back);
+    try std.testing.expect(!res.is_rolled_back);
     const out = res.upgraded_source;
 
     // `UR-21-00` & `UR-22-05`:
@@ -6458,7 +7722,7 @@ test "test_tier3_semantic_modernizers_and_surgical_rule_filter" {
     var res = try upgradeSource(std.testing.allocator, tier3_cx, FileId.fromInt(20), .{});
     defer res.deinit(std.testing.allocator);
     try std.testing.expect(res.is_changed);
-    try std.testing.expect(!res.was_rolled_back);
+    try std.testing.expect(!res.is_rolled_back);
     const out = res.upgraded_source;
 
     // `UR-22-02` Tier-3 `~Copy` completion (`mut handle: OwnedHandle` -> `var handle: own OwnedHandle`):
@@ -6697,7 +7961,7 @@ test "test_precedence_rewrites_ur21_05_pipe_and_ur22_03_slice_array_fn_ptr" {
     var res = try upgradeSource(std.testing.allocator, legacy_src, FileId.fromInt(40), .{});
     defer res.deinit(std.testing.allocator);
     try std.testing.expect(res.is_changed);
-    try std.testing.expect(!res.was_rolled_back);
+    try std.testing.expect(!res.is_rolled_back);
 
     const out = res.upgraded_source;
     try std.testing.expect(std.mem.indexOf(u8, out, "(opt orelse 10) |> inc()") != null);
@@ -6762,7 +8026,7 @@ test "test_deprecated_variadic_and_comment_guards_plus_standalone_fix_inline" {
     var upg_res = try upgradeSource(std.testing.allocator, dep_src, FileId.fromInt(43), .{});
     defer upg_res.deinit(std.testing.allocator);
     try std.testing.expect(upg_res.is_changed);
-    try std.testing.expect(!upg_res.was_rolled_back);
+    try std.testing.expect(!upg_res.is_rolled_back);
 
     const upgraded = upg_res.upgraded_source;
     try std.testing.expect(std.mem.indexOf(u8, upgraded, "c_printf(fmt_ptr, num, 99)") != null);
@@ -6835,7 +8099,7 @@ test "test_generated_script_frontmatter_guard_ref_self_type_and_cst_comment_guar
     var self_res = try upgradeSource(std.testing.allocator, self_modes_src, FileId.fromInt(46), .{});
     defer self_res.deinit(std.testing.allocator);
     try std.testing.expect(self_res.is_changed);
-    try std.testing.expect(!self_res.was_rolled_back);
+    try std.testing.expect(!self_res.is_rolled_back);
     try std.testing.expect(std.mem.indexOf(u8, self_res.upgraded_source, "(&self: Self)") != null);
     try std.testing.expect(std.mem.indexOf(u8, self_res.upgraded_source, "(&mut self: Self)") != null);
     try std.testing.expect(std.mem.indexOf(u8, self_res.upgraded_source, "(own self: Self)") != null);
