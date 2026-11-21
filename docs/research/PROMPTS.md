@@ -1,6 +1,6 @@
-# Upfront `Deep Research` Prompts (`DR-01`–`DR-22`)
+# Upfront `Deep Research` Prompts (`DR-01`–`DR-23`)
 
-This catalog contains the 22 self-contained, copy-pasteable compiler `Deep research` prompts and specifications that resolve `RDG-01`–`RDG-22` in [PLAN.md](../../PLAN.md) (`docs/research/DR-XX.md`). For the companion module-level **Standard Library (`cx.*`)** `Deep research` prompts (`STD-01`–`STD-07` → `docs/research/stdlib/STD-XX.md`), see [docs/research/stdlib/PROMPTS.md](stdlib/PROMPTS.md).
+This catalog contains the 23 self-contained, copy-pasteable compiler `Deep research` prompts and specifications that resolve `RDG-01`–`RDG-23` in [PLAN.md](../../PLAN.md) (`docs/research/DR-XX.md`). For the companion module-level **Standard Library (`cx.*`)** `Deep research` prompts (`STD-01`–`STD-07` → `docs/research/stdlib/STD-XX.md`), see [docs/research/stdlib/PROMPTS.md](stdlib/PROMPTS.md).
 
 ---
 
@@ -30,6 +30,7 @@ This catalog contains the 22 self-contained, copy-pasteable compiler `Deep resea
 | **`DR-20`** | **`RDG-20`** | `docs/research/DR-20.md` | Wave 4 | *None*                                              | Phases 6–13           | Holistic Superpower Catalog (`D-01`–`D-11`), Soundness Fixes & `195-LOC` Seam Audit    |
 | **`DR-21`** | **`RDG-21`** | `docs/research/DR-21.md` | Wave 5 | `PLAN`, `DR-02`–`DR-08`, `DR-12`–`DR-15`, `DR-20`   | Phase 7.5 (Pre-Ph. 8) | Surface Syntax, `cx.*` Namespace, Unified `.` Paths & `SE-01`–`SE-08` Ergonomics       |
 | **`DR-22`** | **`RDG-22`** | `docs/research/DR-22.md` | Wave 6 | `PLAN`, `DR-21`, `DR-02`–`04`, `DR-06`–`08`, `10`, `15` | Phase 7.6 (Pre-Ph. 8) | Canonical CoreX v1.0 Surface Lock (`ADR-22A`–`22F`) & `SE-09`–`SE-23` Advantages       |
+| **`DR-23`** | **`RDG-23`** | `docs/research/DR-23.md` | Wave 7 | `PLAN`, `AGENTS`, `DR-03`, `DR-21`, `DR-22`             | Phase 10.6 (Pre-Ph. 11) | Final Pre-Stdlib Docstrings, `impl`, `else if`, Scalar Casing, `_ =` & `:` Audit       |
 
 ---
 
@@ -715,3 +716,9 @@ Output your entire completed specification report wrapped inside **one single ou
 ## `DR-22` (Plugs into `RDG-22` → `docs/research/DR-22.md`): Definitive Surface Syntax Canonicalization, Micro-Ergonomic Polish & Zero-Cost Language Advantages
 
 > Resolved in [DR-22.md](DR-22.md) (`ADR-22A`–`22F` One Canonical Way surface lock – word-based `and`/`or`/`not` + `~x`, `let`/`var` + `&T`/`&mut T`/`own T`/`&out T` MVS parameter modes with callee-local `var x: T`, payload-first `T!E` + 4-tier `Type` precedence, `@attr(k: v)` + `bit_field Name: uN` + `enum Name: Int` + `.len()` + `Number` + `@no_alloc`, 4-tier `pub(super)`/`pub(pkg)`/`pub` visibility, and `*T`/`*mut T`/`*opaque` + `&raw [mut]` + postfix `ptr.*` – alongside `120` `TokenKind`s, `SE-09`–`SE-23` zero-cost language advantages, and `UR-22-00`–`UR-22-06` `corex upgrade` rules).
+
+---
+
+## `DR-23` (Plugs into `RDG-23` → `docs/research/DR-23.md`): Pre-Stdlib Surface Syntax Audit – Docstrings, Method Attachment, Conditionals, Scalar Casing, Discard Statements & Type Annotations
+
+> Resolved in [DR-23.md](DR-23.md) (`ADR-23A`–`23F` final pre-stdlib surface lock – strict line-only `///` outer item docs + file-top-only `//!` module headers banning `/**`/`/*!` block doc comments, separate `impl` blocks banning inline type-body `fn`/`subscript` and `pub impl`, compositional two-token `else if` over `elif`, 20 lowercase `PRIM_TYPE` scalars with O(1) `E0403` foreign-scalar hints, bare `_ = expr;` as the sole statement-level discard retiring non-binding `let _ = expr;` / `var _ = expr;`, and postfix colon `x: T` type annotations – adding `0` `TokenKind`s [`120 / 128`], diagnostics `E0118`, `E0229`–`E0236`, `E0439`, and `UR-23-00`–`UR-23-06` `corex upgrade` rules).
