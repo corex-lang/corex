@@ -3019,6 +3019,7 @@ fn mountWorkspaceCoreStdlibLazy(
             );
             try session.db.registerRootModule("core", core_fid);
             try session.db.registerRootModule("cx", core_fid);
+            _ = session.db.resolveSignatures(core_fid) catch {};
             return;
         } else |_| {}
         break :blk "core/root.cx";
@@ -3037,6 +3038,7 @@ fn mountWorkspaceCoreStdlibLazy(
     );
     try session.db.registerRootModule("core", core_fid);
     try session.db.registerRootModule("cx", core_fid);
+    _ = session.db.resolveSignatures(core_fid) catch {};
 }
 
 /// Walks `<dir_path>` and mounts any additional `.cx` files at `Durability.medium` without typechecking bodies.
@@ -4282,6 +4284,117 @@ fn resolveAstNodeFocalToken(
     return ast_node.main_token;
 }
 
+/// Emits semantic comment spans for `piece`, splitting `TRIVIA_FLAG_COALESCED` runs into individual comments.
+fn appendCommentTriviaSemanticSpans(
+    arena_alloc: std.mem.Allocator,
+    src: []const u8,
+    line_idx: *const LineIndex,
+    encoding: PositionEncoding,
+    piece: syntax_arenas.TriviaPiece,
+    range_filter: ?LspRange,
+    out_tokens: *std.ArrayListUnmanaged(RawSemanticToken),
+) !void {
+    const piece_start: usize = piece.byte_offset;
+    const piece_end: usize = @min(@as(usize, piece.byte_offset) + @as(usize, piece.byte_len), src.len);
+    if (piece_start >= piece_end) return;
+
+    if ((piece.flags & syntax_arenas.TRIVIA_FLAG_COALESCED) == 0) {
+        switch (piece.kind) {
+            .doc_comment, .module_doc_comment => {
+                try appendSplitSemanticSpan(
+                    arena_alloc,
+                    src,
+                    line_idx,
+                    encoding,
+                    piece.byte_offset,
+                    @intCast(piece_end),
+                    SEM_TOK_COMMENT,
+                    SEM_MOD_DOCUMENTATION,
+                    range_filter,
+                    out_tokens,
+                );
+            },
+            .line_comment, .block_comment => {
+                try appendSplitSemanticSpan(
+                    arena_alloc,
+                    src,
+                    line_idx,
+                    encoding,
+                    piece.byte_offset,
+                    @intCast(piece_end),
+                    SEM_TOK_COMMENT,
+                    0,
+                    range_filter,
+                    out_tokens,
+                );
+            },
+            else => {},
+        }
+        return;
+    }
+
+    var cursor: usize = piece_start;
+    while (cursor < piece_end) {
+        if (src[cursor] == '#' and cursor == 0 and cursor + 1 < piece_end and src[cursor + 1] == '!') {
+            while (cursor < piece_end and src[cursor] != '\n' and src[cursor] != '\r') : (cursor += 1) {}
+            continue;
+        }
+        if (src[cursor] == '/' and cursor + 1 < piece_end) {
+            const next_byte = src[cursor + 1];
+            if (next_byte == '/') {
+                const com_start = cursor;
+                const is_doc = (cursor + 2 < piece_end) and
+                    (src[cursor + 2] == '!' or
+                        (src[cursor + 2] == '/' and (cursor + 3 >= piece_end or src[cursor + 3] != '/')));
+                cursor += 2;
+                while (cursor < piece_end and src[cursor] != '\n' and src[cursor] != '\r') : (cursor += 1) {}
+                try appendSplitSemanticSpan(
+                    arena_alloc,
+                    src,
+                    line_idx,
+                    encoding,
+                    @intCast(com_start),
+                    @intCast(cursor),
+                    SEM_TOK_COMMENT,
+                    if (is_doc) SEM_MOD_DOCUMENTATION else 0,
+                    range_filter,
+                    out_tokens,
+                );
+                continue;
+            } else if (next_byte == '*') {
+                const blk_start = cursor;
+                cursor += 2;
+                var blk_depth: u32 = 1;
+                while (cursor < piece_end and blk_depth > 0) {
+                    if (src[cursor] == '/' and cursor + 1 < piece_end and src[cursor + 1] == '*') {
+                        blk_depth += 1;
+                        cursor += 2;
+                    } else if (src[cursor] == '*' and cursor + 1 < piece_end and src[cursor + 1] == '/') {
+                        blk_depth -= 1;
+                        cursor += 2;
+                    } else {
+                        cursor += 1;
+                    }
+                }
+                try appendSplitSemanticSpan(
+                    arena_alloc,
+                    src,
+                    line_idx,
+                    encoding,
+                    @intCast(blk_start),
+                    @intCast(cursor),
+                    SEM_TOK_COMMENT,
+                    0,
+                    range_filter,
+                    out_tokens,
+                );
+                continue;
+            }
+        }
+        cursor += 1;
+    }
+}
+
 /// Computes the 5-`u32`-per-token delta-encoded semantic token stream for `file_id` (optionally clipped to `range_opt`).
 fn computeSemanticTokensData(
     session: *LspSession,
@@ -4403,43 +4516,21 @@ fn computeSemanticTokensData(
         const tok_id = TokenIndex.fromInt(@intCast(tok_i));
         const tok_rec = parsed_art.token_buffer.getToken(tok_id);
 
-        // Emit comment trivia attached to `tok_rec`:
+        // Emit comment trivia attached to `tok_rec` (expanding `TRIVIA_FLAG_COALESCED` runs):
         const triv_start: usize = tok_rec.trivia_span.start_index;
         const triv_total: usize = @as(usize, tok_rec.trivia_span.leading_count) +
             @as(usize, tok_rec.trivia_span.trailing_count);
         if (triv_total > 0 and triv_start + triv_total <= parsed_art.token_buffer.trivia.items.len) {
             for (parsed_art.token_buffer.trivia.items[triv_start .. triv_start + triv_total]) |piece| {
-                switch (piece.kind) {
-                    .doc_comment, .module_doc_comment => {
-                        try appendSplitSemanticSpan(
-                            arena_alloc,
-                            src,
-                            line_idx,
-                            session.position_encoding,
-                            piece.byte_offset,
-                            piece.byte_offset +| piece.byte_len,
-                            SEM_TOK_COMMENT,
-                            SEM_MOD_DOCUMENTATION,
-                            range_opt,
-                            &raw_tokens,
-                        );
-                    },
-                    .line_comment, .block_comment => {
-                        try appendSplitSemanticSpan(
-                            arena_alloc,
-                            src,
-                            line_idx,
-                            session.position_encoding,
-                            piece.byte_offset,
-                            piece.byte_offset +| piece.byte_len,
-                            SEM_TOK_COMMENT,
-                            0,
-                            range_opt,
-                            &raw_tokens,
-                        );
-                    },
-                    else => {},
-                }
+                try appendCommentTriviaSemanticSpans(
+                    arena_alloc,
+                    src,
+                    line_idx,
+                    session.position_encoding,
+                    piece,
+                    range_opt,
+                    &raw_tokens,
+                );
             }
         }
 
@@ -5113,18 +5204,114 @@ fn resolveCursorTarget(
     }
 
     if (session.db.symbol_table.file_module_scopes.get(file_id.asInt())) |mod_scope| {
-        if (session.db.interner.lookup(tok_lex)) |name_id| {
-            const ns_mask: NamespaceMask = switch (tok_rec.kind) {
-                .type_ident => NamespaceMask.TYPE_OR_VALUE,
-                .const_ident => NamespaceMask.CONST_ONLY,
-                else => NamespaceMask.ALL,
-            };
-            switch (session.db.symbol_table.lookupLexical(mod_scope, name_id, ns_mask)) {
-                .found => |found_sym| {
-                    result.symbol_index = found_sym;
-                    result.type_id = session.db.symbol_table.getSymbol(found_sym).type_id;
-                },
-                else => {},
+        const tok_raw = tok_idx.asInt();
+        const tok_total = parsed_art.token_buffer.countTokens();
+        const prev_kind: TokenKind = if (tok_raw > 0)
+            parsed_art.token_buffer.getToken(TokenIndex.fromInt(tok_raw - 1)).kind
+        else
+            .eof;
+        const next_kind: TokenKind = if (tok_raw + 1 < tok_total)
+            parsed_art.token_buffer.getToken(TokenIndex.fromInt(tok_raw + 1)).kind
+        else
+            .eof;
+
+        // Resolve dotted module/type paths (`cx.async.Poll`, `use cx.sys.wasi;`, `cx.ffi.CStr`):
+        if (prev_kind == .dot or next_kind == .dot) {
+            var rev_segs: [16]TokenIndex = undefined;
+            var rev_len: usize = 0;
+            var walk_tok: usize = tok_raw;
+            while (rev_len < rev_segs.len) {
+                const walk_id = TokenIndex.fromInt(@intCast(walk_tok));
+                const walk_kind = parsed_art.token_buffer.getToken(walk_id).kind;
+                if (!isIdentifierOrKeywordToken(walk_kind)) break;
+                rev_segs[rev_len] = walk_id;
+                rev_len += 1;
+                if (walk_tok < 2) break;
+                if (parsed_art.token_buffer.getToken(TokenIndex.fromInt(@intCast(walk_tok - 1))).kind != .dot) break;
+                walk_tok -= 2;
+            }
+
+            if (rev_len >= 2 or (rev_len == 1 and next_kind == .dot)) {
+                var cur_scope: ScopeId = mod_scope;
+                var resolved_chain_sym: SymbolIndex = .none;
+                var step_idx: usize = rev_len;
+                while (step_idx > 0) {
+                    step_idx -= 1;
+                    const seg_tok = rev_segs[step_idx];
+                    const seg_lex = symbol_resolver.extractTokenSlice(src, &parsed_art.token_buffer, seg_tok);
+                    const is_first_seg = (step_idx + 1 == rev_len);
+                    resolved_chain_sym = .none;
+
+                    if (is_first_seg and (std.mem.eql(u8, seg_lex, "cx") or
+                        (session.options.is_internal_core and std.mem.eql(u8, seg_lex, "core"))))
+                    {
+                        const cx_scope = try session.db.symbol_table.ensureCxRootScope(&session.db.interner);
+                        if (session.db.interner.lookup("cx")) |cx_id| {
+                            resolved_chain_sym = session.db.symbol_table.lookupInScopeDirect(
+                                session.db.symbol_table.prelude_scope,
+                                cx_id,
+                                NamespaceMask.VALUE_ONLY,
+                            );
+                        }
+                        cur_scope = cx_scope;
+                        continue;
+                    } else if (is_first_seg and std.mem.eql(u8, seg_lex, "pkg")) {
+                        cur_scope = session.db.symbol_table.resolveCallerPackageRootScope(file_id, mod_scope);
+                        continue;
+                    } else if (is_first_seg and std.mem.eql(u8, seg_lex, "self")) {
+                        cur_scope = mod_scope;
+                        continue;
+                    } else if (is_first_seg and std.mem.eql(u8, seg_lex, "super")) {
+                        const mod_rec = session.db.symbol_table.scope_arena.getScope(mod_scope);
+                        cur_scope = if (!mod_rec.parent_module.isNone()) mod_rec.parent_module else mod_rec.parent;
+                        continue;
+                    }
+
+                    const seg_name_id = session.db.interner.lookup(seg_lex) orelse break;
+                    const seg_found: SymbolIndex = if (is_first_seg) blk_first: {
+                        switch (session.db.symbol_table.lookupLexical(cur_scope, seg_name_id, NamespaceMask.ALL)) {
+                            .found => |found_idx| break :blk_first found_idx,
+                            else => break :blk_first .none,
+                        }
+                    } else if (!cur_scope.isNone())
+                        session.db.symbol_table.lookupInScopeDirect(cur_scope, seg_name_id, NamespaceMask.ALL)
+                    else
+                        .none;
+
+                    if (seg_found.isNone()) break;
+                    resolved_chain_sym = seg_found;
+                    const unwrapped_seg = session.db.symbol_table.unwrapAliasSymbolIdx(seg_found);
+                    cur_scope = session.db.symbol_table.getSymbol(unwrapped_seg).target_scope;
+                }
+
+                if (!resolved_chain_sym.isNone()) {
+                    result.symbol_index = resolved_chain_sym;
+                    result.type_id = session.db.symbol_table.getSymbol(resolved_chain_sym).type_id;
+                    return result;
+                }
+            }
+        }
+
+        const is_contextual_mod_kw = tok_rec.kind == .kw_async and
+            (prev_kind == .dot or prev_kind == .kw_mod or prev_kind == .kw_use or prev_kind == .lbrace);
+        if (isUserIdentifierToken(tok_rec.kind) or
+            tok_rec.kind == .kw_self_val or
+            tok_rec.kind == .kw_self_type or
+            is_contextual_mod_kw)
+        {
+            if (session.db.interner.lookup(tok_lex)) |name_id| {
+                const ns_mask: NamespaceMask = switch (tok_rec.kind) {
+                    .type_ident => NamespaceMask.TYPE_OR_VALUE,
+                    .const_ident => NamespaceMask.CONST_ONLY,
+                    else => NamespaceMask.ALL,
+                };
+                switch (session.db.symbol_table.lookupLexical(mod_scope, name_id, ns_mask)) {
+                    .found => |found_sym| {
+                        result.symbol_index = found_sym;
+                        result.type_id = session.db.symbol_table.getSymbol(found_sym).type_id;
+                    },
+                    else => {},
+                }
             }
         }
     }
@@ -5133,7 +5320,194 @@ fn resolveCursorTarget(
 
 // ----------- Hover (Signature + DR-17 4.4 + Trivia) -----------
 
-/// Extracts `///` or `//!` doc comment lines attached to `decl_span`, skipping previous-item same-line trivia.
+/// Joins extracted doc-comment lines into a single `\n`-separated Markdown slice inside `arena_alloc`.
+fn joinDocLines(arena_alloc: std.mem.Allocator, lines: []const []const u8) ![]const u8 {
+    if (lines.len == 0) return "";
+    var joined: std.ArrayListUnmanaged(u8) = .empty;
+    for (lines, 0..) |line_str, i| {
+        if (i > 0) try joined.append(arena_alloc, '\n');
+        try joined.appendSlice(arena_alloc, line_str);
+    }
+    return joined.items;
+}
+
+/// Advances `start_offset` past an optional UTF-8 BOM (`0xEF 0xBB 0xBF`) and `#!` shebang line at byte `0`.
+fn skipLeadingBomAndShebang(src: []const u8) usize {
+    var cursor: usize = 0;
+    if (src.len >= 3 and src[0] == 0xEF and src[1] == 0xBB and src[2] == 0xBF) {
+        cursor = 3;
+    }
+    if (cursor + 1 < src.len and src[cursor] == '#' and src[cursor + 1] == '!') {
+        while (cursor < src.len and src[cursor] != '\n') : (cursor += 1) {}
+        if (cursor < src.len and src[cursor] == '\n') cursor += 1;
+    }
+    return cursor;
+}
+
+/// Extracts contiguous top-of-file `//!` module doc comments from `mod_fid` (or `""` if none exist at the top).
+fn extractFileModuleDocComments(
+    session: *LspSession,
+    arena_alloc: std.mem.Allocator,
+    mod_fid: FileId,
+) ![]const u8 {
+    if (mod_fid.isNone()) return "";
+    const src = getLiveDocumentSource(session, mod_fid) orelse return "";
+    var cursor = skipLeadingBomAndShebang(src);
+    var doc_lines: std.ArrayListUnmanaged([]const u8) = .empty;
+
+    while (cursor < src.len) {
+        var line_end = cursor;
+        while (line_end < src.len and src[line_end] != '\n') : (line_end += 1) {}
+        const raw_line = std.mem.trimEnd(u8, src[cursor..line_end], "\r");
+        const trimmed_start = std.mem.trimStart(u8, raw_line, " \t");
+        if (!std.mem.startsWith(u8, trimmed_start, "//!")) break;
+
+        var content_slice = trimmed_start[3..];
+        if (content_slice.len > 0 and content_slice[0] == ' ') {
+            content_slice = content_slice[1..];
+        }
+        try doc_lines.append(arena_alloc, content_slice);
+        cursor = if (line_end < src.len) line_end + 1 else src.len;
+    }
+    return joinDocLines(arena_alloc, doc_lines.items);
+}
+
+/// Resolves the backing `.cx` `FileId` for a file-backed `.module_sym` (or `.none` for inline `mod { … }`).
+fn resolveModuleBackingFileId(
+    session: *LspSession,
+    target: CursorTarget,
+    sym: SymbolRecord,
+) FileId {
+    if (!target.external_mod_file_id.isNone()) return target.external_mod_file_id;
+
+    // Check whether `sym` is an inline `mod foo { … }` block (`rhs.tag == .extra`):
+    if (!sym.decl_span.file_id.isNone()) {
+        const decl_fid = sym.decl_span.file_id;
+        _ = session.db.parseCst(decl_fid) catch {};
+        if (session.db.parsed_artifacts.getPtr(decl_fid.asInt())) |parsed_art| {
+            var check_ast = sym.ast_node;
+            if (!sym.def_id.isNone() and sym.def_id.fileId() == decl_fid) {
+                if (session.db.extractItemTree(decl_fid) catch null) |tree| {
+                    if (tree.getEntry(sym.def_id)) |live_entry| {
+                        check_ast = live_entry.ast_node;
+                    }
+                }
+            }
+            if (!check_ast.isNone() and check_ast.asInt() < parsed_art.ast_arena.countNodes()) {
+                const mod_ast = parsed_art.ast_arena.getNode(check_ast);
+                if (mod_ast.tag == .mod_decl and mod_ast.rhs.tag == .extra) {
+                    return .none;
+                }
+            }
+        }
+        if (!sym.name.isNone()) {
+            const ext_key: u64 = (@as(u64, decl_fid.asInt()) << 32) | @as(u64, sym.name.asInt());
+            if (session.db.external_mod_files.get(ext_key)) |bound_fid| {
+                return bound_fid;
+            }
+        }
+    }
+
+    if (!sym.target_scope.isNone() and sym.target_scope.asInt() < session.db.symbol_table.scope_arena.countScopes()) {
+        const scope_rec = session.db.symbol_table.scope_arena.getScope(sym.target_scope);
+        if (scope_rec.owner_def_id.isNone() and !scope_rec.file_id.isNone()) {
+            return scope_rec.file_id;
+        }
+    }
+
+    // Built-in `cx` / `core` root or `cx.<submod>` bridge fallback via `root_module_files` + `external_mod_files`:
+    if (session.db.interner.lookup("core") orelse session.db.interner.lookup("cx")) |root_id| {
+        if (session.db.root_module_files.get(root_id.asInt())) |core_root_fid| {
+            if (std.mem.eql(u8, sym.name_text, "cx") or std.mem.eql(u8, sym.name_text, "core")) {
+                return core_root_fid;
+            }
+            if (!sym.name.isNone()) {
+                const sub_key: u64 = (@as(u64, core_root_fid.asInt()) << 32) | @as(u64, sym.name.asInt());
+                if (session.db.external_mod_files.get(sub_key)) |sub_fid| {
+                    return sub_fid;
+                }
+            }
+        }
+    }
+    return .none;
+}
+
+/// Extracts inner `//!` doc comments immediately inside an inline `mod foo { … }`, or falls back to outer `///`.
+fn extractInlineModDocComments(
+    session: *LspSession,
+    arena_alloc: std.mem.Allocator,
+    decl_span: Span,
+    sym_def_id: DefId,
+    fallback_cst_node: CstNodeIndex,
+) ![]const u8 {
+    if (!decl_span.file_id.isNone() and session.db.source_inputs.contains(decl_span.file_id.asInt())) {
+        const decl_fid = decl_span.file_id;
+        if (getLiveDocumentSource(session, decl_fid)) |src| {
+            _ = session.db.parseCst(decl_fid) catch {};
+            if (session.db.parsed_artifacts.getPtr(decl_fid.asInt())) |parsed_art| {
+                var live_cst = fallback_cst_node;
+                if (!sym_def_id.isNone() and sym_def_id.fileId() == decl_fid) {
+                    if (session.db.extractItemTree(decl_fid) catch null) |tree| {
+                        if (tree.getEntry(sym_def_id)) |entry| live_cst = entry.cst_node;
+                    }
+                }
+                const cst_total = parsed_art.cst_arena.countNodes();
+                const tok_total = parsed_art.token_buffer.countTokens();
+                if (!live_cst.isNone() and live_cst.asInt() < cst_total) {
+                    const start_idx: usize = live_cst.asInt();
+                    const end_idx = @min(
+                        start_idx + @max(@as(usize, parsed_art.cst_arena.getNode(live_cst).subtree_size), 1),
+                        cst_total,
+                    );
+                    var lbrace_end_byte: ?usize = null;
+                    var cur = start_idx;
+                    while (cur < end_idx) : (cur += 1) {
+                        const leaf = parsed_art.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+                        if (leaf.subtree_size <= 1 and !leaf.flags.is_missing_or_injected and
+                            !leaf.token.isNone() and leaf.token.asInt() < tok_total)
+                        {
+                            const tok_rec = parsed_art.token_buffer.getToken(leaf.token);
+                            if (!tok_rec.flags.is_synthesized and tok_rec.kind == .lbrace) {
+                                lbrace_end_byte = @min(
+                                    @as(usize, tok_rec.byte_offset) + @as(usize, tok_rec.byte_len),
+                                    src.len,
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    if (lbrace_end_byte) |after_brace| {
+                        var cursor = after_brace;
+                        while (cursor < src.len and (src[cursor] == ' ' or src[cursor] == '\t' or src[cursor] == '\r')) {
+                            cursor += 1;
+                        }
+                        if (cursor < src.len and src[cursor] == '\n') cursor += 1;
+                        var inner_lines: std.ArrayListUnmanaged([]const u8) = .empty;
+                        while (cursor < src.len) {
+                            var line_end = cursor;
+                            while (line_end < src.len and src[line_end] != '\n') : (line_end += 1) {}
+                            const raw_line = std.mem.trimEnd(u8, src[cursor..line_end], "\r");
+                            const trimmed_start = std.mem.trimStart(u8, raw_line, " \t");
+                            if (!std.mem.startsWith(u8, trimmed_start, "//!")) break;
+                            var content_slice = trimmed_start[3..];
+                            if (content_slice.len > 0 and content_slice[0] == ' ') {
+                                content_slice = content_slice[1..];
+                            }
+                            try inner_lines.append(arena_alloc, content_slice);
+                            cursor = if (line_end < src.len) line_end + 1 else src.len;
+                        }
+                        if (inner_lines.items.len > 0) {
+                            return joinDocLines(arena_alloc, inner_lines.items);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return extractDeclarationDocComments(session, arena_alloc, decl_span, sym_def_id, fallback_cst_node);
+}
+
+/// Extracts outer `///` doc comment lines attached to `decl_span` (immune to `TRIVIA_FLAG_COALESCED` & `//!` headers).
 fn extractDeclarationDocComments(
     session: *LspSession,
     arena_alloc: std.mem.Allocator,
@@ -5144,7 +5518,6 @@ fn extractDeclarationDocComments(
     if (decl_span.file_id.isNone() or !session.db.source_inputs.contains(decl_span.file_id.asInt())) return "";
     const decl_fid = decl_span.file_id;
     const src = getLiveDocumentSource(session, decl_fid) orelse return "";
-    const line_idx = session.vfs.getLineIndex(decl_fid) catch return "";
     _ = session.db.parseCst(decl_fid) catch return "";
     const item_tree_opt = session.db.extractItemTree(decl_fid) catch null;
     const parsed_art = session.db.parsed_artifacts.getPtr(decl_fid.asInt()) orelse return "";
@@ -5199,11 +5572,12 @@ fn extractDeclarationDocComments(
     }
     if (first_tok.isNone()) {
         first_tok = findExactTokenAtByteOffset(&parsed_art.token_buffer, decl_span.start_byte) orelse return "";
-        // Walk backward over same-declaration modifiers (`pub`, `fn`, `struct`, `const`, `async`, `unsafe`, `@attr`):
+        // Walk backward over same-declaration modifiers (`pub`, `fn`, `struct`, `const`, `async`, `unsafe`):
         while (first_tok.asInt() > 0) {
             const prev_id = TokenIndex.fromInt(first_tok.asInt() - 1);
-            const prev_kind = parsed_art.token_buffer.getToken(prev_id).kind;
-            const is_header_mod = switch (prev_kind) {
+            const prev_rec = parsed_art.token_buffer.getToken(prev_id);
+            if (prev_rec.flags.is_synthesized) break;
+            const is_header_mod = switch (prev_rec.kind) {
                 .kw_pub,
                 .kw_fn,
                 .kw_struct,
@@ -5225,70 +5599,108 @@ fn extractDeclarationDocComments(
         }
     }
 
-    const prev_tok_end_line: u32 = if (first_tok.asInt() > 0) blk: {
-        const prev_rec = parsed_art.token_buffer.getToken(TokenIndex.fromInt(first_tok.asInt() - 1));
-        const prev_end = prev_rec.byte_offset +| prev_rec.byte_len;
-        break :blk line_idx.resolveLineCol(src, prev_end).line;
-    } else 0;
-
-    // Collect trivia pieces between `prev_tok` and `first_tok`:
-    var doc_lines: std.ArrayListUnmanaged([]const u8) = .empty;
-    var consecutive_newlines: u32 = 0;
-
-    var check_tok_idx: usize = if (first_tok.asInt() > 0) first_tok.asInt() - 1 else first_tok.asInt();
-    while (check_tok_idx <= first_tok.asInt()) : (check_tok_idx += 1) {
-        const t_rec = parsed_art.token_buffer.getToken(TokenIndex.fromInt(@intCast(check_tok_idx)));
-        const piece_start: usize = if (check_tok_idx < first_tok.asInt())
-            @as(usize, t_rec.trivia_span.start_index) + @as(usize, t_rec.trivia_span.leading_count)
-        else
-            @as(usize, t_rec.trivia_span.start_index);
-        const piece_count: usize = if (check_tok_idx < first_tok.asInt())
-            @as(usize, t_rec.trivia_span.trailing_count)
-        else
-            @as(usize, t_rec.trivia_span.leading_count);
-
-        if (piece_start + piece_count > parsed_art.token_buffer.trivia.items.len) continue;
-        for (parsed_art.token_buffer.trivia.items[piece_start .. piece_start + piece_count]) |piece| {
-            switch (piece.kind) {
-                .newline_lf, .newline_crlf => {
-                    consecutive_newlines += 1;
-                    if (consecutive_newlines >= 2 and doc_lines.items.len > 0) {
-                        // A blank line separates unrelated earlier comments from this item's doc block:
-                        doc_lines.clearRetainingCapacity();
-                    }
-                },
-                .doc_comment, .module_doc_comment => {
-                    const piece_line = line_idx.resolveLineCol(src, piece.byte_offset).line;
-                    // Strictly skip trailing same-line trivia attached to the previous item:
-                    if (first_tok.asInt() > 0 and piece_line == prev_tok_end_line) continue;
-                    consecutive_newlines = 0;
-                    const end_off = @min(@as(usize, piece.byte_offset) + @as(usize, piece.byte_len), src.len);
-                    var text_slice = std.mem.trimEnd(u8, src[piece.byte_offset..end_off], "\r\n");
-                    if (std.mem.startsWith(u8, text_slice, "///") or std.mem.startsWith(u8, text_slice, "//!")) {
-                        text_slice = text_slice[3..];
-                        if (text_slice.len > 0 and text_slice[0] == ' ') {
-                            text_slice = text_slice[1..];
-                        }
-                    }
-                    try doc_lines.append(arena_alloc, text_slice);
-                },
-                .line_comment, .block_comment => {
-                    const piece_line = line_idx.resolveLineCol(src, piece.byte_offset).line;
-                    if (first_tok.asInt() > 0 and piece_line == prev_tok_end_line) continue;
-                    consecutive_newlines = 0;
-                },
-                else => {},
-            }
+    const region_end: usize = @min(@as(usize, parsed_art.token_buffer.getToken(first_tok).byte_offset), src.len);
+    var prev_real_end: ?usize = null;
+    var back_idx: usize = first_tok.asInt();
+    while (back_idx > 0) {
+        back_idx -= 1;
+        const cand_rec = parsed_art.token_buffer.getToken(TokenIndex.fromInt(@intCast(back_idx)));
+        if (!cand_rec.flags.is_synthesized and cand_rec.byte_len > 0) {
+            prev_real_end = @min(@as(usize, cand_rec.byte_offset) + @as(usize, cand_rec.byte_len), region_end);
+            break;
         }
     }
 
-    if (doc_lines.items.len == 0) return "";
-    var joined: std.ArrayListUnmanaged(u8) = .empty;
-    for (doc_lines.items, 0..) |line_str, i| {
-        if (i > 0) try joined.append(arena_alloc, '\n');
-        try joined.appendSlice(arena_alloc, line_str);
+    // Advance `region_start` past any trailing trivia on `prev_real_tok`'s closing line (including `/* … */`):
+    const region_start: usize = if (prev_real_end) |prev_end| blk_start: {
+        var skip_cur = prev_end;
+        while (skip_cur < region_end) {
+            if (src[skip_cur] == '\n') {
+                skip_cur += 1;
+                break;
+            }
+            if (src[skip_cur] == '/' and skip_cur + 1 < region_end) {
+                if (src[skip_cur + 1] == '/') {
+                    while (skip_cur < region_end and src[skip_cur] != '\n') : (skip_cur += 1) {}
+                    if (skip_cur < region_end and src[skip_cur] == '\n') skip_cur += 1;
+                    break;
+                } else if (src[skip_cur + 1] == '*') {
+                    skip_cur += 2;
+                    var blk_depth: u32 = 1;
+                    while (skip_cur < region_end and blk_depth > 0) {
+                        if (src[skip_cur] == '/' and skip_cur + 1 < region_end and src[skip_cur + 1] == '*') {
+                            blk_depth += 1;
+                            skip_cur += 2;
+                        } else if (src[skip_cur] == '*' and skip_cur + 1 < region_end and src[skip_cur + 1] == '/') {
+                            blk_depth -= 1;
+                            skip_cur += 2;
+                        } else {
+                            skip_cur += 1;
+                        }
+                    }
+                    continue;
+                }
+            }
+            skip_cur += 1;
+        }
+        break :blk_start skip_cur;
+    } else @min(skipLeadingBomAndShebang(src), region_end);
+
+    if (region_start >= region_end) return "";
+
+    // Scan `[region_start, region_end)` directly: keep only the contiguous `///` block attached to `first_tok`.
+    var doc_lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    var consecutive_newlines: u32 = 0;
+    var cursor: usize = region_start;
+    while (cursor < region_end) {
+        const byte_val = src[cursor];
+        if (byte_val == ' ' or byte_val == '\t' or byte_val == '\r') {
+            cursor += 1;
+        } else if (byte_val == '\n') {
+            consecutive_newlines += 1;
+            if (consecutive_newlines >= 2 and doc_lines.items.len > 0) {
+                doc_lines.clearRetainingCapacity();
+            }
+            cursor += 1;
+        } else if (byte_val == '/' and cursor + 1 < region_end and src[cursor + 1] == '/') {
+            const com_start = cursor;
+            while (cursor < region_end and src[cursor] != '\n') : (cursor += 1) {}
+            const raw_comment = std.mem.trimEnd(u8, src[com_start..cursor], "\r\n");
+            const is_outer_doc = std.mem.startsWith(u8, raw_comment, "///") and
+                !std.mem.startsWith(u8, raw_comment, "////");
+            if (is_outer_doc) {
+                consecutive_newlines = 0;
+                var content_slice = raw_comment[3..];
+                if (content_slice.len > 0 and content_slice[0] == ' ') {
+                    content_slice = content_slice[1..];
+                }
+                try doc_lines.append(arena_alloc, content_slice);
+            } else {
+                // `//!` module header or `//` / `////` separator comment breaks any earlier doc block:
+                doc_lines.clearRetainingCapacity();
+                consecutive_newlines = 0;
+            }
+        } else if (byte_val == '/' and cursor + 1 < region_end and src[cursor + 1] == '*') {
+            cursor += 2;
+            var blk_depth: u32 = 1;
+            while (cursor < region_end and blk_depth > 0) {
+                if (src[cursor] == '/' and cursor + 1 < region_end and src[cursor + 1] == '*') {
+                    blk_depth += 1;
+                    cursor += 2;
+                } else if (src[cursor] == '*' and cursor + 1 < region_end and src[cursor + 1] == '/') {
+                    blk_depth -= 1;
+                    cursor += 2;
+                } else {
+                    cursor += 1;
+                }
+            }
+            doc_lines.clearRetainingCapacity();
+            consecutive_newlines = 0;
+        } else {
+            cursor += 1;
+        }
     }
-    return joined.items;
+    return joinDocLines(arena_alloc, doc_lines.items);
 }
 
 /// Formats a function or method signature string (with generics and `/` / `*` parameter zones) into `writer`.
@@ -5904,7 +6316,19 @@ fn handleHoverRequest(
         }
 
         const live_decl_span = session.db.resolveLiveSymbolDeclSpan(sym_idx) catch sym.decl_span;
-        const doc_md = try extractDeclarationDocComments(
+        const doc_md = if (sym.kind == .module_sym) blk_mod_doc: {
+            const mod_fid = resolveModuleBackingFileId(session, target, sym);
+            if (!mod_fid.isNone()) {
+                break :blk_mod_doc try extractFileModuleDocComments(session, arena_alloc, mod_fid);
+            }
+            break :blk_mod_doc try extractInlineModDocComments(
+                session,
+                arena_alloc,
+                live_decl_span,
+                sym.def_id,
+                sym.cst_node,
+            );
+        } else try extractDeclarationDocComments(
             session,
             arena_alloc,
             live_decl_span,
@@ -11413,4 +11837,150 @@ test "test_lsp_hover_attrs_variants_semantic_tokens_inlay_and_internal_rename" {
     try std.testing.expect(
         std.mem.indexOf(u8, frames[8], "\"start\":{\"line\":18,\"character\":9},\"end\":{\"line\":18,\"character\":14}") != null,
     );
+}
+
+test "test_lsp_module_hover_file_docstring_and_coalesced_trivia_isolation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var session = try LspSession.init(allocator, io, null, null, .{ .is_internal_core = true });
+    defer session.deinit();
+    session.bindInternalPointers();
+    session.state = .initialized;
+    session.position_encoding = .utf8;
+    session.workspace_root_dir = try allocator.dupe(u8, "d:/corex");
+
+    var out_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer out_alloc.deinit();
+    var exit_opt: ?u8 = null;
+
+    // `core/async.cx`: > 15 leading trivia pieces (`TRIVIA_FLAG_COALESCED`) + section divider + `///` on `Poll`:
+    const async_src =
+        "//! Structured Cooperative Async Concurrency (`core.async`)\n" ++
+        "//!\n" ++
+        "//! Defines stackless coroutine polling (`Poll[T]`), cancellation tokens,\n" ++
+        "//! and bounded `16 KiB` inline task frames across all execution tiers.\n" ++
+        "//!\n" ++
+        "//! Paragraph three line one.\n" ++
+        "//! Paragraph three line two.\n" ++
+        "//! Paragraph three line three.\n" ++
+        "//! Paragraph three line four.\n" ++
+        "// ---------------------------------------- TYPES ----------------------------------------\n" ++
+        "/// Cooperative step outcome returned when polling an asynchronous state machine.\n" ++
+        "pub enum Poll[T] {\n" ++
+        "    Ready(T),\n" ++
+        "    Pending,\n" ++
+        "}\n";
+
+    // `core/bare.cx`: NO top-of-file `//!` docstring, starts with `///` on its first item:
+    const bare_src =
+        "/// First item doc that must never leak onto `mod bare`.\n" ++
+        "pub struct BareItem {\n" ++
+        "    pub count: u32,\n" ++
+        "}\n";
+
+    const root_src =
+        "//! Core Root Module Header (`core`)\n" ++
+        "/// One-liner summary on `pub mod async;` in `root.cx`.\n" ++
+        "pub mod async;\n" ++
+        "/// One-liner summary on `pub mod bare;` in `root.cx`.\n" ++
+        "pub mod bare;\n";
+
+    const client_src =
+        "use cx.async;\n" ++
+        "pub fn check_poll(state: cx.async.Poll[u32]) -> bool {\n" ++
+        "    return match state {\n" ++
+        "        .Ready(_) => true,\n" ++
+        "        .Pending => false,\n" ++
+        "    };\n" ++
+        "}\n";
+
+    const root_fid = try session.vfs.setEditorOverlay(io, "d:/corex/core/root.cx", root_src, .std_core, true);
+    const async_fid = try session.vfs.setEditorOverlay(io, "d:/corex/core/async.cx", async_src, .std_core, true);
+    const bare_fid = try session.vfs.setEditorOverlay(io, "d:/corex/core/bare.cx", bare_src, .std_core, true);
+    const client_fid = try session.vfs.setEditorOverlay(io, "d:/corex/src/app.cx", client_src, .root, true);
+
+    for ([_]struct { fid: FileId, path: []const u8, src: []const u8, pkg: PackageId }{
+        .{ .fid = root_fid, .path = "d:/corex/core/root.cx", .src = root_src, .pkg = .std_core },
+        .{ .fid = async_fid, .path = "d:/corex/core/async.cx", .src = async_src, .pkg = .std_core },
+        .{ .fid = bare_fid, .path = "d:/corex/core/bare.cx", .src = bare_src, .pkg = .std_core },
+        .{ .fid = client_fid, .path = "d:/corex/src/app.cx", .src = client_src, .pkg = .root },
+    }) |entry| {
+        _ = try session.vfs.getLineIndex(entry.fid);
+        _ = try session.db.setInput(entry.fid, entry.src, .low);
+        try session.db.setFilePackageId(entry.fid, entry.pkg);
+        try session.db.setFilePath(entry.fid, entry.path);
+        try session.open_doc_versions.put(allocator, entry.fid.asInt(), 1);
+        try session.recordMountedFile(entry.fid);
+    }
+    try session.db.bindExternalModule(root_fid, "async", async_fid);
+    try session.db.bindExternalModule(root_fid, "bare", bare_fid);
+    try session.db.registerRootModule("core", root_fid);
+    try session.db.registerRootModule("cx", root_fid);
+    _ = try session.db.resolveSignatures(root_fid);
+
+    const requests = [_][]const u8{
+        // [0] Hover `async` on `pub mod async;` in `core/root.cx` (line 2, col 9):
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"textDocument/hover\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///d:/corex/core/root.cx\"},\"position\":{\"line\":2,\"character\":9}}}",
+        // [1] Hover `bare` on `pub mod bare;` in `core/root.cx` (line 4, col 9) -> file has no `//!`, so zero docs:
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/hover\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///d:/corex/core/root.cx\"},\"position\":{\"line\":4,\"character\":9}}}",
+        // [2] Hover `async` on `use cx.async;` in `src/app.cx` (line 0, col 9):
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/hover\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///d:/corex/src/app.cx\"},\"position\":{\"line\":0,\"character\":9}}}",
+        // [3] Hover `async` in `cx.async.Poll[u32]` in `src/app.cx` (line 1, col 29):
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/hover\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///d:/corex/src/app.cx\"},\"position\":{\"line\":1,\"character\":29}}}",
+        // [4] Hover `Poll` in `core/async.cx` (line 11, col 10) -> only `Poll`'s `///`, zero `//!` or `// ----`:
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/hover\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///d:/corex/core/async.cx\"},\"position\":{\"line\":11,\"character\":10}}}",
+    };
+
+    for (requests) |req_json| {
+        session.turn_arena.resetRetainingCapacity();
+        const turn_alloc = session.turn_arena.asAllocator();
+        const parsed_msg = try parseJsonPayload(turn_alloc, req_json);
+        const msg_id = try extractJsonRpcId(parsed_msg);
+        const method_name = parsed_msg.getStringField("method").?;
+        try dispatchSingleJsonMessage(
+            &session,
+            turn_alloc,
+            parsed_msg,
+            msg_id,
+            method_name,
+            &out_alloc.writer,
+            &exit_opt,
+        );
+    }
+
+    const frames = try extractTestOutboundPayloads(allocator, out_alloc.written());
+    defer allocator.free(frames);
+    try std.testing.expectEqual(@as(usize, 5), frames.len);
+
+    // [0], [2], [3] `mod async` hovers all show `core/async.cx`'s multiline `//!` header, never `Poll`'s `///` or 1-liner:
+    for ([_]usize{ 0, 2, 3 }) |frame_idx| {
+        try std.testing.expect(std.mem.indexOf(u8, frames[frame_idx], "mod async") != null);
+        try std.testing.expect(
+            std.mem.indexOf(u8, frames[frame_idx], "Structured Cooperative Async Concurrency (`core.async`)") != null,
+        );
+        try std.testing.expect(std.mem.indexOf(u8, frames[frame_idx], "Paragraph three line four.") != null);
+        try std.testing.expect(std.mem.indexOf(u8, frames[frame_idx], "One-liner summary") == null);
+        try std.testing.expect(std.mem.indexOf(u8, frames[frame_idx], "Cooperative step outcome") == null);
+    }
+
+    // [1] `mod bare` hover shows `mod bare` with NO docstring (neither `root.cx` 1-liner nor `BareItem`'s `///`):
+    try std.testing.expect(std.mem.indexOf(u8, frames[1], "mod bare") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[1], "---") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[1], "First item doc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[1], "One-liner summary") == null);
+
+    // [4] `Poll` hover shows ONLY `Poll`'s outer `///` docstring, with zero `//!` or `// ----` leakage:
+    try std.testing.expect(std.mem.indexOf(u8, frames[4], "pub enum Poll") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, frames[4], "Cooperative step outcome returned when polling") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, frames[4], "Structured Cooperative Async Concurrency") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[4], "TYPES") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[4], "//!") == null);
 }
