@@ -22032,7 +22032,7 @@ test "test_phase6_sast_defer_linear_set_param_double_free_and_drop_if_live" {
             \\    pub code: i64,
             \\}
             \\pub fn close_guard(guard: own TxGuard) {
-            \\    let TxGuard { code: _ } = guard;
+            \\    let TxGuard { code: _code } = guard;
             \\}
             \\pub fn run_tx(flag: bool) -> i64 {
             \\    let guard = TxGuard { code: 11 };
@@ -22086,7 +22086,7 @@ test "test_phase6_sast_defer_linear_set_param_double_free_and_drop_if_live" {
             \\    pub len: usize,
             \\}
             \\pub fn close_fd(desc: own FileDesc) {
-            \\    let FileDesc { fd: _ } = desc;
+            \\    let FileDesc { fd: _fd } = desc;
             \\}
             \\pub fn take_vec(items: own Vec[i64]) {}
             \\pub fn bad_double_and_move() {
@@ -22095,7 +22095,7 @@ test "test_phase6_sast_defer_linear_set_param_double_free_and_drop_if_live" {
             \\    close_fd(own desc);
             \\    let items = Vec { len: 4 };
             \\    take_vec(own items);
-            \\    let _ = items.len;
+            \\    _ = items.len;
             \\}
         ;
         var dbl_bundle = try lowerAndVerifySourceMirSast(
@@ -22735,16 +22735,16 @@ test "test_phase8_mir_sast_ffi_effects_cstr_e0308_dealloc_e0310_nullable_e0311_s
         \\    if ptr == (0 as *mut u8) {
         \\        return -1;
         \\    }
-        \\    let _ = c_puts("static_literal".as_ptr());
-        \\    let _ = c_puts(cstr.as_ptr());
+        \\    _ = c_puts("static_literal".as_ptr());
+        \\    _ = c_puts(cstr.as_ptr());
         \\    let nul_arr: [u8; 4] = [65, 66, 67, 0];
-        \\    let _ = c_puts(nul_arr.as_ptr());
-        \\    let _ = c_read(buf.as_ptr(), buf.len());
+        \\    _ = c_puts(nul_arr.as_ptr());
+        \\    _ = c_read(buf.as_ptr(), buf.len());
         \\    if req_len <= buf.len() {
-        \\        let _ = c_read(buf.as_ptr(), req_len);
+        \\        _ = c_read(buf.as_ptr(), req_len);
         \\    }
         \\    let fixed_u32: [u32; 4] = [1, 2, 3, 4];
-        \\    let _ = c_write_bytes(fixed_u32.as_ptr(), 16);
+        \\    _ = c_write_bytes(fixed_u32.as_ptr(), 16);
         \\    var filled: i32;
         \\    c_fill_out(&raw mut filled);
         \\    let mask = SmallMask { active: true, rest: 4 };
@@ -22909,11 +22909,11 @@ test "test_mir_sast_nursery_exclusivity_cross_thread_send_ffi_aliasing_and_opaqu
         const dual_async_mut_src =
             \\pub async fn dual_mut_async_blocks() -> i32 {
             \\    var count: i32 = 0;
-            \\    let _ = cx.async.task_group(|grp| {
+            \\    _ = cx.async.task_group(|grp| {
             \\        let handle_1 = grp.spawn(async { count += 1; });
             \\        let handle_2 = grp.spawn(async { count += 2; });
-            \\        let _ = handle_1.join().await;
-            \\        let _ = handle_2.join().await;
+            \\        handle_1.join().await;
+            \\        handle_2.join().await;
             \\        0
             \\    }).await;
             \\    return count;
@@ -22930,10 +22930,10 @@ test "test_mir_sast_nursery_exclusivity_cross_thread_send_ffi_aliasing_and_opaqu
         const cond_join_src =
             \\pub async fn conditional_join_race(is_joining: bool) -> i32 {
             \\    var count: i32 = 0;
-            \\    let _ = cx.async.task_group(|grp| {
+            \\    _ = cx.async.task_group(|grp| {
             \\        let handle = grp.spawn(async { count += 1; });
             \\        if is_joining {
-            \\            let _ = handle.join().await;
+            \\            handle.join().await;
             \\        }
             \\        count += 10;
             \\        0
@@ -22952,11 +22952,11 @@ test "test_mir_sast_nursery_exclusivity_cross_thread_send_ffi_aliasing_and_opaqu
         const unawaited_join_src =
             \\pub async fn unawaited_join_race() -> i32 {
             \\    var count: i32 = 0;
-            \\    let _ = cx.async.task_group(|grp| {
+            \\    _ = cx.async.task_group(|grp| {
             \\        let handle = grp.spawn(async { count += 1; });
             \\        let join_fut = handle.join();
             \\        count += 10;
-            \\        let _ = join_fut.await;
+            \\        join_fut.await;
             \\        0
             \\    }).await;
             \\    return count;
@@ -22973,12 +22973,12 @@ test "test_mir_sast_nursery_exclusivity_cross_thread_send_ffi_aliasing_and_opaqu
         const seq_join_ok_src =
             \\pub async fn sequential_awaited_join_ok() -> i32 {
             \\    var count: i32 = 0;
-            \\    let _ = cx.async.task_group(|grp| {
+            \\    _ = cx.async.task_group(|grp| {
             \\        let handle_1 = grp.spawn(async { count += 1; });
-            \\        let _ = handle_1.join().await;
+            \\        handle_1.join().await;
             \\        count += 10;
             \\        let handle_2 = grp.spawn(async { count += 2; });
-            \\        let _ = handle_2.join().await;
+            \\        handle_2.join().await;
             \\        0
             \\    }).await;
             \\    return count;
@@ -23469,7 +23469,7 @@ test "test_phase8_hardening_nursery_task_handle_raw_provenance_linear_future_spo
             \\    pub raw: *mut i32,
             \\}
             \\async fn take_spoof(val: AtomicSpoof) -> i32 {
-            \\    let _ = val.raw;
+            \\    _ = val.raw;
             \\    return 0;
             \\}
             \\pub async fn spawn_spoofed_atomic(spoof: AtomicSpoof) -> i32 {

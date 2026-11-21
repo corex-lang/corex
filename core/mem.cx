@@ -6,6 +6,7 @@
 //!
 //! Alignment helpers use bitwise complement `~mask` and wrapping arithmetic so power-of-two rounding
 //! is branch-minimal and `@no_panic`-verified (`DR-22` §4.2).
+
 // ---------------------------------------- TYPES ----------------------------------------
 /// Cache-line padded wrapper isolating concurrent state from destructive false sharing (`DR-08`).
 @cache_aligned

@@ -561,7 +561,7 @@ test "test_codegen_llvm_native_release_execution_and_fuzz_sancov_edge_hits" {
         \\    let vec_res = @simd_reduce_add(@simd_add(@simd_splat[[i32; 4]](3), [1, 2, 3, 4]));
         \\    {
         \\        let guard = DropProbe { tag: 99 };
-        \\        let _ = guard.tag;
+        \\        _ = guard.tag;
         \\    }
         \\    let wr_len = @sys_write(1, "LLVM_OK");
         \\    return total + old_atom + atom_cell + vec_res + swap_loop(4) + (wr_len as i32) - 90;

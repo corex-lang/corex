@@ -33,7 +33,7 @@ test "test_diagnostic_severity_and_catalog_code_resolution" {
     try std.testing.expectEqualStrings("note", Severity.info.asLabel());
     try std.testing.expectEqualStrings("help", Severity.help.asLabel());
 
-    try std.testing.expectEqual(@as(usize, 128), diag.DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 138), diag.DIAGNOSTIC_CATALOG.len);
     try std.testing.expectEqual(DiagnosticCode.w0202_non_idiomatic_construct, DiagnosticCode.fromCodeStr("W0202").?);
     try std.testing.expectEqual(DiagnosticCode.w0403_deprecated_symbol, DiagnosticCode.fromCodeStr("W0403").?);
     try std.testing.expectEqual(DiagnosticCode.e0009_c_header_translation_failed, DiagnosticCode.fromCodeStr("E0009").?);
@@ -42,12 +42,21 @@ test "test_diagnostic_severity_and_catalog_code_resolution" {
     try std.testing.expectEqual(DiagnosticCode.e0112_retired_path_separator, DiagnosticCode.fromCodeStr("E0112").?);
     try std.testing.expectEqual(DiagnosticCode.e0113_retired_logical_and, DiagnosticCode.fromCodeStr("E0113").?);
     try std.testing.expectEqual(DiagnosticCode.e0117_non_ascii_byte_literal, DiagnosticCode.fromCodeStr("E0117").?);
+    try std.testing.expectEqual(DiagnosticCode.e0118_block_doc_comment_forbidden, DiagnosticCode.fromCodeStr("E0118").?);
     try std.testing.expectEqual(DiagnosticCode.e0214_invalid_condition_binding, DiagnosticCode.fromCodeStr("E0214").?);
     try std.testing.expectEqual(DiagnosticCode.e0215_invalid_walrus_position, DiagnosticCode.fromCodeStr("E0215").?);
     try std.testing.expectEqual(DiagnosticCode.e0216_retired_if_while_let, DiagnosticCode.fromCodeStr("E0216").?);
     try std.testing.expectEqual(DiagnosticCode.e0218_direct_core_import_forbidden, DiagnosticCode.fromCodeStr("E0218").?);
     try std.testing.expectEqual(DiagnosticCode.e0219_retired_logical_or, DiagnosticCode.fromCodeStr("E0219").?);
     try std.testing.expectEqual(DiagnosticCode.e0228_invalid_param_zone_separator, DiagnosticCode.fromCodeStr("E0228").?);
+    try std.testing.expectEqual(DiagnosticCode.e0229_misplaced_module_doc_comment, DiagnosticCode.fromCodeStr("E0229").?);
+    try std.testing.expectEqual(DiagnosticCode.e0230_unattached_doc_comment, DiagnosticCode.fromCodeStr("E0230").?);
+    try std.testing.expectEqual(DiagnosticCode.e0231_visibility_on_impl_block, DiagnosticCode.fromCodeStr("E0231").?);
+    try std.testing.expectEqual(DiagnosticCode.e0232_inline_method_in_type_decl, DiagnosticCode.fromCodeStr("E0232").?);
+    try std.testing.expectEqual(DiagnosticCode.e0233_invalid_elif_keyword, DiagnosticCode.fromCodeStr("E0233").?);
+    try std.testing.expectEqual(DiagnosticCode.e0234_non_binding_wildcard_let_var, DiagnosticCode.fromCodeStr("E0234").?);
+    try std.testing.expectEqual(DiagnosticCode.e0235_all_wildcard_destructuring_assign, DiagnosticCode.fromCodeStr("E0235").?);
+    try std.testing.expectEqual(DiagnosticCode.e0236_missing_colon_before_type, DiagnosticCode.fromCodeStr("E0236").?);
     try std.testing.expectEqual(DiagnosticCode.e0302_use_after_move, DiagnosticCode.fromCodeStr("E0302").?);
     try std.testing.expectEqual(DiagnosticCode.e0308_unterminated_cstr_ffi, DiagnosticCode.fromCodeStr("E0308").?);
     try std.testing.expectEqual(DiagnosticCode.e0309_concurrent_exclusivity_or_escape, DiagnosticCode.fromCodeStr("E0309").?);
@@ -61,6 +70,7 @@ test "test_diagnostic_severity_and_catalog_code_resolution" {
     try std.testing.expectEqual(DiagnosticCode.e0420_missing_call_site_own, DiagnosticCode.fromCodeStr("E0420").?);
     try std.testing.expectEqual(DiagnosticCode.e0437_invalid_labeled_match_continue, DiagnosticCode.fromCodeStr("E0437").?);
     try std.testing.expectEqual(DiagnosticCode.e0438_await_outside_async_context, DiagnosticCode.fromCodeStr("E0438").?);
+    try std.testing.expectEqual(DiagnosticCode.e0439_pointless_unit_or_used_discard, DiagnosticCode.fromCodeStr("E0439").?);
     try std.testing.expectEqual(DiagnosticCode.e0503_forbidden_comptime_operation, DiagnosticCode.fromCodeStr("E0503").?);
     try std.testing.expectEqual(DiagnosticCode.e0504_comptime_out_of_bounds, DiagnosticCode.fromCodeStr("E0504").?);
     try std.testing.expectEqual(DiagnosticCode.e0505_comptime_uninitialized_read, DiagnosticCode.fromCodeStr("E0505").?);

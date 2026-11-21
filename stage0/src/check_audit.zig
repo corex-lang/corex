@@ -4765,7 +4765,7 @@ test "test_script_frontmatter_check_fix_disk_preservation_and_coalesced_comments
     const mode_c_shebang = "#!/usr/bin/env corex\n";
     const mode_c_disk_init = mode_c_shebang ++
         "pub fn check_c(opt: Option[u8], flag: bool) -> bool {\n" ++
-        "    let _ = opt;\n" ++
+        "    _ = opt;\n" ++
         "    if flag == true {\n" ++
         "        return true;\n" ++
         "    } else {\n" ++
@@ -4784,7 +4784,7 @@ test "test_script_frontmatter_check_fix_disk_preservation_and_coalesced_comments
         "---\n";
     const mode_b_disk_init = mode_b_prefix ++
         "pub fn check_b(opt: Option[i32], flag: bool) -> bool {\n" ++
-        "    let _ = opt;\n" ++
+        "    _ = opt;\n" ++
         "    if flag == true {\n" ++
         "        return true;\n" ++
         "    } else {\n" ++

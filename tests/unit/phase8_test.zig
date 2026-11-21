@@ -939,7 +939,7 @@ test "test_phase8_four_tier_async_await_frame_pinned_task_group_cancel_and_conte
         "}\n\n" ++
         "pub async fn generic_async_size[T](item: T) -> i32 {\n" ++
         "    let echoed = sync_passthrough(item);\n" ++
-        "    let _ = echoed;\n" ++
+        "    _ = echoed;\n" ++
         "    cx.async.yield_now().await;\n" ++
         "    return @size_of[T]() as i32;\n" ++
         "}\n\n" ++

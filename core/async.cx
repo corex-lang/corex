@@ -7,6 +7,7 @@
 //!
 //! Every `async` frame is statically bounded at `16 KiB` (`ASYNC_INLINE_CAP_BYTES`) with zero hidden
 //! per-await heap allocations and deterministic `defer` cancellation cleanup across all 4 execution tiers.
+
 // ---------------------------------------- TYPES ----------------------------------------
 /// Cooperative step outcome returned when polling an asynchronous state machine (`DR-08` §3.1).
 pub enum Poll[T] {

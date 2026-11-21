@@ -221,7 +221,7 @@ fn generateRandomValidCxProgram(allocator: std.mem.Allocator, prng_seed: u64) ![
             "    let banner_str: str = \"\"\"\n" ++
             "        fuzz-ok\n" ++
             "        \"\"\";\n" ++
-            "    let _ = @sys_write(1, \"{{banner_str}}\\n\");\n" ++
+            "    _ = @sys_write(1, \"{{banner_str}}\\n\");\n" ++
             "    return running_acc +% opt_term +% orelse_term +% call_term +% dollar_tail +%\n" ++
             "        search_term +% ctx_term +% res_term +% simd_term;\n" ++
             "}}\n",

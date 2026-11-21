@@ -1,7 +1,7 @@
-//! Zero-Legacy Automated Source Upgrade Rule Catalog (`DR-14`, `DR-21`, & `DR-22`)
+//! Zero-Legacy Automated Source Upgrade Rule Catalog (`DR-14`, `DR-21`, `DR-22`, & `DR-23`)
 //!
 //! Defines the strongly typed rule identifiers, three-tier rewrite engine classifications, and static
-//! metadata catalog (`UPGRADE_RULE_CATALOG`) governing `corex upgrade` (`UR-21-00`–`UR-21-07` and `UR-22-00`–`UR-22-06`).
+//! metadata catalog (`UPGRADE_RULE_CATALOG`) governing `corex upgrade` (`UR-21-00`–`UR-23-06`).
 //!
 //! Enforces CoreX's Zero-Legacy Firewall (`AGENTS.md` §2): retired surface syntax and stdlib APIs are
 //! migrated exclusively through deterministic token, lossless CST, and `TypeId`-aware semantic rewrites
@@ -20,11 +20,11 @@ const FixApplicability = diagnostic.FixApplicability;
 
 /// Three-tier execution stage in the `corex upgrade` rewrite pipeline (`DR-14` §2.2).
 pub const UpgradeEngineTier = enum(u8) {
-    /// Tier 1 raw `TokenBuffer` pre-parse lexical canonicalization shim (`UR-21-00`, `UR-22-00`).
+    /// Tier 1 raw `TokenBuffer` pre-parse lexical canonicalization shim (`UR-21-00`, `UR-22-00`, `UR-23-00`, `UR-23-02`).
     tier1_token_shim = 1,
     /// Tier 2 lossless `LosslessCstArena` + `AstArena` structural pattern rewriter.
     tier2_cst_pattern = 2,
-    /// Tier 3 `CompilerDb` `TypeId`-aware semantic modernizer (`UR-21-04`–`UR-21-07`, `UR-22-06`).
+    /// Tier 3 `CompilerDb` `TypeId`-aware semantic modernizer (`UR-21-04`–`UR-21-07`, `UR-22-06`, `UR-23-04`, `UR-23-05`).
     tier3_semantic_modernizer = 3,
 
     /// Returns the numeric 1-based tier index (`1`–`3`) of `self`.
@@ -53,17 +53,20 @@ pub const UpgradeWave = enum(u8) {
     dr21_phase75 = 21,
     /// Phase 7.6 Canonical Syntax Consolidation & Expressivity Elevation (`DR-22`).
     dr22_phase76 = 22,
+    /// Phase 10.6 Syntactic Orthogonality, Doc-Comment Canonicalization & Zero-Legacy Purity (`DR-23`).
+    dr23_phase106 = 23,
 
-    /// Returns the canonical research specification identifier (`"DR-21"` or `"DR-22"`).
+    /// Returns the canonical research specification identifier (`"DR-21"`, `"DR-22"`, or `"DR-23"`).
     pub inline fn asSpecCode(self: UpgradeWave) []const u8 {
         return switch (self) {
             .dr21_phase75 => "DR-21",
             .dr22_phase76 => "DR-22",
+            .dr23_phase106 => "DR-23",
         };
     }
 };
 
-/// Contiguous 1-byte identifier for every canonical `corex upgrade` rule (`0..14`).
+/// Contiguous 1-byte identifier for every canonical `corex upgrade` rule (`0..21`).
 pub const UpgradeRuleId = enum(u8) {
     /// `UR-21-00`: Rewrites `::` path separators to `.` and root `std` module paths to `cx`.
     ur_21_00_path_coloncolon_and_std_root = 0,
@@ -95,8 +98,22 @@ pub const UpgradeRuleId = enum(u8) {
     ur_22_05_ffi_pointers_and_prose_tests = 13,
     /// `UR-22-06`: Rewrites `!$e` to `not`/`~` by `TypeId`, prefix `*$p` to `$p.*`, and `.len`/`.ptr` to `.len()`/`.as_ptr()`.
     ur_22_06_semantic_unary_deref_and_slice_methods = 14,
+    /// `UR-23-00`: Rewrites `/** … */` and `/*! … */` block doc comments to `///` or `//!` line docs (`E0118`).
+    ur_23_00_block_doc_comments_to_line_docs = 15,
+    /// `UR-23-01`: Hoists inline `mod` `//!` docs to outer `///`, downgrades mid-file `//!`, and attaches `///` (`E0229`, `E0230`).
+    ur_23_01_doc_comment_placement_and_attachment = 16,
+    /// `UR-23-02`: Rewrites `elif`, `elsif`, and `elseif` branch tokens to `"else if"` (`E0233`).
+    ur_23_02_elif_to_else_if = 17,
+    /// `UR-23-03`: Strips `[Vis]` on `impl` blocks and extracts inline nominal type methods into adjacent `impl` blocks (`E0231`, `E0232`).
+    ur_23_03_impl_visibility_and_inline_type_methods = 18,
+    /// `UR-23-04`: Rewrites wildcard `let _ =` / `var _ =` / `(_, _) =` and refines `unit` / `T!E` / `AutoDrop` discards (`E0234`–`E0439`).
+    ur_23_04_canonical_wildcard_discard_stmt = 19,
+    /// `UR-23-05`: Rewrites unambiguous `PascalCase` foreign scalar type names (`U32`, `Bool`, `Void`, …) to lowercase primitives (`E0403`).
+    ur_23_05_foreign_scalar_type_names = 20,
+    /// `UR-23-06`: Inserts missing `:` before type annotations in parameters, fields, closures, and bindings (`E0236`).
+    ur_23_06_missing_colon_before_type = 21,
 
-    /// Returns the dense zero-based catalog index (`0..14`) of `self`.
+    /// Returns the dense zero-based catalog index (`0..21`) of `self`.
     pub inline fn asInt(self: UpgradeRuleId) u8 {
         return @backingInt(self);
     }
@@ -120,11 +137,11 @@ pub const UpgradeRuleId = enum(u8) {
 
 /// Static metadata record describing a single `corex upgrade` transformation rule.
 pub const UpgradeRuleDescriptor = struct {
-    /// Strongly typed contiguous rule enum tag (`0..14`).
+    /// Strongly typed contiguous rule enum tag (`0..21`).
     id: UpgradeRuleId,
-    /// Canonical external rule code (`"UR-21-00"`–`"UR-22-06"`).
+    /// Canonical external rule code (`"UR-21-00"`–`"UR-23-06"`).
     rule_code: []const u8,
-    /// Specification wave (`DR-21` or `DR-22`) that defined this migration rule.
+    /// Specification wave (`DR-21`, `DR-22`, or `DR-23`) that defined this migration rule.
     wave: UpgradeWave,
     /// Execution engine tier (`Tier 1`, `Tier 2`, or `Tier 3`).
     tier: UpgradeEngineTier,
@@ -146,8 +163,8 @@ pub const UpgradeRuleDescriptor = struct {
 
 // ------------------------ Rule Catalog ------------------------
 
-/// Total number of canonical `corex upgrade` rules across `DR-21` (`8`) and `DR-22` (`7`).
-pub const UPGRADE_RULE_COUNT: usize = 15;
+/// Total number of canonical `corex upgrade` rules across `DR-21` (`8`), `DR-22` (`7`), and `DR-23` (`7`).
+pub const UPGRADE_RULE_COUNT: usize = 22;
 
 /// Maximum multi-pass fixed-point synergy iterations executed by `corex upgrade` (`DR-21` §3.3).
 pub const MAX_SYNERGY_PASSES: u8 = 4;
@@ -338,6 +355,92 @@ pub const UPGRADE_RULE_CATALOG: [UPGRADE_RULE_COUNT]UpgradeRuleDescriptor = .{
         .related_diagnostic = .e0227_retired_prefix_deref,
         .summary = "Rewrite '!$e' to 'not $e' or '~$e' by TypeId, prefix '*$p' to '$p.*', and '.len'/'.ptr' to '.len()'/'.as_ptr()'.",
     },
+
+    // `DR-23` §3.1 (`UR-23-00`–`UR-23-06`):
+    .{
+        .id = .ur_23_00_block_doc_comments_to_line_docs,
+        .rule_code = "UR-23-00",
+        .wave = .dr23_phase106,
+        .tier = .tier1_token_shim,
+        .priority = 100,
+        .edit_priority = .syntax_canonicalization,
+        .applicability = .machine_applicable,
+        .is_mandatory_syntax = true,
+        .related_diagnostic = .e0118_block_doc_comment_forbidden,
+        .summary = "Rewrite '/** … */' and '/*! … */' block doc comments to '///' or '//!' line doc comments.",
+    },
+    .{
+        .id = .ur_23_01_doc_comment_placement_and_attachment,
+        .rule_code = "UR-23-01",
+        .wave = .dr23_phase106,
+        .tier = .tier2_cst_pattern,
+        .priority = 98,
+        .edit_priority = .syntax_canonicalization,
+        .applicability = .machine_applicable,
+        .is_mandatory_syntax = true,
+        .related_diagnostic = .e0229_misplaced_module_doc_comment,
+        .summary = "Hoist inline 'mod' '//!' docs to outer '///', downgrade mid-file '//!', and strip blank lines after '///'.",
+    },
+    .{
+        .id = .ur_23_02_elif_to_else_if,
+        .rule_code = "UR-23-02",
+        .wave = .dr23_phase106,
+        .tier = .tier1_token_shim,
+        .priority = 96,
+        .edit_priority = .syntax_canonicalization,
+        .applicability = .machine_applicable,
+        .is_mandatory_syntax = true,
+        .related_diagnostic = .e0233_invalid_elif_keyword,
+        .summary = "Rewrite foreign 'elif', 'elsif', and 'elseif' branch keywords to 'else if'.",
+    },
+    .{
+        .id = .ur_23_03_impl_visibility_and_inline_type_methods,
+        .rule_code = "UR-23-03",
+        .wave = .dr23_phase106,
+        .tier = .tier2_cst_pattern,
+        .priority = 92,
+        .edit_priority = .syntax_canonicalization,
+        .applicability = .machine_applicable,
+        .is_mandatory_syntax = true,
+        .related_diagnostic = .e0231_visibility_on_impl_block,
+        .summary = "Strip visibility modifiers on 'impl' blocks and extract inline methods from type bodies into adjacent 'impl' blocks.",
+    },
+    .{
+        .id = .ur_23_04_canonical_wildcard_discard_stmt,
+        .rule_code = "UR-23-04",
+        .wave = .dr23_phase106,
+        .tier = .tier3_semantic_modernizer,
+        .priority = 90,
+        .edit_priority = .syntax_canonicalization,
+        .applicability = .machine_applicable,
+        .is_mandatory_syntax = true,
+        .related_diagnostic = .e0234_non_binding_wildcard_let_var,
+        .summary = "Rewrite 'let _ = $e;', 'var _ = $e;', and '(_, _) = $e;' to '_ = $e;' and refine 'unit', 'T!E', and 'AutoDrop' discards.",
+    },
+    .{
+        .id = .ur_23_05_foreign_scalar_type_names,
+        .rule_code = "UR-23-05",
+        .wave = .dr23_phase106,
+        .tier = .tier3_semantic_modernizer,
+        .priority = 50,
+        .edit_priority = .type_migration,
+        .applicability = .machine_applicable,
+        .is_mandatory_syntax = true,
+        .related_diagnostic = .e0403_unresolved_symbol,
+        .summary = "Rewrite unambiguous foreign scalar type names ('U32', 'UInt32', 'Bool', 'Void', …) to lowercase CoreX primitives.",
+    },
+    .{
+        .id = .ur_23_06_missing_colon_before_type,
+        .rule_code = "UR-23-06",
+        .wave = .dr23_phase106,
+        .tier = .tier2_cst_pattern,
+        .priority = 85,
+        .edit_priority = .syntax_canonicalization,
+        .applicability = .machine_applicable,
+        .is_mandatory_syntax = true,
+        .related_diagnostic = .e0236_missing_colon_before_type,
+        .summary = "Insert missing ':' between identifiers and type annotations in parameters, fields, closures, and local bindings.",
+    },
 };
 
 /// Static $O(1)$ lookup table mapping canonical `"UR-XX-YY"` strings to `UpgradeRuleId`.
@@ -357,6 +460,13 @@ const RULE_CODE_MAP = std.StaticStringMap(UpgradeRuleId).initComptime(.{
     .{ "UR-22-04", .ur_22_04_attributes_enums_and_bitfields },
     .{ "UR-22-05", .ur_22_05_ffi_pointers_and_prose_tests },
     .{ "UR-22-06", .ur_22_06_semantic_unary_deref_and_slice_methods },
+    .{ "UR-23-00", .ur_23_00_block_doc_comments_to_line_docs },
+    .{ "UR-23-01", .ur_23_01_doc_comment_placement_and_attachment },
+    .{ "UR-23-02", .ur_23_02_elif_to_else_if },
+    .{ "UR-23-03", .ur_23_03_impl_visibility_and_inline_type_methods },
+    .{ "UR-23-04", .ur_23_04_canonical_wildcard_discard_stmt },
+    .{ "UR-23-05", .ur_23_05_foreign_scalar_type_names },
+    .{ "UR-23-06", .ur_23_06_missing_colon_before_type },
 });
 
 // -------------------------------------- INTERNALS --------------------------------------
@@ -365,6 +475,7 @@ const RULE_CODE_MAP = std.StaticStringMap(UpgradeRuleId).initComptime(.{
 
 /// Compile-time drift guard verifying 1:1 index parity between `UpgradeRuleId`, `UPGRADE_RULE_CATALOG`, and `RULE_CODE_MAP`.
 fn verifyCatalogInvariantsComptime() void {
+    @setEvalBranchQuota(8_192);
     std.debug.assert(std.enums.values(UpgradeRuleId).len == UPGRADE_RULE_COUNT);
     std.debug.assert(UPGRADE_RULE_CATALOG.len == UPGRADE_RULE_COUNT);
 
@@ -397,12 +508,13 @@ pub inline fn resolveUpgradeRuleDescriptor(rule_code: []const u8) ?UpgradeRuleDe
 
 // ------------------------- Unit Tests -------------------------
 
-test "test_upgrade_rule_catalog_dr21_and_dr22_parity_and_o1_lookup" {
-    try std.testing.expectEqual(@as(usize, 15), UPGRADE_RULE_CATALOG.len);
+test "test_upgrade_rule_catalog_dr21_dr22_and_dr23_parity_and_o1_lookup" {
+    try std.testing.expectEqual(@as(usize, 22), UPGRADE_RULE_CATALOG.len);
     try std.testing.expectEqual(@as(u8, 4), MAX_SYNERGY_PASSES);
 
     var dr21_count: usize = 0;
     var dr22_count: usize = 0;
+    var dr23_count: usize = 0;
     var tier1_count: usize = 0;
     var tier2_count: usize = 0;
     var tier3_count: usize = 0;
@@ -426,6 +538,10 @@ test "test_upgrade_rule_catalog_dr21_and_dr22_parity_and_o1_lookup" {
                 dr22_count += 1;
                 try std.testing.expectEqualStrings("DR-22", descriptor.wave.asSpecCode());
             },
+            .dr23_phase106 => {
+                dr23_count += 1;
+                try std.testing.expectEqualStrings("DR-23", descriptor.wave.asSpecCode());
+            },
         }
         switch (descriptor.tier) {
             .tier1_token_shim => {
@@ -448,15 +564,16 @@ test "test_upgrade_rule_catalog_dr21_and_dr22_parity_and_o1_lookup" {
 
     try std.testing.expectEqual(@as(usize, 8), dr21_count);
     try std.testing.expectEqual(@as(usize, 7), dr22_count);
-    try std.testing.expectEqual(@as(usize, 2), tier1_count);
-    try std.testing.expectEqual(@as(usize, 8), tier2_count);
-    try std.testing.expectEqual(@as(usize, 5), tier3_count);
+    try std.testing.expectEqual(@as(usize, 7), dr23_count);
+    try std.testing.expectEqual(@as(usize, 4), tier1_count);
+    try std.testing.expectEqual(@as(usize, 11), tier2_count);
+    try std.testing.expectEqual(@as(usize, 7), tier3_count);
 
-    try std.testing.expectEqual(@as(?UpgradeRuleId, null), UpgradeRuleId.fromInt(15));
+    try std.testing.expectEqual(@as(?UpgradeRuleId, null), UpgradeRuleId.fromInt(22));
     try std.testing.expectEqual(@as(?UpgradeRuleId, null), lookupUpgradeRule("UR-99-99"));
     try std.testing.expectEqual(@as(?UpgradeRuleDescriptor, null), resolveUpgradeRuleDescriptor(""));
 
-    // Spot-check key `DR-22` §3.4 diagnostic associations and priorities:
+    // Spot-check key `DR-22` §3.4 and `DR-23` §3.1 diagnostic associations and priorities:
     const ur2200 = lookupUpgradeRule("UR-22-00").?.asDescriptor();
     try std.testing.expectEqual(DiagnosticCode.e0113_retired_logical_and, ur2200.related_diagnostic.?);
     try std.testing.expectEqual(@as(u8, 100), ur2200.priority);
@@ -468,4 +585,20 @@ test "test_upgrade_rule_catalog_dr21_and_dr22_parity_and_o1_lookup" {
     const ur2206 = lookupUpgradeRule("UR-22-06").?.asDescriptor();
     try std.testing.expectEqual(DiagnosticCode.e0227_retired_prefix_deref, ur2206.related_diagnostic.?);
     try std.testing.expectEqual(@as(u8, 50), ur2206.priority);
+
+    const ur2300 = lookupUpgradeRule("UR-23-00").?.asDescriptor();
+    try std.testing.expectEqual(DiagnosticCode.e0118_block_doc_comment_forbidden, ur2300.related_diagnostic.?);
+    try std.testing.expectEqual(@as(u8, 100), ur2300.priority);
+
+    const ur2304 = lookupUpgradeRule("UR-23-04").?.asDescriptor();
+    try std.testing.expectEqual(DiagnosticCode.e0234_non_binding_wildcard_let_var, ur2304.related_diagnostic.?);
+    try std.testing.expectEqual(@as(u8, 90), ur2304.priority);
+
+    const ur2305 = lookupUpgradeRule("UR-23-05").?.asDescriptor();
+    try std.testing.expectEqual(DiagnosticCode.e0403_unresolved_symbol, ur2305.related_diagnostic.?);
+    try std.testing.expectEqual(@as(u8, 50), ur2305.priority);
+
+    const ur2306 = lookupUpgradeRule("UR-23-06").?.asDescriptor();
+    try std.testing.expectEqual(DiagnosticCode.e0236_missing_colon_before_type, ur2306.related_diagnostic.?);
+    try std.testing.expectEqual(@as(u8, 85), ur2306.priority);
 }

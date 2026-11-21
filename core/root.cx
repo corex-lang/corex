@@ -6,6 +6,7 @@
 //!
 //! All modules inside `core` are strictly typed, heap-allocation-free (`@no_alloc` compatible),
 //! and verified across `MirVm`, Tier A (`-ofmt=c`), and Tier B (`LLVM`).
+
 /// Scalar integer bounds and branch-clean min/max/clamp helpers.
 pub mod primitives;
 

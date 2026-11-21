@@ -1,9 +1,10 @@
 //! CoreX Hybrid Steerable Wadler-Lindig Formatter & 8-Byte `DocArena` (`stage0/src/fmt_engine.zig`)
 //!
 //! Implements the deterministic, comment-preserving source formatter (`corex fmt`) and autofix pass
-//! (`corex fmt --fix`) specified in `DR-03` Section 7, `DR-14` Section 1, and `DR-22` Section 3.4.
-//! Lowers the lossless Concrete Syntax Tree (`LosslessCstArena`) and `TokenBuffer` into a flat array
-//! of 8-byte `DocInst` document algebra instructions with $O(1)$ open-group `flat_width` backpatching.
+//! (`corex fmt --fix`) specified in `DR-03` Section 7, `DR-14` Section 1, `DR-22` Section 3.4, and
+//! `DR-23` Section 2.3. Lowers the lossless Concrete Syntax Tree (`LosslessCstArena`) and `TokenBuffer`
+//! into a flat array of 8-byte `DocInst` document algebra instructions with $O(1)$ open-group `flat_width`
+//! backpatching.
 //!
 //! - **8-Byte `DocInst` & $O(1)$ Group Backpatching:** Packs every document algebra instruction into
 //!   an `extern struct` of exactly 8 bytes (`DocOp` + `mode_or_delta` + `flat_width` + `payload`).
@@ -23,8 +24,10 @@ const vfs_sourcemap = @import("vfs_sourcemap.zig");
 const syntax_arenas = @import("syntax_arenas.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
+const diagnostic = @import("diag/diagnostic.zig");
 
 const FileId = mem_foundation.FileId;
+const StringInterner = mem_foundation.StringInterner;
 const LineIndex = vfs_sourcemap.LineIndex;
 const TokenKind = syntax_arenas.TokenKind;
 const TokenIndex = mem_foundation.TokenIndex;
@@ -36,6 +39,11 @@ const CstNodeIndex = mem_foundation.CstNodeIndex;
 const CstNodeRecord = syntax_arenas.CstNodeRecord;
 const LosslessCstArena = syntax_arenas.LosslessCstArena;
 const AstArena = syntax_arenas.AstArena;
+const DiagnosticSink = diagnostic.DiagnosticSink;
+const EditPriority = diagnostic.EditPriority;
+const SuggestedFix = diagnostic.SuggestedFix;
+const TextEdit = diagnostic.TextEdit;
+const TransactionalPatcher = diagnostic.TransactionalPatcher;
 
 // ---------------------------------------- TYPES ----------------------------------------
 
@@ -2408,6 +2416,65 @@ const CstFormatter = struct {
         }
     }
 
+    /// Returns `true` if `trimmed` is a 3-slash `///` outer doc comment (excluding `////`+ banners).
+    inline fn isOuterDocCommentText(trimmed: []const u8) bool {
+        return std.mem.startsWith(u8, trimmed, "///") and !std.mem.startsWith(u8, trimmed, "////");
+    }
+
+    /// Returns `true` if `trimmed` is a `//!` module doc comment.
+    inline fn isModuleDocCommentText(trimmed: []const u8) bool {
+        return std.mem.startsWith(u8, trimmed, "//!");
+    }
+
+    /// Emits a `///` or `//!` line with `ADR-23A` byte-3 space normalization while preserving fenced code blocks.
+    fn emitNormalizedDocComment(
+        self: *CstFormatter,
+        trimmed: []const u8,
+        in_doc_code_fence: *bool,
+    ) !void {
+        const after_prefix = std.mem.trimStart(u8, trimmed[3..], " \t");
+        const is_fence_delim = std.mem.startsWith(u8, after_prefix, "```");
+        if (in_doc_code_fence.* and !is_fence_delim) {
+            try self.doc_arena.emitText(trimmed);
+            return;
+        }
+        if (trimmed.len > 3 and trimmed[3] != ' ' and trimmed[3] != '\t') {
+            try self.doc_arena.emitText(trimmed[0..3]);
+            try self.doc_arena.emitText(" ");
+            try self.doc_arena.emitText(trimmed[3..]);
+        } else {
+            try self.doc_arena.emitText(trimmed);
+        }
+        if (is_fence_delim) {
+            in_doc_code_fence.* = !in_doc_code_fence.*;
+        }
+    }
+
+    /// Returns `true` when any item token or comment follows token `0`'s leading `//!` module header block.
+    fn hasContentFollowingTokenZeroModDoc(self: *const CstFormatter) bool {
+        if (self.token_meta.len == 0) return false;
+        const tok0_rec = self.token_buffer.getToken(TokenIndex.fromInt(0));
+        if (tok0_rec.kind != .eof and tok0_rec.kind != .semi and
+            !(tok0_rec.kind == .invalid_token and tok0_rec.flags.is_synthesized))
+        {
+            return true;
+        }
+        if (self.token_meta[0].has_trailing_comments) return true;
+        var scan_i: usize = 1;
+        while (scan_i < self.token_meta.len) : (scan_i += 1) {
+            if (self.token_meta[scan_i].has_leading_comments or self.token_meta[scan_i].has_trailing_comments) {
+                return true;
+            }
+            const rec = self.token_buffer.getToken(TokenIndex.fromInt(@intCast(scan_i)));
+            if (rec.kind != .eof and rec.kind != .semi and
+                !(rec.kind == .invalid_token and rec.flags.is_synthesized))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Emits all unconsumed leading comments of `tok_id` into `self.doc_arena`.
     fn emitLeadingTrivia(
         self: *CstFormatter,
@@ -2422,9 +2489,14 @@ const CstFormatter = struct {
         if (!meta.has_leading_comments) return;
 
         const all_trivia = self.trivia_slice;
+        const tok_rec = self.token_buffer.getToken(tok_id);
         var newline_count: u32 = if (meta.has_split_newline) 1 else 0;
         var has_emitted_any_comment = false;
         var last_was_line_comment = false;
+        var in_doc_code_fence = false;
+        var active_doc_kind: ?TriviaKind = null;
+        var has_passed_top_mod_doc_region = tok_id.asInt() != 0;
+        var is_in_top_mod_doc_block = false;
 
         var idx: u32 = meta.leading_start;
         while (idx < meta.leading_end) : (idx += 1) {
@@ -2441,8 +2513,40 @@ const CstFormatter = struct {
             const raw_slice = self.source[start..end];
             const trimmed = std.mem.trimEnd(u8, raw_slice, " \t\r\n");
 
+            const is_outer_doc = piece.kind == .doc_comment and isOuterDocCommentText(trimmed);
+            const is_mod_doc = piece.kind == .module_doc_comment and isModuleDocCommentText(trimmed);
+            const eff_doc_kind: ?TriviaKind = if (is_outer_doc)
+                .doc_comment
+            else if (is_mod_doc)
+                .module_doc_comment
+            else
+                null;
+            if (newline_count >= 2 or eff_doc_kind == null or active_doc_kind != eff_doc_kind) {
+                in_doc_code_fence = false;
+                active_doc_kind = eff_doc_kind;
+            }
+
+            var should_force_blank_after_mod_doc = false;
+            if (piece.kind == .shebang and !has_emitted_any_comment) {
+                // Keep `has_passed_top_mod_doc_region` unchanged so `#!` followed by `//!` recognizes the header.
+            } else if (!has_passed_top_mod_doc_region and is_mod_doc) {
+                if (is_in_top_mod_doc_block and newline_count >= 2) {
+                    should_force_blank_after_mod_doc = true;
+                    is_in_top_mod_doc_block = false;
+                    has_passed_top_mod_doc_region = true;
+                } else {
+                    is_in_top_mod_doc_block = true;
+                }
+            } else {
+                if (is_in_top_mod_doc_block) {
+                    should_force_blank_after_mod_doc = true;
+                    is_in_top_mod_doc_block = false;
+                }
+                has_passed_top_mod_doc_region = true;
+            }
+
             if (has_emitted_any_comment) {
-                if (is_blank_line_allowed and newline_count >= 2) {
+                if (should_force_blank_after_mod_doc or (is_blank_line_allowed and newline_count >= 2)) {
                     try self.doc_arena.emitBlankLine();
                 } else if (last_was_line_comment or newline_count >= 1) {
                     try self.doc_arena.emitHardLine();
@@ -2460,24 +2564,58 @@ const CstFormatter = struct {
                 }
             }
 
-            try self.doc_arena.emitText(trimmed);
+            if (eff_doc_kind != null) {
+                try self.emitNormalizedDocComment(trimmed, &in_doc_code_fence);
+            } else {
+                try self.doc_arena.emitText(trimmed);
+            }
             has_emitted_any_comment = true;
             last_was_line_comment = (piece.kind != .block_comment);
             newline_count = 0;
         }
 
         if (has_emitted_any_comment) {
-            if (is_blank_line_allowed and newline_count >= 2) {
+            const should_blank_after_top_mod_doc = is_in_top_mod_doc_block and
+                self.hasContentFollowingTokenZeroModDoc();
+            if (should_blank_after_top_mod_doc or
+                (is_blank_line_allowed and newline_count >= 2 and tok_rec.kind != .eof))
+            {
                 try self.doc_arena.emitBlankLine();
             } else if (last_was_line_comment or newline_count >= 1) {
                 try self.doc_arena.emitHardLine();
             } else {
-                const tok_rec = self.token_buffer.getToken(tok_id);
                 if (tok_rec.kind != .eof and !tok_rec.flags.is_synthesized) {
                     try self.doc_arena.emitText(" ");
                 }
             }
         }
+    }
+
+    /// Emits a single trailing comment piece as a normalized `line_suffix` instruction.
+    fn emitTrailingCommentPiece(self: *CstFormatter, piece: TriviaPiece) !void {
+        if (!isCommentOrShebangTrivia(piece.kind)) return;
+        const start: usize = piece.byte_offset;
+        if (start >= self.source.len) return;
+        const end: usize = @min(self.source.len, start + piece.byte_len);
+        const raw_slice = self.source[start..end];
+        const trimmed = std.mem.trimEnd(u8, raw_slice, " \t\r\n");
+        const is_doc = (piece.kind == .doc_comment and isOuterDocCommentText(trimmed)) or
+            (piece.kind == .module_doc_comment and isModuleDocCommentText(trimmed));
+        if (is_doc) {
+            if (trimmed.len > 3 and trimmed[3] != ' ' and trimmed[3] != '\t') {
+                const norm_buf = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s} {s}",
+                    .{ trimmed[0..3], trimmed[3..] },
+                );
+                defer self.allocator.free(norm_buf);
+                try self.doc_arena.emitLineSuffix(norm_buf);
+            } else {
+                try self.doc_arena.emitLineSuffix(trimmed);
+            }
+            return;
+        }
+        try self.doc_arena.emitLineSuffix(raw_slice);
     }
 
     /// Emits all unconsumed same-line trailing comments of `tok_id` as `line_suffix` instructions.
@@ -2491,21 +2629,12 @@ const CstFormatter = struct {
 
         const all_trivia = self.trivia_slice;
         for (all_trivia[meta.trailing_start..meta.trailing_end]) |piece| {
-            if (!isCommentOrShebangTrivia(piece.kind)) continue;
-            const start: usize = piece.byte_offset;
-            if (start >= self.source.len) continue;
-            const end: usize = @min(self.source.len, start + piece.byte_len);
-            try self.doc_arena.emitLineSuffix(self.source[start..end]);
+            try self.emitTrailingCommentPiece(piece);
         }
 
         var idx: u32 = meta.stolen_trailing_start;
         while (idx < meta.stolen_trailing_end) : (idx += 1) {
-            const piece = all_trivia[idx];
-            if (!isCommentOrShebangTrivia(piece.kind)) continue;
-            const start: usize = piece.byte_offset;
-            if (start >= self.source.len) continue;
-            const end: usize = @min(self.source.len, start + piece.byte_len);
-            try self.doc_arena.emitLineSuffix(self.source[start..end]);
+            try self.emitTrailingCommentPiece(all_trivia[idx]);
         }
     }
 
@@ -3244,7 +3373,10 @@ const CstFormatter = struct {
 
         // Guarantee 100% of comments (including on `.eof`) are flushed:
         const eof_tok_idx: u32 = @intCast(self.token_meta.len);
-        if (self.hasUnconsumedCommentsInTokenRange(0, eof_tok_idx, false, true)) {
+        const has_tok0_leading = eof_tok_idx > 0 and
+            !self.token_meta[0].is_leading_consumed and
+            self.token_meta[0].has_leading_comments;
+        if (has_tok0_leading or self.hasUnconsumedCommentsInTokenRange(0, eof_tok_idx, false, true)) {
             if (self.doc_arena.instructions.items.len > 0) {
                 var last_idx = self.doc_arena.instructions.items.len;
                 var last_op: DocOp = .nop;
@@ -8290,6 +8422,160 @@ fn spliceFrontmatterAndBody(
     return out_buf;
 }
 
+/// Converts the body of a `/** … */` or `/*! … */` block doc comment into `line_prefix` (`"///"` or `"//!"`) lines.
+pub fn renderBlockDocAsLineComments(
+    allocator: std.mem.Allocator,
+    inner_body: []const u8,
+    line_prefix: []const u8,
+    indent_slice: []const u8,
+    needs_leading_newline: bool,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    if (needs_leading_newline) {
+        try out.append(allocator, '\n');
+        try out.appendSlice(allocator, indent_slice);
+    }
+
+    if (std.mem.indexOfAny(u8, inner_body, "\r\n") == null) {
+        const clean_single = std.mem.trim(u8, inner_body, " \t");
+        try out.appendSlice(allocator, line_prefix);
+        if (clean_single.len > 0) {
+            try out.append(allocator, ' ');
+            try out.appendSlice(allocator, clean_single);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    var raw_lines: std.ArrayList([]const u8) = .empty;
+    defer raw_lines.deinit(allocator);
+    var scan_pos: usize = 0;
+    while (scan_pos <= inner_body.len) {
+        const nl_rel = std.mem.indexOfAnyPos(u8, inner_body, scan_pos, "\r\n");
+        const seg_end = nl_rel orelse inner_body.len;
+        try raw_lines.append(allocator, inner_body[scan_pos..seg_end]);
+        if (nl_rel) |found_nl| {
+            scan_pos = if (inner_body[found_nl] == '\r' and
+                found_nl + 1 < inner_body.len and
+                inner_body[found_nl + 1] == '\n')
+                found_nl + 2
+            else
+                found_nl + 1;
+        } else {
+            break;
+        }
+    }
+
+    var start_line: usize = 0;
+    var end_line: usize = raw_lines.items.len;
+    if (start_line < end_line and std.mem.trim(u8, raw_lines.items[start_line], " \t").len == 0) {
+        start_line += 1;
+    }
+    if (end_line > start_line and std.mem.trim(u8, raw_lines.items[end_line - 1], " \t").len == 0) {
+        end_line -= 1;
+    }
+
+    if (start_line >= end_line) {
+        try out.appendSlice(allocator, line_prefix);
+        return out.toOwnedSlice(allocator);
+    }
+
+    var idx = start_line;
+    while (idx < end_line) : (idx += 1) {
+        if (idx > start_line) {
+            try out.append(allocator, '\n');
+            try out.appendSlice(allocator, indent_slice);
+        }
+        const raw_ln = raw_lines.items[idx];
+        const trimmed_left = std.mem.trimStart(u8, raw_ln, " \t");
+        var payload: []const u8 = trimmed_left;
+        if (std.mem.startsWith(u8, trimmed_left, "*")) {
+            const after_star = trimmed_left[1..];
+            if (after_star.len == 0) {
+                payload = "";
+            } else if (after_star[0] == ' ' or after_star[0] == '\t') {
+                payload = after_star[1..];
+            }
+        }
+        const clean_payload = std.mem.trimEnd(u8, payload, " \t");
+        try out.appendSlice(allocator, line_prefix);
+        if (clean_payload.len > 0) {
+            try out.append(allocator, ' ');
+            try out.appendSlice(allocator, clean_payload);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Collects `corex fmt --fix` patches for `E0118`, `E0230`, `E0234`, and `E0235` from `parse_sink` onto `fixes_out`.
+fn collectPreFormatSyntaxFixes(
+    allocator: std.mem.Allocator,
+    parse_sink: *const DiagnosticSink,
+    fixes_out: *std.ArrayList(SuggestedFix),
+) !void {
+    for (parse_sink.diagnostics.items) |diag_item| {
+        const is_fmt_fix_diag = switch (diag_item.code) {
+            .e0118_block_doc_comment_forbidden,
+            .e0230_unattached_doc_comment,
+            .e0234_non_binding_wildcard_let_var,
+            .e0235_all_wildcard_destructuring_assign,
+            => true,
+            else => false,
+        };
+        if (!is_fmt_fix_diag) continue;
+        for (diag_item.suggestions) |sug| {
+            if (sug.applicability != .machine_applicable or sug.edits.len == 0) continue;
+            try fixes_out.append(allocator, sug);
+        }
+    }
+}
+
+/// Applies up to 2 bounded pre-CST `SuggestedFix` passes (`E0118`, `E0230`, `E0234`, `E0235`) when `--fix` is active.
+fn applyPreFormatSyntaxFixes(
+    allocator: std.mem.Allocator,
+    initial_source: []const u8,
+    file_id: FileId,
+) !?[]u8 {
+    var owned_working: ?[]u8 = null;
+    errdefer if (owned_working) |buf| allocator.free(buf);
+
+    var pass: u8 = 0;
+    while (pass < 2) : (pass += 1) {
+        const active_src: []const u8 = owned_working orelse initial_source;
+        var tok_buf = TokenBuffer.init(allocator);
+        defer tok_buf.deinit();
+        var cst_arena = LosslessCstArena.init(allocator);
+        defer cst_arena.deinit();
+        var ast_arena = AstArena.init(allocator);
+        defer ast_arena.deinit();
+        var sink = DiagnosticSink.init(allocator);
+        defer sink.deinit();
+        var interner = try StringInterner.init(allocator);
+        defer interner.deinit();
+        var fixes: std.ArrayList(SuggestedFix) = .empty;
+        defer fixes.deinit(allocator);
+
+        _ = try parser.parseSource(active_src, file_id, &tok_buf, &cst_arena, &ast_arena, &sink, &interner);
+        try collectPreFormatSyntaxFixes(allocator, &sink, &fixes);
+        if (fixes.items.len == 0) break;
+
+        const patch_res = try TransactionalPatcher.apply(
+            allocator,
+            active_src,
+            file_id,
+            fixes.items,
+            &interner,
+        );
+        if (patch_res.applied_count == 0 or std.mem.eql(u8, active_src, patch_res.patched_source)) {
+            allocator.free(patch_res.patched_source);
+            break;
+        }
+        if (owned_working) |prev| allocator.free(prev);
+        owned_working = patch_res.patched_source;
+    }
+    return owned_working;
+}
+
 /// Formats an already-masked `masked_source` with its corresponding `token_buffer` and `cst_arena`, then splices `prefix`.
 fn formatMaskedTokensAndCstWithPrefix(
     allocator: std.mem.Allocator,
@@ -8354,7 +8640,7 @@ pub fn formatTokensAndCst(
     token_buffer: *const TokenBuffer,
     cst_arena: *const LosslessCstArena,
     options: FormatOptions,
-) !FormatResult {
+) anyerror!FormatResult {
     if (extractScriptFrontmatterPrefix(source)) |prefix| {
         const has_unmasked_frontmatter_tokens = token_buffer.countTokens() > 0 and
             token_buffer.getToken(TokenIndex.fromInt(0)).byte_offset < prefix.fence_end;
@@ -8375,6 +8661,40 @@ pub fn formatTokensAndCst(
     }
 
     const is_fix_mode = options.is_fix_mode;
+    if (is_fix_mode) {
+        if (try applyPreFormatSyntaxFixes(allocator, source, FileId.fromInt(0))) |healed_source| {
+            defer allocator.free(healed_source);
+            var healed_toks = TokenBuffer.init(allocator);
+            defer healed_toks.deinit();
+            var healed_cst = LosslessCstArena.init(allocator);
+            defer healed_cst.deinit();
+            var healed_ast = AstArena.init(allocator);
+            defer healed_ast.deinit();
+            _ = try parser.parseSource(healed_source, FileId.fromInt(0), &healed_toks, &healed_cst, &healed_ast, null, null);
+            if (!hasBlockingSyntaxErrors(&healed_toks, &healed_cst, true)) {
+                var doc_arena = DocArena.init(allocator);
+                defer doc_arena.deinit();
+                var cst_formatter = try CstFormatter.init(
+                    allocator,
+                    healed_source,
+                    &healed_toks,
+                    &healed_cst,
+                    &doc_arena,
+                    true,
+                );
+                defer cst_formatter.deinit();
+                try cst_formatter.formatRoot();
+                var renderer = DocRenderer.init(allocator, options.max_line_width);
+                defer renderer.deinit();
+                const formatted = try renderer.render(&doc_arena);
+                return .{
+                    .formatted_text = formatted,
+                    .is_changed = !std.mem.eql(u8, source, formatted),
+                    .has_syntax_errors = false,
+                };
+            }
+        }
+    }
     const has_errors = hasBlockingSyntaxErrors(token_buffer, cst_arena, is_fix_mode);
     if (has_errors) {
         const verbatim_copy = try allocator.dupe(u8, source);
@@ -8418,7 +8738,7 @@ pub fn formatSourceWithOptions(
     source: []const u8,
     file_id: FileId,
     options: FormatOptions,
-) !FormatResult {
+) anyerror!FormatResult {
     var token_buffer = TokenBuffer.init(allocator);
     defer token_buffer.deinit();
     var cst_arena = LosslessCstArena.init(allocator);
@@ -8427,10 +8747,17 @@ pub fn formatSourceWithOptions(
     defer ast_arena.deinit();
 
     if (extractScriptFrontmatterPrefix(source)) |prefix| {
-        const masked_source = try allocateMaskedFrontmatterSource(allocator, source, prefix.fence_end);
-        defer allocator.free(masked_source);
+        const raw_masked = try allocateMaskedFrontmatterSource(allocator, source, prefix.fence_end);
+        defer allocator.free(raw_masked);
+        const healed_masked = if (options.is_fix_mode)
+            try applyPreFormatSyntaxFixes(allocator, raw_masked, file_id)
+        else
+            null;
+        defer if (healed_masked) |buf| allocator.free(buf);
+        const active_masked: []const u8 = healed_masked orelse raw_masked;
+
         _ = try parser.parseSource(
-            masked_source,
+            active_masked,
             file_id,
             &token_buffer,
             &cst_arena,
@@ -8441,12 +8768,36 @@ pub fn formatSourceWithOptions(
         return formatMaskedTokensAndCstWithPrefix(
             allocator,
             source,
-            masked_source,
+            active_masked,
             prefix,
             &token_buffer,
             &cst_arena,
             options,
         );
+    }
+
+    if (options.is_fix_mode) {
+        if (try applyPreFormatSyntaxFixes(allocator, source, file_id)) |healed_src| {
+            defer allocator.free(healed_src);
+            _ = try parser.parseSource(
+                healed_src,
+                file_id,
+                &token_buffer,
+                &cst_arena,
+                &ast_arena,
+                null,
+                null,
+            );
+            var res = try formatTokensAndCst(
+                allocator,
+                healed_src,
+                &token_buffer,
+                &cst_arena,
+                .{ .max_line_width = options.max_line_width, .is_fix_mode = true },
+            );
+            res.is_changed = !std.mem.eql(u8, source, res.formatted_text);
+            return res;
+        }
     }
 
     _ = try parser.parseSource(
@@ -9242,7 +9593,7 @@ test "test_stage4_attributed_block_match_no_spurious_semi_and_raw_quote_runs" {
         "        \"\"\";\n" ++
         "    @cfg(debug)\n" ++
         "    comptime {\n" ++
-        "        let _ = 1;\n" ++
+        "        _ = 1;\n" ++
         "    }\n" ++
         "    @cfg(debug)\n" ++
         "    fsm: match state {\n" ++
@@ -9255,8 +9606,8 @@ test "test_stage4_attributed_block_match_no_spurious_semi_and_raw_quote_runs" {
     defer pass1.deinit(std.testing.allocator);
     try std.testing.expect(!pass1.has_syntax_errors);
     try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "let quoted = r#\"\"\"\"#;\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "    comptime {\n        let _ = 1;\n    }\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "    comptime {\n        let _ = 1;\n    };") == null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "    comptime {\n        _ = 1;\n    }\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "    comptime {\n        _ = 1;\n    };") == null);
     try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "        _ => state,\n    }\n}\n") != null);
 
     var pass2 = try formatSource(std.testing.allocator, pass1.formatted_text, FileId.fromInt(0));
@@ -9330,7 +9681,7 @@ test "test_format_kw_async_module_paths_canonical_unchanged" {
         "pub async fn spawn_all(grp: &mut cx.async.TaskGroup[IoError], sub: &async.TaskGroup[IoError]) {\n" ++
         "    async.yield_now().await;\n" ++
         "    cx.async.task_group(|group| {\n" ++
-        "        let _ = group;\n" ++
+        "        _ = group;\n" ++
         "    });\n" ++
         "}\n";
 
@@ -9536,4 +9887,92 @@ test "test_format_byte_range_nested_statement_trailing_comment_and_idempotency" 
     try std.testing.expect(
         (try formatByteRange(std.testing.allocator, suppressed_src, &sup_toks, &sup_cst, &sup_lines, 42, 60, .{})) == null,
     );
+}
+
+test "test_dr23_doc_comment_normalization_mod_header_blank_line_and_fmt_fix" {
+    // [1] `ADR-23A` doc-comment normalization, fenced code preservation, and 1-blank-line `//!` rule:
+    const raw_doc_src =
+        "//!Module Header\n" ++
+        "//!   \n" ++
+        "//!     indented detail\n" ++
+        "// ---------------------------------------- TYPES ----------------------------------------\n" ++
+        "///Summary without leading space.\n" ++
+        "///   \n" ++
+        "///     indented list item\n" ++
+        "///```cx\n" ++
+        "///keep_verbatim_in_fence();\n" ++
+        "///```\n" ++
+        "pub struct RingBuf {\n" ++
+        "    ///Field doc\n" ++
+        "    pub cap: usize,\n" ++
+        "}\n";
+
+    var pass1 = try formatSource(std.testing.allocator, raw_doc_src, FileId.fromInt(0));
+    defer pass1.deinit(std.testing.allocator);
+    try std.testing.expect(!pass1.has_syntax_errors);
+    try std.testing.expect(pass1.is_changed);
+
+    const expected_doc =
+        "//! Module Header\n" ++
+        "//!\n" ++
+        "//!     indented detail\n\n" ++
+        "// ---------------------------------------- TYPES ----------------------------------------\n" ++
+        "/// Summary without leading space.\n" ++
+        "///\n" ++
+        "///     indented list item\n" ++
+        "/// ```cx\n" ++
+        "///keep_verbatim_in_fence();\n" ++
+        "/// ```\n" ++
+        "pub struct RingBuf {\n" ++
+        "    /// Field doc\n" ++
+        "    pub cap: usize,\n" ++
+        "}\n";
+    try std.testing.expectEqualStrings(expected_doc, pass1.formatted_text);
+
+    var pass2 = try formatSource(std.testing.allocator, pass1.formatted_text, FileId.fromInt(0));
+    defer pass2.deinit(std.testing.allocator);
+    try std.testing.expect(!pass2.is_changed);
+    try std.testing.expectEqualStrings(expected_doc, pass2.formatted_text);
+
+    // [2] `//!` immediately followed by `.eof` emits zero trailing blank lines:
+    const eof_mod_src = "//!Solo Header   \n";
+    var eof_res = try formatSource(std.testing.allocator, eof_mod_src, FileId.fromInt(1));
+    defer eof_res.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("//! Solo Header\n", eof_res.formatted_text);
+    var eof_idem = try formatSource(std.testing.allocator, eof_res.formatted_text, FileId.fromInt(1));
+    defer eof_idem.deinit(std.testing.allocator);
+    try std.testing.expect(!eof_idem.is_changed);
+
+    // [3] `corex fmt --fix` heals `E0118`, `E0230`, `E0234`, and `E0235`:
+    const fix_src =
+        "/*!\n" ++
+        " * Module Doc From Block\n" ++
+        " */\n" ++
+        "/**\n" ++
+        " * Computes tuple sum.\n" ++
+        " */\n\n" ++
+        "pub fn check_discards(pair: (u32, u32)) {\n" ++
+        "    let _ = 1_u32;\n" ++
+        "    var _ = 2_u32;\n" ++
+        "    let (_, _) = pair;\n" ++
+        "    (_, _) = pair;\n" ++
+        "}\n";
+    var fix_res = try formatSourceWithOptions(
+        std.testing.allocator,
+        fix_src,
+        FileId.fromInt(2),
+        .{ .is_fix_mode = true },
+    );
+    defer fix_res.deinit(std.testing.allocator);
+    try std.testing.expect(!fix_res.has_syntax_errors);
+    const expected_fixed =
+        "//! Module Doc From Block\n\n" ++
+        "/// Computes tuple sum.\n" ++
+        "pub fn check_discards(pair: (u32, u32)) {\n" ++
+        "    _ = 1_u32;\n" ++
+        "    _ = 2_u32;\n" ++
+        "    _ = pair;\n" ++
+        "    _ = pair;\n" ++
+        "}\n";
+    try std.testing.expectEqualStrings(expected_fixed, fix_res.formatted_text);
 }

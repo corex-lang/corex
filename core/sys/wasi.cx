@@ -5,6 +5,7 @@
 //!
 //! Safe `write_stdout`, `write_stderr`, and `exit_process` wrappers lower through `@sys_write` and
 //! `@sys_exit`, which emit `fd_write` / `proc_exit` directly on `wasm32-wasi` targets.
+
 // ---------------------------------------- TYPES ----------------------------------------
 /// WASI scatter/gather read buffer descriptor (`__wasi_ciovec_t`, `@repr(C)`).
 @repr(C)

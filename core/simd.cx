@@ -7,6 +7,7 @@
 //! All arithmetic operations (`splat`, `add`, `sub`, `mul`, `reduce_add`) delegate directly to
 //! `@simd_*` intrinsics with guaranteed bit-exact cross-tier parity (in-order horizontal reductions
 //! for floating-point vectors per `Fix-16`).
+
 // ---------------------------------------- TYPES ----------------------------------------
 /// 128-bit 4-lane single-precision floating-point SIMD vector (`4 x f32`).
 @repr(C)

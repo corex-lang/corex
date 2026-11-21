@@ -8554,6 +8554,24 @@ pub const TypeChecker = struct {
     suppress_ident_deprecated_node: NodeIndex = .none,
     /// Deduplication set `(file_id, start_byte, end_byte, sym_idx)` for emitted `W0403` warnings.
     emitted_deprecated_refs: std.AutoHashMapUnmanaged(DeprecatedDiagKey, void) = .empty,
+    /// Set of local/parameter `SymbolIndex.asInt()` values read outside bare `_ = ident;` discards (`ADR-23E`, `E0439`).
+    non_discard_read_syms: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Pending bare `_ = ident;` / `_ = self;` discard sites accumulated for the active body (`ADR-23E`, `E0439`).
+    pending_ident_discards: std.ArrayListUnmanaged(PendingIdentDiscard) = .empty,
+    /// Nesting depth of active function/test/bench/`subscript` bodies for `E0439` discard verification.
+    fn_discard_scope_depth: u32 = 0,
+    /// Active bare `_ = ident;` RHS `NodeIndex` excluded from `non_discard_read_syms` (`NodeIndex.none` otherwise).
+    active_bare_discard_rhs: NodeIndex = .none,
+    /// Active simple-assignment (`x = expr;`) LHS `NodeIndex` excluded from `non_discard_read_syms` (`NodeIndex.none` otherwise).
+    active_simple_assign_lhs: NodeIndex = .none,
+
+    /// Deferred `_ = ident;` / `_ = self;` discard site validated against `non_discard_read_syms` at body exit (`E0439`).
+    const PendingIdentDiscard = struct {
+        /// Canonical resolved `.local_let_sym`, `.local_var_sym`, or `.param_sym` handle.
+        sym_idx: SymbolIndex,
+        /// Full statement byte span (`_ = ident;`) removed when `E0439` triggers.
+        stmt_span: Span,
+    };
 
     /// Deduplication key for `W0403` deprecated-symbol references.
     const DeprecatedDiagKey = struct {
@@ -8663,6 +8681,8 @@ pub const TypeChecker = struct {
         self.fix_inline_nodes.deinit(self.allocator);
         if (self.allowed_spans.len > 0) self.allocator.free(self.allowed_spans);
         self.emitted_deprecated_refs.deinit(self.allocator);
+        self.non_discard_read_syms.deinit(self.allocator);
+        self.pending_ident_discards.deinit(self.allocator);
         for (self.attr_instances.items) |attr_inst| {
             if (attr_inst.fields.len > 0) self.allocator.free(attr_inst.fields);
         }
@@ -8715,10 +8735,71 @@ pub const TypeChecker = struct {
         return .err_ty;
     }
 
-    /// Records `sym_idx` for `node_id` in `self.node_symbols`.
+    /// Records `sym_idx` for `node_id` in `self.node_symbols` and tracks non-discard local/parameter reads (`E0439`).
     inline fn recordNodeSymbol(self: *TypeChecker, node_id: NodeIndex, sym_idx: SymbolIndex) void {
         if (!node_id.isNone() and node_id.asInt() < self.node_symbols.len) {
             self.node_symbols[node_id.asInt()] = sym_idx;
+            if (node_id != self.active_bare_discard_rhs and
+                node_id != self.active_simple_assign_lhs and
+                node_id.asInt() < self.ast_arena.countNodes())
+            {
+                const tag = self.ast_arena.getNode(node_id).tag;
+                if (tag == .ident_expr or tag == .self_val or tag == .call_expr or
+                    tag == .generic_call or tag == .index_expr)
+                {
+                    const resolved_idx = self.unwrapAliasSymbolIdx(sym_idx);
+                    if (!resolved_idx.isNone() and resolved_idx.asInt() < self.sym_table.symbols.items.len) {
+                        const kind = self.sym_table.getSymbol(resolved_idx).kind;
+                        if (kind == .local_let_sym or kind == .local_var_sym or kind == .param_sym) {
+                            self.non_discard_read_syms.put(self.allocator, resolved_idx.asInt(), {}) catch {};
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Validates all pending bare `_ = ident;` discards accumulated from `start_idx` (`ADR-23E`, `E0439`).
+    fn flushPendingIdentDiscards(self: *TypeChecker, start_idx: usize) !void {
+        defer self.pending_ident_discards.shrinkRetainingCapacity(start_idx);
+        if (start_idx >= self.pending_ident_discards.items.len) return;
+
+        var seen_discards: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer seen_discards.deinit(self.allocator);
+
+        for (self.pending_ident_discards.items[start_idx..]) |entry| {
+            const sym_key = entry.sym_idx.asInt();
+            const is_read_elsewhere = self.non_discard_read_syms.contains(sym_key);
+            const gop = try seen_discards.getOrPut(self.allocator, sym_key);
+            const is_duplicate_discard = gop.found_existing;
+            if (!is_read_elsewhere and !is_duplicate_discard) continue;
+
+            const sym_name = self.sym_table.getSymbol(entry.sym_idx).name_text;
+            var msg_buf: [224]u8 = undefined;
+            const msg = if (is_read_elsewhere)
+                std.fmt.bufPrint(
+                    &msg_buf,
+                    "pointless `_ = {s};` discard of binding `{s}` that is already read in this body (`ADR-23E`)",
+                    .{ sym_name, sym_name },
+                ) catch "pointless `_ =` discard of already-used binding (`ADR-23E`)"
+            else
+                std.fmt.bufPrint(
+                    &msg_buf,
+                    "duplicate `_ = {s};` discard of `{s}` (`ADR-23E`); a single `_ = {s};` suffices",
+                    .{ sym_name, sym_name, sym_name },
+                ) catch "duplicate `_ =` discard of the same binding (`ADR-23E`)";
+            try self.emitDiagnosticWithSingleFix(
+                .e0439_pointless_unit_or_used_discard,
+                entry.stmt_span,
+                msg,
+                if (is_read_elsewhere)
+                    "binding is already used elsewhere in this body; remove redundant `_ =` statement"
+                else
+                    "binding was already discarded earlier in this body; remove duplicate `_ =` statement",
+                "remove redundant `_ =` discard statement",
+                entry.stmt_span,
+                "",
+            );
         }
     }
 
@@ -18063,12 +18144,19 @@ pub const TypeChecker = struct {
                 self.sym_table.scope_arena.getScope(mod_scope).depth;
         }
         self.pure_comptime_depth = prev_pure_depth + 1;
+        if (self.fn_discard_scope_depth == 0) {
+            self.non_discard_read_syms.clearRetainingCapacity();
+        }
+        const discard_start_idx = self.pending_ident_discards.items.len;
+        self.fn_discard_scope_depth += 1;
+        defer self.fn_discard_scope_depth -= 1;
         defer {
             self.current_scope = saved_scope;
             self.pure_comptime_depth = prev_pure_depth;
             self.comptime_boundary_scope_depth = prev_boundary;
         }
         _ = try self.checkBlock(block_id, .unit_ty, false);
+        try self.flushPendingIdentDiscards(discard_start_idx);
     }
 
     /// Type-checks the body of a single `DefId` in isolation (used by `CompilerDb.typecheckBody`).
@@ -18206,6 +18294,12 @@ pub const TypeChecker = struct {
                 self.sym_table.scope_arena.getScope(sym.scope_id).depth;
         }
         self.pure_comptime_depth = prev_pure_depth + 1;
+        if (self.fn_discard_scope_depth == 0) {
+            self.non_discard_read_syms.clearRetainingCapacity();
+        }
+        const discard_start_idx = self.pending_ident_discards.items.len;
+        self.fn_discard_scope_depth += 1;
+        defer self.fn_discard_scope_depth -= 1;
         defer {
             self.current_scope = saved_scope;
             self.pure_comptime_depth = prev_pure_depth;
@@ -18222,6 +18316,7 @@ pub const TypeChecker = struct {
             const inferred_ty = try self.synthExpr(init_node_id);
             self.sym_table.getSymbolMut(const_sym_idx).type_id = self.materializeUntypedType(inferred_ty);
         }
+        try self.flushPendingIdentDiscards(discard_start_idx);
         self.bindCImportModuleToSymbolIfPresent(const_sym_idx, init_node_id);
 
         const resolved_const_ty = self.sym_table.getSymbol(const_sym_idx).type_id;
@@ -18445,6 +18540,13 @@ pub const TypeChecker = struct {
         if (!fn_sym.target_scope.isNone() and self.active_allow_mask.hasAny()) {
             self.sym_table.scope_arena.addAllowMask(fn_sym.target_scope, self.active_allow_mask);
         }
+        if (self.fn_discard_scope_depth == 0) {
+            self.non_discard_read_syms.clearRetainingCapacity();
+        }
+        const discard_start_idx = self.pending_ident_discards.items.len;
+        self.fn_discard_scope_depth += 1;
+        defer self.fn_discard_scope_depth -= 1;
+
         defer {
             self.current_scope = saved_scope;
             self.current_fn_ret_ty = saved_ret_ty;
@@ -18600,6 +18702,7 @@ pub const TypeChecker = struct {
                 );
             }
             self.current_scope = base_fn_scope;
+            try self.flushPendingIdentDiscards(discard_start_idx);
             if (!fn_sym.target_scope.isNone()) {
                 try symbol_resolver.checkUnusedBindingsInScope(
                     self.sym_table,
@@ -18616,6 +18719,7 @@ pub const TypeChecker = struct {
         if (body_block_id.isNone() or body_block_id.asInt() >= self.ast_arena.countNodes()) return;
 
         _ = try self.checkBlock(body_block_id, sig_view.ret_ty, true);
+        try self.flushPendingIdentDiscards(discard_start_idx);
 
         if (!fn_sym.target_scope.isNone()) {
             try symbol_resolver.checkUnusedBindingsInScope(
@@ -18740,7 +18844,11 @@ pub const TypeChecker = struct {
                     result_ty = .never_ty;
                 } else if (!tail_ty.isError() and tail_ty != .unit_ty) {
                     if (self.isMustUseTypeOrCall(tail_id, tail_ty)) {
-                        try self.emitUnhandledMustUseError(self.getAstNodeSpan(tail_id), tail_ty);
+                        try self.emitUnhandledMustUseError(
+                            self.getAstSubtreeSpan(tail_id),
+                            tail_ty,
+                            true,
+                        );
                     } else if (is_fn_body) {
                         try self.emitTypeMismatch(
                             self.getAstNodeSpan(tail_id),
@@ -18845,7 +18953,11 @@ pub const TypeChecker = struct {
                 // Enforce `@must_use` / `Result[T, E]` handling on discarded expression statements (`E0413`, `DR-07` Section 2.4):
                 if (!expr_ty.isError() and expr_ty != .unit_ty and expr_ty != .never_ty) {
                     if (self.isMustUseTypeOrCall(stmt_id, expr_ty)) {
-                        try self.emitUnhandledMustUseError(self.getAstNodeSpan(stmt_id), expr_ty);
+                        try self.emitUnhandledMustUseError(
+                            self.getAstSubtreeSpan(stmt_id),
+                            expr_ty,
+                            false,
+                        );
                     }
                 }
                 break :blk self.recordNodeType(stmt_id, expr_ty);
@@ -19213,7 +19325,8 @@ pub const TypeChecker = struct {
         return self.recordNodeType(stmt_id, .unit_ty);
     }
 
-    /// Type-checks `let`/`var` local declarations, including `: Type = Expr`, `let … else { … }` (`E0412`), and `let _ = result` (`E0414`).
+    /// Type-checks `let`/`var` local declarations, including `: Type = Expr`, `let … else { … }` (`E0412`),
+    /// and wildcard `Result` slots (`E0414`).
     fn checkLocalVarDecl(self: *TypeChecker, decl_id: NodeIndex) anyerror!TypeId {
         const decl_node = self.ast_arena.getNode(decl_id);
         const decl_cst = self.ast_arena.getCstOrigin(decl_id);
@@ -19278,11 +19391,20 @@ pub const TypeChecker = struct {
             if (colon_cst_pos) |c_pos| {
                 const search_end = eq_cst_pos orelse end_idx;
                 explicit_ty_ast = self.findFirstAstInCstRange(c_pos + 1, search_end);
+            } else {
+                const search_end = eq_cst_pos orelse end_idx;
+                const cand_ty = self.findFirstAstInCstRange(pat_end_pos, search_end);
+                if (!cand_ty.isNone() and isTypeAstTag(self.ast_arena.getNode(cand_ty).tag)) {
+                    explicit_ty_ast = cand_ty;
+                }
             }
             if (eq_cst_pos != null and decl_node.rhs.tag == .node) {
                 init_expr_ast = NodeIndex.fromInt(decl_node.rhs.payload);
-            } else if (colon_cst_pos != null and eq_cst_pos == null and decl_node.rhs.tag == .node) {
-                explicit_ty_ast = NodeIndex.fromInt(decl_node.rhs.payload);
+            } else if (eq_cst_pos == null and decl_node.rhs.tag == .node) {
+                const rhs_cand = NodeIndex.fromInt(decl_node.rhs.payload);
+                if (colon_cst_pos != null or isTypeAstTag(self.ast_arena.getNode(rhs_cand).tag)) {
+                    explicit_ty_ast = rhs_cand;
+                }
             }
         } else if (decl_node.rhs.tag == .node) {
             const rhs_id = NodeIndex.fromInt(decl_node.rhs.payload);
@@ -19308,22 +19430,14 @@ pub const TypeChecker = struct {
             }
         }
 
-        // [1] Reject bare `let _ = fallible_expr;` without `catch` (`E0414`, `DR-07` Section 2.4):
+        // [1] Reject bare wildcard discard of `T!E` error union without `catch` or `.ok()` (`E0414`, `ADR-23E`):
         if (!pat_id.isNone() and !init_expr_ast.isNone() and !val_ty.isError()) {
-            const init_ast = self.ast_arena.getNode(init_expr_ast);
-            const is_catch_handled = init_ast.tag == .binary_expr and
-                !init_ast.main_token.isNone() and
-                self.token_buffer.getToken(init_ast.main_token).kind == .kw_catch;
-            if (self.hasWildcardDiscardOfResult(pat_id, val_ty) or
-                (self.ast_arena.getNode(pat_id).tag == .wildcard_pat and
-                    !is_catch_handled and
-                    self.isMustUseTypeOrCall(init_expr_ast, val_ty)))
-            {
+            if (self.hasWildcardDiscardOfResult(pat_id, val_ty)) {
                 try self.emitDiagnosticSimple(
                     .e0414_bare_wildcard_result_discard,
                     self.getAstNodeSpan(decl_id),
-                    "discarding `@must_use` or `Result[T, E]` with `let _ = …` is forbidden",
-                    "handle the error explicitly with `let _ = expr catch {};` or propagate with `?`",
+                    "discarding fallible `T!E` result with `_` is forbidden (`ADR-23E`)",
+                    "handle the error explicitly via `catch`, `?`, or `.ok()`",
                 );
             }
         }
@@ -19512,7 +19626,11 @@ pub const TypeChecker = struct {
                 const expr_ty = try self.synthExpr(body_id);
                 if (!expr_ty.isError() and expr_ty != .unit_ty and expr_ty != .never_ty) {
                     if (self.isMustUseTypeOrCall(body_id, expr_ty)) {
-                        try self.emitUnhandledMustUseError(self.getAstNodeSpan(body_id), expr_ty);
+                        try self.emitUnhandledMustUseError(
+                            self.getAstSubtreeSpan(body_id),
+                            expr_ty,
+                            false,
+                        );
                     }
                 }
             }
@@ -20349,14 +20467,14 @@ pub const TypeChecker = struct {
         }
     }
 
-    /// Validates a `_` discard target against `@linear` (`E0304`) and `@must_use` / `Result` (`E0414`).
+    /// Validates a `_` discard target against `@linear` (`E0304`), `T!E` (`E0414`), and `unit` (`E0439`), returning `true` on error.
     fn validateWildcardAssignDiscard(
         self: *TypeChecker,
         discard_span: Span,
         rhs_expr_opt: NodeIndex,
         discarded_ty: TypeId,
-    ) !void {
-        if (discarded_ty.isError()) return;
+    ) !bool {
+        if (discarded_ty.isError()) return true;
         const mat_ty = self.materializeUntypedType(discarded_ty);
         if (hasLinearObligation(self.pool, self.sym_table, mat_ty)) {
             try self.emitDiagnosticSimple(
@@ -20365,23 +20483,73 @@ pub const TypeChecker = struct {
                 "cannot discard `@linear` obligation with `_`",
                 "consume the `@linear` value via its consuming method instead of discarding it",
             );
-            return;
+            return true;
         }
-        const is_catch_handled = !rhs_expr_opt.isNone() and blk: {
-            const rhs_node = self.ast_arena.getNode(rhs_expr_opt);
-            break :blk rhs_node.tag == .binary_expr and !rhs_node.main_token.isNone() and
-                self.token_buffer.getToken(rhs_node.main_token).kind == .kw_catch;
-        };
-        if (self.pool.getTag(self.pool.unwrapUnderlyingType(mat_ty)) == .result_ty or
-            (!rhs_expr_opt.isNone() and !is_catch_handled and self.isMustUseTypeOrCall(rhs_expr_opt, mat_ty)))
-        {
+        const unwrapped = self.pool.unwrapUnderlyingType(mat_ty);
+        if (self.pool.getTag(unwrapped) == .result_ty) {
+            const ok_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(self.pool.getNode(unwrapped).lhs));
+            if (!rhs_expr_opt.isNone() and self.diagnostic_sink != null) {
+                const sink = self.diagnostic_sink.?;
+                const rhs_span = self.getAstSubtreeSpan(rhs_expr_opt);
+                if (rhs_span.start_byte <= rhs_span.end_byte and @as(usize, rhs_span.end_byte) <= self.source.len) {
+                    const expr_src = self.source[rhs_span.start_byte..rhs_span.end_byte];
+                    const has_semi = discard_span.end_byte > discard_span.start_byte and
+                        @as(usize, discard_span.end_byte) <= self.source.len and
+                        self.source[discard_span.end_byte - 1] == ';';
+                    const suffix: []const u8 = if (has_semi) ";" else "";
+                    const rep_text = if (ok_ty == .unit_ty)
+                        try std.fmt.allocPrint(sink.arena.asAllocator(), "{s} catch {{}}{s}", .{ expr_src, suffix })
+                    else
+                        try std.fmt.allocPrint(sink.arena.asAllocator(), "_ = ({s}).ok(){s}", .{ expr_src, suffix });
+                    try self.emitDiagnosticWithSingleFix(
+                        .e0414_bare_wildcard_result_discard,
+                        discard_span,
+                        "discarding fallible `T!E` result with bare `_ = …` is forbidden (`ADR-23E`)",
+                        if (ok_ty == .unit_ty)
+                            "handle the error explicitly with `expr catch {};` or propagate with `?`"
+                        else
+                            "convert to optional with `_ = (expr).ok();`, handle with `catch`, or propagate with `?`",
+                        if (ok_ty == .unit_ty)
+                            "handle error explicitly with `catch {}`"
+                        else
+                            "acknowledge fallible discard with `.ok()`",
+                        discard_span,
+                        rep_text,
+                    );
+                    return true;
+                }
+            }
             try self.emitDiagnosticSimple(
                 .e0414_bare_wildcard_result_discard,
                 discard_span,
-                "discarding `@must_use` or `Result[T, E]` with `_ = …` is forbidden",
-                "handle the error explicitly with `catch` or propagate with `?`",
+                "discarding fallible `T!E` result with `_` is forbidden (`ADR-23E`)",
+                "handle the error explicitly with `catch`, propagate with `?`, or call `.ok()`",
             );
+            return true;
         }
+        if (!rhs_expr_opt.isNone() and unwrapped == .unit_ty) {
+            const rhs_span = self.getAstSubtreeSpan(rhs_expr_opt);
+            if (discard_span.start_byte < rhs_span.start_byte) {
+                try self.emitDiagnosticWithSingleFix(
+                    .e0439_pointless_unit_or_used_discard,
+                    discard_span,
+                    "pointless `_ =` discard of `unit` expression (`ADR-23E`); execute the statement directly",
+                    "expression already returns `unit`; `_ =` is redundant",
+                    "remove redundant `_ = ` prefix",
+                    Span.init(self.file_id, discard_span.start_byte, rhs_span.start_byte),
+                    "",
+                );
+            } else {
+                try self.emitDiagnosticSimple(
+                    .e0439_pointless_unit_or_used_discard,
+                    discard_span,
+                    "pointless `_ =` discard of `unit` expression (`ADR-23E`); execute the statement directly",
+                    "expression already returns `unit`; `_ =` is redundant",
+                );
+            }
+            return true;
+        }
+        return false;
     }
 
     /// Recursively checks an `SE-15` parallel destructuring LHS target against `rhs_ty`, collecting leaf paths.
@@ -20398,7 +20566,7 @@ pub const TypeChecker = struct {
 
         switch (target_node.tag) {
             .wildcard_pat => {
-                try self.validateWildcardAssignDiscard(self.getAstNodeSpan(target_id), .none, rhs_ty);
+                _ = try self.validateWildcardAssignDiscard(self.getAstNodeSpan(target_id), .none, rhs_ty);
                 return;
             },
             .tuple_lit => {
@@ -20614,7 +20782,15 @@ pub const TypeChecker = struct {
         }
 
         // Leaf place target in parallel assignment:
-        const leaf_ty = try self.synthExpr(target_id);
+        const target_tag = self.ast_arena.getNode(target_id).tag;
+        const saved_assign_lhs = self.active_simple_assign_lhs;
+        if (target_tag == .ident_expr or target_tag == .self_val) {
+            self.active_simple_assign_lhs = target_id;
+        }
+        const leaf_ty = blk_leaf_ty: {
+            defer self.active_simple_assign_lhs = saved_assign_lhs;
+            break :blk_leaf_ty try self.synthExpr(target_id);
+        };
         if (!self.isAssignablePlace(target_id) or !self.isMutableAssignablePlace(target_id)) {
             try self.emitDiagnosticSimple(
                 .e0434_invalid_parallel_assign_target,
@@ -20675,9 +20851,32 @@ pub const TypeChecker = struct {
         const lhs_node = self.ast_arena.getNode(lhs_id);
         if (lhs_node.tag == .wildcard_pat) {
             if (!rhs_id.isNone()) {
-                const rhs_ty = try self.synthExpr(rhs_id);
+                const rhs_tag = self.ast_arena.getNode(rhs_id).tag;
+                const is_bare_ident_rhs = rhs_tag == .ident_expr or rhs_tag == .self_val;
+                const prev_bare_discard = self.active_bare_discard_rhs;
+                if (is_bare_ident_rhs) self.active_bare_discard_rhs = rhs_id;
+                const rhs_ty = blk_rhs: {
+                    defer self.active_bare_discard_rhs = prev_bare_discard;
+                    break :blk_rhs try self.synthExpr(rhs_id);
+                };
                 _ = self.recordNodeType(lhs_id, rhs_ty);
-                try self.validateWildcardAssignDiscard(self.getAstNodeSpan(stmt_id), rhs_id, rhs_ty);
+                const full_stmt_span = self.getAstSubtreeSpan(stmt_id);
+                const had_discard_err = try self.validateWildcardAssignDiscard(full_stmt_span, rhs_id, rhs_ty);
+                if (!had_discard_err and is_bare_ident_rhs and rhs_id.asInt() < self.node_symbols.len) {
+                    const raw_sym = self.node_symbols[rhs_id.asInt()];
+                    if (!raw_sym.isNone()) {
+                        const resolved_sym = self.unwrapAliasSymbolIdx(raw_sym);
+                        if (!resolved_sym.isNone() and resolved_sym.asInt() < self.sym_table.symbols.items.len) {
+                            const sym_kind = self.sym_table.getSymbol(resolved_sym).kind;
+                            if (sym_kind == .local_let_sym or sym_kind == .local_var_sym or sym_kind == .param_sym) {
+                                try self.pending_ident_discards.append(self.allocator, .{
+                                    .sym_idx = resolved_sym,
+                                    .stmt_span = full_stmt_span,
+                                });
+                            }
+                        }
+                    }
+                }
             }
             return self.recordNodeType(stmt_id, .unit_ty);
         }
@@ -20715,7 +20914,15 @@ pub const TypeChecker = struct {
             return self.recordNodeType(stmt_id, .unit_ty);
         }
 
-        const lhs_ty = try self.synthExpr(lhs_id);
+        const is_simple_ident_assign = !stmt_node.main_token.isNone() and
+            self.token_buffer.getToken(stmt_node.main_token).kind == .eq and
+            (lhs_node.tag == .ident_expr or lhs_node.tag == .self_val);
+        const prev_assign_lhs = self.active_simple_assign_lhs;
+        if (is_simple_ident_assign) self.active_simple_assign_lhs = lhs_id;
+        const lhs_ty = blk_lhs: {
+            defer self.active_simple_assign_lhs = prev_assign_lhs;
+            break :blk_lhs try self.synthExpr(lhs_id);
+        };
         if (!lhs_ty.isError()) {
             if (!self.isAssignablePlace(lhs_id)) {
                 try self.emitDiagnosticSimple(
@@ -23621,6 +23828,18 @@ pub const TypeChecker = struct {
         if (is_nursery_cb) {
             self.nursery_scope_depth = self.sym_table.scope_arena.getScope(closure_scope).depth;
         }
+        const is_outermost_closure_discard_scope = (self.fn_discard_scope_depth == 0);
+        if (is_outermost_closure_discard_scope) {
+            self.non_discard_read_syms.clearRetainingCapacity();
+        }
+        const closure_discard_start = self.pending_ident_discards.items.len;
+        if (is_outermost_closure_discard_scope) {
+            self.fn_discard_scope_depth += 1;
+        }
+        defer if (is_outermost_closure_discard_scope) {
+            self.fn_discard_scope_depth -= 1;
+        };
+
         defer {
             self.current_scope = saved_scope;
             self.current_fn_ret_ty = saved_ret_ty;
@@ -23706,9 +23925,12 @@ pub const TypeChecker = struct {
                             is_mode_explicit = true;
                         }
                     }
-                    if (colon_pos) |c_pos| {
-                        const ty_ast = self.findFirstAstInCstRange(c_pos + 1, sub_end);
-                        if (!ty_ast.isNone() and self.ast_arena.getNode(ty_ast).tag == .mode_type) {
+                    const ty_ast: NodeIndex = if (colon_pos) |c_pos|
+                        self.findFirstAstInCstRange(c_pos + 1, sub_end)
+                    else
+                        self.findFirstAstInCstRange(cursor + 1, sub_end);
+                    if (!ty_ast.isNone() and isTypeAstTag(self.ast_arena.getNode(ty_ast).tag)) {
+                        if (self.ast_arena.getNode(ty_ast).tag == .mode_type) {
                             const m_tok = self.ast_arena.getNode(ty_ast).main_token;
                             if (!m_tok.isNone() and m_tok.asInt() < self.token_buffer.countTokens()) {
                                 const m_kind = self.token_buffer.getToken(m_tok).kind;
@@ -23727,20 +23949,18 @@ pub const TypeChecker = struct {
                                 }
                             }
                         }
-                        if (!ty_ast.isNone() and isTypeAstTag(self.ast_arena.getNode(ty_ast).tag)) {
-                            param_types[param_ord] = try self.resolveTypeAst(ty_ast);
-                            if (self.pool.isOutRef(param_types[param_ord])) {
-                                mode = .set_mode;
-                                is_mode_explicit = true;
-                            } else if (self.pool.getTag(param_types[param_ord]) == .closure_ty and
-                                (if (self.pool.getFnSignatureView(param_types[param_ord])) |cl_sig|
-                                    cl_sig.capture_tier != .copy_tier
-                                else
-                                    false))
-                            {
-                                mode = .sink_mode;
-                                is_mode_explicit = true;
-                            }
+                        param_types[param_ord] = try self.resolveTypeAst(ty_ast);
+                        if (self.pool.isOutRef(param_types[param_ord])) {
+                            mode = .set_mode;
+                            is_mode_explicit = true;
+                        } else if (self.pool.getTag(param_types[param_ord]) == .closure_ty and
+                            (if (self.pool.getFnSignatureView(param_types[param_ord])) |cl_sig|
+                                cl_sig.capture_tier != .copy_tier
+                            else
+                                false))
+                        {
+                            mode = .sink_mode;
+                            is_mode_explicit = true;
                         }
                         const p_ty = param_types[param_ord];
                         const p_tag = self.pool.getTag(p_ty);
@@ -23866,6 +24086,9 @@ pub const TypeChecker = struct {
             }
             break :blk self.materializeUntypedType(try self.synthExpr(body_node));
         } else .unit_ty;
+        if (is_outermost_closure_discard_scope) {
+            try self.flushPendingIdentDiscards(closure_discard_start);
+        }
         if (is_nursery_cb and !body_ty.isError()) {
             const tail_span = if (ast_node.rhs.tag == .node)
                 self.getAstNodeSpan(NodeIndex.fromInt(ast_node.rhs.payload))
@@ -24262,6 +24485,10 @@ pub const TypeChecker = struct {
                         hole_ty = sub_checker.materializeUntypedType(raw_hole_ty);
                     }
                 }
+                var read_it = sub_checker.non_discard_read_syms.keyIterator();
+                while (read_it.next()) |sym_k| {
+                    try self.non_discard_read_syms.put(self.allocator, sym_k.*, {});
+                }
             }
 
             const base_in_file: u32 = tok_span.start_byte + @as(u32, @intCast(delim_width + seg.expr_start));
@@ -24269,6 +24496,7 @@ pub const TypeChecker = struct {
                 const prefix_u32: u32 = @intCast(wrapper_prefix.len);
                 for (sub_diags.asSlice()) |sub_diag| {
                     if (sub_diag.severity != .err) continue;
+                    if (sub_diag.code == .e0118_block_doc_comment_forbidden) continue;
                     const rebased_start = if (sub_diag.primary_span.start_byte >= prefix_u32)
                         base_in_file + (sub_diag.primary_span.start_byte - prefix_u32)
                     else
@@ -30856,8 +31084,38 @@ pub const TypeChecker = struct {
             return .err_ty;
         }
 
-        const unwrapped_recv = self.unwrapRefType(recv_ty);
+        const unwrapped_recv = self.pool.unwrapUnderlyingType(self.unwrapRefType(recv_ty));
         const recv_node = self.pool.getNode(unwrapped_recv);
+
+        // [0a] Built-in `Result` (`T!E`) `.ok() -> T?` and `.err() -> E?` projections (`DR-23` `ADR-23E`):
+        if (recv_node.tag == .result_ty and explicit_type_args.len == 0 and
+            (std.mem.eql(u8, member_name, "ok") or std.mem.eql(u8, member_name, "err")))
+        {
+            const is_ok_method = std.mem.eql(u8, member_name, "ok");
+            const proj_ty = TypeId.fromInt(if (is_ok_method) recv_node.lhs else recv_node.rhs);
+            const opt_proj_ty = try self.pool.internOptional(proj_ty);
+            if (args.len != 0) {
+                for (args) |arg_id| _ = try self.synthExpr(self.unwrapCallArgExpr(arg_id));
+                try self.emitDiagnosticSimple(
+                    .e0401_type_mismatch,
+                    self.getAstNodeSpan(expr_id),
+                    "`Result.ok()` / `Result.err()` takes 0 arguments",
+                    "unexpected argument to 0-argument `Result` projection",
+                );
+            }
+            const recv_outer_tag = self.pool.getTag(self.pool.unwrapUnderlyingType(recv_ty));
+            if ((recv_outer_tag == .ref_ty or recv_outer_tag == .mut_ref_ty) and
+                !self.isCopyType(unwrapped_recv))
+            {
+                try self.emitDiagnosticSimple(
+                    .e0401_type_mismatch,
+                    self.getAstNodeSpan(recv_id),
+                    "`Result.ok()` / `Result.err()` consumes non-`Copy` `T!E` by value (`own self`)",
+                    "cannot move non-`Copy` `Result` out of a borrowed reference",
+                );
+            }
+            return self.recordNodeType(expr_id, opt_proj_ty);
+        }
 
         // [0] Retired `Option.unwrap()` / `Option.unwrap_or(d)` migration autofix (`DR-21` `SE-03`):
         if (recv_node.tag == .optional_ty and
@@ -34685,22 +34943,87 @@ pub const TypeChecker = struct {
         );
     }
 
-    /// Emits `E0413` (`unhandled_must_use_result`) when a `Result[T, E]` or `@must_use` value is discarded.
-    fn emitUnhandledMustUseError(self: *TypeChecker, span: Span, expr_ty: TypeId) !void {
-        if (self.diagnostic_sink == null) return;
+    /// Emits `E0413` (`e0413_unhandled_must_use_or_result`) when a `T!E` or `@must_use` value is ignored.
+    fn emitUnhandledMustUseError(
+        self: *TypeChecker,
+        stmt_span: Span,
+        expr_ty: TypeId,
+        is_tail_without_semi: bool,
+    ) !void {
+        const sink = self.diagnostic_sink orelse return;
+        const mat_ty = self.materializeUntypedType(expr_ty);
+        const is_result = self.pool.getTag(self.pool.unwrapUnderlyingType(mat_ty)) == .result_ty;
         var ty_buf: [96]u8 = undefined;
         const ty_str = self.pool.formatType(expr_ty, self.sym_table, &ty_buf);
 
-        var msg_buf: [220]u8 = undefined;
-        const msg = std.fmt.bufPrint(
-            &msg_buf,
-            "unhandled `@must_use` or `Result` value of type `{s}`; propagate with `?` or handle with `catch`",
-            .{ty_str},
-        ) catch "unhandled `@must_use` or `Result` value";
+        var msg_buf: [240]u8 = undefined;
+        const msg = if (is_result)
+            std.fmt.bufPrint(
+                &msg_buf,
+                "unhandled `Result` value of type `{s}`; propagate with `?`, handle with `catch`, or call `.ok()`",
+                .{ty_str},
+            ) catch "unhandled `Result` value; propagate with `?` or handle with `catch`"
+        else
+            std.fmt.bufPrint(
+                &msg_buf,
+                "unhandled `@must_use` value of type `{s}`; bind it or discard explicitly with `_ = …;`",
+                .{ty_str},
+            ) catch "unhandled `@must_use` value; discard explicitly with `_ = …;`";
+
+        if (!is_result and !stmt_span.file_id.isNone()) {
+            if (is_tail_without_semi) {
+                const arena_alloc = sink.arena.asAllocator();
+                const labels = try arena_alloc.alloc(LabeledSpan, 1);
+                labels[0] = .{
+                    .span = stmt_span,
+                    .label = "unused `@must_use` value must be bound or explicitly discarded",
+                    .style = .primary,
+                };
+                const edits = try arena_alloc.alloc(TextEdit, 2);
+                edits[0] = .{
+                    .file_id = stmt_span.file_id,
+                    .start_byte = stmt_span.start_byte,
+                    .end_byte = stmt_span.start_byte,
+                    .replacement_id = try self.interner.intern("_ = "),
+                };
+                edits[1] = .{
+                    .file_id = stmt_span.file_id,
+                    .start_byte = stmt_span.end_byte,
+                    .end_byte = stmt_span.end_byte,
+                    .replacement_id = try self.interner.intern(";"),
+                };
+                const fixes = try arena_alloc.alloc(SuggestedFix, 1);
+                fixes[0] = .{
+                    .message = "explicitly discard `@must_use` value with `_ = …;`",
+                    .applicability = .machine_applicable,
+                    .priority = .syntax_canonicalization,
+                    .edits = edits,
+                };
+                try sink.emit(.{
+                    .code = .e0413_unhandled_must_use_or_result,
+                    .severity = .err,
+                    .primary_span = stmt_span,
+                    .message = try arena_alloc.dupe(u8, msg),
+                    .labels = labels,
+                    .suggestions = fixes,
+                });
+                return;
+            }
+            try self.emitDiagnosticWithSingleFix(
+                .e0413_unhandled_must_use_or_result,
+                stmt_span,
+                msg,
+                "unused `@must_use` value must be bound or explicitly discarded",
+                "explicitly discard `@must_use` value with `_ = `",
+                Span.init(stmt_span.file_id, stmt_span.start_byte, stmt_span.start_byte),
+                "_ = ",
+            );
+            return;
+        }
 
         try self.emitDiagnosticSimple(
             .e0413_unhandled_must_use_or_result,
-            span,
+            stmt_span,
             msg,
             "unused `@must_use` / `Result` value must be handled",
         );
@@ -34932,8 +35255,8 @@ test "test_bind_once_vs_bind_many_and_distinct_refinement_typing" {
         \\}
         \\
         \\pub fn accept_any(first_val: any Integer, second_val: any Integer) -> i32 {
-        \\    let _ = first_val;
-        \\    let _ = second_val;
+        \\    _ = first_val;
+        \\    _ = second_val;
         \\    return 0;
         \\}
         \\
@@ -34946,7 +35269,7 @@ test "test_bind_once_vs_bind_many_and_distinct_refinement_typing" {
         \\    let mix_ok = accept_any(small_val, big_val);
         \\    let valid_port: Port = 8080;
         \\    let widened_u16: u16 = valid_port;
-        \\    let _ = widened_u16;
+        \\    _ = widened_u16;
         \\    return sum_ok + mix_ok;
         \\}
     ;
@@ -34992,10 +35315,10 @@ test "test_phase5_all_reflection_intrinsics_and_compile_assert" {
         \\    let embedded: &[u8] = @embed_bytes("assets/header.bin");
         \\    let info = @type_info[Point]();
         \\    let col_opt: ColumnAttr? = @field_attr_lookup[ColumnAttr](info.id, 0);
-        \\    let _ = x_copy;
-        \\    let _ = ty_label;
-        \\    let _ = embedded;
-        \\    let _ = col_opt;
+        \\    _ = x_copy;
+        \\    _ = ty_label;
+        \\    _ = embedded;
+        \\    _ = col_opt;
         \\    return @size_of[Point]();
         \\}
     ;
@@ -35021,10 +35344,10 @@ test "test_phase5_comptime_fn_params_for_and_forbidden_ops_e0503" {
         \\}
         \\
         \\pub fn with_comptime_param(comptime tag_name: str, runtime_val: i32) -> i32 {
-        \\    let _ = tag_name;
+        \\    _ = tag_name;
         \\    let folded: i32 = comptime compute_magic(8);
         \\    comptime for step_idx in 0..3 {
-        \\        let _ = step_idx;
+        \\        _ = step_idx;
         \\    }
         \\    return runtime_val + folded;
         \\}
@@ -35136,8 +35459,8 @@ test "test_phase5_attribute_schema_and_two_phase_derive" {
         \\}
         \\
         \\pub fn same_pair[T: Eq](lhs: &T, rhs: &T) -> bool {
-        \\    let _ = lhs;
-        \\    let _ = rhs;
+        \\    _ = lhs;
+        \\    _ = rhs;
         \\    return true;
         \\}
         \\
@@ -35146,9 +35469,9 @@ test "test_phase5_attribute_schema_and_two_phase_derive" {
         \\    let is_same: bool = cloned_a.eq(&item_b);
         \\    let is_generic_eq: bool = same_pair(&cloned_a, &item_b);
         \\    let dbg_text: str = cloned_a.debug();
-        \\    let _ = is_same;
-        \\    let _ = is_generic_eq;
-        \\    let _ = dbg_text;
+        \\    _ = is_same;
+        \\    _ = is_generic_eq;
+        \\    _ = dbg_text;
         \\    return cloned_a.hash();
         \\}
     ;
@@ -35176,7 +35499,7 @@ test "test_phase5_defer_errdefer_control_flow_guards_and_const_array_lengths" {
         \\const HEADER_WORDS: usize = 4;
         \\
         \\pub fn select_first[T: Copy, const N: usize](lhs: [T; N], rhs: [T; N]) -> [T; N] {
-        \\    let _ = rhs;
+        \\    _ = rhs;
         \\    return lhs;
         \\}
         \\
@@ -35598,28 +35921,19 @@ test "test_phase6_three_tier_ownership_and_generic_containers" {
         \\    pub list: Vec[File],
         \\}
         \\pub fn check_tiers(
-        \\    sp: Span16,
-        \\    key: SlotKey[File],
-        \\    nums: own Vec[u32],
-        \\    text: own String,
-        \\    file_val: own File,
-        \\    sock_opt: own Socket?,
-        \\    tx: own TxHandle,
-        \\    holder: own AutoHolder,
-        \\    lin_holder: own LinearHolder,
+        \\    _sp: Span16,
+        \\    _key: SlotKey[File],
+        \\    _nums: own Vec[u32],
+        \\    _text: own String,
+        \\    _file_val: own File,
+        \\    _sock_opt: own Socket?,
+        \\    _tx: own TxHandle,
+        \\    _holder: own AutoHolder,
+        \\    _lin_holder: own LinearHolder,
         \\) -> bool {
         \\    let copy_ok = @implements[Span16, Copy]() and @implements[SlotKey[File], Copy]();
         \\    let vec_auto = not @implements[Vec[u32], Copy]() and @implements[Vec[u32], AutoDrop]();
         \\    let file_lin = not @implements[File, Copy]() and not @implements[File, AutoDrop]();
-        \\    let _ = sp;
-        \\    let _ = key;
-        \\    let _ = nums;
-        \\    let _ = text;
-        \\    let _ = file_val;
-        \\    let _ = sock_opt;
-        \\    let _ = tx;
-        \\    let _ = holder;
-        \\    let _ = lin_holder;
         \\    return copy_ok and vec_auto and file_lin;
         \\}
     ;
@@ -35647,14 +35961,14 @@ test "test_phase6_three_tier_ownership_and_generic_containers" {
     while (sym_i < res.symbol_table.symbols.items.len) : (sym_i += 1) {
         const sym = res.symbol_table.getSymbol(SymbolIndex.fromInt(sym_i)).*;
         if (sym.kind == .param_sym) {
-            if (std.mem.eql(u8, sym.name_text, "key")) {
+            if (std.mem.eql(u8, sym.name_text, "_key")) {
                 try std.testing.expectEqual(
                     OwnershipTier.copy_tier,
                     classifyOwnershipTier(&res.type_pool, &res.symbol_table, sym.type_id),
                 );
                 try std.testing.expect(res.type_pool.getFlags(sym.type_id).is_copy);
                 has_checked_slot_key = true;
-            } else if (std.mem.eql(u8, sym.name_text, "nums")) {
+            } else if (std.mem.eql(u8, sym.name_text, "_nums")) {
                 try std.testing.expectEqual(
                     OwnershipTier.auto_drop_tier,
                     classifyOwnershipTier(&res.type_pool, &res.symbol_table, sym.type_id),
@@ -35662,26 +35976,26 @@ test "test_phase6_three_tier_ownership_and_generic_containers" {
                 try std.testing.expect(!res.type_pool.getFlags(sym.type_id).is_copy);
                 try std.testing.expect(res.type_pool.getFlags(sym.type_id).has_drop);
                 has_checked_vec_u32 = true;
-            } else if (std.mem.eql(u8, sym.name_text, "tx")) {
+            } else if (std.mem.eql(u8, sym.name_text, "_tx")) {
                 try std.testing.expectEqual(
                     OwnershipTier.linear_tier,
                     classifyOwnershipTier(&res.type_pool, &res.symbol_table, sym.type_id),
                 );
                 try std.testing.expect(!res.type_pool.getFlags(sym.type_id).is_copy);
                 has_checked_tx_handle = true;
-            } else if (std.mem.eql(u8, sym.name_text, "holder")) {
+            } else if (std.mem.eql(u8, sym.name_text, "_holder")) {
                 try std.testing.expectEqual(
                     OwnershipTier.auto_drop_tier,
                     classifyOwnershipTier(&res.type_pool, &res.symbol_table, sym.type_id),
                 );
                 has_checked_auto_holder = true;
-            } else if (std.mem.eql(u8, sym.name_text, "lin_holder")) {
+            } else if (std.mem.eql(u8, sym.name_text, "_lin_holder")) {
                 try std.testing.expectEqual(
                     OwnershipTier.linear_tier,
                     classifyOwnershipTier(&res.type_pool, &res.symbol_table, sym.type_id),
                 );
                 has_checked_lin_holder = true;
-            } else if (std.mem.eql(u8, sym.name_text, "sock_opt")) {
+            } else if (std.mem.eql(u8, sym.name_text, "_sock_opt")) {
                 try std.testing.expectEqual(
                     OwnershipTier.linear_tier,
                     classifyOwnershipTier(&res.type_pool, &res.symbol_table, sym.type_id),
@@ -35719,9 +36033,9 @@ test "test_phase6_wire_contracts_from_bytes_into_bytes_and_zero_pad" {
         \\    let view_opt: (&PackedHdr)? = @view_bytes[PackedHdr](bytes_a);
         \\    let flt_val: f32 = 1.0;
         \\    let bits: u32 = @bit_cast[u32](flt_val);
-        \\    let _ = bytes_b;
-        \\    let _ = parsed_opt;
-        \\    let _ = view_opt;
+        \\    _ = bytes_b;
+        \\    _ = parsed_opt;
+        \\    _ = view_opt;
         \\    return bits;
         \\}
     ;
@@ -35898,11 +36212,11 @@ test "test_phase6_seam2_context_fields_and_safe_narrowing_d11" {
         \\    let inferred_b: u8 = wide_val.narrow();
         \\    let try_explicit: u8? = wide_val.try_narrow[u8]();
         \\    let try_inferred: u8? = wide_val.try_narrow();
-        \\    let _ = seed;
-        \\    let _ = sink_ptr;
-        \\    let _ = inferred_b;
-        \\    let _ = try_explicit;
-        \\    let _ = try_inferred;
+        \\    _ = seed;
+        \\    _ = sink_ptr;
+        \\    _ = inferred_b;
+        \\    _ = try_explicit;
+        \\    _ = try_inferred;
         \\    return explicit_b;
         \\}
     ;
@@ -35991,9 +36305,9 @@ test "test_phase6_fn_ptr_contracts_trait_nonescalation_and_sandbox_e0320_e0327" 
         \\    let f_alloc: @no_alloc fn(i32) -> i32 = plain_cb;
         \\    let f_panic: @no_panic fn(i32) -> i32 = plain_cb;
         \\    let f_block: @no_block fn(i32) -> i32 = plain_cb;
-        \\    let _ = f_alloc;
-        \\    let _ = f_panic;
-        \\    let _ = f_block;
+        \\    _ = f_alloc;
+        \\    _ = f_panic;
+        \\    _ = f_block;
         \\}
     ;
     var bad_fn_res = try typecheckSource(std.testing.allocator, FileId.fromInt(36), bad_fn_src);
@@ -36172,7 +36486,7 @@ test "test_phase76_adr22a_b_c_operators_mvs_own_out_and_result_sugar" {
         \\    let moved_len: usize = consume_vec(own named_vec);
         \\    var out_target: i32 = 0;
         \\    write_out_slot(&out out_target, 41);
-        \\    let _ = (inv_u32, inv_mask, inv_simd, logic_ok, rval_len, moved_len);
+        \\    _ = (inv_u32, inv_mask, inv_simd, logic_ok, rval_len, moved_len);
         \\    return out_target;
         \\}
     ;
@@ -36290,9 +36604,9 @@ test "test_phase76_adr22d_e_f_bitfield_backed_enum_len_visibility_and_raw_ffi" {
         \\    let addr_rw: *mut u8 = &raw mut local_byte;
         \\    unsafe {
         \\        addr_rw.* = addr_ro.*;
-        \\        let _ = c_snprintf(rw_ptr, total_len, ro_ptr, flag_int, op_u16, void_ptr);
+        \\        _ = c_snprintf(rw_ptr, total_len, ro_ptr, flag_int, op_u16, void_ptr);
         \\    }
-        \\    let _ = any_empty;
+        \\    _ = any_empty;
         \\    return total_len;
         \\}
     ;
@@ -36341,7 +36655,7 @@ test "test_phase76_adr22d_e_f_bitfield_backed_enum_len_visibility_and_raw_ffi" {
     const bad_opaque_src =
         \\pub fn bad_deref(raw_p: *u8, void_p: *opaque) -> u8 {
         \\    unsafe {
-        \\        let _ = void_p.*;
+        \\        _ = void_p.*;
         \\    }
         \\    return raw_p.*;
         \\}
@@ -36391,7 +36705,7 @@ test "test_phase76_se09_se10_se11_union_bounds_generic_defaults_derive_from_and_
         \\}
         \\
         \\pub fn dial(host: str, /, port: u16 = 443, *, is_tls: bool = true) -> u16 {
-        \\    let _ = (host, is_tls);
+        \\    _ = (host, is_tls);
         \\    return port;
         \\}
         \\
@@ -36405,7 +36719,7 @@ test "test_phase76_se09_se10_se11_union_bounds_generic_defaults_derive_from_and_
         \\    let b_byte: u8 = first_byte_or_zero(b"world");
         \\    let p_num: u16 = dial("corex.dev", is_tls: false);
         \\    let v_num: i32 = read_step()?;
-        \\    let _ = (default_buf, a_byte, b_byte, p_num);
+        \\    _ = (default_buf, a_byte, b_byte, p_num);
         \\    return .Ok(v_num);
         \\}
     ;
@@ -36493,7 +36807,7 @@ test "test_phase76_se12_se13_se14_se15_fmt_literals_struct_update_and_destructur
         \\    pub buf: Vec[u8],
         \\}
         \\pub fn sink_fmt(args: FmtArgs) -> usize {
-        \\    let _ = args;
+        \\    _ = args;
         \\    return 1;
         \\}
         \\pub fn exercise_literals_and_updates() -> u16 {
@@ -36510,7 +36824,7 @@ test "test_phase76_se12_se13_se14_se15_fmt_literals_struct_update_and_destructur
         \\    var left_port: u16 = cfg_b.port;
         \\    var right_port: u16 = 443_u16;
         \\    (left_port, right_port) = (right_port, left_port);
-        \\    let _ = (lf_byte, ratio, formatted, logged, box_b, right_port);
+        \\    _ = (lf_byte, ratio, formatted, logged, box_b);
         \\    return left_port;
         \\}
     ;
@@ -36580,7 +36894,7 @@ test "test_phase76_se12_se13_se14_se15_fmt_literals_struct_update_and_destructur
         \\    var mut_y: i32 = 2;
         \\    (immut_x, mut_y) = (3, 4);
         \\    (mut_y, mut_y) = (5, 6);
-        \\    let _ = bad_s;
+        \\    _ = bad_s;
         \\    return "{flag:#x}";
         \\}
     ;
@@ -36641,7 +36955,7 @@ test "test_phase76_se16_se18_se19_se20_se21_se22_se23_cfg_test_closures_subscrip
         \\pub fn panel(title: str, body: @builder |&mut PanelScope|) -> u32 {
         \\    var scope = PanelScope { count: 0 };
         \\    body(&mut scope);
-        \\    let _ = title;
+        \\    _ = title;
         \\    return scope.count;
         \\}
         \\
@@ -36658,7 +36972,7 @@ test "test_phase76_se16_se18_se19_se20_se21_se22_se23_cfg_test_closures_subscrip
         \\pub fn trace_here(loc: SourceLoc = @caller_location()) -> u32 {
         \\    let file_name: str = loc.file;
         \\    let fn_label: str = loc.fn_name;
-        \\    let _ = (file_name, fn_label);
+        \\    _ = (file_name, fn_label);
         \\    return loc.line + loc.col;
         \\}
         \\
@@ -36677,17 +36991,17 @@ test "test_phase76_se16_se18_se19_se20_se21_se22_se23_cfg_test_closures_subscrip
         \\        .Running(cur) => continue :fsm .Done(cur + active_platform_helper()),
         \\        .Done(final_v) => final_v,
         \\    };
-        \\    let _ = (cell_val, built_rows, loc_sum);
+        \\    _ = (cell_val, built_rows, loc_sum);
         \\    return fsm_out;
         \\}
         \\
         \\test "matrix and fsm smoke" {
         \\    let out_v = run_all();
-        \\    let _ = out_v;
+        \\    _ = out_v;
         \\}
         \\
         \\bench "panel builder bench" (bencher: &mut Bencher) {
-        \\    let _ = bencher;
+        \\    _ = bencher;
         \\}
     ;
     var interner = try StringInterner.init(std.testing.allocator);
@@ -36811,7 +37125,7 @@ test "test_stage4_mvs_mutability_casts_default_init_cmpxchg6_and_dependent_gener
         \\    let opt_lease: LinearLease? = @default_init[LinearLease?]();
         \\    if opt_lease is .Some(lease) {
         \\        let LinearLease { id } = lease;
-        \\        let _ = id;
+        \\        _ = id;
         \\    }
         \\    let zero_ref: NonNegative = @default_init[NonNegative]();
         \\    let raw_zero: *u64 = unsafe { @default_init[*u64]() };
@@ -36828,7 +37142,7 @@ test "test_stage4_mvs_mutability_casts_default_init_cmpxchg6_and_dependent_gener
         \\        0 => continue :fsm 1,
         \\        other => other,
         \\    };
-        \\    let _ = (flt_a, flt_b, zero_ref, raw_zero, cmpx_res, interp_ok, raw_ml_ok, stepped);
+        \\    _ = (flt_a, flt_b, zero_ref, raw_zero, cmpx_res, interp_ok, raw_ml_ok, stepped);
         \\    return (.Ok((dep_sec as i32) + (local_box.count as i32))) as TxnResult;
         \\}
         \\pub mod trailing_mod {
@@ -36864,7 +37178,7 @@ test "test_stage4_mvs_mutability_casts_default_init_cmpxchg6_and_dependent_gener
         \\    for &mut elem in ro_slice {
         \\        elem = 4;
         \\    }
-        \\    let _ = rebound_ref;
+        \\    _ = rebound_ref;
         \\}
     ;
     var mvs_res = try typecheckSource(std.testing.allocator, FileId.fromInt(61), mvs_err_src);
@@ -36898,7 +37212,7 @@ test "test_stage4_mvs_mutability_casts_default_init_cmpxchg6_and_dependent_gener
         \\    let _zero_sec = @default_init[SecretPin]();
         \\    let _zero_lin = @default_init[LinearTok]();
         \\    let LinearTok { fd } = _zero_lin;
-        \\    let _ = fd;
+        \\    _ = fd;
         \\}
     ;
     var cast_res = try typecheckSource(std.testing.allocator, FileId.fromInt(62), cast_and_init_err_src);
@@ -36951,7 +37265,7 @@ test "test_stage4_generic_default_bounds_parallel_assign_subscript_yield_and_cfg
         \\    PairBox { left: out_left } = PairBox { left: 5, right: 6 };
         \\    LinearPair { count: out_left, .. } = lin_pair;
         \\    let _escaped = @embed_bytes(r#"../outside.bin"#);
-        \\    let _ = (arr, out_left);
+        \\    _ = (arr, out_left);
         \\}
     ;
     var err_res = try typecheckSource(std.testing.allocator, FileId.fromInt(63), err_src);
@@ -37119,7 +37433,7 @@ test "test_stage4_generic_default_bounds_parallel_assign_subscript_yield_and_cfg
         \\test "heavy test body" {
         \\    let alpha = 1 + 2 + 3 + 4;
         \\    let beta = alpha * 5;
-        \\    let _ = beta;
+        \\    _ = beta;
         \\}
     ;
     var tok_inc = TokenBuffer.init(std.testing.allocator);
@@ -37332,7 +37646,7 @@ test "test_phase8_ffi_contracts_c_import_trusted_extern_non_niche_opt_ptr_and_va
         \\}
         \\pub fn bad_caller() -> i32 {
         \\    let missing_c = @c_import("nonexistent_header.h");
-        \\    let _ = missing_c;
+        \\    _ = missing_c;
         \\    let val_a = untrusted_c_fn();
         \\    let val_b = UNTRUSTED_CONST;
         \\    GLOBAL_MUT_COUNTER = 5;
@@ -37563,10 +37877,10 @@ test "test_phase8_linear_future_producer_tier_and_nominal_spoofing_guards" {
         \\    }).await;
         \\}
         \\pub async fn reject_atomic_spoof_and_variadic_cstr(spoof: AtomicSpoof, fake_cstr: CStr, fmt_ptr: *u8) -> i32 {
-        \\    let _ = c_var_sink(fmt_ptr, fake_cstr);
+        \\    _ = c_var_sink(fmt_ptr, fake_cstr);
         \\    return task_group(|grp| {
         \\        let handle = grp.spawn(own || {
-        \\            let _ = spoof;
+        \\            _ = spoof;
         \\            0
         \\        });
         \\        handle.join().await
@@ -37623,4 +37937,80 @@ test "test_deprecated_upgrade_struct_lit_receiver_parenthesization" {
         }
     }
     try std.testing.expect(has_w0403_fix);
+}
+
+test "test_adr23d_e_foreign_scalar_autofix_must_use_suppress_and_e0439" {
+    // [1] `_ = must_use_fn();` suppresses `E0413`, and single `_ = unused_param;` suppresses `W0402`:
+    const valid_src =
+        \\@must_use
+        \\pub fn compute_crc() -> u32 {
+        \\    return 42;
+        \\}
+        \\pub fn side_effect() {}
+        \\pub fn clean_discards(unused_param: u32) {
+        \\    _ = compute_crc();
+        \\    _ = unused_param;
+        \\    side_effect();
+        \\}
+    ;
+    var ok_res = try typecheckSource(std.testing.allocator, FileId.fromInt(80), valid_src);
+    defer ok_res.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ok_res.diagnostics.countDiagnostics());
+
+    // [2] Foreign scalar `UInt32` (`E0403` `.machine_applicable`), unhandled `@must_use` (`E0413` `"_ = "`),
+    //     `T!E` bare discard (`E0414`), and pointless `unit` / already-used / duplicate discards (`E0439`):
+    const neg_src =
+        \\@must_use
+        \\pub fn compute_crc() -> u32 { return 7; }
+        \\pub fn noop() {}
+        \\pub fn fallible() -> u32!u32 { return .Ok(1); }
+        \\pub fn bad_discards(used_before: u32, used_after: u32, dup_unused: u32, bad_ty: UInt32) -> u32 {
+        \\    _ = bad_ty;
+        \\    compute_crc();
+        \\    _ = noop();
+        \\    _ = fallible();
+        \\    let copy_v: u32 = used_before;
+        \\    _ = used_before;
+        \\    _ = used_after;
+        \\    _ = dup_unused;
+        \\    _ = dup_unused;
+        \\    return copy_v + used_after;
+        \\}
+    ;
+    var neg_res = try typecheckSource(std.testing.allocator, FileId.fromInt(81), neg_src);
+    defer neg_res.deinit();
+
+    var has_scalar_e0403 = false;
+    var has_must_use_e0413 = false;
+    var has_result_e0414 = false;
+    var count_e0439: u32 = 0;
+    for (neg_res.diagnostics.asSlice()) |diag_item| {
+        switch (diag_item.code) {
+            .e0403_unresolved_symbol => {
+                if (diag_item.suggestions.len == 1 and
+                    diag_item.suggestions[0].applicability == .machine_applicable and
+                    std.mem.eql(u8, neg_res.interner.get(diag_item.suggestions[0].edits[0].replacement_id), "u32"))
+                {
+                    has_scalar_e0403 = true;
+                }
+            },
+            .e0413_unhandled_must_use_or_result => {
+                if (diag_item.suggestions.len == 1 and
+                    diag_item.suggestions[0].applicability == .machine_applicable and
+                    std.mem.eql(u8, neg_res.interner.get(diag_item.suggestions[0].edits[0].replacement_id), "_ = "))
+                {
+                    has_must_use_e0413 = true;
+                }
+            },
+            .e0414_bare_wildcard_result_discard => {
+                if (diag_item.suggestions.len == 1) has_result_e0414 = true;
+            },
+            .e0439_pointless_unit_or_used_discard => count_e0439 += 1,
+            else => {},
+        }
+    }
+    try std.testing.expect(has_scalar_e0403);
+    try std.testing.expect(has_must_use_e0413);
+    try std.testing.expect(has_result_e0414);
+    try std.testing.expectEqual(@as(u32, 4), count_e0439);
 }

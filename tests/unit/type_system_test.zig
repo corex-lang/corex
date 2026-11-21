@@ -441,7 +441,7 @@ test "test_type_system_contextual_variants_overload_try_from_error_and_must_use"
         try std.testing.expect(hasDiag(&res.diagnostics, .e0410_try_outside_fallible_fn));
     }
 
-    // [4] `let … else` non-diverging `else` block (`E0412`), unused `Result` (`E0413`), and wildcard `let _ = fallible()` (`E0414`):
+    // [4] `let … else` non-diverging `else` block (`E0412`), unused `Result` (`E0413`), and wildcard `_ = fallible()` (`E0414`):
     {
         const err_sem_src =
             "pub fn compute_res(val: i32) -> i32!i32 {\n" ++
@@ -449,7 +449,7 @@ test "test_type_system_contextual_variants_overload_try_from_error_and_must_use"
             "}\n" ++
             "pub fn bad_semantics(opt_val: i32?) -> i32 {\n" ++
             "    compute_res(1);\n" ++
-            "    let _ = compute_res(2);\n" ++
+            "    _ = compute_res(2);\n" ++
             "    let .Some(unwrapped) = opt_val else {\n" ++
             "        let _non_diverging: i32 = 0;\n" ++
             "    };\n" ++
@@ -869,7 +869,7 @@ test "test_type_system_overload_named_defaults_generic_default_subst_and_tuple_v
         "pub fn format_metric(val: i32, scale: i32 = 10) -> i32 = val * scale;\n" ++
         "@overload\n" ++
         "pub fn format_metric(tag: str, bonus: i32 = 5) -> i32 {\n" ++
-        "    let _ = tag;\n" ++
+        "    _ = tag;\n" ++
         "    return bonus;\n" ++
         "}\n" ++
         "pub fn caller() -> i32 {\n" ++
@@ -952,13 +952,13 @@ test "test_type_system_tuple_leading_zero_loop_labels_break_typing_and_context_l
 
     const mixed_break_cases = [_][]const u8{
         "pub fn mix_val_then_bare(items: &[i32]) {\n" ++
-            "    let _ = for item in items {\n" ++
+            "    let _mix = for item in items {\n" ++
             "        if item > 0 { break (); }\n" ++
             "        break;\n" ++
             "    };\n" ++
             "}\n",
         "pub fn mix_bare_then_val(items: &[i32]) {\n" ++
-            "    let _ = for item in items {\n" ++
+            "    let _mix = for item in items {\n" ++
             "        if item > 0 { break; }\n" ++
             "        break ();\n" ++
             "    };\n" ++
@@ -1088,7 +1088,7 @@ test "test_type_system_dr22_positive_features_and_e0420_through_e0437_diagnostic
         "pub fn parse_sugar() -> i32!IoFail = .Ok(1);\n" ++
         "pub fn parse_canon() -> Result[i32, IoFail] = .Ok(1);\n" ++
         "pub fn dial(host: str, /, port: u16 = 443, *, is_tls: bool = true) -> u16 {\n" ++
-        "    let _ = (host, is_tls);\n" ++
+        "    _ = (host, is_tls);\n" ++
         "    return port;\n" ++
         "}\n" ++
         "pub fn trace_loc(loc: SourceLoc = @caller_location()) -> u32 = loc.line;\n" ++
@@ -1101,7 +1101,7 @@ test "test_type_system_dr22_positive_features_and_e0420_through_e0437_diagnostic
         "    let step_val = parse_sugar()?;\n" ++
         "    let loc_line = trace_loc();\n" ++
         "    let msg: str = \"v={step_val=:#04x}\";\n" ++
-        "    let _ = (moved_grid, panel_sum, port_num, loc_line, msg);\n" ++
+        "    _ = (moved_grid, panel_sum, port_num, loc_line, msg);\n" ++
         "    let out_val = fsm: match FsmStep.Start {\n" ++
         "        .Start => continue :fsm .Done(step_val),\n" ++
         "        .Done(res) => res,\n" ++
@@ -1133,11 +1133,11 @@ test "test_type_system_dr22_positive_features_and_e0420_through_e0437_diagnostic
         "pub enum WideOp: u16 { Alpha = 1 }\n" ++
         "pub fn trigger_e0420_to_e0425(slice: &[u8], op: WideOp, void_p: *opaque) -> usize {\n" ++
         "    let local_vec = Vec { len: 1 };\n" ++
-        "    let _ = take_vec(local_vec);\n" ++
+        "    _ = take_vec(local_vec);\n" ++
         "    let immut_slot: i32 = 0;\n" ++
         "    init_slot(&out immut_slot);\n" ++
-        "    let _ = op as u8;\n" ++
-        "    unsafe { let _ = void_p.*; }\n" ++
+        "    _ = op as u8;\n" ++
+        "    unsafe { _ = void_p.*; }\n" ++
         "    return slice.len;\n" ++
         "}\n";
     var res_a = try runFullTypecheck(std.testing.allocator, e0420_to_e0425_src);
@@ -1180,13 +1180,13 @@ test "test_type_system_dr22_positive_features_and_e0420_through_e0437_diagnostic
         "pub fn add_box_item(scope: &mut ScopeBox, delta: u32) { scope.count += delta; }\n" ++
         "pub enum FsmTag { Alpha, Beta }\n" ++
         "pub fn trigger_e0431_to_e0437(flag: bool) -> str {\n" ++
-        "    let _ = PairReq { left: 1 };\n" ++
-        "    let _ = locked_mod.Locked { secret_id: 9 };\n" ++
+        "    _ = PairReq { left: 1 };\n" ++
+        "    _ = locked_mod.Locked { secret_id: 9 };\n" ++
         "    let immut_lhs: i32 = 1;\n" ++
         "    var mut_rhs: i32 = 2;\n" ++
         "    (immut_lhs, mut_rhs) = (3, 4);\n" ++
         "    add_box_item(5);\n" ++
-        "    let _ = fsm: match FsmTag.Alpha {\n" ++
+        "    _ = fsm: match FsmTag.Alpha {\n" ++
         "        .Alpha => continue :fsm,\n" ++
         "        .Beta => 0,\n" ++
         "    };\n" ++
@@ -1201,4 +1201,144 @@ test "test_type_system_dr22_positive_features_and_e0420_through_e0437_diagnostic
     try std.testing.expect(hasDiag(&res_c.diagnostics, .e0435_invalid_cfg_predicate));
     try std.testing.expect(hasDiag(&res_c.diagnostics, .e0436_builder_item_outside_scope));
     try std.testing.expect(hasDiag(&res_c.diagnostics, .e0437_invalid_labeled_match_continue));
+}
+
+// ----------- Phase 10.6 (DR-23) Discard & Typo Sema -----------
+
+test "test_type_system_dr23_five_tier_discard_lattice_e0439_and_foreign_scalar_e0403" {
+    // [1] `_ = must_use_fn();` suppresses `E0413` cleanly, while bare `must_use_fn();` emits `E0413` with `"_ = "` fix:
+    {
+        const clean_must_use_discard_src =
+            "@must_use\n" ++
+            "pub fn compute_checksum(seed: u32) -> u32 = seed ^ 0xA5A5_u32;\n" ++
+            "pub struct Sensor { pub id: u32 }\n" ++
+            "impl Sensor {\n" ++
+            "    pub fn nop_ping(&self, unused_param: u32, *, loc: SourceLoc = @caller_location()) -> u32 {\n" ++
+            "        _ = self;\n" ++
+            "        _ = unused_param;\n" ++
+            "        _ = loc;\n" ++
+            "        _ = compute_checksum(7_u32);\n" ++
+            "        return 1_u32;\n" ++
+            "    }\n" ++
+            "}\n";
+        var ok_res = try runFullTypecheck(std.testing.allocator, clean_must_use_discard_src);
+        defer ok_res.deinit();
+        try std.testing.expect(!ok_res.diagnostics.hasErrors());
+        try std.testing.expectEqual(@as(usize, 0), ok_res.diagnostics.diagnostics.items.len);
+        try std.testing.expect(!hasDiag(&ok_res.diagnostics, .e0413_unhandled_must_use_or_result));
+        try std.testing.expect(!hasDiag(&ok_res.diagnostics, .e0414_bare_wildcard_result_discard));
+        try std.testing.expect(!hasDiag(&ok_res.diagnostics, .e0439_pointless_unit_or_used_discard));
+        try std.testing.expect(!hasDiag(&ok_res.diagnostics, .w0402_unused_binding));
+
+        var db = try CompilerDb.init(std.testing.allocator);
+        defer db.deinit();
+        const bare_fid = FileId.fromInt(80);
+        const bare_must_use_src =
+            "@must_use\n" ++
+            "pub fn compute_checksum(seed: u32) -> u32 = seed ^ 0xA5A5_u32;\n" ++
+            "pub fn bad_bare_call() {\n" ++
+            "    compute_checksum(7_u32);\n" ++
+            "}\n";
+        _ = try db.setInput(bare_fid, bare_must_use_src, .low);
+        _ = try db.typecheckBody(DefId.init(bare_fid, 1));
+        const body_sink = db.getBodyDiagnostics(DefId.init(bare_fid, 1)).?;
+        try std.testing.expect(hasDiag(body_sink, .e0413_unhandled_must_use_or_result));
+
+        var has_discard_prefix_fix = false;
+        for (body_sink.diagnostics.items) |diag_item| {
+            if (diag_item.code != .e0413_unhandled_must_use_or_result) continue;
+            for (diag_item.suggestions) |sug| {
+                for (sug.edits) |edit| {
+                    if (std.mem.indexOf(u8, db.interner.get(edit.replacement_id), "_ = ") != null) {
+                        has_discard_prefix_fix = true;
+                    }
+                }
+            }
+        }
+        try std.testing.expect(has_discard_prefix_fix);
+    }
+
+    // [2] `_ = fallible();` still emits `E0414`, and `_ = linear_handle;` still emits `E0304`:
+    {
+        const fallible_discard_src =
+            "pub fn fallible_op() -> u32!u32 = .Ok(1_u32);\n" ++
+            "pub fn reject_result_discard() {\n" ++
+            "    _ = fallible_op();\n" ++
+            "}\n";
+        var res_e0414 = try runFullTypecheck(std.testing.allocator, fallible_discard_src);
+        defer res_e0414.deinit();
+        try std.testing.expect(hasDiag(&res_e0414.diagnostics, .e0414_bare_wildcard_result_discard));
+
+        const linear_discard_src =
+            "@linear\n" ++
+            "pub struct LeaseHandle { pub fd: i32 }\n" ++
+            "pub fn reject_linear_discard(linear_handle: own LeaseHandle) {\n" ++
+            "    _ = linear_handle;\n" ++
+            "}\n";
+        var sast_lin = try corex.lowerAndVerifySourceMirSast(
+            std.testing.allocator,
+            FileId.fromInt(81),
+            linear_discard_src,
+            type_system.TargetLayout.NATIVE_64,
+            .{},
+        );
+        defer sast_lin.deinit();
+        try std.testing.expect(hasDiag(&sast_lin.diagnostics, .e0304_resource_or_memory_leak));
+    }
+
+    // [3] `E0439` on `_ = unit_fn();`, `_ = x; return x;`, and `let y = x; _ = x;`:
+    {
+        const e0439_cases = [_][]const u8{
+            "pub fn unit_fn() {}\npub fn bad_unit_discard() {\n    _ = unit_fn();\n}\n",
+            "pub fn discard_before_read(x: u32) -> u32 {\n    _ = x;\n    return x;\n}\n",
+            "pub fn discard_after_read(x: u32) -> u32 {\n    let y = x;\n    _ = x;\n    return y;\n}\n",
+        };
+        for (e0439_cases) |bad_discard_src| {
+            var res_e0439 = try runFullTypecheck(std.testing.allocator, bad_discard_src);
+            defer res_e0439.deinit();
+            try std.testing.expect(hasDiag(&res_e0439.diagnostics, .e0439_pointless_unit_or_used_discard));
+        }
+    }
+
+    // [4] `E0403` on foreign scalar spellings (`UInt32`, `Bool`, `U8`) suggests `"u32"`, `"bool"`, `"u8"`:
+    {
+        var db = try CompilerDb.init(std.testing.allocator);
+        defer db.deinit();
+        const foreign_fid = FileId.fromInt(82);
+        const foreign_scalar_src =
+            "pub fn bad_foreign_scalars(x: UInt32, y: Bool, z: U8) -> u32 {\n" ++
+            "    _ = (x, y, z);\n" ++
+            "    return 0_u32;\n" ++
+            "}\n";
+        _ = try db.setInput(foreign_fid, foreign_scalar_src, .low);
+        _ = try db.resolveSignatures(foreign_fid);
+        const sig_sink = db.getSignatureDiagnostics(foreign_fid).?;
+        try std.testing.expect(hasDiag(sig_sink, .e0403_unresolved_symbol));
+
+        var saw_u32_hint = false;
+        var saw_bool_hint = false;
+        var saw_u8_hint = false;
+        for (sig_sink.diagnostics.items) |diag_item| {
+            if (diag_item.code != .e0403_unresolved_symbol) continue;
+            if (std.mem.indexOf(u8, diag_item.message, "u32") != null) saw_u32_hint = true;
+            if (std.mem.indexOf(u8, diag_item.message, "bool") != null) saw_bool_hint = true;
+            if (std.mem.indexOf(u8, diag_item.message, "u8") != null) saw_u8_hint = true;
+            for (diag_item.notes) |note_str| {
+                if (std.mem.indexOf(u8, note_str, "u32") != null) saw_u32_hint = true;
+                if (std.mem.indexOf(u8, note_str, "bool") != null) saw_bool_hint = true;
+                if (std.mem.indexOf(u8, note_str, "u8") != null) saw_u8_hint = true;
+            }
+            for (diag_item.suggestions) |sug| {
+                for (sug.edits) |edit| {
+                    const repl = db.interner.get(edit.replacement_id);
+                    if (std.mem.eql(u8, repl, "u32")) saw_u32_hint = true;
+                    if (std.mem.eql(u8, repl, "bool")) saw_bool_hint = true;
+                    if (std.mem.eql(u8, repl, "u8")) saw_u8_hint = true;
+                }
+            }
+        }
+        try std.testing.expect(saw_u32_hint);
+        try std.testing.expect(saw_bool_hint);
+        try std.testing.expect(saw_u8_hint);
+    }
 }

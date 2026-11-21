@@ -14428,7 +14428,7 @@ test "test_redteam_3a_mir_definite_init_partial_moves_local_closure_escape_and_c
     // [4] Captureless closure passes `own` cleanly, while Tier-1 borrow closure, field-stored `@local`, and `&mut` escape fail `V6`:
     const pure_closure_ok_src =
         \\pub fn consume_sink[F](cb: own F) -> i32 {
-        \\    let _ = cb;
+        \\    _ = cb;
         \\    return 7;
         \\}
         \\pub fn pass_pure() -> i32 {
@@ -14441,7 +14441,7 @@ test "test_redteam_3a_mir_definite_init_partial_moves_local_closure_escape_and_c
 
     const anon_local_escape_src =
         \\pub fn consume_sink[F](cb: own F) -> i32 {
-        \\    let _ = cb;
+        \\    _ = cb;
         \\    return 0;
         \\}
         \\pub fn escape_anon(borrowed: &i32) -> i32 {
@@ -14458,7 +14458,7 @@ test "test_redteam_3a_mir_definite_init_partial_moves_local_closure_escape_and_c
         \\    pub cb: F,
         \\}
         \\pub fn consume_sink[T](item: own T) -> i32 {
-        \\    let _ = item;
+        \\    _ = item;
         \\    return 0;
         \\}
         \\pub fn escape_via_field(borrowed: &i32) -> i32 {
@@ -14517,8 +14517,8 @@ test "test_redteam_3a_mir_definite_init_partial_moves_local_closure_escape_and_c
         \\    errdefer { err_count = err_count + 1; }
         \\    {
         \\        let inner_owned = GuardedRes { tag: 1 };
-        \\        let _ = fallible_step(flag_a)?;
-        \\        let _ = inner_owned.tag;
+        \\        _ = fallible_step(flag_a)?;
+        \\        _ = inner_owned.tag;
         \\    }
         \\    let outer_owned = GuardedRes { tag: 2 };
         \\    let v_b: i32 = fallible_step(flag_b)?;
@@ -14634,13 +14634,13 @@ test "test_phase6_mir_intrinsics_vacated_windows_and_subscript_defer" {
         \\    @drop_trace(42);
         \\    var trace_log: i32 = 0;
         \\    {
-        \\        let _ = &boxes.*[&mut trace_log, 0];
+        \\        _ = &boxes.*[&mut trace_log, 0];
         \\    }
         \\    boxes.*[&mut trace_log, 1] = NonCopyBox { data: Vec { len: 2 } };
-        \\    let _ = maybe_u8;
-        \\    let _ = casted_u64;
-        \\    let _ = decoded_hdr;
-        \\    let _ = viewed_hdr;
+        \\    _ = maybe_u8;
+        \\    _ = casted_u64;
+        \\    _ = decoded_hdr;
+        \\    _ = viewed_hdr;
         \\    return hdr_bytes[0] as u32;
         \\}
     ;

@@ -5,6 +5,7 @@
 //!
 //! On macOS, userland binaries link against `libSystem` rather than invoking unstable raw traps;
 //! safe stream helpers route through `@sys_write` and `@sys_exit`.
+
 // --------------------------------------- CONSTS ----------------------------------------
 /// Darwin standard input file descriptor (`0`).
 pub const STDIN_FILENO: i32 = 0;

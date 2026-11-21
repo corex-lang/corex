@@ -1558,7 +1558,7 @@ test "test_parser_dr22_visibility_zones_subscript_test_bench_fsm_and_e0219_throu
         \\    let magic_bytes = b"CX22";
         \\    let base_grid = Grid { cells: [0.0_f32; 4] };
         \\    let next_grid = Grid { ..own base_grid };
-        \\    let _ = (ui_body, header_byte, magic_bytes, next_grid);
+        \\    _ = (ui_body, header_byte, magic_bytes, next_grid);
         \\    let code = fsm: match StepOrder.Relaxed {
         \\        .Relaxed => continue :fsm .Acquire,
         \\        .Acquire => 42_i32,
@@ -1567,10 +1567,10 @@ test "test_parser_dr22_visibility_zones_subscript_test_bench_fsm_and_e0219_throu
         \\}
         \\test "grid multi-index smoke" {
         \\    let grid = Grid { cells: [1.0_f32; 4] };
-        \\    let _ = &grid[0, 1];
+        \\    _ = &grid[0, 1];
         \\}
         \\bench "grid swap bench" (bencher: &mut Bencher) {
-        \\    let _ = bencher;
+        \\    _ = bencher;
         \\}
     ;
     try expectCleanParse(valid_dr22_src, &ast_arena, &cst_arena);
@@ -1593,7 +1593,7 @@ test "test_parser_dr22_visibility_zones_subscript_test_bench_fsm_and_e0219_throu
         \\fn legacy_fn(mut self, /, *, val: inout i32, *) {
         \\    let mut flag = !true || false;
         \\    let derefed = *val;
-        \\    let _ = (flag, derefed);
+        \\    _ = (flag, derefed);
         \\}
     ;
     _ = try corex.parseSource(
@@ -1625,5 +1625,255 @@ test "test_parser_dr22_visibility_zones_subscript_test_bench_fsm_and_e0219_throu
     }
     for (seen_codes) |is_seen| {
         try std.testing.expect(is_seen);
+    }
+}
+
+// ----------- Phase 10.6 (DR-23) Surface Diagnostics -----------
+
+test "test_parser_dr23_doc_attachment_impl_elif_discard_and_colon_diagnostics" {
+    // [1] Positive `ADR-23A` & `ADR-23E`; top-of-file `//!`, valid `///` attachments, and `_ = expr;`:
+    const valid_dr23_src =
+        \\//! Canonical Phase 10.6 module header (`ADR-23A`).
+        \\
+        \\use cx.mem.size_of_type;
+        \\
+        \\/// Child module declaration.
+        \\pub mod child;
+        \\/// Module-level constant.
+        \\pub const RING_SLOTS: usize = 8;
+        \\/// Type alias declaration.
+        \\pub type SlotIdx = u32;
+        \\/// Contiguous struct declaration.
+        \\pub struct PairSlot {
+        \\    /// First 32-bit lane.
+        \\    pub first_lane: u32,
+        \\    /// Second 32-bit lane.
+        \\    pub second_lane: u32,
+        \\}
+        \\/// Tagged enum declaration.
+        \\pub enum SlotState: u8 {
+        \\    /// Empty slot state.
+        \\    Empty = 0,
+        \\    /// Populated slot state.
+        \\    Ready = 1,
+        \\}
+        \\/// Packed hardware bitfield declaration.
+        \\pub bit_field CtrlWord: u16 {
+        \\    /// Active enable bit.
+        \\    pub enabled: bool | 1,
+        \\    /// Remaining payload bits.
+        \\    pub rest: u16 | 15,
+        \\}
+        \\/// Raw C-compatible union declaration.
+        \\pub union WordBits {
+        \\    /// Unsigned integer view.
+        \\    pub word: u32,
+        \\    /// Floating-point view.
+        \\    pub ratio: f32,
+        \\}
+        \\/// Trait contract declaration.
+        \\pub trait Inspectable {
+        \\    /// Returns slot score.
+        \\    fn score(&self) -> u32;
+        \\}
+        \\/// Foreign block declaration.
+        \\extern "C" {
+        \\    /// Foreign status poll prototype.
+        \\    fn c_poll_status() -> i32;
+        \\}
+        \\/// Foreign standalone function declaration.
+        \\extern "C" fn c_fast_nop() -> i32;
+        \\/// Inherent implementation block.
+        \\impl PairSlot {
+        \\    /// Computes lane sum.
+        \\    pub fn sum(&self) -> u32 = self.first_lane + self.second_lane;
+        \\    /// Projects lane by index.
+        \\    pub subscript(idx: usize) -> u32 {
+        \\        let { yield self.first_lane; }
+        \\        inout { yield &mut self.first_lane; }
+        \\    }
+        \\}
+        \\/// Standalone function exercising canonical `_ =` and partial destructuring.
+        \\pub fn exercise_discards(pair_in: (u32, u32)) -> u32 {
+        \\    let (bound_first, _) = pair_in;
+        \\    var mut_lane: u32 = 0;
+        \\    (mut_lane, _) = pair_in;
+        \\    _ = size_of_type[PairSlot]();
+        \\    return bound_first + mut_lane;
+        \\}
+        \\/// Prose unit test item.
+        \\test "dr23 doc attachment smoke" {
+        \\    _ = exercise_discards((1, 2));
+        \\}
+        \\/// Prose microbenchmark item.
+        \\bench "dr23 discard bench" (bencher: &mut Bencher) {
+        \\    _ = bencher;
+        \\}
+    ;
+    {
+        var ok_cst = LosslessCstArena.init(std.testing.allocator);
+        defer ok_cst.deinit();
+        var ok_ast = AstArena.init(std.testing.allocator);
+        defer ok_ast.deinit();
+        try expectCleanParse(valid_dr23_src, &ok_ast, &ok_cst);
+    }
+
+    // [2] Table-driven verification of `E0229`–`E0236` diagnostics and lossless CST/AST recovery:
+    const negative_cases = [_]struct {
+        /// Input `.cx` source snippet expected to emit `expected_code`.
+        source: []const u8,
+        /// Target Phase 10.6 diagnostic code under verification.
+        expected_code: DiagnosticCode,
+        /// Minimum number of occurrences of `expected_code` expected in `sink`.
+        min_hits: usize = 1,
+    }{
+        // `E0229`; mid-file `//!` after an item and `//!` inside `mod inner { … }`:
+        .{
+            .source = "pub const SEED: u32 = 1;\n//! misplaced module doc\npub fn after() {}\n",
+            .expected_code = .e0229_misplaced_module_doc_comment,
+        },
+        .{
+            .source = "pub mod inner {\n    //! inner module doc forbidden\n    pub fn f() {}\n}\n",
+            .expected_code = .e0229_misplaced_module_doc_comment,
+        },
+        // `E0230`; `///` before `use`, local `let`, blank line, `//` comment, and `EOF`:
+        .{
+            .source = "/// doc on use\nuse cx.mem;\npub fn f() {}\n",
+            .expected_code = .e0230_unattached_doc_comment,
+        },
+        .{
+            .source = "pub fn f() -> i32 {\n    /// doc on local let\n    let local_x = 1;\n    return local_x;\n}\n",
+            .expected_code = .e0230_unattached_doc_comment,
+        },
+        .{
+            .source = "/// detached by blank line\n\npub fn f() {}\n",
+            .expected_code = .e0230_unattached_doc_comment,
+        },
+        .{
+            .source = "/// detached by line comment\n// ordinary comment\npub fn f() {}\n",
+            .expected_code = .e0230_unattached_doc_comment,
+        },
+        .{
+            .source = "pub fn f() {}\n/// trailing eof doc comment\n",
+            .expected_code = .e0230_unattached_doc_comment,
+        },
+        // `E0231`; visibility modifier on `impl` block:
+        .{
+            .source = "pub struct Foo { pub x: u32 }\npub impl Foo {}\n",
+            .expected_code = .e0231_visibility_on_impl_block,
+        },
+        // `E0232`; inline `fn` and `subscript` inside `struct`, `enum`, `bit_field`, and `union`:
+        .{
+            .source =
+            \\pub struct InlineStruct {
+            \\    pub val: u32,
+            \\    pub fn get(&self) -> u32 = self.val;
+            \\    pub subscript(idx: usize) -> u32 { let { yield self.val; } }
+            \\}
+            \\pub enum InlineEnum: u8 {
+            \\    Idle = 0,
+            \\    pub fn is_idle(&self) -> bool = true;
+            \\}
+            \\pub bit_field InlineBits: u8 {
+            \\    pub flag: bool | 1,
+            \\    pub rest: u8 | 7,
+            \\    pub fn check(&self) -> bool = self.flag;
+            \\}
+            \\pub union InlineUnion {
+            \\    pub raw: u32,
+            \\    pub fn read_raw(&self) -> u32 = 0;
+            \\}
+            ,
+            .expected_code = .e0232_inline_method_in_type_decl,
+            .min_hits = 5,
+        },
+        // `E0233`; `elif`, `elsif`, and `elseif` conditional recovery:
+        .{
+            .source =
+            \\pub fn branch_tier(code: u32) -> u32 {
+            \\    if code == 0 {
+            \\        return 10;
+            \\    } elif code == 1 {
+            \\        return 20;
+            \\    } elsif code == 2 {
+            \\        return 30;
+            \\    } elseif code == 3 {
+            \\        return 40;
+            \\    } else {
+            \\        return 50;
+            \\    }
+            \\}
+            ,
+            .expected_code = .e0233_invalid_elif_keyword,
+            .min_hits = 3,
+        },
+        // `E0234`; non-binding `let _ =`, `var _ =`, `let _: u32 =`, and `let (_, _) =`:
+        .{
+            .source =
+            \\pub fn retired_discards(pair: (u32, u32)) {
+            \\    let _ = 1_u32;
+            \\    var _ = 2_u32;
+            \\    let _: u32 = 3_u32;
+            \\    let (_, _) = pair;
+            \\}
+            ,
+            .expected_code = .e0234_non_binding_wildcard_let_var,
+            .min_hits = 4,
+        },
+        // `E0235`; all-wildcard compound assignment `(_, _) = pair;` and `Point { .. } = pt;`:
+        .{
+            .source =
+            \\pub struct Point { pub x: i32, pub y: i32 }
+            \\pub fn wildcard_assigns(pair: (i32, i32), pt: Point) {
+            \\    (_, _) = pair;
+            \\    Point { .. } = pt;
+            \\}
+            ,
+            .expected_code = .e0235_all_wildcard_destructuring_assign,
+            .min_hits = 2,
+        },
+        // `E0236`; missing `:` before type annotation in params, `let`, and closures:
+        .{
+            .source =
+            \\pub fn missing_colons(left_val u32, ptr *mut u8) -> u32 {
+            \\    let count usize = 0;
+            \\    let mapper = |item_v u32| item_v + 1_u32;
+            \\    _ = (ptr, count);
+            \\    return mapper(left_val);
+            \\}
+            ,
+            .expected_code = .e0236_missing_colon_before_type,
+            .min_hits = 4,
+        },
+    };
+
+    for (negative_cases, 0..) |tc, case_i| {
+        var token_buf = TokenBuffer.init(std.testing.allocator);
+        defer token_buf.deinit();
+        var cst_arena = LosslessCstArena.init(std.testing.allocator);
+        defer cst_arena.deinit();
+        var ast_arena = AstArena.init(std.testing.allocator);
+        defer ast_arena.deinit();
+        var sink = DiagnosticSink.init(std.testing.allocator);
+        defer sink.deinit();
+        var interner = try StringInterner.init(std.testing.allocator);
+        defer interner.deinit();
+
+        _ = try corex.parseSource(
+            tc.source,
+            FileId.fromInt(@intCast(50 + case_i)),
+            &token_buf,
+            &cst_arena,
+            &ast_arena,
+            &sink,
+            &interner,
+        );
+        try expectValidCstAndAstInvariants(tc.source, &token_buf, &cst_arena, &ast_arena);
+
+        var hit_count: usize = 0;
+        for (sink.asSlice()) |diag_item| {
+            if (diag_item.code == tc.expected_code) hit_count += 1;
+        }
+        try std.testing.expect(hit_count >= tc.min_hits);
     }
 }

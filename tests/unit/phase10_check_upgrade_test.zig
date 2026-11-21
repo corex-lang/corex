@@ -534,7 +534,7 @@ test "test_cli_upgrade_list_explain_surgical_rule_check_and_accept_caps" {
     defer list_res.deinit(allocator);
     try std.testing.expectEqual(@as(u8, 0), list_res.exit_code);
     try std.testing.expect(
-        std.mem.indexOf(u8, list_res.stdout, "✓ 15 canonical Zero-Legacy upgrade rules registered") != null,
+        std.mem.indexOf(u8, list_res.stdout, "✓ 22 canonical Zero-Legacy upgrade rules registered") != null,
     );
     for (corex.UPGRADE_RULE_CATALOG) |rule_entry| {
         try std.testing.expect(std.mem.indexOf(u8, list_res.stdout, rule_entry.rule_code) != null);
@@ -927,8 +927,8 @@ test "test_phase10_w0202_precedence_ur2204_array_multifile_upgrade_and_accept_ca
         "    pub tag_id: u32;\n" ++
         "}\n\n" ++
         "pub fn inspect_ptrs(ro_ptr: *u8, rw_ptr: *mut u8) -> usize {\n" ++
-        "    let _ = ro_ptr;\n" ++
-        "    let _ = rw_ptr;\n" ++
+        "    _ = ro_ptr;\n" ++
+        "    _ = rw_ptr;\n" ++
         "    return 16;\n" ++
         "}\n\n" ++
         "pub fn pass_array_ptrs() -> usize {\n" ++
@@ -1152,8 +1152,8 @@ test "test_phase10_w0202_precedence_ur2204_array_multifile_upgrade_and_accept_ca
     const interp_src =
         "pub mod tag_mod {\n" ++
         "    pub fn pick(first_s: str, second_b: &[u8]) -> i32 {\n" ++
-        "        let _ = first_s;\n" ++
-        "        let _ = second_b;\n" ++
+        "        _ = first_s;\n" ++
+        "        _ = second_b;\n" ++
         "        return 7;\n" ++
         "    }\n" ++
         "}\n\n" ++
@@ -1208,4 +1208,155 @@ test "test_phase10_w0202_precedence_ur2204_array_multifile_upgrade_and_accept_ca
     );
     defer interp_chk_res.deinit(allocator);
     try std.testing.expectEqual(@as(u8, 0), interp_chk_res.exit_code);
+}
+
+test "test_phase106_dr23_upgrade_rules_ur2300_through_ur2306_end_to_end" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const scratch_dir = try createScratchDir(allocator, io, "dr23_upgrade_e2e");
+    defer cleanupScratchDir(allocator, io, scratch_dir);
+
+    const home_dir = try std.fmt.allocPrint(allocator, "{s}/home", .{scratch_dir});
+    defer allocator.free(home_dir);
+    try std.Io.Dir.cwd().createDirPath(io, home_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("COREX_HOME", home_dir);
+
+    // [1] Verify `--explain` renders `Before:` / `After:` cards for all 7 `UR-23-00`–`UR-23-06` rules:
+    const dr23_codes = [_][]const u8{
+        "UR-23-00",
+        "UR-23-01",
+        "UR-23-02",
+        "UR-23-03",
+        "UR-23-04",
+        "UR-23-05",
+        "UR-23-06",
+    };
+    for (dr23_codes) |rule_code| {
+        const explain_arg = try std.fmt.allocPrint(allocator, "--explain={s}", .{rule_code});
+        defer allocator.free(explain_arg);
+        var exp_res = try runCliCaptured(
+            allocator,
+            io,
+            &env_map,
+            &.{ "--color=never", "upgrade", explain_arg },
+        );
+        defer exp_res.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0), exp_res.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, exp_res.stdout, rule_code) != null);
+        try std.testing.expect(std.mem.indexOf(u8, exp_res.stdout, "Before:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, exp_res.stdout, "After:") != null);
+    }
+
+    // [2] Combined pre-`DR-23` showcase exercising `UR-23-00` through `UR-23-06` into zero-error CoreX:
+    const pre_dr23_showcase =
+        "/*!\n" ++
+        " * Legacy block module header converted by UR-23-00.\n" ++
+        " */\n" ++
+        "pub mod sub_mod {\n" ++
+        "    //! Inner module doc hoisted above mod by UR-23-01.\n" ++
+        "    pub fn base_seed() -> U32 = 10_u32;\n" ++
+        "}\n\n" ++
+        "/**\n" ++
+        " * Descriptor struct with inline method extracted by UR-23-03.\n" ++
+        " */\n" ++
+        "pub struct SlotBox {\n" ++
+        "    pub count: UInt32,\n" ++
+        "    pub active: Bool,\n\n" ++
+        "    @must_use\n" ++
+        "    pub fn classify(&self) -> U32 {\n" ++
+        "        if not self.active {\n" ++
+        "            return 0_u32;\n" ++
+        "        } elif self.count > 10_u32 {\n" ++
+        "            return 2_u32;\n" ++
+        "        } elsif self.count > 5_u32 {\n" ++
+        "            return 1_u32;\n" ++
+        "        } else {\n" ++
+        "            return 3_u32;\n" ++
+        "        }\n" ++
+        "    }\n" ++
+        "}\n\n" ++
+        "/// Detached doc comment healed by UR-23-01.\n\n" ++
+        "pub fn unit_fn() {}\n\n" ++
+        "pub fn fallible_unit(flag Bool) -> unit!U32 {\n" ++
+        "    if not flag {\n" ++
+        "        return .Err(1_u32);\n" ++
+        "    }\n" ++
+        "    return .Ok(());\n" ++
+        "}\n\n" ++
+        "pub fn fallible_val(seed U32) -> U32!U32 {\n" ++
+        "    return .Ok(seed + 1_u32);\n" ++
+        "}\n\n" ++
+        "pub impl SlotBox {\n" ++
+        "    pub fn run_all(x U32) -> U32 {\n" ++
+        "        //! Mid-body module doc downgraded by UR-23-01.\n" ++
+        "        let slot = SlotBox { count: x, active: true };\n" ++
+        "        let bonus USize = 4_usize;\n" ++
+        "        let _ = unit_fn();\n" ++
+        "        let _ = fallible_unit(true);\n" ++
+        "        let _ = fallible_val(x);\n" ++
+        "        let _ = slot.classify();\n" ++
+        "        return sub_mod.base_seed() + (bonus as u32);\n" ++
+        "    }\n" ++
+        "}\n";
+
+    const showcase_path = try writeScratchFile(allocator, io, scratch_dir, "dr23_showcase.cx", pre_dr23_showcase);
+    defer allocator.free(showcase_path);
+
+    var pre_upg_check = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "upgrade", "--check", showcase_path },
+    );
+    defer pre_upg_check.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), pre_upg_check.exit_code);
+
+    var run_upg = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "upgrade", showcase_path },
+    );
+    defer run_upg.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), run_upg.exit_code);
+
+    const upgraded_src = try readDiskFileAlloc(allocator, io, showcase_path);
+    defer allocator.free(upgraded_src);
+    try std.testing.expect(std.mem.startsWith(u8, upgraded_src, "//! Legacy block module header"));
+    try std.testing.expect(std.mem.indexOf(u8, upgraded_src, "/**") == null);
+    try std.testing.expect(std.mem.indexOf(u8, upgraded_src, "/*!") == null);
+    try std.testing.expect(std.mem.indexOf(u8, upgraded_src, "pub impl") == null);
+    try std.testing.expect(std.mem.indexOf(u8, upgraded_src, " elif ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, upgraded_src, " elsif ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, upgraded_src, "else if") != null);
+    try std.testing.expect(std.mem.indexOf(u8, upgraded_src, "let _ =") == null);
+    try std.testing.expect(std.mem.indexOf(u8, upgraded_src, "UInt32") == null);
+    try std.testing.expect(std.mem.indexOf(u8, upgraded_src, "Bool") == null);
+    try std.testing.expect(std.mem.indexOf(u8, upgraded_src, "USize") == null);
+    try std.testing.expect(std.mem.indexOf(u8, upgraded_src, "x: u32") != null);
+
+    var strict_check = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--deny-warnings", showcase_path },
+    );
+    defer strict_check.deinit(allocator);
+    if (strict_check.exit_code != 0) {
+        std.debug.print("Upgraded DR-23 source:\n{s}\nStderr:\n{s}\n", .{ upgraded_src, strict_check.stderr });
+    }
+    try std.testing.expectEqual(@as(u8, 0), strict_check.exit_code);
+
+    var post_upg_check = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "upgrade", "--check", showcase_path },
+    );
+    defer post_upg_check.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), post_upg_check.exit_code);
 }

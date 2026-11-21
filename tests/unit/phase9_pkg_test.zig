@@ -2463,7 +2463,7 @@ test "test_phase9_sandbox_escalation_cas_tamper_and_edge_cases" {
                 "pub struct Guard {\n    pub v: i32,\n}\n" ++
                 "impl Drop for Guard {\n" ++
                 "    fn drop(&mut self) {\n" ++
-                "        let _ = unsafe { raw_ping() };\n" ++
+                "        _ = unsafe { raw_ping() };\n" ++
                 "    }\n" ++
                 "}\n",
             "extern \"C\" fn raw_env() -> i32;\n" ++

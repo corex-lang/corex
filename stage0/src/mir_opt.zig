@@ -9127,22 +9127,22 @@ test "test_mir_opt_r6_icf_never_folds_distinct_aggregates_indices_or_struct_fiel
         \\}
         \\
         \\pub fn make_pair_alpha(first: i64, second: i64, shared: i64) -> [i64; 2] {
-        \\    let _ = second;
+        \\    _ = second;
         \\    return [first, shared];
         \\}
         \\
         \\pub fn make_pair_beta(first: i64, second: i64, shared: i64) -> [i64; 2] {
-        \\    let _ = first;
+        \\    _ = first;
         \\    return [second, shared];
         \\}
         \\
         \\pub fn load_idx_alpha(arr: &[i64; 4], idx_a: usize, idx_b: usize) -> i64 {
-        \\    let _ = idx_b;
+        \\    _ = idx_b;
         \\    return arr[idx_a];
         \\}
         \\
         \\pub fn load_idx_beta(arr: &[i64; 4], idx_a: usize, idx_b: usize) -> i64 {
-        \\    let _ = idx_a;
+        \\    _ = idx_a;
         \\    return arr[idx_b];
         \\}
         \\
@@ -9220,7 +9220,7 @@ test "test_mir_opt_d5_monomorphize_preserves_type_name_and_interior_field_signed
 
     const source =
         \\pub fn type_label[T](val: T) -> str {
-        \\    let _ = val;
+        \\    _ = val;
         \\    return @type_name[T]();
         \\}
         \\
@@ -9995,7 +9995,7 @@ test "test_mir_opt_d5_asyncmono_specializes_sync_callees_size_of_and_rejects_pol
         \\
         \\async fn generic_async[T](val: T) -> usize {
         \\    let echoed = sync_id(val);
-        \\    let _ = echoed;
+        \\    _ = echoed;
         \\    yield_now().await;
         \\    return @size_of[T]();
         \\}

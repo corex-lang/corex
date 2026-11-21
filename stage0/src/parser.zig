@@ -269,6 +269,29 @@ const RETIRED_PARAM_MODE_MAP = std.StaticStringMap(RetiredParamModeKind).initCom
     .{ "yielded", .yielded },
 });
 
+/// $O(1)$ static lookup map of foreign chained-conditional keywords (`ADR-23C`, `E0233`).
+const FOREIGN_ELIF_KEYWORD_MAP = std.StaticStringMap(void).initComptime(.{
+    .{ "elif", {} },
+    .{ "elseif", {} },
+    .{ "elsif", {} },
+});
+
+/// $O(1)$ static lookup map of foreign prefix type modifiers recognized by `E0236` missing-`:` recovery.
+const FOREIGN_TYPE_PREFIX_MODIFIER_MAP = std.StaticStringMap(void).initComptime(.{
+    .{ "any", {} },
+    .{ "distinct", {} },
+    .{ "dyn", {} },
+});
+
+/// $O(1)$ static lookup map of foreign lowercase scalar names recognized by `E0236` missing-`:` recovery.
+const FOREIGN_LOWERCASE_SCALAR_MAP = std.StaticStringMap(void).initComptime(.{
+    .{ "double", {} },
+    .{ "float", {} },
+    .{ "int", {} },
+    .{ "string", {} },
+    .{ "uint", {} },
+});
+
 // -------------------- Synchronization Sets --------------------
 
 /// Tokens that can legally begin a top-level `Item` after optional attributes and `pub`.
@@ -1240,6 +1263,7 @@ pub const Parser = struct {
         }
 
         self.cst.finishNode(root_cst, .{ .has_error = self.cst.has_parse_errors });
+        try self.validateFileDocComments(root_cst);
 
         if (item_indices.items.len > 0) {
             self.ast.nodes.items(.lhs)[root_ast.asInt()] = PackedOperand.initExtra(
@@ -1251,6 +1275,690 @@ pub const Parser = struct {
             };
         }
         return root_ast;
+    }
+
+    /// Trivia comment classification scanned directly from `self.source` (`ADR-23A`, `TRIVIA_FLAG_COALESCED`-safe).
+    const ScannedTriviaCommentKind = enum(u8) {
+        /// `//!` module header doc comment.
+        module_doc,
+        /// `///` (exact three slashes) outer declaration doc comment.
+        outer_doc,
+        /// Ordinary `//` (including `////`+) or `/* … */` comment.
+        ordinary_comment,
+    };
+
+    /// Single comment entry extracted from an inter-token trivia slice `[region_start .. region_end)`.
+    const ScannedTriviaComment = struct {
+        /// Classified comment kind.
+        kind: ScannedTriviaCommentKind,
+        /// Inclusive byte offset of `/` opening the comment.
+        start_byte: u32,
+        /// Exclusive byte offset at the end of the comment (before `\r`/`\n`).
+        end_byte: u32,
+        /// Count of line breaks (`\n` / `\r\n` / `\r`) between `end_byte` and the next comment or token.
+        newlines_after: u32,
+    };
+
+    /// Advances past a nested `/* … */` block comment in `src` starting at `open_pos`, tracking crossed line breaks.
+    fn skipNestedBlockCommentInSource(src: []const u8, open_pos: usize, limit: usize, crossed_newline: *bool) usize {
+        var pos = @min(open_pos + 2, limit);
+        var depth: u32 = 1;
+        while (pos < limit and depth > 0) {
+            const cur = src[pos];
+            if (cur == '/' and pos + 1 < limit and src[pos + 1] == '*') {
+                depth += 1;
+                pos += 2;
+            } else if (cur == '*' and pos + 1 < limit and src[pos + 1] == '/') {
+                depth -= 1;
+                pos += 2;
+            } else if (cur == '\r') {
+                crossed_newline.* = true;
+                pos += 1;
+                if (pos < limit and src[pos] == '\n') pos += 1;
+            } else if (cur == '\n') {
+                crossed_newline.* = true;
+                pos += 1;
+            } else {
+                pos += 1;
+            }
+        }
+        return pos;
+    }
+
+    /// Validates `ADR-23A` `//!` placement (`E0229`) and `///` declaration attachment (`E0230`) across `self.source`.
+    fn validateFileDocComments(self: *Parser, root_cst: CstNodeIndex) !void {
+        const sink = self.diagnostic_sink orelse return;
+        const total_tokens = self.token_buffer.countTokens();
+        if (total_tokens == 0) return;
+
+        const alloc = self.ast.allocator;
+        const is_doc_target = try alloc.alloc(bool, total_tokens);
+        defer alloc.free(is_doc_target);
+        @memset(is_doc_target, false);
+
+        const is_error_hole_tok = try alloc.alloc(bool, total_tokens);
+        defer alloc.free(is_error_hole_tok);
+        @memset(is_error_hole_tok, false);
+
+        const inline_mod_for_tok = try alloc.alloc(CstNodeIndex, total_tokens);
+        defer alloc.free(inline_mod_for_tok);
+        @memset(inline_mod_for_tok, .none);
+
+        const attr_head_for_decl_tok = try alloc.alloc(TokenIndex, total_tokens);
+        defer alloc.free(attr_head_for_decl_tok);
+        @memset(attr_head_for_decl_tok, .none);
+
+        const cst_count = self.cst.countNodes();
+        var cst_i: usize = 0;
+        while (cst_i < cst_count) : (cst_i += 1) {
+            const cst_id = CstNodeIndex.fromInt(@intCast(cst_i));
+            const rec = self.cst.getNode(cst_id);
+            const sub_end = @min(cst_i + @max(@as(usize, rec.subtree_size), 1), cst_count);
+
+            if (rec.kind == .invalid_parse_subtree) {
+                var sub_i = cst_i;
+                while (sub_i < sub_end) : (sub_i += 1) {
+                    const sub_rec = self.cst.getNode(CstNodeIndex.fromInt(@intCast(sub_i)));
+                    if (!sub_rec.token.isNone() and sub_rec.token.asInt() < total_tokens) {
+                        is_error_hole_tok[sub_rec.token.asInt()] = true;
+                    }
+                }
+                continue;
+            }
+
+            if (rec.kind.isDocumentable() and !rec.token.isNone() and rec.token.asInt() < total_tokens) {
+                is_doc_target[rec.token.asInt()] = true;
+                var attr_scan = cst_i + 1;
+                var has_leading_attr = false;
+                while (attr_scan < sub_end) {
+                    const attr_rec = self.cst.getNode(CstNodeIndex.fromInt(@intCast(attr_scan)));
+                    if (attr_rec.kind == .attribute) {
+                        has_leading_attr = true;
+                        attr_scan += @max(@as(usize, attr_rec.subtree_size), 1);
+                        continue;
+                    }
+                    if (has_leading_attr and !attr_rec.token.isNone() and
+                        attr_rec.token.asInt() < total_tokens and
+                        attr_rec.token != rec.token)
+                    {
+                        attr_head_for_decl_tok[attr_rec.token.asInt()] = rec.token;
+                    }
+                    break;
+                }
+            }
+
+            if (rec.kind == .mod_item) {
+                var sub_i = cst_i + 1;
+                while (sub_i < sub_end) : (sub_i += 1) {
+                    const sub_rec = self.cst.getNode(CstNodeIndex.fromInt(@intCast(sub_i)));
+                    const is_leaf = sub_rec.subtree_size <= 1 and !sub_rec.flags.is_bracketed;
+                    if (!is_leaf or sub_rec.flags.is_missing_or_injected or sub_rec.token.isNone()) continue;
+                    const t_idx = sub_rec.token.asInt();
+                    if (t_idx >= total_tokens) continue;
+                    const t_kind = self.token_buffer.getToken(sub_rec.token).kind;
+                    if (t_kind == .semi) break;
+                    if (t_kind == .lbrace) {
+                        const first_inner = self.skipCarrierRawIndex(t_idx + 1);
+                        if (first_inner < total_tokens) {
+                            inline_mod_for_tok[first_inner] = cst_id;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        const ast_count = self.ast.countNodes();
+        var ast_i: usize = 0;
+        while (ast_i < ast_count) : (ast_i += 1) {
+            const ast_id = NodeIndex.fromInt(@intCast(ast_i));
+            const tag = self.ast.getNode(ast_id).tag;
+            if (tag == .item_hole or tag == .stmt_hole) {
+                const orig_cst = self.ast.getCstOrigin(ast_id);
+                if (!orig_cst.isNone() and orig_cst.asInt() < cst_count) {
+                    const hole_start: usize = orig_cst.asInt();
+                    const hole_rec = self.cst.getNode(orig_cst);
+                    const hole_end = @min(hole_start + @max(@as(usize, hole_rec.subtree_size), 1), cst_count);
+                    var sub_i = hole_start;
+                    while (sub_i < hole_end) : (sub_i += 1) {
+                        const sub_rec = self.cst.getNode(CstNodeIndex.fromInt(@intCast(sub_i)));
+                        if (!sub_rec.token.isNone() and sub_rec.token.asInt() < total_tokens) {
+                            is_error_hole_tok[sub_rec.token.asInt()] = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        const has_outer_doc_on_tok = try alloc.alloc(bool, total_tokens);
+        defer alloc.free(has_outer_doc_on_tok);
+        @memset(has_outer_doc_on_tok, false);
+
+        var comments: std.ArrayListUnmanaged(ScannedTriviaComment) = .empty;
+        defer comments.deinit(alloc);
+
+        var has_emitted_doc_err = false;
+        var prev_tok_end: usize = 0;
+        var real_ordinal: usize = 0;
+        var tok_raw: usize = 0;
+
+        while (tok_raw < total_tokens) : (tok_raw += 1) {
+            const tok_id = TokenIndex.fromInt(@intCast(tok_raw));
+            const tok_rec = self.token_buffer.getToken(tok_id);
+            if (isCarrierToken(tok_rec)) continue;
+
+            const region_start: usize = @min(prev_tok_end, self.source.len);
+            const region_end: usize = @min(@as(usize, tok_rec.byte_offset), self.source.len);
+            defer {
+                prev_tok_end = @min(
+                    @as(usize, tok_rec.byte_offset) + @as(usize, tok_rec.byte_len),
+                    self.source.len,
+                );
+                real_ordinal += 1;
+            }
+            if (region_start >= region_end) continue;
+
+            var pos: usize = region_start;
+
+            // [1] Scan same-line trailing trivia belonging to `prev_tok` when `real_ordinal > 0`:
+            if (real_ordinal > 0) {
+                while (pos < region_end) {
+                    const ch = self.source[pos];
+                    if (ch == ' ' or ch == '\t') {
+                        pos += 1;
+                    } else if (ch == '\r') {
+                        pos += 1;
+                        if (pos < region_end and self.source[pos] == '\n') pos += 1;
+                        break;
+                    } else if (ch == '\n') {
+                        pos += 1;
+                        break;
+                    } else if (ch == '/' and pos + 1 < region_end and self.source[pos + 1] == '*') {
+                        var crossed_nl = false;
+                        pos = skipNestedBlockCommentInSource(self.source, pos, region_end, &crossed_nl);
+                        if (crossed_nl) break;
+                    } else if (ch == '/' and pos + 1 < region_end and self.source[pos + 1] == '/') {
+                        const c_start: u32 = @intCast(pos);
+                        const is_mod_doc = pos + 2 < region_end and self.source[pos + 2] == '!';
+                        const is_item_doc = pos + 2 < region_end and
+                            self.source[pos + 2] == '/' and
+                            (pos + 3 >= region_end or self.source[pos + 3] != '/');
+                        pos += 2;
+                        while (pos < region_end and self.source[pos] != '\n' and self.source[pos] != '\r') {
+                            pos += 1;
+                        }
+                        const c_end: u32 = @intCast(pos);
+                        if (is_mod_doc) {
+                            has_emitted_doc_err = true;
+                            try self.emitDiagnosticWithFix(
+                                .e0229_misplaced_module_doc_comment,
+                                Span.init(self.file_id, c_start, c_end),
+                                "module doc comment `//!` is only allowed at the very top of a `.cx` file",
+                                "trailing same-line `//!` comment is not allowed here",
+                                Span.init(self.file_id, c_start, c_start + 3),
+                                "//",
+                                "convert `//!` to an ordinary `//` comment",
+                            );
+                        } else if (is_item_doc) {
+                            has_emitted_doc_err = true;
+                            try self.emitDiagnosticWithFix(
+                                .e0230_unattached_doc_comment,
+                                Span.init(self.file_id, c_start, c_end),
+                                "trailing same-line `///` doc comment does not document any declaration",
+                                "unattached trailing `///` comment; write `//` for end-of-line comments",
+                                Span.init(self.file_id, c_start, c_start + 3),
+                                "//",
+                                "convert `///` to an ordinary `//` comment",
+                            );
+                        }
+                        if (pos < region_end and self.source[pos] == '\r') {
+                            pos += 1;
+                            if (pos < region_end and self.source[pos] == '\n') pos += 1;
+                        } else if (pos < region_end and self.source[pos] == '\n') {
+                            pos += 1;
+                        }
+                        break;
+                    } else {
+                        pos += 1;
+                    }
+                }
+            } else if (pos == 0) {
+                if (region_end >= 3 and
+                    self.source[0] == 0xEF and
+                    self.source[1] == 0xBB and
+                    self.source[2] == 0xBF)
+                {
+                    pos = 3;
+                }
+                if (pos + 1 < region_end and self.source[pos] == '#' and self.source[pos + 1] == '!') {
+                    pos += 2;
+                    while (pos < region_end and self.source[pos] != '\n' and self.source[pos] != '\r') {
+                        pos += 1;
+                    }
+                    if (pos < region_end and self.source[pos] == '\r') {
+                        pos += 1;
+                        if (pos < region_end and self.source[pos] == '\n') pos += 1;
+                    } else if (pos < region_end and self.source[pos] == '\n') {
+                        pos += 1;
+                    }
+                }
+            }
+
+            // [2] Collect leading comments in `[pos .. region_end)`:
+            comments.clearRetainingCapacity();
+            while (pos < region_end) {
+                const ch = self.source[pos];
+                if (ch == ' ' or ch == '\t') {
+                    pos += 1;
+                } else if (ch == '\r') {
+                    pos += 1;
+                    if (pos < region_end and self.source[pos] == '\n') pos += 1;
+                    if (comments.items.len > 0) comments.items[comments.items.len - 1].newlines_after += 1;
+                } else if (ch == '\n') {
+                    pos += 1;
+                    if (comments.items.len > 0) comments.items[comments.items.len - 1].newlines_after += 1;
+                } else if (ch == '/' and pos + 1 < region_end and self.source[pos + 1] == '*') {
+                    const c_start: u32 = @intCast(pos);
+                    var dummy_nl = false;
+                    pos = skipNestedBlockCommentInSource(self.source, pos, region_end, &dummy_nl);
+                    try comments.append(alloc, .{
+                        .kind = .ordinary_comment,
+                        .start_byte = c_start,
+                        .end_byte = @intCast(pos),
+                        .newlines_after = 0,
+                    });
+                } else if (ch == '/' and pos + 1 < region_end and self.source[pos + 1] == '/') {
+                    const c_start: u32 = @intCast(pos);
+                    const c_kind: ScannedTriviaCommentKind = if (pos + 2 < region_end and self.source[pos + 2] == '!')
+                        .module_doc
+                    else if (pos + 2 < region_end and
+                        self.source[pos + 2] == '/' and
+                        (pos + 3 >= region_end or self.source[pos + 3] != '/'))
+                        .outer_doc
+                    else
+                        .ordinary_comment;
+                    pos += 2;
+                    while (pos < region_end and self.source[pos] != '\n' and self.source[pos] != '\r') {
+                        pos += 1;
+                    }
+                    try comments.append(alloc, .{
+                        .kind = c_kind,
+                        .start_byte = c_start,
+                        .end_byte = @intCast(pos),
+                        .newlines_after = 0,
+                    });
+                } else {
+                    pos += 1;
+                }
+            }
+            if (comments.items.len == 0) continue;
+
+            // [3] Validate `E0229` (`//!` placement):
+            var e0229_scan_start: usize = 0;
+            const parent_mod_cst = inline_mod_for_tok[tok_raw];
+            if (!parent_mod_cst.isNone() and comments.items[0].kind == .module_doc) {
+                const mod_rec = self.cst.getNode(parent_mod_cst);
+                const mod_first_tok = mod_rec.token;
+                const can_hoist = !mod_first_tok.isNone() and
+                    mod_first_tok.asInt() < total_tokens and
+                    !has_outer_doc_on_tok[mod_first_tok.asInt()] and
+                    self.interner != null;
+                if (can_hoist) {
+                    var run_end: usize = 1;
+                    while (run_end < comments.items.len and
+                        comments.items[run_end].kind == .module_doc and
+                        comments.items[run_end - 1].newlines_after <= 1) : (run_end += 1)
+                    {}
+                    const first_mod_doc = comments.items[0];
+                    const last_mod_doc = comments.items[run_end - 1];
+                    const diag_span = Span.init(self.file_id, first_mod_doc.start_byte, last_mod_doc.end_byte);
+                    const mod_tok_byte: usize = @intCast(self.getTokenSpan(mod_first_tok).start_byte);
+                    var mod_line_start: usize = mod_tok_byte;
+                    while (mod_line_start > 0 and
+                        self.source[mod_line_start - 1] != '\n' and
+                        self.source[mod_line_start - 1] != '\r')
+                    {
+                        mod_line_start -= 1;
+                    }
+                    const mod_indent = self.source[mod_line_start..mod_tok_byte];
+
+                    const arena_alloc = sink.arena.asAllocator();
+                    var hoisted_buf: std.ArrayListUnmanaged(u8) = .empty;
+                    for (comments.items[0..run_end]) |doc_item| {
+                        try hoisted_buf.appendSlice(arena_alloc, mod_indent);
+                        try hoisted_buf.appendSlice(arena_alloc, "///");
+                        try hoisted_buf.appendSlice(
+                            arena_alloc,
+                            self.source[@intCast(doc_item.start_byte + 3)..@intCast(doc_item.end_byte)],
+                        );
+                        try hoisted_buf.append(arena_alloc, '\n');
+                    }
+
+                    var del_start: usize = @intCast(first_mod_doc.start_byte);
+                    while (del_start > region_start and
+                        (self.source[del_start - 1] == ' ' or self.source[del_start - 1] == '\t'))
+                    {
+                        del_start -= 1;
+                    }
+                    var del_end: usize = @intCast(last_mod_doc.end_byte);
+                    if (del_end < region_end and self.source[del_end] == '\r') {
+                        del_end += 1;
+                        if (del_end < region_end and self.source[del_end] == '\n') del_end += 1;
+                    } else if (del_end < region_end and self.source[del_end] == '\n') {
+                        del_end += 1;
+                    }
+
+                    if (mod_line_start <= del_start) {
+                        const str_interner = self.interner.?;
+                        const edits = try arena_alloc.alloc(TextEdit, 2);
+                        edits[0] = .{
+                            .file_id = self.file_id,
+                            .start_byte = @intCast(mod_line_start),
+                            .end_byte = @intCast(mod_line_start),
+                            .replacement_id = try str_interner.intern(hoisted_buf.items),
+                        };
+                        edits[1] = .{
+                            .file_id = self.file_id,
+                            .start_byte = @intCast(del_start),
+                            .end_byte = @intCast(del_end),
+                            .replacement_id = try str_interner.intern(""),
+                        };
+                        const fixes = try arena_alloc.alloc(SuggestedFix, 1);
+                        fixes[0] = .{
+                            .message = "hoist inner `//!` lines as outer `///` doc comments above `mod`",
+                            .applicability = .machine_applicable,
+                            .priority = .syntax_canonicalization,
+                            .edits = edits,
+                        };
+                        const labels = try arena_alloc.alloc(LabeledSpan, 1);
+                        labels[0] = .{
+                            .span = diag_span,
+                            .label = "`//!` is only valid at top of file; use outer `///` above inline `mod`",
+                            .style = .primary,
+                        };
+                        try sink.emit(.{
+                            .code = .e0229_misplaced_module_doc_comment,
+                            .severity = .err,
+                            .primary_span = diag_span,
+                            .message = "inner `//!` module doc comment is not allowed inside inline `mod` blocks (`ADR-23A`)",
+                            .labels = labels,
+                            .suggestions = fixes,
+                        });
+                        has_emitted_doc_err = true;
+                        e0229_scan_start = run_end;
+                    }
+                }
+            }
+
+            var has_seen_non_mod_doc_on_tok0 = false;
+            for (comments.items, 0..) |c_item, c_idx| {
+                if (c_item.kind != .module_doc) {
+                    has_seen_non_mod_doc_on_tok0 = true;
+                    continue;
+                }
+                if (c_idx < e0229_scan_start) continue;
+                if (real_ordinal == 0 and !has_seen_non_mod_doc_on_tok0) continue;
+
+                has_emitted_doc_err = true;
+                try self.emitDiagnosticWithFix(
+                    .e0229_misplaced_module_doc_comment,
+                    Span.init(self.file_id, c_item.start_byte, c_item.end_byte),
+                    "module doc comment `//!` may only appear at the top of a `.cx` file before any `///` or non-doc comment",
+                    "misplaced `//!` module doc comment",
+                    Span.init(self.file_id, c_item.start_byte, c_item.start_byte + 3),
+                    "//",
+                    "convert `//!` to an ordinary `//` comment",
+                );
+            }
+
+            // [4] Validate `E0230` (`///` attachment on contiguous outer-doc blocks):
+            var idx: usize = 0;
+            while (idx < comments.items.len) {
+                if (comments.items[idx].kind != .outer_doc) {
+                    idx += 1;
+                    continue;
+                }
+                var run_end = idx + 1;
+                while (run_end < comments.items.len and
+                    comments.items[run_end].kind == .outer_doc and
+                    comments.items[run_end - 1].newlines_after == 1) : (run_end += 1)
+                {}
+
+                const first_doc = comments.items[idx];
+                const last_doc = comments.items[run_end - 1];
+                const block_span = Span.init(self.file_id, first_doc.start_byte, last_doc.end_byte);
+                const is_final_block = (run_end == comments.items.len);
+
+                if (!is_final_block) {
+                    has_emitted_doc_err = true;
+                    try self.emitUnattachedDocBlockConvertFix(
+                        sink,
+                        block_span,
+                        comments.items[idx..run_end],
+                        "outer `///` doc comment is separated from its target declaration by a blank line or non-doc comment",
+                        "detached `///` doc comment",
+                    );
+                } else if (last_doc.newlines_after >= 2) {
+                    has_emitted_doc_err = true;
+                    const can_delete_blank = is_doc_target[tok_raw] and
+                        !is_error_hole_tok[tok_raw] and
+                        tok_rec.kind != .eof;
+                    if (can_delete_blank) {
+                        var first_nl_end: usize = @intCast(last_doc.end_byte);
+                        while (first_nl_end < region_end and
+                            (self.source[first_nl_end] == ' ' or self.source[first_nl_end] == '\t'))
+                        {
+                            first_nl_end += 1;
+                        }
+                        if (first_nl_end < region_end and self.source[first_nl_end] == '\r') {
+                            first_nl_end += 1;
+                            if (first_nl_end < region_end and self.source[first_nl_end] == '\n') first_nl_end += 1;
+                        } else if (first_nl_end < region_end and self.source[first_nl_end] == '\n') {
+                            first_nl_end += 1;
+                        }
+                        var tok_line_start: usize = region_end;
+                        while (tok_line_start > first_nl_end and
+                            (self.source[tok_line_start - 1] == ' ' or self.source[tok_line_start - 1] == '\t'))
+                        {
+                            tok_line_start -= 1;
+                        }
+                        if (first_nl_end < tok_line_start) {
+                            try self.emitDiagnosticWithFix(
+                                .e0230_unattached_doc_comment,
+                                block_span,
+                                "outer `///` doc comment cannot be separated from its declaration by a blank line (`ADR-23A`)",
+                                "blank line detaches `///` from the following declaration",
+                                Span.init(self.file_id, @intCast(first_nl_end), @intCast(tok_line_start)),
+                                "",
+                                "remove blank line after `///` doc comment",
+                            );
+                        } else {
+                            try self.emitUnattachedDocBlockConvertFix(
+                                sink,
+                                block_span,
+                                comments.items[idx..run_end],
+                                "outer `///` doc comment cannot be separated from its declaration by a blank line (`ADR-23A`)",
+                                "blank line detaches `///` from the following declaration",
+                            );
+                        }
+                    } else {
+                        try self.emitUnattachedDocBlockConvertFix(
+                            sink,
+                            block_span,
+                            comments.items[idx..run_end],
+                            "unattached `///` doc comment followed by a blank line does not document any declaration",
+                            "unattached `///` doc comment",
+                        );
+                    }
+                } else if (is_doc_target[tok_raw]) {
+                    has_outer_doc_on_tok[tok_raw] = true;
+                } else if (!attr_head_for_decl_tok[tok_raw].isNone() and !is_error_hole_tok[tok_raw]) {
+                    has_emitted_doc_err = true;
+                    const attr_first_tok = attr_head_for_decl_tok[tok_raw];
+                    const can_hoist_above_attr = attr_first_tok.asInt() < total_tokens and
+                        !has_outer_doc_on_tok[attr_first_tok.asInt()] and
+                        self.interner != null;
+                    if (can_hoist_above_attr) {
+                        const attr_tok_byte: usize = @intCast(self.getTokenSpan(attr_first_tok).start_byte);
+                        var attr_line_start: usize = attr_tok_byte;
+                        while (attr_line_start > 0 and
+                            self.source[attr_line_start - 1] != '\n' and
+                            self.source[attr_line_start - 1] != '\r')
+                        {
+                            attr_line_start -= 1;
+                        }
+                        const attr_indent = self.source[attr_line_start..attr_tok_byte];
+                        const arena_alloc = sink.arena.asAllocator();
+                        var hoisted_attr_doc: std.ArrayListUnmanaged(u8) = .empty;
+                        for (comments.items[idx..run_end]) |doc_item| {
+                            try hoisted_attr_doc.appendSlice(arena_alloc, attr_indent);
+                            try hoisted_attr_doc.appendSlice(
+                                arena_alloc,
+                                self.source[@intCast(doc_item.start_byte)..@intCast(doc_item.end_byte)],
+                            );
+                            try hoisted_attr_doc.append(arena_alloc, '\n');
+                        }
+                        var del_start: usize = @intCast(first_doc.start_byte);
+                        while (del_start > region_start and
+                            (self.source[del_start - 1] == ' ' or self.source[del_start - 1] == '\t'))
+                        {
+                            del_start -= 1;
+                        }
+                        var del_end: usize = @intCast(last_doc.end_byte);
+                        if (del_end < region_end and self.source[del_end] == '\r') {
+                            del_end += 1;
+                            if (del_end < region_end and self.source[del_end] == '\n') del_end += 1;
+                        } else if (del_end < region_end and self.source[del_end] == '\n') {
+                            del_end += 1;
+                        }
+                        if (attr_line_start <= del_start) {
+                            const str_interner = self.interner.?;
+                            const edits = try arena_alloc.alloc(TextEdit, 2);
+                            edits[0] = .{
+                                .file_id = self.file_id,
+                                .start_byte = @intCast(attr_line_start),
+                                .end_byte = @intCast(attr_line_start),
+                                .replacement_id = try str_interner.intern(hoisted_attr_doc.items),
+                            };
+                            edits[1] = .{
+                                .file_id = self.file_id,
+                                .start_byte = @intCast(del_start),
+                                .end_byte = @intCast(del_end),
+                                .replacement_id = try str_interner.intern(""),
+                            };
+                            const fixes = try arena_alloc.alloc(SuggestedFix, 1);
+                            fixes[0] = .{
+                                .message = "hoist `///` doc comments above `@attribute` annotations",
+                                .applicability = .machine_applicable,
+                                .priority = .syntax_canonicalization,
+                                .edits = edits,
+                            };
+                            const labels = try arena_alloc.alloc(LabeledSpan, 1);
+                            labels[0] = .{
+                                .span = block_span,
+                                .label = "place `///` doc comments above `@attribute` annotations",
+                                .style = .primary,
+                            };
+                            try sink.emit(.{
+                                .code = .e0230_unattached_doc_comment,
+                                .severity = .err,
+                                .primary_span = block_span,
+                                .message = "outer `///` doc comment must precede `@attribute` annotations (`ADR-23A`)",
+                                .labels = labels,
+                                .suggestions = fixes,
+                            });
+                        } else {
+                            try self.emitUnattachedDocBlockConvertFix(
+                                sink,
+                                block_span,
+                                comments.items[idx..run_end],
+                                "outer `///` doc comment must precede `@attribute` annotations (`ADR-23A`)",
+                                "place `///` doc comments above `@attribute` annotations",
+                            );
+                        }
+                    } else {
+                        try self.emitUnattachedDocBlockConvertFix(
+                            sink,
+                            block_span,
+                            comments.items[idx..run_end],
+                            "outer `///` doc comment must precede `@attribute` annotations (`ADR-23A`)",
+                            "place `///` doc comments above `@attribute` annotations",
+                        );
+                    }
+                } else if (!is_error_hole_tok[tok_raw]) {
+                    has_emitted_doc_err = true;
+                    try self.emitUnattachedDocBlockConvertFix(
+                        sink,
+                        block_span,
+                        comments.items[idx..run_end],
+                        "outer `///` doc comment does not precede a documentable declaration (`ADR-23A`)",
+                        "`///` cannot attach to `use`, `let`/`var`, statements, `}`, or end of file",
+                    );
+                }
+
+                idx = run_end;
+            }
+        }
+
+        if (has_emitted_doc_err) {
+            self.cst.has_parse_errors = true;
+            if (!root_cst.isNone() and root_cst.asInt() < self.cst.countNodes()) {
+                self.cst.nodes.items(.flags)[root_cst.asInt()].has_error = true;
+            }
+        }
+    }
+
+    /// Emits `E0230` on `block_span` with an atomic `SuggestedFix` converting every `///` line in `doc_lines` to `//`.
+    fn emitUnattachedDocBlockConvertFix(
+        self: *Parser,
+        sink: *DiagnosticSink,
+        block_span: Span,
+        doc_lines: []const ScannedTriviaComment,
+        message: []const u8,
+        label_text: []const u8,
+    ) !void {
+        const arena_alloc = sink.arena.asAllocator();
+        const labels = try arena_alloc.alloc(LabeledSpan, 1);
+        labels[0] = .{
+            .span = block_span,
+            .label = label_text,
+            .style = .primary,
+        };
+        if (self.interner) |str_interner| {
+            const slash_pair_id = try str_interner.intern("//");
+            const edits = try arena_alloc.alloc(TextEdit, doc_lines.len);
+            for (doc_lines, 0..) |line_item, i| {
+                edits[i] = .{
+                    .file_id = self.file_id,
+                    .start_byte = line_item.start_byte,
+                    .end_byte = line_item.start_byte + 3,
+                    .replacement_id = slash_pair_id,
+                };
+            }
+            const fixes = try arena_alloc.alloc(SuggestedFix, 1);
+            fixes[0] = .{
+                .message = "convert unattached `///` doc comment to ordinary `//` comment",
+                .applicability = .machine_applicable,
+                .priority = .syntax_canonicalization,
+                .edits = edits,
+            };
+            try sink.emit(.{
+                .code = .e0230_unattached_doc_comment,
+                .severity = .err,
+                .primary_span = block_span,
+                .message = message,
+                .labels = labels,
+                .suggestions = fixes,
+            });
+        } else {
+            try sink.emit(.{
+                .code = .e0230_unattached_doc_comment,
+                .severity = .err,
+                .primary_span = block_span,
+                .message = message,
+                .labels = labels,
+            });
+        }
     }
 
     /// Flushes any pending pure trivia carrier tokens at `self.cursor` into `self.cst`.
@@ -2332,7 +3040,48 @@ pub const Parser = struct {
             self.is_allowing_non_canonical_case = true;
         }
         defer self.is_allowing_non_canonical_case = saved_allow_case;
+        const vis_start_tok = self.peekTokenIndexNth(0);
+        const vis_cst_idx = self.cst.countNodes();
         const outer_vis = try self.parseVisibilityWithLevel(&has_error);
+        const vis_last_tok: TokenIndex = if (outer_vis != .private and self.cursor > 0)
+            TokenIndex.fromInt(self.cursor - 1)
+        else
+            vis_start_tok;
+
+        if (outer_vis != .private and
+            (self.peekKind() == .kw_impl or (self.peekKind() == .kw_unsafe and self.peekKindNth(1) == .kw_impl)))
+        {
+            has_error = true;
+            if (vis_cst_idx < self.cst.countNodes()) {
+                self.cst.nodes.items(.flags)[vis_cst_idx].has_error = true;
+            }
+            const vis_span = Span.init(
+                self.file_id,
+                self.getTokenSpan(vis_start_tok).start_byte,
+                self.getTokenSpan(vis_last_tok).end_byte,
+            );
+            const next_start = self.getTokenSpan(self.peekTokenIndexNth(0)).start_byte;
+            var del_end: u32 = vis_span.end_byte;
+            if (next_start > vis_span.end_byte and @as(usize, next_start) <= self.source.len) {
+                var is_horiz_ws = true;
+                for (self.source[vis_span.end_byte..next_start]) |ws_byte| {
+                    if (ws_byte != ' ' and ws_byte != '\t') {
+                        is_horiz_ws = false;
+                        break;
+                    }
+                }
+                if (is_horiz_ws) del_end = next_start;
+            }
+            try self.emitDiagnosticWithFix(
+                .e0231_visibility_on_impl_block,
+                vis_span,
+                "visibility modifier is not allowed on an `impl` block (`ADR-23B`); mark individual methods or items `pub` instead",
+                "redundant visibility modifier on `impl` block",
+                Span.init(self.file_id, vis_span.start_byte, del_end),
+                "",
+                "remove visibility modifier before `impl`",
+            );
+        }
 
         switch (self.peekKind()) {
             .kw_mod => return self.parseModItem(item_cst, &has_error),
@@ -2760,7 +3509,7 @@ pub const Parser = struct {
     ) anyerror!NodeIndex {
         self.cst.nodes.items(.kind)[item_cst.asInt()] = .const_item;
         const const_tok = try self.consumeLeaf(.const_introducer, .{});
-        _ = try self.expectIdentifierWithCasing(
+        const name_tok = try self.expectIdentifierWithCasing(
             .const_ident,
             .screaming_snake_case,
             has_error,
@@ -2770,6 +3519,10 @@ pub const Parser = struct {
         var type_op: PackedOperand = .NONE;
         if (self.peekKind() == .colon) {
             _ = try self.consumeLeaf(.token_leaf, .{});
+            type_op = PackedOperand.initNode(try self.parseType());
+        } else if (self.isUnambiguousMissingColonTypeStart(false)) {
+            has_error.* = true;
+            try self.emitMissingColonBeforeType(name_tok);
             type_op = PackedOperand.initNode(try self.parseType());
         }
 
@@ -2943,7 +3696,7 @@ pub const Parser = struct {
         defer field_nodes.deinit(self.ast.allocator);
 
         if (self.peekKind() == .lbrace) {
-            try self.parseStructFieldsBlock(&field_nodes, has_error);
+            try self.parseStructFieldsBlock(&field_nodes, if (is_union) "union" else "struct", has_error);
         } else if (self.peekKind() == .semi) {
             _ = try self.consumeLeaf(.token_leaf, .{});
         } else {
@@ -2971,15 +3724,144 @@ pub const Parser = struct {
         }, item_cst);
     }
 
+    /// Returns `true` if `peek(0)` starts an inline `[pub…] [async|unsafe|comptime|extern…] fn` or `[pub…] subscript`.
+    fn isInlineMethodInTypeBody(self: *const Parser) bool {
+        var off: usize = 0;
+        if (self.peekKindNth(off) == .kw_pub) {
+            off += 1;
+            if (self.peekKindNth(off) == .lparen) {
+                off += 1;
+                if (self.peekKindNth(off) != .rparen and self.peekKindNth(off) != .eof) off += 1;
+                if (self.peekKindNth(off) == .rparen) off += 1;
+            }
+        }
+        if (self.peekKindNth(off) == .kw_subscript) return true;
+        var steps: usize = 0;
+        while (steps < 6) : (steps += 1) {
+            switch (self.peekKindNth(off)) {
+                .kw_async, .kw_unsafe, .kw_comptime => off += 1,
+                .kw_extern => {
+                    off += 1;
+                    if (self.peekKindNth(off) == .string_lit) off += 1;
+                },
+                .kw_fn => return true,
+                else => return false,
+            }
+        }
+        return self.peekKindNth(off) == .kw_fn;
+    }
+
+    /// Consumes an illegal inline `fn` or `subscript` inside a nominal type body into `member_cst` and emits `E0232`.
+    fn recoverInlineMethodInTypeDecl(
+        self: *Parser,
+        member_cst: CstNodeIndex,
+        first_member_tok: TokenIndex,
+        container_kind: []const u8,
+        has_error: *bool,
+    ) !void {
+        has_error.* = true;
+        self.cst.nodes.items(.kind)[member_cst.asInt()] = .invalid_parse_subtree;
+
+        // Consume signature tokens up to body `{`, expression `=`, `;`, or enclosing `}`:
+        while (self.peekKind() != .eof and
+            self.peekKind() != .lbrace and
+            self.peekKind() != .eq and
+            self.peekKind() != .semi and
+            self.peekKind() != .rbrace)
+        {
+            const cur_kind = self.peekKind();
+            if (cur_kind == .lparen or cur_kind == .lbracket) {
+                const close_kind: TokenKind = if (cur_kind == .lparen) .rparen else .rbracket;
+                var depth: u32 = 1;
+                _ = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                while (self.peekKind() != .eof and depth > 0) {
+                    const inner = self.peekKind();
+                    if (inner == cur_kind) {
+                        depth += 1;
+                    } else if (inner == close_kind) {
+                        depth -= 1;
+                    } else if (inner == .rbrace and depth == 1) {
+                        break;
+                    }
+                    _ = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                }
+            } else {
+                _ = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+            }
+        }
+
+        // Consume `{ … }` block body, `= expr ;` body, or declaration `;`:
+        if (self.peekKind() == .lbrace) {
+            var brace_depth: u32 = 1;
+            _ = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+            while (self.peekKind() != .eof and brace_depth > 0) {
+                const inner = self.peekKind();
+                if (inner == .lbrace) {
+                    brace_depth += 1;
+                } else if (inner == .rbrace) {
+                    brace_depth -= 1;
+                }
+                _ = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+            }
+        } else if (self.peekKind() == .eq) {
+            _ = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+            var nested_depth: u32 = 0;
+            while (self.peekKind() != .eof) {
+                const inner = self.peekKind();
+                if (nested_depth == 0 and (inner == .semi or inner == .rbrace)) break;
+                if (inner == .lparen or inner == .lbracket or inner == .lbrace) {
+                    nested_depth += 1;
+                } else if (inner == .rparen or inner == .rbracket or inner == .rbrace) {
+                    if (nested_depth > 0) nested_depth -= 1;
+                }
+                _ = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+            }
+            if (self.peekKind() == .semi) {
+                _ = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+            }
+        } else if (self.peekKind() == .semi) {
+            _ = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+        }
+        if (self.peekKind() == .comma) {
+            _ = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+        }
+
+        const last_tok = if (self.cursor > 0) TokenIndex.fromInt(self.cursor - 1) else first_member_tok;
+        const member_span = Span.init(
+            self.file_id,
+            self.getTokenSpan(first_member_tok).start_byte,
+            self.getTokenSpan(last_tok).end_byte,
+        );
+        if (self.diagnostic_sink) |sink| {
+            const msg = try std.fmt.allocPrint(
+                sink.arena.asAllocator(),
+                "inline methods and `subscript` items are not allowed inside `{s}` bodies (`ADR-23B`); move them into an `impl` block",
+                .{container_kind},
+            );
+            try self.emitDiagnosticWithFix(
+                .e0232_inline_method_in_type_decl,
+                member_span,
+                msg,
+                "move this method or `subscript` into a separate `impl` block",
+                null,
+                null,
+                null,
+            );
+        }
+        self.cst.finishNode(member_cst, .{ .has_error = true });
+    }
+
     /// Parses `"{ " { StructField } "}"` into `field_nodes` and `self.cst`.
     fn parseStructFieldsBlock(
         self: *Parser,
         field_nodes: *std.ArrayList(u32),
+        container_kind: []const u8,
         has_error: *bool,
     ) anyerror!void {
         const open_brace = try self.consumeLeaf(.token_leaf, .{});
         while (self.peekKind() != .rbrace and self.peekKind() != .eof) {
             const loop_start = self.cursor;
+            const first_member_tok = self.peekTokenIndexNth(0);
             const field_cst = try self.startCstNode(.struct_field);
             var has_field_err = false;
 
@@ -2991,19 +3873,36 @@ pub const Parser = struct {
             defer self.is_allowing_non_canonical_case = saved_allow_field;
             try self.parseVisibility(&has_field_err);
 
+            if (self.isInlineMethodInTypeBody()) {
+                try self.recoverInlineMethodInTypeDecl(
+                    field_cst,
+                    first_member_tok,
+                    container_kind,
+                    has_error,
+                );
+                continue;
+            }
+
             if (isIdentifierKind(self.peekKind())) {
-                _ = try self.expectIdentifierWithCasing(
+                const field_tok = try self.expectIdentifierWithCasing(
                     .ident,
                     .snake_case,
                     &has_field_err,
                     "expected `snake_case` field name",
                 );
-                _ = try self.expectToken(
-                    .colon,
-                    &has_field_err,
-                    "expected `:` after struct field name",
-                    "expected `:` before field type",
-                );
+                if (self.peekKind() == .colon) {
+                    _ = try self.consumeLeaf(.token_leaf, .{});
+                } else if (self.isUnambiguousMissingColonTypeStart(false)) {
+                    has_field_err = true;
+                    try self.emitMissingColonBeforeType(field_tok);
+                } else {
+                    _ = try self.expectToken(
+                        .colon,
+                        &has_field_err,
+                        "expected `:` after struct field name",
+                        "expected `:` before field type",
+                    );
+                }
                 try field_nodes.append(self.ast.allocator, (try self.parseType()).asInt());
 
                 if (self.peekKind() == .eq) {
@@ -3133,6 +4032,7 @@ pub const Parser = struct {
         const open_brace = try self.consumeLeaf(.token_leaf, .{});
         while (self.peekKind() != .rbrace and self.peekKind() != .eof) {
             const loop_start = self.cursor;
+            const first_member_tok = self.peekTokenIndexNth(0);
             const member_cst = try self.startCstNode(.struct_field);
             var has_mem_err = false;
 
@@ -3144,19 +4044,36 @@ pub const Parser = struct {
             defer self.is_allowing_non_canonical_case = saved_allow_mem;
             try self.parseVisibility(&has_mem_err);
 
+            if (self.isInlineMethodInTypeBody()) {
+                try self.recoverInlineMethodInTypeDecl(
+                    member_cst,
+                    first_member_tok,
+                    "bit_field",
+                    has_error,
+                );
+                continue;
+            }
+
             if (isIdentifierKind(self.peekKind())) {
-                _ = try self.expectIdentifierWithCasing(
+                const mem_tok = try self.expectIdentifierWithCasing(
                     .ident,
                     .snake_case,
                     &has_mem_err,
                     "expected `snake_case` bit_field member name",
                 );
-                _ = try self.expectToken(
-                    .colon,
-                    &has_mem_err,
-                    "expected `:` after `bit_field` member name",
-                    "expected `:` here",
-                );
+                if (self.peekKind() == .colon) {
+                    _ = try self.consumeLeaf(.token_leaf, .{});
+                } else if (self.isUnambiguousMissingColonTypeStart(false)) {
+                    has_mem_err = true;
+                    try self.emitMissingColonBeforeType(mem_tok);
+                } else {
+                    _ = try self.expectToken(
+                        .colon,
+                        &has_mem_err,
+                        "expected `:` after `bit_field` member name",
+                        "expected `:` here",
+                    );
+                }
                 _ = try self.parseType();
                 if (self.peekKind() == .pipe) {
                     _ = try self.consumeLeaf(.token_leaf, .{});
@@ -3228,6 +4145,7 @@ pub const Parser = struct {
             const open_brace = try self.consumeLeaf(.token_leaf, .{});
             while (self.peekKind() != .rbrace and self.peekKind() != .eof) {
                 const loop_start = self.cursor;
+                const first_member_tok = self.peekTokenIndexNth(0);
                 const var_cst = try self.startCstNode(.enum_variant);
                 var has_var_err = false;
 
@@ -3237,6 +4155,15 @@ pub const Parser = struct {
                     self.is_allowing_non_canonical_case = true;
                 }
                 defer self.is_allowing_non_canonical_case = saved_allow_var;
+                if (self.isInlineMethodInTypeBody()) {
+                    try self.recoverInlineMethodInTypeDecl(
+                        var_cst,
+                        first_member_tok,
+                        "enum",
+                        has_error,
+                    );
+                    continue;
+                }
                 if (isIdentifierKind(self.peekKind())) {
                     _ = try self.expectIdentifierWithCasing(
                         .type_ident,
@@ -3268,7 +4195,7 @@ pub const Parser = struct {
                     } else if (self.peekKind() == .lbrace) {
                         var dummy_fields: std.ArrayList(u32) = .empty;
                         defer dummy_fields.deinit(self.ast.allocator);
-                        try self.parseStructFieldsBlock(&dummy_fields, &has_var_err);
+                        try self.parseStructFieldsBlock(&dummy_fields, "enum", &has_var_err);
                     }
 
                     if (self.peekKind() == .eq) {
@@ -4864,12 +5791,19 @@ pub const Parser = struct {
                             &has_param_err,
                             "expected `snake_case` parameter name",
                         );
-                    _ = try self.expectToken(
-                        .colon,
-                        &has_param_err,
-                        "expected `:` and parameter type after parameter name",
-                        "expected `:` here",
-                    );
+                    if (self.peekKind() == .colon) {
+                        _ = try self.consumeLeaf(.token_leaf, .{});
+                    } else if (self.isUnambiguousMissingColonTypeStart(false)) {
+                        has_param_err = true;
+                        try self.emitMissingColonBeforeType(name_tok);
+                    } else {
+                        _ = try self.expectToken(
+                            .colon,
+                            &has_param_err,
+                            "expected `:` and parameter type after parameter name",
+                            "expected `:` here",
+                        );
+                    }
                     try self.consumeRetiredPostColonParamMode(&has_param_err);
                     const ty_start_tok = self.peekTokenIndexNth(0);
                     _ = try self.parseType();
@@ -6347,11 +7281,21 @@ pub const Parser = struct {
             => {
                 return self.parseItem();
             },
+            .ident => {
+                if (self.isRecoveredElifBranchStart()) {
+                    const recovered_if = try self.parseRecoveredElifExpr();
+                    if (self.peekKind() == .rbrace or self.peekKind() == .eof) {
+                        is_tail_out.* = true;
+                    }
+                    return recovered_if;
+                }
+            },
             else => {},
         }
 
         // Expression, Assignment (`Expr AssignOp Expr ";"`), or `TailExpr`:
         try self.flushCarrierTokens();
+        const stmt_first_tok = self.peekTokenIndexNth(0);
         const stmt_cst_start = CstNodeIndex.fromInt(@intCast(self.cst.countNodes()));
         const stmt_ast_start = self.ast.countNodes();
 
@@ -6372,10 +7316,34 @@ pub const Parser = struct {
 
         if (isAssignOp(self.peekKind())) {
             const op_tok = self.peekTokenIndexNth(0);
+            const op_kind = self.peekKind();
             _ = try self.precedeNode(stmt_cst_start, stmt_ast_start, .assign_stmt, op_tok);
             _ = try self.consumeLeaf(.token_leaf, .{});
             const rhs_expr = try self.parseExpr(true);
             var has_assign_err = false;
+            if (op_kind == .eq and
+                expr_tag != .wildcard_pat and
+                (expr_tag == .tuple_lit or expr_tag == .array_lit or expr_tag == .struct_lit))
+            {
+                var has_lhs_hole = false;
+                const bound_leaves = self.countBoundAssignPlaceLeaves(expr_node, &has_lhs_hole, 0);
+                if (!has_lhs_hole and bound_leaves == 0) {
+                    has_assign_err = true;
+                    const lhs_start = self.getTokenSpan(stmt_first_tok).start_byte;
+                    const op_end = self.getTokenSpan(op_tok).end_byte;
+                    const discard_span = Span.init(self.file_id, lhs_start, op_end);
+                    const has_lhs_cmt = hasCommentMarkerInSlice(self.source, lhs_start, op_end);
+                    try self.emitDiagnosticWithFix(
+                        .e0235_all_wildcard_destructuring_assign,
+                        discard_span,
+                        "all-wildcard destructuring assignment binds zero places (`ADR-23E`); write bare `_ = expr;` instead",
+                        "destructuring assignment must bind at least one mutable place",
+                        discard_span,
+                        if (has_lhs_cmt) null else "_ =",
+                        "replace all-wildcard destructuring target with `_ =`",
+                    );
+                }
+            }
             if (self.peekKind() == .semi) {
                 _ = try self.consumeLeaf(.token_leaf, .{});
             } else {
@@ -6463,10 +7431,21 @@ pub const Parser = struct {
         }
 
         const pat_node = try self.parsePattern(true);
+        const pat_end_ast = self.ast.countNodes();
 
+        var has_type_ann = false;
         var rhs_op: PackedOperand = .NONE;
         if (self.peekKind() == .colon) {
+            has_type_ann = true;
             _ = try self.consumeLeaf(.token_leaf, .{});
+            rhs_op = PackedOperand.initNode(try self.parseType());
+        } else if (!pat_node.isNone() and
+            self.ast.getNode(pat_node).tag == .bind_pat and
+            self.isUnambiguousMissingColonTypeStart(false))
+        {
+            has_error = true;
+            has_type_ann = true;
+            try self.emitMissingColonBeforeType(self.ast.getNode(pat_node).main_token);
             rhs_op = PackedOperand.initNode(try self.parseType());
         }
 
@@ -6490,11 +7469,16 @@ pub const Parser = struct {
             }, decl_cst);
         }
 
+        var opt_eq_tok: ?TokenIndex = null;
+        var init_expr: NodeIndex = .none;
+        var has_let_else = false;
         if (self.peekKind() == .eq) {
-            _ = try self.consumeLeaf(.token_leaf, .{});
-            rhs_op = PackedOperand.initNode(try self.parseExpr(true));
+            opt_eq_tok = try self.consumeLeaf(.token_leaf, .{});
+            init_expr = try self.parseExpr(true);
+            rhs_op = PackedOperand.initNode(init_expr);
 
             if (self.peekKind() == .kw_else) {
+                has_let_else = true;
                 const else_cst = try self.startCstNode(.let_else_branch);
                 _ = try self.consumeLeaf(.token_leaf, .{});
                 _ = try self.parseBlock();
@@ -6512,6 +7496,86 @@ pub const Parser = struct {
                 "expected `;` here",
             );
             try self.skipToRecoveryAnchor(BLOCK_STMT_CONSUME_SET, LOCAL_INIT_STOP_SET, false);
+        }
+
+        if (!has_error and !has_let_else and !pat_node.isNone()) {
+            var has_pat_hole = false;
+            const bound_count = self.countBoundPatternIdents(pat_node, pat_end_ast, &has_pat_hole, 0);
+            if (!has_pat_hole and bound_count == 0) {
+                has_error = true;
+                const kw_span = self.getTokenSpan(kw_tok);
+                const last_decl_tok = if (self.cursor > 0) TokenIndex.fromInt(self.cursor - 1) else kw_tok;
+                const decl_end_byte = self.getTokenSpan(last_decl_tok).end_byte;
+                const diag_end_byte = if (opt_eq_tok) |eq_t|
+                    self.getTokenSpan(eq_t).end_byte
+                else
+                    decl_end_byte;
+                const diag_span = Span.init(self.file_id, kw_span.start_byte, diag_end_byte);
+
+                const pat_tag = self.ast.getNode(pat_node).tag;
+                const is_non_nominal_discard_pat = pat_tag == .wildcard_pat or
+                    pat_tag == .tuple_pat or
+                    pat_tag == .slice_pat;
+                if (!has_type_ann and is_non_nominal_discard_pat and opt_eq_tok != null and !init_expr.isNone()) {
+                    const eq_start = self.getTokenSpan(opt_eq_tok.?).start_byte;
+                    const has_decl_cmt = hasCommentMarkerInSlice(self.source, kw_span.start_byte, eq_start);
+                    try self.emitDiagnosticWithFix(
+                        .e0234_non_binding_wildcard_let_var,
+                        diag_span,
+                        "non-binding `let _ = …;` / `var _ = …;` has been retired (`ADR-23E`); write bare `_ = expr;` instead",
+                        "retired non-binding wildcard declaration",
+                        Span.init(self.file_id, kw_span.start_byte, eq_start),
+                        if (has_decl_cmt) null else "_ ",
+                        "replace `let _ =` / `var _ =` with bare `_ =`",
+                    );
+                } else if (self.diagnostic_sink) |sink| {
+                    const arena_alloc = sink.arena.asAllocator();
+                    const labels = try arena_alloc.alloc(LabeledSpan, 1);
+                    labels[0] = .{
+                        .span = diag_span,
+                        .label = "wildcard pattern binds zero variables; use `_name` for an intentionally unused typed binding or bare `_ = expr;`",
+                        .style = .primary,
+                    };
+                    if (self.interner) |str_interner| {
+                        const pat_cst = self.ast.getCstOrigin(pat_node);
+                        const pat_tok = if (!pat_cst.isNone() and pat_cst.asInt() < self.cst.countNodes())
+                            self.cst.getNode(pat_cst).token
+                        else
+                            self.ast.getNode(pat_node).main_token;
+                        const pat_span = self.getTokenSpan(pat_tok);
+                        const edits = try arena_alloc.alloc(TextEdit, 1);
+                        edits[0] = .{
+                            .file_id = self.file_id,
+                            .start_byte = pat_span.start_byte,
+                            .end_byte = pat_span.end_byte,
+                            .replacement_id = try str_interner.intern("_<name>"),
+                        };
+                        const fixes = try arena_alloc.alloc(SuggestedFix, 1);
+                        fixes[0] = .{
+                            .message = "bind to an underscore-prefixed identifier `_<name>` or remove the type annotation and write `_ = expr;`",
+                            .applicability = .has_placeholders,
+                            .priority = .syntax_canonicalization,
+                            .edits = edits,
+                        };
+                        try sink.emit(.{
+                            .code = .e0234_non_binding_wildcard_let_var,
+                            .severity = .err,
+                            .primary_span = diag_span,
+                            .message = "non-binding wildcard `let` / `var` declaration is forbidden (`ADR-23E`)",
+                            .labels = labels,
+                            .suggestions = fixes,
+                        });
+                    } else {
+                        try sink.emit(.{
+                            .code = .e0234_non_binding_wildcard_let_var,
+                            .severity = .err,
+                            .primary_span = diag_span,
+                            .message = "non-binding wildcard `let` / `var` declaration is forbidden (`ADR-23E`)",
+                            .labels = labels,
+                        });
+                    }
+                }
+            }
         }
 
         self.cst.finishNode(decl_cst, .{ .has_error = has_error });
@@ -8120,6 +9184,254 @@ pub const Parser = struct {
         return self.token_buffer.getToken(last_leaf.token).kind == .rbracket;
     }
 
+    /// Returns `true` if `src[lo..hi)` contains any `//` or `/*` comment marker.
+    fn hasCommentMarkerInSlice(src: []const u8, lo: u32, hi: u32) bool {
+        const clamped_hi = @min(@as(usize, hi), src.len);
+        var idx = @min(@as(usize, lo), clamped_hi);
+        while (idx + 1 < clamped_hi) : (idx += 1) {
+            if (src[idx] == '/' and (src[idx + 1] == '/' or src[idx + 1] == '*')) return true;
+        }
+        return false;
+    }
+
+    /// Returns the `extra_data` slice belonging to `node_id` given an upper AST node boundary `ast_limit`.
+    fn getParserAstExtraSlice(
+        self: *const Parser,
+        node_id: NodeIndex,
+        ast_limit: usize,
+        is_rhs: bool,
+    ) []const u32 {
+        if (node_id.isNone() or node_id.asInt() >= self.ast.countNodes()) return &.{};
+        const node = self.ast.getNode(node_id);
+        if (!is_rhs and node.lhs.tag == .extra and node.rhs.tag == .extra) {
+            const start_idx: usize = node.lhs.payload;
+            const end_idx: usize = @min(
+                start_idx +| @as(usize, node.rhs.payload),
+                self.ast.extra_data.items.len,
+            );
+            if (start_idx >= end_idx) return &.{};
+            return self.ast.extra_data.items[start_idx..end_idx];
+        }
+        const op = if (is_rhs) node.rhs else node.lhs;
+        if (op.tag != .extra) return &.{};
+        const start_idx: usize = op.payload;
+        var end_idx: usize = self.ast.extra_data.items.len;
+        const clamped_ast = @min(ast_limit, self.ast.countNodes());
+        var scan_i: usize = node_id.asInt() + 1;
+        while (scan_i < clamped_ast) : (scan_i += 1) {
+            const other = self.ast.getNode(NodeIndex.fromInt(@intCast(scan_i)));
+            if (other.lhs.tag == .extra and other.rhs.tag == .extra) {
+                if (other.lhs.payload > start_idx and other.lhs.payload < end_idx) {
+                    end_idx = other.lhs.payload;
+                }
+            } else {
+                if (other.lhs.tag == .extra and other.lhs.payload > start_idx and other.lhs.payload < end_idx) {
+                    end_idx = other.lhs.payload;
+                }
+                if (other.rhs.tag == .extra and other.rhs.payload > start_idx and other.rhs.payload < end_idx) {
+                    end_idx = other.rhs.payload;
+                }
+            }
+        }
+        if (start_idx >= end_idx or end_idx > self.ast.extra_data.items.len) return &.{};
+        return self.ast.extra_data.items[start_idx..end_idx];
+    }
+
+    /// Counts bound non-`_` identifiers inside `pat_id` (`E0234`).
+    fn countBoundPatternIdents(
+        self: *const Parser,
+        pat_id: NodeIndex,
+        ast_limit: usize,
+        has_hole: *bool,
+        depth: u32,
+    ) u32 {
+        if (depth >= 128 or pat_id.isNone() or pat_id.asInt() >= self.ast.countNodes()) return 0;
+        const node = self.ast.getNode(pat_id);
+        return switch (node.tag) {
+            .wildcard_pat,
+            .int_lit,
+            .float_lit,
+            .string_lit,
+            .byte_string_lit,
+            .char_lit,
+            .byte_lit,
+            .bool_lit,
+            .range_expr,
+            .path_expr,
+            => 0,
+            .expr_hole, .pattern_hole, .stmt_hole => {
+                has_hole.* = true;
+                return 0;
+            },
+            .bind_pat => blk: {
+                if (node.main_token.isNone()) break :blk 0;
+                const lex = self.getTokenLexeme(node.main_token);
+                break :blk if (lex.len > 0 and !std.mem.eql(u8, lex, "_")) 1 else 0;
+            },
+            .at_pat => blk: {
+                var count: u32 = 1;
+                if (node.rhs.tag == .node) {
+                    count += self.countBoundPatternIdents(
+                        NodeIndex.fromInt(node.rhs.payload),
+                        ast_limit,
+                        has_hole,
+                        depth + 1,
+                    );
+                }
+                break :blk count;
+            },
+            .or_pat => blk: {
+                var count: u32 = 0;
+                if (node.lhs.tag == .node) {
+                    count += self.countBoundPatternIdents(
+                        NodeIndex.fromInt(node.lhs.payload),
+                        ast_limit,
+                        has_hole,
+                        depth + 1,
+                    );
+                }
+                if (node.rhs.tag == .node) {
+                    count += self.countBoundPatternIdents(
+                        NodeIndex.fromInt(node.rhs.payload),
+                        ast_limit,
+                        has_hole,
+                        depth + 1,
+                    );
+                }
+                break :blk count;
+            },
+            .tuple_pat, .slice_pat, .struct_pat, .variant_pat => blk: {
+                var count: u32 = 0;
+                for (self.getParserAstExtraSlice(pat_id, ast_limit, false)) |raw_child| {
+                    count += self.countBoundPatternIdents(
+                        NodeIndex.fromInt(raw_child),
+                        ast_limit,
+                        has_hole,
+                        depth + 1,
+                    );
+                }
+                break :blk count;
+            },
+            else => 0,
+        };
+    }
+
+    /// Counts non-`_` bound place leaves inside a destructuring assignment LHS (`E0235`).
+    fn countBoundAssignPlaceLeaves(
+        self: *const Parser,
+        lhs_id: NodeIndex,
+        has_hole: *bool,
+        depth: u32,
+    ) u32 {
+        if (depth >= 128 or lhs_id.isNone() or lhs_id.asInt() >= self.ast.countNodes()) return 0;
+        const ast_limit = self.ast.countNodes();
+        const node = self.ast.getNode(lhs_id);
+        return switch (node.tag) {
+            .wildcard_pat => 0,
+            .range_expr => if (node.lhs.tag == .none and node.rhs.tag == .none) 0 else 1,
+            .expr_hole, .pattern_hole, .stmt_hole, .incomplete_member_access, .incomplete_call => {
+                has_hole.* = true;
+                return 0;
+            },
+            .tuple_lit, .array_lit => blk: {
+                var count: u32 = 0;
+                for (self.getParserAstExtraSlice(lhs_id, ast_limit, false)) |raw_elem| {
+                    count += self.countBoundAssignPlaceLeaves(
+                        NodeIndex.fromInt(raw_elem),
+                        has_hole,
+                        depth + 1,
+                    );
+                }
+                break :blk count;
+            },
+            .struct_lit => blk: {
+                var count: u32 = 0;
+                for (self.getParserAstExtraSlice(lhs_id, ast_limit, true)) |raw_field| {
+                    count += self.countBoundAssignPlaceLeaves(
+                        NodeIndex.fromInt(raw_field),
+                        has_hole,
+                        depth + 1,
+                    );
+                }
+                break :blk count;
+            },
+            else => 1,
+        };
+    }
+
+    /// Returns `true` if the token at `lookahead` unambiguously begins a `Type` where `:` was omitted (`ADR-23F`, `E0236`).
+    fn isUnambiguousMissingColonTypeStartAt(
+        self: *const Parser,
+        lookahead: usize,
+        is_closure_param: bool,
+    ) bool {
+        if (self.peekNth(lookahead).flags.has_leading_newline) return false;
+        return switch (self.peekKindNth(lookahead)) {
+            .prim_type,
+            .type_ident,
+            .kw_self_type,
+            .amp,
+            .kw_own,
+            .hash_soa,
+            .tilde,
+            .lbracket,
+            .kw_fn,
+            .kw_unsafe,
+            .kw_extern,
+            => true,
+            .star => blk: {
+                const after_star = self.peekKindNth(lookahead + 1);
+                break :blk after_star == .kw_mut or
+                    after_star == .kw_const or
+                    self.isTypeStart(lookahead + 1);
+            },
+            .pipe, .pipepipe => !is_closure_param and self.isTypeStart(lookahead),
+            .lparen => self.peekKindNth(lookahead + 1) == .rparen or self.isTypeStart(lookahead + 1),
+            .kw_async => self.isTypeStart(lookahead),
+            .ident => blk: {
+                const lex = self.peekLexemeNth(lookahead);
+                if (FOREIGN_TYPE_PREFIX_MODIFIER_MAP.has(lex) and self.isTypeStart(lookahead + 1)) {
+                    break :blk true;
+                }
+                if (CANONICAL_C_TYPE_ALIASES.has(lex) or
+                    self.allowed_non_canonical_types.contains(lex) or
+                    FOREIGN_LOWERCASE_SCALAR_MAP.has(lex))
+                {
+                    break :blk true;
+                }
+                break :blk self.peekKindNth(lookahead + 1) == .dot and self.isTypeStart(lookahead);
+            },
+            else => false,
+        };
+    }
+
+    /// Returns `true` if `peek(0)` unambiguously begins a `Type` after an identifier missing `:` (`E0236`).
+    fn isUnambiguousMissingColonTypeStart(self: *const Parser, is_closure_param: bool) bool {
+        return self.isUnambiguousMissingColonTypeStartAt(0, is_closure_param);
+    }
+
+    /// Emits `E0236` (`e0236_missing_colon_before_type`) inserting `:` (or `: ` if adjacent) after `ident_tok`.
+    fn emitMissingColonBeforeType(self: *Parser, ident_tok: TokenIndex) !void {
+        const ident_span = self.getTokenSpan(ident_tok);
+        const next_span = self.getTokenSpan(self.peekTokenIndexNth(0));
+        const insert_span = Span.init(self.file_id, ident_span.end_byte, ident_span.end_byte);
+        const is_adjacent = next_span.start_byte == ident_span.end_byte;
+        const diag_span = Span.init(
+            self.file_id,
+            ident_span.start_byte,
+            @max(ident_span.end_byte, next_span.end_byte),
+        );
+        try self.emitDiagnosticWithFix(
+            .e0236_missing_colon_before_type,
+            diag_span,
+            "missing `:` separator before type annotation (`ADR-23F`); write `name: Type`",
+            "insert `:` between identifier and type",
+            insert_span,
+            if (is_adjacent) ": " else ":",
+            "insert `:` before type annotation",
+        );
+    }
+
     /// Returns `true` if `(` at `peek(0)` starts a `WalrusCondExpr` (`([var] x [: T] := expr)`).
     fn isWalrusAfterLParen(self: *const Parser) bool {
         if (self.peekKind() != .lparen) return false;
@@ -8128,19 +9440,23 @@ pub const Parser = struct {
         if (!isIdentifierKind(first_kind)) return false;
         const second_kind = self.peekKindNth(2);
         if (second_kind == .colon_eq) return true;
-        if (second_kind != .colon) return false;
+        const is_missing_colon_ty = second_kind != .colon and
+            self.isUnambiguousMissingColonTypeStartAt(2, false);
+        if (second_kind != .colon and !is_missing_colon_ty) return false;
 
-        const third_kind = self.peekKindNth(3);
-        if (third_kind == .kw_for or
-            third_kind == .kw_while or
-            third_kind == .kw_loop or
-            third_kind == .kw_match or
-            (third_kind == .kw_comptime and self.peekKindNth(4) == .kw_for))
-        {
-            return false;
+        if (second_kind == .colon) {
+            const third_kind = self.peekKindNth(3);
+            if (third_kind == .kw_for or
+                third_kind == .kw_while or
+                third_kind == .kw_loop or
+                third_kind == .kw_match or
+                (third_kind == .kw_comptime and self.peekKindNth(4) == .kw_for))
+            {
+                return false;
+            }
         }
 
-        var scan_off: usize = 3;
+        var scan_off: usize = if (second_kind == .colon) 3 else 2;
         var steps: usize = 0;
         var delim_depth: u32 = 0;
         while (steps < MAX_TYPE_LOOKAHEAD) : (steps += 1) {
@@ -9531,7 +10847,7 @@ pub const Parser = struct {
                 return self.ast.appendNodeWithCst(.{ .tag = .bool_lit, .main_token = tok }, leaf_cst);
             },
             .underscore => {
-                if (saved_lhs_place and (!saved_stmt_lhs or isAssignOp(self.peekKindNth(1)))) {
+                if (saved_lhs_place and (!saved_stmt_lhs or self.peekKindNth(1) == .eq)) {
                     const tok = try self.consumeLeaf(.wildcard_pat, .{});
                     const leaf_cst = CstNodeIndex.fromInt(@intCast(self.cst.countNodes() - 1));
                     return self.ast.appendNodeWithCst(.{
@@ -9900,6 +11216,10 @@ pub const Parser = struct {
         if (self.peekKind() == .colon) {
             _ = try self.consumeLeaf(.token_leaf, .{});
             type_node = try self.parseType();
+        } else if (self.isUnambiguousMissingColonTypeStart(false)) {
+            has_err = true;
+            try self.emitMissingColonBeforeType(ident_tok);
+            type_node = try self.parseType();
         }
 
         const colon_eq_tok = try self.expectToken(
@@ -10116,11 +11436,13 @@ pub const Parser = struct {
         has_error: *bool,
     ) anyerror!void {
         const saved_cond_header = self.is_in_cond_header;
+        const saved_stmt_lhs = self.is_in_stmt_lhs;
         const saved_lhs_place = self.is_in_lhs_place;
         self.is_in_cond_header = false;
-        self.is_in_lhs_place = false;
+        self.is_in_stmt_lhs = false;
         defer {
             self.is_in_cond_header = saved_cond_header;
+            self.is_in_stmt_lhs = saved_stmt_lhs;
             self.is_in_lhs_place = saved_lhs_place;
         }
         const open_brace = try self.consumeLeaf(.struct_lit_start, .{});
@@ -10146,6 +11468,8 @@ pub const Parser = struct {
                     self.peekKind() != .comma and
                     self.peekKind() != .eof)
                 {
+                    self.is_in_lhs_place = false;
+                    defer self.is_in_lhs_place = saved_lhs_place;
                     try field_nodes.append(self.ast.allocator, (try self.parseExpr(true)).asInt());
                 }
                 self.cst.finishNode(field_cst, .{});
@@ -10260,12 +11584,11 @@ pub const Parser = struct {
                 {
                     _ = try self.consumePatternBindingModifier(&has_param_err);
                 }
-                if (self.peekKind() == .underscore) {
-                    try param_tokens.append(
-                        self.ast.allocator,
-                        (try self.consumeLeaf(.token_leaf, .{})).asInt(),
-                    );
-                } else {
+                const param_name_tok: TokenIndex = if (self.peekKind() == .underscore) blk_us: {
+                    const us_tok = try self.consumeLeaf(.token_leaf, .{});
+                    try param_tokens.append(self.ast.allocator, us_tok.asInt());
+                    break :blk_us us_tok;
+                } else blk_id: {
                     const param_tok = try self.expectIdentifierWithCasing(
                         .ident,
                         .snake_case,
@@ -10273,10 +11596,15 @@ pub const Parser = struct {
                         "expected `snake_case` closure parameter name",
                     );
                     try param_tokens.append(self.ast.allocator, param_tok.asInt());
-                }
+                    break :blk_id param_tok;
+                };
 
                 if (self.peekKind() == .colon) {
                     _ = try self.consumeLeaf(.token_leaf, .{});
+                    _ = try self.parseType();
+                } else if (self.isUnambiguousMissingColonTypeStart(true)) {
+                    has_param_err = true;
+                    try self.emitMissingColonBeforeType(param_name_tok);
                     _ = try self.parseType();
                 }
                 if (has_param_err) has_error = true;
@@ -10322,6 +11650,120 @@ pub const Parser = struct {
         }, clos_cst);
     }
 
+    /// Returns `true` if `peek(0)` is a foreign chained-conditional spelling (`elif`, `elsif`, `elseif`).
+    fn isInvalidElifKeyword(self: *const Parser) bool {
+        if (self.peekKind() != .ident) return false;
+        return FOREIGN_ELIF_KEYWORD_MAP.has(self.peekLexemeNth(0));
+    }
+
+    /// Returns `true` if `peek(0)` is `elif`/`elsif`/`elseif` followed by a condition header and `{` block (`E0233`).
+    fn isRecoveredElifBranchStart(self: *const Parser) bool {
+        if (!self.isInvalidElifKeyword()) return false;
+        const next_kind = self.peekKindNth(1);
+        if (next_kind == .kw_let) return true;
+        if (!isExprStart(next_kind, false)) return false;
+
+        var depth: u32 = 0;
+        var step: usize = 1;
+        while (step <= 64) : (step += 1) {
+            const kind = self.peekKindNth(step);
+            if (kind == .eof) return false;
+            if (depth == 0) {
+                if (kind == .lbrace) return step > 1;
+                if (kind == .semi or kind == .rbrace or kind == .comma or isAssignOp(kind)) return false;
+            }
+            switch (kind) {
+                .lparen, .lbracket => depth += 1,
+                .rparen, .rbracket => {
+                    if (depth == 0) return false;
+                    depth -= 1;
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    /// Emits `E0233` (`-> "else if"`) on `elif` / `elsif` / `elseif` and parses the chained `IfExpr` cleanly.
+    fn parseRecoveredElifExpr(self: *Parser) anyerror!NodeIndex {
+        const if_cst = try self.startCstNode(.if_expr);
+        self.pushState(.if_after_cond, if_cst) catch |err| switch (err) {
+            error.ParseDepthExceeded => {
+                return self.recoverDepthOverflow(if_cst, EXPR_SYNC_STOP_SET, .expr_hole);
+            },
+            else => return err,
+        };
+        defer self.popStates(1);
+
+        const saved_lhs_place = self.is_in_lhs_place;
+        self.is_in_lhs_place = false;
+        defer self.is_in_lhs_place = saved_lhs_place;
+
+        const elif_tok = try self.consumeLeaf(.if_introducer, .{ .has_error = true });
+        const elif_span = self.getTokenSpan(elif_tok);
+        const elif_lex = self.getTokenLexeme(elif_tok);
+        if (self.diagnostic_sink) |sink| {
+            const msg = try std.fmt.allocPrint(
+                sink.arena.asAllocator(),
+                "`{s}` is not a valid CoreX keyword (`ADR-23C`); write `else if` instead",
+                .{elif_lex},
+            );
+            try self.emitDiagnosticWithFix(
+                .e0233_invalid_elif_keyword,
+                elif_span,
+                msg,
+                "invalid keyword; replace with `else if`",
+                elif_span,
+                "else if",
+                "replace with `else if`",
+            );
+        }
+
+        const cond_cst = try self.startCstNode(.if_cond);
+        var has_cond_err = false;
+        const cond_node: NodeIndex = if (self.peekKind() == .kw_let)
+            try self.parseRetiredIfWhileLet(cond_cst, "if", &has_cond_err)
+        else blk_cond: {
+            const saved_cond_header = self.is_in_cond_header;
+            self.is_in_cond_header = true;
+            defer self.is_in_cond_header = saved_cond_header;
+            break :blk_cond try self.parseExpr(false);
+        };
+        self.cst.finishNode(cond_cst, .{ .has_error = has_cond_err });
+
+        const then_block = try self.parseBlock();
+        var rhs_op = PackedOperand.initNode(then_block);
+
+        if (self.peekKind() == .kw_else) {
+            const else_cst = try self.startCstNode(.else_branch);
+            _ = try self.consumeLeaf(.token_leaf, .{});
+            const else_node = if (self.peekKind() == .kw_if)
+                try self.parseIfExpr()
+            else if (self.isRecoveredElifBranchStart())
+                try self.parseRecoveredElifExpr()
+            else
+                try self.parseBlock();
+            self.cst.finishNode(else_cst, .{});
+            const branches = [_]u32{ then_block.asInt(), else_node.asInt() };
+            rhs_op = PackedOperand.initExtra(try self.ast.appendExtraSlice(&branches));
+        } else if (self.isRecoveredElifBranchStart()) {
+            const else_cst = try self.startCstNode(.else_branch);
+            const else_node = try self.parseRecoveredElifExpr();
+            self.cst.finishNode(else_cst, .{ .has_error = true });
+            const branches = [_]u32{ then_block.asInt(), else_node.asInt() };
+            rhs_op = PackedOperand.initExtra(try self.ast.appendExtraSlice(&branches));
+        }
+
+        self.cst.finishNode(if_cst, .{ .has_error = true });
+        self.has_last_expr_block_body = true;
+        return self.ast.appendNodeWithCst(.{
+            .tag = .if_expr,
+            .main_token = elif_tok,
+            .lhs = PackedOperand.initNode(cond_node),
+            .rhs = rhs_op,
+        }, if_cst);
+    }
+
     /// Parses `IfExpr = "if" CondExprNoStruct Block ["else" (IfExpr | Block)]` (`DR-21` `SE-01` & `SE-02`).
     fn parseIfExpr(self: *Parser) anyerror!NodeIndex {
         const if_cst = try self.startCstNode(.if_expr);
@@ -10362,9 +11804,19 @@ pub const Parser = struct {
             _ = try self.consumeLeaf(.token_leaf, .{});
             const else_node = if (self.peekKind() == .kw_if)
                 try self.parseIfExpr()
-            else
-                try self.parseBlock();
-            self.cst.finishNode(else_cst, .{});
+            else if (self.isRecoveredElifBranchStart()) blk_else_elif: {
+                has_error = true;
+                break :blk_else_elif try self.parseRecoveredElifExpr();
+            } else try self.parseBlock();
+            self.cst.finishNode(else_cst, .{ .has_error = has_error });
+
+            const branches = [_]u32{ then_block.asInt(), else_node.asInt() };
+            rhs_op = PackedOperand.initExtra(try self.ast.appendExtraSlice(&branches));
+        } else if (self.isRecoveredElifBranchStart()) {
+            has_error = true;
+            const else_cst = try self.startCstNode(.else_branch);
+            const else_node = try self.parseRecoveredElifExpr();
+            self.cst.finishNode(else_cst, .{ .has_error = true });
 
             const branches = [_]u32{ then_block.asInt(), else_node.asInt() };
             rhs_op = PackedOperand.initExtra(try self.ast.appendExtraSlice(&branches));
@@ -10681,6 +12133,38 @@ pub fn reparseIncremental(
                         {
                             has_win_lex_err = true;
                             break;
+                        }
+                    }
+                }
+
+                if (!has_win_lex_err) {
+                    const win_slice = new_source[reparse_start_byte..reparse_new_end_byte];
+                    if (std.mem.indexOf(u8, win_slice, "///") != null or
+                        std.mem.indexOf(u8, win_slice, "//!") != null)
+                    {
+                        has_win_lex_err = true;
+                    } else if (prefix_count == 0 and token_buffer.countTokens() > 0) {
+                        const tok0_end: usize = @min(
+                            @as(usize, token_buffer.getToken(TokenIndex.fromInt(0)).byte_offset),
+                            new_source.len,
+                        );
+                        const tok0_trivia = new_source[0..tok0_end];
+                        if (std.mem.indexOf(u8, tok0_trivia, "///") != null or
+                            std.mem.indexOf(u8, tok0_trivia, "//!") != null)
+                        {
+                            has_win_lex_err = true;
+                        }
+                    }
+                    if (!has_win_lex_err and is_suffix_reused) {
+                        const suf_tok = TokenIndex.fromInt(@intCast(windows[suffix_start].first_token));
+                        for (token_buffer.getLeadingTrivia(suf_tok)) |triv_piece| {
+                            if (triv_piece.kind == .doc_comment or
+                                triv_piece.kind == .module_doc_comment or
+                                triv_piece.flags != 0)
+                            {
+                                has_win_lex_err = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -12395,7 +13879,7 @@ test "test_parser_kw_async_module_path_segments_zero_diagnostics" {
         \\    let fut = async {
         \\        cx.async.sleep(10).await
         \\    };
-        \\    let _ = fut.await;
+        \\    fut.await;
         \\    cx.async.task_group[IoError](async |sub_group| {
         \\        match cx.async.Poll.Ready(hdr.state) {
         \\            cx.async.Poll.Ready(val) => val,
@@ -12793,4 +14277,115 @@ test "test_parser_inline_string_use_decl_and_diagnostics" {
     try std.testing.expect(!isValidInlineUseSpec("registry:serde-json"));
     try std.testing.expect(!isValidInlineUseSpec("serde--json@1.0.0"));
     try std.testing.expect(!isValidInlineUseSpec("Serde@1.0.0"));
+}
+
+test "test_adr23_doc_attachment_pub_impl_inline_methods_elif_discards_and_missing_colon" {
+    const allocator = std.testing.allocator;
+    var interner = try StringInterner.init(allocator);
+    defer interner.deinit();
+
+    // [1] Valid top-of-file `//!`, attached `///`, `else if`, `_ = expr;`, and partial struct destructuring:
+    const valid_src =
+        \\//! Module header line.
+        \\
+        \\/// Documented struct.
+        \\pub struct Point {
+        \\    /// Horizontal coordinate.
+        \\    pub x: i32,
+        \\    /// Vertical coordinate.
+        \\    pub y: i32,
+        \\}
+        \\
+        \\impl Point {
+        \\    /// Resets `x` while discarding `y`.
+        \\    pub fn unpack(pt: Point) -> i32 {
+        \\        var out_x: i32 = 0;
+        \\        Point { x: out_x, y: _ } = pt;
+        \\        _ = out_x + 1;
+        \\        if out_x > 0 { 1 } else if out_x < 0 { -1 } else { 0 }
+        \\    }
+        \\}
+    ;
+    var ok_tok = TokenBuffer.init(allocator);
+    defer ok_tok.deinit();
+    var ok_cst = LosslessCstArena.init(allocator);
+    defer ok_cst.deinit();
+    var ok_ast = AstArena.init(allocator);
+    defer ok_ast.deinit();
+    var ok_sink = DiagnosticSink.init(allocator);
+    defer ok_sink.deinit();
+
+    _ = try parseSource(valid_src, FileId.fromInt(95), &ok_tok, &ok_cst, &ok_ast, &ok_sink, &interner);
+    try std.testing.expectEqual(@as(u32, 0), ok_sink.error_count);
+    try verifyCstAndAstInvariants(allocator, valid_src, &ok_tok, &ok_cst, &ok_ast);
+
+    // [2] Negative checks; `E0229`, `E0230`, `E0231`, `E0232`, `E0233`, `E0234`, `E0235`, `E0236` + CST losslessness:
+    const neg_src =
+        \\/// Detached item doc followed by blank line.
+        \\
+        \\pub struct Pair {
+        \\    left i32,
+        \\    pub fn inline_bad(&self) -> i32 { return 0; }
+        \\}
+        \\
+        \\//! Misplaced mid-file module doc.
+        \\const LIMIT usize = 8;
+        \\
+        \\pub impl Pair {
+        \\    pub fn check(val i32) -> i32 {
+        \\        let _ = val;
+        \\        (_, _) = (1, 2);
+        \\        let f = |item i32| item;
+        \\        _ = f;
+        \\        if (bound i32 := val) and bound > 0 {
+        \\            1
+        \\        } elif val < 0 {
+        \\            -1
+        \\        } else {
+        \\            0
+        \\        }
+        \\    }
+        \\}
+    ;
+    var neg_tok = TokenBuffer.init(allocator);
+    defer neg_tok.deinit();
+    var neg_cst = LosslessCstArena.init(allocator);
+    defer neg_cst.deinit();
+    var neg_ast = AstArena.init(allocator);
+    defer neg_ast.deinit();
+    var neg_sink = DiagnosticSink.init(allocator);
+    defer neg_sink.deinit();
+
+    _ = try parseSource(neg_src, FileId.fromInt(96), &neg_tok, &neg_cst, &neg_ast, &neg_sink, &interner);
+    try verifyCstAndAstInvariants(allocator, neg_src, &neg_tok, &neg_cst, &neg_ast);
+
+    var seen_e0229 = false;
+    var seen_e0230 = false;
+    var seen_e0231 = false;
+    var seen_e0232 = false;
+    var seen_e0233 = false;
+    var seen_e0234 = false;
+    var seen_e0235 = false;
+    var count_e0236: u32 = 0;
+    for (neg_sink.asSlice()) |diag_item| {
+        switch (diag_item.code) {
+            .e0229_misplaced_module_doc_comment => seen_e0229 = true,
+            .e0230_unattached_doc_comment => seen_e0230 = true,
+            .e0231_visibility_on_impl_block => seen_e0231 = true,
+            .e0232_inline_method_in_type_decl => seen_e0232 = true,
+            .e0233_invalid_elif_keyword => seen_e0233 = true,
+            .e0234_non_binding_wildcard_let_var => seen_e0234 = true,
+            .e0235_all_wildcard_destructuring_assign => seen_e0235 = true,
+            .e0236_missing_colon_before_type => count_e0236 += 1,
+            else => {},
+        }
+    }
+    try std.testing.expect(seen_e0229);
+    try std.testing.expect(seen_e0230);
+    try std.testing.expect(seen_e0231);
+    try std.testing.expect(seen_e0232);
+    try std.testing.expect(seen_e0233);
+    try std.testing.expect(seen_e0234);
+    try std.testing.expect(seen_e0235);
+    try std.testing.expectEqual(@as(u32, 5), count_e0236);
 }

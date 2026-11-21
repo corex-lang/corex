@@ -450,7 +450,7 @@ test "test_codegen_c_native_executable_execution_and_oracle_trace_parity" {
         \\    let big_q: i32 = ((big_a * 3) / 1000000000000) as i32;
         \\    {
         \\        let guard = DropProbe { tag: 42 };
-        \\        let _ = guard.tag;
+        \\        _ = guard.tag;
         \\    }
         \\    let wrote_n = @sys_write(1, "C99_OK");
         \\    let fib_v = cyclic_fib(5);

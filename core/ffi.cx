@@ -6,6 +6,7 @@
 //!
 //! All `CStr` methods are heap-allocation-free (`@no_alloc`) and preserve identical ABI representation
 //! to `const char*` across `MirVm`, Tier A (`-ofmt=c`), and Tier B (`LLVM`).
+
 // ---------------------------------------- TYPES ----------------------------------------
 /// Target-calibrated C `char` (`u8` on `aarch64-linux-*` AAPCS64).
 @cfg(target.arch == "aarch64" and target.os == "linux")

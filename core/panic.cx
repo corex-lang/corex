@@ -5,6 +5,7 @@
 //!
 //! Under `COREX_ORACLE_TRACE_FILE` and `MirVm` oracle execution, both `trap` and `panic` record
 //! deterministic trap markers (`exit_code = 101`) with identical `stderr` output across all tiers.
+
 // ------------------------------------- PUBLIC API --------------------------------------
 /// Triggers an immediate hardware trap (`@trap()`) without writing diagnostic text.
 @cold @no_alloc @noinline
@@ -15,14 +16,14 @@ pub fn trap() -> never {
 /// Writes `panic: <message>\n` to standard error and aborts execution (`@panic(message)`).
 @cold @no_alloc @noinline
 pub fn panic(message: FmtArgs = "", *, loc: SourceLoc = @caller_location()) -> never {
-    let _ = loc.line;
+    _ = loc;
     @panic(message);
 }
 
 /// Verifies that `is_valid` holds, aborting via `@panic(message)` when `is_valid` is `false`.
 @inline @no_alloc
 pub fn assert_true(is_valid: bool, message: FmtArgs = "", *, loc: SourceLoc = @caller_location()) {
-    let _ = loc.line;
+    _ = loc;
     if not is_valid {
         @panic(message);
     }

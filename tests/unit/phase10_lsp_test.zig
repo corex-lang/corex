@@ -387,7 +387,7 @@ test "test_lsp_lifecycle_utf16_vs_utf8_encoding_and_surrogate_positions" {
             "pub fn id_fn(val_in: i32) -> i32 { return val_in; }\n" ++
             "pub fn astral_probe() -> i32 {\n" ++
             "    let glyph_pair = \"𐍈𝐀\"; let target_num: i32 = 100; let out_v = id_fn(target_num);\n" ++
-            "    let _ = glyph_pair;\n" ++
+            "    _ = glyph_pair;\n" ++
             "    return out_v;\n" ++
             "}\n";
         try appendDidOpenFrame(allocator, &inbound, astral_uri, 1, astral_src);
@@ -701,7 +701,7 @@ test "test_lsp_semantic_tokens_delta_hover_and_dr17_contracts" {
 
     const sem_uri = "file:///D%3A/virt/sem_contracts.cx";
     const contracts_cx =
-        "pub const HEADER_SEED: i32 = 7; /// trailing comment on previous constant\n" ++
+        "pub const HEADER_SEED: i32 = 7; // trailing comment on previous constant\n" ++
         "/// Clamps telemetry sample within real-time bounds.\n" ++
         "@no_alloc\n" ++
         "@no_panic\n" ++

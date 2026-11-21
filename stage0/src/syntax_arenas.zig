@@ -861,6 +861,34 @@ pub const CstNodeKind = enum(u8) {
     pub const param: CstNodeKind = .fn_param;
     /// Alias for `.invalid_parse_subtree`.
     pub const error_recovery: CstNodeKind = .invalid_parse_subtree;
+
+    /// Returns `true` if this CST node represents a declaration item or member that accepts `///` outer doc comments (`DR-23` §2.2).
+    pub fn isDocumentable(self: CstNodeKind) bool {
+        return switch (self) {
+            .mod_item,
+            .const_item,
+            .type_alias_item,
+            .struct_item,
+            .struct_field,
+            .bit_field_item,
+            .bit_field_member,
+            .enum_item,
+            .enum_variant,
+            .union_item,
+            .trait_item,
+            .trait_member,
+            .impl_item,
+            .impl_member,
+            .subscript_item,
+            .fn_item,
+            .extern_static_item,
+            .extern_block_item,
+            .test_item,
+            .bench_item,
+            => true,
+            else => false,
+        };
+    }
 };
 
 /// 1-byte bit-packed flags attached to each `CstNodeRecord` (`DR-12` Section 1.4).

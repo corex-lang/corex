@@ -6,6 +6,7 @@
 //!
 //! Event loops and frame schedulers call `poll_reload()` at quiescent safe points without incurring
 //! any heap allocations or indirect branch overhead in production binaries.
+
 // ------------------------------------- PUBLIC API --------------------------------------
 /// Polls the `DR-19` hot-reload generation counter at a quiescent safe point (zero-cost in `--release`).
 @inline

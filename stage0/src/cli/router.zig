@@ -173,7 +173,7 @@ pub const UpgradeFlagId = enum(u8) {
     explain = 2,
     /// `--internal-core` – permit direct `core.*` kernel imports without `E0218` (`3`).
     internal_core = 3,
-    /// `--list` – list all 15 canonical Zero-Legacy upgrade rules (`4`).
+    /// `--list` – list all 22 canonical Zero-Legacy upgrade rules (`4`).
     list = 4,
     /// `--rule=<id,…>` – run only the specified comma-separated upgrade rule IDs (`5`).
     rule = 5,
@@ -694,7 +694,7 @@ pub const UPGRADE_FLAGS = [_]UpgradeFlagDescriptor{
     .{
         .id = .list,
         .long_flag = "--list",
-        .summary = "List all 15 canonical Zero-Legacy upgrade rules",
+        .summary = "List all 22 canonical Zero-Legacy upgrade rules",
     },
     .{
         .id = .rule,
@@ -4196,7 +4196,7 @@ fn executeUpgradeSubcommand(
                     "unknown upgrade rule `{s}` for `--explain`",
                     .{rule_str},
                 ),
-                .notes = &.{"help: run `corex upgrade --list` to see all 15 canonical Zero-Legacy upgrade rules"},
+                .notes = &.{"help: run `corex upgrade --list` to see all 22 canonical Zero-Legacy upgrade rules"},
             });
             try diag_renderer.renderAll(stderr_writer, sink);
             return 1;
@@ -4206,7 +4206,7 @@ fn executeUpgradeSubcommand(
     }
 
     // [2] Validate `--rule=<id,…>` and `--accept-caps[=<cap,…>]`:
-    var rule_mask: u16 = upgrade_engine.ALL_UPGRADE_RULES_MASK;
+    var rule_mask: u32 = upgrade_engine.ALL_UPGRADE_RULES_MASK;
     var has_explicit_rule_filter = false;
     if (exec_info.upgrade_rule_csv) |csv_str| {
         rule_mask = upgrade_engine.parseRuleFilterMask(csv_str) orelse {
@@ -6668,7 +6668,7 @@ test "test_cli_check_fix_preserves_script_prefixes_and_atomic_fmt" {
         .data = shebang_line ++
             "pub fn main() -> i32 {\n" ++
             "    let opt: Option[u8] = .None;\n" ++
-            "    let _ = opt;\n" ++
+            "    _ = opt;\n" ++
             "    return 0;\n" ++
             "}\n",
     });

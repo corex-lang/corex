@@ -1,4 +1,5 @@
 //! Module header doc comment
+
 // Leading comment on Point
 pub struct Point {
     pub x: i32, // trailing comment on x

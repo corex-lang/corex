@@ -90,7 +90,7 @@ const PHASE4_SEED_ITEMS = [_][]const u8{
         "    let msg = \"\"\"\n" ++
         "        {{hdr}} {left_n=} hex={right_n:#06x}\n" ++
         "        \"\"\";\n" ++
-        "    let _ = msg;\n" ++
+        "    _ = msg;\n" ++
         "    return fsm: match WireOrder.Relaxed {\n" ++
         "        .Relaxed => continue :fsm .SeqCst,\n" ++
         "        .Acquire => left_n,\n" ++
@@ -99,7 +99,7 @@ const PHASE4_SEED_ITEMS = [_][]const u8{
         "}\n",
     "@cfg(target.ptr_width == 64 or target.ptr_width == 32)\n" ++
         "pub fn cfg_guarded_helper() -> i32 = ~0_i32;\n",
-    "test \"typecheck prose test\" (raw_in: &[u8]) { let _ = raw_in.len(); }\n",
+    "test \"typecheck prose test\" (raw_in: &[u8]) { _ = raw_in.len(); }\n",
     "pub fn affine_calc(base: i32, scale: i32 = 2, bias: i32 = base + 1) -> i32 = base * scale + bias;\n",
     "pub fn read_assoc_and_tuple(nested: ((i32, i32), i32)) -> i32 =\n" ++
         "    PairCounter.with_seed(PairCounter.DEFAULT_SEED).count + nested.0.1 + nested.1;\n",
@@ -171,7 +171,7 @@ const PHASE4_MUTATION_SNIPPETS = [_][]const u8{
     "pub fn bad_refine() -> PortNum { return 9999; }\n",
     "pub fn bad_try() -> i32 { return read_port(80)?; }\n",
     "pub fn bad_match(flag: bool) -> i32 { return match flag { true => 1 }; }\n",
-    "pub fn bad_discard() { read_port(80); let _ = read_port(80); }\n",
+    "pub fn bad_discard() { read_port(80); _ = read_port(80); }\n",
     "pub fn bad_or_is_bind(opt_val: i32?) -> i32 {\n" ++
         "    if opt_val is .Some(inner_val) or true { return inner_val; }\n" ++
         "    return 0;\n" ++
@@ -193,7 +193,7 @@ const PHASE4_MUTATION_SNIPPETS = [_][]const u8{
         "}\n",
     "pub fn bad_named_arg_order() -> i32 = affine_calc(scale: 2, 10);\n",
     "pub fn bad_slice_len_field(items: &[i32]) -> usize = items.len;\n",
-    "pub fn bad_opaque_deref(ptr: *opaque) { unsafe { let _ = ptr.*; } }\n",
+    "pub fn bad_opaque_deref(ptr: *opaque) { unsafe { _ = ptr.*; } }\n",
     "pub fn bad_noncopy_val_param(err: IoError) -> i32 = err.code;\n",
     "pub fn bad_missing_own_arg() {\n" ++
         "    let box_v = OwnedBox { payload: 1 };\n" ++

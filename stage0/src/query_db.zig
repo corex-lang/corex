@@ -602,6 +602,25 @@ pub const ItemKind = enum(u8) {
     extern_static = 15,
 };
 
+/// Compact 8-byte token-anchored doc-comment span cached on `ItemTree` and `ItemTreeEntry` (`DR-23` §2.4).
+pub const DocTriviaSpan = extern struct {
+    /// Leading-trivia anchor token index (`std.math.maxInt(u32)` when undocumented).
+    doc_first_tok: u32 = std.math.maxInt(u32),
+    /// Contiguous attached `///` or file-top `//!` line count (`0` when undocumented).
+    doc_line_count: u16 = 0,
+    /// Reserved bit-flags for fenced code block or `@doc` metadata (`0` by default).
+    flags: u16 = 0,
+
+    comptime {
+        std.debug.assert(@sizeOf(DocTriviaSpan) == 8);
+    }
+
+    /// Returns `true` when at least one `///` or `//!` line is attached to this span.
+    pub inline fn hasDocs(self: DocTriviaSpan) bool {
+        return self.doc_line_count > 0 and self.doc_first_tok != std.math.maxInt(u32);
+    }
+};
+
 /// Single top-level declaration entry in a file's position-independent `ItemTree`.
 pub const ItemTreeEntry = struct {
     /// File-scoped definition identifier (`(file_id, local_item_index)`).
@@ -622,6 +641,8 @@ pub const ItemTreeEntry = struct {
     body_ast_node: NodeIndex,
     /// Body CST node index (`block` CST node for functions/tests/benches, init CST for `const_decl`, `.none` otherwise).
     body_cst_node: CstNodeIndex,
+    /// Outer `///` doc-comment span (excluded from `signature_fingerprint` to preserve 100% Early Cutoff).
+    doc_span: DocTriviaSpan = .{},
     /// Position-independent 128-bit fingerprint of the item's signature (excluding function/accessor body blocks).
     signature_fingerprint: Fingerprint128,
     /// Position-independent 128-bit fingerprint of the item's body block or initializer.
@@ -641,6 +662,8 @@ pub const ItemTree = struct {
     file_id: FileId = .none,
     /// Whether `test` and `bench` declarations were retained when extracting `entries`.
     is_including_tests: bool = true,
+    /// Top-of-file `//!` module doc-comment span (excluded from `tree_fingerprint` to preserve Early Cutoff).
+    mod_doc: DocTriviaSpan = .{},
     /// 128-bit fingerprint of all item signatures in this file (excluding function bodies).
     tree_fingerprint: Fingerprint128 = Fingerprint128.ZERO,
     /// Combined 128-bit fingerprint covering both `tree_fingerprint` and all `body_fingerprint`s.
@@ -2709,6 +2732,191 @@ fn findConstInitCst(
     return .none;
 }
 
+/// Skips an optional UTF-8 BOM (`0xEF 0xBB 0xBF`) and leading `#!` shebang line in `source[0..limit]`.
+fn skipLeadingBomAndShebangInPrefix(source: []const u8, limit: usize) usize {
+    var cursor: usize = 0;
+    if (limit >= 3 and source[0] == 0xEF and source[1] == 0xBB and source[2] == 0xBF) {
+        cursor = 3;
+    }
+    if (cursor + 1 < limit and source[cursor] == '#' and source[cursor + 1] == '!') {
+        while (cursor < limit and source[cursor] != '\n') : (cursor += 1) {}
+        if (cursor < limit and source[cursor] == '\n') cursor += 1;
+    }
+    return cursor;
+}
+
+/// Extracts the 8-byte `DocTriviaSpan` for contiguous top-of-file `//!` module doc comments (`DR-23` §2.4).
+fn extractFileModuleDocSpan(source: []const u8, token_buffer: *const TokenBuffer) DocTriviaSpan {
+    if (token_buffer.countTokens() == 0) return .{};
+    const limit = @min(source.len, @as(usize, token_buffer.getToken(TokenIndex.fromInt(0)).byte_offset));
+    var cursor = skipLeadingBomAndShebangInPrefix(source, limit);
+
+    // Skip blank/whitespace-only lines from masked `---` script frontmatter before the `//!` header:
+    while (cursor < limit) {
+        var probe = cursor;
+        while (probe < limit and (source[probe] == ' ' or source[probe] == '\t' or source[probe] == '\r')) {
+            probe += 1;
+        }
+        if (probe < limit and source[probe] == '\n') {
+            cursor = probe + 1;
+            continue;
+        }
+        break;
+    }
+
+    var line_count: u16 = 0;
+    while (cursor < limit) {
+        var line_end = cursor;
+        while (line_end < limit and source[line_end] != '\n') : (line_end += 1) {}
+        const raw_line = std.mem.trimEnd(u8, source[cursor..line_end], "\r");
+        const trimmed_start = std.mem.trimStart(u8, raw_line, " \t");
+        if (!std.mem.startsWith(u8, trimmed_start, "//!")) break;
+        line_count +|= 1;
+        cursor = if (line_end < limit) line_end + 1 else limit;
+    }
+
+    if (line_count == 0) return .{};
+    return .{
+        .doc_first_tok = 0,
+        .doc_line_count = line_count,
+        .flags = 0,
+    };
+}
+
+/// Extracts the 8-byte `DocTriviaSpan` for outer `///` doc comments attached to `item_cst_node` (`DR-23` §2.4).
+fn extractItemOuterDocSpan(
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    item_cst_node: CstNodeIndex,
+) DocTriviaSpan {
+    const tok_count = token_buffer.countTokens();
+    const cst_count = cst_arena.countNodes();
+    if (tok_count == 0 or item_cst_node.isNone() or item_cst_node.asInt() >= cst_count) return .{};
+
+    const start_idx: usize = item_cst_node.asInt();
+    const end_idx = @min(
+        start_idx + @max(@as(usize, cst_arena.getNode(item_cst_node).subtree_size), 1),
+        cst_count,
+    );
+    var first_tok: TokenIndex = .none;
+    var cur_idx = start_idx;
+    while (cur_idx < end_idx) : (cur_idx += 1) {
+        const leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur_idx)));
+        if (leaf.subtree_size <= 1 and !leaf.flags.is_missing_or_injected and
+            !leaf.token.isNone() and leaf.token.asInt() < tok_count and
+            !token_buffer.getToken(leaf.token).flags.is_synthesized)
+        {
+            first_tok = leaf.token;
+            break;
+        }
+    }
+    if (first_tok.isNone()) return .{};
+
+    const region_end: usize = @min(@as(usize, token_buffer.getToken(first_tok).byte_offset), source.len);
+    var prev_real_end: ?usize = null;
+    var scan_idx: u32 = first_tok.asInt();
+    while (scan_idx > 0) {
+        scan_idx -= 1;
+        const prev_rec = token_buffer.getToken(TokenIndex.fromInt(scan_idx));
+        if (!prev_rec.flags.is_synthesized) {
+            prev_real_end = @min(@as(usize, prev_rec.byte_offset) + @as(usize, prev_rec.byte_len), region_end);
+            break;
+        }
+    }
+
+    const region_start: usize = if (prev_real_end) |prev_end| blk_start: {
+        var skip_cur = prev_end;
+        while (skip_cur < region_end) {
+            if (source[skip_cur] == '\n') {
+                skip_cur += 1;
+                break;
+            }
+            if (source[skip_cur] == '/' and skip_cur + 1 < region_end) {
+                if (source[skip_cur + 1] == '/') {
+                    while (skip_cur < region_end and source[skip_cur] != '\n') : (skip_cur += 1) {}
+                    if (skip_cur < region_end and source[skip_cur] == '\n') skip_cur += 1;
+                    break;
+                } else if (source[skip_cur + 1] == '*') {
+                    skip_cur += 2;
+                    var blk_depth: u32 = 1;
+                    while (skip_cur < region_end and blk_depth > 0) {
+                        if (source[skip_cur] == '/' and skip_cur + 1 < region_end and source[skip_cur + 1] == '*') {
+                            blk_depth += 1;
+                            skip_cur += 2;
+                        } else if (source[skip_cur] == '*' and skip_cur + 1 < region_end and source[skip_cur + 1] == '/') {
+                            blk_depth -= 1;
+                            skip_cur += 2;
+                        } else {
+                            skip_cur += 1;
+                        }
+                    }
+                    continue;
+                }
+            }
+            skip_cur += 1;
+        }
+        break :blk_start skip_cur;
+    } else skipLeadingBomAndShebangInPrefix(source, region_end);
+
+    if (region_start >= region_end) return .{};
+
+    var doc_line_count: u16 = 0;
+    var consecutive_newlines: u32 = 0;
+    var cursor: usize = region_start;
+    while (cursor < region_end) {
+        const byte_val = source[cursor];
+        if (byte_val == ' ' or byte_val == '\t' or byte_val == '\r') {
+            cursor += 1;
+        } else if (byte_val == '\n') {
+            consecutive_newlines += 1;
+            if (consecutive_newlines >= 2) {
+                doc_line_count = 0;
+            }
+            cursor += 1;
+        } else if (byte_val == '/' and cursor + 1 < region_end and source[cursor + 1] == '/') {
+            const com_start = cursor;
+            while (cursor < region_end and source[cursor] != '\n') : (cursor += 1) {}
+            const raw_comment = std.mem.trimEnd(u8, source[com_start..cursor], "\r\n");
+            const is_outer_doc = std.mem.startsWith(u8, raw_comment, "///") and
+                !std.mem.startsWith(u8, raw_comment, "////");
+            if (is_outer_doc) {
+                consecutive_newlines = 0;
+                doc_line_count +|= 1;
+            } else {
+                doc_line_count = 0;
+                consecutive_newlines = 0;
+            }
+        } else if (byte_val == '/' and cursor + 1 < region_end and source[cursor + 1] == '*') {
+            cursor += 2;
+            var blk_depth: u32 = 1;
+            while (cursor < region_end and blk_depth > 0) {
+                if (source[cursor] == '/' and cursor + 1 < region_end and source[cursor + 1] == '*') {
+                    blk_depth += 1;
+                    cursor += 2;
+                } else if (source[cursor] == '*' and cursor + 1 < region_end and source[cursor + 1] == '/') {
+                    blk_depth -= 1;
+                    cursor += 2;
+                } else {
+                    cursor += 1;
+                }
+            }
+            doc_line_count = 0;
+            consecutive_newlines = 0;
+        } else {
+            doc_line_count = 0;
+            cursor += 1;
+        }
+    }
+
+    if (doc_line_count == 0) return .{};
+    return .{
+        .doc_first_tok = first_tok.asInt(),
+        .doc_line_count = doc_line_count,
+        .flags = 0,
+    };
+}
+
 /// Appends a single top-level or flattened `extern` member `ItemTreeEntry` into `entries_list`.
 fn appendExtractedAstItemEntry(
     allocator: std.mem.Allocator,
@@ -2874,6 +3082,12 @@ fn appendExtractedAstItemEntry(
             body_cst_node,
         );
 
+    const doc_span = extractItemOuterDocSpan(
+        source,
+        &parsed.token_buffer,
+        &parsed.cst_arena,
+        item_cst_node,
+    );
     const def_id = DefId.init(file_id, @intCast(entries_list.items.len));
     try entries_list.append(allocator, .{
         .def_id = def_id,
@@ -2885,6 +3099,7 @@ fn appendExtractedAstItemEntry(
         .cst_node = item_cst_node,
         .body_ast_node = body_ast_node,
         .body_cst_node = body_cst_node,
+        .doc_span = doc_span,
         .signature_fingerprint = sig_fp,
         .body_fingerprint = body_fp,
     });
@@ -2948,10 +3163,12 @@ fn extractItemTreeFromAst(
         combined_hasher.updateFingerprint(entry.body_fingerprint);
     }
 
+    const mod_doc = extractFileModuleDocSpan(source, &parsed.token_buffer);
     return .{
         .entries = try entries_list.toOwnedSlice(allocator),
         .file_id = file_id,
         .is_including_tests = is_including_tests,
+        .mod_doc = mod_doc,
         .tree_fingerprint = tree_fp,
         .combined_fingerprint = combined_hasher.final(),
         .source_ast_fingerprint = parsed.ast_fingerprint,
@@ -6715,6 +6932,9 @@ pub const CompilerDb = struct {
     /// Stage 3: Extracts the position-independent `ItemTree` for `file_id`.
     pub fn extractItemTree(self: *CompilerDb, file_id: FileId) QueryError!*const ItemTree {
         _ = try self.fetchQuery(QueryKey.forFile(.item_tree, file_id));
+        if (self.lowered_artifacts.get(file_id.asInt())) |lowered| {
+            return self.ensureFreshItemTree(file_id, lowered);
+        }
         return self.item_trees.getPtr(file_id.asInt()) orelse error.MissingSourceInput;
     }
 
@@ -8064,6 +8284,22 @@ pub const CompilerDb = struct {
                 existing_tree.is_including_tests == is_including_tests and
                 Fingerprint128.eql(existing_tree.pkg_cfg_fingerprint, pkg_cfg_fp))
             {
+                if (self.source_inputs.getPtr(file_id.asInt())) |inp_ptr| {
+                    if (self.parsed_artifacts.getPtr(file_id.asInt())) |par_ptr| {
+                        existing_tree.mod_doc = extractFileModuleDocSpan(
+                            inp_ptr.owned_text,
+                            &par_ptr.token_buffer,
+                        );
+                        for (existing_tree.entries) |*ent| {
+                            ent.doc_span = extractItemOuterDocSpan(
+                                inp_ptr.owned_text,
+                                &par_ptr.token_buffer,
+                                &par_ptr.cst_arena,
+                                ent.cst_node,
+                            );
+                        }
+                    }
+                }
                 return existing_tree;
             }
         }
@@ -13736,9 +13972,9 @@ test "test_phase76_expr_fn_positional_slash_test_bench_items_and_cxi_visibility_
     const tb_file = FileId.fromInt(72);
     const tb_src =
         \\pub fn helper_fn() -> i32 { return 7; }
-        \\test "alpha case" { let _ = helper_fn(); }
-        \\test "beta case" { let _ = helper_fn(); }
-        \\bench "throughput loop" (bencher: &var Bencher) { let _ = bencher; }
+        \\test "alpha case" { _ = helper_fn(); }
+        \\test "beta case" { _ = helper_fn(); }
+        \\bench "throughput loop" (bencher: &var Bencher) { _ = bencher; }
     ;
     _ = try db.setInput(tb_file, tb_src, .low);
     const tb_tree_with = try db.extractItemTree(tb_file);
@@ -13784,6 +14020,47 @@ test "test_phase76_expr_fn_positional_slash_test_bench_items_and_cxi_visibility_
     const vis_sigs_v2 = try db.resolveSignatures(vis_file);
     try std.testing.expect(Fingerprint128.eql(cxi_fp_v1, vis_sigs_v2.public_interface_fingerprint));
     try std.testing.expect(!Fingerprint128.eql(intra_fp_v1, vis_sigs_v2.signatures_fingerprint));
+
+    // [5] `DR-23` §2.4 8-byte `DocTriviaSpan` updates on doc edits with 100% `signature_fingerprint` Early Cutoff:
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(DocTriviaSpan));
+    const doc_file = FileId.fromInt(90);
+    const doc_v1 =
+        \\//! Module Header Line One
+        \\//! Module Header Line Two
+        \\
+        \\/// Computes initial checksum.
+        \\pub fn compute_crc(seed: u32) -> u32 { return seed; }
+    ;
+    _ = try db.setInput(doc_file, doc_v1, .low);
+    const doc_tree_v1 = try db.extractItemTree(doc_file);
+    try std.testing.expect(doc_tree_v1.mod_doc.hasDocs());
+    try std.testing.expectEqual(@as(u32, 0), doc_tree_v1.mod_doc.doc_first_tok);
+    try std.testing.expectEqual(@as(u16, 2), doc_tree_v1.mod_doc.doc_line_count);
+    try std.testing.expect(doc_tree_v1.entries[0].doc_span.hasDocs());
+    try std.testing.expectEqual(@as(u16, 1), doc_tree_v1.entries[0].doc_span.doc_line_count);
+    const doc_sig_fp_v1 = doc_tree_v1.entries[0].signature_fingerprint;
+    const doc_tree_fp_v1 = doc_tree_v1.tree_fingerprint;
+    _ = try db.resolveSignatures(doc_file);
+    const sig_execs_before = db.telemetry.countExecutions(.resolve_signatures);
+
+    const doc_v2 =
+        \\//! Module Header Line One
+        \\//! Module Header Line Two
+        \\//! Module Header Line Three
+        \\
+        \\/// Computes expanded checksum.
+        \\/// Preserves Early Cutoff across callers.
+        \\pub fn compute_crc(seed: u32) -> u32 { return seed; }
+    ;
+    _ = try db.setInput(doc_file, doc_v2, .low);
+    _ = try db.parseCst(doc_file);
+    const doc_tree_v2 = try db.extractItemTree(doc_file);
+    try std.testing.expectEqual(@as(u16, 3), doc_tree_v2.mod_doc.doc_line_count);
+    try std.testing.expectEqual(@as(u16, 2), doc_tree_v2.entries[0].doc_span.doc_line_count);
+    try std.testing.expect(Fingerprint128.eql(doc_sig_fp_v1, doc_tree_v2.entries[0].signature_fingerprint));
+    try std.testing.expect(Fingerprint128.eql(doc_tree_fp_v1, doc_tree_v2.tree_fingerprint));
+    _ = try db.resolveSignatures(doc_file);
+    try std.testing.expectEqual(sig_execs_before, db.telemetry.countExecutions(.resolve_signatures));
 }
 
 test "test_stage4_cxi_firewall_impl_const_inline_mod_slash_underscore_and_cfg_target" {
@@ -13870,7 +14147,7 @@ test "test_stage4_cxi_firewall_impl_const_inline_mod_slash_underscore_and_cfg_ta
         \\pub mod nested_pub {
         \\    pub fn exported_nested() -> i32 { return 2; }
         \\    pub(pkg) fn hidden_pkg_nested(arg: i64, flag: bool) -> i64 {
-        \\        let _ = flag;
+        \\        _ = flag;
         \\        return arg;
         \\    }
         \\}

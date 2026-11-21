@@ -364,7 +364,7 @@ test "test_fmt_advanced_declarations_function_types_unary_ops_and_patterns" {
 
 test "test_fmt_comment_preservation_empty_containers_and_fmt_off_directives" {
     const src =
-        "//! Module-level doc comment\n" ++
+        "//! Module-level doc comment\n\n" ++
         "// Leading file comment\n" ++
         "pub struct EmptyStruct {\n" ++
         "    // Dangling comment inside empty struct braces\n" ++
@@ -667,7 +667,7 @@ test "test_fmt_preserves_comments_across_slot14_coalesced_trivia" {
         "//! Line 4 of module header\n" ++
         "//! Line 5 of module header\n" ++
         "//! Line 6 of module header\n" ++
-        "//! Line 7 of module header\n" ++
+        "//! Line 7 of module header\n\n" ++
         "// ------------------------------------- PUBLIC API --------------------------------------\n" ++
         "/// Triggers an immediate hardware trap without losing slot-14 coalesced comments.\n" ++
         "@cold\n" ++
@@ -700,7 +700,7 @@ test "test_fmt_dr22_type_canonicalization_multiline_strings_and_attributes" {
         "  line one\n" ++
         "    line two\n" ++
         "  \"\"\";\n" ++
-        "    let _ = (opt_val, res_val, updated, msg);\n" ++
+        "    _ = (opt_val, res_val, updated, msg);\n" ++
         "    fsm: match state {\n" ++
         "        0 => continue :fsm 1,\n" ++
         "        _ => {},\n" ++
@@ -730,7 +730,7 @@ test "test_fmt_dr22_type_canonicalization_multiline_strings_and_attributes" {
     const pascal_exempt_src =
         "@constructor\n" ++
         "pub fn Button(label: str) -> i32 {\n" ++
-        "    let _ = label;\n" ++
+        "    _ = label;\n" ++
         "    return 1;\n" ++
         "}\n\n" ++
         "@builder_item\n" ++
@@ -756,4 +756,91 @@ test "test_fmt_dr22_type_canonicalization_multiline_strings_and_attributes" {
     );
     try std.testing.expectEqual(@as(usize, 0), exempt_sink.diagnostics.items.len);
     try expectCanonicalFormat(pascal_exempt_src, pascal_exempt_src, .{ .is_fix_mode = true });
+}
+
+test "test_fmt_dr23_doc_spacing_fenced_blocks_and_fix_healing" {
+    // [1] `corex fmt` normalizes `///Summary` -> `/// Summary`, preserves indented & fenced ```` ```cx ```` blocks,
+    // strips trailing spaces on empty `///` / `//!` lines, and inserts 1 blank line after `//!`:
+    const unspaced_doc_src =
+        "//!Tight module header\n" ++
+        "//!   \n" ++
+        "//!Second header line\n" ++
+        "///Summary without leading space.\n" ++
+        "///   \n" ++
+        "///     indented list item stays aligned\n" ++
+        "/// ```cx\n" ++
+        "/// let raw = \"\"\"\n" ++
+        "///     kept verbatim\n" ++
+        "///     \"\"\";\n" ++
+        "/// _ = raw;\n" ++
+        "/// ```\n" ++
+        "pub fn documented_api(seed: u32) -> u32 {\n" ++
+        "    _ = seed;\n" ++
+        "    return 42_u32;\n" ++
+        "}\n";
+
+    const expected_doc_src =
+        "//! Tight module header\n" ++
+        "//!\n" ++
+        "//! Second header line\n\n" ++
+        "/// Summary without leading space.\n" ++
+        "///\n" ++
+        "///     indented list item stays aligned\n" ++
+        "/// ```cx\n" ++
+        "/// let raw = \"\"\"\n" ++
+        "///     kept verbatim\n" ++
+        "///     \"\"\";\n" ++
+        "/// _ = raw;\n" ++
+        "/// ```\n" ++
+        "pub fn documented_api(seed: u32) -> u32 {\n" ++
+        "    _ = seed;\n" ++
+        "    return 42_u32;\n" ++
+        "}\n";
+
+    try expectCanonicalFormat(unspaced_doc_src, expected_doc_src, .{});
+
+    // [2] `corex fmt --fix` heals `/** … */` (`E0118`), detached `///` (`E0230`), and `let _ = expr;` (`E0234`):
+    const unhealed_src =
+        "/**\n" ++
+        " * Block doc comment healed to line doc.\n" ++
+        " */\n" ++
+        "pub struct Counter {\n" ++
+        "    pub count: u32,\n" ++
+        "}\n\n" ++
+        "/// Detached doc comment healed by removing blank line.\n\n" ++
+        "pub fn reset_counter(val: u32) -> u32 {\n" ++
+        "    let _ = val;\n" ++
+        "    return 0_u32;\n" ++
+        "}\n";
+
+    var healed_pass1 = try fmt_engine.formatSourceWithOptions(
+        std.testing.allocator,
+        unhealed_src,
+        FileId.fromInt(0),
+        .{ .is_fix_mode = true },
+    );
+    defer healed_pass1.deinit(std.testing.allocator);
+    try std.testing.expect(healed_pass1.is_changed);
+    try std.testing.expect(std.mem.indexOf(u8, healed_pass1.formatted_text, "/**") == null);
+    try std.testing.expect(std.mem.indexOf(u8, healed_pass1.formatted_text, "/// Block doc comment healed to line doc.") != null);
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            healed_pass1.formatted_text,
+            "/// Detached doc comment healed by removing blank line.\npub fn reset_counter",
+        ) != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, healed_pass1.formatted_text, "let _ =") == null);
+    try std.testing.expect(std.mem.indexOf(u8, healed_pass1.formatted_text, "    _ = val;\n") != null);
+
+    var healed_pass2 = try fmt_engine.formatSourceWithOptions(
+        std.testing.allocator,
+        healed_pass1.formatted_text,
+        FileId.fromInt(0),
+        .{},
+    );
+    defer healed_pass2.deinit(std.testing.allocator);
+    try std.testing.expect(!healed_pass2.has_syntax_errors);
+    try std.testing.expect(!healed_pass2.is_changed);
+    try std.testing.expectEqualStrings(healed_pass1.formatted_text, healed_pass2.formatted_text);
 }

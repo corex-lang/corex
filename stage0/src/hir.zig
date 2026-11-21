@@ -4887,7 +4887,7 @@ const HirLowerer = struct {
             return;
         }
 
-        // [2] Wildcard `let _ = init;`:
+        // [2] Fault-tolerant lowering for retired wildcard `let _ = init;` (`E0234` recovery):
         if (else_block_ast.isNone() and !pat_id.isNone() and
             self.ast_arena.getNode(pat_id).tag == .wildcard_pat)
         {
@@ -6460,13 +6460,14 @@ const HirLowerer = struct {
                 if (rhs_id.isNone()) return self.emitUnitConst(tok, stmt_id);
                 const discarded_hir = try self.lowerExpr(rhs_id, self.nodeType(lhs_id));
                 const tmp_slot = try self.allocTempLocal(self.store.getNode(discarded_hir).type_id, tok, false);
-                return self.emitNode(.{
+                const decl_hir = try self.emitNode(.{
                     .tag = .hir_local_decl,
                     .flags = .{ .category = .rvalue, .is_synthetic = true, .is_unsafe = self.is_in_unsafe },
                     .type_id = .unit_ty,
                     .origin_token = tok,
                     .data = .{ .lhs = tmp_slot, .rhs = discarded_hir.asInt() },
                 }, stmt_id);
+                return self.emitSyntheticBlock(&.{decl_hir.asInt()}, .none, .unit_ty, tok);
             }
             const is_parallel = switch (lhs_ast.tag) {
                 .tuple_lit => blk: {
@@ -13533,6 +13534,94 @@ const HirLowerer = struct {
             const raw_recv_ty = self.nodeType(recv_id);
             const unwrapped_recv = self.pool.unwrapUnderlyingType(self.unwrapRefType(raw_recv_ty));
             const recv_tag = self.pool.getTag(unwrapped_recv);
+            if (recv_tag == .result_ty and type_arg_nodes.items.len == 0 and
+                (std.mem.eql(u8, member_name, "ok") or std.mem.eql(u8, member_name, "err")))
+            {
+                const is_ok_proj = std.mem.eql(u8, member_name, "ok");
+                var recv_hir = try self.autoDerefPlace(try self.lowerExpr(recv_id, .err_ty), tok);
+                const cur_recv_ty = self.store.getNode(recv_hir).type_id;
+                const res_ty = self.pool.unwrapUnderlyingType(cur_recv_ty);
+                if (res_ty != cur_recv_ty) {
+                    recv_hir = try self.emitNode(.{
+                        .tag = .hir_cast,
+                        .flags = .{ .category = .rvalue, .is_synthetic = true },
+                        .type_id = res_ty,
+                        .origin_token = tok,
+                        .data = .{ .lhs = recv_hir.asInt(), .rhs = @backingInt(HirCastKind.distinct_unwrap) },
+                    }, .none);
+                }
+                const res_node = self.pool.getNode(res_ty);
+                const ok_ty = self.concreteType(TypeId.fromInt(res_node.lhs));
+                const err_ty = self.concreteType(TypeId.fromInt(res_node.rhs));
+                const proj_ty = if (is_ok_proj) ok_ty else err_ty;
+                const opt_ty = try self.pool.internOptional(proj_ty);
+
+                const ok_local = try self.allocTempLocal(ok_ty, tok, false);
+                const ok_bind = try self.store.appendPat(.{
+                    .type_id = ok_ty,
+                    .origin_token = tok,
+                    .kind = .{ .bind = .{ .local_id = ok_local, .is_mut = false, .is_ref = false } },
+                });
+                const ok_sub = try self.store.appendExtraSlice(&[1]u32{ok_bind});
+                const ok_pat = try self.store.appendPat(.{
+                    .type_id = res_ty,
+                    .origin_token = tok,
+                    .kind = .{ .variant = .{ .tag_ordinal = 0, .payload_ty = ok_ty, .sub_start = ok_sub, .sub_len = 1 } },
+                });
+
+                const err_local = try self.allocTempLocal(err_ty, tok, false);
+                const err_bind = try self.store.appendPat(.{
+                    .type_id = err_ty,
+                    .origin_token = tok,
+                    .kind = .{ .bind = .{ .local_id = err_local, .is_mut = false, .is_ref = false } },
+                });
+                const err_sub = try self.store.appendExtraSlice(&[1]u32{err_bind});
+                const err_pat = try self.store.appendPat(.{
+                    .type_id = res_ty,
+                    .origin_token = tok,
+                    .kind = .{ .variant = .{ .tag_ordinal = 1, .payload_ty = err_ty, .sub_start = err_sub, .sub_len = 1 } },
+                });
+
+                const kept_ref = try self.emitVarRef(if (is_ok_proj) ok_local else err_local, tok, .none);
+                const some_extra = try self.store.appendLenPrefixedExtra(&[1]u32{kept_ref.asInt()});
+                const some_hir = try self.emitNode(.{
+                    .tag = .hir_construct,
+                    .flags = .{ .category = .rvalue, .is_synthetic = true },
+                    .type_id = opt_ty,
+                    .origin_token = tok,
+                    .data = .{ .lhs = @as(u32, @backingInt(HirConstructKind.optional_some)) | (1 << 8), .rhs = some_extra },
+                }, .none);
+                const none_extra = try self.store.appendLenPrefixedExtra(&.{});
+                const none_hir = try self.emitNode(.{
+                    .tag = .hir_construct,
+                    .flags = .{ .category = .rvalue, .is_synthetic = true },
+                    .type_id = opt_ty,
+                    .origin_token = tok,
+                    .data = .{ .lhs = @backingInt(HirConstructKind.optional_none), .rhs = none_extra },
+                }, .none);
+
+                const arm_start: u32 = @intCast(self.store.match_arms.items.len);
+                try self.store.match_arms.append(self.allocator, .{
+                    .pat_idx = ok_pat,
+                    .guard_hir = .none,
+                    .body_hir = if (is_ok_proj) some_hir else none_hir,
+                    .origin_token = tok,
+                });
+                try self.store.match_arms.append(self.allocator, .{
+                    .pat_idx = err_pat,
+                    .guard_hir = .none,
+                    .body_hir = if (is_ok_proj) none_hir else some_hir,
+                    .origin_token = tok,
+                });
+                const match_extra = try self.store.appendExtraSlice(&[2]u32{ arm_start, 2 });
+                return self.emitNode(.{
+                    .tag = .hir_match,
+                    .flags = .{ .category = .rvalue, .is_synthetic = true },
+                    .type_id = opt_ty,
+                    .origin_token = tok,
+                    .data = .{ .lhs = recv_hir.asInt(), .rhs = match_extra },
+                }, expr_id);
+            }
             const union_elem_opt = self.unionSliceElemType(unwrapped_recv);
             const is_seq_ty = recv_tag == .slice_ty or recv_tag == .array_ty or
                 recv_tag == .soa_slice_ty or recv_tag == .soa_array_ty or
@@ -19824,7 +19913,7 @@ test "test_hir_comptime_unrolling_hylo_eval_order_and_resource_caps" {
         \\    var total: usize = 0;
         \\    comptime if @has_field[Pair]("first") {
         \\        comptime for fld in @type_info[Pair]().as_struct().fields {
-        \\            let _ = fld;
+        \\            _ = fld;
         \\            total = total + @size_of[i32]();
         \\        }
         \\    }
@@ -19844,7 +19933,7 @@ test "test_hir_comptime_unrolling_hylo_eval_order_and_resource_caps" {
         \\pub fn too_many_iters() -> i32 {
         \\    var count: i32 = 0;
         \\    comptime for step in 0..5000 {
-        \\        let _ = step;
+        \\        _ = step;
         \\        count = count + 1;
         \\    }
         \\    return count;
@@ -19914,16 +20003,16 @@ test "test_redteam_3a_hir_conjunctive_is_shadow_isolation_comptime_for_and_opera
         \\        unrolled_sum = unrolled_sum + 10;
         \\    }
         \\    comptime for empty_step in 5..5 {
-        \\        let _ = empty_step;
+        \\        _ = empty_step;
         \\        unrolled_sum = unrolled_sum + 999;
         \\    }
         \\    let ctr = Counter { val: 7 };
         \\    let piped: i32 = 5 |> ctr.add_piped(2);
         \\    let cloned_pkt: Packet = pkt.clone();
-        \\    let _ = cloned_pkt.hash();
+        \\    _ = cloned_pkt.hash();
         \\    let raw_s: str = r"a\nb";
         \\    let fmt_str: str = "raw={raw_s} hex=\x41 uni=\u{03B1} sum={unrolled_sum}";
-        \\    let _ = fmt_str;
+        \\    _ = fmt_str;
         \\    return saved_outer + outer_shadow + else_hits + matched_shadow + unrolled_sum + piped;
         \\}
     ;
@@ -19949,7 +20038,7 @@ test "test_redteam_3a_hir_conjunctive_is_shadow_isolation_comptime_for_and_opera
         \\pub fn bad_runtime_break(runtime_cond: bool) -> i32 {
         \\    var acc: i32 = 0;
         \\    comptime for idx in 0..3 {
-        \\        let _ = idx;
+        \\        _ = idx;
         \\        if runtime_cond {
         \\            break;
         \\        }
@@ -20116,7 +20205,7 @@ test "test_phase76_stage4_hir_subscript_single_def_raw_multiline_caller_loc_and_
             \\            """ => 10,
             \\        _ => 0,
             \\    };
-            \\    let _ = raw_hashed;
+            \\    _ = raw_hashed;
             \\    return loc.line + zero_cap_fn() + matched_tag;
             \\}
         ;

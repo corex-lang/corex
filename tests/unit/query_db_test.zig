@@ -773,7 +773,7 @@ test "test_query_db_comptime_derive_impl_methods_memo_isolation_and_invalidation
         "        return self.count + 10;\n" ++
         "    }\n" ++
         "    pub fn id_val[T](&self, item: T) -> T {\n" ++
-        "        let _ = self;\n" ++
+        "        _ = self;\n" ++
         "        return item;\n" ++
         "    }\n" ++
         "}\n" ++
@@ -808,7 +808,7 @@ test "test_query_db_comptime_derive_impl_methods_memo_isolation_and_invalidation
         "        return self.count + 10;\n" ++
         "    }\n" ++
         "    pub fn id_val[T](&self, item: T) -> T {\n" ++
-        "        let _ = self;\n" ++
+        "        _ = self;\n" ++
         "        return item;\n" ++
         "    }\n" ++
         "}\n" ++
@@ -1179,10 +1179,10 @@ test "test_query_db_dr22_cxi_public_interface_firewall_positional_erasure_and_te
         "    return val;\n" ++
         "}\n" ++
         "test \"smoke check\" {\n" ++
-        "    let _ = exported_api(1);\n" ++
+        "    _ = exported_api(1);\n" ++
         "}\n" ++
         "bench \"api bench\" (bencher: &mut Bencher) {\n" ++
-        "    let _ = bencher;\n" ++
+        "    _ = bencher;\n" ++
         "}\n";
 
     // [1] With `include_tests = true` (default), `extractItemTree` retains `test_decl` and `bench_decl`:
@@ -1207,10 +1207,10 @@ test "test_query_db_dr22_cxi_public_interface_firewall_positional_erasure_and_te
         "    return val;\n" ++
         "}\n" ++
         "test \"smoke check\" {\n" ++
-        "    let _ = exported_api(1);\n" ++
+        "    _ = exported_api(1);\n" ++
         "}\n" ++
         "bench \"api bench\" (bencher: &mut Bencher) {\n" ++
-        "    let _ = bencher;\n" ++
+        "    _ = bencher;\n" ++
         "}\n";
     _ = try db.setInput(file_id, src_v2, .low);
     const sigs_v2 = try db.resolveSignatures(file_id);

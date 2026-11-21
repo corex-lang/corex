@@ -434,7 +434,7 @@ test "test_fuzz_vfs_incremental_edits_match_fresh_parse" {
             "}\n" ++
             "pub fn update_counter(cnt: &mut Counter, delta: i32) -> i32 {\n" ++
             "    let glyph_note = \"café • 𐍈𝐀\";\n" ++
-            "    let _ = glyph_note;\n" ++
+            "    _ = glyph_note;\n" ++
             "    cnt.val_num = cnt.val_num +% delta;\n" ++
             "    return cnt.val_num;\n" ++
             "}\n";

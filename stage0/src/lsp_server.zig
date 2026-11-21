@@ -5432,7 +5432,7 @@ fn resolveModuleBackingFileId(
     return .none;
 }
 
-/// Extracts inner `//!` doc comments immediately inside an inline `mod foo { … }`, or falls back to outer `///`.
+/// Extracts outer `///` doc comments attached to an inline `mod foo { … }` declaration (`ADR-23A`).
 fn extractInlineModDocComments(
     session: *LspSession,
     arena_alloc: std.mem.Allocator,
@@ -5440,70 +5440,6 @@ fn extractInlineModDocComments(
     sym_def_id: DefId,
     fallback_cst_node: CstNodeIndex,
 ) ![]const u8 {
-    if (!decl_span.file_id.isNone() and session.db.source_inputs.contains(decl_span.file_id.asInt())) {
-        const decl_fid = decl_span.file_id;
-        if (getLiveDocumentSource(session, decl_fid)) |src| {
-            _ = session.db.parseCst(decl_fid) catch {};
-            if (session.db.parsed_artifacts.getPtr(decl_fid.asInt())) |parsed_art| {
-                var live_cst = fallback_cst_node;
-                if (!sym_def_id.isNone() and sym_def_id.fileId() == decl_fid) {
-                    if (session.db.extractItemTree(decl_fid) catch null) |tree| {
-                        if (tree.getEntry(sym_def_id)) |entry| live_cst = entry.cst_node;
-                    }
-                }
-                const cst_total = parsed_art.cst_arena.countNodes();
-                const tok_total = parsed_art.token_buffer.countTokens();
-                if (!live_cst.isNone() and live_cst.asInt() < cst_total) {
-                    const start_idx: usize = live_cst.asInt();
-                    const end_idx = @min(
-                        start_idx + @max(@as(usize, parsed_art.cst_arena.getNode(live_cst).subtree_size), 1),
-                        cst_total,
-                    );
-                    var lbrace_end_byte: ?usize = null;
-                    var cur = start_idx;
-                    while (cur < end_idx) : (cur += 1) {
-                        const leaf = parsed_art.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
-                        if (leaf.subtree_size <= 1 and !leaf.flags.is_missing_or_injected and
-                            !leaf.token.isNone() and leaf.token.asInt() < tok_total)
-                        {
-                            const tok_rec = parsed_art.token_buffer.getToken(leaf.token);
-                            if (!tok_rec.flags.is_synthesized and tok_rec.kind == .lbrace) {
-                                lbrace_end_byte = @min(
-                                    @as(usize, tok_rec.byte_offset) + @as(usize, tok_rec.byte_len),
-                                    src.len,
-                                );
-                                break;
-                            }
-                        }
-                    }
-                    if (lbrace_end_byte) |after_brace| {
-                        var cursor = after_brace;
-                        while (cursor < src.len and (src[cursor] == ' ' or src[cursor] == '\t' or src[cursor] == '\r')) {
-                            cursor += 1;
-                        }
-                        if (cursor < src.len and src[cursor] == '\n') cursor += 1;
-                        var inner_lines: std.ArrayListUnmanaged([]const u8) = .empty;
-                        while (cursor < src.len) {
-                            var line_end = cursor;
-                            while (line_end < src.len and src[line_end] != '\n') : (line_end += 1) {}
-                            const raw_line = std.mem.trimEnd(u8, src[cursor..line_end], "\r");
-                            const trimmed_start = std.mem.trimStart(u8, raw_line, " \t");
-                            if (!std.mem.startsWith(u8, trimmed_start, "//!")) break;
-                            var content_slice = trimmed_start[3..];
-                            if (content_slice.len > 0 and content_slice[0] == ' ') {
-                                content_slice = content_slice[1..];
-                            }
-                            try inner_lines.append(arena_alloc, content_slice);
-                            cursor = if (line_end < src.len) line_end + 1 else src.len;
-                        }
-                        if (inner_lines.items.len > 0) {
-                            return joinDocLines(arena_alloc, inner_lines.items);
-                        }
-                    }
-                }
-            }
-        }
-    }
     return extractDeclarationDocComments(session, arena_alloc, decl_span, sym_def_id, fallback_cst_node);
 }
 

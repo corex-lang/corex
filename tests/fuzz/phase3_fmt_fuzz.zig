@@ -84,19 +84,19 @@ const FMT_SEED_ITEMS = [_][]const u8{
         "    let piped = val |> step_one() |> step_two();\n" ++
         "    let chained = tail.iter().count_all() + comp;\n" ++
         "    if (rem := piped) > 0 { while (neg < rem) { break; }; };\n" ++
-        "    with context.allocator = &mut scratch { let _ = opt_v orelse 0; }\n" ++
+        "    with context.allocator = &mut scratch { _ = opt_v orelse 0; }\n" ++
         "    return fsm: match (piped) { 0 => continue :fsm 1, 1 => chained, _ => neg, };\n" ++
         "}\n",
-    "test \"formatter prose test\" (raw: &[u8]) -> unit { let _ = raw.len(); }\n",
-    "bench \"formatter bench\" (b: &mut Bencher) -> unit { let _ = b; }\n",
+    "test \"formatter prose test\" (raw: &[u8]) -> unit { _ = raw.len(); }\n",
+    "bench \"formatter bench\" (b: &mut Bencher) -> unit { _ = b; }\n",
     "// corex fmt: off\nconst   RAW_UNTOUCHED:   i32  =   777;\n// corex fmt: on\n",
     "@fmt_off\nconst   ATTR_UNTOUCHED:  i32  =   888;\n",
     "const unfixed_const: i32 = 42\nstruct bad_struct { FieldOne: i32 }\nfn BadFunc( ArgVal: i32 ) -> i32 { return ArgVal }\n",
 };
 
-/// Comment snippets injected at random positions between seed items.
+/// Comment snippets injected at valid positions between seed items.
 const RANDOM_COMMENT_SNIPPETS = [_][]const u8{
-    "//! module doc comment snippet\n",
+    "//! module doc comment snippet\n\n",
     "/// item doc comment snippet\n",
     "// standalone line comment snippet\n",
     "/* inline block comment snippet */\n",
@@ -196,16 +196,22 @@ test "test_fuzz_fmt_idempotency_and_comment_preservation" {
         const frag_count = random.intRangeAtMost(usize, 1, 6);
         var frag_i: usize = 0;
         while (frag_i < frag_count) : (frag_i += 1) {
+            const item = FMT_SEED_ITEMS[random.uintLessThan(usize, FMT_SEED_ITEMS.len)];
             if (random.boolean()) {
-                const cmt = RANDOM_COMMENT_SNIPPETS[
-                    random.uintLessThan(usize, RANDOM_COMMENT_SNIPPETS.len)
-                ];
-                if (byte_len + cmt.len <= source_buf.len) {
+                const raw_cmt_idx = random.uintLessThan(usize, RANDOM_COMMENT_SNIPPETS.len);
+                const is_doc_attachable = !std.mem.startsWith(u8, item, "use ") and
+                    !std.mem.startsWith(u8, item, "//");
+                const cmt_idx: usize = switch (raw_cmt_idx) {
+                    0 => if (frag_i == 0 and byte_len == 0) 0 else 2,
+                    1 => if (is_doc_attachable) 1 else 2,
+                    else => raw_cmt_idx,
+                };
+                const cmt = RANDOM_COMMENT_SNIPPETS[cmt_idx];
+                if (byte_len + cmt.len + item.len <= source_buf.len) {
                     @memcpy(source_buf[byte_len .. byte_len + cmt.len], cmt);
                     byte_len += cmt.len;
                 }
             }
-            const item = FMT_SEED_ITEMS[random.uintLessThan(usize, FMT_SEED_ITEMS.len)];
             if (byte_len + item.len <= source_buf.len) {
                 @memcpy(source_buf[byte_len .. byte_len + item.len], item);
                 byte_len += item.len;

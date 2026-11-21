@@ -103,7 +103,7 @@ const PHASE6_SEED_ITEMS = [_][]const u8{
     "pub fn view_head_slice(items: &[i64]) -> &[i64] = items;\n",
     "pub fn bump_first_slot(target: &mut [i64; 4], delta: i64) {\n    target[0] = delta;\n}\n",
     "pub struct Arena {\n    pub bump_tag: usize,\n}\n" ++
-        "pub fn close_arena(arena_in: own Arena) {\n    let Arena { bump_tag: _ } = arena_in;\n}\n" ++
+        "pub fn close_arena(arena_in: own Arena) {\n    let Arena { bump_tag: _bump_tag } = arena_in;\n}\n" ++
         "pub struct OwnedHeapBuf {\n    pub raw_handle: usize,\n    pub byte_len: usize,\n}\n" ++
         "impl OwnedHeapBuf {\n    pub fn drop(&mut self) {}\n}\n" ++
         "pub fn alloc_ctx_buf(size_n: usize) -> OwnedHeapBuf {\n" ++
@@ -140,7 +140,7 @@ const PHASE6_SEED_ITEMS = [_][]const u8{
         "}\n",
     "pub fn linear_orelse_and_loop(is_ready: bool) -> i64 {\n" ++
         "    let live_tok = maybe_ticket(is_ready, 19) orelse return 0;\n" ++
-        "    defer { let _ = close_ticket(own live_tok); }\n" ++
+        "    defer { _ = close_ticket(own live_tok); }\n" ++
         "    var loop_sum: i64 = 0;\n" ++
         "    var step_idx: i64 = 0;\n" ++
         "    while step_idx < 2 {\n" ++
@@ -160,7 +160,7 @@ const PHASE6_SEED_ITEMS = [_][]const u8{
         "}\n",
     "pub fn linear_defer_and_errdefer(is_ok: bool) -> i64!u32 {\n" ++
         "    let ticket = LinearTicket { code: 19 };\n" ++
-        "    defer { let _ = close_ticket(own ticket); }\n" ++
+        "    defer { _ = close_ticket(own ticket); }\n" ++
         "    var rollback_note: i64 = 0;\n" ++
         "    errdefer { rollback_note = 1; }\n" ++
         "    if not is_ok { return .Err(3); }\n" ++
@@ -173,7 +173,7 @@ const PHASE6_SEED_ITEMS = [_][]const u8{
         "    bump_first_slot(&mut local_arr, 99);\n" ++
         "    let guard_buf = TrackedBuf { tag: 77 };\n" ++
         "    if cond_flag {\n" ++
-        "        let _ = consume_buf(own guard_buf);\n" ++
+        "        _ = consume_buf(own guard_buf);\n" ++
         "    }\n" ++
         "    return snap_len;\n" ++
         "}\n",
@@ -200,7 +200,7 @@ const PHASE6_SEED_ITEMS = [_][]const u8{
         "    let fsm_v: i64 = fsm: match FsmTag.First {\n" ++
         "        .First => {\n" ++
         "            let arm_guard = TrackedBuf { tag: 44 };\n" ++
-        "            let _ = arm_guard.tag;\n" ++
+        "            _ = arm_guard.tag;\n" ++
         "            continue :fsm .Second;\n" ++
         "        }\n" ++
         "        .Second => pair_upd.primary.tag +% pair_upd.secondary.tag,\n" ++
@@ -213,7 +213,7 @@ const PHASE6_SEED_ITEMS = [_][]const u8{
 const PHASE6_MUTATION_SNIPPETS = [_][]const u8{
     "pub fn bad_use_after_move() -> i64 {\n" ++
         "    let owned_buf = TrackedBuf { tag: 11 };\n" ++
-        "    let _ = consume_buf(own owned_buf);\n" ++
+        "    _ = consume_buf(own owned_buf);\n" ++
         "    return owned_buf.tag;\n" ++
         "}\n",
     "pub fn bad_loan_conflict() -> usize {\n" ++
@@ -409,7 +409,7 @@ fn generateWellTypedPhase6Program(
             "}\n" ++
             "pub struct Arena {\n    pub bump_tag: usize,\n}\n" ++
             "pub fn close_arena(arena_in: own Arena) {\n" ++
-            "    let Arena { bump_tag: _ } = arena_in;\n" ++
+            "    let Arena { bump_tag: _bump_tag } = arena_in;\n" ++
             "}\n",
     );
 
@@ -444,7 +444,7 @@ fn generateWellTypedPhase6Program(
     );
 
     const return_tail = if (prog_idx % 23 == 22)
-        "    let _ = acc + outer_guard.id;\n    let near_max: i64 = 9223372036854775806;\n    return near_max + ((safe_seed & 7) + 2);\n}\n"
+        "    _ = acc + outer_guard.id;\n    let near_max: i64 = 9223372036854775806;\n    return near_max + ((safe_seed & 7) + 2);\n}\n"
     else
         "    return acc + outer_guard.id;\n}\n";
 

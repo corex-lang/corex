@@ -542,7 +542,7 @@ test "test_mir_opt_d5_layout_shape_dedup_positive_and_negative_soundness_guards"
     // `i32` vs `u32` division/comparison, and distinct field-offset 8-byte tuples never merge):
     const neg_src =
         \\pub fn ptr_type_label[T](ptr_val: T) -> str {
-        \\    let _ = ptr_val;
+        \\    _ = ptr_val;
         \\    return @type_name[T]();
         \\}
         \\
@@ -990,7 +990,7 @@ test "test_mir_opt_release_r4_sccp_switch_fusion_commutative_gvn_r5_dce_and_r6_i
         \\    let fixed_mode: i64 = 2;
         \\    let mode_tag: i64 = if fixed_mode == 2 { 20 } else { 90 };
         \\    let dead_calc = (tag_in + 123) * 3;
-        \\    let _ = dead_calc;
+        \\    _ = dead_calc;
         \\    if mode_tag == 10 {
         \\        return tag_in + 1;
         \\    } else if mode_tag == 20 {

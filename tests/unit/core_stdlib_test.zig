@@ -506,8 +506,8 @@ test "test_core_stdlib_four_tier_differential_oracle_end_to_end" {
         "\n" ++
         "    record_drop_trace(101);\n" ++
         "    record_drop_trace(202);\n" ++
-        "    let _ = write_stdout(\"core-stdout-ok\\n\");\n" ++
-        "    let _ = write_stderr(\"core-stderr-ok\\n\");\n" ++
+        "    _ = write_stdout(\"core-stdout-ok\\n\");\n" ++
+        "    _ = write_stderr(\"core-stderr-ok\\n\");\n" ++
         "\n" ++
         "    return padded_slot.value +\n" ++
         "        (prev_u32 as i32) +\n" ++

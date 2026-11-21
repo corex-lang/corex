@@ -878,3 +878,68 @@ test "test_lexer_dr22_retired_ampamp_brace_escapes_multiline_byte_literals_and_f
     defer std.testing.allocator.free(decoded_braces);
     try std.testing.expectEqualStrings("{ok}", decoded_braces);
 }
+
+// ---------- Phase 10.6 (DR-23) Block Doc Diagnostics ----------
+
+test "test_lexer_dr23_block_doc_comments_e0118_and_four_slash_banners" {
+    // [1] Empty `/**/`, non-doc `/***/`, nested `/* … */`, and `////`+ banners emit zero errors (`ADR-23A`):
+    const valid_comments_src =
+        "//! Module header doc\n" ++
+        "/**/ /***/ /* outer /* inner */ comment */\n" ++
+        "//// Four-slash banner comment\n" ++
+        "///// Five-slash banner comment\n" ++
+        "/// Exact three-slash item doc\n" ++
+        "pub const LIMIT: u32 = 16;\n";
+
+    var ok_buf = TokenBuffer.init(std.testing.allocator);
+    defer ok_buf.deinit();
+    var ok_sink = DiagnosticSink.init(std.testing.allocator);
+    defer ok_sink.deinit();
+
+    try corex.tokenize(valid_comments_src, FileId.fromInt(0), &ok_buf, &ok_sink, null);
+    try std.testing.expectEqual(@as(u32, 0), ok_sink.error_count);
+    try std.testing.expectEqual(@as(u32, 0), ok_sink.warning_count);
+    try expectLosslessRoundTrip(valid_comments_src, &ok_buf);
+
+    var doc_count: usize = 0;
+    var mod_doc_count: usize = 0;
+    var line_cmt_count: usize = 0;
+    var block_cmt_count: usize = 0;
+    for (ok_buf.getLeadingTrivia(TokenIndex.fromInt(0))) |piece| {
+        switch (piece.kind) {
+            .doc_comment => doc_count += 1,
+            .module_doc_comment => mod_doc_count += 1,
+            .line_comment => line_cmt_count += 1,
+            .block_comment => block_cmt_count += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), mod_doc_count);
+    try std.testing.expectEqual(@as(usize, 1), doc_count);
+    try std.testing.expectEqual(@as(usize, 2), line_cmt_count);
+    try std.testing.expectEqual(@as(usize, 3), block_cmt_count);
+
+    // [2] Banned `/** … */` and `/*! … */` block doc comments emit `E0118` with auto-fix suggestions:
+    const banned_block_doc_cases = [_][]const u8{
+        "/** Single-line outer block doc */\npub fn ping() -> u32 = 1;\n",
+        "/**\n * Multiline outer block doc\n * with aligned star border.\n */\npub struct Slot { pub id: u32 }\n",
+        "/*! Inner block module doc */\npub const SEED: u32 = 7;\n",
+    };
+    for (banned_block_doc_cases) |bad_src| {
+        var bad_buf = TokenBuffer.init(std.testing.allocator);
+        defer bad_buf.deinit();
+        var bad_sink = DiagnosticSink.init(std.testing.allocator);
+        defer bad_sink.deinit();
+        var interner = try StringInterner.init(std.testing.allocator);
+        defer interner.deinit();
+
+        try corex.tokenize(bad_src, FileId.fromInt(0), &bad_buf, &bad_sink, &interner);
+        try std.testing.expectEqual(@as(u32, 1), bad_sink.error_count);
+        try std.testing.expectEqual(
+            DiagnosticCode.e0118_block_doc_comment_forbidden,
+            bad_sink.asSlice()[0].code,
+        );
+        try std.testing.expect(bad_sink.asSlice()[0].suggestions.len >= 1);
+        try expectLosslessRoundTrip(bad_src, &bad_buf);
+    }
+}

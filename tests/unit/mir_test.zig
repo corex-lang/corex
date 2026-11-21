@@ -1437,8 +1437,8 @@ test "test_regression_comptime_with_context_allocator_synthetic_ptr_cast" {
         \\    pub fn as_handle(&self) -> usize = 0;
         \\}
         \\pub fn run_ctx_arena_and_log() -> i64 {
-        \\    let _ = context.allocator;
-        \\    let _ = context.logger;
+        \\    _ = context.allocator;
+        \\    _ = context.logger;
         \\    var arena = Arena { cap: 56 };
         \\    defer arena.release();
         \\    let local_log = LocalLog { level: 3 };
@@ -1559,4 +1559,65 @@ test "test_phase76_mir_labeled_fsm_parallel_swap_and_bool_int_zext" {
             &[_]mir_vm.RegSlot{.{ .scalar_u64 = 0 }},
         ),
     );
+}
+
+// ----------- Phase 10.6 (DR-23) Immediate AutoDrop ------------
+
+test "test_phase106_mir_discard_stmt_immediate_autodrop_before_next_statement" {
+    const discard_drop_src =
+        \\pub struct ScopedGuard {
+        \\    pub tag: i64,
+        \\}
+        \\impl ScopedGuard {
+        \\    pub fn drop(&mut self) {
+        \\        @drop_trace(self.tag);
+        \\    }
+        \\}
+        \\@must_use
+        \\pub fn make_guard(tag: i64) -> ScopedGuard = ScopedGuard { tag: tag };
+        \\pub fn verify_immediate_discard_drop() -> i64 {
+        \\    let block_guard = make_guard(10);
+        \\    _ = make_guard(20);
+        \\    @drop_trace(30);
+        \\    return block_guard.tag;
+        \\}
+    ;
+
+    var bundle = try corex.lowerAndVerifySourceMirSast(
+        std.testing.allocator,
+        FileId.fromInt(90),
+        discard_drop_src,
+        TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer bundle.deinit();
+    try std.testing.expect(!bundle.diagnostics.hasErrors());
+
+    const entry_body = bundle.mir_module.findBodyByName(
+        &bundle.interner,
+        "verify_immediate_discard_drop",
+    ).?;
+
+    var rodata = mir_vm.RodataPool.init(std.testing.allocator);
+    defer rodata.deinit();
+    var vm = try mir_vm.MirVm.init(
+        std.testing.allocator,
+        &bundle.interner,
+        &bundle.pool,
+        &bundle.sym_table,
+        &rodata,
+        null,
+        null,
+        .{ .target_layout = TargetLayout.NATIVE_64 },
+    );
+    defer vm.deinit();
+    for (bundle.mir_module.bodies.items) |*body_ptr| {
+        _ = try vm.registerBody(body_ptr, body_ptr.symbol_index);
+    }
+
+    const eval_res = try vm.evalBody(entry_body, &.{});
+    try std.testing.expectEqual(@as(i64, 10), eval_res.slot.scalar_i64);
+    // `_ = make_guard(20);` drops `20` immediately before `@drop_trace(30);`, while `block_guard` (`10`) drops at `}`:
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 20, 30, 10 }, vm.asDropTraceSlice());
+    try std.testing.expectEqual(@as(u32, 0), vm.countUnfreedHeapAllocations());
 }

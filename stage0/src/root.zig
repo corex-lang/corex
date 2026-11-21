@@ -26,7 +26,7 @@ pub const parser = @import("parser.zig");
 pub const query_db = @import("query_db.zig");
 /// Hybrid steerable Wadler-Lindig formatter (`corex fmt`), 8-byte `DocArena`, and `--fix` engine.
 pub const fmt_engine = @import("fmt_engine.zig");
-/// Zero-legacy `corex upgrade` three-tier rule catalog (`DR-14`, `DR-21`, & `DR-22`).
+/// Zero-legacy `corex upgrade` three-tier rule catalog (`DR-14`, `DR-21`, `DR-22`, & `DR-23`).
 pub const upgrade_rules = @import("upgrade_rules.zig");
 /// Zero-legacy 3-tier CST/AST/semantic source and manifest migration engine (`corex upgrade`, `DR-14`).
 pub const upgrade_engine = @import("upgrade_engine.zig");
@@ -156,7 +156,7 @@ pub const LineIndex = vfs_sourcemap.LineIndex;
 pub const VfsSourceMap = vfs_sourcemap.VfsSourceMap;
 /// Ergonomic alias for `VfsSourceMap`.
 pub const SourceMap = vfs_sourcemap.SourceMap;
-/// 120-variant lexical token taxonomy (`DR-03`, `DR-21`, & `DR-22`).
+/// 120-variant lexical token taxonomy (`DR-03`, `DR-21`, `DR-22`, & `DR-23`).
 pub const TokenKind = syntax_arenas.TokenKind;
 /// 1-byte bit-packed token trivia and lexical recovery flags.
 pub const TokenFlags = syntax_arenas.TokenFlags;
@@ -264,6 +264,8 @@ pub const MemoHeader = query_db.MemoHeader;
 pub const QueryError = query_db.QueryError;
 /// Top-level declaration category tag in `ItemTree`.
 pub const ItemKind = query_db.ItemKind;
+/// Packed 8-byte `TriviaPiece` slice reference for $O(1)$ declaration and module doc hover extraction (`ADR-23A`).
+pub const DocTriviaSpan = query_db.DocTriviaSpan;
 /// Single top-level declaration entry in a file's `ItemTree`.
 pub const ItemTreeEntry = query_db.ItemTreeEntry;
 /// Position-independent top-level `ItemTree` firewall for a source file.
@@ -318,17 +320,17 @@ pub const formatByteRange = fmt_engine.formatByteRange;
 // ------------------ Upgrade Rules Re-Exports ------------------
 /// Three-tier execution stage in `corex upgrade` (`DR-14` §2.2).
 pub const UpgradeEngineTier = upgrade_rules.UpgradeEngineTier;
-/// Specification wave introducing an upgrade rule (`DR-21` or `DR-22`).
+/// Specification wave introducing an upgrade rule (`DR-21`, `DR-22`, or `DR-23`).
 pub const UpgradeWave = upgrade_rules.UpgradeWave;
-/// Contiguous 1-byte identifier for canonical `corex upgrade` rules (`0..14`).
+/// Contiguous 1-byte identifier for canonical `corex upgrade` rules.
 pub const UpgradeRuleId = upgrade_rules.UpgradeRuleId;
 /// Static metadata descriptor for a `corex upgrade` transformation rule.
 pub const UpgradeRuleDescriptor = upgrade_rules.UpgradeRuleDescriptor;
-/// Total number of canonical `corex upgrade` rules (`15`).
+/// Total number of canonical `corex upgrade` rules (`UPGRADE_RULE_CATALOG.len`).
 pub const UPGRADE_RULE_COUNT = upgrade_rules.UPGRADE_RULE_COUNT;
 /// Maximum fixed-point synergy passes executed by `corex upgrade` (`4`).
 pub const MAX_SYNERGY_PASSES = upgrade_rules.MAX_SYNERGY_PASSES;
-/// Dense 15-entry `corex upgrade` rule catalog (`UR-21-00`–`UR-22-06`).
+/// Dense `corex upgrade` rule catalog (`UR-21-00`–`UR-23-06`).
 pub const UPGRADE_RULE_CATALOG = upgrade_rules.UPGRADE_RULE_CATALOG;
 /// Resolves a `"UR-XX-YY"` rule code to its `UpgradeRuleId` in $O(1)$ time.
 pub const lookupUpgradeRule = upgrade_rules.lookupUpgradeRule;

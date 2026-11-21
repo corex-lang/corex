@@ -308,7 +308,7 @@ test "test_diff_oracle_four_tier_sys_exit_and_deliberate_runtime_trap_parity" {
         "//! `@sys_exit` 4-Tier Parity\n" ++
         "pub fn main() -> i32 {\n" ++
         "    @drop_trace(55);\n" ++
-        "    let _ = @sys_write(1, \"bye-37\\n\");\n" ++
+        "    _ = @sys_write(1, \"bye-37\\n\");\n" ++
         "    @sys_exit(37);\n" ++
         "}\n";
     var exit_report = try expectFourTierParity(allocator, io, sys_exit_src);
@@ -393,7 +393,7 @@ test "test_cli_end_to_end_build_emit_c_emit_llvm_fuzz_run_test_diff_backends_and
         "}\n" ++
         "\n" ++
         "pub fn main() -> i32 {\n" ++
-        "    let _ = @sys_write(1, \"cli-run-ok\\n\");\n" ++
+        "    _ = @sys_write(1, \"cli-run-ok\\n\");\n" ++
         "    return compute_tag(5) - 20;\n" ++
         "}\n";
 
@@ -1046,7 +1046,7 @@ test "test_regression_four_tier_context_arena_closure_drop_and_dependent_default
         \\
         \\pub fn run_arena_context() -> i32 {
         \\    let initial_alloc = context.allocator;
-        \\    let _ = initial_alloc._handle;
+        \\    _ = initial_alloc._handle;
         \\    var local_arena = Arena { bump_tag: 99 };
         \\    defer local_arena.release();
         \\    with context.allocator = &mut local_arena {
@@ -1062,11 +1062,11 @@ test "test_regression_four_tier_context_arena_closure_drop_and_dependent_default
         \\    let active_tok = CancelToken { _handle: 33 };
         \\    let inner_res: i32 = with context.cancel_token = active_tok {
         \\        let inner_probe = CtxDropProbe { marker: 100 };
-        \\        let _ = inner_probe.marker;
+        \\        _ = inner_probe.marker;
         \\        read_cancel(7)
         \\    };
         \\    let outer_probe = CtxDropProbe { marker: 200 };
-        \\    let _ = outer_probe.marker;
+        \\    _ = outer_probe.marker;
         \\    let snap_ctx = context;
         \\    return inner_res + read_cancel(0) + (snap_ctx.rng_seed as i32);
         \\}
@@ -1229,7 +1229,7 @@ test "test_phase76_four_tier_parity_dr22_strings_fmt_update_swap_subscript_loc_b
         \\        hdr={tag_num}
         \\        ok
         \\        """;
-        \\    let _ = @sys_write(1, banner);
+        \\    _ = @sys_write(1, banner);
         \\
         \\    let magic_bytes: &[u8; 4] = b"CX\x2a!";
         \\    let byte_nl: u8 = b'\n';
@@ -1237,7 +1237,7 @@ test "test_phase76_four_tier_parity_dr22_strings_fmt_update_swap_subscript_loc_b
         \\
         \\    let hex_val: u32 = 0x2a_u32;
         \\    let fmt_line: str = "\n{{{hex_val:08x}|{hex_val=}}}\n";
-        \\    let _ = @sys_write(1, fmt_line);
+        \\    _ = @sys_write(1, fmt_line);
         \\    let fmt_score: i32 = fmt_line.len() as i32;
         \\
         \\    let base_cfg = ConfigCopy { width: 10, height: 20, scale: 3 };

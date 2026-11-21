@@ -6,6 +6,7 @@
 //!
 //! Methods operate on shared `&self` borrows using `&raw self.inner` raw-address projections inside
 //! `@std_cap_boundary(clears: [unsafe_op])` boundaries so callers need neither `var` nor `unsafe`.
+
 // ---------------------------------------- TYPES ----------------------------------------
 /// Hardware and compiler atomic memory ordering lattice (`DR-08`, `DR-22` §4.1).
 pub enum MemoryOrder: u8 {

@@ -2,7 +2,7 @@
 //!
 //! Enforces zero colored emojis across the entire repository, 100% parity between `router.zig`
 //! tables and `corex --help`, `DIAGNOSTIC_CATALOG` subsystem prefix integrity, Phase 1–10 IR/VM/
-//! SAST/ABI/Async/Pkg struct layouts, `DR-08`/`DR-11`/`DR-16`–`DR-22` seams, enum contiguity, and
+//! SAST/ABI/Async/Pkg struct layouts, `DR-08`/`DR-11`/`DR-16`–`DR-23` seams, enum contiguity, and
 //! diagnostic coverage, plus `< 150` column line length and 90-char dividers in `.zig`/`.cx` files.
 //!
 //! Prevents code/documentation drift and stylistic regressions automatically during `zig build test`.
@@ -1054,8 +1054,8 @@ test "test_drift_guard_phase7_5_dr21_surface_syntax_and_diagnostics" {
         try std.testing.expectEqual(@as(u8, @intCast(i)), resolved.?.slot_ordinal);
     }
 
-    // [4] Verify all 8 `DR-21` `DiagnosticCode` tags (`128` total catalog entries) and test coverage:
-    try std.testing.expectEqual(@as(usize, 128), diagnostic.DIAGNOSTIC_CATALOG.len);
+    // [4] Verify all 8 `DR-21` `DiagnosticCode` tags (`138` total catalog entries) and test coverage:
+    try std.testing.expectEqual(@as(usize, 138), diagnostic.DIAGNOSTIC_CATALOG.len);
     const dr21_specs = [_]struct {
         /// Canonical Phase 7.5 `DR-21` `DiagnosticCode` tag.
         code: DiagnosticCode,
@@ -1109,10 +1109,10 @@ test "test_drift_guard_phase7_5_dr21_surface_syntax_and_diagnostics" {
 }
 
 test "test_drift_guard_phase7_6_dr22_surface_syntax_upgrade_rules_and_diagnostics" {
-    // [1] Verify 15-rule `UPGRADE_RULE_CATALOG` (`UR-21-00`–`UR-21-07` & `UR-22-00`–`UR-22-06`):
+    // [1] Verify 22-rule `UPGRADE_RULE_CATALOG` (`UR-21-00`–`UR-21-07`, `UR-22-00`–`UR-22-06`, `UR-23-00`–`UR-23-06`):
     try expectContiguousEnum(corex.UpgradeRuleId);
     const upgrade_catalog = corex.upgrade_rules.UPGRADE_RULE_CATALOG;
-    try std.testing.expectEqual(@as(usize, 15), upgrade_catalog.len);
+    try std.testing.expectEqual(@as(usize, 22), upgrade_catalog.len);
 
     const expected_rule_codes = [_][]const u8{
         "UR-21-00",
@@ -1130,6 +1130,13 @@ test "test_drift_guard_phase7_6_dr22_surface_syntax_upgrade_rules_and_diagnostic
         "UR-22-04",
         "UR-22-05",
         "UR-22-06",
+        "UR-23-00",
+        "UR-23-01",
+        "UR-23-02",
+        "UR-23-03",
+        "UR-23-04",
+        "UR-23-05",
+        "UR-23-06",
     };
     for (upgrade_catalog, 0..) |rule_desc, i| {
         try std.testing.expectEqual(i, @as(usize, @backingInt(rule_desc.id)));
@@ -1545,7 +1552,7 @@ test "test_drift_guard_phase9_pkg_seams_diagnostics_and_cli" {
 
     // [5] Verify all 7 new Phase 9 `DiagnosticCode` tags (`E0010`–`E0016`) + reused `DR-17` codes (`E0324`–`E0327`,
     //     `E0435`, `W0330`) in `DIAGNOSTIC_CATALOG`, `stage0/src/`, and `tests/unit/`:
-    try std.testing.expectEqual(@as(usize, 128), diagnostic.DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 138), diagnostic.DIAGNOSTIC_CATALOG.len);
     try std.testing.expectEqual(
         DiagnosticCode.e0435_invalid_cfg_predicate,
         DiagnosticCode.e0435_unknown_cfg_feature,
@@ -1617,10 +1624,10 @@ test "test_drift_guard_phase9_pkg_seams_diagnostics_and_cli" {
 }
 
 test "test_drift_guard_phase10_tooling_lsp_check_and_upgrade" {
-    // [1] Verify `DIAGNOSTIC_CATALOG` (`128` contiguous entries) and `W0202` / `W0403` coverage:
+    // [1] Verify `DIAGNOSTIC_CATALOG` (`138` contiguous entries) and `W0202` / `W0403` coverage:
     try expectContiguousEnum(DiagnosticCode);
-    try std.testing.expectEqual(@as(usize, 128), diagnostic.DIAGNOSTIC_CATALOG.len);
-    try std.testing.expectEqual(@as(usize, 128), std.enums.values(DiagnosticCode).len);
+    try std.testing.expectEqual(@as(usize, 138), diagnostic.DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 138), std.enums.values(DiagnosticCode).len);
 
     const phase10_diag_specs = [_]struct {
         /// Canonical Phase 10 `DiagnosticCode` tag exercised by `check` and `upgrade`.
@@ -1745,10 +1752,10 @@ test "test_drift_guard_phase10_tooling_lsp_check_and_upgrade" {
         try std.testing.expect(std.mem.indexOf(u8, lsp_help_text, lsp_desc.summary) != null);
     }
 
-    // [4] Verify `UPGRADE_RULE_CATALOG` (`15` contiguous rules `UR-21-00`–`UR-21-07`, `UR-22-00`–`UR-22-06`):
+    // [4] Verify `UPGRADE_RULE_CATALOG` (`22` contiguous rules `UR-21-00`–`UR-23-06`):
     try expectContiguousEnum(corex.UpgradeRuleId);
-    try std.testing.expectEqual(@as(usize, 15), corex.UPGRADE_RULE_COUNT);
-    try std.testing.expectEqual(@as(usize, 15), corex.UPGRADE_RULE_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 22), corex.UPGRADE_RULE_COUNT);
+    try std.testing.expectEqual(@as(usize, 22), corex.UPGRADE_RULE_CATALOG.len);
     const expected_rule_codes = [_][]const u8{
         "UR-21-00",
         "UR-21-01",
@@ -1765,6 +1772,13 @@ test "test_drift_guard_phase10_tooling_lsp_check_and_upgrade" {
         "UR-22-04",
         "UR-22-05",
         "UR-22-06",
+        "UR-23-00",
+        "UR-23-01",
+        "UR-23-02",
+        "UR-23-03",
+        "UR-23-04",
+        "UR-23-05",
+        "UR-23-06",
     };
     for (corex.UPGRADE_RULE_CATALOG, 0..) |rule_desc, i| {
         try std.testing.expectEqual(i, @as(usize, rule_desc.id.asInt()));
@@ -1784,4 +1798,134 @@ test "test_drift_guard_phase10_tooling_lsp_check_and_upgrade" {
     try std.testing.expectEqual(@as(usize, 1024 * 1024), corex.lsp_server.MAX_CLIENT_URI_MAP_BYTES);
     try std.testing.expectEqual(@as(usize, 64), corex.lsp_server.MAX_SEMANTIC_TOKEN_CACHE_ENTRIES);
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), corex.lsp_server.MAX_SEMANTIC_TOKEN_CACHE_BYTES);
+}
+
+test "test_drift_guard_phase106_dr23_diagnostics_tokens_and_upgrade_rules" {
+    // [1] Verify `TokenKind` remains frozen at `120` variants (`8` spare bits in `TokenSet128`, `DR-23` §2.1):
+    try expectContiguousEnum(TokenKind);
+    const token_count = std.enums.values(TokenKind).len;
+    try std.testing.expectEqual(@as(usize, 120), token_count);
+    try std.testing.expectEqual(@as(usize, 8), 128 - token_count);
+    try std.testing.expect(!@hasField(TokenKind, "kw_elif"));
+    try std.testing.expect(!@hasField(TokenKind, "kw_elsif"));
+    try std.testing.expect(!@hasField(TokenKind, "kw_elseif"));
+
+    // [2] Verify all 10 `DR-23` `DiagnosticCode` tags (`138` total catalog entries) and `.err` severity:
+    try expectContiguousEnum(DiagnosticCode);
+    try std.testing.expectEqual(@as(usize, 138), diagnostic.DIAGNOSTIC_CATALOG.len);
+    const dr23_diag_specs = [_]struct {
+        /// Canonical Phase 10.6 `DR-23` `DiagnosticCode` tag.
+        code: DiagnosticCode,
+        /// Expected 5-character CLI diagnostic code string.
+        expected_str: []const u8,
+    }{
+        .{ .code = .e0118_block_doc_comment_forbidden, .expected_str = "E0118" },
+        .{ .code = .e0229_misplaced_module_doc_comment, .expected_str = "E0229" },
+        .{ .code = .e0230_unattached_doc_comment, .expected_str = "E0230" },
+        .{ .code = .e0231_visibility_on_impl_block, .expected_str = "E0231" },
+        .{ .code = .e0232_inline_method_in_type_decl, .expected_str = "E0232" },
+        .{ .code = .e0233_invalid_elif_keyword, .expected_str = "E0233" },
+        .{ .code = .e0234_non_binding_wildcard_let_var, .expected_str = "E0234" },
+        .{ .code = .e0235_all_wildcard_destructuring_assign, .expected_str = "E0235" },
+        .{ .code = .e0236_missing_colon_before_type, .expected_str = "E0236" },
+        .{ .code = .e0439_pointless_unit_or_used_discard, .expected_str = "E0439" },
+    };
+    try std.testing.expectEqual(@as(usize, 10), dr23_diag_specs.len);
+
+    var diag_tag_names: [dr23_diag_specs.len][]const u8 = undefined;
+    var has_src_ref: [dr23_diag_specs.len]bool = @splat(false);
+    var has_test_ref: [dr23_diag_specs.len]bool = @splat(false);
+    for (dr23_diag_specs, 0..) |spec, i| {
+        const cat_entry = diagnostic.DIAGNOSTIC_CATALOG[@backingInt(spec.code)];
+        try std.testing.expectEqual(spec.code, cat_entry.code);
+        try std.testing.expectEqualStrings(spec.expected_str, spec.code.asCodeStr());
+        try std.testing.expectEqualStrings(spec.expected_str, cat_entry.code_str);
+        try std.testing.expectEqual(corex.Severity.err, cat_entry.default_severity);
+        try std.testing.expect(cat_entry.title.len > 0);
+        try std.testing.expect(cat_entry.explanation.len > 0);
+        diag_tag_names[i] = @tagName(spec.code);
+    }
+    try markReferencedIdentifiersInDir(
+        std.testing.allocator,
+        std.testing.io,
+        "stage0/src",
+        &diag_tag_names,
+        &has_src_ref,
+    );
+    try markReferencedIdentifiersInDir(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/unit",
+        &diag_tag_names,
+        &has_test_ref,
+    );
+    for (0..dr23_diag_specs.len) |i| {
+        if (!has_src_ref[i]) {
+            std.debug.print(
+                "Phase 10.6 diagnostic `{s}` is not referenced in `stage0/src/`\n",
+                .{diag_tag_names[i]},
+            );
+        }
+        try std.testing.expect(has_src_ref[i]);
+        if (!has_test_ref[i]) {
+            std.debug.print(
+                "Phase 10.6 diagnostic `{s}` is not referenced in `tests/unit/`\n",
+                .{diag_tag_names[i]},
+            );
+        }
+        try std.testing.expect(has_test_ref[i]);
+    }
+
+    // [3] Verify all 7 `DR-23` `UpgradeRuleId` entries (`UR-23-00`–`UR-23-06`) under `.dr23_phase106`:
+    try expectContiguousEnum(corex.UpgradeRuleId);
+    try std.testing.expectEqual(@as(usize, 22), corex.UPGRADE_RULE_COUNT);
+    const dr23_rule_specs = [_]struct {
+        /// Canonical `DR-23` `UpgradeRuleId` tag (`15..21`).
+        id: corex.UpgradeRuleId,
+        /// Expected `"UR-23-XX"` rule code string.
+        rule_code: []const u8,
+    }{
+        .{ .id = .ur_23_00_block_doc_comments_to_line_docs, .rule_code = "UR-23-00" },
+        .{ .id = .ur_23_01_doc_comment_placement_and_attachment, .rule_code = "UR-23-01" },
+        .{ .id = .ur_23_02_elif_to_else_if, .rule_code = "UR-23-02" },
+        .{ .id = .ur_23_03_impl_visibility_and_inline_type_methods, .rule_code = "UR-23-03" },
+        .{ .id = .ur_23_04_canonical_wildcard_discard_stmt, .rule_code = "UR-23-04" },
+        .{ .id = .ur_23_05_foreign_scalar_type_names, .rule_code = "UR-23-05" },
+        .{ .id = .ur_23_06_missing_colon_before_type, .rule_code = "UR-23-06" },
+    };
+    for (dr23_rule_specs) |rule_spec| {
+        const desc = corex.UPGRADE_RULE_CATALOG[rule_spec.id.asInt()];
+        try std.testing.expectEqual(rule_spec.id, desc.id);
+        try std.testing.expectEqualStrings(rule_spec.rule_code, desc.rule_code);
+        try std.testing.expectEqual(corex.upgrade_rules.UpgradeWave.dr23_phase106, desc.wave);
+        try std.testing.expectEqual(rule_spec.id, corex.lookupUpgradeRule(rule_spec.rule_code).?);
+        try std.testing.expect(desc.summary.len > 0);
+    }
+
+    // [4] Verify `ADR-23D` O(1) foreign-scalar suggestion lookup tables (`DR-23` §2.1 & §3.1):
+    const foreign_scalar_pairs = [_]struct {
+        /// Foreign-language scalar spelling rejected as a built-in primitive.
+        foreign_name: []const u8,
+        /// Canonical CoreX lowercase `PRIM_TYPE` replacement.
+        canonical_prim: []const u8,
+    }{
+        .{ .foreign_name = "U32", .canonical_prim = "u32" },
+        .{ .foreign_name = "UInt32", .canonical_prim = "u32" },
+        .{ .foreign_name = "Bool", .canonical_prim = "bool" },
+        .{ .foreign_name = "Float64", .canonical_prim = "f64" },
+        .{ .foreign_name = "USize", .canonical_prim = "usize" },
+        .{ .foreign_name = "Void", .canonical_prim = "unit" },
+        .{ .foreign_name = "Opaque", .canonical_prim = "opaque" },
+    };
+    for (foreign_scalar_pairs) |pair| {
+        try std.testing.expectEqualStrings(
+            pair.canonical_prim,
+            corex.symbol_resolver.lookupUnambiguousForeignScalar(pair.foreign_name).?,
+        );
+        try std.testing.expectEqualStrings(
+            pair.canonical_prim,
+            corex.symbol_resolver.lookupForeignScalarHint(pair.foreign_name).?,
+        );
+    }
+    try std.testing.expect(corex.symbol_resolver.lookupUnambiguousForeignScalar("PacketHeader") == null);
 }

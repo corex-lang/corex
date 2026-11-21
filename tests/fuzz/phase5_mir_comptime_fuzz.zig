@@ -307,7 +307,7 @@ fn generateWellTypedDifferentialProgram(
 
     // [3] Emit `entry_main(seed: i64) -> i64` exercising `DR-21` `is`, `:=`, `orelse`, `$`, `for`, `search:`, & `with`:
     const final_tail = if (is_overflow_probe)
-        "    let _ = dr21_total;\n    let max_pos: i64 = 9223372036854775806;\n    return max_pos + (safe_seed & 7);\n}\n"
+        "    _ = dr21_total;\n    let max_pos: i64 = 9223372036854775806;\n    return max_pos + (safe_seed & 7);\n}\n"
     else
         "    return pair.left + pair.right + tup.0 - tup.1 + matched + mode_val + audit_acc + (small_sum as i64) + dr21_total;\n}\n";
 

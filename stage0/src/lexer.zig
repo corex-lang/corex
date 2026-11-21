@@ -2062,7 +2062,7 @@ pub const Lexer = struct {
                         );
                     } else if (second_byte == '*') {
                         const block_start: u32 = @intCast(self.cursor);
-                        if (try self.scanNestedBlockComment(has_trivia_error)) {
+                        if (try self.scanNestedBlockComment(has_trivia_error, true)) {
                             self.trivia_acc.has_newline = true;
                         }
                         try self.appendTriviaSpan(
@@ -2094,11 +2094,18 @@ pub const Lexer = struct {
     }
 
     /// Scans a nestable `/* … */` block comment starting at `cursor`, returning `true` if it spans `\n`.
-    fn scanNestedBlockComment(self: *Lexer, has_error: *bool) !bool {
-        const open_start: u32 = @intCast(self.cursor);
+    fn scanNestedBlockComment(self: *Lexer, has_error: *bool, is_trivia_context: bool) !bool {
+        const open_idx: usize = self.cursor;
+        const open_start: u32 = @intCast(open_idx);
+        const is_inner_block_doc = open_idx + 2 < self.source.len and self.source[open_idx + 2] == '!';
+        const is_outer_block_doc = open_idx + 2 < self.source.len and
+            self.source[open_idx + 2] == '*' and
+            (open_idx + 3 >= self.source.len or
+                (self.source[open_idx + 3] != '*' and self.source[open_idx + 3] != '/'));
         self.cursor += 2;
         var depth: u32 = 1;
         var has_newline = false;
+        var had_inner_utf8_err = false;
 
         while (self.cursor < self.source.len and depth > 0) {
             const byte_val = self.source[self.cursor];
@@ -2117,7 +2124,12 @@ pub const Lexer = struct {
             } else if (byte_val < 0x80) {
                 self.cursor += 1;
             } else {
-                try self.validateAndAdvanceUtf8Codepoint(has_error);
+                var had_utf8_step_err = false;
+                try self.validateAndAdvanceUtf8Codepoint(&had_utf8_step_err);
+                if (had_utf8_step_err) {
+                    has_error.* = true;
+                    had_inner_utf8_err = true;
+                }
             }
         }
 
@@ -2129,8 +2141,265 @@ pub const Lexer = struct {
                 "unterminated block comment `/* … */`",
                 "block comment opened here was never closed before end of file",
             );
+        } else if (is_inner_block_doc or is_outer_block_doc) {
+            has_error.* = true;
+            try self.emitBlockDocCommentError(
+                open_start,
+                @intCast(self.cursor),
+                is_inner_block_doc,
+                is_trivia_context and !had_inner_utf8_err,
+            );
         }
         return has_newline;
+    }
+
+    /// Returns `true` if `[open_start .. close_end)` sits before token `0` and is followed by a blank line.
+    fn isDetachedFileTopBlockDoc(self: *const Lexer, open_start: u32, close_end: u32) bool {
+        if (self.token_buffer.countTokens() != 0) return false;
+        const limit: usize = @min(@as(usize, open_start), self.source.len);
+        var scan_idx: usize = 0;
+        if (limit >= 3 and
+            self.source[0] == 0xEF and
+            self.source[1] == 0xBB and
+            self.source[2] == 0xBF)
+        {
+            scan_idx = 3;
+        }
+        if (scan_idx + 1 < limit and self.source[scan_idx] == '#' and self.source[scan_idx + 1] == '!') {
+            scan_idx += 2;
+            while (scan_idx < limit and self.source[scan_idx] != '\n' and self.source[scan_idx] != '\r') {
+                scan_idx += 1;
+            }
+        }
+        while (scan_idx < limit) {
+            const cur_byte = self.source[scan_idx];
+            if (cur_byte == ' ' or cur_byte == '\t' or cur_byte == '\r' or cur_byte == '\n') {
+                scan_idx += 1;
+            } else if (scan_idx + 2 < limit and
+                cur_byte == '/' and
+                self.source[scan_idx + 1] == '/' and
+                self.source[scan_idx + 2] == '!')
+            {
+                scan_idx += 3;
+                while (scan_idx < limit and self.source[scan_idx] != '\n' and self.source[scan_idx] != '\r') {
+                    scan_idx += 1;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        var after_idx: usize = @min(@as(usize, close_end), self.source.len);
+        var line_breaks: u32 = 0;
+        while (after_idx < self.source.len) {
+            const cur_byte = self.source[after_idx];
+            if (cur_byte == ' ' or cur_byte == '\t') {
+                after_idx += 1;
+            } else if (cur_byte == '\r') {
+                line_breaks += 1;
+                after_idx += 1;
+                if (after_idx < self.source.len and self.source[after_idx] == '\n') {
+                    after_idx += 1;
+                }
+            } else if (cur_byte == '\n') {
+                line_breaks += 1;
+                after_idx += 1;
+            } else {
+                break;
+            }
+        }
+        return line_breaks >= 2;
+    }
+
+    /// Emits `E0118` (`e0118_block_doc_comment_forbidden`) with a `.machine_applicable` `///` or `//!` rewrite.
+    fn emitBlockDocCommentError(
+        self: *Lexer,
+        open_start: u32,
+        close_end: u32,
+        is_inner_block_doc: bool,
+        is_trivia_context: bool,
+    ) !void {
+        const sink = self.diagnostic_sink orelse return;
+        const comment_span = Span.init(self.file_id, open_start, close_end);
+        const use_module_doc = is_inner_block_doc or
+            (is_trivia_context and self.isDetachedFileTopBlockDoc(open_start, close_end));
+        const marker_text: []const u8 = if (use_module_doc) "//!" else "///";
+        const primary_labels = [_]LabeledSpan{.{
+            .span = comment_span,
+            .label = if (use_module_doc)
+                "block doc comments are forbidden (`ADR-23A`); use `//!` lines"
+            else
+                "block doc comments are forbidden (`ADR-23A`); use `///` lines",
+            .style = .primary,
+        }};
+        const msg_text: []const u8 = if (is_inner_block_doc)
+            "inner block doc comment `/*! … */` is forbidden; write top-of-file `//!` lines instead"
+        else
+            "outer block doc comment `/** … */` is forbidden; write `///` lines instead";
+
+        if (is_trivia_context) {
+            if (self.interner) |str_interner| {
+                const arena_alloc = sink.arena.asAllocator();
+                const open_usize: usize = @intCast(open_start);
+                const close_usize: usize = @intCast(close_end);
+                if (close_usize >= open_usize + 5 and close_usize <= self.source.len) {
+                    var line_start: usize = open_usize;
+                    while (line_start > 0 and
+                        self.source[line_start - 1] != '\n' and
+                        self.source[line_start - 1] != '\r')
+                    {
+                        line_start -= 1;
+                    }
+                    var is_pure_indent = true;
+                    for (self.source[line_start..open_usize]) |ind_byte| {
+                        if (ind_byte != ' ' and ind_byte != '\t') {
+                            is_pure_indent = false;
+                            break;
+                        }
+                    }
+                    const base_indent: []const u8 = if (is_pure_indent)
+                        self.source[line_start..open_usize]
+                    else
+                        "";
+
+                    const inner = self.source[open_usize + 3 .. close_usize - 2];
+                    var builder: std.ArrayListUnmanaged(u8) = .empty;
+                    const has_inner_newline = std.mem.indexOfAny(u8, inner, "\r\n") != null;
+
+                    if (!has_inner_newline) {
+                        const trimmed = std.mem.trim(u8, inner, " \t");
+                        try builder.appendSlice(arena_alloc, marker_text);
+                        if (trimmed.len > 0) {
+                            try builder.append(arena_alloc, ' ');
+                            try builder.appendSlice(arena_alloc, trimmed);
+                        }
+                    } else {
+                        var line_count: usize = 1;
+                        var count_pos: usize = 0;
+                        while (count_pos < inner.len) {
+                            if (inner[count_pos] == '\r') {
+                                line_count += 1;
+                                count_pos += if (count_pos + 1 < inner.len and inner[count_pos + 1] == '\n') 2 else 1;
+                            } else if (inner[count_pos] == '\n') {
+                                line_count += 1;
+                                count_pos += 1;
+                            } else {
+                                count_pos += 1;
+                            }
+                        }
+                        var seg_idx: usize = 0;
+                        var has_emitted_line = false;
+                        var pos: usize = 0;
+                        while (pos <= inner.len) : (seg_idx += 1) {
+                            const nl_rel = std.mem.indexOfAnyPos(u8, inner, pos, "\r\n");
+                            const seg_end = nl_rel orelse inner.len;
+                            const raw_line = inner[pos..seg_end];
+
+                            if (seg_idx == 0) {
+                                const first_trimmed = std.mem.trim(u8, raw_line, " \t");
+                                if (first_trimmed.len > 0) {
+                                    try builder.appendSlice(arena_alloc, marker_text);
+                                    try builder.append(arena_alloc, ' ');
+                                    try builder.appendSlice(arena_alloc, first_trimmed);
+                                    has_emitted_line = true;
+                                }
+                            } else if (seg_idx + 1 == line_count and std.mem.trim(u8, raw_line, " \t").len == 0) {
+                                // Skip trailing closing-delimiter indentation line before `*/`.
+                            } else {
+                                const after_ws = std.mem.trimStart(u8, raw_line, " \t");
+                                var content: []const u8 = after_ws;
+                                if (after_ws.len == 1 and after_ws[0] == '*') {
+                                    content = "";
+                                } else if (after_ws.len >= 2 and
+                                    after_ws[0] == '*' and
+                                    (after_ws[1] == ' ' or after_ws[1] == '\t'))
+                                {
+                                    content = if (after_ws[1] == ' ') after_ws[2..] else after_ws[1..];
+                                }
+                                content = std.mem.trimEnd(u8, content, " \t");
+
+                                if (has_emitted_line) {
+                                    try builder.append(arena_alloc, '\n');
+                                    try builder.appendSlice(arena_alloc, base_indent);
+                                }
+                                try builder.appendSlice(arena_alloc, marker_text);
+                                if (content.len > 0) {
+                                    try builder.append(arena_alloc, ' ');
+                                    try builder.appendSlice(arena_alloc, content);
+                                }
+                                has_emitted_line = true;
+                            }
+
+                            if (nl_rel) |found_nl| {
+                                pos = if (inner[found_nl] == '\r' and
+                                    found_nl + 1 < inner.len and
+                                    inner[found_nl + 1] == '\n')
+                                    found_nl + 2
+                                else
+                                    found_nl + 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        if (!has_emitted_line) {
+                            try builder.appendSlice(arena_alloc, marker_text);
+                        }
+                    }
+
+                    // Preserve any code placed on the same line after `*/` by inserting a line break:
+                    var edit_end_usize: usize = close_usize;
+                    var scan_after: usize = close_usize;
+                    while (scan_after < self.source.len and
+                        (self.source[scan_after] == ' ' or self.source[scan_after] == '\t'))
+                    {
+                        scan_after += 1;
+                    }
+                    if (scan_after < self.source.len and
+                        self.source[scan_after] != '\n' and
+                        self.source[scan_after] != '\r')
+                    {
+                        edit_end_usize = scan_after;
+                        try builder.append(arena_alloc, '\n');
+                        try builder.appendSlice(arena_alloc, base_indent);
+                    }
+
+                    const fix_edits = try arena_alloc.alloc(TextEdit, 1);
+                    fix_edits[0] = .{
+                        .file_id = self.file_id,
+                        .start_byte = open_start,
+                        .end_byte = @intCast(edit_end_usize),
+                        .replacement_id = try str_interner.intern(builder.items),
+                    };
+                    const fixes = try arena_alloc.alloc(SuggestedFix, 1);
+                    fixes[0] = .{
+                        .message = if (use_module_doc)
+                            "rewrite block doc comment as `//!` module doc lines"
+                        else
+                            "rewrite block doc comment as `///` outer doc lines",
+                        .applicability = .machine_applicable,
+                        .priority = .syntax_canonicalization,
+                        .edits = fix_edits,
+                    };
+                    try sink.emit(.{
+                        .code = .e0118_block_doc_comment_forbidden,
+                        .severity = .err,
+                        .primary_span = comment_span,
+                        .message = msg_text,
+                        .labels = &primary_labels,
+                        .suggestions = fixes,
+                    });
+                    return;
+                }
+            }
+        }
+
+        try sink.emit(.{
+            .code = .e0118_block_doc_comment_forbidden,
+            .severity = .err,
+            .primary_span = comment_span,
+            .message = msg_text,
+            .labels = &primary_labels,
+        });
     }
 
     /// Validates a single UTF-8 multi-byte sequence at `cursor`, emitting `E0101` on invalid bytes.
@@ -3089,7 +3358,7 @@ pub const Lexer = struct {
                         self.cursor += 2;
                         try self.scanToEndOfLineValidatingUtf8(has_lexer_error);
                     } else if (self.source[self.cursor + 1] == '*') {
-                        _ = try self.scanNestedBlockComment(has_lexer_error);
+                        _ = try self.scanNestedBlockComment(has_lexer_error, false);
                     } else {
                         self.cursor += 1;
                     }
@@ -4714,4 +4983,66 @@ test "test_stage4_single_line_hashed_raw_quote_runs_and_nested_interp" {
     const cooked_three_quotes = try cookStringLiteral(std.testing.allocator, "r##\"\"\"\"\"##");
     defer std.testing.allocator.free(cooked_three_quotes);
     try std.testing.expectEqualStrings("\"\"\"", cooked_three_quotes);
+}
+
+test "test_adr23a_e0118_block_doc_comments_and_ordinary_star_block_comments" {
+    // `/**/` and `/***/` and nested `/* /** inner */ */` must emit zero errors:
+    const clean_src = "/**/ /***/ /**** banner ****/ /* outer /** inner */ /*! inner */ end */ pub fn ok() {}\n";
+    var clean_buf = TokenBuffer.init(std.testing.allocator);
+    defer clean_buf.deinit();
+    var clean_sink = DiagnosticSink.init(std.testing.allocator);
+    defer clean_sink.deinit();
+    try tokenize(clean_src, FileId.fromInt(0), &clean_buf, &clean_sink, null);
+    try std.testing.expectEqual(@as(u32, 0), clean_sink.error_count);
+
+    // `/*! … */` and `/** … */` must emit `E0118` with machine-applicable `//!` / `///` fixes:
+    const bad_src =
+        "/**\n" ++
+        " * Detached file header.\n" ++
+        " */\n\n" ++
+        "/** Single-line item doc. */ pub struct Item {\n" ++
+        "    /*! Misplaced inner block doc. */\n" ++
+        "    pub count: u32,\n" ++
+        "}\n";
+    var bad_buf = TokenBuffer.init(std.testing.allocator);
+    defer bad_buf.deinit();
+    var bad_sink = DiagnosticSink.init(std.testing.allocator);
+    defer bad_sink.deinit();
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    try tokenize(bad_src, FileId.fromInt(1), &bad_buf, &bad_sink, &interner);
+    try std.testing.expectEqual(@as(u32, 3), bad_sink.error_count);
+
+    var fixes: [3]SuggestedFix = undefined;
+    for (bad_sink.asSlice(), 0..) |diag_item, i| {
+        try std.testing.expectEqual(DiagnosticCode.e0118_block_doc_comment_forbidden, diag_item.code);
+        fixes[i] = diag_item.suggestions[0];
+    }
+
+    const patch_res = try diagnostic.TransactionalPatcher.apply(
+        std.testing.allocator,
+        bad_src,
+        FileId.fromInt(1),
+        &fixes,
+        &interner,
+    );
+    defer std.testing.allocator.free(patch_res.patched_source);
+    try std.testing.expectEqual(@as(u32, 3), patch_res.applied_count);
+    try std.testing.expectEqualStrings(
+        "//! Detached file header.\n\n" ++
+            "/// Single-line item doc.\n" ++
+            "pub struct Item {\n" ++
+            "    //! Misplaced inner block doc.\n" ++
+            "    pub count: u32,\n" ++
+            "}\n",
+        patch_res.patched_source,
+    );
+
+    var relex_buf = TokenBuffer.init(std.testing.allocator);
+    defer relex_buf.deinit();
+    var relex_sink = DiagnosticSink.init(std.testing.allocator);
+    defer relex_sink.deinit();
+    try tokenize(patch_res.patched_source, FileId.fromInt(1), &relex_buf, &relex_sink, &interner);
+    try std.testing.expectEqual(@as(u32, 0), relex_sink.error_count);
 }

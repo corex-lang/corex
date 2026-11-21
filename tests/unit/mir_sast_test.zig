@@ -357,10 +357,10 @@ test "test_phase6_ownership_tiers_trivial_arena_drop_secret_context_and_wire_e03
         \\    let encoded: &[u8] = hdr.as_bytes();
         \\    let decoded: WireHeader? = @from_bytes[WireHeader](raw);
         \\    let viewed: (&WireHeader)? = @view_bytes[WireHeader](encoded);
-        \\    let _ = trace_ptr;
-        \\    let _ = seed_val;
-        \\    let _ = decoded;
-        \\    let _ = viewed;
+        \\    _ = trace_ptr;
+        \\    _ = seed_val;
+        \\    _ = decoded;
+        \\    _ = viewed;
         \\    return encoded.len();
         \\}
     ;
@@ -607,9 +607,9 @@ test "test_phase6_ownership_tiers_trivial_arena_drop_secret_context_and_wire_e03
         \\    let ptr_bytes = ptr_pkt.as_bytes();
         \\    let sec_bytes = sec_env.as_bytes();
         \\    let bad_bool: bool? = @from_bytes[bool](raw_bytes);
-        \\    let _ = ptr_bytes;
-        \\    let _ = sec_bytes;
-        \\    let _ = bad_bool;
+        \\    _ = ptr_bytes;
+        \\    _ = sec_bytes;
+        \\    _ = bad_bool;
         \\    return pad_bytes.len();
         \\}
     ;
@@ -782,7 +782,7 @@ test "test_phase6_linear_completeness_e0304_defer_errdefer_and_double_close_e031
         \\    return .Ok(0);
         \\}
         \\pub fn close_lease(lease: own SocketLease) {
-        \\    let SocketLease { port: _ } = lease;
+        \\    let SocketLease { port: _port } = lease;
         \\}
         \\pub fn leak_on_try_unwind(flag: bool) -> i32!i32 {
         \\    let lease = SocketLease { port: 8080 };
@@ -804,10 +804,10 @@ test "test_phase6_linear_completeness_e0304_defer_errdefer_and_double_close_e031
         \\    return .Ok(100);
         \\}
         \\pub fn commit_tx(session: own TxSession) {
-        \\    let TxSession { tx_id: _ } = session;
+        \\    let TxSession { tx_id: _tx_id } = session;
         \\}
         \\pub fn rollback_tx(session: own TxSession) {
-        \\    let TxSession { tx_id: _ } = session;
+        \\    let TxSession { tx_id: _tx_id } = session;
         \\}
         \\pub fn run_with_defer(flag: bool) -> i64 {
         \\    let session = TxSession { tx_id: 1 };
@@ -841,7 +841,7 @@ test "test_phase6_linear_completeness_e0304_defer_errdefer_and_double_close_e031
         \\    }
         \\}
         \\pub fn close_file(tok: own FileToken) {
-        \\    let FileToken { handle: _ } = tok;
+        \\    let FileToken { handle: _handle } = tok;
         \\}
         \\pub fn bad_double_cleanup() {
         \\    let tok = FileToken { handle: 4 };
@@ -879,7 +879,7 @@ test "test_phase6_nll_exclusivity_e0305_over_64_loans_mut_move_out_and_set_drop_
         \\pub fn ok_shortened_borrow() -> i64 {
         \\    var arr: [i64; 4] = [1, 2, 3, 4];
         \\    let view = head_slice(&arr);
-        \\    let _ = view;
+        \\    _ = view;
         \\    write_head(&mut arr);
         \\    return arr[0];
         \\}
@@ -1037,7 +1037,7 @@ test "test_phase6_w0308_per_arena_tracking_and_d04_scratch_ping_pong_e0328" {
         \\        self.cursor = 0;
         \\    }
         \\    pub fn deinit(own self) {
-        \\        let BumpArena { cursor: _ } = self;
+        \\        let BumpArena { cursor: _cursor } = self;
         \\    }
         \\}
         \\pub fn loop_arenas_clean(iters: usize) -> usize {
@@ -1075,7 +1075,7 @@ test "test_phase6_w0308_per_arena_tracking_and_d04_scratch_ping_pong_e0328" {
         \\        self.cursor = 0;
         \\    }
         \\    pub fn deinit(own self) {
-        \\        let BumpArena { cursor: _ } = self;
+        \\        let BumpArena { cursor: _cursor } = self;
         \\    }
         \\}
         \\pub fn loop_with_one_unused_arena(iters: usize) -> usize {
@@ -1364,7 +1364,7 @@ test "test_phase6_region_escape_e0306_return_param_flow_wrapper_and_closures" {
         \\        return &self.buf;
         \\    }
         \\    pub fn deinit(own self) {
-        \\        let BumpArena { buf: _ } = self;
+        \\        let BumpArena { buf: _buf } = self;
         \\    }
         \\}
         \\pub fn escape_inner_region_via_closure(fallback: &[u8]) -> usize {
@@ -1535,7 +1535,7 @@ test "test_phase6_max_stack_e0316_malformed_attr_and_contracts_e0320_to_e0323" {
         \\    return cb(ctx);
         \\}
         \\pub fn pure_cb(ctx: &Context) -> usize {
-        \\    let _ = ctx;
+        \\    _ = ctx;
         \\    return 0;
         \\}
         \\pub fn alloc_cb(ctx: &Context) -> usize {
@@ -2047,7 +2047,7 @@ test "test_phase6_intv_lattice_pentagon_subrow_and_wasm32_usize_clamp" {
         \\    let sum_pair = table[checked_idx] +% table[wrapped_idx];
         \\    let low_bits: usize = raw_idx & 255;
         \\    let narrowed: u32 = low_bits.narrow[u32]();
-        \\    let _ = sum_pair;
+        \\    _ = sum_pair;
         \\    return narrowed;
         \\}
     ;
@@ -2342,7 +2342,7 @@ test "test_phase6_audit_regressions_overflow_params_drops_and_cross_file_caps" {
         \\    }
         \\    pub fn deinit(own self) {
         \\        @drop_trace(100 + self.id);
-        \\        let TrackedBuf { id: _ } = self;
+        \\        let TrackedBuf { id: _id } = self;
         \\    }
         \\}
         \\pub struct BufPair {
@@ -2421,7 +2421,7 @@ test "test_phase6_audit_regressions_overflow_params_drops_and_cross_file_caps" {
         \\    pub right: LinearLease,
         \\}
         \\pub fn release_lease(lease: own LinearLease) {
-        \\    let LinearLease { handle: _ } = lease;
+        \\    let LinearLease { handle: _handle } = lease;
         \\}
         \\pub fn split_and_release_both(pair: own LeasePair) {
         \\    release_lease(own pair.left);
@@ -3161,7 +3161,7 @@ test "test_regression_context_handle_escape_e0306_and_allocator_slot_isolation" 
         \\    let inner_temp = Allocator { _handle: 8192 };
         \\    with context.temp_allocator = inner_temp {
         \\        let scratch_only = alloc_temp(16);
-        \\        let _ = scratch_only.len;
+        \\        _ = scratch_only.len;
         \\        return alloc_primary(64);
         \\    }
         \\}

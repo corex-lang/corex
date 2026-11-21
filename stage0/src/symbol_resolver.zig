@@ -1404,6 +1404,59 @@ pub const C_PRIMITIVE_TYPE_ALIAS_MAP = std.StaticStringMap(void).initComptime(.{
     .{ "c_void", {} },
 });
 
+/// $O(1)$ static lookup map from unambiguous `PascalCase` foreign scalar spellings to CoreX primitives (`ADR-23D`).
+pub const UNAMBIGUOUS_FOREIGN_SCALAR_MAP = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "Bool", "bool" },
+    .{ "Char", "char" },
+    .{ "F32", "f32" },
+    .{ "F64", "f64" },
+    .{ "Float32", "f32" },
+    .{ "Float64", "f64" },
+    .{ "I128", "i128" },
+    .{ "I16", "i16" },
+    .{ "I32", "i32" },
+    .{ "I64", "i64" },
+    .{ "I8", "i8" },
+    .{ "ISize", "isize" },
+    .{ "Int128", "i128" },
+    .{ "Int16", "i16" },
+    .{ "Int32", "i32" },
+    .{ "Int64", "i64" },
+    .{ "Int8", "i8" },
+    .{ "Isize", "isize" },
+    .{ "Never", "never" },
+    .{ "Opaque", "opaque" },
+    .{ "Str", "str" },
+    .{ "U128", "u128" },
+    .{ "U16", "u16" },
+    .{ "U32", "u32" },
+    .{ "U64", "u64" },
+    .{ "U8", "u8" },
+    .{ "UInt128", "u128" },
+    .{ "UInt16", "u16" },
+    .{ "UInt32", "u32" },
+    .{ "UInt64", "u64" },
+    .{ "UInt8", "u8" },
+    .{ "USize", "usize" },
+    .{ "Uint128", "u128" },
+    .{ "Uint16", "u16" },
+    .{ "Uint32", "u32" },
+    .{ "Uint64", "u64" },
+    .{ "Uint8", "u8" },
+    .{ "Unit", "unit" },
+    .{ "Usize", "usize" },
+    .{ "Void", "unit" },
+});
+
+/// $O(1)$ static lookup map from width-ambiguous lowercase C/Go/TS scalar spellings to CoreX hints (`ADR-23D`).
+const LOWERCASE_FOREIGN_SCALAR_HINT_MAP = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "double", "f64" },
+    .{ "float", "f32" },
+    .{ "int", "i32" },
+    .{ "string", "str" },
+    .{ "uint", "u32" },
+});
+
 /// $O(1)$ static lookup map from declaration `@attr` identifiers to `HeaderAttrKind`.
 const HEADER_ATTR_MAP = std.StaticStringMap(HeaderAttrKind).initComptime(.{
     .{ "align", .align_attr },
@@ -5153,8 +5206,13 @@ pub const SymbolTable = struct {
         mask: NamespaceMask,
     ) ?[]const u8 {
         if (query_text.len < 2 or query_text.len > MAX_EDIT_DISTANCE_LEN) return null;
-        if (mask.is_type and std.mem.eql(u8, query_text, "Numeric")) {
-            return "Number";
+        if (mask.is_type) {
+            if (std.mem.eql(u8, query_text, "Numeric")) {
+                return "Number";
+            }
+            if (lookupForeignScalarHint(query_text)) |scalar_hint| {
+                return scalar_hint;
+            }
         }
         const max_allowed_dist: u16 = if (query_text.len <= 4) 1 else if (query_text.len <= 8) 2 else 3;
 
@@ -5298,6 +5356,16 @@ pub const SymbolTable = struct {
 
 // ---------------- Diagnostic Emission Helpers -----------------
 
+/// Maps unambiguous `PascalCase` foreign scalar type spellings (`U32`, `UInt32`, `Bool`, `Str`, `Void`, …) to CoreX primitives.
+pub fn lookupUnambiguousForeignScalar(name: []const u8) ?[]const u8 {
+    return UNAMBIGUOUS_FOREIGN_SCALAR_MAP.get(name);
+}
+
+/// Maps foreign scalar type spellings (including width-ambiguous `int`, `uint`, `float`, `double`, `string`) to CoreX hints.
+pub fn lookupForeignScalarHint(name: []const u8) ?[]const u8 {
+    return UNAMBIGUOUS_FOREIGN_SCALAR_MAP.get(name) orelse LOWERCASE_FOREIGN_SCALAR_HINT_MAP.get(name);
+}
+
 /// Emits `W0402` (`w0402_unused_binding`) for any unreferenced local bindings/parameters in `scope_id`.
 pub fn checkUnusedBindingsInScope(
     sym_table: *const SymbolTable,
@@ -5409,15 +5477,36 @@ pub fn emitUnresolvedSymbolDiagnostic(
             .replacement_id = rep_id,
         }};
         const fix_msg = try std.fmt.allocPrint(arena_alloc, "replace with `{s}`", .{sug});
+        const is_unambiguous_scalar = if (lookupUnambiguousForeignScalar(name_text)) |prim_name|
+            std.mem.eql(u8, sug, prim_name)
+        else
+            false;
+        const is_any_scalar_hint = if (lookupForeignScalarHint(name_text)) |hint_name|
+            std.mem.eql(u8, sug, hint_name)
+        else
+            false;
         const fix = [1]SuggestedFix{.{
             .message = fix_msg,
-            .applicability = .maybe_incorrect,
+            .applicability = if (is_unambiguous_scalar) .machine_applicable else .maybe_incorrect,
             .priority = .type_migration,
             .edits = &edit,
         }};
         if (is_retired_numeric) {
             const notes = [1][]const u8{
                 "help: constrain generic numeric code with `Number`, `Integer`, `Signed`, `Unsigned`, or `Float`",
+            };
+            _ = try sink.emit(.{
+                .code = .e0403_unresolved_symbol,
+                .severity = .err,
+                .primary_span = use_span,
+                .message = main_msg,
+                .labels = &labels,
+                .notes = &notes,
+                .suggestions = &fix,
+            });
+        } else if (is_any_scalar_hint) {
+            const notes = [1][]const u8{
+                "help: CoreX built-in scalar types use concise lowercase names (`i32`, `u64`, `usize`, `f64`, `bool`, `str`, `unit`)",
             };
             _ = try sink.emit(.{
                 .code = .e0403_unresolved_symbol,
